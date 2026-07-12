@@ -714,6 +714,8 @@ button {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* 防止浏览器滚动锚定在虚拟列表卸挂时把位置拽回去，导致发送后钉底失效 */
+  overflow-anchor: none;
   user-select: text;
 }
 
@@ -729,6 +731,13 @@ button {
 /* transcript 虚拟化 wrapper：不参与 flex 收缩，卸载时用等高占位撑住滚动高度 */
 .vgroup {
   flex: 0 0 auto;
+}
+
+.transcript-end {
+  flex: 0 0 auto;
+  height: 1px;
+  width: 100%;
+  pointer-events: none;
 }
 
 .transcript-hint {

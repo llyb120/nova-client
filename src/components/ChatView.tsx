@@ -18,25 +18,28 @@ import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
  * DOM，节点数随会话线性增长，WebView2 渲染进程内存单调上涨直至崩溃。这里给每个轮次套一层
  * 轻量 wrapper（始终存在，成本仅一个 div），用 IntersectionObserver 判断是否临近视口：
  * 远离视口时卸载内部重内容、用等高占位撑住（滚动位置不跳），滚回来再挂载。
- * 正在流式输出的当前轮（active）永不卸载，避免高度剧变导致抖动。
+ * 正在流式输出的当前轮（active）与列表末组永不卸载，避免高度剧变 / 发送后钉底失效。
  */
 function VirtualGroup(props: {
   group: Group;
   active: boolean;
+  /** 列表最后一组：始终挂载，保证新提示词有真实高度可供吸底 */
+  keepMounted?: boolean;
   scrollEl: () => HTMLElement | undefined;
 }) {
   let ref: HTMLDivElement | undefined;
   const [visible, setVisible] = createSignal(true);
   const [height, setHeight] = createSignal(0);
-  const mounted = () => visible() || props.active;
+  const mounted = () => visible() || props.active || !!props.keepMounted;
 
   onMount(() => {
     if (!ref) return;
+    const root = props.scrollEl();
     const io = new IntersectionObserver(
       (entries) => {
         const entry = entries[0];
         if (!entry) return;
-        if (entry.isIntersecting) {
+        if (entry.isIntersecting || props.active || props.keepMounted) {
           setVisible(true);
         } else {
           // 卸载前记录真实高度（此刻内容仍挂载）：用等高占位替身，滚动条不跳。
@@ -46,10 +49,15 @@ function VirtualGroup(props: {
         }
       },
       // 视口上下各留 1200px 缓冲，减少快速滚动时的空白闪烁
-      { root: props.scrollEl(), rootMargin: "1200px 0px" },
+      { root: root ?? null, rootMargin: "1200px 0px" },
     );
     io.observe(ref);
     onCleanup(() => io.disconnect());
+  });
+
+  // keepMounted / active 变为 true 时立刻挂回，不等下一次 IO 回调
+  createEffect(() => {
+    if (props.active || props.keepMounted) setVisible(true);
   });
 
   return (
@@ -68,11 +76,11 @@ function VirtualGroup(props: {
 export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
+  let endRef: HTMLDivElement | undefined;
   let stickToBottom = true;
-  /** 发送后强制吸底截止：覆盖「bump → 用户消息入 DOM → 虚拟列表挂载」整段异步 */
+  /** 发送后强制吸底：直到新内容入 DOM 且真正贴近底部，或超时 */
   let forceStickUntil = 0;
   let settleRaf = 0;
-  /** 已 bump、尚在等这条用户消息落进 items（发送瞬间消息还没到 DOM） */
   let awaitingSendUserItem = false;
   let itemsLenAtSend = 0;
 
@@ -85,15 +93,41 @@ export function ChatView() {
     [],
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
+  const lastGroupIndex = () => groups().length - 1;
 
   const sticking = () => stickToBottom || performance.now() < forceStickUntil;
 
-  const pinBottom = () => {
-    if (!scrollRef) return;
-    scrollRef.scrollTop = scrollRef.scrollHeight;
+  const distanceFromBottom = () => {
+    if (!scrollRef) return Number.POSITIVE_INFINITY;
+    return scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight;
   };
 
-  // 流式更新高频触发，用 rAF 去重：每帧至多读一次 scrollHeight（强制重排），避免抖动
+  const pinBottom = () => {
+    if (!scrollRef) return;
+    // 先拉满 scrollTop，再用底部哨兵 scrollIntoView（虚拟列表高度变化时更稳）
+    scrollRef.scrollTop = scrollRef.scrollHeight;
+    endRef?.scrollIntoView({ block: "end", inline: "nearest" });
+  };
+
+  /** 持续钉底直到贴近底部，或超过 deadline（覆盖「发送 → 用户消息入 DOM → 末组布局」） */
+  const stickUntilSettled = (ms = 3000) => {
+    stickToBottom = true;
+    forceStickUntil = performance.now() + ms;
+    if (settleRaf) cancelAnimationFrame(settleRaf);
+    const deadline = performance.now() + ms;
+    const step = () => {
+      settleRaf = 0;
+      if (!scrollRef) return;
+      pinBottom();
+      const needMore =
+        performance.now() < deadline && (awaitingSendUserItem || distanceFromBottom() > 4);
+      if (needMore) settleRaf = requestAnimationFrame(step);
+    };
+    pinBottom();
+    settleRaf = requestAnimationFrame(step);
+  };
+
+  // 流式更新高频触发，用 rAF 去重
   let scrollPending = false;
   const scrollToBottom = () => {
     if (scrollPending) return;
@@ -102,33 +136,15 @@ export function ChatView() {
       scrollPending = false;
       if (!scrollRef || !sticking()) return;
       pinBottom();
-      const dist = scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight;
-      if (dist > 1 && sticking()) scrollToBottom();
+      if (distanceFromBottom() > 1 && sticking()) scrollToBottom();
     });
   };
 
-  /** 连续多帧钉住底部，等虚拟列表 / 新气泡高度稳定 */
-  const settleToBottom = (frames = 24) => {
-    if (settleRaf) cancelAnimationFrame(settleRaf);
-    let left = frames;
-    const step = () => {
-      settleRaf = 0;
-      if (!scrollRef || !sticking()) return;
-      pinBottom();
-      left -= 1;
-      if (left > 0) settleRaf = requestAnimationFrame(step);
-    };
-    settleRaf = requestAnimationFrame(step);
-  };
-
-  /** 发送新提示词：立刻跳到底，并标记等待用户消息入 DOM 后再钉一次 */
+  /** 发送新提示词：强制跳到底，并等到 items 增长后再钉稳 */
   const jumpToBottomNow = () => {
-    stickToBottom = true;
-    forceStickUntil = performance.now() + 2000;
     awaitingSendUserItem = true;
     itemsLenAtSend = state.items.length;
-    pinBottom();
-    settleToBottom();
+    stickUntilSettled(3000);
   };
 
   // 会话累计 token 用量
@@ -141,38 +157,29 @@ export function ChatView() {
 
   const onScroll = () => {
     if (!scrollRef) return;
-    // 发送后的强制窗口内不解除吸底，避免跳转时虚拟列表高度抖动误判
     if (performance.now() < forceStickUntil) {
       stickToBottom = true;
       return;
     }
-    const dist = scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight;
-    stickToBottom = dist < 60;
+    stickToBottom = distanceFromBottom() < 60;
   };
 
-  // 内容变化时自动吸底；发送场景下等用户消息真正出现后再强制钉底（bump 时 DOM 里还没有它）
+  // 内容变化时自动吸底；发送后等 items 增长（提示词落库）是关键钉底时机
   createEffect(() => {
     const len = state.items.length;
     const last = state.items[len - 1];
     if (last && "text" in last) void (last as { text: string }).text.length;
     void permissions().length;
 
-    // bump 时用户消息尚未入 DOM；items 一旦增长（提示词落库）再强制钉底
     if (awaitingSendUserItem && len > itemsLenAtSend) {
       awaitingSendUserItem = false;
-      stickToBottom = true;
-      forceStickUntil = performance.now() + 800;
-      pinBottom();
-      settleToBottom();
+      stickUntilSettled(1500);
       return;
     }
 
-    if (sticking() && scrollRef) {
-      scrollToBottom();
-    }
+    if (sticking() && scrollRef) scrollToBottom();
   });
 
-  // 高度变化吸底兜底：Markdown / 图片 / 工具卡片等会在 store 更新后继续增高
   onMount(() => {
     if (!innerRef) return;
     const ro = new ResizeObserver(() => {
@@ -185,15 +192,16 @@ export function ChatView() {
     });
   });
 
-  // 切换线程时滚到底
-  createEffect(() => {
-    void state.currentId;
-    awaitingSendUserItem = false;
-    stickToBottom = true;
-    forceStickUntil = performance.now() + 400;
-    scrollToBottom();
-    settleToBottom(16);
-  });
+  // 仅在切换会话时重置吸底（不要在无关更新里清掉「等待发送落库」标记）
+  createEffect((prevId: string | null | undefined) => {
+    const id = state.currentId;
+    if (id !== prevId) {
+      awaitingSendUserItem = false;
+      stickToBottom = true;
+      stickUntilSettled(800);
+    }
+    return id;
+  }, undefined);
 
   // 会话中继续发送提示词：未在底部时也立刻跳到底（无过渡）
   createEffect(() => {
@@ -369,18 +377,21 @@ export function ChatView() {
           </Show>
           <Show keyed when={state.currentId}>
             <For each={groups()}>
-              {(g) => (
+              {(g, i) => (
                 <VirtualGroup
                   group={g}
                   // 运行中所有尚未闭合的轮次都保持活跃：补充提示词会新开一组，
                   // 若只标最后一组，前面仍在跑的工具/输出会像已停止。
                   active={isRunning() && !g.turn}
+                  keepMounted={i() === lastGroupIndex()}
                   scrollEl={() => scrollRef}
                 />
               )}
             </For>
           </Show>
           <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
+          {/* 吸底哨兵：发送新提示词时 scrollIntoView，不依赖虚拟列表占位高度 */}
+          <div ref={endRef} class="transcript-end" aria-hidden="true" />
         </div>
       </div>
 
