@@ -12,6 +12,7 @@ mod notice;
 mod pxpipe;
 mod quota;
 mod relay;
+mod remote;
 mod semantic;
 mod settings;
 mod skills;
@@ -164,7 +165,7 @@ impl AppState {
     }
 }
 
-fn is_running(state: &AppState, thread: &Thread) -> bool {
+pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     if thread.is_roaming_guest() {
         return state.relay.is_guest_running(&thread.id);
     }
@@ -3365,6 +3366,8 @@ pub fn run() {
             register_roaming_forwarders(app.handle(), relay.clone());
             // 连接中转站（未配置 token 时内部直接返回）
             relay.restart();
+            // server 侧远程会话：空闲只做命令长轮询；运行中按全量 + 增量同步。
+            remote::start(app.handle().clone());
 
             // 数字员工心跳：每 5 秒 tick 一次，到点的在岗员工自动唤起干一轮（续做在手单子或找新单子）。
             // 放后端 tokio 定时器（同更新检测）：窗口最小化/隐藏也不受 WebView 节流影响。

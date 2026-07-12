@@ -18,7 +18,7 @@ use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, Worktree};
 use crate::AppState;
 use base64::Engine;
 use flate2::read::DeflateDecoder;
-use flate2::write::DeflateEncoder;
+use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -107,6 +107,7 @@ pub struct RelayManager {
     pub app: AppHandle,
     config_dir: PathBuf,
     http: reqwest::Client,
+    device_id: String,
     connected: AtomicBool,
     last_seq: AtomicI64,
     last_persist: StdMutex<Instant>,
@@ -146,6 +147,7 @@ impl RelayManager {
     pub fn new(app: AppHandle, config_dir: PathBuf) -> Arc<Self> {
         let last_seq = read_last_seq(&config_dir);
         let inbox = read_inbox(&config_dir);
+        let device_id = read_or_create_device_id(&config_dir);
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             // 开启 TCP keepalive：让 OS 层也能更早发现静默死亡的长连接（SSE），
@@ -158,6 +160,7 @@ impl RelayManager {
             app,
             config_dir,
             http,
+            device_id,
             connected: AtomicBool::new(false),
             last_seq: AtomicI64::new(last_seq),
             last_persist: StdMutex::new(Instant::now()),
@@ -249,6 +252,10 @@ impl RelayManager {
         self.cfg().is_some()
     }
 
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
     pub fn status(&self) -> Value {
         json!({
             "enabled": self.enabled(),
@@ -276,6 +283,7 @@ impl RelayManager {
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Relay-Name", &name)
             .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Device", &self.device_id)
             .timeout(Duration::from_secs(15))
             .send()
             .await;
@@ -349,11 +357,12 @@ impl RelayManager {
     async fn connect_once(&self, server: &str, token: &str, name: &str) -> Result<(), String> {
         let since = self.last_seq.load(Ordering::SeqCst);
         let url = format!(
-            "{server}/v1/stream?token={}&name={}&since={}&groups={}",
+            "{server}/v1/stream?token={}&name={}&since={}&groups={}&device={}",
             urlencode(token),
             urlencode(name),
             since,
             urlencode(&self.groups_csv()),
+            urlencode(&self.device_id),
         );
         let resp = self
             .http
@@ -536,15 +545,17 @@ impl RelayManager {
 
     pub async fn send(&self, to: &str, kind: &str, data: Value) -> Result<Value, String> {
         let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
-        // 大载荷端到端压缩（快照/大批量增量），减小传输体积、加快接收方追帧
-        let data = maybe_compress(data);
+        let body = gzip_json(&json!({ "to": to, "type": kind, "data": data }))?;
         let resp = self
             .http
             .post(format!("{server}/v1/send"))
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Relay-Name", &name)
             .header("X-Relay-Groups", self.groups_csv())
-            .json(&json!({ "to": to, "type": kind, "data": data }))
+            .header("X-Relay-Device", &self.device_id)
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "gzip")
+            .body(body)
             .timeout(Duration::from_secs(30))
             .send()
             .await
@@ -568,16 +579,20 @@ impl RelayManager {
         ttl_ms: i64,
     ) -> Result<(String, Value), String> {
         let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
+        let body = gzip_json(&json!({
+            "scope": scope, "key": key, "title": title,
+            "owner": owner, "ownerName": owner_name, "ttlMs": ttl_ms,
+        }))?;
         let resp = self
             .http
             .post(format!("{server}/v1/ledger/claim"))
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Relay-Name", &name)
             .header("X-Relay-Groups", self.groups_csv())
-            .json(&json!({
-                "scope": scope, "key": key, "title": title,
-                "owner": owner, "ownerName": owner_name, "ttlMs": ttl_ms,
-            }))
+            .header("X-Relay-Device", &self.device_id)
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "gzip")
+            .body(body)
             .timeout(Duration::from_secs(15))
             .send()
             .await
@@ -604,16 +619,20 @@ impl RelayManager {
         release: bool,
     ) -> Result<(), String> {
         let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
+        let body = gzip_json(&json!({
+            "scope": scope, "key": key, "status": status,
+            "note": note, "release": release,
+        }))?;
         let resp = self
             .http
             .post(format!("{server}/v1/ledger/set"))
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Relay-Name", &name)
             .header("X-Relay-Groups", self.groups_csv())
-            .json(&json!({
-                "scope": scope, "key": key, "status": status,
-                "note": note, "release": release,
-            }))
+            .header("X-Relay-Device", &self.device_id)
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "gzip")
+            .body(body)
             .timeout(Duration::from_secs(15))
             .send()
             .await
@@ -627,13 +646,17 @@ impl RelayManager {
     /// 删除一个单子。
     pub async fn ledger_remove(&self, scope: &str, key: &str) -> Result<(), String> {
         let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
+        let body = gzip_json(&json!({ "scope": scope, "key": key }))?;
         let resp = self
             .http
             .post(format!("{server}/v1/ledger/remove"))
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Relay-Name", &name)
             .header("X-Relay-Groups", self.groups_csv())
-            .json(&json!({ "scope": scope, "key": key }))
+            .header("X-Relay-Device", &self.device_id)
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "gzip")
+            .body(body)
             .timeout(Duration::from_secs(15))
             .send()
             .await
@@ -653,6 +676,7 @@ impl RelayManager {
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Relay-Name", &name)
             .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Device", &self.device_id)
             .query(&[("scope", scope)])
             .timeout(Duration::from_secs(15))
             .send()
@@ -712,13 +736,20 @@ impl RelayManager {
         };
         let groups = self.groups_csv();
         let http = self.http.clone();
+        let device_id = self.device_id.clone();
+        let Ok(body) = gzip_json(&json!({ "folders": folders })) else {
+            return;
+        };
         tauri::async_runtime::spawn(async move {
             let _ = http
                 .post(format!("{server}/v1/folders"))
                 .header("Authorization", format!("Bearer {token}"))
                 .header("X-Relay-Name", &name)
                 .header("X-Relay-Groups", groups)
-                .json(&json!({ "folders": folders }))
+                .header("X-Relay-Device", device_id)
+                .header("Content-Type", "application/json")
+                .header("Content-Encoding", "gzip")
+                .body(body)
                 .timeout(Duration::from_secs(15))
                 .send()
                 .await;
@@ -2487,29 +2518,7 @@ fn first_line(s: &str, n: usize) -> String {
         .collect()
 }
 
-/// 超过此大小的载荷才压缩：增量很小不值得压，快照/大批量才有收益。
-const COMPRESS_THRESHOLD: usize = 6 * 1024;
-
-/// 端到端压缩：大载荷用 deflate + base64 包成 `{"_z": "..."}`。中转站只透传 data，
-/// 不感知内容，所以无需改服务端；对端 maybe_decompress 还原。
-fn maybe_compress(data: Value) -> Value {
-    let raw = match serde_json::to_vec(&data) {
-        Ok(b) if b.len() >= COMPRESS_THRESHOLD => b,
-        _ => return data,
-    };
-    let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
-    if enc.write_all(&raw).is_err() {
-        return data;
-    }
-    match enc.finish() {
-        Ok(compressed) => {
-            json!({ "_z": base64::engine::general_purpose::STANDARD.encode(compressed) })
-        }
-        Err(_) => data,
-    }
-}
-
-/// 还原 maybe_compress 压缩过的载荷；非压缩载荷原样返回。
+/// 兼容旧版客户端的 deflate+base64 载荷；新版 HTTP 整体统一使用 gzip。
 fn maybe_decompress(data: &mut Value) {
     let Some(z) = data.get("_z").and_then(|v| v.as_str()) else {
         return;
@@ -2525,6 +2534,13 @@ fn maybe_decompress(data: &mut Value) {
     if let Ok(v) = serde_json::from_slice::<Value>(&out) {
         *data = v;
     }
+}
+
+pub(crate) fn gzip_json(value: &Value) -> Result<Vec<u8>, String> {
+    let raw = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(&raw).map_err(|e| e.to_string())?;
+    enc.finish().map_err(|e| e.to_string())
 }
 
 /// 把一批出站消息里「连续、同目标、同会话」的 roaming.update 合并成一条（ops 数组），
@@ -2690,6 +2706,20 @@ fn read_last_seq(dir: &PathBuf) -> i64 {
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v["lastSeq"].as_i64())
         .unwrap_or(0)
+}
+
+fn read_or_create_device_id(dir: &PathBuf) -> String {
+    let path = dir.join("relay-device-id");
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        let id = id.trim();
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(path, &id);
+    id
 }
 
 fn write_last_seq(dir: &PathBuf, seq: i64) {
