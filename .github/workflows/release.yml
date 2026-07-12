@@ -150,3 +150,22 @@ jobs:
             dist/**/*.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Keep only the 10 most recent releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 按 createdAt 升序，取除最新 10 个之外的所有 release（含 draft/prerelease）
+          mapfile -t TO_DELETE < <(gh release list --limit 100 \
+            --json createdAt,tagName \
+            --jq 'sort_by(.createdAt) | .[:-10] | .[].tagName')
+          if [ ${#TO_DELETE[@]} -eq 0 ]; then
+            echo "无需清理（release 数量 ≤ 10）"
+            exit 0
+          fi
+          for tag in "${TO_DELETE[@]}"; do
+            echo "删除旧 release: $tag"
+            gh release delete "$tag" --cleanup-tag -y || echo "警告：删除 $tag 失败"
+          done
