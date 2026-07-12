@@ -1,7 +1,8 @@
 //! server 侧远程会话客户端。
 //!
-//! 空闲期只维持一个低流量命令长轮询，不上传会话；会话运行时首包/纠错/收尾发全量，
-//! 中间流式阶段只发变化条目（约 400ms 一拍，配合网页长轮询做到近实时）。
+//! 连上中转站后先推一次快照；空闲期只维持低流量命令长轮询，不持续上传。
+//! 网页端刚打开（bootstrap state）时服务端会 refreshRequested，唤醒桌面补发。
+//! 会话运行时首包/纠错/收尾发全量，中间流式阶段只发变化条目（约 400ms 一拍）。
 //! 打开历史会话走 kind=threads 轻量包（不重传 models/projects），并预热最近若干会话。
 //! 所有请求体均 gzip，响应由 reqwest 自动解 gzip。
 
@@ -163,7 +164,8 @@ async fn run(app: AppHandle) {
             requested.clear();
             revision = 0;
             previous.clear();
-            force_full = false;
+            // 连上中转站后立刻推一次快照，避免空闲长轮询时网页端打开仍是空列表。
+            force_full = true;
             was_running = false;
             ack_id = 0;
             processed_id = 0;
@@ -171,12 +173,11 @@ async fn run(app: AppHandle) {
             warmed.clear();
         }
 
-        // 浏览器刚点开的会话优先单独上传；其余最近会话后台预热。
+        // 全量/纠错时带上最近会话；浏览器点名的会话一并纳入同一包。
         let mut sync_ids = requested.clone();
-        let prioritize_request = !requested.is_empty();
-        if revision > 0 && !prioritize_request {
+        if force_full || revision > 0 {
             for id in recent_thread_ids(&app, PREFETCH_RECENT) {
-                if !warmed.contains(&id) {
+                if force_full || !warmed.contains(&id) {
                     sync_ids.insert(id);
                 }
             }
@@ -192,8 +193,11 @@ async fn run(app: AppHandle) {
         }
 
         let has_unwarmed = current.keys().any(|id| !warmed.contains(id));
-        let want_upload =
-            force_full || any_running || !results.is_empty() || prioritize_request || has_unwarmed;
+        let want_upload = force_full
+            || any_running
+            || !results.is_empty()
+            || !requested.is_empty()
+            || has_unwarmed;
 
         if !want_upload {
             match pull(&client, &cfg).await {
