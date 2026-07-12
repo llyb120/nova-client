@@ -14,6 +14,7 @@ mod quota;
 mod relay;
 mod semantic;
 mod settings;
+mod skills;
 mod sys_notify;
 mod threads;
 mod updater;
@@ -576,23 +577,17 @@ fn collect_skill_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn codex_skill_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
-        roots.push(home.join("skills"));
-    }
-    if let Some(home) = user_home_dir() {
-        roots.push(home.join(".codex").join("skills"));
-        roots.push(home.join(".agents").join("skills"));
-    }
+fn codex_skill_roots(config_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = skills::backend_skill_roots();
+    roots.push(skills::skills_dir(config_dir));
     roots.sort();
     roots.dedup();
     roots
 }
 
-fn list_codex_skill_commands() -> Vec<Value> {
+fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
     let mut files = Vec::new();
-    for root in codex_skill_roots() {
+    for root in codex_skill_roots(config_dir) {
         collect_skill_files(&root, 4, &mut files);
     }
 
@@ -1798,8 +1793,35 @@ async fn get_slash_commands(
             let commands = mgr.fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
         }
-        None => Ok(list_codex_skill_commands()),
+        None => Ok(list_codex_skill_commands(&state.config_dir)),
     }
+}
+
+#[tauri::command]
+fn list_skills(state: State<'_, AppState>) -> Vec<skills::SkillInfo> {
+    skills::list_skills(&state.config_dir)
+}
+
+#[tauri::command]
+fn get_skills_dir(state: State<'_, AppState>) -> String {
+    skills::ensure_skills_dir(&state.config_dir)
+        .to_string_lossy()
+        .to_string()
+}
+
+#[tauri::command]
+fn install_skill(state: State<'_, AppState>, path: String) -> Result<skills::SkillInfo, String> {
+    skills::install_skill_path(&state.config_dir, Path::new(&path))
+}
+
+#[tauri::command]
+fn remove_skill(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    skills::remove_skill(&state.config_dir, &name)
+}
+
+#[tauri::command]
+fn sync_skills(state: State<'_, AppState>) -> Result<(), String> {
+    skills::sync_skills_to_backends(&state.config_dir)
 }
 
 #[tauri::command]
@@ -3199,6 +3221,8 @@ pub fn run() {
                 }
             }
             let settings = Settings::load(&dir);
+            // 集中 skills → 各后端全局目录的软链接/联接（启动时先同步一次）
+            let _ = skills::sync_skills_to_backends(&dir);
             let roaming = RoamingStore::load(&dir);
             let worktrees = WorktreeStore::load(&dir);
             let employees = employees::EmployeeStore::load(&dir);
@@ -3479,6 +3503,11 @@ pub fn run() {
             list_worktrees,
             remove_worktree,
             merge_worktree_thread,
+            list_skills,
+            get_skills_dir,
+            install_skill,
+            remove_skill,
+            sync_skills,
             list_employees,
             create_employee,
             update_employee,

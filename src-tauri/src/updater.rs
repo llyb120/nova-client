@@ -6,7 +6,7 @@
 //! - Windows：`nova-{version}.zip`（内含 `Nova.exe`）
 //! - macOS：`nova-macos-{aarch64|x86_64}-{version}.zip`（内含 `Nova`）
 //!
-//! 仓库：`option_env!("NOVA_GH_REPO")` 或下方默认 `YOUR_GITHUB_USER/nova-client`。
+//! 仓库：`option_env!("NOVA_GH_REPO")` 或下方默认 `llyb120/nova-client`。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,7 +20,7 @@ const APPLY_UPDATE_ARG: &str = "--nova-apply-update";
 
 /// GitHub 仓库 owner/repo。编译时可设 NOVA_GH_REPO 覆盖。
 fn github_repo() -> &'static str {
-    option_env!("NOVA_GH_REPO").unwrap_or("YOUR_GITHUB_USER/nova-client")
+    option_env!("NOVA_GH_REPO").unwrap_or("llyb120/nova-client")
 }
 
 fn github_api_latest() -> String {

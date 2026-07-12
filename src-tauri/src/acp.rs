@@ -1315,6 +1315,9 @@ impl AcpManager {
             crate::pxpipe::apply_pxpipe_env(&mut cmd, settings, self.proxy_of(settings))?;
         }
 
+        // 把 ~/.nova/skills 用软链接/目录联接同步到各后端全局 skills 目录
+        crate::skills::sync_skills_from_home();
+
         // Cursor：拉起进程前确保其 CLI 配置里 Max Mode 处于关闭状态（cursor-agent 启动时
         // 读取 cli-config.json，之后缓存在内存里，所以必须在 spawn 前完成清理）。
         if self.kind == AgentKind::Cursor {

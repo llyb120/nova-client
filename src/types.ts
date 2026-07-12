@@ -278,6 +278,13 @@ export interface Settings {
   embedApiKey: string;
 }
 
+/** 集中管理的 skill（~/.nova/skills） */
+export interface SkillInfo {
+  name: string;
+  description: string;
+  path: string;
+}
+
 export interface CliStatus {
   agentKind: AgentKind;
   cliName: string;

@@ -1,7 +1,7 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
-import { compactThread, setState, state } from "../store";
+import { compactThread, chatScrollToBottomSignal, setState, state } from "../store";
 import type { Item } from "../types";
 import { agentLabel } from "../utils";
 import { Composer } from "./Composer";
@@ -91,6 +91,17 @@ export function ChatView() {
     });
   };
 
+  /** 发送新提示词：无论当前是否吸底，立刻跳到底部（无平滑滚动） */
+  const jumpToBottomNow = () => {
+    stickToBottom = true;
+    if (!scrollRef) return;
+    scrollRef.scrollTop = scrollRef.scrollHeight;
+    // 新消息入 DOM 后高度可能再变，下一帧再钉一次
+    requestAnimationFrame(() => {
+      if (scrollRef && stickToBottom) scrollRef.scrollTop = scrollRef.scrollHeight;
+    });
+  };
+
   // 会话累计 token 用量
   const totalTokens = createMemo(() =>
     state.items.reduce(
@@ -133,6 +144,13 @@ export function ChatView() {
     void state.currentId;
     stickToBottom = true;
     scrollToBottom();
+  });
+
+  // 会话中继续发送提示词：未在底部时也立刻跳到底（无过渡）
+  createEffect(() => {
+    const tick = chatScrollToBottomSignal();
+    if (tick === 0) return;
+    jumpToBottomNow();
   });
 
   const [editing, setEditing] = createSignal(false);

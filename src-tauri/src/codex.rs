@@ -524,6 +524,9 @@ impl CodexManager {
     }
 
     async fn spawn_conn(self: &Arc<Self>, settings: &Settings) -> Result<Arc<CodexConn>, String> {
+        // 把 ~/.nova/skills 用软链接/目录联接同步到各后端全局 skills 目录
+        crate::skills::sync_skills_from_home();
+
         let mut args: Vec<String> = settings
             .codex_args
             .split_whitespace()

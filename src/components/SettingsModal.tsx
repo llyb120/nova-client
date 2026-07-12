@@ -1,6 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import {
   checkAndStageUpdate,
@@ -13,10 +14,10 @@ import {
   setTheme,
   state,
 } from "../store";
-import { agentLabel, isScratch } from "../utils";
+import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker } from "./ConfigSelects";
 import { IconX } from "./icons";
-import type { AgentKind, CliStatus, PxpipeServiceStatus, Settings, WorktreeRecord } from "../types";
+import type { AgentKind, CliStatus, PxpipeServiceStatus, Settings, SkillInfo, WorktreeRecord } from "../types";
 
 function threadGroupName(cwd: string): string {
   if (isScratch(cwd)) return "临时会话";
@@ -93,7 +94,15 @@ function CliManager(props: {
   );
 }
 
-type SettingsTab = "general" | "backends" | "appearance" | "team" | "memory" | "worktree" | "about";
+type SettingsTab =
+  | "general"
+  | "backends"
+  | "appearance"
+  | "team"
+  | "memory"
+  | "worktree"
+  | "skills"
+  | "about";
 
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
@@ -102,6 +111,7 @@ const TABS: { id: SettingsTab; name: string }[] = [
   { id: "team", name: "团队" },
   { id: "memory", name: "记忆检索" },
   { id: "worktree", name: "Worktree" },
+  { id: "skills", name: "Skills" },
   { id: "about", name: "关于" },
 ];
 
@@ -381,6 +391,13 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   // worktree 管理
   const [worktreeDir, setWorktreeDir] = createSignal(s?.worktreeDir ?? "");
+  // skills 管理（集中存放 ~/.nova/skills）
+  const [skillsDir, setSkillsDir] = createSignal("");
+  const [skills, setSkills] = createSignal<SkillInfo[]>([]);
+  const [skillsLoading, setSkillsLoading] = createSignal(false);
+  const [skillsBusy, setSkillsBusy] = createSignal(false);
+  const [skillsDragging, setSkillsDragging] = createSignal(false);
+  const [skillsMsg, setSkillsMsg] = createSignal("");
   const [semanticEnabled, setSemanticEnabled] = createSignal(s?.semanticEnabled ?? false);
   const [embedEndpoint, setEmbedEndpoint] = createSignal(s?.embedEndpoint ?? "http://localhost:11434");
   const [embedModel, setEmbedModel] = createSignal(s?.embedModel ?? "bge-m3");
@@ -467,6 +484,139 @@ export function SettingsModal(props: { onClose: () => void }) {
       await refreshWorktrees();
     }
   };
+
+  const refreshSkills = async () => {
+    setSkillsLoading(true);
+    try {
+      const [dir, list] = await Promise.all([api.getSkillsDir(), api.listSkills()]);
+      setSkillsDir(dir);
+      setSkills(list);
+    } catch (e) {
+      setSkillsMsg(`加载失败：${String(e)}`);
+    } finally {
+      setSkillsLoading(false);
+    }
+  };
+  createEffect(() => {
+    if (tab() === "skills") void refreshSkills();
+  });
+
+  const installSkillPaths = async (paths: string[]) => {
+    if (paths.length === 0) return;
+    setSkillsBusy(true);
+    setSkillsMsg("");
+    const okNames: string[] = [];
+    const errors: string[] = [];
+    for (const path of paths) {
+      try {
+        const info = await api.installSkill(path);
+        okNames.push(info.name);
+      } catch (e) {
+        errors.push(`${path.split(/[\\/]/).pop()}: ${String(e)}`);
+      }
+    }
+    await refreshSkills();
+    setSkillsBusy(false);
+    if (okNames.length > 0) {
+      setSkillsMsg(`已安装：${okNames.join("、")}（已同步到各后端）`);
+    }
+    if (errors.length > 0) {
+      setSkillsMsg((prev) => (prev ? `${prev}；` : "") + errors.join("；"));
+    }
+  };
+
+  const pickSkillZip = async () => {
+    const selected = await openDialog({
+      multiple: true,
+      title: "选择 skill zip 或文件夹",
+      filters: [{ name: "Skill 包", extensions: ["zip"] }],
+    });
+    const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+    await installSkillPaths(paths.filter((p): p is string => typeof p === "string"));
+  };
+
+  const pickSkillFolder = async () => {
+    const dir = await openDialog({ directory: true, title: "选择 skill 文件夹（含 SKILL.md）" });
+    if (typeof dir === "string" && dir) await installSkillPaths([dir]);
+  };
+
+  const removeSkillItem = async (sk: SkillInfo) => {
+    const ok = await confirm(`删除 skill「${sk.name}」？各后端中的对应快捷方式也会移除。`, {
+      title: "删除 skill",
+      kind: "warning",
+    });
+    if (!ok) return;
+    setSkillsBusy(true);
+    try {
+      await api.removeSkill(sk.name);
+      setSkillsMsg(`已删除：${sk.name}`);
+      await refreshSkills();
+    } catch (e) {
+      await message(String(e), { kind: "error" });
+    } finally {
+      setSkillsBusy(false);
+    }
+  };
+
+  const openSkillsDir = async () => {
+    const dir = skillsDir() || (await api.getSkillsDir());
+    if (!dir) return;
+    try {
+      await api.openInExplorer(dir);
+    } catch (e) {
+      await message(String(e), { kind: "error" });
+    }
+  };
+
+  const resyncSkills = async () => {
+    setSkillsBusy(true);
+    try {
+      await api.syncSkills();
+      setSkillsMsg("已重新同步到各后端全局 skills 目录");
+    } catch (e) {
+      setSkillsMsg(`同步失败：${String(e)}`);
+    } finally {
+      setSkillsBusy(false);
+    }
+  };
+
+  // 设置弹层打开期间屏蔽聊天区拖放；Skills 页接管 zip/文件夹拖入
+  onMount(() => {
+    setFileDropBlocked(true);
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    try {
+      void getCurrentWebview()
+        .onDragDropEvent((event) => {
+          if (tab() !== "skills") {
+            if (event.payload.type === "drop" || event.payload.type === "leave") {
+              setSkillsDragging(false);
+            }
+            return;
+          }
+          if (event.payload.type === "enter" || event.payload.type === "over") {
+            setSkillsDragging(true);
+          } else if (event.payload.type === "drop") {
+            setSkillsDragging(false);
+            void installSkillPaths(event.payload.paths);
+          } else {
+            setSkillsDragging(false);
+          }
+        })
+        .then((fn) => {
+          if (cancelled) fn();
+          else unlisten = fn;
+        })
+        .catch(() => setSkillsDragging(false));
+    } catch {
+      setSkillsDragging(false);
+    }
+    onCleanup(() => {
+      cancelled = true;
+      unlisten?.();
+      setFileDropBlocked(false);
+    });
+  });
 
   const save = async () => {
     setSaving(true);
@@ -1263,6 +1413,88 @@ export function SettingsModal(props: { onClose: () => void }) {
                         </div>
                       );
                     }}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          </Show>
+
+          {/* ===== Skills ===== */}
+          <Show when={tab() === "skills"}>
+            <div class="field">
+              <span class="field-label">集中目录</span>
+              <div class="wt-dir-row">
+                <input class="field-input" value={skillsDir()} readonly title={skillsDir()} />
+                <button class="btn secondary" onClick={() => void openSkillsDir()}>
+                  打开
+                </button>
+                <button class="btn secondary" disabled={skillsBusy()} onClick={() => void resyncSkills()}>
+                  同步
+                </button>
+              </div>
+              <span class="field-hint">
+                Skill 统一放在 <code>~/.nova/skills</code>。启动各后端时会以软链接（macOS/Linux）或目录联接（Windows）同步到
+                Codex / Claude Code / Cursor / OpenCode / agents 的全局 skills 目录，不拷贝文件。
+              </span>
+            </div>
+
+            <div
+              classList={{
+                "skills-drop": true,
+                "is-dragging": skillsDragging(),
+                busy: skillsBusy(),
+              }}
+            >
+              <div class="skills-drop-title">拖入 zip 或 skill 文件夹</div>
+              <div class="skills-drop-hint">也可使用下方按钮选择。每个 skill 需包含 SKILL.md。</div>
+              <div class="skills-drop-actions">
+                <button class="btn secondary" disabled={skillsBusy()} onClick={() => void pickSkillZip()}>
+                  上传 zip…
+                </button>
+                <button class="btn secondary" disabled={skillsBusy()} onClick={() => void pickSkillFolder()}>
+                  选择文件夹…
+                </button>
+                <button class="link-btn" disabled={skillsLoading()} onClick={() => void refreshSkills()}>
+                  刷新
+                </button>
+              </div>
+            </div>
+
+            <Show when={skillsMsg()}>
+              <div class="field-hint">{skillsMsg()}</div>
+            </Show>
+
+            <div class="field">
+              <span class="field-label">已安装（共 {skills().length} 个）</span>
+              <Show
+                when={skills().length > 0}
+                fallback={
+                  <div class="sel-empty">{skillsLoading() ? "加载中…" : "暂无 skill，拖入或上传开始管理"}</div>
+                }
+              >
+                <div class="wt-list">
+                  <For each={skills()}>
+                    {(sk) => (
+                      <div class="wt-row">
+                        <div class="wt-row-main">
+                          <span class="wt-branch" title={sk.name}>
+                            {sk.name}
+                          </span>
+                        </div>
+                        <div class="wt-row-sub">
+                          <span class="wt-path" title={sk.description || sk.path}>
+                            {sk.description || sk.path}
+                          </span>
+                          <button
+                            class="btn danger small"
+                            disabled={skillsBusy()}
+                            onClick={() => void removeSkillItem(sk)}
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </For>
                 </div>
               </Show>

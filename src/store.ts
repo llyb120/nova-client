@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { batch } from "solid-js";
+import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile } from "solid-js/store";
 import { api } from "./ipc";
 import type {
@@ -992,6 +992,8 @@ export async function sendPrompt(text: string, images: PromptImage[] = []) {
     await api.registerLedgerItem(thread.employeeId, text, images);
     return;
   }
+  // 继续发提示词时：若用户滚在中部，立刻跳到底（无过渡动画）
+  bumpChatScrollToBottom();
   setState("proposedPlan", null);
   setState("running", id, true);
   try {
@@ -1000,6 +1002,15 @@ export async function sendPrompt(text: string, images: PromptImage[] = []) {
     setState("running", id, false);
     throw e;
   }
+}
+
+/** ChatView 订阅：发送新提示词时强制滚到底 */
+const [chatScrollToBottomTick, setChatScrollToBottomTick] = createSignal(0);
+export function chatScrollToBottomSignal() {
+  return chatScrollToBottomTick();
+}
+function bumpChatScrollToBottom() {
+  setChatScrollToBottomTick((n) => n + 1);
 }
 
 /** 本地 worktree 会话：worktree 在后台创建，暂存首条提示词，就绪后（acp:worktree-ready）再自动发送 */

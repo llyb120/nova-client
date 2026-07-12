@@ -23,6 +23,7 @@ import type {
   RevertChange,
   RevertResult,
   Settings,
+  SkillInfo,
   SlashCommand,
   Status,
   Thread,
@@ -193,6 +194,13 @@ export const api = {
   /** 把 worktree 会话的分支合并到目标分支；返回 "merged" 或 "conflict"（冲突已交给该会话的 AI 解决） */
   mergeWorktreeThread: (threadId: string, targetBranch: string) =>
     invoke<"merged" | "conflict">("merge_worktree_thread", { threadId, targetBranch }),
+
+  // Skills（集中管理 ~/.nova/skills，启动后端时软链接到各 agent 全局目录）
+  listSkills: () => invoke<SkillInfo[]>("list_skills"),
+  getSkillsDir: () => invoke<string>("get_skills_dir"),
+  installSkill: (path: string) => invoke<SkillInfo>("install_skill", { path }),
+  removeSkill: (name: string) => invoke<void>("remove_skill", { name }),
+  syncSkills: () => invoke<void>("sync_skills"),
 
   // 数字员工
   listEmployees: () => invoke<Employee[]>("list_employees"),

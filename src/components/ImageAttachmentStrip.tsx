@@ -2,6 +2,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import type { PromptImage } from "../types";
+import { isFileDropBlocked } from "../utils";
 import { IconFile, IconX } from "./icons";
 
 function fileToImage(f: File): Promise<PromptImage> {
@@ -108,6 +109,12 @@ export function createImageAttachments(options: { enableFileDrop?: boolean } = {
     try {
       void getCurrentWebview()
         .onDragDropEvent((event) => {
+          if (isFileDropBlocked()) {
+            if (event.payload.type === "drop" || event.payload.type === "leave") {
+              setDragging(false);
+            }
+            return;
+          }
           if (event.payload.type === "enter" || event.payload.type === "over") {
             setDragging(true);
           } else if (event.payload.type === "drop") {

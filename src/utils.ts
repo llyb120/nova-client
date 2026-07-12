@@ -59,3 +59,12 @@ export function scratchParent(cwd: string): string {
   const i = cwd.indexOf(SCRATCH_MARK);
   return i >= 0 ? cwd.slice(0, i + SCRATCH_MARK.length) : cwd;
 }
+
+/** 设置弹层打开时屏蔽聊天区的全局文件拖放，避免与 Skills 拖入冲突 */
+let fileDropBlocked = false;
+export function setFileDropBlocked(blocked: boolean) {
+  fileDropBlocked = blocked;
+}
+export function isFileDropBlocked() {
+  return fileDropBlocked;
+}
