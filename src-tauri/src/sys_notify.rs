@@ -43,8 +43,13 @@ pub fn show(
             .title(title)
             .text1(body);
         if let Some(cb) = on_activate {
+            // on_activated 要求 FnMut（可多次触发），而 cb 是 FnOnce。
+            // 用 Option + take() 让闭包第一次调用时消费 cb，后续触发为 no-op。
+            let mut cb = Some(cb);
             toast = toast.on_activated(move |_| {
-                cb();
+                if let Some(f) = cb.take() {
+                    f();
+                }
                 Ok(())
             });
         }
