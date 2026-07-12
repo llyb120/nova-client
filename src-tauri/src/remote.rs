@@ -1,7 +1,9 @@
 //! server 侧远程会话客户端。
 //!
 //! 空闲期只维持一个低流量命令长轮询，不上传会话；会话运行时首包/纠错/收尾发全量，
-//! 中间流式阶段只发变化条目。所有请求体均 gzip，响应由 reqwest 自动解 gzip。
+//! 中间流式阶段只发变化条目（约 400ms 一拍，配合网页长轮询做到近实时）。
+//! 打开历史会话走 kind=threads 轻量包（不重传 models/projects），并预热最近若干会话。
+//! 所有请求体均 gzip，响应由 reqwest 自动解 gzip。
 
 use crate::relay::{gzip_json, resolve_relay_server};
 use crate::threads::{AgentKind, Item, Thread};
@@ -14,8 +16,10 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::sleep;
 
-const ACTIVE_INTERVAL: Duration = Duration::from_secs(2);
+const ACTIVE_INTERVAL: Duration = Duration::from_millis(400);
 const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
+/// 空闲时预热最近 N 个历史会话到 server 缓存，打开时几乎秒出。
+const PREFETCH_RECENT: usize = 8;
 
 #[derive(Clone, PartialEq, Eq)]
 struct RemoteConfig {
@@ -93,6 +97,8 @@ struct RemoteCommand {
     mode: String,
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    path: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -104,6 +110,8 @@ struct CommandResult {
     error: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +144,7 @@ async fn run(app: AppHandle) {
     let mut ack_id = 0i64;
     let mut processed_id = 0i64;
     let mut results: Vec<CommandResult> = Vec::new();
+    let mut warmed: HashSet<String> = HashSet::new();
 
     loop {
         let Some(cfg) = config(&app) else {
@@ -144,6 +153,7 @@ async fn run(app: AppHandle) {
             revision = 0;
             previous.clear();
             force_full = false;
+            warmed.clear();
             sleep(Duration::from_secs(10)).await;
             continue;
         };
@@ -158,69 +168,40 @@ async fn run(app: AppHandle) {
             ack_id = 0;
             processed_id = 0;
             results.clear();
+            warmed.clear();
         }
 
-        let current = sync_threads(&app, &requested);
+        // 浏览器刚点开的会话优先单独上传；其余最近会话后台预热。
+        let mut sync_ids = requested.clone();
+        let prioritize_request = !requested.is_empty();
+        if revision > 0 && !prioritize_request {
+            for id in recent_thread_ids(&app, PREFETCH_RECENT) {
+                if !warmed.contains(&id) {
+                    sync_ids.insert(id);
+                }
+            }
+        }
+
+        let current = sync_threads(&app, &sync_ids);
         let any_running = threads_running(&app, current.values());
         let tracked_changed = !previous.is_empty()
             && (previous.len() != current.len()
                 || previous.keys().any(|id| !current.contains_key(id)));
         if (was_running && !any_running) || tracked_changed {
-            force_full = true; // 一轮结束用全量校准，之后停止上传。
+            force_full = true;
         }
 
-        if force_full || any_running || !results.is_empty() {
-            let next_revision = revision.saturating_add(1).max(1);
-            let (body, sent_full) = if force_full || previous.is_empty() {
-                let snap = full_snapshot(&app, &current);
-                (
-                    json!({
-                        "deviceName": cfg.name,
-                        "ackId": ack_id,
-                        "results": results,
-                        "kind": "full",
-                        "baseRevision": revision,
-                        "revision": next_revision,
-                        "snapshot": snap,
-                    }),
-                    true,
-                )
-            } else {
-                let mut deltas = Vec::with_capacity(current.len());
-                for (id, current_thread) in &current {
-                    let Some(old) = previous.get(id) else {
-                        force_full = true;
-                        break;
-                    };
-                    let Some(delta) = make_delta(old, current_thread, &app) else {
-                        force_full = true;
-                        break;
-                    };
-                    deltas.push(delta);
-                }
-                if force_full {
-                    continue;
-                }
-                (
-                    json!({
-                        "deviceName": cfg.name,
-                        "ackId": ack_id,
-                        "results": results,
-                        "kind": "delta",
-                        "baseRevision": revision,
-                        "revision": next_revision,
-                        "delta": { "threads": deltas },
-                    }),
-                    false,
-                )
-            };
+        let has_unwarmed = current.keys().any(|id| !warmed.contains(id));
+        let want_upload =
+            force_full || any_running || !results.is_empty() || prioritize_request || has_unwarmed;
 
-            match sync(&client, &cfg, &body).await {
+        if !want_upload {
+            match pull(&client, &cfg).await {
                 Ok(resp) => {
-                    revision = resp.revision.max(next_revision);
-                    previous = current;
-                    force_full = resp.need_full;
-                    results.clear();
+                    revision = resp.revision;
+                    if resp.need_full {
+                        force_full = true;
+                    }
                     requested = resp.requested_thread_ids.into_iter().collect();
                     process_commands(
                         &app,
@@ -232,27 +213,85 @@ async fn run(app: AppHandle) {
                         &mut requested,
                     )
                     .await;
-                    if sent_full && !any_running && results.is_empty() && !force_full {
-                        was_running = false;
-                    } else {
-                        was_running = any_running;
-                    }
                 }
                 Err(e) => sleep(error_backoff(&e)).await,
             }
-            if any_running || force_full || !results.is_empty() {
-                sleep(ACTIVE_INTERVAL).await;
-            }
+            was_running = any_eligible_thread_running(&app);
             continue;
         }
 
-        // 空闲不上传快照；只用长轮询等待网页命令或 server 请求补全量。
-        match pull(&client, &cfg).await {
+        let next_revision = revision.saturating_add(1).max(1);
+        // 已有基线且无运行中：用 threads 轻量包（含仅回传 git 结果的场景，避免为结果重做 full）。
+        let lean = revision > 0
+            && !any_running
+            && !(force_full && previous.is_empty() && results.is_empty());
+        let (body, sent_full) = if lean {
+            (
+                json!({
+                    "deviceName": cfg.name,
+                    "ackId": ack_id,
+                    "results": results,
+                    "kind": "threads",
+                    "baseRevision": revision,
+                    "revision": next_revision,
+                    "snapshot": threads_pack(&app, &current),
+                }),
+                false,
+            )
+        } else if force_full || previous.is_empty() {
+            (
+                json!({
+                    "deviceName": cfg.name,
+                    "ackId": ack_id,
+                    "results": results,
+                    "kind": "full",
+                    "baseRevision": revision,
+                    "revision": next_revision,
+                    "snapshot": full_snapshot(&app, &current),
+                }),
+                true,
+            )
+        } else {
+            let mut deltas = Vec::with_capacity(current.len());
+            let mut delta_ok = true;
+            for (id, current_thread) in &current {
+                let Some(old) = previous.get(id) else {
+                    delta_ok = false;
+                    break;
+                };
+                let Some(delta) = make_delta(old, current_thread, &app) else {
+                    delta_ok = false;
+                    break;
+                };
+                deltas.push(delta);
+            }
+            if !delta_ok {
+                force_full = true;
+                continue;
+            }
+            (
+                json!({
+                    "deviceName": cfg.name,
+                    "ackId": ack_id,
+                    "results": results,
+                    "kind": "delta",
+                    "baseRevision": revision,
+                    "revision": next_revision,
+                    "delta": { "threads": deltas },
+                }),
+                false,
+            )
+        };
+
+        match sync(&client, &cfg, &body).await {
             Ok(resp) => {
-                revision = resp.revision;
-                if resp.need_full {
-                    force_full = true;
+                revision = resp.revision.max(next_revision);
+                for (id, thread) in current {
+                    warmed.insert(id.clone());
+                    previous.insert(id, thread);
                 }
+                force_full = resp.need_full;
+                results.clear();
                 requested = resp.requested_thread_ids.into_iter().collect();
                 process_commands(
                     &app,
@@ -264,10 +303,17 @@ async fn run(app: AppHandle) {
                     &mut requested,
                 )
                 .await;
+                if sent_full && !any_running && results.is_empty() && !force_full {
+                    was_running = false;
+                } else {
+                    was_running = any_running;
+                }
             }
             Err(e) => sleep(error_backoff(&e)).await,
         }
-        was_running = any_eligible_thread_running(&app);
+        if any_running || force_full || !results.is_empty() {
+            sleep(ACTIVE_INTERVAL).await;
+        }
     }
 }
 
@@ -498,6 +544,32 @@ fn full_snapshot(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSna
     }
 }
 
+/// 轻量包：只带会话列表 + 指定会话快照，供打开历史/预热，避免重扫 projects 与重传 models。
+fn threads_pack(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSnapshot {
+    RemoteSnapshot {
+        projects: Vec::new(),
+        threads: thread_metas(app),
+        thread: None,
+        thread_snapshots: synced
+            .iter()
+            .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
+            .collect(),
+        models: HashMap::new(),
+    }
+}
+
+fn recent_thread_ids(app: &AppHandle, limit: usize) -> Vec<String> {
+    let state = app.state::<AppState>();
+    let store = state.store.lock().unwrap();
+    let mut items: Vec<_> = store.threads.iter().filter(|t| eligible(t)).collect();
+    items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    items
+        .into_iter()
+        .take(limit)
+        .map(|t| t.id.clone())
+        .collect()
+}
+
 fn remote_thread_value(thread: &Thread) -> Value {
     let mut thread = thread.clone();
     for item in &mut thread.items {
@@ -573,48 +645,176 @@ async fn process_commands(
         let result = execute_command(app, &cmd).await;
         *processed_id = cmd.id;
         *ack_id = cmd.id;
-        results.push(match result {
-            Ok(thread_id) => {
-                // 创建/发送/停止成功后把该会话加入只读快照同步集合。
-                // 浏览器自己的 selectedThreadId 由 server 按 Cookie 独立维护，不反向影响 client。
-                if !thread_id.is_empty() {
-                    requested.insert(thread_id.clone());
-                }
-                CommandResult {
-                    id: cmd.id,
-                    ok: true,
-                    error: String::new(),
-                    thread_id,
-                }
-            }
-            Err(error) => CommandResult {
-                id: cmd.id,
-                ok: false,
-                error,
-                thread_id: String::new(),
-            },
-        });
-        *force_full = true;
+        if result.ok && !result.thread_id.is_empty() {
+            requested.insert(result.thread_id.clone());
+        }
+        // git 只读查询不触发会话全量重传
+        if matches!(cmd.kind.as_str(), "create" | "send" | "stop") {
+            *force_full = true;
+        }
+        results.push(result);
     }
 }
 
-async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> Result<String, String> {
+async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult {
+    let fail = |error: String| CommandResult {
+        id: cmd.id,
+        ok: false,
+        error,
+        thread_id: String::new(),
+        data: None,
+    };
+    let ok_thread = |thread_id: String| CommandResult {
+        id: cmd.id,
+        ok: true,
+        error: String::new(),
+        thread_id,
+        data: None,
+    };
     match cmd.kind.as_str() {
-        "create" => {
-            let thread = create_thread(app, cmd)?;
+        "create" => match create_thread(app, cmd).and_then(|thread| {
             send_prompt(app, &thread.id, &cmd.text)?;
             Ok(thread.id)
-        }
-        "send" => {
-            send_prompt(app, &cmd.thread_id, &cmd.text)?;
-            Ok(cmd.thread_id.clone())
-        }
-        "stop" => {
-            stop_thread(app, &cmd.thread_id).await?;
-            Ok(cmd.thread_id.clone())
-        }
-        _ => Err("不支持的远程操作".into()),
+        }) {
+            Ok(id) => ok_thread(id),
+            Err(e) => fail(e),
+        },
+        "send" => match send_prompt(app, &cmd.thread_id, &cmd.text) {
+            Ok(()) => ok_thread(cmd.thread_id.clone()),
+            Err(e) => fail(e),
+        },
+        "stop" => match stop_thread(app, &cmd.thread_id).await {
+            Ok(()) => ok_thread(cmd.thread_id.clone()),
+            Err(e) => fail(e),
+        },
+        "git_status" => match remote_git_status(app, &cmd.cwd) {
+            Ok(data) => CommandResult {
+                id: cmd.id,
+                ok: true,
+                error: String::new(),
+                thread_id: String::new(),
+                data: Some(data),
+            },
+            Err(e) => fail(e),
+        },
+        "git_file" => match remote_git_file(app, &cmd.cwd, &cmd.path) {
+            Ok(data) => CommandResult {
+                id: cmd.id,
+                ok: true,
+                error: String::new(),
+                thread_id: String::new(),
+                data: Some(data),
+            },
+            Err(e) => fail(e),
+        },
+        _ => fail("不支持的远程操作".into()),
     }
+}
+
+fn ensure_remote_git_cwd(app: &AppHandle, cwd: &str) -> Result<String, String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return Err("缺少项目目录".into());
+    }
+    if !projects(app).iter().any(|p| p.path == cwd)
+        && !{
+            let state = app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            store.threads.iter().any(|t| eligible(t) && t.cwd == cwd)
+        }
+    {
+        return Err("只能查看电脑端已有项目的 git 变化".into());
+    }
+    if !crate::gitwt::is_repo(cwd) {
+        return Err("该目录不是 git 仓库".into());
+    }
+    crate::gitwt::repo_root(cwd)
+}
+
+fn remote_git_status(app: &AppHandle, cwd: &str) -> Result<Value, String> {
+    let root = ensure_remote_git_cwd(app, cwd)?;
+    let branch = crate::gitwt::run(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into());
+    let porcelain = crate::gitwt::run(
+        &root,
+        &["status", "--porcelain=v1", "-uall", "--ignore-submodules=dirty"],
+    )?;
+    let mut files = Vec::new();
+    for line in porcelain.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let x = line.as_bytes()[0] as char;
+        let y = line.as_bytes()[1] as char;
+        let rest = &line[3..];
+        // rename: "R  old -> new"
+        let path = if let Some((_, new_path)) = rest.split_once(" -> ") {
+            new_path
+        } else {
+            rest
+        };
+        let status = match (x, y) {
+            ('?', '?') => "untracked",
+            ('A', _) | (_, 'A') => "added",
+            ('D', _) | (_, 'D') => "deleted",
+            ('R', _) | (_, 'R') => "renamed",
+            _ => "modified",
+        };
+        files.push(json!({
+            "path": path,
+            "index": x.to_string(),
+            "worktree": y.to_string(),
+            "status": status,
+        }));
+    }
+    Ok(json!({
+        "repo": root,
+        "branch": branch,
+        "files": files,
+    }))
+}
+
+fn remote_git_file(app: &AppHandle, cwd: &str, path: &str) -> Result<Value, String> {
+    let root = ensure_remote_git_cwd(app, cwd)?;
+    let path = path.trim().trim_start_matches(['/', '\\']);
+    if path.is_empty() || path.contains("..") {
+        return Err("文件路径无效".into());
+    }
+    let abs = std::path::Path::new(&root).join(path);
+    let old_text = crate::gitwt::run(&root, &["show", &format!("HEAD:{path}")]).unwrap_or_default();
+    let new_text = if abs.is_file() {
+        std::fs::read_to_string(&abs).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    const LIMIT: usize = 400_000;
+    let mut truncated = false;
+    let mut old = old_text;
+    let mut new = new_text;
+    if old.len() > LIMIT {
+        old.truncate(LIMIT);
+        truncated = true;
+    }
+    if new.len() > LIMIT {
+        new.truncate(LIMIT);
+        truncated = true;
+    }
+    // 粗判二进制：含 NUL
+    if old.contains('\0') || new.contains('\0') {
+        return Ok(json!({
+            "path": path,
+            "binary": true,
+            "oldText": "",
+            "newText": "",
+            "truncated": false,
+        }));
+    }
+    Ok(json!({
+        "path": path,
+        "binary": false,
+        "oldText": old,
+        "newText": new,
+        "truncated": truncated,
+    }))
 }
 
 fn create_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String> {

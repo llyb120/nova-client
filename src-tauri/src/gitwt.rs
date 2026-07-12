@@ -9,6 +9,11 @@ use std::process::Command;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 在 repo 目录执行一条 git 子命令，成功返回 stdout（已 trim），失败返回 stderr。
+pub fn run(repo: &str, args: &[&str]) -> Result<String, String> {
+    git(repo, args)
+}
+
+/// 在 repo 目录执行一条 git 子命令，成功返回 stdout（已 trim），失败返回 stderr。
 fn git(repo: &str, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);
