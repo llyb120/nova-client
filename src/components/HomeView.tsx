@@ -15,6 +15,7 @@ import {
   normalizeUnifiedMode,
   openThread,
   refreshSlashCommands,
+  resolveAvailableModel,
   resolveEnabledAgentKind,
   sendPrompt,
   state,
@@ -143,13 +144,6 @@ export function HomeView() {
     });
   };
 
-  const availableModelOrFallback = (targetAgentKind: AgentKind, preferred: string) => {
-    const choices = modelChoices(targetAgentKind);
-    if (choices.length === 0 || choices.some((c) => c.value === preferred)) return preferred;
-    const previous = lastUsed.globalModel(targetAgentKind);
-    return choices.find((c) => c.value === previous)?.value ?? choices[0].value;
-  };
-
   const pickModel = (v: string) => {
     setModel(v);
     lastUsed.setModel(agentKind(), v, cwd());
@@ -220,17 +214,17 @@ export function HomeView() {
     }
   });
 
-  // 模型默认用第一个（不再有「默认」选项）。漫游单独处理。
+  // 空值才落到可用项；已有选择即使暂不在列表也保留（Cursor 目录未就绪等中间态不应重置成 Auto）。
   createEffect(() => {
     if (roaming()) return;
     const choices = modelChoices(agentKind());
     if (choices.length === 0) return;
-    if (!choices.some((c) => c.value === model())) {
-      setModel(availableModelOrFallback(agentKind(), model()));
-    }
+    const current = model();
+    const resolved = resolveAvailableModel(agentKind(), current);
+    if (resolved !== current) setModel(resolved);
   });
 
-  // 漫游：拉取对端模型；到达后把后端/模型/模式收敛到对方可用的第一项
+  // 漫游：拉取对端模型；到达后把后端/模型/模式收敛到对方可用项（跳过 value="" 的 Auto）
   createEffect(() => {
     const t = roamPeerToken();
     if (!t) return;
@@ -241,7 +235,9 @@ export function HomeView() {
     if (!backend) return;
     if (backend !== agentKind()) setAgentKind(backend);
     const models = modelChoices(backend, pm.options[backend] ?? null);
-    if (!models.some((m) => m.value === model())) setModel(models[0]?.value ?? "");
+    if (!models.some((m) => m.value === model())) {
+      setModel(models.find((m) => m.value)?.value ?? models[0]?.value ?? "");
+    }
     const modes = modeChoices(backend, pm.options[backend] ?? null);
     if (!modes.some((m) => m.id === mode())) setMode(modes[0]?.id ?? "");
   });
@@ -281,7 +277,7 @@ export function HomeView() {
   const selectProject = (p: string, warm = true) => {
     setRoam(null); // 选了本地项目就退出漫游
     setCwd(p);
-    const nextModel = availableModelOrFallback(agentKind(), lastUsed.model(agentKind(), p));
+    const nextModel = resolveAvailableModel(agentKind(), lastUsed.model(agentKind(), p));
     setModel(nextModel);
     if (warm) prewarmCurrent({ cwd: p, model: nextModel });
   };

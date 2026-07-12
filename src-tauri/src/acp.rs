@@ -2179,6 +2179,15 @@ impl AcpManager {
                     .cloned()
                     .unwrap_or_default();
                 *self.cursor_acp_models.lock().unwrap() = acp_options;
+                // 本地 CLI 查询不发送 prompt、不产生模型调用费用。完成后再次合并并广播。
+                self.spawn_cursor_catalog_fetch();
+                // 目录未就绪时，若内存里已有较完整列表（磁盘缓存 / 上次合并结果），
+                // 不要用「仅 Auto + ACP 默认变体」覆盖并广播——否则前端会把已选模型重置成 Auto。
+                let catalog_ready = self.cursor_catalog.lock().unwrap().is_some();
+                let existing_rich = Self::model_option_count(self.get_model_options().as_ref()) > 1;
+                if !catalog_ready && existing_rich {
+                    return;
+                }
                 let merged = self.cursor_merged_model_options();
                 match model_opt {
                     Some(opt) => {
@@ -2192,8 +2201,6 @@ impl AcpManager {
                         "options": merged,
                     })),
                 }
-                // 本地 CLI 查询不发送 prompt、不产生模型调用费用。完成后再次合并并广播。
-                self.spawn_cursor_catalog_fetch();
             }
         }
         let modes = match result.get("modes") {
@@ -2210,6 +2217,34 @@ impl AcpManager {
             EV_OPTIONS,
             json!({ "agentKind": self.kind.as_str(), "options": v }),
         );
+    }
+
+    /// 已缓存模型选项里非空 value 的数量（用于判断是否比「仅 Auto」更完整）。
+    fn model_option_count(opts: Option<&Value>) -> usize {
+        let Some(opts) = opts else { return 0 };
+        let Some(arr) = opts.get("configOptions").and_then(|c| c.as_array()) else {
+            return 0;
+        };
+        let Some(model) = arr
+            .iter()
+            .find(|o| o.get("id").and_then(|x| x.as_str()) == Some("model"))
+        else {
+            return 0;
+        };
+        model
+            .get("options")
+            .and_then(|o| o.as_array())
+            .map(|xs| {
+                xs.iter()
+                    .filter(|o| {
+                        o.get("value")
+                            .and_then(|v| v.as_str())
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     fn capture_commands(&self, update: &Value) {

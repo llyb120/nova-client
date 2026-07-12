@@ -6,6 +6,7 @@ import {
   modeChoices,
   modelChoices,
   normalizeUnifiedMode,
+  resolveAvailableModel,
   state,
 } from "../store";
 import type { AgentKind, ModelCost, ModelOptions } from "../types";
@@ -183,11 +184,9 @@ export function ModelPicker(props: {
   const effectiveModel = createMemo(() => {
     // 允许「默认」时空值合法（跟随默认），未命中列表的旧值也原样保留显示
     if (props.allowDefault) return props.model ?? "";
-    const choices = modelChoices(props.agentKind, sourceOf(props.agentKind));
-    if (props.model && (choices.length === 0 || choices.some((c) => c.value === props.model))) {
-      return props.model;
-    }
-    return choices[0]?.value ?? props.model ?? "";
+    // 已有明确选择：即使暂不在列表也保留（用 fallbackLabel 显示友好名），避免中间态闪成第一项/Auto
+    if (props.model) return props.model;
+    return resolveAvailableModel(props.agentKind, "", sourceOf(props.agentKind));
   });
 
   const modelValue = createMemo(() =>

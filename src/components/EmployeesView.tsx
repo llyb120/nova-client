@@ -6,8 +6,8 @@ import {
   enabledAgentKinds,
   ensureModelOptions,
   modeChoices,
-  modelChoices,
   refreshEmployees,
+  resolveAvailableModel,
   setView,
   state,
 } from "../store";
@@ -356,24 +356,20 @@ export function EmployeesView() {
     );
   };
 
-  // 表单：切后端时拉取模型列表，并把所选模型收敛到该后端的可用项
+  // 表单：切后端时拉取模型列表；空值才落到可用项，已有选择即使暂不在列表也保留
   createEffect(() => {
     if (!showForm()) return;
     const k = fAgent();
     void ensureModelOptions(k);
-    const choices = modelChoices(k);
-    if (choices.length > 0 && !choices.some((c) => c.value === fModel())) {
-      setFModel(choices[0].value);
-    }
-    // 巡查/心跳模型与工作模型用同一个（新会话）选择器，可独立选后端：把它收敛到其后端的可用项。
-    const hbChoices = modelChoices(fHeartbeatAgent());
-    if (hbChoices.length > 0 && !hbChoices.some((c) => c.value === fHeartbeatModel())) {
-      setFHeartbeatModel(hbChoices[0].value);
-    }
-    const mindChoices = modelChoices(fMindAgent());
-    if (mindChoices.length > 0 && !mindChoices.some((c) => c.value === fMindModel())) {
-      setFMindModel(mindChoices[0].value);
-    }
+    const nextModel = resolveAvailableModel(k, fModel());
+    if (nextModel !== fModel()) setFModel(nextModel);
+    // 巡查/心跳模型与工作模型用同一个（新会话）选择器，可独立选后端
+    void ensureModelOptions(fHeartbeatAgent());
+    const nextHb = resolveAvailableModel(fHeartbeatAgent(), fHeartbeatModel());
+    if (nextHb !== fHeartbeatModel()) setFHeartbeatModel(nextHb);
+    void ensureModelOptions(fMindAgent());
+    const nextMind = resolveAvailableModel(fMindAgent(), fMindModel());
+    if (nextMind !== fMindModel()) setFMindModel(nextMind);
     // 运行权限必须是该后端真实支持的模式，否则会话创建/设置模式时后端会报错（巡查出错的根因）。
     // 与新会话一致：空值/非法值（如把 Devin 的 accept-edits 用到 Codex 上）回退到第一项，
     // 保证所见即所存、且始终把合法 mode 发给后端。

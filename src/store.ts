@@ -247,6 +247,24 @@ export function modelChoices(
   return (model?.options as ModelChoice[]) ?? [];
 }
 
+/** 在可选列表中解析应使用的模型。
+ *  优先 preferred → 全局 lastUsed → 保留 preferred（列表不全/中间态时不落到第一项）→
+ *  仅空值时取第一项非空选项（跳过 Cursor「Auto」这类 value="" 入口）。 */
+export function resolveAvailableModel(
+  agentKind: AgentKind,
+  preferred: string,
+  source?: ModelOptions | null,
+): string {
+  const choices = modelChoices(agentKind, source);
+  if (choices.length === 0) return preferred;
+  if (preferred && choices.some((c) => c.value === preferred)) return preferred;
+  const previous = lastUsed.globalModel(agentKind);
+  if (previous && choices.some((c) => c.value === previous)) return previous;
+  // 有明确选择但不在当前列表：保留，避免 Cursor 目录未就绪等中间态把选择重置成 Auto/第一项
+  if (preferred) return preferred;
+  return choices.find((c) => c.value)?.value ?? choices[0]?.value ?? "";
+}
+
 /** 统一会话模式：全部后端只暴露 Build（放开全部权限执行）/ Plan（只规划不执行）两种，
  *  发送时由 Rust 侧翻译成各后端的真实模式 id（bypass / bypassPermissions / agent / build …）。 */
 export const UNIFIED_MODES: ModeChoice[] = [
