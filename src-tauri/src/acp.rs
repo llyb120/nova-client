@@ -1,7 +1,9 @@
 use crate::model_cache;
 use crate::nova_data_dir;
 use crate::settings::Settings;
-use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, ToolCall};
+use crate::threads::{
+    now_ms, render_handoff_context, AgentKind, Item, PromptImage, Thread, ToolCall,
+};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2640,6 +2642,19 @@ impl AcpManager {
 
         let sid = match existing {
             Some(sid) if self.routes.lock().unwrap().contains_key(&sid) => sid,
+            Some(sid) if self.kind == AgentKind::Cursor => {
+                self.push_log(format!(
+                    "[nova] Cursor 跳过 session/load，同步旧会话 {sid} 改为本地历史接力"
+                ));
+                let new_sid = self.new_session_for(&conn, &key, thread_id, &cwd).await?;
+                let state = self.app.state::<AppState>();
+                let mut store = state.store.lock().unwrap();
+                if let Some(thread) = store.get_mut(thread_id) {
+                    thread.acp_session_id = Some(new_sid.clone());
+                }
+                store.save();
+                new_sid
+            }
             Some(sid) => {
                 // 进程重启过：尝试 session/load 恢复上下文。瞬时网络错先重试，避免误丢上下文。
                 self.loading_sessions.lock().unwrap().insert(sid.clone());
@@ -3209,12 +3224,44 @@ impl AcpManager {
         let cancel_epoch = self.cancel_epoch(&thread_id);
         // 上下文接力：跨 agent 切换后的首条消息，把历史注入新 agent
         let handoff = {
+            let cursor_routes = (self.kind == AgentKind::Cursor).then(|| {
+                self.routes
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            });
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
-            let ctx = store
-                .get_mut(&thread_id)
-                .and_then(|t| t.take_handoff_context(self.kind.label()));
-            if ctx.is_some() {
+            let mut consumed_marker = false;
+            let ctx = store.get_mut(&thread_id).and_then(|t| {
+                if let Some(ctx) = t.take_handoff_context(self.kind.label()) {
+                    consumed_marker = true;
+                    return Some(ctx);
+                }
+                let needs_cursor_handoff = if self.kind == AgentKind::Cursor && !t.items.is_empty()
+                {
+                    match (cursor_routes.as_ref(), t.acp_session_id.as_deref()) {
+                        (Some(routes), Some(sid)) => !routes.contains(sid),
+                        (Some(_), None) => true,
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                needs_cursor_handoff
+                .then(|| {
+                    render_handoff_context(
+                        &t.items,
+                        t.plan.as_ref(),
+                        self.kind.label(),
+                        self.kind.label(),
+                    )
+                })
+                .flatten()
+            });
+            if consumed_marker {
                 store.save();
             }
             ctx
@@ -3514,10 +3561,15 @@ impl AcpManager {
         let include_runtime_guidance = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
-            store
-                .get(thread_id)
-                .and_then(|t| t.acp_session_id.as_ref())
-                .is_none()
+            let sid = store.get(thread_id).and_then(|t| t.acp_session_id.clone());
+            drop(store);
+            match sid {
+                Some(sid) if self.kind == AgentKind::Cursor => {
+                    !self.routes.lock().unwrap().contains_key(&sid)
+                }
+                Some(_) => false,
+                None => true,
+            }
         };
         let t_ensure = std::time::Instant::now();
         let mut session_id = self.ensure_session(thread_id).await?;
@@ -4222,14 +4274,22 @@ fn sync_cursor_cli_model_selection(cfg: &mut Value, model: &str) -> bool {
         None => true,
     };
     if needs_params {
-        if !cfg.get("modelParameters").map(|v| v.is_object()).unwrap_or(false) {
+        if !cfg
+            .get("modelParameters")
+            .map(|v| v.is_object())
+            .unwrap_or(false)
+        {
             cfg["modelParameters"] = json!({});
         }
-        cfg["modelParameters"][&base] = params_value;
+        cfg["modelParameters"][&base] = params_value.clone();
         changed = true;
     }
 
-    if cfg.get("model").and_then(|m| m.get("modelId")).and_then(|v| v.as_str()) != Some(base.as_str())
+    if cfg
+        .get("model")
+        .and_then(|m| m.get("modelId"))
+        .and_then(|v| v.as_str())
+        != Some(base.as_str())
     {
         if !cfg.get("model").map(|v| v.is_object()).unwrap_or(false) {
             cfg["model"] = json!({});
@@ -4237,6 +4297,25 @@ fn sync_cursor_cli_model_selection(cfg: &mut Value, model: &str) -> bool {
         cfg["model"]["modelId"] = json!(base);
         cfg["model"]["displayModelId"] = json!(base);
         changed = true;
+    }
+    if !cfg.get("model").map(|v| v.is_object()).unwrap_or(false) {
+        cfg["model"] = json!({});
+    }
+    if cfg["model"].get("parameters") != Some(&params_value) {
+        cfg["model"]["parameters"] = params_value.clone();
+        changed = true;
+    }
+    for stale in [
+        "displayName",
+        "selectedModelVariantId",
+        "variantId",
+        "effort",
+        "fast",
+    ] {
+        if cfg["model"].get(stale).is_some() {
+            cfg["model"].as_object_mut().unwrap().remove(stale);
+            changed = true;
+        }
     }
 
     changed
@@ -4720,6 +4799,11 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
                 "modelId": "grok-4.5",
                 "displayModelId": "grok-4.5",
                 "displayName": "Cursor Grok 4.5 High Fast",
+                "selectedModelVariantId": "grok-4.5-high-fast",
+                "parameters": [
+                    { "id": "effort", "value": "high" },
+                    { "id": "fast", "value": "true" }
+                ],
                 "maxMode": true
             },
             "modelParameters": {
@@ -4757,6 +4841,15 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
                 { "id": "fast", "value": "false" }
             ])
         );
+        assert_eq!(
+            cfg["model"]["parameters"],
+            json!([
+                { "id": "effort", "value": "xhigh" },
+                { "id": "fast", "value": "false" }
+            ])
+        );
+        assert!(cfg["model"].get("displayName").is_none());
+        assert!(cfg["model"].get("selectedModelVariantId").is_none());
         // 已对齐时再写应无改动
         assert!(!sync_cursor_cli_model_selection(&mut cfg, "grok-4.5-xhigh"));
     }
