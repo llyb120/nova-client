@@ -1,0 +1,1374 @@
+import { getVersion } from "@tauri-apps/api/app";
+import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
+import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js";
+import { api } from "../ipc";
+import {
+  checkAndStageUpdate,
+  deleteThreads,
+  enabledAgentKinds,
+  ensureModelOptions,
+  normalizeUnifiedMode,
+  refreshRelayStatus,
+  setState,
+  setTheme,
+  state,
+} from "../store";
+import { agentLabel, isScratch } from "../utils";
+import { ModelPicker } from "./ConfigSelects";
+import { IconX } from "./icons";
+import type { AgentKind, CliStatus, PxpipeServiceStatus, Settings, WorktreeRecord } from "../types";
+
+function threadGroupName(cwd: string): string {
+  if (isScratch(cwd)) return "临时会话";
+  return cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd;
+}
+
+const DEFAULT_RELAY_SERVER = "";
+const DEFAULT_CLAUDECODE_ARGS = "-y @zed-industries/claude-code-acp";
+const DEFAULT_PXPIPE_MODELS = "gpt-5.5";
+
+/** 统一会话模式（与 store.UNIFIED_MODES 一致，带说明文案） */
+const UNIFIED_MODE_OPTIONS = [
+  { id: "build", name: "Build（放开全部权限，自动执行）" },
+  { id: "plan", name: "Plan（只规划不执行）" },
+];
+
+/** 后端代理输入框（每个后端进程可单独走代理） */
+function ProxyField(props: { value: string; onInput: (v: string) => void }) {
+  return (
+    <label class="field">
+      <span class="field-label">代理</span>
+      <input
+        class="field-input"
+        value={props.value}
+        onInput={(e) => props.onInput(e.currentTarget.value)}
+        placeholder="http://127.0.0.1:10808"
+      />
+      <span class="field-hint">
+        只影响该后端进程（注入 HTTP(S)_PROXY 环境变量）。留空 = 不代理；填
+        127.0.0.1:10808 按 http 代理处理。
+      </span>
+    </label>
+  );
+}
+
+function CliManager(props: {
+  status?: CliStatus;
+  loading: boolean;
+  busy: boolean;
+  upgrading: boolean;
+  message?: string;
+  onUpgrade: () => void;
+}) {
+  return (
+    <div class="cli-manager">
+      <div class="cli-manager-info">
+        <span class="field-label">对应 CLI</span>
+        <span class="cli-manager-name">{props.status?.cliName ?? "检测中…"}</span>
+        <span
+          classList={{
+            "cli-manager-version": true,
+            missing: props.status?.installed === false,
+          }}
+          title={props.status?.detail || ""}
+        >
+          {props.loading ? "正在读取版本…" : (props.status?.version ?? "尚未检测")}
+        </span>
+      </div>
+      <button
+        type="button"
+        class="btn secondary cli-upgrade-btn"
+        disabled={props.loading || props.busy || props.status?.upgradeSupported !== true}
+        onClick={props.onUpgrade}
+      >
+        {props.upgrading ? "升级中…" : "一键升级"}
+      </button>
+      <Show when={props.message}>
+        <span class={`cli-manager-message ${props.message?.startsWith("升级失败") ? "bad" : "ok"}`}>
+          {props.message}
+        </span>
+      </Show>
+    </div>
+  );
+}
+
+type SettingsTab = "general" | "backends" | "appearance" | "team" | "memory" | "worktree" | "about";
+
+const TABS: { id: SettingsTab; name: string }[] = [
+  { id: "general", name: "通用" },
+  { id: "backends", name: "模型后端" },
+  { id: "appearance", name: "外观" },
+  { id: "team", name: "团队" },
+  { id: "memory", name: "记忆检索" },
+  { id: "worktree", name: "Worktree" },
+  { id: "about", name: "关于" },
+];
+
+export function SettingsModal(props: { onClose: () => void }) {
+  const s = state.settings;
+  const [tab, setTab] = createSignal<SettingsTab>("general");
+  const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
+  const [acpArgs, setAcpArgs] = createSignal(s?.acpArgs ?? "acp");
+  const [codebuddyPath, setCodebuddyPath] = createSignal(s?.codebuddyPath ?? "codebuddy");
+  const [codebuddyArgs, setCodebuddyArgs] = createSignal(s?.codebuddyArgs ?? "--acp");
+  const [claudecodePath, setClaudecodePath] = createSignal(s?.claudecodePath ?? "npx");
+  const [claudecodeArgs, setClaudecodeArgs] = createSignal(
+    s?.claudecodeArgs ?? DEFAULT_CLAUDECODE_ARGS,
+  );
+  const [cursorPath, setCursorPath] = createSignal(s?.cursorPath ?? "cursor-agent");
+  const [cursorArgs, setCursorArgs] = createSignal(s?.cursorArgs ?? "acp");
+  const [opencodePath, setOpencodePath] = createSignal(s?.opencodePath ?? "opencode");
+  const [opencodeArgs, setOpencodeArgs] = createSignal(s?.opencodeArgs ?? "acp");
+  const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
+  const [codexArgs, setCodexArgs] = createSignal(s?.codexArgs ?? "app-server --stdio");
+  const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
+  const [pxpipeExperimental, setPxpipeExperimental] = createSignal(
+    s?.pxpipeExperimental ?? false,
+  );
+  const [pxpipeModels, setPxpipeModels] = createSignal(s?.pxpipeModels ?? DEFAULT_PXPIPE_MODELS);
+  const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
+  const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
+  const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
+  const [cursorProxy, setCursorProxy] = createSignal(s?.cursorProxy ?? "");
+  const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
+  const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
+  const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
+  const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
+  const [claudecodeEnabled, setClaudecodeEnabled] = createSignal(s?.claudecodeEnabled !== false);
+  const [cursorEnabled, setCursorEnabled] = createSignal(s?.cursorEnabled !== false);
+  const [opencodeEnabled, setOpencodeEnabled] = createSignal(s?.opencodeEnabled !== false);
+  // 旧值（bypass 等）归一到统一模式 build/plan
+  const [defaultMode, setDefaultMode] = createSignal(
+    normalizeUnifiedMode(s?.defaultMode) ?? s?.defaultMode ?? "",
+  );
+  const [titleAgent, setTitleAgent] = createSignal<AgentKind>(
+    (s?.titleModelAgent as AgentKind) || "devin",
+  );
+  const [titleModel, setTitleModel] = createSignal(s?.titleModel ?? "swe-1-6");
+  const [shareAgent, setShareAgent] = createSignal<AgentKind>(
+    (s?.shareModelAgent as AgentKind) || "devin",
+  );
+  const [shareModel, setShareModel] = createSignal(s?.shareModel ?? "swe-1.6");
+  const [editor, setEditor] = createSignal(s?.editor ?? "code");
+  // server 留空回退默认地址；这里也预填，避免误存成空导致团队/漫游被静默关闭
+  const [relayServer, setRelayServer] = createSignal(s?.relayServer || DEFAULT_RELAY_SERVER);
+  const [relayToken, setRelayToken] = createSignal(s?.relayToken ?? "");
+  const [relayGroups, setRelayGroups] = createSignal(s?.relayGroups ?? "");
+  const [relayName, setRelayName] = createSignal(s?.relayName ?? "");
+  const [verifying, setVerifying] = createSignal(false);
+  const [verifyMsg, setVerifyMsg] = createSignal("");
+  const [showLogs, setShowLogs] = createSignal(false);
+  const [saving, setSaving] = createSignal(false);
+  const [restarting, setRestarting] = createSignal(false);
+  const [restartMsg, setRestartMsg] = createSignal("");
+  const [pxpipeBusy, setPxpipeBusy] = createSignal(false);
+  const [pxpipeStatus, setPxpipeStatus] = createSignal<PxpipeServiceStatus | null>(null);
+  const [pxpipeMsg, setPxpipeMsg] = createSignal("");
+  const [cliStatuses, setCliStatuses] = createSignal<Partial<Record<AgentKind, CliStatus>>>({});
+  const [cliLoading, setCliLoading] = createSignal(false);
+  const [upgradingCli, setUpgradingCli] = createSignal<AgentKind | null>(null);
+  const [cliMessages, setCliMessages] = createSignal<Partial<Record<AgentKind, string>>>({});
+
+  const restartAgents = async () => {
+    setRestarting(true);
+    setRestartMsg("");
+    try {
+      await api.restartDevin();
+      setRestartMsg("已重启所有 agent 进程");
+      setTimeout(() => setRestartMsg(""), 4000);
+    } catch (e) {
+      setRestartMsg(`重启失败：${String(e)}`);
+    } finally {
+      setRestarting(false);
+    }
+  };
+
+  // 至少保留一个启用的后端：是最后一个时不允许关闭
+  const enabledCount = () =>
+    [
+      devinEnabled(),
+      codexEnabled(),
+      codebuddyEnabled(),
+      claudecodeEnabled(),
+      cursorEnabled(),
+      opencodeEnabled(),
+    ].filter(Boolean).length;
+
+  // 后端可用性检测结果：false = 已检测且未找到 CLI（卡片上提示，仍可手动改路径）
+  const backendMissing = (kind: string) => state.backendAvailability[kind] === false;
+
+  const verifyRelay = async () => {
+    setVerifying(true);
+    setVerifyMsg("");
+    try {
+      const online = await api.verifyRelay(
+        relayServer().trim(),
+        relayToken().trim(),
+        relayGroups().trim(),
+      );
+      setVerifyMsg(`连接正常 ✓ 本群组在线 ${online} 人`);
+    } catch (e) {
+      setVerifyMsg(`✗ ${String(e)}`);
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  // 版本与更新
+  const [version, setVersion] = createSignal("");
+  const [checking, setChecking] = createSignal(false);
+  const [checkResult, setCheckResult] = createSignal("");
+  onMount(() => void getVersion().then(setVersion));
+  const checkNow = async () => {
+    setChecking(true);
+    setCheckResult("");
+    try {
+      setCheckResult(await checkAndStageUpdate());
+    } catch (e) {
+      setCheckResult(String(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const draftSettings = (): Settings => ({
+    devinPath: devinPath().trim() || "devin",
+    acpArgs: acpArgs().trim() || "acp",
+    codebuddyPath: codebuddyPath().trim() || "codebuddy",
+    codebuddyArgs: codebuddyArgs().trim() || "--acp",
+    claudecodePath: claudecodePath().trim() || "npx",
+    claudecodeArgs: claudecodeArgs().trim() || DEFAULT_CLAUDECODE_ARGS,
+    cursorPath: cursorPath().trim() || "cursor-agent",
+    cursorArgs: cursorArgs().trim() || "acp",
+    opencodePath: opencodePath().trim() || "opencode",
+    opencodeArgs: opencodeArgs().trim() || "acp",
+    codexPath: codexPath().trim() || "codex",
+    codexArgs: codexArgs().trim() || "app-server --stdio",
+    codexProxy: codexProxy().trim(),
+    pxpipeExperimental: pxpipeExperimental(),
+    pxpipeModels: pxpipeModels().trim(),
+    devinProxy: devinProxy().trim(),
+    codebuddyProxy: codebuddyProxy().trim(),
+    claudecodeProxy: claudecodeProxy().trim(),
+    cursorProxy: cursorProxy().trim(),
+    opencodeProxy: opencodeProxy().trim(),
+    defaultMode: defaultMode(),
+    titleModelAgent: titleAgent(),
+    titleModel: titleModel().trim(),
+    shareModelAgent: shareAgent(),
+    shareModel: shareModel().trim(),
+    editor: editor().trim() || "code",
+    theme: state.theme,
+    relayServer: relayServer().trim(),
+    relayToken: relayToken().trim(),
+    relayGroups: relayGroups().trim(),
+    relayName: relayName().trim(),
+    devinEnabled: devinEnabled(),
+    codexEnabled: codexEnabled(),
+    codebuddyEnabled: codebuddyEnabled(),
+    claudecodeEnabled: claudecodeEnabled(),
+    cursorEnabled: cursorEnabled(),
+    opencodeEnabled: opencodeEnabled(),
+    worktreeDir: worktreeDir().trim(),
+    semanticEnabled: semanticEnabled(),
+    embedEndpoint: embedEndpoint().trim(),
+    embedModel: embedModel().trim(),
+    embedApiKey: embedApiKey().trim(),
+  });
+
+  const refreshCliStatuses = async () => {
+    setCliLoading(true);
+    try {
+      const statuses = await api.getCliStatuses(draftSettings());
+      const next: Partial<Record<AgentKind, CliStatus>> = {};
+      for (const status of statuses) next[status.agentKind] = status;
+      setCliStatuses(next);
+    } finally {
+      setCliLoading(false);
+    }
+  };
+
+  const upgradeCli = async (kind: AgentKind) => {
+    setUpgradingCli(kind);
+    setCliMessages((prev) => ({ ...prev, [kind]: "" }));
+    try {
+      const status = await api.upgradeCli(kind, draftSettings());
+      setCliStatuses((prev) => ({ ...prev, [kind]: status }));
+      setCliMessages((prev) => ({ ...prev, [kind]: `已更新到 ${status.version}` }));
+    } catch (e) {
+      setCliMessages((prev) => ({ ...prev, [kind]: `升级失败：${String(e)}` }));
+    } finally {
+      setUpgradingCli(null);
+    }
+  };
+
+  let cliStatusesLoaded = false;
+  createEffect(() => {
+    if (tab() === "backends" && !cliStatusesLoaded) {
+      cliStatusesLoaded = true;
+      void refreshCliStatuses();
+    }
+  });
+
+  const refreshPxpipeStatus = async () => {
+    setPxpipeBusy(true);
+    setPxpipeMsg("");
+    try {
+      setPxpipeStatus(await api.getPxpipeServiceStatus(draftSettings()));
+    } catch (e) {
+      setPxpipeMsg(`状态读取失败：${String(e)}`);
+    } finally {
+      setPxpipeBusy(false);
+    }
+  };
+
+  const restartPxpipe = async () => {
+    setPxpipeBusy(true);
+    setPxpipeMsg("");
+    try {
+      setPxpipeStatus(await api.restartPxpipeService(draftSettings()));
+      setPxpipeMsg("pxpipe 已重启");
+    } catch (e) {
+      setPxpipeMsg(`重启失败：${String(e)}`);
+    } finally {
+      setPxpipeBusy(false);
+    }
+  };
+
+  onMount(() => {
+    if (pxpipeExperimental()) void refreshPxpipeStatus();
+  });
+
+  // 会话批量管理
+  const [managing, setManaging] = createSignal(false);
+  const [sel, setSel] = createSignal<Record<string, boolean>>({});
+  const [deleting, setDeleting] = createSignal(false);
+  const deletable = createMemo(() => state.threads.filter((t) => !state.running[t.id]));
+  const selectedIds = createMemo(() =>
+    deletable()
+      .filter((t) => sel()[t.id])
+      .map((t) => t.id),
+  );
+  const allSelected = createMemo(
+    () => deletable().length > 0 && deletable().every((t) => sel()[t.id]),
+  );
+  const toggleAll = () => {
+    const on = !allSelected();
+    const next: Record<string, boolean> = {};
+    if (on) for (const t of deletable()) next[t.id] = true;
+    setSel(next);
+  };
+  const removeSelected = async () => {
+    const ids = selectedIds();
+    if (ids.length === 0) return;
+    const ok = await confirm(`删除选中的 ${ids.length} 个会话？聊天记录将一并删除。`, {
+      title: "批量删除会话",
+      kind: "warning",
+    });
+    if (!ok) return;
+    setDeleting(true);
+    try {
+      await deleteThreads(ids);
+      setSel({});
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  // 统一模式：全后端只有 Build / Plan 两种（Rust 侧翻译成各后端真实模式 id）
+  const modes = () => UNIFIED_MODE_OPTIONS;
+
+  // worktree 管理
+  const [worktreeDir, setWorktreeDir] = createSignal(s?.worktreeDir ?? "");
+  const [semanticEnabled, setSemanticEnabled] = createSignal(s?.semanticEnabled ?? false);
+  const [embedEndpoint, setEmbedEndpoint] = createSignal(s?.embedEndpoint ?? "http://localhost:11434");
+  const [embedModel, setEmbedModel] = createSignal(s?.embedModel ?? "bge-m3");
+  const [embedApiKey, setEmbedApiKey] = createSignal(s?.embedApiKey ?? "");
+  const [embedBusy, setEmbedBusy] = createSignal(false);
+  const [embedMsg, setEmbedMsg] = createSignal("");
+  const persistEmbed = async () => {
+    const cur = await api.getSettings();
+    const next: Settings = {
+      ...cur,
+      semanticEnabled: semanticEnabled(),
+      embedEndpoint: embedEndpoint().trim(),
+      embedModel: embedModel().trim(),
+      embedApiKey: embedApiKey().trim(),
+    };
+    await api.setSettings(next);
+    setState("settings", next);
+  };
+  const testEmbed = async () => {
+    setEmbedBusy(true);
+    setEmbedMsg("正在连接…");
+    try {
+      await persistEmbed();
+      const r = await api.semanticStatus();
+      setEmbedMsg(`连接成功，向量维度 ${r.dim}。`);
+    } catch (e) {
+      setEmbedMsg(`连接失败：${String(e)}`);
+    } finally {
+      setEmbedBusy(false);
+    }
+  };
+  const pullModel = async () => {
+    const m = embedModel().trim();
+    if (!m) {
+      setEmbedMsg("请先填写模型名。");
+      return;
+    }
+    setEmbedBusy(true);
+    setEmbedMsg(`正在下载模型 ${m}…（体积较大，请耐心等待，勿关闭）`);
+    try {
+      await persistEmbed();
+      await api.semanticPull(m);
+      setEmbedMsg("模型下载完成，可点「测试连接」验证。");
+    } catch (e) {
+      setEmbedMsg(`下载失败：${String(e)}`);
+    } finally {
+      setEmbedBusy(false);
+    }
+  };
+  const [worktrees, setWorktrees] = createSignal<WorktreeRecord[]>([]);
+  const [wtLoading, setWtLoading] = createSignal(false);
+  const [wtDelBranch, setWtDelBranch] = createSignal<Record<string, boolean>>({});
+  const refreshWorktrees = async () => {
+    setWtLoading(true);
+    try {
+      setWorktrees(await api.listWorktrees());
+    } finally {
+      setWtLoading(false);
+    }
+  };
+  // 进入 Worktree 页时拉取一次列表
+  createEffect(() => {
+    if (tab() === "worktree") void refreshWorktrees();
+  });
+  const pickWorktreeDir = async () => {
+    const dir = await openDialog({ directory: true, title: "选择 worktree 根目录" });
+    if (typeof dir === "string" && dir) setWorktreeDir(dir);
+  };
+  const removeWt = async (w: WorktreeRecord) => {
+    // 直接检出用户已有分支的 worktree 没有「删分支」可言（后端也会强制忽略）
+    const del = !!wtDelBranch()[w.id] && w.ownedBranch !== false;
+    const ok = await confirm(
+      del
+        ? `移除 worktree「${w.branch}」并删除该分支？分支上未合并/未推送的提交会一并丢失，属于该目录的会话历史也会一起删除。`
+        : `移除 worktree「${w.branch}」的工作目录？分支保留，未提交的改动会丢弃，属于该目录的会话历史也会一起删除。`,
+      { title: "移除 worktree", kind: "warning" },
+    );
+    if (!ok) return;
+    try {
+      await api.removeWorktree(w.id, del);
+    } catch (e) {
+      await message(String(e), { kind: "error" });
+    } finally {
+      await refreshWorktrees();
+    }
+  };
+
+  const save = async () => {
+    setSaving(true);
+    const settings = draftSettings();
+    try {
+      await api.setSettings(settings);
+      setState("settings", settings);
+      // 中转站配置可能变化，稍后刷新连接状态
+      setTimeout(() => void refreshRelayStatus(), 800);
+      props.onClose();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div class="modal-backdrop">
+      <div class="modal settings-modal">
+        <div class="modal-head">
+          <span>设置</span>
+          <button class="icon-btn" onClick={props.onClose}>
+            <IconX size={16} />
+          </button>
+        </div>
+
+        <div class="settings-tabs">
+          <For each={TABS}>
+            {(t) => (
+              <button
+                type="button"
+                classList={{ "settings-tab": true, active: tab() === t.id }}
+                onClick={() => setTab(t.id)}
+              >
+                {t.name}
+              </button>
+            )}
+          </For>
+        </div>
+
+        <div class="modal-body">
+          {/* ===== 通用 ===== */}
+          <Show when={tab() === "general"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">会话</h3>
+              <label class="field">
+                <span class="field-label">新会话默认模式</span>
+                <select
+                  class="field-input"
+                  value={defaultMode()}
+                  onChange={(e) => setDefaultMode(e.currentTarget.value)}
+                >
+                  <option value="">跟随 agent 默认</option>
+                  <For each={modes()}>{(m) => <option value={m.id}>{m.name}</option>}</For>
+                </select>
+                <span class="field-hint">
+                  新建会话未手动选择模式时使用。Build 等价原 Bypass Permissions（全部自动批准）。
+                </span>
+              </label>
+
+              <label class="field">
+                <span class="field-label">编辑器命令</span>
+                <input
+                  class="field-input"
+                  value={editor()}
+                  onInput={(e) => setEditor(e.currentTarget.value)}
+                  placeholder="code"
+                />
+                <span class="field-hint">
+                  点击文件路径时用它打开，如 cursor / code / zed / windsurf（需在
+                  PATH 中）。正式项目会连同项目目录一起打开，临时会话只打开文件。
+                </span>
+              </label>
+
+              <label class="field setting-check">
+                <input
+                  type="checkbox"
+                  checked={pxpipeExperimental()}
+                  onChange={(e) => {
+                    setPxpipeExperimental(e.currentTarget.checked);
+                    if (e.currentTarget.checked) {
+                      setTimeout(() => void refreshPxpipeStatus(), 0);
+                    } else {
+                      setPxpipeStatus(null);
+                      setPxpipeMsg("");
+                    }
+                  }}
+                />
+                <span>
+                  <span class="field-label">实验模式：图片化上下文</span>
+                  <span class="field-hint">
+                    对 agent 内部发往 Anthropic/OpenAI 的大段 system prompt、工具说明和旧历史启用
+                    pxpipe。模型不支持时透传，前台仍显示原文字。
+                  </span>
+                </span>
+              </label>
+
+              <Show when={pxpipeExperimental()}>
+                <div class="field inline-action-field">
+                  <label class="field">
+                    <span class="field-label">额外生效模型</span>
+                    <input
+                      class="field-input"
+                      value={pxpipeModels()}
+                      onInput={(e) => setPxpipeModels(e.currentTarget.value)}
+                      placeholder={DEFAULT_PXPIPE_MODELS}
+                    />
+                    <span class="field-hint">
+                      逗号或空格分隔。pxpipe 默认已有 claude-fable-5、gpt-5.6，这里用于追加
+                      gpt-5.5 等模型。
+                    </span>
+                  </label>
+                  <span class="field-label">pxpipe 服务</span>
+                  <span class="field-hint">
+                    {pxpipeStatus()?.message ?? "当前没有状态。pxpipe 会在下一次 agent 请求时启动。"}
+                  </span>
+                  <Show when={pxpipeStatus()?.instances.length}>
+                    <span class="field-hint">
+                      {pxpipeStatus()!
+                        .instances.map((p) => `${p.url} · PID ${p.pid} · ${p.message}`)
+                        .join("；")}
+                    </span>
+                    <span class="field-hint">
+                      {pxpipeStatus()!
+                        .instances.map(
+                          (p) =>
+                            `OpenAI ${p.openaiUpstream} · Anthropic ${p.anthropicUpstream} · 代理 ${p.proxy}`,
+                        )
+                        .join("；")}
+                    </span>
+                    <span class="field-hint">
+                      {pxpipeStatus()!
+                        .instances.map((p) => `生效模型 ${p.models}`)
+                        .join("；")}
+                    </span>
+                  </Show>
+                  <div class="inline-actions">
+                    <button
+                      class="link-btn"
+                      disabled={pxpipeBusy()}
+                      onClick={() => void refreshPxpipeStatus()}
+                    >
+                      {pxpipeBusy() ? "处理中…" : "刷新状态"}
+                    </button>
+                    <button
+                      class="link-btn"
+                      disabled={pxpipeBusy()}
+                      onClick={() => void restartPxpipe()}
+                    >
+                      重启 pxpipe
+                    </button>
+                  </div>
+                  <Show when={pxpipeMsg()}>
+                    <span class="field-hint">{pxpipeMsg()}</span>
+                  </Show>
+                </div>
+              </Show>
+
+            </section>
+
+            <section class="settings-group">
+              <h3 class="settings-group-title">标题与分享模型</h3>
+              <p class="settings-group-desc">
+                与新建会话同款的模型选择器，可任选任意已启用后端下的模型，不再限定
+                Devin。
+              </p>
+              <div class="field">
+                <span class="field-label">标题生成模型</span>
+                <ModelPicker
+                  agentKind={titleAgent()}
+                  agentKinds={enabledAgentKinds()}
+                  model={titleModel()}
+                  onPickModel={(a, m) => {
+                    setTitleAgent(a);
+                    setTitleModel(m);
+                  }}
+                  prefix="标题模型"
+                  title="标题生成模型"
+                  portal
+                />
+                <span class="field-hint">
+                  自动为新会话生成标题时所用的轻量模型。标题统一在所选后端生成；选
+                  Codex 或该后端不可用时，自动回退到会话所在后端。
+                </span>
+              </div>
+
+              <div class="field">
+                <span class="field-label">高级分享处理模型</span>
+                <ModelPicker
+                  agentKind={shareAgent()}
+                  agentKinds={enabledAgentKinds()}
+                  model={shareModel()}
+                  onPickModel={(a, m) => {
+                    setShareAgent(a);
+                    setShareModel(m);
+                  }}
+                  prefix="分享模型"
+                  title="高级分享处理模型"
+                  portal
+                />
+                <span class="field-hint">
+                  高级分享「按提示词处理/总结会话」时的默认后端与模型。分享时仍可临时改选。
+                </span>
+              </div>
+            </section>
+
+            <section class="settings-group">
+              <h3 class="settings-group-title">更新</h3>
+              <div class="field">
+                <span class="field-label">自动升级</span>
+                <span class="field-hint">
+                  新版本会在后台自动下载好，并在空闲时间（没有任何会话或任务在运行）弹窗提示你选择是否现在更新，不会强制静默重启。
+                </span>
+              </div>
+            </section>
+          </Show>
+
+          {/* ===== 模型后端 ===== */}
+          <Show when={tab() === "backends"}>
+            <p class="field-hint">
+              每个后端可单独启用/关闭并配置启动方式。关闭的后端不会出现在新建/切换会话的后端列表里（历史会话仍可打开查看）。
+            </p>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class={`agent-badge devin`}>{agentLabel("devin")}</span>
+                <Show when={backendMissing("devin")}>
+                  <span class="backend-missing">未检测到 CLI</span>
+                </Show>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={devinEnabled()}
+                    disabled={devinEnabled() && enabledCount() === 1}
+                    onChange={(e) => setDevinEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager
+                status={cliStatuses().devin}
+                loading={cliLoading()}
+                busy={upgradingCli() !== null}
+                upgrading={upgradingCli() === "devin"}
+                message={cliMessages().devin}
+                onUpgrade={() => void upgradeCli("devin")}
+              />
+              <label class="field">
+                <span class="field-label">可执行文件</span>
+                <input
+                  class="field-input"
+                  value={devinPath()}
+                  onInput={(e) => setDevinPath(e.currentTarget.value)}
+                  placeholder="devin"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">启动参数（ACP）</span>
+                <input
+                  class="field-input"
+                  value={acpArgs()}
+                  onInput={(e) => setAcpArgs(e.currentTarget.value)}
+                  placeholder="acp"
+                />
+                <span class="field-hint">
+                  也可换成任何支持 ACP 的 agent。如 Claude：可执行文件 npx，参数
+                  -y @zed-industries/claude-code-acp
+                </span>
+              </label>
+              <ProxyField value={devinProxy()} onInput={setDevinProxy} />
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class={`agent-badge codebuddy`}>{agentLabel("codebuddy")}</span>
+                <Show when={backendMissing("codebuddy")}>
+                  <span class="backend-missing">未检测到 CLI</span>
+                </Show>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={codebuddyEnabled()}
+                    disabled={codebuddyEnabled() && enabledCount() === 1}
+                    onChange={(e) => setCodebuddyEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager
+                status={cliStatuses().codebuddy}
+                loading={cliLoading()}
+                busy={upgradingCli() !== null}
+                upgrading={upgradingCli() === "codebuddy"}
+                message={cliMessages().codebuddy}
+                onUpgrade={() => void upgradeCli("codebuddy")}
+              />
+              <label class="field">
+                <span class="field-label">可执行文件</span>
+                <input
+                  class="field-input"
+                  value={codebuddyPath()}
+                  onInput={(e) => setCodebuddyPath(e.currentTarget.value)}
+                  placeholder="codebuddy"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">启动参数</span>
+                <input
+                  class="field-input"
+                  value={codebuddyArgs()}
+                  onInput={(e) => setCodebuddyArgs(e.currentTarget.value)}
+                  placeholder="--acp"
+                />
+                <span class="field-hint">
+                  腾讯云代码助手（ACP）。默认用已安装的 codebuddy --acp；未安装可改为可执行文件
+                  npx，参数 -y @tencent-ai/codebuddy-code@latest --acp。
+                </span>
+              </label>
+              <ProxyField value={codebuddyProxy()} onInput={setCodebuddyProxy} />
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class={`agent-badge claudecode`}>{agentLabel("claudecode")}</span>
+                <Show when={backendMissing("claudecode")}>
+                  <span class="backend-missing">未检测到 CLI</span>
+                </Show>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={claudecodeEnabled()}
+                    disabled={claudecodeEnabled() && enabledCount() === 1}
+                    onChange={(e) => setClaudecodeEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager
+                status={cliStatuses().claudecode}
+                loading={cliLoading()}
+                busy={upgradingCli() !== null}
+                upgrading={upgradingCli() === "claudecode"}
+                message={cliMessages().claudecode}
+                onUpgrade={() => void upgradeCli("claudecode")}
+              />
+              <label class="field">
+                <span class="field-label">可执行文件</span>
+                <input
+                  class="field-input"
+                  value={claudecodePath()}
+                  onInput={(e) => setClaudecodePath(e.currentTarget.value)}
+                  placeholder="npx"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">启动参数</span>
+                <input
+                  class="field-input"
+                  value={claudecodeArgs()}
+                  onInput={(e) => setClaudecodeArgs(e.currentTarget.value)}
+                  placeholder={DEFAULT_CLAUDECODE_ARGS}
+                />
+                <span class="field-hint">
+                  Claude Code（ACP）。默认用 npx -y 免确认拉起 @zed-industries/claude-code-acp；
+                  需先在环境里配置好 Claude（如 ANTHROPIC_API_KEY 或已登录的 claude CLI）。
+                </span>
+              </label>
+              <ProxyField value={claudecodeProxy()} onInput={setClaudecodeProxy} />
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class={`agent-badge codex`}>{agentLabel("codex")}</span>
+                <Show when={backendMissing("codex")}>
+                  <span class="backend-missing">未检测到 CLI</span>
+                </Show>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={codexEnabled()}
+                    disabled={codexEnabled() && enabledCount() === 1}
+                    onChange={(e) => setCodexEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager
+                status={cliStatuses().codex}
+                loading={cliLoading()}
+                busy={upgradingCli() !== null}
+                upgrading={upgradingCli() === "codex"}
+                message={cliMessages().codex}
+                onUpgrade={() => void upgradeCli("codex")}
+              />
+              <label class="field">
+                <span class="field-label">可执行文件</span>
+                <input
+                  class="field-input"
+                  value={codexPath()}
+                  onInput={(e) => setCodexPath(e.currentTarget.value)}
+                  placeholder="codex"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">app-server 参数</span>
+                <input
+                  class="field-input"
+                  value={codexArgs()}
+                  onInput={(e) => setCodexArgs(e.currentTarget.value)}
+                  placeholder="app-server --stdio"
+                />
+              </label>
+              <ProxyField value={codexProxy()} onInput={setCodexProxy} />
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class={`agent-badge cursor`}>{agentLabel("cursor")}</span>
+                <Show when={backendMissing("cursor")}>
+                  <span class="backend-missing">未检测到 CLI</span>
+                </Show>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={cursorEnabled()}
+                    disabled={cursorEnabled() && enabledCount() === 1}
+                    onChange={(e) => setCursorEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager
+                status={cliStatuses().cursor}
+                loading={cliLoading()}
+                busy={upgradingCli() !== null}
+                upgrading={upgradingCli() === "cursor"}
+                message={cliMessages().cursor}
+                onUpgrade={() => void upgradeCli("cursor")}
+              />
+              <label class="field">
+                <span class="field-label">可执行文件</span>
+                <input
+                  class="field-input"
+                  value={cursorPath()}
+                  onInput={(e) => setCursorPath(e.currentTarget.value)}
+                  placeholder="cursor-agent"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">启动参数</span>
+                <input
+                  class="field-input"
+                  value={cursorArgs()}
+                  onInput={(e) => setCursorArgs(e.currentTarget.value)}
+                  placeholder="acp"
+                />
+                <span class="field-hint">
+                  Cursor CLI（ACP）。需已安装并登录 cursor-agent（cursor-agent login）；
+                  新版 CLI 命令若为 agent，把可执行文件改成 agent 即可。
+                  每次拉起进程前会自动确保其 Max Mode 处于关闭（避免高额计费）。
+                </span>
+              </label>
+              <ProxyField value={cursorProxy()} onInput={setCursorProxy} />
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class={`agent-badge opencode`}>{agentLabel("opencode")}</span>
+                <Show when={backendMissing("opencode")}>
+                  <span class="backend-missing">未检测到 CLI</span>
+                </Show>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={opencodeEnabled()}
+                    disabled={opencodeEnabled() && enabledCount() === 1}
+                    onChange={(e) => setOpencodeEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager
+                status={cliStatuses().opencode}
+                loading={cliLoading()}
+                busy={upgradingCli() !== null}
+                upgrading={upgradingCli() === "opencode"}
+                message={cliMessages().opencode}
+                onUpgrade={() => void upgradeCli("opencode")}
+              />
+              <label class="field">
+                <span class="field-label">可执行文件</span>
+                <input
+                  class="field-input"
+                  value={opencodePath()}
+                  onInput={(e) => setOpencodePath(e.currentTarget.value)}
+                  placeholder="opencode"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">启动参数</span>
+                <input
+                  class="field-input"
+                  value={opencodeArgs()}
+                  onInput={(e) => setOpencodeArgs(e.currentTarget.value)}
+                  placeholder="acp"
+                />
+                <span class="field-hint">
+                  OpenCode（ACP）。需已安装 opencode CLI（npm i -g opencode-ai
+                  或官方安装脚本）并配置好模型/凭据。
+                </span>
+              </label>
+              <ProxyField value={opencodeProxy()} onInput={setOpencodeProxy} />
+            </div>
+
+            <p class="field-hint">
+              修改可执行文件/启动参数会重启对应 agent 进程，进行中的会话将被打断（上下文下次发消息时自动恢复）。
+              未检测到 CLI 的后端不会出现在新建会话的后端列表里（保存后会自动重新检测）。
+            </p>
+            <div class="field">
+              <button
+                class="btn secondary"
+                style={{ "align-self": "flex-start" }}
+                disabled={restarting()}
+                onClick={() => void restartAgents()}
+              >
+                {restarting() ? "重启中…" : "重启所有 agent 进程"}
+              </button>
+              <Show when={restartMsg()}>
+                <span class={`relay-verify ${restartMsg().startsWith("重启失败") ? "bad" : "ok"}`}>
+                  {restartMsg()}
+                </span>
+              </Show>
+              <p class="field-hint">
+                任务卡死（如后端网络重试不止）时使用：所有运行中的轮次会立即结束，会话上下文下次发消息时自动恢复。
+              </p>
+            </div>
+          </Show>
+
+          {/* ===== 外观 ===== */}
+          <Show when={tab() === "appearance"}>
+            <div class="field">
+              <span class="field-label">界面主题</span>
+              <div class="theme-seg">
+                <button
+                  type="button"
+                  classList={{ "theme-seg-btn": true, active: state.theme === "ink-light" }}
+                  onClick={() => setTheme("ink-light")}
+                >
+                  <span class="theme-swatch light" />
+                  云白 · 亮色
+                </button>
+                <button
+                  type="button"
+                  classList={{ "theme-seg-btn": true, active: state.theme === "ink-dark" }}
+                  onClick={() => setTheme("ink-dark")}
+                >
+                  <span class="theme-swatch dark" />
+                  苍穹 · 暗色
+                </button>
+              </div>
+              <span class="field-hint">明暗两套主题互为镜像、即点即换，选择会自动记住。</span>
+            </div>
+          </Show>
+
+          {/* ===== 团队 ===== */}
+          <Show when={tab() === "team"}>
+            <div class="field">
+              <span class="field-label">
+                团队 / 漫游中转站
+                <Show when={state.settings?.relayToken}>
+                  <span class={`relay-state ${state.relay.connected ? "on" : "off"}`}>
+                    {state.relay.connected ? "已连接" : "未连接"}
+                  </span>
+                </Show>
+              </span>
+              <input
+                class="field-input"
+                value={relayServer()}
+                onInput={(e) => setRelayServer(e.currentTarget.value)}
+                placeholder={DEFAULT_RELAY_SERVER}
+              />
+              <span class="field-hint">中转服务地址，一般用默认即可（留空也会回退到默认）。</span>
+            </div>
+
+            <label class="field">
+              <span class="field-label">身份 token</span>
+              <div class="relay-token-row">
+                <input
+                  class="field-input"
+                  value={relayToken()}
+                  onInput={(e) => setRelayToken(e.currentTarget.value)}
+                  placeholder="一个长一点的永久随机串，用以区分每个人"
+                />
+                <button
+                  class="btn secondary small"
+                  disabled={verifying() || !relayToken().trim()}
+                  onClick={() => void verifyRelay()}
+                >
+                  {verifying() ? "验证中…" : "验证"}
+                </button>
+              </div>
+              <span class="field-hint">
+                团队成员各自一个永久 token（明文显示便于核对）。<b>填了 token 即开启团队/漫游，清空 token 即关闭。</b>
+              </span>
+              <Show when={verifyMsg()}>
+                <span class={`relay-verify ${verifyMsg().startsWith("✗") ? "bad" : "ok"}`}>
+                  {verifyMsg()}
+                </span>
+              </Show>
+            </label>
+
+            <label class="field">
+              <span class="field-label">群组</span>
+              <input
+                class="field-input"
+                value={relayGroups()}
+                onInput={(e) => setRelayGroups(e.currentTarget.value)}
+                placeholder="如：backend, infra（逗号或空格分隔，可多个）"
+              />
+              <span class="field-hint">
+                只有<b>相同群组</b>的人才能在在线名单里看到彼此、互相分享/漫游；一个人可归属多个群组。<b>留空 = 默认群组</b>（与其他同样未配置群组的人互相可见）。
+              </span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">团队昵称</span>
+              <input
+                class="field-input"
+                value={relayName()}
+                onInput={(e) => setRelayName(e.currentTarget.value)}
+                placeholder="留空则用机器名"
+              />
+              <span class="field-hint">分享、漫游时队友看到的名字。</span>
+            </label>
+          </Show>
+
+          {/* ===== 记忆检索 ===== */}
+          <Show when={tab() === "memory"}>
+            <label
+              class="field"
+              style={{ display: "flex", "flex-direction": "row", "align-items": "center", gap: "8px" }}
+            >
+              <input
+                type="checkbox"
+                checked={semanticEnabled()}
+                onChange={(e) => setSemanticEnabled(e.currentTarget.checked)}
+              />
+              <span>启用语义检索（关闭 = 用内置 BM25 关键词检索，零依赖）</span>
+            </label>
+            <div class="field">
+              <span class="field-hint">
+                语义检索由「外置 embedding 服务」提供：主程序不内置模型、不增加体积。可本地安装 Ollama 后填模型名并点「下载模型」；也可把服务部署在服务器上（Ollama / TEI / vLLM 等，见 docs/embedding-server.md），本地只在下方填服务器地址即可，无需本地部署；还可填任意 OpenAI 兼容的 /v1/embeddings 服务（含云端）。不配置或连不上时自动回退 BM25，员工记忆检索始终可用。
+              </span>
+            </div>
+            <label class="field">
+              <span class="field-label">服务地址</span>
+              <input
+                class="field-input"
+                value={embedEndpoint()}
+                onInput={(e) => setEmbedEndpoint(e.currentTarget.value)}
+                placeholder="http://localhost:11434"
+              />
+              <span class="field-hint">OpenAI 兼容服务的 base 地址（无需带 /v1）。可填本地（Ollama 默认 http://localhost:11434），也可填部署在服务器上的地址（如 http://your-server:11434），本地无需装模型。服务器部署见 docs/embedding-server.md。</span>
+            </label>
+            <label class="field">
+              <span class="field-label">模型名</span>
+              <input
+                class="field-input"
+                value={embedModel()}
+                onInput={(e) => setEmbedModel(e.currentTarget.value)}
+                placeholder="bge-m3 / nomic-embed-text / text-embedding-3-small"
+              />
+              <span class="field-hint">中文/多语言推荐 bge-m3；轻量可用 nomic-embed-text。换模型后向量会自动重建。</span>
+            </label>
+            <label class="field">
+              <span class="field-label">API Key</span>
+              <input
+                class="field-input"
+                type="password"
+                value={embedApiKey()}
+                onInput={(e) => setEmbedApiKey(e.currentTarget.value)}
+                placeholder="本地服务留空；云端填对应 key"
+              />
+            </label>
+            <div class="wt-dir-row">
+              <button class="btn secondary" disabled={embedBusy()} onClick={() => void testEmbed()}>
+                测试连接
+              </button>
+              <button class="btn secondary" disabled={embedBusy()} onClick={() => void pullModel()}>
+                下载模型（Ollama）
+              </button>
+            </div>
+            <Show when={embedMsg()}>
+              <div class="field-hint">{embedMsg()}</div>
+            </Show>
+          </Show>
+
+          {/* ===== Worktree ===== */}
+          <Show when={tab() === "worktree"}>
+            <div class="field">
+              <span class="field-label">worktree 根目录</span>
+              <div class="wt-dir-row">
+                <input
+                  class="field-input"
+                  value={worktreeDir()}
+                  onInput={(e) => setWorktreeDir(e.currentTarget.value)}
+                  placeholder="留空 = 应用数据目录下的 worktrees/"
+                />
+                <button class="btn secondary" onClick={() => void pickWorktreeDir()}>
+                  浏览…
+                </button>
+              </div>
+              <span class="field-hint">
+                会话开启「在 worktree 中执行」时，在此目录下为其创建独立工作目录（每个 worktree 一个子文件夹）。改动仅对之后新建的 worktree 生效。
+              </span>
+            </div>
+
+            <div class="field">
+              <span class="field-label">
+                已创建的 worktree（共 {worktrees().length} 个）
+                <button
+                  class="link-btn"
+                  style={{ "margin-left": "8px" }}
+                  onClick={() => void refreshWorktrees()}
+                >
+                  刷新
+                </button>
+              </span>
+              <span class="field-hint">
+                这些工作目录不随会话删除而自动清理，在此手动移除。移除只影响该 worktree，不动主工作区。
+              </span>
+              <Show
+                when={worktrees().length > 0}
+                fallback={
+                  <div class="sel-empty">{wtLoading() ? "加载中…" : "暂无 worktree"}</div>
+                }
+              >
+                <div class="wt-list">
+                  <For each={worktrees()}>
+                    {(w) => {
+                      const linked = () => state.threads.find((t) => t.id === w.threadId);
+                      return (
+                        <div class="wt-row">
+                          <div class="wt-row-main">
+                            <span class="wt-branch" title={w.branch}>
+                              ⎇ {w.branch}
+                            </span>
+                            <span class="wt-repo" title={w.repo}>
+                              {threadGroupName(w.repo)}
+                            </span>
+                            <Show when={w.roaming}>
+                              <span class="wt-tag">漫游</span>
+                            </Show>
+                          </div>
+                          <div class="wt-row-sub">
+                            <span class="wt-path" title={w.path}>
+                              {w.path}
+                            </span>
+                            <Show
+                              when={linked()}
+                              fallback={<span class="wt-linked dim">无关联会话</span>}
+                            >
+                              <span class="wt-linked" title={linked()!.title}>
+                                {linked()!.title}
+                              </span>
+                            </Show>
+                          </div>
+                          <div class="wt-row-actions">
+                            <Show
+                              when={w.ownedBranch !== false}
+                              fallback={
+                                <span class="wt-delbranch dim" title="该 worktree 直接检出的是已有分支，移除时不会删除分支">
+                                  已有分支
+                                </span>
+                              }
+                            >
+                              <label class="wt-delbranch">
+                                <input
+                                  type="checkbox"
+                                  checked={!!wtDelBranch()[w.id]}
+                                  onChange={(e) =>
+                                    setWtDelBranch({
+                                      ...wtDelBranch(),
+                                      [w.id]: e.currentTarget.checked,
+                                    })
+                                  }
+                                />
+                                同时删分支
+                              </label>
+                            </Show>
+                            <button class="btn danger small" onClick={() => void removeWt(w)}>
+                              移除
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          </Show>
+
+          {/* ===== 关于 ===== */}
+          <Show when={tab() === "about"}>
+            <div class="field">
+              <span class="field-label">版本</span>
+              <div class="version-row">
+                <span>Nova v{version() || "…"}</span>
+                <button class="link-btn" disabled={checking()} onClick={() => void checkNow()}>
+                  {checking() ? "检查中…" : "检查更新"}
+                </button>
+                <Show when={checkResult()}>
+                  <span class="field-hint">{checkResult()}</span>
+                </Show>
+              </div>
+            </div>
+
+            <div class="field">
+              <span class="field-label">会话管理（共 {state.threads.length} 个）</span>
+              <button
+                class="btn secondary"
+                style={{ "align-self": "flex-start" }}
+                onClick={() => setManaging(!managing())}
+              >
+                {managing() ? "收起" : "批量管理会话"}
+              </button>
+              <Show when={managing()}>
+                <div>
+                  <div class="tm-toolbar">
+                    <label>
+                      <input type="checkbox" checked={allSelected()} onChange={toggleAll} />
+                      全选
+                    </label>
+                    <span>已选 {selectedIds().length} 个</span>
+                    <span class="tm-spacer" />
+                    <button
+                      class="btn danger small"
+                      disabled={selectedIds().length === 0 || deleting()}
+                      onClick={() => void removeSelected()}
+                    >
+                      {deleting() ? "删除中…" : "删除选中"}
+                    </button>
+                  </div>
+                  <div class="tm-list">
+                    <For each={state.threads}>
+                      {(t) => {
+                        const running = () => !!state.running[t.id];
+                        return (
+                          <label class={`tm-row ${running() ? "disabled" : ""}`}>
+                            <input
+                              type="checkbox"
+                              disabled={running()}
+                              checked={!!sel()[t.id]}
+                              onChange={(e) =>
+                                setSel({ ...sel(), [t.id]: e.currentTarget.checked })
+                              }
+                            />
+                            <span class="tm-title" title={t.title}>
+                              {t.title}
+                            </span>
+                            <span class={`thread-agent ${t.agentKind}`}>
+                              {agentLabel(t.agentKind)}
+                            </span>
+                            <span class="tm-meta" title={t.cwd}>
+                              {threadGroupName(t.cwd)}
+                            </span>
+                            <Show when={running()}>
+                              <span class="tm-running">运行中</span>
+                            </Show>
+                          </label>
+                        );
+                      }}
+                    </For>
+                    <Show when={state.threads.length === 0}>
+                      <div class="sel-empty">暂无会话</div>
+                    </Show>
+                  </div>
+                </div>
+              </Show>
+            </div>
+
+            <div class="field">
+              <button class="link-btn" onClick={() => setShowLogs(!showLogs())}>
+                {showLogs() ? "隐藏 agent 日志" : `查看 agent 日志（${state.logs.length}）`}
+              </button>
+              <Show when={showLogs()}>
+                <pre class="log-view">
+                  <For each={state.logs.slice(-200)}>{(line) => <div>{line}</div>}</For>
+                </pre>
+              </Show>
+            </div>
+          </Show>
+        </div>
+
+        <div class="modal-foot">
+          <button class="btn secondary" onClick={props.onClose}>
+            取消
+          </button>
+          <button class="btn primary" disabled={saving()} onClick={() => void save()}>
+            {saving() ? "保存中…" : "保存"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

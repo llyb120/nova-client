@@ -1,0 +1,28 @@
+{
+  "name": "nova",
+  "private": true,
+  "version": "0.1.196",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "package": "python scripts/package.py"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vite-plugin-solid": "^2.11.12"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "diff": "^9.0.0",
+    "dompurify": "^3.4.9",
+    "marked": "^18.0.5",
+    "solid-js": "^1.9.13"
+  }
+}

@@ -1,0 +1,384 @@
+use crate::acp::{apply_proxy_env, resolve_program_on_path};
+use crate::settings::Settings;
+use crate::threads::AgentKind;
+use crate::AppState;
+use serde::Serialize;
+use std::process::Stdio;
+use std::time::Duration;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliStatus {
+    pub agent_kind: String,
+    pub cli_name: String,
+    pub installed: bool,
+    pub version: String,
+    pub upgrade_supported: bool,
+    pub detail: String,
+}
+
+struct CliSpec {
+    kind: AgentKind,
+    cli_name: &'static str,
+    program: String,
+    version_args: Vec<String>,
+    upgrade_program: String,
+    upgrade_args: Vec<String>,
+    proxy: String,
+}
+
+fn configured_cli_program(configured: &str, expected_names: &[&str], fallback: &str) -> String {
+    let name = std::path::Path::new(configured)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(configured)
+        .to_ascii_lowercase();
+    if expected_names.iter().any(|expected| name == *expected) {
+        configured.to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
+    match kind {
+        AgentKind::Devin => {
+            let program = configured_cli_program(&settings.devin_path, &["devin"], "devin");
+            CliSpec {
+                kind: kind.clone(),
+                cli_name: "devin-cli",
+                program: program.clone(),
+                version_args: vec!["--version".into()],
+                upgrade_program: program,
+                upgrade_args: vec!["update".into()],
+                proxy: settings.devin_proxy.clone(),
+            }
+        }
+        AgentKind::Codex => {
+            let program = configured_cli_program(&settings.codex_path, &["codex"], "codex");
+            CliSpec {
+                kind: kind.clone(),
+                cli_name: "codex-cli",
+                program,
+                version_args: vec!["--version".into()],
+                // Codex CLI 当前没有自更新子命令，官方 npm 包是 @openai/codex。
+                upgrade_program: "npm".into(),
+                upgrade_args: vec!["install".into(), "-g".into(), "@openai/codex@latest".into()],
+                proxy: settings.codex_proxy.clone(),
+            }
+        }
+        AgentKind::CodeBuddy => {
+            let program = configured_cli_program(
+                &settings.codebuddy_path,
+                &["codebuddy", "cbc"],
+                "codebuddy",
+            );
+            CliSpec {
+                kind: kind.clone(),
+                cli_name: "codebuddy-cli",
+                program: program.clone(),
+                version_args: vec!["--version".into()],
+                upgrade_program: program,
+                upgrade_args: vec!["update".into()],
+                proxy: settings.codebuddy_proxy.clone(),
+            }
+        }
+        AgentKind::ClaudeCode => CliSpec {
+            kind: kind.clone(),
+            cli_name: "claude-code-cli",
+            // 后端通过 ACP 包装器启动，真正需要管理的是独立的 Claude Code CLI。
+            program: "claude".into(),
+            version_args: vec!["--version".into()],
+            upgrade_program: "claude".into(),
+            upgrade_args: vec!["update".into()],
+            proxy: settings.claudecode_proxy.clone(),
+        },
+        AgentKind::Cursor => {
+            let program = configured_cli_program(
+                &settings.cursor_path,
+                &["cursor-agent", "agent"],
+                "cursor-agent",
+            );
+            CliSpec {
+                kind: kind.clone(),
+                cli_name: "cursor-agent-cli",
+                program: program.clone(),
+                version_args: vec!["--version".into()],
+                upgrade_program: program,
+                upgrade_args: vec!["update".into()],
+                proxy: settings.cursor_proxy.clone(),
+            }
+        }
+        AgentKind::OpenCode => {
+            let program =
+                configured_cli_program(&settings.opencode_path, &["opencode"], "opencode");
+            CliSpec {
+                kind: kind.clone(),
+                cli_name: "opencode-cli",
+                program: program.clone(),
+                version_args: vec!["--version".into()],
+                upgrade_program: program,
+                upgrade_args: vec!["upgrade".into()],
+                proxy: settings.opencode_proxy.clone(),
+            }
+        }
+    }
+}
+
+fn all_specs(settings: &Settings) -> Vec<CliSpec> {
+    [
+        AgentKind::Devin,
+        AgentKind::Codex,
+        AgentKind::CodeBuddy,
+        AgentKind::ClaudeCode,
+        AgentKind::Cursor,
+        AgentKind::OpenCode,
+    ]
+    .iter()
+    .map(|kind| spec_for(kind, settings))
+    .collect()
+}
+
+#[cfg(windows)]
+fn build_command(program: &str, args: &[String]) -> tokio::process::Command {
+    let resolved = resolve_program_on_path(program);
+    let mut cmd = match resolved
+        .as_ref()
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+    {
+        Some(ext) if ext.eq_ignore_ascii_case("exe") => {
+            tokio::process::Command::new(resolved.unwrap())
+        }
+        Some(ext) if ext.eq_ignore_ascii_case("ps1") => {
+            let mut cmd = tokio::process::Command::new("powershell.exe");
+            cmd.arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(resolved.unwrap());
+            cmd
+        }
+        _ => {
+            let mut cmd = tokio::process::Command::new("cmd.exe");
+            cmd.arg("/D").arg("/S").arg("/C").arg(program);
+            cmd
+        }
+    };
+    cmd.args(args);
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
+#[cfg(not(windows))]
+fn build_command(program: &str, args: &[String]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    cmd
+}
+
+async fn run_command(
+    program: &str,
+    args: &[String],
+    proxy: &str,
+    timeout_duration: Duration,
+) -> Result<String, String> {
+    let mut cmd = build_command(program, args);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    apply_proxy_env(&mut cmd, proxy);
+    let output = tokio::time::timeout(timeout_duration, cmd.output())
+        .await
+        .map_err(|_| format!("{program} 执行超时"))?
+        .map_err(|e| format!("无法启动 {program}：{e}"))?;
+    let text = command_output(&output.stdout, &output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(if text.is_empty() {
+            format!("{program} 退出码 {:?}", output.status.code())
+        } else {
+            text
+        })
+    }
+}
+
+fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = strip_ansi(&String::from_utf8_lossy(stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(stderr));
+    let joined = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    joined.chars().take(4000).collect()
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+async fn status_for(spec: CliSpec) -> CliStatus {
+    let available = resolve_program_on_path(&spec.program).is_some();
+    if !available {
+        return CliStatus {
+            agent_kind: spec.kind.as_str().into(),
+            cli_name: spec.cli_name.into(),
+            installed: false,
+            version: "未安装".into(),
+            upgrade_supported: false,
+            detail: format!("未找到 {}", spec.program),
+        };
+    }
+    let upgrade_available = resolve_program_on_path(&spec.upgrade_program).is_some();
+    match run_command(
+        &spec.program,
+        &spec.version_args,
+        &spec.proxy,
+        Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(version) => CliStatus {
+            agent_kind: spec.kind.as_str().into(),
+            cli_name: spec.cli_name.into(),
+            installed: true,
+            version: version.lines().next().unwrap_or("未知版本").trim().into(),
+            upgrade_supported: upgrade_available,
+            detail: if upgrade_available {
+                String::new()
+            } else {
+                format!("未找到升级程序 {}", spec.upgrade_program)
+            },
+        },
+        Err(error) => CliStatus {
+            agent_kind: spec.kind.as_str().into(),
+            cli_name: spec.cli_name.into(),
+            installed: true,
+            version: "版本读取失败".into(),
+            upgrade_supported: upgrade_available,
+            detail: if upgrade_available {
+                error
+            } else {
+                format!("{error}\n未找到升级程序 {}", spec.upgrade_program)
+            },
+        },
+    }
+}
+
+pub async fn statuses(settings: &Settings) -> Vec<CliStatus> {
+    let tasks = all_specs(settings)
+        .into_iter()
+        .map(|spec| tauri::async_runtime::spawn(status_for(spec)))
+        .collect::<Vec<_>>();
+    let mut result = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        if let Ok(status) = task.await {
+            result.push(status);
+        }
+    }
+    result
+}
+
+async fn stop_backend(state: &AppState, kind: &AgentKind) {
+    match kind {
+        AgentKind::Codex => state.codex.restart().await,
+        _ => {
+            if let Some(manager) = state.acp_for(kind) {
+                manager.restart().await;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn devin_process_running() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return true;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                if name.eq_ignore_ascii_case("devin.exe") {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+#[cfg(not(windows))]
+fn devin_process_running() -> bool {
+    std::process::Command::new("pgrep")
+        .arg("-x")
+        .arg("devin")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+pub async fn upgrade(
+    state: &AppState,
+    kind: AgentKind,
+    settings: &Settings,
+) -> Result<CliStatus, String> {
+    let _guard = state.cli_upgrade_lock.lock().await;
+    let spec = spec_for(&kind, settings);
+    if resolve_program_on_path(&spec.program).is_none() {
+        return Err(format!("未找到 {}，无法升级", spec.cli_name));
+    }
+
+    stop_backend(state, &kind).await;
+    if kind == AgentKind::Devin && devin_process_running() {
+        return Err("检测到仍在运行的 devin 进程。请先结束 Nova 之外的 Devin 进程再升级。".into());
+    }
+
+    run_command(
+        &spec.upgrade_program,
+        &spec.upgrade_args,
+        &spec.proxy,
+        Duration::from_secs(15 * 60),
+    )
+    .await
+    .map_err(|e| format!("{} 升级失败：{e}", spec.cli_name))?;
+
+    Ok(status_for(spec).await)
+}

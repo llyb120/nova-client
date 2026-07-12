@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nova</title>
+    <script>
+      // 首帧前同步应用已保存主题，避免「先黑后白」闪烁（FOUC）。
+      // 键名/取值需与 src/store.ts 的 THEME_KEY、readThemePref 保持一致。
+      (function () {
+        try {
+          var t = localStorage.getItem("fd:theme");
+          document.documentElement.dataset.theme =
+            t === "ink-light" ? "ink-light" : "ink-dark";
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>
