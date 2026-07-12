@@ -2,8 +2,8 @@
 //!
 //! 连上中转站后先推一次快照；空闲期只维持低流量命令长轮询，不持续上传。
 //! 网页端刚打开（bootstrap state）时服务端会 refreshRequested，唤醒桌面补发。
-//! 会话运行时首包/纠错/收尾发全量，中间流式阶段只发变化条目（约 400ms 一拍）。
-//! 打开历史会话走 kind=threads 轻量包（不重传 models/projects），并预热最近若干会话。
+//! 每个运行会话独立维护基线：首包快照，中间与收尾只发变化条目（约 400ms 一拍）。
+//! 打开历史会话走一次性 kind=threads 轻量包（不重传 models/projects）；仅首连预热最新会话。
 //! 所有请求体均 gzip，响应由 reqwest 自动解 gzip。
 
 use crate::relay::{gzip_json, resolve_relay_server};
@@ -19,8 +19,8 @@ use tokio::time::sleep;
 
 const ACTIVE_INTERVAL: Duration = Duration::from_millis(400);
 const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
-/// 空闲时预热最近 N 个历史会话到 server 缓存，打开时几乎秒出。
-const PREFETCH_RECENT: usize = 8;
+/// 首次连接只预热最新会话；其余历史按点击请求，兼顾首屏速度与流量。
+const PREFETCH_RECENT: usize = 1;
 
 #[derive(Clone, PartialEq, Eq)]
 struct RemoteConfig {
@@ -38,7 +38,7 @@ struct RemoteProject {
     name: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct RemoteThreadMeta {
     id: String,
@@ -139,13 +139,14 @@ async fn run(app: AppHandle) {
     let mut client = Client::new();
     let mut requested: HashSet<String> = HashSet::new();
     let mut revision = 0i64;
-    let mut previous: HashMap<String, Thread> = HashMap::new();
+    // 只保留正在流式同步的逐会话基线。历史会话按需发一次快照后立即释放，
+    // 不把 server 缓存误当成永久订阅，也不让一个会话的基线影响另一个会话。
+    let mut previous: HashMap<String, (Thread, bool)> = HashMap::new();
     let mut force_full = false;
-    let mut was_running = false;
     let mut ack_id = 0i64;
     let mut processed_id = 0i64;
     let mut results: Vec<CommandResult> = Vec::new();
-    let mut warmed: HashSet<String> = HashSet::new();
+    let mut catalog_signature = String::new();
 
     loop {
         let Some(cfg) = config(&app) else {
@@ -154,7 +155,7 @@ async fn run(app: AppHandle) {
             revision = 0;
             previous.clear();
             force_full = false;
-            warmed.clear();
+            catalog_signature.clear();
             sleep(Duration::from_secs(10)).await;
             continue;
         };
@@ -166,38 +167,49 @@ async fn run(app: AppHandle) {
             previous.clear();
             // 连上中转站后立刻推一次快照，避免空闲长轮询时网页端打开仍是空列表。
             force_full = true;
-            was_running = false;
             ack_id = 0;
             processed_id = 0;
             results.clear();
-            warmed.clear();
+            catalog_signature.clear();
         }
 
-        // 全量/纠错时带上最近会话；浏览器点名的会话一并纳入同一包。
+        // requested 是 server 的一次性 cache-miss 队列；另外保留上一拍仍在运行的会话，
+        // 确保 running=false 与最后一段内容一定能作为收尾增量送达。
         let mut sync_ids = requested.clone();
-        if force_full || revision > 0 {
+        sync_ids.extend(
+            previous
+                .iter()
+                .filter_map(|(id, (_, running))| (*running).then(|| id.clone())),
+        );
+        if force_full && revision == 0 {
             for id in recent_thread_ids(&app, PREFETCH_RECENT) {
-                if force_full || !warmed.contains(&id) {
-                    sync_ids.insert(id);
-                }
+                sync_ids.insert(id);
             }
         }
 
         let current = sync_threads(&app, &sync_ids);
-        let any_running = threads_running(&app, current.values());
-        let tracked_changed = !previous.is_empty()
-            && (previous.len() != current.len()
-                || previous.keys().any(|id| !current.contains_key(id)));
-        if (was_running && !any_running) || tracked_changed {
-            force_full = true;
-        }
-
-        let has_unwarmed = current.keys().any(|id| !warmed.contains(id));
+        let running_now: HashMap<String, bool> = current
+            .iter()
+            .map(|(id, thread)| (id.clone(), thread_running(&app, thread)))
+            .collect();
+        let any_running = running_now.values().any(|running| *running);
+        let metas = thread_metas(&app);
+        let next_catalog_signature = catalog_signature_for(&metas);
+        let catalog_changed = next_catalog_signature != catalog_signature;
+        let needs_snapshot = current.keys().any(|id| !previous.contains_key(id));
+        let dirty_ids: HashSet<String> = current
+            .iter()
+            .filter_map(|(id, thread)| {
+                let (old, old_running) = previous.get(id)?;
+                let running = running_now.get(id).copied().unwrap_or(false);
+                thread_changed(old, *old_running, thread, running).then(|| id.clone())
+            })
+            .collect();
         let want_upload = force_full
-            || any_running
-            || !results.is_empty()
-            || !requested.is_empty()
-            || has_unwarmed;
+            || catalog_changed
+            || needs_snapshot
+            || !dirty_ids.is_empty()
+            || !results.is_empty();
 
         if !want_upload {
             match pull(&client, &cfg).await {
@@ -213,36 +225,23 @@ async fn run(app: AppHandle) {
                         &mut processed_id,
                         &mut ack_id,
                         &mut results,
-                        &mut force_full,
                         &mut requested,
                     )
                     .await;
                 }
                 Err(e) => sleep(error_backoff(&e)).await,
             }
-            was_running = any_eligible_thread_running(&app);
             continue;
         }
 
         let next_revision = revision.saturating_add(1).max(1);
-        // 已有基线且无运行中：用 threads 轻量包（含仅回传 git 结果的场景，避免为结果重做 full）。
-        let lean = revision > 0
-            && !any_running
-            && !(force_full && previous.is_empty() && results.is_empty());
-        let (body, sent_full) = if lean {
-            (
-                json!({
-                    "deviceName": cfg.name,
-                    "ackId": ack_id,
-                    "results": results,
-                    "kind": "threads",
-                    "baseRevision": revision,
-                    "revision": next_revision,
-                    "snapshot": threads_pack(&app, &current),
-                }),
-                false,
-            )
-        } else if force_full || previous.is_empty() {
+        let snapshot_threads: HashMap<String, Thread> = current
+            .iter()
+            .filter_map(|(id, thread)| {
+                (!previous.contains_key(id)).then(|| (id.clone(), thread.clone()))
+            })
+            .collect();
+        let (body, sent_ids, sent_catalog) = if force_full || revision == 0 {
             (
                 json!({
                     "deviceName": cfg.name,
@@ -253,13 +252,34 @@ async fn run(app: AppHandle) {
                     "revision": next_revision,
                     "snapshot": full_snapshot(&app, &current),
                 }),
+                current.keys().cloned().collect::<HashSet<_>>(),
+                true,
+            )
+        } else if catalog_changed || needs_snapshot || dirty_ids.is_empty() {
+            // 新会话/目录变化/单纯命令结果走轻量包。只附带缺基线的会话快照；
+            // 已有基线的运行会话留到下一拍继续发增量，避免被另一个历史会话拖成全量。
+            (
+                json!({
+                    "deviceName": cfg.name,
+                    "ackId": ack_id,
+                    "results": results,
+                    "kind": "threads",
+                    "baseRevision": revision,
+                    "revision": next_revision,
+                    "snapshot": threads_pack_with_metas(metas.clone(), &snapshot_threads),
+                }),
+                snapshot_threads.keys().cloned().collect::<HashSet<_>>(),
                 true,
             )
         } else {
-            let mut deltas = Vec::with_capacity(current.len());
+            let mut deltas = Vec::with_capacity(dirty_ids.len());
             let mut delta_ok = true;
-            for (id, current_thread) in &current {
-                let Some(old) = previous.get(id) else {
+            for id in &dirty_ids {
+                let Some(current_thread) = current.get(id) else {
+                    delta_ok = false;
+                    break;
+                };
+                let Some((old, _)) = previous.get(id) else {
                     delta_ok = false;
                     break;
                 };
@@ -270,7 +290,10 @@ async fn run(app: AppHandle) {
                 deltas.push(delta);
             }
             if !delta_ok {
-                force_full = true;
+                // 只把本次涉及的会话改走快照，不清空其他会话基线。
+                for id in &dirty_ids {
+                    previous.remove(id);
+                }
                 continue;
             }
             (
@@ -283,16 +306,29 @@ async fn run(app: AppHandle) {
                     "revision": next_revision,
                     "delta": { "threads": deltas },
                 }),
+                dirty_ids.clone(),
                 false,
             )
         };
 
         match sync(&client, &cfg, &body).await {
             Ok(resp) => {
-                revision = resp.revision.max(next_revision);
-                for (id, thread) in current {
-                    warmed.insert(id.clone());
-                    previous.insert(id, thread);
+                revision = resp.revision;
+                if !resp.need_full {
+                    for id in &sent_ids {
+                        if let Some(thread) = current.get(id) {
+                            previous.insert(
+                                id.clone(),
+                                (
+                                    thread.clone(),
+                                    running_now.get(id).copied().unwrap_or(false),
+                                ),
+                            );
+                        }
+                    }
+                    if sent_catalog {
+                        catalog_signature = next_catalog_signature;
+                    }
                 }
                 force_full = resp.need_full;
                 results.clear();
@@ -303,14 +339,12 @@ async fn run(app: AppHandle) {
                     &mut processed_id,
                     &mut ack_id,
                     &mut results,
-                    &mut force_full,
                     &mut requested,
                 )
                 .await;
-                if sent_full && !any_running && results.is_empty() && !force_full {
-                    was_running = false;
-                } else {
-                    was_running = any_running;
+                if !force_full {
+                    // 非运行、也不再被 server 点名的历史快照已经落到 server，立即释放大对象。
+                    previous.retain(|id, (_, running)| *running || requested.contains(id));
                 }
             }
             Err(e) => sleep(error_backoff(&e)).await,
@@ -520,19 +554,9 @@ fn sync_threads(app: &AppHandle, requested: &HashSet<String>) -> HashMap<String,
         .collect()
 }
 
-fn threads_running<'a>(app: &AppHandle, threads: impl Iterator<Item = &'a Thread>) -> bool {
+fn thread_running(app: &AppHandle, thread: &Thread) -> bool {
     let state = app.state::<AppState>();
-    threads.into_iter().any(|thread| is_running(&state, thread))
-}
-
-fn any_eligible_thread_running(app: &AppHandle) -> bool {
-    let state = app.state::<AppState>();
-    let store = state.store.lock().unwrap();
-    store
-        .threads
-        .iter()
-        .filter(|thread| eligible(thread))
-        .any(|thread| is_running(&state, thread))
+    is_running(&state, thread)
 }
 
 fn full_snapshot(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSnapshot {
@@ -549,10 +573,13 @@ fn full_snapshot(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSna
 }
 
 /// 轻量包：只带会话列表 + 指定会话快照，供打开历史/预热，避免重扫 projects 与重传 models。
-fn threads_pack(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSnapshot {
+fn threads_pack_with_metas(
+    metas: Vec<RemoteThreadMeta>,
+    synced: &HashMap<String, Thread>,
+) -> RemoteSnapshot {
     RemoteSnapshot {
         projects: Vec::new(),
-        threads: thread_metas(app),
+        threads: metas,
         thread: None,
         thread_snapshots: synced
             .iter()
@@ -560,6 +587,36 @@ fn threads_pack(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSnap
             .collect(),
         models: HashMap::new(),
     }
+}
+
+/// 目录签名刻意排除 updated_at/running：这两个高频字段由逐会话增量携带，
+/// 避免流式输出时退化成每 400ms 重传完整会话。标题/模型/目录变化仍会触发轻量目录包。
+fn catalog_signature_for(metas: &[RemoteThreadMeta]) -> String {
+    let rows: Vec<_> = metas
+        .iter()
+        .map(|m| {
+            (
+                &m.id,
+                &m.title,
+                &m.cwd,
+                &m.agent_kind,
+                &m.model,
+                &m.mode,
+            )
+        })
+        .collect();
+    serde_json::to_string(&rows).unwrap_or_default()
+}
+
+fn thread_changed(old: &Thread, old_running: bool, current: &Thread, running: bool) -> bool {
+    old_running != running
+        || old.updated_at != current.updated_at
+        || old.title != current.title
+        || old.cwd != current.cwd
+        || old.agent_kind != current.agent_kind
+        || old.model != current.model
+        || old.mode != current.mode
+        || old.items.len() != current.items.len()
 }
 
 fn recent_thread_ids(app: &AppHandle, limit: usize) -> Vec<String> {
@@ -639,7 +696,6 @@ async fn process_commands(
     processed_id: &mut i64,
     ack_id: &mut i64,
     results: &mut Vec<CommandResult>,
-    force_full: &mut bool,
     requested: &mut HashSet<String>,
 ) {
     for cmd in commands {
@@ -652,10 +708,8 @@ async fn process_commands(
         if result.ok && !result.thread_id.is_empty() {
             requested.insert(result.thread_id.clone());
         }
-        // git 只读查询不触发会话全量重传
-        if matches!(cmd.kind.as_str(), "create" | "send" | "stop") {
-            *force_full = true;
-        }
+        // create/send/stop 的会话 id 已加入一次性请求集；下一拍会按该会话独立选择
+        // 快照或增量，不再把一个命令升级成全局 full。
         results.push(result);
     }
 }
