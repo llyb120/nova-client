@@ -307,6 +307,10 @@ fn main() {
         return;
     }
 
+    // Finder / Dock 启动的 macOS .app 不继承终端 PATH。必须在任何 CLI 探测或
+    // 后端线程启动前恢复，否则已安装的 codex、npx 等都会被误判为不可用。
+    nova_lib::init_process_path();
+
     // 自更新 helper：新版 exe 被旧版拉起后，先替换旧 exe，再启动正式实例。
     if nova_lib::maybe_run_update_helper() {
         return;

@@ -9,6 +9,7 @@ mod marks;
 mod mind;
 mod model_cache;
 mod notice;
+mod path_env;
 mod pxpipe;
 mod quota;
 mod relay;
@@ -22,6 +23,8 @@ mod updater;
 
 /// 临时会话目录的统一父目录名（前端据此识别并显示「临时会话」）
 pub const SCRATCH_MARK: &str = "Nova-scratch";
+
+pub use path_env::init_process_path;
 
 use acp::AcpManager;
 use codex::CodexManager;
