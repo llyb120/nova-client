@@ -620,7 +620,7 @@ impl AcpManager {
     /// 残留的 selectedModelVariantId 再次覆盖 `--model`。因此：
     /// 1. 始终关闭 Max Mode 计费开关（模型名/effort 里的 Max 不是该开关）；
     /// 2. 若本次以明确 CLI 模型启动，把 `selectedModel` / `modelParameters` 写成与扁平 id
-    ///    一致的参数（含显式 `fast=false`）；
+    ///    一致的参数（effort 与 fast 都严格跟随所选模型变体）；
     /// 3. 每次进程启动都从全局配置重新复制，及时带上登录态/网络设置的变化。
     /// 只做本地文件操作，不发出任何模型请求。失败时返回 None，让 Cursor 回退到默认目录。
     fn prepare_cursor_config_dir(
@@ -4674,25 +4674,42 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
     }
 
     #[test]
-    fn flat_id_selection_clears_stale_fast() {
-        let (base, params) = cursor_selection_from_flat_id("grok-4.5-xhigh");
-        assert_eq!(base, "grok-4.5");
-        assert_eq!(
-            params,
-            vec![
-                json!({ "id": "effort", "value": "xhigh" }),
-                json!({ "id": "fast", "value": "false" }),
-            ]
-        );
-        let (base_fast, params_fast) = cursor_selection_from_flat_id("grok-4.5-fast-xhigh");
-        assert_eq!(base_fast, "grok-4.5");
-        assert_eq!(
-            params_fast,
-            vec![
-                json!({ "id": "effort", "value": "xhigh" }),
-                json!({ "id": "fast", "value": "true" }),
-            ]
-        );
+    fn flat_id_selection_follows_effort_and_fast_variant() {
+        for (model, expected_base, expected_params) in [
+            (
+                "grok-4.5-medium",
+                "grok-4.5",
+                vec![
+                    json!({ "id": "effort", "value": "medium" }),
+                    json!({ "id": "fast", "value": "false" }),
+                ],
+            ),
+            (
+                "gpt-5.3-codex-high",
+                "gpt-5.3-codex",
+                vec![
+                    json!({ "id": "effort", "value": "high" }),
+                    json!({ "id": "fast", "value": "false" }),
+                ],
+            ),
+            (
+                "claude-opus-4-8-thinking-xhigh-fast",
+                "claude-opus-4-8-thinking",
+                vec![
+                    json!({ "id": "effort", "value": "xhigh" }),
+                    json!({ "id": "fast", "value": "true" }),
+                ],
+            ),
+            (
+                "composer-2.5-fast",
+                "composer-2.5",
+                vec![json!({ "id": "fast", "value": "true" })],
+            ),
+        ] {
+            let (base, params) = cursor_selection_from_flat_id(model);
+            assert_eq!(base, expected_base, "model={model}");
+            assert_eq!(params, expected_params, "model={model}");
+        }
     }
 
     #[test]
