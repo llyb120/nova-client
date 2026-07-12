@@ -2292,6 +2292,9 @@ impl AcpManager {
             if !config_options.is_array() {
                 config_options = json!([]);
             }
+            // 必须从本次 session/new 的原始选项读取，不能在模型合并函数里再锁
+            // self.model_options：后台目录刷新本身已持有该锁，重复加锁会永久死锁。
+            let fast_values = cursor_fast_values(&config_options);
             if let Some(arr) = config_options.as_array_mut() {
                 let model_opt = arr
                     .iter_mut()
@@ -2312,7 +2315,7 @@ impl AcpManager {
                 if !catalog_ready && existing_rich {
                     return;
                 }
-                let merged = self.cursor_merged_model_options();
+                let merged = self.cursor_merged_model_options(&fast_values);
                 match model_opt {
                     Some(opt) => {
                         opt["options"] = merged;
@@ -2388,7 +2391,7 @@ impl AcpManager {
     /// CLI 项保留原始短 id，实际在独立 ACP 进程启动时通过 `--model` 生效。
     /// 当 ACP 返回参数化选择器（model + fast）且 CLI 目录尚未就绪时，
     /// 从基础模型合成 fast/non-fast 短 id，保证前端仍能切换速度档。
-    fn cursor_merged_model_options(&self) -> Value {
+    fn cursor_merged_model_options(&self, fast_values: &[String]) -> Value {
         let mut options = vec![json!({
             "value": "",
             "name": "Auto（Cursor 默认）"
@@ -2401,32 +2404,6 @@ impl AcpManager {
             }
         }
 
-        // 参数化模型选择器返回的 fast 可选值（"true" / "false"）。
-        let fast_values: Vec<String> = {
-            let guard = self.model_options.lock().unwrap();
-            guard
-                .as_ref()
-                .and_then(|v| v.get("configOptions").and_then(|v| v.as_array()))
-                .and_then(|arr| {
-                    arr.iter()
-                        .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("fast"))
-                        .cloned()
-                })
-                .and_then(|fast_opt| fast_opt.get("options").and_then(|v| v.as_array()).cloned())
-                .map(|opts| {
-                    opts.iter()
-                        .filter_map(|o| {
-                            let v = o.get("value").and_then(|v| v.as_str())?;
-                            if v == "true" || v == "false" {
-                                Some(v.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
         let can_synthesize = !fast_values.is_empty()
             && self
                 .cursor_catalog
@@ -2454,7 +2431,7 @@ impl AcpManager {
                     .and_then(|v| v.as_str())
                     .unwrap_or(value)
                     .to_string();
-                for fast in &fast_values {
+                for fast in fast_values {
                     let (id, display) = if fast == "true" {
                         (format!("{base}-fast"), format!("{name} Fast"))
                     } else {
@@ -2518,6 +2495,7 @@ impl AcpManager {
         let updated = {
             let mut guard = self.model_options.lock().unwrap();
             let Some(v) = guard.as_mut() else { return };
+            let fast_values = cursor_fast_values(v);
             let Some(arr) = v.get_mut("configOptions").and_then(|c| c.as_array_mut()) else {
                 return;
             };
@@ -2527,7 +2505,7 @@ impl AcpManager {
             else {
                 return;
             };
-            opt["options"] = self.cursor_merged_model_options();
+            opt["options"] = self.cursor_merged_model_options(&fast_values);
             v.clone()
         };
         self.persist_model_options(&updated);
@@ -4124,6 +4102,28 @@ fn is_cursor_cli_model_id(model: &str) -> bool {
     !model.is_empty() && !model.contains('[')
 }
 
+/// 从 Cursor 的 configOptions 中读取参数化 Fast 选择器支持的值。
+/// 只接受协议当前使用的 "true" / "false"，避免把未知值合成成前端模型 id。
+fn cursor_fast_values(options: &Value) -> Vec<String> {
+    options
+        .as_array()
+        .or_else(|| options.get("configOptions").and_then(|v| v.as_array()))
+        .and_then(|arr| {
+            arr.iter()
+                .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("fast"))
+        })
+        .and_then(|fast_opt| fast_opt.get("options").and_then(|v| v.as_array()))
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| {
+                    let value = o.get("value").and_then(|v| v.as_str())?;
+                    matches!(value, "true" | "false").then(|| value.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 关闭 cli-config 里的 Max Mode 计费开关。返回是否有改动。
 fn clear_cursor_max_mode(cfg: &mut Value) -> bool {
     let mut changed = false;
@@ -4611,6 +4611,25 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
         assert!(is_cursor_cli_model_id("gpt-5.3-codex-high"));
         assert!(!is_cursor_cli_model_id("gpt-5.3-codex[effort=high]"));
         assert!(!is_cursor_cli_model_id(""));
+    }
+
+    #[test]
+    fn reads_fast_values_from_current_session_options() {
+        let config_options = json!([
+            {
+                "id": "fast",
+                "options": [
+                    { "value": "false", "name": "Off" },
+                    { "value": "true", "name": "Fast" },
+                    { "value": "future", "name": "Unknown" }
+                ]
+            }
+        ]);
+        assert_eq!(cursor_fast_values(&config_options), vec!["false", "true"]);
+        assert_eq!(
+            cursor_fast_values(&json!({ "configOptions": config_options })),
+            vec!["false", "true"]
+        );
     }
 
     #[test]
