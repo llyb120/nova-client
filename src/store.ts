@@ -1041,6 +1041,7 @@ export function stashWorktreePrompt(threadId: string, text: string, images: Prom
 /** 向指定会话发送（不依赖 currentId），用于 worktree 就绪后补发首条提示词 */
 async function sendPromptTo(threadId: string, text: string, images: PromptImage[]) {
   if (!text.trim() && images.length === 0) return;
+  if (state.currentId === threadId) bumpChatScrollToBottom();
   setState("running", threadId, true);
   try {
     await api.sendPrompt(threadId, text, images);

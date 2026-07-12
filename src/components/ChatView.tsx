@@ -69,6 +69,12 @@ export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
   let stickToBottom = true;
+  /** 发送后强制吸底截止：覆盖「bump → 用户消息入 DOM → 虚拟列表挂载」整段异步 */
+  let forceStickUntil = 0;
+  let settleRaf = 0;
+  /** 已 bump、尚在等这条用户消息落进 items（发送瞬间消息还没到 DOM） */
+  let awaitingSendUserItem = false;
+  let itemsLenAtSend = 0;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -80,6 +86,13 @@ export function ChatView() {
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
 
+  const sticking = () => stickToBottom || performance.now() < forceStickUntil;
+
+  const pinBottom = () => {
+    if (!scrollRef) return;
+    scrollRef.scrollTop = scrollRef.scrollHeight;
+  };
+
   // 流式更新高频触发，用 rAF 去重：每帧至多读一次 scrollHeight（强制重排），避免抖动
   let scrollPending = false;
   const scrollToBottom = () => {
@@ -87,19 +100,35 @@ export function ChatView() {
     scrollPending = true;
     requestAnimationFrame(() => {
       scrollPending = false;
-      if (scrollRef && stickToBottom) scrollRef.scrollTop = scrollRef.scrollHeight;
+      if (!scrollRef || !sticking()) return;
+      pinBottom();
+      const dist = scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight;
+      if (dist > 1 && sticking()) scrollToBottom();
     });
   };
 
-  /** 发送新提示词：无论当前是否吸底，立刻跳到底部（无平滑滚动） */
+  /** 连续多帧钉住底部，等虚拟列表 / 新气泡高度稳定 */
+  const settleToBottom = (frames = 24) => {
+    if (settleRaf) cancelAnimationFrame(settleRaf);
+    let left = frames;
+    const step = () => {
+      settleRaf = 0;
+      if (!scrollRef || !sticking()) return;
+      pinBottom();
+      left -= 1;
+      if (left > 0) settleRaf = requestAnimationFrame(step);
+    };
+    settleRaf = requestAnimationFrame(step);
+  };
+
+  /** 发送新提示词：立刻跳到底，并标记等待用户消息入 DOM 后再钉一次 */
   const jumpToBottomNow = () => {
     stickToBottom = true;
-    if (!scrollRef) return;
-    scrollRef.scrollTop = scrollRef.scrollHeight;
-    // 新消息入 DOM 后高度可能再变，下一帧再钉一次
-    requestAnimationFrame(() => {
-      if (scrollRef && stickToBottom) scrollRef.scrollTop = scrollRef.scrollHeight;
-    });
+    forceStickUntil = performance.now() + 2000;
+    awaitingSendUserItem = true;
+    itemsLenAtSend = state.items.length;
+    pinBottom();
+    settleToBottom();
   };
 
   // 会话累计 token 用量
@@ -112,38 +141,58 @@ export function ChatView() {
 
   const onScroll = () => {
     if (!scrollRef) return;
+    // 发送后的强制窗口内不解除吸底，避免跳转时虚拟列表高度抖动误判
+    if (performance.now() < forceStickUntil) {
+      stickToBottom = true;
+      return;
+    }
     const dist = scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight;
     stickToBottom = dist < 60;
   };
 
-  // 内容变化时自动吸底
+  // 内容变化时自动吸底；发送场景下等用户消息真正出现后再强制钉底（bump 时 DOM 里还没有它）
   createEffect(() => {
-    void state.items.length;
-    const last = state.items[state.items.length - 1];
+    const len = state.items.length;
+    const last = state.items[len - 1];
     if (last && "text" in last) void (last as { text: string }).text.length;
     void permissions().length;
-    if (stickToBottom && scrollRef) {
+
+    // bump 时用户消息尚未入 DOM；items 一旦增长（提示词落库）再强制钉底
+    if (awaitingSendUserItem && len > itemsLenAtSend) {
+      awaitingSendUserItem = false;
+      stickToBottom = true;
+      forceStickUntil = performance.now() + 800;
+      pinBottom();
+      settleToBottom();
+      return;
+    }
+
+    if (sticking() && scrollRef) {
       scrollToBottom();
     }
   });
 
-  // 高度变化吸底兜底：Markdown 平滑出字的动画在 store 更新之后仍会持续增高内容，
-  // （图片加载、工具卡片展开同理），仅靠上面的 store effect 会漏。用 ResizeObserver
-  // 观察内容容器，任何来源的高度变化都触发吸底（scrollToBottom 内部已做 rAF 去重）。
+  // 高度变化吸底兜底：Markdown / 图片 / 工具卡片等会在 store 更新后继续增高
   onMount(() => {
     if (!innerRef) return;
     const ro = new ResizeObserver(() => {
-      if (stickToBottom) scrollToBottom();
+      if (sticking()) scrollToBottom();
     });
     ro.observe(innerRef);
-    onCleanup(() => ro.disconnect());
+    onCleanup(() => {
+      ro.disconnect();
+      if (settleRaf) cancelAnimationFrame(settleRaf);
+    });
   });
 
   // 切换线程时滚到底
   createEffect(() => {
     void state.currentId;
+    awaitingSendUserItem = false;
     stickToBottom = true;
+    forceStickUntil = performance.now() + 400;
     scrollToBottom();
+    settleToBottom(16);
   });
 
   // 会话中继续发送提示词：未在底部时也立刻跳到底（无过渡）

@@ -504,14 +504,23 @@ fn current_exe_name() -> String {
         })
 }
 
+/// 更新检查/下载专用 HTTP 客户端：走系统代理（Windows 注册表 / macOS 网络偏好 /
+/// 环境变量 HTTP(S)_PROXY，与浏览器「使用系统代理」一致）。
+fn update_http_client(user_agent: Option<&str>, request_timeout: Option<Duration>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
+    if let Some(t) = request_timeout {
+        builder = builder.timeout(t);
+    }
+    if let Some(ua) = user_agent {
+        builder = builder.user_agent(ua);
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
 /// 查询最新版本并与当前版本比较（GitHub Releases）
 pub async fn check(app: &AppHandle) -> Result<Value, String> {
     let current = app.package_info().version.to_string();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent(format!("Nova/{current}"))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = update_http_client(Some(&format!("Nova/{current}")), Some(Duration::from_secs(15)))?;
     let resp = client
         .get(github_api_latest())
         .header("Accept", "application/vnd.github+json")
@@ -824,11 +833,8 @@ pub async fn download_and_stage(app: AppHandle) -> Result<Value, String> {
         );
     };
 
-    // 1. 下载（流式，带进度）
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
+    // 1. 下载（流式，带进度；走系统代理；不设整请求超时，大包由分块进度推进）
+    let client = update_http_client(None, None)?;
     let mut resp = client
         .get(&url)
         .send()
