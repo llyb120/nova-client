@@ -589,12 +589,16 @@ impl AcpManager {
         }
     }
 
-    /// 确保 Cursor 的 Max Mode 处于关闭状态（Max Mode 按量计费显著更贵）。
-    /// cursor-agent 的 ACP 进程在启动时读取 ~/.cursor/cli-config.json 并缓存，
-    /// 这里在每次拉起进程前只关闭顶层 `maxMode` 与 `model.maxMode` 计费开关。
-    /// 模型名或 reasoning effort 里的 Max 是思考强度，不属于该计费开关，必须保留。
-    /// 只做纯本地文件操作，不发出任何模型请求。
-    fn ensure_cursor_max_mode_off(&self) {
+    /// 拉起 cursor-agent 前同步 `~/.cursor/cli-config.json`。
+    ///
+    /// cursor-agent 启动时读取该文件并缓存；`--model <flat-id>` 只会解析出基座 + effort，
+    /// **不会清掉**配置里残留的 `fast=true`，于是 `grok-4.5-high` 会被合成成
+    /// `grok-4.5-fast-high`。因此：
+    /// 1. 始终关闭 Max Mode 计费开关（模型名/effort 里的 Max 不是该开关）；
+    /// 2. 若本次以明确 CLI 模型启动，把 `selectedModel` / `modelParameters` 写成与扁平 id
+    ///    一致的参数（含显式 `fast=false`），避免 IDE/上次会话的 Fast 偏好污染 ACP。
+    /// 只做本地文件操作，不发出任何模型请求。
+    fn ensure_cursor_cli_config(&self, startup_model: Option<&str>) {
         let Some(home) = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(std::path::PathBuf::from)
@@ -608,48 +612,24 @@ impl AcpManager {
         let Ok(mut cfg) = serde_json::from_str::<Value>(&raw) else {
             return;
         };
-        let mut changed = false;
-        if cfg.get("maxMode").and_then(|v| v.as_bool()) == Some(true) {
-            cfg["maxMode"] = json!(false);
-            changed = true;
+        let mut notes: Vec<String> = Vec::new();
+        if clear_cursor_max_mode(&mut cfg) {
+            notes.push("关闭 Max Mode".into());
         }
-        if cfg
-            .get("model")
-            .and_then(|m| m.get("maxMode"))
-            .and_then(|v| v.as_bool())
-            == Some(true)
-        {
-            cfg["model"]["maxMode"] = json!(false);
-            changed = true;
+        if let Some(model) = startup_model.filter(|m| is_cursor_cli_model_id(m)) {
+            if sync_cursor_cli_model_selection(&mut cfg, model) {
+                notes.push(format!("同步模型参数 → {model}"));
+            }
         }
-        if !changed {
+        if notes.is_empty() {
             return;
         }
-        // 该文件可能带只读属性（实测如此）：先摘只读、写入后再还原，避免静默写失败
-        let was_readonly = std::fs::metadata(&path)
-            .map(|m| m.permissions().readonly())
-            .unwrap_or(false);
-        if was_readonly {
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let mut perms = meta.permissions();
-                #[allow(clippy::permissions_set_readonly_false)]
-                perms.set_readonly(false);
-                let _ = std::fs::set_permissions(&path, perms);
-            }
-        }
-        let result = serde_json::to_string_pretty(&cfg)
-            .map_err(|e| e.to_string())
-            .and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string()));
-        if was_readonly {
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let mut perms = meta.permissions();
-                perms.set_readonly(true);
-                let _ = std::fs::set_permissions(&path, perms);
-            }
-        }
-        match result {
-            Ok(()) => self.push_log("[nova] 已关闭 Cursor Max Mode（cli-config.json）".into()),
-            Err(e) => self.push_log(format!("[nova] 关闭 Cursor Max Mode 失败：{e}")),
+        match write_cursor_cli_config(&path, &cfg) {
+            Ok(()) => self.push_log(format!(
+                "[nova] 已更新 Cursor cli-config.json（{}）",
+                notes.join("；")
+            )),
+            Err(e) => self.push_log(format!("[nova] 更新 Cursor cli-config.json 失败：{e}")),
         }
     }
 
@@ -1284,10 +1264,14 @@ impl AcpManager {
         };
         // Cursor ACP 的 session/set_model 只接受 session/new 返回的少量默认变体；CLI 目录里的
         // 完整 thinking/effort/fast 组合必须用全局 `--model <id>` 在 `acp` 子命令之前启动。
-        if self.kind == AgentKind::Cursor && conn_key != self.aux_key() {
-            if let Some(model) = self.cursor_startup_model_for_thread(conn_key) {
-                args_str = format!("--model {model} {args_str}");
-            }
+        let cursor_startup_model = if self.kind == AgentKind::Cursor && conn_key != self.aux_key()
+        {
+            self.cursor_startup_model_for_thread(conn_key)
+        } else {
+            None
+        };
+        if let Some(model) = cursor_startup_model.as_deref() {
+            args_str = format!("--model {model} {args_str}");
         }
         #[cfg(windows)]
         let mut cmd = build_acp_command(&program, &args_str);
@@ -1318,10 +1302,11 @@ impl AcpManager {
         // 把 ~/.nova/skills 用软链接/目录联接同步到各后端全局 skills 目录
         crate::skills::sync_skills_from_home();
 
-        // Cursor：拉起进程前确保其 CLI 配置里 Max Mode 处于关闭状态（cursor-agent 启动时
-        // 读取 cli-config.json，之后缓存在内存里，所以必须在 spawn 前完成清理）。
+        // Cursor：拉起进程前同步 cli-config（关 Max Mode；按 --model 扁平 id 写回
+        // selectedModel/modelParameters，避免残留 fast=true 把 high 合成 fast-high）。
+        // cursor-agent 启动时读入并缓存该文件，必须在 spawn 前写完。
         if self.kind == AgentKind::Cursor {
-            self.ensure_cursor_max_mode_off();
+            self.ensure_cursor_cli_config(cursor_startup_model.as_deref());
         }
 
         // CodeBuddy / Cursor：按会话项目目录启动进程。
@@ -3924,6 +3909,109 @@ fn is_cursor_cli_model_id(model: &str) -> bool {
     !model.is_empty() && !model.contains('[')
 }
 
+/// 关闭 cli-config 里的 Max Mode 计费开关。返回是否有改动。
+fn clear_cursor_max_mode(cfg: &mut Value) -> bool {
+    let mut changed = false;
+    if cfg.get("maxMode").and_then(|v| v.as_bool()) == Some(true) {
+        cfg["maxMode"] = json!(false);
+        changed = true;
+    }
+    if cfg
+        .get("model")
+        .and_then(|m| m.get("maxMode"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        cfg["model"]["maxMode"] = json!(false);
+        changed = true;
+    }
+    changed
+}
+
+/// 从扁平 CLI 模型 id 生成 cursor-agent 参数化选择（基座 id + parameters）。
+/// `fast` 始终显式写出，避免配置里残留的 `fast=true` 盖过 `--model`。
+fn cursor_selection_from_flat_id(model: &str) -> (String, Vec<Value>) {
+    let (base, effort, fast) = cursor_variant_dims(model);
+    let mut params = Vec::new();
+    if let Some(rank) = effort {
+        let value = ["none", "low", "medium", "high", "xhigh", "max"]
+            [rank.min(CURSOR_EFFORT_LABELS.len() - 1)];
+        params.push(json!({ "id": "effort", "value": value }));
+    }
+    params.push(json!({
+        "id": "fast",
+        "value": if fast { "true" } else { "false" }
+    }));
+    (base, params)
+}
+
+/// 把扁平 `--model` id 写回 cli-config 的 selectedModel / modelParameters / model.modelId。
+/// 返回是否有实质改动。
+fn sync_cursor_cli_model_selection(cfg: &mut Value, model: &str) -> bool {
+    let (base, params) = cursor_selection_from_flat_id(model);
+    let params_value = Value::Array(params);
+    let mut changed = false;
+
+    let selected = json!({
+        "modelId": base,
+        "parameters": params_value.clone(),
+    });
+    if cfg.get("selectedModel") != Some(&selected) {
+        cfg["selectedModel"] = selected;
+        changed = true;
+    }
+
+    let needs_params = match cfg.get("modelParameters").and_then(|v| v.as_object()) {
+        Some(map) => map.get(&base) != Some(&params_value),
+        None => true,
+    };
+    if needs_params {
+        if !cfg.get("modelParameters").map(|v| v.is_object()).unwrap_or(false) {
+            cfg["modelParameters"] = json!({});
+        }
+        cfg["modelParameters"][&base] = params_value;
+        changed = true;
+    }
+
+    if cfg.get("model").and_then(|m| m.get("modelId")).and_then(|v| v.as_str()) != Some(base.as_str())
+    {
+        if !cfg.get("model").map(|v| v.is_object()).unwrap_or(false) {
+            cfg["model"] = json!({});
+        }
+        cfg["model"]["modelId"] = json!(base);
+        cfg["model"]["displayModelId"] = json!(base);
+        changed = true;
+    }
+
+    changed
+}
+
+/// 写入 cli-config.json；文件可能带只读属性，先摘只读再还原。
+fn write_cursor_cli_config(path: &std::path::Path, cfg: &Value) -> Result<(), String> {
+    let was_readonly = std::fs::metadata(path)
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false);
+    if was_readonly {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+    let result = serde_json::to_string_pretty(cfg)
+        .map_err(|e| e.to_string())
+        .and_then(|s| std::fs::write(path, s).map_err(|e| e.to_string()));
+    if was_readonly {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(true);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+    result
+}
+
 /// cursor-agent 等后端连云端时偶发的瞬时网络错。
 /// 典型：`RetriableError: [unavailable] PING timed out`、`RetriableError: Connection stalled`、
 /// `RetriableError: [aborted] read ECONNRESET`、裸 `Internal error`。
@@ -4308,6 +4396,77 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
         assert!(is_cursor_cli_model_id("gpt-5.3-codex-high"));
         assert!(!is_cursor_cli_model_id("gpt-5.3-codex[effort=high]"));
         assert!(!is_cursor_cli_model_id(""));
+    }
+
+    #[test]
+    fn flat_id_selection_clears_stale_fast() {
+        let (base, params) = cursor_selection_from_flat_id("grok-4.5-high");
+        assert_eq!(base, "grok-4.5");
+        assert_eq!(
+            params,
+            vec![
+                json!({ "id": "effort", "value": "high" }),
+                json!({ "id": "fast", "value": "false" }),
+            ]
+        );
+        let (base_fast, params_fast) = cursor_selection_from_flat_id("grok-4.5-fast-high");
+        assert_eq!(base_fast, "grok-4.5");
+        assert_eq!(
+            params_fast,
+            vec![
+                json!({ "id": "effort", "value": "high" }),
+                json!({ "id": "fast", "value": "true" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn sync_cli_config_overrides_persisted_fast_true() {
+        let mut cfg = json!({
+            "maxMode": true,
+            "model": {
+                "modelId": "grok-4.5",
+                "displayModelId": "grok-4.5",
+                "displayName": "Cursor Grok 4.5 High Fast",
+                "maxMode": true
+            },
+            "modelParameters": {
+                "grok-4.5": [
+                    { "id": "effort", "value": "high" },
+                    { "id": "fast", "value": "true" }
+                ]
+            },
+            "selectedModel": {
+                "modelId": "grok-4.5",
+                "parameters": [
+                    { "id": "effort", "value": "high" },
+                    { "id": "fast", "value": "true" }
+                ]
+            }
+        });
+        assert!(clear_cursor_max_mode(&mut cfg));
+        assert_eq!(cfg["maxMode"], json!(false));
+        assert_eq!(cfg["model"]["maxMode"], json!(false));
+        assert!(sync_cursor_cli_model_selection(&mut cfg, "grok-4.5-high"));
+        assert_eq!(
+            cfg["selectedModel"],
+            json!({
+                "modelId": "grok-4.5",
+                "parameters": [
+                    { "id": "effort", "value": "high" },
+                    { "id": "fast", "value": "false" }
+                ]
+            })
+        );
+        assert_eq!(
+            cfg["modelParameters"]["grok-4.5"],
+            json!([
+                { "id": "effort", "value": "high" },
+                { "id": "fast", "value": "false" }
+            ])
+        );
+        // 已对齐时再写应无改动
+        assert!(!sync_cursor_cli_model_selection(&mut cfg, "grok-4.5-high"));
     }
 
     #[test]
