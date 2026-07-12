@@ -77,10 +77,8 @@ export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
   let endRef: HTMLDivElement | undefined;
-  let stickToBottom = true;
-  /** 发送后强制吸底：直到新内容入 DOM 且真正贴近底部，或超时 */
-  let forceStickUntil = 0;
-  let settleRaf = 0;
+  const [isEndVisible, setIsEndVisible] = createSignal(false);
+  let scrollRaf = 0;
   let awaitingSendUserItem = false;
   let itemsLenAtSend = 0;
 
@@ -95,56 +93,25 @@ export function ChatView() {
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
   const lastGroupIndex = () => groups().length - 1;
 
-  const sticking = () => stickToBottom || performance.now() < forceStickUntil;
-
-  const distanceFromBottom = () => {
-    if (!scrollRef) return Number.POSITIVE_INFINITY;
-    return scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight;
-  };
-
-  const pinBottom = () => {
+  const forceScrollToBottom = () => {
     if (!scrollRef) return;
-    // 先拉满 scrollTop，再用底部哨兵 scrollIntoView（虚拟列表高度变化时更稳）
-    scrollRef.scrollTop = scrollRef.scrollHeight;
-    endRef?.scrollIntoView({ block: "end", inline: "nearest" });
-  };
-
-  /** 持续钉底直到贴近底部，或超过 deadline（覆盖「发送 → 用户消息入 DOM → 末组布局」） */
-  const stickUntilSettled = (ms = 3000) => {
-    stickToBottom = true;
-    forceStickUntil = performance.now() + ms;
-    if (settleRaf) cancelAnimationFrame(settleRaf);
-    const deadline = performance.now() + ms;
-    const step = () => {
-      settleRaf = 0;
+    if (scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
       if (!scrollRef) return;
-      pinBottom();
-      const needMore =
-        performance.now() < deadline && (awaitingSendUserItem || distanceFromBottom() > 4);
-      if (needMore) settleRaf = requestAnimationFrame(step);
-    };
-    pinBottom();
-    settleRaf = requestAnimationFrame(step);
+      scrollRef.scrollTo({ top: scrollRef.scrollHeight, behavior: "instant" });
+    });
   };
 
-  // 流式更新高频触发，用 rAF 去重
-  let scrollPending = false;
   const scrollToBottom = () => {
-    if (scrollPending) return;
-    scrollPending = true;
-    requestAnimationFrame(() => {
-      scrollPending = false;
-      if (!scrollRef || !sticking()) return;
-      pinBottom();
-      if (distanceFromBottom() > 1 && sticking()) scrollToBottom();
-    });
+    if (!isEndVisible()) return;
+    forceScrollToBottom();
   };
 
   /** 发送新提示词：强制跳到底，并等到 items 增长后再钉稳 */
   const jumpToBottomNow = () => {
     awaitingSendUserItem = true;
     itemsLenAtSend = state.items.length;
-    stickUntilSettled(3000);
   };
 
   // 会话累计 token 用量
@@ -155,16 +122,7 @@ export function ChatView() {
     ),
   );
 
-  const onScroll = () => {
-    if (!scrollRef) return;
-    if (performance.now() < forceStickUntil) {
-      stickToBottom = true;
-      return;
-    }
-    stickToBottom = distanceFromBottom() < 60;
-  };
-
-  // 内容变化时自动吸底；发送后等 items 增长（提示词落库）是关键钉底时机
+  // 内容变化时自动吸底；发送后等 items 增长是关键钉底时机
   createEffect(() => {
     const len = state.items.length;
     const last = state.items[len - 1];
@@ -173,22 +131,33 @@ export function ChatView() {
 
     if (awaitingSendUserItem && len > itemsLenAtSend) {
       awaitingSendUserItem = false;
-      stickUntilSettled(1500);
+      setIsEndVisible(true);
+      forceScrollToBottom();
       return;
     }
 
-    if (sticking() && scrollRef) scrollToBottom();
+    if (isEndVisible() && scrollRef) scrollToBottom();
   });
 
   onMount(() => {
-    if (!innerRef) return;
+    if (!innerRef || !endRef || !scrollRef) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (!entry) return;
+        setIsEndVisible(entry.isIntersecting);
+      },
+      { root: scrollRef, rootMargin: "0px 0px 60px 0px", threshold: 0 },
+    );
+    io.observe(endRef);
     const ro = new ResizeObserver(() => {
-      if (sticking()) scrollToBottom();
+      if (isEndVisible()) scrollToBottom();
     });
     ro.observe(innerRef);
     onCleanup(() => {
+      io.disconnect();
       ro.disconnect();
-      if (settleRaf) cancelAnimationFrame(settleRaf);
+      if (scrollRaf) cancelAnimationFrame(scrollRaf);
     });
   });
 
@@ -197,8 +166,8 @@ export function ChatView() {
     const id = state.currentId;
     if (id !== prevId) {
       awaitingSendUserItem = false;
-      stickToBottom = true;
-      stickUntilSettled(800);
+      setIsEndVisible(true);
+      forceScrollToBottom();
     }
     return id;
   }, undefined);
@@ -367,7 +336,7 @@ export function ChatView() {
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
       </Show>
 
-      <div class="transcript" ref={scrollRef} onScroll={onScroll}>
+      <div class="transcript" ref={scrollRef}>
         <div class="transcript-inner" ref={innerRef}>
           <Show when={state.items.length === 0 && !state.loadingThread}>
             <div class="transcript-hint">

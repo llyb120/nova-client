@@ -598,19 +598,20 @@ impl AcpManager {
     /// 2. 若本次以明确 CLI 模型启动，把 `selectedModel` / `modelParameters` 写成与扁平 id
     ///    一致的参数（含显式 `fast=false`），避免 IDE/上次会话的 Fast 偏好污染 ACP。
     /// 只做本地文件操作，不发出任何模型请求。
-    fn ensure_cursor_cli_config(&self, startup_model: Option<&str>) {
+    /// 返回是否有实质改动（用于调用方决定是否需要重启已缓存的 cursor-agent 进程）。
+    fn ensure_cursor_cli_config(&self, startup_model: Option<&str>) -> bool {
         let Some(home) = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(std::path::PathBuf::from)
         else {
-            return;
+            return false;
         };
         let path = home.join(".cursor").join("cli-config.json");
         let Ok(raw) = std::fs::read_to_string(&path) else {
-            return; // 没有配置文件：cursor-agent 默认 Max Mode 关闭，无需处理
+            return false; // 没有配置文件：cursor-agent 默认 Max Mode 关闭，无需处理
         };
         let Ok(mut cfg) = serde_json::from_str::<Value>(&raw) else {
-            return;
+            return false;
         };
         let mut notes: Vec<String> = Vec::new();
         if clear_cursor_max_mode(&mut cfg) {
@@ -622,14 +623,20 @@ impl AcpManager {
             }
         }
         if notes.is_empty() {
-            return;
+            return false;
         }
         match write_cursor_cli_config(&path, &cfg) {
-            Ok(()) => self.push_log(format!(
-                "[nova] 已更新 Cursor cli-config.json（{}）",
-                notes.join("；")
-            )),
-            Err(e) => self.push_log(format!("[nova] 更新 Cursor cli-config.json 失败：{e}")),
+            Ok(()) => {
+                self.push_log(format!(
+                    "[nova] 已更新 Cursor cli-config.json（{}）",
+                    notes.join("；")
+                ));
+                true
+            }
+            Err(e) => {
+                self.push_log(format!("[nova] 更新 Cursor cli-config.json 失败：{e}"));
+                false
+            }
         }
     }
 
@@ -684,6 +691,101 @@ impl AcpManager {
             .and_then(|thread| thread.model.as_deref())
             .filter(|model| is_cursor_cli_model_id(model))
             .map(str::to_string)
+    }
+
+    /// 从缓存的 model_options 里查找指定 id 的 config option。
+    fn cached_config_option(&self, id: &str) -> Option<Value> {
+        let guard = self.model_options.lock().unwrap();
+        let cfg = guard.as_ref()?.get("configOptions").and_then(|v| v.as_array())?;
+        cfg.iter()
+            .find(|o| o.get("id").and_then(|v| v.as_str()) == Some(id))
+            .cloned()
+    }
+
+    /// 某个 config option 的 options 列表里是否包含指定 value。
+    fn config_option_has_value(option: &Value, value: &str) -> bool {
+        option
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|opts| {
+                opts.iter()
+                    .any(|o| o.get("value").and_then(|v| v.as_str()) == Some(value))
+            })
+            .unwrap_or(false)
+    }
+
+    /// 对 Cursor ACP 使用参数化模型选择器：把 CLI 短 id 拆成基座模型 + fast 开关，
+    /// 通过 `session/set_config_option` 分别设置。只有当前端 model_options 缓存里同时
+    /// 存在 `model` 和 `fast` 两个 config option 时才走这条路径；否则返回 None，
+    /// 让调用方回退到原来的 set_model / set_config_option。
+    /// 返回 Some(true) 表示设置成功，Some(false) 表示参数化路径存在但执行失败，
+    /// None 表示当前不支持参数化设置。
+    async fn apply_cursor_parameterized_model(
+        &self,
+        conn: &Arc<AcpConn>,
+        sid: &str,
+        model: &str,
+    ) -> Option<bool> {
+        if self.kind != AgentKind::Cursor {
+            return None;
+        }
+        let (base, _effort, fast) = cursor_variant_dims(model);
+        let fast_str = if fast { "true" } else { "false" };
+
+        let model_opt = self.cached_config_option("model")?;
+        let fast_opt = self.cached_config_option("fast")?;
+
+        let model_config_id = model_opt.get("id").and_then(|v| v.as_str())?;
+        let fast_config_id = fast_opt.get("id").and_then(|v| v.as_str())?;
+
+        if !Self::config_option_has_value(&model_opt, &base)
+            || !Self::config_option_has_value(&fast_opt, fast_str)
+        {
+            return None;
+        }
+
+        let set_model = conn
+            .request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": sid,
+                    "configId": model_config_id,
+                    "value": base
+                }),
+                Some(Duration::from_secs(30)),
+            )
+            .await;
+        if let Err(e) = set_model {
+            self.push_log(format!("[nova] Cursor 设置模型基座失败：{e}"));
+            return Some(false);
+        }
+
+        let set_fast = conn
+            .request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": sid,
+                    "configId": fast_config_id,
+                    "value": fast_str
+                }),
+                Some(Duration::from_secs(30)),
+            )
+            .await;
+        match set_fast {
+            Ok(_) => {
+                if let Some(route) = self.routes.lock().unwrap().get_mut(sid) {
+                    route.applied_model = Some(model.to_string());
+                }
+                self.push_log(format!(
+                    "[nova] Cursor 已切换到 {model}（基座={base} fast={fast_str}）"
+                ));
+                Some(true)
+            }
+            Err(e) => {
+                self.push_log(format!("[nova] Cursor 设置 fast 开关失败：{e}"));
+                Some(false)
+            }
+        }
     }
 
     pub fn get_commands(&self) -> Option<Value> {
@@ -1177,7 +1279,7 @@ impl AcpManager {
         let mut guard = slot.lock().await;
         if let Some(c) = guard.as_ref() {
             if c.alive.load(Ordering::SeqCst) {
-                let needs_respawn = matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor)
+                let mut needs_respawn = matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor)
                     && want_cwd.is_some()
                     && self
                         .conn_cwd
@@ -1186,20 +1288,45 @@ impl AcpManager {
                         .get(conn_key)
                         .map(String::as_str)
                         != want_cwd;
+                // Cursor：连接复用时也要同步 cli-config。cursor-agent 启动时缓存了该文件，
+                // 若残留 fast=true 会把 --model grok-4.5-high 合成 grok-4.5-fast-high。
+                // 检测到需要改动时 kill 旧进程、重新 spawn，让 cursor-agent 读入修正后的配置。
+                if !needs_respawn
+                    && self.kind == AgentKind::Cursor
+                    && conn_key != AUX_KEY
+                {
+                    let startup_model = self.cursor_startup_model_for_thread(conn_key);
+                    if self.ensure_cursor_cli_config(startup_model.as_deref()) {
+                        needs_respawn = true;
+                        self.push_log(format!(
+                            "[nova] cli-config 已变更，重启 Cursor 连接以应用新配置"
+                        ));
+                    }
+                }
                 if !needs_respawn {
                     self.touch_conn(conn_key);
                     return Ok(c.clone());
                 }
-                // 切工作目录：摘掉旧连接并杀掉（其关闭回调会因槽内即将换成新连接而判定 stale、
-                // 跳过清理）；这里只清理本连接键的会话路由，随后按新目录重启。
+                // 切工作目录或 cli-config 变更：摘掉旧连接并杀掉（其关闭回调会因槽内即将换成
+                // 新连接而判定 stale、跳过清理）；这里只清理本连接键的会话路由，随后重启。
                 if let Some(old) = guard.take() {
                     old.kill();
                 }
                 self.clear_sessions_of_key(conn_key);
-                self.push_log(format!(
-                    "切换工作目录，重启连接 → {}",
-                    want_cwd.unwrap_or("")
-                ));
+                if want_cwd.is_some()
+                    && self
+                        .conn_cwd
+                        .lock()
+                        .unwrap()
+                        .get(conn_key)
+                        .map(String::as_str)
+                        != want_cwd
+                {
+                    self.push_log(format!(
+                        "切换工作目录，重启连接 → {}",
+                        want_cwd.unwrap_or("")
+                    ));
+                }
             }
         }
         // 再次确认：等槽锁期间可能已被 cancel
@@ -1306,7 +1433,7 @@ impl AcpManager {
         // selectedModel/modelParameters，避免残留 fast=true 把 high 合成 fast-high）。
         // cursor-agent 启动时读入并缓存该文件，必须在 spawn 前写完。
         if self.kind == AgentKind::Cursor {
-            self.ensure_cursor_cli_config(cursor_startup_model.as_deref());
+            let _ = self.ensure_cursor_cli_config(cursor_startup_model.as_deref());
         }
 
         // CodeBuddy / Cursor：按会话项目目录启动进程。
@@ -1390,6 +1517,20 @@ impl AcpManager {
         }
 
         // initialize 握手
+        // Cursor ACP 只在客户端声明 parameterizedModelPicker 能力时，
+        // 才会把 Composer 等模型的 Fast 开关暴露为独立的 `fast` config option；
+        // 否则它只返回爆炸变体（如 `composer-2.5[fast=true]`），非 fast 变体无法选择。
+        // 该字段放在 clientCapabilities._meta，其它后端会忽略。
+        let client_capabilities = if self.kind == AgentKind::Cursor {
+            json!({
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "_meta": { "parameterizedModelPicker": true }
+            })
+        } else {
+            json!({
+                "fs": { "readTextFile": false, "writeTextFile": false }
+            })
+        };
         let init = conn
             .request(
                 "initialize",
@@ -1404,9 +1545,7 @@ impl AcpManager {
                     // 让 devin 走自己内部的文件读写管线——它对图片等二进制
                     // 文件有专门处理，经客户端 fs/read_text_file 读图片必然
                     // UTF-8 报错（导致带图会话前几个工具调用失败）
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": false, "writeTextFile": false }
-                    }
+                    "clientCapabilities": client_capabilities
                 }),
                 Some(Duration::from_secs(60)),
             )
@@ -2247,6 +2386,8 @@ impl AcpManager {
 
     /// Cursor 模型选项：「Auto」+ CLI 完整变体 + ACP 独有模型。
     /// CLI 项保留原始短 id，实际在独立 ACP 进程启动时通过 `--model` 生效。
+    /// 当 ACP 返回参数化选择器（model + fast）且 CLI 目录尚未就绪时，
+    /// 从基础模型合成 fast/non-fast 短 id，保证前端仍能切换速度档。
     fn cursor_merged_model_options(&self) -> Value {
         let mut options = vec![json!({
             "value": "",
@@ -2259,12 +2400,68 @@ impl AcpManager {
                 options.push(json!({ "value": id, "name": name }));
             }
         }
+
+        // 参数化模型选择器返回的 fast 可选值（"true" / "false"）。
+        let fast_values: Vec<String> = {
+            let guard = self.model_options.lock().unwrap();
+            guard
+                .as_ref()
+                .and_then(|v| v.get("configOptions").and_then(|v| v.as_array()))
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("fast"))
+                        .cloned()
+                })
+                .and_then(|fast_opt| fast_opt.get("options").and_then(|v| v.as_array()).cloned())
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|o| {
+                            let v = o.get("value").and_then(|v| v.as_str())?;
+                            if v == "true" || v == "false" {
+                                Some(v.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let can_synthesize = !fast_values.is_empty()
+            && self
+                .cursor_catalog
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.is_empty())
+                .unwrap_or(true);
+
         for option in self.cursor_acp_models.lock().unwrap().iter() {
             let Some(value) = option.get("value").and_then(|v| v.as_str()) else {
                 continue;
             };
+            if value == "default" {
+                continue;
+            }
             let base = value.split_once('[').map(|(base, _)| base).unwrap_or(value);
-            if base == "default" || cli_bases.contains(base) {
+            if cli_bases.contains(base) {
+                continue;
+            }
+            // 参数化模式返回的基础模型：合成 fast/non-fast 短 id 变体。
+            if can_synthesize && !value.contains('[') {
+                let name = option
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(value)
+                    .to_string();
+                for fast in &fast_values {
+                    let (id, display) = if fast == "true" {
+                        (format!("{base}-fast"), format!("{name} Fast"))
+                    } else {
+                        (base.to_string(), name.clone())
+                    };
+                    options.push(json!({ "value": id, "name": display }));
+                }
                 continue;
             }
             options.push(option.clone());
@@ -2623,7 +2820,25 @@ impl AcpManager {
         // 模型与模式互相独立，并发下发以省一次往返，缩短首字前的等待。
         let model_fut = async {
             if let Some(model) = need_model {
-                // 标准 ACP（Claude Code / Cursor / OpenCode）用 session/set_model{modelId}；
+                // Cursor ACP：若 initialize 时声明了 parameterizedModelPicker，
+                // 优先把 CLI 短 id 拆成基座模型 + fast 开关，用 set_config_option 分别下发。
+                // 这样选择 `composer-2.5` 会显式设置 fast=false，避免被 Cursor 默认成 fast。
+                if self.kind == AgentKind::Cursor {
+                    match self.apply_cursor_parameterized_model(conn, sid, &model).await {
+                        Some(true) => return,
+                        Some(false) => {
+                            self.mark_model_applied_with_warn(
+                                sid,
+                                &model,
+                                format!("Cursor 参数化模型设置失败「{model}」，本会话将按 Cursor CLI 的当前默认模型执行。"),
+                            );
+                            return;
+                        }
+                        None => {}
+                    }
+                }
+
+                // 标准 ACP（Claude Code / OpenCode）用 session/set_model{modelId}；
                 // Cognition/Devin、CodeBuddy 扩展用 session/set_config_option{configId:"model"}。
                 let standard_acp = matches!(
                     self.kind,
