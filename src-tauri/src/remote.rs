@@ -55,6 +55,8 @@ struct RemoteSnapshot {
     threads: Vec<RemoteThreadMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thread: Option<Value>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    thread_snapshots: HashMap<String, Value>,
     models: HashMap<String, Value>,
 }
 
@@ -128,7 +130,7 @@ async fn run(app: AppHandle) {
     let mut client = Client::new();
     let mut wanted = String::new();
     let mut revision = 0i64;
-    let mut previous: Option<Thread> = None;
+    let mut previous: HashMap<String, Thread> = HashMap::new();
     let mut force_full = false;
     let mut was_running = false;
     let mut ack_id = 0i64;
@@ -140,7 +142,7 @@ async fn run(app: AppHandle) {
             last_cfg = None;
             wanted.clear();
             revision = 0;
-            previous = None;
+            previous.clear();
             force_full = false;
             sleep(Duration::from_secs(10)).await;
             continue;
@@ -150,7 +152,7 @@ async fn run(app: AppHandle) {
             last_cfg = Some(cfg.clone());
             wanted.clear();
             revision = 0;
-            previous = None;
+            previous.clear();
             force_full = false;
             was_running = false;
             ack_id = 0;
@@ -158,21 +160,19 @@ async fn run(app: AppHandle) {
             results.clear();
         }
 
-        let selected_running = selected_thread(&app, &wanted)
-            .map(|t| {
-                let state = app.state::<AppState>();
-                is_running(&state, &t)
-            })
-            .unwrap_or(false);
-        if was_running && !selected_running {
+        let current = sync_threads(&app, &wanted);
+        let any_running = threads_running(&app, current.values());
+        let tracked_changed = !previous.is_empty()
+            && (previous.len() != current.len()
+                || previous.keys().any(|id| !current.contains_key(id)));
+        if (was_running && !any_running) || tracked_changed {
             force_full = true; // 一轮结束用全量校准，之后停止上传。
         }
 
-        if force_full || selected_running || !results.is_empty() {
+        if force_full || any_running || !results.is_empty() {
             let next_revision = revision.saturating_add(1).max(1);
-            let (body, current, sent_full) = if force_full || previous.is_none() {
-                let snap = full_snapshot(&app, &wanted);
-                let current = selected_thread(&app, &wanted);
+            let (body, sent_full) = if force_full || previous.is_empty() {
+                let snap = full_snapshot(&app, &wanted, &current);
                 (
                     json!({
                         "deviceName": cfg.name,
@@ -183,20 +183,24 @@ async fn run(app: AppHandle) {
                         "revision": next_revision,
                         "snapshot": snap,
                     }),
-                    current,
                     true,
                 )
             } else {
-                let current = selected_thread(&app, &wanted);
-                let Some(current_thread) = current.clone() else {
-                    force_full = true;
+                let mut deltas = Vec::with_capacity(current.len());
+                for (id, current_thread) in &current {
+                    let Some(old) = previous.get(id) else {
+                        force_full = true;
+                        break;
+                    };
+                    let Some(delta) = make_delta(old, current_thread, &app) else {
+                        force_full = true;
+                        break;
+                    };
+                    deltas.push(delta);
+                }
+                if force_full {
                     continue;
-                };
-                let Some(delta) = make_delta(previous.as_ref().unwrap(), &current_thread, &app)
-                else {
-                    force_full = true;
-                    continue;
-                };
+                }
                 (
                     json!({
                         "deviceName": cfg.name,
@@ -205,9 +209,8 @@ async fn run(app: AppHandle) {
                         "kind": "delta",
                         "baseRevision": revision,
                         "revision": next_revision,
-                        "delta": { "thread": delta },
+                        "delta": { "threads": deltas },
                     }),
-                    current,
                     false,
                 )
             };
@@ -220,7 +223,7 @@ async fn run(app: AppHandle) {
                     results.clear();
                     if resp.wanted_thread_id != wanted {
                         wanted = resp.wanted_thread_id;
-                        previous = None;
+                        previous.clear();
                         force_full = true;
                     }
                     process_commands(
@@ -233,15 +236,15 @@ async fn run(app: AppHandle) {
                         &mut wanted,
                     )
                     .await;
-                    if sent_full && !selected_running && results.is_empty() && !force_full {
+                    if sent_full && !any_running && results.is_empty() && !force_full {
                         was_running = false;
                     } else {
-                        was_running = selected_running;
+                        was_running = any_running;
                     }
                 }
                 Err(e) => sleep(error_backoff(&e)).await,
             }
-            if selected_running || force_full || !results.is_empty() {
+            if any_running || force_full || !results.is_empty() {
                 sleep(ACTIVE_INTERVAL).await;
             }
             continue;
@@ -256,7 +259,7 @@ async fn run(app: AppHandle) {
                 }
                 if resp.wanted_thread_id != wanted {
                     wanted = resp.wanted_thread_id;
-                    previous = None;
+                    previous.clear();
                     force_full = true;
                 }
                 process_commands(
@@ -272,12 +275,7 @@ async fn run(app: AppHandle) {
             }
             Err(e) => sleep(error_backoff(&e)).await,
         }
-        was_running = selected_thread(&app, &wanted)
-            .map(|t| {
-                let state = app.state::<AppState>();
-                is_running(&state, &t)
-            })
-            .unwrap_or(false);
+        was_running = any_eligible_thread_running(&app);
     }
 }
 
@@ -480,11 +478,59 @@ fn selected_thread(app: &AppHandle, wanted: &str) -> Option<Thread> {
         .cloned()
 }
 
-fn full_snapshot(app: &AppHandle, wanted: &str) -> RemoteSnapshot {
+/// server 当前查看的会话始终同步；除此之外，所有正在运行的普通会话也加入同步集合。
+/// 这里只决定上传范围，不修改桌面端 active_thread，因此后台会话不会被强制切到前台。
+fn sync_threads(app: &AppHandle, wanted: &str) -> HashMap<String, Thread> {
+    let state = app.state::<AppState>();
+    let store = state.store.lock().unwrap();
+    let selected_id = if !wanted.is_empty() && store.get(wanted).is_some_and(eligible) {
+        Some(wanted.to_string())
+    } else {
+        store
+            .threads
+            .iter()
+            .filter(|t| eligible(t))
+            .max_by_key(|t| t.updated_at)
+            .map(|t| t.id.clone())
+    };
+    store
+        .threads
+        .iter()
+        .filter(|t| eligible(t))
+        .filter(|t| selected_id.as_deref() == Some(t.id.as_str()) || is_running(&state, t))
+        .map(|t| (t.id.clone(), t.clone()))
+        .collect()
+}
+
+fn threads_running<'a>(app: &AppHandle, threads: impl Iterator<Item = &'a Thread>) -> bool {
+    let state = app.state::<AppState>();
+    threads.into_iter().any(|thread| is_running(&state, thread))
+}
+
+fn any_eligible_thread_running(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    let store = state.store.lock().unwrap();
+    store
+        .threads
+        .iter()
+        .filter(|thread| eligible(thread))
+        .any(|thread| is_running(&state, thread))
+}
+
+fn full_snapshot(
+    app: &AppHandle,
+    wanted: &str,
+    synced: &HashMap<String, Thread>,
+) -> RemoteSnapshot {
+    let selected = selected_thread(app, wanted);
     RemoteSnapshot {
         projects: projects(app),
         threads: thread_metas(app),
-        thread: selected_thread(app, wanted).map(|t| remote_thread_value(&t)),
+        thread: selected.as_ref().map(remote_thread_value),
+        thread_snapshots: synced
+            .iter()
+            .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
+            .collect(),
         models: models(app),
     }
 }
