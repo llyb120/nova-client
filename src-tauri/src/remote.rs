@@ -112,7 +112,7 @@ struct ServerResponse {
     #[serde(default)]
     commands: Vec<RemoteCommand>,
     #[serde(default)]
-    wanted_thread_id: String,
+    requested_thread_ids: Vec<String>,
     #[serde(default)]
     need_full: bool,
     #[serde(default)]
@@ -128,7 +128,7 @@ pub fn start(app: AppHandle) {
 async fn run(app: AppHandle) {
     let mut last_cfg: Option<RemoteConfig> = None;
     let mut client = Client::new();
-    let mut wanted = String::new();
+    let mut requested: HashSet<String> = HashSet::new();
     let mut revision = 0i64;
     let mut previous: HashMap<String, Thread> = HashMap::new();
     let mut force_full = false;
@@ -140,7 +140,7 @@ async fn run(app: AppHandle) {
     loop {
         let Some(cfg) = config(&app) else {
             last_cfg = None;
-            wanted.clear();
+            requested.clear();
             revision = 0;
             previous.clear();
             force_full = false;
@@ -150,7 +150,7 @@ async fn run(app: AppHandle) {
         if last_cfg.as_ref() != Some(&cfg) {
             client = build_client(&cfg.proxy);
             last_cfg = Some(cfg.clone());
-            wanted.clear();
+            requested.clear();
             revision = 0;
             previous.clear();
             force_full = false;
@@ -160,7 +160,7 @@ async fn run(app: AppHandle) {
             results.clear();
         }
 
-        let current = sync_threads(&app, &wanted);
+        let current = sync_threads(&app, &requested);
         let any_running = threads_running(&app, current.values());
         let tracked_changed = !previous.is_empty()
             && (previous.len() != current.len()
@@ -172,7 +172,7 @@ async fn run(app: AppHandle) {
         if force_full || any_running || !results.is_empty() {
             let next_revision = revision.saturating_add(1).max(1);
             let (body, sent_full) = if force_full || previous.is_empty() {
-                let snap = full_snapshot(&app, &wanted, &current);
+                let snap = full_snapshot(&app, &current);
                 (
                     json!({
                         "deviceName": cfg.name,
@@ -221,11 +221,7 @@ async fn run(app: AppHandle) {
                     previous = current;
                     force_full = resp.need_full;
                     results.clear();
-                    if resp.wanted_thread_id != wanted {
-                        wanted = resp.wanted_thread_id;
-                        previous.clear();
-                        force_full = true;
-                    }
+                    requested = resp.requested_thread_ids.into_iter().collect();
                     process_commands(
                         &app,
                         resp.commands,
@@ -233,7 +229,7 @@ async fn run(app: AppHandle) {
                         &mut ack_id,
                         &mut results,
                         &mut force_full,
-                        &mut wanted,
+                        &mut requested,
                     )
                     .await;
                     if sent_full && !any_running && results.is_empty() && !force_full {
@@ -257,11 +253,7 @@ async fn run(app: AppHandle) {
                 if resp.need_full {
                     force_full = true;
                 }
-                if resp.wanted_thread_id != wanted {
-                    wanted = resp.wanted_thread_id;
-                    previous.clear();
-                    force_full = true;
-                }
+                requested = resp.requested_thread_ids.into_iter().collect();
                 process_commands(
                     &app,
                     resp.commands,
@@ -269,7 +261,7 @@ async fn run(app: AppHandle) {
                     &mut ack_id,
                     &mut results,
                     &mut force_full,
-                    &mut wanted,
+                    &mut requested,
                 )
                 .await;
             }
@@ -464,40 +456,16 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
     out
 }
 
-fn selected_thread(app: &AppHandle, wanted: &str) -> Option<Thread> {
+/// 浏览器按需读取过的会话 + 所有正在运行的普通会话加入同步集合。
+/// 浏览器选择只形成只读快照请求，不修改桌面端 active_thread，也不影响其他浏览器。
+fn sync_threads(app: &AppHandle, requested: &HashSet<String>) -> HashMap<String, Thread> {
     let state = app.state::<AppState>();
     let store = state.store.lock().unwrap();
-    if !wanted.is_empty() {
-        return store.get(wanted).filter(|t| eligible(t)).cloned();
-    }
     store
         .threads
         .iter()
         .filter(|t| eligible(t))
-        .max_by_key(|t| t.updated_at)
-        .cloned()
-}
-
-/// server 当前查看的会话始终同步；除此之外，所有正在运行的普通会话也加入同步集合。
-/// 这里只决定上传范围，不修改桌面端 active_thread，因此后台会话不会被强制切到前台。
-fn sync_threads(app: &AppHandle, wanted: &str) -> HashMap<String, Thread> {
-    let state = app.state::<AppState>();
-    let store = state.store.lock().unwrap();
-    let selected_id = if !wanted.is_empty() && store.get(wanted).is_some_and(eligible) {
-        Some(wanted.to_string())
-    } else {
-        store
-            .threads
-            .iter()
-            .filter(|t| eligible(t))
-            .max_by_key(|t| t.updated_at)
-            .map(|t| t.id.clone())
-    };
-    store
-        .threads
-        .iter()
-        .filter(|t| eligible(t))
-        .filter(|t| selected_id.as_deref() == Some(t.id.as_str()) || is_running(&state, t))
+        .filter(|t| requested.contains(&t.id) || is_running(&state, t))
         .map(|t| (t.id.clone(), t.clone()))
         .collect()
 }
@@ -517,16 +485,11 @@ fn any_eligible_thread_running(app: &AppHandle) -> bool {
         .any(|thread| is_running(&state, thread))
 }
 
-fn full_snapshot(
-    app: &AppHandle,
-    wanted: &str,
-    synced: &HashMap<String, Thread>,
-) -> RemoteSnapshot {
-    let selected = selected_thread(app, wanted);
+fn full_snapshot(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSnapshot {
     RemoteSnapshot {
         projects: projects(app),
         threads: thread_metas(app),
-        thread: selected.as_ref().map(remote_thread_value),
+        thread: None,
         thread_snapshots: synced
             .iter()
             .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
@@ -601,7 +564,7 @@ async fn process_commands(
     ack_id: &mut i64,
     results: &mut Vec<CommandResult>,
     force_full: &mut bool,
-    wanted: &mut String,
+    requested: &mut HashSet<String>,
 ) {
     for cmd in commands {
         if cmd.id <= *processed_id {
@@ -612,11 +575,10 @@ async fn process_commands(
         *ack_id = cmd.id;
         results.push(match result {
             Ok(thread_id) => {
-                // 创建/发送/停止成功后立即把该会话设为下一次同步目标。
-                // 尤其是 create：必须让新会话全量快照与 command result 同包到达 server，
-                // 避免 server 先切 selectedThreadId、快照却仍是旧会话而一直显示“正在同步”。
+                // 创建/发送/停止成功后把该会话加入只读快照同步集合。
+                // 浏览器自己的 selectedThreadId 由 server 按 Cookie 独立维护，不反向影响 client。
                 if !thread_id.is_empty() {
-                    *wanted = thread_id.clone();
+                    requested.insert(thread_id.clone());
                 }
                 CommandResult {
                     id: cmd.id,

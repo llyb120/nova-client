@@ -26,38 +26,72 @@ function VirtualGroup(props: {
   /** 列表最后一组：始终挂载，保证新提示词有真实高度可供吸底 */
   keepMounted?: boolean;
   scrollEl: () => HTMLElement | undefined;
+  /** 滚动/布局变化时递增，兜底校正 WebView2 偶发漏掉的 IntersectionObserver 回调 */
+  viewportTick: number;
 }) {
   let ref: HTMLDivElement | undefined;
   const [visible, setVisible] = createSignal(true);
   const [height, setHeight] = createSignal(0);
   const mounted = () => visible() || props.active || !!props.keepMounted;
 
+  const rememberHeight = () => {
+    if (!ref || !mounted()) return;
+    const h = ref.getBoundingClientRect().height;
+    if (h > 0) setHeight((prev) => (Math.abs(prev - h) > 0.5 ? h : prev));
+  };
+
+  /**
+   * 不直接信任 IntersectionObserver 传来的 entry：快速程序化滚动时，WebView2 可能在
+   * 回调执行前已经滚到了新位置，旧 entry 会把当前视口里的轮次误卸载成一整块空白。
+   * 每次都用当前几何位置复核，并由父级滚动 tick 再兜一层。
+   */
+  const syncMounted = () => {
+    if (!ref || props.active || props.keepMounted) {
+      setVisible(true);
+      return;
+    }
+    const root = props.scrollEl();
+    if (!root) {
+      // 找不到滚动根时宁可保留 DOM，不能把内容变成无法恢复的空占位。
+      setVisible(true);
+      return;
+    }
+    const rect = ref.getBoundingClientRect();
+    const rootRect = root.getBoundingClientRect();
+    const buffer = 1200;
+    const nearViewport =
+      rect.bottom >= rootRect.top - buffer && rect.top <= rootRect.bottom + buffer;
+    if (nearViewport) {
+      setVisible(true);
+    } else {
+      rememberHeight();
+      setVisible(false);
+    }
+  };
+
   onMount(() => {
     if (!ref) return;
     const root = props.scrollEl();
+    if (!root) return;
     const io = new IntersectionObserver(
-      (entries) => {
-        const entry = entries[0];
-        if (!entry) return;
-        if (entry.isIntersecting || props.active || props.keepMounted) {
-          setVisible(true);
-        } else {
-          // 卸载前记录真实高度（此刻内容仍挂载）：用等高占位替身，滚动条不跳。
-          const h = entry.boundingClientRect.height;
-          if (h > 0) setHeight(h);
-          setVisible(false);
-        }
-      },
+      () => syncMounted(),
       // 视口上下各留 1200px 缓冲，减少快速滚动时的空白闪烁
-      { root: root ?? null, rootMargin: "1200px 0px" },
+      { root, rootMargin: "1200px 0px" },
     );
     io.observe(ref);
-    onCleanup(() => io.disconnect());
+    const ro = new ResizeObserver(() => rememberHeight());
+    ro.observe(ref);
+    syncMounted();
+    onCleanup(() => {
+      io.disconnect();
+      ro.disconnect();
+    });
   });
 
-  // keepMounted / active 变为 true 时立刻挂回，不等下一次 IO 回调
+  // keepMounted / active、滚动位置或整体布局变化后，立即用当前几何位置校正挂载状态。
   createEffect(() => {
-    if (props.active || props.keepMounted) setVisible(true);
+    void props.viewportTick;
+    syncMounted();
   });
 
   return (
@@ -78,7 +112,10 @@ export function ChatView() {
   let innerRef: HTMLDivElement | undefined;
   let endRef: HTMLDivElement | undefined;
   const [isEndVisible, setIsEndVisible] = createSignal(false);
+  const [viewportTick, setViewportTick] = createSignal(0);
   let scrollRaf = 0;
+  let settleRaf = 0;
+  let viewportRaf = 0;
   let awaitingSendUserItem = false;
   let itemsLenAtSend = 0;
 
@@ -93,14 +130,55 @@ export function ChatView() {
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
   const lastGroupIndex = () => groups().length - 1;
 
+  const refreshVirtualGroups = () => {
+    if (viewportRaf) return;
+    viewportRaf = requestAnimationFrame(() => {
+      viewportRaf = 0;
+      setViewportTick((n) => n + 1);
+    });
+  };
+
+  const pinBottom = () => {
+    if (!scrollRef) return;
+    scrollRef.scrollTop = scrollRef.scrollHeight;
+    endRef?.scrollIntoView({ block: "end", inline: "nearest" });
+    refreshVirtualGroups();
+  };
+
   const forceScrollToBottom = () => {
     if (!scrollRef) return;
     if (scrollRaf) return;
     scrollRaf = requestAnimationFrame(() => {
       scrollRaf = 0;
-      if (!scrollRef) return;
-      scrollRef.scrollTo({ top: scrollRef.scrollHeight, behavior: "instant" });
+      pinBottom();
     });
+  };
+
+  /** 虚拟轮次挂回会改变 scrollHeight；连续钉底到布局稳定，避免停在旧占位高度中间。 */
+  const settleToBottom = (maxMs = 1000) => {
+    if (settleRaf) cancelAnimationFrame(settleRaf);
+    if (scrollRaf) {
+      cancelAnimationFrame(scrollRaf);
+      scrollRaf = 0;
+    }
+    setIsEndVisible(true);
+    const deadline = performance.now() + maxMs;
+    let lastHeight = -1;
+    let stableFrames = 0;
+    const step = () => {
+      settleRaf = 0;
+      if (!scrollRef) return;
+      pinBottom();
+      const height = scrollRef.scrollHeight;
+      const distance = height - scrollRef.scrollTop - scrollRef.clientHeight;
+      if (height === lastHeight && distance <= 1) stableFrames++;
+      else stableFrames = 0;
+      lastHeight = height;
+      if (performance.now() < deadline && (awaitingSendUserItem || stableFrames < 3)) {
+        settleRaf = requestAnimationFrame(step);
+      }
+    };
+    settleRaf = requestAnimationFrame(step);
   };
 
   const scrollToBottom = () => {
@@ -112,6 +190,7 @@ export function ChatView() {
   const jumpToBottomNow = () => {
     awaitingSendUserItem = true;
     itemsLenAtSend = state.items.length;
+    settleToBottom(1200);
   };
 
   // 会话累计 token 用量
@@ -131,8 +210,7 @@ export function ChatView() {
 
     if (awaitingSendUserItem && len > itemsLenAtSend) {
       awaitingSendUserItem = false;
-      setIsEndVisible(true);
-      forceScrollToBottom();
+      settleToBottom(1000);
       return;
     }
 
@@ -151,6 +229,7 @@ export function ChatView() {
     );
     io.observe(endRef);
     const ro = new ResizeObserver(() => {
+      refreshVirtualGroups();
       if (isEndVisible()) scrollToBottom();
     });
     ro.observe(innerRef);
@@ -158,6 +237,8 @@ export function ChatView() {
       io.disconnect();
       ro.disconnect();
       if (scrollRaf) cancelAnimationFrame(scrollRaf);
+      if (settleRaf) cancelAnimationFrame(settleRaf);
+      if (viewportRaf) cancelAnimationFrame(viewportRaf);
     });
   });
 
@@ -166,8 +247,7 @@ export function ChatView() {
     const id = state.currentId;
     if (id !== prevId) {
       awaitingSendUserItem = false;
-      setIsEndVisible(true);
-      forceScrollToBottom();
+      settleToBottom(800);
     }
     return id;
   }, undefined);
@@ -336,7 +416,7 @@ export function ChatView() {
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
       </Show>
 
-      <div class="transcript" ref={scrollRef}>
+      <div class="transcript" ref={scrollRef} onScroll={refreshVirtualGroups}>
         <div class="transcript-inner" ref={innerRef}>
           <Show when={state.items.length === 0 && !state.loadingThread}>
             <div class="transcript-hint">
@@ -354,6 +434,7 @@ export function ChatView() {
                   active={isRunning() && !g.turn}
                   keepMounted={i() === lastGroupIndex()}
                   scrollEl={() => scrollRef}
+                  viewportTick={viewportTick()}
                 />
               )}
             </For>
