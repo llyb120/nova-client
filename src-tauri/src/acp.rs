@@ -326,6 +326,9 @@ pub struct AcpManager {
     /// 正在 session/load 回放、需要抑制 update 的会话
     loading_sessions: StdMutex<HashSet<String>>,
     running_threads: StdMutex<HashSet<String>>,
+    /// 每线程取消代次。CodeBuddy/Cursor 的 run_prompt 可能在串行闸门上等待；cancel
+    /// 递增代次后，仍在等待的旧轮次拿到闸门时必须退出，不能再次 set_running(true)。
+    cancel_epochs: StdMutex<HashMap<String, u64>>,
     /// 轮次开始时间，用于结束时计算耗时
     turn_started: StdMutex<HashMap<String, std::time::Instant>>,
     /// 诊断：session/prompt 发出时刻 → 用于测量「首响应延迟」(session_id)
@@ -401,6 +404,7 @@ impl AcpManager {
             routes: StdMutex::new(HashMap::new()),
             loading_sessions: StdMutex::new(HashSet::new()),
             running_threads: StdMutex::new(HashSet::new()),
+            cancel_epochs: StdMutex::new(HashMap::new()),
             turn_started: StdMutex::new(HashMap::new()),
             prompt_sent_at: StdMutex::new(HashMap::new()),
             pending_permissions: StdMutex::new(HashMap::new()),
@@ -451,6 +455,21 @@ impl AcpManager {
 
     pub fn is_running(&self, thread_id: &str) -> bool {
         self.running_threads.lock().unwrap().contains(thread_id)
+    }
+
+    fn cancel_epoch(&self, thread_id: &str) -> u64 {
+        self.cancel_epochs
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn bump_cancel_epoch(&self, thread_id: &str) {
+        let mut epochs = self.cancel_epochs.lock().unwrap();
+        let epoch = epochs.entry(thread_id.to_string()).or_insert(0);
+        *epoch = epoch.wrapping_add(1);
     }
 
     /// ACP session 不挂 Nova MCP；数字员工工具统一走 CLI。
@@ -3174,6 +3193,8 @@ impl AcpManager {
         text: String,
         images: Vec<PromptImage>,
     ) {
+        // 必须在任何 await / running 置位之前记录：停止可能发生在本轮等待独占连接闸门时。
+        let cancel_epoch = self.cancel_epoch(&thread_id);
         // 上下文接力：跨 agent 切换后的首条消息，把历史注入新 agent
         let handoff = {
             let state = self.app.state::<AppState>();
@@ -3217,6 +3238,11 @@ impl AcpManager {
         // 同线程排队 / 停止后重发：上一轮收尾可能已把 running 置为 false（或新轮次先置位后又
         // 被旧轮次 finish_turn 清掉），拿到闸门、真正开跑前重新置位并重置计时。
         if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor) {
+            if self.cancel_epoch(&thread_id) != cancel_epoch {
+                // 本轮在等待闸门期间已被停止。cancel 已负责写结束状态和清 running；
+                // 这里直接退出，禁止旧轮次“反弹”复活，导致用户必须再点一次停止。
+                return;
+            }
             self.set_running(&thread_id, true, None);
         }
 
@@ -3678,6 +3704,9 @@ impl AcpManager {
     pub async fn cancel(self: &Arc<Self>, thread_id: &str) {
         if !self.is_running(thread_id) {
             return;
+        }
+        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor) {
+            self.bump_cancel_epoch(thread_id);
         }
 
         let conn_key = self.conn_key_for_thread(thread_id);

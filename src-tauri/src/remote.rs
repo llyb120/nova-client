@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::sleep;
 
 const ACTIVE_INTERVAL: Duration = Duration::from_secs(2);
+const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
 
 #[derive(Clone, PartialEq, Eq)]
 struct RemoteConfig {
@@ -229,6 +230,7 @@ async fn run(app: AppHandle) {
                         &mut ack_id,
                         &mut results,
                         &mut force_full,
+                        &mut wanted,
                     )
                     .await;
                     if sent_full && !selected_running && results.is_empty() && !force_full {
@@ -264,6 +266,7 @@ async fn run(app: AppHandle) {
                     &mut ack_id,
                     &mut results,
                     &mut force_full,
+                    &mut wanted,
                 )
                 .await;
             }
@@ -379,7 +382,7 @@ async fn sync(
 }
 
 fn eligible(t: &Thread) -> bool {
-    t.roaming_role.is_none() && t.employee_id.is_none() && !t.mind_thread && !t.ephemeral
+    t.roaming_role.is_none() && t.employee_id.is_none() && !t.mind_thread
 }
 
 fn thread_metas(app: &AppHandle) -> Vec<RemoteThreadMeta> {
@@ -552,6 +555,7 @@ async fn process_commands(
     ack_id: &mut i64,
     results: &mut Vec<CommandResult>,
     force_full: &mut bool,
+    wanted: &mut String,
 ) {
     for cmd in commands {
         if cmd.id <= *processed_id {
@@ -561,12 +565,20 @@ async fn process_commands(
         *processed_id = cmd.id;
         *ack_id = cmd.id;
         results.push(match result {
-            Ok(thread_id) => CommandResult {
-                id: cmd.id,
-                ok: true,
-                error: String::new(),
-                thread_id,
-            },
+            Ok(thread_id) => {
+                // 创建/发送/停止成功后立即把该会话设为下一次同步目标。
+                // 尤其是 create：必须让新会话全量快照与 command result 同包到达 server，
+                // 避免 server 先切 selectedThreadId、快照却仍是旧会话而一直显示“正在同步”。
+                if !thread_id.is_empty() {
+                    *wanted = thread_id.clone();
+                }
+                CommandResult {
+                    id: cmd.id,
+                    ok: true,
+                    error: String::new(),
+                    thread_id,
+                }
+            }
             Err(error) => CommandResult {
                 id: cmd.id,
                 ok: false,
@@ -598,7 +610,8 @@ async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> Result<String,
 }
 
 fn create_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String> {
-    if !projects(app).iter().any(|p| p.path == cmd.cwd) {
+    let scratch = cmd.cwd == REMOTE_SCRATCH_PATH;
+    if !scratch && !projects(app).iter().any(|p| p.path == cmd.cwd) {
         return Err("只能选择电脑端已有项目".into());
     }
     let kind = AgentKind::from_str(&cmd.agent_kind).ok_or("模型后端无效")?;
@@ -606,13 +619,18 @@ fn create_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String>
     if !state.agent_enabled(&kind) {
         return Err(format!("{} 后端已关闭", kind.label()));
     }
+    let cwd = if scratch {
+        make_scratch_dir()?
+    } else {
+        cmd.cwd.clone()
+    };
     let mut thread = Thread::new(
-        cmd.cwd.clone(),
+        cwd.clone(),
         kind,
         Some(cmd.model.clone()).filter(|s| !s.is_empty()),
         Some(cmd.mode.clone()).filter(|s| !s.is_empty()),
         None,
-        false,
+        scratch,
     );
     // 远程入口不支持创建目录/worktree，只把已存在目录记录为最近项目。
     thread.updated_at = crate::threads::now_ms();
@@ -621,10 +639,23 @@ fn create_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String>
         store.threads.push(thread.clone());
         store.save();
     }
-    state.projects.lock().unwrap().touch(&cmd.cwd);
-    state.relay.publish_folders();
+    if !scratch {
+        state.projects.lock().unwrap().touch(&cwd);
+        state.relay.publish_folders();
+    }
     let _ = app.emit(crate::acp::EV_THREADS, json!({}));
     Ok(thread)
+}
+
+fn make_scratch_dir() -> Result<String, String> {
+    let name = format!(
+        "remote-{}-{}",
+        chrono::Local::now().format("%m%d-%H%M%S"),
+        &uuid::Uuid::new_v4().to_string()[..4]
+    );
+    let dir = std::env::temp_dir().join(SCRATCH_MARK).join(name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+    Ok(dir.to_string_lossy().to_string())
 }
 
 fn send_prompt(app: &AppHandle, thread_id: &str, text: &str) -> Result<(), String> {
@@ -687,6 +718,23 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         }
         thread.agent_kind.clone()
     };
+    if kind == AgentKind::Cursor {
+        let mgr = state.acp_for(&kind).ok_or("后端不可用")?;
+
+        // 远程 create/send 是异步启动的：停止命令可能紧跟着到达，而 run_prompt 还没来得及
+        // 登记 running。短暂等它进入启动窗口，避免第一次 cancel 被当成空闲直接忽略。
+        for _ in 0..40 {
+            if mgr.is_running(thread_id) {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        if !mgr.is_running(thread_id) {
+            return Ok(());
+        }
+        mgr.cancel(thread_id).await;
+        return Ok(());
+    }
     match state.acp_for(&kind) {
         Some(mgr) => mgr.cancel(thread_id).await,
         None => state.codex.cancel(thread_id).await,
