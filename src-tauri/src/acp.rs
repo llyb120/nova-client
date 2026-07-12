@@ -608,29 +608,38 @@ impl AcpManager {
         }
     }
 
-    /// 拉起 cursor-agent 前同步 `~/.cursor/cli-config.json`。
+    /// 为一条 cursor-agent 连接准备隔离的配置目录。
     ///
-    /// cursor-agent 启动时读取该文件并缓存；`--model <flat-id>` 只会解析出基座 + effort，
-    /// **不会清掉**配置里残留的 `fast=true`，于是 `grok-4.5-high` 会被合成成
-    /// `grok-4.5-fast-high`。因此：
+    /// Nova 的 Cursor 用户线程各自运行独立进程，但 Cursor 默认让所有进程共享
+    /// `~/.cursor/cli-config.json` 与同目录的 `acp-config.json`。并发使用不同模型时，进程会
+    /// 互相覆盖 selectedModel / effort / fast；新进程也可能恰好读到另一线程刚写入的参数，
+    /// 于是选择 xhigh 却实际发出 high/medium，或意外带上 fast。
+    ///
+    /// Cursor 官方支持用 `CURSOR_CONFIG_DIR` 改写配置目录。这里从全局 cli-config 复制登录、
+    /// 网络等设置到本进程专属目录，再写入本线程模型参数；不复制全局 acp-config，避免其中
+    /// 残留的 selectedModelVariantId 再次覆盖 `--model`。因此：
     /// 1. 始终关闭 Max Mode 计费开关（模型名/effort 里的 Max 不是该开关）；
     /// 2. 若本次以明确 CLI 模型启动，把 `selectedModel` / `modelParameters` 写成与扁平 id
-    ///    一致的参数（含显式 `fast=false`），避免 IDE/上次会话的 Fast 偏好污染 ACP。
-    /// 只做本地文件操作，不发出任何模型请求。
-    /// 返回是否有实质改动（用于调用方决定是否需要重启已缓存的 cursor-agent 进程）。
-    fn ensure_cursor_cli_config(&self, startup_model: Option<&str>) -> bool {
+    ///    一致的参数（含显式 `fast=false`）；
+    /// 3. 每次进程启动都从全局配置重新复制，及时带上登录态/网络设置的变化。
+    /// 只做本地文件操作，不发出任何模型请求。失败时返回 None，让 Cursor 回退到默认目录。
+    fn prepare_cursor_config_dir(
+        &self,
+        conn_key: &str,
+        startup_model: Option<&str>,
+    ) -> Option<std::path::PathBuf> {
         let Some(home) = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(std::path::PathBuf::from)
         else {
-            return false;
+            return None;
         };
-        let path = home.join(".cursor").join("cli-config.json");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return false; // 没有配置文件：cursor-agent 默认 Max Mode 关闭，无需处理
+        let source = home.join(".cursor").join("cli-config.json");
+        let Ok(raw) = std::fs::read_to_string(&source) else {
+            return None;
         };
         let Ok(mut cfg) = serde_json::from_str::<Value>(&raw) else {
-            return false;
+            return None;
         };
         let mut notes: Vec<String> = Vec::new();
         if clear_cursor_max_mode(&mut cfg) {
@@ -641,20 +650,36 @@ impl AcpManager {
                 notes.push(format!("同步模型参数 → {model}"));
             }
         }
-        if notes.is_empty() {
-            return false;
+        // conn_key 只会是 UUID / __aux__ / __shared__，直接作为目录名可保持同一连接重启时复用。
+        // 再按进程 id 分层，避免上次异常退出留下的 acp-config 污染本次运行。
+        let config_dir = nova_data_dir(&self.app)
+            .join("cursor-config")
+            .join(std::process::id().to_string())
+            .join(conn_key);
+        if let Err(e) = std::fs::create_dir_all(&config_dir) {
+            self.push_log(format!("[nova] 创建 Cursor 隔离配置目录失败：{e}"));
+            return None;
         }
+        // 同一线程切换模型后会复用这个目录；Cursor ACP 持久化的旧变体优先级可能高于
+        // `--model`，所以每次重启都清掉，仅保留下面重新生成的 cli-config。
+        let _ = std::fs::remove_file(config_dir.join("acp-config.json"));
+        let path = config_dir.join("cli-config.json");
         match write_cursor_cli_config(&path, &cfg) {
             Ok(()) => {
                 self.push_log(format!(
-                    "[nova] 已更新 Cursor cli-config.json（{}）",
-                    notes.join("；")
+                    "[nova] 已准备 Cursor 隔离配置 {}{}",
+                    config_dir.display(),
+                    if notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!("（{}）", notes.join("；"))
+                    }
                 ));
-                true
+                Some(config_dir)
             }
             Err(e) => {
-                self.push_log(format!("[nova] 更新 Cursor cli-config.json 失败：{e}"));
-                false
+                self.push_log(format!("[nova] 写入 Cursor 隔离配置失败：{e}"));
+                None
             }
         }
     }
@@ -1298,36 +1323,22 @@ impl AcpManager {
         let mut guard = slot.lock().await;
         if let Some(c) = guard.as_ref() {
             if c.alive.load(Ordering::SeqCst) {
-                let mut needs_respawn = matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor)
-                    && want_cwd.is_some()
-                    && self
-                        .conn_cwd
-                        .lock()
-                        .unwrap()
-                        .get(conn_key)
-                        .map(String::as_str)
-                        != want_cwd;
-                // Cursor：连接复用时也要同步 cli-config。cursor-agent 启动时缓存了该文件，
-                // 若残留 fast=true 会把 --model grok-4.5-high 合成 grok-4.5-fast-high。
-                // 检测到需要改动时 kill 旧进程、重新 spawn，让 cursor-agent 读入修正后的配置。
-                if !needs_respawn
-                    && self.kind == AgentKind::Cursor
-                    && conn_key != AUX_KEY
-                {
-                    let startup_model = self.cursor_startup_model_for_thread(conn_key);
-                    if self.ensure_cursor_cli_config(startup_model.as_deref()) {
-                        needs_respawn = true;
-                        self.push_log(format!(
-                            "[nova] cli-config 已变更，重启 Cursor 连接以应用新配置"
-                        ));
-                    }
-                }
+                let needs_respawn =
+                    matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor)
+                        && want_cwd.is_some()
+                        && self
+                            .conn_cwd
+                            .lock()
+                            .unwrap()
+                            .get(conn_key)
+                            .map(String::as_str)
+                            != want_cwd;
                 if !needs_respawn {
                     self.touch_conn(conn_key);
                     return Ok(c.clone());
                 }
-                // 切工作目录或 cli-config 变更：摘掉旧连接并杀掉（其关闭回调会因槽内即将换成
-                // 新连接而判定 stale、跳过清理）；这里只清理本连接键的会话路由，随后重启。
+                // 切工作目录：摘掉旧连接并杀掉（其关闭回调会因槽内即将换成新连接而判定
+                // stale、跳过清理）；这里只清理本连接键的会话路由，随后重启。
                 if let Some(old) = guard.take() {
                     old.kill();
                 }
@@ -1410,8 +1421,7 @@ impl AcpManager {
         };
         // Cursor ACP 的 session/set_model 只接受 session/new 返回的少量默认变体；CLI 目录里的
         // 完整 thinking/effort/fast 组合必须用全局 `--model <id>` 在 `acp` 子命令之前启动。
-        let cursor_startup_model = if self.kind == AgentKind::Cursor && conn_key != self.aux_key()
-        {
+        let cursor_startup_model = if self.kind == AgentKind::Cursor && conn_key != self.aux_key() {
             self.cursor_startup_model_for_thread(conn_key)
         } else {
             None
@@ -1448,11 +1458,13 @@ impl AcpManager {
         // 把 ~/.nova/skills 用软链接/目录联接同步到各后端全局 skills 目录
         crate::skills::sync_skills_from_home();
 
-        // Cursor：拉起进程前同步 cli-config（关 Max Mode；按 --model 扁平 id 写回
-        // selectedModel/modelParameters，避免残留 fast=true 把 high 合成 fast-high）。
-        // cursor-agent 启动时读入并缓存该文件，必须在 spawn 前写完。
-        if self.kind == AgentKind::Cursor {
-            let _ = self.ensure_cursor_cli_config(cursor_startup_model.as_deref());
+        // Cursor：每条连接使用自己的配置目录，隔离不同线程的 effort / fast / ACP 变体缓存。
+        // cursor-agent 启动时读入并缓存配置，必须在 spawn 前准备并注入环境变量。
+        let cursor_config_dir = (self.kind == AgentKind::Cursor)
+            .then(|| self.prepare_cursor_config_dir(conn_key, cursor_startup_model.as_deref()))
+            .flatten();
+        if let Some(dir) = cursor_config_dir.as_ref() {
+            cmd.env("CURSOR_CONFIG_DIR", dir);
         }
 
         // CodeBuddy / Cursor：按会话项目目录启动进程。
@@ -4663,21 +4675,21 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
 
     #[test]
     fn flat_id_selection_clears_stale_fast() {
-        let (base, params) = cursor_selection_from_flat_id("grok-4.5-high");
+        let (base, params) = cursor_selection_from_flat_id("grok-4.5-xhigh");
         assert_eq!(base, "grok-4.5");
         assert_eq!(
             params,
             vec![
-                json!({ "id": "effort", "value": "high" }),
+                json!({ "id": "effort", "value": "xhigh" }),
                 json!({ "id": "fast", "value": "false" }),
             ]
         );
-        let (base_fast, params_fast) = cursor_selection_from_flat_id("grok-4.5-fast-high");
+        let (base_fast, params_fast) = cursor_selection_from_flat_id("grok-4.5-fast-xhigh");
         assert_eq!(base_fast, "grok-4.5");
         assert_eq!(
             params_fast,
             vec![
-                json!({ "id": "effort", "value": "high" }),
+                json!({ "id": "effort", "value": "xhigh" }),
                 json!({ "id": "fast", "value": "true" }),
             ]
         );
@@ -4710,13 +4722,13 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
         assert!(clear_cursor_max_mode(&mut cfg));
         assert_eq!(cfg["maxMode"], json!(false));
         assert_eq!(cfg["model"]["maxMode"], json!(false));
-        assert!(sync_cursor_cli_model_selection(&mut cfg, "grok-4.5-high"));
+        assert!(sync_cursor_cli_model_selection(&mut cfg, "grok-4.5-xhigh"));
         assert_eq!(
             cfg["selectedModel"],
             json!({
                 "modelId": "grok-4.5",
                 "parameters": [
-                    { "id": "effort", "value": "high" },
+                    { "id": "effort", "value": "xhigh" },
                     { "id": "fast", "value": "false" }
                 ]
             })
@@ -4724,12 +4736,12 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
         assert_eq!(
             cfg["modelParameters"]["grok-4.5"],
             json!([
-                { "id": "effort", "value": "high" },
+                { "id": "effort", "value": "xhigh" },
                 { "id": "fast", "value": "false" }
             ])
         );
         // 已对齐时再写应无改动
-        assert!(!sync_cursor_cli_model_selection(&mut cfg, "grok-4.5-high"));
+        assert!(!sync_cursor_cli_model_selection(&mut cfg, "grok-4.5-xhigh"));
     }
 
     #[test]

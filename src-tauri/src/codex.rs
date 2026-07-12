@@ -20,6 +20,7 @@ use tokio::time::{timeout, Duration};
 
 const LOG_CAP: usize = 800;
 const TOOL_OUTPUT_MAX_LINES: usize = 500;
+const TOOL_OUTPUT_MAX_CHARS: usize = 10_000;
 const TOOL_OUTPUT_OMISSION_PREFIX: &str = "[输出过长，已省略前面内容，仅保留最后";
 
 #[cfg(windows)]
@@ -2707,14 +2708,32 @@ fn codex_result_content(result: Option<&Value>, error: Option<&Value>) -> Vec<Va
 fn limit_display_text(text: &str) -> String {
     let text = strip_omission_notice(text);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    if lines.len() <= TOOL_OUTPUT_MAX_LINES {
+    let exceeds_line_limit = lines.len() > TOOL_OUTPUT_MAX_LINES;
+    let exceeds_char_limit = text.chars().count() > TOOL_OUTPUT_MAX_CHARS;
+    if !exceeds_line_limit && !exceeds_char_limit {
         return text.to_string();
     }
-    format!(
-        "{} {}行]\n{}",
-        TOOL_OUTPUT_OMISSION_PREFIX,
-        TOOL_OUTPUT_MAX_LINES,
+
+    let tail = if exceeds_line_limit {
         lines[lines.len() - TOOL_OUTPUT_MAX_LINES..].concat()
+    } else {
+        text.to_string()
+    };
+    let tail_char_count = tail.chars().count();
+    let tail = if tail_char_count > TOOL_OUTPUT_MAX_CHARS {
+        let start = tail
+            .char_indices()
+            .nth(tail_char_count - TOOL_OUTPUT_MAX_CHARS)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        &tail[start..]
+    } else {
+        &tail
+    };
+
+    format!(
+        "{} {}行或{}字符（取较小者）]\n{}",
+        TOOL_OUTPUT_OMISSION_PREFIX, TOOL_OUTPUT_MAX_LINES, TOOL_OUTPUT_MAX_CHARS, tail
     )
 }
 
@@ -2723,6 +2742,55 @@ fn strip_omission_notice(text: &str) -> &str {
         return text;
     };
     rest.split_once('\n').map(|(_, tail)| tail).unwrap_or(text)
+}
+
+#[cfg(test)]
+mod display_text_tests {
+    use super::*;
+
+    fn omission_payload(text: &str) -> &str {
+        text.split_once('\n').map(|(_, tail)| tail).unwrap()
+    }
+
+    #[test]
+    fn limits_tool_output_to_last_500_lines() {
+        let input = (0..501)
+            .map(|index| format!("line {index}\n"))
+            .collect::<String>();
+
+        let output = limit_display_text(&input);
+        let payload = omission_payload(&output);
+
+        assert!(output.starts_with(TOOL_OUTPUT_OMISSION_PREFIX));
+        assert_eq!(payload.lines().count(), TOOL_OUTPUT_MAX_LINES);
+        assert!(!payload.starts_with("line 0\n"));
+        assert!(payload.ends_with("line 500\n"));
+    }
+
+    #[test]
+    fn limits_tool_output_to_last_10000_unicode_characters() {
+        let input = format!("开头{}", "界".repeat(TOOL_OUTPUT_MAX_CHARS));
+
+        let output = limit_display_text(&input);
+        let payload = omission_payload(&output);
+
+        assert_eq!(payload.chars().count(), TOOL_OUTPUT_MAX_CHARS);
+        assert_eq!(payload, "界".repeat(TOOL_OUTPUT_MAX_CHARS));
+    }
+
+    #[test]
+    fn applies_the_smaller_of_the_line_and_character_limits() {
+        let input = (0..501)
+            .map(|_| format!("{}\n", "字".repeat(30)))
+            .collect::<String>();
+
+        let output = limit_display_text(&input);
+        let payload = omission_payload(&output);
+
+        assert_eq!(payload.chars().count(), TOOL_OUTPUT_MAX_CHARS);
+        assert!(payload.lines().count() <= TOOL_OUTPUT_MAX_LINES);
+        assert!(input.ends_with(payload));
+    }
 }
 
 fn normalize_tool_status(status: &str) -> String {
