@@ -610,13 +610,17 @@ fn catalog_signature_for(metas: &[RemoteThreadMeta]) -> String {
 
 fn thread_changed(old: &Thread, old_running: bool, current: &Thread, running: bool) -> bool {
     old_running != running
-        || old.updated_at != current.updated_at
         || old.title != current.title
         || old.cwd != current.cwd
         || old.agent_kind != current.agent_kind
         || old.model != current.model
         || old.mode != current.mode
         || old.items.len() != current.items.len()
+        || old
+            .items
+            .iter()
+            .zip(current.items.iter())
+            .any(|(before, after)| remote_item_value(before) != remote_item_value(after))
 }
 
 fn recent_thread_ids(app: &AppHandle, limit: usize) -> Vec<String> {
@@ -634,25 +638,42 @@ fn recent_thread_ids(app: &AppHandle, limit: usize) -> Vec<String> {
 fn remote_thread_value(thread: &Thread) -> Value {
     let mut thread = thread.clone();
     for item in &mut thread.items {
-        if let Item::User { images, .. } = item {
-            for image in images {
-                image.data = None;
-                image.uri = None;
-            }
-        }
+        compact_remote_item(item);
     }
     serde_json::to_value(thread).unwrap_or(Value::Null)
 }
 
 fn remote_item_value(item: &Item) -> Value {
     let mut item = item.clone();
-    if let Item::User { images, .. } = &mut item {
-        for image in images {
-            image.data = None;
-            image.uri = None;
-        }
-    }
+    compact_remote_item(&mut item);
     serde_json::to_value(item).unwrap_or(Value::Null)
+}
+
+// 远控会话只展示工具做了什么，不传输命令输出、原始入参/出参和文件 diff。
+// title 已包含执行命令；文件编辑保留 locations 中的路径即可。
+fn compact_remote_item(item: &mut Item) {
+    match item {
+        Item::User { images, .. } => {
+            for image in images {
+                image.data = None;
+                image.uri = None;
+            }
+        }
+        Item::Tool { call, .. } => {
+            call.content.clear();
+            call.raw_input = None;
+            call.raw_output = None;
+            for location in &mut call.locations {
+                let Some(path) = location.get("path").cloned() else {
+                    *location = Value::Null;
+                    continue;
+                };
+                *location = json!({ "path": path });
+            }
+            call.locations.retain(|location| !location.is_null());
+        }
+        _ => {}
+    }
 }
 
 fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<RemoteThreadDelta> {
@@ -669,7 +690,7 @@ fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<Re
         let differs = previous
             .items
             .get(index)
-            .map(|old| serde_json::to_vec(old).ok() != serde_json::to_vec(item).ok())
+            .map(|old| remote_item_value(old) != remote_item_value(item))
             .unwrap_or(true);
         if differs {
             changed.push(remote_item_value(item));
@@ -688,6 +709,57 @@ fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<Re
         item_count: current.items.len(),
         items: changed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_tool_items_only_keep_summary_and_file_paths() {
+        let item: Item = serde_json::from_value(json!({
+            "type": "tool",
+            "id": 7,
+            "ts": 1,
+            "toolCallId": "call-1",
+            "title": "修改 src/main.rs",
+            "kind": "edit",
+            "status": "completed",
+            "content": [{"type": "diff", "oldText": "secret old", "newText": "secret new"}],
+            "locations": [{"path": "src/main.rs", "line": 42, "extra": "detail"}],
+            "rawInput": {"patch": "internal"},
+            "rawOutput": {"diff": "internal"}
+        }))
+        .unwrap();
+
+        let value = remote_item_value(&item);
+        assert_eq!(value["title"], "修改 src/main.rs");
+        assert_eq!(value["kind"], "edit");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["locations"], json!([{"path": "src/main.rs"}]));
+        assert_eq!(value["content"], json!([]));
+        assert!(value.get("rawInput").is_none());
+        assert!(value.get("rawOutput").is_none());
+    }
+
+    #[test]
+    fn internal_tool_output_does_not_count_as_remote_change() {
+        let before: Item = serde_json::from_value(json!({
+            "type": "tool", "id": 7, "ts": 1, "toolCallId": "call-1",
+            "title": "cargo test", "kind": "execute", "status": "in_progress",
+            "content": [{"type": "content", "content": {"type": "text", "text": "line 1"}}],
+            "locations": [], "rawOutput": {"text": "line 1"}
+        }))
+        .unwrap();
+        let after: Item = serde_json::from_value(json!({
+            "type": "tool", "id": 7, "ts": 1, "toolCallId": "call-1",
+            "title": "cargo test", "kind": "execute", "status": "in_progress",
+            "content": [{"type": "content", "content": {"type": "text", "text": "line 1\nline 2"}}],
+            "locations": [], "rawOutput": {"text": "line 1\nline 2"}
+        }))
+        .unwrap();
+        assert_eq!(remote_item_value(&before), remote_item_value(&after));
+    }
 }
 
 async fn process_commands(
