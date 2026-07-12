@@ -24,6 +24,7 @@ function threadGroupName(cwd: string): string {
 }
 
 const DEFAULT_RELAY_SERVER = "";
+const RELAY_SERVER_PLACEHOLDER = "http://127.0.0.1:8320";
 const DEFAULT_CLAUDECODE_ARGS = "-y @zed-industries/claude-code-acp";
 const DEFAULT_PXPIPE_MODELS = "gpt-5.5";
 
@@ -1044,7 +1045,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                 class="field-input"
                 value={relayServer()}
                 onInput={(e) => setRelayServer(e.currentTarget.value)}
-                placeholder={DEFAULT_RELAY_SERVER}
+                placeholder={RELAY_SERVER_PLACEHOLDER}
               />
               <span class="field-hint">中转服务地址，一般用默认即可（留空也会回退到默认）。</span>
             </div>

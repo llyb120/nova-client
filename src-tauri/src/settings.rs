@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-/// 默认中转服务地址。relay_server 为空时回退到它，使「填了 token 就能连」。
+/// 默认中转服务地址。relay_server 为空时回退到它；空字符串表示必须用户自填。
 pub const DEFAULT_RELAY_SERVER: &str = "";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

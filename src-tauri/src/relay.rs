@@ -229,6 +229,10 @@ impl RelayManager {
             return None;
         }
         let server = resolve_relay_server(&s.relay_server);
+        // 无默认地址时必须显式填写 server，否则不启中转。
+        if server.is_empty() {
+            return None;
+        }
         let name = relay_display_name(&s);
         Some((server, token, name))
     }
@@ -2621,6 +2625,9 @@ pub async fn probe_relay(server: &str, token: &str, groups: &str) -> Result<i64,
         return Err("请先填写 token".into());
     }
     let server = resolve_relay_server(server);
+    if server.is_empty() {
+        return Err("请先填写中转站地址".into());
+    }
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(15))
