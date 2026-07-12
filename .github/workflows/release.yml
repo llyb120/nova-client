@@ -1,79 +1,42 @@
 name: Release
 
-# 手动发版 → 打 zip/DMG → 创建 GitHub Release（客户端从此拉取更新）
+# push 到 master → 自动 patch+1 → 构建 → 发 GitHub Release → 版本号写回仓库
+# 构建失败不会写回版本号，不会跳号。
 
 on:
-  workflow_dispatch:
-    inputs:
-      bump:
-        description: Version bump（不填 version 时生效）
-        type: choice
-        options: [patch, minor, major]
-        default: patch
-      version:
-        description: 显式版本号（如 0.1.200；留空则按 bump 自增）
-        required: false
-        default: ""
+  push:
+    branches: [master, main]
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   prepare:
-    name: Bump version & push
+    name: Compute next version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
-      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute & write version
+      - name: Compute next version (patch +1)
         id: ver
         shell: bash
         run: |
           set -euo pipefail
           CUR=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
-          EXPLICIT="${{ inputs.version }}"
-          BUMP="${{ inputs.bump }}"
-          if [[ -n "$EXPLICIT" ]]; then
-            NEW="$EXPLICIT"
-          else
-            IFS=. read -r A B C <<< "$CUR"
-            A=${A:-0}; B=${B:-0}; C=${C:-0}
-            case "$BUMP" in
-              major) NEW="$((A+1)).0.0" ;;
-              minor) NEW="${A}.$((B+1)).0" ;;
-              *)     NEW="${A}.${B}.$((C+1))" ;;
-            esac
-          fi
-          echo "current=$CUR"
-          echo "version=$NEW"
+          IFS=. read -r A B C <<< "$CUR"
+          A=${A:-0}; B=${B:-0}; C=${C:-0}
+          NEW="${A}.${B}.$((C+1))"
+          echo "current=$CUR -> $NEW"
           echo "version=$NEW" >> "$GITHUB_OUTPUT"
-          python3 scripts/package.py --version "$NEW" --bump-only
 
-      - name: Commit and push version bump
-        id: commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          VER="${{ steps.ver.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src-tauri/tauri.conf.json package.json
-          if git diff --staged --quiet; then
-            echo "版本已是 v${VER}，无需提交"
-            echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          else
-            git commit -m "chore: release v${VER} [skip ci]"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          fi
-
-  release:
-    name: Package (${{ matrix.name }})
+  build:
+    name: Build (${{ matrix.name }})
     needs: prepare
     strategy:
       fail-fast: false
@@ -86,8 +49,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: Use crates.io (skip China mirror on GitHub runners)
         shell: bash
@@ -106,17 +67,29 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
-      - run: npm ci
 
-      - name: Build update zip
+      - run: npm ci
+      - run: npm run check
+
+      - name: Write version into config files
         shell: bash
         run: |
           VER="${{ needs.prepare.outputs.version }}"
-          python scripts/package.py --version "$VER" --no-upload
+          python3 scripts/package.py --version "$VER" --bump-only
 
-      - name: Build macOS DMG
+      - name: Build (Windows binary)
+        if: runner.os == 'Windows'
+        run: npx tauri build --no-bundle
+
+      - name: Build (macOS app + DMG)
         if: runner.os == 'macOS'
         run: npx tauri build --bundles dmg
+
+      - name: Package update zip
+        shell: bash
+        run: |
+          VER="${{ needs.prepare.outputs.version }}"
+          python3 scripts/package.py --version "$VER" --no-build
 
       - name: Upload update zip
         uses: actions/upload-artifact@v4
@@ -133,21 +106,44 @@ jobs:
           path: src-tauri/target/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
-  github-release:
-    name: GitHub Release
-    needs: [prepare, release]
+  release:
+    name: Write back version & publish Release
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write version & commit & push & tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ needs.prepare.outputs.version }}"
+          python3 scripts/package.py --version "$VER" --bump-only
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/tauri.conf.json package.json
+          if git diff --staged --quiet; then
+            echo "版本已是 v${VER}，无需提交"
+          else
+            git commit -m "chore: release v${VER} [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+          git tag -f "v${VER}"
+          git push origin "v${VER}" -f
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: Nova v${{ needs.prepare.outputs.version }}
-          target_commitish: ${{ needs.prepare.outputs.sha }}
+          target_commitish: ${{ github.ref }}
           generate_release_notes: true
           files: |
             dist/**/*.zip
