@@ -215,6 +215,8 @@ export function ModelPicker(props: {
   );
   const merged = createMemo(() => kinds().length > 1 || sharedOptions().length > 0);
   const sourceOf = (k: AgentKind) => props.modelSource?.(k);
+  const quotaPeerForToken = (token: string) =>
+    (props.sharedModels ?? []).find((source) => source.peer.token === token)?.peer;
 
   const modelOptions = createMemo<SelectOption[]>(() => {
     if (!merged()) return modelOptionsOf(props.agentKind, false, sourceOf(props.agentKind));
@@ -245,9 +247,7 @@ export function ModelPicker(props: {
     }
     const decoded = decodeModelValue(v);
     if (!decoded) return;
-    const quotaPeer = decoded.peerToken
-      ? (props.sharedModels ?? []).find((source) => source.peer.token === decoded.peerToken)?.peer
-      : null;
+    const quotaPeer = decoded.peerToken ? quotaPeerForToken(decoded.peerToken) : null;
     props.onPickModel(decoded.agentKind, decoded.model, quotaPeer);
   };
 
@@ -259,9 +259,7 @@ export function ModelPicker(props: {
   const fallbackLabel = createMemo(() => {
     if (props.modelSource) return undefined;
     if (props.quotaPeerToken) {
-      const peer = (props.sharedModels ?? []).find(
-        (source) => source.peer.token === props.quotaPeerToken,
-      )?.peer;
+      const peer = quotaPeerForToken(props.quotaPeerToken);
       return peer
         ? `${peer.name}的${agentLabel(props.agentKind)} · ${props.model || "默认"}`
         : props.model;

@@ -209,28 +209,25 @@ export function SettingsModal(props: { onClose: () => void }) {
       opencodeEnabled(),
     ].filter(Boolean).length;
 
-  const quotaShareKinds = (): AgentKind[] =>
-    [
-      ["devin", devinEnabled()],
-      ["codex", codexEnabled()],
-      ["codebuddy", codebuddyEnabled()],
-      ["claudecode", claudecodeEnabled()],
-      ["cursor", cursorEnabled()],
-      ["opencode", opencodeEnabled()],
-    ]
-      .filter((entry) => entry[1])
-      .map((entry) => entry[0] as AgentKind);
+  const quotaShareKinds = createMemo<AgentKind[]>(() => {
+    const kinds: AgentKind[] = [];
+    if (devinEnabled()) kinds.push("devin");
+    if (codexEnabled()) kinds.push("codex");
+    if (codebuddyEnabled()) kinds.push("codebuddy");
+    if (claudecodeEnabled()) kinds.push("claudecode");
+    if (cursorEnabled()) kinds.push("cursor");
+    if (opencodeEnabled()) kinds.push("opencode");
+    return kinds;
+  });
 
   const quotaShareKey = (kind: AgentKind, model: string) => `${kind}:${model}`;
   const toggleQuotaSharedModel = (kind: AgentKind, model: string, checked: boolean) => {
     const key = quotaShareKey(kind, model);
-    setQuotaSharedModels((current) =>
-      checked
-        ? current.includes(key)
-          ? current
-          : [...current, key]
-        : current.filter((item) => item !== key),
-    );
+    setQuotaSharedModels((current) => {
+      if (!checked) return current.filter((item) => item !== key);
+      if (current.includes(key)) return current;
+      return [...current, key];
+    });
   };
 
   // 后端可用性检测结果：false = 已检测且未找到 CLI（卡片上提示，仍可手动改路径）
@@ -1316,12 +1313,12 @@ export function SettingsModal(props: { onClose: () => void }) {
                           <div class="quota-share-options">
                             <For each={choices()}>
                               {(choice) => {
-                                const key = () => quotaShareKey(kind, choice.value);
+                                const key = quotaShareKey(kind, choice.value);
                                 return (
                                   <label class="quota-share-option" title={choice.value}>
                                     <input
                                       type="checkbox"
-                                      checked={quotaSharedModels().includes(key())}
+                                      checked={quotaSharedModels().includes(key)}
                                       onChange={(event) =>
                                         toggleQuotaSharedModel(
                                           kind,

@@ -105,8 +105,7 @@ fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> 
         && !model.is_empty()
         && settings
             .quota_shared_models
-            .iter()
-            .any(|item| item == &quota_model_key(kind, model))
+            .contains(&quota_model_key(kind, model))
 }
 
 fn shared_model_options(
@@ -128,19 +127,17 @@ fn shared_model_options(
         option
             .get("value")
             .and_then(Value::as_str)
-            .map(|model| shared.contains(&quota_model_key(kind, model)))
-            .unwrap_or(false)
+            .is_some_and(|model| shared.contains(&quota_model_key(kind, model)))
     });
     let first = options
         .first()
         .and_then(|option| option.get("value"))
         .and_then(Value::as_str)
         .map(str::to_string)?;
-    let current_is_shared = current
+    if !current
         .as_deref()
-        .map(|model| shared.contains(&quota_model_key(kind, model)))
-        .unwrap_or(false);
-    if !current_is_shared {
+        .is_some_and(|model| shared.contains(&quota_model_key(kind, model)))
+    {
         model_option["currentValue"] = json!(first);
     }
     Some(filtered)

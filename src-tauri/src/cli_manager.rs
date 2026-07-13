@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
 pub const EV_CLI_OPERATION_PROGRESS: &str = "cli:operation-progress";
 const CANCELLED_ERROR: &str = "CLI 操作已取消";
+const MAX_COMMAND_OUTPUT_LEN: usize = 4000;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -318,11 +319,14 @@ where
         if line.is_empty() {
             continue;
         }
-        if output.len() < 4000 {
+        if output.len() < MAX_COMMAND_OUTPUT_LEN {
             if !output.is_empty() {
                 output.push('\n');
             }
-            output.extend(line.chars().take(4000usize.saturating_sub(output.len())));
+            output.extend(
+                line.chars()
+                    .take(MAX_COMMAND_OUTPUT_LEN.saturating_sub(output.len())),
+            );
         }
         emit_operation_progress(
             &app,
@@ -335,6 +339,14 @@ where
         );
     }
     output
+}
+
+async fn terminate_child(child: &mut tokio::process::Child, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        crate::acp::kill_process_tree(pid);
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 async fn run_command_with_progress(
@@ -389,19 +401,11 @@ async fn run_command_with_progress(
             result = child.wait() => break result.map_err(|e| format!("等待 {program} 失败：{e}"))?,
             _ = ticker.tick() => {
                 if cancelled.load(Ordering::SeqCst) {
-                    if let Some(pid) = pid {
-                        crate::acp::kill_process_tree(pid);
-                    }
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    terminate_child(&mut child, pid).await;
                     return Err(CANCELLED_ERROR.into());
                 }
                 if started.elapsed() >= timeout_duration {
-                    if let Some(pid) = pid {
-                        crate::acp::kill_process_tree(pid);
-                    }
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    terminate_child(&mut child, pid).await;
                     return Err(format!("{program} 执行超时"));
                 }
                 let next = percent.load(Ordering::SeqCst).saturating_add(1).min(85);
@@ -449,7 +453,7 @@ fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    joined.chars().take(4000).collect()
+    joined.chars().take(MAX_COMMAND_OUTPUT_LEN).collect()
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -723,18 +727,17 @@ pub async fn upgrade(
 }
 
 pub fn cancel(state: &AppState, operation_id: &str) -> bool {
-    let operation = state
+    let Some(cancelled) = state
         .cli_operations
         .lock()
         .unwrap()
         .get(operation_id)
-        .cloned();
-    if let Some(cancelled) = operation {
-        cancelled.store(true, Ordering::SeqCst);
-        true
-    } else {
-        false
-    }
+        .cloned()
+    else {
+        return false;
+    };
+    cancelled.store(true, Ordering::SeqCst);
+    true
 }
 
 pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
