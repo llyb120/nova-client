@@ -36,6 +36,8 @@ const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
 ///   与用户线程的连接完全隔离，避免抢占某个线程连接的「单活跃 session」。
 const SHARED_KEY: &str = "__shared__";
 const AUX_KEY: &str = "__aux__";
+const OPENCODE_BASE_MODEL_META: &str = "nova.ai/opencodeBaseModel";
+const OPENCODE_VARIANT_META: &str = "nova.ai/opencodeVariant";
 
 pub struct PendingPermission {
     pub rpc_id: Value,
@@ -904,7 +906,7 @@ impl AcpManager {
         std::fs::create_dir_all(&cwd)
             .map_err(|e| format!("创建 {} 模型探测目录失败：{e}", self.kind.label()))?;
         let conn = self.ensure_conn_for(&aux, None).await?;
-        let resp = conn
+        let mut resp = conn
             .request(
                 "session/new",
                 json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
@@ -912,6 +914,9 @@ impl AcpManager {
             )
             .await
             .map_err(|e| format!("拉取 {} 模型列表失败：{e}", self.kind.label()))?;
+        if self.kind == AgentKind::OpenCode {
+            resp = self.expand_opencode_model_variants(&conn, resp).await;
+        }
         self.capture_options(&resp);
         self.note_session_spawned(&aux);
         if let Some(sid) = resp["sessionId"].as_str() {
@@ -2319,6 +2324,14 @@ impl AcpManager {
         } else {
             models_to_config_options(result.get("models"))
         };
+        // OpenCode 只在切到某个模型后才返回该模型的 effort 选项。模型目录探测会把
+        // provider/model/variant 展开成可直接选择的模型项；普通 session/new / prewarm
+        // 仍只有基座模型列表，这里把已探测到的 variants 合回去，避免覆盖丰富目录。
+        if self.kind == AgentKind::OpenCode && !opencode_catalog_is_expanded(&config_options) {
+            if let Some(cached) = self.get_model_options() {
+                merge_cached_opencode_variants(&mut config_options, &cached);
+            }
+        }
         // Cursor 的 ACP 只上报每个模型的默认变体，完整 thinking/effort/fast 枚举来自
         // `cursor-agent models`。两边合并：CLI 负责完整变体，ACP 补充 CLI 偶尔漏掉的模型。
         if self.kind == AgentKind::Cursor {
@@ -2377,6 +2390,88 @@ impl AcpManager {
             EV_OPTIONS,
             json!({ "agentKind": self.kind.as_str(), "options": v }),
         );
+    }
+
+    /// OpenCode 的首次 session/new 只列基座模型；对探测 session 逐个切换模型后，
+    /// 它会用标准 effort config option 返回该模型的全部 variants。每次切换只改本地
+    /// session 状态，不发送 prompt，也不会产生模型调用费用。
+    async fn expand_opencode_model_variants(
+        &self,
+        conn: &Arc<AcpConn>,
+        mut response: Value,
+    ) -> Value {
+        let Some(session_id) = response
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            return response;
+        };
+        let base_models = opencode_model_choices(&response);
+        if base_models.is_empty() {
+            return response;
+        }
+
+        let cached_groups = self
+            .get_model_options()
+            .as_ref()
+            .map(opencode_variant_groups)
+            .unwrap_or_default();
+        let mut expanded = Vec::new();
+        let mut consecutive_failures = 0usize;
+
+        for model in base_models {
+            let Some(model_id) = model
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let fallback = || {
+                cached_groups
+                    .get(&model_id)
+                    .cloned()
+                    .unwrap_or_else(|| vec![model.clone()])
+            };
+            if consecutive_failures >= 2 {
+                expanded.extend(fallback());
+                continue;
+            }
+
+            match conn
+                .request(
+                    "session/set_config_option",
+                    json!({
+                        "sessionId": session_id,
+                        "configId": "model",
+                        "value": &model_id,
+                    }),
+                    Some(Duration::from_secs(5)),
+                )
+                .await
+            {
+                Ok(result) => {
+                    consecutive_failures = 0;
+                    expanded.extend(expand_opencode_model_choice(
+                        &model,
+                        &opencode_effort_choices(&result),
+                    ));
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    self.push_log(format!(
+                        "[nova] 获取 OpenCode 模型 variants 失败 {model_id}: {e}"
+                    ));
+                    expanded.extend(fallback());
+                }
+            }
+        }
+
+        if let Some(model_option) = config_option_mut(&mut response, "model") {
+            model_option["options"] = Value::Array(expanded);
+        }
+        response
     }
 
     /// 已缓存模型选项里非空 value 的数量（用于判断是否比「仅 Auto」更完整）。
@@ -3897,6 +3992,160 @@ impl AcpManager {
     }
 }
 
+fn config_option<'a>(value: &'a Value, id: &str) -> Option<&'a Value> {
+    let options = value
+        .as_array()
+        .or_else(|| value.get("configOptions").and_then(|v| v.as_array()))?;
+    options
+        .iter()
+        .find(|option| option.get("id").and_then(|v| v.as_str()) == Some(id))
+}
+
+fn config_option_mut<'a>(value: &'a mut Value, id: &str) -> Option<&'a mut Value> {
+    let options = if value.is_array() {
+        value.as_array_mut()?
+    } else {
+        value.get_mut("configOptions")?.as_array_mut()?
+    };
+    options
+        .iter_mut()
+        .find(|option| option.get("id").and_then(|v| v.as_str()) == Some(id))
+}
+
+fn config_choices(value: &Value, id: &str) -> Vec<Value> {
+    config_option(value, id)
+        .and_then(|option| option.get("options"))
+        .and_then(|options| options.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn opencode_model_choices(value: &Value) -> Vec<Value> {
+    config_choices(value, "model")
+}
+
+fn opencode_effort_choices(value: &Value) -> Vec<Value> {
+    config_choices(value, "effort")
+}
+
+fn set_json_meta(value: &mut Value, key: &str, meta_value: Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let meta = object.entry("_meta").or_insert_with(|| json!({}));
+    if !meta.is_object() {
+        *meta = json!({});
+    }
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert(key.to_string(), meta_value);
+    }
+}
+
+fn opencode_variant_label(value: &str, name: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "none" => "None".into(),
+        "minimal" => "Minimal".into(),
+        "low" => "Low".into(),
+        "medium" => "Medium".into(),
+        "high" => "High".into(),
+        "xhigh" | "extra-high" | "extra_high" => "XHigh".into(),
+        "max" => "Max".into(),
+        _ if !name.trim().is_empty() => name.trim().to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// 把 OpenCode 的独立 effort 选项展开成可持久化、可直接传给 session/set_model 的
+/// provider/model/variant。基座项保留为 Default，兼容旧会话里没有 variant 的模型值。
+fn expand_opencode_model_choice(model: &Value, efforts: &[Value]) -> Vec<Value> {
+    let Some(base_id) = model.get("value").and_then(|v| v.as_str()) else {
+        return vec![];
+    };
+    let Some(base_name) = model.get("name").and_then(|v| v.as_str()) else {
+        return vec![model.clone()];
+    };
+    if efforts.is_empty() {
+        return vec![model.clone()];
+    }
+
+    let mut base = model.clone();
+    base["name"] = json!(format!("{base_name} · Default"));
+    set_json_meta(&mut base, OPENCODE_BASE_MODEL_META, json!(base_id));
+    let mut choices = vec![base];
+
+    for effort in efforts {
+        let Some(variant) = effort.get("value").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if variant.is_empty() || variant.eq_ignore_ascii_case("default") {
+            continue;
+        }
+        let effort_name = effort
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(variant);
+        let mut choice = model.clone();
+        choice["value"] = json!(format!("{base_id}/{variant}"));
+        choice["name"] = json!(format!(
+            "{base_name} · {}",
+            opencode_variant_label(variant, effort_name)
+        ));
+        set_json_meta(&mut choice, OPENCODE_BASE_MODEL_META, json!(base_id));
+        set_json_meta(&mut choice, OPENCODE_VARIANT_META, json!(variant));
+        choices.push(choice);
+    }
+    choices
+}
+
+fn opencode_variant_groups(value: &Value) -> HashMap<String, Vec<Value>> {
+    let mut groups: HashMap<String, Vec<Value>> = HashMap::new();
+    for choice in opencode_model_choices(value) {
+        let Some(base) = choice
+            .get("_meta")
+            .and_then(|meta| meta.get(OPENCODE_BASE_MODEL_META))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        groups.entry(base.to_string()).or_default().push(choice);
+    }
+    groups
+}
+
+fn opencode_catalog_is_expanded(config_options: &Value) -> bool {
+    !opencode_variant_groups(config_options).is_empty()
+}
+
+fn merge_cached_opencode_variants(config_options: &mut Value, cached: &Value) {
+    let groups = opencode_variant_groups(cached);
+    if groups.is_empty() {
+        return;
+    }
+    let Some(model_option) = config_option_mut(config_options, "model") else {
+        return;
+    };
+    let Some(base_models) = model_option
+        .get("options")
+        .and_then(|options| options.as_array())
+        .cloned()
+    else {
+        return;
+    };
+
+    let mut merged = Vec::new();
+    for model in base_models {
+        let Some(base_id) = model.get("value").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(variants) = groups.get(base_id) {
+            merged.extend(variants.clone());
+        } else {
+            merged.push(model);
+        }
+    }
+    model_option["options"] = Value::Array(merged);
+}
+
 /// Windows：在 PATH 中按 exe/cmd/bat 顺序解析裸命令名为具体文件路径。
 /// 已带扩展名或路径分隔符的输入视为具体文件，存在即返回。
 /// 也被「后端可用性检查」复用：零成本判断某个 CLI 是否安装（不拉起进程）。
@@ -4739,6 +4988,84 @@ fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod opencode_models_tests {
+    use super::*;
+
+    #[test]
+    fn expands_effort_variants_into_selectable_model_ids() {
+        let model = json!({
+            "value": "codex/gpt-5.4",
+            "name": "Codex Custom/GPT-5.4"
+        });
+        let efforts = vec![
+            json!({ "value": "low", "name": "Low" }),
+            json!({ "value": "medium", "name": "Medium" }),
+            json!({ "value": "xhigh", "name": "Xhigh" }),
+        ];
+
+        let choices = expand_opencode_model_choice(&model, &efforts);
+        let values: Vec<&str> = choices
+            .iter()
+            .filter_map(|choice| choice.get("value").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                "codex/gpt-5.4",
+                "codex/gpt-5.4/low",
+                "codex/gpt-5.4/medium",
+                "codex/gpt-5.4/xhigh",
+            ]
+        );
+        assert_eq!(choices[0]["name"], "Codex Custom/GPT-5.4 · Default");
+        assert_eq!(choices[3]["name"], "Codex Custom/GPT-5.4 · XHigh");
+        assert_eq!(choices[3]["_meta"]["nova.ai/opencodeVariant"], "xhigh");
+    }
+
+    #[test]
+    fn plain_session_options_keep_cached_opencode_variants() {
+        let cached_choices = expand_opencode_model_choice(
+            &json!({ "value": "codex/gpt-5.4", "name": "GPT-5.4" }),
+            &[
+                json!({ "value": "low", "name": "Low" }),
+                json!({ "value": "high", "name": "High" }),
+            ],
+        );
+        let cached = json!({
+            "configOptions": [{
+                "id": "model",
+                "options": cached_choices
+            }]
+        });
+        let mut fresh = json!([{
+            "id": "model",
+            "options": [
+                { "value": "codex/gpt-5.4", "name": "GPT-5.4" },
+                { "value": "opencode/big-pickle", "name": "Big Pickle" }
+            ]
+        }]);
+
+        merge_cached_opencode_variants(&mut fresh, &cached);
+        let values: Vec<&str> = config_option(&fresh, "model").unwrap()["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|choice| choice.get("value").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                "codex/gpt-5.4",
+                "codex/gpt-5.4/low",
+                "codex/gpt-5.4/high",
+                "opencode/big-pickle",
+            ]
+        );
+        assert!(opencode_catalog_is_expanded(&fresh));
+    }
 }
 
 #[cfg(test)]

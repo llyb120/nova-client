@@ -155,7 +155,7 @@ export function groupedModelOptions(
 /** 单独的「模型（含后端）」下拉——与新会话完全一致的选择器。
  *  - 单后端：二级（厂商 → 模型）。
  *  - 多后端（已启用 >1）：三级菜单（后端 → 厂商 → 模型），选中即同时提交后端与模型。
- *  Codex 思考强度已并入模型选项。工作模型与巡查/心跳模型共用此组件，保证体验一致。 */
+ *  Codex 思考强度与 OpenCode variants 已并入模型选项。工作模型与巡查/心跳模型共用此组件。 */
 export function ModelPicker(props: {
   agentKind: AgentKind;
   agentKinds?: AgentKind[];
