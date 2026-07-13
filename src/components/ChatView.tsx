@@ -111,13 +111,15 @@ export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
   let endRef: HTMLDivElement | undefined;
-  const [isEndVisible, setIsEndVisible] = createSignal(false);
+  const [stickToBottom, setStickToBottom] = createSignal(false);
   const [viewportTick, setViewportTick] = createSignal(0);
   let scrollRaf = 0;
   let settleRaf = 0;
   let viewportRaf = 0;
+  let manualScrollRaf = 0;
   let awaitingSendUserItem = false;
   let itemsLenAtSend = 0;
+  let manualScroll = false;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -136,6 +138,54 @@ export function ChatView() {
       viewportRaf = 0;
       setViewportTick((n) => n + 1);
     });
+  };
+
+  const isAtBottom = () => {
+    if (!scrollRef) return true;
+    return scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight <= 1;
+  };
+
+  const cancelBottomFollow = () => {
+    manualScroll = true;
+    awaitingSendUserItem = false;
+    setStickToBottom(false);
+    if (scrollRaf) {
+      cancelAnimationFrame(scrollRaf);
+      scrollRaf = 0;
+    }
+    if (settleRaf) {
+      cancelAnimationFrame(settleRaf);
+      settleRaf = 0;
+    }
+    if (manualScrollRaf) {
+      cancelAnimationFrame(manualScrollRaf);
+      manualScrollRaf = 0;
+    }
+  };
+
+  const syncManualScroll = () => {
+    if (!manualScroll) return;
+    const atBottom = isAtBottom();
+    setStickToBottom(atBottom);
+    if (atBottom) manualScroll = false;
+  };
+
+  const scheduleManualScrollSync = () => {
+    if (manualScrollRaf) cancelAnimationFrame(manualScrollRaf);
+    manualScrollRaf = requestAnimationFrame(() => {
+      manualScrollRaf = 0;
+      syncManualScroll();
+    });
+  };
+
+  const handleWheel = () => {
+    cancelBottomFollow();
+    scheduleManualScrollSync();
+  };
+
+  const handleTranscriptScroll = () => {
+    refreshVirtualGroups();
+    syncManualScroll();
   };
 
   const pinBottom = () => {
@@ -161,7 +211,8 @@ export function ChatView() {
       cancelAnimationFrame(scrollRaf);
       scrollRaf = 0;
     }
-    setIsEndVisible(true);
+    manualScroll = false;
+    setStickToBottom(true);
     const deadline = performance.now() + maxMs;
     let lastHeight = -1;
     let stableFrames = 0;
@@ -182,7 +233,7 @@ export function ChatView() {
   };
 
   const scrollToBottom = () => {
-    if (!isEndVisible()) return;
+    if (!stickToBottom() || manualScroll) return;
     forceScrollToBottom();
   };
 
@@ -214,31 +265,37 @@ export function ChatView() {
       return;
     }
 
-    if (isEndVisible() && scrollRef) scrollToBottom();
+    if (stickToBottom() && scrollRef) scrollToBottom();
   });
 
   onMount(() => {
-    if (!innerRef || !endRef || !scrollRef) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        const entry = entries[0];
-        if (!entry) return;
-        setIsEndVisible(entry.isIntersecting);
-      },
-      { root: scrollRef, rootMargin: "0px 0px 60px 0px", threshold: 0 },
-    );
-    io.observe(endRef);
+    if (!innerRef || !scrollRef) return;
     const ro = new ResizeObserver(() => {
       refreshVirtualGroups();
-      if (isEndVisible()) scrollToBottom();
+      if (stickToBottom() && !manualScroll) scrollToBottom();
     });
     ro.observe(innerRef);
+
+    const scrollKeys = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
+    const handleScrollKey = (event: KeyboardEvent) => {
+      if (event.altKey || event.ctrlKey || event.metaKey || !scrollKeys.has(event.key)) return;
+      const target = event.target;
+      if (target instanceof Node && target !== document.body && !scrollRef?.contains(target)) return;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
+      ) return;
+      cancelBottomFollow();
+      scheduleManualScrollSync();
+    };
+    window.addEventListener("keydown", handleScrollKey, true);
     onCleanup(() => {
-      io.disconnect();
       ro.disconnect();
+      window.removeEventListener("keydown", handleScrollKey, true);
       if (scrollRaf) cancelAnimationFrame(scrollRaf);
       if (settleRaf) cancelAnimationFrame(settleRaf);
       if (viewportRaf) cancelAnimationFrame(viewportRaf);
+      if (manualScrollRaf) cancelAnimationFrame(manualScrollRaf);
     });
   });
 
@@ -416,7 +473,15 @@ export function ChatView() {
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
       </Show>
 
-      <div class="transcript" ref={scrollRef} onScroll={refreshVirtualGroups}>
+      <div
+        class="transcript"
+        ref={scrollRef}
+        onScroll={handleTranscriptScroll}
+        onWheel={handleWheel}
+        onPointerDown={cancelBottomFollow}
+        onPointerUp={syncManualScroll}
+        onPointerCancel={syncManualScroll}
+      >
         <div class="transcript-inner" ref={innerRef}>
           <Show when={state.items.length === 0 && !state.loadingThread}>
             <div class="transcript-hint">
