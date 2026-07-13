@@ -1,9 +1,12 @@
-//! server 侧远程会话客户端。
+//! server 侧远程会话客户端（重构版）。
 //!
-//! 连上中转站后先推一次快照；空闲期只维持低流量命令长轮询，不持续上传。
-//! 网页端刚打开（bootstrap state）时服务端会 refreshRequested，唤醒桌面补发。
-//! 每个运行会话独立维护基线：首包快照，中间与收尾只发变化条目（约 400ms 一拍）。
-//! 打开历史会话走一次性 kind=threads 轻量包（不重传 models/projects）；仅首连预热最新会话。
+//! 只有一个统一端点 `POST /v1/remote/sync`：一次请求既上传变化，也领取待办命令。
+//! 上传内容分三块，各自按需发送、且尽量少传：
+//!   - catalog（projects + models）：低频，仅在项目/模型可用性变化时上传。
+//!   - threads（会话列表元数据）：小体积，任何标题/运行状态/结构变化时上传，不含正文。
+//!   - focuses（被浏览器打开的会话正文）：只对「当前被查看」的会话流式上传，且只发尾部增量。
+//! 服务端从不重建正文，只按下标拼接不透明条目，避免语义合并出错。
+//! 空闲且无人查看时带 wait=true 让服务端长轮询命令；有活动时按 ACTIVE_INTERVAL 主动推送。
 //! 所有请求体均 gzip，响应由 reqwest 自动解 gzip。
 
 use crate::relay::{gzip_json, resolve_relay_server};
@@ -18,10 +21,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::sleep;
 
 const ACTIVE_INTERVAL: Duration = Duration::from_millis(400);
+/// 处理完命令后，即使会话暂时还没登记 running 也继续主动推送这么久，
+/// 避免异步启动窗口内漏掉会话开头的输出。
 const COMMAND_WATCH_DURATION: Duration = Duration::from_secs(30);
 const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
-/// 首次连接只预热最新会话；其余历史按点击请求，兼顾首屏速度与流量。
-const PREFETCH_RECENT: usize = 1;
 
 #[derive(Clone, PartialEq, Eq)]
 struct RemoteConfig {
@@ -32,7 +35,7 @@ struct RemoteConfig {
     device_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RemoteProject {
     path: String,
@@ -56,29 +59,44 @@ struct RemoteThreadMeta {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RemoteSnapshot {
+struct CatalogOut {
+    version: i64,
     projects: Vec<RemoteProject>,
-    threads: Vec<RemoteThreadMeta>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thread: Option<Value>,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    thread_snapshots: HashMap<String, Value>,
     models: HashMap<String, Value>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RemoteThreadDelta {
+struct ThreadsOut {
+    version: i64,
+    list: Vec<RemoteThreadMeta>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FocusOut {
     id: String,
-    title: String,
-    cwd: String,
-    agent_kind: String,
-    model: String,
-    mode: String,
-    updated_at: i64,
     running: bool,
-    item_count: usize,
+    base: usize,
+    count: usize,
+    version: i64,
+    // plan 随每次正文更新一并携带（体积很小），服务端原样透传给浏览器渲染计划卡片。
+    plan: Value,
     items: Vec<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncRequest {
+    device_name: String,
+    ack_id: i64,
+    wait: bool,
+    results: Vec<CommandResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog: Option<CatalogOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threads: Option<ThreadsOut>,
+    focuses: Vec<FocusOut>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -118,15 +136,23 @@ struct CommandResult {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ServerResponse {
+struct SyncResponse {
     #[serde(default)]
     commands: Vec<RemoteCommand>,
     #[serde(default)]
-    requested_thread_ids: Vec<String>,
+    focus_ids: Vec<String>,
     #[serde(default)]
-    need_full: bool,
+    need_catalog: bool,
     #[serde(default)]
-    revision: i64,
+    need_threads: bool,
+    #[serde(default)]
+    need_full: Vec<String>,
+}
+
+/// 桌面端已上传到服务端的某个 focus 会话正文基线，用于计算下一次的尾部增量。
+struct FocusState {
+    items: Vec<Value>,
+    version: i64,
 }
 
 pub fn start(app: AppHandle) {
@@ -138,248 +164,225 @@ pub fn start(app: AppHandle) {
 async fn run(app: AppHandle) {
     let mut last_cfg: Option<RemoteConfig> = None;
     let mut client = Client::new();
-    let mut requested: HashSet<String> = HashSet::new();
-    let mut revision = 0i64;
-    // 只保留正在流式同步的逐会话基线。历史会话按需发一次快照后立即释放，
-    // 不把 server 缓存误当成永久订阅，也不让一个会话的基线影响另一个会话。
-    let mut previous: HashMap<String, (Thread, bool)> = HashMap::new();
-    let mut force_full = false;
+
+    let mut catalog_version = 0i64;
+    let mut threads_version = 0i64;
+    let mut last_catalog_sig = String::new();
+    let mut last_threads_sig = String::new();
+    let mut need_catalog = true;
+    let mut need_threads = true;
+
+    // 服务端要求推送正文的会话集合（=浏览器当前查看的会话，通常只有一个）。
+    let mut focus_ids: HashSet<String> = HashSet::new();
+    // 需要重发整包（服务端缺基线）的会话。
+    let mut need_full: HashSet<String> = HashSet::new();
+    // 每个 focus 会话已上传的正文基线。
+    let mut focus_state: HashMap<String, FocusState> = HashMap::new();
+
     let mut ack_id = 0i64;
     let mut processed_id = 0i64;
     let mut results: Vec<CommandResult> = Vec::new();
-    let mut catalog_signature = String::new();
-    // 远程命令通过异步任务启动。初始快照可能先看到 running=false，随后任务才登记运行；
-    // 在这段窗口内主动跟踪命令涉及的会话，避免释放基线后漏掉整个短任务。
-    let mut command_watch: HashMap<String, Instant> = HashMap::new();
+    // 处理命令后的一段主动推送窗口，覆盖异步启动会话的开头输出。
+    let mut active_until = Instant::now();
+
+    let reset = |catalog_version: &mut i64,
+                 threads_version: &mut i64,
+                 last_catalog_sig: &mut String,
+                 last_threads_sig: &mut String,
+                 need_catalog: &mut bool,
+                 need_threads: &mut bool,
+                 focus_ids: &mut HashSet<String>,
+                 need_full: &mut HashSet<String>,
+                 focus_state: &mut HashMap<String, FocusState>,
+                 ack_id: &mut i64,
+                 processed_id: &mut i64,
+                 results: &mut Vec<CommandResult>| {
+        *catalog_version = 0;
+        *threads_version = 0;
+        last_catalog_sig.clear();
+        last_threads_sig.clear();
+        *need_catalog = true;
+        *need_threads = true;
+        focus_ids.clear();
+        need_full.clear();
+        focus_state.clear();
+        *ack_id = 0;
+        *processed_id = 0;
+        results.clear();
+    };
 
     loop {
         let Some(cfg) = config(&app) else {
             last_cfg = None;
-            requested.clear();
-            revision = 0;
-            previous.clear();
-            force_full = false;
-            catalog_signature.clear();
-            command_watch.clear();
+            reset(
+                &mut catalog_version,
+                &mut threads_version,
+                &mut last_catalog_sig,
+                &mut last_threads_sig,
+                &mut need_catalog,
+                &mut need_threads,
+                &mut focus_ids,
+                &mut need_full,
+                &mut focus_state,
+                &mut ack_id,
+                &mut processed_id,
+                &mut results,
+            );
             sleep(Duration::from_secs(10)).await;
             continue;
         };
         if last_cfg.as_ref() != Some(&cfg) {
             client = build_client(&cfg.proxy);
             last_cfg = Some(cfg.clone());
-            requested.clear();
-            revision = 0;
-            previous.clear();
-            // 连上中转站后立刻推一次快照，避免空闲长轮询时网页端打开仍是空列表。
-            force_full = true;
-            ack_id = 0;
-            processed_id = 0;
-            results.clear();
-            catalog_signature.clear();
-            command_watch.clear();
+            reset(
+                &mut catalog_version,
+                &mut threads_version,
+                &mut last_catalog_sig,
+                &mut last_threads_sig,
+                &mut need_catalog,
+                &mut need_threads,
+                &mut focus_ids,
+                &mut need_full,
+                &mut focus_state,
+                &mut ack_id,
+                &mut processed_id,
+                &mut results,
+            );
         }
 
-        let now = Instant::now();
-        command_watch.retain(|id, until| {
-            now < *until
-                || previous
-                    .get(id)
-                    .is_some_and(|(_, running)| *running)
-        });
-        previous.retain(|id, (_, running)| {
-            *running || requested.contains(id) || command_watch.contains_key(id)
-        });
-        // requested 是 server 的一次性 cache-miss 队列；另外保留上一拍仍在运行的会话，
-        // 确保 running=false 与最后一段内容一定能作为收尾增量送达。
-        let mut sync_ids = requested.clone();
-        sync_ids.extend(command_watch.keys().cloned());
-        sync_ids.extend(
-            previous
-                .iter()
-                .filter_map(|(id, (_, running))| (*running).then(|| id.clone())),
-        );
-        if force_full && revision == 0 {
-            for id in recent_thread_ids(&app, PREFETCH_RECENT) {
-                sync_ids.insert(id);
-            }
-        }
-
-        let current = sync_threads(&app, &sync_ids);
-        let running_now: HashMap<String, bool> = current
-            .iter()
-            .map(|(id, thread)| (id.clone(), thread_running(&app, thread)))
-            .collect();
-        let any_running = running_now.values().any(|running| *running);
+        // --- 组装本轮要上传的变化 ---
+        let catalog_sig = catalog_signature(&app);
         let metas = thread_metas(&app);
-        let next_catalog_signature = catalog_signature_for(&metas);
-        let catalog_changed = next_catalog_signature != catalog_signature;
-        let needs_snapshot = current.keys().any(|id| !previous.contains_key(id));
-        let dirty_ids: HashSet<String> = current
-            .iter()
-            .filter_map(|(id, thread)| {
-                let (old, old_running) = previous.get(id)?;
-                let running = running_now.get(id).copied().unwrap_or(false);
-                thread_changed(old, *old_running, thread, running).then(|| id.clone())
-            })
-            .collect();
-        let want_upload = force_full
-            || catalog_changed
-            || needs_snapshot
-            || !dirty_ids.is_empty()
-            || !results.is_empty();
+        let threads_sig = threads_signature(&metas);
 
-        if !want_upload {
-            if !should_long_poll(any_running, !command_watch.is_empty()) {
-                // 运行中的会话不能进入命令长轮询。某一拍没有浏览器可见变化很常见，
-                // 继续按活动间隔检查，才能及时捕获最后内容与 running=false。
-                sleep(ACTIVE_INTERVAL).await;
-                continue;
-            }
-            match pull(&client, &cfg).await {
-                Ok(resp) => {
-                    revision = resp.revision;
-                    if resp.need_full {
-                        force_full = true;
-                    }
-                    requested = resp.requested_thread_ids.into_iter().collect();
-                    process_commands(
-                        &app,
-                        resp.commands,
-                        &mut processed_id,
-                        &mut ack_id,
-                        &mut results,
-                        &mut requested,
-                        &mut command_watch,
-                    )
-                    .await;
-                }
-                Err(e) => sleep(error_backoff(&e)).await,
-            }
-            continue;
+        let mut catalog_out = None;
+        if need_catalog || catalog_sig != last_catalog_sig {
+            catalog_version += 1;
+            catalog_out = Some(CatalogOut {
+                version: catalog_version,
+                projects: projects(&app),
+                models: models(&app),
+            });
+        }
+        let mut threads_out = None;
+        if need_threads || threads_sig != last_threads_sig {
+            threads_version += 1;
+            threads_out = Some(ThreadsOut {
+                version: threads_version,
+                list: metas.clone(),
+            });
         }
 
-        let next_revision = revision.saturating_add(1).max(1);
-        let snapshot_threads: HashMap<String, Thread> = current
-            .iter()
-            .filter_map(|(id, thread)| {
-                (!previous.contains_key(id)).then(|| (id.clone(), thread.clone()))
-            })
-            .collect();
-        let (body, sent_ids, sent_catalog) = if force_full || revision == 0 {
-            (
-                json!({
-                    "deviceName": cfg.name,
-                    "ackId": ack_id,
-                    "results": results,
-                    "kind": "full",
-                    "baseRevision": revision,
-                    "revision": next_revision,
-                    "snapshot": full_snapshot(&app, &current),
-                }),
-                current.keys().cloned().collect::<HashSet<_>>(),
-                true,
-            )
-        } else if catalog_changed || needs_snapshot || dirty_ids.is_empty() {
-            // 新会话/目录变化/单纯命令结果走轻量包。只附带缺基线的会话快照；
-            // 已有基线的运行会话留到下一拍继续发增量，避免被另一个历史会话拖成全量。
-            (
-                json!({
-                    "deviceName": cfg.name,
-                    "ackId": ack_id,
-                    "results": results,
-                    "kind": "threads",
-                    "baseRevision": revision,
-                    "revision": next_revision,
-                    "snapshot": threads_pack_with_metas(metas.clone(), &snapshot_threads),
-                }),
-                snapshot_threads.keys().cloned().collect::<HashSet<_>>(),
-                true,
-            )
-        } else {
-            let mut deltas = Vec::with_capacity(dirty_ids.len());
-            let mut delta_ok = true;
-            for id in &dirty_ids {
-                let Some(current_thread) = current.get(id) else {
-                    delta_ok = false;
-                    break;
-                };
-                let Some((old, _)) = previous.get(id) else {
-                    delta_ok = false;
-                    break;
-                };
-                let Some(delta) = make_delta(old, current_thread, &app) else {
-                    delta_ok = false;
-                    break;
-                };
-                deltas.push(delta);
+        let focus_threads = collect_focus_threads(&app, &focus_ids);
+        let mut focus_running = false;
+        let mut focuses: Vec<FocusOut> = Vec::new();
+        // 记录本轮实际发送的 focus 基线，成功后再提交。
+        let mut sent_focus: HashMap<String, (Vec<Value>, i64)> = HashMap::new();
+        for id in &focus_ids {
+            let Some(thread) = focus_threads.get(id) else {
+                continue;
+            };
+            let running = thread_running(&app, thread);
+            if running {
+                focus_running = true;
             }
-            if !delta_ok {
-                // 只把本次涉及的会话改走快照，不清空其他会话基线。
-                for id in &dirty_ids {
-                    previous.remove(id);
+            let items = compact_items(thread);
+            let want_full = need_full.contains(id) || !focus_state.contains_key(id);
+            let (base, tail) = if want_full {
+                (0usize, items.clone())
+            } else {
+                let prev = focus_state.get(id).map(|s| &s.items);
+                let first = first_diff(prev.map(|v| v.as_slice()).unwrap_or(&[]), &items);
+                let unchanged = prev.map(|p| p.len()) == Some(items.len()) && first == items.len();
+                if unchanged {
+                    continue;
                 }
+                (first, items[first..].to_vec())
+            };
+            let version = focus_state.get(id).map(|s| s.version + 1).unwrap_or(1);
+            focuses.push(FocusOut {
+                id: id.clone(),
+                running,
+                base,
+                count: items.len(),
+                version,
+                plan: thread.plan.clone().unwrap_or(Value::Null),
+                items: tail,
+            });
+            sent_focus.insert(id.clone(), (items, version));
+        }
+
+        let did_push = catalog_out.is_some()
+            || threads_out.is_some()
+            || !focuses.is_empty()
+            || !results.is_empty();
+        let active = focus_running || Instant::now() < active_until;
+        let wait = !did_push && !active;
+
+        let sent_catalog = catalog_out.is_some();
+        let sent_threads = threads_out.is_some();
+        let request = SyncRequest {
+            device_name: cfg.name.clone(),
+            ack_id,
+            wait,
+            results: results.clone(),
+            catalog: catalog_out,
+            threads: threads_out,
+            focuses,
+        };
+        let body = match serde_json::to_value(&request) {
+            Ok(v) => v,
+            Err(e) => {
+                sleep(error_backoff(&e.to_string())).await;
                 continue;
             }
-            (
-                json!({
-                    "deviceName": cfg.name,
-                    "ackId": ack_id,
-                    "results": results,
-                    "kind": "delta",
-                    "baseRevision": revision,
-                    "revision": next_revision,
-                    "delta": { "threads": deltas },
-                }),
-                dirty_ids.clone(),
-                false,
-            )
         };
 
         match sync(&client, &cfg, &body).await {
             Ok(resp) => {
-                revision = resp.revision;
-                if !resp.need_full {
-                    for id in &sent_ids {
-                        if let Some(thread) = current.get(id) {
-                            let completed_after_baseline = previous
-                                .get(id)
-                                .is_some_and(|(_, was_running)| *was_running)
-                                && !running_now.get(id).copied().unwrap_or(false);
-                            previous.insert(
-                                id.clone(),
-                                (
-                                    thread.clone(),
-                                    running_now.get(id).copied().unwrap_or(false),
-                                ),
-                            );
-                            if completed_after_baseline {
-                                command_watch.remove(id);
-                            }
-                        }
-                    }
-                    if sent_catalog {
-                        catalog_signature = next_catalog_signature;
-                    }
+                if sent_catalog {
+                    last_catalog_sig = catalog_sig;
                 }
-                force_full = resp.need_full;
+                if sent_threads {
+                    last_threads_sig = threads_sig;
+                }
+                for (id, (items, version)) in sent_focus {
+                    focus_state.insert(id, FocusState { items, version });
+                }
                 results.clear();
-                requested = resp.requested_thread_ids.into_iter().collect();
-                process_commands(
+
+                focus_ids = resp.focus_ids.into_iter().collect();
+                need_catalog = resp.need_catalog;
+                need_threads = resp.need_threads;
+                need_full = resp.need_full.into_iter().collect();
+                focus_state.retain(|id, _| focus_ids.contains(id));
+
+                let processed = process_commands(
                     &app,
                     resp.commands,
                     &mut processed_id,
                     &mut ack_id,
                     &mut results,
-                    &mut requested,
-                    &mut command_watch,
                 )
                 .await;
+                if processed {
+                    active_until = Instant::now() + COMMAND_WATCH_DURATION;
+                }
             }
-            Err(e) => sleep(error_backoff(&e)).await,
+            Err(e) => {
+                sleep(error_backoff(&e)).await;
+                continue;
+            }
         }
-        if any_running || !command_watch.is_empty() || force_full || !results.is_empty() {
+
+        // 命令刚产生结果时立即再跑一轮把结果送出；否则按活动/空闲决定节奏。
+        if !results.is_empty() {
+            continue;
+        }
+        if did_push || active || !wait {
             sleep(ACTIVE_INTERVAL).await;
         }
+        // wait==true 时请求已在服务端阻塞，返回后直接进入下一轮，无需额外 sleep。
     }
 }
 
@@ -389,6 +392,92 @@ fn error_backoff(error: &str) -> Duration {
     } else {
         Duration::from_secs(3)
     }
+}
+
+/// 返回 a、b 首个不同下标；相同前缀越长，需要重传的尾部越短。
+fn first_diff(a: &[Value], b: &[Value]) -> usize {
+    let mut i = 0;
+    while i < a.len() && i < b.len() && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+fn compact_items(thread: &Thread) -> Vec<Value> {
+    thread.items.iter().map(remote_item_value).collect()
+}
+
+/// 目录（projects + models）廉价签名：只看内存里的项目路径、会话目录与各后端启用/可用状态，
+/// 避免每拍做文件系统扫描或重建 model 选项。真正上传时才构造完整 catalog。
+fn catalog_signature(app: &AppHandle) -> String {
+    let state = app.state::<AppState>();
+    let mut paths: Vec<String> = state.projects.lock().unwrap().projects.clone();
+    {
+        let store = state.store.lock().unwrap();
+        paths.extend(
+            store
+                .threads
+                .iter()
+                .filter(|t| eligible(t))
+                .map(|t| t.cwd.clone()),
+        );
+    }
+    paths.sort();
+    paths.dedup();
+    let mut agents: Vec<String> = Vec::new();
+    for kind in [
+        AgentKind::Devin,
+        AgentKind::Codex,
+        AgentKind::CodeBuddy,
+        AgentKind::ClaudeCode,
+        AgentKind::Cursor,
+        AgentKind::OpenCode,
+    ] {
+        let enabled = state.agent_enabled(&kind);
+        let available = state
+            .backend_availability
+            .lock()
+            .unwrap()
+            .get(kind.as_str())
+            .copied()
+            .unwrap_or(true);
+        agents.push(format!("{}:{}:{}", kind.as_str(), enabled, available));
+    }
+    format!("{paths:?}|{agents:?}")
+}
+
+/// 会话列表签名刻意排除 updated_at：流式过程中该字段每拍都变，排除它可避免列表被反复重传。
+/// 运行状态 running 仍纳入签名，运行开始/结束时列表会刷新一次，保证前端小圆点及时更新。
+fn threads_signature(metas: &[RemoteThreadMeta]) -> String {
+    let rows: Vec<_> = metas
+        .iter()
+        .map(|m| {
+            (
+                &m.id,
+                &m.title,
+                &m.cwd,
+                &m.agent_kind,
+                &m.model,
+                &m.mode,
+                m.running,
+            )
+        })
+        .collect();
+    serde_json::to_string(&rows).unwrap_or_default()
+}
+
+fn collect_focus_threads(app: &AppHandle, ids: &HashSet<String>) -> HashMap<String, Thread> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    let state = app.state::<AppState>();
+    let store = state.store.lock().unwrap();
+    store
+        .threads
+        .iter()
+        .filter(|t| eligible(t) && ids.contains(&t.id))
+        .map(|t| (t.id.clone(), t.clone()))
+        .collect()
 }
 
 fn config(app: &AppHandle) -> Option<RemoteConfig> {
@@ -445,26 +534,11 @@ fn build_client(proxy: &str) -> Client {
     builder.build().unwrap_or_default()
 }
 
-async fn pull(client: &Client, cfg: &RemoteConfig) -> Result<ServerResponse, String> {
-    let resp = client
-        .get(format!("{}/v1/remote/pull", cfg.server))
-        .header("Authorization", format!("Bearer {}", cfg.token))
-        .header("X-Relay-Name", &cfg.name)
-        .header("X-Relay-Device", &cfg.device_id)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    resp.json().await.map_err(|e| e.to_string())
-}
-
 async fn sync(
     client: &Client,
     cfg: &RemoteConfig,
     value: &Value,
-) -> Result<ServerResponse, String> {
+) -> Result<SyncResponse, String> {
     let body = gzip_json(value)?;
     let resp = client
         .post(format!("{}/v1/remote/sync", cfg.server))
@@ -568,107 +642,9 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
     out
 }
 
-/// 浏览器按需读取过的会话 + 所有正在运行的普通会话加入同步集合。
-/// 浏览器选择只形成只读快照请求，不修改桌面端 active_thread，也不影响其他浏览器。
-fn sync_threads(app: &AppHandle, requested: &HashSet<String>) -> HashMap<String, Thread> {
-    let state = app.state::<AppState>();
-    let store = state.store.lock().unwrap();
-    store
-        .threads
-        .iter()
-        .filter(|t| eligible(t))
-        .filter(|t| requested.contains(&t.id) || is_running(&state, t))
-        .map(|t| (t.id.clone(), t.clone()))
-        .collect()
-}
-
 fn thread_running(app: &AppHandle, thread: &Thread) -> bool {
     let state = app.state::<AppState>();
     is_running(&state, thread)
-}
-
-fn full_snapshot(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSnapshot {
-    RemoteSnapshot {
-        projects: projects(app),
-        threads: thread_metas(app),
-        thread: None,
-        thread_snapshots: synced
-            .iter()
-            .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
-            .collect(),
-        models: models(app),
-    }
-}
-
-/// 轻量包：只带会话列表 + 指定会话快照，供打开历史/预热，避免重扫 projects 与重传 models。
-fn threads_pack_with_metas(
-    metas: Vec<RemoteThreadMeta>,
-    synced: &HashMap<String, Thread>,
-) -> RemoteSnapshot {
-    RemoteSnapshot {
-        projects: Vec::new(),
-        threads: metas,
-        thread: None,
-        thread_snapshots: synced
-            .iter()
-            .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
-            .collect(),
-        models: HashMap::new(),
-    }
-}
-
-/// 目录签名刻意排除 updated_at/running：这两个高频字段由逐会话增量携带，
-/// 避免流式输出时退化成每 400ms 重传完整会话。标题/模型/目录变化仍会触发轻量目录包。
-fn catalog_signature_for(metas: &[RemoteThreadMeta]) -> String {
-    let rows: Vec<_> = metas
-        .iter()
-        .map(|m| {
-            (
-                &m.id,
-                &m.title,
-                &m.cwd,
-                &m.agent_kind,
-                &m.model,
-                &m.mode,
-            )
-        })
-        .collect();
-    serde_json::to_string(&rows).unwrap_or_default()
-}
-
-fn thread_changed(old: &Thread, old_running: bool, current: &Thread, running: bool) -> bool {
-    old_running != running
-        || old.title != current.title
-        || old.cwd != current.cwd
-        || old.agent_kind != current.agent_kind
-        || old.model != current.model
-        || old.mode != current.mode
-        || old.items.len() != current.items.len()
-        || old
-            .items
-            .iter()
-            .zip(current.items.iter())
-            .any(|(before, after)| remote_item_value(before) != remote_item_value(after))
-}
-
-fn recent_thread_ids(app: &AppHandle, limit: usize) -> Vec<String> {
-    let state = app.state::<AppState>();
-    let store = state.store.lock().unwrap();
-    let mut items: Vec<_> = store.threads.iter().filter(|t| eligible(t)).collect();
-    items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    items
-        .into_iter()
-        .take(limit)
-        .map(|t| t.id.clone())
-        .collect()
-}
-
-fn remote_thread_value(thread: &Thread) -> Value {
-    let mut thread = thread.clone();
-    for item in &mut thread.items {
-        compact_remote_item(item);
-    }
-    serde_json::to_value(thread).unwrap_or(Value::Null)
 }
 
 fn remote_item_value(item: &Item) -> Value {
@@ -702,41 +678,6 @@ fn compact_remote_item(item: &mut Item) {
         }
         _ => {}
     }
-}
-
-fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<RemoteThreadDelta> {
-    if previous.id != current.id || current.items.len() < previous.items.len() {
-        return None;
-    }
-    for (old, new) in previous.items.iter().zip(current.items.iter()) {
-        if old.id() != new.id() {
-            return None;
-        }
-    }
-    let mut changed = Vec::new();
-    for (index, item) in current.items.iter().enumerate() {
-        let differs = previous
-            .items
-            .get(index)
-            .map(|old| remote_item_value(old) != remote_item_value(item))
-            .unwrap_or(true);
-        if differs {
-            changed.push(remote_item_value(item));
-        }
-    }
-    let state = app.state::<AppState>();
-    Some(RemoteThreadDelta {
-        id: current.id.clone(),
-        title: current.title.clone(),
-        cwd: current.cwd.clone(),
-        agent_kind: current.agent_kind.as_str().to_string(),
-        model: current.model.clone().unwrap_or_default(),
-        mode: current.mode.clone().unwrap_or_default(),
-        updated_at: current.updated_at,
-        running: is_running(&state, current),
-        item_count: current.items.len(),
-        items: changed,
-    })
 }
 
 #[cfg(test)]
@@ -790,26 +731,28 @@ mod tests {
     }
 
     #[test]
-    fn running_thread_without_visible_change_stays_on_active_polling() {
-        assert!(!should_long_poll(true, false));
-        assert!(!should_long_poll(false, true));
-        assert!(should_long_poll(false, false));
+    fn first_diff_finds_common_prefix() {
+        let a = vec![json!({"id": 1}), json!({"id": 2})];
+        let b = vec![json!({"id": 1}), json!({"id": 2}), json!({"id": 3})];
+        assert_eq!(first_diff(&a, &b), 2);
+
+        let c = vec![json!({"id": 1}), json!({"id": 9})];
+        assert_eq!(first_diff(&a, &c), 1);
+
+        assert_eq!(first_diff(&a, &a), 2);
     }
 }
 
-fn should_long_poll(any_running: bool, has_command_watch: bool) -> bool {
-    !any_running && !has_command_watch
-}
-
+/// 执行服务端下发的命令并收集结果。返回是否处理了至少一个新命令，
+/// 供上层进入命令后的主动推送窗口。
 async fn process_commands(
     app: &AppHandle,
     commands: Vec<RemoteCommand>,
     processed_id: &mut i64,
     ack_id: &mut i64,
     results: &mut Vec<CommandResult>,
-    requested: &mut HashSet<String>,
-    command_watch: &mut HashMap<String, Instant>,
-) {
+) -> bool {
+    let mut processed_any = false;
     for cmd in commands {
         if cmd.id <= *processed_id {
             continue;
@@ -817,17 +760,10 @@ async fn process_commands(
         let result = execute_command(app, &cmd).await;
         *processed_id = cmd.id;
         *ack_id = cmd.id;
-        if result.ok && !result.thread_id.is_empty() {
-            requested.insert(result.thread_id.clone());
-            command_watch.insert(
-                result.thread_id.clone(),
-                Instant::now() + COMMAND_WATCH_DURATION,
-            );
-        }
-        // create/send/stop 的会话 id 已加入一次性请求集；下一拍会按该会话独立选择
-        // 快照或增量，不再把一个命令升级成全局 full。
         results.push(result);
+        processed_any = true;
     }
+    processed_any
 }
 
 async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult {
