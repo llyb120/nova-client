@@ -560,6 +560,7 @@ impl RelayManager {
             "roaming.config" => self.on_roaming_config(&env),
             "roaming.resync" => self.on_roaming_resync(&env),
             "roaming.recall" => self.on_roaming_recall(&env),
+            "roaming.models_changed" => self.on_roaming_models_changed(&env),
             "roaming.models_request" => self.on_roaming_models_request(&env),
             "roaming.branches_request" => self.on_roaming_branches_request(&env),
             "quota.request" => self.on_quota_request(&env),
@@ -1584,6 +1585,35 @@ impl RelayManager {
             return;
         }
         self.spawn_send(peer_token, "roaming.models_request", json!({}));
+    }
+
+    /// 本机共享模型配置变化后，通知在线队友立即回拉，避免等待定时刷新或重启。
+    pub fn notify_peer_models_changed(self: &Arc<Self>) {
+        let Some((_, me, _)) = self.cfg() else {
+            return;
+        };
+        let peers = self.peers();
+        let Some(peers) = peers.as_array() else {
+            return;
+        };
+        for peer in peers {
+            let token = peer["token"].as_str().unwrap_or_default();
+            if token.is_empty()
+                || token == me.as_str()
+                || !peer["online"].as_bool().unwrap_or(false)
+            {
+                continue;
+            }
+            self.spawn_send(token.to_string(), "roaming.models_changed", json!({}));
+        }
+    }
+
+    /// 队友提示其共享模型已变化：立即向该队友回拉最新列表。
+    fn on_roaming_models_changed(&self, env: &InEnvelope) {
+        if env.from.is_empty() {
+            return;
+        }
+        self.spawn_send_now(env.from.clone(), "roaming.models_request", json!({}));
     }
 
     /// host：收到模型请求，收集本机「已启用且检测可用」后端的模型/模式列表回给对端。

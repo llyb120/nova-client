@@ -2258,6 +2258,7 @@ async fn set_settings(
         restart_opencode,
         restart_codex,
         restart_relay,
+        notify_peer_models,
         recheck_availability,
         pxpipe_changed,
     ) = {
@@ -2300,11 +2301,11 @@ async fn set_settings(
             || s.codex_proxy != settings.codex_proxy
             || s.codex_enabled != settings.codex_enabled
             || pxpipe_changed;
+        let notify_peer_models = s.quota_shared_models != settings.quota_shared_models;
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
             || s.relay_groups != settings.relay_groups
-            || s.relay_name != settings.relay_name
-            || s.quota_shared_models != settings.quota_shared_models;
+            || s.relay_name != settings.relay_name;
         // 任一后端的路径变化都可能影响「是否可用」，保存后重新并发检测
         let recheck_availability = restart_devin
             || restart_codebuddy
@@ -2322,6 +2323,7 @@ async fn set_settings(
             restart_opencode,
             restart_codex,
             restart_relay,
+            notify_peer_models,
             recheck_availability,
             pxpipe_changed,
         )
@@ -2354,6 +2356,8 @@ async fn set_settings(
     }
     if restart_relay {
         state.relay.restart();
+    } else if notify_peer_models {
+        state.relay.notify_peer_models_changed();
     }
     if recheck_availability {
         spawn_backend_availability_check(app);

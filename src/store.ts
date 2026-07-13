@@ -1513,14 +1513,14 @@ export async function initStore() {
     if (e.payload.connected) {
       void refreshPeers();
       void refreshInbox();
-      // 连上后立即后台预拉一轮在线队友的漫游模型（不必等到发起漫游才加载）
-      preloadPeerModels();
+      // 重连后强制校准：离线期间对端可能已调整共享模型，旧 peerModels 不能继续复用。
+      preloadPeerModels(true);
     }
   });
   await listen<{ peers: Peer[] } | Peer[]>("relay:peers", (e) => {
     setState("peers", normalizePeers(e.payload));
-    // 名单变化（有人上线/重连）即静默补拉其漫游模型，保持随时可用
-    preloadPeerModels();
+    // 名单变化（有人上线/重连）即强制刷新，避免继续复用该成员断线前的旧模型列表。
+    preloadPeerModels(true);
   });
   // 漫游：对端回传其可选模型/模式，按 token 缓存供选择器使用
   await listen<{

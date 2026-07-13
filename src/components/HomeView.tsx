@@ -16,6 +16,7 @@ import {
   modelChoices,
   normalizeUnifiedMode,
   openThread,
+  preloadPeerModels,
   refreshSlashCommands,
   resolveAvailableModel,
   resolveEnabledAgentKind,
@@ -331,6 +332,8 @@ export function HomeView() {
   };
 
   onMount(ensureScratchProject);
+  // 每次进入新会话页都强制校准在线队友的共享模型，避免沿用旧 peerModels 缓存。
+  onMount(() => preloadPeerModels(true));
 
   createEffect(() => {
     if (state.currentId === null) ensureScratchProject();
