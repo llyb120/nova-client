@@ -573,12 +573,8 @@ impl CodexManager {
             .kill_on_drop(true);
         crate::acp::apply_proxy_env(&mut cmd, &settings.codex_proxy);
         crate::pxpipe::apply_codex_pxpipe_env(&mut cmd, pxpipe_url.as_deref());
-        // 关键：给 codex 进程本身打上 CREATE_NO_WINDOW。codex 会获得一个无窗口的
-        // 控制台，其后续 fork 出来的所有子孙进程（shell、git、apply_patch 等）都会
-        // 继承这个无窗口控制台，从而彻底消除编辑文件 / 新会话输入时一闪而过的黑窗。
-        // 这是无侵入做法：不改 PATH/ComSpec、不复制 exe、不注入 wrapper。
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        // Windows 下继承 Nova 在启动时建立的隐藏控制台。这里不能使用 CREATE_NO_WINDOW，
+        // 否则 Codex 本身没有控制台，其后续启动 PowerShell 时会重新创建可见 conhost。
         #[cfg(unix)]
         {
             cmd.process_group(0);

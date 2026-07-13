@@ -1443,8 +1443,8 @@ impl AcpManager {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        // Windows 下继承 Nova 在启动时建立的隐藏控制台，保证 ACP 后端继续拉起的
+        // cmd/PowerShell/工具进程不会各自创建可见 conhost。
         #[cfg(unix)]
         {
             // 独立进程组：退出时可 kill(-pid) 整组清理子孙
