@@ -10,11 +10,17 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 在 repo 目录执行一条 git 子命令，成功返回 stdout（已 trim），失败返回 stderr。
 pub fn run(repo: &str, args: &[&str]) -> Result<String, String> {
-    git(repo, args)
+    Ok(git_stdout(repo, args)?.trim().to_string())
 }
 
-/// 在 repo 目录执行一条 git 子命令，成功返回 stdout（已 trim），失败返回 stderr。
-fn git(repo: &str, args: &[&str]) -> Result<String, String> {
+/// 在 repo 目录执行一条 git 子命令，成功返回原始 stdout（不 trim），失败返回 stderr。
+/// 用于 `git show` / `git diff` 等需要保留文件尾部换行的场景。
+pub fn run_raw(repo: &str, args: &[&str]) -> Result<String, String> {
+    git_stdout(repo, args)
+}
+
+/// 在 repo 目录执行一条 git 子命令，成功返回 stdout，失败返回 stderr。
+fn git_stdout(repo: &str, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);
     #[cfg(windows)]
@@ -29,7 +35,7 @@ fn git(repo: &str, args: &[&str]) -> Result<String, String> {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("git {}：{}", args.join(" "), err.trim()));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// 目录是否位于某个 git 工作树内
@@ -37,14 +43,14 @@ pub fn is_repo(dir: &str) -> bool {
     if !Path::new(dir).is_dir() {
         return false;
     }
-    git(dir, &["rev-parse", "--is-inside-work-tree"])
+    run(dir, &["rev-parse", "--is-inside-work-tree"])
         .map(|s| s == "true")
         .unwrap_or(false)
 }
 
 /// 返回 dir 所属仓库的根目录（顶层工作树）
 pub fn repo_root(dir: &str) -> Result<String, String> {
-    let root = git(dir, &["rev-parse", "--show-toplevel"])?;
+    let root = run(dir, &["rev-parse", "--show-toplevel"])?;
     if root.is_empty() {
         return Err("不是 git 仓库".into());
     }
@@ -97,7 +103,7 @@ pub fn branch_conflict(repo: &str, branch: &str) -> Option<String> {
 
 /// 列出仓库的本地分支（refs/heads），按名称排序。
 pub fn list_branches(dir: &str) -> Result<Vec<String>, String> {
-    let out = git(
+    let out = run(
         dir,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
     )?;
@@ -112,7 +118,7 @@ pub fn list_branches(dir: &str) -> Result<Vec<String>, String> {
 
 /// 当前分支名；分离 HEAD 时返回空串。
 pub fn current_branch(dir: &str) -> String {
-    git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap_or_default()
+    run(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap_or_default()
 }
 
 /// 创建 worktree：
@@ -123,9 +129,9 @@ pub fn add(repo: &str, path: &str, branch: &str, base: &str) -> Result<(), Strin
     let base = base.trim();
     let base = if base.is_empty() { "HEAD" } else { base };
     if branch.is_empty() {
-        git(repo, &["worktree", "add", path, base])?;
+        run(repo, &["worktree", "add", path, base])?;
     } else {
-        git(repo, &["worktree", "add", "-b", branch, path, base])?;
+        run(repo, &["worktree", "add", "-b", branch, path, base])?;
     }
     Ok(())
 }
@@ -133,7 +139,7 @@ pub fn add(repo: &str, path: &str, branch: &str, base: &str) -> Result<(), Strin
 /// 分支是否已被某个工作树检出（含主工作区）；是则返回那个工作树的路径。
 /// git 不允许同一分支同时检出到两个工作树，直接使用已有分支前需要预检。
 pub fn branch_checked_out(repo: &str, branch: &str) -> Option<String> {
-    let out = git(repo, &["worktree", "list", "--porcelain"]).ok()?;
+    let out = run(repo, &["worktree", "list", "--porcelain"]).ok()?;
     let mut cur_path: Option<String> = None;
     for line in out.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
@@ -150,12 +156,12 @@ pub fn branch_checked_out(repo: &str, branch: &str) -> Option<String> {
 
 /// 工作树是否干净（无未提交改动/未跟踪文件）。
 pub fn is_clean(dir: &str) -> Result<bool, String> {
-    Ok(git(dir, &["status", "--porcelain"])?.is_empty())
+    Ok(run(dir, &["status", "--porcelain"])?.is_empty())
 }
 
 /// 检出已有分支（工作树需干净，调用方自行预检）。
 pub fn checkout(dir: &str, branch: &str) -> Result<(), String> {
-    git(dir, &["checkout", branch])?;
+    run(dir, &["checkout", branch])?;
     Ok(())
 }
 
@@ -163,16 +169,16 @@ pub fn checkout(dir: &str, branch: &str) -> Result<(), String> {
 pub fn checkout_new_branch(dir: &str, branch: &str, base: &str) -> Result<(), String> {
     let base = base.trim();
     if base.is_empty() {
-        git(dir, &["checkout", "-b", branch])?;
+        run(dir, &["checkout", "-b", branch])?;
     } else {
-        git(dir, &["checkout", "-b", branch, base])?;
+        run(dir, &["checkout", "-b", branch, base])?;
     }
     Ok(())
 }
 
 /// 是否有任何未提交改动或未跟踪文件。
 pub fn has_changes(dir: &str) -> Result<bool, String> {
-    Ok(!git(dir, &["status", "--porcelain"])?.is_empty())
+    Ok(!run(dir, &["status", "--porcelain"])?.is_empty())
 }
 
 /// 提交当前工作树全部变更。无变更时直接返回 Ok(false)。
@@ -180,37 +186,37 @@ pub fn commit_all(dir: &str, message: &str) -> Result<bool, String> {
     if !has_changes(dir)? {
         return Ok(false);
     }
-    git(dir, &["add", "-A"])?;
-    git(dir, &["commit", "-m", message])?;
+    run(dir, &["add", "-A"])?;
+    run(dir, &["commit", "-m", message])?;
     Ok(true)
 }
 
 /// 在 dir 执行 `git merge <branch>`。成功返回 Ok；失败返回 stderr（冲突与否由调用方查 has_conflicts）。
 pub fn merge(dir: &str, branch: &str) -> Result<(), String> {
-    git(dir, &["merge", "--no-edit", branch])?;
+    run(dir, &["merge", "--no-edit", branch])?;
     Ok(())
 }
 
 /// 工作树当前是否存在未解决的合并冲突（index 里有 unmerged 条目）。
 pub fn has_conflicts(dir: &str) -> bool {
-    git(dir, &["ls-files", "-u"])
+    run(dir, &["ls-files", "-u"])
         .map(|s| !s.is_empty())
         .unwrap_or(false)
 }
 
 /// 中止一次失败的合并（best-effort，工作树没有进行中的合并时静默忽略）。
 pub fn merge_abort(dir: &str) {
-    let _ = git(dir, &["merge", "--abort"]);
+    let _ = run(dir, &["merge", "--abort"]);
 }
 
 /// 移除 worktree 工作目录（--force：容忍未提交改动/锁定）。
 pub fn remove(repo: &str, path: &str) -> Result<(), String> {
-    git(repo, &["worktree", "remove", "--force", path])?;
+    run(repo, &["worktree", "remove", "--force", path])?;
     Ok(())
 }
 
 /// 删除分支（-D 强制，忽略未合并检查）。
 pub fn delete_branch(repo: &str, branch: &str) -> Result<(), String> {
-    git(repo, &["branch", "-D", branch])?;
+    run(repo, &["branch", "-D", branch])?;
     Ok(())
 }

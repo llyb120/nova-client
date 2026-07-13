@@ -1094,27 +1094,38 @@ fn ensure_remote_git_cwd(app: &AppHandle, cwd: &str) -> Result<String, String> {
     {
         return Err("只能查看电脑端已有项目的 git 变化".into());
     }
-    if !crate::gitwt::is_repo(cwd) {
-        return Err("该目录不是 git 仓库".into());
-    }
-    crate::gitwt::repo_root(cwd)
+    // repo_root 本身会失败于非仓库，省掉额外的 is_repo 进程启动（Windows 上很贵）
+    crate::gitwt::repo_root(cwd).map_err(|_| "该目录不是 git 仓库".into())
 }
 
 fn remote_git_status(app: &AppHandle, cwd: &str) -> Result<Value, String> {
     let root = ensure_remote_git_cwd(app, cwd)?;
-    let branch = crate::gitwt::run(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .unwrap_or_else(|_| "HEAD".into());
+    // -b 把分支信息放进同一条 status，少一次 git 进程；
+    // 默认 untracked=normal（目录级），比 -uall 枚举全部未跟踪文件快得多。
     let porcelain = crate::gitwt::run(
         &root,
         &[
             "status",
             "--porcelain=v1",
-            "-uall",
+            "-b",
+            "--untracked-files=normal",
             "--ignore-submodules=dirty",
         ],
     )?;
+    let mut branch = "HEAD".to_string();
     let mut files = Vec::new();
     for line in porcelain.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            let name = rest
+                .split("...")
+                .next()
+                .unwrap_or(rest)
+                .split_whitespace()
+                .next()
+                .unwrap_or("HEAD");
+            branch = name.to_string();
+            continue;
+        }
         if line.len() < 3 {
             continue;
         }
@@ -1148,6 +1159,23 @@ fn remote_git_status(app: &AppHandle, cwd: &str) -> Result<Value, String> {
     }))
 }
 
+fn looks_binary(sample: &[u8]) -> bool {
+    sample.iter().any(|&b| b == 0)
+}
+
+fn truncate_str(mut s: String, limit: usize) -> (String, bool) {
+    if s.len() <= limit {
+        return (s, false);
+    }
+    // 尽量按 UTF-8 边界截断，避免 panic
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    (s, true)
+}
+
 fn remote_git_file(app: &AppHandle, cwd: &str, path: &str) -> Result<Value, String> {
     let root = ensure_remote_git_cwd(app, cwd)?;
     let path = path.trim().trim_start_matches(['/', '\\']);
@@ -1155,40 +1183,154 @@ fn remote_git_file(app: &AppHandle, cwd: &str, path: &str) -> Result<Value, Stri
         return Err("文件路径无效".into());
     }
     let abs = std::path::Path::new(&root).join(path);
-    let old_text = crate::gitwt::run(&root, &["show", &format!("HEAD:{path}")]).unwrap_or_default();
-    let new_text = if abs.is_file() {
+    // 全文 LCS 模式上限；超过则改走 git 统一 diff，体积小且桌面/手机都扛得住
+    const FULL_TEXT_LIMIT: u64 = 120_000;
+    const UNIFIED_LIMIT: usize = 600_000;
+    const SAMPLE: usize = 8_192;
+
+    let in_head = crate::gitwt::run(&root, &["cat-file", "-e", &format!("HEAD:{path}")]).is_ok();
+    let new_meta = abs.metadata().ok();
+    let new_is_file = new_meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
+    let new_size = new_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let old_size = if in_head {
+        crate::gitwt::run(&root, &["cat-file", "-s", &format!("HEAD:{path}")])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // 先抽样判二进制，避免把大二进制读进内存
+    if new_is_file {
+        if let Ok(mut f) = std::fs::File::open(&abs) {
+            use std::io::Read;
+            let mut buf = vec![0u8; SAMPLE];
+            let n = f.read(&mut buf).unwrap_or(0);
+            if looks_binary(&buf[..n]) {
+                return Ok(json!({
+                    "path": path,
+                    "binary": true,
+                    "oldText": "",
+                    "newText": "",
+                    "unified": "",
+                    "truncated": false,
+                }));
+            }
+        }
+    }
+
+    let prefer_unified = old_size > FULL_TEXT_LIMIT || new_size > FULL_TEXT_LIMIT;
+
+    if prefer_unified {
+        // 已跟踪变更：让 git 算 diff，payload 通常远小于双全文
+        if in_head {
+            let unified = crate::gitwt::run_raw(
+                &root,
+                &["diff", "--no-color", "--unified=3", "HEAD", "--", path],
+            )
+            .unwrap_or_default();
+            if unified.contains("Binary files ") || looks_binary(unified.as_bytes()) {
+                return Ok(json!({
+                    "path": path,
+                    "binary": true,
+                    "oldText": "",
+                    "newText": "",
+                    "unified": "",
+                    "truncated": false,
+                }));
+            }
+            let (unified, truncated) = truncate_str(unified, UNIFIED_LIMIT);
+            // 删除文件时 git diff 通常仍有输出；若为空则回退展示旧内容头
+            if unified.is_empty() && !new_is_file {
+                let old = crate::gitwt::run_raw(&root, &["show", &format!("HEAD:{path}")])
+                    .unwrap_or_default();
+                if looks_binary(old.as_bytes()) {
+                    return Ok(json!({
+                        "path": path,
+                        "binary": true,
+                        "oldText": "",
+                        "newText": "",
+                        "unified": "",
+                        "truncated": false,
+                    }));
+                }
+                let (old, truncated) = truncate_str(old, FULL_TEXT_LIMIT as usize);
+                return Ok(json!({
+                    "path": path,
+                    "binary": false,
+                    "oldText": old,
+                    "newText": "",
+                    "unified": "",
+                    "truncated": truncated,
+                }));
+            }
+            return Ok(json!({
+                "path": path,
+                "binary": false,
+                "oldText": "",
+                "newText": "",
+                "unified": unified,
+                "truncated": truncated,
+            }));
+        }
+        // 未跟踪大文件：只传截断后的新内容，前端按整文件新增展示
+        let new_text = if new_is_file {
+            std::fs::read_to_string(&abs).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if looks_binary(new_text.as_bytes()) {
+            return Ok(json!({
+                "path": path,
+                "binary": true,
+                "oldText": "",
+                "newText": "",
+                "unified": "",
+                "truncated": false,
+            }));
+        }
+        let (new_text, truncated) = truncate_str(new_text, FULL_TEXT_LIMIT as usize);
+        return Ok(json!({
+            "path": path,
+            "binary": false,
+            "oldText": "",
+            "newText": new_text,
+            "unified": "",
+            "truncated": truncated,
+        }));
+    }
+
+    // 小文件：传双全文，前端做行级 LCS
+    let old_text = if in_head {
+        crate::gitwt::run_raw(&root, &["show", &format!("HEAD:{path}")]).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let new_text = if new_is_file {
         std::fs::read_to_string(&abs).unwrap_or_default()
     } else {
         String::new()
     };
-    const LIMIT: usize = 400_000;
-    let mut truncated = false;
-    let mut old = old_text;
-    let mut new = new_text;
-    if old.len() > LIMIT {
-        old.truncate(LIMIT);
-        truncated = true;
-    }
-    if new.len() > LIMIT {
-        new.truncate(LIMIT);
-        truncated = true;
-    }
-    // 粗判二进制：含 NUL
-    if old.contains('\0') || new.contains('\0') {
+    if looks_binary(old_text.as_bytes()) || looks_binary(new_text.as_bytes()) {
         return Ok(json!({
             "path": path,
             "binary": true,
             "oldText": "",
             "newText": "",
+            "unified": "",
             "truncated": false,
         }));
     }
+    let (old, t1) = truncate_str(old_text, FULL_TEXT_LIMIT as usize);
+    let (new, t2) = truncate_str(new_text, FULL_TEXT_LIMIT as usize);
     Ok(json!({
         "path": path,
         "binary": false,
         "oldText": old,
         "newText": new,
-        "truncated": truncated,
+        "unified": "",
+        "truncated": t1 || t2,
     }))
 }
 
