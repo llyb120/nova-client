@@ -4031,15 +4031,23 @@ async fn run_cursor_models_cli(
 ///   Thinking" 实为 high 档、"Fable 5 1M Extra High Thinking" 强度词插在中间、
 ///   gpt-5.5-extra-high 的原始名只写了 "High"）；
 /// - 排序按「基础模型（首次出现序）→ 常规/Fast → 思考强度升序」聚拢，同族变体相邻。
+///
+/// 少数家族的 **id 后缀档位** 与 **CLI 营销名档位** 整体错开一档（如 grok：
+/// id `grok-4.5-medium/high/xhigh` 的营销名却是 "Low/Medium/(顶档无后缀)"，
+/// Cursor GUI 里也只有三档、根本没有 "XHigh"）。若同一基座下 ≥2 个变体的
+/// 「营销名档位 − id 档位」是同一个非零常量，就判定该家族整体偏移，显示名按营销
+/// 档位（= id 档位 + 偏移）标注，避免造出 Cursor 里不存在的档位。id 本身不改：
+/// 实际启动仍用真实 CLI id（`--model grok-4.5-xhigh`）。
 fn parse_cursor_models(out: &str) -> Vec<(String, String)> {
-    struct Entry {
+    struct Raw {
         id: String,
-        display: String,
-        base_idx: usize,
+        name: String,
+        base_key: String,
+        id_effort: Option<usize>,
+        name_effort: Option<usize>,
         fast: bool,
-        effort_rank: usize,
     }
-    let mut entries: Vec<Entry> = Vec::new();
+    let mut raws: Vec<Raw> = Vec::new();
     let mut base_order: Vec<String> = Vec::new();
     for line in out.lines() {
         // 去掉可能的 ANSI 颜色码
@@ -4065,25 +4073,93 @@ fn parse_cursor_models(out: &str) -> Vec<(String, String)> {
             }
             name = stripped;
         }
-        let (base_key, effort, fast) = cursor_variant_dims(id);
-        let base_idx = match base_order.iter().position(|b| b == &base_key) {
-            Some(i) => i,
-            None => {
-                base_order.push(base_key.clone());
-                base_order.len() - 1
-            }
-        };
-        entries.push(Entry {
+        let (base_key, id_effort, fast) = cursor_variant_dims(id);
+        if !base_order.iter().any(|b| b == &base_key) {
+            base_order.push(base_key.clone());
+        }
+        let name_effort = cursor_name_effort_rank(name, &base_key);
+        raws.push(Raw {
             id: id.to_string(),
-            display: cursor_display_name(name, &base_key, effort, fast),
-            base_idx,
+            name: name.to_string(),
+            base_key,
+            id_effort,
+            name_effort,
             fast,
-            // 无强度段即 CLI 缺省档，按 Medium 档参与排序
-            effort_rank: effort.unwrap_or(2),
         });
     }
-    entries.sort_by_key(|e| (e.base_idx, e.fast, e.effort_rank));
-    entries.into_iter().map(|e| (e.id, e.display)).collect()
+
+    // 侦测家族级档位偏移：某基座下同时带 id 档位与营销名档位的变体，若差值一致且非零，
+    // 视为整族刻度偏移（如 grok 恒 -1）。单个变体的差值可能只是营销名漏词（如 gpt-5.5
+    // 把 "Extra High" 写成 "High"），故要求 ≥2 个变体佐证，避免误判。
+    let mut diffs: HashMap<String, Vec<isize>> = HashMap::new();
+    for r in &raws {
+        if let (Some(ie), Some(ne)) = (r.id_effort, r.name_effort) {
+            diffs
+                .entry(r.base_key.clone())
+                .or_default()
+                .push(ne as isize - ie as isize);
+        }
+    }
+    let offsets: HashMap<String, isize> = diffs
+        .into_iter()
+        .filter_map(|(base, ds)| {
+            let first = *ds.first()?;
+            (ds.len() >= 2 && first != 0 && ds.iter().all(|d| *d == first))
+                .then_some((base, first))
+        })
+        .collect();
+
+    let max_rank = (CURSOR_EFFORT_LABELS.len() - 1) as isize;
+    let mut entries: Vec<(usize, bool, usize, String, String)> = Vec::new();
+    for r in &raws {
+        let base_idx = base_order.iter().position(|b| b == &r.base_key).unwrap();
+        // 偏移家族按营销档位显示（id 档位 + 偏移，夹取到合法范围）；其余仍以 id 档位为准。
+        let shown_effort = match (r.id_effort, offsets.get(&r.base_key)) {
+            (Some(rank), Some(off)) => Some((rank as isize + off).clamp(0, max_rank) as usize),
+            _ => r.id_effort,
+        };
+        let display = cursor_display_name(&r.name, &r.base_key, shown_effort, r.fast);
+        // 无强度段即 CLI 缺省档，按 Medium 档参与排序
+        entries.push((base_idx, r.fast, shown_effort.unwrap_or(2), r.id.clone(), display));
+    }
+    entries.sort_by_key(|e| (e.0, e.1, e.2));
+    entries
+        .into_iter()
+        .map(|(_, _, _, id, display)| (id, display))
+        .collect()
+}
+
+/// 从 CLI 显示名里解析思考强度档位（供家族档位偏移侦测）。排除括号尾注、Fast、以及
+/// 属于基座名的段（如 `gpt-5.1-codex-max` 里的 Max）。支持 "Extra High" 两段写法（= XHigh）。
+/// 返回 None 表示名里没有强度词。
+fn cursor_name_effort_rank(name: &str, base_key: &str) -> Option<usize> {
+    let core = match name.find('(') {
+        Some(i) => &name[..i],
+        None => name,
+    };
+    let tokens: Vec<&str> = core
+        .split_whitespace()
+        .filter(|t| !t.eq_ignore_ascii_case("fast"))
+        .collect();
+    let keep: Vec<&str> = base_key.split('-').collect();
+    let kept = |t: &str| keep.iter().any(|s| s.eq_ignore_ascii_case(t));
+    for i in 0..tokens.len().saturating_sub(1) {
+        if !kept(tokens[i])
+            && !kept(tokens[i + 1])
+            && tokens[i].eq_ignore_ascii_case("extra")
+            && tokens[i + 1].eq_ignore_ascii_case("high")
+        {
+            return Some(4);
+        }
+    }
+    tokens.iter().find_map(|t| {
+        if kept(t) {
+            return None;
+        }
+        CURSOR_EFFORT_LABELS
+            .iter()
+            .position(|l| t.eq_ignore_ascii_case(l))
+    })
 }
 
 /// 思考强度档位显示名（与排序档位一致）。
@@ -4708,22 +4784,24 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
         // `max` 属于模型名，`low` 才是强度
         assert_eq!(cursor_variant_dims("gpt-5.1-codex-max-low").0, "gpt-5.1-codex-max");
         assert_eq!(max_low.1, "Codex 5.1 Max Low");
-        // CLI 营销名与 id 档位不一致时，以 id 为准、不叠词
+        // grok 家族 id 后缀档位（medium/high/xhigh）比 CLI 营销档位（Low/Medium/顶档）整体高一档，
+        // ≥2 个变体佐证同一 -1 偏移，显示名按营销档位对齐，避免造出 Cursor 里不存在的 "XHigh"。
         let grok_med = parsed
             .iter()
             .find(|(id, _)| id == "grok-4.5-medium")
             .unwrap();
-        assert_eq!(grok_med.1, "Cursor Grok 4.5 Medium");
+        assert_eq!(grok_med.1, "Cursor Grok 4.5 Low");
         let grok_high = parsed
             .iter()
             .find(|(id, _)| id == "grok-4.5-high")
             .unwrap();
-        assert_eq!(grok_high.1, "Cursor Grok 4.5 High");
+        assert_eq!(grok_high.1, "Cursor Grok 4.5 Medium");
+        // id 仍是真实 CLI id（启动时 --model 直传），只有显示名跟随营销档位。
         let grok_x = parsed
             .iter()
             .find(|(id, _)| id == "grok-4.5-xhigh")
             .unwrap();
-        assert_eq!(grok_x.1, "Cursor Grok 4.5 XHigh");
+        assert_eq!(grok_x.1, "Cursor Grok 4.5 High");
     }
 
     #[test]
