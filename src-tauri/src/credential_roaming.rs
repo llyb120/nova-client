@@ -204,11 +204,24 @@ pub fn collect_credentials(agent_kind: AgentKind) -> Result<CredentialBundle, St
             "codex-home/auth.json",
             &mut files,
         )?,
-        AgentKind::Cursor => collect_file(
-            &configured_home("CURSOR_CONFIG_DIR", ".cursor").join("cli-config.json"),
-            "cursor/cli-config.json",
-            &mut files,
-        )?,
+        AgentKind::Cursor => {
+            collect_file(
+                &configured_home("CURSOR_CONFIG_DIR", ".cursor").join("cli-config.json"),
+                "cursor/cli-config.json",
+                &mut files,
+            )?;
+            #[cfg(windows)]
+            {
+                let appdata = std::env::var_os("APPDATA")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"));
+                collect_file(
+                    &appdata.join("Cursor").join("auth.json"),
+                    "appdata/Cursor/auth.json",
+                    &mut files,
+                )?;
+            }
+        }
         AgentKind::ClaudeCode => collect_file(
             &configured_home("CLAUDE_CONFIG_DIR", ".claude").join(".credentials.json"),
             "claude/.credentials.json",
@@ -344,6 +357,8 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
             let dir = root.join("cursor");
             let _ = std::fs::remove_file(dir.join("acp-config.json"));
             env.insert("CURSOR_CONFIG_DIR".into(), as_string(dir));
+            #[cfg(windows)]
+            env.insert("APPDATA".into(), as_string(root.join("appdata")));
         }
         AgentKind::OpenCode => {
             let data = root.join("xdg-data");
@@ -500,5 +515,21 @@ mod tests {
         assert!(safe_relative_path("../auth.json").is_err());
         assert!(safe_relative_path("/tmp/auth.json").is_err());
         assert!(safe_relative_path("codex-home/auth.json").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cursor_launch_env_isolates_appdata() {
+        let root = std::env::temp_dir().join("nova-cursor-launch-env-test");
+        let env = launch_env(&AgentKind::Cursor, &root).unwrap();
+
+        assert_eq!(
+            env.get("CURSOR_CONFIG_DIR"),
+            Some(&root.join("cursor").to_string_lossy().to_string())
+        );
+        assert_eq!(
+            env.get("APPDATA"),
+            Some(&root.join("appdata").to_string_lossy().to_string())
+        );
     }
 }
