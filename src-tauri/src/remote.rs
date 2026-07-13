@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 const ACTIVE_INTERVAL: Duration = Duration::from_millis(400);
@@ -164,6 +165,9 @@ pub fn start(app: AppHandle) {
 async fn run(app: AppHandle) {
     let mut last_cfg: Option<RemoteConfig> = None;
     let mut client = Client::new();
+    let (pull_tx, mut pull_rx) = mpsc::unbounded_channel();
+    let mut pull_task: Option<tauri::async_runtime::JoinHandle<()>> = None;
+    let mut pull_generation = 0u64;
     let mut requested: HashSet<String> = HashSet::new();
     let mut revision = 0i64;
     // 只保留正在流式同步的逐会话基线。历史会话按需发一次快照后立即释放，
@@ -180,6 +184,10 @@ async fn run(app: AppHandle) {
 
     loop {
         let Some(cfg) = config(&app) else {
+            if let Some(task) = pull_task.take() {
+                task.abort();
+            }
+            pull_generation = pull_generation.wrapping_add(1);
             last_cfg = None;
             requested.clear();
             revision = 0;
@@ -191,6 +199,10 @@ async fn run(app: AppHandle) {
             continue;
         };
         if last_cfg.as_ref() != Some(&cfg) {
+            if let Some(task) = pull_task.take() {
+                task.abort();
+            }
+            pull_generation = pull_generation.wrapping_add(1);
             client = build_client(&cfg.proxy);
             last_cfg = Some(cfg.clone());
             requested.clear();
@@ -203,6 +215,36 @@ async fn run(app: AppHandle) {
             results.clear();
             catalog_signature.clear();
             command_watch.clear();
+        }
+
+        while let Ok((generation, result)) = pull_rx.try_recv() {
+            if generation != pull_generation {
+                continue;
+            }
+            pull_task.take();
+            if let Ok(response) = result {
+                apply_pull_response(
+                    &app,
+                    response,
+                    &mut revision,
+                    &mut force_full,
+                    &mut previous,
+                    &mut processed_id,
+                    &mut ack_id,
+                    &mut results,
+                    &mut requested,
+                    &mut command_watch,
+                )
+                .await;
+            }
+        }
+        if pull_task.is_none() && revision > 0 && !force_full && results.is_empty() {
+            pull_task = Some(spawn_pull(
+                client.clone(),
+                cfg.clone(),
+                pull_generation,
+                pull_tx.clone(),
+            ));
         }
 
         let now = Instant::now();
@@ -252,31 +294,31 @@ async fn run(app: AppHandle) {
             || !results.is_empty();
 
         if !want_upload {
-            if !should_long_poll(any_running, !command_watch.is_empty()) {
-                // 运行中的会话不能进入命令长轮询。某一拍没有浏览器可见变化很常见，
-                // 继续按活动间隔检查，才能及时捕获最后内容与 running=false。
+            if any_running || !command_watch.is_empty() {
+                // 内容同步继续按活动间隔检查；服务端命令由独立长轮询并发领取，
+                // 不会再被一个长任务或无可见输出的工具调用挡住。
                 sleep(ACTIVE_INTERVAL).await;
                 continue;
             }
-            match pull(&client, &cfg).await {
-                Ok(resp) => {
-                    revision = resp.revision;
-                    if resp.need_full {
-                        force_full = true;
+            if let Some((generation, result)) = pull_rx.recv().await {
+                if generation == pull_generation {
+                    pull_task.take();
+                    if let Ok(response) = result {
+                        apply_pull_response(
+                            &app,
+                            response,
+                            &mut revision,
+                            &mut force_full,
+                            &mut previous,
+                            &mut processed_id,
+                            &mut ack_id,
+                            &mut results,
+                            &mut requested,
+                            &mut command_watch,
+                        )
+                        .await;
                     }
-                    requested = reconcile_response(&app, &resp, &mut previous);
-                    process_commands(
-                        &app,
-                        resp.commands,
-                        &mut processed_id,
-                        &mut ack_id,
-                        &mut results,
-                        &mut requested,
-                        &mut command_watch,
-                    )
-                    .await;
                 }
-                Err(e) => sleep(error_backoff(&e)).await,
             }
             continue;
         }
@@ -423,6 +465,56 @@ async fn run(app: AppHandle) {
             sleep(ACTIVE_INTERVAL).await;
         }
     }
+}
+
+fn spawn_pull(
+    client: Client,
+    cfg: RemoteConfig,
+    generation: u64,
+    tx: mpsc::UnboundedSender<(u64, Result<ServerResponse, String>)>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let result = pull(&client, &cfg).await;
+        if let Err(error) = &result {
+            sleep(error_backoff(error)).await;
+        }
+        let _ = tx.send((generation, result));
+    })
+}
+
+async fn apply_pull_response(
+    app: &AppHandle,
+    response: ServerResponse,
+    revision: &mut i64,
+    force_full: &mut bool,
+    previous: &mut HashMap<String, (Thread, bool)>,
+    processed_id: &mut i64,
+    ack_id: &mut i64,
+    results: &mut Vec<CommandResult>,
+    requested: &mut HashSet<String>,
+    command_watch: &mut HashMap<String, Instant>,
+) {
+    // pull 与内容上传并发，较早发出的 pull 可能晚于一次 sync 返回。修订号只能前进；
+    // 命令 id 自带去重，因此无论响应修订新旧都可以安全处理。
+    if response.need_full {
+        *revision = response.revision;
+        *force_full = true;
+        previous.clear();
+        requested.extend(reconcile_response(app, &response, previous));
+    } else if response.revision >= *revision {
+        *revision = response.revision;
+        requested.extend(reconcile_response(app, &response, previous));
+    }
+    process_commands(
+        app,
+        response.commands,
+        processed_id,
+        ack_id,
+        results,
+        requested,
+        command_watch,
+    )
+    .await;
 }
 
 fn error_backoff(error: &str) -> Duration {
@@ -888,13 +980,6 @@ mod tests {
     }
 
     #[test]
-    fn running_thread_without_visible_change_stays_on_active_polling() {
-        assert!(!should_long_poll(true, false));
-        assert!(!should_long_poll(false, true));
-        assert!(should_long_poll(false, false));
-    }
-
-    #[test]
     fn server_response_accepts_null_collections() {
         let response: ServerResponse = serde_json::from_value(json!({
             "commands": null,
@@ -909,10 +994,6 @@ mod tests {
         assert!(response.thread_checkpoints.is_empty());
         assert_eq!(response.revision, 3);
     }
-}
-
-fn should_long_poll(any_running: bool, has_command_watch: bool) -> bool {
-    !any_running && !has_command_watch
 }
 
 async fn process_commands(
