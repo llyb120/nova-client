@@ -264,6 +264,8 @@ export interface Settings {
   relayGroups: string;
   /** 在团队里展示的名字（空 = 用机器名兜底） */
   relayName: string;
+  /** 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>` */
+  quotaSharedModels: string[];
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
   codexEnabled: boolean;
@@ -297,6 +299,15 @@ export interface CliStatus {
   version: string;
   upgradeSupported: boolean;
   detail: string;
+}
+
+export interface CliOperationProgress {
+  operationId: string;
+  agentKind: AgentKind;
+  action: "安装" | "升级";
+  stage: "waiting" | "running" | "verifying" | "completed" | "failed" | "cancelled";
+  percent: number;
+  message: string;
 }
 
 export interface PxpipeServiceStatus {
@@ -347,6 +358,8 @@ export interface PeerModels {
   backends: AgentKind[];
   /** 各后端的模型/模式选项（缺失的后端为 undefined） */
   options: Partial<Record<AgentKind, ModelOptions | null>>;
+  /** 对端明确开放额度租借的模型；仅注入新会话模型选择器。 */
+  sharedOptions: Partial<Record<AgentKind, ModelOptions | null>>;
 }
 
 /** 团队/漫游：在线名单里的一个人 */

@@ -5,6 +5,7 @@ import { api } from "./ipc";
 import type {
   AgentKind,
   BranchList,
+  CliOperationProgress,
   Decision,
   EffortChoice,
   Employee,
@@ -95,6 +96,8 @@ interface AppStore {
   slashCommands: Record<AgentKind, SlashCommand[]>;
   /** 更新下载/安装进度 */
   updateProgress: UpdateProgress | null;
+  /** CLI 安装/升级进度；设置页与额度租借前置安装共用。 */
+  cliOperationProgress: CliOperationProgress | null;
   /** 团队/漫游中转站状态 */
   relay: RelayStatus;
   /** 在线名单（团队/漫游） */
@@ -177,6 +180,7 @@ export const [state, setState] = createStore<AppStore>({
     opencode: [],
   },
   updateProgress: null,
+  cliOperationProgress: null,
   relay: { enabled: false, connected: false },
   peers: [],
   peerModels: {},
@@ -1395,6 +1399,10 @@ export async function initStore() {
     setState("backendAvailability", reconcile(e.payload.availability ?? {}));
   });
 
+  await listen<CliOperationProgress>("cli:operation-progress", (e) => {
+    setState("cliOperationProgress", e.payload);
+  });
+
   await listen<string>("acp:log", (e) => {
     setState(
       "logs",
@@ -1515,14 +1523,20 @@ export async function initStore() {
     preloadPeerModels();
   });
   // 漫游：对端回传其可选模型/模式，按 token 缓存供选择器使用
-  await listen<{ peer: string; backends: AgentKind[]; options: PeerModels["options"] }>(
+  await listen<{
+    peer: string;
+    backends: AgentKind[];
+    options: PeerModels["options"];
+    sharedOptions: PeerModels["sharedOptions"];
+  }>(
     "relay:peer-models",
     (e) => {
-      const { peer, backends, options } = e.payload;
+      const { peer, backends, options, sharedOptions } = e.payload;
       if (!peer) return;
       setState("peerModels", peer, {
         backends: Array.isArray(backends) ? backends : [],
         options: options ?? {},
+        sharedOptions: sharedOptions ?? {},
       });
     },
   );

@@ -16,6 +16,16 @@ import { SearchSelect, type SelectOption } from "./SearchSelect";
 /** 模型/模式选项来源：漫游时返回对端（host）的列表；返回 undefined 表示用本机全局列表。 */
 export type ModelOptionsSource = (agentKind: AgentKind) => ModelOptions | null | undefined;
 
+export interface QuotaModelPeer {
+  token: string;
+  name: string;
+}
+
+export interface SharedModelSource {
+  peer: QuotaModelPeer;
+  options: Partial<Record<AgentKind, ModelOptions | null>>;
+}
+
 const PROVIDER_LABEL: Record<string, string> = {
   MODEL_PROVIDER_ANTHROPIC: "Claude",
   MODEL_PROVIDER_OPENAI: "GPT",
@@ -53,7 +63,23 @@ const fmt = (n: number) => String(Math.round(n * 100) / 100);
 const encodeModelValue = (agentKind: AgentKind, value: string) =>
   `${agentKind}:${encodeURIComponent(value)}`;
 
-function decodeModelValue(value: string): { agentKind: AgentKind; model: string } | null {
+const encodeQuotaModelValue = (peerToken: string, agentKind: AgentKind, value: string) =>
+  `quota:${encodeURIComponent(peerToken)}:${agentKind}:${encodeURIComponent(value)}`;
+
+function decodeModelValue(
+  value: string,
+): { agentKind: AgentKind; model: string; peerToken?: string } | null {
+  if (value.startsWith("quota:")) {
+    const parts = value.split(":");
+    if (parts.length !== 4) return null;
+    const agentKind = parts[2] as AgentKind;
+    if (!ALL_AGENT_KINDS.includes(agentKind)) return null;
+    return {
+      peerToken: decodeURIComponent(parts[1]),
+      agentKind,
+      model: decodeURIComponent(parts[3]),
+    };
+  }
   const i = value.indexOf(":");
   if (i <= 0) return null;
   const agentKind = value.slice(0, i) as AgentKind;
@@ -161,7 +187,9 @@ export function ModelPicker(props: {
   agentKinds?: AgentKind[];
   model: string;
   modelSource?: ModelOptionsSource;
-  onPickModel: (agentKind: AgentKind, model: string) => void;
+  sharedModels?: SharedModelSource[];
+  quotaPeerToken?: string | null;
+  onPickModel: (agentKind: AgentKind, model: string, quotaPeer?: QuotaModelPeer | null) => void;
   title?: string;
   prefix?: string;
   portal?: boolean;
@@ -173,12 +201,27 @@ export function ModelPicker(props: {
   defaultLabel?: string;
 }) {
   const kinds = createMemo(() => props.agentKinds ?? [props.agentKind]);
-  const merged = createMemo(() => kinds().length > 1);
+  const sharedOptions = createMemo<SelectOption[]>(() =>
+    (props.sharedModels ?? []).flatMap(({ peer, options }) =>
+      ALL_AGENT_KINDS.flatMap((kind) =>
+        modelOptionsOf(kind, false, options[kind] ?? null).map((option) => ({
+          ...option,
+          value: encodeQuotaModelValue(peer.token, kind, option.value),
+          backend: `quota:${peer.token}:${kind}`,
+          backendLabel: `${peer.name}的${agentLabel(kind)}`,
+        })),
+      ),
+    ),
+  );
+  const merged = createMemo(() => kinds().length > 1 || sharedOptions().length > 0);
   const sourceOf = (k: AgentKind) => props.modelSource?.(k);
 
   const modelOptions = createMemo<SelectOption[]>(() => {
     if (!merged()) return modelOptionsOf(props.agentKind, false, sourceOf(props.agentKind));
-    return kinds().flatMap((k) => modelOptionsOf(k, true, sourceOf(k)));
+    return [
+      ...kinds().flatMap((k) => modelOptionsOf(k, true, sourceOf(k))),
+      ...sharedOptions(),
+    ];
   });
 
   const effectiveModel = createMemo(() => {
@@ -189,17 +232,23 @@ export function ModelPicker(props: {
     return resolveAvailableModel(props.agentKind, "", sourceOf(props.agentKind));
   });
 
-  const modelValue = createMemo(() =>
-    merged() ? encodeModelValue(props.agentKind, effectiveModel()) : effectiveModel(),
-  );
+  const modelValue = createMemo(() => {
+    const peerToken = props.quotaPeerToken;
+    if (peerToken) return encodeQuotaModelValue(peerToken, props.agentKind, effectiveModel());
+    return merged() ? encodeModelValue(props.agentKind, effectiveModel()) : effectiveModel();
+  });
 
   const onModelChange = (v: string) => {
     if (!merged()) {
-      props.onPickModel(props.agentKind, v);
+      props.onPickModel(props.agentKind, v, null);
       return;
     }
     const decoded = decodeModelValue(v);
-    if (decoded) props.onPickModel(decoded.agentKind, decoded.model);
+    if (!decoded) return;
+    const quotaPeer = decoded.peerToken
+      ? (props.sharedModels ?? []).find((source) => source.peer.token === decoded.peerToken)?.peer
+      : null;
+    props.onPickModel(decoded.agentKind, decoded.model, quotaPeer);
   };
 
   const loadLocalOptions = () => {
@@ -209,6 +258,14 @@ export function ModelPicker(props: {
 
   const fallbackLabel = createMemo(() => {
     if (props.modelSource) return undefined;
+    if (props.quotaPeerToken) {
+      const peer = (props.sharedModels ?? []).find(
+        (source) => source.peer.token === props.quotaPeerToken,
+      )?.peer;
+      return peer
+        ? `${peer.name}的${agentLabel(props.agentKind)} · ${props.model || "默认"}`
+        : props.model;
+    }
     const name = lastUsed.modelName(props.agentKind);
     return props.model && name ? name : undefined;
   });
@@ -241,8 +298,10 @@ export function ConfigSelects(props: {
   mode: string;
   /** 模型/模式选项来源（漫游时用对端列表）；不传则用本机全局列表 */
   modelSource?: ModelOptionsSource;
+  sharedModels?: SharedModelSource[];
+  quotaPeerToken?: string | null;
   /** 一次性提交「后端 + 模型」；单后端时 agentKind 即当前后端 */
-  onPickModel: (agentKind: AgentKind, model: string) => void;
+  onPickModel: (agentKind: AgentKind, model: string, quotaPeer?: QuotaModelPeer | null) => void;
   onMode: (v: string) => void;
   /** 浮层是否用 Portal 渲染到 body（在弹窗/受限容器里避免被裁剪） */
   portal?: boolean;
@@ -283,6 +342,8 @@ export function ConfigSelects(props: {
         agentKinds={props.agentKinds}
         model={props.model}
         modelSource={props.modelSource}
+        sharedModels={props.sharedModels}
+        quotaPeerToken={props.quotaPeerToken}
         onPickModel={props.onPickModel}
         portal={props.portal}
         anchorTo={props.anchorTo}

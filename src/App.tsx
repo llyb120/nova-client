@@ -1,10 +1,10 @@
 import { createEffect, createSignal, onMount, Show } from "solid-js";
 import { AmbientScene } from "./components/AmbientScene";
 import { ChatView } from "./components/ChatView";
+import { CliOperationModal } from "./components/CliOperationModal";
 import { DecisionWorkbench } from "./components/DecisionWorkbench";
 import { EmployeesView } from "./components/EmployeesView";
 import { HomeView } from "./components/HomeView";
-import { QuotaRequestModal } from "./components/QuotaRequestModal";
 import { RoamRequestModal } from "./components/RoamRequestModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { ShareInboxModal } from "./components/ShareInboxModal";
@@ -83,8 +83,8 @@ export default function App() {
         <ShareInboxModal onClose={() => setShowInbox(false)} />
       </Show>
       <RoamRequestModal />
-      <QuotaRequestModal />
       <UpdateModal show={showUpdate()} onClose={() => setShowUpdate(false)} />
+      <CliOperationModal />
     </div>
   );
 }

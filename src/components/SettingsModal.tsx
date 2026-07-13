@@ -8,6 +8,7 @@ import {
   deleteThreads,
   enabledAgentKinds,
   ensureModelOptions,
+  modelChoices,
   normalizeUnifiedMode,
   refreshRelayStatus,
   setState,
@@ -168,6 +169,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [relayToken, setRelayToken] = createSignal(s?.relayToken ?? "");
   const [relayGroups, setRelayGroups] = createSignal(s?.relayGroups ?? "");
   const [relayName, setRelayName] = createSignal(s?.relayName ?? "");
+  const [quotaSharedModels, setQuotaSharedModels] = createSignal<string[]>(s?.quotaSharedModels ?? []);
   const [verifying, setVerifying] = createSignal(false);
   const [verifyMsg, setVerifyMsg] = createSignal("");
   const [showLogs, setShowLogs] = createSignal(false);
@@ -206,6 +208,30 @@ export function SettingsModal(props: { onClose: () => void }) {
       cursorEnabled(),
       opencodeEnabled(),
     ].filter(Boolean).length;
+
+  const quotaShareKinds = (): AgentKind[] =>
+    [
+      ["devin", devinEnabled()],
+      ["codex", codexEnabled()],
+      ["codebuddy", codebuddyEnabled()],
+      ["claudecode", claudecodeEnabled()],
+      ["cursor", cursorEnabled()],
+      ["opencode", opencodeEnabled()],
+    ]
+      .filter((entry) => entry[1])
+      .map((entry) => entry[0] as AgentKind);
+
+  const quotaShareKey = (kind: AgentKind, model: string) => `${kind}:${model}`;
+  const toggleQuotaSharedModel = (kind: AgentKind, model: string, checked: boolean) => {
+    const key = quotaShareKey(kind, model);
+    setQuotaSharedModels((current) =>
+      checked
+        ? current.includes(key)
+          ? current
+          : [...current, key]
+        : current.filter((item) => item !== key),
+    );
+  };
 
   // 后端可用性检测结果：false = 已检测且未找到 CLI（卡片上提示，仍可手动改路径）
   const backendMissing = (kind: string) => state.backendAvailability[kind] === false;
@@ -276,6 +302,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     relayToken: relayToken().trim(),
     relayGroups: relayGroups().trim(),
     relayName: relayName().trim(),
+    quotaSharedModels: quotaSharedModels(),
     devinEnabled: devinEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
@@ -303,19 +330,21 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const upgradeCli = async (kind: AgentKind) => {
     const wasInstalled = cliStatuses()[kind]?.installed !== false;
+    const operationId = crypto.randomUUID();
     setUpgradingCli(kind);
     setCliMessages((prev) => ({ ...prev, [kind]: "" }));
     try {
-      const status = await api.upgradeCli(kind, draftSettings());
+      const status = await api.upgradeCli(kind, draftSettings(), operationId);
       setCliStatuses((prev) => ({ ...prev, [kind]: status }));
       setCliMessages((prev) => ({
         ...prev,
         [kind]: `${wasInstalled ? "已更新" : "已安装"}到 ${status.version}`,
       }));
     } catch (e) {
+      const cancelled = String(e).includes("CLI 操作已取消");
       setCliMessages((prev) => ({
         ...prev,
-        [kind]: `${wasInstalled ? "升级" : "安装"}失败：${String(e)}`,
+        [kind]: cancelled ? "操作已取消" : `${wasInstalled ? "升级" : "安装"}失败：${String(e)}`,
       }));
     } finally {
       setUpgradingCli(null);
@@ -328,6 +357,11 @@ export function SettingsModal(props: { onClose: () => void }) {
       cliStatusesLoaded = true;
       void refreshCliStatuses();
     }
+  });
+
+  createEffect(() => {
+    if (tab() !== "team") return;
+    for (const kind of quotaShareKinds()) void ensureModelOptions(kind);
   });
 
   const refreshPxpipeStatus = async () => {
@@ -1259,6 +1293,56 @@ export function SettingsModal(props: { onClose: () => void }) {
               />
               <span class="field-hint">分享、漫游时队友看到的名字。</span>
             </label>
+
+            <div class="field">
+              <span class="field-label">共享模型额度（可多选）</span>
+              <span class="field-hint">
+                选中的模型会以“{relayName().trim() || "我的"}的 Cursor”这类一级分类出现在队友的新会话模型选择器中。每次创建会话都会重新同步当前凭据；取消勾选后，旧缓存中的入口也无法再使用。
+              </span>
+              <div class="quota-share-models">
+                <For each={quotaShareKinds()}>
+                  {(kind) => {
+                    const choices = () => modelChoices(kind);
+                    return (
+                      <section class="quota-share-backend">
+                        <div class="quota-share-backend-title">
+                          <span class={`agent-badge ${kind}`}>{agentLabel(kind)}</span>
+                          <span>{choices().length} 个模型</span>
+                        </div>
+                        <Show
+                          when={choices().length > 0}
+                          fallback={<div class="field-hint">暂无模型，请先安装并登录对应 CLI。</div>}
+                        >
+                          <div class="quota-share-options">
+                            <For each={choices()}>
+                              {(choice) => {
+                                const key = () => quotaShareKey(kind, choice.value);
+                                return (
+                                  <label class="quota-share-option" title={choice.value}>
+                                    <input
+                                      type="checkbox"
+                                      checked={quotaSharedModels().includes(key())}
+                                      onChange={(event) =>
+                                        toggleQuotaSharedModel(
+                                          kind,
+                                          choice.value,
+                                          event.currentTarget.checked,
+                                        )
+                                      }
+                                    />
+                                    <span>{choice.name}</span>
+                                  </label>
+                                );
+                              }}
+                            </For>
+                          </div>
+                        </Show>
+                      </section>
+                    );
+                  }}
+                </For>
+              </div>
+            </div>
           </Show>
 
           {/* ===== 记忆检索 ===== */}

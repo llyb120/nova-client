@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use settings::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use threads::{
@@ -93,6 +94,8 @@ pub struct AppState {
     pub backend_availability: Mutex<HashMap<String, bool>>,
     /// CLI 升级串行执行，避免两个包管理器/自更新器同时改写 PATH 下的文件。
     pub cli_upgrade_lock: tokio::sync::Mutex<()>,
+    /// 正在执行的 CLI 安装/升级任务；值为取消标记，设置页和额度前置安装共用。
+    pub cli_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 进程内 Tool API（localhost）；员工工具优先走此通道。
     pub tool_api: Mutex<Option<tool_api::ToolApiInfo>>,
 }
@@ -352,10 +355,17 @@ async fn upgrade_cli(
     state: State<'_, AppState>,
     agent_kind: AgentKind,
     settings: Settings,
+    operation_id: String,
 ) -> Result<cli_manager::CliStatus, String> {
-    let status = cli_manager::upgrade(&state, agent_kind, &settings).await?;
+    let status =
+        cli_manager::upgrade(&app, &state, agent_kind, &settings, &operation_id).await?;
     spawn_backend_availability_check(app);
     Ok(status)
+}
+
+#[tauri::command]
+fn cancel_cli_operation(state: State<'_, AppState>, operation_id: String) -> bool {
+    cli_manager::cancel(&state, &operation_id)
 }
 
 #[tauri::command]
@@ -2293,7 +2303,8 @@ async fn set_settings(
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
             || s.relay_groups != settings.relay_groups
-            || s.relay_name != settings.relay_name;
+            || s.relay_name != settings.relay_name
+            || s.quota_shared_models != settings.quota_shared_models;
         // 任一后端的路径变化都可能影响「是否可用」，保存后重新并发检测
         let recheck_availability = restart_devin
             || restart_codebuddy
@@ -3455,6 +3466,7 @@ pub fn run() {
                 employee_stop_reasons: Mutex::new(HashMap::new()),
                 backend_availability: Mutex::new(HashMap::new()),
                 cli_upgrade_lock: tokio::sync::Mutex::new(()),
+                cli_operations: Mutex::new(HashMap::new()),
                 tool_api: Mutex::new(None),
             });
 
@@ -3663,6 +3675,7 @@ pub fn run() {
             get_backend_availability,
             get_cli_statuses,
             upgrade_cli,
+            cancel_cli_operation,
             restart_devin,
             get_status,
             get_logs,

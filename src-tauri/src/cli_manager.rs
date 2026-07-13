@@ -4,7 +4,14 @@ use crate::threads::AgentKind;
 use crate::AppState;
 use serde::Serialize;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+
+pub const EV_CLI_OPERATION_PROGRESS: &str = "cli:operation-progress";
+const CANCELLED_ERROR: &str = "CLI 操作已取消";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -271,6 +278,169 @@ async fn run_command(
     }
 }
 
+fn emit_operation_progress(
+    app: &AppHandle,
+    operation_id: &str,
+    kind: &AgentKind,
+    action: &str,
+    stage: &str,
+    percent: u8,
+    message: impl Into<String>,
+) {
+    let _ = app.emit(
+        EV_CLI_OPERATION_PROGRESS,
+        serde_json::json!({
+            "operationId": operation_id,
+            "agentKind": kind,
+            "action": action,
+            "stage": stage,
+            "percent": percent,
+            "message": message.into(),
+        }),
+    );
+}
+
+async fn read_progress_stream<R>(
+    reader: R,
+    app: AppHandle,
+    operation_id: String,
+    kind: AgentKind,
+    action: String,
+    percent: Arc<AtomicU8>,
+) -> String
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut output = String::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = strip_ansi(line.trim());
+        if line.is_empty() {
+            continue;
+        }
+        if output.len() < 4000 {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.extend(line.chars().take(4000usize.saturating_sub(output.len())));
+        }
+        emit_operation_progress(
+            &app,
+            &operation_id,
+            &kind,
+            &action,
+            "running",
+            percent.load(Ordering::SeqCst),
+            line,
+        );
+    }
+    output
+}
+
+async fn run_command_with_progress(
+    app: &AppHandle,
+    operation_id: &str,
+    kind: &AgentKind,
+    action: &str,
+    program: &str,
+    args: &[String],
+    proxy: &str,
+    timeout_duration: Duration,
+    cancelled: Arc<AtomicBool>,
+) -> Result<String, String> {
+    let mut cmd = build_command(program, args);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    apply_proxy_env(&mut cmd, proxy);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("无法启动 {program}：{e}"))?;
+    let pid = child.id();
+    let percent = Arc::new(AtomicU8::new(10));
+    let stdout_task = child.stdout.take().map(|stdout| {
+        tauri::async_runtime::spawn(read_progress_stream(
+            stdout,
+            app.clone(),
+            operation_id.to_string(),
+            kind.clone(),
+            action.to_string(),
+            percent.clone(),
+        ))
+    });
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tauri::async_runtime::spawn(read_progress_stream(
+            stderr,
+            app.clone(),
+            operation_id.to_string(),
+            kind.clone(),
+            action.to_string(),
+            percent.clone(),
+        ))
+    });
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let started = tokio::time::Instant::now();
+
+    let status = loop {
+        tokio::select! {
+            result = child.wait() => break result.map_err(|e| format!("等待 {program} 失败：{e}"))?,
+            _ = ticker.tick() => {
+                if cancelled.load(Ordering::SeqCst) {
+                    if let Some(pid) = pid {
+                        crate::acp::kill_process_tree(pid);
+                    }
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(CANCELLED_ERROR.into());
+                }
+                if started.elapsed() >= timeout_duration {
+                    if let Some(pid) = pid {
+                        crate::acp::kill_process_tree(pid);
+                    }
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(format!("{program} 执行超时"));
+                }
+                let next = percent.load(Ordering::SeqCst).saturating_add(1).min(85);
+                percent.store(next, Ordering::SeqCst);
+                emit_operation_progress(
+                    app,
+                    operation_id,
+                    kind,
+                    action,
+                    "running",
+                    next,
+                    format!("正在{action} {}…", kind.label()),
+                );
+            }
+        }
+    };
+
+    let stdout = match stdout_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
+    let stderr = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
+    let text = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if status.success() {
+        Ok(text)
+    } else if text.is_empty() {
+        Err(format!("{program} 退出码 {:?}", status.code()))
+    } else {
+        Err(text)
+    }
+}
+
 fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = strip_ansi(&String::from_utf8_lossy(stdout));
     let stderr = strip_ansi(&String::from_utf8_lossy(stderr));
@@ -430,41 +600,141 @@ fn devin_process_running() -> bool {
 }
 
 pub async fn upgrade(
+    app: &AppHandle,
     state: &AppState,
     kind: AgentKind,
     settings: &Settings,
+    operation_id: &str,
 ) -> Result<CliStatus, String> {
-    let _guard = state.cli_upgrade_lock.lock().await;
     let spec = spec_for(&kind, settings);
     let installed = resolve_program_on_path(&spec.program).is_some();
-
-    if installed {
-        stop_backend(state, &kind).await;
-        if kind == AgentKind::Devin && devin_process_running() {
-            return Err(
-                "检测到仍在运行的 devin 进程。请先结束 Nova 之外的 Devin 进程再升级。"
-                    .into(),
-            );
+    let action = if installed { "升级" } else { "安装" };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    {
+        let mut operations = state.cli_operations.lock().unwrap();
+        if operations.contains_key(operation_id) {
+            return Err("CLI 操作编号重复".into());
         }
+        operations.insert(operation_id.to_string(), cancelled.clone());
     }
+    emit_operation_progress(
+        app,
+        operation_id,
+        &kind,
+        action,
+        "waiting",
+        0,
+        format!("正在准备{action} {}…", kind.label()),
+    );
 
-    let (program, args, action) = if installed {
-        (&spec.upgrade_program, &spec.upgrade_args, "升级")
+    let result = async {
+        let _guard = state.cli_upgrade_lock.lock().await;
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(CANCELLED_ERROR.into());
+        }
+
+        if installed {
+            stop_backend(state, &kind).await;
+            if kind == AgentKind::Devin && devin_process_running() {
+                return Err(
+                    "检测到仍在运行的 devin 进程。请先结束 Nova 之外的 Devin 进程再升级。"
+                        .into(),
+                );
+            }
+        }
+
+        let (program, args) = if installed {
+            (&spec.upgrade_program, &spec.upgrade_args)
+        } else {
+            (&spec.install_program, &spec.install_args)
+        };
+        run_command_with_progress(
+            app,
+            operation_id,
+            &kind,
+            action,
+            program,
+            args,
+            &spec.proxy,
+            Duration::from_secs(15 * 60),
+            cancelled.clone(),
+        )
+        .await
+        .map_err(|e| {
+            if e == CANCELLED_ERROR {
+                e
+            } else {
+                format!("{} {action}失败：{e}", spec.cli_name)
+            }
+        })?;
+
+        emit_operation_progress(
+            app,
+            operation_id,
+            &kind,
+            action,
+            "verifying",
+            92,
+            format!("{action}命令已完成，正在校验 CLI…"),
+        );
+        refresh_cli_search_path();
+        let status = status_for(spec).await;
+        if !status.installed {
+            return Err(format!(
+                "{} {action}完成，但 Nova 仍未找到可执行文件",
+                status.cli_name
+            ));
+        }
+        Ok(status)
+    }
+    .await;
+
+    state.cli_operations.lock().unwrap().remove(operation_id);
+    match &result {
+        Ok(status) => emit_operation_progress(
+            app,
+            operation_id,
+            &kind,
+            action,
+            "completed",
+            100,
+            format!("{} 已就绪：{}", status.cli_name, status.version),
+        ),
+        Err(error) if error == CANCELLED_ERROR => emit_operation_progress(
+            app,
+            operation_id,
+            &kind,
+            action,
+            "cancelled",
+            0,
+            format!("已取消{action} {}", kind.label()),
+        ),
+        Err(error) => emit_operation_progress(
+            app,
+            operation_id,
+            &kind,
+            action,
+            "failed",
+            0,
+            error,
+        ),
+    }
+    result
+}
+
+pub fn cancel(state: &AppState, operation_id: &str) -> bool {
+    let operation = state
+        .cli_operations
+        .lock()
+        .unwrap()
+        .get(operation_id)
+        .cloned();
+    if let Some(cancelled) = operation {
+        cancelled.store(true, Ordering::SeqCst);
+        true
     } else {
-        (&spec.install_program, &spec.install_args, "安装")
-    };
-    run_command(
-        program,
-        args,
-        &spec.proxy,
-        Duration::from_secs(15 * 60),
-    )
-    .await
-    .map_err(|e| format!("{} {action}失败：{e}", spec.cli_name))?;
-
-    refresh_cli_search_path();
-
-    Ok(status_for(spec).await)
+        false
+    }
 }
 
 pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
@@ -473,14 +743,16 @@ pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
 }
 
 pub async fn ensure_installed(
+    app: &AppHandle,
     state: &AppState,
     kind: AgentKind,
     settings: &Settings,
+    operation_id: &str,
 ) -> Result<CliStatus, String> {
     if is_installed(&kind, settings) {
         return Ok(status_for(spec_for(&kind, settings)).await);
     }
-    let status = upgrade(state, kind, settings).await?;
+    let status = upgrade(app, state, kind, settings, operation_id).await?;
     if !status.installed {
         return Err(format!("{} 安装完成，但 Nova 仍未找到可执行文件", status.cli_name));
     }

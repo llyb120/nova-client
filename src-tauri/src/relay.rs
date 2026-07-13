@@ -44,8 +44,6 @@ pub const EV_RELAY_PEER_MODELS: &str = "relay:peer-models";
 pub const EV_RELAY_PEER_BRANCHES: &str = "relay:peer-branches";
 /// host 侧：收到漫游请求，前端弹确认框
 pub const EV_RELAY_ROAM_REQUEST: &str = "relay:roam-request";
-/// 额度提供方：收到凭证租借请求，前端弹确认框。
-pub const EV_RELAY_QUOTA_REQUEST: &str = "relay:quota-request";
 /// 额度借用方：请求、安装 CLI、准备隔离凭证的进度。
 pub const EV_RELAY_QUOTA_PROGRESS: &str = "relay:quota-progress";
 /// 整段刷新某线程（漫游快照重同步后用），前端据此重新拉取 transcript
@@ -88,6 +86,64 @@ struct IncomingQuota {
     from: String,
     agent_kind: AgentKind,
     public_key: String,
+}
+
+fn quota_model_key(kind: &AgentKind, model: &str) -> String {
+    format!("{}:{model}", kind.as_str())
+}
+
+fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> bool {
+    let enabled = match kind {
+        AgentKind::Devin => settings.devin_enabled,
+        AgentKind::Codex => settings.codex_enabled,
+        AgentKind::CodeBuddy => settings.codebuddy_enabled,
+        AgentKind::ClaudeCode => settings.claudecode_enabled,
+        AgentKind::Cursor => settings.cursor_enabled,
+        AgentKind::OpenCode => settings.opencode_enabled,
+    };
+    enabled
+        && !model.is_empty()
+        && settings
+            .quota_shared_models
+            .iter()
+            .any(|item| item == &quota_model_key(kind, model))
+}
+
+fn shared_model_options(
+    kind: &AgentKind,
+    value: &Value,
+    shared: &HashSet<String>,
+) -> Option<Value> {
+    let mut filtered = value.clone();
+    let config_options = filtered.get_mut("configOptions")?.as_array_mut()?;
+    let model_option = config_options
+        .iter_mut()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))?;
+    let current = model_option
+        .get("currentValue")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let options = model_option.get_mut("options")?.as_array_mut()?;
+    options.retain(|option| {
+        option
+            .get("value")
+            .and_then(Value::as_str)
+            .map(|model| shared.contains(&quota_model_key(kind, model)))
+            .unwrap_or(false)
+    });
+    let first = options
+        .first()
+        .and_then(|option| option.get("value"))
+        .and_then(Value::as_str)
+        .map(str::to_string)?;
+    let current_is_shared = current
+        .as_deref()
+        .map(|model| shared.contains(&quota_model_key(kind, model)))
+        .unwrap_or(false);
+    if !current_is_shared {
+        model_option["currentValue"] = json!(first);
+    }
+    Some(filtered)
 }
 
 /// 一条待接收的分享
@@ -364,17 +420,29 @@ impl RelayManager {
             };
             // 连上后先上报漫游目录
             let result = self.connect_once(&server, &token, &name).await;
+            // connect_once 只有在收到成功响应头后才会置 connected=true。只要本轮曾经
+            // 连上过，后续断线就应从 1s 重新退避；否则启动阶段的历史失败会让一条已稳定
+            // 很久的连接断开后仍等待最多 30s，叠加读侧断线检测后看起来像没有重连。
+            let was_connected = self.connected.load(Ordering::SeqCst);
             self.set_connected(false);
             self.persist_seq(true);
-            match result {
-                Ok(_) => backoff = Duration::from_secs(1),
-                Err(e) => {
-                    self.log(format!("[relay] 连接断开：{e}"));
-                }
+            if was_connected {
+                backoff = Duration::from_secs(1);
             }
             // 退避重连（带抖动）
             let jitter = Duration::from_millis((now_ms() % 500) as u64);
-            sleep(backoff + jitter).await;
+            let delay = backoff + jitter;
+            match result {
+                Ok(_) => self.log(format!(
+                    "[relay] 连接已关闭，{:.1}s 后重连",
+                    delay.as_secs_f32()
+                )),
+                Err(e) => self.log(format!(
+                    "[relay] 连接断开：{e}；{:.1}s 后重连",
+                    delay.as_secs_f32()
+                )),
+            }
+            sleep(delay).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     }
@@ -389,13 +457,19 @@ impl RelayManager {
             urlencode(&self.groups_csv()),
             urlencode(&self.device_id),
         );
-        let resp = self
-            .http
-            .get(&url)
-            .header("Accept", "text/event-stream")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        // Client 的 connect_timeout 只约束建 TCP 连接；若 TCP 已接通但服务端/反代一直
+        // 不返回 SSE 响应头，send() 仍可能永久等待，使整个重连循环卡死。这里只包住
+        // 响应头阶段，不能给整个流设置 request timeout，否则健康 SSE 也会被定时切断。
+        let resp = timeout(
+            Duration::from_secs(20),
+            self.http
+                .get(&url)
+                .header("Accept", "text/event-stream")
+                .send(),
+        )
+        .await
+        .map_err(|_| "建立连接超时（20s 未收到响应），重试".to_string())?
+        .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
@@ -1037,6 +1111,28 @@ impl RelayManager {
         if !std::path::Path::new(&cwd).is_dir() {
             return Err(format!("本地目录不存在：{cwd}"));
         }
+        let settings = {
+            let state = self.app.state::<AppState>();
+            let settings = state.settings.lock().unwrap().clone();
+            settings
+        };
+        if !crate::cli_manager::is_installed(&agent_kind, &settings) {
+            self.emit_quota_progress(
+                "installing",
+                format!("本机缺少 {} CLI，正在一键安装…", agent_kind.label()),
+            );
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let state = self.app.state::<AppState>();
+            crate::cli_manager::ensure_installed(
+                &self.app,
+                state.inner(),
+                agent_kind.clone(),
+                &settings,
+                &operation_id,
+            )
+            .await?;
+        }
+
         let request_id = uuid::Uuid::new_v4().to_string();
         let (secret, public_key) = crate::credential_roaming::new_request_key();
         let (reply, wait) = oneshot::channel();
@@ -1049,13 +1145,14 @@ impl RelayManager {
                 reply,
             },
         );
-        self.emit_quota_progress("requesting", format!("等待 {peer_name} 授权额度…"));
+        self.emit_quota_progress("requesting", format!("正在向 {peer_name} 同步当前凭据…"));
         self.spawn_send(
             peer_token.clone(),
             "quota.request",
             json!({
                 "reqId": request_id,
                 "agentKind": agent_kind,
+                "model": model.clone(),
                 "publicKey": public_key,
                 "projectName": basename(&cwd),
                 "prompt": first_prompt,
@@ -1070,21 +1167,6 @@ impl RelayManager {
                 return Err("等待对方授权超时".into());
             }
         };
-
-        let settings = {
-            let state = self.app.state::<AppState>();
-            let settings = state.settings.lock().unwrap().clone();
-            settings
-        };
-        if !crate::cli_manager::is_installed(&agent_kind, &settings) {
-            self.emit_quota_progress(
-                "installing",
-                format!("本机缺少 {} CLI，正在一键安装…", agent_kind.label()),
-            );
-            let state = self.app.state::<AppState>();
-            crate::cli_manager::ensure_installed(state.inner(), agent_kind.clone(), &settings)
-                .await?;
-        }
 
         self.emit_quota_progress("preparing", "正在解密并准备隔离凭证…");
         let default_mode = {
@@ -1146,29 +1228,51 @@ impl RelayManager {
             .to_string();
         let agent_kind: AgentKind =
             serde_json::from_value(env.data["agentKind"].clone()).unwrap_or(AgentKind::Devin);
+        let model = env.data["model"].as_str().unwrap_or_default().to_string();
         if req_id.is_empty() || public_key.is_empty() {
             return;
         }
-        self.incoming_quota.lock().unwrap().insert(
-            req_id.clone(),
-            IncomingQuota {
-                from: env.from.clone(),
-                agent_kind: agent_kind.clone(),
-                public_key,
-            },
-        );
-        let _ = self.app.emit(
-            EV_RELAY_QUOTA_REQUEST,
-            json!({
-                "reqId": req_id,
-                "from": env.from,
-                "fromName": env.from_name,
-                "agentKind": agent_kind,
-                "projectName": env.data["projectName"],
-                "prompt": env.data["prompt"],
-            }),
-        );
-        crate::sys_notify::notify_quota_request(&self.app, &env.from_name, agent_kind.label());
+        let allowed = {
+            let state = self.app.state::<AppState>();
+            let settings = state.settings.lock().unwrap();
+            quota_model_is_shared(&settings, &agent_kind, &model)
+        };
+        if !allowed {
+            self.spawn_send_now(
+                env.from.clone(),
+                "quota.rejected",
+                json!({
+                    "reqId": req_id,
+                    "error": format!(
+                        "对方已取消共享 {} 模型 {model}，当前无法使用",
+                        agent_kind.label()
+                    ),
+                }),
+            );
+            return;
+        }
+
+        let app = self.app.clone();
+        let to = env.from.clone();
+        std::thread::spawn(move || {
+            let result = crate::credential_roaming::collect_credentials(agent_kind)
+                .and_then(|bundle| {
+                    crate::credential_roaming::encrypt_bundle(&public_key, &req_id, &bundle)
+                });
+            let relay = app.state::<AppState>().relay.clone();
+            match result {
+                Ok(grant) => relay.spawn_send_now(
+                    to,
+                    "quota.granted",
+                    json!({ "reqId": req_id, "grant": grant }),
+                ),
+                Err(error) => relay.spawn_send_now(
+                    to,
+                    "quota.rejected",
+                    json!({ "reqId": req_id, "error": error }),
+                ),
+            }
+        });
     }
 
     pub fn respond_quota_request(
@@ -1491,11 +1595,11 @@ impl RelayManager {
         let to = env.from.clone();
         let app = self.app.clone();
         tauri::async_runtime::spawn(async move {
-            let kinds: Vec<AgentKind> = {
+            let (kinds, shared): (Vec<AgentKind>, HashSet<String>) = {
                 let state = app.state::<AppState>();
                 let s = state.settings.lock().unwrap();
                 let avail = state.backend_availability.lock().unwrap();
-                [
+                let kinds = [
                     (AgentKind::Devin, s.devin_enabled),
                     (AgentKind::Codex, s.codex_enabled),
                     (AgentKind::CodeBuddy, s.codebuddy_enabled),
@@ -1507,10 +1611,12 @@ impl RelayManager {
                 // 可用性未检测完（map 为空/无该键）时按可用处理，避免误伤
                 .filter(|(k, en)| *en && avail.get(k.as_str()).copied().unwrap_or(true))
                 .map(|(k, _)| k)
-                .collect()
+                .collect();
+                (kinds, s.quota_shared_models.iter().cloned().collect())
             };
             let mut backends: Vec<&str> = Vec::new();
             let mut options = serde_json::Map::new();
+            let mut shared_options = serde_json::Map::new();
             for kind in kinds {
                 backends.push(kind.as_str());
                 let fetched = match app.state::<AppState>().acp_for(&kind) {
@@ -1521,6 +1627,9 @@ impl RelayManager {
                     }
                 };
                 if let Ok(v) = fetched {
+                    if let Some(filtered) = shared_model_options(&kind, &v, &shared) {
+                        shared_options.insert(kind.as_str().into(), filtered);
+                    }
                     options.insert(kind.as_str().into(), v);
                 }
             }
@@ -1528,7 +1637,11 @@ impl RelayManager {
             relay.spawn_send(
                 to,
                 "roaming.models",
-                json!({ "backends": backends, "options": Value::Object(options) }),
+                json!({
+                    "backends": backends,
+                    "options": Value::Object(options),
+                    "sharedOptions": Value::Object(shared_options),
+                }),
             );
         });
     }
@@ -1541,6 +1654,7 @@ impl RelayManager {
                 "peer": env.from,
                 "backends": env.data["backends"].clone(),
                 "options": env.data["options"].clone(),
+                "sharedOptions": env.data["sharedOptions"].clone(),
             }),
         );
     }
@@ -3012,5 +3126,54 @@ fn persist_inbox(dir: &PathBuf, inbox: &[Share]) {
     let _ = std::fs::create_dir_all(dir);
     if let Ok(json) = serde_json::to_string_pretty(inbox) {
         let _ = std::fs::write(dir.join("relay-inbox.json"), json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_peer_models_to_explicit_quota_shares() {
+        let source = json!({
+            "configOptions": [{
+                "id": "model",
+                "currentValue": "cursor-large",
+                "options": [
+                    { "value": "cursor-small", "name": "Small" },
+                    { "value": "cursor-large", "name": "Large" }
+                ]
+            }],
+            "modes": null
+        });
+        let shared = HashSet::from(["cursor:cursor-small".to_string()]);
+
+        let filtered = shared_model_options(&AgentKind::Cursor, &source, &shared).unwrap();
+        let model = &filtered["configOptions"][0];
+        assert_eq!(model["currentValue"], "cursor-small");
+        assert_eq!(model["options"].as_array().unwrap().len(), 1);
+        assert_eq!(model["options"][0]["value"], "cursor-small");
+    }
+
+    #[test]
+    fn quota_request_requires_current_exact_model_share() {
+        let mut settings = Settings::default();
+        settings.quota_shared_models = vec!["cursor:cursor-small".into()];
+
+        assert!(quota_model_is_shared(
+            &settings,
+            &AgentKind::Cursor,
+            "cursor-small"
+        ));
+        assert!(!quota_model_is_shared(
+            &settings,
+            &AgentKind::Cursor,
+            "cursor-large"
+        ));
+        assert!(!quota_model_is_shared(
+            &settings,
+            &AgentKind::Codex,
+            "cursor-small"
+        ));
     }
 }

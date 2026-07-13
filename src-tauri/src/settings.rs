@@ -74,6 +74,8 @@ pub struct Settings {
     pub relay_groups: String,
     /// 在团队里展示的名字（空 = 用机器名兜底）
     pub relay_name: String,
+    /// 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>`；空 = 不共享额度。
+    pub quota_shared_models: Vec<String>,
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
@@ -129,6 +131,7 @@ impl Default for Settings {
             relay_token: String::new(),
             relay_groups: String::new(),
             relay_name: String::new(),
+            quota_shared_models: Vec::new(),
             devin_enabled: true,
             codex_enabled: true,
             codebuddy_enabled: true,

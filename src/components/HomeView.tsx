@@ -26,8 +26,8 @@ import {
 } from "../store";
 import type { AgentKind, Peer } from "../types";
 import { agentLabel } from "../utils";
-import { ConfigSelects } from "./ConfigSelects";
-import { IconBroadcast, IconFolder, IconLogo, IconSend, IconX } from "./icons";
+import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
+import { IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { ProjectPicker } from "./ProjectPicker";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
@@ -177,7 +177,24 @@ export function HomeView() {
     prewarmCurrent({ agentKind: next, model: nextModel, mode: nextMode });
   };
   // 三级菜单一次性提交「后端 + 模型」：跨后端时连同模式一起切换，同后端时仅换模型
-  const pickModelCombined = (next: AgentKind, m: string) => {
+  const pickModelCombined = (next: AgentKind, m: string, borrowed?: QuotaModelPeer | null) => {
+    if (borrowed) {
+      const peer = roamingPeers().find((item) => item.token === borrowed.token);
+      if (!peer) return;
+      const source = state.peerModels[peer.token]?.sharedOptions[next] ?? null;
+      const nextModes = modeChoices(next, source);
+      const nextMode = nextModes.some((item) => item.id === mode())
+        ? mode()
+        : (nextModes[0]?.id ?? "");
+      setRoam(null);
+      setQuotaPeer(peer);
+      setAgentKind(next);
+      setModel(m);
+      setMode(nextMode);
+      modeTouched = false;
+      return;
+    }
+    setQuotaPeer(null);
     if (next === agentKind()) {
       pickModel(m);
       return;
@@ -199,8 +216,8 @@ export function HomeView() {
   // ===== 漫游：用对端（host）的模型/模式列表，而不是本机的（本机模型对方可能没有）=====
   const roaming = () => !!roam();
   const quotaBorrowing = () => !!quotaPeer();
-  const usesPeerModels = () => roaming() || quotaBorrowing();
-  const roamPeerToken = () => roam()?.peer.token ?? quotaPeer()?.token ?? null;
+  const usesPeerModels = () => roaming();
+  const roamPeerToken = () => roam()?.peer.token ?? null;
   const peerModels = () => {
     const t = roamPeerToken();
     return t ? state.peerModels[t] : undefined;
@@ -212,11 +229,19 @@ export function HomeView() {
     usesPeerModels() ? peerModels()?.backends ?? [] : enabledAgentKinds();
   // 模型/模式选项来源：漫游取对端列表（缺失返回 null → 空列表），否则用本机全局
   const peerModelSource = (k: AgentKind) => peerModels()?.options[k] ?? null;
+  const quotaSharedModelSources = createMemo<SharedModelSource[]>(() =>
+    roamingPeers()
+      .map((peer) => ({
+        peer: { token: peer.token, name: peer.name },
+        options: state.peerModels[peer.token]?.sharedOptions ?? {},
+      }))
+      .filter((source) => Object.keys(source.options).length > 0),
+  );
 
   // 没有历史/无效选择时的模式默认：优先设置里的默认（旧值如 bypass 归一到 build），
   // 否则用第一项（Build）。漫游单独处理。
   createEffect(() => {
-    if (usesPeerModels() || modeTouched) return;
+    if (usesPeerModels() || quotaBorrowing() || modeTouched) return;
     const opts = modeChoices(agentKind());
     if (opts.length === 0) return;
     if (!mode() || !opts.some((m) => m.id === mode())) {
@@ -229,7 +254,7 @@ export function HomeView() {
 
   // 空值才落到可用项；已有选择即使暂不在列表也保留（Cursor 目录未就绪等中间态不应重置成 Auto）。
   createEffect(() => {
-    if (usesPeerModels()) return;
+    if (usesPeerModels() || quotaBorrowing()) return;
     const choices = modelChoices(agentKind());
     if (choices.length === 0) return;
     const current = model();
@@ -257,12 +282,12 @@ export function HomeView() {
 
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => {
-    if (!usesPeerModels()) void ensureModelOptions(agentKind());
+    if (!usesPeerModels() && !quotaBorrowing()) void ensureModelOptions(agentKind());
   });
 
   // 当前选中的后端若被设置里关闭，回退到第一个启用的后端（漫游时后端由对端决定，跳过）
   createEffect(() => {
-    if (usesPeerModels()) return;
+    if (usesPeerModels() || quotaBorrowing()) return;
     const next = resolveEnabledAgentKind(agentKind());
     if (next !== agentKind()) pickModelAgent(next);
   });
@@ -274,7 +299,7 @@ export function HomeView() {
   // 漫游目录在对方机器上，无法本地判断，统一按可用处理、交由 host 校验。
   createEffect(() => {
     const dir = cwd();
-    if (usesPeerModels() || !dir) {
+    if (usesPeerModels() || quotaBorrowing() || !dir) {
       setCwdIsRepo(false);
       return;
     }
@@ -596,26 +621,6 @@ export function HomeView() {
                 setRoam({ peer, folder });
               }}
             />
-            <label class="quota-peer-picker" title="本机目录执行，只借用所选队友的后端额度">
-              <IconBroadcast size={13} />
-              <select
-                value={quotaPeer()?.token ?? ""}
-                onChange={(event) => {
-                  const token = event.currentTarget.value;
-                  const peer = roamingPeers().find((item) => item.token === token) ?? null;
-                  setQuotaPeer(peer);
-                  if (peer) {
-                    setRoam(null);
-                    ensurePeerModels(peer.token);
-                  }
-                }}
-              >
-                <option value="">本机额度</option>
-                <For each={roamingPeers()}>
-                  {(peer) => <option value={peer.token}>借用 {peer.name} 额度</option>}
-                </For>
-              </select>
-            </label>
             <Show
               when={peerReady()}
               fallback={<span class="pill roam-models-loading">模型：加载对方模型…</span>}
@@ -626,6 +631,8 @@ export function HomeView() {
                 model={model()}
                 mode={mode()}
                 modelSource={usesPeerModels() ? peerModelSource : undefined}
+                sharedModels={usesPeerModels() ? undefined : quotaSharedModelSources()}
+                quotaPeerToken={quotaPeer()?.token}
                 onPickModel={pickModelCombined}
                 onMode={pickMode}
                 anchorTo=".home-composer"
@@ -774,7 +781,11 @@ export function HomeView() {
           </div>
         </div>
       </Show>
-      <Show when={state.quotaRoamingProgress}>
+      <Show
+        when={
+          state.quotaRoamingProgress && state.quotaRoamingProgress.stage !== "installing"
+        }
+      >
         <div class="modal-backdrop quota-loading-backdrop">
           <div class="modal quota-loading-modal">
             <div class="quota-loading-spinner" />

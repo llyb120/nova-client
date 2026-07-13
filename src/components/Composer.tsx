@@ -72,7 +72,7 @@ export function Composer() {
     (state.threads.find((t) => t.id === state.currentId)?.roamingRole ?? null) === "guest";
   const isQuotaBorrowed = () =>
     !!state.threads.find((t) => t.id === state.currentId)?.quotaPeerName;
-  const usesPeerModels = () => isGuest() || isQuotaBorrowed();
+  const usesPeerModels = () => isGuest();
   const agentKinds = (): AgentKind[] =>
     !running() && !usesPeerModels() ? enabledAgentKinds() : [state.agentKind];
   // 漫游 guest：模型选择用对端（host）的列表（本机模型对方可能没有）
@@ -83,7 +83,7 @@ export function Composer() {
   const guestModelSource = (k: AgentKind) => guestModels()?.options[k] ?? null;
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => {
-    if (!usesPeerModels()) void ensureModelOptions(state.agentKind);
+    if (!usesPeerModels() && !isQuotaBorrowed()) void ensureModelOptions(state.agentKind);
   });
   // 漫游 guest：确保已拉取对端模型列表
   createEffect(() => {
@@ -374,16 +374,21 @@ export function Composer() {
         rows={3}
       />
       <div class="composer-bar">
-        <ConfigSelects
-          agentKind={state.agentKind}
-          agentKinds={agentKinds()}
-          model={state.model}
-          mode={state.mode}
-          modelSource={usesPeerModels() ? guestModelSource : undefined}
-          onPickModel={(k, m) => void pickThreadModel(k, m)}
-          onMode={(v) => void setThreadMode(v)}
-          anchorTo=".composer"
-        />
+        <Show
+          when={!isQuotaBorrowed()}
+          fallback={<span class="pill">模型：{state.model || "默认"}（额度会话已锁定）</span>}
+        >
+          <ConfigSelects
+            agentKind={state.agentKind}
+            agentKinds={agentKinds()}
+            model={state.model}
+            mode={state.mode}
+            modelSource={usesPeerModels() ? guestModelSource : undefined}
+            onPickModel={(k, m) => void pickThreadModel(k, m)}
+            onMode={(v) => void setThreadMode(v)}
+            anchorTo=".composer"
+          />
+        </Show>
         <span class="bar-spacer" />
         <span class="composer-stop-slot" classList={{ hidden: !running() }}>
           <button
