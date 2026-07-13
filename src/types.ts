@@ -34,6 +34,8 @@ export interface ThreadMeta {
   roamingRole?: string | null;
   /** 漫游对端展示名 */
   roamingPeerName?: string | null;
+  /** 额度租借提供方展示名 */
+  quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行 */
   worktree?: Worktree | null;
   /** 非空：该会话由数字员工后台产生，不在左侧历史列表展示，仅点开查看 */
@@ -136,6 +138,9 @@ export interface Thread {
   roamingPeer?: string | null;
   roamingPeerName?: string | null;
   roamingRemoteId?: string | null;
+  /** 非空：本机会话使用该在线队友临时授权的额度 */
+  quotaPeer?: string | null;
+  quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行（cwd 已指向该 worktree 工作目录） */
   worktree?: Worktree | null;
   /** 非空：该会话由数字员工后台产生 */
@@ -374,6 +379,21 @@ export interface IncomingRoamRequest {
   /** 对方要求在 worktree 中执行（host 侧确认框据此提示） */
   worktree?: boolean;
   worktreeBranch?: string | null;
+}
+
+/** 额度提供方收到的一次临时凭证授权请求。 */
+export interface IncomingQuotaRequest {
+  reqId: string;
+  from: string;
+  fromName: string;
+  agentKind: AgentKind;
+  projectName?: string | null;
+  prompt?: string | null;
+}
+
+export interface QuotaRoamingProgress {
+  stage: "requesting" | "installing" | "preparing" | "ready";
+  message: string;
 }
 
 /** 收到的一条分享 */

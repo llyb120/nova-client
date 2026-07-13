@@ -3,7 +3,9 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show }
 import { api } from "../ipc";
 import {
   createRoamingThread,
+  createQuotaThread,
   createThread,
+  clearQuotaRoamingProgress,
   enabledAgentKinds,
   ensureModelOptions,
   ensurePeerBranches,
@@ -17,6 +19,7 @@ import {
   refreshSlashCommands,
   resolveAvailableModel,
   resolveEnabledAgentKind,
+  roamingPeers,
   sendPrompt,
   state,
   stashWorktreePrompt,
@@ -24,7 +27,7 @@ import {
 import type { AgentKind, Peer } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
-import { IconFolder, IconLogo, IconSend, IconX } from "./icons";
+import { IconBroadcast, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { ProjectPicker } from "./ProjectPicker";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
@@ -47,6 +50,8 @@ export function HomeView() {
   const [busy, setBusy] = createSignal(false);
   // 漫游目标：选中队友目录后在对方机器上执行，本机只接收
   const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
+  // 额度租借目标：代码仍在 A 的本地目录执行，只临时使用所选队友的后端凭证/额度。
+  const [quotaPeer, setQuotaPeer] = createSignal<Peer | null>(null);
   // worktree：在独立 git worktree（分支 + 工作目录）中执行，不干扰主工作区正在进行的任务。
   // 通过 Alt+Enter 或工具条按钮弹窗填分支名后创建（不占用输入行空间）。
   const [cwdIsRepo, setCwdIsRepo] = createSignal(false);
@@ -124,6 +129,7 @@ export function HomeView() {
   });
 
   const prewarmCurrent = (target: PrewarmTarget = {}) => {
+    if (roam() || quotaPeer()) return;
     const p = target.cwd ?? cwd();
     if (!p) return;
     const nextAgentKind = target.agentKind ?? agentKind();
@@ -164,8 +170,10 @@ export function HomeView() {
     setModel(nextModel);
     setMode(nextMode);
     modeTouched = false;
-    void ensureModelOptions(next);
-    void refreshSlashCommands(next);
+    if (!usesPeerModels()) {
+      void ensureModelOptions(next);
+      void refreshSlashCommands(next);
+    }
     prewarmCurrent({ agentKind: next, model: nextModel, mode: nextMode });
   };
   // 三级菜单一次性提交「后端 + 模型」：跨后端时连同模式一起切换，同后端时仅换模型
@@ -179,8 +187,10 @@ export function HomeView() {
     lastUsed.setAgentKind(next);
     setMode(nextMode);
     modeTouched = false;
-    void ensureModelOptions(next);
-    void refreshSlashCommands(next);
+    if (!usesPeerModels()) {
+      void ensureModelOptions(next);
+      void refreshSlashCommands(next);
+    }
     setModel(m);
     lastUsed.setModel(next, m, cwd());
     prewarmCurrent({ agentKind: next, model: m, mode: nextMode });
@@ -188,22 +198,25 @@ export function HomeView() {
 
   // ===== 漫游：用对端（host）的模型/模式列表，而不是本机的（本机模型对方可能没有）=====
   const roaming = () => !!roam();
-  const roamPeerToken = () => roam()?.peer.token ?? null;
+  const quotaBorrowing = () => !!quotaPeer();
+  const usesPeerModels = () => roaming() || quotaBorrowing();
+  const roamPeerToken = () => roam()?.peer.token ?? quotaPeer()?.token ?? null;
   const peerModels = () => {
     const t = roamPeerToken();
     return t ? state.peerModels[t] : undefined;
   };
   // 对端模型列表就绪（非漫游恒真）；未就绪时选择器显示「加载对方模型…」
-  const peerReady = () => !roaming() || !!peerModels();
+  const peerReady = () => !usesPeerModels() || !!peerModels();
   // ConfigSelects 的后端列表：漫游用对端已启用的后端，否则本机已启用的
-  const configAgentKinds = () => (roaming() ? peerModels()?.backends ?? [] : enabledAgentKinds());
+  const configAgentKinds = () =>
+    usesPeerModels() ? peerModels()?.backends ?? [] : enabledAgentKinds();
   // 模型/模式选项来源：漫游取对端列表（缺失返回 null → 空列表），否则用本机全局
   const peerModelSource = (k: AgentKind) => peerModels()?.options[k] ?? null;
 
   // 没有历史/无效选择时的模式默认：优先设置里的默认（旧值如 bypass 归一到 build），
   // 否则用第一项（Build）。漫游单独处理。
   createEffect(() => {
-    if (roaming() || modeTouched) return;
+    if (usesPeerModels() || modeTouched) return;
     const opts = modeChoices(agentKind());
     if (opts.length === 0) return;
     if (!mode() || !opts.some((m) => m.id === mode())) {
@@ -216,7 +229,7 @@ export function HomeView() {
 
   // 空值才落到可用项；已有选择即使暂不在列表也保留（Cursor 目录未就绪等中间态不应重置成 Auto）。
   createEffect(() => {
-    if (roaming()) return;
+    if (usesPeerModels()) return;
     const choices = modelChoices(agentKind());
     if (choices.length === 0) return;
     const current = model();
@@ -244,24 +257,24 @@ export function HomeView() {
 
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => {
-    if (!roaming()) void ensureModelOptions(agentKind());
+    if (!usesPeerModels()) void ensureModelOptions(agentKind());
   });
 
   // 当前选中的后端若被设置里关闭，回退到第一个启用的后端（漫游时后端由对端决定，跳过）
   createEffect(() => {
-    if (roaming()) return;
+    if (usesPeerModels()) return;
     const next = resolveEnabledAgentKind(agentKind());
     if (next !== agentKind()) pickModelAgent(next);
   });
 
   // worktree 是否可用：漫游（对方仓库交给 host 校验）或本地当前目录是 git 仓库
-  const worktreeAvailable = () => roaming() || cwdIsRepo();
+  const worktreeAvailable = () => roaming() || (!quotaBorrowing() && cwdIsRepo());
 
   // 本地会话：判断当前目录是否 git 仓库（决定 worktree 开关可用性）。
   // 漫游目录在对方机器上，无法本地判断，统一按可用处理、交由 host 校验。
   createEffect(() => {
     const dir = cwd();
-    if (roaming() || !dir) {
+    if (usesPeerModels() || !dir) {
       setCwdIsRepo(false);
       return;
     }
@@ -311,6 +324,8 @@ export function HomeView() {
     const wt = worktreeAvailable() ? " · Alt+Enter 在 worktree 执行" : "";
     const target = roam();
     if (target) return `描述任务，将在 ${target.peer.name} 的机器上执行（Enter 发送${wt}）`;
+    const quota = quotaPeer();
+    if (quota) return `描述任务，将在本机执行并使用 ${quota.name} 的额度（Enter 发送）`;
     if (cwd()) return `描述任务，Enter 发送 · Ctrl+Enter 临时会话${wt}`;
     return "先选择一个项目目录…";
   };
@@ -321,7 +336,14 @@ export function HomeView() {
     const t = text().trim();
     const images = attach.images();
     const target = roam();
-    if ((!t && images.length === 0) || busy() || (!cwd() && !target)) return;
+    const quota = quotaPeer();
+    if (
+      (!t && images.length === 0) ||
+      busy() ||
+      (!cwd() && !target) ||
+      !peerReady() ||
+      (usesPeerModels() && configAgentKinds().length === 0)
+    ) return;
     const wtOn = opts.worktree === true && worktreeAvailable();
     const branch = opts.branch?.trim() ?? "";
     const base = wtOn ? opts.base?.trim() ?? "" : "";
@@ -341,6 +363,9 @@ export function HomeView() {
           branch,
           base,
         );
+        await sendPrompt(t, images);
+      } else if (quota) {
+        await createQuotaThread(quota, cwd(), agentKind(), model(), mode(), t);
         await sendPrompt(t, images);
       } else if (wtOn) {
         // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词
@@ -363,9 +388,13 @@ export function HomeView() {
       setText("");
       setSlashStart(null);
       setRoam(null);
+      setQuotaPeer(null);
       attach.clear();
       if (textareaRef) textareaRef.style.height = "auto";
+    } catch (error) {
+      await message(String(error), { kind: "error" });
     } finally {
+      clearQuotaRoamingProgress();
       setBusy(false);
     }
   };
@@ -562,8 +591,31 @@ export function HomeView() {
               value={cwd()}
               onChange={selectProject}
               roam={roam()}
-              onPickRoaming={(peer, folder) => setRoam({ peer, folder })}
+              onPickRoaming={(peer, folder) => {
+                setQuotaPeer(null);
+                setRoam({ peer, folder });
+              }}
             />
+            <label class="quota-peer-picker" title="本机目录执行，只借用所选队友的后端额度">
+              <IconBroadcast size={13} />
+              <select
+                value={quotaPeer()?.token ?? ""}
+                onChange={(event) => {
+                  const token = event.currentTarget.value;
+                  const peer = roamingPeers().find((item) => item.token === token) ?? null;
+                  setQuotaPeer(peer);
+                  if (peer) {
+                    setRoam(null);
+                    ensurePeerModels(peer.token);
+                  }
+                }}
+              >
+                <option value="">本机额度</option>
+                <For each={roamingPeers()}>
+                  {(peer) => <option value={peer.token}>借用 {peer.name} 额度</option>}
+                </For>
+              </select>
+            </label>
             <Show
               when={peerReady()}
               fallback={<span class="pill roam-models-loading">模型：加载对方模型…</span>}
@@ -573,7 +625,7 @@ export function HomeView() {
                 agentKinds={configAgentKinds()}
                 model={model()}
                 mode={mode()}
-                modelSource={roaming() ? peerModelSource : undefined}
+                modelSource={usesPeerModels() ? peerModelSource : undefined}
                 onPickModel={pickModelCombined}
                 onMode={pickMode}
                 anchorTo=".home-composer"
@@ -582,7 +634,13 @@ export function HomeView() {
             <span class="bar-spacer" />
             <button
               class="composer-btn send"
-              disabled={(!text().trim() && attach.images().length === 0) || (!cwd() && !roam()) || busy()}
+              disabled={
+                (!text().trim() && attach.images().length === 0) ||
+                (!cwd() && !roam()) ||
+                busy() ||
+                !peerReady() ||
+                (usesPeerModels() && configAgentKinds().length === 0)
+              }
               onClick={(e) => void submit({ ephemeral: e.ctrlKey || e.metaKey })}
               title="发送（Enter）· Ctrl+Enter 临时会话"
             >
@@ -713,6 +771,15 @@ export function HomeView() {
                 {wtBranchDraft().trim() ? "创建并执行" : "在所选分支执行"}
               </button>
             </div>
+          </div>
+        </div>
+      </Show>
+      <Show when={state.quotaRoamingProgress}>
+        <div class="modal-backdrop quota-loading-backdrop">
+          <div class="modal quota-loading-modal">
+            <div class="quota-loading-spinner" />
+            <div class="quota-loading-title">正在准备额度会话</div>
+            <div class="field-hint">{state.quotaRoamingProgress?.message}</div>
           </div>
         </div>
       </Show>

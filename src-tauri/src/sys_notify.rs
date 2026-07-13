@@ -135,6 +135,25 @@ pub fn notify_roam_request(app: &AppHandle, from_name: &str, folder_name: &str) 
     );
 }
 
+/// 额度租借请求：与漫游审批一样必须显式唤起本机用户确认。
+pub fn notify_quota_request(app: &AppHandle, from_name: &str, agent_name: &str) {
+    let was_focused = main_window_focused(app);
+    focus_main_window(app);
+    if was_focused {
+        return;
+    }
+    let app2 = app.clone();
+    show(
+        app,
+        "收到额度租借请求",
+        &format!("{from_name} 想临时使用你的 {agent_name} 额度，点击处理"),
+        false,
+        Some(Box::new(move || {
+            focus_main_window(&app2);
+        })),
+    );
+}
+
 #[cfg(target_os = "macos")]
 fn escape_applescript(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")

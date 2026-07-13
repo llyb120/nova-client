@@ -319,6 +319,10 @@ pub struct AcpManager {
     /// 该实例对应的 agent 类型。Devin 与 CodeBuddy 都走标准 ACP 协议，
     /// 仅启动命令、事件标签、权限 key 前缀不同，故复用同一套实现、各起一个实例。
     pub kind: AgentKind,
+    /// 额度租借实例使用的独立凭证环境；普通全局实例为空。
+    launch_env: HashMap<String, String>,
+    /// 额度租借实例的权限请求作用域，避免不同进程的递增 RPC id 发生碰撞。
+    permission_scope: String,
     /// 连接池：conn_key → 该键的连接槽（TokioMutex<Option<conn>>，语义同「旧单连接」但按键分裂）。
     /// - Devin：只用 SHARED 一个键（多路复用，一条连接跑所有 session）。
     /// - CodeBuddy：每个用户线程一个键（thread_id）独占一条连接（一个进程），从而真正并行；
@@ -400,9 +404,20 @@ const SHARED_SESSIONS_RECYCLE_AT: u64 = 6;
 
 impl AcpManager {
     pub fn new(app: AppHandle, kind: AgentKind) -> Arc<Self> {
+        Self::new_with_env(app, kind, HashMap::new(), String::new())
+    }
+
+    pub fn new_with_env(
+        app: AppHandle,
+        kind: AgentKind,
+        launch_env: HashMap<String, String>,
+        permission_scope: String,
+    ) -> Arc<Self> {
         let mgr = Arc::new(AcpManager {
             app,
             kind,
+            launch_env,
+            permission_scope,
             slots: StdMutex::new(HashMap::new()),
             alive_conns: AtomicU64::new(0),
             routes: StdMutex::new(HashMap::new()),
@@ -1458,6 +1473,7 @@ impl AcpManager {
 
         // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 不覆盖）
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
+        cmd.envs(&self.launch_env);
         if self.kind != AgentKind::Cursor {
             crate::pxpipe::apply_pxpipe_env(&mut cmd, settings, self.proxy_of(settings))?;
         }
@@ -1467,9 +1483,16 @@ impl AcpManager {
 
         // Cursor：每条连接使用自己的配置目录，隔离不同线程的 effort / fast / ACP 变体缓存。
         // cursor-agent 启动时读入并缓存配置，必须在 spawn 前准备并注入环境变量。
-        let cursor_config_dir = (self.kind == AgentKind::Cursor)
-            .then(|| self.prepare_cursor_config_dir(conn_key, cursor_startup_model.as_deref()))
-            .flatten();
+        let cursor_config_dir = if self.kind == AgentKind::Cursor {
+            self.launch_env
+                .get("CURSOR_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    self.prepare_cursor_config_dir(conn_key, cursor_startup_model.as_deref())
+                })
+        } else {
+            None
+        };
         if let Some(dir) = cursor_config_dir.as_ref() {
             cmd.env("CURSOR_CONFIG_DIR", dir);
         }
@@ -1803,7 +1826,7 @@ impl AcpManager {
                     AgentKind::OpenCode => "oc-",
                     _ => "",
                 };
-                let key = format!("{prefix}perm-{}", id);
+                let key = format!("{}{prefix}perm-{}", self.permission_scope, id);
                 self.pending_permissions.lock().unwrap().insert(
                     key.clone(),
                     PendingPermission {
@@ -3970,6 +3993,13 @@ impl AcpManager {
             .app
             .emit(EV_PERMISSION_RESOLVED, json!({ "requestKey": request_key }));
         Ok(())
+    }
+
+    pub fn has_pending_permission(&self, request_key: &str) -> bool {
+        self.pending_permissions
+            .lock()
+            .unwrap()
+            .contains_key(request_key)
     }
 
     pub fn forget_session_of_thread(self: &Arc<Self>, thread_id: &str) {

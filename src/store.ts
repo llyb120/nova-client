@@ -10,6 +10,7 @@ import type {
   Employee,
   EmployeeTask,
   IncomingRoamRequest,
+  IncomingQuotaRequest,
   IncomingShare,
   Item,
   Mark,
@@ -24,6 +25,7 @@ import type {
   ProjectEntry,
   PromptImage,
   Quota,
+  QuotaRoamingProgress,
   RelayStatus,
   Settings,
   SlashCommand,
@@ -107,6 +109,10 @@ interface AppStore {
   inboxPromptAt: number;
   /** host 侧：待本机确认的漫游请求队列 */
   incomingRoams: IncomingRoamRequest[];
+  /** 额度提供方：等待本机确认的凭证租借请求。 */
+  incomingQuotas: IncomingQuotaRequest[];
+  /** 借用方：等待授权、安装 CLI、准备隔离凭证的进度。 */
+  quotaRoamingProgress: QuotaRoamingProgress | null;
   /** 本机允许漫游的目录 */
   roamingFolders: string[];
   /** 手动展开的详情（工具调用/轮次折叠/思考过程），key 为 item id；切换线程时清空 */
@@ -178,6 +184,8 @@ export const [state, setState] = createStore<AppStore>({
   inbox: [],
   inboxPromptAt: 0,
   incomingRoams: [],
+  incomingQuotas: [],
+  quotaRoamingProgress: null,
   roamingFolders: [],
   expanded: {},
   titleTyping: {},
@@ -669,6 +677,59 @@ export async function respondRoamRequest(reqId: string, accept: boolean) {
   }
 }
 
+/** 本机目录执行，临时使用在线队友授权的后端额度。 */
+export async function createQuotaThread(
+  peer: Peer,
+  cwd: string,
+  agentKind: AgentKind,
+  model: string,
+  mode: string,
+  firstPrompt = "",
+): Promise<string> {
+  const t = await api.createQuotaThread(
+    peer.token,
+    peer.name,
+    cwd,
+    agentKind,
+    model || null,
+    mode || null,
+    firstPrompt.trim() || null,
+  );
+  rememberThreadSnapshot(t);
+  setState("expanded", reconcile({}));
+  setState({
+    currentId: t.id,
+    items: t.items,
+    plan: (t.plan as PlanEntry[] | null) ?? null,
+    proposedPlan: null,
+    cwd: t.cwd,
+    title: t.title,
+    agentKind: t.agentKind ?? agentKind,
+    model: t.model ?? "",
+    mode: t.mode ?? "",
+    reasoningEffort: "",
+    roamingPeer: peer.token,
+    loadingThread: false,
+  });
+  setState("running", t.id, false);
+  reportActivity(true);
+  void refreshThreads();
+  ensurePeerModels(peer.token);
+  return t.id;
+}
+
+export async function respondQuotaRequest(reqId: string, accept: boolean) {
+  try {
+    await api.respondQuotaRequest(reqId, accept);
+  } finally {
+    setState("incomingQuotas", (prev) => prev.filter((request) => request.reqId !== reqId));
+  }
+}
+
+export function clearQuotaRoamingProgress() {
+  setState("quotaRoamingProgress", null);
+}
+
 const THREAD_SNAPSHOT_LIMIT = 2;
 const threadSnapshots = new Map<string, Thread>();
 const loadingThreadSnapshots = new Set<string>();
@@ -717,7 +778,10 @@ function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileIte
     model: thread.model ?? "",
     mode: thread.mode ?? "",
     reasoningEffort: thread.reasoningEffort ?? "",
-    roamingPeer: thread.roamingRole === "guest" ? thread.roamingPeer ?? null : null,
+    roamingPeer:
+      thread.roamingRole === "guest"
+        ? thread.roamingPeer ?? null
+        : thread.quotaPeer ?? null,
     loadingThread,
   });
 }
@@ -782,10 +846,11 @@ export async function openThread(id: string) {
     const agentKind = t.agentKind ?? "devin";
     rememberThreadConfig(agentKind, t.cwd, t.model, t.mode, t.reasoningEffort);
     showThreadSnapshot(t, false, !!cached);
-    void ensureModelOptions(agentKind);
-    // 漫游 guest：拉取对端模型列表，选择器用对方的（本机模型对方可能没有）
-    const roamingPeer = t.roamingRole === "guest" ? t.roamingPeer ?? null : null;
+    // 漫游 / 额度租借：拉取对端模型列表；普通本地会话才探测本机后端。
+    const roamingPeer =
+      t.roamingRole === "guest" ? t.roamingPeer ?? null : t.quotaPeer ?? null;
     if (roamingPeer) ensurePeerModels(roamingPeer);
+    else void ensureModelOptions(agentKind);
     // 活动已在 getThread 之前上报（见开头），此处无需重复
   } catch {
     setState({ loadingThread: false });
@@ -1504,6 +1569,15 @@ export async function initStore() {
       ...prev.filter((r) => r.reqId !== e.payload.reqId),
       e.payload,
     ]);
+  });
+  await listen<IncomingQuotaRequest>("relay:quota-request", (e) => {
+    setState("incomingQuotas", (prev) => [
+      ...prev.filter((request) => request.reqId !== e.payload.reqId),
+      e.payload,
+    ]);
+  });
+  await listen<QuotaRoamingProgress>("relay:quota-progress", (e) => {
+    setState("quotaRoamingProgress", e.payload);
   });
 
   // settingsReady 在 initStore 开头已经启动并会尽快 setState；这里 await 只是拿到值供后续

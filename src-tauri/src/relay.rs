@@ -29,8 +29,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout, Duration, Instant};
+use x25519_dalek::StaticSecret;
 
 use crate::acp::{EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS, EV_TURN, EV_UPDATE};
 
@@ -43,6 +44,10 @@ pub const EV_RELAY_PEER_MODELS: &str = "relay:peer-models";
 pub const EV_RELAY_PEER_BRANCHES: &str = "relay:peer-branches";
 /// host 侧：收到漫游请求，前端弹确认框
 pub const EV_RELAY_ROAM_REQUEST: &str = "relay:roam-request";
+/// 额度提供方：收到凭证租借请求，前端弹确认框。
+pub const EV_RELAY_QUOTA_REQUEST: &str = "relay:quota-request";
+/// 额度借用方：请求、安装 CLI、准备隔离凭证的进度。
+pub const EV_RELAY_QUOTA_PROGRESS: &str = "relay:quota-progress";
 /// 整段刷新某线程（漫游快照重同步后用），前端据此重新拉取 transcript
 pub const EV_RELAY_RELOAD: &str = "acp:reload";
 
@@ -69,6 +74,20 @@ struct PendingRoam {
     worktree_branch: Option<String>,
     /// worktree 基于哪个分支/提交创建（空 = host 仓库当前 HEAD）
     worktree_base: Option<String>,
+}
+
+struct PendingQuotaClient {
+    peer: String,
+    agent_kind: AgentKind,
+    secret: StaticSecret,
+    reply: oneshot::Sender<Result<crate::credential_roaming::CredentialBundle, String>>,
+}
+
+#[derive(Clone)]
+struct IncomingQuota {
+    from: String,
+    agent_kind: AgentKind,
+    public_key: String,
 }
 
 /// 一条待接收的分享
@@ -125,6 +144,10 @@ pub struct RelayManager {
     pending_prompts: StdMutex<HashMap<String, Vec<(String, Vec<PromptImage>)>>>,
     /// host 侧：reqId -> 待本机用户确认的漫游请求
     incoming_roams: StdMutex<HashMap<String, PendingRoam>>,
+    /// 借用方：reqId -> 一次性私钥与等待中的 Tauri 调用。
+    pending_quota: StdMutex<HashMap<String, PendingQuotaClient>>,
+    /// 提供方：reqId -> 等待本机用户确认的凭证租借请求。
+    incoming_quota: StdMutex<HashMap<String, IncomingQuota>>,
     /// 高级分享：本机处理线程 id -> 处理完成后要分享给谁
     advanced: StdMutex<HashMap<String, String>>,
     /// guest 侧落盘节流：流式期间不要每条增量都写整个 store（会拖慢 SSE 消费）
@@ -172,6 +195,8 @@ impl RelayManager {
             pending_creates: StdMutex::new(HashMap::new()),
             pending_prompts: StdMutex::new(HashMap::new()),
             incoming_roams: StdMutex::new(HashMap::new()),
+            pending_quota: StdMutex::new(HashMap::new()),
+            incoming_quota: StdMutex::new(HashMap::new()),
             advanced: StdMutex::new(HashMap::new()),
             last_store_save: StdMutex::new(Instant::now()),
             guest_activity: StdMutex::new(HashMap::new()),
@@ -466,6 +491,7 @@ impl RelayManager {
             "roaming.recall" => self.on_roaming_recall(&env),
             "roaming.models_request" => self.on_roaming_models_request(&env),
             "roaming.branches_request" => self.on_roaming_branches_request(&env),
+            "quota.request" => self.on_quota_request(&env),
             // host -> guest
             "roaming.created" => self.on_roaming_created(&env),
             "roaming.models" => self.on_roaming_models(&env),
@@ -477,6 +503,8 @@ impl RelayManager {
             "roaming.snapshot" => self.on_roaming_snapshot(&env),
             "roaming.title" => self.on_roaming_title(&env),
             "roaming.error" => self.on_roaming_error(&env),
+            "quota.granted" => self.on_quota_granted(&env),
+            "quota.rejected" => self.on_quota_rejected(&env),
             // 数字员工跨机讨论：队友员工来咨询 / 对我方咨询的回复
             "employee.discuss" => {
                 crate::employees::on_remote_discuss(&self.app, &env.from, &env.from_name, env.data)
@@ -982,6 +1010,249 @@ impl RelayManager {
 
     pub fn is_advanced(&self, thread_id: &str) -> bool {
         self.advanced.lock().unwrap().contains_key(thread_id)
+    }
+
+    // ===== 额度租借：A 本机执行，临时使用 B 的加密凭证 =====
+
+    fn emit_quota_progress(&self, stage: &str, message: impl Into<String>) {
+        let _ = self.app.emit(
+            EV_RELAY_QUOTA_PROGRESS,
+            json!({ "stage": stage, "message": message.into() }),
+        );
+    }
+
+    pub async fn create_quota_thread(
+        self: &Arc<Self>,
+        peer_token: String,
+        peer_name: String,
+        cwd: String,
+        agent_kind: AgentKind,
+        model: Option<String>,
+        mode: Option<String>,
+        first_prompt: Option<String>,
+    ) -> Result<Thread, String> {
+        if self.cfg().is_none() {
+            return Err("未配置中转站 token".into());
+        }
+        if !std::path::Path::new(&cwd).is_dir() {
+            return Err(format!("本地目录不存在：{cwd}"));
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (secret, public_key) = crate::credential_roaming::new_request_key();
+        let (reply, wait) = oneshot::channel();
+        self.pending_quota.lock().unwrap().insert(
+            request_id.clone(),
+            PendingQuotaClient {
+                peer: peer_token.clone(),
+                agent_kind: agent_kind.clone(),
+                secret,
+                reply,
+            },
+        );
+        self.emit_quota_progress("requesting", format!("等待 {peer_name} 授权额度…"));
+        self.spawn_send(
+            peer_token.clone(),
+            "quota.request",
+            json!({
+                "reqId": request_id,
+                "agentKind": agent_kind,
+                "publicKey": public_key,
+                "projectName": basename(&cwd),
+                "prompt": first_prompt,
+            }),
+        );
+
+        let bundle = match timeout(Duration::from_secs(5 * 60), wait).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(_)) => return Err("额度授权通道已关闭".into()),
+            Err(_) => {
+                self.pending_quota.lock().unwrap().remove(&request_id);
+                return Err("等待对方授权超时".into());
+            }
+        };
+
+        let settings = {
+            let state = self.app.state::<AppState>();
+            let settings = state.settings.lock().unwrap().clone();
+            settings
+        };
+        if !crate::cli_manager::is_installed(&agent_kind, &settings) {
+            self.emit_quota_progress(
+                "installing",
+                format!("本机缺少 {} CLI，正在一键安装…", agent_kind.label()),
+            );
+            let state = self.app.state::<AppState>();
+            crate::cli_manager::ensure_installed(state.inner(), agent_kind.clone(), &settings)
+                .await?;
+        }
+
+        self.emit_quota_progress("preparing", "正在解密并准备隔离凭证…");
+        let default_mode = {
+            let state = self.app.state::<AppState>();
+            let default_mode = state.settings.lock().unwrap().default_mode.clone();
+            default_mode
+        };
+        let mut thread = Thread::new(
+            cwd.clone(),
+            agent_kind.clone(),
+            model.filter(|value| !value.is_empty()),
+            mode.filter(|value| !value.is_empty())
+                .or(Some(default_mode).filter(|value| !value.is_empty())),
+            None,
+            false,
+        );
+        thread.quota_peer = Some(peer_token);
+        thread.quota_peer_name = Some(peer_name.clone());
+        thread.title = format!("额度@{peer_name} · {}", basename(&cwd));
+        thread.push_system_local(
+            format!(
+                "🔐 本会话在你的本地目录执行，临时使用 {peer_name} 的 {} 额度；凭证已隔离，不会覆盖本机登录。",
+                agent_kind.label()
+            ),
+            "info",
+        );
+        let thread_id = thread.id.clone();
+        let runtime = crate::credential_roaming::materialize_runtime(
+            self.app.clone(),
+            &thread_id,
+            &agent_kind,
+            bundle,
+        )?;
+        {
+            let state = self.app.state::<AppState>();
+            state
+                .borrowed_runtimes
+                .lock()
+                .unwrap()
+                .insert(thread_id.clone(), runtime);
+            let mut store = state.store.lock().unwrap();
+            store.threads.push(thread.clone());
+            store.save();
+            if !cwd.contains(crate::SCRATCH_MARK) {
+                state.projects.lock().unwrap().touch(&cwd);
+            }
+        }
+        self.publish_folders();
+        let _ = self.app.emit(EV_THREADS, json!({}));
+        self.emit_quota_progress("ready", "额度凭证已就绪，开始本地会话");
+        Ok(thread)
+    }
+
+    fn on_quota_request(&self, env: &InEnvelope) {
+        let req_id = env.data["reqId"].as_str().unwrap_or_default().to_string();
+        let public_key = env.data["publicKey"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let agent_kind: AgentKind =
+            serde_json::from_value(env.data["agentKind"].clone()).unwrap_or(AgentKind::Devin);
+        if req_id.is_empty() || public_key.is_empty() {
+            return;
+        }
+        self.incoming_quota.lock().unwrap().insert(
+            req_id.clone(),
+            IncomingQuota {
+                from: env.from.clone(),
+                agent_kind: agent_kind.clone(),
+                public_key,
+            },
+        );
+        let _ = self.app.emit(
+            EV_RELAY_QUOTA_REQUEST,
+            json!({
+                "reqId": req_id,
+                "from": env.from,
+                "fromName": env.from_name,
+                "agentKind": agent_kind,
+                "projectName": env.data["projectName"],
+                "prompt": env.data["prompt"],
+            }),
+        );
+        crate::sys_notify::notify_quota_request(&self.app, &env.from_name, agent_kind.label());
+    }
+
+    pub fn respond_quota_request(
+        self: &Arc<Self>,
+        req_id: &str,
+        accept: bool,
+    ) -> Result<(), String> {
+        let pending = self
+            .incoming_quota
+            .lock()
+            .unwrap()
+            .remove(req_id)
+            .ok_or("额度请求已失效")?;
+        if !accept {
+            self.spawn_send_now(
+                pending.from,
+                "quota.rejected",
+                json!({ "reqId": req_id, "error": "对方拒绝了额度租借请求" }),
+            );
+            return Ok(());
+        }
+        let this = Arc::clone(self);
+        let req_id = req_id.to_string();
+        std::thread::spawn(move || {
+            let result = crate::credential_roaming::collect_credentials(pending.agent_kind.clone())
+                .and_then(|bundle| {
+                    crate::credential_roaming::encrypt_bundle(
+                        &pending.public_key,
+                        &req_id,
+                        &bundle,
+                    )
+                });
+            match result {
+                Ok(grant) => this.spawn_send_now(
+                    pending.from,
+                    "quota.granted",
+                    json!({ "reqId": req_id, "grant": grant }),
+                ),
+                Err(error) => this.spawn_send_now(
+                    pending.from,
+                    "quota.rejected",
+                    json!({ "reqId": req_id, "error": error }),
+                ),
+            }
+        });
+        Ok(())
+    }
+
+    fn on_quota_granted(&self, env: &InEnvelope) {
+        let req_id = env.data["reqId"].as_str().unwrap_or_default().to_string();
+        let Some(pending) = self.pending_quota.lock().unwrap().remove(&req_id) else {
+            return;
+        };
+        let result = if env.from != pending.peer {
+            Err("额度凭证来源与请求目标不一致".into())
+        } else {
+            serde_json::from_value::<crate::credential_roaming::EncryptedGrant>(
+                env.data["grant"].clone(),
+            )
+            .map_err(|_| "加密凭证载荷无效".to_string())
+            .and_then(|grant| {
+                crate::credential_roaming::decrypt_bundle(pending.secret, &req_id, &grant)
+            })
+            .and_then(|bundle| {
+                if bundle.agent_kind == pending.agent_kind {
+                    Ok(bundle)
+                } else {
+                    Err("额度凭证后端与请求不一致".into())
+                }
+            })
+        };
+        let _ = pending.reply.send(result);
+    }
+
+    fn on_quota_rejected(&self, env: &InEnvelope) {
+        let req_id = env.data["reqId"].as_str().unwrap_or_default().to_string();
+        let Some(pending) = self.pending_quota.lock().unwrap().remove(&req_id) else {
+            return;
+        };
+        let error = env.data["error"]
+            .as_str()
+            .unwrap_or("对方拒绝了额度租借请求")
+            .to_string();
+        let _ = pending.reply.send(Err(error));
     }
 
     // ===== 漫游：guest 侧 =====

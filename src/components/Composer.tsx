@@ -70,21 +70,24 @@ export function Composer() {
   // 进行中 / 漫游会话不开放跨后端切换，退回当前后端单选；否则可在已启用后端间切换
   const isGuest = () =>
     (state.threads.find((t) => t.id === state.currentId)?.roamingRole ?? null) === "guest";
+  const isQuotaBorrowed = () =>
+    !!state.threads.find((t) => t.id === state.currentId)?.quotaPeerName;
+  const usesPeerModels = () => isGuest() || isQuotaBorrowed();
   const agentKinds = (): AgentKind[] =>
-    !running() && !isGuest() ? enabledAgentKinds() : [state.agentKind];
+    !running() && !usesPeerModels() ? enabledAgentKinds() : [state.agentKind];
   // 漫游 guest：模型选择用对端（host）的列表（本机模型对方可能没有）
   const guestModels = () => {
     const t = state.roamingPeer;
-    return isGuest() && t ? state.peerModels[t] : undefined;
+    return usesPeerModels() && t ? state.peerModels[t] : undefined;
   };
   const guestModelSource = (k: AgentKind) => guestModels()?.options[k] ?? null;
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => {
-    if (!isGuest()) void ensureModelOptions(state.agentKind);
+    if (!usesPeerModels()) void ensureModelOptions(state.agentKind);
   });
   // 漫游 guest：确保已拉取对端模型列表
   createEffect(() => {
-    if (isGuest() && state.roamingPeer) ensurePeerModels(state.roamingPeer);
+    if (usesPeerModels() && state.roamingPeer) ensurePeerModels(state.roamingPeer);
   });
   const currentHistoryPrefix = () => `${state.currentId ?? ""}:`;
 
@@ -376,7 +379,7 @@ export function Composer() {
           agentKinds={agentKinds()}
           model={state.model}
           mode={state.mode}
-          modelSource={isGuest() ? guestModelSource : undefined}
+          modelSource={usesPeerModels() ? guestModelSource : undefined}
           onPickModel={(k, m) => void pickThreadModel(k, m)}
           onMode={(v) => void setThreadMode(v)}
           anchorTo=".composer"

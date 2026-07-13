@@ -333,6 +333,12 @@ pub struct Thread {
     /// 漫游对端的线程 id（guest 记录 host 侧线程 id，用于发送/取消路由）
     #[serde(default)]
     pub roaming_remote_id: Option<String>,
+    /// 额度租借提供方 token。非空时本机执行，但必须走独立租借进程，禁止回退到本机凭证。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_peer: Option<String>,
+    /// 额度租借提供方展示名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_peer_name: Option<String>,
     /// 非 None：本会话在独立 git worktree 中执行（cwd 已指向该 worktree 工作目录）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
@@ -379,6 +385,8 @@ impl Thread {
             roaming_peer: None,
             roaming_peer_name: None,
             roaming_remote_id: None,
+            quota_peer: None,
+            quota_peer_name: None,
             worktree: None,
             employee_id: None,
             mind_thread: false,
@@ -393,6 +401,10 @@ impl Thread {
     /// 是否为漫游 guest 会话（本机只接收展示，真正执行在对端）
     pub fn is_roaming_guest(&self) -> bool {
         self.roaming_role.as_deref() == Some("guest")
+    }
+
+    pub fn is_quota_borrowed(&self) -> bool {
+        self.quota_peer.is_some()
     }
 
     pub fn next_item_id(&self) -> u64 {
@@ -508,6 +520,8 @@ pub struct ThreadMeta {
     pub roaming_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roaming_peer_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_peer_name: Option<String>,
     /// 非 None：该会话在独立 git worktree 中执行（前端据此显示分支标记）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,

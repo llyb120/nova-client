@@ -22,9 +22,43 @@ struct CliSpec {
     cli_name: &'static str,
     program: String,
     version_args: Vec<String>,
+    install_program: String,
+    install_args: Vec<String>,
     upgrade_program: String,
     upgrade_args: Vec<String>,
     proxy: String,
+}
+
+#[cfg(windows)]
+fn script_installer(url: &str) -> (String, Vec<String>) {
+    (
+        "powershell.exe".into(),
+        vec![
+            "-NoProfile".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-Command".into(),
+            format!(
+                "$ProgressPreference='SilentlyContinue'; Invoke-RestMethod '{}' | Invoke-Expression",
+                url
+            ),
+        ],
+    )
+}
+
+#[cfg(not(windows))]
+fn script_installer(url: &str) -> (String, Vec<String>) {
+    (
+        "sh".into(),
+        vec!["-lc".into(), format!("curl -fsSL '{}' | bash", url)],
+    )
+}
+
+fn npm_installer(package: &str) -> (String, Vec<String>) {
+    (
+        "npm".into(),
+        vec!["install".into(), "-g".into(), package.into()],
+    )
 }
 
 fn configured_cli_program(configured: &str, expected_names: &[&str], fallback: &str) -> String {
@@ -44,11 +78,19 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
     match kind {
         AgentKind::Devin => {
             let program = configured_cli_program(&settings.devin_path, &["devin"], "devin");
+            #[cfg(windows)]
+            let (install_program, install_args) =
+                script_installer("https://static.devin.ai/cli/setup.ps1");
+            #[cfg(not(windows))]
+            let (install_program, install_args) =
+                script_installer("https://cli.devin.ai/install.sh");
             CliSpec {
                 kind: kind.clone(),
                 cli_name: "devin-cli",
                 program: program.clone(),
                 version_args: vec!["--version".into()],
+                install_program,
+                install_args,
                 upgrade_program: program,
                 upgrade_args: vec!["update".into()],
                 proxy: settings.devin_proxy.clone(),
@@ -56,14 +98,17 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
         }
         AgentKind::Codex => {
             let program = configured_cli_program(&settings.codex_path, &["codex"], "codex");
+            let (install_program, install_args) = npm_installer("@openai/codex@latest");
             CliSpec {
                 kind: kind.clone(),
                 cli_name: "codex-cli",
                 program,
                 version_args: vec!["--version".into()],
+                install_program: install_program.clone(),
+                install_args: install_args.clone(),
                 // Codex CLI 当前没有自更新子命令，官方 npm 包是 @openai/codex。
-                upgrade_program: "npm".into(),
-                upgrade_args: vec!["install".into(), "-g".into(), "@openai/codex@latest".into()],
+                upgrade_program: install_program,
+                upgrade_args: install_args,
                 proxy: settings.codex_proxy.clone(),
             }
         }
@@ -73,37 +118,55 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
                 &["codebuddy", "cbc"],
                 "codebuddy",
             );
+            let (install_program, install_args) =
+                npm_installer("@tencent-ai/codebuddy-code@latest");
             CliSpec {
                 kind: kind.clone(),
                 cli_name: "codebuddy-cli",
                 program: program.clone(),
                 version_args: vec!["--version".into()],
+                install_program,
+                install_args,
                 upgrade_program: program,
                 upgrade_args: vec!["update".into()],
                 proxy: settings.codebuddy_proxy.clone(),
             }
         }
-        AgentKind::ClaudeCode => CliSpec {
-            kind: kind.clone(),
-            cli_name: "claude-code-cli",
-            // 后端通过 ACP 包装器启动，真正需要管理的是独立的 Claude Code CLI。
-            program: "claude".into(),
-            version_args: vec!["--version".into()],
-            upgrade_program: "claude".into(),
-            upgrade_args: vec!["update".into()],
-            proxy: settings.claudecode_proxy.clone(),
-        },
+        AgentKind::ClaudeCode => {
+            let (install_program, install_args) =
+                npm_installer("@anthropic-ai/claude-code@latest");
+            CliSpec {
+                kind: kind.clone(),
+                cli_name: "claude-code-cli",
+                // 后端通过 ACP 包装器启动，真正需要管理的是独立的 Claude Code CLI。
+                program: "claude".into(),
+                version_args: vec!["--version".into()],
+                install_program,
+                install_args,
+                upgrade_program: "claude".into(),
+                upgrade_args: vec!["update".into()],
+                proxy: settings.claudecode_proxy.clone(),
+            }
+        }
         AgentKind::Cursor => {
             let program = configured_cli_program(
                 &settings.cursor_path,
                 &["cursor-agent", "agent"],
                 "cursor-agent",
             );
+            #[cfg(windows)]
+            let (install_program, install_args) =
+                script_installer("https://cursor.com/install?win32=true");
+            #[cfg(not(windows))]
+            let (install_program, install_args) =
+                script_installer("https://cursor.com/install");
             CliSpec {
                 kind: kind.clone(),
                 cli_name: "cursor-agent-cli",
                 program: program.clone(),
                 version_args: vec!["--version".into()],
+                install_program,
+                install_args,
                 upgrade_program: program,
                 upgrade_args: vec!["update".into()],
                 proxy: settings.cursor_proxy.clone(),
@@ -112,11 +175,14 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
         AgentKind::OpenCode => {
             let program =
                 configured_cli_program(&settings.opencode_path, &["opencode"], "opencode");
+            let (install_program, install_args) = npm_installer("opencode-ai@latest");
             CliSpec {
                 kind: kind.clone(),
                 cli_name: "opencode-cli",
                 program: program.clone(),
                 version_args: vec!["--version".into()],
+                install_program,
+                install_args,
                 upgrade_program: program,
                 upgrade_args: vec!["upgrade".into()],
                 proxy: settings.opencode_proxy.clone(),
@@ -237,13 +303,21 @@ fn strip_ansi(input: &str) -> String {
 async fn status_for(spec: CliSpec) -> CliStatus {
     let available = resolve_program_on_path(&spec.program).is_some();
     if !available {
+        let install_available = resolve_program_on_path(&spec.install_program).is_some();
         return CliStatus {
             agent_kind: spec.kind.as_str().into(),
             cli_name: spec.cli_name.into(),
             installed: false,
             version: "未安装".into(),
-            upgrade_supported: false,
-            detail: format!("未找到 {}", spec.program),
+            upgrade_supported: install_available,
+            detail: if install_available {
+                format!("未找到 {}，可一键安装", spec.program)
+            } else {
+                format!(
+                    "未找到 {}，且安装程序 {} 不可用",
+                    spec.program, spec.install_program
+                )
+            },
         };
     }
     let upgrade_available = resolve_program_on_path(&spec.upgrade_program).is_some();
@@ -362,23 +436,95 @@ pub async fn upgrade(
 ) -> Result<CliStatus, String> {
     let _guard = state.cli_upgrade_lock.lock().await;
     let spec = spec_for(&kind, settings);
-    if resolve_program_on_path(&spec.program).is_none() {
-        return Err(format!("未找到 {}，无法升级", spec.cli_name));
+    let installed = resolve_program_on_path(&spec.program).is_some();
+
+    if installed {
+        stop_backend(state, &kind).await;
+        if kind == AgentKind::Devin && devin_process_running() {
+            return Err(
+                "检测到仍在运行的 devin 进程。请先结束 Nova 之外的 Devin 进程再升级。"
+                    .into(),
+            );
+        }
     }
 
-    stop_backend(state, &kind).await;
-    if kind == AgentKind::Devin && devin_process_running() {
-        return Err("检测到仍在运行的 devin 进程。请先结束 Nova 之外的 Devin 进程再升级。".into());
-    }
-
+    let (program, args, action) = if installed {
+        (&spec.upgrade_program, &spec.upgrade_args, "升级")
+    } else {
+        (&spec.install_program, &spec.install_args, "安装")
+    };
     run_command(
-        &spec.upgrade_program,
-        &spec.upgrade_args,
+        program,
+        args,
         &spec.proxy,
         Duration::from_secs(15 * 60),
     )
     .await
-    .map_err(|e| format!("{} 升级失败：{e}", spec.cli_name))?;
+    .map_err(|e| format!("{} {action}失败：{e}", spec.cli_name))?;
+
+    refresh_cli_search_path();
 
     Ok(status_for(spec).await)
+}
+
+pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
+    let spec = spec_for(kind, settings);
+    resolve_program_on_path(&spec.program).is_some()
+}
+
+pub async fn ensure_installed(
+    state: &AppState,
+    kind: AgentKind,
+    settings: &Settings,
+) -> Result<CliStatus, String> {
+    if is_installed(&kind, settings) {
+        return Ok(status_for(spec_for(&kind, settings)).await);
+    }
+    let status = upgrade(state, kind, settings).await?;
+    if !status.installed {
+        return Err(format!("{} 安装完成，但 Nova 仍未找到可执行文件", status.cli_name));
+    }
+    Ok(status)
+}
+
+fn refresh_cli_search_path() {
+    let Some(current) = std::env::var_os("PATH") else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
+
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            paths.push(std::path::PathBuf::from(appdata).join("npm"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = std::path::PathBuf::from(local);
+            paths.push(local.join("devin").join("cli").join("bin"));
+            paths.push(local.join("codebuddy").join("bin"));
+            paths.push(local.join("cursor-agent"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        paths.push(home.join(".local").join("bin"));
+        paths.push(home.join(".npm-global").join("bin"));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| {
+        if !path.is_dir() {
+            return false;
+        }
+        #[cfg(windows)]
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        #[cfg(not(windows))]
+        let key = path.to_string_lossy().to_string();
+        seen.insert(key)
+    });
+    if let Ok(path) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", path);
+    }
 }

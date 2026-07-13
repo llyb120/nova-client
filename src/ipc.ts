@@ -177,6 +177,26 @@ export const api = {
     }),
   respondRoamRequest: (reqId: string, accept: boolean) =>
     invoke<void>("respond_roam_request", { reqId, accept }),
+  createQuotaThread: (
+    peerToken: string,
+    peerName: string,
+    cwd: string,
+    agentKind: AgentKind,
+    model: string | null,
+    mode: string | null,
+    firstPrompt: string | null,
+  ) =>
+    invoke<Thread>("create_quota_thread", {
+      peerToken,
+      peerName,
+      cwd,
+      agentKind,
+      model,
+      mode,
+      firstPrompt,
+    }),
+  respondQuotaRequest: (reqId: string, accept: boolean) =>
+    invoke<void>("respond_quota_request", { reqId, accept }),
   /** guest：召回漫游会话（host 自动把完整快照 Flow 回来，去收件箱选项目接收） */
   recallRoamingThread: (threadId: string) =>
     invoke<void>("recall_roaming_thread", { threadId }),

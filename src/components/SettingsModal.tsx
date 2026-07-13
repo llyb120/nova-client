@@ -83,10 +83,12 @@ function CliManager(props: {
         disabled={props.loading || props.busy || props.status?.upgradeSupported !== true}
         onClick={props.onUpgrade}
       >
-        {props.upgrading ? "升级中…" : "一键升级"}
+        {props.upgrading
+          ? (props.status?.installed === false ? "安装中…" : "升级中…")
+          : (props.status?.installed === false ? "一键安装" : "一键升级")}
       </button>
       <Show when={props.message}>
-        <span class={`cli-manager-message ${props.message?.startsWith("升级失败") ? "bad" : "ok"}`}>
+        <span class={`cli-manager-message ${props.message?.includes("失败") ? "bad" : "ok"}`}>
           {props.message}
         </span>
       </Show>
@@ -300,14 +302,21 @@ export function SettingsModal(props: { onClose: () => void }) {
   };
 
   const upgradeCli = async (kind: AgentKind) => {
+    const wasInstalled = cliStatuses()[kind]?.installed !== false;
     setUpgradingCli(kind);
     setCliMessages((prev) => ({ ...prev, [kind]: "" }));
     try {
       const status = await api.upgradeCli(kind, draftSettings());
       setCliStatuses((prev) => ({ ...prev, [kind]: status }));
-      setCliMessages((prev) => ({ ...prev, [kind]: `已更新到 ${status.version}` }));
+      setCliMessages((prev) => ({
+        ...prev,
+        [kind]: `${wasInstalled ? "已更新" : "已安装"}到 ${status.version}`,
+      }));
     } catch (e) {
-      setCliMessages((prev) => ({ ...prev, [kind]: `升级失败：${String(e)}` }));
+      setCliMessages((prev) => ({
+        ...prev,
+        [kind]: `${wasInstalled ? "升级" : "安装"}失败：${String(e)}`,
+      }));
     } finally {
       setUpgradingCli(null);
     }

@@ -231,6 +231,9 @@ const CODEX_QUIET_MS: u128 = 2 * 60 * 1000;
 
 pub struct CodexManager {
     pub app: AppHandle,
+    /// 额度租借实例使用的独立凭证环境；普通全局实例为空。
+    launch_env: HashMap<String, String>,
+    permission_scope: String,
     conn: TokioMutex<Option<Arc<CodexConn>>>,
     routes: StdMutex<HashMap<String, String>>,
     running_threads: StdMutex<HashSet<String>>,
@@ -263,8 +266,18 @@ pub struct CodexManager {
 
 impl CodexManager {
     pub fn new(app: AppHandle) -> Arc<Self> {
+        Self::new_with_env(app, HashMap::new(), String::new())
+    }
+
+    pub fn new_with_env(
+        app: AppHandle,
+        launch_env: HashMap<String, String>,
+        permission_scope: String,
+    ) -> Arc<Self> {
         let mgr = Arc::new(CodexManager {
             app,
+            launch_env,
+            permission_scope,
             conn: TokioMutex::new(None),
             routes: StdMutex::new(HashMap::new()),
             running_threads: StdMutex::new(HashSet::new()),
@@ -572,6 +585,7 @@ impl CodexManager {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         crate::acp::apply_proxy_env(&mut cmd, &settings.codex_proxy);
+        cmd.envs(&self.launch_env);
         crate::pxpipe::apply_codex_pxpipe_env(&mut cmd, pxpipe_url.as_deref());
         // Windows 下继承 Nova 在启动时建立的隐藏控制台。这里不能使用 CREATE_NO_WINDOW，
         // 否则 Codex 本身没有控制台，其后续启动 PowerShell 时会重新创建可见 conhost。
@@ -788,7 +802,7 @@ impl CodexManager {
             conn.respond_ok(id, json!({ "decision": decision }));
             return;
         }
-        let key = format!("codex-perm-{}", id);
+        let key = format!("{}codex-perm-{}", self.permission_scope, id);
         self.pending_permissions.lock().unwrap().insert(
             key.clone(),
             PendingCodexPermission {
@@ -2165,6 +2179,13 @@ impl CodexManager {
             .app
             .emit(EV_PERMISSION_RESOLVED, json!({ "requestKey": request_key }));
         Ok(())
+    }
+
+    pub fn has_pending_permission(&self, request_key: &str) -> bool {
+        self.pending_permissions
+            .lock()
+            .unwrap()
+            .contains_key(request_key)
     }
 
     fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<String>) {

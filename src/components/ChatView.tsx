@@ -401,6 +401,15 @@ export function ChatView() {
               : `代执行 · ${currentMeta()?.roamingPeerName ?? "队友"}`}
           </span>
         </Show>
+        <Show when={currentMeta()?.quotaPeerName}>
+          <span
+            class="roaming-badge quota"
+            title={`本机目录执行，临时使用 ${currentMeta()?.quotaPeerName} 的加密授权额度`}
+          >
+            <IconBroadcast size={11} />
+            额度 · {currentMeta()?.quotaPeerName}
+          </span>
+        </Show>
         <div
           class="chat-cwd"
           title={
