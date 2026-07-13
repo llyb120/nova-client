@@ -13,11 +13,12 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::sleep;
 
 const ACTIVE_INTERVAL: Duration = Duration::from_millis(400);
+const COMMAND_WATCH_DURATION: Duration = Duration::from_secs(30);
 const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
 /// 首次连接只预热最新会话；其余历史按点击请求，兼顾首屏速度与流量。
 const PREFETCH_RECENT: usize = 1;
@@ -147,6 +148,9 @@ async fn run(app: AppHandle) {
     let mut processed_id = 0i64;
     let mut results: Vec<CommandResult> = Vec::new();
     let mut catalog_signature = String::new();
+    // 远程命令通过异步任务启动。初始快照可能先看到 running=false，随后任务才登记运行；
+    // 在这段窗口内主动跟踪命令涉及的会话，避免释放基线后漏掉整个短任务。
+    let mut command_watch: HashMap<String, Instant> = HashMap::new();
 
     loop {
         let Some(cfg) = config(&app) else {
@@ -156,6 +160,7 @@ async fn run(app: AppHandle) {
             previous.clear();
             force_full = false;
             catalog_signature.clear();
+            command_watch.clear();
             sleep(Duration::from_secs(10)).await;
             continue;
         };
@@ -171,11 +176,23 @@ async fn run(app: AppHandle) {
             processed_id = 0;
             results.clear();
             catalog_signature.clear();
+            command_watch.clear();
         }
 
+        let now = Instant::now();
+        command_watch.retain(|id, until| {
+            now < *until
+                || previous
+                    .get(id)
+                    .is_some_and(|(_, running)| *running)
+        });
+        previous.retain(|id, (_, running)| {
+            *running || requested.contains(id) || command_watch.contains_key(id)
+        });
         // requested 是 server 的一次性 cache-miss 队列；另外保留上一拍仍在运行的会话，
         // 确保 running=false 与最后一段内容一定能作为收尾增量送达。
         let mut sync_ids = requested.clone();
+        sync_ids.extend(command_watch.keys().cloned());
         sync_ids.extend(
             previous
                 .iter()
@@ -212,7 +229,7 @@ async fn run(app: AppHandle) {
             || !results.is_empty();
 
         if !want_upload {
-            if !should_long_poll(any_running) {
+            if !should_long_poll(any_running, !command_watch.is_empty()) {
                 // 运行中的会话不能进入命令长轮询。某一拍没有浏览器可见变化很常见，
                 // 继续按活动间隔检查，才能及时捕获最后内容与 running=false。
                 sleep(ACTIVE_INTERVAL).await;
@@ -232,6 +249,7 @@ async fn run(app: AppHandle) {
                         &mut ack_id,
                         &mut results,
                         &mut requested,
+                        &mut command_watch,
                     )
                     .await;
                 }
@@ -323,6 +341,10 @@ async fn run(app: AppHandle) {
                 if !resp.need_full {
                     for id in &sent_ids {
                         if let Some(thread) = current.get(id) {
+                            let completed_after_baseline = previous
+                                .get(id)
+                                .is_some_and(|(_, was_running)| *was_running)
+                                && !running_now.get(id).copied().unwrap_or(false);
                             previous.insert(
                                 id.clone(),
                                 (
@@ -330,6 +352,9 @@ async fn run(app: AppHandle) {
                                     running_now.get(id).copied().unwrap_or(false),
                                 ),
                             );
+                            if completed_after_baseline {
+                                command_watch.remove(id);
+                            }
                         }
                     }
                     if sent_catalog {
@@ -346,16 +371,13 @@ async fn run(app: AppHandle) {
                     &mut ack_id,
                     &mut results,
                     &mut requested,
+                    &mut command_watch,
                 )
                 .await;
-                if !force_full {
-                    // 非运行、也不再被 server 点名的历史快照已经落到 server，立即释放大对象。
-                    previous.retain(|id, (_, running)| *running || requested.contains(id));
-                }
             }
             Err(e) => sleep(error_backoff(&e)).await,
         }
-        if any_running || force_full || !results.is_empty() {
+        if any_running || !command_watch.is_empty() || force_full || !results.is_empty() {
             sleep(ACTIVE_INTERVAL).await;
         }
     }
@@ -769,13 +791,14 @@ mod tests {
 
     #[test]
     fn running_thread_without_visible_change_stays_on_active_polling() {
-        assert!(!should_long_poll(true));
-        assert!(should_long_poll(false));
+        assert!(!should_long_poll(true, false));
+        assert!(!should_long_poll(false, true));
+        assert!(should_long_poll(false, false));
     }
 }
 
-fn should_long_poll(any_running: bool) -> bool {
-    !any_running
+fn should_long_poll(any_running: bool, has_command_watch: bool) -> bool {
+    !any_running && !has_command_watch
 }
 
 async fn process_commands(
@@ -785,6 +808,7 @@ async fn process_commands(
     ack_id: &mut i64,
     results: &mut Vec<CommandResult>,
     requested: &mut HashSet<String>,
+    command_watch: &mut HashMap<String, Instant>,
 ) {
     for cmd in commands {
         if cmd.id <= *processed_id {
@@ -795,6 +819,10 @@ async fn process_commands(
         *ack_id = cmd.id;
         if result.ok && !result.thread_id.is_empty() {
             requested.insert(result.thread_id.clone());
+            command_watch.insert(
+                result.thread_id.clone(),
+                Instant::now() + COMMAND_WATCH_DURATION,
+            );
         }
         // create/send/stop 的会话 id 已加入一次性请求集；下一拍会按该会话独立选择
         // 快照或增量，不再把一个命令升级成全局 full。
