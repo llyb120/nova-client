@@ -212,6 +212,12 @@ async fn run(app: AppHandle) {
             || !results.is_empty();
 
         if !want_upload {
+            if !should_long_poll(any_running) {
+                // 运行中的会话不能进入命令长轮询。某一拍没有浏览器可见变化很常见，
+                // 继续按活动间隔检查，才能及时捕获最后内容与 running=false。
+                sleep(ACTIVE_INTERVAL).await;
+                continue;
+            }
             match pull(&client, &cfg).await {
                 Ok(resp) => {
                     revision = resp.revision;
@@ -760,6 +766,16 @@ mod tests {
         .unwrap();
         assert_eq!(remote_item_value(&before), remote_item_value(&after));
     }
+
+    #[test]
+    fn running_thread_without_visible_change_stays_on_active_polling() {
+        assert!(!should_long_poll(true));
+        assert!(should_long_poll(false));
+    }
+}
+
+fn should_long_poll(any_running: bool) -> bool {
+    !any_running
 }
 
 async fn process_commands(
