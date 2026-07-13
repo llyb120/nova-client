@@ -1183,23 +1183,14 @@ fn remote_git_file(app: &AppHandle, cwd: &str, path: &str) -> Result<Value, Stri
         return Err("文件路径无效".into());
     }
     let abs = std::path::Path::new(&root).join(path);
-    // 全文 LCS 模式上限；超过则改走 git 统一 diff，体积小且桌面/手机都扛得住
-    const FULL_TEXT_LIMIT: u64 = 120_000;
+    // 已跟踪文件一律走统一 diff（改几行不再传双全文）；未跟踪才传 newText
+    const FULL_TEXT_LIMIT: usize = 120_000;
     const UNIFIED_LIMIT: usize = 600_000;
     const SAMPLE: usize = 8_192;
 
     let in_head = crate::gitwt::run(&root, &["cat-file", "-e", &format!("HEAD:{path}")]).is_ok();
     let new_meta = abs.metadata().ok();
     let new_is_file = new_meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
-    let new_size = new_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let old_size = if in_head {
-        crate::gitwt::run(&root, &["cat-file", "-s", &format!("HEAD:{path}")])
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
 
     // 先抽样判二进制，避免把大二进制读进内存
     if new_is_file {
@@ -1220,67 +1211,22 @@ fn remote_git_file(app: &AppHandle, cwd: &str, path: &str) -> Result<Value, Stri
         }
     }
 
-    let prefer_unified = old_size > FULL_TEXT_LIMIT || new_size > FULL_TEXT_LIMIT;
-
-    if prefer_unified {
-        // 已跟踪变更：让 git 算 diff，payload 通常远小于双全文
-        if in_head {
-            let unified = crate::gitwt::run_raw(
-                &root,
-                &["diff", "--no-color", "--unified=3", "HEAD", "--", path],
-            )
-            .unwrap_or_default();
-            if unified.contains("Binary files ") || looks_binary(unified.as_bytes()) {
-                return Ok(json!({
-                    "path": path,
-                    "binary": true,
-                    "oldText": "",
-                    "newText": "",
-                    "unified": "",
-                    "truncated": false,
-                }));
-            }
-            let (unified, truncated) = truncate_str(unified, UNIFIED_LIMIT);
-            // 删除文件时 git diff 通常仍有输出；若为空则回退展示旧内容头
-            if unified.is_empty() && !new_is_file {
-                let old = crate::gitwt::run_raw(&root, &["show", &format!("HEAD:{path}")])
-                    .unwrap_or_default();
-                if looks_binary(old.as_bytes()) {
-                    return Ok(json!({
-                        "path": path,
-                        "binary": true,
-                        "oldText": "",
-                        "newText": "",
-                        "unified": "",
-                        "truncated": false,
-                    }));
-                }
-                let (old, truncated) = truncate_str(old, FULL_TEXT_LIMIT as usize);
-                return Ok(json!({
-                    "path": path,
-                    "binary": false,
-                    "oldText": old,
-                    "newText": "",
-                    "unified": "",
-                    "truncated": truncated,
-                }));
-            }
-            return Ok(json!({
-                "path": path,
-                "binary": false,
-                "oldText": "",
-                "newText": "",
-                "unified": unified,
-                "truncated": truncated,
-            }));
-        }
-        // 未跟踪大文件：只传截断后的新内容，前端按整文件新增展示
-        let new_text = if new_is_file {
-            std::fs::read_to_string(&abs).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        if looks_binary(new_text.as_bytes()) {
+    // 已跟踪：始终用 git 统一 diff，真实改动几行就只传几行
+    if in_head {
+        let unified = crate::gitwt::run_raw(
+            &root,
+            &[
+                "diff",
+                "--no-color",
+                "--unified=3",
+                "--ignore-cr-at-eol",
+                "HEAD",
+                "--",
+                path,
+            ],
+        )
+        .unwrap_or_default();
+        if unified.contains("Binary files ") || looks_binary(unified.as_bytes()) {
             return Ok(json!({
                 "path": path,
                 "binary": true,
@@ -1290,29 +1236,48 @@ fn remote_git_file(app: &AppHandle, cwd: &str, path: &str) -> Result<Value, Stri
                 "truncated": false,
             }));
         }
-        let (new_text, truncated) = truncate_str(new_text, FULL_TEXT_LIMIT as usize);
+        let (unified, truncated) = truncate_str(unified, UNIFIED_LIMIT);
+        // 删除文件时 git diff 通常仍有输出；若为空则回退展示旧内容头
+        if unified.is_empty() && !new_is_file {
+            let old = crate::gitwt::run_raw(&root, &["show", &format!("HEAD:{path}")])
+                .unwrap_or_default();
+            if looks_binary(old.as_bytes()) {
+                return Ok(json!({
+                    "path": path,
+                    "binary": true,
+                    "oldText": "",
+                    "newText": "",
+                    "unified": "",
+                    "truncated": false,
+                }));
+            }
+            let (old, truncated) = truncate_str(old, FULL_TEXT_LIMIT);
+            return Ok(json!({
+                "path": path,
+                "binary": false,
+                "oldText": old,
+                "newText": "",
+                "unified": "",
+                "truncated": truncated,
+            }));
+        }
         return Ok(json!({
             "path": path,
             "binary": false,
             "oldText": "",
-            "newText": new_text,
-            "unified": "",
+            "newText": "",
+            "unified": unified,
             "truncated": truncated,
         }));
     }
 
-    // 小文件：传双全文，前端做行级 LCS
-    let old_text = if in_head {
-        crate::gitwt::run_raw(&root, &["show", &format!("HEAD:{path}")]).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // 未跟踪：只传截断后的新内容，前端按整文件新增展示
     let new_text = if new_is_file {
         std::fs::read_to_string(&abs).unwrap_or_default()
     } else {
         String::new()
     };
-    if looks_binary(old_text.as_bytes()) || looks_binary(new_text.as_bytes()) {
+    if looks_binary(new_text.as_bytes()) {
         return Ok(json!({
             "path": path,
             "binary": true,
@@ -1322,15 +1287,14 @@ fn remote_git_file(app: &AppHandle, cwd: &str, path: &str) -> Result<Value, Stri
             "truncated": false,
         }));
     }
-    let (old, t1) = truncate_str(old_text, FULL_TEXT_LIMIT as usize);
-    let (new, t2) = truncate_str(new_text, FULL_TEXT_LIMIT as usize);
+    let (new_text, truncated) = truncate_str(new_text, FULL_TEXT_LIMIT);
     Ok(json!({
         "path": path,
         "binary": false,
-        "oldText": old,
-        "newText": new,
+        "oldText": "",
+        "newText": new_text,
         "unified": "",
-        "truncated": t1 || t2,
+        "truncated": truncated,
     }))
 }
 
