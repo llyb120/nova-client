@@ -11,7 +11,7 @@ use crate::relay::{gzip_json, resolve_relay_server};
 use crate::threads::{AgentKind, Item, Thread};
 use crate::{is_running, AppState, SCRATCH_MARK};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -131,9 +131,9 @@ struct CommandResult {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     commands: Vec<RemoteCommand>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     requested_thread_ids: Vec<String>,
     #[serde(default)]
     need_full: bool,
@@ -141,8 +141,18 @@ struct ServerResponse {
     revision: i64,
     #[serde(default)]
     resync: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     thread_checkpoints: HashMap<String, ThreadCheckpoint>,
+}
+
+/// 兼容旧服务端把空集合编码成 `null`。协议升级期间不能因为一个空字段让整条
+/// 长轮询响应解析失败，否则历史会话的按需同步请求永远到不了客户端。
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 pub fn start(app: AppHandle) {
@@ -882,6 +892,22 @@ mod tests {
         assert!(!should_long_poll(true, false));
         assert!(!should_long_poll(false, true));
         assert!(should_long_poll(false, false));
+    }
+
+    #[test]
+    fn server_response_accepts_null_collections() {
+        let response: ServerResponse = serde_json::from_value(json!({
+            "commands": null,
+            "requestedThreadIds": null,
+            "threadCheckpoints": null,
+            "revision": 3
+        }))
+        .unwrap();
+
+        assert!(response.commands.is_empty());
+        assert!(response.requested_thread_ids.is_empty());
+        assert!(response.thread_checkpoints.is_empty());
+        assert_eq!(response.revision, 3);
     }
 }
 
