@@ -38,26 +38,10 @@ struct CliSpec {
 }
 
 #[cfg(windows)]
-fn script_installer(url: &str) -> (String, Vec<String>) {
-    (
-        "powershell.exe".into(),
-        vec![
-            "-NoProfile".into(),
-            "-ExecutionPolicy".into(),
-            "Bypass".into(),
-            "-Command".into(),
-            format!(
-                "$ProgressPreference='SilentlyContinue'; Invoke-RestMethod '{}' | Invoke-Expression",
-                url
-            ),
-        ],
-    )
-}
-
-#[cfg(windows)]
-fn elevated_powershell_script_installer(url: &str) -> (String, Vec<String>) {
+fn powershell_script_installer(url: &str, elevated: bool) -> (String, Vec<String>) {
     use base64::Engine;
 
+    // Devin 脚本最后会运行交互式 `devin setup`，脚本安装必须使用可见的独立 PowerShell。
     let script = format!(
         "$ProgressPreference='SilentlyContinue'; Invoke-RestMethod '{}' | Invoke-Expression",
         url.replace('\'', "''")
@@ -68,6 +52,7 @@ fn elevated_powershell_script_installer(url: &str) -> (String, Vec<String>) {
             .flat_map(|unit| unit.to_le_bytes())
             .collect::<Vec<_>>(),
     );
+    let run_as = if elevated { " -Verb RunAs" } else { "" };
     (
         "powershell.exe".into(),
         vec![
@@ -75,10 +60,20 @@ fn elevated_powershell_script_installer(url: &str) -> (String, Vec<String>) {
             "-NonInteractive".into(),
             "-Command".into(),
             format!(
-                "$process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand','{encoded_script}'); exit $process.ExitCode"
+                "$process = Start-Process -FilePath 'powershell.exe'{run_as} -WindowStyle Normal -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{encoded_script}'); exit $process.ExitCode"
             ),
         ],
     )
+}
+
+#[cfg(windows)]
+fn script_installer(url: &str) -> (String, Vec<String>) {
+    powershell_script_installer(url, false)
+}
+
+#[cfg(windows)]
+fn elevated_powershell_script_installer(url: &str) -> (String, Vec<String>) {
+    powershell_script_installer(url, true)
 }
 
 #[cfg(not(windows))]
@@ -836,14 +831,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cursor_install_uses_elevated_powershell_only_on_windows() {
+    fn windows_script_installers_open_visible_powershell_and_cursor_elevates() {
         let settings = Settings::default();
         let cursor = spec_for(&AgentKind::Cursor, &settings);
         let devin = spec_for(&AgentKind::Devin, &settings);
+        let cursor_args = cursor.install_args.join(" ");
+        let devin_args = devin.install_args.join(" ");
 
         assert_eq!(cursor.install_program, "powershell.exe");
-        assert!(cursor.install_args.join(" ").contains("-Verb RunAs"));
-        assert!(cursor.install_args.join(" ").contains("-EncodedCommand"));
-        assert!(!devin.install_args.join(" ").contains("-Verb RunAs"));
+        assert_eq!(devin.install_program, "powershell.exe");
+        assert!(cursor_args.contains("Start-Process"));
+        assert!(devin_args.contains("Start-Process"));
+        assert!(cursor_args.contains("-WindowStyle Normal"));
+        assert!(devin_args.contains("-WindowStyle Normal"));
+        assert!(cursor_args.contains("-Verb RunAs"));
+        assert!(cursor_args.contains("-EncodedCommand"));
+        assert!(!devin_args.contains("-Verb RunAs"));
+        assert!(devin_args.contains("-EncodedCommand"));
+        assert!(!cursor_args.contains("-WindowStyle Hidden"));
+        assert!(!devin_args.contains("-WindowStyle Hidden"));
     }
 }
