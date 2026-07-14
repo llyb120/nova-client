@@ -114,22 +114,6 @@ fn run_nowindow_shell_wrapper() -> bool {
 }
 
 #[cfg(windows)]
-fn prepare_hidden_backend_console() {
-    use windows_sys::Win32::System::Console::{AllocConsole, GetConsoleWindow};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-
-    unsafe {
-        if !GetConsoleWindow().is_null() || AllocConsole() == 0 {
-            return;
-        }
-        let window = GetConsoleWindow();
-        if !window.is_null() {
-            ShowWindow(window, SW_HIDE);
-        }
-    }
-}
-
-#[cfg(windows)]
 fn wait_for_restart_parent() {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
@@ -339,11 +323,6 @@ fn main() {
     if nova_lib::maybe_run_cli() {
         return;
     }
-
-    // Release GUI 本身没有控制台。给 Nova 建一个隐藏控制台，让所有长期运行的后端及其
-    // shell/命令子孙继承同一个隐藏窗口，避免每次执行命令都新建可见 conhost。
-    #[cfg(windows)]
-    prepare_hidden_backend_console();
 
     #[cfg(any(windows, target_os = "macos"))]
     let _single_instance = if should_enforce_single_instance() {

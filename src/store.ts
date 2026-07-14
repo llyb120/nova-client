@@ -577,6 +577,7 @@ export async function checkAndStageUpdate(): Promise<string> {
     setState("update", info);
     return "新版本已就绪，可重启更新";
   }
+  setState("updateProgress", null);
   setState("updateStaging", true);
   try {
     const res = await api.downloadStagedUpdate();

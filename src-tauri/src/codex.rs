@@ -584,8 +584,8 @@ impl CodexManager {
             .kill_on_drop(true);
         crate::acp::apply_proxy_env(&mut cmd, &settings.codex_proxy);
         cmd.envs(&self.launch_env);
-        // Windows 下继承 Nova 在启动时建立的隐藏控制台。这里不能使用 CREATE_NO_WINDOW，
-        // 否则 Codex 本身没有控制台，其后续启动 PowerShell 时会重新创建可见 conhost。
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         #[cfg(unix)]
         {
             cmd.process_group(0);

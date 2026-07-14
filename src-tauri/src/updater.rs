@@ -17,6 +17,10 @@ use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Positio
 use tokio::time::Duration;
 
 const APPLY_UPDATE_ARG: &str = "--nova-apply-update";
+#[cfg(windows)]
+const RESTART_PARENT_PID: &str = "NOVA_RESTART_PARENT_PID";
+/// 后台定时下载与手动检查共用同一套临时文件，必须串行，避免进度交叉和暂存包互相覆盖。
+static UPDATE_OPERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// GitHub 仓库 owner/repo。编译时可设 NOVA_GH_REPO 覆盖。
 fn github_repo() -> &'static str {
@@ -672,6 +676,33 @@ fn restore_old_exe(target: &Path, old: &Path) {
     let _ = std::fs::rename(old, target);
 }
 
+fn spawn_installed_app(target: &Path) -> Result<(), String> {
+    let install_dir = target.parent().ok_or("target has no parent")?;
+    let mut cmd = Command::new(target);
+    cmd.current_dir(install_dir);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+        // 新实例先等 helper 退出，再清理 .old 并进入正常启动流程。
+        cmd.env(RESTART_PARENT_PID, std::process::id().to_string());
+    }
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("启动版本失败:{e}"))
+}
+
+fn restart_after_failed_update(args: &[String]) -> Result<(), String> {
+    let target = PathBuf::from(arg_value(args, "--target").ok_or("missing --target")?);
+    if !target.exists() {
+        let old = PathBuf::from(arg_value(args, "--old").ok_or("missing --old")?);
+        if old.exists() {
+            std::fs::rename(&old, &target).map_err(|e| format!("恢复旧版本失败:{e}"))?;
+        }
+    }
+    spawn_installed_app(&target)
+}
+
 fn apply_update_from_helper_args(args: &[String]) -> Result<(), String> {
     let target = PathBuf::from(arg_value(args, "--target").ok_or("missing --target")?);
     let source = PathBuf::from(arg_value(args, "--source").ok_or("missing --source")?);
@@ -738,16 +769,9 @@ fn apply_update_from_helper_args(args: &[String]) -> Result<(), String> {
 
     copy_extras(&stage_dir, &install_dir, &source);
 
-    let mut cmd = Command::new(&target);
-    cmd.current_dir(&install_dir);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    if let Err(e) = cmd.spawn() {
+    if let Err(e) = spawn_installed_app(&target) {
         restore_old_exe(&target, &old);
-        return Err(format!("启动新版本失败:{e}"));
+        return Err(e);
     }
 
     remove_file_if_exists(&marker);
@@ -763,8 +787,12 @@ pub fn maybe_run_apply_helper() -> bool {
         return false;
     }
     if let Err(e) = apply_update_from_helper_args(&args[2..]) {
+        let mut detail = e;
+        if let Err(restart_error) = restart_after_failed_update(&args[2..]) {
+            detail.push_str(&format!("\n恢复启动旧版本也失败:{restart_error}"));
+        }
         if let Some(path) = arg_value(&args[2..], "--error-log") {
-            let _ = std::fs::write(path, &e);
+            let _ = std::fs::write(path, detail);
         }
         std::process::exit(1);
     }
@@ -807,6 +835,7 @@ fn spawn_update_helper(
 /// 静默下载并解压最新版本到暂存目录（不替换、不重启）。
 /// 已暂存过同版本则直接返回，避免重复下载。
 pub async fn download_and_stage(app: AppHandle) -> Result<Value, String> {
+    let _operation = UPDATE_OPERATION_LOCK.lock().await;
     let info = check(&app).await?;
     if !info["hasUpdate"].as_bool().unwrap_or(false) {
         return Ok(json!({ "ready": false, "hasUpdate": false }));
@@ -917,6 +946,7 @@ pub async fn download_and_stage(app: AppHandle) -> Result<Value, String> {
 
 /// 应用已暂存的更新：替换 exe 并重启。
 pub async fn apply_staged(app: AppHandle) -> Result<(), String> {
+    let _operation = UPDATE_OPERATION_LOCK.lock().await;
     let marker = valid_staged(&app).ok_or("没有已下载好的更新")?;
     let extract_dir = PathBuf::from(&marker.dir);
     let marker_file = marker_path(&app).ok_or("更新标记路径不可用")?;
