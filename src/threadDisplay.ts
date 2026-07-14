@@ -12,7 +12,7 @@ export function firstWakeDoChild(
   threads: readonly ThreadMeta[],
   wake: ThreadMeta,
 ): ThreadMeta | undefined {
-  if (wake.parentThreadId || !isWakeThread(wake)) return undefined;
+  if (!isWakeThread(wake)) return undefined;
   return threads
     .filter((thread) => thread.parentThreadId === wake.id && isDoThread(thread))
     .sort((a, b) => a.createdAt - b.createdAt)[0];
@@ -25,10 +25,12 @@ export function firstWakeDoPairForThread(
   if (!threadId) return null;
   const current = threads.find((thread) => thread.id === threadId);
   if (!current) return null;
-  const wake = current.parentThreadId
-    ? threads.find((thread) => thread.id === current.parentThreadId)
-    : current;
-  if (!wake || wake.parentThreadId || !isWakeThread(wake)) return null;
+  const wake = isWakeThread(current)
+    ? current
+    : current.parentThreadId && isDoThread(current)
+      ? threads.find((thread) => thread.id === current.parentThreadId)
+      : undefined;
+  if (!wake || !isWakeThread(wake)) return null;
   const doThread = firstWakeDoChild(threads, wake);
   if (current.id !== wake.id && current.id !== doThread?.id) return null;
   return { wake, doThread };
