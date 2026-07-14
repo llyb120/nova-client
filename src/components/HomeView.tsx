@@ -50,6 +50,7 @@ export function HomeView() {
   const [model, setModel] = createSignal(lastUsed.model(agentKind()));
   const [mode, setMode] = createSignal(lastUsed.mode(agentKind()));
   const [busy, setBusy] = createSignal(false);
+  const [quotaCancelling, setQuotaCancelling] = createSignal(false);
   // 漫游目标：选中队友目录后在对方机器上执行，本机只接收
   const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
   // 额度租借目标：代码仍在 A 的本地目录执行，只临时使用所选队友的后端凭证/额度。
@@ -195,6 +196,9 @@ export function HomeView() {
       setModel(m);
       setMode(nextMode);
       modeTouched = false;
+      void api
+        .prepareQuotaLease(peer.token, next, m)
+        .catch((error) => console.warn("额度租约预热失败", error));
       return;
     }
     setQuotaPeer(null);
@@ -382,6 +386,7 @@ export function HomeView() {
     const base = wtOn ? opts.base?.trim() ?? "" : "";
     if (wtOn && !branch && !base) return; // 新分支名与基于分支至少填一个（留空分支名 = 直接用所选分支）
     submittingPrompt = true;
+    setQuotaCancelling(false);
     setBusy(true);
     try {
       if (target) {
@@ -399,7 +404,7 @@ export function HomeView() {
         );
         await sendPrompt(t, images);
       } else if (quota) {
-        await createQuotaThread(quota, cwd(), agentKind(), model(), mode(), t);
+        await createQuotaThread(quota, cwd(), agentKind(), model(), mode());
         await sendPrompt(t, images);
       } else if (wtOn) {
         // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词
@@ -428,10 +433,26 @@ export function HomeView() {
       submittingPrompt = false;
     } catch (error) {
       submittingPrompt = false;
-      await message(String(error), { kind: "error" });
+      const text = String(error);
+      if (!text.includes("额度漫游已取消") && !text.includes("CLI 操作已取消")) {
+        await message(text, { kind: "error" });
+      }
     } finally {
       clearQuotaRoamingProgress();
+      setQuotaCancelling(false);
       setBusy(false);
+    }
+  };
+
+  const cancelQuotaPreparation = async () => {
+    const operationId = state.quotaRoamingProgress?.operationId;
+    if (!operationId || quotaCancelling()) return;
+    setQuotaCancelling(true);
+    try {
+      await api.cancelQuotaRoaming(operationId);
+    } catch (error) {
+      setQuotaCancelling(false);
+      await message(String(error), { kind: "error" });
     }
   };
 
@@ -827,7 +848,20 @@ export function HomeView() {
           <div class="modal quota-loading-modal">
             <div class="quota-loading-spinner" />
             <div class="quota-loading-title">正在准备额度会话</div>
-            <div class="field-hint">{state.quotaRoamingProgress?.message}</div>
+            <div class="field-hint">
+              {quotaCancelling()
+                ? "正在取消本次额度漫游…"
+                : state.quotaRoamingProgress?.message}
+            </div>
+            <Show when={state.quotaRoamingProgress?.stage !== "ready"}>
+              <button
+                class="btn secondary quota-loading-cancel"
+                disabled={quotaCancelling()}
+                onClick={() => void cancelQuotaPreparation()}
+              >
+                {quotaCancelling() ? "正在取消…" : "取消本次漫游"}
+              </button>
+            </Show>
           </div>
         </div>
       </Show>

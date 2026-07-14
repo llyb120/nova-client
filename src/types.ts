@@ -388,17 +388,8 @@ export interface IncomingRoamRequest {
   worktreeBranch?: string | null;
 }
 
-/** 额度提供方收到的一次临时凭证授权请求。 */
-export interface IncomingQuotaRequest {
-  reqId: string;
-  from: string;
-  fromName: string;
-  agentKind: AgentKind;
-  projectName?: string | null;
-  prompt?: string | null;
-}
-
 export interface QuotaRoamingProgress {
+  operationId: string;
   stage: "requesting" | "installing" | "preparing" | "ready";
   message: string;
 }

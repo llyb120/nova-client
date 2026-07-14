@@ -1,9 +1,11 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
-import { createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import { firstWakeDoChild } from "../threadDisplay";
 import type { ThreadMeta, Worktree } from "../types";
 import {
+  checkAndStageUpdate,
   closeThread,
   deleteThread,
   deleteThreads,
@@ -64,6 +66,28 @@ export function Sidebar(props: {
   onOpenUpdate: () => void;
   onOpenInbox: () => void;
 }) {
+  const [version, setVersion] = createSignal("");
+  let updateCheckTimer: number | undefined;
+  let updateCheckClick = 0;
+
+  onMount(() => void getVersion().then(setVersion));
+  onCleanup(() => {
+    updateCheckClick += 1;
+    if (updateCheckTimer !== undefined) window.clearTimeout(updateCheckTimer);
+  });
+
+  const checkUpdateSilently = () => {
+    const click = ++updateCheckClick;
+    if (updateCheckTimer !== undefined) window.clearTimeout(updateCheckTimer);
+    updateCheckTimer = window.setTimeout(() => {
+      updateCheckTimer = undefined;
+      if (click !== updateCheckClick) return;
+      void checkAndStageUpdate().catch(() => {
+        // 静默检查失败不打断当前操作。
+      });
+    }, 300);
+  };
+
   const myToken = () => state.settings?.relayToken ?? "";
   // 本群组在线名单（含自己）：服务端已按群组过滤；自己置顶，渲染时标注「我」。
   const onlinePeers = createMemo(() => {
@@ -390,6 +414,16 @@ export function Sidebar(props: {
         <div class="brand">
           <IconLogo size={20} class="brand-icon" />
           <span class="brand-name">Nova</span>
+          <Show when={version()}>
+            <button
+              type="button"
+              class="brand-version"
+              title="点击静默检查更新"
+              onClick={checkUpdateSilently}
+            >
+              v{version()}
+            </button>
+          </Show>
           <span class="brand-spacer" />
           <Show when={state.relay.enabled}>
             <div class="relay-badge-wrap">

@@ -212,6 +212,16 @@ button {
   letter-spacing: 0.2px;
 }
 
+.brand-version {
+  padding: 2px 0 0;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1;
+}
+.brand-version:hover {
+  color: var(--text-dim);
+}
+
 .new-thread-btn {
   display: flex;
   align-items: center;
@@ -1676,6 +1686,7 @@ button {
     padding-inline: 0;
   }
   .brand-name,
+  .brand-version,
   .group-label span,
   .thread-title,
   .thread-delete,
@@ -5870,6 +5881,10 @@ button.head-badge:hover {
   margin: 12px 0 6px;
   font-size: 15px;
   font-weight: 600;
+}
+
+.quota-loading-cancel {
+  margin-top: 18px;
 }
 
 .quota-loading-spinner {

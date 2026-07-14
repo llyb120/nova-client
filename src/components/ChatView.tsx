@@ -204,6 +204,11 @@ export function ChatView() {
     }
   };
 
+  const cancelBottomFollow = () => {
+    beginManualScroll();
+    setStickToBottom(false);
+  };
+
   // 必须先实际离开底部，再实际回到底部，才恢复自动吸底。
   const syncManualScroll = () => {
     if (!manualScroll) return;
@@ -226,7 +231,7 @@ export function ChatView() {
 
   const handleWheel = (event: WheelEvent) => {
     if (event.deltaY >= 0 || !scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
-    beginManualScroll();
+    cancelBottomFollow();
   };
 
   const handleTranscriptScroll = () => {
@@ -333,7 +338,7 @@ export function ChatView() {
         target instanceof HTMLElement &&
         (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
       ) return;
-      beginManualScroll();
+      cancelBottomFollow();
     };
     window.addEventListener("keydown", handleScrollKey, true);
     onCleanup(() => {

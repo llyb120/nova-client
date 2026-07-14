@@ -32,6 +32,10 @@ function threadGroupName(cwd: string): string {
   return cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd;
 }
 
+function projectPathKey(path: string): string {
+  return path.replace(/\\/g, "/").toLowerCase();
+}
+
 const DEFAULT_RELAY_SERVER = "";
 const RELAY_SERVER_PLACEHOLDER = "http://127.0.0.1:8320";
 const DEFAULT_CLAUDECODE_ARGS = "-y @zed-industries/claude-code-acp";
@@ -254,27 +258,20 @@ export function SettingsModal(props: { onClose: () => void }) {
       setRoamingFoldersLoading(false);
     }
   };
-  const pickRoamingFolders = async () => {
-    const picked = await openDialog({
-      directory: true,
-      multiple: true,
-      title: "选择允许漫游的目录",
-    });
-    if (!picked) return;
-    const paths = Array.isArray(picked) ? picked : [picked];
+  const roamingProjectSelected = (path: string) => {
+    const key = projectPathKey(path);
+    return roamingFolders().some((folder) => projectPathKey(folder) === key);
+  };
+  const toggleRoamingProject = (path: string, checked: boolean) => {
     setRoamingFolders((current) => {
-      const next = [...current];
-      const keys = new Set(current.map((path) => path.replace(/\\/g, "/").toLowerCase()));
-      for (const path of paths) {
-        const key = path.replace(/\\/g, "/").toLowerCase();
-        if (!keys.has(key)) {
-          keys.add(key);
-          next.push(path);
-        }
-      }
-      return next;
+      const key = projectPathKey(path);
+      const next = current.filter((folder) => projectPathKey(folder) !== key);
+      return checked ? [...next, path] : next;
     });
   };
+  const selectedRoamingProjectCount = createMemo(
+    () => state.projects.filter((project) => roamingProjectSelected(project.path)).length,
+  );
 
   let globalInstructionsLoaded = false;
   const loadGlobalInstructions = async () => {
@@ -1355,49 +1352,48 @@ export function SettingsModal(props: { onClose: () => void }) {
             </label>
 
             <div class="field">
-              <span class="field-label">允许漫游的目录</span>
+              <span class="field-label">允许漫游的项目</span>
               <span class="field-hint">
-                只有这里列出的本机目录会展示给队友并接受漫游请求；每次请求仍需你在本机确认。
+                只能从你当前已有的本地项目中选择；未列入项目列表的目录不会展示给队友，也不会接受漫游请求。每次请求仍需你在本机确认。
               </span>
-              <div class="wt-dir-row">
-                <button
-                  type="button"
-                  class="btn secondary"
-                  disabled={roamingFoldersLoading()}
-                  onClick={() => void pickRoamingFolders()}
-                >
-                  添加目录…
-                </button>
-                <span class="field-hint">
-                  {roamingFoldersLoading() ? "加载中…" : `已允许 ${roamingFolders().length} 个目录`}
-                </span>
-              </div>
               <Show
-                when={roamingFolders().length > 0}
-                fallback={<div class="sel-empty">未开放任何目录，队友无法在本机发起漫游。</div>}
+                when={!roamingFoldersLoading()}
+                fallback={<div class="sel-empty">加载中…</div>}
               >
-                <div class="wt-list">
-                  <For each={roamingFolders()}>
-                    {(folder) => (
-                      <div class="wt-row">
-                        <div class="wt-row-sub">
-                          <span class="wt-path" title={folder}>
-                            {folder}
-                          </span>
-                          <button
-                            type="button"
-                            class="btn danger small"
-                            onClick={() =>
-                              setRoamingFolders((current) => current.filter((item) => item !== folder))
-                            }
-                          >
-                            移除
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </For>
-                </div>
+                <Show
+                  when={state.projects.length > 0}
+                  fallback={<div class="sel-empty">当前没有可共享的本地项目。</div>}
+                >
+                  <div class="wt-dir-row">
+                    <span class="field-hint">
+                      已允许 {selectedRoamingProjectCount()} / {state.projects.length} 个项目
+                    </span>
+                  </div>
+                  <div class="wt-list">
+                    <For each={state.projects}>
+                      {(project) => (
+                        <label class="wt-row" title={project.path}>
+                          <div class="wt-row-main">
+                            <input
+                              type="checkbox"
+                              checked={roamingProjectSelected(project.path)}
+                              onChange={(event) =>
+                                toggleRoamingProject(project.path, event.currentTarget.checked)
+                              }
+                            />
+                            <span class="wt-branch">{threadGroupName(project.path)}</span>
+                            <Show when={project.worktree}>
+                              <span class="wt-tag">⎇ {project.worktree!.branch}</span>
+                            </Show>
+                          </div>
+                          <div class="wt-row-sub">
+                            <span class="wt-path">{project.path}</span>
+                          </div>
+                        </label>
+                      )}
+                    </For>
+                  </div>
+                </Show>
               </Show>
             </div>
 

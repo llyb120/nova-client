@@ -13,6 +13,7 @@
 //! 断线重连：SSE 断开后指数退避重连；每条定向消息有服务端分配的 seq，重连时带
 //! since=<最后 seq> 补发漏掉的消息，保证不丢、不影响使用。
 
+use crate::credential_roaming::CredentialBundle;
 use crate::settings::Settings;
 use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, Worktree};
 use crate::AppState;
@@ -25,11 +26,11 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::{sleep, timeout, Duration, Instant};
 use x25519_dalek::StaticSecret;
 
@@ -48,6 +49,12 @@ pub const EV_RELAY_ROAM_REQUEST: &str = "relay:roam-request";
 pub const EV_RELAY_QUOTA_PROGRESS: &str = "relay:quota-progress";
 /// 整段刷新某线程（漫游快照重同步后用），前端据此重新拉取 transcript
 pub const EV_RELAY_RELOAD: &str = "acp:reload";
+
+const QUOTA_CANCELLED_ERROR: &str = "额度漫游已取消";
+const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const QUOTA_OPERATION_ACTIVE: u8 = 0;
+const QUOTA_OPERATION_CANCELLED: u8 = 1;
+const QUOTA_OPERATION_COMMITTED: u8 = 2;
 
 /// host 侧：本机某线程正被哪个 guest 漫游驱动
 #[derive(Clone)]
@@ -78,18 +85,113 @@ struct PendingQuotaClient {
     peer: String,
     agent_kind: AgentKind,
     secret: StaticSecret,
-    reply: oneshot::Sender<Result<crate::credential_roaming::CredentialBundle, String>>,
+    reply: oneshot::Sender<Result<CredentialBundle, String>>,
 }
 
-#[derive(Clone)]
-struct IncomingQuota {
-    from: String,
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct QuotaLeaseKey {
+    peer: String,
     agent_kind: AgentKind,
-    public_key: String,
+}
+
+impl QuotaLeaseKey {
+    fn new(peer: String, agent_kind: AgentKind) -> Result<Self, String> {
+        let peer = peer.trim().to_string();
+        if peer.is_empty() {
+            return Err("额度租约必须指定队友".into());
+        }
+        Ok(Self { peer, agent_kind })
+    }
+}
+
+type QuotaLeaseResult = Result<CredentialBundle, String>;
+type QuotaLeaseWaiter = oneshot::Sender<QuotaLeaseResult>;
+
+struct QuotaOperation {
+    state: AtomicU8,
+    notify: Notify,
+}
+
+impl QuotaOperation {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(QUOTA_OPERATION_ACTIVE),
+            notify: Notify::new(),
+        }
+    }
+
+    fn cancel(&self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                QUOTA_OPERATION_ACTIVE,
+                QUOTA_OPERATION_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.notify.notify_one();
+        true
+    }
+
+    fn commit(&self) -> bool {
+        self.state
+            .compare_exchange(
+                QUOTA_OPERATION_ACTIVE,
+                QUOTA_OPERATION_COMMITTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn ensure_active(&self) -> Result<(), String> {
+        if self.state.load(Ordering::SeqCst) == QUOTA_OPERATION_ACTIVE {
+            Ok(())
+        } else {
+            Err(QUOTA_CANCELLED_ERROR.into())
+        }
+    }
+
+    async fn cancelled(&self) {
+        if self.state.load(Ordering::SeqCst) != QUOTA_OPERATION_ACTIVE {
+            return;
+        }
+        self.notify.notified().await;
+    }
 }
 
 fn quota_model_key(kind: &AgentKind, model: &str) -> String {
     format!("{}:{model}", kind.as_str())
+}
+
+fn shared_quota_model_keys(shared_options: &Value) -> HashSet<String> {
+    let mut shared = HashSet::new();
+    let Some(backends) = shared_options.as_object() else {
+        return shared;
+    };
+    for (kind, options) in backends {
+        let model_options = options["configOptions"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["id"].as_str() == Some("model"))
+            })
+            .and_then(|item| item["options"].as_array());
+        let Some(model_options) = model_options else {
+            continue;
+        };
+        for model in model_options {
+            if let Some(value) = model["value"].as_str().filter(|value| !value.is_empty()) {
+                shared.insert(format!("{kind}:{value}"));
+            }
+        }
+    }
+    shared
 }
 
 fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> bool {
@@ -175,6 +277,12 @@ pub struct Share {
     pub ts: i64,
 }
 
+fn accepted_share_mode(recall: bool, default_mode: &str) -> Option<String> {
+    recall
+        .then(|| default_mode.to_string())
+        .filter(|mode| !mode.is_empty())
+}
+
 #[derive(Deserialize)]
 struct InEnvelope {
     #[serde(default)]
@@ -216,8 +324,12 @@ pub struct RelayManager {
     incoming_roams: StdMutex<HashMap<String, PendingRoam>>,
     /// 借用方：reqId -> 一次性私钥与等待中的 Tauri 调用。
     pending_quota: StdMutex<HashMap<String, PendingQuotaClient>>,
-    /// 提供方：reqId -> 等待本机用户确认的凭证租借请求。
-    incoming_quota: StdMutex<HashMap<String, IncomingQuota>>,
+    /// 借用方：一次额度漫游从安装、请求凭证到落库的取消状态。
+    quota_operations: StdMutex<HashMap<String, Arc<QuotaOperation>>>,
+    /// 借用方：共享模型的应用级内存租约；每个会话仍各自创建隔离运行目录。
+    quota_leases: StdMutex<HashMap<QuotaLeaseKey, CredentialBundle>>,
+    /// 同一租约同时预热/创建时只向对端请求一次，其余调用等待同一结果。
+    quota_lease_flights: StdMutex<HashMap<QuotaLeaseKey, Vec<QuotaLeaseWaiter>>>,
     /// 高级分享：本机处理线程 id -> 处理完成后要分享给谁
     advanced: StdMutex<HashMap<String, String>>,
     /// guest 侧落盘节流：流式期间不要每条增量都写整个 store（会拖慢 SSE 消费）
@@ -267,7 +379,9 @@ impl RelayManager {
             pending_prompts: StdMutex::new(HashMap::new()),
             incoming_roams: StdMutex::new(HashMap::new()),
             pending_quota: StdMutex::new(HashMap::new()),
-            incoming_quota: StdMutex::new(HashMap::new()),
+            quota_operations: StdMutex::new(HashMap::new()),
+            quota_leases: StdMutex::new(HashMap::new()),
+            quota_lease_flights: StdMutex::new(HashMap::new()),
             advanced: StdMutex::new(HashMap::new()),
             last_store_save: StdMutex::new(Instant::now()),
             guest_activity: StdMutex::new(HashMap::new()),
@@ -393,6 +507,7 @@ impl RelayManager {
         // 保留服务端返回的完整名单（含自己）：天线在线名单要显示自己（前端标注「我」）。
         // 漫游/分享侧各自会用自己的 token 排除自己，不受此影响。
         let peers = body.get("peers").cloned().unwrap_or(json!([]));
+        self.retain_online_quota_leases(&peers);
         *self.peers.lock().unwrap() = peers.clone();
         let _ = self.app.emit(EV_RELAY_PEERS, peers);
     }
@@ -405,8 +520,47 @@ impl RelayManager {
         let _ = self.app.emit(EV_RELAY_STATUS, self.status());
     }
 
+    fn clear_quota_leases(&self) {
+        self.quota_leases.lock().unwrap().clear();
+    }
+
+    fn invalidate_quota_leases_for_peer(&self, peer: &str) {
+        self.quota_leases
+            .lock()
+            .unwrap()
+            .retain(|key, _| key.peer != peer);
+    }
+
+    fn retain_online_quota_leases(&self, peers: &Value) {
+        let online: HashSet<&str> = peers
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|peer| peer["online"].as_bool().unwrap_or(false))
+            .filter_map(|peer| peer["token"].as_str())
+            .collect();
+        self.quota_leases
+            .lock()
+            .unwrap()
+            .retain(|key, _| online.contains(key.peer.as_str()));
+    }
+
+    fn retain_shared_quota_leases(&self, peer: &str, shared_options: &Value) {
+        let shared = shared_quota_model_keys(shared_options);
+        self.quota_leases.lock().unwrap().retain(|key, _| {
+            if key.peer != peer {
+                return true;
+            }
+            let prefix = format!("{}:", key.agent_kind.as_str());
+            shared.iter().any(|model| model.starts_with(&prefix))
+        });
+    }
+
     fn set_connected(&self, on: bool) {
         let prev = self.connected.swap(on, Ordering::SeqCst);
+        if prev && !on {
+            self.clear_quota_leases();
+        }
         if prev != on {
             self.emit_status();
         }
@@ -566,6 +720,7 @@ impl RelayManager {
                 // 保留服务端返回的完整名单（含自己）：天线在线名单要显示自己（前端标注「我」）。
                 // 漫游/分享侧各自会用自己的 token 排除自己，不受此影响。
                 let peers = env.data.get("peers").cloned().unwrap_or(json!([]));
+                self.retain_online_quota_leases(&peers);
                 *self.peers.lock().unwrap() = peers.clone();
                 let _ = self.app.emit(EV_RELAY_PEERS, peers);
             }
@@ -836,7 +991,7 @@ impl RelayManager {
                     })
                     .collect()
             };
-            let allowed = state.roaming.lock().unwrap().folders.clone();
+            let allowed = crate::current_roaming_project_folders(state.inner());
             allowed
                 .iter()
                 .filter(|path| is_allowed_roaming_path(&allowed, path))
@@ -951,11 +1106,19 @@ impl RelayManager {
             return Err(format!("目录不存在：{cwd}"));
         }
         let items: Vec<Item> = serde_json::from_value(share.items).unwrap_or_default();
+        // 召回后会在本机继续执行，模式应与本机新会话默认值一致；普通分享保持原行为。
+        let mode = if share.recall {
+            let state = self.app.state::<AppState>();
+            let default_mode = state.settings.lock().unwrap().default_mode.clone();
+            accepted_share_mode(share.recall, &default_mode)
+        } else {
+            None
+        };
         let mut thread = Thread::new(
             cwd.to_string(),
             share.agent_kind,
             None,
-            None,
+            mode,
             None,
             ephemeral,
         );
@@ -1101,11 +1264,161 @@ impl RelayManager {
 
     // ===== 额度租借：A 本机执行，临时使用 B 的加密凭证 =====
 
-    fn emit_quota_progress(&self, stage: &str, message: impl Into<String>) {
+    fn emit_quota_progress(&self, operation_id: &str, stage: &str, message: impl Into<String>) {
         let _ = self.app.emit(
             EV_RELAY_QUOTA_PROGRESS,
-            json!({ "stage": stage, "message": message.into() }),
+            json!({
+                "operationId": operation_id,
+                "stage": stage,
+                "message": message.into(),
+            }),
         );
+    }
+
+    pub async fn prepare_quota_lease(
+        self: &Arc<Self>,
+        peer_token: String,
+        agent_kind: AgentKind,
+        model: String,
+    ) -> Result<(), String> {
+        if self.cfg().is_none() {
+            return Err("未配置中转站 token".into());
+        }
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err("额度租约必须指定共享模型".into());
+        }
+        let key = QuotaLeaseKey::new(peer_token, agent_kind)?;
+        self.acquire_quota_lease(key, model, None).await?;
+        Ok(())
+    }
+
+    fn quota_lease_ready(&self, key: &QuotaLeaseKey) -> bool {
+        self.quota_leases.lock().unwrap().contains_key(key)
+    }
+
+    async fn wait_quota_lease_flight(
+        wait: oneshot::Receiver<QuotaLeaseResult>,
+        operation: Option<&QuotaOperation>,
+    ) -> QuotaLeaseResult {
+        let result = if let Some(operation) = operation {
+            tokio::select! {
+                _ = operation.cancelled() => return Err(QUOTA_CANCELLED_ERROR.into()),
+                result = wait => result,
+            }
+        } else {
+            wait.await
+        };
+        result.map_err(|_| "额度租约准备通道已关闭".to_string())?
+    }
+
+    async fn acquire_quota_lease(
+        self: &Arc<Self>,
+        key: QuotaLeaseKey,
+        model: String,
+        operation: Option<&QuotaOperation>,
+    ) -> QuotaLeaseResult {
+        if let Some(bundle) = self.quota_leases.lock().unwrap().get(&key).cloned() {
+            return Ok(bundle);
+        }
+
+        let wait = {
+            let mut flights = self.quota_lease_flights.lock().unwrap();
+            if let Some(waiters) = flights.get_mut(&key) {
+                let (reply, wait) = oneshot::channel();
+                waiters.push(reply);
+                Some(wait)
+            } else {
+                flights.insert(key.clone(), Vec::new());
+                None
+            }
+        };
+        if let Some(wait) = wait {
+            return Self::wait_quota_lease_flight(wait, operation).await;
+        }
+
+        let result = self.request_quota_bundle(&key, &model, operation).await;
+        if let Ok(bundle) = &result {
+            self.quota_leases
+                .lock()
+                .unwrap()
+                .insert(key.clone(), bundle.clone());
+        }
+        let waiters = self
+            .quota_lease_flights
+            .lock()
+            .unwrap()
+            .remove(&key)
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+        result
+    }
+
+    async fn request_quota_bundle(
+        self: &Arc<Self>,
+        key: &QuotaLeaseKey,
+        model: &str,
+        operation: Option<&QuotaOperation>,
+    ) -> QuotaLeaseResult {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (secret, public_key) = crate::credential_roaming::new_request_key();
+        let (reply, wait) = oneshot::channel();
+        self.pending_quota.lock().unwrap().insert(
+            request_id.clone(),
+            PendingQuotaClient {
+                peer: key.peer.clone(),
+                agent_kind: key.agent_kind.clone(),
+                secret,
+                reply,
+            },
+        );
+        let request = self.send(
+            &key.peer,
+            "quota.request",
+            json!({
+                "reqId": request_id,
+                "agentKind": key.agent_kind,
+                "model": model,
+                "publicKey": public_key,
+            }),
+        );
+        let send_result = if let Some(operation) = operation {
+            tokio::select! {
+                _ = operation.cancelled() => {
+                    self.pending_quota.lock().unwrap().remove(&request_id);
+                    return Err(QUOTA_CANCELLED_ERROR.into());
+                }
+                result = request => result,
+            }
+        } else {
+            request.await
+        };
+        if let Err(error) = send_result {
+            self.pending_quota.lock().unwrap().remove(&request_id);
+            return Err(format!("发送额度请求失败：{error}"));
+        }
+
+        let response = if let Some(operation) = operation {
+            tokio::select! {
+                _ = operation.cancelled() => {
+                    self.pending_quota.lock().unwrap().remove(&request_id);
+                    return Err(QUOTA_CANCELLED_ERROR.into());
+                }
+                result = timeout(QUOTA_REQUEST_TIMEOUT, wait) => result,
+            }
+        } else {
+            timeout(QUOTA_REQUEST_TIMEOUT, wait).await
+        };
+        match response {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("额度授权通道已关闭".into()),
+            Err(_) => {
+                self.pending_quota.lock().unwrap().remove(&request_id);
+                Err("等待对方授权超时".into())
+            }
+        }
     }
 
     pub async fn create_quota_thread(
@@ -1116,7 +1429,7 @@ impl RelayManager {
         agent_kind: AgentKind,
         model: Option<String>,
         mode: Option<String>,
-        first_prompt: Option<String>,
+        operation_id: String,
     ) -> Result<Thread, String> {
         if self.cfg().is_none() {
             return Err("未配置中转站 token".into());
@@ -1124,64 +1437,96 @@ impl RelayManager {
         if !std::path::Path::new(&cwd).is_dir() {
             return Err(format!("本地目录不存在：{cwd}"));
         }
+        let operation_id = operation_id.trim().to_string();
+        if operation_id.is_empty() {
+            return Err("额度漫游操作编号不能为空".into());
+        }
+        let operation = Arc::new(QuotaOperation::new());
+        {
+            let mut operations = self.quota_operations.lock().unwrap();
+            if operations.contains_key(&operation_id) {
+                return Err("额度漫游操作已存在".into());
+            }
+            operations.insert(operation_id.clone(), operation.clone());
+        }
+        let result = self
+            .create_quota_thread_inner(
+                peer_token,
+                peer_name,
+                cwd,
+                agent_kind,
+                model,
+                mode,
+                &operation_id,
+                operation,
+            )
+            .await;
+        self.quota_operations.lock().unwrap().remove(&operation_id);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_quota_thread_inner(
+        self: &Arc<Self>,
+        peer_token: String,
+        peer_name: String,
+        cwd: String,
+        agent_kind: AgentKind,
+        model: Option<String>,
+        mode: Option<String>,
+        operation_id: &str,
+        operation: Arc<QuotaOperation>,
+    ) -> Result<Thread, String> {
         let settings = {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap().clone();
             settings
         };
+        operation.ensure_active()?;
         if !crate::cli_manager::is_installed(&agent_kind, &settings) {
             self.emit_quota_progress(
+                operation_id,
                 "installing",
                 format!("本机缺少 {} CLI，正在一键安装…", agent_kind.label()),
             );
-            let operation_id = uuid::Uuid::new_v4().to_string();
             let state = self.app.state::<AppState>();
             crate::cli_manager::ensure_installed(
                 &self.app,
                 state.inner(),
                 agent_kind.clone(),
                 &settings,
-                &operation_id,
+                operation_id,
             )
             .await?;
+            operation.ensure_active()?;
         }
 
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let (secret, public_key) = crate::credential_roaming::new_request_key();
-        let (reply, wait) = oneshot::channel();
-        self.pending_quota.lock().unwrap().insert(
-            request_id.clone(),
-            PendingQuotaClient {
-                peer: peer_token.clone(),
-                agent_kind: agent_kind.clone(),
-                secret,
-                reply,
-            },
-        );
-        self.emit_quota_progress("requesting", format!("正在向 {peer_name} 同步当前凭据…"));
-        self.spawn_send(
-            peer_token.clone(),
-            "quota.request",
-            json!({
-                "reqId": request_id,
-                "agentKind": agent_kind,
-                "model": model.clone(),
-                "publicKey": public_key,
-                "projectName": basename(&cwd),
-                "prompt": first_prompt,
-            }),
-        );
+        let model = model
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("额度漫游必须选择对方明确共享的模型")?;
+        let lease_key = QuotaLeaseKey::new(peer_token.clone(), agent_kind.clone())?;
+        let lease_ready = self.quota_lease_ready(&lease_key);
+        if lease_ready {
+            self.emit_quota_progress(operation_id, "preparing", "正在复用已预热的额度租约…");
+        } else {
+            self.emit_quota_progress(
+                operation_id,
+                "requesting",
+                format!("正在向 {peer_name} 同步额度租约…"),
+            );
+        }
+        let bundle = self
+            .acquire_quota_lease(lease_key, model.clone(), Some(operation.as_ref()))
+            .await?;
 
-        let bundle = match timeout(Duration::from_secs(5 * 60), wait).await {
-            Ok(Ok(result)) => result?,
-            Ok(Err(_)) => return Err("额度授权通道已关闭".into()),
-            Err(_) => {
-                self.pending_quota.lock().unwrap().remove(&request_id);
-                return Err("等待对方授权超时".into());
-            }
-        };
-
-        self.emit_quota_progress("preparing", "正在解密并准备隔离凭证…");
+        operation.ensure_active()?;
+        if !lease_ready {
+            self.emit_quota_progress(
+                operation_id,
+                "preparing",
+                "额度租约已就绪，正在创建隔离会话…",
+            );
+        }
         let default_mode = {
             let state = self.app.state::<AppState>();
             let default_mode = state.settings.lock().unwrap().default_mode.clone();
@@ -1190,7 +1535,7 @@ impl RelayManager {
         let mut thread = Thread::new(
             cwd.clone(),
             agent_kind.clone(),
-            model.filter(|value| !value.is_empty()),
+            Some(model),
             mode.filter(|value| !value.is_empty())
                 .or(Some(default_mode).filter(|value| !value.is_empty())),
             None,
@@ -1213,6 +1558,10 @@ impl RelayManager {
             &agent_kind,
             bundle,
         )?;
+        if !operation.commit() {
+            runtime.shutdown().await;
+            return Err(QUOTA_CANCELLED_ERROR.into());
+        }
         {
             let state = self.app.state::<AppState>();
             state
@@ -1229,8 +1578,29 @@ impl RelayManager {
         }
         self.publish_folders();
         let _ = self.app.emit(EV_THREADS, json!({}));
-        self.emit_quota_progress("ready", "额度凭证已就绪，开始本地会话");
+        self.emit_quota_progress(operation_id, "ready", "额度凭证已就绪，开始本地会话");
         Ok(thread)
+    }
+
+    pub fn cancel_quota_roaming(&self, operation_id: &str) -> bool {
+        let Some(operation) = self
+            .quota_operations
+            .lock()
+            .unwrap()
+            .get(operation_id)
+            .cloned()
+        else {
+            return false;
+        };
+        operation.cancel()
+    }
+
+    fn spawn_quota_send(&self, to: String, kind: &str, data: Value) {
+        let relay = self.app.state::<AppState>().relay.clone();
+        let kind = kind.to_string();
+        tauri::async_runtime::spawn(async move {
+            relay.send_with_retry(&to, &kind, data).await;
+        });
     }
 
     fn on_quota_request(&self, env: &InEnvelope) {
@@ -1251,7 +1621,7 @@ impl RelayManager {
             quota_model_is_shared(&settings, &agent_kind, &model)
         };
         if !allowed {
-            self.spawn_send_now(
+            self.spawn_quota_send(
                 env.from.clone(),
                 "quota.rejected",
                 json!({
@@ -1268,70 +1638,24 @@ impl RelayManager {
         let app = self.app.clone();
         let to = env.from.clone();
         std::thread::spawn(move || {
-            let result = crate::credential_roaming::collect_credentials(agent_kind)
-                .and_then(|bundle| {
+            let result =
+                crate::credential_roaming::collect_credentials(agent_kind).and_then(|bundle| {
                     crate::credential_roaming::encrypt_bundle(&public_key, &req_id, &bundle)
                 });
             let relay = app.state::<AppState>().relay.clone();
             match result {
-                Ok(grant) => relay.spawn_send_now(
+                Ok(grant) => relay.spawn_quota_send(
                     to,
                     "quota.granted",
                     json!({ "reqId": req_id, "grant": grant }),
                 ),
-                Err(error) => relay.spawn_send_now(
+                Err(error) => relay.spawn_quota_send(
                     to,
                     "quota.rejected",
                     json!({ "reqId": req_id, "error": error }),
                 ),
             }
         });
-    }
-
-    pub fn respond_quota_request(
-        self: &Arc<Self>,
-        req_id: &str,
-        accept: bool,
-    ) -> Result<(), String> {
-        let pending = self
-            .incoming_quota
-            .lock()
-            .unwrap()
-            .remove(req_id)
-            .ok_or("额度请求已失效")?;
-        if !accept {
-            self.spawn_send_now(
-                pending.from,
-                "quota.rejected",
-                json!({ "reqId": req_id, "error": "对方拒绝了额度租借请求" }),
-            );
-            return Ok(());
-        }
-        let this = Arc::clone(self);
-        let req_id = req_id.to_string();
-        std::thread::spawn(move || {
-            let result = crate::credential_roaming::collect_credentials(pending.agent_kind.clone())
-                .and_then(|bundle| {
-                    crate::credential_roaming::encrypt_bundle(
-                        &pending.public_key,
-                        &req_id,
-                        &bundle,
-                    )
-                });
-            match result {
-                Ok(grant) => this.spawn_send_now(
-                    pending.from,
-                    "quota.granted",
-                    json!({ "reqId": req_id, "grant": grant }),
-                ),
-                Err(error) => this.spawn_send_now(
-                    pending.from,
-                    "quota.rejected",
-                    json!({ "reqId": req_id, "error": error }),
-                ),
-            }
-        });
-        Ok(())
     }
 
     fn on_quota_granted(&self, env: &InEnvelope) {
@@ -1650,6 +1974,7 @@ impl RelayManager {
         if env.from.is_empty() {
             return;
         }
+        self.invalidate_quota_leases_for_peer(&env.from);
         self.spawn_send_now(env.from.clone(), "roaming.models_request", json!({}));
     }
 
@@ -1712,6 +2037,7 @@ impl RelayManager {
 
     /// guest：收到 host 回传的模型列表，转发给前端按对端 token 缓存。
     fn on_roaming_models(&self, env: &InEnvelope) {
+        self.retain_shared_quota_leases(&env.from, &env.data["sharedOptions"]);
         let _ = self.app.emit(
             EV_RELAY_PEER_MODELS,
             json!({
@@ -2041,7 +2367,7 @@ impl RelayManager {
 
     fn roaming_folder_allowed(&self, folder: &str) -> bool {
         let state = self.app.state::<AppState>();
-        let allowed = state.roaming.lock().unwrap().folders.clone();
+        let allowed = crate::current_roaming_project_folders(state.inner());
         is_allowed_roaming_path(&allowed, folder)
     }
 
@@ -3253,6 +3579,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recalled_share_uses_local_default_mode() {
+        assert_eq!(accepted_share_mode(true, "build").as_deref(), Some("build"));
+        assert_eq!(accepted_share_mode(true, ""), None);
+        assert_eq!(accepted_share_mode(false, "build"), None);
+    }
+
+    #[test]
     fn filters_peer_models_to_explicit_quota_shares() {
         let source = json!({
             "configOptions": [{
@@ -3294,6 +3627,55 @@ mod tests {
             &AgentKind::Codex,
             "cursor-small"
         ));
+    }
+
+    #[test]
+    fn quota_lease_key_is_per_peer_and_backend() {
+        let cursor = QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor).unwrap();
+        let codex = QuotaLeaseKey::new("peer-a".into(), AgentKind::Codex).unwrap();
+
+        assert_ne!(cursor, codex);
+        assert!(QuotaLeaseKey::new("".into(), AgentKind::Cursor).is_err());
+    }
+
+    #[test]
+    fn shared_quota_model_keys_follow_peer_payload() {
+        let shared = shared_quota_model_keys(&json!({
+            "cursor": {
+                "configOptions": [{
+                    "id": "model",
+                    "options": [
+                        { "value": "cursor-small" },
+                        { "value": "cursor-large" }
+                    ]
+                }]
+            }
+        }));
+
+        assert!(shared.contains("cursor:cursor-small"));
+        assert!(shared.contains("cursor:cursor-large"));
+        assert!(!shared.contains("codex:cursor-small"));
+    }
+
+    #[tokio::test]
+    async fn quota_operation_cancel_wakes_waiter_and_blocks_commit() {
+        let operation = Arc::new(QuotaOperation::new());
+        let waiter = operation.clone();
+        let task = tokio::spawn(async move { waiter.cancelled().await });
+
+        assert!(operation.cancel());
+        timeout(Duration::from_millis(100), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!operation.commit());
+    }
+
+    #[test]
+    fn committed_quota_operation_rejects_late_cancel() {
+        let operation = QuotaOperation::new();
+        assert!(operation.commit());
+        assert!(!operation.cancel());
     }
 
     #[test]

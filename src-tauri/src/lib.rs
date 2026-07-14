@@ -445,8 +445,7 @@ struct ProjectWorktreeInfo {
     branch: String,
 }
 
-#[tauri::command]
-fn list_projects(state: State<'_, AppState>) -> Vec<ProjectEntry> {
+fn local_project_entries(state: &AppState) -> Vec<ProjectEntry> {
     // 会话用过的目录也并入列表（此前由前端合并，挪到后端统一做标注/过滤）。
     // guest 漫游会话的 cwd 指向对方机器，不能当本地项目。
     let (guest_cwds, thread_cwds): (HashSet<String>, Vec<String>) = {
@@ -506,6 +505,84 @@ fn list_projects(state: State<'_, AppState>) -> Vec<ProjectEntry> {
             ProjectEntry { path: p, worktree }
         })
         .collect()
+}
+
+#[tauri::command]
+fn list_projects(state: State<'_, AppState>) -> Vec<ProjectEntry> {
+    local_project_entries(state.inner())
+}
+
+fn project_path_key(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        path.replace('/', "\\").to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+}
+
+fn match_existing_project_folders(projects: Vec<String>, folders: Vec<String>) -> Vec<String> {
+    let projects: HashMap<String, String> = projects
+        .into_iter()
+        .map(|path| (project_path_key(&path), path))
+        .collect();
+    let mut seen = HashSet::new();
+    folders
+        .into_iter()
+        .filter_map(|folder| {
+            let key = project_path_key(folder.trim());
+            if key.is_empty() || !seen.insert(key.clone()) {
+                return None;
+            }
+            projects.get(&key).cloned()
+        })
+        .collect()
+}
+
+pub(crate) fn restrict_roaming_folders_to_projects(
+    state: &AppState,
+    folders: Vec<String>,
+) -> Vec<String> {
+    let projects = local_project_entries(state)
+        .into_iter()
+        .map(|project| project.path)
+        .collect();
+    match_existing_project_folders(projects, folders)
+}
+
+pub(crate) fn current_roaming_project_folders(state: &AppState) -> Vec<String> {
+    let current = state.roaming.lock().unwrap().folders.clone();
+    let folders = restrict_roaming_folders_to_projects(state, current.clone());
+    if folders != current {
+        let mut roaming = state.roaming.lock().unwrap();
+        if roaming.folders == current {
+            roaming.folders = folders.clone();
+            roaming.save();
+        }
+    }
+    folders
+}
+
+#[cfg(test)]
+mod roaming_folder_selection_tests {
+    use super::match_existing_project_folders;
+
+    #[test]
+    fn roaming_folders_only_keep_existing_projects() {
+        let projects = vec!["/projects/alpha".to_string(), "/projects/beta".to_string()];
+        let folders = vec![
+            " /projects/alpha ".to_string(),
+            "/tmp/arbitrary".to_string(),
+            "/projects/alpha".to_string(),
+        ];
+
+        assert_eq!(
+            match_existing_project_folders(projects, folders),
+            vec!["/projects/alpha".to_string()]
+        );
+    }
 }
 
 #[tauri::command]
@@ -2425,17 +2502,30 @@ fn decline_share(state: State<'_, AppState>, id: String) {
 
 #[tauri::command]
 fn list_roaming_folders(state: State<'_, AppState>) -> Vec<String> {
-    state.roaming.lock().unwrap().folders.clone()
+    current_roaming_project_folders(state.inner())
 }
 
 #[tauri::command]
 fn is_folder_roaming(state: State<'_, AppState>, cwd: String) -> bool {
-    state.roaming.lock().unwrap().is_allowed(&cwd)
+    current_roaming_project_folders(state.inner())
+        .iter()
+        .any(|folder| project_path_key(folder) == project_path_key(&cwd))
 }
 
 /// 切换某目录是否允许漫游，返回切换后的状态
 #[tauri::command]
 fn set_folder_roaming(state: State<'_, AppState>, cwd: String, allowed: bool) -> bool {
+    let cwd = if allowed {
+        let Some(cwd) = restrict_roaming_folders_to_projects(state.inner(), vec![cwd])
+            .into_iter()
+            .next()
+        else {
+            return false;
+        };
+        cwd
+    } else {
+        cwd
+    };
     {
         let mut roaming = state.roaming.lock().unwrap();
         roaming.set(&cwd, allowed);
@@ -2447,21 +2537,7 @@ fn set_folder_roaming(state: State<'_, AppState>, cwd: String, allowed: bool) ->
 /// 批量替换允许漫游目录，设置页一次保存后只广播一遍。
 #[tauri::command]
 fn set_roaming_folders(state: State<'_, AppState>, folders: Vec<String>) -> Vec<String> {
-    let mut normalized = Vec::new();
-    let mut seen = HashSet::new();
-    for folder in folders {
-        let folder = folder.trim();
-        if folder.is_empty() || folder.contains(SCRATCH_MARK) {
-            continue;
-        }
-        #[cfg(windows)]
-        let key = folder.replace('/', "\\").to_lowercase();
-        #[cfg(not(windows))]
-        let key = folder.to_string();
-        if seen.insert(key) {
-            normalized.push(folder.to_string());
-        }
-    }
+    let normalized = restrict_roaming_folders_to_projects(state.inner(), folders);
     {
         let mut roaming = state.roaming.lock().unwrap();
         roaming.folders = normalized.clone();
@@ -2520,7 +2596,7 @@ async fn create_quota_thread(
     agent_kind: Option<AgentKind>,
     model: Option<String>,
     mode: Option<String>,
-    first_prompt: Option<String>,
+    operation_id: String,
 ) -> Result<Thread, String> {
     state
         .relay
@@ -2531,9 +2607,30 @@ async fn create_quota_thread(
             agent_kind.unwrap_or(AgentKind::Devin),
             model,
             mode,
-            first_prompt.filter(|value| !value.trim().is_empty()),
+            operation_id,
         )
         .await
+}
+
+/// 选择共享模型时后台预热应用级额度租约，正式创建会话时直接复用。
+#[tauri::command]
+async fn prepare_quota_lease(
+    state: State<'_, AppState>,
+    peer_token: String,
+    agent_kind: AgentKind,
+    model: String,
+) -> Result<(), String> {
+    state
+        .relay
+        .prepare_quota_lease(peer_token, agent_kind, model)
+        .await
+}
+
+#[tauri::command]
+fn cancel_quota_roaming(state: State<'_, AppState>, operation_id: String) -> bool {
+    let roaming_cancelled = state.relay.cancel_quota_roaming(&operation_id);
+    let cli_cancelled = cli_manager::cancel(&state, &operation_id);
+    roaming_cancelled || cli_cancelled
 }
 
 /// guest：召回漫游会话——请求 host 把完整会话快照 Flow 回来，
@@ -2558,16 +2655,6 @@ fn respond_roam_request(
     accept: bool,
 ) -> Result<(), String> {
     state.relay.respond_roam_request(&req_id, accept)
-}
-
-/// 额度提供方：同意时采集对应后端登录态并端到端加密给借用方。
-#[tauri::command]
-fn respond_quota_request(
-    state: State<'_, AppState>,
-    req_id: String,
-    accept: bool,
-) -> Result<(), String> {
-    state.relay.respond_quota_request(&req_id, accept)
 }
 
 /// 强制重启 devin 进程：杀进程后所有挂起的轮次会立即失败返回，
@@ -3708,10 +3795,11 @@ pub fn run() {
             set_roaming_folders,
             create_roaming_thread,
             create_quota_thread,
+            prepare_quota_lease,
+            cancel_quota_roaming,
             recall_roaming_thread,
             request_peer_models,
             respond_roam_request,
-            respond_quota_request,
             is_git_repo,
             list_branches,
             request_peer_branches,

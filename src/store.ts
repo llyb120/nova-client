@@ -11,7 +11,6 @@ import type {
   Employee,
   EmployeeTask,
   IncomingRoamRequest,
-  IncomingQuotaRequest,
   IncomingShare,
   Item,
   Mark,
@@ -114,8 +113,6 @@ interface AppStore {
   inboxPromptAt: number;
   /** host 侧：待本机确认的漫游请求队列 */
   incomingRoams: IncomingRoamRequest[];
-  /** 额度提供方：等待本机确认的凭证租借请求。 */
-  incomingQuotas: IncomingQuotaRequest[];
   /** 借用方：等待授权、安装 CLI、准备隔离凭证的进度。 */
   quotaRoamingProgress: QuotaRoamingProgress | null;
   /** 本机允许漫游的目录 */
@@ -190,7 +187,6 @@ export const [state, setState] = createStore<AppStore>({
   inbox: [],
   inboxPromptAt: 0,
   incomingRoams: [],
-  incomingQuotas: [],
   quotaRoamingProgress: null,
   roamingFolders: [],
   expanded: {},
@@ -696,8 +692,8 @@ export async function createQuotaThread(
   agentKind: AgentKind,
   model: string,
   mode: string,
-  firstPrompt = "",
 ): Promise<string> {
+  const operationId = crypto.randomUUID();
   const t = await api.createQuotaThread(
     peer.token,
     peer.name,
@@ -705,7 +701,7 @@ export async function createQuotaThread(
     agentKind,
     model || null,
     mode || null,
-    firstPrompt.trim() || null,
+    operationId,
   );
   rememberThreadSnapshot(t);
   setState("expanded", reconcile({}));
@@ -728,14 +724,6 @@ export async function createQuotaThread(
   void refreshThreads();
   ensurePeerModels(peer.token);
   return t.id;
-}
-
-export async function respondQuotaRequest(reqId: string, accept: boolean) {
-  try {
-    await api.respondQuotaRequest(reqId, accept);
-  } finally {
-    setState("incomingQuotas", (prev) => prev.filter((request) => request.reqId !== reqId));
-  }
 }
 
 export function clearQuotaRoamingProgress() {
@@ -1596,12 +1584,6 @@ export async function initStore() {
   await listen<IncomingRoamRequest>("relay:roam-request", (e) => {
     setState("incomingRoams", (prev) => [
       ...prev.filter((r) => r.reqId !== e.payload.reqId),
-      e.payload,
-    ]);
-  });
-  await listen<IncomingQuotaRequest>("relay:quota-request", (e) => {
-    setState("incomingQuotas", (prev) => [
-      ...prev.filter((request) => request.reqId !== e.payload.reqId),
       e.payload,
     ]);
   });
