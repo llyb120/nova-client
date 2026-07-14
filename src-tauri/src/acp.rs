@@ -7,6 +7,7 @@ use crate::threads::{
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{AppHandle, Emitter, Manager};
@@ -57,6 +58,13 @@ struct TitleJob {
     thread_id: String,
     fallback_title: String,
     output: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CursorToolDetails {
+    tool_name: Option<String>,
+    raw_input: Option<Value>,
+    raw_output: Option<Value>,
 }
 
 pub struct AcpConn {
@@ -363,6 +371,11 @@ pub struct AcpManager {
     cursor_catalog: StdMutex<Option<Vec<(String, String)>>>,
     /// Cursor ACP 的标准模型列表。它包含 CLI 目录偶尔缺少的模型，合并时作为补充来源。
     cursor_acp_models: StdMutex<Vec<Value>>,
+    /// Cursor ACP 把 MCP 调用压扁为 `MCP: tool`。按 session/toolCallId 缓存从 Cursor
+    /// 当前会话存储恢复出的真实工具名与参数，供后续 in_progress/completed 更新复用。
+    cursor_tool_details: StdMutex<HashMap<String, CursorToolDetails>>,
+    /// Cursor 自带的 Node 运行时，用其只读 SQLite API 读取同一 ACP 会话库。
+    cursor_node_path: StdMutex<Option<PathBuf>>,
     /// Cursor 目录拉取进行中标记（防并发重复拉取）
     cursor_catalog_fetching: StdMutex<bool>,
     /// 本进程内是否已对磁盘缓存做过一次后台重拉（避免每次 get 都打 agent）
@@ -435,6 +448,8 @@ impl AcpManager {
             model_options: StdMutex::new(None),
             cursor_catalog: StdMutex::new(None),
             cursor_acp_models: StdMutex::new(Vec::new()),
+            cursor_tool_details: StdMutex::new(HashMap::new()),
+            cursor_node_path: StdMutex::new(None),
             cursor_catalog_fetching: StdMutex::new(false),
             model_options_revalidated: AtomicBool::new(false),
             model_options_refreshing: AtomicBool::new(false),
@@ -754,6 +769,73 @@ impl AcpManager {
             .and_then(|thread| thread.model.as_deref())
             .filter(|model| is_cursor_cli_model_id(model))
             .map(str::to_string)
+    }
+
+    fn cursor_session_store_path(&self, thread_id: &str, session_id: &str) -> Option<PathBuf> {
+        if self.kind != AgentKind::Cursor || session_id.is_empty() {
+            return None;
+        }
+        let config_dir = self
+            .launch_env
+            .get("CURSOR_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                nova_data_dir(&self.app)
+                    .join("cursor-config")
+                    .join(std::process::id().to_string())
+                    .join(thread_id)
+            });
+        Some(
+            config_dir
+                .join("acp-sessions")
+                .join(session_id)
+                .join("store.db"),
+        )
+    }
+
+    fn enrich_cursor_tool_update(
+        &self,
+        thread_id: &str,
+        session_id: &str,
+        update: &Value,
+    ) -> Value {
+        let tool_call_id = update["toolCallId"].as_str().unwrap_or_default();
+        if tool_call_id.is_empty() {
+            return update.clone();
+        }
+        let cache_key = format!("{session_id}\n{tool_call_id}");
+        let generic_mcp = is_generic_cursor_mcp_title(update["title"].as_str().unwrap_or_default());
+        let terminal = matches!(update["status"].as_str(), Some("completed" | "failed"));
+        let mut details = {
+            let mut cache = self.cursor_tool_details.lock().unwrap();
+            if !generic_mcp && !cache.contains_key(&cache_key) {
+                return update.clone();
+            }
+            cache.remove(&cache_key).unwrap_or_default()
+        };
+        if details.tool_name.is_none() || (terminal && details.raw_output.is_none()) {
+            let node_path = self.cursor_node_path.lock().unwrap().clone();
+            if let (Some(node_path), Some(store_path)) = (
+                node_path,
+                self.cursor_session_store_path(thread_id, session_id),
+            ) {
+                if let Some(found) =
+                    read_cursor_tool_details(&node_path, &store_path, tool_call_id)
+                {
+                    details.merge(found);
+                }
+            }
+        }
+
+        let mut enriched = update.clone();
+        apply_cursor_tool_details(&mut enriched, &details, terminal);
+        if !terminal {
+            self.cursor_tool_details
+                .lock()
+                .unwrap()
+                .insert(cache_key, details);
+        }
+        enriched
     }
 
     /// 从缓存的 model_options 里查找指定 id 的 config option。
@@ -1441,6 +1523,9 @@ impl AcpManager {
             ),
             _ => (settings.devin_path.clone(), settings.acp_args.clone()),
         };
+        if self.kind == AgentKind::Cursor {
+            *self.cursor_node_path.lock().unwrap() = cursor_node_path_for_program(&program);
+        }
         // Cursor ACP 的 session/set_model 只接受 session/new 返回的少量默认变体；CLI 目录里的
         // 完整 thinking/effort/fast 组合必须用全局 `--model <id>` 在 `acp` 子命令之前启动。
         let cursor_startup_model = if self.kind == AgentKind::Cursor && conn_key != self.aux_key() {
@@ -1768,6 +1853,12 @@ impl AcpManager {
                     conn.respond_ok(id, json!({ "outcome": { "outcome": "cancelled" } }));
                     return;
                 };
+                let tool_call = params.get("toolCall").cloned().unwrap_or(Value::Null);
+                let tool_call = if self.kind == AgentKind::Cursor {
+                    self.enrich_cursor_tool_update(&thread_id, &session_id, &tool_call)
+                } else {
+                    tool_call
+                };
                 // 自动放行（挑一个 allow 选项作答）的两种情形：
                 // - 数字员工：无人值守，授权请求没人应答会让本轮永久挂起（is_running 卡死、
                 //   员工「永远在忙」、无法再次「立即执行」）；
@@ -1806,9 +1897,8 @@ impl AcpManager {
                         None => json!({ "outcome": "cancelled" }),
                     };
                     if is_build && !is_employee {
-                        let title = params
-                            .get("toolCall")
-                            .and_then(|tc| tc.get("title"))
+                        let title = tool_call
+                            .get("title")
                             .and_then(|v| v.as_str())
                             .unwrap_or("工具调用");
                         self.push_log(format!("[nova] Build 模式自动批准授权：{title}"));
@@ -1841,7 +1931,7 @@ impl AcpManager {
                         "threadId": thread_id,
                         "agentKind": self.kind.as_str(),
                         "requestKey": key,
-                        "toolCall": params.get("toolCall").cloned().unwrap_or(Value::Null),
+                        "toolCall": tool_call,
                         "options": params.get("options").cloned().unwrap_or(json!([])),
                     }),
                 );
@@ -1949,6 +2039,13 @@ impl AcpManager {
             };
             r.thread_id.clone()
         };
+        let enriched_update =
+            if matches!(kind, "tool_call" | "tool_call_update") && self.kind == AgentKind::Cursor {
+                Some(self.enrich_cursor_tool_update(&thread_id, session_id, update))
+            } else {
+                None
+            };
+        let update = enriched_update.as_ref().unwrap_or(update);
         let state = self.app.state::<AppState>();
         {
             let mut store = state.store.lock().unwrap();
@@ -4212,6 +4309,32 @@ pub(crate) fn resolve_program_on_path(name: &str) -> Option<std::path::PathBuf> 
     })
 }
 
+fn cursor_node_path_for_program(program: &str) -> Option<PathBuf> {
+    let launcher = resolve_program_on_path(program)?;
+    let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+    if launcher
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(node_name))
+    {
+        return Some(launcher);
+    }
+    let root = launcher.parent()?;
+    let direct = root.join(node_name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let bundled = std::fs::read_dir(root.join("versions"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join(node_name))
+        .filter(|path| path.is_file())
+        .max_by(|left, right| left.parent().cmp(&right.parent()));
+    bundled.or_else(|| resolve_program_on_path("node"))
+}
+
 /// Windows：构造 ACP agent 启动命令。
 /// - 解析到 .exe（如 devin.exe）：直接启动，与原有行为一致；
 /// - 解析到 .cmd/.bat 垫片（如 npx.cmd）：经 `cmd /D /S /C` 启动，借 cmd 的 PATHEXT 解析，
@@ -4925,6 +5048,110 @@ fn tool_call_from_update(tc_id: &str, update: &Value) -> ToolCall {
     }
 }
 
+impl CursorToolDetails {
+    fn merge(&mut self, other: CursorToolDetails) {
+        if other.tool_name.is_some() {
+            self.tool_name = other.tool_name;
+        }
+        if other.raw_input.is_some() {
+            self.raw_input = other.raw_input;
+        }
+        if other.raw_output.is_some() {
+            self.raw_output = other.raw_output;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tool_name.is_none() && self.raw_input.is_none() && self.raw_output.is_none()
+    }
+}
+
+fn is_generic_cursor_mcp_title(title: &str) -> bool {
+    matches!(title.trim().to_ascii_lowercase().as_str(), "mcp: tool" | "mcp tool")
+}
+
+fn cursor_tool_title(tool_name: &str) -> String {
+    format!("MCP: {}", tool_name.strip_prefix("mcp_").unwrap_or(tool_name))
+}
+
+fn apply_cursor_tool_details(update: &mut Value, details: &CursorToolDetails, terminal: bool) {
+    let Some(map) = update.as_object_mut() else {
+        return;
+    };
+    if let Some(tool_name) = details.tool_name.as_deref() {
+        map.insert("title".into(), Value::String(cursor_tool_title(tool_name)));
+    }
+    if let Some(raw_input) = details.raw_input.as_ref() {
+        map.insert("rawInput".into(), compact_tool_value(raw_input));
+    }
+    if terminal {
+        if let Some(raw_output) = details.raw_output.as_ref() {
+            map.insert("rawOutput".into(), compact_tool_value(raw_output));
+        }
+    }
+}
+
+const CURSOR_TOOL_DETAILS_SCRIPT: &str = r#"
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[1], { readOnly: true });
+const id = process.argv[2];
+const escapedId = JSON.stringify(id).slice(1, -1);
+const rows = db.prepare(
+  'SELECT data FROM blobs WHERE instr(data, CAST(? AS BLOB)) > 0 OR instr(data, CAST(? AS BLOB)) > 0'
+).all(id, escapedId);
+const details = {};
+for (const row of rows) {
+  let message;
+  try { message = JSON.parse(Buffer.from(row.data).toString('utf8')); } catch { continue; }
+  if (!Array.isArray(message.content)) continue;
+  for (const block of message.content) {
+    if (block?.toolCallId !== id) continue;
+    if (typeof block.toolName === 'string') details.toolName = block.toolName;
+    if (block.type === 'tool-call' && block.args !== undefined) details.rawInput = block.args;
+    if (block.type === 'tool-result') {
+      if (block.result !== undefined) details.rawOutput = block.result;
+      else if (block.experimental_content !== undefined) details.rawOutput = block.experimental_content;
+    }
+  }
+}
+process.stdout.write(JSON.stringify(details));
+"#;
+
+fn read_cursor_tool_details(
+    node_path: &Path,
+    store_path: &Path,
+    tool_call_id: &str,
+) -> Option<CursorToolDetails> {
+    let mut command = std::process::Command::new(node_path);
+    command
+        .arg("-e")
+        .arg(CURSOR_TOOL_DETAILS_SCRIPT)
+        .arg(store_path)
+        .arg(tool_call_id)
+        .env("NODE_NO_WARNINGS", "1")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(&output.stdout).ok()?;
+    let details = CursorToolDetails {
+        tool_name: value
+            .get("toolName")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        raw_input: value.get("rawInput").filter(|v| !v.is_null()).cloned(),
+        raw_output: value.get("rawOutput").filter(|v| !v.is_null()).cloned(),
+    };
+    (!details.is_empty()).then_some(details)
+}
+
 fn merge_tool_call(call: &mut ToolCall, update: &Value) {
     if let Some(title) = update["title"].as_str() {
         call.title = title.to_string();
@@ -5101,6 +5328,31 @@ mod opencode_models_tests {
 #[cfg(test)]
 mod cursor_models_tests {
     use super::*;
+
+    #[test]
+    fn cursor_mcp_tool_details_replace_generic_payload() {
+        let details = CursorToolDetails {
+            tool_name: Some("mcp_codegraph_codegraph_status".into()),
+            raw_input: Some(json!({ "projectPath": "D:/project/nova-client" })),
+            raw_output: Some(json!("healthy")),
+        };
+        let mut update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool_test_123",
+            "title": "MCP: tool",
+            "status": "completed",
+            "rawInput": {},
+            "rawOutput": { "success": true }
+        });
+        apply_cursor_tool_details(&mut update, &details, true);
+
+        assert_eq!(update["title"], "MCP: codegraph_codegraph_status");
+        assert_eq!(
+            update["rawInput"],
+            json!({ "projectPath": "D:/project/nova-client" })
+        );
+        assert_eq!(update["rawOutput"], "healthy");
+    }
 
     #[test]
     fn parse_lists_effort_and_fast_variants() {
