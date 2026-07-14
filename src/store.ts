@@ -443,7 +443,9 @@ function normalizePeers(raw: { peers: Peer[] } | Peer[]): Peer[] {
   return Array.isArray(arr)
     ? arr.map((peer) => ({
         ...peer,
-        folders: peer.folders.filter((folder) => !isScratch(folder.path)),
+        folders: Array.isArray(peer.folders)
+          ? peer.folders.filter((folder) => !isScratch(folder.path))
+          : [],
       }))
     : [];
 }
