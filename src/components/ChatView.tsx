@@ -116,10 +116,10 @@ export function ChatView() {
   let scrollRaf = 0;
   let settleRaf = 0;
   let viewportRaf = 0;
-  let manualScrollRaf = 0;
   let awaitingSendUserItem = false;
   let itemsLenAtSend = 0;
   let manualScroll = false;
+  let manualScrollMovedAway = false;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -145,10 +145,9 @@ export function ChatView() {
     return scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight <= 1;
   };
 
-  const cancelBottomFollow = () => {
+  const beginManualScroll = () => {
     manualScroll = true;
     awaitingSendUserItem = false;
-    setStickToBottom(false);
     if (scrollRaf) {
       cancelAnimationFrame(scrollRaf);
       scrollRaf = 0;
@@ -157,30 +156,31 @@ export function ChatView() {
       cancelAnimationFrame(settleRaf);
       settleRaf = 0;
     }
-    if (manualScrollRaf) {
-      cancelAnimationFrame(manualScrollRaf);
-      manualScrollRaf = 0;
-    }
   };
 
+  // 必须先实际离开底部，再实际回到底部，才恢复自动吸底。
   const syncManualScroll = () => {
     if (!manualScroll) return;
-    const atBottom = isAtBottom();
-    setStickToBottom(atBottom);
-    if (atBottom) manualScroll = false;
+    if (!isAtBottom()) {
+      manualScrollMovedAway = true;
+      setStickToBottom(false);
+      return;
+    }
+    if (!manualScrollMovedAway) return;
+    manualScroll = false;
+    manualScrollMovedAway = false;
+    setStickToBottom(true);
   };
 
-  const scheduleManualScrollSync = () => {
-    if (manualScrollRaf) cancelAnimationFrame(manualScrollRaf);
-    manualScrollRaf = requestAnimationFrame(() => {
-      manualScrollRaf = 0;
-      syncManualScroll();
-    });
+  const finishManualScroll = () => {
+    if (!manualScroll || manualScrollMovedAway) return;
+    manualScroll = false;
+    if (stickToBottom()) forceScrollToBottom();
   };
 
-  const handleWheel = () => {
-    cancelBottomFollow();
-    scheduleManualScrollSync();
+  const handleWheel = (event: WheelEvent) => {
+    if (event.deltaY >= 0 || !scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
+    beginManualScroll();
   };
 
   const handleTranscriptScroll = () => {
@@ -212,6 +212,7 @@ export function ChatView() {
       scrollRaf = 0;
     }
     manualScroll = false;
+    manualScrollMovedAway = false;
     setStickToBottom(true);
     const deadline = performance.now() + maxMs;
     let lastHeight = -1;
@@ -276,17 +277,17 @@ export function ChatView() {
     });
     ro.observe(innerRef);
 
-    const scrollKeys = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
+    const scrollUpKeys = new Set(["ArrowUp", "PageUp", "Home"]);
     const handleScrollKey = (event: KeyboardEvent) => {
-      if (event.altKey || event.ctrlKey || event.metaKey || !scrollKeys.has(event.key)) return;
+      const scrollsUp = scrollUpKeys.has(event.key) || (event.key === " " && event.shiftKey);
+      if (event.altKey || event.ctrlKey || event.metaKey || !scrollsUp) return;
       const target = event.target;
       if (target instanceof Node && target !== document.body && !scrollRef?.contains(target)) return;
       if (
         target instanceof HTMLElement &&
         (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
       ) return;
-      cancelBottomFollow();
-      scheduleManualScrollSync();
+      beginManualScroll();
     };
     window.addEventListener("keydown", handleScrollKey, true);
     onCleanup(() => {
@@ -295,7 +296,6 @@ export function ChatView() {
       if (scrollRaf) cancelAnimationFrame(scrollRaf);
       if (settleRaf) cancelAnimationFrame(settleRaf);
       if (viewportRaf) cancelAnimationFrame(viewportRaf);
-      if (manualScrollRaf) cancelAnimationFrame(manualScrollRaf);
     });
   });
 
@@ -487,9 +487,9 @@ export function ChatView() {
         ref={scrollRef}
         onScroll={handleTranscriptScroll}
         onWheel={handleWheel}
-        onPointerDown={cancelBottomFollow}
-        onPointerUp={syncManualScroll}
-        onPointerCancel={syncManualScroll}
+        onPointerDown={beginManualScroll}
+        onPointerUp={finishManualScroll}
+        onPointerCancel={finishManualScroll}
       >
         <div class="transcript-inner" ref={innerRef}>
           <Show when={state.items.length === 0 && !state.loadingThread}>

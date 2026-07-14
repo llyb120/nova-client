@@ -38,6 +38,7 @@ import type {
   UpdateOp,
   UpdateProgress,
 } from "./types";
+import { isScratch } from "./utils";
 
 /** 界面皮肤：水墨夜色 / 宣纸亮色 */
 export type ThemePref = "ink-dark" | "ink-light";
@@ -442,7 +443,12 @@ export async function refreshModelCosts() {
 
 function normalizePeers(raw: { peers: Peer[] } | Peer[]): Peer[] {
   const arr = Array.isArray(raw) ? raw : raw?.peers;
-  return Array.isArray(arr) ? arr : [];
+  return Array.isArray(arr)
+    ? arr.map((peer) => ({
+        ...peer,
+        folders: peer.folders.filter((folder) => !isScratch(folder.path)),
+      }))
+    : [];
 }
 
 export async function refreshRelayStatus() {

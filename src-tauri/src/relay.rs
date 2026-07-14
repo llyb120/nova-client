@@ -143,6 +143,10 @@ fn shared_model_options(
     Some(filtered)
 }
 
+fn is_publishable_roaming_path(path: &str) -> bool {
+    !path.contains(crate::SCRATCH_MARK)
+}
+
 /// 一条待接收的分享
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -824,7 +828,9 @@ impl RelayManager {
             projects
                 .projects
                 .iter()
-                .filter(|p| std::path::Path::new(p).is_dir())
+                .filter(|p| {
+                    is_publishable_roaming_path(p) && std::path::Path::new(p).is_dir()
+                })
                 .map(|p| {
                     let name = wt_names
                         .get(p.as_str())
@@ -3202,5 +3208,13 @@ mod tests {
             &AgentKind::Codex,
             "cursor-small"
         ));
+    }
+
+    #[test]
+    fn temporary_sessions_are_not_published_as_roaming_projects() {
+        assert!(!is_publishable_roaming_path(
+            r"C:\Users\tester\AppData\Local\Temp\Nova-scratch\0714-104825-1912"
+        ));
+        assert!(is_publishable_roaming_path(r"D:\project\nova-client"));
     }
 }
