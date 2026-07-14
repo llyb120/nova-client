@@ -54,6 +54,33 @@ fn script_installer(url: &str) -> (String, Vec<String>) {
     )
 }
 
+#[cfg(windows)]
+fn elevated_powershell_script_installer(url: &str) -> (String, Vec<String>) {
+    use base64::Engine;
+
+    let script = format!(
+        "$ProgressPreference='SilentlyContinue'; Invoke-RestMethod '{}' | Invoke-Expression",
+        url.replace('\'', "''")
+    );
+    let encoded_script = base64::engine::general_purpose::STANDARD.encode(
+        script
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    (
+        "powershell.exe".into(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!(
+                "$process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand','{encoded_script}'); exit $process.ExitCode"
+            ),
+        ],
+    )
+}
+
 #[cfg(not(windows))]
 fn script_installer(url: &str) -> (String, Vec<String>) {
     (
@@ -164,7 +191,7 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
             );
             #[cfg(windows)]
             let (install_program, install_args) =
-                script_installer("https://cursor.com/install?win32=true");
+                elevated_powershell_script_installer("https://cursor.com/install?win32=true");
             #[cfg(not(windows))]
             let (install_program, install_args) =
                 script_installer("https://cursor.com/install");
@@ -801,5 +828,22 @@ fn refresh_cli_search_path() {
     });
     if let Ok(path) = std::env::join_paths(paths) {
         std::env::set_var("PATH", path);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_install_uses_elevated_powershell_only_on_windows() {
+        let settings = Settings::default();
+        let cursor = spec_for(&AgentKind::Cursor, &settings);
+        let devin = spec_for(&AgentKind::Devin, &settings);
+
+        assert_eq!(cursor.install_program, "powershell.exe");
+        assert!(cursor.install_args.join(" ").contains("-Verb RunAs"));
+        assert!(cursor.install_args.join(" ").contains("-EncodedCommand"));
+        assert!(!devin.install_args.join(" ").contains("-Verb RunAs"));
     }
 }

@@ -46,10 +46,6 @@ pub struct Settings {
     pub codex_args: String,
     /// Codex 代理地址（空 = 不覆盖环境变量）
     pub codex_proxy: String,
-    /// 实验模式：把模型请求里的大段上下文交给 pxpipe 代理按视觉模型能力图片化。
-    pub pxpipe_experimental: bool,
-    /// pxpipe 默认模型白名单之外，额外允许图片化的模型前缀，逗号/空格分隔。
-    pub pxpipe_models: String,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,
     /// 自动生成会话标题所用的后端（devin/codex/codebuddy/...，空 = devin）。
@@ -118,8 +114,6 @@ impl Default for Settings {
             codex_path: "codex".into(),
             codex_args: "app-server --stdio".into(),
             codex_proxy: String::new(),
-            pxpipe_experimental: false,
-            pxpipe_models: "gpt-5.5".into(),
             default_mode: String::new(),
             title_model_agent: "devin".into(),
             title_model: "swe-1-6".into(),

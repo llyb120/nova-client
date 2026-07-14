@@ -239,10 +239,6 @@ export interface Settings {
   codexPath: string;
   codexArgs: string;
   codexProxy: string;
-  /** 实验模式：通过 pxpipe 本地代理把模型请求里的大段上下文图片化 */
-  pxpipeExperimental: boolean;
-  /** pxpipe 默认白名单之外，额外允许图片化的模型前缀 */
-  pxpipeModels: string;
   defaultMode: string;
   /** 自动生成会话标题所用后端（devin/codex/codebuddy/...，空 = devin） */
   titleModelAgent: string;
@@ -308,22 +304,6 @@ export interface CliOperationProgress {
   stage: "waiting" | "running" | "verifying" | "completed" | "failed" | "cancelled";
   percent: number;
   message: string;
-}
-
-export interface PxpipeServiceStatus {
-  enabled: boolean;
-  running: boolean;
-  message: string;
-  instances: {
-    url: string;
-    pid: number;
-    running: boolean;
-    message: string;
-    proxy: string;
-    models: string;
-    anthropicUpstream: string;
-    openaiUpstream: string;
-  }[];
 }
 
 /** worktree「基于分支」下拉的数据：当前分支 + 本地分支列表 */

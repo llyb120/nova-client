@@ -1559,9 +1559,6 @@ impl AcpManager {
         // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 不覆盖）
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
         cmd.envs(&self.launch_env);
-        if self.kind != AgentKind::Cursor {
-            crate::pxpipe::apply_pxpipe_env(&mut cmd, settings, self.proxy_of(settings))?;
-        }
 
         // 把 ~/.nova/skills 用软链接/目录联接同步到各后端全局 skills 目录
         crate::skills::sync_skills_from_home();

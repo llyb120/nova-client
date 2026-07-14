@@ -18,7 +18,7 @@ import {
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker } from "./ConfigSelects";
 import { IconX } from "./icons";
-import type { AgentKind, CliStatus, PxpipeServiceStatus, Settings, SkillInfo, WorktreeRecord } from "../types";
+import type { AgentKind, CliStatus, Settings, SkillInfo, WorktreeRecord } from "../types";
 
 function threadGroupName(cwd: string): string {
   if (isScratch(cwd)) return "临时会话";
@@ -28,7 +28,6 @@ function threadGroupName(cwd: string): string {
 const DEFAULT_RELAY_SERVER = "";
 const RELAY_SERVER_PLACEHOLDER = "http://127.0.0.1:8320";
 const DEFAULT_CLAUDECODE_ARGS = "-y @zed-industries/claude-code-acp";
-const DEFAULT_PXPIPE_MODELS = "gpt-5.5";
 
 /** 统一会话模式（与 store.UNIFIED_MODES 一致，带说明文案） */
 const UNIFIED_MODE_OPTIONS = [
@@ -136,10 +135,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexArgs, setCodexArgs] = createSignal(s?.codexArgs ?? "app-server --stdio");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
-  const [pxpipeExperimental, setPxpipeExperimental] = createSignal(
-    s?.pxpipeExperimental ?? false,
-  );
-  const [pxpipeModels, setPxpipeModels] = createSignal(s?.pxpipeModels ?? DEFAULT_PXPIPE_MODELS);
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
   const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
@@ -176,9 +171,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [saving, setSaving] = createSignal(false);
   const [restarting, setRestarting] = createSignal(false);
   const [restartMsg, setRestartMsg] = createSignal("");
-  const [pxpipeBusy, setPxpipeBusy] = createSignal(false);
-  const [pxpipeStatus, setPxpipeStatus] = createSignal<PxpipeServiceStatus | null>(null);
-  const [pxpipeMsg, setPxpipeMsg] = createSignal("");
   const [cliStatuses, setCliStatuses] = createSignal<Partial<Record<AgentKind, CliStatus>>>({});
   const [cliLoading, setCliLoading] = createSignal(false);
   const [upgradingCli, setUpgradingCli] = createSignal<AgentKind | null>(null);
@@ -281,8 +273,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     codexPath: codexPath().trim() || "codex",
     codexArgs: codexArgs().trim() || "app-server --stdio",
     codexProxy: codexProxy().trim(),
-    pxpipeExperimental: pxpipeExperimental(),
-    pxpipeModels: pxpipeModels().trim(),
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
     claudecodeProxy: claudecodeProxy().trim(),
@@ -359,35 +349,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   createEffect(() => {
     if (tab() !== "team") return;
     for (const kind of quotaShareKinds()) void ensureModelOptions(kind);
-  });
-
-  const refreshPxpipeStatus = async () => {
-    setPxpipeBusy(true);
-    setPxpipeMsg("");
-    try {
-      setPxpipeStatus(await api.getPxpipeServiceStatus(draftSettings()));
-    } catch (e) {
-      setPxpipeMsg(`状态读取失败：${String(e)}`);
-    } finally {
-      setPxpipeBusy(false);
-    }
-  };
-
-  const restartPxpipe = async () => {
-    setPxpipeBusy(true);
-    setPxpipeMsg("");
-    try {
-      setPxpipeStatus(await api.restartPxpipeService(draftSettings()));
-      setPxpipeMsg("pxpipe 已重启");
-    } catch (e) {
-      setPxpipeMsg(`重启失败：${String(e)}`);
-    } finally {
-      setPxpipeBusy(false);
-    }
-  };
-
-  onMount(() => {
-    if (pxpipeExperimental()) void refreshPxpipeStatus();
   });
 
   // 会话批量管理
@@ -729,91 +690,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                   PATH 中）。正式项目会连同项目目录一起打开，临时会话只打开文件。
                 </span>
               </label>
-
-              <label class="field setting-check">
-                <input
-                  type="checkbox"
-                  checked={pxpipeExperimental()}
-                  onChange={(e) => {
-                    setPxpipeExperimental(e.currentTarget.checked);
-                    if (e.currentTarget.checked) {
-                      setTimeout(() => void refreshPxpipeStatus(), 0);
-                    } else {
-                      setPxpipeStatus(null);
-                      setPxpipeMsg("");
-                    }
-                  }}
-                />
-                <span>
-                  <span class="field-label">实验模式：图片化上下文</span>
-                  <span class="field-hint">
-                    对 agent 内部发往 Anthropic/OpenAI 的大段 system prompt、工具说明和旧历史启用
-                    pxpipe。模型不支持时透传，前台仍显示原文字。
-                  </span>
-                </span>
-              </label>
-
-              <Show when={pxpipeExperimental()}>
-                <div class="field inline-action-field">
-                  <label class="field">
-                    <span class="field-label">额外生效模型</span>
-                    <input
-                      class="field-input"
-                      value={pxpipeModels()}
-                      onInput={(e) => setPxpipeModels(e.currentTarget.value)}
-                      placeholder={DEFAULT_PXPIPE_MODELS}
-                    />
-                    <span class="field-hint">
-                      逗号或空格分隔。pxpipe 默认已有 claude-fable-5、gpt-5.6，这里用于追加
-                      gpt-5.5 等模型。
-                    </span>
-                  </label>
-                  <span class="field-label">pxpipe 服务</span>
-                  <span class="field-hint">
-                    {pxpipeStatus()?.message ?? "当前没有状态。pxpipe 会在下一次 agent 请求时启动。"}
-                  </span>
-                  <Show when={pxpipeStatus()?.instances.length}>
-                    <span class="field-hint">
-                      {pxpipeStatus()!
-                        .instances.map((p) => `${p.url} · PID ${p.pid} · ${p.message}`)
-                        .join("；")}
-                    </span>
-                    <span class="field-hint">
-                      {pxpipeStatus()!
-                        .instances.map(
-                          (p) =>
-                            `OpenAI ${p.openaiUpstream} · Anthropic ${p.anthropicUpstream} · 代理 ${p.proxy}`,
-                        )
-                        .join("；")}
-                    </span>
-                    <span class="field-hint">
-                      {pxpipeStatus()!
-                        .instances.map((p) => `生效模型 ${p.models}`)
-                        .join("；")}
-                    </span>
-                  </Show>
-                  <div class="inline-actions">
-                    <button
-                      class="link-btn"
-                      disabled={pxpipeBusy()}
-                      onClick={() => void refreshPxpipeStatus()}
-                    >
-                      {pxpipeBusy() ? "处理中…" : "刷新状态"}
-                    </button>
-                    <button
-                      class="link-btn"
-                      disabled={pxpipeBusy()}
-                      onClick={() => void restartPxpipe()}
-                    >
-                      重启 pxpipe
-                    </button>
-                  </div>
-                  <Show when={pxpipeMsg()}>
-                    <span class="field-hint">{pxpipeMsg()}</span>
-                  </Show>
-                </div>
-              </Show>
-
             </section>
 
             <section class="settings-group">

@@ -11,7 +11,6 @@ mod mind;
 mod model_cache;
 mod notice;
 mod path_env;
-mod pxpipe;
 mod quota;
 mod relay;
 mod remote;
@@ -1203,18 +1202,6 @@ async fn check_update(app: tauri::AppHandle) -> Result<Value, String> {
     updater::check(&app).await
 }
 
-/// 查看当前由 Nova 托管的 pxpipe 服务状态。
-#[tauri::command]
-fn get_pxpipe_service_status(settings: Settings) -> Result<Value, String> {
-    serde_json::to_value(pxpipe::service_status(&settings)).map_err(|e| e.to_string())
-}
-
-/// 重启当前 pxpipe 服务；若尚未启动，则按当前设置启动一个实例。
-#[tauri::command]
-fn restart_pxpipe_service(settings: Settings) -> Result<Value, String> {
-    serde_json::to_value(pxpipe::restart_service(&settings)?).map_err(|e| e.to_string())
-}
-
 /// 静默下载并暂存更新（进度走 update:progress 事件），不替换、不重启。
 /// 已暂存同版本则直接返回 ready，避免重复下载。
 #[tauri::command]
@@ -2260,47 +2247,32 @@ async fn set_settings(
         restart_relay,
         notify_peer_models,
         recheck_availability,
-        pxpipe_changed,
     ) = {
         let mut s = state.settings.lock().unwrap();
-        let pxpipe_changed = s.pxpipe_experimental != settings.pxpipe_experimental
-            || s.pxpipe_models != settings.pxpipe_models
-            || s.devin_proxy != settings.devin_proxy
-            || s.codebuddy_proxy != settings.codebuddy_proxy
-            || s.claudecode_proxy != settings.claudecode_proxy
-            || s.cursor_proxy != settings.cursor_proxy
-            || s.opencode_proxy != settings.opencode_proxy
-            || s.codex_proxy != settings.codex_proxy;
         let restart_devin = s.devin_path != settings.devin_path
             || s.acp_args != settings.acp_args
             || s.devin_proxy != settings.devin_proxy
-            || s.devin_enabled != settings.devin_enabled
-            || pxpipe_changed;
+            || s.devin_enabled != settings.devin_enabled;
         let restart_codebuddy = s.codebuddy_path != settings.codebuddy_path
             || s.codebuddy_args != settings.codebuddy_args
             || s.codebuddy_proxy != settings.codebuddy_proxy
-            || s.codebuddy_enabled != settings.codebuddy_enabled
-            || pxpipe_changed;
+            || s.codebuddy_enabled != settings.codebuddy_enabled;
         let restart_claudecode = s.claudecode_path != settings.claudecode_path
             || s.claudecode_args != settings.claudecode_args
             || s.claudecode_proxy != settings.claudecode_proxy
-            || s.claudecode_enabled != settings.claudecode_enabled
-            || pxpipe_changed;
+            || s.claudecode_enabled != settings.claudecode_enabled;
         let restart_cursor = s.cursor_path != settings.cursor_path
             || s.cursor_args != settings.cursor_args
             || s.cursor_proxy != settings.cursor_proxy
-            || s.cursor_enabled != settings.cursor_enabled
-            || pxpipe_changed;
+            || s.cursor_enabled != settings.cursor_enabled;
         let restart_opencode = s.opencode_path != settings.opencode_path
             || s.opencode_args != settings.opencode_args
             || s.opencode_proxy != settings.opencode_proxy
-            || s.opencode_enabled != settings.opencode_enabled
-            || pxpipe_changed;
+            || s.opencode_enabled != settings.opencode_enabled;
         let restart_codex = s.codex_path != settings.codex_path
             || s.codex_args != settings.codex_args
             || s.codex_proxy != settings.codex_proxy
-            || s.codex_enabled != settings.codex_enabled
-            || pxpipe_changed;
+            || s.codex_enabled != settings.codex_enabled;
         let notify_peer_models = s.quota_shared_models != settings.quota_shared_models;
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
@@ -2325,16 +2297,8 @@ async fn set_settings(
             restart_relay,
             notify_peer_models,
             recheck_availability,
-            pxpipe_changed,
         )
     };
-    if pxpipe_changed {
-        pxpipe::shutdown();
-        let settings = state.settings.lock().unwrap().clone();
-        if settings.pxpipe_experimental {
-            pxpipe::restart_service(&settings)?;
-        }
-    }
     if restart_devin {
         // 杀掉当前进程，下次发消息时用新配置重启（历史会话靠 session/load 恢复）
         state.acp.kill_conn().await;
@@ -3648,8 +3612,6 @@ pub fn run() {
             get_quota,
             get_model_costs,
             check_update,
-            get_pxpipe_service_status,
-            restart_pxpipe_service,
             download_staged_update,
             apply_staged_update,
             report_activity,

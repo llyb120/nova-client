@@ -16,7 +16,6 @@ import type {
   Partner,
   Peer,
   ProjectEntry,
-  PxpipeServiceStatus,
   PromptImage,
   Quota,
   RelayStatus,
@@ -44,10 +43,6 @@ export const api = {
   getQuota: () => invoke<Quota>("get_quota"),
   getModelCosts: () => invoke<Record<string, ModelCost>>("get_model_costs"),
   checkUpdate: () => invoke<UpdateInfo>("check_update"),
-  getPxpipeServiceStatus: (settings: Settings) =>
-    invoke<PxpipeServiceStatus>("get_pxpipe_service_status", { settings }),
-  restartPxpipeService: (settings: Settings) =>
-    invoke<PxpipeServiceStatus>("restart_pxpipe_service", { settings }),
   downloadStagedUpdate: () =>
     invoke<{ ready: boolean; hasUpdate?: boolean; version?: string }>("download_staged_update"),
   applyStagedUpdate: () => invoke<void>("apply_staged_update"),

@@ -548,8 +548,6 @@ impl CodexManager {
             .collect();
         #[cfg(windows)]
         apply_windows_sandbox_fallback(&mut args);
-        let pxpipe_url =
-            crate::pxpipe::prepare_codex_pxpipe(&mut args, settings, &settings.codex_proxy)?;
         #[cfg(windows)]
         let mut cmd = {
             if let Some(binary) = resolve_codex_native_binary(&settings.codex_path) {
@@ -586,7 +584,6 @@ impl CodexManager {
             .kill_on_drop(true);
         crate::acp::apply_proxy_env(&mut cmd, &settings.codex_proxy);
         cmd.envs(&self.launch_env);
-        crate::pxpipe::apply_codex_pxpipe_env(&mut cmd, pxpipe_url.as_deref());
         // Windows 下继承 Nova 在启动时建立的隐藏控制台。这里不能使用 CREATE_NO_WINDOW，
         // 否则 Codex 本身没有控制台，其后续启动 PowerShell 时会重新创建可见 conhost。
         #[cfg(unix)]
