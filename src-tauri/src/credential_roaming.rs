@@ -335,11 +335,31 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
     let as_string = |path: PathBuf| path.to_string_lossy().to_string();
     match kind {
         AgentKind::Devin => {
-            let appdata = root.join("appdata");
-            let local = root.join("localappdata");
-            std::fs::create_dir_all(&local).map_err(|e| e.to_string())?;
-            env.insert("APPDATA".into(), as_string(appdata));
-            env.insert("LOCALAPPDATA".into(), as_string(local));
+            #[cfg(windows)]
+            {
+                // Devin 通过 USERPROFILE 解析凭据目录，仅覆盖 APPDATA/LOCALAPPDATA 不会生效。
+                let profile = root.join("profile");
+                let appdata = profile.join("AppData").join("Roaming");
+                let local = profile.join("AppData").join("Local");
+                let staged = root.join("appdata").join("devin").join("credentials.toml");
+                let credentials_dir = appdata.join("devin");
+                let credentials = credentials_dir.join("credentials.toml");
+                std::fs::create_dir_all(&credentials_dir).map_err(|e| e.to_string())?;
+                std::fs::create_dir_all(&local).map_err(|e| e.to_string())?;
+                std::fs::rename(&staged, &credentials)
+                    .map_err(|e| format!("准备 Devin 隔离凭据失败：{e}"))?;
+                env.insert("USERPROFILE".into(), as_string(profile));
+                env.insert("APPDATA".into(), as_string(appdata));
+                env.insert("LOCALAPPDATA".into(), as_string(local));
+            }
+            #[cfg(not(windows))]
+            {
+                let appdata = root.join("appdata");
+                let local = root.join("localappdata");
+                std::fs::create_dir_all(&local).map_err(|e| e.to_string())?;
+                env.insert("APPDATA".into(), as_string(appdata));
+                env.insert("LOCALAPPDATA".into(), as_string(local));
+            }
         }
         AgentKind::Codex => {
             env.insert("CODEX_HOME".into(), as_string(root.join("codex-home")));
@@ -531,5 +551,40 @@ mod tests {
             env.get("APPDATA"),
             Some(&root.join("appdata").to_string_lossy().to_string())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn devin_launch_env_uses_isolated_user_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-devin-launch-env-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let staged = root.join("appdata").join("devin").join("credentials.toml");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"secret").unwrap();
+
+        let env = launch_env(&AgentKind::Devin, &root).unwrap();
+        let profile = root.join("profile");
+        let appdata = profile.join("AppData").join("Roaming");
+        let local = profile.join("AppData").join("Local");
+        let credentials = appdata.join("devin").join("credentials.toml");
+
+        assert_eq!(
+            env.get("USERPROFILE"),
+            Some(&profile.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            env.get("APPDATA"),
+            Some(&appdata.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            env.get("LOCALAPPDATA"),
+            Some(&local.to_string_lossy().to_string())
+        );
+        assert_eq!(std::fs::read(credentials).unwrap(), b"secret");
+        assert!(!staged.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

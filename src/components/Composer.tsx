@@ -1,4 +1,5 @@
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, Show } from "solid-js";
+import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
   cancelTurn,
   enabledAgentKinds,
@@ -168,10 +169,22 @@ export function Composer() {
       ?.scrollIntoView({ block: "nearest" });
   });
 
-  createEffect(() => {
-    void state.currentId;
-    setHistoryOpen(false);
-  });
+  createEffect(
+    on(
+      () => state.currentId,
+      (currentId, previousId) => {
+        if (previousId === undefined || currentId === previousId) return;
+        rememberPromptDraft(text(), attach.images());
+        setText("");
+        setCursor(0);
+        setSlashStart(null);
+        setHistoryOpen(false);
+        attach.clear();
+      },
+    ),
+  );
+
+  onCleanup(() => rememberPromptDraft(text(), attach.images()));
 
   // 运行中也可发送：消息会注入当前轮次实时引导 agent
   const submit = () => {
@@ -225,6 +238,23 @@ export function Composer() {
     });
   };
 
+  const restoreDraft = () => {
+    const draft = takePromptDraft();
+    if (!draft) return false;
+    const nextCursor = draft.text.length;
+    setText(draft.text);
+    attach.set(draft.images);
+    setHistoryOpen(false);
+    setSlashStart(null);
+    setCursor(nextCursor);
+    queueMicrotask(() => {
+      textareaRef?.focus();
+      textareaRef?.setSelectionRange(nextCursor, nextCursor);
+      resizeInput();
+    });
+    return true;
+  };
+
   const onKeyDown = (e: KeyboardEvent) => {
     const suggestions = slashSuggestions();
     const history = promptHistory();
@@ -270,6 +300,10 @@ export function Composer() {
     if (e.key === "Escape" && slashQuery() !== null) {
       e.preventDefault();
       setSlashStart(null);
+      return;
+    }
+    if (e.key === "ArrowDown" && empty() && restoreDraft()) {
+      e.preventDefault();
       return;
     }
     if (e.key === "ArrowUp" && empty() && history.length > 0) {

@@ -40,6 +40,13 @@ const AUX_KEY: &str = "__aux__";
 const OPENCODE_BASE_MODEL_META: &str = "nova.ai/opencodeBaseModel";
 const OPENCODE_VARIANT_META: &str = "nova.ai/opencodeVariant";
 
+#[cfg(windows)]
+const CURSOR_WINDOWS_HIDE_PATCH: &str = include_str!("../cursor-windows-hide.cjs");
+
+#[cfg(windows)]
+static CURSOR_WINDOWS_HIDE_PATCH_PATH: std::sync::OnceLock<Result<PathBuf, String>> =
+    std::sync::OnceLock::new();
+
 pub struct PendingPermission {
     pub rpc_id: Value,
     pub session_id: String,
@@ -52,6 +59,14 @@ struct Route {
     thread_id: String,
     applied_model: Option<String>,
     applied_mode: Option<String>,
+}
+
+fn connection_scoped_model_session_changed(
+    kind: &AgentKind,
+    active_sid: Option<&str>,
+    sid: &str,
+) -> bool {
+    kind == &AgentKind::OpenCode && active_sid != Some(sid)
 }
 
 struct TitleJob {
@@ -356,13 +371,13 @@ pub struct AcpManager {
     /// 串行化同一线程上的 session 建立操作
     thread_locks: StdMutex<HashMap<String, Arc<TokioMutex<()>>>>,
     /// 连接级串行闸门（按 conn_key 分裂）：CodeBuddy 的 ACP server 无法在单条 stdio 连接上并发
-    /// 处理请求（并发 prompt 会把响应串台、prompt 运行中并发 session/new 会卡死整轮），故对
-    /// 「同一条连接」上的会话级操作用同一把闸门排队；不同连接（不同 thread）各有各的闸门、可并行。
-    /// Devin 支持多路复用，返回 None、不进闸门。
+    /// 处理请求（并发 prompt 会把响应串台、prompt 运行中并发 session/new 会卡死整轮）；OpenCode
+    /// 的模型选择则实际落在共享连接上，不串行会让不同 session 的模型互相覆盖。故对这两类后端的
+    /// 「同一条连接」会话级操作用同一把闸门排队；不同连接（不同 thread）仍可并行。
+    /// Devin 等支持多路复用，返回 None、不进闸门。
     serial_gates: StdMutex<HashMap<String, Arc<TokioMutex<()>>>>,
-    /// CodeBuddy 每条连接「同一时刻只有一个活跃 session」：任何 session/new 都会把新建的设为
-    /// 活跃、其余全部失活（失活的 session 再 prompt 会 end_turn 且零内容）。这里按 conn_key 记录
-    /// 各连接当前活跃的 sessionId，prompt 前若目标不是活跃会话就先 session/load 重新激活。仅 CodeBuddy 用。
+    /// CodeBuddy：记录每条连接当前活跃的 sessionId，prompt 前按需 session/load 重新激活。
+    /// OpenCode：记录共享连接上最近应用模型的 sessionId，切换 session 时强制重下发线程模型。
     active_session: StdMutex<HashMap<String, String>>,
     /// devin 返回的可用模型/模式（来自 session/new 响应）
     model_options: StdMutex<Option<Value>>,
@@ -1312,11 +1327,14 @@ impl AcpManager {
             .clone()
     }
 
-    /// 取连接级串行闸门（按 conn_key）：CodeBuddy / Cursor 返回该连接对应的 Some(guard)
+    /// 取连接级串行闸门（按 conn_key）：CodeBuddy / Cursor / OpenCode 返回该连接对应的 Some(guard)
     /// （持有期间独占这条连接），其它 agent 返回 None（不串行、保持多路复用）。
     /// 不同 conn_key 各有各的闸门，因此不同线程（各自独占一条连接）之间互不阻塞，可真正并行。
     async fn serial_gate(&self, conn_key: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor) {
+        if matches!(
+            self.kind,
+            AgentKind::CodeBuddy | AgentKind::Cursor | AgentKind::OpenCode
+        ) {
             let gate = self
                 .serial_gates
                 .lock()
@@ -1330,14 +1348,35 @@ impl AcpManager {
         }
     }
 
-    /// 记录某条连接「刚刚被设为活跃」的 session（session/new 或 session/load 之后调用）。
-    /// 仅 CodeBuddy 维护此状态；其它 agent 无单活跃限制，无需记录。
+    /// 记录某条连接刚刚激活的 session（session/new 或 session/load 之后调用）。
+    /// CodeBuddy 用它恢复单活跃会话；OpenCode 用它识别共享连接上的模型作用域切换。
     fn mark_active_session(&self, conn_key: &str, sid: &str) {
-        if self.kind == AgentKind::CodeBuddy {
+        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::OpenCode) {
             self.active_session
                 .lock()
                 .unwrap()
                 .insert(conn_key.to_string(), sid.to_string());
+        }
+    }
+
+    fn activate_model_session(&self, conn_key: &str, sid: &str) {
+        let switched = {
+            let mut active_sessions = self.active_session.lock().unwrap();
+            if !connection_scoped_model_session_changed(
+                &self.kind,
+                active_sessions.get(conn_key).map(String::as_str),
+                sid,
+            ) {
+                false
+            } else {
+                active_sessions.insert(conn_key.to_string(), sid.to_string());
+                true
+            }
+        };
+        if switched {
+            if let Some(route) = self.routes.lock().unwrap().get_mut(sid) {
+                route.applied_model = None;
+            }
         }
     }
 
@@ -1559,6 +1598,11 @@ impl AcpManager {
         // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 不覆盖）
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
         cmd.envs(&self.launch_env);
+        #[cfg(windows)]
+        if self.kind == AgentKind::Cursor {
+            // Cursor 的 shell runner 未设置 windowsHide；仅对它的 Node 进程预加载默认值补丁。
+            apply_cursor_windows_hide_patch(&self.app, &mut cmd, &self.launch_env)?;
+        }
 
         // 把 ~/.nova/skills 用软链接/目录联接同步到各后端全局 skills 目录
         crate::skills::sync_skills_from_home();
@@ -2775,8 +2819,8 @@ impl AcpManager {
                 return;
             }
         }
-        // 这里只有非 CodeBuddy 会走到（CodeBuddy 已在函数开头返回）。serial_gate 对 Devin 返回
-        // None，不串行；保留调用是为了与其它会话级操作一致，未来若放开 CodeBuddy 预热也安全。
+        // 这里只有非 CodeBuddy / Cursor 会走到。OpenCode 预热仍需与用户轮次共用连接闸门，
+        // 避免 session/new 与模型切换或 prompt 重叠；Devin 等返回 None、保持多路复用。
         let _gate = self.serial_gate(SHARED_KEY).await;
         {
             let warmed = self.prewarmed.lock().unwrap();
@@ -2966,7 +3010,8 @@ impl AcpManager {
 
         // CodeBuddy：prompt 前确保本会话仍是其连接的活跃会话（期间可能被别的 session/new 挤下）
         self.ensure_active_session(&conn, &key, &sid, &cwd).await?;
-        self.apply_session_config(&conn, &sid, model, mode).await;
+        self.apply_session_config(&conn, &key, &sid, model, mode)
+            .await;
         Ok(sid)
     }
 
@@ -2994,10 +3039,12 @@ impl AcpManager {
     async fn apply_session_config(
         &self,
         conn: &Arc<AcpConn>,
+        conn_key: &str,
         sid: &str,
         model: Option<String>,
         mode: Option<String>,
     ) {
+        self.activate_model_session(conn_key, sid);
         let (mut need_model, mut need_mode) = {
             let routes = self.routes.lock().unwrap();
             let Some(r) = routes.get(sid) else { return };
@@ -3196,7 +3243,8 @@ impl AcpManager {
             .ok_or("session/new 未返回 sessionId")?
             .to_string();
         self.note_session_spawned(&aux);
-        // 标题会话占用的是 AUX 连接的活跃位，记录之（与用户线程连接互不影响）
+        // CodeBuddy 标题会话占用独立 AUX 活跃位；OpenCode 与用户会话共用 SHARED，
+        // 记录后可让下一轮用户 prompt 重新下发其线程模型。
         self.mark_active_session(&aux, &sid);
         // 标题用轻量模型生成：model 由上层按「标题后端」解析好后传入（已保证是本后端的模型 id），
         // 非空即下发；空则用本后端会话默认模型。
@@ -3319,14 +3367,15 @@ impl AcpManager {
                 return;
             }
         }
-        // CodeBuddy：set_config_option/set_mode 也不能与该线程正在跑的 prompt 重叠，用同一把
-        // 连接闸门排队（不同线程连接各自的闸门，互不阻塞）。
+        // CodeBuddy / OpenCode：配置切换不能与同连接正在跑的 prompt 重叠，用同一把连接闸门排队。
+        // CodeBuddy 不同线程连接各自独立；OpenCode 所有线程共用 SHARED，借此避免模型串台。
         let key = self.conn_key_for_thread(thread_id);
         let _gate = self.serial_gate(&key).await;
         let Some(conn) = self.conn_for_key(&key).await else {
             return;
         };
-        self.apply_session_config(&conn, &sid, model, mode).await;
+        self.apply_session_config(&conn, &key, &sid, model, mode)
+            .await;
     }
 
     async fn new_session_for(
@@ -3420,7 +3469,7 @@ impl AcpManager {
             },
         );
         self.note_session_spawned(conn_key);
-        // session/new 会把新会话设为该连接的活跃会话（CodeBuddy）
+        // CodeBuddy 记录单活跃会话；OpenCode 记录共享连接最近影响模型作用域的会话。
         self.mark_active_session(conn_key, &sid);
         Ok(sid)
     }
@@ -3501,8 +3550,8 @@ impl AcpManager {
 
         // CodeBuddy / Cursor：整轮独占「本线程自己的连接」，避免同一连接上的会话级操作重叠
         // 导致响应串台或卡死；也避免「停止后立刻重发」时旧轮次收尾误清新轮次的 running。
-        // 不同线程各自独占一条连接、各自的闸门，因此多线程真正并行。Devin 等返回 None、
-        // 不串行，保持多路复用。闸门在本函数作用域内持有，结束自动释放。
+        // OpenCode：整轮独占共享连接，避免另一 session 在本轮中途切换连接级模型。Devin 等返回
+        // None、不串行，保持多路复用。闸门在本函数作用域内持有，结束自动释放。
         let conn_key = self.conn_key_for_thread(&thread_id);
         let _gate = self.serial_gate(&conn_key).await;
 
@@ -4304,6 +4353,69 @@ pub(crate) fn resolve_program_on_path(name: &str) -> Option<std::path::PathBuf> 
             p.is_file().then_some(p)
         })
     })
+}
+
+#[cfg(windows)]
+fn cursor_windows_hide_patch_path(app: &AppHandle) -> Result<PathBuf, String> {
+    CURSOR_WINDOWS_HIDE_PATCH_PATH
+        .get_or_init(|| {
+            let dir = nova_data_dir(app).join("runtime");
+            std::fs::create_dir_all(&dir).map_err(|e| format!("创建 Cursor 运行目录失败：{e}"))?;
+            let path = dir.join("cursor-windows-hide.cjs");
+            let current = std::fs::read_to_string(&path).ok();
+            if current.as_deref() != Some(CURSOR_WINDOWS_HIDE_PATCH) {
+                std::fs::write(&path, CURSOR_WINDOWS_HIDE_PATCH)
+                    .map_err(|e| format!("写入 Cursor 无闪屏补丁失败：{e}"))?;
+            }
+            Ok(path)
+        })
+        .clone()
+}
+
+#[cfg(windows)]
+fn cursor_windows_hide_node_options(existing: Option<&str>, patch: &Path) -> String {
+    let patch = patch
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('"', "\\\"");
+    let require = format!("--require \"{patch}\"");
+    match existing.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(existing) => format!("{existing} {require}"),
+        None => require,
+    }
+}
+
+#[cfg(windows)]
+fn apply_cursor_windows_hide_patch(
+    app: &AppHandle,
+    cmd: &mut tokio::process::Command,
+    launch_env: &HashMap<String, String>,
+) -> Result<(), String> {
+    let patch = cursor_windows_hide_patch_path(app)?;
+    let existing = launch_env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("NODE_OPTIONS"))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("NODE_OPTIONS").ok());
+    cmd.env(
+        "NODE_OPTIONS",
+        cursor_windows_hide_node_options(existing.as_deref(), &patch),
+    );
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod cursor_windows_hide_tests {
+    use super::*;
+
+    #[test]
+    fn node_options_preserve_existing_flags_and_quote_patch_path() {
+        let patch = Path::new(r"C:\Nova Data\cursor-windows-hide.cjs");
+        assert_eq!(
+            cursor_windows_hide_node_options(Some("--trace-warnings"), patch),
+            r#"--trace-warnings --require "C:/Nova Data/cursor-windows-hide.cjs""#
+        );
+    }
 }
 
 fn cursor_node_path_for_program(program: &str) -> Option<PathBuf> {
@@ -5247,6 +5359,27 @@ fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>
 #[cfg(test)]
 mod opencode_models_tests {
     use super::*;
+
+    #[test]
+    fn switching_opencode_sessions_requires_model_reapply() {
+        let gpt_sid = "gpt-session";
+        let ds_sid = "ds-session";
+        assert!(connection_scoped_model_session_changed(
+            &AgentKind::OpenCode,
+            Some(gpt_sid),
+            ds_sid,
+        ));
+        assert!(!connection_scoped_model_session_changed(
+            &AgentKind::OpenCode,
+            Some(ds_sid),
+            ds_sid,
+        ));
+        assert!(!connection_scoped_model_session_changed(
+            &AgentKind::Devin,
+            Some(gpt_sid),
+            ds_sid,
+        ));
+    }
 
     #[test]
     fn expands_effort_variants_into_selectable_model_ids() {

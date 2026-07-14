@@ -1,6 +1,7 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
+import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
   createRoamingThread,
   createQuotaThread,
@@ -70,6 +71,7 @@ export function HomeView() {
   let modeTouched = false;
   let lastPrewarmKey = "";
   let scratchLoading = false;
+  let submittingPrompt = false;
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   type PrewarmTarget = {
@@ -334,6 +336,9 @@ export function HomeView() {
   onMount(ensureScratchProject);
   // 每次进入新会话页都强制校准在线队友的共享模型，避免沿用旧 peerModels 缓存。
   onMount(() => preloadPeerModels(true));
+  onCleanup(() => {
+    if (!submittingPrompt) rememberPromptDraft(text(), attach.images());
+  });
 
   createEffect(() => {
     if (state.currentId === null) ensureScratchProject();
@@ -376,6 +381,7 @@ export function HomeView() {
     const branch = opts.branch?.trim() ?? "";
     const base = wtOn ? opts.base?.trim() ?? "" : "";
     if (wtOn && !branch && !base) return; // 新分支名与基于分支至少填一个（留空分支名 = 直接用所选分支）
+    submittingPrompt = true;
     setBusy(true);
     try {
       if (target) {
@@ -419,7 +425,9 @@ export function HomeView() {
       setQuotaPeer(null);
       attach.clear();
       if (textareaRef) textareaRef.style.height = "auto";
+      submittingPrompt = false;
     } catch (error) {
+      submittingPrompt = false;
       await message(String(error), { kind: "error" });
     } finally {
       clearQuotaRoamingProgress();
@@ -519,6 +527,22 @@ export function HomeView() {
     });
   };
 
+  const restoreDraft = () => {
+    const draft = takePromptDraft();
+    if (!draft) return false;
+    const nextCursor = draft.text.length;
+    setText(draft.text);
+    attach.set(draft.images);
+    setSlashStart(null);
+    setCursor(nextCursor);
+    queueMicrotask(() => {
+      textareaRef?.focus();
+      textareaRef?.setSelectionRange(nextCursor, nextCursor);
+      resizeInput();
+    });
+    return true;
+  };
+
   const onKeyDown = (e: KeyboardEvent) => {
     const suggestions = slashSuggestions();
     if (slashQuery() !== null && suggestions.length > 0) {
@@ -544,6 +568,15 @@ export function HomeView() {
     if (e.key === "Escape" && slashQuery() !== null) {
       e.preventDefault();
       setSlashStart(null);
+      return;
+    }
+    if (
+      e.key === "ArrowDown" &&
+      !text().trim() &&
+      attach.images().length === 0 &&
+      restoreDraft()
+    ) {
+      e.preventDefault();
       return;
     }
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
