@@ -851,4 +851,12 @@ mod tests {
         assert!(!cursor_args.contains("-WindowStyle Hidden"));
         assert!(!devin_args.contains("-WindowStyle Hidden"));
     }
+
+    #[test]
+    fn cursor_installer_program_with_extension_resolves_from_path() {
+        let cursor = spec_for(&AgentKind::Cursor, &Settings::default());
+
+        assert_eq!(cursor.install_program, "powershell.exe");
+        assert!(resolve_program_on_path(&cursor.install_program).is_some());
+    }
 }

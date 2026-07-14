@@ -2,7 +2,8 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import { compactThread, chatScrollToBottomSignal, setState, state } from "../store";
-import type { Item } from "../types";
+import { firstWakeDoPairForThread } from "../threadDisplay";
+import type { Item, Thread } from "../types";
 import { agentLabel } from "../utils";
 import { Composer } from "./Composer";
 import { IconBroadcast, IconCompress, IconDownload, IconShare } from "./icons";
@@ -107,6 +108,24 @@ function VirtualGroup(props: {
   );
 }
 
+interface TranscriptSegmentProps {
+  stage: "Wake" | "Do";
+  agentKind: Thread["agentKind"];
+  model?: string | null;
+}
+
+function TranscriptSegment(props: TranscriptSegmentProps) {
+  return (
+    <div class="transcript-segment">
+      <span class={`agent-badge ${props.agentKind}`}>{props.stage}</span>
+      <span class="transcript-segment-agent">{agentLabel(props.agentKind)}</span>
+      <span class="transcript-segment-model" title={props.model || "默认模型"}>
+        {props.model || "默认模型"}
+      </span>
+    </div>
+  );
+}
+
 export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
@@ -127,6 +146,33 @@ export function ChatView() {
 
   const groups = createMemo<ReturnType<typeof groupItems>>(
     (prev) => groupItems(state.items as Item[], prev),
+    [],
+  );
+  const mergedPair = createMemo(() => firstWakeDoPairForThread(state.threads, state.currentId));
+  const [mergedWake, setMergedWake] = createSignal<Thread | null>(null);
+  let wakeLoad = 0;
+  createEffect(() => {
+    const pair = mergedPair();
+    const wakeId = pair?.doThread?.id === state.currentId ? pair.wake.id : null;
+    if (!wakeId) {
+      wakeLoad++;
+      setMergedWake(null);
+      return;
+    }
+    if (mergedWake()?.id === wakeId) return;
+    const load = ++wakeLoad;
+    void api
+      .getThread(wakeId)
+      .then((thread) => {
+        if (load === wakeLoad) setMergedWake(thread);
+      })
+      .catch(() => {
+        if (load === wakeLoad) setMergedWake(null);
+      });
+  });
+  onCleanup(() => wakeLoad++);
+  const wakeGroups = createMemo<ReturnType<typeof groupItems>>(
+    (prev) => groupItems((mergedWake()?.items ?? []) as Item[], prev),
     [],
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
@@ -247,7 +293,7 @@ export function ChatView() {
 
   // 会话累计 token 用量
   const totalTokens = createMemo(() =>
-    state.items.reduce(
+    [...(mergedWake()?.items ?? []), ...state.items].reduce(
       (sum, it) => (it.type === "turn" && it.totalTokens ? sum + it.totalTokens : sum),
       0,
     ),
@@ -492,13 +538,43 @@ export function ChatView() {
         onPointerCancel={finishManualScroll}
       >
         <div class="transcript-inner" ref={innerRef}>
-          <Show when={state.items.length === 0 && !state.loadingThread}>
+          <Show when={state.items.length === 0 && !mergedWake() && !state.loadingThread}>
             <div class="transcript-hint">
               在下方输入任务，{agentLabel(state.agentKind)} 将在{" "}
               <code>{cwdDisplay()}</code> 中工作。
             </div>
           </Show>
           <Show keyed when={state.currentId}>
+            <Show when={mergedWake()}>
+              {(wake) => (
+                <>
+                  <TranscriptSegment
+                    stage="Wake"
+                    agentKind={wake().agentKind}
+                    model={wake().model}
+                  />
+                  <For each={wakeGroups()}>
+                    {(g) => (
+                      <VirtualGroup
+                        group={g}
+                        active={false}
+                        scrollEl={() => scrollRef}
+                        viewportTick={viewportTick()}
+                      />
+                    )}
+                  </For>
+                </>
+              )}
+            </Show>
+            <Show when={mergedPair()}>
+              {(pair) => (
+                <TranscriptSegment
+                  stage={pair().doThread?.id === state.currentId ? "Do" : "Wake"}
+                  agentKind={state.agentKind}
+                  model={state.model}
+                />
+              )}
+            </Show>
             <For each={groups()}>
               {(g, i) => (
                 <VirtualGroup

@@ -18,7 +18,14 @@ import {
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker } from "./ConfigSelects";
 import { IconX } from "./icons";
-import type { AgentKind, CliStatus, Settings, SkillInfo, WorktreeRecord } from "../types";
+import type {
+  AgentInstructionTarget,
+  AgentKind,
+  CliStatus,
+  Settings,
+  SkillInfo,
+  WorktreeRecord,
+} from "../types";
 
 function threadGroupName(cwd: string): string {
   if (isScratch(cwd)) return "临时会话";
@@ -99,6 +106,7 @@ function CliManager(props: {
 type SettingsTab =
   | "general"
   | "backends"
+  | "instructions"
   | "appearance"
   | "team"
   | "memory"
@@ -109,6 +117,7 @@ type SettingsTab =
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
   { id: "backends", name: "模型后端" },
+  { id: "instructions", name: "Agent 配置" },
   { id: "appearance", name: "外观" },
   { id: "team", name: "团队" },
   { id: "memory", name: "记忆检索" },
@@ -165,6 +174,17 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [relayGroups, setRelayGroups] = createSignal(s?.relayGroups ?? "");
   const [relayName, setRelayName] = createSignal(s?.relayName ?? "");
   const [quotaSharedModels, setQuotaSharedModels] = createSignal<string[]>(s?.quotaSharedModels ?? []);
+  const [roamingFolders, setRoamingFolders] = createSignal<string[]>(state.roamingFolders);
+  const [roamingFoldersLoading, setRoamingFoldersLoading] = createSignal(false);
+  const [globalInstructions, setGlobalInstructions] = createSignal("");
+  const [globalInstructionsPath, setGlobalInstructionsPath] = createSignal("");
+  const [globalInstructionTargets, setGlobalInstructionTargets] = createSignal<
+    AgentInstructionTarget[]
+  >([]);
+  const [globalInstructionsLoading, setGlobalInstructionsLoading] = createSignal(false);
+  const [globalInstructionsBusy, setGlobalInstructionsBusy] = createSignal(false);
+  const [globalInstructionsDirty, setGlobalInstructionsDirty] = createSignal(false);
+  const [globalInstructionsMsg, setGlobalInstructionsMsg] = createSignal("");
   const [verifying, setVerifying] = createSignal(false);
   const [verifyMsg, setVerifyMsg] = createSignal("");
   const [showLogs, setShowLogs] = createSignal(false);
@@ -220,6 +240,81 @@ export function SettingsModal(props: { onClose: () => void }) {
       if (current.includes(key)) return current;
       return [...current, key];
     });
+  };
+
+  let roamingFoldersLoaded = false;
+  const loadRoamingFolders = async () => {
+    if (roamingFoldersLoaded || roamingFoldersLoading()) return;
+    setRoamingFoldersLoading(true);
+    try {
+      const folders = await api.listRoamingFolders();
+      setRoamingFolders(folders);
+      roamingFoldersLoaded = true;
+    } finally {
+      setRoamingFoldersLoading(false);
+    }
+  };
+  const pickRoamingFolders = async () => {
+    const picked = await openDialog({
+      directory: true,
+      multiple: true,
+      title: "选择允许漫游的目录",
+    });
+    if (!picked) return;
+    const paths = Array.isArray(picked) ? picked : [picked];
+    setRoamingFolders((current) => {
+      const next = [...current];
+      const keys = new Set(current.map((path) => path.replace(/\\/g, "/").toLowerCase()));
+      for (const path of paths) {
+        const key = path.replace(/\\/g, "/").toLowerCase();
+        if (!keys.has(key)) {
+          keys.add(key);
+          next.push(path);
+        }
+      }
+      return next;
+    });
+  };
+
+  let globalInstructionsLoaded = false;
+  const loadGlobalInstructions = async () => {
+    if (globalInstructionsLoaded || globalInstructionsLoading()) return;
+    setGlobalInstructionsLoading(true);
+    setGlobalInstructionsMsg("");
+    try {
+      const config = await api.getGlobalAgentInstructions();
+      setGlobalInstructions(config.content);
+      setGlobalInstructionsPath(config.path);
+      setGlobalInstructionTargets(config.targets);
+      setGlobalInstructionsDirty(false);
+      globalInstructionsLoaded = true;
+    } catch (error) {
+      setGlobalInstructionsMsg(`加载失败：${String(error)}`);
+    } finally {
+      setGlobalInstructionsLoading(false);
+    }
+  };
+  const syncGlobalInstructions = async () => {
+    setGlobalInstructionsBusy(true);
+    setGlobalInstructionsMsg("");
+    try {
+      const config = await api.setGlobalAgentInstructions(globalInstructions());
+      setGlobalInstructions(config.content);
+      setGlobalInstructionsPath(config.path);
+      setGlobalInstructionTargets(config.targets);
+      setGlobalInstructionsDirty(false);
+      const conflicts = config.targets.filter(
+        (target) => target.status === "conflict" || target.status === "error",
+      ).length;
+      setGlobalInstructionsMsg(
+        conflicts > 0
+          ? `已同步，其余 ${conflicts} 个冲突入口未覆盖，请检查下方状态。`
+          : "已同步到所有后端；正在运行的 Agent 重启后读取新配置。",
+      );
+      return config;
+    } finally {
+      setGlobalInstructionsBusy(false);
+    }
   };
 
   // 后端可用性检测结果：false = 已检测且未找到 CLI（卡片上提示，仍可手动改路径）
@@ -348,7 +443,12 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   createEffect(() => {
     if (tab() !== "team") return;
+    void loadRoamingFolders();
     for (const kind of quotaShareKinds()) void ensureModelOptions(kind);
+  });
+
+  createEffect(() => {
+    if (tab() === "instructions") void loadGlobalInstructions();
   });
 
   // 会话批量管理
@@ -625,9 +725,19 @@ export function SettingsModal(props: { onClose: () => void }) {
     try {
       await api.setSettings(settings);
       setState("settings", settings);
+      if (roamingFoldersLoaded) {
+        const folders = await api.setRoamingFolders(roamingFolders());
+        setRoamingFolders(folders);
+        setState("roamingFolders", folders);
+      }
+      if (globalInstructionsLoaded && globalInstructionsDirty()) {
+        await syncGlobalInstructions();
+      }
       // 中转站配置可能变化，稍后刷新连接状态
       setTimeout(() => void refreshRelayStatus(), 800);
       props.onClose();
+    } catch (error) {
+      await message(String(error), { title: "保存设置失败", kind: "error" });
     } finally {
       setSaving(false);
     }
@@ -1070,6 +1180,83 @@ export function SettingsModal(props: { onClose: () => void }) {
             </div>
           </Show>
 
+          {/* ===== Agent 全局配置 ===== */}
+          <Show when={tab() === "instructions"}>
+            <div class="field">
+              <span class="field-label">集中配置</span>
+              <input
+                class="field-input"
+                value={globalInstructionsPath()}
+                readonly
+                title={globalInstructionsPath()}
+                placeholder={globalInstructionsLoading() ? "加载中…" : "~/.nova/global-agent-instructions.md"}
+              />
+              <span class="field-hint">
+                只维护这一份内容；Nova 会按每个后端的原生规则入口分别适配。已有真实配置文件会保留原内容，只更新 Nova 托管区块。
+              </span>
+            </div>
+            <label class="field">
+              <span class="field-label">全局指令</span>
+              <textarea
+                class="field-input global-agent-instructions"
+                value={globalInstructions()}
+                disabled={globalInstructionsLoading()}
+                onInput={(event) => {
+                  setGlobalInstructions(event.currentTarget.value);
+                  setGlobalInstructionsDirty(true);
+                  setGlobalInstructionsMsg("");
+                }}
+                placeholder="例如：始终使用中文；修改代码后执行聚焦测试；不要覆盖用户已有改动……"
+              />
+              <div class="global-agent-actions">
+                <button
+                  type="button"
+                  class="btn secondary"
+                  disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                  onClick={() => void syncGlobalInstructions()}
+                >
+                  {globalInstructionsBusy() ? "同步中…" : "保存并同步到所有后端"}
+                </button>
+                <Show when={globalInstructionsMsg()}>
+                  <span
+                    class={`relay-verify ${globalInstructionsMsg().includes("失败") ? "bad" : "ok"}`}
+                  >
+                    {globalInstructionsMsg()}
+                  </span>
+                </Show>
+              </div>
+              <span class="field-hint">
+                清空后同步会移除 Nova 创建的托管文件/区块，不会删除各后端原有的其它配置。正在运行的 Agent 需重启后读取新内容。
+              </span>
+            </label>
+
+            <div class="field">
+              <span class="field-label">后端适配状态</span>
+              <Show
+                when={globalInstructionTargets().length > 0}
+                fallback={<div class="sel-empty">{globalInstructionsLoading() ? "加载中…" : "暂无状态"}</div>}
+              >
+                <div class="wt-list">
+                  <For each={globalInstructionTargets()}>
+                    {(target) => (
+                      <div class="wt-row">
+                        <div class="wt-row-main">
+                          <span class={`agent-badge ${target.agentKind}`}>{target.label}</span>
+                          <span class={`agent-config-status ${target.status}`}>{target.detail}</span>
+                        </div>
+                        <div class="wt-row-sub">
+                          <span class="wt-path" title={target.path}>
+                            {target.path}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          </Show>
+
           {/* ===== 外观 ===== */}
           <Show when={tab() === "appearance"}>
             <div class="field">
@@ -1166,6 +1353,53 @@ export function SettingsModal(props: { onClose: () => void }) {
               />
               <span class="field-hint">分享、漫游时队友看到的名字。</span>
             </label>
+
+            <div class="field">
+              <span class="field-label">允许漫游的目录</span>
+              <span class="field-hint">
+                只有这里列出的本机目录会展示给队友并接受漫游请求；每次请求仍需你在本机确认。
+              </span>
+              <div class="wt-dir-row">
+                <button
+                  type="button"
+                  class="btn secondary"
+                  disabled={roamingFoldersLoading()}
+                  onClick={() => void pickRoamingFolders()}
+                >
+                  添加目录…
+                </button>
+                <span class="field-hint">
+                  {roamingFoldersLoading() ? "加载中…" : `已允许 ${roamingFolders().length} 个目录`}
+                </span>
+              </div>
+              <Show
+                when={roamingFolders().length > 0}
+                fallback={<div class="sel-empty">未开放任何目录，队友无法在本机发起漫游。</div>}
+              >
+                <div class="wt-list">
+                  <For each={roamingFolders()}>
+                    {(folder) => (
+                      <div class="wt-row">
+                        <div class="wt-row-sub">
+                          <span class="wt-path" title={folder}>
+                            {folder}
+                          </span>
+                          <button
+                            type="button"
+                            class="btn danger small"
+                            onClick={() =>
+                              setRoamingFolders((current) => current.filter((item) => item !== folder))
+                            }
+                          >
+                            移除
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
 
             <div class="field">
               <span class="field-label">共享模型额度（可多选）</span>

@@ -281,6 +281,20 @@ export interface Settings {
   embedApiKey: string;
 }
 
+export interface AgentInstructionTarget {
+  agentKind: AgentKind;
+  label: string;
+  path: string;
+  status: "inactive" | "pending" | "merged" | "managed" | "conflict" | "error";
+  detail: string;
+}
+
+export interface GlobalAgentInstructions {
+  content: string;
+  path: string;
+  targets: AgentInstructionTarget[];
+}
+
 /** 集中管理的 skill（~/.nova/skills） */
 export interface SkillInfo {
   name: string;

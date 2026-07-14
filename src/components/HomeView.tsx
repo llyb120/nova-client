@@ -669,6 +669,7 @@ export function HomeView() {
                 modelSource={usesPeerModels() ? peerModelSource : undefined}
                 sharedModels={usesPeerModels() ? undefined : quotaSharedModelSources()}
                 quotaPeerToken={quotaPeer()?.token}
+                projectCwd={cwd()}
                 onPickModel={pickModelCombined}
                 onMode={pickMode}
                 anchorTo=".home-composer"

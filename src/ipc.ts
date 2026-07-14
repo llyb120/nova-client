@@ -7,6 +7,7 @@ import type {
   Employee,
   EmployeeJournalEntry,
   EmployeeTask,
+  GlobalAgentInstructions,
   IncomingShare,
   Mark,
   MindSnapshot,
@@ -111,6 +112,10 @@ export const api = {
     invoke<void>("respond_permission", { requestKey, optionId }),
   getSettings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
+  getGlobalAgentInstructions: () =>
+    invoke<GlobalAgentInstructions>("get_global_agent_instructions"),
+  setGlobalAgentInstructions: (content: string) =>
+    invoke<GlobalAgentInstructions>("set_global_agent_instructions", { content }),
   /** 后端可用性检测结果（agentKind → 是否可用）；空 map = 尚未检测完成 */
   getBackendAvailability: () =>
     invoke<Record<string, boolean>>("get_backend_availability"),
@@ -148,6 +153,8 @@ export const api = {
   isFolderRoaming: (cwd: string) => invoke<boolean>("is_folder_roaming", { cwd }),
   setFolderRoaming: (cwd: string, allowed: boolean) =>
     invoke<boolean>("set_folder_roaming", { cwd, allowed }),
+  setRoamingFolders: (folders: string[]) =>
+    invoke<string[]>("set_roaming_folders", { folders }),
   createRoamingThread: (
     peerToken: string,
     peerName: string,

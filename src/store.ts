@@ -38,6 +38,7 @@ import type {
   UpdateOp,
   UpdateProgress,
 } from "./types";
+import { firstWakeDoPairForThread } from "./threadDisplay";
 import { isScratch } from "./utils";
 
 /** 界面皮肤：水墨夜色 / 宣纸亮色 */
@@ -261,8 +262,8 @@ export function modelChoices(
 }
 
 /** 在可选列表中解析应使用的模型。
- *  优先 preferred → 全局 lastUsed → 保留 preferred（列表不全/中间态时不落到第一项）→
- *  仅空值时取第一项非空选项（跳过 Cursor「Auto」这类 value="" 入口）。 */
+ *  优先 preferred；项目模型即使暂不在列表也必须保留，避免异步加载时被全局 lastUsed 覆盖；
+ *  仅 preferred 为空时才回退全局 lastUsed / 第一项（跳过 Cursor「Auto」这类 value="" 入口）。 */
 export function resolveAvailableModel(
   agentKind: AgentKind,
   preferred: string,
@@ -271,10 +272,10 @@ export function resolveAvailableModel(
   const choices = modelChoices(agentKind, source);
   if (choices.length === 0) return preferred;
   if (preferred && choices.some((c) => c.value === preferred)) return preferred;
+  // 有明确选择但不在当前列表：保留，避免项目模型在列表不全/中间态被全局最近模型覆盖。
+  if (preferred) return preferred;
   const previous = lastUsed.globalModel(agentKind);
   if (previous && choices.some((c) => c.value === previous)) return previous;
-  // 有明确选择但不在当前列表：保留，避免 Cursor 目录未就绪等中间态把选择重置成 Auto/第一项
-  if (preferred) return preferred;
   return choices.find((c) => c.value)?.value ?? choices[0]?.value ?? "";
 }
 
@@ -815,6 +816,8 @@ function recoverProposedPlan(thread: Thread): string | null {
 }
 
 export async function openThread(id: string) {
+  const pair = firstWakeDoPairForThread(state.threads, id);
+  if (pair?.wake.id === id && pair.doThread) id = pair.doThread.id;
   const switching = state.currentId !== id;
   if (switching) {
     discardPendingDeltas();
@@ -1461,6 +1464,11 @@ export async function initStore() {
     void refreshThreads().then(() => {
       const id = state.currentId;
       if (!id) return;
+      const pair = firstWakeDoPairForThread(state.threads, id);
+      if (pair?.wake.id === id && pair.doThread) {
+        void openThread(id);
+        return;
+      }
       const meta = state.threads.find((t) => t.id === id);
       if (meta && meta.title !== state.title) setState("title", meta.title);
     });

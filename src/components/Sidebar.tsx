@@ -1,6 +1,7 @@
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import { api } from "../ipc";
+import { firstWakeDoChild } from "../threadDisplay";
 import type { ThreadMeta, Worktree } from "../types";
 import {
   closeThread,
@@ -124,7 +125,12 @@ export function Sidebar(props: {
       : groupByCwd(state.threads.filter((t) => !t.employeeId)),
   );
 
-  type ThreadTreeRow = { thread: ThreadMeta; child: boolean; childCount: number };
+  type ThreadTreeRow = {
+    thread: ThreadMeta;
+    child: boolean;
+    childCount: number;
+    mergedChild?: ThreadMeta;
+  };
   const threadTreeRows = (threads: ThreadMeta[]): ThreadTreeRow[] => {
     const byId = new Map(threads.map((t) => [t.id, t]));
     const children = new Map<string, ThreadMeta[]>();
@@ -138,13 +144,18 @@ export function Sidebar(props: {
     const rows: ThreadTreeRow[] = [];
     const add = (t: ThreadMeta, child: boolean) => {
       const kids = children.get(t.id) ?? [];
-      rows.push({ thread: t, child, childCount: kids.length });
-      for (const kid of kids) add(kid, true);
+      const mergedChild = firstWakeDoChild(threads, t);
+      const visibleKids = mergedChild ? kids.filter((kid) => kid.id !== mergedChild.id) : kids;
+      rows.push({ thread: t, child, childCount: visibleKids.length, mergedChild });
+      for (const kid of visibleKids) add(kid, true);
     };
-    for (const t of threads) {
-      if (t.parentThreadId && byId.has(t.parentThreadId)) continue;
-      add(t, false);
-    }
+    const roots = threads.filter((t) => !t.parentThreadId || !byId.has(t.parentThreadId));
+    roots.sort((a, b) => {
+      const aUpdatedAt = Math.max(a.updatedAt, firstWakeDoChild(threads, a)?.updatedAt ?? 0);
+      const bUpdatedAt = Math.max(b.updatedAt, firstWakeDoChild(threads, b)?.updatedAt ?? 0);
+      return bUpdatedAt - aUpdatedAt;
+    });
+    for (const root of roots) add(root, false);
     return rows;
   };
 
@@ -282,74 +293,96 @@ export function Sidebar(props: {
   };
 
   // 单条会话行：用户会话与员工会话共用同一渲染。
-  const ThreadRow = (t: (typeof state.threads)[number], child = false, childCount = 0) => (
-    <div
-      class={`thread-item ${state.currentId === t.id ? "active" : ""}`}
-      classList={{ child, parent: childCount > 0 }}
-      onClick={() => void openThread(t.id)}
-      onContextMenu={(e) => {
-        // 目前只有 worktree 会话有右键动作（合并到分支）；漫游 guest 的 worktree 在对端，不提供
-        if (!t.worktree?.path) return;
-        e.preventDefault();
-        setTmenu({
-          x: Math.min(e.clientX, window.innerWidth - 200),
-          y: Math.min(e.clientY, window.innerHeight - 90),
-          id: t.id,
-          wt: t.worktree,
-          running: !!state.running[t.id],
-        });
-      }}
-    >
-      <Show when={child}>
-        <span class="thread-tree-mark" title="属于上方预检会话">
-          └
-        </span>
-      </Show>
-      <span class={`thread-agent ${t.agentKind}`} title={agentLabel(t.agentKind)}>
-        {agentShort(t.agentKind)}
-      </span>
-      <span class="thread-run-slot">
-        <Show when={state.running[t.id]}>
-          <span class="spinner small" />
-        </Show>
-      </span>
-      <TypewriterText
-        class="thread-title"
-        text={t.title}
-        title={t.title}
-        animate={state.titleTyping[t.id]}
-      />
-      <Show when={t.worktree}>
-        <span
-          class="thread-worktree"
-          title={`在 worktree 中执行 · 分支：${t.worktree!.branch}`}
-        >
-          ⎇ {t.worktree!.branch}
-        </span>
-      </Show>
-      <Show when={childCount > 0}>
-        <span class="thread-tree-badge" title={`该预检会话下有 ${childCount} 个开发子会话`}>
-          预检 · {childCount}
-        </span>
-      </Show>
-      <Show when={t.ephemeral}>
-        <span class="thread-ephemeral" title="临时会话：程序关闭时自动删除">
-          临时
-        </span>
-      </Show>
-      <span class="thread-time">{fmtTime(t.updatedAt)}</span>
-      <button
-        class="thread-delete"
-        title="删除会话"
-        onClick={(e) => {
-          e.stopPropagation();
-          void remove(t.id, t.title);
+  const ThreadRow = (
+    t: (typeof state.threads)[number],
+    child = false,
+    childCount = 0,
+    mergedChild?: ThreadMeta,
+  ) => {
+    const activeThread = mergedChild ?? t;
+    const running = () =>
+      !!state.running[t.id] || !!(mergedChild && state.running[mergedChild.id]);
+    const active = () => state.currentId === t.id || state.currentId === mergedChild?.id;
+    const title = () => mergedChild?.title ?? t.title;
+    const updatedAt = () => Math.max(t.updatedAt, mergedChild?.updatedAt ?? 0);
+    return (
+      <div
+        class={`thread-item ${active() ? "active" : ""}`}
+        classList={{ child, parent: childCount > 0 }}
+        onClick={() => void openThread(activeThread.id)}
+        onContextMenu={(e) => {
+          // 目前只有 worktree 会话有右键动作（合并到分支）；漫游 guest 的 worktree 在对端，不提供
+          if (!activeThread.worktree?.path) return;
+          e.preventDefault();
+          setTmenu({
+            x: Math.min(e.clientX, window.innerWidth - 200),
+            y: Math.min(e.clientY, window.innerHeight - 90),
+            id: activeThread.id,
+            wt: activeThread.worktree,
+            running: running(),
+          });
         }}
       >
-        <IconTrash size={13} />
-      </button>
-    </div>
-  );
+        <Show when={child}>
+          <span class="thread-tree-mark" title="属于上方预检会话">
+            └
+          </span>
+        </Show>
+        <span class={`thread-agent ${t.agentKind}`} title={`Wake · ${agentLabel(t.agentKind)}`}>
+          {agentShort(t.agentKind)}
+        </span>
+        <Show when={mergedChild}>
+          <span class="thread-pair-arrow">→</span>
+          <span
+            class={`thread-agent ${mergedChild!.agentKind}`}
+            title={`Do · ${agentLabel(mergedChild!.agentKind)}`}
+          >
+            {agentShort(mergedChild!.agentKind)}
+          </span>
+        </Show>
+        <span class="thread-run-slot">
+          <Show when={running()}>
+            <span class="spinner small" />
+          </Show>
+        </span>
+        <TypewriterText
+          class="thread-title"
+          text={title()}
+          title={title()}
+          animate={state.titleTyping[t.id] || !!(mergedChild && state.titleTyping[mergedChild.id])}
+        />
+        <Show when={activeThread.worktree}>
+          <span
+            class="thread-worktree"
+            title={`在 worktree 中执行 · 分支：${activeThread.worktree!.branch}`}
+          >
+            ⎇ {activeThread.worktree!.branch}
+          </span>
+        </Show>
+        <Show when={childCount > 0}>
+          <span class="thread-tree-badge" title={`该预检会话下有 ${childCount} 个开发子会话`}>
+            预检 · {childCount}
+          </span>
+        </Show>
+        <Show when={t.ephemeral}>
+          <span class="thread-ephemeral" title="临时会话：程序关闭时自动删除">
+            临时
+          </span>
+        </Show>
+        <span class="thread-time">{fmtTime(updatedAt())}</span>
+        <button
+          class="thread-delete"
+          title="删除会话"
+          onClick={(e) => {
+            e.stopPropagation();
+            void remove(t.id, title());
+          }}
+        >
+          <IconTrash size={13} />
+        </button>
+      </div>
+    );
+  };
 
   return (
     <aside class="sidebar">
@@ -515,7 +548,7 @@ export function Sidebar(props: {
                     </button>
                   </div>
                   <For each={threadTreeRows(threads)}>
-                    {(row) => ThreadRow(row.thread, row.child, row.childCount)}
+                    {(row) => ThreadRow(row.thread, row.child, row.childCount, row.mergedChild)}
                   </For>
                 </div>
               );

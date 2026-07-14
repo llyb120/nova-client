@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
@@ -147,6 +147,16 @@ fn is_publishable_roaming_path(path: &str) -> bool {
     !path.contains(crate::SCRATCH_MARK)
 }
 
+fn is_allowed_roaming_path(allowed: &[String], path: &str) -> bool {
+    is_publishable_roaming_path(path)
+        && std::path::Path::new(path).is_dir()
+        && allowed.iter().any(|folder| folder == path)
+}
+
+fn host_prompt_is_current(prompt_epoch: &(Arc<AtomicU64>, u64)) -> bool {
+    prompt_epoch.0.load(Ordering::SeqCst) == prompt_epoch.1
+}
+
 /// 一条待接收的分享
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,6 +201,9 @@ pub struct RelayManager {
     inbox: StdMutex<Vec<Share>>,
     /// host 侧：hostThreadId -> guest
     hosted: StdMutex<HashMap<String, RoamGuest>>,
+    /// host 侧漫游提示词的取消代次。收到 cancel 时递增；尚未真正进入 manager 的旧任务
+    /// 会在启动前发现代次变化并退出，避免 prompt/cancel 连续到达时 cancel 抢先判定未运行。
+    host_prompt_epochs: StdMutex<HashMap<String, Arc<AtomicU64>>>,
     /// guest 侧：requestKey -> host token（权限响应回传路由）
     guest_perms: StdMutex<HashMap<String, String>>,
     /// guest 侧正在运行的线程（host 不在本机，managers 不知道运行态）
@@ -247,6 +260,7 @@ impl RelayManager {
             peers: StdMutex::new(json!([])),
             inbox: StdMutex::new(inbox),
             hosted: StdMutex::new(HashMap::new()),
+            host_prompt_epochs: StdMutex::new(HashMap::new()),
             guest_perms: StdMutex::new(HashMap::new()),
             guest_running: StdMutex::new(HashSet::new()),
             pending_creates: StdMutex::new(HashMap::new()),
@@ -806,8 +820,6 @@ impl RelayManager {
         let Some((server, token, name)) = self.cfg() else {
             return;
         };
-        // 不再依赖手动「允许漫游」：直接把本机的项目列表广播出去，
-        // 对端可选其中任意项目发起漫游，真正放行由本机用户在确认框里决定。
         let folders: Vec<Value> = {
             let state = self.app.state::<AppState>();
             // worktree 目录名是随机 uuid：广播给队友时换成「仓库名 ⎇ 分支」
@@ -824,19 +836,16 @@ impl RelayManager {
                     })
                     .collect()
             };
-            let projects = state.projects.lock().unwrap();
-            projects
-                .projects
+            let allowed = state.roaming.lock().unwrap().folders.clone();
+            allowed
                 .iter()
-                .filter(|p| {
-                    is_publishable_roaming_path(p) && std::path::Path::new(p).is_dir()
-                })
-                .map(|p| {
+                .filter(|path| is_allowed_roaming_path(&allowed, path))
+                .map(|path| {
                     let name = wt_names
-                        .get(p.as_str())
+                        .get(path.as_str())
                         .cloned()
-                        .unwrap_or_else(|| basename(p));
-                    json!({ "path": p, "name": name })
+                        .unwrap_or_else(|| basename(&path));
+                    json!({ "path": path, "name": name })
                 })
                 .collect()
         };
@@ -1525,12 +1534,34 @@ impl RelayManager {
     }
 
     pub fn guest_cancel(self: &Arc<Self>, thread_id: &str) -> Result<(), String> {
-        let (peer, host_thread_id) = self.roaming_route(thread_id)?;
-        self.spawn_send(
-            peer,
-            "roaming.cancel",
-            json!({ "hostThreadId": host_thread_id }),
-        );
+        let (peer, host_thread_id) = {
+            let state = self.app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            let t = store.get(thread_id).ok_or("线程不存在")?;
+            if !t.is_roaming_guest() {
+                return Err("不是漫游会话".into());
+            }
+            (
+                t.roaming_peer.clone().ok_or("不是漫游会话")?,
+                t.roaming_remote_id.clone(),
+            )
+        };
+        // host 尚未接受时，停止就是撤掉本地排队的提示词，不能让它在稍后获批后又自动开跑。
+        self.pending_prompts.lock().unwrap().remove(thread_id);
+        if let Some(host_thread_id) = host_thread_id {
+            self.spawn_send(
+                peer,
+                "roaming.cancel",
+                json!({ "hostThreadId": host_thread_id }),
+            );
+        } else {
+            self.guest_running.lock().unwrap().remove(thread_id);
+            let _ = self.app.emit(
+                EV_TURN,
+                json!({ "threadId": thread_id, "running": false, "stopReason": "force_cancelled" }),
+            );
+            let _ = self.app.emit(EV_THREADS, json!({}));
+        }
         Ok(())
     }
 
@@ -1709,6 +1740,14 @@ impl RelayManager {
     fn on_roaming_branches_request(&self, env: &InEnvelope) {
         let to = env.from.clone();
         let folder = env.data["folder"].as_str().unwrap_or_default().to_string();
+        if !self.roaming_folder_allowed(&folder) {
+            self.spawn_send_now(
+                to,
+                "roaming.branches",
+                json!({ "folder": folder, "current": null, "branches": [], "error": "该目录未开放漫游" }),
+            );
+            return;
+        }
         let app = self.app.clone();
         std::thread::spawn(move || {
             let branches = crate::gitwt::list_branches(&folder).unwrap_or_default();
@@ -1822,14 +1861,19 @@ impl RelayManager {
             .unwrap_or_default()
             .to_string();
         let folder = env.data["folder"].as_str().unwrap_or_default().to_string();
-        // 审批制：不再预检/限制目录，一律登记为待确认请求交本机用户决定。
-        // 目录是否存在等到用户点「允许」时（respond_roam_request）再校验——避免在请求
-        // 阶段就静默拒绝，导致 host 完全无感知（表现为「对方漫游时本机毫无提示」）。
         if folder.trim().is_empty() {
             self.spawn_send_now(
                 env.from.clone(),
                 "roaming.created",
                 json!({ "reqId": req_id, "ok": false, "error": "未指定目录" }),
+            );
+            return;
+        }
+        if !self.roaming_folder_allowed(&folder) {
+            self.spawn_send_now(
+                env.from.clone(),
+                "roaming.created",
+                json!({ "reqId": req_id, "ok": false, "error": "该目录未开放漫游" }),
             );
             return;
         }
@@ -1877,8 +1921,7 @@ impl RelayManager {
                 "folder": folder,
                 "folderName": basename(&folder),
                 "agentKind": agent_kind_str,
-                // 目录在本机是否存在：不存在时前端确认框会提示，允许后会在该路径新建
-                "folderExists": std::path::Path::new(&folder).is_dir(),
+                "folderExists": true,
                 // 发起人想做什么：让本机用户能看清提示词再决定是否放行
                 "prompt": prompt,
                 // worktree：确认框提示「对方要求在 worktree 中执行」
@@ -1919,17 +1962,14 @@ impl RelayManager {
 
     /// host 侧：后台完成漫游会话创建（含 worktree），成败都回 roaming.created。
     fn finish_roam_accept(self: &Arc<Self>, req_id: String, pending: PendingRoam) {
-        // 审批制：用户已点「允许」即表示认可该路径。目录不存在就按其意愿现场创建，
-        // 这样漫游不再被「必须是本机已存在的项目」限制；创建失败（权限/非法路径）才回错。
-        if !std::path::Path::new(&pending.folder).is_dir() {
-            if let Err(e) = std::fs::create_dir_all(&pending.folder) {
-                self.spawn_send_now(
-                    pending.from.clone(),
-                    "roaming.created",
-                    json!({ "reqId": req_id, "ok": false, "error": format!("目录不存在且无法创建：{e}") }),
-                );
-                return;
-            }
+        // 请求等待确认期间用户可能撤销目录授权，最终落地前必须再次校验。
+        if !self.roaming_folder_allowed(&pending.folder) {
+            self.spawn_send_now(
+                pending.from.clone(),
+                "roaming.created",
+                json!({ "reqId": req_id, "ok": false, "error": "该目录已取消漫游授权" }),
+            );
+            return;
         }
         let mut thread = Thread::new(
             pending.folder.clone(),
@@ -1999,6 +2039,12 @@ impl RelayManager {
         crate::sys_notify::notify_roam_request(&self.app, from_name, folder_name);
     }
 
+    fn roaming_folder_allowed(&self, folder: &str) -> bool {
+        let state = self.app.state::<AppState>();
+        let allowed = state.roaming.lock().unwrap().folders.clone();
+        is_allowed_roaming_path(&allowed, folder)
+    }
+
     fn on_roaming_prompt(&self, env: &InEnvelope) {
         let host_thread_id = env.data["hostThreadId"]
             .as_str()
@@ -2019,12 +2065,24 @@ impl RelayManager {
             }
         };
         let state = self.app.state::<AppState>();
+        let prompt_epoch = {
+            let mut epochs = self.host_prompt_epochs.lock().unwrap();
+            let epoch = epochs
+                .entry(host_thread_id.clone())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone();
+            let value = epoch.load(Ordering::SeqCst);
+            (epoch, value)
+        };
         match agent_kind {
             AgentKind::CodeBuddy => {
                 // CodeBuddy 单连接不能并发：运行中再发不走「注入」，一律 run_prompt，
                 // 经串行闸门排到当前轮次之后顺序执行（详见 acp.rs 的 serial_gate 说明）。
                 let mgr = state.codebuddy.clone();
                 tauri::async_runtime::spawn(async move {
+                    if !host_prompt_is_current(&prompt_epoch) {
+                        return;
+                    }
                     mgr.run_prompt(host_thread_id, text, images).await;
                 });
             }
@@ -2032,10 +2090,16 @@ impl RelayManager {
                 let mgr = state.codex.clone();
                 if mgr.is_running(&host_thread_id) {
                     tauri::async_runtime::spawn(async move {
+                        if !host_prompt_is_current(&prompt_epoch) {
+                            return;
+                        }
                         mgr.steer_prompt(host_thread_id, text, images).await;
                     });
                 } else {
                     tauri::async_runtime::spawn(async move {
+                        if !host_prompt_is_current(&prompt_epoch) {
+                            return;
+                        }
                         mgr.run_prompt(host_thread_id, text, images).await;
                     });
                 }
@@ -2047,10 +2111,16 @@ impl RelayManager {
                 };
                 if mgr.is_running(&host_thread_id) {
                     tauri::async_runtime::spawn(async move {
+                        if !host_prompt_is_current(&prompt_epoch) {
+                            return;
+                        }
                         mgr.steer_prompt(host_thread_id, text, images).await;
                     });
                 } else {
                     tauri::async_runtime::spawn(async move {
+                        if !host_prompt_is_current(&prompt_epoch) {
+                            return;
+                        }
                         mgr.run_prompt(host_thread_id, text, images).await;
                     });
                 }
@@ -2071,15 +2141,30 @@ impl RelayManager {
         let Some(agent_kind) = agent_kind else {
             return;
         };
+        {
+            let mut epochs = self.host_prompt_epochs.lock().unwrap();
+            epochs
+                .entry(host_thread_id.clone())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .fetch_add(1, Ordering::SeqCst);
+        }
         let state = self.app.state::<AppState>();
         match state.acp_for(&agent_kind) {
             Some(mgr) => {
+                if !mgr.is_running(&host_thread_id) {
+                    self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
+                    return;
+                }
                 tauri::async_runtime::spawn(async move {
                     mgr.cancel(&host_thread_id).await;
                 });
             }
             None => {
                 let mgr = state.codex.clone();
+                if !mgr.is_running(&host_thread_id) {
+                    self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
+                    return;
+                }
                 tauri::async_runtime::spawn(async move {
                     mgr.cancel(&host_thread_id).await;
                 });
@@ -2454,6 +2539,7 @@ impl RelayManager {
     /// 避免同 token 的其他实例对重同步请求作出错误终止判断。
     pub fn notify_host_thread_deleted(&self, thread_id: &str) {
         self.ensure_hosted(thread_id);
+        self.host_prompt_epochs.lock().unwrap().remove(thread_id);
         let guest = self.hosted.lock().unwrap().remove(thread_id);
         let Some(guest) = guest else {
             return;
@@ -3216,5 +3302,28 @@ mod tests {
             r"C:\Users\tester\AppData\Local\Temp\Nova-scratch\0714-104825-1912"
         ));
         assert!(is_publishable_roaming_path(r"D:\project\nova-client"));
+    }
+
+    #[test]
+    fn roaming_path_requires_whitelist_and_existing_directory() {
+        let dir = std::env::temp_dir().join(format!("nova-roaming-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().to_string();
+        assert!(!is_allowed_roaming_path(&[], &path));
+        assert!(is_allowed_roaming_path(std::slice::from_ref(&path), &path));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!is_allowed_roaming_path(std::slice::from_ref(&path), &path));
+    }
+
+    #[test]
+    fn roaming_cancel_invalidates_host_prompt_that_has_not_started() {
+        let epoch = Arc::new(AtomicU64::new(0));
+        let pending = (epoch.clone(), epoch.load(Ordering::SeqCst));
+
+        epoch.fetch_add(1, Ordering::SeqCst);
+
+        assert!(!host_prompt_is_current(&pending));
+        let next = (epoch.clone(), epoch.load(Ordering::SeqCst));
+        assert!(host_prompt_is_current(&next));
     }
 }

@@ -189,6 +189,8 @@ export function ModelPicker(props: {
   modelSource?: ModelOptionsSource;
   sharedModels?: SharedModelSource[];
   quotaPeerToken?: string | null;
+  /** 项目目录；用于模型选项尚未加载时显示该项目最近模型的友好名 */
+  projectCwd?: string | null;
   onPickModel: (agentKind: AgentKind, model: string, quotaPeer?: QuotaModelPeer | null) => void;
   title?: string;
   prefix?: string;
@@ -264,7 +266,7 @@ export function ModelPicker(props: {
         ? `${peer.name}的${agentLabel(props.agentKind)} · ${props.model || "默认"}`
         : props.model;
     }
-    const name = lastUsed.modelName(props.agentKind);
+    const name = lastUsed.modelName(props.agentKind, props.projectCwd);
     return props.model && name ? name : undefined;
   });
 
@@ -298,6 +300,8 @@ export function ConfigSelects(props: {
   modelSource?: ModelOptionsSource;
   sharedModels?: SharedModelSource[];
   quotaPeerToken?: string | null;
+  /** 项目目录；用于项目级最近模型的回退显示 */
+  projectCwd?: string | null;
   /** 一次性提交「后端 + 模型」；单后端时 agentKind 即当前后端 */
   onPickModel: (agentKind: AgentKind, model: string, quotaPeer?: QuotaModelPeer | null) => void;
   onMode: (v: string) => void;
@@ -342,6 +346,7 @@ export function ConfigSelects(props: {
         modelSource={props.modelSource}
         sharedModels={props.sharedModels}
         quotaPeerToken={props.quotaPeerToken}
+        projectCwd={props.projectCwd}
         onPickModel={props.onPickModel}
         portal={props.portal}
         anchorTo={props.anchorTo}

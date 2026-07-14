@@ -458,6 +458,13 @@ button {
   font-size: 11px;
 }
 
+.thread-pair-arrow {
+  flex-shrink: 0;
+  margin: 0 -4px;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
 .thread-run-slot {
   display: flex;
   align-items: center;
@@ -726,6 +733,39 @@ button {
   padding: 24px clamp(14px, 3vw, 28px) 16px;
   display: flex;
   flex-direction: column;
+}
+
+.transcript-segment {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 4px 0 18px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+.transcript-segment:not(:first-child) {
+  margin-top: 24px;
+}
+.transcript-segment::after {
+  content: "";
+  flex: 1;
+  min-width: 20px;
+  height: 1px;
+  background: linear-gradient(to right, var(--border), transparent);
+}
+.transcript-segment-agent {
+  white-space: nowrap;
+}
+.transcript-segment-model {
+  min-width: 0;
+  max-width: min(42vw, 420px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-family: var(--mono);
 }
 
 /* transcript 虚拟化 wrapper：不参与 flex 收缩，卸载时用等高占位撑住滚动高度 */
@@ -2101,6 +2141,33 @@ button {
 .wt-dir-row .field-input {
   flex: 1;
   min-width: 0;
+}
+
+.global-agent-instructions {
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+  line-height: 1.55;
+  font-family: var(--mono);
+}
+.global-agent-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.agent-config-status {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.agent-config-status.conflict,
+.agent-config-status.error {
+  color: var(--red);
+}
+.agent-config-status.merged,
+.agent-config-status.managed {
+  color: var(--accent);
 }
 
 /* Skills 设置页拖放区 */

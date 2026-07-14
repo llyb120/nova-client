@@ -709,6 +709,12 @@ impl AcpManager {
             self.push_log(format!("[nova] 创建 Cursor 隔离配置目录失败：{e}"));
             return None;
         }
+        if let Err(e) = crate::agent_config::sync_cursor_config_dir(
+            &nova_data_dir(&self.app),
+            &config_dir,
+        ) {
+            self.push_log(format!("[nova] 同步 Cursor 全局 Rule 失败：{e}"));
+        }
         // 同一线程切换模型后会复用这个目录；Cursor ACP 持久化的旧变体优先级可能高于
         // `--model`，所以每次重启都清掉，仅保留下面重新生成的 cli-config。
         let _ = std::fs::remove_file(config_dir.join("acp-config.json"));
@@ -4320,14 +4326,25 @@ fn merge_cached_opencode_variants(config_options: &mut Value, cached: &Value) {
 }
 
 /// Windows：在 PATH 中按 exe/cmd/bat 顺序解析裸命令名为具体文件路径。
-/// 已带扩展名或路径分隔符的输入视为具体文件，存在即返回。
+/// 带路径分隔符的输入视为具体文件；仅带扩展名的裸文件名仍需搜索 PATH。
 /// 也被「后端可用性检查」复用：零成本判断某个 CLI 是否安装（不拉起进程）。
 #[cfg(windows)]
 pub(crate) fn resolve_program_on_path(name: &str) -> Option<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
-    if Path::new(name).extension().is_some() || name.contains('\\') || name.contains('/') {
+    if name.contains('\\') || name.contains('/') {
         let p = PathBuf::from(name);
         return p.is_file().then_some(p);
+    }
+    if Path::new(name).extension().is_some() {
+        let p = PathBuf::from(name);
+        if p.is_file() {
+            return Some(p);
+        }
+        return std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(name))
+                .find(|p| p.is_file())
+        });
     }
     let exts = ["exe", "cmd", "bat"];
     std::env::var_os("PATH").and_then(|paths| {

@@ -315,6 +315,11 @@ pub fn materialize_runtime(
     }
 
     let launch_env = launch_env(expected_kind, &root)?;
+    crate::agent_config::sync_backend_with_env(
+        &crate::nova_data_dir(&app),
+        expected_kind,
+        &launch_env,
+    )?;
     let scope = format!("quota-{thread_id}-");
     let manager = match expected_kind {
         AgentKind::Codex => {

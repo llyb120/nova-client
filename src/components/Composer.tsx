@@ -418,6 +418,7 @@ export function Composer() {
             model={state.model}
             mode={state.mode}
             modelSource={usesPeerModels() ? guestModelSource : undefined}
+            projectCwd={state.cwd}
             onPickModel={(k, m) => void pickThreadModel(k, m)}
             onMode={(v) => void setThreadMode(v)}
             anchorTo=".composer"

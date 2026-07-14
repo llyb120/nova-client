@@ -1,4 +1,5 @@
 mod acp;
+mod agent_config;
 mod cli;
 mod cli_manager;
 mod tool_api;
@@ -2231,6 +2232,21 @@ fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
+fn get_global_agent_instructions(
+    state: State<'_, AppState>,
+) -> agent_config::GlobalAgentInstructions {
+    agent_config::get_global_instructions(&state.config_dir)
+}
+
+#[tauri::command]
+fn set_global_agent_instructions(
+    state: State<'_, AppState>,
+    content: String,
+) -> Result<agent_config::GlobalAgentInstructions, String> {
+    agent_config::set_global_instructions(&state.config_dir, &content)
+}
+
+#[tauri::command]
 async fn set_settings(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -2426,6 +2442,33 @@ fn set_folder_roaming(state: State<'_, AppState>, cwd: String, allowed: bool) ->
     }
     state.relay.publish_folders();
     allowed
+}
+
+/// 批量替换允许漫游目录，设置页一次保存后只广播一遍。
+#[tauri::command]
+fn set_roaming_folders(state: State<'_, AppState>, folders: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for folder in folders {
+        let folder = folder.trim();
+        if folder.is_empty() || folder.contains(SCRATCH_MARK) {
+            continue;
+        }
+        #[cfg(windows)]
+        let key = folder.replace('/', "\\").to_lowercase();
+        #[cfg(not(windows))]
+        let key = folder.to_string();
+        if seen.insert(key) {
+            normalized.push(folder.to_string());
+        }
+    }
+    {
+        let mut roaming = state.roaming.lock().unwrap();
+        roaming.folders = normalized.clone();
+        roaming.save();
+    }
+    state.relay.publish_folders();
+    normalized
 }
 
 /// guest：在对端的目录上新建漫游会话
@@ -3353,6 +3396,9 @@ pub fn run() {
             // 更新都要读该目录里的 marker。首启从旧 Tauri 数据目录（com.nova → com.fuckdevin）整体迁移。
             let dir = nova_data_dir(app.handle());
             migrate_data_to_home(app.handle(), &dir);
+            if let Err(error) = agent_config::sync_global_instructions(&dir) {
+                eprintln!("[agent-config] 启动同步失败：{error}");
+            }
             // 上次若异常退出，租借凭证明文目录可能没走正常清理；启动第一时间删除。
             let _ = std::fs::remove_dir_all(
                 std::env::temp_dir().join("Nova-borrowed-credentials"),
@@ -3638,6 +3684,8 @@ pub fn run() {
             respond_permission,
             get_settings,
             set_settings,
+            get_global_agent_instructions,
+            set_global_agent_instructions,
             get_backend_availability,
             get_cli_statuses,
             upgrade_cli,
@@ -3657,6 +3705,7 @@ pub fn run() {
             list_roaming_folders,
             is_folder_roaming,
             set_folder_roaming,
+            set_roaming_folders,
             create_roaming_thread,
             create_quota_thread,
             recall_roaming_thread,
