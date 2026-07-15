@@ -67,6 +67,32 @@ fn connection_scoped_model_session_changed(
     kind == &AgentKind::OpenCode && active_sid != Some(sid)
 }
 
+fn thread_owns_connection(kind: &AgentKind) -> bool {
+    matches!(
+        kind,
+        AgentKind::CodeBuddy | AgentKind::Cursor | AgentKind::OpenCode
+    )
+}
+
+fn permission_request_key(
+    kind: &AgentKind,
+    permission_scope: &str,
+    conn_key: &str,
+    id: &Value,
+) -> String {
+    let prefix = match kind {
+        AgentKind::CodeBuddy => "cb-",
+        AgentKind::ClaudeCode => "cc-",
+        AgentKind::Cursor => "cs-",
+        AgentKind::OpenCode => "oc-",
+        _ => "",
+    };
+    let conn_scope = (kind == &AgentKind::OpenCode)
+        .then(|| format!("{conn_key}-"))
+        .unwrap_or_default();
+    format!("{permission_scope}{prefix}perm-{conn_scope}{id}")
+}
+
 struct TitleJob {
     thread_id: String,
     fallback_title: String,
@@ -346,7 +372,7 @@ pub struct AcpManager {
     permission_scope: String,
     /// 连接池：conn_key → 该键的连接槽（TokioMutex<Option<conn>>，语义同「旧单连接」但按键分裂）。
     /// - Devin：只用 SHARED 一个键（多路复用，一条连接跑所有 session）。
-    /// - CodeBuddy：每个用户线程一个键（thread_id）独占一条连接（一个进程），从而真正并行；
+    /// - CodeBuddy / Cursor / OpenCode：每个用户线程一个键（thread_id）独占一条连接（一个进程），从而真正并行；
     ///   另有 AUX 键专跑标题/探测。不同键各自的槽互不阻塞，可并发建连接。
     slots: StdMutex<HashMap<String, Arc<TokioMutex<Option<Arc<AcpConn>>>>>>,
     /// 存活连接计数：spawn 成功 +1、连接关闭 -1；用于 connected() 与断连广播（归零才广播）。
@@ -355,7 +381,7 @@ pub struct AcpManager {
     /// 正在 session/load 回放、需要抑制 update 的会话
     loading_sessions: StdMutex<HashSet<String>>,
     running_threads: StdMutex<HashSet<String>>,
-    /// 每线程取消代次。CodeBuddy/Cursor/OpenCode 的 run_prompt 可能在串行闸门上等待；cancel
+    /// 每线程取消代次。CodeBuddy / Cursor / OpenCode 的 run_prompt 可能在本线程闸门上等待；cancel
     /// 递增代次后，仍在等待的旧轮次拿到闸门时必须退出，不能再次 set_running(true)。
     cancel_epochs: StdMutex<HashMap<String, u64>>,
     /// 轮次开始时间，用于结束时计算耗时
@@ -368,14 +394,12 @@ pub struct AcpManager {
     prewarming: StdMutex<HashSet<String>>,
     /// 串行化同一线程上的 session 建立操作
     thread_locks: StdMutex<HashMap<String, Arc<TokioMutex<()>>>>,
-    /// 连接级串行闸门（按 conn_key 分裂）：CodeBuddy 的 ACP server 无法在单条 stdio 连接上并发
-    /// 处理请求（并发 prompt 会把响应串台、prompt 运行中并发 session/new 会卡死整轮）；OpenCode
-    /// 的模型选择则实际落在共享连接上，不串行会让不同 session 的模型互相覆盖。故对这两类后端的
-    /// 「同一条连接」会话级操作用同一把闸门排队；不同连接（不同 thread）仍可并行。
+    /// 连接级串行闸门（按 conn_key 分裂）：这些 ACP server 无法安全地在单条 stdio 连接上并发
+    /// 处理会话级操作。故同一线程用同一把闸门排队；不同连接（不同 thread）仍可并行。
     /// Devin 等支持多路复用，返回 None、不进闸门。
     serial_gates: StdMutex<HashMap<String, Arc<TokioMutex<()>>>>,
     /// CodeBuddy：记录每条连接当前活跃的 sessionId，prompt 前按需 session/load 重新激活。
-    /// OpenCode：记录共享连接上最近应用模型的 sessionId，切换 session 时强制重下发线程模型。
+    /// OpenCode：记录连接上最近应用模型的 sessionId，切换 session 时强制重下发线程模型。
     active_session: StdMutex<HashMap<String, String>>,
     /// devin 返回的可用模型/模式（来自 session/new 响应）
     model_options: StdMutex<Option<Value>>,
@@ -479,7 +503,7 @@ impl AcpManager {
         //   会话此前会让进程永久驻留），按键逐条回收。
         // - ClaudeCode：共享一条连接，但 claude-code-acp 适配器会为每个 session 常驻一个
         //   claude 子进程（自带 gopls 等 LSP + 整套 MCP 服务器，单套数百 MB），只能整树回收。
-        // - OpenCode：共享一条连接（bun 运行时常驻上百 MB），空闲整树回收，
+        // - OpenCode：每线程一条连接（bun 运行时常驻上百 MB），逐条空闲回收，
         //   下次发消息自动重连并经 session/load 恢复。
         // - Devin 不回收：进程本身只有几十 MB，且预热 session、剩余额度查询都依赖常驻连接。
         // - Cursor 不回收：cursor-agent 的 session/load 有已知缺陷（恢复会失败），
@@ -524,21 +548,23 @@ impl AcpManager {
         json!([])
     }
 
-    /// 用户线程对应的连接键：CodeBuddy 每线程独占一条连接以实现并行；Cursor 的完整模型
-    /// 变体只能在进程启动时通过 `--model` 生效，也必须按线程独占连接；其它后端共用 SHARED。
+    /// 用户线程对应的连接键：CodeBuddy / OpenCode 每线程独占一条连接以实现并行；Cursor 的完整
+    /// 模型变体只能在进程启动时通过 `--model` 生效，也必须按线程独占连接；其它后端共用 SHARED。
     fn conn_key_for_thread(&self, thread_id: &str) -> String {
-        match self.kind {
-            AgentKind::CodeBuddy | AgentKind::Cursor => thread_id.to_string(),
-            _ => SHARED_KEY.to_string(),
+        if thread_owns_connection(&self.kind) {
+            thread_id.to_string()
+        } else {
+            SHARED_KEY.to_string()
         }
     }
 
-    /// 辅助操作（标题生成 / 模型·命令探测）所用连接键：CodeBuddy 用独立 AUX 连接，
+    /// 辅助操作（标题生成 / 模型·命令探测）所用连接键：独占连接的后端用独立 AUX 连接，
     /// 与用户线程连接隔离；其它后端复用 SHARED。
     fn aux_key(&self) -> String {
-        match self.kind {
-            AgentKind::CodeBuddy | AgentKind::Cursor => AUX_KEY.to_string(),
-            _ => SHARED_KEY.to_string(),
+        if thread_owns_connection(&self.kind) {
+            AUX_KEY.to_string()
+        } else {
+            SHARED_KEY.to_string()
         }
     }
 
@@ -961,7 +987,7 @@ impl AcpManager {
         if let Some(v) = self.get_commands() {
             return Ok(v);
         }
-        // CodeBuddy：探测斜杠命令也要开 session/new，走独立 AUX 连接，不占用任何用户线程连接
+        // 独占连接的后端用 AUX 探测斜杠命令，不占用任何用户线程连接。
         let aux = self.aux_key();
         let _gate = self.serial_gate(&aux).await;
         if let Some(v) = self.get_commands() {
@@ -1014,7 +1040,7 @@ impl AcpManager {
 
     /// 无视内存缓存，向 agent 开探测 session 拉最新模型列表（供启动后台刷新）。
     async fn fetch_model_options_from_agent(self: &Arc<Self>) -> Result<Value, String> {
-        // CodeBuddy：探测模型列表也要开 session/new，走独立 AUX 连接，不占用任何用户线程连接
+        // 独占连接的后端用 AUX 探测模型列表，不占用任何用户线程连接。
         let aux = self.aux_key();
         let _gate = self.serial_gate(&aux).await;
         // 拿闸门期间可能已被别的路径填好缓存，复查一次（非强制刷新场景）
@@ -1098,7 +1124,7 @@ impl AcpManager {
         self.prompt_sent_at.lock().unwrap().clear();
     }
 
-    /// 杀掉单个键对应的连接（CodeBuddy / Cursor 用于「停止/删除某线程」时释放它独占的进程），
+    /// 杀掉单个键对应的连接（独占连接的后端用于「停止/删除某线程」时释放进程），
     /// 并只清理属于该连接的会话路由，不影响其它并行连接。
     ///
     /// 注意：不移除 `serial_gates`。停止时旧轮次的 `run_prompt` 仍持有闸门，若此处删掉，
@@ -1164,8 +1190,8 @@ impl AcpManager {
     /// 空闲连接回收入口（由后台循环每 30s 调一次），按后端分派不同策略。
     async fn reap_idle_conns(self: &Arc<Self>) {
         match self.kind {
-            AgentKind::CodeBuddy => self.reap_idle_codebuddy().await,
-            AgentKind::ClaudeCode | AgentKind::OpenCode => self.reap_idle_shared().await,
+            AgentKind::CodeBuddy | AgentKind::OpenCode => self.reap_idle_thread_conns().await,
+            AgentKind::ClaudeCode => self.reap_idle_shared().await,
             _ => {}
         }
     }
@@ -1229,9 +1255,9 @@ impl AcpManager {
         self.kill_conn_key(SHARED_KEY).await;
     }
 
-    /// CodeBuddy 空闲连接回收：把「不在运行中、闸门空闲、超时未活跃」的连接杀掉。
+    /// 每线程独占连接的后端：把「不在运行中、闸门空闲、超时未活跃」的连接杀掉。
     /// 下次再用该线程会自动重启进程并经 session/load 恢复上下文（与手动停止后的自愈一致）。
-    async fn reap_idle_codebuddy(self: &Arc<Self>) {
+    async fn reap_idle_thread_conns(self: &Arc<Self>) {
         let keys: Vec<String> = self.slots.lock().unwrap().keys().cloned().collect();
         let now = std::time::Instant::now();
         for key in keys {
@@ -1265,8 +1291,9 @@ impl AcpManager {
                 None => None,
             };
             self.push_log(format!(
-                "[codebuddy] 连接空闲 {} 分钟，回收进程（key={key}）",
-                idle_ms / 60000
+                "[{}] 连接空闲 {} 分钟，回收进程（key={key}）",
+                self.kind.as_str(),
+                idle_ms / 60000,
             ));
             self.kill_conn_key(&key).await;
         }
@@ -1336,10 +1363,7 @@ impl AcpManager {
     /// （持有期间独占这条连接），其它 agent 返回 None（不串行、保持多路复用）。
     /// 不同 conn_key 各有各的闸门，因此不同线程（各自独占一条连接）之间互不阻塞，可真正并行。
     async fn serial_gate(&self, conn_key: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        if matches!(
-            self.kind,
-            AgentKind::CodeBuddy | AgentKind::Cursor | AgentKind::OpenCode
-        ) {
+        if thread_owns_connection(&self.kind) {
             let gate = self
                 .serial_gates
                 .lock()
@@ -1354,7 +1378,7 @@ impl AcpManager {
     }
 
     /// 记录某条连接刚刚激活的 session（session/new 或 session/load 之后调用）。
-    /// CodeBuddy 用它恢复单活跃会话；OpenCode 用它识别共享连接上的模型作用域切换。
+    /// CodeBuddy 用它恢复单活跃会话；OpenCode 用它识别连接上的模型作用域切换。
     fn mark_active_session(&self, conn_key: &str, sid: &str) {
         if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::OpenCode) {
             self.active_session
@@ -1458,13 +1482,10 @@ impl AcpManager {
         conn_key: &str,
         want_cwd: Option<&str>,
     ) -> Result<Arc<AcpConn>, String> {
-        // CodeBuddy / Cursor 用户线程：cancel 已把 running 清掉并 kill 连接后，
+        // 独占连接的用户线程：cancel 已把 running 清掉并 kill 连接后，
         // 仍在飞的 drive_prompt/ensure_session 绝不能把进程重新拉起来
         // （否则界面已停、agent 还在跑，随后重发就会报内部错误）。
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor)
-            && conn_key != AUX_KEY
-            && !self.is_running(conn_key)
-        {
+        if thread_owns_connection(&self.kind) && conn_key != AUX_KEY && !self.is_running(conn_key) {
             return Err("任务已停止".into());
         }
         let slot = self.slot(conn_key);
@@ -1507,10 +1528,7 @@ impl AcpManager {
             }
         }
         // 再次确认：等槽锁期间可能已被 cancel
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor)
-            && conn_key != AUX_KEY
-            && !self.is_running(conn_key)
-        {
+        if thread_owns_connection(&self.kind) && conn_key != AUX_KEY && !self.is_running(conn_key) {
             return Err("任务已停止".into());
         }
         let settings = {
@@ -1958,14 +1976,9 @@ impl AcpManager {
                 // 权限 key 带实例前缀，便于 respond_permission 路由到正确的 manager。
                 // Devin 保持无前缀（perm-）以兼容历史；CodeBuddy 用 cb-perm-；ClaudeCode 用 cc-perm-；
                 // Cursor 用 cs-perm-；OpenCode 用 oc-perm-。
-                let prefix = match self.kind {
-                    AgentKind::CodeBuddy => "cb-",
-                    AgentKind::ClaudeCode => "cc-",
-                    AgentKind::Cursor => "cs-",
-                    AgentKind::OpenCode => "oc-",
-                    _ => "",
-                };
-                let key = format!("{}{prefix}perm-{}", self.permission_scope, id);
+                // 独立进程的 RPC id 都会从 1 开始，连接键必须进入请求 key，避免并行会话覆盖。
+                let key =
+                    permission_request_key(&self.kind, &self.permission_scope, &conn.key, &id);
                 self.pending_permissions.lock().unwrap().insert(
                     key.clone(),
                     PendingPermission {
@@ -2833,9 +2846,8 @@ impl AcpManager {
 
     /// 预热：提前为某个项目目录创建空 session，消除首条消息的建会话延迟
     pub async fn prewarm(self: &Arc<Self>, cwd: String) {
-        // CodeBuddy 单连接只允许一个活跃 session；Cursor 的完整模型需按线程启动独立进程，
-        // 两者都不能用不带线程/模型信息的共享预热 session。
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor) {
+        // 独占连接的后端不能使用不带线程信息、建在另一进程上的共享预热 session。
+        if thread_owns_connection(&self.kind) {
             return;
         }
         // 拿闸门前先粗筛：已预热好/正在预热就别再排队
@@ -2846,8 +2858,7 @@ impl AcpManager {
                 return;
             }
         }
-        // 这里只有非 CodeBuddy / Cursor 会走到。OpenCode 预热仍需与用户轮次共用连接闸门，
-        // 避免 session/new 与模型切换或 prompt 重叠；Devin 等返回 None、保持多路复用。
+        // 这里只有共享连接后端会走到；Devin 等返回 None、保持多路复用。
         let _gate = self.serial_gate(SHARED_KEY).await;
         {
             let warmed = self.prewarmed.lock().unwrap();
@@ -2918,7 +2929,7 @@ impl AcpManager {
                 thread.mode.clone(),
             )
         };
-        // CodeBuddy：每个线程独占一条连接（key=thread_id）、按其项目目录启动进程 → 真正并行。
+        // CodeBuddy / Cursor / OpenCode：每个线程独占一条连接（key=thread_id）→ 真正并行。
         // Devin：所有线程共用 SHARED 连接（多路复用）。
         let key = self.conn_key_for_thread(thread_id);
         let conn = self.ensure_conn_for(&key, Some(&cwd)).await?;
@@ -3252,7 +3263,7 @@ impl AcpManager {
         fallback_title: String,
         model: String,
     ) -> Result<(), String> {
-        // CodeBuddy：标题生成另开 session 发一轮 prompt，走独立 AUX 连接（与用户线程连接隔离），
+        // 标题生成另开 session 发一轮 prompt；独占连接的后端走 AUX（与用户线程连接隔离），
         // 用 AUX 闸门把标题/探测这类辅助任务串行化，不占用也不阻塞任何用户会话的并行。
         let aux = self.aux_key();
         let _gate = self.serial_gate(&aux).await;
@@ -3273,8 +3284,7 @@ impl AcpManager {
             .ok_or("session/new 未返回 sessionId")?
             .to_string();
         self.note_session_spawned(&aux);
-        // CodeBuddy 标题会话占用独立 AUX 活跃位；OpenCode 与用户会话共用 SHARED，
-        // 记录后可让下一轮用户 prompt 重新下发其线程模型。
+        // 独占连接的后端在 AUX 上记录标题会话活跃位，不影响用户线程连接。
         self.mark_active_session(&aux, &sid);
         // 标题用轻量模型生成：model 由上层按「标题后端」解析好后传入（已保证是本后端的模型 id），
         // 非空即下发；空则用本后端会话默认模型。
@@ -3398,7 +3408,7 @@ impl AcpManager {
             }
         }
         // CodeBuddy / OpenCode：配置切换不能与同连接正在跑的 prompt 重叠，用同一把连接闸门排队。
-        // CodeBuddy 不同线程连接各自独立；OpenCode 所有线程共用 SHARED，借此避免模型串台。
+        // 不同线程连接各自独立，不会互相阻塞或导致模型串台。
         let key = self.conn_key_for_thread(thread_id);
         let _gate = self.serial_gate(&key).await;
         let Some(conn) = self.conn_for_key(&key).await else {
@@ -3423,7 +3433,7 @@ impl AcpManager {
         let mut resp = None;
         let mut conn = conn.clone();
         for attempt in 1..=max_attempts {
-            if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor)
+            if thread_owns_connection(&self.kind)
                 && conn_key != AUX_KEY
                 && !self.is_running(conn_key)
             {
@@ -3497,7 +3507,7 @@ impl AcpManager {
             },
         );
         self.note_session_spawned(conn_key);
-        // CodeBuddy 记录单活跃会话；OpenCode 记录共享连接最近影响模型作用域的会话。
+        // CodeBuddy 记录单活跃会话；OpenCode 记录连接上最近影响模型作用域的会话。
         self.mark_active_session(conn_key, &sid);
         Ok(sid)
     }
@@ -3574,10 +3584,9 @@ impl AcpManager {
         self.clear_plan(&thread_id);
         self.set_running(&thread_id, true, None);
 
-        // CodeBuddy / Cursor：整轮独占「本线程自己的连接」，避免同一连接上的会话级操作重叠
-        // 导致响应串台或卡死；也避免「停止后立刻重发」时旧轮次收尾误清新轮次的 running。
-        // OpenCode：整轮独占共享连接，避免另一 session 在本轮中途切换连接级模型。Devin 等返回
-        // None、不串行，保持多路复用。闸门在本函数作用域内持有，结束自动释放。
+        // CodeBuddy / Cursor / OpenCode：整轮独占「本线程自己的连接」，避免同一连接上的会话级
+        // 操作重叠导致响应串台或卡死；不同线程使用不同连接，可并行运行。Devin 等返回 None、
+        // 保持多路复用。闸门在本函数作用域内持有，结束自动释放。
         let conn_key = self.conn_key_for_thread(&thread_id);
         let _gate = self.serial_gate(&conn_key).await;
 
@@ -4113,13 +4122,13 @@ impl AcpManager {
             }
         }
 
-        // CodeBuddy / Cursor：该线程独占一条连接（一个进程），直接 kill 即可立即停手，
+        // CodeBuddy / Cursor / OpenCode：该线程独占一条连接（一个进程），直接 kill 即可立即停手，
         // 且完全不影响其它并行会话。
         // - CodeBuddy：下次发送自动重连并经 session/load 恢复上下文。
         // - Cursor：session/cancel 不可靠（界面已停但 agent 仍在跑），随后重发会撞上
         //   仍活跃的 turn 报内部错误；session/load 也有缺陷，不能软取消后复用。
         //   必须硬杀进程；杀后清掉 session，下次发送走 handoff 注入上下文。
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor) {
+        if thread_owns_connection(&self.kind) {
             self.force_finish(thread_id, "已停止当前任务。").await;
             self.kill_conn_key(&conn_key).await;
             if self.kind == AgentKind::Cursor {
@@ -4139,7 +4148,7 @@ impl AcpManager {
             return;
         }
 
-        // Devin / ClaudeCode / OpenCode：共享连接上多 session 复用。
+        // Devin / ClaudeCode：共享连接上多 session 复用。
         let Some(session_id) = session_id else {
             // 还没建立 session 就要停（如卡在 session/new）：直接本地结束
             if self.is_running(thread_id) {
@@ -4199,9 +4208,9 @@ impl AcpManager {
             .unwrap()
             .retain(|_, r| r.thread_id != thread_id);
         self.thread_locks.lock().unwrap().remove(thread_id);
-        // CodeBuddy / Cursor：线程独占一条连接，线程删除/切换后端时一并回收。
+        // CodeBuddy / Cursor / OpenCode：线程独占一条连接，线程删除/切换后端时一并回收。
         // Devin 等共用 SHARED 连接，绝不能在这里 kill。
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor) {
+        if thread_owns_connection(&self.kind) {
             let me = self.clone();
             let key = self.conn_key_for_thread(thread_id);
             // 线程已废弃：闸门也可回收（kill_conn_key 有意保留闸门供「停止→重发」同步）。
@@ -5274,10 +5283,7 @@ fn opencode_thought_needs_separator(existing: &str, delta: &str) -> bool {
 }
 
 fn queued_turn_uses_cancel_epoch(kind: &AgentKind) -> bool {
-    matches!(
-        kind,
-        AgentKind::CodeBuddy | AgentKind::Cursor | AgentKind::OpenCode
-    )
+    thread_owns_connection(kind)
 }
 
 fn opencode_todo_entries(update: &Value) -> Option<Value> {
@@ -5606,7 +5612,36 @@ mod opencode_models_tests {
     }
 
     #[test]
-    fn opencode_turns_share_the_connection_queue_and_cancel_epoch() {
+    fn opencode_threads_use_independent_connections() {
+        assert!(thread_owns_connection(&AgentKind::OpenCode));
+        assert!(thread_owns_connection(&AgentKind::CodeBuddy));
+        assert!(thread_owns_connection(&AgentKind::Cursor));
+        assert!(!thread_owns_connection(&AgentKind::Devin));
+    }
+
+    #[test]
+    fn opencode_permission_ids_are_scoped_by_connection() {
+        let first = permission_request_key(&AgentKind::OpenCode, "", "thread-a", &json!(1));
+        let second = permission_request_key(&AgentKind::OpenCode, "", "thread-b", &json!(1));
+        assert_eq!(first, "oc-perm-thread-a-1");
+        assert_eq!(second, "oc-perm-thread-b-1");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn existing_permission_key_formats_stay_stable() {
+        assert_eq!(
+            permission_request_key(&AgentKind::Devin, "", SHARED_KEY, &json!(1)),
+            "perm-1"
+        );
+        assert_eq!(
+            permission_request_key(&AgentKind::CodeBuddy, "", "thread-a", &json!(1)),
+            "cb-perm-1"
+        );
+    }
+
+    #[test]
+    fn opencode_queued_turns_use_cancel_epoch() {
         assert!(queued_turn_uses_cancel_epoch(&AgentKind::OpenCode));
         assert!(!queued_turn_uses_cancel_epoch(&AgentKind::Devin));
     }

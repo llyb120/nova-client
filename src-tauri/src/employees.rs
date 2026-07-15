@@ -6118,6 +6118,7 @@ fn discard_thread(app: &AppHandle, thread_id: &str) {
     state.acp.forget_session_of_thread(thread_id);
     state.codebuddy.forget_session_of_thread(thread_id);
     state.claudecode.forget_session_of_thread(thread_id);
+    state.opencode.forget_session_of_thread(thread_id);
     state.codex.forget_session_of_thread(thread_id);
     let _ = app.emit(crate::acp::EV_THREADS, json!({}));
 }

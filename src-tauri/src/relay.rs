@@ -57,13 +57,6 @@ const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const QUOTA_OPERATION_ACTIVE: u8 = 0;
 const QUOTA_OPERATION_CANCELLED: u8 = 1;
 const QUOTA_OPERATION_COMMITTED: u8 = 2;
-const GAP_RESYNC_COOLDOWN: Duration = Duration::from_millis(1200);
-const AUTOMATIC_RESYNC_COOLDOWN: Duration = Duration::from_secs(15);
-
-fn resync_cooldown_elapsed(last: Option<&Instant>, now: Instant, cooldown: Duration) -> bool {
-    last.map(|time| now.saturating_duration_since(*time) >= cooldown)
-        .unwrap_or(true)
-}
 
 /// host 侧：本机某线程正被哪个 guest 漫游驱动
 #[derive(Clone)]
@@ -2309,8 +2302,14 @@ impl RelayManager {
     /// guest：检测到 update 序号缺口时立即请求一次重同步（按会话节流，避免缺口风暴）。
     /// 比看门狗(数秒)更快收敛「思考残缺 / 命令卡 loading」。
     fn request_resync(&self, thread_id: &str) {
-        if !self.try_mark_resync(thread_id, GAP_RESYNC_COOLDOWN) {
-            return;
+        {
+            let mut last = self.last_resync.lock().unwrap();
+            if let Some(t) = last.get(thread_id) {
+                if t.elapsed() < Duration::from_millis(1200) {
+                    return; // 刚请求过，节流
+                }
+            }
+            last.insert(thread_id.to_string(), Instant::now());
         }
         let Ok((peer, host_thread_id)) = self.roaming_route(thread_id) else {
             return;
@@ -2338,9 +2337,6 @@ impl RelayManager {
                 .collect()
         };
         for (guest_thread_id, peer, host_thread_id) in routes {
-            if !self.try_mark_resync(&guest_thread_id, AUTOMATIC_RESYNC_COOLDOWN) {
-                continue;
-            }
             let _ = self.send_blocking(
                 &peer,
                 "roaming.resync",
@@ -2890,16 +2886,6 @@ impl RelayManager {
             .insert(thread_id.to_string(), Instant::now());
     }
 
-    fn try_mark_resync(&self, thread_id: &str, cooldown: Duration) -> bool {
-        let now = Instant::now();
-        let mut last = self.last_resync.lock().unwrap();
-        if !resync_cooldown_elapsed(last.get(thread_id), now, cooldown) {
-            return false;
-        }
-        last.insert(thread_id.to_string(), now);
-        true
-    }
-
     /// guest 看门狗：周期性对「自认为还在运行」的漫游会话请求一次重同步。
     /// host 会回一份当前快照（含真实运行态），用于自愈：
     /// 1) 长轮次中途丢失/卡住的增量（命令卡 loading、思考残缺）；
@@ -2952,9 +2938,6 @@ impl RelayManager {
                 .collect()
         };
         for (guest_thread_id, peer, host_thread_id) in routes {
-            if !self.try_mark_resync(&guest_thread_id, AUTOMATIC_RESYNC_COOLDOWN) {
-                continue;
-            }
             self.spawn_send_now(
                 peer,
                 "roaming.resync",
@@ -3933,28 +3916,5 @@ mod tests {
         assert!(!host_prompt_is_current(&pending));
         let next = (epoch.clone(), epoch.load(Ordering::SeqCst));
         assert!(host_prompt_is_current(&next));
-    }
-
-    #[test]
-    fn automatic_resync_waits_for_cooldown() {
-        let now = Instant::now();
-        let recent = now - Duration::from_secs(3);
-        let elapsed = now - AUTOMATIC_RESYNC_COOLDOWN;
-
-        assert!(resync_cooldown_elapsed(
-            None,
-            now,
-            AUTOMATIC_RESYNC_COOLDOWN
-        ));
-        assert!(!resync_cooldown_elapsed(
-            Some(&recent),
-            now,
-            AUTOMATIC_RESYNC_COOLDOWN
-        ));
-        assert!(resync_cooldown_elapsed(
-            Some(&elapsed),
-            now,
-            AUTOMATIC_RESYNC_COOLDOWN
-        ));
     }
 }

@@ -76,7 +76,7 @@ pub struct AppState {
     pub claudecode: Arc<AcpManager>,
     /// Cursor（cursor-agent acp）：标准 ACP，多路复用；session/load 有已知缺陷故进程常驻不回收
     pub cursor: Arc<AcpManager>,
-    /// OpenCode（opencode acp 模式）：标准 ACP，多路复用，空闲整树回收
+    /// OpenCode（opencode acp 模式）：每线程独立连接，支持多会话并行，空闲逐连接回收
     pub opencode: Arc<AcpManager>,
     pub codex: Arc<CodexManager>,
     /// 额度租借会话的独立后端进程与临时凭证目录（只在本次运行内存在）。
