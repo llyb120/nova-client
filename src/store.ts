@@ -5,7 +5,10 @@ import { api } from "./ipc";
 import type {
   AgentKind,
   BranchList,
+  CaptureClueResult,
   CliOperationProgress,
+  ClueCard,
+  ClueNodeGroup,
   Decision,
   EffortChoice,
   Employee,
@@ -120,8 +123,12 @@ interface AppStore {
   /** 手动展开的详情（工具调用/轮次折叠/思考过程），key 为 item id；切换线程时清空 */
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
-  /** 主区域视图：主页 / 数字员工配置 / 御书房日常（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "employees" | "workbench";
+  /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
+  view: "home" | "clues" | "employees" | "workbench";
+  /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
+  clueGroups: ClueNodeGroup[];
+  /** 从证据链跳到新会话时暂存的根线索。 */
+  pendingClueCard: { id: string; title: string } | null;
   /** 数字员工列表 */
   employees: Employee[];
   /** 全部员工的任务活动记录（历史/进行中） */
@@ -192,6 +199,8 @@ export const [state, setState] = createStore<AppStore>({
   expanded: {},
   titleTyping: {},
   view: "home",
+  clueGroups: [],
+  pendingClueCard: null,
   employees: [],
   employeeTasks: [],
   marks: [],
@@ -488,9 +497,55 @@ export async function refreshRoamingFolders() {
 
 // ===== 数字员工 =====
 
-/** 切换主区域视图（主页 / 数字员工配置 / 御书房日常）。不影响已打开的会话（currentId 优先） */
-export function setView(view: "home" | "employees" | "workbench") {
+/** 切换主区域视图。不影响已打开的会话（currentId 优先）。 */
+export function setView(view: "home" | "clues" | "employees" | "workbench") {
   setState("view", view);
+}
+
+export function clueCurrentVersion(card: ClueCard) {
+  return card.versions.find((version) => version.id === card.currentVersionId) ?? card.versions.at(-1);
+}
+
+export function clueCardById(cardId: string | null | undefined): ClueCard | undefined {
+  if (!cardId) return undefined;
+  for (const group of state.clueGroups) {
+    const card = group.cards.find((item) => item.id === cardId);
+    if (card) return card;
+  }
+  return undefined;
+}
+
+export async function refreshClueGroups() {
+  const groups = await api.listClueGroups();
+  setState("clueGroups", reconcile(groups));
+}
+
+export async function captureClue(
+  threadId: string | null,
+  title: string,
+  content: string,
+  placement: "update" | "parallel" | "new",
+  targetCardId: string | null,
+): Promise<CaptureClueResult> {
+  const result = await api.captureClue(threadId, title, content, placement, targetCardId);
+  await Promise.all([refreshClueGroups(), refreshThreads()]);
+  return result;
+}
+
+export async function associateClues(beforeCardId: string, afterCardId: string) {
+  await api.associateClues(beforeCardId, afterCardId);
+  await refreshClueGroups();
+}
+
+export function startSessionFromClue(card: ClueCard) {
+  const version = clueCurrentVersion(card);
+  setState("pendingClueCard", { id: card.id, title: version?.title || "未命名线索" });
+  closeThread();
+  setView("home");
+}
+
+export function clearPendingClueCard() {
+  setState("pendingClueCard", null);
 }
 
 export async function refreshEmployees() {
@@ -638,6 +693,7 @@ export async function createRoamingThread(
   model: string,
   mode: string,
   firstPrompt = "",
+  clueCardId = "",
   worktree = false,
   worktreeBranch = "",
   worktreeBase = "",
@@ -650,6 +706,7 @@ export async function createRoamingThread(
     model || null,
     mode || null,
     firstPrompt.trim() || null,
+    clueCardId || null,
     worktree,
     worktreeBranch.trim() || null,
     worktreeBase.trim() || null,
@@ -694,6 +751,7 @@ export async function createQuotaThread(
   agentKind: AgentKind,
   model: string,
   mode: string,
+  clueCardId = "",
 ): Promise<string> {
   const operationId = crypto.randomUUID();
   const t = await api.createQuotaThread(
@@ -703,6 +761,7 @@ export async function createQuotaThread(
     agentKind,
     model || null,
     mode || null,
+    clueCardId || null,
     operationId,
   );
   rememberThreadSnapshot(t);
@@ -891,6 +950,7 @@ export async function createThread(
   worktree = false,
   worktreeBranch = "",
   worktreeBase = "",
+  clueCardId = "",
 ): Promise<string> {
   const t = await api.createThread(
     cwd,
@@ -902,6 +962,7 @@ export async function createThread(
     worktree,
     worktreeBranch.trim() || null,
     worktreeBase.trim() || null,
+    clueCardId || null,
   );
   rememberThreadSnapshot(t);
   const storedAgentKind = t.agentKind ?? agentKind;
@@ -1484,6 +1545,9 @@ export async function initStore() {
   await listen("decisions:changed", () => {
     void refreshDecisions();
   });
+  await listen("clues:changed", () => {
+    void refreshClueGroups();
+  });
 
   // 系统通知点击：跳转到对应会话
   await listen<{ threadId: string }>("acp:notify-open", (e) => {
@@ -1630,6 +1694,7 @@ export async function initStore() {
   void refreshEmployeeTasks();
   void refreshMarks();
   void refreshDecisions();
+  void refreshClueGroups();
 
   // 会话/项目列表也是快的本地读取；升级重启后的会话恢复依赖 threads 已就绪，故这里 await 等它俩。
   await Promise.all([refreshThreads(), refreshProjects()]);

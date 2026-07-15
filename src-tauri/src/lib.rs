@@ -3,6 +3,7 @@ mod agent_config;
 mod cli;
 mod cli_manager;
 mod tool_api;
+mod clues;
 mod codex;
 mod credential_roaming;
 mod employees;
@@ -45,6 +46,8 @@ use threads::{
 
 pub struct AppState {
     pub store: Mutex<ThreadStore>,
+    /// 证据链本地存储：未配置 Relay 时是真相来源；配置后作为团队数据缓存。
+    pub clues: Mutex<clues::ClueStore>,
     pub projects: Mutex<ProjectStore>,
     pub settings: Mutex<Settings>,
     pub roaming: Mutex<RoamingStore>,
@@ -480,10 +483,116 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
             employee_id: t.employee_id.clone(),
             mind_thread: t.mind_thread,
             parent_thread_id: t.parent_thread_id.clone(),
+            active_clue_card_id: t.active_clue_card_id.clone(),
         })
         .collect();
     metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     metas
+}
+
+#[tauri::command]
+async fn list_clue_groups(
+    state: State<'_, AppState>,
+) -> Result<Vec<clues::ClueNodeGroup>, String> {
+    if state.relay.is_configured() {
+        let groups = state.relay.clue_list().await?;
+        let _ = state.clues.lock().unwrap().replace(groups.clone());
+        Ok(groups)
+    } else {
+        Ok(state.clues.lock().unwrap().list())
+    }
+}
+
+#[tauri::command]
+async fn get_clue_context(
+    state: State<'_, AppState>,
+    card_id: String,
+) -> Result<clues::ClueContextSnapshot, String> {
+    if state.relay.is_configured() {
+        state.relay.clue_context(&card_id).await
+    } else {
+        state.clues.lock().unwrap().snapshot(&card_id)
+    }
+}
+
+#[tauri::command]
+async fn capture_clue(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: Option<String>,
+    title: String,
+    content: String,
+    placement: String,
+    target_card_id: Option<String>,
+) -> Result<clues::CaptureClueResult, String> {
+    if let Some(thread_id) = thread_id.as_deref() {
+        let store = state.store.lock().unwrap();
+        if store.get(thread_id).is_none() {
+            return Err("线程不存在".into());
+        }
+    }
+    let result = if state.relay.is_configured() {
+        let result = state
+            .relay
+            .clue_capture(
+                thread_id.as_deref(),
+                &title,
+                &content,
+                &placement,
+                target_card_id.as_deref(),
+            )
+            .await?;
+        if let Ok(groups) = state.relay.clue_list().await {
+            let _ = state.clues.lock().unwrap().replace(groups);
+        }
+        result
+    } else {
+        state.clues.lock().unwrap().capture(
+            &placement,
+            target_card_id.as_deref(),
+            title,
+            content,
+            thread_id.clone(),
+        )?
+    };
+    if let Some(thread_id) = thread_id {
+        let mut store = state.store.lock().unwrap();
+        if let Some(thread) = store.get_mut(&thread_id) {
+            thread.active_clue_card_id = Some(result.card.id.clone());
+            thread.updated_at = now_ms();
+            store.save();
+        }
+        let _ = app.emit(acp::EV_THREADS, json!({}));
+    }
+    let _ = app.emit(clues::EV_CLUES, json!({}));
+    Ok(result)
+}
+
+#[tauri::command]
+async fn associate_clues(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    before_card_id: String,
+    after_card_id: String,
+) -> Result<clues::ClueNodeGroup, String> {
+    let group = if state.relay.is_configured() {
+        let group = state
+            .relay
+            .clue_associate(&before_card_id, &after_card_id)
+            .await?;
+        if let Ok(groups) = state.relay.clue_list().await {
+            let _ = state.clues.lock().unwrap().replace(groups);
+        }
+        group
+    } else {
+        state
+            .clues
+            .lock()
+            .unwrap()
+            .associate(&before_card_id, &after_card_id)?
+    };
+    let _ = app.emit(clues::EV_CLUES, json!({}));
+    Ok(group)
 }
 
 #[tauri::command]
@@ -913,7 +1022,7 @@ pub fn create_worktree_for(
 }
 
 #[tauri::command]
-fn create_thread(
+async fn create_thread(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     cwd: String,
@@ -925,6 +1034,7 @@ fn create_thread(
     worktree: Option<bool>,
     worktree_branch: Option<String>,
     worktree_base: Option<String>,
+    clue_card_id: Option<String>,
 ) -> Result<Thread, String> {
     let dir = std::path::Path::new(&cwd);
     if !dir.is_dir() {
@@ -945,6 +1055,15 @@ fn create_thread(
         reasoning_effort.filter(|s| !s.is_empty()),
         ephemeral.unwrap_or(false),
     );
+    if let Some(card_id) = clue_card_id.filter(|value| !value.trim().is_empty()) {
+        let snapshot = if state.relay.is_configured() {
+            state.relay.clue_context(&card_id).await?
+        } else {
+            state.clues.lock().unwrap().snapshot(&card_id)?
+        };
+        thread.active_clue_card_id = Some(card_id);
+        thread.clue_context = Some(snapshot);
+    }
     // worktree：在独立工作目录 + 分支中执行，不动主工作区。
     // 大仓库 `git worktree add` 很慢，改为后台创建：会话先落库返回、前端立即进入，
     // 就绪后再把 cwd 切到 worktree 并由前端补发首条提示词，避免卡住界面。
@@ -2631,6 +2750,7 @@ async fn create_roaming_thread(
     model: Option<String>,
     mode: Option<String>,
     first_prompt: Option<String>,
+    clue_card_id: Option<String>,
     worktree: Option<bool>,
     worktree_branch: Option<String>,
     worktree_base: Option<String>,
@@ -2643,6 +2763,10 @@ async fn create_roaming_thread(
     let mode = mode
         .filter(|s| !s.is_empty())
         .or(Some(default_mode).filter(|s| !s.is_empty()));
+    let clue_context = match clue_card_id.filter(|value| !value.trim().is_empty()) {
+        Some(card_id) => Some(state.relay.clue_context(&card_id).await?),
+        None => None,
+    };
     relay
         .create_roaming_thread(
             peer_token,
@@ -2652,6 +2776,7 @@ async fn create_roaming_thread(
             model.filter(|s| !s.is_empty()),
             mode,
             first_prompt.filter(|s| !s.trim().is_empty()),
+            clue_context,
             worktree.unwrap_or(false),
             worktree_branch.filter(|s| !s.trim().is_empty()),
             worktree_base.filter(|s| !s.trim().is_empty()),
@@ -2669,8 +2794,13 @@ async fn create_quota_thread(
     agent_kind: Option<AgentKind>,
     model: Option<String>,
     mode: Option<String>,
+    clue_card_id: Option<String>,
     operation_id: String,
 ) -> Result<Thread, String> {
+    let clue_context = match clue_card_id.filter(|value| !value.trim().is_empty()) {
+        Some(card_id) => Some(state.relay.clue_context(&card_id).await?),
+        None => None,
+    };
     state
         .relay
         .create_quota_thread(
@@ -2680,6 +2810,7 @@ async fn create_quota_thread(
             agent_kind.unwrap_or(AgentKind::Devin),
             model,
             mode,
+            clue_context,
             operation_id,
         )
         .await
@@ -3576,6 +3707,7 @@ pub fn run() {
             // 后端的空闲提示定时器会在没有任务时弹窗让用户选择是否现在更新（用户主导）。
 
             let store = ThreadStore::load(dir.clone());
+            let clues = clues::ClueStore::load(&dir);
             let mut projects = ProjectStore::load(&dir);
             // 迁移：项目列表为空时从既有会话提取目录
             if projects.projects.is_empty() && !store.threads.is_empty() {
@@ -3611,6 +3743,7 @@ pub fn run() {
 
             app.manage(AppState {
                 store: Mutex::new(store),
+                clues: Mutex::new(clues),
                 projects: Mutex::new(projects),
                 settings: Mutex::new(settings),
                 roaming: Mutex::new(roaming),
@@ -3821,6 +3954,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_threads,
             get_thread,
+            list_clue_groups,
+            get_clue_context,
+            capture_clue,
+            associate_clues,
             list_projects,
             remove_project,
             prewarm,

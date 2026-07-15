@@ -66,6 +66,16 @@ export const IconMerge = (p: P) =>
     </>,
     p,
   );
+export const IconClue = (p: P) =>
+  svg(
+    <>
+      <circle cx="6" cy="6" r="2.5" />
+      <circle cx="18" cy="12" r="2.5" />
+      <circle cx="6" cy="18" r="2.5" />
+      <path d="M8.5 6c4.2 0 4.5 4.4 7 5.5M8.5 18c4.2 0 4.5-4.4 7-5.5" />
+    </>,
+    p,
+  );
 export const IconEye = (p: P) =>
   svg(<><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></>, p);
 export const IconCopy = (p: P) =>

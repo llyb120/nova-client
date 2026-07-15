@@ -794,6 +794,9 @@ fn recent_thread_ids(app: &AppHandle, limit: usize) -> Vec<String> {
 
 fn remote_thread_value(thread: &Thread) -> Value {
     let mut thread = thread.clone();
+    // 远程设备/网页会话暂不传递证据链；漫游会话走 relay.rs 的独立协议。
+    thread.active_clue_card_id = None;
+    thread.clue_context = None;
     for item in &mut thread.items {
         compact_remote_item(item);
     }
@@ -977,6 +980,23 @@ mod tests {
         let before = thread_checkpoint(&thread);
         thread.plan = Some(json!([{"step": "test", "status": "pending"}]));
         assert_ne!(before, thread_checkpoint(&thread));
+    }
+
+    #[test]
+    fn remote_thread_snapshot_omits_clue_context() {
+        let mut thread = Thread::new("C:/work".into(), AgentKind::Codex, None, None, None, false);
+        thread.active_clue_card_id = Some("card-1".into());
+        thread.clue_context = serde_json::from_value(json!({
+            "rootCardId": "card-1",
+            "cards": [],
+            "renderedContext": "secret clue context",
+            "createdAt": 1
+        }))
+        .ok();
+
+        let value = remote_thread_value(&thread);
+        assert!(value.get("activeClueCardId").is_none());
+        assert!(value.get("clueContext").is_none());
     }
 
     #[test]

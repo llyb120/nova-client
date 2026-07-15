@@ -14,6 +14,9 @@
 //! since=<最后 seq> 补发漏掉的消息，保证不丢、不影响使用。
 
 use crate::credential_roaming::CredentialBundle;
+use crate::clues::{
+    CaptureClueResult, ClueContextSnapshot, ClueNodeGroup, EV_CLUES,
+};
 use crate::settings::Settings;
 use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, Worktree};
 use crate::AppState;
@@ -21,6 +24,7 @@ use base64::Engine;
 use flate2::read::DeflateDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -73,6 +77,7 @@ struct PendingRoam {
     agent_kind: AgentKind,
     model: Option<String>,
     mode: Option<String>,
+    clue_context: Option<ClueContextSnapshot>,
     /// guest 是否要求在 worktree 中执行（host 侧在自己仓库代建）
     worktree: bool,
     /// worktree 分支名（guest 手填）
@@ -295,6 +300,16 @@ struct InEnvelope {
     kind: String,
     #[serde(default)]
     data: Value,
+}
+
+#[derive(Deserialize)]
+struct RelayClueList {
+    groups: Vec<ClueNodeGroup>,
+}
+
+#[derive(Deserialize)]
+struct RelayClueAssociate {
+    group: ClueNodeGroup,
 }
 
 pub struct RelayManager {
@@ -724,6 +739,9 @@ impl RelayManager {
                 *self.peers.lock().unwrap() = peers.clone();
                 let _ = self.app.emit(EV_RELAY_PEERS, peers);
             }
+            "clues.changed" => {
+                let _ = self.app.emit(EV_CLUES, env.data);
+            }
             "share" => self.on_share(&env),
             // guest -> host
             "roaming.create" => self.on_roaming_create(&env),
@@ -963,6 +981,83 @@ impl RelayManager {
             .and_then(|m| m.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    fn clue_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
+        Ok(self
+            .http
+            .request(method, format!("{server}{path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Relay-Name", &name)
+            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Device", &self.device_id)
+            .timeout(Duration::from_secs(15)))
+    }
+
+    pub async fn clue_list(&self) -> Result<Vec<ClueNodeGroup>, String> {
+        let response = self
+            .clue_request(reqwest::Method::GET, "/v1/clues")?
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(decode_relay_json::<RelayClueList>(response).await?.groups)
+    }
+
+    pub async fn clue_capture(
+        &self,
+        thread_id: Option<&str>,
+        title: &str,
+        content: &str,
+        placement: &str,
+        target_card_id: Option<&str>,
+    ) -> Result<CaptureClueResult, String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v1/clues/capture")?
+            .json(&json!({
+                "threadId": thread_id.unwrap_or_default(),
+                "title": title,
+                "content": content,
+                "placement": placement,
+                "targetCardId": target_card_id.unwrap_or_default(),
+            }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        decode_relay_json(response).await
+    }
+
+    pub async fn clue_associate(
+        &self,
+        before_card_id: &str,
+        after_card_id: &str,
+    ) -> Result<ClueNodeGroup, String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v1/clues/associate")?
+            .json(&json!({
+                "beforeCardId": before_card_id,
+                "afterCardId": after_card_id,
+            }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(decode_relay_json::<RelayClueAssociate>(response)
+            .await?
+            .group)
+    }
+
+    pub async fn clue_context(&self, card_id: &str) -> Result<ClueContextSnapshot, String> {
+        let response = self
+            .clue_request(reqwest::Method::GET, "/v1/clues/context")?
+            .query(&[("cardId", card_id)])
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        decode_relay_json(response).await
     }
 
     /// 中转站是否已配置（用于判断能否使用共享账本）。
@@ -1429,6 +1524,7 @@ impl RelayManager {
         agent_kind: AgentKind,
         model: Option<String>,
         mode: Option<String>,
+        clue_context: Option<ClueContextSnapshot>,
         operation_id: String,
     ) -> Result<Thread, String> {
         if self.cfg().is_none() {
@@ -1457,6 +1553,7 @@ impl RelayManager {
                 agent_kind,
                 model,
                 mode,
+                clue_context,
                 &operation_id,
                 operation,
             )
@@ -1474,6 +1571,7 @@ impl RelayManager {
         agent_kind: AgentKind,
         model: Option<String>,
         mode: Option<String>,
+        clue_context: Option<ClueContextSnapshot>,
         operation_id: &str,
         operation: Arc<QuotaOperation>,
     ) -> Result<Thread, String> {
@@ -1543,6 +1641,10 @@ impl RelayManager {
         );
         thread.quota_peer = Some(peer_token);
         thread.quota_peer_name = Some(peer_name.clone());
+        if let Some(context) = clue_context {
+            thread.active_clue_card_id = Some(context.root_card_id.clone());
+            thread.clue_context = Some(context);
+        }
         thread.title = format!("额度@{peer_name} · {}", basename(&cwd));
         thread.push_system_local(
             format!(
@@ -1708,6 +1810,7 @@ impl RelayManager {
         model: Option<String>,
         mode: Option<String>,
         first_prompt: Option<String>,
+        clue_context: Option<ClueContextSnapshot>,
         worktree: bool,
         worktree_branch: Option<String>,
         worktree_base: Option<String>,
@@ -1726,6 +1829,10 @@ impl RelayManager {
         thread.roaming_role = Some("guest".into());
         thread.roaming_peer = Some(peer_token.clone());
         thread.roaming_peer_name = Some(peer_name.clone());
+        if let Some(context) = clue_context.clone() {
+            thread.active_clue_card_id = Some(context.root_card_id.clone());
+            thread.clue_context = Some(context);
+        }
         thread.title = format!("漫游 · {}", basename(&folder));
         if worktree {
             // guest 侧只是展示壳，真实 worktree 由 host 在自己仓库创建；这里仅记录分支用于界面标注
@@ -1768,6 +1875,7 @@ impl RelayManager {
                 "mode": mode,
                 // 首条提示词随请求发给 host，仅用于审批确认框展示「谁要做什么」
                 "prompt": first_prompt,
+                "clueContext": clue_context,
                 // worktree：让 host 在自己仓库为这次漫游创建独立工作目录 + 分支
                 "worktree": worktree,
                 "worktreeBranch": worktree_branch,
@@ -2208,6 +2316,22 @@ impl RelayManager {
         let agent_kind_str = agent_kind.as_str();
         let model = env.data["model"].as_str().map(|s| s.to_string());
         let mode = env.data["mode"].as_str().map(|s| s.to_string());
+        let clue_context = match env.data.get("clueContext") {
+            Some(value) if !value.is_null() => {
+                match serde_json::from_value::<ClueContextSnapshot>(value.clone()) {
+                    Ok(context) => Some(context),
+                    Err(_) => {
+                        self.spawn_send_now(
+                            env.from.clone(),
+                            "roaming.created",
+                            json!({ "reqId": req_id, "ok": false, "error": "证据链上下文格式无效" }),
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
         let worktree = env.data["worktree"].as_bool().unwrap_or(false);
         let worktree_branch = env.data["worktreeBranch"].as_str().map(|s| s.to_string());
         let worktree_base = env.data["worktreeBase"].as_str().map(|s| s.to_string());
@@ -2233,6 +2357,7 @@ impl RelayManager {
                 agent_kind: agent_kind.clone(),
                 model,
                 mode,
+                clue_context,
                 worktree,
                 worktree_branch: worktree_branch.clone(),
                 worktree_base,
@@ -2309,6 +2434,10 @@ impl RelayManager {
         thread.roaming_peer = Some(pending.from.clone());
         thread.roaming_peer_name = Some(pending.from_name.clone());
         thread.roaming_remote_id = Some(pending.guest_thread_id.clone());
+        if let Some(context) = pending.clue_context {
+            thread.active_clue_card_id = Some(context.root_card_id.clone());
+            thread.clue_context = Some(context);
+        }
         thread.title = format!("漫游@{} · {}", pending.from_name, basename(&pending.folder));
         let host_thread_id = thread.id.clone();
         // worktree：host 在自己仓库为这次漫游创建独立工作目录 + 分支，会话在其中执行。
@@ -3503,6 +3632,20 @@ pub async fn probe_relay(server: &str, token: &str, groups: &str) -> Result<i64,
         })
         .unwrap_or(0);
     Ok(online)
+}
+
+async fn decode_relay_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, String> {
+    let status = response.status();
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        let message = body.trim();
+        return Err(if message.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            message.to_string()
+        });
+    }
+    serde_json::from_str(&body).map_err(|error| error.to_string())
 }
 
 fn relay_display_name(s: &Settings) -> String {

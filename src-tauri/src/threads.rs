@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+use crate::clues::ClueContextSnapshot;
+
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -352,6 +354,12 @@ pub struct Thread {
     /// 会话树父节点：用于把数字员工“开工预检”与后续开发会话关联展示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
+    /// 本会话从哪张线索卡发起；后续生成线索时默认以它为当前位置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_clue_card_id: Option<String>,
+    /// 发起会话时固定的证据链上下文快照。节点组是内部结构，快照只包含用户可见卡片。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clue_context: Option<ClueContextSnapshot>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default)]
@@ -391,6 +399,8 @@ impl Thread {
             employee_id: None,
             mind_thread: false,
             parent_thread_id: None,
+            active_clue_card_id: None,
+            clue_context: None,
             created_at: now,
             updated_at: now,
             items: Vec::new(),
@@ -502,6 +512,32 @@ impl Thread {
         let from = self.handoff_from.take()?;
         render_handoff_context(&self.items, self.plan.as_ref(), from.label(), to_label)
     }
+
+    /// 当前 prompt 需要额外注入的上下文：
+    /// - 从线索发起的新会话首条消息注入固定 Paper Trail；
+    /// - 跨 Agent 接力时再次携带该 Trail，并拼接原有会话历史。
+    pub fn take_prompt_context(&mut self, to_label: &str) -> Option<String> {
+        let has_user_message = self
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::User { .. }));
+        let has_handoff = self.handoff_from.is_some();
+        let clue = if !has_user_message || has_handoff {
+            self.clue_context
+                .as_ref()
+                .map(|context| context.rendered_context.trim().to_string())
+                .filter(|context| !context.is_empty())
+        } else {
+            None
+        };
+        let handoff = self.take_handoff_context(to_label);
+        match (clue, handoff) {
+            (Some(clue), Some(handoff)) => Some(format!("{clue}\n\n{handoff}")),
+            (Some(clue), None) => Some(clue),
+            (None, Some(handoff)) => Some(handoff),
+            (None, None) => None,
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -534,6 +570,8 @@ pub struct ThreadMeta {
     /// 会话树父节点：用于把预检会话与后续开发会话关联展示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_clue_card_id: Option<String>,
 }
 
 /// 最近项目列表（独立持久化，删除会话后仍保留）

@@ -6,6 +6,7 @@ import {
   createRoamingThread,
   createQuotaThread,
   createThread,
+  clearPendingClueCard,
   clearQuotaRoamingProgress,
   enabledAgentKinds,
   ensureModelOptions,
@@ -23,13 +24,14 @@ import {
   resolveEnabledAgentKind,
   roamingPeers,
   sendPrompt,
+  setView,
   state,
   stashWorktreePrompt,
 } from "../store";
 import type { AgentKind, Peer } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
-import { IconFolder, IconLogo, IconSend, IconX } from "./icons";
+import { IconClue, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { ProjectPicker } from "./ProjectPicker";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
@@ -374,6 +376,7 @@ export function HomeView() {
     const images = attach.images();
     const target = roam();
     const quota = quotaPeer();
+    const clue = state.pendingClueCard;
     if (
       (!t && images.length === 0) ||
       busy() ||
@@ -398,13 +401,16 @@ export function HomeView() {
           model(),
           mode(),
           t,
+          clue?.id ?? "",
           wtOn,
           branch,
           base,
         );
+        if (clue) clearPendingClueCard();
         await sendPrompt(t, images);
       } else if (quota) {
-        await createQuotaThread(quota, cwd(), agentKind(), model(), mode());
+        await createQuotaThread(quota, cwd(), agentKind(), model(), mode(), clue?.id ?? "");
+        if (clue) clearPendingClueCard();
         await sendPrompt(t, images);
       } else if (wtOn) {
         // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词
@@ -418,10 +424,24 @@ export function HomeView() {
           true,
           branch,
           base,
+          clue?.id ?? "",
         );
+        if (clue) clearPendingClueCard();
         stashWorktreePrompt(id, t, images);
       } else {
-        await createThread(cwd(), agentKind(), model(), mode(), "", opts.ephemeral ?? false, false, "", "");
+        await createThread(
+          cwd(),
+          agentKind(),
+          model(),
+          mode(),
+          "",
+          opts.ephemeral ?? false,
+          false,
+          "",
+          "",
+          clue?.id ?? "",
+        );
+        if (clue) clearPendingClueCard();
         await sendPrompt(t, images);
       }
       setText("");
@@ -429,6 +449,7 @@ export function HomeView() {
       setRoam(null);
       setQuotaPeer(null);
       attach.clear();
+      clearPendingClueCard();
       if (textareaRef) textareaRef.style.height = "auto";
       submittingPrompt = false;
     } catch (error) {
@@ -625,6 +646,17 @@ export function HomeView() {
           classList={{ "is-dragging": attach.dragging() }}
         >
           <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
+          <Show when={state.pendingClueCard}>
+            {(clue) => (
+              <div class="clue-context-chip">
+                <IconClue size={13} />
+                <span>证据链 · {clue().title}</span>
+                <button type="button" title="移除线索上下文" onClick={clearPendingClueCard}>
+                  <IconX size={12} />
+                </button>
+              </div>
+            )}
+          </Show>
           <Show when={slashQuery() !== null}>
             <div ref={slashMenuRef} class="slash-menu">
               <div class="slash-menu-head">
@@ -697,6 +729,14 @@ export function HomeView() {
               />
             </Show>
             <span class="bar-spacer" />
+            <button
+              type="button"
+              class="composer-btn clue"
+              title={state.pendingClueCard ? "查看或更换证据链" : "从证据链发起会话"}
+              onClick={() => setView("clues")}
+            >
+              <IconClue size={16} />
+            </button>
             <button
               class="composer-btn send"
               disabled={

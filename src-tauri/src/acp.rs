@@ -2,7 +2,7 @@ use crate::model_cache;
 use crate::nova_data_dir;
 use crate::settings::Settings;
 use crate::threads::{
-    now_ms, render_handoff_context, AgentKind, Item, PromptImage, Thread, ToolCall,
+    now_ms, AgentKind, Item, PromptImage, Thread, ToolCall,
 };
 use crate::AppState;
 use serde_json::{json, Value};
@@ -3489,7 +3489,7 @@ impl AcpManager {
     ) {
         // 必须在任何 await / running 置位之前记录：停止可能发生在本轮等待独占连接闸门时。
         let cancel_epoch = self.cancel_epoch(&thread_id);
-        // 上下文接力：跨 agent 切换后的首条消息，把历史注入新 agent
+        // 新会话的 Paper Trail / 跨 agent 接力上下文，在真实用户输入前隐式注入。
         let handoff = {
             let cursor_routes = (self.kind == AgentKind::Cursor).then(|| {
                 self.routes
@@ -3503,8 +3503,9 @@ impl AcpManager {
             let mut store = state.store.lock().unwrap();
             let mut consumed_marker = false;
             let ctx = store.get_mut(&thread_id).and_then(|t| {
-                if let Some(ctx) = t.take_handoff_context(self.kind.label()) {
-                    consumed_marker = true;
+                let had_handoff = t.handoff_from.is_some();
+                if let Some(ctx) = t.take_prompt_context(self.kind.label()) {
+                    consumed_marker = had_handoff;
                     return Some(ctx);
                 }
                 let needs_cursor_handoff = if self.kind == AgentKind::Cursor && !t.items.is_empty()
@@ -3517,16 +3518,13 @@ impl AcpManager {
                 } else {
                     false
                 };
-                needs_cursor_handoff
-                .then(|| {
-                    render_handoff_context(
-                        &t.items,
-                        t.plan.as_ref(),
-                        self.kind.label(),
-                        self.kind.label(),
-                    )
-                })
-                .flatten()
+                if needs_cursor_handoff {
+                    t.handoff_from = Some(AgentKind::Cursor);
+                    consumed_marker = true;
+                    t.take_prompt_context(self.kind.label())
+                } else {
+                    None
+                }
             });
             if consumed_marker {
                 store.save();
@@ -3898,7 +3896,7 @@ impl AcpManager {
                         let mut store = state.store.lock().unwrap();
                         store.get_mut(thread_id).and_then(|thread| {
                             thread.handoff_from = Some(AgentKind::Cursor);
-                            thread.take_handoff_context(self.kind.label())
+                            thread.take_prompt_context(self.kind.label())
                         })
                     };
                     if let Some(ctx) = ctx {

@@ -2,7 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentKind,
   BranchList,
+  CaptureClueResult,
   CliStatus,
+  ClueContextSnapshot,
+  ClueNodeGroup,
   Decision,
   Employee,
   EmployeeJournalEntry,
@@ -60,6 +63,7 @@ export const api = {
     worktree = false,
     worktreeBranch: string | null = null,
     worktreeBase: string | null = null,
+    clueCardId: string | null = null,
   ) =>
     invoke<Thread>("create_thread", {
       cwd,
@@ -71,7 +75,27 @@ export const api = {
       worktree,
       worktreeBranch,
       worktreeBase,
+      clueCardId,
     }),
+  listClueGroups: () => invoke<ClueNodeGroup[]>("list_clue_groups"),
+  getClueContext: (cardId: string) =>
+    invoke<ClueContextSnapshot>("get_clue_context", { cardId }),
+  captureClue: (
+    threadId: string | null,
+    title: string,
+    content: string,
+    placement: "update" | "parallel" | "new",
+    targetCardId: string | null,
+  ) =>
+    invoke<CaptureClueResult>("capture_clue", {
+      threadId,
+      title,
+      content,
+      placement,
+      targetCardId,
+    }),
+  associateClues: (beforeCardId: string, afterCardId: string) =>
+    invoke<ClueNodeGroup>("associate_clues", { beforeCardId, afterCardId }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),
   openInExplorer: (path: string) => invoke<void>("open_in_explorer", { path }),
@@ -163,6 +187,7 @@ export const api = {
     model: string | null,
     mode: string | null,
     firstPrompt: string | null,
+    clueCardId: string | null = null,
     worktree = false,
     worktreeBranch: string | null = null,
     worktreeBase: string | null = null,
@@ -175,6 +200,7 @@ export const api = {
       model,
       mode,
       firstPrompt,
+      clueCardId,
       worktree,
       worktreeBranch,
       worktreeBase,
@@ -188,6 +214,7 @@ export const api = {
     agentKind: AgentKind,
     model: string | null,
     mode: string | null,
+    clueCardId: string | null,
     operationId: string,
   ) =>
     invoke<Thread>("create_quota_thread", {
@@ -197,6 +224,7 @@ export const api = {
       agentKind,
       model,
       mode,
+      clueCardId,
       operationId,
     }),
   cancelQuotaRoaming: (operationId: string) =>

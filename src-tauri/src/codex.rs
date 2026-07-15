@@ -1869,13 +1869,13 @@ impl CodexManager {
         text: String,
         images: Vec<PromptImage>,
     ) {
-        // 上下文接力：跨 agent 切换后的首条消息，把历史注入新 agent
+        // 新会话的 Paper Trail / 跨 agent 接力上下文，在真实用户输入前隐式注入。
         let handoff = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let ctx = store
                 .get_mut(&thread_id)
-                .and_then(|t| t.take_handoff_context("Codex"));
+                .and_then(|t| t.take_prompt_context("Codex"));
             if ctx.is_some() {
                 store.save();
             }

@@ -20,6 +20,51 @@ export interface ProjectEntry {
   worktree?: { repo: string; branch: string } | null;
 }
 
+export interface ClueCardVersion {
+  id: string;
+  title: string;
+  content: string;
+  sourceThreadId?: string | null;
+  createdAt: number;
+}
+
+export interface ClueCard {
+  id: string;
+  currentVersionId: string;
+  versions: ClueCardVersion[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 内部节点组；界面只把 cards 展示为共享前置线索的平行后续卡片。 */
+export interface ClueNodeGroup {
+  id: string;
+  parentCardIds: string[];
+  cards: ClueCard[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ClueContextCard {
+  cardId: string;
+  versionId: string;
+  title: string;
+  content: string;
+  parentCardIds: string[];
+}
+
+export interface ClueContextSnapshot {
+  rootCardId: string;
+  cards: ClueContextCard[];
+  renderedContext: string;
+  createdAt: number;
+}
+
+export interface CaptureClueResult {
+  group: ClueNodeGroup;
+  card: ClueCard;
+}
+
 export interface ThreadMeta {
   id: string;
   title: string;
@@ -44,6 +89,8 @@ export interface ThreadMeta {
   mindThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
+  /** 当前会话在证据链中的线索位置 */
+  activeClueCardId?: string | null;
 }
 
 /** 用户随 prompt 带上的附件。图片可带 base64，普通文件走 file:// resource_link。 */
@@ -149,6 +196,8 @@ export interface Thread {
   mindThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
+  activeClueCardId?: string | null;
+  clueContext?: ClueContextSnapshot | null;
   createdAt: number;
   updatedAt: number;
   items: Item[];

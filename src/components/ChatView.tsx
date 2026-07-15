@@ -6,7 +6,8 @@ import { firstWakeDoPairForThread } from "../threadDisplay";
 import type { Item, Thread } from "../types";
 import { agentLabel } from "../utils";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconDownload, IconShare } from "./icons";
+import { ClueCaptureModal } from "./ClueCaptureModal";
+import { IconBroadcast, IconClue, IconCompress, IconDownload, IconShare } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { PlanCard } from "./PlanCard";
@@ -370,6 +371,7 @@ export function ChatView() {
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   const [showShare, setShowShare] = createSignal(false);
+  const [showClueCapture, setShowClueCapture] = createSignal(false);
 
   const currentMeta = createMemo(() =>
     state.threads.find((t) => t.id === state.currentId),
@@ -507,6 +509,23 @@ export function ChatView() {
             压缩
           </button>
         </Show>
+        <Show
+          when={
+            !!state.currentId &&
+            roamingRole() !== "guest" &&
+            state.items.some((item) => item.type === "assistant")
+          }
+        >
+          <button
+            class="chat-share-btn clue"
+            title="把本次会话结论保存到证据链"
+            disabled={isRunning()}
+            onClick={() => setShowClueCapture(true)}
+          >
+            <IconClue size={14} />
+            线索
+          </button>
+        </Show>
         <Show when={state.relay.connected && state.currentId && roamingRole() !== "guest"}>
           <button
             class="chat-share-btn"
@@ -531,6 +550,9 @@ export function ChatView() {
       </header>
       <Show when={showShare() && state.currentId}>
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
+      </Show>
+      <Show when={showClueCapture() && state.currentId}>
+        <ClueCaptureModal threadId={state.currentId!} onClose={() => setShowClueCapture(false)} />
       </Show>
 
       <div

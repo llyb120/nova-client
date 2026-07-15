@@ -20,6 +20,7 @@ import {
   IconBell,
   IconBroadcast,
   IconCheck,
+  IconClue,
   IconDownload,
   IconFolder,
   IconGear,
@@ -106,12 +107,13 @@ export function Sidebar(props: {
     ).length;
     return decisions + active;
   });
-  // 视图切换：直接切换（普通会话卷 / 员工会话卷 / 御书房），不加动画。
-  const switchView = (view: "home" | "employees" | "workbench") => {
+  // 视图切换：第一层是普通模式/证据链，第二层是御书房/数字员工。
+  const switchView = (view: "home" | "clues" | "employees" | "workbench") => {
     setView(view);
     closeThread();
   };
   const openHome = () => switchView("home");
+  const openClues = () => switchView("clues");
   const openEmployees = () => switchView("employees");
   const openWorkbench = () => switchView("workbench");
 
@@ -487,36 +489,49 @@ export function Sidebar(props: {
           <IconPlus size={15} />
           新对话
         </button>
-        <div class="mode-seg" role="tablist" aria-label="会话卷宗">
-          <button
-            class="mode-seg-btn"
-            classList={{ active: state.view === "home" }}
-            onClick={openHome}
-            title="普通模式：查看你自己的会话"
-          >
-            普通模式
-          </button>
-          <button
-            class="mode-seg-btn"
-            classList={{ active: state.view === "workbench" }}
-            onClick={openWorkbench}
-            title="御书房：下旨交办、查看进行中事件、批阅奏折与汇报"
-          >
-            <IconBell size={14} />
-            御书房
-            <Show when={workbenchBadge() > 0}>
-              <span class="mode-seg-badge alert">{workbenchBadge()}</span>
-            </Show>
-          </button>
-          <button
-            class="mode-seg-btn"
-            classList={{ active: state.view === "employees" }}
-            onClick={openEmployees}
-            title="数字员工配置：岗位、心跳、模型与知识库"
-          >
-            <IconUsers size={14} />
-            数字员工
-          </button>
+        <div class="mode-stack" role="tablist" aria-label="会话卷宗">
+          <div class="mode-seg">
+            <button
+              class="mode-seg-btn"
+              classList={{ active: state.view === "home" }}
+              onClick={openHome}
+              title="普通模式：查看你自己的会话"
+            >
+              普通模式
+            </button>
+            <button
+              class="mode-seg-btn"
+              classList={{ active: state.view === "clues" }}
+              onClick={openClues}
+              title="证据链：整理线索并沿线索发起新会话"
+            >
+              <IconClue size={14} />
+              证据链
+            </button>
+          </div>
+          <div class="mode-seg secondary">
+            <button
+              class="mode-seg-btn"
+              classList={{ active: state.view === "workbench" }}
+              onClick={openWorkbench}
+              title="御书房：下旨交办、查看进行中事件、批阅奏折与汇报"
+            >
+              <IconBell size={14} />
+              御书房
+              <Show when={workbenchBadge() > 0}>
+                <span class="mode-seg-badge alert">{workbenchBadge()}</span>
+              </Show>
+            </button>
+            <button
+              class="mode-seg-btn"
+              classList={{ active: state.view === "employees" }}
+              onClick={openEmployees}
+              title="数字员工配置：岗位、心跳、模型与知识库"
+            >
+              <IconUsers size={14} />
+              数字员工
+            </button>
+          </div>
         </div>
       </div>
 

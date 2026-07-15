@@ -4,6 +4,7 @@ import { ChatView } from "./components/ChatView";
 import { CliOperationModal } from "./components/CliOperationModal";
 import { DecisionWorkbench } from "./components/DecisionWorkbench";
 import { EmployeesView } from "./components/EmployeesView";
+import { EvidenceChainView } from "./components/EvidenceChainView";
 import { HomeView } from "./components/HomeView";
 import { RoamRequestModal } from "./components/RoamRequestModal";
 import { SettingsModal } from "./components/SettingsModal";
@@ -60,12 +61,16 @@ export default function App() {
       <Show
         when={state.currentId}
         fallback={
-          <Show when={state.view === "employees"} fallback={
-            <Show when={state.view === "workbench"} fallback={<HomeView />}>
-              <DecisionWorkbench />
+          <Show when={state.view === "clues"} fallback={
+            <Show when={state.view === "employees"} fallback={
+              <Show when={state.view === "workbench"} fallback={<HomeView />}>
+                <DecisionWorkbench />
+              </Show>
+            }>
+              <EmployeesView />
             </Show>
           }>
-            <EmployeesView />
+            <EvidenceChainView />
           </Show>
         }
       >
