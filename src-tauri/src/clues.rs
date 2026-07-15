@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -6,6 +6,14 @@ use std::path::PathBuf;
 use crate::threads::now_ms;
 
 pub const EV_CLUES: &str = "clues:changed";
+
+pub(crate) fn deserialize_vec_or_default<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +31,7 @@ pub struct ClueCardVersion {
 pub struct ClueCard {
     pub id: String,
     pub current_version_id: String,
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub versions: Vec<ClueCardVersion>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -42,9 +51,9 @@ impl ClueCard {
 #[serde(rename_all = "camelCase")]
 pub struct ClueNodeGroup {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub parent_card_ids: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub cards: Vec<ClueCard>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -57,7 +66,7 @@ pub struct ClueContextCard {
     pub version_id: String,
     pub title: String,
     pub content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub parent_card_ids: Vec<String>,
 }
 
@@ -65,6 +74,7 @@ pub struct ClueContextCard {
 #[serde(rename_all = "camelCase")]
 pub struct ClueContextSnapshot {
     pub root_card_id: String,
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub cards: Vec<ClueContextCard>,
     pub rendered_context: String,
     pub created_at: i64,
@@ -80,6 +90,7 @@ pub struct CaptureClueResult {
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClueFile {
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     groups: Vec<ClueNodeGroup>,
 }
 
@@ -512,5 +523,28 @@ mod tests {
             .unwrap();
 
         assert!(store.associate(&second.card.id, &first.card.id).is_err());
+    }
+
+    #[test]
+    fn null_arrays_from_older_relay_are_treated_as_empty() {
+        let group: ClueNodeGroup = serde_json::from_value(serde_json::json!({
+            "id": "group-1",
+            "parentCardIds": null,
+            "cards": null,
+            "createdAt": 1,
+            "updatedAt": 1
+        }))
+        .unwrap();
+        assert!(group.parent_card_ids.is_empty());
+        assert!(group.cards.is_empty());
+
+        let snapshot: ClueContextSnapshot = serde_json::from_value(serde_json::json!({
+            "rootCardId": "card-1",
+            "cards": null,
+            "renderedContext": "",
+            "createdAt": 1
+        }))
+        .unwrap();
+        assert!(snapshot.cards.is_empty());
     }
 }

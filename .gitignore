@@ -52,3 +52,5 @@ src-tauri/target/
 
 # 打包输出（Nova 更新包 nova-x.y.z.zip）
 release/
+
+*.pid
