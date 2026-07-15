@@ -477,6 +477,26 @@ button {
   white-space: nowrap;
   font-size: 13px;
 }
+.thread-content {
+  flex: 1;
+  min-width: 0;
+}
+.thread-content .thread-title {
+  display: block;
+}
+.thread-item.history-time {
+  height: 42px;
+}
+.thread-history-meta {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 13px;
+}
 
 .title-typing {
   text-overflow: clip;
@@ -1783,6 +1803,7 @@ button {
   .brand-version,
   .group-label span,
   .thread-title,
+  .thread-history-meta,
   .thread-star,
   .thread-delete,
   .thread-empty,
@@ -1803,6 +1824,9 @@ button {
   }
   .thread-item {
     gap: 0;
+  }
+  .thread-item.history-time {
+    height: 32px;
   }
   .home {
     padding: 24px 10px;

@@ -63,6 +63,8 @@ pub struct Settings {
     pub editor: String,
     /// 界面皮肤（ink-dark / ink-light，空 = 未设置，由前端 localStorage 迁移）
     pub theme: String,
+    /// 会话历史展示方式（project / time）。
+    pub history_display_mode: String,
     /// 团队/漫游中转服务地址（空 = 关闭团队/漫游功能）
     pub relay_server: String,
     /// 团队/漫游身份 token（永久，用以区分每个人；空 = 不连接中转站）
@@ -128,6 +130,7 @@ impl Default for Settings {
             share_model: "swe-1.6".into(),
             editor: "code".into(),
             theme: String::new(),
+            history_display_mode: "project".into(),
             relay_server: DEFAULT_RELAY_SERVER.into(),
             relay_token: String::new(),
             relay_groups: String::new(),
@@ -157,6 +160,12 @@ mod tests {
     #[test]
     fn windows_shell_shim_is_disabled_by_default() {
         assert!(!Settings::default().windows_shell_shim_enabled);
+    }
+
+    #[test]
+    fn missing_history_display_mode_defaults_to_project() {
+        let settings: Settings = serde_json::from_str(r#"{"theme":"ink-dark"}"#).unwrap();
+        assert_eq!(settings.history_display_mode, "project");
     }
 }
 

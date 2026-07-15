@@ -551,6 +551,8 @@ pub struct ThreadMeta {
     pub title: String,
     pub cwd: String,
     pub agent_kind: AgentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub running: bool,

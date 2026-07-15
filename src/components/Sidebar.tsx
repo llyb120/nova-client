@@ -192,6 +192,17 @@ export function Sidebar(props: {
     for (const root of roots) add(root, false);
     return rows;
   };
+  const showHistoryByTime = () =>
+    !isEmployeeView() && state.settings?.historyDisplayMode === "time";
+  const timeRows = createMemo(() => {
+    const effectiveUpdatedAt = (row: ThreadTreeRow) =>
+      Math.max(row.thread.updatedAt, row.mergedChild?.updatedAt ?? 0);
+    return currentGroups()
+      .flatMap(([cwd, threads]) =>
+        threadTreeRows(threads).map((row) => ({ ...row, cwd })),
+      )
+      .sort((a, b) => effectiveUpdatedAt(b) - effectiveUpdatedAt(a));
+  });
 
   const descendantCount = (id: string) => {
     let count = 0;
@@ -342,6 +353,7 @@ export function Sidebar(props: {
     child = false,
     childCount = 0,
     mergedChild?: ThreadMeta,
+    historyProject?: string,
   ) => {
     const activeThread = mergedChild ?? t;
     const running = () =>
@@ -351,7 +363,7 @@ export function Sidebar(props: {
     const updatedAt = () => Math.max(t.updatedAt, mergedChild?.updatedAt ?? 0);
     return (
       <div
-        class={`thread-item ${active() ? "active" : ""}`}
+        class={`thread-item ${active() ? "active" : ""}${historyProject ? " history-time" : ""}`}
         classList={{ child, parent: childCount > 0, starred: !!t.starred }}
         onClick={() => void openHistoryThread(activeThread.id)}
         onContextMenu={(e) => {
@@ -389,12 +401,22 @@ export function Sidebar(props: {
             <span class="spinner small" />
           </Show>
         </span>
-        <TypewriterText
-          class="thread-title"
-          text={title()}
-          title={title()}
-          animate={state.titleTyping[t.id] || !!(mergedChild && state.titleTyping[mergedChild.id])}
-        />
+        <span class="thread-content">
+          <TypewriterText
+            class="thread-title"
+            text={title()}
+            title={title()}
+            animate={state.titleTyping[t.id] || !!(mergedChild && state.titleTyping[mergedChild.id])}
+          />
+          <Show when={historyProject}>
+            <span
+              class="thread-history-meta"
+              title={`项目：${historyProject}\n模型：${activeThread.model || "默认模型"}`}
+            >
+              {historyProject} · {activeThread.model || "默认模型"}
+            </span>
+          </Show>
+        </span>
         <Show when={activeThread.worktree}>
           <span
             class="thread-worktree"
@@ -585,88 +607,95 @@ export function Sidebar(props: {
             </div>
           }
         >
-          <For each={currentGroups()}>
-            {([cwd, threads]) => {
-              const guestThread = threads.find((t) => t.roamingRole === "guest");
-              const isRemote = !!guestThread;
-              const peerName = guestThread?.roamingPeerName ?? "";
-              const rows = createMemo(() => threadTreeRows(threads));
-              const expanded = () => expandedGroups().has(cwd);
-              const collapsible = () =>
-                !isEmployeeView() && rows().length > COLLAPSED_THREAD_LIMIT;
-              const visibleRows = () =>
-                collapsible() && !expanded()
-                  ? rows().slice(0, COLLAPSED_THREAD_LIMIT)
-                  : rows();
-              return (
-                <div class="thread-group">
-                  <div
-                    class="group-label"
-                    title={
-                      isRemote
-                        ? `${peerName} 的目录（漫游，只读）\n${cwd}`
-                        : `${cwd}\n右键：打开终端 / 资源管理器`
-                    }
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      setMenu({
-                        x: Math.min(e.clientX, window.innerWidth - 180),
-                        y: Math.min(e.clientY, window.innerHeight - 90),
-                        path: cwd,
-                        remote: isRemote,
-                      });
-                    }}
-                  >
-                    {isRemote ? <IconBroadcast size={12} /> : <IconFolder size={12} />}
-                    <span class="group-name">{groupName(cwd)}</span>
-                    <Show when={isRemote}>
-                      <span class="group-roam" title={`在 ${peerName} 的机器上执行`}>
-                        @{peerName}
-                      </span>
-                    </Show>
-                    <button
-                      class="group-delete"
-                      title="删除该文件夹里的会话"
-                      disabled={
-                        deletingGroup() === cwd ||
-                        threads.every((t) => state.running[t.id] || t.starred)
+          <Show when={showHistoryByTime()}>
+            <For each={timeRows()}>
+              {(row) => ThreadRow(row.thread, false, 0, row.mergedChild, groupName(row.cwd))}
+            </For>
+          </Show>
+          <Show when={!showHistoryByTime()}>
+            <For each={currentGroups()}>
+              {([cwd, threads]) => {
+                const guestThread = threads.find((t) => t.roamingRole === "guest");
+                const isRemote = !!guestThread;
+                const peerName = guestThread?.roamingPeerName ?? "";
+                const rows = createMemo(() => threadTreeRows(threads));
+                const expanded = () => expandedGroups().has(cwd);
+                const collapsible = () =>
+                  !isEmployeeView() && rows().length > COLLAPSED_THREAD_LIMIT;
+                const visibleRows = () =>
+                  collapsible() && !expanded()
+                    ? rows().slice(0, COLLAPSED_THREAD_LIMIT)
+                    : rows();
+                return (
+                  <div class="thread-group">
+                    <div
+                      class="group-label"
+                      title={
+                        isRemote
+                          ? `${peerName} 的目录（漫游，只读）\n${cwd}`
+                          : `${cwd}\n右键：打开终端 / 资源管理器`
                       }
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void removeGroup(cwd, threads);
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setMenu({
+                          x: Math.min(e.clientX, window.innerWidth - 180),
+                          y: Math.min(e.clientY, window.innerHeight - 90),
+                          path: cwd,
+                          remote: isRemote,
+                        });
                       }}
                     >
-                      <IconTrash size={12} />
-                    </button>
+                      {isRemote ? <IconBroadcast size={12} /> : <IconFolder size={12} />}
+                      <span class="group-name">{groupName(cwd)}</span>
+                      <Show when={isRemote}>
+                        <span class="group-roam" title={`在 ${peerName} 的机器上执行`}>
+                          @{peerName}
+                        </span>
+                      </Show>
+                      <button
+                        class="group-delete"
+                        title="删除该文件夹里的会话"
+                        disabled={
+                          deletingGroup() === cwd ||
+                          threads.every((t) => state.running[t.id] || t.starred)
+                        }
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void removeGroup(cwd, threads);
+                        }}
+                      >
+                        <IconTrash size={12} />
+                      </button>
+                    </div>
+                    <For each={visibleRows()}>
+                      {(row) => ThreadRow(row.thread, row.child, row.childCount, row.mergedChild)}
+                    </For>
+                    <Show when={collapsible()}>
+                      <button
+                        type="button"
+                        class="thread-group-toggle"
+                        classList={{ expanded: expanded() }}
+                        aria-expanded={expanded()}
+                        aria-label={
+                          expanded()
+                            ? "收起会话"
+                            : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
+                        }
+                        title={
+                          expanded()
+                            ? `收起到最近 ${COLLAPSED_THREAD_LIMIT} 个会话`
+                            : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
+                        }
+                        onClick={() => toggleGroup(cwd)}
+                      >
+                        <IconChevron size={14} open />
+                      </button>
+                    </Show>
                   </div>
-                  <For each={visibleRows()}>
-                    {(row) => ThreadRow(row.thread, row.child, row.childCount, row.mergedChild)}
-                  </For>
-                  <Show when={collapsible()}>
-                    <button
-                      type="button"
-                      class="thread-group-toggle"
-                      classList={{ expanded: expanded() }}
-                      aria-expanded={expanded()}
-                      aria-label={
-                        expanded()
-                          ? "收起会话"
-                          : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
-                      }
-                      title={
-                        expanded()
-                          ? `收起到最近 ${COLLAPSED_THREAD_LIMIT} 个会话`
-                          : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
-                      }
-                      onClick={() => toggleGroup(cwd)}
-                    >
-                      <IconChevron size={14} open />
-                    </button>
-                  </Show>
-                </div>
-              );
-            }}
-          </For>
+                );
+              }}
+            </For>
+          </Show>
         </Show>
       </div>
 

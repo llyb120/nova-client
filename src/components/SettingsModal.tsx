@@ -183,6 +183,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [sessionAutoCleanupHours, setSessionAutoCleanupHours] = createSignal(
     s?.sessionAutoCleanupHours ?? 24 * 30,
   );
+  const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
+    s?.historyDisplayMode === "time" ? "time" : "project",
+  );
   // server 留空回退默认地址；这里也预填，避免误存成空导致团队/漫游被静默关闭
   const [relayServer, setRelayServer] = createSignal(s?.relayServer || DEFAULT_RELAY_SERVER);
   const [relayToken, setRelayToken] = createSignal(s?.relayToken ?? "");
@@ -403,6 +406,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     worktreeDir: worktreeDir().trim(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
+    historyDisplayMode: historyDisplayMode(),
     semanticEnabled: semanticEnabled(),
     embedEndpoint: embedEndpoint().trim(),
     embedModel: embedModel().trim(),
@@ -803,6 +807,23 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </select>
                 <span class="field-hint">
                   新建会话未手动选择模式时使用。Build 等价原 Bypass Permissions（全部自动批准）。
+                </span>
+              </label>
+
+              <label class="field">
+                <span class="field-label">会话历史展示方式</span>
+                <select
+                  class="field-input"
+                  value={historyDisplayMode()}
+                  onChange={(e) =>
+                    setHistoryDisplayMode(e.currentTarget.value === "time" ? "time" : "project")
+                  }
+                >
+                  <option value="project">按项目</option>
+                  <option value="time">按时间</option>
+                </select>
+                <span class="field-hint">
+                  按时间会将普通会话按最近更新时间排列，并标出项目和模型。
                 </span>
               </label>
 

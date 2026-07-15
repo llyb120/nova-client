@@ -77,6 +77,7 @@ export interface ThreadMeta {
   title: string;
   cwd: string;
   agentKind: AgentKind;
+  model?: string | null;
   createdAt: number;
   updatedAt: number;
   running: boolean;
@@ -313,6 +314,8 @@ export interface Settings {
   editor: string;
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */
   theme: string;
+  /** 会话历史展示方式（按项目 / 按时间） */
+  historyDisplayMode: "project" | "time";
   /** 团队/漫游中转服务地址（空 = 关闭团队/漫游） */
   relayServer: string;
   /** 团队/漫游身份 token（永久，用以区分每个人） */

@@ -534,6 +534,7 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
             title: t.title.clone(),
             cwd: t.cwd.clone(),
             agent_kind: t.agent_kind.clone(),
+            model: t.model.clone(),
             created_at: t.created_at,
             updated_at: t.updated_at,
             running: is_running(&state, t),
