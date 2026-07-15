@@ -3596,8 +3596,8 @@ fn coalesce_outbound(batch: Vec<(String, String, Value)>) -> Vec<(String, String
     out
 }
 
-/// 把会话条目拼成纯文本，用于高级分享时喂给模型
-fn build_transcript(items: &[Item]) -> String {
+/// 把会话条目拼成纯文本，用于高级分享 / 线索 AI 总结时喂给模型
+pub(crate) fn build_transcript(items: &[Item]) -> String {
     let mut out = String::new();
     for it in items {
         match it {

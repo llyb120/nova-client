@@ -2814,6 +2814,140 @@ fn advanced_share(
     )
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClueAiSummary {
+    title: String,
+    content: String,
+}
+
+/// 用高级分享模型总结会话核心内容，供线索表单填入（不分享、不切换当前会话）
+#[tauri::command]
+async fn summarize_clue(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<ClueAiSummary, String> {
+    let (src_cwd, transcript, fallback_title) = {
+        let store = state.store.lock().unwrap();
+        let t = store.get(&thread_id).ok_or("线程不存在")?;
+        (
+            t.cwd.clone(),
+            relay::build_transcript(&t.items),
+            t.title.clone(),
+        )
+    };
+    if transcript.trim().is_empty() {
+        return Err("会话还没有内容可总结".into());
+    }
+
+    let (agent_kind, model_opt) = {
+        let s = state.settings.lock().unwrap();
+        let agent_kind = AgentKind::from_str(&s.share_model_agent).unwrap_or(AgentKind::Devin);
+        let model = {
+            let m = s.share_model.trim().to_string();
+            if m.is_empty() && agent_kind == AgentKind::Devin {
+                "swe-1.6".to_string()
+            } else {
+                m
+            }
+        };
+        let model_opt = if model.is_empty() { None } else { Some(model) };
+        (agent_kind, model_opt)
+    };
+
+    let cwd = if std::path::Path::new(&src_cwd).is_dir() {
+        src_cwd
+    } else {
+        let name = format!("clue-sum-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let dir = std::env::temp_dir().join(SCRATCH_MARK).join(name);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+        dir.to_string_lossy().to_string()
+    };
+
+    let mut thread = Thread::new(cwd, agent_kind.clone(), model_opt, None, None, true);
+    thread.title = "线索 AI 总结".into();
+    let run_id = thread.id.clone();
+    {
+        let mut store = state.store.lock().unwrap();
+        store.threads.push(thread);
+        store.save();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+
+    let seed = format!(
+        "请总结下面这段会话的核心内容，用于保存为「线索」。\n\
+         严格按以下格式输出，不要其它前言或解释：\n\n\
+         标题：一句话概括（不超过50字）\n\
+         内容：\n\
+         结论、关键证据/产物、验证结果与下一步（可多段）\n\n\
+         ----\n会话记录：\n\n{transcript}"
+    );
+
+    employees::run_employee_prompt(&agent_kind, &app, run_id.clone(), seed).await;
+
+    let raw = employees::last_employee_assistant(&app, &run_id)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| "总结失败：模型没有返回内容".to_string())?;
+
+    // 清理临时会话，避免污染列表
+    {
+        let mut store = state.store.lock().unwrap();
+        store.threads.retain(|t| t.id != run_id);
+        store.save();
+    }
+    for mgr in state.all_acp() {
+        mgr.forget_session_of_thread(&run_id);
+    }
+    state.codex.forget_session_of_thread(&run_id);
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+
+    Ok(parse_clue_ai_summary(&raw, &fallback_title))
+}
+
+fn parse_clue_ai_summary(raw: &str, fallback_title: &str) -> ClueAiSummary {
+    let text = raw.trim();
+    let (mut title, mut content) = if let Some(rest) = text
+        .strip_prefix("标题：")
+        .or_else(|| text.strip_prefix("标题:"))
+    {
+        let rest = rest.trim_start();
+        if let Some((t, c)) = rest
+            .split_once("\n内容：")
+            .or_else(|| rest.split_once("\n内容:"))
+        {
+            (
+                t.lines().next().unwrap_or("").trim().to_string(),
+                c.trim().to_string(),
+            )
+        } else if let Some((t, c)) = rest.split_once('\n') {
+            (t.trim().to_string(), c.trim().to_string())
+        } else {
+            (rest.trim().to_string(), String::new())
+        }
+    } else {
+        let mut lines = text.lines();
+        let first = lines.next().unwrap_or("").trim().to_string();
+        let rest = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+        if rest.is_empty() {
+            (String::new(), text.to_string())
+        } else {
+            (first, rest)
+        }
+    };
+
+    if title.is_empty() {
+        title = fallback_title.trim().to_string();
+    }
+    if title.chars().count() > 100 {
+        title = title.chars().take(100).collect();
+    }
+    if content.is_empty() {
+        content = text.to_string();
+    }
+    ClueAiSummary { title, content }
+}
+
 /// 接收一条分享，在指定目录新建本地会话，返回新会话 id
 #[tauri::command]
 fn accept_share(
@@ -4150,6 +4284,7 @@ pub fn run() {
             get_relay_inbox,
             share_thread,
             advanced_share,
+            summarize_clue,
             accept_share,
             decline_share,
             list_roaming_folders,

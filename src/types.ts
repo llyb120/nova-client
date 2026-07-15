@@ -66,6 +66,12 @@ export interface CaptureClueResult {
   card: ClueCard;
 }
 
+/** 线索 AI 总结：高级分享模型产出的标题与内容 */
+export interface ClueAiSummary {
+  title: string;
+  content: string;
+}
+
 export interface ThreadMeta {
   id: string;
   title: string;

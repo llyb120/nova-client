@@ -6,8 +6,7 @@ import { firstWakeDoPairForThread } from "../threadDisplay";
 import type { Item, Thread } from "../types";
 import { agentLabel } from "../utils";
 import { Composer } from "./Composer";
-import { ClueCaptureModal } from "./ClueCaptureModal";
-import { IconBroadcast, IconClue, IconCompress, IconDownload, IconShare } from "./icons";
+import { IconBroadcast, IconCompress, IconDownload, IconShare } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { PlanCard } from "./PlanCard";
@@ -394,7 +393,6 @@ export function ChatView() {
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   const [showShare, setShowShare] = createSignal(false);
-  const [showClueCapture, setShowClueCapture] = createSignal(false);
 
   const currentMeta = createMemo(() =>
     state.threads.find((t) => t.id === state.currentId),
@@ -536,23 +534,13 @@ export function ChatView() {
           when={
             !!state.currentId &&
             roamingRole() !== "guest" &&
-            state.items.some((item) => item.type === "assistant")
+            (state.relay.connected ||
+              state.items.some((item) => item.type === "assistant"))
           }
         >
           <button
-            class="chat-share-btn clue"
-            title="把本次会话结论保存到证据链"
-            disabled={isRunning()}
-            onClick={() => setShowClueCapture(true)}
-          >
-            <IconClue size={14} />
-            线索
-          </button>
-        </Show>
-        <Show when={state.relay.connected && state.currentId && roamingRole() !== "guest"}>
-          <button
             class="chat-share-btn"
-            title="用 Flow 把这个对话分享给队友"
+            title="线索与 Flow 分享"
             onClick={() => setShowShare(true)}
           >
             <IconShare size={14} />
@@ -573,9 +561,6 @@ export function ChatView() {
       </header>
       <Show when={showShare() && state.currentId}>
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
-      </Show>
-      <Show when={showClueCapture() && state.currentId}>
-        <ClueCaptureModal threadId={state.currentId!} onClose={() => setShowClueCapture(false)} />
       </Show>
 
       <div

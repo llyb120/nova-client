@@ -356,6 +356,13 @@ impl ClueStore {
         }
 
         cards.sort_by_key(|card| card.created_at);
+        // 后续节点若同时挂着多张即将入堆的前置卡，折叠为堆内一张代表卡，避免同组多条重合连线
+        let representative_id = cards
+            .first()
+            .map(|card| card.id.clone())
+            .ok_or("线索不存在")?;
+        let stacked_card_ids: HashSet<String> =
+            cards.iter().map(|card| card.id.clone()).collect();
         let now = now_ms();
         for group in &mut self.groups {
             let original_len = group.cards.len();
@@ -367,6 +374,32 @@ impl ClueStore {
             }
         }
         self.groups.retain(|group| !group.cards.is_empty());
+        for group in &mut self.groups {
+            let mut saw_stacked_parent = false;
+            let next_parents: Vec<String> = group
+                .parent_card_ids
+                .iter()
+                .filter_map(|parent_id| {
+                    if stacked_card_ids.contains(parent_id) {
+                        saw_stacked_parent = true;
+                        None
+                    } else {
+                        Some(parent_id.clone())
+                    }
+                })
+                .collect();
+            if !saw_stacked_parent {
+                continue;
+            }
+            let mut merged = next_parents;
+            if !merged.iter().any(|parent_id| parent_id == &representative_id) {
+                merged.push(representative_id.clone());
+            }
+            if merged != group.parent_card_ids {
+                group.parent_card_ids = merged;
+                group.updated_at = now;
+            }
+        }
         let group = ClueNodeGroup {
             id: uuid::Uuid::new_v4().to_string(),
             parent_card_ids: parent_card_ids.unwrap_or_default(),
@@ -761,6 +794,86 @@ mod tests {
 
         let result = store.stack_cards(&[root.card.id, child.card.id]);
         assert!(result.is_err());
+        assert_eq!(store.groups.len(), 2);
+    }
+
+    #[test]
+    fn stacking_parents_collapses_duplicate_child_edges() {
+        let mut store = store();
+        let left = store
+            .capture("new", None, "左".into(), "left".into(), None, "甲".into())
+            .unwrap();
+        let right = store
+            .capture("new", None, "右".into(), "right".into(), None, "乙".into())
+            .unwrap();
+        let child = store
+            .capture(
+                "new",
+                Some(&left.card.id),
+                "后续".into(),
+                "child".into(),
+                None,
+                "丙".into(),
+            )
+            .unwrap();
+        store
+            .associate(&right.card.id, &child.card.id)
+            .unwrap();
+        let before = store
+            .groups
+            .iter()
+            .find(|group| group.cards.iter().any(|card| card.id == child.card.id))
+            .unwrap();
+        assert_eq!(before.parent_card_ids.len(), 2);
+
+        let stacked = store
+            .stack_cards(&[left.card.id.clone(), right.card.id.clone()])
+            .unwrap();
+        assert_eq!(stacked.cards.len(), 2);
+        let after = store
+            .groups
+            .iter()
+            .find(|group| group.cards.iter().any(|card| card.id == child.card.id))
+            .unwrap();
+        assert_eq!(after.parent_card_ids.len(), 1);
+        assert!(stacked
+            .cards
+            .iter()
+            .any(|card| after.parent_card_ids.contains(&card.id)));
+    }
+
+    #[test]
+    fn stacking_siblings_keeps_single_parent() {
+        let mut store = store();
+        let root = store
+            .capture("new", None, "根".into(), "root".into(), None, "甲".into())
+            .unwrap();
+        let left = store
+            .capture(
+                "new",
+                Some(&root.card.id),
+                "左".into(),
+                "left".into(),
+                None,
+                "乙".into(),
+            )
+            .unwrap();
+        let right = store
+            .capture(
+                "new",
+                Some(&root.card.id),
+                "右".into(),
+                "right".into(),
+                None,
+                "丙".into(),
+            )
+            .unwrap();
+        assert_eq!(store.groups.len(), 3);
+
+        let stacked = store
+            .stack_cards(&[left.card.id.clone(), right.card.id.clone()])
+            .unwrap();
+        assert_eq!(stacked.parent_card_ids, vec![root.card.id]);
         assert_eq!(store.groups.len(), 2);
     }
 

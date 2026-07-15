@@ -532,6 +532,11 @@ export async function captureClue(
   return result;
 }
 
+/** 用高级分享模型总结会话，供线索表单填入 */
+export async function summarizeClue(threadId: string) {
+  return api.summarizeClue(threadId);
+}
+
 export async function associateClues(beforeCardId: string, afterCardId: string) {
   await api.associateClues(beforeCardId, afterCardId);
   await refreshClueGroups();

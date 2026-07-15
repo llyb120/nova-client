@@ -4,6 +4,7 @@ import type {
   BranchList,
   CaptureClueResult,
   CliStatus,
+  ClueAiSummary,
   ClueContextSnapshot,
   ClueNodeGroup,
   Decision,
@@ -175,6 +176,7 @@ export const api = {
     agent: string | null,
     model: string | null,
   ) => invoke<Thread>("advanced_share", { threadId, to, prompt, agent, model }),
+  summarizeClue: (threadId: string) => invoke<ClueAiSummary>("summarize_clue", { threadId }),
   acceptShare: (id: string, cwd: string, ephemeral = false) =>
     invoke<string>("accept_share", { id, cwd, ephemeral }),
   declineShare: (id: string) => invoke<void>("decline_share", { id }),

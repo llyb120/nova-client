@@ -4206,6 +4206,9 @@ button.head-badge:hover {
 }
 
 /* ===== 分享弹窗：快速 / 高级 ===== */
+.share-modal-tabbar {
+  padding: 0 20px 4px;
+}
 .share-seg {
   display: flex;
   gap: 6px;
@@ -5043,10 +5046,26 @@ button.head-badge:hover {
 .clue-capture-modal {
   width: min(620px, calc(100vw - 32px));
 }
+.clue-capture-embedded .modal-body {
+  padding-top: 8px;
+}
 .clue-modal-title {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+}
+.clue-stack-check {
+  margin-bottom: 14px;
+}
+.clue-content-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.clue-ai-summary-btn {
+  padding: 4px 10px;
+  font-size: 12px;
 }
 .clue-placement {
   display: grid;

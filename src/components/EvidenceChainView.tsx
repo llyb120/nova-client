@@ -393,11 +393,16 @@ export function EvidenceChainView() {
       start: Point;
       end: Point;
     }> = [];
+    // 同一组 → 同一组只画一条线：堆叠后多张前置卡共享锚点，按卡去重前会画出重合的多条边
+    const seenGroupEdges = new Set<string>();
     for (const node of nodes) {
       for (const parentCardId of node.group.parentCardIds) {
         const sourceNode = nodeByCard.get(parentCardId);
         const start = cardAnchors.get(parentCardId);
         if (!sourceNode || !start) continue;
+        const groupEdgeKey = `${sourceNode.group.id}->${node.group.id}`;
+        if (seenGroupEdges.has(groupEdgeKey)) continue;
+        seenGroupEdges.add(groupEdgeKey);
         rawEdges.push({
           key: `${sourceNode.depth}:${node.depth}`,
           fromCardId: parentCardId,
