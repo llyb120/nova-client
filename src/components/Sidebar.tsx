@@ -20,6 +20,7 @@ import {
   IconBell,
   IconBroadcast,
   IconCheck,
+  IconChevron,
   IconClue,
   IconDownload,
   IconFolder,
@@ -33,6 +34,8 @@ import {
   IconX,
 } from "./icons";
 import { TypewriterText } from "./TypewriterText";
+
+const COLLAPSED_THREAD_LIMIT = 5;
 
 function basename(p: string) {
   return p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
@@ -215,6 +218,15 @@ export function Sidebar(props: {
   };
 
   const [deletingGroup, setDeletingGroup] = createSignal<string | null>(null);
+  const [expandedGroups, setExpandedGroups] = createSignal<Set<string>>(new Set());
+  const toggleGroup = (cwd: string) => {
+    setExpandedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(cwd)) next.delete(cwd);
+      else next.add(cwd);
+      return next;
+    });
+  };
   const removeGroup = async (cwd: string, threads: typeof state.threads) => {
     const deletable = threads.filter((t) => !state.running[t.id]);
     const ids = deletable.map((t) => t.id);
@@ -556,6 +568,14 @@ export function Sidebar(props: {
               const guestThread = threads.find((t) => t.roamingRole === "guest");
               const isRemote = !!guestThread;
               const peerName = guestThread?.roamingPeerName ?? "";
+              const rows = createMemo(() => threadTreeRows(threads));
+              const expanded = () => expandedGroups().has(cwd);
+              const collapsible = () =>
+                state.view === "home" && rows().length > COLLAPSED_THREAD_LIMIT;
+              const visibleRows = () =>
+                collapsible() && !expanded()
+                  ? rows().slice(0, COLLAPSED_THREAD_LIMIT)
+                  : rows();
               return (
                 <div class="thread-group">
                   <div
@@ -596,9 +616,30 @@ export function Sidebar(props: {
                       <IconTrash size={12} />
                     </button>
                   </div>
-                  <For each={threadTreeRows(threads)}>
+                  <For each={visibleRows()}>
                     {(row) => ThreadRow(row.thread, row.child, row.childCount, row.mergedChild)}
                   </For>
+                  <Show when={collapsible()}>
+                    <button
+                      type="button"
+                      class="thread-group-toggle"
+                      classList={{ expanded: expanded() }}
+                      aria-expanded={expanded()}
+                      aria-label={
+                        expanded()
+                          ? "收起会话"
+                          : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
+                      }
+                      title={
+                        expanded()
+                          ? `收起到最近 ${COLLAPSED_THREAD_LIMIT} 个会话`
+                          : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
+                      }
+                      onClick={() => toggleGroup(cwd)}
+                    >
+                      <IconChevron size={14} open />
+                    </button>
+                  </Show>
                 </div>
               );
             }}

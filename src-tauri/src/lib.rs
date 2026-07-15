@@ -41,11 +41,13 @@ use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use threads::{
     now_ms, AgentKind, Item, ProjectStore, PromptImage, RoamingStore, Thread, ThreadMeta,
-    ThreadStore, Worktree, WorktreeRecord, WorktreeStore,
+    ThreadStore, ThreadTrashStore, Worktree, WorktreeRecord, WorktreeStore,
 };
 
 pub struct AppState {
     pub store: Mutex<ThreadStore>,
+    /// 自动清理会话的延迟删除回收站（thread-trash.json）。
+    pub thread_trash: Mutex<ThreadTrashStore>,
     /// 证据链本地存储：未配置 Relay 时是真相来源；配置后作为团队数据缓存。
     pub clues: Mutex<clues::ClueStore>,
     pub projects: Mutex<ProjectStore>,
@@ -222,7 +224,16 @@ fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
     updated_at < now.saturating_sub(timeout_ms)
 }
 
+fn is_session_auto_cleanup_day(weekday: chrono::Weekday) -> bool {
+    !matches!(weekday, chrono::Weekday::Sat | chrono::Weekday::Sun)
+}
+
 fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
+    use chrono::Datelike;
+
+    if !is_session_auto_cleanup_day(chrono::Local::now().weekday()) {
+        return 0;
+    }
     let state = app.state::<AppState>();
     let hours = {
         let settings = state.settings.lock().unwrap();
@@ -232,6 +243,16 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
         settings.session_auto_cleanup_hours
     };
     let now = now_ms();
+    let permanently_removed = state
+        .thread_trash
+        .lock()
+        .unwrap()
+        .purge_expired(now, hours);
+    for thread in permanently_removed {
+        if thread.cwd.contains(SCRATCH_MARK) {
+            let _ = std::fs::remove_dir_all(thread.cwd);
+        }
+    }
     let thread_ids = {
         let store = state.store.lock().unwrap();
         store
@@ -244,7 +265,24 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
             .map(|thread| thread.id.clone())
             .collect()
     };
-    delete_threads_impl(app, &state, thread_ids)
+    let deletable = collect_deletable_thread_ids(&state, thread_ids);
+    let threads: Vec<Thread> = {
+        let store = state.store.lock().unwrap();
+        store
+            .threads
+            .iter()
+            .filter(|thread| deletable.contains(&thread.id))
+            .cloned()
+            .collect()
+    };
+    if threads.is_empty() {
+        return 0;
+    }
+    if let Err(error) = state.thread_trash.lock().unwrap().move_to_trash(threads, now) {
+        eprintln!("[session-cleanup] 移入回收站失败：{error}");
+        return 0;
+    }
+    remove_threads(app, &state, deletable).len()
 }
 
 /// 是否有任意会话正在运行（本地 Devin/Codex、漫游 guest、被别人漫游的 host 均算）。
@@ -299,7 +337,10 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
 
 #[cfg(test)]
 mod session_auto_cleanup_tests {
-    use super::{is_normal_thread_for_auto_cleanup, thread_is_expired, AgentKind, Thread};
+    use super::{
+        is_normal_thread_for_auto_cleanup, is_session_auto_cleanup_day, thread_is_expired,
+        AgentKind, Thread,
+    };
 
     #[test]
     fn thread_is_expired_only_after_the_configured_retention() {
@@ -324,6 +365,13 @@ mod session_auto_cleanup_tests {
         thread.employee_id = None;
         thread.roaming_role = Some("host".into());
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
+    }
+
+    #[test]
+    fn session_auto_cleanup_skips_weekends() {
+        assert!(is_session_auto_cleanup_day(chrono::Weekday::Fri));
+        assert!(!is_session_auto_cleanup_day(chrono::Weekday::Sat));
+        assert!(!is_session_auto_cleanup_day(chrono::Weekday::Sun));
     }
 }
 
@@ -547,12 +595,24 @@ async fn capture_clue(
         }
         result
     } else {
+        let author_name = {
+            let configured = state.settings.lock().unwrap().relay_name.trim().to_string();
+            if configured.is_empty() {
+                std::env::var("USERNAME")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "我".into())
+            } else {
+                configured
+            }
+        };
         state.clues.lock().unwrap().capture(
             &placement,
             target_card_id.as_deref(),
             title,
             content,
             thread_id.clone(),
+            author_name,
         )?
     };
     if let Some(thread_id) = thread_id {
@@ -593,6 +653,30 @@ async fn associate_clues(
     };
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(group)
+}
+
+#[tauri::command]
+async fn delete_clue(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    card_id: String,
+) -> Result<(), String> {
+    if state.relay.is_configured() {
+        state.relay.clue_delete(&card_id).await?;
+        if let Ok(groups) = state.relay.clue_list().await {
+            let _ = state.clues.lock().unwrap().replace(groups);
+        }
+    } else {
+        state.clues.lock().unwrap().delete(&card_id)?;
+    }
+    let mut store = state.store.lock().unwrap();
+    if store.clear_active_clue_card(&card_id) {
+        store.save();
+        let _ = app.emit(acp::EV_THREADS, json!({}));
+    }
+    drop(store);
+    let _ = app.emit(clues::EV_CLUES, json!({}));
+    Ok(())
 }
 
 #[tauri::command]
@@ -1541,8 +1625,8 @@ fn delete_thread(
     Ok(())
 }
 
-/// 批量删除会话；运行中的自动跳过，返回实际删除数量
-fn delete_threads_impl(app: &tauri::AppHandle, state: &AppState, thread_ids: Vec<String>) -> usize {
+/// 过滤掉运行中的会话树，返回可安全移除的完整树 id 集合。
+fn collect_deletable_thread_ids(state: &AppState, thread_ids: Vec<String>) -> Vec<String> {
     let roots: Vec<String> = thread_ids
         .into_iter()
         .filter(|id| !running_by_id(&state, id))
@@ -1558,18 +1642,23 @@ fn delete_threads_impl(app: &tauri::AppHandle, state: &AppState, thread_ids: Vec
         }
         delete_set.extend(tree);
     }
-    let deletable: Vec<String> = delete_set.into_iter().collect();
+    delete_set.into_iter().collect()
+}
+
+/// 从正常会话存储移除，并清理关联的运行时状态；返回完整会话快照供回收站持久化。
+fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<String>) -> Vec<Thread> {
     for id in &deletable {
         state.relay.notify_host_thread_deleted(id);
     }
-    let deleted;
-    {
+    let removed = {
         let mut store = state.store.lock().unwrap();
-        let before = store.threads.len();
-        store.threads.retain(|t| !deletable.contains(&t.id));
-        deleted = before - store.threads.len();
+        let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut store.threads)
+            .into_iter()
+            .partition(|thread| deletable.contains(&thread.id));
+        store.threads = kept;
         store.save();
-    }
+        removed
+    };
     employees::delete_tasks_for_threads(app, &deletable);
     state.workflows.lock().unwrap().detach_threads(&deletable);
     for id in &deletable {
@@ -1580,7 +1669,13 @@ fn delete_threads_impl(app: &tauri::AppHandle, state: &AppState, thread_ids: Vec
         cleanup_borrowed_runtime(&state, id);
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
-    deleted
+    removed
+}
+
+/// 批量删除会话；运行中的自动跳过，返回实际删除数量
+fn delete_threads_impl(app: &tauri::AppHandle, state: &AppState, thread_ids: Vec<String>) -> usize {
+    let deletable = collect_deletable_thread_ids(state, thread_ids);
+    remove_threads(app, state, deletable).len()
 }
 
 #[tauri::command]
@@ -3707,6 +3802,7 @@ pub fn run() {
             // 后端的空闲提示定时器会在没有任务时弹窗让用户选择是否现在更新（用户主导）。
 
             let store = ThreadStore::load(dir.clone());
+            let thread_trash = ThreadTrashStore::load(&dir);
             let clues = clues::ClueStore::load(&dir);
             let mut projects = ProjectStore::load(&dir);
             // 迁移：项目列表为空时从既有会话提取目录
@@ -3743,6 +3839,7 @@ pub fn run() {
 
             app.manage(AppState {
                 store: Mutex::new(store),
+                thread_trash: Mutex::new(thread_trash),
                 clues: Mutex::new(clues),
                 projects: Mutex::new(projects),
                 settings: Mutex::new(settings),
@@ -3958,6 +4055,7 @@ pub fn run() {
             get_clue_context,
             capture_clue,
             associate_clues,
+            delete_clue,
             list_projects,
             remove_project,
             prewarm,

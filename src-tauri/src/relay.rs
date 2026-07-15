@@ -1050,6 +1050,17 @@ impl RelayManager {
             .group)
     }
 
+    pub async fn clue_delete(&self, card_id: &str) -> Result<(), String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v1/clues/delete")?
+            .json(&json!({ "cardId": card_id }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        decode_relay_json::<Value>(response).await?;
+        Ok(())
+    }
+
     pub async fn clue_context(&self, card_id: &str) -> Result<ClueContextSnapshot, String> {
         let response = self
             .clue_request(reqwest::Method::GET, "/v1/clues/context")?

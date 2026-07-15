@@ -53,6 +53,7 @@ interface ClueCardVersion {
   id: string;
   title: string;
   content: string;
+  authorName?: string;
   sourceThreadId?: string | null;
   createdAt: number;
 }
@@ -72,6 +73,7 @@ interface ClueCard {
 
 - 首次发布创建 `v1`。
 - “更新旧线索”创建新版本，并移动 `currentVersionId`。
+- 每个版本记录本次发布者；Relay 模式以鉴权身份为准，本地模式使用团队显示名或系统用户名。
 - 历史版本不可原地修改。
 - 新会话默认使用发起时的当前版本。
 - 已经发起的会话继续使用自己的固定快照。
@@ -259,7 +261,9 @@ clue_context: Option<ClueContextSnapshot>,
 
 - 横向阶段表示前后深度。
 - 同一内部位置的平行后续卡纵向排列。
-- 卡片只显示标题、正文摘要、更新时间和版本数。
+- 卡片间绘制 `前置 -> 后续` 的有向箭头，选中卡片时高亮与它直接相连的边。
+- 卡片左上角显示当前版本作者头像，头像内使用姓名或姓名缩写。
+- 卡片显示标题、正文摘要、更新时间和版本数。
 - 右侧详情显示正文、前置线索、后续线索、版本记录和操作按钮。
 - 用户可以点击前置或后续线索跳转查看。
 
@@ -270,6 +274,9 @@ clue_context: Option<ClueContextSnapshot>,
 - 平行后续。
 - 开启下一条。
 - 关联已有线索。
+- 删除线索。
+
+删除采用非级联语义：只删除目标卡及其版本，并从下游 `parentCardIds` 中移除该卡；下游线索和既有会话中的固定快照都保留，不自动把祖先补接到下游。
 
 ## 12. AI 总结
 
@@ -307,6 +314,7 @@ Tauri 命令：
 - `get_clue_context`：从某张卡生成 Paper Trail 快照。
 - `capture_clue`：执行 update / parallel / new。
 - `associate_clues`：给两张已有卡建立前后顺序。
+- `delete_clue`：非级联删除一张线索卡并解除下游引用。
 - `create_thread(clue_card_id)`：创建带固定证据链快照的会话。
 
 写入采用临时文件后替换，避免直接覆盖过程中留下半份 JSON。
@@ -324,14 +332,14 @@ Relay 服务端沿用同一简单模型：
 当前实现：
 
 - 按团队空间隔离读取和写入。
-- 所有 capture / associate 操作在服务端锁内原子执行，不接收整份图覆盖。
+- 所有 capture / associate / delete 操作在服务端锁内原子执行，不接收整份图覆盖。
 - 每个团队分区维护 revision。
 - SSE 发送 `clues.changed` 轻量失效通知，正文由客户端重新拉取。
 - Paper Trail 快照在一次一致性读取中固定版本。
 - 漫游创建消息携带固定快照，guest 与 host Thread 都记录 `activeClueCardId` 和 `clueContext`。
 - 远程设备/网页会话序列化时明确移除证据链字段。
 
-服务端接口为 `GET /v1/clues`、`POST /v1/clues/capture`、`POST /v1/clues/associate` 和 `GET /v1/clues/context`。
+服务端接口为 `GET /v1/clues`、`POST /v1/clues/capture`、`POST /v1/clues/associate`、`POST /v1/clues/delete` 和 `GET /v1/clues/context`。
 
 ## 15. 异常与边界
 

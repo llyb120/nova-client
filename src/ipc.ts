@@ -96,6 +96,7 @@ export const api = {
     }),
   associateClues: (beforeCardId: string, afterCardId: string) =>
     invoke<ClueNodeGroup>("associate_clues", { beforeCardId, afterCardId }),
+  deleteClue: (cardId: string) => invoke<void>("delete_clue", { cardId }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),
   openInExplorer: (path: string) => invoke<void>("open_in_explorer", { path }),

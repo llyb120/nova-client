@@ -537,6 +537,11 @@ export async function associateClues(beforeCardId: string, afterCardId: string) 
   await refreshClueGroups();
 }
 
+export async function deleteClue(cardId: string) {
+  await api.deleteClue(cardId);
+  await Promise.all([refreshClueGroups(), refreshThreads()]);
+}
+
 export function startSessionFromClue(card: ClueCard) {
   const version = clueCurrentVersion(card);
   setState("pendingClueCard", { id: card.id, title: version?.title || "未命名线索" });

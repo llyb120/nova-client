@@ -779,6 +779,78 @@ struct StoreFileRef<'a> {
     threads: &'a [Thread],
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct ThreadTrashFile {
+    entries: Vec<TrashedThread>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashedThread {
+    pub thread: Thread,
+    pub trashed_at: i64,
+}
+
+/// 自动清理会话的延迟删除回收站。回收站独立落在 `thread-trash.json`，不参与正常会话列表。
+pub struct ThreadTrashStore {
+    path: PathBuf,
+    entries: Vec<TrashedThread>,
+}
+
+impl ThreadTrashStore {
+    pub fn load(dir: &PathBuf) -> Self {
+        let path = dir.join("thread-trash.json");
+        let entries = fs::read_to_string(&path)
+            .ok()
+            .and_then(|json| serde_json::from_str::<ThreadTrashFile>(&json).ok())
+            .map(|file| file.entries)
+            .unwrap_or_default();
+        Self { path, entries }
+    }
+
+    fn save(&self) -> Result<(), String> {
+        let json = serde_json::to_string(&ThreadTrashFile {
+            entries: self.entries.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        fs::write(&tmp, json).map_err(|error| error.to_string())?;
+        fs::rename(tmp, &self.path).map_err(|error| error.to_string())
+    }
+
+    /// 先持久化到回收站，再允许调用方从正常会话存储移除，优先保证不会直接丢失会话。
+    pub fn move_to_trash(&mut self, threads: Vec<Thread>, trashed_at: i64) -> Result<(), String> {
+        let len = self.entries.len();
+        self.entries.extend(threads.into_iter().map(|thread| TrashedThread {
+            thread,
+            trashed_at,
+        }));
+        if let Err(error) = self.save() {
+            self.entries.truncate(len);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 回收站内停留满同一个保留周期后才彻底清除，返回需要一并删除工作目录的会话。
+    pub fn purge_expired(&mut self, now: i64, hours: u32) -> Vec<Thread> {
+        let timeout_ms = i64::from(hours.max(1)).saturating_mul(60 * 60 * 1000);
+        let cutoff = now.saturating_sub(timeout_ms);
+        let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
+            .into_iter()
+            .partition(|entry| entry.trashed_at < cutoff);
+        self.entries = kept;
+        if self.save().is_err() {
+            self.entries.extend(expired);
+            return Vec::new();
+        }
+        expired.into_iter().map(|entry| entry.thread).collect()
+    }
+}
+
 pub struct ThreadStore {
     path: PathBuf,
     pub threads: Vec<Thread>,
@@ -876,6 +948,17 @@ impl ThreadStore {
 
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Thread> {
         self.threads.iter_mut().find(|t| t.id == id)
+    }
+
+    pub fn clear_active_clue_card(&mut self, card_id: &str) -> bool {
+        let mut changed = false;
+        for thread in &mut self.threads {
+            if thread.active_clue_card_id.as_deref() == Some(card_id) {
+                thread.active_clue_card_id = None;
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn thread_by_session_mut(&mut self, session_id: &str) -> Option<&mut Thread> {

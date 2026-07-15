@@ -3847,10 +3847,11 @@ impl AcpManager {
             include_runtime_guidance
         ));
         let conn_key = self.conn_key_for_thread(thread_id);
-        let mut conn = self
-            .conn_for_key(&conn_key)
-            .await
-            .ok_or_else(|| format!("{} 未连接", self.kind.label()))?;
+        // ensure_session 返回后进程可能恰好退出；Cursor 交给下面的重建分支恢复。
+        let mut conn = self.conn_for_key(&conn_key).await;
+        if conn.is_none() && self.kind != AgentKind::Cursor {
+            return Err(format!("{} 未连接", self.kind.label()));
+        }
         let mut prompt = Self::build_user_prompt_blocks(text, images, include_runtime_guidance);
         if let Some(ctx) = handoff {
             prompt.insert(0, json!({ "type": "text", "text": ctx }));
@@ -3864,14 +3865,20 @@ impl AcpManager {
             store.get(thread_id).map(|t| t.items.len()).unwrap_or(0)
         };
         let max_attempts: u32 = if self.kind == AgentKind::Cursor { 5 } else { 3 };
-        let mut last_err = String::new();
+        let mut last_err = if conn.is_none() {
+            format!("{} 未连接", self.kind.label())
+        } else {
+            String::new()
+        };
         for attempt in 1..=max_attempts {
             if !self.is_running(thread_id) {
                 return Err("任务已停止".into());
             }
-            let process_dead =
-                !conn.alive.load(Ordering::SeqCst) || is_process_exit_error(&last_err);
-            if process_dead && attempt > 1 {
+            let needs_rebuild = prompt_conn_needs_rebuild(
+                conn.as_ref().map(|conn| conn.alive.load(Ordering::SeqCst)),
+                &last_err,
+            );
+            if needs_rebuild && (attempt > 1 || conn.is_none()) {
                 // 已有输出时不重建（上面 soft-finish 会先 return）；此处仅无输出场景。
                 let produced = {
                     let state = self.app.state::<AppState>();
@@ -3885,9 +3892,12 @@ impl AcpManager {
                     break;
                 }
                 self.push_log(format!(
-                    "[nova] {} 进程已退出，重建会话后重试 prompt（第{attempt}/{max_attempts}次）",
+                    "[nova] {} 连接不可用，重建会话后重试 prompt（第{attempt}/{max_attempts}次）：{last_err}",
                     self.kind.label()
                 ));
+                if let Some(conn) = conn.as_ref() {
+                    conn.kill();
+                }
                 self.clear_thread_session_for_respawn(thread_id);
                 // Cursor session/load 不可靠：把已有历史注入 prompt，避免新会话空上下文。
                 if handoff.is_none() && self.kind == AgentKind::Cursor {
@@ -3909,12 +3919,25 @@ impl AcpManager {
                     }
                 }
                 session_id = self.ensure_session(thread_id).await?;
-                conn = self
-                    .conn_for_key(&conn_key)
-                    .await
-                    .ok_or_else(|| format!("{} 未连接", self.kind.label()))?;
+                conn = self.conn_for_key(&conn_key).await;
+                if conn.is_none() {
+                    last_err = format!("{} 未连接", self.kind.label());
+                    if attempt < max_attempts {
+                        let delay_ms = retriable_backoff_ms(attempt);
+                        self.push_log(format!(
+                            "[nova] 重建后连接仍不可用（第{attempt}/{max_attempts}次），{delay_ms}ms 后重试"
+                        ));
+                        sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
                 last_err.clear();
-            } else if !conn.alive.load(Ordering::SeqCst) {
+            } else if conn
+                .as_ref()
+                .map(|conn| !conn.alive.load(Ordering::SeqCst))
+                .unwrap_or(true)
+            {
                 // 首轮就发现进程已死：走与上面相同的重建路径（计入 attempt）
                 last_err = format!("{} 进程已退出", self.kind.label());
                 if attempt < max_attempts {
@@ -3927,6 +3950,10 @@ impl AcpManager {
                 }
                 break;
             }
+            let Some(conn) = conn.as_ref() else {
+                last_err = format!("{} 未连接", self.kind.label());
+                continue;
+            };
             self.prompt_sent_at
                 .lock()
                 .unwrap()
@@ -4975,7 +5002,11 @@ fn is_retriable_rpc_error(err: &str) -> bool {
 }
 
 fn is_process_exit_error(err: &str) -> bool {
-    err.contains("进程已退出")
+    err.contains("进程已退出") || err.contains("进程不可写") || err.contains("连接已断开")
+}
+
+fn prompt_conn_needs_rebuild(conn_alive: Option<bool>, last_err: &str) -> bool {
+    conn_alive != Some(true) || is_process_exit_error(last_err)
 }
 
 /// 瞬时错误退避：1s → 2s → 4s → 8s（封顶 8s）。Cursor 云端 PING/stall 恢复常需数秒。
@@ -5703,7 +5734,17 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
         assert!(!is_retriable_rpc_error("模型不存在"));
         assert!(!is_retriable_rpc_error("session/new 未返回 sessionId"));
         assert!(is_process_exit_error("Cursor 进程已退出"));
+        assert!(is_process_exit_error("Cursor 进程不可写（已退出？）"));
+        assert!(is_process_exit_error("Cursor 连接已断开"));
         assert!(!is_process_exit_error("Internal error"));
+    }
+
+    #[test]
+    fn rebuilds_prompt_connection_when_cursor_slot_disappears() {
+        assert!(prompt_conn_needs_rebuild(None, "Cursor 未连接"));
+        assert!(prompt_conn_needs_rebuild(Some(false), ""));
+        assert!(prompt_conn_needs_rebuild(Some(true), "Cursor 连接已断开"));
+        assert!(!prompt_conn_needs_rebuild(Some(true), "Internal error"));
     }
 
     #[test]

@@ -24,6 +24,7 @@ export interface ClueCardVersion {
   id: string;
   title: string;
   content: string;
+  authorName?: string;
   sourceThreadId?: string | null;
   createdAt: number;
 }

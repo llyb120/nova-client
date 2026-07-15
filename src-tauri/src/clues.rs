@@ -22,6 +22,8 @@ pub struct ClueCardVersion {
     pub title: String,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_thread_id: Option<String>,
     pub created_at: i64,
 }
@@ -144,6 +146,7 @@ impl ClueStore {
         title: String,
         content: String,
         source_thread_id: Option<String>,
+        author_name: String,
     ) -> Result<CaptureClueResult, String> {
         let title = title.trim().to_string();
         let content = content.trim().to_string();
@@ -160,7 +163,7 @@ impl ClueStore {
                 let target = target_card_id.ok_or("请选择要更新的线索")?;
                 let (group_index, card_index) =
                     self.card_location(target).ok_or("目标线索不存在")?;
-                let version = new_version(title, content, source_thread_id, now);
+                let version = new_version(title, content, source_thread_id, author_name, now);
                 let group = &mut self.groups[group_index];
                 let card = {
                     let card = &mut group.cards[card_index];
@@ -178,7 +181,7 @@ impl ClueStore {
             "parallel" => {
                 let target = target_card_id.ok_or("请选择平行线索的位置")?;
                 let (group_index, _) = self.card_location(target).ok_or("目标线索不存在")?;
-                let card = new_card(title, content, source_thread_id, now);
+                let card = new_card(title, content, source_thread_id, author_name, now);
                 let group = &mut self.groups[group_index];
                 group.cards.push(card.clone());
                 group.updated_at = now;
@@ -195,7 +198,7 @@ impl ClueStore {
                     }
                     None => Vec::new(),
                 };
-                let card = new_card(title, content, source_thread_id, now);
+                let card = new_card(title, content, source_thread_id, author_name, now);
                 let group = ClueNodeGroup {
                     id: uuid::Uuid::new_v4().to_string(),
                     parent_card_ids,
@@ -262,6 +265,26 @@ impl ClueStore {
 
         self.save()?;
         Ok(group)
+    }
+
+    pub fn delete(&mut self, card_id: &str) -> Result<(), String> {
+        let (group_index, card_index) = self.card_location(card_id).ok_or("线索不存在")?;
+        let now = now_ms();
+        if self.groups[group_index].cards.len() == 1 {
+            self.groups.remove(group_index);
+        } else {
+            let group = &mut self.groups[group_index];
+            group.cards.remove(card_index);
+            group.updated_at = now;
+        }
+        for group in &mut self.groups {
+            let parent_count = group.parent_card_ids.len();
+            group.parent_card_ids.retain(|parent| parent != card_id);
+            if group.parent_card_ids.len() != parent_count {
+                group.updated_at = now;
+            }
+        }
+        self.save()
     }
 
     pub fn snapshot(&self, root_card_id: &str) -> Result<ClueContextSnapshot, String> {
@@ -380,12 +403,14 @@ fn new_version(
     title: String,
     content: String,
     source_thread_id: Option<String>,
+    author_name: String,
     now: i64,
 ) -> ClueCardVersion {
     ClueCardVersion {
         id: uuid::Uuid::new_v4().to_string(),
         title,
         content,
+        author_name: Some(author_name),
         source_thread_id,
         created_at: now,
     }
@@ -395,9 +420,10 @@ fn new_card(
     title: String,
     content: String,
     source_thread_id: Option<String>,
+    author_name: String,
     now: i64,
 ) -> ClueCard {
-    let version = new_version(title, content, source_thread_id, now);
+    let version = new_version(title, content, source_thread_id, author_name, now);
     ClueCard {
         id: uuid::Uuid::new_v4().to_string(),
         current_version_id: version.id.clone(),
@@ -422,7 +448,14 @@ mod tests {
     fn update_parallel_and_new_have_distinct_shapes() {
         let mut store = store();
         let root = store
-            .capture("new", None, "根线索".into(), "root".into(), None)
+            .capture(
+                "new",
+                None,
+                "根线索".into(),
+                "root".into(),
+                None,
+                "甲".into(),
+            )
             .unwrap();
         let updated = store
             .capture(
@@ -431,6 +464,7 @@ mod tests {
                 "根线索 v2".into(),
                 "updated".into(),
                 None,
+                "乙".into(),
             )
             .unwrap();
         assert_eq!(updated.group.id, root.group.id);
@@ -444,6 +478,7 @@ mod tests {
                 "平行线索".into(),
                 "parallel".into(),
                 None,
+                "丙".into(),
             )
             .unwrap();
         assert_eq!(parallel.group.id, root.group.id);
@@ -456,6 +491,7 @@ mod tests {
                 "后续线索".into(),
                 "child".into(),
                 None,
+                "丁".into(),
             )
             .unwrap();
         assert_eq!(child.group.parent_card_ids, vec![parallel.card.id]);
@@ -465,7 +501,7 @@ mod tests {
     fn snapshot_orders_parent_before_child() {
         let mut store = store();
         let root = store
-            .capture("new", None, "根".into(), "root".into(), None)
+            .capture("new", None, "根".into(), "root".into(), None, "甲".into())
             .unwrap();
         let child = store
             .capture(
@@ -474,6 +510,7 @@ mod tests {
                 "后续".into(),
                 "child".into(),
                 None,
+                "乙".into(),
             )
             .unwrap();
         let snapshot = store.snapshot(&child.card.id).unwrap();
@@ -486,7 +523,7 @@ mod tests {
     fn association_splits_only_the_selected_parallel_card() {
         let mut store = store();
         let first = store
-            .capture("new", None, "线索 A".into(), "a".into(), None)
+            .capture("new", None, "线索 A".into(), "a".into(), None, "甲".into())
             .unwrap();
         let second = store
             .capture(
@@ -495,6 +532,7 @@ mod tests {
                 "线索 B".into(),
                 "b".into(),
                 None,
+                "乙".into(),
             )
             .unwrap();
 
@@ -510,7 +548,7 @@ mod tests {
     fn association_rejects_cycles() {
         let mut store = store();
         let first = store
-            .capture("new", None, "线索 A".into(), "a".into(), None)
+            .capture("new", None, "线索 A".into(), "a".into(), None, "甲".into())
             .unwrap();
         let second = store
             .capture(
@@ -519,6 +557,7 @@ mod tests {
                 "线索 B".into(),
                 "b".into(),
                 None,
+                "乙".into(),
             )
             .unwrap();
 
@@ -546,5 +585,39 @@ mod tests {
         }))
         .unwrap();
         assert!(snapshot.cards.is_empty());
+    }
+
+    #[test]
+    fn delete_keeps_downstream_and_removes_parent_reference() {
+        let mut store = store();
+        let root = store
+            .capture("new", None, "根".into(), "root".into(), None, "甲".into())
+            .unwrap();
+        let parallel = store
+            .capture(
+                "parallel",
+                Some(&root.card.id),
+                "平行".into(),
+                "parallel".into(),
+                None,
+                "乙".into(),
+            )
+            .unwrap();
+        let child = store
+            .capture(
+                "new",
+                Some(&root.card.id),
+                "后续".into(),
+                "child".into(),
+                None,
+                "丙".into(),
+            )
+            .unwrap();
+
+        store.delete(&root.card.id).unwrap();
+        assert!(store.card_location(&root.card.id).is_none());
+        assert!(store.card_location(&parallel.card.id).is_some());
+        let (group_index, _) = store.card_location(&child.card.id).unwrap();
+        assert!(store.groups[group_index].parent_card_ids.is_empty());
     }
 }
