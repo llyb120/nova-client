@@ -295,6 +295,8 @@ export interface Settings {
   codexPath: string;
   codexArgs: string;
   codexProxy: string;
+  /** Windows shell 启动 shim（保存后重启应用生效） */
+  windowsShellShimEnabled: boolean;
   defaultMode: string;
   /** 自动生成会话标题所用后端（devin/codex/codebuddy/...，空 = devin） */
   titleModelAgent: string;

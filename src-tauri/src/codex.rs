@@ -585,8 +585,11 @@ impl CodexManager {
         crate::acp::apply_proxy_env(&mut cmd, &settings.codex_proxy);
         cmd.envs(&self.launch_env);
         #[cfg(windows)]
-        if let Err(e) = crate::windows_shell_shim::apply(&self.app, &mut cmd, &self.launch_env) {
-            self.push_log(format!("[windows-shell-shim] {e}"));
+        if self.app.state::<AppState>().windows_shell_shim_enabled {
+            if let Err(e) = crate::windows_shell_shim::apply(&self.app, &mut cmd, &self.launch_env)
+            {
+                self.push_log(format!("[windows-shell-shim] {e}"));
+            }
         }
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW

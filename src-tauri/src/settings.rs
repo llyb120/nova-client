@@ -46,6 +46,8 @@ pub struct Settings {
     pub codex_args: String,
     /// Codex 代理地址（空 = 不覆盖环境变量）
     pub codex_proxy: String,
+    /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
+    pub windows_shell_shim_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,
     /// 自动生成会话标题所用的后端（devin/codex/codebuddy/...，空 = devin）。
@@ -118,6 +120,7 @@ impl Default for Settings {
             codex_path: "codex".into(),
             codex_args: "app-server --stdio".into(),
             codex_proxy: String::new(),
+            windows_shell_shim_enabled: false,
             default_mode: String::new(),
             title_model_agent: "devin".into(),
             title_model: "swe-1-6".into(),
@@ -144,6 +147,16 @@ impl Default for Settings {
             embed_model: "bge-m3".into(),
             embed_api_key: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn windows_shell_shim_is_disabled_by_default() {
+        assert!(!Settings::default().windows_shell_shim_enabled);
     }
 }
 

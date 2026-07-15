@@ -1094,6 +1094,42 @@ fn render_handoff_tool(call: &ToolCall) -> String {
     s
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoff_to_opencode_preserves_history_once() {
+        let mut thread = Thread::new(
+            "D:/project".into(),
+            AgentKind::Devin,
+            None,
+            None,
+            None,
+            false,
+        );
+        thread.push_user("请修复这个问题".into(), Vec::new());
+        thread.items.push(Item::Assistant {
+            id: thread.next_item_id(),
+            text: "已经定位到旧会话状态。".into(),
+            ts: now_ms(),
+        });
+        thread.agent_kind = AgentKind::OpenCode;
+        thread.acp_session_id = None;
+        thread.handoff_from = Some(AgentKind::Devin);
+
+        let context = thread
+            .take_prompt_context("OpenCode")
+            .expect("跨后端切换应把已有历史交给 OpenCode");
+
+        assert!(context.contains("此前由 Devin 处理，现在改由你（OpenCode）接手"));
+        assert!(context.contains("用户：\n请修复这个问题"));
+        assert!(context.contains("Devin：\n已经定位到旧会话状态。"));
+        assert_eq!(thread.handoff_from, None);
+        assert!(thread.take_prompt_context("OpenCode").is_none());
+    }
+}
+
 fn tool_output_text(content: &[Value]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for c in content {

@@ -109,6 +109,7 @@ function CliManager(props: {
 
 type SettingsTab =
   | "general"
+  | "advanced"
   | "backends"
   | "instructions"
   | "appearance"
@@ -120,6 +121,7 @@ type SettingsTab =
 
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
+  { id: "advanced", name: "高级" },
   { id: "backends", name: "模型后端" },
   { id: "instructions", name: "Agent 配置" },
   { id: "appearance", name: "外观" },
@@ -148,6 +150,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexArgs, setCodexArgs] = createSignal(s?.codexArgs ?? "app-server --stdio");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
+  const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
+    s?.windowsShellShimEnabled ?? false,
+  );
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
   const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
@@ -371,6 +376,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     codexPath: codexPath().trim() || "codex",
     codexArgs: codexArgs().trim() || "app-server --stdio",
     codexProxy: codexProxy().trim(),
+    windowsShellShimEnabled: windowsShellShimEnabled(),
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
     claudecodeProxy: claudecodeProxy().trim(),
@@ -727,6 +733,8 @@ export function SettingsModal(props: { onClose: () => void }) {
   const save = async () => {
     setSaving(true);
     const settings = draftSettings();
+    const shellShimChanged =
+      settings.windowsShellShimEnabled !== (state.settings?.windowsShellShimEnabled ?? false);
     try {
       await api.setSettings(settings);
       setState("settings", settings);
@@ -740,6 +748,12 @@ export function SettingsModal(props: { onClose: () => void }) {
       }
       // 中转站配置可能变化，稍后刷新连接状态
       setTimeout(() => void refreshRelayStatus(), 800);
+      if (shellShimChanged) {
+        await message("Windows 启动 shim 设置已保存，重启 Nova 后生效。", {
+          title: "需要重启 Nova",
+          kind: "info",
+        });
+      }
       props.onClose();
     } catch (error) {
       await message(String(error), { title: "保存设置失败", kind: "error" });
@@ -889,6 +903,27 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <span class="field-label">自动升级</span>
                 <span class="field-hint">
                   新版本会在后台自动下载好，并在空闲时间（没有任何会话或任务在运行）弹窗提示你选择是否现在更新，不会强制静默重启。
+                </span>
+              </div>
+            </section>
+          </Show>
+
+          {/* ===== 高级 ===== */}
+          <Show when={tab() === "advanced"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">Windows 启动</h3>
+              <div class="field">
+                <span class="field-label">Windows shell 启动 shim</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={windowsShellShimEnabled()}
+                    onChange={(e) => setWindowsShellShimEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  为 agent 子进程的 cmd、PowerShell 和 pwsh 使用无窗口 shim，减少控制台闪现。默认关闭；保存后重启 Nova 生效。
                 </span>
               </div>
             </section>

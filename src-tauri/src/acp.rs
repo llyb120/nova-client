@@ -1631,8 +1631,11 @@ impl AcpManager {
         }
         // 微型 GUI helper 统一覆盖各后端绕过父进程 flags 的 cmd/powershell/pwsh 孙进程。
         #[cfg(windows)]
-        if let Err(e) = crate::windows_shell_shim::apply(&self.app, &mut cmd, &self.launch_env) {
-            self.push_log(format!("[windows-shell-shim] {e}"));
+        if self.app.state::<AppState>().windows_shell_shim_enabled {
+            if let Err(e) = crate::windows_shell_shim::apply(&self.app, &mut cmd, &self.launch_env)
+            {
+                self.push_log(format!("[windows-shell-shim] {e}"));
+            }
         }
 
         // 把 ~/.nova/skills 用软链接/目录联接同步到各后端全局 skills 目录

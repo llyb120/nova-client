@@ -53,6 +53,8 @@ pub struct AppState {
     pub clues: Mutex<clues::ClueStore>,
     pub projects: Mutex<ProjectStore>,
     pub settings: Mutex<Settings>,
+    /// 应用启动时读取的 Windows shell shim 开关；运行中改设置只会在下次重启时生效。
+    pub windows_shell_shim_enabled: bool,
     pub roaming: Mutex<RoamingStore>,
     /// 已创建的 git worktree 记录（独立持久化，供设置面板手动清理）
     pub worktrees: Mutex<WorktreeStore>,
@@ -2184,6 +2186,7 @@ fn set_thread_agent(
         return Err("会话正在运行，请先停止再切换模型".into());
     }
     let changed;
+    let old_kind: AgentKind;
     let switched_item;
     {
         let mut store = state.store.lock().unwrap();
@@ -2194,7 +2197,7 @@ fn set_thread_agent(
         if thread.is_quota_borrowed() {
             return Err("额度租借会话的后端已绑定；请重新发起租借以切换后端".into());
         }
-        let old_kind = thread.agent_kind.clone();
+        old_kind = thread.agent_kind.clone();
         changed = old_kind != agent_kind;
         thread.agent_kind = agent_kind.clone();
         thread.model = model.filter(|s| !s.is_empty());
@@ -2207,7 +2210,7 @@ fn set_thread_agent(
             thread.handoff_from = if thread.items.is_empty() {
                 None
             } else {
-                Some(old_kind)
+                Some(old_kind.clone())
             };
             let label = agent_kind.label();
             let note = if thread.handoff_from.is_some() {
@@ -2225,11 +2228,14 @@ fn set_thread_agent(
         store.save();
     }
     if changed {
-        // 所有 manager 都解除该线程的 remote 会话路由，确保下次按新 agent 新建
-        for mgr in state.all_acp() {
+        // 旧 remote session 只属于切换前的后端。不能清理目标后端：OpenCode 等独占连接
+        // 的 manager 会异步杀掉 thread_id 对应连接，若紧接着发送首条接力消息，可能误杀
+        // 刚创建的新连接并导致 session not found。
+        if let Some(mgr) = state.acp_for(&old_kind) {
             mgr.forget_session_of_thread(&thread_id);
+        } else {
+            state.codex.forget_session_of_thread(&thread_id);
         }
-        state.codex.forget_session_of_thread(&thread_id);
         if let Some(item) = switched_item {
             let _ = app.emit(
                 acp::EV_UPDATE,
@@ -3995,6 +4001,7 @@ pub fn run() {
                 }
             }
             let settings = Settings::load(&dir);
+            let windows_shell_shim_enabled = settings.windows_shell_shim_enabled;
             // 集中 skills → 各后端全局目录的软链接/联接（启动时先同步一次）
             let _ = skills::sync_skills_to_backends(&dir);
             let roaming = RoamingStore::load(&dir);
@@ -4022,6 +4029,7 @@ pub fn run() {
                 clues: Mutex::new(clues),
                 projects: Mutex::new(projects),
                 settings: Mutex::new(settings),
+                windows_shell_shim_enabled,
                 roaming: Mutex::new(roaming),
                 worktrees: Mutex::new(worktrees),
                 employees: Mutex::new(employees),
