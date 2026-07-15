@@ -204,6 +204,8 @@ export function ChatView() {
 
   const cancelBottomFollow = () => {
     beginManualScroll();
+    // 滚轮/快捷键上滑是明确意图：立刻视为已离开底部，避免等 scroll 事件期间仍被钉底拉回。
+    manualScrollMovedAway = true;
     setStickToBottom(false);
   };
 
@@ -217,7 +219,13 @@ export function ChatView() {
     setStickToBottom(false);
   };
 
+  const isFromProgrammaticPin = () =>
+    !!scrollRef &&
+    lastPinnedScrollTop !== null &&
+    Math.abs(scrollRef.scrollTop - lastPinnedScrollTop) <= 1;
+
   // 必须先实际离开底部，再实际回到底部，才恢复自动吸底。
+  // 程序化钉底造成的「回到底部」不能恢复吸底，否则流式输出时刚滑走又被锁回底部。
   const syncManualScroll = () => {
     if (!manualScroll) return;
     if (!isAtBottom()) {
@@ -225,7 +233,7 @@ export function ChatView() {
       setStickToBottom(false);
       return;
     }
-    if (!manualScrollMovedAway) return;
+    if (!manualScrollMovedAway || isFromProgrammaticPin()) return;
     manualScroll = false;
     manualScrollMovedAway = false;
     setStickToBottom(true);
@@ -254,11 +262,12 @@ export function ChatView() {
   const handleTranscriptScroll = () => {
     refreshVirtualGroups();
     // 输入事件可能被原生滚动条或嵌套内容吞掉；实际滚动位置才是是否继续吸底的最终依据。
-    const fromBottomPin =
-      !!scrollRef &&
-      lastPinnedScrollTop !== null &&
-      Math.abs(scrollRef.scrollTop - lastPinnedScrollTop) <= 1;
-    if (!fromBottomPin && !manualScroll && stickToBottom() && !isAtBottom()) cancelBottomFollow();
+    const fromBottomPin = isFromProgrammaticPin();
+    if (!fromBottomPin) {
+      // 用户已离开程序化钉底位置，清标记，避免之后误判为「钉底回到底部」
+      if (lastPinnedScrollTop !== null && manualScroll) lastPinnedScrollTop = null;
+      if (!manualScroll && stickToBottom() && !isAtBottom()) cancelBottomFollow();
+    }
     syncManualScroll();
   };
 
@@ -293,14 +302,20 @@ export function ChatView() {
     let stableFrames = 0;
     const step = () => {
       settleRaf = 0;
-      if (!scrollRef) return;
+      // 用户已上滑脱离吸底：立刻停止 settle，绝不能无条件 pinBottom 把人拉回去。
+      if (!scrollRef || !stickToBottom() || manualScroll) return;
       pinBottom(true);
       const height = scrollRef.scrollHeight;
       const distance = height - scrollRef.scrollTop - scrollRef.clientHeight;
       if (height === lastHeight && distance <= 1) stableFrames++;
       else stableFrames = 0;
       lastHeight = height;
-      if (performance.now() < deadline && (awaitingSendUserItem || stableFrames < 3)) {
+      if (
+        stickToBottom() &&
+        !manualScroll &&
+        performance.now() < deadline &&
+        (awaitingSendUserItem || stableFrames < 3)
+      ) {
         settleRaf = requestAnimationFrame(step);
       }
     };

@@ -932,7 +932,8 @@ export async function openThread(id: string) {
     if (state.currentId !== id) return;
     rememberThreadSnapshot(t);
     const agentKind = t.agentKind ?? "devin";
-    rememberThreadConfig(agentKind, t.cwd, t.model, t.mode, t.reasoningEffort);
+    // 仅「显式选择」和「新建会话」才更新 lastUsed；查看已有会话只同步 UI（showThreadSnapshot），
+    // 不写 lastUsed——否则打开一条用后端默认模型跑的旧会话，会覆盖该项目/全局记住的模型偏好。
     showThreadSnapshot(t, false, !!cached);
     // 漫游 / 额度租借：拉取对端模型列表；普通本地会话才探测本机后端。
     const roamingPeer =
