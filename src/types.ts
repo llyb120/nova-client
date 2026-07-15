@@ -271,6 +271,10 @@ export interface Settings {
   opencodeEnabled: boolean;
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
   worktreeDir: string;
+  /** 是否自动清理长期未更新的会话 */
+  sessionAutoCleanupEnabled: boolean;
+  /** 自动清理会话的保留时长（小时） */
+  sessionAutoCleanupHours: number;
   /** 语义检索开关（关 = 内置 BM25 关键词检索） */
   semanticEnabled: boolean;
   /** embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434） */

@@ -172,6 +172,12 @@ export function SettingsModal(props: { onClose: () => void }) {
   );
   const [shareModel, setShareModel] = createSignal(s?.shareModel ?? "swe-1.6");
   const [editor, setEditor] = createSignal(s?.editor ?? "code");
+  const [sessionAutoCleanupEnabled, setSessionAutoCleanupEnabled] = createSignal(
+    s?.sessionAutoCleanupEnabled ?? false,
+  );
+  const [sessionAutoCleanupHours, setSessionAutoCleanupHours] = createSignal(
+    s?.sessionAutoCleanupHours ?? 24 * 30,
+  );
   // server 留空回退默认地址；这里也预填，避免误存成空导致团队/漫游被静默关闭
   const [relayServer, setRelayServer] = createSignal(s?.relayServer || DEFAULT_RELAY_SERVER);
   const [relayToken, setRelayToken] = createSignal(s?.relayToken ?? "");
@@ -389,6 +395,8 @@ export function SettingsModal(props: { onClose: () => void }) {
     cursorEnabled: cursorEnabled(),
     opencodeEnabled: opencodeEnabled(),
     worktreeDir: worktreeDir().trim(),
+    sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
+    sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
     semanticEnabled: semanticEnabled(),
     embedEndpoint: embedEndpoint().trim(),
     embedModel: embedModel().trim(),
@@ -796,6 +804,34 @@ export function SettingsModal(props: { onClose: () => void }) {
                   点击文件路径时用它打开，如 cursor / code / zed / windsurf（需在
                   PATH 中）。正式项目会连同项目目录一起打开，临时会话只打开文件。
                 </span>
+              </label>
+
+              <div class="field">
+                <span class="field-label">自动清理过期会话</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={sessionAutoCleanupEnabled()}
+                    onChange={(e) => setSessionAutoCleanupEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  启用后会在启动时及之后每小时检查一次，运行中的会话不会被清理。
+                </span>
+              </div>
+
+              <label class="field">
+                <span class="field-label">会话保留时间（小时）</span>
+                <input
+                  class="field-input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={sessionAutoCleanupHours()}
+                  onInput={(e) => setSessionAutoCleanupHours(Number(e.currentTarget.value))}
+                />
+                <span class="field-hint">仅清理普通会话；最后更新距当前超过该时长将被自动删除。</span>
               </label>
             </section>
 

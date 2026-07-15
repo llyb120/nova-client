@@ -83,6 +83,10 @@ pub struct Settings {
     /// worktree 工作目录的根（空 = 应用数据目录下的 worktrees/）。
     /// 会话开启「在 worktree 中执行」时，在此目录下为其创建独立工作目录。
     pub worktree_dir: String,
+    /// 是否自动清理长期未更新的会话。
+    pub session_auto_cleanup_enabled: bool,
+    /// 自动清理会话的保留时长（小时）。
+    pub session_auto_cleanup_hours: u32,
     /// 语义检索开关（关 = 用内置 BM25 关键词检索；开需配置下面的 embedding 服务）
     pub semantic_enabled: bool,
     /// embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434）
@@ -133,6 +137,8 @@ impl Default for Settings {
             cursor_enabled: true,
             opencode_enabled: true,
             worktree_dir: String::new(),
+            session_auto_cleanup_enabled: false,
+            session_auto_cleanup_hours: 24 * 30,
             semantic_enabled: false,
             embed_endpoint: "http://localhost:11434".into(),
             embed_model: "bge-m3".into(),
@@ -143,14 +149,26 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(dir: &PathBuf) -> Self {
-        let mut settings: Self = fs::read_to_string(dir.join("settings.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+        let raw = fs::read_to_string(dir.join("settings.json")).ok();
+        let legacy_days = raw.as_deref().and_then(|json| {
+            serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .and_then(|value| value["sessionAutoCleanupDays"].as_u64())
+                .and_then(|days| u32::try_from(days).ok())
+        });
+        let mut settings: Self = raw
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_default();
         if settings.claudecode_path.trim() == "npx"
             && settings.claudecode_args.trim() == "@zed-industries/claude-code-acp"
         {
             settings.claudecode_args = "-y @zed-industries/claude-code-acp".into();
+        }
+        if settings.session_auto_cleanup_hours == 0 {
+            settings.session_auto_cleanup_hours = legacy_days
+                .map(|days| days.saturating_mul(24))
+                .unwrap_or(24 * 30);
         }
         settings
     }

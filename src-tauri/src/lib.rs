@@ -207,6 +207,43 @@ fn running_by_id(state: &AppState, thread_id: &str) -> bool {
     is_running(state, thread)
 }
 
+fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
+    thread.employee_id.is_none()
+        && !thread.mind_thread
+        && thread.roaming_role.is_none()
+        && thread.quota_peer.is_none()
+}
+
+fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
+    let timeout_ms = i64::from(hours.max(1)).saturating_mul(60 * 60 * 1000);
+    updated_at < now.saturating_sub(timeout_ms)
+}
+
+fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
+    let state = app.state::<AppState>();
+    let hours = {
+        let settings = state.settings.lock().unwrap();
+        if !settings.session_auto_cleanup_enabled {
+            return 0;
+        }
+        settings.session_auto_cleanup_hours
+    };
+    let now = now_ms();
+    let thread_ids = {
+        let store = state.store.lock().unwrap();
+        store
+            .threads
+            .iter()
+            .filter(|thread| {
+                is_normal_thread_for_auto_cleanup(thread)
+                    && thread_is_expired(thread.updated_at, now, hours)
+            })
+            .map(|thread| thread.id.clone())
+            .collect()
+    };
+    delete_threads_impl(app, &state, thread_ids)
+}
+
 /// 是否有任意会话正在运行（本地 Devin/Codex、漫游 guest、被别人漫游的 host 均算）。
 /// 静默升级的前置条件之一：没有任何会话在跑才允许自动替换重启。
 fn any_session_running(state: &AppState) -> bool {
@@ -254,6 +291,36 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
         tauri::async_runtime::spawn(async move {
             runtime.shutdown().await;
         });
+    }
+}
+
+#[cfg(test)]
+mod session_auto_cleanup_tests {
+    use super::{is_normal_thread_for_auto_cleanup, thread_is_expired, AgentKind, Thread};
+
+    #[test]
+    fn thread_is_expired_only_after_the_configured_retention() {
+        const HOUR_MS: i64 = 60 * 60 * 1000;
+        let now = 10 * HOUR_MS;
+
+        assert!(!thread_is_expired(now - 3 * HOUR_MS, now, 3));
+        assert!(thread_is_expired(now - 3 * HOUR_MS - 1, now, 3));
+        assert!(thread_is_expired(now - HOUR_MS - 1, now, 0));
+    }
+
+    #[test]
+    fn special_threads_are_not_auto_cleanup_candidates() {
+        let mut thread = Thread::new(String::new(), AgentKind::Devin, None, None, None, false);
+        assert!(is_normal_thread_for_auto_cleanup(&thread));
+
+        thread.ephemeral = true;
+        assert!(is_normal_thread_for_auto_cleanup(&thread));
+        thread.ephemeral = false;
+        thread.employee_id = Some("employee".into());
+        assert!(!is_normal_thread_for_auto_cleanup(&thread));
+        thread.employee_id = None;
+        thread.roaming_role = Some("host".into());
+        assert!(!is_normal_thread_for_auto_cleanup(&thread));
     }
 }
 
@@ -1356,12 +1423,7 @@ fn delete_thread(
 }
 
 /// 批量删除会话；运行中的自动跳过，返回实际删除数量
-#[tauri::command]
-fn delete_threads(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    thread_ids: Vec<String>,
-) -> Result<usize, String> {
+fn delete_threads_impl(app: &tauri::AppHandle, state: &AppState, thread_ids: Vec<String>) -> usize {
     let roots: Vec<String> = thread_ids
         .into_iter()
         .filter(|id| !running_by_id(&state, id))
@@ -1389,7 +1451,7 @@ fn delete_threads(
         deleted = before - store.threads.len();
         store.save();
     }
-    employees::delete_tasks_for_threads(&app, &deletable);
+    employees::delete_tasks_for_threads(app, &deletable);
     state.workflows.lock().unwrap().detach_threads(&deletable);
     for id in &deletable {
         for mgr in state.all_acp() {
@@ -1399,7 +1461,16 @@ fn delete_threads(
         cleanup_borrowed_runtime(&state, id);
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
-    Ok(deleted)
+    deleted
+}
+
+#[tauri::command]
+fn delete_threads(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_ids: Vec<String>,
+) -> Result<usize, String> {
+    Ok(delete_threads_impl(&app, &state, thread_ids))
 }
 
 /// 用配置的编辑器打开文件（可带行号）。
@@ -2327,8 +2398,9 @@ fn set_global_agent_instructions(
 async fn set_settings(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    settings: Settings,
+    mut settings: Settings,
 ) -> Result<(), String> {
+    settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
     let (
         restart_devin,
@@ -2417,8 +2489,9 @@ async fn set_settings(
         state.relay.notify_peer_models_changed();
     }
     if recheck_availability {
-        spawn_backend_availability_check(app);
+        spawn_backend_availability_check(app.clone());
     }
+    run_session_auto_cleanup(&app);
     Ok(())
 }
 
@@ -3569,6 +3642,16 @@ pub fn run() {
                 cli_upgrade_lock: tokio::sync::Mutex::new(()),
                 cli_operations: Mutex::new(HashMap::new()),
                 tool_api: Mutex::new(None),
+            });
+
+            run_session_auto_cleanup(app.handle());
+            let cleanup_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tokio::time::{sleep, Duration};
+                loop {
+                    sleep(Duration::from_secs(60 * 60)).await;
+                    run_session_auto_cleanup(&cleanup_app);
+                }
             });
 
             // 旧奏折 → Notice（一次性迁移 pending/待领旨）
