@@ -261,9 +261,11 @@ clue_context: Option<ClueContextSnapshot>,
 
 - Canvas 绘制网格和连线，DOM 卡牌与 Canvas 共用同一组世界坐标。
 - 支持拖动空白处平移、以鼠标位置为中心缩放和一键适应全部线索。
-- 横向阶段表示前后深度；同一隐藏节点组的平行线索按卡牌堆叠展示。
+- 横向阶段表示前后深度；同一隐藏节点组的线索纵向堆叠，背景卡露出标题栏，点击后临时置顶。
+- 同组卡牌共用一对对外锚点，锚点连接操作使用当前置顶卡作为实际关联卡。
 - 卡片间绘制 `前置 -> 后续` 的正交有向箭头，通过节点排序、独立车道和底色描边减少交叉干扰。
 - 用户可以从卡牌右侧连接点拖到另一张卡直接建立前后顺序。
+- 用户可以右键连接线删除该组共享的前置关系。
 - 卡片左上角显示当前版本作者头像，头像内使用姓名或姓名缩写。
 - 卡片显示标题、正文摘要、更新时间和版本数。
 - 右侧详情显示正文、前置线索、后续线索、版本记录和操作按钮。
@@ -342,7 +344,7 @@ Relay 服务端沿用同一简单模型：
 - 漫游创建消息携带固定快照，guest 与 host Thread 都记录 `activeClueCardId` 和 `clueContext`。
 - 远程设备/网页会话序列化时明确移除证据链字段。
 
-服务端接口为 `GET /v1/clues`、`POST /v1/clues/capture`、`POST /v1/clues/associate`、`POST /v1/clues/delete` 和 `GET /v1/clues/context`。
+服务端接口为 `GET /v1/clues`、`POST /v1/clues/capture`、`POST /v1/clues/associate`、`POST /v1/clues/disassociate`、`POST /v1/clues/split`、`POST /v1/clues/stack`、`POST /v1/clues/delete` 和 `GET /v1/clues/context`。
 
 ## 15. 异常与边界
 

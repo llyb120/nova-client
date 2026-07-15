@@ -57,6 +57,13 @@ const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const QUOTA_OPERATION_ACTIVE: u8 = 0;
 const QUOTA_OPERATION_CANCELLED: u8 = 1;
 const QUOTA_OPERATION_COMMITTED: u8 = 2;
+const GAP_RESYNC_COOLDOWN: Duration = Duration::from_millis(1200);
+const AUTOMATIC_RESYNC_COOLDOWN: Duration = Duration::from_secs(15);
+
+fn resync_cooldown_elapsed(last: Option<&Instant>, now: Instant, cooldown: Duration) -> bool {
+    last.map(|time| now.saturating_duration_since(*time) >= cooldown)
+        .unwrap_or(true)
+}
 
 /// host 侧：本机某线程正被哪个 guest 漫游驱动
 #[derive(Clone)]
@@ -274,6 +281,8 @@ pub struct Share {
     pub items: Value,
     #[serde(default)]
     pub plan: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_clue_card_id: Option<String>,
     /// 漫游召回自动回传的快照（前端标注「召回」并自动弹出收件箱）
     #[serde(default)]
     pub recall: bool,
@@ -1050,6 +1059,49 @@ impl RelayManager {
             .group)
     }
 
+    pub async fn clue_disassociate(
+        &self,
+        before_card_id: &str,
+        after_card_id: &str,
+    ) -> Result<ClueNodeGroup, String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v1/clues/disassociate")?
+            .json(&json!({
+                "beforeCardId": before_card_id,
+                "afterCardId": after_card_id,
+            }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(decode_relay_json::<RelayClueAssociate>(response)
+            .await?
+            .group)
+    }
+
+    pub async fn clue_split(&self, card_id: &str) -> Result<ClueNodeGroup, String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v1/clues/split")?
+            .json(&json!({ "cardId": card_id }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(decode_relay_json::<RelayClueAssociate>(response)
+            .await?
+            .group)
+    }
+
+    pub async fn clue_stack(&self, card_ids: &[String]) -> Result<ClueNodeGroup, String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v1/clues/stack")?
+            .json(&json!({ "cardIds": card_ids }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(decode_relay_json::<RelayClueAssociate>(response)
+            .await?
+            .group)
+    }
+
     pub async fn clue_delete(&self, card_id: &str) -> Result<(), String> {
         let response = self
             .clue_request(reqwest::Method::POST, "/v1/clues/delete")?
@@ -1140,7 +1192,7 @@ impl RelayManager {
 
     /// 把会话快照发给 to。recall=true 表示这是漫游召回的自动回传（对方前端标注「召回」）。
     fn send_share(&self, thread_id: &str, to: &str, recall: bool) -> Result<(), String> {
-        let (title, agent_kind, items, plan) = {
+        let (title, agent_kind, items, plan, active_clue_card_id) = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             let t = store.get(thread_id).ok_or("线程不存在")?;
@@ -1152,6 +1204,7 @@ impl RelayManager {
                 t.agent_kind.clone(),
                 serde_json::to_value(&items).unwrap_or(json!([])),
                 t.plan.clone().unwrap_or(json!(null)),
+                t.active_clue_card_id.clone(),
             )
         };
         self.enqueue(
@@ -1162,6 +1215,7 @@ impl RelayManager {
                 "agentKind": agent_kind,
                 "items": items,
                 "plan": plan,
+                "activeClueCardId": active_clue_card_id,
                 "recall": recall,
             }),
         );
@@ -1178,6 +1232,7 @@ impl RelayManager {
                 .unwrap_or(AgentKind::Devin),
             items: env.data["items"].clone(),
             plan: env.data["plan"].clone(),
+            active_clue_card_id: env.data["activeClueCardId"].as_str().map(str::to_string),
             recall: env.data["recall"].as_bool().unwrap_or(false),
             ts: now_ms(),
         };
@@ -1239,6 +1294,7 @@ impl RelayManager {
         } else {
             Some(share.plan)
         };
+        thread.active_clue_card_id = share.active_clue_card_id;
         let thread_id = thread.id.clone();
         {
             let state = self.app.state::<AppState>();
@@ -1272,11 +1328,15 @@ impl RelayManager {
         if self.cfg().is_none() {
             return Err("未配置中转站 token".into());
         }
-        let (src_cwd, transcript) = {
+        let (src_cwd, transcript, active_clue_card_id) = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             let t = store.get(thread_id).ok_or("线程不存在")?;
-            (t.cwd.clone(), build_transcript(&t.items))
+            (
+                t.cwd.clone(),
+                build_transcript(&t.items),
+                t.active_clue_card_id.clone(),
+            )
         };
         if transcript.trim().is_empty() {
             return Err("会话还没有内容可处理".into());
@@ -1318,6 +1378,7 @@ impl RelayManager {
         };
         let model_opt = if model.is_empty() { None } else { Some(model) };
         let mut thread = Thread::new(cwd, agent_kind.clone(), model_opt, None, None, true);
+        thread.active_clue_card_id = active_clue_card_id;
         thread.title = format!("高级分享 · {}", first_line(&prompt, 24));
         let new_id = thread.id.clone();
         {
@@ -2248,14 +2309,8 @@ impl RelayManager {
     /// guest：检测到 update 序号缺口时立即请求一次重同步（按会话节流，避免缺口风暴）。
     /// 比看门狗(数秒)更快收敛「思考残缺 / 命令卡 loading」。
     fn request_resync(&self, thread_id: &str) {
-        {
-            let mut last = self.last_resync.lock().unwrap();
-            if let Some(t) = last.get(thread_id) {
-                if t.elapsed() < Duration::from_millis(1200) {
-                    return; // 刚请求过，节流
-                }
-            }
-            last.insert(thread_id.to_string(), Instant::now());
+        if !self.try_mark_resync(thread_id, GAP_RESYNC_COOLDOWN) {
+            return;
         }
         let Ok((peer, host_thread_id)) = self.roaming_route(thread_id) else {
             return;
@@ -2283,6 +2338,9 @@ impl RelayManager {
                 .collect()
         };
         for (guest_thread_id, peer, host_thread_id) in routes {
+            if !self.try_mark_resync(&guest_thread_id, AUTOMATIC_RESYNC_COOLDOWN) {
+                continue;
+            }
             let _ = self.send_blocking(
                 &peer,
                 "roaming.resync",
@@ -2832,6 +2890,16 @@ impl RelayManager {
             .insert(thread_id.to_string(), Instant::now());
     }
 
+    fn try_mark_resync(&self, thread_id: &str, cooldown: Duration) -> bool {
+        let now = Instant::now();
+        let mut last = self.last_resync.lock().unwrap();
+        if !resync_cooldown_elapsed(last.get(thread_id), now, cooldown) {
+            return false;
+        }
+        last.insert(thread_id.to_string(), now);
+        true
+    }
+
     /// guest 看门狗：周期性对「自认为还在运行」的漫游会话请求一次重同步。
     /// host 会回一份当前快照（含真实运行态），用于自愈：
     /// 1) 长轮次中途丢失/卡住的增量（命令卡 loading、思考残缺）；
@@ -2884,6 +2952,9 @@ impl RelayManager {
                 .collect()
         };
         for (guest_thread_id, peer, host_thread_id) in routes {
+            if !self.try_mark_resync(&guest_thread_id, AUTOMATIC_RESYNC_COOLDOWN) {
+                continue;
+            }
             self.spawn_send_now(
                 peer,
                 "roaming.resync",
@@ -3862,5 +3933,28 @@ mod tests {
         assert!(!host_prompt_is_current(&pending));
         let next = (epoch.clone(), epoch.load(Ordering::SeqCst));
         assert!(host_prompt_is_current(&next));
+    }
+
+    #[test]
+    fn automatic_resync_waits_for_cooldown() {
+        let now = Instant::now();
+        let recent = now - Duration::from_secs(3);
+        let elapsed = now - AUTOMATIC_RESYNC_COOLDOWN;
+
+        assert!(resync_cooldown_elapsed(
+            None,
+            now,
+            AUTOMATIC_RESYNC_COOLDOWN
+        ));
+        assert!(!resync_cooldown_elapsed(
+            Some(&recent),
+            now,
+            AUTOMATIC_RESYNC_COOLDOWN
+        ));
+        assert!(resync_cooldown_elapsed(
+            Some(&elapsed),
+            now,
+            AUTOMATIC_RESYNC_COOLDOWN
+        ));
     }
 }

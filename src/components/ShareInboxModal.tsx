@@ -1,7 +1,15 @@
 import { message, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { api } from "../ipc";
-import { openThread, refreshInbox, refreshThreads, state } from "../store";
+import {
+  clueCardById,
+  openThread,
+  refreshClueGroups,
+  refreshInbox,
+  refreshThreads,
+  startSessionFromClue,
+  state,
+} from "../store";
 import { agentLabel, isScratch } from "../utils";
 import { IconBell, IconFolder, IconPlus, IconX } from "./icons";
 import { projectDisplayName } from "./ProjectPicker";
@@ -37,9 +45,19 @@ export function ShareInboxModal(props: { onClose: () => void }) {
   const accept = async (id: string, cwd: string) => {
     setBusy(id);
     try {
+      const clueCardId = state.inbox.find((share) => share.id === id)?.activeClueCardId;
       const newId = await api.acceptShare(id, cwd, isScratch(cwd));
       await refreshThreads();
       await refreshInbox();
+      if (clueCardId) {
+        await refreshClueGroups();
+        const clue = clueCardById(clueCardId);
+        if (clue) {
+          startSessionFromClue(clue);
+          props.onClose();
+          return;
+        }
+      }
       await openThread(newId);
       props.onClose();
     } catch (e) {

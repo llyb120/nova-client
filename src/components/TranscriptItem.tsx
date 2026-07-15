@@ -4,13 +4,20 @@ import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
 import type { Item, PromptImage } from "../types";
 import { IconChevron, IconFile, IconPencil } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { Markdown } from "./Markdown";
+import { ToolCallCard } from "./ToolCallCard";
 
 function attachmentSrc(img: PromptImage): string {
   if (img.data) return `data:${img.mimeType};base64,${img.data}`;
   return convertFileSrc(decodeURI((img.uri ?? "").replace(/^file:\/+/, "")));
 }
-import { Markdown } from "./Markdown";
-import { ToolCallCard } from "./ToolCallCard";
+
+function normalizeThoughtMarkdown(text: string): string {
+  // Older OpenCode sessions joined adjacent reasoning parts as **A****B**.
+  return state.agentKind === "opencode"
+    ? text.replace(/(\S)\*{4}(?=\S)/g, "$1**\n\n**")
+    : text;
+}
 
 /** 用户消息气泡：hover 显示编辑按钮，编辑后从该处重新开始会话（codex 风格） */
 function UserMessage(props: { item: Extract<Item, { type: "user" }> }) {
@@ -142,7 +149,11 @@ export function TranscriptItem(props: { item: Item; active?: boolean }) {
               </button>
               <Show when={thoughtOpen()}>
                 <div class="thought-body">
-                  <Markdown text={(props.item as Extract<Item, { type: "thought" }>).text} />
+                  <Markdown
+                    text={normalizeThoughtMarkdown(
+                      (props.item as Extract<Item, { type: "thought" }>).text,
+                    )}
+                  />
                 </div>
               </Show>
             </div>

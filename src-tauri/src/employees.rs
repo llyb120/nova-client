@@ -1946,15 +1946,6 @@ pub async fn process_command_inbox(app: &AppHandle) {
     let _ = app.emit(EV_TASKS, json!({}));
 }
 
-/// 分发一条协作命令（Tool API / 收件箱共用）。
-pub async fn dispatch_inbox_command(app: &AppHandle, cmd: InboxCommand) {
-    let _ = exec_inbox_command(app, cmd).await;
-    let _ = app.emit(EV_MARKS, json!({}));
-    let _ = app.emit(EV_DECISIONS, json!({}));
-    let _ = app.emit(EV_EMPLOYEES, json!({}));
-    let _ = app.emit(EV_TASKS, json!({}));
-}
-
 async fn exec_inbox_command(app: &AppHandle, cmd: InboxCommand) -> Result<(), String> {
     let Some(actor) = find_employee(app, &cmd.from) else {
         return Err(format!("发起方员工不存在：{}", cmd.from));
@@ -2174,54 +2165,6 @@ pub fn find_employee(app: &AppHandle, id_or_name: &str) -> Option<Employee> {
         .find(|e| e.id == id_or_name)
         .or_else(|| store.employees.iter().find(|e| e.name == id_or_name))
         .cloned()
-}
-
-/// Tool API：语义/BM25 检索员工记忆。
-pub fn tool_kb_search(app: &AppHandle, employee: &str, query: &str, k: usize) -> String {
-    let employee = employee.trim();
-    let query = query.trim();
-    if employee.is_empty() || query.is_empty() {
-        return "需要 employee 与 query".into();
-    }
-    let k = k.clamp(1, 20);
-    let entries = {
-        let state = app.state::<AppState>();
-        let mem = state.memory.lock().unwrap();
-        mem.all(employee).to_vec()
-    };
-    if entries.is_empty() {
-        return "（这名员工还没有任何历史记忆/知识）".into();
-    }
-    let refs: Vec<&JournalEntry> = entries.iter().collect();
-    let ranked = bm25_rank(&refs, query, k);
-    if ranked.is_empty() {
-        return "（没有找到相关记忆）".into();
-    }
-    let mut out = format!("与「{}」最相关的 {} 条记忆/知识：\n", query, ranked.len());
-    for e in ranked {
-        let tag = if e.kind == "lesson" {
-            if e.pinned {
-                "守则·已内化"
-            } else {
-                "守则·试行"
-            }
-        } else if e.pinned {
-            "长期知识"
-        } else {
-            "工作记忆"
-        };
-        let title = if e.task_title.trim().is_empty() {
-            "(无标题)"
-        } else {
-            e.task_title.trim()
-        };
-        out.push_str(&format!(
-            "\n- [{tag}] ts={} 〔{title}〕{}",
-            e.ts,
-            one_line(&e.summary, 400)
-        ));
-    }
-    out
 }
 
 fn relay_configured(app: &AppHandle) -> bool {

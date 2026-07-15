@@ -267,6 +267,118 @@ impl ClueStore {
         Ok(group)
     }
 
+    pub fn disassociate(
+        &mut self,
+        before_card_id: &str,
+        after_card_id: &str,
+    ) -> Result<ClueNodeGroup, String> {
+        self.card_location(before_card_id).ok_or("前置线索不存在")?;
+        let (after_group_index, _) = self.card_location(after_card_id).ok_or("后续线索不存在")?;
+        let group = &mut self.groups[after_group_index];
+        if !group
+            .parent_card_ids
+            .iter()
+            .any(|card_id| card_id == before_card_id)
+        {
+            return Err("这两组线索没有该连接".into());
+        }
+        group
+            .parent_card_ids
+            .retain(|card_id| card_id != before_card_id);
+        group.updated_at = now_ms();
+        let result = group.clone();
+        self.save()?;
+        Ok(result)
+    }
+
+    pub fn split_card(&mut self, card_id: &str) -> Result<ClueNodeGroup, String> {
+        let (group_index, card_index) = self.card_location(card_id).ok_or("线索不存在")?;
+        if self.groups[group_index].cards.len() < 2 {
+            return Err("这条线索没有与其它线索堆叠".into());
+        }
+        let now = now_ms();
+        let (parent_card_ids, card) = {
+            let group = &mut self.groups[group_index];
+            let card = group.cards.remove(card_index);
+            group.updated_at = now;
+            (group.parent_card_ids.clone(), card)
+        };
+        let group = ClueNodeGroup {
+            id: uuid::Uuid::new_v4().to_string(),
+            parent_card_ids,
+            cards: vec![card],
+            created_at: now,
+            updated_at: now,
+        };
+        self.groups.push(group.clone());
+        self.save()?;
+        Ok(group)
+    }
+
+    pub fn stack_cards(&mut self, card_ids: &[String]) -> Result<ClueNodeGroup, String> {
+        let selected: HashSet<&str> = card_ids.iter().map(String::as_str).collect();
+        if selected.len() < 2 {
+            return Err("请至少选择两条线索进行堆叠".into());
+        }
+
+        let mut cards = Vec::with_capacity(selected.len());
+        let mut parent_card_ids: Option<Vec<String>> = None;
+        let mut expected_parents: Option<Vec<String>> = None;
+        let mut source_group_ids = HashSet::new();
+        for card_id in &selected {
+            let (group_index, card_index) = self.card_location(card_id).ok_or("线索不存在")?;
+            let group = &self.groups[group_index];
+            let parents = group.parent_card_ids.clone();
+            let mut canonical_parents = parents.clone();
+            canonical_parents.sort();
+            match &expected_parents {
+                Some(expected) if expected != &canonical_parents => {
+                    return Err("只有前置关系相同的线索才能堆叠".into());
+                }
+                None => {
+                    expected_parents = Some(canonical_parents);
+                    parent_card_ids = Some(parents);
+                }
+                _ => {}
+            }
+            source_group_ids.insert(group.id.clone());
+            cards.push(group.cards[card_index].clone());
+        }
+        if source_group_ids.len() == 1 {
+            let group = self
+                .groups
+                .iter()
+                .find(|group| source_group_ids.contains(&group.id))
+                .ok_or("线索组不存在")?;
+            if group.cards.len() == selected.len() {
+                return Err("所选线索已经堆叠在一起".into());
+            }
+        }
+
+        cards.sort_by_key(|card| card.created_at);
+        let now = now_ms();
+        for group in &mut self.groups {
+            let original_len = group.cards.len();
+            group
+                .cards
+                .retain(|card| !selected.contains(card.id.as_str()));
+            if group.cards.len() != original_len {
+                group.updated_at = now;
+            }
+        }
+        self.groups.retain(|group| !group.cards.is_empty());
+        let group = ClueNodeGroup {
+            id: uuid::Uuid::new_v4().to_string(),
+            parent_card_ids: parent_card_ids.unwrap_or_default(),
+            cards,
+            created_at: now,
+            updated_at: now,
+        };
+        self.groups.push(group.clone());
+        self.save()?;
+        Ok(group)
+    }
+
     pub fn delete(&mut self, card_id: &str) -> Result<(), String> {
         let (group_index, card_index) = self.card_location(card_id).ok_or("线索不存在")?;
         let now = now_ms();
@@ -562,6 +674,94 @@ mod tests {
             .unwrap();
 
         assert!(store.associate(&second.card.id, &first.card.id).is_err());
+    }
+
+    #[test]
+    fn disassociation_removes_shared_group_connection() {
+        let mut store = store();
+        let root = store
+            .capture("new", None, "根".into(), "root".into(), None, "甲".into())
+            .unwrap();
+        let child = store
+            .capture(
+                "new",
+                Some(&root.card.id),
+                "后续".into(),
+                "child".into(),
+                None,
+                "乙".into(),
+            )
+            .unwrap();
+        let group = store.disassociate(&root.card.id, &child.card.id).unwrap();
+        assert!(group.parent_card_ids.is_empty());
+    }
+
+    #[test]
+    fn split_and_stack_only_move_selected_cards() {
+        let mut store = store();
+        let first = store
+            .capture("new", None, "线索 A".into(), "a".into(), None, "甲".into())
+            .unwrap();
+        let second = store
+            .capture(
+                "parallel",
+                Some(&first.card.id),
+                "线索 B".into(),
+                "b".into(),
+                None,
+                "乙".into(),
+            )
+            .unwrap();
+        let third = store
+            .capture(
+                "parallel",
+                Some(&first.card.id),
+                "线索 C".into(),
+                "c".into(),
+                None,
+                "丙".into(),
+            )
+            .unwrap();
+
+        let split = store.split_card(&second.card.id).unwrap();
+        assert_eq!(split.cards[0].id, second.card.id);
+        let original = store
+            .groups
+            .iter()
+            .find(|group| group.cards.iter().any(|card| card.id == first.card.id))
+            .unwrap();
+        assert_eq!(original.cards.len(), 2);
+
+        let stacked = store
+            .stack_cards(&[first.card.id.clone(), second.card.id.clone()])
+            .unwrap();
+        assert_eq!(stacked.cards.len(), 2);
+        assert!(stacked.cards.iter().any(|card| card.id == first.card.id));
+        assert!(stacked.cards.iter().any(|card| card.id == second.card.id));
+        let remaining = store.card_location(&third.card.id).unwrap();
+        assert_eq!(store.groups[remaining.0].cards.len(), 1);
+    }
+
+    #[test]
+    fn stacking_rejects_different_parent_relationships() {
+        let mut store = store();
+        let root = store
+            .capture("new", None, "根".into(), "root".into(), None, "甲".into())
+            .unwrap();
+        let child = store
+            .capture(
+                "new",
+                Some(&root.card.id),
+                "后续".into(),
+                "child".into(),
+                None,
+                "乙".into(),
+            )
+            .unwrap();
+
+        let result = store.stack_cards(&[root.card.id, child.card.id]);
+        assert!(result.is_err());
+        assert_eq!(store.groups.len(), 2);
     }
 
     #[test]

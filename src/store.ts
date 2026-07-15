@@ -537,6 +537,21 @@ export async function associateClues(beforeCardId: string, afterCardId: string) 
   await refreshClueGroups();
 }
 
+export async function disassociateClues(beforeCardId: string, afterCardId: string) {
+  await api.disassociateClues(beforeCardId, afterCardId);
+  await refreshClueGroups();
+}
+
+export async function splitClue(cardId: string) {
+  await api.splitClue(cardId);
+  await refreshClueGroups();
+}
+
+export async function stackClues(cardIds: string[]) {
+  await api.stackClues(cardIds);
+  await refreshClueGroups();
+}
+
 export async function deleteClue(cardId: string) {
   await api.deleteClue(cardId);
   await Promise.all([refreshClueGroups(), refreshThreads()]);

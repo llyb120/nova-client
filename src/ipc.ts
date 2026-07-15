@@ -96,6 +96,10 @@ export const api = {
     }),
   associateClues: (beforeCardId: string, afterCardId: string) =>
     invoke<ClueNodeGroup>("associate_clues", { beforeCardId, afterCardId }),
+  disassociateClues: (beforeCardId: string, afterCardId: string) =>
+    invoke<ClueNodeGroup>("disassociate_clues", { beforeCardId, afterCardId }),
+  splitClue: (cardId: string) => invoke<ClueNodeGroup>("split_clue", { cardId }),
+  stackClues: (cardIds: string[]) => invoke<ClueNodeGroup>("stack_clues", { cardIds }),
   deleteClue: (cardId: string) => invoke<void>("delete_clue", { cardId }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),

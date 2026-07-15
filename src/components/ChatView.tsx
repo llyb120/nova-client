@@ -133,13 +133,14 @@ export function ChatView() {
   let endRef: HTMLDivElement | undefined;
   const [stickToBottom, setStickToBottom] = createSignal(false);
   const [viewportTick, setViewportTick] = createSignal(0);
-  let scrollRaf = 0;
+  let scrollQueued = false;
   let settleRaf = 0;
   let viewportRaf = 0;
   let awaitingSendUserItem = false;
   let itemsLenAtSend = 0;
   let manualScroll = false;
   let manualScrollMovedAway = false;
+  let lastPinnedScrollTop: number | null = null;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -195,10 +196,7 @@ export function ChatView() {
   const beginManualScroll = () => {
     manualScroll = true;
     awaitingSendUserItem = false;
-    if (scrollRaf) {
-      cancelAnimationFrame(scrollRaf);
-      scrollRaf = 0;
-    }
+    lastPinnedScrollTop = null;
     if (settleRaf) {
       cancelAnimationFrame(settleRaf);
       settleRaf = 0;
@@ -256,21 +254,31 @@ export function ChatView() {
 
   const handleTranscriptScroll = () => {
     refreshVirtualGroups();
+    // 输入事件可能被原生滚动条或嵌套内容吞掉；实际滚动位置才是是否继续吸底的最终依据。
+    const fromBottomPin =
+      !!scrollRef &&
+      lastPinnedScrollTop !== null &&
+      Math.abs(scrollRef.scrollTop - lastPinnedScrollTop) <= 1;
+    if (!fromBottomPin && !manualScroll && stickToBottom() && !isAtBottom()) cancelBottomFollow();
     syncManualScroll();
   };
 
-  const pinBottom = () => {
+  const pinBottom = (ensureSentinel = false) => {
     if (!scrollRef) return;
-    scrollRef.scrollTop = scrollRef.scrollHeight;
-    endRef?.scrollIntoView({ block: "end", inline: "nearest" });
+    scrollRef.scrollTop = Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight);
+    if (ensureSentinel) endRef?.scrollIntoView({ block: "end", inline: "nearest" });
+    lastPinnedScrollTop = scrollRef.scrollTop;
     refreshVirtualGroups();
   };
 
+  // DOM 更新后在下一次绘制前钉底，避免 rAF 留出一帧旧滚动位置造成闪动。
   const forceScrollToBottom = () => {
     if (!scrollRef) return;
-    if (scrollRaf) return;
-    scrollRaf = requestAnimationFrame(() => {
-      scrollRaf = 0;
+    if (scrollQueued) return;
+    scrollQueued = true;
+    queueMicrotask(() => {
+      scrollQueued = false;
+      if (!stickToBottom() || manualScroll) return;
       pinBottom();
     });
   };
@@ -278,10 +286,6 @@ export function ChatView() {
   /** 虚拟轮次挂回会改变 scrollHeight；连续钉底到布局稳定，避免停在旧占位高度中间。 */
   const settleToBottom = (maxMs = 1000) => {
     if (settleRaf) cancelAnimationFrame(settleRaf);
-    if (scrollRaf) {
-      cancelAnimationFrame(scrollRaf);
-      scrollRaf = 0;
-    }
     manualScroll = false;
     manualScrollMovedAway = false;
     setStickToBottom(true);
@@ -291,7 +295,7 @@ export function ChatView() {
     const step = () => {
       settleRaf = 0;
       if (!scrollRef) return;
-      pinBottom();
+      pinBottom(true);
       const height = scrollRef.scrollHeight;
       const distance = height - scrollRef.scrollTop - scrollRef.clientHeight;
       if (height === lastHeight && distance <= 1) stableFrames++;
@@ -365,7 +369,6 @@ export function ChatView() {
     onCleanup(() => {
       ro.disconnect();
       window.removeEventListener("keydown", handleScrollKey, true);
-      if (scrollRaf) cancelAnimationFrame(scrollRaf);
       if (settleRaf) cancelAnimationFrame(settleRaf);
       if (viewportRaf) cancelAnimationFrame(viewportRaf);
     });

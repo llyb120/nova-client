@@ -355,7 +355,7 @@ pub struct AcpManager {
     /// 正在 session/load 回放、需要抑制 update 的会话
     loading_sessions: StdMutex<HashSet<String>>,
     running_threads: StdMutex<HashSet<String>>,
-    /// 每线程取消代次。CodeBuddy/Cursor 的 run_prompt 可能在串行闸门上等待；cancel
+    /// 每线程取消代次。CodeBuddy/Cursor/OpenCode 的 run_prompt 可能在串行闸门上等待；cancel
     /// 递增代次后，仍在等待的旧轮次拿到闸门时必须退出，不能再次 set_running(true)。
     cancel_epochs: StdMutex<HashMap<String, u64>>,
     /// 轮次开始时间，用于结束时计算耗时
@@ -2123,20 +2123,27 @@ impl AcpManager {
                     let appended = match thread.items.last_mut() {
                         Some(Item::Assistant { id, text: t, .. }) if !is_thought => {
                             t.push_str(&text);
-                            Some(*id)
+                            Some((*id, text.clone()))
                         }
                         Some(Item::Thought { id, text: t, .. }) if is_thought => {
-                            t.push_str(&text);
-                            Some(*id)
+                            let appended = if self.kind == AgentKind::OpenCode
+                                && opencode_thought_needs_separator(t, &text)
+                            {
+                                format!("\n\n{text}")
+                            } else {
+                                text.clone()
+                            };
+                            t.push_str(&appended);
+                            Some((*id, appended))
                         }
                         _ => None,
                     };
                     thread.updated_at = now_ms();
                     match appended {
-                        Some(item_id) => {
+                        Some((item_id, appended)) => {
                             self.emit_update(
                                 &thread_id,
-                                json!({ "t": "delta", "itemId": item_id, "text": text }),
+                                json!({ "t": "delta", "itemId": item_id, "text": appended }),
                             );
                         }
                         None => {
@@ -2160,6 +2167,24 @@ impl AcpManager {
                     }
                 }
                 "tool_call" | "tool_call_update" => {
+                    // OpenCode 把 todowrite 作为普通工具调用上报；转换成 Nova 既有的 plan
+                    // 状态，避免同时出现原始 JSON 工具卡和计划卡。
+                    if self.kind == AgentKind::OpenCode {
+                        if let Some(entries) = opencode_todo_entries(update) {
+                            if kind == "tool_call" {
+                                for item in complete_pending_tools(thread, None) {
+                                    self.emit_update(
+                                        &thread_id,
+                                        json!({ "t": "upsert", "item": item }),
+                                    );
+                                }
+                            }
+                            thread.plan = Some(entries.clone());
+                            thread.updated_at = now_ms();
+                            self.emit_update(&thread_id, json!({ "t": "plan", "plan": entries }));
+                            return;
+                        }
+                    }
                     let tc_id = update["toolCallId"]
                         .as_str()
                         .unwrap_or_default()
@@ -3554,7 +3579,7 @@ impl AcpManager {
 
         // 同线程排队 / 停止后重发：上一轮收尾可能已把 running 置为 false（或新轮次先置位后又
         // 被旧轮次 finish_turn 清掉），拿到闸门、真正开跑前重新置位并重置计时。
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor) {
+        if queued_turn_uses_cancel_epoch(&self.kind) {
             if self.cancel_epoch(&thread_id) != cancel_epoch {
                 // 本轮在等待闸门期间已被停止。cancel 已负责写结束状态和清 running；
                 // 这里直接退出，禁止旧轮次“反弹”复活，导致用户必须再点一次停止。
@@ -4049,7 +4074,7 @@ impl AcpManager {
         if !self.is_running(thread_id) {
             return;
         }
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor) {
+        if queued_turn_uses_cancel_epoch(&self.kind) {
             self.bump_cancel_epoch(thread_id);
         }
 
@@ -5174,6 +5199,56 @@ fn extract_text(content: &Value) -> String {
     }
 }
 
+fn opencode_thought_needs_separator(existing: &str, delta: &str) -> bool {
+    existing.len() > 4 && delta.len() > 2 && existing.ends_with("**") && delta.starts_with("**")
+}
+
+fn queued_turn_uses_cancel_epoch(kind: &AgentKind) -> bool {
+    matches!(
+        kind,
+        AgentKind::CodeBuddy | AgentKind::Cursor | AgentKind::OpenCode
+    )
+}
+
+fn opencode_todo_entries(update: &Value) -> Option<Value> {
+    let title = update["title"].as_str().unwrap_or_default().trim();
+    let title_lower = title.to_ascii_lowercase();
+    let todo_title = title_lower == "todowrite"
+        || title_lower
+            .strip_suffix(" todos")
+            .is_some_and(|count| count.parse::<usize>().is_ok());
+    if !todo_title {
+        return None;
+    }
+
+    let todos = update
+        .pointer("/rawInput/todos")
+        .or_else(|| update.pointer("/rawOutput/metadata/todos"))
+        .or_else(|| update.pointer("/rawOutput/todos"))?
+        .as_array()?;
+    let entries = todos
+        .iter()
+        .filter_map(|todo| {
+            let content = todo["content"].as_str()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let status = match todo["status"].as_str().unwrap_or("pending") {
+                "completed" => "completed",
+                "in_progress" => "in_progress",
+                "cancelled" | "interrupted" => "cancelled",
+                _ => "pending",
+            };
+            let mut entry = json!({ "content": content, "status": status });
+            if let Some(priority) = todo["priority"].as_str() {
+                entry["priority"] = json!(priority);
+            }
+            Some(entry)
+        })
+        .collect();
+    Some(Value::Array(entries))
+}
+
 fn tool_call_from_update(tc_id: &str, update: &Value) -> ToolCall {
     ToolCall {
         tool_call_id: tc_id.to_string(),
@@ -5404,6 +5479,67 @@ fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>
 #[cfg(test)]
 mod opencode_models_tests {
     use super::*;
+
+    #[test]
+    fn separates_adjacent_opencode_reasoning_headings() {
+        assert!(opencode_thought_needs_separator(
+            "**Inspecting implementation**",
+            "**Planning the fix**"
+        ));
+        assert!(!opencode_thought_needs_separator(
+            "Inspecting implementation",
+            " and planning the fix"
+        ));
+        assert!(!opencode_thought_needs_separator(
+            "**Inspecting implementation**\n\n",
+            "**Planning the fix**"
+        ));
+    }
+
+    #[test]
+    fn adapts_opencode_todowrite_input_to_plan_entries() {
+        let update = json!({
+            "title": "todowrite",
+            "rawInput": {
+                "todos": [
+                    { "content": "Inspect", "priority": "high", "status": "completed" },
+                    { "content": "Implement", "priority": "medium", "status": "in_progress" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            opencode_todo_entries(&update),
+            Some(json!([
+                { "content": "Inspect", "priority": "high", "status": "completed" },
+                { "content": "Implement", "priority": "medium", "status": "in_progress" }
+            ]))
+        );
+    }
+
+    #[test]
+    fn adapts_opencode_completed_todo_metadata() {
+        let update = json!({
+            "title": "0 todos",
+            "rawOutput": { "metadata": { "todos": [] } }
+        });
+        assert_eq!(opencode_todo_entries(&update), Some(json!([])));
+    }
+
+    #[test]
+    fn leaves_unrelated_tool_inputs_as_tool_calls() {
+        let update = json!({
+            "title": "read",
+            "rawInput": { "todos": [] }
+        });
+        assert_eq!(opencode_todo_entries(&update), None);
+    }
+
+    #[test]
+    fn opencode_turns_share_the_connection_queue_and_cancel_epoch() {
+        assert!(queued_turn_uses_cancel_epoch(&AgentKind::OpenCode));
+        assert!(!queued_turn_uses_cancel_epoch(&AgentKind::Devin));
+    }
 
     #[test]
     fn switching_opencode_sessions_requires_model_reapply() {

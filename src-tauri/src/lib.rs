@@ -20,7 +20,6 @@ mod settings;
 mod skills;
 mod sys_notify;
 mod threads;
-mod tool_api;
 mod updater;
 
 /// 临时会话目录的统一父目录名（前端据此识别并显示「临时会话」）
@@ -101,8 +100,6 @@ pub struct AppState {
     pub cli_upgrade_lock: tokio::sync::Mutex<()>,
     /// 正在执行的 CLI 安装/升级任务；值为取消标记，设置页和额度前置安装共用。
     pub cli_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// 进程内 Tool API（localhost）；员工工具优先走此通道。
-    pub tool_api: Mutex<Option<tool_api::ToolApiInfo>>,
 }
 
 impl AppState {
@@ -648,6 +645,71 @@ async fn associate_clues(
             .lock()
             .unwrap()
             .associate(&before_card_id, &after_card_id)?
+    };
+    let _ = app.emit(clues::EV_CLUES, json!({}));
+    Ok(group)
+}
+
+#[tauri::command]
+async fn disassociate_clues(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    before_card_id: String,
+    after_card_id: String,
+) -> Result<clues::ClueNodeGroup, String> {
+    let group = if state.relay.is_configured() {
+        let group = state
+            .relay
+            .clue_disassociate(&before_card_id, &after_card_id)
+            .await?;
+        if let Ok(groups) = state.relay.clue_list().await {
+            let _ = state.clues.lock().unwrap().replace(groups);
+        }
+        group
+    } else {
+        state
+            .clues
+            .lock()
+            .unwrap()
+            .disassociate(&before_card_id, &after_card_id)?
+    };
+    let _ = app.emit(clues::EV_CLUES, json!({}));
+    Ok(group)
+}
+
+#[tauri::command]
+async fn split_clue(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    card_id: String,
+) -> Result<clues::ClueNodeGroup, String> {
+    let group = if state.relay.is_configured() {
+        let group = state.relay.clue_split(&card_id).await?;
+        if let Ok(groups) = state.relay.clue_list().await {
+            let _ = state.clues.lock().unwrap().replace(groups);
+        }
+        group
+    } else {
+        state.clues.lock().unwrap().split_card(&card_id)?
+    };
+    let _ = app.emit(clues::EV_CLUES, json!({}));
+    Ok(group)
+}
+
+#[tauri::command]
+async fn stack_clues(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    card_ids: Vec<String>,
+) -> Result<clues::ClueNodeGroup, String> {
+    let group = if state.relay.is_configured() {
+        let group = state.relay.clue_stack(&card_ids).await?;
+        if let Ok(groups) = state.relay.clue_list().await {
+            let _ = state.clues.lock().unwrap().replace(groups);
+        }
+        group
+    } else {
+        state.clues.lock().unwrap().stack_cards(&card_ids)?
     };
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(group)
@@ -3852,7 +3914,6 @@ pub fn run() {
                 backend_availability: Mutex::new(HashMap::new()),
                 cli_upgrade_lock: tokio::sync::Mutex::new(()),
                 cli_operations: Mutex::new(HashMap::new()),
-                tool_api: Mutex::new(None),
             });
 
             run_session_auto_cleanup(app.handle());
@@ -3867,8 +3928,8 @@ pub fn run() {
 
             // 旧奏折 → Notice（一次性迁移 pending/待领旨）
             notice::migrate_from_decisions(app.handle());
-            // 进程内 Tool API：员工工具走 HTTP
-            let _ = tool_api::start(app.handle().clone(), dir);
+            // Tool API 已移除，清理旧版本遗留的失效连接信息。
+            let _ = std::fs::remove_file(dir.join("tool-api.json"));
 
             // 启动后并发检测各后端 CLI 可用性（只解析 PATH，零成本），
             // 前端据结果只显示真正可用的后端
@@ -4036,6 +4097,9 @@ pub fn run() {
             get_clue_context,
             capture_clue,
             associate_clues,
+            disassociate_clues,
+            split_clue,
+            stack_clues,
             delete_clue,
             list_projects,
             remove_project,

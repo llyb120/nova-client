@@ -18,11 +18,18 @@ export function ClueCaptureModal(props: {
     [...state.items].reverse().find((item) => item.type === "assistant")?.text?.trim() ?? "";
   const defaultPlacement = (): Placement =>
     props.initialPlacement ?? (activeCardId() ? "update" : "new");
+  const initialVersion = () => {
+    if (props.threadId || defaultPlacement() !== "update") return undefined;
+    const card = clueCardById(activeCardId());
+    return card ? clueCurrentVersion(card) : undefined;
+  };
 
   const [placement, setPlacement] = createSignal<Placement>(defaultPlacement());
   const [targetCardId, setTargetCardId] = createSignal(activeCardId() ?? "");
-  const [title, setTitle] = createSignal(props.threadId ? state.title : "");
-  const [content, setContent] = createSignal(props.threadId ? lastAssistant() : "");
+  const [title, setTitle] = createSignal(initialVersion()?.title ?? (props.threadId ? state.title : ""));
+  const [content, setContent] = createSignal(
+    initialVersion()?.content ?? (props.threadId ? lastAssistant() : ""),
+  );
   const [busy, setBusy] = createSignal(false);
   const targetCard = createMemo(() => clueCardById(targetCardId()));
   const targetCardTitle = createMemo(() => {
@@ -42,7 +49,7 @@ export function ClueCaptureModal(props: {
       case "update":
         return "更新哪条线索";
       case "parallel":
-        return "与哪条线索平行";
+        return "堆叠到哪组线索";
       default:
         return "接在哪条线索之后（留空即新起点）";
     }
@@ -96,7 +103,7 @@ export function ClueCaptureModal(props: {
               disabled={allCards().length === 0}
               onClick={() => setPlacement("parallel")}
             >
-              平行后续线索
+              堆叠线索
             </button>
             <button
               type="button"

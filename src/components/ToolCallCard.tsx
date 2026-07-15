@@ -1,6 +1,6 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { diffLines } from "diff";
-import { createMemo, createSignal, For, Index, Match, Show, Switch } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Index, Match, Show, Switch } from "solid-js";
 import { api } from "../ipc";
 import { isExpanded, state, toggleExpanded } from "../store";
 import type { ToolContent, ToolItem } from "../types";
@@ -16,9 +16,33 @@ function openInEditor(path: string, line?: number) {
   void api.openInEditor(id, path, line).catch((e) => void message(String(e), { kind: "error" }));
 }
 
+const toolScrollPositions = new Map<string, number>();
+
 /** 带悬停复制按钮的 pre 块 */
-function CopyablePre(props: { class: string; text: string }) {
+function CopyablePre(props: { class: string; text: string; scrollKey: string }) {
   const [copied, setCopied] = createSignal(false);
+  let pre: HTMLPreElement | undefined;
+
+  const restoreScrollPosition = () => {
+    const element = pre;
+    if (!element) return;
+    queueMicrotask(() => {
+      if (pre !== element) return;
+      const scrollTop = toolScrollPositions.get(props.scrollKey);
+      if (scrollTop === undefined) return;
+      const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+      const nextScrollTop = Math.min(scrollTop, maxScrollTop);
+      element.scrollTop = nextScrollTop;
+      toolScrollPositions.set(props.scrollKey, nextScrollTop);
+    });
+  };
+
+  // 流式快照会替换文本节点，必要时也可能重挂载该 pre；两种情况都恢复用户的位置。
+  createEffect(() => {
+    props.text;
+    restoreScrollPosition();
+  });
+
   const copy = (e: MouseEvent) => {
     e.stopPropagation();
     void navigator.clipboard.writeText(props.text);
@@ -35,7 +59,14 @@ function CopyablePre(props: { class: string; text: string }) {
       >
         {copied() ? <IconCheck size={13} /> : <IconCopy size={13} />}
       </button>
-      <pre class={props.class}>{props.text}</pre>
+      <pre
+        ref={(element) => {
+          pre = element;
+          restoreScrollPosition();
+        }}
+        class={props.class}
+        onScroll={(event) => toolScrollPositions.set(props.scrollKey, event.currentTarget.scrollTop)}
+      >{props.text}</pre>
     </div>
   );
 }
@@ -153,6 +184,7 @@ function DiffView(props: {
 
 function ContentBlock(props: {
   block: ToolContent;
+  scrollKey: string;
   onFileContextMenu: (event: MouseEvent, path: string) => void;
 }) {
   return (
@@ -176,7 +208,7 @@ function ContentBlock(props: {
           const text = inner?.type === "text" && isUsefulText(inner.text) ? stripAnsi(inner.text) : "";
           return (
             <Show when={text}>
-              <CopyablePre class="tool-output" text={text} />
+              <CopyablePre class="tool-output" text={text} scrollKey={props.scrollKey} />
             </Show>
           );
         })()}
@@ -202,6 +234,7 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
   // 展开状态放 store（按 item id）：流式更新重挂载组件时不丢失
   const key = () => `tool-${props.item.id}`;
   const rawKey = () => `tool-raw-${props.item.id}`;
+  const scrollKey = (part: string) => `${state.currentId ?? ""}-${props.item.id}-${part}`;
   const defaultOpen = () =>
     !!props.active || props.item.status === "pending" || props.item.status === "in_progress";
   const open = () => isExpanded(key(), defaultOpen());
@@ -295,7 +328,13 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
             </div>
           </Show>
           <Index each={props.item.content}>
-            {(block) => <ContentBlock block={block()} onFileContextMenu={fileMenu.open} />}
+            {(block, index) => (
+              <ContentBlock
+                block={block()}
+                scrollKey={scrollKey(`output-${index}`)}
+                onFileContextMenu={fileMenu.open}
+              />
+            )}
           </Index>
           <Show when={!visibleContent() && summary()}>
             <div class="tool-summary">{summary()}</div>
@@ -316,12 +355,14 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
                 <CopyablePre
                   class="tool-raw"
                   text={`输入: ${stringifyJson(props.item.rawInput)}`}
+                  scrollKey={scrollKey("raw-input")}
                 />
               </Show>
               <Show when={props.item.rawOutput !== undefined}>
                 <CopyablePre
                   class="tool-raw"
                   text={`输出: ${stringifyJson(props.item.rawOutput)}`}
+                  scrollKey={scrollKey("raw-output")}
                 />
               </Show>
             </Show>

@@ -5,12 +5,14 @@ import {
   clueCardById,
   clueCurrentVersion,
   deleteClue,
+  disassociateClues,
   refreshClueGroups,
+  splitClue,
+  stackClues,
   startSessionFromClue,
   state,
 } from "../store";
 import type { ClueCard, ClueNodeGroup } from "../types";
-import { ClueAssociateModal } from "./ClueAssociateModal";
 import { ClueCaptureModal } from "./ClueCaptureModal";
 import { IconClue, IconMove, IconPlus } from "./icons";
 
@@ -21,6 +23,7 @@ type Camera = { x: number; y: number; zoom: number };
 type GroupNode = {
   group: ClueNodeGroup;
   cards: ClueCard[];
+  role: "start" | "middle" | "end" | "isolated";
   depth: number;
   x: number;
   y: number;
@@ -43,13 +46,15 @@ type GraphLayout = {
 
 const CARD_WIDTH = 236;
 const CARD_HEIGHT = 296;
-const STACK_X = 13;
-const STACK_Y = 11;
-const MAX_STACK_OFFSET = 4;
+const STACK_TITLE_PEEK = 48;
 const COLUMN_GAP = 150;
 const ROW_GAP = 105;
 const WORLD_LEFT = 110;
 const WORLD_TOP = 104;
+const EDGE_LANE_GAP = 14;
+const PORT_CENTER_Y = 66.5;
+const OUTPUT_ANCHOR_X = CARD_WIDTH + 4.5;
+const INPUT_ANCHOR_X = -4.5;
 const MIN_ZOOM = 0.42;
 const MAX_ZOOM = 1.65;
 
@@ -80,10 +85,24 @@ function authorBadge(name?: string) {
   return characters.slice(0, 2).join("");
 }
 
-function cardVariant(id: string) {
-  let hash = 0;
-  for (const char of id) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-  return ["amber", "azure", "violet", "jade"][hash % 4];
+function roleLabel(role: GroupNode["role"]) {
+  switch (role) {
+    case "start":
+      return "START · 起始";
+    case "end":
+      return "END · 末尾";
+    case "isolated":
+      return "ISOLATED · 孤立";
+    default:
+      return "CLUE · 证据";
+  }
+}
+
+function groupRole(group: ClueNodeGroup, parentCardIds: Set<string>): GroupNode["role"] {
+  const hasIncoming = group.parentCardIds.length > 0;
+  const hasOutgoing = group.cards.some((card) => parentCardIds.has(card.id));
+  if (!hasIncoming) return hasOutgoing ? "start" : "isolated";
+  return hasOutgoing ? "middle" : "end";
 }
 
 function stackCards(group: ClueNodeGroup, selectedCardId: string | null) {
@@ -135,15 +154,38 @@ function drawArrow(context: CanvasRenderingContext2D, from: Point, to: Point, si
   context.fill();
 }
 
+function distanceToSegment(point: Point, start: Point, end: Point) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  if (dx === 0 && dy === 0) return Math.hypot(point.x - start.x, point.y - start.y);
+  const progress = Math.max(
+    0,
+    Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / (dx * dx + dy * dy)),
+  );
+  return Math.hypot(point.x - (start.x + progress * dx), point.y - (start.y + progress * dy));
+}
+
+function distanceToEdge(point: Point, edge: GraphEdge) {
+  let distance = Number.POSITIVE_INFINITY;
+  for (let index = 1; index < edge.points.length; index += 1) {
+    distance = Math.min(distance, distanceToSegment(point, edge.points[index - 1], edge.points[index]));
+  }
+  return distance;
+}
+
 export function EvidenceChainView() {
   const [selectedCardId, setSelectedCardId] = createSignal<string | null>(null);
   const [capture, setCapture] = createSignal<{
     placement: Placement;
     targetCardId: string | null;
   } | null>(null);
-  const [showAssociate, setShowAssociate] = createSignal(false);
+  const [selectedCardIds, setSelectedCardIds] = createSignal<Set<string>>(new Set());
   const [deletingCardId, setDeletingCardId] = createSignal<string | null>(null);
+  const [splittingCardId, setSplittingCardId] = createSignal<string | null>(null);
+  const [stacking, setStacking] = createSignal(false);
   const [camera, setCamera] = createSignal<Camera>({ x: 40, y: 40, zoom: 1 });
+  const [nodePositions, setNodePositions] = createSignal<Map<string, Point>>(new Map());
+  const [draggingGroupId, setDraggingGroupId] = createSignal<string | null>(null);
   const [connecting, setConnecting] = createSignal<{
     fromCardId: string;
     pointerId: number;
@@ -151,6 +193,13 @@ export function EvidenceChainView() {
   } | null>(null);
   const [connectionTargetId, setConnectionTargetId] = createSignal<string | null>(null);
   const [connectionBusy, setConnectionBusy] = createSignal(false);
+  const [edgeMenu, setEdgeMenu] = createSignal<{
+    x: number;
+    y: number;
+    beforeCardId: string;
+    afterCardId: string;
+  } | null>(null);
+  const [edgeBusy, setEdgeBusy] = createSignal(false);
   let viewportElement: HTMLDivElement | undefined;
   let canvasElement: HTMLCanvasElement | undefined;
   let resizeObserver: ResizeObserver | undefined;
@@ -162,6 +211,14 @@ export function EvidenceChainView() {
     startY: number;
     cameraX: number;
     cameraY: number;
+  } | null = null;
+  let nodeDrag: {
+    pointerId: number;
+    groupId: string;
+    startX: number;
+    startY: number;
+    nodeX: number;
+    nodeY: number;
   } | null = null;
 
   const cardToGroup = createMemo(() => {
@@ -197,42 +254,120 @@ export function EvidenceChainView() {
     };
 
     const stageGroups = new Map<number, ClueNodeGroup[]>();
+    const parentCardIds = new Set(state.clueGroups.flatMap((group) => group.parentCardIds));
+    const parentsByGroup = new Map<string, Set<string>>();
+    const childrenByGroup = new Map<string, Set<string>>();
     for (const group of state.clueGroups) {
       const depth = depthOf(group);
       stageGroups.set(depth, [...(stageGroups.get(depth) ?? []), group]);
+      for (const parentCardId of group.parentCardIds) {
+        const parent = byCard.get(parentCardId);
+        if (!parent || parent.id === group.id) continue;
+        parentsByGroup.set(group.id, new Set([...(parentsByGroup.get(group.id) ?? []), parent.id]));
+        childrenByGroup.set(parent.id, new Set([...(childrenByGroup.get(parent.id) ?? []), group.id]));
+      }
     }
 
-    const groupOrder = new Map<string, number>();
+    const orderedStages = [...stageGroups.entries()].sort(([left], [right]) => left - right);
+    for (const [, groups] of orderedStages) {
+      groups.sort((left, right) => left.createdAt - right.createdAt);
+    }
+    const reorderByNeighbors = (groups: ClueNodeGroup[], neighbors: Map<string, Set<string>>) => {
+      const positions = new Map<string, number>();
+      for (const [, stage] of orderedStages) {
+        stage.forEach((group, index) => positions.set(group.id, (index + 0.5) / stage.length));
+      }
+      const previousOrder = new Map(groups.map((group, index) => [group.id, index]));
+      const score = (group: ClueNodeGroup) => {
+        const values = [...(neighbors.get(group.id) ?? [])]
+          .map((id) => positions.get(id))
+          .filter((value): value is number => value !== undefined);
+        return values.length
+          ? values.reduce((sum, value) => sum + value, 0) / values.length
+          : Number.MAX_SAFE_INTEGER;
+      };
+      groups.sort((left, right) => {
+        const difference = score(left) - score(right);
+        return difference || (previousOrder.get(left.id) ?? 0) - (previousOrder.get(right.id) ?? 0);
+      });
+    };
+    for (let iteration = 0; iteration < 4; iteration += 1) {
+      for (let index = 1; index < orderedStages.length; index += 1) {
+        reorderByNeighbors(orderedStages[index][1], parentsByGroup);
+      }
+      for (let index = orderedStages.length - 2; index >= 0; index -= 1) {
+        reorderByNeighbors(orderedStages[index][1], childrenByGroup);
+      }
+    }
+
+    const longEdgeCount = state.clueGroups.reduce((count, group) => {
+      const targetDepth = depthMemo.get(group.id) ?? 0;
+      return count + group.parentCardIds.filter((parentCardId) => {
+        const parent = byCard.get(parentCardId);
+        return parent && targetDepth - (depthMemo.get(parent.id) ?? 0) > 1;
+      }).length;
+    }, 0);
+    const layoutTop = WORLD_TOP + longEdgeCount * EDGE_LANE_GAP;
+    const groupHeight = (group: ClueNodeGroup) =>
+      CARD_HEIGHT + Math.max(0, group.cards.length - 1) * STACK_TITLE_PEEK;
+    const stageHeight = (groups: ClueNodeGroup[]) =>
+      groups.reduce((sum, group) => sum + groupHeight(group), 0)
+      + Math.max(0, groups.length - 1) * ROW_GAP;
+    const groupsById = new Map(state.clueGroups.map((group) => [group.id, group]));
+    const unassignedGroupIds = new Set(groupsById.keys());
+    const components: ClueNodeGroup[][] = [];
+    for (const seed of [...state.clueGroups].sort((left, right) => left.createdAt - right.createdAt)) {
+      if (!unassignedGroupIds.delete(seed.id)) continue;
+      const component: ClueNodeGroup[] = [];
+      const queue = [seed.id];
+      for (let index = 0; index < queue.length; index += 1) {
+        const groupId = queue[index];
+        const group = groupsById.get(groupId);
+        if (group) component.push(group);
+        const neighbors = new Set([
+          ...(parentsByGroup.get(groupId) ?? []),
+          ...(childrenByGroup.get(groupId) ?? []),
+        ]);
+        for (const neighborId of neighbors) {
+          if (unassignedGroupIds.delete(neighborId)) queue.push(neighborId);
+        }
+      }
+      components.push(component);
+    }
+
+    const groupY = new Map<string, number>();
+    let componentTop = layoutTop;
+    for (const component of components) {
+      const componentIds = new Set(component.map((group) => group.id));
+      const componentStages = orderedStages
+        .map(([, groups]) => groups.filter((group) => componentIds.has(group.id)))
+        .filter((groups) => groups.length > 0);
+      const componentHeight = Math.max(...componentStages.map(stageHeight));
+      for (const groups of componentStages) {
+        let y = componentTop + (componentHeight - stageHeight(groups)) / 2;
+        for (const group of groups) {
+          groupY.set(group.id, y);
+          y += groupHeight(group) + ROW_GAP;
+        }
+      }
+      componentTop += componentHeight + ROW_GAP;
+    }
+
     const nodes: GroupNode[] = [];
     const stages: Array<{ depth: number; x: number }> = [];
-    for (const [depth, groups] of [...stageGroups.entries()].sort(([left], [right]) => left - right)) {
-      const groupScores = new Map(
-        groups.map((group) => {
-          const parentOrders = group.parentCardIds
-            .map((parentId) => byCard.get(parentId))
-            .filter((parent): parent is ClueNodeGroup => !!parent)
-            .map((parent) => groupOrder.get(parent.id))
-            .filter((order): order is number => order !== undefined);
-          const score = parentOrders.length
-            ? parentOrders.reduce((sum, order) => sum + order, 0) / parentOrders.length
-            : Number.MAX_SAFE_INTEGER;
-          return [group.id, score] as const;
-        }),
-      );
-      groups.sort((left, right) => {
-        const difference = (groupScores.get(left.id) ?? 0) - (groupScores.get(right.id) ?? 0);
-        return difference || left.createdAt - right.createdAt;
-      });
-      const x = WORLD_LEFT + depth * (CARD_WIDTH + COLUMN_GAP + MAX_STACK_OFFSET * STACK_X);
+    for (const [depth, groups] of orderedStages) {
+      const x = WORLD_LEFT + depth * (CARD_WIDTH + COLUMN_GAP);
       stages.push({ depth, x });
-      groups.forEach((group, index) => {
-        groupOrder.set(group.id, index);
+      groups.forEach((group) => {
+        const orderedCards = stackCards(group, selectedCardId());
+        const manualPosition = nodePositions().get(group.id);
         nodes.push({
           group,
-          cards: stackCards(group, selectedCardId()),
+          cards: orderedCards,
+          role: groupRole(group, parentCardIds),
           depth,
-          x,
-          y: WORLD_TOP + index * (CARD_HEIGHT + ROW_GAP + MAX_STACK_OFFSET * STACK_Y),
+          x: manualPosition?.x ?? x,
+          y: manualPosition?.y ?? groupY.get(group.id) ?? layoutTop,
         });
       });
     }
@@ -240,13 +375,14 @@ export function EvidenceChainView() {
     const nodeByCard = new Map<string, GroupNode>();
     const cardAnchors = new Map<string, Point>();
     for (const node of nodes) {
-      node.cards.forEach((card, index) => {
+      const frontOffset = Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK;
+      const commonOutput = {
+        x: node.x + OUTPUT_ANCHOR_X,
+        y: node.y + PORT_CENTER_Y + frontOffset,
+      };
+      node.cards.forEach((card) => {
         nodeByCard.set(card.id, node);
-        const offset = Math.min(index, MAX_STACK_OFFSET);
-        cardAnchors.set(card.id, {
-          x: node.x + CARD_WIDTH + offset * STACK_X + 8,
-          y: node.y + 68 + offset * STACK_Y,
-        });
+        cardAnchors.set(card.id, commonOutput);
       });
     }
 
@@ -267,14 +403,27 @@ export function EvidenceChainView() {
           fromCardId: parentCardId,
           toCardIds: node.group.cards.map((card) => card.id),
           start,
-          end: { x: node.x - 12, y: node.y + 68 },
+          end: {
+            x: node.x + INPUT_ANCHOR_X,
+            y: node.y + PORT_CENTER_Y + Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK,
+          },
         });
       }
     }
 
     const edges: GraphEdge[] = [];
     const edgeGroups = new Map<string, typeof rawEdges>();
-    for (const edge of rawEdges) edgeGroups.set(edge.key, [...(edgeGroups.get(edge.key) ?? []), edge]);
+    const longEdges = rawEdges
+      .filter((edge) => {
+        const [sourceDepth, targetDepth] = edge.key.split(":").map(Number);
+        return targetDepth - sourceDepth > 1;
+      })
+      .sort((left, right) => left.start.y - right.start.y || left.end.y - right.end.y);
+    const longEdgeSet = new Set(longEdges);
+    for (const edge of rawEdges) {
+      if (longEdgeSet.has(edge)) continue;
+      edgeGroups.set(edge.key, [...(edgeGroups.get(edge.key) ?? []), edge]);
+    }
     for (const groupedEdges of edgeGroups.values()) {
       groupedEdges.sort((left, right) => left.start.y - right.start.y || left.end.y - right.end.y);
       groupedEdges.forEach((edge, index) => {
@@ -288,14 +437,33 @@ export function EvidenceChainView() {
         });
       });
     }
+    longEdges.forEach((edge, index) => {
+      const railY = layoutTop - 28 - index * EDGE_LANE_GAP;
+      const sourceLaneX = edge.start.x + COLUMN_GAP / 2;
+      const targetLaneX = edge.end.x - COLUMN_GAP / 2;
+      edges.push({
+        fromCardId: edge.fromCardId,
+        toCardIds: edge.toCardIds,
+        points: [
+          edge.start,
+          { x: sourceLaneX, y: edge.start.y },
+          { x: sourceLaneX, y: railY },
+          { x: targetLaneX, y: railY },
+          { x: targetLaneX, y: edge.end.y },
+          edge.end,
+        ],
+      });
+    });
 
     const maxX = Math.max(
       520,
-      ...nodes.map((node) => node.x + CARD_WIDTH + MAX_STACK_OFFSET * STACK_X + 80),
+      ...nodes.map((node) => node.x + CARD_WIDTH + 80),
     );
     const maxY = Math.max(
       420,
-      ...nodes.map((node) => node.y + CARD_HEIGHT + MAX_STACK_OFFSET * STACK_Y + 80),
+      ...nodes.map(
+        (node) => node.y + CARD_HEIGHT + Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK + 80,
+      ),
     );
     return { nodes, stages, edges, cardAnchors, maxX, maxY };
   });
@@ -368,13 +536,16 @@ export function EvidenceChainView() {
     context.scale(currentCamera.zoom, currentCamera.zoom);
 
     const selected = selectedCardId();
+    const activeCardIds = new Set(
+      selected ? (cardToGroup().get(selected)?.cards.map((card) => card.id) ?? [selected]) : [],
+    );
+    const edgeIsActive = (edge: GraphEdge) =>
+      activeCardIds.has(edge.fromCardId) || edge.toCardIds.some((cardId) => activeCardIds.has(cardId));
     const orderedEdges = [...graphLayout().edges].sort((left, right) => {
-      const active = (edge: GraphEdge) =>
-        edge.fromCardId === selected || edge.toCardIds.includes(selected ?? "");
-      return Number(active(left)) - Number(active(right));
+      return Number(edgeIsActive(left)) - Number(edgeIsActive(right));
     });
     for (const edge of orderedEdges) {
-      const active = edge.fromCardId === selected || edge.toCardIds.includes(selected ?? "");
+      const active = edgeIsActive(edge);
       traceRoundedRoute(context, edge.points, 14 / currentCamera.zoom);
       context.strokeStyle = surface;
       context.lineWidth = (active ? 8 : 6) / currentCamera.zoom;
@@ -414,7 +585,9 @@ export function EvidenceChainView() {
   const fitGraph = () => {
     const viewport = viewportElement;
     const layout = graphLayout();
-    if (!viewport || layout.nodes.length === 0) return;
+    if (!viewport || layout.nodes.length === 0 || viewport.clientWidth <= 0 || viewport.clientHeight <= 0) {
+      return false;
+    }
     const padding = 54;
     const zoom = Math.max(
       MIN_ZOOM,
@@ -429,6 +602,7 @@ export function EvidenceChainView() {
       y: Math.max(padding, (viewport.clientHeight - layout.maxY * zoom) / 2),
       zoom,
     });
+    return true;
   };
 
   const zoomAt = (nextZoom: number, screenX?: number, screenY?: number) => {
@@ -454,11 +628,16 @@ export function EvidenceChainView() {
     };
   };
 
+  const selectOnly = (cardId: string) => {
+    setSelectedCardId(cardId);
+    setSelectedCardIds(new Set([cardId]));
+  };
+
   const beginConnection = (cardId: string, event: PointerEvent) => {
     if (connectionBusy()) return;
     event.preventDefault();
     event.stopPropagation();
-    setSelectedCardId(cardId);
+    selectOnly(cardId);
     setConnecting({
       fromCardId: cardId,
       pointerId: event.pointerId,
@@ -467,16 +646,43 @@ export function EvidenceChainView() {
     viewportElement?.setPointerCapture(event.pointerId);
   };
 
-  const finishConnection = async () => {
+  const beginNodeDrag = (groupId: string, cardId: string, event: PointerEvent) => {
+    if (event.button !== 0 || (event.target as HTMLElement).closest(".clue-port")) return;
+    if (event.ctrlKey || event.metaKey) return;
+    const pendingConnection = connecting();
+    if (pendingConnection) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (pendingConnection.fromCardId === cardId) cancelPointerAction();
+      else void finishConnection(cardId);
+      return;
+    }
+    const node = graphLayout().nodes.find((item) => item.group.id === groupId);
+    if (!node) return;
+    event.stopPropagation();
+    selectOnly(cardId);
+    setDraggingGroupId(groupId);
+    nodeDrag = {
+      pointerId: event.pointerId,
+      groupId,
+      startX: event.clientX,
+      startY: event.clientY,
+      nodeX: node.x,
+      nodeY: node.y,
+    };
+    viewportElement?.setPointerCapture(event.pointerId);
+  };
+
+  const finishConnection = async (targetCardId?: string) => {
     const pending = connecting();
-    const target = connectionTargetId();
+    const target = targetCardId ?? connectionTargetId();
     setConnecting(null);
     setConnectionTargetId(null);
     if (!pending || !target || target === pending.fromCardId) return;
     setConnectionBusy(true);
     try {
       await associateClues(pending.fromCardId, target);
-      setSelectedCardId(target);
+      selectOnly(target);
     } catch (error) {
       await message(String(error), { title: "连接失败", kind: "error" });
     } finally {
@@ -486,8 +692,13 @@ export function EvidenceChainView() {
 
   const onPointerDown = (event: PointerEvent) => {
     const target = event.target as HTMLElement;
-    if (target.closest(".clue-group-node, .clue-canvas-toolbar")) return;
+    if (!target.closest(".clue-edge-menu")) setEdgeMenu(null);
+    if (target.closest(".clue-group-node, .clue-canvas-toolbar, .clue-edge-menu")) return;
     if (event.button !== 0 && event.button !== 1) return;
+    if (connecting()) {
+      cancelPointerAction();
+      return;
+    }
     const current = camera();
     panGesture = {
       pointerId: event.pointerId,
@@ -504,9 +715,19 @@ export function EvidenceChainView() {
     if (pending) {
       setConnecting({ ...pending, pointer: screenToWorld(event.clientX, event.clientY) });
       const target = (document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null)
-        ?.closest("[data-clue-card-id]")
-        ?.getAttribute("data-clue-card-id");
+        ?.closest(".clue-group-node")
+        ?.getAttribute("data-clue-target-id");
       setConnectionTargetId(target && target !== pending.fromCardId ? target : null);
+      return;
+    }
+    if (nodeDrag?.pointerId === event.pointerId) {
+      const zoom = camera().zoom;
+      const next = new Map(nodePositions());
+      next.set(nodeDrag.groupId, {
+        x: nodeDrag.nodeX + (event.clientX - nodeDrag.startX) / zoom,
+        y: nodeDrag.nodeY + (event.clientY - nodeDrag.startY) / zoom,
+      });
+      setNodePositions(next);
       return;
     }
     if (!panGesture || panGesture.pointerId !== event.pointerId) return;
@@ -521,12 +742,18 @@ export function EvidenceChainView() {
     if (viewportElement?.hasPointerCapture(event.pointerId)) {
       viewportElement.releasePointerCapture(event.pointerId);
     }
-    if (connecting()?.pointerId === event.pointerId) void finishConnection();
+    if (connecting()?.pointerId === event.pointerId && connectionTargetId()) void finishConnection();
+    if (nodeDrag?.pointerId === event.pointerId) {
+      nodeDrag = null;
+      setDraggingGroupId(null);
+    }
     if (panGesture?.pointerId === event.pointerId) panGesture = null;
   };
 
   const cancelPointerAction = () => {
     panGesture = null;
+    nodeDrag = null;
+    setDraggingGroupId(null);
     setConnecting(null);
     setConnectionTargetId(null);
   };
@@ -535,20 +762,49 @@ export function EvidenceChainView() {
     event.preventDefault();
     const viewport = viewportElement;
     if (!viewport) return;
-    if (event.ctrlKey || event.metaKey) {
-      const rect = viewport.getBoundingClientRect();
-      zoomAt(
-        camera().zoom * Math.exp(-event.deltaY * 0.0015),
-        event.clientX - rect.left,
-        event.clientY - rect.top,
-      );
-      return;
+    const rect = viewport.getBoundingClientRect();
+    zoomAt(
+      camera().zoom * Math.exp(-event.deltaY * 0.0015),
+      event.clientX - rect.left,
+      event.clientY - rect.top,
+    );
+  };
+
+  const onEdgeContextMenu = (event: MouseEvent) => {
+    if ((event.target as HTMLElement).closest(".clue-group-node, .clue-canvas-toolbar")) return;
+    const point = screenToWorld(event.clientX, event.clientY);
+    const edge = graphLayout().edges
+      .map((item) => ({ item, distance: distanceToEdge(point, item) }))
+      .sort((left, right) => left.distance - right.distance)[0];
+    if (!edge || edge.distance > 24 / camera().zoom || edge.item.toCardIds.length === 0) return;
+    event.preventDefault();
+    const rect = viewportElement?.getBoundingClientRect();
+    if (!rect) return;
+    setEdgeMenu({
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+      beforeCardId: edge.item.fromCardId,
+      afterCardId: edge.item.toCardIds[0],
+    });
+  };
+
+  const arrangeGraph = () => {
+    setNodePositions(new Map());
+    requestAnimationFrame(fitGraph);
+  };
+
+  const removeConnection = async () => {
+    const edge = edgeMenu();
+    if (!edge || edgeBusy()) return;
+    setEdgeBusy(true);
+    try {
+      await disassociateClues(edge.beforeCardId, edge.afterCardId);
+      setEdgeMenu(null);
+    } catch (error) {
+      await message(String(error), { title: "删除连接失败", kind: "error" });
+    } finally {
+      setEdgeBusy(false);
     }
-    setCamera((current) => ({
-      ...current,
-      x: current.x - event.deltaX,
-      y: current.y - event.deltaY,
-    }));
   };
 
   const removeCard = async (card: ClueCard) => {
@@ -568,14 +824,63 @@ export function EvidenceChainView() {
     }
   };
 
+  const selectCard = (cardId: string, event: MouseEvent) => {
+    if (!event.ctrlKey && !event.metaKey) {
+      selectOnly(cardId);
+      return;
+    }
+    const next = new Set(selectedCardIds());
+    if (next.has(cardId)) next.delete(cardId);
+    else next.add(cardId);
+    if (next.size === 0) next.add(cardId);
+    setSelectedCardIds(next);
+    setSelectedCardId(cardId);
+  };
+
+  const splitSelectedCard = async (card: ClueCard) => {
+    if (splittingCardId()) return;
+    setSplittingCardId(card.id);
+    try {
+      await splitClue(card.id);
+      setSelectedCardIds(new Set([card.id]));
+      requestAnimationFrame(fitGraph);
+    } catch (error) {
+      await message(String(error), { title: "拆分失败", kind: "error" });
+    } finally {
+      setSplittingCardId(null);
+    }
+  };
+
+  const stackSelectedCards = async () => {
+    const cardIds = [...selectedCardIds()];
+    if (cardIds.length < 2 || stacking()) return;
+    setStacking(true);
+    try {
+      await stackClues(cardIds);
+      const selected = selectedCardId() ?? cardIds[0];
+      setSelectedCardIds(new Set([selected]));
+      setNodePositions(new Map());
+      requestAnimationFrame(fitGraph);
+    } catch (error) {
+      await message(String(error), { title: "堆叠失败", kind: "error" });
+    } finally {
+      setStacking(false);
+    }
+  };
+
   createEffect(() => {
     const available = cards();
     const selected = selectedCardId();
-    if (selected && available.some((card) => card.id === selected)) return;
+    if (selected && available.some((card) => card.id === selected)) {
+      const availableIds = new Set(available.map((card) => card.id));
+      const next = new Set([...selectedCardIds()].filter((cardId) => availableIds.has(cardId)));
+      if (next.size !== selectedCardIds().size) setSelectedCardIds(next);
+      return;
+    }
     const preferred = state.pendingClueCard?.id;
-    setSelectedCardId(
-      (preferred && available.some((card) => card.id === preferred) ? preferred : available[0]?.id) ?? null,
-    );
+    const next = (preferred && available.some((card) => card.id === preferred) ? preferred : available[0]?.id) ?? null;
+    setSelectedCardId(next);
+    setSelectedCardIds(new Set(next ? [next] : []));
   });
 
   createEffect(() => {
@@ -585,18 +890,22 @@ export function EvidenceChainView() {
     selectedCardId();
     scheduleDraw();
     if (!fitted && layout.nodes.length > 0 && viewportElement) {
-      fitted = true;
-      requestAnimationFrame(fitGraph);
+      requestAnimationFrame(() => {
+        if (!fitted && fitGraph()) fitted = true;
+      });
     }
   });
 
   onMount(() => {
-    void refreshClueGroups();
+    void refreshClueGroups().then(() => {
+      requestAnimationFrame(() => {
+        if (fitGraph()) fitted = true;
+      });
+    });
     resizeObserver = new ResizeObserver(() => {
       scheduleDraw();
       if (!fitted && graphLayout().nodes.length > 0) {
-        fitted = true;
-        fitGraph();
+        fitted = fitGraph();
       }
     });
     if (viewportElement) resizeObserver.observe(viewportElement);
@@ -613,14 +922,9 @@ export function EvidenceChainView() {
       <header class="clue-head">
         <div>
           <h1 class="clue-title">证据链</h1>
-          <p class="clue-sub">拖动画布浏览，按住 Ctrl 滚轮缩放；从卡片右侧连接点拖到另一张卡建立顺序。</p>
+          <p class="clue-sub">拖动空白处平移，滚轮缩放；拖动卡牌调整位置，从右侧连接点建立顺序。</p>
         </div>
         <div class="clue-head-actions">
-          <Show when={cards().length > 1}>
-            <button class="btn secondary" onClick={() => setShowAssociate(true)}>
-              选择关联
-            </button>
-          </Show>
           <button class="btn primary" onClick={() => setCapture({ placement: "new", targetCardId: null })}>
             <IconPlus size={14} />
             新建线索
@@ -647,9 +951,7 @@ export function EvidenceChainView() {
             onPointerUp={onPointerUp}
             onPointerCancel={cancelPointerAction}
             onWheel={onWheel}
-            onDblClick={(event) => {
-              if (!(event.target as HTMLElement).closest(".clue-group-node")) fitGraph();
-            }}
+            onContextMenu={onEdgeContextMenu}
           >
             <canvas class="clue-canvas-lines" ref={(element) => (canvasElement = element)} />
             <div
@@ -667,52 +969,77 @@ export function EvidenceChainView() {
                 {(node) => (
                   <section
                     class="clue-group-node"
-                    classList={{ stacked: node.cards.length > 1 }}
+                    classList={{
+                      stacked: node.cards.length > 1,
+                      dragging: draggingGroupId() === node.group.id,
+                      "connection-source": node.group.cards.some(
+                        (card) => connecting()?.fromCardId === card.id,
+                      ),
+                      "connection-target": node.group.cards.some(
+                        (card) => connectionTargetId() === card.id,
+                      ),
+                    }}
+                    data-clue-target-id={node.cards[node.cards.length - 1]?.id}
                     style={{
                       left: `${node.x}px`,
                       top: `${node.y}px`,
-                      width: `${CARD_WIDTH + Math.min(node.cards.length - 1, MAX_STACK_OFFSET) * STACK_X}px`,
-                      height: `${CARD_HEIGHT + Math.min(node.cards.length - 1, MAX_STACK_OFFSET) * STACK_Y}px`,
+                      width: `${CARD_WIDTH}px`,
+                      height: `${CARD_HEIGHT + Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK}px`,
                     }}
                   >
                     <Show when={node.cards.length > 1}>
                       <div class="clue-stack-count">{node.cards.length} 张平行线索</div>
                     </Show>
+                    <span
+                      class="clue-port input"
+                      style={{ top: `${Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK + 58}px` }}
+                      aria-hidden="true"
+                      onPointerDown={(event) => {
+                        const frontCard = node.cards[node.cards.length - 1];
+                        if (!connecting() || !frontCard) return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        void finishConnection(frontCard.id);
+                      }}
+                    />
+                    <button
+                      type="button"
+                      class="clue-port output"
+                      style={{ top: `${Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK + 58}px` }}
+                      title="拖到另一组线索，建立前置 → 后续"
+                      disabled={connectionBusy()}
+                      onPointerDown={(event) => {
+                        const frontCard = node.cards[node.cards.length - 1];
+                        if (frontCard) beginConnection(frontCard.id, event);
+                      }}
+                    />
                     <For each={node.cards}>
                       {(card, index) => {
                         const version = () => clueCurrentVersion(card);
-                        const offset = () => Math.min(index(), MAX_STACK_OFFSET);
                         const front = () => index() === node.cards.length - 1;
                         return (
                           <article
-                            class={`clue-trading-card variant-${cardVariant(card.id)}`}
-                            classList={{
-                              active: selectedCardId() === card.id,
-                              front: front(),
-                              "connection-source": connecting()?.fromCardId === card.id,
-                              "connection-target": connectionTargetId() === card.id,
+                            class={`clue-trading-card role-${node.role}`}
+                             classList={{
+                               active: selectedCardId() === card.id,
+                               selected: selectedCardIds().has(card.id),
+                               front: front(),
                             }}
-                            data-clue-card-id={card.id}
                             role="button"
                             tabIndex={0}
                             style={{
-                              left: `${offset() * STACK_X}px`,
-                              top: `${offset() * STACK_Y}px`,
+                              left: "0",
+                              top: `${index() * STACK_TITLE_PEEK}px`,
                               "z-index": index() + 1,
                             }}
-                            onClick={() => setSelectedCardId(card.id)}
+                            onPointerDown={(event) => beginNodeDrag(node.group.id, card.id, event)}
+                            onClick={(event) => selectCard(card.id, event)}
                             onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === " ") setSelectedCardId(card.id);
+                              if (event.key === "Enter" || event.key === " ") {
+                                selectOnly(card.id);
+                              }
                             }}
                           >
-                            <span class="clue-port input" aria-hidden="true" />
-                            <button
-                              type="button"
-                              class="clue-port output"
-                              title="拖到另一张线索，建立前置 → 后续"
-                              disabled={connectionBusy()}
-                              onPointerDown={(event) => beginConnection(card.id, event)}
-                            />
                             <div class="clue-card-nameplate">
                               <span
                                 class="clue-author-avatar"
@@ -724,11 +1051,8 @@ export function EvidenceChainView() {
                               <strong>{version()?.title || "未命名线索"}</strong>
                               <span class="clue-version-gem">v{card.versions.length}</span>
                             </div>
-                            <div class="clue-card-art">
-                              <span class="clue-card-sigil"><IconClue size={34} /></span>
-                              <span class="clue-card-kind">CLUE · EVIDENCE</span>
-                            </div>
                             <div class="clue-card-textbox">
+                              <div class="clue-card-kind">{roleLabel(node.role)}</div>
                               <p>{excerpt(version()?.content ?? "")}</p>
                               <div class="clue-card-rule" />
                               <footer>
@@ -751,8 +1075,24 @@ export function EvidenceChainView() {
               </button>
               <button title="放大" onClick={() => zoomAt(camera().zoom * 1.16)}>＋</button>
               <button title="适应全部线索" onClick={fitGraph}><IconMove size={14} /></button>
+              <button class="arrange" title="清除手动位置并自动整理结构" onClick={arrangeGraph}>
+                一键整理
+              </button>
             </div>
-            <div class="clue-canvas-hint">拖动空白处平移 · Ctrl + 滚轮缩放 · 拖动卡牌右侧圆点连接</div>
+            <div class="clue-canvas-hint">Ctrl + 点击多选 · 滚轮缩放 · 拖动卡牌移动 · 右侧圆点连接</div>
+            <Show when={edgeMenu()}>
+              {(menu) => (
+                <div
+                  class="clue-edge-menu"
+                  style={{ left: `${menu().x}px`, top: `${menu().y}px` }}
+                  onPointerDown={(event) => event.stopPropagation()}
+                >
+                  <button disabled={edgeBusy()} onClick={() => void removeConnection()}>
+                    {edgeBusy() ? "删除中…" : "删除连接"}
+                  </button>
+                </div>
+              )}
+            </Show>
           </div>
 
           <Show when={selectedCard()}>
@@ -774,6 +1114,11 @@ export function EvidenceChainView() {
                   <pre class="clue-detail-content">{version()?.content}</pre>
 
                   <div class="clue-detail-actions">
+                    <Show when={selectedCardIds().size > 1}>
+                      <button class="btn primary" disabled={stacking()} onClick={() => void stackSelectedCards()}>
+                        {stacking() ? "堆叠中…" : `堆叠所选（${selectedCardIds().size}）`}
+                      </button>
+                    </Show>
                     <button class="btn primary" onClick={() => startSessionFromClue(card())}>
                       沿此线索发起会话
                     </button>
@@ -787,8 +1132,17 @@ export function EvidenceChainView() {
                       class="btn secondary"
                       onClick={() => setCapture({ placement: "parallel", targetCardId: card().id })}
                     >
-                      平行后续
+                      堆叠线索
                     </button>
+                    <Show when={(selectedGroup()?.cards.length ?? 0) > 1}>
+                      <button
+                        class="btn secondary"
+                        disabled={splittingCardId() === card().id}
+                        onClick={() => void splitSelectedCard(card())}
+                      >
+                        {splittingCardId() === card().id ? "拆分中…" : "拆分"}
+                      </button>
+                    </Show>
                     <button
                       class="btn secondary"
                       onClick={() => setCapture({ placement: "new", targetCardId: card().id })}
@@ -809,7 +1163,7 @@ export function EvidenceChainView() {
                       <div class="clue-section-title">前置线索</div>
                       <For each={predecessors()}>
                         {(item) => (
-                          <button onClick={() => setSelectedCardId(item.id)}>
+                          <button onClick={() => selectOnly(item.id)}>
                             {clueCurrentVersion(item)?.title || "未命名线索"}
                           </button>
                         )}
@@ -821,7 +1175,7 @@ export function EvidenceChainView() {
                       <div class="clue-section-title">后续线索</div>
                       <For each={successors()}>
                         {(item) => (
-                          <button onClick={() => setSelectedCardId(item.id)}>
+                          <button onClick={() => selectOnly(item.id)}>
                             {clueCurrentVersion(item)?.title || "未命名线索"}
                           </button>
                         )}
@@ -858,12 +1212,6 @@ export function EvidenceChainView() {
             onClose={() => setCapture(null)}
           />
         )}
-      </Show>
-      <Show when={showAssociate()}>
-        <ClueAssociateModal
-          initialBeforeCardId={selectedCardId()}
-          onClose={() => setShowAssociate(false)}
-        />
       </Show>
     </main>
   );

@@ -457,6 +457,7 @@ export interface IncomingShare {
   agentKind: AgentKind;
   items: Item[];
   plan?: PlanEntry[] | null;
+  activeClueCardId?: string | null;
   /** 漫游召回自动回传的快照（收件箱标注「召回」并自动弹出） */
   recall?: boolean;
   ts: number;
