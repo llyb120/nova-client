@@ -129,23 +129,12 @@ function TranscriptSegment(props: TranscriptSegmentProps) {
 export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
-  let endRef: HTMLDivElement | undefined;
-  const [stickToBottom, setStickToBottom] = createSignal(false);
+  const [stickToBottom, setStickToBottom] = createSignal(true);
   const [viewportTick, setViewportTick] = createSignal(0);
   let scrollQueued = false;
-  let settleRaf = 0;
   let viewportRaf = 0;
-  let awaitingSendUserItem = false;
-  let itemsLenAtSend = 0;
-  let manualScroll = false;
-  let manualScrollMovedAway = false;
-  let lastPinnedScrollTop: number | null = null;
-  let userActivelyScrolledDown = false;
-  let userReachedBottom = false;
-  let manualScrollResumeTimer = 0;
-  let lastKnownScrollTop = 0;
-  let pointerScrolling = false;
-  let pointerScrollEndTimer = 0;
+  let lastScrollTop = 0;
+  let pointerActive = false;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -193,214 +182,69 @@ export function ChatView() {
     });
   };
 
-  const isAtBottom = () => {
-    if (!scrollRef) return true;
-    return scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight <= 1;
-  };
+  const maxScrollTop = () =>
+    scrollRef ? Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight) : 0;
 
-  const cancelManualScrollResume = () => {
-    if (manualScrollResumeTimer) window.clearTimeout(manualScrollResumeTimer);
-    manualScrollResumeTimer = 0;
-    userActivelyScrolledDown = false;
-    userReachedBottom = false;
-  };
+  const isAtBottom = () => !scrollRef || maxScrollTop() - scrollRef.scrollTop <= 1;
 
-  const cancelPointerScrollFinish = () => {
-    if (pointerScrollEndTimer) window.clearTimeout(pointerScrollEndTimer);
-    pointerScrollEndTimer = 0;
-  };
-
-  const beginManualScroll = () => {
-    manualScroll = true;
-    cancelManualScrollResume();
-    awaitingSendUserItem = false;
-    // 保留程序化钉底位置，直到 scroll 事件确认用户真的离开；否则排队中的旧 scroll
-    // 事件会被误认为用户已滚回底部，并立刻恢复吸底。
-    if (settleRaf) {
-      cancelAnimationFrame(settleRaf);
-      settleRaf = 0;
-    }
-  };
-
-  const cancelBottomFollow = () => {
-    beginManualScroll();
-    setStickToBottom(false);
-  };
+  const cancelBottomFollow = () => setStickToBottom(false);
 
   const isToolDetailScroll = (target: EventTarget | null) =>
     target instanceof Element && !!target.closest(".tool-output, .tool-raw");
 
-  // 工具详情本身可滚动；用户在其中阅读时不应被外层会话自动吸底打断。
-  const suspendBottomFollowForToolDetail = () => {
-    beginManualScroll();
-    manualScrollMovedAway = true;
-    setStickToBottom(false);
-  };
-
-  const isFromProgrammaticPin = () =>
-    !!scrollRef &&
-    lastPinnedScrollTop !== null &&
-    Math.abs(scrollRef.scrollTop - lastPinnedScrollTop) <= 1;
-
-  const scheduleManualScrollResume = () => {
-    if (!manualScroll || !userActivelyScrolledDown) return;
-    if (manualScrollResumeTimer) window.clearTimeout(manualScrollResumeTimer);
-    manualScrollResumeTimer = window.setTimeout(() => {
-      manualScrollResumeTimer = 0;
-      const shouldResume =
-        manualScroll &&
-        manualScrollMovedAway &&
-        userActivelyScrolledDown &&
-        userReachedBottom &&
-        isAtBottom() &&
-        !isFromProgrammaticPin();
-      userActivelyScrolledDown = false;
-      userReachedBottom = false;
-      if (!shouldResume) return;
-      manualScroll = false;
-      manualScrollMovedAway = false;
-      setStickToBottom(true);
-    }, 120);
-  };
-
-  // 只在本次用户向下滚动真正到达底部、且滚动与虚拟分组布局稳定后恢复吸底。
-  const syncManualScroll = () => {
-    if (!manualScroll) return;
-    if (!isAtBottom()) {
-      manualScrollMovedAway = true;
-      setStickToBottom(false);
-    }
-    scheduleManualScrollResume();
-  };
-
-  const completePointerScroll = () => {
-    pointerScrollEndTimer = 0;
-    pointerScrolling = false;
-    if (!manualScroll || manualScrollMovedAway) return;
-    manualScroll = false;
-    cancelManualScrollResume();
-    if (stickToBottom()) forceScrollToBottom();
-  };
-
-  const schedulePointerScrollFinish = () => {
-    if (!pointerScrolling) return;
-    cancelPointerScrollFinish();
-    pointerScrollEndTimer = window.setTimeout(completePointerScroll, 120);
-  };
-
-  const finishManualScroll = () => schedulePointerScrollFinish();
-
   const handleWheel = (event: WheelEvent) => {
     if (isToolDetailScroll(event.target)) {
-      suspendBottomFollowForToolDetail();
+      cancelBottomFollow();
       return;
     }
     if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
-    if (event.deltaY < 0) {
-      cancelBottomFollow();
-    } else if (event.deltaY > 0 && manualScroll) {
-      userActivelyScrolledDown = true;
-      scheduleManualScrollResume();
-    }
+    if (event.deltaY < 0) cancelBottomFollow();
+    else if (event.deltaY > 0 && !stickToBottom() && isAtBottom()) enableBottomFollow();
   };
 
   const handlePointerDown = (event: PointerEvent) => {
-    if (isToolDetailScroll(event.target)) suspendBottomFollowForToolDetail();
-    else {
-      cancelPointerScrollFinish();
-      pointerScrolling = true;
-      beginManualScroll();
-    }
+    pointerActive = true;
+    if (isToolDetailScroll(event.target)) cancelBottomFollow();
   };
 
   const handleTranscriptScroll = () => {
     refreshVirtualGroups();
-    if (pointerScrollEndTimer) schedulePointerScrollFinish();
-    const fromBottomPin = isFromProgrammaticPin();
     const currentTop = scrollRef?.scrollTop ?? 0;
-    if (!fromBottomPin) {
-      if (lastPinnedScrollTop !== null && manualScroll) lastPinnedScrollTop = null;
-      if (!manualScroll && stickToBottom() && !isAtBottom()) cancelBottomFollow();
-      if (manualScroll && currentTop < lastKnownScrollTop) {
-        cancelManualScrollResume();
-      } else if (
-        manualScroll &&
-        currentTop > lastKnownScrollTop &&
-        (pointerScrolling || userActivelyScrolledDown)
-      ) {
-        userActivelyScrolledDown = true;
-        if (isAtBottom()) userReachedBottom = true;
-      }
+    const atBottom = isAtBottom();
+    if (stickToBottom()) {
+      if (!atBottom && currentTop < lastScrollTop) cancelBottomFollow();
+    } else if (atBottom && currentTop > lastScrollTop) {
+      setStickToBottom(true);
     }
-    lastKnownScrollTop = currentTop;
-    syncManualScroll();
+    lastScrollTop = currentTop;
   };
 
-  const pinBottom = (ensureSentinel = false) => {
-    if (!scrollRef) return;
-    scrollRef.scrollTop = Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight);
-    if (ensureSentinel) endRef?.scrollIntoView({ block: "end", inline: "nearest" });
-    lastPinnedScrollTop = scrollRef.scrollTop;
-    lastKnownScrollTop = scrollRef.scrollTop;
+  const pinBottom = () => {
+    if (!scrollRef || !stickToBottom() || pointerActive) return;
+    scrollRef.scrollTop = maxScrollTop();
+    lastScrollTop = scrollRef.scrollTop;
     refreshVirtualGroups();
   };
 
-  // DOM 更新后在下一次绘制前钉底，避免 rAF 留出一帧旧滚动位置造成闪动。
-  const forceScrollToBottom = () => {
-    if (!scrollRef) return;
+  // 合并同一轮内容变化，并在下一次绘制前直接钉底；不做滚动动画或多帧追赶。
+  const scheduleBottomPin = () => {
     if (scrollQueued) return;
     scrollQueued = true;
     queueMicrotask(() => {
       scrollQueued = false;
-      if (!stickToBottom() || manualScroll) return;
       pinBottom();
     });
   };
 
-  /** 虚拟轮次挂回会改变 scrollHeight；连续钉底到布局稳定，避免停在旧占位高度中间。 */
-  const settleToBottom = (maxMs = 1000) => {
-    if (settleRaf) cancelAnimationFrame(settleRaf);
-    manualScroll = false;
-    manualScrollMovedAway = false;
-    cancelManualScrollResume();
-    cancelPointerScrollFinish();
-    pointerScrolling = false;
+  const enableBottomFollow = () => {
     setStickToBottom(true);
-    const deadline = performance.now() + maxMs;
-    let lastHeight = -1;
-    let stableFrames = 0;
-    const step = () => {
-      settleRaf = 0;
-      // 用户已上滑脱离吸底：立刻停止 settle，绝不能无条件 pinBottom 把人拉回去。
-      if (!scrollRef || !stickToBottom() || manualScroll) return;
-      pinBottom(true);
-      const height = scrollRef.scrollHeight;
-      const distance = height - scrollRef.scrollTop - scrollRef.clientHeight;
-      if (height === lastHeight && distance <= 1) stableFrames++;
-      else stableFrames = 0;
-      lastHeight = height;
-      if (
-        stickToBottom() &&
-        !manualScroll &&
-        performance.now() < deadline &&
-        (awaitingSendUserItem || stableFrames < 3)
-      ) {
-        settleRaf = requestAnimationFrame(step);
-      }
-    };
-    settleRaf = requestAnimationFrame(step);
+    scheduleBottomPin();
   };
 
-  const scrollToBottom = () => {
-    if (!stickToBottom() || manualScroll) return;
-    forceScrollToBottom();
-  };
-
-  /** 发送新提示词：强制跳到底，并等到 items 增长后再钉稳 */
-  const jumpToBottomNow = () => {
-    awaitingSendUserItem = true;
-    itemsLenAtSend = state.items.length;
-    settleToBottom(1200);
+  const finishPointerInteraction = () => {
+    handleTranscriptScroll();
+    pointerActive = false;
+    if (stickToBottom()) scheduleBottomPin();
   };
 
   // 会话累计 token 用量
@@ -411,28 +255,20 @@ export function ChatView() {
     ),
   );
 
-  // 内容变化时自动吸底；发送后等 items 增长是关键钉底时机
+  // 流式内容变化后请求一次绘制前钉底；自由浏览时 pinBottom 会直接退出。
   createEffect(() => {
     const len = state.items.length;
     const last = state.items[len - 1];
     if (last && "text" in last) void (last as { text: string }).text.length;
     void permissions().length;
-
-    if (awaitingSendUserItem && len > itemsLenAtSend) {
-      awaitingSendUserItem = false;
-      settleToBottom(1000);
-      return;
-    }
-
-    if (stickToBottom() && scrollRef) scrollToBottom();
+    scheduleBottomPin();
   });
 
   onMount(() => {
     if (!innerRef || !scrollRef) return;
     const ro = new ResizeObserver(() => {
       refreshVirtualGroups();
-      scheduleManualScrollResume();
-      if (stickToBottom() && !manualScroll) scrollToBottom();
+      scheduleBottomPin();
     });
     ro.observe(innerRef);
 
@@ -449,46 +285,40 @@ export function ChatView() {
         target instanceof HTMLElement &&
         (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
       ) return;
-      if (scrollsDown) {
-        if (manualScroll) {
-          userActivelyScrolledDown = true;
-          scheduleManualScrollResume();
-        }
+      if (isToolDetailScroll(target)) {
+        cancelBottomFollow();
         return;
       }
-      if (isToolDetailScroll(target)) suspendBottomFollowForToolDetail();
-      else cancelBottomFollow();
+      if (scrollsDown) {
+        if (!stickToBottom() && isAtBottom()) enableBottomFollow();
+        return;
+      }
+      cancelBottomFollow();
     };
     window.addEventListener("keydown", handleScrollKey, true);
-    window.addEventListener("pointerup", finishManualScroll, true);
-    window.addEventListener("pointercancel", finishManualScroll, true);
+    window.addEventListener("pointerup", finishPointerInteraction, true);
+    window.addEventListener("pointercancel", finishPointerInteraction, true);
     onCleanup(() => {
       ro.disconnect();
       window.removeEventListener("keydown", handleScrollKey, true);
-      window.removeEventListener("pointerup", finishManualScroll, true);
-      window.removeEventListener("pointercancel", finishManualScroll, true);
-      if (settleRaf) cancelAnimationFrame(settleRaf);
+      window.removeEventListener("pointerup", finishPointerInteraction, true);
+      window.removeEventListener("pointercancel", finishPointerInteraction, true);
       if (viewportRaf) cancelAnimationFrame(viewportRaf);
-      cancelManualScrollResume();
-      cancelPointerScrollFinish();
     });
   });
 
-  // 仅在切换会话时重置吸底（不要在无关更新里清掉「等待发送落库」标记）
+  // 切换会话时从底部开始；后续尺寸变化由 ResizeObserver 持续对齐。
   createEffect((prevId: string | null | undefined) => {
     const id = state.currentId;
-    if (id !== prevId) {
-      awaitingSendUserItem = false;
-      settleToBottom(800);
-    }
+    if (id !== prevId) enableBottomFollow();
     return id;
   }, undefined);
 
-  // 会话中继续发送提示词：未在底部时也立刻跳到底（无过渡）
+  // 主动发送新提示词时重新进入吸底，无动画直接显示最新内容。
   createEffect(() => {
     const tick = chatScrollToBottomSignal();
     if (tick === 0) return;
-    jumpToBottomNow();
+    enableBottomFollow();
   });
 
   const [editing, setEditing] = createSignal(false);
@@ -670,8 +500,6 @@ export function ChatView() {
         onScroll={handleTranscriptScroll}
         onWheel={handleWheel}
         onPointerDown={handlePointerDown}
-        onPointerUp={finishManualScroll}
-        onPointerCancel={finishManualScroll}
       >
         <div class="transcript-inner" ref={innerRef}>
           <Show when={state.items.length === 0 && !mergedWake() && !state.loadingThread}>
@@ -726,8 +554,6 @@ export function ChatView() {
             </For>
           </Show>
           <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
-          {/* 吸底哨兵：发送新提示词时 scrollIntoView，不依赖虚拟列表占位高度 */}
-          <div ref={endRef} class="transcript-end" aria-hidden="true" />
         </div>
       </div>
 

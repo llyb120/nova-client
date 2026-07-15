@@ -851,13 +851,6 @@ button {
   flex: 0 0 auto;
 }
 
-.transcript-end {
-  flex: 0 0 auto;
-  height: 1px;
-  width: 100%;
-  pointer-events: none;
-}
-
 .transcript-hint {
   color: var(--text-faint);
   font-size: 13px;
