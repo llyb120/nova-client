@@ -12,7 +12,7 @@ mod mind;
 mod model_cache;
 mod notice;
 #[cfg(windows)]
-pub mod nowindow;
+mod windows_shell_shim;
 mod path_env;
 mod quota;
 mod relay;

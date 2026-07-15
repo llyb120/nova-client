@@ -2,116 +2,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(windows)]
-const NOWINDOW_WRAPPER_MARKER: &str = "NOVA_NOWINDOW_WRAPPER";
-#[cfg(windows)]
-const NOWINDOW_PWSH_REAL: &str = "NOVA_NOWINDOW_PWSH_REAL";
-#[cfg(windows)]
-const NOWINDOW_POWERSHELL_REAL: &str = "NOVA_NOWINDOW_POWERSHELL_REAL";
-#[cfg(windows)]
-const NOWINDOW_CMD_REAL: &str = "NOVA_NOWINDOW_CMD_REAL";
-#[cfg(windows)]
-const NOWINDOW_REAL_PREFIX: &str = "NOVA_NOWINDOW_REAL_";
-#[cfg(windows)]
 const RESTART_PARENT_PID: &str = "NOVA_RESTART_PARENT_PID";
 #[cfg(windows)]
 const SINGLE_INSTANCE_MUTEX: &str = "Local\\NovaDesktopSingleInstanceMutex";
 #[cfg(windows)]
 const FOCUS_EVENT: &str = "Local\\NovaDesktopFocusEvent";
-
-#[cfg(windows)]
-fn nowindow_real_env(stem: &str) -> String {
-    let key: String = stem
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{NOWINDOW_REAL_PREFIX}{key}")
-}
-
-#[cfg(windows)]
-fn run_nowindow_shell_wrapper() -> bool {
-    use std::ffi::OsString;
-    use std::io::{self, Write};
-    use std::os::windows::process::CommandExt;
-    use std::path::PathBuf;
-    use std::process::{exit, Command, Stdio};
-    use std::thread;
-
-    if std::env::var(NOWINDOW_WRAPPER_MARKER).ok().as_deref() != Some("1") {
-        return false;
-    }
-
-    let Ok(current_exe) = std::env::current_exe() else {
-        return false;
-    };
-    let Some(stem) = current_exe.file_stem().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    let lower_stem = stem.to_ascii_lowercase();
-    let real = match lower_stem.as_str() {
-        "pwsh" => std::env::var_os(NOWINDOW_PWSH_REAL),
-        "powershell" => std::env::var_os(NOWINDOW_POWERSHELL_REAL),
-        "cmd" => std::env::var_os(NOWINDOW_CMD_REAL),
-        _ => std::env::var_os(nowindow_real_env(&lower_stem)),
-    };
-    let Some(real_shell) = real.map(PathBuf::from) else {
-        exit(1);
-    };
-
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let mut child = Command::new(real_shell);
-    child
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x08000000);
-
-    let Ok(mut child) = child.spawn() else {
-        exit(1);
-    };
-
-    if let Some(mut child_stdin) = child.stdin.take() {
-        thread::spawn(move || {
-            let mut stdin = io::stdin();
-            let _ = io::copy(&mut stdin, &mut child_stdin);
-        });
-    }
-
-    let stdout_thread = child.stdout.take().map(|mut child_stdout| {
-        thread::spawn(move || {
-            let mut stdout = io::stdout();
-            let _ = io::copy(&mut child_stdout, &mut stdout);
-            let _ = stdout.flush();
-        })
-    });
-
-    let stderr_thread = child.stderr.take().map(|mut child_stderr| {
-        thread::spawn(move || {
-            let mut stderr = io::stderr();
-            let _ = io::copy(&mut child_stderr, &mut stderr);
-            let _ = stderr.flush();
-        })
-    });
-
-    let code = child
-        .wait()
-        .ok()
-        .and_then(|status| status.code())
-        .unwrap_or(1);
-    if let Some(handle) = stdout_thread {
-        let _ = handle.join();
-    }
-    if let Some(handle) = stderr_thread {
-        let _ = handle.join();
-    }
-    exit(code);
-}
 
 #[cfg(windows)]
 fn wait_for_restart_parent() {
@@ -304,11 +199,6 @@ fn should_enforce_single_instance() -> bool {
 }
 
 fn main() {
-    #[cfg(windows)]
-    if run_nowindow_shell_wrapper() {
-        return;
-    }
-
     // Finder / Dock 启动的 macOS .app 不继承终端 PATH。必须在任何 CLI 探测或
     // 后端线程启动前恢复，否则已安装的 codex、npx 等都会被误判为不可用。
     nova_lib::init_process_path();

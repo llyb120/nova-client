@@ -1629,10 +1629,11 @@ impl AcpManager {
             // Cursor 的 shell runner 未设置 windowsHide；仅对它的 Node 进程预加载默认值补丁。
             apply_cursor_windows_hide_patch(&self.app, &mut cmd, &self.launch_env)?;
         }
-        // 无窗口 shim：拦截后端按裸名拉起的 cmd/powershell（node-pty / ConPTY / ComSpec 等
-        // windowsHide 补丁覆盖不到的路径），消除残留控制台闪屏。
+        // 微型 GUI helper 统一覆盖各后端绕过父进程 flags 的 cmd/powershell/pwsh 孙进程。
         #[cfg(windows)]
-        crate::nowindow::apply(&self.app, &mut cmd, &self.launch_env)?;
+        if let Err(e) = crate::windows_shell_shim::apply(&self.app, &mut cmd, &self.launch_env) {
+            self.push_log(format!("[windows-shell-shim] {e}"));
+        }
 
         // 把 ~/.nova/skills 用软链接/目录联接同步到各后端全局 skills 目录
         crate::skills::sync_skills_from_home();
