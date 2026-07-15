@@ -643,6 +643,34 @@ button {
 .thread-item:hover .thread-time {
   opacity: 0;
 }
+.thread-item.starred .thread-time {
+  margin-right: 20px;
+}
+
+.thread-star {
+  position: absolute;
+  right: 27px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 1px 2px;
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-faint);
+  opacity: 0;
+  pointer-events: none;
+}
+.thread-item:hover .thread-star,
+.thread-star.starred {
+  opacity: 1;
+  pointer-events: auto;
+}
+.thread-star.starred {
+  color: var(--yellow);
+}
+.thread-star:hover {
+  background: color-mix(in srgb, var(--yellow) 13%, transparent);
+}
 
 .thread-delete {
   display: flex;
@@ -1755,6 +1783,7 @@ button {
   .brand-version,
   .group-label span,
   .thread-title,
+  .thread-star,
   .thread-delete,
   .thread-empty,
   .sidebar-foot {

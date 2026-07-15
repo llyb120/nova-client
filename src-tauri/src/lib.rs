@@ -213,11 +213,15 @@ fn running_by_id(state: &AppState, thread_id: &str) -> bool {
     is_running(state, thread)
 }
 
-fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
+fn is_ordinary_thread(thread: &Thread) -> bool {
     thread.employee_id.is_none()
         && !thread.mind_thread
         && thread.roaming_role.is_none()
         && thread.quota_peer.is_none()
+}
+
+fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
+    is_ordinary_thread(thread) && !thread.starred
 }
 
 fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
@@ -262,7 +266,7 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
             .map(|thread| thread.id.clone())
             .collect()
     };
-    let deletable = collect_deletable_thread_ids(&state, thread_ids);
+    let deletable = collect_deletable_thread_ids(&state, thread_ids, true);
     let threads: Vec<Thread> = {
         let store = state.store.lock().unwrap();
         store
@@ -341,8 +345,9 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
 mod session_auto_cleanup_tests {
     use super::{
         is_normal_thread_for_auto_cleanup, is_session_auto_cleanup_day, thread_is_expired,
-        AgentKind, Thread,
+        tree_contains_starred_thread, AgentKind, Thread,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn thread_is_expired_only_after_the_configured_retention() {
@@ -361,12 +366,23 @@ mod session_auto_cleanup_tests {
 
         thread.ephemeral = true;
         assert!(is_normal_thread_for_auto_cleanup(&thread));
+        thread.starred = true;
+        assert!(!is_normal_thread_for_auto_cleanup(&thread));
+        thread.starred = false;
         thread.ephemeral = false;
         thread.employee_id = Some("employee".into());
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
         thread.employee_id = None;
         thread.roaming_role = Some("host".into());
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
+    }
+
+    #[test]
+    fn starred_descendant_protects_its_tree() {
+        let tree = vec!["parent".to_string(), "child".to_string()];
+        let starred = HashSet::from(["child".to_string()]);
+
+        assert!(tree_contains_starred_thread(&tree, &starred));
     }
 
     #[test]
@@ -522,6 +538,7 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
             updated_at: t.updated_at,
             running: is_running(&state, t),
             ephemeral: t.ephemeral,
+            starred: t.starred,
             roaming_role: t.roaming_role.clone(),
             roaming_peer_name: t.roaming_peer_name.clone(),
             quota_peer_name: t.quota_peer_name.clone(),
@@ -1674,8 +1691,27 @@ fn delete_thread(
     Ok(())
 }
 
-/// 过滤掉运行中的会话树，返回可安全移除的完整树 id 集合。
-fn collect_deletable_thread_ids(state: &AppState, thread_ids: Vec<String>) -> Vec<String> {
+fn tree_contains_starred_thread(tree: &[String], starred_thread_ids: &HashSet<String>) -> bool {
+    tree.iter().any(|id| starred_thread_ids.contains(id))
+}
+
+/// 过滤掉运行中的会话树，按需保留含星标节点的完整树，返回可安全移除的完整树 id 集合。
+fn collect_deletable_thread_ids(
+    state: &AppState,
+    thread_ids: Vec<String>,
+    preserve_starred: bool,
+) -> Vec<String> {
+    let starred_thread_ids: HashSet<String> = if preserve_starred {
+        let store = state.store.lock().unwrap();
+        store
+            .threads
+            .iter()
+            .filter(|thread| thread.starred)
+            .map(|thread| thread.id.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let roots: Vec<String> = thread_ids
         .into_iter()
         .filter(|id| !running_by_id(&state, id))
@@ -1687,6 +1723,9 @@ fn collect_deletable_thread_ids(state: &AppState, thread_ids: Vec<String>) -> Ve
         }
         let tree = expand_thread_tree_ids(&state, std::slice::from_ref(&root));
         if tree.iter().any(|id| running_by_id(&state, id)) {
+            continue;
+        }
+        if preserve_starred && tree_contains_starred_thread(&tree, &starred_thread_ids) {
             continue;
         }
         delete_set.extend(tree);
@@ -1721,9 +1760,14 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
     removed
 }
 
-/// 批量删除会话；运行中的自动跳过，返回实际删除数量
-fn delete_threads_impl(app: &tauri::AppHandle, state: &AppState, thread_ids: Vec<String>) -> usize {
-    let deletable = collect_deletable_thread_ids(state, thread_ids);
+/// 批量删除会话；运行中的自动跳过，返回实际删除数量。
+fn delete_threads_impl(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    thread_ids: Vec<String>,
+    preserve_starred: bool,
+) -> usize {
+    let deletable = collect_deletable_thread_ids(state, thread_ids, preserve_starred);
     remove_threads(app, state, deletable).len()
 }
 
@@ -1733,7 +1777,17 @@ fn delete_threads(
     state: State<'_, AppState>,
     thread_ids: Vec<String>,
 ) -> Result<usize, String> {
-    Ok(delete_threads_impl(&app, &state, thread_ids))
+    Ok(delete_threads_impl(&app, &state, thread_ids, false))
+}
+
+/// 项目侧栏的一键清理：运行中及星标会话（含其所在树）均保留。
+#[tauri::command]
+fn delete_project_threads(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_ids: Vec<String>,
+) -> Result<usize, String> {
+    Ok(delete_threads_impl(&app, &state, thread_ids, true))
 }
 
 /// 用配置的编辑器打开文件（可带行号）。
@@ -2166,6 +2220,26 @@ fn set_thread_reasoning_effort(
     let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
     thread.reasoning_effort = reasoning_effort.filter(|s| !s.is_empty());
     store.save();
+    Ok(())
+}
+
+#[tauri::command]
+fn set_thread_starred(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    starred: bool,
+) -> Result<(), String> {
+    {
+        let mut store = state.store.lock().unwrap();
+        let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
+        if !is_ordinary_thread(thread) {
+            return Err("仅普通会话支持星标".into());
+        }
+        thread.starred = starred;
+        store.save();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
     Ok(())
 }
 
@@ -4259,6 +4333,7 @@ pub fn run() {
             create_thread,
             delete_thread,
             delete_threads,
+            delete_project_threads,
             open_in_editor,
             revert_file_changes,
             open_in_explorer,
@@ -4268,6 +4343,7 @@ pub fn run() {
             set_thread_model,
             set_thread_mode,
             set_thread_reasoning_effort,
+            set_thread_starred,
             set_thread_agent,
             get_model_options,
             get_slash_commands,

@@ -322,6 +322,9 @@ pub struct Thread {
     /// 临时会话：程序关闭时自动删除，不跨重启持久化
     #[serde(default)]
     pub ephemeral: bool,
+    /// 用户星标：在所在项目内置顶，并豁免自动清理与项目一键删除。
+    #[serde(default)]
+    pub starred: bool,
     /// 漫游角色：None = 本地会话；Some("host") = 我替别人在本机执行；
     /// Some("guest") = 我在别人机器上执行、本机只接收展示
     #[serde(default)]
@@ -389,6 +392,7 @@ impl Thread {
             reasoning_effort,
             handoff_from: None,
             ephemeral,
+            starred: false,
             roaming_role: None,
             roaming_peer: None,
             roaming_peer_name: None,
@@ -552,6 +556,7 @@ pub struct ThreadMeta {
     pub running: bool,
     #[serde(default)]
     pub ephemeral: bool,
+    pub starred: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roaming_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1127,6 +1132,19 @@ mod tests {
         assert!(context.contains("Devin：\n已经定位到旧会话状态。"));
         assert_eq!(thread.handoff_from, None);
         assert!(thread.take_prompt_context("OpenCode").is_none());
+    }
+
+    #[test]
+    fn legacy_thread_without_starred_defaults_to_false() {
+        let thread = Thread::new(String::new(), AgentKind::Devin, None, None, None, false);
+        let mut value = serde_json::to_value(thread).expect("线程应可序列化");
+        value
+            .as_object_mut()
+            .expect("线程应序列化为对象")
+            .remove("starred");
+
+        let restored: Thread = serde_json::from_value(value).expect("旧线程应可反序列化");
+        assert!(!restored.starred);
     }
 }
 

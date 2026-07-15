@@ -104,6 +104,8 @@ export const api = {
   deleteClue: (cardId: string) => invoke<void>("delete_clue", { cardId }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),
+  deleteProjectThreads: (threadIds: string[]) =>
+    invoke<number>("delete_project_threads", { threadIds }),
   openInExplorer: (path: string) => invoke<void>("open_in_explorer", { path }),
   openInTerminal: (path: string) => invoke<void>("open_in_terminal", { path }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
@@ -117,6 +119,8 @@ export const api = {
     invoke<void>("set_thread_mode", { threadId, mode }),
   setThreadReasoningEffort: (threadId: string, reasoningEffort: string | null) =>
     invoke<void>("set_thread_reasoning_effort", { threadId, reasoningEffort }),
+  setThreadStarred: (threadId: string, starred: boolean) =>
+    invoke<void>("set_thread_starred", { threadId, starred }),
   setThreadAgent: (
     threadId: string,
     agentKind: AgentKind,

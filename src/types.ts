@@ -82,6 +82,8 @@ export interface ThreadMeta {
   running: boolean;
   /** 临时会话：程序关闭时自动删除 */
   ephemeral?: boolean;
+  /** 用户星标：在所在项目内置顶 */
+  starred: boolean;
   /** 漫游角色：host = 我替别人执行；guest = 在别人机器上执行、本机只接收 */
   roamingRole?: string | null;
   /** 漫游对端展示名 */
@@ -188,6 +190,7 @@ export interface Thread {
   mode?: string | null;
   reasoningEffort?: string | null;
   ephemeral?: boolean;
+  starred?: boolean;
   roamingRole?: string | null;
   roamingPeer?: string | null;
   roamingPeerName?: string | null;

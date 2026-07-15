@@ -7,8 +7,8 @@ import type { ThreadMeta, Worktree } from "../types";
 import {
   checkAndStageUpdate,
   closeThread,
+  deleteProjectThreads,
   deleteThread,
-  deleteThreads,
   openThread,
   pendingDecisionCount,
   refreshQuota,
@@ -233,13 +233,14 @@ export function Sidebar(props: {
     });
   };
   const removeGroup = async (cwd: string, threads: typeof state.threads) => {
-    const deletable = threads.filter((t) => !state.running[t.id]);
+    const deletable = threads.filter((t) => !state.running[t.id] && !t.starred);
     const ids = deletable.map((t) => t.id);
     if (ids.length === 0 || deletingGroup()) return;
-    const runningCount = threads.length - deletable.length;
+    const starredCount = threads.filter((t) => t.starred).length;
+    const runningCount = threads.filter((t) => !t.starred && state.running[t.id]).length;
     const name = groupName(cwd);
     const ok = await confirm(
-      `删除「${name}」里的 ${ids.length} 个会话？聊天记录将一并删除。${runningCount > 0 ? "运行中的会话会保留。" : ""}`,
+      `删除「${name}」里的非星标会话？聊天记录将一并删除。${starredCount > 0 ? `${starredCount} 个星标会话会保留。` : ""}${runningCount > 0 ? "运行中的会话会保留。" : ""}`,
       {
         title: "批量删除会话",
         kind: "warning",
@@ -248,7 +249,7 @@ export function Sidebar(props: {
     if (!ok) return;
     setDeletingGroup(cwd);
     try {
-      await deleteThreads(ids);
+      await deleteProjectThreads(ids);
     } finally {
       setDeletingGroup(null);
     }
@@ -351,7 +352,7 @@ export function Sidebar(props: {
     return (
       <div
         class={`thread-item ${active() ? "active" : ""}`}
-        classList={{ child, parent: childCount > 0 }}
+        classList={{ child, parent: childCount > 0, starred: !!t.starred }}
         onClick={() => void openHistoryThread(activeThread.id)}
         onContextMenu={(e) => {
           // 目前只有 worktree 会话有右键动作（合并到分支）；漫游 guest 的 worktree 在对端，不提供
@@ -411,6 +412,22 @@ export function Sidebar(props: {
           <span class="thread-ephemeral" title="临时会话：程序关闭时自动删除">
             临时
           </span>
+        </Show>
+        <Show when={!isEmployeeView() && !isMindThread(t) && !t.roamingRole && !t.quotaPeerName}>
+          <button
+            type="button"
+            class="thread-star"
+            classList={{ starred: !!t.starred }}
+            title={t.starred ? "取消星标" : "加星标并在项目内置顶"}
+            onClick={(e) => {
+              e.stopPropagation();
+              void api
+                .setThreadStarred(t.id, !t.starred)
+                .catch((error) => void message(String(error), { kind: "error" }));
+            }}
+          >
+            {t.starred ? "🌟" : "☆"}
+          </button>
         </Show>
         <span class="thread-time">{fmtTime(updatedAt())}</span>
         <button
@@ -611,7 +628,8 @@ export function Sidebar(props: {
                       class="group-delete"
                       title="删除该文件夹里的会话"
                       disabled={
-                        deletingGroup() === cwd || threads.every((t) => state.running[t.id])
+                        deletingGroup() === cwd ||
+                        threads.every((t) => state.running[t.id] || t.starred)
                       }
                       onClick={(e) => {
                         e.stopPropagation();

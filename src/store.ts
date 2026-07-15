@@ -1153,6 +1153,16 @@ export async function deleteThreads(ids: string[]): Promise<number> {
   return deleted;
 }
 
+/** 项目侧栏一键清理：后端会保留星标会话及其所在会话树。 */
+export async function deleteProjectThreads(ids: string[]): Promise<number> {
+  const activeId = state.currentId;
+  const deleted = await api.deleteProjectThreads(ids);
+  for (const id of ids) threadSnapshots.delete(id);
+  await refreshThreads();
+  if (activeId && !state.threads.some((thread) => thread.id === activeId)) closeThread();
+  return deleted;
+}
+
 export async function sendPrompt(text: string, images: PromptImage[] = []) {
   const id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
