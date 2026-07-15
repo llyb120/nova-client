@@ -28,7 +28,10 @@ fn github_repo() -> &'static str {
 }
 
 fn github_api_latest() -> String {
-    format!("https://api.github.com/repos/{}/releases/latest", github_repo())
+    format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        github_repo()
+    )
 }
 
 fn asset_name_for(version: &str) -> String {
@@ -510,7 +513,10 @@ fn current_exe_name() -> String {
 
 /// 更新检查/下载专用 HTTP 客户端：走系统代理（Windows 注册表 / macOS 网络偏好 /
 /// 环境变量 HTTP(S)_PROXY，与浏览器「使用系统代理」一致）。
-fn update_http_client(user_agent: Option<&str>, request_timeout: Option<Duration>) -> Result<reqwest::Client, String> {
+fn update_http_client(
+    user_agent: Option<&str>,
+    request_timeout: Option<Duration>,
+) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
     if let Some(t) = request_timeout {
         builder = builder.timeout(t);
@@ -524,7 +530,10 @@ fn update_http_client(user_agent: Option<&str>, request_timeout: Option<Duration
 /// 查询最新版本并与当前版本比较（GitHub Releases）
 pub async fn check(app: &AppHandle) -> Result<Value, String> {
     let current = app.package_info().version.to_string();
-    let client = update_http_client(Some(&format!("Nova/{current}")), Some(Duration::from_secs(15)))?;
+    let client = update_http_client(
+        Some(&format!("Nova/{current}")),
+        Some(Duration::from_secs(15)),
+    )?;
     let resp = client
         .get(github_api_latest())
         .header("Accept", "application/vnd.github+json")
@@ -584,7 +593,6 @@ pub async fn check(app: &AppHandle) -> Result<Value, String> {
         "downloadUrl": download_url,
     }))
 }
-
 
 /// 在解压目录中找新版可执行文件（优先同名；Windows 回退任意 .exe，Unix 回退名为 Nova 的文件）
 fn find_exe(dir: &Path, name: &str) -> Option<PathBuf> {

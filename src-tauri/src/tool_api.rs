@@ -129,10 +129,7 @@ async fn handle_http(state: &ApiState, raw: &str) -> String {
             let query = v.get("query").and_then(|x| x.as_str()).unwrap_or("");
             let k = v.get("k").and_then(|x| x.as_u64()).unwrap_or(6) as usize;
             let text = employees::tool_kb_search(&state.app, employee, query, k);
-            http_response(
-                200,
-                &json!({"ok":true,"text":text}).to_string(),
-            )
+            http_response(200, &json!({"ok":true,"text":text}).to_string())
         }
         ("POST", "/v1/ledger-list") | ("GET", "/v1/ledger-list") => {
             let scope = if method == "GET" {
@@ -239,13 +236,19 @@ fn urlencoding_decode(s: &str) -> String {
 }
 
 fn parse_request(raw: &str) -> Option<(String, String, Vec<(String, String)>, &str)> {
-    let (head, body) = raw.split_once("\r\n\r\n").or_else(|| raw.split_once("\n\n"))?;
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))?;
     let mut lines = head.lines();
     let req = lines.next()?;
     let mut parts = req.split_whitespace();
     let method = parts.next()?.to_string();
     let path_full = parts.next()?.to_string();
-    let path = path_full.split('?').next().unwrap_or(&path_full).to_string();
+    let path = path_full
+        .split('?')
+        .next()
+        .unwrap_or(&path_full)
+        .to_string();
     let mut headers = Vec::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {

@@ -824,10 +824,11 @@ impl ThreadTrashStore {
     /// 先持久化到回收站，再允许调用方从正常会话存储移除，优先保证不会直接丢失会话。
     pub fn move_to_trash(&mut self, threads: Vec<Thread>, trashed_at: i64) -> Result<(), String> {
         let len = self.entries.len();
-        self.entries.extend(threads.into_iter().map(|thread| TrashedThread {
-            thread,
-            trashed_at,
-        }));
+        self.entries.extend(
+            threads
+                .into_iter()
+                .map(|thread| TrashedThread { thread, trashed_at }),
+        );
         if let Err(error) = self.save() {
             self.entries.truncate(len);
             return Err(error);

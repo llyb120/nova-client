@@ -1504,7 +1504,11 @@ fn create_mind_decision(
         "other",
         cap_vec(escalation.options, 5, 180),
         thread_id.map(str::to_string),
-        Some(format!("mind:{}:{}", emp.id, stable_hash(&escalation.question))),
+        Some(format!(
+            "mind:{}:{}",
+            emp.id,
+            stable_hash(&escalation.question)
+        )),
         "mind",
         &cap(&escalation.proposed_action, 500),
         "Dream 已暂停相关学习，数字员工仍可继续工作。",

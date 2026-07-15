@@ -276,12 +276,7 @@ impl NoticeStore {
         let mut archived: Vec<(i64, String)> = self
             .notices
             .iter()
-            .filter(|n| {
-                !matches!(
-                    n.status.as_str(),
-                    "pending" | "delivered"
-                )
-            })
+            .filter(|n| !matches!(n.status.as_str(), "pending" | "delivered"))
             .map(|n| (n.handled_at.max(n.created_at), n.id.clone()))
             .collect();
         if archived.len() <= KEEP_ARCHIVED {
@@ -348,7 +343,11 @@ impl NoticeStore {
                         n.body.brief.trim()
                     );
                 }
-                if n.body.question.as_ref().is_some_and(|q| !q.trim().is_empty()) {
+                if n.body
+                    .question
+                    .as_ref()
+                    .is_some_and(|q| !q.trim().is_empty())
+                {
                     existing.body.question = n.body.question;
                 }
                 if !n.body.options.is_empty() {
@@ -410,7 +409,8 @@ impl NoticeStore {
     }
 
     pub fn retain_employee(&mut self, employee_id: &str) {
-        self.notices.retain(|n| n.from.employee_id() != Some(employee_id));
+        self.notices
+            .retain(|n| n.from.employee_id() != Some(employee_id));
         self.injections
             .retain(|k, _| !k.starts_with(&format!("{employee_id}\u{1}")));
         self.save();
@@ -527,10 +527,7 @@ pub fn template_decision(
                 "approve".into(),
                 vec![inject_approve.clone(), resume.clone(), wake.clone()],
             ),
-            (
-                "shelve".into(),
-                vec![inject_approve, resume, wake.clone()],
-            ),
+            ("shelve".into(), vec![inject_approve, resume, wake.clone()]),
         ]),
         on_reject: vec![
             Action::FailMark {
@@ -785,7 +782,12 @@ pub struct RespondParams {
     pub reject: bool,
 }
 
-pub fn respond_notice(app: &AppHandle, id: &str, by: ActorRef, params: RespondParams) -> Result<Notice, String> {
+pub fn respond_notice(
+    app: &AppHandle,
+    id: &str,
+    by: ActorRef,
+    params: RespondParams,
+) -> Result<Notice, String> {
     let notice = {
         let st = app.state::<AppState>();
         let store = st.notices.lock().unwrap();
@@ -907,9 +909,7 @@ fn fill_action_placeholders(
         for a in actions.iter_mut() {
             match a {
                 Action::InjectContext {
-                    text: t,
-                    thread_id,
-                    ..
+                    text: t, thread_id, ..
                 } if t.is_empty() => {
                     *t = inject_text.clone();
                     if thread_id.is_none() {
@@ -973,11 +973,7 @@ fn fill_action_placeholders(
             "我奏问：{question}\n主管留中不发（让我自行斟酌）。复盘提示：这类问题主管认为我可以自己定，下次同类情况直接按专业判断办，不必上奏。"
         )
     } else if notice.label == "report" && !text.trim().is_empty() {
-        format!(
-            "完工汇报：{}\n【用户】批阅：{}",
-            question,
-            text.trim()
-        )
+        format!("完工汇报：{}\n【用户】批阅：{}", question, text.trim())
     } else {
         format!(
             "我奏问：{question}\n主管批示：{}\n复盘提示：记住主管在这类问题上的口径，下次同类情况按此办理，不必再问。",
@@ -992,9 +988,7 @@ fn fill_action_placeholders(
     for a in actions.iter_mut() {
         match a {
             Action::InjectContext {
-                text: t,
-                thread_id,
-                ..
+                text: t, thread_id, ..
             } => {
                 if t.is_empty() {
                     *t = inject_text.clone();
@@ -1053,7 +1047,12 @@ pub fn pending_hold_on(app: &AppHandle, scope: &str, key: &str) -> bool {
 }
 
 /// 发给该员工、待答复的讨论 Notice（串行交棒回程用）。
-pub fn pending_discuss_id(app: &AppHandle, employee_id: &str, scope: &str, key: &str) -> Option<String> {
+pub fn pending_discuss_id(
+    app: &AppHandle,
+    employee_id: &str,
+    scope: &str,
+    key: &str,
+) -> Option<String> {
     let st = app.state::<AppState>();
     let store = st.notices.lock().unwrap();
     store
@@ -1071,7 +1070,12 @@ pub fn pending_discuss_id(app: &AppHandle, employee_id: &str, scope: &str, key: 
         .map(|n| n.id.clone())
 }
 
-pub fn take_injection(app: &AppHandle, employee_id: &str, scope: &str, key: &str) -> Option<String> {
+pub fn take_injection(
+    app: &AppHandle,
+    employee_id: &str,
+    scope: &str,
+    key: &str,
+) -> Option<String> {
     let st = app.state::<AppState>();
     let mut store = st.notices.lock().unwrap();
     store.take_injection(employee_id, scope, key)
@@ -1093,11 +1097,7 @@ fn notify_user_notice(app: &AppHandle, notice: &Notice) {
     if notice.label != "decision" {
         return;
     }
-    let emp_name = notice
-        .from
-        .name
-        .clone()
-        .unwrap_or_else(|| "员工".into());
+    let emp_name = notice.from.name.clone().unwrap_or_else(|| "员工".into());
     let question = notice
         .body
         .question
@@ -1108,7 +1108,12 @@ fn notify_user_notice(app: &AppHandle, notice: &Notice) {
 
 // ===== Action 执行 =====
 
-fn execute_actions(app: &AppHandle, notice: &Notice, actions: &[Action], _response_text: Option<&str>) {
+fn execute_actions(
+    app: &AppHandle,
+    notice: &Notice,
+    actions: &[Action],
+    _response_text: Option<&str>,
+) {
     for action in actions {
         match action {
             Action::Noop => {}
@@ -1177,7 +1182,8 @@ fn execute_actions(app: &AppHandle, notice: &Notice, actions: &[Action], _respon
                     title.clone()
                 };
                 tauri::async_runtime::spawn(async move {
-                    employees::notice_claim_mark(&app2, &employee_id, &scope, &key, &title, "").await;
+                    employees::notice_claim_mark(&app2, &employee_id, &scope, &key, &title, "")
+                        .await;
                 });
             }
             Action::ClaimFor {
@@ -1198,17 +1204,11 @@ fn execute_actions(app: &AppHandle, notice: &Notice, actions: &[Action], _respon
                 };
                 let brief = brief.clone();
                 tauri::async_runtime::spawn(async move {
-                    employees::notice_claim_mark(
-                        &app2, &employee_id, &scope, &key, &title, &brief,
-                    )
-                    .await;
+                    employees::notice_claim_mark(&app2, &employee_id, &scope, &key, &title, &brief)
+                        .await;
                 });
             }
-            Action::FailMark {
-                scope,
-                key,
-                reason,
-            } => {
+            Action::FailMark { scope, key, reason } => {
                 let app2 = app.clone();
                 let scope = scope.clone();
                 let key = key.clone();
@@ -1369,8 +1369,10 @@ pub fn migrate_from_decisions(app: &AppHandle) {
     }
     let mut migrated = 0;
     for d in legacy {
-        if !matches!(d.status.as_str(), "pending" | "report" | "resolved" | "shelved" | "rejected")
-        {
+        if !matches!(
+            d.status.as_str(),
+            "pending" | "report" | "resolved" | "shelved" | "rejected"
+        ) {
             continue;
         }
         let exists = {
@@ -1456,7 +1458,11 @@ pub fn migrate_from_decisions(app: &AppHandle) {
             } else {
                 notice.expect.on_handled.clone()
             };
-            let choice = if d.status == "shelved" { "shelve" } else { "approve" };
+            let choice = if d.status == "shelved" {
+                "shelve"
+            } else {
+                "approve"
+            };
             fill_action_placeholders(
                 &mut actions,
                 &notice,

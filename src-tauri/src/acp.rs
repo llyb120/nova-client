@@ -1,9 +1,7 @@
 use crate::model_cache;
 use crate::nova_data_dir;
 use crate::settings::Settings;
-use crate::threads::{
-    now_ms, AgentKind, Item, PromptImage, Thread, ToolCall,
-};
+use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, ToolCall};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -709,10 +707,9 @@ impl AcpManager {
             self.push_log(format!("[nova] 创建 Cursor 隔离配置目录失败：{e}"));
             return None;
         }
-        if let Err(e) = crate::agent_config::sync_cursor_config_dir(
-            &nova_data_dir(&self.app),
-            &config_dir,
-        ) {
+        if let Err(e) =
+            crate::agent_config::sync_cursor_config_dir(&nova_data_dir(&self.app), &config_dir)
+        {
             self.push_log(format!("[nova] 同步 Cursor 全局 Rule 失败：{e}"));
         }
         // 同一线程切换模型后会复用这个目录；Cursor ACP 持久化的旧变体优先级可能高于
@@ -840,8 +837,7 @@ impl AcpManager {
                 node_path,
                 self.cursor_session_store_path(thread_id, session_id),
             ) {
-                if let Some(found) =
-                    read_cursor_tool_details(&node_path, &store_path, tool_call_id)
+                if let Some(found) = read_cursor_tool_details(&node_path, &store_path, tool_call_id)
                 {
                     details.merge(found);
                 }
@@ -862,7 +858,10 @@ impl AcpManager {
     /// 从缓存的 model_options 里查找指定 id 的 config option。
     fn cached_config_option(&self, id: &str) -> Option<Value> {
         let guard = self.model_options.lock().unwrap();
-        let cfg = guard.as_ref()?.get("configOptions").and_then(|v| v.as_array())?;
+        let cfg = guard
+            .as_ref()?
+            .get("configOptions")
+            .and_then(|v| v.as_array())?;
         cfg.iter()
             .find(|o| o.get("id").and_then(|v| v.as_str()) == Some(id))
             .cloned()
@@ -1472,16 +1471,15 @@ impl AcpManager {
         let mut guard = slot.lock().await;
         if let Some(c) = guard.as_ref() {
             if c.alive.load(Ordering::SeqCst) {
-                let needs_respawn =
-                    matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor)
-                        && want_cwd.is_some()
-                        && self
-                            .conn_cwd
-                            .lock()
-                            .unwrap()
-                            .get(conn_key)
-                            .map(String::as_str)
-                            != want_cwd;
+                let needs_respawn = matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Cursor)
+                    && want_cwd.is_some()
+                    && self
+                        .conn_cwd
+                        .lock()
+                        .unwrap()
+                        .get(conn_key)
+                        .map(String::as_str)
+                        != want_cwd;
                 if !needs_respawn {
                     self.touch_conn(conn_key);
                     return Ok(c.clone());
@@ -2101,142 +2099,139 @@ impl AcpManager {
             };
 
             match kind {
-            "agent_message_chunk" | "agent_thought_chunk" => {
-                for item in complete_pending_tools(thread, None) {
-                    self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
-                }
-                let text = extract_text(&update["content"]);
-                if text.is_empty() {
-                    return;
-                }
-                let is_thought = kind == "agent_thought_chunk";
-                // devin 在工具调用间隙会泄漏内容恰为 "None" 的独立消息块（上游 bug），
-                // 仅在「将创建新条目」时丢弃，正常长文本中的 None 字样不受影响
-                if text.trim() == "None" {
-                    let continues_last = match thread.items.last() {
-                        Some(Item::Assistant { .. }) => !is_thought,
-                        Some(Item::Thought { .. }) => is_thought,
-                        _ => false,
-                    };
-                    if !continues_last {
-                        return;
-                    }
-                }
-                let appended = match thread.items.last_mut() {
-                    Some(Item::Assistant { id, text: t, .. }) if !is_thought => {
-                        t.push_str(&text);
-                        Some(*id)
-                    }
-                    Some(Item::Thought { id, text: t, .. }) if is_thought => {
-                        t.push_str(&text);
-                        Some(*id)
-                    }
-                    _ => None,
-                };
-                thread.updated_at = now_ms();
-                match appended {
-                    Some(item_id) => {
-                        self.emit_update(
-                            &thread_id,
-                            json!({ "t": "delta", "itemId": item_id, "text": text }),
-                        );
-                    }
-                    None => {
-                        let id = thread.next_item_id();
-                        let item = if is_thought {
-                            Item::Thought {
-                                id,
-                                text,
-                                ts: now_ms(),
-                            }
-                        } else {
-                            Item::Assistant {
-                                id,
-                                text,
-                                ts: now_ms(),
-                            }
-                        };
-                        thread.items.push(item.clone());
+                "agent_message_chunk" | "agent_thought_chunk" => {
+                    for item in complete_pending_tools(thread, None) {
                         self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                     }
-                }
-            }
-            "tool_call" | "tool_call_update" => {
-                let tc_id = update["toolCallId"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                if tc_id.is_empty() {
-                    return;
-                }
-                let mut found = false;
-                let mut completed = false;
-                let mut snapshot: Option<Item> = None;
-                for item in thread.items.iter_mut().rev() {
-                    if let Item::Tool { call, .. } = item {
-                        if call.tool_call_id == tc_id {
-                            merge_tool_call(call, update);
-                            completed = call.status == "completed" || call.status == "failed";
-                            snapshot = Some(item.clone());
-                            found = true;
-                            break;
+                    let text = extract_text(&update["content"]);
+                    if text.is_empty() {
+                        return;
+                    }
+                    let is_thought = kind == "agent_thought_chunk";
+                    // devin 在工具调用间隙会泄漏内容恰为 "None" 的独立消息块（上游 bug），
+                    // 仅在「将创建新条目」时丢弃，正常长文本中的 None 字样不受影响
+                    if text.trim() == "None" {
+                        let continues_last = match thread.items.last() {
+                            Some(Item::Assistant { .. }) => !is_thought,
+                            Some(Item::Thought { .. }) => is_thought,
+                            _ => false,
+                        };
+                        if !continues_last {
+                            return;
+                        }
+                    }
+                    let appended = match thread.items.last_mut() {
+                        Some(Item::Assistant { id, text: t, .. }) if !is_thought => {
+                            t.push_str(&text);
+                            Some(*id)
+                        }
+                        Some(Item::Thought { id, text: t, .. }) if is_thought => {
+                            t.push_str(&text);
+                            Some(*id)
+                        }
+                        _ => None,
+                    };
+                    thread.updated_at = now_ms();
+                    match appended {
+                        Some(item_id) => {
+                            self.emit_update(
+                                &thread_id,
+                                json!({ "t": "delta", "itemId": item_id, "text": text }),
+                            );
+                        }
+                        None => {
+                            let id = thread.next_item_id();
+                            let item = if is_thought {
+                                Item::Thought {
+                                    id,
+                                    text,
+                                    ts: now_ms(),
+                                }
+                            } else {
+                                Item::Assistant {
+                                    id,
+                                    text,
+                                    ts: now_ms(),
+                                }
+                            };
+                            thread.items.push(item.clone());
+                            self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                         }
                     }
                 }
-                if !found {
-                    for item in complete_pending_tools(thread, Some(&tc_id)) {
+                "tool_call" | "tool_call_update" => {
+                    let tc_id = update["toolCallId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    if tc_id.is_empty() {
+                        return;
+                    }
+                    let mut found = false;
+                    let mut completed = false;
+                    let mut snapshot: Option<Item> = None;
+                    for item in thread.items.iter_mut().rev() {
+                        if let Item::Tool { call, .. } = item {
+                            if call.tool_call_id == tc_id {
+                                merge_tool_call(call, update);
+                                completed = call.status == "completed" || call.status == "failed";
+                                snapshot = Some(item.clone());
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found {
+                        for item in complete_pending_tools(thread, Some(&tc_id)) {
+                            self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
+                        }
+                        let call = tool_call_from_update(&tc_id, update);
+                        let item = Item::Tool {
+                            id: thread.next_item_id(),
+                            ts: now_ms(),
+                            call,
+                        };
+                        thread.items.push(item.clone());
+                        snapshot = Some(item);
+                    }
+                    thread.updated_at = now_ms();
+                    if let Some(item) = snapshot {
                         self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                     }
-                    let call = tool_call_from_update(&tc_id, update);
-                    let item = Item::Tool {
-                        id: thread.next_item_id(),
-                        ts: now_ms(),
-                        call,
-                    };
-                    thread.items.push(item.clone());
-                    snapshot = Some(item);
-                }
-                thread.updated_at = now_ms();
-                if let Some(item) = snapshot {
-                    self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
-                }
-                if completed {
-                    store.save();
-                }
-            }
-            "plan" => {
-                let entries = update["entries"].clone();
-                thread.plan = Some(entries.clone());
-                thread.updated_at = now_ms();
-                self.emit_update(&thread_id, json!({ "t": "plan", "plan": entries }));
-            }
-            "current_mode_update" => {
-                // agent 自发切模式（Cursor SwitchMode / Devin 进 plan 等）：同步到统一
-                // Build/Plan，更新选择器，并让轮次结束时能弹出「实施此计划」。
-                // 以前若只改了后端 session、UI 事件被 active_thread 门控丢掉，就会出现
-                // 「已进 Plan 并停住，但前端仍显示 Build、也没有实施按钮」。
-                if let Some(mode) = update["currentModeId"].as_str() {
-                    let reported = unify_mode_id(mode);
-                    if let Some(r) = self.routes.lock().unwrap().get_mut(session_id) {
-                        r.applied_mode = Some(reported.clone());
-                    }
-                    if thread.mode.as_deref() != Some(reported.as_str()) {
-                        thread.mode = Some(reported.clone());
-                        thread.updated_at = now_ms();
+                    if completed {
                         store.save();
-                        self.emit_update(
-                            &thread_id,
-                            json!({ "t": "mode", "mode": reported }),
-                        );
                     }
                 }
-            }
-            "available_commands_update" => {
-                self.capture_commands(update);
-            }
-            _ => {
-                // user_message_chunk（load 回放）等忽略
-            }
+                "plan" => {
+                    let entries = update["entries"].clone();
+                    thread.plan = Some(entries.clone());
+                    thread.updated_at = now_ms();
+                    self.emit_update(&thread_id, json!({ "t": "plan", "plan": entries }));
+                }
+                "current_mode_update" => {
+                    // agent 自发切模式（Cursor SwitchMode / Devin 进 plan 等）：同步到统一
+                    // Build/Plan，更新选择器，并让轮次结束时能弹出「实施此计划」。
+                    // 以前若只改了后端 session、UI 事件被 active_thread 门控丢掉，就会出现
+                    // 「已进 Plan 并停住，但前端仍显示 Build、也没有实施按钮」。
+                    if let Some(mode) = update["currentModeId"].as_str() {
+                        let reported = unify_mode_id(mode);
+                        if let Some(r) = self.routes.lock().unwrap().get_mut(session_id) {
+                            r.applied_mode = Some(reported.clone());
+                        }
+                        if thread.mode.as_deref() != Some(reported.as_str()) {
+                            thread.mode = Some(reported.clone());
+                            thread.updated_at = now_ms();
+                            store.save();
+                            self.emit_update(&thread_id, json!({ "t": "mode", "mode": reported }));
+                        }
+                    }
+                }
+                "available_commands_update" => {
+                    self.capture_commands(update);
+                }
+                _ => {
+                    // user_message_chunk（load 回放）等忽略
+                }
             }
         }
     }
@@ -2301,10 +2296,7 @@ impl AcpManager {
 
     /// Plan 模式产出的正文：前端据此展示「实施此计划 / 继续规划」。
     fn emit_proposed_plan(&self, thread_id: &str, text: Option<String>) {
-        self.emit_update(
-            thread_id,
-            json!({ "t": "proposed_plan", "text": text }),
-        );
+        self.emit_update(thread_id, json!({ "t": "proposed_plan", "text": text }));
     }
 
     fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<String>) {
@@ -3113,7 +3105,10 @@ impl AcpManager {
                 // 优先把 CLI 短 id 拆成基座模型 + fast 开关，用 set_config_option 分别下发。
                 // 这样选择 `composer-2.5` 会显式设置 fast=false，避免被 Cursor 默认成 fast。
                 if self.kind == AgentKind::Cursor {
-                    match self.apply_cursor_parameterized_model(conn, sid, &model).await {
+                    match self
+                        .apply_cursor_parameterized_model(conn, sid, &model)
+                        .await
+                    {
                         Some(true) => return,
                         Some(false) => {
                             self.mark_model_applied_with_warn(
@@ -3440,11 +3435,9 @@ impl AcpManager {
                 }
                 Err(e) => {
                     last_err = e;
-                    let dead = is_process_exit_error(&last_err)
-                        || !conn.alive.load(Ordering::SeqCst);
-                    if attempt < max_attempts
-                        && (is_retriable_rpc_error(&last_err) || dead)
-                    {
+                    let dead =
+                        is_process_exit_error(&last_err) || !conn.alive.load(Ordering::SeqCst);
+                    if attempt < max_attempts && (is_retriable_rpc_error(&last_err) || dead) {
                         let delay_ms = retriable_backoff_ms(attempt);
                         self.push_log(format!(
                             "[nova] session/new 瞬时失败（第{attempt}/{max_attempts}次）：{last_err}，{delay_ms}ms 后重试"
@@ -3910,11 +3903,8 @@ impl AcpManager {
                         })
                     };
                     if let Some(ctx) = ctx {
-                        prompt = Self::build_user_prompt_blocks(
-                            text,
-                            images,
-                            include_runtime_guidance,
-                        );
+                        prompt =
+                            Self::build_user_prompt_blocks(text, images, include_runtime_guidance);
                         prompt.insert(0, json!({ "type": "text", "text": ctx }));
                     }
                 }
@@ -3979,8 +3969,8 @@ impl AcpManager {
                 }
                 Err(e) => {
                     last_err = e;
-                    let dead = is_process_exit_error(&last_err)
-                        || !conn.alive.load(Ordering::SeqCst);
+                    let dead =
+                        is_process_exit_error(&last_err) || !conn.alive.load(Ordering::SeqCst);
                     if !is_retriable_rpc_error(&last_err) && !dead {
                         break;
                     }
@@ -4002,13 +3992,11 @@ impl AcpManager {
                             let mut store = state.store.lock().unwrap();
                             if let Some(thread) = store.get_mut(thread_id) {
                                 let item = thread.push_system(
-                                    "云端连接短暂中断，本轮已保留已生成内容；可直接继续发送。".into(),
+                                    "云端连接短暂中断，本轮已保留已生成内容；可直接继续发送。"
+                                        .into(),
                                     "warn",
                                 );
-                                self.emit_update(
-                                    thread_id,
-                                    json!({ "t": "upsert", "item": item }),
-                                );
+                                self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
                             }
                             store.save();
                         }
@@ -4657,8 +4645,7 @@ fn parse_cursor_models(out: &str) -> Vec<(String, String)> {
         .into_iter()
         .filter_map(|(base, ds)| {
             let first = *ds.first()?;
-            (ds.len() >= 2 && first != 0 && ds.iter().all(|d| *d == first))
-                .then_some((base, first))
+            (ds.len() >= 2 && first != 0 && ds.iter().all(|d| *d == first)).then_some((base, first))
         })
         .collect();
 
@@ -4673,7 +4660,13 @@ fn parse_cursor_models(out: &str) -> Vec<(String, String)> {
         };
         let display = cursor_display_name(&r.name, &r.base_key, shown_effort, r.fast);
         // 无强度段即 CLI 缺省档，按 Medium 档参与排序
-        entries.push((base_idx, r.fast, shown_effort.unwrap_or(2), r.id.clone(), display));
+        entries.push((
+            base_idx,
+            r.fast,
+            shown_effort.unwrap_or(2),
+            r.id.clone(),
+            display,
+        ));
     }
     entries.sort_by_key(|e| (e.0, e.1, e.2));
     entries
@@ -5222,11 +5215,17 @@ impl CursorToolDetails {
 }
 
 fn is_generic_cursor_mcp_title(title: &str) -> bool {
-    matches!(title.trim().to_ascii_lowercase().as_str(), "mcp: tool" | "mcp tool")
+    matches!(
+        title.trim().to_ascii_lowercase().as_str(),
+        "mcp: tool" | "mcp tool"
+    )
 }
 
 fn cursor_tool_title(tool_name: &str) -> String {
-    format!("MCP: {}", tool_name.strip_prefix("mcp_").unwrap_or(tool_name))
+    format!(
+        "MCP: {}",
+        tool_name.strip_prefix("mcp_").unwrap_or(tool_name)
+    )
 }
 
 fn apply_cursor_tool_details(update: &mut Value, details: &CursorToolDetails, terminal: bool) {
@@ -5561,13 +5560,20 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
             .iter()
             .find(|(id, _)| id == "gpt-5.3-codex-xhigh-fast")
             .unwrap();
-        assert!(xfast.1.contains("XHigh") && xfast.1.contains("Fast"), "{}", xfast.1);
+        assert!(
+            xfast.1.contains("XHigh") && xfast.1.contains("Fast"),
+            "{}",
+            xfast.1
+        );
         let max_low = parsed
             .iter()
             .find(|(id, _)| id == "gpt-5.1-codex-max-low")
             .unwrap();
         // `max` 属于模型名，`low` 才是强度
-        assert_eq!(cursor_variant_dims("gpt-5.1-codex-max-low").0, "gpt-5.1-codex-max");
+        assert_eq!(
+            cursor_variant_dims("gpt-5.1-codex-max-low").0,
+            "gpt-5.1-codex-max"
+        );
         assert_eq!(max_low.1, "Codex 5.1 Max Low");
         // grok 家族 id 后缀档位（medium/high/xhigh）比 CLI 营销档位（Low/Medium/顶档）整体高一档，
         // ≥2 个变体佐证同一 -1 偏移，显示名按营销档位对齐，避免造出 Cursor 里不存在的 "XHigh"。
@@ -5576,10 +5582,7 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
             .find(|(id, _)| id == "grok-4.5-medium")
             .unwrap();
         assert_eq!(grok_med.1, "Cursor Grok 4.5 Low");
-        let grok_high = parsed
-            .iter()
-            .find(|(id, _)| id == "grok-4.5-high")
-            .unwrap();
+        let grok_high = parsed.iter().find(|(id, _)| id == "grok-4.5-high").unwrap();
         assert_eq!(grok_high.1, "Cursor Grok 4.5 Medium");
         // id 仍是真实 CLI id（启动时 --model 直传），只有显示名跟随营销档位。
         let grok_x = parsed
@@ -5725,7 +5728,9 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
         assert!(is_retriable_rpc_error(
             "RetriableError: [unavailable] PING timed out"
         ));
-        assert!(is_retriable_rpc_error("Error: RetriableError: Connection stalled"));
+        assert!(is_retriable_rpc_error(
+            "Error: RetriableError: Connection stalled"
+        ));
         assert!(is_retriable_rpc_error("connect ETIMEDOUT"));
         assert!(is_retriable_rpc_error("socket hang up"));
         assert!(is_retriable_rpc_error("stall_detector"));

@@ -13,10 +13,8 @@
 //! 断线重连：SSE 断开后指数退避重连；每条定向消息有服务端分配的 seq，重连时带
 //! since=<最后 seq> 补发漏掉的消息，保证不丢、不影响使用。
 
+use crate::clues::{CaptureClueResult, ClueContextSnapshot, ClueNodeGroup, EV_CLUES};
 use crate::credential_roaming::CredentialBundle;
-use crate::clues::{
-    CaptureClueResult, ClueContextSnapshot, ClueNodeGroup, EV_CLUES,
-};
 use crate::settings::Settings;
 use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, Worktree};
 use crate::AppState;

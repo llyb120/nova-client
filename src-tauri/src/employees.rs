@@ -3069,7 +3069,11 @@ fn thread_chain_root(app: &AppHandle, thread_id: &str) -> String {
         let Some(t) = store.get(&cur) else {
             break;
         };
-        match t.parent_thread_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        match t
+            .parent_thread_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
             Some(p) if p != cur => cur = p.to_string(),
             _ => break,
         }
@@ -3714,8 +3718,8 @@ fn run_cycle(app: AppHandle, emp: Employee, manual: bool) {
 
         if let Some(m) = inhand {
             let prior_thread = dev_thread_get(&scope, &m.key).filter(|t| thread_alive(&app, t));
-            let extra = crate::notice::take_injection(&app, &emp.id, &scope, &m.key)
-                .unwrap_or_default();
+            let extra =
+                crate::notice::take_injection(&app, &emp.id, &scope, &m.key).unwrap_or_default();
             develop_and_conclude(
                 &app,
                 &emp,
@@ -3833,8 +3837,8 @@ fn run_cycle(app: AppHandle, emp: Employee, manual: bool) {
         });
         if let Some(m) = inhand {
             let prior_thread = dev_thread_get(&scope, &m.key).filter(|t| thread_alive(&app, t));
-            let extra = crate::notice::take_injection(&app, &emp.id, &scope, &m.key)
-                .unwrap_or_default();
+            let extra =
+                crate::notice::take_injection(&app, &emp.id, &scope, &m.key).unwrap_or_default();
             develop_and_conclude(
                 &app,
                 &emp,
@@ -4419,9 +4423,7 @@ async fn develop_and_conclude(
         .unwrap_or_else(|| "（本轮没有产生文字总结）".to_string());
 
     // 若本棒是「答讨论」：用本轮产出作为意见回程，交还发起方（串行 wake-do）。
-    if let Some(notice_id) =
-        crate::notice::pending_discuss_id(app, &emp.id, scope, key)
-    {
+    if let Some(notice_id) = crate::notice::pending_discuss_id(app, &emp.id, scope, key) {
         let _ = crate::notice::respond_notice(
             app,
             &notice_id,
@@ -5334,8 +5336,7 @@ async fn run_wake(
                         ..Default::default()
                     };
                     if cmd.question.trim().is_empty() {
-                        cmd.question =
-                            format!("（原 to「{to}」不存在）请协助判断如何推进。");
+                        cmd.question = format!("（原 to「{to}」不存在）请协助判断如何推进。");
                     }
                     let _ = exec_inbox_command(app, cmd).await;
                     rename_thread(app, &thread_id, &format!("[{}] Wake · 候旨", emp.name));
@@ -5512,9 +5513,7 @@ fn wake_context_blocks(prior_note: &str, extra: &str) -> (String, String, String
         || extra.contains("遵照批示")
     {
         edict.push_str(extra);
-    } else if prior.contains("主管批示")
-        || prior.contains("留中不发")
-        || prior.contains("遵照批示")
+    } else if prior.contains("主管批示") || prior.contains("留中不发") || prior.contains("遵照批示")
     {
         edict.push_str(prior);
     } else {
@@ -6791,9 +6790,7 @@ fn tools_manual_cli(
             "【工具】请用下面的 nova CLI（经 shell 执行）。读工具查资料；写工具提前落地 NEXT_ACTION。\n不要调用 MCP。\n",
         )
     } else {
-        String::from(
-            "【工具】请用下面的 nova CLI（经 shell 执行）做只读检索。\n不要调用 MCP。\n",
-        )
+        String::from("【工具】请用下面的 nova CLI（经 shell 执行）做只读检索。\n不要调用 MCP。\n")
     };
     if cfg!(windows) {
         s.push_str("PowerShell 注意：必须保留 `& \"...exe\" 参数...`。\n");
@@ -7684,7 +7681,10 @@ text after"#,
 
     #[test]
     fn supervision_forces_do_detects_批示() {
-        assert!(supervision_forces_do("", "【主管已在御书房批阅你上奏的折子】\n主管批示：先别改"));
+        assert!(supervision_forces_do(
+            "",
+            "【主管已在御书房批阅你上奏的折子】\n主管批示：先别改"
+        ));
         assert!(supervision_forces_do("留中不发", ""));
         assert!(!supervision_forces_do("普通进展", "继续排查"));
     }

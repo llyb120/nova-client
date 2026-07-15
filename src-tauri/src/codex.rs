@@ -1241,7 +1241,12 @@ impl CodexManager {
     }
 
     /// 读取已落库的 assistant/thought 正文（plan 终稿为空时回退用）
-    fn local_text_item(&self, thread_id: &str, remote_item_id: &str, thought: bool) -> Option<String> {
+    fn local_text_item(
+        &self,
+        thread_id: &str,
+        remote_item_id: &str,
+        thought: bool,
+    ) -> Option<String> {
         let local_id = self.item_ids.lock().unwrap().get(remote_item_id).cloned()?;
         let state = self.app.state::<AppState>();
         let store = state.store.lock().unwrap();
@@ -2323,10 +2328,7 @@ impl CodexManager {
 
     /// Plan 模式产出的 proposed plan 正文：前端据此展示「实施此计划 / 继续规划」。
     fn emit_proposed_plan(&self, thread_id: &str, text: Option<String>) {
-        self.emit_update(
-            thread_id,
-            json!({ "t": "proposed_plan", "text": text }),
-        );
+        self.emit_update(thread_id, json!({ "t": "proposed_plan", "text": text }));
     }
 
     fn notify_done(&self, thread_id: &str, stop_reason: &str) {

@@ -61,9 +61,7 @@ pub fn show(
         let _ = on_activate; // macOS 通知点击无法可靠带自定义回调
         let title_esc = escape_applescript(title);
         let body_esc = escape_applescript(body);
-        let script = format!(
-            "display notification \"{body_esc}\" with title \"{title_esc}\""
-        );
+        let script = format!("display notification \"{body_esc}\" with title \"{title_esc}\"");
         let _ = std::process::Command::new("osascript")
             .args(["-e", &script])
             .stdout(std::process::Stdio::null())
@@ -78,13 +76,7 @@ pub fn show(
 }
 
 /// 任务结束通知：点击（Windows）跳转到会话。
-pub fn notify_thread_done(
-    app: &AppHandle,
-    thread_id: &str,
-    title: &str,
-    body: &str,
-    event: &str,
-) {
+pub fn notify_thread_done(app: &AppHandle, thread_id: &str, title: &str, body: &str, event: &str) {
     let app2 = app.clone();
     let tid = thread_id.to_string();
     let event = event.to_string();
@@ -134,7 +126,6 @@ pub fn notify_roam_request(app: &AppHandle, from_name: &str, folder_name: &str) 
         })),
     );
 }
-
 
 #[cfg(target_os = "macos")]
 fn escape_applescript(s: &str) -> String {

@@ -271,10 +271,12 @@ fn acquire_single_instance() -> Option<SingleInstanceGuard> {
                 .open(fallback)
             {
                 Ok(f) => return Some(SingleInstanceGuard { file: f }),
-                Err(_) => return Some(SingleInstanceGuard {
-                    // /dev/null 几乎总是可读
-                    file: std::fs::File::open("/dev/null").ok()?,
-                }),
+                Err(_) => {
+                    return Some(SingleInstanceGuard {
+                        // /dev/null 几乎总是可读
+                        file: std::fs::File::open("/dev/null").ok()?,
+                    });
+                }
             }
         }
     };

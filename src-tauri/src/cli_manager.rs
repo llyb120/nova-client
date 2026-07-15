@@ -163,8 +163,7 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
             }
         }
         AgentKind::ClaudeCode => {
-            let (install_program, install_args) =
-                npm_installer("@anthropic-ai/claude-code@latest");
+            let (install_program, install_args) = npm_installer("@anthropic-ai/claude-code@latest");
             CliSpec {
                 kind: kind.clone(),
                 cli_name: "claude-code-cli",
@@ -188,8 +187,7 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
             let (install_program, install_args) =
                 elevated_powershell_script_installer("https://cursor.com/install?win32=true");
             #[cfg(not(windows))]
-            let (install_program, install_args) =
-                script_installer("https://cursor.com/install");
+            let (install_program, install_args) = script_installer("https://cursor.com/install");
             CliSpec {
                 kind: kind.clone(),
                 cli_name: "cursor-agent-cli",
@@ -663,8 +661,7 @@ pub async fn upgrade(
             stop_backend(state, &kind).await;
             if kind == AgentKind::Devin && devin_process_running() {
                 return Err(
-                    "检测到仍在运行的 devin 进程。请先结束 Nova 之外的 Devin 进程再升级。"
-                        .into(),
+                    "检测到仍在运行的 devin 进程。请先结束 Nova 之外的 Devin 进程再升级。".into(),
                 );
             }
         }
@@ -735,15 +732,7 @@ pub async fn upgrade(
             0,
             format!("已取消{action} {}", kind.label()),
         ),
-        Err(error) => emit_operation_progress(
-            app,
-            operation_id,
-            &kind,
-            action,
-            "failed",
-            0,
-            error,
-        ),
+        Err(error) => emit_operation_progress(app, operation_id, &kind, action, "failed", 0, error),
     }
     result
 }
@@ -779,7 +768,10 @@ pub async fn ensure_installed(
     }
     let status = upgrade(app, state, kind, settings, operation_id).await?;
     if !status.installed {
-        return Err(format!("{} 安装完成，但 Nova 仍未找到可执行文件", status.cli_name));
+        return Err(format!(
+            "{} 安装完成，但 Nova 仍未找到可执行文件",
+            status.cli_name
+        ));
     }
     Ok(status)
 }

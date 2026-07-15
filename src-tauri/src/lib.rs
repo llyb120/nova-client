@@ -2,7 +2,6 @@ mod acp;
 mod agent_config;
 mod cli;
 mod cli_manager;
-mod tool_api;
 mod clues;
 mod codex;
 mod credential_roaming;
@@ -21,6 +20,7 @@ mod settings;
 mod skills;
 mod sys_notify;
 mod threads;
+mod tool_api;
 mod updater;
 
 /// 临时会话目录的统一父目录名（前端据此识别并显示「临时会话」）
@@ -243,11 +243,7 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
         settings.session_auto_cleanup_hours
     };
     let now = now_ms();
-    let permanently_removed = state
-        .thread_trash
-        .lock()
-        .unwrap()
-        .purge_expired(now, hours);
+    let permanently_removed = state.thread_trash.lock().unwrap().purge_expired(now, hours);
     for thread in permanently_removed {
         if thread.cwd.contains(SCRATCH_MARK) {
             let _ = std::fs::remove_dir_all(thread.cwd);
@@ -278,7 +274,12 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
     if threads.is_empty() {
         return 0;
     }
-    if let Err(error) = state.thread_trash.lock().unwrap().move_to_trash(threads, now) {
+    if let Err(error) = state
+        .thread_trash
+        .lock()
+        .unwrap()
+        .move_to_trash(threads, now)
+    {
         eprintln!("[session-cleanup] 移入回收站失败：{error}");
         return 0;
     }
@@ -475,8 +476,7 @@ async fn upgrade_cli(
     settings: Settings,
     operation_id: String,
 ) -> Result<cli_manager::CliStatus, String> {
-    let status =
-        cli_manager::upgrade(&app, &state, agent_kind, &settings, &operation_id).await?;
+    let status = cli_manager::upgrade(&app, &state, agent_kind, &settings, &operation_id).await?;
     spawn_backend_availability_check(app);
     Ok(status)
 }
@@ -539,9 +539,7 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
 }
 
 #[tauri::command]
-async fn list_clue_groups(
-    state: State<'_, AppState>,
-) -> Result<Vec<clues::ClueNodeGroup>, String> {
+async fn list_clue_groups(state: State<'_, AppState>) -> Result<Vec<clues::ClueNodeGroup>, String> {
     if state.relay.is_configured() {
         let groups = state.relay.clue_list().await?;
         let _ = state.clues.lock().unwrap().replace(groups.clone());
@@ -3786,9 +3784,7 @@ pub fn run() {
                 eprintln!("[agent-config] 启动同步失败：{error}");
             }
             // 上次若异常退出，租借凭证明文目录可能没走正常清理；启动第一时间删除。
-            let _ = std::fs::remove_dir_all(
-                std::env::temp_dir().join("Nova-borrowed-credentials"),
-            );
+            let _ = std::fs::remove_dir_all(std::env::temp_dir().join("Nova-borrowed-credentials"));
 
             // 清理上次自更新留下的旧 exe
             updater::cleanup_old();
