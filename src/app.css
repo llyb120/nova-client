@@ -1619,7 +1619,8 @@ button {
 }
 
 .composer-input {
-  flex: 1;
+  /* flex:1 会在纵向 flex 的 .composer 里抢走内容测高，导致无法随输入撑开 */
+  flex: 0 0 auto;
   display: block;
   width: 100%;
   background: none;

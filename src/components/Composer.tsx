@@ -39,7 +39,9 @@ export function Composer() {
   const resizeInput = () => {
     if (!textareaRef) return;
     textareaRef.style.height = "auto";
-    textareaRef.style.height = textareaRef.scrollHeight + "px";
+    const maxPx = Number.parseFloat(getComputedStyle(textareaRef).maxHeight);
+    const next = textareaRef.scrollHeight;
+    textareaRef.style.height = (Number.isFinite(maxPx) ? Math.min(next, maxPx) : next) + "px";
   };
 
   createEffect(() => {
