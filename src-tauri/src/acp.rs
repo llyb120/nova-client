@@ -1580,7 +1580,11 @@ impl AcpManager {
             args_str = format!("--model {model} {args_str}");
         }
         #[cfg(windows)]
-        let mut cmd = build_acp_command(&program, &args_str);
+        let mut cmd = if self.kind == AgentKind::Cursor {
+            build_cursor_command(&program, &args_str)
+        } else {
+            build_acp_command(&program, &args_str)
+        };
         #[cfg(not(windows))]
         let mut cmd = {
             let mut c = tokio::process::Command::new(&program);
@@ -4471,6 +4475,37 @@ mod cursor_windows_hide_tests {
             r#"--trace-warnings --require "C:/Nova Data/cursor-windows-hide.cjs""#
         );
     }
+
+    #[test]
+    fn cursor_script_launches_bundled_node_directly() {
+        let root =
+            std::env::temp_dir().join(format!("nova-cursor-launch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let launcher = root.join("cursor-agent.cmd");
+        let node = root.join("node.exe");
+        let index = root.join("index.js");
+        for path in [&launcher, &node, &index] {
+            std::fs::write(path, []).unwrap();
+        }
+
+        let command = build_cursor_command(launcher.to_str().unwrap(), "--model test acp");
+        let command = command.as_std();
+        assert_eq!(command.get_program(), node.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                index.as_os_str(),
+                std::ffi::OsStr::new("--model"),
+                std::ffi::OsStr::new("test"),
+                std::ffi::OsStr::new("acp"),
+            ]
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "CURSOR_INVOKED_AS" && value == Some(launcher.file_name().unwrap())
+        }));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn cursor_node_path_for_program(program: &str) -> Option<PathBuf> {
@@ -4497,6 +4532,41 @@ fn cursor_node_path_for_program(program: &str) -> Option<PathBuf> {
         .filter(|path| path.is_file())
         .max_by(|left, right| left.parent().cmp(&right.parent()));
     bundled.or_else(|| resolve_program_on_path("node"))
+}
+
+/// Cursor 的 Windows 启动器是 cmd -> powershell -> node。即使外层 cmd 使用
+/// CREATE_NO_WINDOW，powershell 仍可能重新分配控制台；对脚本启动器直接运行随附的 Node。
+#[cfg(windows)]
+fn build_cursor_command(program: &str, args_str: &str) -> tokio::process::Command {
+    let launcher = resolve_program_on_path(program);
+    let is_script = launcher
+        .as_deref()
+        .and_then(Path::extension)
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "cmd" | "bat" | "ps1"
+            )
+        });
+    if is_script {
+        if let Some(node) = cursor_node_path_for_program(program) {
+            let index = node.with_file_name("index.js");
+            if index.is_file() {
+                let invoked_as = launcher
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .unwrap_or_else(|| std::ffi::OsStr::new(program));
+                let mut command = tokio::process::Command::new(node);
+                command
+                    .arg(index)
+                    .args(args_str.split_whitespace())
+                    .env("CURSOR_INVOKED_AS", invoked_as);
+                return command;
+            }
+        }
+    }
+    build_acp_command(program, args_str)
 }
 
 /// Windows：构造 ACP agent 启动命令。
@@ -4562,7 +4632,7 @@ async fn run_cursor_models_cli(
     proxy: &str,
 ) -> Result<Vec<(String, String)>, String> {
     #[cfg(windows)]
-    let mut cmd = build_acp_command(program, "models");
+    let mut cmd = build_cursor_command(program, "models");
     #[cfg(not(windows))]
     let mut cmd = {
         let mut c = tokio::process::Command::new(program);
