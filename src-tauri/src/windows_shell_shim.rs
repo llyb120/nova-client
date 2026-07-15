@@ -1,0 +1,169 @@
+//! Windows 后端通用 shell 微型 shim。
+//!
+//! 父进程的 `CREATE_NO_WINDOW` 不会强制继承给孙进程；Node `child_process` 补丁也覆盖不到
+//! node-pty / ConPTY 等原生启动路径。构建时生成一个纯 std 的 GUI-subsystem helper，嵌入
+//! Nova.exe，运行时按内容哈希释放，并以硬链接映射为 cmd/powershell/pwsh。主发布包仍是单文件。
+#![cfg(windows)]
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use sha2::{Digest, Sha256};
+use tauri::AppHandle;
+
+const SHELL_SHIM_EXE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nova-shell-shim.exe"));
+const CMD_REAL: &str = "NOVA_SHELL_SHIM_CMD_REAL";
+const POWERSHELL_REAL: &str = "NOVA_SHELL_SHIM_POWERSHELL_REAL";
+const PWSH_REAL: &str = "NOVA_SHELL_SHIM_PWSH_REAL";
+
+#[derive(Clone)]
+struct ShellShim {
+    dir: PathBuf,
+    cmd: PathBuf,
+    powershell: PathBuf,
+    pwsh: Option<PathBuf>,
+}
+
+static SHELL_SHIM: OnceLock<Result<ShellShim, String>> = OnceLock::new();
+
+fn system32() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+}
+
+fn real_cmd() -> PathBuf {
+    let path = system32().join("cmd.exe");
+    if path.is_file() {
+        path
+    } else {
+        crate::acp::resolve_program_on_path("cmd").unwrap_or(path)
+    }
+}
+
+fn real_powershell() -> PathBuf {
+    let path = system32()
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if path.is_file() {
+        path
+    } else {
+        crate::acp::resolve_program_on_path("powershell").unwrap_or(path)
+    }
+}
+
+fn content_key() -> String {
+    Sha256::digest(SHELL_SHIM_EXE)[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_helper(dir: &Path) -> Result<PathBuf, String> {
+    let helper = dir.join("nova-shell-shim.exe");
+    if std::fs::read(&helper).ok().as_deref() != Some(SHELL_SHIM_EXE) {
+        let temp = dir.join(format!("nova-shell-shim-{}.tmp", std::process::id()));
+        std::fs::write(&temp, SHELL_SHIM_EXE)
+            .map_err(|e| format!("写入 Windows shell shim 临时文件失败：{e}"))?;
+        let _ = std::fs::remove_file(&helper);
+        std::fs::rename(&temp, &helper).map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            format!("安装 Windows shell shim 失败：{e}")
+        })?;
+    }
+    Ok(helper)
+}
+
+fn ensure_alias(helper: &Path, dir: &Path, name: &str) -> Result<(), String> {
+    let dest = dir.join(name);
+    if std::fs::read(&dest).ok().as_deref() == Some(SHELL_SHIM_EXE) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&dest);
+    if std::fs::hard_link(helper, &dest).is_err() {
+        std::fs::copy(helper, &dest)
+            .map_err(|e| format!("创建 Windows shell shim {name} 失败：{e}"))?;
+    }
+    Ok(())
+}
+
+fn init(app: &AppHandle) -> Result<ShellShim, String> {
+    let dir = crate::nova_data_dir(app)
+        .join("runtime")
+        .join("windows-shell-shim")
+        .join(content_key());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 Windows shell shim 目录失败：{e}"))?;
+    let helper = write_helper(&dir)?;
+    ensure_alias(&helper, &dir, "cmd.exe")?;
+    ensure_alias(&helper, &dir, "powershell.exe")?;
+
+    let pwsh = crate::acp::resolve_program_on_path("pwsh");
+    if pwsh.is_some() {
+        ensure_alias(&helper, &dir, "pwsh.exe")?;
+    }
+    Ok(ShellShim {
+        dir,
+        cmd: real_cmd(),
+        powershell: real_powershell(),
+        pwsh,
+    })
+}
+
+/// 给所有 Windows 后端前置微型 shell helper。PATH 覆盖原生裸名启动，ComSpec 覆盖
+/// `shell:true` / cross-spawn；真实 shell 使用绝对路径，避免递归。
+pub(crate) fn apply(
+    app: &AppHandle,
+    command: &mut tokio::process::Command,
+    launch_env: &HashMap<String, String>,
+) -> Result<(), String> {
+    let shim = SHELL_SHIM.get_or_init(|| init(app)).clone()?;
+    command.env(CMD_REAL, &shim.cmd);
+    command.env(POWERSHELL_REAL, &shim.powershell);
+    if let Some(pwsh) = shim.pwsh.as_ref() {
+        command.env(PWSH_REAL, pwsh);
+    }
+
+    let base_path = launch_env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let mut paths = vec![shim.dir.clone()];
+    paths.extend(std::env::split_paths(&base_path));
+    let joined = std::env::join_paths(paths)
+        .map_err(|e| format!("拼接 Windows shell shim PATH 失败：{e}"))?;
+    command.env("PATH", joined);
+    command.env("ComSpec", shim.dir.join("cmd.exe"));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_helper_is_windows_executable() {
+        assert!(SHELL_SHIM_EXE.starts_with(b"MZ"));
+        assert!(SHELL_SHIM_EXE.len() < 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn helper_aliases_share_one_payload() {
+        let root = std::env::temp_dir().join(format!("nova-shell-shim-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let helper = write_helper(&root).unwrap();
+        ensure_alias(&helper, &root, "cmd.exe").unwrap();
+        ensure_alias(&helper, &root, "powershell.exe").unwrap();
+        assert_eq!(std::fs::read(root.join("cmd.exe")).unwrap(), SHELL_SHIM_EXE);
+        assert_eq!(
+            std::fs::read(root.join("powershell.exe")).unwrap(),
+            SHELL_SHIM_EXE
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+}

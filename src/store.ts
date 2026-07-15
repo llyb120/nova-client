@@ -362,7 +362,7 @@ export async function ensureModelOptions(agentKind: AgentKind) {
     // 选项就绪后回填友好名，供下次冷启动触发器使用
     const model = lastUsed.model(agentKind);
     const name = modelChoices(agentKind).find((c) => c.value === model)?.name;
-    if (model && name) lastUsed.setModel(agentKind, model, undefined, name);
+    if (model && name) lastUsed.setModelName(agentKind, name);
   } catch {
     // 模型列表拉取失败不影响会话发送，后端仍可使用 agent 默认模型
   } finally {
@@ -932,8 +932,7 @@ export async function openThread(id: string) {
     if (state.currentId !== id) return;
     rememberThreadSnapshot(t);
     const agentKind = t.agentKind ?? "devin";
-    // 仅「显式选择」和「新建会话」才更新 lastUsed；查看已有会话只同步 UI（showThreadSnapshot），
-    // 不写 lastUsed——否则打开一条用后端默认模型跑的旧会话，会覆盖该项目/全局记住的模型偏好。
+    // 只有本地 createThread 成功后才更新模型偏好；打开、恢复、会话内切换和漫游只同步 UI。
     showThreadSnapshot(t, false, !!cached);
     // 漫游 / 额度租借：拉取对端模型列表；普通本地会话才探测本机后端。
     const roamingPeer =
@@ -992,7 +991,13 @@ export async function createThread(
   );
   rememberThreadSnapshot(t);
   const storedAgentKind = t.agentKind ?? agentKind;
-  rememberThreadConfig(storedAgentKind, t.cwd, t.model, t.mode, t.reasoningEffort);
+  // 本地 createThread 是唯一写入模型偏好的入口；漫游和额度租借走各自创建函数，不会到这里。
+  lastUsed.setAgentKind(storedAgentKind);
+  lastUsed.setModel(agentKind, model, cwd);
+  lastUsed.setMode(storedAgentKind, t.mode ?? "");
+  if (storedAgentKind === "codex") {
+    lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
+  }
   setState("expanded", reconcile({}));
   setState({
     currentId: t.id,
@@ -1060,32 +1065,23 @@ export const lastUsed = {
       localStorage.setItem(`fd:${agentKind}:lastModelName`, resolved);
     }
   },
+  setModelName: (agentKind: AgentKind, name: string, cwd?: string | null) => {
+    const resolved = name.trim();
+    if (!resolved) return;
+    const key = projectStorageKey(cwd);
+    if (key) localStorage.setItem(`fd:${agentKind}:project:${key}:lastModelName`, resolved);
+    localStorage.setItem(`fd:${agentKind}:lastModelName`, resolved);
+  },
   setMode: (agentKind: AgentKind, v: string) =>
     localStorage.setItem(`fd:${agentKind}:lastMode`, v),
   setReasoningEffort: (agentKind: AgentKind, v: string) =>
     localStorage.setItem(`fd:${agentKind}:lastReasoningEffort`, v),
 };
 
-function rememberThreadConfig(
-  agentKind: AgentKind,
-  cwd?: string | null,
-  model?: string | null,
-  mode?: string | null,
-  reasoningEffort?: string | null,
-) {
-  lastUsed.setAgentKind(agentKind);
-  lastUsed.setModel(agentKind, model ?? "", cwd);
-  lastUsed.setMode(agentKind, mode ?? "");
-  if (agentKind === "codex") {
-    lastUsed.setReasoningEffort(agentKind, reasoningEffort ?? "");
-  }
-}
-
 export async function setThreadModel(model: string) {
   const id = state.currentId;
   if (!id) return;
   setState("model", model);
-  lastUsed.setModel(state.agentKind, model, state.cwd);
   await api.setThreadModel(id, model || null);
 }
 
@@ -1102,7 +1098,6 @@ export async function pickThreadModel(agentKind: AgentKind, model: string) {
   const reasoningEffort = agentKind === "codex" ? lastUsed.reasoningEffort(agentKind) : "";
   setState({ agentKind, model, mode, reasoningEffort });
   lastUsed.setAgentKind(agentKind);
-  lastUsed.setModel(agentKind, model, state.cwd);
   void ensureModelOptions(agentKind);
   void refreshSlashCommands(agentKind);
   try {
@@ -1525,7 +1520,7 @@ export async function initStore() {
       setState("modelOptions", payload.agentKind, payload.options);
       const model = lastUsed.model(payload.agentKind);
       const name = modelChoices(payload.agentKind).find((c) => c.value === model)?.name;
-      if (model && name) lastUsed.setModel(payload.agentKind, model, undefined, name);
+      if (model && name) lastUsed.setModelName(payload.agentKind, name);
     } else {
       setState("modelOptions", "devin", payload as ModelOptions);
     }

@@ -140,6 +140,9 @@ export function ChatView() {
   let manualScroll = false;
   let manualScrollMovedAway = false;
   let lastPinnedScrollTop: number | null = null;
+  let userActivelyScrolledDown = false;
+  let lastKnownScrollTop = 0;
+  let pointerScrolling = false;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -194,8 +197,10 @@ export function ChatView() {
 
   const beginManualScroll = () => {
     manualScroll = true;
+    userActivelyScrolledDown = false;
     awaitingSendUserItem = false;
-    lastPinnedScrollTop = null;
+    // 保留程序化钉底位置，直到 scroll 事件确认用户真的离开；否则排队中的旧 scroll
+    // 事件会被误认为用户已滚回底部，并立刻恢复吸底。
     if (settleRaf) {
       cancelAnimationFrame(settleRaf);
       settleRaf = 0;
@@ -204,8 +209,6 @@ export function ChatView() {
 
   const cancelBottomFollow = () => {
     beginManualScroll();
-    // 滚轮/快捷键上滑是明确意图：立刻视为已离开底部，避免等 scroll 事件期间仍被钉底拉回。
-    manualScrollMovedAway = true;
     setStickToBottom(false);
   };
 
@@ -224,8 +227,8 @@ export function ChatView() {
     lastPinnedScrollTop !== null &&
     Math.abs(scrollRef.scrollTop - lastPinnedScrollTop) <= 1;
 
-  // 必须先实际离开底部，再实际回到底部，才恢复自动吸底。
-  // 程序化钉底造成的「回到底部」不能恢复吸底，否则流式输出时刚滑走又被锁回底部。
+  // 恢复吸底条件：用户主动向下滚动到达底部。
+  // 虚拟分组高度变化等被动布局偏移不触发恢复，避免流式输出时刚滑走又被锁回底部。
   const syncManualScroll = () => {
     if (!manualScroll) return;
     if (!isAtBottom()) {
@@ -233,13 +236,15 @@ export function ChatView() {
       setStickToBottom(false);
       return;
     }
-    if (!manualScrollMovedAway || isFromProgrammaticPin()) return;
+    if (!manualScrollMovedAway || !userActivelyScrolledDown || isFromProgrammaticPin()) return;
     manualScroll = false;
     manualScrollMovedAway = false;
+    userActivelyScrolledDown = false;
     setStickToBottom(true);
   };
 
   const finishManualScroll = () => {
+    pointerScrolling = false;
     if (!manualScroll || manualScrollMovedAway) return;
     manualScroll = false;
     if (stickToBottom()) forceScrollToBottom();
@@ -250,24 +255,35 @@ export function ChatView() {
       suspendBottomFollowForToolDetail();
       return;
     }
-    if (event.deltaY >= 0 || !scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
-    cancelBottomFollow();
+    if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
+    if (event.deltaY < 0) {
+      cancelBottomFollow();
+    } else if (event.deltaY > 0 && manualScroll) {
+      userActivelyScrolledDown = true;
+    }
   };
 
   const handlePointerDown = (event: PointerEvent) => {
     if (isToolDetailScroll(event.target)) suspendBottomFollowForToolDetail();
-    else beginManualScroll();
+    else {
+      pointerScrolling = true;
+      beginManualScroll();
+    }
   };
 
   const handleTranscriptScroll = () => {
     refreshVirtualGroups();
-    // 输入事件可能被原生滚动条或嵌套内容吞掉；实际滚动位置才是是否继续吸底的最终依据。
     const fromBottomPin = isFromProgrammaticPin();
+    const currentTop = scrollRef?.scrollTop ?? 0;
     if (!fromBottomPin) {
-      // 用户已离开程序化钉底位置，清标记，避免之后误判为「钉底回到底部」
       if (lastPinnedScrollTop !== null && manualScroll) lastPinnedScrollTop = null;
       if (!manualScroll && stickToBottom() && !isAtBottom()) cancelBottomFollow();
+      // 只有 pointer 拖动期间的向下位移才算用户意图；普通布局/虚拟分组校准不能恢复吸底。
+      if (manualScroll && pointerScrolling && currentTop > lastKnownScrollTop) {
+        userActivelyScrolledDown = true;
+      }
     }
+    lastKnownScrollTop = currentTop;
     syncManualScroll();
   };
 
@@ -276,6 +292,7 @@ export function ChatView() {
     scrollRef.scrollTop = Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight);
     if (ensureSentinel) endRef?.scrollIntoView({ block: "end", inline: "nearest" });
     lastPinnedScrollTop = scrollRef.scrollTop;
+    lastKnownScrollTop = scrollRef.scrollTop;
     refreshVirtualGroups();
   };
 
@@ -296,6 +313,8 @@ export function ChatView() {
     if (settleRaf) cancelAnimationFrame(settleRaf);
     manualScroll = false;
     manualScrollMovedAway = false;
+    userActivelyScrolledDown = false;
+    pointerScrolling = false;
     setStickToBottom(true);
     const deadline = performance.now() + maxMs;
     let lastHeight = -1;
@@ -367,22 +386,33 @@ export function ChatView() {
     ro.observe(innerRef);
 
     const scrollUpKeys = new Set(["ArrowUp", "PageUp", "Home"]);
+    const scrollDownKeys = new Set(["ArrowDown", "PageDown", "End"]);
     const handleScrollKey = (event: KeyboardEvent) => {
       const scrollsUp = scrollUpKeys.has(event.key) || (event.key === " " && event.shiftKey);
-      if (event.altKey || event.ctrlKey || event.metaKey || !scrollsUp) return;
+      const scrollsDown = scrollDownKeys.has(event.key) || (event.key === " " && !event.shiftKey);
+      if (event.altKey || event.ctrlKey || event.metaKey || (!scrollsUp && !scrollsDown)) return;
+      if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
       const target = event.target;
       if (target instanceof Node && target !== document.body && !scrollRef?.contains(target)) return;
       if (
         target instanceof HTMLElement &&
         (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
       ) return;
+      if (scrollsDown) {
+        if (manualScroll) userActivelyScrolledDown = true;
+        return;
+      }
       if (isToolDetailScroll(target)) suspendBottomFollowForToolDetail();
       else cancelBottomFollow();
     };
     window.addEventListener("keydown", handleScrollKey, true);
+    window.addEventListener("pointerup", finishManualScroll, true);
+    window.addEventListener("pointercancel", finishManualScroll, true);
     onCleanup(() => {
       ro.disconnect();
       window.removeEventListener("keydown", handleScrollKey, true);
+      window.removeEventListener("pointerup", finishManualScroll, true);
+      window.removeEventListener("pointercancel", finishManualScroll, true);
       if (settleRaf) cancelAnimationFrame(settleRaf);
       if (viewportRaf) cancelAnimationFrame(viewportRaf);
     });

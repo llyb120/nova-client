@@ -584,9 +584,10 @@ impl CodexManager {
             .kill_on_drop(true);
         crate::acp::apply_proxy_env(&mut cmd, &settings.codex_proxy);
         cmd.envs(&self.launch_env);
-        // 无窗口 shim：拦截后端按裸名拉起的 cmd/powershell，消除残留控制台闪屏。
         #[cfg(windows)]
-        crate::nowindow::apply(&self.app, &mut cmd, &self.launch_env)?;
+        if let Err(e) = crate::windows_shell_shim::apply(&self.app, &mut cmd, &self.launch_env) {
+            self.push_log(format!("[windows-shell-shim] {e}"));
+        }
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         #[cfg(unix)]
