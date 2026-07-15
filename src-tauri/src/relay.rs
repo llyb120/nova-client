@@ -987,13 +987,13 @@ impl RelayManager {
         path: &str,
     ) -> Result<reqwest::RequestBuilder, String> {
         let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
+        let groups = self.groups_csv();
         Ok(self
             .http
             .request(method, format!("{server}{path}"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
             .header("X-Relay-Device", &self.device_id)
+            .query(&[("name", name), ("groups", groups)])
             .timeout(Duration::from_secs(15)))
     }
 
@@ -1014,6 +1014,7 @@ impl RelayManager {
         placement: &str,
         target_card_id: Option<&str>,
     ) -> Result<CaptureClueResult, String> {
+        let author_name = self.cfg().map(|(_, _, name)| name).unwrap_or_default();
         let response = self
             .clue_request(reqwest::Method::POST, "/v1/clues/capture")?
             .json(&json!({
@@ -1022,6 +1023,7 @@ impl RelayManager {
                 "content": content,
                 "placement": placement,
                 "targetCardId": target_card_id.unwrap_or_default(),
+                "authorName": author_name,
             }))
             .send()
             .await
@@ -3662,9 +3664,10 @@ fn relay_display_name(s: &Settings) -> String {
     if !name.is_empty() {
         return name.to_string();
     }
-    std::env::var("COMPUTERNAME")
+    std::env::var("USERNAME")
         .ok()
         .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "Nova".to_string())
 }

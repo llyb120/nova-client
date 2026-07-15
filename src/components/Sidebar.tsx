@@ -110,7 +110,7 @@ export function Sidebar(props: {
     ).length;
     return decisions + active;
   });
-  // 视图切换：第一层是普通模式/证据链，第二层是御书房/数字员工。
+  // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
   const switchView = (view: "home" | "clues" | "employees" | "workbench") => {
     setView(view);
     closeThread();
@@ -122,6 +122,11 @@ export function Sidebar(props: {
 
   // 数字员工（配置）/ 御书房（日常）视图下，左侧切换为「员工会话」这一卷。
   const isEmployeeView = () => state.view === "employees" || state.view === "workbench";
+
+  const openHistoryThread = async (id: string) => {
+    if (state.view === "clues") setView("home");
+    await openThread(id);
+  };
 
   // 按目录分组（普通会话与员工会话共用同一套分组/结构，只是各看各的、不混在一起）。
   // worktree 会话的 cwd 是 uuid 工作目录，不适合展示/分组：归到源仓库组，用分支 badge 区分。
@@ -347,7 +352,7 @@ export function Sidebar(props: {
       <div
         class={`thread-item ${active() ? "active" : ""}`}
         classList={{ child, parent: childCount > 0 }}
-        onClick={() => void openThread(activeThread.id)}
+        onClick={() => void openHistoryThread(activeThread.id)}
         onContextMenu={(e) => {
           // 目前只有 worktree 会话有右键动作（合并到分支）；漫游 guest 的 worktree 在对端，不提供
           if (!activeThread.worktree?.path) return;
@@ -501,11 +506,11 @@ export function Sidebar(props: {
           <IconPlus size={15} />
           新对话
         </button>
-        <div class="mode-stack" role="tablist" aria-label="会话卷宗">
+        <div class="mode-stack" role="tablist" aria-label="主区域">
           <div class="mode-seg">
             <button
               class="mode-seg-btn"
-              classList={{ active: state.view === "home" }}
+              classList={{ active: state.view === "home" || state.view === "clues" }}
               onClick={openHome}
               title="普通模式：查看你自己的会话"
             >
@@ -513,9 +518,9 @@ export function Sidebar(props: {
             </button>
             <button
               class="mode-seg-btn"
-              classList={{ active: state.view === "clues" }}
+              classList={{ open: state.view === "clues" }}
               onClick={openClues}
-              title="证据链：整理线索并沿线索发起新会话"
+              title="打开证据链页面；左侧仍保持普通会话"
             >
               <IconClue size={14} />
               证据链
@@ -571,7 +576,7 @@ export function Sidebar(props: {
               const rows = createMemo(() => threadTreeRows(threads));
               const expanded = () => expandedGroups().has(cwd);
               const collapsible = () =>
-                state.view === "home" && rows().length > COLLAPSED_THREAD_LIMIT;
+                !isEmployeeView() && rows().length > COLLAPSED_THREAD_LIMIT;
               const visibleRows = () =>
                 collapsible() && !expanded()
                   ? rows().slice(0, COLLAPSED_THREAD_LIMIT)
