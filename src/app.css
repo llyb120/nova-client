@@ -1199,6 +1199,8 @@ button {
   padding: 10px;
   max-height: 320px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--text-dim);
@@ -1240,6 +1242,8 @@ button {
   padding: 8px;
   max-height: 200px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--text-faint);

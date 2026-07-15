@@ -210,6 +210,16 @@ export function ChatView() {
     setStickToBottom(false);
   };
 
+  const isToolDetailScroll = (target: EventTarget | null) =>
+    target instanceof Element && !!target.closest(".tool-output, .tool-raw");
+
+  // 工具详情本身可滚动；用户在其中阅读时不应被外层会话自动吸底打断。
+  const suspendBottomFollowForToolDetail = () => {
+    beginManualScroll();
+    manualScrollMovedAway = true;
+    setStickToBottom(false);
+  };
+
   // 必须先实际离开底部，再实际回到底部，才恢复自动吸底。
   const syncManualScroll = () => {
     if (!manualScroll) return;
@@ -231,8 +241,17 @@ export function ChatView() {
   };
 
   const handleWheel = (event: WheelEvent) => {
+    if (isToolDetailScroll(event.target)) {
+      suspendBottomFollowForToolDetail();
+      return;
+    }
     if (event.deltaY >= 0 || !scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
     cancelBottomFollow();
+  };
+
+  const handlePointerDown = (event: PointerEvent) => {
+    if (isToolDetailScroll(event.target)) suspendBottomFollowForToolDetail();
+    else beginManualScroll();
   };
 
   const handleTranscriptScroll = () => {
@@ -339,7 +358,8 @@ export function ChatView() {
         target instanceof HTMLElement &&
         (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
       ) return;
-      cancelBottomFollow();
+      if (isToolDetailScroll(target)) suspendBottomFollowForToolDetail();
+      else cancelBottomFollow();
     };
     window.addEventListener("keydown", handleScrollKey, true);
     onCleanup(() => {
@@ -560,7 +580,7 @@ export function ChatView() {
         ref={scrollRef}
         onScroll={handleTranscriptScroll}
         onWheel={handleWheel}
-        onPointerDown={beginManualScroll}
+        onPointerDown={handlePointerDown}
         onPointerUp={finishManualScroll}
         onPointerCancel={finishManualScroll}
       >

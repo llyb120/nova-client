@@ -3043,7 +3043,7 @@ impl AcpManager {
         mode: Option<String>,
     ) {
         self.activate_model_session(conn_key, sid);
-        let (mut need_model, mut need_mode) = {
+        let (mut need_model, need_mode) = {
             let routes = self.routes.lock().unwrap();
             let Some(r) = routes.get(sid) else { return };
             (

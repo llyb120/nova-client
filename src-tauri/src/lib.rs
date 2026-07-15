@@ -886,21 +886,6 @@ fn prewarm(
     }
 }
 
-fn user_home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .or_else(|| {
-            let drive = std::env::var_os("HOMEDRIVE")?;
-            let path = std::env::var_os("HOMEPATH")?;
-            Some(PathBuf::from(format!(
-                "{}{}",
-                drive.to_string_lossy(),
-                path.to_string_lossy()
-            )))
-        })
-}
-
 fn clean_frontmatter_value(value: &str) -> String {
     let trimmed = value.trim();
     trimmed

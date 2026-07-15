@@ -874,10 +874,10 @@ export async function openThread(id: string) {
   if (pair?.wake.id === id && pair.doThread) id = pair.doThread.id;
   const switching = state.currentId !== id;
   if (switching) {
-    discardPendingDeltas();
+    discardPendingStreamUpdates();
     setState("expanded", reconcile({}));
   } else {
-    flushPendingDeltas();
+    flushPendingStreamUpdates();
   }
   const cached = getThreadSnapshot(id);
   if (cached) {
@@ -926,7 +926,7 @@ export async function openThread(id: string) {
 }
 
 export function closeThread() {
-  discardPendingDeltas();
+  discardPendingStreamUpdates();
   setState("expanded", reconcile({}));
   const agentKind = lastUsed.agentKind();
   setState({
@@ -1250,6 +1250,11 @@ let deltaFlushTimer: number | undefined;
 let lastDeltaFlush = 0;
 /** delta 合并窗口：足够小保证流式顺滑，配合 leading-edge 让首字几乎即时 */
 const DELTA_FLUSH_MS = 33;
+const pendingToolItems = new Map<number, Extract<Item, { type: "tool" }>>();
+let toolUpdateFlushTimer: number | undefined;
+let lastToolUpdateFlush = 0;
+/** 工具更新是整条快照；比文本增量稍长的窗口可避免详情高频整块重绘。 */
+const TOOL_UPDATE_FLUSH_MS = 50;
 
 function discardPendingDeltas() {
   if (deltaFlushTimer !== undefined) {
@@ -1257,6 +1262,19 @@ function discardPendingDeltas() {
     deltaFlushTimer = undefined;
   }
   pendingDeltas.clear();
+}
+
+function discardPendingToolUpserts() {
+  if (toolUpdateFlushTimer !== undefined) {
+    window.clearTimeout(toolUpdateFlushTimer);
+    toolUpdateFlushTimer = undefined;
+  }
+  pendingToolItems.clear();
+}
+
+function discardPendingStreamUpdates() {
+  discardPendingDeltas();
+  discardPendingToolUpserts();
 }
 
 function flushPendingDeltas() {
@@ -1293,19 +1311,51 @@ function queueDelta(op: Extract<UpdateOp, { t: "delta" }>) {
   deltaFlushTimer = window.setTimeout(flushPendingDeltas, wait);
 }
 
+function applyUpsert(item: Item) {
+  const idx = state.items.findIndex((current) => current.id === item.id);
+  if (idx >= 0) setState("items", idx, reconcile(item));
+  else setState("items", state.items.length, item);
+}
+
+function flushPendingToolUpserts() {
+  if (toolUpdateFlushTimer !== undefined) {
+    window.clearTimeout(toolUpdateFlushTimer);
+    toolUpdateFlushTimer = undefined;
+  }
+  if (pendingToolItems.size === 0) return;
+  lastToolUpdateFlush = performance.now();
+  const items = Array.from(pendingToolItems.values());
+  pendingToolItems.clear();
+  batch(() => {
+    for (const item of items) applyUpsert(item);
+  });
+}
+
+function queueToolItem(item: Extract<Item, { type: "tool" }>) {
+  pendingToolItems.set(item.id, item);
+  if (toolUpdateFlushTimer !== undefined) return;
+  const wait = Math.max(0, TOOL_UPDATE_FLUSH_MS - (performance.now() - lastToolUpdateFlush));
+  toolUpdateFlushTimer = window.setTimeout(flushPendingToolUpserts, wait);
+}
+
+function flushPendingStreamUpdates() {
+  flushPendingDeltas();
+  flushPendingToolUpserts();
+}
+
 function applyOp(op: UpdateOp) {
   if (op.t === "plan") {
-    flushPendingDeltas();
+    flushPendingStreamUpdates();
     setState("plan", op.plan);
     return;
   }
   if (op.t === "proposed_plan") {
-    flushPendingDeltas();
+    flushPendingStreamUpdates();
     setState("proposedPlan", op.text);
     return;
   }
   if (op.t === "mode") {
-    flushPendingDeltas();
+    flushPendingStreamUpdates();
     // 后端偶发上报原生 id（bypass/agent…），归一成 Build/Plan 再进 UI
     const mode = normalizeUnifiedMode(op.mode) ?? op.mode;
     setState("mode", mode);
@@ -1317,7 +1367,7 @@ function applyOp(op: UpdateOp) {
     return;
   }
   if (op.t === "remove") {
-    flushPendingDeltas();
+    flushPendingStreamUpdates();
     setState(
       "items",
       state.items.filter((item) => item.id !== op.itemId),
@@ -1325,10 +1375,15 @@ function applyOp(op: UpdateOp) {
     return;
   }
   // upsert
-  flushPendingDeltas();
-  const idx = state.items.findIndex((i) => i.id === op.item.id);
-  if (idx >= 0) setState("items", idx, reconcile(op.item));
-  else setState("items", state.items.length, op.item);
+  if (op.item.type === "tool") {
+    queueToolItem(op.item);
+    if (op.item.status !== "pending" && op.item.status !== "in_progress") {
+      flushPendingStreamUpdates();
+    }
+    return;
+  }
+  flushPendingStreamUpdates();
+  applyUpsert(op.item);
 }
 
 let initialized = false;
@@ -1572,7 +1627,7 @@ export async function initStore() {
     if (state.currentId !== id) return;
     void api.getThread(id).then((t) => {
       if (state.currentId !== id) return;
-      flushPendingDeltas();
+      flushPendingStreamUpdates();
       setState("items", reconcile(t.items, { key: "id" }));
       setState({
         plan: (t.plan as PlanEntry[] | null) ?? null,

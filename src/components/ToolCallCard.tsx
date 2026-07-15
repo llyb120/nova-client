@@ -1,6 +1,6 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { diffLines } from "diff";
-import { createMemo, createSignal, For, Match, Show, Switch } from "solid-js";
+import { createMemo, createSignal, For, Index, Match, Show, Switch } from "solid-js";
 import { api } from "../ipc";
 import { isExpanded, state, toggleExpanded } from "../store";
 import type { ToolContent, ToolItem } from "../types";
@@ -294,9 +294,9 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
               </For>
             </div>
           </Show>
-          <For each={props.item.content}>
-            {(block) => <ContentBlock block={block} onFileContextMenu={fileMenu.open} />}
-          </For>
+          <Index each={props.item.content}>
+            {(block) => <ContentBlock block={block()} onFileContextMenu={fileMenu.open} />}
+          </Index>
           <Show when={!visibleContent() && summary()}>
             <div class="tool-summary">{summary()}</div>
           </Show>
