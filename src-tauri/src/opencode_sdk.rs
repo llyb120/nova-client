@@ -1,18 +1,23 @@
 use crate::acp::{
-    apply_proxy_env, resolve_program_on_path, EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS,
-    EV_TURN, EV_UPDATE,
+    apply_proxy_env, resolve_program_on_path, EV_OPTIONS, EV_PERMISSION, EV_PERMISSION_RESOLVED,
+    EV_THREADS, EV_TURN, EV_UPDATE,
 };
+use crate::model_cache;
 use crate::threads::{now_ms, Item, PromptImage, ToolCall};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+use tokio::time::{sleep, Duration};
+
+pub const MODEL_CACHE_KEY: &str = "opencode-sdk";
 
 struct RunningBridge {
     child: Child,
@@ -31,6 +36,8 @@ pub struct OpenCodeSdkManager {
     running: Mutex<HashSet<String>>,
     turn_started: Mutex<HashMap<String, Instant>>,
     model_options: Mutex<Option<Value>>,
+    model_options_refreshing: AtomicBool,
+    model_options_revalidated: AtomicBool,
 }
 
 impl OpenCodeSdkManager {
@@ -42,6 +49,8 @@ impl OpenCodeSdkManager {
             running: Mutex::new(HashSet::new()),
             turn_started: Mutex::new(HashMap::new()),
             model_options: Mutex::new(None),
+            model_options_refreshing: AtomicBool::new(false),
+            model_options_revalidated: AtomicBool::new(false),
         })
     }
 
@@ -53,24 +62,63 @@ impl OpenCodeSdkManager {
         self.model_options.lock().unwrap().clone()
     }
 
+    pub fn seed_model_options(&self, value: Value) {
+        *self.model_options.lock().unwrap() = Some(value);
+    }
+
     pub fn spawn_revalidate_model_options(self: &Arc<Self>) {
+        if self.model_options_revalidated.load(Ordering::SeqCst)
+            || self
+                .model_options_refreshing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = manager.ensure_model_options().await;
+            let _ = manager.refresh_model_options().await;
+            manager
+                .model_options_refreshing
+                .store(false, Ordering::SeqCst);
         });
     }
 
-    pub async fn ensure_model_options(&self) -> Result<Value, String> {
-        if let Some(value) = self.get_model_options() {
-            return Ok(value);
-        }
+    async fn refresh_model_options(&self) -> Result<Value, String> {
         let cwd = current_dir()?;
         let value = provider_options(
             self.run_bridge(&cwd, json!({ "action": "providers" }))
                 .await?,
         )?;
         *self.model_options.lock().unwrap() = Some(value.clone());
+        model_cache::save(&crate::nova_data_dir(&self.app), MODEL_CACHE_KEY, &value);
+        self.model_options_revalidated.store(true, Ordering::SeqCst);
+        let _ = self.app.emit(
+            EV_OPTIONS,
+            json!({ "agentKind": "opencode", "options": value }),
+        );
         Ok(value)
+    }
+
+    pub async fn ensure_model_options(self: &Arc<Self>) -> Result<Value, String> {
+        if let Some(value) = self.get_model_options() {
+            self.spawn_revalidate_model_options();
+            return Ok(value);
+        }
+        self.spawn_revalidate_model_options();
+        for _ in 0..600 {
+            if let Some(value) = self.get_model_options() {
+                return Ok(value);
+            }
+            if !self.model_options_refreshing.load(Ordering::SeqCst) {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        if let Some(value) = self.get_model_options() {
+            return Ok(value);
+        }
+        self.refresh_model_options().await
     }
 
     pub async fn fetch_commands(&self) -> Result<Vec<Value>, String> {

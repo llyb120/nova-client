@@ -4,6 +4,7 @@ mod cli;
 mod cli_manager;
 mod clues;
 mod codex;
+mod codex_sdk;
 mod credential_roaming;
 mod employees;
 mod gitwt;
@@ -32,6 +33,7 @@ pub use path_env::init_process_path;
 
 use acp::AcpManager;
 use codex::CodexManager;
+use codex_sdk::{CodexSdkManager, SdkBackend};
 use credential_roaming::{BorrowedManager, BorrowedRuntime};
 use opencode_sdk::OpenCodeSdkManager;
 use relay::{RelayManager, Share};
@@ -87,6 +89,12 @@ pub struct AppState {
     /// OpenCode 官方 SDK 对应的 HTTP API 后端，不经过 ACP。
     pub opencodeplus: Arc<OpenCodeSdkManager>,
     pub codex: Arc<CodexManager>,
+    /// Codex 官方 TypeScript SDK 后端，不经过 app-server 集成层。
+    pub codexplus: Arc<CodexSdkManager>,
+    /// CodeBuddy 官方 Agent SDK 后端。
+    pub codebuddyplus: Arc<CodexSdkManager>,
+    pub claudeplus: Arc<CodexSdkManager>,
+    pub cursorplus: Arc<CodexSdkManager>,
     /// 额度租借会话的独立后端进程与临时凭证目录（只在本次运行内存在）。
     pub borrowed_runtimes: Mutex<HashMap<String, BorrowedRuntime>>,
     pub relay: Arc<RelayManager>,
@@ -111,6 +119,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn uses_sdk(&self, kind: &AgentKind) -> bool {
+        let settings = self.settings.lock().unwrap();
+        match kind {
+            AgentKind::Codex => settings.codex_integration == "sdk",
+            AgentKind::CodeBuddy => settings.codebuddy_integration == "sdk",
+            AgentKind::ClaudeCode => settings.claudecode_integration == "sdk",
+            AgentKind::Cursor => settings.cursor_integration == "sdk",
+            AgentKind::OpenCode => settings.opencode_integration == "sdk",
+            AgentKind::CodexPlus | AgentKind::CodeBuddyPlus | AgentKind::OpenCodePlus => true,
+            AgentKind::Devin => false,
+        }
+    }
+
     /// 按 AgentKind 取对应的 ACP manager 实例（Codex 走原生协议，返回 None）。
     pub fn acp_for(&self, kind: &AgentKind) -> Option<Arc<AcpManager>> {
         match kind {
@@ -119,7 +140,7 @@ impl AppState {
             AgentKind::ClaudeCode => Some(self.claudecode.clone()),
             AgentKind::Cursor => Some(self.cursor.clone()),
             AgentKind::OpenCode => Some(self.opencode.clone()),
-            AgentKind::Codex | AgentKind::OpenCodePlus => None,
+            AgentKind::Codex | AgentKind::CodexPlus | AgentKind::CodeBuddyPlus | AgentKind::OpenCodePlus => None,
         }
     }
 
@@ -148,7 +169,9 @@ impl AppState {
         match kind {
             AgentKind::Devin => s.devin_enabled,
             AgentKind::Codex => s.codex_enabled,
+            AgentKind::CodexPlus => s.codexplus_enabled,
             AgentKind::CodeBuddy => s.codebuddy_enabled,
+            AgentKind::CodeBuddyPlus => s.codebuddyplus_enabled,
             AgentKind::ClaudeCode => s.claudecode_enabled,
             AgentKind::Cursor => s.cursor_enabled,
             AgentKind::OpenCode => s.opencode_enabled,
@@ -160,7 +183,7 @@ impl AppState {
     /// 时改用 Devin（Cursor 按用量计费、不为标题额外发轮；Codex 无 ACP 标题能力）。
     fn title_fallback_mgr(&self, origin: &AgentKind) -> Arc<AcpManager> {
         match origin {
-            AgentKind::Cursor | AgentKind::Codex => self.acp.clone(),
+            AgentKind::Cursor | AgentKind::Codex | AgentKind::CodexPlus => self.acp.clone(),
             other => self.acp_for(other).unwrap_or_else(|| self.acp.clone()),
         }
     }
@@ -183,16 +206,18 @@ impl AppState {
                 s.title_model.trim().to_string(),
             )
         };
-        if AgentKind::from_str(&agent_raw) == Some(AgentKind::OpenCodePlus)
-            && self.agent_enabled(&AgentKind::OpenCodePlus)
+        if AgentKind::from_str(&agent_raw) == Some(AgentKind::OpenCode)
+            && self.agent_enabled(&AgentKind::OpenCode)
+            && self.uses_sdk(&AgentKind::OpenCode)
         {
             self.opencodeplus
                 .generate_title_async(thread_id, prompt, fallback, model);
             return;
         }
         if agent_raw.is_empty()
-            && origin == &AgentKind::OpenCodePlus
-            && self.agent_enabled(&AgentKind::OpenCodePlus)
+            && origin == &AgentKind::OpenCode
+            && self.agent_enabled(&AgentKind::OpenCode)
+            && self.uses_sdk(&AgentKind::OpenCode)
         {
             self.opencodeplus
                 .generate_title_async(thread_id, prompt, fallback, String::new());
@@ -221,6 +246,22 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     }
     if thread.agent_kind == AgentKind::OpenCodePlus {
         return state.opencodeplus.is_running(&thread.id);
+    }
+    if thread.agent_kind == AgentKind::CodexPlus {
+        return state.codexplus.is_running(&thread.id);
+    }
+    if thread.agent_kind == AgentKind::CodeBuddyPlus {
+        return state.codebuddyplus.is_running(&thread.id);
+    }
+    if state.uses_sdk(&thread.agent_kind) {
+        return match thread.agent_kind {
+            AgentKind::Codex => state.codexplus.is_running(&thread.id),
+            AgentKind::CodeBuddy => state.codebuddyplus.is_running(&thread.id),
+            AgentKind::OpenCode => state.opencodeplus.is_running(&thread.id),
+            AgentKind::ClaudeCode => state.claudeplus.is_running(&thread.id),
+            AgentKind::Cursor => state.cursorplus.is_running(&thread.id),
+            _ => false,
+        };
     }
     match state.acp_for(&thread.agent_kind) {
         Some(mgr) => mgr.is_running(&thread.id),
@@ -1018,7 +1059,9 @@ fn prewarm(
         mode.filter(|s| !s.is_empty())
             .or(Some(default_mode).filter(|s| !s.is_empty()))
     };
-    if agent_kind == AgentKind::OpenCodePlus {
+    if state.uses_sdk(&agent_kind)
+        || matches!(agent_kind, AgentKind::OpenCodePlus | AgentKind::CodexPlus | AgentKind::CodeBuddyPlus)
+    {
         return;
     }
     match state.acp_for(&agent_kind) {
@@ -2225,6 +2268,15 @@ fn set_thread_model(
         }
     } else if is_quota {
         return Err("额度凭证已过期，请重新发起租借".into());
+    } else if state.uses_sdk(&agent_kind) {
+        match agent_kind {
+            AgentKind::Codex => state.codexplus.forget_session_of_thread(&thread_id),
+            AgentKind::CodeBuddy => state.codebuddyplus.forget_session_of_thread(&thread_id),
+            AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&thread_id),
+            AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&thread_id),
+            AgentKind::OpenCode => state.opencodeplus.forget_session_of_thread(&thread_id),
+            _ => {}
+        }
     } else if let Some(mgr) = state.acp_for(&agent_kind) {
         // ACP 后端需把模型/模式同步到已挂载的 session；Codex 不需要
         tauri::async_runtime::spawn(async move {
@@ -2265,6 +2317,8 @@ fn set_thread_mode(
         }
     } else if is_quota {
         return Err("额度凭证已过期，请重新发起租借".into());
+    } else if state.uses_sdk(&agent_kind) {
+        // SDK bridge 每轮从 thread 读取 mode；无需启动未使用的 ACP 进程同步。
     } else if let Some(mgr) = state.acp_for(&agent_kind) {
         // ACP 后端需把模型/模式同步到已挂载的 session
         tauri::async_runtime::spawn(async move {
@@ -2375,6 +2429,10 @@ fn set_thread_agent(
         // 刚创建的新连接并导致 session not found。
         if old_kind == AgentKind::OpenCodePlus {
             state.opencodeplus.forget_session_of_thread(&thread_id);
+        } else if old_kind == AgentKind::CodexPlus {
+            state.codexplus.forget_session_of_thread(&thread_id);
+        } else if old_kind == AgentKind::CodeBuddyPlus {
+            state.codebuddyplus.forget_session_of_thread(&thread_id);
         } else if let Some(mgr) = state.acp_for(&old_kind) {
             mgr.forget_session_of_thread(&thread_id);
         } else {
@@ -2403,6 +2461,22 @@ async fn get_model_options(
     if agent_kind == AgentKind::OpenCodePlus {
         return state.opencodeplus.ensure_model_options().await.map(Some);
     }
+    if agent_kind == AgentKind::CodexPlus {
+        return state.codex.ensure_model_options().await.map(Some);
+    }
+    if agent_kind == AgentKind::CodeBuddyPlus {
+        return state.codebuddy.ensure_model_options().await.map(Some);
+    }
+    if state.uses_sdk(&agent_kind) {
+        return match agent_kind {
+            AgentKind::Codex => state.codex.ensure_model_options().await.map(Some),
+            AgentKind::CodeBuddy => state.codebuddy.ensure_model_options().await.map(Some),
+            AgentKind::OpenCode => state.opencodeplus.ensure_model_options().await.map(Some),
+            AgentKind::ClaudeCode => state.claudecode.ensure_model_options().await.map(Some),
+            AgentKind::Cursor => state.cursor.ensure_model_options().await.map(Some),
+            _ => Err(format!("{} SDK 尚未接入", agent_kind.label())),
+        };
+    }
     match state.acp_for(&agent_kind) {
         Some(mgr) => mgr.ensure_model_options().await.map(Some),
         None => state.codex.ensure_model_options().await.map(Some),
@@ -2420,6 +2494,32 @@ async fn get_slash_commands(
     }
     if agent_kind == AgentKind::OpenCodePlus {
         return state.opencodeplus.fetch_commands().await;
+    }
+    if agent_kind == AgentKind::CodexPlus {
+        return Ok(list_codex_skill_commands(&state.config_dir));
+    }
+    if agent_kind == AgentKind::CodeBuddyPlus {
+        let commands = state.codebuddy.fetch_commands().await?;
+        return Ok(commands.as_array().cloned().unwrap_or_default());
+    }
+    if state.uses_sdk(&agent_kind) {
+        return match agent_kind {
+            AgentKind::CodeBuddy => {
+                let commands = state.codebuddy.fetch_commands().await?;
+                Ok(commands.as_array().cloned().unwrap_or_default())
+            }
+            AgentKind::Codex => Ok(list_codex_skill_commands(&state.config_dir)),
+            AgentKind::OpenCode => state.opencodeplus.fetch_commands().await,
+            AgentKind::ClaudeCode => {
+                let commands = state.claudecode.fetch_commands().await?;
+                Ok(commands.as_array().cloned().unwrap_or_default())
+            }
+            AgentKind::Cursor => {
+                let commands = state.cursor.fetch_commands().await?;
+                Ok(commands.as_array().cloned().unwrap_or_default())
+            }
+            _ => Ok(Vec::new()),
+        };
     }
     match state.acp_for(&agent_kind) {
         Some(mgr) => {
@@ -2523,8 +2623,40 @@ fn send_prompt(
         return Ok(());
     }
     match agent_kind {
+        AgentKind::Codex if state.uses_sdk(&AgentKind::Codex) => {
+            let mgr = state.codexplus.clone();
+            tauri::async_runtime::spawn(async move { mgr.run_prompt(thread_id, text, images).await; });
+        }
+        AgentKind::CodeBuddy if state.uses_sdk(&AgentKind::CodeBuddy) => {
+            let mgr = state.codebuddyplus.clone();
+            tauri::async_runtime::spawn(async move { mgr.run_prompt(thread_id, text, images).await; });
+        }
+        AgentKind::OpenCode if state.uses_sdk(&AgentKind::OpenCode) => {
+            let mgr = state.opencodeplus.clone();
+            tauri::async_runtime::spawn(async move { mgr.run_prompt(thread_id, text, images).await; });
+        }
+        AgentKind::ClaudeCode if state.uses_sdk(&AgentKind::ClaudeCode) => {
+            let mgr = state.claudeplus.clone();
+            tauri::async_runtime::spawn(async move { mgr.run_prompt(thread_id, text, images).await; });
+        }
+        AgentKind::Cursor if state.uses_sdk(&AgentKind::Cursor) => {
+            let mgr = state.cursorplus.clone();
+            tauri::async_runtime::spawn(async move { mgr.run_prompt(thread_id, text, images).await; });
+        }
         AgentKind::OpenCodePlus => {
             let mgr = state.opencodeplus.clone();
+            tauri::async_runtime::spawn(async move {
+                mgr.run_prompt(thread_id, text, images).await;
+            });
+        }
+        AgentKind::CodexPlus => {
+            let mgr = state.codexplus.clone();
+            tauri::async_runtime::spawn(async move {
+                mgr.run_prompt(thread_id, text, images).await;
+            });
+        }
+        AgentKind::CodeBuddyPlus => {
+            let mgr = state.codebuddyplus.clone();
             tauri::async_runtime::spawn(async move {
                 mgr.run_prompt(thread_id, text, images).await;
             });
@@ -2614,6 +2746,10 @@ fn truncate_thread(
         mgr.forget_session_of_thread(&thread_id);
     }
     state.codex.forget_session_of_thread(&thread_id);
+    state.codexplus.forget_session_of_thread(&thread_id);
+    state.codebuddyplus.forget_session_of_thread(&thread_id);
+    state.claudeplus.forget_session_of_thread(&thread_id);
+    state.cursorplus.forget_session_of_thread(&thread_id);
     state.opencodeplus.forget_session_of_thread(&thread_id);
     if let Some(runtime) = state.borrowed_runtime(&thread_id) {
         match runtime.manager {
@@ -2709,8 +2845,16 @@ async fn cancel_turn(
         }
     }
     let kind = agent_kind_for_thread(&state, &thread_id)?;
-    if kind == AgentKind::OpenCodePlus {
+    if kind == AgentKind::OpenCodePlus || (kind == AgentKind::OpenCode && state.uses_sdk(&kind)) {
         state.opencodeplus.cancel(&thread_id).await;
+    } else if kind == AgentKind::CodexPlus || (kind == AgentKind::Codex && state.uses_sdk(&kind)) {
+        state.codexplus.cancel(&thread_id).await;
+    } else if kind == AgentKind::CodeBuddyPlus || (kind == AgentKind::CodeBuddy && state.uses_sdk(&kind)) {
+        state.codebuddyplus.cancel(&thread_id).await;
+    } else if kind == AgentKind::ClaudeCode && state.uses_sdk(&kind) {
+        state.claudeplus.cancel(&thread_id).await;
+    } else if kind == AgentKind::Cursor && state.uses_sdk(&kind) {
+        state.cursorplus.cancel(&thread_id).await;
     } else {
         match state.acp_for(&kind) {
             Some(mgr) => mgr.cancel(&thread_id).await,
@@ -2775,7 +2919,17 @@ async fn respond_permission(
     if let Some(runtime) = borrowed {
         return runtime.respond_permission(&request_key, &option_id).await;
     }
-    if request_key.starts_with("ocp-") {
+    if request_key.starts_with("cbp-") {
+        state
+            .codebuddyplus
+            .respond_permission(&request_key, &option_id)
+            .await
+    } else if request_key.starts_with("clp-") {
+        state
+            .claudeplus
+            .respond_permission(&request_key, &option_id)
+            .await
+    } else if request_key.starts_with("ocp-") {
         state
             .opencodeplus
             .respond_permission(&request_key, &option_id)
@@ -2857,23 +3011,28 @@ async fn set_settings(
         let restart_codebuddy = s.codebuddy_path != settings.codebuddy_path
             || s.codebuddy_args != settings.codebuddy_args
             || s.codebuddy_proxy != settings.codebuddy_proxy
-            || s.codebuddy_enabled != settings.codebuddy_enabled;
+            || s.codebuddy_enabled != settings.codebuddy_enabled
+            || s.codebuddy_integration != settings.codebuddy_integration;
         let restart_claudecode = s.claudecode_path != settings.claudecode_path
             || s.claudecode_args != settings.claudecode_args
             || s.claudecode_proxy != settings.claudecode_proxy
-            || s.claudecode_enabled != settings.claudecode_enabled;
+            || s.claudecode_enabled != settings.claudecode_enabled
+            || s.claudecode_integration != settings.claudecode_integration;
         let restart_cursor = s.cursor_path != settings.cursor_path
             || s.cursor_args != settings.cursor_args
             || s.cursor_proxy != settings.cursor_proxy
-            || s.cursor_enabled != settings.cursor_enabled;
+            || s.cursor_enabled != settings.cursor_enabled
+            || s.cursor_integration != settings.cursor_integration;
         let restart_opencode = s.opencode_path != settings.opencode_path
             || s.opencode_args != settings.opencode_args
             || s.opencode_proxy != settings.opencode_proxy
-            || s.opencode_enabled != settings.opencode_enabled;
+            || s.opencode_enabled != settings.opencode_enabled
+            || s.opencode_integration != settings.opencode_integration;
         let restart_codex = s.codex_path != settings.codex_path
             || s.codex_args != settings.codex_args
             || s.codex_proxy != settings.codex_proxy
-            || s.codex_enabled != settings.codex_enabled;
+            || s.codex_enabled != settings.codex_enabled
+            || s.codex_integration != settings.codex_integration;
         let notify_peer_models = s.quota_shared_models != settings.quota_shared_models;
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
@@ -2906,17 +3065,22 @@ async fn set_settings(
     }
     if restart_codebuddy {
         state.codebuddy.kill_conn().await;
+        state.codebuddyplus.shutdown();
     }
     if restart_claudecode {
         state.claudecode.kill_conn().await;
+        state.claudeplus.shutdown();
     }
     if restart_cursor {
         state.cursor.kill_conn().await;
+        state.cursorplus.shutdown();
     }
     if restart_opencode {
         state.opencode.kill_conn().await;
+        state.opencodeplus.shutdown();
     }
     if restart_codex {
+        state.codexplus.shutdown();
         state.codex.kill_conn().await;
     }
     if restart_relay {
@@ -4208,6 +4372,10 @@ pub fn run() {
             let opencode = AcpManager::new(app.handle().clone(), AgentKind::OpenCode);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
+            let codexplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Codex);
+            let codebuddyplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::CodeBuddy);
+            let claudeplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Claude);
+            let cursorplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Cursor);
             let relay = RelayManager::new(app.handle().clone(), dir.clone());
 
             app.manage(AppState {
@@ -4235,6 +4403,10 @@ pub fn run() {
                 opencode,
                 opencodeplus,
                 codex,
+                codexplus,
+                codebuddyplus,
+                claudeplus,
+                cursorplus,
                 borrowed_runtimes: Mutex::new(HashMap::new()),
                 relay: relay.clone(),
                 config_dir: dir.clone(),
@@ -4285,6 +4457,12 @@ pub fn run() {
                         }
                     }
                 }
+                if state.uses_sdk(&AgentKind::OpenCode) {
+                    if let Some(v) = model_cache::load(&dir, opencode_sdk::MODEL_CACHE_KEY) {
+                        state.opencodeplus.seed_model_options(v);
+                    }
+                    state.opencodeplus.spawn_revalidate_model_options();
+                }
                 if let Some(v) = model_cache::load(&dir, "codex") {
                     state.codex.seed_model_options(v);
                 }
@@ -4295,14 +4473,21 @@ pub fn run() {
                     AgentKind::ClaudeCode,
                     AgentKind::Cursor,
                     AgentKind::OpenCode,
-                    AgentKind::OpenCodePlus,
                 ]
                 .into_iter()
                 .find(|k| state.agent_enabled(k))
                 .unwrap_or(AgentKind::Devin);
                 // 与 get_model_options 共用 refreshing 闸门，避免启动时双开探测 session
-                if default_kind == AgentKind::OpenCodePlus {
+                if default_kind == AgentKind::OpenCode && state.uses_sdk(&default_kind) {
                     state.opencodeplus.spawn_revalidate_model_options();
+                } else if state.uses_sdk(&default_kind) {
+                    match default_kind {
+                        AgentKind::Codex => state.codex.spawn_revalidate_model_options(),
+                        AgentKind::CodeBuddy => state.codebuddy.spawn_revalidate_model_options(),
+                        AgentKind::ClaudeCode => state.claudecode.spawn_revalidate_model_options(),
+                        AgentKind::Cursor => state.cursor.spawn_revalidate_model_options(),
+                        _ => {}
+                    }
                 } else {
                     match state.acp_for(&default_kind) {
                         Some(mgr) => mgr.spawn_revalidate_model_options(),

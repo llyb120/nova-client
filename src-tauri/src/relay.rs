@@ -209,7 +209,9 @@ fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> 
     let enabled = match kind {
         AgentKind::Devin => settings.devin_enabled,
         AgentKind::Codex => settings.codex_enabled,
+        AgentKind::CodexPlus => false,
         AgentKind::CodeBuddy => settings.codebuddy_enabled,
+        AgentKind::CodeBuddyPlus => false,
         AgentKind::ClaudeCode => settings.claudecode_enabled,
         AgentKind::Cursor => settings.cursor_enabled,
         AgentKind::OpenCode => settings.opencode_enabled,

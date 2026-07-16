@@ -17,7 +17,9 @@ pub fn now_ms() -> i64 {
 pub enum AgentKind {
     Devin,
     Codex,
+    CodexPlus,
     CodeBuddy,
+    CodeBuddyPlus,
     ClaudeCode,
     Cursor,
     OpenCode,
@@ -35,7 +37,9 @@ impl AgentKind {
         match self {
             AgentKind::Devin => "devin",
             AgentKind::Codex => "codex",
+            AgentKind::CodexPlus => "codexplus",
             AgentKind::CodeBuddy => "codebuddy",
+            AgentKind::CodeBuddyPlus => "codebuddyplus",
             AgentKind::ClaudeCode => "claudecode",
             AgentKind::Cursor => "cursor",
             AgentKind::OpenCode => "opencode",
@@ -48,7 +52,9 @@ impl AgentKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "devin" => Some(AgentKind::Devin),
             "codex" => Some(AgentKind::Codex),
+            "codexplus" => Some(AgentKind::CodexPlus),
             "codebuddy" => Some(AgentKind::CodeBuddy),
+            "codebuddyplus" => Some(AgentKind::CodeBuddyPlus),
             "claudecode" => Some(AgentKind::ClaudeCode),
             "cursor" => Some(AgentKind::Cursor),
             "opencode" => Some(AgentKind::OpenCode),
@@ -62,11 +68,13 @@ impl AgentKind {
         match self {
             AgentKind::Devin => "Devin",
             AgentKind::Codex => "Codex",
+            AgentKind::CodexPlus => "Codex",
             AgentKind::CodeBuddy => "CodeBuddy",
+            AgentKind::CodeBuddyPlus => "CodeBuddy",
             AgentKind::ClaudeCode => "Claude Code",
             AgentKind::Cursor => "Cursor",
             AgentKind::OpenCode => "OpenCode",
-            AgentKind::OpenCodePlus => "OpenCode+",
+            AgentKind::OpenCodePlus => "OpenCode",
         }
     }
 }

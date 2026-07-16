@@ -171,7 +171,6 @@ export const [state, setState] = createStore<AppStore>({
     claudecode: null,
     cursor: null,
     opencode: null,
-    opencodeplus: null,
   },
   logs: [],
   loadingThread: false,
@@ -187,7 +186,6 @@ export const [state, setState] = createStore<AppStore>({
     claudecode: [],
     cursor: [],
     opencode: [],
-    opencodeplus: [],
   },
   updateProgress: null,
   cliOperationProgress: null,
@@ -383,7 +381,6 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
   "claudecode",
   "cursor",
   "opencode",
-  "opencodeplus",
 ];
 
 /** 某后端在设置里是否启用。缺字段（老版本 settings）按启用处理（!== false）。 */
@@ -401,8 +398,6 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
       return s.cursorEnabled !== false;
     case "opencode":
       return s.opencodeEnabled !== false;
-    case "opencodeplus":
-      return s.opencodeplusEnabled !== false;
   }
 }
 
@@ -1531,6 +1526,8 @@ export async function initStore() {
       ? preferredAgent
       : (ALL_AGENT_KINDS.find((kind) => agentEnabled(settings, kind)) ?? preferredAgent);
     setState({ settings, agentKind: initialAgent });
+    // 后端启动时已把磁盘缓存灌入内存，立即读取，不等待其余事件监听和会话初始化。
+    void ensureModelOptions(initialAgent);
     return { settings, initialAgent };
   }).catch((error: unknown) => ({ error }));
 
@@ -1855,8 +1852,7 @@ export async function initStore() {
       // 连接状态拉取失败不影响使用，后端连上后会通过 acp:status 事件补正
     });
   void api.getLogs().then((logs) => setState("logs", logs)).catch(() => {});
-  // 只加载当前后端；其他后端在用户切换或打开模型选择器时按需加载。
-  void ensureModelOptions(initialAgent);
+  // 其他后端在用户切换或打开模型选择器时按需加载。
   void refreshSlashCommands(initialAgent);
 
   // 额度：启动拉取一次，之后每 10 分钟刷新；模型费用基本不变，失败时随额度周期重试

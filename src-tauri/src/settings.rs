@@ -28,12 +28,16 @@ pub struct Settings {
     pub claudecode_args: String,
     /// Claude Code 代理地址
     pub claudecode_proxy: String,
+    /// Claude Agent SDK API Key；空 = 使用环境/provider 凭据。
+    pub claudecode_sdk_api_key: String,
     /// Cursor CLI（cursor-agent）可执行文件路径（默认 cursor-agent，依赖 PATH）
     pub cursor_path: String,
     /// Cursor ACP 启动参数（默认 acp）
     pub cursor_args: String,
     /// Cursor 代理地址
     pub cursor_proxy: String,
+    /// Cursor SDK API Key；空 = 使用 CURSOR_API_KEY 环境变量。
+    pub cursor_sdk_api_key: String,
     /// OpenCode CLI 可执行文件路径（默认 opencode，依赖 PATH）
     pub opencode_path: String,
     /// OpenCode ACP 启动参数（默认 acp）
@@ -80,12 +84,20 @@ pub struct Settings {
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
     pub codex_enabled: bool,
+    /// 旧版独立 SDK 后端开关，仅用于兼容反序列化。
+    pub codexplus_enabled: bool,
     pub codebuddy_enabled: bool,
+    pub codebuddyplus_enabled: bool,
     pub claudecode_enabled: bool,
     pub cursor_enabled: bool,
     pub opencode_enabled: bool,
-    /// OpenCode SDK 后端开关；复用 OpenCode CLI 路径与代理配置。
     pub opencodeplus_enabled: bool,
+    /// 各后端接入方式：sdk / acp。Devin 固定使用 ACP。
+    pub codex_integration: String,
+    pub codebuddy_integration: String,
+    pub claudecode_integration: String,
+    pub cursor_integration: String,
+    pub opencode_integration: String,
     /// worktree 工作目录的根（空 = 应用数据目录下的 worktrees/）。
     /// 会话开启「在 worktree 中执行」时，在此目录下为其创建独立工作目录。
     pub worktree_dir: String,
@@ -115,9 +127,11 @@ impl Default for Settings {
             claudecode_path: "npx".into(),
             claudecode_args: "-y @zed-industries/claude-code-acp".into(),
             claudecode_proxy: String::new(),
+            claudecode_sdk_api_key: String::new(),
             cursor_path: "cursor-agent".into(),
             cursor_args: "acp".into(),
             cursor_proxy: String::new(),
+            cursor_sdk_api_key: String::new(),
             opencode_path: "opencode".into(),
             opencode_args: "acp".into(),
             opencode_proxy: String::new(),
@@ -140,11 +154,18 @@ impl Default for Settings {
             quota_shared_models: Vec::new(),
             devin_enabled: true,
             codex_enabled: true,
+            codexplus_enabled: false,
             codebuddy_enabled: true,
+            codebuddyplus_enabled: false,
             claudecode_enabled: true,
             cursor_enabled: true,
             opencode_enabled: true,
-            opencodeplus_enabled: true,
+            opencodeplus_enabled: false,
+            codex_integration: "sdk".into(),
+            codebuddy_integration: "sdk".into(),
+            claudecode_integration: "acp".into(),
+            cursor_integration: "acp".into(),
+            opencode_integration: "sdk".into(),
             worktree_dir: String::new(),
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
@@ -169,6 +190,16 @@ mod tests {
     fn missing_history_display_mode_defaults_to_project() {
         let settings: Settings = serde_json::from_str(r#"{"theme":"ink-dark"}"#).unwrap();
         assert_eq!(settings.history_display_mode, "project");
+    }
+
+    #[test]
+    fn sdk_integration_defaults_match_backend_policy() {
+        let settings = Settings::default();
+        assert_eq!(settings.codex_integration, "sdk");
+        assert_eq!(settings.codebuddy_integration, "sdk");
+        assert_eq!(settings.opencode_integration, "sdk");
+        assert_eq!(settings.claudecode_integration, "acp");
+        assert_eq!(settings.cursor_integration, "acp");
     }
 }
 
@@ -195,6 +226,19 @@ impl Settings {
                 .map(|days| days.saturating_mul(24))
                 .unwrap_or(24 * 30);
         }
+        // 旧版把 SDK 暴露为独立 “+” 后端；升级后折叠为同一后端的接入方式。
+        if settings.codexplus_enabled {
+            settings.codex_integration = "sdk".into();
+        }
+        if settings.codebuddyplus_enabled {
+            settings.codebuddy_integration = "sdk".into();
+        }
+        if settings.opencodeplus_enabled {
+            settings.opencode_integration = "sdk".into();
+        }
+        settings.codexplus_enabled = false;
+        settings.codebuddyplus_enabled = false;
+        settings.opencodeplus_enabled = false;
         settings
     }
 

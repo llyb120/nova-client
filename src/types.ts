@@ -1,4 +1,4 @@
-export type AgentKind = "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode" | "opencodeplus";
+export type AgentKind = "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
 
 export interface SlashCommand {
   name: string;
@@ -303,11 +303,13 @@ export interface Settings {
   /** Claude Code ACP 启动参数，默认 -y @zed-industries/claude-code-acp */
   claudecodeArgs: string;
   claudecodeProxy: string;
+  claudecodeSdkApiKey: string;
   /** Cursor CLI（cursor-agent）可执行文件，默认 cursor-agent 依赖 PATH */
   cursorPath: string;
   /** Cursor ACP 启动参数，默认 acp */
   cursorArgs: string;
   cursorProxy: string;
+  cursorSdkApiKey: string;
   /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */
   opencodePath: string;
   /** OpenCode ACP 启动参数，默认 acp */
@@ -350,7 +352,11 @@ export interface Settings {
   claudecodeEnabled: boolean;
   cursorEnabled: boolean;
   opencodeEnabled: boolean;
-  opencodeplusEnabled: boolean;
+  codexIntegration: "sdk" | "acp";
+  codebuddyIntegration: "sdk" | "acp";
+  claudecodeIntegration: "sdk" | "acp";
+  cursorIntegration: "sdk" | "acp";
+  opencodeIntegration: "sdk" | "acp";
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
   worktreeDir: string;
   /** 是否自动清理长期未更新的会话 */

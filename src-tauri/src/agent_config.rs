@@ -169,16 +169,16 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 TargetFormat::Markdown,
             )
         }
-        AgentKind::Codex => {
+        AgentKind::Codex | AgentKind::CodexPlus => {
             let root =
                 configured_dir(overrides, "CODEX_HOME").unwrap_or_else(|| home.join(".codex"));
-            ("Codex", root.join("AGENTS.md"), TargetFormat::Markdown)
+            (kind.label(), root.join("AGENTS.md"), TargetFormat::Markdown)
         }
-        AgentKind::CodeBuddy => {
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
             let root = configured_dir(overrides, "CODEBUDDY_CONFIG_DIR")
                 .unwrap_or_else(|| home.join(".codebuddy"));
             (
-                "CodeBuddy",
+                kind.label(),
                 root.join("CODEBUDDY.md"),
                 TargetFormat::Markdown,
             )

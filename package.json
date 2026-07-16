@@ -1,13 +1,18 @@
 {
   "name": "nova",
   "private": true,
-  "version": "0.1.258",
+  "version": "0.1.259",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:tauri": "npm run build:opencode-bridge && vite",
-    "build": "npm run build:opencode-bridge && vite build",
+    "dev:tauri": "npm run build:sdk-bridges && vite",
+    "build": "npm run build:sdk-bridges && vite build",
+    "build:sdk-bridges": "npm run build:opencode-bridge && npm run build:codex-bridge && npm run build:codebuddy-bridge && npm run build:claude-bridge && npm run build:cursor-bridge",
     "build:opencode-bridge": "esbuild scripts/opencode-bridge.mjs --bundle --platform=node --format=cjs --outfile=src-tauri/resources/opencode-bridge.cjs",
+    "build:codex-bridge": "esbuild scripts/codex-bridge.mjs --bundle --platform=node --format=esm --outfile=src-tauri/resources/codex-bridge.mjs",
+    "build:codebuddy-bridge": "esbuild scripts/codebuddy-bridge.mjs --bundle --platform=node --format=cjs --outfile=src-tauri/resources/codebuddy-bridge.cjs",
+    "build:claude-bridge": "esbuild scripts/claude-bridge.mjs --bundle --platform=node --format=esm --outfile=src-tauri/resources/claude-bridge.mjs",
+    "build:cursor-bridge": "esbuild scripts/cursor-bridge.mjs --bundle --platform=node --format=esm --external:bun:sqlite --external:vendor/* --loader:.map=empty --loader:.ts=empty --banner:js=\"import{createRequire}from'node:module';const require=createRequire(import.meta.url);\" --outfile=src-tauri/resources/cursor-bridge.mjs",
     "check": "tsc --noEmit",
     "preview": "vite preview",
     "tauri": "tauri",
@@ -15,15 +20,19 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.2",
+    "esbuild": "^0.28.0",
     "typescript": "^6.0.3",
     "vite": "^8.0.16",
-    "vite-plugin-solid": "^2.11.12",
-    "esbuild": "^0.28.0"
+    "vite-plugin-solid": "^2.11.12"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.211",
+    "@cursor/sdk": "^1.0.23",
+    "@openai/codex-sdk": "^0.144.5",
     "@opencode-ai/sdk": "^1.18.2",
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tencent-ai/agent-sdk": "^0.3.217",
     "diff": "^9.0.0",
     "dompurify": "^3.4.9",
     "marked": "^18.0.5",

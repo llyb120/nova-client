@@ -215,7 +215,8 @@ export function ChatView() {
     const currentTop = scrollRef?.scrollTop ?? 0;
     const atBottom = isAtBottom();
     if (stickToBottom()) {
-      if (!atBottom && currentTop !== lastScrollTop) cancelBottomFollow();
+      // 流式布局和虚拟分组高度变化也会触发 scroll；只有指针拖动时才把位移视为用户操作。
+      if (pointerActive && !atBottom && currentTop !== lastScrollTop) cancelBottomFollow();
     } else if (atBottom && currentTop > lastScrollTop) {
       setStickToBottom(true);
     }
