@@ -809,9 +809,13 @@ export async function createRoamingThread(
 }
 
 /** host：应答一条漫游请求（接受/拒绝），无论成败都从队列移除 */
-export async function respondRoamRequest(reqId: string, accept: boolean) {
+export async function respondRoamRequest(
+  reqId: string,
+  accept: boolean,
+  changes: Parameters<typeof api.respondRoamRequest>[2],
+) {
   try {
-    await api.respondRoamRequest(reqId, accept);
+    await api.respondRoamRequest(reqId, accept, changes);
   } finally {
     setState("incomingRoams", (prev) => prev.filter((r) => r.reqId !== reqId));
   }

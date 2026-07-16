@@ -3397,6 +3397,21 @@ button {
   max-height: 160px;
   overflow-y: auto;
 }
+.roam-req-prompt-input {
+  min-height: 110px;
+  resize: vertical;
+  line-height: 1.5;
+}
+.roam-req-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+@media (max-width: 560px) {
+  .roam-req-grid {
+    grid-template-columns: 1fr;
+  }
+}
 
 .field {
   display: flex;

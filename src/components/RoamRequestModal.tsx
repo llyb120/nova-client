@@ -1,5 +1,5 @@
 import { message } from "@tauri-apps/plugin-dialog";
-import { createSignal, Show } from "solid-js";
+import { createEffect, createSignal, Show } from "solid-js";
 import { respondRoamRequest, state } from "../store";
 import { agentLabel } from "../utils";
 import { IconFolder } from "./icons";
@@ -8,13 +8,40 @@ import { IconFolder } from "./icons";
 export function RoamRequestModal() {
   const [busy, setBusy] = createSignal(false);
   const current = () => state.incomingRoams[0] ?? null;
+  const [prompt, setPrompt] = createSignal("");
+  const [folder, setFolder] = createSignal("");
+  const [model, setModel] = createSignal("");
+  const [mode, setMode] = createSignal("");
+  const [worktree, setWorktree] = createSignal(false);
+  const [worktreeBranch, setWorktreeBranch] = createSignal("");
+  const [worktreeBase, setWorktreeBase] = createSignal("");
+
+  createEffect(() => {
+    const req = current();
+    if (!req) return;
+    setPrompt(req.prompt ?? "");
+    setFolder(req.folder);
+    setModel(req.model ?? "");
+    setMode(req.mode ?? "");
+    setWorktree(req.worktree ?? false);
+    setWorktreeBranch(req.worktreeBranch ?? "");
+    setWorktreeBase(req.worktreeBase ?? "");
+  });
 
   const respond = async (accept: boolean) => {
     const req = current();
     if (!req || busy()) return;
     setBusy(true);
     try {
-      await respondRoamRequest(req.reqId, accept);
+      await respondRoamRequest(req.reqId, accept, {
+        prompt: prompt(),
+        folder: folder(),
+        model: model(),
+        mode: mode(),
+        worktree: worktree(),
+        worktreeBranch: worktreeBranch(),
+        worktreeBase: worktreeBase(),
+      });
     } catch (e) {
       await message(String(e), { kind: "error" });
     } finally {
@@ -38,39 +65,78 @@ export function RoamRequestModal() {
                 <b>{req().fromName}</b> 想在你的机器上漫游执行（
                 {agentLabel(req().agentKind)}）。
               </p>
-              <div class="roam-req-folder" title={req().folder}>
-                <IconFolder size={15} />
-                <span class="roam-req-folder-name">{req().folderName}</span>
-                <span class="roam-req-folder-path">{req().folder}</span>
-              </div>
-              <Show when={req().prompt}>
-                <div class="roam-req-prompt">
-                  <span class="roam-req-prompt-label">对方想执行</span>
-                  <p class="roam-req-prompt-text">{req().prompt}</p>
+              <Show when={!req().continuation} fallback={
+                <div class="roam-req-folder" title={req().folder}>
+                  <IconFolder size={15} />
+                  <span class="roam-req-folder-name">{req().folderName}</span>
+                  <span class="roam-req-folder-path">{req().folder}</span>
                 </div>
+              }>
+                <label class="field">
+                  <span class="field-label">执行目录</span>
+                  <input class="field-input" value={folder()} onInput={(e) => setFolder(e.currentTarget.value)} />
+                </label>
               </Show>
+              <label class="field">
+                <span class="field-label">提示词</span>
+                <textarea
+                  class="field-input roam-req-prompt-input"
+                  value={prompt()}
+                  onInput={(e) => setPrompt(e.currentTarget.value)}
+                />
+              </label>
               <Show when={req().folderExists === false}>
                 <p class="roam-req-warn">
                   该目录在你机器上不存在，允许后将自动创建。
                 </p>
               </Show>
-              <Show when={req().worktree}>
-                <p class="roam-req-worktree">
-                  ⎇ 对方要求在 <b>git worktree</b> 中执行：将在此仓库新建分支{" "}
-                  <b>{req().worktreeBranch || "（未命名）"}</b> 的独立工作目录，不影响你当前工作区。
-                  该目录须为 git 仓库，否则会失败。
-                </p>
+              <Show when={!req().continuation}>
+                <label class="setting-check">
+                  <input type="checkbox" checked={worktree()} onChange={(e) => setWorktree(e.currentTarget.checked)} />
+                  <span>
+                    在 git worktree 中执行
+                    <span class="field-hint">新建独立工作目录和分支，不影响当前工作区。</span>
+                  </span>
+                </label>
+                <Show when={worktree()}>
+                  <div class="roam-req-grid">
+                    <label class="field">
+                      <span class="field-label">worktree 分支</span>
+                      <input class="field-input" value={worktreeBranch()} onInput={(e) => setWorktreeBranch(e.currentTarget.value)} />
+                    </label>
+                    <label class="field">
+                      <span class="field-label">基于分支/提交</span>
+                      <input class="field-input" value={worktreeBase()} onInput={(e) => setWorktreeBase(e.currentTarget.value)} />
+                    </label>
+                  </div>
+                </Show>
+                <div class="roam-req-grid">
+                  <label class="field">
+                    <span class="field-label">模型</span>
+                    <input class="field-input" value={model()} onInput={(e) => setModel(e.currentTarget.value)} />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">模式</span>
+                    <input class="field-input" value={mode()} onInput={(e) => setMode(e.currentTarget.value)} />
+                  </label>
+                </div>
               </Show>
               <p class="field-hint">
-                同意后对方将在该目录直接驱动会话、读写文件并执行命令，仅在你信任对方时允许。
+                {req().continuation
+                  ? "上次授权已超过 30 分钟。同意后将续期 30 分钟并执行上方提示词。"
+                  : "同意后对方可在该目录驱动会话、读写文件并执行命令，授权有效期为 30 分钟。"}
               </p>
             </div>
             <div class="modal-foot">
               <button class="btn danger" disabled={busy()} onClick={() => void respond(false)}>
                 拒绝
               </button>
-              <button class="btn primary" disabled={busy()} onClick={() => void respond(true)}>
-                {busy() ? "处理中…" : "允许漫游"}
+              <button
+                class="btn primary"
+                disabled={busy() || (req().continuation && !prompt().trim())}
+                onClick={() => void respond(true)}
+              >
+                {busy() ? "处理中…" : req().continuation ? "续期并执行" : "允许漫游"}
               </button>
             </div>
           </div>
