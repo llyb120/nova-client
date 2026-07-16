@@ -3266,6 +3266,11 @@ button {
   font-size: 12px;
 }
 
+.cli-upgrade-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .cli-manager-message {
   flex: 0 1 auto;
   max-width: 42%;

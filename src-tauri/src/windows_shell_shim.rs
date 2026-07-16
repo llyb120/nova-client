@@ -44,7 +44,7 @@ fn real_cmd() -> PathBuf {
     }
 }
 
-fn real_powershell() -> PathBuf {
+pub(crate) fn real_powershell() -> PathBuf {
     let path = system32()
         .join("WindowsPowerShell")
         .join("v1.0")

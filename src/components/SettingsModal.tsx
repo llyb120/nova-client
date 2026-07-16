@@ -103,6 +103,11 @@ function CliManager(props: {
           {props.message}
         </span>
       </Show>
+      <Show when={!props.message && !props.loading && props.status?.upgradeSupported === false}>
+        <span class="cli-manager-message bad" title={props.status?.detail}>
+          {props.status?.detail}
+        </span>
+      </Show>
     </div>
   );
 }
@@ -427,10 +432,12 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const upgradeCli = async (kind: AgentKind) => {
     const wasInstalled = cliStatuses()[kind]?.installed !== false;
-    const operationId = crypto.randomUUID();
     setUpgradingCli(kind);
     setCliMessages((prev) => ({ ...prev, [kind]: "" }));
     try {
+      const operationId = typeof globalThis.crypto?.randomUUID === "function"
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const status = await api.upgradeCli(kind, draftSettings(), operationId);
       setCliStatuses((prev) => ({ ...prev, [kind]: status }));
       setCliMessages((prev) => ({
