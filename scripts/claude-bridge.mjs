@@ -41,6 +41,60 @@ function claudeModelSelection(selected) {
   return match ? { model: match[1], effort: match[2] } : { model: selected };
 }
 
+function streamEventItem(message, stream, streamedBlocks) {
+  const event = message.event;
+  if (event.type === "message_start") {
+    stream.messageId = event.message.id;
+    stream.blocks.clear();
+    streamedBlocks.clear();
+    return null;
+  }
+  if (event.type === "content_block_start") {
+    const block = event.content_block;
+    if (block.type !== "text" && block.type !== "thinking") return null;
+    const text = block.type === "text" ? block.text : block.thinking;
+    stream.blocks.set(event.index, { type: block.type, text });
+    if (!text) return null;
+    streamedBlocks.add(event.index);
+    return {
+      id: `${stream.messageId}-${event.index}`,
+      type: block.type === "text" ? "agent_message" : "reasoning",
+      text,
+    };
+  }
+  if (event.type !== "content_block_delta") return null;
+  const delta = event.delta;
+  if (delta.type !== "text_delta" && delta.type !== "thinking_delta") return null;
+  const block = stream.blocks.get(event.index) ?? {
+    type: delta.type === "text_delta" ? "text" : "thinking",
+    text: "",
+  };
+  block.text += delta.type === "text_delta" ? delta.text : delta.thinking;
+  stream.blocks.set(event.index, block);
+  streamedBlocks.add(event.index);
+  return {
+    id: `${stream.messageId}-${event.index}`,
+    type: block.type === "text" ? "agent_message" : "reasoning",
+    text: block.text,
+  };
+}
+
+function assistantItems(message, streamedBlocks) {
+  return message.message.content.flatMap((block, index) => {
+    const id = block.id ?? `${message.uuid}-${index}`;
+    if (block.type === "text" && !streamedBlocks.has(index)) {
+      return [{ id, type: "agent_message", text: block.text }];
+    }
+    if (block.type === "thinking" && !streamedBlocks.has(index)) {
+      return [{ id, type: "reasoning", text: block.thinking }];
+    }
+    if (block.type === "tool_use") {
+      return [{ id, type: "mcp_tool_call", server: "Claude", tool: block.name, arguments: block.input, status: "in_progress" }];
+    }
+    return [];
+  });
+}
+
 async function modelOptions(request) {
   const activeQuery = query({
     prompt: "",
@@ -79,6 +133,8 @@ async function main() {
   const selection = claudeModelSelection(request.model);
   const controller = new AbortController();
   const pending = new Map();
+  const stream = { messageId: "message", blocks: new Map() };
+  const streamedBlocks = new Set();
   void (async () => {
     for await (const line of lines) {
       const command = JSON.parse(line);
@@ -98,6 +154,7 @@ async function main() {
       resume: request.sessionId || undefined,
       model: selection.model,
       effort: selection.effort,
+      includePartialMessages: true,
       permissionMode: request.mode === "plan" ? "plan" : "default",
       abortController: controller,
       pathToClaudeCodeExecutable: claudePathOverride(),
@@ -108,14 +165,11 @@ async function main() {
     },
   })) {
     if (message.type === "system" && message.subtype === "init") send({ type: "ready", sessionId: message.session_id });
-    if (message.type === "assistant") {
-      for (const [index, block] of message.message.content.entries()) {
-        const id = block.id ?? `${message.uuid}-${index}`;
-        if (block.type === "text") send({ type: "item", item: { id, type: "agent_message", text: block.text } });
-        if (block.type === "thinking") send({ type: "item", item: { id, type: "reasoning", text: block.thinking } });
-        if (block.type === "tool_use") send({ type: "item", item: { id, type: "mcp_tool_call", server: "Claude", tool: block.name, arguments: block.input, status: "in_progress" } });
-      }
+    if (message.type === "stream_event") {
+      const item = streamEventItem(message, stream, streamedBlocks);
+      if (item) send({ type: "item", item });
     }
+    if (message.type === "assistant") for (const item of assistantItems(message, streamedBlocks)) send({ type: "item", item });
     if (message.type === "result") {
       if (message.is_error) throw new Error(message.errors?.join("\n") || "Claude turn failed");
       send({ type: "done", usage: message.usage });
@@ -125,4 +179,4 @@ async function main() {
 
 if (process.env.NOVA_CLAUDE_BRIDGE_TEST !== "1") main().catch((error) => { send({ ok: false, error: error instanceof Error ? error.message : String(error) }); process.exitCode = 1; });
 
-export { claudeModelOptions, claudeModelSelection };
+export { assistantItems, claudeModelOptions, claudeModelSelection, streamEventItem };

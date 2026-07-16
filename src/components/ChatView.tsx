@@ -275,6 +275,7 @@ export function ChatView() {
       scheduleBottomPin();
     });
     ro.observe(innerRef);
+    ro.observe(scrollRef);
 
     const scrollUpKeys = new Set(["ArrowUp", "PageUp", "Home"]);
     const scrollDownKeys = new Set(["ArrowDown", "PageDown", "End"]);
