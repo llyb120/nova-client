@@ -37,6 +37,8 @@ const SHARED_KEY: &str = "__shared__";
 const AUX_KEY: &str = "__aux__";
 const OPENCODE_BASE_MODEL_META: &str = "nova.ai/opencodeBaseModel";
 const OPENCODE_VARIANT_META: &str = "nova.ai/opencodeVariant";
+const CURSOR_CONTINUE_PROMPT: &str =
+    "<system_reminder>Please continue. Respond to the user or make tool calls.</system_reminder>";
 
 #[cfg(windows)]
 const CURSOR_WINDOWS_HIDE_PATCH: &str = include_str!("../cursor-windows-hide.cjs");
@@ -3909,14 +3911,18 @@ impl AcpManager {
         } else {
             String::new()
         };
+        let mut force_rebuild = false;
+        let mut cursor_continues = 0u32;
+        let mut continuing = false;
         for attempt in 1..=max_attempts {
             if !self.is_running(thread_id) {
                 return Err("任务已停止".into());
             }
-            let needs_rebuild = prompt_conn_needs_rebuild(
-                conn.as_ref().map(|conn| conn.alive.load(Ordering::SeqCst)),
-                &last_err,
-            );
+            let needs_rebuild = force_rebuild
+                || prompt_conn_needs_rebuild(
+                    conn.as_ref().map(|conn| conn.alive.load(Ordering::SeqCst)),
+                    &last_err,
+                );
             if needs_rebuild && (attempt > 1 || conn.is_none()) {
                 // 已有输出时不重建（上面 soft-finish 会先 return）；此处仅无输出场景。
                 let produced = {
@@ -3927,7 +3933,7 @@ impl AcpManager {
                         .map(|t| t.items.len() > items_at_prompt)
                         .unwrap_or(false)
                 };
-                if produced {
+                if produced && !force_rebuild {
                     break;
                 }
                 self.push_log(format!(
@@ -3949,8 +3955,11 @@ impl AcpManager {
                         })
                     };
                     if let Some(ctx) = ctx {
-                        prompt =
-                            Self::build_user_prompt_blocks(text, images, include_runtime_guidance);
+                        prompt = if continuing {
+                            Self::build_user_prompt_blocks(CURSOR_CONTINUE_PROMPT, &[], false)
+                        } else {
+                            Self::build_user_prompt_blocks(text, images, include_runtime_guidance)
+                        };
                         prompt.insert(0, json!({ "type": "text", "text": ctx }));
                     }
                 }
@@ -3969,6 +3978,7 @@ impl AcpManager {
                     break;
                 }
                 last_err.clear();
+                force_rebuild = false;
             } else if conn
                 .as_ref()
                 .map(|conn| !conn.alive.load(Ordering::SeqCst))
@@ -3994,6 +4004,11 @@ impl AcpManager {
                 .lock()
                 .unwrap()
                 .insert(session_id.clone(), std::time::Instant::now());
+            let attempt_items_start = {
+                let state = self.app.state::<AppState>();
+                let store = state.store.lock().unwrap();
+                store.get(thread_id).map(|t| t.items.len()).unwrap_or(0)
+            };
             match conn
                 .request(
                     "session/prompt",
@@ -4010,6 +4025,66 @@ impl AcpManager {
                         .as_str()
                         .unwrap_or("end_turn")
                         .to_string();
+                    if self.kind == AgentKind::Cursor && stop == "end_turn" {
+                        let signal = {
+                            let state = self.app.state::<AppState>();
+                            let store = state.store.lock().unwrap();
+                            store.get(thread_id).and_then(|thread| {
+                                cursor_turn_signal(
+                                    thread.items.get(attempt_items_start..).unwrap_or(&[]),
+                                )
+                            })
+                        };
+                        match signal {
+                            Some(CursorTurnSignal::RetriableError { item_id, error }) => {
+                                {
+                                    let state = self.app.state::<AppState>();
+                                    let mut store = state.store.lock().unwrap();
+                                    if let Some(thread) = store.get_mut(thread_id) {
+                                        thread.items.retain(|item| item.id() != item_id);
+                                    }
+                                    store.save();
+                                }
+                                self.emit_update(
+                                    thread_id,
+                                    json!({ "t": "remove", "itemId": item_id }),
+                                );
+                                last_err = error;
+                                if attempt < max_attempts {
+                                    continuing = true;
+                                    prompt = Self::build_user_prompt_blocks(
+                                        CURSOR_CONTINUE_PROMPT,
+                                        &[],
+                                        false,
+                                    );
+                                    force_rebuild = true;
+                                    let delay_ms = retriable_backoff_ms(attempt);
+                                    self.push_log(format!(
+                                        "[nova] Cursor 将瞬时错误作为正文返回（第{attempt}/{max_attempts}次）：{last_err}，重建会话后继续"
+                                    ));
+                                    sleep(Duration::from_millis(delay_ms)).await;
+                                    continue;
+                                }
+                                break;
+                            }
+                            Some(CursorTurnSignal::NeedsContinue)
+                                if cursor_continues < 2 && attempt < max_attempts =>
+                            {
+                                cursor_continues += 1;
+                                continuing = true;
+                                prompt = Self::build_user_prompt_blocks(
+                                    CURSOR_CONTINUE_PROMPT,
+                                    &[],
+                                    false,
+                                );
+                                self.push_log(format!(
+                                    "[nova] Cursor 以过程性消息提前结束，自动继续（第{cursor_continues}/2次）"
+                                ));
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     let usage = resp.get("usage").cloned().filter(|v| !v.is_null());
                     return Ok((stop, usage));
                 }
@@ -4029,6 +4104,18 @@ impl AcpManager {
                             .unwrap_or(false)
                     };
                     if produced {
+                        if self.kind == AgentKind::Cursor && attempt < max_attempts {
+                            continuing = true;
+                            prompt =
+                                Self::build_user_prompt_blocks(CURSOR_CONTINUE_PROMPT, &[], false);
+                            force_rebuild = true;
+                            let delay_ms = retriable_backoff_ms(attempt);
+                            self.push_log(format!(
+                                "[nova] session/prompt 云端中断且已有输出，重建会话后从中断处继续：{last_err}"
+                            ));
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
                         // 已有部分输出：保留会话与已生成内容，不当硬错误打断。
                         self.push_log(format!(
                             "[nova] session/prompt 云端中断但已有输出，软收尾保留会话：{last_err}"
@@ -4049,6 +4136,9 @@ impl AcpManager {
                         return Ok(("end_turn".into(), None));
                     }
                     if attempt < max_attempts {
+                        if self.kind == AgentKind::Cursor {
+                            force_rebuild = true;
+                        }
                         let delay_ms = retriable_backoff_ms(attempt);
                         self.push_log(format!(
                             "[nova] session/prompt 瞬时失败（第{attempt}/{max_attempts}次）：{last_err}，{delay_ms}ms 后重试"
@@ -5106,6 +5196,55 @@ fn is_retriable_rpc_error(err: &str) -> bool {
         || lower == "internalerror"
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CursorTurnSignal {
+    RetriableError { item_id: u64, error: String },
+    NeedsContinue,
+}
+
+fn cursor_turn_signal(items: &[Item]) -> Option<CursorTurnSignal> {
+    let has_tool = items.iter().any(|item| matches!(item, Item::Tool { .. }));
+    let (item_id, text) = items.iter().rev().find_map(|item| match item {
+        Item::Assistant { id, text, .. } if !text.trim().is_empty() => Some((*id, text.trim())),
+        _ => None,
+    })?;
+    if text.to_ascii_lowercase().starts_with("error:") && is_retriable_rpc_error(text) {
+        return Some(CursorTurnSignal::RetriableError {
+            item_id,
+            error: text.to_string(),
+        });
+    }
+    if has_tool && cursor_progress_text_needs_continue(text) {
+        return Some(CursorTurnSignal::NeedsContinue);
+    }
+    None
+}
+
+fn cursor_progress_text_needs_continue(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > 240 {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    let ongoing = ["接着", "接下来", "继续", "正在", "准备", "下一步"]
+        .iter()
+        .any(|marker| text.contains(marker))
+        || [
+            "continuing",
+            "continue to",
+            "next i will",
+            "next, i will",
+            "i'll now",
+            "i will now",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let finished = ["已完成", "修复完成", "全部完成", "无需继续"]
+        .iter()
+        .any(|marker| text.contains(marker));
+    ongoing && !finished
+}
+
 fn is_process_exit_error(err: &str) -> bool {
     err.contains("进程已退出") || err.contains("进程不可写") || err.contains("连接已断开")
 }
@@ -5991,6 +6130,54 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
         assert!(is_process_exit_error("Cursor 进程不可写（已退出？）"));
         assert!(is_process_exit_error("Cursor 连接已断开"));
         assert!(!is_process_exit_error("Internal error"));
+    }
+
+    #[test]
+    fn detects_cursor_retriable_error_returned_as_assistant_text() {
+        let items = vec![Item::Assistant {
+            id: 7,
+            text: "Error: RetriableError: [aborted] read ECONNRESET".into(),
+            ts: 1,
+        }];
+        assert_eq!(
+            cursor_turn_signal(&items),
+            Some(CursorTurnSignal::RetriableError {
+                item_id: 7,
+                error: "Error: RetriableError: [aborted] read ECONNRESET".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn continues_cursor_turn_that_ends_with_progress_message() {
+        let items = vec![
+            Item::Tool {
+                id: 1,
+                ts: 1,
+                call: ToolCall {
+                    tool_call_id: "tool-1".into(),
+                    title: "Read File".into(),
+                    kind: "read".into(),
+                    status: "completed".into(),
+                    content: vec![],
+                    locations: vec![],
+                    raw_input: None,
+                    raw_output: None,
+                },
+            },
+            Item::Assistant {
+                id: 2,
+                text: "后端星标逻辑看起来没问题，接着查前端布局和点击取消为什么失效。".into(),
+                ts: 2,
+            },
+        ];
+        assert_eq!(
+            cursor_turn_signal(&items),
+            Some(CursorTurnSignal::NeedsContinue)
+        );
+        assert!(!cursor_progress_text_needs_continue(
+            "修复完成，接下来您可以重新测试。"
+        ));
     }
 
     #[test]
