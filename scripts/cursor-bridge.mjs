@@ -73,8 +73,19 @@ function completePendingTools(state) {
 
 function modelSelection(selected) {
   if (!selected) return undefined;
+  const separator = selected.indexOf("::");
+  if (separator >= 0) {
+    const id = selected.slice(0, separator);
+    const params = [...new URLSearchParams(selected.slice(separator + 2))]
+      .map(([paramId, value]) => ({ id: paramId, value }));
+    return { id, ...(params.length ? { params } : {}) };
+  }
   const segments = selected.split("-");
   const params = [];
+  if (segments.at(-1) === "false") {
+    segments.pop();
+    params.unshift({ id: "fast", value: "false" });
+  }
   if (segments.at(-1) === "fast") {
     segments.pop();
     params.unshift({ id: "fast", value: "true" });
@@ -86,13 +97,18 @@ function modelSelection(selected) {
 }
 
 function encodeModelVariant(model, variant) {
-  const suffix = variant.params
-    .map((param) => param.id === "fast" && param.value === "true" ? "fast" : param.value)
-    .filter(Boolean)
-    .join("-");
+  const params = new URLSearchParams(variant.params.map((param) => [param.id, param.value]));
+  const definitions = new Map((model.parameters ?? []).map((param) => [param.id, param]));
+  const labels = variant.params.flatMap((param) => {
+    if (param.value === "false") return [];
+    const definition = definitions.get(param.id);
+    if (param.value === "true") return [definition?.displayName ?? param.id];
+    const value = definition?.values?.find((item) => item.value === param.value);
+    return [value?.displayName ?? param.value];
+  });
   return {
-    value: suffix ? `${model.id}-${suffix}` : model.id,
-    name: variant.displayName || `${model.displayName} ${suffix}`,
+    value: `${model.id}::${params}`,
+    name: [model.displayName, ...labels].join(" "),
     description: variant.description || model.description,
   };
 }
@@ -100,7 +116,7 @@ function encodeModelVariant(model, variant) {
 function cursorModelOptions(models) {
   const options = [{ value: "", name: "Auto（Cursor 默认）" }];
   for (const model of models) {
-    if (!model.id || model.id.toLowerCase() === "auto") continue;
+    if (!model.id || ["auto", "default"].includes(model.id.toLowerCase())) continue;
     if (model.variants?.length) {
       options.push(...model.variants.map((variant) => encodeModelVariant(model, variant)));
     } else {
@@ -116,6 +132,7 @@ async function modelOptions() {
     ? await Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY }).catch(() => [])
     : [];
   return {
+    novaCursorModelSchema: 2,
     configOptions: [{
       id: "model",
       name: "Model",

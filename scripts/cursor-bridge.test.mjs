@@ -30,17 +30,23 @@ assert.equal(embeddedDone.id, "embedded");
 assert.equal(embeddedDone.status, "completed");
 assert.deepEqual(embeddedDone.arguments, { query: "SDK auth" });
 assert.deepEqual(modelSelection("cursor-grok-4.5-high-fast"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] });
+assert.deepEqual(modelSelection("grok-4.5-high-false"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] });
 assert.deepEqual(modelSelection("composer-2.5-fast"), { id: "composer-2.5", params: [{ id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("gpt-5.6-sol"), { id: "gpt-5.6-sol" });
+assert.deepEqual(modelSelection("grok-4.5::effort=high&fast=false"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] });
 assert.deepEqual(cursorModelOptions([
   { id: "auto", displayName: "Auto" },
-  { id: "grok-4.5", displayName: "Grok 4.5", variants: [
-    { displayName: "Grok 4.5 High", params: [{ id: "effort", value: "high" }] },
-    { displayName: "Grok 4.5 High Fast", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] },
+  { id: "default", displayName: "Auto" },
+  { id: "grok-4.5", displayName: "Cursor Grok 4.5", parameters: [
+    { id: "effort", displayName: "Effort", values: [{ value: "high", displayName: "High" }] },
+    { id: "fast", displayName: "Fast", values: [{ value: "false" }, { value: "true", displayName: "Fast" }] },
+  ], variants: [
+    { displayName: "Cursor Grok 4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] },
+    { displayName: "Cursor Grok 4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] },
   ] },
 ]), [
   { value: "", name: "Auto（Cursor 默认）" },
-  { value: "grok-4.5-high", name: "Grok 4.5 High", description: undefined },
-  { value: "grok-4.5-high-fast", name: "Grok 4.5 High Fast", description: undefined },
+  { value: "grok-4.5::effort=high&fast=false", name: "Cursor Grok 4.5 High", description: undefined },
+  { value: "grok-4.5::effort=high&fast=true", name: "Cursor Grok 4.5 High Fast", description: undefined },
 ]);
 assert.deepEqual(await promptMessage([{ type: "text", text: "look" }, { type: "image_data", mime: "image/png", data: "base64" }]), { text: "look", images: [{ data: "base64", mimeType: "image/png" }] });

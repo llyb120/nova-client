@@ -4334,6 +4334,11 @@ pub fn run() {
                     (AgentKind::Cursor, &state.cursorplus),
                 ] {
                     if let Some(v) = model_cache::load(&dir, kind.as_str()) {
+                        if kind == AgentKind::Cursor
+                            && v.get("novaCursorModelSchema").and_then(Value::as_u64) != Some(2)
+                        {
+                            continue;
+                        }
                         manager.seed_model_options(v);
                     }
                 }
