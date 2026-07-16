@@ -473,6 +473,11 @@ export interface IncomingRoamRequest {
   /** 对方要求在 worktree 中执行（host 侧确认框据此提示） */
   worktree?: boolean;
   worktreeBranch?: string | null;
+  worktreeBase?: string | null;
+  model?: string | null;
+  mode?: string | null;
+  /** 已有会话授权过期后的单轮续期审批。 */
+  continuation?: boolean;
 }
 
 export interface QuotaRoamingProgress {

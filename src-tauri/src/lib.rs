@@ -3255,8 +3255,25 @@ fn respond_roam_request(
     state: State<'_, AppState>,
     req_id: String,
     accept: bool,
+    prompt: Option<String>,
+    folder: Option<String>,
+    model: Option<String>,
+    mode: Option<String>,
+    worktree: Option<bool>,
+    worktree_branch: Option<String>,
+    worktree_base: Option<String>,
 ) -> Result<(), String> {
-    state.relay.respond_roam_request(&req_id, accept)
+    state.relay.respond_roam_request(
+        &req_id,
+        accept,
+        prompt,
+        folder,
+        model,
+        mode,
+        worktree,
+        worktree_branch,
+        worktree_base,
+    )
 }
 
 /// 强制重启 devin 进程：杀进程后所有挂起的轮次会立即失败返回，

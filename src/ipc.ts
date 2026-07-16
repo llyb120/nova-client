@@ -230,8 +230,19 @@ export const api = {
       worktreeBranch,
       worktreeBase,
     }),
-  respondRoamRequest: (reqId: string, accept: boolean) =>
-    invoke<void>("respond_roam_request", { reqId, accept }),
+  respondRoamRequest: (
+    reqId: string,
+    accept: boolean,
+    changes: {
+      prompt: string;
+      folder: string;
+      model: string;
+      mode: string;
+      worktree: boolean;
+      worktreeBranch: string;
+      worktreeBase: string;
+    },
+  ) => invoke<void>("respond_roam_request", { reqId, accept, ...changes }),
   createQuotaThread: (
     peerToken: string,
     peerName: string,

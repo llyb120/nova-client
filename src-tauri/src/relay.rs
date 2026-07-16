@@ -63,6 +63,7 @@ const QUOTA_OPERATION_COMMITTED: u8 = 2;
 struct RoamGuest {
     token: String,
     guest_thread_id: String,
+    approved_until: Instant,
 }
 
 /// host 侧：一条等待本机用户确认的漫游请求
@@ -82,7 +83,14 @@ struct PendingRoam {
     worktree_branch: Option<String>,
     /// worktree 基于哪个分支/提交创建（空 = host 仓库当前 HEAD）
     worktree_base: Option<String>,
+    /// 审批时展示并允许 host 修改的提示词。
+    prompt: Option<String>,
+    /// 续期审批时已有的 host 会话；首次创建时为空。
+    host_thread_id: Option<String>,
+    images: Vec<PromptImage>,
 }
+
+const ROAM_AUTHORIZATION_DURATION: Duration = Duration::from_secs(30 * 60);
 
 struct PendingQuotaClient {
     peer: String,
@@ -2471,6 +2479,9 @@ impl RelayManager {
                 worktree,
                 worktree_branch: worktree_branch.clone(),
                 worktree_base,
+                prompt: prompt.clone(),
+                host_thread_id: None,
+                images: Vec::new(),
             },
         );
         let _ = self.app.emit(
@@ -2488,6 +2499,10 @@ impl RelayManager {
                 // worktree：确认框提示「对方要求在 worktree 中执行」
                 "worktree": worktree,
                 "worktreeBranch": worktree_branch,
+                "worktreeBase": env.data["worktreeBase"].clone(),
+                "model": env.data["model"].clone(),
+                "mode": env.data["mode"].clone(),
+                "continuation": false,
             }),
         );
         self.notify_roam_request(&env.from_name, &basename(&folder));
@@ -2500,21 +2515,59 @@ impl RelayManager {
         self: &Arc<Self>,
         req_id: &str,
         accept: bool,
+        prompt: Option<String>,
+        folder: Option<String>,
+        model: Option<String>,
+        mode: Option<String>,
+        worktree: Option<bool>,
+        worktree_branch: Option<String>,
+        worktree_base: Option<String>,
     ) -> Result<(), String> {
-        let pending = self
+        let mut pending = self
             .incoming_roams
             .lock()
             .unwrap()
             .remove(req_id)
             .ok_or("漫游请求已失效")?;
         if !accept {
-            self.spawn_send_now(
-                pending.from.clone(),
-                "roaming.created",
-                json!({ "reqId": req_id, "ok": false, "error": "对方拒绝了漫游请求" }),
-            );
+            if pending.host_thread_id.is_some() {
+                self.spawn_send_now(
+                    pending.from.clone(),
+                    "roaming.error",
+                    json!({ "guestThreadId": pending.guest_thread_id, "error": "对方拒绝了本轮漫游授权" }),
+                );
+            } else {
+                self.spawn_send_now(
+                    pending.from.clone(),
+                    "roaming.created",
+                    json!({ "reqId": req_id, "ok": false, "error": "对方拒绝了漫游请求" }),
+                );
+            }
             return Ok(());
         }
+        pending.prompt = prompt
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(host_thread_id) = pending.host_thread_id.clone() {
+            let Some(text) = pending.prompt else {
+                return Err("提示词不能为空".into());
+            };
+            if let Some(guest) = self.hosted.lock().unwrap().get_mut(&host_thread_id) {
+                guest.approved_until = Instant::now() + ROAM_AUTHORIZATION_DURATION;
+            } else {
+                return Err("漫游会话已失效".into());
+            }
+            self.run_roaming_prompt(host_thread_id, text, pending.images);
+            return Ok(());
+        }
+        if let Some(folder) = folder {
+            pending.folder = folder.trim().to_string();
+        }
+        pending.model = model.filter(|value| !value.trim().is_empty());
+        pending.mode = mode.filter(|value| !value.trim().is_empty());
+        pending.worktree = worktree.unwrap_or(pending.worktree);
+        pending.worktree_branch = worktree_branch.filter(|value| !value.trim().is_empty());
+        pending.worktree_base = worktree_base.filter(|value| !value.trim().is_empty());
         let this = Arc::clone(self);
         let req_id = req_id.to_string();
         std::thread::spawn(move || this.finish_roam_accept(req_id, pending));
@@ -2587,13 +2640,19 @@ impl RelayManager {
             RoamGuest {
                 token: pending.from.clone(),
                 guest_thread_id: pending.guest_thread_id.clone(),
+                approved_until: Instant::now() + ROAM_AUTHORIZATION_DURATION,
             },
         );
         let _ = self.app.emit(EV_THREADS, json!({}));
         self.spawn_send_now(
             pending.from.clone(),
             "roaming.created",
-            json!({ "reqId": req_id, "ok": true, "hostThreadId": host_thread_id }),
+            json!({
+                "reqId": req_id,
+                "ok": true,
+                "hostThreadId": host_thread_id,
+                "approvedPrompt": pending.prompt,
+            }),
         );
     }
 
@@ -2621,6 +2680,66 @@ impl RelayManager {
         let text = env.data["text"].as_str().unwrap_or_default().to_string();
         let images: Vec<PromptImage> =
             serde_json::from_value(env.data["images"].clone()).unwrap_or_default();
+        let guest = self.hosted.lock().unwrap().get(&host_thread_id).cloned();
+        let Some(guest) = guest.filter(|guest| guest.token == env.from) else {
+            return;
+        };
+        if guest.approved_until <= Instant::now() {
+            let req_id = uuid::Uuid::new_v4().to_string();
+            let (folder, agent_kind, model, mode) = {
+                let state = self.app.state::<AppState>();
+                let store = state.store.lock().unwrap();
+                let Some(thread) = store.get(&host_thread_id) else {
+                    return;
+                };
+                (
+                    thread.cwd.clone(),
+                    thread.agent_kind.clone(),
+                    thread.model.clone(),
+                    thread.mode.clone(),
+                )
+            };
+            self.incoming_roams.lock().unwrap().insert(
+                req_id.clone(),
+                PendingRoam {
+                    from: env.from.clone(),
+                    from_name: env.from_name.clone(),
+                    guest_thread_id: guest.guest_thread_id,
+                    folder: folder.clone(),
+                    agent_kind: agent_kind.clone(),
+                    model: model.clone(),
+                    mode: mode.clone(),
+                    clue_context: None,
+                    worktree: false,
+                    worktree_branch: None,
+                    worktree_base: None,
+                    prompt: Some(text.clone()),
+                    host_thread_id: Some(host_thread_id),
+                    images,
+                },
+            );
+            let _ = self.app.emit(
+                EV_RELAY_ROAM_REQUEST,
+                json!({
+                    "reqId": req_id,
+                    "from": env.from,
+                    "fromName": env.from_name,
+                    "folder": folder,
+                    "folderName": basename(&folder),
+                    "agentKind": agent_kind.as_str(),
+                    "prompt": text,
+                    "model": model,
+                    "mode": mode,
+                    "continuation": true,
+                }),
+            );
+            self.notify_roam_request(&env.from_name, &basename(&folder));
+            return;
+        }
+        self.run_roaming_prompt(host_thread_id, text, images);
+    }
+
+    fn run_roaming_prompt(&self, host_thread_id: String, text: String, images: Vec<PromptImage>) {
         let agent_kind = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
@@ -3144,6 +3263,8 @@ impl RelayManager {
             RoamGuest {
                 token,
                 guest_thread_id,
+                // 重启后不沿用旧授权，下一条提示词必须重新审批。
+                approved_until: Instant::now(),
             },
         );
         true
@@ -3229,7 +3350,13 @@ impl RelayManager {
             .unwrap()
             .remove(&guest_thread_id)
             .unwrap_or_default();
-        for (text, images) in queued {
+        let approved_prompt = env.data["approvedPrompt"].as_str();
+        for (index, (text, images)) in queued.into_iter().enumerate() {
+            let text = if index == 0 {
+                approved_prompt.unwrap_or(&text).to_string()
+            } else {
+                text
+            };
             self.spawn_send_now(
                 peer.clone(),
                 "roaming.prompt",
