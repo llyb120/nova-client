@@ -21,6 +21,7 @@ pub enum AgentKind {
     ClaudeCode,
     Cursor,
     OpenCode,
+    OpenCodePlus,
 }
 
 impl Default for AgentKind {
@@ -38,6 +39,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => "claudecode",
             AgentKind::Cursor => "cursor",
             AgentKind::OpenCode => "opencode",
+            AgentKind::OpenCodePlus => "opencodeplus",
         }
     }
 
@@ -50,6 +52,7 @@ impl AgentKind {
             "claudecode" => Some(AgentKind::ClaudeCode),
             "cursor" => Some(AgentKind::Cursor),
             "opencode" => Some(AgentKind::OpenCode),
+            "opencodeplus" => Some(AgentKind::OpenCodePlus),
             _ => None,
         }
     }
@@ -63,6 +66,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => "Claude Code",
             AgentKind::Cursor => "Cursor",
             AgentKind::OpenCode => "OpenCode",
+            AgentKind::OpenCodePlus => "OpenCode+",
         }
     }
 }

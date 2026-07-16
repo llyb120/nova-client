@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "dev:tauri": "npm run build:opencode-bridge && vite",
+    "build": "npm run build:opencode-bridge && vite build",
+    "build:opencode-bridge": "esbuild scripts/opencode-bridge.mjs --bundle --platform=node --format=cjs --outfile=src-tauri/resources/opencode-bridge.cjs",
     "check": "tsc --noEmit",
     "preview": "vite preview",
     "tauri": "tauri",
@@ -15,9 +17,11 @@
     "@tauri-apps/cli": "^2.11.2",
     "typescript": "^6.0.3",
     "vite": "^8.0.16",
-    "vite-plugin-solid": "^2.11.12"
+    "vite-plugin-solid": "^2.11.12",
+    "esbuild": "^0.28.0"
   },
   "dependencies": {
+    "@opencode-ai/sdk": "^1.18.2",
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "diff": "^9.0.0",

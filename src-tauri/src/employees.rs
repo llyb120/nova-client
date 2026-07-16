@@ -1666,9 +1666,13 @@ fn thread_running(app: &AppHandle, thread_id: &str) -> bool {
         let store = state.store.lock().unwrap();
         store.get(thread_id).map(|t| t.agent_kind.clone())
     };
-    match kind.and_then(|kind| state.acp_for(&kind)) {
-        Some(mgr) => mgr.is_running(thread_id),
-        None => state.codex.is_running(thread_id),
+    match kind {
+        Some(AgentKind::OpenCodePlus) => state.opencodeplus.is_running(thread_id),
+        Some(kind) => match state.acp_for(&kind) {
+            Some(mgr) => mgr.is_running(thread_id),
+            None => state.codex.is_running(thread_id),
+        },
+        None => false,
     }
 }
 
@@ -2914,6 +2918,11 @@ async fn run_prompt_for_images(
     prompt: String,
     images: Vec<PromptImage>,
 ) {
+    if kind == &AgentKind::OpenCodePlus {
+        let mgr = app.state::<AppState>().opencodeplus.clone();
+        mgr.run_prompt(thread_id, prompt, images).await;
+        return;
+    }
     // 先取出 manager 再 await，避免持着 State 引用跨 await 点
     let acp_mgr = app.state::<AppState>().acp_for(kind);
     match acp_mgr {
@@ -3141,12 +3150,16 @@ pub(crate) async fn cancel_employee_thread(app: &AppHandle, thread_id: &str) {
         .lock()
         .unwrap()
         .insert(thread_id.to_string());
-    match state.acp_for(&kind) {
-        Some(mgr) => {
-            let _ = mgr.cancel(thread_id).await;
-        }
-        None => {
-            let _ = state.codex.cancel(thread_id).await;
+    if kind == AgentKind::OpenCodePlus {
+        state.opencodeplus.cancel(thread_id).await;
+    } else {
+        match state.acp_for(&kind) {
+            Some(mgr) => {
+                let _ = mgr.cancel(thread_id).await;
+            }
+            None => {
+                let _ = state.codex.cancel(thread_id).await;
+            }
         }
     }
 }
@@ -3413,9 +3426,15 @@ fn employee_has_running_thread(app: &AppHandle, employee_id: &str) -> bool {
             .map(|t| (t.id.clone(), t.agent_kind.clone()))
             .collect()
     };
-    ids.iter().any(|(id, kind)| match state.acp_for(kind) {
-        Some(mgr) => mgr.is_running(id),
-        None => state.codex.is_running(id),
+    ids.iter().any(|(id, kind)| {
+        if kind == &AgentKind::OpenCodePlus {
+            state.opencodeplus.is_running(id)
+        } else {
+            match state.acp_for(kind) {
+                Some(mgr) => mgr.is_running(id),
+                None => state.codex.is_running(id),
+            }
+        }
     })
 }
 

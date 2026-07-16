@@ -169,6 +169,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [claudecodeEnabled, setClaudecodeEnabled] = createSignal(s?.claudecodeEnabled !== false);
   const [cursorEnabled, setCursorEnabled] = createSignal(s?.cursorEnabled !== false);
   const [opencodeEnabled, setOpencodeEnabled] = createSignal(s?.opencodeEnabled !== false);
+  const [opencodeplusEnabled, setOpencodeplusEnabled] = createSignal(s?.opencodeplusEnabled !== false);
   // 旧值（bypass 等）归一到统一模式 build/plan
   const [defaultMode, setDefaultMode] = createSignal(
     normalizeUnifiedMode(s?.defaultMode) ?? s?.defaultMode ?? "",
@@ -242,6 +243,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       claudecodeEnabled(),
       cursorEnabled(),
       opencodeEnabled(),
+      opencodeplusEnabled(),
     ].filter(Boolean).length;
 
   const quotaShareKinds = createMemo<AgentKind[]>(() => {
@@ -408,6 +410,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     claudecodeEnabled: claudecodeEnabled(),
     cursorEnabled: cursorEnabled(),
     opencodeEnabled: opencodeEnabled(),
+    opencodeplusEnabled: opencodeplusEnabled(),
     worktreeDir: worktreeDir().trim(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
@@ -1252,6 +1255,28 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </span>
               </label>
               <ProxyField value={opencodeProxy()} onInput={setOpencodeProxy} />
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class={`agent-badge opencodeplus`}>{agentLabel("opencodeplus")}</span>
+                <Show when={backendMissing("opencodeplus")}>
+                  <span class="backend-missing">未检测到 CLI</span>
+                </Show>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={opencodeplusEnabled()}
+                    disabled={opencodeplusEnabled() && enabledCount() === 1}
+                    onChange={(e) => setOpencodeplusEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <p class="field-hint">
+                OpenCode 官方 SDK 接入（非 ACP）。Nova 会启动 Node.js bridge 并直接调用
+                @opencode-ai/sdk，复用上方 OpenCode CLI、代理和凭据配置。
+              </p>
             </div>
 
             <p class="field-hint">

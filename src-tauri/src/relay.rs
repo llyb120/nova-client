@@ -213,6 +213,7 @@ fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> 
         AgentKind::ClaudeCode => settings.claudecode_enabled,
         AgentKind::Cursor => settings.cursor_enabled,
         AgentKind::OpenCode => settings.opencode_enabled,
+        AgentKind::OpenCodePlus => false,
     };
     enabled
         && !model.is_empty()
@@ -2221,6 +2222,7 @@ impl RelayManager {
                     (AgentKind::ClaudeCode, s.claudecode_enabled),
                     (AgentKind::Cursor, s.cursor_enabled),
                     (AgentKind::OpenCode, s.opencode_enabled),
+                    (AgentKind::OpenCodePlus, s.opencodeplus_enabled),
                 ]
                 .into_iter()
                 // 可用性未检测完（map 为空/无该键）时按可用处理，避免误伤
@@ -2234,11 +2236,20 @@ impl RelayManager {
             let mut shared_options = serde_json::Map::new();
             for kind in kinds {
                 backends.push(kind.as_str());
-                let fetched = match app.state::<AppState>().acp_for(&kind) {
-                    Some(mgr) => mgr.fetch_model_options().await,
-                    None => {
-                        let mgr = app.state::<AppState>().codex.clone();
-                        mgr.fetch_model_options().await
+                let fetched = match kind {
+                    AgentKind::OpenCodePlus => {
+                        app.state::<AppState>()
+                            .opencodeplus
+                            .ensure_model_options()
+                            .await
+                    }
+                    AgentKind::Codex => app.state::<AppState>().codex.fetch_model_options().await,
+                    _ => {
+                        app.state::<AppState>()
+                            .acp_for(&kind)
+                            .expect("ACP 后端必有 manager")
+                            .fetch_model_options()
+                            .await
                     }
                 };
                 if let Ok(v) = fetched {
@@ -2759,6 +2770,14 @@ impl RelayManager {
             (epoch, value)
         };
         match agent_kind {
+            AgentKind::OpenCodePlus => {
+                let mgr = state.opencodeplus.clone();
+                tauri::async_runtime::spawn(async move {
+                    if host_prompt_is_current(&prompt_epoch) {
+                        mgr.run_prompt(host_thread_id, text, images).await;
+                    }
+                });
+            }
             AgentKind::CodeBuddy => {
                 // CodeBuddy 单连接不能并发：运行中再发不走「注入」，一律 run_prompt，
                 // 经串行闸门排到当前轮次之后顺序执行（详见 acp.rs 的 serial_gate 说明）。
@@ -2833,6 +2852,17 @@ impl RelayManager {
                 .fetch_add(1, Ordering::SeqCst);
         }
         let state = self.app.state::<AppState>();
+        if agent_kind == AgentKind::OpenCodePlus {
+            let mgr = state.opencodeplus.clone();
+            if !mgr.is_running(&host_thread_id) {
+                self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
+                return;
+            }
+            tauri::async_runtime::spawn(async move {
+                mgr.cancel(&host_thread_id).await;
+            });
+            return;
+        }
         match state.acp_for(&agent_kind) {
             Some(mgr) => {
                 if !mgr.is_running(&host_thread_id) {

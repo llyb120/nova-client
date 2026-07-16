@@ -202,7 +202,7 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
                 proxy: settings.cursor_proxy.clone(),
             }
         }
-        AgentKind::OpenCode => {
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
             let program =
                 configured_cli_program(&settings.opencode_path, &["opencode"], "opencode");
             let (install_program, install_args) = npm_installer("opencode-ai@latest");
@@ -229,6 +229,7 @@ fn all_specs(settings: &Settings) -> Vec<CliSpec> {
         AgentKind::ClaudeCode,
         AgentKind::Cursor,
         AgentKind::OpenCode,
+        AgentKind::OpenCodePlus,
     ]
     .iter()
     .map(|kind| spec_for(kind, settings))
@@ -569,6 +570,7 @@ pub async fn statuses(settings: &Settings) -> Vec<CliStatus> {
 async fn stop_backend(state: &AppState, kind: &AgentKind) {
     match kind {
         AgentKind::Codex => state.codex.restart().await,
+        AgentKind::OpenCodePlus => state.opencodeplus.shutdown(),
         _ => {
             if let Some(manager) = state.acp_for(kind) {
                 manager.restart().await;

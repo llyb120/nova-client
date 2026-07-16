@@ -1,4 +1,4 @@
-export type AgentKind = "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
+export type AgentKind = "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode" | "opencodeplus";
 
 export interface SlashCommand {
   name: string;
@@ -350,6 +350,7 @@ export interface Settings {
   claudecodeEnabled: boolean;
   cursorEnabled: boolean;
   opencodeEnabled: boolean;
+  opencodeplusEnabled: boolean;
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
   worktreeDir: string;
   /** 是否自动清理长期未更新的会话 */

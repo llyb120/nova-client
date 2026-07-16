@@ -171,6 +171,7 @@ export const [state, setState] = createStore<AppStore>({
     claudecode: null,
     cursor: null,
     opencode: null,
+    opencodeplus: null,
   },
   logs: [],
   loadingThread: false,
@@ -186,6 +187,7 @@ export const [state, setState] = createStore<AppStore>({
     claudecode: [],
     cursor: [],
     opencode: [],
+    opencodeplus: [],
   },
   updateProgress: null,
   cliOperationProgress: null,
@@ -381,6 +383,7 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
   "claudecode",
   "cursor",
   "opencode",
+  "opencodeplus",
 ];
 
 /** 某后端在设置里是否启用。缺字段（老版本 settings）按启用处理（!== false）。 */
@@ -398,6 +401,8 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
       return s.cursorEnabled !== false;
     case "opencode":
       return s.opencodeEnabled !== false;
+    case "opencodeplus":
+      return s.opencodeplusEnabled !== false;
   }
 }
 

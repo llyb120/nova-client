@@ -618,6 +618,13 @@ button {
   background: color-mix(in srgb, var(--green) 13%, transparent);
 }
 
+.thread-agent.opencodeplus,
+.agent-badge.opencodeplus {
+  color: #f0a35b;
+  border-color: color-mix(in srgb, #f0a35b 45%, transparent);
+  background: color-mix(in srgb, #f0a35b 12%, transparent);
+}
+
 .thread-ephemeral {
   flex-shrink: 0;
   height: 16px;

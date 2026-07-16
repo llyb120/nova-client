@@ -681,6 +681,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         AgentKind::ClaudeCode,
         AgentKind::Cursor,
         AgentKind::OpenCode,
+        AgentKind::OpenCodePlus,
     ] {
         if !state.agent_enabled(&kind) {
             continue;
@@ -695,9 +696,10 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         if !available {
             continue;
         }
-        let value = match state.acp_for(&kind) {
-            Some(mgr) => mgr.get_model_options(),
-            None => state.codex.get_model_options(),
+        let value = match kind {
+            AgentKind::OpenCodePlus => state.opencodeplus.get_model_options(),
+            AgentKind::Codex => state.codex.get_model_options(),
+            _ => state.acp_for(&kind).and_then(|mgr| mgr.get_model_options()),
         }
         .unwrap_or_else(|| json!({ "configOptions": [], "modes": null }));
         out.insert(kind.as_str().to_string(), value);
@@ -1382,6 +1384,14 @@ fn send_prompt(app: &AppHandle, thread_id: &str, text: &str) -> Result<(), Strin
         thread.agent_kind.clone()
     };
     match kind {
+        AgentKind::OpenCodePlus => {
+            let mgr = state.opencodeplus.clone();
+            let id = thread_id.to_string();
+            if mgr.is_running(&id) {
+                return Err("OpenCode+ 当前轮次尚未结束".into());
+            }
+            tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
+        }
         AgentKind::CodeBuddy | AgentKind::Cursor => {
             let mgr = state.acp_for(&kind).ok_or("后端不可用")?;
             let id = thread_id.to_string();
@@ -1427,6 +1437,10 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         }
         thread.agent_kind.clone()
     };
+    if kind == AgentKind::OpenCodePlus {
+        state.opencodeplus.cancel(thread_id).await;
+        return Ok(());
+    }
     if kind == AgentKind::Cursor {
         let mgr = state.acp_for(&kind).ok_or("后端不可用")?;
 

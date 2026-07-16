@@ -201,11 +201,11 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 TargetFormat::CursorRule,
             )
         }
-        AgentKind::OpenCode => {
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
             let root = configured_dir(overrides, "XDG_CONFIG_HOME")
                 .unwrap_or_else(|| home.join(".config"));
             (
-                "OpenCode",
+                kind.label(),
                 root.join("opencode").join("AGENTS.md"),
                 TargetFormat::Markdown,
             )

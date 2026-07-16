@@ -13,6 +13,8 @@ export function agentLabel(kind: AgentKind): string {
       return "Cursor";
     case "opencode":
       return "OpenCode";
+    case "opencodeplus":
+      return "OpenCode+";
     default:
       return "Devin";
   }
@@ -32,6 +34,8 @@ export function agentShort(kind: AgentKind): string {
       return "CS";
     case "opencode":
       return "OC";
+    case "opencodeplus":
+      return "OC+";
     default:
       return "D";
   }

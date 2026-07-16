@@ -11,8 +11,7 @@ mod marks;
 mod mind;
 mod model_cache;
 mod notice;
-#[cfg(windows)]
-mod windows_shell_shim;
+mod opencode_sdk;
 mod path_env;
 mod quota;
 mod relay;
@@ -23,6 +22,8 @@ mod skills;
 mod sys_notify;
 mod threads;
 mod updater;
+#[cfg(windows)]
+mod windows_shell_shim;
 
 /// 临时会话目录的统一父目录名（前端据此识别并显示「临时会话」）
 pub const SCRATCH_MARK: &str = "Nova-scratch";
@@ -32,6 +33,7 @@ pub use path_env::init_process_path;
 use acp::AcpManager;
 use codex::CodexManager;
 use credential_roaming::{BorrowedManager, BorrowedRuntime};
+use opencode_sdk::OpenCodeSdkManager;
 use relay::{RelayManager, Share};
 use serde_json::{json, Value};
 use settings::Settings;
@@ -82,6 +84,8 @@ pub struct AppState {
     pub cursor: Arc<AcpManager>,
     /// OpenCode（opencode acp 模式）：每线程独立连接，支持多会话并行，空闲逐连接回收
     pub opencode: Arc<AcpManager>,
+    /// OpenCode 官方 SDK 对应的 HTTP API 后端，不经过 ACP。
+    pub opencodeplus: Arc<OpenCodeSdkManager>,
     pub codex: Arc<CodexManager>,
     /// 额度租借会话的独立后端进程与临时凭证目录（只在本次运行内存在）。
     pub borrowed_runtimes: Mutex<HashMap<String, BorrowedRuntime>>,
@@ -115,7 +119,7 @@ impl AppState {
             AgentKind::ClaudeCode => Some(self.claudecode.clone()),
             AgentKind::Cursor => Some(self.cursor.clone()),
             AgentKind::OpenCode => Some(self.opencode.clone()),
-            AgentKind::Codex => None,
+            AgentKind::Codex | AgentKind::OpenCodePlus => None,
         }
     }
 
@@ -148,6 +152,7 @@ impl AppState {
             AgentKind::ClaudeCode => s.claudecode_enabled,
             AgentKind::Cursor => s.cursor_enabled,
             AgentKind::OpenCode => s.opencode_enabled,
+            AgentKind::OpenCodePlus => s.opencodeplus_enabled,
         }
     }
 
@@ -178,6 +183,21 @@ impl AppState {
                 s.title_model.trim().to_string(),
             )
         };
+        if AgentKind::from_str(&agent_raw) == Some(AgentKind::OpenCodePlus)
+            && self.agent_enabled(&AgentKind::OpenCodePlus)
+        {
+            self.opencodeplus
+                .generate_title_async(thread_id, prompt, fallback, model);
+            return;
+        }
+        if agent_raw.is_empty()
+            && origin == &AgentKind::OpenCodePlus
+            && self.agent_enabled(&AgentKind::OpenCodePlus)
+        {
+            self.opencodeplus
+                .generate_title_async(thread_id, prompt, fallback, String::new());
+            return;
+        }
         let (mgr, model) = match AgentKind::from_str(&agent_raw) {
             Some(kind) if self.agent_enabled(&kind) => match self.acp_for(&kind) {
                 Some(mgr) => (mgr, model),
@@ -198,6 +218,9 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
             .borrowed_runtime(&thread.id)
             .map(|runtime| runtime.is_running(&thread.id))
             .unwrap_or(false);
+    }
+    if thread.agent_kind == AgentKind::OpenCodePlus {
+        return state.opencodeplus.is_running(&thread.id);
     }
     match state.acp_for(&thread.agent_kind) {
         Some(mgr) => mgr.is_running(&thread.id),
@@ -995,6 +1018,9 @@ fn prewarm(
         mode.filter(|s| !s.is_empty())
             .or(Some(default_mode).filter(|s| !s.is_empty()))
     };
+    if agent_kind == AgentKind::OpenCodePlus {
+        return;
+    }
     match state.acp_for(&agent_kind) {
         Some(mgr) => {
             tauri::async_runtime::spawn(async move {
@@ -2347,7 +2373,9 @@ fn set_thread_agent(
         // 旧 remote session 只属于切换前的后端。不能清理目标后端：OpenCode 等独占连接
         // 的 manager 会异步杀掉 thread_id 对应连接，若紧接着发送首条接力消息，可能误杀
         // 刚创建的新连接并导致 session not found。
-        if let Some(mgr) = state.acp_for(&old_kind) {
+        if old_kind == AgentKind::OpenCodePlus {
+            state.opencodeplus.forget_session_of_thread(&thread_id);
+        } else if let Some(mgr) = state.acp_for(&old_kind) {
             mgr.forget_session_of_thread(&thread_id);
         } else {
             state.codex.forget_session_of_thread(&thread_id);
@@ -2372,6 +2400,9 @@ async fn get_model_options(
     if !state.agent_enabled(&agent_kind) {
         return Err(format!("{} 后端已关闭", agent_kind.label()));
     }
+    if agent_kind == AgentKind::OpenCodePlus {
+        return state.opencodeplus.ensure_model_options().await.map(Some);
+    }
     match state.acp_for(&agent_kind) {
         Some(mgr) => mgr.ensure_model_options().await.map(Some),
         None => state.codex.ensure_model_options().await.map(Some),
@@ -2386,6 +2417,9 @@ async fn get_slash_commands(
     let agent_kind = agent_kind.unwrap_or(AgentKind::Devin);
     if !state.agent_enabled(&agent_kind) {
         return Ok(Vec::new());
+    }
+    if agent_kind == AgentKind::OpenCodePlus {
+        return state.opencodeplus.fetch_commands().await;
     }
     match state.acp_for(&agent_kind) {
         Some(mgr) => {
@@ -2489,6 +2523,12 @@ fn send_prompt(
         return Ok(());
     }
     match agent_kind {
+        AgentKind::OpenCodePlus => {
+            let mgr = state.opencodeplus.clone();
+            tauri::async_runtime::spawn(async move {
+                mgr.run_prompt(thread_id, text, images).await;
+            });
+        }
         AgentKind::CodeBuddy | AgentKind::Cursor => {
             // 每线程独占一条连接，无法像 Devin 那样把追问并发「注入」当前轮次（会串台/
             // 冲掉，Cursor 还会在仍活跃的 turn 上报内部错误）。一律走 run_prompt——经串行
@@ -2574,6 +2614,7 @@ fn truncate_thread(
         mgr.forget_session_of_thread(&thread_id);
     }
     state.codex.forget_session_of_thread(&thread_id);
+    state.opencodeplus.forget_session_of_thread(&thread_id);
     if let Some(runtime) = state.borrowed_runtime(&thread_id) {
         match runtime.manager {
             BorrowedManager::Acp(manager) => manager.forget_session_of_thread(&thread_id),
@@ -2667,9 +2708,14 @@ async fn cancel_turn(
             emps.save();
         }
     }
-    match state.acp_for(&agent_kind_for_thread(&state, &thread_id)?) {
-        Some(mgr) => mgr.cancel(&thread_id).await,
-        None => state.codex.cancel(&thread_id).await,
+    let kind = agent_kind_for_thread(&state, &thread_id)?;
+    if kind == AgentKind::OpenCodePlus {
+        state.opencodeplus.cancel(&thread_id).await;
+    } else {
+        match state.acp_for(&kind) {
+            Some(mgr) => mgr.cancel(&thread_id).await,
+            None => state.codex.cancel(&thread_id).await,
+        }
     }
     if delete_work.unwrap_or(false) {
         employees::delete_work_by_thread(&app, &thread_id).await;
@@ -2729,7 +2775,12 @@ async fn respond_permission(
     if let Some(runtime) = borrowed {
         return runtime.respond_permission(&request_key, &option_id).await;
     }
-    if request_key.starts_with("codex-") {
+    if request_key.starts_with("ocp-") {
+        state
+            .opencodeplus
+            .respond_permission(&request_key, &option_id)
+            .await
+    } else if request_key.starts_with("codex-") {
         state
             .codex
             .respond_permission(&request_key, &option_id)
@@ -4155,6 +4206,7 @@ pub fn run() {
             let claudecode = AcpManager::new(app.handle().clone(), AgentKind::ClaudeCode);
             let cursor = AcpManager::new(app.handle().clone(), AgentKind::Cursor);
             let opencode = AcpManager::new(app.handle().clone(), AgentKind::OpenCode);
+            let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
             let relay = RelayManager::new(app.handle().clone(), dir.clone());
 
@@ -4181,6 +4233,7 @@ pub fn run() {
                 claudecode,
                 cursor,
                 opencode,
+                opencodeplus,
                 codex,
                 borrowed_runtimes: Mutex::new(HashMap::new()),
                 relay: relay.clone(),
@@ -4242,14 +4295,19 @@ pub fn run() {
                     AgentKind::ClaudeCode,
                     AgentKind::Cursor,
                     AgentKind::OpenCode,
+                    AgentKind::OpenCodePlus,
                 ]
                 .into_iter()
                 .find(|k| state.agent_enabled(k))
                 .unwrap_or(AgentKind::Devin);
                 // 与 get_model_options 共用 refreshing 闸门，避免启动时双开探测 session
-                match state.acp_for(&default_kind) {
-                    Some(mgr) => mgr.spawn_revalidate_model_options(),
-                    None => state.codex.spawn_revalidate_model_options(),
+                if default_kind == AgentKind::OpenCodePlus {
+                    state.opencodeplus.spawn_revalidate_model_options();
+                } else {
+                    match state.acp_for(&default_kind) {
+                        Some(mgr) => mgr.spawn_revalidate_model_options(),
+                        None => state.codex.spawn_revalidate_model_options(),
+                    }
                 }
             }
 

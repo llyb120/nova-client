@@ -84,6 +84,8 @@ pub struct Settings {
     pub claudecode_enabled: bool,
     pub cursor_enabled: bool,
     pub opencode_enabled: bool,
+    /// OpenCode SDK 后端开关；复用 OpenCode CLI 路径与代理配置。
+    pub opencodeplus_enabled: bool,
     /// worktree 工作目录的根（空 = 应用数据目录下的 worktrees/）。
     /// 会话开启「在 worktree 中执行」时，在此目录下为其创建独立工作目录。
     pub worktree_dir: String,
@@ -142,6 +144,7 @@ impl Default for Settings {
             claudecode_enabled: true,
             cursor_enabled: true,
             opencode_enabled: true,
+            opencodeplus_enabled: true,
             worktree_dir: String::new(),
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,

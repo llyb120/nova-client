@@ -255,6 +255,7 @@ pub fn collect_credentials(agent_kind: AgentKind) -> Result<CredentialBundle, St
                 &mut files,
             )?;
         }
+        AgentKind::OpenCodePlus => return Err("OpenCode+ 暂不支持额度租借".into()),
     }
     let total = files
         .iter()
@@ -395,6 +396,7 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
             env.insert("XDG_CONFIG_HOME".into(), as_string(config));
             env.insert("XDG_CACHE_HOME".into(), as_string(cache));
         }
+        AgentKind::OpenCodePlus => return Err("OpenCode+ 暂不支持额度租借".into()),
     }
     Ok(env)
 }
