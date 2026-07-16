@@ -333,10 +333,26 @@ export function ChatView() {
   const currentMeta = createMemo(() =>
     state.threads.find((t) => t.id === state.currentId),
   );
+  const [starUpdating, setStarUpdating] = createSignal(false);
   const roamingRole = () => currentMeta()?.roamingRole ?? null;
   const canStar = () => {
     const meta = currentMeta();
     return !!meta && !meta.employeeId && !meta.mindThread && !meta.roamingRole && !meta.quotaPeerName;
+  };
+  const toggleStar = async () => {
+    const meta = currentMeta();
+    if (!meta || starUpdating()) return;
+    const starred = !meta.starred;
+    setStarUpdating(true);
+    setState("threads", (thread) => thread.id === meta.id, "starred", starred);
+    try {
+      await api.setThreadStarred(meta.id, starred);
+    } catch (error) {
+      setState("threads", (thread) => thread.id === meta.id, "starred", !starred);
+      void message(String(error), { kind: "error" });
+    } finally {
+      setStarUpdating(false);
+    }
   };
   // worktree 会话的 cwd 是 uuid 工作目录，展示时用源仓库路径更直观
   const cwdDisplay = () => currentMeta()?.worktree?.repo || state.cwd;
@@ -404,13 +420,7 @@ export function ChatView() {
             classList={{ starred: !!currentMeta()?.starred }}
             title={currentMeta()?.starred ? "取消星标" : "加星标并在项目内置顶"}
             aria-pressed={!!currentMeta()?.starred}
-            onClick={() => {
-              const meta = currentMeta();
-              if (!meta) return;
-              void api
-                .setThreadStarred(meta.id, !meta.starred)
-                .catch((error) => void message(String(error), { kind: "error" }));
-            }}
+            onClick={() => void toggleStar()}
           >
             <IconStar size={15} filled={!!currentMeta()?.starred} />
           </button>

@@ -485,7 +485,8 @@ button {
   display: block;
 }
 .thread-item.starred .thread-title {
-  color: color-mix(in srgb, var(--yellow) 72%, var(--text));
+  color: var(--blue);
+  font-weight: 600;
 }
 .thread-item.history-time {
   height: 42px;
@@ -782,11 +783,11 @@ button {
   color: var(--text-faint);
 }
 .chat-star.starred {
-  color: var(--yellow);
+  color: var(--blue);
 }
 .chat-star:hover {
-  color: var(--yellow);
-  background: color-mix(in srgb, var(--yellow) 13%, transparent);
+  color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 13%, transparent);
 }
 
 .chat-head .agent-badge {

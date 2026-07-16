@@ -363,20 +363,33 @@ export function Sidebar(props: {
     const updatedAt = () => Math.max(t.updatedAt, mergedChild?.updatedAt ?? 0);
     return (
       <div
-        class={`thread-item ${active() ? "active" : ""}${historyProject ? " history-time" : ""}`}
-        classList={{ child, parent: childCount > 0, starred: !!t.starred }}
+        class="thread-item"
+        classList={{
+          active: active(),
+          "history-time": !!historyProject,
+          child,
+          parent: childCount > 0,
+          starred: !!(t.starred || mergedChild?.starred),
+        }}
         onClick={() => void openHistoryThread(activeThread.id)}
         onContextMenu={(e) => {
-          // 目前只有 worktree 会话有右键动作（合并到分支）；漫游 guest 的 worktree 在对端，不提供
-          if (!activeThread.worktree?.path) return;
           e.preventDefault();
-          setTmenu({
-            x: Math.min(e.clientX, window.innerWidth - 200),
-            y: Math.min(e.clientY, window.innerHeight - 90),
-            id: activeThread.id,
-            wt: activeThread.worktree,
-            running: running(),
-          });
+          if (activeThread.worktree?.path) {
+            setTmenu({
+              x: Math.min(e.clientX, window.innerWidth - 200),
+              y: Math.min(e.clientY, window.innerHeight - 120),
+              id: activeThread.id,
+              wt: activeThread.worktree,
+              running: running(),
+            });
+          } else {
+            setMenu({
+              x: Math.min(e.clientX, window.innerWidth - 180),
+              y: Math.min(e.clientY, window.innerHeight - 90),
+              path: activeThread.cwd,
+              remote: activeThread.roamingRole === "guest",
+            });
+          }
         }}
       >
         <Show when={child}>
@@ -730,6 +743,16 @@ export function Sidebar(props: {
           >
             <IconTerminal size={13} />
             在终端中打开 worktree
+          </button>
+          <button
+            class="ctx-item"
+            onClick={() => {
+              void api.openInExplorer(tmenu()!.wt.path);
+              closeMenu();
+            }}
+          >
+            <IconFolder size={13} />
+            在资源管理器中打开 worktree
           </button>
         </div>
       </Show>
