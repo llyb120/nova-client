@@ -794,6 +794,9 @@ impl RelayManager {
         if card_id.is_empty() {
             return;
         }
+        let _ = self
+            .app
+            .emit("clues:mentioned", json!({ "cardId": card_id }));
         crate::sys_notify::notify_clue_mention(
             &self.app,
             card_id,

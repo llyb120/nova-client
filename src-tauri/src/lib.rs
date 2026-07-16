@@ -1191,6 +1191,36 @@ fn precheck_worktree_branch(repo: &str, branch: &str, base: &str) -> Result<bool
     Ok(true)
 }
 
+/// 同一仓库和分支已有 Nova 管理的 worktree 时直接复用，避免再次 `git worktree add`。
+fn reuse_worktree(
+    state: &AppState,
+    repo: &str,
+    branch: &str,
+    thread_id: Option<String>,
+    roaming: bool,
+) -> Option<Worktree> {
+    if branch.is_empty() {
+        return None;
+    }
+    let checked_out = gitwt::branch_checked_out(repo, branch)?;
+    let mut store = state.worktrees.lock().unwrap();
+    let record = store.worktrees.iter_mut().find(|record| {
+        (record.repo == repo || Path::new(&record.path) == Path::new(repo))
+            && record.branch == branch
+            && Path::new(&record.path).is_dir()
+            && Path::new(&record.path) == Path::new(&checked_out)
+    })?;
+    record.thread_id = thread_id;
+    record.roaming = roaming;
+    let worktree = Worktree {
+        repo: record.repo.clone(),
+        path: record.path.clone(),
+        branch: record.branch.clone(),
+    };
+    store.save();
+    Some(worktree)
+}
+
 /// 为 dir 所在 git 仓库创建一个 worktree 并登记到 WorktreeStore：
 /// branch 非空 = 基于 base（空则 HEAD）新建分支；branch 空 = 直接检出 base 所选分支。
 /// 返回 worktree 信息（含工作目录 path）；roaming=true 表示漫游 host 侧代建。
@@ -1209,6 +1239,16 @@ pub fn create_worktree_for(
     let branch = branch.map(|s| s.trim()).unwrap_or("").to_string();
     // 基于哪个分支/提交创建（空 = 当前 HEAD，仅新建分支时允许为空）
     let base_branch = base_branch.map(|s| s.trim()).unwrap_or("").to_string();
+    let requested_branch = if branch.is_empty() {
+        &base_branch
+    } else {
+        &branch
+    };
+    if let Some(worktree) =
+        reuse_worktree(state, &repo, requested_branch, thread_id.clone(), roaming)
+    {
+        return Ok(worktree);
+    }
     let owned_branch = precheck_worktree_branch(&repo, &branch, &base_branch)?;
     // 展示/记录用的分支名：新建用新分支，直接检出用所选分支
     let display_branch = if owned_branch {
@@ -1300,6 +1340,29 @@ async fn create_thread(
             .as_deref()
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
+        let requested_branch = if branch.is_empty() { &base } else { &branch };
+        if let Some(worktree) = reuse_worktree(
+            state.inner(),
+            &repo,
+            requested_branch,
+            Some(thread.id.clone()),
+            false,
+        ) {
+            thread.cwd = worktree.path.clone();
+            thread.worktree = Some(worktree);
+            thread.push_system("已复用现有 git worktree，开始执行".into(), "info");
+            {
+                let mut store = state.store.lock().unwrap();
+                store.threads.push(thread.clone());
+                store.save();
+            }
+            if !repo.contains(SCRATCH_MARK) {
+                state.projects.lock().unwrap().touch(&repo);
+                state.relay.publish_folders();
+            }
+            let _ = app.emit(acp::EV_THREADS, json!({}));
+            return Ok(thread);
+        }
         let owned_branch = precheck_worktree_branch(&repo, &branch, &base)?;
         let display_branch = if owned_branch {
             branch.clone()

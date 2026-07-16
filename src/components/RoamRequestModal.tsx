@@ -1,8 +1,12 @@
 import { message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createSignal, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, Show } from "solid-js";
+import { api } from "../ipc";
 import { respondRoamRequest, state } from "../store";
+import type { BranchList } from "../types";
 import { agentLabel } from "../utils";
+import { ConfigSelects } from "./ConfigSelects";
 import { IconFolder } from "./icons";
+import { SearchSelect } from "./SearchSelect";
 
 /** host 侧：有人请求漫游本机项目时弹出，确认后才真正建立会话 */
 export function RoamRequestModal() {
@@ -15,6 +19,7 @@ export function RoamRequestModal() {
   const [worktree, setWorktree] = createSignal(false);
   const [worktreeBranch, setWorktreeBranch] = createSignal("");
   const [worktreeBase, setWorktreeBase] = createSignal("");
+  const [branches, setBranches] = createSignal<BranchList | null>(null);
 
   createEffect(() => {
     const req = current();
@@ -26,7 +31,22 @@ export function RoamRequestModal() {
     setWorktree(req.worktree ?? false);
     setWorktreeBranch(req.worktreeBranch ?? "");
     setWorktreeBase(req.worktreeBase ?? "");
+    setBranches(null);
+    if (!req.continuation && req.folderExists !== false) {
+      void api.listBranches(req.folder).then((list) => {
+        if (current()?.reqId !== req.reqId) return;
+        setBranches(list);
+        if (!req.worktreeBase?.trim()) setWorktreeBase(list.current);
+      }).catch(() => {});
+    }
   });
+
+  const branchOptions = createMemo(() =>
+    (branches()?.branches ?? []).map((branch) => ({
+      value: branch,
+      label: branch === branches()?.current ? `${branch}（当前）` : branch,
+    })),
+  );
 
   const respond = async (accept: boolean) => {
     const req = current();
@@ -106,19 +126,29 @@ export function RoamRequestModal() {
                     </label>
                     <label class="field">
                       <span class="field-label">基于分支/提交</span>
-                      <input class="field-input" value={worktreeBase()} onInput={(e) => setWorktreeBase(e.currentTarget.value)} />
+                      <SearchSelect
+                        prefix="源分支"
+                        value={worktreeBase()}
+                        options={branchOptions()}
+                        fallbackLabel={worktreeBase() || "请选择"}
+                        searchable
+                        wide
+                        portal
+                        onChange={setWorktreeBase}
+                      />
                     </label>
                   </div>
                 </Show>
-                <div class="roam-req-grid">
-                  <label class="field">
-                    <span class="field-label">模型</span>
-                    <input class="field-input" value={model()} onInput={(e) => setModel(e.currentTarget.value)} />
-                  </label>
-                  <label class="field">
-                    <span class="field-label">模式</span>
-                    <input class="field-input" value={mode()} onInput={(e) => setMode(e.currentTarget.value)} />
-                  </label>
+                <div class="roam-req-config">
+                  <ConfigSelects
+                    agentKind={req().agentKind}
+                    model={model()}
+                    mode={mode()}
+                    projectCwd={folder()}
+                    portal
+                    onPickModel={(_, value) => setModel(value)}
+                    onMode={setMode}
+                  />
                 </div>
               </Show>
               <p class="field-hint">

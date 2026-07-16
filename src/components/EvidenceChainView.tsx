@@ -9,6 +9,7 @@ import {
   clueMentionPeers,
   deleteClue,
   disassociateClues,
+  markClueMentionRead,
   refreshClueGroups,
   splitClue,
   stackClues,
@@ -651,6 +652,7 @@ export function EvidenceChainView() {
   };
 
   const selectOnly = (cardId: string) => {
+    markClueMentionRead(cardId);
     setSelectedCardId(cardId);
     setSelectedCardIds(new Set([cardId]));
   };
@@ -1094,7 +1096,8 @@ export function EvidenceChainView() {
                                active: selectedCardId() === card.id,
                                selected: selectedCardIds().has(card.id),
                                front: front(),
-                            }}
+                               mentioned: state.unreadClueMentions.includes(card.id),
+                             }}
                             role="button"
                             tabIndex={0}
                             style={{
@@ -1265,15 +1268,16 @@ export function EvidenceChainView() {
                                     {authorBadge(item.authorName)}
                                   </span>
                                   <strong>{authorName(item.authorName)}</strong>
-                                  <Show when={parent()}>
-                                    {(target) => (
-                                      <span class="clue-comment-reply-target">
-                                        回复 @{authorName(target().authorName)}
-                                      </span>
-                                    )}
-                                  </Show>
                                   <time>{fmtTime(item.createdAt)}</time>
                                 </div>
+                                <Show when={parent()}>
+                                  {(target) => (
+                                    <blockquote class="clue-comment-quote">
+                                      <strong>@{authorName(target().authorName)}</strong>
+                                      <span>{target().content}</span>
+                                    </blockquote>
+                                  )}
+                                </Show>
                                 <Show when={(item.mentions ?? []).length > 0}>
                                   <div class="clue-comment-mentions">
                                     <For each={item.mentions ?? []}>

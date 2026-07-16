@@ -131,6 +131,8 @@ interface AppStore {
   pendingClueCard: { id: string; title: string } | null;
   /** 系统提醒点击后，请证据链定位到指定卡片。 */
   clueOpenRequest: string | null;
+  /** 收到的线索 @ 提醒；打开对应卡片后清除。 */
+  unreadClueMentions: string[];
   /** 数字员工列表 */
   employees: Employee[];
   /** 全部员工的任务活动记录（历史/进行中） */
@@ -206,6 +208,7 @@ export const [state, setState] = createStore<AppStore>({
   clueGroups: [],
   pendingClueCard: null,
   clueOpenRequest: null,
+  unreadClueMentions: [],
   employees: [],
   employeeTasks: [],
   marks: [],
@@ -616,6 +619,7 @@ export function clearPendingClueCard() {
 
 export function openClueCard(cardId: string) {
   if (!cardId) return;
+  setState("unreadClueMentions", (ids) => ids.filter((id) => id !== cardId));
   setView("clues");
   closeThread();
   setState("clueOpenRequest", cardId);
@@ -624,6 +628,10 @@ export function openClueCard(cardId: string) {
 
 export function clearClueOpenRequest(cardId: string) {
   if (state.clueOpenRequest === cardId) setState("clueOpenRequest", null);
+}
+
+export function markClueMentionRead(cardId: string) {
+  setState("unreadClueMentions", (ids) => ids.filter((id) => id !== cardId));
 }
 
 export async function refreshEmployees() {
@@ -1694,6 +1702,12 @@ export async function initStore() {
 
   await listen<{ cardId: string }>("clues:mention-open", (e) => {
     openClueCard(e.payload.cardId);
+  });
+
+  await listen<{ cardId: string }>("clues:mentioned", (e) => {
+    const cardId = e.payload.cardId;
+    if (!cardId || state.unreadClueMentions.includes(cardId)) return;
+    setState("unreadClueMentions", (ids) => [...ids, cardId]);
   });
 
   // 系统通知点击：跳转到对应会话

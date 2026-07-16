@@ -560,6 +560,9 @@ export function Sidebar(props: {
             >
               <IconClue size={14} />
               证据链
+              <Show when={state.unreadClueMentions.length > 0}>
+                <span class="mode-seg-badge alert">{state.unreadClueMentions.length}</span>
+              </Show>
             </button>
           </div>
           <div class="mode-seg secondary">

@@ -3414,6 +3414,15 @@ button {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
+.roam-req-grid .sel,
+.roam-req-grid .pill {
+  width: 100%;
+}
+.roam-req-config {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 @media (max-width: 560px) {
   .roam-req-grid {
     grid-template-columns: 1fr;
@@ -4745,6 +4754,14 @@ button.head-badge:hover {
     inset 0 0 0 2px rgba(255, 245, 215, 0.76),
     inset 0 0 0 5px rgba(62, 39, 17, 0.24);
 }
+.clue-trading-card.mentioned:not(.active) {
+  box-shadow:
+    0 12px 25px rgba(42, 54, 76, 0.18),
+    0 0 0 4px color-mix(in srgb, var(--accent) 72%, transparent),
+    0 0 30px color-mix(in srgb, var(--accent) 48%, transparent),
+    inset 0 0 0 2px rgba(255, 255, 255, 0.72),
+    inset 0 0 0 5px rgba(91, 67, 27, 0.12);
+}
 .clue-group-node.connection-target .clue-trading-card.front {
   box-shadow:
     0 0 0 4px color-mix(in srgb, var(--accent) 72%, transparent),
@@ -5175,6 +5192,8 @@ button.head-badge:hover {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  max-height: 72px;
+  overflow-y: auto;
 }
 .mention-chip {
   display: inline-flex;
@@ -5227,6 +5246,11 @@ button.head-badge:hover {
   border-radius: 9px;
   background: var(--bg-float);
   box-shadow: 0 12px 30px var(--shadow);
+}
+.mention-menu.portal {
+  position: fixed;
+  right: auto;
+  bottom: auto;
 }
 .mention-option {
   display: flex;
@@ -5339,13 +5363,30 @@ button.head-badge:hover {
   color: var(--text-faint);
   font-size: 10px;
 }
-.clue-comment-reply-target {
-  min-width: 0;
+.clue-comment-quote {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 8px 0 0;
+  padding: 7px 9px;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 50%, var(--border));
+  border-radius: 0 6px 6px 0;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-panel));
+  font-size: 11px;
+}
+.clue-comment-quote strong {
   color: var(--accent);
-  font-size: 10px;
+  font-weight: 600;
+}
+.clue-comment-quote span {
+  display: -webkit-box;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  white-space: pre-wrap;
 }
 .clue-comment-mentions {
   display: flex;
