@@ -52,6 +52,14 @@ export const IconWrench = (p: P) =>
 export const IconMove = (p: P) =>
   svg(<><path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M12 2v20" /></>, p);
 export const IconCheck = (p: P) => svg(<path d="M20 6 9 17l-5-5" />, p);
+export const IconStar = (p: P & { filled?: boolean }) =>
+  svg(
+    <path
+      d="m12 2.7 2.85 5.78 6.38.93-4.62 4.5 1.09 6.35L12 17.27l-5.7 3 1.09-6.35-4.62-4.5 6.38-.93L12 2.7Z"
+      fill={p.filled ? "currentColor" : "none"}
+    />,
+    p,
+  );
 export const IconThumbUp = (p: P) =>
   svg(<><path d="M7 10v12H3V10h4Z" /><path d="M7 20h10.2a2 2 0 0 0 1.94-1.52l1.5-6A2 2 0 0 0 18.7 10H14l.7-4.2A3.25 3.25 0 0 0 11.5 2L7 10Z" /></>, p);
 export const IconThumbDown = (p: P) =>

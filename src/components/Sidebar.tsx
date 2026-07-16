@@ -435,22 +435,6 @@ export function Sidebar(props: {
             临时
           </span>
         </Show>
-        <Show when={!isEmployeeView() && !isMindThread(t) && !t.roamingRole && !t.quotaPeerName}>
-          <button
-            type="button"
-            class="thread-star"
-            classList={{ starred: !!t.starred }}
-            title={t.starred ? "取消星标" : "加星标并在项目内置顶"}
-            onClick={(e) => {
-              e.stopPropagation();
-              void api
-                .setThreadStarred(t.id, !t.starred)
-                .catch((error) => void message(String(error), { kind: "error" }));
-            }}
-          >
-            {t.starred ? "🌟" : "☆"}
-          </button>
-        </Show>
         <span class="thread-time">{fmtTime(updatedAt())}</span>
         <button
           class="thread-delete"

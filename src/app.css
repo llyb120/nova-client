@@ -484,6 +484,9 @@ button {
 .thread-content .thread-title {
   display: block;
 }
+.thread-item.starred .thread-title {
+  color: color-mix(in srgb, var(--yellow) 72%, var(--text));
+}
 .thread-item.history-time {
   height: 42px;
 }
@@ -663,34 +666,6 @@ button {
 .thread-item:hover .thread-time {
   opacity: 0;
 }
-.thread-item.starred .thread-time {
-  margin-right: 20px;
-}
-
-.thread-star {
-  position: absolute;
-  right: 27px;
-  top: 50%;
-  transform: translateY(-50%);
-  padding: 1px 2px;
-  border-radius: 4px;
-  font-size: 14px;
-  line-height: 1;
-  color: var(--text-faint);
-  opacity: 0;
-  pointer-events: none;
-}
-.thread-item:hover .thread-star,
-.thread-star.starred {
-  opacity: 1;
-  pointer-events: auto;
-}
-.thread-star.starred {
-  color: var(--yellow);
-}
-.thread-star:hover {
-  background: color-mix(in srgb, var(--yellow) 13%, transparent);
-}
 
 .thread-delete {
   display: flex;
@@ -793,6 +768,25 @@ button {
   text-overflow: ellipsis;
   max-width: 40%;
   cursor: default;
+}
+
+.chat-star {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  margin-left: -6px;
+  border-radius: 6px;
+  color: var(--text-faint);
+}
+.chat-star.starred {
+  color: var(--yellow);
+}
+.chat-star:hover {
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 13%, transparent);
 }
 
 .chat-head .agent-badge {
@@ -1804,7 +1798,6 @@ button {
   .group-label span,
   .thread-title,
   .thread-history-meta,
-  .thread-star,
   .thread-delete,
   .thread-empty,
   .sidebar-foot {
