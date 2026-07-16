@@ -3886,11 +3886,8 @@ impl AcpManager {
             include_runtime_guidance
         ));
         let conn_key = self.conn_key_for_thread(thread_id);
-        // ensure_session 返回后进程可能恰好退出；Cursor 交给下面的重建分支恢复。
+        // ensure_session 返回后进程可能恰好退出；交给下面的重建分支恢复。
         let mut conn = self.conn_for_key(&conn_key).await;
-        if conn.is_none() && self.kind != AgentKind::Cursor {
-            return Err(format!("{} 未连接", self.kind.label()));
-        }
         let mut prompt = Self::build_user_prompt_blocks(text, images, include_runtime_guidance);
         if let Some(ctx) = handoff {
             prompt.insert(0, json!({ "type": "text", "text": ctx }));
@@ -4219,13 +4216,21 @@ impl AcpManager {
         // CodeBuddy / Cursor / OpenCode：线程独占一条连接，线程删除/切换后端时一并回收。
         // Devin 等共用 SHARED 连接，绝不能在这里 kill。
         if thread_owns_connection(&self.kind) {
-            let me = self.clone();
             let key = self.conn_key_for_thread(thread_id);
-            // 线程已废弃：闸门也可回收（kill_conn_key 有意保留闸门供「停止→重发」同步）。
+            // 返回前先从连接池摘掉旧槽。后续重发会按同一 key 创建新槽，异步清理只能接触
+            // 这里捕获的旧槽，不能再按 key 回查并误杀新连接。
+            let slot = self.slots.lock().unwrap().remove(&key);
+            self.conn_cwd.lock().unwrap().remove(&key);
+            self.conn_last_active.lock().unwrap().remove(&key);
+            self.conn_sessions.lock().unwrap().remove(&key);
             self.serial_gates.lock().unwrap().remove(&key);
-            tauri::async_runtime::spawn(async move {
-                me.kill_conn_key(&key).await;
-            });
+            if let Some(slot) = slot {
+                tauri::async_runtime::spawn(async move {
+                    if let Some(conn) = slot.lock().await.take() {
+                        conn.kill();
+                    }
+                });
+            }
         }
     }
 }
@@ -5994,8 +5999,9 @@ grok-4.5-xhigh - Cursor Grok 4.5\n\
     }
 
     #[test]
-    fn rebuilds_prompt_connection_when_cursor_slot_disappears() {
+    fn rebuilds_prompt_connection_when_slot_disappears() {
         assert!(prompt_conn_needs_rebuild(None, "Cursor 未连接"));
+        assert!(prompt_conn_needs_rebuild(None, "OpenCode 未连接"));
         assert!(prompt_conn_needs_rebuild(Some(false), ""));
         assert!(prompt_conn_needs_rebuild(Some(true), "Cursor 连接已断开"));
         assert!(!prompt_conn_needs_rebuild(Some(true), "Internal error"));
