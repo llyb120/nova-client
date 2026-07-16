@@ -580,6 +580,18 @@ async fn get_clue_context(
     }
 }
 
+fn local_clue_author_name(state: &AppState) -> String {
+    let configured = state.settings.lock().unwrap().relay_name.trim().to_string();
+    if configured.is_empty() {
+        std::env::var("USERNAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "我".into())
+    } else {
+        configured
+    }
+}
+
 #[tauri::command]
 async fn capture_clue(
     app: tauri::AppHandle,
@@ -589,6 +601,7 @@ async fn capture_clue(
     content: String,
     placement: String,
     target_card_id: Option<String>,
+    mention_tokens: Vec<String>,
 ) -> Result<clues::CaptureClueResult, String> {
     if let Some(thread_id) = thread_id.as_deref() {
         let store = state.store.lock().unwrap();
@@ -605,6 +618,7 @@ async fn capture_clue(
                 &content,
                 &placement,
                 target_card_id.as_deref(),
+                &mention_tokens,
             )
             .await?;
         if let Ok(groups) = state.relay.clue_list().await {
@@ -612,17 +626,7 @@ async fn capture_clue(
         }
         result
     } else {
-        let author_name = {
-            let configured = state.settings.lock().unwrap().relay_name.trim().to_string();
-            if configured.is_empty() {
-                std::env::var("USERNAME")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "我".into())
-            } else {
-                configured
-            }
-        };
+        let author_name = local_clue_author_name(&state);
         state.clues.lock().unwrap().capture(
             &placement,
             target_card_id.as_deref(),
@@ -643,6 +647,43 @@ async fn capture_clue(
     }
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(result)
+}
+
+#[tauri::command]
+async fn add_clue_comment(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    card_id: String,
+    content: String,
+    parent_comment_id: Option<String>,
+    mention_tokens: Vec<String>,
+) -> Result<(), String> {
+    if state.relay.is_configured() {
+        state
+            .relay
+            .clue_comment(
+                &card_id,
+                &content,
+                parent_comment_id.as_deref(),
+                &mention_tokens,
+            )
+            .await?;
+        if let Ok(groups) = state.relay.clue_list().await {
+            let _ = state.clues.lock().unwrap().replace(groups);
+        }
+    } else {
+        let author_name = local_clue_author_name(&state);
+        state.clues.lock().unwrap().add_comment(
+            &card_id,
+            content,
+            parent_comment_id,
+            None,
+            author_name,
+            Vec::new(),
+        )?;
+    }
+    let _ = app.emit(clues::EV_CLUES, json!({}));
+    Ok(())
 }
 
 #[tauri::command]
@@ -4315,6 +4356,7 @@ pub fn run() {
             list_clue_groups,
             get_clue_context,
             capture_clue,
+            add_clue_comment,
             associate_clues,
             disassociate_clues,
             split_clue,

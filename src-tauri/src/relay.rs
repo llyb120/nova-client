@@ -742,6 +742,7 @@ impl RelayManager {
             "clues.changed" => {
                 let _ = self.app.emit(EV_CLUES, env.data);
             }
+            "clue.mentioned" => self.on_clue_mentioned(&env),
             "share" => self.on_share(&env),
             // guest -> host
             "roaming.create" => self.on_roaming_create(&env),
@@ -777,6 +778,26 @@ impl RelayManager {
             }
             _ => {}
         }
+    }
+
+    fn on_clue_mentioned(&self, env: &InEnvelope) {
+        let card_id = env.data["cardId"].as_str().unwrap_or_default();
+        if card_id.is_empty() {
+            return;
+        }
+        crate::sys_notify::notify_clue_mention(
+            &self.app,
+            card_id,
+            if env.from_name.trim().is_empty() {
+                "队友"
+            } else {
+                &env.from_name
+            },
+            env.data["title"].as_str().unwrap_or("未命名线索"),
+            env.data["kind"].as_str().unwrap_or("publish"),
+            env.data["content"].as_str().unwrap_or_default(),
+            crate::clues::EV_CLUE_MENTION_OPEN,
+        );
     }
 
     // ===== 发送 =====
@@ -1015,6 +1036,7 @@ impl RelayManager {
         content: &str,
         placement: &str,
         target_card_id: Option<&str>,
+        mention_tokens: &[String],
     ) -> Result<CaptureClueResult, String> {
         let author_name = self.cfg().map(|(_, _, name)| name).unwrap_or_default();
         let response = self
@@ -1026,11 +1048,34 @@ impl RelayManager {
                 "placement": placement,
                 "targetCardId": target_card_id.unwrap_or_default(),
                 "authorName": author_name,
+                "mentionTokens": mention_tokens,
             }))
             .send()
             .await
             .map_err(|error| error.to_string())?;
         decode_relay_json(response).await
+    }
+
+    pub async fn clue_comment(
+        &self,
+        card_id: &str,
+        content: &str,
+        parent_comment_id: Option<&str>,
+        mention_tokens: &[String],
+    ) -> Result<(), String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v1/clues/comment")?
+            .json(&json!({
+                "cardId": card_id,
+                "content": content,
+                "parentCommentId": parent_comment_id.unwrap_or_default(),
+                "mentionTokens": mention_tokens,
+            }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        decode_relay_json::<Value>(response).await?;
+        Ok(())
     }
 
     pub async fn clue_associate(

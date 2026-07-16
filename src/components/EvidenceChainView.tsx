@@ -1,9 +1,12 @@
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
+  addClueComment,
   associateClues,
+  clearClueOpenRequest,
   clueCardById,
   clueCurrentVersion,
+  clueMentionPeers,
   deleteClue,
   disassociateClues,
   refreshClueGroups,
@@ -12,9 +15,10 @@ import {
   startSessionFromClue,
   state,
 } from "../store";
-import type { ClueCard, ClueNodeGroup } from "../types";
+import type { ClueCard, ClueComment, ClueNodeGroup } from "../types";
 import { ClueCaptureModal } from "./ClueCaptureModal";
 import { IconClue, IconMove, IconPlus } from "./icons";
+import { MentionPicker } from "./MentionPicker";
 
 type Placement = "update" | "parallel" | "new";
 type Point = { x: number; y: number };
@@ -200,8 +204,14 @@ export function EvidenceChainView() {
     afterCardId: string;
   } | null>(null);
   const [edgeBusy, setEdgeBusy] = createSignal(false);
+  const [commentText, setCommentText] = createSignal("");
+  const [commentMentions, setCommentMentions] = createSignal<string[]>([]);
+  const [replyToCommentId, setReplyToCommentId] = createSignal<string | null>(null);
+  const [commentBusy, setCommentBusy] = createSignal(false);
   let viewportElement: HTMLDivElement | undefined;
   let canvasElement: HTMLCanvasElement | undefined;
+  let commentInputElement: HTMLTextAreaElement | undefined;
+  let composingCardId: string | null | undefined;
   let resizeObserver: ResizeObserver | undefined;
   let drawFrame: number | undefined;
   let fitted = false;
@@ -489,6 +499,13 @@ export function EvidenceChainView() {
     return state.clueGroups
       .filter((group) => group.parentCardIds.includes(id))
       .flatMap((group) => group.cards);
+  });
+  const mentionPeers = createMemo(clueMentionPeers);
+  const replyTarget = createMemo(() => {
+    const replyId = replyToCommentId();
+    return replyId
+      ? (selectedCard()?.comments ?? []).find((comment) => comment.id === replyId)
+      : undefined;
   });
 
   const scheduleDraw = () => {
@@ -873,8 +890,56 @@ export function EvidenceChainView() {
     }
   };
 
+  const beginReply = (comment: ClueComment) => {
+    setReplyToCommentId(comment.id);
+    const myToken = state.settings?.relayToken ?? "";
+    setCommentMentions(
+      comment.authorToken && comment.authorToken !== myToken ? [comment.authorToken] : [],
+    );
+    requestAnimationFrame(() => commentInputElement?.focus());
+  };
+
+  const cancelReply = () => {
+    setReplyToCommentId(null);
+    setCommentMentions([]);
+  };
+
+  const submitComment = async () => {
+    const card = selectedCard();
+    const content = commentText().trim();
+    if (!card || !content || commentBusy()) return;
+    setCommentBusy(true);
+    try {
+      await addClueComment(card.id, content, replyToCommentId(), commentMentions());
+      setCommentText("");
+      setCommentMentions([]);
+      setReplyToCommentId(null);
+    } catch (error) {
+      await message(String(error), { title: "评论失败", kind: "error" });
+    } finally {
+      setCommentBusy(false);
+    }
+  };
+
+  createEffect(() => {
+    const cardId = selectedCardId();
+    if (composingCardId !== undefined && composingCardId !== cardId) {
+      setCommentText("");
+      setCommentMentions([]);
+      setReplyToCommentId(null);
+    }
+    composingCardId = cardId;
+  });
+
   createEffect(() => {
     const available = cards();
+    const request = state.clueOpenRequest;
+    if (request && available.some((card) => card.id === request)) {
+      setSelectedCardId(request);
+      setSelectedCardIds(new Set([request]));
+      clearClueOpenRequest(request);
+      return;
+    }
     const selected = selectedCardId();
     if (selected && available.some((card) => card.id === selected)) {
       const availableIds = new Set(available.map((card) => card.id));
@@ -1103,6 +1168,9 @@ export function EvidenceChainView() {
           <Show when={selectedCard()}>
             {(card) => {
               const version = () => clueCurrentVersion(card());
+              const comments = () => card().comments ?? [];
+              const commentById = (id?: string | null) =>
+                id ? comments().find((comment) => comment.id === id) : undefined;
               return (
                 <aside class="clue-detail">
                   <div class="clue-detail-head">
@@ -1117,6 +1185,14 @@ export function EvidenceChainView() {
                     <span class="clue-detail-meta">{fmtTime(card().updatedAt)} · {card().versions.length} 个版本</span>
                   </div>
                   <pre class="clue-detail-content">{version()?.content}</pre>
+                  <Show when={(version()?.mentions ?? []).length > 0}>
+                    <div class="clue-mention-summary">
+                      <span>本次提醒</span>
+                      <For each={version()?.mentions ?? []}>
+                        {(mention) => <strong>@{mention.name}</strong>}
+                      </For>
+                    </div>
+                  </Show>
 
                   <div class="clue-detail-actions">
                     <Show when={selectedCardIds().size > 1}>
@@ -1161,6 +1237,104 @@ export function EvidenceChainView() {
                     >
                       {deletingCardId() === card().id ? "删除中…" : "删除线索"}
                     </button>
+                  </div>
+
+                  <div class="clue-comments">
+                    <div class="clue-comments-head">
+                      <div class="clue-section-title">评论与回复</div>
+                      <span>{comments().length}</span>
+                    </div>
+                    <Show
+                      when={comments().length > 0}
+                      fallback={<div class="clue-comments-empty">还没有评论</div>}
+                    >
+                      <div class="clue-comment-list">
+                        <For each={comments()}>
+                          {(item) => {
+                            const parent = () => commentById(item.parentCommentId);
+                            return (
+                              <article
+                                class="clue-comment"
+                                classList={{ reply: !!item.parentCommentId }}
+                              >
+                                <div class="clue-comment-head">
+                                  <span
+                                    class="clue-author-avatar"
+                                    title={`作者：${authorName(item.authorName)}`}
+                                  >
+                                    {authorBadge(item.authorName)}
+                                  </span>
+                                  <strong>{authorName(item.authorName)}</strong>
+                                  <Show when={parent()}>
+                                    {(target) => (
+                                      <span class="clue-comment-reply-target">
+                                        回复 @{authorName(target().authorName)}
+                                      </span>
+                                    )}
+                                  </Show>
+                                  <time>{fmtTime(item.createdAt)}</time>
+                                </div>
+                                <Show when={(item.mentions ?? []).length > 0}>
+                                  <div class="clue-comment-mentions">
+                                    <For each={item.mentions ?? []}>
+                                      {(mention) => <span>@{mention.name}</span>}
+                                    </For>
+                                  </div>
+                                </Show>
+                                <p>{item.content}</p>
+                                <button
+                                  type="button"
+                                  class="clue-comment-reply"
+                                  onClick={() => beginReply(item)}
+                                >
+                                  回复
+                                </button>
+                              </article>
+                            );
+                          }}
+                        </For>
+                      </div>
+                    </Show>
+
+                    <div class="clue-comment-composer">
+                      <Show when={replyTarget()}>
+                        {(target) => (
+                          <div class="clue-comment-replying">
+                            <span>回复 @{authorName(target().authorName)}</span>
+                            <button type="button" onClick={cancelReply}>
+                              取消回复
+                            </button>
+                          </div>
+                        )}
+                      </Show>
+                      <textarea
+                        ref={commentInputElement}
+                        class="field-input"
+                        rows={3}
+                        value={commentText()}
+                        disabled={commentBusy()}
+                        placeholder={replyTarget() ? "写下回复…" : "写下评论…"}
+                        onInput={(event) => setCommentText(event.currentTarget.value)}
+                      />
+                      <MentionPicker
+                        peers={mentionPeers()}
+                        selectedTokens={commentMentions()}
+                        disabled={commentBusy() || mentionPeers().length === 0}
+                        placeholder={mentionPeers().length > 0 ? "@ 提醒团队成员" : "暂无可提醒的团队成员"}
+                        onChange={setCommentMentions}
+                      />
+                      <div class="clue-comment-submit-row">
+                        <span class="field-hint">回复会自动 @ 原评论作者。</span>
+                        <button
+                          type="button"
+                          class="btn primary small"
+                          disabled={commentBusy() || !commentText().trim()}
+                          onClick={() => void submitComment()}
+                        >
+                          {commentBusy() ? "发送中…" : replyTarget() ? "发送回复" : "发表评论"}
+                        </button>
+                      </div>
+                    </div>
                   </div>
 
                   <Show when={predecessors().length > 0}>

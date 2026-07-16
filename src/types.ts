@@ -20,12 +20,28 @@ export interface ProjectEntry {
   worktree?: { repo: string; branch: string } | null;
 }
 
+export interface ClueMention {
+  token: string;
+  name: string;
+}
+
 export interface ClueCardVersion {
   id: string;
   title: string;
   content: string;
   authorName?: string;
   sourceThreadId?: string | null;
+  mentions: ClueMention[];
+  createdAt: number;
+}
+
+export interface ClueComment {
+  id: string;
+  parentCommentId?: string | null;
+  content: string;
+  authorToken?: string | null;
+  authorName?: string;
+  mentions: ClueMention[];
   createdAt: number;
 }
 
@@ -33,6 +49,7 @@ export interface ClueCard {
   id: string;
   currentVersionId: string;
   versions: ClueCardVersion[];
+  comments: ClueComment[];
   createdAt: number;
   updatedAt: number;
 }
@@ -429,6 +446,8 @@ export interface Peer {
   token: string;
   name: string;
   online: boolean;
+  /** 中转站返回的归属群组；旧服务端可能缺省。 */
+  groups?: string[];
   folders: RoamingFolder[];
   lastSeen: number;
 }

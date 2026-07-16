@@ -127,6 +127,42 @@ pub fn notify_roam_request(app: &AppHandle, from_name: &str, folder_name: &str) 
     );
 }
 
+/// 线索 @ 提醒：点击后打开对应线索卡。
+pub fn notify_clue_mention(
+    app: &AppHandle,
+    card_id: &str,
+    from_name: &str,
+    clue_title: &str,
+    kind: &str,
+    content: &str,
+    event: &str,
+) {
+    let title = match kind {
+        "reply" => format!("{from_name} 回复了你的线索评论"),
+        "comment" => format!("{from_name} 在线索评论中 @了你"),
+        _ => format!("{from_name} 发布线索时 @了你"),
+    };
+    let excerpt = content.trim().chars().take(100).collect::<String>();
+    let body = if excerpt.is_empty() {
+        format!("「{clue_title}」")
+    } else {
+        format!("「{clue_title}」：{excerpt}")
+    };
+    let app2 = app.clone();
+    let card_id = card_id.to_string();
+    let event = event.to_string();
+    show(
+        app,
+        &title,
+        &body,
+        false,
+        Some(Box::new(move || {
+            focus_main_window(&app2);
+            let _ = app2.emit(&event, serde_json::json!({ "cardId": card_id }));
+        })),
+    );
+}
+
 #[cfg(target_os = "macos")]
 fn escape_applescript(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
