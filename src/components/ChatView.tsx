@@ -198,8 +198,11 @@ export function ChatView() {
       return;
     }
     if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
-    if (event.deltaY < 0) cancelBottomFollow();
-    else if (event.deltaY > 0 && !stickToBottom() && isAtBottom()) enableBottomFollow();
+    if (event.deltaY > 0 && isAtBottom()) {
+      if (!stickToBottom()) enableBottomFollow();
+      return;
+    }
+    if (event.deltaY !== 0) cancelBottomFollow();
   };
 
   const handlePointerDown = (event: PointerEvent) => {
@@ -212,7 +215,7 @@ export function ChatView() {
     const currentTop = scrollRef?.scrollTop ?? 0;
     const atBottom = isAtBottom();
     if (stickToBottom()) {
-      if (!atBottom && currentTop < lastScrollTop) cancelBottomFollow();
+      if (!atBottom && currentTop !== lastScrollTop) cancelBottomFollow();
     } else if (atBottom && currentTop > lastScrollTop) {
       setStickToBottom(true);
     }
@@ -290,8 +293,10 @@ export function ChatView() {
         return;
       }
       if (scrollsDown) {
-        if (!stickToBottom() && isAtBottom()) enableBottomFollow();
-        return;
+        if (isAtBottom()) {
+          if (!stickToBottom()) enableBottomFollow();
+          return;
+        }
       }
       cancelBottomFollow();
     };
