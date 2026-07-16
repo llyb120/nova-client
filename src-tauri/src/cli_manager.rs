@@ -54,13 +54,15 @@ fn powershell_script_installer(url: &str, elevated: bool) -> (String, Vec<String
     );
     let run_as = if elevated { " -Verb RunAs" } else { "" };
     (
-        "powershell.exe".into(),
+        crate::windows_shell_shim::real_powershell()
+            .to_string_lossy()
+            .into_owned(),
         vec![
             "-NoProfile".into(),
             "-NonInteractive".into(),
             "-Command".into(),
             format!(
-                "$process = Start-Process -FilePath 'powershell.exe'{run_as} -WindowStyle Normal -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{encoded_script}'); exit $process.ExitCode"
+                "$ErrorActionPreference='Stop'; $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe'){run_as} -WindowStyle Normal -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{encoded_script}'); exit $process.ExitCode"
             ),
         ],
     )
@@ -830,10 +832,26 @@ mod tests {
         let cursor_args = cursor.install_args.join(" ");
         let devin_args = devin.install_args.join(" ");
 
-        assert_eq!(cursor.install_program, "powershell.exe");
-        assert_eq!(devin.install_program, "powershell.exe");
+        assert_eq!(
+            std::path::Path::new(&cursor.install_program)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("powershell.exe")
+        );
+        assert!(std::path::Path::new(&cursor.install_program).is_absolute());
+        assert_eq!(
+            std::path::Path::new(&devin.install_program)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("powershell.exe")
+        );
+        assert!(std::path::Path::new(&devin.install_program).is_absolute());
         assert!(cursor_args.contains("Start-Process"));
         assert!(devin_args.contains("Start-Process"));
+        assert!(cursor_args.contains("Join-Path $PSHOME 'powershell.exe'"));
+        assert!(devin_args.contains("Join-Path $PSHOME 'powershell.exe'"));
+        assert!(cursor_args.contains("$ErrorActionPreference='Stop'"));
+        assert!(devin_args.contains("$ErrorActionPreference='Stop'"));
         assert!(cursor_args.contains("-WindowStyle Normal"));
         assert!(devin_args.contains("-WindowStyle Normal"));
         assert!(cursor_args.contains("-Verb RunAs"));
@@ -845,10 +863,16 @@ mod tests {
     }
 
     #[test]
-    fn cursor_installer_program_with_extension_resolves_from_path() {
+    fn cursor_installer_uses_resolvable_windows_powershell() {
         let cursor = spec_for(&AgentKind::Cursor, &Settings::default());
 
-        assert_eq!(cursor.install_program, "powershell.exe");
+        assert_eq!(
+            std::path::Path::new(&cursor.install_program)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("powershell.exe")
+        );
+        assert!(std::path::Path::new(&cursor.install_program).is_absolute());
         assert!(resolve_program_on_path(&cursor.install_program).is_some());
     }
 }
