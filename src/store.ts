@@ -129,6 +129,8 @@ interface AppStore {
   clueGroups: ClueNodeGroup[];
   /** 从证据链跳到新会话时暂存的根线索。 */
   pendingClueCard: { id: string; title: string } | null;
+  /** 系统提醒点击后，请证据链定位到指定卡片。 */
+  clueOpenRequest: string | null;
   /** 数字员工列表 */
   employees: Employee[];
   /** 全部员工的任务活动记录（历史/进行中） */
@@ -201,6 +203,7 @@ export const [state, setState] = createStore<AppStore>({
   view: "home",
   clueGroups: [],
   pendingClueCard: null,
+  clueOpenRequest: null,
   employees: [],
   employeeTasks: [],
   marks: [],
@@ -479,6 +482,21 @@ export async function refreshPeers() {
   }
 }
 
+export function clueMentionPeers(): Peer[] {
+  const ownToken = state.settings?.relayToken ?? "";
+  const firstGroup =
+    (state.settings?.relayGroups ?? "")
+      .split(/[,;\s]+/)
+      .map((group) => group.trim())
+      .find(Boolean) ?? "";
+  return state.peers.filter((peer) => {
+    if (peer.token === ownToken) return false;
+    if (!Array.isArray(peer.groups)) return true;
+    const groups = peer.groups.length > 0 ? peer.groups : [""];
+    return groups.includes(firstGroup);
+  });
+}
+
 export async function refreshInbox() {
   try {
     setState("inbox", await api.getRelayInbox());
@@ -526,10 +544,28 @@ export async function captureClue(
   content: string,
   placement: "update" | "parallel" | "new",
   targetCardId: string | null,
+  mentionTokens: string[] = [],
 ): Promise<CaptureClueResult> {
-  const result = await api.captureClue(threadId, title, content, placement, targetCardId);
+  const result = await api.captureClue(
+    threadId,
+    title,
+    content,
+    placement,
+    targetCardId,
+    mentionTokens,
+  );
   await Promise.all([refreshClueGroups(), refreshThreads()]);
   return result;
+}
+
+export async function addClueComment(
+  cardId: string,
+  content: string,
+  parentCommentId: string | null,
+  mentionTokens: string[] = [],
+) {
+  await api.addClueComment(cardId, content, parentCommentId, mentionTokens);
+  await refreshClueGroups();
 }
 
 /** 用高级分享模型总结会话，供线索表单填入 */
@@ -571,6 +607,18 @@ export function startSessionFromClue(card: ClueCard) {
 
 export function clearPendingClueCard() {
   setState("pendingClueCard", null);
+}
+
+export function openClueCard(cardId: string) {
+  if (!cardId) return;
+  setView("clues");
+  closeThread();
+  setState("clueOpenRequest", cardId);
+  void refreshClueGroups();
+}
+
+export function clearClueOpenRequest(cardId: string) {
+  if (state.clueOpenRequest === cardId) setState("clueOpenRequest", null);
 }
 
 export async function refreshEmployees() {
@@ -1633,6 +1681,10 @@ export async function initStore() {
   });
   await listen("clues:changed", () => {
     void refreshClueGroups();
+  });
+
+  await listen<{ cardId: string }>("clues:mention-open", (e) => {
+    openClueCard(e.payload.cardId);
   });
 
   // 系统通知点击：跳转到对应会话

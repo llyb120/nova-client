@@ -87,6 +87,7 @@ export const api = {
     content: string,
     placement: "update" | "parallel" | "new",
     targetCardId: string | null,
+    mentionTokens: string[],
   ) =>
     invoke<CaptureClueResult>("capture_clue", {
       threadId,
@@ -94,6 +95,19 @@ export const api = {
       content,
       placement,
       targetCardId,
+      mentionTokens,
+    }),
+  addClueComment: (
+    cardId: string,
+    content: string,
+    parentCommentId: string | null,
+    mentionTokens: string[],
+  ) =>
+    invoke<void>("add_clue_comment", {
+      cardId,
+      content,
+      parentCommentId,
+      mentionTokens,
     }),
   associateClues: (beforeCardId: string, afterCardId: string) =>
     invoke<ClueNodeGroup>("associate_clues", { beforeCardId, afterCardId }),

@@ -4,10 +4,12 @@ import {
   captureClue,
   clueCardById,
   clueCurrentVersion,
+  clueMentionPeers,
   state,
   summarizeClue,
 } from "../store";
 import { IconClue, IconX } from "./icons";
+import { MentionPicker } from "./MentionPicker";
 
 type Placement = "update" | "parallel" | "new";
 
@@ -47,6 +49,8 @@ export function ClueCaptureModal(props: {
   );
   const [busy, setBusy] = createSignal(false);
   const [summarizing, setSummarizing] = createSignal(false);
+  const [mentionTokens, setMentionTokens] = createSignal<string[]>([]);
+  const mentionPeers = createMemo(clueMentionPeers);
   const targetCard = createMemo(() => clueCardById(targetCardId()));
   const targetCardTitle = createMemo(() => {
     const card = targetCard();
@@ -119,7 +123,14 @@ export function ClueCaptureModal(props: {
     }
     setBusy(true);
     try {
-      await captureClue(props.threadId ?? null, title(), content(), nextPlacement, nextTarget);
+      await captureClue(
+        props.threadId ?? null,
+        title(),
+        content(),
+        nextPlacement,
+        nextTarget,
+        mentionTokens(),
+      );
       props.onClose();
     } catch (error) {
       await message(String(error), { kind: "error" });
@@ -237,6 +248,18 @@ export function ClueCaptureModal(props: {
             onInput={(event) => setContent(event.currentTarget.value)}
           />
         </label>
+
+        <div class="field">
+          <span class="field-label">@ 提醒谁注意</span>
+          <MentionPicker
+            peers={mentionPeers()}
+            selectedTokens={mentionTokens()}
+            disabled={busy() || summarizing() || mentionPeers().length === 0}
+            placeholder={mentionPeers().length > 0 ? "@ 提醒团队成员" : "暂无可提醒的团队成员"}
+            onChange={setMentionTokens}
+          />
+          <span class="field-hint">被 @ 的成员会收到可点击的线索提醒，离线时会在重连后补发。</span>
+        </div>
 
         <Show when={!props.sessionMode && targetCardId()}>
           <div class="field-hint">当前选择：{targetCardTitle()}</div>

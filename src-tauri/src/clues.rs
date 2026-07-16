@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::threads::now_ms;
 
 pub const EV_CLUES: &str = "clues:changed";
+pub const EV_CLUE_MENTION_OPEN: &str = "clues:mention-open";
 
 pub(crate) fn deserialize_vec_or_default<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
@@ -13,6 +14,13 @@ where
     T: Deserialize<'de>,
 {
     Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClueMention {
+    pub token: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,6 +33,23 @@ pub struct ClueCardVersion {
     pub author_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_thread_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    pub mentions: Vec<ClueMention>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClueComment {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_comment_id: Option<String>,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_token: Option<String>,
+    pub author_name: String,
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    pub mentions: Vec<ClueMention>,
     pub created_at: i64,
 }
 
@@ -35,6 +60,8 @@ pub struct ClueCard {
     pub current_version_id: String,
     #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub versions: Vec<ClueCardVersion>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    pub comments: Vec<ClueComment>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -148,6 +175,27 @@ impl ClueStore {
         source_thread_id: Option<String>,
         author_name: String,
     ) -> Result<CaptureClueResult, String> {
+        self.capture_with_mentions(
+            placement,
+            target_card_id,
+            title,
+            content,
+            source_thread_id,
+            author_name,
+            Vec::new(),
+        )
+    }
+
+    pub fn capture_with_mentions(
+        &mut self,
+        placement: &str,
+        target_card_id: Option<&str>,
+        title: String,
+        content: String,
+        source_thread_id: Option<String>,
+        author_name: String,
+        mentions: Vec<ClueMention>,
+    ) -> Result<CaptureClueResult, String> {
         let title = title.trim().to_string();
         let content = content.trim().to_string();
         if title.is_empty() {
@@ -156,6 +204,7 @@ impl ClueStore {
         if content.is_empty() {
             return Err("线索内容不能为空".into());
         }
+        let mentions = normalize_mentions(mentions, None);
         let now = now_ms();
 
         let result = match placement {
@@ -163,7 +212,14 @@ impl ClueStore {
                 let target = target_card_id.ok_or("请选择要更新的线索")?;
                 let (group_index, card_index) =
                     self.card_location(target).ok_or("目标线索不存在")?;
-                let version = new_version(title, content, source_thread_id, author_name, now);
+                let version = new_version(
+                    title,
+                    content,
+                    source_thread_id,
+                    author_name,
+                    mentions,
+                    now,
+                );
                 let group = &mut self.groups[group_index];
                 let card = {
                     let card = &mut group.cards[card_index];
@@ -181,7 +237,14 @@ impl ClueStore {
             "parallel" => {
                 let target = target_card_id.ok_or("请选择平行线索的位置")?;
                 let (group_index, _) = self.card_location(target).ok_or("目标线索不存在")?;
-                let card = new_card(title, content, source_thread_id, author_name, now);
+                let card = new_card(
+                    title,
+                    content,
+                    source_thread_id,
+                    author_name,
+                    mentions,
+                    now,
+                );
                 let group = &mut self.groups[group_index];
                 group.cards.push(card.clone());
                 group.updated_at = now;
@@ -198,7 +261,14 @@ impl ClueStore {
                     }
                     None => Vec::new(),
                 };
-                let card = new_card(title, content, source_thread_id, author_name, now);
+                let card = new_card(
+                    title,
+                    content,
+                    source_thread_id,
+                    author_name,
+                    mentions,
+                    now,
+                );
                 let group = ClueNodeGroup {
                     id: uuid::Uuid::new_v4().to_string(),
                     parent_card_ids,
@@ -214,6 +284,58 @@ impl ClueStore {
 
         self.save()?;
         Ok(result)
+    }
+
+    pub fn add_comment(
+        &mut self,
+        card_id: &str,
+        content: String,
+        parent_comment_id: Option<String>,
+        author_token: Option<String>,
+        author_name: String,
+        mut mentions: Vec<ClueMention>,
+    ) -> Result<ClueComment, String> {
+        let content = content.trim().to_string();
+        if content.is_empty() {
+            return Err("评论内容不能为空".into());
+        }
+        let (group_index, card_index) = self.card_location(card_id).ok_or("线索不存在")?;
+        let parent = match parent_comment_id.as_deref().filter(|value| !value.is_empty()) {
+            Some(parent_id) => Some(
+                self.groups[group_index].cards[card_index]
+                    .comments
+                    .iter()
+                    .find(|comment| comment.id == parent_id)
+                    .cloned()
+                    .ok_or("回复的评论不存在")?,
+            ),
+            None => None,
+        };
+        if let Some(parent) = &parent {
+            if let Some(token) = parent.author_token.as_deref().filter(|token| !token.is_empty()) {
+                mentions.push(ClueMention {
+                    token: token.to_string(),
+                    name: parent.author_name.clone(),
+                });
+            }
+        }
+        let author_token = author_token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        let comment = ClueComment {
+            id: uuid::Uuid::new_v4().to_string(),
+            parent_comment_id: parent.map(|comment| comment.id),
+            content,
+            mentions: normalize_mentions(mentions, author_token.as_deref()),
+            author_token,
+            author_name: author_name.trim().to_string(),
+            created_at: now_ms(),
+        };
+        self.groups[group_index].cards[card_index]
+            .comments
+            .push(comment.clone());
+        self.save()?;
+        Ok(comment)
     }
 
     pub fn associate(
@@ -549,6 +671,7 @@ fn new_version(
     content: String,
     source_thread_id: Option<String>,
     author_name: String,
+    mentions: Vec<ClueMention>,
     now: i64,
 ) -> ClueCardVersion {
     ClueCardVersion {
@@ -557,6 +680,7 @@ fn new_version(
         content,
         author_name: Some(author_name),
         source_thread_id,
+        mentions,
         created_at: now,
     }
 }
@@ -566,16 +690,49 @@ fn new_card(
     content: String,
     source_thread_id: Option<String>,
     author_name: String,
+    mentions: Vec<ClueMention>,
     now: i64,
 ) -> ClueCard {
-    let version = new_version(title, content, source_thread_id, author_name, now);
+    let version = new_version(
+        title,
+        content,
+        source_thread_id,
+        author_name,
+        mentions,
+        now,
+    );
     ClueCard {
         id: uuid::Uuid::new_v4().to_string(),
         current_version_id: version.id.clone(),
         versions: vec![version],
+        comments: Vec::new(),
         created_at: now,
         updated_at: now,
     }
+}
+
+fn normalize_mentions(
+    mentions: Vec<ClueMention>,
+    excluded_token: Option<&str>,
+) -> Vec<ClueMention> {
+    let mut seen = HashSet::new();
+    mentions
+        .into_iter()
+        .filter_map(|mention| {
+            let token = mention.token.trim().to_string();
+            if token.is_empty()
+                || excluded_token.is_some_and(|excluded| excluded == token)
+                || !seen.insert(token.clone())
+            {
+                return None;
+            }
+            let name = mention.name.trim().to_string();
+            Some(ClueMention {
+                name: if name.is_empty() { token.clone() } else { name },
+                token,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -898,6 +1055,153 @@ mod tests {
         }))
         .unwrap();
         assert!(snapshot.cards.is_empty());
+
+        let card: ClueCard = serde_json::from_value(serde_json::json!({
+            "id": "card-1",
+            "currentVersionId": "version-1",
+            "versions": [{
+                "id": "version-1",
+                "title": "旧线索",
+                "content": "正文",
+                "mentions": null,
+                "createdAt": 1
+            }],
+            "comments": null,
+            "createdAt": 1,
+            "updatedAt": 1
+        }))
+        .unwrap();
+        assert!(card.versions[0].mentions.is_empty());
+        assert!(card.comments.is_empty());
+    }
+
+    #[test]
+    fn mentions_belong_to_the_published_version_and_are_deduplicated() {
+        let mut store = store();
+        let root = store
+            .capture("new", None, "线索".into(), "v1".into(), None, "甲".into())
+            .unwrap();
+        let updated = store
+            .capture_with_mentions(
+                "update",
+                Some(&root.card.id),
+                "线索".into(),
+                "v2".into(),
+                None,
+                "乙".into(),
+                vec![
+                    ClueMention {
+                        token: "peer-b".into(),
+                        name: "成员乙".into(),
+                    },
+                    ClueMention {
+                        token: "peer-b".into(),
+                        name: "重复名称".into(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert!(updated.card.versions[0].mentions.is_empty());
+        assert_eq!(updated.card.versions[1].mentions.len(), 1);
+        assert_eq!(updated.card.versions[1].mentions[0].token, "peer-b");
+        assert_eq!(updated.card.versions[1].mentions[0].name, "成员乙");
+    }
+
+    #[test]
+    fn comments_and_replies_persist_and_reply_mentions_the_parent_author() {
+        let mut store = store();
+        let root = store
+            .capture("new", None, "线索".into(), "正文".into(), None, "甲".into())
+            .unwrap();
+        let comment = store
+            .add_comment(
+                &root.card.id,
+                "第一条评论".into(),
+                None,
+                Some("peer-a".into()),
+                "甲".into(),
+                vec![
+                    ClueMention {
+                        token: "peer-b".into(),
+                        name: "乙".into(),
+                    },
+                    ClueMention {
+                        token: "peer-b".into(),
+                        name: "重复".into(),
+                    },
+                    ClueMention {
+                        token: "peer-a".into(),
+                        name: "甲".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(comment.mentions.len(), 1);
+        assert_eq!(comment.mentions[0].token, "peer-b");
+
+        let reply = store
+            .add_comment(
+                &root.card.id,
+                "回复".into(),
+                Some(comment.id.clone()),
+                Some("peer-b".into()),
+                "乙".into(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(reply.parent_comment_id.as_deref(), Some(comment.id.as_str()));
+        assert_eq!(reply.mentions.len(), 1);
+        assert_eq!(reply.mentions[0].token, "peer-a");
+
+        let self_reply = store
+            .add_comment(
+                &root.card.id,
+                "自回复".into(),
+                Some(comment.id.clone()),
+                Some("peer-a".into()),
+                "甲".into(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(self_reply.mentions.is_empty());
+
+        let (group_index, card_index) = store.card_location(&root.card.id).unwrap();
+        assert_eq!(store.groups[group_index].updated_at, root.group.updated_at);
+        assert_eq!(
+            store.groups[group_index].cards[card_index].updated_at,
+            root.card.updated_at
+        );
+
+        let persisted: ClueFile =
+            serde_json::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        let card = persisted
+            .groups
+            .iter()
+            .flat_map(|group| &group.cards)
+            .find(|card| card.id == root.card.id)
+            .unwrap();
+        assert_eq!(card.comments.len(), 3);
+        assert!(store
+            .add_comment(
+                &root.card.id,
+                " ".into(),
+                None,
+                None,
+                "甲".into(),
+                Vec::new(),
+            )
+            .is_err());
+        assert!(store
+            .add_comment(
+                &root.card.id,
+                "回复不存在的评论".into(),
+                Some("missing".into()),
+                None,
+                "甲".into(),
+                Vec::new(),
+            )
+            .is_err());
     }
 
     #[test]
