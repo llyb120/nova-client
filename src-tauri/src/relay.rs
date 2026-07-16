@@ -103,15 +103,30 @@ struct PendingQuotaClient {
 struct QuotaLeaseKey {
     peer: String,
     agent_kind: AgentKind,
+    auth_scope: String,
 }
 
 impl QuotaLeaseKey {
-    fn new(peer: String, agent_kind: AgentKind) -> Result<Self, String> {
+    fn new(peer: String, agent_kind: AgentKind, model: &str) -> Result<Self, String> {
         let peer = peer.trim().to_string();
         if peer.is_empty() {
             return Err("额度租约必须指定队友".into());
         }
-        Ok(Self { peer, agent_kind })
+        let auth_scope = if matches!(agent_kind, AgentKind::OpenCode | AgentKind::OpenCodePlus) {
+            model.split('/').next().unwrap_or_default().to_string()
+        } else {
+            String::new()
+        };
+        if matches!(agent_kind, AgentKind::OpenCode | AgentKind::OpenCodePlus)
+            && auth_scope.is_empty()
+        {
+            return Err("OpenCode 额度租约缺少 Provider 标识".into());
+        }
+        Ok(Self {
+            peer,
+            agent_kind,
+            auth_scope,
+        })
     }
 }
 
@@ -181,8 +196,15 @@ fn quota_model_key(kind: &AgentKind, model: &str) -> String {
 
 fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
     match kind {
-        AgentKind::Devin | AgentKind::Codex => Ok(()),
-        _ => Err(format!("{} SDK 暂不支持隔离额度租借", kind.label())),
+        AgentKind::Devin
+        | AgentKind::Codex
+        | AgentKind::CodexPlus
+        | AgentKind::CodeBuddy
+        | AgentKind::CodeBuddyPlus
+        | AgentKind::ClaudeCode
+        | AgentKind::Cursor
+        | AgentKind::OpenCode
+        | AgentKind::OpenCodePlus => Ok(()),
     }
 }
 
@@ -216,13 +238,13 @@ fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> 
     let enabled = match kind {
         AgentKind::Devin => settings.devin_enabled,
         AgentKind::Codex => settings.codex_enabled,
-        AgentKind::CodexPlus => false,
+        AgentKind::CodexPlus => settings.codex_enabled,
         AgentKind::CodeBuddy => settings.codebuddy_enabled,
-        AgentKind::CodeBuddyPlus => false,
+        AgentKind::CodeBuddyPlus => settings.codebuddy_enabled,
         AgentKind::ClaudeCode => settings.claudecode_enabled,
         AgentKind::Cursor => settings.cursor_enabled,
         AgentKind::OpenCode => settings.opencode_enabled,
-        AgentKind::OpenCodePlus => false,
+        AgentKind::OpenCodePlus => settings.opencode_enabled,
     };
     enabled
         && !model.is_empty()
@@ -585,7 +607,14 @@ impl RelayManager {
                 return true;
             }
             let prefix = format!("{}:", key.agent_kind.as_str());
-            shared.iter().any(|model| model.starts_with(&prefix))
+            shared.iter().any(|model| {
+                let Some(model) = model.strip_prefix(&prefix) else {
+                    return false;
+                };
+                key.auth_scope.is_empty()
+                    || model == key.auth_scope
+                    || model.starts_with(&format!("{}/", key.auth_scope))
+            })
         });
     }
 
@@ -1536,7 +1565,7 @@ impl RelayManager {
         if model.is_empty() {
             return Err("额度租约必须指定共享模型".into());
         }
-        let key = QuotaLeaseKey::new(peer_token, agent_kind)?;
+        let key = QuotaLeaseKey::new(peer_token, agent_kind, &model)?;
         self.acquire_quota_lease(key, model, None).await?;
         Ok(())
     }
@@ -1756,7 +1785,7 @@ impl RelayManager {
         let model = model
             .filter(|value| !value.trim().is_empty())
             .ok_or("额度漫游必须选择对方明确共享的模型")?;
-        let lease_key = QuotaLeaseKey::new(peer_token.clone(), agent_kind.clone())?;
+        let lease_key = QuotaLeaseKey::new(peer_token.clone(), agent_kind.clone(), &model)?;
         let lease_ready = self.quota_lease_ready(&lease_key);
         if lease_ready {
             self.emit_quota_progress(operation_id, "preparing", "正在复用已预热的额度租约…");
@@ -1894,8 +1923,8 @@ impl RelayManager {
         let app = self.app.clone();
         let to = env.from.clone();
         std::thread::spawn(move || {
-            let result =
-                crate::credential_roaming::collect_credentials(agent_kind).and_then(|bundle| {
+            let result = crate::credential_roaming::collect_credentials(&app, agent_kind, &model)
+                .and_then(|bundle| {
                     crate::credential_roaming::encrypt_bundle(&public_key, &req_id, &bundle)
                 });
             let relay = app.state::<AppState>().relay.clone();
@@ -2279,10 +2308,30 @@ impl RelayManager {
                             .await
                     }
                     AgentKind::Codex | AgentKind::CodexPlus => {
-                        app.state::<AppState>().codex.fetch_model_options().await
+                        app.state::<AppState>()
+                            .codexplus
+                            .ensure_model_options()
+                            .await
+                    }
+                    AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+                        app.state::<AppState>()
+                            .codebuddyplus
+                            .ensure_model_options()
+                            .await
+                    }
+                    AgentKind::ClaudeCode => {
+                        app.state::<AppState>()
+                            .claudeplus
+                            .ensure_model_options()
+                            .await
+                    }
+                    AgentKind::Cursor => {
+                        app.state::<AppState>()
+                            .cursorplus
+                            .ensure_model_options()
+                            .await
                     }
                     AgentKind::Devin => app.state::<AppState>().acp.fetch_model_options().await,
-                    _ => continue,
                 };
                 if let Ok(v) = fetched {
                     if let Some(filtered) = shared_model_options(&kind, &v, &shared) {
@@ -4071,21 +4120,41 @@ mod tests {
 
     #[test]
     fn quota_lease_key_is_per_peer_and_backend() {
-        let cursor = QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor).unwrap();
-        let codex = QuotaLeaseKey::new("peer-a".into(), AgentKind::Codex).unwrap();
+        let cursor =
+            QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor, "cursor-small").unwrap();
+        let codex = QuotaLeaseKey::new("peer-a".into(), AgentKind::Codex, "gpt-5").unwrap();
 
         assert_ne!(cursor, codex);
-        assert!(QuotaLeaseKey::new("".into(), AgentKind::Cursor).is_err());
+        assert!(QuotaLeaseKey::new("".into(), AgentKind::Cursor, "cursor-small").is_err());
     }
 
     #[test]
-    fn quota_runtime_only_supports_devin_and_native_codex() {
-        assert!(ensure_quota_backend_supported(&AgentKind::Devin).is_ok());
-        assert!(ensure_quota_backend_supported(&AgentKind::Codex).is_ok());
-        assert!(ensure_quota_backend_supported(&AgentKind::CodeBuddy).is_err());
-        assert!(ensure_quota_backend_supported(&AgentKind::ClaudeCode).is_err());
-        assert!(ensure_quota_backend_supported(&AgentKind::Cursor).is_err());
-        assert!(ensure_quota_backend_supported(&AgentKind::OpenCode).is_err());
+    fn opencode_quota_lease_is_scoped_to_provider() {
+        let anthropic = QuotaLeaseKey::new(
+            "peer-a".into(),
+            AgentKind::OpenCode,
+            "anthropic/claude-sonnet-4",
+        )
+        .unwrap();
+        let openai =
+            QuotaLeaseKey::new("peer-a".into(), AgentKind::OpenCode, "openai/gpt-5").unwrap();
+
+        assert_ne!(anthropic, openai);
+        assert_eq!(anthropic.auth_scope, "anthropic");
+    }
+
+    #[test]
+    fn quota_runtime_supports_every_frontend_backend() {
+        for kind in [
+            AgentKind::Devin,
+            AgentKind::Codex,
+            AgentKind::CodeBuddy,
+            AgentKind::ClaudeCode,
+            AgentKind::Cursor,
+            AgentKind::OpenCode,
+        ] {
+            assert!(ensure_quota_backend_supported(&kind).is_ok());
+        }
     }
 
     #[test]

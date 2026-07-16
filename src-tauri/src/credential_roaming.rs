@@ -4,8 +4,10 @@
 //! 后端进程通过 CODEX_HOME / CURSOR_CONFIG_DIR / XDG_* 等环境变量读取，不覆盖本机账号。
 
 use crate::acp::AcpManager;
-use crate::codex::CodexManager;
+use crate::codex_sdk::{CodexSdkManager, SdkBackend};
+use crate::opencode_sdk::OpenCodeSdkManager;
 use crate::threads::AgentKind;
+use crate::AppState;
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -16,7 +18,8 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
+use tokio::process::Command;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
@@ -35,6 +38,8 @@ pub struct CredentialBundle {
     pub version: u8,
     pub agent_kind: AgentKind,
     pub files: Vec<CredentialFile>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -48,7 +53,8 @@ pub struct EncryptedGrant {
 #[derive(Clone)]
 pub enum BorrowedManager {
     Acp(Arc<AcpManager>),
-    Codex(Arc<CodexManager>),
+    Sdk(Arc<CodexSdkManager>),
+    OpenCode(Arc<OpenCodeSdkManager>),
 }
 
 #[derive(Clone)]
@@ -61,14 +67,16 @@ impl BorrowedRuntime {
     pub fn is_running(&self, thread_id: &str) -> bool {
         match &self.manager {
             BorrowedManager::Acp(manager) => manager.is_running(thread_id),
-            BorrowedManager::Codex(manager) => manager.is_running(thread_id),
+            BorrowedManager::Sdk(manager) => manager.is_running(thread_id),
+            BorrowedManager::OpenCode(manager) => manager.is_running(thread_id),
         }
     }
 
     pub fn has_pending_permission(&self, request_key: &str) -> bool {
         match &self.manager {
             BorrowedManager::Acp(manager) => manager.has_pending_permission(request_key),
-            BorrowedManager::Codex(manager) => manager.has_pending_permission(request_key),
+            BorrowedManager::Sdk(manager) => manager.has_pending_permission(request_key),
+            BorrowedManager::OpenCode(manager) => manager.has_pending_permission(request_key),
         }
     }
 
@@ -81,7 +89,10 @@ impl BorrowedRuntime {
             BorrowedManager::Acp(manager) => {
                 manager.respond_permission(request_key, option_id).await
             }
-            BorrowedManager::Codex(manager) => {
+            BorrowedManager::Sdk(manager) => {
+                manager.respond_permission(request_key, option_id).await
+            }
+            BorrowedManager::OpenCode(manager) => {
                 manager.respond_permission(request_key, option_id).await
             }
         }
@@ -90,7 +101,8 @@ impl BorrowedRuntime {
     pub async fn shutdown(self) {
         match &self.manager {
             BorrowedManager::Acp(manager) => manager.kill_conn().await,
-            BorrowedManager::Codex(manager) => manager.kill_conn().await,
+            BorrowedManager::Sdk(manager) => manager.shutdown(),
+            BorrowedManager::OpenCode(manager) => manager.shutdown(),
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
@@ -162,7 +174,10 @@ pub fn decrypt_bundle(
         .map_err(|_| "凭证解密失败：密文损坏或会话密钥不匹配".to_string())?;
     let bundle: CredentialBundle =
         serde_json::from_slice(&plain).map_err(|_| "凭证包格式无效".to_string())?;
-    if bundle.version != 1 || bundle.files.is_empty() || bundle.files.len() > MAX_BUNDLE_FILES {
+    if bundle.version != 1
+        || (bundle.files.is_empty() && bundle.env.is_empty())
+        || bundle.files.len() > MAX_BUNDLE_FILES
+    {
         return Err("凭证包版本或文件数量无效".into());
     }
     Ok(bundle)
@@ -191,28 +206,80 @@ fn derive_key(
     Ok(key)
 }
 
-pub fn collect_credentials(agent_kind: AgentKind) -> Result<CredentialBundle, String> {
+pub fn collect_credentials(
+    app: &AppHandle,
+    agent_kind: AgentKind,
+    model: &str,
+) -> Result<CredentialBundle, String> {
     let mut files = Vec::new();
-    match agent_kind {
+    let mut env = HashMap::new();
+    match &agent_kind {
         AgentKind::Devin => collect_file(
             &devin_credentials_path()?,
             "appdata/devin/credentials.toml",
             &mut files,
         )?,
-        AgentKind::Codex => collect_file(
-            &configured_home("CODEX_HOME", ".codex").join("auth.json"),
-            "codex-home/auth.json",
-            &mut files,
-        )?,
-        AgentKind::CodeBuddy
-        | AgentKind::ClaudeCode
-        | AgentKind::Cursor
-        | AgentKind::OpenCode
-        | AgentKind::OpenCodePlus
-        | AgentKind::CodexPlus
-        | AgentKind::CodeBuddyPlus => {
-            return Err(format!("{} 暂不支持额度租借", agent_kind.label()))
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            collect_file(
+                &configured_home("CODEX_HOME", ".codex").join("auth.json"),
+                "codex-home/auth.json",
+                &mut files,
+            )?;
         }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            let root = configured_home("CODEBUDDY_CONFIG_DIR", ".codebuddy");
+            collect_directory(
+                &root.join("local_storage"),
+                "profile/.codebuddy/local_storage",
+                &mut files,
+            )?;
+            collect_optional_file(
+                &root.join("instances.json"),
+                "profile/.codebuddy/instances.json",
+                &mut files,
+            )?;
+        }
+        AgentKind::ClaudeCode => {
+            let configured = app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap()
+                .claudecode_sdk_api_key
+                .clone();
+            collect_secret_env("ANTHROPIC_API_KEY", &configured, &mut env);
+            collect_secret_env("CLAUDE_CODE_OAUTH_TOKEN", "", &mut env);
+        }
+        AgentKind::Cursor => {
+            let configured = app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap()
+                .cursor_sdk_api_key
+                .clone();
+            collect_secret_env("CURSOR_API_KEY", &configured, &mut env);
+        }
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            let data = configured_home("XDG_DATA_HOME", ".local/share");
+            let provider = model
+                .split('/')
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or("OpenCode 共享模型缺少 Provider 标识")?;
+            collect_json_entry(
+                &data.join("opencode").join("auth.json"),
+                "opencode-data/opencode/auth.json",
+                provider,
+                &mut files,
+            )?;
+        }
+    }
+    if files.is_empty() && env.is_empty() {
+        return Err(format!(
+            "未找到 {} 可安全共享的登录凭证，请先配置该后端的 API Key 或完成本地登录",
+            agent_kind.label()
+        ));
     }
     let total = files
         .iter()
@@ -222,7 +289,8 @@ pub fn collect_credentials(agent_kind: AgentKind) -> Result<CredentialBundle, St
                 .ok()
                 .map(|data| data.len())
         })
-        .sum::<usize>();
+        .sum::<usize>()
+        + env.values().map(String::len).sum::<usize>();
     if total > MAX_BUNDLE_BYTES {
         return Err("凭证包过大，已拒绝发送".into());
     }
@@ -230,6 +298,7 @@ pub fn collect_credentials(agent_kind: AgentKind) -> Result<CredentialBundle, St
         version: 1,
         agent_kind,
         files,
+        env,
     })
 }
 
@@ -252,8 +321,16 @@ pub fn materialize_runtime(
     std::fs::create_dir_all(&root).map_err(|e| format!("创建租借目录失败：{e}"))?;
     restrict_dir(&root);
 
+    let CredentialBundle { files, env, .. } = bundle;
     let mut total = 0usize;
-    for file in bundle.files {
+    for file in files {
+        if !credential_path_allowed(expected_kind, &file.path) {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(format!(
+                "{} 凭证文件路径不在允许范围内",
+                expected_kind.label()
+            ));
+        }
         let relative = safe_relative_path(&file.path)?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(file.data.as_bytes())
@@ -272,26 +349,48 @@ pub fn materialize_runtime(
         restrict_file(&path);
     }
 
-    let launch_env = launch_env(expected_kind, &root)?;
+    let mut launch_env = launch_env(expected_kind, &root)?;
+    for (name, value) in env {
+        if !credential_env_allowed(expected_kind, &name) {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(format!(
+                "{} 凭证环境变量不在允许范围内",
+                expected_kind.label()
+            ));
+        }
+        launch_env.insert(name, value);
+    }
     crate::agent_config::sync_backend_with_env(
         &crate::nova_data_dir(&app),
         expected_kind,
         &launch_env,
     )?;
-    let scope = format!("quota-{thread_id}-");
+    stage_local_skills(&app, expected_kind, &launch_env)?;
     let manager = match expected_kind {
         AgentKind::Devin => BorrowedManager::Acp(AcpManager::new_with_env(
             app,
             AgentKind::Devin,
             launch_env,
-            scope,
+            format!("quota-{thread_id}-"),
         )),
-        AgentKind::Codex => {
-            BorrowedManager::Codex(CodexManager::new_with_env(app, launch_env, scope))
-        }
-        kind => {
-            let _ = std::fs::remove_dir_all(&root);
-            return Err(format!("{} SDK 暂不支持隔离额度租借", kind.label()));
+        AgentKind::Codex | AgentKind::CodexPlus => BorrowedManager::Sdk(
+            CodexSdkManager::new_with_env(app, SdkBackend::Codex, launch_env),
+        ),
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => BorrowedManager::Sdk(
+            CodexSdkManager::new_with_env(app, SdkBackend::CodeBuddy, launch_env),
+        ),
+        AgentKind::ClaudeCode => BorrowedManager::Sdk(CodexSdkManager::new_with_env(
+            app,
+            SdkBackend::Claude,
+            launch_env,
+        )),
+        AgentKind::Cursor => BorrowedManager::Sdk(CodexSdkManager::new_with_env(
+            app,
+            SdkBackend::Cursor,
+            launch_env,
+        )),
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            BorrowedManager::OpenCode(OpenCodeSdkManager::new_with_env(app, launch_env))
         }
     };
     Ok(BorrowedRuntime { manager, root })
@@ -328,18 +427,129 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
                 env.insert("LOCALAPPDATA".into(), as_string(local));
             }
         }
-        AgentKind::Codex => {
+        AgentKind::Codex | AgentKind::CodexPlus => {
             env.insert("CODEX_HOME".into(), as_string(root.join("codex-home")));
         }
-        AgentKind::CodeBuddy
-        | AgentKind::ClaudeCode
-        | AgentKind::Cursor
-        | AgentKind::OpenCode
-        | AgentKind::OpenCodePlus
-        | AgentKind::CodexPlus
-        | AgentKind::CodeBuddyPlus => return Err(format!("{} 暂不支持额度租借", kind.label())),
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            let profile = root.join("profile");
+            let config = profile.join(".codebuddy");
+            std::fs::create_dir_all(&config).map_err(|e| e.to_string())?;
+            env.insert("USERPROFILE".into(), as_string(profile.clone()));
+            env.insert("HOME".into(), as_string(profile));
+            env.insert("CODEBUDDY_CONFIG_DIR".into(), as_string(config));
+        }
+        AgentKind::ClaudeCode => {
+            let config = root.join("claude");
+            std::fs::create_dir_all(&config).map_err(|e| e.to_string())?;
+            env.insert("CLAUDE_CONFIG_DIR".into(), as_string(config.clone()));
+            env.insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), as_string(config));
+        }
+        AgentKind::Cursor => {
+            let config = root.join("cursor");
+            std::fs::create_dir_all(&config).map_err(|e| e.to_string())?;
+            env.insert("CURSOR_CONFIG_DIR".into(), as_string(config.clone()));
+            env.insert("CURSOR_DATA_DIR".into(), as_string(config));
+        }
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            let profile = root.join("profile");
+            let config = root.join("opencode-config");
+            let data = root.join("opencode-data");
+            let cache = root.join("opencode-cache");
+            for dir in [&profile, &config, &data, &cache] {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            env.insert("USERPROFILE".into(), as_string(profile.clone()));
+            env.insert("HOME".into(), as_string(profile));
+            env.insert("XDG_CONFIG_HOME".into(), as_string(config));
+            env.insert("XDG_DATA_HOME".into(), as_string(data));
+            env.insert("XDG_CACHE_HOME".into(), as_string(cache));
+        }
     }
+    env.insert("NOVA_QUOTA_BORROWED".into(), "1".into());
     Ok(env)
+}
+
+fn stage_local_skills(
+    app: &AppHandle,
+    kind: &AgentKind,
+    env: &HashMap<String, String>,
+) -> Result<(), String> {
+    let root = match kind {
+        AgentKind::Devin => return Ok(()),
+        AgentKind::Codex | AgentKind::CodexPlus => env
+            .get("CODEX_HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join("skills")),
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => env
+            .get("CODEBUDDY_CONFIG_DIR")
+            .map(PathBuf::from)
+            .map(|path| path.join("skills")),
+        AgentKind::ClaudeCode => env
+            .get("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .map(|path| path.join("skills")),
+        AgentKind::Cursor => env
+            .get("CURSOR_CONFIG_DIR")
+            .map(PathBuf::from)
+            .map(|path| path.join("skills")),
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => env
+            .get("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join("opencode").join("skills")),
+    };
+    if let Some(root) = root {
+        crate::skills::copy_skills_to_runtime(&crate::nova_data_dir(app), &root)?;
+    }
+    Ok(())
+}
+
+pub fn isolate_borrowed_command(command: &mut Command) {
+    for name in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CURSOR_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "XAI_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AZURE_OPENAI_API_KEY",
+    ] {
+        command.env_remove(name);
+    }
+}
+
+fn credential_path_allowed(kind: &AgentKind, raw: &str) -> bool {
+    let path = raw.replace('\\', "/");
+    match kind {
+        AgentKind::Devin => path == "appdata/devin/credentials.toml",
+        AgentKind::Codex | AgentKind::CodexPlus => path == "codex-home/auth.json",
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            path == "profile/.codebuddy/instances.json"
+                || path.starts_with("profile/.codebuddy/local_storage/")
+        }
+        AgentKind::ClaudeCode | AgentKind::Cursor => false,
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => path == "opencode-data/opencode/auth.json",
+    }
+}
+
+fn credential_env_allowed(kind: &AgentKind, name: &str) -> bool {
+    match kind {
+        AgentKind::ClaudeCode => matches!(
+            name,
+            "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "CLAUDE_CODE_OAUTH_TOKEN"
+        ),
+        AgentKind::Cursor => name == "CURSOR_API_KEY",
+        _ => false,
+    }
 }
 
 fn home_dir() -> PathBuf {
@@ -389,6 +599,101 @@ fn collect_file(path: &Path, target: &str, files: &mut Vec<CredentialFile>) -> R
     Ok(())
 }
 
+fn collect_optional_file(
+    path: &Path,
+    target: &str,
+    files: &mut Vec<CredentialFile>,
+) -> Result<(), String> {
+    if path.is_file() {
+        collect_file(path, target, files)?;
+    }
+    Ok(())
+}
+
+fn collect_json_entry(
+    path: &Path,
+    target: &str,
+    key: &str,
+    files: &mut Vec<CredentialFile>,
+) -> Result<(), String> {
+    let data = std::fs::read(path).map_err(|_| {
+        format!(
+            "未找到 {} 登录凭证，请先在额度提供方完成登录",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&data)
+        .map_err(|_| format!("登录凭证格式无效：{}", path.display()))?;
+    let credential = value
+        .get(key)
+        .cloned()
+        .ok_or_else(|| format!("OpenCode Provider {key} 尚未登录，无法共享该模型额度"))?;
+    let mut filtered = serde_json::Map::new();
+    filtered.insert(key.to_string(), credential);
+    let filtered = serde_json::to_vec(&filtered).map_err(|e| format!("凭证序列化失败：{e}"))?;
+    files.push(CredentialFile {
+        path: target.into(),
+        data: base64::engine::general_purpose::STANDARD.encode(filtered),
+    });
+    Ok(())
+}
+
+fn collect_directory(
+    source: &Path,
+    target: &str,
+    files: &mut Vec<CredentialFile>,
+) -> Result<(), String> {
+    if !source.is_dir() {
+        return Err(format!(
+            "未找到 {} 登录凭证，请先在额度提供方完成登录",
+            source.display()
+        ));
+    }
+    let initial_file_count = files.len();
+    let mut pending = vec![source.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(source)
+                .map_err(|_| "凭证目录结构无效".to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            collect_file(&entry.path(), &format!("{target}/{relative}"), files)?;
+            if files.len() > MAX_BUNDLE_FILES {
+                return Err("凭证文件数量过多，已拒绝发送".into());
+            }
+        }
+    }
+    if files.len() == initial_file_count {
+        return Err(format!("登录凭证目录为空：{}", source.display()));
+    }
+    Ok(())
+}
+
+fn collect_secret_env(name: &str, configured: &str, env: &mut HashMap<String, String>) {
+    let value = if configured.trim().is_empty() {
+        std::env::var(name).unwrap_or_default()
+    } else {
+        configured.trim().to_string()
+    };
+    if !value.is_empty() {
+        env.insert(name.to_string(), value);
+    }
+}
+
 fn safe_relative_path(raw: &str) -> Result<PathBuf, String> {
     let path = Path::new(raw);
     if path.is_absolute()
@@ -433,11 +738,16 @@ mod tests {
                 path: "codex-home/auth.json".into(),
                 data: base64::engine::general_purpose::STANDARD.encode(b"secret"),
             }],
+            env: HashMap::from([("OPENAI_API_KEY".into(), "test-key".into())]),
         };
         let grant = encrypt_bundle(&public_key, "request-1", &bundle).unwrap();
         let decoded = decrypt_bundle(secret, "request-1", &grant).unwrap();
         assert_eq!(decoded.agent_kind, AgentKind::Codex);
         assert_eq!(decoded.files[0].path, "codex-home/auth.json");
+        assert_eq!(
+            decoded.env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("test-key")
+        );
     }
 
     #[test]
@@ -445,16 +755,59 @@ mod tests {
         assert!(safe_relative_path("../auth.json").is_err());
         assert!(safe_relative_path("/tmp/auth.json").is_err());
         assert!(safe_relative_path("codex-home/auth.json").is_ok());
+        assert!(credential_path_allowed(
+            &AgentKind::Codex,
+            "codex-home/auth.json"
+        ));
+        assert!(!credential_path_allowed(
+            &AgentKind::Codex,
+            "codex-home/config.toml"
+        ));
+        assert!(credential_env_allowed(
+            &AgentKind::ClaudeCode,
+            "ANTHROPIC_API_KEY"
+        ));
+        assert!(!credential_env_allowed(
+            &AgentKind::ClaudeCode,
+            "NODE_OPTIONS"
+        ));
+    }
+
+    #[test]
+    fn opencode_credentials_only_include_requested_provider() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-opencode-credential-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let auth = root.join("auth.json");
+        std::fs::write(
+            &auth,
+            br#"{"anthropic":{"token":"a"},"openai":{"token":"b"}}"#,
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        collect_json_entry(&auth, "opencode/auth.json", "openai", &mut files).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(files[0].data.as_bytes())
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert!(value.get("openai").is_some());
+        assert!(value.get("anthropic").is_none());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]
     #[test]
-    fn cursor_launch_env_is_rejected_without_isolated_sdk_support() {
+    fn cursor_launch_env_uses_isolated_sdk_data_dir() {
         let root = std::env::temp_dir().join("nova-cursor-launch-env-test");
-        assert_eq!(
-            launch_env(&AgentKind::Cursor, &root).unwrap_err(),
-            "Cursor 暂不支持额度租借"
-        );
+        let env = launch_env(&AgentKind::Cursor, &root).unwrap();
+        let cursor = root.join("cursor").to_string_lossy().to_string();
+        assert_eq!(env.get("CURSOR_CONFIG_DIR"), Some(&cursor));
+        assert_eq!(env.get("CURSOR_DATA_DIR"), Some(&cursor));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]

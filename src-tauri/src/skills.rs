@@ -226,6 +226,25 @@ fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 把借入方本机的 Nova skills 复制到额度租借的隔离后端目录。
+/// 使用会话快照而不是链接，避免隔离进程修改用户的原始 skill。
+pub fn copy_skills_to_runtime(config_dir: &Path, destination: &Path) -> Result<(), String> {
+    let source = skills_dir(config_dir);
+    if !source.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !is_skill_dir(&path) {
+            continue;
+        }
+        copy_dir_all(&path, &destination.join(entry.file_name())).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn find_skill_md(dir: &Path, depth: usize) -> Option<PathBuf> {
     if depth == 0 || !dir.is_dir() {
         return None;
@@ -490,4 +509,29 @@ pub fn sync_skills_to_backends(config_dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copies_local_skills_into_isolated_runtime() {
+        let root =
+            std::env::temp_dir().join(format!("nova-skill-runtime-test-{}", uuid::Uuid::new_v4()));
+        let config = root.join("config");
+        let skill = skills_dir(&config).join("demo");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\n").unwrap();
+        std::fs::write(skill.join("helper.txt"), "local").unwrap();
+
+        let destination = root.join("runtime-skills");
+        copy_skills_to_runtime(&config, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("demo").join("helper.txt")).unwrap(),
+            "local"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -31,6 +31,7 @@ struct PendingPermission {
 
 pub struct OpenCodeSdkManager {
     app: AppHandle,
+    launch_env: HashMap<String, String>,
     running_children: Mutex<HashMap<String, RunningBridge>>,
     pending_permissions: Mutex<HashMap<String, PendingPermission>>,
     running: Mutex<HashSet<String>>,
@@ -42,8 +43,13 @@ pub struct OpenCodeSdkManager {
 
 impl OpenCodeSdkManager {
     pub fn new(app: AppHandle) -> Arc<Self> {
+        Self::new_with_env(app, HashMap::new())
+    }
+
+    pub fn new_with_env(app: AppHandle, launch_env: HashMap<String, String>) -> Arc<Self> {
         Arc::new(Self {
             app,
+            launch_env,
             running_children: Mutex::new(HashMap::new()),
             pending_permissions: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
@@ -56,6 +62,13 @@ impl OpenCodeSdkManager {
 
     pub fn is_running(&self, thread_id: &str) -> bool {
         self.running.lock().unwrap().contains(thread_id)
+    }
+
+    pub fn has_pending_permission(&self, request_key: &str) -> bool {
+        self.pending_permissions
+            .lock()
+            .unwrap()
+            .contains_key(request_key)
     }
 
     pub fn get_model_options(&self) -> Option<Value> {
@@ -385,6 +398,10 @@ impl OpenCodeSdkManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if !self.launch_env.is_empty() {
+            crate::credential_roaming::isolate_borrowed_command(&mut command);
+            command.envs(&self.launch_env);
+        }
         if let Some(dir) = resolve_program_on_path(&opencode_path)
             .and_then(|path| path.parent().map(PathBuf::from))
         {

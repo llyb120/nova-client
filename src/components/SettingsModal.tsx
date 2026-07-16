@@ -238,6 +238,10 @@ export function SettingsModal(props: { onClose: () => void }) {
     const kinds: AgentKind[] = [];
     if (devinEnabled()) kinds.push("devin");
     if (codexEnabled()) kinds.push("codex");
+    if (codebuddyEnabled()) kinds.push("codebuddy");
+    if (claudecodeEnabled()) kinds.push("claudecode");
+    if (cursorEnabled()) kinds.push("cursor");
+    if (opencodeEnabled()) kinds.push("opencode");
     return kinds;
   });
   const titleAgentKinds = createMemo(() =>
@@ -1429,7 +1433,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="field">
               <span class="field-label">共享模型额度（可多选）</span>
               <span class="field-hint">
-                选中的模型会以“{relayName().trim() || "我的"}的 Cursor”这类一级分类出现在队友的新会话模型选择器中。每次创建会话都会重新同步当前凭据；取消勾选后，旧缓存中的入口也无法再使用。
+                选中的模型会以“{relayName().trim() || "我的"}的 Cursor”这类一级分类出现在队友的新会话模型选择器中。首次选择时会安全同步并预热额度租约；取消勾选后，旧缓存中的入口也无法再使用。
               </span>
               <div class="quota-share-models">
                 <For each={quotaShareKinds()}>

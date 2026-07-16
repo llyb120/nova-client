@@ -2245,10 +2245,14 @@ fn set_thread_model(
     if is_guest {
         state.relay.guest_sync_config(&thread_id);
     } else if let Some(runtime) = state.borrowed_runtime(&thread_id) {
-        if let BorrowedManager::Acp(manager) = runtime.manager {
-            tauri::async_runtime::spawn(async move {
-                manager.sync_thread_config(&thread_id).await;
-            });
+        match runtime.manager {
+            BorrowedManager::Acp(manager) => {
+                tauri::async_runtime::spawn(async move {
+                    manager.sync_thread_config(&thread_id).await;
+                });
+            }
+            BorrowedManager::Sdk(manager) => manager.forget_session_of_thread(&thread_id),
+            BorrowedManager::OpenCode(manager) => manager.forget_session_of_thread(&thread_id),
         }
     } else if is_quota {
         return Err("额度凭证已过期，请重新发起租借".into());
@@ -2303,7 +2307,8 @@ fn set_thread_mode(
                     manager.sync_thread_config(&thread_id).await;
                 });
             }
-            BorrowedManager::Codex(manager) => manager.remount_for_config(&thread_id),
+            BorrowedManager::Sdk(manager) => manager.forget_session_of_thread(&thread_id),
+            BorrowedManager::OpenCode(manager) => manager.forget_session_of_thread(&thread_id),
         }
     } else if is_quota {
         return Err("额度凭证已过期，请重新发起租借".into());
@@ -2552,17 +2557,6 @@ fn send_prompt(
             "额度凭证已过期。为避免误用本机账号，本会话不会自动回退；请从首页重新发起额度租借。",
         )?;
         match runtime.manager {
-            BorrowedManager::Codex(manager) => {
-                if manager.is_running(&thread_id) {
-                    tauri::async_runtime::spawn(async move {
-                        manager.steer_prompt(thread_id, text, images).await;
-                    });
-                } else {
-                    tauri::async_runtime::spawn(async move {
-                        manager.run_prompt(thread_id, text, images).await;
-                    });
-                }
-            }
             BorrowedManager::Acp(manager) => {
                 if matches!(agent_kind, AgentKind::CodeBuddy | AgentKind::Cursor)
                     || !manager.is_running(&thread_id)
@@ -2575,6 +2569,16 @@ fn send_prompt(
                         manager.steer_prompt(thread_id, text, images).await;
                     });
                 }
+            }
+            BorrowedManager::Sdk(manager) => {
+                tauri::async_runtime::spawn(async move {
+                    manager.run_prompt(thread_id, text, images).await;
+                });
+            }
+            BorrowedManager::OpenCode(manager) => {
+                tauri::async_runtime::spawn(async move {
+                    manager.run_prompt(thread_id, text, images).await;
+                });
             }
         }
         return Ok(());
@@ -2679,7 +2683,8 @@ fn truncate_thread(
     if let Some(runtime) = state.borrowed_runtime(&thread_id) {
         match runtime.manager {
             BorrowedManager::Acp(manager) => manager.forget_session_of_thread(&thread_id),
-            BorrowedManager::Codex(manager) => manager.forget_session_of_thread(&thread_id),
+            BorrowedManager::Sdk(manager) => manager.forget_session_of_thread(&thread_id),
+            BorrowedManager::OpenCode(manager) => manager.forget_session_of_thread(&thread_id),
         }
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
@@ -2707,7 +2712,8 @@ async fn cancel_turn(
     if let Some(runtime) = state.borrowed_runtime(&thread_id) {
         match runtime.manager {
             BorrowedManager::Acp(manager) => manager.cancel(&thread_id).await,
-            BorrowedManager::Codex(manager) => manager.cancel(&thread_id).await,
+            BorrowedManager::Sdk(manager) => manager.cancel(&thread_id).await,
+            BorrowedManager::OpenCode(manager) => manager.cancel(&thread_id).await,
         }
         return Ok(());
     }
@@ -2840,7 +2846,12 @@ async fn respond_permission(
     if let Some(runtime) = borrowed {
         return runtime.respond_permission(&request_key, &option_id).await;
     }
-    if request_key.starts_with("cbp-") {
+    if request_key.starts_with("cdp-") {
+        state
+            .codexplus
+            .respond_permission(&request_key, &option_id)
+            .await
+    } else if request_key.starts_with("cbp-") {
         state
             .codebuddyplus
             .respond_permission(&request_key, &option_id)
@@ -2848,6 +2859,11 @@ async fn respond_permission(
     } else if request_key.starts_with("clp-") {
         state
             .claudeplus
+            .respond_permission(&request_key, &option_id)
+            .await
+    } else if request_key.starts_with("cup-") {
+        state
+            .cursorplus
             .respond_permission(&request_key, &option_id)
             .await
     } else if request_key.starts_with("ocp-") {

@@ -78,6 +78,7 @@ struct IdleBridge {
 pub struct CodexSdkManager {
     app: AppHandle,
     backend: SdkBackend,
+    launch_env: HashMap<String, String>,
     running_children: Mutex<HashMap<String, RunningBridge>>,
     idle_children: Mutex<HashMap<String, IdleBridge>>,
     running: Mutex<HashSet<String>>,
@@ -90,9 +91,18 @@ pub struct CodexSdkManager {
 
 impl CodexSdkManager {
     pub fn new(app: AppHandle, backend: SdkBackend) -> Arc<Self> {
+        Self::new_with_env(app, backend, HashMap::new())
+    }
+
+    pub fn new_with_env(
+        app: AppHandle,
+        backend: SdkBackend,
+        launch_env: HashMap<String, String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             app,
             backend,
+            launch_env,
             running_children: Mutex::new(HashMap::new()),
             idle_children: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
@@ -106,6 +116,13 @@ impl CodexSdkManager {
 
     pub fn is_running(&self, thread_id: &str) -> bool {
         self.running.lock().unwrap().contains(thread_id)
+    }
+
+    pub fn has_pending_permission(&self, request_key: &str) -> bool {
+        self.pending_permissions
+            .lock()
+            .unwrap()
+            .contains_key(request_key)
     }
 
     pub async fn run_prompt(
@@ -517,9 +534,15 @@ impl CodexSdkManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .env(path_env, &program);
+        if !self.launch_env.is_empty() {
+            crate::credential_roaming::isolate_borrowed_command(&mut command);
+            command.envs(&self.launch_env);
+        }
         apply_proxy_env(&mut command, &proxy);
-        if let Some((name, value)) = api_key {
-            command.env(name, value);
+        if self.launch_env.is_empty() {
+            if let Some((name, value)) = api_key {
+                command.env(name, value);
+            }
         }
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
@@ -616,8 +639,10 @@ impl CodexSdkManager {
             return;
         };
         let (prefix, agent_kind) = match self.backend {
+            SdkBackend::Codex => ("cdp", "codex"),
+            SdkBackend::CodeBuddy => ("cbp", "codebuddy"),
             SdkBackend::Claude => ("clp", "claudecode"),
-            _ => ("cbp", "codebuddy"),
+            SdkBackend::Cursor => ("cup", "cursor"),
         };
         let request_key = format!("{prefix}-perm-{thread_id}-{request_id}");
         self.pending_permissions.lock().unwrap().insert(
