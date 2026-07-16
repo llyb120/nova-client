@@ -1137,6 +1137,37 @@ mod tests {
     }
 
     #[test]
+    fn edited_opencode_prompt_replays_retained_history_once() {
+        let mut thread = Thread::new(
+            "D:/project".into(),
+            AgentKind::OpenCode,
+            None,
+            None,
+            None,
+            false,
+        );
+        thread.push_user("先定位问题".into(), Vec::new());
+        thread.items.push(Item::Assistant {
+            id: thread.next_item_id(),
+            text: "问题位于会话恢复逻辑。".into(),
+            ts: now_ms(),
+        });
+        thread.handoff_from = Some(AgentKind::OpenCode);
+
+        let context = thread
+            .take_prompt_context("OpenCode")
+            .expect("重编辑后应把截断点前的历史交给新的 OpenCode 会话");
+
+        assert!(context.contains("用户：\n先定位问题"));
+        assert!(context.contains("OpenCode：\n问题位于会话恢复逻辑。"));
+        assert!(thread.take_prompt_context("OpenCode").is_none());
+
+        thread.items.clear();
+        thread.handoff_from = None;
+        assert!(thread.take_prompt_context("OpenCode").is_none());
+    }
+
+    #[test]
     fn legacy_thread_without_starred_defaults_to_false() {
         let thread = Thread::new(String::new(), AgentKind::Devin, None, None, None, false);
         let mut value = serde_json::to_value(thread).expect("线程应可序列化");

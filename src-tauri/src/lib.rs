@@ -2551,6 +2551,8 @@ fn truncate_thread(
         thread.items.truncate(idx);
         thread.plan = None;
         thread.acp_session_id = None;
+        // 远端会话已作废；若截断点前仍有历史，下一条 prompt 需在新会话中接续它。
+        thread.handoff_from = (!thread.items.is_empty()).then(|| thread.agent_kind.clone());
         // 截断到开头时重置标题，让编辑后的首条消息重新生成标题
         if idx == 0 {
             thread.title = thread
