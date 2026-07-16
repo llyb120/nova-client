@@ -3194,67 +3194,6 @@ button {
   justify-content: space-between;
 }
 
-.integration-control {
-  display: grid;
-  gap: 4px;
-  flex: 0 0 auto;
-}
-
-.integration-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-dim);
-}
-
-.integration-switch {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 2px;
-  width: 164px;
-  padding: 3px;
-  border: 1px solid var(--border-strong);
-  border-radius: 9px;
-  background: var(--bg-input);
-}
-
-.integration-switch button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  min-height: 28px;
-  padding: 4px 10px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  color: var(--text-muted);
-  background: transparent;
-  font-weight: 600;
-  cursor: pointer;
-  transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
-}
-
-.integration-switch button:not(.active):hover {
-  color: var(--text);
-  background: var(--bg-hover);
-}
-
-.integration-switch button.active {
-  color: var(--on-accent);
-  border-color: color-mix(in srgb, var(--accent) 84%, var(--border-strong));
-  background: var(--accent);
-  box-shadow: 0 2px 7px color-mix(in srgb, var(--accent) 32%, transparent);
-}
-
-.integration-check {
-  visibility: hidden;
-  font-size: 13px;
-  line-height: 1;
-}
-
-.integration-switch button.active .integration-check {
-  visibility: visible;
-}
-
 .backend-config-row {
   display: flex;
   align-items: end;
@@ -3319,7 +3258,6 @@ button {
     flex-direction: column;
   }
 
-  .integration-switch,
   .fixed-integration {
     width: 100%;
   }

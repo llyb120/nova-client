@@ -179,6 +179,13 @@ fn quota_model_key(kind: &AgentKind, model: &str) -> String {
     format!("{}:{model}", kind.as_str())
 }
 
+fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
+    match kind {
+        AgentKind::Devin | AgentKind::Codex => Ok(()),
+        _ => Err(format!("{} SDK 暂不支持隔离额度租借", kind.label())),
+    }
+}
+
 fn shared_quota_model_keys(shared_options: &Value) -> HashSet<String> {
     let mut shared = HashSet::new();
     let Some(backends) = shared_options.as_object() else {
@@ -1442,18 +1449,42 @@ impl RelayManager {
         let seed = format!(
             "{prompt}\n\n----\n下面是需要你处理的会话记录（请直接输出处理后的结果，便于分享给同事）：\n\n{transcript}"
         );
-        // 处理会话按其后端路由：Codex 走原生管理器，其它走对应 ACP 管理器
+        // 处理会话按固定后端路由执行。
         let state = self.app.state::<AppState>();
         let run_id = new_id.clone();
         match agent_kind {
-            AgentKind::Codex => {
-                let mgr = state.codex.clone();
+            AgentKind::Devin => {
+                let mgr = state.acp.clone();
                 tauri::async_runtime::spawn(async move {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
             }
-            kind => {
-                let mgr = state.acp_for(&kind).expect("ACP 后端必有 manager");
+            AgentKind::Codex | AgentKind::CodexPlus => {
+                let mgr = state.codexplus.clone();
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(run_id, seed, vec![]).await;
+                });
+            }
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+                let mgr = state.codebuddyplus.clone();
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(run_id, seed, vec![]).await;
+                });
+            }
+            AgentKind::ClaudeCode => {
+                let mgr = state.claudeplus.clone();
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(run_id, seed, vec![]).await;
+                });
+            }
+            AgentKind::Cursor => {
+                let mgr = state.cursorplus.clone();
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(run_id, seed, vec![]).await;
+                });
+            }
+            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+                let mgr = state.opencodeplus.clone();
                 tauri::async_runtime::spawn(async move {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
@@ -1497,6 +1528,7 @@ impl RelayManager {
         agent_kind: AgentKind,
         model: String,
     ) -> Result<(), String> {
+        ensure_quota_backend_supported(&agent_kind)?;
         if self.cfg().is_none() {
             return Err("未配置中转站 token".into());
         }
@@ -1696,6 +1728,7 @@ impl RelayManager {
         operation_id: &str,
         operation: Arc<QuotaOperation>,
     ) -> Result<Thread, String> {
+        ensure_quota_backend_supported(&agent_kind)?;
         let settings = {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap().clone();
@@ -2239,20 +2272,17 @@ impl RelayManager {
             for kind in kinds {
                 backends.push(kind.as_str());
                 let fetched = match kind {
-                    AgentKind::OpenCodePlus => {
+                    AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                         app.state::<AppState>()
                             .opencodeplus
                             .ensure_model_options()
                             .await
                     }
-                    AgentKind::Codex => app.state::<AppState>().codex.fetch_model_options().await,
-                    _ => {
-                        app.state::<AppState>()
-                            .acp_for(&kind)
-                            .expect("ACP 后端必有 manager")
-                            .fetch_model_options()
-                            .await
+                    AgentKind::Codex | AgentKind::CodexPlus => {
+                        app.state::<AppState>().codex.fetch_model_options().await
                     }
+                    AgentKind::Devin => app.state::<AppState>().acp.fetch_model_options().await,
+                    _ => continue,
                 };
                 if let Ok(v) = fetched {
                     if let Some(filtered) = shared_model_options(&kind, &v, &shared) {
@@ -2772,7 +2802,7 @@ impl RelayManager {
             (epoch, value)
         };
         match agent_kind {
-            AgentKind::OpenCodePlus => {
+            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                 let mgr = state.opencodeplus.clone();
                 tauri::async_runtime::spawn(async move {
                     if host_prompt_is_current(&prompt_epoch) {
@@ -2780,10 +2810,8 @@ impl RelayManager {
                     }
                 });
             }
-            AgentKind::CodeBuddy => {
-                // CodeBuddy 单连接不能并发：运行中再发不走「注入」，一律 run_prompt，
-                // 经串行闸门排到当前轮次之后顺序执行（详见 acp.rs 的 serial_gate 说明）。
-                let mgr = state.codebuddy.clone();
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+                let mgr = state.codebuddyplus.clone();
                 tauri::async_runtime::spawn(async move {
                     if !host_prompt_is_current(&prompt_epoch) {
                         return;
@@ -2791,8 +2819,16 @@ impl RelayManager {
                     mgr.run_prompt(host_thread_id, text, images).await;
                 });
             }
-            AgentKind::Codex => {
-                let mgr = state.codex.clone();
+            AgentKind::Codex | AgentKind::CodexPlus => {
+                let mgr = state.codexplus.clone();
+                tauri::async_runtime::spawn(async move {
+                    if host_prompt_is_current(&prompt_epoch) {
+                        mgr.run_prompt(host_thread_id, text, images).await;
+                    }
+                });
+            }
+            AgentKind::Devin => {
+                let mgr = state.acp.clone();
                 if mgr.is_running(&host_thread_id) {
                     tauri::async_runtime::spawn(async move {
                         if !host_prompt_is_current(&prompt_epoch) {
@@ -2809,26 +2845,21 @@ impl RelayManager {
                     });
                 }
             }
-            // Devin / ClaudeCode / Cursor / OpenCode：多路复用，运行中注入「引导」，否则新起一轮
-            kind => {
-                let Some(mgr) = state.acp_for(&kind) else {
-                    return;
-                };
-                if mgr.is_running(&host_thread_id) {
-                    tauri::async_runtime::spawn(async move {
-                        if !host_prompt_is_current(&prompt_epoch) {
-                            return;
-                        }
-                        mgr.steer_prompt(host_thread_id, text, images).await;
-                    });
-                } else {
-                    tauri::async_runtime::spawn(async move {
-                        if !host_prompt_is_current(&prompt_epoch) {
-                            return;
-                        }
+            AgentKind::ClaudeCode => {
+                let mgr = state.claudeplus.clone();
+                tauri::async_runtime::spawn(async move {
+                    if host_prompt_is_current(&prompt_epoch) {
                         mgr.run_prompt(host_thread_id, text, images).await;
-                    });
-                }
+                    }
+                });
+            }
+            AgentKind::Cursor => {
+                let mgr = state.cursorplus.clone();
+                tauri::async_runtime::spawn(async move {
+                    if host_prompt_is_current(&prompt_epoch) {
+                        mgr.run_prompt(host_thread_id, text, images).await;
+                    }
+                });
             }
         }
     }
@@ -2854,38 +2885,39 @@ impl RelayManager {
                 .fetch_add(1, Ordering::SeqCst);
         }
         let state = self.app.state::<AppState>();
-        if agent_kind == AgentKind::OpenCodePlus {
-            let mgr = state.opencodeplus.clone();
-            if !mgr.is_running(&host_thread_id) {
-                self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
-                return;
-            }
-            tauri::async_runtime::spawn(async move {
-                mgr.cancel(&host_thread_id).await;
-            });
+        if !crate::is_running(
+            &state,
+            state.store.lock().unwrap().get(&host_thread_id).unwrap(),
+        ) {
+            self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
             return;
         }
-        match state.acp_for(&agent_kind) {
-            Some(mgr) => {
-                if !mgr.is_running(&host_thread_id) {
-                    self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
-                    return;
-                }
-                tauri::async_runtime::spawn(async move {
-                    mgr.cancel(&host_thread_id).await;
-                });
+        match agent_kind {
+            AgentKind::Devin => {
+                let mgr = state.acp.clone();
+                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
-            None => {
-                let mgr = state.codex.clone();
-                if !mgr.is_running(&host_thread_id) {
-                    self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
-                    return;
-                }
-                tauri::async_runtime::spawn(async move {
-                    mgr.cancel(&host_thread_id).await;
-                });
+            AgentKind::Codex | AgentKind::CodexPlus => {
+                let mgr = state.codexplus.clone();
+                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
-        }
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+                let mgr = state.codebuddyplus.clone();
+                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
+            }
+            AgentKind::ClaudeCode => {
+                let mgr = state.claudeplus.clone();
+                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
+            }
+            AgentKind::Cursor => {
+                let mgr = state.cursorplus.clone();
+                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
+            }
+            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+                let mgr = state.opencodeplus.clone();
+                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
+            }
+        };
     }
 
     /// host：guest 主动召回漫游会话。校验请求者确实是该会话的漫游对端后，
@@ -2958,28 +2990,23 @@ impl RelayManager {
             .unwrap_or_default()
             .to_string();
         let state = self.app.state::<AppState>();
-        if request_key.starts_with("codex-") {
+        if request_key.starts_with("cbp-") {
+            let mgr = state.codebuddyplus.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = mgr.respond_permission(&request_key, &option_id).await;
+            });
+        } else if request_key.starts_with("clp-") {
+            let mgr = state.claudeplus.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = mgr.respond_permission(&request_key, &option_id).await;
+            });
+        } else if request_key.starts_with("ocp-") {
+            let mgr = state.opencodeplus.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = mgr.respond_permission(&request_key, &option_id).await;
+            });
+        } else if request_key.starts_with("codex-") {
             let mgr = state.codex.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else if request_key.starts_with("cb-") {
-            let mgr = state.codebuddy.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else if request_key.starts_with("cc-") {
-            let mgr = state.claudecode.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else if request_key.starts_with("cs-") {
-            let mgr = state.cursor.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else if request_key.starts_with("oc-") {
-            let mgr = state.opencode.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = mgr.respond_permission(&request_key, &option_id).await;
             });
@@ -3014,7 +3041,8 @@ impl RelayManager {
             ak
         };
         let state = self.app.state::<AppState>();
-        if let Some(mgr) = state.acp_for(&agent_kind) {
+        if agent_kind == AgentKind::Devin {
+            let mgr = state.acp.clone();
             tauri::async_runtime::spawn(async move {
                 mgr.sync_thread_config(&host_thread_id).await;
             });
@@ -3044,8 +3072,7 @@ impl RelayManager {
             let Some(t) = store.get(host_thread_id) else {
                 return;
             };
-            let running = state.all_acp().iter().any(|m| m.is_running(host_thread_id))
-                || state.codex.is_running(host_thread_id);
+            let running = crate::is_running(&state, t);
             // 用户消息的图片/文件内容 guest 本地已有，快照里剥掉 data 省带宽：
             // guest 会按顺序用自己保留的用户条目回填（含附件内容）。
             let mut items = t.items.clone();
@@ -4049,6 +4076,16 @@ mod tests {
 
         assert_ne!(cursor, codex);
         assert!(QuotaLeaseKey::new("".into(), AgentKind::Cursor).is_err());
+    }
+
+    #[test]
+    fn quota_runtime_only_supports_devin_and_native_codex() {
+        assert!(ensure_quota_backend_supported(&AgentKind::Devin).is_ok());
+        assert!(ensure_quota_backend_supported(&AgentKind::Codex).is_ok());
+        assert!(ensure_quota_backend_supported(&AgentKind::CodeBuddy).is_err());
+        assert!(ensure_quota_backend_supported(&AgentKind::ClaudeCode).is_err());
+        assert!(ensure_quota_backend_supported(&AgentKind::Cursor).is_err());
+        assert!(ensure_quota_backend_supported(&AgentKind::OpenCode).is_err());
     }
 
     #[test]

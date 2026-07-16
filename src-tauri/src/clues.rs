@@ -212,14 +212,8 @@ impl ClueStore {
                 let target = target_card_id.ok_or("请选择要更新的线索")?;
                 let (group_index, card_index) =
                     self.card_location(target).ok_or("目标线索不存在")?;
-                let version = new_version(
-                    title,
-                    content,
-                    source_thread_id,
-                    author_name,
-                    mentions,
-                    now,
-                );
+                let version =
+                    new_version(title, content, source_thread_id, author_name, mentions, now);
                 let group = &mut self.groups[group_index];
                 let card = {
                     let card = &mut group.cards[card_index];
@@ -237,14 +231,7 @@ impl ClueStore {
             "parallel" => {
                 let target = target_card_id.ok_or("请选择平行线索的位置")?;
                 let (group_index, _) = self.card_location(target).ok_or("目标线索不存在")?;
-                let card = new_card(
-                    title,
-                    content,
-                    source_thread_id,
-                    author_name,
-                    mentions,
-                    now,
-                );
+                let card = new_card(title, content, source_thread_id, author_name, mentions, now);
                 let group = &mut self.groups[group_index];
                 group.cards.push(card.clone());
                 group.updated_at = now;
@@ -261,14 +248,7 @@ impl ClueStore {
                     }
                     None => Vec::new(),
                 };
-                let card = new_card(
-                    title,
-                    content,
-                    source_thread_id,
-                    author_name,
-                    mentions,
-                    now,
-                );
+                let card = new_card(title, content, source_thread_id, author_name, mentions, now);
                 let group = ClueNodeGroup {
                     id: uuid::Uuid::new_v4().to_string(),
                     parent_card_ids,
@@ -300,7 +280,10 @@ impl ClueStore {
             return Err("评论内容不能为空".into());
         }
         let (group_index, card_index) = self.card_location(card_id).ok_or("线索不存在")?;
-        let parent = match parent_comment_id.as_deref().filter(|value| !value.is_empty()) {
+        let parent = match parent_comment_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
             Some(parent_id) => Some(
                 self.groups[group_index].cards[card_index]
                     .comments
@@ -312,7 +295,11 @@ impl ClueStore {
             None => None,
         };
         if let Some(parent) = &parent {
-            if let Some(token) = parent.author_token.as_deref().filter(|token| !token.is_empty()) {
+            if let Some(token) = parent
+                .author_token
+                .as_deref()
+                .filter(|token| !token.is_empty())
+            {
                 mentions.push(ClueMention {
                     token: token.to_string(),
                     name: parent.author_name.clone(),
@@ -483,8 +470,7 @@ impl ClueStore {
             .first()
             .map(|card| card.id.clone())
             .ok_or("线索不存在")?;
-        let stacked_card_ids: HashSet<String> =
-            cards.iter().map(|card| card.id.clone()).collect();
+        let stacked_card_ids: HashSet<String> = cards.iter().map(|card| card.id.clone()).collect();
         let now = now_ms();
         for group in &mut self.groups {
             let original_len = group.cards.len();
@@ -514,7 +500,10 @@ impl ClueStore {
                 continue;
             }
             let mut merged = next_parents;
-            if !merged.iter().any(|parent_id| parent_id == &representative_id) {
+            if !merged
+                .iter()
+                .any(|parent_id| parent_id == &representative_id)
+            {
                 merged.push(representative_id.clone());
             }
             if merged != group.parent_card_ids {
@@ -693,14 +682,7 @@ fn new_card(
     mentions: Vec<ClueMention>,
     now: i64,
 ) -> ClueCard {
-    let version = new_version(
-        title,
-        content,
-        source_thread_id,
-        author_name,
-        mentions,
-        now,
-    );
+    let version = new_version(title, content, source_thread_id, author_name, mentions, now);
     ClueCard {
         id: uuid::Uuid::new_v4().to_string(),
         current_version_id: version.id.clone(),
@@ -973,9 +955,7 @@ mod tests {
                 "丙".into(),
             )
             .unwrap();
-        store
-            .associate(&right.card.id, &child.card.id)
-            .unwrap();
+        store.associate(&right.card.id, &child.card.id).unwrap();
         let before = store
             .groups
             .iter()
@@ -1150,7 +1130,10 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        assert_eq!(reply.parent_comment_id.as_deref(), Some(comment.id.as_str()));
+        assert_eq!(
+            reply.parent_comment_id.as_deref(),
+            Some(comment.id.as_str())
+        );
         assert_eq!(reply.mentions.len(), 1);
         assert_eq!(reply.mentions[0].token, "peer-a");
 

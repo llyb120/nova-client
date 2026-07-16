@@ -1662,18 +1662,11 @@ pub fn assign_task(
 
 fn thread_running(app: &AppHandle, thread_id: &str) -> bool {
     let state = app.state::<AppState>();
-    let kind = {
+    let thread = {
         let store = state.store.lock().unwrap();
-        store.get(thread_id).map(|t| t.agent_kind.clone())
+        store.get(thread_id).cloned()
     };
-    match kind {
-        Some(AgentKind::OpenCodePlus) => state.opencodeplus.is_running(thread_id),
-        Some(kind) => match state.acp_for(&kind) {
-            Some(mgr) => mgr.is_running(thread_id),
-            None => state.codex.is_running(thread_id),
-        },
-        None => false,
-    }
+    thread.is_some_and(|thread| crate::is_running(&state, &thread))
 }
 
 pub fn delete_task(app: &AppHandle, id: &str) -> Result<(), String> {
@@ -2918,18 +2911,48 @@ async fn run_prompt_for_images(
     prompt: String,
     images: Vec<PromptImage>,
 ) {
-    if kind == &AgentKind::OpenCodePlus {
-        let mgr = app.state::<AppState>().opencodeplus.clone();
-        mgr.run_prompt(thread_id, prompt, images).await;
-        return;
-    }
-    // 先取出 manager 再 await，避免持着 State 引用跨 await 点
-    let acp_mgr = app.state::<AppState>().acp_for(kind);
-    match acp_mgr {
-        Some(mgr) => mgr.run_prompt(thread_id, prompt, images).await,
-        None => {
-            let mgr = app.state::<AppState>().codex.clone();
-            mgr.run_prompt(thread_id, prompt, images).await
+    match kind {
+        AgentKind::Devin => {
+            app.state::<AppState>()
+                .acp
+                .clone()
+                .run_prompt(thread_id, prompt, images)
+                .await
+        }
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            app.state::<AppState>()
+                .codexplus
+                .clone()
+                .run_prompt(thread_id, prompt, images)
+                .await
+        }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            app.state::<AppState>()
+                .codebuddyplus
+                .clone()
+                .run_prompt(thread_id, prompt, images)
+                .await
+        }
+        AgentKind::ClaudeCode => {
+            app.state::<AppState>()
+                .claudeplus
+                .clone()
+                .run_prompt(thread_id, prompt, images)
+                .await
+        }
+        AgentKind::Cursor => {
+            app.state::<AppState>()
+                .cursorplus
+                .clone()
+                .run_prompt(thread_id, prompt, images)
+                .await
+        }
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            app.state::<AppState>()
+                .opencodeplus
+                .clone()
+                .run_prompt(thread_id, prompt, images)
+                .await
         }
     }
 }
@@ -3150,17 +3173,15 @@ pub(crate) async fn cancel_employee_thread(app: &AppHandle, thread_id: &str) {
         .lock()
         .unwrap()
         .insert(thread_id.to_string());
-    if kind == AgentKind::OpenCodePlus {
-        state.opencodeplus.cancel(thread_id).await;
-    } else {
-        match state.acp_for(&kind) {
-            Some(mgr) => {
-                let _ = mgr.cancel(thread_id).await;
-            }
-            None => {
-                let _ = state.codex.cancel(thread_id).await;
-            }
+    match kind {
+        AgentKind::Devin => state.acp.cancel(thread_id).await,
+        AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            state.codebuddyplus.cancel(thread_id).await
         }
+        AgentKind::ClaudeCode => state.claudeplus.cancel(thread_id).await,
+        AgentKind::Cursor => state.cursorplus.cancel(thread_id).await,
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.cancel(thread_id).await,
     }
 }
 
@@ -3426,15 +3447,13 @@ fn employee_has_running_thread(app: &AppHandle, employee_id: &str) -> bool {
             .map(|t| (t.id.clone(), t.agent_kind.clone()))
             .collect()
     };
-    ids.iter().any(|(id, kind)| {
-        if kind == &AgentKind::OpenCodePlus {
-            state.opencodeplus.is_running(id)
-        } else {
-            match state.acp_for(kind) {
-                Some(mgr) => mgr.is_running(id),
-                None => state.codex.is_running(id),
-            }
-        }
+    ids.iter().any(|(id, kind)| match kind {
+        AgentKind::Devin => state.acp.is_running(id),
+        AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.is_running(id),
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddyplus.is_running(id),
+        AgentKind::ClaudeCode => state.claudeplus.is_running(id),
+        AgentKind::Cursor => state.cursorplus.is_running(id),
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.is_running(id),
     })
 }
 
@@ -6135,10 +6154,12 @@ fn discard_thread(app: &AppHandle, thread_id: &str) {
     }
     let state = app.state::<AppState>();
     state.acp.forget_session_of_thread(thread_id);
-    state.codebuddy.forget_session_of_thread(thread_id);
-    state.claudecode.forget_session_of_thread(thread_id);
-    state.opencode.forget_session_of_thread(thread_id);
     state.codex.forget_session_of_thread(thread_id);
+    state.codexplus.forget_session_of_thread(thread_id);
+    state.codebuddyplus.forget_session_of_thread(thread_id);
+    state.claudeplus.forget_session_of_thread(thread_id);
+    state.cursorplus.forget_session_of_thread(thread_id);
+    state.opencodeplus.forget_session_of_thread(thread_id);
     let _ = app.emit(crate::acp::EV_THREADS, json!({}));
 }
 

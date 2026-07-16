@@ -101,7 +101,7 @@ function priceText(cost?: ModelCost): string | undefined {
   return `$${fmt(p.input ?? 0)}/$${fmt(p.output ?? 0)}`;
 }
 
-/** CodeBuddy 的费用（积分倍率）随 ACP 选项 description 下发，形如 "x0.79 credits"。
+/** CodeBuddy 的费用（积分倍率）随模型 description 下发，形如 "x0.79 credits"。
  *  解析成与 Devin 积分倍率一致的紧凑样式 "0.79×"，解析失败时回退去掉前缀的原文。 */
 function creditsText(description?: string): string | undefined {
   if (!description || !/credits/i.test(description)) return undefined;
@@ -140,7 +140,7 @@ export function modelOptionsOf(
       m._meta?.["cognition.ai/supportsImages"] ?? m._meta?.["codex.ai/supportsImages"];
     const price = priceText(cost);
     const mult = multiplierText(cost);
-    // CodeBuddy 无 windsurf 费用数据，改用 ACP 选项 description 里的积分倍率
+    // CodeBuddy 无 windsurf 费用数据，改用模型 description 里的积分倍率
     const credits = creditsText(m.description);
     return {
       value: merged ? encodeModelValue(agentKind, m.value) : m.value,

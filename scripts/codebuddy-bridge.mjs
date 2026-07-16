@@ -114,17 +114,47 @@ async function runPrompt(lines, request) {
   void input;
 }
 
+async function modelOptions(request) {
+  const cliPath = process.env.NOVA_CODEBUDDY_PATH || undefined;
+  if (cliPath) process.env.CODEBUDDY_CODE_PATH = cliPath;
+  const activeQuery = query({ options: {
+    cwd: request.cwd,
+    pathToCodebuddyCode: cliPath,
+  } });
+  try {
+    const models = await activeQuery.supportedModels();
+    return {
+      configOptions: [{
+        id: "model",
+        name: "Model",
+        currentValue: "",
+        options: models.map((model) => ({
+          value: model.value ?? model.id,
+          name: model.displayName ?? model.name ?? model.value ?? model.id,
+          description: model.description,
+        })),
+      }],
+      modes: null,
+    };
+  } finally {
+    await activeQuery.return();
+  }
+}
+
 async function main() {
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  let request;
   try {
-    const request = await readRequest(lines);
+    request = await readRequest(lines);
     if (request.action === "prompt") await runPrompt(lines, request);
+    else if (request.action === "models") send({ ok: true, data: await modelOptions(request) });
     else throw new Error(`Unknown action: ${request.action}`);
   } catch (error) {
     send({ ok: false, error: error instanceof Error ? error.message : String(error) });
     process.exitCode = 1;
   } finally {
     lines.close();
+    if (request?.action === "models") process.exit(0);
   }
 }
 

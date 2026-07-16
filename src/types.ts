@@ -293,30 +293,21 @@ export interface Settings {
   acpArgs: string;
   /** Devin 代理地址（空 = 不代理；下同：注入 HTTP(S)_PROXY 到该后端子进程） */
   devinProxy: string;
-  /** CodeBuddy（腾讯云代码助手）ACP 可执行文件，默认 npx 免安装拉起 */
+  /** CodeBuddy CLI 可执行文件 */
   codebuddyPath: string;
-  /** CodeBuddy ACP 启动参数，默认 -y @tencent-ai/codebuddy-code@latest --acp */
-  codebuddyArgs: string;
   codebuddyProxy: string;
-  /** Claude Code（@zed-industries/claude-code-acp）ACP 可执行文件，默认 npx 免安装拉起 */
+  /** Claude Code CLI 可执行文件 */
   claudecodePath: string;
-  /** Claude Code ACP 启动参数，默认 -y @zed-industries/claude-code-acp */
-  claudecodeArgs: string;
   claudecodeProxy: string;
   claudecodeSdkApiKey: string;
-  /** Cursor CLI（cursor-agent）可执行文件，默认 cursor-agent 依赖 PATH */
-  cursorPath: string;
-  /** Cursor ACP 启动参数，默认 acp */
-  cursorArgs: string;
   cursorProxy: string;
+  /** Cursor CLI 可执行文件 */
+  cursorPath: string;
   cursorSdkApiKey: string;
   /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */
   opencodePath: string;
-  /** OpenCode ACP 启动参数，默认 acp */
-  opencodeArgs: string;
   opencodeProxy: string;
   codexPath: string;
-  codexArgs: string;
   codexProxy: string;
   /** Windows shell 启动 shim（保存后重启应用生效） */
   windowsShellShimEnabled: boolean;
@@ -352,11 +343,11 @@ export interface Settings {
   claudecodeEnabled: boolean;
   cursorEnabled: boolean;
   opencodeEnabled: boolean;
-  codexIntegration: "sdk" | "acp";
-  codebuddyIntegration: "sdk" | "acp";
-  claudecodeIntegration: "sdk" | "acp";
-  cursorIntegration: "sdk" | "acp";
-  opencodeIntegration: "sdk" | "acp";
+  codexIntegration: "sdk";
+  codebuddyIntegration: "sdk";
+  claudecodeIntegration: "sdk";
+  cursorIntegration: "sdk";
+  opencodeIntegration: "sdk";
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
   worktreeDir: string;
   /** 是否自动清理长期未更新的会话 */

@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline";
-import { Agent } from "@cursor/sdk";
+import { Agent, Cursor } from "@cursor/sdk";
 import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 
@@ -85,6 +85,47 @@ function modelSelection(selected) {
   return { id: segments.join("-"), ...(params.length ? { params } : {}) };
 }
 
+function encodeModelVariant(model, variant) {
+  const suffix = variant.params
+    .map((param) => param.id === "fast" && param.value === "true" ? "fast" : param.value)
+    .filter(Boolean)
+    .join("-");
+  return {
+    value: suffix ? `${model.id}-${suffix}` : model.id,
+    name: variant.displayName || `${model.displayName} ${suffix}`,
+    description: variant.description || model.description,
+  };
+}
+
+function cursorModelOptions(models) {
+  const options = [{ value: "", name: "Auto（Cursor 默认）" }];
+  for (const model of models) {
+    if (!model.id || model.id.toLowerCase() === "auto") continue;
+    if (model.variants?.length) {
+      options.push(...model.variants.map((variant) => encodeModelVariant(model, variant)));
+    } else {
+      options.push({ value: model.id, name: model.displayName, description: model.description });
+    }
+  }
+  return options.filter((option, index) =>
+    options.findIndex((candidate) => candidate.value === option.value) === index);
+}
+
+async function modelOptions() {
+  const models = process.env.CURSOR_API_KEY
+    ? await Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY }).catch(() => [])
+    : [];
+  return {
+    configOptions: [{
+      id: "model",
+      name: "Model",
+      currentValue: "",
+      options: cursorModelOptions(models),
+    }],
+    modes: null,
+  };
+}
+
 async function promptMessage(parts) {
   const text = parts.filter((part) => part.type === "text").map((part) => part.text).join("\n\n");
   const images = [];
@@ -126,6 +167,11 @@ async function main() {
     const request = requests.shift();
     if (!request) continue;
     try {
+      if (request.action === "models") {
+        send({ ok: true, data: await modelOptions() });
+        continue;
+      }
+      if (request.action !== "prompt") throw new Error(`Unknown action: ${request.action}`);
       if (!agent) {
         const options = { apiKey: process.env.CURSOR_API_KEY, model: modelSelection(request.model), local: { cwd: request.cwd } };
         agent = request.sessionId ? await Agent.resume(request.sessionId, options) : await Agent.create(options);
@@ -153,4 +199,4 @@ async function main() {
 
 if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => { send({ ok: false, error: error instanceof Error ? error.message : String(error) }); process.exitCode = 1; });
 
-export { completePendingTools, createMessageState, mapMessage, modelSelection, promptMessage };
+export { completePendingTools, createMessageState, cursorModelOptions, mapMessage, modelSelection, promptMessage };

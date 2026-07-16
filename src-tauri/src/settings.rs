@@ -10,21 +10,19 @@ pub const DEFAULT_RELAY_SERVER: &str = "";
 pub struct Settings {
     /// ACP agent 可执行文件路径（默认 devin，依赖 PATH）
     pub devin_path: String,
-    /// ACP 启动参数（空格分隔）。换成其他 ACP agent 时一并修改，
-    /// 例如 Claude Agent: path=npx, args="-y @zed-industries/claude-code-acp"
+    /// Devin ACP 启动参数（空格分隔）。
     pub acp_args: String,
     /// Devin 代理地址（空 = 不覆盖环境变量；下同：注入 HTTP(S)_PROXY 等到该后端子进程）
     pub devin_proxy: String,
-    /// CodeBuddy（腾讯云代码助手）ACP 可执行文件路径（默认 codebuddy，依赖 PATH）
+    /// CodeBuddy CLI 可执行文件路径（默认 codebuddy，依赖 PATH）
     pub codebuddy_path: String,
-    /// CodeBuddy ACP 启动参数。默认 --acp；未全局安装可改为 path=npx, args="-y @tencent-ai/codebuddy-code@latest --acp"
+    /// 旧版 CodeBuddy ACP 启动参数，仅用于兼容已有设置。
     pub codebuddy_args: String,
     /// CodeBuddy 代理地址
     pub codebuddy_proxy: String,
-    /// Claude Code（@zed-industries/claude-code-acp）ACP 可执行文件路径（默认 npx，依赖 PATH）
+    /// Claude Code CLI 可执行文件路径，仅用于 CLI 检测和升级。
     pub claudecode_path: String,
-    /// Claude Code ACP 启动参数。默认用 npx 直接拉起：-y @zed-industries/claude-code-acp；
-    /// 也可换成本地已安装的可执行文件。
+    /// 旧版 Claude Code ACP 启动参数，仅用于兼容已有设置。
     pub claudecode_args: String,
     /// Claude Code 代理地址
     pub claudecode_proxy: String,
@@ -32,7 +30,7 @@ pub struct Settings {
     pub claudecode_sdk_api_key: String,
     /// Cursor CLI（cursor-agent）可执行文件路径（默认 cursor-agent，依赖 PATH）
     pub cursor_path: String,
-    /// Cursor ACP 启动参数（默认 acp）
+    /// 旧版 Cursor ACP 启动参数，仅用于兼容已有设置。
     pub cursor_args: String,
     /// Cursor 代理地址
     pub cursor_proxy: String,
@@ -40,7 +38,7 @@ pub struct Settings {
     pub cursor_sdk_api_key: String,
     /// OpenCode CLI 可执行文件路径（默认 opencode，依赖 PATH）
     pub opencode_path: String,
-    /// OpenCode ACP 启动参数（默认 acp）
+    /// 旧版 OpenCode ACP 启动参数，仅用于兼容已有设置。
     pub opencode_args: String,
     /// OpenCode 代理地址
     pub opencode_proxy: String,
@@ -124,7 +122,7 @@ impl Default for Settings {
             codebuddy_path: "codebuddy".into(),
             codebuddy_args: "--acp".into(),
             codebuddy_proxy: String::new(),
-            claudecode_path: "npx".into(),
+            claudecode_path: "claude".into(),
             claudecode_args: "-y @zed-industries/claude-code-acp".into(),
             claudecode_proxy: String::new(),
             claudecode_sdk_api_key: String::new(),
@@ -163,8 +161,8 @@ impl Default for Settings {
             opencodeplus_enabled: false,
             codex_integration: "sdk".into(),
             codebuddy_integration: "sdk".into(),
-            claudecode_integration: "acp".into(),
-            cursor_integration: "acp".into(),
+            claudecode_integration: "sdk".into(),
+            cursor_integration: "sdk".into(),
             opencode_integration: "sdk".into(),
             worktree_dir: String::new(),
             session_auto_cleanup_enabled: false,
@@ -180,6 +178,7 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::Settings;
+    use std::fs;
 
     #[test]
     fn windows_shell_shim_is_disabled_by_default() {
@@ -198,8 +197,34 @@ mod tests {
         assert_eq!(settings.codex_integration, "sdk");
         assert_eq!(settings.codebuddy_integration, "sdk");
         assert_eq!(settings.opencode_integration, "sdk");
-        assert_eq!(settings.claudecode_integration, "acp");
-        assert_eq!(settings.cursor_integration, "acp");
+        assert_eq!(settings.claudecode_integration, "sdk");
+        assert_eq!(settings.cursor_integration, "sdk");
+    }
+
+    #[test]
+    fn load_forces_persisted_integrations_to_sdk() {
+        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            r#"{
+                "codexIntegration":"acp",
+                "codebuddyIntegration":"acp",
+                "claudecodeIntegration":"acp",
+                "cursorIntegration":"acp",
+                "opencodeIntegration":"acp"
+            }"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(&dir);
+
+        assert_eq!(settings.codex_integration, "sdk");
+        assert_eq!(settings.codebuddy_integration, "sdk");
+        assert_eq!(settings.claudecode_integration, "sdk");
+        assert_eq!(settings.cursor_integration, "sdk");
+        assert_eq!(settings.opencode_integration, "sdk");
+        fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -216,10 +241,8 @@ impl Settings {
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_default();
-        if settings.claudecode_path.trim() == "npx"
-            && settings.claudecode_args.trim() == "@zed-industries/claude-code-acp"
-        {
-            settings.claudecode_args = "-y @zed-industries/claude-code-acp".into();
+        if settings.claudecode_path.trim() == "npx" {
+            settings.claudecode_path = "claude".into();
         }
         if settings.session_auto_cleanup_hours == 0 {
             settings.session_auto_cleanup_hours = legacy_days
@@ -239,6 +262,14 @@ impl Settings {
         settings.codexplus_enabled = false;
         settings.codebuddyplus_enabled = false;
         settings.opencodeplus_enabled = false;
+        settings.codex_integration = "sdk".into();
+        settings.codebuddy_integration = "sdk".into();
+        settings.claudecode_integration = "sdk".into();
+        settings.cursor_integration = "sdk".into();
+        settings.opencode_integration = "sdk".into();
+        settings
+            .quota_shared_models
+            .retain(|entry| entry.starts_with("devin:") || entry.starts_with("codex:"));
         settings
     }
 

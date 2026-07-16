@@ -571,15 +571,15 @@ pub async fn statuses(settings: &Settings) -> Vec<CliStatus> {
 
 async fn stop_backend(state: &AppState, kind: &AgentKind) {
     match kind {
-        AgentKind::Codex => state.codex.restart().await,
-        AgentKind::CodexPlus => state.codexplus.shutdown(),
-        AgentKind::CodeBuddyPlus => state.codebuddyplus.shutdown(),
-        AgentKind::OpenCodePlus => state.opencodeplus.shutdown(),
-        _ => {
-            if let Some(manager) = state.acp_for(kind) {
-                manager.restart().await;
-            }
+        AgentKind::Devin => state.acp.restart().await,
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            state.codexplus.shutdown();
+            state.codex.restart().await;
         }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddyplus.shutdown(),
+        AgentKind::ClaudeCode => state.claudeplus.shutdown(),
+        AgentKind::Cursor => state.cursorplus.shutdown(),
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.shutdown(),
     }
 }
 

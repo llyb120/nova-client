@@ -21,11 +21,62 @@ function claudePathOverride() {
     .find(existsSync);
 }
 
+function claudeModelOptions(models) {
+  return models.flatMap((model) => {
+    const efforts = model.supportedEffortLevels ?? [];
+    if (!model.supportsEffort || efforts.length === 0) {
+      return [{ value: model.value, name: model.displayName, description: model.description }];
+    }
+    return efforts.map((effort) => ({
+      value: `${model.value}:${effort}`,
+      name: `${model.displayName} ${effort[0].toUpperCase()}${effort.slice(1)}`,
+      description: model.description,
+    }));
+  });
+}
+
+function claudeModelSelection(selected) {
+  if (!selected) return {};
+  const match = selected.match(/^(.*):(low|medium|high|xhigh|max)$/);
+  return match ? { model: match[1], effort: match[2] } : { model: selected };
+}
+
+async function modelOptions(request) {
+  const activeQuery = query({
+    prompt: "",
+    options: {
+      cwd: request.cwd,
+      pathToClaudeCodeExecutable: claudePathOverride(),
+    },
+  });
+  try {
+    const models = await activeQuery.supportedModels();
+    return {
+      configOptions: [{
+        id: "model",
+        name: "Model",
+        currentValue: "",
+        options: claudeModelOptions(models),
+      }],
+      modes: null,
+    };
+  } finally {
+    activeQuery.close();
+  }
+}
+
 async function main() {
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   const first = await lines[Symbol.asyncIterator]().next();
   if (first.done) throw new Error("Missing request");
   const request = JSON.parse(first.value);
+  if (request.action === "models") {
+    send({ ok: true, data: await modelOptions(request) });
+    lines.close();
+    return;
+  }
+  if (request.action !== "prompt") throw new Error(`Unknown action: ${request.action}`);
+  const selection = claudeModelSelection(request.model);
   const controller = new AbortController();
   const pending = new Map();
   void (async () => {
@@ -45,7 +96,8 @@ async function main() {
     options: {
       cwd: request.cwd,
       resume: request.sessionId || undefined,
-      model: request.model || undefined,
+      model: selection.model,
+      effort: selection.effort,
       permissionMode: request.mode === "plan" ? "plan" : "default",
       abortController: controller,
       pathToClaudeCodeExecutable: claudePathOverride(),
@@ -71,4 +123,6 @@ async function main() {
   }
 }
 
-main().catch((error) => { send({ ok: false, error: error instanceof Error ? error.message : String(error) }); process.exitCode = 1; });
+if (process.env.NOVA_CLAUDE_BRIDGE_TEST !== "1") main().catch((error) => { send({ ok: false, error: error instanceof Error ? error.message : String(error) }); process.exitCode = 1; });
+
+export { claudeModelOptions, claudeModelSelection };

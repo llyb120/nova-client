@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
-const { completePendingTools, createMessageState, mapMessage, modelSelection, promptMessage } = await import("./cursor-bridge.mjs");
+const { completePendingTools, createMessageState, cursorModelOptions, mapMessage, modelSelection, promptMessage } = await import("./cursor-bridge.mjs");
 const state = createMessageState();
 
 assert.equal(mapMessage({ type: "assistant", run_id: "run", message: { content: [{ type: "text", text: "Hello" }] } }, state)[0].text, "Hello");
@@ -32,4 +32,15 @@ assert.deepEqual(embeddedDone.arguments, { query: "SDK auth" });
 assert.deepEqual(modelSelection("cursor-grok-4.5-high-fast"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("composer-2.5-fast"), { id: "composer-2.5", params: [{ id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("gpt-5.6-sol"), { id: "gpt-5.6-sol" });
+assert.deepEqual(cursorModelOptions([
+  { id: "auto", displayName: "Auto" },
+  { id: "grok-4.5", displayName: "Grok 4.5", variants: [
+    { displayName: "Grok 4.5 High", params: [{ id: "effort", value: "high" }] },
+    { displayName: "Grok 4.5 High Fast", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] },
+  ] },
+]), [
+  { value: "", name: "Auto（Cursor 默认）" },
+  { value: "grok-4.5-high", name: "Grok 4.5 High", description: undefined },
+  { value: "grok-4.5-high-fast", name: "Grok 4.5 High Fast", description: undefined },
+]);
 assert.deepEqual(await promptMessage([{ type: "text", text: "look" }, { type: "image_data", mime: "image/png", data: "base64" }]), { text: "look", images: [{ data: "base64", mimeType: "image/png" }] });

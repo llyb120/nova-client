@@ -1,10 +1,14 @@
-use crate::acp::{apply_proxy_env, resolve_program_on_path, EV_THREADS, EV_TURN, EV_UPDATE};
+use crate::acp::{
+    apply_proxy_env, resolve_program_on_path, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
+};
+use crate::model_cache;
 use crate::threads::{now_ms, Item, PromptImage, ToolCall};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
@@ -20,6 +24,15 @@ pub enum SdkBackend {
 }
 
 impl SdkBackend {
+    fn agent_kind(self) -> crate::threads::AgentKind {
+        match self {
+            Self::Codex => crate::threads::AgentKind::Codex,
+            Self::CodeBuddy => crate::threads::AgentKind::CodeBuddy,
+            Self::Claude => crate::threads::AgentKind::ClaudeCode,
+            Self::Cursor => crate::threads::AgentKind::Cursor,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex+",
@@ -70,6 +83,9 @@ pub struct CodexSdkManager {
     running: Mutex<HashSet<String>>,
     turn_started: Mutex<HashMap<String, Instant>>,
     pending_permissions: Mutex<HashMap<String, (String, String)>>,
+    model_options: Mutex<Option<Value>>,
+    model_options_refreshing: AtomicBool,
+    model_options_revalidated: AtomicBool,
 }
 
 impl CodexSdkManager {
@@ -82,6 +98,9 @@ impl CodexSdkManager {
             running: Mutex::new(HashSet::new()),
             turn_started: Mutex::new(HashMap::new()),
             pending_permissions: Mutex::new(HashMap::new()),
+            model_options: Mutex::new(None),
+            model_options_refreshing: AtomicBool::new(false),
+            model_options_revalidated: AtomicBool::new(false),
         })
     }
 
@@ -229,6 +248,135 @@ impl CodexSdkManager {
         }
     }
 
+    pub fn seed_model_options(&self, value: Value) {
+        *self.model_options.lock().unwrap() = Some(value);
+    }
+
+    pub fn spawn_revalidate_model_options(self: &Arc<Self>) {
+        if self.model_options_revalidated.load(Ordering::SeqCst)
+            || self
+                .model_options_refreshing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = manager.refresh_model_options().await;
+            manager
+                .model_options_refreshing
+                .store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub async fn ensure_model_options(self: &Arc<Self>) -> Result<Value, String> {
+        if let Some(value) = self.model_options.lock().unwrap().clone() {
+            self.spawn_revalidate_model_options();
+            return Ok(value);
+        }
+        self.spawn_revalidate_model_options();
+        Ok(self.empty_model_options())
+    }
+
+    fn empty_model_options(&self) -> Value {
+        let options = if self.backend == SdkBackend::Cursor {
+            vec![json!({ "value": "", "name": "Auto（Cursor 默认）" })]
+        } else {
+            Vec::new()
+        };
+        json!({
+            "configOptions": [{
+                "id": "model",
+                "name": "Model",
+                "currentValue": "",
+                "options": options,
+            }],
+            "modes": null,
+        })
+    }
+
+    async fn refresh_model_options(&self) -> Result<Value, String> {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let value = self
+            .run_bridge(&cwd, json!({ "action": "models", "cwd": cwd }))
+            .await?;
+        *self.model_options.lock().unwrap() = Some(value.clone());
+        let kind = self.backend.agent_kind();
+        model_cache::save(&crate::nova_data_dir(&self.app), kind.as_str(), &value);
+        self.model_options_revalidated.store(true, Ordering::SeqCst);
+        let _ = self.app.emit(
+            EV_OPTIONS,
+            json!({ "agentKind": kind.as_str(), "options": value }),
+        );
+        Ok(value)
+    }
+
+    pub fn generate_title_async(
+        self: &Arc<Self>,
+        thread_id: String,
+        prompt: String,
+        fallback: String,
+        model: String,
+    ) {
+        if self.backend != SdkBackend::Codex {
+            return;
+        }
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let model = split_codex_effort(&model)
+                .map(|(model, _)| model)
+                .unwrap_or(&model);
+            let request = json!({
+                "action": "title",
+                "cwd": cwd,
+                "model": model,
+                "prompt": format!(
+                    "请为下面用户第一次提示词生成一个简短会话标题。\n只输出标题本身，不要解释，不要引号，不要句号。\n中文最多12个字，英文最多6个词。\n\n用户提示词：\n{}",
+                    prompt.trim()
+                )
+            });
+            let Ok(output) = manager.run_bridge(&cwd, request).await else {
+                return;
+            };
+            let title = normalize_title(output.as_str().unwrap_or(""), &fallback);
+            if title == fallback {
+                return;
+            }
+            let state = manager.app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(&thread_id) {
+                if thread.title == "新会话" || thread.title == fallback {
+                    thread.title = title;
+                    store.save();
+                    let _ = manager.app.emit(EV_THREADS, json!({}));
+                }
+            }
+        });
+    }
+
+    async fn run_bridge(&self, cwd: &str, request: Value) -> Result<Value, String> {
+        let mut child = self.spawn_bridge(cwd)?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("{} bridge stdin 不可用", self.backend.label()))?;
+        stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        drop(stdin);
+        let output = child.wait_with_output().await.map_err(|e| e.to_string())?;
+        parse_bridge_output(&String::from_utf8_lossy(&output.stdout), self.backend)
+    }
+
     async fn run_prompt_bridge(
         &self,
         thread_id: &str,
@@ -336,7 +484,7 @@ impl CodexSdkManager {
                     None,
                 ),
                 SdkBackend::Claude => (
-                    "claude".into(),
+                    settings.claudecode_path.clone(),
                     settings.claudecode_proxy.clone(),
                     "NOVA_CLAUDE_PATH",
                     (!settings.claudecode_sdk_api_key.is_empty())
@@ -624,6 +772,42 @@ fn kill_child(child: &mut Child) {
     let _ = child.start_kill();
 }
 
+fn parse_bridge_output(output: &str, backend: SdkBackend) -> Result<Value, String> {
+    let line = output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| format!("{} bridge 未返回结果", backend.label()))?;
+    let response: Value = serde_json::from_str(line).map_err(|e| {
+        format!(
+            "解析 {} bridge 响应失败：{e}；输出：{line}",
+            backend.label()
+        )
+    })?;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(response["error"]
+            .as_str()
+            .unwrap_or("SDK bridge 执行失败")
+            .into());
+    }
+    response
+        .get("data")
+        .cloned()
+        .ok_or_else(|| format!("{} bridge 响应缺少 data", backend.label()))
+}
+
+fn normalize_title(output: &str, fallback: &str) -> String {
+    let title = output
+        .trim()
+        .trim_matches(['"', '\'', '`'])
+        .trim_end_matches(['。', '.', '！', '!', '？', '?'])
+        .trim();
+    if title.is_empty() {
+        fallback.to_string()
+    } else {
+        title.chars().take(60).collect()
+    }
+}
+
 fn resolve_codex_model(
     options: &Value,
     selected: &str,
@@ -689,7 +873,10 @@ fn complete_pending_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_pending_tools, resolve_codex_model};
+    use super::{
+        complete_pending_tools, normalize_title, parse_bridge_output, resolve_codex_model,
+        SdkBackend,
+    };
     use crate::threads::{now_ms, AgentKind, Item, Thread, ToolCall};
     use serde_json::json;
 
@@ -724,6 +911,20 @@ mod tests {
             Some(("gpt-5.6-terra".into(), Some("max".into())))
         );
         assert_eq!(resolve_codex_model(&options, "gpt-5.4-minilow", None), None);
+    }
+
+    #[test]
+    fn parses_and_normalizes_title_response() {
+        let output = parse_bridge_output(
+            r#"{"ok":true,"data":"`修复标题路由。`"}"#,
+            SdkBackend::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            normalize_title(output.as_str().unwrap(), "fallback"),
+            "修复标题路由"
+        );
+        assert_eq!(normalize_title("  ", "fallback"), "fallback");
     }
 
     #[test]

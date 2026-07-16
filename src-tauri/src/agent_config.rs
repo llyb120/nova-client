@@ -102,19 +102,6 @@ pub fn sync_global_instructions(config_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Cursor 正常会话使用 Nova 的隔离 `CURSOR_CONFIG_DIR`，必须把全局 Rule 写进真实启动目录。
-pub fn sync_cursor_config_dir(config_dir: &Path, cursor_config_dir: &Path) -> Result<(), String> {
-    let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
-    let target = Target {
-        kind: AgentKind::Cursor,
-        label: "Cursor",
-        path: cursor_config_dir.join("rules").join("nova-global.mdc"),
-        format: TargetFormat::CursorRule,
-    };
-    let _ = sync_target(&target, &content);
-    Ok(())
-}
-
 /// 额度漫游会为每个后端准备隔离 HOME/config；把本机全局指令同步进该真实运行环境。
 pub fn sync_backend_with_env(
     config_dir: &Path,

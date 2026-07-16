@@ -204,58 +204,13 @@ pub fn collect_credentials(agent_kind: AgentKind) -> Result<CredentialBundle, St
             "codex-home/auth.json",
             &mut files,
         )?,
-        AgentKind::Cursor => {
-            collect_file(
-                &configured_home("CURSOR_CONFIG_DIR", ".cursor").join("cli-config.json"),
-                "cursor/cli-config.json",
-                &mut files,
-            )?;
-            #[cfg(windows)]
-            {
-                let appdata = std::env::var_os("APPDATA")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"));
-                collect_file(
-                    &appdata.join("Cursor").join("auth.json"),
-                    "appdata/Cursor/auth.json",
-                    &mut files,
-                )?;
-            }
-        }
-        AgentKind::ClaudeCode => collect_file(
-            &configured_home("CLAUDE_CONFIG_DIR", ".claude").join(".credentials.json"),
-            "claude/.credentials.json",
-            &mut files,
-        )?,
-        AgentKind::CodeBuddy => {
-            let root = configured_home("CODEBUDDY_CONFIG_DIR", ".codebuddy");
-            collect_dir(
-                &root.join("local_storage"),
-                "codebuddy/local_storage",
-                &mut files,
-            )?;
-            collect_optional_file(
-                &root.join("settings.json"),
-                "codebuddy/settings.json",
-                &mut files,
-            )?;
-            collect_optional_file(
-                &root.join("user-state.json"),
-                "codebuddy/user-state.json",
-                &mut files,
-            )?;
-        }
-        AgentKind::OpenCode => {
-            let data = std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home_dir().join(".local").join("share"));
-            collect_file(
-                &data.join("opencode").join("auth.json"),
-                "xdg-data/opencode/auth.json",
-                &mut files,
-            )?;
-        }
-        AgentKind::OpenCodePlus | AgentKind::CodexPlus | AgentKind::CodeBuddyPlus => {
+        AgentKind::CodeBuddy
+        | AgentKind::ClaudeCode
+        | AgentKind::Cursor
+        | AgentKind::OpenCode
+        | AgentKind::OpenCodePlus
+        | AgentKind::CodexPlus
+        | AgentKind::CodeBuddyPlus => {
             return Err(format!("{} 暂不支持额度租借", agent_kind.label()))
         }
     }
@@ -325,15 +280,19 @@ pub fn materialize_runtime(
     )?;
     let scope = format!("quota-{thread_id}-");
     let manager = match expected_kind {
-        AgentKind::Codex => {
-            BorrowedManager::Codex(CodexManager::new_with_env(app, launch_env, scope))
-        }
-        kind => BorrowedManager::Acp(AcpManager::new_with_env(
+        AgentKind::Devin => BorrowedManager::Acp(AcpManager::new_with_env(
             app,
-            kind.clone(),
+            AgentKind::Devin,
             launch_env,
             scope,
         )),
+        AgentKind::Codex => {
+            BorrowedManager::Codex(CodexManager::new_with_env(app, launch_env, scope))
+        }
+        kind => {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(format!("{} SDK 暂不支持隔离额度租借", kind.label()));
+        }
     };
     Ok(BorrowedRuntime { manager, root })
 }
@@ -372,35 +331,13 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
         AgentKind::Codex => {
             env.insert("CODEX_HOME".into(), as_string(root.join("codex-home")));
         }
-        AgentKind::CodeBuddy => {
-            env.insert(
-                "CODEBUDDY_CONFIG_DIR".into(),
-                as_string(root.join("codebuddy")),
-            );
-        }
-        AgentKind::ClaudeCode => {
-            env.insert("CLAUDE_CONFIG_DIR".into(), as_string(root.join("claude")));
-        }
-        AgentKind::Cursor => {
-            let dir = root.join("cursor");
-            let _ = std::fs::remove_file(dir.join("acp-config.json"));
-            env.insert("CURSOR_CONFIG_DIR".into(), as_string(dir));
-            #[cfg(windows)]
-            env.insert("APPDATA".into(), as_string(root.join("appdata")));
-        }
-        AgentKind::OpenCode => {
-            let data = root.join("xdg-data");
-            let config = root.join("xdg-config");
-            let cache = root.join("xdg-cache");
-            std::fs::create_dir_all(&config).map_err(|e| e.to_string())?;
-            std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
-            env.insert("XDG_DATA_HOME".into(), as_string(data));
-            env.insert("XDG_CONFIG_HOME".into(), as_string(config));
-            env.insert("XDG_CACHE_HOME".into(), as_string(cache));
-        }
-        AgentKind::OpenCodePlus | AgentKind::CodexPlus | AgentKind::CodeBuddyPlus => {
-            return Err(format!("{} 暂不支持额度租借", kind.label()))
-        }
+        AgentKind::CodeBuddy
+        | AgentKind::ClaudeCode
+        | AgentKind::Cursor
+        | AgentKind::OpenCode
+        | AgentKind::OpenCodePlus
+        | AgentKind::CodexPlus
+        | AgentKind::CodeBuddyPlus => return Err(format!("{} 暂不支持额度租借", kind.label())),
     }
     Ok(env)
 }
@@ -449,44 +386,6 @@ fn collect_file(path: &Path, target: &str, files: &mut Vec<CredentialFile>) -> R
         path: target.into(),
         data: base64::engine::general_purpose::STANDARD.encode(data),
     });
-    Ok(())
-}
-
-fn collect_optional_file(
-    path: &Path,
-    target: &str,
-    files: &mut Vec<CredentialFile>,
-) -> Result<(), String> {
-    if path.is_file() {
-        collect_file(path, target, files)?;
-    }
-    Ok(())
-}
-
-fn collect_dir(path: &Path, target: &str, files: &mut Vec<CredentialFile>) -> Result<(), String> {
-    if !path.is_dir() {
-        return Err(format!(
-            "未找到 {} 登录凭证，请先在额度提供方完成登录",
-            path.display()
-        ));
-    }
-    for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let source = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        let child_target = format!("{target}/{name}");
-        if source.is_dir() {
-            collect_dir(&source, &child_target, files)?;
-        } else if source.is_file() {
-            collect_file(&source, &child_target, files)?;
-        }
-        if files.len() > MAX_BUNDLE_FILES {
-            return Err("凭证文件过多，已拒绝发送".into());
-        }
-    }
-    if files.is_empty() {
-        return Err("登录凭证目录为空".into());
-    }
     Ok(())
 }
 
@@ -550,17 +449,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn cursor_launch_env_isolates_appdata() {
+    fn cursor_launch_env_is_rejected_without_isolated_sdk_support() {
         let root = std::env::temp_dir().join("nova-cursor-launch-env-test");
-        let env = launch_env(&AgentKind::Cursor, &root).unwrap();
-
         assert_eq!(
-            env.get("CURSOR_CONFIG_DIR"),
-            Some(&root.join("cursor").to_string_lossy().to_string())
-        );
-        assert_eq!(
-            env.get("APPDATA"),
-            Some(&root.join("appdata").to_string_lossy().to_string())
+            launch_env(&AgentKind::Cursor, &root).unwrap_err(),
+            "Cursor 暂不支持额度租借"
         );
     }
 
