@@ -6,7 +6,7 @@ import { firstWakeDoPairForThread } from "../threadDisplay";
 import type { Item, Thread } from "../types";
 import { agentLabel } from "../utils";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconDownload, IconShare } from "./icons";
+import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { PlanCard } from "./PlanCard";
@@ -334,6 +334,10 @@ export function ChatView() {
     state.threads.find((t) => t.id === state.currentId),
   );
   const roamingRole = () => currentMeta()?.roamingRole ?? null;
+  const canStar = () => {
+    const meta = currentMeta();
+    return !!meta && !meta.employeeId && !meta.mindThread && !meta.roamingRole && !meta.quotaPeerName;
+  };
   // worktree 会话的 cwd 是 uuid 工作目录，展示时用源仓库路径更直观
   const cwdDisplay = () => currentMeta()?.worktree?.repo || state.cwd;
 
@@ -392,6 +396,24 @@ export function ChatView() {
             }}
             ref={(el) => queueMicrotask(() => el.focus())}
           />
+        </Show>
+        <Show when={canStar()}>
+          <button
+            type="button"
+            class="chat-star"
+            classList={{ starred: !!currentMeta()?.starred }}
+            title={currentMeta()?.starred ? "取消星标" : "加星标并在项目内置顶"}
+            aria-pressed={!!currentMeta()?.starred}
+            onClick={() => {
+              const meta = currentMeta();
+              if (!meta) return;
+              void api
+                .setThreadStarred(meta.id, !meta.starred)
+                .catch((error) => void message(String(error), { kind: "error" }));
+            }}
+          >
+            <IconStar size={15} filled={!!currentMeta()?.starred} />
+          </button>
         </Show>
         <span class={`agent-badge ${state.agentKind}`}>
           {agentLabel(state.agentKind)}
