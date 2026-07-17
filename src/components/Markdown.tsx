@@ -1,7 +1,9 @@
 import DOMPurify from "dompurify";
 import { marked } from "marked";
+import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createSignal, onCleanup, untrack } from "solid-js";
 import { api } from "../ipc";
+import { state } from "../store";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -91,6 +93,16 @@ const COPY_SVG =
   '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 const CHECK_SVG =
   '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+const FILE_SVG =
+  '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>';
+const FILE_EXTENSIONS =
+  "7z|avif|avi|bmp|c|cc|cfg|conf|cpp|cs|css|csv|docx?|env|fig|gif|go|gz|h|hpp|html?|ico|ini|java|jpe?g|js|json|jsx|lock|log|md|mjs|mov|mp3|mp4|pdf|php|png|pptx?|ps1|psd|py|rar|rb|rs|scss|sh|sql|svg|tar|toml|ts|tsx|txt|vue|wav|webm|webp|xlsx?|xml|ya?ml|zip";
+const FILE_REFERENCE_RE = new RegExp(
+  String.raw`(?:[A-Za-z]:[\\/]|(?:\.{1,2})?[\\/])?[^\s<>"'\x60()[\]{}，。；：！？、]+(?:[\\/][^\s<>"'\x60()[\]{}，。；：！？、]+)*\.(?:${FILE_EXTENSIONS})(?::\d+)?`,
+  "gi",
+);
+const WHOLE_FILE_REFERENCE_RE = new RegExp(String.raw`\.(?:${FILE_EXTENSIONS})(?::\d+)?$`, "i");
+const IMAGE_FILE_RE = /\.(?:avif|bmp|gif|ico|jpe?g|png|svg|webp)$/i;
 
 /** 给所有代码块包一层容器并附上复制按钮（点击事件走容器委托） */
 function withCopyButtons(html: string): string {
@@ -99,12 +111,65 @@ function withCopyButtons(html: string): string {
     .replace(/<\/pre>/g, "</pre></div>");
 }
 
-function renderMarkdown(src: string): string {
-  if (!src) return "";
-  return DOMPurify.sanitize(withCopyButtons(marked.parse(src, { async: false }) as string));
+function fileReference(pathWithLine: string): HTMLButtonElement {
+  const lineMatch = pathWithLine.match(/:(\d+)$/);
+  const path = lineMatch ? pathWithLine.slice(0, -lineMatch[0].length) : pathWithLine;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "md-file-ref";
+  button.dataset.path = path;
+  if (lineMatch) button.dataset.line = lineMatch[1];
+  button.title = IMAGE_FILE_RE.test(path) ? `打开图片 ${path}` : `打开文件 ${pathWithLine}`;
+  button.innerHTML = `${FILE_SVG}<span></span>`;
+  button.querySelector("span")!.textContent = pathWithLine;
+  return button;
 }
 
-export function Markdown(props: { text: string }) {
+function withFileReferences(html: string): string {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+
+  for (const code of template.content.querySelectorAll("code:not(pre code)")) {
+    const path = code.textContent?.trim();
+    if (path && WHOLE_FILE_REFERENCE_RE.test(path)) code.replaceWith(fileReference(path));
+  }
+  for (const link of template.content.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+    const href = link.getAttribute("href") ?? "";
+    if (/^(?:https?:|mailto:|#)/i.test(href)) continue;
+    const path = decodeURIComponent(href.replace(/^file:\/+/i, ""));
+    if (WHOLE_FILE_REFERENCE_RE.test(path)) link.replaceWith(fileReference(path));
+  }
+
+  const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
+  const nodes: Text[] = [];
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    if (!node.parentElement?.closest("pre, code, a, button, svg")) nodes.push(node);
+  }
+  for (const node of nodes) {
+    const text = node.data;
+    FILE_REFERENCE_RE.lastIndex = 0;
+    if (!FILE_REFERENCE_RE.test(text)) continue;
+    FILE_REFERENCE_RE.lastIndex = 0;
+    const fragment = document.createDocumentFragment();
+    let end = 0;
+    for (const match of text.matchAll(FILE_REFERENCE_RE)) {
+      fragment.append(text.slice(end, match.index), fileReference(match[0]));
+      end = match.index + match[0].length;
+    }
+    fragment.append(text.slice(end));
+    node.replaceWith(fragment);
+  }
+  return template.innerHTML;
+}
+
+function renderMarkdown(src: string, markFiles: boolean): string {
+  if (!src) return "";
+  const html = DOMPurify.sanitize(withCopyButtons(marked.parse(src, { async: false }) as string));
+  return markFiles ? withFileReferences(html) : html;
+}
+
+export function Markdown(props: { text: string; markFiles?: boolean }) {
   // 平滑出字层：shown 是 props.text 的一个前缀，按节拍逐步追上目标。
   // 初始即为完整文本——历史消息、非流式内容立即全量显示，不做动画。
   const [shown, setShown] = createSignal(props.text);
@@ -172,10 +237,10 @@ export function Markdown(props: { text: string }) {
     if (cut > 0 && stableRef) {
       const chunk = tail.slice(0, cut);
       stableSrc += chunk;
-      stableRef.insertAdjacentHTML("beforeend", renderMarkdown(chunk));
+      stableRef.insertAdjacentHTML("beforeend", renderMarkdown(chunk, !!props.markFiles));
       tail = tail.slice(cut);
     }
-    setTailHtml(renderMarkdown(tail));
+    setTailHtml(renderMarkdown(tail, !!props.markFiles));
   });
 
   const onClick = (e: MouseEvent) => {
@@ -196,9 +261,20 @@ export function Markdown(props: { text: string }) {
 
     const link = target.closest<HTMLAnchorElement>("a[href]");
     const href = link?.href;
-    if (!href || !/^https?:\/\//i.test(href)) return;
-    e.preventDefault();
-    void api.openUrl(href).catch((err) => console.error("open url failed", err));
+    if (href && /^https?:\/\//i.test(href)) {
+      e.preventDefault();
+      void api.openUrl(href).catch((err) => console.error("open url failed", err));
+      return;
+    }
+
+    const file = target.closest<HTMLButtonElement>(".md-file-ref");
+    const path = file?.dataset.path;
+    const id = state.currentId;
+    if (!path || !id) return;
+    const action = IMAGE_FILE_RE.test(path)
+      ? api.openFileDefault(id, path)
+      : api.openInEditor(id, path, file.dataset.line ? Number(file.dataset.line) : undefined);
+    void action.catch((err) => void message(String(err), { kind: "error" }));
   };
 
   // md-seg 为 display:contents（不产生盒子），布局与单容器完全一致。

@@ -697,9 +697,10 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
             continue;
         }
         let value = match kind {
-            AgentKind::OpenCodePlus => state.opencodeplus.get_model_options(),
-            AgentKind::Codex => state.codex.get_model_options(),
-            _ => state.acp_for(&kind).and_then(|mgr| mgr.get_model_options()),
+            AgentKind::Devin => state.acp.get_model_options(),
+            AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
+            AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.get_model_options(),
+            _ => None,
         }
         .unwrap_or_else(|| json!({ "configOptions": [], "modes": null }));
         out.insert(kind.as_str().to_string(), value);
@@ -1384,7 +1385,7 @@ fn send_prompt(app: &AppHandle, thread_id: &str, text: &str) -> Result<(), Strin
         thread.agent_kind.clone()
     };
     match kind {
-        AgentKind::OpenCodePlus => {
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
             let mgr = state.opencodeplus.clone();
             let id = thread_id.to_string();
             if mgr.is_running(&id) {
@@ -1392,26 +1393,28 @@ fn send_prompt(app: &AppHandle, thread_id: &str, text: &str) -> Result<(), Strin
             }
             tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
         }
-        AgentKind::CodeBuddy | AgentKind::Cursor => {
-            let mgr = state.acp_for(&kind).ok_or("后端不可用")?;
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            let mgr = state.codebuddyplus.clone();
             let id = thread_id.to_string();
             tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
         }
-        AgentKind::Codex => {
-            let mgr = state.codex.clone();
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            let mgr = state.codexplus.clone();
             let id = thread_id.to_string();
-            if mgr.is_running(&id) {
-                tauri::async_runtime::spawn(
-                    async move { mgr.steer_prompt(id, text, Vec::new()).await },
-                );
-            } else {
-                tauri::async_runtime::spawn(
-                    async move { mgr.run_prompt(id, text, Vec::new()).await },
-                );
-            }
+            tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
         }
-        _ => {
-            let mgr = state.acp_for(&kind).ok_or("后端不可用")?;
+        AgentKind::ClaudeCode => {
+            let mgr = state.claudeplus.clone();
+            let id = thread_id.to_string();
+            tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
+        }
+        AgentKind::Cursor => {
+            let mgr = state.cursorplus.clone();
+            let id = thread_id.to_string();
+            tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
+        }
+        AgentKind::Devin => {
+            let mgr = state.acp.clone();
             let id = thread_id.to_string();
             if mgr.is_running(&id) {
                 tauri::async_runtime::spawn(
@@ -1437,30 +1440,15 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         }
         thread.agent_kind.clone()
     };
-    if kind == AgentKind::OpenCodePlus {
-        state.opencodeplus.cancel(thread_id).await;
-        return Ok(());
-    }
-    if kind == AgentKind::Cursor {
-        let mgr = state.acp_for(&kind).ok_or("后端不可用")?;
-
-        // 远程 create/send 是异步启动的：停止命令可能紧跟着到达，而 run_prompt 还没来得及
-        // 登记 running。短暂等它进入启动窗口，避免第一次 cancel 被当成空闲直接忽略。
-        for _ in 0..40 {
-            if mgr.is_running(thread_id) {
-                break;
-            }
-            sleep(Duration::from_millis(50)).await;
+    match kind {
+        AgentKind::Devin => state.acp.cancel(thread_id).await,
+        AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            state.codebuddyplus.cancel(thread_id).await
         }
-        if !mgr.is_running(thread_id) {
-            return Ok(());
-        }
-        mgr.cancel(thread_id).await;
-        return Ok(());
-    }
-    match state.acp_for(&kind) {
-        Some(mgr) => mgr.cancel(thread_id).await,
-        None => state.codex.cancel(thread_id).await,
+        AgentKind::ClaudeCode => state.claudeplus.cancel(thread_id).await,
+        AgentKind::Cursor => state.cursorplus.cancel(thread_id).await,
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.cancel(thread_id).await,
     };
     Ok(())
 }

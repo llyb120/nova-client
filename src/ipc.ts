@@ -125,6 +125,8 @@ export const api = {
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   openInEditor: (threadId: string, path: string, line?: number) =>
     invoke<void>("open_in_editor", { threadId, path, line }),
+  openFileDefault: (threadId: string, path: string) =>
+    invoke<void>("open_file_default", { threadId, path }),
   revertFileChanges: (threadId: string, changes: RevertChange[]) =>
     invoke<RevertResult>("revert_file_changes", { threadId, changes }),
   setThreadModel: (threadId: string, model: string | null) =>

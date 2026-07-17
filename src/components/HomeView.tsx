@@ -319,7 +319,7 @@ export function HomeView() {
     });
   });
 
-  const selectProject = (p: string, warm = true) => {
+  const selectProject = (p: string, warm = false) => {
     setRoam(null); // 选了本地项目就退出漫游
     setCwd(p);
     const nextModel = resolveAvailableModel(agentKind(), lastUsed.model(agentKind(), p));

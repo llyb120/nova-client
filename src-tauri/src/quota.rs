@@ -98,18 +98,35 @@ fn devin_version() -> Option<String> {
 }
 
 fn model_prices(m: &Value) -> Value {
+    let dimension = |label: &str| {
+        m.get("modelDimensions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|dimension| {
+                dimension
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(label))
+            })
+            .and_then(|dimension| dimension.get("value"))
+            .and_then(as_f64)
+    };
     let input = find(m, "inputTokenCost")
         .or_else(|| find(m, "inputPrice"))
         .or_else(|| find(m, "promptTokenCost"))
-        .and_then(as_f64);
+        .and_then(as_f64)
+        .or_else(|| dimension("Input"));
     let cached = find(m, "cachedInputTokenCost")
         .or_else(|| find(m, "cachedPrice"))
         .or_else(|| find(m, "cacheReadTokenCost"))
-        .and_then(as_f64);
+        .and_then(as_f64)
+        .or_else(|| dimension("Cached input"));
     let output = find(m, "outputTokenCost")
         .or_else(|| find(m, "outputPrice"))
         .or_else(|| find(m, "completionTokenCost"))
-        .and_then(as_f64);
+        .and_then(as_f64)
+        .or_else(|| dimension("Output"));
     if input.is_none() && cached.is_none() && output.is_none() {
         return Value::Null;
     }
@@ -118,6 +135,25 @@ fn model_prices(m: &Value) -> Value {
         "cached": cached,
         "output": output,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_model_dimension_prices() {
+        let prices = model_prices(&json!({
+            "modelDimensions": [
+                { "label": "Input", "value": 5, "denominator": "1M tokens" },
+                { "label": "Cached input", "value": 0.5, "denominator": "1M tokens" },
+                { "label": "Output", "value": 25, "denominator": "1M tokens" }
+            ]
+        }));
+        assert_eq!(prices["input"], 5.0);
+        assert_eq!(prices["cached"], 0.5);
+        assert_eq!(prices["output"], 25.0);
+    }
 }
 
 /// 拉取模型配置（积分倍率/厂商/视觉支持），整理成 { modelUid: ModelCost } 映射。

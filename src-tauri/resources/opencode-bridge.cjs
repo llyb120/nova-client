@@ -12,6 +12,10 @@ var __commonJS = (cb, mod) => function __require() {
     throw mod = 0, e;
   }
 };
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
     for (let key of __getOwnPropNames(from))
@@ -28,6 +32,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
   mod
 ));
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // node_modules/isexe/windows.js
 var require_windows = __commonJS({
@@ -527,6 +532,11 @@ var require_cross_spawn = __commonJS({
 });
 
 // scripts/opencode-bridge.mjs
+var opencode_bridge_exports = {};
+__export(opencode_bridge_exports, {
+  automaticPermissionReply: () => automaticPermissionReply
+});
+module.exports = __toCommonJS(opencode_bridge_exports);
 var import_node_readline = require("node:readline");
 
 // node_modules/@opencode-ai/sdk/dist/v2/gen/core/serverSentEvents.gen.js
@@ -6110,6 +6120,14 @@ async function oneShot(client2, request) {
       if (result.error) throw new Error(JSON.stringify(result.error));
       return result.data.parts.filter((part) => part.type === "text").map((part) => part.text).join("");
     }
+    case "fork": {
+      const result = await client2.session.fork({
+        sessionID: request.sessionId,
+        messageID: request.position
+      });
+      if (result.error) throw new Error(JSON.stringify(result.error));
+      return result.data.id;
+    }
     default:
       throw new Error(`Unknown action: ${request.action}`);
   }
@@ -6123,10 +6141,14 @@ async function ensureSession(client2, sessionId) {
   if (created.error) throw new Error(JSON.stringify(created.error));
   return created.data.id;
 }
+function automaticPermissionReply(mode) {
+  return mode === "build" ? "always" : void 0;
+}
 async function runPrompt(client2, lines, request) {
   const sessionId = await ensureSession(client2, request.sessionId);
   const subscription = await client2.event.subscribe();
   send({ type: "ready", sessionId });
+  let cancelled = false;
   const input = (async () => {
     for await (const line of lines) {
       if (!line.trim()) continue;
@@ -6138,6 +6160,7 @@ async function runPrompt(client2, lines, request) {
         });
         if (result.error) send({ type: "error", error: JSON.stringify(result.error) });
       } else if (command.action === "cancel") {
+        cancelled = true;
         await client2.session.abort({ sessionID: sessionId });
       }
     }
@@ -6165,29 +6188,52 @@ async function runPrompt(client2, lines, request) {
     });
   }
   started.then((result) => {
-    if (result.error) send({ type: "error", error: JSON.stringify(result.error) });
-  }).catch((error) => send({ type: "error", error: error instanceof Error ? error.message : String(error) }));
+    if (result.error && !cancelled) send({ type: "error", error: JSON.stringify(result.error) });
+  }).catch((error) => {
+    if (!cancelled) send({ type: "error", error: error instanceof Error ? error.message : String(error) });
+  });
   const assistantMessages = /* @__PURE__ */ new Set();
+  const pendingParts = /* @__PURE__ */ new Map();
   for await (const event of subscription.stream) {
     const properties = event.properties ?? {};
     if (properties.sessionID !== sessionId) continue;
     if (event.type === "message.updated") {
-      if (properties.info?.role === "assistant") assistantMessages.add(properties.info.id);
+      if (properties.info?.role === "assistant") {
+        assistantMessages.add(properties.info.id);
+        for (const part of pendingParts.get(properties.info.id)?.values() ?? []) send({ type: "part", part });
+        pendingParts.delete(properties.info.id);
+      }
       continue;
     }
     if (event.type === "message.part.updated") {
-      if (assistantMessages.has(properties.part?.messageID)) send({ type: "part", part: properties.part });
+      const part = properties.part;
+      if (assistantMessages.has(part?.messageID)) {
+        send({ type: "part", part });
+      } else if (part?.messageID && part?.id) {
+        const parts = pendingParts.get(part.messageID) ?? /* @__PURE__ */ new Map();
+        parts.set(part.id, part);
+        pendingParts.set(part.messageID, parts);
+      }
       continue;
     }
     if (event.type === "permission.asked" || event.type === "permission.v2.asked") {
-      send({ type: "permission", permission: properties });
+      const reply = automaticPermissionReply(request.mode);
+      if (reply) {
+        const result = await client2.permission.reply({ requestID: properties.id, reply });
+        if (result.error) send({ type: "error", error: JSON.stringify(result.error) });
+      } else {
+        send({ type: "permission", permission: properties });
+      }
       continue;
     }
     if (event.type === "session.error") {
+      if (cancelled) break;
       send({ type: "error", error: JSON.stringify(properties.error ?? "OpenCode session error") });
       break;
     }
     if (event.type === "session.idle") {
+      const position = [...assistantMessages].at(-1);
+      if (position) send({ type: "checkpoint", sessionId, position });
       send({ type: "done" });
       break;
     }
@@ -6214,4 +6260,8 @@ async function main() {
     opencode?.server.close();
   }
 }
-void main();
+if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  automaticPermissionReply
+});

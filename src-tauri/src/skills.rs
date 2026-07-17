@@ -226,6 +226,25 @@ fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 把借入方本机的 Nova skills 复制到额度租借的隔离后端目录。
+/// 使用会话快照而不是链接，避免隔离进程修改用户的原始 skill。
+pub fn copy_skills_to_runtime(config_dir: &Path, destination: &Path) -> Result<(), String> {
+    let source = skills_dir(config_dir);
+    if !source.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !is_skill_dir(&path) {
+            continue;
+        }
+        copy_dir_all(&path, &destination.join(entry.file_name())).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn find_skill_md(dir: &Path, depth: usize) -> Option<PathBuf> {
     if depth == 0 || !dir.is_dir() {
         return None;
@@ -415,16 +434,22 @@ pub fn remove_skill(config_dir: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 启动后端时调用：按用户主目录下的 `~/.nova/skills` 同步（与 `nova_data_dir` 一致）。
+/// 启动后端时调用：从当前构建的数据目录同步 skills。
 pub fn sync_skills_from_home() {
+    if cfg!(debug_assertions) {
+        return;
+    }
     if let Some(home) = user_home_dir() {
-        let _ = sync_skills_to_backends(&home.join(".nova"));
+        let _ = sync_skills_to_backends(&home.join(crate::nova_data_dir_name()));
     }
 }
 
 /// 把 `~/.nova/skills/<name>` 以软链接/目录联接同步到各后端全局 skills 目录。
 /// 不覆盖用户已有的真实目录；只维护指向 Nova 集中目录的链接。
 pub fn sync_skills_to_backends(config_dir: &Path) -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
     let central = ensure_skills_dir(config_dir);
     let mut managed_names = Vec::new();
     if let Ok(entries) = fs::read_dir(&central) {
@@ -490,4 +515,29 @@ pub fn sync_skills_to_backends(config_dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copies_local_skills_into_isolated_runtime() {
+        let root =
+            std::env::temp_dir().join(format!("nova-skill-runtime-test-{}", uuid::Uuid::new_v4()));
+        let config = root.join("config");
+        let skill = skills_dir(&config).join("demo");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\n").unwrap();
+        std::fs::write(skill.join("helper.txt"), "local").unwrap();
+
+        let destination = root.join("runtime-skills");
+        copy_skills_to_runtime(&config, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("demo").join("helper.txt")).unwrap(),
+            "local"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -128,7 +128,7 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
                 proxy: settings.devin_proxy.clone(),
             }
         }
-        AgentKind::Codex => {
+        AgentKind::Codex | AgentKind::CodexPlus => {
             let program = configured_cli_program(&settings.codex_path, &["codex"], "codex");
             let (install_program, install_args) = npm_installer("@openai/codex@latest");
             CliSpec {
@@ -144,7 +144,7 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
                 proxy: settings.codex_proxy.clone(),
             }
         }
-        AgentKind::CodeBuddy => {
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
             let program = configured_cli_program(
                 &settings.codebuddy_path,
                 &["codebuddy", "cbc"],
@@ -225,7 +225,9 @@ fn all_specs(settings: &Settings) -> Vec<CliSpec> {
     [
         AgentKind::Devin,
         AgentKind::Codex,
+        AgentKind::CodexPlus,
         AgentKind::CodeBuddy,
+        AgentKind::CodeBuddyPlus,
         AgentKind::ClaudeCode,
         AgentKind::Cursor,
         AgentKind::OpenCode,
@@ -569,13 +571,15 @@ pub async fn statuses(settings: &Settings) -> Vec<CliStatus> {
 
 async fn stop_backend(state: &AppState, kind: &AgentKind) {
     match kind {
-        AgentKind::Codex => state.codex.restart().await,
-        AgentKind::OpenCodePlus => state.opencodeplus.shutdown(),
-        _ => {
-            if let Some(manager) = state.acp_for(kind) {
-                manager.restart().await;
-            }
+        AgentKind::Devin => state.acp.restart().await,
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            state.codexplus.shutdown();
+            state.codex.restart().await;
         }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddyplus.shutdown(),
+        AgentKind::ClaudeCode => state.claudeplus.shutdown(),
+        AgentKind::Cursor => state.cursorplus.shutdown(),
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.shutdown(),
     }
 }
 

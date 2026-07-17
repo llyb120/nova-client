@@ -75,10 +75,14 @@ pub fn set_global_instructions(
     if active {
         fs::write(&central, content).map_err(|e| format!("保存全局指令失败：{e}"))?;
     }
-    let targets = normal_targets()?
-        .iter()
-        .map(|target| sync_target(target, if active { content } else { "" }))
-        .collect();
+    let targets = if cfg!(debug_assertions) {
+        Vec::new()
+    } else {
+        normal_targets()?
+            .iter()
+            .map(|target| sync_target(target, if active { content } else { "" }))
+            .collect()
+    };
     if !active {
         let _ = fs::remove_file(&central);
     }
@@ -95,23 +99,13 @@ pub fn set_global_instructions(
 
 /// 启动时重新同步一次，修复用户移动/删除了后端配置入口的情况。
 pub fn sync_global_instructions(config_dir: &Path) -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
     let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
     for target in normal_targets()? {
         let _ = sync_target(&target, &content);
     }
-    Ok(())
-}
-
-/// Cursor 正常会话使用 Nova 的隔离 `CURSOR_CONFIG_DIR`，必须把全局 Rule 写进真实启动目录。
-pub fn sync_cursor_config_dir(config_dir: &Path, cursor_config_dir: &Path) -> Result<(), String> {
-    let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
-    let target = Target {
-        kind: AgentKind::Cursor,
-        label: "Cursor",
-        path: cursor_config_dir.join("rules").join("nova-global.mdc"),
-        format: TargetFormat::CursorRule,
-    };
-    let _ = sync_target(&target, &content);
     Ok(())
 }
 
@@ -121,6 +115,9 @@ pub fn sync_backend_with_env(
     kind: &AgentKind,
     env: &HashMap<String, String>,
 ) -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
     let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
     if content.trim().is_empty() {
         return Ok(());
@@ -169,16 +166,16 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 TargetFormat::Markdown,
             )
         }
-        AgentKind::Codex => {
+        AgentKind::Codex | AgentKind::CodexPlus => {
             let root =
                 configured_dir(overrides, "CODEX_HOME").unwrap_or_else(|| home.join(".codex"));
-            ("Codex", root.join("AGENTS.md"), TargetFormat::Markdown)
+            (kind.label(), root.join("AGENTS.md"), TargetFormat::Markdown)
         }
-        AgentKind::CodeBuddy => {
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
             let root = configured_dir(overrides, "CODEBUDDY_CONFIG_DIR")
                 .unwrap_or_else(|| home.join(".codebuddy"));
             (
-                "CodeBuddy",
+                kind.label(),
                 root.join("CODEBUDDY.md"),
                 TargetFormat::Markdown,
             )

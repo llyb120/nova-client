@@ -38,7 +38,6 @@ function projectPathKey(path: string): string {
 
 const DEFAULT_RELAY_SERVER = "";
 const RELAY_SERVER_PLACEHOLDER = "http://127.0.0.1:8320";
-const DEFAULT_CLAUDECODE_ARGS = "-y @zed-industries/claude-code-acp";
 
 /** 统一会话模式（与 store.UNIFIED_MODES 一致，带说明文案） */
 const UNIFIED_MODE_OPTIONS = [
@@ -49,7 +48,7 @@ const UNIFIED_MODE_OPTIONS = [
 /** 后端代理输入框（每个后端进程可单独走代理） */
 function ProxyField(props: { value: string; onInput: (v: string) => void }) {
   return (
-    <label class="field">
+    <label class="backend-proxy-field">
       <span class="field-label">代理</span>
       <input
         class="field-input"
@@ -57,10 +56,6 @@ function ProxyField(props: { value: string; onInput: (v: string) => void }) {
         onInput={(e) => props.onInput(e.currentTarget.value)}
         placeholder="http://127.0.0.1:10808"
       />
-      <span class="field-hint">
-        只影响该后端进程（注入 HTTP(S)_PROXY 环境变量）。留空 = 不代理；填
-        127.0.0.1:10808 按 http 代理处理。
-      </span>
     </label>
   );
 }
@@ -143,17 +138,10 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
   const [acpArgs, setAcpArgs] = createSignal(s?.acpArgs ?? "acp");
   const [codebuddyPath, setCodebuddyPath] = createSignal(s?.codebuddyPath ?? "codebuddy");
-  const [codebuddyArgs, setCodebuddyArgs] = createSignal(s?.codebuddyArgs ?? "--acp");
-  const [claudecodePath, setClaudecodePath] = createSignal(s?.claudecodePath ?? "npx");
-  const [claudecodeArgs, setClaudecodeArgs] = createSignal(
-    s?.claudecodeArgs ?? DEFAULT_CLAUDECODE_ARGS,
-  );
+  const [claudecodePath, setClaudecodePath] = createSignal(s?.claudecodePath ?? "claude");
   const [cursorPath, setCursorPath] = createSignal(s?.cursorPath ?? "cursor-agent");
-  const [cursorArgs, setCursorArgs] = createSignal(s?.cursorArgs ?? "acp");
   const [opencodePath, setOpencodePath] = createSignal(s?.opencodePath ?? "opencode");
-  const [opencodeArgs, setOpencodeArgs] = createSignal(s?.opencodeArgs ?? "acp");
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
-  const [codexArgs, setCodexArgs] = createSignal(s?.codexArgs ?? "app-server --stdio");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
@@ -161,7 +149,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
   const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
+  const [claudecodeSdkApiKey, setClaudecodeSdkApiKey] = createSignal(s?.claudecodeSdkApiKey ?? "");
   const [cursorProxy, setCursorProxy] = createSignal(s?.cursorProxy ?? "");
+  const [cursorSdkApiKey, setCursorSdkApiKey] = createSignal(s?.cursorSdkApiKey ?? "");
   const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
   const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
@@ -169,7 +159,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [claudecodeEnabled, setClaudecodeEnabled] = createSignal(s?.claudecodeEnabled !== false);
   const [cursorEnabled, setCursorEnabled] = createSignal(s?.cursorEnabled !== false);
   const [opencodeEnabled, setOpencodeEnabled] = createSignal(s?.opencodeEnabled !== false);
-  const [opencodeplusEnabled, setOpencodeplusEnabled] = createSignal(s?.opencodeplusEnabled !== false);
   // 旧值（bypass 等）归一到统一模式 build/plan
   const [defaultMode, setDefaultMode] = createSignal(
     normalizeUnifiedMode(s?.defaultMode) ?? s?.defaultMode ?? "",
@@ -243,7 +232,6 @@ export function SettingsModal(props: { onClose: () => void }) {
       claudecodeEnabled(),
       cursorEnabled(),
       opencodeEnabled(),
-      opencodeplusEnabled(),
     ].filter(Boolean).length;
 
   const quotaShareKinds = createMemo<AgentKind[]>(() => {
@@ -256,6 +244,9 @@ export function SettingsModal(props: { onClose: () => void }) {
     if (opencodeEnabled()) kinds.push("opencode");
     return kinds;
   });
+  const titleAgentKinds = createMemo(() =>
+    enabledAgentKinds().filter((kind) => kind === "devin" || kind === "codex" || kind === "opencode"),
+  );
 
   const quotaShareKey = (kind: AgentKind, model: string) => `${kind}:${model}`;
   const toggleQuotaSharedModel = (kind: AgentKind, model: string, checked: boolean) => {
@@ -386,21 +377,18 @@ export function SettingsModal(props: { onClose: () => void }) {
     devinPath: devinPath().trim() || "devin",
     acpArgs: acpArgs().trim() || "acp",
     codebuddyPath: codebuddyPath().trim() || "codebuddy",
-    codebuddyArgs: codebuddyArgs().trim() || "--acp",
-    claudecodePath: claudecodePath().trim() || "npx",
-    claudecodeArgs: claudecodeArgs().trim() || DEFAULT_CLAUDECODE_ARGS,
+    claudecodePath: claudecodePath().trim() || "claude",
     cursorPath: cursorPath().trim() || "cursor-agent",
-    cursorArgs: cursorArgs().trim() || "acp",
     opencodePath: opencodePath().trim() || "opencode",
-    opencodeArgs: opencodeArgs().trim() || "acp",
     codexPath: codexPath().trim() || "codex",
-    codexArgs: codexArgs().trim() || "app-server --stdio",
     codexProxy: codexProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
     claudecodeProxy: claudecodeProxy().trim(),
+    claudecodeSdkApiKey: claudecodeSdkApiKey().trim(),
     cursorProxy: cursorProxy().trim(),
+    cursorSdkApiKey: cursorSdkApiKey().trim(),
     opencodeProxy: opencodeProxy().trim(),
     defaultMode: defaultMode(),
     titleModelAgent: titleAgent(),
@@ -420,7 +408,11 @@ export function SettingsModal(props: { onClose: () => void }) {
     claudecodeEnabled: claudecodeEnabled(),
     cursorEnabled: cursorEnabled(),
     opencodeEnabled: opencodeEnabled(),
-    opencodeplusEnabled: opencodeplusEnabled(),
+    codexIntegration: "sdk",
+    codebuddyIntegration: "sdk",
+    claudecodeIntegration: "sdk",
+    cursorIntegration: "sdk",
+    opencodeIntegration: "sdk",
     worktreeDir: worktreeDir().trim(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
@@ -903,7 +895,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <span class="field-label">标题生成模型</span>
                 <ModelPicker
                   agentKind={titleAgent()}
-                  agentKinds={enabledAgentKinds()}
+                  agentKinds={titleAgentKinds()}
                   model={titleModel()}
                   onPickModel={(a, m) => {
                     setTitleAgent(a);
@@ -1001,28 +993,19 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().devin}
                 onUpgrade={() => void upgradeCli("devin")}
               />
-              <label class="field">
-                <span class="field-label">可执行文件</span>
-                <input
-                  class="field-input"
-                  value={devinPath()}
-                  onInput={(e) => setDevinPath(e.currentTarget.value)}
-                  placeholder="devin"
-                />
-              </label>
-              <label class="field">
-                <span class="field-label">启动参数（ACP）</span>
-                <input
-                  class="field-input"
-                  value={acpArgs()}
-                  onInput={(e) => setAcpArgs(e.currentTarget.value)}
-                  placeholder="acp"
-                />
-                <span class="field-hint">
-                  也可换成任何支持 ACP 的 agent。如 Claude：可执行文件 npx，参数
-                  -y @zed-industries/claude-code-acp
-                </span>
-              </label>
+              <div class="backend-config-row">
+                <span class="fixed-integration">ACP</span>
+                <div class="backend-fields">
+                  <label class="backend-field">
+                    <span class="field-label">可执行文件</span>
+                    <input class="field-input" value={devinPath()} onInput={(e) => setDevinPath(e.currentTarget.value)} placeholder="devin" />
+                  </label>
+                  <label class="backend-field">
+                    <span class="field-label">启动参数</span>
+                    <input class="field-input" value={acpArgs()} onInput={(e) => setAcpArgs(e.currentTarget.value)} placeholder="acp" />
+                  </label>
+                </div>
+              </div>
               <ProxyField value={devinProxy()} onInput={setDevinProxy} />
             </div>
 
@@ -1050,28 +1033,15 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().codebuddy}
                 onUpgrade={() => void upgradeCli("codebuddy")}
               />
-              <label class="field">
-                <span class="field-label">可执行文件</span>
-                <input
-                  class="field-input"
-                  value={codebuddyPath()}
-                  onInput={(e) => setCodebuddyPath(e.currentTarget.value)}
-                  placeholder="codebuddy"
-                />
-              </label>
-              <label class="field">
-                <span class="field-label">启动参数</span>
-                <input
-                  class="field-input"
-                  value={codebuddyArgs()}
-                  onInput={(e) => setCodebuddyArgs(e.currentTarget.value)}
-                  placeholder="--acp"
-                />
-                <span class="field-hint">
-                  腾讯云代码助手（ACP）。默认用已安装的 codebuddy --acp；未安装可改为可执行文件
-                  npx，参数 -y @tencent-ai/codebuddy-code@latest --acp。
-                </span>
-              </label>
+              <div class="backend-config-row">
+                <span class="fixed-integration">SDK</span>
+                <div class="backend-fields">
+                  <label class="backend-field">
+                    <span class="field-label">可执行文件</span>
+                    <input class="field-input" value={codebuddyPath()} onInput={(e) => setCodebuddyPath(e.currentTarget.value)} placeholder="codebuddy" />
+                  </label>
+                </div>
+              </div>
               <ProxyField value={codebuddyProxy()} onInput={setCodebuddyProxy} />
             </div>
 
@@ -1099,28 +1069,19 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().claudecode}
                 onUpgrade={() => void upgradeCli("claudecode")}
               />
-              <label class="field">
-                <span class="field-label">可执行文件</span>
-                <input
-                  class="field-input"
-                  value={claudecodePath()}
-                  onInput={(e) => setClaudecodePath(e.currentTarget.value)}
-                  placeholder="npx"
-                />
-              </label>
-              <label class="field">
-                <span class="field-label">启动参数</span>
-                <input
-                  class="field-input"
-                  value={claudecodeArgs()}
-                  onInput={(e) => setClaudecodeArgs(e.currentTarget.value)}
-                  placeholder={DEFAULT_CLAUDECODE_ARGS}
-                />
-                <span class="field-hint">
-                  Claude Code（ACP）。默认用 npx -y 免确认拉起 @zed-industries/claude-code-acp；
-                  需先在环境里配置好 Claude（如 ANTHROPIC_API_KEY 或已登录的 claude CLI）。
-                </span>
-              </label>
+              <div class="backend-config-row">
+                <span class="fixed-integration">SDK</span>
+                <div class="backend-fields">
+                  <label class="backend-field">
+                    <span class="field-label">可执行文件</span>
+                    <input class="field-input" value={claudecodePath()} onInput={(e) => setClaudecodePath(e.currentTarget.value)} placeholder="claude" />
+                  </label>
+                  <label class="backend-field backend-field-wide">
+                    <span class="field-label">Anthropic API Key</span>
+                    <input class="field-input" value={claudecodeSdkApiKey()} onInput={(e) => setClaudecodeSdkApiKey(e.currentTarget.value)} placeholder="留空使用环境/provider 凭据" />
+                  </label>
+                </div>
+              </div>
               <ProxyField value={claudecodeProxy()} onInput={setClaudecodeProxy} />
             </div>
 
@@ -1148,24 +1109,15 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().codex}
                 onUpgrade={() => void upgradeCli("codex")}
               />
-              <label class="field">
-                <span class="field-label">可执行文件</span>
-                <input
-                  class="field-input"
-                  value={codexPath()}
-                  onInput={(e) => setCodexPath(e.currentTarget.value)}
-                  placeholder="codex"
-                />
-              </label>
-              <label class="field">
-                <span class="field-label">app-server 参数</span>
-                <input
-                  class="field-input"
-                  value={codexArgs()}
-                  onInput={(e) => setCodexArgs(e.currentTarget.value)}
-                  placeholder="app-server --stdio"
-                />
-              </label>
+              <div class="backend-config-row">
+                <span class="fixed-integration">SDK</span>
+                <div class="backend-fields">
+                  <label class="backend-field">
+                    <span class="field-label">可执行文件</span>
+                    <input class="field-input" value={codexPath()} onInput={(e) => setCodexPath(e.currentTarget.value)} placeholder="codex" />
+                  </label>
+                </div>
+              </div>
               <ProxyField value={codexProxy()} onInput={setCodexProxy} />
             </div>
 
@@ -1193,29 +1145,19 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().cursor}
                 onUpgrade={() => void upgradeCli("cursor")}
               />
-              <label class="field">
-                <span class="field-label">可执行文件</span>
-                <input
-                  class="field-input"
-                  value={cursorPath()}
-                  onInput={(e) => setCursorPath(e.currentTarget.value)}
-                  placeholder="cursor-agent"
-                />
-              </label>
-              <label class="field">
-                <span class="field-label">启动参数</span>
-                <input
-                  class="field-input"
-                  value={cursorArgs()}
-                  onInput={(e) => setCursorArgs(e.currentTarget.value)}
-                  placeholder="acp"
-                />
-                <span class="field-hint">
-                  Cursor CLI（ACP）。需已安装并登录 cursor-agent（cursor-agent login）；
-                  新版 CLI 命令若为 agent，把可执行文件改成 agent 即可。
-                  每次拉起进程前会自动确保其 Max Mode 处于关闭（避免高额计费）。
-                </span>
-              </label>
+              <div class="backend-config-row">
+                <span class="fixed-integration">SDK</span>
+                <div class="backend-fields">
+                  <label class="backend-field">
+                    <span class="field-label">可执行文件</span>
+                    <input class="field-input" value={cursorPath()} onInput={(e) => setCursorPath(e.currentTarget.value)} placeholder="cursor-agent" />
+                  </label>
+                  <label class="backend-field backend-field-wide">
+                    <span class="field-label">Cursor API Key</span>
+                    <input class="field-input" value={cursorSdkApiKey()} onInput={(e) => setCursorSdkApiKey(e.currentTarget.value)} placeholder="留空使用 CURSOR_API_KEY" />
+                  </label>
+                </div>
+              </div>
               <ProxyField value={cursorProxy()} onInput={setCursorProxy} />
             </div>
 
@@ -1243,55 +1185,20 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().opencode}
                 onUpgrade={() => void upgradeCli("opencode")}
               />
-              <label class="field">
-                <span class="field-label">可执行文件</span>
-                <input
-                  class="field-input"
-                  value={opencodePath()}
-                  onInput={(e) => setOpencodePath(e.currentTarget.value)}
-                  placeholder="opencode"
-                />
-              </label>
-              <label class="field">
-                <span class="field-label">启动参数</span>
-                <input
-                  class="field-input"
-                  value={opencodeArgs()}
-                  onInput={(e) => setOpencodeArgs(e.currentTarget.value)}
-                  placeholder="acp"
-                />
-                <span class="field-hint">
-                  OpenCode（ACP）。需已安装 opencode CLI（npm i -g opencode-ai
-                  或官方安装脚本）并配置好模型/凭据。
-                </span>
-              </label>
+              <div class="backend-config-row">
+                <span class="fixed-integration">SDK</span>
+                <div class="backend-fields">
+                  <label class="backend-field">
+                    <span class="field-label">可执行文件</span>
+                    <input class="field-input" value={opencodePath()} onInput={(e) => setOpencodePath(e.currentTarget.value)} placeholder="opencode" />
+                  </label>
+                </div>
+              </div>
               <ProxyField value={opencodeProxy()} onInput={setOpencodeProxy} />
             </div>
 
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class={`agent-badge opencodeplus`}>{agentLabel("opencodeplus")}</span>
-                <Show when={backendMissing("opencodeplus")}>
-                  <span class="backend-missing">未检测到 CLI</span>
-                </Show>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={opencodeplusEnabled()}
-                    disabled={opencodeplusEnabled() && enabledCount() === 1}
-                    onChange={(e) => setOpencodeplusEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <p class="field-hint">
-                OpenCode 官方 SDK 接入（非 ACP）。Nova 会启动 Node.js bridge 并直接调用
-                @opencode-ai/sdk，复用上方 OpenCode CLI、代理和凭据配置。
-              </p>
-            </div>
-
             <p class="field-hint">
-              修改可执行文件/启动参数会重启对应 agent 进程，进行中的会话将被打断（上下文下次发消息时自动恢复）。
+              修改后端配置会重启对应 agent 进程，进行中的会话将被打断（上下文下次发消息时自动恢复）。
               未检测到 CLI 的后端不会出现在新建会话的后端列表里（保存后会自动重新检测）。
             </p>
             <div class="field">
@@ -1537,7 +1444,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="field">
               <span class="field-label">共享模型额度（可多选）</span>
               <span class="field-hint">
-                选中的模型会以“{relayName().trim() || "我的"}的 Cursor”这类一级分类出现在队友的新会话模型选择器中。每次创建会话都会重新同步当前凭据；取消勾选后，旧缓存中的入口也无法再使用。
+                选中的模型会以“{relayName().trim() || "我的"}的 Cursor”这类一级分类出现在队友的新会话模型选择器中。首次选择时会安全同步并预热额度租约；取消勾选后，旧缓存中的入口也无法再使用。
               </span>
               <div class="quota-share-models">
                 <For each={quotaShareKinds()}>

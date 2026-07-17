@@ -1,18 +1,25 @@
 use crate::acp::{
-    apply_proxy_env, resolve_program_on_path, EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS,
-    EV_TURN, EV_UPDATE,
+    apply_proxy_env, resolve_program_on_path, EV_OPTIONS, EV_PERMISSION, EV_PERMISSION_RESOLVED,
+    EV_THREADS, EV_TURN, EV_UPDATE,
 };
-use crate::threads::{now_ms, Item, PromptImage, ToolCall};
+use crate::model_cache;
+use crate::threads::{
+    file_uri_to_local_path, now_ms, save_attachment_to_temp, Item, PromptImage, ToolCall,
+};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+use tokio::time::{sleep, Duration};
+
+pub const MODEL_CACHE_KEY: &str = "opencode-sdk";
 
 struct RunningBridge {
     child: Child,
@@ -26,22 +33,32 @@ struct PendingPermission {
 
 pub struct OpenCodeSdkManager {
     app: AppHandle,
+    launch_env: HashMap<String, String>,
     running_children: Mutex<HashMap<String, RunningBridge>>,
     pending_permissions: Mutex<HashMap<String, PendingPermission>>,
     running: Mutex<HashSet<String>>,
     turn_started: Mutex<HashMap<String, Instant>>,
     model_options: Mutex<Option<Value>>,
+    model_options_refreshing: AtomicBool,
+    model_options_revalidated: AtomicBool,
 }
 
 impl OpenCodeSdkManager {
     pub fn new(app: AppHandle) -> Arc<Self> {
+        Self::new_with_env(app, HashMap::new())
+    }
+
+    pub fn new_with_env(app: AppHandle, launch_env: HashMap<String, String>) -> Arc<Self> {
         Arc::new(Self {
             app,
+            launch_env,
             running_children: Mutex::new(HashMap::new()),
             pending_permissions: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
             turn_started: Mutex::new(HashMap::new()),
             model_options: Mutex::new(None),
+            model_options_refreshing: AtomicBool::new(false),
+            model_options_revalidated: AtomicBool::new(false),
         })
     }
 
@@ -49,28 +66,74 @@ impl OpenCodeSdkManager {
         self.running.lock().unwrap().contains(thread_id)
     }
 
+    pub fn has_pending_permission(&self, request_key: &str) -> bool {
+        self.pending_permissions
+            .lock()
+            .unwrap()
+            .contains_key(request_key)
+    }
+
     pub fn get_model_options(&self) -> Option<Value> {
         self.model_options.lock().unwrap().clone()
     }
 
+    pub fn seed_model_options(&self, value: Value) {
+        *self.model_options.lock().unwrap() = Some(value);
+    }
+
     pub fn spawn_revalidate_model_options(self: &Arc<Self>) {
+        if self.model_options_revalidated.load(Ordering::SeqCst)
+            || self
+                .model_options_refreshing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = manager.ensure_model_options().await;
+            let _ = manager.refresh_model_options().await;
+            manager
+                .model_options_refreshing
+                .store(false, Ordering::SeqCst);
         });
     }
 
-    pub async fn ensure_model_options(&self) -> Result<Value, String> {
-        if let Some(value) = self.get_model_options() {
-            return Ok(value);
-        }
+    async fn refresh_model_options(&self) -> Result<Value, String> {
         let cwd = current_dir()?;
         let value = provider_options(
             self.run_bridge(&cwd, json!({ "action": "providers" }))
                 .await?,
         )?;
         *self.model_options.lock().unwrap() = Some(value.clone());
+        model_cache::save(&crate::nova_data_dir(&self.app), MODEL_CACHE_KEY, &value);
+        self.model_options_revalidated.store(true, Ordering::SeqCst);
+        let _ = self.app.emit(
+            EV_OPTIONS,
+            json!({ "agentKind": "opencode", "options": value }),
+        );
         Ok(value)
+    }
+
+    pub async fn ensure_model_options(self: &Arc<Self>) -> Result<Value, String> {
+        if let Some(value) = self.get_model_options() {
+            self.spawn_revalidate_model_options();
+            return Ok(value);
+        }
+        self.spawn_revalidate_model_options();
+        for _ in 0..600 {
+            if let Some(value) = self.get_model_options() {
+                return Ok(value);
+            }
+            if !self.model_options_refreshing.load(Ordering::SeqCst) {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        if let Some(value) = self.get_model_options() {
+            return Ok(value);
+        }
+        self.refresh_model_options().await
     }
 
     pub async fn fetch_commands(&self) -> Result<Vec<Value>, String> {
@@ -102,7 +165,7 @@ impl OpenCodeSdkManager {
         if self.is_running(&thread_id) {
             return;
         }
-        let (cwd, model, mode, reasoning_effort, context, session_id) = {
+        let (cwd, model, mode, reasoning_effort, context, session_id, user_item_id) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
@@ -110,6 +173,7 @@ impl OpenCodeSdkManager {
             };
             let context = thread.take_prompt_context("OpenCode+");
             let item = thread.push_user(text.clone(), images.clone());
+            let user_item_id = item.id();
             let _ = self.emit_update(&thread_id, &item);
             let values = (
                 thread.cwd.clone(),
@@ -118,6 +182,7 @@ impl OpenCodeSdkManager {
                 thread.reasoning_effort.clone(),
                 context,
                 thread.acp_session_id.clone(),
+                user_item_id,
             );
             store.save();
             values
@@ -132,14 +197,8 @@ impl OpenCodeSdkManager {
             parts.push(json!({ "type": "text", "text": text }));
         }
         for image in images {
-            let url = image
-                .data
-                .map(|data| format!("data:{};base64,{data}", image.mime_type))
-                .or(image.uri);
-            if let Some(url) = url {
-                parts.push(json!({
-                    "type": "file", "mime": image.mime_type, "filename": image.name, "url": url
-                }));
+            if let Some(part) = prompt_attachment_part(image) {
+                parts.push(part);
             }
         }
         let selected = model.as_deref().and_then(split_model_variant);
@@ -154,11 +213,14 @@ impl OpenCodeSdkManager {
             "sessionId": session_id,
             "model": model,
             "variant": variant,
+            "mode": mode,
             "agent": mode.filter(|value| value == "plan"),
             "parts": parts
         });
         let request = with_command(request, &text);
-        let outcome = self.run_prompt_bridge(&thread_id, &cwd, request).await;
+        let outcome = self
+            .run_prompt_bridge(&thread_id, &cwd, request, user_item_id)
+            .await;
         if !self.is_running(&thread_id) {
             return;
         }
@@ -173,6 +235,10 @@ impl OpenCodeSdkManager {
     }
 
     pub async fn cancel(&self, thread_id: &str) {
+        if self.is_running(thread_id) {
+            self.push_system(thread_id, "已停止当前任务。".into(), "warn");
+            self.finish_turn(thread_id, "cancelled");
+        }
         let stdin = self
             .running_children
             .lock()
@@ -186,7 +252,28 @@ impl OpenCodeSdkManager {
         if let Some(mut bridge) = self.running_children.lock().unwrap().remove(thread_id) {
             kill_child(&mut bridge.child);
         }
-        self.finish_turn(thread_id, "cancelled");
+    }
+
+    pub async fn fork_session(
+        &self,
+        cwd: &str,
+        session_id: &str,
+        position: &str,
+    ) -> Result<String, String> {
+        let value = self
+            .run_bridge(
+                cwd,
+                json!({
+                    "action": "fork",
+                    "sessionId": session_id,
+                    "position": position,
+                }),
+            )
+            .await?;
+        value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "OpenCode fork 未返回新会话 ID".into())
     }
 
     pub fn forget_session_of_thread(&self, thread_id: &str) {
@@ -249,6 +336,7 @@ impl OpenCodeSdkManager {
         thread_id: &str,
         cwd: &str,
         request: Value,
+        user_item_id: u64,
     ) -> Result<(), String> {
         let mut child = self.spawn_bridge(cwd)?;
         let stdin = child.stdin.take().ok_or("OpenCode+ bridge stdin 不可用")?;
@@ -262,7 +350,9 @@ impl OpenCodeSdkManager {
             .lock()
             .unwrap()
             .insert(thread_id.to_string(), RunningBridge { child, stdin });
-        let result = self.read_prompt_events(thread_id, stdout).await;
+        let result = self
+            .read_prompt_events(thread_id, user_item_id, stdout)
+            .await;
         if let Some(mut bridge) = self.running_children.lock().unwrap().remove(thread_id) {
             if result.is_err() {
                 kill_child(&mut bridge.child);
@@ -284,6 +374,7 @@ impl OpenCodeSdkManager {
     async fn read_prompt_events(
         &self,
         thread_id: &str,
+        user_item_id: u64,
         stdout: tokio::process::ChildStdout,
     ) -> Result<(), String> {
         let mut lines = BufReader::new(stdout).lines();
@@ -304,6 +395,7 @@ impl OpenCodeSdkManager {
                     }
                 }
                 Some("part") => self.apply_part(thread_id, &event["part"], &mut part_items),
+                Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
                 Some("permission") => self.handle_permission(thread_id, &event["permission"]),
                 Some("error") => {
                     return Err(event["error"]
@@ -337,6 +429,10 @@ impl OpenCodeSdkManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if !self.launch_env.is_empty() {
+            crate::credential_roaming::isolate_borrowed_command(&mut command);
+            command.envs(&self.launch_env);
+        }
         if let Some(dir) = resolve_program_on_path(&opencode_path)
             .and_then(|path| path.parent().map(PathBuf::from))
         {
@@ -361,6 +457,25 @@ impl OpenCodeSdkManager {
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
             thread.acp_session_id = Some(session_id.to_string());
+        }
+        store.save();
+    }
+
+    fn save_checkpoint(&self, thread_id: &str, user_item_id: u64, event: &Value) {
+        let Some(session_id) = event.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(position) = event.get("position").and_then(Value::as_str) else {
+            return;
+        };
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        if let Some(thread) = store.get_mut(thread_id) {
+            thread.record_provider_checkpoint(
+                user_item_id,
+                session_id.to_string(),
+                position.to_string(),
+            );
         }
         store.save();
     }
@@ -434,7 +549,7 @@ impl OpenCodeSdkManager {
             EV_PERMISSION,
             json!({
                 "threadId": thread_id,
-                "agentKind": "opencodeplus",
+                "agentKind": "opencode",
                 "requestKey": request_key,
                 "toolCall": {
                     "title": title,
@@ -561,6 +676,21 @@ impl OpenCodeSdkManager {
             }),
         )
     }
+}
+
+fn prompt_attachment_part(image: PromptImage) -> Option<Value> {
+    if image.mime_type.starts_with("image/") {
+        let url = image
+            .data
+            .map(|data| format!("data:{};base64,{data}", image.mime_type))
+            .or(image.uri)?;
+        return Some(json!({
+            "type": "file", "mime": image.mime_type, "filename": image.name, "url": url
+        }));
+    }
+    let path = save_attachment_to_temp(&image)
+        .or_else(|| image.uri.as_deref().and_then(file_uri_to_local_path))?;
+    Some(json!({ "type": "text", "text": format!("Attached file: {path}") }))
 }
 
 impl Drop for OpenCodeSdkManager {
@@ -770,6 +900,48 @@ fn tool_call(part: &Value) -> ToolCall {
             .map(str::to_string)
             .unwrap_or_else(|| value.to_string())
     });
+    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("Tool");
+    let input = state.get("input").cloned();
+    let path = input.as_ref().and_then(|value| {
+        ["filePath", "file_path", "path"]
+            .iter()
+            .find_map(|key| value.get(key).and_then(Value::as_str))
+    });
+    let is_todo = matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "todowrite" | "todo_write" | "todo"
+    );
+    let todo_text = is_todo.then(|| {
+        input
+            .as_ref()
+            .and_then(|value| value.get("todos"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|todo| {
+                let content = todo.get("content").and_then(Value::as_str)?;
+                let marker = match todo.get("status").and_then(Value::as_str) {
+                    Some("completed") => "x",
+                    Some("in_progress" | "inProgress") => ">",
+                    Some("cancelled") => "-",
+                    _ => " ",
+                };
+                Some(format!("[{marker}] {content}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    let detail = input
+        .as_ref()
+        .and_then(|value| match tool.to_ascii_lowercase().as_str() {
+            "bash" | "shell" => value.get("command"),
+            "grep" | "search" => value.get("pattern").or_else(|| value.get("query")),
+            "glob" => value.get("pattern"),
+            _ => None,
+        })
+        .and_then(Value::as_str)
+        .map(compact_tool_detail)
+        .filter(|value| !value.is_empty());
     ToolCall {
         tool_call_id: part
             .get("callID")
@@ -777,12 +949,24 @@ fn tool_call(part: &Value) -> ToolCall {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        title: part
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("Tool")
-            .to_string(),
-        kind: "other".into(),
+        title: if is_todo {
+            "Todo list".into()
+        } else if let Some(path) = path {
+            format!("{tool} {path}")
+        } else if let Some(detail) = detail {
+            format!("{tool} {detail}")
+        } else {
+            tool.to_string()
+        },
+        kind: match tool.to_ascii_lowercase().as_str() {
+            "read" => "read",
+            "edit" | "write" | "patch" | "apply_patch" => "edit",
+            "grep" | "glob" | "search" => "search",
+            "bash" | "shell" => "execute",
+            _ if is_todo => "think",
+            _ => "other",
+        }
+        .into(),
         status: match status {
             "completed" => "completed",
             "error" => "failed",
@@ -790,19 +974,58 @@ fn tool_call(part: &Value) -> ToolCall {
         }
         .into(),
         content: output_text
+            .or(todo_text)
             .map(|text| {
                 vec![json!({ "type": "content", "content": { "type": "text", "text": text } })]
             })
             .unwrap_or_default(),
-        locations: Vec::new(),
-        raw_input: state.get("input").cloned(),
+        locations: path
+            .map(|path| vec![json!({ "path": path })])
+            .unwrap_or_default(),
+        raw_input: input,
         raw_output: output,
+    }
+}
+
+fn compact_tool_detail(value: &str) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = value.chars();
+    let detail = chars.by_ref().take(160).collect::<String>();
+    if chars.next().is_some() {
+        format!("{detail}…")
+    } else {
+        detail
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_attachments_become_readable_paths() {
+        let part = prompt_attachment_part(PromptImage {
+            name: "质量公式分析视图_backup.xlsx".into(),
+            mime_type: "application/octet-stream".into(),
+            data: None,
+            uri: Some("file:///C:/Users/1/Desktop/%E8%B4%A8%E9%87%8F.xlsx".into()),
+            size: None,
+        })
+        .unwrap();
+        assert_eq!(part["type"], "text");
+        assert!(part["text"].as_str().unwrap().contains("质量.xlsx"));
+
+        let image = prompt_attachment_part(PromptImage {
+            name: "chart.png".into(),
+            mime_type: "image/png".into(),
+            data: Some("base64".into()),
+            uri: None,
+            size: None,
+        })
+        .unwrap();
+        assert_eq!(image["type"], "file");
+        assert_eq!(image["mime"], "image/png");
+    }
 
     #[test]
     fn splits_sdk_model_identifier() {
@@ -851,5 +1074,33 @@ mod tests {
         assert!(
             with_command(json!({ "action": "prompt" }), "explain /review")["command"].is_null()
         );
+    }
+
+    #[test]
+    fn maps_read_and_todo_tools_for_display() {
+        let read = tool_call(&json!({
+            "id": "part", "callID": "call", "type": "tool", "tool": "read",
+            "state": { "status": "running", "input": { "filePath": "src/main.rs" } }
+        }));
+        assert_eq!(read.title, "read src/main.rs");
+        assert_eq!(read.kind, "read");
+        assert_eq!(read.locations[0]["path"], "src/main.rs");
+
+        let todo = tool_call(&json!({
+            "id": "todo", "type": "tool", "tool": "todowrite",
+            "state": { "status": "completed", "input": { "todos": [
+                { "content": "Fix streaming", "status": "in_progress" }
+            ] } }
+        }));
+        assert_eq!(todo.title, "Todo list");
+        assert_eq!(todo.kind, "think");
+        assert!(todo.raw_input.unwrap()["todos"].is_array());
+
+        let bash = tool_call(&json!({
+            "id": "bash", "type": "tool", "tool": "bash",
+            "state": { "status": "running", "input": { "command": "python inspect_excel.py report.xlsx" } }
+        }));
+        assert_eq!(bash.title, "bash python inspect_excel.py report.xlsx");
+        assert_eq!(bash.kind, "execute");
     }
 }

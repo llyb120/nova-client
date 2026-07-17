@@ -190,7 +190,7 @@ fn dirs_nova_lock_path() -> std::path::PathBuf {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".nova").join("nova.lock")
+    home.join(nova_lib::nova_data_dir_name()).join("nova.lock")
 }
 
 #[cfg(target_os = "macos")]

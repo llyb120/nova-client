@@ -1124,6 +1124,33 @@ button {
 .markdown a {
   color: var(--blue);
 }
+.md-file-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--bg-panel);
+  color: var(--blue);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: inherit;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+.md-file-ref:hover {
+  background: var(--bg-hover);
+  text-decoration: underline;
+}
+.md-file-ref svg {
+  flex-shrink: 0;
+}
+.md-file-ref span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .markdown blockquote {
   border-left: 3px solid var(--border-light);
   padding-left: 12px;
@@ -3181,8 +3208,8 @@ button {
 .backend-card {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 14px;
+  gap: 8px;
+  padding: 12px;
   border: 1px solid var(--card-border);
   border-radius: 10px;
   background: var(--bg-panel);
@@ -3192,6 +3219,92 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.backend-config-row {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+}
+
+.fixed-integration {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 164px;
+  min-height: 34px;
+  border: 1px solid color-mix(in srgb, var(--accent) 84%, var(--border-strong));
+  border-radius: 8px;
+  color: var(--on-accent);
+  background: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.backend-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  align-items: end;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.backend-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.backend-field-wide {
+  grid-column: span 2;
+}
+
+.backend-field .field-input {
+  min-width: 0;
+}
+
+.backend-proxy-field {
+  display: grid;
+  grid-template-columns: 164px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.backend-proxy-field .field-label {
+  text-align: right;
+}
+
+.backend-proxy-field .field-input {
+  min-width: 0;
+}
+
+@media (max-width: 680px) {
+  .backend-config-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .fixed-integration {
+    width: 100%;
+  }
+
+  .fixed-integration {
+    flex-basis: auto;
+  }
+
+  .backend-field-wide {
+    grid-column: auto;
+  }
+
+  .backend-proxy-field {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .backend-proxy-field .field-label {
+    text-align: left;
+  }
 }
 
 .backend-switch {
@@ -3227,7 +3340,7 @@ button {
   align-items: center;
   gap: 10px;
   min-height: 34px;
-  padding: 8px 10px;
+  padding: 6px 9px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: color-mix(in srgb, var(--bg) 62%, transparent);
