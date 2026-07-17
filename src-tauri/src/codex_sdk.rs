@@ -137,6 +137,7 @@ impl CodexSdkManager {
         if self.is_running(&thread_id) {
             return;
         }
+        let mut title_job: Option<(String, String)> = None;
         let (
             cwd,
             mut model,
@@ -160,6 +161,12 @@ impl CodexSdkManager {
                 .or_else(|| thread.acp_session_id.clone());
             let item = thread.push_user(text.clone(), images.clone());
             let user_item_id = item.id();
+            if self.backend == SdkBackend::Codex && thread.title == "新会话" {
+                let fallback = derive_title(&text, !images.is_empty());
+                thread.title = fallback.clone();
+                title_job = Some((text.clone(), fallback));
+                let _ = self.app.emit(EV_THREADS, json!({}));
+            }
             let _ = self.emit_update(&thread_id, &item);
             let values = (
                 thread.cwd.clone(),
@@ -174,6 +181,14 @@ impl CodexSdkManager {
             store.save();
             values
         };
+        if let Some((prompt, fallback)) = title_job {
+            self.app.state::<AppState>().generate_title(
+                &self.backend.agent_kind(),
+                thread_id.clone(),
+                prompt,
+                fallback,
+            );
+        }
         if self.backend == SdkBackend::Codex {
             let state = self.app.state::<AppState>();
             if let (Some(selected), Some(options)) =
@@ -1038,6 +1053,17 @@ fn split_codex_effort(value: &str) -> Option<(&str, &str)> {
     EFFORTS.contains(&effort).then_some((model, effort))
 }
 
+fn derive_title(text: &str, has_images: bool) -> String {
+    let title: String = text.lines().next().unwrap_or("").trim().chars().take(40).collect();
+    if !title.is_empty() {
+        title
+    } else if has_images {
+        "[图片]".into()
+    } else {
+        "新会话".into()
+    }
+}
+
 fn complete_pending_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
     let mut changed = Vec::new();
     for item in &mut thread.items {
@@ -1055,11 +1081,18 @@ fn complete_pending_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_pending_tools, normalize_title, parse_bridge_output, resolve_codex_model,
-        tool_call, SdkBackend,
+        complete_pending_tools, derive_title, normalize_title, parse_bridge_output,
+        resolve_codex_model, tool_call, SdkBackend,
     };
     use crate::threads::{now_ms, AgentKind, Item, Thread, ToolCall};
     use serde_json::json;
+
+    #[test]
+    fn title_fallback_uses_first_prompt_line_or_image() {
+        assert_eq!(derive_title("  修复标题生成\n更多内容", false), "修复标题生成");
+        assert_eq!(derive_title("", true), "[图片]");
+        assert_eq!(derive_title("", false), "新会话");
+    }
 
     #[test]
     fn codex_model_resolution_splits_combined_values() {
@@ -1173,7 +1206,10 @@ mod tests {
         }));
         assert_eq!(files.title, "修改 2 个文件");
         assert_eq!(files.locations[0]["path"], "src/main.rs");
-        assert_eq!(files.content[0]["content"]["text"], "更新 src/main.rs\n新增 src/new.rs");
+        assert_eq!(
+            files.content[0]["content"]["text"],
+            "更新 src/main.rs\n新增 src/new.rs"
+        );
 
         let mcp = tool_call(&json!({
             "id": "mcp", "type": "mcp_tool_call", "server": "files", "tool": "read",

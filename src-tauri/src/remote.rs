@@ -1125,17 +1125,13 @@ fn remote_file(app: &AppHandle, thread_id: &str, cwd: &str, path: &str) -> Resul
         }
         thread.cwd.clone()
     };
-    let root = std::fs::canonicalize(&thread_cwd).map_err(|_| "会话工作目录不存在")?;
     let requested = std::path::Path::new(path.trim());
     let abs = if requested.is_absolute() {
         requested.to_path_buf()
     } else {
-        root.join(requested)
+        std::path::Path::new(&thread_cwd).join(requested)
     };
     let abs = std::fs::canonicalize(abs).map_err(|_| "文件不存在")?;
-    if !abs.starts_with(&root) {
-        return Err("只能下载会话工作目录内的文件".into());
-    }
     let meta = abs.metadata().map_err(|e| format!("读取文件失败：{e}"))?;
     if !meta.is_file() {
         return Err("目标不是文件".into());
@@ -1394,7 +1390,7 @@ fn create_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String>
         Some(cmd.model.clone()).filter(|s| !s.is_empty()),
         Some(cmd.mode.clone()).filter(|s| !s.is_empty()),
         None,
-        scratch,
+        false, // 临时目录只决定 cwd；Server 创建的会话仍是普通持久会话。
     );
     // 远程入口不支持创建目录/worktree，只把已存在目录记录为最近项目。
     thread.updated_at = crate::threads::now_ms();
