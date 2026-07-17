@@ -530,7 +530,7 @@ impl RelayManager {
         };
         // 保留服务端返回的完整名单（含自己）：天线在线名单要显示自己（前端标注「我」）。
         // 漫游/分享侧各自会用自己的 token 排除自己，不受此影响。
-        let peers = body.get("peers").cloned().unwrap_or(json!([]));
+        let peers = relay_display_peers(body.get("peers").cloned().unwrap_or(json!([])));
         self.retain_online_quota_leases(&peers);
         *self.peers.lock().unwrap() = peers.clone();
         let _ = self.app.emit(EV_RELAY_PEERS, peers);
@@ -723,6 +723,7 @@ impl RelayManager {
         let Ok(mut env) = serde_json::from_str::<InEnvelope>(data) else {
             return;
         };
+        env.from_name = relay_sender_name(&env.from, &env.from_name);
         // 还原对端可能压缩过的大载荷
         maybe_decompress(&mut env.data);
         if env.seq > 0 {
@@ -743,7 +744,8 @@ impl RelayManager {
             "presence" => {
                 // 保留服务端返回的完整名单（含自己）：天线在线名单要显示自己（前端标注「我」）。
                 // 漫游/分享侧各自会用自己的 token 排除自己，不受此影响。
-                let peers = env.data.get("peers").cloned().unwrap_or(json!([]));
+                let peers =
+                    relay_display_peers(env.data.get("peers").cloned().unwrap_or(json!([])));
                 self.retain_online_quota_leases(&peers);
                 *self.peers.lock().unwrap() = peers.clone();
                 let _ = self.app.emit(EV_RELAY_PEERS, peers);
@@ -3919,6 +3921,9 @@ async fn decode_relay_json<T: DeserializeOwned>(response: reqwest::Response) -> 
 }
 
 fn relay_display_name(s: &Settings) -> String {
+    if let Some(name) = relay_token_username(&s.relay_token) {
+        return name.to_string();
+    }
     let name = s.relay_name.trim();
     if !name.is_empty() {
         return name.to_string();
@@ -3929,6 +3934,31 @@ fn relay_display_name(s: &Settings) -> String {
         .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "Nova".to_string())
+}
+
+fn relay_token_username(token: &str) -> Option<&str> {
+    token.trim().split_once('/').map(|(username, _)| username)
+}
+
+fn relay_sender_name(token: &str, fallback: &str) -> String {
+    relay_token_username(token).unwrap_or(fallback).to_string()
+}
+
+fn relay_display_peers(mut peers: Value) -> Value {
+    if let Some(items) = peers.as_array_mut() {
+        for peer in items {
+            let Some(name) = peer
+                .get("token")
+                .and_then(Value::as_str)
+                .and_then(relay_token_username)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            peer["name"] = json!(name);
+        }
+    }
+    peers
 }
 
 fn urlencode(s: &str) -> String {
@@ -3991,6 +4021,28 @@ fn persist_inbox(dir: &PathBuf, inbox: &[Share]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_token_username_is_backward_compatible() {
+        assert_eq!(relay_token_username("alice/random-id"), Some("alice"));
+        assert_eq!(relay_token_username("legacy-token"), None);
+        assert_eq!(relay_sender_name("alice/random-id", "Secret"), "alice");
+        assert_eq!(
+            relay_sender_name("legacy-token", "Legacy Name"),
+            "Legacy Name"
+        );
+    }
+
+    #[test]
+    fn relay_peer_names_hide_random_token_suffixes() {
+        let peers = relay_display_peers(json!([
+            { "token": "alice/random-id", "name": "Secret" },
+            { "token": "legacy-token", "name": "Legacy Name" }
+        ]));
+        assert_eq!(peers[0]["token"], "alice/random-id");
+        assert_eq!(peers[0]["name"], "alice");
+        assert_eq!(peers[1]["name"], "Legacy Name");
+    }
 
     #[test]
     fn recalled_share_uses_local_default_mode() {
