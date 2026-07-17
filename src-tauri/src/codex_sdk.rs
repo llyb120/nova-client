@@ -763,7 +763,12 @@ impl CodexSdkManager {
                 ts: now_ms(),
                 call: tool_call(value),
             }),
-            _ => None,
+            Some(_) => Some(Item::Tool {
+                id,
+                ts: now_ms(),
+                call: tool_call(value),
+            }),
+            None => None,
         };
         let Some(item) = item else {
             return;
@@ -1149,6 +1154,45 @@ mod tests {
         assert_eq!(read.kind, "read");
         assert_eq!(read.locations[0]["path"], "C:/Users/1/Desktop/1.xlsx");
     }
+
+    #[test]
+    fn codex_sdk_tools_preserve_available_details() {
+        let command = tool_call(&json!({
+            "id": "command", "type": "command_execution", "command": "git status",
+            "aggregated_output": " M src/main.rs\n", "exit_code": 0, "status": "completed"
+        }));
+        assert_eq!(command.raw_input.unwrap()["command"], "git status");
+        assert_eq!(command.raw_output.as_ref().unwrap()["exitCode"], 0);
+        assert_eq!(command.content[0]["content"]["text"], " M src/main.rs\n");
+
+        let files = tool_call(&json!({
+            "id": "files", "type": "file_change", "status": "completed", "changes": [
+                { "path": "src/main.rs", "kind": "update" },
+                { "path": "src/new.rs", "kind": "add" }
+            ]
+        }));
+        assert_eq!(files.title, "修改 2 个文件");
+        assert_eq!(files.locations[0]["path"], "src/main.rs");
+        assert_eq!(files.content[0]["content"]["text"], "更新 src/main.rs\n新增 src/new.rs");
+
+        let mcp = tool_call(&json!({
+            "id": "mcp", "type": "mcp_tool_call", "server": "files", "tool": "read",
+            "arguments": { "path": "README.md" }, "status": "completed",
+            "result": {
+                "content": [{ "type": "text", "text": "hello" }],
+                "structured_content": { "lines": 1 }
+            }
+        }));
+        assert_eq!(mcp.content[0]["content"]["text"], "hello");
+        assert_eq!(mcp.raw_output.unwrap()["structured_content"]["lines"], 1);
+
+        let future = tool_call(&json!({
+            "id": "future", "type": "image_generation", "status": "completed",
+            "result": { "path": "out.png" }
+        }));
+        assert_eq!(future.title, "image generation");
+        assert_eq!(future.raw_output.unwrap()["result"]["path"], "out.png");
+    }
 }
 
 fn compact_tool_detail(value: &str) -> String {
@@ -1162,31 +1206,105 @@ fn compact_tool_detail(value: &str) -> String {
     }
 }
 
+fn text_content(text: String) -> Vec<Value> {
+    if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "type": "content", "content": { "type": "text", "text": text } })]
+    }
+}
+
+fn display_file_change(kind: &str, path: &str) -> String {
+    let action = match kind {
+        "add" => "新增",
+        "delete" => "删除",
+        "update" => "更新",
+        _ => kind,
+    };
+    format!("{action} {path}")
+}
+
+fn mcp_result_text(result: &Value) -> Option<String> {
+    let content = result.get("content")?.as_array()?;
+    let text = content
+        .iter()
+        .filter_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
 fn tool_call(value: &Value) -> ToolCall {
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("tool");
     let status = value
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("completed");
-    let (title, tool_kind, locations, raw_input, output) = match kind {
-        "command_execution" => (
-            value
-                .get("command")
+    let (title, tool_kind, locations, raw_input, raw_output, content) = match kind {
+        "command_execution" => {
+            let output = value
+                .get("aggregated_output")
                 .and_then(Value::as_str)
-                .unwrap_or("Command")
-                .to_string(),
-            "execute",
-            Vec::new(),
-            value.get("command").cloned(),
-            value.get("aggregated_output").cloned(),
-        ),
-        "file_change" => (
-            "File changes".into(),
-            "edit",
-            Vec::new(),
-            value.get("changes").cloned(),
-            None,
-        ),
+                .unwrap_or_default();
+            (
+                value
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Command")
+                    .to_string(),
+                "execute",
+                Vec::new(),
+                Some(json!({ "command": value.get("command").cloned().unwrap_or(Value::Null) })),
+                Some(json!({
+                    "aggregatedOutput": value.get("aggregated_output").cloned().unwrap_or(Value::Null),
+                    "exitCode": value.get("exit_code").cloned().unwrap_or(Value::Null)
+                })),
+                text_content(output.to_string()),
+            )
+        }
+        "file_change" => {
+            let changes = value
+                .get("changes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let locations = changes
+                .iter()
+                .filter_map(|change| change.get("path").and_then(Value::as_str))
+                .map(|path| json!({ "path": path }))
+                .collect();
+            let details = changes
+                .iter()
+                .filter_map(|change| {
+                    Some(display_file_change(
+                        change.get("kind")?.as_str()?,
+                        change.get("path")?.as_str()?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let title = if changes.len() == 1 {
+                changes[0]
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(|path| format!("修改 {path}"))
+                    .unwrap_or_else(|| "修改文件".into())
+            } else {
+                format!("修改 {} 个文件", changes.len())
+            };
+            (
+                title,
+                "edit",
+                locations,
+                Some(json!({ "changes": changes })),
+                None,
+                text_content(details),
+            )
+        }
         "mcp_tool_call" => {
             let server = value.get("server").and_then(Value::as_str).unwrap_or("MCP");
             let tool = value.get("tool").and_then(Value::as_str).unwrap_or("tool");
@@ -1207,6 +1325,13 @@ fn tool_call(value: &Value) -> ToolCall {
             let path = arguments
                 .and_then(|args| args.get("path"))
                 .and_then(Value::as_str);
+            let result = value.get("result").or_else(|| value.get("error")).cloned();
+            let output = value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| value.get("result").and_then(mcp_result_text));
             (
                 format!(
                     "{server} / {tool}{}",
@@ -1226,30 +1351,59 @@ fn tool_call(value: &Value) -> ToolCall {
                 path.map(|path| vec![json!({ "path": path })])
                     .unwrap_or_default(),
                 arguments.cloned(),
-                value.get("result").or_else(|| value.get("error")).cloned(),
+                result,
+                output.map(text_content).unwrap_or_default(),
             )
         }
         "web_search" => (
-            "Web search".into(),
+            value
+                .get("query")
+                .and_then(Value::as_str)
+                .map(|query| format!("搜索 {query}"))
+                .unwrap_or_else(|| "网页搜索".into()),
             "search",
             Vec::new(),
-            value.get("query").cloned(),
+            Some(json!({ "query": value.get("query").cloned().unwrap_or(Value::Null) })),
             None,
-        ),
-        "todo_list" => (
-            "Todo list".into(),
-            "think",
             Vec::new(),
-            value.get("items").cloned(),
-            None,
         ),
-        _ => ("Tool".into(), "other", Vec::new(), None, None),
+        "todo_list" => {
+            let items = value
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let text = items
+                .iter()
+                .filter_map(|item| {
+                    let text = item.get("text")?.as_str()?;
+                    let mark = if item.get("completed").and_then(Value::as_bool) == Some(true) {
+                        "x"
+                    } else {
+                        " "
+                    };
+                    Some(format!("[{mark}] {text}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (
+                "Todo list".into(),
+                "think",
+                Vec::new(),
+                Some(json!({ "items": items })),
+                None,
+                text_content(text),
+            )
+        }
+        _ => (
+            kind.replace('_', " "),
+            "other",
+            Vec::new(),
+            None,
+            Some(value.clone()),
+            Vec::new(),
+        ),
     };
-    let output_text = output.as_ref().map(|v| {
-        v.as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| v.to_string())
-    });
     ToolCall {
         tool_call_id: value.get("id").and_then(Value::as_str).unwrap_or("").into(),
         title,
@@ -1260,13 +1414,9 @@ fn tool_call(value: &Value) -> ToolCall {
             _ => "completed",
         }
         .into(),
-        content: output_text
-            .map(|text| {
-                vec![json!({ "type": "content", "content": { "type": "text", "text": text } })]
-            })
-            .unwrap_or_default(),
+        content,
         locations,
         raw_input,
-        raw_output: output,
+        raw_output,
     }
 }

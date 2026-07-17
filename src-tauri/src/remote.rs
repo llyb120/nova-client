@@ -10,6 +10,7 @@
 use crate::relay::{gzip_json, resolve_relay_server};
 use crate::threads::{AgentKind, Item, Thread};
 use crate::{is_running, AppState, SCRATCH_MARK};
+use base64::Engine;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
@@ -25,6 +26,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
 const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
 /// 首次连接只预热最新会话；其余历史按点击请求，兼顾首屏速度与流量。
 const PREFETCH_RECENT: usize = 1;
+const REMOTE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
 struct RemoteConfig {
@@ -1099,8 +1101,58 @@ async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult 
             },
             Err(e) => fail(e),
         },
+        "remote_file" => match remote_file(app, &cmd.thread_id, &cmd.cwd, &cmd.path) {
+            Ok(data) => CommandResult {
+                id: cmd.id,
+                ok: true,
+                error: String::new(),
+                thread_id: String::new(),
+                data: Some(data),
+            },
+            Err(e) => fail(e),
+        },
         _ => fail("不支持的远程操作".into()),
     }
+}
+
+fn remote_file(app: &AppHandle, thread_id: &str, cwd: &str, path: &str) -> Result<Value, String> {
+    let thread_cwd = {
+        let state = app.state::<AppState>();
+        let store = state.store.lock().unwrap();
+        let thread = store.get(thread_id).ok_or("会话不存在")?;
+        if !eligible(thread) || thread.cwd != cwd {
+            return Err("文件不属于该会话".into());
+        }
+        thread.cwd.clone()
+    };
+    let root = std::fs::canonicalize(&thread_cwd).map_err(|_| "会话工作目录不存在")?;
+    let requested = std::path::Path::new(path.trim());
+    let abs = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let abs = std::fs::canonicalize(abs).map_err(|_| "文件不存在")?;
+    if !abs.starts_with(&root) {
+        return Err("只能下载会话工作目录内的文件".into());
+    }
+    let meta = abs.metadata().map_err(|e| format!("读取文件失败：{e}"))?;
+    if !meta.is_file() {
+        return Err("目标不是文件".into());
+    }
+    if meta.len() > REMOTE_FILE_MAX_BYTES {
+        return Err("文件超过 50 MiB，无法通过中转下载".into());
+    }
+    let bytes = std::fs::read(&abs).map_err(|e| format!("读取文件失败：{e}"))?;
+    let name = abs
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download")
+        .to_string();
+    Ok(json!({
+        "name": name,
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+    }))
 }
 
 fn ensure_remote_git_cwd(app: &AppHandle, cwd: &str) -> Result<String, String> {
