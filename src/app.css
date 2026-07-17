@@ -5338,7 +5338,6 @@ button.head-badge:hover {
   background: var(--bg-input);
 }
 .clue-comment.reply {
-  margin-left: 18px;
   border-left-color: color-mix(in srgb, var(--accent) 48%, var(--border));
 }
 .clue-comment-head {

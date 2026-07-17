@@ -48,10 +48,14 @@ export function MentionPicker(props: {
   const add = (token: string) => {
     if (props.disabled) return;
     const tokens = [...new Set(props.selectedTokens)];
+    const keepOpen = candidates().length > 1;
     if (!tokens.includes(token)) props.onChange([...tokens, token]);
     setQuery("");
-    setOpened(true);
-    queueMicrotask(() => inputRef?.focus());
+    setOpened(keepOpen);
+    queueMicrotask(() => {
+      inputRef?.focus();
+      if (keepOpen) positionMenu();
+    });
   };
 
   const remove = (token: string) => {
@@ -62,7 +66,7 @@ export function MentionPicker(props: {
   const positionMenu = () => {
     if (!rootRef) return;
     const rect = rootRef.getBoundingClientRect();
-    const menuHeight = Math.min(190, window.innerHeight - 16);
+    const menuHeight = Math.min(candidates().length * 35 + 10, 190, window.innerHeight - 16);
     const top = window.innerHeight - rect.bottom >= menuHeight + 5
       ? rect.bottom + 5
       : Math.max(8, rect.top - menuHeight - 5);
@@ -134,30 +138,28 @@ export function MentionPicker(props: {
         }}
       />
 
-      <Show when={opened() && !props.disabled}>
+      <Show when={opened() && !props.disabled && candidates().length > 0}>
         <Portal mount={document.body}>
         <div
           class="mention-menu portal"
           role="listbox"
           style={{ left: `${menuRect().left}px`, top: `${menuRect().top}px`, width: `${menuRect().width}px` }}
         >
-          <Show when={candidates().length > 0} fallback={<div class="mention-empty">暂无匹配成员</div>}>
-            <For each={candidates()}>
-              {(peer) => (
-                <button
-                  type="button"
-                  class="mention-option"
-                  role="option"
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => add(peer.token)}
-                >
-                  <span class={`peer-dot ${peer.online ? "on" : "off"}`} />
-                  <span class="mention-option-name">@{peer.name}</span>
-                  <span class="mention-option-status">{peer.online ? "在线" : "离线"}</span>
-                </button>
-              )}
-            </For>
-          </Show>
+          <For each={candidates()}>
+            {(peer) => (
+              <button
+                type="button"
+                class="mention-option"
+                role="option"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => add(peer.token)}
+              >
+                <span class={`peer-dot ${peer.online ? "on" : "off"}`} />
+                <span class="mention-option-name">@{peer.name}</span>
+                <span class="mention-option-status">{peer.online ? "在线" : "离线"}</span>
+              </button>
+            )}
+          </For>
         </div>
         </Portal>
       </Show>
