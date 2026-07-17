@@ -526,16 +526,6 @@ export function Sidebar(props: {
               <span class="badge-count">{state.inbox.length}</span>
             </button>
           </Show>
-          <Show when={state.unreadClueMentions.length > 0}>
-            <button
-              class="head-badge alert"
-              title={`收到 ${state.unreadClueMentions.length} 个线索提醒`}
-              onClick={openClues}
-            >
-              <IconBell size={14} />
-              <span class="badge-count">{state.unreadClueMentions.length}</span>
-            </button>
-          </Show>
           <Show when={state.update?.staged || state.updateStaging}>
             <button
               class={`head-badge update ${state.updateStaging ? "busy" : "ready"}`}
