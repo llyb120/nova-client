@@ -1921,19 +1921,23 @@ fn open_in_editor(
         return Err(format!("文件不存在：{abs}"));
     }
     let scratch = cwd.contains(SCRATCH_MARK);
+    let in_project = std::fs::canonicalize(&abs)
+        .ok()
+        .zip(std::fs::canonicalize(&cwd).ok())
+        .is_some_and(|(file, project)| file.starts_with(project));
     let loc = match line {
         Some(l) => format!("{abs}:{l}"),
         None => abs.clone(),
     };
     let mut args: Vec<String> = Vec::new();
     if editor.to_lowercase().contains("zed") {
-        if !scratch {
+        if !scratch && in_project {
             args.push(cwd.clone());
         }
         args.push(loc);
     } else {
         // vscode / cursor / windsurf 同源，支持 --goto file:line
-        if !scratch {
+        if !scratch && in_project {
             args.push(cwd.clone());
         }
         args.push("--goto".into());
@@ -1955,6 +1959,48 @@ fn open_in_editor(
             .spawn()
             .map_err(|e| format!("启动编辑器失败：{e}"))?;
     }
+    Ok(())
+}
+
+/// 用系统默认程序打开线程工作目录中的文件，图片通常由图片查看器或浏览器处理。
+#[tauri::command]
+fn open_file_default(
+    state: State<'_, AppState>,
+    thread_id: String,
+    path: String,
+) -> Result<(), String> {
+    let cwd = {
+        let store = state.store.lock().unwrap();
+        store.get(&thread_id).ok_or("线程不存在")?.cwd.clone()
+    };
+    let path = std::path::PathBuf::from(path);
+    let abs = if path.is_absolute() {
+        path
+    } else {
+        std::path::Path::new(&cwd).join(path)
+    };
+    if !abs.is_file() {
+        return Err(format!("文件不存在：{}", abs.to_string_lossy()));
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("rundll32.exe");
+        cmd.arg("url.dll,FileProtocolHandler").arg(&abs);
+        cmd.creation_flags(0x0800_0000);
+        cmd.spawn().map_err(|e| format!("打开文件失败：{e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg(&abs)
+        .spawn()
+        .map_err(|e| format!("打开文件失败：{e}"))?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open")
+        .arg(&abs)
+        .spawn()
+        .map_err(|e| format!("打开文件失败：{e}"))?;
     Ok(())
 }
 
@@ -4639,6 +4685,7 @@ pub fn run() {
             delete_threads,
             delete_project_threads,
             open_in_editor,
+            open_file_default,
             revert_file_changes,
             open_in_explorer,
             open_in_terminal,

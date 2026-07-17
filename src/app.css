@@ -1124,6 +1124,33 @@ button {
 .markdown a {
   color: var(--blue);
 }
+.md-file-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--bg-panel);
+  color: var(--blue);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: inherit;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+.md-file-ref:hover {
+  background: var(--bg-hover);
+  text-decoration: underline;
+}
+.md-file-ref svg {
+  flex-shrink: 0;
+}
+.md-file-ref span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .markdown blockquote {
   border-left: 3px solid var(--border-light);
   padding-left: 12px;
