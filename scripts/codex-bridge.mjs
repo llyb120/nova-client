@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
 import { Codex } from "@openai/codex-sdk";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -106,6 +107,61 @@ async function generateTitle(codex, request) {
   return (await thread.run(request.prompt)).finalResponse;
 }
 
+async function forkThread(request) {
+  const child = spawn(codexPathOverride() ?? "codex", ["app-server"], {
+    cwd: request.cwd,
+    windowsHide: true,
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const pending = new Map();
+  let nextId = 1;
+  const exited = new Promise((_, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`Codex app-server exited with code ${code}`)));
+  });
+  void (async () => {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      const message = JSON.parse(line);
+      if (message.id == null) continue;
+      const callback = pending.get(message.id);
+      if (!callback) continue;
+      pending.delete(message.id);
+      if (message.error) callback.reject(new Error(message.error.message ?? JSON.stringify(message.error)));
+      else callback.resolve(message.result);
+    }
+  })();
+  function rpc(method, params) {
+    const id = nextId++;
+    const response = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    return Promise.race([response, exited]);
+  }
+  try {
+    await rpc("initialize", {
+      clientInfo: { name: "nova-sdk-bridge", title: "Nova", version: "0.1.0" },
+      capabilities: { experimentalApi: true },
+    });
+    const read = await rpc("thread/read", {
+      threadId: request.sessionId,
+      includeTurns: true,
+    });
+    const turns = read.thread?.turns ?? [];
+    const lastTurn = turns[request.retainedTurns - 1];
+    if (!lastTurn) throw new Error(`Codex session only has ${turns.length} turns`);
+    const fork = await rpc("thread/fork", {
+      threadId: request.sessionId,
+      lastTurnId: lastTurn.id,
+      cwd: request.cwd,
+    });
+    return fork.thread.id;
+  } finally {
+    lines.close();
+    child.kill();
+  }
+}
+
 async function main() {
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   try {
@@ -113,6 +169,7 @@ async function main() {
     const codex = new Codex({ codexPathOverride: codexPathOverride() });
     if (request.action === "prompt") await runPrompt(codex, lines, request);
     else if (request.action === "title") send({ ok: true, data: await generateTitle(codex, request) });
+    else if (request.action === "fork") send({ ok: true, data: await forkThread(request) });
     else throw new Error(`Unknown action: ${request.action}`);
   } catch (error) {
     send({ ok: false, error: error instanceof Error ? error.message : String(error) });

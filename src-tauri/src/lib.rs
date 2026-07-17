@@ -2391,6 +2391,8 @@ fn set_thread_agent(
         switched_item = if changed {
             // 旧 remote session 属于旧 agent，作废；下次发消息时新 agent 重新建会话
             thread.acp_session_id = None;
+            thread.pending_native_restore = None;
+            thread.provider_checkpoints.clear();
             // 标记上下文接力：仅当已有历史时才有意义（无历史时 take 会返回 None）
             thread.handoff_from = if thread.items.is_empty() {
                 None
@@ -2630,11 +2632,10 @@ fn send_prompt(
     Ok(())
 }
 
-/// 从指定用户消息处截断会话（该消息及其之后的内容全部删除），
-/// 用于「编辑并从此处重新开始」。旧 ACP session 上下文已不一致，一并丢弃，
-/// 之后由前端走正常发送流程重新发起。
+/// 从指定用户消息处截断会话（该消息及其之后的内容全部删除）。支持历史分叉的后端
+/// 优先从远端对应位置 fork；失败或不支持时，下一条 prompt 才走文本上下文接力。
 #[tauri::command]
-fn truncate_thread(
+async fn truncate_thread(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
@@ -2643,7 +2644,7 @@ fn truncate_thread(
     if running_by_id(&state, &thread_id) {
         return Err("会话正在运行，请先停止".into());
     }
-    {
+    let (agent_kind, cwd, old_session_id, retained_turns, checkpoint, is_quota) = {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
         let idx = thread
@@ -2651,11 +2652,29 @@ fn truncate_thread(
             .iter()
             .position(|i| i.id() == item_id && matches!(i, Item::User { .. }))
             .ok_or("该消息不存在或不是用户消息")?;
+        let checkpoint = thread.checkpoint_before(item_id);
+        let old_session_id = thread.acp_session_id.clone();
         thread.items.truncate(idx);
         thread.plan = None;
         thread.acp_session_id = None;
-        // 远端会话已作废；若截断点前仍有历史，下一条 prompt 需在新会话中接续它。
+        thread.pending_native_restore = None;
+        thread
+            .provider_checkpoints
+            .retain(|checkpoint| checkpoint.user_item_id < item_id);
+        // 在原生 fork 确认成功前保留接力上下文，作为唯一一次兜底。
         thread.handoff_from = (!thread.items.is_empty()).then(|| thread.agent_kind.clone());
+        if matches!(
+            thread.agent_kind,
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::ClaudeCode
+        ) {
+            if let Some(checkpoint) = checkpoint.as_ref() {
+                thread.acp_session_id = Some(checkpoint.session_id.clone());
+                thread.pending_native_restore = Some(threads::PendingNativeRestore {
+                    session_id: checkpoint.session_id.clone(),
+                    position: checkpoint.position.clone(),
+                });
+            }
+        }
         // 截断到开头时重置标题，让编辑后的首条消息重新生成标题
         if idx == 0 {
             thread.title = thread
@@ -2671,8 +2690,22 @@ fn truncate_thread(
                 .unwrap_or_else(|| "新会话".into());
         }
         thread.updated_at = now_ms();
+        let retained_turns = thread
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::User { .. }))
+            .count();
+        let result = (
+            thread.agent_kind.clone(),
+            thread.cwd.clone(),
+            old_session_id,
+            retained_turns,
+            checkpoint,
+            thread.is_quota_borrowed(),
+        );
         store.save();
-    }
+        result
+    };
     state.acp.forget_session_of_thread(&thread_id);
     state.codex.forget_session_of_thread(&thread_id);
     state.codexplus.forget_session_of_thread(&thread_id);
@@ -2686,6 +2719,63 @@ fn truncate_thread(
             BorrowedManager::Sdk(manager) => manager.forget_session_of_thread(&thread_id),
             BorrowedManager::OpenCode(manager) => manager.forget_session_of_thread(&thread_id),
         }
+    }
+
+    let forked_session = match agent_kind {
+        AgentKind::Codex | AgentKind::CodexPlus if retained_turns > 0 => {
+            if let Some(session_id) = old_session_id.as_deref() {
+                let manager = match state.borrowed_runtime(&thread_id) {
+                    Some(runtime) => match runtime.manager {
+                        BorrowedManager::Sdk(manager) => Some(manager),
+                        _ => None,
+                    },
+                    None if !is_quota => Some(state.codexplus.clone()),
+                    None => None,
+                };
+                if let Some(manager) = manager {
+                    manager
+                        .fork_session(&cwd, session_id, retained_turns)
+                        .await
+                        .ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            if let Some(checkpoint) = checkpoint.as_ref() {
+                let manager = match state.borrowed_runtime(&thread_id) {
+                    Some(runtime) => match runtime.manager {
+                        BorrowedManager::OpenCode(manager) => Some(manager),
+                        _ => None,
+                    },
+                    None if !is_quota => Some(state.opencodeplus.clone()),
+                    None => None,
+                };
+                if let Some(manager) = manager {
+                    manager
+                        .fork_session(&cwd, &checkpoint.session_id, &checkpoint.position)
+                        .await
+                        .ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(session_id) = forked_session {
+        let mut store = state.store.lock().unwrap();
+        if let Some(thread) = store.get_mut(&thread_id) {
+            thread.acp_session_id = Some(session_id);
+            thread.handoff_from = None;
+            thread.pending_native_restore = None;
+        }
+        store.save();
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
     Ok(())

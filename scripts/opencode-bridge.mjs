@@ -58,6 +58,14 @@ async function oneShot(client, request) {
         .map((part) => part.text)
         .join("");
     }
+    case "fork": {
+      const result = await client.session.fork({
+        sessionID: request.sessionId,
+        messageID: request.position,
+      });
+      if (result.error) throw new Error(JSON.stringify(result.error));
+      return result.data.id;
+    }
     default:
       throw new Error(`Unknown action: ${request.action}`);
   }
@@ -143,6 +151,8 @@ async function runPrompt(client, lines, request) {
       break;
     }
     if (event.type === "session.idle") {
+      const position = [...assistantMessages].at(-1);
+      if (position) send({ type: "checkpoint", sessionId, position });
       send({ type: "done" });
       break;
     }

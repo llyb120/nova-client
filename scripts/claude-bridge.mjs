@@ -135,6 +135,8 @@ async function main() {
   const pending = new Map();
   const stream = { messageId: "message", blocks: new Map() };
   const streamedBlocks = new Set();
+  let sessionId = request.sessionId;
+  let checkpoint;
   void (async () => {
     for await (const line of lines) {
       const command = JSON.parse(line);
@@ -152,6 +154,8 @@ async function main() {
     options: {
       cwd: request.cwd,
       resume: request.sessionId || undefined,
+      resumeSessionAt: request.restoreAt || undefined,
+      forkSession: Boolean(request.restoreAt),
       model: selection.model,
       effort: selection.effort,
       includePartialMessages: true,
@@ -164,14 +168,21 @@ async function main() {
       }),
     },
   })) {
-    if (message.type === "system" && message.subtype === "init") send({ type: "ready", sessionId: message.session_id });
+    if (message.type === "system" && message.subtype === "init") {
+      sessionId = message.session_id;
+      send({ type: "ready", sessionId });
+    }
     if (message.type === "stream_event") {
       const item = streamEventItem(message, stream, streamedBlocks);
       if (item) send({ type: "item", item });
     }
-    if (message.type === "assistant") for (const item of assistantItems(message, streamedBlocks)) send({ type: "item", item });
+    if (message.type === "assistant") {
+      checkpoint = message.uuid;
+      for (const item of assistantItems(message, streamedBlocks)) send({ type: "item", item });
+    }
     if (message.type === "result") {
       if (message.is_error) throw new Error(message.errors?.join("\n") || "Claude turn failed");
+      if (sessionId && checkpoint) send({ type: "checkpoint", sessionId, position: checkpoint });
       send({ type: "done", usage: message.usage });
     }
   }

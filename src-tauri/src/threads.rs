@@ -308,6 +308,22 @@ pub struct Worktree {
     pub branch: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCheckpoint {
+    pub user_item_id: u64,
+    pub agent_kind: AgentKind,
+    pub session_id: String,
+    pub position: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingNativeRestore {
+    pub session_id: String,
+    pub position: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
@@ -331,6 +347,12 @@ pub struct Thread {
     /// 注入新 agent 的输入，随后清除。None = 无待接力的上下文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_from: Option<AgentKind>,
+    /// 支持历史节点分叉的 SDK 后端在每轮完成后记录的远端位置。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_checkpoints: Vec<ProviderCheckpoint>,
+    /// Claude / CodeBuddy 在下一条 prompt 启动时执行的原生分叉位置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_native_restore: Option<PendingNativeRestore>,
     /// 临时会话：程序关闭时自动删除，不跨重启持久化
     #[serde(default)]
     pub ephemeral: bool,
@@ -403,6 +425,8 @@ impl Thread {
             mode,
             reasoning_effort,
             handoff_from: None,
+            provider_checkpoints: Vec::new(),
+            pending_native_restore: None,
             ephemeral,
             starred: false,
             roaming_role: None,
@@ -461,6 +485,33 @@ impl Thread {
         self.items.push(item.clone());
         self.updated_at = now_ms();
         item
+    }
+
+    pub fn record_provider_checkpoint(
+        &mut self,
+        user_item_id: u64,
+        session_id: String,
+        position: String,
+    ) {
+        self.provider_checkpoints.retain(|checkpoint| {
+            checkpoint.user_item_id != user_item_id || checkpoint.agent_kind != self.agent_kind
+        });
+        self.provider_checkpoints.push(ProviderCheckpoint {
+            user_item_id,
+            agent_kind: self.agent_kind.clone(),
+            session_id,
+            position,
+        });
+    }
+
+    pub fn checkpoint_before(&self, item_id: u64) -> Option<ProviderCheckpoint> {
+        self.provider_checkpoints
+            .iter()
+            .filter(|checkpoint| {
+                checkpoint.user_item_id < item_id && checkpoint.agent_kind == self.agent_kind
+            })
+            .max_by_key(|checkpoint| checkpoint.user_item_id)
+            .cloned()
     }
 
     /// guest 漫游会话专用：本地乐观落用户消息，id 取高位区间避免与 host 条目冲突
@@ -1180,16 +1231,63 @@ mod tests {
     }
 
     #[test]
-    fn legacy_thread_without_starred_defaults_to_false() {
+    fn checkpoint_before_uses_latest_position_from_current_backend() {
+        let mut thread = Thread::new(
+            "D:/project".into(),
+            AgentKind::OpenCode,
+            None,
+            None,
+            None,
+            false,
+        );
+        thread.record_provider_checkpoint(1, "open-session".into(), "message-1".into());
+        thread.record_provider_checkpoint(5, "open-session".into(), "message-5".into());
+        thread.agent_kind = AgentKind::ClaudeCode;
+        thread.record_provider_checkpoint(3, "claude-session".into(), "message-3".into());
+
+        assert_eq!(
+            thread.checkpoint_before(5),
+            Some(ProviderCheckpoint {
+                user_item_id: 3,
+                agent_kind: AgentKind::ClaudeCode,
+                session_id: "claude-session".into(),
+                position: "message-3".into(),
+            })
+        );
+        assert!(thread.checkpoint_before(1).is_none());
+    }
+
+    #[test]
+    fn recording_checkpoint_replaces_same_turn_position() {
+        let mut thread = Thread::new(
+            "D:/project".into(),
+            AgentKind::CodeBuddy,
+            None,
+            None,
+            None,
+            false,
+        );
+        thread.record_provider_checkpoint(2, "old-session".into(), "old-message".into());
+        thread.record_provider_checkpoint(2, "new-session".into(), "new-message".into());
+
+        assert_eq!(thread.provider_checkpoints.len(), 1);
+        assert_eq!(thread.provider_checkpoints[0].session_id, "new-session");
+        assert_eq!(thread.provider_checkpoints[0].position, "new-message");
+    }
+
+    #[test]
+    fn legacy_thread_defaults_new_persistence_fields() {
         let thread = Thread::new(String::new(), AgentKind::Devin, None, None, None, false);
         let mut value = serde_json::to_value(thread).expect("线程应可序列化");
-        value
-            .as_object_mut()
-            .expect("线程应序列化为对象")
-            .remove("starred");
+        let object = value.as_object_mut().expect("线程应序列化为对象");
+        object.remove("starred");
+        object.remove("providerCheckpoints");
+        object.remove("pendingNativeRestore");
 
         let restored: Thread = serde_json::from_value(value).expect("旧线程应可反序列化");
         assert!(!restored.starred);
+        assert!(restored.provider_checkpoints.is_empty());
+        assert!(restored.pending_native_restore.is_none());
     }
 }
 

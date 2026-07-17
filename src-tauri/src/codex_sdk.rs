@@ -134,14 +134,29 @@ impl CodexSdkManager {
         if self.is_running(&thread_id) {
             return;
         }
-        let (cwd, mut model, mode, mut reasoning_effort, context, session_id) = {
+        let (
+            cwd,
+            mut model,
+            mode,
+            mut reasoning_effort,
+            context,
+            session_id,
+            native_restore,
+            user_item_id,
+        ) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
                 return;
             };
             let context = thread.take_prompt_context(self.backend.label());
+            let native_restore = thread.pending_native_restore.take();
+            let session_id = native_restore
+                .as_ref()
+                .map(|restore| restore.session_id.clone())
+                .or_else(|| thread.acp_session_id.clone());
             let item = thread.push_user(text.clone(), images.clone());
+            let user_item_id = item.id();
             let _ = self.emit_update(&thread_id, &item);
             let values = (
                 thread.cwd.clone(),
@@ -149,7 +164,9 @@ impl CodexSdkManager {
                 thread.mode.clone(),
                 thread.reasoning_effort.clone(),
                 context,
-                thread.acp_session_id.clone(),
+                session_id,
+                native_restore,
+                user_item_id,
             );
             store.save();
             values
@@ -180,32 +197,52 @@ impl CodexSdkManager {
         self.set_running(&thread_id, true, None);
 
         let mut parts = Vec::new();
-        if let Some(context) = context {
-            parts.push(json!({ "type": "text", "text": context }));
+        if native_restore.is_none() {
+            if let Some(context) = context.as_ref() {
+                parts.push(json!({ "type": "text", "text": context }));
+            }
         }
         if !text.is_empty() {
             parts.push(json!({ "type": "text", "text": text }));
         }
-        for image in images {
-            if let Some(data) = image.data {
+        for image in &images {
+            if let Some(data) = &image.data {
                 parts.push(json!({
                     "type": "image_data", "name": image.name, "mime": image.mime_type, "data": data
                 }));
-            } else if let Some(uri) = image.uri {
-                let path = uri.strip_prefix("file://").unwrap_or(&uri);
+            } else if let Some(uri) = &image.uri {
+                let path = uri.strip_prefix("file://").unwrap_or(uri);
                 parts.push(json!({ "type": "local_image", "path": path }));
             }
         }
-        let request = json!({
+        let mut request = json!({
             "action": "prompt",
             "cwd": cwd,
             "sessionId": session_id,
+            "restoreAt": native_restore.as_ref().map(|restore| &restore.position),
             "model": model,
             "mode": mode,
             "reasoningEffort": reasoning_effort,
             "parts": parts
         });
-        let outcome = self.run_prompt_bridge(&thread_id, &cwd, request).await;
+        let mut outcome = self
+            .run_prompt_bridge(&thread_id, &cwd, request.clone(), user_item_id)
+            .await;
+        if outcome.is_err() && native_restore.is_some() {
+            self.forget_session_of_thread(&thread_id);
+            self.clear_session_id(&thread_id);
+            let mut fallback_parts = Vec::new();
+            if let Some(context) = context {
+                fallback_parts.push(json!({ "type": "text", "text": context }));
+            }
+            fallback_parts.extend(request["parts"].as_array().cloned().unwrap_or_default());
+            request["sessionId"] = Value::Null;
+            request["restoreAt"] = Value::Null;
+            request["parts"] = Value::Array(fallback_parts);
+            outcome = self
+                .run_prompt_bridge(&thread_id, &cwd, request, user_item_id)
+                .await;
+        }
         if !self.is_running(&thread_id) {
             return;
         }
@@ -252,6 +289,29 @@ impl CodexSdkManager {
         if let Some(mut bridge) = self.idle_children.lock().unwrap().remove(thread_id) {
             kill_child(&mut bridge.child);
         }
+    }
+
+    pub async fn fork_session(
+        &self,
+        cwd: &str,
+        session_id: &str,
+        retained_turns: usize,
+    ) -> Result<String, String> {
+        let value = self
+            .run_bridge(
+                cwd,
+                json!({
+                    "action": "fork",
+                    "cwd": cwd,
+                    "sessionId": session_id,
+                    "retainedTurns": retained_turns,
+                }),
+            )
+            .await?;
+        value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "Codex fork 未返回新会话 ID".into())
     }
 
     pub fn shutdown(&self) {
@@ -399,6 +459,7 @@ impl CodexSdkManager {
         thread_id: &str,
         cwd: &str,
         request: Value,
+        user_item_id: u64,
     ) -> Result<(), String> {
         let mut bridge = match self.backend {
             SdkBackend::Cursor => self.idle_children.lock().unwrap().remove(thread_id),
@@ -414,7 +475,9 @@ impl CodexSdkManager {
                 pid: bridge.child.id(),
             },
         );
-        let result = self.read_events(thread_id, &mut bridge.stdout).await;
+        let result = self
+            .read_events(thread_id, user_item_id, &mut bridge.stdout)
+            .await;
         self.running_children.lock().unwrap().remove(thread_id);
         let reusable = self.backend == SdkBackend::Cursor
             && result.is_ok()
@@ -450,6 +513,7 @@ impl CodexSdkManager {
     async fn read_events(
         &self,
         thread_id: &str,
+        user_item_id: u64,
         stdout: &mut BufReader<tokio::process::ChildStdout>,
     ) -> Result<(), String> {
         let mut lines = stdout.lines();
@@ -471,6 +535,7 @@ impl CodexSdkManager {
                     }
                 }
                 Some("item") => self.apply_item(thread_id, &event["item"], &mut item_ids),
+                Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
                 Some("permission") => self.emit_permission(thread_id, &event["permission"]),
                 Some("done") => {
                     let usage = event.get("usage").cloned();
@@ -556,6 +621,34 @@ impl CodexSdkManager {
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
             thread.acp_session_id = Some(session_id.to_string());
+        }
+        store.save();
+    }
+
+    fn clear_session_id(&self, thread_id: &str) {
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        if let Some(thread) = store.get_mut(thread_id) {
+            thread.acp_session_id = None;
+        }
+        store.save();
+    }
+
+    fn save_checkpoint(&self, thread_id: &str, user_item_id: u64, event: &Value) {
+        let Some(session_id) = event.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(position) = event.get("position").and_then(Value::as_str) else {
+            return;
+        };
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        if let Some(thread) = store.get_mut(thread_id) {
+            thread.record_provider_checkpoint(
+                user_item_id,
+                session_id.to_string(),
+                position.to_string(),
+            );
         }
         store.save();
     }

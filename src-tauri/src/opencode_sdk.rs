@@ -163,7 +163,7 @@ impl OpenCodeSdkManager {
         if self.is_running(&thread_id) {
             return;
         }
-        let (cwd, model, mode, reasoning_effort, context, session_id) = {
+        let (cwd, model, mode, reasoning_effort, context, session_id, user_item_id) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
@@ -171,6 +171,7 @@ impl OpenCodeSdkManager {
             };
             let context = thread.take_prompt_context("OpenCode+");
             let item = thread.push_user(text.clone(), images.clone());
+            let user_item_id = item.id();
             let _ = self.emit_update(&thread_id, &item);
             let values = (
                 thread.cwd.clone(),
@@ -179,6 +180,7 @@ impl OpenCodeSdkManager {
                 thread.reasoning_effort.clone(),
                 context,
                 thread.acp_session_id.clone(),
+                user_item_id,
             );
             store.save();
             values
@@ -219,7 +221,9 @@ impl OpenCodeSdkManager {
             "parts": parts
         });
         let request = with_command(request, &text);
-        let outcome = self.run_prompt_bridge(&thread_id, &cwd, request).await;
+        let outcome = self
+            .run_prompt_bridge(&thread_id, &cwd, request, user_item_id)
+            .await;
         if !self.is_running(&thread_id) {
             return;
         }
@@ -248,6 +252,28 @@ impl OpenCodeSdkManager {
             kill_child(&mut bridge.child);
         }
         self.finish_turn(thread_id, "cancelled");
+    }
+
+    pub async fn fork_session(
+        &self,
+        cwd: &str,
+        session_id: &str,
+        position: &str,
+    ) -> Result<String, String> {
+        let value = self
+            .run_bridge(
+                cwd,
+                json!({
+                    "action": "fork",
+                    "sessionId": session_id,
+                    "position": position,
+                }),
+            )
+            .await?;
+        value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "OpenCode fork 未返回新会话 ID".into())
     }
 
     pub fn forget_session_of_thread(&self, thread_id: &str) {
@@ -310,6 +336,7 @@ impl OpenCodeSdkManager {
         thread_id: &str,
         cwd: &str,
         request: Value,
+        user_item_id: u64,
     ) -> Result<(), String> {
         let mut child = self.spawn_bridge(cwd)?;
         let stdin = child.stdin.take().ok_or("OpenCode+ bridge stdin 不可用")?;
@@ -323,7 +350,9 @@ impl OpenCodeSdkManager {
             .lock()
             .unwrap()
             .insert(thread_id.to_string(), RunningBridge { child, stdin });
-        let result = self.read_prompt_events(thread_id, stdout).await;
+        let result = self
+            .read_prompt_events(thread_id, user_item_id, stdout)
+            .await;
         if let Some(mut bridge) = self.running_children.lock().unwrap().remove(thread_id) {
             if result.is_err() {
                 kill_child(&mut bridge.child);
@@ -345,6 +374,7 @@ impl OpenCodeSdkManager {
     async fn read_prompt_events(
         &self,
         thread_id: &str,
+        user_item_id: u64,
         stdout: tokio::process::ChildStdout,
     ) -> Result<(), String> {
         let mut lines = BufReader::new(stdout).lines();
@@ -365,6 +395,7 @@ impl OpenCodeSdkManager {
                     }
                 }
                 Some("part") => self.apply_part(thread_id, &event["part"], &mut part_items),
+                Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
                 Some("permission") => self.handle_permission(thread_id, &event["permission"]),
                 Some("error") => {
                     return Err(event["error"]
@@ -426,6 +457,25 @@ impl OpenCodeSdkManager {
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
             thread.acp_session_id = Some(session_id.to_string());
+        }
+        store.save();
+    }
+
+    fn save_checkpoint(&self, thread_id: &str, user_item_id: u64, event: &Value) {
+        let Some(session_id) = event.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(position) = event.get("position").and_then(Value::as_str) else {
+            return;
+        };
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        if let Some(thread) = store.get_mut(thread_id) {
+            thread.record_provider_checkpoint(
+                user_item_id,
+                session_id.to_string(),
+                position.to_string(),
+            );
         }
         store.save();
     }

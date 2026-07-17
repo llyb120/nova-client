@@ -68,6 +68,8 @@ async function runPrompt(lines, request) {
   const pending = new Map();
   const stream = { messageId: "message", blocks: new Map() };
   const streamedBlocks = new Set();
+  let sessionId = request.sessionId;
+  let checkpoint;
   let activeQuery;
   const input = (async () => {
     for await (const line of lines) {
@@ -90,6 +92,8 @@ async function runPrompt(lines, request) {
     options: {
       cwd: request.cwd,
       resume: request.sessionId || undefined,
+      resumeSessionAt: request.restoreAt || undefined,
+      forkSession: Boolean(request.restoreAt),
       model: request.model || undefined,
       effort: request.reasoningEffort || undefined,
       includePartialMessages: true,
@@ -102,12 +106,19 @@ async function runPrompt(lines, request) {
     },
   });
   for await (const message of activeQuery) {
-    if (message.type === "system" && message.subtype === "init") send({ type: "ready", sessionId: message.session_id });
+    if (message.type === "system" && message.subtype === "init") {
+      sessionId = message.session_id;
+      send({ type: "ready", sessionId });
+    }
     else if (message.type === "stream_event") emitStreamEvent(message, stream, streamedBlocks);
-    else if (message.type === "assistant") emitContent(message, streamedBlocks);
+    else if (message.type === "assistant") {
+      checkpoint = message.uuid;
+      emitContent(message, streamedBlocks);
+    }
     else if (message.type === "error") throw new Error(message.error);
     else if (message.type === "result") {
       if (message.is_error) throw new Error(message.errors?.join("\n") || "CodeBuddy turn failed");
+      if (sessionId && checkpoint) send({ type: "checkpoint", sessionId, position: checkpoint });
       send({ type: "done", usage: message.usage });
     }
   }
