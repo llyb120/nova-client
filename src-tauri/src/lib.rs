@@ -4209,19 +4209,41 @@ fn register_roaming_forwarders(app: &tauri::AppHandle, relay: Arc<RelayManager>)
 /// com.nova.desktop：更名 Nova 后的目录；com.fuckdevin.desktop：更早的品牌目录。
 const LEGACY_IDENTIFIERS: &[&str] = &["com.nova.desktop", "com.fuckdevin.desktop"];
 
-/// 全应用统一数据目录：**用户主目录下的 `.nova`**。
+pub const fn nova_data_dir_name() -> &'static str {
+    data_dir_name(cfg!(debug_assertions))
+}
+
+const fn data_dir_name(debug: bool) -> &'static str {
+    if debug {
+        ".novadev"
+    } else {
+        ".nova"
+    }
+}
+
+#[cfg(test)]
+mod data_dir_tests {
+    #[test]
+    fn build_profiles_use_separate_data_directories() {
+        assert_eq!(super::data_dir_name(true), ".novadev");
+        assert_eq!(super::data_dir_name(false), ".nova");
+    }
+}
+
+/// 全应用统一数据目录：开发构建使用 `~/.novadev`，正式构建使用 `~/.nova`。
 /// 相比 Tauri 默认的 `%APPDATA%/<identifier>`，它跨项目、跨安装位置、跨版本都稳定，
 /// 便于用户直接找到；worktree、CLI 工具、会话、记忆等都放在这里。
 pub fn nova_data_dir(app: &tauri::AppHandle) -> PathBuf {
+    let name = nova_data_dir_name();
     let dir = app
         .path()
         .home_dir()
-        .map(|h| h.join(".nova"))
+        .map(|h| h.join(name))
         // 极端情况下取不到主目录：回退到旧的 app_data_dir，保证永不 panic。
         .unwrap_or_else(|_| {
             app.path()
                 .app_data_dir()
-                .unwrap_or_else(|_| PathBuf::from(".nova"))
+                .unwrap_or_else(|_| PathBuf::from(name))
         });
     let _ = std::fs::create_dir_all(&dir);
     dir
@@ -4303,10 +4325,11 @@ pub fn run() {
             #[cfg(windows)]
             spawn_single_instance_focus_listener(app.handle());
 
-            // 统一数据目录为 ~/.nova（跨项目/安装位置/版本稳定）。必须最先执行——后续窗口还原/
-            // 更新都要读该目录里的 marker。首启从旧 Tauri 数据目录（com.nova → com.fuckdevin）整体迁移。
+            // 数据目录必须最先确定，后续窗口还原/更新都要读取其中的 marker。
             let dir = nova_data_dir(app.handle());
-            migrate_data_to_home(app.handle(), &dir);
+            if !cfg!(debug_assertions) {
+                migrate_data_to_home(app.handle(), &dir);
+            }
             if let Err(error) = agent_config::sync_global_instructions(&dir) {
                 eprintln!("[agent-config] 启动同步失败：{error}");
             }

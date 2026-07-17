@@ -434,16 +434,22 @@ pub fn remove_skill(config_dir: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 启动后端时调用：按用户主目录下的 `~/.nova/skills` 同步（与 `nova_data_dir` 一致）。
+/// 启动后端时调用：从当前构建的数据目录同步 skills。
 pub fn sync_skills_from_home() {
+    if cfg!(debug_assertions) {
+        return;
+    }
     if let Some(home) = user_home_dir() {
-        let _ = sync_skills_to_backends(&home.join(".nova"));
+        let _ = sync_skills_to_backends(&home.join(crate::nova_data_dir_name()));
     }
 }
 
 /// 把 `~/.nova/skills/<name>` 以软链接/目录联接同步到各后端全局 skills 目录。
 /// 不覆盖用户已有的真实目录；只维护指向 Nova 集中目录的链接。
 pub fn sync_skills_to_backends(config_dir: &Path) -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
     let central = ensure_skills_dir(config_dir);
     let mut managed_names = Vec::new();
     if let Ok(entries) = fs::read_dir(&central) {

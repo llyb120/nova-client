@@ -75,10 +75,14 @@ pub fn set_global_instructions(
     if active {
         fs::write(&central, content).map_err(|e| format!("保存全局指令失败：{e}"))?;
     }
-    let targets = normal_targets()?
-        .iter()
-        .map(|target| sync_target(target, if active { content } else { "" }))
-        .collect();
+    let targets = if cfg!(debug_assertions) {
+        Vec::new()
+    } else {
+        normal_targets()?
+            .iter()
+            .map(|target| sync_target(target, if active { content } else { "" }))
+            .collect()
+    };
     if !active {
         let _ = fs::remove_file(&central);
     }
@@ -95,6 +99,9 @@ pub fn set_global_instructions(
 
 /// 启动时重新同步一次，修复用户移动/删除了后端配置入口的情况。
 pub fn sync_global_instructions(config_dir: &Path) -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
     let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
     for target in normal_targets()? {
         let _ = sync_target(&target, &content);
@@ -108,6 +115,9 @@ pub fn sync_backend_with_env(
     kind: &AgentKind,
     env: &HashMap<String, String>,
 ) -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
     let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
     if content.trim().is_empty() {
         return Ok(());
