@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
-const { completePendingTools, createMessageState, cursorModelOptions, mapMessage, modelSelection, promptMessage } = await import("./cursor-bridge.mjs");
+const { completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage } = await import("./cursor-bridge.mjs");
 const state = createMessageState();
 
 assert.equal(mapMessage({ type: "assistant", run_id: "run", message: { content: [{ type: "text", text: "Hello" }] } }, state)[0].text, "Hello");
@@ -29,6 +29,20 @@ const embeddedDone = mapMessage({ type: "tool_call", call_id: "embedded", name: 
 assert.equal(embeddedDone.id, "embedded");
 assert.equal(embeddedDone.status, "completed");
 assert.deepEqual(embeddedDone.arguments, { query: "SDK auth" });
+const deltaState = createMessageState();
+assert.equal(mapDelta({ type: "thinking-delta", text: "Think" }, deltaState, "delta").text, "Think");
+assert.equal(mapDelta({ type: "thinking-delta", text: "ing" }, deltaState, "delta").text, "Thinking");
+assert.equal(mapMessage({ type: "thinking", run_id: "delta", text: "Thinking" }, deltaState).length, 0);
+assert.equal(mapDelta({ type: "text-delta", text: "Hello" }, deltaState, "delta").text, "Hello");
+assert.equal(mapMessage({ type: "assistant", run_id: "delta", message: { content: [{ type: "text", text: "Hello" }] } }, deltaState).length, 0);
+const deltaTool = mapDelta({ type: "tool-call-started", callId: "read", toolCall: { type: "read", args: { path: "README.md" } } }, deltaState, "delta");
+assert.equal(deltaTool.status, "in_progress");
+assert.deepEqual(deltaTool.arguments, { path: "README.md" });
+assert.equal(mapDelta({ type: "tool-call-completed", callId: "read", toolCall: { type: "read", result: { status: "success", value: "ok" } } }, deltaState, "delta").status, "completed");
+assert.deepEqual(parseCliModels("Available models\r\n\r\nauto - Auto (default)\r\ncursor-grok-4.5-high - Cursor Grok 4.5\r\ncomposer-2.5-fast - Composer 2.5 Fast\r\n"), [
+  { id: "cursor-grok-4.5-high", displayName: "Cursor Grok 4.5" },
+  { id: "composer-2.5-fast", displayName: "Composer 2.5 Fast" },
+]);
 assert.deepEqual(modelSelection("cursor-grok-4.5-high-fast"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("grok-4.5-high-false"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] });
 assert.deepEqual(modelSelection("composer-2.5-fast"), { id: "composer-2.5", params: [{ id: "fast", value: "true" }] });

@@ -238,6 +238,10 @@ impl OpenCodeSdkManager {
     }
 
     pub async fn cancel(&self, thread_id: &str) {
+        if self.is_running(thread_id) {
+            self.push_system(thread_id, "已停止当前任务。".into(), "warn");
+            self.finish_turn(thread_id, "cancelled");
+        }
         let stdin = self
             .running_children
             .lock()
@@ -251,7 +255,6 @@ impl OpenCodeSdkManager {
         if let Some(mut bridge) = self.running_children.lock().unwrap().remove(thread_id) {
             kill_child(&mut bridge.child);
         }
-        self.finish_turn(thread_id, "cancelled");
     }
 
     pub async fn fork_session(
@@ -885,6 +888,37 @@ fn tool_call(part: &Value) -> ToolCall {
             .map(str::to_string)
             .unwrap_or_else(|| value.to_string())
     });
+    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("Tool");
+    let input = state.get("input").cloned();
+    let path = input.as_ref().and_then(|value| {
+        ["filePath", "file_path", "path"]
+            .iter()
+            .find_map(|key| value.get(key).and_then(Value::as_str))
+    });
+    let is_todo = matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "todowrite" | "todo_write" | "todo"
+    );
+    let todo_text = is_todo.then(|| {
+        input
+            .as_ref()
+            .and_then(|value| value.get("todos"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|todo| {
+                let content = todo.get("content").and_then(Value::as_str)?;
+                let marker = match todo.get("status").and_then(Value::as_str) {
+                    Some("completed") => "x",
+                    Some("in_progress" | "inProgress") => ">",
+                    Some("cancelled") => "-",
+                    _ => " ",
+                };
+                Some(format!("[{marker}] {content}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
     ToolCall {
         tool_call_id: part
             .get("callID")
@@ -892,12 +926,22 @@ fn tool_call(part: &Value) -> ToolCall {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        title: part
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("Tool")
-            .to_string(),
-        kind: "other".into(),
+        title: if is_todo {
+            "Todo list".into()
+        } else if let Some(path) = path {
+            format!("{tool} {path}")
+        } else {
+            tool.to_string()
+        },
+        kind: match tool.to_ascii_lowercase().as_str() {
+            "read" => "read",
+            "edit" | "write" | "patch" | "apply_patch" => "edit",
+            "grep" | "glob" | "search" => "search",
+            "bash" | "shell" => "execute",
+            _ if is_todo => "think",
+            _ => "other",
+        }
+        .into(),
         status: match status {
             "completed" => "completed",
             "error" => "failed",
@@ -905,12 +949,15 @@ fn tool_call(part: &Value) -> ToolCall {
         }
         .into(),
         content: output_text
+            .or(todo_text)
             .map(|text| {
                 vec![json!({ "type": "content", "content": { "type": "text", "text": text } })]
             })
             .unwrap_or_default(),
-        locations: Vec::new(),
-        raw_input: state.get("input").cloned(),
+        locations: path
+            .map(|path| vec![json!({ "path": path })])
+            .unwrap_or_default(),
+        raw_input: input,
         raw_output: output,
     }
 }
@@ -966,5 +1013,26 @@ mod tests {
         assert!(
             with_command(json!({ "action": "prompt" }), "explain /review")["command"].is_null()
         );
+    }
+
+    #[test]
+    fn maps_read_and_todo_tools_for_display() {
+        let read = tool_call(&json!({
+            "id": "part", "callID": "call", "type": "tool", "tool": "read",
+            "state": { "status": "running", "input": { "filePath": "src/main.rs" } }
+        }));
+        assert_eq!(read.title, "read src/main.rs");
+        assert_eq!(read.kind, "read");
+        assert_eq!(read.locations[0]["path"], "src/main.rs");
+
+        let todo = tool_call(&json!({
+            "id": "todo", "type": "tool", "tool": "todowrite",
+            "state": { "status": "completed", "input": { "todos": [
+                { "content": "Fix streaming", "status": "in_progress" }
+            ] } }
+        }));
+        assert_eq!(todo.title, "Todo list");
+        assert_eq!(todo.kind, "think");
+        assert!(todo.raw_input.unwrap()["todos"].is_array());
     }
 }

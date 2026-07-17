@@ -73,6 +73,7 @@ struct IdleBridge {
     child: Child,
     stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
     stdout: BufReader<tokio::process::ChildStdout>,
+    stderr: Arc<Mutex<Vec<String>>>,
 }
 
 pub struct CodexSdkManager {
@@ -262,6 +263,9 @@ impl CodexSdkManager {
     }
 
     pub async fn cancel(&self, thread_id: &str) {
+        if self.is_running(thread_id) {
+            self.push_system(thread_id, "已停止当前任务。".into(), "warn");
+        }
         let stdin = self
             .running_children
             .lock()
@@ -479,6 +483,27 @@ impl CodexSdkManager {
             .read_events(thread_id, user_item_id, &mut bridge.stdout)
             .await;
         self.running_children.lock().unwrap().remove(thread_id);
+        let result = result.map_err(|error| {
+            let status = bridge
+                .child
+                .try_wait()
+                .ok()
+                .flatten()
+                .map(|status| status.to_string());
+            let stderr = bridge.stderr.lock().unwrap().join("\n");
+            if status.is_none() && stderr.is_empty() {
+                return error;
+            }
+            format!(
+                "{error}{}{}",
+                status
+                    .map(|value| format!("；退出状态：{value}"))
+                    .unwrap_or_default(),
+                (!stderr.is_empty())
+                    .then(|| format!("；stderr：{stderr}"))
+                    .unwrap_or_default()
+            )
+        });
         let reusable = self.backend == SdkBackend::Cursor
             && result.is_ok()
             && bridge.child.try_wait().ok().flatten().is_none();
@@ -503,10 +528,27 @@ impl CodexSdkManager {
             .stdout
             .take()
             .ok_or_else(|| format!("{} bridge stdout 不可用", self.backend.label()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| format!("{} bridge stderr 不可用", self.backend.label()))?;
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = stderr_lines.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut captured = captured.lock().unwrap();
+                captured.push(line);
+                if captured.len() > 20 {
+                    captured.remove(0);
+                }
+            }
+        });
         Ok(IdleBridge {
             child,
             stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
             stdout: BufReader::new(stdout),
+            stderr: stderr_lines,
         })
     }
 
@@ -597,7 +639,7 @@ impl CodexSdkManager {
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .env(path_env, &program);
         if !self.launch_env.is_empty() {
             crate::credential_roaming::isolate_borrowed_command(&mut command);

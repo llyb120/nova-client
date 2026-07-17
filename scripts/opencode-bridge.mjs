@@ -86,6 +86,7 @@ async function runPrompt(client, lines, request) {
   const subscription = await client.event.subscribe();
   send({ type: "ready", sessionId });
 
+  let cancelled = false;
   const input = (async () => {
     for await (const line of lines) {
       if (!line.trim()) continue;
@@ -97,6 +98,7 @@ async function runPrompt(client, lines, request) {
         });
         if (result.error) send({ type: "error", error: JSON.stringify(result.error) });
       } else if (command.action === "cancel") {
+        cancelled = true;
         await client.session.abort({ sessionID: sessionId });
       }
     }
@@ -127,19 +129,33 @@ async function runPrompt(client, lines, request) {
     });
   }
   started.then((result) => {
-    if (result.error) send({ type: "error", error: JSON.stringify(result.error) });
-  }).catch((error) => send({ type: "error", error: error instanceof Error ? error.message : String(error) }));
+    if (result.error && !cancelled) send({ type: "error", error: JSON.stringify(result.error) });
+  }).catch((error) => {
+    if (!cancelled) send({ type: "error", error: error instanceof Error ? error.message : String(error) });
+  });
 
   const assistantMessages = new Set();
+  const pendingParts = new Map();
   for await (const event of subscription.stream) {
     const properties = event.properties ?? {};
     if (properties.sessionID !== sessionId) continue;
     if (event.type === "message.updated") {
-      if (properties.info?.role === "assistant") assistantMessages.add(properties.info.id);
+      if (properties.info?.role === "assistant") {
+        assistantMessages.add(properties.info.id);
+        for (const part of pendingParts.get(properties.info.id)?.values() ?? []) send({ type: "part", part });
+        pendingParts.delete(properties.info.id);
+      }
       continue;
     }
     if (event.type === "message.part.updated") {
-      if (assistantMessages.has(properties.part?.messageID)) send({ type: "part", part: properties.part });
+      const part = properties.part;
+      if (assistantMessages.has(part?.messageID)) {
+        send({ type: "part", part });
+      } else if (part?.messageID && part?.id) {
+        const parts = pendingParts.get(part.messageID) ?? new Map();
+        parts.set(part.id, part);
+        pendingParts.set(part.messageID, parts);
+      }
       continue;
     }
     if (event.type === "permission.asked" || event.type === "permission.v2.asked") {
@@ -147,6 +163,7 @@ async function runPrompt(client, lines, request) {
       continue;
     }
     if (event.type === "session.error") {
+      if (cancelled) break;
       send({ type: "error", error: JSON.stringify(properties.error ?? "OpenCode session error") });
       break;
     }

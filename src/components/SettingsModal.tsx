@@ -1067,7 +1067,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   </label>
                   <label class="backend-field backend-field-wide">
                     <span class="field-label">Anthropic API Key</span>
-                    <input class="field-input" type="password" value={claudecodeSdkApiKey()} onInput={(e) => setClaudecodeSdkApiKey(e.currentTarget.value)} placeholder="留空使用环境/provider 凭据" />
+                    <input class="field-input" value={claudecodeSdkApiKey()} onInput={(e) => setClaudecodeSdkApiKey(e.currentTarget.value)} placeholder="留空使用环境/provider 凭据" />
                   </label>
                 </div>
               </div>
@@ -1143,7 +1143,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   </label>
                   <label class="backend-field backend-field-wide">
                     <span class="field-label">Cursor API Key</span>
-                    <input class="field-input" type="password" value={cursorSdkApiKey()} onInput={(e) => setCursorSdkApiKey(e.currentTarget.value)} placeholder="留空使用 CURSOR_API_KEY" />
+                    <input class="field-input" value={cursorSdkApiKey()} onInput={(e) => setCursorSdkApiKey(e.currentTarget.value)} placeholder="留空使用 CURSOR_API_KEY" />
                   </label>
                 </div>
               </div>

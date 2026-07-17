@@ -87,8 +87,9 @@ function decodeModelValue(
   return { agentKind, model: decodeURIComponent(value.slice(i + 1)) };
 }
 
-/** 积分倍率文案；protobuf 省略零值，固定计费下倍率缺失即 0×（促销免费） */
-function multiplierText(cost?: ModelCost): string | undefined {
+/** 积分倍率文案；Devin 已直接提供 token 单价，不再展示模型乘数。 */
+function multiplierText(agentKind: AgentKind, cost?: ModelCost): string | undefined {
+  if (agentKind === "devin") return undefined;
   if (!cost) return undefined;
   if (cost.pricing && cost.pricing !== "MODEL_PRICING_TYPE_STATIC_CREDIT") return undefined;
   return `${cost.multiplier ?? 0}×`;
@@ -112,7 +113,7 @@ function creditsText(description?: string): string | undefined {
 }
 
 /** 附注悬停说明：完整单价 + 倍率参考 */
-function detailTitle(cost?: ModelCost): string | undefined {
+function detailTitle(agentKind: AgentKind, cost?: ModelCost): string | undefined {
   if (!cost) return undefined;
   const parts: string[] = [];
   const p = cost.prices;
@@ -121,7 +122,7 @@ function detailTitle(cost?: ModelCost): string | undefined {
       `每 1M tokens：输入 $${fmt(p.input ?? 0)} · 缓存命中 $${fmt(p.cached ?? 0)} · 输出 $${fmt(p.output ?? 0)}`,
     );
   }
-  const mult = multiplierText(cost);
+  const mult = multiplierText(agentKind, cost);
   if (mult) parts.push(`积分倍率：${mult}（参考）`);
   return parts.length ? parts.join("\n") : undefined;
 }
@@ -139,7 +140,7 @@ export function modelOptionsOf(
     const metaVision =
       m._meta?.["cognition.ai/supportsImages"] ?? m._meta?.["codex.ai/supportsImages"];
     const price = priceText(cost);
-    const mult = multiplierText(cost);
+    const mult = multiplierText(agentKind, cost);
     // CodeBuddy 无 windsurf 费用数据，改用模型 description 里的积分倍率
     const credits = creditsText(m.description);
     return {
@@ -153,7 +154,7 @@ export function modelOptionsOf(
       detail: price ?? mult ?? credits,
       detail2: price ? mult : undefined,
       detailTitle:
-        detailTitle(cost) ??
+        detailTitle(agentKind, cost) ??
         (credits && m.description ? `积分倍率：${m.description.trim()}` : undefined),
       vision: cost?.supportsImages ?? (typeof metaVision === "boolean" ? metaVision : false),
     };

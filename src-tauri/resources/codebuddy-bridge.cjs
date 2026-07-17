@@ -39082,27 +39082,28 @@ async function runPrompt(lines, request) {
 async function modelOptions(request) {
   const cliPath = process.env.NOVA_CODEBUDDY_PATH || void 0;
   if (cliPath) process.env.CODEBUDDY_CODE_PATH = cliPath;
-  const activeQuery = (0, import_agent_sdk.query)({ options: {
+  const session = (0, import_agent_sdk.unstable_v2_createSession)({
     cwd: request.cwd,
     pathToCodebuddyCode: cliPath
-  } });
+  });
   try {
-    const models = await activeQuery.supportedModels();
+    const models = await session.getAvailableModelsRaw();
     return {
       configOptions: [{
         id: "model",
         name: "Model",
         currentValue: "",
         options: models.map((model) => ({
-          value: model.value ?? model.id,
-          name: model.displayName ?? model.name ?? model.value ?? model.id,
-          description: model.description
+          value: model.id,
+          name: model.name ?? model.id,
+          description: model.credits ?? model.description,
+          _meta: { "codex.ai/supportsImages": model.supportsImages ?? false }
         }))
       }],
       modes: null
     };
   } finally {
-    await activeQuery.return();
+    session.close();
   }
 }
 async function main() {

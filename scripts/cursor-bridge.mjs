@@ -1,12 +1,15 @@
 import { createInterface } from "node:readline";
 import { Agent, Cursor } from "@cursor/sdk";
+import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
+import { promisify } from "node:util";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+const execFileAsync = promisify(execFile);
 
 function createMessageState() {
-  return { activeTextType: null, textIndex: 0, texts: new Map(), tools: new Map() };
+  return { activeTextType: null, textIndex: 0, texts: new Map(), tools: new Map(), deltaTypes: new Set() };
 }
 
 function appendText(state, runId, type, text) {
@@ -41,7 +44,7 @@ function mapMessage(message, state) {
   const items = [];
   if (message.type === "assistant") {
     for (const block of message.message.content) {
-      if (block.type === "text" && block.text) {
+      if (block.type === "text" && block.text && !state.deltaTypes.has("assistant")) {
         items.push(appendText(state, message.run_id, "assistant", block.text));
       }
       if (block.type === "tool_use") {
@@ -50,7 +53,7 @@ function mapMessage(message, state) {
       }
     }
   }
-  if (message.type === "thinking" && message.text) {
+  if (message.type === "thinking" && message.text && !state.deltaTypes.has("thinking")) {
     items.push(appendText(state, message.run_id, "thinking", message.text));
   }
   if (message.type === "tool_call") {
@@ -58,6 +61,30 @@ function mapMessage(message, state) {
     if (item) items.push(item);
   }
   return items;
+}
+
+function mapDelta(update, state, runId) {
+  if (update.type === "text-delta" && update.text) {
+    state.deltaTypes.add("assistant");
+    return appendText(state, runId, "assistant", update.text);
+  }
+  if (update.type === "thinking-delta" && update.text) {
+    state.deltaTypes.add("thinking");
+    return appendText(state, runId, "thinking", update.text);
+  }
+  if (["tool-call-started", "partial-tool-call", "tool-call-completed"].includes(update.type)) {
+    const tool = update.toolCall;
+    const failed = tool?.result?.status === "error";
+    return mapTool(
+      state,
+      update.callId,
+      tool?.type,
+      update.type === "tool-call-completed" ? (failed ? "error" : "completed") : "running",
+      tool?.args,
+      tool?.result,
+    );
+  }
+  return null;
 }
 
 function completePendingTools(state) {
@@ -127,10 +154,41 @@ function cursorModelOptions(models) {
     options.findIndex((candidate) => candidate.value === option.value) === index);
 }
 
+function parseCliModels(output) {
+  return output
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      const match = line.trim().match(/^(\S+)\s+-\s+(.+?)(?:\s+\(default\))?$/);
+      if (!match || match[1].toLowerCase() === "auto") return [];
+      return [{ id: match[1], displayName: match[2] }];
+    });
+}
+
+async function cliModels() {
+  const program = process.env.NOVA_CURSOR_PATH || "cursor-agent";
+  const executable = process.platform === "win32" && program.toLowerCase().endsWith(".ps1")
+    ? "powershell.exe"
+    : program;
+  const args = executable === program
+    ? ["--list-models"]
+    : ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", program, "--list-models"];
+  const { stdout } = await execFileAsync(executable, args, {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+    windowsHide: true,
+  });
+  const models = parseCliModels(stdout);
+  if (!models.length) throw new Error("Cursor CLI 未返回模型列表");
+  return models;
+}
+
 async function modelOptions() {
-  const models = process.env.CURSOR_API_KEY
-    ? await Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY }).catch(() => [])
-    : [];
+  let models;
+  if (process.env.CURSOR_API_KEY) {
+    models = await Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY }).catch(() => undefined);
+  }
+  models ??= await cliModels();
   return {
     novaCursorModelSchema: 2,
     configOptions: [{
@@ -179,6 +237,36 @@ async function main() {
     wake?.();
   });
   let agent;
+  async function sendPrompt(request, state) {
+    const options = {
+      mode: request.mode === "plan" ? "plan" : "agent",
+      onDelta: ({ update }) => {
+        try {
+          const item = mapDelta(update, state, activeRun?.id ?? "run");
+          if (item) send({ type: "item", item });
+        } catch (error) {
+          process.stderr.write(`Cursor onDelta failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+        }
+      },
+    };
+    try {
+      return await agent.send(await promptMessage(request.parts), options);
+    } catch (error) {
+      if (!String(error).includes("already has active run")) throw error;
+      const runs = await Agent.listRuns(agent.agentId, { runtime: "local", cwd: request.cwd });
+      for (const run of runs.items) {
+        if (run.status === "running") await Agent.cancelRun(run.id, { runtime: "local", cwd: request.cwd });
+      }
+      const agentId = agent.agentId;
+      agent.close();
+      agent = await Agent.resume(agentId, {
+        apiKey: process.env.CURSOR_API_KEY,
+        model: modelSelection(request.model),
+        local: { cwd: request.cwd },
+      });
+      return agent.send(await promptMessage(request.parts), options);
+    }
+  }
   while (!closed || requests.length) {
     if (!requests.length) await new Promise((resolve) => { wake = resolve; });
     const request = requests.shift();
@@ -194,9 +282,9 @@ async function main() {
         agent = request.sessionId ? await Agent.resume(request.sessionId, options) : await Agent.create(options);
       }
       send({ type: "ready", sessionId: agent.agentId });
-      activeRun = await agent.send(await promptMessage(request.parts), { mode: request.mode === "plan" ? "plan" : "agent" });
-      let usage;
       const state = createMessageState();
+      activeRun = await sendPrompt(request, state);
+      let usage;
       for await (const message of activeRun.stream()) {
         for (const item of mapMessage(message, state)) send({ type: "item", item });
         if (message.type === "usage") usage = message.usage;
@@ -214,6 +302,10 @@ async function main() {
   agent?.close();
 }
 
-if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => { send({ ok: false, error: error instanceof Error ? error.message : String(error) }); process.exitCode = 1; });
+if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => {
+  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+  send({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  process.exitCode = 1;
+});
 
-export { completePendingTools, createMessageState, cursorModelOptions, mapMessage, modelSelection, promptMessage };
+export { completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage };

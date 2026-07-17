@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline";
-import { query } from "@tencent-ai/agent-sdk";
+import { query, unstable_v2_createSession } from "@tencent-ai/agent-sdk";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -128,27 +128,28 @@ async function runPrompt(lines, request) {
 async function modelOptions(request) {
   const cliPath = process.env.NOVA_CODEBUDDY_PATH || undefined;
   if (cliPath) process.env.CODEBUDDY_CODE_PATH = cliPath;
-  const activeQuery = query({ options: {
+  const session = unstable_v2_createSession({
     cwd: request.cwd,
     pathToCodebuddyCode: cliPath,
-  } });
+  });
   try {
-    const models = await activeQuery.supportedModels();
+    const models = await session.getAvailableModelsRaw();
     return {
       configOptions: [{
         id: "model",
         name: "Model",
         currentValue: "",
         options: models.map((model) => ({
-          value: model.value ?? model.id,
-          name: model.displayName ?? model.name ?? model.value ?? model.id,
-          description: model.description,
+          value: model.id,
+          name: model.name ?? model.id,
+          description: model.credits ?? model.description,
+          _meta: { "codex.ai/supportsImages": model.supportsImages ?? false },
         })),
       }],
       modes: null,
     };
   } finally {
-    await activeQuery.return();
+    session.close();
   }
 }
 
