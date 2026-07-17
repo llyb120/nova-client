@@ -202,17 +202,18 @@ async function modelOptions() {
 }
 
 async function promptMessage(parts) {
-  const text = parts.filter((part) => part.type === "text").map((part) => part.text).join("\n\n");
+  const textParts = parts.filter((part) => part.type === "text").map((part) => part.text);
   const images = [];
   const mediaTypes = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp" };
   for (const part of parts) {
     if (part.type === "image_data") images.push({ data: part.data, mimeType: part.mime });
     if (part.type === "local_image") {
       const mimeType = mediaTypes[extname(part.path).toLowerCase()];
-      if (!mimeType) throw new Error(`Unsupported image type: ${part.path}`);
-      images.push({ data: (await readFile(part.path)).toString("base64"), mimeType });
+      if (mimeType) images.push({ data: (await readFile(part.path)).toString("base64"), mimeType });
+      else textParts.push(`Attached file: ${part.path}`);
     }
   }
+  const text = textParts.join("\n\n");
   return images.length ? { text, images } : text;
 }
 

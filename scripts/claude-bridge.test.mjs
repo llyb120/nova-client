@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_CLAUDE_BRIDGE_TEST = "1";
-const { assistantItems, claudeModelOptions, claudeModelSelection, streamEventItem } = await import("./claude-bridge.mjs");
+const { assistantItems, claudeModelOptions, claudeModelSelection, promptText, streamEventItem } = await import("./claude-bridge.mjs");
 
 assert.deepEqual(claudeModelOptions([
   {
@@ -20,6 +20,10 @@ assert.deepEqual(claudeModelOptions([
 ]);
 assert.deepEqual(claudeModelSelection("sonnet:xhigh"), { model: "sonnet", effort: "xhigh" });
 assert.deepEqual(claudeModelSelection("opus[1m]"), { model: "opus[1m]" });
+assert.equal(promptText([
+  { type: "text", text: "inspect" },
+  { type: "local_image", path: "C:\\Users\\1\\Desktop\\质量.xlsx" },
+]), "inspect\n\nAttached file: C:\\Users\\1\\Desktop\\质量.xlsx");
 
 const stream = { messageId: "message", blocks: new Map() };
 const streamedBlocks = new Set();

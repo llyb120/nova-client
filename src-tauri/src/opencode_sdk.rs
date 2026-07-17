@@ -3,7 +3,9 @@ use crate::acp::{
     EV_THREADS, EV_TURN, EV_UPDATE,
 };
 use crate::model_cache;
-use crate::threads::{now_ms, Item, PromptImage, ToolCall};
+use crate::threads::{
+    file_uri_to_local_path, now_ms, save_attachment_to_temp, Item, PromptImage, ToolCall,
+};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -195,14 +197,8 @@ impl OpenCodeSdkManager {
             parts.push(json!({ "type": "text", "text": text }));
         }
         for image in images {
-            let url = image
-                .data
-                .map(|data| format!("data:{};base64,{data}", image.mime_type))
-                .or(image.uri);
-            if let Some(url) = url {
-                parts.push(json!({
-                    "type": "file", "mime": image.mime_type, "filename": image.name, "url": url
-                }));
+            if let Some(part) = prompt_attachment_part(image) {
+                parts.push(part);
             }
         }
         let selected = model.as_deref().and_then(split_model_variant);
@@ -217,6 +213,7 @@ impl OpenCodeSdkManager {
             "sessionId": session_id,
             "model": model,
             "variant": variant,
+            "mode": mode,
             "agent": mode.filter(|value| value == "plan"),
             "parts": parts
         });
@@ -552,7 +549,7 @@ impl OpenCodeSdkManager {
             EV_PERMISSION,
             json!({
                 "threadId": thread_id,
-                "agentKind": "opencodeplus",
+                "agentKind": "opencode",
                 "requestKey": request_key,
                 "toolCall": {
                     "title": title,
@@ -679,6 +676,21 @@ impl OpenCodeSdkManager {
             }),
         )
     }
+}
+
+fn prompt_attachment_part(image: PromptImage) -> Option<Value> {
+    if image.mime_type.starts_with("image/") {
+        let url = image
+            .data
+            .map(|data| format!("data:{};base64,{data}", image.mime_type))
+            .or(image.uri)?;
+        return Some(json!({
+            "type": "file", "mime": image.mime_type, "filename": image.name, "url": url
+        }));
+    }
+    let path = save_attachment_to_temp(&image)
+        .or_else(|| image.uri.as_deref().and_then(file_uri_to_local_path))?;
+    Some(json!({ "type": "text", "text": format!("Attached file: {path}") }))
 }
 
 impl Drop for OpenCodeSdkManager {
@@ -919,6 +931,17 @@ fn tool_call(part: &Value) -> ToolCall {
             .collect::<Vec<_>>()
             .join("\n")
     });
+    let detail = input
+        .as_ref()
+        .and_then(|value| match tool.to_ascii_lowercase().as_str() {
+            "bash" | "shell" => value.get("command"),
+            "grep" | "search" => value.get("pattern").or_else(|| value.get("query")),
+            "glob" => value.get("pattern"),
+            _ => None,
+        })
+        .and_then(Value::as_str)
+        .map(compact_tool_detail)
+        .filter(|value| !value.is_empty());
     ToolCall {
         tool_call_id: part
             .get("callID")
@@ -930,6 +953,8 @@ fn tool_call(part: &Value) -> ToolCall {
             "Todo list".into()
         } else if let Some(path) = path {
             format!("{tool} {path}")
+        } else if let Some(detail) = detail {
+            format!("{tool} {detail}")
         } else {
             tool.to_string()
         },
@@ -962,9 +987,45 @@ fn tool_call(part: &Value) -> ToolCall {
     }
 }
 
+fn compact_tool_detail(value: &str) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = value.chars();
+    let detail = chars.by_ref().take(160).collect::<String>();
+    if chars.next().is_some() {
+        format!("{detail}…")
+    } else {
+        detail
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_attachments_become_readable_paths() {
+        let part = prompt_attachment_part(PromptImage {
+            name: "质量公式分析视图_backup.xlsx".into(),
+            mime_type: "application/octet-stream".into(),
+            data: None,
+            uri: Some("file:///C:/Users/1/Desktop/%E8%B4%A8%E9%87%8F.xlsx".into()),
+            size: None,
+        })
+        .unwrap();
+        assert_eq!(part["type"], "text");
+        assert!(part["text"].as_str().unwrap().contains("质量.xlsx"));
+
+        let image = prompt_attachment_part(PromptImage {
+            name: "chart.png".into(),
+            mime_type: "image/png".into(),
+            data: Some("base64".into()),
+            uri: None,
+            size: None,
+        })
+        .unwrap();
+        assert_eq!(image["type"], "file");
+        assert_eq!(image["mime"], "image/png");
+    }
 
     #[test]
     fn splits_sdk_model_identifier() {
@@ -1034,5 +1095,12 @@ mod tests {
         assert_eq!(todo.title, "Todo list");
         assert_eq!(todo.kind, "think");
         assert!(todo.raw_input.unwrap()["todos"].is_array());
+
+        let bash = tool_call(&json!({
+            "id": "bash", "type": "tool", "tool": "bash",
+            "state": { "status": "running", "input": { "command": "python inspect_excel.py report.xlsx" } }
+        }));
+        assert_eq!(bash.title, "bash python inspect_excel.py report.xlsx");
+        assert_eq!(bash.kind, "execute");
     }
 }

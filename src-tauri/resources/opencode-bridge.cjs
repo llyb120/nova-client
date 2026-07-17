@@ -12,6 +12,10 @@ var __commonJS = (cb, mod) => function __require() {
     throw mod = 0, e;
   }
 };
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
     for (let key of __getOwnPropNames(from))
@@ -28,6 +32,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
   mod
 ));
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // node_modules/isexe/windows.js
 var require_windows = __commonJS({
@@ -527,6 +532,11 @@ var require_cross_spawn = __commonJS({
 });
 
 // scripts/opencode-bridge.mjs
+var opencode_bridge_exports = {};
+__export(opencode_bridge_exports, {
+  automaticPermissionReply: () => automaticPermissionReply
+});
+module.exports = __toCommonJS(opencode_bridge_exports);
 var import_node_readline = require("node:readline");
 
 // node_modules/@opencode-ai/sdk/dist/v2/gen/core/serverSentEvents.gen.js
@@ -6131,6 +6141,9 @@ async function ensureSession(client2, sessionId) {
   if (created.error) throw new Error(JSON.stringify(created.error));
   return created.data.id;
 }
+function automaticPermissionReply(mode) {
+  return mode === "build" ? "always" : void 0;
+}
 async function runPrompt(client2, lines, request) {
   const sessionId = await ensureSession(client2, request.sessionId);
   const subscription = await client2.event.subscribe();
@@ -6204,7 +6217,13 @@ async function runPrompt(client2, lines, request) {
       continue;
     }
     if (event.type === "permission.asked" || event.type === "permission.v2.asked") {
-      send({ type: "permission", permission: properties });
+      const reply = automaticPermissionReply(request.mode);
+      if (reply) {
+        const result = await client2.permission.reply({ requestID: properties.id, reply });
+        if (result.error) send({ type: "error", error: JSON.stringify(result.error) });
+      } else {
+        send({ type: "permission", permission: properties });
+      }
       continue;
     }
     if (event.type === "session.error") {
@@ -6241,4 +6260,8 @@ async function main() {
     opencode?.server.close();
   }
 }
-void main();
+if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  automaticPermissionReply
+});

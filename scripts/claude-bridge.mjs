@@ -41,6 +41,14 @@ function claudeModelSelection(selected) {
   return match ? { model: match[1], effort: match[2] } : { model: selected };
 }
 
+function promptText(parts) {
+  return parts.flatMap((part) => {
+    if (part.type === "text") return [part.text];
+    if (part.type === "local_image") return [`Attached file: ${part.path}`];
+    return [];
+  }).join("\n\n");
+}
+
 function streamEventItem(message, stream, streamedBlocks) {
   const event = message.event;
   if (event.type === "message_start") {
@@ -148,7 +156,7 @@ async function main() {
       }
     }
   })();
-  const prompt = request.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n\n");
+  const prompt = promptText(request.parts);
   for await (const message of query({
     prompt,
     options: {
@@ -190,4 +198,4 @@ async function main() {
 
 if (process.env.NOVA_CLAUDE_BRIDGE_TEST !== "1") main().catch((error) => { send({ ok: false, error: error instanceof Error ? error.message : String(error) }); process.exitCode = 1; });
 
-export { assistantItems, claudeModelOptions, claudeModelSelection, streamEventItem };
+export { assistantItems, claudeModelOptions, claudeModelSelection, promptText, streamEventItem };

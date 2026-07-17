@@ -12,6 +12,10 @@ var __commonJS = (cb, mod) => function __require() {
     throw mod = 0, e;
   }
 };
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
     for (let key of __getOwnPropNames(from))
@@ -28,6 +32,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
   mod
 ));
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // node_modules/@tencent-ai/agent-sdk/lib/_internal/query-controller.js
 var require_query_controller = __commonJS({
@@ -38962,6 +38967,11 @@ var require_lib = __commonJS({
 });
 
 // scripts/codebuddy-bridge.mjs
+var codebuddy_bridge_exports = {};
+__export(codebuddy_bridge_exports, {
+  promptMessages: () => promptMessages
+});
+module.exports = __toCommonJS(codebuddy_bridge_exports);
 var import_node_readline = require("node:readline");
 var import_agent_sdk = __toESM(require_lib(), 1);
 function send(message) {
@@ -38983,8 +38993,8 @@ async function* promptMessages(request) {
       const { extname } = await import("node:path");
       const mediaTypes = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp" };
       const mediaType = mediaTypes[extname(part.path).toLowerCase()];
-      if (!mediaType) throw new Error(`Unsupported image type: ${part.path}`);
-      content.push({ type: "image", source: { type: "base64", media_type: mediaType, data: (await readFile(part.path)).toString("base64") } });
+      if (mediaType) content.push({ type: "image", source: { type: "base64", media_type: mediaType, data: (await readFile(part.path)).toString("base64") } });
+      else content.push({ type: "text", text: `Attached file: ${part.path}` });
     }
   }
   yield { type: "user", session_id: request.sessionId || "", message: { role: "user", content }, parent_tool_use_id: null };
@@ -39122,4 +39132,8 @@ async function main() {
     if (request?.action === "models") process.exit(0);
   }
 }
-void main();
+if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  promptMessages
+});

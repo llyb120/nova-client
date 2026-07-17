@@ -81,6 +81,10 @@ async function ensureSession(client, sessionId) {
   return created.data.id;
 }
 
+function automaticPermissionReply(mode) {
+  return mode === "build" ? "always" : undefined;
+}
+
 async function runPrompt(client, lines, request) {
   const sessionId = await ensureSession(client, request.sessionId);
   const subscription = await client.event.subscribe();
@@ -159,7 +163,13 @@ async function runPrompt(client, lines, request) {
       continue;
     }
     if (event.type === "permission.asked" || event.type === "permission.v2.asked") {
-      send({ type: "permission", permission: properties });
+      const reply = automaticPermissionReply(request.mode);
+      if (reply) {
+        const result = await client.permission.reply({ requestID: properties.id, reply });
+        if (result.error) send({ type: "error", error: JSON.stringify(result.error) });
+      } else {
+        send({ type: "permission", permission: properties });
+      }
       continue;
     }
     if (event.type === "session.error") {
@@ -198,4 +208,6 @@ async function main() {
   }
 }
 
-void main();
+if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
+
+export { automaticPermissionReply };

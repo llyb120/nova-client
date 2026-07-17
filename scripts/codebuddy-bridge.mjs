@@ -21,8 +21,8 @@ async function* promptMessages(request) {
       const { extname } = await import("node:path");
       const mediaTypes = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp" };
       const mediaType = mediaTypes[extname(part.path).toLowerCase()];
-      if (!mediaType) throw new Error(`Unsupported image type: ${part.path}`);
-      content.push({ type: "image", source: { type: "base64", media_type: mediaType, data: (await readFile(part.path)).toString("base64") } });
+      if (mediaType) content.push({ type: "image", source: { type: "base64", media_type: mediaType, data: (await readFile(part.path)).toString("base64") } });
+      else content.push({ type: "text", text: `Attached file: ${part.path}` });
     }
   }
   yield { type: "user", session_id: request.sessionId || "", message: { role: "user", content }, parent_tool_use_id: null };
@@ -170,4 +170,6 @@ async function main() {
   }
 }
 
-void main();
+if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
+
+export { promptMessages };

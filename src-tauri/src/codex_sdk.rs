@@ -2,7 +2,9 @@ use crate::acp::{
     apply_proxy_env, resolve_program_on_path, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
 };
 use crate::model_cache;
-use crate::threads::{now_ms, Item, PromptImage, ToolCall};
+use crate::threads::{
+    file_uri_to_local_path, now_ms, save_attachment_to_temp, Item, PromptImage, ToolCall,
+};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -207,13 +209,22 @@ impl CodexSdkManager {
             parts.push(json!({ "type": "text", "text": text }));
         }
         for image in &images {
-            if let Some(data) = &image.data {
-                parts.push(json!({
-                    "type": "image_data", "name": image.name, "mime": image.mime_type, "data": data
-                }));
-            } else if let Some(uri) = &image.uri {
-                let path = uri.strip_prefix("file://").unwrap_or(uri);
+            if image.mime_type.starts_with("image/") || self.backend == SdkBackend::Codex {
+                if let Some(data) = &image.data {
+                    parts.push(json!({
+                        "type": "image_data", "name": image.name, "mime": image.mime_type, "data": data
+                    }));
+                    continue;
+                }
+            } else if let Some(path) = save_attachment_to_temp(image) {
                 parts.push(json!({ "type": "local_image", "path": path }));
+                continue;
+            }
+            if let Some(uri) = &image.uri {
+                let path = file_uri_to_local_path(uri).unwrap_or_else(|| uri.clone());
+                parts.push(json!({
+                    "type": "local_image", "path": path
+                }));
             }
         }
         let mut request = json!({
@@ -537,6 +548,11 @@ impl CodexSdkManager {
         tauri::async_runtime::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("ExperimentalWarning: SQLite is an experimental feature")
+                    || line.contains("node --trace-warnings")
+                {
+                    continue;
+                }
                 let mut captured = captured.lock().unwrap();
                 captured.push(line);
                 if captured.len() > 20 {
@@ -1035,7 +1051,7 @@ fn complete_pending_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
 mod tests {
     use super::{
         complete_pending_tools, normalize_title, parse_bridge_output, resolve_codex_model,
-        SdkBackend,
+        tool_call, SdkBackend,
     };
     use crate::threads::{now_ms, AgentKind, Item, Thread, ToolCall};
     use serde_json::json;
@@ -1112,6 +1128,38 @@ mod tests {
         };
         assert_eq!(call.status, "completed");
     }
+
+    #[test]
+    fn cursor_tools_show_the_specific_operation() {
+        let shell = tool_call(&json!({
+            "id": "shell", "type": "mcp_tool_call", "server": "Cursor", "tool": "shell",
+            "arguments": { "command": "python inspect_excel.py 1.xlsx" }, "status": "in_progress"
+        }));
+        assert_eq!(
+            shell.title,
+            "Cursor / shell · python inspect_excel.py 1.xlsx"
+        );
+        assert_eq!(shell.kind, "execute");
+
+        let read = tool_call(&json!({
+            "id": "read", "type": "mcp_tool_call", "server": "Cursor", "tool": "read",
+            "arguments": { "path": "C:/Users/1/Desktop/1.xlsx" }, "status": "completed"
+        }));
+        assert_eq!(read.title, "Cursor / read · C:/Users/1/Desktop/1.xlsx");
+        assert_eq!(read.kind, "read");
+        assert_eq!(read.locations[0]["path"], "C:/Users/1/Desktop/1.xlsx");
+    }
+}
+
+fn compact_tool_detail(value: &str) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = value.chars();
+    let detail = chars.by_ref().take(160).collect::<String>();
+    if chars.next().is_some() {
+        format!("{detail}…")
+    } else {
+        detail
+    }
 }
 
 fn tool_call(value: &Value) -> ToolCall {
@@ -1120,29 +1168,82 @@ fn tool_call(value: &Value) -> ToolCall {
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("completed");
-    let (title, raw_input, output) = match kind {
+    let (title, tool_kind, locations, raw_input, output) = match kind {
         "command_execution" => (
             value
                 .get("command")
                 .and_then(Value::as_str)
                 .unwrap_or("Command")
                 .to_string(),
+            "execute",
+            Vec::new(),
             value.get("command").cloned(),
             value.get("aggregated_output").cloned(),
         ),
-        "file_change" => ("File changes".into(), value.get("changes").cloned(), None),
-        "mcp_tool_call" => (
-            format!(
-                "{} / {}",
-                value.get("server").and_then(Value::as_str).unwrap_or("MCP"),
-                value.get("tool").and_then(Value::as_str).unwrap_or("tool")
-            ),
-            value.get("arguments").cloned(),
-            value.get("result").or_else(|| value.get("error")).cloned(),
+        "file_change" => (
+            "File changes".into(),
+            "edit",
+            Vec::new(),
+            value.get("changes").cloned(),
+            None,
         ),
-        "web_search" => ("Web search".into(), value.get("query").cloned(), None),
-        "todo_list" => ("Todo list".into(), value.get("items").cloned(), None),
-        _ => ("Tool".into(), None, None),
+        "mcp_tool_call" => {
+            let server = value.get("server").and_then(Value::as_str).unwrap_or("MCP");
+            let tool = value.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let arguments = value.get("arguments");
+            let detail = match tool {
+                "shell" => arguments.and_then(|args| args.get("command")),
+                "read" | "edit" | "write" | "delete" | "ls" => {
+                    arguments.and_then(|args| args.get("path"))
+                }
+                "glob" => arguments.and_then(|args| args.get("globPattern")),
+                "grep" => arguments.and_then(|args| args.get("pattern")),
+                "semSearch" => arguments.and_then(|args| args.get("query")),
+                _ => None,
+            }
+            .and_then(Value::as_str)
+            .map(compact_tool_detail)
+            .filter(|detail| !detail.is_empty());
+            let path = arguments
+                .and_then(|args| args.get("path"))
+                .and_then(Value::as_str);
+            (
+                format!(
+                    "{server} / {tool}{}",
+                    detail
+                        .map(|detail| format!(" · {detail}"))
+                        .unwrap_or_default()
+                ),
+                match tool {
+                    "shell" => "execute",
+                    "read" => "read",
+                    "edit" | "write" => "edit",
+                    "delete" => "delete",
+                    "glob" | "grep" | "semSearch" | "ls" => "search",
+                    "createPlan" | "updateTodos" => "think",
+                    _ => "other",
+                },
+                path.map(|path| vec![json!({ "path": path })])
+                    .unwrap_or_default(),
+                arguments.cloned(),
+                value.get("result").or_else(|| value.get("error")).cloned(),
+            )
+        }
+        "web_search" => (
+            "Web search".into(),
+            "search",
+            Vec::new(),
+            value.get("query").cloned(),
+            None,
+        ),
+        "todo_list" => (
+            "Todo list".into(),
+            "think",
+            Vec::new(),
+            value.get("items").cloned(),
+            None,
+        ),
+        _ => ("Tool".into(), "other", Vec::new(), None, None),
     };
     let output_text = output.as_ref().map(|v| {
         v.as_str()
@@ -1152,7 +1253,7 @@ fn tool_call(value: &Value) -> ToolCall {
     ToolCall {
         tool_call_id: value.get("id").and_then(Value::as_str).unwrap_or("").into(),
         title,
-        kind: "other".into(),
+        kind: tool_kind.into(),
         status: match status {
             "failed" => "failed",
             "in_progress" => "in_progress",
@@ -1164,7 +1265,7 @@ fn tool_call(value: &Value) -> ToolCall {
                 vec![json!({ "type": "content", "content": { "type": "text", "text": text } })]
             })
             .unwrap_or_default(),
-        locations: Vec::new(),
+        locations,
         raw_input,
         raw_output: output,
     }
