@@ -1034,6 +1034,23 @@ mod tests {
         assert!(response.thread_checkpoints.is_empty());
         assert_eq!(response.revision, 3);
     }
+
+    #[test]
+    fn remote_file_path_normalizes_slash_prefixed_windows_drive() {
+        assert_eq!(
+            normalize_remote_file_path(" /D:/code/nova/file.rs "),
+            "D:/code/nova/file.rs"
+        );
+        assert_eq!(
+            normalize_remote_file_path("/c:\\code\\nova\\file.rs"),
+            "c:\\code\\nova\\file.rs"
+        );
+        assert_eq!(
+            normalize_remote_file_path("/home/user/file.rs"),
+            "/home/user/file.rs"
+        );
+        assert_eq!(normalize_remote_file_path("src/file.rs"), "src/file.rs");
+    }
 }
 
 async fn process_commands(
@@ -1143,7 +1160,7 @@ fn remote_file(app: &AppHandle, thread_id: &str, cwd: &str, path: &str) -> Resul
         }
         thread.cwd.clone()
     };
-    let requested = std::path::Path::new(path.trim());
+    let requested = std::path::Path::new(normalize_remote_file_path(path));
     let abs = if requested.is_absolute() {
         requested.to_path_buf()
     } else {
@@ -1167,6 +1184,23 @@ fn remote_file(app: &AppHandle, thread_id: &str, cwd: &str, path: &str) -> Resul
         "name": name,
         "data": base64::engine::general_purpose::STANDARD.encode(bytes),
     }))
+}
+
+// Codex file links on Windows can use /D:/path syntax. Rust treats that as a
+// rooted path without a drive prefix, so joining/canonicalizing it fails.
+fn normalize_remote_file_path(path: &str) -> &str {
+    let path = path.trim();
+    let bytes = path.as_bytes();
+    if bytes.len() >= 4
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && matches!(bytes[3], b'/' | b'\\')
+    {
+        &path[1..]
+    } else {
+        path
+    }
 }
 
 fn ensure_remote_git_cwd(app: &AppHandle, cwd: &str) -> Result<String, String> {
