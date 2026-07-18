@@ -10,6 +10,15 @@ function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
+// Recent Codex CLI versions report an in-progress transport reconnect through
+// the same top-level `error` event that the SDK documents as fatal.  Throwing
+// here aborts the bridge on attempt 1/5 and prevents Codex from recovering.
+// Only suppress messages that explicitly carry a retry counter; a later real
+// stream error (or turn.failed) must still end the turn.
+function isStreamReconnect(message) {
+  return /^Reconnecting(?:\.{3}|…)?\s*\d+\s*\/\s*\d+\b/i.test(message.trim());
+}
+
 function codexPathOverride() {
   const path = process.env.NOVA_CODEX_PATH;
   if (process.platform === "win32" && path && !path.toLowerCase().endsWith(".exe")) {
@@ -88,7 +97,7 @@ async function runPrompt(codex, lines, request) {
         send({ type: "item", item: event.item });
       } else if (event.type === "turn.completed") send({ type: "done", usage: event.usage });
       else if (event.type === "turn.failed") throw new Error(event.error.message);
-      else if (event.type === "error") throw new Error(event.message);
+      else if (event.type === "error" && !isStreamReconnect(event.message)) throw new Error(event.message);
     }
   } finally {
     if (imageDir) await rm(imageDir, { recursive: true, force: true });

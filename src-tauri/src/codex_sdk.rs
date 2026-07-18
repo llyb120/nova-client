@@ -1,6 +1,7 @@
 use crate::acp::{
     apply_proxy_env, resolve_program_on_path, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
 };
+use crate::codex_radar;
 use crate::model_cache;
 use crate::threads::{
     file_uri_to_local_path, now_ms, save_attachment_to_temp, Item, PromptImage, ToolCall,
@@ -188,6 +189,35 @@ impl CodexSdkManager {
                 prompt,
                 fallback,
             );
+        }
+        if self.backend == SdkBackend::Codex
+            && model.as_deref().is_some_and(codex_radar::is_auto_model)
+        {
+            let manager = self.app.state::<AppState>().codex.clone();
+            let options = match manager.ensure_model_options().await {
+                Ok(options) => options,
+                Err(error) => {
+                    self.set_running(&thread_id, true, None);
+                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                    self.finish_turn(&thread_id, "error", None);
+                    return;
+                }
+            };
+            match codex_radar::resolve_auto_model(
+                model.as_deref().unwrap_or_default(),
+                &options,
+                false,
+            )
+            .await
+            {
+                Ok(resolved) => model = Some(resolved),
+                Err(error) => {
+                    self.set_running(&thread_id, true, None);
+                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                    self.finish_turn(&thread_id, "error", None);
+                    return;
+                }
+            }
         }
         if self.backend == SdkBackend::Codex {
             let state = self.app.state::<AppState>();
@@ -788,12 +818,24 @@ impl CodexSdkManager {
         let Some(item) = item else {
             return;
         };
+        let mut update = Some(json!({ "t": "upsert", "item": item }));
         if existing.is_some() {
             if let Some(slot) = thread
                 .items
                 .iter_mut()
                 .find(|candidate| candidate.id() == id)
             {
+                update = if self.backend == SdkBackend::Codex {
+                    match text_snapshot_change(slot, &item) {
+                        TextSnapshotChange::Delta(delta) => {
+                            Some(json!({ "t": "delta", "itemId": id, "text": delta }))
+                        }
+                        TextSnapshotChange::Unchanged => None,
+                        TextSnapshotChange::Replace => Some(json!({ "t": "upsert", "item": item })),
+                    }
+                } else {
+                    Some(json!({ "t": "upsert", "item": item }))
+                };
                 *slot = item.clone();
             }
         } else {
@@ -801,7 +843,9 @@ impl CodexSdkManager {
             thread.items.push(item.clone());
         }
         thread.updated_at = now_ms();
-        let _ = self.emit_update(thread_id, &item);
+        if let Some(op) = update {
+            let _ = self.emit_op(thread_id, op);
+        }
         store.save();
     }
 
@@ -923,10 +967,12 @@ impl CodexSdkManager {
     }
 
     fn emit_update(&self, thread_id: &str, item: &Item) -> Result<(), tauri::Error> {
-        self.app.emit(
-            EV_UPDATE,
-            json!({ "threadId": thread_id, "op": { "t": "upsert", "item": item } }),
-        )
+        self.emit_op(thread_id, json!({ "t": "upsert", "item": item }))
+    }
+
+    fn emit_op(&self, thread_id: &str, op: Value) -> Result<(), tauri::Error> {
+        self.app
+            .emit(EV_UPDATE, json!({ "threadId": thread_id, "op": op }))
     }
 }
 
@@ -1078,11 +1124,39 @@ fn complete_pending_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
     changed
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TextSnapshotChange<'a> {
+    Delta(&'a str),
+    Unchanged,
+    Replace,
+}
+
+/// Codex SDK 的 `item.updated` 携带累计文本快照。把纯追加部分转换成前端 delta，
+/// 同文快照不重复刷新；若服务端改写了既有文本，则回退到整条 upsert。
+fn text_snapshot_change<'a>(previous: &Item, next: &'a Item) -> TextSnapshotChange<'a> {
+    let texts = match (previous, next) {
+        (Item::Assistant { text: previous, .. }, Item::Assistant { text: next, .. })
+        | (Item::Thought { text: previous, .. }, Item::Thought { text: next, .. }) => {
+            Some((previous.as_str(), next.as_str()))
+        }
+        _ => None,
+    };
+    let Some((previous, next)) = texts else {
+        return TextSnapshotChange::Replace;
+    };
+    if previous == next {
+        return TextSnapshotChange::Unchanged;
+    }
+    next.strip_prefix(previous)
+        .map(TextSnapshotChange::Delta)
+        .unwrap_or(TextSnapshotChange::Replace)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         complete_pending_tools, derive_title, normalize_title, parse_bridge_output,
-        resolve_codex_model, tool_call, SdkBackend,
+        resolve_codex_model, text_snapshot_change, tool_call, SdkBackend, TextSnapshotChange,
     };
     use crate::threads::{now_ms, AgentKind, Item, Thread, ToolCall};
     use serde_json::json;
@@ -1165,6 +1239,39 @@ mod tests {
             panic!("expected tool item");
         };
         assert_eq!(call.status, "completed");
+    }
+
+    #[test]
+    fn codex_text_snapshots_become_deltas_when_they_only_append() {
+        let previous = Item::Assistant {
+            id: 1,
+            text: "你好".into(),
+            ts: 1,
+        };
+        let appended = Item::Assistant {
+            id: 1,
+            text: "你好，世界".into(),
+            ts: 2,
+        };
+        let unchanged = appended.clone();
+        let rewritten = Item::Assistant {
+            id: 1,
+            text: "您好，世界".into(),
+            ts: 3,
+        };
+
+        assert_eq!(
+            text_snapshot_change(&previous, &appended),
+            TextSnapshotChange::Delta("，世界")
+        );
+        assert_eq!(
+            text_snapshot_change(&appended, &unchanged),
+            TextSnapshotChange::Unchanged
+        );
+        assert_eq!(
+            text_snapshot_change(&appended, &rewritten),
+            TextSnapshotChange::Replace
+        );
     }
 
     #[test]
