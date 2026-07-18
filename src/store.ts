@@ -46,7 +46,14 @@ import { isScratch } from "./utils";
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
 
+/** 界面风格：现代新版（默认）/ 经典旧版 */
+export type UiStylePref = "modern" | "classic";
+
 const THEME_KEY = "fd:theme";
+const UI_STYLE_KEY = "fd:ui-style";
+
+let modernStyleUrl = "";
+let classicStyleUrl = "";
 
 function readThemePref(): ThemePref {
   return localStorage.getItem(THEME_KEY) === "ink-light" ? "ink-light" : "ink-dark";
@@ -56,9 +63,31 @@ function applyThemeToDom(theme: ThemePref) {
   document.documentElement.dataset.theme = theme;
 }
 
+function readUiStylePref(): UiStylePref {
+  return localStorage.getItem(UI_STYLE_KEY) === "classic" ? "classic" : "modern";
+}
+
+function applyUiStyleToDom(style: UiStylePref) {
+  document.documentElement.dataset.uiStyle = style;
+  const link = document.getElementById("nova-ui-style") as HTMLLinkElement | null;
+  if (link) link.href = style === "classic" ? classicStyleUrl : modernStyleUrl;
+}
+
+/** 在首屏渲染前注册两套样式表地址。两套 CSS 互斥加载，确保旧风格与改版前完全一致。 */
+export function configureUiStyles(modern: string, classic: string) {
+  modernStyleUrl = modern;
+  classicStyleUrl = classic;
+  const link = document.createElement("link");
+  link.id = "nova-ui-style";
+  link.rel = "stylesheet";
+  document.head.append(link);
+  return link;
+}
+
 /** 在首屏渲染前调用，按已保存偏好设置主题，避免明暗闪烁 */
 export function initTheme() {
   applyThemeToDom(readThemePref());
+  applyUiStyleToDom(readUiStylePref());
 }
 
 interface AppStore {
@@ -143,6 +172,8 @@ interface AppStore {
   decisions: Decision[];
   /** 当前界面皮肤 */
   theme: ThemePref;
+  /** 当前界面风格 */
+  uiStyle: UiStylePref;
   /** 后端可用性检测结果（agentKind → 是否可用）。空 = 尚未检测完成（按全部可用处理） */
   backendAvailability: Record<string, boolean>;
 }
@@ -212,11 +243,16 @@ export const [state, setState] = createStore<AppStore>({
   marks: [],
   decisions: [],
   theme: readThemePref(),
+  uiStyle: readUiStylePref(),
   backendAvailability: {},
 });
 
 function isThemePref(v: unknown): v is ThemePref {
   return v === "ink-dark" || v === "ink-light";
+}
+
+function isUiStylePref(v: unknown): v is UiStylePref {
+  return v === "modern" || v === "classic";
 }
 
 /**
@@ -240,6 +276,24 @@ export function setTheme(theme: ThemePref) {
   applyThemeToDom(theme);
   setState("theme", theme);
   persistThemeToBackend(theme);
+}
+
+function persistUiStyleToBackend(uiStyle: UiStylePref) {
+  const s = state.settings;
+  if (!s || s.uiStyle === uiStyle) return;
+  const next = { ...s, uiStyle };
+  setState("settings", next);
+  void api.setSettings(next).catch(() => {
+    // localStorage 仍可保证当前设备上的偏好不丢失
+  });
+}
+
+/** 切换并持久化界面风格，立即更换整套样式表。 */
+export function setUiStyle(uiStyle: UiStylePref) {
+  localStorage.setItem(UI_STYLE_KEY, uiStyle);
+  applyUiStyleToDom(uiStyle);
+  setState("uiStyle", uiStyle);
+  persistUiStyleToBackend(uiStyle);
 }
 
 /**
@@ -1880,6 +1934,13 @@ export async function initStore() {
     if (settings.theme !== state.theme) setTheme(settings.theme);
   } else {
     persistThemeToBackend(state.theme);
+  }
+
+  // 界面风格同样以后端配置为准；老版本缺少字段时 Rust 默认值为 modern。
+  if (isUiStylePref(settings.uiStyle)) {
+    if (settings.uiStyle !== state.uiStyle) setUiStyle(settings.uiStyle);
+  } else {
+    persistUiStyleToBackend(state.uiStyle);
   }
 
   // 团队/漫游：settings 一就绪就立刻刷新中转站状态/名单/收件箱/漫游目录。关键是排在下面较慢的

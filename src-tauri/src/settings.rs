@@ -65,6 +65,8 @@ pub struct Settings {
     pub editor: String,
     /// 界面皮肤（ink-dark / ink-light，空 = 未设置，由前端 localStorage 迁移）
     pub theme: String,
+    /// 界面风格（modern / classic）；缺省使用 modern。
+    pub ui_style: String,
     /// 会话历史展示方式（project / time）。
     pub history_display_mode: String,
     /// 团队/漫游中转服务地址（空 = 关闭团队/漫游功能）
@@ -144,6 +146,7 @@ impl Default for Settings {
             share_model: "swe-1.6".into(),
             editor: "code".into(),
             theme: String::new(),
+            ui_style: "modern".into(),
             history_display_mode: "project".into(),
             relay_server: DEFAULT_RELAY_SERVER.into(),
             relay_token: String::new(),
@@ -196,6 +199,7 @@ mod tests {
     fn missing_history_display_mode_defaults_to_project() {
         let settings: Settings = serde_json::from_str(r#"{"theme":"ink-dark"}"#).unwrap();
         assert_eq!(settings.history_display_mode, "project");
+        assert_eq!(settings.ui_style, "modern");
     }
 
     #[test]
