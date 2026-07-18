@@ -52,7 +52,9 @@ export default function App() {
 
   return (
     <div class="app">
-      <AmbientScene />
+      <Show when={state.uiStyle === "classic"}>
+        <AmbientScene />
+      </Show>
       <Sidebar
         onOpenSettings={() => setShowSettings(true)}
         onOpenUpdate={() => setShowUpdate(true)}
