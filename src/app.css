@@ -933,6 +933,18 @@ button {
   color: var(--text);
 }
 
+.turn-actual-model {
+  width: fit-content;
+  margin: -8px 0 8px auto;
+  padding: 2px 7px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  color: var(--text-faint);
+  background: var(--bg-panel);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
 .turn-process {
   margin: 4px 0 6px;
   padding: 2px 0 2px 12px;

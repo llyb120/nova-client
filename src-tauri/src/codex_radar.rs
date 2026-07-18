@@ -16,17 +16,34 @@ struct RadarModel {
     iq: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedAutoModel {
+    pub value: String,
+    pub label: String,
+}
+
 pub fn is_auto_model(model: &str) -> bool {
     matches!(model, AUTO_VALUE_MODEL | AUTO_IQ_MODEL)
+}
+
+pub fn selection_label(model: &str) -> &'static str {
+    if model == AUTO_IQ_MODEL {
+        "按智商"
+    } else {
+        "按性价比"
+    }
 }
 
 pub async fn resolve_auto_model(
     selected: &str,
     options: &Value,
     open_code: bool,
-) -> Result<String, String> {
+) -> Result<ResolvedAutoModel, String> {
     if !is_auto_model(selected) {
-        return Ok(selected.to_string());
+        return Ok(ResolvedAutoModel {
+            value: selected.to_string(),
+            label: selected.to_string(),
+        });
     }
     if open_code && !has_gpt_model(options) {
         return Err("OpenCode 尚未配置 GPT 模型，Auto 路由未生效".into());
@@ -47,11 +64,15 @@ pub async fn resolve_auto_model(
         let homepage = fetch_text(&client, RADAR_URL).await?;
         latest_value_winner(&entries, &homepage)?
     };
-    match_available_model(options, &winner, open_code).ok_or_else(|| {
+    let value = match_available_model(options, &winner, open_code).ok_or_else(|| {
         format!(
             "Codex 雷达当前第一名 {} · {}，但本机没有对应模型/推理档位",
             winner.model, winner.effort
         )
+    })?;
+    Ok(ResolvedAutoModel {
+        value,
+        label: format!("{} · {}", winner.model, winner.effort),
     })
 }
 

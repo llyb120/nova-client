@@ -2346,7 +2346,11 @@ fn set_thread_model(
     {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
-        thread.model = model.filter(|s| !s.is_empty());
+        let model = model.filter(|s| !s.is_empty());
+        if thread.model != model {
+            thread.clear_auto_route();
+        }
+        thread.model = model;
         agent_kind = thread.agent_kind.clone();
         is_guest = thread.is_roaming_guest();
         is_quota = thread.is_quota_borrowed();
@@ -2494,8 +2498,12 @@ fn set_thread_agent(
         }
         old_kind = thread.agent_kind.clone();
         changed = old_kind != agent_kind;
+        let model = model.filter(|s| !s.is_empty());
+        if changed || thread.model != model {
+            thread.clear_auto_route();
+        }
         thread.agent_kind = agent_kind.clone();
-        thread.model = model.filter(|s| !s.is_empty());
+        thread.model = model;
         thread.mode = mode.filter(|s| !s.is_empty());
         thread.reasoning_effort = reasoning_effort.filter(|s| !s.is_empty());
         switched_item = if changed {
@@ -2698,9 +2706,15 @@ fn send_prompt(
     match agent_kind {
         AgentKind::Codex | AgentKind::CodexPlus => {
             let mgr = state.codexplus.clone();
-            tauri::async_runtime::spawn(async move {
-                mgr.run_prompt(thread_id, text, images).await;
-            });
+            if mgr.is_running(&thread_id) {
+                tauri::async_runtime::spawn(async move {
+                    mgr.steer_prompt(thread_id, text, images).await;
+                });
+            } else {
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(thread_id, text, images).await;
+                });
+            }
         }
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
             let mgr = state.codebuddyplus.clone();

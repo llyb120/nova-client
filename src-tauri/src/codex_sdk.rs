@@ -148,6 +148,7 @@ impl CodexSdkManager {
             session_id,
             native_restore,
             user_item_id,
+            cached_auto_model,
         ) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
@@ -178,6 +179,10 @@ impl CodexSdkManager {
                 session_id,
                 native_restore,
                 user_item_id,
+                thread
+                    .model
+                    .as_deref()
+                    .and_then(|selection| thread.cached_auto_model(selection)),
             );
             store.save();
             values
@@ -190,32 +195,53 @@ impl CodexSdkManager {
                 fallback,
             );
         }
+        self.set_running(&thread_id, true, None);
         if self.backend == SdkBackend::Codex
             && model.as_deref().is_some_and(codex_radar::is_auto_model)
         {
-            let manager = self.app.state::<AppState>().codex.clone();
-            let options = match manager.ensure_model_options().await {
-                Ok(options) => options,
-                Err(error) => {
-                    self.set_running(&thread_id, true, None);
-                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                    self.finish_turn(&thread_id, "error", None);
-                    return;
-                }
-            };
-            match codex_radar::resolve_auto_model(
-                model.as_deref().unwrap_or_default(),
-                &options,
-                false,
-            )
-            .await
-            {
-                Ok(resolved) => model = Some(resolved),
-                Err(error) => {
-                    self.set_running(&thread_id, true, None);
-                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                    self.finish_turn(&thread_id, "error", None);
-                    return;
+            if let Some(cached) = cached_auto_model {
+                model = Some(cached);
+            } else {
+                let selection = model.clone().unwrap_or_default();
+                self.push_system(
+                    &thread_id,
+                    format!(
+                        "正在查询 Codex 雷达，为本会话选择{}第一名…",
+                        codex_radar::selection_label(&selection)
+                    ),
+                    "info",
+                );
+                let manager = self.app.state::<AppState>().codex.clone();
+                let options = match manager.ensure_model_options().await {
+                    Ok(options) => options,
+                    Err(error) => {
+                        self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                        self.finish_turn(&thread_id, "error", None);
+                        return;
+                    }
+                };
+                match codex_radar::resolve_auto_model(&selection, &options, false).await {
+                    Ok(resolved) => {
+                        model = Some(resolved.value.clone());
+                        let state = self.app.state::<AppState>();
+                        let mut store = state.store.lock().unwrap();
+                        if let Some(thread) = store.get_mut(&thread_id) {
+                            thread.auto_route_selection = Some(selection);
+                            thread.auto_routed_model = Some(resolved.value);
+                            thread.auto_routed_label = Some(resolved.label.clone());
+                            let item = thread.push_system(
+                                format!("Auto 路由完成，实际使用模型：{}", resolved.label),
+                                "info",
+                            );
+                            let _ = self.emit_update(&thread_id, &item);
+                        }
+                        store.save();
+                    }
+                    Err(error) => {
+                        self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                        self.finish_turn(&thread_id, "error", None);
+                        return;
+                    }
                 }
             }
         }
@@ -234,6 +260,7 @@ impl CodexSdkManager {
                         reasoning_effort = None;
                         let mut store = state.store.lock().unwrap();
                         if let Some(thread) = store.get_mut(&thread_id) {
+                            thread.clear_auto_route();
                             thread.model = None;
                             thread.reasoning_effort = None;
                         }
@@ -242,8 +269,6 @@ impl CodexSdkManager {
                 }
             }
         }
-        self.set_running(&thread_id, true, None);
-
         let mut parts = Vec::new();
         if native_restore.is_none() {
             if let Some(context) = context.as_ref() {
