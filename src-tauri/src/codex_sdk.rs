@@ -365,6 +365,21 @@ impl CodexSdkManager {
         self.finish_turn(thread_id, "cancelled", None);
     }
 
+    /// SDK 暂不提供向当前活跃 turn 注入提示的接口。
+    /// 收到引导消息时先结束当前 turn，再复用已有 session 启动新 turn，
+    /// 既保留会话上下文，也避免 run_prompt 因 running=true 直接丢弃消息。
+    pub async fn steer_prompt(
+        self: &Arc<Self>,
+        thread_id: String,
+        text: String,
+        images: Vec<PromptImage>,
+    ) {
+        if self.is_running(&thread_id) {
+            self.cancel(&thread_id).await;
+        }
+        self.clone().run_prompt(thread_id, text, images).await;
+    }
+
     pub fn forget_session_of_thread(&self, thread_id: &str) {
         if let Some(bridge) = self.running_children.lock().unwrap().remove(thread_id) {
             if let Some(pid) = bridge.pid {
