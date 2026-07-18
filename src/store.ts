@@ -43,7 +43,7 @@ import type {
 import { firstWakeDoPairForThread } from "./threadDisplay";
 import { isScratch } from "./utils";
 
-/** 界面皮肤：水墨夜色 / 宣纸亮色 */
+/** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
 
 const THEME_KEY = "fd:theme";

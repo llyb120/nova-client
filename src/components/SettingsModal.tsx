@@ -1311,7 +1311,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   onClick={() => setTheme("ink-light")}
                 >
                   <span class="theme-swatch light" />
-                  云白 · 亮色
+                  浅色
                 </button>
                 <button
                   type="button"
@@ -1319,7 +1319,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   onClick={() => setTheme("ink-dark")}
                 >
                   <span class="theme-swatch dark" />
-                  苍穹 · 暗色
+                  深色
                 </button>
               </div>
               <span class="field-hint">明暗两套主题互为镜像、即点即换，选择会自动记住。</span>
