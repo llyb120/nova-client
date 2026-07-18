@@ -193,10 +193,8 @@ export function ChatView() {
     target instanceof Element && !!target.closest(".tool-output, .tool-raw");
 
   const handleWheel = (event: WheelEvent) => {
-    if (isToolDetailScroll(event.target)) {
-      cancelBottomFollow();
-      return;
-    }
+    // 工具详情有独立滚动区，内部滚动不应改变外层会话的吸底状态。
+    if (isToolDetailScroll(event.target)) return;
     if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
     if (event.deltaY > 0 && isAtBottom()) {
       if (!stickToBottom()) enableBottomFollow();
@@ -206,8 +204,9 @@ export function ChatView() {
   };
 
   const handlePointerDown = (event: PointerEvent) => {
+    // 仅跟踪外层滚动区的指针交互；拖动工具详情滚动条不能暂停吸底。
+    if (isToolDetailScroll(event.target)) return;
     pointerActive = true;
-    if (isToolDetailScroll(event.target)) cancelBottomFollow();
   };
 
   const handleTranscriptScroll = () => {
@@ -290,10 +289,7 @@ export function ChatView() {
         target instanceof HTMLElement &&
         (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
       ) return;
-      if (isToolDetailScroll(target)) {
-        cancelBottomFollow();
-        return;
-      }
+      if (isToolDetailScroll(target)) return;
       if (scrollsDown) {
         if (isAtBottom()) {
           if (!stickToBottom()) enableBottomFollow();
