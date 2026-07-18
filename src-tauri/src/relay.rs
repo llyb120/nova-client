@@ -4005,15 +4005,11 @@ fn relay_display_name(s: &Settings) -> String {
     if let Some(name) = relay_token_username(&s.relay_token) {
         return name.to_string();
     }
-    let name = s.relay_name.trim();
-    if !name.is_empty() {
-        return name.to_string();
-    }
-    std::env::var("USERNAME")
+    std::env::var("COMPUTERNAME")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("USERNAME").ok())
         .unwrap_or_else(|| "Nova".to_string())
 }
 

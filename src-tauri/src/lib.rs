@@ -108,6 +108,8 @@ pub struct AppState {
     pub cli_upgrade_lock: tokio::sync::Mutex<()>,
     /// 正在执行的 CLI 安装/升级任务；值为取消标记，设置页和额度前置安装共用。
     pub cli_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 编辑历史消息后正在后台 restore/fork、等待自动重发的会话。
+    pub pending_prompt_restores: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -216,6 +218,14 @@ impl AppState {
 }
 
 pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
+    if state
+        .pending_prompt_restores
+        .lock()
+        .unwrap()
+        .contains(&thread.id)
+    {
+        return true;
+    }
     if thread.is_roaming_guest() {
         return state.relay.is_guest_running(&thread.id);
     }
@@ -613,16 +623,11 @@ async fn get_clue_context(
     }
 }
 
-fn local_clue_author_name(state: &AppState) -> String {
-    let configured = state.settings.lock().unwrap().relay_name.trim().to_string();
-    if configured.is_empty() {
-        std::env::var("USERNAME")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "我".into())
-    } else {
-        configured
-    }
+fn local_clue_author_name() -> String {
+    std::env::var("USERNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "我".into())
 }
 
 #[tauri::command]
@@ -659,7 +664,7 @@ async fn capture_clue(
         }
         result
     } else {
-        let author_name = local_clue_author_name(&state);
+        let author_name = local_clue_author_name();
         state.clues.lock().unwrap().capture(
             &placement,
             target_card_id.as_deref(),
@@ -705,7 +710,7 @@ async fn add_clue_comment(
             let _ = state.clues.lock().unwrap().replace(groups);
         }
     } else {
-        let author_name = local_clue_author_name(&state);
+        let author_name = local_clue_author_name();
         state.clues.lock().unwrap().add_comment(
             &card_id,
             content,
@@ -2641,13 +2646,22 @@ fn sync_skills(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn send_prompt(
-    state: State<'_, AppState>,
+    app: tauri::AppHandle,
     thread_id: String,
     text: String,
     images: Option<Vec<PromptImage>>,
 ) -> Result<(), String> {
+    dispatch_prompt(&app, thread_id, text, images.unwrap_or_default())
+}
+
+fn dispatch_prompt(
+    app: &tauri::AppHandle,
+    thread_id: String,
+    text: String,
+    images: Vec<PromptImage>,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
     let text = text.trim().to_string();
-    let images = images.unwrap_or_default();
     if text.is_empty() && images.is_empty() {
         return Err("内容不能为空".into());
     }
@@ -2759,11 +2773,13 @@ fn send_prompt(
 /// 从指定用户消息处截断会话（该消息及其之后的内容全部删除）。支持历史分叉的后端
 /// 优先从远端对应位置 fork；失败或不支持时，下一条 prompt 才走文本上下文接力。
 #[tauri::command]
-async fn truncate_thread(
+fn truncate_thread(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     item_id: u64,
+    text: Option<String>,
+    images: Option<Vec<PromptImage>>,
 ) -> Result<(), String> {
     if running_by_id(&state, &thread_id) {
         return Err("会话正在运行，请先停止".into());
@@ -2845,63 +2861,111 @@ async fn truncate_thread(
         }
     }
 
-    let forked_session = match agent_kind {
-        AgentKind::Codex | AgentKind::CodexPlus if retained_turns > 0 => {
-            if let Some(session_id) = old_session_id.as_deref() {
-                let manager = match state.borrowed_runtime(&thread_id) {
-                    Some(runtime) => match runtime.manager {
-                        BorrowedManager::Sdk(manager) => Some(manager),
-                        _ => None,
-                    },
-                    None if !is_quota => Some(state.codexplus.clone()),
-                    None => None,
-                };
-                if let Some(manager) = manager {
-                    manager
-                        .fork_session(&cwd, session_id, retained_turns)
-                        .await
-                        .ok()
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-            if let Some(checkpoint) = checkpoint.as_ref() {
-                let manager = match state.borrowed_runtime(&thread_id) {
-                    Some(runtime) => match runtime.manager {
-                        BorrowedManager::OpenCode(manager) => Some(manager),
-                        _ => None,
-                    },
-                    None if !is_quota => Some(state.opencodeplus.clone()),
-                    None => None,
-                };
-                if let Some(manager) = manager {
-                    manager
-                        .fork_session(&cwd, &checkpoint.session_id, &checkpoint.position)
-                        .await
-                        .ok()
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-    if let Some(session_id) = forked_session {
-        let mut store = state.store.lock().unwrap();
-        if let Some(thread) = store.get_mut(&thread_id) {
-            thread.acp_session_id = Some(session_id);
-            thread.handoff_from = None;
-            thread.pending_native_restore = None;
-        }
-        store.save();
-    }
     let _ = app.emit(acp::EV_THREADS, json!({}));
+    let images = images.unwrap_or_default();
+    let prompt_text = text.unwrap_or_default().trim().to_string();
+    let prompt = (!prompt_text.is_empty() || !images.is_empty()).then_some(prompt_text);
+    if prompt.is_some() {
+        state
+            .pending_prompt_restores
+            .lock()
+            .unwrap()
+            .insert(thread_id.clone());
+        let _ = app.emit(
+            acp::EV_TURN,
+            json!({ "threadId": thread_id, "running": true, "stopReason": null }),
+        );
+    }
+    let background_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let forked_session = {
+            let state = background_app.state::<AppState>();
+            match agent_kind {
+                AgentKind::Codex | AgentKind::CodexPlus if retained_turns > 0 => {
+                    if let Some(session_id) = old_session_id.as_deref() {
+                        let manager = match state.borrowed_runtime(&thread_id) {
+                            Some(runtime) => match runtime.manager {
+                                BorrowedManager::Sdk(manager) => Some(manager),
+                                _ => None,
+                            },
+                            None if !is_quota => Some(state.codexplus.clone()),
+                            None => None,
+                        };
+                        if let Some(manager) = manager {
+                            manager
+                                .fork_session(&cwd, session_id, retained_turns)
+                                .await
+                                .ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+                    if let Some(checkpoint) = checkpoint.as_ref() {
+                        let manager = match state.borrowed_runtime(&thread_id) {
+                            Some(runtime) => match runtime.manager {
+                                BorrowedManager::OpenCode(manager) => Some(manager),
+                                _ => None,
+                            },
+                            None if !is_quota => Some(state.opencodeplus.clone()),
+                            None => None,
+                        };
+                        if let Some(manager) = manager {
+                            manager
+                                .fork_session(&cwd, &checkpoint.session_id, &checkpoint.position)
+                                .await
+                                .ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(session_id) = forked_session {
+            let state = background_app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(&thread_id) {
+                thread.acp_session_id = Some(session_id);
+                thread.handoff_from = None;
+                thread.pending_native_restore = None;
+            }
+            store.save();
+        }
+        let should_send = prompt.is_some()
+            && background_app
+                .state::<AppState>()
+                .pending_prompt_restores
+                .lock()
+                .unwrap()
+                .remove(&thread_id);
+        if should_send {
+            let prompt = prompt.unwrap_or_default();
+            if let Err(error) = dispatch_prompt(&background_app, thread_id.clone(), prompt, images)
+            {
+                let state = background_app.state::<AppState>();
+                let mut store = state.store.lock().unwrap();
+                if let Some(thread) = store.get_mut(&thread_id) {
+                    let item = thread.push_system(format!("编辑后重新发送失败：{error}"), "error");
+                    let _ = background_app.emit(
+                        acp::EV_UPDATE,
+                        json!({ "threadId": thread_id, "op": { "t": "upsert", "item": item } }),
+                    );
+                }
+                store.save();
+                let _ = background_app.emit(
+                    acp::EV_TURN,
+                    json!({ "threadId": thread_id, "running": false, "stopReason": "error" }),
+                );
+            }
+        }
+    });
     Ok(())
 }
 
@@ -2913,6 +2977,18 @@ async fn cancel_turn(
     stop_reason: Option<String>,
     delete_work: Option<bool>,
 ) -> Result<(), String> {
+    if state
+        .pending_prompt_restores
+        .lock()
+        .unwrap()
+        .remove(&thread_id)
+    {
+        let _ = app.emit(
+            acp::EV_TURN,
+            json!({ "threadId": thread_id, "running": false, "stopReason": "cancelled" }),
+        );
+        return Ok(());
+    }
     let (is_guest, is_quota) = {
         let store = state.store.lock().unwrap();
         store
@@ -3158,8 +3234,7 @@ async fn set_settings(
         let notify_peer_models = s.quota_shared_models != settings.quota_shared_models;
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
-            || s.relay_groups != settings.relay_groups
-            || s.relay_name != settings.relay_name;
+            || s.relay_groups != settings.relay_groups;
         // 任一后端的路径变化都可能影响「是否可用」，保存后重新并发检测
         let recheck_availability = restart_devin
             || restart_codebuddy
@@ -4545,6 +4620,7 @@ pub fn run() {
                 backend_availability: Mutex::new(HashMap::new()),
                 cli_upgrade_lock: tokio::sync::Mutex::new(()),
                 cli_operations: Mutex::new(HashMap::new()),
+                pending_prompt_restores: Mutex::new(HashSet::new()),
             });
 
             run_session_auto_cleanup(app.handle());

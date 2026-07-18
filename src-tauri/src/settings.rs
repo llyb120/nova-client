@@ -74,8 +74,8 @@ pub struct Settings {
     /// 归属的群组（逗号/空格分隔，可多个）。只有相同群组的人才能在在线名单里看到彼此；
     /// 空 = 默认群组（与其他同样未配置群组的人互相可见，向后兼容）。
     pub relay_groups: String,
-    /// 在团队里展示的名字（空 = 用机器名兜底）
-    pub relay_name: String,
+    /// 是否允许 server 端远程查看和控制本机会话；默认关闭。
+    pub remote_control_enabled: bool,
     /// 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>`；空 = 不共享额度。
     pub quota_shared_models: Vec<String>,
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
@@ -148,7 +148,7 @@ impl Default for Settings {
             relay_server: DEFAULT_RELAY_SERVER.into(),
             relay_token: String::new(),
             relay_groups: String::new(),
-            relay_name: String::new(),
+            remote_control_enabled: false,
             quota_shared_models: Vec::new(),
             devin_enabled: true,
             codex_enabled: true,
@@ -183,6 +183,13 @@ mod tests {
     #[test]
     fn windows_shell_shim_is_disabled_by_default() {
         assert!(!Settings::default().windows_shell_shim_enabled);
+    }
+
+    #[test]
+    fn remote_control_is_disabled_by_default() {
+        assert!(!Settings::default().remote_control_enabled);
+        let settings: Settings = serde_json::from_str(r#"{"relayToken":"configured"}"#).unwrap();
+        assert!(!settings.remote_control_enabled);
     }
 
     #[test]

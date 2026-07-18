@@ -197,7 +197,8 @@ async fn run(app: AppHandle) {
             force_full = false;
             catalog_signature.clear();
             command_watch.clear();
-            sleep(Duration::from_secs(10)).await;
+            // 设置页开启后尽快生效；关闭时命令执行入口还会再次校验开关。
+            sleep(Duration::from_secs(1)).await;
             continue;
         };
         if last_cfg.as_ref() != Some(&cfg) {
@@ -406,6 +407,10 @@ async fn run(app: AppHandle) {
             )
         };
 
+        // 构造同步包期间用户可能刚关闭开关；关闭后不再向 server 上传任何数据。
+        if !remote_control_enabled(&app) {
+            continue;
+        }
         match sync(&client, &cfg, &body).await {
             Ok(resp) => {
                 revision = resp.revision;
@@ -530,18 +535,20 @@ fn error_backoff(error: &str) -> Duration {
 fn config(app: &AppHandle) -> Option<RemoteConfig> {
     let state = app.state::<AppState>();
     let s = state.settings.lock().unwrap().clone();
+    if !s.remote_control_enabled {
+        return None;
+    }
     let server = resolve_relay_server(&s.relay_server);
     let token = s.relay_token.trim().to_string();
     if server.is_empty() || token.is_empty() {
         return None;
     }
-    let name = if s.relay_name.trim().is_empty() {
-        std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "Nova".into())
-    } else {
-        s.relay_name.trim().to_string()
-    };
+    let name = std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("USERNAME").ok())
+        .unwrap_or_else(|| "Nova".into());
     let proxy = [
         &s.devin_proxy,
         &s.codex_proxy,
@@ -562,6 +569,14 @@ fn config(app: &AppHandle) -> Option<RemoteConfig> {
         proxy,
         device_id: state.relay.device_id().to_string(),
     })
+}
+
+fn remote_control_enabled(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .remote_control_enabled
 }
 
 fn build_client(proxy: &str) -> Client {
@@ -1065,6 +1080,9 @@ async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult 
         thread_id,
         data: None,
     };
+    if !remote_control_enabled(app) {
+        return fail("本机未允许远程控制".into());
+    }
     match cmd.kind.as_str() {
         "create" => match create_thread(app, cmd).and_then(|thread| {
             send_prompt(app, &thread.id, &cmd.text)?;

@@ -1292,33 +1292,42 @@ async function sendPromptTo(threadId: string, text: string, images: PromptImage[
   }
 }
 
-/** 编辑历史用户消息并从该处重新开始：先截断，刷新快照后走正常发送流程 */
+/** 编辑历史用户消息并从该处重新开始：界面立即更新，SDK restore/fork 在后端排队完成后再发送。 */
 export async function editUserMessage(itemId: number, text: string, images: PromptImage[] = []) {
   const id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
+  const targetIndex = state.items.findIndex((item) => item.id === itemId);
+  const retained = targetIndex < 0 ? state.items : state.items.slice(0, targetIndex);
+  // 临时 id 只存在于前端；后端 restore 完成、发出真实 user item 后由快照/事件替换。
+  const optimisticId = -Date.now();
+  setState({
+    items: [
+      ...retained,
+      { type: "user", id: optimisticId, text, images, ts: Date.now() } as Item,
+    ],
+    plan: null,
+    proposedPlan: null,
+  });
+  setState("expanded", reconcile({}));
+  setState("running", id, true);
+  bumpChatScrollToBottom();
   // 「停止 → 立刻编辑重发」的竞态：后端 cancel 可能尚未完成，truncate 会被
   // 「会话正在运行」校验拒绝，直接抛错会让这次编辑静默丢失（表现为第一次发送失败）。
   // 短暂重试等 cancel 落地，仍失败才抛出。
   for (let attempt = 0; ; attempt++) {
     try {
-      await api.truncateThread(id, itemId);
+      await api.truncateThread(id, itemId, text, images);
       break;
     } catch (e) {
-      if (attempt >= 10) throw e;
+      if (attempt >= 10) {
+        setState("running", id, false);
+        if (state.currentId === id) await openThread(id);
+        throw e;
+      }
       await new Promise((r) => setTimeout(r, 300));
       if (state.currentId !== id) return;
     }
   }
-  const t = await api.getThread(id);
-  // 防竞态：用户可能已切走
-  if (state.currentId !== id) return;
-  setState({
-    items: t.items,
-    plan: (t.plan as PlanEntry[] | null) ?? null,
-    title: t.title,
-  });
-  setState("expanded", reconcile({}));
-  await sendPrompt(text, images);
 }
 
 export async function cancelTurn(stopReason?: string, deleteWork = false) {
@@ -1419,6 +1428,12 @@ function queueDelta(op: Extract<UpdateOp, { t: "delta" }>) {
 }
 
 function applyUpsert(item: Item) {
+  if (item.type === "user") {
+    const optimistic = state.items.findIndex(
+      (current) => current.type === "user" && current.id < 0,
+    );
+    if (optimistic >= 0) setState("items", (items) => items.filter((_, i) => i !== optimistic));
+  }
   const idx = state.items.findIndex((current) => current.id === item.id);
   if (idx >= 0) setState("items", idx, reconcile(item));
   else setState("items", state.items.length, item);
@@ -1590,6 +1605,13 @@ export async function initStore() {
   await listen<TurnEvent>("acp:turn", (e) => {
     setState("running", e.payload.threadId, e.payload.running);
     if (e.payload.running) preloadThreadSnapshot(e.payload.threadId);
+    else if (
+      e.payload.threadId === state.currentId &&
+      state.items.some((item) => item.id < 0)
+    ) {
+      // 后台 restore 被取消或自动重发失败：清掉尚未落库的乐观消息。
+      void openThread(e.payload.threadId);
+    }
   });
 
   await listen<PermissionRequest>("acp:permission", (e) => {
