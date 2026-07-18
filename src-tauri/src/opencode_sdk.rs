@@ -2,6 +2,7 @@ use crate::acp::{
     apply_proxy_env, resolve_program_on_path, EV_OPTIONS, EV_PERMISSION, EV_PERMISSION_RESOLVED,
     EV_THREADS, EV_TURN, EV_UPDATE,
 };
+use crate::codex_radar;
 use crate::model_cache;
 use crate::threads::{
     file_uri_to_local_path, now_ms, save_attachment_to_temp, Item, PromptImage, ToolCall,
@@ -165,7 +166,7 @@ impl OpenCodeSdkManager {
         if self.is_running(&thread_id) {
             return;
         }
-        let (cwd, model, mode, reasoning_effort, context, session_id, user_item_id) = {
+        let (cwd, mut model, mode, reasoning_effort, context, session_id, user_item_id) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
@@ -188,6 +189,31 @@ impl OpenCodeSdkManager {
             values
         };
         self.set_running(&thread_id, true, None);
+
+        if model.as_deref().is_some_and(codex_radar::is_auto_model) {
+            let options = match self.ensure_model_options().await {
+                Ok(options) => options,
+                Err(error) => {
+                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                    self.finish_turn(&thread_id, "error");
+                    return;
+                }
+            };
+            match codex_radar::resolve_auto_model(
+                model.as_deref().unwrap_or_default(),
+                &options,
+                true,
+            )
+            .await
+            {
+                Ok(resolved) => model = Some(resolved),
+                Err(error) => {
+                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                    self.finish_turn(&thread_id, "error");
+                    return;
+                }
+            }
+        }
 
         let mut parts = Vec::new();
         if let Some(context) = context {

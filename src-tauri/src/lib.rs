@@ -4,6 +4,7 @@ mod cli;
 mod cli_manager;
 mod clues;
 mod codex;
+mod codex_radar;
 mod codex_sdk;
 mod credential_roaming;
 mod employees;

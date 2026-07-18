@@ -1,6 +1,7 @@
 use crate::acp::{
     apply_proxy_env, resolve_program_on_path, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
 };
+use crate::codex_radar;
 use crate::model_cache;
 use crate::threads::{
     file_uri_to_local_path, now_ms, save_attachment_to_temp, Item, PromptImage, ToolCall,
@@ -188,6 +189,35 @@ impl CodexSdkManager {
                 prompt,
                 fallback,
             );
+        }
+        if self.backend == SdkBackend::Codex
+            && model.as_deref().is_some_and(codex_radar::is_auto_model)
+        {
+            let manager = self.app.state::<AppState>().codex.clone();
+            let options = match manager.ensure_model_options().await {
+                Ok(options) => options,
+                Err(error) => {
+                    self.set_running(&thread_id, true, None);
+                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                    self.finish_turn(&thread_id, "error", None);
+                    return;
+                }
+            };
+            match codex_radar::resolve_auto_model(
+                model.as_deref().unwrap_or_default(),
+                &options,
+                false,
+            )
+            .await
+            {
+                Ok(resolved) => model = Some(resolved),
+                Err(error) => {
+                    self.set_running(&thread_id, true, None);
+                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                    self.finish_turn(&thread_id, "error", None);
+                    return;
+                }
+            }
         }
         if self.backend == SdkBackend::Codex {
             let state = self.app.state::<AppState>();

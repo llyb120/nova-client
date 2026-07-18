@@ -266,7 +266,28 @@ export function modelChoices(
   const opts = (source !== undefined ? source : state.modelOptions[agentKind])?.configOptions;
   if (!opts) return [];
   const model = opts.find((o) => o.id === "model");
-  return (model?.options as ModelChoice[]) ?? [];
+  const choices = (model?.options as ModelChoice[]) ?? [];
+  if (agentKind !== "codex" && agentKind !== "opencode") return choices;
+  // OpenCode 的 Auto 只能路由到 GPT；未配置任何 GPT 时不展示，避免产生无效入口。
+  if (
+    agentKind === "opencode" &&
+    !choices.some((choice) => choice.value.toLowerCase().includes("gpt"))
+  ) {
+    return choices;
+  }
+  const auto: ModelChoice[] = [
+    {
+      value: "__nova_auto_value__",
+      name: "Auto（按性价比）",
+      description: "发送前获取最近性价比第一名；数据来自 Codex 雷达 codexradar.com",
+    },
+    {
+      value: "__nova_auto_iq__",
+      name: "Auto（按智商）",
+      description: "发送前获取最近 IQ 第一名；数据来自 Codex 雷达 codexradar.com",
+    },
+  ];
+  return [...auto, ...choices.filter((choice) => !choice.value.startsWith("__nova_auto_"))];
 }
 
 /** 在可选列表中解析应使用的模型。
