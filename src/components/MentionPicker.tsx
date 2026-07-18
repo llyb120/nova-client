@@ -1,4 +1,5 @@
-import { createMemo, createSignal, For, Show } from "solid-js";
+import { createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { Portal } from "solid-js/web";
 import type { Peer } from "../types";
 
 export function MentionPicker(props: {
@@ -10,6 +11,8 @@ export function MentionPicker(props: {
 }) {
   const [query, setQuery] = createSignal("");
   const [opened, setOpened] = createSignal(false);
+  const [menuRect, setMenuRect] = createSignal({ left: 0, top: 0, width: 0 });
+  let rootRef: HTMLDivElement | undefined;
   let inputRef: HTMLInputElement | undefined;
 
   const selected = createMemo(() => {
@@ -45,10 +48,14 @@ export function MentionPicker(props: {
   const add = (token: string) => {
     if (props.disabled) return;
     const tokens = [...new Set(props.selectedTokens)];
+    const keepOpen = candidates().length > 1;
     if (!tokens.includes(token)) props.onChange([...tokens, token]);
     setQuery("");
-    setOpened(true);
-    queueMicrotask(() => inputRef?.focus());
+    setOpened(keepOpen);
+    queueMicrotask(() => {
+      inputRef?.focus();
+      if (keepOpen) positionMenu();
+    });
   };
 
   const remove = (token: string) => {
@@ -56,9 +63,28 @@ export function MentionPicker(props: {
     props.onChange([...new Set(props.selectedTokens)].filter((item) => item !== token));
   };
 
+  const positionMenu = () => {
+    if (!rootRef) return;
+    const rect = rootRef.getBoundingClientRect();
+    const menuHeight = Math.min(candidates().length * 35 + 10, 190, window.innerHeight - 16);
+    const top = window.innerHeight - rect.bottom >= menuHeight + 5
+      ? rect.bottom + 5
+      : Math.max(8, rect.top - menuHeight - 5);
+    setMenuRect({ left: rect.left, top, width: rect.width });
+  };
+
+  const onReflow = () => opened() && positionMenu();
+  window.addEventListener("resize", onReflow);
+  window.addEventListener("scroll", onReflow, true);
+  onCleanup(() => {
+    window.removeEventListener("resize", onReflow);
+    window.removeEventListener("scroll", onReflow, true);
+  });
+
   return (
     <div
       class="mention-picker"
+      ref={rootRef}
       classList={{ "mention-disabled": !!props.disabled }}
       onFocusOut={(event) => {
         const next = event.relatedTarget;
@@ -94,10 +120,14 @@ export function MentionPicker(props: {
         placeholder={props.placeholder ?? "@ 提醒团队成员"}
         aria-expanded={opened()}
         aria-haspopup="listbox"
-        onFocus={() => setOpened(true)}
+        onFocus={() => {
+          positionMenu();
+          setOpened(true);
+        }}
         onInput={(event) => {
           const value = event.currentTarget.value;
           setQuery(value && !value.startsWith("@") ? `@${value.replace(/^@+/, "")}` : value);
+          positionMenu();
           setOpened(true);
         }}
         onKeyDown={(event) => {
@@ -108,25 +138,30 @@ export function MentionPicker(props: {
         }}
       />
 
-      <Show when={opened() && !props.disabled}>
-        <div class="mention-menu" role="listbox">
-          <Show when={candidates().length > 0} fallback={<div class="mention-empty">暂无匹配成员</div>}>
-            <For each={candidates()}>
-              {(peer) => (
-                <button
-                  type="button"
-                  class="mention-option"
-                  role="option"
-                  onClick={() => add(peer.token)}
-                >
-                  <span class={`peer-dot ${peer.online ? "on" : "off"}`} />
-                  <span class="mention-option-name">@{peer.name}</span>
-                  <span class="mention-option-status">{peer.online ? "在线" : "离线"}</span>
-                </button>
-              )}
-            </For>
-          </Show>
+      <Show when={opened() && !props.disabled && candidates().length > 0}>
+        <Portal mount={document.body}>
+        <div
+          class="mention-menu portal"
+          role="listbox"
+          style={{ left: `${menuRect().left}px`, top: `${menuRect().top}px`, width: `${menuRect().width}px` }}
+        >
+          <For each={candidates()}>
+            {(peer) => (
+              <button
+                type="button"
+                class="mention-option"
+                role="option"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => add(peer.token)}
+              >
+                <span class={`peer-dot ${peer.online ? "on" : "off"}`} />
+                <span class="mention-option-name">@{peer.name}</span>
+                <span class="mention-option-status">{peer.online ? "在线" : "离线"}</span>
+              </button>
+            )}
+          </For>
         </div>
+        </Portal>
       </Show>
     </div>
   );
