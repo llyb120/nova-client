@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
@@ -91,6 +91,8 @@ pub struct CodexSdkManager {
     model_options: Mutex<Option<Value>>,
     model_options_refreshing: AtomicBool,
     model_options_revalidated: AtomicBool,
+    next_run_epoch: AtomicU64,
+    run_epochs: Mutex<HashMap<String, u64>>,
 }
 
 impl CodexSdkManager {
@@ -115,6 +117,8 @@ impl CodexSdkManager {
             model_options: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
             model_options_revalidated: AtomicBool::new(false),
+            next_run_epoch: AtomicU64::new(1),
+            run_epochs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -195,6 +199,11 @@ impl CodexSdkManager {
                 fallback,
             );
         }
+        let run_epoch = self.next_run_epoch.fetch_add(1, Ordering::Relaxed);
+        self.run_epochs
+            .lock()
+            .unwrap()
+            .insert(thread_id.clone(), run_epoch);
         self.set_running(&thread_id, true, None);
         if self.backend == SdkBackend::Codex
             && model.as_deref().is_some_and(codex_radar::is_auto_model)
@@ -212,15 +221,23 @@ impl CodexSdkManager {
                     "info",
                 );
                 let manager = self.app.state::<AppState>().codex.clone();
-                let options = match manager.ensure_model_options().await {
+                let options_result = manager.ensure_model_options().await;
+                if !self.is_current_run(&thread_id, run_epoch) {
+                    return;
+                }
+                let options = match options_result {
                     Ok(options) => options,
                     Err(error) => {
                         self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                        self.finish_turn(&thread_id, "error", None);
+                        self.finish_turn_if_current(&thread_id, run_epoch, "error", None);
                         return;
                     }
                 };
-                match codex_radar::resolve_auto_model(&selection, &options, false).await {
+                let resolved = codex_radar::resolve_auto_model(&selection, &options, false).await;
+                if !self.is_current_run(&thread_id, run_epoch) {
+                    return;
+                }
+                match resolved {
                     Ok(resolved) => {
                         model = Some(resolved.value.clone());
                         let state = self.app.state::<AppState>();
@@ -239,7 +256,7 @@ impl CodexSdkManager {
                     }
                     Err(error) => {
                         self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                        self.finish_turn(&thread_id, "error", None);
+                        self.finish_turn_if_current(&thread_id, run_epoch, "error", None);
                         return;
                     }
                 }
@@ -308,8 +325,11 @@ impl CodexSdkManager {
             "parts": parts
         });
         let mut outcome = self
-            .run_prompt_bridge(&thread_id, &cwd, request.clone(), user_item_id)
+            .run_prompt_bridge(&thread_id, &cwd, request.clone(), user_item_id, run_epoch)
             .await;
+        if !self.is_current_run(&thread_id, run_epoch) {
+            return;
+        }
         if outcome.is_err() && native_restore.is_some() {
             self.forget_session_of_thread(&thread_id);
             self.clear_session_id(&thread_id);
@@ -322,10 +342,10 @@ impl CodexSdkManager {
             request["restoreAt"] = Value::Null;
             request["parts"] = Value::Array(fallback_parts);
             outcome = self
-                .run_prompt_bridge(&thread_id, &cwd, request, user_item_id)
+                .run_prompt_bridge(&thread_id, &cwd, request, user_item_id, run_epoch)
                 .await;
         }
-        if !self.is_running(&thread_id) {
+        if !self.is_current_run(&thread_id, run_epoch) {
             return;
         }
         let succeeded = outcome.is_ok();
@@ -336,8 +356,9 @@ impl CodexSdkManager {
                 "error",
             );
         }
-        self.finish_turn(
+        self.finish_turn_if_current(
             &thread_id,
+            run_epoch,
             if succeeded { "end_turn" } else { "error" },
             None,
         );
@@ -366,8 +387,8 @@ impl CodexSdkManager {
     }
 
     /// SDK 暂不提供向当前活跃 turn 注入提示的接口。
-    /// 收到引导消息时先结束当前 turn，再复用已有 session 启动新 turn，
-    /// 既保留会话上下文，也避免 run_prompt 因 running=true 直接丢弃消息。
+    /// 收到引导消息时静默结束当前流，再复用已有 session 启动新 turn。
+    /// 整个过程不生成取消消息或中断轮次，界面持续保持运行状态。
     pub async fn steer_prompt(
         self: &Arc<Self>,
         thread_id: String,
@@ -375,9 +396,39 @@ impl CodexSdkManager {
         images: Vec<PromptImage>,
     ) {
         if self.is_running(&thread_id) {
-            self.cancel(&thread_id).await;
+            self.interrupt_for_steer(&thread_id).await;
         }
         self.clone().run_prompt(thread_id, text, images).await;
+    }
+
+    async fn interrupt_for_steer(&self, thread_id: &str) {
+        // 先让旧轮次失效。即使旧 bridge 随后返回迟到事件，也不能结束新轮次。
+        self.run_epochs.lock().unwrap().remove(thread_id);
+        let bridge = self
+            .running_children
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .map(|bridge| (bridge.stdin.clone(), bridge.pid));
+        if let Some((stdin, pid)) = bridge {
+            let _ = write_line(&stdin, &json!({ "action": "cancel" })).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Some(pid) = pid {
+                crate::acp::kill_process_tree(pid);
+            }
+            self.running_children.lock().unwrap().remove(thread_id);
+        }
+        self.running.lock().unwrap().remove(thread_id);
+
+        // 工具卡片不能永远停留在进行中，但不插入 cancelled turn 或系统提示。
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        if let Some(thread) = store.get_mut(thread_id) {
+            for item in complete_pending_tools(thread) {
+                let _ = self.emit_update(thread_id, &item);
+            }
+        }
+        store.save();
     }
 
     pub fn forget_session_of_thread(&self, thread_id: &str) {
@@ -560,6 +611,7 @@ impl CodexSdkManager {
         cwd: &str,
         request: Value,
         user_item_id: u64,
+        run_epoch: u64,
     ) -> Result<(), String> {
         let mut bridge = match self.backend {
             SdkBackend::Cursor => self.idle_children.lock().unwrap().remove(thread_id),
@@ -576,7 +628,7 @@ impl CodexSdkManager {
             },
         );
         let result = self
-            .read_events(thread_id, user_item_id, &mut bridge.stdout)
+            .read_events(thread_id, user_item_id, run_epoch, &mut bridge.stdout)
             .await;
         self.running_children.lock().unwrap().remove(thread_id);
         let result = result.map_err(|error| {
@@ -657,6 +709,7 @@ impl CodexSdkManager {
         &self,
         thread_id: &str,
         user_item_id: u64,
+        run_epoch: u64,
         stdout: &mut BufReader<tokio::process::ChildStdout>,
     ) -> Result<(), String> {
         let mut lines = stdout.lines();
@@ -671,18 +724,24 @@ impl CodexSdkManager {
                     .unwrap_or("SDK bridge 执行失败")
                     .into());
             }
-            match event.get("type").and_then(Value::as_str) {
-                Some("ready") => {
-                    if let Some(session_id) = event.get("sessionId").and_then(Value::as_str) {
-                        self.save_session_id(thread_id, session_id);
-                    }
+            let event_type = event.get("type").and_then(Value::as_str);
+            // 静默换轮期间仍接收 session id，确保新轮能够续接原上下文。
+            if event_type == Some("ready") {
+                if let Some(session_id) = event.get("sessionId").and_then(Value::as_str) {
+                    self.save_session_id(thread_id, session_id);
                 }
+            }
+            if !self.is_current_run(thread_id, run_epoch) {
+                return Ok(());
+            }
+            match event_type {
+                Some("ready") => {}
                 Some("item") => self.apply_item(thread_id, &event["item"], &mut item_ids),
                 Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
                 Some("permission") => self.emit_permission(thread_id, &event["permission"]),
                 Some("done") => {
                     let usage = event.get("usage").cloned();
-                    self.finish_turn(thread_id, "end_turn", usage);
+                    self.finish_turn_if_current(thread_id, run_epoch, "end_turn", usage);
                     return Ok(());
                 }
                 _ => {}
@@ -962,7 +1021,8 @@ impl CodexSdkManager {
             self.turn_started
                 .lock()
                 .unwrap()
-                .insert(thread_id.into(), Instant::now());
+                .entry(thread_id.into())
+                .or_insert_with(Instant::now);
         } else {
             self.running.lock().unwrap().remove(thread_id);
         }
@@ -977,6 +1037,7 @@ impl CodexSdkManager {
         if !self.is_running(thread_id) {
             return;
         }
+        self.run_epochs.lock().unwrap().remove(thread_id);
         let duration = self
             .turn_started
             .lock()
@@ -1004,6 +1065,26 @@ impl CodexSdkManager {
         store.save();
         drop(store);
         self.set_running(thread_id, false, Some(stop_reason));
+    }
+
+    fn is_current_run(&self, thread_id: &str, run_epoch: u64) -> bool {
+        self.run_epochs
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .is_some_and(|current| *current == run_epoch)
+    }
+
+    fn finish_turn_if_current(
+        &self,
+        thread_id: &str,
+        run_epoch: u64,
+        stop_reason: &str,
+        usage: Option<Value>,
+    ) {
+        if self.is_current_run(thread_id, run_epoch) {
+            self.finish_turn(thread_id, stop_reason, usage);
+        }
     }
 
     fn emit_update(&self, thread_id: &str, item: &Item) -> Result<(), tauri::Error> {
