@@ -153,8 +153,12 @@ export const api = {
     invoke<void>("rename_thread", { threadId, title }),
   sendPrompt: (threadId: string, text: string, images: PromptImage[] = []) =>
     invoke<void>("send_prompt", { threadId, text, images }),
-  truncateThread: (threadId: string, itemId: number) =>
-    invoke<void>("truncate_thread", { threadId, itemId }),
+  truncateThread: (
+    threadId: string,
+    itemId: number,
+    text?: string,
+    images: PromptImage[] = [],
+  ) => invoke<void>("truncate_thread", { threadId, itemId, text, images }),
   cancelTurn: (threadId: string, stopReason?: string | null, deleteWork = false) =>
     invoke<void>("cancel_turn", { threadId, stopReason: stopReason ?? null, deleteWork }),
   compactThread: (threadId: string) => invoke<void>("compact_thread", { threadId }),
