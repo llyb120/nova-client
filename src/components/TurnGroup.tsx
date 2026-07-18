@@ -205,6 +205,9 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
       <Show when={props.group.user}>
         <TranscriptItem item={props.group.user!} />
       </Show>
+      <Show when={props.group.turn?.actualModel}>
+        <div class="turn-actual-model">实际模型：{props.group.turn!.actualModel}</div>
+      </Show>
       <Show when={split().process.length > 0}>
         <Show
           when={foldable()}

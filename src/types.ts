@@ -182,6 +182,8 @@ export interface TurnItem {
   totalTokens?: number | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
+  /** Auto 模式在本轮实际使用的模型及推理档位 */
+  actualModel?: string | null;
   stopReason: string;
 }
 
@@ -207,6 +209,11 @@ export interface Thread {
   model?: string | null;
   mode?: string | null;
   reasoningEffort?: string | null;
+  /** Auto 模式首次查询后缓存的实际模型 value */
+  autoRoutedModel?: string | null;
+  autoRouteSelection?: string | null;
+  /** Auto 模式实际模型的展示名称 */
+  autoRoutedLabel?: string | null;
   ephemeral?: boolean;
   starred?: boolean;
   roamingRole?: string | null;

@@ -276,6 +276,9 @@ pub enum Item {
         input_tokens: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_tokens: Option<u64>,
+        /// Auto 模式在本轮实际路由到的模型及推理档位。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actual_model: Option<String>,
         stop_reason: String,
     },
 }
@@ -343,6 +346,15 @@ pub struct Thread {
     /// Codex 思考强度（None = Codex 模型默认）
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Auto 模式首次查询后缓存的实际模型 value；后续轮次不再抓取雷达。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_routed_model: Option<String>,
+    /// 与缓存对应的 Auto 选项（按性价比 / 按智商）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_route_selection: Option<String>,
+    /// 会话和轮次中展示的实际模型名称。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_routed_label: Option<String>,
     /// 上下文接力：跨 agent 切换时记录切换前的 agent；下一条消息发送时据此把历史
     /// 注入新 agent 的输入，随后清除。None = 无待接力的上下文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,6 +418,18 @@ pub struct Thread {
 }
 
 impl Thread {
+    pub fn cached_auto_model(&self, selection: &str) -> Option<String> {
+        (self.auto_route_selection.as_deref() == Some(selection))
+            .then(|| self.auto_routed_model.clone())
+            .flatten()
+    }
+
+    pub fn clear_auto_route(&mut self) {
+        self.auto_routed_model = None;
+        self.auto_route_selection = None;
+        self.auto_routed_label = None;
+    }
+
     pub fn new(
         cwd: String,
         agent_kind: AgentKind,
@@ -424,6 +448,9 @@ impl Thread {
             model,
             mode,
             reasoning_effort,
+            auto_routed_model: None,
+            auto_route_selection: None,
+            auto_routed_label: None,
             handoff_from: None,
             provider_checkpoints: Vec::new(),
             pending_native_restore: None,
@@ -566,6 +593,11 @@ impl Thread {
             total_tokens: g("totalTokens"),
             input_tokens: g("inputTokens"),
             output_tokens: g("outputTokens"),
+            actual_model: self
+                .model
+                .as_deref()
+                .filter(|model| model.starts_with("__nova_auto_"))
+                .and_then(|_| self.auto_routed_label.clone()),
             stop_reason: stop_reason.into(),
         };
         self.items.push(item.clone());
@@ -1167,6 +1199,35 @@ fn render_handoff_tool(call: &ToolCall) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_route_cache_is_reused_and_written_to_turns() {
+        let mut thread = Thread::new(
+            "D:/project".into(),
+            AgentKind::Codex,
+            Some("__nova_auto_iq__".into()),
+            None,
+            None,
+            false,
+        );
+        thread.auto_route_selection = Some("__nova_auto_iq__".into());
+        thread.auto_routed_model = Some("gpt-5.6-sol:max".into());
+        thread.auto_routed_label = Some("gpt-5.6-sol · max".into());
+
+        assert_eq!(
+            thread.cached_auto_model("__nova_auto_iq__").as_deref(),
+            Some("gpt-5.6-sol:max")
+        );
+        assert!(thread.cached_auto_model("__nova_auto_value__").is_none());
+        let turn = thread.push_turn(1, None, "end_turn");
+        assert!(matches!(
+            turn,
+            Item::Turn {
+                actual_model: Some(model),
+                ..
+            } if model == "gpt-5.6-sol · max"
+        ));
+    }
 
     #[test]
     fn handoff_to_opencode_preserves_history_once() {

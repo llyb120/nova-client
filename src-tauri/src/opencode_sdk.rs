@@ -166,7 +166,16 @@ impl OpenCodeSdkManager {
         if self.is_running(&thread_id) {
             return;
         }
-        let (cwd, mut model, mode, reasoning_effort, context, session_id, user_item_id) = {
+        let (
+            cwd,
+            mut model,
+            mode,
+            reasoning_effort,
+            context,
+            session_id,
+            user_item_id,
+            cached_auto_model,
+        ) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
@@ -184,6 +193,10 @@ impl OpenCodeSdkManager {
                 context,
                 thread.acp_session_id.clone(),
                 user_item_id,
+                thread
+                    .model
+                    .as_deref()
+                    .and_then(|selection| thread.cached_auto_model(selection)),
             );
             store.save();
             values
@@ -191,26 +204,48 @@ impl OpenCodeSdkManager {
         self.set_running(&thread_id, true, None);
 
         if model.as_deref().is_some_and(codex_radar::is_auto_model) {
-            let options = match self.ensure_model_options().await {
-                Ok(options) => options,
-                Err(error) => {
-                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                    self.finish_turn(&thread_id, "error");
-                    return;
-                }
-            };
-            match codex_radar::resolve_auto_model(
-                model.as_deref().unwrap_or_default(),
-                &options,
-                true,
-            )
-            .await
-            {
-                Ok(resolved) => model = Some(resolved),
-                Err(error) => {
-                    self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                    self.finish_turn(&thread_id, "error");
-                    return;
+            if let Some(cached) = cached_auto_model {
+                model = Some(cached);
+            } else {
+                let selection = model.clone().unwrap_or_default();
+                self.push_system(
+                    &thread_id,
+                    format!(
+                        "正在查询 Codex 雷达，为本会话选择{}第一名…",
+                        codex_radar::selection_label(&selection)
+                    ),
+                    "info",
+                );
+                let options = match self.ensure_model_options().await {
+                    Ok(options) => options,
+                    Err(error) => {
+                        self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                        self.finish_turn(&thread_id, "error");
+                        return;
+                    }
+                };
+                match codex_radar::resolve_auto_model(&selection, &options, true).await {
+                    Ok(resolved) => {
+                        model = Some(resolved.value.clone());
+                        let state = self.app.state::<AppState>();
+                        let mut store = state.store.lock().unwrap();
+                        if let Some(thread) = store.get_mut(&thread_id) {
+                            thread.auto_route_selection = Some(selection);
+                            thread.auto_routed_model = Some(resolved.value);
+                            thread.auto_routed_label = Some(resolved.label.clone());
+                            let item = thread.push_system(
+                                format!("Auto 路由完成，实际使用模型：{}", resolved.label),
+                                "info",
+                            );
+                            let _ = self.emit_update(&thread_id, &item);
+                        }
+                        store.save();
+                    }
+                    Err(error) => {
+                        self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
+                        self.finish_turn(&thread_id, "error");
+                        return;
+                    }
                 }
             }
         }

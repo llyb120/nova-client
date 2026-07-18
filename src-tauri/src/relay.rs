@@ -3083,6 +3083,9 @@ impl RelayManager {
             let Some(t) = store.get_mut(&host_thread_id) else {
                 return;
             };
+            if t.model != model {
+                t.clear_auto_route();
+            }
             t.model = model;
             t.mode = mode;
             let ak = t.agent_kind.clone();
