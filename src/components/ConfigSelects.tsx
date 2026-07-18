@@ -39,7 +39,9 @@ const PROVIDER_LABEL: Record<string, string> = {
 
 /** 厂商分组：优先用后端 provider 字段，缺失时按命名启发式归类 */
 function groupOf(value: string, name: string, cost?: ModelCost): string {
-  if (value.startsWith("__nova_auto_")) return "Auto";
+  // Codex Radar Auto ultimately selects a GPT model, so keep it alongside the
+  // GPT choices for both Codex and OpenCode instead of creating a separate group.
+  if (value.startsWith("__nova_auto_")) return "GPT";
   const byProvider = cost?.provider && PROVIDER_LABEL[cost.provider];
   if (byProvider) return byProvider;
   const v = `${value} ${name}`.toLowerCase();
