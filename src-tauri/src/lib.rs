@@ -2643,9 +2643,15 @@ fn send_prompt(
     match agent_kind {
         AgentKind::Codex | AgentKind::CodexPlus => {
             let mgr = state.codexplus.clone();
-            tauri::async_runtime::spawn(async move {
-                mgr.run_prompt(thread_id, text, images).await;
-            });
+            if mgr.is_running(&thread_id) {
+                tauri::async_runtime::spawn(async move {
+                    mgr.steer_prompt(thread_id, text, images).await;
+                });
+            } else {
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(thread_id, text, images).await;
+                });
+            }
         }
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
             let mgr = state.codebuddyplus.clone();
