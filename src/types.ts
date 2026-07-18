@@ -339,8 +339,8 @@ export interface Settings {
   relayToken: string;
   /** 归属的群组（逗号/空格分隔，可多个）；只有相同群组的人能互相看到（空 = 默认群组） */
   relayGroups: string;
-  /** 在团队里展示的名字（空 = 用机器名兜底） */
-  relayName: string;
+  /** 是否允许 server 端远程查看和控制本机会话（默认关闭） */
+  remoteControlEnabled: boolean;
   /** 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>` */
   quotaSharedModels: string[];
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */

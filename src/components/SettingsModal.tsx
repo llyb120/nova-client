@@ -185,7 +185,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [relayServer, setRelayServer] = createSignal(s?.relayServer || DEFAULT_RELAY_SERVER);
   const [relayToken, setRelayToken] = createSignal(s?.relayToken ?? "");
   const [relayGroups, setRelayGroups] = createSignal(s?.relayGroups ?? "");
-  const [relayName, setRelayName] = createSignal(s?.relayName ?? "");
+  const [remoteControlEnabled, setRemoteControlEnabled] = createSignal(
+    s?.remoteControlEnabled ?? false,
+  );
   const [quotaSharedModels, setQuotaSharedModels] = createSignal<string[]>(s?.quotaSharedModels ?? []);
   const [roamingFolders, setRoamingFolders] = createSignal<string[]>(state.roamingFolders);
   const [roamingFoldersLoading, setRoamingFoldersLoading] = createSignal(false);
@@ -390,7 +392,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     relayServer: relayServer().trim(),
     relayToken: relayToken().trim(),
     relayGroups: relayGroups().trim(),
-    relayName: relayName().trim(),
+    remoteControlEnabled: remoteControlEnabled(),
     quotaSharedModels: quotaSharedModels(),
     devinEnabled: devinEnabled(),
     codexEnabled: codexEnabled(),
@@ -1373,16 +1375,21 @@ export function SettingsModal(props: { onClose: () => void }) {
               </span>
             </label>
 
-            <label class="field">
-              <span class="field-label">团队昵称</span>
-              <input
-                class="field-input"
-                value={relayName()}
-                onInput={(e) => setRelayName(e.currentTarget.value)}
-                placeholder="留空则用机器名"
-              />
-              <span class="field-hint">分享、漫游时队友看到的名字。</span>
-            </label>
+            <div class="field">
+              <label
+                style={{ display: "flex", "align-items": "center", gap: "8px" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={remoteControlEnabled()}
+                  onChange={(event) => setRemoteControlEnabled(event.currentTarget.checked)}
+                />
+                <span>允许 server 端远程控制</span>
+              </label>
+              <span class="field-hint">
+                默认关闭。手动开启并保存后，server 端才可查看会话、读取项目文件或发送远程操作。
+              </span>
+            </div>
 
             <div class="field">
               <span class="field-label">允许漫游的项目</span>
@@ -1433,7 +1440,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="field">
               <span class="field-label">共享模型额度（可多选）</span>
               <span class="field-hint">
-                选中的模型会以“{relayName().trim() || "我的"}的 Cursor”这类一级分类出现在队友的新会话模型选择器中。首次选择时会安全同步并预热额度租约；取消勾选后，旧缓存中的入口也无法再使用。
+                选中的模型会以“我的 Cursor”这类一级分类出现在队友的新会话模型选择器中。首次选择时会安全同步并预热额度租约；取消勾选后，旧缓存中的入口也无法再使用。
               </span>
               <div class="quota-share-models">
                 <For each={quotaShareKinds()}>

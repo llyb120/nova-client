@@ -613,16 +613,11 @@ async fn get_clue_context(
     }
 }
 
-fn local_clue_author_name(state: &AppState) -> String {
-    let configured = state.settings.lock().unwrap().relay_name.trim().to_string();
-    if configured.is_empty() {
-        std::env::var("USERNAME")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "我".into())
-    } else {
-        configured
-    }
+fn local_clue_author_name() -> String {
+    std::env::var("USERNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "我".into())
 }
 
 #[tauri::command]
@@ -659,7 +654,7 @@ async fn capture_clue(
         }
         result
     } else {
-        let author_name = local_clue_author_name(&state);
+        let author_name = local_clue_author_name();
         state.clues.lock().unwrap().capture(
             &placement,
             target_card_id.as_deref(),
@@ -705,7 +700,7 @@ async fn add_clue_comment(
             let _ = state.clues.lock().unwrap().replace(groups);
         }
     } else {
-        let author_name = local_clue_author_name(&state);
+        let author_name = local_clue_author_name();
         state.clues.lock().unwrap().add_comment(
             &card_id,
             content,
@@ -3095,8 +3090,7 @@ async fn set_settings(
         let notify_peer_models = s.quota_shared_models != settings.quota_shared_models;
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
-            || s.relay_groups != settings.relay_groups
-            || s.relay_name != settings.relay_name;
+            || s.relay_groups != settings.relay_groups;
         // 任一后端的路径变化都可能影响「是否可用」，保存后重新并发检测
         let recheck_availability = restart_devin
             || restart_codebuddy
