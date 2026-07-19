@@ -1,4 +1,4 @@
-import { createMemo } from "solid-js";
+import { createMemo, For, Show } from "solid-js";
 import "./EngravedNumberMark.css";
 
 interface EngravedNumberMarkProps {
@@ -14,6 +14,7 @@ interface EngravedNumberMarkProps {
 export function EngravedNumberMark(props: EngravedNumberMarkProps) {
   const digits = createMemo(() => String(props.number).replace(/\D/g, ""));
   const username = createMemo(() => (props.username ?? "").replace(/[^A-Za-z.]/g, ""));
+  const usernameParts = createMemo(() => username().split("."));
   const label = createMemo(() =>
     username() ? `No. ${digits()} ${username()}` : `No. ${digits()}`,
   );
@@ -26,7 +27,20 @@ export function EngravedNumberMark(props: EngravedNumberMarkProps) {
     >
       <span class="engraved-number-mark-text" aria-hidden="true">
         <span class="engraved-number-mark-serial">No. {digits()}</span>
-        {username() && <span class="engraved-number-mark-name">{username()}</span>}
+        <Show when={username()}>
+          <span class="engraved-number-mark-name">
+            <For each={usernameParts()}>
+              {(part, index) => (
+                <>
+                  {part}
+                  <Show when={index() < usernameParts().length - 1}>
+                    <span class="engraved-number-mark-dot">.</span>
+                  </Show>
+                </>
+              )}
+            </For>
+          </span>
+        </Show>
       </span>
     </span>
   );

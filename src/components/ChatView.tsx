@@ -11,7 +11,6 @@ import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { PlanCard } from "./PlanCard";
 import { ShareModal } from "./ShareModal";
-import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
 
@@ -645,9 +644,6 @@ export function ChatView() {
         onWheel={handleWheel}
         onPointerDown={handlePointerDown}
       >
-        <ExclusiveChatMark
-          token={state.roamingPeer || state.settings?.relayToken || ""}
-        />
         <div class="transcript-inner" ref={innerRef}>
           <Show when={state.items.length === 0 && !mergedWake() && !state.loadingThread}>
             <div class="transcript-hint">

@@ -51,16 +51,17 @@
 .engraved-number-mark-text {
   display: inline-flex;
   align-items: baseline;
-  gap: 0.24em;
-  transform: translateY(0.04em) rotate(-1deg);
+  gap: 0.18em;
+  transform: translateY(0.04em) rotate(-2.2deg);
   color: var(--engraved-ink);
   font-family: "Nova Flourish Serial", cursive;
   font-size: 1.12em;
   font-style: normal;
   font-weight: 400;
   font-synthesis: none;
+  font-feature-settings: "liga" 1, "calt" 1;
   line-height: 0.72;
-  letter-spacing: 0.015em;
+  letter-spacing: 0;
   white-space: nowrap;
   text-shadow:
     0 -1px 1px var(--engraved-edge-dark),
@@ -70,6 +71,39 @@
 .engraved-number-mark-name,
 .engraved-number-mark-serial {
   display: inline-block;
+}
+
+.engraved-number-mark-serial {
+  font-size: 0.56em;
+  letter-spacing: 0.025em;
+  transform: translateY(-0.08em);
+}
+
+.engraved-number-mark-name {
+  position: relative;
+  padding-inline: 0.02em 0.12em;
+  font-size: 1.08em;
+}
+
+/* 一道渐细的收笔弧线，让整组文字更接近真实签名而不是普通标签。 */
+.engraved-number-mark-name::after {
+  content: "";
+  position: absolute;
+  right: -0.08em;
+  bottom: -0.13em;
+  left: 0.08em;
+  height: 0.22em;
+  border-bottom: 0.018em solid currentColor;
+  border-radius: 0 0 60% 45%;
+  opacity: 0.68;
+  transform: skewX(-24deg) rotate(-1.5deg);
+  transform-origin: right center;
+}
+
+/* 花体句点为独立标点预留了边距；用户名中收紧为域名式间隔。 */
+.engraved-number-mark-dot {
+  display: inline-block;
+  margin-inline: -0.07em;
 }
 
 :root[data-theme="ink-light"] .engraved-number-mark {
@@ -91,27 +125,27 @@
   border-color: color-mix(in srgb, var(--border-strong) 82%, #95866d 18%);
 }
 
-/* 会话专属标识直接刻在背景上，不呈现独立牌体，也不参与消息布局。 */
-.chat-engraved-watermark {
-  position: sticky;
+/* 会话专属标识直接刻在输入框背景上，不呈现独立牌体，也不参与输入布局。 */
+.composer-engraved-watermark {
+  position: absolute;
   z-index: 0;
-  top: 72%;
+  right: 14px;
+  bottom: 47px;
   display: flex;
-  height: 0;
   align-items: center;
   justify-content: flex-end;
-  overflow: visible;
-  padding-right: clamp(24px, 6vw, 84px);
   pointer-events: none;
   user-select: none;
 }
 
-.transcript-inner {
+.composer-input,
+.composer-bar,
+.composer > .image-strip {
   position: relative;
   z-index: 1;
 }
 
-.chat-engraved-mark.engraved-number-mark {
+.composer-engraved-mark.engraved-number-mark {
   min-width: 0;
   height: auto;
   margin: 0;
@@ -122,38 +156,39 @@
   background: transparent;
   box-shadow: none;
   contain: none;
-  font-size: clamp(38px, 5.2vw, 72px);
-  opacity: 0.07;
+  font-size: clamp(27px, 3.8vw, 46px);
+  opacity: 0.11;
 }
 
-.chat-engraved-mark.engraved-number-mark::after {
+.composer-engraved-mark.engraved-number-mark::after {
   display: none;
 }
 
-.chat-engraved-mark .engraved-number-mark-text {
+.composer-engraved-mark .engraved-number-mark-text {
   text-shadow:
-    0 -1px 1px rgba(0, 0, 0, 0.82),
-    0 1px 0 rgba(255, 255, 255, 0.34);
+    0 -1px 0 rgba(0, 0, 0, 0.86),
+    0 1px 0 rgba(255, 255, 255, 0.38);
 }
 
-:root[data-theme="ink-light"] .chat-engraved-mark.engraved-number-mark {
-  opacity: 0.055;
+:root[data-theme="ink-light"] .composer-engraved-mark.engraved-number-mark {
+  opacity: 0.12;
 }
 
-:root[data-theme="ink-light"] .chat-engraved-mark .engraved-number-mark-text {
-  color: #241e18;
+:root[data-theme="ink-light"] .composer-engraved-mark .engraved-number-mark-text {
+  color: #55483a;
+  -webkit-text-stroke: 0.12px rgba(49, 40, 31, 0.5);
   text-shadow:
-    0 -1px 1px rgba(54, 45, 35, 0.58),
-    0 1px 0 rgba(255, 255, 255, 0.94);
+    0 -1px 0 rgba(45, 36, 28, 0.74),
+    0 1px 0 rgba(255, 255, 255, 1);
 }
 
-:root[data-theme="ink-dark"] .chat-engraved-mark.engraved-number-mark {
-  opacity: 0.075;
+:root[data-theme="ink-dark"] .composer-engraved-mark.engraved-number-mark {
+  opacity: 0.15;
 }
 
-:root[data-theme="ink-dark"] .chat-engraved-mark .engraved-number-mark-text {
-  color: var(--text-dim);
+:root[data-theme="ink-dark"] .composer-engraved-mark .engraved-number-mark-text {
+  color: var(--text-muted);
   text-shadow:
-    0 -1px 1px rgba(0, 0, 0, 0.94),
-    0 1px 0 rgba(255, 248, 232, 0.25);
+    0 -1px 0 rgba(0, 0, 0, 1),
+    0 1px 0 rgba(255, 248, 232, 0.34);
 }

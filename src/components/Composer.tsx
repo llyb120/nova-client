@@ -13,6 +13,7 @@ import {
 import type { AgentKind, PromptImage } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
+import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconFile, IconSend, IconStop } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
@@ -349,6 +350,7 @@ export function Composer() {
       class="composer"
       classList={{ "is-dragging": attach.dragging() }}
     >
+      <ExclusiveChatMark token={state.roamingPeer || state.settings?.relayToken || ""} />
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
       <Show when={slashQuery() !== null}>
         <div ref={slashMenuRef} class="slash-menu">
