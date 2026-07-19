@@ -182,6 +182,17 @@ export function ChatView() {
     });
   };
 
+  // scroll 事件发生在浏览器绘制之前。这里若也等到下一帧，快速向上滚动时当前帧只能
+  // 画出虚拟组的空占位；连续滚动会让空白一直追着视口走。用户滚动路径立即复核各组，
+  // ResizeObserver 等可能密集触发的布局变化仍走上面的 RAF 合帧。
+  const refreshVirtualGroupsNow = () => {
+    if (viewportRaf) {
+      cancelAnimationFrame(viewportRaf);
+      viewportRaf = 0;
+    }
+    setViewportTick((n) => n + 1);
+  };
+
   const maxScrollTop = () =>
     scrollRef ? Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight) : 0;
 
@@ -210,7 +221,7 @@ export function ChatView() {
   };
 
   const handleTranscriptScroll = () => {
-    refreshVirtualGroups();
+    refreshVirtualGroupsNow();
     const currentTop = scrollRef?.scrollTop ?? 0;
     const atBottom = isAtBottom();
     if (stickToBottom()) {
