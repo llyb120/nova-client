@@ -1396,6 +1396,10 @@ impl AcpManager {
     }
 
     fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<String>) {
+        self.app
+            .state::<AppState>()
+            .sleep_inhibitor
+            .set_running(thread_id, running);
         {
             let mut set = self.running_threads.lock().unwrap();
             if running {

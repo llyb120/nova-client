@@ -21,6 +21,7 @@ mod remote;
 mod semantic;
 mod settings;
 mod skills;
+mod sleep_inhibitor;
 mod sys_notify;
 mod threads;
 mod updater;
@@ -110,6 +111,8 @@ pub struct AppState {
     pub cli_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 编辑历史消息后正在后台 restore/fork、等待自动重发的会话。
     pub pending_prompt_restores: Mutex<HashSet<String>>,
+    /// 有会话运行时阻止系统因空闲自动休眠；最后一个会话结束后自动释放。
+    pub sleep_inhibitor: sleep_inhibitor::SleepInhibitor,
 }
 
 impl AppState {
@@ -2871,6 +2874,7 @@ fn truncate_thread(
             .lock()
             .unwrap()
             .insert(thread_id.clone());
+        state.sleep_inhibitor.set_running(&thread_id, true);
         let _ = app.emit(
             acp::EV_TURN,
             json!({ "threadId": thread_id, "running": true, "stopReason": null }),
@@ -2945,6 +2949,12 @@ fn truncate_thread(
                 .lock()
                 .unwrap()
                 .remove(&thread_id);
+        if prompt.is_some() {
+            background_app
+                .state::<AppState>()
+                .sleep_inhibitor
+                .set_running(&thread_id, false);
+        }
         if should_send {
             let prompt = prompt.unwrap_or_default();
             if let Err(error) = dispatch_prompt(&background_app, thread_id.clone(), prompt, images)
@@ -2983,6 +2993,7 @@ async fn cancel_turn(
         .unwrap()
         .remove(&thread_id)
     {
+        state.sleep_inhibitor.set_running(&thread_id, false);
         let _ = app.emit(
             acp::EV_TURN,
             json!({ "threadId": thread_id, "running": false, "stopReason": "cancelled" }),
@@ -4621,6 +4632,7 @@ pub fn run() {
                 cli_upgrade_lock: tokio::sync::Mutex::new(()),
                 cli_operations: Mutex::new(HashMap::new()),
                 pending_prompt_restores: Mutex::new(HashSet::new()),
+                sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
             });
 
             run_session_auto_cleanup(app.handle());

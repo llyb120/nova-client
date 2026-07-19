@@ -689,6 +689,10 @@ impl OpenCodeSdkManager {
     }
 
     fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<&str>) {
+        self.app
+            .state::<AppState>()
+            .sleep_inhibitor
+            .set_running(thread_id, running);
         if running {
             self.running.lock().unwrap().insert(thread_id.to_string());
             self.turn_started
