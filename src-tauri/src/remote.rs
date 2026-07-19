@@ -1120,6 +1120,31 @@ mod tests {
         );
         assert_eq!(normalize_remote_file_path("src/file.rs"), "src/file.rs");
     }
+
+    #[test]
+    fn remote_file_path_accepts_linux_file_uris_and_url_encoding() {
+        assert_eq!(
+            normalize_remote_file_path("file:///home/nova/output/%E6%8A%A5%E5%91%8A.pdf"),
+            "/home/nova/output/报告.pdf"
+        );
+        assert_eq!(
+            normalize_remote_file_path("/home/nova/output/my%20report.txt"),
+            "/home/nova/output/my report.txt"
+        );
+    }
+
+    #[test]
+    fn equivalent_remote_cwds_match_after_canonicalization() {
+        let root = std::env::temp_dir().join(format!("nova-remote-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let with_dot = root.join(".");
+        assert!(remote_cwd_matches(
+            &root.to_string_lossy(),
+            &with_dot.to_string_lossy()
+        ));
+        assert!(!remote_cwd_matches(&root.to_string_lossy(), ""));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 async fn process_commands(
@@ -1350,12 +1375,16 @@ fn remote_file(app: &AppHandle, thread_id: &str, cwd: &str, path: &str) -> Resul
         let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
         let thread = store.get(thread_id).ok_or("会话不存在")?;
-        if !eligible(thread) || thread.cwd != cwd {
+        if !eligible(thread) || !remote_cwd_matches(&thread.cwd, cwd) {
             return Err("文件不属于该会话".into());
         }
         thread.cwd.clone()
     };
-    let requested = std::path::Path::new(normalize_remote_file_path(path));
+    let normalized_path = normalize_remote_file_path(path);
+    if normalized_path.is_empty() {
+        return Err("文件路径为空".into());
+    }
+    let requested = std::path::Path::new(&normalized_path);
     let abs = if requested.is_absolute() {
         requested.to_path_buf()
     } else {
@@ -1381,10 +1410,13 @@ fn remote_file(app: &AppHandle, thread_id: &str, cwd: &str, path: &str) -> Resul
     }))
 }
 
-// Codex file links on Windows can use /D:/path syntax. Rust treats that as a
-// rooted path without a drive prefix, so joining/canonicalizing it fails.
-fn normalize_remote_file_path(path: &str) -> &str {
+// Web links can arrive as file:// URIs or URL-encoded paths. Codex links on
+// Windows may additionally use /D:/path, which Rust does not see as a drive path.
+fn normalize_remote_file_path(path: &str) -> String {
     let path = path.trim();
+    let decoded = crate::threads::file_uri_to_local_path(path)
+        .unwrap_or_else(|| crate::threads::percent_decode(path));
+    let path = decoded.as_str();
     let bytes = path.as_bytes();
     if bytes.len() >= 4
         && bytes[0] == b'/'
@@ -1392,9 +1424,26 @@ fn normalize_remote_file_path(path: &str) -> &str {
         && bytes[2] == b':'
         && matches!(bytes[3], b'/' | b'\\')
     {
-        &path[1..]
+        path[1..].to_string()
     } else {
-        path
+        path.to_string()
+    }
+}
+
+fn remote_cwd_matches(thread_cwd: &str, command_cwd: &str) -> bool {
+    let command_cwd = command_cwd.trim();
+    if command_cwd.is_empty() {
+        return false;
+    }
+    if thread_cwd == command_cwd {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(thread_cwd),
+        std::fs::canonicalize(command_cwd),
+    ) {
+        (Ok(thread_cwd), Ok(command_cwd)) => thread_cwd == command_cwd,
+        _ => false,
     }
 }
 
