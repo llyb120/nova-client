@@ -570,8 +570,8 @@ impl RelayManager {
             .http
             .get(format!("{server}/v2/peers"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .timeout(Duration::from_secs(15))
             .send()
@@ -729,12 +729,12 @@ impl RelayManager {
             HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| e.to_string())?,
         );
         headers.insert(
-            "X-Relay-Name",
-            HeaderValue::from_str(name).map_err(|e| e.to_string())?,
+            "X-Relay-Name-Encoded",
+            HeaderValue::from_str(&urlencode(name)).map_err(|e| e.to_string())?,
         );
         headers.insert(
-            "X-Relay-Groups",
-            HeaderValue::from_str(&self.groups_csv()).map_err(|e| e.to_string())?,
+            "X-Relay-Groups-Encoded",
+            HeaderValue::from_str(&urlencode(&self.groups_csv())).map_err(|e| e.to_string())?,
         );
         headers.insert(
             "X-Relay-Device",
@@ -1086,8 +1086,8 @@ impl RelayManager {
             .http
             .post(format!("{server}/v2/ledger/claim"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .header("Content-Type", "application/json")
             .header("Content-Encoding", "gzip")
@@ -1126,8 +1126,8 @@ impl RelayManager {
             .http
             .post(format!("{server}/v2/ledger/set"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .header("Content-Type", "application/json")
             .header("Content-Encoding", "gzip")
@@ -1150,8 +1150,8 @@ impl RelayManager {
             .http
             .post(format!("{server}/v2/ledger/remove"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .header("Content-Type", "application/json")
             .header("Content-Encoding", "gzip")
@@ -1173,8 +1173,8 @@ impl RelayManager {
             .http
             .get(format!("{server}/v2/ledger/list"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .query(&[("scope", scope)])
             .timeout(Duration::from_secs(15))
@@ -1397,8 +1397,8 @@ impl RelayManager {
             let _ = http
                 .post(format!("{server}/v2/folders"))
                 .header("Authorization", format!("Bearer {token}"))
-                .header("X-Relay-Name", &name)
-                .header("X-Relay-Groups", groups)
+                .header("X-Relay-Name-Encoded", urlencode(&name))
+                .header("X-Relay-Groups-Encoded", urlencode(&groups))
                 .header("X-Relay-Device", device_id)
                 .header("Content-Type", "application/json")
                 .header("Content-Encoding", "gzip")
@@ -4116,7 +4116,10 @@ pub async fn probe_relay(server: &str, token: &str, groups: &str) -> Result<i64,
     let resp = client
         .get(format!("{server}/v2/peers"))
         .header("Authorization", format!("Bearer {token}"))
-        .header("X-Relay-Groups", normalize_groups_csv(groups))
+        .header(
+            "X-Relay-Groups-Encoded",
+            urlencode(&normalize_groups_csv(groups)),
+        )
         .send()
         .await
         .map_err(|e| format!("连不上中转站：{e}"))?;
@@ -4190,7 +4193,7 @@ fn relay_display_peers(mut peers: Value) -> Value {
     peers
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

@@ -603,7 +603,7 @@ async fn pull(client: &Client, cfg: &RemoteConfig) -> Result<ServerResponse, Str
     let resp = client
         .get(format!("{}/v2/remote/pull", cfg.server))
         .header("Authorization", format!("Bearer {}", cfg.token))
-        .header("X-Relay-Name", &cfg.name)
+        .header("X-Relay-Name-Encoded", crate::relay::urlencode(&cfg.name))
         .header("X-Relay-Device", &cfg.device_id)
         .send()
         .await
@@ -623,7 +623,7 @@ async fn sync(
     let resp = client
         .post(format!("{}/v2/remote/sync", cfg.server))
         .header("Authorization", format!("Bearer {}", cfg.token))
-        .header("X-Relay-Name", &cfg.name)
+        .header("X-Relay-Name-Encoded", crate::relay::urlencode(&cfg.name))
         .header("X-Relay-Device", &cfg.device_id)
         .header("Content-Type", "application/json")
         .header("Content-Encoding", "gzip")

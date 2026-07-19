@@ -331,23 +331,13 @@ export function SettingsModal(props: { onClose: () => void }) {
   // 后端可用性检测结果：false = 已检测且未找到 CLI（卡片上提示，仍可手动改路径）
   const backendMissing = (kind: string) => state.backendAvailability[kind] === false;
 
-  const ensureRelayToken = () => {
-    const token = relayToken().trim();
-    if (!state.settings?.relayToken.trim() && token && !token.includes("/")) {
-      const generated = `${token}/${crypto.randomUUID()}`;
-      setRelayToken(generated);
-      return generated;
-    }
-    return token;
-  };
-
   const verifyRelay = async () => {
     setVerifying(true);
     setVerifyMsg("");
     try {
       const online = await api.verifyRelay(
         relayServer().trim(),
-        ensureRelayToken(),
+        relayToken().trim(),
         relayGroups().trim(),
       );
       setVerifyMsg(`连接正常 ✓ 本群组在线 ${online} 人`);
@@ -751,7 +741,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const save = async () => {
     setSaving(true);
     const settings = draftSettings();
-    settings.relayToken = ensureRelayToken();
+    settings.relayToken = relayToken().trim();
     const shellShimChanged =
       settings.windowsShellShimEnabled !== (state.settings?.windowsShellShimEnabled ?? false);
     try {
@@ -1353,7 +1343,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   class="field-input"
                   value={relayToken()}
                   onInput={(e) => setRelayToken(e.currentTarget.value)}
-                  placeholder="首次使用时填写用户名"
+                  placeholder="填写服务端配置的 token"
                 />
                 <button
                   class="btn secondary small"
@@ -1364,7 +1354,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </button>
               </div>
               <span class="field-hint">
-                首次保存会生成“用户名/随机串”作为永久 token；队友只会看到用户名。<b>填了 token 即开启团队/漫游，清空 token 即关闭。</b>
+                填写服务端为你配置的身份 token，客户端不会修改或自动生成。<b>填了 token 即开启团队/漫游，清空 token 即关闭。</b>
               </span>
               <Show when={verifyMsg()}>
                 <span class={`relay-verify ${verifyMsg().startsWith("✗") ? "bad" : "ok"}`}>
