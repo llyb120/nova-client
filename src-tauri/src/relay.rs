@@ -1,6 +1,6 @@
 //! 团队分享 + 漫游模式的中转客户端。
 //!
-//! 连接关系：HTTP 负责发送（POST /v1/send），SSE 负责接收（GET /v1/stream）。
+//! 连接关系：v2 WebSocket 单连接双向收发。
 //! 身份用永久 token 区分（设置里配置）。
 //!
 //! 三种能力：
@@ -10,7 +10,7 @@
 //!    guest 只接收展示。host 复用本地 acp/codex 管理器执行，所有产生的 update/turn/
 //!    permission 事件由 lib.rs 的事件监听转发回 guest。
 //!
-//! 断线重连：SSE 断开后指数退避重连；每条定向消息有服务端分配的 seq，重连时带
+//! 断线重连：WebSocket 断开后指数退避重连；每条定向消息有服务端分配的 seq，重连时带
 //! since=<最后 seq> 补发漏掉的消息，保证不丢、不影响使用。
 
 use crate::clues::{CaptureClueResult, ClueContextSnapshot, ClueNodeGroup, EV_CLUES};
@@ -19,9 +19,11 @@ use crate::settings::Settings;
 use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, Worktree};
 use crate::AppState;
 use base64::Engine;
-use flate2::read::DeflateDecoder;
+use flate2::read::{DeflateDecoder, GzDecoder};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures_util::stream::SplitSink;
+use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -32,11 +34,18 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use x25519_dalek::StaticSecret;
 
 use crate::acp::{EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS, EV_TURN, EV_UPDATE};
+
+type RelayWsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 pub const EV_RELAY_STATUS: &str = "relay:status";
 pub const EV_RELAY_PEERS: &str = "relay:peers";
@@ -358,6 +367,16 @@ pub struct RelayManager {
     http: reqwest::Client,
     device_id: String,
     connected: AtomicBool,
+    /// v2 WebSocket 是否已经就绪。
+    protocol_v2: AtomicBool,
+    /// 本次客户端进程的协议纪元，配合 messageId 识别重试和进程重启。
+    epoch: String,
+    /// 最近一次 v2 服务端纪元；服务端重启后游标自动归零重放。
+    server_epoch: StdMutex<String>,
+    /// v2 WebSocket 写半边；读循环独立运行并完成 ACK waiter。
+    ws_writer: tokio::sync::Mutex<Option<RelayWsWriter>>,
+    pending_ws_acks: StdMutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
+    v2_ready: Notify,
     last_seq: AtomicI64,
     last_persist: StdMutex<Instant>,
     peers: StdMutex<Value>,
@@ -387,7 +406,7 @@ pub struct RelayManager {
     quota_lease_flights: StdMutex<HashMap<QuotaLeaseKey, Vec<QuotaLeaseWaiter>>>,
     /// 高级分享：本机处理线程 id -> 处理完成后要分享给谁
     advanced: StdMutex<HashMap<String, String>>,
-    /// guest 侧落盘节流：流式期间不要每条增量都写整个 store（会拖慢 SSE 消费）
+    /// guest 侧落盘节流：流式期间不要每条增量都写整个 store（会拖慢 WebSocket 消费）
     last_store_save: StdMutex<Instant>,
     /// guest 侧每个漫游会话最近一次收到 host 事件的时间，看门狗据此判断是否卡住
     guest_activity: StdMutex<HashMap<String, Instant>>,
@@ -405,13 +424,12 @@ pub struct RelayManager {
 
 impl RelayManager {
     pub fn new(app: AppHandle, config_dir: PathBuf) -> Arc<Self> {
-        let last_seq = read_last_seq(&config_dir);
+        let (last_seq, server_epoch) = read_relay_state(&config_dir);
         let inbox = read_inbox(&config_dir);
         let device_id = read_or_create_device_id(&config_dir);
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
-            // 开启 TCP keepalive：让 OS 层也能更早发现静默死亡的长连接（SSE），
-            // 配合下面 SSE 读侧的空闲超时，双重兜底「漫游过一会儿就不动了」。
+            // HTTP 客户端用于 v2 REST 辅助接口；长连接存活由 WebSocket Ping/Pong 检测。
             .tcp_keepalive(Duration::from_secs(20))
             .build()
             .unwrap_or_default();
@@ -422,6 +440,12 @@ impl RelayManager {
             http,
             device_id,
             connected: AtomicBool::new(false),
+            protocol_v2: AtomicBool::new(false),
+            epoch: uuid::Uuid::new_v4().to_string(),
+            server_epoch: StdMutex::new(server_epoch),
+            ws_writer: tokio::sync::Mutex::new(None),
+            pending_ws_acks: StdMutex::new(HashMap::new()),
+            v2_ready: Notify::new(),
             last_seq: AtomicI64::new(last_seq),
             last_persist: StdMutex::new(Instant::now()),
             peers: StdMutex::new(json!([])),
@@ -533,9 +557,9 @@ impl RelayManager {
     }
 
     /// 主动从服务端拉取一次在线名单，更新缓存并通知前端。
-    /// 前端定时器用它做「兜底刷新」——此前定时器读的是本地缓存（只被 SSE presence 更新），
+    /// 前端定时器用它做「兜底刷新」——定时器平时读的是本地 presence 缓存，
     /// 一旦某次 presence 推送丢失，名单会长时间停在旧状态；这里直接查服务端 roster，
-    /// 不依赖 SSE，既能自愈丢失的 presence，也能在 SSE 尚未连上时就先显示在线名单（加快入网体感）。
+    /// 不依赖 WebSocket 单次推送，既能自愈丢失的 presence，也能在长连接尚未连上时先显示在线名单。
     pub async fn refresh_peers(&self) {
         let Some((server, token, name)) = self.cfg() else {
             *self.peers.lock().unwrap() = json!([]);
@@ -544,10 +568,10 @@ impl RelayManager {
         };
         let resp = self
             .http
-            .get(format!("{server}/v1/peers"))
+            .get(format!("{server}/v2/peers"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .timeout(Duration::from_secs(15))
             .send()
@@ -678,103 +702,149 @@ impl RelayManager {
         }
     }
 
-    async fn connect_once(&self, server: &str, token: &str, name: &str) -> Result<(), String> {
-        let since = self.last_seq.load(Ordering::SeqCst);
-        let url = format!(
-            "{server}/v1/stream?token={}&name={}&since={}&groups={}&device={}",
-            urlencode(token),
-            urlencode(name),
-            since,
-            urlencode(&self.groups_csv()),
-            urlencode(&self.device_id),
-        );
-        // Client 的 connect_timeout 只约束建 TCP 连接；若 TCP 已接通但服务端/反代一直
-        // 不返回 SSE 响应头，send() 仍可能永久等待，使整个重连循环卡死。这里只包住
-        // 响应头阶段，不能给整个流设置 request timeout，否则健康 SSE 也会被定时切断。
-        let resp = timeout(
-            Duration::from_secs(20),
-            self.http
-                .get(&url)
-                .header("Accept", "text/event-stream")
-                .send(),
-        )
-        .await
-        .map_err(|_| "建立连接超时（20s 未收到响应），重试".to_string())?
-        .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
+    async fn clear_v2(&self, reason: &str) {
+        self.protocol_v2.store(false, Ordering::SeqCst);
+        self.ws_writer.lock().await.take();
+        let pending: Vec<oneshot::Sender<Result<Value, String>>> = self
+            .pending_ws_acks
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, tx)| tx)
+            .collect();
+        for tx in pending {
+            let _ = tx.send(Err(reason.to_string()));
         }
+    }
+
+    async fn connect_once(&self, server: &str, token: &str, name: &str) -> Result<(), String> {
+        self.clear_v2("v2 连接正在重建").await;
+        let since = self.last_seq.load(Ordering::SeqCst);
+        let previous_epoch = self.server_epoch.lock().unwrap().clone();
+        let url = websocket_url(server, since, &previous_epoch)?;
+        let mut request = url.into_client_request().map_err(|e| e.to_string())?;
+        let headers = request.headers_mut();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| e.to_string())?,
+        );
+        headers.insert(
+            "X-Relay-Name-Encoded",
+            HeaderValue::from_str(&urlencode(name)).map_err(|e| e.to_string())?,
+        );
+        headers.insert(
+            "X-Relay-Groups-Encoded",
+            HeaderValue::from_str(&urlencode(&self.groups_csv())).map_err(|e| e.to_string())?,
+        );
+        headers.insert(
+            "X-Relay-Device",
+            HeaderValue::from_str(&self.device_id).map_err(|e| e.to_string())?,
+        );
+        headers.insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static("nova.v2"),
+        );
+
+        let (socket, _) = timeout(Duration::from_secs(20), connect_async(request))
+            .await
+            .map_err(|_| "建立 v2 WebSocket 超时（20s）".to_string())?
+            .map_err(|e| e.to_string())?;
+        let (writer, mut reader) = socket.split();
+        *self.ws_writer.lock().await = Some(writer);
+        self.protocol_v2.store(true, Ordering::SeqCst);
+        self.v2_ready.notify_waiters();
         self.set_connected(true);
-        self.log("[relay] 已连接中转站".into());
-        // 上报漫游目录 + 恢复 host 映射 + 重同步进行中的漫游会话
+        self.log("[relay] 已通过 v2 WebSocket 连接中转站".into());
         self.publish_folders();
         self.rebuild_hosted();
         self.resync_guest_threads();
 
-        let mut resp = resp;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut data_lines: Vec<String> = Vec::new();
-        let mut event_type = String::from("message");
-        loop {
-            // SSE 读侧空闲超时：服务端每 15s 发一次心跳（注释行），健康连接下绝不会 40s
-            // 收不到任何字节。一旦底层 TCP 静默死亡（NAT 重绑定 / 网络切换 / 中间设备重置
-            // 而未被 reqwest 感知为正常关闭），resp.chunk() 会永久挂起——既不报错也不返回 None，
-            // 于是永远不重连、不重同步，表现为「漫游执行过一会儿就自动停止」（host/guest 同理）。
-            // 超时即判定连接已死，返回 Err 触发 run_loop 退避重连 + since 补发，自动恢复。
-            let chunk = match timeout(Duration::from_secs(40), resp.chunk()).await {
-                Ok(r) => r.map_err(|e| e.to_string())?,
-                Err(_) => return Err("接收空闲超时（40s 无心跳/数据），判定连接已断，重连".into()),
+        let result = loop {
+            let incoming = match timeout(Duration::from_secs(40), reader.next()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(error))) => break Err(error.to_string()),
+                Ok(None) => break Ok(()),
+                Err(_) => break Err("v2 接收空闲超时（40s 无心跳/数据）".into()),
             };
-            let Some(chunk) = chunk else {
-                return Ok(()); // 服务端关闭，正常重连
-            };
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-                let line = line.trim_end_matches('\r');
-                if line.is_empty() {
-                    if !data_lines.is_empty() {
-                        let data = data_lines.join("\n");
-                        self.on_sse_event(&event_type, &data);
+            match incoming {
+                Message::Text(text) => self.on_v2_frame(text.as_str()),
+                Message::Binary(bytes) => {
+                    if let Some(text) = decode_v2_binary(bytes.as_ref()) {
+                        self.on_v2_frame(&text);
                     }
-                    data_lines.clear();
-                    event_type = "message".into();
-                    continue;
                 }
-                if line.starts_with(':') {
-                    continue; // 心跳/注释
+                Message::Ping(payload) => {
+                    let mut guard = self.ws_writer.lock().await;
+                    let Some(writer) = guard.as_mut() else {
+                        break Err("v2 写通道已关闭".into());
+                    };
+                    if let Err(error) = writer.send(Message::Pong(payload)).await {
+                        break Err(error.to_string());
+                    }
                 }
-                if let Some(rest) = line.strip_prefix("data:") {
-                    data_lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
-                } else if let Some(rest) = line.strip_prefix("event:") {
-                    event_type = rest.trim().to_string();
-                }
+                Message::Pong(_) => {}
+                Message::Close(_) => break Ok(()),
+                _ => {}
             }
-        }
+        };
+        self.clear_v2("v2 连接已断开").await;
+        result
     }
 
-    fn on_sse_event(&self, event_type: &str, data: &str) {
-        if event_type == "ready" {
-            return;
-        }
-        let Ok(mut env) = serde_json::from_str::<InEnvelope>(data) else {
+    fn on_v2_frame(&self, text: &str) {
+        let Ok(frame) = serde_json::from_str::<Value>(text) else {
             return;
         };
-        env.from_name = relay_sender_name(&env.from, &env.from_name);
-        // 还原对端可能压缩过的大载荷
-        maybe_decompress(&mut env.data);
-        if env.seq > 0 {
-            // 跟随服务端分配的序号，作为断线/重连补发的基准（since）。
-            // 关键是「跟随」而非「只增大」：服务端重启后每人的 seq 会从 0 重新计数（新纪元），
-            // 这时收到的 seq 比旧 last_seq 小；若只取较大值，重连时仍会上报旧纪元的大 since，
-            // 服务端便把新消息（低 seq）全部过滤掉 => 漫游/分享消息互相收不到。直接存最近收到
-            // 的 seq（SSE 单连接内严格递增，跨重连由服务端按 since 续发），配合服务端对越界
-            // since 的归零处理即可自愈。on_sse_event 由单一接收循环顺序调用，无并发写。
-            self.last_seq.store(env.seq, Ordering::SeqCst);
-            self.persist_seq(false);
+        match frame["op"].as_str().unwrap_or_default() {
+            "ready" => {
+                if let Some(last_seq) = frame["lastSeq"].as_i64() {
+                    // 服务端可能因纪元变化或游标越界把 since 夹回 0；必须跟随其实际基准。
+                    self.last_seq.store(last_seq, Ordering::SeqCst);
+                }
+                if let Some(epoch) = frame["serverEpoch"].as_str() {
+                    let mut current = self.server_epoch.lock().unwrap();
+                    if !current.is_empty() && *current != epoch {
+                        self.log("[relay] 检测到 v2 服务端新纪元，已自动重放有效缓冲".into());
+                    }
+                    *current = epoch.to_string();
+                    drop(current);
+                    self.persist_seq(true);
+                }
+            }
+            "ack" => {
+                let Some(message_id) = frame["messageId"].as_str() else {
+                    return;
+                };
+                let waiter = self.pending_ws_acks.lock().unwrap().remove(message_id);
+                if let Some(waiter) = waiter {
+                    let result = if let Some(error) = frame["error"].as_str() {
+                        Err(error.to_string())
+                    } else {
+                        Ok(frame)
+                    };
+                    let _ = waiter.send(result);
+                }
+            }
+            "event" => {
+                let Ok(mut env) = serde_json::from_value::<InEnvelope>(frame["event"].clone())
+                else {
+                    return;
+                };
+                env.from_name = relay_sender_name(&env.from, &env.from_name);
+                maybe_decompress(&mut env.data);
+                if env.seq > 0 {
+                    self.last_seq.store(env.seq, Ordering::SeqCst);
+                    self.persist_seq(false);
+                }
+                self.dispatch(env);
+            }
+            "error" => {
+                if let Some(error) = frame["error"].as_str() {
+                    self.log(format!("[relay] v2 协议错误：{error}"));
+                }
+            }
+            _ => {}
         }
-        self.dispatch(env);
     }
 
     fn dispatch(&self, env: InEnvelope) {
@@ -889,9 +959,10 @@ impl RelayManager {
     /// 出站发送 + 瞬时失败重传。序号去重保证重传幂等，
     /// 因此丢消息(网络抖动)不再造成「思考残缺/命令卡 loading/任务卡 loading」。
     async fn send_with_retry(&self, to: &str, kind: &str, data: Value) {
+        let message_id = uuid::Uuid::new_v4().to_string();
         let mut attempt = 0u32;
         loop {
-            match self.send(to, kind, data.clone()).await {
+            match self.send_once(&message_id, to, kind, data.clone()).await {
                 Ok(_) => return,
                 Err(e) => {
                     attempt += 1;
@@ -908,26 +979,90 @@ impl RelayManager {
     }
 
     pub async fn send(&self, to: &str, kind: &str, data: Value) -> Result<Value, String> {
-        let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
-        let body = gzip_json(&json!({ "to": to, "type": kind, "data": data }))?;
-        let resp = self
-            .http
-            .post(format!("{server}/v1/send"))
-            .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
-            .header("X-Relay-Device", &self.device_id)
-            .header("Content-Type", "application/json")
-            .header("Content-Encoding", "gzip")
-            .body(body)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
+        let message_id = uuid::Uuid::new_v4().to_string();
+        self.send_once(&message_id, to, kind, data).await
+    }
+
+    async fn wait_v2_ready(&self) -> Result<(), String> {
+        if self.protocol_v2.load(Ordering::SeqCst) {
+            return Ok(());
         }
-        resp.json::<Value>().await.map_err(|e| e.to_string())
+        let notified = self.v2_ready.notified();
+        // 注册 waiter 后再次检查，避免连接恰好在两次操作之间完成导致丢通知。
+        if self.protocol_v2.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        timeout(Duration::from_secs(30), notified)
+            .await
+            .map_err(|_| "等待 v2 WebSocket 连接恢复超时".to_string())?;
+        if self.protocol_v2.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("v2 WebSocket 尚未连接".into())
+        }
+    }
+
+    async fn send_once(
+        &self,
+        message_id: &str,
+        to: &str,
+        kind: &str,
+        data: Value,
+    ) -> Result<Value, String> {
+        self.wait_v2_ready().await?;
+        self.send_v2(message_id, to, kind, data).await
+    }
+
+    async fn send_v2(
+        &self,
+        message_id: &str,
+        to: &str,
+        kind: &str,
+        data: Value,
+    ) -> Result<Value, String> {
+        let thread_id = relay_thread_id(&data);
+        let (reply, wait) = oneshot::channel();
+        let frame = json!({
+            "version": 2,
+            "op": "send",
+            "messageId": message_id,
+            "epoch": &self.epoch,
+            "threadId": thread_id,
+            "to": to,
+            "type": kind,
+            "data": data,
+        });
+        let encoded = serde_json::to_vec(&frame).map_err(|e| e.to_string())?;
+        let outbound = if encoded.len() >= 1024 {
+            Message::Binary(gzip_json(&frame)?.into())
+        } else {
+            let text = String::from_utf8(encoded).map_err(|e| e.to_string())?;
+            Message::Text(text.into())
+        };
+        self.pending_ws_acks
+            .lock()
+            .unwrap()
+            .insert(message_id.to_string(), reply);
+        let send_result = {
+            let mut guard = self.ws_writer.lock().await;
+            let Some(writer) = guard.as_mut() else {
+                self.pending_ws_acks.lock().unwrap().remove(message_id);
+                return Err("v2 WebSocket 尚未连接".into());
+            };
+            writer.send(outbound).await
+        };
+        if let Err(error) = send_result {
+            self.pending_ws_acks.lock().unwrap().remove(message_id);
+            return Err(error.to_string());
+        }
+        match timeout(Duration::from_secs(30), wait).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("v2 ACK 通道已关闭".into()),
+            Err(_) => {
+                self.pending_ws_acks.lock().unwrap().remove(message_id);
+                Err("等待 v2 ACK 超时".into())
+            }
+        }
     }
 
     // ---- 共享协作账本（跨机器去重/互斥/接力，仲裁在中转站）----
@@ -949,10 +1084,10 @@ impl RelayManager {
         }))?;
         let resp = self
             .http
-            .post(format!("{server}/v1/ledger/claim"))
+            .post(format!("{server}/v2/ledger/claim"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .header("Content-Type", "application/json")
             .header("Content-Encoding", "gzip")
@@ -989,10 +1124,10 @@ impl RelayManager {
         }))?;
         let resp = self
             .http
-            .post(format!("{server}/v1/ledger/set"))
+            .post(format!("{server}/v2/ledger/set"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .header("Content-Type", "application/json")
             .header("Content-Encoding", "gzip")
@@ -1013,10 +1148,10 @@ impl RelayManager {
         let body = gzip_json(&json!({ "scope": scope, "key": key }))?;
         let resp = self
             .http
-            .post(format!("{server}/v1/ledger/remove"))
+            .post(format!("{server}/v2/ledger/remove"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .header("Content-Type", "application/json")
             .header("Content-Encoding", "gzip")
@@ -1036,10 +1171,10 @@ impl RelayManager {
         let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
         let resp = self
             .http
-            .get(format!("{server}/v1/ledger/list"))
+            .get(format!("{server}/v2/ledger/list"))
             .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name", &name)
-            .header("X-Relay-Groups", self.groups_csv())
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
             .query(&[("scope", scope)])
             .timeout(Duration::from_secs(15))
@@ -1074,7 +1209,7 @@ impl RelayManager {
 
     pub async fn clue_list(&self) -> Result<Vec<ClueNodeGroup>, String> {
         let response = self
-            .clue_request(reqwest::Method::GET, "/v1/clues")?
+            .clue_request(reqwest::Method::GET, "/v2/clues")?
             .send()
             .await
             .map_err(|error| error.to_string())?;
@@ -1092,7 +1227,7 @@ impl RelayManager {
     ) -> Result<CaptureClueResult, String> {
         let author_name = self.cfg().map(|(_, _, name)| name).unwrap_or_default();
         let response = self
-            .clue_request(reqwest::Method::POST, "/v1/clues/capture")?
+            .clue_request(reqwest::Method::POST, "/v2/clues/capture")?
             .json(&json!({
                 "threadId": thread_id.unwrap_or_default(),
                 "title": title,
@@ -1116,7 +1251,7 @@ impl RelayManager {
         mention_tokens: &[String],
     ) -> Result<(), String> {
         let response = self
-            .clue_request(reqwest::Method::POST, "/v1/clues/comment")?
+            .clue_request(reqwest::Method::POST, "/v2/clues/comment")?
             .json(&json!({
                 "cardId": card_id,
                 "content": content,
@@ -1136,7 +1271,7 @@ impl RelayManager {
         after_card_id: &str,
     ) -> Result<ClueNodeGroup, String> {
         let response = self
-            .clue_request(reqwest::Method::POST, "/v1/clues/associate")?
+            .clue_request(reqwest::Method::POST, "/v2/clues/associate")?
             .json(&json!({
                 "beforeCardId": before_card_id,
                 "afterCardId": after_card_id,
@@ -1155,7 +1290,7 @@ impl RelayManager {
         after_card_id: &str,
     ) -> Result<ClueNodeGroup, String> {
         let response = self
-            .clue_request(reqwest::Method::POST, "/v1/clues/disassociate")?
+            .clue_request(reqwest::Method::POST, "/v2/clues/disassociate")?
             .json(&json!({
                 "beforeCardId": before_card_id,
                 "afterCardId": after_card_id,
@@ -1170,7 +1305,7 @@ impl RelayManager {
 
     pub async fn clue_split(&self, card_id: &str) -> Result<ClueNodeGroup, String> {
         let response = self
-            .clue_request(reqwest::Method::POST, "/v1/clues/split")?
+            .clue_request(reqwest::Method::POST, "/v2/clues/split")?
             .json(&json!({ "cardId": card_id }))
             .send()
             .await
@@ -1182,7 +1317,7 @@ impl RelayManager {
 
     pub async fn clue_stack(&self, card_ids: &[String]) -> Result<ClueNodeGroup, String> {
         let response = self
-            .clue_request(reqwest::Method::POST, "/v1/clues/stack")?
+            .clue_request(reqwest::Method::POST, "/v2/clues/stack")?
             .json(&json!({ "cardIds": card_ids }))
             .send()
             .await
@@ -1194,7 +1329,7 @@ impl RelayManager {
 
     pub async fn clue_delete(&self, card_id: &str) -> Result<(), String> {
         let response = self
-            .clue_request(reqwest::Method::POST, "/v1/clues/delete")?
+            .clue_request(reqwest::Method::POST, "/v2/clues/delete")?
             .json(&json!({ "cardId": card_id }))
             .send()
             .await
@@ -1205,7 +1340,7 @@ impl RelayManager {
 
     pub async fn clue_context(&self, card_id: &str) -> Result<ClueContextSnapshot, String> {
         let response = self
-            .clue_request(reqwest::Method::GET, "/v1/clues/context")?
+            .clue_request(reqwest::Method::GET, "/v2/clues/context")?
             .query(&[("cardId", card_id)])
             .send()
             .await
@@ -1260,10 +1395,10 @@ impl RelayManager {
         };
         tauri::async_runtime::spawn(async move {
             let _ = http
-                .post(format!("{server}/v1/folders"))
+                .post(format!("{server}/v2/folders"))
                 .header("Authorization", format!("Bearer {token}"))
-                .header("X-Relay-Name", &name)
-                .header("X-Relay-Groups", groups)
+                .header("X-Relay-Name-Encoded", urlencode(&name))
+                .header("X-Relay-Groups-Encoded", urlencode(&groups))
                 .header("X-Relay-Device", device_id)
                 .header("Content-Type", "application/json")
                 .header("Content-Encoding", "gzip")
@@ -2385,7 +2520,7 @@ impl RelayManager {
     }
 
     /// host：收到分支请求，列出该目录所在仓库的本地分支 + 当前分支回给对端。
-    /// git 是同步阻塞命令，丢到独立线程执行，避免卡住 SSE 分发。
+    /// git 是同步阻塞命令，丢到独立线程执行，避免卡住 WebSocket 分发。
     fn on_roaming_branches_request(&self, env: &InEnvelope) {
         let to = env.from.clone();
         let folder = env.data["folder"].as_str().unwrap_or_default().to_string();
@@ -3528,7 +3663,7 @@ impl RelayManager {
         }
         self.touch_guest_activity(&thread_id);
         // 一次性应用整批；落盘做节流（流式期间每条增量都把整个 store 写盘会拖慢
-        // SSE 消费，导致中转缓冲溢出丢消息、卡 loading、思考残缺）。最终一致性由
+        // WebSocket 消费，导致中转缓冲溢出丢消息、卡 loading、思考残缺）。最终一致性由
         // 轮次结束快照 + 重连重同步兜底，所以这里漏存几条流式增量是安全的。
         {
             let state = self.app.state::<AppState>();
@@ -3744,7 +3879,8 @@ impl RelayManager {
             *last = Instant::now();
         }
         let seq = self.last_seq.load(Ordering::SeqCst);
-        write_last_seq(&self.config_dir, seq);
+        let server_epoch = self.server_epoch.lock().unwrap().clone();
+        write_relay_state(&self.config_dir, seq, &server_epoch);
     }
 
     fn log(&self, line: String) {
@@ -3845,6 +3981,22 @@ fn maybe_decompress(data: &mut Value) {
     }
     if let Ok(v) = serde_json::from_slice::<Value>(&out) {
         *data = v;
+    }
+}
+
+fn decode_v2_binary(bytes: &[u8]) -> Option<String> {
+    const MAX_DECOMPRESSED: u64 = 32 * 1024 * 1024;
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let decoder = GzDecoder::new(bytes);
+        let mut limited = decoder.take(MAX_DECOMPRESSED + 1);
+        let mut out = Vec::new();
+        limited.read_to_end(&mut out).ok()?;
+        if out.len() as u64 > MAX_DECOMPRESSED {
+            return None;
+        }
+        String::from_utf8(out).ok()
+    } else {
+        std::str::from_utf8(bytes).ok().map(str::to_string)
     }
 }
 
@@ -3962,9 +4114,12 @@ pub async fn probe_relay(server: &str, token: &str, groups: &str) -> Result<i64,
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
-        .get(format!("{server}/v1/peers"))
+        .get(format!("{server}/v2/peers"))
         .header("Authorization", format!("Bearer {token}"))
-        .header("X-Relay-Groups", normalize_groups_csv(groups))
+        .header(
+            "X-Relay-Groups-Encoded",
+            urlencode(&normalize_groups_csv(groups)),
+        )
         .send()
         .await
         .map_err(|e| format!("连不上中转站：{e}"))?;
@@ -4038,7 +4193,7 @@ fn relay_display_peers(mut peers: Value) -> Value {
     peers
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -4051,12 +4206,40 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-fn read_last_seq(dir: &PathBuf) -> i64 {
-    std::fs::read_to_string(dir.join("relay-state.json"))
+fn websocket_url(server: &str, since: i64, server_epoch: &str) -> Result<String, String> {
+    let base = if let Some(rest) = server.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = server.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        return Err("中转站地址必须以 http:// 或 https:// 开头".into());
+    };
+    Ok(format!(
+        "{}/v2/ws?since={since}&serverEpoch={}",
+        base.trim_end_matches('/'),
+        urlencode(server_epoch),
+    ))
+}
+
+fn relay_thread_id(data: &Value) -> &str {
+    data.get("guestThreadId")
+        .or_else(|| data.get("hostThreadId"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn read_relay_state(dir: &PathBuf) -> (i64, String) {
+    let state = std::fs::read_to_string(dir.join("relay-state.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v["lastSeq"].as_i64())
-        .unwrap_or(0)
+        .unwrap_or_else(|| json!({}));
+    (
+        state["lastSeq"].as_i64().unwrap_or(0),
+        state["serverEpoch"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    )
 }
 
 fn read_or_create_device_id(dir: &PathBuf) -> String {
@@ -4073,11 +4256,11 @@ fn read_or_create_device_id(dir: &PathBuf) -> String {
     id
 }
 
-fn write_last_seq(dir: &PathBuf, seq: i64) {
+fn write_relay_state(dir: &PathBuf, seq: i64, server_epoch: &str) {
     let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(
         dir.join("relay-state.json"),
-        json!({ "lastSeq": seq }).to_string(),
+        json!({ "lastSeq": seq, "serverEpoch": server_epoch }).to_string(),
     );
 }
 
@@ -4098,6 +4281,30 @@ fn persist_inbox(dir: &PathBuf, inbox: &[Share]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_websocket_url_keeps_cursor_and_server_epoch() {
+        assert_eq!(
+            websocket_url("https://relay.example/base", 42, "epoch/a").unwrap(),
+            "wss://relay.example/base/v2/ws?since=42&serverEpoch=epoch%2Fa"
+        );
+        assert_eq!(
+            websocket_url("http://127.0.0.1:8320/", 0, "").unwrap(),
+            "ws://127.0.0.1:8320/v2/ws?since=0&serverEpoch="
+        );
+    }
+
+    #[test]
+    fn v2_gzip_binary_round_trips_and_rejects_oversize() {
+        let value = json!({ "text": "x".repeat(4096) });
+        let compressed = gzip_json(&value).unwrap();
+        let decoded = decode_v2_binary(&compressed).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&decoded).unwrap(), value);
+
+        let huge = json!({ "text": "x".repeat(33 * 1024 * 1024) });
+        let compressed = gzip_json(&huge).unwrap();
+        assert!(decode_v2_binary(&compressed).is_none());
+    }
 
     #[test]
     fn relay_token_username_is_backward_compatible() {

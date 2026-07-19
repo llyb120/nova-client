@@ -247,7 +247,21 @@ fn matches_opencode(value: &str, winner: &RadarModel) -> bool {
         .map(|parts| (parts.0, Some(parts.1)))
         .unwrap_or((value, None));
     let model = base.split_once('/').map(|parts| parts.1).unwrap_or(base);
-    same_model(model, &winner.model) && effort == Some(winner.effort.as_str())
+    if let Some(effort) = effort {
+        return same_model(model, &winner.model) && effort == winner.effort;
+    }
+
+    // Some OpenCode providers expose Codex models as one flat id instead of a
+    // model plus `/variant/<effort>`, for example:
+    //   Codex:    gpt-5.6-sol + max
+    //   OpenCode: windsurf/gpt-5-6-sol-max
+    // Normalize punctuation, peel off the effort suffix, then compare the model
+    // part so both representations resolve to the same locally available model.
+    let model = normalize_key(model);
+    let effort_suffix = format!("_{}", normalize_key(&winner.effort));
+    model
+        .strip_suffix(&effort_suffix)
+        .is_some_and(|model| same_model(model, &winner.model))
 }
 
 fn same_model(available: &str, radar: &str) -> bool {
@@ -331,6 +345,25 @@ mod tests {
         assert_eq!(
             match_available_model(&opencode, &winner, true).as_deref(),
             Some("openai/gpt-5.6-terra/variant/high")
+        );
+    }
+
+    #[test]
+    fn matches_opencode_flat_model_ids_with_embedded_effort() {
+        let winner = RadarModel {
+            key: "x".into(),
+            model: "gpt-5.6-sol".into(),
+            effort: "max".into(),
+            date: "x".into(),
+            iq: 1.0,
+        };
+        let opencode = json!({"configOptions":[{"id":"model","options":[
+            {"value":"windsurf/gpt-5-6-sol-max"},
+            {"value":"windsurf/gpt-5-6-sol-max-priority"}
+        ]}]});
+        assert_eq!(
+            match_available_model(&opencode, &winner, true).as_deref(),
+            Some("windsurf/gpt-5-6-sol-max")
         );
     }
 }

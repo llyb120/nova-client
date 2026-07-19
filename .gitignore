@@ -50,6 +50,7 @@ lerna-debug.log*
 # Tauri specific
 src-tauri/target/
 src-tauri/resources/*.mjs
+src-tauri/resources/*.cjs
 
 # 打包输出（Nova 更新包 nova-x.y.z.zip）
 release/
