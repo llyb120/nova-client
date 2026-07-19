@@ -601,7 +601,7 @@ fn build_client(proxy: &str) -> Client {
 
 async fn pull(client: &Client, cfg: &RemoteConfig) -> Result<ServerResponse, String> {
     let resp = client
-        .get(format!("{}/v1/remote/pull", cfg.server))
+        .get(format!("{}/v2/remote/pull", cfg.server))
         .header("Authorization", format!("Bearer {}", cfg.token))
         .header("X-Relay-Name", &cfg.name)
         .header("X-Relay-Device", &cfg.device_id)
@@ -621,7 +621,7 @@ async fn sync(
 ) -> Result<ServerResponse, String> {
     let body = gzip_json(value)?;
     let resp = client
-        .post(format!("{}/v1/remote/sync", cfg.server))
+        .post(format!("{}/v2/remote/sync", cfg.server))
         .header("Authorization", format!("Bearer {}", cfg.token))
         .header("X-Relay-Name", &cfg.name)
         .header("X-Relay-Device", &cfg.device_id)
