@@ -2212,6 +2212,19 @@ impl RelayManager {
         self.guest_running.lock().unwrap().contains(thread_id)
     }
 
+    fn set_guest_running(&self, thread_id: &str, running: bool) {
+        self.app
+            .state::<AppState>()
+            .sleep_inhibitor
+            .set_running(thread_id, running);
+        let mut threads = self.guest_running.lock().unwrap();
+        if running {
+            threads.insert(thread_id.to_string());
+        } else {
+            threads.remove(thread_id);
+        }
+    }
+
     /// guest：发送一轮对话（路由到 host 执行）
     pub fn guest_send_prompt(
         self: &Arc<Self>,
@@ -2252,10 +2265,7 @@ impl RelayManager {
             store.save();
             self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
         }
-        self.guest_running
-            .lock()
-            .unwrap()
-            .insert(thread_id.to_string());
+        self.set_guest_running(thread_id, true);
         self.touch_guest_activity(thread_id);
         let _ = self.app.emit(
             EV_TURN,
@@ -2310,7 +2320,7 @@ impl RelayManager {
                 json!({ "hostThreadId": host_thread_id }),
             );
         } else {
-            self.guest_running.lock().unwrap().remove(thread_id);
+            self.set_guest_running(thread_id, false);
             let _ = self.app.emit(
                 EV_TURN,
                 json!({ "threadId": thread_id, "running": false, "stopReason": "force_cancelled" }),
@@ -3560,7 +3570,7 @@ impl RelayManager {
                 .lock()
                 .unwrap()
                 .remove(&guest_thread_id);
-            self.guest_running.lock().unwrap().remove(&guest_thread_id);
+            self.set_guest_running(&guest_thread_id, false);
             {
                 let state = self.app.state::<AppState>();
                 let mut store = state.store.lock().unwrap();
@@ -3706,10 +3716,8 @@ impl RelayManager {
             .to_string();
         let running = env.data["running"].as_bool().unwrap_or(false);
         self.touch_guest_activity(&thread_id);
-        if running {
-            self.guest_running.lock().unwrap().insert(thread_id.clone());
-        } else {
-            self.guest_running.lock().unwrap().remove(&thread_id);
+        self.set_guest_running(&thread_id, running);
+        if !running {
             // 轮次结束：强制落盘一次，确保最终状态持久化（流式期间是节流落盘）
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
@@ -3763,6 +3771,7 @@ impl RelayManager {
         let plan = env.data["plan"].clone();
         let running = env.data["running"].as_bool().unwrap_or(false);
         self.touch_guest_activity(&thread_id);
+        self.set_guest_running(&thread_id, running);
         // 快照是全量真相：把序号基准对齐到快照携带的 seq，之后只接受更高序号的增量，
         // 丢弃迟到/重复的旧增量（避免快照后又被旧 delta 二次追加）。
         if let Some(seq) = env.data.get("seq").and_then(|v| v.as_i64()) {
@@ -3818,11 +3827,6 @@ impl RelayManager {
                 return;
             }
         }
-        if running {
-            self.guest_running.lock().unwrap().insert(thread_id.clone());
-        } else {
-            self.guest_running.lock().unwrap().remove(&thread_id);
-        }
         let _ = self
             .app
             .emit(EV_RELAY_RELOAD, json!({ "threadId": thread_id }));
@@ -3838,7 +3842,7 @@ impl RelayManager {
             .unwrap_or_default()
             .to_string();
         let msg = env.data["error"].as_str().unwrap_or("漫游出错").to_string();
-        self.guest_running.lock().unwrap().remove(&thread_id);
+        self.set_guest_running(&thread_id, false);
         {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
