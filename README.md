@@ -96,6 +96,17 @@ npm run tauri build
 
 产物在 `src-tauri/target/release/bundle/` 下。
 
+**Linux 无界面服务器：**
+
+Nova 可作为常驻后端运行，并通过 Nova Web 远程控制。服务器无需桌面环境，只需安装
+`xvfb`；启动时不会显示窗口：
+
+```bash
+Nova server --relay-server https://relay.example.com --token "$NOVA_TOKEN" --project /srv/project
+```
+
+完整参数、安全建议和 systemd 配置见 [Nova Headless Server](docs/headless-server.md)。
+
 打包并上传自更新通道：
 
 ```bash

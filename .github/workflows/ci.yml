@@ -18,6 +18,8 @@ jobs:
             os: windows-latest
           - name: macos
             os: macos-latest
+          - name: linux
+            os: ubuntu-22.04
 
     runs-on: ${{ matrix.os }}
 
@@ -48,6 +50,12 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb
+
       - name: Typecheck
         run: npm run check
 
@@ -58,6 +66,10 @@ jobs:
       - name: Build (macOS app + DMG)
         if: runner.os == 'macOS'
         run: npx tauri build --bundles dmg
+
+      - name: Build (Linux DEB + AppImage)
+        if: runner.os == 'Linux'
+        run: npx tauri build --bundles deb,appimage
 
       - name: Upload Windows binary
         if: runner.os == 'Windows'
@@ -81,4 +93,15 @@ jobs:
         with:
           name: Nova-macos-binary
           path: src-tauri/target/release/Nova
+          if-no-files-found: error
+
+      - name: Upload Linux packages
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nova-linux-x64
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/Nova
           if-no-files-found: error

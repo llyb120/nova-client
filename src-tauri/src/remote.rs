@@ -69,6 +69,7 @@ struct RemoteSnapshot {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     thread_snapshots: HashMap<String, Value>,
     models: HashMap<String, Value>,
+    permissions: Vec<Value>,
 }
 
 #[derive(Serialize)]
@@ -116,6 +117,12 @@ struct RemoteCommand {
     text: String,
     #[serde(default)]
     path: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    request_key: String,
+    #[serde(default)]
+    option_id: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -180,6 +187,7 @@ async fn run(app: AppHandle) {
     let mut processed_id = 0i64;
     let mut results: Vec<CommandResult> = Vec::new();
     let mut catalog_signature = String::new();
+    let mut permission_signature = String::new();
     // 远程命令通过异步任务启动。初始快照可能先看到 running=false，随后任务才登记运行；
     // 在这段窗口内主动跟踪命令涉及的会话，避免释放基线后漏掉整个短任务。
     let mut command_watch: HashMap<String, Instant> = HashMap::new();
@@ -196,6 +204,7 @@ async fn run(app: AppHandle) {
             previous.clear();
             force_full = false;
             catalog_signature.clear();
+            permission_signature.clear();
             command_watch.clear();
             // 设置页开启后尽快生效；关闭时命令执行入口还会再次校验开关。
             sleep(Duration::from_secs(1)).await;
@@ -217,6 +226,7 @@ async fn run(app: AppHandle) {
             processed_id = 0;
             results.clear();
             catalog_signature.clear();
+            permission_signature.clear();
             command_watch.clear();
         }
 
@@ -281,6 +291,10 @@ async fn run(app: AppHandle) {
         let metas = thread_metas(&app);
         let next_catalog_signature = catalog_signature_for(&metas);
         let catalog_changed = next_catalog_signature != catalog_signature;
+        let permissions = remote_permissions(&app);
+        let next_permission_signature =
+            serde_json::to_string(&permissions).unwrap_or_else(|_| "[]".into());
+        let permissions_changed = next_permission_signature != permission_signature;
         let needs_snapshot = current.keys().any(|id| !previous.contains_key(id));
         let dirty_ids: HashSet<String> = current
             .iter()
@@ -294,6 +308,7 @@ async fn run(app: AppHandle) {
             || catalog_changed
             || needs_snapshot
             || !dirty_ids.is_empty()
+            || permissions_changed
             || !results.is_empty();
 
         if !want_upload {
@@ -361,7 +376,7 @@ async fn run(app: AppHandle) {
                     "kind": "threads",
                     "baseRevision": revision,
                     "revision": next_revision,
-                    "snapshot": threads_pack_with_metas(metas.clone(), &snapshot_threads),
+                    "snapshot": threads_pack_with_metas(&app, metas.clone(), &snapshot_threads),
                     "threadCheckpoints": checkpoints,
                 }),
                 snapshot_threads.keys().cloned().collect::<HashSet<_>>(),
@@ -401,6 +416,7 @@ async fn run(app: AppHandle) {
                     "baseRevision": revision,
                     "revision": next_revision,
                     "delta": { "threads": deltas },
+                    "permissions": permissions,
                 }),
                 dirty_ids.clone(),
                 false,
@@ -450,6 +466,9 @@ async fn run(app: AppHandle) {
                     }
                     if sent_catalog && !resp.resync {
                         catalog_signature = next_catalog_signature;
+                    }
+                    if !resp.resync {
+                        permission_signature = next_permission_signature;
                     }
                 }
                 force_full = resp.need_full;
@@ -543,25 +562,27 @@ fn config(app: &AppHandle) -> Option<RemoteConfig> {
     if server.is_empty() || token.is_empty() {
         return None;
     }
-    let name = std::env::var("COMPUTERNAME")
-        .ok()
+    let name = crate::server::configured_name()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .filter(|value| !value.trim().is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(|| std::env::var("USERNAME").ok())
         .unwrap_or_else(|| "Nova".into());
-    let proxy = [
-        &s.devin_proxy,
-        &s.codex_proxy,
-        &s.codebuddy_proxy,
-        &s.claudecode_proxy,
-        &s.cursor_proxy,
-        &s.opencode_proxy,
-    ]
-    .into_iter()
-    .map(|p| p.trim())
-    .find(|p| !p.is_empty())
-    .unwrap_or("")
-    .to_string();
+    let proxy = crate::server::configured_proxy().unwrap_or_else(|| {
+        [
+            &s.devin_proxy,
+            &s.codex_proxy,
+            &s.codebuddy_proxy,
+            &s.claudecode_proxy,
+            &s.cursor_proxy,
+            &s.opencode_proxy,
+        ]
+        .into_iter()
+        .map(|p| p.trim())
+        .find(|p| !p.is_empty())
+        .unwrap_or("")
+        .to_string()
+    });
     Some(RemoteConfig {
         server,
         token,
@@ -638,7 +659,10 @@ async fn sync(
 }
 
 fn eligible(t: &Thread) -> bool {
-    t.roaming_role.is_none() && t.employee_id.is_none() && !t.mind_thread
+    t.roaming_role.is_none()
+        && t.employee_id.is_none()
+        && !t.mind_thread
+        && crate::server::path_allowed(&t.cwd)
 }
 
 fn thread_metas(app: &AppHandle) -> Vec<RemoteThreadMeta> {
@@ -754,11 +778,13 @@ fn full_snapshot(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSna
             .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
             .collect(),
         models: models(app),
+        permissions: remote_permissions(app),
     }
 }
 
 /// 轻量包：只带会话列表 + 指定会话快照，供打开历史/预热，避免重扫 projects 与重传 models。
 fn threads_pack_with_metas(
+    app: &AppHandle,
     metas: Vec<RemoteThreadMeta>,
     synced: &HashMap<String, Thread>,
 ) -> RemoteSnapshot {
@@ -771,7 +797,18 @@ fn threads_pack_with_metas(
             .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
             .collect(),
         models: HashMap::new(),
+        permissions: remote_permissions(app),
     }
+}
+
+fn remote_permissions(app: &AppHandle) -> Vec<Value> {
+    app.state::<AppState>()
+        .remote_permissions
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect()
 }
 
 /// 目录签名刻意排除 updated_at/running：这两个高频字段由逐会话增量携带，
@@ -1116,6 +1153,26 @@ async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult 
             Ok(()) => ok_thread(cmd.thread_id.clone()),
             Err(e) => fail(e),
         },
+        "rename" => match rename_remote_thread(app, &cmd.thread_id, &cmd.title) {
+            Ok(()) => ok_thread(cmd.thread_id.clone()),
+            Err(e) => fail(e),
+        },
+        "configure" => match configure_remote_thread(app, cmd) {
+            Ok(()) => ok_thread(cmd.thread_id.clone()),
+            Err(e) => fail(e),
+        },
+        "permission" => {
+            match respond_remote_permission(app, &cmd.request_key, &cmd.option_id).await {
+                Ok(()) => CommandResult {
+                    id: cmd.id,
+                    ok: true,
+                    error: String::new(),
+                    thread_id: cmd.thread_id.clone(),
+                    data: None,
+                },
+                Err(e) => fail(e),
+            }
+        }
         "git_status" => match remote_git_status(app, &cmd.cwd) {
             Ok(data) => CommandResult {
                 id: cmd.id,
@@ -1147,6 +1204,112 @@ async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult 
             Err(e) => fail(e),
         },
         _ => fail("不支持的远程操作".into()),
+    }
+}
+
+fn rename_remote_thread(app: &AppHandle, thread_id: &str, title: &str) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("标题不能为空".into());
+    }
+    let state = app.state::<AppState>();
+    let mut store = state.store.lock().unwrap();
+    let thread = store.get_mut(thread_id).ok_or("会话不存在")?;
+    if !eligible(thread) {
+        return Err("该会话不支持远程操作".into());
+    }
+    thread.title = title.to_string();
+    store.save();
+    let _ = app.emit(crate::acp::EV_THREADS, json!({}));
+    Ok(())
+}
+
+fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let kind = {
+        let mut store = state.store.lock().unwrap();
+        let thread = store.get_mut(&cmd.thread_id).ok_or("会话不存在")?;
+        if !eligible(thread) {
+            return Err("该会话不支持远程操作".into());
+        }
+        if is_running(&state, thread) {
+            return Err("请先停止当前轮次再切换模型或模式".into());
+        }
+        if !cmd.model.trim().is_empty() {
+            thread.model = Some(cmd.model.trim().to_string());
+        }
+        if !cmd.mode.trim().is_empty() {
+            thread.mode = Some(cmd.mode.trim().to_string());
+        }
+        let kind = thread.agent_kind.clone();
+        store.save();
+        kind
+    };
+    match kind {
+        AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            state.codexplus.forget_session_of_thread(&cmd.thread_id)
+        }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            state.codebuddyplus.forget_session_of_thread(&cmd.thread_id)
+        }
+        AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&cmd.thread_id),
+        AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            state.opencodeplus.forget_session_of_thread(&cmd.thread_id)
+        }
+    }
+    Ok(())
+}
+
+async fn respond_remote_permission(
+    app: &AppHandle,
+    request_key: &str,
+    option_id: &str,
+) -> Result<(), String> {
+    if request_key.trim().is_empty() {
+        return Err("缺少权限请求标识".into());
+    }
+    let state = app.state::<AppState>();
+    let borrowed = state
+        .borrowed_runtimes
+        .lock()
+        .unwrap()
+        .values()
+        .find(|runtime| runtime.has_pending_permission(request_key))
+        .cloned();
+    if let Some(runtime) = borrowed {
+        return runtime.respond_permission(request_key, option_id).await;
+    }
+    if request_key.starts_with("cdp-") {
+        state
+            .codexplus
+            .respond_permission(request_key, option_id)
+            .await
+    } else if request_key.starts_with("cbp-") {
+        state
+            .codebuddyplus
+            .respond_permission(request_key, option_id)
+            .await
+    } else if request_key.starts_with("clp-") {
+        state
+            .claudeplus
+            .respond_permission(request_key, option_id)
+            .await
+    } else if request_key.starts_with("cup-") {
+        state
+            .cursorplus
+            .respond_permission(request_key, option_id)
+            .await
+    } else if request_key.starts_with("ocp-") {
+        state
+            .opencodeplus
+            .respond_permission(request_key, option_id)
+            .await
+    } else if request_key.starts_with("codex-") {
+        state.codex.respond_permission(request_key, option_id).await
+    } else {
+        state.acp.respond_permission(request_key, option_id).await
     }
 }
 

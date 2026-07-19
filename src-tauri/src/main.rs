@@ -203,6 +203,29 @@ fn main() {
     // 后端线程启动前恢复，否则已安装的 codex、npx 等都会被误判为不可用。
     nova_lib::init_process_path();
 
+    let server_mode = match nova_lib::configure_server_mode() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("Nova server 参数错误：{error}");
+            std::process::exit(2);
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = server_mode;
+
+    #[cfg(target_os = "linux")]
+    let _virtual_display = if server_mode {
+        match start_virtual_display_if_needed() {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("Nova server 启动失败：{error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     // 自更新 helper：新版 exe 被旧版拉起后，先替换旧 exe，再启动正式实例。
     if nova_lib::maybe_run_update_helper() {
         return;
@@ -227,4 +250,42 @@ fn main() {
     };
 
     nova_lib::run()
+}
+
+#[cfg(target_os = "linux")]
+struct VirtualDisplay(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for VirtualDisplay {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_virtual_display_if_needed() -> Result<Option<VirtualDisplay>, String> {
+    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return Ok(None);
+    }
+    let display = format!(":{}", 100 + std::process::id() % 900);
+    let mut child = std::process::Command::new("Xvfb")
+        .args([&display, "-screen", "0", "1280x800x24", "-nolisten", "tcp"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("无法启动 Xvfb（请先安装 xvfb）：{error}"))?;
+    std::env::set_var("DISPLAY", &display);
+    // Xvfb normally becomes ready in a few milliseconds. Tauri connects immediately afterwards,
+    // so give the socket a bounded readiness window instead of relying on a fixed long sleep.
+    let socket = format!("/tmp/.X11-unix/X{}", display.trim_start_matches(':'));
+    for _ in 0..40 {
+        if std::path::Path::new(&socket).exists() {
+            return Ok(Some(VirtualDisplay(child)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!("Xvfb 未能创建显示套接字 {socket}"))
 }
