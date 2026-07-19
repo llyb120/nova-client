@@ -14,6 +14,39 @@ import { ShareModal } from "./ShareModal";
 import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
 
+interface VirtualObserverPool {
+  observer: IntersectionObserver;
+  callbacks: Map<Element, () => void>;
+}
+
+const virtualObserverPools = new WeakMap<HTMLElement, VirtualObserverPool>();
+
+/** 同一个滚动根只创建一个 IO；无论会话有多少轮，观察器数量都保持为 1。 */
+function observeVirtualGroup(root: HTMLElement, element: Element, callback: () => void) {
+  let pool = virtualObserverPools.get(root);
+  if (!pool) {
+    const callbacks = new Map<Element, () => void>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) callbacks.get(entry.target)?.();
+      },
+      { root, rootMargin: "1200px 0px" },
+    );
+    pool = { observer, callbacks };
+    virtualObserverPools.set(root, pool);
+  }
+  pool.callbacks.set(element, callback);
+  pool.observer.observe(element);
+  return () => {
+    pool!.observer.unobserve(element);
+    pool!.callbacks.delete(element);
+    if (pool!.callbacks.size === 0) {
+      pool!.observer.disconnect();
+      virtualObserverPools.delete(root);
+    }
+  };
+}
+
 /**
  * transcript 虚拟化包裹层：长会话若把每一轮（含 Markdown 结论、工具卡片、diff）都常驻
  * DOM，节点数随会话线性增长，WebView2 渲染进程内存单调上涨直至崩溃。这里给每个轮次套一层
@@ -27,10 +60,10 @@ function VirtualGroup(props: {
   /** 列表最后一组：始终挂载，保证新提示词有真实高度可供吸底 */
   keepMounted?: boolean;
   scrollEl: () => HTMLElement | undefined;
-  /** 滚动/布局变化时递增，兜底校正 WebView2 偶发漏掉的 IntersectionObserver 回调 */
-  viewportTick: number;
+  /** 已挂载内容在视口上方变高/变矮时补偿 scrollTop，保持正在阅读的内容不跳 */
+  compensateHeight: (delta: number) => void;
 }) {
-  let ref: HTMLDivElement | undefined;
+  let ref: VirtualGroupElement | undefined;
   const [visible, setVisible] = createSignal(true);
   const [height, setHeight] = createSignal(0);
   const mounted = () => visible() || props.active || !!props.keepMounted;
@@ -38,7 +71,16 @@ function VirtualGroup(props: {
   const rememberHeight = () => {
     if (!ref || !mounted()) return;
     const h = ref.getBoundingClientRect().height;
-    if (h > 0) setHeight((prev) => (Math.abs(prev - h) > 0.5 ? h : prev));
+    const prev = height();
+    if (h <= 0 || Math.abs(prev - h) <= 0.5) return;
+
+    // 浏览器滚动锚定被禁用后，视口上方内容的真实尺寸变化必须由虚拟列表自己补偿。
+    // 首次测量时内容本来就在正常流里，不能重复补；只修正已有占位高度的差值。
+    const root = props.scrollEl();
+    const aboveViewport =
+      !!root && ref.getBoundingClientRect().bottom <= root.getBoundingClientRect().top;
+    setHeight(h);
+    if (prev > 0 && aboveViewport) props.compensateHeight(h - prev);
   };
 
   /**
@@ -74,38 +116,46 @@ function VirtualGroup(props: {
     if (!ref) return;
     const root = props.scrollEl();
     if (!root) return;
-    const io = new IntersectionObserver(
-      () => syncMounted(),
-      // 视口上下各留 1200px 缓冲，减少快速滚动时的空白闪烁
-      { root, rootMargin: "1200px 0px" },
-    );
-    io.observe(ref);
+    const stopObserving = observeVirtualGroup(root, ref, syncMounted);
     const ro = new ResizeObserver(() => rememberHeight());
     ro.observe(ref);
+    // scroll 事件可以通过命中测试直接唤醒当前视口内的占位，避免等待异步 IO 回调。
+    ref.mountVirtualGroup = () => setVisible(true);
     syncMounted();
     onCleanup(() => {
-      io.disconnect();
+      stopObserving();
       ro.disconnect();
+      if (ref) delete ref.mountVirtualGroup;
     });
   });
 
-  // keepMounted / active、滚动位置或整体布局变化后，立即用当前几何位置校正挂载状态。
+  // keepMounted / active 变为 true 时立即挂回；普通滚动交给 IO 和视口命中唤醒处理。
   createEffect(() => {
-    void props.viewportTick;
-    syncMounted();
+    if (props.active || props.keepMounted) setVisible(true);
   });
 
   return (
     <div
       ref={ref}
       class="vgroup"
-      style={!mounted() && height() > 0 ? { height: `${height()}px` } : undefined}
+      // 重挂载时仍保留最小高度，TurnGroup/Markdown 构建期间总滚动高度不会瞬间塌陷。
+      style={
+        height() > 0
+          ? mounted()
+            ? { "min-height": `${height()}px` }
+            : { height: `${height()}px` }
+          : undefined
+      }
     >
       <Show when={mounted()}>
         <TurnGroup group={props.group} active={props.active} />
       </Show>
     </div>
   );
+}
+
+interface VirtualGroupElement extends HTMLDivElement {
+  mountVirtualGroup?: () => void;
 }
 
 interface TranscriptSegmentProps {
@@ -130,9 +180,7 @@ export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
   const [stickToBottom, setStickToBottom] = createSignal(true);
-  const [viewportTick, setViewportTick] = createSignal(0);
   let scrollQueued = false;
-  let viewportRaf = 0;
   let lastScrollTop = 0;
   let pointerActive = false;
 
@@ -174,23 +222,24 @@ export function ChatView() {
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
   const lastGroupIndex = () => groups().length - 1;
 
-  const refreshVirtualGroups = () => {
-    if (viewportRaf) return;
-    viewportRaf = requestAnimationFrame(() => {
-      viewportRaf = 0;
-      setViewportTick((n) => n + 1);
-    });
-  };
-
-  // scroll 事件发生在浏览器绘制之前。这里若也等到下一帧，快速向上滚动时当前帧只能
-  // 画出虚拟组的空占位；连续滚动会让空白一直追着视口走。用户滚动路径立即复核各组，
-  // ResizeObserver 等可能密集触发的布局变化仍走上面的 RAF 合帧。
-  const refreshVirtualGroupsNow = () => {
-    if (viewportRaf) {
-      cancelAnimationFrame(viewportRaf);
-      viewportRaf = 0;
+  /**
+   * IO 回调是异步的，拖动滚动条跨过很长距离时可能晚一帧。只命中采样当前视口里的
+   * wrapper 并立即挂载即可消除空白；成本固定在约 6 次命中测试，不再遍历全部分组。
+   */
+  const mountVisibleVirtualGroups = () => {
+    if (!scrollRef) return;
+    const rect = scrollRef.getBoundingClientRect();
+    const x = Math.min(rect.right - 1, Math.max(rect.left + 1, rect.left + rect.width / 2));
+    const top = Math.ceil(rect.top + 1);
+    const bottom = Math.floor(rect.bottom - 1);
+    if (bottom < top) return;
+    const step = Math.max(120, Math.floor((bottom - top) / 5));
+    for (let y = top; y <= bottom; y += step) {
+      const group = document.elementFromPoint(x, y)?.closest<VirtualGroupElement>(".vgroup");
+      group?.mountVirtualGroup?.();
     }
-    setViewportTick((n) => n + 1);
+    const last = document.elementFromPoint(x, bottom)?.closest<VirtualGroupElement>(".vgroup");
+    last?.mountVirtualGroup?.();
   };
 
   const maxScrollTop = () =>
@@ -221,7 +270,7 @@ export function ChatView() {
   };
 
   const handleTranscriptScroll = () => {
-    refreshVirtualGroupsNow();
+    mountVisibleVirtualGroups();
     const currentTop = scrollRef?.scrollTop ?? 0;
     const atBottom = isAtBottom();
     if (stickToBottom()) {
@@ -237,7 +286,13 @@ export function ChatView() {
     if (!scrollRef || !stickToBottom() || pointerActive) return;
     scrollRef.scrollTop = maxScrollTop();
     lastScrollTop = scrollRef.scrollTop;
-    refreshVirtualGroups();
+    mountVisibleVirtualGroups();
+  };
+
+  const compensateVirtualHeight = (delta: number) => {
+    if (!scrollRef || Math.abs(delta) <= 0.5) return;
+    scrollRef.scrollTop += delta;
+    lastScrollTop = scrollRef.scrollTop;
   };
 
   // 合并同一轮内容变化，并在下一次绘制前直接钉底；不做滚动动画或多帧追赶。
@@ -281,7 +336,6 @@ export function ChatView() {
   onMount(() => {
     if (!innerRef || !scrollRef) return;
     const ro = new ResizeObserver(() => {
-      refreshVirtualGroups();
       scheduleBottomPin();
     });
     ro.observe(innerRef);
@@ -317,7 +371,6 @@ export function ChatView() {
       window.removeEventListener("keydown", handleScrollKey, true);
       window.removeEventListener("pointerup", finishPointerInteraction, true);
       window.removeEventListener("pointercancel", finishPointerInteraction, true);
-      if (viewportRaf) cancelAnimationFrame(viewportRaf);
     });
   });
 
@@ -569,7 +622,7 @@ export function ChatView() {
                         group={g}
                         active={false}
                         scrollEl={() => scrollRef}
-                        viewportTick={viewportTick()}
+                        compensateHeight={compensateVirtualHeight}
                       />
                     )}
                   </For>
@@ -594,7 +647,7 @@ export function ChatView() {
                   active={isRunning() && !g.turn}
                   keepMounted={i() === lastGroupIndex()}
                   scrollEl={() => scrollRef}
-                  viewportTick={viewportTick()}
+                  compensateHeight={compensateVirtualHeight}
                 />
               )}
             </For>
