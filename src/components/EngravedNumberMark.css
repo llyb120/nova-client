@@ -1,0 +1,152 @@
+@font-face {
+  font-family: "Nova Flourish Serial";
+  src: url("../assets/nova-flourish-serial.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+  unicode-range: U+0020, U+002E, U+0030-0039, U+004E, U+006F;
+}
+
+.engraved-number-mark {
+  --engraved-base: color-mix(in srgb, var(--bg-active) 76%, #b6aa91 24%);
+  --engraved-ink: color-mix(in srgb, var(--text) 72%, #17130e 28%);
+  --engraved-edge-light: rgba(255, 255, 255, 0.46);
+  --engraved-edge-dark: rgba(0, 0, 0, 0.58);
+
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 3.65em;
+  height: 1.55em;
+  margin-block: -0.2em;
+  padding: 0.08em 0.48em 0.02em 0.38em;
+  overflow: hidden;
+  vertical-align: -0.22em;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 72%, transparent);
+  border-radius: 0.36em;
+  background:
+    linear-gradient(112deg, rgba(255, 255, 255, 0.2), transparent 24% 67%, rgba(0, 0, 0, 0.12)),
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.024) 0 1px, rgba(0, 0, 0, 0.018) 1px 2px),
+    var(--engraved-base);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.3),
+    0 1px 2px rgba(0, 0, 0, 0.14);
+  contain: paint;
+}
+
+.engraved-number-mark::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(96deg, transparent 8%, rgba(255, 255, 255, 0.14) 42%, transparent 68%);
+  opacity: 0.7;
+}
+
+.engraved-number-mark-text {
+  display: block;
+  transform: translateY(0.04em) rotate(-1deg);
+  color: var(--engraved-ink);
+  font-family: "Nova Flourish Serial", cursive;
+  font-size: 1.12em;
+  font-style: normal;
+  font-weight: 400;
+  font-synthesis: none;
+  line-height: 0.72;
+  letter-spacing: 0.015em;
+  white-space: nowrap;
+  text-shadow:
+    0 -1px 1px var(--engraved-edge-dark),
+    0 1px 0 var(--engraved-edge-light);
+}
+
+:root[data-theme="ink-light"] .engraved-number-mark {
+  --engraved-base: color-mix(in srgb, #d4c9b2 44%, var(--bg-input) 56%);
+  --engraved-ink: color-mix(in srgb, var(--text) 82%, #3d3328 18%);
+  --engraved-edge-light: rgba(255, 255, 255, 0.88);
+  --engraved-edge-dark: rgba(50, 41, 31, 0.48);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.78),
+    inset 0 -1px 0 rgba(73, 61, 47, 0.3),
+    0 1px 2px rgba(30, 26, 20, 0.1);
+}
+
+:root[data-theme="ink-dark"] .engraved-number-mark {
+  --engraved-base: color-mix(in srgb, var(--bg-active) 82%, #8c816c 18%);
+  --engraved-ink: color-mix(in srgb, var(--text-dim) 62%, #07090c 38%);
+  --engraved-edge-light: rgba(255, 248, 232, 0.24);
+  --engraved-edge-dark: rgba(0, 0, 0, 0.82);
+  border-color: color-mix(in srgb, var(--border-strong) 82%, #95866d 18%);
+}
+
+/* 会话专属标识直接刻在背景上，不呈现独立牌体，也不参与消息布局。 */
+.chat-engraved-watermark {
+  position: sticky;
+  z-index: 0;
+  top: 72%;
+  display: flex;
+  height: 0;
+  align-items: center;
+  justify-content: flex-end;
+  overflow: visible;
+  padding-right: clamp(24px, 6vw, 84px);
+  pointer-events: none;
+  user-select: none;
+}
+
+.transcript-inner {
+  position: relative;
+  z-index: 1;
+}
+
+.chat-engraved-mark.engraved-number-mark {
+  min-width: 0;
+  height: auto;
+  margin: 0;
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  contain: none;
+  font-size: clamp(46px, 6.5vw, 86px);
+  opacity: 0.07;
+}
+
+.chat-engraved-mark.engraved-number-mark::after {
+  display: none;
+}
+
+.chat-engraved-mark .engraved-number-mark-text {
+  text-shadow:
+    0 -1px 1px rgba(0, 0, 0, 0.82),
+    0 1px 0 rgba(255, 255, 255, 0.34);
+}
+
+:root[data-theme="ink-light"] .chat-engraved-mark.engraved-number-mark {
+  opacity: 0.055;
+}
+
+:root[data-theme="ink-light"] .chat-engraved-mark .engraved-number-mark-text {
+  color: #241e18;
+  text-shadow:
+    0 -1px 1px rgba(54, 45, 35, 0.58),
+    0 1px 0 rgba(255, 255, 255, 0.94);
+}
+
+:root[data-theme="ink-dark"] .chat-engraved-mark.engraved-number-mark {
+  opacity: 0.075;
+}
+
+:root[data-theme="ink-dark"] .chat-engraved-mark .engraved-number-mark-text {
+  color: var(--text-dim);
+  text-shadow:
+    0 -1px 1px rgba(0, 0, 0, 0.94),
+    0 1px 0 rgba(255, 248, 232, 0.25);
+}
