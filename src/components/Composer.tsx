@@ -35,18 +35,32 @@ export function Composer() {
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
+  let resizeFrame: number | undefined;
+  let maxInputHeight: number | undefined;
 
-  const resizeInput = () => {
+  const flushInputResize = () => {
+    resizeFrame = undefined;
     if (!textareaRef) return;
     textareaRef.style.height = "auto";
-    const maxPx = Number.parseFloat(getComputedStyle(textareaRef).maxHeight);
+    if (maxInputHeight === undefined) {
+      const value = Number.parseFloat(getComputedStyle(textareaRef).maxHeight);
+      maxInputHeight = Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+    }
     const next = textareaRef.scrollHeight;
-    textareaRef.style.height = (Number.isFinite(maxPx) ? Math.min(next, maxPx) : next) + "px";
+    textareaRef.style.height = Math.min(next, maxInputHeight) + "px";
+  };
+
+  const resizeInput = () => {
+    if (resizeFrame === undefined) resizeFrame = requestAnimationFrame(flushInputResize);
   };
 
   createEffect(() => {
     text();
-    queueMicrotask(resizeInput);
+    resizeInput();
+  });
+
+  onCleanup(() => {
+    if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
   });
 
   const attach = createImageAttachments({ enableFileDrop: true });
@@ -325,11 +339,9 @@ export function Composer() {
     const el = e.currentTarget as HTMLTextAreaElement;
     const typedSlash = e.inputType === "insertText" && e.data === "/";
     const trackingSlash = slashStart() !== null;
-    resizeInput();
     setText(el.value);
     if (historyOpen()) setHistoryOpen(false);
     updateSlashState(el, typedSlash || trackingSlash);
-    resizeInput();
   };
 
   return (

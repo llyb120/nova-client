@@ -49,6 +49,12 @@ type GraphLayout = {
   maxY: number;
 };
 
+type GraphStructure = {
+  nodes: Array<Omit<GroupNode, "cards">>;
+  stages: Array<{ depth: number; x: number }>;
+  layoutTop: number;
+};
+
 const CARD_WIDTH = 236;
 const CARD_HEIGHT = 296;
 const STACK_TITLE_PEEK = 48;
@@ -215,6 +221,8 @@ export function EvidenceChainView() {
   let composingCardId: string | null | undefined;
   let resizeObserver: ResizeObserver | undefined;
   let drawFrame: number | undefined;
+  let dragFrame: number | undefined;
+  let pendingDragPosition: { groupId: string; point: Point } | undefined;
   let fitted = false;
   let panGesture: {
     pointerId: number;
@@ -242,7 +250,8 @@ export function EvidenceChainView() {
 
   const cards = createMemo(() => state.clueGroups.flatMap((group) => group.cards));
 
-  const graphLayout = createMemo<GraphLayout>(() => {
+  // 拓扑排序和自动布局只依赖线索结构。选中卡片、节点拖动不再触发这部分昂贵计算。
+  const graphStructure = createMemo<GraphStructure>(() => {
     const byCard = cardToGroup();
     const depthMemo = new Map<string, number>();
     const depthOf = (group: ClueNodeGroup, visiting = new Set<string>()): number => {
@@ -364,24 +373,40 @@ export function EvidenceChainView() {
       componentTop += componentHeight + ROW_GAP;
     }
 
-    const nodes: GroupNode[] = [];
+    const nodes: GraphStructure["nodes"] = [];
     const stages: Array<{ depth: number; x: number }> = [];
     for (const [depth, groups] of orderedStages) {
       const x = WORLD_LEFT + depth * (CARD_WIDTH + COLUMN_GAP);
       stages.push({ depth, x });
       groups.forEach((group) => {
-        const orderedCards = stackCards(group, selectedCardId());
-        const manualPosition = nodePositions().get(group.id);
         nodes.push({
           group,
-          cards: orderedCards,
           role: groupRole(group, parentCardIds),
           depth,
-          x: manualPosition?.x ?? x,
-          y: manualPosition?.y ?? groupY.get(group.id) ?? layoutTop,
+          x,
+          y: groupY.get(group.id) ?? layoutTop,
         });
       });
     }
+
+    return { nodes, stages, layoutTop };
+  });
+
+  // 交互层只套用卡片前后顺序和手动坐标，再更新锚点/连线；拖动时不重跑拓扑布局。
+  const graphLayout = createMemo<GraphLayout>(() => {
+    const structure = graphStructure();
+    const positions = nodePositions();
+    const selected = selectedCardId();
+    const nodes: GroupNode[] = structure.nodes.map((node) => {
+      const manualPosition = positions.get(node.group.id);
+      return {
+        ...node,
+        cards: stackCards(node.group, selected),
+        x: manualPosition?.x ?? node.x,
+        y: manualPosition?.y ?? node.y,
+      };
+    });
+    const { stages, layoutTop } = structure;
 
     const nodeByCard = new Map<string, GroupNode>();
     const cardAnchors = new Map<string, Point>();
@@ -734,6 +759,21 @@ export function EvidenceChainView() {
     viewportElement?.setPointerCapture(event.pointerId);
   };
 
+  const flushDragPosition = () => {
+    dragFrame = undefined;
+    const pending = pendingDragPosition;
+    pendingDragPosition = undefined;
+    if (!pending) return;
+    const next = new Map(nodePositions());
+    next.set(pending.groupId, pending.point);
+    setNodePositions(next);
+  };
+
+  const scheduleDragPosition = (groupId: string, point: Point) => {
+    pendingDragPosition = { groupId, point };
+    if (dragFrame === undefined) dragFrame = requestAnimationFrame(flushDragPosition);
+  };
+
   const onPointerMove = (event: PointerEvent) => {
     const pending = connecting();
     if (pending) {
@@ -746,12 +786,10 @@ export function EvidenceChainView() {
     }
     if (nodeDrag?.pointerId === event.pointerId) {
       const zoom = camera().zoom;
-      const next = new Map(nodePositions());
-      next.set(nodeDrag.groupId, {
+      scheduleDragPosition(nodeDrag.groupId, {
         x: nodeDrag.nodeX + (event.clientX - nodeDrag.startX) / zoom,
         y: nodeDrag.nodeY + (event.clientY - nodeDrag.startY) / zoom,
       });
-      setNodePositions(next);
       return;
     }
     if (!panGesture || panGesture.pointerId !== event.pointerId) return;
@@ -768,6 +806,8 @@ export function EvidenceChainView() {
     }
     if (connecting()?.pointerId === event.pointerId && connectionTargetId()) void finishConnection();
     if (nodeDrag?.pointerId === event.pointerId) {
+      if (dragFrame !== undefined) cancelAnimationFrame(dragFrame);
+      flushDragPosition();
       nodeDrag = null;
       setDraggingGroupId(null);
     }
@@ -775,6 +815,9 @@ export function EvidenceChainView() {
   };
 
   const cancelPointerAction = () => {
+    if (dragFrame !== undefined) cancelAnimationFrame(dragFrame);
+    dragFrame = undefined;
+    pendingDragPosition = undefined;
     panGesture = null;
     nodeDrag = null;
     setDraggingGroupId(null);
@@ -986,6 +1029,7 @@ export function EvidenceChainView() {
 
   onCleanup(() => {
     if (drawFrame !== undefined) cancelAnimationFrame(drawFrame);
+    if (dragFrame !== undefined) cancelAnimationFrame(dragFrame);
     resizeObserver?.disconnect();
   });
 

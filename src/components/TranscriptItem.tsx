@@ -128,7 +128,7 @@ export function TranscriptItem(props: { item: Item; active?: boolean }) {
           return (
             <Show when={item.text.trim() !== "None"}>
               <div class="msg msg-assistant">
-                <Markdown text={item.text} markFiles />
+                <Markdown text={item.text} markFiles live={props.active} />
               </div>
             </Show>
           );

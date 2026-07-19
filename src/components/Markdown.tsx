@@ -102,6 +102,7 @@ const FILE_REFERENCE_RE = new RegExp(
   "gi",
 );
 const WHOLE_FILE_REFERENCE_RE = new RegExp(String.raw`\.(?:${FILE_EXTENSIONS})(?::\d+)?$`, "i");
+const FILE_REFERENCE_CANDIDATE_RE = new RegExp(String.raw`\.(?:${FILE_EXTENSIONS})(?::\d+)?`, "i");
 const IMAGE_FILE_RE = /\.(?:avif|bmp|gif|ico|jpe?g|png|svg|webp)$/i;
 
 /** 给所有代码块包一层容器并附上复制按钮（点击事件走容器委托） */
@@ -166,10 +167,11 @@ function withFileReferences(html: string): string {
 function renderMarkdown(src: string, markFiles: boolean): string {
   if (!src) return "";
   const html = DOMPurify.sanitize(withCopyButtons(marked.parse(src, { async: false }) as string));
-  return markFiles ? withFileReferences(html) : html;
+  // 大多数回答没有文件路径，先用源文本做廉价预检，避免无意义地构建 template 并遍历整棵 DOM。
+  return markFiles && FILE_REFERENCE_CANDIDATE_RE.test(src) ? withFileReferences(html) : html;
 }
 
-export function Markdown(props: { text: string; markFiles?: boolean }) {
+export function Markdown(props: { text: string; markFiles?: boolean; live?: boolean }) {
   // 平滑出字层：shown 是 props.text 的一个前缀，按节拍逐步追上目标。
   // 初始即为完整文本——历史消息、非流式内容立即全量显示，不做动画。
   const [shown, setShown] = createSignal(props.text);
@@ -237,10 +239,12 @@ export function Markdown(props: { text: string; markFiles?: boolean }) {
     if (cut > 0 && stableRef) {
       const chunk = tail.slice(0, cut);
       stableSrc += chunk;
+      // 稳定前缀只处理一次，可以在固化时完成较重的文件引用标记。
       stableRef.insertAdjacentHTML("beforeend", renderMarkdown(chunk, !!props.markFiles));
       tail = tail.slice(cut);
     }
-    setTailHtml(renderMarkdown(tail, !!props.markFiles));
+    // 流式尾部每 33ms 更新：此时跳过 template/TreeWalker 扫描，结束后 effect 会自动补齐。
+    setTailHtml(renderMarkdown(tail, !!props.markFiles && !props.live));
   });
 
   const onClick = (e: MouseEvent) => {
