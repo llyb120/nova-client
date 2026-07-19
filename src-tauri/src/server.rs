@@ -8,6 +8,7 @@ use crate::settings::Settings;
 use crate::threads::ProjectStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 const ENV_HEADLESS: &str = "NOVA_HEADLESS";
@@ -23,6 +24,9 @@ const ENV_DATA_DIR: &str = "NOVA_DATA_DIR";
 struct ServerFile {
     name: String,
     proxy: String,
+    /// Extra environment inherited by agent processes. This is primarily for custom model
+    /// provider credentials whose variable name is selected by Codex `env_key`.
+    environment: HashMap<String, String>,
 }
 
 const HELP: &str = r#"Nova Headless Server
@@ -34,7 +38,7 @@ const HELP: &str = r#"Nova Headless Server
   Nova server project add <目录>          添加项目
   Nova server project remove <目录>       删除项目（不删除文件和会话）
   Nova server config show [--show-token]  查看持久配置
-  Nova server config set <键> <值>        更新配置
+  Nova server config set <键> <值>        更新配置（环境变量使用 env.<NAME>）
   Nova server config unset <键>           清空配置
   Nova server update --check              仅检查 Nova 更新
   Nova server update                      下载并安装最新版本
@@ -55,6 +59,7 @@ const HELP: &str = r#"Nova Headless Server
   cursor-proxy, opencode-proxy
   devin-enabled, codex-enabled, codebuddy-enabled, claude-enabled,
   cursor-enabled, opencode-enabled
+  env.<NAME>（例如 config.toml 中自定义 provider 的 env_key）
 
 环境变量：NOVA_SERVER_RELAY_URL、NOVA_SERVER_TOKEN、NOVA_SERVER_NAME、
 NOVA_SERVER_PROXY、NOVA_DATA_DIR。命令行/环境变量只覆盖本次运行；config set 会持久化。
@@ -98,7 +103,14 @@ fn save_server_file(value: &ServerFile) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let text = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
-    std::fs::write(path, text).map_err(|error| error.to_string())
+    std::fs::write(&path, text).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// Execute administrative `Nova server ...` commands without starting Tauri or Xvfb.
@@ -226,6 +238,20 @@ fn show_config(show_token: bool) -> Result<(), String> {
     } else {
         mask_secret(&settings.relay_token)
     };
+    let environment: HashMap<_, _> = server
+        .environment
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                if show_token {
+                    value.clone()
+                } else {
+                    mask_secret(value)
+                },
+            )
+        })
+        .collect();
     let value = json!({
         "dataDir": dir,
         "relayServer": settings.relay_server,
@@ -233,6 +259,7 @@ fn show_config(show_token: bool) -> Result<(), String> {
         "groups": settings.relay_groups,
         "name": server.name,
         "proxy": server.proxy,
+        "environment": environment,
         "defaultMode": settings.default_mode,
         "agents": {
             "devin": { "enabled": settings.devin_enabled, "path": settings.devin_path, "proxy": settings.devin_proxy },
@@ -262,39 +289,73 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
     let dir = data_dir();
     let mut settings = Settings::load(&dir);
     let mut server = load_server_file();
-    match key.trim_start_matches("--") {
-        "relay-server" => settings.relay_server = value.into(),
-        "token" | "relay-token" => settings.relay_token = value.into(),
-        "groups" | "relay-groups" => settings.relay_groups = value.into(),
-        "name" => server.name = value.into(),
-        "proxy" => server.proxy = value.into(),
-        "default-mode" => settings.default_mode = value.into(),
-        "devin-path" => settings.devin_path = value.into(),
-        "codex-path" => settings.codex_path = value.into(),
-        "codex-args" => settings.codex_args = value.into(),
-        "codebuddy-path" => settings.codebuddy_path = value.into(),
-        "claude-path" => settings.claudecode_path = value.into(),
-        "cursor-path" => settings.cursor_path = value.into(),
-        "opencode-path" => settings.opencode_path = value.into(),
-        "devin-proxy" => settings.devin_proxy = value.into(),
-        "codex-proxy" => settings.codex_proxy = value.into(),
-        "codebuddy-proxy" => settings.codebuddy_proxy = value.into(),
-        "claude-proxy" => settings.claudecode_proxy = value.into(),
-        "cursor-proxy" => settings.cursor_proxy = value.into(),
-        "opencode-proxy" => settings.opencode_proxy = value.into(),
-        "devin-enabled" => settings.devin_enabled = parse_bool(value)?,
-        "codex-enabled" => settings.codex_enabled = parse_bool(value)?,
-        "codebuddy-enabled" => settings.codebuddy_enabled = parse_bool(value)?,
-        "claude-enabled" => settings.claudecode_enabled = parse_bool(value)?,
-        "cursor-enabled" => settings.cursor_enabled = parse_bool(value)?,
-        "opencode-enabled" => settings.opencode_enabled = parse_bool(value)?,
-        unknown => return Err(format!("未知配置键：{unknown}\n\n{HELP}")),
+    let key = key.trim_start_matches("--");
+    if let Some(name) = key.strip_prefix("env.") {
+        validate_environment_name(name)?;
+        if value.is_empty() {
+            server.environment.remove(name);
+        } else {
+            server
+                .environment
+                .insert(name.to_string(), value.to_string());
+        }
+    } else {
+        match key {
+            "relay-server" => settings.relay_server = value.into(),
+            "token" | "relay-token" => settings.relay_token = value.into(),
+            "groups" | "relay-groups" => settings.relay_groups = value.into(),
+            "name" => server.name = value.into(),
+            "proxy" => server.proxy = value.into(),
+            "default-mode" => settings.default_mode = value.into(),
+            "devin-path" => settings.devin_path = value.into(),
+            "codex-path" => settings.codex_path = value.into(),
+            "codex-args" => settings.codex_args = value.into(),
+            "codebuddy-path" => settings.codebuddy_path = value.into(),
+            "claude-path" => settings.claudecode_path = value.into(),
+            "cursor-path" => settings.cursor_path = value.into(),
+            "opencode-path" => settings.opencode_path = value.into(),
+            "devin-proxy" => settings.devin_proxy = value.into(),
+            "codex-proxy" => settings.codex_proxy = value.into(),
+            "codebuddy-proxy" => settings.codebuddy_proxy = value.into(),
+            "claude-proxy" => settings.claudecode_proxy = value.into(),
+            "cursor-proxy" => settings.cursor_proxy = value.into(),
+            "opencode-proxy" => settings.opencode_proxy = value.into(),
+            "devin-enabled" => settings.devin_enabled = parse_bool(value)?,
+            "codex-enabled" => settings.codex_enabled = parse_bool(value)?,
+            "codebuddy-enabled" => settings.codebuddy_enabled = parse_bool(value)?,
+            "claude-enabled" => settings.claudecode_enabled = parse_bool(value)?,
+            "cursor-enabled" => settings.cursor_enabled = parse_bool(value)?,
+            "opencode-enabled" => settings.opencode_enabled = parse_bool(value)?,
+            unknown => return Err(format!("未知配置键：{unknown}\n\n{HELP}")),
+        }
     }
     settings.remote_control_enabled = true;
     settings.save(&dir);
     save_server_file(&server)?;
     println!("已更新配置：{key}");
     Ok(())
+}
+
+fn validate_environment_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return Err(format!("无效环境变量名：{name}"));
+    }
+    Ok(())
+}
+
+/// Persisted agent credentials are a fallback. Values explicitly supplied by systemd, a shell,
+/// or an EnvironmentFile win so operators can rotate secrets without rewriting Nova data.
+fn apply_server_environment() {
+    for (name, value) in load_server_file().environment {
+        if validate_environment_name(&name).is_ok() && std::env::var_os(&name).is_none() {
+            std::env::set_var(name, value);
+        }
+    }
 }
 
 fn mask_secret(value: &str) -> String {
@@ -364,6 +425,7 @@ pub fn configure_from_args() -> Result<bool, String> {
         // ambiguity across platforms. Values are process-local and never written as this string.
         std::env::set_var(ENV_PROJECTS, projects.join("\u{1f}"));
     }
+    apply_server_environment();
     Ok(true)
 }
 
@@ -459,5 +521,14 @@ mod tests {
         assert_eq!(parse_bool("yes"), Ok(true));
         assert_eq!(parse_bool("disabled"), Ok(false));
         assert!(parse_bool("maybe").is_err());
+    }
+
+    #[test]
+    fn validates_environment_variable_names() {
+        assert!(validate_environment_name("OPENAI_API_KEY").is_ok());
+        assert!(validate_environment_name("_PROVIDER_TOKEN_2").is_ok());
+        assert!(validate_environment_name("").is_err());
+        assert!(validate_environment_name("2TOKEN").is_err());
+        assert!(validate_environment_name("BAD-NAME").is_err());
     }
 }

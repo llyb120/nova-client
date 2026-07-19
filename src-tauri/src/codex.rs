@@ -408,7 +408,9 @@ impl CodexManager {
         }
         let mgr = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
-            let _ = mgr.refresh_model_options().await;
+            if let Err(error) = mgr.refresh_model_options().await {
+                mgr.push_log(format!("刷新模型列表失败：{error}"));
+            }
             mgr.model_options_refreshing.store(false, Ordering::SeqCst);
         });
     }
@@ -449,6 +451,9 @@ impl CodexManager {
 
     fn push_log(&self, line: String) {
         let line = format!("[codex] {line}");
+        if crate::server::is_headless() {
+            eprintln!("{line}");
+        }
         {
             let mut logs = self.logs.lock().unwrap();
             if logs.len() >= LOG_CAP {

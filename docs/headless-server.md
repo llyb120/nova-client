@@ -34,6 +34,8 @@ Nova server \
 export NOVA_SERVER_RELAY_URL=https://relay.example.com
 export NOVA_SERVER_TOKEN=replace-with-secret
 export NOVA_SERVER_NAME=build-server-01
+# 若 ~/.codex/config.toml 的自定义 provider 配置了 env_key，请注入同名变量：
+export MY_CODEX_PROVIDER_KEY=replace-with-provider-secret
 Nova server
 ```
 
@@ -67,10 +69,13 @@ Nova server config set token replace-with-secret
 Nova server config set name build-server-01
 Nova server config set codex-path /usr/local/bin/codex
 Nova server config set codex-enabled true
+# 名称必须与 ~/.codex/config.toml 中 model_providers.<id>.env_key 完全一致
+Nova server config set env.MY_CODEX_PROVIDER_KEY replace-with-provider-secret
 Nova server config show
 ```
 
-`config show` 默认会遮盖 Token；仅在安全终端中使用 `config show --show-token` 查看完整值。
+`config show` 默认会遮盖 Token 和环境变量值；仅在安全终端中使用
+`config show --show-token` 查看完整值。Linux 下 `server.json` 会以 `0600` 权限保存。
 可以通过 `config unset <键>` 清空字符串配置。使用单独数据目录时，在任意命令中加入
 `--data-dir /path/to/data`，或设置 `NOVA_DATA_DIR`。
 
@@ -92,6 +97,8 @@ Nova server update
 NOVA_SERVER_RELAY_URL=https://relay.example.com
 NOVA_SERVER_TOKEN=replace-with-secret
 NOVA_SERVER_NAME=build-server-01
+# 示例：必须与 Codex 自定义 provider 的 env_key 同名
+MY_CODEX_PROVIDER_KEY=replace-with-provider-secret
 ```
 
 然后创建 `/etc/systemd/system/nova-server.service`：
@@ -105,6 +112,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=nova
+Environment=HOME=/home/nova
 EnvironmentFile=/etc/nova-server.env
 ExecStart=/usr/bin/Nova server --project /srv/project-a
 Restart=on-failure
@@ -119,5 +127,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now nova-server
 journalctl -u nova-server -f
 ```
+
+Codex 的 `~/.codex/config.toml`、`auth.json` 和 provider 凭证必须属于上面的 `User`。建议先以
+该用户运行一次 `codex login`；自定义 provider 若使用 `env_key`，systemd 不会读取交互 shell
+中的 `export`，必须通过 `EnvironmentFile` 或 `Nova server config set env.<NAME> ...` 注入。
 
 Token 等同远程控制凭证；应使用 HTTPS、限制环境文件权限，并只通过 `--project` 暴露必要目录。
