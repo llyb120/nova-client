@@ -2657,7 +2657,7 @@ fn send_prompt(
     dispatch_prompt(&app, thread_id, text, images.unwrap_or_default())
 }
 
-fn dispatch_prompt(
+pub(crate) fn dispatch_prompt(
     app: &tauri::AppHandle,
     thread_id: String,
     text: String,

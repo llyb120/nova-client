@@ -1471,63 +1471,20 @@ fn make_scratch_dir() -> Result<String, String> {
 }
 
 fn send_prompt(app: &AppHandle, thread_id: &str, text: &str) -> Result<(), String> {
-    let text = text.trim().to_string();
-    if text.is_empty() {
+    if text.trim().is_empty() {
         return Err("内容不能为空".into());
     }
     let state = app.state::<AppState>();
-    let kind = {
+    {
         let store = state.store.lock().unwrap();
         let thread = store.get(thread_id).ok_or("会话不存在")?;
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        thread.agent_kind.clone()
-    };
-    match kind {
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-            let mgr = state.opencodeplus.clone();
-            let id = thread_id.to_string();
-            if mgr.is_running(&id) {
-                return Err("OpenCode+ 当前轮次尚未结束".into());
-            }
-            tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
-        }
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-            let mgr = state.codebuddyplus.clone();
-            let id = thread_id.to_string();
-            tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
-        }
-        AgentKind::Codex | AgentKind::CodexPlus => {
-            let mgr = state.codexplus.clone();
-            let id = thread_id.to_string();
-            tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
-        }
-        AgentKind::ClaudeCode => {
-            let mgr = state.claudeplus.clone();
-            let id = thread_id.to_string();
-            tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
-        }
-        AgentKind::Cursor => {
-            let mgr = state.cursorplus.clone();
-            let id = thread_id.to_string();
-            tauri::async_runtime::spawn(async move { mgr.run_prompt(id, text, Vec::new()).await });
-        }
-        AgentKind::Devin => {
-            let mgr = state.acp.clone();
-            let id = thread_id.to_string();
-            if mgr.is_running(&id) {
-                tauri::async_runtime::spawn(
-                    async move { mgr.steer_prompt(id, text, Vec::new()).await },
-                );
-            } else {
-                tauri::async_runtime::spawn(
-                    async move { mgr.run_prompt(id, text, Vec::new()).await },
-                );
-            }
-        }
     }
-    Ok(())
+    // 复用本地聊天的唯一分发入口：运行中的 Codex/Devin 会走 steer_prompt，
+    // 其余后端也与桌面输入框保持完全一致，避免远程入口再次出现能力漂移。
+    crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), Vec::new())
 }
 
 async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
