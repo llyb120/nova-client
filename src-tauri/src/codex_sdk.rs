@@ -859,6 +859,9 @@ impl CodexSdkManager {
         let Some(remote_id) = value.get("id").and_then(Value::as_str) else {
             return;
         };
+        let plan = (self.backend == SdkBackend::Codex)
+            .then(|| codex_todo_plan(value))
+            .flatten();
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         let Some(thread) = store.get_mut(thread_id) else {
@@ -941,9 +944,15 @@ impl CodexSdkManager {
             ids.insert(remote_id.into(), id);
             thread.items.push(item.clone());
         }
+        if let Some(plan) = &plan {
+            thread.plan = Some(plan.clone());
+        }
         thread.updated_at = now_ms();
         if let Some(op) = update {
             let _ = self.emit_op(thread_id, op);
+        }
+        if let Some(plan) = plan {
+            let _ = self.emit_op(thread_id, json!({ "t": "plan", "plan": plan }));
         }
         store.save();
     }
@@ -1225,7 +1234,14 @@ fn split_codex_effort(value: &str) -> Option<(&str, &str)> {
 }
 
 fn derive_title(text: &str, has_images: bool) -> String {
-    let title: String = text.lines().next().unwrap_or("").trim().chars().take(40).collect();
+    let title: String = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(40)
+        .collect();
     if !title.is_empty() {
         title
     } else if has_images {
@@ -1277,18 +1293,48 @@ fn text_snapshot_change<'a>(previous: &Item, next: &'a Item) -> TextSnapshotChan
         .unwrap_or(TextSnapshotChange::Replace)
 }
 
+/// Codex SDK 用 `todo_list` 快照表达计划进度；转换成 Nova 各后端共用的计划结构。
+fn codex_todo_plan(value: &Value) -> Option<Value> {
+    if value.get("type").and_then(Value::as_str) != Some("todo_list") {
+        return None;
+    }
+    let entries = value
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let content = item.get("text")?.as_str()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let status = if item.get("completed").and_then(Value::as_bool) == Some(true) {
+                "completed"
+            } else {
+                "pending"
+            };
+            Some(json!({ "content": content, "status": status }))
+        })
+        .collect::<Vec<_>>();
+    Some(json!(entries))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_pending_tools, derive_title, normalize_title, parse_bridge_output,
-        resolve_codex_model, text_snapshot_change, tool_call, SdkBackend, TextSnapshotChange,
+        codex_todo_plan, complete_pending_tools, derive_title, normalize_title,
+        parse_bridge_output, resolve_codex_model, text_snapshot_change, tool_call, SdkBackend,
+        TextSnapshotChange,
     };
     use crate::threads::{now_ms, AgentKind, Item, Thread, ToolCall};
     use serde_json::json;
 
     #[test]
     fn title_fallback_uses_first_prompt_line_or_image() {
-        assert_eq!(derive_title("  修复标题生成\n更多内容", false), "修复标题生成");
+        assert_eq!(
+            derive_title("  修复标题生成\n更多内容", false),
+            "修复标题生成"
+        );
         assert_eq!(derive_title("", true), "[图片]");
         assert_eq!(derive_title("", false), "新会话");
     }
@@ -1396,6 +1442,30 @@ mod tests {
         assert_eq!(
             text_snapshot_change(&appended, &rewritten),
             TextSnapshotChange::Replace
+        );
+    }
+
+    #[test]
+    fn codex_todo_list_becomes_the_shared_plan_shape() {
+        let plan = codex_todo_plan(&json!({
+            "id": "todo-1",
+            "type": "todo_list",
+            "items": [
+                { "text": " inspect repository ", "completed": true },
+                { "text": "Implement fix", "completed": false },
+                { "text": "  ", "completed": false }
+            ]
+        }));
+        assert_eq!(
+            plan,
+            Some(json!([
+                { "content": "inspect repository", "status": "completed" },
+                { "content": "Implement fix", "status": "pending" }
+            ]))
+        );
+        assert_eq!(
+            codex_todo_plan(&json!({ "id": "tool", "type": "web_search" })),
+            None
         );
     }
 
