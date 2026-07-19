@@ -187,6 +187,7 @@ async fn run(app: AppHandle) {
     let mut processed_id = 0i64;
     let mut results: Vec<CommandResult> = Vec::new();
     let mut catalog_signature = String::new();
+    let mut model_signature = String::new();
     let mut permission_signature = String::new();
     // 远程命令通过异步任务启动。初始快照可能先看到 running=false，随后任务才登记运行；
     // 在这段窗口内主动跟踪命令涉及的会话，避免释放基线后漏掉整个短任务。
@@ -204,6 +205,7 @@ async fn run(app: AppHandle) {
             previous.clear();
             force_full = false;
             catalog_signature.clear();
+            model_signature.clear();
             permission_signature.clear();
             command_watch.clear();
             // 设置页开启后尽快生效；关闭时命令执行入口还会再次校验开关。
@@ -226,6 +228,7 @@ async fn run(app: AppHandle) {
             processed_id = 0;
             results.clear();
             catalog_signature.clear();
+            model_signature.clear();
             permission_signature.clear();
             command_watch.clear();
         }
@@ -291,6 +294,9 @@ async fn run(app: AppHandle) {
         let metas = thread_metas(&app);
         let next_catalog_signature = catalog_signature_for(&metas);
         let catalog_changed = next_catalog_signature != catalog_signature;
+        let current_models = models(&app);
+        let next_model_signature = model_signature_for(&current_models);
+        let models_changed = next_model_signature != model_signature;
         let permissions = remote_permissions(&app);
         let next_permission_signature =
             serde_json::to_string(&permissions).unwrap_or_else(|_| "[]".into());
@@ -306,6 +312,7 @@ async fn run(app: AppHandle) {
             .collect();
         let want_upload = force_full
             || catalog_changed
+            || models_changed
             || needs_snapshot
             || !dirty_ids.is_empty()
             || permissions_changed
@@ -364,7 +371,7 @@ async fn run(app: AppHandle) {
                 current.keys().cloned().collect::<HashSet<_>>(),
                 true,
             )
-        } else if catalog_changed || needs_snapshot || dirty_ids.is_empty() {
+        } else if catalog_changed || models_changed || needs_snapshot || dirty_ids.is_empty() {
             // 新会话/目录变化/单纯命令结果走轻量包。只附带缺基线的会话快照；
             // 已有基线的运行会话留到下一拍继续发增量，避免被另一个历史会话拖成全量。
             let checkpoints = checkpoints_for(&snapshot_threads);
@@ -468,6 +475,7 @@ async fn run(app: AppHandle) {
                         catalog_signature = next_catalog_signature;
                     }
                     if !resp.resync {
+                        model_signature = next_model_signature;
                         permission_signature = next_permission_signature;
                     }
                 }
@@ -749,6 +757,14 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
     out
 }
 
+/// HashMap 每次创建时迭代顺序可能不同；签名必须先按后端 key 排序，否则远程循环会把
+/// 相同模型列表误判为持续变化并反复上传。
+fn model_signature_for(models: &HashMap<String, Value>) -> String {
+    let mut rows: Vec<_> = models.iter().collect();
+    rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+    serde_json::to_string(&rows).unwrap_or_default()
+}
+
 /// 浏览器按需读取过的会话 + 所有正在运行的普通会话加入同步集合。
 /// 浏览器选择只形成只读快照请求，不修改桌面端 active_thread，也不影响其他浏览器。
 fn sync_threads(app: &AppHandle, requested: &HashSet<String>) -> HashMap<String, Thread> {
@@ -796,7 +812,9 @@ fn threads_pack_with_metas(
             .iter()
             .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
             .collect(),
-        models: HashMap::new(),
+        // 模型后台刷新完成时会走轻量 threads 包；这里必须携带最新模型，否则首次
+        // full 快照中的空列表会永久留在网页缓存中。
+        models: models(app),
         permissions: remote_permissions(app),
     }
 }
@@ -979,6 +997,20 @@ fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_signature_does_not_depend_on_hashmap_order() {
+        let mut left = HashMap::new();
+        left.insert("codex".to_string(), json!({ "models": ["gpt-5"] }));
+        left.insert("opencode".to_string(), json!({ "models": ["kimi"] }));
+        let mut right = HashMap::new();
+        right.insert("opencode".to_string(), json!({ "models": ["kimi"] }));
+        right.insert("codex".to_string(), json!({ "models": ["gpt-5"] }));
+
+        assert_eq!(model_signature_for(&left), model_signature_for(&right));
+        right.insert("codex".to_string(), json!({ "models": ["gpt-5.1"] }));
+        assert_ne!(model_signature_for(&left), model_signature_for(&right));
+    }
 
     #[test]
     fn remote_tool_items_only_keep_summary() {
