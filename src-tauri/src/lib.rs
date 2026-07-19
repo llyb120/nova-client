@@ -34,6 +34,7 @@ pub const SCRATCH_MARK: &str = "Nova-scratch";
 
 pub use path_env::init_process_path;
 pub use server::configure_from_args as configure_server_mode;
+pub use server::maybe_run_management_command as maybe_run_server_command;
 
 use acp::AcpManager;
 use codex::CodexManager;
@@ -4484,6 +4485,10 @@ mod data_dir_tests {
 /// 相比 Tauri 默认的 `%APPDATA%/<identifier>`，它跨项目、跨安装位置、跨版本都稳定，
 /// 便于用户直接找到；worktree、CLI 工具、会话、记忆等都放在这里。
 pub fn nova_data_dir(app: &tauri::AppHandle) -> PathBuf {
+    if let Some(dir) = server::data_dir_override() {
+        let _ = std::fs::create_dir_all(&dir);
+        return dir;
+    }
     let name = nova_data_dir_name();
     let dir = app
         .path()

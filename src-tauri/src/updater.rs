@@ -5,6 +5,7 @@
 //! Release 资产约定：
 //! - Windows：`nova-{version}.zip`（内含 `Nova.exe`）
 //! - macOS：`nova-macos-{aarch64|x86_64}-{version}.zip`（内含 `Nova`）
+//! - Linux：`nova-linux-{aarch64|x86_64}-{version}.zip`（内含 `Nova`）
 //!
 //! 仓库：`option_env!("NOVA_GH_REPO")` 或下方默认 `llyb120/nova-client`。
 
@@ -40,7 +41,7 @@ fn asset_name_for(version: &str) -> String {
 
 /// 自更新主通道标识。
 /// - Windows 继续用 `nova`（兼容存量客户端）
-/// - macOS 用 `nova-macos-{arch}`，避免误下 Windows 包
+/// - macOS/Linux 使用带平台与架构的通道，避免跨平台误下更新包
 fn update_channel() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -50,10 +51,165 @@ fn update_channel() -> &'static str {
     {
         "nova-macos-x86_64"
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        "nova-linux-aarch64"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "nova-linux-x86_64"
+    }
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "aarch64", target_arch = "x86_64"))
+    ))]
+    {
+        "nova-linux-unsupported"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         "nova"
     }
+}
+
+fn compiled_app_version() -> String {
+    serde_json::from_str::<Value>(include_str!("../tauri.conf.json"))
+        .ok()
+        .and_then(|value| value["version"].as_str().map(str::to_string))
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Pure CLI updater used by `Nova server update`; it never initializes Tauri, GTK, or Xvfb.
+pub fn run_server_update(check_only: bool) -> Result<(), String> {
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    runtime.block_on(run_server_update_async(check_only))
+}
+
+async fn run_server_update_async(check_only: bool) -> Result<(), String> {
+    let current = compiled_app_version();
+    let client = update_http_client(
+        Some(&format!("Nova/{current}")),
+        Some(Duration::from_secs(30)),
+    )?;
+    let response = client
+        .get(github_api_latest())
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| format!("检查更新失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("检查更新失败：HTTP {}", response.status()));
+    }
+    let release: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("更新信息解析失败：{error}"))?;
+    let latest = release["tag_name"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('v')
+        .to_string();
+    if latest.is_empty() {
+        return Err("最新 Release 没有有效版本号".into());
+    }
+    let has_update = matches!(
+        (parse_ver(&latest), parse_ver(&current)),
+        (Some(latest), Some(current)) if latest > current
+    );
+    println!("当前版本：{current}");
+    println!("最新版本：{latest}");
+    if !has_update {
+        println!("已是最新版本。");
+        return Ok(());
+    }
+    if check_only {
+        println!("发现可用更新。运行 `Nova server update` 安装。");
+        return Ok(());
+    }
+
+    let asset_name = asset_name_for(&latest);
+    let download_url = release["assets"]
+        .as_array()
+        .and_then(|assets| {
+            assets.iter().find_map(|asset| {
+                (asset["name"].as_str() == Some(asset_name.as_str()))
+                    .then(|| asset["browser_download_url"].as_str())
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| format!("Release 中没有当前平台更新包：{asset_name}"))?;
+    println!("正在下载 {asset_name} ...");
+    let bytes = client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|error| format!("下载更新失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("下载更新失败：{error}"))?
+        .bytes()
+        .await
+        .map_err(|error| format!("读取更新包失败：{error}"))?;
+
+    let stage_dir = std::env::temp_dir().join(format!(
+        "nova-server-update-{}-{}",
+        latest,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    std::fs::create_dir_all(&stage_dir).map_err(|error| error.to_string())?;
+    let extraction = (|| -> Result<PathBuf, String> {
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive =
+            zip::ZipArchive::new(cursor).map_err(|error| format!("更新包损坏：{error}"))?;
+        archive
+            .extract(&stage_dir)
+            .map_err(|error| format!("解压更新包失败：{error}"))?;
+        let staged = find_exe(&stage_dir, "Nova").ok_or("更新包中没有 Nova 可执行文件")?;
+        validate_staged_exe(&staged)?;
+        Ok(staged)
+    })();
+    let staged = match extraction {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(error);
+        }
+    };
+
+    let target = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+        .ok_or("无法确定当前 Nova 可执行文件")?;
+    ensure_install_dir_writable(&target)?;
+    let backup = target.with_file_name(format!(
+        "{}.old",
+        target
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default()
+    ));
+    remove_file_if_exists(&backup);
+    std::fs::rename(&target, &backup).map_err(|error| format!("备份当前版本失败：{error}"))?;
+    if let Err(error) = std::fs::copy(&staged, &target) {
+        let _ = std::fs::rename(&backup, &target);
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        return Err(format!("安装新版本失败：{error}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&target)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o755);
+        std::fs::set_permissions(&target, permissions).map_err(|error| error.to_string())?;
+    }
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    println!("已更新至 {latest}：{}", target.display());
+    println!("旧版本备份：{}", backup.display());
+    println!("请重新启动 Nova Server。");
+    Ok(())
 }
 
 pub const EV_PROGRESS: &str = "update:progress";
@@ -328,12 +484,61 @@ fn validate_staged_exe(path: &Path) -> Result<(), String> {
     {
         validate_mach_o_image(&bytes).map_err(|e| format!("更新包里的可执行文件无效:{e}"))
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(target_arch = "x86_64")]
+        let expected_machine = 62;
+        #[cfg(target_arch = "aarch64")]
+        let expected_machine = 183;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        return Err("当前 Linux 架构暂不支持自动更新".into());
+        validate_elf_image(&bytes, expected_machine)
+            .map_err(|e| format!("更新包里的可执行文件无效:{e}"))
+    }
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
     {
         if bytes.is_empty() {
             return Err("更新包里的可执行文件无效:文件为空".into());
         }
         Ok(())
+    }
+}
+
+fn validate_elf_image(bytes: &[u8], expected_machine: u16) -> Result<(), String> {
+    if bytes.len() < 20 || bytes.get(..4) != Some(b"\x7fELF") {
+        return Err("缺少 ELF 文件头".into());
+    }
+    if !matches!(bytes[4], 1 | 2) {
+        return Err("ELF 位数标记无效".into());
+    }
+    let machine = match bytes[5] {
+        1 => u16::from_le_bytes([bytes[18], bytes[19]]),
+        2 => u16::from_be_bytes([bytes[18], bytes[19]]),
+        _ => return Err("ELF 字节序标记无效".into()),
+    };
+    if machine != expected_machine {
+        return Err(format!(
+            "ELF 架构不匹配:machine={machine}, expected={expected_machine}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cli_update_tests {
+    use super::*;
+
+    #[test]
+    fn validates_elf_header_and_architecture() {
+        let mut bytes = vec![0u8; 64];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        assert!(validate_elf_image(&bytes, 62).is_ok());
+        assert!(validate_elf_image(&bytes, 183).is_err());
+        bytes[0] = 0;
+        assert!(validate_elf_image(&bytes, 62).is_err());
     }
 }
 

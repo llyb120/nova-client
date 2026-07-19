@@ -5,6 +5,9 @@
 //! window is presented and supplies the remote-control settings from command-line arguments.
 
 use crate::settings::Settings;
+use crate::threads::ProjectStore;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::PathBuf;
 
 const ENV_HEADLESS: &str = "NOVA_HEADLESS";
@@ -13,9 +16,300 @@ const ENV_TOKEN: &str = "NOVA_SERVER_TOKEN";
 const ENV_NAME: &str = "NOVA_SERVER_NAME";
 const ENV_PROXY: &str = "NOVA_SERVER_PROXY";
 const ENV_PROJECTS: &str = "NOVA_SERVER_PROJECTS";
+const ENV_DATA_DIR: &str = "NOVA_DATA_DIR";
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ServerFile {
+    name: String,
+    proxy: String,
+}
+
+const HELP: &str = r#"Nova Headless Server
+
+用法：
+  Nova server [启动参数]                  启动无界面服务
+  Nova server help                        显示帮助
+  Nova server project list                列出允许远控的项目
+  Nova server project add <目录>          添加项目
+  Nova server project remove <目录>       删除项目（不删除文件和会话）
+  Nova server config show [--show-token]  查看持久配置
+  Nova server config set <键> <值>        更新配置
+  Nova server config unset <键>           清空配置
+  Nova server update --check              仅检查 Nova 更新
+  Nova server update                      下载并安装最新版本
+
+启动参数：
+  --relay-server <URL>   本次运行使用的 Relay/Web 地址
+  --token <TOKEN>        本次运行使用的远控 Token
+  --name <NAME>          本次运行显示的设备名
+  --proxy <URL>          本次运行的远程同步代理
+  --project <DIR>        本次运行的项目白名单，可重复
+  --data-dir <DIR>       Nova 数据目录（默认 ~/.nova）
+
+可配置键：
+  relay-server, token, groups, name, proxy, default-mode
+  devin-path, codex-path, codex-args, codebuddy-path, claude-path,
+  cursor-path, opencode-path
+  devin-proxy, codex-proxy, codebuddy-proxy, claude-proxy,
+  cursor-proxy, opencode-proxy
+  devin-enabled, codex-enabled, codebuddy-enabled, claude-enabled,
+  cursor-enabled, opencode-enabled
+
+环境变量：NOVA_SERVER_RELAY_URL、NOVA_SERVER_TOKEN、NOVA_SERVER_NAME、
+NOVA_SERVER_PROXY、NOVA_DATA_DIR。命令行/环境变量只覆盖本次运行；config set 会持久化。
+"#;
 
 pub fn is_headless() -> bool {
     std::env::var_os(ENV_HEADLESS).is_some()
+}
+
+pub fn data_dir_override() -> Option<PathBuf> {
+    std::env::var_os(ENV_DATA_DIR)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn data_dir() -> PathBuf {
+    if let Some(path) = data_dir_override() {
+        return path;
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(crate::nova_data_dir_name())
+}
+
+fn server_file_path() -> PathBuf {
+    data_dir().join("server.json")
+}
+
+fn load_server_file() -> ServerFile {
+    std::fs::read_to_string(server_file_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_server_file(value: &ServerFile) -> Result<(), String> {
+    let path = server_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    std::fs::write(path, text).map_err(|error| error.to_string())
+}
+
+/// Execute administrative `Nova server ...` commands without starting Tauri or Xvfb.
+pub fn maybe_run_management_command() -> Option<Result<(), String>> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) != Some("server") {
+        return None;
+    }
+    args.remove(0);
+    extract_data_dir_arg(&mut args);
+    let command = args.first().map(String::as_str)?;
+    let result = match command {
+        "help" | "--help" | "-h" => {
+            println!("{HELP}");
+            Ok(())
+        }
+        "project" | "projects" => manage_projects(&args[1..]),
+        "config" => manage_config(&args[1..]),
+        "update" => {
+            let check_only = args[1..].iter().any(|arg| arg == "--check");
+            crate::updater::run_server_update(check_only)
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn extract_data_dir_arg(args: &mut Vec<String>) {
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(value) = args[i].strip_prefix("--data-dir=") {
+            std::env::set_var(ENV_DATA_DIR, value);
+            args.remove(i);
+            continue;
+        }
+        if args[i] == "--data-dir" && i + 1 < args.len() {
+            let value = args.remove(i + 1);
+            args.remove(i);
+            std::env::set_var(ENV_DATA_DIR, value);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn manage_projects(args: &[String]) -> Result<(), String> {
+    let dir = data_dir();
+    let mut store = ProjectStore::load(&dir);
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            if store.projects.is_empty() {
+                println!("（尚未添加项目）");
+            } else {
+                for project in &store.projects {
+                    println!("{project}");
+                }
+            }
+            Ok(())
+        }
+        Some("add") => {
+            let raw = args.get(1).ok_or("用法：Nova server project add <目录>")?;
+            let path = std::fs::canonicalize(raw)
+                .map_err(|error| format!("项目目录不存在：{raw}（{error}）"))?;
+            if !path.is_dir() {
+                return Err(format!("不是目录：{}", path.display()));
+            }
+            let path = path.to_string_lossy().to_string();
+            store.touch(&path);
+            println!("已添加项目：{path}");
+            Ok(())
+        }
+        Some("remove") | Some("delete") | Some("rm") => {
+            let raw = args
+                .get(1)
+                .ok_or("用法：Nova server project remove <目录>")?;
+            let requested = std::fs::canonicalize(raw)
+                .unwrap_or_else(|_| PathBuf::from(raw))
+                .to_string_lossy()
+                .to_string();
+            let before = store.projects.len();
+            store.projects.retain(|stored| {
+                let normalized = std::fs::canonicalize(stored)
+                    .unwrap_or_else(|_| PathBuf::from(stored))
+                    .to_string_lossy()
+                    .to_string();
+                stored != raw && normalized != requested
+            });
+            store.save();
+            if store.projects.len() == before {
+                return Err(format!("项目不在列表中：{raw}"));
+            }
+            println!("已移除项目：{raw}");
+            Ok(())
+        }
+        _ => Err("用法：Nova server project <list|add|remove> [目录]".into()),
+    }
+}
+
+fn manage_config(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("show") | Some("list") => show_config(args.iter().any(|arg| arg == "--show-token")),
+        Some("set") => {
+            let key = args
+                .get(1)
+                .ok_or("用法：Nova server config set <键> <值>")?;
+            let value = args
+                .get(2)
+                .ok_or("用法：Nova server config set <键> <值>")?;
+            set_config(key, value)
+        }
+        Some("unset") => {
+            let key = args.get(1).ok_or("用法：Nova server config unset <键>")?;
+            set_config(key, "")
+        }
+        _ => Err("用法：Nova server config <show|set|unset> ...".into()),
+    }
+}
+
+fn show_config(show_token: bool) -> Result<(), String> {
+    let dir = data_dir();
+    let settings = Settings::load(&dir);
+    let server = load_server_file();
+    let token = if show_token {
+        settings.relay_token.clone()
+    } else {
+        mask_secret(&settings.relay_token)
+    };
+    let value = json!({
+        "dataDir": dir,
+        "relayServer": settings.relay_server,
+        "token": token,
+        "groups": settings.relay_groups,
+        "name": server.name,
+        "proxy": server.proxy,
+        "defaultMode": settings.default_mode,
+        "agents": {
+            "devin": { "enabled": settings.devin_enabled, "path": settings.devin_path, "proxy": settings.devin_proxy },
+            "codex": { "enabled": settings.codex_enabled, "path": settings.codex_path, "args": settings.codex_args, "proxy": settings.codex_proxy },
+            "codebuddy": { "enabled": settings.codebuddy_enabled, "path": settings.codebuddy_path, "proxy": settings.codebuddy_proxy },
+            "claude": { "enabled": settings.claudecode_enabled, "path": settings.claudecode_path, "proxy": settings.claudecode_proxy },
+            "cursor": { "enabled": settings.cursor_enabled, "path": settings.cursor_path, "proxy": settings.cursor_proxy },
+            "opencode": { "enabled": settings.opencode_enabled, "path": settings.opencode_path, "proxy": settings.opencode_proxy }
+        }
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "enable" | "enabled" => Ok(true),
+        "false" | "0" | "no" | "off" | "disable" | "disabled" => Ok(false),
+        _ => Err(format!("无效布尔值：{value}（应为 true/false）")),
+    }
+}
+
+fn set_config(key: &str, value: &str) -> Result<(), String> {
+    let dir = data_dir();
+    let mut settings = Settings::load(&dir);
+    let mut server = load_server_file();
+    match key.trim_start_matches("--") {
+        "relay-server" => settings.relay_server = value.into(),
+        "token" | "relay-token" => settings.relay_token = value.into(),
+        "groups" | "relay-groups" => settings.relay_groups = value.into(),
+        "name" => server.name = value.into(),
+        "proxy" => server.proxy = value.into(),
+        "default-mode" => settings.default_mode = value.into(),
+        "devin-path" => settings.devin_path = value.into(),
+        "codex-path" => settings.codex_path = value.into(),
+        "codex-args" => settings.codex_args = value.into(),
+        "codebuddy-path" => settings.codebuddy_path = value.into(),
+        "claude-path" => settings.claudecode_path = value.into(),
+        "cursor-path" => settings.cursor_path = value.into(),
+        "opencode-path" => settings.opencode_path = value.into(),
+        "devin-proxy" => settings.devin_proxy = value.into(),
+        "codex-proxy" => settings.codex_proxy = value.into(),
+        "codebuddy-proxy" => settings.codebuddy_proxy = value.into(),
+        "claude-proxy" => settings.claudecode_proxy = value.into(),
+        "cursor-proxy" => settings.cursor_proxy = value.into(),
+        "opencode-proxy" => settings.opencode_proxy = value.into(),
+        "devin-enabled" => settings.devin_enabled = parse_bool(value)?,
+        "codex-enabled" => settings.codex_enabled = parse_bool(value)?,
+        "codebuddy-enabled" => settings.codebuddy_enabled = parse_bool(value)?,
+        "claude-enabled" => settings.claudecode_enabled = parse_bool(value)?,
+        "cursor-enabled" => settings.cursor_enabled = parse_bool(value)?,
+        "opencode-enabled" => settings.opencode_enabled = parse_bool(value)?,
+        unknown => return Err(format!("未知配置键：{unknown}\n\n{HELP}")),
+    }
+    settings.remote_control_enabled = true;
+    settings.save(&dir);
+    save_server_file(&server)?;
+    println!("已更新配置：{key}");
+    Ok(())
+}
+
+fn mask_secret(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    if chars.len() <= 8 {
+        return "****".into();
+    }
+    format!(
+        "{}****{}",
+        chars[..4].iter().collect::<String>(),
+        chars[chars.len() - 4..].iter().collect::<String>()
+    )
 }
 
 /// Recognize `Nova server` / `Nova --headless`, persist the options in process-local environment
@@ -60,6 +354,7 @@ pub fn configure_from_args() -> Result<bool, String> {
             "name" => std::env::set_var(ENV_NAME, value),
             "proxy" => std::env::set_var(ENV_PROXY, value),
             "project" => projects.push(value),
+            "data-dir" => std::env::set_var(ENV_DATA_DIR, value),
             unknown => return Err(format!("未知的 server 参数：--{unknown}")),
         }
         i += 1;
@@ -97,9 +392,19 @@ pub fn configured_projects() -> Vec<PathBuf> {
 /// `--project` 同时充当网页远控的目录白名单。未显式配置时保留桌面 settings/projects
 /// 的兼容行为；临时会话由 Nova 自己创建，可以安全展示。
 pub fn path_allowed(path: &str) -> bool {
-    let roots = configured_projects();
-    if roots.is_empty() || path.contains(crate::SCRATCH_MARK) {
+    if !is_headless() || path.contains(crate::SCRATCH_MARK) {
         return true;
+    }
+    let mut roots = configured_projects();
+    if roots.is_empty() {
+        roots = ProjectStore::load(&data_dir())
+            .projects
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+    }
+    if roots.is_empty() {
+        return false;
     }
     let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
     roots.into_iter().any(|root| {
@@ -112,12 +417,20 @@ pub fn configured_name() -> Option<String> {
     std::env::var(ENV_NAME)
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            let value = load_server_file().name;
+            (!value.trim().is_empty()).then_some(value)
+        })
 }
 
 pub fn configured_proxy() -> Option<String> {
     std::env::var(ENV_PROXY)
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            let value = load_server_file().proxy;
+            (!value.trim().is_empty()).then_some(value)
+        })
 }
 
 #[cfg(test)]
@@ -132,5 +445,19 @@ mod tests {
             vec![PathBuf::from("/srv/a"), PathBuf::from("/srv/b")]
         );
         std::env::remove_var(ENV_PROJECTS);
+    }
+
+    #[test]
+    fn token_masking_does_not_expose_full_secret() {
+        assert_eq!(mask_secret(""), "");
+        assert_eq!(mask_secret("short"), "****");
+        assert_eq!(mask_secret("abcd-very-secret-wxyz"), "abcd****wxyz");
+    }
+
+    #[test]
+    fn boolean_config_values_are_human_friendly() {
+        assert_eq!(parse_bool("yes"), Ok(true));
+        assert_eq!(parse_bool("disabled"), Ok(false));
+        assert!(parse_bool("maybe").is_err());
     }
 }
