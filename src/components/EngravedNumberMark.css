@@ -74,6 +74,9 @@
 }
 
 .engraved-number-mark-serial {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.16em;
   font-family: var(--mono);
   font-size: 0.34em;
   font-weight: 600;

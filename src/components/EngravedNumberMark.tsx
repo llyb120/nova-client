@@ -26,7 +26,10 @@ export function EngravedNumberMark(props: EngravedNumberMarkProps) {
       title={props.title ?? label()}
     >
       <span class="engraved-number-mark-text" aria-hidden="true">
-        <span class="engraved-number-mark-serial">No. {digits()}</span>
+        <span class="engraved-number-mark-serial">
+          <span>No.</span>
+          <span>{digits()}</span>
+        </span>
         <Show when={username()}>
           <span class="engraved-number-mark-name">
             <For each={usernameParts()}>
