@@ -9,7 +9,7 @@
 
 use crate::relay::{gzip_json, resolve_relay_server};
 use crate::threads::{AgentKind, Item, Thread};
-use crate::{is_running, AppState, SCRATCH_MARK};
+use crate::{delete_thread, is_running, AppState, SCRATCH_MARK};
 use base64::Engine;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1231,6 +1231,18 @@ async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult 
             Ok(()) => ok_thread(cmd.thread_id.clone()),
             Err(e) => fail(e),
         },
+        "delete" => {
+            match delete_thread(app.clone(), app.state::<AppState>(), cmd.thread_id.clone()) {
+                Ok(()) => CommandResult {
+                    id: cmd.id,
+                    ok: true,
+                    error: String::new(),
+                    thread_id: String::new(),
+                    data: None,
+                },
+                Err(e) => fail(e),
+            }
+        }
         "rename" => match rename_remote_thread(app, &cmd.thread_id, &cmd.title) {
             Ok(()) => ok_thread(cmd.thread_id.clone()),
             Err(e) => fail(e),
