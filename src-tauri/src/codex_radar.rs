@@ -3,9 +3,11 @@ use std::time::Duration;
 
 pub const AUTO_VALUE_MODEL: &str = "__nova_auto_value__";
 pub const AUTO_IQ_MODEL: &str = "__nova_auto_iq__";
+pub const AUTO_COMMUNITY_MODEL: &str = "__nova_auto_community__";
 
 const RADAR_URL: &str = "https://codexradar.com/";
 const RADAR_JSON_URL: &str = "https://codexradar.com/current.json";
+const RADAR_RATINGS_URL: &str = "https://codexradar.com/api/model-ratings";
 
 #[derive(Clone, Debug, PartialEq)]
 struct RadarModel {
@@ -23,14 +25,17 @@ pub struct ResolvedAutoModel {
 }
 
 pub fn is_auto_model(model: &str) -> bool {
-    matches!(model, AUTO_VALUE_MODEL | AUTO_IQ_MODEL)
+    matches!(
+        model,
+        AUTO_VALUE_MODEL | AUTO_IQ_MODEL | AUTO_COMMUNITY_MODEL
+    )
 }
 
 pub fn selection_label(model: &str) -> &'static str {
-    if model == AUTO_IQ_MODEL {
-        "按智商"
-    } else {
-        "按性价比"
+    match model {
+        AUTO_IQ_MODEL => "按智商",
+        AUTO_COMMUNITY_MODEL => "按社区评分",
+        _ => "按性价比",
     }
 }
 
@@ -54,15 +59,22 @@ pub async fn resolve_auto_model(
         .user_agent("Nova/codex-radar-auto-router")
         .build()
         .map_err(|e| format!("创建 Codex 雷达请求失败：{e}"))?;
-    let summary = fetch_text(&client, RADAR_JSON_URL).await?;
-    let summary: Value =
-        serde_json::from_str(&summary).map_err(|e| format!("解析 Codex 雷达状态失败：{e}"))?;
-    let entries = radar_models(&summary)?;
-    let winner = if selected == AUTO_IQ_MODEL {
-        latest_iq_winner(&entries)?
+    let winner = if selected == AUTO_COMMUNITY_MODEL {
+        let ratings = fetch_text(&client, RADAR_RATINGS_URL).await?;
+        let ratings: Value = serde_json::from_str(&ratings)
+            .map_err(|e| format!("解析 Codex 雷达社区评分失败：{e}"))?;
+        community_rating_winner(&ratings)?
     } else {
-        let homepage = fetch_text(&client, RADAR_URL).await?;
-        latest_value_winner(&entries, &homepage)?
+        let summary = fetch_text(&client, RADAR_JSON_URL).await?;
+        let summary: Value =
+            serde_json::from_str(&summary).map_err(|e| format!("解析 Codex 雷达状态失败：{e}"))?;
+        let entries = radar_models(&summary)?;
+        if selected == AUTO_IQ_MODEL {
+            latest_iq_winner(&entries)?
+        } else {
+            let homepage = fetch_text(&client, RADAR_URL).await?;
+            latest_value_winner(&entries, &homepage)?
+        }
     };
     let value = match_available_model(options, &winner, open_code).ok_or_else(|| {
         format!(
@@ -181,6 +193,53 @@ fn latest_value_winner(entries: &[RadarModel], html: &str) -> Result<RadarModel,
         .find(|entry| compact_key(&entry.key) == compact_key(winner_key))
         .cloned()
         .ok_or_else(|| format!("Codex 雷达性价比第一名 {winner_key} 缺少模型信息"))
+}
+
+fn community_rating_winner(ratings: &Value) -> Result<RadarModel, String> {
+    ratings
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or("Codex 雷达社区评分响应缺少 models")?
+        .iter()
+        .filter_map(|rating| {
+            let id = rating.get("id")?.as_str()?;
+            let model = rating.get("group")?.as_str()?;
+            let average = rating.get("average")?.as_f64()?;
+            let count = rating.get("count")?.as_u64()?;
+            if count == 0 {
+                return None;
+            }
+            let model_slug = model
+                .split_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+                .join("-");
+            let model_key = normalize_key(&model_slug);
+            let id_key = normalize_key(id);
+            let effort = id_key.strip_prefix(&format!("{model_key}_"))?;
+            if effort == "ultra" {
+                return None;
+            }
+            Some((
+                RadarModel {
+                    key: id.to_string(),
+                    model: model_slug,
+                    effort: effort.to_string(),
+                    date: ratings
+                        .get("updated_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    iq: average,
+                },
+                count,
+            ))
+        })
+        .max_by(|(a, a_count), (b, b_count)| {
+            a.iq.total_cmp(&b.iq).then_with(|| a_count.cmp(b_count))
+        })
+        .map(|(winner, _)| winner)
+        .ok_or_else(|| "Codex 雷达没有可用的社区体感评分（已排除 ultra）".into())
 }
 
 fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
@@ -325,6 +384,24 @@ mod tests {
             compact_key("gpt_5_6_sol_max"),
             compact_key("gpt_56_sol_max")
         );
+    }
+
+    #[test]
+    fn picks_highest_community_rating_and_excludes_ultra() {
+        let ratings = json!({
+            "updated_at": "2026-07-19T02:46:38.504Z",
+            "models": [
+                {"id":"gpt-5.6-sol-ultra","group":"GPT-5.6 Sol","average":9.9,"count":100},
+                {"id":"gpt-5.6-sol-max","group":"GPT-5.6 Sol","average":8.5,"count":10},
+                {"id":"gpt-5.6-terra-max","group":"GPT-5.6 Terra","average":8.5,"count":20},
+                {"id":"gpt-5.6-luna-high","group":"GPT-5.6 Luna","average":null,"count":0}
+            ]
+        });
+        let winner = community_rating_winner(&ratings).unwrap();
+        assert_eq!(winner.model, "gpt-5.6-terra");
+        assert_eq!(winner.effort, "max");
+        assert_eq!(selection_label(AUTO_COMMUNITY_MODEL), "按社区评分");
+        assert!(is_auto_model(AUTO_COMMUNITY_MODEL));
     }
 
     #[test]
