@@ -46,6 +46,8 @@ jobs:
             os: windows-latest
           - name: macos
             os: macos-latest
+          - name: linux
+            os: ubuntu-22.04
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -71,6 +73,12 @@ jobs:
       - run: npm ci
       - run: npm run check
 
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb
+
       - name: Write version into config files
         shell: bash
         run: |
@@ -84,6 +92,10 @@ jobs:
       - name: Build (macOS app + DMG)
         if: runner.os == 'macOS'
         run: npx tauri build --bundles dmg
+
+      - name: Build (Linux DEB + AppImage)
+        if: runner.os == 'Linux'
+        run: npx tauri build --bundles deb,appimage
 
       - name: Package update zip
         shell: bash
@@ -104,6 +116,16 @@ jobs:
         with:
           name: Nova-macos-dmg-v${{ needs.prepare.outputs.version }}
           path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      - name: Upload Linux packages
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nova-linux-v${{ needs.prepare.outputs.version }}
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
 
   release:
@@ -148,6 +170,8 @@ jobs:
           files: |
             dist/**/*.zip
             dist/**/*.dmg
+            dist/**/*.deb
+            dist/**/*.AppImage
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -2,6 +2,9 @@
 # 打包 Nova 更新 zip（由 GitHub Release 分发，不上传私服）
 # Windows：Nova.exe → nova-{ver}.zip
 # macOS：Nova → nova-macos-{arch}-{ver}.zip
+# Linux：Nova → nova-linux-{arch}-{ver}.zip
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -25,11 +28,19 @@ def is_macos() -> bool:
     return sys.platform == "darwin"
 
 
+def is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
 def update_channel() -> str:
     if is_macos():
         machine = platform.machine().lower()
         arch = "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
         return f"nova-macos-{arch}"
+    if is_linux():
+        machine = platform.machine().lower()
+        arch = "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
+        return f"nova-linux-{arch}"
     return "nova"
 
 
@@ -129,6 +140,24 @@ def validate_mach_o_image(data: bytes) -> None:
         raise ValueError(f"架构不匹配，包内 cputype=0x{cputype:x}，当前需要 0x{expected:x}")
 
 
+def validate_elf_image(data: bytes) -> None:
+    if len(data) < 20:
+        raise ValueError("文件太小")
+    if data[:4] != b"\x7fELF":
+        raise ValueError("缺少 ELF 文件头")
+    elf_class = data[4]
+    if elf_class not in (1, 2):
+        raise ValueError("ELF 位数标记无效")
+    endian = "<" if data[5] == 1 else ">" if data[5] == 2 else ""
+    if not endian:
+        raise ValueError("ELF 字节序标记无效")
+    machine = struct.unpack_from(f"{endian}H", data, 18)[0]
+    host = platform.machine().lower()
+    expected = 183 if host in ("arm64", "aarch64") else 62
+    if machine != expected:
+        raise ValueError(f"架构不匹配，ELF machine={machine}，当前需要 {expected}")
+
+
 def validate_update_zip(zip_path: Path, expected_name: str) -> None:
     with zipfile.ZipFile(zip_path) as zf:
         exe_name = next(
@@ -143,6 +172,8 @@ def validate_update_zip(zip_path: Path, expected_name: str) -> None:
                 validate_pe_image(data)
             elif is_macos():
                 validate_mach_o_image(data)
+            elif is_linux():
+                validate_elf_image(data)
             elif not data:
                 raise ValueError("文件为空")
         except ValueError as exc:

@@ -19,6 +19,7 @@ mod quota;
 mod relay;
 mod remote;
 mod semantic;
+mod server;
 mod settings;
 mod skills;
 mod sleep_inhibitor;
@@ -32,6 +33,7 @@ mod windows_shell_shim;
 pub const SCRATCH_MARK: &str = "Nova-scratch";
 
 pub use path_env::init_process_path;
+pub use server::configure_from_args as configure_server_mode;
 
 use acp::AcpManager;
 use codex::CodexManager;
@@ -111,6 +113,8 @@ pub struct AppState {
     pub cli_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 编辑历史消息后正在后台 restore/fork、等待自动重发的会话。
     pub pending_prompt_restores: Mutex<HashSet<String>>,
+    /// 网页远控尚待处理的权限请求（requestKey -> 原始事件）。
+    pub remote_permissions: Mutex<HashMap<String, Value>>,
     /// 有会话运行时阻止系统因空闲自动休眠；最后一个会话结束后自动释放。
     pub sleep_inhibitor: sleep_inhibitor::SleepInhibitor,
 }
@@ -4415,6 +4419,42 @@ fn register_roaming_forwarders(app: &tauri::AppHandle, relay: Arc<RelayManager>)
     });
 }
 
+/// 权限请求原本只存在于 WebView 的临时状态。Server 没有 WebView，因此在核心状态中保留
+/// 一份待审批事件，随远程快照同步给 Nova Web，并在审批完成后删除。
+fn register_remote_permission_capture(app: &tauri::AppHandle) {
+    let capture_app = app.clone();
+    app.listen(acp::EV_PERMISSION, move |event| {
+        let Ok(value) = serde_json::from_str::<Value>(event.payload()) else {
+            return;
+        };
+        let Some(key) = value["requestKey"].as_str().map(str::to_string) else {
+            return;
+        };
+        capture_app
+            .state::<AppState>()
+            .remote_permissions
+            .lock()
+            .unwrap()
+            .insert(key, value);
+    });
+
+    let resolve_app = app.clone();
+    app.listen(acp::EV_PERMISSION_RESOLVED, move |event| {
+        let Ok(value) = serde_json::from_str::<Value>(event.payload()) else {
+            return;
+        };
+        let Some(key) = value["requestKey"].as_str() else {
+            return;
+        };
+        resolve_app
+            .state::<AppState>()
+            .remote_permissions
+            .lock()
+            .unwrap()
+            .remove(key);
+    });
+}
+
 /// 旧的 Tauri app_data_dir 标识（按新→旧排列），仅用于一次性迁移到 ~/.nova。
 /// com.nova.desktop：更名 Nova 后的目录；com.fuckdevin.desktop：更早的品牌目录。
 const LEGACY_IDENTIFIERS: &[&str] = &["com.nova.desktop", "com.fuckdevin.desktop"];
@@ -4552,7 +4592,11 @@ pub fn run() {
             // 窗口在配置里以 visible:false 创建：这里统一决定如何呈现。
             // 升级重启会还原成「更新前的样子」（位置/多屏/最大化/最小化/是否前台），
             // 普通启动则正常显示并聚焦。
-            updater::restore_window_on_launch(app.handle());
+            if !server::is_headless() {
+                updater::restore_window_on_launch(app.handle());
+            } else {
+                eprintln!("[nova-server] headless runtime started");
+            }
 
             // 不再在启动时强制替换重启。若本地已有暂存好的新版本：前端会显示「可更新」角标，
             // 后端的空闲提示定时器会在没有任务时弹窗让用户选择是否现在更新（用户主导）。
@@ -4571,7 +4615,32 @@ pub fn run() {
                     }
                 }
             }
-            let settings = Settings::load(&dir);
+            let mut settings = Settings::load(&dir);
+            server::apply_settings(&mut settings);
+            if server::is_headless()
+                && (settings.relay_server.trim().is_empty()
+                    || settings.relay_token.trim().is_empty())
+            {
+                return Err(
+                    "Nova server 需要 relay server 和 token（命令行参数、环境变量或 settings.json）"
+                        .into(),
+                );
+            }
+            let configured_projects = server::configured_projects();
+            if !configured_projects.is_empty() {
+                // 显式白名单覆盖历史最近项目，防止服务器复用旧数据目录时意外暴露其他路径。
+                projects.projects.clear();
+            }
+            for project in configured_projects {
+                if project.is_dir() {
+                    projects.touch(&project.to_string_lossy());
+                } else {
+                    eprintln!(
+                        "[nova-server] ignored missing project: {}",
+                        project.display()
+                    );
+                }
+            }
             let windows_shell_shim_enabled = settings.windows_shell_shim_enabled;
             // 集中 skills → 各后端全局目录的软链接/联接（启动时先同步一次）
             let _ = skills::sync_skills_to_backends(&dir);
@@ -4632,6 +4701,7 @@ pub fn run() {
                 cli_upgrade_lock: tokio::sync::Mutex::new(()),
                 cli_operations: Mutex::new(HashMap::new()),
                 pending_prompt_restores: Mutex::new(HashSet::new()),
+                remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
             });
 
@@ -4747,6 +4817,7 @@ pub fn run() {
 
             // 漫游 host：把本机被漫游会话的更新/轮次/权限事件转发给 guest
             register_roaming_forwarders(app.handle(), relay.clone());
+            register_remote_permission_capture(app.handle());
             // 连接中转站（未配置 token 时内部直接返回）
             relay.restart();
             // server 侧远程会话：空闲只做命令长轮询；运行中按全量 + 增量同步。
@@ -4772,55 +4843,59 @@ pub fn run() {
             // 放后端而非前端 setInterval：WebView 计时器在窗口最小化/隐藏时会被严重节流甚至暂停，
             // 表现为「只有启动时才检测、之后角标一直不出现」。tokio 定时器不受影响，稳定触发；
             // 检测到新版本就静默下载暂存，就绪后发 update:available 事件，前端据此显示可更新角标。
-            let update_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use tokio::time::{sleep, Duration};
-                sleep(Duration::from_secs(3)).await; // 稍等，避开启动高峰（拉会话/连中转站）
-                loop {
-                    if let Ok(info) = updater::check(&update_app).await {
-                        if info["hasUpdate"].as_bool().unwrap_or(false) {
-                            if info["staged"].as_bool().unwrap_or(false) {
-                                // 已暂存好（上次会话或本次刚下完）：直接通知前端显示角标
-                                let _ = update_app.emit(updater::EV_AVAILABLE, info);
-                            } else if let Ok(res) =
-                                updater::download_and_stage(update_app.clone()).await
-                            {
-                                if res["ready"].as_bool().unwrap_or(false) {
-                                    if let Ok(info2) = updater::check(&update_app).await {
-                                        let _ = update_app.emit(updater::EV_AVAILABLE, info2);
+            if !server::is_headless() {
+                let update_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::time::{sleep, Duration};
+                    sleep(Duration::from_secs(3)).await; // 稍等，避开启动高峰（拉会话/连中转站）
+                    loop {
+                        if let Ok(info) = updater::check(&update_app).await {
+                            if info["hasUpdate"].as_bool().unwrap_or(false) {
+                                if info["staged"].as_bool().unwrap_or(false) {
+                                    // 已暂存好（上次会话或本次刚下完）：直接通知前端显示角标
+                                    let _ = update_app.emit(updater::EV_AVAILABLE, info);
+                                } else if let Ok(res) =
+                                    updater::download_and_stage(update_app.clone()).await
+                                {
+                                    if res["ready"].as_bool().unwrap_or(false) {
+                                        if let Ok(info2) = updater::check(&update_app).await {
+                                            let _ = update_app.emit(updater::EV_AVAILABLE, info2);
+                                        }
                                     }
                                 }
                             }
                         }
+                        sleep(Duration::from_secs(10 * 60)).await;
                     }
-                    sleep(Duration::from_secs(10 * 60)).await;
-                }
-            });
+                });
+            }
 
             // 空闲提示更新（取代原「强制静默自动升级」）：新版本已下载好、且当前空闲
             //（没有任何会话在运行、没有员工任务在执行）时，主动弹窗让用户选择是否现在更新，
             // 而不是自动替换重启。每个版本每次运行只弹一次；用户「稍后」则不再打扰。
-            let prompt_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use tokio::time::{sleep, Duration};
-                let mut prompted: Option<String> = None;
-                sleep(Duration::from_secs(60)).await;
-                loop {
-                    if let Some(ver) = updater::staged_upgrade_version(&prompt_app) {
-                        let idle = {
-                            let state = prompt_app.state::<AppState>();
-                            !any_session_running(&state) && !any_employee_working(&state)
-                        };
-                        if idle && prompted.as_deref() != Some(ver.as_str()) {
-                            if let Ok(info) = updater::check(&prompt_app).await {
-                                let _ = prompt_app.emit(updater::EV_PROMPT, info);
-                                prompted = Some(ver);
+            if !server::is_headless() {
+                let prompt_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::time::{sleep, Duration};
+                    let mut prompted: Option<String> = None;
+                    sleep(Duration::from_secs(60)).await;
+                    loop {
+                        if let Some(ver) = updater::staged_upgrade_version(&prompt_app) {
+                            let idle = {
+                                let state = prompt_app.state::<AppState>();
+                                !any_session_running(&state) && !any_employee_working(&state)
+                            };
+                            if idle && prompted.as_deref() != Some(ver.as_str()) {
+                                if let Ok(info) = updater::check(&prompt_app).await {
+                                    let _ = prompt_app.emit(updater::EV_PROMPT, info);
+                                    prompted = Some(ver);
+                                }
                             }
                         }
+                        sleep(Duration::from_secs(60)).await;
                     }
-                    sleep(Duration::from_secs(60)).await;
-                }
-            });
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
