@@ -4764,16 +4764,40 @@ pub fn run() {
                 .into_iter()
                 .find(|k| state.agent_enabled(k))
                 .unwrap_or(AgentKind::Devin);
-                // 与 get_model_options 共用 refreshing 闸门，避免启动时双开探测 session
-                match default_kind {
-                    AgentKind::Devin => state.acp.spawn_revalidate_model_options(),
-                    AgentKind::Codex | AgentKind::CodexPlus => {
-                        state.codex.spawn_revalidate_model_options()
+                // Server 的网页不会像桌面 WebView 那样在打开选择器时调用
+                // get_model_options，因此必须主动刷新所有启用后端。否则首次远程快照
+                // 发出后 Codex 仍是空列表，只能用 CLI 默认模型对话。
+                if server::is_headless() {
+                    if state.agent_enabled(&AgentKind::Devin) {
+                        state.acp.spawn_revalidate_model_options();
                     }
-                    AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-                        state.opencodeplus.spawn_revalidate_model_options()
+                    if state.agent_enabled(&AgentKind::Codex) {
+                        state.codex.spawn_revalidate_model_options();
                     }
-                    _ => {}
+                    if state.agent_enabled(&AgentKind::OpenCode) {
+                        state.opencodeplus.spawn_revalidate_model_options();
+                    }
+                    if state.agent_enabled(&AgentKind::CodeBuddy) {
+                        state.codebuddyplus.spawn_revalidate_model_options();
+                    }
+                    if state.agent_enabled(&AgentKind::ClaudeCode) {
+                        state.claudeplus.spawn_revalidate_model_options();
+                    }
+                    if state.agent_enabled(&AgentKind::Cursor) {
+                        state.cursorplus.spawn_revalidate_model_options();
+                    }
+                } else {
+                    // 与 get_model_options 共用 refreshing 闸门，避免桌面启动时双开探测 session
+                    match default_kind {
+                        AgentKind::Devin => state.acp.spawn_revalidate_model_options(),
+                        AgentKind::Codex | AgentKind::CodexPlus => {
+                            state.codex.spawn_revalidate_model_options()
+                        }
+                        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+                            state.opencodeplus.spawn_revalidate_model_options()
+                        }
+                        _ => {}
+                    }
                 }
             }
 
