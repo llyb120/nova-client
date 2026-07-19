@@ -504,6 +504,7 @@ fn validate_staged_exe(path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn validate_elf_image(bytes: &[u8], expected_machine: u16) -> Result<(), String> {
     if bytes.len() < 20 || bytes.get(..4) != Some(b"\x7fELF") {
         return Err("缺少 ELF 文件头".into());
