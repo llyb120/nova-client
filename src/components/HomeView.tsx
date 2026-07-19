@@ -31,6 +31,7 @@ import {
 import type { AgentKind, Peer } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
+import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconClue, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { ProjectPicker } from "./ProjectPicker";
@@ -643,6 +644,9 @@ export function HomeView() {
           class="home-composer"
           classList={{ "is-dragging": attach.dragging() }}
         >
+          <ExclusiveChatMark
+            token={roam()?.peer.token || state.settings?.relayToken || ""}
+          />
           <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
           <Show when={state.pendingClueCard}>
             {(clue) => (

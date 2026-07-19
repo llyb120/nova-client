@@ -3,7 +3,7 @@
   src: url("../assets/nova-flourish-serial.woff2") format("woff2");
   font-display: swap;
   font-style: normal;
-  font-weight: 400;
+  font-weight: 500;
   unicode-range: U+0020, U+002E, U+0030-0039, U+0041-005A, U+0061-007A;
 }
 
@@ -50,14 +50,14 @@
 
 .engraved-number-mark-text {
   display: inline-flex;
-  align-items: baseline;
-  gap: 0.18em;
-  transform: translateY(0.04em) rotate(-2.2deg);
+  align-items: flex-end;
+  gap: 0.28em;
+  transform: translateY(0.02em) rotate(-0.7deg);
   color: var(--engraved-ink);
   font-family: "Nova Flourish Serial", cursive;
   font-size: 1.12em;
   font-style: normal;
-  font-weight: 400;
+  font-weight: 500;
   font-synthesis: none;
   font-feature-settings: "liga" 1, "calt" 1;
   line-height: 0.72;
@@ -74,30 +74,17 @@
 }
 
 .engraved-number-mark-serial {
-  font-size: 0.56em;
-  letter-spacing: 0.025em;
-  transform: translateY(-0.08em);
+  font-family: var(--mono);
+  font-size: 0.34em;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.055em;
+  transform: translateY(-0.1em);
 }
 
 .engraved-number-mark-name {
-  position: relative;
-  padding-inline: 0.02em 0.12em;
-  font-size: 1.08em;
-}
-
-/* 一道渐细的收笔弧线，让整组文字更接近真实签名而不是普通标签。 */
-.engraved-number-mark-name::after {
-  content: "";
-  position: absolute;
-  right: -0.08em;
-  bottom: -0.13em;
-  left: 0.08em;
-  height: 0.22em;
-  border-bottom: 0.018em solid currentColor;
-  border-radius: 0 0 60% 45%;
-  opacity: 0.68;
-  transform: skewX(-24deg) rotate(-1.5deg);
-  transform-origin: right center;
+  padding-inline-end: 0.08em;
+  font-size: 1em;
 }
 
 /* 花体句点为独立标点预留了边距；用户名中收紧为域名式间隔。 */
@@ -146,6 +133,10 @@
 }
 
 .composer-engraved-mark.engraved-number-mark {
+  --signature-from: #9aa8c7;
+  --signature-mid: #f2f5ff;
+  --signature-to: #8398c8;
+  --signature-glow: rgba(121, 151, 224, 0.35);
   min-width: 0;
   height: auto;
   margin: 0;
@@ -157,7 +148,7 @@
   box-shadow: none;
   contain: none;
   font-size: clamp(27px, 3.8vw, 46px);
-  opacity: 0.11;
+  opacity: 0.26;
 }
 
 .composer-engraved-mark.engraved-number-mark::after {
@@ -165,30 +156,50 @@
 }
 
 .composer-engraved-mark .engraved-number-mark-text {
-  text-shadow:
-    0 -1px 0 rgba(0, 0, 0, 0.86),
-    0 1px 0 rgba(255, 255, 255, 0.38);
+  color: inherit;
+  text-shadow: none;
+}
+
+.composer-engraved-mark .engraved-number-mark-name,
+.composer-engraved-mark .engraved-number-mark-serial {
+  color: transparent;
+  background: linear-gradient(
+    105deg,
+    var(--signature-from) 0%,
+    var(--signature-mid) 48%,
+    var(--signature-to) 100%
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  filter: drop-shadow(0 0 3px var(--signature-glow));
 }
 
 :root[data-theme="ink-light"] .composer-engraved-mark.engraved-number-mark {
-  opacity: 0.12;
+  --signature-from: #8f6338;
+  --signature-mid: #d9b77d;
+  --signature-to: #735033;
+  --signature-glow: rgba(181, 121, 61, 0.28);
+  opacity: 0.24;
 }
 
-:root[data-theme="ink-light"] .composer-engraved-mark .engraved-number-mark-text {
-  color: #55483a;
-  -webkit-text-stroke: 0.12px rgba(49, 40, 31, 0.5);
-  text-shadow:
-    0 -1px 0 rgba(45, 36, 28, 0.74),
-    0 1px 0 rgba(255, 255, 255, 1);
+:root[data-theme="ink-light"] .composer-engraved-mark .engraved-number-mark-name,
+:root[data-theme="ink-light"] .composer-engraved-mark .engraved-number-mark-serial {
+  filter:
+    drop-shadow(0 0 2px var(--signature-glow))
+    drop-shadow(0 1px 0 rgba(255, 255, 255, 0.72));
 }
 
 :root[data-theme="ink-dark"] .composer-engraved-mark.engraved-number-mark {
-  opacity: 0.15;
+  --signature-from: #8196c7;
+  --signature-mid: #f1f5ff;
+  --signature-to: #7089c4;
+  --signature-glow: rgba(112, 151, 245, 0.42);
+  opacity: 0.3;
 }
 
-:root[data-theme="ink-dark"] .composer-engraved-mark .engraved-number-mark-text {
-  color: var(--text-muted);
-  text-shadow:
-    0 -1px 0 rgba(0, 0, 0, 1),
-    0 1px 0 rgba(255, 248, 232, 0.34);
+:root[data-theme="ink-dark"] .composer-engraved-mark .engraved-number-mark-name,
+:root[data-theme="ink-dark"] .composer-engraved-mark .engraved-number-mark-serial {
+  filter:
+    drop-shadow(0 0 3px var(--signature-glow))
+    drop-shadow(0 0 7px rgba(94, 133, 230, 0.16));
 }
