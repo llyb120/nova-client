@@ -187,6 +187,7 @@ async fn run(app: AppHandle) {
     let mut processed_id = 0i64;
     let mut results: Vec<CommandResult> = Vec::new();
     let mut catalog_signature = String::new();
+    let mut project_signature = String::new();
     let mut model_signature = String::new();
     let mut permission_signature = String::new();
     // 远程命令通过异步任务启动。初始快照可能先看到 running=false，随后任务才登记运行；
@@ -205,6 +206,7 @@ async fn run(app: AppHandle) {
             previous.clear();
             force_full = false;
             catalog_signature.clear();
+            project_signature.clear();
             model_signature.clear();
             permission_signature.clear();
             command_watch.clear();
@@ -228,6 +230,7 @@ async fn run(app: AppHandle) {
             processed_id = 0;
             results.clear();
             catalog_signature.clear();
+            project_signature.clear();
             model_signature.clear();
             permission_signature.clear();
             command_watch.clear();
@@ -294,6 +297,10 @@ async fn run(app: AppHandle) {
         let metas = thread_metas(&app);
         let next_catalog_signature = catalog_signature_for(&metas);
         let catalog_changed = next_catalog_signature != catalog_signature;
+        let current_projects = projects(&app);
+        let next_project_signature =
+            serde_json::to_string(&current_projects).unwrap_or_else(|_| "[]".into());
+        let projects_changed = next_project_signature != project_signature;
         let current_models = models(&app);
         let next_model_signature = model_signature_for(&current_models);
         let models_changed = next_model_signature != model_signature;
@@ -312,6 +319,7 @@ async fn run(app: AppHandle) {
             .collect();
         let want_upload = force_full
             || catalog_changed
+            || projects_changed
             || models_changed
             || needs_snapshot
             || !dirty_ids.is_empty()
@@ -325,25 +333,32 @@ async fn run(app: AppHandle) {
                 sleep(ACTIVE_INTERVAL).await;
                 continue;
             }
-            if let Some((generation, result)) = pull_rx.recv().await {
-                if generation == pull_generation {
-                    pull_task.take();
-                    if let Ok(response) = result {
-                        apply_pull_response(
-                            &app,
-                            response,
-                            &mut revision,
-                            &mut force_full,
-                            &mut previous,
-                            &mut processed_id,
-                            &mut ack_id,
-                            &mut results,
-                            &mut requested,
-                            &mut command_watch,
-                        )
-                        .await;
+            tokio::select! {
+                received = pull_rx.recv() => {
+                    if let Some((generation, result)) = received {
+                        if generation == pull_generation {
+                            pull_task.take();
+                            if let Ok(response) = result {
+                                apply_pull_response(
+                                    &app,
+                                    response,
+                                    &mut revision,
+                                    &mut force_full,
+                                    &mut previous,
+                                    &mut processed_id,
+                                    &mut ack_id,
+                                    &mut results,
+                                    &mut requested,
+                                    &mut command_watch,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
+                // 管理指令可能在独立进程里改掉 Relay 地址/Token。定期回到循环顶部
+                // 重读 live settings，并在配置变化时主动 abort 旧长轮询。
+                _ = sleep(Duration::from_millis(250)) => {}
             }
             continue;
         }
@@ -371,7 +386,12 @@ async fn run(app: AppHandle) {
                 current.keys().cloned().collect::<HashSet<_>>(),
                 true,
             )
-        } else if catalog_changed || models_changed || needs_snapshot || dirty_ids.is_empty() {
+        } else if catalog_changed
+            || projects_changed
+            || models_changed
+            || needs_snapshot
+            || dirty_ids.is_empty()
+        {
             // 新会话/目录变化/单纯命令结果走轻量包。只附带缺基线的会话快照；
             // 已有基线的运行会话留到下一拍继续发增量，避免被另一个历史会话拖成全量。
             let checkpoints = checkpoints_for(&snapshot_threads);
@@ -473,6 +493,7 @@ async fn run(app: AppHandle) {
                     }
                     if sent_catalog && !resp.resync {
                         catalog_signature = next_catalog_signature;
+                        project_signature = next_project_signature;
                     }
                     if !resp.resync {
                         model_signature = next_model_signature;
@@ -798,14 +819,14 @@ fn full_snapshot(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSna
     }
 }
 
-/// 轻量包：只带会话列表 + 指定会话快照，供打开历史/预热，避免重扫 projects 与重传 models。
+/// 轻量包：带项目/会话目录与指定会话快照，供打开历史、配置热更新与模型刷新。
 fn threads_pack_with_metas(
     app: &AppHandle,
     metas: Vec<RemoteThreadMeta>,
     synced: &HashMap<String, Thread>,
 ) -> RemoteSnapshot {
     RemoteSnapshot {
-        projects: Vec::new(),
+        projects: projects(app),
         threads: metas,
         thread: None,
         thread_snapshots: synced

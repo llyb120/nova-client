@@ -8,8 +8,9 @@ use crate::settings::Settings;
 use crate::threads::ProjectStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 const ENV_HEADLESS: &str = "NOVA_HEADLESS";
 const ENV_RELAY_SERVER: &str = "NOVA_SERVER_RELAY_URL";
@@ -18,6 +19,12 @@ const ENV_NAME: &str = "NOVA_SERVER_NAME";
 const ENV_PROXY: &str = "NOVA_SERVER_PROXY";
 const ENV_PROJECTS: &str = "NOVA_SERVER_PROJECTS";
 const ENV_DATA_DIR: &str = "NOVA_DATA_DIR";
+const RELOAD_MARKER: &str = "server.reload";
+
+/// Environment variables installed by Nova (as opposed to variables inherited from systemd or
+/// the shell). Keeping this distinction lets `config unset env.X` remove a live value without
+/// accidentally deleting an operator-supplied variable, which always has precedence.
+static MANAGED_ENVIRONMENT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -88,6 +95,30 @@ fn data_dir() -> PathBuf {
 
 fn server_file_path() -> PathBuf {
     data_dir().join("server.json")
+}
+
+fn reload_marker_path() -> PathBuf {
+    data_dir().join(RELOAD_MARKER)
+}
+
+pub fn reload_marker() -> String {
+    std::fs::read_to_string(reload_marker_path()).unwrap_or_default()
+}
+
+fn notify_runtime() -> Result<(), String> {
+    let path = reload_marker_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let marker = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    std::fs::write(path, marker).map_err(|error| error.to_string())
 }
 
 fn load_server_file() -> ServerFile {
@@ -179,6 +210,7 @@ fn manage_projects(args: &[String]) -> Result<(), String> {
             }
             let path = path.to_string_lossy().to_string();
             store.touch(&path);
+            notify_runtime()?;
             println!("已添加项目：{path}");
             Ok(())
         }
@@ -202,6 +234,7 @@ fn manage_projects(args: &[String]) -> Result<(), String> {
             if store.projects.len() == before {
                 return Err(format!("项目不在列表中：{raw}"));
             }
+            notify_runtime()?;
             println!("已移除项目：{raw}");
             Ok(())
         }
@@ -332,6 +365,7 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
     settings.remote_control_enabled = true;
     settings.save(&dir);
     save_server_file(&server)?;
+    notify_runtime()?;
     println!("已更新配置：{key}");
     Ok(())
 }
@@ -351,11 +385,43 @@ fn validate_environment_name(name: &str) -> Result<(), String> {
 /// Persisted agent credentials are a fallback. Values explicitly supplied by systemd, a shell,
 /// or an EnvironmentFile win so operators can rotate secrets without rewriting Nova data.
 fn apply_server_environment() {
-    for (name, value) in load_server_file().environment {
-        if validate_environment_name(&name).is_ok() && std::env::var_os(&name).is_none() {
-            std::env::set_var(name, value);
+    let _ = sync_server_environment();
+}
+
+/// Reconcile persisted provider credentials with this process. Returns true when an environment
+/// value used by future agent children changed, so the caller can retire existing children.
+pub fn sync_server_environment() -> bool {
+    let configured = load_server_file().environment;
+    let managed = MANAGED_ENVIRONMENT.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut managed = managed.lock().unwrap();
+    let mut changed = false;
+
+    let removed: Vec<_> = managed
+        .iter()
+        .filter(|name| !configured.contains_key(*name))
+        .cloned()
+        .collect();
+    for name in removed {
+        std::env::remove_var(&name);
+        managed.remove(&name);
+        changed = true;
+    }
+
+    for (name, value) in configured {
+        if validate_environment_name(&name).is_err() {
+            continue;
+        }
+        // Values inherited from the service manager/shell win. Values previously installed by
+        // Nova remain managed and can be rotated live.
+        if managed.contains(&name) || std::env::var_os(&name).is_none() {
+            if std::env::var_os(&name).as_deref() != Some(value.as_ref()) {
+                std::env::set_var(&name, &value);
+                changed = true;
+            }
+            managed.insert(name);
         }
     }
+    changed
 }
 
 fn mask_secret(value: &str) -> String {
@@ -449,6 +515,13 @@ pub fn configured_projects() -> Vec<PathBuf> {
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
         .collect()
+}
+
+/// Update the process-local whitelist after a `server project` management command. This also
+/// updates runs originally started with `--project`, whose initial environment value would
+/// otherwise mask the newly persisted project list until restart.
+pub fn replace_configured_projects(projects: &[String]) {
+    std::env::set_var(ENV_PROJECTS, projects.join("\u{1f}"));
 }
 
 /// `--project` 同时充当网页远控的目录白名单。未显式配置时保留桌面 settings/projects

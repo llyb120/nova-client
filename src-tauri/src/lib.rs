@@ -3210,9 +3210,21 @@ fn set_global_agent_instructions(
 #[tauri::command]
 async fn set_settings(
     app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    mut settings: Settings,
+    _state: State<'_, AppState>,
+    settings: Settings,
 ) -> Result<(), String> {
+    apply_runtime_settings(&app, settings, true, false).await
+}
+
+/// Apply settings to the live runtime. The headless file watcher uses the same restart rules as
+/// the desktop settings command, but does not write the file back after loading it.
+async fn apply_runtime_settings(
+    app: &tauri::AppHandle,
+    mut settings: Settings,
+    persist: bool,
+    restart_all_agents: bool,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
     let (
@@ -3227,23 +3239,29 @@ async fn set_settings(
         recheck_availability,
     ) = {
         let mut s = state.settings.lock().unwrap();
-        let restart_devin = s.devin_path != settings.devin_path
+        let restart_devin = restart_all_agents
+            || s.devin_path != settings.devin_path
             || s.acp_args != settings.acp_args
             || s.devin_proxy != settings.devin_proxy
             || s.devin_enabled != settings.devin_enabled;
-        let restart_codebuddy = s.codebuddy_path != settings.codebuddy_path
+        let restart_codebuddy = restart_all_agents
+            || s.codebuddy_path != settings.codebuddy_path
             || s.codebuddy_proxy != settings.codebuddy_proxy
             || s.codebuddy_enabled != settings.codebuddy_enabled;
-        let restart_claudecode = s.claudecode_path != settings.claudecode_path
+        let restart_claudecode = restart_all_agents
+            || s.claudecode_path != settings.claudecode_path
             || s.claudecode_proxy != settings.claudecode_proxy
             || s.claudecode_enabled != settings.claudecode_enabled;
-        let restart_cursor = s.cursor_path != settings.cursor_path
+        let restart_cursor = restart_all_agents
+            || s.cursor_path != settings.cursor_path
             || s.cursor_proxy != settings.cursor_proxy
             || s.cursor_enabled != settings.cursor_enabled;
-        let restart_opencode = s.opencode_path != settings.opencode_path
+        let restart_opencode = restart_all_agents
+            || s.opencode_path != settings.opencode_path
             || s.opencode_proxy != settings.opencode_proxy
             || s.opencode_enabled != settings.opencode_enabled;
-        let restart_codex = s.codex_path != settings.codex_path
+        let restart_codex = restart_all_agents
+            || s.codex_path != settings.codex_path
             || s.codex_args != settings.codex_args
             || s.codex_proxy != settings.codex_proxy
             || s.codex_enabled != settings.codex_enabled;
@@ -3259,7 +3277,9 @@ async fn set_settings(
             || restart_opencode
             || restart_codex;
         *s = settings;
-        s.save(&state.config_dir);
+        if persist {
+            s.save(&state.config_dir);
+        }
         (
             restart_devin,
             restart_codebuddy,
@@ -3300,8 +3320,58 @@ async fn set_settings(
     if recheck_availability {
         spawn_backend_availability_check(app.clone());
     }
-    run_session_auto_cleanup(&app);
+    run_session_auto_cleanup(app);
     Ok(())
+}
+
+/// Management commands run in a short-lived process. Watch their commit marker and reconcile the
+/// three persisted server inputs into the already-running headless process.
+fn start_headless_config_watcher(app: tauri::AppHandle) {
+    if !server::is_headless() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        // 从空基线开始，避免管理命令恰好在 setup 与 watcher 启动之间提交而被漏掉。
+        // 已存在的旧 marker 最多导致启动后做一次无害的重复校准。
+        let mut marker = String::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let next = server::reload_marker();
+            if next == marker {
+                continue;
+            }
+            marker = next;
+
+            let environment_changed = server::sync_server_environment();
+            let dir = app.state::<AppState>().config_dir.clone();
+            let mut settings = Settings::load(&dir);
+            server::apply_settings(&mut settings);
+            if let Err(error) =
+                apply_runtime_settings(&app, settings, false, environment_changed).await
+            {
+                eprintln!("[nova-server] failed to reload settings: {error}");
+            }
+
+            let loaded = ProjectStore::load(&dir);
+            let changed = {
+                let state = app.state::<AppState>();
+                let mut projects = state.projects.lock().unwrap();
+                if projects.projects == loaded.projects {
+                    false
+                } else {
+                    *projects = loaded;
+                    true
+                }
+            };
+            if changed {
+                let state = app.state::<AppState>();
+                let projects = state.projects.lock().unwrap().projects.clone();
+                server::replace_configured_projects(&projects);
+                let _ = app.emit("projects:changed", json!({}));
+                eprintln!("[nova-server] project whitelist reloaded");
+            }
+        }
+    });
 }
 
 // ===== 团队分享 / 漫游 =====
@@ -4851,6 +4921,9 @@ pub fn run() {
             relay.restart();
             // server 侧远程会话：空闲只做命令长轮询；运行中按全量 + 增量同步。
             remote::start(app.handle().clone());
+            // `Nova server config/project ...` 由独立管理进程写盘；运行实例监听提交标记，
+            // 无需重启即可同步设置、环境变量与项目白名单。
+            start_headless_config_watcher(app.handle().clone());
 
             // 数字员工心跳：每 5 秒 tick 一次，到点的在岗员工自动唤起干一轮（续做在手单子或找新单子）。
             // 放后端 tokio 定时器（同更新检测）：窗口最小化/隐藏也不受 WebView 节流影响。

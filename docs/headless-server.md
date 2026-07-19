@@ -60,6 +60,7 @@ Nova server project remove /srv/project-a
 
 删除项目只会撤销网页访问权限，不会删除目录或历史会话。项目目录是远控白名单；无头模式
 不会向网页同步白名单之外的历史会话。
+服务运行期间执行 `project add/remove` 会即时刷新白名单和网页端项目列表，无需重启 Nova。
 
 持久化配置：
 
@@ -78,6 +79,8 @@ Nova server config show
 `config show --show-token` 查看完整值。Linux 下 `server.json` 会以 `0600` 权限保存。
 可以通过 `config unset <键>` 清空字符串配置。使用单独数据目录时，在任意命令中加入
 `--data-dir /path/to/data`，或设置 `NOVA_DATA_DIR`。
+服务运行期间执行 `config set/unset` 会即时生效：Relay 配置会自动重连；agent 路径、代理、
+启用状态和 `env.<NAME>` 变化会让受影响的 agent 在下次使用时按新配置启动，无需重启 Nova。
 
 检查和安装 Nova Server 更新：
 
