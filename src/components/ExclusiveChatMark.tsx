@@ -1,8 +1,8 @@
 import { Show } from "solid-js";
 import { EngravedNumberMark } from "./EngravedNumberMark";
 
-/** token 前缀对应的会话背景编号，按声明顺序匹配。 */
-const EXCLUSIVE_NUMBER_BY_TOKEN_PREFIX: ReadonlyArray<readonly [string, string]> = [
+/** token 前缀对应的会话背景身份，按声明顺序匹配。 */
+const EXCLUSIVE_MARK_BY_TOKEN_PREFIX: ReadonlyArray<readonly [string, string]> = [
   ["you.bin", "000"],
   ["bin.ge", "000"],
   ["yao.mengjia", "001"],
@@ -10,21 +10,35 @@ const EXCLUSIVE_NUMBER_BY_TOKEN_PREFIX: ReadonlyArray<readonly [string, string]>
   ["zheng.hanliang", "003"],
 ];
 
-export function exclusiveNumberForToken(token: string): string | undefined {
+export interface ExclusiveChatIdentity {
+  username: string;
+  number: string;
+}
+
+export function exclusiveIdentityForToken(token: string): ExclusiveChatIdentity | undefined {
   const normalized = token.trim();
-  return EXCLUSIVE_NUMBER_BY_TOKEN_PREFIX.find(([prefix]) =>
+  const match = EXCLUSIVE_MARK_BY_TOKEN_PREFIX.find(([prefix]) =>
     normalized.startsWith(prefix),
-  )?.[1];
+  );
+  return match ? { username: match[0], number: match[1] } : undefined;
+}
+
+export function exclusiveNumberForToken(token: string): string | undefined {
+  return exclusiveIdentityForToken(token)?.number;
 }
 
 export function ExclusiveChatMark(props: { token: string }) {
-  const number = () => exclusiveNumberForToken(props.token);
+  const identity = () => exclusiveIdentityForToken(props.token);
 
   return (
-    <Show when={number()}>
+    <Show when={identity()}>
       {(value) => (
         <div class="chat-engraved-watermark" aria-hidden="true">
-          <EngravedNumberMark number={value()} class="chat-engraved-mark" />
+          <EngravedNumberMark
+            username={value().username}
+            number={value().number}
+            class="chat-engraved-mark"
+          />
         </div>
       )}
     </Show>

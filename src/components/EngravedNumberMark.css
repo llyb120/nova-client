@@ -4,7 +4,7 @@
   font-display: swap;
   font-style: normal;
   font-weight: 400;
-  unicode-range: U+0020, U+002E, U+0030-0039, U+004E, U+006F;
+  unicode-range: U+0020, U+002E, U+0030-0039, U+0041-005A, U+0061-007A;
 }
 
 .engraved-number-mark {
@@ -49,7 +49,9 @@
 }
 
 .engraved-number-mark-text {
-  display: block;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.24em;
   transform: translateY(0.04em) rotate(-1deg);
   color: var(--engraved-ink);
   font-family: "Nova Flourish Serial", cursive;
@@ -63,6 +65,11 @@
   text-shadow:
     0 -1px 1px var(--engraved-edge-dark),
     0 1px 0 var(--engraved-edge-light);
+}
+
+.engraved-number-mark-name,
+.engraved-number-mark-serial {
+  display: inline-block;
 }
 
 :root[data-theme="ink-light"] .engraved-number-mark {
@@ -115,7 +122,7 @@
   background: transparent;
   box-shadow: none;
   contain: none;
-  font-size: clamp(46px, 6.5vw, 86px);
+  font-size: clamp(38px, 5.2vw, 72px);
   opacity: 0.07;
 }
 
