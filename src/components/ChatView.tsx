@@ -21,6 +21,8 @@ interface VirtualObserverPool {
 
 const virtualObserverPools = new WeakMap<HTMLElement, VirtualObserverPool>();
 
+const virtualBuffer = (root: HTMLElement) => Math.max(1200, root.clientHeight * 2);
+
 /** 同一个滚动根只创建一个 IO；无论会话有多少轮，观察器数量都保持为 1。 */
 function observeVirtualGroup(root: HTMLElement, element: Element, callback: () => void) {
   let pool = virtualObserverPools.get(root);
@@ -30,7 +32,7 @@ function observeVirtualGroup(root: HTMLElement, element: Element, callback: () =
       (entries) => {
         for (const entry of entries) callbacks.get(entry.target)?.();
       },
-      { root, rootMargin: "1200px 0px" },
+      { root, rootMargin: `${virtualBuffer(root)}px 0px` },
     );
     pool = { observer, callbacks };
     virtualObserverPools.set(root, pool);
@@ -101,7 +103,7 @@ function VirtualGroup(props: {
     }
     const rect = ref.getBoundingClientRect();
     const rootRect = root.getBoundingClientRect();
-    const buffer = 1200;
+    const buffer = virtualBuffer(root);
     const nearViewport =
       rect.bottom >= rootRect.top - buffer && rect.top <= rootRect.bottom + buffer;
     if (nearViewport) {
@@ -182,6 +184,7 @@ export function ChatView() {
   const [stickToBottom, setStickToBottom] = createSignal(true);
   let scrollQueued = false;
   let lastScrollTop = 0;
+  let lastVirtualMountTop = Number.NaN;
   let pointerActive = false;
 
   const permissions = createMemo(() =>
@@ -223,23 +226,64 @@ export function ChatView() {
   const lastGroupIndex = () => groups().length - 1;
 
   /**
-   * IO 回调是异步的，拖动滚动条跨过很长距离时可能晚一帧。只命中采样当前视口里的
-   * wrapper 并立即挂载即可消除空白；成本固定在约 6 次命中测试，不再遍历全部分组。
+   * IO 回调是异步的，拖动滚动条跨很长距离时可能晚一帧。先用命中测试找到一个锚点，
+   * 再沿 DOM 上下连续唤醒整个视口和两屏缓冲区；不会像坐标采样那样漏掉短分组。
    */
-  const mountVisibleVirtualGroups = () => {
-    if (!scrollRef) return;
-    const rect = scrollRef.getBoundingClientRect();
-    const x = Math.min(rect.right - 1, Math.max(rect.left + 1, rect.left + rect.width / 2));
-    const top = Math.ceil(rect.top + 1);
-    const bottom = Math.floor(rect.bottom - 1);
-    if (bottom < top) return;
-    const step = Math.max(120, Math.floor((bottom - top) / 5));
-    for (let y = top; y <= bottom; y += step) {
-      const group = document.elementFromPoint(x, y)?.closest<VirtualGroupElement>(".vgroup");
-      group?.mountVirtualGroup?.();
+  const mountVisibleVirtualGroups = (force = false) => {
+    if (!scrollRef || !innerRef) return;
+    const viewportHeight = scrollRef.clientHeight;
+    if (
+      !force &&
+      Number.isFinite(lastVirtualMountTop) &&
+      Math.abs(scrollRef.scrollTop - lastVirtualMountTop) < viewportHeight / 3
+    ) {
+      return;
     }
-    const last = document.elementFromPoint(x, bottom)?.closest<VirtualGroupElement>(".vgroup");
-    last?.mountVirtualGroup?.();
+    const rootRect = scrollRef.getBoundingClientRect();
+    const x = Math.min(
+      rootRect.right - 1,
+      Math.max(rootRect.left + 1, rootRect.left + rootRect.width / 2),
+    );
+    const sampleY = [
+      rootRect.top + 1,
+      rootRect.top + rootRect.height / 2,
+      rootRect.bottom - 1,
+    ];
+    let anchor: VirtualGroupElement | undefined;
+    for (const y of sampleY) {
+      const hit = document.elementFromPoint(x, y)?.closest<VirtualGroupElement>(".vgroup");
+      if (hit && innerRef.contains(hit)) {
+        anchor = hit;
+        break;
+      }
+    }
+    if (!anchor) return;
+    lastVirtualMountTop = scrollRef.scrollTop;
+
+    const top = rootRect.top - virtualBuffer(scrollRef);
+    const bottom = rootRect.bottom + virtualBuffer(scrollRef);
+    const mount = (element: Element) => {
+      if (element instanceof HTMLDivElement && element.classList.contains("vgroup")) {
+        (element as VirtualGroupElement).mountVirtualGroup?.();
+      }
+    };
+    mount(anchor);
+    for (
+      let element = anchor.previousElementSibling;
+      element;
+      element = element.previousElementSibling
+    ) {
+      if (element.getBoundingClientRect().bottom < top) break;
+      mount(element);
+    }
+    for (
+      let element = anchor.nextElementSibling;
+      element;
+      element = element.nextElementSibling
+    ) {
+      if (element.getBoundingClientRect().top > bottom) break;
+      mount(element);
+    }
   };
 
   const maxScrollTop = () =>
@@ -286,7 +330,7 @@ export function ChatView() {
     if (!scrollRef || !stickToBottom() || pointerActive) return;
     scrollRef.scrollTop = maxScrollTop();
     lastScrollTop = scrollRef.scrollTop;
-    mountVisibleVirtualGroups();
+    mountVisibleVirtualGroups(true);
   };
 
   const compensateVirtualHeight = (delta: number) => {

@@ -171,6 +171,38 @@ function renderMarkdown(src: string, markFiles: boolean): string {
   return markFiles && FILE_REFERENCE_CANDIDATE_RE.test(src) ? withFileReferences(html) : html;
 }
 
+// 虚拟列表会反复卸载/挂载历史消息。缓存净化后的 HTML，避免每次滚回去都重新执行
+// marked + DOMPurify；按 JS 字符串约 2 bytes/字符限制在约 8 MiB，远小于常驻 DOM 的成本。
+const MARKDOWN_CACHE_LIMIT = 8 * 1024 * 1024;
+const markdownCache = new Map<string, { html: string; size: number }>();
+let markdownCacheSize = 0;
+
+function cachedRenderMarkdown(src: string, markFiles: boolean): string {
+  if (!src) return "";
+  const key = `${markFiles ? "1" : "0"}:${src}`;
+  const cached = markdownCache.get(key);
+  if (cached) {
+    markdownCache.delete(key);
+    markdownCache.set(key, cached);
+    return cached.html;
+  }
+  const html = renderMarkdown(src, markFiles);
+  const size = (key.length + html.length) * 2;
+  // 单条超大消息不应挤掉整个历史缓存。
+  if (size > MARKDOWN_CACHE_LIMIT / 2) return html;
+  markdownCache.set(key, { html, size });
+  markdownCacheSize += size;
+  while (markdownCacheSize > MARKDOWN_CACHE_LIMIT) {
+    const oldest = markdownCache.entries().next().value as
+      | [string, { html: string; size: number }]
+      | undefined;
+    if (!oldest) break;
+    markdownCache.delete(oldest[0]);
+    markdownCacheSize -= oldest[1].size;
+  }
+  return html;
+}
+
 export function Markdown(props: { text: string; markFiles?: boolean; live?: boolean }) {
   // 平滑出字层：shown 是 props.text 的一个前缀，按节拍逐步追上目标。
   // 初始即为完整文本——历史消息、非流式内容立即全量显示，不做动画。
@@ -240,11 +272,15 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
       const chunk = tail.slice(0, cut);
       stableSrc += chunk;
       // 稳定前缀只处理一次，可以在固化时完成较重的文件引用标记。
-      stableRef.insertAdjacentHTML("beforeend", renderMarkdown(chunk, !!props.markFiles));
+      stableRef.insertAdjacentHTML("beforeend", cachedRenderMarkdown(chunk, !!props.markFiles));
       tail = tail.slice(cut);
     }
     // 流式尾部每 33ms 更新：此时跳过 template/TreeWalker 扫描，结束后 effect 会自动补齐。
-    setTailHtml(renderMarkdown(tail, !!props.markFiles && !props.live));
+    setTailHtml(
+      props.live
+        ? renderMarkdown(tail, false)
+        : cachedRenderMarkdown(tail, !!props.markFiles),
+    );
   });
 
   const onClick = (e: MouseEvent) => {
