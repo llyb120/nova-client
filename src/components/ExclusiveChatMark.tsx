@@ -33,13 +33,25 @@ export function ExclusiveChatMark(props: { token: string }) {
   return (
     <Show when={identity()}>
       {(value) => (
-        <div class="composer-engraved-watermark" aria-hidden="true">
-          <EngravedNumberMark
-            username={value().username}
-            number={value().number}
-            class="composer-engraved-mark"
-          />
-        </div>
+        <>
+          <div class="composer-engraved-watermark" aria-hidden="true">
+            <EngravedNumberMark
+              username={value().username}
+              number={value().number}
+              class="composer-engraved-mark"
+            />
+          </div>
+          <div
+            class="composer-engraved-watermark composer-engraved-watermark-completion"
+            aria-hidden="true"
+          >
+            <EngravedNumberMark
+              username={value().username}
+              number={value().number}
+              class="composer-engraved-mark"
+            />
+          </div>
+        </>
       )}
     </Show>
   );

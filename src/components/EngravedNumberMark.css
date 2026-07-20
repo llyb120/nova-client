@@ -128,6 +128,16 @@
   user-select: none;
 }
 
+/* 在工具栏上方补画签名最底部，和底层原稿拼合出完整的下伸笔画。 */
+.composer-engraved-watermark-completion {
+  z-index: 2;
+  clip-path: inset(calc(100% - 5px) 0 0 0);
+}
+
+.home-composer .composer-engraved-watermark-completion {
+  clip-path: inset(calc(100% - 7px) 0 0 0);
+}
+
 .composer-input,
 .composer-bar,
 .composer > .image-strip {
