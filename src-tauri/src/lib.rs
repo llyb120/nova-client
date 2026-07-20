@@ -50,8 +50,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use threads::{
-    now_ms, AgentKind, Item, ProjectStore, PromptImage, RoamingStore, Thread, ThreadMeta,
-    ThreadStore, ThreadTrashStore, Worktree, WorktreeRecord, WorktreeStore,
+    now_ms, session_cleanup_is_expired, AgentKind, Item, ProjectStore, PromptImage, RoamingStore,
+    Thread, ThreadMeta, ThreadStore, ThreadTrashStore, Worktree, WorktreeRecord, WorktreeStore,
 };
 
 pub struct AppState {
@@ -275,8 +275,7 @@ fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
 }
 
 fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
-    let timeout_ms = i64::from(hours.max(1)).saturating_mul(60 * 60 * 1000);
-    updated_at < now.saturating_sub(timeout_ms)
+    session_cleanup_is_expired(updated_at, now, hours)
 }
 
 fn is_session_auto_cleanup_day(weekday: chrono::Weekday) -> bool {
@@ -408,6 +407,31 @@ mod session_auto_cleanup_tests {
         assert!(!thread_is_expired(now - 3 * HOUR_MS, now, 3));
         assert!(thread_is_expired(now - 3 * HOUR_MS - 1, now, 3));
         assert!(thread_is_expired(now - HOUR_MS - 1, now, 0));
+    }
+
+    #[test]
+    fn thread_expiration_does_not_count_weekends() {
+        use chrono::TimeZone;
+
+        let friday = chrono::Local
+            .with_ymd_and_hms(2026, 7, 17, 17, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let monday = chrono::Local
+            .with_ymd_and_hms(2026, 7, 20, 9, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let tuesday = chrono::Local
+            .with_ymd_and_hms(2026, 7, 21, 17, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert!(!thread_is_expired(friday, monday, 48));
+        assert!(!thread_is_expired(friday, tuesday, 48));
+        assert!(thread_is_expired(friday, tuesday + 1, 48));
     }
 
     #[test]

@@ -12,6 +12,40 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// 自动清理只累计本地时间周一至周五的时长，周六、周日暂停计时。
+pub fn session_cleanup_is_expired(timestamp: i64, now: i64, hours: u32) -> bool {
+    use chrono::{Datelike, TimeZone};
+
+    let timeout_ms = i64::from(hours.max(1)).saturating_mul(60 * 60 * 1000);
+    let Some(start) = chrono::Local.timestamp_millis_opt(timestamp).single() else {
+        return timestamp < now.saturating_sub(timeout_ms);
+    };
+    let Some(end) = chrono::Local.timestamp_millis_opt(now).single() else {
+        return timestamp < now.saturating_sub(timeout_ms);
+    };
+    let mut cursor = start.naive_local();
+    let end = end.naive_local();
+    let mut elapsed_ms = 0i64;
+
+    while cursor < end {
+        let next_midnight = cursor
+            .date()
+            .succ_opt()
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .unwrap_or(end);
+        let segment_end = end.min(next_midnight);
+        if !matches!(
+            cursor.weekday(),
+            chrono::Weekday::Sat | chrono::Weekday::Sun
+        ) {
+            elapsed_ms = elapsed_ms.saturating_add((segment_end - cursor).num_milliseconds());
+        }
+        cursor = segment_end;
+    }
+
+    elapsed_ms > timeout_ms
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
@@ -940,11 +974,9 @@ impl ThreadTrashStore {
 
     /// 回收站内停留满同一个保留周期后才彻底清除，返回需要一并删除工作目录的会话。
     pub fn purge_expired(&mut self, now: i64, hours: u32) -> Vec<Thread> {
-        let timeout_ms = i64::from(hours.max(1)).saturating_mul(60 * 60 * 1000);
-        let cutoff = now.saturating_sub(timeout_ms);
         let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
             .into_iter()
-            .partition(|entry| entry.trashed_at < cutoff);
+            .partition(|entry| session_cleanup_is_expired(entry.trashed_at, now, hours));
         self.entries = kept;
         if self.save().is_err() {
             self.entries.extend(expired);
