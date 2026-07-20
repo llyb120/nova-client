@@ -165,8 +165,10 @@
 
 .composer-engraved-mark .engraved-number-mark-name,
 .composer-engraved-mark .engraved-number-mark-serial {
-  /* 扩展渐变文字的绘制盒，负 margin 抵消尺寸，避免花体下伸笔画被背景边界截断。 */
+  /* 扩展渐变文字的绘制盒，负 margin 抵消尺寸，避免花体上下伸笔画被背景边界截断。 */
+  padding-top: 0.32em;
   padding-bottom: 0.32em;
+  margin-top: -0.32em;
   margin-bottom: -0.32em;
   color: transparent;
   background: linear-gradient(
