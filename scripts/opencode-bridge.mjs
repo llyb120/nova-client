@@ -111,12 +111,12 @@ function todoPlan(todos) {
     .filter((todo) => todo.content);
 }
 
-function promptEventState(event, sessionId, started) {
+function promptEventState(event, sessionId, started, pendingPrompts = 0) {
   const properties = eventProperties(event);
   if (properties.sessionID !== sessionId) return { started, done: false };
   const status = event.type === "session.status" ? properties.status?.type : undefined;
   if (event.type === "session.idle" || status === "idle") {
-    return { started, done: started };
+    return { started, done: started && pendingPrompts === 0 };
   }
   const activity = status === "busy"
     || status === "retry"
@@ -129,6 +129,16 @@ function promptEventState(event, sessionId, started) {
       "session.error",
     ].includes(event.type);
   return { started: started || activity, done: false };
+}
+
+async function sessionIsIdle(client, sessionId) {
+  try {
+    const result = await client.session.status();
+    const status = result.data?.[sessionId];
+    return !status || status.type === "idle";
+  } catch {
+    return true;
+  }
 }
 
 function steerPrompt(client, sessionId, parts) {
@@ -184,10 +194,14 @@ async function runPrompt(client, lines, request) {
 
   let cancelled = false;
   let checkpointUserItemId = request.userItemId;
+  let pendingPrompts = 0;
   const reportStarted = (started) => {
+    pendingPrompts += 1;
     started.then((result) => {
+      pendingPrompts -= 1;
       if (result.error && !cancelled) send({ type: "error", error: JSON.stringify(result.error) });
     }).catch((error) => {
+      pendingPrompts -= 1;
       if (!cancelled) send({ type: "error", error: error instanceof Error ? error.message : String(error) });
     });
   };
@@ -224,7 +238,7 @@ async function runPrompt(client, lines, request) {
   for await (const event of subscription.stream) {
     const properties = eventProperties(event);
     if (properties.sessionID !== sessionId) continue;
-    const eventState = promptEventState(event, sessionId, promptStarted);
+    const eventState = promptEventState(event, sessionId, promptStarted, pendingPrompts);
     promptStarted = eventState.started;
     if (event.type === "message.updated") {
       if (properties.info?.role === "assistant") {
@@ -267,6 +281,7 @@ async function runPrompt(client, lines, request) {
       break;
     }
     if (eventState.done) {
+      if (!await sessionIsIdle(client, sessionId)) continue;
       const position = [...assistantMessages].at(-1);
       if (position) send({ type: "checkpoint", sessionId, position, userItemId: checkpointUserItemId });
       send({ type: "done" });
@@ -299,4 +314,4 @@ async function main() {
 
 if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
 
-export { automaticPermissionReply, eventProperties, promptEventState, startPrompt, steerPrompt, todoPart, todoPlan };
+export { automaticPermissionReply, eventProperties, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan };
