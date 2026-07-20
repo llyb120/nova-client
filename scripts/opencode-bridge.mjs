@@ -81,6 +81,21 @@ async function ensureSession(client, sessionId) {
   return created.data.id;
 }
 
+async function removeEmptyAssistantMessages(client, sessionId) {
+  const result = await client.session.messages({ sessionID: sessionId });
+  if (result.error) throw new Error(JSON.stringify(result.error));
+  const emptyMessages = (result.data ?? []).filter(
+    (message) => message.info.role === "assistant" && message.parts.length === 0,
+  );
+  for (const message of emptyMessages) {
+    const deleted = await client.session.deleteMessage({
+      sessionID: sessionId,
+      messageID: message.info.id,
+    });
+    if (deleted.error) throw new Error(JSON.stringify(deleted.error));
+  }
+}
+
 function automaticPermissionReply(mode) {
   return mode === "build" ? "always" : undefined;
 }
@@ -208,6 +223,7 @@ function startPrompt(client, sessionId, request) {
 
 async function runPrompt(client, lines, request) {
   const sessionId = await ensureSession(client, request.sessionId);
+  if (sessionId === request.sessionId) await removeEmptyAssistantMessages(client, sessionId);
   const subscription = await client.event.subscribe();
   send({ type: "ready", sessionId });
 
@@ -326,4 +342,4 @@ async function main() {
 
 if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
 
-export { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan };
+export { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, removeEmptyAssistantMessages, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan };

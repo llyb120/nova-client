@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_OPENCODE_BRIDGE_TEST = "1";
-const { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan } = await import("./opencode-bridge.mjs");
+const { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, removeEmptyAssistantMessages, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan } = await import("./opencode-bridge.mjs");
 
 assert.equal(automaticPermissionReply("build"), "always");
 assert.equal(automaticPermissionReply("plan"), undefined);
@@ -42,6 +42,25 @@ assert.equal(await sessionIsIdle({
 assert.equal(await sessionIsIdle({
   session: { status: async () => ({ data: {} }) },
 }, "session-1"), true);
+
+const deletedMessages = [];
+await removeEmptyAssistantMessages({
+  session: {
+    messages: async () => ({
+      data: [
+        { info: { id: "user-empty", role: "user" }, parts: [] },
+        { info: { id: "assistant-empty", role: "assistant" }, parts: [] },
+        { info: { id: "assistant-text", role: "assistant" }, parts: [{ type: "text", text: "done" }] },
+        { info: { id: "assistant-tool", role: "assistant" }, parts: [{ type: "tool" }] },
+      ],
+    }),
+    deleteMessage: async (args) => {
+      deletedMessages.push(args);
+      return { data: true };
+    },
+  },
+}, "session-1");
+assert.deepEqual(deletedMessages, [{ sessionID: "session-1", messageID: "assistant-empty" }]);
 
 assert.deepEqual(eventProperties({ data: { sessionID: "session-1" } }), { sessionID: "session-1" });
 assert.deepEqual(todoPlan([
