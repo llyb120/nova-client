@@ -965,7 +965,11 @@ fn with_command(mut request: Value, text: &str) -> Value {
     let (name, arguments) = command
         .split_once(char::is_whitespace)
         .unwrap_or((command, ""));
-    if name.is_empty() {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
         return request;
     }
     request["command"] = json!(name);
@@ -1289,6 +1293,11 @@ mod tests {
         assert!(
             with_command(json!({ "action": "prompt" }), "explain /review")["command"].is_null()
         );
+        assert!(with_command(
+            json!({ "action": "prompt" }),
+            "/api/v1/mgmt_pc/upload/studio_metric_logic 检查告警原因"
+        )["command"]
+            .is_null());
     }
 
     #[test]
