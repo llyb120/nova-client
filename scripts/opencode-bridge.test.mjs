@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_OPENCODE_BRIDGE_TEST = "1";
-const { automaticPermissionReply, eventProperties, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan } = await import("./opencode-bridge.mjs");
+const { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan } = await import("./opencode-bridge.mjs");
 
 assert.equal(automaticPermissionReply("build"), "always");
 assert.equal(automaticPermissionReply("plan"), undefined);
@@ -18,10 +18,23 @@ assert.deepEqual(promptEventState({
   type: "session.status",
   properties: { sessionID: "session-1", status: { type: "idle" } },
 }, "session-1", true), { started: true, done: true });
-assert.deepEqual(promptEventState({
-  type: "session.status",
-  properties: { sessionID: "session-1", status: { type: "idle" } },
-}, "session-1", true, 1), { started: true, done: false });
+
+let finishSteer;
+const promptErrors = [];
+const tracker = createPromptTracker((error) => promptErrors.push(error));
+tracker.start(new Promise((resolve) => {
+  finishSteer = resolve;
+}));
+let trackerSettled = false;
+const trackerWait = tracker.wait().then(() => {
+  trackerSettled = true;
+});
+await Promise.resolve();
+assert.equal(trackerSettled, false);
+finishSteer({});
+await trackerWait;
+assert.equal(trackerSettled, true);
+assert.deepEqual(promptErrors, []);
 
 assert.equal(await sessionIsIdle({
   session: { status: async () => ({ data: { "session-1": { type: "busy" } } }) },
@@ -72,10 +85,12 @@ assert.deepEqual(promptArgs, {
 
 let steerArgs;
 await steerPrompt({
-  session: {
-    prompt: async (args) => {
-      steerArgs = args;
-      return {};
+  v2: {
+    session: {
+      prompt: async (args) => {
+        steerArgs = args;
+        return {};
+      },
     },
   },
 }, "session-1", [
@@ -85,19 +100,21 @@ await steerPrompt({
 ]);
 assert.deepEqual(steerArgs, {
   sessionID: "session-1",
-  parts: [
-    { type: "text", text: "先定位根因" },
-    { type: "text", text: "不要重构" },
-    { type: "file", filename: "trace.png", url: "data:image/png;base64,abc", mime: "image/png" },
-  ],
+  prompt: {
+    text: "先定位根因\n不要重构",
+    files: [{ uri: "data:image/png;base64,abc", name: "trace.png" }],
+  },
+  delivery: "steer",
 });
 
 steerArgs = undefined;
 await startPrompt({
-  session: {
-    prompt: async (args) => {
-      steerArgs = args;
-      return {};
+  v2: {
+    session: {
+      prompt: async (args) => {
+        steerArgs = args;
+        return {};
+      },
     },
   },
 }, "session-1", {
@@ -107,5 +124,6 @@ await startPrompt({
 });
 assert.deepEqual(steerArgs, {
   sessionID: "session-1",
-  parts: [{ type: "text", text: "改为只修复测试" }],
+  prompt: { text: "改为只修复测试" },
+  delivery: "steer",
 });

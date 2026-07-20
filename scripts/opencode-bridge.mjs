@@ -111,12 +111,12 @@ function todoPlan(todos) {
     .filter((todo) => todo.content);
 }
 
-function promptEventState(event, sessionId, started, pendingPrompts = 0) {
+function promptEventState(event, sessionId, started) {
   const properties = eventProperties(event);
   if (properties.sessionID !== sessionId) return { started, done: false };
   const status = event.type === "session.status" ? properties.status?.type : undefined;
   if (event.type === "session.idle" || status === "idle") {
-    return { started, done: started && pendingPrompts === 0 };
+    return { started, done: started };
   }
   const activity = status === "busy"
     || status === "retry"
@@ -142,10 +142,40 @@ async function sessionIsIdle(client, sessionId) {
 }
 
 function steerPrompt(client, sessionId, parts) {
-  return client.session.prompt({
+  const text = parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+  const files = parts
+    .filter((part) => part.type === "file")
+    .map((part) => ({
+      uri: part.url,
+      ...(part.filename ? { name: part.filename } : {}),
+    }));
+  return client.v2.session.prompt({
     sessionID: sessionId,
-    parts,
+    prompt: { text, ...(files.length ? { files } : {}) },
+    delivery: "steer",
   });
+}
+
+function createPromptTracker(reportError) {
+  const pending = new Set();
+  return {
+    start(started) {
+      const tracked = Promise.resolve(started)
+        .then((result) => {
+          if (result.error) reportError(JSON.stringify(result.error));
+        }, (error) => {
+          reportError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => pending.delete(tracked));
+      pending.add(tracked);
+    },
+    async wait() {
+      while (pending.size) await Promise.all([...pending]);
+    },
+  };
 }
 
 function startPrompt(client, sessionId, request) {
@@ -183,17 +213,9 @@ async function runPrompt(client, lines, request) {
 
   let cancelled = false;
   let checkpointUserItemId = request.userItemId;
-  let pendingPrompts = 0;
-  const reportStarted = (started) => {
-    pendingPrompts += 1;
-    started.then((result) => {
-      pendingPrompts -= 1;
-      if (result.error && !cancelled) send({ type: "error", error: JSON.stringify(result.error) });
-    }).catch((error) => {
-      pendingPrompts -= 1;
-      if (!cancelled) send({ type: "error", error: error instanceof Error ? error.message : String(error) });
-    });
-  };
+  const prompts = createPromptTracker((error) => {
+    if (!cancelled) send({ type: "error", error });
+  });
   const input = (async () => {
     for await (const line of lines) {
       if (!line.trim()) continue;
@@ -209,7 +231,7 @@ async function runPrompt(client, lines, request) {
         await client.session.abort({ sessionID: sessionId });
       } else if (command.action === "prompt") {
         checkpointUserItemId = command.userItemId;
-        reportStarted(startPrompt(client, sessionId, {
+        prompts.start(startPrompt(client, sessionId, {
           ...command,
           model: command.model ?? request.model,
           agent: command.agent ?? request.agent,
@@ -219,7 +241,7 @@ async function runPrompt(client, lines, request) {
     }
   })();
 
-  reportStarted(startPrompt(client, sessionId, request));
+  prompts.start(startPrompt(client, sessionId, request));
 
   const assistantMessages = new Set();
   const pendingParts = new Map();
@@ -227,7 +249,7 @@ async function runPrompt(client, lines, request) {
   for await (const event of subscription.stream) {
     const properties = eventProperties(event);
     if (properties.sessionID !== sessionId) continue;
-    const eventState = promptEventState(event, sessionId, promptStarted, pendingPrompts);
+    const eventState = promptEventState(event, sessionId, promptStarted);
     promptStarted = eventState.started;
     if (event.type === "message.updated") {
       if (properties.info?.role === "assistant") {
@@ -270,6 +292,7 @@ async function runPrompt(client, lines, request) {
       break;
     }
     if (eventState.done) {
+      await prompts.wait();
       if (!await sessionIsIdle(client, sessionId)) continue;
       const position = [...assistantMessages].at(-1);
       if (position) send({ type: "checkpoint", sessionId, position, userItemId: checkpointUserItemId });
@@ -303,4 +326,4 @@ async function main() {
 
 if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
 
-export { automaticPermissionReply, eventProperties, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan };
+export { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan };
