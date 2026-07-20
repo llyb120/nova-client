@@ -144,7 +144,6 @@ export function RoamRequestModal() {
                     agentKind={req().agentKind}
                     model={model()}
                     mode={mode()}
-                    projectCwd={folder()}
                     portal
                     onPickModel={(_, value) => setModel(value)}
                     onMode={setMode}

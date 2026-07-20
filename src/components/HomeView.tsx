@@ -159,7 +159,6 @@ export function HomeView() {
 
   const pickModel = (v: string) => {
     setModel(v);
-    if (!usesPeerModels() && !quotaBorrowing()) lastUsed.setModel(agentKind(), v, cwd());
     prewarmCurrent({ model: v });
   };
   const pickMode = (v: string) => {
@@ -170,10 +169,9 @@ export function HomeView() {
   };
   const pickModelAgent = (next: AgentKind) => {
     if (next === agentKind()) return;
-    const nextModel = lastUsed.model(next, cwd());
+    const nextModel = resolveAvailableModel(next, lastUsed.model(next));
     const nextMode = lastUsed.mode(next);
     setAgentKind(next);
-    lastUsed.setAgentKind(next);
     setModel(nextModel);
     setMode(nextMode);
     modeTouched = false;
@@ -211,7 +209,6 @@ export function HomeView() {
     }
     const nextMode = lastUsed.mode(next);
     setAgentKind(next);
-    lastUsed.setAgentKind(next);
     setMode(nextMode);
     modeTouched = false;
     if (!usesPeerModels()) {
@@ -219,7 +216,6 @@ export function HomeView() {
       void refreshSlashCommands(next);
     }
     setModel(m);
-    if (!usesPeerModels()) lastUsed.setModel(next, m, cwd());
     prewarmCurrent({ agentKind: next, model: m, mode: nextMode });
   };
 
@@ -325,7 +321,7 @@ export function HomeView() {
   const selectProject = (p: string, warm = false) => {
     setRoam(null); // 选了本地项目就退出漫游
     setCwd(p);
-    const nextModel = resolveAvailableModel(agentKind(), lastUsed.model(agentKind(), p));
+    const nextModel = resolveAvailableModel(agentKind(), lastUsed.model(agentKind()));
     setModel(nextModel);
     if (warm) prewarmCurrent({ cwd: p, model: nextModel });
   };
@@ -430,18 +426,20 @@ export function HomeView() {
         if (clue) clearPendingClueCard();
         stashWorktreePrompt(id, t, images);
       } else {
+        const ephemeral = opts.ephemeral ?? false;
         await createThread(
           cwd(),
           agentKind(),
           model(),
           mode(),
           "",
-          opts.ephemeral ?? false,
+          ephemeral,
           false,
           "",
           "",
           clue?.id ?? "",
         );
+        if (!ephemeral) lastUsed.setModel(agentKind(), model());
         if (clue) clearPendingClueCard();
         await sendPrompt(t, images);
       }
@@ -726,10 +724,10 @@ export function HomeView() {
                 modelSource={usesPeerModels() ? peerModelSource : undefined}
                 sharedModels={usesPeerModels() ? undefined : quotaSharedModelSources()}
                 quotaPeerToken={quotaPeer()?.token}
-                projectCwd={cwd()}
                 onPickModel={pickModelCombined}
                 onMode={pickMode}
                 anchorTo=".home-composer"
+                favorites
               />
             </Show>
             <span class="bar-spacer" />

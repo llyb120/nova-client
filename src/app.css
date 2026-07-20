@@ -2866,6 +2866,22 @@ button {
   color: var(--text-faint);
 }
 
+.sel-favorite {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.sel-favorite:hover,
+.sel-favorite.active {
+  color: var(--accent);
+}
+
 /* ===== 右键菜单 ===== */
 .ctx-menu {
   position: fixed;

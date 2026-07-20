@@ -353,8 +353,8 @@ export function modelChoices(
 }
 
 /** 在可选列表中解析应使用的模型。
- *  优先 preferred；项目模型即使暂不在列表也必须保留，避免异步加载时被全局 lastUsed 覆盖；
- *  仅 preferred 为空时才回退全局 lastUsed / 第一项（跳过 Cursor「Auto」这类 value="" 入口）。 */
+ *  优先 preferred；明确模型即使暂不在列表也必须保留，避免异步加载时被覆盖；
+ *  仅 preferred 为空时才回退上次模型 / 第一项（跳过 Cursor「Auto」这类 value="" 入口）。 */
 export function resolveAvailableModel(
   agentKind: AgentKind,
   preferred: string,
@@ -363,9 +363,9 @@ export function resolveAvailableModel(
   const choices = modelChoices(agentKind, source);
   if (choices.length === 0) return preferred;
   if (preferred && choices.some((c) => c.value === preferred)) return preferred;
-  // 有明确选择但不在当前列表：保留，避免项目模型在列表不全/中间态被全局最近模型覆盖。
+  // 有明确选择但不在当前列表：保留，避免模型列表不全/中间态覆盖最近选择。
   if (preferred) return preferred;
-  const previous = lastUsed.globalModel(agentKind);
+  const previous = lastUsed.model(agentKind);
   if (previous && choices.some((c) => c.value === previous)) return previous;
   return choices.find((c) => c.value)?.value ?? choices[0]?.value ?? "";
 }
@@ -1131,9 +1131,6 @@ export async function createThread(
   );
   rememberThreadSnapshot(t);
   const storedAgentKind = t.agentKind ?? agentKind;
-  // 本地 createThread 是唯一写入模型偏好的入口；漫游和额度租借走各自创建函数，不会到这里。
-  lastUsed.setAgentKind(storedAgentKind);
-  lastUsed.setModel(agentKind, model, cwd);
   lastUsed.setMode(storedAgentKind, t.mode ?? "");
   if (storedAgentKind === "codex") {
     lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
@@ -1160,57 +1157,50 @@ export async function createThread(
   return t.id;
 }
 
-function projectStorageKey(cwd?: string | null): string | null {
-  const key = cwd?.trim();
-  return key ? encodeURIComponent(isScratch(key) ? scratchParent(key) : key) : null;
-}
-
 /** 记住最近一次选择的模型/模式，作为新会话默认值 */
 export const lastUsed = {
   agentKind: (): AgentKind =>
     (localStorage.getItem("fd:lastAgentKind") as AgentKind | null) ?? "devin",
   setAgentKind: (v: AgentKind) => localStorage.setItem("fd:lastAgentKind", v),
-  globalModel: (agentKind: AgentKind = "devin") =>
-    localStorage.getItem(`fd:${agentKind}:lastModel`) ??
-    (agentKind === "devin" ? localStorage.getItem("fd:lastModel") ?? "" : ""),
-  model: (agentKind: AgentKind = "devin", cwd?: string | null) =>
-    (projectStorageKey(cwd)
-      ? localStorage.getItem(`fd:${agentKind}:project:${projectStorageKey(cwd)}:lastModel`)
-      : null) ??
-    lastUsed.globalModel(agentKind),
+  model: (agentKind: AgentKind = "devin") => {
+    if (agentKind !== lastUsed.agentKind()) return "";
+    return (
+      localStorage.getItem("fd:lastUsedModel") ??
+      localStorage.getItem(`fd:${agentKind}:lastModel`) ??
+      (agentKind === "devin" ? localStorage.getItem("fd:lastModel") ?? "" : "")
+    );
+  },
   /** 与 lastModel 成对保存的友好名；选项未到时触发器先显示它，避免闪裸 id */
-  modelName: (agentKind: AgentKind = "devin", cwd?: string | null) =>
-    (projectStorageKey(cwd)
-      ? localStorage.getItem(`fd:${agentKind}:project:${projectStorageKey(cwd)}:lastModelName`)
-      : null) ??
-    localStorage.getItem(`fd:${agentKind}:lastModelName`) ??
-    (agentKind === "devin" ? localStorage.getItem("fd:lastModelName") ?? "" : ""),
+  modelName: (agentKind: AgentKind = "devin") => {
+    if (agentKind !== lastUsed.agentKind()) return "";
+    return (
+      localStorage.getItem("fd:lastUsedModelName") ??
+      localStorage.getItem(`fd:${agentKind}:lastModelName`) ??
+      (agentKind === "devin" ? localStorage.getItem("fd:lastModelName") ?? "" : "")
+    );
+  },
   mode: (agentKind: AgentKind = "devin") =>
     localStorage.getItem(`fd:${agentKind}:lastMode`) ??
     (agentKind === "devin" ? localStorage.getItem("fd:lastMode") ?? "" : ""),
   reasoningEffort: (agentKind: AgentKind = "codex") =>
     localStorage.getItem(`fd:${agentKind}:lastReasoningEffort`) ?? "",
-  setModel: (agentKind: AgentKind, v: string, cwd?: string | null, name?: string | null) => {
-    const key = projectStorageKey(cwd);
-    const prevModel = lastUsed.model(agentKind, cwd);
-    const prevName = lastUsed.modelName(agentKind, cwd);
-    if (key) localStorage.setItem(`fd:${agentKind}:project:${key}:lastModel`, v);
-    localStorage.setItem(`fd:${agentKind}:lastModel`, v);
+  setModel: (agentKind: AgentKind, v: string, name?: string | null) => {
+    const prevModel = lastUsed.model(agentKind);
+    const prevName = lastUsed.modelName(agentKind);
+    lastUsed.setAgentKind(agentKind);
+    localStorage.setItem("fd:lastUsedModel", v);
     const resolved =
       name?.trim() ||
       modelChoices(agentKind).find((c) => c.value === v)?.name ||
       (v && v === prevModel ? prevName : "");
     if (resolved) {
-      if (key) localStorage.setItem(`fd:${agentKind}:project:${key}:lastModelName`, resolved);
-      localStorage.setItem(`fd:${agentKind}:lastModelName`, resolved);
+      localStorage.setItem("fd:lastUsedModelName", resolved);
     }
   },
-  setModelName: (agentKind: AgentKind, name: string, cwd?: string | null) => {
+  setModelName: (agentKind: AgentKind, name: string) => {
     const resolved = name.trim();
     if (!resolved) return;
-    const key = projectStorageKey(cwd);
-    if (key) localStorage.setItem(`fd:${agentKind}:project:${key}:lastModelName`, resolved);
-    localStorage.setItem(`fd:${agentKind}:lastModelName`, resolved);
+    if (agentKind === lastUsed.agentKind()) localStorage.setItem("fd:lastUsedModelName", resolved);
   },
   setMode: (agentKind: AgentKind, v: string) =>
     localStorage.setItem(`fd:${agentKind}:lastMode`, v),
@@ -1237,7 +1227,6 @@ export async function pickThreadModel(agentKind: AgentKind, model: string) {
   const mode = lastUsed.mode(agentKind);
   const reasoningEffort = agentKind === "codex" ? lastUsed.reasoningEffort(agentKind) : "";
   setState({ agentKind, model, mode, reasoningEffort });
-  lastUsed.setAgentKind(agentKind);
   void ensureModelOptions(agentKind);
   void refreshSlashCommands(agentKind);
   try {

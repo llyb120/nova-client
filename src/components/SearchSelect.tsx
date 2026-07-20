@@ -1,6 +1,18 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import { Portal } from "solid-js/web";
-import { IconCheck, IconChevron, IconEye } from "./icons";
+import { IconCheck, IconChevron, IconEye, IconStar } from "./icons";
+
+const FAVORITE_GROUP = "收藏";
+const MODEL_FAVORITES_KEY = "fd:modelFavorites";
+
+function storedFavorites(): string[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(MODEL_FAVORITES_KEY) ?? "[]");
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
 
 export interface SelectOption {
   value: string;
@@ -22,6 +34,8 @@ export interface SelectOption {
   detailTitle?: string;
   /** 是否支持图片输入（显示眼睛标识） */
   vision?: boolean;
+  /** 跨后端唯一的收藏标识；未提供时该选项不显示收藏按钮 */
+  favoriteId?: string;
 }
 
 /** 可搜索的下拉选择器（浮层向上弹出，适合放在 composer 工具条）。
@@ -49,6 +63,8 @@ export function SearchSelect(props: {
   /** 浮层水平对齐到最近的祖先容器（CSS 选择器，如 ".home-composer"）：
    *  宽度不超过容器、贴容器边缘对齐，观感与输入框浑然一体；隐含 portal 行为。 */
   anchorTo?: string;
+  /** 为模型项显示持久化收藏按钮，并在分组首项展示收藏模型。 */
+  favorites?: boolean;
 }) {
   const [opened, setOpened] = createSignal(false);
   const [query, setQuery] = createSignal("");
@@ -58,6 +74,7 @@ export function SearchSelect(props: {
   const [activeBackend, setActiveBackend] = createSignal<string | null>(null);
   /** 弹层方向：空间不足时向下翻转 / 右对齐，避免溢出窗口 */
   const [place, setPlace] = createSignal({ down: false, right: false });
+  const [favoriteIds, setFavoriteIds] = createSignal(storedFavorites());
   /** portal 模式下的浮层 fixed 坐标（相对视口） */
   const [coords, setCoords] = createSignal<{
     left: number;
@@ -113,6 +130,16 @@ export function SearchSelect(props: {
     );
   });
 
+  const isFavorite = (o: SelectOption) => !!o.favoriteId && favoriteIds().includes(o.favoriteId);
+  const toggleFavorite = (o: SelectOption) => {
+    if (!o.favoriteId) return;
+    const next = isFavorite(o)
+      ? favoriteIds().filter((id) => id !== o.favoriteId)
+      : [...favoriteIds(), o.favoriteId];
+    setFavoriteIds(next);
+    localStorage.setItem(MODEL_FAVORITES_KEY, JSON.stringify(next));
+  };
+
   // ===== 二级（厂商→模型）=====
   const groups = createMemo(() => {
     const order: string[] = [];
@@ -126,11 +153,17 @@ export function SearchSelect(props: {
       }
       map.get(g)!.push(o);
     }
-    return order.map((name) => ({ name, items: map.get(name)! }));
+    const result = order.map((name) => ({ name, items: map.get(name)! }));
+    const favorites = props.favorites ? props.options.filter(isFavorite) : [];
+    return favorites.length ? [{ name: FAVORITE_GROUP, items: favorites }, ...result] : result;
   });
 
   const currentGroup = () => currentOption()?.group;
-  const shownGroup = createMemo(() => activeGroup() ?? currentGroup() ?? groups()[0]?.name);
+  const shownGroup = createMemo(() => {
+    const active = activeGroup();
+    if (active && groups().some((group) => group.name === active)) return active;
+    return currentGroup() ?? groups()[0]?.name;
+  });
   const shownItems = createMemo(() => groups().find((g) => g.name === shownGroup())?.items ?? []);
 
   // ===== 三级（后端→厂商→模型）=====
@@ -170,10 +203,15 @@ export function SearchSelect(props: {
       }
       map.get(g)!.push(o);
     }
-    return order.map((name) => ({ name, items: map.get(name)! }));
+    const result = order.map((name) => ({ name, items: map.get(name)! }));
+    const favorites = props.favorites
+      ? props.options.filter((o) => o.backend === b && !o.isDefault && isFavorite(o))
+      : [];
+    return favorites.length ? [{ name: FAVORITE_GROUP, items: favorites }, ...result] : result;
   });
   const shownProvider = createMemo(() => {
-    if (activeGroup()) return activeGroup();
+    const active = activeGroup();
+    if (active && providersOfBackend().some((group) => group.name === active)) return active;
     if (shownBackend() === currentBackend() && currentGroup()) return currentGroup();
     return providersOfBackend()[0]?.name;
   });
@@ -313,6 +351,19 @@ export function SearchSelect(props: {
         <span class="sel-detail dim" title={o.detailTitle}>
           {o.detail2}
         </span>
+      </Show>
+      <Show when={props.favorites && o.favoriteId}>
+        <button
+          type="button"
+          class={`sel-favorite ${isFavorite(o) ? "active" : ""}`}
+          title={isFavorite(o) ? "取消收藏" : "收藏模型"}
+          onClick={(event) => {
+            event.stopPropagation();
+            toggleFavorite(o);
+          }}
+        >
+          <IconStar size={14} filled={isFavorite(o)} />
+        </button>
       </Show>
       <Show when={o.value === activeValue()}>
         <IconCheck size={13} />

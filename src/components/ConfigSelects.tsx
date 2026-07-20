@@ -160,6 +160,7 @@ export function modelOptionsOf(
         detailTitle(agentKind, cost) ??
         (credits && m.description ? `积分倍率：${m.description.trim()}` : undefined),
       vision: cost?.supportsImages ?? (typeof metaVision === "boolean" ? metaVision : false),
+      favoriteId: `${agentKind}:${encodeURIComponent(m.value)}`,
     };
   });
 }
@@ -193,8 +194,6 @@ export function ModelPicker(props: {
   modelSource?: ModelOptionsSource;
   sharedModels?: SharedModelSource[];
   quotaPeerToken?: string | null;
-  /** 项目目录；用于模型选项尚未加载时显示该项目最近模型的友好名 */
-  projectCwd?: string | null;
   onPickModel: (agentKind: AgentKind, model: string, quotaPeer?: QuotaModelPeer | null) => void;
   title?: string;
   prefix?: string;
@@ -205,6 +204,8 @@ export function ModelPicker(props: {
   allowDefault?: boolean;
   /** 「默认」入口的显示名 */
   defaultLabel?: string;
+  /** 显示模型收藏入口（仅新会话选择器使用）。 */
+  favorites?: boolean;
 }) {
   const kinds = createMemo(() => props.agentKinds ?? [props.agentKind]);
   const sharedOptions = createMemo<SelectOption[]>(() =>
@@ -270,7 +271,7 @@ export function ModelPicker(props: {
         ? `${peer.name}的${agentLabel(props.agentKind)} · ${props.model || "默认"}`
         : props.model;
     }
-    const name = lastUsed.modelName(props.agentKind, props.projectCwd);
+    const name = lastUsed.modelName(props.agentKind);
     return props.model && name ? name : undefined;
   });
 
@@ -289,6 +290,7 @@ export function ModelPicker(props: {
       anchorTo={props.anchorTo}
       allowDefault={props.allowDefault}
       defaultLabel={props.defaultLabel}
+      favorites={props.favorites}
     />
   );
 }
@@ -304,8 +306,6 @@ export function ConfigSelects(props: {
   modelSource?: ModelOptionsSource;
   sharedModels?: SharedModelSource[];
   quotaPeerToken?: string | null;
-  /** 项目目录；用于项目级最近模型的回退显示 */
-  projectCwd?: string | null;
   /** 一次性提交「后端 + 模型」；单后端时 agentKind 即当前后端 */
   onPickModel: (agentKind: AgentKind, model: string, quotaPeer?: QuotaModelPeer | null) => void;
   onMode: (v: string) => void;
@@ -313,6 +313,8 @@ export function ConfigSelects(props: {
   portal?: boolean;
   /** 浮层水平对齐到最近的祖先容器（如 composer），见 SearchSelect.anchorTo */
   anchorTo?: string;
+  /** 显示模型收藏入口。 */
+  favorites?: boolean;
 }) {
   const sourceOf = (k: AgentKind) => props.modelSource?.(k);
 
@@ -350,10 +352,10 @@ export function ConfigSelects(props: {
         modelSource={props.modelSource}
         sharedModels={props.sharedModels}
         quotaPeerToken={props.quotaPeerToken}
-        projectCwd={props.projectCwd}
         onPickModel={props.onPickModel}
         portal={props.portal}
         anchorTo={props.anchorTo}
+        favorites={props.favorites}
       />
     </>
   );
