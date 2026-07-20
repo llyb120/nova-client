@@ -166,6 +166,7 @@ impl OpenCodeSdkManager {
         if self.is_running(&thread_id) {
             return;
         }
+        let mut title_job: Option<(String, String)> = None;
         let (
             cwd,
             mut model,
@@ -184,6 +185,12 @@ impl OpenCodeSdkManager {
             let context = thread.take_prompt_context("OpenCode+");
             let item = thread.push_user(text.clone(), images.clone());
             let user_item_id = item.id();
+            if thread.title == "新会话" {
+                let fallback = derive_title(&text, !images.is_empty());
+                thread.title = fallback.clone();
+                title_job = Some((text.clone(), fallback));
+                let _ = self.app.emit(EV_THREADS, json!({}));
+            }
             let _ = self.emit_update(&thread_id, &item);
             let values = (
                 thread.cwd.clone(),
@@ -201,6 +208,14 @@ impl OpenCodeSdkManager {
             store.save();
             values
         };
+        if let Some((prompt, fallback)) = title_job {
+            self.app.state::<AppState>().generate_title(
+                &crate::threads::AgentKind::OpenCode,
+                thread_id.clone(),
+                prompt,
+                fallback,
+            );
+        }
         self.set_running(&thread_id, true, None);
 
         if model.as_deref().is_some_and(codex_radar::is_auto_model) {
@@ -1063,9 +1078,37 @@ fn compact_tool_detail(value: &str) -> String {
     }
 }
 
+fn derive_title(text: &str, has_images: bool) -> String {
+    let title: String = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(40)
+        .collect();
+    if !title.is_empty() {
+        title
+    } else if has_images {
+        "[图片]".into()
+    } else {
+        "新会话".into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_fallback_uses_first_prompt_line_or_image() {
+        assert_eq!(
+            derive_title("  修复标题生成\n更多内容", false),
+            "修复标题生成"
+        );
+        assert_eq!(derive_title("", true), "[图片]");
+        assert_eq!(derive_title("", false), "新会话");
+    }
 
     #[test]
     fn ordinary_attachments_become_readable_paths() {
