@@ -426,6 +426,30 @@ mod tests {
     }
 
     #[test]
+    fn does_not_map_radar_max_to_opencode_xhigh_variant() {
+        let winner = RadarModel {
+            key: "x".into(),
+            model: "gpt-5.6-terra".into(),
+            effort: "max".into(),
+            date: "x".into(),
+            iq: 1.0,
+        };
+        let opencode = json!({"configOptions":[{"id":"model","options":[
+            {"value":"codex/gpt-5.6-terra/variant/xhigh"}
+        ]}]});
+        assert_eq!(match_available_model(&opencode, &winner, true), None);
+
+        let opencode = json!({"configOptions":[{"id":"model","options":[
+            {"value":"codex/gpt-5.6-terra/variant/xhigh"},
+            {"value":"codex/gpt-5.6-terra/variant/max"}
+        ]}]});
+        assert_eq!(
+            match_available_model(&opencode, &winner, true).as_deref(),
+            Some("codex/gpt-5.6-terra/variant/max")
+        );
+    }
+
+    #[test]
     fn matches_opencode_flat_model_ids_with_embedded_effort() {
         let winner = RadarModel {
             key: "x".into(),
