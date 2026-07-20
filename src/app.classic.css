@@ -1694,6 +1694,7 @@ button {
   opacity: 0;
   transition: opacity 0.25s;
   pointer-events: none;
+  contain: layout paint style;
 }
 .composer-notes.active {
   opacity: 1;
@@ -1710,26 +1711,26 @@ button {
 }
 @keyframes composer-note-flow {
   0% {
-    transform: translate(0, 0) rotate(-8deg);
+    transform: translate3d(0, 0, 0) rotate(-8deg);
     opacity: 0;
   }
   10% {
     opacity: 1;
   }
   25% {
-    transform: translate(34px, calc(-3px - var(--note-amp, 0) * 7px)) rotate(8deg);
+    transform: translate3d(34px, var(--note-rise, -3px), 0) rotate(8deg);
   }
   50% {
-    transform: translate(72px, 0) rotate(-8deg);
+    transform: translate3d(72px, 0, 0) rotate(-8deg);
   }
   75% {
-    transform: translate(110px, calc(-3px - var(--note-amp, 0) * 7px)) rotate(8deg);
+    transform: translate3d(110px, var(--note-rise, -3px), 0) rotate(8deg);
   }
   90% {
     opacity: 1;
   }
   100% {
-    transform: translate(152px, 0) rotate(-8deg);
+    transform: translate3d(152px, 0, 0) rotate(-8deg);
     opacity: 0;
   }
 }

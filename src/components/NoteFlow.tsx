@@ -8,6 +8,7 @@ type FlowNote = {
   id: number;
   glyph: string;
   size: string;
+  rise: string;
 };
 
 export type NoteFlow = {
@@ -17,22 +18,31 @@ export type NoteFlow = {
 
 export function createNoteFlow(running?: () => boolean): NoteFlow {
   const [flowNotes, setFlowNotes] = createSignal<FlowNote[]>([]);
-  const [energyLive, setEnergyLive] = createSignal(false);
-  let notesRef: HTMLDivElement | undefined;
   let noteSeq = 0;
-  let energyTarget = 0;
-  let energyCurrent = 0;
+  let energy = 0;
+  let energyUpdatedAt = 0;
   let lastTypeAt = 0;
   let lastSpawnAt = 0;
-  let energyTimer: number | undefined;
   let runningNoteTimer: number | undefined;
 
-  const spawnNote = () => {
+  const currentEnergy = (now: number) => {
+    if (energyUpdatedAt === 0) return 0;
+    // 只在需要时计算衰减，避免打字期间用定时器反复改写所有音符的样式。
+    return energy * Math.exp(-(now - energyUpdatedAt) / 650);
+  };
+
+  const spawnNote = (now: number) => {
     noteSeq += 1;
     const glyph = NOTE_GLYPHS[(Math.random() * NOTE_GLYPHS.length) | 0];
+    const rise = -3 - currentEnergy(now) * 7;
     setFlowNotes((list) => [
       ...list.slice(-11),
-      { id: noteSeq, glyph, size: `${11 + ((Math.random() * 5) | 0)}px` },
+      {
+        id: noteSeq,
+        glyph,
+        size: `${11 + ((Math.random() * 5) | 0)}px`,
+        rise: `${rise.toFixed(2)}px`,
+      },
     ]);
   };
 
@@ -40,35 +50,19 @@ export function createNoteFlow(running?: () => boolean): NoteFlow {
     const now = performance.now();
     if (now - lastSpawnAt < MIN_SPAWN_GAP) return;
     lastSpawnAt = now;
-    spawnNote();
+    spawnNote(now);
   };
 
   const dropNote = (id: number) =>
     setFlowNotes((list) => list.filter((note) => note.id !== id));
-
-  const ensureEnergyLoop = () => {
-    if (energyTimer !== undefined) return;
-    energyTimer = window.setInterval(() => {
-      energyTarget *= 0.9;
-      energyCurrent += (energyTarget - energyCurrent) * 0.25;
-      if (energyTarget < 0.01 && energyCurrent < 0.01) {
-        energyTarget = 0;
-        energyCurrent = 0;
-        window.clearInterval(energyTimer);
-        energyTimer = undefined;
-      }
-      notesRef?.style.setProperty("--note-amp", energyCurrent.toFixed(2));
-      setEnergyLive(energyCurrent > 0.02);
-    }, 50);
-  };
 
   const bump = () => {
     const now = performance.now();
     const dt = now - lastTypeAt;
     lastTypeAt = now;
     const speedBoost = dt > 0 && dt < 600 ? 1 - dt / 600 : 0.3;
-    energyTarget = Math.min(1, energyTarget + 0.25 + speedBoost * 0.4);
-    ensureEnergyLoop();
+    energy = Math.min(1, currentEnergy(now) + 0.25 + speedBoost * 0.4);
+    energyUpdatedAt = now;
     trySpawnNote();
   };
 
@@ -82,15 +76,13 @@ export function createNoteFlow(running?: () => boolean): NoteFlow {
   });
 
   onCleanup(() => {
-    if (energyTimer !== undefined) window.clearInterval(energyTimer);
     if (runningNoteTimer !== undefined) window.clearInterval(runningNoteTimer);
   });
 
-  const active = () => !!(running?.() || energyLive() || flowNotes().length > 0);
+  const active = () => !!(running?.() || flowNotes().length > 0);
 
   const Notes: Component = () => (
     <div
-      ref={notesRef}
       class="composer-notes"
       classList={{ active: active() }}
       aria-hidden="true"
@@ -99,7 +91,7 @@ export function createNoteFlow(running?: () => boolean): NoteFlow {
         {(note) => (
           <span
             class="composer-note"
-            style={{ "font-size": note.size }}
+            style={{ "font-size": note.size, "--note-rise": note.rise }}
             onAnimationEnd={() => dropNote(note.id)}
           >
             {note.glyph}
