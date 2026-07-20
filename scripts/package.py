@@ -32,10 +32,20 @@ def is_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
-def update_channel() -> str:
+def target_arch(target: str) -> str:
+    if target.startswith("aarch64-"):
+        return "aarch64"
+    if target.startswith("x86_64-"):
+        return "x86_64"
+    return ""
+
+
+def update_channel(target: str = "") -> str:
     if is_macos():
-        machine = platform.machine().lower()
-        arch = "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
+        arch = target_arch(target)
+        if not arch:
+            machine = platform.machine().lower()
+            arch = "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
         return f"nova-macos-{arch}"
     if is_linux():
         machine = platform.machine().lower()
@@ -106,7 +116,12 @@ def validate_pe_image(data: bytes) -> None:
             raise ValueError(f"文件被截断，需要至少 {raw_end} 字节，实际 {len(data)} 字节")
 
 
-def expected_mach_o_cputype() -> int | None:
+def expected_mach_o_cputype(target: str = "") -> int | None:
+    arch = target_arch(target)
+    if arch == "aarch64":
+        return 0x0100000C
+    if arch == "x86_64":
+        return 0x01000007
     machine = platform.machine().lower()
     if machine in ("arm64", "aarch64"):
         return 0x0100000C
@@ -115,7 +130,7 @@ def expected_mach_o_cputype() -> int | None:
     return None
 
 
-def validate_mach_o_image(data: bytes) -> None:
+def validate_mach_o_image(data: bytes, target: str = "") -> None:
     if len(data) < 8:
         raise ValueError("文件太小")
     magic = struct.unpack_from("<I", data, 0)[0]
@@ -135,7 +150,7 @@ def validate_mach_o_image(data: bytes) -> None:
         cputype = struct.unpack_from(">I", data, 4)[0]
     else:
         cputype = struct.unpack_from("<I", data, 4)[0]
-    expected = expected_mach_o_cputype()
+    expected = expected_mach_o_cputype(target)
     if expected is not None and cputype != expected:
         raise ValueError(f"架构不匹配，包内 cputype=0x{cputype:x}，当前需要 0x{expected:x}")
 
@@ -158,7 +173,7 @@ def validate_elf_image(data: bytes) -> None:
         raise ValueError(f"架构不匹配，ELF machine={machine}，当前需要 {expected}")
 
 
-def validate_update_zip(zip_path: Path, expected_name: str) -> None:
+def validate_update_zip(zip_path: Path, expected_name: str, target: str = "") -> None:
     with zipfile.ZipFile(zip_path) as zf:
         exe_name = next(
             (n for n in zf.namelist() if Path(n).name.lower() == expected_name.lower()),
@@ -171,7 +186,7 @@ def validate_update_zip(zip_path: Path, expected_name: str) -> None:
             if is_windows():
                 validate_pe_image(data)
             elif is_macos():
-                validate_mach_o_image(data)
+                validate_mach_o_image(data, target)
             elif is_linux():
                 validate_elf_image(data)
             elif not data:
@@ -215,7 +230,6 @@ def executable_version(exe: Path) -> str:
 
 
 def main() -> None:
-    channel = update_channel()
     bin_name = binary_name()
     ap = argparse.ArgumentParser(description="打包 Nova 更新 zip（GitHub Release 分发）")
     ap.add_argument("--version", "-v", default="", help="显式指定版本号（默认 patch 自增）")
@@ -225,7 +239,14 @@ def main() -> None:
     ap.add_argument("--no-upload", action="store_true", default=True, help="兼容旧参数（始终不上传）")
     ap.add_argument("--bump-only", action="store_true", help="只更新版本号后退出")
     ap.add_argument("--legacy", action="store_true", help="已废弃，无效果")
+    ap.add_argument(
+        "--target",
+        choices=("aarch64-apple-darwin", "x86_64-apple-darwin"),
+        default="",
+        help="macOS Rust 目标 triple（用于交叉编译和产物路径）",
+    )
     args = ap.parse_args()
+    channel = update_channel(args.target)
 
     cur = json.loads(CONF.read_text(encoding="utf-8"))["version"]
     new = bump(cur, args)
@@ -238,11 +259,17 @@ def main() -> None:
 
     print(f"通道: {channel}  产物: {bin_name}")
     if not args.no_build:
-        r = subprocess.run("npx tauri build --no-bundle", shell=True, cwd=ROOT)
+        command = "npx tauri build --no-bundle"
+        if args.target:
+            command += f" --target {args.target}"
+        r = subprocess.run(command, shell=True, cwd=ROOT)
         if r.returncode != 0:
             sys.exit(f"tauri build 失败（exit {r.returncode}）")
 
-    exe = ROOT / "src-tauri" / "target" / "release" / bin_name
+    target_dir = ROOT / "src-tauri" / "target"
+    if args.target:
+        target_dir /= args.target
+    exe = target_dir / "release" / bin_name
     if not exe.exists():
         sys.exit(f"未找到构建产物: {exe}")
     if not is_windows():
@@ -255,7 +282,7 @@ def main() -> None:
     zip_path = out_dir / f"{channel}-{new}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(exe, exe.name)
-    validate_update_zip(zip_path, bin_name)
+    validate_update_zip(zip_path, bin_name, args.target)
     print(f"\n[OK] 打包完成: {zip_path} ({zip_path.stat().st_size / 1048576:.1f} MB)")
     print("用 GitHub Actions Release 或 gh release upload 发布该 zip。")
 

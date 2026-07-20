@@ -44,10 +44,16 @@ jobs:
         include:
           - name: windows
             os: windows-latest
-          - name: macos
+            target: ""
+          - name: macos-aarch64
             os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
           - name: linux
             os: ubuntu-22.04
+            target: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +72,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install macOS Rust target
+        if: runner.os == 'macOS'
+        run: rustup target add "${{ matrix.target }}"
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
@@ -91,7 +100,7 @@ jobs:
 
       - name: Build (macOS app + DMG)
         if: runner.os == 'macOS'
-        run: npx tauri build --bundles dmg
+        run: npx tauri build --target "${{ matrix.target }}" --bundles dmg
 
       - name: Build (Linux DEB + AppImage)
         if: runner.os == 'Linux'
@@ -101,7 +110,12 @@ jobs:
         shell: bash
         run: |
           VER="${{ needs.prepare.outputs.version }}"
-          python3 scripts/package.py --version "$VER" --no-build
+          TARGET="${{ matrix.target }}"
+          if [ -n "$TARGET" ]; then
+            python3 scripts/package.py --version "$VER" --no-build --target "$TARGET"
+          else
+            python3 scripts/package.py --version "$VER" --no-build
+          fi
 
       - name: Upload update zip
         uses: actions/upload-artifact@v4
@@ -114,8 +128,8 @@ jobs:
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: Nova-macos-dmg-v${{ needs.prepare.outputs.version }}
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          name: Nova-${{ matrix.name }}-dmg-v${{ needs.prepare.outputs.version }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
       - name: Upload Linux packages
