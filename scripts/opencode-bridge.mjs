@@ -85,6 +85,39 @@ function automaticPermissionReply(mode) {
   return mode === "build" ? "always" : undefined;
 }
 
+function todoPart(sessionId, todos) {
+  const id = `nova-todo-${sessionId}`;
+  return {
+    id,
+    sessionID: sessionId,
+    messageID: id,
+    type: "tool",
+    callID: id,
+    tool: "todowrite",
+    state: { status: "completed", input: { todos } },
+  };
+}
+
+function promptEventState(event, sessionId, started) {
+  const properties = event.properties ?? {};
+  if (properties.sessionID !== sessionId) return { started, done: false };
+  const status = event.type === "session.status" ? properties.status?.type : undefined;
+  if (event.type === "session.idle" || status === "idle") {
+    return { started, done: started };
+  }
+  const activity = status === "busy"
+    || status === "retry"
+    || [
+      "message.updated",
+      "message.part.updated",
+      "todo.updated",
+      "permission.asked",
+      "permission.v2.asked",
+      "session.error",
+    ].includes(event.type);
+  return { started: started || activity, done: false };
+}
+
 async function runPrompt(client, lines, request) {
   const sessionId = await ensureSession(client, request.sessionId);
   const subscription = await client.event.subscribe();
@@ -140,9 +173,12 @@ async function runPrompt(client, lines, request) {
 
   const assistantMessages = new Set();
   const pendingParts = new Map();
+  let promptStarted = false;
   for await (const event of subscription.stream) {
     const properties = event.properties ?? {};
     if (properties.sessionID !== sessionId) continue;
+    const eventState = promptEventState(event, sessionId, promptStarted);
+    promptStarted = eventState.started;
     if (event.type === "message.updated") {
       if (properties.info?.role === "assistant") {
         assistantMessages.add(properties.info.id);
@@ -162,6 +198,10 @@ async function runPrompt(client, lines, request) {
       }
       continue;
     }
+    if (event.type === "todo.updated") {
+      send({ type: "part", part: todoPart(sessionId, properties.todos ?? []) });
+      continue;
+    }
     if (event.type === "permission.asked" || event.type === "permission.v2.asked") {
       const reply = automaticPermissionReply(request.mode);
       if (reply) {
@@ -177,7 +217,7 @@ async function runPrompt(client, lines, request) {
       send({ type: "error", error: JSON.stringify(properties.error ?? "OpenCode session error") });
       break;
     }
-    if (event.type === "session.idle") {
+    if (eventState.done) {
       const position = [...assistantMessages].at(-1);
       if (position) send({ type: "checkpoint", sessionId, position });
       send({ type: "done" });
@@ -210,4 +250,4 @@ async function main() {
 
 if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
 
-export { automaticPermissionReply };
+export { automaticPermissionReply, promptEventState, todoPart };
