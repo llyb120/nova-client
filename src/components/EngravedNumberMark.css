@@ -185,7 +185,7 @@
   --signature-mid: #d9b77d;
   --signature-to: #735033;
   --signature-glow: rgba(181, 121, 61, 0.28);
-  opacity: 0.24;
+  opacity: 0.36;
 }
 
 :root[data-theme="ink-light"] .composer-engraved-mark .engraved-number-mark-name,
@@ -200,7 +200,7 @@
   --signature-mid: #f1f5ff;
   --signature-to: #7089c4;
   --signature-glow: rgba(112, 151, 245, 0.42);
-  opacity: 0.3;
+  opacity: 0.42;
 }
 
 :root[data-theme="ink-dark"] .composer-engraved-mark .engraved-number-mark-name,
