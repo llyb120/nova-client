@@ -1707,6 +1707,55 @@ button {
 .home-composer.is-dragging {
   border-color: var(--accent);
 }
+.composer-notes {
+  position: absolute;
+  left: 18px;
+  bottom: calc(100% + 4px);
+  width: 172px;
+  height: 22px;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 0.25s;
+  pointer-events: none;
+}
+.composer-notes.active {
+  opacity: 1;
+}
+.composer-note {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  line-height: 1;
+  color: var(--accent);
+  text-shadow: 0 0 6px color-mix(in srgb, var(--accent) 45%, transparent);
+  animation: composer-note-flow 1.8s linear forwards;
+  will-change: transform, opacity;
+}
+@keyframes composer-note-flow {
+  0% {
+    transform: translate(0, 0) rotate(-8deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  25% {
+    transform: translate(34px, calc(-3px - var(--note-amp, 0) * 7px)) rotate(8deg);
+  }
+  50% {
+    transform: translate(72px, 0) rotate(-8deg);
+  }
+  75% {
+    transform: translate(110px, calc(-3px - var(--note-amp, 0) * 7px)) rotate(8deg);
+  }
+  90% {
+    opacity: 1;
+  }
+  100% {
+    transform: translate(152px, 0) rotate(-8deg);
+    opacity: 0;
+  }
+}
 .composer.is-dragging::after,
 .home-composer.is-dragging::after {
   content: "松手添加文件";

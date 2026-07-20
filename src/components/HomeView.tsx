@@ -34,6 +34,7 @@ import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./Co
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconClue, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 import { TypewriterText } from "./TypewriterText";
@@ -45,6 +46,7 @@ export function HomeView() {
   const [slashStart, setSlashStart] = createSignal<number | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
   const attach = createImageAttachments({ enableFileDrop: true });
+  const noteFlow = createNoteFlow();
   const [cwd, setCwd] = createSignal("");
   const [agentKind, setAgentKind] = createSignal<AgentKind>(
     resolveEnabledAgentKind(lastUsed.agentKind()),
@@ -352,6 +354,7 @@ export function HomeView() {
     const typedSlash = e.inputType === "insertText" && e.data === "/";
     const trackingSlash = slashStart() !== null;
     setText(el.value);
+    noteFlow.bump();
     updateSlashState(el, typedSlash || trackingSlash);
     if (el.value.trim()) prewarmCurrent();
   };
@@ -644,6 +647,7 @@ export function HomeView() {
           class="home-composer"
           classList={{ "is-dragging": attach.dragging() }}
         >
+          <noteFlow.Notes />
           <ExclusiveChatMark
             token={roam()?.peer.token || state.settings?.relayToken || ""}
           />

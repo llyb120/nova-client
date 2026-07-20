@@ -16,6 +16,7 @@ import { ConfigSelects } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconFile, IconSend, IconStop } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { createNoteFlow } from "./NoteFlow";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 
 type PromptHistoryItem = {
@@ -67,6 +68,7 @@ export function Composer() {
   const attach = createImageAttachments({ enableFileDrop: true });
 
   const running = () => !!(state.currentId && state.running[state.currentId]);
+  const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
@@ -341,6 +343,7 @@ export function Composer() {
     const typedSlash = e.inputType === "insertText" && e.data === "/";
     const trackingSlash = slashStart() !== null;
     setText(el.value);
+    noteFlow.bump();
     if (historyOpen()) setHistoryOpen(false);
     updateSlashState(el, typedSlash || trackingSlash);
   };
@@ -350,6 +353,7 @@ export function Composer() {
       class="composer"
       classList={{ "is-dragging": attach.dragging() }}
     >
+      <noteFlow.Notes />
       <ExclusiveChatMark token={state.roamingPeer || state.settings?.relayToken || ""} />
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
       <Show when={slashQuery() !== null}>
