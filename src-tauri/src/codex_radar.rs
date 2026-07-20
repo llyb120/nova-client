@@ -167,7 +167,7 @@ fn latest_value_winner(entries: &[RadarModel], html: &str) -> Result<RadarModel,
         let Some(tooltip) = attr(tag, "data-model-iq-tooltip-key") else {
             continue;
         };
-        let Some(rest) = tooltip.strip_prefix("value|") else {
+        let Some(rest) = tooltip.strip_prefix("custom_value|") else {
             continue;
         };
         let Some((date, score)) = rest.rsplit_once('|') else {
@@ -378,7 +378,7 @@ mod tests {
             },
         ];
         assert_eq!(latest_iq_winner(&entries).unwrap().key, "smart");
-        let html = r#"<circle data-model-key="smart" data-model-iq-tooltip-key="value|2026-07-18T08:00:00+08:00|90.0"><circle data-model-key="value" data-model-iq-tooltip-key="value|2026-07-18T08:00:00+08:00|120.0">"#;
+        let html = r#"<circle data-model-key="smart" data-model-iq-tooltip-key="custom_value|2026-07-18T08:00:00+08:00|90.0"><circle data-model-key="value" data-model-iq-tooltip-key="custom_value|2026-07-18T08:00:00+08:00|120.0">"#;
         assert_eq!(latest_value_winner(&entries, html).unwrap().key, "value");
         assert_eq!(
             compact_key("gpt_5_6_sol_max"),
