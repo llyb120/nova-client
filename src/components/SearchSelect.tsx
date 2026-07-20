@@ -3,6 +3,7 @@ import { Portal } from "solid-js/web";
 import { IconCheck, IconChevron, IconEye, IconStar } from "./icons";
 
 const FAVORITE_GROUP = "收藏";
+const FAVORITE_BACKEND = "__favorites__";
 const MODEL_FAVORITES_KEY = "fd:modelFavorites";
 
 function storedFavorites(): string[] {
@@ -177,10 +178,19 @@ export function SearchSelect(props: {
         order.push(o.backend);
       }
     }
-    return order.map((id) => ({ id, label: labels.get(id)! }));
+    const result = order.map((id) => ({ id, label: labels.get(id)! }));
+    const hasFavorites = props.favorites && props.options.some(isFavorite);
+    return hasFavorites
+      ? [{ id: FAVORITE_BACKEND, label: FAVORITE_GROUP }, ...result]
+      : result;
   });
   const currentBackend = () => currentOption()?.backend;
-  const shownBackend = createMemo(() => activeBackend() ?? currentBackend() ?? backends()[0]?.id);
+  const shownBackend = createMemo(() => {
+    const active = activeBackend();
+    if (active && backends().some((backend) => backend.id === active)) return active;
+    return currentBackend() ?? backends()[0]?.id;
+  });
+  const showingFavorites = () => shownBackend() === FAVORITE_BACKEND;
   const chooseBackend = (id: string) => {
     setActiveBackend(id);
     setActiveGroup(null);
@@ -203,11 +213,7 @@ export function SearchSelect(props: {
       }
       map.get(g)!.push(o);
     }
-    const result = order.map((name) => ({ name, items: map.get(name)! }));
-    const favorites = props.favorites
-      ? props.options.filter((o) => o.backend === b && !o.isDefault && isFavorite(o))
-      : [];
-    return favorites.length ? [{ name: FAVORITE_GROUP, items: favorites }, ...result] : result;
+    return order.map((name) => ({ name, items: map.get(name)! }));
   });
   const shownProvider = createMemo(() => {
     const active = activeGroup();
@@ -215,9 +221,10 @@ export function SearchSelect(props: {
     if (shownBackend() === currentBackend() && currentGroup()) return currentGroup();
     return providersOfBackend()[0]?.name;
   });
-  const shownModels = createMemo(
-    () => providersOfBackend().find((g) => g.name === shownProvider())?.items ?? [],
-  );
+  const shownModels = createMemo(() => {
+    if (showingFavorites()) return props.options.filter((o) => !o.isDefault && isFavorite(o));
+    return providersOfBackend().find((g) => g.name === shownProvider())?.items ?? [];
+  });
 
   const pick = (v: string) => {
     props.onChange(
@@ -329,14 +336,18 @@ export function SearchSelect(props: {
 
   const itemRow = (o: SelectOption, showBackend = false) => (
     <div
-      class={`sel-item ${o.value === activeValue() ? "active" : ""}`}
+      class={`sel-item ${showBackend ? "with-source" : ""} ${
+        o.value === activeValue() ? "active" : ""
+      }`}
       onClick={() => pick(o.value)}
       title={o.title ?? o.value}
     >
-      <Show when={showBackend && o.backendLabel}>
-        <span class="sel-backend-tag">{o.backendLabel}</span>
-      </Show>
-      <span class="sel-label">{o.label}</span>
+      <span class="sel-model-copy">
+        <span class="sel-label">{o.label}</span>
+        <Show when={showBackend && o.backendLabel}>
+          <span class="sel-model-source">{o.backendLabel}</span>
+        </Show>
+      </span>
       <Show when={o.vision}>
         <span class="sel-vision" title="支持图片输入">
           <IconEye size={12} />
@@ -365,7 +376,7 @@ export function SearchSelect(props: {
           <IconStar size={14} filled={isFavorite(o)} />
         </button>
       </Show>
-      <Show when={o.value === activeValue()}>
+      <Show when={!showBackend && o.value === activeValue()}>
         <IconCheck size={13} />
       </Show>
     </div>
@@ -424,40 +435,42 @@ export function SearchSelect(props: {
                   )}
                 </For>
               </div>
-              <div class="sel-groups sel-providers">
-                <Show when={props.allowDefault && defaultOfBackend()}>
-                  {(d) => (
-                    <div
-                      class={`sel-item ${props.value === d().value ? "active" : ""}`}
-                      onClick={() => pick(d().value)}
-                    >
-                      <span class="sel-label">{defaultLabel()}</span>
-                      <Show when={props.value === d().value}>
-                        <IconCheck size={13} />
-                      </Show>
-                    </div>
-                  )}
-                </Show>
-                <For each={providersOfBackend()}>
-                  {(g) => (
-                    <div
-                      class={`sel-group-row ${shownProvider() === g.name ? "open" : ""} ${
-                        currentGroup() === g.name && currentBackend() === shownBackend()
-                          ? "active"
-                          : ""
-                      }`}
-                      onMouseEnter={() => setActiveGroup(g.name)}
-                      onClick={() => setActiveGroup(g.name)}
-                    >
-                      <span class="sel-label">{g.name}</span>
-                      <span class="sel-count">{g.items.length}</span>
-                      <IconChevron size={11} />
-                    </div>
-                  )}
-                </For>
-              </div>
+              <Show when={!showingFavorites()}>
+                <div class="sel-groups sel-providers">
+                  <Show when={props.allowDefault && defaultOfBackend()}>
+                    {(d) => (
+                      <div
+                        class={`sel-item ${props.value === d().value ? "active" : ""}`}
+                        onClick={() => pick(d().value)}
+                      >
+                        <span class="sel-label">{defaultLabel()}</span>
+                        <Show when={props.value === d().value}>
+                          <IconCheck size={13} />
+                        </Show>
+                      </div>
+                    )}
+                  </Show>
+                  <For each={providersOfBackend()}>
+                    {(g) => (
+                      <div
+                        class={`sel-group-row ${shownProvider() === g.name ? "open" : ""} ${
+                          currentGroup() === g.name && currentBackend() === shownBackend()
+                            ? "active"
+                            : ""
+                        }`}
+                        onMouseEnter={() => setActiveGroup(g.name)}
+                        onClick={() => setActiveGroup(g.name)}
+                      >
+                        <span class="sel-label">{g.name}</span>
+                        <span class="sel-count">{g.items.length}</span>
+                        <IconChevron size={11} />
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
               <div class="sel-list sel-models">
-                <For each={shownModels()}>{(o) => itemRow(o)}</For>
+                <For each={shownModels()}>{(o) => itemRow(o, showingFavorites())}</For>
               </div>
             </div>
           </Show>

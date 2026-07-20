@@ -216,6 +216,7 @@ export function ModelPicker(props: {
           value: encodeQuotaModelValue(peer.token, kind, option.value),
           backend: `quota:${peer.token}:${kind}`,
           backendLabel: `${peer.name}的${agentLabel(kind)}`,
+          favoriteId: `quota:${encodeURIComponent(peer.token)}:${kind}:${encodeURIComponent(option.value)}`,
         })),
       ),
     ),
