@@ -67,6 +67,21 @@ impl SdkBackend {
     }
 }
 
+fn is_codex_model_resume_warning(value: &Value) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("error") {
+        return false;
+    }
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| {
+            message.starts_with("This session was recorded with model `")
+                && message.contains("` but is resuming with `")
+                && message.contains("`. Consider switching back to `")
+                && message.ends_with("` as it may affect Codex performance.")
+        })
+}
+
 struct RunningBridge {
     stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
     pid: Option<u32>,
@@ -856,6 +871,9 @@ impl CodexSdkManager {
     }
 
     fn apply_item(&self, thread_id: &str, value: &Value, ids: &mut HashMap<String, u64>) {
+        if self.backend == SdkBackend::Codex && is_codex_model_resume_warning(value) {
+            return;
+        }
         let Some(remote_id) = value.get("id").and_then(Value::as_str) else {
             return;
         };
@@ -1322,9 +1340,9 @@ fn codex_todo_plan(value: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_todo_plan, complete_pending_tools, derive_title, normalize_title,
-        parse_bridge_output, resolve_codex_model, text_snapshot_change, tool_call, SdkBackend,
-        TextSnapshotChange,
+        codex_todo_plan, complete_pending_tools, derive_title, is_codex_model_resume_warning,
+        normalize_title, parse_bridge_output, resolve_codex_model, text_snapshot_change, tool_call,
+        SdkBackend, TextSnapshotChange,
     };
     use crate::threads::{now_ms, AgentKind, Item, Thread, ToolCall};
     use serde_json::json;
@@ -1370,6 +1388,18 @@ mod tests {
             Some(("gpt-5.6-terra".into(), Some("max".into())))
         );
         assert_eq!(resolve_codex_model(&options, "gpt-5.4-minilow", None), None);
+    }
+
+    #[test]
+    fn codex_model_resume_warning_is_nonfatal() {
+        assert!(is_codex_model_resume_warning(&json!({
+            "type": "error",
+            "message": "This session was recorded with model `gpt-5.6-terra` but is resuming with `gpt-5.6-sol`. Consider switching back to `gpt-5.6-terra` as it may affect Codex performance."
+        })));
+        assert!(!is_codex_model_resume_warning(&json!({
+            "type": "error",
+            "message": "Codex transport failed"
+        })));
     }
 
     #[test]

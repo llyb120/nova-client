@@ -19,6 +19,16 @@ function normalizeThoughtMarkdown(text: string): string {
     : text;
 }
 
+function isCodexModelResumeWarning(item: Item): boolean {
+  if (item.type !== "system" || item.level !== "error") return false;
+  return (
+    item.text.startsWith("This session was recorded with model `") &&
+    item.text.includes("` but is resuming with `") &&
+    item.text.includes("`. Consider switching back to `") &&
+    item.text.endsWith("` as it may affect Codex performance.")
+  );
+}
+
 /** 用户消息气泡：hover 显示编辑按钮，编辑后从该处重新开始会话（codex 风格） */
 function UserMessage(props: { item: Extract<Item, { type: "user" }> }) {
   const [editing, setEditing] = createSignal(false);
@@ -165,7 +175,7 @@ export function TranscriptItem(props: { item: Item; active?: boolean }) {
       <Match when={props.item.type === "tool"}>
         <ToolCallCard item={props.item as Extract<Item, { type: "tool" }>} active={props.active} />
       </Match>
-      <Match when={props.item.type === "system"}>
+      <Match when={props.item.type === "system" && !isCodexModelResumeWarning(props.item)}>
         {(() => {
           const item = props.item as Extract<Item, { type: "system" }>;
           const isCompaction = item.level === "compacting" || item.level === "compacted";
