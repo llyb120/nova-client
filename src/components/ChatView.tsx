@@ -140,14 +140,9 @@ function VirtualGroup(props: {
     <div
       ref={ref}
       class="vgroup"
-      // 重挂载时仍保留最小高度，TurnGroup/Markdown 构建期间总滚动高度不会瞬间塌陷。
-      style={
-        height() > 0
-          ? mounted()
-            ? { "min-height": `${height()}px` }
-            : { height: `${height()}px` }
-          : undefined
-      }
+      // 仅卸载时使用缓存高度。挂载后必须恢复自然高度，否则内容折叠时旧 min-height
+      // 会反过来撑住观察目标，ResizeObserver 无法测到变矮后的真实尺寸。
+      style={height() > 0 && !mounted() ? { height: `${height()}px` } : undefined}
     >
       <Show when={mounted()}>
         <TurnGroup group={props.group} active={props.active} />
