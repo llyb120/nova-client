@@ -164,8 +164,18 @@ impl OpenCodeSdkManager {
         images: Vec<PromptImage>,
     ) {
         if self.is_running(&thread_id) {
+            self.steer_prompt(thread_id, text, images).await;
             return;
         }
+        self.run_new_prompt(thread_id, text, images).await;
+    }
+
+    async fn run_new_prompt(
+        self: Arc<Self>,
+        thread_id: String,
+        text: String,
+        images: Vec<PromptImage>,
+    ) {
         let mut title_job: Option<(String, String)> = None;
         let (
             cwd,
@@ -308,6 +318,79 @@ impl OpenCodeSdkManager {
             }
         }
         self.finish_turn(&thread_id, if succeeded { "end_turn" } else { "error" });
+    }
+
+    /// 运行中追加提示：复用当前 bridge，向同一个 OpenCode session 注入 prompt。
+    /// 当前轮次的事件订阅和收尾仍由最初的 run_prompt 负责。
+    pub async fn steer_prompt(
+        self: &Arc<Self>,
+        thread_id: String,
+        text: String,
+        images: Vec<PromptImage>,
+    ) {
+        let mut stdin = None;
+        for _ in 0..20 {
+            stdin = self
+                .running_children
+                .lock()
+                .unwrap()
+                .get(&thread_id)
+                .map(|bridge| bridge.stdin.clone());
+            if stdin.is_some() || !self.is_running(&thread_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if !self.is_running(&thread_id) {
+            self.clone().run_new_prompt(thread_id, text, images).await;
+            return;
+        }
+
+        let mut parts = Vec::new();
+        if !text.is_empty() {
+            parts.push(json!({ "type": "text", "text": text }));
+        }
+        for image in images.iter().cloned() {
+            if let Some(part) = prompt_attachment_part(image) {
+                parts.push(part);
+            }
+        }
+        let user_item_id = {
+            let state = self.app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            let Some(thread) = store.get_mut(&thread_id) else {
+                return;
+            };
+            let item = thread.push_user(text.clone(), images);
+            let user_item_id = item.id();
+            let _ = self.emit_update(&thread_id, &item);
+            store.save();
+            user_item_id
+        };
+
+        let Some(stdin) = stdin else {
+            self.push_system(
+                &thread_id,
+                "OpenCode+ 引导消息发送失败：运行中的 bridge 不可用".into(),
+                "error",
+            );
+            return;
+        };
+        let request = with_command(
+            json!({
+                "action": "prompt",
+                "parts": parts,
+                "userItemId": user_item_id,
+            }),
+            &text,
+        );
+        if let Err(error) = write_line(&stdin, &request).await {
+            self.push_system(
+                &thread_id,
+                format!("OpenCode+ 引导消息发送失败：{error}"),
+                "error",
+            );
+        }
     }
 
     pub async fn cancel(&self, thread_id: &str) {
@@ -471,7 +554,14 @@ impl OpenCodeSdkManager {
                     }
                 }
                 Some("part") => self.apply_part(thread_id, &event["part"], &mut part_items),
-                Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
+                Some("checkpoint") => self.save_checkpoint(
+                    thread_id,
+                    event
+                        .get("userItemId")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(user_item_id),
+                    &event,
+                ),
                 Some("permission") => self.handle_permission(thread_id, &event["permission"]),
                 Some("error") => {
                     return Err(event["error"]

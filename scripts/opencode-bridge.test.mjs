@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_OPENCODE_BRIDGE_TEST = "1";
-const { automaticPermissionReply, promptEventState, todoPart } = await import("./opencode-bridge.mjs");
+const { automaticPermissionReply, promptEventState, startPrompt, todoPart } = await import("./opencode-bridge.mjs");
 
 assert.equal(automaticPermissionReply("build"), "always");
 assert.equal(automaticPermissionReply("plan"), undefined);
@@ -30,4 +30,25 @@ assert.deepEqual(todoPart("session-1", [{ content: "Connect todos", status: "in_
     status: "completed",
     input: { todos: [{ content: "Connect todos", status: "in_progress", priority: "high" }] },
   },
+});
+
+let promptArgs;
+await startPrompt({
+  session: {
+    promptAsync: async (args) => {
+      promptArgs = args;
+      return {};
+    },
+  },
+}, "session-1", {
+  action: "prompt",
+  model: { providerID: "openai", modelID: "gpt-5" },
+  variant: "high",
+  parts: [{ type: "text", text: "继续检查" }],
+});
+assert.deepEqual(promptArgs, {
+  sessionID: "session-1",
+  model: { providerID: "openai", modelID: "gpt-5" },
+  variant: "high",
+  parts: [{ type: "text", text: "继续检查" }],
 });

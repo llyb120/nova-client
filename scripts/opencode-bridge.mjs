@@ -118,12 +118,45 @@ function promptEventState(event, sessionId, started) {
   return { started: started || activity, done: false };
 }
 
+function startPrompt(client, sessionId, request) {
+  if (request.command) {
+    return client.session.command({
+      sessionID: sessionId,
+      command: request.command,
+      arguments: request.arguments ?? "",
+      parts: request.parts.filter((part) => part.type === "file"),
+      model: request.model
+        ? `${request.model.providerID}/${request.model.modelID}`
+        : undefined,
+      agent: request.agent,
+      variant: request.variant,
+    });
+  }
+  const body = {};
+  if (request.model) body.model = request.model;
+  if (request.agent) body.agent = request.agent;
+  if (request.variant) body.variant = request.variant;
+  return client.session.promptAsync({
+    sessionID: sessionId,
+    ...body,
+    parts: request.parts,
+  });
+}
+
 async function runPrompt(client, lines, request) {
   const sessionId = await ensureSession(client, request.sessionId);
   const subscription = await client.event.subscribe();
   send({ type: "ready", sessionId });
 
   let cancelled = false;
+  let checkpointUserItemId = request.userItemId;
+  const reportStarted = (started) => {
+    started.then((result) => {
+      if (result.error && !cancelled) send({ type: "error", error: JSON.stringify(result.error) });
+    }).catch((error) => {
+      if (!cancelled) send({ type: "error", error: error instanceof Error ? error.message : String(error) });
+    });
+  };
   const input = (async () => {
     for await (const line of lines) {
       if (!line.trim()) continue;
@@ -137,39 +170,19 @@ async function runPrompt(client, lines, request) {
       } else if (command.action === "cancel") {
         cancelled = true;
         await client.session.abort({ sessionID: sessionId });
+      } else if (command.action === "prompt") {
+        checkpointUserItemId = command.userItemId;
+        reportStarted(startPrompt(client, sessionId, {
+          ...command,
+          model: command.model ?? request.model,
+          agent: command.agent ?? request.agent,
+          variant: command.variant ?? request.variant,
+        }));
       }
     }
   })();
 
-  const body = {};
-  if (request.model) body.model = request.model;
-  if (request.agent) body.agent = request.agent;
-  if (request.variant) body.variant = request.variant;
-  let started;
-  if (request.command) {
-    started = client.session.command({
-      sessionID: sessionId,
-      command: request.command,
-      arguments: request.arguments ?? "",
-      parts: request.parts.filter((part) => part.type === "file"),
-      model: request.model
-        ? `${request.model.providerID}/${request.model.modelID}`
-        : undefined,
-      agent: request.agent,
-      variant: request.variant,
-    });
-  } else {
-    started = client.session.promptAsync({
-      sessionID: sessionId,
-      ...body,
-      parts: request.parts,
-    });
-  }
-  started.then((result) => {
-    if (result.error && !cancelled) send({ type: "error", error: JSON.stringify(result.error) });
-  }).catch((error) => {
-    if (!cancelled) send({ type: "error", error: error instanceof Error ? error.message : String(error) });
-  });
+  reportStarted(startPrompt(client, sessionId, request));
 
   const assistantMessages = new Set();
   const pendingParts = new Map();
@@ -219,7 +232,7 @@ async function runPrompt(client, lines, request) {
     }
     if (eventState.done) {
       const position = [...assistantMessages].at(-1);
-      if (position) send({ type: "checkpoint", sessionId, position });
+      if (position) send({ type: "checkpoint", sessionId, position, userItemId: checkpointUserItemId });
       send({ type: "done" });
       break;
     }
@@ -250,4 +263,4 @@ async function main() {
 
 if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
 
-export { automaticPermissionReply, promptEventState, todoPart };
+export { automaticPermissionReply, promptEventState, startPrompt, todoPart };
