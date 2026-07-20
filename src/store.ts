@@ -41,7 +41,7 @@ import type {
   UpdateProgress,
 } from "./types";
 import { firstWakeDoPairForThread } from "./threadDisplay";
-import { isScratch } from "./utils";
+import { isScratch, scratchParent } from "./utils";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
@@ -1162,7 +1162,7 @@ export async function createThread(
 
 function projectStorageKey(cwd?: string | null): string | null {
   const key = cwd?.trim();
-  return key ? encodeURIComponent(key) : null;
+  return key ? encodeURIComponent(isScratch(key) ? scratchParent(key) : key) : null;
 }
 
 /** 记住最近一次选择的模型/模式，作为新会话默认值 */

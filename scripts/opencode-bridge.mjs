@@ -98,8 +98,21 @@ function todoPart(sessionId, todos) {
   };
 }
 
+function eventProperties(event) {
+  return event.properties ?? event.data ?? {};
+}
+
+function todoPlan(todos) {
+  return todos
+    .map((todo) => ({
+      content: todo.content?.trim() ?? "",
+      status: todo.status ?? "pending",
+    }))
+    .filter((todo) => todo.content);
+}
+
 function promptEventState(event, sessionId, started) {
-  const properties = event.properties ?? {};
+  const properties = eventProperties(event);
   if (properties.sessionID !== sessionId) return { started, done: false };
   const status = event.type === "session.status" ? properties.status?.type : undefined;
   if (event.type === "session.idle" || status === "idle") {
@@ -209,7 +222,7 @@ async function runPrompt(client, lines, request) {
   const pendingParts = new Map();
   let promptStarted = false;
   for await (const event of subscription.stream) {
-    const properties = event.properties ?? {};
+    const properties = eventProperties(event);
     if (properties.sessionID !== sessionId) continue;
     const eventState = promptEventState(event, sessionId, promptStarted);
     promptStarted = eventState.started;
@@ -233,7 +246,9 @@ async function runPrompt(client, lines, request) {
       continue;
     }
     if (event.type === "todo.updated") {
-      send({ type: "part", part: todoPart(sessionId, properties.todos ?? []) });
+      const todos = properties.todos ?? [];
+      send({ type: "part", part: todoPart(sessionId, todos) });
+      send({ type: "plan", plan: todoPlan(todos) });
       continue;
     }
     if (event.type === "permission.asked" || event.type === "permission.v2.asked") {
@@ -284,4 +299,4 @@ async function main() {
 
 if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
 
-export { automaticPermissionReply, promptEventState, startPrompt, steerPrompt, todoPart };
+export { automaticPermissionReply, eventProperties, promptEventState, startPrompt, steerPrompt, todoPart, todoPlan };

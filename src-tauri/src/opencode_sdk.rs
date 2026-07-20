@@ -555,6 +555,7 @@ impl OpenCodeSdkManager {
                     }
                 }
                 Some("part") => self.apply_part(thread_id, &event["part"], &mut part_items),
+                Some("plan") => self.apply_plan(thread_id, &event["plan"]),
                 Some("checkpoint") => self.save_checkpoint(
                     thread_id,
                     event
@@ -693,6 +694,21 @@ impl OpenCodeSdkManager {
         }
         thread.updated_at = now_ms();
         let _ = self.emit_update(thread_id, &item);
+        store.save();
+    }
+
+    fn apply_plan(&self, thread_id: &str, plan: &Value) {
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        let Some(thread) = store.get_mut(thread_id) else {
+            return;
+        };
+        thread.plan = Some(plan.clone());
+        thread.updated_at = now_ms();
+        let _ = self.app.emit(
+            EV_UPDATE,
+            json!({ "threadId": thread_id, "op": { "t": "plan", "plan": plan } }),
+        );
         store.save();
     }
 

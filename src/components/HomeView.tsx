@@ -159,6 +159,7 @@ export function HomeView() {
 
   const pickModel = (v: string) => {
     setModel(v);
+    if (!usesPeerModels() && !quotaBorrowing()) lastUsed.setModel(agentKind(), v, cwd());
     prewarmCurrent({ model: v });
   };
   const pickMode = (v: string) => {
@@ -218,6 +219,7 @@ export function HomeView() {
       void refreshSlashCommands(next);
     }
     setModel(m);
+    if (!usesPeerModels()) lastUsed.setModel(next, m, cwd());
     prewarmCurrent({ agentKind: next, model: m, mode: nextMode });
   };
 
