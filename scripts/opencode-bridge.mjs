@@ -142,20 +142,9 @@ async function sessionIsIdle(client, sessionId) {
 }
 
 function steerPrompt(client, sessionId, parts) {
-  const text = parts
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("\n");
-  const files = parts
-    .filter((part) => part.type === "file")
-    .map((part) => ({
-      uri: part.url,
-      ...(part.filename ? { name: part.filename } : {}),
-    }));
-  return client.v2.session.prompt({
+  return client.session.prompt({
     sessionID: sessionId,
-    prompt: { text, ...(files.length ? { files } : {}) },
-    delivery: "steer",
+    parts,
   });
 }
 

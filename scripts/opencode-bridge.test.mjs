@@ -72,12 +72,10 @@ assert.deepEqual(promptArgs, {
 
 let steerArgs;
 await steerPrompt({
-  v2: {
-    session: {
-      prompt: async (args) => {
-        steerArgs = args;
-        return {};
-      },
+  session: {
+    prompt: async (args) => {
+      steerArgs = args;
+      return {};
     },
   },
 }, "session-1", [
@@ -87,21 +85,19 @@ await steerPrompt({
 ]);
 assert.deepEqual(steerArgs, {
   sessionID: "session-1",
-  prompt: {
-    text: "先定位根因\n不要重构",
-    files: [{ uri: "data:image/png;base64,abc", name: "trace.png" }],
-  },
-  delivery: "steer",
+  parts: [
+    { type: "text", text: "先定位根因" },
+    { type: "text", text: "不要重构" },
+    { type: "file", filename: "trace.png", url: "data:image/png;base64,abc", mime: "image/png" },
+  ],
 });
 
 steerArgs = undefined;
 await startPrompt({
-  v2: {
-    session: {
-      prompt: async (args) => {
-        steerArgs = args;
-        return {};
-      },
+  session: {
+    prompt: async (args) => {
+      steerArgs = args;
+      return {};
     },
   },
 }, "session-1", {
@@ -109,4 +105,7 @@ await startPrompt({
   delivery: "steer",
   parts: [{ type: "text", text: "改为只修复测试" }],
 });
-assert.equal(steerArgs.delivery, "steer");
+assert.deepEqual(steerArgs, {
+  sessionID: "session-1",
+  parts: [{ type: "text", text: "改为只修复测试" }],
+});
