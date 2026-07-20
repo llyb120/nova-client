@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_OPENCODE_BRIDGE_TEST = "1";
-const { automaticPermissionReply, promptEventState, startPrompt, todoPart } = await import("./opencode-bridge.mjs");
+const { automaticPermissionReply, promptEventState, startPrompt, steerPrompt, todoPart } = await import("./opencode-bridge.mjs");
 
 assert.equal(automaticPermissionReply("build"), "always");
 assert.equal(automaticPermissionReply("plan"), undefined);
@@ -52,3 +52,44 @@ assert.deepEqual(promptArgs, {
   variant: "high",
   parts: [{ type: "text", text: "继续检查" }],
 });
+
+let steerArgs;
+await steerPrompt({
+  v2: {
+    session: {
+      prompt: async (args) => {
+        steerArgs = args;
+        return {};
+      },
+    },
+  },
+}, "session-1", [
+  { type: "text", text: "先定位根因" },
+  { type: "text", text: "不要重构" },
+  { type: "file", filename: "trace.png", url: "data:image/png;base64,abc", mime: "image/png" },
+]);
+assert.deepEqual(steerArgs, {
+  sessionID: "session-1",
+  prompt: {
+    text: "先定位根因\n不要重构",
+    files: [{ uri: "data:image/png;base64,abc", name: "trace.png" }],
+  },
+  delivery: "steer",
+});
+
+steerArgs = undefined;
+await startPrompt({
+  v2: {
+    session: {
+      prompt: async (args) => {
+        steerArgs = args;
+        return {};
+      },
+    },
+  },
+}, "session-1", {
+  action: "prompt",
+  delivery: "steer",
+  parts: [{ type: "text", text: "改为只修复测试" }],
+});
+assert.equal(steerArgs.delivery, "steer");

@@ -379,6 +379,7 @@ impl OpenCodeSdkManager {
         let request = with_command(
             json!({
                 "action": "prompt",
+                "delivery": "steer",
                 "parts": parts,
                 "userItemId": user_item_id,
             }),

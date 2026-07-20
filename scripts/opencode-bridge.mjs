@@ -118,6 +118,24 @@ function promptEventState(event, sessionId, started) {
   return { started: started || activity, done: false };
 }
 
+function steerPrompt(client, sessionId, parts) {
+  const text = parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+  const files = parts
+    .filter((part) => part.type === "file")
+    .map((part) => ({
+      uri: part.url,
+      ...(part.filename ? { name: part.filename } : {}),
+    }));
+  return client.v2.session.prompt({
+    sessionID: sessionId,
+    prompt: { text, ...(files.length ? { files } : {}) },
+    delivery: "steer",
+  });
+}
+
 function startPrompt(client, sessionId, request) {
   if (request.command) {
     return client.session.command({
@@ -131,6 +149,9 @@ function startPrompt(client, sessionId, request) {
       agent: request.agent,
       variant: request.variant,
     });
+  }
+  if (request.delivery === "steer") {
+    return steerPrompt(client, sessionId, request.parts);
   }
   const body = {};
   if (request.model) body.model = request.model;
@@ -263,4 +284,4 @@ async function main() {
 
 if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
 
-export { automaticPermissionReply, promptEventState, startPrompt, todoPart };
+export { automaticPermissionReply, promptEventState, startPrompt, steerPrompt, todoPart };
