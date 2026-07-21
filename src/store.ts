@@ -1616,13 +1616,12 @@ export async function initStore() {
       setTheme(resolvedSettings.theme);
     }
     setState({ settings: resolvedSettings, agentKind: initialAgent });
-    // 窗口以 hidden 创建；可靠主题已同步到 DOM 后再显示，避免露出 WebView 默认底色。
-    void api.showMainWindow().catch(() => {});
     // 后端启动时已把磁盘缓存灌入内存，立即读取，不等待其余事件监听和会话初始化。
     void ensureModelOptions(initialAgent);
     return { settings: resolvedSettings, initialAgent };
   }).catch((error: unknown) => {
     // 设置读取失败也不能让窗口永久隐藏；此时沿用 localStorage 的首帧主题。
+    setRestoreSettled(true);
     void api.showMainWindow().catch(() => {});
     return { error };
   });
@@ -1989,11 +1988,12 @@ export async function initStore() {
       if (id && !state.currentId && state.threads.some((t) => t.id === id)) {
         await openThread(id).catch(() => {});
       }
-      setRestoreSettled(true);
     })
-    .catch(() => {
-      // 无恢复标记或读取失败时静默停留在主页
+    .catch(() => {})
+    .finally(() => {
+      // 目标页面已经稳定后再显示窗口，避免升级重启时先露出新会话页。
       setRestoreSettled(true);
+      void api.showMainWindow().catch(() => {});
     });
 
   // 监听用户交互并节流上报活动，供后端静默升级判断「一段时间没有操作」

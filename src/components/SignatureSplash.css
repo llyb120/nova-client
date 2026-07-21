@@ -1,8 +1,5 @@
-/* 会话滚动区和输入区是两个 flex 层叠上下文；签名时连同底栏一起抬升，
-   避免溢出输入框上沿的花体笔画被会话区盖住。 */
-.chat-foot:has(.composer-engraved-watermark.signing) {
-  position: relative;
-  z-index: 1;
+.composer-engraved-watermark.awaiting-signature {
+  visibility: hidden;
 }
 
 .composer-engraved-watermark.signing {

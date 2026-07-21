@@ -2,14 +2,16 @@ import { onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { api } from "../ipc";
 import { restoreSettled } from "../store";
-import { setSignatureProgress, signatureProgress } from "./signatureOverlay";
+import {
+  setSignatureProgress,
+  setSignatureVisible,
+  signatureProgress,
+} from "./signatureOverlay";
 import "./SignatureSplash.css";
 
 /** 描笔时长；之后稍作停留再固化。 */
 const REVEAL_MS = 2600;
 const SETTLE_HOLD_MS = 500;
-/** 等恢复结论/目标水印渲染的最长等待，异常时不至于永远签不上。 */
-const WAIT_TIMEOUT_MS = 3000;
 
 /**
  * 启动签名：在输入框水印原位置、原样式上描笔——水印本体被斜边软刷从左到右揭开，
@@ -22,14 +24,12 @@ export function SignatureSplash() {
   let raf = 0;
   let holdTimer: number | undefined;
   let waitInterval: number | undefined;
-  let waitTimer: number | undefined;
   let started = false;
 
   const stop = () => {
     cancelAnimationFrame(raf);
     window.clearTimeout(holdTimer);
     window.clearInterval(waitInterval);
-    window.clearTimeout(waitTimer);
     setSignatureProgress(null);
   };
 
@@ -45,6 +45,7 @@ export function SignatureSplash() {
       }
     };
     setSignatureProgress(0);
+    setSignatureVisible(true);
     raf = requestAnimationFrame(tick);
   };
 
@@ -63,27 +64,30 @@ export function SignatureSplash() {
       }
       if (attempts > 0) {
         raf = requestAnimationFrame(() => locate(attempts - 1));
+      } else {
+        setSignatureVisible(true);
       }
     };
     locate(60);
   };
 
   onMount(() => {
-    void api.signaturePending().then((value) => {
-      if (!value) return;
-      // 升级重启会恢复之前的会话：等恢复有结论，签名落在最终显示的输入框里；
-      // 普通启动 restoreSettled 很快置位，直接在主页输入框签。超时兜底防卡死。
-      waitInterval = window.setInterval(() => {
-        if (restoreSettled()) {
-          window.clearInterval(waitInterval);
-          start();
+    void api
+      .signaturePending()
+      .then((value) => {
+        if (!value) {
+          setSignatureVisible(true);
+          return;
         }
-      }, 100);
-      waitTimer = window.setTimeout(() => {
-        window.clearInterval(waitInterval);
-        start();
-      }, WAIT_TIMEOUT_MS);
-    });
+        // 只在升级恢复完成或确认无需恢复后定位目标水印，绝不提前在主页签名。
+        waitInterval = window.setInterval(() => {
+          if (restoreSettled()) {
+            window.clearInterval(waitInterval);
+            start();
+          }
+        }, 100);
+      })
+      .catch(() => setSignatureVisible(true));
   });
 
   onCleanup(stop);
