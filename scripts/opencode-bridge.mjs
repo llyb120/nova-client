@@ -100,6 +100,16 @@ function automaticPermissionReply(mode) {
   return mode === "build" ? "always" : undefined;
 }
 
+function respondToQuestion(client, command) {
+  if (command.action === "question-reject") {
+    return client.question.reject({ requestID: command.requestId });
+  }
+  return client.question.reply({
+    requestID: command.requestId,
+    answers: command.answers,
+  });
+}
+
 function todoPart(sessionId, todos) {
   const id = `nova-todo-${sessionId}`;
   return {
@@ -141,6 +151,8 @@ function promptEventState(event, sessionId, started) {
       "todo.updated",
       "permission.asked",
       "permission.v2.asked",
+      "question.asked",
+      "question.v2.asked",
       "session.error",
     ].includes(event.type);
   return { started: started || activity, done: false };
@@ -242,6 +254,9 @@ async function runPrompt(client, lines, request) {
           reply: command.reply,
         });
         if (result.error) send({ type: "error", error: JSON.stringify(result.error) });
+      } else if (command.action === "question" || command.action === "question-reject") {
+        const result = await respondToQuestion(client, command);
+        if (result.error) send({ type: "error", error: JSON.stringify(result.error) });
       } else if (command.action === "cancel") {
         cancelled = true;
         await client.session.abort({ sessionID: sessionId });
@@ -302,6 +317,10 @@ async function runPrompt(client, lines, request) {
       }
       continue;
     }
+    if (event.type === "question.asked" || event.type === "question.v2.asked") {
+      send({ type: "question", question: properties });
+      continue;
+    }
     if (event.type === "session.error") {
       if (cancelled) break;
       send({ type: "error", error: JSON.stringify(properties.error ?? "OpenCode session error") });
@@ -342,4 +361,4 @@ async function main() {
 
 if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
 
-export { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, removeEmptyAssistantMessages, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan };
+export { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, removeEmptyAssistantMessages, respondToQuestion, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan };

@@ -1,10 +1,30 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_OPENCODE_BRIDGE_TEST = "1";
-const { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, removeEmptyAssistantMessages, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan } = await import("./opencode-bridge.mjs");
+const { automaticPermissionReply, createPromptTracker, eventProperties, promptEventState, removeEmptyAssistantMessages, respondToQuestion, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan } = await import("./opencode-bridge.mjs");
 
 assert.equal(automaticPermissionReply("build"), "always");
 assert.equal(automaticPermissionReply("plan"), undefined);
+
+{
+  const calls = [];
+  const client = {
+    question: {
+      reply: async (request) => calls.push(["reply", request]),
+      reject: async (request) => calls.push(["reject", request]),
+    },
+  };
+  await respondToQuestion(client, {
+    action: "question",
+    requestId: "question-1",
+    answers: [["Windows"], ["TypeScript", "Rust"]],
+  });
+  await respondToQuestion(client, { action: "question-reject", requestId: "question-2" });
+  assert.deepEqual(calls, [
+    ["reply", { requestID: "question-1", answers: [["Windows"], ["TypeScript", "Rust"]] }],
+    ["reject", { requestID: "question-2" }],
+  ]);
+}
 
 assert.deepEqual(promptEventState({ type: "session.idle", properties: { sessionID: "session-1" } }, "session-1", false), {
   started: false,
@@ -18,6 +38,10 @@ assert.deepEqual(promptEventState({
   type: "session.status",
   properties: { sessionID: "session-1", status: { type: "idle" } },
 }, "session-1", true), { started: true, done: true });
+assert.deepEqual(promptEventState({
+  type: "question.asked",
+  properties: { sessionID: "session-1", id: "question-1" },
+}, "session-1", false), { started: true, done: false });
 
 let finishSteer;
 const promptErrors = [];

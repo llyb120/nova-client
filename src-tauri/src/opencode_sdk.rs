@@ -27,9 +27,15 @@ struct RunningBridge {
     stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
 }
 
+enum PendingRequestKind {
+    Permission,
+    Question,
+}
+
 struct PendingPermission {
     thread_id: String,
     request_id: String,
+    kind: PendingRequestKind,
 }
 
 pub struct OpenCodeSdkManager {
@@ -565,6 +571,7 @@ impl OpenCodeSdkManager {
                     &event,
                 ),
                 Some("permission") => self.handle_permission(thread_id, &event["permission"]),
+                Some("question") => self.handle_question(thread_id, &event["question"]),
                 Some("error") => {
                     return Err(event["error"]
                         .as_str()
@@ -722,6 +729,7 @@ impl OpenCodeSdkManager {
             PendingPermission {
                 thread_id: thread_id.to_string(),
                 request_id: request_id.to_string(),
+                kind: PendingRequestKind::Permission,
             },
         );
         let title = permission
@@ -748,6 +756,35 @@ impl OpenCodeSdkManager {
         );
     }
 
+    fn handle_question(&self, thread_id: &str, question: &Value) {
+        let Some(request_id) = question.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let request_key = format!("ocp-question-{thread_id}-{request_id}");
+        self.pending_permissions.lock().unwrap().insert(
+            request_key.clone(),
+            PendingPermission {
+                thread_id: thread_id.to_string(),
+                request_id: request_id.to_string(),
+                kind: PendingRequestKind::Question,
+            },
+        );
+        let _ = self.app.emit(
+            EV_PERMISSION,
+            json!({
+                "threadId": thread_id,
+                "agentKind": "opencode",
+                "requestKey": request_key,
+                "toolCall": {
+                    "title": "回答问题",
+                    "kind": "other"
+                },
+                "options": [],
+                "questions": question.get("questions").cloned().unwrap_or_else(|| json!([]))
+            }),
+        );
+    }
+
     pub async fn respond_permission(
         &self,
         request_key: &str,
@@ -766,16 +803,18 @@ impl OpenCodeSdkManager {
             .get(&permission.thread_id)
             .map(|bridge| bridge.stdin.clone())
             .ok_or("OpenCode+ 会话已结束")?;
-        let reply = match option_id {
-            "always" => "always",
-            "reject" | "" => "reject",
-            _ => "once",
+        let command = match permission.kind {
+            PendingRequestKind::Permission => {
+                let reply = match option_id {
+                    "always" => "always",
+                    "reject" | "" => "reject",
+                    _ => "once",
+                };
+                json!({ "action": "permission", "requestId": permission.request_id, "reply": reply })
+            }
+            PendingRequestKind::Question => question_command(&permission.request_id, option_id)?,
         };
-        write_line(
-            &stdin,
-            &json!({ "action": "permission", "requestId": permission.request_id, "reply": reply }),
-        )
-        .await?;
+        write_line(&stdin, &command).await?;
         let _ = self
             .app
             .emit(EV_PERMISSION_RESOLVED, json!({ "requestKey": request_key }));
@@ -1189,6 +1228,15 @@ fn compact_tool_detail(value: &str) -> String {
     }
 }
 
+fn question_command(request_id: &str, answer: &str) -> Result<Value, String> {
+    if answer.is_empty() {
+        return Ok(json!({ "action": "question-reject", "requestId": request_id }));
+    }
+    let answers = serde_json::from_str::<Vec<Vec<String>>>(answer)
+        .map_err(|_| "OpenCode+ 问题答案格式无效".to_string())?;
+    Ok(json!({ "action": "question", "requestId": request_id, "answers": answers }))
+}
+
 fn derive_title(text: &str, has_images: bool) -> String {
     let title: String = text
         .lines()
@@ -1219,6 +1267,23 @@ mod tests {
         );
         assert_eq!(derive_title("", true), "[图片]");
         assert_eq!(derive_title("", false), "新会话");
+    }
+
+    #[test]
+    fn builds_question_reply_and_reject_commands() {
+        assert_eq!(
+            question_command("question-1", r#"[["Windows"],["Rust","TypeScript"]]"#).unwrap(),
+            json!({
+                "action": "question",
+                "requestId": "question-1",
+                "answers": [["Windows"], ["Rust", "TypeScript"]]
+            })
+        );
+        assert_eq!(
+            question_command("question-2", "").unwrap(),
+            json!({ "action": "question-reject", "requestId": "question-2" })
+        );
+        assert!(question_command("question-3", "not-json").is_err());
     }
 
     #[test]

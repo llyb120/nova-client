@@ -281,6 +281,14 @@ export interface PermissionOption {
   kind: string;
 }
 
+export interface QuestionInfo {
+  header: string;
+  question: string;
+  options: Array<{ label: string; description: string }>;
+  multiple?: boolean;
+  custom?: boolean;
+}
+
 export interface PermissionRequest {
   threadId: string;
   agentKind?: AgentKind;
@@ -293,6 +301,7 @@ export interface PermissionRequest {
     [k: string]: unknown;
   } | null;
   options: PermissionOption[];
+  questions?: QuestionInfo[];
 }
 
 export interface Settings {
