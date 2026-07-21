@@ -1,6 +1,6 @@
 import { Show } from "solid-js";
 import { EngravedNumberMark } from "./EngravedNumberMark";
-import { signatureProgress } from "./signatureOverlay";
+import { signatureProgress, signatureVisible } from "./signatureOverlay";
 
 /** token 前缀对应的会话背景身份，按声明顺序匹配。 */
 const EXCLUSIVE_MARK_BY_TOKEN_PREFIX: ReadonlyArray<readonly [string, string]> = [
@@ -42,7 +42,11 @@ export function ExclusiveChatMark(props: { token: string }) {
     <Show when={identity()}>
       {(value) => (
         <div
-          class={`composer-engraved-watermark${signatureProgress() !== null ? " signing" : ""}`}
+          class="composer-engraved-watermark"
+          classList={{
+            "awaiting-signature": !signatureVisible(),
+            signing: signatureProgress() !== null,
+          }}
           aria-hidden="true"
           style={
             revealMask()

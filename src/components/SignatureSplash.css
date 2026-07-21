@@ -1,6 +1,13 @@
-/* 描笔期间抬升水印层级：平时它压在输入框/底栏（z-index:1）下面，签名时不被遮挡。 */
+.composer-engraved-watermark.awaiting-signature {
+  visibility: hidden;
+}
+
 .composer-engraved-watermark.signing {
-  z-index: 2;
+  /* mask 会按元素边框盒裁剪花体溢出笔画；扩大上下盒子并等量抵消 bottom，
+     只扩展动画绘制范围，不移动签名内容。 */
+  bottom: 19px;
+  padding-block: 28px;
+  z-index: 3;
 }
 
 /* 启动签名的笔尖光点：沿水印基线游走，笔停即隐。 */

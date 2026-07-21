@@ -5,3 +5,6 @@ import { createSignal } from "solid-js";
  * 非 null 时输入框水印按进度被从左到右「描出」，签完置回 null 完成固化。
  */
 export const [signatureProgress, setSignatureProgress] = createSignal<number | null>(null);
+
+/** 启动签名确认目标输入框前隐藏水印，避免先露出完整签名再开始动画。 */
+export const [signatureVisible, setSignatureVisible] = createSignal(false);

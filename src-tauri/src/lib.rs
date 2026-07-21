@@ -5,7 +5,6 @@ mod cli_manager;
 mod clues;
 mod codex;
 mod codex_radar;
-mod codex_sdk;
 mod credential_roaming;
 mod employees;
 mod gitwt;
@@ -18,6 +17,8 @@ mod path_env;
 mod quota;
 mod relay;
 mod remote;
+mod sdk_adapters;
+mod sdk_runtime;
 mod semantic;
 mod server;
 mod settings;
@@ -39,10 +40,11 @@ pub use server::maybe_run_management_command as maybe_run_server_command;
 
 use acp::AcpManager;
 use codex::CodexManager;
-use codex_sdk::{CodexSdkManager, SdkBackend};
 use credential_roaming::{BorrowedManager, BorrowedRuntime};
 use opencode_sdk::OpenCodeSdkManager;
 use relay::{RelayManager, Share};
+use sdk_adapters::{AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter};
+use sdk_runtime::SdkManager;
 use serde_json::{json, Value};
 use settings::Settings;
 use std::collections::{HashMap, HashSet};
@@ -87,13 +89,13 @@ pub struct AppState {
     pub opencodeplus: Arc<OpenCodeSdkManager>,
     pub codex: Arc<CodexManager>,
     /// Alkaid 自研 pi agent 后端。
-    pub alkaid: Arc<CodexSdkManager>,
+    pub alkaid: Arc<SdkManager>,
     /// Codex 官方 TypeScript SDK 后端，不经过 app-server 集成层。
-    pub codexplus: Arc<CodexSdkManager>,
+    pub codexplus: Arc<SdkManager>,
     /// CodeBuddy 官方 Agent SDK 后端。
-    pub codebuddyplus: Arc<CodexSdkManager>,
-    pub claudeplus: Arc<CodexSdkManager>,
-    pub cursorplus: Arc<CodexSdkManager>,
+    pub codebuddyplus: Arc<SdkManager>,
+    pub claudeplus: Arc<SdkManager>,
+    pub cursorplus: Arc<SdkManager>,
     /// 额度租借会话的独立后端进程与临时凭证目录（只在本次运行内存在）。
     pub borrowed_runtimes: Mutex<HashMap<String, BorrowedRuntime>>,
     pub relay: Arc<RelayManager>,
@@ -1866,6 +1868,12 @@ fn report_activity(state: State<'_, AppState>, thread_id: Option<String>) {
     *state.active_thread.lock().unwrap() = thread_id;
 }
 
+/// 前端在可靠主题已经写入 DOM 后调用；窗口此前始终隐藏，避免启动时露出默认底色。
+#[tauri::command]
+fn show_main_window(app: tauri::AppHandle) {
+    updater::restore_window_on_launch(&app);
+}
+
 /// 读取并清除「升级重启前正在查看的会话」标记，返回需要自动恢复打开的会话 id。
 /// 普通启动返回 null；仅升级（手动/静默）重启后才会返回上次的会话。
 #[tauri::command]
@@ -2597,6 +2605,7 @@ fn set_thread_agent(
             thread.acp_session_id = None;
             thread.pending_native_restore = None;
             thread.provider_checkpoints.clear();
+            thread.codex_usage_snapshot = None;
             // 标记上下文接力：仅当已有历史时才有意义（无历史时 take 会返回 None）
             thread.handoff_from = if thread.items.is_empty() {
                 None
@@ -2893,6 +2902,7 @@ fn truncate_thread(
         thread.plan = None;
         thread.acp_session_id = None;
         thread.pending_native_restore = None;
+        thread.codex_usage_snapshot = None;
         thread
             .provider_checkpoints
             .retain(|checkpoint| checkpoint.user_item_id < item_id);
@@ -4781,12 +4791,9 @@ pub fn run() {
             // 清理上次自更新留下的旧 exe
             updater::cleanup_old();
 
-            // 窗口在配置里以 visible:false 创建：这里统一决定如何呈现。
-            // 升级重启会还原成「更新前的样子」（位置/多屏/最大化/最小化/是否前台），
-            // 普通启动则正常显示并聚焦。
-            if !server::is_headless() {
-                updater::restore_window_on_launch(app.handle());
-            } else {
+            // GUI 窗口保持隐藏，等前端应用可靠主题后通过 show_main_window 显示；
+            // headless 模式没有前端，只记录启动状态。
+            if server::is_headless() {
                 eprintln!("[nova-server] headless runtime started");
             }
 
@@ -4850,11 +4857,11 @@ pub fn run() {
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
-            let alkaid = CodexSdkManager::new(app.handle().clone(), SdkBackend::Alkaid);
-            let codexplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Codex);
-            let codebuddyplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::CodeBuddy);
-            let claudeplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Claude);
-            let cursorplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Cursor);
+            let alkaid = SdkManager::new(app.handle().clone(), AlkaidAdapter);
+            let codexplus = SdkManager::new(app.handle().clone(), CodexAdapter);
+            let codebuddyplus = SdkManager::new(app.handle().clone(), CodeBuddyAdapter);
+            let claudeplus = SdkManager::new(app.handle().clone(), ClaudeAdapter);
+            let cursorplus = SdkManager::new(app.handle().clone(), CursorAdapter);
             let relay = RelayManager::new(app.handle().clone(), dir.clone());
 
             app.manage(AppState {
@@ -5141,6 +5148,7 @@ pub fn run() {
             download_staged_update,
             apply_staged_update,
             report_activity,
+            show_main_window,
             take_restore_thread,
             signature_pending,
             create_thread,

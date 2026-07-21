@@ -258,7 +258,7 @@ impl WindowState {
 }
 
 /// 升级重启后用来恢复「重启前状态」的标记（app_data_dir/update-restore.json）。
-/// 替换 exe 前写入：`window` 由后端在启动早期读取并还原窗口；`thread_id` 由前端读取并打开对应会话，随即清除。
+/// 替换 exe 前写入：前端先消费 `thread_id` 并恢复会话，页面稳定后后端再消费 `window` 显示窗口。
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct RestoreMarker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -594,15 +594,21 @@ pub fn write_restore_state(app: &AppHandle, thread_id: Option<&str>) {
     );
 }
 
-/// 读取并清除「待恢复会话」标记，返回升级前正在查看的会话 id。
+/// 读取并摘除「待恢复会话」字段，保留窗口状态供页面稳定后再恢复。
 /// 仅升级重启会写入该标记，普通启动读到 None。
 pub fn take_restore_thread(app: &AppHandle) -> Option<String> {
     let path = restore_path(app)?;
     let text = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    serde_json::from_str::<RestoreMarker>(&text)
-        .ok()
-        .and_then(|m| m.thread_id)
+    let mut marker: RestoreMarker = serde_json::from_str(&text).ok()?;
+    let thread_id = marker.thread_id.take();
+    if marker.window.is_some() {
+        if let Ok(json) = serde_json::to_string_pretty(&marker) {
+            let _ = std::fs::write(&path, json);
+        }
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+    thread_id
 }
 
 /// 取主窗口（label 固定为 "main"；兜底取任意一个窗口，避免 label 变化导致取不到）。

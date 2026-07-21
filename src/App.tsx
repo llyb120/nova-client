@@ -1,5 +1,4 @@
 import { createEffect, createSignal, onMount, Show } from "solid-js";
-import { AmbientScene } from "./components/AmbientScene";
 import { ChatView } from "./components/ChatView";
 import { CliOperationModal } from "./components/CliOperationModal";
 import { DecisionWorkbench } from "./components/DecisionWorkbench";
@@ -53,9 +52,6 @@ export default function App() {
 
   return (
     <div class="app">
-      <Show when={state.uiStyle === "classic"}>
-        <AmbientScene />
-      </Show>
       <Sidebar
         onOpenSettings={() => setShowSettings(true)}
         onOpenUpdate={() => setShowUpdate(true)}

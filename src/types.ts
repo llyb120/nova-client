@@ -340,8 +340,6 @@ export interface Settings {
   editor: string;
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */
   theme: string;
-  /** 界面风格（modern / classic，缺省 = modern） */
-  uiStyle: string;
   /** 会话历史展示方式（按项目 / 按时间） */
   historyDisplayMode: "project" | "time";
   /** 团队/漫游中转服务地址（空 = 关闭团队/漫游） */
@@ -354,6 +352,8 @@ export interface Settings {
   remoteControlEnabled: boolean;
   /** 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>` */
   quotaSharedModels: string[];
+  /** 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>` */
+  modelFavorites: string[];
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
   alkaidEnabled: boolean;

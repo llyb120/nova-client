@@ -365,6 +365,15 @@ pub struct PendingNativeRestore {
     pub position: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsageSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
@@ -403,6 +412,9 @@ pub struct Thread {
     /// Claude / CodeBuddy 在下一条 prompt 启动时执行的原生分叉位置。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_native_restore: Option<PendingNativeRestore>,
+    /// Codex SDK 返回会话累计量；保留上次快照以换算本轮增量。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_usage_snapshot: Option<CodexUsageSnapshot>,
     /// 临时会话：程序关闭时自动删除，不跨重启持久化
     #[serde(default)]
     pub ephemeral: bool,
@@ -492,6 +504,7 @@ impl Thread {
             handoff_from: None,
             provider_checkpoints: Vec::new(),
             pending_native_restore: None,
+            codex_usage_snapshot: None,
             ephemeral,
             starred: false,
             roaming_role: None,
@@ -1380,11 +1393,13 @@ mod tests {
         object.remove("starred");
         object.remove("providerCheckpoints");
         object.remove("pendingNativeRestore");
+        object.remove("codexUsageSnapshot");
 
         let restored: Thread = serde_json::from_value(value).expect("旧线程应可反序列化");
         assert!(!restored.starred);
         assert!(restored.provider_checkpoints.is_empty());
         assert!(restored.pending_native_restore.is_none());
+        assert!(restored.codex_usage_snapshot.is_none());
     }
 }
 

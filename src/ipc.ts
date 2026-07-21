@@ -54,6 +54,7 @@ export const api = {
   applyStagedUpdate: () => invoke<void>("apply_staged_update"),
   reportActivity: (threadId: string | null) =>
     invoke<void>("report_activity", { threadId }),
+  showMainWindow: () => invoke<void>("show_main_window"),
   takeRestoreThread: () => invoke<string | null>("take_restore_thread"),
   signaturePending: () => invoke<ExclusiveChatIdentity | null>("signature_pending"),
   createThread: (

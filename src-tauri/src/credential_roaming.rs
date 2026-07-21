@@ -4,8 +4,9 @@
 //! 后端进程通过 CODEX_HOME / CURSOR_CONFIG_DIR / XDG_* 等环境变量读取，不覆盖本机账号。
 
 use crate::acp::AcpManager;
-use crate::codex_sdk::{CodexSdkManager, SdkBackend};
 use crate::opencode_sdk::OpenCodeSdkManager;
+use crate::sdk_adapters::{ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter};
+use crate::sdk_runtime::SdkManager;
 use crate::threads::AgentKind;
 use crate::AppState;
 use base64::Engine;
@@ -53,7 +54,7 @@ pub struct EncryptedGrant {
 #[derive(Clone)]
 pub enum BorrowedManager {
     Acp(Arc<AcpManager>),
-    Sdk(Arc<CodexSdkManager>),
+    Sdk(Arc<SdkManager>),
     OpenCode(Arc<OpenCodeSdkManager>),
 }
 
@@ -368,33 +369,25 @@ pub fn materialize_runtime(
     )?;
     stage_local_skills(&app, expected_kind, &launch_env)?;
     let manager = match expected_kind {
-        AgentKind::Alkaid => BorrowedManager::Sdk(CodexSdkManager::new_with_env(
-            app,
-            SdkBackend::Alkaid,
-            launch_env,
-        )),
+        AgentKind::Alkaid => return Err("Alkaid 暂不支持额度凭据共享".into()),
         AgentKind::Devin => BorrowedManager::Acp(AcpManager::new_with_env(
             app,
             AgentKind::Devin,
             launch_env,
             format!("quota-{thread_id}-"),
         )),
-        AgentKind::Codex | AgentKind::CodexPlus => BorrowedManager::Sdk(
-            CodexSdkManager::new_with_env(app, SdkBackend::Codex, launch_env),
-        ),
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => BorrowedManager::Sdk(
-            CodexSdkManager::new_with_env(app, SdkBackend::CodeBuddy, launch_env),
-        ),
-        AgentKind::ClaudeCode => BorrowedManager::Sdk(CodexSdkManager::new_with_env(
-            app,
-            SdkBackend::Claude,
-            launch_env,
-        )),
-        AgentKind::Cursor => BorrowedManager::Sdk(CodexSdkManager::new_with_env(
-            app,
-            SdkBackend::Cursor,
-            launch_env,
-        )),
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            BorrowedManager::Sdk(SdkManager::new_with_env(app, CodexAdapter, launch_env))
+        }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            BorrowedManager::Sdk(SdkManager::new_with_env(app, CodeBuddyAdapter, launch_env))
+        }
+        AgentKind::ClaudeCode => {
+            BorrowedManager::Sdk(SdkManager::new_with_env(app, ClaudeAdapter, launch_env))
+        }
+        AgentKind::Cursor => {
+            BorrowedManager::Sdk(SdkManager::new_with_env(app, CursorAdapter, launch_env))
+        }
         AgentKind::OpenCode | AgentKind::OpenCodePlus => {
             BorrowedManager::OpenCode(OpenCodeSdkManager::new_with_env(app, launch_env))
         }

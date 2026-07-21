@@ -65,8 +65,6 @@ pub struct Settings {
     pub editor: String,
     /// 界面皮肤（ink-dark / ink-light，空 = 未设置，由前端 localStorage 迁移）
     pub theme: String,
-    /// 界面风格（modern / classic）；缺省使用 modern。
-    pub ui_style: String,
     /// 会话历史展示方式（project / time）。
     pub history_display_mode: String,
     /// 团队/漫游中转服务地址（空 = 关闭团队/漫游功能）
@@ -80,6 +78,8 @@ pub struct Settings {
     pub remote_control_enabled: bool,
     /// 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>`；空 = 不共享额度。
     pub quota_shared_models: Vec<String>,
+    /// 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>`。
+    pub model_favorites: Vec<String>,
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
@@ -147,13 +147,13 @@ impl Default for Settings {
             share_model: "swe-1.6".into(),
             editor: "code".into(),
             theme: String::new(),
-            ui_style: "modern".into(),
             history_display_mode: "project".into(),
             relay_server: DEFAULT_RELAY_SERVER.into(),
             relay_token: String::new(),
             relay_groups: String::new(),
             remote_control_enabled: false,
             quota_shared_models: Vec::new(),
+            model_favorites: Vec::new(),
             devin_enabled: true,
             alkaid_enabled: true,
             codex_enabled: true,
@@ -198,10 +198,23 @@ mod tests {
     }
 
     #[test]
+    fn model_favorites_survive_reload() {
+        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
+        let mut settings = Settings::default();
+        settings.model_favorites = vec!["codex:gpt-5.6".into()];
+        settings.save(&dir);
+
+        assert_eq!(
+            Settings::load(&dir).model_favorites,
+            settings.model_favorites
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn missing_history_display_mode_defaults_to_project() {
         let settings: Settings = serde_json::from_str(r#"{"theme":"ink-dark"}"#).unwrap();
         assert_eq!(settings.history_display_mode, "project");
-        assert_eq!(settings.ui_style, "modern");
     }
 
     #[test]

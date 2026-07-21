@@ -46,14 +46,8 @@ import { isScratch, scratchParent } from "./utils";
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
 
-/** 界面风格：现代新版（默认）/ 经典旧版 */
-export type UiStylePref = "modern" | "classic";
-
 const THEME_KEY = "fd:theme";
-const UI_STYLE_KEY = "fd:ui-style";
-
-let modernStyleUrl = "";
-let classicStyleUrl = "";
+const MODEL_FAVORITES_KEY = "fd:modelFavorites";
 
 function readThemePref(): ThemePref {
   return localStorage.getItem(THEME_KEY) === "ink-light" ? "ink-light" : "ink-dark";
@@ -63,31 +57,36 @@ function applyThemeToDom(theme: ThemePref) {
   document.documentElement.dataset.theme = theme;
 }
 
-function readUiStylePref(): UiStylePref {
-  return localStorage.getItem(UI_STYLE_KEY) === "classic" ? "classic" : "modern";
+function readModelFavorites(): string[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(MODEL_FAVORITES_KEY) ?? "[]");
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
-function applyUiStyleToDom(style: UiStylePref) {
-  document.documentElement.dataset.uiStyle = style;
-  const link = document.getElementById("nova-ui-style") as HTMLLinkElement | null;
-  if (link) link.href = style === "classic" ? classicStyleUrl : modernStyleUrl;
-}
+/** 模型收藏以 settings.json 为可靠存储，localStorage 仅用于升级兼容和即时兜底。 */
+export const [modelFavoriteIds, setModelFavoriteIds] = createSignal(readModelFavorites());
 
-/** 在首屏渲染前注册两套样式表地址。两套 CSS 互斥加载，确保旧风格与改版前完全一致。 */
-export function configureUiStyles(modern: string, classic: string) {
-  modernStyleUrl = modern;
-  classicStyleUrl = classic;
-  const link = document.createElement("link");
-  link.id = "nova-ui-style";
-  link.rel = "stylesheet";
-  document.head.append(link);
-  return link;
+export function toggleModelFavorite(id: string) {
+  const next = modelFavoriteIds().includes(id)
+    ? modelFavoriteIds().filter((favorite) => favorite !== id)
+    : [...modelFavoriteIds(), id];
+  setModelFavoriteIds(next);
+  localStorage.setItem(MODEL_FAVORITES_KEY, JSON.stringify(next));
+  const settings = state.settings;
+  if (!settings) return;
+  const updated = { ...settings, modelFavorites: next };
+  setState("settings", updated);
+  void api.setSettings(updated).catch(() => {
+    // settings.json 落盘失败时仍保留本次 localStorage 写入，不打断选择模型。
+  });
 }
 
 /** 在首屏渲染前调用，按已保存偏好设置主题，避免明暗闪烁 */
 export function initTheme() {
   applyThemeToDom(readThemePref());
-  applyUiStyleToDom(readUiStylePref());
 }
 
 interface AppStore {
@@ -172,8 +171,6 @@ interface AppStore {
   decisions: Decision[];
   /** 当前界面皮肤 */
   theme: ThemePref;
-  /** 当前界面风格 */
-  uiStyle: UiStylePref;
   /** 后端可用性检测结果（agentKind → 是否可用）。空 = 尚未检测完成（按全部可用处理） */
   backendAvailability: Record<string, boolean>;
 }
@@ -245,16 +242,11 @@ export const [state, setState] = createStore<AppStore>({
   marks: [],
   decisions: [],
   theme: readThemePref(),
-  uiStyle: readUiStylePref(),
   backendAvailability: {},
 });
 
 function isThemePref(v: unknown): v is ThemePref {
   return v === "ink-dark" || v === "ink-light";
-}
-
-function isUiStylePref(v: unknown): v is UiStylePref {
-  return v === "modern" || v === "classic";
 }
 
 /**
@@ -278,24 +270,6 @@ export function setTheme(theme: ThemePref) {
   applyThemeToDom(theme);
   setState("theme", theme);
   persistThemeToBackend(theme);
-}
-
-function persistUiStyleToBackend(uiStyle: UiStylePref) {
-  const s = state.settings;
-  if (!s || s.uiStyle === uiStyle) return;
-  const next = { ...s, uiStyle };
-  setState("settings", next);
-  void api.setSettings(next).catch(() => {
-    // localStorage 仍可保证当前设备上的偏好不丢失
-  });
-}
-
-/** 切换并持久化界面风格，立即更换整套样式表。 */
-export function setUiStyle(uiStyle: UiStylePref) {
-  localStorage.setItem(UI_STYLE_KEY, uiStyle);
-  applyUiStyleToDom(uiStyle);
-  setState("uiStyle", uiStyle);
-  persistUiStyleToBackend(uiStyle);
 }
 
 /**
@@ -1621,6 +1595,9 @@ export async function refreshSlashCommands(agentKind: AgentKind) {
   }
 }
 
+/** 升级重启的会话恢复是否已有结论（恢复完成或确认无需恢复）。启动签名据此等待目标视图稳定。 */
+export const [restoreSettled, setRestoreSettled] = createSignal(false);
+
 export async function initStore() {
   if (initialized) return;
   initialized = true;
@@ -1628,15 +1605,31 @@ export async function initStore() {
   // settings 是本地快照且不依赖事件监听：先并行拉取并尽快写进 store。
   // 后面的 listen 仍照常尽早注册；但不会再因为逐个 await listen 而拖慢设置页回显。
   const settingsReady = api.getSettings().then((settings) => {
+    let resolvedSettings = settings;
+    if (settings.modelFavorites.length > 0) {
+      setModelFavoriteIds(settings.modelFavorites);
+      localStorage.setItem(MODEL_FAVORITES_KEY, JSON.stringify(settings.modelFavorites));
+    } else if (modelFavoriteIds().length > 0) {
+      resolvedSettings = { ...settings, modelFavorites: modelFavoriteIds() };
+      void api.setSettings(resolvedSettings).catch(() => {});
+    }
     const preferredAgent = lastUsed.agentKind();
-    const initialAgent = agentEnabled(settings, preferredAgent)
+    const initialAgent = agentEnabled(resolvedSettings, preferredAgent)
       ? preferredAgent
-      : (ALL_AGENT_KINDS.find((kind) => agentEnabled(settings, kind)) ?? preferredAgent);
-    setState({ settings, agentKind: initialAgent });
+      : (ALL_AGENT_KINDS.find((kind) => agentEnabled(resolvedSettings, kind)) ?? preferredAgent);
+    if (isThemePref(resolvedSettings.theme) && resolvedSettings.theme !== state.theme) {
+      setTheme(resolvedSettings.theme);
+    }
+    setState({ settings: resolvedSettings, agentKind: initialAgent });
     // 后端启动时已把磁盘缓存灌入内存，立即读取，不等待其余事件监听和会话初始化。
     void ensureModelOptions(initialAgent);
-    return { settings, initialAgent };
-  }).catch((error: unknown) => ({ error }));
+    return { settings: resolvedSettings, initialAgent };
+  }).catch((error: unknown) => {
+    // 设置读取失败也不能让窗口永久隐藏；此时沿用 localStorage 的首帧主题。
+    setRestoreSettled(true);
+    void api.showMainWindow().catch(() => {});
+    return { error };
+  });
 
   await listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
     if (e.payload.threadId !== state.currentId) return;
@@ -1939,17 +1932,8 @@ export async function initStore() {
 
   // 主题以后端 settings.json 为准；后端未设置（老版本/首次升级）时，
   // 把当前 localStorage 里的偏好迁移上去，使其成为可靠真相来源。
-  if (isThemePref(settings.theme)) {
-    if (settings.theme !== state.theme) setTheme(settings.theme);
-  } else {
+  if (!isThemePref(settings.theme)) {
     persistThemeToBackend(state.theme);
-  }
-
-  // 界面风格同样以后端配置为准；老版本缺少字段时 Rust 默认值为 modern。
-  if (isUiStylePref(settings.uiStyle)) {
-    if (settings.uiStyle !== state.uiStyle) setUiStyle(settings.uiStyle);
-  } else {
-    persistUiStyleToBackend(state.uiStyle);
   }
 
   // 团队/漫游：settings 一就绪就立刻刷新中转站状态/名单/收件箱/漫游目录。关键是排在下面较慢的
@@ -2005,13 +1989,16 @@ export async function initStore() {
   // 普通启动时后端返回 null，不会恢复任何会话。
   void api
     .takeRestoreThread()
-    .then((id) => {
+    .then(async (id) => {
       if (id && !state.currentId && state.threads.some((t) => t.id === id)) {
-        void openThread(id);
+        await openThread(id).catch(() => {});
       }
     })
-    .catch(() => {
-      // 无恢复标记或读取失败时静默停留在主页
+    .catch(() => {})
+    .finally(() => {
+      // 目标页面已经稳定后再显示窗口，避免升级重启时先露出新会话页。
+      setRestoreSettled(true);
+      void api.showMainWindow().catch(() => {});
     });
 
   // 监听用户交互并节流上报活动，供后端静默升级判断「一段时间没有操作」
