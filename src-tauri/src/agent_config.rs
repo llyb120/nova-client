@@ -134,6 +134,7 @@ fn central_path(config_dir: &Path) -> PathBuf {
 fn normal_targets() -> Result<Vec<Target>, String> {
     let env = HashMap::new();
     [
+        AgentKind::Alkaid,
         AgentKind::Devin,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
@@ -152,6 +153,11 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
         .or_else(user_home_dir)
         .ok_or("无法确定用户主目录")?;
     let (label, path, format) = match kind {
+        AgentKind::Alkaid => (
+            "Alkaid",
+            home.join(".nova").join("alkaid").join("AGENTS.md"),
+            TargetFormat::Markdown,
+        ),
         AgentKind::Devin => {
             #[cfg(windows)]
             let root = configured_dir(overrides, "APPDATA")

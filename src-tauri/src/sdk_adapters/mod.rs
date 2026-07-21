@@ -1,15 +1,17 @@
+mod alkaid;
 mod claude;
 mod codebuddy;
 mod codex;
 mod cursor;
 
+pub use alkaid::AlkaidAdapter;
 pub use claude::ClaudeAdapter;
 pub use codebuddy::CodeBuddyAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
 
 use crate::settings::Settings;
-use crate::threads::{AgentKind, CodexUsageSnapshot};
+use crate::threads::{AgentKind, CodexUsageSnapshot, ToolCall};
 use serde_json::{json, Value};
 
 pub struct LaunchConfig {
@@ -44,6 +46,18 @@ pub trait SdkAdapter: Send + Sync {
 
     fn uses_text_deltas(&self) -> bool {
         false
+    }
+
+    fn cancel_grace_attempts(&self) -> usize {
+        2
+    }
+
+    fn done_is_cancelled(&self, _event: &Value) -> bool {
+        false
+    }
+
+    fn map_tool_call(&self, _value: &Value) -> Option<ToolCall> {
+        None
     }
 
     fn empty_model_options(&self) -> Value {

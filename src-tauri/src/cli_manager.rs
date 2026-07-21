@@ -108,6 +108,17 @@ fn configured_cli_program(configured: &str, expected_names: &[&str], fallback: &
 
 fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
     match kind {
+        AgentKind::Alkaid => CliSpec {
+            kind: kind.clone(),
+            cli_name: "alkaid",
+            program: "node".into(),
+            version_args: vec!["--version".into()],
+            install_program: String::new(),
+            install_args: Vec::new(),
+            upgrade_program: String::new(),
+            upgrade_args: Vec::new(),
+            proxy: String::new(),
+        },
         AgentKind::Devin => {
             let program = configured_cli_program(&settings.devin_path, &["devin"], "devin");
             #[cfg(windows)]
@@ -571,6 +582,7 @@ pub async fn statuses(settings: &Settings) -> Vec<CliStatus> {
 
 async fn stop_backend(state: &AppState, kind: &AgentKind) {
     match kind {
+        AgentKind::Alkaid => state.alkaid.shutdown(),
         AgentKind::Devin => state.acp.restart().await,
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codexplus.shutdown();

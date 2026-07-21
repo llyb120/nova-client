@@ -43,7 +43,7 @@ use codex::CodexManager;
 use credential_roaming::{BorrowedManager, BorrowedRuntime};
 use opencode_sdk::OpenCodeSdkManager;
 use relay::{RelayManager, Share};
-use sdk_adapters::{ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter};
+use sdk_adapters::{AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter};
 use sdk_runtime::SdkManager;
 use serde_json::{json, Value};
 use settings::Settings;
@@ -88,6 +88,8 @@ pub struct AppState {
     /// OpenCode 官方 SDK 对应的 HTTP API 后端，不经过 ACP。
     pub opencodeplus: Arc<OpenCodeSdkManager>,
     pub codex: Arc<CodexManager>,
+    /// Alkaid 自研 pi agent 后端。
+    pub alkaid: Arc<SdkManager>,
     /// Codex 官方 TypeScript SDK 后端，不经过 app-server 集成层。
     pub codexplus: Arc<SdkManager>,
     /// CodeBuddy 官方 Agent SDK 后端。
@@ -144,6 +146,7 @@ impl AppState {
     pub fn agent_enabled(&self, kind: &AgentKind) -> bool {
         let s = self.settings.lock().unwrap();
         match kind {
+            AgentKind::Alkaid => s.alkaid_enabled,
             AgentKind::Devin => s.devin_enabled,
             AgentKind::Codex => s.codex_enabled,
             AgentKind::CodexPlus => s.codexplus_enabled,
@@ -209,6 +212,21 @@ impl AppState {
                 .generate_title_async(thread_id, prompt, fallback, String::new());
             return;
         }
+        if AgentKind::from_str(&agent_raw) == Some(AgentKind::Alkaid)
+            && self.agent_enabled(&AgentKind::Alkaid)
+        {
+            self.alkaid
+                .generate_title_async(thread_id, prompt, fallback, model);
+            return;
+        }
+        if agent_raw.is_empty()
+            && origin == &AgentKind::Alkaid
+            && self.agent_enabled(&AgentKind::Alkaid)
+        {
+            self.alkaid
+                .generate_title_async(thread_id, prompt, fallback, String::new());
+            return;
+        }
         if matches!(
             AgentKind::from_str(&agent_raw),
             Some(AgentKind::Codex | AgentKind::CodexPlus)
@@ -259,6 +277,7 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
             .unwrap_or(false);
     }
     match thread.agent_kind {
+        AgentKind::Alkaid => state.alkaid.is_running(&thread.id),
         AgentKind::Devin => state.acp.is_running(&thread.id),
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.is_running(&thread.id),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
@@ -372,6 +391,7 @@ fn any_employee_working(state: &AppState) -> bool {
 pub(crate) async fn shutdown_agent_processes(state: &AppState) {
     state.acp.kill_conn().await;
     state.codex.kill_conn().await;
+    state.alkaid.shutdown();
     state.codexplus.shutdown();
     state.codebuddyplus.shutdown();
     state.claudeplus.shutdown();
@@ -1161,9 +1181,9 @@ fn codex_skill_roots(config_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
+fn list_skill_commands(roots: Vec<PathBuf>, fallback_description: &str) -> Vec<Value> {
     let mut files = Vec::new();
-    for root in codex_skill_roots(config_dir) {
+    for root in roots {
         collect_skill_files(&root, 4, &mut files);
     }
 
@@ -1182,7 +1202,7 @@ fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
             continue;
         }
         let description = frontmatter_value(&contents, "description")
-            .unwrap_or_else(|| "Codex skill".to_string());
+            .unwrap_or_else(|| fallback_description.to_string());
         skills.entry(name.clone()).or_insert_with(|| {
             json!({
                 "name": name,
@@ -1201,6 +1221,17 @@ fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
             .cmp(b["name"].as_str().unwrap_or_default())
     });
     values
+}
+
+fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
+    list_skill_commands(codex_skill_roots(config_dir), "Codex skill")
+}
+
+fn list_alkaid_skill_commands(config_dir: &Path) -> Vec<Value> {
+    list_skill_commands(
+        vec![config_dir.join("alkaid").join("skills")],
+        "Alkaid skill",
+    )
 }
 
 /// worktree 工作目录的根：优先设置里的自定义路径，为空则回退应用数据目录下的 worktrees/。
@@ -1636,6 +1667,7 @@ fn remove_worktree(
         for tid in &doomed {
             state.acp.forget_session_of_thread(tid);
             state.codex.forget_session_of_thread(tid);
+            state.alkaid.forget_session_of_thread(tid);
             state.codexplus.forget_session_of_thread(tid);
             state.codebuddyplus.forget_session_of_thread(tid);
             state.claudeplus.forget_session_of_thread(tid);
@@ -1761,6 +1793,12 @@ async fn merge_worktree_thread(
                 wt.branch
             );
             match agent_kind {
+                AgentKind::Alkaid => {
+                    let mgr = state.alkaid.clone();
+                    tauri::async_runtime::spawn(async move {
+                        mgr.run_prompt(thread_id, prompt, vec![]).await;
+                    });
+                }
                 AgentKind::Devin => {
                     let mgr = state.acp.clone();
                     tauri::async_runtime::spawn(async move {
@@ -2443,6 +2481,7 @@ fn set_thread_model(
         });
     } else {
         match agent_kind {
+            AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&thread_id),
             AgentKind::Codex | AgentKind::CodexPlus => {
                 state.codexplus.forget_session_of_thread(&thread_id)
             }
@@ -2641,6 +2680,7 @@ async fn get_model_options(
         return Err(format!("{} 后端已关闭", agent_kind.label()));
     }
     match agent_kind {
+        AgentKind::Alkaid => state.alkaid.ensure_model_options().await.map(Some),
         AgentKind::Devin => state.acp.ensure_model_options().await.map(Some),
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codex.ensure_model_options().await.map(Some)
@@ -2666,6 +2706,7 @@ async fn get_slash_commands(
         return Ok(Vec::new());
     }
     match agent_kind {
+        AgentKind::Alkaid => Ok(list_alkaid_skill_commands(&state.config_dir)),
         AgentKind::Devin => {
             let commands = state.acp.fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
@@ -2780,6 +2821,18 @@ pub(crate) fn dispatch_prompt(
         return Ok(());
     }
     match agent_kind {
+        AgentKind::Alkaid => {
+            let mgr = state.alkaid.clone();
+            if mgr.is_running(&thread_id) {
+                tauri::async_runtime::spawn(async move {
+                    mgr.steer_prompt(thread_id, text, images).await;
+                });
+            } else {
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(thread_id, text, images).await;
+                });
+            }
+        }
         AgentKind::Codex | AgentKind::CodexPlus => {
             let mgr = state.codexplus.clone();
             if mgr.is_running(&thread_id) {
@@ -3138,6 +3191,7 @@ async fn cancel_turn(
     }
     let kind = agent_kind_for_thread(&state, &thread_id)?;
     match kind {
+        AgentKind::Alkaid => state.alkaid.cancel(&thread_id).await,
         AgentKind::Devin => state.acp.cancel(&thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(&thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
@@ -3573,6 +3627,7 @@ async fn summarize_clue(
     }
     state.acp.forget_session_of_thread(&run_id);
     state.codex.forget_session_of_thread(&run_id);
+    state.alkaid.forget_session_of_thread(&run_id);
     state.codexplus.forget_session_of_thread(&run_id);
     state.codebuddyplus.forget_session_of_thread(&run_id);
     state.claudeplus.forget_session_of_thread(&run_id);
@@ -3835,6 +3890,7 @@ fn respond_roam_request(
 async fn restart_devin(state: State<'_, AppState>) -> Result<(), String> {
     state.acp.restart().await;
     state.codex.restart().await;
+    state.alkaid.shutdown();
     state.codexplus.shutdown();
     state.codebuddyplus.shutdown();
     state.claudeplus.shutdown();
@@ -4812,6 +4868,7 @@ pub fn run() {
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
+            let alkaid = SdkManager::new(app.handle().clone(), AlkaidAdapter);
             let codexplus = SdkManager::new(app.handle().clone(), CodexAdapter);
             let codebuddyplus = SdkManager::new(app.handle().clone(), CodeBuddyAdapter);
             let claudeplus = SdkManager::new(app.handle().clone(), ClaudeAdapter);
@@ -4839,6 +4896,7 @@ pub fn run() {
                 acp,
                 opencodeplus,
                 codex,
+                alkaid,
                 codexplus,
                 codebuddyplus,
                 claudeplus,
@@ -4890,6 +4948,9 @@ pub fn run() {
                     state.opencodeplus.seed_model_options(v);
                 }
                 state.opencodeplus.spawn_revalidate_model_options();
+                if let Some(v) = model_cache::load(&dir, AgentKind::Alkaid.as_str()) {
+                    state.alkaid.seed_model_options(v);
+                }
                 if let Some(v) = model_cache::load(&dir, "codex") {
                     state.codex.seed_model_options(v);
                 }
@@ -4909,6 +4970,7 @@ pub fn run() {
                 }
                 let default_kind = [
                     AgentKind::Devin,
+                    AgentKind::Alkaid,
                     AgentKind::Codex,
                     AgentKind::CodeBuddy,
                     AgentKind::ClaudeCode,
@@ -4924,6 +4986,9 @@ pub fn run() {
                 if server::is_headless() {
                     if state.agent_enabled(&AgentKind::Devin) {
                         state.acp.spawn_revalidate_model_options();
+                    }
+                    if state.agent_enabled(&AgentKind::Alkaid) {
+                        state.alkaid.spawn_revalidate_model_options();
                     }
                     if state.agent_enabled(&AgentKind::Codex) {
                         state.codex.spawn_revalidate_model_options();
@@ -4944,6 +5009,7 @@ pub fn run() {
                     // 与 get_model_options 共用 refreshing 闸门，避免桌面启动时双开探测 session
                     match default_kind {
                         AgentKind::Devin => state.acp.spawn_revalidate_model_options(),
+                        AgentKind::Alkaid => state.alkaid.spawn_revalidate_model_options(),
                         AgentKind::Codex | AgentKind::CodexPlus => {
                             state.codex.spawn_revalidate_model_options()
                         }

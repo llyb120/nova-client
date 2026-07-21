@@ -339,17 +339,37 @@ impl SdkManager {
         if self.is_running(thread_id) {
             self.push_system(thread_id, "已停止当前任务。".into(), "warn");
         }
-        let stdin = self
+        let bridge = self
             .running_children
             .lock()
             .unwrap()
             .get(thread_id)
-            .map(|bridge| bridge.stdin.clone());
-        if let Some(stdin) = stdin {
+            .map(|bridge| (bridge.stdin.clone(), bridge.pid));
+        let target_pid = bridge.as_ref().and_then(|(_, pid)| *pid);
+        if let Some((stdin, _)) = bridge {
             let _ = write_line(&stdin, &json!({ "action": "cancel" })).await;
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            for _ in 0..self.adapter.cancel_grace_attempts() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let target_is_running = self
+                    .running_children
+                    .lock()
+                    .unwrap()
+                    .get(thread_id)
+                    .is_some_and(|bridge| bridge.pid == target_pid);
+                if !target_is_running {
+                    break;
+                }
+            }
         }
-        if let Some(bridge) = self.running_children.lock().unwrap().remove(thread_id) {
+        let bridge = {
+            let mut running = self.running_children.lock().unwrap();
+            running
+                .get(thread_id)
+                .is_some_and(|bridge| bridge.pid == target_pid)
+                .then(|| running.remove(thread_id))
+                .flatten()
+        };
+        if let Some(bridge) = bridge {
             if let Some(pid) = bridge.pid {
                 crate::acp::kill_process_tree(pid);
             }
@@ -585,18 +605,31 @@ impl SdkManager {
             .flatten()
             .map(Ok)
             .unwrap_or_else(|| self.spawn_idle_bridge(cwd))?;
-        write_line(&bridge.stdin, &request).await?;
+        let pid = bridge.child.id();
         self.running_children.lock().unwrap().insert(
             thread_id.to_string(),
             RunningBridge {
                 stdin: bridge.stdin.clone(),
-                pid: bridge.child.id(),
+                pid,
             },
         );
+        if let Err(error) = write_line(&bridge.stdin, &request).await {
+            self.running_children.lock().unwrap().remove(thread_id);
+            kill_child(&mut bridge.child);
+            return Err(error);
+        }
         let result = self
             .read_events(thread_id, user_item_id, run_epoch, &mut bridge.stdout)
             .await;
-        self.running_children.lock().unwrap().remove(thread_id);
+        {
+            let mut running = self.running_children.lock().unwrap();
+            if running
+                .get(thread_id)
+                .is_some_and(|bridge| bridge.pid == pid)
+            {
+                running.remove(thread_id);
+            }
+        }
         let result = result.map_err(|error| {
             let status = bridge
                 .child
@@ -726,7 +759,12 @@ impl SdkManager {
                 Some("permission") => self.emit_permission(thread_id, &event["permission"]),
                 Some("done") => {
                     let usage = event.get("usage").cloned();
-                    self.finish_turn_if_current(thread_id, run_epoch, "end_turn", usage);
+                    let stop_reason = if self.adapter.done_is_cancelled(&event) {
+                        "cancelled"
+                    } else {
+                        "end_turn"
+                    };
+                    self.finish_turn_if_current(thread_id, run_epoch, stop_reason, usage);
                     return Ok(());
                 }
                 _ => {}
@@ -886,12 +924,18 @@ impl SdkManager {
             | Some("todo_list") => Some(Item::Tool {
                 id,
                 ts: now_ms(),
-                call: tool_call(value),
+                call: self
+                    .adapter
+                    .map_tool_call(value)
+                    .unwrap_or_else(|| tool_call(value)),
             }),
             Some(_) => Some(Item::Tool {
                 id,
                 ts: now_ms(),
-                call: tool_call(value),
+                call: self
+                    .adapter
+                    .map_tool_call(value)
+                    .unwrap_or_else(|| tool_call(value)),
             }),
             None => None,
         };

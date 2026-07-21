@@ -7,8 +7,9 @@
     "dev": "vite",
     "dev:tauri": "npm run build:sdk-bridges && vite",
     "build": "npm run build:sdk-bridges && vite build",
-    "build:sdk-bridges": "npm run build:opencode-bridge && npm run build:codex-bridge && npm run build:codebuddy-bridge && npm run build:claude-bridge && npm run build:cursor-bridge",
+    "build:sdk-bridges": "npm run build:opencode-bridge && npm run build:alkaid-bridge && npm run build:codex-bridge && npm run build:codebuddy-bridge && npm run build:claude-bridge && npm run build:cursor-bridge",
     "build:opencode-bridge": "esbuild scripts/opencode-bridge.mjs --bundle --platform=node --format=cjs --outfile=src-tauri/resources/opencode-bridge.cjs",
+    "build:alkaid-bridge": "esbuild scripts/alkaid-bridge.mjs --bundle --platform=node --format=esm --banner:js=\"import{createRequire as __novaCreateRequire}from'node:module';const require=__novaCreateRequire(import.meta.url);\" --outfile=src-tauri/resources/alkaid-bridge.mjs",
     "build:codex-bridge": "esbuild scripts/codex-bridge.mjs --bundle --platform=node --format=esm --outfile=src-tauri/resources/codex-bridge.mjs",
     "build:codebuddy-bridge": "esbuild scripts/codebuddy-bridge.mjs --bundle --platform=node --format=cjs --outfile=src-tauri/resources/codebuddy-bridge.cjs",
     "build:claude-bridge": "esbuild scripts/claude-bridge.mjs --bundle --platform=node --format=esm --outfile=src-tauri/resources/claude-bridge.mjs",
@@ -16,7 +17,9 @@
     "check": "tsc --noEmit",
     "preview": "vite preview",
     "tauri": "tauri",
-    "package": "python scripts/package.py"
+    "package": "python scripts/package.py",
+    "alkaid": "node scripts/alkaid.mjs",
+    "test:alkaid": "node --test scripts/alkaid.test.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.2",
@@ -32,6 +35,10 @@
     "@fontsource-variable/inter": "^5.2.8",
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@fontsource-variable/noto-sans-sc": "^5.2.10",
+    "@earendil-works/pi-agent-core": "^0.80.10",
+    "@earendil-works/pi-ai": "^0.80.10",
+    "@earendil-works/pi-coding-agent": "^0.80.10",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "^0.144.5",
     "@opencode-ai/sdk": "^1.18.4",
     "@tauri-apps/api": "^2.11.0",
@@ -40,6 +47,7 @@
     "diff": "^9.0.0",
     "dompurify": "^3.4.9",
     "marked": "^18.0.5",
-    "solid-js": "^1.9.13"
+    "solid-js": "^1.9.13",
+    "typebox": "^1.1.38"
   }
 }
