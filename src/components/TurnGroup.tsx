@@ -162,21 +162,6 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
     return b.length ? b[b.length - 1].id : -1;
   };
 
-  // 首字前 / 引导后新开轮：还没有任何模型输出时给轻量「思考中…」。
-  // 后端若已推送同文案的 thought 占位则不再重复。
-  const showWaiting = () => {
-    if (!props.active) return false;
-    const b = props.group.body;
-    if (b.some((i) => i.type === "thought" && i.text === "思考中…")) return false;
-    return !b.some(
-      (i) =>
-        i.type === "assistant" ||
-        i.type === "thought" ||
-        i.type === "tool" ||
-        i.type === "system",
-    );
-  };
-
   // 当最后一行只是上一句 assistant 进度说明、实际仍在上方工具卡片里跑时，
   // 在底部补一个轻量活动尾标，避免用户看到“最后一句不动”误以为卡死。
   const showLiveTail = () => {
@@ -236,9 +221,6 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
             </div>
           </Show>
         </Show>
-      </Show>
-      <Show when={showWaiting()}>
-        <div class="msg msg-thought thinking">思考中…</div>
       </Show>
       <Show when={showLiveTail()}>
         <div class="turn-live-tail">

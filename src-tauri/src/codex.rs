@@ -243,7 +243,6 @@ pub struct CodexManager {
     turn_usage: StdMutex<HashMap<String, Value>>,
     /// 轮次进行中收到的 error 通知文案（turnId -> 最近一条），轮次失败时作为兜底展示
     turn_errors: StdMutex<HashMap<String, String>>,
-    turn_reasoning_items: StdMutex<HashMap<String, String>>,
     pending_permissions: StdMutex<HashMap<String, PendingCodexPermission>>,
     prewarmed: StdMutex<HashMap<String, String>>,
     prewarming: StdMutex<HashSet<String>>,
@@ -286,7 +285,6 @@ impl CodexManager {
             turn_waiters: StdMutex::new(HashMap::new()),
             turn_usage: StdMutex::new(HashMap::new()),
             turn_errors: StdMutex::new(HashMap::new()),
-            turn_reasoning_items: StdMutex::new(HashMap::new()),
             pending_permissions: StdMutex::new(HashMap::new()),
             prewarmed: StdMutex::new(HashMap::new()),
             prewarming: StdMutex::new(HashSet::new()),
@@ -478,7 +476,6 @@ impl CodexManager {
         self.item_ids.lock().unwrap().clear();
         self.tool_outputs.lock().unwrap().clear();
         self.turn_errors.lock().unwrap().clear();
-        self.turn_reasoning_items.lock().unwrap().clear();
         self.manual_compacting.lock().unwrap().clear();
         let waiters: Vec<_> = self.turn_waiters.lock().unwrap().drain().collect();
         for (_, tx) in waiters {
@@ -729,7 +726,6 @@ impl CodexManager {
         self.item_ids.lock().unwrap().clear();
         self.tool_outputs.lock().unwrap().clear();
         self.turn_errors.lock().unwrap().clear();
-        self.turn_reasoning_items.lock().unwrap().clear();
         self.manual_compacting.lock().unwrap().clear();
         *self.threads_spawned.lock().unwrap() = 0;
         *self.agent_info.lock().unwrap() = None;
@@ -901,7 +897,6 @@ impl CodexManager {
                 .lock()
                 .unwrap()
                 .insert(thread_id.clone(), turn_id.to_string());
-            self.set_turn_waiting_item(&thread_id);
         }
     }
 
@@ -917,7 +912,6 @@ impl CodexManager {
         // 它没有注册 turn_waiter，这里仅清理并解除忙碌态，不写入轮次统计。
         if self.manual_compacting.lock().unwrap().contains(&thread_id) {
             self.turn_usage.lock().unwrap().remove(&turn_id);
-            self.remove_turn_reasoning_item(&thread_id, &turn_id);
             self.turn_errors.lock().unwrap().remove(&turn_id);
             self.finish_manual_compaction(&thread_id);
             return;
@@ -931,7 +925,6 @@ impl CodexManager {
         }
         .to_string();
         let usage = self.turn_usage.lock().unwrap().remove(&turn_id);
-        self.remove_turn_reasoning_item(&thread_id, &turn_id);
         let captured = self.turn_errors.lock().unwrap().remove(&turn_id);
         // 失败轮次：优先取 turn.error，其次取进行中捕获的 error 通知，最后兜底文案
         let error = if status == "failed" {
@@ -988,6 +981,9 @@ impl CodexManager {
     }
 
     fn on_text_delta(&self, params: &Value, thought: bool) {
+        if thought {
+            return;
+        }
         let remote_thread_id = params["threadId"]
             .as_str()
             .or_else(|| params["conversationId"].as_str())
@@ -1003,12 +999,7 @@ impl CodexManager {
         let Some(thread_id) = self.local_thread_id(remote_thread_id) else {
             return;
         };
-        if thought {
-            self.set_thinking_item(&thread_id, item_id);
-            return;
-        }
-        self.remove_current_turn_reasoning_item(&thread_id);
-        self.append_text_item(&thread_id, item_id, delta, thought);
+        self.append_text_item(&thread_id, item_id, delta);
     }
 
     fn on_tool_output_delta(&self, params: &Value) {
@@ -1089,7 +1080,7 @@ impl CodexManager {
             .emit(EV_UPDATE, json!({ "threadId": thread_id, "op": op }));
     }
 
-    fn append_text_item(&self, thread_id: &str, remote_item_id: &str, text: String, thought: bool) {
+    fn append_text_item(&self, thread_id: &str, remote_item_id: &str, text: String) {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         let Some(thread) = store.get_mut(thread_id) else {
@@ -1099,16 +1090,7 @@ impl CodexManager {
         if let Some(local_id) = local_id {
             for item in thread.items.iter_mut().rev() {
                 match item {
-                    Item::Assistant { id, text: t, .. } if *id == local_id && !thought => {
-                        t.push_str(&text);
-                        thread.updated_at = now_ms();
-                        self.emit_update(
-                            thread_id,
-                            json!({ "t": "delta", "itemId": local_id, "text": text }),
-                        );
-                        return;
-                    }
-                    Item::Thought { id, text: t, .. } if *id == local_id && thought => {
+                    Item::Assistant { id, text: t, .. } if *id == local_id => {
                         t.push_str(&text);
                         thread.updated_at = now_ms();
                         self.emit_update(
@@ -1126,18 +1108,10 @@ impl CodexManager {
             self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
         }
         let id = thread.next_item_id();
-        let item = if thought {
-            Item::Thought {
-                id,
-                text,
-                ts: now_ms(),
-            }
-        } else {
-            Item::Assistant {
-                id,
-                text,
-                ts: now_ms(),
-            }
+        let item = Item::Assistant {
+            id,
+            text,
+            ts: now_ms(),
         };
         self.item_ids
             .lock()
@@ -1200,30 +1174,22 @@ impl CodexManager {
             "agentMessage" => {
                 let text = remote_item["text"].as_str().unwrap_or_default().to_string();
                 if !text.is_empty() {
-                    self.remove_current_turn_reasoning_item(thread_id);
-                    self.set_text_item(thread_id, remote_id, text, false);
+                    self.set_text_item(thread_id, remote_id, text);
                 }
             }
-            "reasoning" => {
-                if completed {
-                    self.remove_text_item(thread_id, remote_id, true);
-                } else {
-                    self.set_thinking_item(thread_id, remote_id);
-                }
-            }
+            "reasoning" => {}
             "plan" => {
                 // Plan 模式的 proposed plan：以正文展示（不是思考折叠），
                 // item/completed 的 text 为权威终稿；流式靠 item/plan/delta。
                 let text = remote_item["text"].as_str().unwrap_or_default().to_string();
                 if !text.is_empty() {
-                    self.remove_current_turn_reasoning_item(thread_id);
-                    self.set_text_item(thread_id, remote_id, text.clone(), false);
+                    self.set_text_item(thread_id, remote_id, text.clone());
                 }
                 if completed {
                     let final_text = if !text.is_empty() {
                         Some(text)
                     } else {
-                        self.local_text_item(thread_id, remote_id, false)
+                        self.local_text_item(thread_id, remote_id)
                     };
                     if let Some(final_text) = final_text.filter(|t| !t.trim().is_empty()) {
                         self.emit_proposed_plan(thread_id, Some(final_text));
@@ -1232,43 +1198,26 @@ impl CodexManager {
             }
             "commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall" | "webSearch"
             | "imageGeneration" => {
-                if !completed {
-                    self.remove_current_turn_reasoning_item(thread_id);
-                }
                 let item = self.tool_item_from_codex(thread_id, remote_item);
                 self.upsert_tool_item(thread_id, remote_id, item, save_on_complete);
-                if completed {
-                    self.set_turn_waiting_item(thread_id);
-                }
             }
             // 上下文压缩（自动触发或手动 thread/compact/start）：以分隔条形式展示进度
             "contextCompaction" => {
-                if !completed {
-                    self.remove_current_turn_reasoning_item(thread_id);
-                }
                 self.set_compaction_item(thread_id, remote_id, completed);
             }
             _ => {}
         }
     }
 
-    /// 读取已落库的 assistant/thought 正文（plan 终稿为空时回退用）
-    fn local_text_item(
-        &self,
-        thread_id: &str,
-        remote_item_id: &str,
-        thought: bool,
-    ) -> Option<String> {
+    /// 读取已落库的 assistant 正文（plan 终稿为空时回退用）
+    fn local_text_item(&self, thread_id: &str, remote_item_id: &str) -> Option<String> {
         let local_id = self.item_ids.lock().unwrap().get(remote_item_id).cloned()?;
         let state = self.app.state::<AppState>();
         let store = state.store.lock().unwrap();
         let thread = store.get(thread_id)?;
         for item in thread.items.iter().rev() {
             match item {
-                Item::Assistant { id, text, .. } if *id == local_id && !thought => {
-                    return Some(text.clone());
-                }
-                Item::Thought { id, text, .. } if *id == local_id && thought => {
+                Item::Assistant { id, text, .. } if *id == local_id => {
                     return Some(text.clone());
                 }
                 _ => {}
@@ -1277,7 +1226,7 @@ impl CodexManager {
         None
     }
 
-    fn set_text_item(&self, thread_id: &str, remote_item_id: &str, text: String, thought: bool) {
+    fn set_text_item(&self, thread_id: &str, remote_item_id: &str, text: String) {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         let Some(thread) = store.get_mut(thread_id) else {
@@ -1287,13 +1236,7 @@ impl CodexManager {
         if let Some(local_id) = local_id {
             for item in thread.items.iter_mut().rev() {
                 match item {
-                    Item::Assistant { id, text: t, .. } if *id == local_id && !thought => {
-                        *t = text;
-                        let snapshot = item.clone();
-                        self.emit_update(thread_id, json!({ "t": "upsert", "item": snapshot }));
-                        return;
-                    }
-                    Item::Thought { id, text: t, .. } if *id == local_id && thought => {
+                    Item::Assistant { id, text: t, .. } if *id == local_id => {
                         *t = text;
                         let snapshot = item.clone();
                         self.emit_update(thread_id, json!({ "t": "upsert", "item": snapshot }));
@@ -1308,18 +1251,10 @@ impl CodexManager {
             self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
         }
         let id = thread.next_item_id();
-        let item = if thought {
-            Item::Thought {
-                id,
-                text,
-                ts: now_ms(),
-            }
-        } else {
-            Item::Assistant {
-                id,
-                text,
-                ts: now_ms(),
-            }
+        let item = Item::Assistant {
+            id,
+            text,
+            ts: now_ms(),
         };
         self.item_ids
             .lock()
@@ -1328,67 +1263,6 @@ impl CodexManager {
         thread.items.push(item.clone());
         thread.updated_at = now_ms();
         self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
-    }
-
-    fn set_thinking_item(&self, thread_id: &str, remote_item_id: &str) {
-        if remote_item_id.is_empty() {
-            return;
-        }
-        if let Some(turn_id) = self.active_turns.lock().unwrap().get(thread_id).cloned() {
-            let previous = self
-                .turn_reasoning_items
-                .lock()
-                .unwrap()
-                .insert(turn_id, remote_item_id.to_string());
-            if let Some(previous) = previous.filter(|id| id != remote_item_id) {
-                self.remove_text_item(thread_id, &previous, true);
-            }
-        }
-        self.set_text_item(thread_id, remote_item_id, "思考中…".to_string(), true);
-    }
-
-    fn set_turn_waiting_item(&self, thread_id: &str) {
-        let turn_id = self.active_turns.lock().unwrap().get(thread_id).cloned();
-        if let Some(turn_id) = turn_id {
-            let remote_item_id = format!("turn-waiting-{turn_id}");
-            self.set_thinking_item(thread_id, &remote_item_id);
-        }
-    }
-
-    fn remove_current_turn_reasoning_item(&self, thread_id: &str) {
-        let turn_id = self.active_turns.lock().unwrap().get(thread_id).cloned();
-        if let Some(turn_id) = turn_id {
-            self.remove_turn_reasoning_item(thread_id, &turn_id);
-        }
-    }
-
-    fn remove_turn_reasoning_item(&self, thread_id: &str, turn_id: &str) {
-        let remote_item_id = self.turn_reasoning_items.lock().unwrap().remove(turn_id);
-        if let Some(remote_item_id) = remote_item_id {
-            self.remove_text_item(thread_id, &remote_item_id, true);
-        }
-    }
-
-    fn remove_text_item(&self, thread_id: &str, remote_item_id: &str, thought: bool) {
-        let local_id = self.item_ids.lock().unwrap().remove(remote_item_id);
-        let Some(local_id) = local_id else {
-            return;
-        };
-        let state = self.app.state::<AppState>();
-        let mut store = state.store.lock().unwrap();
-        let Some(thread) = store.get_mut(thread_id) else {
-            return;
-        };
-        let before = thread.items.len();
-        thread.items.retain(|item| match item {
-            Item::Assistant { id, .. } if *id == local_id && !thought => false,
-            Item::Thought { id, .. } if *id == local_id && thought => false,
-            _ => true,
-        });
-        if thread.items.len() != before {
-            thread.updated_at = now_ms();
-            self.emit_update(thread_id, json!({ "t": "remove", "itemId": local_id }));
-        }
     }
 
     fn upsert_tool_item(
@@ -2034,7 +1908,6 @@ impl CodexManager {
             .lock()
             .unwrap()
             .insert(thread_id.to_string(), turn_id.clone());
-        self.set_turn_waiting_item(thread_id);
         let (tx, rx) = oneshot::channel();
         self.turn_waiters
             .lock()
@@ -2089,7 +1962,6 @@ impl CodexManager {
         }
         self.mark_plan_interrupted(&thread_id, "interrupted", false);
         self.emit_proposed_plan(&thread_id, None);
-        self.set_turn_waiting_item(&thread_id);
         let _ = self.app.emit(EV_THREADS, json!({}));
         let input = build_user_input(&text, &images);
         let mgr = self.clone();
@@ -2148,8 +2020,6 @@ impl CodexManager {
 
     async fn force_finish(&self, thread_id: &str, msg: &str) {
         self.mark_plan_interrupted(thread_id, "cancelled", true);
-        // 清掉本轮残留的「思考中…」占位，避免停止后界面仍显示在思考。
-        self.remove_current_turn_reasoning_item(thread_id);
         {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
