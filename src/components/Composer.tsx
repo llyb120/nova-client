@@ -14,7 +14,7 @@ import type { AgentKind, PromptImage } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
-import { IconFile, IconSend, IconStop } from "./icons";
+import { IconFile, IconSend, IconStop, IconUsers } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
@@ -73,6 +73,15 @@ export function Composer() {
   const providerName = () => agentLabel(state.agentKind);
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
   const [stopReason, setStopReason] = createSignal("");
+  const [employeeMenuOpen, setEmployeeMenuOpen] = createSignal(false);
+  const [selectedEmployeeId, setSelectedEmployeeId] = createSignal<string | null>(null);
+  const selectedEmployee = createMemo(() =>
+    state.employees.find((employee) => employee.id === selectedEmployeeId()) ?? null,
+  );
+  const isOrdinaryThread = () => {
+    const thread = state.threads.find((item) => item.id === state.currentId);
+    return !!thread && !thread.employeeId && !thread.roamingRole && !thread.quotaPeerName;
+  };
   const requestStop = () => {
     const thread = state.threads.find((item) => item.id === state.currentId);
     if (thread?.employeeId && !thread.mindThread) {
@@ -223,7 +232,10 @@ export function Composer() {
     setHistoryOpen(false);
     attach.clear();
     if (textareaRef) textareaRef.style.height = "auto";
-    void sendPrompt(value, images);
+    const employeeId = isOrdinaryThread() ? selectedEmployeeId() : null;
+    setSelectedEmployeeId(null);
+    setEmployeeMenuOpen(false);
+    void sendPrompt(value, images, employeeId);
   };
 
   const insertSlashSuggestion = (item: SlashSuggestion) => {
@@ -444,6 +456,53 @@ export function Composer() {
           />
         </Show>
         <span class="bar-spacer" />
+        <Show when={isOrdinaryThread() && state.employees.length > 0}>
+          <div class="composer-employee-picker">
+            <Show when={employeeMenuOpen()}>
+              <div class="composer-employee-menu">
+                <div class="composer-employee-head">本次工作交给</div>
+                <button
+                  type="button"
+                  classList={{ "composer-employee-item": true, active: !selectedEmployeeId() }}
+                  onClick={() => {
+                    setSelectedEmployeeId(null);
+                    setEmployeeMenuOpen(false);
+                  }}
+                >
+                  <span>普通会话</span>
+                  <small>直接由当前模型执行</small>
+                </button>
+                <For each={state.employees.filter((employee) => employee.enabled)}>
+                  {(employee) => (
+                    <button
+                      type="button"
+                      classList={{
+                        "composer-employee-item": true,
+                        active: selectedEmployeeId() === employee.id,
+                      }}
+                      onClick={() => {
+                        setSelectedEmployeeId(employee.id);
+                        setEmployeeMenuOpen(false);
+                      }}
+                    >
+                      <span>{employee.name}</span>
+                      <small>Wake → Do · Dream 生效</small>
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
+            <button
+              type="button"
+              class="composer-btn employee"
+              classList={{ active: !!selectedEmployee() }}
+              onClick={() => setEmployeeMenuOpen((open) => !open)}
+              title={selectedEmployee() ? `本次工作：${selectedEmployee()!.name}` : "选择本次工作的数字员工"}
+            >
+              <IconUsers size={16} />
+            </button>
+          </div>
+        </Show>
         <span class="composer-stop-slot" classList={{ hidden: !running() }}>
           <button
             class="composer-btn stop"

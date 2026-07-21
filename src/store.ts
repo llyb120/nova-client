@@ -1292,12 +1292,22 @@ export async function deleteProjectThreads(ids: string[]): Promise<number> {
   return deleted;
 }
 
-export async function sendPrompt(text: string, images: PromptImage[] = []) {
+export async function sendPrompt(
+  text: string,
+  images: PromptImage[] = [],
+  employeeId?: string | null,
+) {
   const id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
   const thread = state.threads.find((t) => t.id === id);
   if (thread?.employeeId && !thread.mindThread) {
     await api.registerLedgerItem(thread.employeeId, text, images);
+    return;
+  }
+  if (employeeId) {
+    // 普通会话只保存用户输入；岗位说明、记忆、Wake/Do 等内部提示留在后台员工会话。
+    bumpChatScrollToBottom();
+    await api.delegateEmployeeWork(id, employeeId, text, images);
     return;
   }
   // 继续发提示词时：若用户滚在中部，立刻跳到底（无过渡动画）

@@ -23,7 +23,6 @@ import { agentLabel } from "../utils";
 import { ConfigSelects, ModelPicker } from "./ConfigSelects";
 import {
   IconCheck,
-  IconFolder,
   IconGear,
   IconPlus,
   IconThumbDown,
@@ -31,11 +30,6 @@ import {
   IconTrash,
   IconX,
 } from "./icons";
-import { ProjectPicker } from "./ProjectPicker";
-
-function basename(p: string) {
-  return p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
-}
 
 function fmtTime(ts: number): string {
   if (!ts) return "";
@@ -296,7 +290,6 @@ export function EmployeesView() {
   const [showForm, setShowForm] = createSignal(false);
   const [editingId, setEditingId] = createSignal<string | null>(null);
   const [fName, setFName] = createSignal("");
-  const [fCwd, setFCwd] = createSignal("");
   const [fAgent, setFAgent] = createSignal<AgentKind>("devin");
   const [fModel, setFModel] = createSignal("");
   const [fHeartbeatAgent, setFHeartbeatAgent] = createSignal<AgentKind>("devin");
@@ -381,7 +374,6 @@ export function EmployeesView() {
 
   const resetForm = () => {
     setFName("");
-    setFCwd("");
     setFAgent(enabledAgentKinds()[0] ?? "devin");
     setFModel("");
     setFHeartbeatAgent(enabledAgentKinds()[0] ?? "devin");
@@ -414,7 +406,6 @@ export function EmployeesView() {
   const openEdit = (e: Employee) => {
     setEditingId(e.id);
     setFName(e.name);
-    setFCwd(e.cwd);
     setFAgent(e.agentKind);
     setFModel(e.model ?? "");
     setFHeartbeatAgent(e.heartbeatAgentKind ?? e.agentKind);
@@ -442,13 +433,8 @@ export function EmployeesView() {
   const saveForm = async () => {
     if (fBusy()) return;
     const name = fName().trim();
-    const cwd = fCwd().trim();
     if (!name) {
       setFErr("请填写员工名字");
-      return;
-    }
-    if (!cwd) {
-      setFErr("请选择工作目录");
       return;
     }
     setFBusy(true);
@@ -480,7 +466,7 @@ export function EmployeesView() {
         await api.updateEmployee({
           ...base,
           name,
-          cwd,
+          cwd: "",
           agentKind: fAgent(),
           model,
           heartbeatAgentKind,
@@ -512,7 +498,7 @@ export function EmployeesView() {
           mindModel,
           mode,
           charter: fCharter().trim(),
-          cwd,
+          cwd: "",
           heartbeatEnabled: fHeartbeatOn(),
           heartbeatSecs: Math.max(10, Math.round(fHeartbeat())),
           workHours,
@@ -735,7 +721,7 @@ export function EmployeesView() {
         fallback={
           <div class="emp-empty">
             <p>还没有数字员工。</p>
-            <p class="emp-empty-sub">新建一名员工，配置岗位说明书、工作目录和常驻职责。日常交办请到御书房下旨。</p>
+            <p class="emp-empty-sub">新建一名员工，配置岗位说明书和常驻职责。工作目录会在每次 Wake 时动态确定。</p>
             <button class="btn primary big" onClick={openCreate}>
               <IconPlus size={16} />
               新建第一名员工
@@ -789,8 +775,8 @@ export function EmployeesView() {
                     <span class={`emp-dot ${emp().enabled ? "on" : "off"}`} />
                     <span class="emp-detail-name">{emp().name}</span>
                     <span class={`agent-badge ${emp().agentKind}`}>{agentLabel(emp().agentKind)}</span>
-                    <span class="emp-detail-cwd" title={emp().cwd}>
-                      <IconFolder size={12} /> {basename(emp().cwd)}
+                    <span class="emp-detail-cwd" title="普通模式沿用当前项目；其他模式由 Wake 查找">
+                      动态工作目录
                     </span>
                     <Show
                       when={emp().heartbeatEnabled !== false}
@@ -1082,14 +1068,6 @@ export function EmployeesView() {
                   value={fName()}
                   onInput={(e) => setFName(e.currentTarget.value)}
                 />
-              </label>
-
-              <label class="field">
-                <span class="field-label">工作目录（项目）</span>
-                <ProjectPicker value={fCwd()} onChange={setFCwd} popDown />
-                <span class="emp-field-hint">
-                  从项目选择器里选，或用其中的「使用现有文件夹…」新增。
-                </span>
               </label>
 
               <label class="field">

@@ -3966,8 +3966,35 @@ async fn register_ledger_item(
     brief: String,
     images: Option<Vec<PromptImage>>,
 ) -> Result<(), String> {
-    employees::register_ledger_item(&app, employee_id, title, brief, images.unwrap_or_default())
-        .await
+    employees::register_ledger_item(
+        &app,
+        employee_id,
+        title,
+        brief,
+        images.unwrap_or_default(),
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn delegate_employee_work(
+    app: tauri::AppHandle,
+    thread_id: String,
+    employee_id: String,
+    content: String,
+    images: Option<Vec<PromptImage>>,
+) -> Result<(), String> {
+    employees::delegate_employee_work(
+        &app,
+        thread_id,
+        employee_id,
+        content,
+        images.unwrap_or_default(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -5126,6 +5153,7 @@ pub fn run() {
             assign_task,
             delete_task,
             register_ledger_item,
+            delegate_employee_work,
             list_decisions,
             list_notices,
             resolve_decision,

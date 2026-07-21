@@ -335,6 +335,13 @@ export const api = {
   /** 交办：把一个具体单子登记到该员工账本的「待处理」（无需标题，直接填内容），员工唤起后自行侦察认领 */
   registerLedgerItem: (employeeId: string, content: string, images: PromptImage[] = []) =>
     invoke<void>("register_ledger_item", { employeeId, title: "", brief: content, images }),
+  /** 普通会话临时交给数字员工：界面只记录用户原文，内部走 Wake → Do。 */
+  delegateEmployeeWork: (
+    threadId: string,
+    employeeId: string,
+    content: string,
+    images: PromptImage[] = [],
+  ) => invoke<void>("delegate_employee_work", { threadId, employeeId, content, images }),
 
   // 御书房（员工上奏、主管朱批准奏；dismiss = 留中不发）—— 底层 Notice 广播
   listDecisions: () => invoke<Decision[]>("list_decisions"),

@@ -1,7 +1,7 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
-import { compactThread, chatScrollToBottomSignal, setState, state } from "../store";
+import { compactThread, chatScrollToBottomSignal, openThread, setState, state } from "../store";
 import { firstWakeDoPairForThread } from "../threadDisplay";
 import type { Item, Thread } from "../types";
 import { agentLabel } from "../utils";
@@ -157,13 +157,14 @@ interface VirtualGroupElement extends HTMLDivElement {
 
 interface TranscriptSegmentProps {
   stage: "Wake" | "Do";
+  threadId: string;
   agentKind: Thread["agentKind"];
   model?: string | null;
 }
 
 function TranscriptSegment(props: TranscriptSegmentProps) {
   return (
-    <div class="transcript-segment">
+    <div class="transcript-segment" data-thread-id={props.threadId}>
       <span class={`agent-badge ${props.agentKind}`}>{props.stage}</span>
       <span class="transcript-segment-agent">{agentLabel(props.agentKind)}</span>
       <span class="transcript-segment-model" title={props.model || "默认模型"}>
@@ -434,6 +435,50 @@ export function ChatView() {
   const currentMeta = createMemo(() =>
     state.threads.find((t) => t.id === state.currentId),
   );
+  const stageThreads = createMemo(() => {
+    const current = currentMeta();
+    if (!current) return [];
+    const byId = new Map(state.threads.map((thread) => [thread.id, thread]));
+    const rootOf = (start: typeof current) => {
+      let root = start;
+      const seen = new Set<string>();
+      while (root.parentThreadId && !seen.has(root.id)) {
+        seen.add(root.id);
+        const parent = byId.get(root.parentThreadId);
+        if (!parent) break;
+        root = parent;
+      }
+      return root;
+    };
+    const root = rootOf(current);
+    const chain = state.threads.filter((thread) => {
+      if (!thread.employeeId) return false;
+      return rootOf(thread).id === root.id;
+    });
+    return chain.sort((a, b) => a.createdAt - b.createdAt);
+  });
+  const stageName = (thread: (typeof state.threads)[number]) => {
+    if (/\]\s*Wake/.test(thread.title)) return "Wake";
+    if (/\]\s*Do/.test(thread.title)) return "Do";
+    if (/\]\s*Dream/.test(thread.title)) return "Dream";
+    if (/\]\s*巡查/.test(thread.title)) return "巡查";
+    return "事件";
+  };
+  const jumpToStage = async (threadId: string) => {
+    await openThread(threadId);
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        const target = innerRef?.querySelector<HTMLElement>(`[data-thread-id="${threadId}"]`);
+        if (target && scrollRef) {
+          setStickToBottom(false);
+          scrollRef.scrollTo({ top: Math.max(0, target.offsetTop - 16), behavior: "smooth" });
+        } else if (scrollRef) {
+          setStickToBottom(false);
+          scrollRef.scrollTo({ top: 0, behavior: "smooth" });
+        }
+      }),
+    );
+  };
   const [starUpdating, setStarUpdating] = createSignal(false);
   const roamingRole = () => currentMeta()?.roamingRole ?? null;
   const canStar = () => {
@@ -632,7 +677,8 @@ export function ChatView() {
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
       </Show>
 
-      <div
+      <div class="chat-body">
+       <div
         class="transcript"
         ref={scrollRef}
         onScroll={handleTranscriptScroll}
@@ -652,6 +698,7 @@ export function ChatView() {
                 <>
                   <TranscriptSegment
                     stage="Wake"
+                    threadId={wake().id}
                     agentKind={wake().agentKind}
                     model={wake().model}
                   />
@@ -672,6 +719,7 @@ export function ChatView() {
               {(pair) => (
                 <TranscriptSegment
                   stage={pair().doThread?.id === state.currentId ? "Do" : "Wake"}
+                  threadId={state.currentId!}
                   agentKind={state.agentKind}
                   model={state.model}
                 />
@@ -693,6 +741,26 @@ export function ChatView() {
           </Show>
           <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
         </div>
+      </div>
+      <Show when={stageThreads().length > 1}>
+        <aside class="stage-rail" aria-label="会话阶段导航">
+          <div class="stage-rail-count">{stageThreads().length} 个事件</div>
+          <For each={stageThreads()}>
+            {(thread, index) => (
+              <button
+                type="button"
+                class="stage-rail-item"
+                classList={{ active: thread.id === state.currentId || thread.id === mergedWake()?.id }}
+                title={thread.title}
+                onClick={() => void jumpToStage(thread.id)}
+              >
+                <span>{stageName(thread)}</span>
+                <small>{index() + 1}</small>
+              </button>
+            )}
+          </For>
+        </aside>
+      </Show>
       </div>
 
       <footer class="chat-foot">

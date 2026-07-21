@@ -612,7 +612,7 @@ export interface Employee {
   allowWorktree?: boolean;
   /** 岗位说明书（启动提示词）：员工是谁、负责什么、工作规范 */
   charter: string;
-  /** 工作目录（员工所有会话都在此执行） */
+  /** @deprecated 兼容旧配置；运行时由普通会话项目或 Wake 动态确定 */
   cwd: string;
   /** 自动心跳开关：false = 不定时巡查/领活，只在御书房交办或朱批时行动；Mind 独立调度 */
   heartbeatEnabled?: boolean;

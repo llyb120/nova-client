@@ -6,7 +6,7 @@
 //! 当前占用人、对应会话和租约。`claim` 是后端 Mutex 保护下的原子 CAS：
 //! 已完成→跳过；他人持有且租约未过期→跳过；租约过期 / open / failed→接管。
 
-use crate::threads::{now_ms, PromptImage};
+use crate::threads::{now_ms, AgentKind, PromptImage};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -39,6 +39,19 @@ pub struct Mark {
     /// 主管交办时随单子带上的图片/文件附件。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<PromptImage>,
+    /// 普通会话交办时的项目目录；员工配置本身不再绑定固定项目。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// 发起交办的普通会话，仅用于回链，不作为 Do 的内部提示词。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_thread_id: Option<String>,
+    /// 普通模式点名员工时，Do 沿用用户在普通会话中选择的执行配置；Wake 仍用员工配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub do_agent_kind: Option<AgentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub do_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub do_mode: Option<String>,
     /// 租约到期时间（ms）。claimed 状态下超过此刻即可被别人接管；0 = 无租约
     #[serde(default)]
     pub lease_until: i64,
@@ -156,6 +169,11 @@ impl MarkStore {
             note: String::new(),
             thread_id: None,
             images: Vec::new(),
+            cwd: None,
+            source_thread_id: None,
+            do_agent_kind: None,
+            do_model: None,
+            do_mode: None,
             lease_until: now + ttl_ms,
             created_at: now,
             updated_at: now,
@@ -221,6 +239,11 @@ impl MarkStore {
         title: &str,
         note: &str,
         images: Vec<PromptImage>,
+        cwd: Option<String>,
+        source_thread_id: Option<String>,
+        do_agent_kind: Option<AgentKind>,
+        do_model: Option<String>,
+        do_mode: Option<String>,
     ) {
         let now = now_ms();
         if let Some(i) = self.idx(scope, key) {
@@ -233,6 +256,17 @@ impl MarkStore {
             }
             if !images.is_empty() {
                 m.images = images;
+            }
+            if cwd.is_some() {
+                m.cwd = cwd;
+            }
+            if source_thread_id.is_some() {
+                m.source_thread_id = source_thread_id;
+            }
+            if do_agent_kind.is_some() {
+                m.do_agent_kind = do_agent_kind;
+                m.do_model = do_model;
+                m.do_mode = do_mode;
             }
             m.updated_at = now;
             self.save();
@@ -248,6 +282,11 @@ impl MarkStore {
             note: note.to_string(),
             thread_id: None,
             images,
+            cwd,
+            source_thread_id,
+            do_agent_kind,
+            do_model,
+            do_mode,
             lease_until: 0,
             created_at: now,
             updated_at: now,

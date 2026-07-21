@@ -145,7 +145,8 @@ pub struct Employee {
     /// 岗位说明书（启动提示词）
     #[serde(default)]
     pub charter: String,
-    /// 工作目录
+    /// 旧版固定工作目录。新配置留空；运行时从普通会话或项目列表动态确定。
+    #[serde(default)]
     pub cwd: String,
     /// 自动心跳开关：false = 完全不做周期性自主行动（不巡查、不自动领活），
     /// 只在用户交办、御书房朱批、手动「立即执行一轮」时行动。旧数据缺省为开。
@@ -1501,9 +1502,6 @@ pub fn create_employee(
     if name.is_empty() {
         return Err("请填写员工名字".into());
     }
-    if cwd.is_empty() {
-        return Err("请填写工作目录".into());
-    }
     let now = now_ms();
     let emp = Employee {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1551,9 +1549,6 @@ pub fn update_employee(app: &AppHandle, mut emp: Employee) -> Result<(), String>
     emp.model = emp.model.filter(|s| !s.trim().is_empty());
     if emp.name.is_empty() {
         return Err("请填写员工名字".into());
-    }
-    if emp.cwd.is_empty() {
-        return Err("请填写工作目录".into());
     }
     emp.heartbeat_secs = emp.heartbeat_secs.max(10);
     emp.directive = emp.directive.trim().to_string();
@@ -2784,6 +2779,9 @@ struct WorkspaceReady {
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 struct WorkPreflight {
+    /// 本次工作的项目目录；普通模式已有明确目录，其他模式由 Wake 从候选项目中选择。
+    #[serde(default)]
+    cwd: String,
     /// current | existingBranch | newBranch | worktree —— current = 留在源/当前分支
     #[serde(default)]
     mode: String,
@@ -2832,6 +2830,8 @@ struct WakeDecision {
     #[serde(default)]
     mode: String,
     #[serde(default)]
+    cwd: String,
+    #[serde(default)]
     branch: String,
     #[serde(default)]
     base_branch: String,
@@ -2864,6 +2864,7 @@ impl WakeDecision {
             return w.clone();
         }
         WorkPreflight {
+            cwd: self.cwd.clone(),
             mode: self.mode.clone(),
             branch: self.branch.clone(),
             base_branch: self.base_branch.clone(),
@@ -3003,11 +3004,12 @@ fn new_mind_thread_with_parent(
         .filter(|s| !s.trim().is_empty())
         .or_else(|| emp.heartbeat_model.clone().filter(|s| !s.trim().is_empty()))
         .or_else(|| emp.model.clone());
+    let cwd = runtime_cwd(app, Some(&emp.cwd)).unwrap_or_else(|| emp.cwd.clone());
     let id = new_thread_full(
         app,
         emp,
         title,
-        emp.cwd.clone(),
+        cwd,
         mind_agent_kind(emp),
         model,
         None,
@@ -3631,7 +3633,57 @@ pub async fn delete_work_by_thread(app: &AppHandle, thread_id: &str) {
 ///
 /// `manual`：用户手动「立即执行一轮」时为 true——不受上班时段限制；
 /// 心跳自动触发为 false——非上班时段只为领旨破例，办完旨意即回去休眠。
-fn run_cycle(app: AppHandle, emp: Employee, manual: bool) {
+fn runtime_cwd(app: &AppHandle, preferred: Option<&str>) -> Option<String> {
+    if let Some(path) = preferred
+        .map(str::trim)
+        .filter(|path| Path::new(path).is_dir())
+    {
+        return Some(path.to_string());
+    }
+    let state = app.state::<AppState>();
+    let projects = state.projects.lock().unwrap().projects.clone();
+    projects
+        .iter()
+        .find(|path| Path::new(path).is_dir())
+        .cloned()
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .filter(|path| path.is_dir())
+                .map(|path| path.to_string_lossy().to_string())
+        })
+}
+
+fn employee_at_cwd(emp: &Employee, cwd: Option<&str>) -> Employee {
+    let mut employee = emp.clone();
+    if let Some(cwd) = cwd.map(str::trim).filter(|path| Path::new(path).is_dir()) {
+        employee.cwd = cwd.to_string();
+    }
+    employee
+}
+
+fn employee_for_mark(app: &AppHandle, emp: &Employee, scope: &str, mark: &Mark) -> Employee {
+    let shadow = if mark.cwd.is_none() && mark.do_agent_kind.is_none() {
+        app.state::<AppState>()
+            .marks
+            .lock()
+            .unwrap()
+            .get(scope, &mark.key)
+            .cloned()
+    } else {
+        None
+    };
+    let metadata = shadow.as_ref().unwrap_or(mark);
+    let mut employee = employee_at_cwd(emp, metadata.cwd.as_deref());
+    if let Some(kind) = &metadata.do_agent_kind {
+        employee.agent_kind = kind.clone();
+        employee.model = metadata.do_model.clone();
+        employee.mode = metadata.do_mode.clone();
+    }
+    employee
+}
+
+fn run_cycle(app: AppHandle, mut emp: Employee, manual: bool) {
     // 同一员工同一时间只允许一个运行中会话：已有会话在跑就跳过（不重置心跳，下次再试）。
     if employee_has_running_thread(&app, &emp.id) {
         return;
@@ -3648,9 +3700,10 @@ fn run_cycle(app: AppHandle, emp: Employee, manual: bool) {
     }
     let _ = app.emit(EV_EMPLOYEES, json!({}));
 
-    if !std::path::Path::new(&emp.cwd).is_dir() {
+    let Some(cwd) = runtime_cwd(&app, Some(&emp.cwd)) else {
         return;
-    }
+    };
+    emp.cwd = cwd;
 
     let scope = emp_scope(&emp);
 
@@ -3698,12 +3751,13 @@ fn run_cycle(app: AppHandle, emp: Employee, manual: bool) {
         }
 
         if let Some(m) = inhand {
+            let task_emp = employee_for_mark(&app, &emp, &scope, &m);
             let prior_thread = dev_thread_get(&scope, &m.key).filter(|t| thread_alive(&app, t));
             let extra =
                 crate::notice::take_injection(&app, &emp.id, &scope, &m.key).unwrap_or_default();
             develop_and_conclude(
                 &app,
-                &emp,
+                &task_emp,
                 &scope,
                 use_shared,
                 &m.key,
@@ -3712,6 +3766,7 @@ fn run_cycle(app: AppHandle, emp: Employee, manual: bool) {
                 m.images.clone(),
                 &extra,
                 prior_thread,
+                m.source_thread_id.clone(),
             )
             .await;
             return;
@@ -3831,6 +3886,7 @@ fn run_cycle(app: AppHandle, emp: Employee, manual: bool) {
                 m.images.clone(),
                 &extra,
                 prior_thread,
+                None,
             )
             .await;
         }
@@ -3978,6 +4034,7 @@ async fn run_notice_injections(
         images,
         &extra,
         prior_thread,
+        None,
     )
     .await;
     true
@@ -4028,9 +4085,19 @@ async fn run_pickup_open(app: &AppHandle, emp: &Employee, scope: &str, use_share
             .map(|s| s.images.clone())
             .unwrap_or_else(|| m.images.clone());
         let prior_thread = dev_thread_get(scope, &m.key).filter(|t| thread_alive(app, t));
+        let task_mark = snap.as_ref().unwrap_or(&m);
+        let task_emp = employee_for_mark(app, emp, scope, task_mark);
+        let source_thread_id = task_mark.source_thread_id.clone().or_else(|| {
+            app.state::<AppState>()
+                .marks
+                .lock()
+                .unwrap()
+                .get(scope, &m.key)
+                .and_then(|mark| mark.source_thread_id.clone())
+        });
         develop_and_conclude(
             app,
-            emp,
+            &task_emp,
             scope,
             use_shared,
             &m.key,
@@ -4039,6 +4106,7 @@ async fn run_pickup_open(app: &AppHandle, emp: &Employee, scope: &str, use_share
             images,
             "",
             prior_thread,
+            source_thread_id,
         )
         .await;
         return true;
@@ -4170,15 +4238,24 @@ async fn develop_and_conclude(
     images: Vec<PromptImage>,
     extra: &str,
     thread_id: Option<String>,
+    chain_parent_hint: Option<String>,
 ) {
     let task_title = task_title_of(key, title);
+    // 普通模式可以覆盖 Do 的后端/模型；Wake 始终使用员工自己的 Wake 配置，
+    // 但沿用本次任务已经确定的动态工作目录。
+    let mut wake_emp = find_employee(app, &emp.id).unwrap_or_else(|| emp.clone());
+    wake_emp.cwd = emp.cwd.clone();
     // 同一任务链共用一个父会话：Notice 锚点 / 既有会话链根。
-    let chain_parent = resolve_chain_parent(app, &emp.id, scope, key, thread_id.as_deref());
+    let chain_parent = chain_parent_hint
+        .as_deref()
+        .filter(|thread_id| thread_alive(app, thread_id))
+        .map(|thread_id| thread_chain_root(app, thread_id))
+        .or_else(|| resolve_chain_parent(app, &emp.id, scope, key, thread_id.as_deref()));
     // 续做同一会话时仍跑 Wake：分支策略由 Wake 当场决定，不依赖 Workflow 缓存。
     // 批注后也必须先 Wake（提示词带批示），再由 Wake 决定是否进入 Do——禁止跳过 Wake 无脑开工。
     let wake_run = run_wake(
         app,
-        emp,
+        &wake_emp,
         scope,
         key,
         title,
@@ -5093,12 +5170,8 @@ async fn run_wake(
     extra: &str,
     chain_parent: Option<&str>,
 ) -> WakeRun {
-    if !crate::gitwt::is_repo(&emp.cwd) {
-        return WakeRun::Skipped;
-    }
-    if crate::gitwt::repo_root(&emp.cwd).is_err() {
-        return WakeRun::Skipped;
-    };
+    // 员工不再绑定固定项目。即使启动目录不是 git 仓库也必须运行 Wake，
+    // 由 Wake 从项目候选中只读核查并在 workspace.cwd 里选出本次工作目录。
     let has_edict = supervision_forces_do(prior_note, extra);
     let prompt = build_wake_prompt(app, emp, scope, key, title, prior_note, extra);
     let wake_title = if has_edict {
@@ -5408,6 +5481,19 @@ fn build_wake_prompt(
         "配置不允许 worktree；mode 不要输出 worktree。"
     };
     let (supervision_block, prior_disp, extra_disp) = wake_context_blocks(prior_note, extra);
+    let project_candidates = {
+        let state = app.state::<AppState>();
+        let mut paths = state.projects.lock().unwrap().projects.clone();
+        if !emp.cwd.trim().is_empty() && !paths.iter().any(|path| path == &emp.cwd) {
+            paths.insert(0, emp.cwd.clone());
+        }
+        paths
+            .into_iter()
+            .filter(|path| Path::new(path).is_dir())
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
         "你是数字员工「{name}」的 Wake。你只做开干前快速思考与路由。\n\
 **严禁改代码、写文件、跑写入命令、提交、安装依赖或任何会改仓库的操作。** 只允许只读检索。\n\n\
@@ -5418,6 +5504,8 @@ fn build_wake_prompt(
 【本机可交棒同事】{peers}\n\
 （to 只能选自上表或 self；禁止虚构人名。找不到人时系统会改上奏御书房。）\n\n\
 {tools}\
+【可用项目目录】\n{project_candidates}\n\
+普通会话交办时，任务上下文中的项目目录优先；否则必须先只读核查上述候选目录，并在 workspace.cwd 中选择本次真正工作的绝对路径。\n\
 请先用上面的只读工具与仓库只读核查当前状态、近期工作、记忆知识和账本占用。\n\
 若下一步是 do：必须主动检索本地分支并给出 workspace；真正干活由后续 **Do 会话（工作模型）** 完成，不在本 Wake 会话里干。\n\
 {worktree_rule}\n\n\
@@ -5431,6 +5519,7 @@ fn build_wake_prompt(
   \"question\":\"上奏或讨论的问题\",\n\
   \"options\":[],\n\
   \"workspace\":{{\n\
+    \"cwd\":\"本次工作目录的绝对路径\",\n\
     \"mode\":\"current|existingBranch|newBranch|worktree\",\n\
     \"branch\":\"\",\n\
     \"baseBranch\":\"\",\n\
@@ -5464,6 +5553,7 @@ fn build_wake_prompt(
         charter = charter_or_default(&emp.charter),
         peers = peers,
         tools = tools,
+        project_candidates = if project_candidates.is_empty() { "（暂无项目记录）" } else { &project_candidates },
         worktree_rule = worktree_rule,
     )
 }
@@ -5798,10 +5888,14 @@ fn apply_workspace(
     title: &str,
     preflight: Option<&WorkPreflight>,
 ) -> Result<WorkspaceReady, String> {
-    if !crate::gitwt::is_repo(&emp.cwd) {
-        return Err(format!("工作目录不是 git 仓库：{}", emp.cwd));
+    let requested_cwd = preflight
+        .map(|plan| plan.cwd.trim())
+        .filter(|path| !path.is_empty() && Path::new(path).is_dir())
+        .unwrap_or(emp.cwd.as_str());
+    if !crate::gitwt::is_repo(requested_cwd) {
+        return Err(format!("工作目录不是 git 仓库：{requested_cwd}"));
     }
-    let repo = crate::gitwt::repo_root(&emp.cwd)?;
+    let repo = crate::gitwt::repo_root(requested_cwd)?;
     let plan = normalize_preflight_plan(preflight, emp, key);
     if plan.mode == "worktree" && emp.allow_worktree {
         let state = app.state::<AppState>();
@@ -5912,6 +6006,7 @@ fn normalize_preflight_plan(
         "work_tree" => "worktree".to_string(),
         _ => "current".to_string(),
     };
+    p.cwd = p.cwd.trim().to_string();
     p.branch = p.branch.trim().to_string();
     p.base_branch = p.base_branch.trim().to_string();
     if p.mode == "worktree" && !emp.allow_worktree {
@@ -6246,7 +6341,20 @@ async fn ledger_register_open(
     title: &str,
     note: &str,
     images: Vec<PromptImage>,
+    cwd: Option<String>,
+    source_thread_id: Option<String>,
+    do_agent_kind: Option<AgentKind>,
+    do_model: Option<String>,
+    do_mode: Option<String>,
 ) {
+    let shadow = (
+        images.clone(),
+        cwd.clone(),
+        source_thread_id.clone(),
+        do_agent_kind.clone(),
+        do_model.clone(),
+        do_mode.clone(),
+    );
     if use_shared {
         if ledger_status(app, true, scope, key).await == "failed" {
             return;
@@ -6262,10 +6370,27 @@ async fn ledger_register_open(
         let _ = relay
             .ledger_set(scope, key, "open", Some(&note), true)
             .await;
+        if shadow.1.is_some() || shadow.3.is_some() {
+            app.state::<AppState>().marks.lock().unwrap().register_open(
+                scope, key, title, &note, shadow.0, shadow.1, shadow.2, shadow.3, shadow.4,
+                shadow.5,
+            );
+        }
     } else {
         let state = app.state::<AppState>();
         let mut marks = state.marks.lock().unwrap();
-        marks.register_open(scope, key, title, note, images);
+        marks.register_open(
+            scope,
+            key,
+            title,
+            note,
+            images,
+            cwd,
+            source_thread_id,
+            do_agent_kind,
+            do_model,
+            do_mode,
+        );
     }
 }
 
@@ -6292,7 +6417,18 @@ pub fn migrate_tasks_to_ledger(app: &AppHandle) {
             if let Some(emp) = employees.iter().find(|e| e.id == t.employee_id) {
                 let scope = emp_scope(emp);
                 let key = one_line(&t.title, 60);
-                marks.register_open(&scope, &key, &t.title, t.brief.trim(), Vec::new());
+                marks.register_open(
+                    &scope,
+                    &key,
+                    &t.title,
+                    t.brief.trim(),
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
             }
         }
     }
@@ -6314,6 +6450,9 @@ pub async fn register_ledger_item(
     title: String,
     brief: String,
     mut images: Vec<PromptImage>,
+    cwd: Option<String>,
+    source_thread_id: Option<String>,
+    do_config: Option<(AgentKind, Option<String>, Option<String>)>,
 ) -> Result<(), String> {
     embed_attachment_data(&mut images);
     let title = title.trim().to_string();
@@ -6360,7 +6499,24 @@ pub async fn register_ledger_item(
         (title.clone(), brief.clone())
     };
     let key = proposed_key;
-    ledger_register_open(app, use_shared, &scope, &key, &mark_title, &note, images).await;
+    let (do_agent_kind, do_model, do_mode) = do_config
+        .map(|(kind, model, mode)| (Some(kind), model, mode))
+        .unwrap_or((None, None, None));
+    ledger_register_open(
+        app,
+        use_shared,
+        &scope,
+        &key,
+        &mark_title,
+        &note,
+        images,
+        cwd.filter(|value| Path::new(value).is_dir()),
+        source_thread_id,
+        do_agent_kind,
+        do_model,
+        do_mode,
+    )
+    .await;
     // 用户亲自交办就是一次新的执行要求。即使同 key 的旧单已经完成，也重新开放再做一遍；
     // 不能让历史 done 状态吞掉本次交办，随后误落入巡查。
     if ledger_status(app, use_shared, &scope, &key).await == "done" {
@@ -6388,10 +6544,56 @@ pub async fn register_ledger_item(
     let _ = app.emit(EV_MARKS, json!({}));
     // 关闭自动心跳的员工不会自己醒来领活：交办即用户点名，立即唤起一轮。
     // 正忙则忽略（单子已登记在账本，忙完后用户可再「立即执行」）。
-    if !emp.heartbeat_enabled {
-        let _ = run_now(app, &employee_id);
-    }
+    // 点名交办应立即开始；员工若正忙，单子已经进入账本，忙完后会继续领取。
+    let _ = run_now(app, &employee_id);
     Ok(())
+}
+
+/// 从普通会话点名数字员工。普通会话只落用户原文；内部岗位、记忆和 Wake/Do 提示
+/// 全部留在员工后台会话，避免普通聊天界面出现大段系统提示。
+pub async fn delegate_employee_work(
+    app: &AppHandle,
+    thread_id: String,
+    employee_id: String,
+    content: String,
+    images: Vec<PromptImage>,
+) -> Result<(), String> {
+    let (cwd, do_config, item) = {
+        let state = app.state::<AppState>();
+        if state.employees.lock().unwrap().get(&employee_id).is_none() {
+            return Err("员工不存在".into());
+        }
+        let mut store = state.store.lock().unwrap();
+        let thread = store.get_mut(&thread_id).ok_or("会话不存在")?;
+        if thread.employee_id.is_some() {
+            return Err("该入口只用于普通会话".into());
+        }
+        let cwd = thread.cwd.clone();
+        let do_config = (
+            thread.agent_kind.clone(),
+            thread.model.clone(),
+            thread.mode.clone(),
+        );
+        let item = thread.push_user(content.clone(), images.clone());
+        store.save();
+        (cwd, do_config, item)
+    };
+    let _ = app.emit(
+        crate::acp::EV_UPDATE,
+        json!({ "threadId": thread_id, "op": { "t": "upsert", "item": item } }),
+    );
+    let _ = app.emit(crate::acp::EV_THREADS, json!({}));
+    register_ledger_item(
+        app,
+        employee_id,
+        String::new(),
+        content,
+        images,
+        Some(cwd),
+        Some(thread_id),
+        Some(do_config),
+    )
+    .await
 }
 
 /// 该会话是否仍存在（用户可能已删除员工会话）。复用前校验，避免往已删除的会话发消息。
