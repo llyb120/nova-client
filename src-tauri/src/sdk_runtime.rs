@@ -471,6 +471,11 @@ impl SdkManager {
         *self.model_options.lock().unwrap() = Some(value);
     }
 
+    /// 返回当前缓存的模型列表，供同步的远程快照构建逻辑使用。
+    pub fn get_model_options(&self) -> Option<Value> {
+        self.model_options.lock().unwrap().clone()
+    }
+
     pub fn spawn_revalidate_model_options(self: &Arc<Self>) {
         if self.model_options_revalidated.load(Ordering::SeqCst)
             || self

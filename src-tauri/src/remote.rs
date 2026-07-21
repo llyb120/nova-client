@@ -745,6 +745,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
     let state = app.state::<AppState>();
     let mut out = HashMap::new();
     for kind in [
+        AgentKind::Alkaid,
         AgentKind::Devin,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
@@ -767,6 +768,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
             continue;
         }
         let value = match kind {
+            AgentKind::Alkaid => state.alkaid.get_model_options(),
             AgentKind::Devin => state.acp.get_model_options(),
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
             AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.get_model_options(),

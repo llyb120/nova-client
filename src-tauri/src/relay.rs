@@ -2428,7 +2428,7 @@ impl RelayManager {
     }
 
     /// host：收到模型请求，收集本机「已启用且检测可用」后端的模型/模式列表回给对端。
-    /// 顺序与前端 ALL_AGENT_KINDS 保持一致（devin → codex → codebuddy → claudecode → cursor → opencode）。
+    /// 顺序与前端 ALL_AGENT_KINDS 保持一致（alkaid → devin → codex → codebuddy → claudecode → cursor → opencode）。
     fn on_roaming_models_request(&self, env: &InEnvelope) {
         let to = env.from.clone();
         let app = self.app.clone();
@@ -2438,6 +2438,7 @@ impl RelayManager {
                 let s = state.settings.lock().unwrap();
                 let avail = state.backend_availability.lock().unwrap();
                 let kinds = [
+                    (AgentKind::Alkaid, s.alkaid_enabled),
                     (AgentKind::Devin, s.devin_enabled),
                     (AgentKind::Codex, s.codex_enabled),
                     (AgentKind::CodeBuddy, s.codebuddy_enabled),
@@ -2459,7 +2460,9 @@ impl RelayManager {
             for kind in kinds {
                 backends.push(kind.as_str());
                 let fetched = match kind {
-                    AgentKind::Alkaid => app.state::<AppState>().alkaid.ensure_model_options().await,
+                    AgentKind::Alkaid => {
+                        app.state::<AppState>().alkaid.ensure_model_options().await
+                    }
                     AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                         app.state::<AppState>()
                             .opencodeplus
