@@ -4,9 +4,9 @@ import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createReadStream } from "node:fs";
-import { readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const DEFAULT_BATCH_READ_LINES = 200;
@@ -52,6 +52,18 @@ export async function alkaidPromptInput(parts = []) {
   return { text: textParts.join("\n\n"), images };
 }
 
+export async function alkaidUserMessage(parts = []) {
+  const input = await alkaidPromptInput(parts);
+  return {
+    role: "user",
+    content: [
+      ...(input.text ? [{ type: "text", text: input.text }] : []),
+      ...input.images,
+    ],
+    timestamp: Date.now(),
+  };
+}
+
 async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES) {
   const input = createReadStream(path, { encoding: "utf8" });
   const lines = createInterface({ input, crlfDelay: Infinity });
@@ -79,9 +91,9 @@ async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES)
   };
 }
 
-export function createFilesystemTools(cwd) {
+export function createFilesystemTools(cwd, editTool = null) {
   const root = resolve(cwd);
-  return [
+  const tools = [
     {
       name: "read_files",
       description: `并行、流式读取多个 UTF-8 文本文件，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行。可为每个文件指定 offset/limit，并用返回的 nextOffset 继续读取。`,
@@ -113,34 +125,29 @@ export function createFilesystemTools(cwd) {
         return textResult(JSON.stringify(results), { count: results.length });
       },
     },
-    {
-      name: "write_files",
-      description: "并行、原子地写入多个工作区文件。仅用于彼此独立的目标文件；同一路径不可重复。",
-      parameters: Type.Object({
-        files: Type.Array(Type.Object({ path: Type.String(), content: Type.String() }), { minItems: 1 }),
-      }),
-      async execute(_id, { files }) {
-        const targets = files.map((file) => safePath(root, file.path));
-        if (new Set(targets).size !== targets.length) throw new Error("write_files 包含重复目标路径");
-        const written = await Promise.all(files.map(async (file, index) => {
-          const target = targets[index];
-          const parent = dirname(target);
-          const parentInfo = await stat(parent).catch(() => null);
-          if (!parentInfo?.isDirectory()) throw new Error(`父目录不存在: ${relative(root, parent)}`);
-          const temp = join(parent, `.${basename(target)}.nova-${process.pid}-${index}.tmp`);
-          try {
-            await writeFile(temp, file.content, "utf8");
-            await rename(temp, target);
-            return file.path;
-          } catch (error) {
-            await unlink(temp).catch(() => {});
-            throw error;
-          }
-        }));
-        return textResult(`已并行写入 ${written.length} 个文件`, { paths: written });
-      },
-    },
   ];
+  if (editTool) {
+    tools.push({
+      name: "edit_files",
+      description: "并行精确编辑多个互不依赖的文件。每个文件的 edits 使用与原生 edit 相同的唯一、非重叠 oldText 精确替换；同一路径不可重复。",
+      parameters: Type.Object({
+        files: Type.Array(Type.Object({
+          path: Type.String(),
+          edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }), { minItems: 1 }),
+        }), { minItems: 1 }),
+      }),
+      async execute(id, { files }, signal) {
+        const targets = files.map((file) => safePath(root, file.path));
+        if (new Set(targets).size !== targets.length) throw new Error("edit_files 包含重复目标路径");
+        const edited = await Promise.all(files.map(async (file, index) => {
+          await editTool.execute(`${id}-${index}`, file, signal);
+          return file.path;
+        }));
+        return textResult(`已并行编辑 ${edited.length} 个文件`, { paths: edited });
+      },
+    });
+  }
+  return tools;
 }
 
 async function findSkills(roots) {
@@ -228,11 +235,12 @@ export async function createAlkaidAgent(options = {}) {
   const codingTools = options.readOnly
     ? createReadOnlyTools(cwd)
     : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell } });
-  const batchTools = createFilesystemTools(cwd).filter((tool) => !options.readOnly || tool.name !== "write_files");
+  const editTool = codingTools.find((tool) => tool.name === "edit");
+  const batchTools = createFilesystemTools(cwd, editTool);
   const tools = [...codingTools, ...batchTools, skillSupport.tool, ...mcp.tools];
   const systemPrompt = [
     "你是 Alkaid：高效、简单、面向软件工程结果。",
-    "你拥有 PI coding agent 的原生 read、bash、edit、write 工具，以及批量增强 read_files、write_files；读取大文件时使用 offset/limit 分段，互不依赖的工具调用应在同一轮并发发出。",
+    "你拥有 PI coding agent 的原生 read、bash、edit、write 工具，以及批量增强 read_files、edit_files；读取大文件时使用 offset/limit 分段。修改两个及以上互不依赖的已有文件时优先使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
     shellConfig ? `命令终端已确认使用 Bash（${shellConfig.shell}）；bash 工具必须从第一次调用起使用 Bash 语法，不要使用 PowerShell cmdlet。` : "",
     options.readOnly ? "当前为计划模式：只读分析，不得修改文件。" : "",
@@ -251,6 +259,7 @@ export async function createAlkaidAgent(options = {}) {
     },
     getApiKey: () => options.apiKey,
     toolExecution: "parallel",
+    steeringMode: "all",
     sessionId: options.sessionId,
   });
   return { agent, close: () => mcp.close(), skills: skillSupport.skills, toolCount: tools.length };

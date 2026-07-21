@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidModelOptions, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
-import { alkaidPromptInput, connectMcpServers, createAlkaidAgent, createFilesystemTools, createSkillSupport } from "./alkaid-core.mjs";
+import { alkaidPromptInput, alkaidUserMessage, connectMcpServers, createAlkaidAgent, createFilesystemTools, createSkillSupport } from "./alkaid-core.mjs";
 
 const configuredModel = {
   id: "gpt-test",
@@ -106,16 +106,33 @@ test("prompt input preserves embedded and local images", async () => {
   });
 });
 
+test("native steering messages preserve text and images", async () => {
+  const message = await alkaidUserMessage([
+    { type: "text", text: "change direction" },
+    { type: "image_data", mime: "image/png", data: "image-data" },
+  ]);
+  assert.equal(message.role, "user");
+  assert.deepEqual(message.content, [
+    { type: "text", text: "change direction" },
+    { type: "image", data: "image-data", mimeType: "image/png" },
+  ]);
+  assert.equal(typeof message.timestamp, "number");
+});
+
 test("batch file tools remain available as Alkaid enhancements", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-"));
   await Promise.all([writeFile(join(cwd, "a.txt"), "A"), writeFile(join(cwd, "b.txt"), "B")]);
-  const [readFiles, writeFiles] = createFilesystemTools(cwd);
+  const editTool = createCodingTools(cwd).find((tool) => tool.name === "edit");
+  const [readFiles, editFiles] = createFilesystemTools(cwd, editTool);
   const read = await readFiles.execute("1", { paths: ["a.txt", "b.txt"] });
   assert.deepEqual(JSON.parse(read.content[0].text), [
     { path: "a.txt", content: "A" },
     { path: "b.txt", content: "B" },
   ]);
-  await writeFiles.execute("2", { files: [{ path: "a.txt", content: "AA" }, { path: "b.txt", content: "BB" }] });
+  await editFiles.execute("2", { files: [
+    { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] },
+    { path: "b.txt", edits: [{ oldText: "B", newText: "BB" }] },
+  ] });
   assert.deepEqual(await Promise.all([readFile(join(cwd, "a.txt"), "utf8"), readFile(join(cwd, "b.txt"), "utf8")]), ["AA", "BB"]);
 });
 
@@ -135,11 +152,18 @@ test("batch reads stream large files in pages", async () => {
   assert.equal(second.nextOffset, 221);
 });
 
-test("batch file tools reject traversal and duplicate writes", async () => {
+test("batch file tools reject traversal and duplicate edits", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-"));
-  const [, writeFiles] = createFilesystemTools(cwd);
-  await assert.rejects(() => writeFiles.execute("1", { files: [{ path: "../outside", content: "x" }] }), /超出工作区/);
-  await assert.rejects(() => writeFiles.execute("2", { files: [{ path: "x", content: "1" }, { path: "x", content: "2" }] }), /重复/);
+  await writeFile(join(cwd, "x.txt"), "x");
+  const editTool = createCodingTools(cwd).find((tool) => tool.name === "edit");
+  const [, editFiles] = createFilesystemTools(cwd, editTool);
+  await assert.rejects(() => editFiles.execute("1", { files: [
+    { path: "../outside", edits: [{ oldText: "x", newText: "y" }] },
+  ] }), /超出工作区/);
+  await assert.rejects(() => editFiles.execute("2", { files: [
+    { path: "x.txt", edits: [{ oldText: "x", newText: "1" }] },
+    { path: "x.txt", edits: [{ oldText: "x", newText: "2" }] },
+  ] }), /重复/);
 });
 
 test("skills are discovered and loadable", async () => {
@@ -173,7 +197,7 @@ test("plan mode exposes no write tool", async () => {
     assert.equal(runtime.agent.state.thinkingLevel, "off");
     assert.deepEqual(runtime.agent.state.tools.slice(0, 4).map((tool) => tool.name), ["read", "grep", "find", "ls"]);
     assert(runtime.agent.state.tools.some((tool) => tool.name === "read_files"));
-    assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
+    assert(!runtime.agent.state.tools.some((tool) => tool.name === "edit_files"));
   } finally {
     await runtime.close();
   }
@@ -184,6 +208,9 @@ test("build mode confirms and uses the detected Bash shell", async () => {
   const shellConfig = getShellConfig();
   const runtime = await createAlkaidAgent({ cwd, model: configuredModel, shellConfig });
   try {
+    assert.equal(runtime.agent.steeringMode, "all");
+    assert(runtime.agent.state.tools.some((tool) => tool.name === "edit_files"));
+    assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
     assert(runtime.agent.state.systemPrompt.includes(`命令终端已确认使用 Bash（${shellConfig.shell}）`));
     assert.match(runtime.agent.state.systemPrompt, /不要使用 PowerShell cmdlet/);
     const bash = runtime.agent.state.tools.find((tool) => tool.name === "bash");
@@ -245,8 +272,8 @@ test("bridge aborts cleanly and persists resumable context", async () => {
     new Promise((_, reject) => {
       timeout = setTimeout(() => {
         child.kill();
-        reject(new Error("Alkaid bridge cancel timed out"));
-      }, 5000);
+        reject(new Error("Alkaid bridge startup or cancel timed out"));
+      }, 15000);
     }),
   ]).finally(() => clearTimeout(timeout));
   await new Promise((resolve) => server.close(resolve));

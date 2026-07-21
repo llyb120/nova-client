@@ -38,6 +38,10 @@ impl SdkAdapter for AlkaidAdapter {
         true
     }
 
+    fn supports_native_steer(&self) -> bool {
+        true
+    }
+
     fn cancel_grace_attempts(&self) -> usize {
         20
     }
@@ -148,7 +152,7 @@ fn alkaid_tool_call(value: &Value) -> ToolCall {
         kind: match tool {
             "bash" | "shell" => "execute",
             "read" | "read_files" | "load_skill" => "read",
-            "edit" | "write" | "write_files" => "edit",
+            "edit" | "write" | "edit_files" => "edit",
             "grep" | "find" | "ls" | "glob" => "search",
             _ => "other",
         }

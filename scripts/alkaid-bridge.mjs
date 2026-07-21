@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alkaidPromptInput, createAlkaidAgent } from "./alkaid-core.mjs";
+import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent } from "./alkaid-core.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -39,7 +39,7 @@ async function saveMessages(sessionId, messages) {
 }
 
 function startedToolItem(event) {
-  const fileChange = event.toolName === "edit" || event.toolName === "write" || event.toolName === "write_files";
+  const fileChange = event.toolName === "edit" || event.toolName === "write" || event.toolName === "edit_files";
   let type = "mcp_tool_call";
   let command;
   let server = "Alkaid";
@@ -52,7 +52,7 @@ function startedToolItem(event) {
     [, server, tool] = event.toolName.split("__");
   } else if (fileChange) {
     type = "file_change";
-    if (event.toolName === "write_files") {
+    if (event.toolName === "edit_files") {
       changes = (event.args.files ?? []).map((file) => ({ path: file.path, kind: "update" }));
     } else {
       changes = [{ path: event.args.path, kind: "update" }];
@@ -86,10 +86,17 @@ async function prompt(request, commands) {
     readOnly: request.mode === "plan",
   });
   let text = "";
-  const assistantId = `assistant-${randomUUID()}`;
+  let assistantId = `assistant-${randomUUID()}`;
+  let userMessageCount = 0;
   const toolItems = new Map();
   runtime.agent.subscribe((event) => {
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+    if (event.type === "message_start" && event.message.role === "user") {
+      userMessageCount += 1;
+      if (userMessageCount > 1) {
+        text = "";
+        assistantId = `assistant-${randomUUID()}`;
+      }
+    } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       text += event.assistantMessageEvent.delta;
       send({ type: "item", item: { id: assistantId, type: "agent_message", text } });
     } else if (event.type === "tool_execution_start") {
@@ -115,6 +122,9 @@ async function prompt(request, commands) {
       if (command.action === "cancel") {
         runtime.agent.abort();
         return;
+      }
+      if (command.action === "steer") {
+        runtime.agent.steer(await alkaidUserMessage(command.parts));
       }
     }
   })().catch((error) => send({ type: "error", message: error instanceof Error ? error.message : String(error) }));

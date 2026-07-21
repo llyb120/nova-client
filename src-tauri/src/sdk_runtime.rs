@@ -263,28 +263,7 @@ impl SdkManager {
                 parts.push(json!({ "type": "text", "text": context }));
             }
         }
-        if !text.is_empty() {
-            parts.push(json!({ "type": "text", "text": text }));
-        }
-        for image in &images {
-            if self.adapter.accepts_data_image(&image.mime_type) {
-                if let Some(data) = &image.data {
-                    parts.push(json!({
-                        "type": "image_data", "name": image.name, "mime": image.mime_type, "data": data
-                    }));
-                    continue;
-                }
-            } else if let Some(path) = save_attachment_to_temp(image) {
-                parts.push(json!({ "type": "local_image", "path": path }));
-                continue;
-            }
-            if let Some(uri) = &image.uri {
-                let path = file_uri_to_local_path(uri).unwrap_or_else(|| uri.clone());
-                parts.push(json!({
-                    "type": "local_image", "path": path
-                }));
-            }
-        }
+        parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
         let mut request = json!({
             "action": "prompt",
             "cwd": cwd,
@@ -377,19 +356,76 @@ impl SdkManager {
         self.finish_turn(thread_id, "cancelled", None);
     }
 
-    /// SDK 暂不提供向当前活跃 turn 注入提示的接口。
-    /// 收到引导消息时静默结束当前流，再复用已有 session 启动新 turn。
-    /// 整个过程不生成取消消息或中断轮次，界面持续保持运行状态。
+    /// 支持原生 steer 的 SDK 直接把用户消息排入当前 Agent run；其他 SDK
+    /// 仍静默结束当前流，再复用已有 session 启动新 turn。
     pub async fn steer_prompt(
         self: &Arc<Self>,
         thread_id: String,
         text: String,
         images: Vec<PromptImage>,
     ) {
+        if self.is_running(&thread_id) && self.adapter.supports_native_steer() {
+            self.native_steer_prompt(&thread_id, text, images).await;
+            return;
+        }
         if self.is_running(&thread_id) {
             self.interrupt_for_steer(&thread_id).await;
         }
         self.clone().run_prompt(thread_id, text, images).await;
+    }
+
+    async fn native_steer_prompt(
+        self: &Arc<Self>,
+        thread_id: &str,
+        text: String,
+        images: Vec<PromptImage>,
+    ) {
+        // set_running 早于 bridge 注册，极快的补充提示可能命中这个短窗口；稍候 bridge 就绪。
+        let mut stdin = None;
+        for _ in 0..20 {
+            stdin = self
+                .running_children
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .map(|bridge| bridge.stdin.clone());
+            if stdin.is_some() || !self.is_running(thread_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let Some(stdin) = stdin else {
+            if !self.is_running(thread_id) {
+                self.clone()
+                    .run_prompt(thread_id.to_string(), text, images)
+                    .await;
+            } else {
+                self.push_system(
+                    thread_id,
+                    "Alkaid 引导失败：运行通道尚未就绪。".into(),
+                    "error",
+                );
+            }
+            return;
+        };
+
+        // 先落 UI transcript，保证 bridge 注入后产生的新输出一定排在引导消息之后。
+        {
+            let state = self.app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            let Some(thread) = store.get_mut(thread_id) else {
+                return;
+            };
+            let item = thread.push_user(text.clone(), images.clone());
+            let _ = self.emit_update(thread_id, &item);
+            store.save();
+        }
+
+        let parts = prompt_parts(self.adapter.as_ref(), &text, &images);
+        if let Err(error) = write_line(&stdin, &json!({ "action": "steer", "parts": parts })).await
+        {
+            self.push_system(thread_id, format!("Alkaid 引导发送失败：{error}"), "error");
+        }
     }
 
     async fn interrupt_for_steer(&self, thread_id: &str) {
@@ -1150,6 +1186,31 @@ fn bridge_path(app: &AppHandle, adapter: &dyn SdkAdapter) -> Result<PathBuf, Str
             .map_err(|e| format!("释放 {} bridge 失败：{e}", adapter.label()))?;
     }
     Ok(path)
+}
+
+fn prompt_parts(adapter: &dyn SdkAdapter, text: &str, images: &[PromptImage]) -> Vec<Value> {
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    for image in images {
+        if adapter.accepts_data_image(&image.mime_type) {
+            if let Some(data) = &image.data {
+                parts.push(json!({
+                    "type": "image_data", "name": image.name, "mime": image.mime_type, "data": data
+                }));
+                continue;
+            }
+        } else if let Some(path) = save_attachment_to_temp(image) {
+            parts.push(json!({ "type": "local_image", "path": path }));
+            continue;
+        }
+        if let Some(uri) = &image.uri {
+            let path = file_uri_to_local_path(uri).unwrap_or_else(|| uri.clone());
+            parts.push(json!({ "type": "local_image", "path": path }));
+        }
+    }
+    parts
 }
 
 async fn write_line(

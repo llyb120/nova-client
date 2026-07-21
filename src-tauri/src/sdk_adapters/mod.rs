@@ -40,6 +40,10 @@ pub trait SdkAdapter: Send + Sync {
         false
     }
 
+    fn supports_native_steer(&self) -> bool {
+        false
+    }
+
     fn accepts_data_image(&self, mime_type: &str) -> bool {
         mime_type.starts_with("image/")
     }

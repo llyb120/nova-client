@@ -6,7 +6,7 @@ Alkaid 是一个基于 pi agent core 的轻量 coding agent，目标是少往返
 
 - 使用维护中的 `@earendil-works/pi-agent-core`，工具执行策略固定为 `parallel`。
 - `read_files`：单次并行读取多个 UTF-8 文件。
-- `write_files`：单次并行、临时文件 + rename 原子写入多个独立文件。
+- `edit_files`：单次并行精确编辑多个互不依赖的已有文件，复用原生 `edit` 的唯一、非重叠文本替换语义。
 - 文件工具限制在当前工作区内，拒绝目录穿越和重复写目标。
 - 启动时发现 `~/.nova/skills`、`~/.agents/skills`、`~/.codex/skills`；只把目录注入提示词，使用时再通过 `load_skill` 读取完整 `SKILL.md`。
 - 支持并行连接多个 MCP stdio server，并把工具映射为 `mcp__<server>__<tool>`。
