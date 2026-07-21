@@ -620,12 +620,6 @@ export function ChatView() {
             {fmtTokens(totalTokens())} tokens
           </span>
         </Show>
-        <Show when={state.currentId && state.running[state.currentId!]}>
-          <span class="chat-running">
-            <span class="spinner small" />
-            运行中
-          </span>
-        </Show>
         <Show
           when={
             state.agentKind === "codex" &&
