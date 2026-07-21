@@ -3,10 +3,77 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createCodingTools, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
+import { alkaidModelOptions, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
 import { connectMcpServers, createAlkaidAgent, createFilesystemTools, createSkillSupport } from "./alkaid-core.mjs";
 
-test("read_files and write_files handle batches", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "alkaid-test-"));
+const configuredModel = {
+  id: "gpt-test",
+  name: "GPT Test",
+  api: "openai-responses",
+  provider: "test",
+  baseUrl: "http://127.0.0.1/v1",
+  reasoning: true,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 128000,
+  maxTokens: 32000,
+};
+
+test("OpenCode-style JSONC config resolves providers and models", () => {
+  const config = {
+    ...parseJsonc(`{
+      // Alkaid provider
+      "model": "custom/gpt-test",
+      "provider": {
+        "custom": {
+          "npm": "@ai-sdk/openai-compatible",
+          "name": "Custom",
+          "options": { "baseURL": "http://127.0.0.1/v1", "apiKey": "{env:TEST_KEY}" },
+          "models": {
+            "gpt-test": {
+              "name": "GPT Test",
+              "reasoning": true,
+              "modalities": { "input": ["text", "image"], "output": ["text"] },
+              "limit": { "context": 200000, "output": 64000 },
+              "variants": { "high": { "reasoningEffort": "high" } },
+            },
+          },
+        },
+      },
+    }`),
+    env: { TEST_KEY: "secret" },
+  };
+  const resolved = resolveAlkaidModel(config);
+  assert.equal(resolved.apiKey, "secret");
+  assert.equal(resolved.model.api, "openai-completions");
+  assert.equal(resolved.model.provider, "custom");
+  assert.equal(resolved.model.contextWindow, 200000);
+  assert.deepEqual(resolved.model.input, ["text", "image"]);
+  assert.deepEqual(resolved.model.thinkingLevelMap, { high: "high" });
+  assert.deepEqual(alkaidModelOptions(config), [{
+    value: "custom/gpt-test",
+    name: "Custom / GPT Test",
+    _meta: { "codex.ai/supportsImages": true },
+  }]);
+  delete config.model;
+  assert.equal(resolveAlkaidModel(config).model.id, "gpt-test");
+});
+
+test("PI coding tools provide read, bash, edit and write", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "alkaid-tools-"));
+  const [read, bash, edit, write] = createCodingTools(cwd);
+  assert.deepEqual([read.name, bash.name, edit.name, write.name], ["read", "bash", "edit", "write"]);
+  assert.deepEqual(createReadOnlyTools(cwd).map((tool) => tool.name), ["read", "grep", "find", "ls"]);
+  await write.execute("1", { path: "a.txt", content: "A" });
+  assert.match((await read.execute("2", { path: "a.txt" })).content[0].text, /A/);
+  await edit.execute("3", { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] });
+  assert.match((await bash.execute("4", { command: "ls -1" })).content[0].text, /a\.txt/);
+  assert.equal(await readFile(join(cwd, "a.txt"), "utf8"), "AA");
+});
+
+test("batch file tools remain available as Alkaid enhancements", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-"));
   await Promise.all([writeFile(join(cwd, "a.txt"), "A"), writeFile(join(cwd, "b.txt"), "B")]);
   const [readFiles, writeFiles] = createFilesystemTools(cwd);
   const read = await readFiles.execute("1", { paths: ["a.txt", "b.txt"] });
@@ -18,8 +85,8 @@ test("read_files and write_files handle batches", async () => {
   assert.deepEqual(await Promise.all([readFile(join(cwd, "a.txt"), "utf8"), readFile(join(cwd, "b.txt"), "utf8")]), ["AA", "BB"]);
 });
 
-test("filesystem tools reject traversal and duplicate writes", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "alkaid-test-"));
+test("batch file tools reject traversal and duplicate writes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-"));
   const [, writeFiles] = createFilesystemTools(cwd);
   await assert.rejects(() => writeFiles.execute("1", { files: [{ path: "../outside", content: "x" }] }), /超出工作区/);
   await assert.rejects(() => writeFiles.execute("2", { files: [{ path: "x", content: "1" }, { path: "x", content: "2" }] }), /重复/);
@@ -51,10 +118,11 @@ test("MCP stdio tools are discovered and callable", async () => {
 
 test("plan mode exposes no write tool", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-plan-"));
-  const runtime = await createAlkaidAgent({ cwd, readOnly: true });
+  const runtime = await createAlkaidAgent({ cwd, readOnly: true, model: configuredModel });
   try {
-    assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
+    assert.deepEqual(runtime.agent.state.tools.slice(0, 4).map((tool) => tool.name), ["read", "grep", "find", "ls"]);
     assert(runtime.agent.state.tools.some((tool) => tool.name === "read_files"));
+    assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
   } finally {
     await runtime.close();
   }

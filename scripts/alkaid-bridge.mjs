@@ -1,32 +1,22 @@
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { createAlkaidAgent } from "./alkaid-core.mjs";
+import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
-const sessionRoot = join(homedir(), ".nova", "alkaid-sessions");
+const dataRoot = alkaidDataRoot();
+const sessionRoot = join(dataRoot, "sessions");
 const sessionPath = (sessionId) => {
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("非法 Alkaid session id");
   return join(sessionRoot, `${sessionId}.json`);
 };
 
-async function codexConfig() {
-  const text = await readFile(join(homedir(), ".codex", "config.toml"), "utf8").catch(() => "");
-  const model = text.match(/^model\s*=\s*"([^"]+)"/m)?.[1] ?? "gpt-5.5";
-  const provider = text.match(/^model_provider\s*=\s*"([^"]+)"/m)?.[1];
-  const escaped = provider?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const section = escaped ? text.split(new RegExp(`^\\[model_providers\\.${escaped}\\]$`, "m"))[1] ?? "" : "";
-  const baseUrl = section.match(/^base_url\s*=\s*"([^"]+)"/m)?.[1] ?? "https://api.openai.com/v1";
-  const envKey = section.match(/^env_key\s*=\s*"([^"]+)"/m)?.[1] ?? "OPENAI_API_KEY";
-  return { model, baseUrl, apiKey: process.env[envKey], envKey };
-}
-
 async function mcpServers() {
   const configured = process.env.ALKAID_MCP_SERVERS;
   if (configured) return JSON.parse(configured);
-  const text = await readFile(join(homedir(), ".nova", "mcp.json"), "utf8").catch(() => "{}");
+  const text = await readFile(join(dataRoot, "mcp.json"), "utf8").catch(() => "{}");
   return JSON.parse(text);
 }
 
@@ -46,14 +36,13 @@ function promptText(parts = []) {
 
 async function prompt(request) {
   const task = promptText(request.parts);
-  const config = await codexConfig();
-  if (!config.apiKey) throw new Error(`本机 Codex 凭据变量 ${config.envKey} 未注入 Nova 进程`);
+  const config = await loadAlkaidConfig({ root: dataRoot });
+  const resolved = resolveAlkaidModel(config, request.model);
   const sessionId = request.sessionId || randomUUID();
   const runtime = await createAlkaidAgent({
     cwd: request.cwd,
-    model: request.model || config.model,
-    baseUrl: config.baseUrl,
-    apiKey: config.apiKey,
+    model: resolved.model,
+    apiKey: resolved.apiKey,
     thinkingLevel: request.reasoningEffort || "high",
     mcpServers: await mcpServers(),
     sessionId,
@@ -68,8 +57,17 @@ async function prompt(request) {
       text += event.assistantMessageEvent.delta;
       send({ type: "item", item: { id: assistantId, type: "agent_message", text } });
     } else if (event.type === "tool_execution_start") {
-      const type = event.toolName.startsWith("mcp__") ? "mcp_tool_call" : event.toolName === "write_files" ? "file_change" : "command_execution";
+      const fileChange = event.toolName === "edit" || event.toolName === "write" || event.toolName === "write_files";
+      let type = "command_execution";
+      if (event.toolName.startsWith("mcp__")) type = "mcp_tool_call";
+      else if (fileChange) type = "file_change";
       const [, server, tool] = event.toolName.split("__");
+      let changes;
+      if (event.toolName === "write_files") {
+        changes = (event.args.files ?? []).map((file) => ({ path: file.path, kind: "update" }));
+      } else if (fileChange) {
+        changes = [{ path: event.args.path, kind: "update" }];
+      }
       const item = {
         id: event.toolCallId,
         type,
@@ -78,9 +76,7 @@ async function prompt(request) {
         command: event.toolName,
         server,
         tool,
-        changes: event.toolName === "write_files"
-          ? (event.args.files ?? []).map((file) => ({ path: file.path, kind: "update" }))
-          : undefined,
+        changes,
       };
       toolItems.set(event.toolCallId, item);
       send({ type: "item", item });
@@ -96,8 +92,11 @@ async function prompt(request) {
   try {
     send({ type: "ready", sessionId });
     await runtime.agent.prompt(task);
-    await saveMessages(sessionId, runtime.agent.state.messages);
     const last = runtime.agent.state.messages.at(-1);
+    if (last?.role === "assistant" && last.stopReason === "error") {
+      throw new Error(last.errorMessage || "Alkaid provider 请求失败");
+    }
+    await saveMessages(sessionId, runtime.agent.state.messages);
     send({ type: "done", usage: last?.role === "assistant" ? last.usage : undefined });
   } finally {
     await runtime.close();
@@ -105,8 +104,9 @@ async function prompt(request) {
 }
 
 async function title(request) {
-  const config = await codexConfig();
-  const runtime = await createAlkaidAgent({ cwd: request.cwd, model: request.model || config.model, baseUrl: config.baseUrl, apiKey: config.apiKey });
+  const config = await loadAlkaidConfig({ root: dataRoot });
+  const resolved = resolveAlkaidModel(config, request.model);
+  const runtime = await createAlkaidAgent({ cwd: request.cwd, model: resolved.model, apiKey: resolved.apiKey });
   let text = "";
   runtime.agent.subscribe((event) => {
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") text += event.assistantMessageEvent.delta;
@@ -124,8 +124,8 @@ try {
   const request = JSON.parse(await new Promise((resolve) => lines.once("line", resolve)));
   if (request.action === "prompt") await prompt(request);
   else if (request.action === "models") {
-    const config = await codexConfig();
-    send({ ok: true, data: { configOptions: [{ id: "model", name: "Model", currentValue: config.model, options: [{ value: config.model, name: config.model }] }], modes: null } });
+    const config = await loadAlkaidConfig({ root: dataRoot });
+    send({ ok: true, data: { configOptions: [{ id: "model", name: "Model", currentValue: defaultAlkaidModel(config), options: alkaidModelOptions(config) }], modes: null } });
   } else if (request.action === "title") await title(request);
   else throw new Error(`Alkaid bridge 不支持 action: ${request.action}`);
 } catch (error) {

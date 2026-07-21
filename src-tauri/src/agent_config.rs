@@ -155,7 +155,7 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
     let (label, path, format) = match kind {
         AgentKind::Alkaid => (
             "Alkaid",
-            home.join(".nova").join("AGENTS.md"),
+            home.join(".nova").join("alkaid").join("AGENTS.md"),
             TargetFormat::Markdown,
         ),
         AgentKind::Devin => {

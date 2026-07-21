@@ -1,4 +1,5 @@
 import { Agent } from "@earendil-works/pi-agent-core";
+import { createCodingTools, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -150,30 +151,17 @@ export async function connectMcpServers(servers = {}, cwd = process.cwd()) {
   };
 }
 
-export function createModel({ model, baseUrl }) {
-  return {
-    id: model,
-    name: model,
-    api: "openai-responses",
-    provider: "alkaid-codex",
-    baseUrl,
-    reasoning: true,
-    input: ["text", "image"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 200000,
-    maxTokens: 64000,
-  };
-}
-
 export async function createAlkaidAgent(options = {}) {
+  if (!options.model) throw new Error("Alkaid 缺少模型配置");
   const cwd = resolve(options.cwd ?? process.cwd());
   const skillSupport = await createSkillSupport(options.skillRoots);
   const mcp = await connectMcpServers(options.mcpServers, cwd);
-  const filesystemTools = createFilesystemTools(cwd).filter((tool) => !options.readOnly || tool.name !== "write_files");
-  const tools = [...filesystemTools, skillSupport.tool, ...mcp.tools];
+  const codingTools = options.readOnly ? createReadOnlyTools(cwd) : createCodingTools(cwd);
+  const batchTools = createFilesystemTools(cwd).filter((tool) => !options.readOnly || tool.name !== "write_files");
+  const tools = [...codingTools, ...batchTools, skillSupport.tool, ...mcp.tools];
   const systemPrompt = [
     "你是 Alkaid：高效、简单、面向软件工程结果。",
-    "互不依赖的工作必须并行：优先一次 read_files 读取多个文件、一次 write_files 写入多个文件；多个工具调用也可在同一轮并发发出。",
+    "你拥有 PI coding agent 的原生 read、bash、edit、write 工具，以及批量增强 read_files、write_files；互不依赖的工具调用应在同一轮并发发出。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
     options.readOnly ? "当前为计划模式：只读分析，不得修改文件。" : "",
     `工作区：${cwd}`,
@@ -184,7 +172,7 @@ export async function createAlkaidAgent(options = {}) {
   const agent = new Agent({
     initialState: {
       systemPrompt,
-      model: createModel({ model: options.model ?? "gpt-5.5", baseUrl: options.baseUrl ?? "http://127.0.0.1:8317/v1" }),
+      model: options.model,
       thinkingLevel: options.thinkingLevel ?? "high",
       tools,
       messages: options.messages ?? [],

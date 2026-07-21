@@ -1,28 +1,16 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { createAlkaidAgent } from "./alkaid-core.mjs";
-
-async function localCodexConfig() {
-  const text = await readFile(join(homedir(), ".codex", "config.toml"), "utf8").catch(() => "");
-  const model = text.match(/^model\s*=\s*"([^"]+)"/m)?.[1] ?? "gpt-5.5";
-  const provider = text.match(/^model_provider\s*=\s*"([^"]+)"/m)?.[1];
-  const section = provider ? text.split(new RegExp(`^\\[model_providers\\.${provider.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\]$`, "m"))[1] ?? "" : "";
-  const baseUrl = section.match(/^base_url\s*=\s*"([^"]+)"/m)?.[1] ?? process.env.ALKAID_BASE_URL ?? "http://127.0.0.1:8317/v1";
-  const envKey = section.match(/^env_key\s*=\s*"([^"]+)"/m)?.[1] ?? "OPENAI_API_KEY";
-  return { model, baseUrl, envKey, apiKey: process.env[envKey] };
-}
+import { loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 function send(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
 async function run(request) {
-  const local = await localCodexConfig();
-  if (!local.apiKey) throw new Error(`本机 Codex 凭据变量 ${local.envKey} 未注入当前进程`);
-  const runtime = await createAlkaidAgent({ ...local, ...request });
+  const config = await loadAlkaidConfig();
+  const resolved = resolveAlkaidModel(config, request.model);
+  const runtime = await createAlkaidAgent({ ...request, model: resolved.model, apiKey: resolved.apiKey });
   let finalText = "";
   runtime.agent.subscribe((event) => {
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
@@ -37,6 +25,10 @@ async function run(request) {
   try {
     send({ type: "ready", skills: runtime.skills.map((skill) => skill.name), toolCount: runtime.toolCount });
     await runtime.agent.prompt(request.prompt);
+    const last = runtime.agent.state.messages.at(-1);
+    if (last?.role === "assistant" && last.stopReason === "error") {
+      throw new Error(last.errorMessage || "Alkaid provider 请求失败");
+    }
     send({ type: "done", text: finalText });
   } finally {
     await runtime.close();
