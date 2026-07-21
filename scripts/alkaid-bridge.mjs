@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createAlkaidAgent } from "./alkaid-core.mjs";
+import { alkaidPromptInput, createAlkaidAgent } from "./alkaid-core.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -38,10 +38,6 @@ async function saveMessages(sessionId, messages) {
   }
 }
 
-function promptText(parts = []) {
-  return parts.filter((part) => part.type === "text").map((part) => part.text).join("\n\n");
-}
-
 function startedToolItem(event) {
   const fileChange = event.toolName === "edit" || event.toolName === "write" || event.toolName === "write_files";
   let type = "mcp_tool_call";
@@ -75,7 +71,7 @@ function startedToolItem(event) {
 }
 
 async function prompt(request, commands) {
-  const task = promptText(request.parts);
+  const input = await alkaidPromptInput(request.parts);
   const config = await loadAlkaidConfig({ root: dataRoot });
   const resolved = resolveAlkaidModel(config, request.model);
   const sessionId = request.sessionId || randomUUID();
@@ -124,7 +120,7 @@ async function prompt(request, commands) {
   })().catch((error) => send({ type: "error", message: error instanceof Error ? error.message : String(error) }));
   try {
     send({ type: "ready", sessionId });
-    await runtime.agent.prompt(task);
+    await runtime.agent.prompt(input.text, input.images);
     const last = runtime.agent.state.messages.at(-1);
     if (last?.role === "assistant" && last.stopReason === "error") {
       throw new Error(last.errorMessage || "Alkaid provider 请求失败");

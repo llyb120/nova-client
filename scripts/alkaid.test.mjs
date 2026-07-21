@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidModelOptions, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
-import { connectMcpServers, createAlkaidAgent, createFilesystemTools, createSkillSupport } from "./alkaid-core.mjs";
+import { alkaidPromptInput, connectMcpServers, createAlkaidAgent, createFilesystemTools, createSkillSupport } from "./alkaid-core.mjs";
 
 const configuredModel = {
   id: "gpt-test",
@@ -87,6 +87,23 @@ test("PI coding tools provide read, bash, edit and write", async () => {
   await edit.execute("3", { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] });
   assert.match((await bash.execute("4", { command: "ls -1" })).content[0].text, /a\.txt/);
   assert.equal(await readFile(join(cwd, "a.txt"), "utf8"), "AA");
+});
+
+test("prompt input preserves embedded and local images", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "alkaid-images-"));
+  const localImage = join(cwd, "local.png");
+  await writeFile(localImage, Buffer.from([1, 2, 3]));
+  assert.deepEqual(await alkaidPromptInput([
+    { type: "text", text: "inspect" },
+    { type: "image_data", mime: "image/webp", data: "embedded" },
+    { type: "local_image", path: localImage },
+  ]), {
+    text: "inspect",
+    images: [
+      { type: "image", data: "embedded", mimeType: "image/webp" },
+      { type: "image", data: "AQID", mimeType: "image/png" },
+    ],
+  });
 });
 
 test("batch file tools remain available as Alkaid enhancements", async () => {
