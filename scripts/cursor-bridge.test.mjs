@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
-const { completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage } = await import("./cursor-bridge.mjs");
+const { completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, sendPromptWithRecovery } = await import("./cursor-bridge.mjs");
 const state = createMessageState();
 
 assert.equal(mapMessage({ type: "assistant", run_id: "run", message: { content: [{ type: "text", text: "Hello" }] } }, state)[0].text, "Hello");
@@ -65,3 +65,58 @@ assert.deepEqual(cursorModelOptions([
 ]);
 assert.deepEqual(await promptMessage([{ type: "text", text: "look" }, { type: "image_data", mime: "image/png", data: "base64" }]), { text: "look", images: [{ data: "base64", mimeType: "image/png" }] });
 assert.equal(await promptMessage([{ type: "text", text: "inspect" }, { type: "local_image", path: "C:/Users/1/Desktop/1.xlsx" }]), "inspect\n\nAttached file: C:/Users/1/Desktop/1.xlsx");
+
+const recoveryCalls = [];
+let sendAttempts = 0;
+const recoveredRun = { id: "new-run" };
+const recoverableAgent = {
+  agentId: "agent-1",
+  send: async () => {
+    sendAttempts += 1;
+    if (sendAttempts === 1) throw new Error("already has active run");
+    return recoveredRun;
+  },
+  close: () => recoveryCalls.push("close"),
+};
+const recoverySdk = {
+  listRuns: async () => ({ items: [{ id: "stale", status: "running" }, { id: "done", status: "completed" }] }),
+  cancelRun: async (id) => recoveryCalls.push(`cancel:${id}`),
+  resume: async () => {
+    recoveryCalls.push("resume");
+    return recoverableAgent;
+  },
+};
+const timingPhases = [];
+const recovered = await sendPromptWithRecovery(
+  recoverableAgent,
+  { cwd: "." },
+  "continue",
+  {},
+  recoverySdk,
+  (phase) => timingPhases.push(phase),
+);
+assert.equal(recovered.agent, recoverableAgent);
+assert.equal(recovered.run, recoveredRun);
+assert.deepEqual(recoveryCalls, ["cancel:stale"]);
+assert.deepEqual(timingPhases, ["send_active_run", "active_run_cleanup", "send_retry"]);
+
+let fallbackAttempts = 0;
+const resumedRun = { id: "resumed-run" };
+const fallbackAgent = {
+  agentId: "agent-2",
+  send: async () => {
+    fallbackAttempts += 1;
+    throw new Error("already has active run");
+  },
+  close: () => recoveryCalls.push("fallback-close"),
+};
+const resumedAgent = { send: async () => resumedRun };
+const fallbackSdk = {
+  listRuns: async () => ({ items: [{ id: "queued", status: "queued" }] }),
+  cancelRun: async (id) => recoveryCalls.push(`cancel:${id}`),
+  resume: async () => resumedAgent,
+};
+const fallback = await sendPromptWithRecovery(fallbackAgent, { cwd: "." }, "continue", {}, fallbackSdk, () => {});
+assert.equal(fallback.agent, resumedAgent);
+assert.equal(fallback.run, resumedRun);
+assert.equal(fallbackAttempts, 2);

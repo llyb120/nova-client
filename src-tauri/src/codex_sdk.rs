@@ -1,5 +1,5 @@
 use crate::acp::{
-    apply_proxy_env, resolve_program_on_path, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
+    apply_proxy_env, resolve_program_on_path, EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
 };
 use crate::codex_radar;
 use crate::model_cache;
@@ -751,6 +751,25 @@ impl CodexSdkManager {
             }
             match event_type {
                 Some("ready") => {}
+                Some("timing") => {
+                    let phase = event
+                        .get("phase")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let elapsed_ms = event.get("elapsedMs").and_then(Value::as_u64).unwrap_or(0);
+                    let cancelled_runs = event
+                        .get("cancelledRuns")
+                        .and_then(Value::as_u64)
+                        .map(|count| format!(" cancelled_runs={count}"))
+                        .unwrap_or_default();
+                    let _ = self.app.emit(
+                        EV_LOG,
+                        format!(
+                            "[{}][timing] {phase} {elapsed_ms}ms{cancelled_runs}",
+                            self.backend.label()
+                        ),
+                    );
+                }
                 Some("item") => self.apply_item(thread_id, &event["item"], &mut item_ids),
                 Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
                 Some("permission") => self.emit_permission(thread_id, &event["permission"]),

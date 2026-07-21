@@ -7,6 +7,66 @@ import { promisify } from "node:util";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const execFileAsync = promisify(execFile);
+const TERMINAL_RUN_STATUSES = new Set(["completed", "error", "failed", "cancelled", "expired"]);
+
+function sendTiming(phase, startedAt, details = {}) {
+  send({ type: "timing", phase, elapsedMs: Math.round(performance.now() - startedAt), ...details });
+}
+
+function isActiveRunError(error) {
+  return String(error).includes("already has active run");
+}
+
+async function sendPromptWithRecovery(
+  agent,
+  request,
+  message,
+  options,
+  sdk = Agent,
+  emitTiming = sendTiming,
+) {
+  const sendStartedAt = performance.now();
+  try {
+    const run = await agent.send(message, options);
+    emitTiming("send", sendStartedAt);
+    return { agent, run };
+  } catch (error) {
+    if (!isActiveRunError(error)) throw error;
+    emitTiming("send_active_run", sendStartedAt);
+  }
+
+  const cleanupStartedAt = performance.now();
+  const runs = await sdk.listRuns(agent.agentId, { runtime: "local", cwd: request.cwd });
+  const activeRuns = runs.items.filter((run) => !TERMINAL_RUN_STATUSES.has(String(run.status).toLowerCase()));
+  for (const run of activeRuns) {
+    await sdk.cancelRun(run.id, { runtime: "local", cwd: request.cwd });
+  }
+  emitTiming("active_run_cleanup", cleanupStartedAt, { cancelledRuns: activeRuns.length });
+
+  const retryStartedAt = performance.now();
+  try {
+    const run = await agent.send(message, options);
+    emitTiming("send_retry", retryStartedAt);
+    return { agent, run };
+  } catch (error) {
+    if (!isActiveRunError(error)) throw error;
+    emitTiming("send_retry_active_run", retryStartedAt);
+  }
+
+  const resumeStartedAt = performance.now();
+  const agentId = agent.agentId;
+  agent.close();
+  const resumedAgent = await sdk.resume(agentId, {
+    apiKey: process.env.CURSOR_API_KEY,
+    model: modelSelection(request.model),
+    local: { cwd: request.cwd },
+  });
+  emitTiming("agent_resume", resumeStartedAt);
+  const finalSendStartedAt = performance.now();
+  const run = await resumedAgent.send(message, options);
+  emitTiming("send_after_resume", finalSendStartedAt);
+  return { agent: resumedAgent, run };
+}
 
 function createMessageState() {
   return { activeTextType: null, textIndex: 0, texts: new Map(), tools: new Map(), deltaTypes: new Set() };
@@ -238,36 +298,6 @@ async function main() {
     wake?.();
   });
   let agent;
-  async function sendPrompt(request, state) {
-    const options = {
-      mode: request.mode === "plan" ? "plan" : "agent",
-      onDelta: ({ update }) => {
-        try {
-          const item = mapDelta(update, state, activeRun?.id ?? "run");
-          if (item) send({ type: "item", item });
-        } catch (error) {
-          process.stderr.write(`Cursor onDelta failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-        }
-      },
-    };
-    try {
-      return await agent.send(await promptMessage(request.parts), options);
-    } catch (error) {
-      if (!String(error).includes("already has active run")) throw error;
-      const runs = await Agent.listRuns(agent.agentId, { runtime: "local", cwd: request.cwd });
-      for (const run of runs.items) {
-        if (run.status === "running") await Agent.cancelRun(run.id, { runtime: "local", cwd: request.cwd });
-      }
-      const agentId = agent.agentId;
-      agent.close();
-      agent = await Agent.resume(agentId, {
-        apiKey: process.env.CURSOR_API_KEY,
-        model: modelSelection(request.model),
-        local: { cwd: request.cwd },
-      });
-      return agent.send(await promptMessage(request.parts), options);
-    }
-  }
   while (!closed || requests.length) {
     if (!requests.length) await new Promise((resolve) => { wake = resolve; });
     const request = requests.shift();
@@ -284,13 +314,37 @@ async function main() {
       }
       send({ type: "ready", sessionId: agent.agentId });
       const state = createMessageState();
-      activeRun = await sendPrompt(request, state);
+      const turnStartedAt = performance.now();
+      let firstDeltaReceived = false;
+      const message = await promptMessage(request.parts);
+      const options = {
+        mode: request.mode === "plan" ? "plan" : "agent",
+        onDelta: ({ update }) => {
+          try {
+            if (!firstDeltaReceived) {
+              firstDeltaReceived = true;
+              sendTiming("first_delta", turnStartedAt);
+            }
+            const item = mapDelta(update, state, activeRun?.id ?? "run");
+            if (item) send({ type: "item", item });
+          } catch (error) {
+            process.stderr.write(`Cursor onDelta failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+          }
+        },
+      };
+      const promptResult = await sendPromptWithRecovery(agent, request, message, options);
+      agent = promptResult.agent;
+      activeRun = promptResult.run;
       let usage;
+      const streamStartedAt = performance.now();
       for await (const message of activeRun.stream()) {
         for (const item of mapMessage(message, state)) send({ type: "item", item });
         if (message.type === "usage") usage = message.usage;
       }
+      sendTiming("stream", streamStartedAt);
+      const waitStartedAt = performance.now();
       const result = await activeRun.wait();
+      sendTiming("wait", waitStartedAt);
       for (const item of completePendingTools(state)) send({ type: "item", item });
       if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
       send({ type: "done", usage: usage ?? result.usage });
@@ -309,4 +363,4 @@ if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => {
   process.exitCode = 1;
 });
 
-export { completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage };
+export { completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, sendPromptWithRecovery };
