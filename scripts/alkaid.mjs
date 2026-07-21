@@ -10,7 +10,12 @@ function send(value) {
 async function run(request) {
   const config = await loadAlkaidConfig();
   const resolved = resolveAlkaidModel(config, request.model);
-  const runtime = await createAlkaidAgent({ ...request, model: resolved.model, apiKey: resolved.apiKey });
+  const runtime = await createAlkaidAgent({
+    ...request,
+    model: resolved.model,
+    apiKey: resolved.apiKey,
+    thinkingLevel: resolved.thinkingLevel ?? request.thinkingLevel ?? request.reasoningEffort,
+  });
   let finalText = "";
   runtime.agent.subscribe((event) => {
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {

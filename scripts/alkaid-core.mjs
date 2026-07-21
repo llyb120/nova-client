@@ -1,11 +1,15 @@
 import { Agent } from "@earendil-works/pi-agent-core";
-import { createCodingTools, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
+import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { createReadStream } from "node:fs";
 import { readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { createInterface } from "node:readline";
+
+const DEFAULT_BATCH_READ_LINES = 200;
 
 const textResult = (text, details = undefined) => ({
   content: [{ type: "text", text: String(text) }],
@@ -21,20 +25,62 @@ function safePath(root, input) {
   return path;
 }
 
+async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES) {
+  const input = createReadStream(path, { encoding: "utf8" });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  const content = [];
+  let lineNumber = 0;
+  let truncated = false;
+  try {
+    for await (const line of lines) {
+      lineNumber += 1;
+      if (lineNumber < offset) continue;
+      if (content.length === limit) {
+        truncated = true;
+        break;
+      }
+      content.push(line);
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+  return {
+    content: content.join("\n"),
+    truncated,
+    nextOffset: truncated ? offset + content.length : undefined,
+  };
+}
+
 export function createFilesystemTools(cwd) {
   const root = resolve(cwd);
   return [
     {
       name: "read_files",
-      description: "并行读取工作区内的多个 UTF-8 文本文件。一次调用传入所有互不依赖的文件，减少往返。",
-      parameters: Type.Object({ paths: Type.Array(Type.String(), { minItems: 1 }) }),
+      description: `并行、流式读取多个 UTF-8 文本文件，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行。可为每个文件指定 offset/limit，并用返回的 nextOffset 继续读取。`,
+      parameters: Type.Object({
+        paths: Type.Array(Type.Union([
+          Type.String(),
+          Type.Object({
+            path: Type.String(),
+            offset: Type.Optional(Type.Integer({ minimum: 1 })),
+            limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000 })),
+          }),
+        ]), { minItems: 1 }),
+      }),
       async execute(_id, { paths }) {
         const results = await Promise.all(paths.map(async (input) => {
+          const request = typeof input === "string" ? { path: input } : input;
           try {
-            const path = safePath(root, input);
-            return { path: input, content: await readFile(path, "utf8") };
+            const path = safePath(root, request.path);
+            const result = await readTextLines(path, request.offset, request.limit);
+            return {
+              path: request.path,
+              content: result.content,
+              ...(result.truncated ? { truncated: true, nextOffset: result.nextOffset } : {}),
+            };
           } catch (error) {
-            return { path: input, error: error instanceof Error ? error.message : String(error) };
+            return { path: request.path, error: error instanceof Error ? error.message : String(error) };
           }
         }));
         return textResult(JSON.stringify(results), { count: results.length });
@@ -87,13 +133,8 @@ async function findSkills(roots) {
   return skills;
 }
 
-export async function createSkillSupport(extraRoots = []) {
-  const skills = await findSkills([
-    ...extraRoots,
-    join(homedir(), ".nova", "skills"),
-    join(homedir(), ".agents", "skills"),
-    join(homedir(), ".codex", "skills"),
-  ]);
+export async function createSkillSupport(root = join(homedir(), ".nova", "alkaid", "skills")) {
+  const skills = await findSkills([root]);
   const byName = new Map(skills.map((skill) => [skill.name, skill]));
   const tool = {
     name: "load_skill",
@@ -154,15 +195,19 @@ export async function connectMcpServers(servers = {}, cwd = process.cwd()) {
 export async function createAlkaidAgent(options = {}) {
   if (!options.model) throw new Error("Alkaid 缺少模型配置");
   const cwd = resolve(options.cwd ?? process.cwd());
-  const skillSupport = await createSkillSupport(options.skillRoots);
+  const skillSupport = await createSkillSupport();
   const mcp = await connectMcpServers(options.mcpServers, cwd);
-  const codingTools = options.readOnly ? createReadOnlyTools(cwd) : createCodingTools(cwd);
+  const shellConfig = options.readOnly ? null : (options.shellConfig ?? getShellConfig());
+  const codingTools = options.readOnly
+    ? createReadOnlyTools(cwd)
+    : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell } });
   const batchTools = createFilesystemTools(cwd).filter((tool) => !options.readOnly || tool.name !== "write_files");
   const tools = [...codingTools, ...batchTools, skillSupport.tool, ...mcp.tools];
   const systemPrompt = [
     "你是 Alkaid：高效、简单、面向软件工程结果。",
-    "你拥有 PI coding agent 的原生 read、bash、edit、write 工具，以及批量增强 read_files、write_files；互不依赖的工具调用应在同一轮并发发出。",
+    "你拥有 PI coding agent 的原生 read、bash、edit、write 工具，以及批量增强 read_files、write_files；读取大文件时使用 offset/limit 分段，互不依赖的工具调用应在同一轮并发发出。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
+    shellConfig ? `命令终端已确认使用 Bash（${shellConfig.shell}）；bash 工具必须从第一次调用起使用 Bash 语法，不要使用 PowerShell cmdlet。` : "",
     options.readOnly ? "当前为计划模式：只读分析，不得修改文件。" : "",
     `工作区：${cwd}`,
     "可用 Skills（需要时先调用 load_skill）：",
@@ -173,7 +218,7 @@ export async function createAlkaidAgent(options = {}) {
     initialState: {
       systemPrompt,
       model: options.model,
-      thinkingLevel: options.thinkingLevel ?? "high",
+      thinkingLevel: options.thinkingLevel,
       tools,
       messages: options.messages ?? [],
     },

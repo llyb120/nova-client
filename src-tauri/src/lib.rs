@@ -1181,9 +1181,9 @@ fn codex_skill_roots(config_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
+fn list_skill_commands(roots: Vec<PathBuf>, fallback_description: &str) -> Vec<Value> {
     let mut files = Vec::new();
-    for root in codex_skill_roots(config_dir) {
+    for root in roots {
         collect_skill_files(&root, 4, &mut files);
     }
 
@@ -1202,7 +1202,7 @@ fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
             continue;
         }
         let description = frontmatter_value(&contents, "description")
-            .unwrap_or_else(|| "Codex skill".to_string());
+            .unwrap_or_else(|| fallback_description.to_string());
         skills.entry(name.clone()).or_insert_with(|| {
             json!({
                 "name": name,
@@ -1221,6 +1221,17 @@ fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
             .cmp(b["name"].as_str().unwrap_or_default())
     });
     values
+}
+
+fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
+    list_skill_commands(codex_skill_roots(config_dir), "Codex skill")
+}
+
+fn list_alkaid_skill_commands(config_dir: &Path) -> Vec<Value> {
+    list_skill_commands(
+        vec![config_dir.join("alkaid").join("skills")],
+        "Alkaid skill",
+    )
 }
 
 /// worktree 工作目录的根：优先设置里的自定义路径，为空则回退应用数据目录下的 worktrees/。
@@ -2695,7 +2706,7 @@ async fn get_slash_commands(
         return Ok(Vec::new());
     }
     match agent_kind {
-        AgentKind::Alkaid => Ok(list_codex_skill_commands(&state.config_dir)),
+        AgentKind::Alkaid => Ok(list_alkaid_skill_commands(&state.config_dir)),
         AgentKind::Devin => {
             let commands = state.acp.fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
@@ -4937,6 +4948,9 @@ pub fn run() {
                     state.opencodeplus.seed_model_options(v);
                 }
                 state.opencodeplus.spawn_revalidate_model_options();
+                if let Some(v) = model_cache::load(&dir, AgentKind::Alkaid.as_str()) {
+                    state.alkaid.seed_model_options(v);
+                }
                 if let Some(v) = model_cache::load(&dir, "codex") {
                     state.codex.seed_model_options(v);
                 }
@@ -4956,6 +4970,7 @@ pub fn run() {
                 }
                 let default_kind = [
                     AgentKind::Devin,
+                    AgentKind::Alkaid,
                     AgentKind::Codex,
                     AgentKind::CodeBuddy,
                     AgentKind::ClaudeCode,
@@ -4971,6 +4986,9 @@ pub fn run() {
                 if server::is_headless() {
                     if state.agent_enabled(&AgentKind::Devin) {
                         state.acp.spawn_revalidate_model_options();
+                    }
+                    if state.agent_enabled(&AgentKind::Alkaid) {
+                        state.alkaid.spawn_revalidate_model_options();
                     }
                     if state.agent_enabled(&AgentKind::Codex) {
                         state.codex.spawn_revalidate_model_options();
@@ -4991,6 +5009,7 @@ pub fn run() {
                     // 与 get_model_options 共用 refreshing 闸门，避免桌面启动时双开探测 session
                     match default_kind {
                         AgentKind::Devin => state.acp.spawn_revalidate_model_options(),
+                        AgentKind::Alkaid => state.alkaid.spawn_revalidate_model_options(),
                         AgentKind::Codex | AgentKind::CodexPlus => {
                             state.codex.spawn_revalidate_model_options()
                         }

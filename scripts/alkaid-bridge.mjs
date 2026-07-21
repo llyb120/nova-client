@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createAlkaidAgent } from "./alkaid-core.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
@@ -27,14 +27,54 @@ async function loadMessages(sessionId) {
 
 async function saveMessages(sessionId, messages) {
   await mkdir(sessionRoot, { recursive: true });
-  await writeFile(sessionPath(sessionId), JSON.stringify(messages), "utf8");
+  const path = sessionPath(sessionId);
+  const temp = `${path}.${process.pid}.tmp`;
+  try {
+    await writeFile(temp, JSON.stringify(messages), "utf8");
+    await rename(temp, path);
+  } catch (error) {
+    await unlink(temp).catch(() => {});
+    throw error;
+  }
 }
 
 function promptText(parts = []) {
   return parts.filter((part) => part.type === "text").map((part) => part.text).join("\n\n");
 }
 
-async function prompt(request) {
+function startedToolItem(event) {
+  const fileChange = event.toolName === "edit" || event.toolName === "write" || event.toolName === "write_files";
+  let type = "mcp_tool_call";
+  let command;
+  let server = "Alkaid";
+  let tool = event.toolName;
+  let changes;
+  if (event.toolName === "bash") {
+    type = "command_execution";
+    command = event.args.command;
+  } else if (event.toolName.startsWith("mcp__")) {
+    [, server, tool] = event.toolName.split("__");
+  } else if (fileChange) {
+    type = "file_change";
+    if (event.toolName === "write_files") {
+      changes = (event.args.files ?? []).map((file) => ({ path: file.path, kind: "update" }));
+    } else {
+      changes = [{ path: event.args.path, kind: "update" }];
+    }
+  }
+  return {
+    id: event.toolCallId,
+    type,
+    status: "in_progress",
+    arguments: event.args,
+    command,
+    server,
+    tool,
+    changes,
+  };
+}
+
+async function prompt(request, commands) {
   const task = promptText(request.parts);
   const config = await loadAlkaidConfig({ root: dataRoot });
   const resolved = resolveAlkaidModel(config, request.model);
@@ -43,7 +83,7 @@ async function prompt(request) {
     cwd: request.cwd,
     model: resolved.model,
     apiKey: resolved.apiKey,
-    thinkingLevel: request.reasoningEffort || "high",
+    thinkingLevel: resolved.thinkingLevel ?? request.reasoningEffort,
     mcpServers: await mcpServers(),
     sessionId,
     messages: await loadMessages(request.sessionId),
@@ -57,38 +97,31 @@ async function prompt(request) {
       text += event.assistantMessageEvent.delta;
       send({ type: "item", item: { id: assistantId, type: "agent_message", text } });
     } else if (event.type === "tool_execution_start") {
-      const fileChange = event.toolName === "edit" || event.toolName === "write" || event.toolName === "write_files";
-      let type = "command_execution";
-      if (event.toolName.startsWith("mcp__")) type = "mcp_tool_call";
-      else if (fileChange) type = "file_change";
-      const [, server, tool] = event.toolName.split("__");
-      let changes;
-      if (event.toolName === "write_files") {
-        changes = (event.args.files ?? []).map((file) => ({ path: file.path, kind: "update" }));
-      } else if (fileChange) {
-        changes = [{ path: event.args.path, kind: "update" }];
-      }
-      const item = {
-        id: event.toolCallId,
-        type,
-        status: "in_progress",
-        arguments: event.args,
-        command: event.toolName,
-        server,
-        tool,
-        changes,
-      };
+      const item = startedToolItem(event);
       toolItems.set(event.toolCallId, item);
       send({ type: "item", item });
     } else if (event.type === "tool_execution_end") {
       const item = toolItems.get(event.toolCallId);
+      const output = event.result?.content?.map((part) => part.text ?? "").join("\n") ?? "";
       if (item) send({ type: "item", item: {
         ...item,
         status: event.isError ? "failed" : "completed",
-        aggregated_output: event.result?.content?.map((part) => part.text ?? "").join("\n") ?? "",
+        aggregated_output: output,
+        result: event.isError ? undefined : event.result,
+        error: event.isError ? { message: output } : undefined,
       } });
     }
   });
+  void (async () => {
+    for await (const line of commands) {
+      if (!line.trim()) continue;
+      const command = JSON.parse(line);
+      if (command.action === "cancel") {
+        runtime.agent.abort();
+        return;
+      }
+    }
+  })().catch((error) => send({ type: "error", message: error instanceof Error ? error.message : String(error) }));
   try {
     send({ type: "ready", sessionId });
     await runtime.agent.prompt(task);
@@ -97,7 +130,11 @@ async function prompt(request) {
       throw new Error(last.errorMessage || "Alkaid provider 请求失败");
     }
     await saveMessages(sessionId, runtime.agent.state.messages);
-    send({ type: "done", usage: last?.role === "assistant" ? last.usage : undefined });
+    send({
+      type: "done",
+      cancelled: last?.role === "assistant" && last.stopReason === "aborted",
+      usage: last?.role === "assistant" ? last.usage : undefined,
+    });
   } finally {
     await runtime.close();
   }
@@ -106,7 +143,12 @@ async function prompt(request) {
 async function title(request) {
   const config = await loadAlkaidConfig({ root: dataRoot });
   const resolved = resolveAlkaidModel(config, request.model);
-  const runtime = await createAlkaidAgent({ cwd: request.cwd, model: resolved.model, apiKey: resolved.apiKey });
+  const runtime = await createAlkaidAgent({
+    cwd: request.cwd,
+    model: resolved.model,
+    apiKey: resolved.apiKey,
+    thinkingLevel: resolved.thinkingLevel ?? request.reasoningEffort,
+  });
   let text = "";
   runtime.agent.subscribe((event) => {
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") text += event.assistantMessageEvent.delta;
@@ -121,8 +163,11 @@ async function title(request) {
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 try {
-  const request = JSON.parse(await new Promise((resolve) => lines.once("line", resolve)));
-  if (request.action === "prompt") await prompt(request);
+  const commands = lines[Symbol.asyncIterator]();
+  const first = await commands.next();
+  if (first.done) throw new Error("Alkaid bridge 缺少请求");
+  const request = JSON.parse(first.value);
+  if (request.action === "prompt") await prompt(request, commands);
   else if (request.action === "models") {
     const config = await loadAlkaidConfig({ root: dataRoot });
     send({ ok: true, data: { configOptions: [{ id: "model", name: "Model", currentValue: defaultAlkaidModel(config), options: alkaidModelOptions(config) }], modes: null } });

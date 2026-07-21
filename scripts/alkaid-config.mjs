@@ -101,20 +101,34 @@ export async function loadAlkaidConfig({ root = alkaidDataRoot(), env = process.
 }
 
 export function defaultAlkaidModel(config) {
-  const first = alkaidModelOptions(config)[0]?.value;
-  const selection = config.model ?? first;
+  const options = alkaidModelOptions(config);
+  let selection = config.model;
+  if (selection && !options.some((option) => option.value === selection)) {
+    const [providerId, ...modelParts] = selection.split("/");
+    const model = config.provider[providerId]?.models?.[modelParts.join("/")];
+    const effort = model?.options?.reasoningEffort;
+    selection = options.find((option) => option.value === `${config.model}/variant/${effort}`)?.value;
+  }
+  selection ??= options[0]?.value;
   if (!selection) throw new Error("Alkaid 配置没有可用模型");
   return selection;
 }
 
 export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config)) {
   if (!selection || !selection.includes("/")) throw new Error("Alkaid model 必须是 provider/model 格式");
-  const [providerId, ...modelParts] = selection.split("/");
+  const marker = "/variant/";
+  const variantIndex = selection.lastIndexOf(marker);
+  const variant = variantIndex >= 0 ? selection.slice(variantIndex + marker.length) : undefined;
+  const baseSelection = variantIndex >= 0 ? selection.slice(0, variantIndex) : selection;
+  const [providerId, ...modelParts] = baseSelection.split("/");
   const modelId = modelParts.join("/");
   const provider = config.provider[providerId];
   const model = provider?.models?.[modelId];
   if (!provider) throw new Error(`Alkaid provider 不存在：${providerId}`);
-  if (!model) throw new Error(`Alkaid model 不存在：${selection}`);
+  if (!model) throw new Error(`Alkaid model 不存在：${baseSelection}`);
+  if (variant && !Object.hasOwn(model.variants ?? {}, variant)) {
+    throw new Error(`Alkaid model 不支持思考强度：${selection}`);
+  }
   const options = provider.options ?? {};
   const baseUrl = resolveEnv(options.baseURL ?? options.baseUrl, config.env);
   if (!baseUrl) throw new Error(`Alkaid provider 缺少 options.baseURL：${providerId}`);
@@ -124,6 +138,9 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
   ]));
   return {
     apiKey: resolveEnv(options.apiKey, config.env),
+    thinkingLevel: variant
+      ? model.variants[variant]?.reasoningEffort ?? variant
+      : model.options?.reasoningEffort,
     model: {
       id: modelId,
       name: model.name ?? modelId,
@@ -142,12 +159,24 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
   };
 }
 
+function variantLabel(variant) {
+  const labels = { minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "XHigh", max: "Max" };
+  return labels[variant] ?? variant;
+}
+
 export function alkaidModelOptions(config) {
   return Object.entries(config.provider).flatMap(([providerId, provider]) =>
-    Object.entries(provider.models ?? {}).map(([modelId, model]) => ({
-      value: `${providerId}/${modelId}`,
-      name: `${provider.name ?? providerId} / ${model.name ?? modelId}`,
-      _meta: { "codex.ai/supportsImages": model.modalities?.input?.includes("image") ?? false },
-    })),
+    Object.entries(provider.models ?? {}).flatMap(([modelId, model]) => {
+      const value = `${providerId}/${modelId}`;
+      const name = `${provider.name ?? providerId} / ${model.name ?? modelId}`;
+      const meta = { "codex.ai/supportsImages": model.modalities?.input?.includes("image") ?? false };
+      const variants = Object.keys(model.variants ?? {});
+      if (variants.length === 0) return [{ value, name, _meta: meta }];
+      return variants.map((variant) => ({
+        value: `${value}/variant/${variant}`,
+        name: `${name} · ${variantLabel(variant)}`,
+        _meta: meta,
+      }));
+    }),
   );
 }
