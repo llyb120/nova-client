@@ -3,6 +3,10 @@
 }
 
 .composer-engraved-watermark.signing {
+  /* mask 会按元素边框盒裁剪花体溢出笔画；扩大上下盒子并等量抵消 bottom，
+     只扩展动画绘制范围，不移动签名内容。 */
+  bottom: 19px;
+  padding-block: 28px;
   z-index: 3;
 }
 
