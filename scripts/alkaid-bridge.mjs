@@ -86,7 +86,9 @@ async function prompt(request, commands) {
     readOnly: request.mode === "plan",
   });
   let text = "";
+  let thinking = "";
   let assistantId = `assistant-${randomUUID()}`;
+  let thinkingId = `thinking-${randomUUID()}`;
   let userMessageCount = 0;
   const toolItems = new Map();
   runtime.agent.subscribe((event) => {
@@ -94,11 +96,16 @@ async function prompt(request, commands) {
       userMessageCount += 1;
       if (userMessageCount > 1) {
         text = "";
+        thinking = "";
         assistantId = `assistant-${randomUUID()}`;
+        thinkingId = `thinking-${randomUUID()}`;
       }
     } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       text += event.assistantMessageEvent.delta;
       send({ type: "item", item: { id: assistantId, type: "agent_message", text } });
+    } else if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_delta") {
+      thinking += event.assistantMessageEvent.delta;
+      send({ type: "item", item: { id: thinkingId, type: "reasoning", text: thinking } });
     } else if (event.type === "tool_execution_start") {
       const item = startedToolItem(event);
       toolItems.set(event.toolCallId, item);
