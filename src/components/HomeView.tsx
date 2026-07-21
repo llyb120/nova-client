@@ -32,12 +32,14 @@ import type { AgentKind, Peer } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
-import { IconClue, IconFolder, IconLogo, IconSend, IconX } from "./icons";
+import { IconClue, IconFolder, IconLogo, IconSend, IconUsers, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 import { TypewriterText } from "./TypewriterText";
+
+const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
 
 /** codex 风格草稿首页：输入任务 + 选择项目/模型/模式，回车即开干 */
 export function HomeView() {
@@ -55,6 +57,15 @@ export function HomeView() {
   const [model, setModel] = createSignal(lastUsed.model(agentKind()));
   const [mode, setMode] = createSignal(lastUsed.mode(agentKind()));
   const [busy, setBusy] = createSignal(false);
+  const [employeeMenuOpen, setEmployeeMenuOpen] = createSignal(false);
+  const [selectedEmployeeId, setSelectedEmployeeId] = createSignal<string | null>(
+    localStorage.getItem(LAST_EMPLOYEE_KEY) || null,
+  );
+  const selectedEmployee = createMemo(() =>
+    state.employees.find(
+      (employee) => employee.id === selectedEmployeeId() && employee.enabled,
+    ) ?? null,
+  );
   const [quotaCancelling, setQuotaCancelling] = createSignal(false);
   // 漫游目标：选中队友目录后在对方机器上执行，本机只接收
   const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
@@ -80,6 +91,7 @@ export function HomeView() {
   let submittingPrompt = false;
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
+  let employeePickerRef: HTMLDivElement | undefined;
   type PrewarmTarget = {
     cwd?: string;
     agentKind?: AgentKind;
@@ -92,6 +104,34 @@ export function HomeView() {
     textareaRef.style.height = "auto";
     textareaRef.style.height = Math.min(textareaRef.scrollHeight, 220) + "px";
   };
+
+  const pickEmployee = (employeeId: string | null) => {
+    setSelectedEmployeeId(employeeId);
+    if (employeeId) localStorage.setItem(LAST_EMPLOYEE_KEY, employeeId);
+    else localStorage.removeItem(LAST_EMPLOYEE_KEY);
+    setEmployeeMenuOpen(false);
+  };
+
+  createEffect(() => {
+    const selectedId = selectedEmployeeId();
+    if (
+      selectedId &&
+      state.employees.length > 0 &&
+      !state.employees.some((employee) => employee.id === selectedId && employee.enabled)
+    ) {
+      pickEmployee(null);
+    }
+    if (roam() || quotaPeer()) setEmployeeMenuOpen(false);
+  });
+
+  onMount(() => {
+    const closeEmployeeMenu = (event: PointerEvent) => {
+      if (!employeeMenuOpen() || employeePickerRef?.contains(event.target as Node)) return;
+      setEmployeeMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeEmployeeMenu);
+    onCleanup(() => document.removeEventListener("pointerdown", closeEmployeeMenu));
+  });
 
   createEffect(() => {
     text();
@@ -375,6 +415,7 @@ export function HomeView() {
     const images = attach.images();
     const target = roam();
     const quota = quotaPeer();
+    const employeeId = !target && !quota ? selectedEmployee()?.id ?? null : null;
     const clue = state.pendingClueCard;
     if (
       (!t && images.length === 0) ||
@@ -383,7 +424,8 @@ export function HomeView() {
       !peerReady() ||
       (usesPeerModels() && configAgentKinds().length === 0)
     ) return;
-    const wtOn = opts.worktree === true && worktreeAvailable();
+    // 员工会由 Wake 自己决定 current/branch/worktree；不要再叠加首页手动 worktree。
+    const wtOn = !employeeId && opts.worktree === true && worktreeAvailable();
     const branch = opts.branch?.trim() ?? "";
     const base = wtOn ? opts.base?.trim() ?? "" : "";
     if (wtOn && !branch && !base) return; // 新分支名与基于分支至少填一个（留空分支名 = 直接用所选分支）
@@ -443,7 +485,7 @@ export function HomeView() {
         );
         if (!ephemeral) lastUsed.setModel(agentKind(), model());
         if (clue) clearPendingClueCard();
-        await sendPrompt(t, images);
+        await sendPrompt(t, images, employeeId);
       }
       setText("");
       setSlashStart(null);
@@ -742,6 +784,54 @@ export function HomeView() {
             >
               <IconClue size={16} />
             </button>
+            <Show when={!roam() && !quotaPeer() && state.employees.length > 0}>
+              <div ref={employeePickerRef} class="composer-employee-picker">
+                <Show when={employeeMenuOpen()}>
+                  <div class="composer-employee-menu">
+                    <div class="composer-employee-head">本次工作交给</div>
+                    <button
+                      type="button"
+                      classList={{
+                        "composer-employee-item": true,
+                        active: !selectedEmployeeId(),
+                      }}
+                      onClick={() => pickEmployee(null)}
+                    >
+                      <span>普通会话</span>
+                      <small>直接由当前模型执行</small>
+                    </button>
+                    <For each={state.employees.filter((employee) => employee.enabled)}>
+                      {(employee) => (
+                        <button
+                          type="button"
+                          classList={{
+                            "composer-employee-item": true,
+                            active: selectedEmployeeId() === employee.id,
+                          }}
+                          onClick={() => pickEmployee(employee.id)}
+                        >
+                          <span>{employee.name}</span>
+                          <small>Wake → Do · Dream 生效</small>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+                <button
+                  type="button"
+                  class="composer-btn employee"
+                  classList={{ active: !!selectedEmployee() }}
+                  onClick={() => setEmployeeMenuOpen((open) => !open)}
+                  title={
+                    selectedEmployee()
+                      ? `本次工作：${selectedEmployee()!.name}`
+                      : "选择本次工作的数字员工"
+                  }
+                >
+                  <IconUsers size={16} />
+                </button>
+              </div>
+            </Show>
             <button
               class="composer-btn send"
               disabled={
