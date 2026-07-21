@@ -12,7 +12,7 @@
     "build:codex-bridge": "esbuild scripts/codex-bridge.mjs --bundle --platform=node --format=esm --outfile=src-tauri/resources/codex-bridge.mjs",
     "build:codebuddy-bridge": "esbuild scripts/codebuddy-bridge.mjs --bundle --platform=node --format=cjs --outfile=src-tauri/resources/codebuddy-bridge.cjs",
     "build:claude-bridge": "esbuild scripts/claude-bridge.mjs --bundle --platform=node --format=esm --outfile=src-tauri/resources/claude-bridge.mjs",
-    "build:cursor-bridge": "esbuild scripts/cursor-bridge.mjs --bundle --platform=node --format=esm --external:bun:sqlite --external:vendor/* --loader:.map=empty --loader:.ts=empty --banner:js=\"import{createRequire}from'node:module';const require=createRequire(import.meta.url);\" --outfile=src-tauri/resources/cursor-bridge.mjs",
+    "build:cursor-bridge": "esbuild scripts/cursor-bridge.mjs --bundle --platform=node --format=esm --external:bun:sqlite --external:vendor/* --loader:.map=empty --loader:.ts=empty --loader:.schemas=empty --banner:js=\"import{createRequire}from'node:module';const require=createRequire(import.meta.url);\" --outfile=src-tauri/resources/cursor-bridge.mjs",
     "check": "tsc --noEmit",
     "preview": "vite preview",
     "tauri": "tauri",
