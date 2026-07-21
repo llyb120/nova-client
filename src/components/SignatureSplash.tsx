@@ -1,52 +1,88 @@
 import { onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { api } from "../ipc";
+import { restoreSettled } from "../store";
 import { setSignatureProgress, signatureProgress } from "./signatureOverlay";
 import "./SignatureSplash.css";
 
 /** 描笔时长；之后稍作停留再固化。 */
 const REVEAL_MS = 2600;
 const SETTLE_HOLD_MS = 500;
+/** 等恢复结论/目标水印渲染的最长等待，异常时不至于永远签不上。 */
+const WAIT_TIMEOUT_MS = 3000;
 
 /**
  * 启动签名：在输入框水印原位置、原样式上描笔——水印本体被斜边软刷从左到右揭开，
  * 笔尖光点沿基线游走；签完进度置回 null，水印就地固化。颜色与位置即水印本身。
+ * 升级重启会先恢复之前的会话：等恢复有结论后，在最终显示的输入框水印上签。
  */
 export function SignatureSplash() {
   let markEl: HTMLElement | null = null;
   let nameEl: Element | null = null;
   let raf = 0;
   let holdTimer: number | undefined;
+  let waitInterval: number | undefined;
+  let waitTimer: number | undefined;
+  let started = false;
 
   const stop = () => {
     cancelAnimationFrame(raf);
     window.clearTimeout(holdTimer);
+    window.clearInterval(waitInterval);
+    window.clearTimeout(waitTimer);
     setSignatureProgress(null);
+  };
+
+  const beginStroke = () => {
+    const start = performance.now();
+    const tick = (now: number) => {
+      const p = Math.min(1, (now - start) / REVEAL_MS);
+      setSignatureProgress(p);
+      if (p < 1) {
+        raf = requestAnimationFrame(tick);
+      } else {
+        holdTimer = window.setTimeout(stop, SETTLE_HOLD_MS);
+      }
+    };
+    setSignatureProgress(0);
+    raf = requestAnimationFrame(tick);
+  };
+
+  const start = () => {
+    if (started) return;
+    started = true;
+    // 恢复结论刚出来时目标视图可能尚未挂载（如 ChatView 正在打开会话），逐帧重试定位水印。
+    const locate = (attempts: number) => {
+      const mark = document.querySelector<HTMLElement>(".composer-engraved-watermark");
+      const r = mark?.getBoundingClientRect();
+      if (mark && r && r.width > 0 && r.height > 0) {
+        markEl = mark;
+        nameEl = mark.querySelector(".engraved-number-mark-name");
+        beginStroke();
+        return;
+      }
+      if (attempts > 0) {
+        raf = requestAnimationFrame(() => locate(attempts - 1));
+      }
+    };
+    locate(60);
   };
 
   onMount(() => {
     void api.signaturePending().then((value) => {
       if (!value) return;
-      // 等一帧让首页水印渲染完再开始。
-      requestAnimationFrame(() => {
-        markEl = document.querySelector<HTMLElement>(".composer-engraved-watermark");
-        if (!markEl) return;
-        const r = markEl.getBoundingClientRect();
-        if (r.width <= 0 || r.height <= 0) return;
-        nameEl = markEl.querySelector(".engraved-number-mark-name");
-        const start = performance.now();
-        const tick = (now: number) => {
-          const p = Math.min(1, (now - start) / REVEAL_MS);
-          setSignatureProgress(p);
-          if (p < 1) {
-            raf = requestAnimationFrame(tick);
-          } else {
-            holdTimer = window.setTimeout(stop, SETTLE_HOLD_MS);
-          }
-        };
-        setSignatureProgress(0);
-        raf = requestAnimationFrame(tick);
-      });
+      // 升级重启会恢复之前的会话：等恢复有结论，签名落在最终显示的输入框里；
+      // 普通启动 restoreSettled 很快置位，直接在主页输入框签。超时兜底防卡死。
+      waitInterval = window.setInterval(() => {
+        if (restoreSettled()) {
+          window.clearInterval(waitInterval);
+          start();
+        }
+      }, 100);
+      waitTimer = window.setTimeout(() => {
+        window.clearInterval(waitInterval);
+        start();
+      }, WAIT_TIMEOUT_MS);
     });
   });
 

@@ -1616,6 +1616,9 @@ export async function refreshSlashCommands(agentKind: AgentKind) {
   }
 }
 
+/** 升级重启的会话恢复是否已有结论（恢复完成或确认无需恢复）。启动签名据此等待目标视图稳定。 */
+export const [restoreSettled, setRestoreSettled] = createSignal(false);
+
 export async function initStore() {
   if (initialized) return;
   initialized = true;
@@ -2000,13 +2003,15 @@ export async function initStore() {
   // 普通启动时后端返回 null，不会恢复任何会话。
   void api
     .takeRestoreThread()
-    .then((id) => {
+    .then(async (id) => {
       if (id && !state.currentId && state.threads.some((t) => t.id === id)) {
-        void openThread(id);
+        await openThread(id).catch(() => {});
       }
+      setRestoreSettled(true);
     })
     .catch(() => {
       // 无恢复标记或读取失败时静默停留在主页
+      setRestoreSettled(true);
     });
 
   // 监听用户交互并节流上报活动，供后端静默升级判断「一段时间没有操作」
