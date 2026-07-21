@@ -261,6 +261,28 @@ async function modelOptions() {
   };
 }
 
+async function generateTitle(request) {
+  const agent = await Agent.create({
+    apiKey: process.env.CURSOR_API_KEY,
+    model: modelSelection(request.model),
+    local: { cwd: request.cwd },
+  });
+  try {
+    const run = await agent.send(request.prompt);
+    const result = await run.wait();
+    if (result.status === "error") throw new Error(result.error?.message || "Cursor title generation failed");
+    if (result.result) return result.result;
+    const turns = await run.conversation();
+    return turns
+      .flatMap((turn) => turn.type === "agentConversationTurn" ? turn.turn.steps : [])
+      .filter((step) => step.type === "assistantMessage")
+      .map((step) => step.message.text)
+      .at(-1) ?? "";
+  } finally {
+    agent.close();
+  }
+}
+
 async function promptMessage(parts) {
   const textParts = parts.filter((part) => part.type === "text").map((part) => part.text);
   const images = [];
@@ -305,6 +327,10 @@ async function main() {
     try {
       if (request.action === "models") {
         send({ ok: true, data: await modelOptions() });
+        continue;
+      }
+      if (request.action === "title") {
+        send({ ok: true, data: await generateTitle(request) });
         continue;
       }
       if (request.action !== "prompt") throw new Error(`Unknown action: ${request.action}`);

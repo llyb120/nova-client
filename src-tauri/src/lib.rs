@@ -191,6 +191,21 @@ impl AppState {
                 .generate_title_async(thread_id, prompt, fallback, String::new());
             return;
         }
+        if AgentKind::from_str(&agent_raw) == Some(AgentKind::Cursor)
+            && self.agent_enabled(&AgentKind::Cursor)
+        {
+            self.cursorplus
+                .generate_title_async(thread_id, prompt, fallback, model);
+            return;
+        }
+        if agent_raw.is_empty()
+            && origin == &AgentKind::Cursor
+            && self.agent_enabled(&AgentKind::Cursor)
+        {
+            self.cursorplus
+                .generate_title_async(thread_id, prompt, fallback, String::new());
+            return;
+        }
         if matches!(
             AgentKind::from_str(&agent_raw),
             Some(AgentKind::Codex | AgentKind::CodexPlus)
@@ -209,12 +224,9 @@ impl AppState {
             return;
         }
         let (mgr, model) = match AgentKind::from_str(&agent_raw) {
-            Some(
-                AgentKind::CodeBuddy
-                | AgentKind::CodeBuddyPlus
-                | AgentKind::ClaudeCode
-                | AgentKind::Cursor,
-            ) => (self.acp.clone(), String::new()),
+            Some(AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::ClaudeCode) => {
+                (self.acp.clone(), String::new())
+            }
             Some(kind) if self.agent_enabled(&kind) => match self.acp_for(&kind) {
                 Some(mgr) => (mgr, model),
                 None => (self.title_fallback_mgr(origin), String::new()),

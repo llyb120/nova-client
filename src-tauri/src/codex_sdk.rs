@@ -182,7 +182,9 @@ impl CodexSdkManager {
                 .or_else(|| thread.acp_session_id.clone());
             let item = thread.push_user(text.clone(), images.clone());
             let user_item_id = item.id();
-            if self.backend == SdkBackend::Codex && thread.title == "新会话" {
+            if matches!(self.backend, SdkBackend::Codex | SdkBackend::Cursor)
+                && thread.title == "新会话"
+            {
                 let fallback = derive_title(&text, !images.is_empty());
                 thread.title = fallback.clone();
                 title_job = Some((text.clone(), fallback));
@@ -565,7 +567,7 @@ impl CodexSdkManager {
         fallback: String,
         model: String,
     ) {
-        if self.backend != SdkBackend::Codex {
+        if !matches!(self.backend, SdkBackend::Codex | SdkBackend::Cursor) {
             return;
         }
         let manager = self.clone();
@@ -574,9 +576,13 @@ impl CodexSdkManager {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            let model = split_codex_effort(&model)
-                .map(|(model, _)| model)
-                .unwrap_or(&model);
+            let model = if manager.backend == SdkBackend::Codex {
+                split_codex_effort(&model)
+                    .map(|(model, _)| model)
+                    .unwrap_or(&model)
+            } else {
+                &model
+            };
             let request = json!({
                 "action": "title",
                 "cwd": cwd,

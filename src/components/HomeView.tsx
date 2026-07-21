@@ -161,6 +161,7 @@ export function HomeView() {
 
   const pickModel = (v: string) => {
     setModel(v);
+    lastUsed.setModel(agentKind(), v);
     prewarmCurrent({ model: v });
   };
   const pickMode = (v: string) => {
@@ -323,9 +324,7 @@ export function HomeView() {
   const selectProject = (p: string, warm = false) => {
     setRoam(null); // 选了本地项目就退出漫游
     setCwd(p);
-    const nextModel = resolveAvailableModel(agentKind(), lastUsed.model(agentKind()));
-    setModel(nextModel);
-    if (warm) prewarmCurrent({ cwd: p, model: nextModel });
+    if (warm) prewarmCurrent({ cwd: p });
   };
 
   const ensureScratchProject = () => {
