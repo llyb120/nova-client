@@ -195,8 +195,7 @@ test("plan mode exposes no write tool", async () => {
   const runtime = await createAlkaidAgent({ cwd, readOnly: true, model: configuredModel });
   try {
     assert.equal(runtime.agent.state.thinkingLevel, "off");
-    assert.deepEqual(runtime.agent.state.tools.slice(0, 4).map((tool) => tool.name), ["read", "grep", "find", "ls"]);
-    assert(runtime.agent.state.tools.some((tool) => tool.name === "read_files"));
+    assert.deepEqual(runtime.agent.state.tools.slice(0, 5).map((tool) => tool.name), ["read_files", "read", "grep", "find", "ls"]);
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "edit_files"));
   } finally {
     await runtime.close();
@@ -209,8 +208,9 @@ test("build mode confirms and uses the detected Bash shell", async () => {
   const runtime = await createAlkaidAgent({ cwd, model: configuredModel, shellConfig });
   try {
     assert.equal(runtime.agent.steeringMode, "all");
-    assert(runtime.agent.state.tools.some((tool) => tool.name === "edit_files"));
+    assert.deepEqual(runtime.agent.state.tools.slice(0, 2).map((tool) => tool.name), ["read_files", "edit_files"]);
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
+    assert.match(runtime.agent.state.systemPrompt, /两个及以上路径已知.*必须优先使用 read_files/);
     assert(runtime.agent.state.systemPrompt.includes(`命令终端已确认使用 Bash（${shellConfig.shell}）`));
     assert.match(runtime.agent.state.systemPrompt, /不要使用 PowerShell cmdlet/);
     const bash = runtime.agent.state.tools.find((tool) => tool.name === "bash");

@@ -96,7 +96,7 @@ export function createFilesystemTools(cwd, editTool = null) {
   const tools = [
     {
       name: "read_files",
-      description: `并行、流式读取多个 UTF-8 文本文件，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行。可为每个文件指定 offset/limit，并用返回的 nextOffset 继续读取。`,
+      description: `优先用于一次读取两个及以上路径已知的 UTF-8 文本文件；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行。可为每个文件指定 offset/limit，并用返回的 nextOffset 继续读取。`,
       parameters: Type.Object({
         paths: Type.Array(Type.Union([
           Type.String(),
@@ -237,10 +237,10 @@ export async function createAlkaidAgent(options = {}) {
     : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell } });
   const editTool = codingTools.find((tool) => tool.name === "edit");
   const batchTools = createFilesystemTools(cwd, editTool);
-  const tools = [...codingTools, ...batchTools, skillSupport.tool, ...mcp.tools];
+  const tools = [...batchTools, ...codingTools, skillSupport.tool, ...mcp.tools];
   const systemPrompt = [
     "你是 Alkaid：高效、简单、面向软件工程结果。",
-    "你拥有 PI coding agent 的原生 read、bash、edit、write 工具，以及批量增强 read_files、edit_files；读取大文件时使用 offset/limit 分段。修改两个及以上互不依赖的已有文件时优先使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
+    "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。读取两个及以上路径已知、互不依赖的文本文件时必须优先使用 read_files，不要连续调用多个单文件 read；只有目标路径依赖前一次结果，或内容不是 UTF-8 文本时才使用原生 read。修改两个及以上互不依赖的已有文件时必须优先使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。读取大文件时使用 offset/limit 分段；仅在存在先后依赖或目标重叠时串行调用工具。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
     shellConfig ? `命令终端已确认使用 Bash（${shellConfig.shell}）；bash 工具必须从第一次调用起使用 Bash 语法，不要使用 PowerShell cmdlet。` : "",
     options.readOnly ? "当前为计划模式：只读分析，不得修改文件。" : "",
