@@ -126,47 +126,73 @@ assert.deepEqual(promptArgs, {
   parts: [{ type: "text", text: "继续检查" }],
 });
 
-let steerArgs;
+const steerCalls = [];
+let steerBusy = false;
 await steerPrompt({
-  v2: {
-    session: {
-      prompt: async (args) => {
-        steerArgs = args;
-        return {};
-      },
+  session: {
+    abort: async (args) => {
+      steerCalls.push(["abort", args]);
+      return { data: true };
     },
+    messages: async () => ({ data: [] }),
+    promptAsync: async (args) => {
+      steerCalls.push(["promptAsync", args]);
+      steerBusy = true;
+      return {};
+    },
+    status: async () => ({
+      data: steerBusy ? { "session-1": { type: "busy" } } : { "session-1": { type: "idle" } },
+    }),
   },
 }, "session-1", [
   { type: "text", text: "先定位根因" },
-  { type: "text", text: "不要重构" },
   { type: "file", filename: "trace.png", url: "data:image/png;base64,abc", mime: "image/png" },
-]);
-assert.deepEqual(steerArgs, {
-  sessionID: "session-1",
-  prompt: {
-    text: "先定位根因\n不要重构",
-    files: [{ uri: "data:image/png;base64,abc", name: "trace.png" }],
-  },
-  delivery: "steer",
+], {
+  model: { providerID: "openai", modelID: "gpt-5" },
+  variant: "high",
 });
+assert.deepEqual(steerCalls, [
+  ["abort", { sessionID: "session-1" }],
+  ["promptAsync", {
+    sessionID: "session-1",
+    model: { providerID: "openai", modelID: "gpt-5" },
+    variant: "high",
+    parts: [
+      { type: "text", text: "先定位根因" },
+      { type: "file", filename: "trace.png", url: "data:image/png;base64,abc", mime: "image/png" },
+    ],
+  }],
+]);
 
-steerArgs = undefined;
+steerCalls.length = 0;
+steerBusy = false;
 await startPrompt({
-  v2: {
-    session: {
-      prompt: async (args) => {
-        steerArgs = args;
-        return {};
-      },
+  session: {
+    abort: async (args) => {
+      steerCalls.push(["abort", args]);
+      return { data: true };
     },
+    messages: async () => ({ data: [] }),
+    promptAsync: async (args) => {
+      steerCalls.push(["promptAsync", args]);
+      steerBusy = true;
+      return {};
+    },
+    status: async () => ({
+      data: steerBusy ? { "session-1": { type: "busy" } } : {},
+    }),
   },
 }, "session-1", {
   action: "prompt",
   delivery: "steer",
+  model: { providerID: "openai", modelID: "gpt-5" },
   parts: [{ type: "text", text: "改为只修复测试" }],
 });
-assert.deepEqual(steerArgs, {
-  sessionID: "session-1",
-  prompt: { text: "改为只修复测试" },
-  delivery: "steer",
-});
+assert.deepEqual(steerCalls, [
+  ["abort", { sessionID: "session-1" }],
+  ["promptAsync", {
+    sessionID: "session-1",
+    model: { providerID: "openai", modelID: "gpt-5" },
+    parts: [{ type: "text", text: "改为只修复测试" }],
+  }],
+]);

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
@@ -48,6 +48,8 @@ pub struct OpenCodeSdkManager {
     model_options: Mutex<Option<Value>>,
     model_options_refreshing: AtomicBool,
     model_options_revalidated: AtomicBool,
+    next_run_epoch: AtomicU64,
+    run_epochs: Mutex<HashMap<String, u64>>,
 }
 
 impl OpenCodeSdkManager {
@@ -66,6 +68,8 @@ impl OpenCodeSdkManager {
             model_options: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
             model_options_revalidated: AtomicBool::new(false),
+            next_run_epoch: AtomicU64::new(1),
+            run_epochs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -232,6 +236,11 @@ impl OpenCodeSdkManager {
                 fallback,
             );
         }
+        let run_epoch = self.next_run_epoch.fetch_add(1, Ordering::Relaxed);
+        self.run_epochs
+            .lock()
+            .unwrap()
+            .insert(thread_id.clone(), run_epoch);
         self.set_running(&thread_id, true, None);
 
         if model.as_deref().is_some_and(codex_radar::is_auto_model) {
@@ -251,12 +260,18 @@ impl OpenCodeSdkManager {
                     Ok(options) => options,
                     Err(error) => {
                         self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                        self.finish_turn(&thread_id, "error");
+                        self.finish_turn_if_current(&thread_id, run_epoch, "error");
                         return;
                     }
                 };
+                if !self.is_current_run(&thread_id, run_epoch) {
+                    return;
+                }
                 match codex_radar::resolve_auto_model(&selection, &options, true).await {
                     Ok(resolved) => {
+                        if !self.is_current_run(&thread_id, run_epoch) {
+                            return;
+                        }
                         model = Some(resolved.value.clone());
                         let state = self.app.state::<AppState>();
                         let mut store = state.store.lock().unwrap();
@@ -274,7 +289,7 @@ impl OpenCodeSdkManager {
                     }
                     Err(error) => {
                         self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                        self.finish_turn(&thread_id, "error");
+                        self.finish_turn_if_current(&thread_id, run_epoch, "error");
                         return;
                     }
                 }
@@ -311,9 +326,9 @@ impl OpenCodeSdkManager {
         });
         let request = with_command(request, &text);
         let outcome = self
-            .run_prompt_bridge(&thread_id, &cwd, request, user_item_id)
+            .run_prompt_bridge(&thread_id, &cwd, request, user_item_id, run_epoch)
             .await;
-        if !self.is_running(&thread_id) {
+        if !self.is_current_run(&thread_id, run_epoch) {
             return;
         }
         let succeeded = outcome.is_ok();
@@ -323,81 +338,56 @@ impl OpenCodeSdkManager {
                 self.push_system(&thread_id, format!("OpenCode+ 请求失败：{error}"), "error")
             }
         }
-        self.finish_turn(&thread_id, if succeeded { "end_turn" } else { "error" });
+        self.finish_turn_if_current(
+            &thread_id,
+            run_epoch,
+            if succeeded { "end_turn" } else { "error" },
+        );
     }
 
-    /// 运行中追加提示：复用当前 bridge，向同一个 OpenCode session 注入 prompt。
-    /// 当前轮次的事件订阅和收尾仍由最初的 run_prompt 负责。
+    /// 运行中追加提示（引导）：与 Codex 一致——静默结束当前流，复用已有 session 开新 turn。
+    /// 不生成取消消息/中断轮次，界面持续保持运行状态。
     pub async fn steer_prompt(
         self: &Arc<Self>,
         thread_id: String,
         text: String,
         images: Vec<PromptImage>,
     ) {
-        let mut stdin = None;
-        for _ in 0..20 {
-            stdin = self
-                .running_children
-                .lock()
-                .unwrap()
-                .get(&thread_id)
-                .map(|bridge| bridge.stdin.clone());
-            if stdin.is_some() || !self.is_running(&thread_id) {
-                break;
-            }
+        if self.is_running(&thread_id) {
+            self.interrupt_for_steer(&thread_id).await;
+        }
+        self.clone().run_new_prompt(thread_id, text, images).await;
+    }
+
+    async fn interrupt_for_steer(&self, thread_id: &str) {
+        // 先让旧轮次失效。即使旧 bridge 随后返回迟到事件，也不能结束新轮次。
+        self.run_epochs.lock().unwrap().remove(thread_id);
+        let stdin = self
+            .running_children
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .map(|bridge| bridge.stdin.clone());
+        if let Some(stdin) = stdin {
+            let _ = write_line(&stdin, &json!({ "action": "cancel" })).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if !self.is_running(&thread_id) {
-            self.clone().run_new_prompt(thread_id, text, images).await;
-            return;
+        if let Some(mut bridge) = self.running_children.lock().unwrap().remove(thread_id) {
+            kill_child(&mut bridge.child);
         }
+        // 只清内部 running 标记，不发 running:false，避免界面闪成“已停止”。
+        self.running.lock().unwrap().remove(thread_id);
 
-        let mut parts = Vec::new();
-        if !text.is_empty() {
-            parts.push(json!({ "type": "text", "text": text }));
-        }
-        for image in images.iter().cloned() {
-            if let Some(part) = prompt_attachment_part(image) {
-                parts.push(part);
+        // 工具卡片不能永远停留在进行中，但不插入 cancelled turn 或系统提示。
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        if let Some(thread) = store.get_mut(thread_id) {
+            for item in complete_pending_tools(thread) {
+                let _ = self.emit_update(thread_id, &item);
             }
         }
-        let user_item_id = {
-            let state = self.app.state::<AppState>();
-            let mut store = state.store.lock().unwrap();
-            let Some(thread) = store.get_mut(&thread_id) else {
-                return;
-            };
-            let item = thread.push_user(text.clone(), images);
-            let user_item_id = item.id();
-            let _ = self.emit_update(&thread_id, &item);
-            store.save();
-            user_item_id
-        };
-
-        let Some(stdin) = stdin else {
-            self.push_system(
-                &thread_id,
-                "OpenCode+ 引导消息发送失败：运行中的 bridge 不可用".into(),
-                "error",
-            );
-            return;
-        };
-        let request = with_command(
-            json!({
-                "action": "prompt",
-                "delivery": "steer",
-                "parts": parts,
-                "userItemId": user_item_id,
-            }),
-            &text,
-        );
-        if let Err(error) = write_line(&stdin, &request).await {
-            self.push_system(
-                &thread_id,
-                format!("OpenCode+ 引导消息发送失败：{error}"),
-                "error",
-            );
-        }
+        store.save();
+        self.clear_permissions(thread_id);
     }
 
     pub async fn cancel(&self, thread_id: &str) {
@@ -503,6 +493,7 @@ impl OpenCodeSdkManager {
         cwd: &str,
         request: Value,
         user_item_id: u64,
+        run_epoch: u64,
     ) -> Result<(), String> {
         let mut child = self.spawn_bridge(cwd)?;
         let stdin = child.stdin.take().ok_or("OpenCode+ bridge stdin 不可用")?;
@@ -517,16 +508,19 @@ impl OpenCodeSdkManager {
             .unwrap()
             .insert(thread_id.to_string(), RunningBridge { child, stdin });
         let result = self
-            .read_prompt_events(thread_id, user_item_id, stdout)
+            .read_prompt_events(thread_id, user_item_id, run_epoch, stdout)
             .await;
-        if let Some(mut bridge) = self.running_children.lock().unwrap().remove(thread_id) {
-            if result.is_err() {
-                kill_child(&mut bridge.child);
-            } else {
-                let _ = bridge.child.try_wait();
+        // 引导中断后旧任务可能已失效：不要误删/误杀新轮次的 bridge。
+        if self.is_current_run(thread_id, run_epoch) {
+            if let Some(mut bridge) = self.running_children.lock().unwrap().remove(thread_id) {
+                if result.is_err() {
+                    kill_child(&mut bridge.child);
+                } else {
+                    let _ = bridge.child.try_wait();
+                }
             }
+            self.clear_permissions(thread_id);
         }
-        self.clear_permissions(thread_id);
         result
     }
 
@@ -541,11 +535,15 @@ impl OpenCodeSdkManager {
         &self,
         thread_id: &str,
         user_item_id: u64,
+        run_epoch: u64,
         stdout: tokio::process::ChildStdout,
     ) -> Result<(), String> {
         let mut lines = BufReader::new(stdout).lines();
         let mut part_items: HashMap<String, u64> = HashMap::new();
         while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+            if !self.is_current_run(thread_id, run_epoch) {
+                return Err("OpenCode+ 轮次已替换".into());
+            }
             let event: Value = serde_json::from_str(&line)
                 .map_err(|e| format!("解析 OpenCode+ 事件失败：{e}；输出：{line}"))?;
             if event.get("ok").and_then(Value::as_bool) == Some(false) {
@@ -876,6 +874,7 @@ impl OpenCodeSdkManager {
         if !self.is_running(thread_id) {
             return;
         }
+        self.run_epochs.lock().unwrap().remove(thread_id);
         let duration = self
             .turn_started
             .lock()
@@ -886,12 +885,29 @@ impl OpenCodeSdkManager {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
+            for item in complete_pending_tools(thread) {
+                let _ = self.emit_update(thread_id, &item);
+            }
             let item = thread.push_turn(duration, None, stop_reason);
             let _ = self.emit_update(thread_id, &item);
         }
         store.save();
         drop(store);
         self.set_running(thread_id, false, Some(stop_reason));
+    }
+
+    fn is_current_run(&self, thread_id: &str, run_epoch: u64) -> bool {
+        self.run_epochs
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .is_some_and(|current| *current == run_epoch)
+    }
+
+    fn finish_turn_if_current(&self, thread_id: &str, run_epoch: u64, stop_reason: &str) {
+        if self.is_current_run(thread_id, run_epoch) {
+            self.finish_turn(thread_id, stop_reason);
+        }
     }
 
     fn emit_update(&self, thread_id: &str, item: &Item) -> Result<(), tauri::Error> {
@@ -902,6 +918,20 @@ impl OpenCodeSdkManager {
             }),
         )
     }
+}
+
+fn complete_pending_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
+    let mut changed = Vec::new();
+    for item in &mut thread.items {
+        let Item::Tool { call, .. } = item else {
+            continue;
+        };
+        if call.status == "pending" || call.status == "in_progress" {
+            call.status = "completed".to_string();
+            changed.push(item.clone());
+        }
+    }
+    changed
 }
 
 fn prompt_attachment_part(image: PromptImage) -> Option<Value> {

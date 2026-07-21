@@ -168,22 +168,35 @@ async function sessionIsIdle(client, sessionId) {
   }
 }
 
-function steerPrompt(client, sessionId, parts) {
-  const text = parts
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("\n");
-  const files = parts
-    .filter((part) => part.type === "file")
-    .map((part) => ({
-      uri: part.url,
-      ...(part.filename ? { name: part.filename } : {}),
-    }));
-  return client.v2.session.prompt({
-    sessionID: sessionId,
-    prompt: { text, ...(files.length ? { files } : {}) },
-    delivery: "steer",
-  });
+/**
+ * 主路径由 Rust 侧静默打断 bridge 后复用 session 开新 turn（与 Codex 一致）。
+ * 若仍收到 delivery:"steer"（同 bridge 内追加），则 abort + promptAsync；
+ * 不能用 v2 delivery:steer——它不会注入经典 promptAsync 循环。
+ */
+function steerPrompt(client, sessionId, parts, options = {}) {
+  return (async () => {
+    await client.session.abort({ sessionID: sessionId });
+    try {
+      await removeEmptyAssistantMessages(client, sessionId);
+    } catch {
+      // best-effort：中止后的空消息清理失败不应挡住引导
+    }
+    const body = {};
+    if (options.model) body.model = options.model;
+    if (options.agent) body.agent = options.agent;
+    if (options.variant) body.variant = options.variant;
+    const result = await client.session.promptAsync({
+      sessionID: sessionId,
+      ...body,
+      parts,
+    });
+    // 避免 abort 触发的 idle 抢先结束事件循环：等到新一轮离开 idle，或短暂超时。
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && await sessionIsIdle(client, sessionId)) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return result;
+  })();
 }
 
 function createPromptTracker(reportError) {
@@ -220,7 +233,11 @@ function startPrompt(client, sessionId, request) {
     });
   }
   if (request.delivery === "steer") {
-    return steerPrompt(client, sessionId, request.parts);
+    return steerPrompt(client, sessionId, request.parts, {
+      model: request.model,
+      agent: request.agent,
+      variant: request.variant,
+    });
   }
   const body = {};
   if (request.model) body.model = request.model;
@@ -323,6 +340,8 @@ async function runPrompt(client, lines, request) {
     }
     if (event.type === "session.error") {
       if (cancelled) break;
+      // abort() 用于引导时会冒泡 MessageAbortedError；用户未取消则继续听下一轮。
+      if (properties.error?.name === "MessageAbortedError") continue;
       send({ type: "error", error: JSON.stringify(properties.error ?? "OpenCode session error") });
       break;
     }
