@@ -6,10 +6,17 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { createReadStream } from "node:fs";
 import { readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const DEFAULT_BATCH_READ_LINES = 200;
+const IMAGE_MEDIA_TYPES = {
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
 
 const textResult = (text, details = undefined) => ({
   content: [{ type: "text", text: String(text) }],
@@ -23,6 +30,26 @@ function safePath(root, input) {
     throw new Error(`路径超出工作区: ${input}`);
   }
   return path;
+}
+
+export async function alkaidPromptInput(parts = []) {
+  const textParts = [];
+  const images = [];
+  for (const part of parts) {
+    if (part.type === "text") textParts.push(part.text);
+    if (part.type === "image_data") {
+      images.push({ type: "image", data: part.data, mimeType: part.mime });
+    }
+    if (part.type === "local_image") {
+      const mimeType = IMAGE_MEDIA_TYPES[extname(part.path).toLowerCase()];
+      if (mimeType) {
+        images.push({ type: "image", data: (await readFile(part.path)).toString("base64"), mimeType });
+      } else {
+        textParts.push(`Attached file: ${part.path}`);
+      }
+    }
+  }
+  return { text: textParts.join("\n\n"), images };
 }
 
 async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES) {
