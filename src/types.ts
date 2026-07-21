@@ -340,8 +340,6 @@ export interface Settings {
   editor: string;
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */
   theme: string;
-  /** 界面风格（modern / classic，缺省 = modern） */
-  uiStyle: string;
   /** 会话历史展示方式（按项目 / 按时间） */
   historyDisplayMode: "project" | "time";
   /** 团队/漫游中转服务地址（空 = 关闭团队/漫游） */

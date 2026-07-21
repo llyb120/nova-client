@@ -13,7 +13,6 @@ import {
   refreshRelayStatus,
   setState,
   setTheme,
-  setUiStyle,
   state,
 } from "../store";
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
@@ -390,7 +389,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     shareModel: shareModel().trim(),
     editor: editor().trim() || "code",
     theme: state.theme,
-    uiStyle: state.uiStyle,
     relayServer: relayServer().trim(),
     relayToken: relayToken().trim(),
     relayGroups: relayGroups().trim(),
@@ -1296,26 +1294,6 @@ export function SettingsModal(props: { onClose: () => void }) {
           {/* ===== 外观 ===== */}
           <Show when={tab() === "appearance"}>
             <div class="field">
-              <span class="field-label">界面风格</span>
-              <div class="theme-seg">
-                <button
-                  type="button"
-                  classList={{ "theme-seg-btn": true, active: state.uiStyle === "modern" }}
-                  onClick={() => setUiStyle("modern")}
-                >
-                  新风格
-                </button>
-                <button
-                  type="button"
-                  classList={{ "theme-seg-btn": true, active: state.uiStyle === "classic" }}
-                  onClick={() => setUiStyle("classic")}
-                >
-                  旧风格
-                </button>
-              </div>
-              <span class="field-hint">新风格为默认界面；旧风格保留改版前的原有样式。</span>
-            </div>
-            <div class="field">
               <span class="field-label">界面主题</span>
               <div class="theme-seg">
                 <button
@@ -1324,7 +1302,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   onClick={() => setTheme("ink-light")}
                 >
                   <span class="theme-swatch light" />
-                  {state.uiStyle === "classic" ? "云白 · 亮色" : "浅色"}
+                  浅色
                 </button>
                 <button
                   type="button"
@@ -1332,7 +1310,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   onClick={() => setTheme("ink-dark")}
                 >
                   <span class="theme-swatch dark" />
-                  {state.uiStyle === "classic" ? "苍穹 · 暗色" : "深色"}
+                  深色
                 </button>
               </div>
               <span class="field-hint">明暗两套主题互为镜像、即点即换，选择会自动记住。</span>
