@@ -396,6 +396,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     relayGroups: relayGroups().trim(),
     remoteControlEnabled: remoteControlEnabled(),
     quotaSharedModels: quotaSharedModels(),
+    modelFavorites: state.settings?.modelFavorites ?? [],
     devinEnabled: devinEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),

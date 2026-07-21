@@ -80,6 +80,8 @@ pub struct Settings {
     pub remote_control_enabled: bool,
     /// 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>`；空 = 不共享额度。
     pub quota_shared_models: Vec<String>,
+    /// 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>`。
+    pub model_favorites: Vec<String>,
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
@@ -153,6 +155,7 @@ impl Default for Settings {
             relay_groups: String::new(),
             remote_control_enabled: false,
             quota_shared_models: Vec::new(),
+            model_favorites: Vec::new(),
             devin_enabled: true,
             codex_enabled: true,
             codexplus_enabled: false,
@@ -193,6 +196,20 @@ mod tests {
         assert!(!Settings::default().remote_control_enabled);
         let settings: Settings = serde_json::from_str(r#"{"relayToken":"configured"}"#).unwrap();
         assert!(!settings.remote_control_enabled);
+    }
+
+    #[test]
+    fn model_favorites_survive_reload() {
+        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
+        let mut settings = Settings::default();
+        settings.model_favorites = vec!["codex:gpt-5.6".into()];
+        settings.save(&dir);
+
+        assert_eq!(
+            Settings::load(&dir).model_favorites,
+            settings.model_favorites
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

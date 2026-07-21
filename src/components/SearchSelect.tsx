@@ -1,19 +1,10 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import { Portal } from "solid-js/web";
+import { modelFavoriteIds, toggleModelFavorite } from "../store";
 import { IconCheck, IconChevron, IconEye, IconStar } from "./icons";
 
 const FAVORITE_GROUP = "收藏";
 const FAVORITE_BACKEND = "__favorites__";
-const MODEL_FAVORITES_KEY = "fd:modelFavorites";
-
-function storedFavorites(): string[] {
-  try {
-    const value = JSON.parse(localStorage.getItem(MODEL_FAVORITES_KEY) ?? "[]");
-    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-  } catch {
-    return [];
-  }
-}
 
 export interface SelectOption {
   value: string;
@@ -75,7 +66,6 @@ export function SearchSelect(props: {
   const [activeBackend, setActiveBackend] = createSignal<string | null>(null);
   /** 弹层方向：空间不足时向下翻转 / 右对齐，避免溢出窗口 */
   const [place, setPlace] = createSignal({ down: false, right: false });
-  const [favoriteIds, setFavoriteIds] = createSignal(storedFavorites());
   /** portal 模式下的浮层 fixed 坐标（相对视口） */
   const [coords, setCoords] = createSignal<{
     left: number;
@@ -131,14 +121,11 @@ export function SearchSelect(props: {
     );
   });
 
-  const isFavorite = (o: SelectOption) => !!o.favoriteId && favoriteIds().includes(o.favoriteId);
+  const isFavorite = (o: SelectOption) =>
+    !!o.favoriteId && modelFavoriteIds().includes(o.favoriteId);
   const toggleFavorite = (o: SelectOption) => {
     if (!o.favoriteId) return;
-    const next = isFavorite(o)
-      ? favoriteIds().filter((id) => id !== o.favoriteId)
-      : [...favoriteIds(), o.favoriteId];
-    setFavoriteIds(next);
-    localStorage.setItem(MODEL_FAVORITES_KEY, JSON.stringify(next));
+    toggleModelFavorite(o.favoriteId);
   };
 
   // ===== 二级（厂商→模型）=====

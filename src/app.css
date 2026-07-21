@@ -1841,6 +1841,12 @@ button {
   animation: composer-note-flow 1.8s linear forwards;
   will-change: transform, opacity;
 }
+:root[data-theme="ink-dark"] .composer-note {
+  color: #dce3ec;
+  text-shadow:
+    0 0 5px rgba(230, 239, 250, 0.72),
+    0 0 11px rgba(164, 190, 222, 0.38);
+}
 @keyframes composer-note-flow {
   0% {
     transform: translate3d(0, 0, 0) rotate(-8deg);

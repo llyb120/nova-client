@@ -354,6 +354,8 @@ export interface Settings {
   remoteControlEnabled: boolean;
   /** 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>` */
   quotaSharedModels: string[];
+  /** 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>` */
+  modelFavorites: string[];
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
   codexEnabled: boolean;

@@ -51,6 +51,7 @@ export type UiStylePref = "modern" | "classic";
 
 const THEME_KEY = "fd:theme";
 const UI_STYLE_KEY = "fd:ui-style";
+const MODEL_FAVORITES_KEY = "fd:modelFavorites";
 
 let modernStyleUrl = "";
 let classicStyleUrl = "";
@@ -65,6 +66,33 @@ function applyThemeToDom(theme: ThemePref) {
 
 function readUiStylePref(): UiStylePref {
   return localStorage.getItem(UI_STYLE_KEY) === "classic" ? "classic" : "modern";
+}
+
+function readModelFavorites(): string[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(MODEL_FAVORITES_KEY) ?? "[]");
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 模型收藏以 settings.json 为可靠存储，localStorage 仅用于升级兼容和即时兜底。 */
+export const [modelFavoriteIds, setModelFavoriteIds] = createSignal(readModelFavorites());
+
+export function toggleModelFavorite(id: string) {
+  const next = modelFavoriteIds().includes(id)
+    ? modelFavoriteIds().filter((favorite) => favorite !== id)
+    : [...modelFavoriteIds(), id];
+  setModelFavoriteIds(next);
+  localStorage.setItem(MODEL_FAVORITES_KEY, JSON.stringify(next));
+  const settings = state.settings;
+  if (!settings) return;
+  const updated = { ...settings, modelFavorites: next };
+  setState("settings", updated);
+  void api.setSettings(updated).catch(() => {
+    // settings.json 落盘失败时仍保留本次 localStorage 写入，不打断选择模型。
+  });
 }
 
 function applyUiStyleToDom(style: UiStylePref) {
@@ -1626,14 +1654,22 @@ export async function initStore() {
   // settings 是本地快照且不依赖事件监听：先并行拉取并尽快写进 store。
   // 后面的 listen 仍照常尽早注册；但不会再因为逐个 await listen 而拖慢设置页回显。
   const settingsReady = api.getSettings().then((settings) => {
+    let resolvedSettings = settings;
+    if (settings.modelFavorites.length > 0) {
+      setModelFavoriteIds(settings.modelFavorites);
+      localStorage.setItem(MODEL_FAVORITES_KEY, JSON.stringify(settings.modelFavorites));
+    } else if (modelFavoriteIds().length > 0) {
+      resolvedSettings = { ...settings, modelFavorites: modelFavoriteIds() };
+      void api.setSettings(resolvedSettings).catch(() => {});
+    }
     const preferredAgent = lastUsed.agentKind();
-    const initialAgent = agentEnabled(settings, preferredAgent)
+    const initialAgent = agentEnabled(resolvedSettings, preferredAgent)
       ? preferredAgent
-      : (ALL_AGENT_KINDS.find((kind) => agentEnabled(settings, kind)) ?? preferredAgent);
-    setState({ settings, agentKind: initialAgent });
+      : (ALL_AGENT_KINDS.find((kind) => agentEnabled(resolvedSettings, kind)) ?? preferredAgent);
+    setState({ settings: resolvedSettings, agentKind: initialAgent });
     // 后端启动时已把磁盘缓存灌入内存，立即读取，不等待其余事件监听和会话初始化。
     void ensureModelOptions(initialAgent);
-    return { settings, initialAgent };
+    return { settings: resolvedSettings, initialAgent };
   }).catch((error: unknown) => ({ error }));
 
   await listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
