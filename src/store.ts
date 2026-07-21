@@ -1612,11 +1612,20 @@ export async function initStore() {
     const initialAgent = agentEnabled(resolvedSettings, preferredAgent)
       ? preferredAgent
       : (ALL_AGENT_KINDS.find((kind) => agentEnabled(resolvedSettings, kind)) ?? preferredAgent);
+    if (isThemePref(resolvedSettings.theme) && resolvedSettings.theme !== state.theme) {
+      setTheme(resolvedSettings.theme);
+    }
     setState({ settings: resolvedSettings, agentKind: initialAgent });
+    // 窗口以 hidden 创建；可靠主题已同步到 DOM 后再显示，避免露出 WebView 默认底色。
+    void api.showMainWindow().catch(() => {});
     // 后端启动时已把磁盘缓存灌入内存，立即读取，不等待其余事件监听和会话初始化。
     void ensureModelOptions(initialAgent);
     return { settings: resolvedSettings, initialAgent };
-  }).catch((error: unknown) => ({ error }));
+  }).catch((error: unknown) => {
+    // 设置读取失败也不能让窗口永久隐藏；此时沿用 localStorage 的首帧主题。
+    void api.showMainWindow().catch(() => {});
+    return { error };
+  });
 
   await listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
     if (e.payload.threadId !== state.currentId) return;
@@ -1919,9 +1928,7 @@ export async function initStore() {
 
   // 主题以后端 settings.json 为准；后端未设置（老版本/首次升级）时，
   // 把当前 localStorage 里的偏好迁移上去，使其成为可靠真相来源。
-  if (isThemePref(settings.theme)) {
-    if (settings.theme !== state.theme) setTheme(settings.theme);
-  } else {
+  if (!isThemePref(settings.theme)) {
     persistThemeToBackend(state.theme);
   }
 

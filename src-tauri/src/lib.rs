@@ -1839,6 +1839,12 @@ fn report_activity(state: State<'_, AppState>, thread_id: Option<String>) {
     *state.active_thread.lock().unwrap() = thread_id;
 }
 
+/// 前端在可靠主题已经写入 DOM 后调用；窗口此前始终隐藏，避免启动时露出默认底色。
+#[tauri::command]
+fn show_main_window(app: tauri::AppHandle) {
+    updater::restore_window_on_launch(&app);
+}
+
 /// 读取并清除「升级重启前正在查看的会话」标记，返回需要自动恢复打开的会话 id。
 /// 普通启动返回 null；仅升级（手动/静默）重启后才会返回上次的会话。
 #[tauri::command]
@@ -4736,12 +4742,9 @@ pub fn run() {
             // 清理上次自更新留下的旧 exe
             updater::cleanup_old();
 
-            // 窗口在配置里以 visible:false 创建：这里统一决定如何呈现。
-            // 升级重启会还原成「更新前的样子」（位置/多屏/最大化/最小化/是否前台），
-            // 普通启动则正常显示并聚焦。
-            if !server::is_headless() {
-                updater::restore_window_on_launch(app.handle());
-            } else {
+            // GUI 窗口保持隐藏，等前端应用可靠主题后通过 show_main_window 显示；
+            // headless 模式没有前端，只记录启动状态。
+            if server::is_headless() {
                 eprintln!("[nova-server] headless runtime started");
             }
 
@@ -5094,6 +5097,7 @@ pub fn run() {
             download_staged_update,
             apply_staged_update,
             report_activity,
+            show_main_window,
             take_restore_thread,
             signature_pending,
             create_thread,
