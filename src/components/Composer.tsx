@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, on, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
   cancelTurn,
@@ -26,6 +26,8 @@ type PromptHistoryItem = {
   images: PromptImage[];
 };
 
+const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
+
 export function Composer() {
   const [text, setText] = createSignal("");
   const [cursor, setCursor] = createSignal(0);
@@ -37,6 +39,7 @@ export function Composer() {
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
+  let employeePickerRef: HTMLDivElement | undefined;
   let resizeFrame: number | undefined;
   let maxInputHeight: number | undefined;
 
@@ -74,14 +77,47 @@ export function Composer() {
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
   const [stopReason, setStopReason] = createSignal("");
   const [employeeMenuOpen, setEmployeeMenuOpen] = createSignal(false);
-  const [selectedEmployeeId, setSelectedEmployeeId] = createSignal<string | null>(null);
-  const selectedEmployee = createMemo(() =>
-    state.employees.find((employee) => employee.id === selectedEmployeeId()) ?? null,
+  const [selectedEmployeeId, setSelectedEmployeeId] = createSignal<string | null>(
+    localStorage.getItem(LAST_EMPLOYEE_KEY) || null,
   );
-  const isOrdinaryThread = () => {
+  const selectedEmployee = createMemo(() =>
+    state.employees.find((employee) => employee.id === selectedEmployeeId() && employee.enabled) ?? null,
+  );
+  const isNewOrdinaryThread = () => {
     const thread = state.threads.find((item) => item.id === state.currentId);
-    return !!thread && !thread.employeeId && !thread.roamingRole && !thread.quotaPeerName;
+    return !!thread &&
+      !thread.employeeId &&
+      !thread.roamingRole &&
+      !thread.quotaPeerName &&
+      !state.loadingThread &&
+      !running() &&
+      !state.items.some((item) => item.type === "user");
   };
+  const pickEmployee = (employeeId: string | null) => {
+    setSelectedEmployeeId(employeeId);
+    if (employeeId) localStorage.setItem(LAST_EMPLOYEE_KEY, employeeId);
+    else localStorage.removeItem(LAST_EMPLOYEE_KEY);
+    setEmployeeMenuOpen(false);
+  };
+  createEffect(() => {
+    const selectedId = selectedEmployeeId();
+    if (
+      selectedId &&
+      state.employees.length > 0 &&
+      !state.employees.some((employee) => employee.id === selectedId && employee.enabled)
+    ) {
+      pickEmployee(null);
+    }
+    if (!isNewOrdinaryThread()) setEmployeeMenuOpen(false);
+  });
+  onMount(() => {
+    const closeEmployeeMenu = (event: PointerEvent) => {
+      if (!employeeMenuOpen() || employeePickerRef?.contains(event.target as Node)) return;
+      setEmployeeMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeEmployeeMenu);
+    onCleanup(() => document.removeEventListener("pointerdown", closeEmployeeMenu));
+  });
   const requestStop = () => {
     const thread = state.threads.find((item) => item.id === state.currentId);
     if (thread?.employeeId && !thread.mindThread) {
@@ -232,8 +268,7 @@ export function Composer() {
     setHistoryOpen(false);
     attach.clear();
     if (textareaRef) textareaRef.style.height = "auto";
-    const employeeId = isOrdinaryThread() ? selectedEmployeeId() : null;
-    setSelectedEmployeeId(null);
+    const employeeId = isNewOrdinaryThread() ? selectedEmployee()?.id ?? null : null;
     setEmployeeMenuOpen(false);
     void sendPrompt(value, images, employeeId);
   };
@@ -456,18 +491,15 @@ export function Composer() {
           />
         </Show>
         <span class="bar-spacer" />
-        <Show when={isOrdinaryThread() && state.employees.length > 0}>
-          <div class="composer-employee-picker">
+        <Show when={isNewOrdinaryThread() && state.employees.length > 0}>
+          <div ref={employeePickerRef} class="composer-employee-picker">
             <Show when={employeeMenuOpen()}>
               <div class="composer-employee-menu">
                 <div class="composer-employee-head">本次工作交给</div>
                 <button
                   type="button"
                   classList={{ "composer-employee-item": true, active: !selectedEmployeeId() }}
-                  onClick={() => {
-                    setSelectedEmployeeId(null);
-                    setEmployeeMenuOpen(false);
-                  }}
+                  onClick={() => pickEmployee(null)}
                 >
                   <span>普通会话</span>
                   <small>直接由当前模型执行</small>
@@ -480,10 +512,7 @@ export function Composer() {
                         "composer-employee-item": true,
                         active: selectedEmployeeId() === employee.id,
                       }}
-                      onClick={() => {
-                        setSelectedEmployeeId(employee.id);
-                        setEmployeeMenuOpen(false);
-                      }}
+                      onClick={() => pickEmployee(employee.id)}
                     >
                       <span>{employee.name}</span>
                       <small>Wake → Do · Dream 生效</small>
