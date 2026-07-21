@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { ExclusiveChatIdentity } from "./components/ExclusiveChatMark";
 import type {
   AgentKind,
   BranchList,
@@ -54,6 +55,7 @@ export const api = {
   reportActivity: (threadId: string | null) =>
     invoke<void>("report_activity", { threadId }),
   takeRestoreThread: () => invoke<string | null>("take_restore_thread"),
+  signaturePending: () => invoke<ExclusiveChatIdentity | null>("signature_pending"),
   createThread: (
     cwd: string,
     agentKind: AgentKind,

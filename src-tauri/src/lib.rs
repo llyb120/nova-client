@@ -21,6 +21,7 @@ mod remote;
 mod semantic;
 mod server;
 mod settings;
+mod signature;
 mod skills;
 mod sleep_inhibitor;
 mod sys_notify;
@@ -1843,6 +1844,14 @@ fn report_activity(state: State<'_, AppState>, thread_id: Option<String>) {
 #[tauri::command]
 fn take_restore_thread(app: tauri::AppHandle) -> Option<String> {
     updater::take_restore_thread(&app)
+}
+
+/// 前端启动时查询待签身份；无专属身份返回 null。每次启动（含升级重启）都签。
+#[tauri::command]
+fn signature_pending(app: tauri::AppHandle) -> Option<signature::SignatureIdentity> {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().unwrap();
+    signature::identity_for_token(&settings.relay_token)
 }
 
 fn expand_thread_tree_ids(state: &AppState, roots: &[String]) -> Vec<String> {
@@ -5086,6 +5095,7 @@ pub fn run() {
             apply_staged_update,
             report_activity,
             take_restore_thread,
+            signature_pending,
             create_thread,
             delete_thread,
             delete_threads,

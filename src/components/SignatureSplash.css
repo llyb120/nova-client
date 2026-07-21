@@ -1,0 +1,33 @@
+/* 描笔期间抬升水印层级：平时它压在输入框/底栏（z-index:1）下面，签名时不被遮挡。 */
+.composer-engraved-watermark.signing {
+  z-index: 2;
+}
+
+/* 启动签名的笔尖光点：沿水印基线游走，笔停即隐。 */
+.signature-pen {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 9999;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50%;
+  pointer-events: none;
+  background: #f1f5ff;
+  filter:
+    drop-shadow(0 0 4px rgba(149, 173, 255, 0.9))
+    drop-shadow(0 0 10px rgba(112, 151, 245, 0.5));
+  transition: opacity 0.3s ease;
+}
+
+:root[data-theme="ink-light"] .signature-pen {
+  background: #8f6338;
+  filter:
+    drop-shadow(0 0 4px rgba(214, 178, 112, 0.9))
+    drop-shadow(0 0 9px rgba(181, 121, 61, 0.45));
+}
+
+.signature-pen.done {
+  opacity: 0;
+}

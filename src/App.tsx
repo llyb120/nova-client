@@ -10,6 +10,7 @@ import { RoamRequestModal } from "./components/RoamRequestModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { ShareInboxModal } from "./components/ShareInboxModal";
 import { Sidebar } from "./components/Sidebar";
+import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
 import { initStore, state } from "./store";
 
@@ -92,6 +93,7 @@ export default function App() {
       <RoamRequestModal />
       <UpdateModal show={showUpdate()} onClose={() => setShowUpdate(false)} />
       <CliOperationModal />
+      <SignatureSplash />
     </div>
   );
 }
