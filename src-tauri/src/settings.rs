@@ -83,6 +83,7 @@ pub struct Settings {
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
+    pub alkaid_enabled: bool,
     pub codex_enabled: bool,
     /// 旧版独立 SDK 后端开关，仅用于兼容反序列化。
     pub codexplus_enabled: bool,
@@ -154,6 +155,7 @@ impl Default for Settings {
             remote_control_enabled: false,
             quota_shared_models: Vec::new(),
             devin_enabled: true,
+            alkaid_enabled: true,
             codex_enabled: true,
             codexplus_enabled: false,
             codebuddy_enabled: true,

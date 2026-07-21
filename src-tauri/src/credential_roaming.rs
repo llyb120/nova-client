@@ -214,6 +214,7 @@ pub fn collect_credentials(
     let mut files = Vec::new();
     let mut env = HashMap::new();
     match &agent_kind {
+        AgentKind::Alkaid => return Err("Alkaid 暂不支持额度凭据共享".into()),
         AgentKind::Devin => collect_file(
             &devin_credentials_path()?,
             "appdata/devin/credentials.toml",
@@ -367,6 +368,11 @@ pub fn materialize_runtime(
     )?;
     stage_local_skills(&app, expected_kind, &launch_env)?;
     let manager = match expected_kind {
+        AgentKind::Alkaid => BorrowedManager::Sdk(CodexSdkManager::new_with_env(
+            app,
+            SdkBackend::Alkaid,
+            launch_env,
+        )),
         AgentKind::Devin => BorrowedManager::Acp(AcpManager::new_with_env(
             app,
             AgentKind::Devin,
@@ -400,6 +406,7 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
     let mut env = HashMap::new();
     let as_string = |path: PathBuf| path.to_string_lossy().to_string();
     match kind {
+        AgentKind::Alkaid => {}
         AgentKind::Devin => {
             #[cfg(windows)]
             {
@@ -475,6 +482,7 @@ fn stage_local_skills(
     env: &HashMap<String, String>,
 ) -> Result<(), String> {
     let root = match kind {
+        AgentKind::Alkaid => return Ok(()),
         AgentKind::Devin => return Ok(()),
         AgentKind::Codex | AgentKind::CodexPlus => env
             .get("CODEX_HOME")
@@ -530,6 +538,7 @@ pub fn isolate_borrowed_command(command: &mut Command) {
 fn credential_path_allowed(kind: &AgentKind, raw: &str) -> bool {
     let path = raw.replace('\\', "/");
     match kind {
+        AgentKind::Alkaid => false,
         AgentKind::Devin => path == "appdata/devin/credentials.toml",
         AgentKind::Codex | AgentKind::CodexPlus => path == "codex-home/auth.json",
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {

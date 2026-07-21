@@ -3,6 +3,8 @@ import type { AgentKind } from "./types";
 /** agent 展示名（徽标 / 标题 / 提示文案统一用） */
 export function agentLabel(kind: AgentKind): string {
   switch (kind) {
+    case "alkaid":
+      return "Alkaid";
     case "codex":
       return "Codex";
     case "codebuddy":
@@ -22,6 +24,8 @@ export function agentLabel(kind: AgentKind): string {
  *  Cursor=CS / OpenCode=OC */
 export function agentShort(kind: AgentKind): string {
   switch (kind) {
+    case "alkaid":
+      return "A";
     case "codex":
       return "C";
     case "codebuddy":

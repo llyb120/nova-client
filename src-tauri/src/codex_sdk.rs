@@ -20,6 +20,7 @@ use tokio::process::{Child, ChildStdin, Command};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SdkBackend {
+    Alkaid,
     Codex,
     CodeBuddy,
     Claude,
@@ -29,6 +30,7 @@ pub enum SdkBackend {
 impl SdkBackend {
     fn agent_kind(self) -> crate::threads::AgentKind {
         match self {
+            Self::Alkaid => crate::threads::AgentKind::Alkaid,
             Self::Codex => crate::threads::AgentKind::Codex,
             Self::CodeBuddy => crate::threads::AgentKind::CodeBuddy,
             Self::Claude => crate::threads::AgentKind::ClaudeCode,
@@ -38,6 +40,7 @@ impl SdkBackend {
 
     fn label(self) -> &'static str {
         match self {
+            Self::Alkaid => "Alkaid",
             Self::Codex => "Codex+",
             Self::CodeBuddy => "CodeBuddy+",
             Self::Claude => "Claude Code+",
@@ -47,6 +50,10 @@ impl SdkBackend {
 
     fn bridge(self) -> (&'static str, &'static [u8]) {
         match self {
+            Self::Alkaid => (
+                "alkaid-bridge.mjs",
+                include_bytes!("../resources/alkaid-bridge.mjs"),
+            ),
             Self::Codex => (
                 "codex-bridge.mjs",
                 include_bytes!("../resources/codex-bridge.mjs"),
@@ -182,7 +189,7 @@ impl CodexSdkManager {
                 .or_else(|| thread.acp_session_id.clone());
             let item = thread.push_user(text.clone(), images.clone());
             let user_item_id = item.id();
-            if matches!(self.backend, SdkBackend::Codex | SdkBackend::Cursor)
+            if matches!(self.backend, SdkBackend::Alkaid | SdkBackend::Codex | SdkBackend::Cursor)
                 && thread.title == "新会话"
             {
                 let fallback = derive_title(&text, !images.is_empty());
@@ -567,7 +574,7 @@ impl CodexSdkManager {
         fallback: String,
         model: String,
     ) {
-        if !matches!(self.backend, SdkBackend::Codex | SdkBackend::Cursor) {
+        if !matches!(self.backend, SdkBackend::Alkaid | SdkBackend::Codex | SdkBackend::Cursor) {
             return;
         }
         let manager = self.clone();
@@ -795,6 +802,7 @@ impl CodexSdkManager {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap();
             match self.backend {
+                SdkBackend::Alkaid => ("node".into(), String::new(), "ALKAID_RUNTIME", None),
                 SdkBackend::Codex => (
                     settings.codex_path.clone(),
                     settings.codex_proxy.clone(),
@@ -1005,6 +1013,7 @@ impl CodexSdkManager {
             return;
         };
         let (prefix, agent_kind) = match self.backend {
+            SdkBackend::Alkaid => ("alk", "alkaid"),
             SdkBackend::Codex => ("cdp", "codex"),
             SdkBackend::CodeBuddy => ("cbp", "codebuddy"),
             SdkBackend::Claude => ("clp", "claudecode"),

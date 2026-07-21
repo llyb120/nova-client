@@ -155,6 +155,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [cursorSdkApiKey, setCursorSdkApiKey] = createSignal(s?.cursorSdkApiKey ?? "");
   const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
   const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
+  const [alkaidEnabled, setAlkaidEnabled] = createSignal(s?.alkaidEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
   const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
   const [claudecodeEnabled, setClaudecodeEnabled] = createSignal(s?.claudecodeEnabled !== false);
@@ -230,6 +231,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const enabledCount = () =>
     [
       devinEnabled(),
+      alkaidEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
       claudecodeEnabled(),
@@ -397,6 +399,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     remoteControlEnabled: remoteControlEnabled(),
     quotaSharedModels: quotaSharedModels(),
     devinEnabled: devinEnabled(),
+    alkaidEnabled: alkaidEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
     claudecodeEnabled: claudecodeEnabled(),
@@ -962,6 +965,25 @@ export function SettingsModal(props: { onClose: () => void }) {
             <p class="field-hint">
               每个后端可单独启用/关闭并配置启动方式。关闭的后端不会出现在新建/切换会话的后端列表里（历史会话仍可打开查看）。
             </p>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class={`agent-badge alkaid`}>{agentLabel("alkaid")}</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={alkaidEnabled()}
+                    disabled={alkaidEnabled() && enabledCount() === 1}
+                    onChange={(e) => setAlkaidEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <div class="backend-config-row">
+                <span class="fixed-integration">PI</span>
+                <span class="field-hint">复用本机 Codex provider 凭据，支持并行文件工具、MCP 与 Skills。</span>
+              </div>
+            </div>
 
             <div class="backend-card">
               <div class="backend-card-head">

@@ -1,4 +1,4 @@
-export type AgentKind = "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
+export type AgentKind = "alkaid" | "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
 
 export interface SlashCommand {
   name: string;
@@ -356,6 +356,7 @@ export interface Settings {
   quotaSharedModels: string[];
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
+  alkaidEnabled: boolean;
   codexEnabled: boolean;
   codebuddyEnabled: boolean;
   claudecodeEnabled: boolean;

@@ -198,6 +198,7 @@ export const [state, setState] = createStore<AppStore>({
   agent: null,
   settings: null,
   modelOptions: {
+    alkaid: null,
     devin: null,
     codex: null,
     codebuddy: null,
@@ -213,6 +214,7 @@ export const [state, setState] = createStore<AppStore>({
   updateStaging: false,
   updatePromptAt: 0,
   slashCommands: {
+    alkaid: [],
     devin: [],
     codex: [],
     codebuddy: [],
@@ -458,6 +460,7 @@ export async function ensureModelOptions(agentKind: AgentKind) {
 
 /** 模型后端固定展示顺序 */
 export const ALL_AGENT_KINDS: AgentKind[] = [
+  "alkaid",
   "devin",
   "codex",
   "codebuddy",
@@ -469,6 +472,8 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
 /** 某后端在设置里是否启用。缺字段（老版本 settings）按启用处理（!== false）。 */
 function agentEnabled(s: Settings, k: AgentKind): boolean {
   switch (k) {
+    case "alkaid":
+      return s.alkaidEnabled !== false;
     case "devin":
       return s.devinEnabled !== false;
     case "codex":

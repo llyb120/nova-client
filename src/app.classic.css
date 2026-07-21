@@ -583,6 +583,13 @@ button {
   background: color-mix(in srgb, var(--blue) 13%, transparent);
 }
 
+.thread-agent.alkaid,
+.agent-badge.alkaid {
+  color: var(--cyan);
+  border-color: color-mix(in srgb, var(--cyan) 40%, transparent);
+  background: color-mix(in srgb, var(--cyan) 14%, transparent);
+}
+
 .thread-agent.devin,
 .agent-badge.devin {
   color: var(--accent);

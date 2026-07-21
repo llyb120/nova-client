@@ -86,6 +86,8 @@ pub struct AppState {
     /// OpenCode 官方 SDK 对应的 HTTP API 后端，不经过 ACP。
     pub opencodeplus: Arc<OpenCodeSdkManager>,
     pub codex: Arc<CodexManager>,
+    /// Alkaid 自研 pi agent 后端。
+    pub alkaid: Arc<CodexSdkManager>,
     /// Codex 官方 TypeScript SDK 后端，不经过 app-server 集成层。
     pub codexplus: Arc<CodexSdkManager>,
     /// CodeBuddy 官方 Agent SDK 后端。
@@ -142,6 +144,7 @@ impl AppState {
     pub fn agent_enabled(&self, kind: &AgentKind) -> bool {
         let s = self.settings.lock().unwrap();
         match kind {
+            AgentKind::Alkaid => s.alkaid_enabled,
             AgentKind::Devin => s.devin_enabled,
             AgentKind::Codex => s.codex_enabled,
             AgentKind::CodexPlus => s.codexplus_enabled,
@@ -207,6 +210,21 @@ impl AppState {
                 .generate_title_async(thread_id, prompt, fallback, String::new());
             return;
         }
+        if AgentKind::from_str(&agent_raw) == Some(AgentKind::Alkaid)
+            && self.agent_enabled(&AgentKind::Alkaid)
+        {
+            self.alkaid
+                .generate_title_async(thread_id, prompt, fallback, model);
+            return;
+        }
+        if agent_raw.is_empty()
+            && origin == &AgentKind::Alkaid
+            && self.agent_enabled(&AgentKind::Alkaid)
+        {
+            self.alkaid
+                .generate_title_async(thread_id, prompt, fallback, String::new());
+            return;
+        }
         if matches!(
             AgentKind::from_str(&agent_raw),
             Some(AgentKind::Codex | AgentKind::CodexPlus)
@@ -257,6 +275,7 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
             .unwrap_or(false);
     }
     match thread.agent_kind {
+        AgentKind::Alkaid => state.alkaid.is_running(&thread.id),
         AgentKind::Devin => state.acp.is_running(&thread.id),
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.is_running(&thread.id),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
@@ -370,6 +389,7 @@ fn any_employee_working(state: &AppState) -> bool {
 pub(crate) async fn shutdown_agent_processes(state: &AppState) {
     state.acp.kill_conn().await;
     state.codex.kill_conn().await;
+    state.alkaid.shutdown();
     state.codexplus.shutdown();
     state.codebuddyplus.shutdown();
     state.claudeplus.shutdown();
@@ -1634,6 +1654,7 @@ fn remove_worktree(
         for tid in &doomed {
             state.acp.forget_session_of_thread(tid);
             state.codex.forget_session_of_thread(tid);
+            state.alkaid.forget_session_of_thread(tid);
             state.codexplus.forget_session_of_thread(tid);
             state.codebuddyplus.forget_session_of_thread(tid);
             state.claudeplus.forget_session_of_thread(tid);
@@ -1759,6 +1780,12 @@ async fn merge_worktree_thread(
                 wt.branch
             );
             match agent_kind {
+                AgentKind::Alkaid => {
+                    let mgr = state.alkaid.clone();
+                    tauri::async_runtime::spawn(async move {
+                        mgr.run_prompt(thread_id, prompt, vec![]).await;
+                    });
+                }
                 AgentKind::Devin => {
                     let mgr = state.acp.clone();
                     tauri::async_runtime::spawn(async move {
@@ -2435,6 +2462,7 @@ fn set_thread_model(
         });
     } else {
         match agent_kind {
+            AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&thread_id),
             AgentKind::Codex | AgentKind::CodexPlus => {
                 state.codexplus.forget_session_of_thread(&thread_id)
             }
@@ -2632,6 +2660,7 @@ async fn get_model_options(
         return Err(format!("{} 后端已关闭", agent_kind.label()));
     }
     match agent_kind {
+        AgentKind::Alkaid => state.alkaid.ensure_model_options().await.map(Some),
         AgentKind::Devin => state.acp.ensure_model_options().await.map(Some),
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codex.ensure_model_options().await.map(Some)
@@ -2657,6 +2686,7 @@ async fn get_slash_commands(
         return Ok(Vec::new());
     }
     match agent_kind {
+        AgentKind::Alkaid => Ok(list_codex_skill_commands(&state.config_dir)),
         AgentKind::Devin => {
             let commands = state.acp.fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
@@ -2771,6 +2801,18 @@ pub(crate) fn dispatch_prompt(
         return Ok(());
     }
     match agent_kind {
+        AgentKind::Alkaid => {
+            let mgr = state.alkaid.clone();
+            if mgr.is_running(&thread_id) {
+                tauri::async_runtime::spawn(async move {
+                    mgr.steer_prompt(thread_id, text, images).await;
+                });
+            } else {
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(thread_id, text, images).await;
+                });
+            }
+        }
         AgentKind::Codex | AgentKind::CodexPlus => {
             let mgr = state.codexplus.clone();
             if mgr.is_running(&thread_id) {
@@ -3128,6 +3170,7 @@ async fn cancel_turn(
     }
     let kind = agent_kind_for_thread(&state, &thread_id)?;
     match kind {
+        AgentKind::Alkaid => state.alkaid.cancel(&thread_id).await,
         AgentKind::Devin => state.acp.cancel(&thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(&thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
@@ -3563,6 +3606,7 @@ async fn summarize_clue(
     }
     state.acp.forget_session_of_thread(&run_id);
     state.codex.forget_session_of_thread(&run_id);
+    state.alkaid.forget_session_of_thread(&run_id);
     state.codexplus.forget_session_of_thread(&run_id);
     state.codebuddyplus.forget_session_of_thread(&run_id);
     state.claudeplus.forget_session_of_thread(&run_id);
@@ -3825,6 +3869,7 @@ fn respond_roam_request(
 async fn restart_devin(state: State<'_, AppState>) -> Result<(), String> {
     state.acp.restart().await;
     state.codex.restart().await;
+    state.alkaid.shutdown();
     state.codexplus.shutdown();
     state.codebuddyplus.shutdown();
     state.claudeplus.shutdown();
@@ -4805,6 +4850,7 @@ pub fn run() {
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
+            let alkaid = CodexSdkManager::new(app.handle().clone(), SdkBackend::Alkaid);
             let codexplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Codex);
             let codebuddyplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::CodeBuddy);
             let claudeplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Claude);
@@ -4832,6 +4878,7 @@ pub fn run() {
                 acp,
                 opencodeplus,
                 codex,
+                alkaid,
                 codexplus,
                 codebuddyplus,
                 claudeplus,
