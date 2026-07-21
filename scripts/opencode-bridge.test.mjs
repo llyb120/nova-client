@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_OPENCODE_BRIDGE_TEST = "1";
-const { applyV2Event, automaticPermissionReply, createPromptTracker, eventProperties, listModels, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan } = await import("./opencode-bridge.mjs");
+const { applyV2Event, automaticPermissionReply, createPromptTracker, ensureSession, eventProperties, listModels, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan } = await import("./opencode-bridge.mjs");
 
 assert.equal(automaticPermissionReply("build"), "always");
 assert.equal(automaticPermissionReply("plan"), undefined);
@@ -38,6 +38,15 @@ assert.equal(await sessionIsIdle({
 assert.equal(await sessionIsIdle({
   v2: { session: { active: async () => ({ data: { data: {} } }) } },
 }, "session-1"), true);
+
+let createSessionArgs;
+assert.equal(await ensureSession({
+  v2: { session: { create: async (args) => {
+    createSessionArgs = args;
+    return { data: { data: { id: "session-new" } } };
+  } } },
+}), "session-new");
+assert.deepEqual(createSessionArgs, { location: { directory: process.cwd() } });
 
 assert.deepEqual(eventProperties({ data: { sessionID: "session-1" } }), { sessionID: "session-1" });
 assert.deepEqual(await listModels({

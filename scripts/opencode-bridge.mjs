@@ -129,6 +129,7 @@ async function ensureSession(client, sessionId, request = {}) {
     if (!existing.error) return sessionId;
   }
   const created = await client.v2.session.create({
+    location: { directory: process.cwd() },
     ...(request.agent ? { agent: request.agent } : {}),
     ...(request.model ? { model: modelRef(request.model, request.variant) } : {}),
   });
@@ -388,4 +389,4 @@ async function main() {
 
 if (process.env.NOVA_OPENCODE_BRIDGE_TEST !== "1") void main();
 
-export { applyV2Event, automaticPermissionReply, createPromptTracker, eventProperties, listModels, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan };
+export { applyV2Event, automaticPermissionReply, createPromptTracker, ensureSession, eventProperties, listModels, promptEventState, sessionIsIdle, startPrompt, steerPrompt, todoPart, todoPlan };
