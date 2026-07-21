@@ -1,8 +1,8 @@
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use std::collections::HashSet;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use std::ffi::{OsStr, OsString};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use std::path::PathBuf;
 
 #[cfg(any(target_os = "macos", test))]
@@ -14,11 +14,13 @@ const PATH_MARKER_END: &[u8] = b"__NOVA_PATH_END__";
 /// /usr/bin:/bin:/usr/sbin:/sbin。后端 CLI 大多由 Homebrew 或 Node 版本管理器安装，
 /// 因此必须在任何后端检测、CLI 子命令或 Tauri 线程启动前恢复终端使用的 PATH。
 pub fn init_process_path() {
+    #[cfg(windows)]
+    init_windows_process_path();
     #[cfg(target_os = "macos")]
     init_macos_process_path();
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn merge_paths<'a>(groups: impl IntoIterator<Item = &'a OsStr>) -> Option<OsString> {
     let mut seen = HashSet::<PathBuf>::new();
     let mut merged = Vec::<PathBuf>::new();
@@ -34,6 +36,28 @@ fn merge_paths<'a>(groups: impl IntoIterator<Item = &'a OsStr>) -> Option<OsStri
     (!merged.is_empty())
         .then(|| std::env::join_paths(merged).ok())
         .flatten()
+}
+
+#[cfg(windows)]
+fn init_windows_process_path() {
+    let current = std::env::var_os("PATH");
+    let fallback = fallback_windows_path(std::env::var_os("USERPROFILE").map(PathBuf::from));
+    let mut groups = Vec::<&OsStr>::new();
+    if let Some(path) = current.as_deref() {
+        groups.push(path);
+    }
+    if let Some(path) = fallback.as_deref() {
+        groups.push(path);
+    }
+    if let Some(path) = merge_paths(groups) {
+        std::env::set_var("PATH", path);
+    }
+}
+
+#[cfg(any(windows, test))]
+fn fallback_windows_path(home: Option<PathBuf>) -> Option<OsString> {
+    let home = home?;
+    std::env::join_paths([home.join(".local/bin"), home.join(".opencode/bin")]).ok()
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -202,7 +226,7 @@ fn append_matching_dirs(paths: &mut Vec<PathBuf>, root: PathBuf, suffix: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_marked_path, merge_paths};
+    use super::{extract_marked_path, fallback_windows_path, merge_paths};
     use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
@@ -231,6 +255,18 @@ mod tests {
                 PathBuf::from("shared"),
                 PathBuf::from("fallback")
             ]
+        );
+    }
+
+    #[test]
+    fn windows_fallback_includes_claude_and_opencode_native_bins() {
+        let home = PathBuf::from("C:/Users/professor");
+        let fallback = fallback_windows_path(Some(home.clone())).unwrap();
+        let paths: Vec<PathBuf> = std::env::split_paths(&fallback).collect();
+
+        assert_eq!(
+            paths,
+            vec![home.join(".local/bin"), home.join(".opencode/bin")]
         );
     }
 }
