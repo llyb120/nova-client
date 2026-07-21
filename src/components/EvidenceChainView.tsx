@@ -1,5 +1,6 @@
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { api } from "../ipc";
 import {
   addClueComment,
   associateClues,
@@ -18,7 +19,8 @@ import {
 } from "../store";
 import type { ClueCard, ClueComment, ClueNodeGroup } from "../types";
 import { ClueCaptureModal } from "./ClueCaptureModal";
-import { IconClue, IconMove, IconPlus } from "./icons";
+import { attachmentPreviewSrc } from "./ImageAttachmentStrip";
+import { IconClue, IconFile, IconMove, IconPlus } from "./icons";
 import { MentionPicker } from "./MentionPicker";
 
 type Placement = "update" | "parallel" | "new";
@@ -1232,6 +1234,42 @@ export function EvidenceChainView() {
                     <span class="clue-detail-meta">{fmtTime(card().updatedAt)} · {card().versions.length} 个版本</span>
                   </div>
                   <pre class="clue-detail-content">{version()?.content}</pre>
+                  <Show when={(version()?.attachments ?? []).length > 0}>
+                    <div class="clue-attachments">
+                      <div class="clue-section-title">附件</div>
+                      <div class="clue-attachment-grid">
+                        <For each={version()?.attachments ?? []}>
+                          {(attachment) => (
+                            <button
+                              type="button"
+                              classList={{
+                                "clue-attachment": true,
+                                image: attachment.mimeType.startsWith("image/"),
+                              }}
+                              title={`打开 ${attachment.name}`}
+                              onClick={() =>
+                                void api.openClueAttachment(attachment).catch((error) =>
+                                  message(String(error), { kind: "error" }),
+                                )
+                              }
+                            >
+                              <Show
+                                when={attachment.mimeType.startsWith("image/")}
+                                fallback={<IconFile size={28} />}
+                              >
+                                <img
+                                  src={attachmentPreviewSrc(attachment)}
+                                  alt={attachment.name}
+                                  draggable={false}
+                                />
+                              </Show>
+                              <span>{attachment.name}</span>
+                            </button>
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                  </Show>
                   <Show when={(version()?.mentions ?? []).length > 0}>
                     <div class="clue-mention-summary">
                       <span>本次提醒</span>

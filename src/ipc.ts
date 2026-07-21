@@ -6,6 +6,7 @@ import type {
   CaptureClueResult,
   CliStatus,
   ClueAiSummary,
+  ClueAttachment,
   ClueContextSnapshot,
   ClueNodeGroup,
   Decision,
@@ -37,6 +38,11 @@ import type {
   WorkHours,
   WorktreeRecord,
 } from "./types";
+
+function fileUriPath(uri: string) {
+  const path = decodeURI(uri.replace(/^file:\/\//, ""));
+  return /^\/[A-Za-z]:\//.test(path) ? path.slice(1) : path;
+}
 
 export const api = {
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
@@ -91,6 +97,7 @@ export const api = {
     placement: "update" | "parallel" | "new",
     targetCardId: string | null,
     mentionTokens: string[],
+    attachments: ClueAttachment[],
   ) =>
     invoke<CaptureClueResult>("capture_clue", {
       threadId,
@@ -99,6 +106,7 @@ export const api = {
       placement,
       targetCardId,
       mentionTokens,
+      attachments,
     }),
   addClueComment: (
     cardId: string,
@@ -130,6 +138,12 @@ export const api = {
     invoke<void>("open_in_editor", { threadId, path, line }),
   openFileDefault: (threadId: string, path: string) =>
     invoke<void>("open_file_default", { threadId, path }),
+  openClueAttachment: (attachment: ClueAttachment) =>
+    invoke<void>("open_clue_attachment", {
+      name: attachment.name,
+      data: attachment.data ?? null,
+      path: attachment.uri ? fileUriPath(attachment.uri) : null,
+    }),
   revertFileChanges: (threadId: string, changes: RevertChange[]) =>
     invoke<RevertResult>("revert_file_changes", { threadId, changes }),
   setThreadModel: (threadId: string, model: string | null) =>

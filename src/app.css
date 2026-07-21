@@ -5303,6 +5303,56 @@ button.head-badge:hover {
   font-size: 12.5px;
   line-height: 1.65;
 }
+.clue-attachments {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 16px;
+}
+.clue-attachment-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 8px;
+}
+.clue-attachment {
+  min-width: 0;
+  height: 86px;
+  padding: 9px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text-dim);
+  background: var(--bg-input);
+}
+.clue-attachment:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--border));
+  background: var(--accent-dim);
+}
+.clue-attachment.image {
+  height: 112px;
+  padding: 5px;
+  justify-content: space-between;
+}
+.clue-attachment img {
+  width: 100%;
+  min-height: 0;
+  flex: 1;
+  object-fit: cover;
+  border-radius: 6px;
+}
+.clue-attachment span {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
 .clue-detail-actions {
   display: flex;
   flex-wrap: wrap;

@@ -25,6 +25,19 @@ pub struct ClueMention {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClueAttachment {
+    pub name: String,
+    pub mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClueCardVersion {
     pub id: String,
     pub title: String,
@@ -35,6 +48,8 @@ pub struct ClueCardVersion {
     pub source_thread_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub mentions: Vec<ClueMention>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    pub attachments: Vec<ClueAttachment>,
     pub created_at: i64,
 }
 
@@ -196,6 +211,29 @@ impl ClueStore {
         author_name: String,
         mentions: Vec<ClueMention>,
     ) -> Result<CaptureClueResult, String> {
+        self.capture_with_attachments(
+            placement,
+            target_card_id,
+            title,
+            content,
+            source_thread_id,
+            author_name,
+            mentions,
+            Vec::new(),
+        )
+    }
+
+    pub fn capture_with_attachments(
+        &mut self,
+        placement: &str,
+        target_card_id: Option<&str>,
+        title: String,
+        content: String,
+        source_thread_id: Option<String>,
+        author_name: String,
+        mentions: Vec<ClueMention>,
+        attachments: Vec<ClueAttachment>,
+    ) -> Result<CaptureClueResult, String> {
         let title = title.trim().to_string();
         let content = content.trim().to_string();
         if title.is_empty() {
@@ -212,8 +250,15 @@ impl ClueStore {
                 let target = target_card_id.ok_or("请选择要更新的线索")?;
                 let (group_index, card_index) =
                     self.card_location(target).ok_or("目标线索不存在")?;
-                let version =
-                    new_version(title, content, source_thread_id, author_name, mentions, now);
+                let version = new_version(
+                    title,
+                    content,
+                    source_thread_id,
+                    author_name,
+                    mentions,
+                    attachments,
+                    now,
+                );
                 let group = &mut self.groups[group_index];
                 let card = {
                     let card = &mut group.cards[card_index];
@@ -231,7 +276,15 @@ impl ClueStore {
             "parallel" => {
                 let target = target_card_id.ok_or("请选择平行线索的位置")?;
                 let (group_index, _) = self.card_location(target).ok_or("目标线索不存在")?;
-                let card = new_card(title, content, source_thread_id, author_name, mentions, now);
+                let card = new_card(
+                    title,
+                    content,
+                    source_thread_id,
+                    author_name,
+                    mentions,
+                    attachments,
+                    now,
+                );
                 let group = &mut self.groups[group_index];
                 group.cards.push(card.clone());
                 group.updated_at = now;
@@ -248,7 +301,15 @@ impl ClueStore {
                     }
                     None => Vec::new(),
                 };
-                let card = new_card(title, content, source_thread_id, author_name, mentions, now);
+                let card = new_card(
+                    title,
+                    content,
+                    source_thread_id,
+                    author_name,
+                    mentions,
+                    attachments,
+                    now,
+                );
                 let group = ClueNodeGroup {
                     id: uuid::Uuid::new_v4().to_string(),
                     parent_card_ids,
@@ -661,6 +722,7 @@ fn new_version(
     source_thread_id: Option<String>,
     author_name: String,
     mentions: Vec<ClueMention>,
+    attachments: Vec<ClueAttachment>,
     now: i64,
 ) -> ClueCardVersion {
     ClueCardVersion {
@@ -670,6 +732,7 @@ fn new_version(
         author_name: Some(author_name),
         source_thread_id,
         mentions,
+        attachments,
         created_at: now,
     }
 }
@@ -680,9 +743,18 @@ fn new_card(
     source_thread_id: Option<String>,
     author_name: String,
     mentions: Vec<ClueMention>,
+    attachments: Vec<ClueAttachment>,
     now: i64,
 ) -> ClueCard {
-    let version = new_version(title, content, source_thread_id, author_name, mentions, now);
+    let version = new_version(
+        title,
+        content,
+        source_thread_id,
+        author_name,
+        mentions,
+        attachments,
+        now,
+    );
     ClueCard {
         id: uuid::Uuid::new_v4().to_string(),
         current_version_id: version.id.clone(),

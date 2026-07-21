@@ -9,6 +9,7 @@ import {
   summarizeClue,
 } from "../store";
 import { IconClue, IconX } from "./icons";
+import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { MentionPicker } from "./MentionPicker";
 
 type Placement = "update" | "parallel" | "new";
@@ -50,6 +51,7 @@ export function ClueCaptureModal(props: {
   const [busy, setBusy] = createSignal(false);
   const [summarizing, setSummarizing] = createSignal(false);
   const [mentionTokens, setMentionTokens] = createSignal<string[]>([]);
+  const attachments = createImageAttachments({ acceptAllPasteFiles: true });
   const mentionPeers = createMemo(clueMentionPeers);
   const targetCard = createMemo(() => clueCardById(targetCardId()));
   const targetCardTitle = createMemo(() => {
@@ -130,6 +132,7 @@ export function ClueCaptureModal(props: {
         nextPlacement,
         nextTarget,
         mentionTokens(),
+        attachments.images(),
       );
       props.onClose();
     } catch (error) {
@@ -141,7 +144,7 @@ export function ClueCaptureModal(props: {
 
   const body = (
     <>
-      <div class="modal-body">
+      <div class="modal-body" onPaste={attachments.onPaste}>
         <Show when={!props.sessionMode}>
           <div class="clue-placement">
             <button
@@ -243,10 +246,15 @@ export function ClueCaptureModal(props: {
             class="field-input clue-content-input"
             rows={10}
             value={content()}
-            placeholder="记录结论、证据、产物、验证结果和下一步"
+            placeholder="记录结论、证据、产物、验证结果和下一步；可直接粘贴图片或文件"
             disabled={busy() || summarizing()}
             onInput={(event) => setContent(event.currentTarget.value)}
           />
+          <ImageAttachmentStrip
+            images={attachments.images()}
+            onRemove={attachments.remove}
+          />
+          <span class="field-hint">在此弹窗中粘贴图片或文件，会随线索版本一并保存。</span>
         </label>
 
         <div class="field">

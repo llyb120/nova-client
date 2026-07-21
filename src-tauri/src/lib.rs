@@ -707,6 +707,7 @@ async fn capture_clue(
     placement: String,
     target_card_id: Option<String>,
     mention_tokens: Vec<String>,
+    attachments: Vec<clues::ClueAttachment>,
 ) -> Result<clues::CaptureClueResult, String> {
     if let Some(thread_id) = thread_id.as_deref() {
         let store = state.store.lock().unwrap();
@@ -724,6 +725,7 @@ async fn capture_clue(
                 &placement,
                 target_card_id.as_deref(),
                 &mention_tokens,
+                &attachments,
             )
             .await?;
         if let Ok(groups) = state.relay.clue_list().await {
@@ -732,13 +734,15 @@ async fn capture_clue(
         result
     } else {
         let author_name = local_clue_author_name();
-        state.clues.lock().unwrap().capture(
+        state.clues.lock().unwrap().capture_with_attachments(
             &placement,
             target_card_id.as_deref(),
             title,
             content,
             thread_id.clone(),
             author_name,
+            Vec::new(),
+            attachments,
         )?
     };
     if let Some(thread_id) = thread_id {
@@ -2130,6 +2134,31 @@ fn open_in_editor(
     Ok(())
 }
 
+fn open_path_default(abs: &std::path::Path) -> Result<(), String> {
+    if !abs.is_file() {
+        return Err(format!("文件不存在：{}", abs.to_string_lossy()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("rundll32.exe");
+        cmd.arg("url.dll,FileProtocolHandler").arg(abs);
+        cmd.creation_flags(0x0800_0000);
+        cmd.spawn().map_err(|e| format!("打开文件失败：{e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg(abs)
+        .spawn()
+        .map_err(|e| format!("打开文件失败：{e}"))?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open")
+        .arg(abs)
+        .spawn()
+        .map_err(|e| format!("打开文件失败：{e}"))?;
+    Ok(())
+}
+
 /// 用系统默认程序打开线程工作目录中的文件，图片通常由图片查看器或浏览器处理。
 #[tauri::command]
 fn open_file_default(
@@ -2147,29 +2176,37 @@ fn open_file_default(
     } else {
         std::path::Path::new(&cwd).join(path)
     };
-    if !abs.is_file() {
-        return Err(format!("文件不存在：{}", abs.to_string_lossy()));
-    }
+    open_path_default(&abs)
+}
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("rundll32.exe");
-        cmd.arg("url.dll,FileProtocolHandler").arg(&abs);
-        cmd.creation_flags(0x0800_0000);
-        cmd.spawn().map_err(|e| format!("打开文件失败：{e}"))?;
-    }
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("open")
-        .arg(&abs)
-        .spawn()
-        .map_err(|e| format!("打开文件失败：{e}"))?;
-    #[cfg(all(unix, not(target_os = "macos")))]
-    std::process::Command::new("xdg-open")
-        .arg(&abs)
-        .spawn()
-        .map_err(|e| format!("打开文件失败：{e}"))?;
-    Ok(())
+/// 打开线索附件。粘贴附件先还原到临时目录，路径附件直接交给系统默认程序。
+#[tauri::command]
+fn open_clue_attachment(
+    name: String,
+    data: Option<String>,
+    path: Option<String>,
+) -> Result<(), String> {
+    let abs = if let Some(data) = data.filter(|value| !value.is_empty()) {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|error| format!("附件数据损坏：{error}"))?;
+        let safe_name = std::path::Path::new(&name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("attachment");
+        let dir = std::env::temp_dir().join("nova-clue-attachments");
+        std::fs::create_dir_all(&dir).map_err(|error| format!("创建附件临时目录失败：{error}"))?;
+        let abs = dir.join(format!("{}-{safe_name}", uuid::Uuid::new_v4()));
+        std::fs::write(&abs, bytes).map_err(|error| format!("还原附件失败：{error}"))?;
+        abs
+    } else if let Some(path) = path.filter(|value| !value.is_empty()) {
+        std::path::PathBuf::from(path)
+    } else {
+        return Err("附件没有可打开的数据".into());
+    };
+    open_path_default(&abs)
 }
 
 /// 撤销目标：一个文件回滚到本轮编辑前的内容
@@ -5176,6 +5213,7 @@ pub fn run() {
             delete_project_threads,
             open_in_editor,
             open_file_default,
+            open_clue_attachment,
             revert_file_changes,
             open_in_explorer,
             open_in_terminal,

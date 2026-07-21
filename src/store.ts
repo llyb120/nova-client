@@ -7,6 +7,7 @@ import type {
   BranchList,
   CaptureClueResult,
   CliOperationProgress,
+  ClueAttachment,
   ClueCard,
   ClueNodeGroup,
   Decision,
@@ -607,6 +608,7 @@ export async function captureClue(
   placement: "update" | "parallel" | "new",
   targetCardId: string | null,
   mentionTokens: string[] = [],
+  attachments: ClueAttachment[] = [],
 ): Promise<CaptureClueResult> {
   const result = await api.captureClue(
     threadId,
@@ -615,6 +617,7 @@ export async function captureClue(
     placement,
     targetCardId,
     mentionTokens,
+    attachments,
   );
   await Promise.all([refreshClueGroups(), refreshThreads()]);
   return result;

@@ -25,6 +25,15 @@ export interface ClueMention {
   name: string;
 }
 
+export interface ClueAttachment {
+  name: string;
+  mimeType: string;
+  /** 粘贴进来的附件以内嵌 base64 保存；本机文件也可保留 file:// URI。 */
+  data?: string;
+  uri?: string;
+  size?: number;
+}
+
 export interface ClueCardVersion {
   id: string;
   title: string;
@@ -32,6 +41,7 @@ export interface ClueCardVersion {
   authorName?: string;
   sourceThreadId?: string | null;
   mentions: ClueMention[];
+  attachments: ClueAttachment[];
   createdAt: number;
 }
 

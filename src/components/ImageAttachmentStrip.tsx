@@ -5,15 +5,16 @@ import type { PromptImage } from "../types";
 import { isFileDropBlocked } from "../utils";
 import { IconFile, IconX } from "./icons";
 
-function fileToImage(f: File): Promise<PromptImage> {
+function fileToAttachment(f: File): Promise<PromptImage> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       const url = reader.result as string;
       resolve({
-        name: f.name || "粘贴的图片",
-        mimeType: f.type,
+        name: f.name || (f.type.startsWith("image/") ? "粘贴的图片" : "粘贴的文件"),
+        mimeType: f.type || guessMimeType(f.name),
         data: url.slice(url.indexOf(",") + 1),
+        size: f.size,
       });
     };
     reader.onerror = () => reject(reader.error);
@@ -73,19 +74,36 @@ function pathToFileUri(path: string) {
   return `file://${encodeURI(withSlash)}`;
 }
 
+export function fileUriPath(uri: string) {
+  const path = decodeURI(uri.replace(/^file:\/\//, ""));
+  return /^\/[A-Za-z]:\//.test(path) ? path.slice(1) : path;
+}
+
+export function attachmentPreviewSrc(image: PromptImage) {
+  return image.data
+    ? `data:${image.mimeType};base64,${image.data}`
+    : convertFileSrc(fileUriPath(image.uri ?? ""));
+}
+
 /** 附件状态：粘贴图片走 base64，拖入文件走 Tauri file path。 */
-export function createImageAttachments(options: { enableFileDrop?: boolean } = {}) {
+export function createImageAttachments(
+  options: { enableFileDrop?: boolean; acceptAllPasteFiles?: boolean } = {},
+) {
   const [images, setImages] = createSignal<PromptImage[]>([]);
   const [dragging, setDragging] = createSignal(false);
 
   const onPaste = (e: ClipboardEvent) => {
     const files = [...(e.clipboardData?.items ?? [])]
-      .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+      .filter(
+        (it) =>
+          it.kind === "file" &&
+          (options.acceptAllPasteFiles || it.type.startsWith("image/")),
+      )
       .map((it) => it.getAsFile())
       .filter((f): f is File => f != null);
     if (files.length === 0) return;
     e.preventDefault();
-    void Promise.all(files.map(fileToImage)).then((imgs) =>
+    void Promise.all(files.map(fileToAttachment)).then((imgs) =>
       setImages((prev) => [...prev, ...imgs]),
     );
   };
@@ -167,18 +185,14 @@ export function ImageAttachmentStrip(props: {
                 }
               >
                 <img
-                  src={
-                    image.data
-                      ? `data:${image.mimeType};base64,${image.data}`
-                      : convertFileSrc(decodeURI((image.uri ?? "").replace(/^file:\/+/, "")))
-                  }
+                  src={attachmentPreviewSrc(image)}
                   alt={image.name}
                   draggable={false}
                 />
               </Show>
               <button
                 class="image-remove"
-                title="移除图片"
+                title="移除附件"
                 onClick={() => props.onRemove(index())}
               >
                 <IconX size={12} />

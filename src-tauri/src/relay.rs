@@ -1206,7 +1206,8 @@ impl RelayManager {
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Relay-Device", &self.device_id)
             .query(&[("name", name), ("groups", groups)])
-            .timeout(Duration::from_secs(15)))
+            // 线索请求可能包含粘贴的图片或文件；给附件上传留出足够时间。
+            .timeout(Duration::from_secs(60)))
     }
 
     pub async fn clue_list(&self) -> Result<Vec<ClueNodeGroup>, String> {
@@ -1226,6 +1227,7 @@ impl RelayManager {
         placement: &str,
         target_card_id: Option<&str>,
         mention_tokens: &[String],
+        attachments: &[crate::clues::ClueAttachment],
     ) -> Result<CaptureClueResult, String> {
         let author_name = self.cfg().map(|(_, _, name)| name).unwrap_or_default();
         let response = self
@@ -1238,6 +1240,7 @@ impl RelayManager {
                 "targetCardId": target_card_id.unwrap_or_default(),
                 "authorName": author_name,
                 "mentionTokens": mention_tokens,
+                "attachments": attachments,
             }))
             .send()
             .await
