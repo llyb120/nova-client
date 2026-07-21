@@ -5,7 +5,6 @@ mod cli_manager;
 mod clues;
 mod codex;
 mod codex_radar;
-mod codex_sdk;
 mod credential_roaming;
 mod employees;
 mod gitwt;
@@ -18,6 +17,8 @@ mod path_env;
 mod quota;
 mod relay;
 mod remote;
+mod sdk_adapters;
+mod sdk_runtime;
 mod semantic;
 mod server;
 mod settings;
@@ -39,10 +40,11 @@ pub use server::maybe_run_management_command as maybe_run_server_command;
 
 use acp::AcpManager;
 use codex::CodexManager;
-use codex_sdk::{CodexSdkManager, SdkBackend};
 use credential_roaming::{BorrowedManager, BorrowedRuntime};
 use opencode_sdk::OpenCodeSdkManager;
 use relay::{RelayManager, Share};
+use sdk_adapters::{ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter};
+use sdk_runtime::SdkManager;
 use serde_json::{json, Value};
 use settings::Settings;
 use std::collections::{HashMap, HashSet};
@@ -87,11 +89,11 @@ pub struct AppState {
     pub opencodeplus: Arc<OpenCodeSdkManager>,
     pub codex: Arc<CodexManager>,
     /// Codex 官方 TypeScript SDK 后端，不经过 app-server 集成层。
-    pub codexplus: Arc<CodexSdkManager>,
+    pub codexplus: Arc<SdkManager>,
     /// CodeBuddy 官方 Agent SDK 后端。
-    pub codebuddyplus: Arc<CodexSdkManager>,
-    pub claudeplus: Arc<CodexSdkManager>,
-    pub cursorplus: Arc<CodexSdkManager>,
+    pub codebuddyplus: Arc<SdkManager>,
+    pub claudeplus: Arc<SdkManager>,
+    pub cursorplus: Arc<SdkManager>,
     /// 额度租借会话的独立后端进程与临时凭证目录（只在本次运行内存在）。
     pub borrowed_runtimes: Mutex<HashMap<String, BorrowedRuntime>>,
     pub relay: Arc<RelayManager>,
@@ -2575,6 +2577,7 @@ fn set_thread_agent(
             thread.acp_session_id = None;
             thread.pending_native_restore = None;
             thread.provider_checkpoints.clear();
+            thread.codex_usage_snapshot = None;
             // 标记上下文接力：仅当已有历史时才有意义（无历史时 take 会返回 None）
             thread.handoff_from = if thread.items.is_empty() {
                 None
@@ -2857,6 +2860,7 @@ fn truncate_thread(
         thread.plan = None;
         thread.acp_session_id = None;
         thread.pending_native_restore = None;
+        thread.codex_usage_snapshot = None;
         thread
             .provider_checkpoints
             .retain(|checkpoint| checkpoint.user_item_id < item_id);
@@ -4808,10 +4812,10 @@ pub fn run() {
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
-            let codexplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Codex);
-            let codebuddyplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::CodeBuddy);
-            let claudeplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Claude);
-            let cursorplus = CodexSdkManager::new(app.handle().clone(), SdkBackend::Cursor);
+            let codexplus = SdkManager::new(app.handle().clone(), CodexAdapter);
+            let codebuddyplus = SdkManager::new(app.handle().clone(), CodeBuddyAdapter);
+            let claudeplus = SdkManager::new(app.handle().clone(), ClaudeAdapter);
+            let cursorplus = SdkManager::new(app.handle().clone(), CursorAdapter);
             let relay = RelayManager::new(app.handle().clone(), dir.clone());
 
             app.manage(AppState {

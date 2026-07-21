@@ -3,8 +3,10 @@ use crate::acp::{
 };
 use crate::codex_radar;
 use crate::model_cache;
+use crate::sdk_adapters::SdkAdapter;
 use crate::threads::{
-    file_uri_to_local_path, now_ms, save_attachment_to_temp, Item, PromptImage, ToolCall,
+    file_uri_to_local_path, now_ms, save_attachment_to_temp, CodexUsageSnapshot, Item, PromptImage,
+    ToolCall,
 };
 use crate::AppState;
 use serde_json::{json, Value};
@@ -17,55 +19,6 @@ use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SdkBackend {
-    Codex,
-    CodeBuddy,
-    Claude,
-    Cursor,
-}
-
-impl SdkBackend {
-    fn agent_kind(self) -> crate::threads::AgentKind {
-        match self {
-            Self::Codex => crate::threads::AgentKind::Codex,
-            Self::CodeBuddy => crate::threads::AgentKind::CodeBuddy,
-            Self::Claude => crate::threads::AgentKind::ClaudeCode,
-            Self::Cursor => crate::threads::AgentKind::Cursor,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex+",
-            Self::CodeBuddy => "CodeBuddy+",
-            Self::Claude => "Claude Code+",
-            Self::Cursor => "Cursor+",
-        }
-    }
-
-    fn bridge(self) -> (&'static str, &'static [u8]) {
-        match self {
-            Self::Codex => (
-                "codex-bridge.mjs",
-                include_bytes!("../resources/codex-bridge.mjs"),
-            ),
-            Self::CodeBuddy => (
-                "codebuddy-bridge.cjs",
-                include_bytes!("../resources/codebuddy-bridge.cjs"),
-            ),
-            Self::Claude => (
-                "claude-bridge.mjs",
-                include_bytes!("../resources/claude-bridge.mjs"),
-            ),
-            Self::Cursor => (
-                "cursor-bridge.mjs",
-                include_bytes!("../resources/cursor-bridge.mjs"),
-            ),
-        }
-    }
-}
 
 fn is_codex_model_resume_warning(value: &Value) -> bool {
     if value.get("type").and_then(Value::as_str) != Some("error") {
@@ -94,9 +47,9 @@ struct IdleBridge {
     stderr: Arc<Mutex<Vec<String>>>,
 }
 
-pub struct CodexSdkManager {
+pub struct SdkManager {
     app: AppHandle,
-    backend: SdkBackend,
+    adapter: Arc<dyn SdkAdapter>,
     launch_env: HashMap<String, String>,
     running_children: Mutex<HashMap<String, RunningBridge>>,
     idle_children: Mutex<HashMap<String, IdleBridge>>,
@@ -110,19 +63,19 @@ pub struct CodexSdkManager {
     run_epochs: Mutex<HashMap<String, u64>>,
 }
 
-impl CodexSdkManager {
-    pub fn new(app: AppHandle, backend: SdkBackend) -> Arc<Self> {
-        Self::new_with_env(app, backend, HashMap::new())
+impl SdkManager {
+    pub fn new<A: SdkAdapter + 'static>(app: AppHandle, adapter: A) -> Arc<Self> {
+        Self::new_with_env(app, adapter, HashMap::new())
     }
 
-    pub fn new_with_env(
+    pub fn new_with_env<A: SdkAdapter + 'static>(
         app: AppHandle,
-        backend: SdkBackend,
+        adapter: A,
         launch_env: HashMap<String, String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             app,
-            backend,
+            adapter: Arc::new(adapter),
             launch_env,
             running_children: Mutex::new(HashMap::new()),
             idle_children: Mutex::new(HashMap::new()),
@@ -174,17 +127,18 @@ impl CodexSdkManager {
             let Some(thread) = store.get_mut(&thread_id) else {
                 return;
             };
-            let context = thread.take_prompt_context(self.backend.label());
+            let context = thread.take_prompt_context(self.adapter.label());
             let native_restore = thread.pending_native_restore.take();
             let session_id = native_restore
                 .as_ref()
                 .map(|restore| restore.session_id.clone())
                 .or_else(|| thread.acp_session_id.clone());
+            if self.adapter.uses_codex_model_routing() && session_id.is_none() {
+                thread.codex_usage_snapshot = Some(CodexUsageSnapshot::default());
+            }
             let item = thread.push_user(text.clone(), images.clone());
             let user_item_id = item.id();
-            if matches!(self.backend, SdkBackend::Codex | SdkBackend::Cursor)
-                && thread.title == "新会话"
-            {
+            if self.adapter.generates_title() && thread.title == "新会话" {
                 let fallback = derive_title(&text, !images.is_empty());
                 thread.title = fallback.clone();
                 title_job = Some((text.clone(), fallback));
@@ -210,7 +164,7 @@ impl CodexSdkManager {
         };
         if let Some((prompt, fallback)) = title_job {
             self.app.state::<AppState>().generate_title(
-                &self.backend.agent_kind(),
+                &self.adapter.agent_kind(),
                 thread_id.clone(),
                 prompt,
                 fallback,
@@ -222,7 +176,7 @@ impl CodexSdkManager {
             .unwrap()
             .insert(thread_id.clone(), run_epoch);
         self.set_running(&thread_id, true, None);
-        if self.backend == SdkBackend::Codex
+        if self.adapter.uses_codex_model_routing()
             && model.as_deref().is_some_and(codex_radar::is_auto_model)
         {
             if let Some(cached) = cached_auto_model {
@@ -279,7 +233,7 @@ impl CodexSdkManager {
                 }
             }
         }
-        if self.backend == SdkBackend::Codex {
+        if self.adapter.uses_codex_model_routing() {
             let state = self.app.state::<AppState>();
             if let (Some(selected), Some(options)) =
                 (model.as_deref(), state.codex.get_model_options())
@@ -313,7 +267,7 @@ impl CodexSdkManager {
             parts.push(json!({ "type": "text", "text": text }));
         }
         for image in &images {
-            if image.mime_type.starts_with("image/") || self.backend == SdkBackend::Codex {
+            if self.adapter.accepts_data_image(&image.mime_type) {
                 if let Some(data) = &image.data {
                     parts.push(json!({
                         "type": "image_data", "name": image.name, "mime": image.mime_type, "data": data
@@ -369,7 +323,7 @@ impl CodexSdkManager {
         if let Err(error) = outcome {
             self.push_system(
                 &thread_id,
-                format!("{} 请求失败：{error}", self.backend.label()),
+                format!("{} 请求失败：{error}", self.adapter.label()),
                 "error",
             );
         }
@@ -525,20 +479,7 @@ impl CodexSdkManager {
     }
 
     fn empty_model_options(&self) -> Value {
-        let options = if self.backend == SdkBackend::Cursor {
-            vec![json!({ "value": "", "name": "Auto（Cursor 默认）" })]
-        } else {
-            Vec::new()
-        };
-        json!({
-            "configOptions": [{
-                "id": "model",
-                "name": "Model",
-                "currentValue": "",
-                "options": options,
-            }],
-            "modes": null,
-        })
+        self.adapter.empty_model_options()
     }
 
     async fn refresh_model_options(&self) -> Result<Value, String> {
@@ -550,7 +491,7 @@ impl CodexSdkManager {
             .run_bridge(&cwd, json!({ "action": "models", "cwd": cwd }))
             .await?;
         *self.model_options.lock().unwrap() = Some(value.clone());
-        let kind = self.backend.agent_kind();
+        let kind = self.adapter.agent_kind();
         model_cache::save(&crate::nova_data_dir(&self.app), kind.as_str(), &value);
         self.model_options_revalidated.store(true, Ordering::SeqCst);
         let _ = self.app.emit(
@@ -567,7 +508,7 @@ impl CodexSdkManager {
         fallback: String,
         model: String,
     ) {
-        if !matches!(self.backend, SdkBackend::Codex | SdkBackend::Cursor) {
+        if !self.adapter.generates_title() {
             return;
         }
         let manager = self.clone();
@@ -576,7 +517,7 @@ impl CodexSdkManager {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            let model = if manager.backend == SdkBackend::Codex {
+            let model = if manager.adapter.uses_codex_model_routing() {
                 split_codex_effort(&model)
                     .map(|(model, _)| model)
                     .unwrap_or(&model)
@@ -616,14 +557,17 @@ impl CodexSdkManager {
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| format!("{} bridge stdin 不可用", self.backend.label()))?;
+            .ok_or_else(|| format!("{} bridge stdin 不可用", self.adapter.label()))?;
         stdin
             .write_all(format!("{request}\n").as_bytes())
             .await
             .map_err(|e| e.to_string())?;
         drop(stdin);
         let output = child.wait_with_output().await.map_err(|e| e.to_string())?;
-        parse_bridge_output(&String::from_utf8_lossy(&output.stdout), self.backend)
+        parse_bridge_output(
+            &String::from_utf8_lossy(&output.stdout),
+            self.adapter.label(),
+        )
     }
 
     async fn run_prompt_bridge(
@@ -634,12 +578,13 @@ impl CodexSdkManager {
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
-        let mut bridge = match self.backend {
-            SdkBackend::Cursor => self.idle_children.lock().unwrap().remove(thread_id),
-            _ => None,
-        }
-        .map(Ok)
-        .unwrap_or_else(|| self.spawn_idle_bridge(cwd))?;
+        let mut bridge = self
+            .adapter
+            .keeps_bridge_alive()
+            .then(|| self.idle_children.lock().unwrap().remove(thread_id))
+            .flatten()
+            .map(Ok)
+            .unwrap_or_else(|| self.spawn_idle_bridge(cwd))?;
         write_line(&bridge.stdin, &request).await?;
         self.running_children.lock().unwrap().insert(
             thread_id.to_string(),
@@ -673,7 +618,7 @@ impl CodexSdkManager {
                     .unwrap_or_default()
             )
         });
-        let reusable = self.backend == SdkBackend::Cursor
+        let reusable = self.adapter.keeps_bridge_alive()
             && result.is_ok()
             && bridge.child.try_wait().ok().flatten().is_none();
         if reusable {
@@ -692,15 +637,15 @@ impl CodexSdkManager {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| format!("{} bridge stdin 不可用", self.backend.label()))?;
+            .ok_or_else(|| format!("{} bridge stdin 不可用", self.adapter.label()))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| format!("{} bridge stdout 不可用", self.backend.label()))?;
+            .ok_or_else(|| format!("{} bridge stdout 不可用", self.adapter.label()))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| format!("{} bridge stderr 不可用", self.backend.label()))?;
+            .ok_or_else(|| format!("{} bridge stderr 不可用", self.adapter.label()))?;
         let stderr_lines = Arc::new(Mutex::new(Vec::new()));
         let captured = stderr_lines.clone();
         tauri::async_runtime::spawn(async move {
@@ -737,7 +682,7 @@ impl CodexSdkManager {
         let mut item_ids = HashMap::new();
         while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
             let event: Value = serde_json::from_str(&line).map_err(|e| {
-                format!("解析 {} 事件失败：{e}；输出：{line}", self.backend.label())
+                format!("解析 {} 事件失败：{e}；输出：{line}", self.adapter.label())
             })?;
             if event.get("ok").and_then(Value::as_bool) == Some(false) {
                 return Err(event["error"]
@@ -772,7 +717,7 @@ impl CodexSdkManager {
                         EV_LOG,
                         format!(
                             "[{}][timing] {phase} {elapsed_ms}ms{cancelled_runs}",
-                            self.backend.label()
+                            self.adapter.label()
                         ),
                     );
                 }
@@ -787,52 +732,25 @@ impl CodexSdkManager {
                 _ => {}
             }
         }
-        Err(format!("{} bridge 意外退出", self.backend.label()))
+        Err(format!("{} bridge 意外退出", self.adapter.label()))
     }
 
     fn spawn_bridge(&self, cwd: &str) -> Result<Child, String> {
-        let (program, proxy, path_env, api_key) = {
+        let launch = {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap();
-            match self.backend {
-                SdkBackend::Codex => (
-                    settings.codex_path.clone(),
-                    settings.codex_proxy.clone(),
-                    "NOVA_CODEX_PATH",
-                    None,
-                ),
-                SdkBackend::CodeBuddy => (
-                    settings.codebuddy_path.clone(),
-                    settings.codebuddy_proxy.clone(),
-                    "NOVA_CODEBUDDY_PATH",
-                    None,
-                ),
-                SdkBackend::Claude => (
-                    settings.claudecode_path.clone(),
-                    settings.claudecode_proxy.clone(),
-                    "NOVA_CLAUDE_PATH",
-                    (!settings.claudecode_sdk_api_key.is_empty())
-                        .then(|| ("ANTHROPIC_API_KEY", settings.claudecode_sdk_api_key.clone())),
-                ),
-                SdkBackend::Cursor => (
-                    settings.cursor_path.clone(),
-                    settings.cursor_proxy.clone(),
-                    "NOVA_CURSOR_PATH",
-                    (!settings.cursor_sdk_api_key.is_empty())
-                        .then(|| ("CURSOR_API_KEY", settings.cursor_sdk_api_key.clone())),
-                ),
-            }
+            self.adapter.launch_config(&settings)
         };
-        let program = resolve_program_on_path(&program)
+        let program = resolve_program_on_path(&launch.program)
             .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or(program);
+            .unwrap_or(launch.program);
         let node = resolve_program_on_path("node").ok_or_else(|| {
             format!(
                 "未找到 Node.js，{} 需要 Node.js 运行官方 SDK",
-                self.backend.label()
+                self.adapter.label()
             )
         })?;
-        let bridge = bridge_path(&self.app, self.backend)?;
+        let bridge = bridge_path(&self.app, self.adapter.as_ref())?;
         let mut command = Command::new(node);
         command
             .arg(bridge)
@@ -840,14 +758,14 @@ impl CodexSdkManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env(path_env, &program);
+            .env(launch.path_env, &program);
         if !self.launch_env.is_empty() {
             crate::credential_roaming::isolate_borrowed_command(&mut command);
             command.envs(&self.launch_env);
         }
-        apply_proxy_env(&mut command, &proxy);
+        apply_proxy_env(&mut command, &launch.proxy);
         if self.launch_env.is_empty() {
-            if let Some((name, value)) = api_key {
+            if let Some((name, value)) = launch.api_key {
                 command.env(name, value);
             }
         }
@@ -855,13 +773,25 @@ impl CodexSdkManager {
         command.creation_flags(0x0800_0000);
         command
             .spawn()
-            .map_err(|e| format!("启动 {} Node bridge 失败：{e}", self.backend.label()))
+            .map_err(|e| format!("启动 {} Node bridge 失败：{e}", self.adapter.label()))
     }
 
     fn save_session_id(&self, thread_id: &str, session_id: &str) {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
+            if self.adapter.uses_codex_model_routing() {
+                if let Some(snapshot) = thread.codex_usage_snapshot.as_mut() {
+                    if snapshot
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|id| id != session_id)
+                    {
+                        *snapshot = CodexUsageSnapshot::default();
+                    }
+                    snapshot.session_id = Some(session_id.to_string());
+                }
+            }
             thread.acp_session_id = Some(session_id.to_string());
         }
         store.save();
@@ -872,6 +802,9 @@ impl CodexSdkManager {
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
             thread.acp_session_id = None;
+            if self.adapter.uses_codex_model_routing() {
+                thread.codex_usage_snapshot = None;
+            }
         }
         store.save();
     }
@@ -896,13 +829,15 @@ impl CodexSdkManager {
     }
 
     fn apply_item(&self, thread_id: &str, value: &Value, ids: &mut HashMap<String, u64>) {
-        if self.backend == SdkBackend::Codex && is_codex_model_resume_warning(value) {
+        if self.adapter.uses_codex_model_routing() && is_codex_model_resume_warning(value) {
             return;
         }
         let Some(remote_id) = value.get("id").and_then(Value::as_str) else {
             return;
         };
-        let plan = (self.backend == SdkBackend::Codex)
+        let plan = self
+            .adapter
+            .uses_codex_model_routing()
             .then(|| codex_todo_plan(value))
             .flatten();
         let state = self.app.state::<AppState>();
@@ -970,7 +905,7 @@ impl CodexSdkManager {
                 .iter_mut()
                 .find(|candidate| candidate.id() == id)
             {
-                update = if self.backend == SdkBackend::Codex {
+                update = if self.adapter.uses_text_deltas() {
                     match text_snapshot_change(slot, &item) {
                         TextSnapshotChange::Delta(delta) => {
                             Some(json!({ "t": "delta", "itemId": id, "text": delta }))
@@ -1004,12 +939,8 @@ impl CodexSdkManager {
         let Some(request_id) = permission.get("id").and_then(Value::as_str) else {
             return;
         };
-        let (prefix, agent_kind) = match self.backend {
-            SdkBackend::Codex => ("cdp", "codex"),
-            SdkBackend::CodeBuddy => ("cbp", "codebuddy"),
-            SdkBackend::Claude => ("clp", "claudecode"),
-            SdkBackend::Cursor => ("cup", "cursor"),
-        };
+        let prefix = self.adapter.permission_prefix();
+        let agent_kind = self.adapter.agent_kind();
         let request_key = format!("{prefix}-perm-{thread_id}-{request_id}");
         self.pending_permissions.lock().unwrap().insert(
             request_key.clone(),
@@ -1017,7 +948,7 @@ impl CodexSdkManager {
         );
         let _ = self.app.emit(crate::acp::EV_PERMISSION, json!({
             "threadId": thread_id,
-            "agentKind": agent_kind,
+            "agentKind": agent_kind.as_str(),
             "requestKey": request_key,
             "toolCall": {
                 "title": permission.get("permission").and_then(Value::as_str).unwrap_or("工具调用"),
@@ -1048,7 +979,7 @@ impl CodexSdkManager {
             .unwrap()
             .get(&thread_id)
             .map(|bridge| bridge.stdin.clone())
-            .ok_or_else(|| format!("{} 会话已结束", self.backend.label()))?;
+            .ok_or_else(|| format!("{} 会话已结束", self.adapter.label()))?;
         write_line(&stdin, &json!({ "action": "permission", "requestId": request_id, "reply": if option_id == "reject" { "reject" } else { "once" } })).await?;
         let _ = self.app.emit(
             crate::acp::EV_PERMISSION_RESOLVED,
@@ -1101,17 +1032,17 @@ impl CodexSdkManager {
             .remove(thread_id)
             .map(|started| started.elapsed().as_millis() as u64)
             .unwrap_or(0);
-        let usage = usage.map(|value| {
-            json!({
-                "inputTokens": value.get("input_tokens").and_then(Value::as_u64),
-                "outputTokens": value.get("output_tokens").and_then(Value::as_u64),
-                "totalTokens": value.get("input_tokens").and_then(Value::as_u64).unwrap_or(0)
-                    + value.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
-            })
-        });
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
+            let (usage, snapshot) = self.adapter.normalize_usage(
+                usage.as_ref(),
+                thread.codex_usage_snapshot.as_ref(),
+                thread.acp_session_id.as_deref(),
+            );
+            if let Some(snapshot) = snapshot {
+                thread.codex_usage_snapshot = Some(snapshot);
+            }
             for item in complete_pending_tools(thread) {
                 let _ = self.emit_update(thread_id, &item);
             }
@@ -1153,21 +1084,21 @@ impl CodexSdkManager {
     }
 }
 
-impl Drop for CodexSdkManager {
+impl Drop for SdkManager {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-fn bridge_path(app: &AppHandle, backend: SdkBackend) -> Result<PathBuf, String> {
-    let (name, bridge) = backend.bridge();
+fn bridge_path(app: &AppHandle, adapter: &dyn SdkAdapter) -> Result<PathBuf, String> {
+    let (name, bridge) = adapter.bridge();
     let dir = crate::nova_data_dir(app).join("runtime");
     std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("创建 {} 运行目录失败：{e}", backend.label()))?;
+        .map_err(|e| format!("创建 {} 运行目录失败：{e}", adapter.label()))?;
     let path = dir.join(name);
     if std::fs::read(&path).ok().as_deref() != Some(bridge) {
         std::fs::write(&path, bridge)
-            .map_err(|e| format!("释放 {} bridge 失败：{e}", backend.label()))?;
+            .map_err(|e| format!("释放 {} bridge 失败：{e}", adapter.label()))?;
     }
     Ok(path)
 }
@@ -1191,17 +1122,13 @@ fn kill_child(child: &mut Child) {
     let _ = child.start_kill();
 }
 
-fn parse_bridge_output(output: &str, backend: SdkBackend) -> Result<Value, String> {
+fn parse_bridge_output(output: &str, label: &str) -> Result<Value, String> {
     let line = output
         .lines()
         .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| format!("{} bridge 未返回结果", backend.label()))?;
-    let response: Value = serde_json::from_str(line).map_err(|e| {
-        format!(
-            "解析 {} bridge 响应失败：{e}；输出：{line}",
-            backend.label()
-        )
-    })?;
+        .ok_or_else(|| format!("{label} bridge 未返回结果"))?;
+    let response: Value = serde_json::from_str(line)
+        .map_err(|e| format!("解析 {} bridge 响应失败：{e}；输出：{line}", label))?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(response["error"]
             .as_str()
@@ -1211,7 +1138,7 @@ fn parse_bridge_output(output: &str, backend: SdkBackend) -> Result<Value, Strin
     response
         .get("data")
         .cloned()
-        .ok_or_else(|| format!("{} bridge 响应缺少 data", backend.label()))
+        .ok_or_else(|| format!("{label} bridge 响应缺少 data"))
 }
 
 fn normalize_title(output: &str, fallback: &str) -> String {
@@ -1367,9 +1294,12 @@ mod tests {
     use super::{
         codex_todo_plan, complete_pending_tools, derive_title, is_codex_model_resume_warning,
         normalize_title, parse_bridge_output, resolve_codex_model, text_snapshot_change, tool_call,
-        SdkBackend, TextSnapshotChange,
+        TextSnapshotChange,
     };
-    use crate::threads::{now_ms, AgentKind, Item, Thread, ToolCall};
+    use crate::sdk_adapters::{
+        ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter, SdkAdapter,
+    };
+    use crate::threads::{now_ms, AgentKind, CodexUsageSnapshot, Item, Thread, ToolCall};
     use serde_json::json;
 
     #[test]
@@ -1428,12 +1358,88 @@ mod tests {
     }
 
     #[test]
+    fn codex_usage_is_the_delta_between_cumulative_snapshots() {
+        let baseline = CodexUsageSnapshot {
+            session_id: Some("thread-1".into()),
+            input_tokens: 1_000,
+            output_tokens: 100,
+        };
+        let (usage, snapshot) = CodexAdapter.normalize_usage(
+            Some(&json!({
+                "input_tokens": 1_600,
+                "cached_input_tokens": 500,
+                "output_tokens": 180,
+                "reasoning_output_tokens": 40
+            })),
+            Some(&baseline),
+            Some("thread-1"),
+        );
+
+        assert_eq!(
+            usage,
+            Some(json!({ "inputTokens": 600, "outputTokens": 80, "totalTokens": 680 }))
+        );
+        assert_eq!(snapshot.unwrap().input_tokens, 1_600);
+    }
+
+    #[test]
+    fn codex_usage_without_a_matching_baseline_is_not_counted() {
+        let raw = json!({ "input_tokens": 1_600, "output_tokens": 180 });
+        let (missing, snapshot) = CodexAdapter.normalize_usage(Some(&raw), None, Some("thread-1"));
+        assert!(missing.is_none());
+        assert_eq!(snapshot.unwrap().output_tokens, 180);
+
+        let other_session = CodexUsageSnapshot {
+            session_id: Some("thread-0".into()),
+            input_tokens: 1_000,
+            output_tokens: 100,
+        };
+        let (mismatched, _) =
+            CodexAdapter.normalize_usage(Some(&raw), Some(&other_session), Some("thread-1"));
+        assert!(mismatched.is_none());
+    }
+
+    #[test]
+    fn cursor_usage_maps_camel_case_and_includes_cached_input() {
+        let raw = json!({
+            "inputTokens": 100,
+            "outputTokens": 20,
+            "cacheReadTokens": 300,
+            "cacheWriteTokens": 40
+        });
+        let (usage, _) = CursorAdapter.normalize_usage(Some(&raw), None, None);
+
+        assert_eq!(
+            usage,
+            Some(json!({ "inputTokens": 440, "outputTokens": 20, "totalTokens": 460 }))
+        );
+    }
+
+    #[test]
+    fn claude_style_usage_includes_cached_input_and_rejects_partial_data() {
+        let raw = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 300,
+            "cache_creation_input_tokens": 40
+        });
+        for adapter in [&ClaudeAdapter as &dyn SdkAdapter, &CodeBuddyAdapter] {
+            let (usage, _) = adapter.normalize_usage(Some(&raw), None, None);
+            assert_eq!(
+                usage,
+                Some(json!({ "inputTokens": 440, "outputTokens": 20, "totalTokens": 460 }))
+            );
+        }
+
+        let partial = json!({ "input_tokens": 100 });
+        let (usage, _) = ClaudeAdapter.normalize_usage(Some(&partial), None, None);
+        assert!(usage.is_none());
+    }
+
+    #[test]
     fn parses_and_normalizes_title_response() {
-        let output = parse_bridge_output(
-            r#"{"ok":true,"data":"`修复标题路由。`"}"#,
-            SdkBackend::Codex,
-        )
-        .unwrap();
+        let output =
+            parse_bridge_output(r#"{"ok":true,"data":"`修复标题路由。`"}"#, "Codex+").unwrap();
         assert_eq!(
             normalize_title(output.as_str().unwrap(), "fallback"),
             "修复标题路由"
@@ -1546,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_sdk_tools_preserve_available_details() {
+    fn sdk_tools_preserve_available_details() {
         let command = tool_call(&json!({
             "id": "command", "type": "command_execution", "command": "git status",
             "aggregated_output": " M src/main.rs\n", "exit_code": 0, "status": "completed"
