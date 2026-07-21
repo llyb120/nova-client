@@ -1,8 +1,23 @@
+import { existsSync } from "node:fs";
+import { win32 } from "node:path";
 import { createInterface } from "node:readline";
 import { query, unstable_v2_createSession } from "@tencent-ai/agent-sdk";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function resolveCodeBuddyCliPath(cliPath, fileExists = existsSync) {
+  if (!cliPath || !/\.(?:cmd|bat)$/i.test(cliPath)) return cliPath;
+  const npmCliPath = win32.join(
+    win32.dirname(cliPath),
+    "node_modules",
+    "@tencent-ai",
+    "codebuddy-code",
+    "bin",
+    "codebuddy",
+  );
+  return fileExists(npmCliPath) ? npmCliPath : cliPath;
 }
 
 async function readRequest(lines) {
@@ -71,6 +86,7 @@ async function runPrompt(lines, request) {
   let sessionId = request.sessionId;
   let checkpoint;
   let activeQuery;
+  const cliPath = resolveCodeBuddyCliPath(process.env.NOVA_CODEBUDDY_PATH || undefined);
   const input = (async () => {
     for await (const line of lines) {
       if (!line.trim()) continue;
@@ -97,7 +113,8 @@ async function runPrompt(lines, request) {
       model: request.model || undefined,
       effort: request.reasoningEffort || undefined,
       includePartialMessages: true,
-      pathToCodebuddyCode: process.env.NOVA_CODEBUDDY_PATH || undefined,
+      pathToCodebuddyCode: cliPath,
+      stderr: (data) => process.stderr.write(data),
       permissionMode: request.mode === "plan" ? "plan" : "default",
       canUseTool: (tool, toolInput, options) => new Promise((resolve) => {
         pending.set(options.toolUseID, resolve);
@@ -126,7 +143,7 @@ async function runPrompt(lines, request) {
 }
 
 async function modelOptions(request) {
-  const cliPath = process.env.NOVA_CODEBUDDY_PATH || undefined;
+  const cliPath = resolveCodeBuddyCliPath(process.env.NOVA_CODEBUDDY_PATH || undefined);
   if (cliPath) process.env.CODEBUDDY_CODE_PATH = cliPath;
   const session = unstable_v2_createSession({
     cwd: request.cwd,
@@ -172,4 +189,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { promptMessages };
+export { promptMessages, resolveCodeBuddyCliPath };
