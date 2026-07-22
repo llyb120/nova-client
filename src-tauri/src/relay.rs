@@ -3132,11 +3132,20 @@ impl RelayManager {
             }
             AgentKind::Cursor => {
                 let mgr = state.cursorplus.clone();
-                tauri::async_runtime::spawn(async move {
-                    if host_prompt_is_current(&prompt_epoch) {
-                        mgr.run_prompt(host_thread_id, text, images).await;
-                    }
-                });
+                if mgr.is_running(&host_thread_id) {
+                    tauri::async_runtime::spawn(async move {
+                        if !host_prompt_is_current(&prompt_epoch) {
+                            return;
+                        }
+                        mgr.steer_prompt(host_thread_id, text, images).await;
+                    });
+                } else {
+                    tauri::async_runtime::spawn(async move {
+                        if host_prompt_is_current(&prompt_epoch) {
+                            mgr.run_prompt(host_thread_id, text, images).await;
+                        }
+                    });
+                }
             }
         }
     }

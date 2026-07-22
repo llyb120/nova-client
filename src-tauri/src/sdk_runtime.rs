@@ -363,7 +363,7 @@ impl SdkManager {
     }
 
     /// 支持原生 steer 的 SDK 直接把用户消息排入当前 Agent run；其他 SDK
-    /// 仍静默结束当前流，再复用已有 session 启动新 turn。
+    /// （如 Cursor：每轮 Agent.create + slim memory）仍静默结束当前流，再开新 turn。
     pub async fn steer_prompt(
         self: &Arc<Self>,
         thread_id: String,

@@ -2884,9 +2884,16 @@ pub(crate) fn dispatch_prompt(
                 }
             }
             BorrowedManager::Sdk(manager) => {
-                tauri::async_runtime::spawn(async move {
-                    manager.run_prompt(thread_id, text, images).await;
-                });
+                // Alkaid：原生 steer；Cursor 等：打断当前轮后以新 turn / slim memory 继续。
+                if manager.is_running(&thread_id) {
+                    tauri::async_runtime::spawn(async move {
+                        manager.steer_prompt(thread_id, text, images).await;
+                    });
+                } else {
+                    tauri::async_runtime::spawn(async move {
+                        manager.run_prompt(thread_id, text, images).await;
+                    });
+                }
             }
             BorrowedManager::OpenCode(manager) => {
                 tauri::async_runtime::spawn(async move {
@@ -2940,10 +2947,18 @@ pub(crate) fn dispatch_prompt(
             });
         }
         AgentKind::Cursor => {
+            // 每轮 Agent.create + slim memory：运行中引导 = 静默打断后开新 turn，
+            // 不是往当前 Cursor agent 注入（无原生 steer）。
             let mgr = state.cursorplus.clone();
-            tauri::async_runtime::spawn(async move {
-                mgr.run_prompt(thread_id, text, images).await;
-            });
+            if mgr.is_running(&thread_id) {
+                tauri::async_runtime::spawn(async move {
+                    mgr.steer_prompt(thread_id, text, images).await;
+                });
+            } else {
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(thread_id, text, images).await;
+                });
+            }
         }
         AgentKind::Devin => {
             let mgr = state.acp.clone();

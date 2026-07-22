@@ -74,6 +74,16 @@ export function Composer() {
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
+  // 原生注入当前轮：Alkaid / Codex / Devin。
+  const supportsLiveSteer = () =>
+    state.agentKind === "alkaid" ||
+    state.agentKind === "codex" ||
+    state.agentKind === "devin";
+  // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）、OpenCode。
+  const supportsInterruptSteer = () =>
+    state.agentKind === "cursor" ||
+    state.agentKind === "opencode";
+  const supportsSteer = () => supportsLiveSteer() || supportsInterruptSteer();
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
   const [stopReason, setStopReason] = createSignal("");
   const [employeeMenuOpen, setEmployeeMenuOpen] = createSignal(false);
@@ -250,10 +260,11 @@ export function Composer() {
 
   onCleanup(() => rememberPromptDraft(text(), attach.images()));
 
-  // 运行中也可发送：消息会注入当前轮次实时引导 agent
+  // 支持引导的后端运行中可继续发送：原生注入或打断后新 turn（Cursor slim memory）。
   const submit = () => {
     const value = text().trim();
     if (empty()) return;
+    if (running() && !supportsSteer()) return;
     const images = attach.images();
     const currentId = state.currentId;
     if (currentId && value) {
@@ -463,7 +474,11 @@ export function Composer() {
         class="composer-input"
         placeholder={
           running()
-            ? `${providerName()} 正在工作…输入并回车可实时引导`
+            ? supportsLiveSteer()
+              ? `${providerName()} 正在工作…输入并回车可实时引导`
+              : supportsInterruptSteer()
+                ? `${providerName()} 正在工作…输入并回车可引导（将打断当前轮继续）`
+                : `${providerName()} 正在工作…请先停止，再发送下一轮`
             : `给 ${providerName()} 下达任务，Enter 发送，Shift+Enter 换行，可粘贴或拖入文件`
         }
         value={text()}
@@ -544,9 +559,17 @@ export function Composer() {
         </span>
         <button
           class="composer-btn send"
-          disabled={empty()}
+          disabled={empty() || (running() && !supportsSteer())}
           onClick={submit}
-          title={running() ? "发送并引导当前任务" : "发送"}
+          title={
+            running() && supportsLiveSteer()
+              ? "发送并引导当前任务"
+              : running() && supportsInterruptSteer()
+                ? "打断当前轮并以引导继续"
+                : running()
+                  ? "请先停止当前轮次"
+                  : "发送"
+          }
         >
           <IconSend size={16} />
         </button>

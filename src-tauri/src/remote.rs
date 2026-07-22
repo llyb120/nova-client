@@ -1762,8 +1762,8 @@ fn send_prompt(app: &AppHandle, thread_id: &str, text: &str) -> Result<(), Strin
             return Err("该会话不支持远程操作".into());
         }
     }
-    // 复用本地聊天的唯一分发入口：运行中的 Codex/Devin 会走 steer_prompt，
-    // 其余后端也与桌面输入框保持完全一致，避免远程入口再次出现能力漂移。
+    // 复用本地聊天的唯一分发入口：运行中的 Alkaid/Codex/Devin 走原生引导，
+    // Cursor 走打断后新 turn（Agent.create + slim memory），与桌面输入框保持一致。
     crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), Vec::new())
 }
 
