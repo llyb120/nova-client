@@ -2777,17 +2777,13 @@ pub(crate) fn resolve_program_on_path(name: &str) -> Option<std::path::PathBuf> 
         });
     }
     let exts = ["exe", "cmd", "bat"];
-    let inherited = std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .unwrap_or_default();
-    inherited
-        .into_iter()
-        .chain(crate::path_env::windows_registry_paths())
-        .find_map(|dir| {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
             exts.iter()
                 .map(|ext| dir.join(format!("{name}.{ext}")))
                 .find(|p| p.is_file())
         })
+    })
 }
 
 /// 非 Windows：在 PATH 中解析裸命令名（带路径分隔符的输入视为具体文件）。
