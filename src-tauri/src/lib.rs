@@ -3586,6 +3586,12 @@ async fn refresh_relay_peers(state: State<'_, AppState>) -> Result<Value, String
     Ok(state.relay.peers())
 }
 
+/// 从中转站拉取当前用户已解锁的成就。
+#[tauri::command]
+async fn list_achievements(state: State<'_, AppState>) -> Result<Vec<relay::Achievement>, String> {
+    state.relay.list_achievements().await
+}
+
 #[tauri::command]
 fn get_relay_inbox(state: State<'_, AppState>) -> Vec<Share> {
     state.relay.inbox_list()
@@ -5287,6 +5293,7 @@ pub fn run() {
             verify_relay,
             get_relay_peers,
             refresh_relay_peers,
+            list_achievements,
             get_relay_inbox,
             share_thread,
             advanced_share,

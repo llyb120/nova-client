@@ -314,6 +314,23 @@ fn host_prompt_is_current(prompt_epoch: &(Arc<AtomicU64>, u64)) -> bool {
 }
 
 /// 一条待接收的分享
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Achievement {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub icon: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AchievementsResponse {
+    #[serde(default)]
+    achievements: Vec<Achievement>,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Share {
@@ -556,6 +573,27 @@ impl RelayManager {
 
     pub fn peers(&self) -> Value {
         self.peers.lock().unwrap().clone()
+    }
+
+    /// 拉取当前 token 已解锁的成就列表。
+    pub async fn list_achievements(&self) -> Result<Vec<Achievement>, String> {
+        let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
+        let resp = self
+            .http
+            .get(format!("{server}/v2/achievements"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
+            .header("X-Relay-Device", &self.device_id)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+        let body: AchievementsResponse = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(body.achievements)
     }
 
     /// 主动从服务端拉取一次在线名单，更新缓存并通知前端。

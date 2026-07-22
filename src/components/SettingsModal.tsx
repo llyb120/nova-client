@@ -18,7 +18,9 @@ import {
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker } from "./ConfigSelects";
 import { IconX } from "./icons";
+import { AchievementBadge } from "./AchievementBadge";
 import type {
+  Achievement,
   AgentInstructionTarget,
   AgentKind,
   CliStatus,
@@ -114,6 +116,7 @@ type SettingsTab =
   | "instructions"
   | "appearance"
   | "team"
+  | "achievements"
   | "memory"
   | "worktree"
   | "skills"
@@ -129,6 +132,7 @@ const TABS: { id: SettingsTab; name: string }[] = [
   { id: "memory", name: "记忆检索" },
   { id: "worktree", name: "Worktree" },
   { id: "skills", name: "Skills" },
+  { id: "achievements", name: "成就" },
   { id: "about", name: "关于" },
 ];
 
@@ -203,6 +207,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [globalInstructionsMsg, setGlobalInstructionsMsg] = createSignal("");
   const [verifying, setVerifying] = createSignal(false);
   const [verifyMsg, setVerifyMsg] = createSignal("");
+  const [achievements, setAchievements] = createSignal<Achievement[]>([]);
+  const [achievementsLoading, setAchievementsLoading] = createSignal(false);
+  const [achievementsError, setAchievementsError] = createSignal("");
   const [showLogs, setShowLogs] = createSignal(false);
   const [saving, setSaving] = createSignal(false);
   const [restarting, setRestarting] = createSignal(false);
@@ -468,6 +475,29 @@ export function SettingsModal(props: { onClose: () => void }) {
     if (tab() !== "team") return;
     void loadRoamingFolders();
     for (const kind of quotaShareKinds()) void ensureModelOptions(kind);
+  });
+
+  const refreshAchievements = async () => {
+    setAchievementsLoading(true);
+    setAchievementsError("");
+    try {
+      if (!state.settings?.relayToken?.trim() && !relayToken().trim()) {
+        setAchievements([]);
+        setAchievementsError("请先在「团队」中配置中转站 token，成就由服务器按身份授予。");
+        return;
+      }
+      const list = await api.listAchievements();
+      setAchievements(list);
+    } catch (error) {
+      setAchievements([]);
+      setAchievementsError(`加载失败：${String(error)}`);
+    } finally {
+      setAchievementsLoading(false);
+    }
+  };
+
+  createEffect(() => {
+    if (tab() === "achievements") void refreshAchievements();
   });
 
   createEffect(() => {
@@ -1510,6 +1540,52 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </For>
               </div>
             </div>
+          </Show>
+
+          {/* ===== 成就 ===== */}
+          <Show when={tab() === "achievements"}>
+            <section class="settings-group achv-section">
+              <h3 class="settings-group-title">我的成就</h3>
+              <p class="settings-group-desc">
+                成就由中转站按你的身份授予。连接团队后可在此查看已解锁的徽章。
+              </p>
+              <div class="achv-toolbar">
+                <span class="field-hint">
+                  {achievementsLoading()
+                    ? "加载中…"
+                    : achievements().length > 0
+                      ? `已解锁 ${achievements().length} 项`
+                      : "暂无成就"}
+                </span>
+                <button
+                  type="button"
+                  class="link-btn"
+                  disabled={achievementsLoading()}
+                  onClick={() => void refreshAchievements()}
+                >
+                  刷新
+                </button>
+              </div>
+              <Show when={achievementsError()}>
+                <div class="field-hint achv-error">{achievementsError()}</div>
+              </Show>
+              <Show
+                when={achievements().length > 0}
+                fallback={
+                  <div class="sel-empty">
+                    {achievementsLoading()
+                      ? "正在从服务器读取成就…"
+                      : achievementsError()
+                        ? "未能加载成就"
+                        : "暂未获得成就"}
+                  </div>
+                }
+              >
+                <div class="achv-grid">
+                  <For each={achievements()}>{(a) => <AchievementBadge achievement={a} />}</For>
+                </div>
+              </Show>
+            </section>
           </Show>
 
           {/* ===== 记忆检索 ===== */}

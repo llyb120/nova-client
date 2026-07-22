@@ -485,6 +485,17 @@ export interface RelayStatus {
   connected: boolean;
 }
 
+/** 用户成就（由中转站按 token 前缀授予） */
+export interface Achievement {
+  id: string;
+  title: string;
+  description: string;
+  /** 徽章资源键，如 founder / pioneer */
+  icon: string;
+  /** 先驱者等编号类成就的用户序号 */
+  number?: string;
+}
+
 /** host 侧：收到的一条待确认漫游请求 */
 export interface IncomingRoamRequest {
   reqId: string;

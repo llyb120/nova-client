@@ -2,3 +2,12 @@
 declare module "@fontsource-variable/inter";
 declare module "@fontsource-variable/noto-sans-sc";
 declare module "@fontsource-variable/jetbrains-mono";
+
+declare module "*.png" {
+  const src: string;
+  export default src;
+}
+declare module "*.svg" {
+  const src: string;
+  export default src;
+}

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ExclusiveChatIdentity } from "./components/ExclusiveChatMark";
 import type {
+  Achievement,
   AgentKind,
   BranchList,
   CaptureClueResult,
@@ -207,6 +208,7 @@ export const api = {
   getRelayPeers: () => invoke<{ peers: Peer[] } | Peer[]>("get_relay_peers"),
   // 联网兜底刷新：直接查服务端 roster（不依赖 SSE presence 推送），自愈丢失的在线名单
   refreshRelayPeers: () => invoke<{ peers: Peer[] } | Peer[]>("refresh_relay_peers"),
+  listAchievements: () => invoke<Achievement[]>("list_achievements"),
   getRelayInbox: () => invoke<IncomingShare[]>("get_relay_inbox"),
   shareThread: (threadId: string, to: string) =>
     invoke<void>("share_thread", { threadId, to }),
