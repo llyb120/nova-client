@@ -5,8 +5,8 @@ use crate::codex_radar;
 use crate::model_cache;
 use crate::sdk_adapters::SdkAdapter;
 use crate::threads::{
-    file_uri_to_local_path, now_ms, save_attachment_to_temp, CodexUsageSnapshot, Item, PromptImage,
-    ToolCall,
+    file_uri_to_local_path, now_ms, save_attachment_to_temp, AgentKind, CodexUsageSnapshot, Item,
+    PromptImage, ToolCall,
 };
 use crate::AppState;
 use serde_json::{json, Value};
