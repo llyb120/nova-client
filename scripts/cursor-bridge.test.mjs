@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
-const { CursorStartupTimeout, completePendingTools, createMessageState, cursorModelOptions, cursorTodoPlan, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, sendPromptWithRecovery, withTimeout } = await import("./cursor-bridge.mjs");
+const { CursorStartupTimeout, compactConversation, completePendingTools, createMessageState, cursorModelOptions, cursorTodoPlan, mapDelta, mapMessage, messageWithRecoveryContext, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, sendPromptWithRecovery, withTimeout } = await import("./cursor-bridge.mjs");
 const state = createMessageState();
 
 assert.equal(mapMessage({ type: "assistant", run_id: "run", message: { content: [{ type: "text", text: "Hello" }] } }, state)[0].text, "Hello");
@@ -161,5 +161,60 @@ const recoveredAfterTimeout = await recoverTimedOutAgent(
   timeoutRecoverySdk,
   100,
 );
-assert.equal(recoveredAfterTimeout, replacementAgent);
+assert.equal(recoveredAfterTimeout.agent, replacementAgent);
+assert.equal(recoveredAfterTimeout.replaced, false);
 assert.deepEqual(timeoutRecoveryCalls, ["cancel-current", "cancel:active", "close", "resume:timed-out-agent"]);
+
+const conversation = [
+  { type: "agentConversationTurn", turn: { userMessage: { text: "Build a restaurant" }, steps: [
+    { type: "toolCall", message: { type: "write" } },
+    { type: "assistantMessage", message: { text: "Created the first version." } },
+  ] } },
+  { type: "agentConversationTurn", turn: { userMessage: { text: "Make it bright" }, steps: [
+    { type: "assistantMessage", message: { text: "Changed the lighting." } },
+  ] } },
+];
+assert.equal(compactConversation(conversation), [
+  "User: Build a restaurant",
+  "Assistant: Created the first version.",
+  "User: Make it bright",
+  "Assistant: Changed the lighting.",
+].join("\n\n"));
+assert.ok(compactConversation(conversation, 40).endsWith("Assistant: Changed the lighting."));
+const recoveredMessage = messageWithRecoveryContext(
+  { text: "Add animation", images: [{ data: "image", mimeType: "image/png" }] },
+  compactConversation(conversation),
+);
+assert.match(recoveredMessage.text, /Created the first version/);
+assert.match(recoveredMessage.text, /Current request:\nAdd animation$/);
+assert.deepEqual(recoveredMessage.images, [{ data: "image", mimeType: "image/png" }]);
+
+const freshCalls = [];
+const freshAgent = { agentId: "fresh-agent" };
+const finishedRun = {
+  id: "finished-run",
+  status: "finished",
+  createdAt: 2,
+  conversation: async () => conversation,
+};
+const freshSdk = {
+  listRuns: async () => ({ items: [finishedRun, { id: "stuck", status: "running" }] }),
+  cancelRun: async (id) => freshCalls.push(`cancel:${id}`),
+  resume: async () => assert.fail("a poisoned agent must not be resumed"),
+  create: async () => {
+    freshCalls.push("create");
+    return freshAgent;
+  },
+};
+const freshRecovery = await recoverTimedOutAgent(
+  { agentId: "poisoned", close: () => freshCalls.push("close") },
+  { cancel: async () => freshCalls.push("cancel-current") },
+  { cwd: ".", model: "grok-4.5-high-fast" },
+  freshSdk,
+  100,
+  true,
+);
+assert.equal(freshRecovery.agent, freshAgent);
+assert.equal(freshRecovery.replaced, true);
+assert.match(freshRecovery.history, /Make it bright/);
+assert.deepEqual(freshCalls, ["cancel-current", "cancel:stuck", "close", "create"]);

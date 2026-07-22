@@ -7,10 +7,11 @@ import { promisify } from "node:util";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const execFileAsync = promisify(execFile);
-const TERMINAL_RUN_STATUSES = new Set(["completed", "error", "failed", "cancelled", "expired"]);
+const TERMINAL_RUN_STATUSES = new Set(["completed", "finished", "error", "failed", "cancelled", "expired"]);
 const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTUP_TIMEOUT_MS, 120_000);
 const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
+const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
 
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value ?? "", 10);
@@ -35,7 +36,72 @@ function withTimeout(promise, timeoutMs, phase) {
   ]).finally(() => clearTimeout(timer));
 }
 
-async function recoverTimedOutAgent(agent, activeRun, request, sdk = Agent, timeoutMs = CURSOR_RECOVERY_TIMEOUT_MS) {
+function compactConversation(turns, maxChars = CURSOR_RECOVERY_CONTEXT_CHARS) {
+  const entries = [];
+  for (const conversation of turns ?? []) {
+    if (conversation?.type !== "agentConversationTurn") continue;
+    const user = conversation.turn?.userMessage?.text?.trim();
+    if (user) entries.push(`User: ${user}`);
+    const assistant = (conversation.turn?.steps ?? [])
+      .filter((step) => step.type === "assistantMessage")
+      .map((step) => step.message?.text?.trim())
+      .filter(Boolean)
+      .join("\n");
+    if (assistant) entries.push(`Assistant: ${assistant}`);
+  }
+  const selected = [];
+  let used = 0;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    const remaining = maxChars - used;
+    if (remaining <= 0) break;
+    selected.unshift(entry.length <= remaining
+      ? entry
+      : remaining === 1 ? "…" : `…${entry.slice(-(remaining - 1))}`);
+    used += Math.min(entry.length, remaining) + 2;
+  }
+  return selected.join("\n\n");
+}
+
+function messageWithRecoveryContext(message, history) {
+  if (!history) return message;
+  const prefix = [
+    "Continue this recovered conversation. The following is a compact transcript of the most recent relevant context.",
+    "Do not mention recovery or ask the user to repeat anything. Continue the current request normally.",
+    "",
+    history,
+    "",
+    "Current request:",
+  ].join("\n");
+  return typeof message === "string"
+    ? `${prefix}\n${message}`
+    : { ...message, text: `${prefix}\n${message.text ?? ""}` };
+}
+
+async function recoveryHistory(runs, timeoutMs = CURSOR_RECOVERY_TIMEOUT_MS) {
+  const candidates = [...(runs ?? [])]
+    .filter((run) => ["completed", "finished"].includes(String(run.status).toLowerCase()))
+    .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0));
+  for (const run of candidates) {
+    try {
+      const conversation = await withTimeout(run.conversation(), timeoutMs, "conversation");
+      const history = compactConversation(conversation);
+      if (history) return history;
+    } catch {
+      // A detached local run may not expose its transcript; try the previous run.
+    }
+  }
+  return "";
+}
+
+async function recoverTimedOutAgent(
+  agent,
+  activeRun,
+  request,
+  sdk = Agent,
+  timeoutMs = CURSOR_RECOVERY_TIMEOUT_MS,
+  createFresh = false,
+) {
   const agentId = agent.agentId;
   await withTimeout(Promise.resolve(activeRun?.cancel?.()), timeoutMs, "cancel").catch(() => {});
   const runs = await withTimeout(
@@ -50,16 +116,32 @@ async function recoverTimedOutAgent(agent, activeRun, request, sdk = Agent, time
       timeoutMs,
       "cancel run",
     ).catch(() => {})));
+  const history = createFresh ? await recoveryHistory(runs.items, timeoutMs) : "";
   agent.close();
   const options = {
     apiKey: process.env.CURSOR_API_KEY,
     model: modelSelection(request.model),
     local: { cwd: request.cwd },
   };
+  if (createFresh) {
+    return {
+      agent: await withTimeout(sdk.create(options), timeoutMs, "create"),
+      history,
+      replaced: true,
+    };
+  }
   try {
-    return await withTimeout(sdk.resume(agentId, options), timeoutMs, "resume");
+    return {
+      agent: await withTimeout(sdk.resume(agentId, options), timeoutMs, "resume"),
+      history: "",
+      replaced: false,
+    };
   } catch {
-    return withTimeout(sdk.create(options), timeoutMs, "create");
+    return {
+      agent: await withTimeout(sdk.create(options), timeoutMs, "create"),
+      history: await recoveryHistory(runs.items, timeoutMs),
+      replaced: true,
+    };
   }
 }
 
@@ -405,7 +487,8 @@ async function main() {
         agent = request.sessionId ? await Agent.resume(request.sessionId, options) : await Agent.create(options);
       }
       send({ type: "ready", sessionId: agent.agentId });
-      const message = await promptMessage(request.parts);
+      const originalMessage = await promptMessage(request.parts);
+      let message = originalMessage;
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
         const state = createMessageState();
@@ -482,7 +565,21 @@ async function main() {
           if (!retryable) throw error;
           attemptActive = false;
           sendTiming("silent_retry", turnStartedAt, { attempt: attempt + 1 });
-          agent = await recoverTimedOutAgent(agent, activeRun, request);
+          const recovery = await recoverTimedOutAgent(
+            agent,
+            activeRun,
+            request,
+            Agent,
+            CURSOR_RECOVERY_TIMEOUT_MS,
+            attempt >= 1,
+          );
+          agent = recovery.agent;
+          message = recovery.replaced
+            ? messageWithRecoveryContext(originalMessage, recovery.history)
+            : originalMessage;
+          // `ready` is an internal session update. It replaces the persisted Cursor agent id
+          // without adding a chat item, so a poisoned session can be abandoned invisibly.
+          if (recovery.replaced) send({ type: "ready", sessionId: agent.agentId });
           activeRun = undefined;
         } finally {
           attemptActive = false;
@@ -503,4 +600,4 @@ if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => {
   process.exitCode = 1;
 });
 
-export { CursorStartupTimeout, completePendingTools, createMessageState, cursorModelOptions, cursorTodoPlan, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, sendPromptWithRecovery, withTimeout };
+export { CursorStartupTimeout, compactConversation, completePendingTools, createMessageState, cursorModelOptions, cursorTodoPlan, mapDelta, mapMessage, messageWithRecoveryContext, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, recoveryHistory, sendPromptWithRecovery, withTimeout };
