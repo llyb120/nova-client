@@ -4408,6 +4408,7 @@ mod tests {
     #[test]
     fn quota_request_requires_current_exact_model_share() {
         let mut settings = Settings::default();
+        settings.cursor_enabled = true;
         settings.quota_shared_models = vec!["cursor:cursor-small".into()];
 
         assert!(quota_model_is_shared(

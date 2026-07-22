@@ -35,6 +35,8 @@ export interface SelectOption {
 export function SearchSelect(props: {
   value: string;
   options: SelectOption[];
+  /** 固定展示的后端一级；即使对应模型选项尚未加载也保留。 */
+  backendOptions?: { id: string; label: string }[];
   onChange: (v: string, option?: SelectOption) => void;
   /** 触发器前缀，如 "模型" */
   prefix: string;
@@ -82,7 +84,9 @@ export function SearchSelect(props: {
   const firstSelectable = createMemo(() => props.options.find((o) => !o.isDefault));
 
   /** 是否启用三级面板（后端 → 厂商 → 模型） */
-  const isThreeLevel = createMemo(() => props.options.some((o) => o.backend));
+  const isThreeLevel = createMemo(
+    () => (props.backendOptions?.length ?? 0) > 0 || props.options.some((o) => o.backend),
+  );
   /** 是否启用分组二级面板（搜索时退化为扁平列表） */
   const isGrouped = createMemo(() => props.options.some((o) => o.group));
 
@@ -158,6 +162,11 @@ export function SearchSelect(props: {
   const backends = createMemo(() => {
     const order: string[] = [];
     const labels = new Map<string, string>();
+    for (const backend of props.backendOptions ?? []) {
+      if (labels.has(backend.id)) continue;
+      labels.set(backend.id, backend.label);
+      order.push(backend.id);
+    }
     for (const o of props.options) {
       if (!o.backend) continue;
       if (!labels.has(o.backend)) {

@@ -464,14 +464,14 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
   }
 }
 
-/** 「已启用 且 本机检测可用」的模型后端（按固定顺序）——新建/切换会话的后端列表只显示这些。
- *  可用性由后端启动后并发检测（backends:availability），尚未出结果（无该键）时按可用处理。
- *  settings 未加载前必须返回空，避免组件抢先探测全部后端并拉起已关闭的进程。 */
+/** 设置中已启用的模型后端（按固定顺序）。
+ *  启用状态是选择器是否展示后端的唯一条件；CLI 探测结果只用于设置页提示，
+ *  不再隐藏后端，避免环境探测失败让用户连配置或尝试启动的入口都看不到。
+ *  settings 未加载前返回空，避免组件抢先探测全部后端。 */
 export function enabledAgentKinds(): AgentKind[] {
   const s = state.settings;
   if (!s) return [];
-  const avail = state.backendAvailability;
-  return ALL_AGENT_KINDS.filter((k) => agentEnabled(s, k) && avail[k] !== false);
+  return ALL_AGENT_KINDS.filter((k) => agentEnabled(s, k));
 }
 
 /** 把 agentKind 收敛到「已启用」集合：已启用则原样返回，否则回退到第一个启用项 */
@@ -1704,8 +1704,7 @@ export async function initStore() {
     setState("slashCommands", e.payload.agentKind, normalizeSlashCommands(e.payload.commands));
   });
 
-  // 后端可用性：启动后 / 保存设置后由后端并发检测（解析 PATH，不拉起进程），
-  // 结果驱动 enabledAgentKinds() 只显示真正可用的后端
+  // 后端可用性只用于设置页的 CLI 缺失提示；选择器是否展示完全由启用开关决定。
   await listen<{ availability: Record<string, boolean> }>("backends:availability", (e) => {
     setState("backendAvailability", reconcile(e.payload.availability ?? {}));
   });
@@ -1923,7 +1922,8 @@ export async function initStore() {
   if ("error" in settingsResult) throw settingsResult.error;
   const { settings, initialAgent } = settingsResult;
 
-  // 后端可用性兜底拉取：启动检测很快，事件可能在前端监听就绪前已 emit 过，这里补一次
+  // 后端可用性兜底拉取：启动检测很快，事件可能在前端监听就绪前已 emit 过；
+  // 结果仅用于设置页提示，不参与选择器过滤。
   void api
     .getBackendAvailability()
     .then((a) => {

@@ -154,15 +154,15 @@ impl Default for Settings {
             remote_control_enabled: false,
             quota_shared_models: Vec::new(),
             model_favorites: Vec::new(),
-            devin_enabled: true,
+            devin_enabled: false,
             alkaid_enabled: true,
-            codex_enabled: true,
+            codex_enabled: false,
             codexplus_enabled: false,
-            codebuddy_enabled: true,
+            codebuddy_enabled: false,
             codebuddyplus_enabled: false,
-            claudecode_enabled: true,
-            cursor_enabled: true,
-            opencode_enabled: true,
+            claudecode_enabled: false,
+            cursor_enabled: false,
+            opencode_enabled: false,
             opencodeplus_enabled: false,
             codex_integration: "sdk".into(),
             codebuddy_integration: "sdk".into(),
@@ -188,6 +188,18 @@ mod tests {
     #[test]
     fn windows_shell_shim_is_disabled_by_default() {
         assert!(!Settings::default().windows_shell_shim_enabled);
+    }
+
+    #[test]
+    fn only_alkaid_is_enabled_by_default() {
+        let settings = Settings::default();
+        assert!(settings.alkaid_enabled);
+        assert!(!settings.devin_enabled);
+        assert!(!settings.codex_enabled);
+        assert!(!settings.codebuddy_enabled);
+        assert!(!settings.claudecode_enabled);
+        assert!(!settings.cursor_enabled);
+        assert!(!settings.opencode_enabled);
     }
 
     #[test]

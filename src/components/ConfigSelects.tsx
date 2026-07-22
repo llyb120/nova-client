@@ -221,7 +221,12 @@ export function ModelPicker(props: {
       ),
     ),
   );
-  const merged = createMemo(() => kinds().length > 1 || sharedOptions().length > 0);
+  // 调用方显式给出后端列表时始终保留「后端」一级，即使只有一个后端或模型尚未加载。
+  // 这样设置里启用的后端不会因为模型探测失败而从选择器中完全消失。
+  const merged = createMemo(() => props.agentKinds !== undefined || sharedOptions().length > 0);
+  const backendOptions = createMemo(() =>
+    kinds().map((kind) => ({ id: kind, label: agentLabel(kind) })),
+  );
   const sourceOf = (k: AgentKind) => props.modelSource?.(k);
   const quotaPeerForToken = (token: string) =>
     (props.sharedModels ?? []).find((source) => source.peer.token === token)?.peer;
@@ -282,6 +287,7 @@ export function ModelPicker(props: {
       title={props.title ?? (merged() ? "后端 / 模型" : `模型（${agentLabel(props.agentKind)}）`)}
       value={modelValue()}
       options={modelOptions()}
+      backendOptions={merged() ? backendOptions() : undefined}
       onOpen={loadLocalOptions}
       onChange={onModelChange}
       fallbackLabel={fallbackLabel()}
@@ -299,7 +305,7 @@ export function ModelPicker(props: {
 /** 会话模式 + 模型两个下拉。模型部分复用 ModelPicker（与新会话/巡查模型一致）。 */
 export function ConfigSelects(props: {
   agentKind: AgentKind;
-  /** 可切换的后端列表（已启用）；>1 时模型下拉合并为三级菜单 */
+  /** 可切换的后端列表（已启用）；提供后始终展示后端一级，再按需加载其模型 */
   agentKinds?: AgentKind[];
   model: string;
   mode: string;
