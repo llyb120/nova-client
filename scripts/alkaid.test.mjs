@@ -369,6 +369,11 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.match(runtime.agent.state.systemPrompt, /按顺序理解文件不构成读取依赖/);
     assert.match(runtime.agent.state.systemPrompt, /后续新发现多个独立文本目标.*仍须合并使用 read_files/);
     assert.match(runtime.agent.state.systemPrompt, /为每个文件分别设置必要的 offset\/limit/);
+    assert.match(runtime.agent.state.systemPrompt, /禁止使用 `grep -r` 或 `grep -R`.*无排除的递归搜索/);
+    assert.match(runtime.agent.state.systemPrompt, /优先使用 `git grep`.*未跟踪文件时使用 `rg`.*遵守 `\.gitignore`/);
+    assert.match(runtime.agent.state.systemPrompt, /输出截断只限制结果展示，不属于工作量限制/);
+    assert.match(runtime.agent.state.systemPrompt, /递归命令必须通过限定路径.*设置较短的 timeout/);
+    assert.match(runtime.agent.state.systemPrompt, /递归命令超时后不得原样重试/);
     assert.match(runtime.agent.state.systemPrompt, /识别可独立验证的工程单元及其依赖关系/);
     assert.match(runtime.agent.state.systemPrompt, /不得用一个单元的验证代替其他受影响单元/);
     assert(runtime.agent.state.systemPrompt.includes(`命令终端已确认使用 Bash（${shellConfig.shell}）`));
