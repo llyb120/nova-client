@@ -134,6 +134,53 @@ export function defaultAlkaidModel(config) {
   return selection;
 }
 
+/**
+ * Fill cache/routing compat defaults without overriding explicit user/server values.
+ * Inspired by pi-cache-optimizer guidance for OpenAI-compatible proxies and reasoning models.
+ */
+export function mergeAlkaidCompatDefaults(api, modelId, baseUrl, existing = undefined) {
+  const compat = isPlainObject(existing) ? { ...existing } : {};
+  const id = String(modelId ?? "").toLowerCase();
+  const url = String(baseUrl ?? "").toLowerCase();
+  const isOfficialOpenAI = url.includes("api.openai.com");
+
+  if (api === "openai-completions" && !isOfficialOpenAI && compat.sendSessionAffinityHeaders === undefined) {
+    compat.sendSessionAffinityHeaders = true;
+  }
+  if (api === "anthropic-messages" && !url.includes("api.anthropic.com") && compat.sendSessionAffinityHeaders === undefined) {
+    compat.sendSessionAffinityHeaders = true;
+  }
+
+  if (/\bdeepseek\b/.test(id)) {
+    if (compat.thinkingFormat === undefined) compat.thinkingFormat = "deepseek";
+    if (compat.requiresReasoningContentOnAssistantMessages === undefined) {
+      compat.requiresReasoningContentOnAssistantMessages = true;
+    }
+  }
+
+  if (/\bk3\b|kimi-for-coding|kimi-k3/.test(id)) {
+    if (compat.forceAdaptiveThinking === undefined) compat.forceAdaptiveThinking = true;
+    if (compat.allowEmptySignature === undefined) compat.allowEmptySignature = true;
+  }
+
+  // Claude adaptive-thinking models (opus/sonnet 4.6+, fable-5+, sonnet-5)
+  if (
+    /claude/.test(id)
+    && (
+      /opus-4(?:\.|-)6/.test(id)
+      || /sonnet-4(?:\.|-)6/.test(id)
+      || /sonnet-5/.test(id)
+      || /fable-5/.test(id)
+      || /claude-sonnet-5/.test(id)
+    )
+    && compat.forceAdaptiveThinking === undefined
+  ) {
+    compat.forceAdaptiveThinking = true;
+  }
+
+  return Object.keys(compat).length ? compat : existing;
+}
+
 export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config)) {
   if (!selection || !selection.includes("/")) throw new Error("Alkaid model 必须是 provider/model 格式");
   const marker = "/variant/";
@@ -156,6 +203,7 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
     level,
     value?.reasoningEffort ?? null,
   ]));
+  const api = providerApi(provider);
   return {
     apiKey: resolveEnv(options.apiKey, config.env),
     thinkingLevel: variant
@@ -164,7 +212,7 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
     model: {
       id: modelId,
       name: model.name ?? modelId,
-      api: providerApi(provider),
+      api,
       provider: providerId,
       baseUrl,
       reasoning: model.reasoning ?? Object.keys(model.variants ?? {}).length > 0,
@@ -174,7 +222,7 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
       contextWindow: model.limit?.context ?? 128000,
       maxTokens: model.limit?.output ?? 32000,
       headers: options.headers,
-      compat: model.compat ?? provider.compat,
+      compat: mergeAlkaidCompatDefaults(api, modelId, baseUrl, model.compat ?? provider.compat),
     },
   };
 }

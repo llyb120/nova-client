@@ -7,8 +7,21 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
-import { alkaidModelOptions, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
-import { alkaidPromptInput, alkaidUserMessage, connectMcpServers, createAlkaidAgent, createFilesystemTools, createSkillSupport, isRetryableAlkaidProviderError, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
+import {
+  alkaidPromptInput,
+  alkaidUserMessage,
+  buildAlkaidSystemPrompt,
+  clampPromptCacheKey,
+  connectMcpServers,
+  createAlkaidAgent,
+  createFilesystemTools,
+  formatAlkaidSkillsPrompt,
+  injectOpenAIPromptCacheKey,
+  isRetryableAlkaidProviderError,
+  loadAlkaidSkills,
+  runAlkaidPromptWithRetry,
+} from "./alkaid-core.mjs";
 
 const configuredModel = {
   id: "gpt-test",
@@ -59,6 +72,7 @@ test("OpenCode-style JSONC config resolves providers and models", () => {
   assert.deepEqual(resolved.model.input, ["text", "image"]);
   assert.equal(resolved.thinkingLevel, "medium");
   assert.deepEqual(resolved.model.thinkingLevelMap, { medium: "medium", high: "high" });
+  assert.equal(resolved.model.compat.sendSessionAffinityHeaders, true);
   assert.deepEqual(alkaidModelOptions(config), [
     {
       value: "custom/gpt-test/variant/medium",
@@ -231,15 +245,85 @@ test("batch file tools reject traversal and duplicate edits", async () => {
   ] }), /重复/);
 });
 
-test("skills are discovered and loadable", async () => {
+test("skills are discovered via pi loadSkillsFromDir", async () => {
   const root = await mkdtemp(join(tmpdir(), "nova-skills-test-"));
   const skillDir = join(root, "demo");
   await mkdir(skillDir);
   await writeFile(join(skillDir, "SKILL.md"), "---\nname: demo\ndescription: Demo skill\n---\nDo demo.");
-  const support = await createSkillSupport(root);
-  assert(support.catalog.includes("demo: Demo skill"));
-  const loaded = await support.tool.execute("1", { name: "demo" });
-  assert(loaded.content[0].text.includes("Do demo."));
+  const { skills } = loadAlkaidSkills(root);
+  assert.equal(skills.length, 1);
+  assert.equal(skills[0].name, "demo");
+  assert.equal(skills[0].description, "Demo skill");
+  const prompt = formatAlkaidSkillsPrompt(skills);
+  assert.match(prompt, /available_skills|<name>demo<\/name>|Demo skill/);
+  assert.match(prompt, /read the SKILL\.md|Use the read tool/i);
+});
+
+test("many skills are compressed for prompt cache", () => {
+  const skills = Array.from({ length: 4 }, (_, index) => ({
+    name: `skill-${index}`,
+    description: `Description ${index} `.repeat(20),
+    filePath: `/home/user/.nova/alkaid/skills/skill-${index}/SKILL.md`,
+    baseDir: `/home/user/.nova/alkaid/skills/skill-${index}`,
+    sourceInfo: { source: "local", scope: "user" },
+    disableModelInvocation: false,
+  }));
+  const verbose = formatAlkaidSkillsPrompt(skills.slice(0, 1));
+  const compressed = formatAlkaidSkillsPrompt(skills);
+  assert.match(verbose, /<available_skills>/);
+  assert.match(compressed, /Skills under .*\/<name>\/SKILL\.md:/);
+  assert.doesNotMatch(compressed, /<available_skills>/);
+  assert.ok(compressed.length < verbose.length * 3);
+});
+
+test("system prompt keeps stable Alkaid policy before dynamic cwd/skills", () => {
+  const prompt = buildAlkaidSystemPrompt({
+    cwd: "D:/work/demo",
+    skills: [{
+      name: "demo",
+      description: "Demo skill",
+      filePath: "D:/skills/demo/SKILL.md",
+      baseDir: "D:/skills/demo",
+      sourceInfo: { source: "local" },
+      disableModelInvocation: false,
+    }],
+    shellConfig: { shell: "/usr/bin/bash" },
+  });
+  const stableIndex = prompt.indexOf("你是 Alkaid");
+  const separatorIndex = prompt.indexOf("\n---\n");
+  const cwdIndex = prompt.indexOf("Current working directory:");
+  assert.ok(stableIndex >= 0);
+  assert.ok(separatorIndex > stableIndex);
+  assert.ok(cwdIndex > separatorIndex);
+  assert.match(prompt, /必须优先使用 read_files/);
+});
+
+test("openai prompt_cache_key fallback clamps session ids", () => {
+  const longId = "s".repeat(80);
+  assert.equal(clampPromptCacheKey(longId).length, 64);
+  assert.deepEqual(injectOpenAIPromptCacheKey({ model: "x" }, "session-1"), {
+    model: "x",
+    prompt_cache_key: "session-1",
+  });
+  assert.equal(injectOpenAIPromptCacheKey({ prompt_cache_key: "keep" }, "session-1"), undefined);
+});
+
+test("compat defaults enable session affinity for openai-compatible proxies", () => {
+  const compat = mergeAlkaidCompatDefaults(
+    "openai-completions",
+    "deepseek-chat",
+    "https://proxy.example/v1",
+    undefined,
+  );
+  assert.equal(compat.sendSessionAffinityHeaders, true);
+  assert.equal(compat.thinkingFormat, "deepseek");
+  assert.equal(compat.requiresReasoningContentOnAssistantMessages, true);
+  assert.deepEqual(
+    mergeAlkaidCompatDefaults("openai-completions", "gpt", "https://proxy.example/v1", {
+      sendSessionAffinityHeaders: false,
+    }),
+    { sendSessionAffinityHeaders: false },
+  );
 });
 
 test("MCP stdio tools are discovered and callable", async () => {
@@ -275,6 +359,7 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.equal(runtime.agent.steeringMode, "all");
     assert.deepEqual(runtime.agent.state.tools.slice(0, 2).map((tool) => tool.name), ["read_files", "edit_files"]);
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
+    assert(!runtime.agent.state.tools.some((tool) => tool.name === "load_skill"));
     assert.match(runtime.agent.state.systemPrompt, /读取文件遵循最小必要原则.*offset\/limit 只读取相关行段/);
     assert.match(runtime.agent.state.systemPrompt, /未知目标位置时，先用搜索工具定位行号/);
     assert.match(runtime.agent.state.systemPrompt, /两个及以上路径已知.*必须优先使用 read_files/);
@@ -283,6 +368,8 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.match(runtime.agent.state.systemPrompt, /不得用一个单元的验证代替其他受影响单元/);
     assert(runtime.agent.state.systemPrompt.includes(`命令终端已确认使用 Bash（${shellConfig.shell}）`));
     assert.match(runtime.agent.state.systemPrompt, /不要使用 PowerShell cmdlet/);
+    assert.match(runtime.agent.state.systemPrompt, /\n---\n/);
+    assert.ok(runtime.agent.state.systemPrompt.indexOf("你是 Alkaid") < runtime.agent.state.systemPrompt.indexOf("Current working directory:"));
     const bash = runtime.agent.state.tools.find((tool) => tool.name === "bash");
     assert.match((await bash.execute("1", { command: "printf 'shell-ok'" })).content[0].text, /shell-ok/);
   } finally {

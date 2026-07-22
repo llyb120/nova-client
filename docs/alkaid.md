@@ -4,15 +4,17 @@ Alkaid 是一个基于 pi agent core 的轻量 coding agent，目标是少往返
 
 ## 当前能力
 
-- 使用维护中的 `@earendil-works/pi-agent-core`，工具执行策略固定为 `parallel`。
+- 使用 `@earendil-works/pi-agent-core` / `pi-ai` / `pi-coding-agent`（0.81+），工具执行策略固定为 `parallel`。
 - `read_files`：两个及以上路径已知的 UTF-8 文本文件优先走单次并行读取。
 - `edit_files`：两个及以上互不依赖的已有文件优先走单次并行精确编辑，复用原生 `edit` 的唯一、非重叠文本替换语义。
 - 文件工具限制在当前工作区内，拒绝目录穿越和重复写目标。
-- 启动时发现 `~/.nova/skills`、`~/.agents/skills`、`~/.codex/skills`；只把目录注入提示词，使用时再通过 `load_skill` 读取完整 `SKILL.md`。
+- Skills 使用 pi 的 `loadSkillsFromDir` + Agent Skills 标准目录格式；根目录为 `~/.nova/alkaid/skills`。模型按需用 `read` / `read_files` 加载完整 `SKILL.md`（不再提供自定义 `load_skill` 工具）。
+- 系统提示词：Alkaid 策略（批量读写、最小读取、改后验证、Bash）为稳态前缀；`cwd` / skills 目录为动态后缀，便于 provider prompt/KV cache 命中。skills ≥ 4 时压缩目录体积。
+- Provider 缓存：默认 `cacheRetention: "long"`，为 OpenAI 兼容请求补齐 `prompt_cache_key`（session id）；第三方 OpenAI/Anthropic 兼容代理默认开启 `sendSessionAffinityHeaders`（不覆盖用户显式配置）。
 - 支持并行连接多个 MCP stdio server，并把工具映射为 `mcp__<server>__<tool>`。
-- 自动读取本机 `~/.codex/config.toml` 的模型、provider URL 和 `env_key`，密钥仅从进程环境读取。
+- 本机配置读取 `~/.nova/alkaid/config.jsonc`（OpenCode 风格），可与服务端下发配置合并；密钥仅从进程环境 / `{env:NAME}` 解析。
 - 已作为独立的 `alkaid` 后端接入桌面端；后端选择顺序为“收藏 → Alkaid → 其他后端”。
-- 会话消息持久化到 `~/.nova/alkaid-sessions`，支持跨 bridge 进程续接多轮上下文。
+- 会话消息持久化到 `~/.nova/alkaid/sessions`，支持跨 bridge 进程续接多轮上下文。
 - Plan 模式不暴露写文件工具；Build 模式开放并行读写。
 
 ## 服务端配置同步
@@ -55,4 +57,4 @@ npm run check
 npm run build
 ```
 
-单测覆盖批量读写、路径安全、Skills 发现/加载，以及 MCP stdio 的工具发现与调用。
+单测覆盖批量读写、路径安全、Skills 发现、prompt 稳态结构、缓存 compat，以及 MCP stdio 的工具发现与调用。

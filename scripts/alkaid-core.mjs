@@ -1,16 +1,25 @@
 import { Agent } from "@earendil-works/pi-agent-core";
-import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
+import {
+  createCodingTools,
+  createReadOnlyTools,
+  formatSkillsForPrompt,
+  getShellConfig,
+  loadSkillsFromDir,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createReadStream } from "node:fs";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { extname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1000, 3000];
+const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
+const SKILL_COMPRESSION_MIN_COUNT = 4;
 const IMAGE_MEDIA_TYPES = {
   ".gif": "image/gif",
   ".jpeg": "image/jpeg",
@@ -31,6 +40,10 @@ function safePath(root, input) {
     throw new Error(`路径超出工作区: ${input}`);
   }
   return path;
+}
+
+export function alkaidSkillsRoot(home = homedir()) {
+  return join(home, ".nova", "alkaid", "skills");
 }
 
 export async function alkaidPromptInput(parts = []) {
@@ -194,40 +207,105 @@ export function createFilesystemTools(cwd, editTool = null) {
   return tools;
 }
 
-async function findSkills(roots) {
-  const skills = [];
-  const seen = new Set();
-  for (const root of roots) {
-    for (const entry of await readdir(root, { withFileTypes: true }).catch(() => [])) {
-      if (!entry.isDirectory() || seen.has(entry.name)) continue;
-      const path = join(root, entry.name, "SKILL.md");
-      const markdown = await readFile(path, "utf8").catch(() => null);
-      if (markdown == null) continue;
-      seen.add(entry.name);
-      const description = markdown.match(/^description:\s*(.+)$/mi)?.[1]?.trim() ?? "";
-      skills.push({ name: entry.name, description, path });
-    }
-  }
-  return skills;
+/** Load skills via pi-coding-agent discovery (Agent Skills standard). */
+export function loadAlkaidSkills(root = alkaidSkillsRoot()) {
+  return loadSkillsFromDir({ dir: root, source: "user" });
 }
 
-export async function createSkillSupport(root = join(homedir(), ".nova", "alkaid", "skills")) {
-  const skills = await findSkills([root]);
-  const byName = new Map(skills.map((skill) => [skill.name, skill]));
-  const tool = {
-    name: "load_skill",
-    description: "按名称加载相关 Skill 的完整 SKILL.md。仅在任务匹配时调用。",
-    parameters: Type.Object({ name: Type.String() }),
-    async execute(_id, { name }) {
-      const skill = byName.get(name);
-      if (!skill) throw new Error(`未知 skill: ${name}`);
-      return textResult(await readFile(skill.path, "utf8"), { name });
-    },
-  };
-  const catalog = skills.length
-    ? skills.map(({ name, description }) => `- ${name}: ${description || "无描述"}`).join("\n")
-    : "（当前未安装 Skill）";
-  return { skills, catalog, tool };
+function formatSkillsForPromptCompressed(skills) {
+  const visible = skills.filter((skill) => !skill.disableModelInvocation);
+  if (visible.length === 0) return "";
+  const byRoot = new Map();
+  for (const skill of visible) {
+    const skillDir = dirname(skill.filePath);
+    const root = dirname(skillDir).replace(/\\/g, "/");
+    const list = byRoot.get(root) ?? [];
+    list.push(skill.name);
+    byRoot.set(root, list);
+  }
+  const lines = [
+    "The following skills provide specialized instructions for specific tasks. When a skill name matches the task you are doing, read the SKILL.md at the listed location to load the full instructions. When a SKILL.md references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+  ];
+  for (const root of [...byRoot.keys()].sort()) {
+    const names = byRoot.get(root).slice().sort();
+    lines.push(`Skills under ${root}/<name>/SKILL.md:`);
+    lines.push(names.map((name) => `- ${name}`).join("\n"));
+  }
+  return lines.join("\n");
+}
+
+export function formatAlkaidSkillsPrompt(skills) {
+  const visible = skills.filter((skill) => !skill.disableModelInvocation);
+  if (visible.length === 0) return "";
+  if (visible.length >= SKILL_COMPRESSION_MIN_COUNT) {
+    return formatSkillsForPromptCompressed(skills);
+  }
+  return formatSkillsForPrompt(skills).trim();
+}
+
+export function optimizeAlkaidSystemPrompt(stableParts, dynamicParts) {
+  const stable = stableParts.filter(Boolean).join("\n\n").trim();
+  const dynamic = dynamicParts.filter(Boolean).join("\n\n").trim();
+  if (!stable) return dynamic;
+  if (!dynamic) return stable;
+  return `${stable}\n\n---\n\n${dynamic}`;
+}
+
+export function buildAlkaidSystemPrompt(options = {}) {
+  const cwd = (options.cwd ?? process.cwd()).replace(/\\/g, "/");
+  const skills = options.skills ?? [];
+  const toolLines = [
+    `- read_files: 并行读取多个 UTF-8 文本文件（可带 offset/limit）`,
+    options.readOnly ? null : "- edit_files: 并行精确编辑多个互不依赖的已有文件",
+    "- read: 读取单个文件",
+    options.readOnly ? "- grep / find / ls: 只读搜索与列举" : "- bash: 执行 Bash 命令",
+    options.readOnly ? null : "- edit / write: 单文件编辑或写入",
+  ].filter(Boolean);
+
+  const stableParts = [
+    "你是 Alkaid：高效、简单、面向软件工程结果。",
+    `Available tools:\n${toolLines.join("\n")}`,
+    "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。读取文件遵循最小必要原则：已知目标行范围时，必须通过 offset/limit 只读取相关行段；需要更多上下文时再按需读取相邻行段，不要无目的地读取整个文件。未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；大文件禁止一次性全量读取。读取两个及以上路径已知、互不依赖的 UTF-8 文本文件时，必须优先使用 read_files，并为每个文件分别设置必要的 offset/limit，不要连续调用多个单文件 read；只有目标路径依赖前一次结果、内容不是 UTF-8 文本，或仅需读取一个文件时才使用原生 read。修改两个及以上互不依赖的已有文件时必须优先使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
+    "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
+    "完成修改后，必须基于仓库的依赖清单、工作区配置、构建脚本和 CI 配置识别可独立验证的工程单元及其依赖关系，并根据实际改动计算影响范围。对每个受影响单元运行成本最低且有效的检查；公共接口、共享代码、依赖、配置、代码生成或构建流程改动还必须覆盖受影响的使用方。不要预设语言、框架或架构，不得用一个单元的验证代替其他受影响单元。无法确定边界时扩大验证范围；无法执行时如实报告未验证范围、原因、建议命令和剩余风险。",
+    options.shellConfig
+      ? `命令终端已确认使用 Bash（${options.shellConfig.shell}）；bash 工具必须从第一次调用起使用 Bash 语法，不要使用 PowerShell cmdlet。`
+      : "",
+  ];
+
+  const dynamicParts = [
+    options.readOnly ? "当前为计划模式：只读分析，不得修改文件。" : "",
+    `Current working directory: ${cwd}`,
+    formatAlkaidSkillsPrompt(skills),
+    options.systemPrompt ?? "",
+  ];
+
+  return optimizeAlkaidSystemPrompt(stableParts, dynamicParts);
+}
+
+export function clampPromptCacheKey(key) {
+  const normalized = key?.trim();
+  if (!normalized) return undefined;
+  const chars = Array.from(normalized);
+  if (chars.length <= OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH) return normalized;
+  return chars.slice(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH).join("");
+}
+
+export function injectOpenAIPromptCacheKey(payload, sessionId) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const record = payload;
+  if (typeof record.prompt_cache_key === "string" && record.prompt_cache_key.trim()) return undefined;
+  if (typeof record.promptCacheKey === "string" && record.promptCacheKey.trim()) return undefined;
+  const key = clampPromptCacheKey(sessionId);
+  if (!key) return undefined;
+  return { ...record, prompt_cache_key: key };
+}
+
+function createAlkaidStreamFn() {
+  return (model, context, options = {}) => streamSimple(model, context, {
+    ...options,
+    cacheRetention: options.cacheRetention ?? "long",
+  });
 }
 
 function mcpResult(result) {
@@ -273,7 +351,7 @@ export async function connectMcpServers(servers = {}, cwd = process.cwd()) {
 export async function createAlkaidAgent(options = {}) {
   if (!options.model) throw new Error("Alkaid 缺少模型配置");
   const cwd = resolve(options.cwd ?? process.cwd());
-  const skillSupport = await createSkillSupport();
+  const { skills } = loadAlkaidSkills(options.skillsRoot ?? alkaidSkillsRoot());
   const mcp = await connectMcpServers(options.mcpServers, cwd);
   const shellConfig = options.readOnly ? null : (options.shellConfig ?? getShellConfig());
   const codingTools = options.readOnly
@@ -281,19 +359,16 @@ export async function createAlkaidAgent(options = {}) {
     : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell } });
   const editTool = codingTools.find((tool) => tool.name === "edit");
   const batchTools = createFilesystemTools(cwd, editTool);
-  const tools = [...batchTools, ...codingTools, skillSupport.tool, ...mcp.tools];
-  const systemPrompt = [
-    "你是 Alkaid：高效、简单、面向软件工程结果。",
-    "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。读取文件遵循最小必要原则：已知目标行范围时，必须通过 offset/limit 只读取相关行段；需要更多上下文时再按需读取相邻行段，不要无目的地读取整个文件。未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；大文件禁止一次性全量读取。读取两个及以上路径已知、互不依赖的 UTF-8 文本文件时，必须优先使用 read_files，并为每个文件分别设置必要的 offset/limit，不要连续调用多个单文件 read；只有目标路径依赖前一次结果、内容不是 UTF-8 文本，或仅需读取一个文件时才使用原生 read。修改两个及以上互不依赖的已有文件时必须优先使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
-    "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
-    "完成修改后，必须基于仓库的依赖清单、工作区配置、构建脚本和 CI 配置识别可独立验证的工程单元及其依赖关系，并根据实际改动计算影响范围。对每个受影响单元运行成本最低且有效的检查；公共接口、共享代码、依赖、配置、代码生成或构建流程改动还必须覆盖受影响的使用方。不要预设语言、框架或架构，不得用一个单元的验证代替其他受影响单元。无法确定边界时扩大验证范围；无法执行时如实报告未验证范围、原因、建议命令和剩余风险。",
-    shellConfig ? `命令终端已确认使用 Bash（${shellConfig.shell}）；bash 工具必须从第一次调用起使用 Bash 语法，不要使用 PowerShell cmdlet。` : "",
-    options.readOnly ? "当前为计划模式：只读分析，不得修改文件。" : "",
-    `工作区：${cwd}`,
-    "可用 Skills（需要时先调用 load_skill）：",
-    skillSupport.catalog,
-    options.systemPrompt ?? "",
-  ].filter(Boolean).join("\n\n");
+  const tools = [...batchTools, ...codingTools, ...mcp.tools];
+  const systemPrompt = buildAlkaidSystemPrompt({
+    cwd,
+    skills,
+    readOnly: options.readOnly,
+    shellConfig,
+    systemPrompt: options.systemPrompt,
+  });
+  const sessionId = options.sessionId;
+  const api = options.model.api;
   const agent = new Agent({
     initialState: {
       systemPrompt,
@@ -303,9 +378,15 @@ export async function createAlkaidAgent(options = {}) {
       messages: options.messages ?? [],
     },
     getApiKey: () => options.apiKey,
+    streamFn: createAlkaidStreamFn(),
     toolExecution: "parallel",
     steeringMode: "all",
-    sessionId: options.sessionId,
+    sessionId,
+    onPayload: (payload, model) => {
+      const modelApi = model?.api ?? api;
+      if (modelApi !== "openai-completions" && modelApi !== "openai-responses") return undefined;
+      return injectOpenAIPromptCacheKey(payload, sessionId);
+    },
   });
-  return { agent, close: () => mcp.close(), skills: skillSupport.skills, toolCount: tools.length };
+  return { agent, close: () => mcp.close(), skills, toolCount: tools.length };
 }
