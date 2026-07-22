@@ -483,7 +483,7 @@ export function ChatView() {
   const roamingRole = () => currentMeta()?.roamingRole ?? null;
   const canStar = () => {
     const meta = currentMeta();
-    return !!meta && !meta.employeeId && !meta.mindThread && !meta.roamingRole && !meta.quotaPeerName;
+    return !!meta && !meta.employeeId && !meta.mindThread && !meta.roamingRole;
   };
   const toggleStar = async () => {
     const meta = currentMeta();

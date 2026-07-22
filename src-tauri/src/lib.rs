@@ -304,6 +304,10 @@ fn is_ordinary_thread(thread: &Thread) -> bool {
         && thread.quota_peer.is_none()
 }
 
+fn is_starrable_thread(thread: &Thread) -> bool {
+    thread.employee_id.is_none() && !thread.mind_thread && thread.roaming_role.is_none()
+}
+
 fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
     is_ordinary_thread(thread) && !thread.starred
 }
@@ -429,8 +433,8 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
 #[cfg(test)]
 mod session_auto_cleanup_tests {
     use super::{
-        is_normal_thread_for_auto_cleanup, is_session_auto_cleanup_day, thread_is_expired,
-        tree_contains_starred_thread, AgentKind, Thread,
+        is_normal_thread_for_auto_cleanup, is_session_auto_cleanup_day, is_starrable_thread,
+        thread_is_expired, tree_contains_starred_thread, AgentKind, Thread,
     };
     use std::collections::HashSet;
 
@@ -485,6 +489,16 @@ mod session_auto_cleanup_tests {
         thread.employee_id = None;
         thread.roaming_role = Some("host".into());
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
+    }
+
+    #[test]
+    fn quota_threads_support_starring() {
+        let mut thread = Thread::new(String::new(), AgentKind::Devin, None, None, None, false);
+        thread.quota_peer = Some("peer".into());
+        assert!(is_starrable_thread(&thread));
+
+        thread.roaming_role = Some("guest".into());
+        assert!(!is_starrable_thread(&thread));
     }
 
     #[test]
@@ -2622,8 +2636,8 @@ fn set_thread_starred(
     {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
-        if !is_ordinary_thread(thread) {
-            return Err("仅普通会话支持星标".into());
+        if !is_starrable_thread(thread) {
+            return Err("仅普通会话和额度租借会话支持星标".into());
         }
         thread.starred = starred;
         store.save();
