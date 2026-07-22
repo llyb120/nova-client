@@ -1,8 +1,10 @@
 import { createInterface } from "node:readline";
 import { Agent, Cursor } from "@cursor/sdk";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { extname } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { extname, join } from "node:path";
 import { promisify } from "node:util";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -12,6 +14,9 @@ const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTU
 const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
+const CURSOR_CONCLUSION_CHARS = positiveInteger(process.env.NOVA_CURSOR_CONCLUSION_CHARS, 2_000);
+const CURSOR_SLIM_MEMORY_DIR = process.env.NOVA_CURSOR_SLIM_MEMORY_DIR
+  || join(homedir(), ".nova", "cursor-slim-memory");
 
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value ?? "", 10);
@@ -63,6 +68,61 @@ function compactConversation(turns, maxChars = CURSOR_RECOVERY_CONTEXT_CHARS) {
   return selected.join("\n\n");
 }
 
+function createSlimMemory() {
+  return { userPrompts: [], conclusions: [] };
+}
+
+function isSlimMemoryEmpty(memory) {
+  return !(memory?.userPrompts?.length || memory?.conclusions?.length);
+}
+
+function clipText(text, maxChars) {
+  const value = String(text ?? "").trim();
+  if (!value) return "";
+  if (value.length <= maxChars) return value;
+  return maxChars <= 1 ? "…" : `${value.slice(0, maxChars - 1)}…`;
+}
+
+function messageText(message) {
+  return typeof message === "string" ? message : (message?.text ?? "");
+}
+
+function withMessageText(message, text) {
+  return typeof message === "string" ? text : { ...message, text };
+}
+
+function formatSlimMemory(memory, maxChars = CURSOR_RECOVERY_CONTEXT_CHARS) {
+  const sections = [];
+  if (memory.conclusions?.length) {
+    sections.push("## Prior conclusions");
+    memory.conclusions.forEach((conclusion, index) => {
+      sections.push(`${index + 1}. ${conclusion}`);
+    });
+  }
+  if (memory.userPrompts?.length) {
+    if (sections.length) sections.push("");
+    sections.push("## User prompts so far");
+    memory.userPrompts.forEach((prompt, index) => {
+      sections.push(`${index + 1}. ${prompt}`);
+    });
+  }
+  return clipText(sections.join("\n"), maxChars);
+}
+
+function messageWithSlimMemory(message, memory) {
+  if (isSlimMemoryEmpty(memory)) return message;
+  const prefix = [
+    "Continue this conversation using only the compact memory below.",
+    "Prior tool traces and full chat checkpoints are intentionally omitted.",
+    "Do not ask the user to repeat earlier requests; use the memory and current request.",
+    "",
+    formatSlimMemory(memory),
+    "",
+    "Current request:",
+  ].join("\n");
+  return withMessageText(message, `${prefix}\n${messageText(message)}`);
+}
+
 function messageWithRecoveryContext(message, history) {
   if (!history) return message;
   const prefix = [
@@ -73,9 +133,99 @@ function messageWithRecoveryContext(message, history) {
     "",
     "Current request:",
   ].join("\n");
-  return typeof message === "string"
-    ? `${prefix}\n${message}`
-    : { ...message, text: `${prefix}\n${message.text ?? ""}` };
+  return withMessageText(message, `${prefix}\n${messageText(message)}`);
+}
+
+function extractTurnConclusion(state, result, maxChars = CURSOR_CONCLUSION_CHARS) {
+  const fromResult = clipText(result?.result, maxChars);
+  if (fromResult) return fromResult;
+  const assistantTexts = [...(state?.texts?.entries?.() ?? [])]
+    .filter(([id]) => String(id).includes("-assistant-"))
+    .map(([, text]) => String(text ?? "").trim())
+    .filter(Boolean);
+  return clipText(assistantTexts.at(-1) ?? "", maxChars);
+}
+
+function recordSlimTurn(memory, userMessage, conclusion) {
+  const user = clipText(messageText(userMessage), CURSOR_RECOVERY_CONTEXT_CHARS);
+  const summary = clipText(conclusion, CURSOR_CONCLUSION_CHARS);
+  if (user) memory.userPrompts.push(user);
+  if (summary) memory.conclusions.push(summary);
+  while (formatSlimMemory(memory).length > CURSOR_RECOVERY_CONTEXT_CHARS
+    && (memory.userPrompts.length > 1 || memory.conclusions.length > 1)) {
+    if (memory.userPrompts.length >= memory.conclusions.length && memory.userPrompts.length > 1) {
+      memory.userPrompts.shift();
+    } else if (memory.conclusions.length > 1) {
+      memory.conclusions.shift();
+    } else {
+      break;
+    }
+  }
+  return memory;
+}
+
+function slimMemoryPath(sessionKey) {
+  return join(CURSOR_SLIM_MEMORY_DIR, `${sessionKey}.json`);
+}
+
+async function loadSlimMemory(sessionKey) {
+  if (!sessionKey) return createSlimMemory();
+  try {
+    const parsed = JSON.parse(await readFile(slimMemoryPath(sessionKey), "utf8"));
+    return {
+      userPrompts: Array.isArray(parsed?.userPrompts) ? parsed.userPrompts.map(String) : [],
+      conclusions: Array.isArray(parsed?.conclusions) ? parsed.conclusions.map(String) : [],
+    };
+  } catch {
+    return createSlimMemory();
+  }
+}
+
+async function saveSlimMemory(sessionKey, memory) {
+  if (!sessionKey) return;
+  await mkdir(CURSOR_SLIM_MEMORY_DIR, { recursive: true });
+  await writeFile(slimMemoryPath(sessionKey), `${JSON.stringify({
+    userPrompts: memory.userPrompts ?? [],
+    conclusions: memory.conclusions ?? [],
+  })}\n`, "utf8");
+}
+
+function ingestCompactHistory(memory, history) {
+  for (const block of String(history ?? "").split(/\n\n+/)) {
+    if (block.startsWith("User: ")) {
+      const user = block.slice(6).trim();
+      if (user) memory.userPrompts.push(user);
+    } else if (block.startsWith("Assistant: ")) {
+      const conclusion = clipText(block.slice(11), CURSOR_CONCLUSION_CHARS);
+      if (conclusion) memory.conclusions.push(conclusion);
+    }
+  }
+  return memory;
+}
+
+async function seedSlimMemoryFromSession(memory, sessionId, request, sdk = Agent) {
+  if (!sessionId || !isSlimMemoryEmpty(memory)) return false;
+  const options = {
+    apiKey: process.env.CURSOR_API_KEY,
+    model: modelSelection(request.model),
+    local: { cwd: request.cwd },
+  };
+  let agent;
+  try {
+    agent = await withTimeout(sdk.resume(sessionId, options), CURSOR_RECOVERY_TIMEOUT_MS, "resume");
+    const runs = await withTimeout(
+      sdk.listRuns(sessionId, { runtime: "local", cwd: request.cwd }),
+      CURSOR_RECOVERY_TIMEOUT_MS,
+      "list runs",
+    ).catch(() => ({ items: [] }));
+    const history = await recoveryHistory(runs.items);
+    ingestCompactHistory(memory, history);
+    return !isSlimMemoryEmpty(memory);
+  } catch {
+    return false;
+  } finally {
+    agent?.close?.();
+  }
 }
 
 async function recoveryHistory(runs, timeoutMs = CURSOR_RECOVERY_TIMEOUT_MS) {
@@ -100,7 +250,7 @@ async function recoverTimedOutAgent(
   request,
   sdk = Agent,
   timeoutMs = CURSOR_RECOVERY_TIMEOUT_MS,
-  createFresh = false,
+  createFresh = true,
 ) {
   const agentId = agent.agentId;
   await withTimeout(Promise.resolve(activeRun?.cancel?.()), timeoutMs, "cancel").catch(() => {});
@@ -116,17 +266,17 @@ async function recoverTimedOutAgent(
       timeoutMs,
       "cancel run",
     ).catch(() => {})));
-  const history = createFresh ? await recoveryHistory(runs.items, timeoutMs) : "";
   agent.close();
   const options = {
     apiKey: process.env.CURSOR_API_KEY,
     model: modelSelection(request.model),
     local: { cwd: request.cwd },
   };
+  // Slim-memory mode prefers a fresh agent so poisoned checkpoints are never resumed.
   if (createFresh) {
     return {
       agent: await withTimeout(sdk.create(options), timeoutMs, "create"),
-      history,
+      history: "",
       replaced: true,
     };
   }
@@ -468,6 +618,8 @@ async function main() {
     wake?.();
   });
   let agent;
+  let sessionKey;
+  let memory = createSlimMemory();
   while (!closed || requests.length) {
     if (!requests.length) await new Promise((resolve) => { wake = resolve; });
     const request = requests.shift();
@@ -482,13 +634,39 @@ async function main() {
         continue;
       }
       if (request.action !== "prompt") throw new Error(`Unknown action: ${request.action}`);
-      if (!agent) {
-        const options = { apiKey: process.env.CURSOR_API_KEY, model: modelSelection(request.model), local: { cwd: request.cwd } };
-        agent = request.sessionId ? await Agent.resume(request.sessionId, options) : await Agent.create(options);
+
+      // Each user turn gets a fresh Cursor agent. Multi-turn continuity is carried by
+      // slim memory (user prompts + conclusions), not by resuming full SDK checkpoints.
+      if (agent) {
+        agent.close();
+        agent = undefined;
       }
-      send({ type: "ready", sessionId: agent.agentId });
+      if (!sessionKey) {
+        sessionKey = request.sessionId || randomUUID();
+        memory = await loadSlimMemory(sessionKey);
+        if (isSlimMemoryEmpty(memory) && request.sessionId) {
+          await seedSlimMemoryFromSession(memory, request.sessionId, request);
+          if (!isSlimMemoryEmpty(memory)) await saveSlimMemory(sessionKey, memory);
+        }
+      } else if (request.sessionId && request.sessionId !== sessionKey) {
+        await saveSlimMemory(sessionKey, memory);
+        sessionKey = request.sessionId;
+        memory = await loadSlimMemory(sessionKey);
+        if (isSlimMemoryEmpty(memory)) {
+          await seedSlimMemoryFromSession(memory, request.sessionId, request);
+          if (!isSlimMemoryEmpty(memory)) await saveSlimMemory(sessionKey, memory);
+        }
+      }
+
+      const options = {
+        apiKey: process.env.CURSOR_API_KEY,
+        model: modelSelection(request.model),
+        local: { cwd: request.cwd },
+      };
+      agent = await Agent.create(options);
+      send({ type: "ready", sessionId: sessionKey });
       const originalMessage = await promptMessage(request.parts);
-      let message = originalMessage;
+      let message = messageWithSlimMemory(originalMessage, memory);
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
         const state = createMessageState();
@@ -503,7 +681,7 @@ async function main() {
           resolveFirstActivity();
           sendTiming("first_delta", turnStartedAt);
         };
-        const options = {
+        const sendOptions = {
           mode: request.mode === "plan" ? "plan" : "agent",
           onDelta: ({ update }) => {
             if (!attemptActive) return;
@@ -520,7 +698,7 @@ async function main() {
         };
         try {
           const promptResult = await withTimeout(
-            sendPromptWithRecovery(agent, request, message, options),
+            sendPromptWithRecovery(agent, request, message, sendOptions),
             CURSOR_STARTUP_TIMEOUT_MS,
             "send",
           );
@@ -558,6 +736,8 @@ async function main() {
           sendTiming("wait", waitStartedAt);
           for (const item of completePendingTools(state)) send({ type: "item", item });
           if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
+          recordSlimTurn(memory, originalMessage, extractTurnConclusion(state, result));
+          await saveSlimMemory(sessionKey, memory);
           send({ type: "done", usage: usage ?? result.usage });
           completed = true;
         } catch (error) {
@@ -571,15 +751,12 @@ async function main() {
             request,
             Agent,
             CURSOR_RECOVERY_TIMEOUT_MS,
-            attempt >= 1,
+            true,
           );
           agent = recovery.agent;
-          message = recovery.replaced
-            ? messageWithRecoveryContext(originalMessage, recovery.history)
-            : originalMessage;
-          // `ready` is an internal session update. It replaces the persisted Cursor agent id
-          // without adding a chat item, so a poisoned session can be abandoned invisibly.
-          if (recovery.replaced) send({ type: "ready", sessionId: agent.agentId });
+          message = messageWithSlimMemory(originalMessage, memory);
+          // Keep the stable slim-memory session key; do not promote ephemeral agent ids.
+          send({ type: "ready", sessionId: sessionKey });
           activeRun = undefined;
         } finally {
           attemptActive = false;
@@ -589,6 +766,10 @@ async function main() {
       send({ ok: false, error: error instanceof Error ? error.message : String(error) });
     } finally {
       activeRun = undefined;
+      if (agent) {
+        agent.close();
+        agent = undefined;
+      }
     }
   }
   agent?.close();
@@ -600,4 +781,29 @@ if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => {
   process.exitCode = 1;
 });
 
-export { CursorStartupTimeout, compactConversation, completePendingTools, createMessageState, cursorModelOptions, cursorTodoPlan, mapDelta, mapMessage, messageWithRecoveryContext, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, recoveryHistory, sendPromptWithRecovery, withTimeout };
+export {
+  CursorStartupTimeout,
+  compactConversation,
+  completePendingTools,
+  createMessageState,
+  createSlimMemory,
+  cursorModelOptions,
+  cursorTodoPlan,
+  extractTurnConclusion,
+  formatSlimMemory,
+  ingestCompactHistory,
+  isSlimMemoryEmpty,
+  mapDelta,
+  mapMessage,
+  messageWithRecoveryContext,
+  messageWithSlimMemory,
+  modelSelection,
+  parseCliModels,
+  promptMessage,
+  recordSlimTurn,
+  recoverTimedOutAgent,
+  recoveryHistory,
+  seedSlimMemoryFromSession,
+  sendPromptWithRecovery,
+  withTimeout,
+};

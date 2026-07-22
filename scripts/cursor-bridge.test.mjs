@@ -1,7 +1,30 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
-const { CursorStartupTimeout, compactConversation, completePendingTools, createMessageState, cursorModelOptions, cursorTodoPlan, mapDelta, mapMessage, messageWithRecoveryContext, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, sendPromptWithRecovery, withTimeout } = await import("./cursor-bridge.mjs");
+const {
+  CursorStartupTimeout,
+  compactConversation,
+  completePendingTools,
+  createMessageState,
+  createSlimMemory,
+  cursorModelOptions,
+  cursorTodoPlan,
+  extractTurnConclusion,
+  formatSlimMemory,
+  ingestCompactHistory,
+  isSlimMemoryEmpty,
+  mapDelta,
+  mapMessage,
+  messageWithRecoveryContext,
+  messageWithSlimMemory,
+  modelSelection,
+  parseCliModels,
+  promptMessage,
+  recordSlimTurn,
+  recoverTimedOutAgent,
+  sendPromptWithRecovery,
+  withTimeout,
+} = await import("./cursor-bridge.mjs");
 const state = createMessageState();
 
 assert.equal(mapMessage({ type: "assistant", run_id: "run", message: { content: [{ type: "text", text: "Hello" }] } }, state)[0].text, "Hello");
@@ -148,11 +171,11 @@ const timedOutAgent = {
 const timeoutRecoverySdk = {
   listRuns: async () => ({ items: [{ id: "active", status: "running" }, { id: "finished", status: "completed" }] }),
   cancelRun: async (id) => timeoutRecoveryCalls.push(`cancel:${id}`),
-  resume: async (id) => {
-    timeoutRecoveryCalls.push(`resume:${id}`);
+  resume: async () => assert.fail("slim recovery must create a fresh agent"),
+  create: async () => {
+    timeoutRecoveryCalls.push("create");
     return replacementAgent;
   },
-  create: async () => assert.fail("resume should recover the agent"),
 };
 const recoveredAfterTimeout = await recoverTimedOutAgent(
   timedOutAgent,
@@ -162,8 +185,8 @@ const recoveredAfterTimeout = await recoverTimedOutAgent(
   100,
 );
 assert.equal(recoveredAfterTimeout.agent, replacementAgent);
-assert.equal(recoveredAfterTimeout.replaced, false);
-assert.deepEqual(timeoutRecoveryCalls, ["cancel-current", "cancel:active", "close", "resume:timed-out-agent"]);
+assert.equal(recoveredAfterTimeout.replaced, true);
+assert.deepEqual(timeoutRecoveryCalls, ["cancel-current", "cancel:active", "close", "create"]);
 
 const conversation = [
   { type: "agentConversationTurn", turn: { userMessage: { text: "Build a restaurant" }, steps: [
@@ -216,5 +239,38 @@ const freshRecovery = await recoverTimedOutAgent(
 );
 assert.equal(freshRecovery.agent, freshAgent);
 assert.equal(freshRecovery.replaced, true);
-assert.match(freshRecovery.history, /Make it bright/);
+assert.equal(freshRecovery.history, "");
 assert.deepEqual(freshCalls, ["cancel-current", "cancel:stuck", "close", "create"]);
+
+const slim = createSlimMemory();
+assert.equal(isSlimMemoryEmpty(slim), true);
+recordSlimTurn(slim, "Build a restaurant", "Created the first version.");
+recordSlimTurn(slim, "Make it bright", "Changed the lighting.");
+assert.deepEqual(slim.userPrompts, ["Build a restaurant", "Make it bright"]);
+assert.deepEqual(slim.conclusions, ["Created the first version.", "Changed the lighting."]);
+assert.match(formatSlimMemory(slim), /Prior conclusions/);
+assert.match(formatSlimMemory(slim), /User prompts so far/);
+const slimMessage = messageWithSlimMemory(
+  { text: "Add animation", images: [{ data: "image", mimeType: "image/png" }] },
+  slim,
+);
+assert.match(slimMessage.text, /Changed the lighting/);
+assert.match(slimMessage.text, /Current request:\nAdd animation$/);
+assert.deepEqual(slimMessage.images, [{ data: "image", mimeType: "image/png" }]);
+assert.equal(messageWithSlimMemory("only current", createSlimMemory()), "only current");
+
+const seeded = createSlimMemory();
+ingestCompactHistory(seeded, compactConversation(conversation));
+assert.deepEqual(seeded.userPrompts, ["Build a restaurant", "Make it bright"]);
+assert.deepEqual(seeded.conclusions, ["Created the first version.", "Changed the lighting."]);
+
+const conclusionState = createMessageState();
+conclusionState.texts.set("run-assistant-1", "Final answer from the assistant.");
+assert.equal(
+  extractTurnConclusion(conclusionState, { result: "Prefer result text." }),
+  "Prefer result text.",
+);
+assert.equal(
+  extractTurnConclusion(conclusionState, {}),
+  "Final answer from the assistant.",
+);
