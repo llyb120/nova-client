@@ -490,8 +490,10 @@ export interface Achievement {
   id: string;
   title: string;
   description: string;
-  /** 徽章资源键，如 founder / pioneer */
+  /** 徽章样式键，如 founder / pioneer */
   icon: string;
+  /** 服务端徽章图 URL（绝对或相对中转站） */
+  imageUrl?: string;
   /** 先驱者等编号类成就的用户序号 */
   number?: string;
 }

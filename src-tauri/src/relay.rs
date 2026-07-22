@@ -321,6 +321,9 @@ pub struct Achievement {
     pub title: String,
     pub description: String,
     pub icon: String,
+    /// 服务端徽章图（绝对或相对中转站）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number: Option<String>,
 }
@@ -592,7 +595,10 @@ impl RelayManager {
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
-        let body: AchievementsResponse = resp.json().await.map_err(|e| e.to_string())?;
+        let mut body: AchievementsResponse = resp.json().await.map_err(|e| e.to_string())?;
+        for a in &mut body.achievements {
+            a.image_url = resolve_relay_asset_url(&server, a.image_url.take());
+        }
         Ok(body.achievements)
     }
 
@@ -4299,6 +4305,24 @@ pub(crate) fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// 把成就图等中转站相对路径拼成绝对 URL；已是 http(s) 则原样返回。
+fn resolve_relay_asset_url(server: &str, url: Option<String>) -> Option<String> {
+    let raw = url?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw);
+    }
+    let base = server.trim_end_matches('/');
+    let path = if raw.starts_with('/') {
+        raw
+    } else {
+        format!("/{raw}")
+    };
+    Some(format!("{base}{path}"))
 }
 
 fn websocket_url(server: &str, since: i64, server_epoch: &str) -> Result<String, String> {
