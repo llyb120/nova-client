@@ -563,10 +563,13 @@ fn spawn_single_instance_focus_listener(app: &tauri::AppHandle) {
 pub const EV_BACKENDS: &str = "backends:availability";
 
 /// 判断后端是否应出现在可选列表。
-/// Alkaid 是 Nova 内置后端，不应因 Windows 桌面进程暂时解析不到 Node.js 而被当成未安装；
-/// 真正启动 bridge 时仍会检查 Node.js，并返回明确错误。其他后端按 CLI 路径检测。
+/// 内置 SDK bridge 后端不依赖设置里的旧 CLI 路径；真正启动 bridge 时仍会检查
+/// Node.js / 凭据并返回明确错误。其余后端按 CLI 路径检测。
 fn backend_is_available(kind: &AgentKind, program: &str) -> bool {
-    kind == &AgentKind::Alkaid || acp::resolve_program_on_path(program).is_some()
+    matches!(
+        kind,
+        AgentKind::Alkaid | AgentKind::CodeBuddy | AgentKind::ClaudeCode | AgentKind::Cursor
+    ) || acp::resolve_program_on_path(program).is_some()
 }
 
 #[cfg(test)]
@@ -574,9 +577,16 @@ mod backend_availability_tests {
     use super::{backend_is_available, AgentKind};
 
     #[test]
-    fn alkaid_is_available_without_an_external_cli() {
+    fn sdk_backends_are_available_without_legacy_cli_paths() {
         let missing = "__nova_missing_backend_executable__";
-        assert!(backend_is_available(&AgentKind::Alkaid, missing));
+        for kind in [
+            AgentKind::Alkaid,
+            AgentKind::CodeBuddy,
+            AgentKind::ClaudeCode,
+            AgentKind::Cursor,
+        ] {
+            assert!(backend_is_available(&kind, missing), "{kind:?}");
+        }
         assert!(!backend_is_available(&AgentKind::Devin, missing));
     }
 }

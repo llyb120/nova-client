@@ -773,8 +773,12 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
             AgentKind::Alkaid => state.alkaid.get_model_options(),
             AgentKind::Devin => state.acp.get_model_options(),
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+                state.codebuddyplus.get_model_options()
+            }
+            AgentKind::ClaudeCode => state.claudeplus.get_model_options(),
+            AgentKind::Cursor => state.cursorplus.get_model_options(),
             AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.get_model_options(),
-            _ => None,
         }
         .unwrap_or_else(|| json!({ "configOptions": [], "modes": null }));
         out.insert(kind.as_str().to_string(), value);
