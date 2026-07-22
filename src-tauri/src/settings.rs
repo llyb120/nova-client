@@ -224,6 +224,27 @@ mod tests {
     }
 
     #[test]
+    fn quota_shared_models_survive_reload_for_all_backends() {
+        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
+        let mut settings = Settings::default();
+        settings.quota_shared_models = vec![
+            "devin:swe-1.6".into(),
+            "codex:gpt-5.6".into(),
+            "codebuddy:claude-sonnet".into(),
+            "claudecode:claude-opus".into(),
+            "cursor:cursor-small".into(),
+            "opencode:provider/model".into(),
+        ];
+        settings.save(&dir);
+
+        assert_eq!(
+            Settings::load(&dir).quota_shared_models,
+            settings.quota_shared_models
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn missing_history_display_mode_defaults_to_project() {
         let settings: Settings = serde_json::from_str(r#"{"theme":"ink-dark"}"#).unwrap();
         assert_eq!(settings.history_display_mode, "project");
@@ -305,9 +326,6 @@ impl Settings {
         settings.claudecode_integration = "sdk".into();
         settings.cursor_integration = "sdk".into();
         settings.opencode_integration = "sdk".into();
-        settings
-            .quota_shared_models
-            .retain(|entry| entry.starts_with("devin:") || entry.starts_with("codex:"));
         settings
     }
 
