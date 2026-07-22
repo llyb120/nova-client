@@ -9,6 +9,7 @@ const EXCLUSIVE_MARK_BY_TOKEN_PREFIX: ReadonlyArray<readonly [string, string]> =
   ["yao.mengjia", "001"],
   ["chen.lv", "002"],
   ["zheng.hanliang", "003"],
+  ["nie.youlin", "004"],
 ];
 
 export interface ExclusiveChatIdentity {
@@ -18,10 +19,12 @@ export interface ExclusiveChatIdentity {
 
 export function exclusiveIdentityForToken(token: string): ExclusiveChatIdentity | undefined {
   const normalized = token.trim();
-  const match = EXCLUSIVE_MARK_BY_TOKEN_PREFIX.find(([prefix]) =>
-    normalized.startsWith(prefix),
-  );
-  return match ? { username: match[0], number: match[1] } : undefined;
+  const lower = normalized.toLocaleLowerCase("en-US");
+  const match = EXCLUSIVE_MARK_BY_TOKEN_PREFIX.find(([prefix]) => lower.startsWith(prefix));
+  // 身份匹配无视大小写；签名文字保留具体 token 中的实际大小写。
+  return match
+    ? { username: normalized.slice(0, match[0].length), number: match[1] }
+    : undefined;
 }
 
 export function exclusiveNumberForToken(token: string): string | undefined {
