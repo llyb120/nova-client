@@ -59,6 +59,9 @@ pub struct SdkManager {
     model_options: Mutex<Option<Value>>,
     model_options_refreshing: AtomicBool,
     model_options_revalidated: AtomicBool,
+    /// 仅 Alkaid 使用：nova-server 下发的配置保存在内存，请求 bridge 时随首包传入。
+    alkaid_server_config: Mutex<Option<Value>>,
+    alkaid_config_generation: AtomicU64,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
 }
@@ -85,6 +88,8 @@ impl SdkManager {
             model_options: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
             model_options_revalidated: AtomicBool::new(false),
+            alkaid_server_config: Mutex::new(None),
+            alkaid_config_generation: AtomicU64::new(0),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
         })
@@ -507,6 +512,51 @@ impl SdkManager {
         *self.model_options.lock().unwrap() = Some(value);
     }
 
+    /// 应用 nova-server 定向下发的 Alkaid 配置。配置只驻留内存；当前运行轮次不打断，
+    /// 后续 bridge 首包携带它并由 JS 侧以本地 config.jsonc 覆盖合并。
+    pub fn set_alkaid_server_config(self: &Arc<Self>, config: Option<Value>) {
+        if self.adapter.agent_kind() != AgentKind::Alkaid {
+            return;
+        }
+        {
+            let mut current = self.alkaid_server_config.lock().unwrap();
+            if *current == config {
+                return;
+            }
+            *current = config;
+        }
+        self.alkaid_config_generation.fetch_add(1, Ordering::SeqCst);
+        *self.model_options.lock().unwrap() = None;
+        self.model_options_revalidated.store(false, Ordering::SeqCst);
+        let _ = self.app.emit(
+            EV_OPTIONS,
+            json!({
+                "agentKind": AgentKind::Alkaid.as_str(),
+                "options": self.empty_model_options(),
+            }),
+        );
+        for mut bridge in std::mem::take(&mut *self.idle_children.lock().unwrap()).into_values() {
+            kill_child(&mut bridge.child);
+        }
+        // 若旧配置的模型探测仍在进行，等它退出 refreshing 闸门后再用新配置重拉。
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            while manager.model_options_refreshing.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            manager.spawn_revalidate_model_options();
+        });
+    }
+
+    fn with_alkaid_server_config(&self, mut request: Value) -> Value {
+        if self.adapter.agent_kind() == AgentKind::Alkaid {
+            if let Some(config) = self.alkaid_server_config.lock().unwrap().clone() {
+                request["alkaidServerConfig"] = config;
+            }
+        }
+        request
+    }
+
     /// 返回当前缓存的模型列表，供同步的远程快照构建逻辑使用。
     pub fn get_model_options(&self) -> Option<Value> {
         self.model_options.lock().unwrap().clone()
@@ -544,6 +594,7 @@ impl SdkManager {
     }
 
     async fn refresh_model_options(&self) -> Result<Value, String> {
+        let generation = self.alkaid_config_generation.load(Ordering::SeqCst);
         let cwd = std::env::current_dir()
             .unwrap_or_default()
             .to_string_lossy()
@@ -551,9 +602,15 @@ impl SdkManager {
         let value = self
             .run_bridge(&cwd, json!({ "action": "models", "cwd": cwd }))
             .await?;
+        if generation != self.alkaid_config_generation.load(Ordering::SeqCst) {
+            return Err("Alkaid 配置已更新，丢弃旧模型列表".into());
+        }
         *self.model_options.lock().unwrap() = Some(value.clone());
         let kind = self.adapter.agent_kind();
-        model_cache::save(&crate::nova_data_dir(&self.app), kind.as_str(), &value);
+        // 服务端配置只允许驻留内存；启用时不把合并后的模型列表写入本地缓存。
+        if kind != AgentKind::Alkaid || self.alkaid_server_config.lock().unwrap().is_none() {
+            model_cache::save(&crate::nova_data_dir(&self.app), kind.as_str(), &value);
+        }
         self.model_options_revalidated.store(true, Ordering::SeqCst);
         let _ = self.app.emit(
             EV_OPTIONS,
@@ -614,6 +671,7 @@ impl SdkManager {
     }
 
     async fn run_bridge(&self, cwd: &str, request: Value) -> Result<Value, String> {
+        let request = self.with_alkaid_server_config(request);
         let mut child = self.spawn_bridge(cwd)?;
         let mut stdin = child
             .stdin
@@ -639,6 +697,7 @@ impl SdkManager {
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
+        let request = self.with_alkaid_server_config(request);
         let mut bridge = self
             .adapter
             .keeps_bridge_alive()

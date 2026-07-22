@@ -85,15 +85,35 @@ function providerApi(provider) {
   throw new Error("Alkaid provider 缺少 api，且无法从 npm 推导协议");
 }
 
-export async function loadAlkaidConfig({ root = alkaidDataRoot(), env = process.env } = {}) {
-  const path = join(root, "config.jsonc");
-  let config;
-  try {
-    config = parseJsonc(await readFile(path, "utf8"));
-  } catch (error) {
-    if (error?.code === "ENOENT") throw new Error(`未找到 Alkaid 配置：${path}`);
-    throw new Error(`读取 Alkaid 配置失败：${error instanceof Error ? error.message : String(error)}`);
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** 服务端配置作基线，本地配置递归覆盖；数组与标量由本地整体替换。 */
+export function mergeAlkaidConfig(serverConfig, localConfig) {
+  if (!isPlainObject(serverConfig)) return structuredClone(localConfig ?? {});
+  if (!isPlainObject(localConfig)) return structuredClone(serverConfig);
+  const merged = structuredClone(serverConfig);
+  for (const [key, localValue] of Object.entries(localConfig)) {
+    merged[key] = isPlainObject(localValue) && isPlainObject(merged[key])
+      ? mergeAlkaidConfig(merged[key], localValue)
+      : structuredClone(localValue);
   }
+  return merged;
+}
+
+export async function loadAlkaidConfig({ root = alkaidDataRoot(), env = process.env, serverConfig } = {}) {
+  const path = join(root, "config.jsonc");
+  let localConfig = {};
+  try {
+    localConfig = parseJsonc(await readFile(path, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new Error(`读取 Alkaid 配置失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!isPlainObject(serverConfig)) throw new Error(`未找到 Alkaid 配置：${path}`);
+  }
+  const config = mergeAlkaidConfig(serverConfig, localConfig);
   if (!config?.provider || typeof config.provider !== "object") {
     throw new Error("Alkaid 配置缺少 provider");
   }

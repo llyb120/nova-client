@@ -72,7 +72,7 @@ function startedToolItem(event) {
 
 async function prompt(request, commands) {
   const input = await alkaidPromptInput(request.parts);
-  const config = await loadAlkaidConfig({ root: dataRoot });
+  const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
   const resolved = resolveAlkaidModel(config, request.model);
   const sessionId = request.sessionId || randomUUID();
   const runtime = await createAlkaidAgent({
@@ -166,7 +166,7 @@ async function prompt(request, commands) {
 }
 
 async function title(request) {
-  const config = await loadAlkaidConfig({ root: dataRoot });
+  const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
   const resolved = resolveAlkaidModel(config, request.model);
   const runtime = await createAlkaidAgent({
     cwd: request.cwd,
@@ -194,7 +194,7 @@ try {
   const request = JSON.parse(first.value);
   if (request.action === "prompt") await prompt(request, commands);
   else if (request.action === "models") {
-    const config = await loadAlkaidConfig({ root: dataRoot });
+    const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
     send({ ok: true, data: { configOptions: [{ id: "model", name: "Model", currentValue: defaultAlkaidModel(config), options: alkaidModelOptions(config) }], modes: null } });
   } else if (request.action === "title") await title(request);
   else throw new Error(`Alkaid bridge 不支持 action: ${request.action}`);
