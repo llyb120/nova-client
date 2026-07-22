@@ -311,16 +311,6 @@ export function modelChoices(
   }
   const auto: ModelChoice[] = [
     {
-      value: "__nova_auto_value__",
-      name: "Auto（按性价比）",
-      description: "新会话首次发送前获取性价比第一名，后续固定复用；数据来自 Codex 雷达 codexradar.com",
-    },
-    {
-      value: "__nova_auto_iq__",
-      name: "Auto（按智商）",
-      description: "新会话首次发送前获取 IQ 第一名，后续固定复用；数据来自 Codex 雷达 codexradar.com",
-    },
-    {
       value: "__nova_auto_community__",
       name: "Auto（按社区评分）",
       description: "新会话首次发送前获取近 24 小时社区体感分第一名（排除 ultra），后续固定复用；数据来自 Codex 雷达 codexradar.com",
