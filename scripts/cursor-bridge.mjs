@@ -8,6 +8,60 @@ import { promisify } from "node:util";
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const execFileAsync = promisify(execFile);
 const TERMINAL_RUN_STATUSES = new Set(["completed", "error", "failed", "cancelled", "expired"]);
+const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTUP_TIMEOUT_MS, 120_000);
+const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
+const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
+
+function positiveInteger(value, fallback) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+class CursorStartupTimeout extends Error {
+  constructor(phase) {
+    super(`Cursor ${phase} timed out before producing output`);
+    this.name = "CursorStartupTimeout";
+  }
+}
+
+function withTimeout(promise, timeoutMs, phase) {
+  if (!timeoutMs) return promise;
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new CursorStartupTimeout(phase)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function recoverTimedOutAgent(agent, activeRun, request, sdk = Agent, timeoutMs = CURSOR_RECOVERY_TIMEOUT_MS) {
+  const agentId = agent.agentId;
+  await withTimeout(Promise.resolve(activeRun?.cancel?.()), timeoutMs, "cancel").catch(() => {});
+  const runs = await withTimeout(
+    sdk.listRuns(agentId, { runtime: "local", cwd: request.cwd }),
+    timeoutMs,
+    "list runs",
+  ).catch(() => ({ items: [] }));
+  await Promise.all((runs.items ?? [])
+    .filter((run) => !TERMINAL_RUN_STATUSES.has(String(run.status).toLowerCase()))
+    .map((run) => withTimeout(
+      sdk.cancelRun(run.id, { runtime: "local", cwd: request.cwd }),
+      timeoutMs,
+      "cancel run",
+    ).catch(() => {})));
+  agent.close();
+  const options = {
+    apiKey: process.env.CURSOR_API_KEY,
+    model: modelSelection(request.model),
+    local: { cwd: request.cwd },
+  };
+  try {
+    return await withTimeout(sdk.resume(agentId, options), timeoutMs, "resume");
+  } catch {
+    return withTimeout(sdk.create(options), timeoutMs, "create");
+  }
+}
 
 function sendTiming(phase, startedAt, details = {}) {
   send({ type: "timing", phase, elapsedMs: Math.round(performance.now() - startedAt), ...details });
@@ -156,6 +210,18 @@ function completePendingTools(state) {
     items.push(completed);
   }
   return items;
+}
+
+function cursorTodoPlan(toolCall) {
+  if (!toolCall || toolCall.type !== "updateTodos") return null;
+  const todos = toolCall.result?.value?.todos ?? toolCall.args?.todos;
+  if (!Array.isArray(todos)) return null;
+  return todos
+    .map((todo) => ({
+      content: typeof todo?.content === "string" ? todo.content.trim() : "",
+      status: todo?.status === "inProgress" ? "in_progress" : (todo?.status ?? "pending"),
+    }))
+    .filter((todo) => todo.content);
 }
 
 function modelSelection(selected) {
@@ -339,41 +405,89 @@ async function main() {
         agent = request.sessionId ? await Agent.resume(request.sessionId, options) : await Agent.create(options);
       }
       send({ type: "ready", sessionId: agent.agentId });
-      const state = createMessageState();
-      const turnStartedAt = performance.now();
-      let firstDeltaReceived = false;
       const message = await promptMessage(request.parts);
-      const options = {
-        mode: request.mode === "plan" ? "plan" : "agent",
-        onDelta: ({ update }) => {
-          try {
-            if (!firstDeltaReceived) {
-              firstDeltaReceived = true;
-              sendTiming("first_delta", turnStartedAt);
+      let completed = false;
+      for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
+        const state = createMessageState();
+        const turnStartedAt = performance.now();
+        let attemptActive = true;
+        let producedOutput = false;
+        let resolveFirstActivity;
+        const firstActivity = new Promise((resolve) => { resolveFirstActivity = resolve; });
+        const markActivity = () => {
+          if (producedOutput) return;
+          producedOutput = true;
+          resolveFirstActivity();
+          sendTiming("first_delta", turnStartedAt);
+        };
+        const options = {
+          mode: request.mode === "plan" ? "plan" : "agent",
+          onDelta: ({ update }) => {
+            if (!attemptActive) return;
+            try {
+              const item = mapDelta(update, state, activeRun?.id ?? "run");
+              const plan = cursorTodoPlan(update.toolCall);
+              if (item || plan) markActivity();
+              if (item) send({ type: "item", item });
+              if (plan) send({ type: "plan", plan });
+            } catch (error) {
+              process.stderr.write(`Cursor onDelta failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
             }
-            const item = mapDelta(update, state, activeRun?.id ?? "run");
-            if (item) send({ type: "item", item });
-          } catch (error) {
-            process.stderr.write(`Cursor onDelta failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-          }
-        },
-      };
-      const promptResult = await sendPromptWithRecovery(agent, request, message, options);
-      agent = promptResult.agent;
-      activeRun = promptResult.run;
-      let usage;
-      const streamStartedAt = performance.now();
-      for await (const message of activeRun.stream()) {
-        for (const item of mapMessage(message, state)) send({ type: "item", item });
-        if (message.type === "usage") usage = message.usage;
+          },
+        };
+        try {
+          const promptResult = await withTimeout(
+            sendPromptWithRecovery(agent, request, message, options),
+            CURSOR_STARTUP_TIMEOUT_MS,
+            "send",
+          );
+          agent = promptResult.agent;
+          activeRun = promptResult.run;
+          let usage;
+          const streamStartedAt = performance.now();
+          const streamTask = (async () => {
+            for await (const streamMessage of activeRun.stream()) {
+              if (!attemptActive) continue;
+              const items = mapMessage(streamMessage, state);
+              const plan = streamMessage.type === "tool_call"
+                ? cursorTodoPlan({ type: streamMessage.name, args: streamMessage.args, result: streamMessage.result })
+                : null;
+              if (items.length || plan) markActivity();
+              for (const item of items) send({ type: "item", item });
+              if (plan) send({ type: "plan", plan });
+              if (streamMessage.type === "usage") usage = streamMessage.usage;
+            }
+          })();
+          // Cursor occasionally leaves a local run pending forever without yielding even one
+          // event. Only that side-effect-free startup window is retried automatically.
+          await withTimeout(
+            Promise.race([firstActivity, streamTask]),
+            CURSOR_STARTUP_TIMEOUT_MS,
+            "stream startup",
+          );
+          await streamTask;
+          sendTiming("stream", streamStartedAt);
+          const waitStartedAt = performance.now();
+          const waitTask = activeRun.wait();
+          const result = producedOutput
+            ? await waitTask
+            : await withTimeout(waitTask, CURSOR_STARTUP_TIMEOUT_MS, "wait startup");
+          sendTiming("wait", waitStartedAt);
+          for (const item of completePendingTools(state)) send({ type: "item", item });
+          if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
+          send({ type: "done", usage: usage ?? result.usage });
+          completed = true;
+        } catch (error) {
+          const retryable = error instanceof CursorStartupTimeout && !producedOutput && attempt < CURSOR_SILENT_RETRIES;
+          if (!retryable) throw error;
+          attemptActive = false;
+          sendTiming("silent_retry", turnStartedAt, { attempt: attempt + 1 });
+          agent = await recoverTimedOutAgent(agent, activeRun, request);
+          activeRun = undefined;
+        } finally {
+          attemptActive = false;
+        }
       }
-      sendTiming("stream", streamStartedAt);
-      const waitStartedAt = performance.now();
-      const result = await activeRun.wait();
-      sendTiming("wait", waitStartedAt);
-      for (const item of completePendingTools(state)) send({ type: "item", item });
-      if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
-      send({ type: "done", usage: usage ?? result.usage });
     } catch (error) {
       send({ ok: false, error: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -389,4 +503,4 @@ if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => {
   process.exitCode = 1;
 });
 
-export { completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, sendPromptWithRecovery };
+export { CursorStartupTimeout, completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, sendPromptWithRecovery, withTimeout };

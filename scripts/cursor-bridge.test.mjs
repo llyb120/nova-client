@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
-const { completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, sendPromptWithRecovery } = await import("./cursor-bridge.mjs");
+const { CursorStartupTimeout, completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, sendPromptWithRecovery, withTimeout } = await import("./cursor-bridge.mjs");
 const state = createMessageState();
 
 assert.equal(mapMessage({ type: "assistant", run_id: "run", message: { content: [{ type: "text", text: "Hello" }] } }, state)[0].text, "Hello");
@@ -120,3 +120,34 @@ const fallback = await sendPromptWithRecovery(fallbackAgent, { cwd: "." }, "cont
 assert.equal(fallback.agent, resumedAgent);
 assert.equal(fallback.run, resumedRun);
 assert.equal(fallbackAttempts, 2);
+
+await assert.rejects(
+  withTimeout(new Promise(() => {}), 10, "test"),
+  (error) => error instanceof CursorStartupTimeout && error.message.includes("test"),
+);
+assert.equal(await withTimeout(Promise.resolve("ready"), 10, "test"), "ready");
+
+const timeoutRecoveryCalls = [];
+const replacementAgent = { agentId: "replacement" };
+const timedOutAgent = {
+  agentId: "timed-out-agent",
+  close: () => timeoutRecoveryCalls.push("close"),
+};
+const timeoutRecoverySdk = {
+  listRuns: async () => ({ items: [{ id: "active", status: "running" }, { id: "finished", status: "completed" }] }),
+  cancelRun: async (id) => timeoutRecoveryCalls.push(`cancel:${id}`),
+  resume: async (id) => {
+    timeoutRecoveryCalls.push(`resume:${id}`);
+    return replacementAgent;
+  },
+  create: async () => assert.fail("resume should recover the agent"),
+};
+const recoveredAfterTimeout = await recoverTimedOutAgent(
+  timedOutAgent,
+  { cancel: async () => timeoutRecoveryCalls.push("cancel-current") },
+  { cwd: ".", model: "grok-4.5-high-fast" },
+  timeoutRecoverySdk,
+  100,
+);
+assert.equal(recoveredAfterTimeout, replacementAgent);
+assert.deepEqual(timeoutRecoveryCalls, ["cancel-current", "cancel:active", "close", "resume:timed-out-agent"]);
