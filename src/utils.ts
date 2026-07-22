@@ -4,7 +4,7 @@ import type { AgentKind } from "./types";
 export function agentLabel(kind: AgentKind): string {
   switch (kind) {
     case "alkaid":
-      return "Alkaid";
+      return "Vega";
     case "codex":
       return "Codex";
     case "codebuddy":
@@ -20,12 +20,12 @@ export function agentLabel(kind: AgentKind): string {
   }
 }
 
-/** agent 单字徽标（侧边栏紧凑展示）：Devin=D / Codex=C / CodeBuddy=B / Claude Code=CC /
- *  Cursor=CS / OpenCode=OC */
+/** agent 单字徽标（侧边栏紧凑展示）：Vega=V / Devin=D / Codex=C / CodeBuddy=B /
+ *  Claude Code=CC / Cursor=CS / OpenCode=OC */
 export function agentShort(kind: AgentKind): string {
   switch (kind) {
     case "alkaid":
-      return "A";
+      return "V";
     case "codex":
       return "C";
     case "codebuddy":
