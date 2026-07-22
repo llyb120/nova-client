@@ -4,7 +4,7 @@ import { createEffect, createMemo, createSignal, For, Index, Match, Show, Switch
 import { api } from "../ipc";
 import { isExpanded, state, toggleExpanded } from "../store";
 import type { ToolContent, ToolItem } from "../types";
-import { stripAnsi } from "../utils";
+import { displayToolTitle, stripAnsi } from "../utils";
 import { createFileContextMenu } from "./FileContextMenu";
 import { relPath } from "./EditedFilesCard";
 import { IconCheck, IconChevron, IconCopy, toolIcon } from "./icons";
@@ -273,7 +273,7 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
 
   const label = () => {
     const t = (props.item.title || "").trim();
-    if (t) return stripAnsi(t);
+    if (t) return displayToolTitle(stripAnsi(t));
     return KIND_LABEL[props.item.kind] ?? props.item.kind;
   };
 

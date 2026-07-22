@@ -51,6 +51,11 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_RE, "").replace(BARE_SGR_RE, "");
 }
 
+/** 历史工具记录仍保留内部后端名；只在界面层替换品牌展示。 */
+export function displayToolTitle(title: string): string {
+  return title.replace(/^Alkaid(\s*\/)/, "Vega$1");
+}
+
 const SCRATCH_MARK = "Nova-scratch";
 
 /** 是否为「不使用项目」的临时会话目录 */
