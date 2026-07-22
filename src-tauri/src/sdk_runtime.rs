@@ -908,6 +908,13 @@ impl SdkManager {
                 command.env(name, value);
             }
         }
+        // SDK 后端统一由这个 Node bridge 启动；必须在 bridge 进程环境中注入 shim，
+        // 才能覆盖 Cursor SDK 等后续创建的 cmd / powershell / pwsh 孙进程。
+        #[cfg(windows)]
+        if self.app.state::<AppState>().windows_shell_shim_enabled {
+            crate::windows_shell_shim::apply(&self.app, &mut command, &self.launch_env)
+                .map_err(|e| format!("应用 Windows shell shim 失败：{e}"))?;
+        }
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
         command

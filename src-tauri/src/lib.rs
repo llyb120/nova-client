@@ -1617,10 +1617,13 @@ fn scratch_dir() -> Result<String, String> {
     Ok(dir.to_string_lossy().to_string())
 }
 
-/// 判断目录是否 git 仓库：前端据此决定「在 worktree 中执行」开关是否可用
+/// 判断目录是否 git 仓库：前端据此决定「在 worktree 中执行」开关是否可用。
+/// git 探测涉及进程启动和磁盘访问，必须离开 Tauri 命令线程，避免选择项目时卡住界面。
 #[tauri::command]
-fn is_git_repo(path: String) -> bool {
-    gitwt::is_repo(&path)
+async fn is_git_repo(path: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || gitwt::is_repo(&path))
+        .await
+        .unwrap_or(false)
 }
 
 /// worktree「基于分支」下拉的数据：当前分支 + 本地分支列表
