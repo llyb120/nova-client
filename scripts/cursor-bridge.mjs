@@ -14,7 +14,7 @@ const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTU
 const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
-const CURSOR_CONCLUSION_CHARS = positiveInteger(process.env.NOVA_CURSOR_CONCLUSION_CHARS, 2_000);
+const CURSOR_SLIM_MEMORY_TURNS = positiveInteger(process.env.NOVA_CURSOR_SLIM_MEMORY_TURNS, 20);
 const CURSOR_SLIM_MEMORY_DIR = process.env.NOVA_CURSOR_SLIM_MEMORY_DIR
   || join(homedir(), ".nova", "cursor-slim-memory");
 
@@ -69,18 +69,11 @@ function compactConversation(turns, maxChars = CURSOR_RECOVERY_CONTEXT_CHARS) {
 }
 
 function createSlimMemory() {
-  return { userPrompts: [], conclusions: [] };
+  return { summary: "", turns: [] };
 }
 
 function isSlimMemoryEmpty(memory) {
-  return !(memory?.userPrompts?.length || memory?.conclusions?.length);
-}
-
-function clipText(text, maxChars) {
-  const value = String(text ?? "").trim();
-  if (!value) return "";
-  if (value.length <= maxChars) return value;
-  return maxChars <= 1 ? "…" : `${value.slice(0, maxChars - 1)}…`;
+  return !(memory?.summary || memory?.turns?.length);
 }
 
 function messageText(message) {
@@ -91,22 +84,18 @@ function withMessageText(message, text) {
   return typeof message === "string" ? text : { ...message, text };
 }
 
-function formatSlimMemory(memory, maxChars = CURSOR_RECOVERY_CONTEXT_CHARS) {
+function formatSlimMemory(memory) {
   const sections = [];
-  if (memory.conclusions?.length) {
-    sections.push("## Prior conclusions");
-    memory.conclusions.forEach((conclusion, index) => {
-      sections.push(`${index + 1}. ${conclusion}`);
-    });
-  }
-  if (memory.userPrompts?.length) {
+  if (memory.summary) sections.push("## Summary of earlier turns", memory.summary);
+  if (memory.turns?.length) {
     if (sections.length) sections.push("");
-    sections.push("## User prompts so far");
-    memory.userPrompts.forEach((prompt, index) => {
-      sections.push(`${index + 1}. ${prompt}`);
+    sections.push("## Recent turns");
+    memory.turns.forEach((turn, index) => {
+      sections.push(`### Turn ${index + 1}`, `User: ${turn.userPrompt}`);
+      if (turn.conclusion) sections.push(`Conclusion: ${turn.conclusion}`);
     });
   }
-  return clipText(sections.join("\n"), maxChars);
+  return sections.join("\n");
 }
 
 function messageWithSlimMemory(message, memory) {
@@ -136,32 +125,60 @@ function messageWithRecoveryContext(message, history) {
   return withMessageText(message, `${prefix}\n${messageText(message)}`);
 }
 
-function extractTurnConclusion(state, result, maxChars = CURSOR_CONCLUSION_CHARS) {
-  const fromResult = clipText(result?.result, maxChars);
+function extractTurnConclusion(state, result) {
+  const fromResult = String(result?.result ?? "").trim();
   if (fromResult) return fromResult;
   const assistantTexts = [...(state?.texts?.entries?.() ?? [])]
     .filter(([id]) => String(id).includes("-assistant-"))
     .map(([, text]) => String(text ?? "").trim())
     .filter(Boolean);
-  return clipText(assistantTexts.at(-1) ?? "", maxChars);
+  return assistantTexts.at(-1) ?? "";
 }
 
 function recordSlimTurn(memory, userMessage, conclusion) {
-  const user = clipText(messageText(userMessage), CURSOR_RECOVERY_CONTEXT_CHARS);
-  const summary = clipText(conclusion, CURSOR_CONCLUSION_CHARS);
-  if (user) memory.userPrompts.push(user);
-  if (summary) memory.conclusions.push(summary);
-  while (formatSlimMemory(memory).length > CURSOR_RECOVERY_CONTEXT_CHARS
-    && (memory.userPrompts.length > 1 || memory.conclusions.length > 1)) {
-    if (memory.userPrompts.length >= memory.conclusions.length && memory.userPrompts.length > 1) {
-      memory.userPrompts.shift();
-    } else if (memory.conclusions.length > 1) {
-      memory.conclusions.shift();
-    } else {
-      break;
-    }
-  }
+  const userPrompt = String(messageText(userMessage)).trim();
+  const turnConclusion = String(conclusion ?? "").trim();
+  if (userPrompt || turnConclusion) memory.turns.push({ userPrompt, conclusion: turnConclusion });
   return memory;
+}
+
+async function compressSlimMemory(memory, summarize, maxTurns = CURSOR_SLIM_MEMORY_TURNS) {
+  if (memory.turns.length <= maxTurns || memory.turns.length < 2) return false;
+  const latestTurn = memory.turns.at(-1);
+  const earlier = {
+    summary: memory.summary,
+    turns: memory.turns.slice(0, -1),
+  };
+  const summary = String(await summarize(formatSlimMemory(earlier)) ?? "").trim();
+  if (!summary) return false;
+  memory.summary = summary;
+  // Compression is turn-based. The latest user prompt is always retained verbatim.
+  memory.turns = [latestTurn];
+  return true;
+}
+
+async function summarizeSlimMemory(memory, request, sdk = Agent) {
+  return compressSlimMemory(memory, async (earlierTurns) => {
+    const agent = await sdk.create({
+      apiKey: process.env.CURSOR_API_KEY,
+      model: modelSelection(request.model),
+      local: { cwd: request.cwd },
+    });
+    try {
+      const run = await agent.send([
+        "Summarize the earlier conversation turns below for another coding agent.",
+        "Preserve user intent, decisions, changed files, important identifiers, constraints, and unresolved work.",
+        "Do not copy the transcript or add commentary. Do not omit facts merely to sound concise.",
+        "",
+        earlierTurns,
+      ].join("\n"));
+      const result = await run.wait();
+      if (result.status === "error") throw new Error(result.error?.message || "Cursor memory summary failed");
+      return result.result;
+    } finally {
+      agent.close();
+    }
+  });
 }
 
 function slimMemoryPath(sessionKey) {
@@ -172,9 +189,24 @@ async function loadSlimMemory(sessionKey) {
   if (!sessionKey) return createSlimMemory();
   try {
     const parsed = JSON.parse(await readFile(slimMemoryPath(sessionKey), "utf8"));
+    if (Array.isArray(parsed?.turns)) {
+      return {
+        summary: String(parsed.summary ?? ""),
+        turns: parsed.turns.map((turn) => ({
+          userPrompt: String(turn?.userPrompt ?? ""),
+          conclusion: String(turn?.conclusion ?? ""),
+        })),
+      };
+    }
+    // Migrate the first slim-memory format, which stored prompts and conclusions separately.
+    const prompts = Array.isArray(parsed?.userPrompts) ? parsed.userPrompts : [];
+    const conclusions = Array.isArray(parsed?.conclusions) ? parsed.conclusions : [];
     return {
-      userPrompts: Array.isArray(parsed?.userPrompts) ? parsed.userPrompts.map(String) : [],
-      conclusions: Array.isArray(parsed?.conclusions) ? parsed.conclusions.map(String) : [],
+      summary: "",
+      turns: Array.from({ length: Math.max(prompts.length, conclusions.length) }, (_, index) => ({
+        userPrompt: String(prompts[index] ?? ""),
+        conclusion: String(conclusions[index] ?? ""),
+      })),
     };
   } catch {
     return createSlimMemory();
@@ -185,19 +217,21 @@ async function saveSlimMemory(sessionKey, memory) {
   if (!sessionKey) return;
   await mkdir(CURSOR_SLIM_MEMORY_DIR, { recursive: true });
   await writeFile(slimMemoryPath(sessionKey), `${JSON.stringify({
-    userPrompts: memory.userPrompts ?? [],
-    conclusions: memory.conclusions ?? [],
+    version: 2,
+    summary: memory.summary ?? "",
+    turns: memory.turns ?? [],
   })}\n`, "utf8");
 }
 
 function ingestCompactHistory(memory, history) {
   for (const block of String(history ?? "").split(/\n\n+/)) {
     if (block.startsWith("User: ")) {
-      const user = block.slice(6).trim();
-      if (user) memory.userPrompts.push(user);
+      memory.turns.push({ userPrompt: block.slice(6).trim(), conclusion: "" });
     } else if (block.startsWith("Assistant: ")) {
-      const conclusion = clipText(block.slice(11), CURSOR_CONCLUSION_CHARS);
-      if (conclusion) memory.conclusions.push(conclusion);
+      const conclusion = block.slice(11).trim();
+      const turn = memory.turns.at(-1);
+      if (turn && !turn.conclusion) turn.conclusion = conclusion;
+      else if (conclusion) memory.turns.push({ userPrompt: "", conclusion });
     }
   }
   return memory;
@@ -737,7 +771,12 @@ async function main() {
           for (const item of completePendingTools(state)) send({ type: "item", item });
           if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
           recordSlimTurn(memory, originalMessage, extractTurnConclusion(state, result));
-          await saveSlimMemory(sessionKey, memory);
+          await summarizeSlimMemory(memory, request).catch((error) => {
+            process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          });
+          await saveSlimMemory(sessionKey, memory).catch((error) => {
+            process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          });
           send({ type: "done", usage: usage ?? result.usage });
           completed = true;
         } catch (error) {
@@ -785,6 +824,7 @@ export {
   CursorStartupTimeout,
   compactConversation,
   completePendingTools,
+  compressSlimMemory,
   createMessageState,
   createSlimMemory,
   cursorModelOptions,
@@ -805,5 +845,6 @@ export {
   recoveryHistory,
   seedSlimMemoryFromSession,
   sendPromptWithRecovery,
+  summarizeSlimMemory,
   withTimeout,
 };

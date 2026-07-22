@@ -5,6 +5,7 @@ const {
   CursorStartupTimeout,
   compactConversation,
   completePendingTools,
+  compressSlimMemory,
   createMessageState,
   createSlimMemory,
   cursorModelOptions,
@@ -246,10 +247,11 @@ const slim = createSlimMemory();
 assert.equal(isSlimMemoryEmpty(slim), true);
 recordSlimTurn(slim, "Build a restaurant", "Created the first version.");
 recordSlimTurn(slim, "Make it bright", "Changed the lighting.");
-assert.deepEqual(slim.userPrompts, ["Build a restaurant", "Make it bright"]);
-assert.deepEqual(slim.conclusions, ["Created the first version.", "Changed the lighting."]);
-assert.match(formatSlimMemory(slim), /Prior conclusions/);
-assert.match(formatSlimMemory(slim), /User prompts so far/);
+assert.deepEqual(slim.turns, [
+  { userPrompt: "Build a restaurant", conclusion: "Created the first version." },
+  { userPrompt: "Make it bright", conclusion: "Changed the lighting." },
+]);
+assert.match(formatSlimMemory(slim), /Recent turns/);
 const slimMessage = messageWithSlimMemory(
   { text: "Add animation", images: [{ data: "image", mimeType: "image/png" }] },
   slim,
@@ -261,8 +263,33 @@ assert.equal(messageWithSlimMemory("only current", createSlimMemory()), "only cu
 
 const seeded = createSlimMemory();
 ingestCompactHistory(seeded, compactConversation(conversation));
-assert.deepEqual(seeded.userPrompts, ["Build a restaurant", "Make it bright"]);
-assert.deepEqual(seeded.conclusions, ["Created the first version.", "Changed the lighting."]);
+assert.deepEqual(seeded.turns, [
+  { userPrompt: "Build a restaurant", conclusion: "Created the first version." },
+  { userPrompt: "Make it bright", conclusion: "Changed the lighting." },
+]);
+
+const compressible = createSlimMemory();
+for (let index = 1; index <= 20; index += 1) {
+  recordSlimTurn(compressible, `user prompt ${index}`, `conclusion ${index}`);
+}
+assert.equal(
+  await compressSlimMemory(compressible, async () => assert.fail("20 turns must not compress")),
+  false,
+);
+recordSlimTurn(compressible, "latest user prompt must remain exact", "latest conclusion");
+let summaryInput = "";
+assert.equal(await compressSlimMemory(compressible, async (input) => {
+  summaryInput = input;
+  return "Summary of the first twenty turns.";
+}), true);
+assert.match(summaryInput, /user prompt 1/);
+assert.match(summaryInput, /user prompt 20/);
+assert.doesNotMatch(summaryInput, /latest user prompt/);
+assert.equal(compressible.summary, "Summary of the first twenty turns.");
+assert.deepEqual(compressible.turns, [{
+  userPrompt: "latest user prompt must remain exact",
+  conclusion: "latest conclusion",
+}]);
 
 const conclusionState = createMessageState();
 conclusionState.texts.set("run-assistant-1", "Final answer from the assistant.");
