@@ -5530,6 +5530,8 @@ button.head-badge:hover {
   position: fixed;
   right: auto;
   bottom: auto;
+  /* Portal 挂在 body 下，必须高于 z-index: 100 的弹窗遮罩，否则菜单会在遮罩后方不可见、不可点击。 */
+  z-index: 120;
 }
 .mention-option {
   display: flex;
