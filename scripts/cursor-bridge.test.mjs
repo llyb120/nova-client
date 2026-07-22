@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
-const { CursorStartupTimeout, completePendingTools, createMessageState, cursorModelOptions, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, sendPromptWithRecovery, withTimeout } = await import("./cursor-bridge.mjs");
+const { CursorStartupTimeout, completePendingTools, createMessageState, cursorModelOptions, cursorTodoPlan, mapDelta, mapMessage, modelSelection, parseCliModels, promptMessage, recoverTimedOutAgent, sendPromptWithRecovery, withTimeout } = await import("./cursor-bridge.mjs");
 const state = createMessageState();
 
 assert.equal(mapMessage({ type: "assistant", run_id: "run", message: { content: [{ type: "text", text: "Hello" }] } }, state)[0].text, "Hello");
@@ -39,6 +39,18 @@ const deltaTool = mapDelta({ type: "tool-call-started", callId: "read", toolCall
 assert.equal(deltaTool.status, "in_progress");
 assert.deepEqual(deltaTool.arguments, { path: "README.md" });
 assert.equal(mapDelta({ type: "tool-call-completed", callId: "read", toolCall: { type: "read", result: { status: "success", value: "ok" } } }, deltaState, "delta").status, "completed");
+assert.deepEqual(cursorTodoPlan({ type: "updateTodos", args: { todos: [
+  { content: " Inspect repository ", status: "completed" },
+  { content: "Implement fix", status: "inProgress" },
+  { content: " ", status: "pending" },
+] } }), [
+  { content: "Inspect repository", status: "completed" },
+  { content: "Implement fix", status: "in_progress" },
+]);
+assert.deepEqual(cursorTodoPlan({ type: "updateTodos", args: { todos: [] }, result: { status: "success", value: { todos: [
+  { content: "Verify", status: "cancelled" },
+] } } }), [{ content: "Verify", status: "cancelled" }]);
+assert.equal(cursorTodoPlan({ type: "read", args: {} }), null);
 assert.deepEqual(parseCliModels("Available models\r\n\r\nauto - Auto (default)\r\ncursor-grok-4.5-high - Cursor Grok 4.5\r\ncomposer-2.5-fast - Composer 2.5 Fast\r\n"), [
   { id: "cursor-grok-4.5-high", displayName: "Cursor Grok 4.5" },
   { id: "composer-2.5-fast", displayName: "Composer 2.5 Fast" },

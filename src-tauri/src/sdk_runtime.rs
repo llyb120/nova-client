@@ -855,6 +855,7 @@ impl SdkManager {
                     );
                 }
                 Some("item") => self.apply_item(thread_id, &event["item"], &mut item_ids),
+                Some("plan") => self.apply_plan(thread_id, &event["plan"]),
                 Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
                 Some("permission") => self.emit_permission(thread_id, &event["permission"]),
                 Some("done") => {
@@ -1076,6 +1077,22 @@ impl SdkManager {
         if let Some(plan) = plan {
             let _ = self.emit_op(thread_id, json!({ "t": "plan", "plan": plan }));
         }
+        store.save();
+    }
+
+    fn apply_plan(&self, thread_id: &str, plan: &Value) {
+        let Some(entries) = plan.as_array() else {
+            return;
+        };
+        let plan = Value::Array(entries.clone());
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        let Some(thread) = store.get_mut(thread_id) else {
+            return;
+        };
+        thread.plan = Some(plan.clone());
+        thread.updated_at = now_ms();
+        let _ = self.emit_op(thread_id, json!({ "t": "plan", "plan": plan }));
         store.save();
     }
 
