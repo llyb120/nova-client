@@ -5,7 +5,7 @@ Alkaid 是一个基于 pi agent core 的轻量 coding agent，目标是少往返
 ## 当前能力
 
 - 使用 `@earendil-works/pi-agent-core` / `pi-ai` / `pi-coding-agent`（0.81+），工具执行策略固定为 `parallel`。
-- `read_files`：两个及以上路径已知的 UTF-8 文本文件优先走单次并行读取。
+- `read_files`：同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，强制合并为单次并行读取，禁止拆成多个原生 `read`。
 - `edit_files`：两个及以上互不依赖的已有文件优先走单次并行精确编辑，复用原生 `edit` 的唯一、非重叠文本替换语义。
 - 文件工具限制在当前工作区内，拒绝目录穿越和重复写目标。
 - Skills 使用 pi 的 `loadSkillsFromDir` + Agent Skills 标准目录格式；根目录为 `~/.nova/alkaid/skills`。模型按需用 `read` / `read_files` 加载完整 `SKILL.md`（不再提供自定义 `load_skill` 工具）。

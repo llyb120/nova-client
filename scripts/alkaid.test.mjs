@@ -295,7 +295,8 @@ test("system prompt keeps stable Alkaid policy before dynamic cwd/skills", () =>
   assert.ok(stableIndex >= 0);
   assert.ok(separatorIndex > stableIndex);
   assert.ok(cwdIndex > separatorIndex);
-  assert.match(prompt, /必须优先使用 read_files/);
+  assert.match(prompt, /必须在一次 read_files 调用中合并读取/);
+  assert.match(prompt, /禁止连续调用多个 read/);
 });
 
 test("openai prompt_cache_key fallback clamps session ids", () => {
@@ -360,9 +361,13 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.deepEqual(runtime.agent.state.tools.slice(0, 2).map((tool) => tool.name), ["read_files", "edit_files"]);
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "load_skill"));
-    assert.match(runtime.agent.state.systemPrompt, /读取文件遵循最小必要原则.*offset\/limit 只读取相关行段/);
+    assert.match(runtime.agent.state.systemPrompt, /读取内容遵循最小必要原则.*已知目标行范围时，只读取相关行段/);
     assert.match(runtime.agent.state.systemPrompt, /未知目标位置时，先用搜索工具定位行号/);
-    assert.match(runtime.agent.state.systemPrompt, /两个及以上路径已知.*必须优先使用 read_files/);
+    assert.match(runtime.agent.state.systemPrompt, /两个及以上路径已知.*必须在一次 read_files 调用中合并读取/);
+    assert.match(runtime.agent.state.systemPrompt, /禁止连续调用多个 read/);
+    assert.match(runtime.agent.state.systemPrompt, /禁止用并行封装的多个 read 代替 read_files/);
+    assert.match(runtime.agent.state.systemPrompt, /按顺序理解文件不构成读取依赖/);
+    assert.match(runtime.agent.state.systemPrompt, /后续新发现多个独立文本目标.*仍须合并使用 read_files/);
     assert.match(runtime.agent.state.systemPrompt, /为每个文件分别设置必要的 offset\/limit/);
     assert.match(runtime.agent.state.systemPrompt, /识别可独立验证的工程单元及其依赖关系/);
     assert.match(runtime.agent.state.systemPrompt, /不得用一个单元的验证代替其他受影响单元/);

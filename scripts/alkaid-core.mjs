@@ -153,7 +153,7 @@ export function createFilesystemTools(cwd, editTool = null) {
   const tools = [
     {
       name: "read_files",
-      description: `优先用于一次读取两个及以上路径已知的 UTF-8 文本文件；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行。可为每个文件指定 offset/limit，并用返回的 nextOffset 继续读取。`,
+      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行。请为每个文件按需指定 offset/limit，并用返回的 nextOffset 继续读取。`,
       parameters: Type.Object({
         paths: Type.Array(Type.Union([
           Type.String(),
@@ -265,7 +265,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
   const stableParts = [
     "你是 Alkaid：高效、简单、面向软件工程结果。",
     `Available tools:\n${toolLines.join("\n")}`,
-    "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。读取文件遵循最小必要原则：已知目标行范围时，必须通过 offset/limit 只读取相关行段；需要更多上下文时再按需读取相邻行段，不要无目的地读取整个文件。未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；大文件禁止一次性全量读取。读取两个及以上路径已知、互不依赖的 UTF-8 文本文件时，必须优先使用 read_files，并为每个文件分别设置必要的 offset/limit，不要连续调用多个单文件 read；只有目标路径依赖前一次结果、内容不是 UTF-8 文本，或仅需读取一个文件时才使用原生 read。修改两个及以上互不依赖的已有文件时必须优先使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
+    "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。每次准备读取前，先汇总当前已知目标：仅有一个目标时使用 read；同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，必须在一次 read_files 调用中合并读取，并为每个文件分别设置必要的 offset/limit。禁止连续调用多个 read，也禁止用并行封装的多个 read 代替 read_files；想按顺序理解文件不构成读取依赖。只有后一个目标的路径或读取范围必须由前一次结果确定、目标不是 UTF-8 文本，或当前确实仅需一个文件时，才使用 read。后续新发现多个独立文本目标时，下一读取阶段仍须合并使用 read_files。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；大文件禁止无目的全量读取。修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
     "完成修改后，必须基于仓库的依赖清单、工作区配置、构建脚本和 CI 配置识别可独立验证的工程单元及其依赖关系，并根据实际改动计算影响范围。对每个受影响单元运行成本最低且有效的检查；公共接口、共享代码、依赖、配置、代码生成或构建流程改动还必须覆盖受影响的使用方。不要预设语言、框架或架构，不得用一个单元的验证代替其他受影响单元。无法确定边界时扩大验证范围；无法执行时如实报告未验证范围、原因、建议命令和剩余风险。",
     options.shellConfig
