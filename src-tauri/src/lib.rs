@@ -98,6 +98,8 @@ pub struct AppState {
     pub cursorplus: Arc<SdkManager>,
     /// 额度租借会话的独立后端进程与临时凭证目录（只在本次运行内存在）。
     pub borrowed_runtimes: Mutex<HashMap<String, BorrowedRuntime>>,
+    /// 重启后按需重新申请额度凭证时的线程级互斥，避免连续发送重复创建隔离运行时。
+    pub restoring_borrowed_runtimes: Mutex<HashSet<String>>,
     pub relay: Arc<RelayManager>,
     pub config_dir: PathBuf,
     /// 用户最近一次操作的时间戳（ms）。前端把鼠标/键盘等交互节流上报到这里，
@@ -2833,6 +2835,19 @@ fn send_prompt(
     dispatch_prompt(&app, thread_id, text, images.unwrap_or_default())
 }
 
+fn append_thread_error(app: &tauri::AppHandle, thread_id: &str, error: String) {
+    let state = app.state::<AppState>();
+    {
+        let mut store = state.store.lock().unwrap();
+        let Some(thread) = store.get_mut(thread_id) else {
+            return;
+        };
+        thread.push_system(error, "error");
+        store.save();
+    }
+    let _ = app.emit(relay::EV_RELAY_RELOAD, json!({ "threadId": thread_id }));
+}
+
 pub(crate) fn dispatch_prompt(
     app: &tauri::AppHandle,
     thread_id: String,
@@ -2866,9 +2881,42 @@ pub(crate) fn dispatch_prompt(
         return state.relay.guest_send_prompt(&thread_id, text, images);
     }
     if is_quota {
-        let runtime = state.borrowed_runtime(&thread_id).ok_or(
-            "额度凭证已过期。为避免误用本机账号，本会话不会自动回退；请从首页重新发起额度租借。",
-        )?;
+        let Some(runtime) = state.borrowed_runtime(&thread_id) else {
+            let started = state
+                .restoring_borrowed_runtimes
+                .lock()
+                .unwrap()
+                .insert(thread_id.clone());
+            if !started {
+                return Err("额度会话正在恢复，请稍候再发送".into());
+            }
+            let restore_app = app.clone();
+            let restore_thread_id = thread_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = restore_app.state::<AppState>();
+                let result = state.relay.restore_quota_runtime(&restore_thread_id).await;
+                state
+                    .restoring_borrowed_runtimes
+                    .lock()
+                    .unwrap()
+                    .remove(&restore_thread_id);
+                match result {
+                    Ok(()) => {
+                        if let Err(error) =
+                            dispatch_prompt(&restore_app, restore_thread_id.clone(), text, images)
+                        {
+                            append_thread_error(&restore_app, &restore_thread_id, error);
+                        }
+                    }
+                    Err(error) => append_thread_error(
+                        &restore_app,
+                        &restore_thread_id,
+                        format!("额度会话恢复失败：{error}"),
+                    ),
+                }
+            });
+            return Ok(());
+        };
         match runtime.manager {
             BorrowedManager::Acp(manager) => {
                 if matches!(agent_kind, AgentKind::CodeBuddy | AgentKind::Cursor)
@@ -4999,6 +5047,7 @@ pub fn run() {
                 claudeplus,
                 cursorplus,
                 borrowed_runtimes: Mutex::new(HashMap::new()),
+                restoring_borrowed_runtimes: Mutex::new(HashSet::new()),
                 relay: relay.clone(),
                 config_dir: dir.clone(),
                 // 启动即视为一次活动，避免刚开机就触发静默升级

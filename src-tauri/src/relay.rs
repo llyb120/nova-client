@@ -1763,6 +1763,60 @@ impl RelayManager {
         );
     }
 
+    /// 程序重启会销毁内存中的隔离运行时和明文凭证。再次发送时向原提供方
+    /// 重新申请同一模型的额度租约，并用持久化的 provider session 恢复上下文。
+    pub async fn restore_quota_runtime(self: &Arc<Self>, thread_id: &str) -> Result<(), String> {
+        if self.cfg().is_none() {
+            return Err("未配置中转站 token".into());
+        }
+        if self
+            .app
+            .state::<AppState>()
+            .borrowed_runtime(thread_id)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let (peer, agent_kind, model) = {
+            let state = self.app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            let thread = store.get(thread_id).ok_or("线程不存在")?;
+            let peer = thread.quota_peer.clone().ok_or("该会话不是额度租借会话")?;
+            let model = thread
+                .model
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("额度会话缺少共享模型")?;
+            (peer, thread.agent_kind.clone(), model)
+        };
+        ensure_quota_backend_supported(&agent_kind)?;
+        let key = QuotaLeaseKey::new(peer, agent_kind.clone(), &model)?;
+        let bundle = self.acquire_quota_lease(key, model, None).await?;
+        let runtime = crate::credential_roaming::materialize_runtime(
+            self.app.clone(),
+            thread_id,
+            &agent_kind,
+            bundle,
+        )?;
+        let state = self.app.state::<AppState>();
+        let still_valid = {
+            let store = state.store.lock().unwrap();
+            store
+                .get(thread_id)
+                .is_some_and(|thread| thread.is_quota_borrowed() && thread.agent_kind == agent_kind)
+        };
+        if !still_valid {
+            runtime.shutdown().await;
+            return Err("额度会话已不存在或后端已变化".into());
+        }
+        state
+            .borrowed_runtimes
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), runtime);
+        Ok(())
+    }
+
     pub async fn prepare_quota_lease(
         self: &Arc<Self>,
         peer_token: String,
