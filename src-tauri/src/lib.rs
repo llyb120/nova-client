@@ -546,6 +546,25 @@ fn spawn_single_instance_focus_listener(app: &tauri::AppHandle) {
 /// 后端可用性检测完成事件：payload = { availability: { devin: bool, codex: bool, ... } }
 pub const EV_BACKENDS: &str = "backends:availability";
 
+/// 判断后端是否应出现在可选列表。
+/// Alkaid 是 Nova 内置后端，不应因 Windows 桌面进程暂时解析不到 Node.js 而被当成未安装；
+/// 真正启动 bridge 时仍会检查 Node.js，并返回明确错误。其他后端按 CLI 路径检测。
+fn backend_is_available(kind: &AgentKind, program: &str) -> bool {
+    kind == &AgentKind::Alkaid || acp::resolve_program_on_path(program).is_some()
+}
+
+#[cfg(test)]
+mod backend_availability_tests {
+    use super::{backend_is_available, AgentKind};
+
+    #[test]
+    fn alkaid_is_available_without_an_external_cli() {
+        let missing = "__nova_missing_backend_executable__";
+        assert!(backend_is_available(&AgentKind::Alkaid, missing));
+        assert!(!backend_is_available(&AgentKind::Devin, missing));
+    }
+}
+
 /// 并发检测各后端 CLI 是否可用：只在 PATH / 具体路径上解析可执行文件（不拉起进程、零成本，
 /// 对 Cursor 也不会产生任何用量）。结果写入 state 并广播，启动后与保存设置后各触发一次。
 fn spawn_backend_availability_check(app: tauri::AppHandle) {
@@ -554,8 +573,8 @@ fn spawn_backend_availability_check(app: tauri::AppHandle) {
             let state = app.state::<AppState>();
             let s = state.settings.lock().unwrap();
             vec![
-                // Alkaid 内置 PI bridge 不需要独立 CLI，但和其他 SDK bridge 一样需要 Node.js。
-                (AgentKind::Alkaid, "node".into()),
+                // Alkaid 是随 Nova 提供的内置后端；占位 program 不参与其可用性判定。
+                (AgentKind::Alkaid, String::new()),
                 (AgentKind::Devin, s.devin_path.clone()),
                 (AgentKind::Codex, s.codex_path.clone()),
                 (AgentKind::CodeBuddy, s.codebuddy_path.clone()),
@@ -569,7 +588,8 @@ fn spawn_backend_availability_check(app: tauri::AppHandle) {
             .into_iter()
             .map(|(kind, path)| {
                 tauri::async_runtime::spawn_blocking(move || {
-                    (kind, acp::resolve_program_on_path(&path).is_some())
+                    let available = backend_is_available(&kind, &path);
+                    (kind, available)
                 })
             })
             .collect();
