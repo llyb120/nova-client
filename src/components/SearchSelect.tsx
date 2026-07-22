@@ -457,7 +457,13 @@ export function SearchSelect(props: {
                 </div>
               </Show>
               <div class="sel-list sel-models">
-                <For each={shownModels()}>{(o) => itemRow(o, showingFavorites())}</For>
+                {/* 分开渲染收藏和普通后端，避免 For 复用模型行时残留后端标识。 */}
+                <Show
+                  when={showingFavorites()}
+                  fallback={<For each={shownModels()}>{(o) => itemRow(o)}</For>}
+                >
+                  <For each={shownModels()}>{(o) => itemRow(o, true)}</For>
+                </Show>
               </div>
             </div>
           </Show>
