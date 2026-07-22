@@ -554,6 +554,8 @@ fn spawn_backend_availability_check(app: tauri::AppHandle) {
             let state = app.state::<AppState>();
             let s = state.settings.lock().unwrap();
             vec![
+                // Alkaid 内置 PI bridge 不需要独立 CLI，但和其他 SDK bridge 一样需要 Node.js。
+                (AgentKind::Alkaid, "node".into()),
                 (AgentKind::Devin, s.devin_path.clone()),
                 (AgentKind::Codex, s.codex_path.clone()),
                 (AgentKind::CodeBuddy, s.codebuddy_path.clone()),

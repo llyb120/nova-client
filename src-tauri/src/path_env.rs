@@ -41,7 +41,13 @@ fn merge_paths<'a>(groups: impl IntoIterator<Item = &'a OsStr>) -> Option<OsStri
 #[cfg(windows)]
 fn init_windows_process_path() {
     let current = std::env::var_os("PATH");
-    let fallback = fallback_windows_path(std::env::var_os("USERPROFILE").map(PathBuf::from));
+    let fallback = fallback_windows_path(
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+        std::env::var_os("APPDATA").map(PathBuf::from),
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        std::env::var_os("ProgramFiles").map(PathBuf::from),
+        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+    );
     let mut groups = Vec::<&OsStr>::new();
     if let Some(path) = current.as_deref() {
         groups.push(path);
@@ -55,9 +61,32 @@ fn init_windows_process_path() {
 }
 
 #[cfg(any(windows, test))]
-fn fallback_windows_path(home: Option<PathBuf>) -> Option<OsString> {
-    let home = home?;
-    std::env::join_paths([home.join(".local/bin"), home.join(".opencode/bin")]).ok()
+fn fallback_windows_path(
+    home: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    program_files: Option<PathBuf>,
+    program_files_x86: Option<PathBuf>,
+) -> Option<OsString> {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        paths.push(home.join(".local/bin"));
+        paths.push(home.join(".opencode/bin"));
+    }
+    // npm 的 Windows 全局 shim 默认在 %APPDATA%\npm。终端可能通过 profile
+    // 临时补上它，但从开始菜单启动的 GUI 不会加载该 profile。
+    if let Some(app_data) = app_data {
+        paths.push(app_data.join("npm"));
+    }
+    if let Some(local_app_data) = local_app_data {
+        paths.push(local_app_data.join("Programs/nodejs"));
+    }
+    for root in [program_files, program_files_x86].into_iter().flatten() {
+        paths.push(root.join("nodejs"));
+    }
+    (!paths.is_empty())
+        .then(|| std::env::join_paths(paths).ok())
+        .flatten()
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -259,14 +288,32 @@ mod tests {
     }
 
     #[test]
-    fn windows_fallback_includes_claude_and_opencode_native_bins() {
+    fn windows_fallback_includes_common_cli_install_locations() {
         let home = PathBuf::from("C:/Users/professor");
-        let fallback = fallback_windows_path(Some(home.clone())).unwrap();
+        let app_data = home.join("AppData/Roaming");
+        let local_app_data = home.join("AppData/Local");
+        let program_files = PathBuf::from("C:/Program Files");
+        let program_files_x86 = PathBuf::from("C:/Program Files (x86)");
+        let fallback = fallback_windows_path(
+            Some(home.clone()),
+            Some(app_data.clone()),
+            Some(local_app_data.clone()),
+            Some(program_files.clone()),
+            Some(program_files_x86.clone()),
+        )
+        .unwrap();
         let paths: Vec<PathBuf> = std::env::split_paths(&fallback).collect();
 
         assert_eq!(
             paths,
-            vec![home.join(".local/bin"), home.join(".opencode/bin")]
+            vec![
+                home.join(".local/bin"),
+                home.join(".opencode/bin"),
+                app_data.join("npm"),
+                local_app_data.join("Programs/nodejs"),
+                program_files.join("nodejs"),
+                program_files_x86.join("nodejs"),
+            ]
         );
     }
 }
