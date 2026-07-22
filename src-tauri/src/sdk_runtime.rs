@@ -271,6 +271,7 @@ impl SdkManager {
         parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
         let mut request = json!({
             "action": "prompt",
+            "threadId": thread_id,
             "cwd": cwd,
             "sessionId": session_id,
             "restoreAt": native_restore.as_ref().map(|restore| &restore.position),

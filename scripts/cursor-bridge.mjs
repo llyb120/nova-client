@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline";
 import { Agent, Cursor } from "@cursor/sdk";
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { extname, join } from "node:path";
@@ -183,6 +183,18 @@ async function summarizeSlimMemory(memory, request, sdk = Agent) {
 
 function slimMemoryPath(sessionKey) {
   return join(CURSOR_SLIM_MEMORY_DIR, `${sessionKey}.json`);
+}
+
+function threadMemoryKey(threadId) {
+  if (!threadId) return undefined;
+  const identity = String(threadId);
+  const safeIdentity = /^[A-Za-z0-9_-]+$/.test(identity)
+    ? identity
+    : createHash("sha256").update(identity).digest("hex");
+  // Keep Nova thread ownership separate from Cursor provider session ids. Provider ids can
+  // occasionally be reused or restored incorrectly; they must never select another thread's
+  // compact memory file.
+  return `nova-thread-${safeIdentity}`;
 }
 
 async function loadSlimMemory(sessionKey) {
@@ -653,6 +665,7 @@ async function main() {
   });
   let agent;
   let sessionKey;
+  let memoryKey;
   let memory = createSlimMemory();
   while (!closed || requests.length) {
     if (!requests.length) await new Promise((resolve) => { wake = resolve; });
@@ -675,20 +688,20 @@ async function main() {
         agent.close();
         agent = undefined;
       }
-      if (!sessionKey) {
-        sessionKey = request.sessionId || randomUUID();
-        memory = await loadSlimMemory(sessionKey);
+      const ownedThreadKey = threadMemoryKey(request.threadId);
+      const nextSessionKey = ownedThreadKey || request.sessionId || sessionKey || randomUUID();
+      const nextMemoryKey = ownedThreadKey || nextSessionKey;
+      if (nextSessionKey !== sessionKey || nextMemoryKey !== memoryKey) {
+        if (memoryKey) await saveSlimMemory(memoryKey, memory);
+        sessionKey = nextSessionKey;
+        memoryKey = nextMemoryKey;
+        memory = await loadSlimMemory(memoryKey);
+        // Legacy provider-session memory is deliberately not loaded here: if Cursor reused or
+        // mis-restored that id, importing it would reproduce the exact cross-thread leak this
+        // ownership key prevents. SDK history is only a best-effort bootstrap for an empty key.
         if (isSlimMemoryEmpty(memory) && request.sessionId) {
           await seedSlimMemoryFromSession(memory, request.sessionId, request);
-          if (!isSlimMemoryEmpty(memory)) await saveSlimMemory(sessionKey, memory);
-        }
-      } else if (request.sessionId && request.sessionId !== sessionKey) {
-        await saveSlimMemory(sessionKey, memory);
-        sessionKey = request.sessionId;
-        memory = await loadSlimMemory(sessionKey);
-        if (isSlimMemoryEmpty(memory)) {
-          await seedSlimMemoryFromSession(memory, request.sessionId, request);
-          if (!isSlimMemoryEmpty(memory)) await saveSlimMemory(sessionKey, memory);
+          if (!isSlimMemoryEmpty(memory)) await saveSlimMemory(memoryKey, memory);
         }
       }
 
@@ -774,7 +787,7 @@ async function main() {
           await summarizeSlimMemory(memory, request).catch((error) => {
             process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
-          await saveSlimMemory(sessionKey, memory).catch((error) => {
+          await saveSlimMemory(memoryKey, memory).catch((error) => {
             process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
           send({ type: "done", usage: usage ?? result.usage });
@@ -846,5 +859,6 @@ export {
   seedSlimMemoryFromSession,
   sendPromptWithRecovery,
   summarizeSlimMemory,
+  threadMemoryKey,
   withTimeout,
 };

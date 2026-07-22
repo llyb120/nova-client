@@ -24,6 +24,7 @@ const {
   recordSlimTurn,
   recoverTimedOutAgent,
   sendPromptWithRecovery,
+  threadMemoryKey,
   withTimeout,
 } = await import("./cursor-bridge.mjs");
 const state = createMessageState();
@@ -101,6 +102,10 @@ assert.deepEqual(cursorModelOptions([
 ]);
 assert.deepEqual(await promptMessage([{ type: "text", text: "look" }, { type: "image_data", mime: "image/png", data: "base64" }]), { text: "look", images: [{ data: "base64", mimeType: "image/png" }] });
 assert.equal(await promptMessage([{ type: "text", text: "inspect" }, { type: "local_image", path: "C:/Users/1/Desktop/1.xlsx" }]), "inspect\n\nAttached file: C:/Users/1/Desktop/1.xlsx");
+assert.equal(threadMemoryKey("thread-a"), "nova-thread-thread-a");
+assert.notEqual(threadMemoryKey("thread-a"), threadMemoryKey("thread-b"));
+assert.match(threadMemoryKey("../unsafe/thread"), /^nova-thread-[a-f0-9]{64}$/);
+assert.equal(threadMemoryKey(undefined), undefined);
 
 const recoveryCalls = [];
 let sendAttempts = 0;
