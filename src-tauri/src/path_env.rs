@@ -41,16 +41,6 @@ fn merge_paths<'a>(groups: impl IntoIterator<Item = &'a OsStr>) -> Option<OsStri
 #[cfg(windows)]
 fn init_windows_process_path() {
     let current = std::env::var_os("PATH");
-    // Explorer 和 Nova 可能仍持有修改前的环境块。直接读取注册表中的最新系统/用户 Path，
-    // 让安装在 D 盘等自定义目录的 Node.js 无需注销 Windows 也能被 bridge 找到。
-    let system = registry_path(
-        windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE,
-        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
-    );
-    let user = registry_path(
-        windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
-        "Environment",
-    );
     let fallback = fallback_windows_path(
         std::env::var_os("USERPROFILE").map(PathBuf::from),
         std::env::var_os("APPDATA").map(PathBuf::from),
@@ -59,13 +49,6 @@ fn init_windows_process_path() {
         std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
     );
     let mut groups = Vec::<&OsStr>::new();
-    // 注册表值优先于进程继承的旧 PATH；当前进程中额外注入的目录仍保留在后面。
-    if let Some(path) = system.as_deref() {
-        groups.push(path);
-    }
-    if let Some(path) = user.as_deref() {
-        groups.push(path);
-    }
     if let Some(path) = current.as_deref() {
         groups.push(path);
     }
@@ -75,6 +58,24 @@ fn init_windows_process_path() {
     if let Some(path) = merge_paths(groups) {
         std::env::set_var("PATH", path);
     }
+}
+
+/// 读取注册表中的最新系统/用户 Path，仅供可执行文件解析兜底。
+/// 不写回 Nova 的全局 PATH，避免异常或陈旧注册表项影响 WebView2、DLL 和 shell shim。
+#[cfg(windows)]
+pub(crate) fn windows_registry_paths() -> Vec<PathBuf> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+
+    let system = registry_path(
+        HKEY_LOCAL_MACHINE,
+        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+    );
+    let user = registry_path(HKEY_CURRENT_USER, "Environment");
+    [system, user]
+        .into_iter()
+        .flatten()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .collect()
 }
 
 #[cfg(windows)]
