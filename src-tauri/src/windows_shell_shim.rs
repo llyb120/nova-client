@@ -16,6 +16,8 @@ const SHELL_SHIM_EXE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nova-she
 const CMD_REAL: &str = "NOVA_SHELL_SHIM_CMD_REAL";
 const POWERSHELL_REAL: &str = "NOVA_SHELL_SHIM_POWERSHELL_REAL";
 const PWSH_REAL: &str = "NOVA_SHELL_SHIM_PWSH_REAL";
+const BASH_REAL: &str = "NOVA_SHELL_SHIM_BASH_REAL";
+const BASH_SHIM: &str = "NOVA_SHELL_SHIM_BASH";
 
 #[derive(Clone)]
 struct ShellShim {
@@ -23,6 +25,7 @@ struct ShellShim {
     cmd: PathBuf,
     powershell: PathBuf,
     pwsh: Option<PathBuf>,
+    bash: Option<PathBuf>,
 }
 
 static SHELL_SHIM: OnceLock<Result<ShellShim, String>> = OnceLock::new();
@@ -54,6 +57,16 @@ pub(crate) fn real_powershell() -> PathBuf {
     } else {
         crate::acp::resolve_program_on_path("powershell").unwrap_or(path)
     }
+}
+
+fn real_bash() -> Option<PathBuf> {
+    ["ProgramFiles", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .map(|root| root.join("Git").join("bin").join("bash.exe"))
+        .find(|path| path.is_file())
+        .or_else(|| crate::acp::resolve_program_on_path("bash"))
 }
 
 fn content_key() -> String {
@@ -105,11 +118,18 @@ fn init(app: &AppHandle) -> Result<ShellShim, String> {
     if pwsh.is_some() {
         ensure_alias(&helper, &dir, "pwsh.exe")?;
     }
+    // Alkaid 的命令工具直接用绝对路径启动 Git Bash，单纯覆盖 PATH 无法拦截。
+    // 为它额外提供 bash helper 路径，并保留探测到的真实 bash 以避免递归。
+    let bash = real_bash();
+    if bash.is_some() {
+        ensure_alias(&helper, &dir, "bash.exe")?;
+    }
     Ok(ShellShim {
         dir,
         cmd: real_cmd(),
         powershell: real_powershell(),
         pwsh,
+        bash,
     })
 }
 
@@ -125,6 +145,10 @@ pub(crate) fn apply(
     command.env(POWERSHELL_REAL, &shim.powershell);
     if let Some(pwsh) = shim.pwsh.as_ref() {
         command.env(PWSH_REAL, pwsh);
+    }
+    if let Some(bash) = shim.bash.as_ref() {
+        command.env(BASH_REAL, bash);
+        command.env(BASH_SHIM, shim.dir.join("bash.exe"));
     }
 
     let base_path = launch_env
@@ -159,11 +183,13 @@ mod tests {
         let helper = write_helper(&root).unwrap();
         ensure_alias(&helper, &root, "cmd.exe").unwrap();
         ensure_alias(&helper, &root, "powershell.exe").unwrap();
+        ensure_alias(&helper, &root, "bash.exe").unwrap();
         assert_eq!(std::fs::read(root.join("cmd.exe")).unwrap(), SHELL_SHIM_EXE);
         assert_eq!(
             std::fs::read(root.join("powershell.exe")).unwrap(),
             SHELL_SHIM_EXE
         );
+        assert_eq!(std::fs::read(root.join("bash.exe")).unwrap(), SHELL_SHIM_EXE);
         std::fs::remove_dir_all(root).ok();
     }
 }

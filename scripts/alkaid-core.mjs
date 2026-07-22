@@ -309,6 +309,13 @@ function createAlkaidStreamFn() {
   });
 }
 
+export function resolveAlkaidShellConfig(shellConfig, env = process.env) {
+  const shim = env.NOVA_SHELL_SHIM_BASH;
+  return process.platform === "win32" && shim
+    ? { ...shellConfig, shell: shim }
+    : shellConfig;
+}
+
 function mcpResult(result) {
   const content = (result.content ?? []).flatMap((part) => {
     if (part.type === "text") return [{ type: "text", text: part.text }];
@@ -354,7 +361,8 @@ export async function createAlkaidAgent(options = {}) {
   const cwd = resolve(options.cwd ?? process.cwd());
   const { skills } = loadAlkaidSkills(options.skillsRoot ?? alkaidSkillsRoot());
   const mcp = await connectMcpServers(options.mcpServers, cwd);
-  const shellConfig = options.readOnly ? null : (options.shellConfig ?? getShellConfig());
+  const detectedShellConfig = options.readOnly ? null : (options.shellConfig ?? getShellConfig());
+  const shellConfig = detectedShellConfig && resolveAlkaidShellConfig(detectedShellConfig);
   const codingTools = options.readOnly
     ? createReadOnlyTools(cwd)
     : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell } });

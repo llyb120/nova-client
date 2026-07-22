@@ -20,6 +20,7 @@ import {
   injectOpenAIPromptCacheKey,
   isRetryableAlkaidProviderError,
   loadAlkaidSkills,
+  resolveAlkaidShellConfig,
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
 
@@ -350,6 +351,14 @@ test("plan mode exposes no write tool", async () => {
   } finally {
     await runtime.close();
   }
+});
+
+test("Windows shell shim overrides Alkaid's absolute Bash path", () => {
+  const detected = { shell: "C:\\Program Files\\Git\\bin\\bash.exe", args: ["-c"] };
+  const shim = "C:\\Nova\\runtime\\windows-shell-shim\\bash.exe";
+  const resolved = resolveAlkaidShellConfig(detected, { NOVA_SHELL_SHIM_BASH: shim });
+  if (process.platform === "win32") assert.deepEqual(resolved, { ...detected, shell: shim });
+  else assert.equal(resolved, detected);
 });
 
 test("build mode confirms and uses the detected Bash shell", async () => {

@@ -9,6 +9,7 @@ use std::process::{exit, Command, Stdio};
 const CMD_REAL: &str = "NOVA_SHELL_SHIM_CMD_REAL";
 const POWERSHELL_REAL: &str = "NOVA_SHELL_SHIM_POWERSHELL_REAL";
 const PWSH_REAL: &str = "NOVA_SHELL_SHIM_PWSH_REAL";
+const BASH_REAL: &str = "NOVA_SHELL_SHIM_BASH_REAL";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[link(name = "kernel32")]
@@ -63,6 +64,8 @@ fn real_shell_env() -> Option<&'static str> {
         Some(POWERSHELL_REAL)
     } else if stem.eq_ignore_ascii_case("pwsh") {
         Some(PWSH_REAL)
+    } else if stem.eq_ignore_ascii_case("bash") {
+        Some(BASH_REAL)
     } else {
         None
     }
