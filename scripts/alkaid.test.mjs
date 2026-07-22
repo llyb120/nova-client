@@ -279,6 +279,8 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.match(runtime.agent.state.systemPrompt, /未知目标位置时，先用搜索工具定位行号/);
     assert.match(runtime.agent.state.systemPrompt, /两个及以上路径已知.*必须优先使用 read_files/);
     assert.match(runtime.agent.state.systemPrompt, /为每个文件分别设置必要的 offset\/limit/);
+    assert.match(runtime.agent.state.systemPrompt, /识别可独立验证的工程单元及其依赖关系/);
+    assert.match(runtime.agent.state.systemPrompt, /不得用一个单元的验证代替其他受影响单元/);
     assert(runtime.agent.state.systemPrompt.includes(`命令终端已确认使用 Bash（${shellConfig.shell}）`));
     assert.match(runtime.agent.state.systemPrompt, /不要使用 PowerShell cmdlet/);
     const bash = runtime.agent.state.tools.find((tool) => tool.name === "bash");
