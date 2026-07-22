@@ -327,30 +327,55 @@ button {
   background: var(--accent-dim);
 }
 .clue-context-chip {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 7px;
-  margin: 8px 10px 0;
-  padding: 7px 10px;
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
-  border-radius: 8px;
-  color: var(--accent);
-  background: var(--accent-dim);
+  gap: 6px;
+  width: fit-content;
+  max-width: 100%;
+  height: 28px;
+  margin-bottom: 8px;
+  padding: 0 3px 0 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-panel));
   font-size: 12px;
 }
-.clue-context-chip span {
-  flex: 1;
+.clue-context-chip > svg {
+  flex: none;
+  color: var(--accent);
+}
+.clue-context-label {
+  flex: none;
+  color: var(--accent);
+  font-weight: 550;
+}
+.clue-context-separator {
+  flex: none;
+  width: 1px;
+  height: 12px;
+  background: color-mix(in srgb, var(--accent) 20%, var(--border-light));
+}
+.clue-context-title {
   min-width: 0;
+  max-width: min(420px, 55vw);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .clue-context-chip button {
-  display: inline-flex;
-  color: var(--text-dim);
+  display: inline-grid;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--text-faint);
+  transition: color 0.15s, background 0.15s;
 }
 .clue-context-chip button:hover {
   color: var(--text);
+  background: var(--bg-hover);
 }
 
 .thread-list {

@@ -695,10 +695,17 @@ export function HomeView() {
           <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
           <Show when={state.pendingClueCard}>
             {(clue) => (
-              <div class="clue-context-chip">
+              <div class="clue-context-chip" title={`引用线索：${clue().title}`}>
                 <IconClue size={13} />
-                <span>证据链 · {clue().title}</span>
-                <button type="button" title="移除线索上下文" onClick={clearPendingClueCard}>
+                <span class="clue-context-label">证据链</span>
+                <span class="clue-context-separator" aria-hidden="true" />
+                <span class="clue-context-title">{clue().title}</span>
+                <button
+                  type="button"
+                  aria-label="移除线索上下文"
+                  title="移除线索上下文"
+                  onClick={clearPendingClueCard}
+                >
                   <IconX size={12} />
                 </button>
               </div>
