@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidModelOptions, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
-import { alkaidPromptInput, alkaidUserMessage, connectMcpServers, createAlkaidAgent, createFilesystemTools, createSkillSupport } from "./alkaid-core.mjs";
+import { alkaidPromptInput, alkaidUserMessage, connectMcpServers, createAlkaidAgent, createFilesystemTools, createSkillSupport, isRetryableAlkaidProviderError, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 
 const configuredModel = {
   id: "gpt-test",
@@ -117,6 +117,46 @@ test("native steering messages preserve text and images", async () => {
     { type: "image", data: "image-data", mimeType: "image/png" },
   ]);
   assert.equal(typeof message.timestamp, "number");
+});
+
+test("provider stream disconnects retry silently and preserve context", async () => {
+  const user = { role: "user", content: [{ type: "text", text: "work" }], timestamp: Date.now() };
+  const failed = { role: "assistant", content: [], stopReason: "error", errorMessage: "terminated" };
+  const completed = { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" };
+  const retries = [];
+  const agent = {
+    state: { messages: [] },
+    async prompt() { this.state.messages.push(user, failed); },
+    async continue() { this.state.messages.push(completed); },
+  };
+  const outcome = await runAlkaidPromptWithRetry(agent, "work", [], {
+    retryDelaysMs: [1000, 3000],
+    sleep: async (delay) => retries.push(delay),
+    onRetry: ({ attempt, error }) => retries.push(`${attempt}:${error}`),
+  });
+  assert.equal(outcome.last, completed);
+  assert.equal(outcome.retries, 1);
+  assert.deepEqual(agent.state.messages, [user, completed]);
+  assert.deepEqual(retries, ["1:terminated", 1000]);
+  assert.equal(isRetryableAlkaidProviderError("TypeError: terminated"), true);
+  assert.equal(isRetryableAlkaidProviderError("HTTP 401 unauthorized"), false);
+});
+
+test("provider retries stop after the configured hidden attempts", async () => {
+  const failures = ["fetch failed", "ECONNRESET", "terminated"];
+  const user = { role: "user", content: [{ type: "text", text: "work" }], timestamp: Date.now() };
+  const agent = {
+    state: { messages: [] },
+    async prompt() { this.state.messages.push(user, { role: "assistant", stopReason: "error", errorMessage: failures.shift() }); },
+    async continue() { this.state.messages.push({ role: "assistant", stopReason: "error", errorMessage: failures.shift() }); },
+  };
+  const outcome = await runAlkaidPromptWithRetry(agent, "work", [], {
+    retryDelaysMs: [0, 0],
+    sleep: async () => {},
+  });
+  assert.equal(outcome.retries, 2);
+  assert.equal(outcome.last.errorMessage, "terminated");
+  assert.equal(agent.state.messages.length, 2);
 });
 
 test("batch file tools remain available as Alkaid enhancements", async () => {

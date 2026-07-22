@@ -10,6 +10,7 @@ import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const DEFAULT_BATCH_READ_LINES = 200;
+const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1000, 3000];
 const IMAGE_MEDIA_TYPES = {
   ".gif": "image/gif",
   ".jpeg": "image/jpeg",
@@ -62,6 +63,49 @@ export async function alkaidUserMessage(parts = []) {
     ],
     timestamp: Date.now(),
   };
+}
+
+export function isRetryableAlkaidProviderError(error) {
+  const message = String(error ?? "").toLowerCase();
+  return [
+    "terminated",
+    "fetch failed",
+    "socket hang up",
+    "econnreset",
+    "etimedout",
+    "econnaborted",
+    "epipe",
+    "und_err_socket",
+    "premature close",
+    "other side closed",
+    "network connection lost",
+  ].some((fragment) => message.includes(fragment));
+}
+
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+export async function runAlkaidPromptWithRetry(agent, input, images, options = {}) {
+  const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_PROVIDER_RETRY_DELAYS_MS;
+  const sleep = options.sleep ?? wait;
+  const isCancelled = options.isCancelled ?? (() => false);
+  let retries = 0;
+  await agent.prompt(input, images);
+  while (true) {
+    const last = agent.state.messages.at(-1);
+    if (last?.role !== "assistant" || last.stopReason !== "error") {
+      return { last, retries, cancelled: last?.role === "assistant" && last.stopReason === "aborted" };
+    }
+    if (retries >= retryDelaysMs.length || !isRetryableAlkaidProviderError(last.errorMessage)) {
+      return { last, retries, cancelled: false };
+    }
+    if (isCancelled()) return { last, retries, cancelled: true };
+    agent.state.messages = agent.state.messages.slice(0, -1);
+    options.onRetry?.({ attempt: retries + 1, error: last.errorMessage });
+    await sleep(retryDelaysMs[retries]);
+    retries += 1;
+    if (isCancelled()) return { last: agent.state.messages.at(-1), retries, cancelled: true };
+    await agent.continue();
+  }
 }
 
 async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES) {

@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent } from "./alkaid-core.mjs";
+import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -89,14 +89,16 @@ async function prompt(request, commands) {
   let thinking = "";
   let assistantId = `assistant-${randomUUID()}`;
   let thinkingId = `thinking-${randomUUID()}`;
-  let userMessageCount = 0;
+  let reuseAssistantIds = false;
+  let cancelled = false;
   const toolItems = new Map();
   runtime.agent.subscribe((event) => {
-    if (event.type === "message_start" && event.message.role === "user") {
-      userMessageCount += 1;
-      if (userMessageCount > 1) {
-        text = "";
-        thinking = "";
+    if (event.type === "message_start" && event.message.role === "assistant") {
+      text = "";
+      thinking = "";
+      if (reuseAssistantIds) {
+        reuseAssistantIds = false;
+      } else {
         assistantId = `assistant-${randomUUID()}`;
         thinkingId = `thinking-${randomUUID()}`;
       }
@@ -127,6 +129,7 @@ async function prompt(request, commands) {
       if (!line.trim()) continue;
       const command = JSON.parse(line);
       if (command.action === "cancel") {
+        cancelled = true;
         runtime.agent.abort();
         return;
       }
@@ -137,15 +140,24 @@ async function prompt(request, commands) {
   })().catch((error) => send({ type: "error", message: error instanceof Error ? error.message : String(error) }));
   try {
     send({ type: "ready", sessionId });
-    await runtime.agent.prompt(input.text, input.images);
-    const last = runtime.agent.state.messages.at(-1);
-    if (last?.role === "assistant" && last.stopReason === "error") {
+    const outcome = await runAlkaidPromptWithRetry(runtime.agent, input.text, input.images, {
+      isCancelled: () => cancelled,
+      onRetry: () => {
+        if (text) send({ type: "item", item: { id: assistantId, type: "agent_message", text: "" } });
+        if (thinking) send({ type: "item", item: { id: thinkingId, type: "reasoning", text: "" } });
+        text = "";
+        thinking = "";
+        reuseAssistantIds = true;
+      },
+    });
+    const last = outcome.last;
+    if (!outcome.cancelled && last?.role === "assistant" && last.stopReason === "error") {
       throw new Error(last.errorMessage || "Alkaid provider 请求失败");
     }
     await saveMessages(sessionId, runtime.agent.state.messages);
     send({
       type: "done",
-      cancelled: last?.role === "assistant" && last.stopReason === "aborted",
+      cancelled: outcome.cancelled,
       usage: last?.role === "assistant" ? last.usage : undefined,
     });
   } finally {
