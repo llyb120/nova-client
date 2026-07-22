@@ -41,16 +41,6 @@ fn merge_paths<'a>(groups: impl IntoIterator<Item = &'a OsStr>) -> Option<OsStri
 #[cfg(windows)]
 fn init_windows_process_path() {
     let current = std::env::var_os("PATH");
-    // Explorer 和 Nova 可能仍持有修改前的环境块。直接读取注册表中的最新系统/用户 Path，
-    // 让安装在 D 盘等自定义目录的 Node.js 无需注销 Windows 也能被 bridge 找到。
-    let system = registry_path(
-        windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE,
-        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
-    );
-    let user = registry_path(
-        windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
-        "Environment",
-    );
     let fallback = fallback_windows_path(
         std::env::var_os("USERPROFILE").map(PathBuf::from),
         std::env::var_os("APPDATA").map(PathBuf::from),
@@ -59,13 +49,6 @@ fn init_windows_process_path() {
         std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
     );
     let mut groups = Vec::<&OsStr>::new();
-    // 注册表值优先于进程继承的旧 PATH；当前进程中额外注入的目录仍保留在后面。
-    if let Some(path) = system.as_deref() {
-        groups.push(path);
-    }
-    if let Some(path) = user.as_deref() {
-        groups.push(path);
-    }
     if let Some(path) = current.as_deref() {
         groups.push(path);
     }
@@ -75,55 +58,6 @@ fn init_windows_process_path() {
     if let Some(path) = merge_paths(groups) {
         std::env::set_var("PATH", path);
     }
-}
-
-#[cfg(windows)]
-fn registry_path(
-    root: windows_sys::Win32::System::Registry::HKEY,
-    subkey: &str,
-) -> Option<OsString> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ};
-
-    let subkey: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-    let value: Vec<u16> = "Path".encode_utf16().chain(std::iter::once(0)).collect();
-    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
-    let mut bytes = 0u32;
-    let status = unsafe {
-        RegGetValueW(
-            root,
-            subkey.as_ptr(),
-            value.as_ptr(),
-            flags,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut bytes,
-        )
-    };
-    if status != 0 || bytes < 2 {
-        return None;
-    }
-    let mut buffer = vec![0u16; (bytes as usize + 1) / 2];
-    let status = unsafe {
-        RegGetValueW(
-            root,
-            subkey.as_ptr(),
-            value.as_ptr(),
-            flags,
-            std::ptr::null_mut(),
-            buffer.as_mut_ptr().cast(),
-            &mut bytes,
-        )
-    };
-    if status != 0 {
-        return None;
-    }
-    let len = (bytes as usize / 2).min(buffer.len());
-    buffer.truncate(len);
-    while buffer.last() == Some(&0) {
-        buffer.pop();
-    }
-    (!buffer.is_empty()).then(|| OsString::from_wide(&buffer))
 }
 
 #[cfg(any(windows, test))]
