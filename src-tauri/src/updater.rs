@@ -1,6 +1,6 @@
 //! 自更新：从 GitHub Releases 检查最新版本。
 //!
-//! 流程：「静默下载 + 角标提示」→ 用户确认后 `apply_staged`。
+//! 流程：后台静默下载暂存；桌面端由用户确认后 `apply_staged`，无头模式空闲时直接应用。
 //!
 //! Release 资产约定：
 //! - Windows：`nova-{version}.zip`（内含 `Nova.exe`）
@@ -899,6 +899,11 @@ fn restore_old_exe(target: &Path, old: &Path) {
 fn spawn_installed_app(target: &Path) -> Result<(), String> {
     let install_dir = target.parent().ok_or("target has no parent")?;
     let mut cmd = Command::new(target);
+    // 更新 helper 继承当前进程的 NOVA_HEADLESS 与 Server 配置环境。重启时仍需显式带上
+    // `server`，让新进程重新创建自己的 Xvfb，并继续以无头模式运行，而不是误启桌面端。
+    if crate::server::is_headless() {
+        cmd.arg("server");
+    }
     cmd.current_dir(install_dir);
     #[cfg(windows)]
     {
@@ -1164,6 +1169,58 @@ pub async fn download_and_stage(app: AppHandle) -> Result<Value, String> {
     Ok(json!({ "ready": true, "version": latest }))
 }
 
+#[cfg(unix)]
+fn install_headless_in_place(
+    current_exe: &Path,
+    new_exe: &Path,
+    extract_dir: &Path,
+    marker_file: &Path,
+    error_log: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe_name = current_exe
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or("当前可执行文件名不可用")?;
+    let old = current_exe.with_file_name(format!("{exe_name}.old"));
+    let source_len = std::fs::metadata(new_exe)
+        .map_err(|error| format!("读取新版文件失败:{error}"))?
+        .len();
+
+    remove_file_if_exists(&old);
+    std::fs::rename(current_exe, &old)
+        .map_err(|error| format!("备份当前版本失败:{error}"))?;
+    let install_result = (|| -> Result<(), String> {
+        let written = std::fs::copy(new_exe, current_exe)
+            .map_err(|error| format!("写入新版本失败:{error}"))?;
+        if written != source_len {
+            return Err(format!("新版文件写入不完整:{written}/{source_len}"));
+        }
+        let mut permissions = std::fs::metadata(current_exe)
+            .map_err(|error| format!("读取新版权限失败:{error}"))?
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o755);
+        std::fs::set_permissions(current_exe, permissions)
+            .map_err(|error| format!("设置新版执行权限失败:{error}"))?;
+        copy_extras(
+            extract_dir,
+            current_exe.parent().ok_or("安装目录不可用")?,
+            new_exe,
+        );
+        Ok(())
+    })();
+    if let Err(error) = install_result {
+        restore_old_exe(current_exe, &old);
+        return Err(error);
+    }
+
+    remove_file_if_exists(marker_file);
+    remove_file_if_exists(error_log);
+    let _ = std::fs::remove_dir_all(extract_dir);
+    Ok(())
+}
+
 /// 应用已暂存的更新：替换 exe 并重启。
 pub async fn apply_staged(app: AppHandle) -> Result<(), String> {
     let _operation = UPDATE_OPERATION_LOCK.lock().await;
@@ -1197,8 +1254,33 @@ pub async fn apply_staged(app: AppHandle) -> Result<(), String> {
         state.store.lock().unwrap().save_now();
     }
 
-    // 让暂存目录里的新版先进入 helper 模式。旧进程退出并释放文件锁后，
-    // helper 再完成替换、校验和正式重启。
+    // Linux/Unix 无头服务可在进程仍运行时替换磁盘上的自身文件。先完成安装再退出，避免
+    // systemd 在 helper 尚未替换完时清理同一 cgroup。systemd 环境用非零码兼容
+    // Restart=on-failure/always；直接从终端启动时则自行拉起新的 `Nova server`。
+    #[cfg(unix)]
+    if crate::server::is_headless() {
+        install_headless_in_place(
+            &current_exe,
+            &new_exe,
+            &extract_dir,
+            &marker_file,
+            &error_log,
+        )?;
+        let managed_by_systemd = std::env::var_os("INVOCATION_ID").is_some();
+        if !managed_by_systemd {
+            spawn_installed_app(&current_exe)?;
+        }
+        let _ = app.emit(
+            EV_PROGRESS,
+            json!({ "phase": "restarting", "downloaded": 1, "total": 1, "version": marker.version }),
+        );
+        let code = if managed_by_systemd { 75 } else { 0 };
+        app.exit(code);
+        std::process::exit(code);
+    }
+
+    // 桌面端（以及非 Unix 平台）让暂存目录里的新版先进入 helper 模式。旧进程退出并
+    // 释放文件锁后，helper 再完成替换、校验和正式重启。
     let old = current_exe.with_file_name(format!("{exe_name}.old"));
     spawn_update_helper(
         &new_exe,

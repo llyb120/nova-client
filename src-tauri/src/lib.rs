@@ -5123,63 +5123,68 @@ pub fn run() {
                 }
             });
 
-            // 自动更新：检测 + 静默下载暂存放在后端 tokio 定时器里跑（每 10 分钟，不只启动时）。
-            // 放后端而非前端 setInterval：WebView 计时器在窗口最小化/隐藏时会被严重节流甚至暂停，
-            // 表现为「只有启动时才检测、之后角标一直不出现」。tokio 定时器不受影响，稳定触发；
-            // 检测到新版本就静默下载暂存，就绪后发 update:available 事件，前端据此显示可更新角标。
-            if !server::is_headless() {
-                let update_app = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    use tokio::time::{sleep, Duration};
-                    sleep(Duration::from_secs(3)).await; // 稍等，避开启动高峰（拉会话/连中转站）
-                    loop {
-                        if let Ok(info) = updater::check(&update_app).await {
-                            if info["hasUpdate"].as_bool().unwrap_or(false) {
-                                if info["staged"].as_bool().unwrap_or(false) {
-                                    // 已暂存好（上次会话或本次刚下完）：直接通知前端显示角标
+            // 自动更新：桌面端和无头模式都由后端 tokio 定时检测并静默下载暂存（每 10 分钟）。
+            // 放后端而非前端 setInterval：WebView 计时器在窗口最小化/隐藏时会被严重节流甚至暂停；
+            // 无头模式则根本没有前端。桌面端下载就绪后额外发事件显示可更新角标。
+            let update_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tokio::time::{sleep, Duration};
+                sleep(Duration::from_secs(3)).await; // 稍等，避开启动高峰（拉会话/连中转站）
+                loop {
+                    if let Ok(info) = updater::check(&update_app).await {
+                        if info["hasUpdate"].as_bool().unwrap_or(false) {
+                            if info["staged"].as_bool().unwrap_or(false) {
+                                if !server::is_headless() {
+                                    // 已暂存好（上次会话或本次刚下完）：通知桌面端显示角标
                                     let _ = update_app.emit(updater::EV_AVAILABLE, info);
-                                } else if let Ok(res) =
-                                    updater::download_and_stage(update_app.clone()).await
+                                }
+                            } else if let Ok(res) =
+                                updater::download_and_stage(update_app.clone()).await
+                            {
+                                if res["ready"].as_bool().unwrap_or(false)
+                                    && !server::is_headless()
                                 {
-                                    if res["ready"].as_bool().unwrap_or(false) {
-                                        if let Ok(info2) = updater::check(&update_app).await {
-                                            let _ = update_app.emit(updater::EV_AVAILABLE, info2);
-                                        }
+                                    if let Ok(info2) = updater::check(&update_app).await {
+                                        let _ = update_app.emit(updater::EV_AVAILABLE, info2);
                                     }
                                 }
                             }
                         }
-                        sleep(Duration::from_secs(10 * 60)).await;
                     }
-                });
-            }
+                    sleep(Duration::from_secs(10 * 60)).await;
+                }
+            });
 
-            // 空闲提示更新（取代原「强制静默自动升级」）：新版本已下载好、且当前空闲
-            //（没有任何会话在运行、没有员工任务在执行）时，主动弹窗让用户选择是否现在更新，
-            // 而不是自动替换重启。每个版本每次运行只弹一次；用户「稍后」则不再打扰。
-            if !server::is_headless() {
-                let prompt_app = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    use tokio::time::{sleep, Duration};
-                    let mut prompted: Option<String> = None;
-                    sleep(Duration::from_secs(60)).await;
-                    loop {
-                        if let Some(ver) = updater::staged_upgrade_version(&prompt_app) {
-                            let idle = {
-                                let state = prompt_app.state::<AppState>();
-                                !any_session_running(&state) && !any_employee_working(&state)
-                            };
-                            if idle && prompted.as_deref() != Some(ver.as_str()) {
+            // 已暂存新版本且当前空闲（没有会话运行、没有员工任务执行）时：桌面端弹窗确认；
+            // 无头模式没有可交互前端，因此满足同样条件后直接应用并重启。桌面端每版本只提示一次。
+            let prompt_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tokio::time::{sleep, Duration};
+                let mut prompted: Option<String> = None;
+                sleep(Duration::from_secs(60)).await;
+                loop {
+                    if let Some(ver) = updater::staged_upgrade_version(&prompt_app) {
+                        let idle = {
+                            let state = prompt_app.state::<AppState>();
+                            !any_session_running(&state) && !any_employee_working(&state)
+                        };
+                        if idle {
+                            if server::is_headless() {
+                                eprintln!("[nova-server] 空闲，正在自动更新至 {ver}");
+                                if let Err(error) = updater::apply_staged(prompt_app.clone()).await {
+                                    eprintln!("[nova-server] 自动更新失败：{error}");
+                                }
+                            } else if prompted.as_deref() != Some(ver.as_str()) {
                                 if let Ok(info) = updater::check(&prompt_app).await {
                                     let _ = prompt_app.emit(updater::EV_PROMPT, info);
                                     prompted = Some(ver);
                                 }
                             }
                         }
-                        sleep(Duration::from_secs(60)).await;
                     }
-                });
-            }
+                    sleep(Duration::from_secs(60)).await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

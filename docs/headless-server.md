@@ -82,7 +82,10 @@ Nova server config show
 服务运行期间执行 `config set/unset` 会即时生效：Relay 配置会自动重连；agent 路径、代理、
 启用状态和 `env.<NAME>` 变化会让受影响的 agent 在下次使用时按新配置启动，无需重启 Nova。
 
-检查和安装 Nova Server 更新：
+Nova Server 与桌面端一样会在后台定期检查并下载更新；当没有会话运行、也没有员工任务执行时，
+无头模式会跳过确认并直接安装、重启。安装目录必须对运行 Nova 的用户可写。
+
+也可以手动检查和安装：
 
 ```bash
 Nova server update --check
@@ -90,7 +93,7 @@ Nova server update
 ```
 
 更新命令按当前 Linux 架构下载 `nova-linux-{arch}-{version}.zip`，替换当前二进制并保留
-`.old` 备份。安装在 `/usr/bin` 等系统目录时需要相应写权限；更新完成后需重启服务。
+`.old` 备份。安装在 `/usr/bin` 等系统目录时需要相应写权限；手动更新完成后需重启服务。
 
 ## systemd
 
