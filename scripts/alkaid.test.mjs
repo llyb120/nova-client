@@ -250,7 +250,10 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.equal(runtime.agent.steeringMode, "all");
     assert.deepEqual(runtime.agent.state.tools.slice(0, 2).map((tool) => tool.name), ["read_files", "edit_files"]);
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
+    assert.match(runtime.agent.state.systemPrompt, /读取文件遵循最小必要原则.*offset\/limit 只读取相关行段/);
+    assert.match(runtime.agent.state.systemPrompt, /未知目标位置时，先用搜索工具定位行号/);
     assert.match(runtime.agent.state.systemPrompt, /两个及以上路径已知.*必须优先使用 read_files/);
+    assert.match(runtime.agent.state.systemPrompt, /为每个文件分别设置必要的 offset\/limit/);
     assert(runtime.agent.state.systemPrompt.includes(`命令终端已确认使用 Bash（${shellConfig.shell}）`));
     assert.match(runtime.agent.state.systemPrompt, /不要使用 PowerShell cmdlet/);
     const bash = runtime.agent.state.tools.find((tool) => tool.name === "bash");
