@@ -8,7 +8,7 @@
 //! 工具条目只同步展示摘要，所有请求体均 gzip，响应由 reqwest 自动解 gzip。
 
 use crate::relay::{gzip_json, resolve_relay_server};
-use crate::threads::{AgentKind, Item, Thread};
+use crate::threads::{AgentKind, Item, PromptImage, Thread};
 use crate::{delete_thread, is_running, AppState, SCRATCH_MARK};
 use base64::Engine;
 use reqwest::Client;
@@ -115,6 +115,8 @@ struct RemoteCommand {
     mode: String,
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    images: Vec<PromptImage>,
     #[serde(default)]
     path: String,
     #[serde(default)]
@@ -1128,6 +1130,28 @@ mod tests {
     }
 
     #[test]
+    fn remote_command_accepts_prompt_attachments() {
+        let command: RemoteCommand = serde_json::from_value(json!({
+            "id": 7,
+            "type": "send",
+            "threadId": "thread-1",
+            "text": "inspect",
+            "images": [{
+                "name": "screen.png",
+                "mimeType": "image/png",
+                "data": "aW1hZ2U=",
+                "size": 5
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(command.images.len(), 1);
+        assert_eq!(command.images[0].name, "screen.png");
+        assert_eq!(command.images[0].mime_type, "image/png");
+        assert_eq!(command.images[0].data.as_deref(), Some("aW1hZ2U="));
+    }
+
+    #[test]
     fn remote_file_path_normalizes_slash_prefixed_windows_drive() {
         assert_eq!(
             normalize_remote_file_path(" /D:/code/nova/file.rs "),
@@ -1219,13 +1243,13 @@ async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult 
     }
     match cmd.kind.as_str() {
         "create" => match create_thread(app, cmd).and_then(|thread| {
-            send_prompt(app, &thread.id, &cmd.text)?;
+            send_prompt(app, &thread.id, &cmd.text, cmd.images.clone())?;
             Ok(thread.id)
         }) {
             Ok(id) => ok_thread(id),
             Err(e) => fail(e),
         },
-        "send" => match send_prompt(app, &cmd.thread_id, &cmd.text) {
+        "send" => match send_prompt(app, &cmd.thread_id, &cmd.text, cmd.images.clone()) {
             Ok(()) => ok_thread(cmd.thread_id.clone()),
             Err(e) => fail(e),
         },
@@ -1750,9 +1774,14 @@ fn make_scratch_dir() -> Result<String, String> {
     Ok(dir.to_string_lossy().to_string())
 }
 
-fn send_prompt(app: &AppHandle, thread_id: &str, text: &str) -> Result<(), String> {
-    if text.trim().is_empty() {
-        return Err("内容不能为空".into());
+fn send_prompt(
+    app: &AppHandle,
+    thread_id: &str,
+    text: &str,
+    images: Vec<PromptImage>,
+) -> Result<(), String> {
+    if text.trim().is_empty() && images.is_empty() {
+        return Err("内容和附件不能同时为空".into());
     }
     let state = app.state::<AppState>();
     {
@@ -1764,7 +1793,7 @@ fn send_prompt(app: &AppHandle, thread_id: &str, text: &str) -> Result<(), Strin
     }
     // 复用本地聊天的唯一分发入口：运行中的 Alkaid/Codex/Devin 走原生引导，
     // Cursor 走打断后新 turn（Agent.create + slim memory），与桌面输入框保持一致。
-    crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), Vec::new())
+    crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), images)
 }
 
 async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
