@@ -21,6 +21,7 @@ import {
   injectOpenAIPromptCacheKey,
   isRetryableAlkaidProviderError,
   loadAlkaidSkills,
+  mergeAlkaidUsage,
   resolveAlkaidShellConfig,
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
@@ -158,6 +159,13 @@ test("native steering messages preserve text and images", async () => {
     { type: "image", data: "image-data", mimeType: "image/png" },
   ]);
   assert.equal(typeof message.timestamp, "number");
+});
+
+test("usage is accumulated across every model request in an agent turn", () => {
+  const first = mergeAlkaidUsage(undefined, { input: 100, output: 20, cacheRead: 300, cacheWrite: 40 });
+  const total = mergeAlkaidUsage(first, { input: 500, output: 30, cacheRead: 200, cacheWrite: 0 });
+  assert.deepEqual(total, { input: 600, output: 50, cacheRead: 500, cacheWrite: 40 });
+  assert.equal(mergeAlkaidUsage(undefined, undefined), undefined);
 });
 
 test("provider stream disconnects retry silently and preserve context", async () => {

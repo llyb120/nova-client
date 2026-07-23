@@ -97,6 +97,16 @@ export function isRetryableAlkaidProviderError(error) {
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+/** PI reports usage per model request, so a tool-using agent turn must sum every assistant message. */
+export function mergeAlkaidUsage(total, usage) {
+  if (!usage) return total;
+  const merged = total ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
+    merged[key] += Number.isFinite(usage[key]) ? usage[key] : 0;
+  }
+  return merged;
+}
+
 export async function runAlkaidPromptWithRetry(agent, input, images, options = {}) {
   const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_PROVIDER_RETRY_DELAYS_MS;
   const sleep = options.sleep ?? wait;

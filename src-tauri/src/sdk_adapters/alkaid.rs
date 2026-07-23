@@ -69,7 +69,16 @@ impl SdkAdapter for AlkaidAdapter {
         let Some(output) = usage.get("output").and_then(Value::as_u64) else {
             return (None, None);
         };
-        (Some(canonical_usage(input, output)), None)
+        // PI exposes uncached input separately; cached reads/writes are still input tokens.
+        let cached_input = usage
+            .get("cacheRead")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0));
+        (
+            Some(canonical_usage(input.saturating_add(cached_input), output)),
+            None,
+        )
     }
 }
 

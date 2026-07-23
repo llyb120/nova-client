@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, expandAlkaidSkillCommand, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, expandAlkaidSkillCommand, mergeAlkaidUsage, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -91,8 +91,12 @@ async function prompt(request, commands) {
   let thinkingId = `thinking-${randomUUID()}`;
   let reuseAssistantIds = false;
   let cancelled = false;
+  let usage;
   const toolItems = new Map();
   runtime.agent.subscribe((event) => {
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      usage = mergeAlkaidUsage(usage, event.message.usage);
+    }
     if (event.type === "message_start" && event.message.role === "assistant") {
       text = "";
       thinking = "";
@@ -162,7 +166,7 @@ async function prompt(request, commands) {
     send({
       type: "done",
       cancelled: outcome.cancelled,
-      usage: last?.role === "assistant" ? last.usage : undefined,
+      usage,
     });
   } finally {
     await runtime.close();

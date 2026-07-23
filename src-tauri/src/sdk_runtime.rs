@@ -1491,7 +1491,7 @@ mod tests {
         TextSnapshotChange,
     };
     use crate::sdk_adapters::{
-        ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter, SdkAdapter,
+        AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter, SdkAdapter,
     };
     use crate::threads::{now_ms, AgentKind, CodexUsageSnapshot, Item, Thread, ToolCall};
     use serde_json::json;
@@ -1591,6 +1591,22 @@ mod tests {
         let (mismatched, _) =
             CodexAdapter.normalize_usage(Some(&raw), Some(&other_session), Some("thread-1"));
         assert!(mismatched.is_none());
+    }
+
+    #[test]
+    fn alkaid_usage_includes_pi_cached_input() {
+        let raw = json!({
+            "input": 100,
+            "output": 20,
+            "cacheRead": 300,
+            "cacheWrite": 40
+        });
+        let (usage, _) = AlkaidAdapter.normalize_usage(Some(&raw), None, None);
+
+        assert_eq!(
+            usage,
+            Some(json!({ "inputTokens": 440, "outputTokens": 20, "totalTokens": 460 }))
+        );
     }
 
     #[test]
