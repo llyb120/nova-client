@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, expandAlkaidSkillCommand, mergeAlkaidUsage, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { appendSlimTurn, compactSlimMemory, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion } from "./alkaid-slim-memory.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -25,17 +26,52 @@ async function loadMessages(sessionId) {
   return JSON.parse(await readFile(sessionPath(sessionId), "utf8").catch(() => "[]"));
 }
 
-async function saveMessages(sessionId, messages) {
+async function saveJson(path, value) {
   await mkdir(sessionRoot, { recursive: true });
-  const path = sessionPath(sessionId);
   const temp = `${path}.${process.pid}.tmp`;
   try {
-    await writeFile(temp, JSON.stringify(messages), "utf8");
+    await writeFile(temp, JSON.stringify(value), "utf8");
     await rename(temp, path);
   } catch (error) {
     await unlink(temp).catch(() => {});
     throw error;
   }
+}
+
+async function saveMessages(sessionId, messages) {
+  await saveJson(sessionPath(sessionId), messages);
+}
+
+const slimMemoryPath = (sessionId) => sessionPath(sessionId).replace(/\.json$/, ".slim.json");
+
+async function loadSlimMemory(sessionId) {
+  if (!sessionId) return createSlimMemory();
+  try {
+    const parsed = JSON.parse(await readFile(slimMemoryPath(sessionId), "utf8"));
+    return Array.isArray(parsed?.turns)
+      ? { summary: String(parsed.summary ?? ""), turns: parsed.turns }
+      : createSlimMemory();
+  } catch {
+    return createSlimMemory();
+  }
+}
+
+async function saveSlimMemory(sessionId, memory) {
+  await saveJson(slimMemoryPath(sessionId), { version: 1, ...memory });
+}
+
+function messageWithSlimMemory(text, memory) {
+  const context = formatSlimMemory(memoryWithoutCurrent(memory));
+  if (!context) return text;
+  return [
+    "请仅使用下面的精简记忆延续会话。完整工具轨迹和原始对话已被有意省略。",
+    "不要要求用户重复之前的要求；结合记忆和当前请求继续工作。",
+    "",
+    context,
+    "",
+    "当前请求：",
+    text,
+  ].join("\n");
 }
 
 function startedToolItem(event) {
@@ -75,6 +111,40 @@ async function prompt(request, commands) {
   const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
   const resolved = resolveAlkaidModel(config, request.model);
   const sessionId = request.sessionId || randomUUID();
+  const slimContext = request.vegaSlimContext === true;
+  let memory = createSlimMemory();
+  if (slimContext) {
+    memory = await loadSlimMemory(sessionId);
+    if (!memory.summary && !memory.turns.length && request.sessionId) {
+      seedSlimMemoryFromMessages(memory, await loadMessages(request.sessionId));
+    }
+    appendSlimTurn(memory, input.text);
+    await compactSlimMemory(memory, async (earlier) => {
+      const summaryRuntime = await createAlkaidAgent({
+        cwd: request.cwd,
+        model: resolved.model,
+        apiKey: resolved.apiKey,
+        thinkingLevel: resolved.thinkingLevel ?? request.reasoningEffort,
+      });
+      let summary = "";
+      summaryRuntime.agent.subscribe((event) => {
+        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+          summary += event.assistantMessageEvent.delta;
+        }
+      });
+      try {
+        await summaryRuntime.agent.prompt([
+          "请把下面较早的会话记忆压缩成供另一个编码 Agent 使用的摘要。",
+          "保留用户意图、决策、改动文件、关键标识、约束和未完成事项；不要照抄对话或添加评论。",
+          "",
+          earlier,
+        ].join("\n"));
+        return summary;
+      } finally {
+        await summaryRuntime.close();
+      }
+    }, { maxChars: Math.max(8_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.75)) });
+  }
   const runtime = await createAlkaidAgent({
     cwd: request.cwd,
     model: resolved.model,
@@ -82,7 +152,7 @@ async function prompt(request, commands) {
     thinkingLevel: resolved.thinkingLevel ?? request.reasoningEffort,
     mcpServers: await mcpServers(),
     sessionId,
-    messages: await loadMessages(request.sessionId),
+    messages: slimContext ? [] : await loadMessages(request.sessionId),
     readOnly: request.mode === "plan",
   });
   let text = "";
@@ -140,7 +210,10 @@ async function prompt(request, commands) {
       if (command.action === "steer") {
         const message = await alkaidUserMessage(command.parts);
         const textPart = message.content.find((part) => part.type === "text");
-        if (textPart) textPart.text = await expandAlkaidSkillCommand(textPart.text, runtime.skills);
+        if (textPart) {
+          if (slimContext) appendSlimTurn(memory, textPart.text);
+          textPart.text = await expandAlkaidSkillCommand(textPart.text, runtime.skills);
+        }
         runtime.agent.steer(message);
       }
     }
@@ -148,7 +221,8 @@ async function prompt(request, commands) {
   try {
     send({ type: "ready", sessionId });
     const expandedText = await expandAlkaidSkillCommand(input.text, runtime.skills);
-    const outcome = await runAlkaidPromptWithRetry(runtime.agent, expandedText, input.images, {
+    const promptText = slimContext ? messageWithSlimMemory(expandedText, memory) : expandedText;
+    const outcome = await runAlkaidPromptWithRetry(runtime.agent, promptText, input.images, {
       isCancelled: () => cancelled,
       onRetry: () => {
         if (text) send({ type: "item", item: { id: assistantId, type: "agent_message", text: "" } });
@@ -162,13 +236,21 @@ async function prompt(request, commands) {
     if (!outcome.cancelled && last?.role === "assistant" && last.stopReason === "error") {
       throw new Error(last.errorMessage || "Vega provider 请求失败");
     }
-    await saveMessages(sessionId, runtime.agent.state.messages);
+    if (slimContext) {
+      if (!outcome.cancelled && last?.role === "assistant" && last.stopReason !== "error") {
+        setLatestConclusion(memory, last.content);
+      }
+      await saveSlimMemory(sessionId, memory);
+    } else {
+      await saveMessages(sessionId, runtime.agent.state.messages);
+    }
     send({
       type: "done",
       cancelled: outcome.cancelled,
       usage,
     });
   } finally {
+    if (slimContext) await saveSlimMemory(sessionId, memory).catch(() => {});
     await runtime.close();
   }
 }

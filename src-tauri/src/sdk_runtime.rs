@@ -269,6 +269,14 @@ impl SdkManager {
             }
         }
         parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
+        let vega_slim_context = self.adapter.agent_kind() == AgentKind::Alkaid
+            && self
+                .app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap()
+                .vega_slim_context_enabled;
         let mut request = json!({
             "action": "prompt",
             "threadId": thread_id,
@@ -278,6 +286,7 @@ impl SdkManager {
             "model": model,
             "mode": mode,
             "reasoningEffort": reasoning_effort,
+            "vegaSlimContext": vega_slim_context,
             "parts": parts
         });
         let mut outcome = self

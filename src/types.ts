@@ -340,6 +340,8 @@ export interface Settings {
   codexProxy: string;
   /** Windows shell 启动 shim（保存后重启应用生效） */
   windowsShellShimEnabled: boolean;
+  /** Vega 精简上下文：仅保留用户提示词与结论，旧轮次自动摘要 */
+  vegaSlimContextEnabled: boolean;
   defaultMode: string;
   /** 自动生成会话标题所用后端（devin/codex/codebuddy/...，空 = devin） */
   titleModelAgent: string;
