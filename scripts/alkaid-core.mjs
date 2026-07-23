@@ -11,10 +11,11 @@ import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createReadStream, existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1000, 3000];
@@ -37,13 +38,8 @@ function resolveInputPath(root, input) {
   return resolve(root, input);
 }
 
-function safeEditPath(root, input) {
-  const path = resolveInputPath(root, input);
-  const rel = relative(root, path);
-  if (rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(rel)) {
-    throw new Error(`编辑路径超出工作区: ${input}`);
-  }
-  return path;
+function resolveEditPath(root, input) {
+  return resolveInputPath(root, input);
 }
 
 function alkaidDataRoot(home = homedir(), env = process.env) {
@@ -204,21 +200,55 @@ export function createFilesystemTools(cwd, editTool = null) {
   if (editTool) {
     tools.push({
       name: "edit_files",
-      description: "并行精确编辑多个互不依赖的文件。每个文件的 edits 使用与原生 edit 相同的唯一、非重叠 oldText 精确替换；同一路径不可重复。",
+      description: "并行智能编辑多个互不依赖的文件。先精确匹配，再通过稀有行锚点按 rstrip、Unicode、相对缩进和保守模糊评分逐级定位；歧义或重叠时拒绝，所有文件验证成功后才并行写入。",
       parameters: Type.Object({
         files: Type.Array(Type.Object({
           path: Type.String(),
           edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }), { minItems: 1 }),
         }), { minItems: 1 }),
       }),
-      async execute(id, { files }, signal) {
-        const targets = files.map((file) => safeEditPath(root, file.path));
-        if (new Set(targets).size !== targets.length) throw new Error("edit_files 包含重复目标路径");
-        const edited = await Promise.all(files.map(async (file, index) => {
-          await editTool.execute(`${id}-${index}`, file, signal);
-          return file.path;
+      async execute(_id, { files }, signal) {
+        const grouped = new Map();
+        for (const file of files) {
+          const target = resolveEditPath(root, file.path);
+          const existing = grouped.get(target);
+          if (existing) existing.edits.push(...file.edits);
+          else grouped.set(target, { path: file.path, target, edits: [...file.edits] });
+        }
+        const targets = [...grouped.values()];
+        if (signal?.aborted) throw new Error("Operation aborted");
+
+        // Read and locate every edit against immutable snapshots before writing any file.
+        // Repeated path entries are one patch target; the patch algorithm decides whether
+        // their edits are uniquely locatable and non-overlapping.
+        const prepared = await Promise.all(targets.map(async (file) => {
+          const raw = await readFile(file.target, "utf8");
+          const bom = raw.startsWith("\uFEFF") ? "\uFEFF" : "";
+          const withoutBom = bom ? raw.slice(1) : raw;
+          const lineEnding = withoutBom.includes("\r\n") ? "\r\n" : "\n";
+          const normalized = withoutBom.replace(/\r\n/g, "\n");
+          const result = applySmartEdits(normalized, file.edits, file.path);
+          return {
+            path: file.path,
+            target: file.target,
+            original: raw,
+            output: bom + (lineEnding === "\r\n" ? result.content.replace(/\n/g, "\r\n") : result.content),
+            matches: result.matches,
+          };
         }));
-        return textResult(`已并行编辑 ${edited.length} 个文件`, { paths: edited });
+        if (signal?.aborted) throw new Error("Operation aborted");
+
+        const writes = await Promise.allSettled(prepared.map((file) => writeFile(file.target, file.output, "utf8")));
+        const failed = writes.findIndex((result) => result.status === "rejected");
+        if (failed >= 0) {
+          await Promise.allSettled(prepared.map((file, index) =>
+            writes[index].status === "fulfilled" ? writeFile(file.target, file.original, "utf8") : Promise.resolve()));
+          throw writes[failed].reason;
+        }
+        return textResult(`已并行智能编辑 ${prepared.length} 个文件`, {
+          paths: prepared.map((file) => file.path),
+          matches: prepared.map((file) => ({ path: file.path, edits: file.matches })),
+        });
       },
     });
   }
@@ -305,7 +335,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
   const skills = options.skills ?? [];
   const toolLines = [
     `- read_files: 并行读取多个 UTF-8 文本文件（可带 offset/limit）`,
-    options.readOnly ? null : "- edit_files: 并行精确编辑多个互不依赖的已有文件",
+    options.readOnly ? null : "- edit_files: 并行智能编辑多个互不依赖的已有文件（精确优先、锚点定位、歧义拒绝）",
     "- read: 读取单个文件",
     options.readOnly
       ? "- grep / find / ls: 只读搜索与列举"

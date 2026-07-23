@@ -29,6 +29,7 @@ import {
   resolveAlkaidShellConfig,
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
+import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 
 const configuredModel = {
   id: "gpt-test",
@@ -229,6 +230,61 @@ test("batch file tools remain available as Alkaid enhancements", async () => {
   assert.deepEqual(await Promise.all([readFile(join(cwd, "a.txt"), "utf8"), readFile(join(cwd, "b.txt"), "utf8")]), ["AA", "BB"]);
 });
 
+test("smart edits use normalized anchors and preserve the matched indentation", () => {
+  const source = [
+    "function outer() {",
+    "    if (ready) {   ",
+    "        log(“old”);",
+    "    }",
+    "}",
+  ].join("\n");
+  const result = applySmartEdits(source, [{
+    oldText: "if (ready) {\n    log(\"old\");\n}",
+    newText: "if (ready) {\n    log(\"new\");\n}",
+  }], "sample.js");
+  assert.equal(result.matches[0].mode, "relative-indent");
+  assert.match(result.content, /    if \(ready\) \{\n        log\(\"new\"\);\n    \}/);
+});
+
+test("smart edits require the complete relative indentation shape", () => {
+  const source = [
+    "function outer() {",
+    "      if (ready) {",
+    "          work();",
+    "      }",
+    "}",
+  ].join("\n");
+  const result = applySmartEdits(source, [{
+    oldText: "if (ready) {\n    work();\n}",
+    newText: "if (ready) {\n    done();\n}",
+  }], "relative.js");
+  assert.equal(result.matches[0].mode, "relative-indent");
+  assert.match(result.content, /      if \(ready\) \{\n          done\(\);\n      \}/);
+});
+
+test("smart edits reject fuzzy ambiguity", () => {
+  const source = [
+    "function first() {", "  calculate(invoiceSubtotal, regionalTax, shippingFee, discountCode, currencyA);", "}",
+    "function second() {", "  calculate(invoiceSubtotal, regionalTax, shippingFee, discountCode, currencyB);", "}",
+  ].join("\n");
+  assert.throws(() => applySmartEdits(source, [{
+    oldText: "calculate(invoiceSubtotal, regionalTax, shippingFee, discountCode, currencyC);",
+    newText: "return total;",
+  }], "ambiguous.js"), /Ambiguous fuzzy match/);
+});
+
+test("batch smart edits validate every file before writing", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "alkaid-smart-transaction-"));
+  await Promise.all([writeFile(join(cwd, "a.txt"), "alpha"), writeFile(join(cwd, "b.txt"), "beta")]);
+  const editTool = createCodingTools(cwd).find((tool) => tool.name === "edit");
+  const [, editFiles] = createFilesystemTools(cwd, editTool);
+  await assert.rejects(() => editFiles.execute("1", { files: [
+    { path: "a.txt", edits: [{ oldText: "alpha", newText: "changed" }] },
+    { path: "b.txt", edits: [{ oldText: "missing", newText: "changed" }] },
+  ] }), /Could not find/);
+  assert.deepEqual(await Promise.all([readFile(join(cwd, "a.txt"), "utf8"), readFile(join(cwd, "b.txt"), "utf8")]), ["alpha", "beta"]);
+});
+
 test("batch reads stream large files in pages", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-page-"));
   await writeFile(join(cwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
@@ -245,7 +301,7 @@ test("batch reads stream large files in pages", async () => {
   assert.equal(second.nextOffset, 221);
 });
 
-test("read tools allow paths outside the workspace while batch edits remain restricted", async () => {
+test("batch file tools allow absolute paths outside the workspace", async () => {
   const parent = await mkdtemp(join(tmpdir(), "alkaid-paths-"));
   const cwd = join(parent, "workspace");
   await mkdir(cwd);
@@ -261,13 +317,25 @@ test("read tools allow paths outside the workspace while batch edits remain rest
   assert.deepEqual(JSON.parse((await readFiles.execute("2", { paths: [outside] })).content[0].text), [
     { path: outside, content: "outside" },
   ]);
-  await assert.rejects(() => editFiles.execute("3", { files: [
+  const absoluteInside = join(cwd, "x.txt");
+  await editFiles.execute("3", { files: [
+    { path: absoluteInside, edits: [{ oldText: "x", newText: "inside" }] },
+  ] });
+  assert.equal(await readFile(absoluteInside, "utf8"), "inside");
+  await editFiles.execute("4", { files: [
     { path: outside, edits: [{ oldText: "outside", newText: "changed" }] },
-  ] }), /超出工作区/);
-  await assert.rejects(() => editFiles.execute("4", { files: [
-    { path: "x.txt", edits: [{ oldText: "x", newText: "1" }] },
-    { path: "x.txt", edits: [{ oldText: "x", newText: "2" }] },
-  ] }), /重复/);
+  ] });
+  assert.equal(await readFile(outside, "utf8"), "changed");
+  await writeFile(absoluteInside, "alpha\nbeta\ngamma");
+  await editFiles.execute("5", { files: [
+    { path: "x.txt", edits: [{ oldText: "alpha", newText: "ALPHA" }] },
+    { path: absoluteInside, edits: [{ oldText: "gamma", newText: "GAMMA" }] },
+  ] });
+  assert.equal(await readFile(absoluteInside, "utf8"), "ALPHA\nbeta\nGAMMA");
+  await assert.rejects(() => editFiles.execute("6", { files: [
+    { path: "x.txt", edits: [{ oldText: "ALPHA\nbeta", newText: "first" }] },
+    { path: absoluteInside, edits: [{ oldText: "beta\nGAMMA", newText: "second" }] },
+  ] }), /overlap/);
 });
 
 test("skills are discovered via pi loadSkillsFromDir", async () => {
