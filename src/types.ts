@@ -192,6 +192,9 @@ export interface TurnItem {
   totalTokens?: number | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
+  /** 后端支持时提供缓存读取/写入 token 明细 */
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
   /** Auto 模式在本轮实际使用的模型及推理档位 */
   actualModel?: string | null;
   stopReason: string;

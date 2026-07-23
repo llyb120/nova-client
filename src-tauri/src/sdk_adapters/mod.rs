@@ -84,10 +84,22 @@ pub trait SdkAdapter: Send + Sync {
     ) -> (Option<Value>, Option<CodexUsageSnapshot>);
 }
 
-fn canonical_usage(input: u64, output: u64) -> Value {
-    json!({
+fn canonical_usage(
+    input: u64,
+    output: u64,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+) -> Value {
+    let mut usage = json!({
         "inputTokens": input,
         "outputTokens": output,
         "totalTokens": input.saturating_add(output),
-    })
+    });
+    if let Some(value) = cache_read {
+        usage["cacheReadTokens"] = value.into();
+    }
+    if let Some(value) = cache_write {
+        usage["cacheWriteTokens"] = value.into();
+    }
+    usage
 }

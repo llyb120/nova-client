@@ -182,7 +182,11 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
   const tokenTitle = () => {
     const t = props.group.turn;
     if (!t?.totalTokens) return undefined;
-    return `输入 ${fmtTokens(t.inputTokens ?? 0)} / 输出 ${fmtTokens(t.outputTokens ?? 0)} tokens`;
+    const parts = [`输入 ${fmtTokens(t.inputTokens ?? 0)}`];
+    if (t.cacheReadTokens != null) parts.push(`缓存读取 ${fmtTokens(t.cacheReadTokens)}`);
+    if (t.cacheWriteTokens != null) parts.push(`缓存写入 ${fmtTokens(t.cacheWriteTokens)}`);
+    parts.push(`输出 ${fmtTokens(t.outputTokens ?? 0)} tokens`);
+    return parts.join(" / ");
   };
 
   return (

@@ -65,10 +65,20 @@ impl SdkAdapter for CodexAdapter {
         let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) else {
             return (None, None);
         };
+        let cache_read = usage
+            .get("cached_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_write = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let snapshot = CodexUsageSnapshot {
             session_id: session_id.map(str::to_string),
             input_tokens: input,
             output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
         };
         let Some(previous) = codex_baseline.filter(|previous| {
             previous.session_id.as_deref() == session_id
@@ -81,6 +91,10 @@ impl SdkAdapter for CodexAdapter {
             Some(canonical_usage(
                 input - previous.input_tokens,
                 output - previous.output_tokens,
+                (cache_read >= previous.cache_read_tokens)
+                    .then_some(cache_read - previous.cache_read_tokens),
+                (cache_write >= previous.cache_write_tokens)
+                    .then_some(cache_write - previous.cache_write_tokens),
             )),
             Some(snapshot),
         )

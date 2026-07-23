@@ -1561,6 +1561,8 @@ mod tests {
             session_id: Some("thread-1".into()),
             input_tokens: 1_000,
             output_tokens: 100,
+            cache_read_tokens: 200,
+            cache_write_tokens: 0,
         };
         let (usage, snapshot) = CodexAdapter.normalize_usage(
             Some(&json!({
@@ -1575,9 +1577,17 @@ mod tests {
 
         assert_eq!(
             usage,
-            Some(json!({ "inputTokens": 600, "outputTokens": 80, "totalTokens": 680 }))
+            Some(json!({
+                "inputTokens": 600,
+                "outputTokens": 80,
+                "totalTokens": 680,
+                "cacheReadTokens": 300,
+                "cacheWriteTokens": 0
+            }))
         );
-        assert_eq!(snapshot.unwrap().input_tokens, 1_600);
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.input_tokens, 1_600);
+        assert_eq!(snapshot.cache_read_tokens, 500);
     }
 
     #[test]
@@ -1591,6 +1601,7 @@ mod tests {
             session_id: Some("thread-0".into()),
             input_tokens: 1_000,
             output_tokens: 100,
+            ..Default::default()
         };
         let (mismatched, _) =
             CodexAdapter.normalize_usage(Some(&raw), Some(&other_session), Some("thread-1"));
@@ -1609,7 +1620,13 @@ mod tests {
 
         assert_eq!(
             usage,
-            Some(json!({ "inputTokens": 440, "outputTokens": 20, "totalTokens": 460 }))
+            Some(json!({
+                "inputTokens": 440,
+                "outputTokens": 20,
+                "totalTokens": 460,
+                "cacheReadTokens": 300,
+                "cacheWriteTokens": 40
+            }))
         );
     }
 
@@ -1625,7 +1642,13 @@ mod tests {
 
         assert_eq!(
             usage,
-            Some(json!({ "inputTokens": 440, "outputTokens": 20, "totalTokens": 460 }))
+            Some(json!({
+                "inputTokens": 440,
+                "outputTokens": 20,
+                "totalTokens": 460,
+                "cacheReadTokens": 300,
+                "cacheWriteTokens": 40
+            }))
         );
     }
 
@@ -1641,7 +1664,13 @@ mod tests {
             let (usage, _) = adapter.normalize_usage(Some(&raw), None, None);
             assert_eq!(
                 usage,
-                Some(json!({ "inputTokens": 440, "outputTokens": 20, "totalTokens": 460 }))
+                Some(json!({
+                    "inputTokens": 440,
+                    "outputTokens": 20,
+                    "totalTokens": 460,
+                    "cacheReadTokens": 300,
+                    "cacheWriteTokens": 40
+                }))
             );
         }
 

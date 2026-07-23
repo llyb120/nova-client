@@ -55,18 +55,15 @@ fn normalize_claude_usage(usage: Option<&Value>) -> (Option<Value>, Option<Codex
     let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) else {
         return (None, None);
     };
+    let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let cache_write = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
     let input = input
-        .saturating_add(
-            usage
-                .get("cache_read_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        )
-        .saturating_add(
-            usage
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        );
-    (Some(canonical_usage(input, output)), None)
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(cache_write.unwrap_or(0));
+    (
+        Some(canonical_usage(input, output, cache_read, cache_write)),
+        None,
+    )
 }
