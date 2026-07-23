@@ -59,14 +59,44 @@ pub(crate) fn real_powershell() -> PathBuf {
     }
 }
 
-fn real_bash() -> Option<PathBuf> {
-    ["ProgramFiles", "ProgramFiles(x86)"]
-        .into_iter()
-        .filter_map(std::env::var_os)
-        .map(PathBuf::from)
-        .map(|root| root.join("Git").join("bin").join("bash.exe"))
-        .find(|path| path.is_file())
-        .or_else(|| crate::acp::resolve_program_on_path("bash"))
+fn find_executable_on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn find_bash_on_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    // 先尊重应用启动环境中的 PATH。Git for Windows 通常只把 Git\cmd（git.exe）
+    // 加入 PATH，因此 bash.exe 不一定能以裸命令找到；这种情况再从 git.exe 反推 Git 根目录。
+    find_executable_on_path("bash.exe", path).or_else(|| {
+        find_executable_on_path("git.exe", path).and_then(|git| {
+            let bash = git.parent()?.parent()?.join("bin").join("bash.exe");
+            bash.is_file().then_some(bash)
+        })
+    })
+}
+
+fn real_bash(launch_env: &HashMap<String, String>) -> Option<PathBuf> {
+    let launch_path = launch_env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| std::ffi::OsStr::new(value));
+
+    launch_path
+        .and_then(find_bash_on_path)
+        .or_else(|| {
+            std::env::var_os("PATH")
+                .as_deref()
+                .and_then(find_bash_on_path)
+        })
+        .or_else(|| {
+            ["ProgramFiles", "ProgramFiles(x86)"]
+                .into_iter()
+                .filter_map(std::env::var_os)
+                .map(PathBuf::from)
+                .map(|root| root.join("Git").join("bin").join("bash.exe"))
+                .find(|path| path.is_file())
+        })
 }
 
 fn content_key() -> String {
@@ -104,7 +134,7 @@ fn ensure_alias(helper: &Path, dir: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn init(app: &AppHandle) -> Result<ShellShim, String> {
+fn init(app: &AppHandle, launch_env: &HashMap<String, String>) -> Result<ShellShim, String> {
     let dir = crate::nova_data_dir(app)
         .join("runtime")
         .join("windows-shell-shim")
@@ -120,7 +150,7 @@ fn init(app: &AppHandle) -> Result<ShellShim, String> {
     }
     // Alkaid 的命令工具直接用绝对路径启动 Git Bash，单纯覆盖 PATH 无法拦截。
     // 为它额外提供 bash helper 路径，并保留探测到的真实 bash 以避免递归。
-    let bash = real_bash();
+    let bash = real_bash(launch_env);
     if bash.is_some() {
         ensure_alias(&helper, &dir, "bash.exe")?;
     }
@@ -140,7 +170,7 @@ pub(crate) fn apply(
     command: &mut tokio::process::Command,
     launch_env: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let shim = SHELL_SHIM.get_or_init(|| init(app)).clone()?;
+    let shim = SHELL_SHIM.get_or_init(|| init(app, launch_env)).clone()?;
     command.env(CMD_REAL, &shim.cmd);
     command.env(POWERSHELL_REAL, &shim.powershell);
     if let Some(pwsh) = shim.pwsh.as_ref() {
@@ -171,6 +201,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finds_git_bash_from_path_before_fixed_install_locations() {
+        let root = std::env::temp_dir().join(format!("nova-git-path-{}", uuid::Uuid::new_v4()));
+        let cmd = root.join("cmd");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&cmd).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(cmd.join("git.exe"), b"git").unwrap();
+        std::fs::write(bin.join("bash.exe"), b"bash").unwrap();
+
+        assert_eq!(
+            find_bash_on_path(cmd.as_os_str()),
+            Some(bin.join("bash.exe"))
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn embedded_helper_is_windows_executable() {
         assert!(SHELL_SHIM_EXE.starts_with(b"MZ"));
         assert!(SHELL_SHIM_EXE.len() < 2 * 1024 * 1024);
@@ -189,7 +236,10 @@ mod tests {
             std::fs::read(root.join("powershell.exe")).unwrap(),
             SHELL_SHIM_EXE
         );
-        assert_eq!(std::fs::read(root.join("bash.exe")).unwrap(), SHELL_SHIM_EXE);
+        assert_eq!(
+            std::fs::read(root.join("bash.exe")).unwrap(),
+            SHELL_SHIM_EXE
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }
