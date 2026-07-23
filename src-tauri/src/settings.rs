@@ -50,6 +50,8 @@ pub struct Settings {
     pub codex_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
+    /// Vega 使用类似 Cursor 的精简上下文：仅携带用户提示词和轮次结论，并自动摘要旧轮次。
+    pub vega_slim_context_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,
     /// 自动生成会话标题所用的后端（devin/codex/codebuddy/...，空 = devin）。
@@ -140,6 +142,7 @@ impl Default for Settings {
             codex_args: "app-server --stdio".into(),
             codex_proxy: String::new(),
             windows_shell_shim_enabled: false,
+            vega_slim_context_enabled: false,
             default_mode: String::new(),
             title_model_agent: "devin".into(),
             title_model: "swe-1-6".into(),
@@ -188,6 +191,11 @@ mod tests {
     #[test]
     fn windows_shell_shim_is_disabled_by_default() {
         assert!(!Settings::default().windows_shell_shim_enabled);
+    }
+
+    #[test]
+    fn vega_slim_context_is_disabled_by_default() {
+        assert!(!Settings::default().vega_slim_context_enabled);
     }
 
     #[test]

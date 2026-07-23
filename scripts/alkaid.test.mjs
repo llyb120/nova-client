@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
+import { appendSlimTurn, compactSlimMemory, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion } from "./alkaid-slim-memory.mjs";
 import {
   alkaidPromptInput,
   alkaidSkillsRoot,
@@ -163,6 +164,47 @@ test("native steering messages preserve text and images", async () => {
     { type: "image", data: "image-data", mimeType: "image/png" },
   ]);
   assert.equal(typeof message.timestamp, "number");
+});
+
+test("Vega slim context keeps 20 conclusions and preserves interrupted prompts", async () => {
+  const memory = createSlimMemory();
+  for (let index = 1; index <= 20; index += 1) {
+    appendSlimTurn(memory, `prompt ${index}`);
+    setLatestConclusion(memory, [{ type: "text", text: `conclusion ${index}` }]);
+  }
+  assert.equal(await compactSlimMemory(memory, async () => assert.fail("20 turns must remain")), false);
+
+  appendSlimTurn(memory, "interrupted prompt");
+  appendSlimTurn(memory, "replacement prompt");
+  const sentContext = formatSlimMemory(memoryWithoutCurrent(memory));
+  assert.match(sentContext, /interrupted prompt/);
+  assert.doesNotMatch(sentContext, /replacement prompt/);
+  setLatestConclusion(memory, [{ type: "text", text: "latest conclusion" }]);
+
+  let summaryInput = "";
+  assert.equal(await compactSlimMemory(memory, async (input) => {
+    summaryInput = input;
+    return "older summary";
+  }), true);
+  assert.match(summaryInput, /prompt 1/);
+  assert.doesNotMatch(summaryInput, /latest conclusion/);
+  assert.equal(memory.summary, "older summary");
+  assert.equal(memory.turns.length, 1);
+  assert.deepEqual(memory.turns[0], {
+    userPrompts: ["interrupted prompt", "replacement prompt"],
+    conclusion: "latest conclusion",
+  });
+});
+
+test("Vega slim context also compresses at the context character limit", async () => {
+  const memory = createSlimMemory();
+  for (let index = 1; index <= 3; index += 1) {
+    appendSlimTurn(memory, `long prompt ${index} ${"x".repeat(100)}`);
+    setLatestConclusion(memory, [{ type: "text", text: `conclusion ${index}` }]);
+  }
+  assert.equal(await compactSlimMemory(memory, async () => "size summary", { maxChars: 80 }), true);
+  assert.equal(memory.summary, "size summary");
+  assert.deepEqual(memory.turns.map((turn) => turn.conclusion), ["conclusion 3"]);
 });
 
 test("usage is accumulated across every model request in an agent turn", () => {

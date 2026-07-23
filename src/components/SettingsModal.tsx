@@ -158,6 +158,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
+  const [vegaSlimContextEnabled, setVegaSlimContextEnabled] = createSignal(
+    s?.vegaSlimContextEnabled ?? false,
+  );
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
   const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
@@ -395,6 +398,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     codexPath: codexPath().trim() || "codex",
     codexProxy: codexProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
+    vegaSlimContextEnabled: vegaSlimContextEnabled(),
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
     claudecodeProxy: claudecodeProxy().trim(),
@@ -990,6 +994,24 @@ export function SettingsModal(props: { onClose: () => void }) {
 
           {/* ===== 高级 ===== */}
           <Show when={tab() === "advanced"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">Vega 上下文</h3>
+              <div class="field">
+                <span class="field-label">精简上下文模式</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={vegaSlimContextEnabled()}
+                    onChange={(e) => setVegaSlimContextEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  类似 Cursor 后端：上下文只携带最近 20 轮的用户提示词与结论；超过 20 轮或上下文上限时自动摘要旧轮次。最近一次结论及其后的用户提示词（包括中断产生的多条提示）始终原样保留。
+                </span>
+              </div>
+            </section>
+
             <section class="settings-group">
               <h3 class="settings-group-title">Windows 启动</h3>
               <div class="field">
