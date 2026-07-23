@@ -502,15 +502,12 @@ export function SettingsModal(props: { onClose: () => void }) {
         return;
       }
       const list = await api.listAchievements();
-      const previousImageUrls = new Map(
-        achievements().map((achievement) => [achievement.id, achievement.imageUrl]),
-      );
       const cacheKey = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       setAchievements(list.map((achievement) => ({
         ...achievement,
         imageUrl: reloadImages && achievement.imageUrl
           ? reloadAchievementImage(achievement.imageUrl, cacheKey)
-          : previousImageUrls.get(achievement.id) ?? achievement.imageUrl,
+          : achievement.imageUrl,
       })));
     } catch (error) {
       setAchievements([]);
