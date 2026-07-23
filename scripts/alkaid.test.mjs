@@ -196,6 +196,24 @@ test("Vega slim context keeps 20 conclusions and preserves interrupted prompts",
   });
 });
 
+test("Vega slim context keeps an interrupted turn as native messages", () => {
+  const memory = createSlimMemory();
+  appendSlimTurn(memory, "completed prompt");
+  setLatestConclusion(memory, "completed conclusion");
+  appendSlimTurn(memory, "interrupted prompt");
+  appendSlimTurn(memory, "current prompt");
+  memory.pendingMessages = [
+    { role: "user", content: [{ type: "text", text: "interrupted prompt" }] },
+    { role: "assistant", content: [{ type: "toolCall", name: "read" }] },
+    { role: "toolResult", content: [{ type: "text", text: "file contents" }] },
+  ];
+
+  const compactContext = formatSlimMemory(memoryWithoutCurrent(memory, { pendingMessages: true }));
+  assert.match(compactContext, /completed conclusion/);
+  assert.doesNotMatch(compactContext, /interrupted prompt|current prompt/);
+  assert.equal(memory.pendingMessages[1].content[0].name, "read");
+});
+
 test("Vega slim context also compresses at the context character limit", async () => {
   const memory = createSlimMemory();
   for (let index = 1; index <= 3; index += 1) {

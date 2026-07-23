@@ -1136,7 +1136,24 @@ pub fn render_handoff_context(
     to_label: &str,
 ) -> Option<String> {
     let mut blocks: Vec<String> = Vec::new();
-    for it in items {
+    // Everything after the last normally completed turn is an unfinished native trajectory.
+    // Under the handoff budget it takes priority over old completed history, so a cancelled Vega
+    // or Cursor turn keeps its assistant/tool state instead of looking like a new conversation.
+    let unfinished_item_start = items
+        .iter()
+        .rposition(|item| {
+            matches!(
+                item,
+                Item::Turn { stop_reason, .. }
+                    if matches!(stop_reason.as_str(), "end_turn" | "max_turn_requests")
+            )
+        })
+        .map_or(0, |index| index + 1);
+    let mut unfinished_block_start = None;
+    for (index, it) in items.iter().enumerate() {
+        if index == unfinished_item_start {
+            unfinished_block_start = Some(blocks.len());
+        }
         match it {
             Item::User { text, images, .. } => {
                 let mut t = truncate_middle(text.trim(), HANDOFF_USER_MAX);
@@ -1169,7 +1186,11 @@ pub fn render_handoff_context(
     if blocks.is_empty() && plan_text.is_empty() {
         return None;
     }
-    let body = clip_blocks_to_budget(&blocks, HANDOFF_TOTAL_BUDGET);
+    let body = clip_blocks_to_budget(
+        &blocks,
+        HANDOFF_TOTAL_BUDGET,
+        unfinished_block_start.filter(|start| *start < blocks.len()),
+    );
     let mut out = String::new();
     out.push_str(&format!(
         "［上下文接力］本会话此前由 {from_label} 处理，现在改由你（{to_label}）接手。\
@@ -1310,6 +1331,24 @@ mod tests {
     }
 
     #[test]
+    fn handoff_budget_prioritizes_an_interrupted_tool_trajectory() {
+        let old = "旧轮已完成".repeat(HANDOFF_TOTAL_BUDGET);
+        let blocks = vec![
+            format!("用户：\n{old}"),
+            "旧轮结论".into(),
+            "用户：\n请继续未完成任务".into(),
+            "[工具] read（完成）\n  输出：关键文件内容".into(),
+        ];
+
+        let context = clip_blocks_to_budget(&blocks, 120, Some(2));
+
+        assert!(!context.contains("旧轮已完成"));
+        assert!(context.contains("请继续未完成任务"));
+        assert!(context.contains("[工具] read"));
+        assert!(context.contains("关键文件内容"));
+    }
+
+    #[test]
     fn edited_opencode_prompt_replays_retained_history_once() {
         let mut thread = Thread::new(
             "D:/project".into(),
@@ -1440,27 +1479,61 @@ fn truncate_middle(s: &str, max: usize) -> String {
     out
 }
 
-/// 控制总长度：超预算时保留首条（最初的用户需求）+ 从尾部尽量多保留最近记录
-fn clip_blocks_to_budget(blocks: &[String], budget: usize) -> String {
+/// 控制总长度：通常保留首条需求和最近记录；若尾部是未完成轮次，则优先完整保留该轮的
+/// 用户、assistant 与工具块，剩余预算才用于更早历史。
+fn clip_blocks_to_budget(
+    blocks: &[String],
+    budget: usize,
+    protected_tail_start: Option<usize>,
+) -> String {
     let sep = 2usize; // "\n\n"
-    let total: usize = blocks.iter().map(|b| b.chars().count() + sep).sum();
+    let total: usize = blocks.iter().map(|block| block.chars().count() + sep).sum();
     if total <= budget {
         return blocks.join("\n\n");
     }
+
+    let protected_start = protected_tail_start.unwrap_or(blocks.len());
+    let protected_cost: usize = blocks[protected_start..]
+        .iter()
+        .map(|block| block.chars().count() + sep)
+        .sum();
+    if protected_start < blocks.len() && protected_cost <= budget {
+        let mut used = protected_cost;
+        let mut prefix = Vec::new();
+        for block in blocks[..protected_start].iter().rev() {
+            let cost = block.chars().count() + sep;
+            if used + cost > budget {
+                continue;
+            }
+            used += cost;
+            prefix.push(block.clone());
+        }
+        prefix.reverse();
+        let omitted = protected_start.saturating_sub(prefix.len());
+        if omitted > 0 {
+            prefix.insert(
+                0,
+                format!("…〔为保留未完成轮次，省略更早 {omitted} 条记录〕…"),
+            );
+        }
+        prefix.extend_from_slice(&blocks[protected_start..]);
+        return prefix.join("\n\n");
+    }
+
     let first = blocks.first().cloned().unwrap_or_default();
     let mut used = first.chars().count() + sep;
-    let mut tail: Vec<String> = Vec::new();
-    for b in blocks.iter().skip(1).rev() {
-        let cost = b.chars().count() + sep;
+    let mut tail = Vec::new();
+    for block in blocks.iter().skip(1).rev() {
+        let cost = block.chars().count() + sep;
         if used + cost > budget {
-            break;
+            continue;
         }
         used += cost;
-        tail.push(b.clone());
+        tail.push(block.clone());
     }
     tail.reverse();
     let omitted = blocks.len().saturating_sub(1).saturating_sub(tail.len());
-    let mut parts: Vec<String> = vec![first];
+    let mut parts = vec![first];
     if omitted > 0 {
         parts.push(format!("…〔为控制长度，省略中间 {omitted} 条记录〕…"));
     }

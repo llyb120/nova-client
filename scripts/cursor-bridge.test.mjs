@@ -11,6 +11,7 @@ const {
   cursorModelOptions,
   cursorTodoPlan,
   extractTurnConclusion,
+  formatInterruptedTurn,
   formatSlimMemory,
   ingestCompactHistory,
   isSlimMemoryEmpty,
@@ -265,6 +266,27 @@ assert.match(slimMessage.text, /Changed the lighting/);
 assert.match(slimMessage.text, /Current request:\nAdd animation$/);
 assert.deepEqual(slimMessage.images, [{ data: "image", mimeType: "image/png" }]);
 assert.equal(messageWithSlimMemory("only current", createSlimMemory()), "only current");
+
+const interruptedState = createMessageState();
+mapMessage({ type: "assistant", run_id: "interrupted", message: { content: [{ type: "text", text: "I inspected the file." }] } }, interruptedState);
+mapMessage({
+  type: "tool_call",
+  run_id: "interrupted",
+  id: "read-call",
+  name: "read_file",
+  args: { path: "src/app.ts" },
+  result: { content: "const answer = 42;" },
+}, interruptedState);
+const interruptedContext = formatInterruptedTurn("Fix the unfinished change", interruptedState);
+assert.match(interruptedContext, /Fix the unfinished change/);
+assert.match(interruptedContext, /I inspected the file/);
+assert.match(interruptedContext, /read_file/);
+assert.match(interruptedContext, /src\/app\.ts/);
+assert.match(interruptedContext, /answer = 42/);
+const interruptedMemory = createSlimMemory();
+interruptedMemory.pendingTurn = interruptedContext;
+assert.equal(isSlimMemoryEmpty(interruptedMemory), false);
+assert.match(messageWithSlimMemory("Continue", interruptedMemory), /complete working context/);
 
 const seeded = createSlimMemory();
 ingestCompactHistory(seeded, compactConversation(conversation));

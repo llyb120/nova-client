@@ -1,7 +1,7 @@
 export const VEGA_SLIM_MEMORY_TURNS = 20;
 
 export function createSlimMemory() {
-  return { summary: "", turns: [] };
+  return { summary: "", turns: [], pendingMessages: [] };
 }
 
 function textContent(content) {
@@ -56,13 +56,18 @@ export function normalizeSlimMemory(memory) {
   return memory;
 }
 
-export function memoryWithoutCurrent(memory) {
+export function memoryWithoutCurrent(memory, { pendingMessages = false } = {}) {
   const normalized = normalizeSlimMemory({
     summary: memory.summary,
     turns: structuredClone(memory.turns ?? []),
   });
   const latest = normalized.turns.at(-1);
-  if (latest && !latest.conclusion) latest.userPrompts.pop();
+  if (latest && !latest.conclusion) {
+    // An interrupted turn is supplied as native PI messages so its user prompts, assistant
+    // messages, and tool results stay together. Otherwise only omit the new current prompt.
+    if (pendingMessages) normalized.turns.pop();
+    else latest.userPrompts.pop();
+  }
   if (latest && !latest.userPrompts.length && !latest.conclusion) normalized.turns.pop();
   return normalized;
 }

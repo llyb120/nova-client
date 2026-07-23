@@ -49,7 +49,11 @@ async function loadSlimMemory(sessionId) {
   try {
     const parsed = JSON.parse(await readFile(slimMemoryPath(sessionId), "utf8"));
     return Array.isArray(parsed?.turns)
-      ? { summary: String(parsed.summary ?? ""), turns: parsed.turns }
+      ? {
+          summary: String(parsed.summary ?? ""),
+          turns: parsed.turns,
+          pendingMessages: Array.isArray(parsed.pendingMessages) ? parsed.pendingMessages : [],
+        }
       : createSlimMemory();
   } catch {
     return createSlimMemory();
@@ -61,7 +65,9 @@ async function saveSlimMemory(sessionId, memory) {
 }
 
 function messageWithSlimMemory(text, memory) {
-  const context = formatSlimMemory(memoryWithoutCurrent(memory));
+  const context = formatSlimMemory(memoryWithoutCurrent(memory, {
+    pendingMessages: memory.pendingMessages?.length > 0,
+  }));
   if (!context) return text;
   return [
     "请仅使用下面的精简记忆延续会话。完整工具轨迹和原始对话已被有意省略。",
@@ -152,7 +158,9 @@ async function prompt(request, commands) {
     thinkingLevel: resolved.thinkingLevel ?? request.reasoningEffort,
     mcpServers: await mcpServers(),
     sessionId,
-    messages: slimContext ? [] : await loadMessages(request.sessionId),
+    // Keep the complete native message/tool trajectory only while its turn has no conclusion.
+    // Once a later turn completes, compact memory replaces the trajectory as usual.
+    messages: slimContext ? memory.pendingMessages : await loadMessages(request.sessionId),
     readOnly: request.mode === "plan",
   });
   let text = "";
@@ -239,6 +247,9 @@ async function prompt(request, commands) {
     if (slimContext) {
       if (!outcome.cancelled && last?.role === "assistant" && last.stopReason !== "error") {
         setLatestConclusion(memory, last.content);
+        memory.pendingMessages = [];
+      } else if (outcome.cancelled) {
+        memory.pendingMessages = structuredClone(runtime.agent.state.messages);
       }
       await saveSlimMemory(sessionId, memory);
     } else {
