@@ -38,6 +38,14 @@ function projectPathKey(path: string): string {
   return path.replace(/\\/g, "/").toLowerCase();
 }
 
+function reloadAchievementImage(url: string, cacheKey: string): string {
+  const hashIndex = url.indexOf("#");
+  const resource = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
+  const hash = hashIndex >= 0 ? url.slice(hashIndex) : "";
+  const separator = resource.includes("?") ? "&" : "?";
+  return `${resource}${separator}_nova_refresh=${encodeURIComponent(cacheKey)}${hash}`;
+}
+
 const DEFAULT_RELAY_SERVER = "";
 const RELAY_SERVER_PLACEHOLDER = "http://127.0.0.1:8320";
 
@@ -477,7 +485,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     for (const kind of quotaShareKinds()) void ensureModelOptions(kind);
   });
 
-  const refreshAchievements = async () => {
+  const refreshAchievements = async (reloadImages = false) => {
     setAchievementsLoading(true);
     setAchievementsError("");
     try {
@@ -487,7 +495,17 @@ export function SettingsModal(props: { onClose: () => void }) {
         return;
       }
       const list = await api.listAchievements();
-      setAchievements(list);
+      if (reloadImages) {
+        const cacheKey = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        setAchievements(list.map((achievement) => ({
+          ...achievement,
+          imageUrl: achievement.imageUrl
+            ? reloadAchievementImage(achievement.imageUrl, cacheKey)
+            : undefined,
+        })));
+      } else {
+        setAchievements(list);
+      }
     } catch (error) {
       setAchievements([]);
       setAchievementsError(`加载失败：${String(error)}`);
@@ -1561,7 +1579,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   type="button"
                   class="link-btn"
                   disabled={achievementsLoading()}
-                  onClick={() => void refreshAchievements()}
+                  onClick={() => void refreshAchievements(true)}
                 >
                   刷新
                 </button>
