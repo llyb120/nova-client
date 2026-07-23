@@ -154,7 +154,7 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
         .ok_or("无法确定用户主目录")?;
     let (label, path, format) = match kind {
         AgentKind::Alkaid => (
-            "Alkaid",
+            "Vega",
             home.join(".nova").join("alkaid").join("AGENTS.md"),
             TargetFormat::Markdown,
         ),
