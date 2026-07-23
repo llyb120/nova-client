@@ -5210,9 +5210,9 @@ pub fn run() {
                 }
             }
 
-            // threads.json 后台落盘器：store.save() 只置脏标记，这里以 600ms 防抖合并、
-            // 序列化（紧凑 JSON、借用不拷贝）后在阻塞线程写盘。写盘不再发生在流式热路径
-            // 且频率受控，消除「每个工具完成都全量序列化十几 MB」带来的出字卡顿与内存碎片。
+            // 会话后台落盘器：store.save() 只置脏标记，这里以 600ms 防抖合并，
+            // 把每个会话序列化为独立紧凑 JSON 后在阻塞线程写盘。写盘不再发生在流式热路径，
+            // 也不再把所有后端的全部历史塞进单个 threads.json。
             {
                 let save_notify = {
                     let state = app.state::<AppState>();
@@ -5228,16 +5228,20 @@ pub fn run() {
                         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
                         let payload = {
                             let state = flush_app.state::<AppState>();
-                            let store = state.store.lock().unwrap();
+                            let mut store = state.store.lock().unwrap();
                             if !store.take_dirty() {
                                 continue;
                             }
-                            store.serialize_json().map(|json| (store.file_path(), json))
+                            store
+                                .serialize_files()
+                                .map(|files| (store.directory_path(), files))
                         };
-                        if let Some((path, json)) = payload {
+                        if let Some((dir, files)) = payload {
                             // 写盘放阻塞线程，不占用 tokio worker
                             let _ = tauri::async_runtime::spawn_blocking(move || {
-                                ThreadStore::write_json(&path, &json);
+                                if let Err(error) = ThreadStore::write_files(&dir, &files) {
+                                    eprintln!("[threads] 后台保存会话失败：{error}");
+                                }
                             })
                             .await;
                         }
@@ -5478,7 +5482,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
                 // 临时会话随程序关闭一并删除，并清理其临时工作目录。
-                // save 已改为后台节流落盘，退出时必须无条件同步 save_now，
+                // save 已改为后台节流、每会话独立落盘；退出时必须无条件同步 save_now，
                 // 把 flusher 尚未来得及写的脏数据一并落盘。
                 let removed = {
                     let mut store = state.store.lock().unwrap();

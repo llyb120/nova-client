@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -142,6 +144,89 @@ fn default_kind() -> String {
 }
 fn default_status() -> String {
     "pending".into()
+}
+
+fn raw_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(values) => {
+            let parts: Vec<String> = values.iter().filter_map(raw_value_text).collect();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| object.get("content").and_then(raw_value_text)),
+        _ => None,
+    }
+}
+
+fn same_output_text(value: &Value, display: &str) -> bool {
+    raw_value_text(value).is_some_and(|text| text.trim() == display.trim())
+}
+
+/// 去掉 rawOutput 中已经完整存在于展示 content 的文本，同时保留 exitCode、details 等
+/// 结构化元数据。这样会话文件不会为同一份命令/MCP 输出保存两遍。
+fn strip_duplicate_raw_output(value: Value, display: &str) -> Option<Value> {
+    match value {
+        Value::String(text) => (text.trim() != display.trim()).then_some(Value::String(text)),
+        Value::Array(values) => {
+            if same_output_text(&Value::Array(values.clone()), display) {
+                return None;
+            }
+            let kept: Vec<Value> = values
+                .into_iter()
+                .filter_map(|value| strip_duplicate_raw_output(value, display))
+                .collect();
+            (!kept.is_empty()).then_some(Value::Array(kept))
+        }
+        Value::Object(mut object) => {
+            let text_block = object.get("text").and_then(Value::as_str).is_some()
+                && object.keys().all(|key| {
+                    matches!(key.as_str(), "type" | "text" | "mimeType" | "mime_type")
+                });
+            if text_block && same_output_text(&Value::Object(object.clone()), display) {
+                return None;
+            }
+            let keys: Vec<String> = object.keys().cloned().collect();
+            for key in keys {
+                let Some(child) = object.remove(&key) else {
+                    continue;
+                };
+                let output_field = matches!(
+                    key.as_str(),
+                    "content" | "text" | "output" | "aggregatedOutput" | "aggregated_output"
+                );
+                if output_field && same_output_text(&child, display) {
+                    continue;
+                }
+                if let Some(child) = strip_duplicate_raw_output(child, display) {
+                    object.insert(key, child);
+                }
+            }
+            (!object.is_empty()).then_some(Value::Object(object))
+        }
+        other => Some(other),
+    }
+}
+
+fn deduplicate_tool_output(call: &mut ToolCall) {
+    let display = tool_output_text(&call.content);
+    if display.trim().is_empty() {
+        return;
+    }
+    if let Some(raw_output) = call.raw_output.take() {
+        call.raw_output = strip_duplicate_raw_output(raw_output, &display);
+    }
+}
+
+fn deduplicate_thread_outputs(thread: &mut Thread) {
+    for item in &mut thread.items {
+        if let Item::Tool { call, .. } = item {
+            deduplicate_tool_output(call);
+        }
+    }
 }
 
 /// 用户随 prompt 带上的附件。图片可带 base64，普通文件走 file:// resource_link。
@@ -947,12 +1032,6 @@ struct StoreFile {
     threads: Vec<Thread>,
 }
 
-/// 序列化用的借用视图：避免 save 时把全部会话（可达数十 MB）深拷贝一遍
-#[derive(Serialize)]
-struct StoreFileRef<'a> {
-    threads: &'a [Thread],
-}
-
 #[derive(Serialize, Deserialize, Default)]
 struct ThreadTrashFile {
     entries: Vec<TrashedThread>,
@@ -1025,7 +1104,7 @@ impl ThreadTrashStore {
 }
 
 pub struct ThreadStore {
-    path: PathBuf,
+    dir: PathBuf,
     pub threads: Vec<Thread>,
     /// 有未落盘的修改。save() 只置位，由后台 flusher（lib.rs）节流合并写盘。
     dirty: Arc<AtomicBool>,
@@ -1034,15 +1113,48 @@ pub struct ThreadStore {
 }
 
 impl ThreadStore {
-    pub fn load(dir: PathBuf) -> Self {
-        let path = dir.join("threads.json");
-        let threads = fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<StoreFile>(&s).ok())
-            .map(|f| f.threads)
-            .unwrap_or_default();
+    pub fn load(data_dir: PathBuf) -> Self {
+        let dir = data_dir.join("threads");
+        let legacy_path = data_dir.join("threads.json");
+        let threads = if legacy_path.exists() {
+            match fs::read_to_string(&legacy_path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<StoreFile>(&text).ok())
+            {
+                Some(mut file) => {
+                    match Self::serialize_threads(&dir, &mut file.threads)
+                        .and_then(|files| Self::write_files(&dir, &files))
+                    {
+                        Ok(()) => {
+                            let backup = legacy_path.with_extension("json.backup");
+                            if backup.exists() {
+                                let _ = fs::remove_file(&backup);
+                            }
+                            if let Err(error) = fs::rename(&legacy_path, &backup) {
+                                eprintln!(
+                                    "[threads] 已完成拆分，但备份旧 threads.json 失败：{error}"
+                                );
+                            } else {
+                                eprintln!(
+                                    "[threads] 已将 threads.json 迁移为每会话一文件，旧文件备份到 {}",
+                                    backup.display()
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!("[threads] 迁移 threads.json 失败：{error}"),
+                    }
+                    file.threads
+                }
+                None => {
+                    eprintln!("[threads] 无法解析 threads.json，保留原文件并尝试读取拆分会话");
+                    Self::load_split_threads(&dir)
+                }
+            }
+        } else {
+            Self::load_split_threads(&dir)
+        };
         let mut store = ThreadStore {
-            path,
+            dir,
             threads,
             dirty: Arc::new(AtomicBool::new(false)),
             save_notify: Arc::new(Notify::new()),
@@ -1052,6 +1164,60 @@ impl ThreadStore {
             store.save();
         }
         store
+    }
+
+    fn load_split_threads(dir: &Path) -> Vec<Thread> {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut threads: Vec<Thread> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension() != Some(OsStr::new("json")) {
+                    return None;
+                }
+                fs::read_to_string(&path).ok().and_then(|text| {
+                    serde_json::from_str::<Thread>(&text).ok().map(|mut thread| {
+                        deduplicate_thread_outputs(&mut thread);
+                        thread
+                    })
+                })
+            })
+            .collect();
+        threads.sort_by_key(|thread| thread.created_at);
+        threads
+    }
+
+    fn thread_file_name(id: &str) -> String {
+        if !id.is_empty()
+            && id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return format!("{id}.json");
+        }
+        let encoded = id
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("encoded-{encoded}.json")
+    }
+
+    fn serialize_threads(
+        dir: &Path,
+        threads: &mut [Thread],
+    ) -> Result<Vec<(PathBuf, String)>, String> {
+        threads
+            .iter_mut()
+            .map(|thread| {
+                deduplicate_thread_outputs(thread);
+                serde_json::to_string(thread)
+                    .map(|json| (dir.join(Self::thread_file_name(&thread.id)), json))
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
     }
 
     /// 删除所有临时会话，返回被删掉的会话（调用方负责清理其工作目录等）
@@ -1066,9 +1232,8 @@ impl ThreadStore {
     /// 请求持久化（异步节流）。
     ///
     /// 这里只置脏标记并唤醒后台 flusher，不做任何序列化/IO：save 的调用点遍布流式
-    /// 热路径（每个工具完成、每条消息、每次 plan 更新……），而 threads.json 会随
-    /// 历史增长到数十 MB——旧实现每次全量 clone + pretty 序列化 + 同步写盘，一轮任务
-    /// 触发上百次，既把流式输出卡出明显顿挫，又因反复大块分配造成堆碎片、内存阶梯上涨。
+    /// 热路径（每个工具完成、每条消息、每次 plan 更新……）。后台会把每个会话写到独立
+    /// 文件，避免单个 threads.json 随全部历史持续膨胀，也避免某个会话损坏所有记录。
     pub fn save(&self) {
         self.dirty.store(true, Ordering::Release);
         self.save_notify.notify_one();
@@ -1084,34 +1249,51 @@ impl ThreadStore {
         self.save_notify.clone()
     }
 
-    /// 序列化当前全部会话为紧凑 JSON（借用序列化，不 clone；写盘由调用方在锁外执行）
-    pub fn serialize_json(&self) -> Option<String> {
-        serde_json::to_string(&StoreFileRef {
-            threads: &self.threads,
-        })
-        .ok()
+    /// 序列化当前全部会话为独立的紧凑 JSON（借用序列化，不 clone）。
+    pub fn serialize_files(&mut self) -> Option<Vec<(PathBuf, String)>> {
+        Self::serialize_threads(&self.dir, &mut self.threads).ok()
     }
 
-    pub fn file_path(&self) -> PathBuf {
-        self.path.clone()
+    pub fn directory_path(&self) -> PathBuf {
+        self.dir.clone()
     }
 
-    /// 原子写盘：先写临时文件再改名，避免中途崩溃留下半个文件
-    pub fn write_json(path: &std::path::Path, json: &str) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+    /// 原子写入会话快照，并删除已不在快照中的旧会话文件。
+    pub fn write_files(dir: &Path, files: &[(PathBuf, String)]) -> Result<(), String> {
+        fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        for (path, json) in files {
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, json).map_err(|error| error.to_string())?;
+            if let Err(first_error) = fs::rename(&tmp, path) {
+                if path.exists() {
+                    fs::remove_file(path).map_err(|error| error.to_string())?;
+                    fs::rename(&tmp, path).map_err(|error| error.to_string())?;
+                } else {
+                    return Err(first_error.to_string());
+                }
+            }
         }
-        let tmp = path.with_extension("json.tmp");
-        if fs::write(&tmp, json).is_ok() {
-            let _ = fs::rename(&tmp, path);
+
+        let expected: HashSet<&Path> = files.iter().map(|(path, _)| path.as_path()).collect();
+        for entry in fs::read_dir(dir)
+            .map_err(|error| error.to_string())?
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension() == Some(OsStr::new("json")) && !expected.contains(path.as_path()) {
+                fs::remove_file(path).map_err(|error| error.to_string())?;
+            }
         }
+        Ok(())
     }
 
     /// 立即同步落盘（进程退出/升级重启前的最终保存），并清除脏标记
-    pub fn save_now(&self) {
+    pub fn save_now(&mut self) {
         self.dirty.store(false, Ordering::Release);
-        if let Some(json) = self.serialize_json() {
-            Self::write_json(&self.path, &json);
+        if let Some(files) = self.serialize_files() {
+            if let Err(error) = Self::write_files(&self.dir, &files) {
+                eprintln!("[threads] 保存会话失败：{error}");
+            }
         }
     }
 
@@ -1336,6 +1518,185 @@ fn render_handoff_tool(call: &ToolCall) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_thread_store_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("nova-thread-store-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn legacy_threads_json_is_migrated_to_one_file_per_thread() {
+        let data_dir = temp_thread_store_dir();
+        let mut first = Thread::new(
+            "/tmp/project-a".into(),
+            AgentKind::Alkaid,
+            None,
+            None,
+            None,
+            false,
+        );
+        first.title = "First".into();
+        let mut second = Thread::new(
+            "/tmp/project-b".into(),
+            AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        second.title = "Second".into();
+        let ids = [first.id.clone(), second.id.clone()];
+        fs::write(
+            data_dir.join("threads.json"),
+            serde_json::to_string(&StoreFile {
+                threads: vec![first, second],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = ThreadStore::load(data_dir.clone());
+
+        assert_eq!(store.threads.len(), 2);
+        assert!(!data_dir.join("threads.json").exists());
+        assert!(data_dir.join("threads.json.backup").exists());
+        for id in &ids {
+            assert!(data_dir
+                .join("threads")
+                .join(ThreadStore::thread_file_name(id))
+                .exists());
+        }
+        let reloaded = ThreadStore::load(data_dir.clone());
+        assert_eq!(reloaded.threads.len(), 2);
+        assert!(ids.iter().all(|id| reloaded.get(id).is_some()));
+
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn split_thread_store_removes_deleted_thread_files() {
+        let data_dir = temp_thread_store_dir();
+        let mut store = ThreadStore::load(data_dir.clone());
+        let first = Thread::new(
+            "/tmp/project-a".into(),
+            AgentKind::Alkaid,
+            None,
+            None,
+            None,
+            false,
+        );
+        let first_id = first.id.clone();
+        let second = Thread::new(
+            "/tmp/project-b".into(),
+            AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        let second_id = second.id.clone();
+        store.threads = vec![first, second];
+        store.save_now();
+
+        let threads_dir = data_dir.join("threads");
+        assert!(threads_dir
+            .join(ThreadStore::thread_file_name(&first_id))
+            .exists());
+        assert!(threads_dir
+            .join(ThreadStore::thread_file_name(&second_id))
+            .exists());
+
+        store.threads.retain(|thread| thread.id != first_id);
+        store.save_now();
+
+        assert!(!threads_dir
+            .join(ThreadStore::thread_file_name(&first_id))
+            .exists());
+        assert!(threads_dir
+            .join(ThreadStore::thread_file_name(&second_id))
+            .exists());
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_tool_output_is_removed_from_raw_output() {
+        let repeated = "same tool output";
+        let mut call = ToolCall {
+            tool_call_id: "call-1".into(),
+            title: "read_files".into(),
+            kind: "read".into(),
+            status: "completed".into(),
+            content: vec![serde_json::json!({
+                "type": "content",
+                "content": { "type": "text", "text": repeated }
+            })],
+            locations: Vec::new(),
+            raw_input: None,
+            raw_output: Some(serde_json::json!({
+                "content": [{ "type": "text", "text": repeated }],
+                "details": { "count": 3 }
+            })),
+        };
+
+        deduplicate_tool_output(&mut call);
+
+        assert_eq!(
+            call.raw_output,
+            Some(serde_json::json!({ "details": { "count": 3 } }))
+        );
+        let serialized = serde_json::to_string(&call).unwrap();
+        assert_eq!(serialized.matches(repeated).count(), 1);
+    }
+
+    #[test]
+    fn duplicate_command_output_keeps_structured_metadata() {
+        let mut call = ToolCall {
+            tool_call_id: "call-2".into(),
+            title: "cargo check".into(),
+            kind: "execute".into(),
+            status: "completed".into(),
+            content: vec![serde_json::json!({
+                "type": "content",
+                "content": { "type": "text", "text": "Finished" }
+            })],
+            locations: Vec::new(),
+            raw_input: None,
+            raw_output: Some(serde_json::json!({
+                "aggregatedOutput": "Finished",
+                "exitCode": 0
+            })),
+        };
+
+        deduplicate_tool_output(&mut call);
+
+        assert_eq!(call.raw_output, Some(serde_json::json!({ "exitCode": 0 })));
+    }
+
+    #[test]
+    fn distinct_raw_output_is_preserved() {
+        let mut call = ToolCall {
+            tool_call_id: "call-3".into(),
+            title: "tool".into(),
+            kind: "other".into(),
+            status: "completed".into(),
+            content: vec![serde_json::json!({
+                "type": "content",
+                "content": { "type": "text", "text": "preview" }
+            })],
+            locations: Vec::new(),
+            raw_input: None,
+            raw_output: Some(serde_json::json!({ "result": "different detail" })),
+        };
+
+        deduplicate_tool_output(&mut call);
+
+        assert_eq!(
+            call.raw_output,
+            Some(serde_json::json!({ "result": "different detail" }))
+        );
+    }
 
     #[test]
     fn auto_route_cache_is_reused_and_written_to_turns() {

@@ -1249,7 +1249,7 @@ pub async fn apply_staged(app: AppHandle) -> Result<(), String> {
     // 这里提前同步清干净更稳妥。
     if let Some(state) = app.try_state::<crate::AppState>() {
         crate::shutdown_agent_processes(&state).await;
-        // 会话持久化已改为后台节流落盘：新实例马上要读 threads.json，
+        // 会话持久化已改为后台节流、每会话独立落盘：新实例马上要读取会话目录，
         // 这里先把可能还没 flush 的脏数据同步写盘，避免升级丢最近几百毫秒的记录
         state.store.lock().unwrap().save_now();
     }
