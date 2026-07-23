@@ -38,12 +38,32 @@ function projectPathKey(path: string): string {
   return path.replace(/\\/g, "/").toLowerCase();
 }
 
+const ACHIEVEMENT_IMAGE_CACHE_KEY = "nova.achievementImageRefresh";
+
+function createAchievementImageCacheKey(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function loadAchievementImageCacheKey(): string {
+  const saved = localStorage.getItem(ACHIEVEMENT_IMAGE_CACHE_KEY);
+  if (saved) return saved;
+
+  const created = createAchievementImageCacheKey();
+  localStorage.setItem(ACHIEVEMENT_IMAGE_CACHE_KEY, created);
+  return created;
+}
+
 function reloadAchievementImage(url: string, cacheKey: string): string {
   const hashIndex = url.indexOf("#");
   const resource = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
   const hash = hashIndex >= 0 ? url.slice(hashIndex) : "";
+  const encodedCacheKey = encodeURIComponent(cacheKey);
+  const existingKey = /([?&])_nova_refresh=[^&#]*/;
+  if (existingKey.test(resource)) {
+    return `${resource.replace(existingKey, `$1_nova_refresh=${encodedCacheKey}`)}${hash}`;
+  }
   const separator = resource.includes("?") ? "&" : "?";
-  return `${resource}${separator}_nova_refresh=${encodeURIComponent(cacheKey)}${hash}`;
+  return `${resource}${separator}_nova_refresh=${encodedCacheKey}${hash}`;
 }
 
 const DEFAULT_RELAY_SERVER = "";
@@ -221,6 +241,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [achievements, setAchievements] = createSignal<Achievement[]>([]);
   const [achievementsLoading, setAchievementsLoading] = createSignal(false);
   const [achievementsError, setAchievementsError] = createSignal("");
+  let achievementImageCacheKey = loadAchievementImageCacheKey();
   const [showLogs, setShowLogs] = createSignal(false);
   const [saving, setSaving] = createSignal(false);
   const [restarting, setRestarting] = createSignal(false);
@@ -501,12 +522,16 @@ export function SettingsModal(props: { onClose: () => void }) {
         setAchievementsError("请先在「团队」中配置中转站 token，成就由服务器按身份授予。");
         return;
       }
+      if (reloadImages) {
+        setAchievements([]);
+        achievementImageCacheKey = createAchievementImageCacheKey();
+        localStorage.setItem(ACHIEVEMENT_IMAGE_CACHE_KEY, achievementImageCacheKey);
+      }
       const list = await api.listAchievements();
-      const cacheKey = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       setAchievements(list.map((achievement) => ({
         ...achievement,
-        imageUrl: reloadImages && achievement.imageUrl
-          ? reloadAchievementImage(achievement.imageUrl, cacheKey)
+        imageUrl: achievement.imageUrl
+          ? reloadAchievementImage(achievement.imageUrl, achievementImageCacheKey)
           : achievement.imageUrl,
       })));
     } catch (error) {
