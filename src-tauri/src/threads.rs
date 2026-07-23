@@ -1148,6 +1148,8 @@ const HANDOFF_ASSISTANT_MAX: usize = 6000;
 const HANDOFF_TOOL_OUTPUT_MAX: usize = 800;
 const HANDOFF_TOTAL_BUDGET: usize = 48000;
 const CLUE_CONTEXT_MAX: usize = 4000;
+const HANDOFF_FULL_TURNS: usize = 10;
+const HANDOFF_CONTEXT_THRESHOLD: usize = HANDOFF_TOTAL_BUDGET * 4 / 5;
 
 /// 跨 agent 切换时，把按时间排列的会话条目 + 计划进度渲染成一段上下文文本，
 /// 供新 agent 接续。无可用内容时返回 None。
@@ -1158,6 +1160,10 @@ pub fn render_handoff_context(
     to_label: &str,
 ) -> Option<String> {
     let mut blocks: Vec<String> = Vec::new();
+    let mut slim_blocks: Vec<String> = Vec::new();
+    let mut turn_users: Vec<String> = Vec::new();
+    let mut turn_conclusion: Option<String> = None;
+    let mut completed_turns = 0;
     // Everything after the last normally completed turn is an unfinished native trajectory.
     // Under the handoff budget it takes priority over old completed history, so a cancelled Vega
     // or Cursor turn keeps its assistant/tool state instead of looking like a new conversation.
@@ -1175,6 +1181,10 @@ pub fn render_handoff_context(
     for (index, it) in items.iter().enumerate() {
         if index == unfinished_item_start {
             unfinished_block_start = Some(blocks.len());
+            // Any prompts not closed by a successful Turn marker belong to the native unfinished
+            // trajectory and must not also appear in completed slim memory.
+            turn_users.clear();
+            turn_conclusion = None;
         }
         match it {
             Item::User { text, images, .. } => {
@@ -1183,13 +1193,17 @@ pub fn render_handoff_context(
                     t.push_str(&format!("（另附 {} 个文件/图片）", images.len()));
                 }
                 if !t.trim().is_empty() {
-                    blocks.push(format!("用户：\n{t}"));
+                    let block = format!("用户：\n{t}");
+                    blocks.push(block.clone());
+                    turn_users.push(block);
                 }
             }
             Item::Assistant { text, .. } => {
                 let t = truncate_middle(text.trim(), HANDOFF_ASSISTANT_MAX);
                 if !t.trim().is_empty() {
-                    blocks.push(format!("{from_label}：\n{t}"));
+                    let block = format!("{from_label}：\n{t}");
+                    blocks.push(block.clone());
+                    turn_conclusion = Some(block);
                 }
             }
             Item::Tool { call, .. } => {
@@ -1201,6 +1215,15 @@ pub fn render_handoff_context(
                     blocks.push(format!("系统错误：{t}"));
                 }
             }
+            Item::Turn { stop_reason, .. }
+                if matches!(stop_reason.as_str(), "end_turn" | "max_turn_requests") =>
+            {
+                slim_blocks.append(&mut turn_users);
+                if let Some(conclusion) = turn_conclusion.take() {
+                    slim_blocks.push(conclusion);
+                }
+                completed_turns += 1;
+            }
             _ => {}
         }
     }
@@ -1208,11 +1231,33 @@ pub fn render_handoff_context(
     if blocks.is_empty() && plan_text.is_empty() {
         return None;
     }
-    let body = clip_blocks_to_budget(
-        &blocks,
-        HANDOFF_TOTAL_BUDGET,
-        unfinished_block_start.filter(|start| *start < blocks.len()),
-    );
+    let native_chars = blocks.iter().map(String::len).sum::<usize>();
+    let use_full_context = completed_turns < HANDOFF_FULL_TURNS
+        && native_chars < HANDOFF_CONTEXT_THRESHOLD;
+    let body = if use_full_context {
+        clip_blocks_to_budget(
+            &blocks,
+            HANDOFF_TOTAL_BUDGET,
+            unfinished_block_start.filter(|start| *start < blocks.len()),
+        )
+    } else {
+        // Stage one keeps completed prompts and conclusions but drops their tool trajectory.
+        // Unfinished work remains native. Stage two only clips old compact turns after this
+        // prompt/conclusion representation reaches the same 80% capacity threshold.
+        let slim_completed_count = slim_blocks.len();
+        slim_blocks.extend(blocks.iter().skip(unfinished_block_start.unwrap_or(blocks.len())).cloned());
+        let slim_chars = slim_blocks.iter().map(String::len).sum::<usize>();
+        let budget = if slim_chars >= HANDOFF_CONTEXT_THRESHOLD {
+            HANDOFF_CONTEXT_THRESHOLD
+        } else {
+            HANDOFF_TOTAL_BUDGET
+        };
+        clip_blocks_to_budget(
+            &slim_blocks,
+            budget,
+            (slim_completed_count < slim_blocks.len()).then_some(slim_completed_count),
+        )
+    };
     let mut out = String::new();
     out.push_str(&format!(
         "［上下文接力］本会话此前由 {from_label} 处理，现在改由你（{to_label}）接手。\
@@ -1350,6 +1395,56 @@ mod tests {
         assert!(context.contains("Devin：\n已经定位到旧会话状态。"));
         assert_eq!(thread.handoff_from, None);
         assert!(thread.take_prompt_context("OpenCode").is_none());
+    }
+
+    #[test]
+    fn handoff_uses_two_stage_context_compaction() {
+        let mut items = Vec::new();
+        for index in 1..=10 {
+            items.push(Item::User {
+                id: index * 4,
+                text: format!("提示 {index}"),
+                ts: now_ms(),
+                images: Vec::new(),
+            });
+            items.push(Item::Tool {
+                id: index * 4 + 1,
+                ts: now_ms(),
+                call: ToolCall {
+                    tool_call_id: format!("tool-{index}"),
+                    title: "read".into(),
+                    kind: "read".into(),
+                    status: "completed".into(),
+                    content: vec![serde_json::json!({ "type": "content", "text": "工具轨迹" })],
+                    locations: Vec::new(),
+                    raw_input: None,
+                    raw_output: None,
+                },
+            });
+            items.push(Item::Assistant {
+                id: index * 4 + 2,
+                text: format!("结论 {index}"),
+                ts: now_ms(),
+            });
+            items.push(Item::Turn {
+                id: index * 4 + 3,
+                ts: now_ms(),
+                duration_ms: 1,
+                total_tokens: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                actual_model: None,
+                stop_reason: "end_turn".into(),
+            });
+        }
+
+        let context = render_handoff_context(&items, None, "Vega", "Cursor").unwrap();
+
+        assert!(context.contains("提示 1"));
+        assert!(context.contains("结论 10"));
+        assert!(!context.contains("工具轨迹"));
     }
 
     #[test]

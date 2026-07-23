@@ -1,7 +1,14 @@
 export const VEGA_SLIM_MEMORY_TURNS = 10;
 
 export function createSlimMemory() {
-  return { summary: "", turns: [], pendingMessages: [], fullMessages: [], contextTokens: 0 };
+  return {
+    summary: "",
+    turns: [],
+    pendingMessages: [],
+    fullMessages: [],
+    contextTokens: 0,
+    contextStage: "full",
+  };
 }
 
 function textContent(content) {
@@ -97,7 +104,10 @@ export async function compactSlimMemory(
 ) {
   normalizeSlimMemory(memory);
   const formatted = formatSlimMemory({ summary: memory.summary, turns: structuredClone(memory.turns) });
-  if (memory.turns.length <= maxTurns && formatted.length <= maxChars && currentTokens <= maxTokens) return false;
+  const withinTurnLimit = memory.turns.length <= maxTurns;
+  const belowCharacterLimit = !Number.isFinite(maxChars) || formatted.length < maxChars;
+  const belowTokenLimit = !Number.isFinite(maxTokens) || currentTokens < maxTokens;
+  if (withinTurnLimit && belowCharacterLimit && belowTokenLimit) return false;
 
   // The latest conclusion and every prompt after it are invariant. Prefer retaining up to 10
   // complete recent turns; if the model limit is already exceeded, summarize all older turns.
@@ -131,12 +141,17 @@ export function contextTokensFromMessages(messages) {
   return tokens;
 }
 
-export function shouldUseFullContext(memory, maxContextTokens) {
+export function shouldUseFullContext(memory, maxContextTokens, maxContextChars = Number.POSITIVE_INFINITY) {
   if (memory.pendingMessages?.length) return true;
+  if (memory.contextStage === "slim") return false;
   const turnCount = memory.turns?.length ?? 0;
   if (turnCount === 0) return true;
+  const measuredTokens = memory.contextTokens ?? 0;
+  const belowCapacity = measuredTokens > 0
+    ? measuredTokens < maxContextTokens
+    : JSON.stringify(memory.fullMessages ?? []).length < maxContextChars;
   return turnCount < VEGA_SLIM_MEMORY_TURNS
-    && (memory.contextTokens ?? 0) < maxContextTokens
+    && belowCapacity
     && memory.fullMessages?.length > 0;
 }
 
@@ -149,5 +164,6 @@ export function seedSlimMemoryFromMessages(memory, messages) {
   }
   memory.fullMessages = structuredClone(messages ?? []);
   memory.contextTokens = contextTokensFromMessages(messages);
+  memory.contextStage = "full";
   return normalizeSlimMemory(memory);
 }
