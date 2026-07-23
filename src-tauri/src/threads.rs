@@ -1143,118 +1143,88 @@ impl ThreadStore {
 
 // ===== 上下文接力：把已有会话历史渲染成注入给新 agent 的上下文 =====
 
-const HANDOFF_EARLIER_USER_MAX: usize = 1200;
-const HANDOFF_EARLIER_CONCLUSION_MAX: usize = 1800;
-// 与 Cursor 的 slim memory 一致：只传每轮用户提示和最终结论，不传思考、工具流水或错误。
-// 超预算时压缩较早轮次；最后一轮始终原样保留，避免接手者丢失当前任务和最新结论。
-const HANDOFF_TOTAL_BUDGET: usize = 12000;
+const HANDOFF_USER_MAX: usize = 4000;
+const HANDOFF_ASSISTANT_MAX: usize = 6000;
+const HANDOFF_TOOL_OUTPUT_MAX: usize = 800;
+const HANDOFF_TOTAL_BUDGET: usize = 48000;
 const CLUE_CONTEXT_MAX: usize = 4000;
 
-#[derive(Default)]
-struct HandoffTurn {
-    user_prompt: String,
-    conclusion: String,
-}
-
-/// 跨 agent 切换时生成类似 Cursor slim memory 的接力上下文：每轮只保留用户提示和
-/// 最后一条助手结论。无论预算如何，最后一轮均原样保留。
+/// 跨 agent 切换时，把按时间排列的会话条目 + 计划进度渲染成一段上下文文本，
+/// 供新 agent 接续。无可用内容时返回 None。
 pub fn render_handoff_context(
     items: &[Item],
     plan: Option<&Value>,
     from_label: &str,
     to_label: &str,
 ) -> Option<String> {
-    let mut turns: Vec<HandoffTurn> = Vec::new();
-    let mut current: Option<HandoffTurn> = None;
-    for item in items {
-        match item {
+    let mut blocks: Vec<String> = Vec::new();
+    // Everything after the last normally completed turn is an unfinished native trajectory.
+    // Under the handoff budget it takes priority over old completed history, so a cancelled Vega
+    // or Cursor turn keeps its assistant/tool state instead of looking like a new conversation.
+    let unfinished_item_start = items
+        .iter()
+        .rposition(|item| {
+            matches!(
+                item,
+                Item::Turn { stop_reason, .. }
+                    if matches!(stop_reason.as_str(), "end_turn" | "max_turn_requests")
+            )
+        })
+        .map_or(0, |index| index + 1);
+    let mut unfinished_block_start = None;
+    for (index, it) in items.iter().enumerate() {
+        if index == unfinished_item_start {
+            unfinished_block_start = Some(blocks.len());
+        }
+        match it {
             Item::User { text, images, .. } => {
-                if let Some(turn) = current.take() {
-                    turns.push(turn);
-                }
-                let mut user_prompt = text.trim().to_string();
+                let mut t = truncate_middle(text.trim(), HANDOFF_USER_MAX);
                 if !images.is_empty() {
-                    user_prompt.push_str(&format!("（另附 {} 个文件/图片）", images.len()));
+                    t.push_str(&format!("（另附 {} 个文件/图片）", images.len()));
                 }
-                current = Some(HandoffTurn {
-                    user_prompt,
-                    conclusion: String::new(),
-                });
+                if !t.trim().is_empty() {
+                    blocks.push(format!("用户：\n{t}"));
+                }
             }
-            Item::Assistant { text, .. } if !text.trim().is_empty() => {
-                if let Some(turn) = current.as_mut() {
-                    // 一轮可能流式产生多条助手消息；最后一条才是该轮结论。
-                    turn.conclusion = text.trim().to_string();
+            Item::Assistant { text, .. } => {
+                let t = truncate_middle(text.trim(), HANDOFF_ASSISTANT_MAX);
+                if !t.trim().is_empty() {
+                    blocks.push(format!("{from_label}：\n{t}"));
+                }
+            }
+            Item::Tool { call, .. } => {
+                blocks.push(render_handoff_tool(call));
+            }
+            Item::System { text, level, .. } if level == "error" => {
+                let t = truncate_middle(text.trim(), 600);
+                if !t.trim().is_empty() {
+                    blocks.push(format!("系统错误：{t}"));
                 }
             }
             _ => {}
         }
     }
-    if let Some(turn) = current {
-        turns.push(turn);
-    }
-    turns.retain(|turn| !turn.user_prompt.is_empty() || !turn.conclusion.is_empty());
-
-    let plan_text = truncate_middle(&render_handoff_plan(plan), 2000);
-    if turns.is_empty() && plan_text.is_empty() {
+    let plan_text = render_handoff_plan(plan);
+    if blocks.is_empty() && plan_text.is_empty() {
         return None;
     }
-
-    let body = render_handoff_turns(&turns, from_label, HANDOFF_TOTAL_BUDGET);
+    let body = clip_blocks_to_budget(
+        &blocks,
+        HANDOFF_TOTAL_BUDGET,
+        unfinished_block_start.filter(|start| *start < blocks.len()),
+    );
     let mut out = String::new();
     out.push_str(&format!(
         "［上下文接力］本会话此前由 {from_label} 处理，现在改由你（{to_label}）接手。\
-以下是精简记忆，仅包含每轮用户提示和最终结论；思考与工具流水已省略。\
-请在此基础上继续，不要重复已完成工作；文件状态以当前工作目录为准。\n\n"
+下面是按时间顺序的对话与操作记录，请通读后在此基础上继续完成用户的任务：不要重复已经做过的工作；\
+涉及的文件请以工作目录中的当前实际内容为准，必要时用读取工具确认。\n\n"
     ));
-    out.push_str("========== 精简记忆开始 ==========\n");
+    out.push_str("========== 历史记录开始 ==========\n");
     out.push_str(&body);
-    out.push_str("\n========== 精简记忆结束 ==========");
+    out.push_str("\n========== 历史记录结束 ==========");
     out.push_str(&plan_text);
-    out.push_str("\n\n请据此理解上下文，并回应用户接下来的消息。");
+    out.push_str("\n\n以上为历史背景，请据此理解上下文，并回应用户接下来的消息。");
     Some(out)
-}
-
-fn render_handoff_turns(turns: &[HandoffTurn], from_label: &str, budget: usize) -> String {
-    let Some((latest, earlier)) = turns.split_last() else {
-        return String::new();
-    };
-    let latest = format_handoff_turn(latest, turns.len(), from_label, false);
-    let available = budget.saturating_sub(latest.chars().count() + 2);
-    let earlier_blocks: Vec<String> = earlier
-        .iter()
-        .enumerate()
-        .map(|(index, turn)| format_handoff_turn(turn, index + 1, from_label, true))
-        .collect();
-    let earlier = clip_blocks_to_budget(&earlier_blocks, available);
-    if earlier.is_empty() {
-        latest
-    } else {
-        format!("{earlier}\n\n{latest}")
-    }
-}
-
-fn format_handoff_turn(
-    turn: &HandoffTurn,
-    number: usize,
-    from_label: &str,
-    compress: bool,
-) -> String {
-    let user_prompt = if compress {
-        truncate_middle(&turn.user_prompt, HANDOFF_EARLIER_USER_MAX)
-    } else {
-        turn.user_prompt.clone()
-    };
-    let conclusion = if compress {
-        truncate_middle(&turn.conclusion, HANDOFF_EARLIER_CONCLUSION_MAX)
-    } else {
-        turn.conclusion.clone()
-    };
-    let mut block = format!("【第 {number} 轮】\n用户提示：\n{user_prompt}");
-    if !conclusion.is_empty() {
-        block.push_str(&format!("\n{from_label} 结论：\n{conclusion}"));
-    }
-    block
 }
 
 fn render_handoff_plan(plan: Option<&Value>) -> String {
@@ -1280,6 +1250,42 @@ fn render_handoff_plan(plan: Option<&Value>) -> String {
     } else {
         format!("\n\n【此前的计划进度】\n{}", lines.join("\n"))
     }
+}
+
+fn render_handoff_tool(call: &ToolCall) -> String {
+    let title = if call.title.trim().is_empty() {
+        call.kind.as_str()
+    } else {
+        call.title.trim()
+    };
+    let mut s = format!("[工具] {title}");
+    let status = match call.status.as_str() {
+        "completed" => "完成",
+        "failed" => "失败",
+        "in_progress" => "进行中",
+        "pending" => "待执行",
+        _ => "",
+    };
+    if !status.is_empty() {
+        s.push_str(&format!("（{status}）"));
+    }
+    let paths: Vec<String> = call
+        .locations
+        .iter()
+        .filter_map(|l| l["path"].as_str().map(|p| p.to_string()))
+        .collect();
+    if !paths.is_empty() {
+        s.push_str(&format!("\n  涉及文件：{}", paths.join("、")));
+    }
+    let out = tool_output_text(&call.content);
+    let out = out.trim();
+    if !out.is_empty() {
+        s.push_str(&format!(
+            "\n  输出：{}",
+            truncate_middle(out, HANDOFF_TOOL_OUTPUT_MAX)
+        ));
+    }
+    s
 }
 
 #[cfg(test)]
@@ -1340,95 +1346,28 @@ mod tests {
             .expect("跨后端切换应把已有历史交给 OpenCode");
 
         assert!(context.contains("此前由 Devin 处理，现在改由你（OpenCode）接手"));
-        assert!(context.contains("用户提示：\n请修复这个问题"));
-        assert!(context.contains("Devin 结论：\n已经定位到旧会话状态。"));
+        assert!(context.contains("用户：\n请修复这个问题"));
+        assert!(context.contains("Devin：\n已经定位到旧会话状态。"));
         assert_eq!(thread.handoff_from, None);
         assert!(thread.take_prompt_context("OpenCode").is_none());
     }
 
     #[test]
-    fn handoff_only_keeps_prompts_and_turn_conclusions() {
-        let items = vec![
-            Item::User {
-                id: 1,
-                text: "第一轮需求".into(),
-                images: Vec::new(),
-                ts: now_ms(),
-            },
-            Item::Assistant {
-                id: 2,
-                text: "第一轮过程消息".into(),
-                ts: now_ms(),
-            },
-            Item::Tool {
-                id: 3,
-                ts: now_ms(),
-                call: ToolCall {
-                    tool_call_id: "tool-1".into(),
-                    title: "不应接力的工具".into(),
-                    kind: "execute".into(),
-                    status: "completed".into(),
-                    content: Vec::new(),
-                    locations: Vec::new(),
-                    raw_input: None,
-                    raw_output: None,
-                },
-            },
-            Item::Assistant {
-                id: 4,
-                text: "第一轮最终结论".into(),
-                ts: now_ms(),
-            },
-            Item::User {
-                id: 5,
-                text: "最后一轮需求".into(),
-                images: Vec::new(),
-                ts: now_ms(),
-            },
-            Item::Assistant {
-                id: 6,
-                text: "最后一轮结论".into(),
-                ts: now_ms(),
-            },
+    fn handoff_budget_prioritizes_an_interrupted_tool_trajectory() {
+        let old = "旧轮已完成".repeat(HANDOFF_TOTAL_BUDGET);
+        let blocks = vec![
+            format!("用户：\n{old}"),
+            "旧轮结论".into(),
+            "用户：\n请继续未完成任务".into(),
+            "[工具] read（完成）\n  输出：关键文件内容".into(),
         ];
 
-        let context = render_handoff_context(&items, None, "Devin", "Vega")
-            .expect("有历史时应生成接力上下文");
+        let context = clip_blocks_to_budget(&blocks, 120, Some(2));
 
-        assert!(context.contains("第一轮需求"));
-        assert!(context.contains("第一轮最终结论"));
-        assert!(!context.contains("第一轮过程消息"));
-        assert!(!context.contains("不应接力的工具"));
-        assert!(context.contains("最后一轮需求"));
-        assert!(context.contains("最后一轮结论"));
-    }
-
-    #[test]
-    fn handoff_compresses_earlier_turns_but_keeps_latest_turn_verbatim() {
-        let mut items = Vec::new();
-        for i in 0..20 {
-            items.push(Item::User {
-                id: i * 2 + 1,
-                text: format!("需求 {i}：{}", "甲".repeat(4000)),
-                images: Vec::new(),
-                ts: now_ms(),
-            });
-            items.push(Item::Assistant {
-                id: i * 2 + 2,
-                text: format!("结论 {i}：{}", "乙".repeat(6000)),
-                ts: now_ms(),
-            });
-        }
-
-        let context = render_handoff_context(&items, None, "Devin", "Vega")
-            .expect("有历史时应生成接力上下文");
-
-        let latest_prompt = format!("需求 19：{}", "甲".repeat(4000));
-        let latest_conclusion = format!("结论 19：{}", "乙".repeat(6000));
-        assert!(context.contains(&latest_prompt));
-        assert!(context.contains(&latest_conclusion));
-        assert!(context.contains("省略"));
-        assert!(context.chars().count() < 14000);
+        assert!(!context.contains("旧轮已完成"));
+        assert!(context.contains("请继续未完成任务"));
+        assert!(context.contains("[工具] read"));
+        assert!(context.contains("关键文件内容"));
     }
 
     #[test]
@@ -1453,8 +1392,8 @@ mod tests {
             .take_prompt_context("OpenCode")
             .expect("重编辑后应把截断点前的历史交给新的 OpenCode 会话");
 
-        assert!(context.contains("用户提示：\n先定位问题"));
-        assert!(context.contains("OpenCode 结论：\n问题位于会话恢复逻辑。"));
+        assert!(context.contains("用户：\n先定位问题"));
+        assert!(context.contains("OpenCode：\n问题位于会话恢复逻辑。"));
         assert!(thread.take_prompt_context("OpenCode").is_none());
 
         thread.items.clear();
@@ -1526,6 +1465,28 @@ mod tests {
 }
 
 /// 按字符数从中间截断，保留首尾，避免单条过长撑爆预算
+fn tool_output_text(content: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for item in content {
+        match item["type"].as_str() {
+            Some("content") => {
+                if let Some(text) = item["content"]["text"].as_str() {
+                    if !text.trim().is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            Some("diff") => {
+                if let Some(path) = item["path"].as_str() {
+                    parts.push(format!("（修改文件：{path}）"));
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
 fn truncate_middle(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -1540,30 +1501,61 @@ fn truncate_middle(s: &str, max: usize) -> String {
     out
 }
 
-/// 控制总长度：超预算时保留首条（最初的用户需求）+ 从尾部尽量多保留最近记录
-fn clip_blocks_to_budget(blocks: &[String], budget: usize) -> String {
-    if blocks.is_empty() || budget == 0 {
-        return String::new();
-    }
+/// 控制总长度：通常保留首条需求和最近记录；若尾部是未完成轮次，则优先完整保留该轮的
+/// 用户、assistant 与工具块，剩余预算才用于更早历史。
+fn clip_blocks_to_budget(
+    blocks: &[String],
+    budget: usize,
+    protected_tail_start: Option<usize>,
+) -> String {
     let sep = 2usize; // "\n\n"
-    let total: usize = blocks.iter().map(|b| b.chars().count() + sep).sum();
+    let total: usize = blocks.iter().map(|block| block.chars().count() + sep).sum();
     if total <= budget {
         return blocks.join("\n\n");
     }
-    let first = truncate_middle(&blocks[0], budget.saturating_sub(sep));
+
+    let protected_start = protected_tail_start.unwrap_or(blocks.len());
+    let protected_cost: usize = blocks[protected_start..]
+        .iter()
+        .map(|block| block.chars().count() + sep)
+        .sum();
+    if protected_start < blocks.len() && protected_cost <= budget {
+        let mut used = protected_cost;
+        let mut prefix = Vec::new();
+        for block in blocks[..protected_start].iter().rev() {
+            let cost = block.chars().count() + sep;
+            if used + cost > budget {
+                continue;
+            }
+            used += cost;
+            prefix.push(block.clone());
+        }
+        prefix.reverse();
+        let omitted = protected_start.saturating_sub(prefix.len());
+        if omitted > 0 {
+            prefix.insert(
+                0,
+                format!("…〔为保留未完成轮次，省略更早 {omitted} 条记录〕…"),
+            );
+        }
+        prefix.extend_from_slice(&blocks[protected_start..]);
+        return prefix.join("\n\n");
+    }
+
+    let first = blocks.first().cloned().unwrap_or_default();
     let mut used = first.chars().count() + sep;
-    let mut tail: Vec<String> = Vec::new();
-    for b in blocks.iter().skip(1).rev() {
-        let cost = b.chars().count() + sep;
+    let mut tail = Vec::new();
+    for block in blocks.iter().skip(1).rev() {
+        let cost = block.chars().count() + sep;
         if used + cost > budget {
-            break;
+            continue;
         }
         used += cost;
-        tail.push(b.clone());
+        tail.push(block.clone());
     }
     tail.reverse();
     let omitted = blocks.len().saturating_sub(1).saturating_sub(tail.len());
-    let mut parts: Vec<String> = vec![first];
+    let mut parts = vec![first];
     if omitted > 0 {
         parts.push(format!("…〔为控制长度，省略中间 {omitted} 条记录〕…"));
     }

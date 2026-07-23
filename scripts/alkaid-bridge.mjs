@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, expandAlkaidSkillCommand, mergeAlkaidUsage, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
-import { appendSlimTurn, compactSlimMemory, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext } from "./alkaid-slim-memory.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -49,7 +49,13 @@ async function loadSlimMemory(sessionId) {
   try {
     const parsed = JSON.parse(await readFile(slimMemoryPath(sessionId), "utf8"));
     return Array.isArray(parsed?.turns)
-      ? { summary: String(parsed.summary ?? ""), turns: parsed.turns }
+      ? {
+          summary: String(parsed.summary ?? ""),
+          turns: parsed.turns,
+          pendingMessages: Array.isArray(parsed.pendingMessages) ? parsed.pendingMessages : [],
+          fullMessages: Array.isArray(parsed.fullMessages) ? parsed.fullMessages : [],
+          contextTokens: Number(parsed.contextTokens) || 0,
+        }
       : createSlimMemory();
   } catch {
     return createSlimMemory();
@@ -61,7 +67,9 @@ async function saveSlimMemory(sessionId, memory) {
 }
 
 function messageWithSlimMemory(text, memory) {
-  const context = formatSlimMemory(memoryWithoutCurrent(memory));
+  const context = formatSlimMemory(memoryWithoutCurrent(memory, {
+    pendingMessages: memory.pendingMessages?.length > 0,
+  }));
   if (!context) return text;
   return [
     "请仅使用下面的精简记忆延续会话。完整工具轨迹和原始对话已被有意省略。",
@@ -113,11 +121,15 @@ async function prompt(request, commands) {
   const sessionId = request.sessionId || randomUUID();
   const slimContext = request.vegaSlimContext === true;
   let memory = createSlimMemory();
+  let useFullContext = false;
+  let maxContextTokens = Number.POSITIVE_INFINITY;
   if (slimContext) {
     memory = await loadSlimMemory(sessionId);
     if (!memory.summary && !memory.turns.length && request.sessionId) {
       seedSlimMemoryFromMessages(memory, await loadMessages(request.sessionId));
     }
+    maxContextTokens = Math.max(2_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.75));
+    useFullContext = shouldUseFullContext(memory, maxContextTokens);
     appendSlimTurn(memory, input.text);
     await compactSlimMemory(memory, async (earlier) => {
       const summaryRuntime = await createAlkaidAgent({
@@ -143,8 +155,19 @@ async function prompt(request, commands) {
       } finally {
         await summaryRuntime.close();
       }
-    }, { maxChars: Math.max(8_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.75)) });
+    }, {
+      currentTokens: memory.contextTokens,
+      maxTokens: maxContextTokens,
+      // Keep the previous character estimate only when the provider reports no token usage.
+      maxChars: memory.contextTokens > 0
+        ? Number.POSITIVE_INFINITY
+        : Math.max(8_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.75)),
+    });
   }
+  let nativeMessages;
+  if (!slimContext) nativeMessages = await loadMessages(request.sessionId);
+  else if (memory.pendingMessages?.length) nativeMessages = memory.pendingMessages;
+  else nativeMessages = useFullContext ? memory.fullMessages : [];
   const runtime = await createAlkaidAgent({
     cwd: request.cwd,
     model: resolved.model,
@@ -152,7 +175,9 @@ async function prompt(request, commands) {
     thinkingLevel: resolved.thinkingLevel ?? request.reasoningEffort,
     mcpServers: await mcpServers(),
     sessionId,
-    messages: slimContext ? [] : await loadMessages(request.sessionId),
+    // Early turns and interrupted work retain the native message/tool trajectory. Once either
+    // threshold is reached, compact memory replaces completed trajectories as usual.
+    messages: nativeMessages,
     readOnly: request.mode === "plan",
   });
   let text = "";
@@ -221,7 +246,7 @@ async function prompt(request, commands) {
   try {
     send({ type: "ready", sessionId });
     const expandedText = await expandAlkaidSkillCommand(input.text, runtime.skills);
-    const promptText = slimContext ? messageWithSlimMemory(expandedText, memory) : expandedText;
+    const promptText = slimContext && !useFullContext ? messageWithSlimMemory(expandedText, memory) : expandedText;
     const outcome = await runAlkaidPromptWithRetry(runtime.agent, promptText, input.images, {
       isCancelled: () => cancelled,
       onRetry: () => {
@@ -239,6 +264,15 @@ async function prompt(request, commands) {
     if (slimContext) {
       if (!outcome.cancelled && last?.role === "assistant" && last.stopReason !== "error") {
         setLatestConclusion(memory, last.content);
+        memory.pendingMessages = [];
+        memory.contextTokens = contextTokensFromMessages(runtime.agent.state.messages);
+        if (memory.turns.length < 10 && memory.contextTokens < maxContextTokens) {
+          memory.fullMessages = structuredClone(runtime.agent.state.messages);
+        } else {
+          memory.fullMessages = [];
+        }
+      } else if (outcome.cancelled) {
+        memory.pendingMessages = structuredClone(runtime.agent.state.messages);
       }
       await saveSlimMemory(sessionId, memory);
     } else {

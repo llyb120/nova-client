@@ -11,6 +11,7 @@ const {
   cursorModelOptions,
   cursorTodoPlan,
   extractTurnConclusion,
+  formatInterruptedTurn,
   formatSlimMemory,
   ingestCompactHistory,
   isSlimMemoryEmpty,
@@ -266,6 +267,27 @@ assert.match(slimMessage.text, /Current request:\nAdd animation$/);
 assert.deepEqual(slimMessage.images, [{ data: "image", mimeType: "image/png" }]);
 assert.equal(messageWithSlimMemory("only current", createSlimMemory()), "only current");
 
+const interruptedState = createMessageState();
+mapMessage({ type: "assistant", run_id: "interrupted", message: { content: [{ type: "text", text: "I inspected the file." }] } }, interruptedState);
+mapMessage({
+  type: "tool_call",
+  run_id: "interrupted",
+  id: "read-call",
+  name: "read_file",
+  args: { path: "src/app.ts" },
+  result: { content: "const answer = 42;" },
+}, interruptedState);
+const interruptedContext = formatInterruptedTurn("Fix the unfinished change", interruptedState);
+assert.match(interruptedContext, /Fix the unfinished change/);
+assert.match(interruptedContext, /I inspected the file/);
+assert.match(interruptedContext, /read_file/);
+assert.match(interruptedContext, /src\/app\.ts/);
+assert.match(interruptedContext, /answer = 42/);
+const interruptedMemory = createSlimMemory();
+interruptedMemory.pendingTurn = interruptedContext;
+assert.equal(isSlimMemoryEmpty(interruptedMemory), false);
+assert.match(messageWithSlimMemory("Continue", interruptedMemory), /complete working context/);
+
 const seeded = createSlimMemory();
 ingestCompactHistory(seeded, compactConversation(conversation));
 assert.deepEqual(seeded.turns, [
@@ -274,23 +296,23 @@ assert.deepEqual(seeded.turns, [
 ]);
 
 const compressible = createSlimMemory();
-for (let index = 1; index <= 20; index += 1) {
+for (let index = 1; index <= 10; index += 1) {
   recordSlimTurn(compressible, `user prompt ${index}`, `conclusion ${index}`);
 }
 assert.equal(
-  await compressSlimMemory(compressible, async () => assert.fail("20 turns must not compress")),
+  await compressSlimMemory(compressible, async () => assert.fail("10 turns must not compress")),
   false,
 );
 recordSlimTurn(compressible, "latest user prompt must remain exact", "latest conclusion");
 let summaryInput = "";
 assert.equal(await compressSlimMemory(compressible, async (input) => {
   summaryInput = input;
-  return "Summary of the first twenty turns.";
+  return "Summary of the first ten turns.";
 }), true);
 assert.match(summaryInput, /user prompt 1/);
-assert.match(summaryInput, /user prompt 20/);
+assert.match(summaryInput, /user prompt 10/);
 assert.doesNotMatch(summaryInput, /latest user prompt/);
-assert.equal(compressible.summary, "Summary of the first twenty turns.");
+assert.equal(compressible.summary, "Summary of the first ten turns.");
 assert.deepEqual(compressible.turns, [{
   userPrompt: "latest user prompt must remain exact",
   conclusion: "latest conclusion",

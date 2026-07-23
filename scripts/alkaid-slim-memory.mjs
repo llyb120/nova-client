@@ -1,7 +1,7 @@
-export const VEGA_SLIM_MEMORY_TURNS = 20;
+export const VEGA_SLIM_MEMORY_TURNS = 10;
 
 export function createSlimMemory() {
-  return { summary: "", turns: [] };
+  return { summary: "", turns: [], pendingMessages: [], fullMessages: [], contextTokens: 0 };
 }
 
 function textContent(content) {
@@ -41,7 +41,7 @@ export function normalizeSlimMemory(memory) {
   let pendingPrompts = [];
   for (const raw of memory.turns ?? []) {
     const prompts = Array.isArray(raw?.userPrompts)
-      ? raw.userPrompts.map((value) => String(value).trim()).filter(Boolean)
+      ? raw.userPrompts.map(String).map((value) => value.trim()).filter(Boolean)
       : [String(raw?.userPrompt ?? "").trim()].filter(Boolean);
     pendingPrompts.push(...prompts);
     const conclusion = String(raw?.conclusion ?? "").trim();
@@ -56,13 +56,18 @@ export function normalizeSlimMemory(memory) {
   return memory;
 }
 
-export function memoryWithoutCurrent(memory) {
+export function memoryWithoutCurrent(memory, { pendingMessages = false } = {}) {
   const normalized = normalizeSlimMemory({
     summary: memory.summary,
     turns: structuredClone(memory.turns ?? []),
   });
   const latest = normalized.turns.at(-1);
-  if (latest && !latest.conclusion) latest.userPrompts.pop();
+  if (latest && !latest.conclusion) {
+    // An interrupted turn is supplied as native PI messages so its user prompts, assistant
+    // messages, and tool results stay together. Otherwise only omit the new current prompt.
+    if (pendingMessages) normalized.turns.pop();
+    else latest.userPrompts.pop();
+  }
   if (latest && !latest.userPrompts.length && !latest.conclusion) normalized.turns.pop();
   return normalized;
 }
@@ -83,14 +88,23 @@ export function formatSlimMemory(memory) {
 export async function compactSlimMemory(
   memory,
   summarize,
-  { maxTurns = VEGA_SLIM_MEMORY_TURNS, maxChars = Number.POSITIVE_INFINITY } = {},
+  {
+    maxTurns = VEGA_SLIM_MEMORY_TURNS,
+    maxChars = Number.POSITIVE_INFINITY,
+    currentTokens = 0,
+    maxTokens = Number.POSITIVE_INFINITY,
+  } = {},
 ) {
   normalizeSlimMemory(memory);
   const formatted = formatSlimMemory({ summary: memory.summary, turns: structuredClone(memory.turns) });
-  if (memory.turns.length <= maxTurns && formatted.length <= maxChars) return false;
+  if (memory.turns.length <= maxTurns && formatted.length <= maxChars && currentTokens <= maxTokens) return false;
 
-  // Preserve the latest conclusion, plus any interrupted prompts grouped with it.
+  // The latest conclusion and every prompt after it are invariant. Prefer retaining up to 10
+  // complete recent turns; if the model limit is already exceeded, summarize all older turns.
   const protectedCount = memory.turns.at(-1)?.conclusion ? 1 : Math.min(2, memory.turns.length);
+  // Match Cursor's policy: once the threshold is crossed, summarize every older complete turn
+  // rather than repeatedly shaving off a single turn. The newest conclusion (or the newest
+  // conclusion plus all following interrupted prompts) remains verbatim.
   const split = memory.turns.length - protectedCount;
   if (split <= 0) return false;
 
@@ -102,6 +116,30 @@ export async function compactSlimMemory(
   return true;
 }
 
+export function contextTokensFromMessages(messages) {
+  let tokens = 0;
+  for (const message of messages ?? []) {
+    if (message?.role !== "assistant" || !message.usage) continue;
+    const usage = message.usage;
+    // Each assistant request reports the context size at that point. The latest/largest request,
+    // not the sum across tool calls, is the value that should be compared with the context window.
+    const measured = Number(usage.totalTokens ?? usage.total_tokens)
+      || ["input", "output", "cacheRead", "cacheWrite"]
+        .reduce((total, key) => total + (Number(usage[key]) || 0), 0);
+    tokens = Math.max(tokens, measured);
+  }
+  return tokens;
+}
+
+export function shouldUseFullContext(memory, maxContextTokens) {
+  if (memory.pendingMessages?.length) return true;
+  const turnCount = memory.turns?.length ?? 0;
+  if (turnCount === 0) return true;
+  return turnCount < VEGA_SLIM_MEMORY_TURNS
+    && (memory.contextTokens ?? 0) < maxContextTokens
+    && memory.fullMessages?.length > 0;
+}
+
 export function seedSlimMemoryFromMessages(memory, messages) {
   for (const message of messages ?? []) {
     if (message?.role === "user") appendSlimTurn(memory, textContent(message.content));
@@ -109,5 +147,7 @@ export function seedSlimMemoryFromMessages(memory, messages) {
       setLatestConclusion(memory, message.content);
     }
   }
+  memory.fullMessages = structuredClone(messages ?? []);
+  memory.contextTokens = contextTokensFromMessages(messages);
   return normalizeSlimMemory(memory);
 }

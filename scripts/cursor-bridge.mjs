@@ -14,7 +14,7 @@ const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTU
 const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
-const CURSOR_SLIM_MEMORY_TURNS = positiveInteger(process.env.NOVA_CURSOR_SLIM_MEMORY_TURNS, 20);
+const CURSOR_SLIM_MEMORY_TURNS = positiveInteger(process.env.NOVA_CURSOR_SLIM_MEMORY_TURNS, 10);
 const CURSOR_SLIM_MEMORY_DIR = process.env.NOVA_CURSOR_SLIM_MEMORY_DIR
   || join(process.env.NOVA_DATA_DIR || join(homedir(), ".nova"), "cursor-slim-memory");
 
@@ -69,11 +69,11 @@ function compactConversation(turns, maxChars = CURSOR_RECOVERY_CONTEXT_CHARS) {
 }
 
 function createSlimMemory() {
-  return { summary: "", turns: [] };
+  return { summary: "", turns: [], pendingTurn: "" };
 }
 
 function isSlimMemoryEmpty(memory) {
-  return !(memory?.summary || memory?.turns?.length);
+  return !(memory?.summary || memory?.turns?.length || memory?.pendingTurn);
 }
 
 function messageText(message) {
@@ -95,7 +95,44 @@ function formatSlimMemory(memory) {
       if (turn.conclusion) sections.push(`Conclusion: ${turn.conclusion}`);
     });
   }
+  if (memory.pendingTurn) {
+    if (sections.length) sections.push("");
+    sections.push(
+      "## Interrupted turn (complete working context)",
+      "This turn did not produce a conclusion. Continue from its assistant and tool trace instead of starting over.",
+      memory.pendingTurn,
+    );
+  }
   return sections.join("\n");
+}
+
+function formatInterruptedTurn(userMessage, state) {
+  const sections = [];
+  const prompt = String(messageText(userMessage)).trim();
+  if (prompt) sections.push(`User:\n${prompt}`);
+  for (const entry of state?.trace ?? []) {
+    if (entry.kind === "assistant" || entry.kind === "thinking") {
+      const text = String(entry.text ?? "").trim();
+      if (text) sections.push(`${entry.kind === "assistant" ? "Assistant" : "Assistant reasoning"}:\n${text}`);
+      continue;
+    }
+    if (entry.kind !== "tool") continue;
+    const tool = entry.item;
+    const details = [`[Tool] ${tool.tool ?? "unknown"} (${tool.status ?? "in_progress"})`];
+    if (tool.arguments !== undefined) details.push(`Arguments: ${safeJson(tool.arguments)}`);
+    if (tool.result !== undefined) details.push(`Result: ${safeJson(tool.result)}`);
+    sections.push(details.join("\n"));
+  }
+  return sections.join("\n\n");
+}
+
+function safeJson(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function messageWithSlimMemory(message, memory) {
@@ -208,6 +245,7 @@ async function loadSlimMemory(sessionKey) {
           userPrompt: String(turn?.userPrompt ?? ""),
           conclusion: String(turn?.conclusion ?? ""),
         })),
+        pendingTurn: String(parsed.pendingTurn ?? ""),
       };
     }
     // Migrate the first slim-memory format, which stored prompts and conclusions separately.
@@ -229,9 +267,10 @@ async function saveSlimMemory(sessionKey, memory) {
   if (!sessionKey) return;
   await mkdir(CURSOR_SLIM_MEMORY_DIR, { recursive: true });
   await writeFile(slimMemoryPath(sessionKey), `${JSON.stringify({
-    version: 2,
+    version: 3,
     summary: memory.summary ?? "",
     turns: memory.turns ?? [],
+    pendingTurn: memory.pendingTurn ?? "",
   })}\n`, "utf8");
 }
 
@@ -401,7 +440,14 @@ async function sendPromptWithRecovery(
 }
 
 function createMessageState() {
-  return { activeTextType: null, textIndex: 0, texts: new Map(), tools: new Map(), deltaTypes: new Set() };
+  return {
+    activeTextType: null,
+    textIndex: 0,
+    texts: new Map(),
+    tools: new Map(),
+    deltaTypes: new Set(),
+    trace: [],
+  };
 }
 
 function appendText(state, runId, type, text) {
@@ -412,6 +458,12 @@ function appendText(state, runId, type, text) {
   const id = `${runId}-${type}-${state.textIndex}`;
   const combined = `${state.texts.get(id) ?? ""}${text}`;
   state.texts.set(id, combined);
+  let trace = state.trace.find((entry) => entry.id === id);
+  if (!trace) {
+    trace = { id, kind: type, text: "" };
+    state.trace.push(trace);
+  }
+  trace.text = combined;
   return { id, type: type === "assistant" ? "agent_message" : "reasoning", text: combined };
 }
 
@@ -429,6 +481,13 @@ function mapTool(state, callId, name, status, args, result) {
     status: status === "error" ? "failed" : status === "running" ? "in_progress" : "completed",
   };
   state.tools.set(callId, item);
+  let trace = state.trace.find((entry) => entry.id === callId);
+  if (!trace) {
+    trace = { id: callId, kind: "tool", item };
+    state.trace.push(trace);
+  } else {
+    trace.item = item;
+  }
   return item;
 }
 
@@ -648,11 +707,15 @@ async function main() {
   const requests = [];
   let wake;
   let activeRun;
+  let preserveActiveTurn;
   let closed = false;
   lines.on("line", (line) => {
     const request = JSON.parse(line);
     if (request.action === "cancel") {
-      void activeRun?.cancel();
+      // Persist the unfinished prompt, assistant output and tool trace before Rust tears down the
+      // bridge. Cursor has no native cross-Agent message restore, so the next fresh Agent receives
+      // this exact working context as part of slim memory.
+      void Promise.resolve(preserveActiveTurn?.()).finally(() => activeRun?.cancel());
       return;
     }
     requests.push(request);
@@ -717,6 +780,12 @@ async function main() {
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
         const state = createMessageState();
+        preserveActiveTurn = async () => {
+          const pendingTurn = formatInterruptedTurn(originalMessage, state);
+          if (!pendingTurn) return;
+          memory.pendingTurn = pendingTurn;
+          await saveSlimMemory(memoryKey, memory);
+        };
         const turnStartedAt = performance.now();
         let attemptActive = true;
         let producedOutput = false;
@@ -783,6 +852,7 @@ async function main() {
           sendTiming("wait", waitStartedAt);
           for (const item of completePendingTools(state)) send({ type: "item", item });
           if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
+          memory.pendingTurn = "";
           recordSlimTurn(memory, originalMessage, extractTurnConclusion(state, result));
           await summarizeSlimMemory(memory, request).catch((error) => {
             process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -812,6 +882,7 @@ async function main() {
           activeRun = undefined;
         } finally {
           attemptActive = false;
+          preserveActiveTurn = undefined;
         }
       }
     } catch (error) {
@@ -843,6 +914,7 @@ export {
   cursorModelOptions,
   cursorTodoPlan,
   extractTurnConclusion,
+  formatInterruptedTurn,
   formatSlimMemory,
   ingestCompactHistory,
   isSlimMemoryEmpty,
