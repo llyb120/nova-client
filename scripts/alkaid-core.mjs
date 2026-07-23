@@ -33,11 +33,15 @@ const textResult = (text, details = undefined) => ({
   details,
 });
 
-function safePath(root, input) {
-  const path = resolve(root, input);
+function resolveInputPath(root, input) {
+  return resolve(root, input);
+}
+
+function safeEditPath(root, input) {
+  const path = resolveInputPath(root, input);
   const rel = relative(root, path);
   if (rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(rel)) {
-    throw new Error(`路径超出工作区: ${input}`);
+    throw new Error(`编辑路径超出工作区: ${input}`);
   }
   return path;
 }
@@ -178,7 +182,7 @@ export function createFilesystemTools(cwd, editTool = null) {
         const results = await Promise.all(paths.map(async (input) => {
           const request = typeof input === "string" ? { path: input } : input;
           try {
-            const path = safePath(root, request.path);
+            const path = resolveInputPath(root, request.path);
             const result = await readTextLines(path, request.offset, request.limit);
             return {
               path: request.path,
@@ -204,7 +208,7 @@ export function createFilesystemTools(cwd, editTool = null) {
         }), { minItems: 1 }),
       }),
       async execute(id, { files }, signal) {
-        const targets = files.map((file) => safePath(root, file.path));
+        const targets = files.map((file) => safeEditPath(root, file.path));
         if (new Set(targets).size !== targets.length) throw new Error("edit_files 包含重复目标路径");
         const edited = await Promise.all(files.map(async (file, index) => {
           await editTool.execute(`${id}-${index}`, file, signal);

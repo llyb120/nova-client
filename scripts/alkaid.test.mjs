@@ -243,15 +243,26 @@ test("batch reads stream large files in pages", async () => {
   assert.equal(second.nextOffset, 221);
 });
 
-test("batch file tools reject traversal and duplicate edits", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-"));
+test("read tools allow paths outside the workspace while batch edits remain restricted", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "alkaid-paths-"));
+  const cwd = join(parent, "workspace");
+  await mkdir(cwd);
+  const outside = join(parent, "outside.txt");
+  await writeFile(outside, "outside");
   await writeFile(join(cwd, "x.txt"), "x");
-  const editTool = createCodingTools(cwd).find((tool) => tool.name === "edit");
-  const [, editFiles] = createFilesystemTools(cwd, editTool);
-  await assert.rejects(() => editFiles.execute("1", { files: [
-    { path: "../outside", edits: [{ oldText: "x", newText: "y" }] },
+
+  const codingTools = createCodingTools(cwd);
+  const nativeRead = codingTools.find((tool) => tool.name === "read");
+  const editTool = codingTools.find((tool) => tool.name === "edit");
+  const [readFiles, editFiles] = createFilesystemTools(cwd, editTool);
+  assert.match((await nativeRead.execute("1", { path: outside })).content[0].text, /outside/);
+  assert.deepEqual(JSON.parse((await readFiles.execute("2", { paths: [outside] })).content[0].text), [
+    { path: outside, content: "outside" },
+  ]);
+  await assert.rejects(() => editFiles.execute("3", { files: [
+    { path: outside, edits: [{ oldText: "outside", newText: "changed" }] },
   ] }), /超出工作区/);
-  await assert.rejects(() => editFiles.execute("2", { files: [
+  await assert.rejects(() => editFiles.execute("4", { files: [
     { path: "x.txt", edits: [{ oldText: "x", newText: "1" }] },
     { path: "x.txt", edits: [{ oldText: "x", newText: "2" }] },
   ] }), /重复/);
