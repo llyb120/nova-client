@@ -20,6 +20,10 @@ function resolveCodeBuddyCliPath(cliPath, fileExists = existsSync) {
   return fileExists(npmCliPath) ? npmCliPath : cliPath;
 }
 
+function permissionModeFor(mode) {
+  return mode === "plan" ? "plan" : "bypassPermissions";
+}
+
 async function readRequest(lines) {
   const { value, done } = await lines[Symbol.asyncIterator]().next();
   if (done) throw new Error("Missing request");
@@ -115,7 +119,7 @@ async function runPrompt(lines, request) {
       includePartialMessages: true,
       pathToCodebuddyCode: cliPath,
       stderr: (data) => process.stderr.write(data),
-      permissionMode: request.mode === "plan" ? "plan" : "default",
+      permissionMode: permissionModeFor(request.mode),
       canUseTool: (tool, toolInput, options) => new Promise((resolve) => {
         pending.set(options.toolUseID, resolve);
         send({ type: "permission", permission: { id: options.toolUseID, permission: tool, metadata: toolInput } });
@@ -189,4 +193,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { promptMessages, resolveCodeBuddyCliPath };
+export { permissionModeFor, promptMessages, resolveCodeBuddyCliPath };
