@@ -47,21 +47,27 @@ async function* promptMessages(request) {
   yield { type: "user", session_id: request.sessionId || "", message: { role: "user", content }, parent_tool_use_id: null };
 }
 
-function emitContent(message, streamedBlocks) {
-  for (const [index, block] of (message.message?.content ?? []).entries()) {
-    const id = block.id ?? `${message.uuid}-${index}`;
-    if (block.type === "text" && !streamedBlocks.has(index)) send({ type: "item", item: { id, type: "agent_message", text: block.text } });
-    else if (block.type === "thinking" && !streamedBlocks.has(index)) send({ type: "item", item: { id, type: "reasoning", text: block.thinking } });
-    else if (block.type === "tool_use") send({ type: "item", item: { id, type: "mcp_tool_call", server: "CodeBuddy", tool: block.name, arguments: block.input, status: "in_progress" } });
-  }
+function assistantItems(message) {
+  return (message.message?.content ?? []).flatMap((block, index) => {
+    // Match the streaming item ID so the complete assistant message is the
+    // authoritative final snapshot, even when partial events were dropped.
+    const id = block.id ?? `${message.message.id}-${index}`;
+    if (block.type === "text") return [{ id, type: "agent_message", text: block.text }];
+    if (block.type === "thinking") return [{ id, type: "reasoning", text: block.thinking }];
+    if (block.type === "tool_use") return [{ id, type: "mcp_tool_call", server: "CodeBuddy", tool: block.name, arguments: block.input, status: "in_progress" }];
+    return [];
+  });
 }
 
-function emitStreamEvent(message, stream, streamedBlocks) {
+function emitContent(message) {
+  for (const item of assistantItems(message)) send({ type: "item", item });
+}
+
+function emitStreamEvent(message, stream) {
   const event = message.event;
   if (event.type === "message_start") {
     stream.messageId = event.message.id;
     stream.blocks.clear();
-    streamedBlocks.clear();
     return;
   }
   if (event.type === "content_block_start") {
@@ -79,14 +85,12 @@ function emitStreamEvent(message, stream, streamedBlocks) {
   const block = stream.blocks.get(event.index) ?? { type: delta.type === "text_delta" ? "text" : "thinking", text: "" };
   block.text += delta.type === "text_delta" ? delta.text : delta.thinking;
   stream.blocks.set(event.index, block);
-  streamedBlocks.add(event.index);
   send({ type: "item", item: { id: `${stream.messageId}-${event.index}`, type: block.type === "text" ? "agent_message" : "reasoning", text: block.text } });
 }
 
 async function runPrompt(lines, request) {
   const pending = new Map();
   const stream = { messageId: "message", blocks: new Map() };
-  const streamedBlocks = new Set();
   let sessionId = request.sessionId;
   let checkpoint;
   let activeQuery;
@@ -131,10 +135,10 @@ async function runPrompt(lines, request) {
       sessionId = message.session_id;
       send({ type: "ready", sessionId });
     }
-    else if (message.type === "stream_event") emitStreamEvent(message, stream, streamedBlocks);
+    else if (message.type === "stream_event") emitStreamEvent(message, stream);
     else if (message.type === "assistant") {
       checkpoint = message.uuid;
-      emitContent(message, streamedBlocks);
+      emitContent(message);
     }
     else if (message.type === "error") throw new Error(message.error);
     else if (message.type === "result") {
@@ -193,4 +197,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { permissionModeFor, promptMessages, resolveCodeBuddyCliPath };
+export { assistantItems, permissionModeFor, promptMessages, resolveCodeBuddyCliPath };
