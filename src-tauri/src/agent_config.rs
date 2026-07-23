@@ -379,12 +379,8 @@ fn sync_markdown(path: &Path, content: &str) -> Result<(&'static str, String), S
         if !removed {
             return Ok(("inactive", "未修改现有配置".into()));
         }
-        if next.trim().is_empty() {
-            fs::remove_file(path).map_err(|e| e.to_string())?;
-        } else {
-            fs::write(path, next).map_err(|e| e.to_string())?;
-        }
-        return Ok(("inactive", "已移除 Nova 托管区块".into()));
+        fs::write(path, next).map_err(|e| e.to_string())?;
+        return Ok(("inactive", "已移除 Nova 托管区块，保留目标文件".into()));
     }
     ensure_parent(path)?;
     let had_content = !existing.trim().is_empty();
@@ -412,8 +408,8 @@ fn sync_cursor_rule(path: &Path, content: &str) -> Result<(&'static str, String)
         }
         let existing = fs::read_to_string(path).unwrap_or_default();
         if existing.contains(CURSOR_MARKER) {
-            fs::remove_file(path).map_err(|e| e.to_string())?;
-            return Ok(("inactive", "已移除 Nova Cursor Rule".into()));
+            fs::write(path, "").map_err(|e| e.to_string())?;
+            return Ok(("inactive", "已移除 Nova Cursor Rule，保留目标文件".into()));
         }
         return Ok(("inactive", "未修改现有配置".into()));
     }
@@ -504,9 +500,29 @@ mod tests {
     }
 
     #[test]
-    fn cursor_adapter_is_always_apply() {
+    fn disabling_markdown_adapter_keeps_target_file() {
+        let path = std::env::temp_dir().join(format!("nova-agent-config-{}.md", uuid::Uuid::new_v4()));
+        fs::write(&path, managed_block("Nova rule")).unwrap();
+
+        sync_markdown(&path, "").unwrap();
+
+        assert!(path.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cursor_adapter_is_always_apply_and_disabling_keeps_target_file() {
         let rule = cursor_rule_content("Use Chinese.");
         assert!(rule.contains("alwaysApply: true"));
         assert!(rule.contains(CURSOR_MARKER));
+
+        let path = std::env::temp_dir().join(format!("nova-agent-config-{}.mdc", uuid::Uuid::new_v4()));
+        fs::write(&path, rule).unwrap();
+        sync_cursor_rule(&path, "").unwrap();
+
+        assert!(path.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        fs::remove_file(path).unwrap();
     }
 }
