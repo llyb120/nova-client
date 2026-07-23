@@ -55,6 +55,7 @@ async function loadSlimMemory(sessionId) {
           pendingMessages: Array.isArray(parsed.pendingMessages) ? parsed.pendingMessages : [],
           fullMessages: Array.isArray(parsed.fullMessages) ? parsed.fullMessages : [],
           contextTokens: Number(parsed.contextTokens) || 0,
+          contextStage: parsed.contextStage === "slim" ? "slim" : "full",
         }
       : createSlimMemory();
   } catch {
@@ -122,16 +123,27 @@ async function prompt(request, commands) {
   const slimContext = request.vegaSlimContext === true;
   let memory = createSlimMemory();
   let useFullContext = false;
+  let enteredSlimStage = false;
   let maxContextTokens = Number.POSITIVE_INFINITY;
+  let maxContextChars = Number.POSITIVE_INFINITY;
   if (slimContext) {
     memory = await loadSlimMemory(sessionId);
     if (!memory.summary && !memory.turns.length && request.sessionId) {
       seedSlimMemoryFromMessages(memory, await loadMessages(request.sessionId));
     }
-    maxContextTokens = Math.max(2_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.75));
-    useFullContext = shouldUseFullContext(memory, maxContextTokens);
+    maxContextTokens = Math.max(2_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.8));
+    maxContextChars = Math.max(8_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.8));
+    useFullContext = shouldUseFullContext(memory, maxContextTokens, maxContextChars);
+    if (!useFullContext && memory.contextStage === "full") {
+      // Stage one only drops native thinking/tool trajectories. Token usage from that native
+      // request must not immediately trigger stage-two summarization.
+      memory.contextStage = "slim";
+      memory.contextTokens = 0;
+      memory.fullMessages = [];
+      enteredSlimStage = true;
+    }
     appendSlimTurn(memory, input.text);
-    await compactSlimMemory(memory, async (earlier) => {
+    const compacted = !enteredSlimStage && await compactSlimMemory(memory, async (earlier) => {
       const summaryRuntime = await createAlkaidAgent({
         cwd: request.cwd,
         model: resolved.model,
@@ -156,13 +168,15 @@ async function prompt(request, commands) {
         await summaryRuntime.close();
       }
     }, {
-      currentTokens: memory.contextTokens,
+      // Stage two is capacity-based: only summarize after prompt/conclusion memory itself reaches
+      // the limit. The turn threshold is exclusively a stage-one transition trigger.
+      maxTurns: Number.POSITIVE_INFINITY,
+      currentTokens: memory.contextStage === "slim" ? memory.contextTokens : 0,
       maxTokens: maxContextTokens,
-      // Keep the previous character estimate only when the provider reports no token usage.
-      maxChars: memory.contextTokens > 0
-        ? Number.POSITIVE_INFINITY
-        : Math.max(8_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.75)),
+      // Keep the character estimate only when the provider reports no token usage.
+      maxChars: memory.contextTokens > 0 ? Number.POSITIVE_INFINITY : maxContextChars,
     });
+    if (compacted) memory.contextTokens = 0;
   }
   let nativeMessages;
   if (!slimContext) nativeMessages = await loadMessages(request.sessionId);
@@ -265,10 +279,22 @@ async function prompt(request, commands) {
       if (!outcome.cancelled && last?.role === "assistant" && last.stopReason !== "error") {
         setLatestConclusion(memory, last.content);
         memory.pendingMessages = [];
-        memory.contextTokens = contextTokensFromMessages(runtime.agent.state.messages);
-        if (memory.turns.length < 10 && memory.contextTokens < maxContextTokens) {
-          memory.fullMessages = structuredClone(runtime.agent.state.messages);
+        const measuredTokens = contextTokensFromMessages(runtime.agent.state.messages);
+        if (memory.contextStage === "full") {
+          memory.contextTokens = measuredTokens;
+          const belowCapacity = measuredTokens > 0
+            ? measuredTokens < maxContextTokens
+            : JSON.stringify(runtime.agent.state.messages).length < maxContextChars;
+          if (memory.turns.length < 10 && belowCapacity) {
+            memory.fullMessages = structuredClone(runtime.agent.state.messages);
+          } else {
+            // Enter stage two without summarizing yet. Its own usage is measured on the next turn.
+            memory.contextStage = "slim";
+            memory.contextTokens = 0;
+            memory.fullMessages = [];
+          }
         } else {
+          memory.contextTokens = measuredTokens;
           memory.fullMessages = [];
         }
       } else if (outcome.cancelled) {

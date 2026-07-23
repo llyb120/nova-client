@@ -225,6 +225,33 @@ test("Vega slim context keeps complete early messages until its turn or token th
   memory.contextTokens = 1;
   while (memory.turns.length < 10) appendSlimTurn(memory, `prompt ${memory.turns.length}`);
   assert.equal(shouldUseFullContext(memory, 1_000), false);
+  memory.contextStage = "slim";
+  memory.contextTokens = 0;
+  assert.equal(shouldUseFullContext(memory, 1_000), false);
+});
+
+test("Vega slim context uses separate thresholds for trajectory removal and summarization", async () => {
+  const memory = createSlimMemory();
+  for (let index = 1; index <= 11; index += 1) {
+    appendSlimTurn(memory, `prompt ${index}`);
+    setLatestConclusion(memory, `conclusion ${index}`);
+  }
+  memory.contextStage = "slim";
+  memory.contextTokens = 0;
+
+  assert.equal(await compactSlimMemory(memory, async () => assert.fail("stage one must not summarize"), {
+    maxTurns: Number.POSITIVE_INFINITY,
+    currentTokens: memory.contextTokens,
+    maxTokens: 750,
+  }), false);
+  memory.contextTokens = 750;
+  assert.equal(await compactSlimMemory(memory, async () => "stage two summary", {
+    maxTurns: Number.POSITIVE_INFINITY,
+    currentTokens: memory.contextTokens,
+    maxTokens: 750,
+  }), true);
+  assert.equal(memory.summary, "stage two summary");
+  assert.deepEqual(memory.turns.map((turn) => turn.conclusion), ["conclusion 11"]);
 });
 
 test("Vega slim context measures the largest native request instead of cumulative turn usage", () => {

@@ -15,6 +15,9 @@ const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOV
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
 const CURSOR_SLIM_MEMORY_TURNS = positiveInteger(process.env.NOVA_CURSOR_SLIM_MEMORY_TURNS, 10);
+const CURSOR_CONTEXT_WINDOW = positiveInteger(process.env.NOVA_CURSOR_CONTEXT_WINDOW, 128_000);
+const CURSOR_CONTEXT_THRESHOLD = Math.max(2_000, Math.floor(CURSOR_CONTEXT_WINDOW * 0.8));
+const CURSOR_CONTEXT_CHAR_THRESHOLD = Math.max(8_000, Math.floor(CURSOR_CONTEXT_WINDOW * 0.8));
 const CURSOR_SLIM_MEMORY_DIR = process.env.NOVA_CURSOR_SLIM_MEMORY_DIR
   || join(process.env.NOVA_DATA_DIR || join(homedir(), ".nova"), "cursor-slim-memory");
 
@@ -69,11 +72,18 @@ function compactConversation(turns, maxChars = CURSOR_RECOVERY_CONTEXT_CHARS) {
 }
 
 function createSlimMemory() {
-  return { summary: "", turns: [], pendingTurn: "" };
+  return {
+    summary: "",
+    turns: [],
+    pendingTurn: "",
+    fullTurns: [],
+    contextTokens: 0,
+    contextStage: "full",
+  };
 }
 
 function isSlimMemoryEmpty(memory) {
-  return !(memory?.summary || memory?.turns?.length || memory?.pendingTurn);
+  return !(memory?.summary || memory?.turns?.length || memory?.pendingTurn || memory?.fullTurns?.length);
 }
 
 function messageText(message) {
@@ -86,14 +96,19 @@ function withMessageText(message, text) {
 
 function formatSlimMemory(memory) {
   const sections = [];
-  if (memory.summary) sections.push("## Summary of earlier turns", memory.summary);
-  if (memory.turns?.length) {
-    if (sections.length) sections.push("");
-    sections.push("## Recent turns");
-    memory.turns.forEach((turn, index) => {
-      sections.push(`### Turn ${index + 1}`, `User: ${turn.userPrompt}`);
-      if (turn.conclusion) sections.push(`Conclusion: ${turn.conclusion}`);
-    });
+  if (memory.contextStage !== "slim" && memory.fullTurns?.length) {
+    sections.push("## Complete earlier turns");
+    memory.fullTurns.forEach((turn, index) => sections.push(`### Turn ${index + 1}`, turn));
+  } else {
+    if (memory.summary) sections.push("## Summary of earlier turns", memory.summary);
+    if (memory.turns?.length) {
+      if (sections.length) sections.push("");
+      sections.push("## Recent turns");
+      memory.turns.forEach((turn, index) => {
+        sections.push(`### Turn ${index + 1}`, `User: ${turn.userPrompt}`);
+        if (turn.conclusion) sections.push(`Conclusion: ${turn.conclusion}`);
+      });
+    }
   }
   if (memory.pendingTurn) {
     if (sections.length) sections.push("");
@@ -162,6 +177,15 @@ function messageWithRecoveryContext(message, history) {
   return withMessageText(message, `${prefix}\n${messageText(message)}`);
 }
 
+function contextTokensFromUsage(usage) {
+  if (!usage || typeof usage !== "object") return 0;
+  const total = Number(usage.totalTokens ?? usage.total_tokens);
+  if (total > 0) return total;
+  return ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]
+    .reduce((sum, key) => sum + (Number(usage[key]) || 0), 0);
+}
+
 function extractTurnConclusion(state, result) {
   const fromResult = String(result?.result ?? "").trim();
   if (fromResult) return fromResult;
@@ -179,8 +203,16 @@ function recordSlimTurn(memory, userMessage, conclusion) {
   return memory;
 }
 
-async function compressSlimMemory(memory, summarize, maxTurns = CURSOR_SLIM_MEMORY_TURNS) {
-  if (memory.turns.length <= maxTurns || memory.turns.length < 2) return false;
+async function compressSlimMemory(memory, summarize, {
+  maxChars = CURSOR_CONTEXT_CHAR_THRESHOLD,
+  currentTokens = memory.contextTokens ?? 0,
+  maxTokens = CURSOR_CONTEXT_THRESHOLD,
+} = {}) {
+  const formattedLength = formatSlimMemory({ ...memory, pendingTurn: "", contextStage: "slim" }).length;
+  const belowCapacity = currentTokens > 0
+    ? currentTokens < maxTokens
+    : formattedLength < maxChars;
+  if (memory.contextStage !== "slim" || belowCapacity || memory.turns.length < 2) return false;
   const latestTurn = memory.turns.at(-1);
   const earlier = {
     summary: memory.summary,
@@ -246,13 +278,18 @@ async function loadSlimMemory(sessionKey) {
           conclusion: String(turn?.conclusion ?? ""),
         })),
         pendingTurn: String(parsed.pendingTurn ?? ""),
+        fullTurns: Array.isArray(parsed.fullTurns) ? parsed.fullTurns.map(String) : [],
+        contextTokens: Number(parsed.contextTokens) || 0,
+        // Older files only contain prompt/conclusion memory and must resume directly in stage two.
+        contextStage: parsed.contextStage === "full" ? "full" : "slim",
       };
     }
     // Migrate the first slim-memory format, which stored prompts and conclusions separately.
     const prompts = Array.isArray(parsed?.userPrompts) ? parsed.userPrompts : [];
     const conclusions = Array.isArray(parsed?.conclusions) ? parsed.conclusions : [];
     return {
-      summary: "",
+      ...createSlimMemory(),
+      contextStage: "slim",
       turns: Array.from({ length: Math.max(prompts.length, conclusions.length) }, (_, index) => ({
         userPrompt: String(prompts[index] ?? ""),
         conclusion: String(conclusions[index] ?? ""),
@@ -267,10 +304,13 @@ async function saveSlimMemory(sessionKey, memory) {
   if (!sessionKey) return;
   await mkdir(CURSOR_SLIM_MEMORY_DIR, { recursive: true });
   await writeFile(slimMemoryPath(sessionKey), `${JSON.stringify({
-    version: 3,
+    version: 4,
     summary: memory.summary ?? "",
     turns: memory.turns ?? [],
     pendingTurn: memory.pendingTurn ?? "",
+    fullTurns: memory.fullTurns ?? [],
+    contextTokens: memory.contextTokens ?? 0,
+    contextStage: memory.contextStage ?? "full",
   })}\n`, "utf8");
 }
 
@@ -305,6 +345,7 @@ async function seedSlimMemoryFromSession(memory, sessionId, request, sdk = Agent
     ).catch(() => ({ items: [] }));
     const history = await recoveryHistory(runs.items);
     ingestCompactHistory(memory, history);
+    if (!isSlimMemoryEmpty(memory)) memory.contextStage = "slim";
     return !isSlimMemoryEmpty(memory);
   } catch {
     return false;
@@ -854,13 +895,35 @@ async function main() {
           if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
           memory.pendingTurn = "";
           recordSlimTurn(memory, originalMessage, extractTurnConclusion(state, result));
-          await summarizeSlimMemory(memory, request).catch((error) => {
+          if (memory.contextStage === "full") {
+            memory.fullTurns.push(formatInterruptedTurn(originalMessage, state));
+          }
+          const turnUsage = usage ?? result.usage;
+          const measuredTokens = contextTokensFromUsage(turnUsage);
+          if (memory.contextStage === "full") {
+            const fullContextChars = formatSlimMemory(memory).length;
+            if (memory.turns.length >= CURSOR_SLIM_MEMORY_TURNS
+              || (measuredTokens > 0 && measuredTokens >= CURSOR_CONTEXT_THRESHOLD)
+              || (measuredTokens === 0 && fullContextChars >= CURSOR_CONTEXT_CHAR_THRESHOLD)) {
+              // Stage one removes completed thinking/tool traces without summarizing conclusions.
+              memory.contextStage = "slim";
+              memory.contextTokens = 0;
+              memory.fullTurns = [];
+            } else {
+              memory.contextTokens = measuredTokens;
+            }
+          } else {
+            memory.contextTokens = measuredTokens;
+          }
+          await summarizeSlimMemory(memory, request).then((compacted) => {
+            if (compacted) memory.contextTokens = 0;
+          }).catch((error) => {
             process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
           await saveSlimMemory(memoryKey, memory).catch((error) => {
             process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
-          send({ type: "done", usage: usage ?? result.usage });
+          send({ type: "done", usage: turnUsage });
           completed = true;
         } catch (error) {
           const retryable = error instanceof CursorStartupTimeout && !producedOutput && attempt < CURSOR_SILENT_RETRIES;
@@ -913,6 +976,7 @@ export {
   createSlimMemory,
   cursorModelOptions,
   cursorTodoPlan,
+  contextTokensFromUsage,
   extractTurnConclusion,
   formatInterruptedTurn,
   formatSlimMemory,

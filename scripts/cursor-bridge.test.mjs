@@ -6,6 +6,7 @@ const {
   compactConversation,
   completePendingTools,
   compressSlimMemory,
+  contextTokensFromUsage,
   createMessageState,
   createSlimMemory,
   cursorModelOptions,
@@ -299,8 +300,13 @@ const compressible = createSlimMemory();
 for (let index = 1; index <= 10; index += 1) {
   recordSlimTurn(compressible, `user prompt ${index}`, `conclusion ${index}`);
 }
+compressible.contextStage = "slim";
 assert.equal(
-  await compressSlimMemory(compressible, async () => assert.fail("10 turns must not compress")),
+  await compressSlimMemory(compressible, async () => assert.fail("stage one must not summarize"), {
+    currentTokens: 0,
+    maxTokens: 750,
+    maxChars: 100_000,
+  }),
   false,
 );
 recordSlimTurn(compressible, "latest user prompt must remain exact", "latest conclusion");
@@ -308,7 +314,7 @@ let summaryInput = "";
 assert.equal(await compressSlimMemory(compressible, async (input) => {
   summaryInput = input;
   return "Summary of the first ten turns.";
-}), true);
+}, { currentTokens: 750, maxTokens: 750 }), true);
 assert.match(summaryInput, /user prompt 1/);
 assert.match(summaryInput, /user prompt 10/);
 assert.doesNotMatch(summaryInput, /latest user prompt/);
@@ -317,6 +323,8 @@ assert.deepEqual(compressible.turns, [{
   userPrompt: "latest user prompt must remain exact",
   conclusion: "latest conclusion",
 }]);
+assert.equal(contextTokensFromUsage({ totalTokens: 900, inputTokens: 800 }), 900);
+assert.equal(contextTokensFromUsage({ input_tokens: 700, output_tokens: 50 }), 750);
 
 const conclusionState = createMessageState();
 conclusionState.texts.set("run-assistant-1", "Final answer from the assistant.");
