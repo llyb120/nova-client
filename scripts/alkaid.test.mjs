@@ -7,9 +7,10 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
-import { alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
+import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
 import {
   alkaidPromptInput,
+  alkaidSkillsRoot,
   alkaidUserMessage,
   buildAlkaidSystemPrompt,
   clampPromptCacheKey,
@@ -22,6 +23,7 @@ import {
   formatAlkaidSkillsPrompt,
   injectOpenAIPromptCacheKey,
   isRetryableAlkaidProviderError,
+  loadAlkaidAgentInstructions,
   loadAlkaidSkills,
   mergeAlkaidUsage,
   resolveAlkaidShellConfig,
@@ -311,6 +313,31 @@ test("many skills are compressed for prompt cache", () => {
   assert.match(compressed, /Skills under .*\/<name>\/SKILL\.md:/);
   assert.doesNotMatch(compressed, /<available_skills>/);
   assert.ok(compressed.length < verbose.length * 3);
+});
+
+test("Vega uses the data directory selected by the host build", () => {
+  const env = { NOVA_DATA_DIR: join("/tmp", ".novadev") };
+  assert.equal(alkaidDataRoot("/home/user", env), join("/tmp", ".novadev", "alkaid"));
+  assert.equal(alkaidSkillsRoot("/home/user", env), join("/tmp", ".novadev", "alkaid", "skills"));
+  assert.equal(alkaidDataRoot("/home/user", {}), join("/home/user", ".nova", "alkaid"));
+});
+
+test("Vega loads its managed AGENTS.md into the system prompt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "alkaid-agents-"));
+  const instructionsPath = join(root, "AGENTS.md");
+  await writeFile(instructionsPath, "Always answer in Chinese.\n", "utf8");
+  assert.equal(await loadAlkaidAgentInstructions(instructionsPath), "Always answer in Chinese.\n");
+
+  const runtime = await createAlkaidAgent({
+    cwd: root,
+    model: configuredModel,
+    agentInstructionsPath: instructionsPath,
+  });
+  try {
+    assert.match(runtime.agent.state.systemPrompt, /Always answer in Chinese\./);
+  } finally {
+    await runtime.close();
+  }
 });
 
 test("system prompt keeps stable Alkaid policy before dynamic cwd/skills", () => {

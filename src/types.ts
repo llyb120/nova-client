@@ -399,6 +399,7 @@ export interface AgentInstructionTarget {
   path: string;
   status: "inactive" | "pending" | "merged" | "managed" | "conflict" | "error";
   detail: string;
+  enabled: boolean;
 }
 
 export interface GlobalAgentInstructions {

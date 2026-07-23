@@ -2621,6 +2621,15 @@ button {
   gap: 10px;
   flex-wrap: wrap;
 }
+.agent-config-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.agent-config-toggle input {
+  margin: 0;
+}
 .agent-config-status {
   margin-left: auto;
   font-size: 11px;

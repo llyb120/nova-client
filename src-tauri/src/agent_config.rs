@@ -2,12 +2,13 @@
 //! 再按各后端的原生用户级入口生成托管配置。
 
 use crate::threads::AgentKind;
-use serde::Serialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const CENTRAL_FILE: &str = "global-agent-instructions.md";
+const ADAPTERS_FILE: &str = "global-agent-adapters.json";
 const BLOCK_START: &str = "<!-- NOVA_GLOBAL_INSTRUCTIONS_START -->";
 const BLOCK_END: &str = "<!-- NOVA_GLOBAL_INSTRUCTIONS_END -->";
 const CURSOR_MARKER: &str = "<!-- NOVA_GLOBAL_INSTRUCTIONS_CURSOR -->";
@@ -20,6 +21,7 @@ pub struct AgentInstructionTarget {
     pub path: String,
     pub status: String,
     pub detail: String,
+    pub enabled: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -28,6 +30,12 @@ pub struct GlobalAgentInstructions {
     pub content: String,
     pub path: String,
     pub targets: Vec<AgentInstructionTarget>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AdapterPreferences {
+    disabled_agent_kinds: HashSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -47,10 +55,11 @@ pub fn get_global_instructions(config_dir: &Path) -> GlobalAgentInstructions {
     let central = central_path(config_dir);
     let content = fs::read_to_string(&central).unwrap_or_default();
     let active = !content.trim().is_empty();
-    let targets = normal_targets()
+    let disabled = read_adapter_preferences(config_dir).disabled_agent_kinds;
+    let targets = normal_targets(config_dir)
         .unwrap_or_default()
         .iter()
-        .map(|target| inspect_target(target, active))
+        .map(|target| inspect_target(target, active, !disabled.contains(target.kind.as_str())))
         .collect();
     GlobalAgentInstructions {
         content,
@@ -62,6 +71,7 @@ pub fn get_global_instructions(config_dir: &Path) -> GlobalAgentInstructions {
 pub fn set_global_instructions(
     config_dir: &Path,
     content: &str,
+    enabled_agent_kinds: &[String],
 ) -> Result<GlobalAgentInstructions, String> {
     if content.contains(BLOCK_START)
         || content.contains(BLOCK_END)
@@ -72,17 +82,35 @@ pub fn set_global_instructions(
     fs::create_dir_all(config_dir).map_err(|e| format!("创建 Nova 配置目录失败：{e}"))?;
     let central = central_path(config_dir);
     let active = !content.trim().is_empty();
+    let enabled: HashSet<&str> = enabled_agent_kinds.iter().map(String::as_str).collect();
+    let all_targets = normal_targets(config_dir)?;
+    let disabled_agent_kinds = all_targets
+        .iter()
+        .filter(|target| !enabled.contains(target.kind.as_str()))
+        .map(|target| target.kind.as_str().to_string())
+        .collect();
+    write_adapter_preferences(
+        config_dir,
+        &AdapterPreferences {
+            disabled_agent_kinds,
+        },
+    )?;
     if active {
         fs::write(&central, content).map_err(|e| format!("保存全局指令失败：{e}"))?;
     }
-    let targets = if cfg!(debug_assertions) {
-        Vec::new()
-    } else {
-        normal_targets()?
-            .iter()
-            .map(|target| sync_target(target, if active { content } else { "" }))
-            .collect()
-    };
+    let targets = all_targets
+        .iter()
+        .map(|target| {
+            let target_enabled = enabled.contains(target.kind.as_str());
+            if cfg!(debug_assertions) {
+                inspect_target(target, active, target_enabled)
+            } else if target_enabled {
+                sync_target(target, if active { content } else { "" }, true)
+            } else {
+                sync_target(target, "", false)
+            }
+        })
+        .collect();
     if !active {
         let _ = fs::remove_file(&central);
     }
@@ -103,8 +131,10 @@ pub fn sync_global_instructions(config_dir: &Path) -> Result<(), String> {
         return Ok(());
     }
     let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
-    for target in normal_targets()? {
-        let _ = sync_target(&target, &content);
+    let disabled = read_adapter_preferences(config_dir).disabled_agent_kinds;
+    for target in normal_targets(config_dir)? {
+        let enabled = !disabled.contains(target.kind.as_str());
+        let _ = sync_target(&target, if enabled { &content } else { "" }, enabled);
     }
     Ok(())
 }
@@ -119,11 +149,11 @@ pub fn sync_backend_with_env(
         return Ok(());
     }
     let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
-    if content.trim().is_empty() {
-        return Ok(());
-    }
+    let enabled = !read_adapter_preferences(config_dir)
+        .disabled_agent_kinds
+        .contains(kind.as_str());
     let target = target_for(kind, env)?;
-    let _ = sync_target(&target, &content);
+    let _ = sync_target(&target, if enabled { &content } else { "" }, enabled);
     Ok(())
 }
 
@@ -131,8 +161,29 @@ fn central_path(config_dir: &Path) -> PathBuf {
     config_dir.join(CENTRAL_FILE)
 }
 
-fn normal_targets() -> Result<Vec<Target>, String> {
-    let env = HashMap::new();
+fn read_adapter_preferences(config_dir: &Path) -> AdapterPreferences {
+    fs::read_to_string(config_dir.join(ADAPTERS_FILE))
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn write_adapter_preferences(
+    config_dir: &Path,
+    preferences: &AdapterPreferences,
+) -> Result<(), String> {
+    let path = config_dir.join(ADAPTERS_FILE);
+    let content = serde_json::to_string_pretty(preferences)
+        .map_err(|e| format!("序列化后端适配配置失败：{e}"))?;
+    fs::write(path, content).map_err(|e| format!("保存后端适配配置失败：{e}"))
+}
+
+fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
+    let mut env = HashMap::new();
+    env.insert(
+        "NOVA_DATA_DIR".to_string(),
+        config_dir.to_string_lossy().into_owned(),
+    );
     [
         AgentKind::Alkaid,
         AgentKind::Devin,
@@ -155,7 +206,10 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
     let (label, path, format) = match kind {
         AgentKind::Alkaid => (
             "Vega",
-            home.join(".nova").join("alkaid").join("AGENTS.md"),
+            configured_dir(overrides, "NOVA_DATA_DIR")
+                .unwrap_or_else(|| home.join(".nova"))
+                .join("alkaid")
+                .join("AGENTS.md"),
             TargetFormat::Markdown,
         ),
         AgentKind::Devin => {
@@ -240,40 +294,58 @@ fn user_home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn sync_target(target: &Target, content: &str) -> AgentInstructionTarget {
+fn sync_target(target: &Target, content: &str, enabled: bool) -> AgentInstructionTarget {
     let result = match target.format {
         TargetFormat::Markdown => sync_markdown(&target.path, content),
         TargetFormat::CursorRule => sync_cursor_rule(&target.path, content),
     };
     match result {
-        Ok((status, detail)) => target_status(target, status, detail),
-        Err(error) => target_status(target, "error", error.to_string()),
+        Ok((status, detail)) => target_status(target, status, detail, enabled),
+        Err(error) => target_status(target, "error", error.to_string(), enabled),
     }
 }
 
-fn inspect_target(target: &Target, active: bool) -> AgentInstructionTarget {
+fn inspect_target(target: &Target, active: bool, enabled: bool) -> AgentInstructionTarget {
+    if !enabled {
+        return target_status(target, "inactive", "已取消适配".into(), false);
+    }
     if !active {
-        return target_status(target, "inactive", "未启用".into());
+        return target_status(target, "inactive", "未启用".into(), true);
     }
     if is_symlink(&target.path) {
-        return target_status(target, "conflict", "目标是符号链接，未覆盖".into());
+        return target_status(target, "conflict", "目标是符号链接，未覆盖".into(), true);
     }
     if !target.path.exists() {
-        return target_status(target, "pending", "保存时创建原生配置入口".into());
+        return target_status(target, "pending", "保存时创建原生配置入口".into(), true);
     }
     let Ok(existing) = fs::read_to_string(&target.path) else {
-        return target_status(target, "conflict", "现有文件不是可合并的 UTF-8 文本".into());
+        return target_status(
+            target,
+            "conflict",
+            "现有文件不是可合并的 UTF-8 文本".into(),
+            true,
+        );
     };
     let managed = match target.format {
         TargetFormat::Markdown => existing.contains(BLOCK_START) && existing.contains(BLOCK_END),
         TargetFormat::CursorRule => existing.contains(CURSOR_MARKER),
     };
     if managed {
-        target_status(target, "managed", "已由 Nova 托管".into())
+        target_status(target, "managed", "已由 Nova 托管".into(), true)
     } else if matches!(target.format, TargetFormat::Markdown) {
-        target_status(target, "pending", "保存时保留原内容并合并 Nova 指令".into())
+        target_status(
+            target,
+            "pending",
+            "保存时保留原内容并合并 Nova 指令".into(),
+            true,
+        )
     } else {
-        target_status(target, "conflict", "同名 Cursor Rule 已存在，未覆盖".into())
+        target_status(
+            target,
+            "conflict",
+            "同名 Cursor Rule 已存在，未覆盖".into(),
+            true,
+        )
     }
 }
 
@@ -281,6 +353,7 @@ fn target_status(
     target: &Target,
     status: impl Into<String>,
     detail: String,
+    enabled: bool,
 ) -> AgentInstructionTarget {
     AgentInstructionTarget {
         agent_kind: target.kind.as_str().to_string(),
@@ -288,6 +361,7 @@ fn target_status(
         path: target.path.to_string_lossy().to_string(),
         status: status.into(),
         detail,
+        enabled,
     }
 }
 

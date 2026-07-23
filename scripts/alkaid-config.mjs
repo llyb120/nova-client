@@ -2,8 +2,8 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export function alkaidDataRoot(home = homedir()) {
-  return join(home, ".nova", "alkaid");
+export function alkaidDataRoot(home = homedir(), env = process.env) {
+  return join(env.NOVA_DATA_DIR || join(home, ".nova"), "alkaid");
 }
 
 function stripJsonComments(text) {

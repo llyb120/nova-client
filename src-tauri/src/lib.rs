@@ -3493,8 +3493,9 @@ fn get_global_agent_instructions(
 fn set_global_agent_instructions(
     state: State<'_, AppState>,
     content: String,
+    enabled_agent_kinds: Vec<String>,
 ) -> Result<agent_config::GlobalAgentInstructions, String> {
-    agent_config::set_global_instructions(&state.config_dir, &content)
+    agent_config::set_global_instructions(&state.config_dir, &content, &enabled_agent_kinds)
 }
 
 #[tauri::command]

@@ -8,7 +8,7 @@ use crate::threads::{
     file_uri_to_local_path, now_ms, save_attachment_to_temp, AgentKind, CodexUsageSnapshot, Item,
     PromptImage, ToolCall,
 };
-use crate::AppState;
+use crate::{nova_data_dir, AppState};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -899,7 +899,10 @@ impl SdkManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env(launch.path_env, &program);
+            .env(launch.path_env, &program)
+            // Node bridges also persist app-owned state. Pin them to the same profile-specific
+            // root as Rust so debug builds never fall back to the release ~/.nova directory.
+            .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
         if !self.launch_env.is_empty() {
             crate::credential_roaming::isolate_borrowed_command(&mut command);
             command.envs(&self.launch_env);

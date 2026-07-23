@@ -46,8 +46,12 @@ function safeEditPath(root, input) {
   return path;
 }
 
-export function alkaidSkillsRoot(home = homedir()) {
-  return join(home, ".nova", "alkaid", "skills");
+function alkaidDataRoot(home = homedir(), env = process.env) {
+  return join(env.NOVA_DATA_DIR || join(home, ".nova"), "alkaid");
+}
+
+export function alkaidSkillsRoot(home = homedir(), env = process.env) {
+  return join(alkaidDataRoot(home, env), "skills");
 }
 
 export async function alkaidPromptInput(parts = []) {
@@ -289,6 +293,13 @@ export function optimizeAlkaidSystemPrompt(stableParts, dynamicParts) {
   return `${stable}\n\n---\n\n${dynamic}`;
 }
 
+export async function loadAlkaidAgentInstructions(path = join(alkaidDataRoot(), "AGENTS.md")) {
+  return readFile(path, "utf8").catch((error) => {
+    if (error?.code === "ENOENT") return "";
+    throw new Error(`读取 Vega AGENTS.md 失败：${error instanceof Error ? error.message : String(error)}`);
+  });
+}
+
 export function buildAlkaidSystemPrompt(options = {}) {
   const cwd = (options.cwd ?? process.cwd()).replace(/\\/g, "/");
   const skills = options.skills ?? [];
@@ -437,12 +448,16 @@ export async function createAlkaidAgent(options = {}) {
   const editTool = codingTools.find((tool) => tool.name === "edit");
   const batchTools = createFilesystemTools(cwd, editTool);
   const tools = [...batchTools, ...codingTools, ...mcp.tools];
+  const agentInstructions = await loadAlkaidAgentInstructions(options.agentInstructionsPath);
+  const customInstructions = [agentInstructions.trim(), options.systemPrompt?.trim()]
+    .filter(Boolean)
+    .join("\n\n");
   const systemPrompt = buildAlkaidSystemPrompt({
     cwd,
     skills,
     readOnly: options.readOnly,
     shellConfig,
-    systemPrompt: options.systemPrompt,
+    systemPrompt: customInstructions,
   });
   const sessionId = options.sessionId;
   const api = options.model.api;

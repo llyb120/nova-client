@@ -326,7 +326,10 @@ export function SettingsModal(props: { onClose: () => void }) {
     setGlobalInstructionsBusy(true);
     setGlobalInstructionsMsg("");
     try {
-      const config = await api.setGlobalAgentInstructions(globalInstructions());
+      const enabledAgentKinds = globalInstructionTargets()
+        .filter((target) => target.enabled)
+        .map((target) => target.agentKind);
+      const config = await api.setGlobalAgentInstructions(globalInstructions(), enabledAgentKinds);
       setGlobalInstructions(config.content);
       setGlobalInstructionsPath(config.path);
       setGlobalInstructionTargets(config.targets);
@@ -337,7 +340,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       setGlobalInstructionsMsg(
         conflicts > 0
           ? `已同步，其余 ${conflicts} 个冲突入口未覆盖，请检查下方状态。`
-          : "已同步到所有后端；正在运行的 Agent 重启后读取新配置。",
+          : "已同步到启用的后端；正在运行的 Agent 重启后读取新配置。",
       );
       return config;
     } finally {
@@ -1292,7 +1295,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                 placeholder={globalInstructionsLoading() ? "加载中…" : "~/.nova/global-agent-instructions.md"}
               />
               <span class="field-hint">
-                只维护这一份内容；Nova 会按每个后端的原生规则入口分别适配。已有真实配置文件会保留原内容，只更新 Nova 托管区块。
+                只维护这一份内容；Nova 会按已启用后端的原生规则入口分别适配。已有真实配置文件会保留原内容，只更新 Nova 托管区块。
               </span>
             </div>
             <label class="field">
@@ -1315,7 +1318,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   disabled={globalInstructionsLoading() || globalInstructionsBusy()}
                   onClick={() => void syncGlobalInstructions()}
                 >
-                  {globalInstructionsBusy() ? "同步中…" : "保存并同步到所有后端"}
+                  {globalInstructionsBusy() ? "同步中…" : "保存并同步"}
                 </button>
                 <Show when={globalInstructionsMsg()}>
                   <span
@@ -1341,7 +1344,26 @@ export function SettingsModal(props: { onClose: () => void }) {
                     {(target) => (
                       <div class="wt-row">
                         <div class="wt-row-main">
-                          <span class={`agent-badge ${target.agentKind}`}>{target.label}</span>
+                          <label class="agent-config-toggle">
+                            <input
+                              type="checkbox"
+                              checked={target.enabled}
+                              disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                              onChange={(event) => {
+                                const enabled = event.currentTarget.checked;
+                                setGlobalInstructionTargets((targets) =>
+                                  targets.map((item) =>
+                                    item.agentKind === target.agentKind
+                                      ? { ...item, enabled, status: "inactive", detail: enabled ? "待同步" : "已取消适配" }
+                                      : item,
+                                  ),
+                                );
+                                setGlobalInstructionsDirty(true);
+                                setGlobalInstructionsMsg("");
+                              }}
+                            />
+                            <span class={`agent-badge ${target.agentKind}`}>{target.label}</span>
+                          </label>
                           <span class={`agent-config-status ${target.status}`}>{target.detail}</span>
                         </div>
                         <div class="wt-row-sub">

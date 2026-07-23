@@ -186,8 +186,8 @@ export const api = {
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   getGlobalAgentInstructions: () =>
     invoke<GlobalAgentInstructions>("get_global_agent_instructions"),
-  setGlobalAgentInstructions: (content: string) =>
-    invoke<GlobalAgentInstructions>("set_global_agent_instructions", { content }),
+  setGlobalAgentInstructions: (content: string, enabledAgentKinds: AgentKind[]) =>
+    invoke<GlobalAgentInstructions>("set_global_agent_instructions", { content, enabledAgentKinds }),
   /** 后端可用性检测结果（agentKind → 是否可用）；空 map = 尚未检测完成 */
   getBackendAvailability: () =>
     invoke<Record<string, boolean>>("get_backend_availability"),
