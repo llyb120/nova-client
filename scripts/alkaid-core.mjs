@@ -10,10 +10,10 @@ import {
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { delimiter, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const DEFAULT_BATCH_READ_LINES = 200;
@@ -292,7 +292,11 @@ export function buildAlkaidSystemPrompt(options = {}) {
     `- read_files: 并行读取多个 UTF-8 文本文件（可带 offset/limit）`,
     options.readOnly ? null : "- edit_files: 并行精确编辑多个互不依赖的已有文件",
     "- read: 读取单个文件",
-    options.readOnly ? "- grep / find / ls: 只读搜索与列举" : "- bash: 执行 Bash 命令",
+    options.readOnly
+      ? "- grep / find / ls: 只读搜索与列举"
+      : options.shellConfig?.kind === "powershell"
+        ? "- bash: 执行 PowerShell 命令"
+        : "- bash: 执行 Bash 命令",
     options.readOnly ? null : "- edit / write: 单文件编辑或写入",
   ].filter(Boolean);
 
@@ -304,7 +308,9 @@ export function buildAlkaidSystemPrompt(options = {}) {
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
     "完成修改后，必须基于仓库的依赖清单、工作区配置、构建脚本和 CI 配置识别可独立验证的工程单元及其依赖关系，并根据实际改动计算影响范围。对每个受影响单元运行成本最低且有效的检查；公共接口、共享代码、依赖、配置、代码生成或构建流程改动还必须覆盖受影响的使用方。不要预设语言、框架或架构，不得用一个单元的验证代替其他受影响单元。无法确定边界时扩大验证范围；无法执行时如实报告未验证范围、原因、建议命令和剩余风险。",
     options.shellConfig
-      ? `命令终端已确认使用 Bash（${options.shellConfig.shell}）；bash 工具必须从第一次调用起使用 Bash 语法，不要使用 PowerShell cmdlet。`
+      ? options.shellConfig.kind === "powershell"
+        ? `命令终端已确认使用 PowerShell（${options.shellConfig.shell}）；bash 工具在 Windows 下通过 PowerShell 执行命令，必须从第一次调用起使用 PowerShell 语法（cmdlet、\`;\` 串联多条命令、\`$env:NAME\` 访问环境变量），不要使用 Bash 语法（\`export\`、\`&&\` 串联在 Windows PowerShell 5.1 中不可用、POSIX 风格的 sed/awk/grep 调用）。`
+        : `命令终端已确认使用 Bash（${options.shellConfig.shell}）；bash 工具必须从第一次调用起使用 Bash 语法，不要使用 PowerShell cmdlet。`
       : "",
   ];
 
@@ -343,11 +349,35 @@ function createAlkaidStreamFn() {
   });
 }
 
-export function resolveAlkaidShellConfig(shellConfig, env = process.env) {
-  const shim = env.NOVA_SHELL_SHIM_BASH;
-  return process.platform === "win32" && shim
-    ? { ...shellConfig, shell: shim }
-    : shellConfig;
+// Windows 下依次尝试：System32 自带的 Windows PowerShell → PATH 上的 powershell.exe。
+export function findWindowsPowerShell(env = process.env) {
+  const roots = [env.SystemRoot, env.windir].filter(Boolean);
+  for (const root of roots) {
+    const candidate = join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    if (existsSync(candidate)) return candidate;
+  }
+  const pathEntry = Object.entries(env).find(([key]) => key.toLowerCase() === "path");
+  for (const dir of (pathEntry?.[1] ?? "").split(delimiter).filter(Boolean)) {
+    const candidate = join(dir, "powershell.exe");
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+// Vega 默认 shell 探测：Windows 直接使用 PowerShell（不再依赖 Git Bash），
+// 找不到 PowerShell 时兜底回退到 pi 的 bash 探测；其他平台维持 bash。
+export function detectAlkaidShellConfig(env = process.env, platform = process.platform) {
+  if (platform !== "win32") return getShellConfig();
+  const shell = findWindowsPowerShell(env);
+  return shell ? { shell, args: ["-c"], kind: "powershell" } : getShellConfig();
+}
+
+export function resolveAlkaidShellConfig(shellConfig, env = process.env, platform = process.platform) {
+  if (!shellConfig || platform !== "win32") return shellConfig;
+  const shim = shellConfig.kind === "powershell"
+    ? env.NOVA_SHELL_SHIM_POWERSHELL
+    : env.NOVA_SHELL_SHIM_BASH;
+  return shim ? { ...shellConfig, shell: shim } : shellConfig;
 }
 
 function mcpResult(result) {
@@ -395,7 +425,7 @@ export async function createAlkaidAgent(options = {}) {
   const cwd = resolve(options.cwd ?? process.cwd());
   const { skills } = loadAlkaidSkills(options.skillsRoot ?? alkaidSkillsRoot());
   const mcp = await connectMcpServers(options.mcpServers, cwd);
-  const detectedShellConfig = options.readOnly ? null : (options.shellConfig ?? getShellConfig());
+  const detectedShellConfig = options.readOnly ? null : (options.shellConfig ?? detectAlkaidShellConfig());
   const shellConfig = detectedShellConfig && resolveAlkaidShellConfig(detectedShellConfig);
   const codingTools = options.readOnly
     ? createReadOnlyTools(cwd)

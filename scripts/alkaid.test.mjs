@@ -16,7 +16,9 @@ import {
   connectMcpServers,
   createAlkaidAgent,
   createFilesystemTools,
+  detectAlkaidShellConfig,
   expandAlkaidSkillCommand,
+  findWindowsPowerShell,
   formatAlkaidSkillsPrompt,
   injectOpenAIPromptCacheKey,
   isRetryableAlkaidProviderError,
@@ -376,12 +378,49 @@ test("plan mode exposes no write tool", async () => {
   }
 });
 
-test("Windows shell shim overrides Alkaid's absolute Bash path", () => {
-  const detected = { shell: "C:\\Program Files\\Git\\bin\\bash.exe", args: ["-c"] };
-  const shim = "C:\\Nova\\runtime\\windows-shell-shim\\bash.exe";
-  const resolved = resolveAlkaidShellConfig(detected, { NOVA_SHELL_SHIM_BASH: shim });
-  if (process.platform === "win32") assert.deepEqual(resolved, { ...detected, shell: shim });
-  else assert.equal(resolved, detected);
+test("Windows shell shim overrides Alkaid's absolute shell path", () => {
+  const bash = { shell: "C:\\Program Files\\Git\\bin\\bash.exe", args: ["-c"] };
+  const bashShim = "C:\\Nova\\runtime\\windows-shell-shim\\bash.exe";
+  assert.deepEqual(
+    resolveAlkaidShellConfig(bash, { NOVA_SHELL_SHIM_BASH: bashShim }, "win32"),
+    { ...bash, shell: bashShim });
+  assert.equal(resolveAlkaidShellConfig(bash, { NOVA_SHELL_SHIM_BASH: bashShim }, "linux"), bash);
+
+  const powershell = { shell: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", args: ["-c"], kind: "powershell" };
+  const psShim = "C:\\Nova\\runtime\\windows-shell-shim\\powershell.exe";
+  assert.deepEqual(
+    resolveAlkaidShellConfig(powershell, { NOVA_SHELL_SHIM_POWERSHELL: psShim }, "win32"),
+    { ...powershell, shell: psShim });
+  assert.equal(resolveAlkaidShellConfig(powershell, { NOVA_SHELL_SHIM_POWERSHELL: psShim }, "linux"), powershell);
+});
+
+test("Windows shell detection uses PowerShell without requiring bash", async () => {
+  const root = await mkdtemp(join(tmpdir(), "alkaid-pshell-"));
+  const psDir = join(root, "System32", "WindowsPowerShell", "v1.0");
+  await mkdir(psDir, { recursive: true });
+  const ps = join(psDir, "powershell.exe");
+  await writeFile(ps, "ps");
+  const config = detectAlkaidShellConfig({ SystemRoot: root, PATH: "" }, "win32");
+  assert.equal(config.kind, "powershell");
+  assert.equal(config.shell, ps);
+});
+
+test("findWindowsPowerShell falls back to PATH lookup", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "alkaid-pspath-"));
+  const ps = join(dir, "powershell.exe");
+  await writeFile(ps, "ps");
+  assert.equal(findWindowsPowerShell({ PATH: dir }), ps);
+  assert.equal(findWindowsPowerShell({ PATH: "" }), null);
+});
+
+test("Windows PowerShell prompt instructs PowerShell syntax", () => {
+  const prompt = buildAlkaidSystemPrompt({
+    cwd: tmpdir(),
+    shellConfig: { shell: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", args: ["-c"], kind: "powershell" },
+  });
+  assert(prompt.includes("命令终端已确认使用 PowerShell"));
+  assert(prompt.includes("- bash: 执行 PowerShell 命令"));
+  assert(!prompt.includes("不要使用 PowerShell cmdlet"));
 });
 
 test("build mode confirms and uses the detected Bash shell", async () => {
