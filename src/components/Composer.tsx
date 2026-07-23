@@ -6,6 +6,7 @@ import {
   ensureModelOptions,
   ensurePeerModels,
   pickThreadModel,
+  refreshSlashCommands,
   sendPrompt,
   setThreadMode,
   state,
@@ -403,6 +404,7 @@ export function Composer() {
     setText(el.value);
     noteFlow.bump();
     if (historyOpen()) setHistoryOpen(false);
+    if (typedSlash) void refreshSlashCommands(state.agentKind);
     updateSlashState(el, typedSlash || trackingSlash);
   };
 

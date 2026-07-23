@@ -394,6 +394,7 @@ export function HomeView() {
     const trackingSlash = slashStart() !== null;
     setText(el.value);
     noteFlow.bump();
+    if (typedSlash) void refreshSlashCommands(agentKind());
     updateSlashState(el, typedSlash || trackingSlash);
     if (el.value.trim()) prewarmCurrent();
   };
