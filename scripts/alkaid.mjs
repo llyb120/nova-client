@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
-import { createAlkaidAgent } from "./alkaid-core.mjs";
+import { createAlkaidAgent, expandAlkaidSkillCommand } from "./alkaid-core.mjs";
 import { loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 function send(value) {
@@ -29,7 +29,7 @@ async function run(request) {
   });
   try {
     send({ type: "ready", skills: runtime.skills.map((skill) => skill.name), toolCount: runtime.toolCount });
-    await runtime.agent.prompt(request.prompt);
+    await runtime.agent.prompt(await expandAlkaidSkillCommand(request.prompt, runtime.skills));
     const last = runtime.agent.state.messages.at(-1);
     if (last?.role === "assistant" && last.stopReason === "error") {
       throw new Error(last.errorMessage || "Alkaid provider 请求失败");

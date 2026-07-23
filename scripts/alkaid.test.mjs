@@ -16,6 +16,7 @@ import {
   connectMcpServers,
   createAlkaidAgent,
   createFilesystemTools,
+  expandAlkaidSkillCommand,
   formatAlkaidSkillsPrompt,
   injectOpenAIPromptCacheKey,
   isRetryableAlkaidProviderError,
@@ -258,6 +259,20 @@ test("skills are discovered via pi loadSkillsFromDir", async () => {
   const prompt = formatAlkaidSkillsPrompt(skills);
   assert.match(prompt, /available_skills|<name>demo<\/name>|Demo skill/);
   assert.match(prompt, /read the SKILL\.md|Use the read tool/i);
+});
+
+test("slash skill commands expand to pi-compatible skill blocks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "nova-skill-command-test-"));
+  const skillDir = join(root, "review");
+  await mkdir(skillDir);
+  await writeFile(join(skillDir, "SKILL.md"), "---\nname: review\ndescription: Review code\n---\nCheck correctness first.\n");
+  const { skills } = loadAlkaidSkills(root);
+  const expanded = await expandAlkaidSkillCommand("/skill:review focus on tests", skills);
+  assert.match(expanded, /^<skill name="review" location=".*SKILL\.md">/);
+  assert.match(expanded, /References are relative to .*review\./);
+  assert.match(expanded, /Check correctness first\.\n<\/skill>\n\nfocus on tests$/);
+  assert.equal(await expandAlkaidSkillCommand("/skill:missing keep", skills), "/skill:missing keep");
+  assert.equal(await expandAlkaidSkillCommand("prefix /skill:review", skills), "prefix /skill:review");
 });
 
 test("many skills are compressed for prompt cache", () => {

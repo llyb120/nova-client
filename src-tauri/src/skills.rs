@@ -101,6 +101,7 @@ pub fn backend_skill_roots() -> Vec<PathBuf> {
         roots.push(home.join("skills"));
     }
     if let Some(home) = user_home_dir() {
+        roots.push(home.join(".nova").join("alkaid").join("skills"));
         roots.push(home.join(".codex").join("skills"));
         roots.push(home.join(".claude").join("skills"));
         roots.push(home.join(".cursor").join("skills"));

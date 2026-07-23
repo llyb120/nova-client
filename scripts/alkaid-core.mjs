@@ -212,6 +212,30 @@ export function loadAlkaidSkills(root = alkaidSkillsRoot()) {
   return loadSkillsFromDir({ dir: root, source: "user" });
 }
 
+function stripSkillFrontmatter(content) {
+  if (!content.startsWith("---")) return content;
+  const lines = content.split(/\r?\n/);
+  if (lines[0].trim() !== "---") return content;
+  const end = lines.slice(1).findIndex((line) => line.trim() === "---");
+  return end < 0 ? content : lines.slice(end + 2).join("\n");
+}
+
+/** Expand pi-compatible /skill:<name> invocations before sending them to the model. */
+export async function expandAlkaidSkillCommand(text, skills) {
+  const match = String(text ?? "").match(/^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/);
+  if (!match) return text;
+  const skill = skills.find((candidate) => candidate.name === match[1]);
+  if (!skill) return text;
+  try {
+    const body = stripSkillFrontmatter(await readFile(skill.filePath, "utf8")).trim();
+    const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+    const args = (match[2] ?? "").trim();
+    return args ? `${skillBlock}\n\n${args}` : skillBlock;
+  } catch {
+    return text;
+  }
+}
+
 function formatSkillsForPromptCompressed(skills) {
   const visible = skills.filter((skill) => !skill.disableModelInvocation);
   if (visible.length === 0) return "";

@@ -1233,7 +1233,12 @@ fn codex_skill_roots(config_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-fn list_skill_commands(roots: Vec<PathBuf>, fallback_description: &str) -> Vec<Value> {
+fn list_skill_commands(
+    roots: Vec<PathBuf>,
+    fallback_description: &str,
+    name_prefix: &str,
+    input_prefix: &str,
+) -> Vec<Value> {
     let mut files = Vec::new();
     for root in roots {
         collect_skill_files(&root, 4, &mut files);
@@ -1255,12 +1260,13 @@ fn list_skill_commands(roots: Vec<PathBuf>, fallback_description: &str) -> Vec<V
         }
         let description = frontmatter_value(&contents, "description")
             .unwrap_or_else(|| fallback_description.to_string());
-        skills.entry(name.clone()).or_insert_with(|| {
+        let command_name = format!("{name_prefix}{name}");
+        skills.entry(command_name.clone()).or_insert_with(|| {
             json!({
-                "name": name,
+                "name": command_name,
                 "description": description,
                 "kind": "skill",
-                "input": format!("${name} ")
+                "input": format!("{input_prefix}{name} ")
             })
         });
     }
@@ -1276,14 +1282,40 @@ fn list_skill_commands(roots: Vec<PathBuf>, fallback_description: &str) -> Vec<V
 }
 
 fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
-    list_skill_commands(codex_skill_roots(config_dir), "Codex skill")
+    list_skill_commands(codex_skill_roots(config_dir), "Codex skill", "", "$")
 }
 
 fn list_alkaid_skill_commands(config_dir: &Path) -> Vec<Value> {
     list_skill_commands(
         vec![config_dir.join("alkaid").join("skills")],
-        "Alkaid skill",
+        "Vega skill",
+        "skill:",
+        "/skill:",
     )
+}
+
+#[cfg(test)]
+mod slash_skill_command_tests {
+    use super::*;
+
+    #[test]
+    fn alkaid_skills_use_pi_slash_command_syntax() {
+        let root = std::env::temp_dir().join(format!("nova-vega-slash-{}", uuid::Uuid::new_v4()));
+        let skill_dir = root.join("alkaid").join("skills").join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code\n---\n",
+        )
+        .unwrap();
+
+        let commands = list_alkaid_skill_commands(&root);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["name"], "skill:review");
+        assert_eq!(commands[0]["input"], "/skill:review ");
+        assert_eq!(commands[0]["kind"], "skill");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// worktree 工作目录的根：优先设置里的自定义路径，为空则回退应用数据目录下的 worktrees/。

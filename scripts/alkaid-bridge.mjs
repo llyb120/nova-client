@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, expandAlkaidSkillCommand, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -134,13 +134,17 @@ async function prompt(request, commands) {
         return;
       }
       if (command.action === "steer") {
-        runtime.agent.steer(await alkaidUserMessage(command.parts));
+        const message = await alkaidUserMessage(command.parts);
+        const textPart = message.content.find((part) => part.type === "text");
+        if (textPart) textPart.text = await expandAlkaidSkillCommand(textPart.text, runtime.skills);
+        runtime.agent.steer(message);
       }
     }
   })().catch((error) => send({ type: "error", message: error instanceof Error ? error.message : String(error) }));
   try {
     send({ type: "ready", sessionId });
-    const outcome = await runAlkaidPromptWithRetry(runtime.agent, input.text, input.images, {
+    const expandedText = await expandAlkaidSkillCommand(input.text, runtime.skills);
+    const outcome = await runAlkaidPromptWithRetry(runtime.agent, expandedText, input.images, {
       isCancelled: () => cancelled,
       onRetry: () => {
         if (text) send({ type: "item", item: { id: assistantId, type: "agent_message", text: "" } });

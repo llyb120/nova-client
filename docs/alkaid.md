@@ -8,7 +8,7 @@ Alkaid 是一个基于 pi agent core 的轻量 coding agent，目标是少往返
 - `read_files`：同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，强制合并为单次并行读取，禁止拆成多个原生 `read`。
 - `edit_files`：两个及以上互不依赖的已有文件优先走单次并行精确编辑，复用原生 `edit` 的唯一、非重叠文本替换语义。
 - 文件工具限制在当前工作区内，拒绝目录穿越和重复写目标。
-- Skills 使用 pi 的 `loadSkillsFromDir` + Agent Skills 标准目录格式；根目录为 `~/.nova/alkaid/skills`。模型按需用 `read` / `read_files` 加载完整 `SKILL.md`（不再提供自定义 `load_skill` 工具）。
+- Skills 使用 pi 的 `loadSkillsFromDir` + Agent Skills 标准目录格式；根目录为 `~/.nova/alkaid/skills`。输入 `/skill:<name>` 可补全并显式调用 skill；普通任务中模型也可按需用 `read` / `read_files` 加载完整 `SKILL.md`（不再提供自定义 `load_skill` 工具）。
 - 系统提示词：Alkaid 策略（批量读写、最小读取、改后验证、Bash）为稳态前缀；`cwd` / skills 目录为动态后缀，便于 provider prompt/KV cache 命中。skills ≥ 4 时压缩目录体积。
 - Provider 缓存：默认 `cacheRetention: "long"`，为 OpenAI 兼容请求补齐 `prompt_cache_key`（session id）；第三方 OpenAI/Anthropic 兼容代理默认开启 `sendSessionAffinityHeaders`（不覆盖用户显式配置）。
 - 支持并行连接多个 MCP stdio server，并把工具映射为 `mcp__<server>__<tool>`。
