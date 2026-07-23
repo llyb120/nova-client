@@ -41,7 +41,7 @@ export function normalizeSlimMemory(memory) {
   let pendingPrompts = [];
   for (const raw of memory.turns ?? []) {
     const prompts = Array.isArray(raw?.userPrompts)
-      ? raw.userPrompts.map(String).map((value) => value.trim()).filter(Boolean)
+      ? raw.userPrompts.map((value) => String(value).trim()).filter(Boolean)
       : [String(raw?.userPrompt ?? "").trim()].filter(Boolean);
     pendingPrompts.push(...prompts);
     const conclusion = String(raw?.conclusion ?? "").trim();
@@ -89,12 +89,8 @@ export async function compactSlimMemory(
   const formatted = formatSlimMemory({ summary: memory.summary, turns: structuredClone(memory.turns) });
   if (memory.turns.length <= maxTurns && formatted.length <= maxChars) return false;
 
-  // The latest conclusion and every prompt after it are invariant. Prefer retaining up to 20
-  // complete recent turns; if the model limit is already exceeded, summarize all older turns.
+  // Preserve the latest conclusion, plus any interrupted prompts grouped with it.
   const protectedCount = memory.turns.at(-1)?.conclusion ? 1 : Math.min(2, memory.turns.length);
-  // Match Cursor's policy: once the threshold is crossed, summarize every older complete turn
-  // rather than repeatedly shaving off a single turn. The newest conclusion (or the newest
-  // conclusion plus all following interrupted prompts) remains verbatim.
   const split = memory.turns.length - protectedCount;
   if (split <= 0) return false;
 

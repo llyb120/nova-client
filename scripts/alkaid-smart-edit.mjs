@@ -137,11 +137,8 @@ function lineSimilarity(left, right) {
 
 function scoreCandidate(targetLines, patternLines, start) {
   let lineScore = 0;
-  let exact = 0;
   for (let offset = 0; offset < patternLines.length; offset += 1) {
-    const score = lineSimilarity(targetLines[start + offset], patternLines[offset]);
-    lineScore += score;
-    if (score === 1) exact += 1;
+    lineScore += lineSimilarity(targetLines[start + offset], patternLines[offset]);
   }
   const count = patternLines.length;
   const boundary = (lineSimilarity(targetLines[start], patternLines[0]) +
@@ -166,9 +163,8 @@ function rebaseIndent(newText, oldText, matchedText) {
 }
 
 function fuzzyCandidates(targetLines, patternLines) {
-  const modes = lineModes;
   const starts = new Set();
-  for (const mode of modes) {
+  for (const mode of lineModes) {
     for (const start of candidateStarts(targetLines, patternLines, mode).starts) starts.add(start);
   }
   const maxStart = targetLines.length - patternLines.length;
@@ -232,7 +228,10 @@ function locateEdit(content, oldText, path, editIndex, totalEdits) {
 
 /** Locate every edit against one immutable snapshot, reject ambiguity/overlap, then apply bottom-up. */
 export function applySmartEdits(content, edits, path) {
-  const normalizedEdits = edits.map((edit) => ({ oldText: edit.oldText.replace(/\r\n/g, "\n"), newText: edit.newText.replace(/\r\n/g, "\n") }));
+  const normalizedEdits = edits.map((edit) => ({
+    oldText: edit.oldText.replace(/\r\n/g, "\n"),
+    newText: edit.newText.replace(/\r\n/g, "\n"),
+  }));
   const matches = normalizedEdits.map((edit, index) => ({
     ...locateEdit(content, edit.oldText, path, index, normalizedEdits.length),
     editIndex: index,
@@ -251,5 +250,12 @@ export function applySmartEdits(content, edits, path) {
     output = output.slice(0, match.index) + replacement + output.slice(match.index + match.length);
   }
   if (output === content) throw new Error(`No changes made to ${path}.`);
-  return { content: output, matches: matches.map(({ editIndex, mode, line }) => ({ editIndex, mode, line: line === undefined ? undefined : line + 1 })) };
+  return {
+    content: output,
+    matches: matches.map(({ editIndex, mode, line }) => ({
+      editIndex,
+      mode,
+      line: line === undefined ? undefined : line + 1,
+    })),
+  };
 }
