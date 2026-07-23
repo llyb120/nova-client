@@ -488,7 +488,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     for (const kind of quotaShareKinds()) void ensureModelOptions(kind);
   });
 
-  const refreshAchievements = async () => {
+  const refreshAchievements = async (reloadImages = false) => {
     setAchievementsLoading(true);
     setAchievementsError("");
     try {
@@ -498,12 +498,15 @@ export function SettingsModal(props: { onClose: () => void }) {
         return;
       }
       const list = await api.listAchievements();
+      const previousImageUrls = new Map(
+        achievements().map((achievement) => [achievement.id, achievement.imageUrl]),
+      );
       const cacheKey = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       setAchievements(list.map((achievement) => ({
         ...achievement,
-        imageUrl: achievement.imageUrl
+        imageUrl: reloadImages && achievement.imageUrl
           ? reloadAchievementImage(achievement.imageUrl, cacheKey)
-          : undefined,
+          : previousImageUrls.get(achievement.id) ?? achievement.imageUrl,
       })));
     } catch (error) {
       setAchievements([]);
@@ -1597,7 +1600,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   type="button"
                   class="link-btn"
                   disabled={achievementsLoading()}
-                  onClick={() => void refreshAchievements()}
+                  onClick={() => void refreshAchievements(true)}
                 >
                   刷新
                 </button>

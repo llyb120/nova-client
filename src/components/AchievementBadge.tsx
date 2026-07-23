@@ -1,8 +1,12 @@
-import { createSignal, Show } from "solid-js";
+import { createEffect, createSignal, Show } from "solid-js";
 import type { Achievement } from "../types";
 
 export function AchievementBadge(props: { achievement: Achievement }) {
   const [failed, setFailed] = createSignal(false);
+  createEffect(() => {
+    props.achievement.imageUrl;
+    setFailed(false);
+  });
   const src = () => {
     if (failed()) return undefined;
     const remote = props.achievement.imageUrl?.trim();
