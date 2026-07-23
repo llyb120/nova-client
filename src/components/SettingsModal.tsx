@@ -997,7 +997,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <section class="settings-group">
               <h3 class="settings-group-title">Vega 上下文</h3>
               <div class="field">
-                <span class="field-label">精简上下文模式</span>
+                <span class="field-label">超级上下文</span>
                 <label class="backend-switch">
                   <input
                     type="checkbox"
@@ -1007,7 +1007,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  类似 Cursor 后端：上下文只携带最近 20 轮的用户提示词与结论；超过 20 轮或上下文上限时自动摘要旧轮次。最近一次结论及其后的用户提示词（包括中断产生的多条提示）始终原样保留。
+                  开启后会增强上下文体验和速度，但可能存在上下文丢失的风险。
                 </span>
               </div>
             </section>

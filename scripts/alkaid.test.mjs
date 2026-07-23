@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
-import { appendSlimTurn, compactSlimMemory, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext } from "./alkaid-slim-memory.mjs";
 import {
   alkaidPromptInput,
   alkaidSkillsRoot,
@@ -166,13 +166,13 @@ test("native steering messages preserve text and images", async () => {
   assert.equal(typeof message.timestamp, "number");
 });
 
-test("Vega slim context keeps 20 conclusions and preserves interrupted prompts", async () => {
+test("Vega slim context keeps 10 conclusions and preserves interrupted prompts", async () => {
   const memory = createSlimMemory();
-  for (let index = 1; index <= 20; index += 1) {
+  for (let index = 1; index <= 10; index += 1) {
     appendSlimTurn(memory, `prompt ${index}`);
     setLatestConclusion(memory, [{ type: "text", text: `conclusion ${index}` }]);
   }
-  assert.equal(await compactSlimMemory(memory, async () => assert.fail("20 turns must remain")), false);
+  assert.equal(await compactSlimMemory(memory, async () => assert.fail("10 turns must remain")), false);
 
   appendSlimTurn(memory, "interrupted prompt");
   appendSlimTurn(memory, "replacement prompt");
@@ -212,6 +212,26 @@ test("Vega slim context keeps an interrupted turn as native messages", () => {
   assert.match(compactContext, /completed conclusion/);
   assert.doesNotMatch(compactContext, /interrupted prompt|current prompt/);
   assert.equal(memory.pendingMessages[1].content[0].name, "read");
+});
+
+test("Vega slim context keeps complete early messages until its turn or token threshold", () => {
+  const memory = createSlimMemory();
+  memory.fullMessages = [{ role: "user", content: "full tool trajectory" }];
+  memory.contextTokens = 749;
+  appendSlimTurn(memory, "early prompt");
+  assert.equal(shouldUseFullContext(memory, 1_000), true);
+  memory.contextTokens = 750;
+  assert.equal(shouldUseFullContext(memory, 750), false);
+  memory.contextTokens = 1;
+  while (memory.turns.length < 10) appendSlimTurn(memory, `prompt ${memory.turns.length}`);
+  assert.equal(shouldUseFullContext(memory, 1_000), false);
+});
+
+test("Vega slim context measures the largest native request instead of cumulative turn usage", () => {
+  assert.equal(contextTokensFromMessages([
+    { role: "assistant", usage: { input: 100, output: 20, cacheRead: 300, cacheWrite: 40 } },
+    { role: "assistant", usage: { totalTokens: 900, input: 500, output: 30 } },
+  ]), 900);
 });
 
 test("Vega slim context also compresses at the context character limit", async () => {

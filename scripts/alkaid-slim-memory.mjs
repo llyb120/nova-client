@@ -1,7 +1,7 @@
-export const VEGA_SLIM_MEMORY_TURNS = 20;
+export const VEGA_SLIM_MEMORY_TURNS = 10;
 
 export function createSlimMemory() {
-  return { summary: "", turns: [], pendingMessages: [] };
+  return { summary: "", turns: [], pendingMessages: [], fullMessages: [], contextTokens: 0 };
 }
 
 function textContent(content) {
@@ -88,13 +88,18 @@ export function formatSlimMemory(memory) {
 export async function compactSlimMemory(
   memory,
   summarize,
-  { maxTurns = VEGA_SLIM_MEMORY_TURNS, maxChars = Number.POSITIVE_INFINITY } = {},
+  {
+    maxTurns = VEGA_SLIM_MEMORY_TURNS,
+    maxChars = Number.POSITIVE_INFINITY,
+    currentTokens = 0,
+    maxTokens = Number.POSITIVE_INFINITY,
+  } = {},
 ) {
   normalizeSlimMemory(memory);
   const formatted = formatSlimMemory({ summary: memory.summary, turns: structuredClone(memory.turns) });
-  if (memory.turns.length <= maxTurns && formatted.length <= maxChars) return false;
+  if (memory.turns.length <= maxTurns && formatted.length <= maxChars && currentTokens <= maxTokens) return false;
 
-  // The latest conclusion and every prompt after it are invariant. Prefer retaining up to 20
+  // The latest conclusion and every prompt after it are invariant. Prefer retaining up to 10
   // complete recent turns; if the model limit is already exceeded, summarize all older turns.
   const protectedCount = memory.turns.at(-1)?.conclusion ? 1 : Math.min(2, memory.turns.length);
   // Match Cursor's policy: once the threshold is crossed, summarize every older complete turn
@@ -111,6 +116,30 @@ export async function compactSlimMemory(
   return true;
 }
 
+export function contextTokensFromMessages(messages) {
+  let tokens = 0;
+  for (const message of messages ?? []) {
+    if (message?.role !== "assistant" || !message.usage) continue;
+    const usage = message.usage;
+    // Each assistant request reports the context size at that point. The latest/largest request,
+    // not the sum across tool calls, is the value that should be compared with the context window.
+    const measured = Number(usage.totalTokens ?? usage.total_tokens)
+      || ["input", "output", "cacheRead", "cacheWrite"]
+        .reduce((total, key) => total + (Number(usage[key]) || 0), 0);
+    tokens = Math.max(tokens, measured);
+  }
+  return tokens;
+}
+
+export function shouldUseFullContext(memory, maxContextTokens) {
+  if (memory.pendingMessages?.length) return true;
+  const turnCount = memory.turns?.length ?? 0;
+  if (turnCount === 0) return true;
+  return turnCount < VEGA_SLIM_MEMORY_TURNS
+    && (memory.contextTokens ?? 0) < maxContextTokens
+    && memory.fullMessages?.length > 0;
+}
+
 export function seedSlimMemoryFromMessages(memory, messages) {
   for (const message of messages ?? []) {
     if (message?.role === "user") appendSlimTurn(memory, textContent(message.content));
@@ -118,5 +147,7 @@ export function seedSlimMemoryFromMessages(memory, messages) {
       setLatestConclusion(memory, message.content);
     }
   }
+  memory.fullMessages = structuredClone(messages ?? []);
+  memory.contextTokens = contextTokensFromMessages(messages);
   return normalizeSlimMemory(memory);
 }

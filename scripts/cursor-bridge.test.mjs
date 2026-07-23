@@ -296,23 +296,23 @@ assert.deepEqual(seeded.turns, [
 ]);
 
 const compressible = createSlimMemory();
-for (let index = 1; index <= 20; index += 1) {
+for (let index = 1; index <= 10; index += 1) {
   recordSlimTurn(compressible, `user prompt ${index}`, `conclusion ${index}`);
 }
 assert.equal(
-  await compressSlimMemory(compressible, async () => assert.fail("20 turns must not compress")),
+  await compressSlimMemory(compressible, async () => assert.fail("10 turns must not compress")),
   false,
 );
 recordSlimTurn(compressible, "latest user prompt must remain exact", "latest conclusion");
 let summaryInput = "";
 assert.equal(await compressSlimMemory(compressible, async (input) => {
   summaryInput = input;
-  return "Summary of the first twenty turns.";
+  return "Summary of the first ten turns.";
 }), true);
 assert.match(summaryInput, /user prompt 1/);
-assert.match(summaryInput, /user prompt 20/);
+assert.match(summaryInput, /user prompt 10/);
 assert.doesNotMatch(summaryInput, /latest user prompt/);
-assert.equal(compressible.summary, "Summary of the first twenty turns.");
+assert.equal(compressible.summary, "Summary of the first ten turns.");
 assert.deepEqual(compressible.turns, [{
   userPrompt: "latest user prompt must remain exact",
   conclusion: "latest conclusion",
