@@ -14,7 +14,9 @@ import {
   alkaidSkillsRoot,
   alkaidUserMessage,
   buildAlkaidSystemPrompt,
+  clampOpenAIPayloadToolOutputs,
   clampPromptCacheKey,
+  clampToolOutputText,
   connectMcpServers,
   createAlkaidAgent,
   createFilesystemTools,
@@ -27,6 +29,8 @@ import {
   loadAlkaidAgentInstructions,
   loadAlkaidSkills,
   mergeAlkaidUsage,
+  OPENAI_TOOL_OUTPUT_MAX_CHARS,
+  OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
   resolveAlkaidShellConfig,
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
@@ -546,6 +550,55 @@ test("openai prompt_cache_key fallback clamps session ids", () => {
     prompt_cache_key: "session-1",
   });
   assert.equal(injectOpenAIPromptCacheKey({ prompt_cache_key: "keep" }, "session-1"), undefined);
+});
+
+test("clampToolOutputText keeps strings under the OpenAI max", () => {
+  const huge = "x".repeat(OPENAI_TOOL_OUTPUT_MAX_CHARS + 1000);
+  const clamped = clampToolOutputText(huge);
+  assert.ok(clamped.length <= OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS);
+  assert.match(clamped, /truncated: tool output exceeded/);
+  assert.equal(clampToolOutputText("short"), "short");
+});
+
+test("clampOpenAIPayloadToolOutputs trims Responses and Completions tool outputs", () => {
+  const huge = "y".repeat(OPENAI_TOOL_OUTPUT_MAX_CHARS + 500);
+  const responses = clampOpenAIPayloadToolOutputs({
+    model: "gpt",
+    input: [
+      { type: "message", role: "user", content: "hi" },
+      { type: "function_call_output", call_id: "c1", output: huge },
+      {
+        type: "function_call_output",
+        call_id: "c2",
+        output: [{ type: "input_text", text: huge }],
+      },
+    ],
+  });
+  assert.ok(responses);
+  assert.ok(responses.input[1].output.length <= OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS);
+  assert.ok(responses.input[2].output[0].text.length <= OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS);
+
+  const completions = clampOpenAIPayloadToolOutputs({
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "tool", tool_call_id: "t1", content: huge },
+    ],
+  });
+  assert.ok(completions);
+  assert.ok(completions.messages[1].content.length <= OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS);
+  assert.equal(clampOpenAIPayloadToolOutputs({ input: [{ type: "function_call_output", output: "ok" }] }), undefined);
+});
+
+test("batch reads truncate oversized lines by byte budget", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-bytes-"));
+  const hugeLine = "z".repeat(80 * 1024);
+  await writeFile(join(cwd, "wide.txt"), `${hugeLine}\nline-2`);
+  const [readFiles] = createFilesystemTools(cwd);
+  const first = JSON.parse((await readFiles.execute("1", { paths: ["wide.txt"] })).content[0].text)[0];
+  assert.equal(first.truncated, true);
+  assert.ok(Buffer.byteLength(first.content, "utf8") <= 50 * 1024);
+  assert.ok(first.content.length < hugeLine.length);
+  assert.equal(first.nextOffset, 2);
 });
 
 test("compat defaults enable session affinity for openai-compatible proxies", () => {

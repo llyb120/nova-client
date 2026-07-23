@@ -18,6 +18,12 @@ import { createInterface } from "node:readline";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
+/** Match pi coding tools: keep read_files outputs usable without blowing the context window. */
+const READ_FILES_MAX_BYTES = 50 * 1024;
+/** OpenAI Responses API hard limit for function_call_output.output string length. */
+export const OPENAI_TOOL_OUTPUT_MAX_CHARS = 10_485_760;
+/** Leave room for a truncation notice before the API rejects the request. */
+export const OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS = OPENAI_TOOL_OUTPUT_MAX_CHARS - 512;
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1000, 3000];
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const SKILL_COMPRESSION_MIN_COUNT = 4;
@@ -33,6 +39,78 @@ const textResult = (text, details = undefined) => ({
   content: [{ type: "text", text: String(text) }],
   details,
 });
+
+/** Truncate oversized tool text so OpenAI accepts function_call_output.output / tool content. */
+export function clampToolOutputText(text, maxChars = OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS) {
+  const value = String(text ?? "");
+  if (value.length <= maxChars) return value;
+  const notice = `\n\n…[truncated: tool output exceeded ${maxChars} chars; original length ${value.length}]`;
+  const keep = Math.max(0, maxChars - notice.length);
+  return `${value.slice(0, keep)}${notice}`;
+}
+
+function truncateUtf8ToBytes(text, maxBytes) {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let end = Math.min(text.length, maxBytes);
+  let slice = text.slice(0, end);
+  while (end > 0 && Buffer.byteLength(slice, "utf8") > maxBytes) {
+    end = Math.floor(end * 0.9);
+    slice = text.slice(0, end);
+  }
+  while (end < text.length && Buffer.byteLength(text.slice(0, end + 1), "utf8") <= maxBytes) {
+    end += 1;
+  }
+  return text.slice(0, end);
+}
+
+/**
+ * Clamp oversized tool outputs already present in an OpenAI request payload
+ * (Responses `input[].output` or Completions `messages[].content` for role=tool).
+ * Returns a new payload when anything changed; otherwise undefined.
+ */
+export function clampOpenAIPayloadToolOutputs(payload, maxChars = OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  let changed = false;
+  const next = { ...payload };
+
+  if (Array.isArray(next.input)) {
+    next.input = next.input.map((item) => {
+      if (!item || typeof item !== "object" || item.type !== "function_call_output") return item;
+      if (typeof item.output === "string" && item.output.length > maxChars) {
+        changed = true;
+        return { ...item, output: clampToolOutputText(item.output, maxChars) };
+      }
+      if (Array.isArray(item.output)) {
+        let partsChanged = false;
+        const output = item.output.map((part) => {
+          if (part?.type === "input_text" && typeof part.text === "string" && part.text.length > maxChars) {
+            partsChanged = true;
+            return { ...part, text: clampToolOutputText(part.text, maxChars) };
+          }
+          return part;
+        });
+        if (partsChanged) {
+          changed = true;
+          return { ...item, output };
+        }
+      }
+      return item;
+    });
+  }
+
+  if (Array.isArray(next.messages)) {
+    next.messages = next.messages.map((message) => {
+      if (message?.role !== "tool") return message;
+      if (typeof message.content === "string" && message.content.length > maxChars) {
+        changed = true;
+        return { ...message, content: clampToolOutputText(message.content, maxChars) };
+      }
+      return message;
+    });
+  }
+
+  return changed ? next : undefined;
+}
 
 function resolveInputPath(root, input) {
   return resolve(root, input);
@@ -135,12 +213,13 @@ export async function runAlkaidPromptWithRetry(agent, input, images, options = {
   }
 }
 
-async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES) {
+async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES, maxBytes = READ_FILES_MAX_BYTES) {
   const input = createReadStream(path, { encoding: "utf8" });
   const lines = createInterface({ input, crlfDelay: Infinity });
   const content = [];
   let lineNumber = 0;
   let truncated = false;
+  let byteCount = 0;
   try {
     for await (const line of lines) {
       lineNumber += 1;
@@ -149,7 +228,16 @@ async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES)
         truncated = true;
         break;
       }
+      const separatorBytes = content.length > 0 ? 1 : 0;
+      const lineBytes = Buffer.byteLength(line, "utf8");
+      if (byteCount + separatorBytes + lineBytes > maxBytes) {
+        truncated = true;
+        const remaining = maxBytes - byteCount - separatorBytes;
+        if (remaining > 0) content.push(truncateUtf8ToBytes(line, remaining));
+        break;
+      }
       content.push(line);
+      byteCount += separatorBytes + lineBytes;
     }
   } finally {
     lines.close();
@@ -158,7 +246,7 @@ async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES)
   return {
     content: content.join("\n"),
     truncated,
-    nextOffset: truncated ? offset + content.length : undefined,
+    nextOffset: truncated ? offset + Math.max(content.length, 1) : undefined,
   };
 }
 
@@ -167,7 +255,7 @@ export function createFilesystemTools(cwd, editTool = null) {
   const tools = [
     {
       name: "read_files",
-      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行。请为每个文件按需指定 offset/limit，并用返回的 nextOffset 继续读取。`,
+      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行（且不超过约 50KB）。请为每个文件按需指定 offset/limit，并用返回的 nextOffset 继续读取。`,
       parameters: Type.Object({
         paths: Type.Array(Type.Union([
           Type.String(),
@@ -427,9 +515,9 @@ export function resolveAlkaidShellConfig(shellConfig, env = process.env, platfor
 
 function mcpResult(result) {
   const content = (result.content ?? []).flatMap((part) => {
-    if (part.type === "text") return [{ type: "text", text: part.text }];
+    if (part.type === "text") return [{ type: "text", text: clampToolOutputText(part.text) }];
     if (part.type === "image") return [{ type: "image", data: part.data, mimeType: part.mimeType }];
-    return [{ type: "text", text: JSON.stringify(part) }];
+    return [{ type: "text", text: clampToolOutputText(JSON.stringify(part)) }];
   });
   return { content: content.length ? content : [{ type: "text", text: "MCP 工具执行完成" }], details: result };
 }
@@ -507,7 +595,19 @@ export async function createAlkaidAgent(options = {}) {
     onPayload: (payload, model) => {
       const modelApi = model?.api ?? api;
       if (modelApi !== "openai-completions" && modelApi !== "openai-responses") return undefined;
-      return injectOpenAIPromptCacheKey(payload, sessionId);
+      let next = payload;
+      let changed = false;
+      const withCache = injectOpenAIPromptCacheKey(next, sessionId);
+      if (withCache) {
+        next = withCache;
+        changed = true;
+      }
+      const clamped = clampOpenAIPayloadToolOutputs(next);
+      if (clamped) {
+        next = clamped;
+        changed = true;
+      }
+      return changed ? next : undefined;
     },
   });
   return { agent, close: () => mcp.close(), skills, toolCount: tools.length };
