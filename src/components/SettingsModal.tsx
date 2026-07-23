@@ -485,7 +485,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     for (const kind of quotaShareKinds()) void ensureModelOptions(kind);
   });
 
-  const refreshAchievements = async (reloadImages = false) => {
+  const refreshAchievements = async () => {
     setAchievementsLoading(true);
     setAchievementsError("");
     try {
@@ -495,17 +495,13 @@ export function SettingsModal(props: { onClose: () => void }) {
         return;
       }
       const list = await api.listAchievements();
-      if (reloadImages) {
-        const cacheKey = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        setAchievements(list.map((achievement) => ({
-          ...achievement,
-          imageUrl: achievement.imageUrl
-            ? reloadAchievementImage(achievement.imageUrl, cacheKey)
-            : undefined,
-        })));
-      } else {
-        setAchievements(list);
-      }
+      const cacheKey = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      setAchievements(list.map((achievement) => ({
+        ...achievement,
+        imageUrl: achievement.imageUrl
+          ? reloadAchievementImage(achievement.imageUrl, cacheKey)
+          : undefined,
+      })));
     } catch (error) {
       setAchievements([]);
       setAchievementsError(`加载失败：${String(error)}`);
@@ -1579,7 +1575,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   type="button"
                   class="link-btn"
                   disabled={achievementsLoading()}
-                  onClick={() => void refreshAchievements(true)}
+                  onClick={() => void refreshAchievements()}
                 >
                   刷新
                 </button>
