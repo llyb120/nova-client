@@ -574,6 +574,7 @@ test("Windows PowerShell prompt instructs PowerShell syntax", () => {
 test("build mode confirms and uses the detected Bash shell", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-shell-"));
   const shellConfig = getShellConfig();
+  const resolvedShellConfig = resolveAlkaidShellConfig(shellConfig);
   const runtime = await createAlkaidAgent({ cwd, model: configuredModel, shellConfig });
   try {
     assert.equal(runtime.agent.steeringMode, "all");
@@ -593,9 +594,9 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.match(runtime.agent.state.systemPrompt, /输出截断只限制结果展示，不属于工作量限制/);
     assert.match(runtime.agent.state.systemPrompt, /递归命令必须通过限定路径.*设置较短的 timeout/);
     assert.match(runtime.agent.state.systemPrompt, /递归命令超时后不得原样重试/);
-    assert.match(runtime.agent.state.systemPrompt, /识别可独立验证的工程单元及其依赖关系/);
-    assert.match(runtime.agent.state.systemPrompt, /不得用一个单元的验证代替其他受影响单元/);
-    assert(runtime.agent.state.systemPrompt.includes(`命令终端已确认使用 Bash（${shellConfig.shell}）`));
+    assert.match(runtime.agent.state.systemPrompt, /优先根据版本控制 diff 按需确定受影响单元及直接使用方/);
+    assert.match(runtime.agent.state.systemPrompt, /禁止遍历或列出完整仓库、无依据扩大范围/);
+    assert(runtime.agent.state.systemPrompt.includes(`命令终端已确认使用 Bash（${resolvedShellConfig.shell}）`));
     assert.match(runtime.agent.state.systemPrompt, /不要使用 PowerShell cmdlet/);
     assert.match(runtime.agent.state.systemPrompt, /\n---\n/);
     assert.ok(runtime.agent.state.systemPrompt.indexOf("你是 Vega") < runtime.agent.state.systemPrompt.indexOf("Current working directory:"));
@@ -631,10 +632,12 @@ test("bridge aborts cleanly and persists resumable context", async () => {
   }));
   const child = spawn(process.execPath, [join(process.cwd(), "scripts/alkaid-bridge.mjs")], {
     cwd: process.cwd(),
-    env: { ...process.env, HOME: home, USERPROFILE: home },
+    env: { ...process.env, HOME: home, USERPROFILE: home, NOVA_DATA_DIR: join(home, ".nova") },
     stdio: ["pipe", "pipe", "pipe"],
   });
   const events = [];
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
   let cancelStartedAt;
   const output = createInterface({ input: child.stdout, crlfDelay: Infinity });
   output.on("line", (line) => {
@@ -663,7 +666,7 @@ test("bridge aborts cleanly and persists resumable context", async () => {
     }),
   ]).finally(() => clearTimeout(timeout));
   await new Promise((resolve) => server.close(resolve));
-  assert.equal(exitCode, 0);
+  assert.equal(exitCode, 0, `events: ${JSON.stringify(events)}\nstderr: ${stderr}`);
   assert(Date.now() - cancelStartedAt < 1000);
   assert(events.some((event) => event.type === "done" && event.cancelled === true));
   const messages = JSON.parse(await readFile(join(dataRoot, "sessions", "abort-test.json"), "utf8"));
