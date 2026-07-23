@@ -215,7 +215,7 @@ pub fn collect_credentials(
     let mut files = Vec::new();
     let mut env = HashMap::new();
     match &agent_kind {
-        AgentKind::Alkaid => return Err("Alkaid 暂不支持额度凭据共享".into()),
+        AgentKind::Alkaid => return Err("Vega 暂不支持额度凭据共享".into()),
         AgentKind::Devin => collect_file(
             &devin_credentials_path()?,
             "appdata/devin/credentials.toml",
@@ -369,7 +369,7 @@ pub fn materialize_runtime(
     )?;
     stage_local_skills(&app, expected_kind, &launch_env)?;
     let manager = match expected_kind {
-        AgentKind::Alkaid => return Err("Alkaid 暂不支持额度凭据共享".into()),
+        AgentKind::Alkaid => return Err("Vega 暂不支持额度凭据共享".into()),
         AgentKind::Devin => BorrowedManager::Acp(AcpManager::new_with_env(
             app,
             AgentKind::Devin,

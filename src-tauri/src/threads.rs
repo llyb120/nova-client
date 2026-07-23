@@ -103,7 +103,7 @@ impl AgentKind {
     /// 展示用名称（注入接力上下文 / 系统提示用）
     pub fn label(&self) -> &'static str {
         match self {
-            AgentKind::Alkaid => "Alkaid",
+            AgentKind::Alkaid => "Vega",
             AgentKind::Devin => "Devin",
             AgentKind::Codex => "Codex",
             AgentKind::CodexPlus => "Codex",

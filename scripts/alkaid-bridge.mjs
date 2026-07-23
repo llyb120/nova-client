@@ -9,7 +9,7 @@ const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const dataRoot = alkaidDataRoot();
 const sessionRoot = join(dataRoot, "sessions");
 const sessionPath = (sessionId) => {
-  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("非法 Alkaid session id");
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("非法 Vega session id");
   return join(sessionRoot, `${sessionId}.json`);
 };
 
@@ -42,7 +42,7 @@ function startedToolItem(event) {
   const fileChange = event.toolName === "edit" || event.toolName === "write" || event.toolName === "edit_files";
   let type = "mcp_tool_call";
   let command;
-  let server = "Alkaid";
+  let server = "Vega";
   let tool = event.toolName;
   let changes;
   if (event.toolName === "bash") {
@@ -160,7 +160,7 @@ async function prompt(request, commands) {
     });
     const last = outcome.last;
     if (!outcome.cancelled && last?.role === "assistant" && last.stopReason === "error") {
-      throw new Error(last.errorMessage || "Alkaid provider 请求失败");
+      throw new Error(last.errorMessage || "Vega provider 请求失败");
     }
     await saveMessages(sessionId, runtime.agent.state.messages);
     send({
@@ -198,14 +198,14 @@ const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 try {
   const commands = lines[Symbol.asyncIterator]();
   const first = await commands.next();
-  if (first.done) throw new Error("Alkaid bridge 缺少请求");
+  if (first.done) throw new Error("Vega bridge 缺少请求");
   const request = JSON.parse(first.value);
   if (request.action === "prompt") await prompt(request, commands);
   else if (request.action === "models") {
     const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
     send({ ok: true, data: { configOptions: [{ id: "model", name: "Model", currentValue: defaultAlkaidModel(config), options: alkaidModelOptions(config) }], modes: null } });
   } else if (request.action === "title") await title(request);
-  else throw new Error(`Alkaid bridge 不支持 action: ${request.action}`);
+  else throw new Error(`Vega bridge 不支持 action: ${request.action}`);
 } catch (error) {
   send({ ok: false, error: error instanceof Error ? error.message : String(error) });
   process.exitCode = 1;

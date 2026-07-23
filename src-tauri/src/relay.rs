@@ -205,7 +205,7 @@ fn quota_model_key(kind: &AgentKind, model: &str) -> String {
 
 fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
     match kind {
-        AgentKind::Alkaid => Err("Alkaid 暂不支持额度共享".into()),
+        AgentKind::Alkaid => Err("Vega 暂不支持额度共享".into()),
         AgentKind::Devin
         | AgentKind::Codex
         | AgentKind::CodexPlus
@@ -958,7 +958,7 @@ impl RelayManager {
             .alkaid
             .set_alkaid_server_config(config);
         self.log(format!(
-            "[relay] 已应用 Alkaid 服务端配置 revision={revision}"
+            "[relay] 已应用 Vega 服务端配置 revision={revision}"
         ));
     }
 

@@ -70,7 +70,7 @@ function resolveEnv(value, env) {
   if (typeof value !== "string") return value;
   return value.replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name) => {
     const resolved = env[name];
-    if (resolved == null) throw new Error(`Alkaid 配置引用的环境变量 ${name} 未注入 Nova 进程`);
+    if (resolved == null) throw new Error(`Vega 配置引用的环境变量 ${name} 未注入 Nova 进程`);
     return resolved;
   });
 }
@@ -82,7 +82,7 @@ function providerApi(provider) {
   if (npm.includes("google")) return "google-generative-ai";
   if (npm.includes("openai-compatible")) return "openai-completions";
   if (npm.includes("openai")) return "openai-responses";
-  throw new Error("Alkaid provider 缺少 api，且无法从 npm 推导协议");
+  throw new Error("Vega provider 缺少 api，且无法从 npm 推导协议");
 }
 
 function isPlainObject(value) {
@@ -109,13 +109,13 @@ export async function loadAlkaidConfig({ root = alkaidDataRoot(), env = process.
     localConfig = parseJsonc(await readFile(path, "utf8"));
   } catch (error) {
     if (error?.code !== "ENOENT") {
-      throw new Error(`读取 Alkaid 配置失败：${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`读取 Vega 配置失败：${error instanceof Error ? error.message : String(error)}`);
     }
-    if (!isPlainObject(serverConfig)) throw new Error(`未找到 Alkaid 配置：${path}`);
+    if (!isPlainObject(serverConfig)) throw new Error(`未找到 Vega 配置：${path}`);
   }
   const config = mergeAlkaidConfig(serverConfig, localConfig);
   if (!config?.provider || typeof config.provider !== "object") {
-    throw new Error("Alkaid 配置缺少 provider");
+    throw new Error("Vega 配置缺少 provider");
   }
   return { ...config, root, env };
 }
@@ -130,7 +130,7 @@ export function defaultAlkaidModel(config) {
     selection = options.find((option) => option.value === `${config.model}/variant/${effort}`)?.value;
   }
   selection ??= options[0]?.value;
-  if (!selection) throw new Error("Alkaid 配置没有可用模型");
+  if (!selection) throw new Error("Vega 配置没有可用模型");
   return selection;
 }
 
@@ -182,7 +182,7 @@ export function mergeAlkaidCompatDefaults(api, modelId, baseUrl, existing = unde
 }
 
 export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config)) {
-  if (!selection || !selection.includes("/")) throw new Error("Alkaid model 必须是 provider/model 格式");
+  if (!selection || !selection.includes("/")) throw new Error("Vega model 必须是 provider/model 格式");
   const marker = "/variant/";
   const variantIndex = selection.lastIndexOf(marker);
   const variant = variantIndex >= 0 ? selection.slice(variantIndex + marker.length) : undefined;
@@ -191,14 +191,14 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
   const modelId = modelParts.join("/");
   const provider = config.provider[providerId];
   const model = provider?.models?.[modelId];
-  if (!provider) throw new Error(`Alkaid provider 不存在：${providerId}`);
-  if (!model) throw new Error(`Alkaid model 不存在：${baseSelection}`);
+  if (!provider) throw new Error(`Vega provider 不存在：${providerId}`);
+  if (!model) throw new Error(`Vega model 不存在：${baseSelection}`);
   if (variant && !Object.hasOwn(model.variants ?? {}, variant)) {
-    throw new Error(`Alkaid model 不支持思考强度：${selection}`);
+    throw new Error(`Vega model 不支持思考强度：${selection}`);
   }
   const options = provider.options ?? {};
   const baseUrl = resolveEnv(options.baseURL ?? options.baseUrl, config.env);
-  if (!baseUrl) throw new Error(`Alkaid provider 缺少 options.baseURL：${providerId}`);
+  if (!baseUrl) throw new Error(`Vega provider 缺少 options.baseURL：${providerId}`);
   const variants = Object.fromEntries(Object.entries(model.variants ?? {}).map(([level, value]) => [
     level,
     value?.reasoningEffort ?? null,

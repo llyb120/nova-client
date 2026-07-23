@@ -313,7 +313,7 @@ test("system prompt keeps stable Alkaid policy before dynamic cwd/skills", () =>
     }],
     shellConfig: { shell: "/usr/bin/bash" },
   });
-  const stableIndex = prompt.indexOf("你是 Alkaid");
+  const stableIndex = prompt.indexOf("你是 Vega");
   const separatorIndex = prompt.indexOf("\n---\n");
   const cwdIndex = prompt.indexOf("Current working directory:");
   assert.ok(stableIndex >= 0);
@@ -411,7 +411,7 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert(runtime.agent.state.systemPrompt.includes(`命令终端已确认使用 Bash（${shellConfig.shell}）`));
     assert.match(runtime.agent.state.systemPrompt, /不要使用 PowerShell cmdlet/);
     assert.match(runtime.agent.state.systemPrompt, /\n---\n/);
-    assert.ok(runtime.agent.state.systemPrompt.indexOf("你是 Alkaid") < runtime.agent.state.systemPrompt.indexOf("Current working directory:"));
+    assert.ok(runtime.agent.state.systemPrompt.indexOf("你是 Vega") < runtime.agent.state.systemPrompt.indexOf("Current working directory:"));
     const bash = runtime.agent.state.tools.find((tool) => tool.name === "bash");
     assert.match((await bash.execute("1", { command: "printf 'shell-ok'" })).content[0].text, /shell-ok/);
   } finally {

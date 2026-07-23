@@ -32,7 +32,7 @@ async function run(request) {
     await runtime.agent.prompt(await expandAlkaidSkillCommand(request.prompt, runtime.skills));
     const last = runtime.agent.state.messages.at(-1);
     if (last?.role === "assistant" && last.stopReason === "error") {
-      throw new Error(last.errorMessage || "Alkaid provider 请求失败");
+      throw new Error(last.errorMessage || "Vega provider 请求失败");
     }
     send({ type: "done", text: finalText });
   } finally {
@@ -42,7 +42,7 @@ async function run(request) {
 
 const promptIndex = process.argv.indexOf("--prompt");
 if (promptIndex >= 0) {
-  run({ prompt: process.argv[promptIndex + 1] ?? "请只回复：Alkaid OK" }).catch((error) => {
+  run({ prompt: process.argv[promptIndex + 1] ?? "请只回复：Vega OK" }).catch((error) => {
     send({ type: "error", error: error instanceof Error ? error.message : String(error) });
     process.exitCode = 1;
   });

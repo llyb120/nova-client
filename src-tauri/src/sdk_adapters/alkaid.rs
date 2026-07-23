@@ -11,7 +11,7 @@ impl SdkAdapter for AlkaidAdapter {
     }
 
     fn label(&self) -> &'static str {
-        "Alkaid"
+        "Vega"
     }
 
     fn bridge(&self) -> (&'static str, &'static [u8]) {
@@ -141,7 +141,7 @@ fn alkaid_tool_call(value: &Value) -> ToolCall {
     let server = value
         .get("server")
         .and_then(Value::as_str)
-        .unwrap_or("Alkaid");
+        .unwrap_or("Vega");
     let tool = value.get("tool").and_then(Value::as_str).unwrap_or("tool");
     let detail = tool_detail(tool, value.get("arguments"));
     let output = value
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn tools_preserve_arguments_outputs_and_locations() {
         let read = alkaid_tool_call(&json!({
-            "id": "read", "type": "mcp_tool_call", "server": "Alkaid", "tool": "read_files",
+            "id": "read", "type": "mcp_tool_call", "server": "Vega", "tool": "read_files",
             "arguments": { "paths": ["src/a.ts", { "path": "src/b.ts", "offset": 20 }] },
             "status": "completed", "result": { "content": [{ "type": "text", "text": "content" }] }
         }));

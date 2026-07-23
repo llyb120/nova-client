@@ -408,7 +408,7 @@ impl SdkManager {
             } else {
                 self.push_system(
                     thread_id,
-                    "Alkaid 引导失败：运行通道尚未就绪。".into(),
+                    "Vega 引导失败：运行通道尚未就绪。".into(),
                     "error",
                 );
             }
@@ -430,7 +430,7 @@ impl SdkManager {
         let parts = prompt_parts(self.adapter.as_ref(), &text, &images);
         if let Err(error) = write_line(&stdin, &json!({ "action": "steer", "parts": parts })).await
         {
-            self.push_system(thread_id, format!("Alkaid 引导发送失败：{error}"), "error");
+            self.push_system(thread_id, format!("Vega 引导发送失败：{error}"), "error");
         }
     }
 
@@ -528,7 +528,8 @@ impl SdkManager {
         }
         self.alkaid_config_generation.fetch_add(1, Ordering::SeqCst);
         *self.model_options.lock().unwrap() = None;
-        self.model_options_revalidated.store(false, Ordering::SeqCst);
+        self.model_options_revalidated
+            .store(false, Ordering::SeqCst);
         let _ = self.app.emit(
             EV_OPTIONS,
             json!({
@@ -604,7 +605,7 @@ impl SdkManager {
             .run_bridge(&cwd, json!({ "action": "models", "cwd": cwd }))
             .await?;
         if generation != self.alkaid_config_generation.load(Ordering::SeqCst) {
-            return Err("Alkaid 配置已更新，丢弃旧模型列表".into());
+            return Err("Vega 配置已更新，丢弃旧模型列表".into());
         }
         *self.model_options.lock().unwrap() = Some(value.clone());
         let kind = self.adapter.agent_kind();
