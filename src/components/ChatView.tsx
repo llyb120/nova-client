@@ -84,6 +84,22 @@ function VirtualGroup(props: {
     if (prev > 0 && aboveViewport) props.compensateHeight(h - prev);
   };
 
+  /** 挂回视口上方的占位时，立即补偿真实高度差，避免一次小滚动产生大幅跳跃。 */
+  const mountContent = () => {
+    if (!ref || visible()) return;
+    const root = props.scrollEl();
+    const before = ref.getBoundingClientRect();
+    const aboveViewport = !!root && before.bottom <= root.getBoundingClientRect().top;
+    setVisible(true);
+
+    const h = ref.getBoundingClientRect().height;
+    const prev = height();
+    if (h > 0 && Math.abs(h - prev) > 0.5) {
+      setHeight(h);
+      if (prev > 0 && aboveViewport) props.compensateHeight(h - prev);
+    }
+  };
+
   /**
    * 不直接信任 IntersectionObserver 传来的 entry：快速程序化滚动时，WebView2 可能在
    * 回调执行前已经滚到了新位置，旧 entry 会把当前视口里的轮次误卸载成一整块空白。
@@ -91,7 +107,7 @@ function VirtualGroup(props: {
    */
   const syncMounted = () => {
     if (!ref || props.active || props.keepMounted) {
-      setVisible(true);
+      mountContent();
       return;
     }
     const root = props.scrollEl();
@@ -106,7 +122,7 @@ function VirtualGroup(props: {
     const nearViewport =
       rect.bottom >= rootRect.top - buffer && rect.top <= rootRect.bottom + buffer;
     if (nearViewport) {
-      setVisible(true);
+      mountContent();
     } else {
       rememberHeight();
       setVisible(false);
@@ -120,8 +136,8 @@ function VirtualGroup(props: {
     const stopObserving = observeVirtualGroup(root, ref, syncMounted);
     const ro = new ResizeObserver(() => rememberHeight());
     ro.observe(ref);
-    // scroll 事件可以通过命中测试直接唤醒当前视口内的占位，避免等待异步 IO 回调。
-    ref.mountVirtualGroup = () => setVisible(true);
+    // scroll 事件可以通过命中测试直接唤醒当前视口内的占位，并同步修正锚点。
+    ref.mountVirtualGroup = mountContent;
     syncMounted();
     onCleanup(() => {
       stopObserving();
@@ -132,7 +148,7 @@ function VirtualGroup(props: {
 
   // keepMounted / active 变为 true 时立即挂回；普通滚动交给 IO 和视口命中唤醒处理。
   createEffect(() => {
-    if (props.active || props.keepMounted) setVisible(true);
+    if (props.active || props.keepMounted) mountContent();
   });
 
   return (
