@@ -182,11 +182,19 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
   const tokenTitle = () => {
     const t = props.group.turn;
     if (!t?.totalTokens) return undefined;
-    const parts = [`输入 ${fmtTokens(t.inputTokens ?? 0)}`];
-    if (t.cacheReadTokens != null) parts.push(`缓存读取 ${fmtTokens(t.cacheReadTokens)}`);
-    if (t.cacheWriteTokens != null) parts.push(`缓存写入 ${fmtTokens(t.cacheWriteTokens)}`);
-    parts.push(`输出 ${fmtTokens(t.outputTokens ?? 0)} tokens`);
-    return parts.join(" / ");
+
+    // inputTokens 是总输入量，包含缓存命中和缓存写入。悬浮明细拆成
+    // 四个互斥类别，避免把缓存 token 同时算进“读取”和缓存项。
+    const cacheRead = t.cacheReadTokens ?? 0;
+    const cacheWrite = t.cacheWriteTokens ?? 0;
+    const read = Math.max(0, (t.inputTokens ?? 0) - cacheRead - cacheWrite);
+    const parts = [
+      `读取 ${fmtTokens(read)}`,
+      `写入 ${fmtTokens(t.outputTokens ?? 0)}`,
+    ];
+    if (t.cacheReadTokens != null) parts.push(`缓存读取 ${fmtTokens(cacheRead)}`);
+    if (t.cacheWriteTokens != null) parts.push(`缓存写入 ${fmtTokens(cacheWrite)}`);
+    return `${parts.join(" / ")} tokens`;
   };
 
   return (
