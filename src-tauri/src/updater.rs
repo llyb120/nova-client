@@ -1189,8 +1189,7 @@ fn install_headless_in_place(
         .len();
 
     remove_file_if_exists(&old);
-    std::fs::rename(current_exe, &old)
-        .map_err(|error| format!("备份当前版本失败:{error}"))?;
+    std::fs::rename(current_exe, &old).map_err(|error| format!("备份当前版本失败:{error}"))?;
     let install_result = (|| -> Result<(), String> {
         let written = std::fs::copy(new_exe, current_exe)
             .map_err(|error| format!("写入新版本失败:{error}"))?;

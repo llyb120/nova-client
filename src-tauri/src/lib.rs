@@ -5297,8 +5297,7 @@ pub fn run() {
                             } else if let Ok(res) =
                                 updater::download_and_stage(update_app.clone()).await
                             {
-                                if res["ready"].as_bool().unwrap_or(false)
-                                    && !server::is_headless()
+                                if res["ready"].as_bool().unwrap_or(false) && !server::is_headless()
                                 {
                                     if let Ok(info2) = updater::check(&update_app).await {
                                         let _ = update_app.emit(updater::EV_AVAILABLE, info2);
@@ -5327,7 +5326,8 @@ pub fn run() {
                         if idle {
                             if server::is_headless() {
                                 eprintln!("[nova-server] 空闲，正在自动更新至 {ver}");
-                                if let Err(error) = updater::apply_staged(prompt_app.clone()).await {
+                                if let Err(error) = updater::apply_staged(prompt_app.clone()).await
+                                {
                                     eprintln!("[nova-server] 自动更新失败：{error}");
                                 }
                             } else if prompted.as_deref() != Some(ver.as_str()) {

@@ -1414,8 +1414,8 @@ pub fn render_handoff_context(
         return None;
     }
     let native_chars = blocks.iter().map(String::len).sum::<usize>();
-    let use_full_context = completed_turns < HANDOFF_FULL_TURNS
-        && native_chars < HANDOFF_CONTEXT_THRESHOLD;
+    let use_full_context =
+        completed_turns < HANDOFF_FULL_TURNS && native_chars < HANDOFF_CONTEXT_THRESHOLD;
     let body = if use_full_context {
         clip_blocks_to_budget(
             &blocks,
@@ -1427,7 +1427,12 @@ pub fn render_handoff_context(
         // Unfinished work remains native. Stage two only clips old compact turns after this
         // prompt/conclusion representation reaches the same 80% capacity threshold.
         let slim_completed_count = slim_blocks.len();
-        slim_blocks.extend(blocks.iter().skip(unfinished_block_start.unwrap_or(blocks.len())).cloned());
+        slim_blocks.extend(
+            blocks
+                .iter()
+                .skip(unfinished_block_start.unwrap_or(blocks.len()))
+                .cloned(),
+        );
         let slim_chars = slim_blocks.iter().map(String::len).sum::<usize>();
         let budget = if slim_chars >= HANDOFF_CONTEXT_THRESHOLD {
             HANDOFF_CONTEXT_THRESHOLD

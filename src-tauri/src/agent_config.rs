@@ -501,7 +501,8 @@ mod tests {
 
     #[test]
     fn disabling_markdown_adapter_keeps_target_file() {
-        let path = std::env::temp_dir().join(format!("nova-agent-config-{}.md", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("nova-agent-config-{}.md", uuid::Uuid::new_v4()));
         fs::write(&path, managed_block("Nova rule")).unwrap();
 
         sync_markdown(&path, "").unwrap();
@@ -517,7 +518,8 @@ mod tests {
         assert!(rule.contains("alwaysApply: true"));
         assert!(rule.contains(CURSOR_MARKER));
 
-        let path = std::env::temp_dir().join(format!("nova-agent-config-{}.mdc", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("nova-agent-config-{}.mdc", uuid::Uuid::new_v4()));
         fs::write(&path, rule).unwrap();
         sync_cursor_rule(&path, "").unwrap();
 
