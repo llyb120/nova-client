@@ -2,7 +2,6 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import { compactThread, chatScrollToBottomSignal, openThread, setState, state } from "../store";
-import { firstWakeDoPairForThread } from "../threadDisplay";
 import type { Item, Thread } from "../types";
 import { agentLabel } from "../utils";
 import { Composer } from "./Composer";
@@ -191,33 +190,6 @@ export function ChatView() {
     (prev) => groupItems(state.items as Item[], prev),
     [],
   );
-  const mergedPair = createMemo(() => firstWakeDoPairForThread(state.threads, state.currentId));
-  const [mergedWake, setMergedWake] = createSignal<Thread | null>(null);
-  let wakeLoad = 0;
-  createEffect(() => {
-    const pair = mergedPair();
-    const wakeId = pair?.doThread?.id === state.currentId ? pair.wake.id : null;
-    if (!wakeId) {
-      wakeLoad++;
-      setMergedWake(null);
-      return;
-    }
-    if (mergedWake()?.id === wakeId) return;
-    const load = ++wakeLoad;
-    void api
-      .getThread(wakeId)
-      .then((thread) => {
-        if (load === wakeLoad) setMergedWake(thread);
-      })
-      .catch(() => {
-        if (load === wakeLoad) setMergedWake(null);
-      });
-  });
-  onCleanup(() => wakeLoad++);
-  const wakeGroups = createMemo<ReturnType<typeof groupItems>>(
-    (prev) => groupItems((mergedWake()?.items ?? []) as Item[], prev),
-    [],
-  );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
   const lastGroupIndex = () => groups().length - 1;
 
@@ -358,7 +330,7 @@ export function ChatView() {
 
   // 会话累计 token 用量
   const totalTokens = createMemo(() =>
-    [...(mergedWake()?.items ?? []), ...state.items].reduce(
+    state.items.reduce(
       (sum, it) => (it.type === "turn" && it.totalTokens ? sum + it.totalTokens : sum),
       0,
     ),
@@ -435,6 +407,7 @@ export function ChatView() {
   const currentMeta = createMemo(() =>
     state.threads.find((t) => t.id === state.currentId),
   );
+  const isFireThread = () => /^\[Fire\]/.test(currentMeta()?.title ?? "");
   const stageThreads = createMemo(() => {
     const current = currentMeta();
     if (!current) return [];
@@ -451,10 +424,7 @@ export function ChatView() {
       return root;
     };
     const root = rootOf(current);
-    const chain = state.threads.filter((thread) => {
-      if (!thread.employeeId) return false;
-      return rootOf(thread).id === root.id;
-    });
+    const chain = state.threads.filter((thread) => rootOf(thread).id === root.id);
     return chain.sort((a, b) => a.createdAt - b.createdAt);
   });
   const stageName = (thread: (typeof state.threads)[number]) => {
@@ -462,22 +432,16 @@ export function ChatView() {
     if (/\]\s*Do/.test(thread.title)) return "Do";
     if (/\]\s*Dream/.test(thread.title)) return "Dream";
     if (/\]\s*巡查/.test(thread.title)) return "巡查";
+    const fireJudge = thread.title.match(/^\[Fire\]\s*判断\s+(\d+)/);
+    if (fireJudge) return `判断 ${fireJudge[1]}`;
+    const fireStage = thread.title.match(/^\[Fire\]\s*阶段\s+(\d+)/);
+    if (fireStage) return `阶段 ${fireStage[1]}`;
+    if (/^\[Fire\]/.test(thread.title)) return "目标";
     return "事件";
   };
   const jumpToStage = async (threadId: string) => {
+    // 每个 stage 都是独立会话；切换 stage 只切换会话，不再拼接 transcript。
     await openThread(threadId);
-    requestAnimationFrame(() =>
-      requestAnimationFrame(() => {
-        const target = innerRef?.querySelector<HTMLElement>(`[data-thread-id="${threadId}"]`);
-        if (target && scrollRef) {
-          setStickToBottom(false);
-          scrollRef.scrollTo({ top: Math.max(0, target.offsetTop - 16), behavior: "smooth" });
-        } else if (scrollRef) {
-          setStickToBottom(false);
-          scrollRef.scrollTo({ top: 0, behavior: "smooth" });
-        }
-      }),
-    );
   };
   const [starUpdating, setStarUpdating] = createSignal(false);
   const roamingRole = () => currentMeta()?.roamingRole ?? null;
@@ -680,45 +644,14 @@ export function ChatView() {
         onPointerDown={handlePointerDown}
       >
         <div class="transcript-inner" ref={innerRef}>
-          <Show when={state.items.length === 0 && !mergedWake() && !state.loadingThread}>
+          <Show when={state.items.length === 0 && !state.loadingThread}>
             <div class="transcript-hint">
               在下方输入任务，{agentLabel(state.agentKind)} 将在{" "}
               <code>{cwdDisplay()}</code> 中工作。
             </div>
           </Show>
           <Show keyed when={state.currentId}>
-            <Show when={mergedWake()}>
-              {(wake) => (
-                <>
-                  <TranscriptSegment
-                    stage="Wake"
-                    threadId={wake().id}
-                    agentKind={wake().agentKind}
-                    model={wake().model}
-                  />
-                  <For each={wakeGroups()}>
-                    {(g) => (
-                      <VirtualGroup
-                        group={g}
-                        active={false}
-                        scrollEl={() => scrollRef}
-                        compensateHeight={compensateVirtualHeight}
-                      />
-                    )}
-                  </For>
-                </>
-              )}
-            </Show>
-            <Show when={mergedPair()}>
-              {(pair) => (
-                <TranscriptSegment
-                  stage={pair().doThread?.id === state.currentId ? "Do" : "Wake"}
-                  threadId={state.currentId!}
-                  agentKind={state.agentKind}
-                  model={state.model}
-                />
-              )}
-            </Show>
+
             <For each={groups()}>
               {(g, i) => (
                 <VirtualGroup
@@ -744,7 +677,7 @@ export function ChatView() {
               <button
                 type="button"
                 class="stage-rail-item"
-                classList={{ active: thread.id === state.currentId || thread.id === mergedWake()?.id }}
+                classList={{ active: thread.id === state.currentId }}
                 title={thread.title}
                 onClick={() => void jumpToStage(thread.id)}
               >
@@ -759,7 +692,9 @@ export function ChatView() {
 
       <footer class="chat-foot">
         <Show when={state.plan && state.plan.length > 0}>
-          <PlanCard plan={state.plan!} />
+          <div classList={{ "fire-plan-inline": isFireThread() && stageThreads().length > 1 }}>
+            <PlanCard plan={state.plan!} />
+          </div>
         </Show>
         <PlanActionCard />
         <Composer />

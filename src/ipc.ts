@@ -75,6 +75,7 @@ export const api = {
     worktreeBranch: string | null = null,
     worktreeBase: string | null = null,
     clueCardId: string | null = null,
+    parentThreadId: string | null = null,
   ) =>
     invoke<Thread>("create_thread", {
       cwd,
@@ -87,6 +88,7 @@ export const api = {
       worktreeBranch,
       worktreeBase,
       clueCardId,
+      parentThreadId,
     }),
   listClueGroups: () => invoke<ClueNodeGroup[]>("list_clue_groups"),
   getClueContext: (cardId: string) =>
@@ -169,6 +171,8 @@ export const api = {
     invoke<SlashCommand[]>("get_slash_commands", { agentKind }),
   renameThread: (threadId: string, title: string) =>
     invoke<void>("rename_thread", { threadId, title }),
+  notifyFireDone: (threadId: string, success: boolean) =>
+    invoke<void>("notify_fire_done", { threadId, success }),
   sendPrompt: (threadId: string, text: string, images: PromptImage[] = []) =>
     invoke<void>("send_prompt", { threadId, text, images }),
   truncateThread: (

@@ -1797,6 +1797,15 @@ button {
   margin: 0 auto;
   width: 100%;
 }
+/* Fire 右侧有 Stage 导航；计划仍在输入框上方，只收窄右边避免视觉上侵入导航列。 */
+.fire-plan-inline {
+  margin-right: 102px;
+}
+@media (max-width: 820px) {
+  .fire-plan-inline {
+    margin-right: 82px;
+  }
+}
 
 .composer {
   position: relative;

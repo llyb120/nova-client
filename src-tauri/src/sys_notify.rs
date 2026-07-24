@@ -77,6 +77,21 @@ pub fn show(
 
 /// 任务结束通知：点击（Windows）跳转到会话。
 pub fn notify_thread_done(app: &AppHandle, thread_id: &str, title: &str, body: &str, event: &str) {
+    // Fire 的执行与判断阶段会连续结束；中间阶段不逐个打扰，最终结果由
+    // `notify_fire_done` 显式发送一次。
+    if title.starts_with("[Fire]") {
+        return;
+    }
+    notify_thread_done_unfiltered(app, thread_id, title, body, event);
+}
+
+pub fn notify_thread_done_unfiltered(
+    app: &AppHandle,
+    thread_id: &str,
+    title: &str,
+    body: &str,
+    event: &str,
+) {
     let app2 = app.clone();
     let tid = thread_id.to_string();
     let event = event.to_string();

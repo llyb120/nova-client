@@ -159,39 +159,49 @@ export function Sidebar(props: {
     child: boolean;
     childCount: number;
     mergedChild?: ThreadMeta;
+    chainUpdatedAt?: number;
   };
   const threadTreeRows = (threads: ThreadMeta[]): ThreadTreeRow[] => {
     const byId = new Map(threads.map((t) => [t.id, t]));
     const children = new Map<string, ThreadMeta[]>();
-    for (const t of threads) {
-      const parent = t.parentThreadId;
-      if (!parent || !byId.has(parent)) continue;
-      const list = children.get(parent) ?? [];
-      list.push(t);
-      children.set(parent, list);
+    for (const thread of threads) {
+      if (!thread.parentThreadId || !byId.has(thread.parentThreadId)) continue;
+      const list = children.get(thread.parentThreadId) ?? [];
+      list.push(thread);
+      children.set(thread.parentThreadId, list);
     }
-    const rows: ThreadTreeRow[] = [];
-    const add = (t: ThreadMeta, child: boolean) => {
-      const kids = children.get(t.id) ?? [];
-      const mergedChild = firstWakeDoChild(threads, t);
-      const visibleKids = mergedChild ? kids.filter((kid) => kid.id !== mergedChild.id) : kids;
-      rows.push({ thread: t, child, childCount: visibleKids.length, mergedChild });
-      for (const kid of visibleKids) add(kid, true);
+    const descendants = (rootId: string) => {
+      const result: ThreadMeta[] = [];
+      const pending = [...(children.get(rootId) ?? [])];
+      while (pending.length > 0) {
+        const thread = pending.shift()!;
+        result.push(thread);
+        pending.push(...(children.get(thread.id) ?? []));
+      }
+      return result;
     };
-    const roots = threads.filter((t) => !t.parentThreadId || !byId.has(t.parentThreadId));
-    roots.sort((a, b) => {
-      const aUpdatedAt = Math.max(a.updatedAt, firstWakeDoChild(threads, a)?.updatedAt ?? 0);
-      const bUpdatedAt = Math.max(b.updatedAt, firstWakeDoChild(threads, b)?.updatedAt ?? 0);
-      return bUpdatedAt - aUpdatedAt;
-    });
-    for (const root of roots) add(root, false);
+    // 左侧每条任务链只显示根会话；各阶段由会话右侧的 Stage 导航切换。
+    // Wake/Do 仍沿用原来的合并展示，避免改变数字员工列表语义。
+    const rows = threads
+      .filter((thread) => !thread.parentThreadId || !byId.has(thread.parentThreadId))
+      .map((thread) => ({
+        thread,
+        child: false,
+        childCount: 0,
+        mergedChild: firstWakeDoChild(threads, thread),
+        chainUpdatedAt: Math.max(
+          thread.updatedAt,
+          ...descendants(thread.id).map((item) => item.updatedAt),
+        ),
+      }));
+    rows.sort((a, b) => b.chainUpdatedAt - a.chainUpdatedAt);
     return rows;
   };
   const showHistoryByTime = () =>
     !isEmployeeView() && state.settings?.historyDisplayMode === "time";
   const timeRows = createMemo(() => {
     const effectiveUpdatedAt = (row: ThreadTreeRow) =>
-      Math.max(row.thread.updatedAt, row.mergedChild?.updatedAt ?? 0);
+      row.chainUpdatedAt ?? Math.max(row.thread.updatedAt, row.mergedChild?.updatedAt ?? 0);
     return currentGroups()
       .flatMap(([cwd, threads]) =>
         threadTreeRows(threads).map((row) => ({ ...row, cwd })),
@@ -219,7 +229,7 @@ export function Sidebar(props: {
   const remove = async (id: string, title: string) => {
     const childCount = descendantCount(id);
     const ok = await confirm(
-      `删除会话「${title}」？聊天记录将一并删除。${childCount > 0 ? `\n\n该预检会话下的 ${childCount} 个子会话也会一起删除。` : ""}`,
+      `删除会话「${title}」？聊天记录将一并删除。${childCount > 0 ? `\n\n该任务下的 ${childCount} 个阶段会话也会一起删除。` : ""}`,
       {
       title: "删除会话",
       kind: "warning",
@@ -351,11 +361,24 @@ export function Sidebar(props: {
     historyProject?: string,
   ) => {
     const activeThread = mergedChild ?? t;
-    const running = () =>
-      !!state.running[t.id] || !!(mergedChild && state.running[mergedChild.id]);
-    const active = () => state.currentId === t.id || state.currentId === mergedChild?.id;
+    const chainThreads = () => {
+      const ids = new Set<string>([t.id]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const thread of state.threads) {
+          if (thread.parentThreadId && ids.has(thread.parentThreadId) && !ids.has(thread.id)) {
+            ids.add(thread.id);
+            changed = true;
+          }
+        }
+      }
+      return state.threads.filter((thread) => ids.has(thread.id));
+    };
+    const running = () => chainThreads().some((thread) => !!state.running[thread.id]);
+    const active = () => !!state.currentId && chainThreads().some((thread) => thread.id === state.currentId);
     const title = () => mergedChild?.title ?? t.title;
-    const updatedAt = () => Math.max(t.updatedAt, mergedChild?.updatedAt ?? 0);
+    const updatedAt = () => Math.max(...chainThreads().map((thread) => thread.updatedAt));
     return (
       <div
         class="thread-item"

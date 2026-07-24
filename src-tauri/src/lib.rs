@@ -1476,6 +1476,7 @@ async fn create_thread(
     worktree_branch: Option<String>,
     worktree_base: Option<String>,
     clue_card_id: Option<String>,
+    parent_thread_id: Option<String>,
 ) -> Result<Thread, String> {
     let dir = std::path::Path::new(&cwd);
     if !dir.is_dir() {
@@ -1496,6 +1497,7 @@ async fn create_thread(
         reasoning_effort.filter(|s| !s.is_empty()),
         ephemeral.unwrap_or(false),
     );
+    thread.parent_thread_id = parent_thread_id.filter(|id| !id.trim().is_empty());
     if let Some(card_id) = clue_card_id.filter(|value| !value.trim().is_empty()) {
         let snapshot = if state.relay.is_configured() {
             state.relay.clue_context(&card_id).await?
@@ -2549,6 +2551,36 @@ fn open_url(url: String) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("打开浏览器失败：{e}"))?;
     }
+    Ok(())
+}
+
+#[tauri::command]
+fn notify_fire_done(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    success: bool,
+) -> Result<(), String> {
+    let title = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(&thread_id).ok_or("线程不存在")?;
+        if !thread.title.starts_with("[Fire]") {
+            return Err("不是 Fire 会话".into());
+        }
+        thread.title.clone()
+    };
+    let body = if success {
+        "Fire 目标已完成，点击查看结果"
+    } else {
+        "Fire 已结束，但目标仍未通过验收"
+    };
+    sys_notify::notify_thread_done_unfiltered(
+        &app,
+        &thread_id,
+        &title,
+        body,
+        acp::EV_NOTIFY_OPEN,
+    );
     Ok(())
 }
 
@@ -5395,6 +5427,7 @@ pub fn run() {
             open_in_terminal,
             open_url,
             rename_thread,
+            notify_fire_done,
             set_thread_model,
             set_thread_mode,
             set_thread_reasoning_effort,

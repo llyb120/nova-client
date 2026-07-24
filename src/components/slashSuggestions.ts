@@ -26,7 +26,21 @@ export function getSlashSuggestions(
   commands: SlashCommand[],
   query: string,
 ): SlashSuggestion[] {
-  return commands
+  const builtins: SlashCommand[] = [
+    {
+      name: "fire",
+      description: "分阶段执行，并用独立会话反复验收直到目标达成",
+      kind: "Nova",
+      input: "/fire ",
+    },
+    {
+      name: "target",
+      description: "为 /fire 明确指定验收规则（需与 /fire 一起发送）",
+      kind: "Nova",
+      input: "/target ",
+    },
+  ];
+  return [...builtins, ...commands]
     .map((c) => commandToSuggestion(agentKind, c))
     .filter((item, index, all) => all.findIndex((x) => x.id === item.id) === index)
     .filter((item) => {

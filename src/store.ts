@@ -42,7 +42,6 @@ import type {
   UpdateOp,
   UpdateProgress,
 } from "./types";
-import { firstWakeDoPairForThread } from "./threadDisplay";
 import { isScratch, scratchParent } from "./utils";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
@@ -1108,8 +1107,6 @@ function recoverProposedPlan(thread: Thread): string | null {
 }
 
 export async function openThread(id: string) {
-  const pair = firstWakeDoPairForThread(state.threads, id);
-  if (pair?.wake.id === id && pair.doThread) id = pair.doThread.id;
   const switching = state.currentId !== id;
   if (switching) {
     discardPendingStreamUpdates();
@@ -1377,6 +1374,18 @@ export async function sendPrompt(
 ) {
   const id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
+  // 统一在 store 层处理内置命令：首页首条提示和会话内 Composer 都走这里。
+  // 只在 Composer 拦截会漏掉“新建会话后立即发送”的首页路径。
+  const builtInInput = text.trim();
+  if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
+    if (images.length > 0) throw new Error("/fire 暂不支持附件");
+    const parsed = parseFireInput(builtInInput);
+    await startFireRelay(parsed.goal, parsed.acceptanceCriteria);
+    return;
+  }
+  if (/^\/target(?:\s|$)/i.test(builtInInput)) {
+    throw new Error("/target 只能与 /fire 一起发送");
+  }
   const thread = state.threads.find((t) => t.id === id);
   if (thread?.employeeId && !thread.mindThread) {
     await api.registerLedgerItem(thread.employeeId, text, images);
@@ -1398,6 +1407,151 @@ export async function sendPrompt(
     setState("running", id, false);
     throw e;
   }
+}
+
+type FireRelayStep = {
+  rootId: string;
+  goal: string;
+  acceptanceCriteria: string | null;
+  role: "work" | "judge";
+  attempt: number;
+};
+
+const fireRelaySteps = new Map<string, FireRelayStep>();
+const FIRE_MAX_ATTEMPTS = 20;
+
+type ParsedFireInput = {
+  goal: string;
+  acceptanceCriteria: string | null;
+};
+
+function parseFireInput(input: string): ParsedFireInput {
+  const body = input.replace(/^\/fire(?:[ \t]+|(?=\r?\n)|$)/i, "");
+  const targetMatches = [...body.matchAll(/^\/target(?:[ \t]+(.*)|[ \t]*)$/gim)];
+  if (targetMatches.length > 1) throw new Error("每个 /fire 只能指定一次 /target");
+
+  const target = targetMatches[0];
+  if (!target || target.index === undefined) {
+    return { goal: body.trim(), acceptanceCriteria: null };
+  }
+
+  const goal = body.slice(0, target.index).trim();
+  const firstRule = target[1]?.trim() ?? "";
+  const remainingRules = body.slice(target.index + target[0].length).trim();
+  const acceptanceCriteria = [firstRule, remainingRules].filter(Boolean).join("\n");
+  if (!acceptanceCriteria) throw new Error("请在 /target 后输入验收规则");
+  return { goal, acceptanceCriteria };
+}
+
+function fireConclusion(thread: Thread): string {
+  return [...thread.items]
+    .reverse()
+    .find((item): item is Extract<Item, { type: "assistant" }> =>
+      item.type === "assistant" && !!item.text.trim())?.text.trim() ?? "（会话没有给出结论）";
+}
+
+async function createFireThread(
+  step: FireRelayStep,
+  title: string,
+  prompt: string,
+): Promise<string> {
+  const root = await api.getThread(step.rootId);
+  const thread = await api.createThread(
+    root.cwd,
+    root.agentKind,
+    root.model ?? null,
+    "build",
+    null,
+    false,
+    false,
+    null,
+    null,
+    null,
+    step.rootId,
+  );
+  await api.renameThread(thread.id, title);
+  fireRelaySteps.set(thread.id, step);
+  await refreshThreads();
+  await openThread(thread.id);
+  setState("running", thread.id, true);
+  await api.sendPrompt(thread.id, prompt);
+  return thread.id;
+}
+
+async function advanceFireRelay(threadId: string) {
+  const step = fireRelaySteps.get(threadId);
+  if (!step) return;
+  fireRelaySteps.delete(threadId);
+  const thread = await api.getThread(threadId);
+  if (step.role === "work") {
+    const conclusion = fireConclusion(thread);
+    await createFireThread(
+      { ...step, role: "judge" },
+      `[Fire] 判断 ${step.attempt}`,
+      `你是独立验收者。判断下面会话的结论是否真正完成目标，不要继续执行任务。\n\n目标：\n${step.goal}${step.acceptanceCriteria ? `\n\n验收规则：\n${step.acceptanceCriteria}` : ""}\n\n待验收结论：\n${conclusion}\n\n必须在回复最后单独输出一行 FIRE_ACCEPTED 或 FIRE_REJECTED；此前说明判断理由，标准从严。`,
+    );
+    return;
+  }
+
+  const verdict = fireConclusion(thread);
+  if (/FIRE_ACCEPTED\s*$/i.test(verdict)) {
+    await api.renameThread(thread.id, `[Fire] 判断 ${step.attempt} · 符合`);
+    await refreshThreads();
+    await api.notifyFireDone(thread.id, true);
+    return;
+  }
+  if (step.attempt >= FIRE_MAX_ATTEMPTS) {
+    await api.renameThread(thread.id, `[Fire] 判断 ${step.attempt} · 已停止`);
+    await refreshThreads();
+    await api.notifyFireDone(thread.id, false);
+    return;
+  }
+  await createFireThread(
+    {
+      rootId: step.rootId,
+      goal: step.goal,
+      acceptanceCriteria: step.acceptanceCriteria,
+      role: "work",
+      attempt: step.attempt + 1,
+    },
+    `[Fire] 阶段 ${step.attempt + 1}`,
+    `继续完成以下目标。上一次验收未通过；请根据验收结论修正问题并给出可验收的最终结论。\n\n目标：\n${step.goal}\n\n验收结论：\n${verdict}`,
+  );
+}
+
+async function stopFireRelay(threadId: string) {
+  const step = fireRelaySteps.get(threadId);
+  if (!step) return;
+  fireRelaySteps.delete(threadId);
+  await api.renameThread(threadId, `[Fire] ${step.role === "judge" ? "判断" : "阶段"} ${step.attempt} · 已中断`);
+  await refreshThreads();
+  await api.notifyFireDone(threadId, false);
+}
+
+export async function startFireRelay(goal: string, acceptanceCriteria: string | null = null) {
+  const rootId = state.currentId;
+  const trimmed = goal.trim();
+  if (!rootId || !trimmed) throw new Error("请在 /fire 后输入目标");
+  // 首页刚创建会话后会立即发送首条提示，此时异步 refreshThreads 可能尚未完成；
+  // 直接读取后端快照，不能依赖列表中已经出现该会话。
+  const root = await api.getThread(rootId);
+  if (root.employeeId || root.roamingRole || root.quotaPeerName) {
+    throw new Error("/fire 仅支持本地普通会话");
+  }
+  if (state.running[rootId]) throw new Error("请等待当前会话结束后再启动 /fire");
+  // Fire 始终执行而不是规划；根会话和后续所有阶段都强制使用 Build。
+  await api.setThreadMode(rootId, "build");
+  if (state.currentId === rootId) setState("mode", "build");
+  await api.renameThread(rootId, `[Fire] 目标 · ${trimmed.slice(0, 28)}`);
+  fireRelaySteps.set(rootId, {
+    rootId,
+    goal: trimmed,
+    acceptanceCriteria,
+    role: "work",
+    attempt: 1,
+  });
+  await refreshThreads();
+  await sendPrompt(trimmed);
 }
 
 /** ChatView 订阅：发送新提示词时强制滚到底 */
@@ -1760,12 +1914,21 @@ export async function initStore() {
   await listen<TurnEvent>("acp:turn", (e) => {
     setState("running", e.payload.threadId, e.payload.running);
     if (e.payload.running) preloadThreadSnapshot(e.payload.threadId);
-    else if (
-      e.payload.threadId === state.currentId &&
-      state.items.some((item) => item.id < 0)
-    ) {
-      // 后台 restore 被取消或自动重发失败：清掉尚未落库的乐观消息。
-      void openThread(e.payload.threadId);
+    else {
+      if (fireRelaySteps.has(e.payload.threadId)) {
+        const interrupted = e.payload.stopReason === "cancelled" || e.payload.stopReason === "force_cancelled";
+        const action = interrupted
+          ? stopFireRelay(e.payload.threadId)
+          : advanceFireRelay(e.payload.threadId);
+        void action.catch((error) => console.error("Fire relay failed", error));
+      }
+      if (
+        e.payload.threadId === state.currentId &&
+        state.items.some((item) => item.id < 0)
+      ) {
+        // 后台 restore 被取消或自动重发失败：清掉尚未落库的乐观消息。
+        void openThread(e.payload.threadId);
+      }
     }
   });
 
@@ -1860,11 +2023,6 @@ export async function initStore() {
     void refreshThreads().then(() => {
       const id = state.currentId;
       if (!id) return;
-      const pair = firstWakeDoPairForThread(state.threads, id);
-      if (pair?.wake.id === id && pair.doThread) {
-        void openThread(id);
-        return;
-      }
       const meta = state.threads.find((t) => t.id === id);
       if (meta && meta.title !== state.title) setState("title", meta.title);
     });
