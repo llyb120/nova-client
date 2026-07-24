@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 process.env.NOVA_CODEBUDDY_BRIDGE_TEST = "1";
 const {
   assistantItems,
+  assistantText,
   permissionModeFor,
   promptMessages,
   resolveCodeBuddyCliPath,
@@ -57,3 +58,6 @@ assert.deepEqual(finalItems, [
   { id: "message-1-1", type: "reasoning", text: "完整思考" },
 ]);
 assert.equal(finalItems[0].id, "message-1-0", "the final snapshot must replace the partial item");
+assert.equal(assistantText({
+  message: { content: [{ type: "thinking", thinking: "ignore" }, { type: "text", text: "修复标题" }] },
+}), "修复标题");

@@ -246,10 +246,25 @@ impl AppState {
                 .generate_title_async(thread_id, prompt, fallback, String::new());
             return;
         }
+        if matches!(
+            AgentKind::from_str(&agent_raw),
+            Some(AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus)
+        ) && self.agent_enabled(&AgentKind::CodeBuddy)
+        {
+            self.codebuddyplus
+                .generate_title_async(thread_id, prompt, fallback, model);
+            return;
+        }
+        if agent_raw.is_empty()
+            && matches!(origin, AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus)
+            && self.agent_enabled(&AgentKind::CodeBuddy)
+        {
+            self.codebuddyplus
+                .generate_title_async(thread_id, prompt, fallback, String::new());
+            return;
+        }
         let (mgr, model) = match AgentKind::from_str(&agent_raw) {
-            Some(AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::ClaudeCode) => {
-                (self.acp.clone(), String::new())
-            }
+            Some(AgentKind::ClaudeCode) => (self.acp.clone(), String::new()),
             Some(kind) if self.agent_enabled(&kind) => match self.acp_for(&kind) {
                 Some(mgr) => (mgr, model),
                 None => (self.title_fallback_mgr(origin), String::new()),

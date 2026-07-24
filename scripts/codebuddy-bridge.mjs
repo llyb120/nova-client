@@ -160,6 +160,37 @@ async function runPrompt(lines, request) {
   void input;
 }
 
+function assistantText(message) {
+  return (message.message?.content ?? [])
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("");
+}
+
+async function generateTitle(request) {
+  const cliPath = resolveCodeBuddyCliPath(process.env.NOVA_CODEBUDDY_PATH || undefined);
+  let title = "";
+  const result = query({
+    prompt: request.prompt,
+    options: {
+      cwd: request.cwd,
+      model: request.model || undefined,
+      pathToCodebuddyCode: cliPath,
+      permissionMode: "bypassPermissions",
+      maxTurns: 1,
+      stderr: (data) => process.stderr.write(data),
+    },
+  });
+  for await (const message of result) {
+    if (message.type === "assistant") title = assistantText(message) || title;
+    else if (message.type === "error") throw new Error(message.error);
+    else if (message.type === "result" && message.is_error) {
+      throw new Error(message.errors?.join("\n") || "CodeBuddy title generation failed");
+    }
+  }
+  return title;
+}
+
 async function modelOptions(request) {
   const cliPath = resolveCodeBuddyCliPath(process.env.NOVA_CODEBUDDY_PATH || undefined);
   if (cliPath) process.env.CODEBUDDY_CODE_PATH = cliPath;
@@ -195,6 +226,7 @@ async function main() {
     request = await readRequest(lines);
     if (request.action === "prompt") await runPrompt(lines, request);
     else if (request.action === "models") send({ ok: true, data: await modelOptions(request) });
+    else if (request.action === "title") send({ ok: true, data: await generateTitle(request) });
     else throw new Error(`Unknown action: ${request.action}`);
   } catch (error) {
     send({ ok: false, error: error instanceof Error ? error.message : String(error) });
@@ -207,4 +239,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { assistantItems, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem };
+export { assistantItems, assistantText, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem };

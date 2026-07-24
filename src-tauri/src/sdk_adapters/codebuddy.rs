@@ -34,6 +34,10 @@ impl SdkAdapter for CodeBuddyAdapter {
         "cbp"
     }
 
+    fn generates_title(&self) -> bool {
+        true
+    }
+
     fn normalize_usage(
         &self,
         usage: Option<&Value>,
