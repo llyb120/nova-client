@@ -269,6 +269,13 @@ export async function runAlkaidPromptWithRetry(agent, input, images, options = {
       await runAttempt(operation);
     } catch (error) {
       thrownError = error;
+      // The idle-timeout race rejects as soon as abort is requested, while PI may still be
+      // appending its final aborted assistant message. Wait for that run to settle before
+      // pruning it; otherwise the late message makes the following continue() fail because
+      // the transcript ends in an assistant role.
+      if (error instanceof AlkaidProviderIdleTimeoutError && typeof agent.waitForIdle === "function") {
+        await agent.waitForIdle();
+      }
     }
 
     const last = agent.state.messages.at(-1);

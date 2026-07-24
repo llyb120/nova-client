@@ -347,6 +347,45 @@ test("provider inactivity aborts and retries automatically", async () => {
   assert.deepEqual(retries, [[1, "AlkaidProviderIdleTimeoutError"]]);
 });
 
+test("provider inactivity waits for PI abort settlement before continuing", async () => {
+  let settleAbort;
+  let activeRun = Promise.resolve();
+  const agent = {
+    state: { messages: [] },
+    prompt() {
+      this.state.messages.push(
+        { role: "user", content: [], timestamp: Date.now() },
+        { role: "assistant", content: [{ type: "thinking", thinking: "partial" }], stopReason: "toolUse" },
+      );
+      activeRun = new Promise((resolve) => { settleAbort = resolve; });
+      return activeRun;
+    },
+    abort() {
+      setTimeout(() => {
+        this.state.messages.push({ role: "assistant", content: [], stopReason: "aborted" });
+        settleAbort();
+      }, 0);
+    },
+    waitForIdle() {
+      return activeRun;
+    },
+    async continue() {
+      if (this.state.messages.at(-1)?.role === "assistant") {
+        throw new Error("Cannot continue from message role: assistant");
+      }
+      this.state.messages.push({ role: "assistant", content: [{ type: "text", text: "recovered" }], stopReason: "stop" });
+    },
+  };
+  const idleTimeout = createAlkaidIdleTimeout({ timeoutMs: 5, onTimeout: () => agent.abort() });
+  const outcome = await runAlkaidPromptWithRetry(agent, "work", [], {
+    retryDelaysMs: [0],
+    sleep: async () => {},
+    runAttempt: (operation) => idleTimeout.run(operation),
+  });
+  assert.equal(outcome.last.content[0].text, "recovered");
+  assert.deepEqual(agent.state.messages.map((message) => message.role), ["user", "assistant"]);
+});
+
 test("provider activity resets the inactivity timeout", async () => {
   let timedOut = false;
   const idleTimeout = createAlkaidIdleTimeout({ timeoutMs: 20, onTimeout: () => { timedOut = true; } });
