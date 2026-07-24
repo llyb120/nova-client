@@ -1431,6 +1431,10 @@ const suspendedFireRelaySteps = new Map<string, FireRelayStep>();
 // 正常结束的阶段也保留流程身份。否则它一旦创建判断会话便会从 fireRelaySteps
 // 删除，用户回到该阶段补充内容时只能进行普通对话，后续结果不会再触发验收。
 const fireRelayStepHistory = new Map<string, FireRelayStep>();
+// 每条 Fire 链只允许最后一个会话继续推进。显式记录最后会话，避免旧阶段补充消息
+// 分叉流程，也避免中断事件遗留的 active 记录挡住最后阶段恢复。
+const latestFireThreadByRoot = new Map<string, string>();
+const completedFireRoots = new Set<string>();
 const FIRE_MAX_ATTEMPTS = 20;
 
 type ParsedFireInput = {
@@ -1493,20 +1497,26 @@ function fireStepTitle(step: FireRelayStep, status = ""): string {
 }
 
 function resumeFireRelay(threadId: string): FireRelayStep | null {
-  if (fireRelaySteps.has(threadId)) return null;
-  const step = suspendedFireRelaySteps.get(threadId) ?? fireRelayStepHistory.get(threadId);
-  if (!step) return null;
+  const step = fireRelaySteps.get(threadId)
+    ?? suspendedFireRelaySteps.get(threadId)
+    ?? fireRelayStepHistory.get(threadId);
+  if (!step || latestFireThreadByRoot.get(step.rootId) !== threadId) return null;
 
-  // 同一任务已有阶段正在运行时，不从历史会话并行启动第二条自动流程。
-  const rootIsActive = [...fireRelaySteps.values()].some(
-    (active) => active.rootId === step.rootId,
-  );
-  if (rootIsActive) return null;
-
-  suspendedFireRelaySteps.delete(threadId);
+  // 用户在最后会话继续对话时原样执行其提示，只撤销该链上一次的暂停或最终结果，
+  // 让这次回复结束后重新按当前阶段角色推进；旧阶段仍不能分叉流程。
+  const wasCompleted = completedFireRoots.delete(step.rootId);
+  for (const [activeId, activeStep] of fireRelaySteps) {
+    if (activeId !== threadId && activeStep.rootId === step.rootId) {
+      fireRelaySteps.delete(activeId);
+      suspendedFireRelaySteps.set(activeId, activeStep);
+    }
+  }
+  const wasSuspended = suspendedFireRelaySteps.delete(threadId);
   fireRelaySteps.set(threadId, step);
-  // 标题恢复不应阻塞用户刚提交的继续提示。
-  void api.renameThread(threadId, fireStepTitle(step)).then(refreshThreads).catch(() => {});
+  if (wasSuspended || wasCompleted) {
+    // 标题恢复不应阻塞用户刚提交的提示。
+    void api.renameThread(threadId, fireStepTitle(step)).then(refreshThreads).catch(() => {});
+  }
   return step;
 }
 
@@ -1532,6 +1542,7 @@ async function createFireThread(
   await api.renameThread(thread.id, title);
   fireRelaySteps.set(thread.id, step);
   fireRelayStepHistory.set(thread.id, step);
+  latestFireThreadByRoot.set(step.rootId, thread.id);
   await refreshThreads();
   await openThread(thread.id);
   setState("running", thread.id, true);
@@ -1556,12 +1567,14 @@ async function advanceFireRelay(threadId: string) {
 
   const verdict = fireConclusion(thread);
   if (/FIRE_ACCEPTED\s*$/i.test(verdict)) {
+    completedFireRoots.add(step.rootId);
     await api.renameThread(thread.id, `[Fire] 判断 ${step.attempt} · 符合`);
     await refreshThreads();
     await api.notifyFireDone(thread.id, true);
     return;
   }
   if (step.attempt >= FIRE_MAX_ATTEMPTS) {
+    completedFireRoots.add(step.rootId);
     await api.renameThread(thread.id, `[Fire] 判断 ${step.attempt} · 已停止`);
     await refreshThreads();
     await api.notifyFireDone(thread.id, false);
@@ -1607,6 +1620,7 @@ export async function startFireRelay(goal: string, acceptanceCriteria: string | 
   if (state.currentId === rootId) setState("mode", "build");
   await api.renameThread(rootId, `[Fire] 目标 · ${trimmed.slice(0, 28)}`);
   suspendedFireRelaySteps.delete(rootId);
+  completedFireRoots.delete(rootId);
   const rootStep: FireRelayStep = {
     rootId,
     goal: trimmed,
@@ -1616,6 +1630,7 @@ export async function startFireRelay(goal: string, acceptanceCriteria: string | 
   };
   fireRelaySteps.set(rootId, rootStep);
   fireRelayStepHistory.set(rootId, rootStep);
+  latestFireThreadByRoot.set(rootId, rootId);
   await refreshThreads();
   await sendPrompt(fireWorkPrompt(trimmed));
 }
