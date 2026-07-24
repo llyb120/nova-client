@@ -29,6 +29,7 @@ export function ProjectPicker(props: {
   const [query, setQuery] = createSignal("");
   let rootRef: HTMLDivElement | undefined;
   let searchRef: HTMLInputElement | undefined;
+  let focusFrame: number | undefined;
 
   // 项目列表由后端统一合并：最近项目 + 本地会话用过的目录（已排除临时目录 /
   // 别人的漫游目录 / 已删除的 worktree），并带 worktree 标注
@@ -93,16 +94,35 @@ export function ProjectPicker(props: {
     pick(dir);
   };
 
+  const cancelPendingFocus = () => {
+    if (focusFrame === undefined) return;
+    cancelAnimationFrame(focusFrame);
+    focusFrame = undefined;
+  };
+
   const toggle = () => {
-    setOpened(!opened());
-    if (opened()) queueMicrotask(() => searchRef?.focus());
+    const willOpen = !opened();
+    setOpened(willOpen);
+    cancelPendingFocus();
+    if (willOpen) {
+      focusFrame = requestAnimationFrame(() => {
+        focusFrame = undefined;
+        searchRef?.focus({ preventScroll: true });
+      });
+    }
   };
 
   const onDocClick = (e: MouseEvent) => {
-    if (rootRef && !rootRef.contains(e.target as Node)) setOpened(false);
+    if (rootRef && !rootRef.contains(e.target as Node)) {
+      setOpened(false);
+      cancelPendingFocus();
+    }
   };
   document.addEventListener("mousedown", onDocClick);
-  onCleanup(() => document.removeEventListener("mousedown", onDocClick));
+  onCleanup(() => {
+    document.removeEventListener("mousedown", onDocClick);
+    cancelPendingFocus();
+  });
 
   return (
     <div class="proj-picker" ref={rootRef}>
@@ -115,16 +135,15 @@ export function ProjectPicker(props: {
         <span class="pill-text">{pillText()}</span>
         <IconChevron size={12} open={opened()} />
       </button>
-      <Show when={opened()}>
-        <div class={`proj-pop ${props.popDown ? "down" : ""}`}>
-          <input
-            ref={searchRef}
-            class="proj-search"
-            placeholder="搜索项目"
-            value={query()}
-            onInput={(e) => setQuery(e.currentTarget.value)}
-          />
-          <div class="proj-list">
+      <div class={`proj-pop ${props.popDown ? "down" : ""}`} hidden={!opened()}>
+        <input
+          ref={searchRef}
+          class="proj-search"
+          placeholder="搜索项目"
+          value={query()}
+          onInput={(e) => setQuery(e.currentTarget.value)}
+        />
+        <div class="proj-list">
             <div
               class={`proj-item scratch ${props.value && isScratch(props.value) ? "active" : ""}`}
               onClick={() => void useScratch()}
@@ -201,12 +220,11 @@ export function ProjectPicker(props: {
               </For>
             </Show>
           </div>
-          <button class="proj-browse" onClick={() => void browse()}>
-            <IconPlus size={13} />
-            使用现有文件夹…
-          </button>
-        </div>
-      </Show>
+        <button class="proj-browse" onClick={() => void browse()}>
+          <IconPlus size={13} />
+          使用现有文件夹…
+        </button>
+      </div>
     </div>
   );
 }
