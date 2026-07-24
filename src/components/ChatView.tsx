@@ -57,6 +57,7 @@ function observeVirtualGroup(root: HTMLElement, element: Element, callback: () =
  */
 function VirtualGroup(props: {
   group: Group;
+  index: number;
   active: boolean;
   /** 列表最后一组：始终挂载，保证新提示词有真实高度可供吸底 */
   keepMounted?: boolean;
@@ -155,6 +156,7 @@ function VirtualGroup(props: {
     <div
       ref={ref}
       class="vgroup"
+      data-group-index={props.index}
       // 仅卸载时使用缓存高度。挂载后必须恢复自然高度，否则内容折叠时旧 min-height
       // 会反过来撑住观察目标，ResizeObserver 无法测到变矮后的真实尺寸。
       style={height() > 0 && !mounted() ? { height: `${height()}px` } : undefined}
@@ -208,6 +210,49 @@ export function ChatView() {
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
   const lastGroupIndex = () => groups().length - 1;
+  const timeStops = createMemo(() => {
+    let turn = 0;
+    return groups().flatMap((group, index) => {
+      if (!group.user) return [];
+      turn++;
+      const text = group.user.text.replace(/\s+/g, " ").trim();
+      return [{ index, turn, label: text || `第 ${turn} 轮` }];
+    });
+  });
+  const [activeTimeIndex, setActiveTimeIndex] = createSignal(-1);
+  const latestTimeIndex = () => timeStops().at(-1)?.index ?? -1;
+
+  const syncTimeCursor = () => {
+    if (!scrollRef) return;
+    const top = scrollRef.getBoundingClientRect().top + 32;
+    let current = timeStops()[0]?.index ?? -1;
+    for (const stop of timeStops()) {
+      const element = innerRef?.querySelector<HTMLElement>(
+        `.vgroup[data-group-index="${stop.index}"]`,
+      );
+      if (element && element.getBoundingClientRect().top <= top) current = stop.index;
+      else if (element) break;
+    }
+    setActiveTimeIndex(current);
+  };
+
+  const travelTo = (index: number) => {
+    const element = innerRef?.querySelector<VirtualGroupElement>(
+      `.vgroup[data-group-index="${index}"]`,
+    );
+    if (!element) return;
+    cancelBottomFollow();
+    element.mountVirtualGroup?.();
+    requestAnimationFrame(() => {
+      element.scrollIntoView({ block: "start" });
+      syncTimeCursor();
+    });
+  };
+
+  const returnToNow = () => {
+    enableBottomFollow();
+    setActiveTimeIndex(latestTimeIndex());
+  };
 
   /**
    * IO 回调是异步的，拖动滚动条跨很长距离时可能晚一帧。先用命中测试找到一个锚点，
@@ -299,6 +344,7 @@ export function ChatView() {
 
   const handleTranscriptScroll = () => {
     mountVisibleVirtualGroups();
+    syncTimeCursor();
     const currentTop = scrollRef?.scrollTop ?? 0;
     const atBottom = isAtBottom();
     if (stickToBottom()) {
@@ -405,9 +451,18 @@ export function ChatView() {
   // 切换会话时从底部开始；后续尺寸变化由 ResizeObserver 持续对齐。
   createEffect((prevId: string | null | undefined) => {
     const id = state.currentId;
-    if (id !== prevId) enableBottomFollow();
+    if (id !== prevId) {
+      enableBottomFollow();
+      setActiveTimeIndex(latestTimeIndex());
+    }
     return id;
   }, undefined);
+
+  // 会话加载和新增轮次后，让“现在”刻度跟随最新用户轮次；回看过去时不抢走光标。
+  createEffect(() => {
+    const latest = latestTimeIndex();
+    if (stickToBottom()) setActiveTimeIndex(latest);
+  });
 
   // 主动发送新提示词时重新进入吸底，无动画直接显示最新内容。
   createEffect(() => {
@@ -672,6 +727,7 @@ export function ChatView() {
               {(g, i) => (
                 <VirtualGroup
                   group={g}
+                  index={i()}
                   // 运行中所有尚未闭合的轮次都保持活跃：补充提示词会新开一组，
                   // 若只标最后一组，前面仍在跑的工具/输出会像已停止。
                   active={isRunning() && !g.turn}
@@ -685,6 +741,44 @@ export function ChatView() {
           <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
         </div>
       </div>
+      <Show when={timeStops().length > 1}>
+        <aside class="time-rail" aria-label="会话时光机">
+          <div class="time-rail-head" title="点击任意刻度回看；编辑那里的消息即可从过去重新开始">
+            <span class="time-rail-clock" aria-hidden="true" />
+            <span>时光机</span>
+          </div>
+          <div class="time-rail-track">
+            <For each={timeStops()}>
+              {(stop) => (
+                <button
+                  type="button"
+                  class="time-stop"
+                  classList={{
+                    active: stop.index === activeTimeIndex(),
+                    future: stop.index > activeTimeIndex(),
+                  }}
+                  title={`第 ${stop.turn} 轮 · ${stop.label}`}
+                  aria-label={`回到第 ${stop.turn} 轮：${stop.label}`}
+                  onClick={() => travelTo(stop.index)}
+                >
+                  <span class="time-stop-dot" />
+                  <span class="time-stop-number">{stop.turn}</span>
+                </button>
+              )}
+            </For>
+          </div>
+          <button
+            type="button"
+            class="time-now"
+            classList={{ active: stickToBottom() }}
+            title="回到对话现在"
+            onClick={returnToNow}
+          >
+            <span class="time-now-pulse" />
+            现在
+          </button>
+        </aside>
+      </Show>
       <Show when={stageThreads().length > 1}>
         <aside class="stage-rail" aria-label="会话阶段导航">
           <div class="stage-rail-count">{stageThreads().length} 个事件</div>

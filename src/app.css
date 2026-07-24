@@ -875,6 +875,149 @@ button {
 .chat-body > .transcript {
   min-width: 0;
 }
+
+/* 会话时光机：Vega 已持有完整上下文，因此把每轮提示词变成可穿梭的时间刻度。 */
+.time-rail {
+  position: relative;
+  z-index: 3;
+  flex: 0 0 58px;
+  width: 58px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 16px 0 12px;
+  border-left: 1px solid var(--border-light);
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
+}
+.time-rail-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 9px;
+  color: var(--text-faint);
+  font-size: 9px;
+  letter-spacing: .08em;
+  white-space: nowrap;
+}
+.time-rail-clock {
+  position: relative;
+  width: 17px;
+  height: 17px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+}
+.time-rail-clock::before,
+.time-rail-clock::after {
+  content: "";
+  position: absolute;
+  left: 7px;
+  top: 3px;
+  width: 1.5px;
+  height: 5px;
+  border-radius: 2px;
+  background: currentColor;
+  transform-origin: 50% 5px;
+}
+.time-rail-clock::after {
+  transform: rotate(125deg);
+}
+.time-rail-track {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-x: visible;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.time-rail-track::-webkit-scrollbar {
+  display: none;
+}
+.time-rail-track::before {
+  content: "";
+  position: absolute;
+  top: 14px;
+  bottom: 14px;
+  left: 28px;
+  width: 1px;
+  background: linear-gradient(to bottom, var(--accent), var(--border-strong) 70%, var(--border));
+  opacity: .48;
+}
+.time-stop {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 32px;
+  color: var(--text-faint);
+  overflow: visible;
+}
+.time-stop-dot {
+  position: absolute;
+  z-index: 1;
+  left: 24px;
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+  background: var(--text-muted);
+  box-shadow: 0 0 0 1px var(--border-strong);
+  transition: transform .16s, background .16s, box-shadow .16s;
+}
+.time-stop-number {
+  width: 20px;
+  margin-left: 34px;
+  color: inherit;
+  font: 9px/1 var(--mono);
+  text-align: left;
+}
+.time-stop:hover,
+.time-stop.active {
+  color: var(--accent);
+}
+.time-stop:hover .time-stop-dot,
+.time-stop.active .time-stop-dot {
+  transform: scale(1.25);
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 10px color-mix(in srgb, var(--accent) 65%, transparent);
+}
+.time-stop.future {
+  opacity: .42;
+}
+.time-now {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 5px 7px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+.time-now:hover,
+.time-now.active {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-dim);
+}
+.time-now-pulse {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.time-now.active .time-now-pulse {
+  box-shadow: 0 0 7px var(--accent);
+  animation: time-now-pulse 1.8s ease-in-out infinite;
+}
+@keyframes time-now-pulse {
+  50% { opacity: .35; transform: scale(.72); }
+}
+
 .stage-rail {
   flex: 0 0 92px;
   width: 92px;
@@ -917,6 +1060,20 @@ button {
   }
   .stage-rail-count {
     display: none;
+  }
+  .time-rail {
+    flex-basis: 46px;
+    width: 46px;
+  }
+  .time-rail-head span:last-child,
+  .time-stop-number {
+    display: none;
+  }
+  .time-rail-track::before {
+    left: 22px;
+  }
+  .time-stop-dot {
+    left: 18px;
   }
 }
 
@@ -965,6 +1122,7 @@ button {
 /* transcript 虚拟化 wrapper：不参与 flex 收缩，卸载时用等高占位撑住滚动高度 */
 .vgroup {
   flex: 0 0 auto;
+  scroll-margin-top: 20px;
 }
 
 .transcript-hint {
