@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, expandAlkaidSkillCommand, mergeAlkaidUsage, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext } from "./alkaid-slim-memory.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
@@ -201,12 +201,15 @@ async function prompt(request, commands) {
   let reuseAssistantIds = false;
   let cancelled = false;
   let usage;
+  let activeTools = 0;
+  const idleTimeout = createAlkaidIdleTimeout({ onTimeout: () => runtime.agent.abort() });
   const toolItems = new Map();
   runtime.agent.subscribe((event) => {
     if (event.type === "message_end" && event.message.role === "assistant") {
       usage = mergeAlkaidUsage(usage, event.message.usage);
     }
     if (event.type === "message_start" && event.message.role === "assistant") {
+      idleTimeout.touch();
       text = "";
       thinking = "";
       if (reuseAssistantIds) {
@@ -216,16 +219,22 @@ async function prompt(request, commands) {
         thinkingId = `thinking-${randomUUID()}`;
       }
     } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      idleTimeout.touch();
       text += event.assistantMessageEvent.delta;
       send({ type: "item", item: { id: assistantId, type: "agent_message", text } });
     } else if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_delta") {
+      idleTimeout.touch();
       thinking += event.assistantMessageEvent.delta;
       send({ type: "item", item: { id: thinkingId, type: "reasoning", text: thinking } });
     } else if (event.type === "tool_execution_start") {
+      activeTools += 1;
+      idleTimeout.pause();
       const item = startedToolItem(event);
       toolItems.set(event.toolCallId, item);
       send({ type: "item", item });
     } else if (event.type === "tool_execution_end") {
+      activeTools = Math.max(0, activeTools - 1);
+      if (activeTools === 0) idleTimeout.resume();
       const item = toolItems.get(event.toolCallId);
       const output = event.result?.content?.map((part) => part.text ?? "").join("\n") ?? "";
       if (item) send({ type: "item", item: {
@@ -263,7 +272,15 @@ async function prompt(request, commands) {
     const promptText = slimContext && !useFullContext ? messageWithSlimMemory(expandedText, memory) : expandedText;
     const outcome = await runAlkaidPromptWithRetry(runtime.agent, promptText, input.images, {
       isCancelled: () => cancelled,
-      onRetry: () => {
+      runAttempt: (operation) => idleTimeout.run(operation),
+      onRetry: ({ attempt, error }) => {
+        send({
+          type: "timing",
+          phase: "provider_retry",
+          elapsedMs: 0,
+          attempt,
+          reason: error instanceof Error ? error.message : String(error),
+        });
         if (text) send({ type: "item", item: { id: assistantId, type: "agent_message", text: "" } });
         if (thinking) send({ type: "item", item: { id: thinkingId, type: "reasoning", text: "" } });
         text = "";

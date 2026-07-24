@@ -19,6 +19,7 @@ import {
   clampToolOutputText,
   connectMcpServers,
   createAlkaidAgent,
+  createAlkaidIdleTimeout,
   createFilesystemTools,
   detectAlkaidShellConfig,
   expandAlkaidSkillCommand,
@@ -307,6 +308,52 @@ test("provider stream disconnects retry silently and preserve context", async ()
   assert.equal(isRetryableAlkaidProviderError("HTTP 429 Too Many Requests"), true);
   assert.equal(isRetryableAlkaidProviderError("rate limit exceeded"), true);
   assert.equal(isRetryableAlkaidProviderError("HTTP 401 unauthorized"), false);
+});
+
+test("provider inactivity aborts and retries automatically", async () => {
+  let aborts = 0;
+  let continues = 0;
+  const agent = {
+    state: { messages: [] },
+    async prompt() {
+      this.state.messages.push({ role: "user", content: [], timestamp: Date.now() });
+      return new Promise(() => {});
+    },
+    async continue() {
+      continues += 1;
+      this.state.messages.push({ role: "assistant", content: [{ type: "text", text: "recovered" }], stopReason: "stop" });
+    },
+    abort() {
+      aborts += 1;
+      this.state.messages.push({ role: "assistant", content: [], stopReason: "aborted" });
+    },
+  };
+  const idleTimeout = createAlkaidIdleTimeout({ timeoutMs: 10, onTimeout: () => agent.abort() });
+  const retries = [];
+  const outcome = await runAlkaidPromptWithRetry(agent, "work", [], {
+    retryDelaysMs: [0],
+    sleep: async () => {},
+    runAttempt: (operation) => idleTimeout.run(operation),
+    onRetry: ({ attempt, error }) => retries.push([attempt, error.name]),
+  });
+  assert.equal(outcome.last.content[0].text, "recovered");
+  assert.equal(outcome.retries, 1);
+  assert.equal(aborts, 1);
+  assert.equal(continues, 1);
+  assert.deepEqual(retries, [[1, "AlkaidProviderIdleTimeoutError"]]);
+});
+
+test("provider activity resets the inactivity timeout", async () => {
+  let timedOut = false;
+  const idleTimeout = createAlkaidIdleTimeout({ timeoutMs: 20, onTimeout: () => { timedOut = true; } });
+  const result = await idleTimeout.run(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 12));
+    idleTimeout.touch();
+    await new Promise((resolve) => setTimeout(resolve, 12));
+    return "done";
+  });
+  assert.equal(result, "done");
+  assert.equal(timedOut, false);
 });
 
 test("provider retries stop after the configured hidden attempts", async () => {

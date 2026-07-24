@@ -25,6 +25,7 @@ export const OPENAI_TOOL_OUTPUT_MAX_CHARS = 10_485_760;
 /** Leave room for a truncation notice before the API rejects the request. */
 export const OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS = OPENAI_TOOL_OUTPUT_MAX_CHARS - 512;
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1000, 3000];
+export const ALKAID_PROVIDER_IDLE_TIMEOUT_MS = 180_000;
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const SKILL_COMPRESSION_MIN_COUNT = 4;
 const IMAGE_MEDIA_TYPES = {
@@ -160,7 +161,15 @@ export async function alkaidUserMessage(parts = []) {
   };
 }
 
+export class AlkaidProviderIdleTimeoutError extends Error {
+  constructor(timeoutMs) {
+    super(`Vega provider stream idle timeout after ${timeoutMs}ms`);
+    this.name = "AlkaidProviderIdleTimeoutError";
+  }
+}
+
 export function isRetryableAlkaidProviderError(error) {
+  if (error instanceof AlkaidProviderIdleTimeoutError) return true;
   const message = String(error ?? "").toLowerCase();
   return [
     "terminated",
@@ -174,10 +183,64 @@ export function isRetryableAlkaidProviderError(error) {
     "premature close",
     "other side closed",
     "network connection lost",
+    "idle timeout",
     "429",
     "too many requests",
     "rate limit",
   ].some((fragment) => message.includes(fragment));
+}
+
+export function createAlkaidIdleTimeout(options = {}) {
+  const timeoutMs = options.timeoutMs ?? ALKAID_PROVIDER_IDLE_TIMEOUT_MS;
+  const onTimeout = options.onTimeout ?? (() => {});
+  let timer;
+  let rejectTimeout;
+  let active = false;
+  let paused = false;
+
+  function clearTimer() {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  }
+
+  function arm() {
+    clearTimer();
+    if (!active || paused || timeoutMs <= 0) return;
+    timer = setTimeout(() => {
+      timer = undefined;
+      onTimeout();
+      rejectTimeout?.(new AlkaidProviderIdleTimeoutError(timeoutMs));
+    }, timeoutMs);
+  }
+
+  return {
+    touch() {
+      arm();
+    },
+    pause() {
+      paused = true;
+      clearTimer();
+    },
+    resume() {
+      paused = false;
+      arm();
+    },
+    async run(operation) {
+      active = true;
+      paused = false;
+      const timeout = new Promise((_, reject) => {
+        rejectTimeout = reject;
+        arm();
+      });
+      try {
+        return await Promise.race([operation(), timeout]);
+      } finally {
+        active = false;
+        rejectTimeout = undefined;
+        clearTimer();
+      }
+    },
+  };
 }
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -196,23 +259,36 @@ export async function runAlkaidPromptWithRetry(agent, input, images, options = {
   const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_PROVIDER_RETRY_DELAYS_MS;
   const sleep = options.sleep ?? wait;
   const isCancelled = options.isCancelled ?? (() => false);
+  const runAttempt = options.runAttempt ?? ((operation) => operation());
   let retries = 0;
-  await agent.prompt(input, images);
+  let operation = () => agent.prompt(input, images);
+
   while (true) {
+    let thrownError;
+    try {
+      await runAttempt(operation);
+    } catch (error) {
+      thrownError = error;
+    }
+
     const last = agent.state.messages.at(-1);
-    if (last?.role !== "assistant" || last.stopReason !== "error") {
+    const providerError = thrownError ?? (
+      last?.role === "assistant" && last.stopReason === "error" ? last.errorMessage : undefined
+    );
+    if (!providerError) {
       return { last, retries, cancelled: last?.role === "assistant" && last.stopReason === "aborted" };
     }
-    if (retries >= retryDelaysMs.length || !isRetryableAlkaidProviderError(last.errorMessage)) {
+    if (retries >= retryDelaysMs.length || !isRetryableAlkaidProviderError(providerError)) {
+      if (thrownError) throw thrownError;
       return { last, retries, cancelled: false };
     }
     if (isCancelled()) return { last, retries, cancelled: true };
-    agent.state.messages = agent.state.messages.slice(0, -1);
-    options.onRetry?.({ attempt: retries + 1, error: last.errorMessage });
+    if (last?.role === "assistant") agent.state.messages = agent.state.messages.slice(0, -1);
+    options.onRetry?.({ attempt: retries + 1, error: providerError });
     await sleep(retryDelaysMs[retries]);
     retries += 1;
     if (isCancelled()) return { last: agent.state.messages.at(-1), retries, cancelled: true };
-    await agent.continue();
+    operation = () => agent.continue();
   }
 }
 
