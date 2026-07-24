@@ -2774,6 +2774,11 @@ button {
   z-index: 50;
 }
 
+/* author 样式的 display:flex 会覆盖浏览器默认 [hidden] 规则，需显式隐藏。 */
+.proj-pop[hidden] {
+  display: none;
+}
+
 .proj-search {
   margin: 10px 10px 6px;
   background: var(--bg-input);
