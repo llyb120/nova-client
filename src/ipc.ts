@@ -35,6 +35,8 @@ import type {
   Status,
   Thread,
   ThreadMeta,
+  TimeMachineRestoreResult,
+  TimeMachineTimeline,
   UpdateInfo,
   WorkHours,
   WorktreeRecord,
@@ -48,6 +50,12 @@ function fileUriPath(uri: string) {
 export const api = {
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
   getThread: (threadId: string) => invoke<Thread>("get_thread", { threadId }),
+  createTimeMachineCheckpoint: (threadId: string) =>
+    invoke<TimeMachineTimeline>("create_time_machine_checkpoint", { threadId }),
+  getTimeMachineTimeline: (threadId: string) =>
+    invoke<TimeMachineTimeline | null>("get_time_machine_timeline", { threadId }),
+  restoreTimeMachineCheckpoint: (threadId: string, checkpointId: string) =>
+    invoke<TimeMachineRestoreResult>("restore_time_machine_checkpoint", { threadId, checkpointId }),
   listProjects: () => invoke<ProjectEntry[]>("list_projects"),
   removeProject: (cwd: string) => invoke<void>("remove_project", { cwd }),
   prewarm: (cwd: string, agentKind: AgentKind, model?: string | null, mode?: string | null) =>

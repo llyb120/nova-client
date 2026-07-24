@@ -131,6 +131,28 @@ export interface ThreadMeta {
 }
 
 /** 用户随 prompt 带上的附件。图片可带 base64，普通文件走 file:// resource_link。 */
+export interface TimeMachineCheckpoint {
+  id: string;
+  parentId?: string | null;
+  sourceThreadId: string;
+  title: string;
+  createdAt: number;
+  changedFiles: number;
+  automatic: boolean;
+}
+
+export interface TimeMachineTimeline {
+  id: string;
+  rootThreadId: string;
+  currentCheckpointId?: string | null;
+  checkpoints: TimeMachineCheckpoint[];
+}
+
+export interface TimeMachineRestoreResult {
+  threadId: string;
+  timeline: TimeMachineTimeline;
+}
+
 export interface PromptImage {
   name: string;
   mimeType: string;

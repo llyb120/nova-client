@@ -1,11 +1,11 @@
-import { message } from "@tauri-apps/plugin-dialog";
+import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
-import { compactThread, chatScrollToBottomSignal, openThread, setState, state } from "../store";
-import type { Item, Thread } from "../types";
+import { compactThread, chatScrollToBottomSignal, openThread, refreshThreads, setState, state } from "../store";
+import type { Item, Thread, TimeMachineCheckpoint, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar } from "./icons";
+import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { PlanCard } from "./PlanCard";
@@ -474,6 +474,18 @@ export function ChatView() {
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   const [showShare, setShowShare] = createSignal(false);
+  const [timeline, setTimeline] = createSignal<TimeMachineTimeline | null>(null);
+  const [checkpointing, setCheckpointing] = createSignal(false);
+  const [restoringCheckpoint, setRestoringCheckpoint] = createSignal<string | null>(null);
+
+  createEffect(() => {
+    const threadId = state.currentId;
+    setTimeline(null);
+    if (!threadId) return;
+    void api.getTimeMachineTimeline(threadId).then((value) => {
+      if (state.currentId === threadId) setTimeline(value);
+    }).catch(() => {});
+  });
 
   const currentMeta = createMemo(() =>
     state.threads.find((t) => t.id === state.currentId),
@@ -543,6 +555,58 @@ export function ChatView() {
     setEditing(true);
   };
 
+  const canUseTimeMachine = () => {
+    const meta = currentMeta();
+    return !!meta && !meta.roamingRole && !meta.worktree && !meta.employeeId;
+  };
+  const createRepositoryCheckpoint = async () => {
+    const threadId = state.currentId;
+    if (!threadId || checkpointing() || restoringCheckpoint()) return;
+    setCheckpointing(true);
+    try {
+      setTimeline(await api.createTimeMachineCheckpoint(threadId));
+    } catch (error) {
+      await message(String(error), { title: "创建时间点失败", kind: "error" });
+    } finally {
+      setCheckpointing(false);
+    }
+  };
+  const checkpointLane = (checkpoint: TimeMachineCheckpoint) => {
+    const checkpoints = timeline()?.checkpoints ?? [];
+    const byId = new Map(checkpoints.map((item) => [item.id, item]));
+    const lanes = new Map<string, number>();
+    for (const item of checkpoints) {
+      const parentLane = item.parentId ? (lanes.get(item.parentId) ?? 0) : 0;
+      const siblings = item.parentId
+        ? checkpoints.filter((candidate) => candidate.parentId === item.parentId)
+        : checkpoints.filter((candidate) => !candidate.parentId);
+      const siblingIndex = siblings.findIndex((candidate) => candidate.id === item.id);
+      lanes.set(item.id, Math.min(parentLane + Math.max(0, siblingIndex), 4));
+      if (item.parentId && !byId.has(item.parentId)) lanes.set(item.id, 0);
+    }
+    return lanes.get(checkpoint.id) ?? 0;
+  };
+  const restoreRepositoryCheckpoint = async (checkpoint: TimeMachineCheckpoint) => {
+    const threadId = state.currentId;
+    if (!threadId || restoringCheckpoint() || checkpoint.id === timeline()?.currentCheckpointId) return;
+    const accepted = await confirm(
+      `跳转到 ${new Date(checkpoint.createdAt).toLocaleString()} 的时间点？当前未保存的对话或文件变化会先自动创建时间点。`,
+      { title: "会话时光机", kind: "warning" },
+    );
+    if (!accepted) return;
+    setRestoringCheckpoint(checkpoint.id);
+    try {
+      const result = await api.restoreTimeMachineCheckpoint(threadId, checkpoint.id);
+      setTimeline(result.timeline);
+      await refreshThreads();
+      await openThread(result.threadId);
+    } catch (error) {
+      await message(String(error), { title: "跳转失败", kind: "error" });
+    } finally {
+      setRestoringCheckpoint(null);
+    }
+  };
+
   // 漫游 guest：召回会话——host 自动把完整快照 Flow 回来，收件箱里选项目接收
   const [recalling, setRecalling] = createSignal(false);
   const recall = async () => {
@@ -604,6 +668,18 @@ export function ChatView() {
             onClick={() => void toggleStar()}
           >
             <IconStar size={15} filled={!!currentMeta()?.starred} />
+          </button>
+        </Show>
+        <Show when={canUseTimeMachine()}>
+          <button
+            type="button"
+            class="chat-time-machine-btn"
+            classList={{ active: !!timeline()?.checkpoints.length }}
+            title="保存当前对话副本和仓库文件状态"
+            disabled={isRunning() || checkpointing() || !!restoringCheckpoint()}
+            onClick={() => void createRepositoryCheckpoint()}
+          >
+            <IconStopwatch size={15} />
           </button>
         </Show>
         <span class={`agent-badge ${state.agentKind}`}>
@@ -778,6 +854,36 @@ export function ChatView() {
             现在
           </button>
         </aside>
+      </Show>
+      <Show when={timeline()?.checkpoints.length}>
+        <nav class="repo-time-machine" aria-label="仓库时间线">
+          <div class="repo-time-machine-label">
+            <IconStopwatch size={13} />
+            <span>{restoringCheckpoint() ? "恢复中…" : "仓库时间线"}</span>
+          </div>
+          <div class="repo-time-machine-track">
+            <For each={timeline()?.checkpoints ?? []}>
+              {(checkpoint, index) => (
+                <button
+                  type="button"
+                  class="repo-time-node"
+                  classList={{
+                    active: checkpoint.id === timeline()?.currentCheckpointId,
+                    restoring: checkpoint.id === restoringCheckpoint(),
+                  }}
+                  style={`--branch-depth:${checkpointLane(checkpoint)}`}
+                  title={`${checkpoint.title} · ${checkpoint.changedFiles} 个变动文件 · ${new Date(checkpoint.createdAt).toLocaleString()}`}
+                  disabled={!!restoringCheckpoint()}
+                  onClick={() => void restoreRepositoryCheckpoint(checkpoint)}
+                >
+                  <span class="repo-time-branch">{checkpoint.parentId && index() > 0 ? "↳" : ""}</span>
+                  <span class="repo-time-dot" />
+                  <small>{index() + 1}</small>
+                </button>
+              )}
+            </For>
+          </div>
+        </nav>
       </Show>
       <Show when={stageThreads().length > 1}>
         <aside class="stage-rail" aria-label="会话阶段导航">

@@ -32,6 +32,8 @@ export const IconGear = (p: P) =>
     p,
   );
 export const IconStop = (p: P) => svg(<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />, p);
+export const IconStopwatch = (p: P) =>
+  svg(<><circle cx="12" cy="13" r="8" /><path d="M12 9v4l2.5 1.5M9 2h6M12 2v3M18 6l1.5-1.5" /></>, p);
 export const IconSend = (p: P) => svg(<path d="m5 12 7-9 7 9M12 3v18" />, p);
 export const IconTrash = (p: P) =>
   svg(<><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></>, p);

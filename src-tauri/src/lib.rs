@@ -27,6 +27,7 @@ mod skills;
 mod sleep_inhibitor;
 mod sys_notify;
 mod threads;
+mod time_machine;
 mod updater;
 #[cfg(windows)]
 mod windows_shell_shim;
@@ -121,6 +122,8 @@ pub struct AppState {
     pub cli_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 编辑历史消息后正在后台 restore/fork、等待自动重发的会话。
     pub pending_prompt_restores: Mutex<HashSet<String>>,
+    /// 仓库时光机的创建/恢复互斥；同一进程内禁止两个恢复事务交叉写文件。
+    pub time_machine_lock: Mutex<()>,
     /// 网页远控尚待处理的权限请求（requestKey -> 原始事件）。
     pub remote_permissions: Mutex<HashMap<String, Value>>,
     /// 有会话运行时阻止系统因空闲自动休眠；最后一个会话结束后自动释放。
@@ -2582,6 +2585,65 @@ fn notify_fire_done(
         acp::EV_NOTIFY_OPEN,
     );
     Ok(())
+}
+
+#[tauri::command]
+fn create_time_machine_checkpoint(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<time_machine::TimelineView, String> {
+    let _guard = state.time_machine_lock.lock().unwrap();
+    let thread = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(&thread_id).ok_or("会话不存在")?;
+        if is_running(&state, thread) {
+            return Err("请等待当前会话执行结束后再创建时间点".into());
+        }
+        if thread.is_roaming_guest() || thread.roaming_role.is_some() || thread.worktree.is_some() {
+            return Err("时光机目前只支持当前分支上的本地普通会话".into());
+        }
+        thread.clone()
+    };
+    time_machine::create_checkpoint(&state.config_dir, &thread)
+}
+
+#[tauri::command]
+fn get_time_machine_timeline(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<Option<time_machine::TimelineView>, String> {
+    let _guard = state.time_machine_lock.lock().unwrap();
+    time_machine::get_timeline(&state.config_dir, &thread_id)
+}
+
+#[tauri::command]
+fn restore_time_machine_checkpoint(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    checkpoint_id: String,
+) -> Result<time_machine::RestoreResult, String> {
+    let _guard = state.time_machine_lock.lock().unwrap();
+    let current = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(&thread_id).ok_or("会话不存在")?;
+        if is_running(&state, thread) {
+            return Err("请等待当前会话执行结束后再跳转".into());
+        }
+        if thread.is_roaming_guest() || thread.roaming_role.is_some() || thread.worktree.is_some() {
+            return Err("时光机目前只支持当前分支上的本地普通会话".into());
+        }
+        thread.clone()
+    };
+    let (thread, result) =
+        time_machine::restore_checkpoint(&state.config_dir, &checkpoint_id, &current)?;
+    {
+        let mut store = state.store.lock().unwrap();
+        store.threads.push(thread);
+        store.save();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    Ok(result)
 }
 
 #[tauri::command]
@@ -5149,6 +5211,7 @@ pub fn run() {
                 cli_upgrade_lock: tokio::sync::Mutex::new(()),
                 cli_operations: Mutex::new(HashMap::new()),
                 pending_prompt_restores: Mutex::new(HashSet::new()),
+                time_machine_lock: Mutex::new(()),
                 remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
             });
@@ -5426,6 +5489,9 @@ pub fn run() {
             open_in_explorer,
             open_in_terminal,
             open_url,
+            create_time_machine_checkpoint,
+            get_time_machine_timeline,
+            restore_time_machine_checkpoint,
             rename_thread,
             notify_fire_done,
             set_thread_model,
