@@ -316,7 +316,10 @@ test("provider inactivity aborts and retries automatically", async () => {
   const agent = {
     state: { messages: [] },
     async prompt() {
-      this.state.messages.push({ role: "user", content: [], timestamp: Date.now() });
+      this.state.messages.push(
+        { role: "user", content: [], timestamp: Date.now() },
+        { role: "assistant", content: [{ type: "thinking", thinking: "partial" }], stopReason: "toolUse" },
+      );
       return new Promise(() => {});
     },
     async continue() {
@@ -340,6 +343,7 @@ test("provider inactivity aborts and retries automatically", async () => {
   assert.equal(outcome.retries, 1);
   assert.equal(aborts, 1);
   assert.equal(continues, 1);
+  assert.deepEqual(agent.state.messages.map((message) => message.role), ["user", "assistant"]);
   assert.deepEqual(retries, [[1, "AlkaidProviderIdleTimeoutError"]]);
 });
 

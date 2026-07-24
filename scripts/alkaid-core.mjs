@@ -25,7 +25,7 @@ export const OPENAI_TOOL_OUTPUT_MAX_CHARS = 10_485_760;
 /** Leave room for a truncation notice before the API rejects the request. */
 export const OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS = OPENAI_TOOL_OUTPUT_MAX_CHARS - 512;
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1000, 3000];
-export const ALKAID_PROVIDER_IDLE_TIMEOUT_MS = 180_000;
+export const ALKAID_PROVIDER_IDLE_TIMEOUT_MS = 90_000;
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const SKILL_COMPRESSION_MIN_COUNT = 4;
 const IMAGE_MEDIA_TYPES = {
@@ -283,7 +283,13 @@ export async function runAlkaidPromptWithRetry(agent, input, images, options = {
       return { last, retries, cancelled: false };
     }
     if (isCancelled()) return { last, retries, cancelled: true };
-    if (last?.role === "assistant") agent.state.messages = agent.state.messages.slice(0, -1);
+    if (thrownError instanceof AlkaidProviderIdleTimeoutError) {
+      while (agent.state.messages.at(-1)?.role === "assistant") {
+        agent.state.messages = agent.state.messages.slice(0, -1);
+      }
+    } else if (last?.role === "assistant") {
+      agent.state.messages = agent.state.messages.slice(0, -1);
+    }
     options.onRetry?.({ attempt: retries + 1, error: providerError });
     await sleep(retryDelaysMs[retries]);
     retries += 1;
