@@ -174,6 +174,9 @@ export function isRetryableAlkaidProviderError(error) {
     "premature close",
     "other side closed",
     "network connection lost",
+    "429",
+    "too many requests",
+    "rate limit",
   ].some((fragment) => message.includes(fragment));
 }
 

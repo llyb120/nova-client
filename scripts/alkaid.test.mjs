@@ -304,6 +304,8 @@ test("provider stream disconnects retry silently and preserve context", async ()
   assert.deepEqual(agent.state.messages, [user, completed]);
   assert.deepEqual(retries, ["1:terminated", 1000]);
   assert.equal(isRetryableAlkaidProviderError("TypeError: terminated"), true);
+  assert.equal(isRetryableAlkaidProviderError("HTTP 429 Too Many Requests"), true);
+  assert.equal(isRetryableAlkaidProviderError("rate limit exceeded"), true);
   assert.equal(isRetryableAlkaidProviderError("HTTP 401 unauthorized"), false);
 });
 
