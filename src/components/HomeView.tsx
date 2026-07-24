@@ -88,6 +88,7 @@ export function HomeView() {
   let wtBranchRef: HTMLInputElement | undefined;
   let modeTouched = false;
   let lastPrewarmKey = "";
+  let lastRoamModelSyncKey = "";
   let scratchLoading = false;
   let submittingPrompt = false;
   let textareaRef: HTMLTextAreaElement | undefined;
@@ -329,22 +330,38 @@ export function HomeView() {
     if (resolved !== current) setModel(resolved);
   });
 
-  // 漫游：拉取对端模型；到达后把后端/模型/模式收敛到对方可用项（跳过 value="" 的 Auto）
+  // 漫游：拉取对端模型；到达后采用对端当前模型，并把后端/模式收敛到可用项。
+  // 只在切换对端或对端配置确实变化时同步，避免覆盖用户随后在选择器里的手动选择。
   createEffect(() => {
     const t = roamPeerToken();
-    if (!t) return;
+    if (!t) {
+      lastRoamModelSyncKey = "";
+      return;
+    }
     ensurePeerModels(t);
     const pm = state.peerModels[t];
     if (!pm) return;
     const backend = pm.backends.includes(agentKind()) ? agentKind() : pm.backends[0];
     if (!backend) return;
     if (backend !== agentKind()) setAgentKind(backend);
-    const models = modelChoices(backend, pm.options[backend] ?? null);
-    if (!models.some((m) => m.value === model())) {
-      setModel(models.find((m) => m.value)?.value ?? models[0]?.value ?? "");
+
+    const source = pm.options[backend] ?? null;
+    const models = modelChoices(backend, source);
+    const syncKey = `${t}\n${JSON.stringify(pm)}`;
+    if (syncKey !== lastRoamModelSyncKey) {
+      lastRoamModelSyncKey = syncKey;
+      const remoteModel = source?.configOptions?.find((option) => option.id === "model")
+        ?.currentValue;
+      let nextModel = models.find((item) => item.value)?.value ?? models[0]?.value ?? "";
+      if (remoteModel && models.some((item) => item.value === remoteModel)) {
+        nextModel = remoteModel;
+      }
+      setModel(nextModel);
+    } else if (!models.some((item) => item.value === model())) {
+      setModel(models.find((item) => item.value)?.value ?? models[0]?.value ?? "");
     }
-    const modes = modeChoices(backend, pm.options[backend] ?? null);
-    if (!modes.some((m) => m.id === mode())) setMode(modes[0]?.id ?? "");
+    const modes = modeChoices(backend, source);
+    if (!modes.some((item) => item.id === mode())) setMode(modes[0]?.id ?? "");
   });
 
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
@@ -781,6 +798,8 @@ export function HomeView() {
               onPickRoaming={(peer, folder) => {
                 setQuotaPeer(null);
                 setRoam({ peer, folder });
+                // 用户明确选择队友时强制刷新，不能继续依赖可能已过期的预加载缓存。
+                ensurePeerModels(peer.token, true);
               }}
             />
             <Show
