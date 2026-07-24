@@ -3,6 +3,7 @@ import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile } from "solid-js/store";
 import { api } from "./ipc";
 import type {
+  Achievement,
   AgentKind,
   BranchList,
   CaptureClueResult,
@@ -141,6 +142,14 @@ interface AppStore {
   peerBranches: Record<string, BranchList>;
   /** 收到的待接收分享 */
   inbox: IncomingShare[];
+  /** 我的成就（中转站按身份授予）；未配置团队 token 时为空 */
+  achievements: Achievement[];
+  /** 成就列表是否已完成首次拉取（区分「加载中」与「暂无成就」） */
+  achievementsLoaded: boolean;
+  /** 成就拉取失败原因（空 = 正常） */
+  achievementsError: string;
+  /** 尚未在成就页看过的成就 id（侧栏角标） */
+  unseenAchievementIds: string[];
   /** 请求自动弹出收件箱的时间戳（漫游召回快照到达时置位；0 = 无请求） */
   inboxPromptAt: number;
   /** host 侧：待本机确认的漫游请求队列 */
@@ -227,6 +236,10 @@ export const [state, setState] = createStore<AppStore>({
   peerModels: {},
   peerBranches: {},
   inbox: [],
+  achievements: [],
+  achievementsLoaded: false,
+  achievementsError: "",
+  unseenAchievementIds: [],
   inboxPromptAt: 0,
   incomingRoams: [],
   quotaRoamingProgress: null,
@@ -556,6 +569,99 @@ export async function refreshInbox() {
   } catch {
     // 忽略
   }
+}
+
+// ===== 成就 =====
+
+const ACHIEVEMENT_IMAGE_CACHE_KEY = "nova.achievementImageRefresh";
+const SEEN_ACHIEVEMENTS_KEY = "nova.seenAchievements";
+
+function createAchievementImageCacheKey(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function loadAchievementImageCacheKey(): string {
+  const saved = localStorage.getItem(ACHIEVEMENT_IMAGE_CACHE_KEY);
+  if (saved) return saved;
+
+  const created = createAchievementImageCacheKey();
+  localStorage.setItem(ACHIEVEMENT_IMAGE_CACHE_KEY, created);
+  return created;
+}
+
+/** 给徽章图追加/替换刷新参数，强制重新拉取（服务器可能按身份换图） */
+function reloadAchievementImage(url: string, cacheKey: string): string {
+  const hashIndex = url.indexOf("#");
+  const resource = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
+  const hash = hashIndex >= 0 ? url.slice(hashIndex) : "";
+  const encodedCacheKey = encodeURIComponent(cacheKey);
+  const existingKey = /([?&])_nova_refresh=[^&#]*/;
+  if (existingKey.test(resource)) {
+    return `${resource.replace(existingKey, `$1_nova_refresh=${encodedCacheKey}`)}${hash}`;
+  }
+  const separator = resource.includes("?") ? "&" : "?";
+  return `${resource}${separator}_nova_refresh=${encodedCacheKey}${hash}`;
+}
+
+let achievementImageCacheKey = loadAchievementImageCacheKey();
+
+function loadSeenAchievementIds(): string[] {
+  try {
+    const raw = localStorage.getItem(SEEN_ACHIEVEMENTS_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed)
+      ? parsed.filter((v): v is string => typeof v === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function refreshAchievements(reloadImages = false) {
+  if (!state.settings?.relayToken?.trim()) {
+    setState({
+      achievements: [],
+      achievementsLoaded: true,
+      achievementsError: "",
+      unseenAchievementIds: [],
+    });
+    return;
+  }
+  if (reloadImages) {
+    achievementImageCacheKey = createAchievementImageCacheKey();
+    localStorage.setItem(ACHIEVEMENT_IMAGE_CACHE_KEY, achievementImageCacheKey);
+  }
+  try {
+    const list = await api.listAchievements();
+    const seen = new Set(loadSeenAchievementIds());
+    setState({
+      achievements: list.map((achievement) => ({
+        ...achievement,
+        imageUrl: achievement.imageUrl
+          ? reloadAchievementImage(achievement.imageUrl, achievementImageCacheKey)
+          : achievement.imageUrl,
+      })),
+      achievementsLoaded: true,
+      achievementsError: "",
+      unseenAchievementIds: list.filter((a) => !seen.has(a.id)).map((a) => a.id),
+    });
+  } catch (error) {
+    setState({
+      achievements: [],
+      achievementsLoaded: true,
+      achievementsError: String(error),
+      unseenAchievementIds: [],
+    });
+  }
+}
+
+/** 打开成就页后调用：当前成就全部标记为已看，清掉侧栏角标 */
+export function markAchievementsSeen() {
+  if (state.unseenAchievementIds.length === 0) return;
+  const seen = new Set(loadSeenAchievementIds());
+  for (const achievement of state.achievements) seen.add(achievement.id);
+  localStorage.setItem(SEEN_ACHIEVEMENTS_KEY, JSON.stringify([...seen]));
+  setState("unseenAchievementIds", []);
 }
 
 export async function refreshRoamingFolders() {
@@ -1935,6 +2041,8 @@ export async function initStore() {
   void refreshRelayStatus();
   void refreshPeers().then(() => preloadPeerModels());
   void refreshInbox();
+  // 成就后台预拉：有新成就时侧栏入口直接亮角标，不必等用户打开成就页
+  void refreshAchievements();
   void refreshRoamingFolders();
 
   // 数字员工：列表 + 任务活动 + 协作账本 + 御书房（纯本地读取，很快）

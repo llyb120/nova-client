@@ -114,6 +114,15 @@ export const IconLogo = (p: P) =>
     </>,
     p,
   );
+export const IconTrophy = (p: P) =>
+  svg(
+    <>
+      <path d="M6 9a6 6 0 0 0 12 0V3H6v6Z" />
+      <path d="M6 5H4a2 2 0 0 0-2 2v1a3 3 0 0 0 3 3h1M18 5h2a2 2 0 0 1 2 2v1a3 3 0 0 1-3 3h-1" />
+      <path d="M12 15v3M8 21h8M10 18h4" />
+    </>,
+    p,
+  );
 export const IconCompress = (p: P) =>
   svg(<path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3" />, p);
 

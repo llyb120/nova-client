@@ -1,4 +1,5 @@
 import { createEffect, createSignal, onMount, Show } from "solid-js";
+import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
 import { CliOperationModal } from "./components/CliOperationModal";
 import { DecisionWorkbench } from "./components/DecisionWorkbench";
@@ -33,6 +34,7 @@ function SettingsLoadingModal(props: { onClose: () => void }) {
 
 export default function App() {
   const [showSettings, setShowSettings] = createSignal(false);
+  const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
 
@@ -54,6 +56,7 @@ export default function App() {
     <div class="app">
       <Sidebar
         onOpenSettings={() => setShowSettings(true)}
+        onOpenAchievements={() => setShowAchievements(true)}
         onOpenUpdate={() => setShowUpdate(true)}
         onOpenInbox={() => setShowInbox(true)}
       />
@@ -82,6 +85,9 @@ export default function App() {
         >
           <SettingsModal onClose={() => setShowSettings(false)} />
         </Show>
+      </Show>
+      <Show when={showAchievements()}>
+        <AchievementsModal onClose={() => setShowAchievements(false)} />
       </Show>
       <Show when={showInbox()}>
         <ShareInboxModal onClose={() => setShowInbox(false)} />

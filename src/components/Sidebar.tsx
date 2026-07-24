@@ -11,7 +11,6 @@ import {
   deleteThread,
   openThread,
   pendingDecisionCount,
-  refreshQuota,
   setView,
   state,
 } from "../store";
@@ -30,6 +29,7 @@ import {
   IconPlus,
   IconTerminal,
   IconTrash,
+  IconTrophy,
   IconUsers,
   IconX,
 } from "./icons";
@@ -43,12 +43,6 @@ function basename(p: string) {
 
 function groupName(cwd: string): string {
   return isScratch(cwd) ? "临时会话" : basename(cwd);
-}
-
-function fmtReset(unix: number | null): string {
-  if (!unix) return "";
-  const d = new Date(unix * 1000);
-  return d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
 function fmtTime(ts: number): string {
@@ -67,6 +61,7 @@ function isMindThread(t: ThreadMeta): boolean {
 
 export function Sidebar(props: {
   onOpenSettings: () => void;
+  onOpenAchievements: () => void;
   onOpenUpdate: () => void;
   onOpenInbox: () => void;
 }) {
@@ -700,27 +695,19 @@ export function Sidebar(props: {
       </div>
 
       <div class="sidebar-foot">
-        <Show when={state.quota}>
-          <button
-            class="quota-row"
-            onClick={() => void refreshQuota()}
-            title={`${state.quota!.plan ?? ""} 套餐\n日额度重置：${fmtReset(state.quota!.dailyResetAt)}\n周额度重置：${fmtReset(state.quota!.weeklyResetAt)}${state.quota!.flexCredits != null ? `\n按量积分：${state.quota!.flexCredits}` : ""}\n点击刷新`}
-          >
-            <span class="quota-label">额度</span>
-            <span class="quota-meter">
-              <span class={`quota-pct ${state.quota!.dailyPercent < 20 ? "low" : ""}`}>
-                日 {Math.round(state.quota!.dailyPercent)}%
-              </span>
-              <span class={`quota-pct ${state.quota!.weeklyPercent < 20 ? "low" : ""}`}>
-                周 {Math.round(state.quota!.weeklyPercent)}%
-              </span>
-            </span>
+        <div class="sidebar-foot-actions">
+          <button class="settings-btn" onClick={props.onOpenSettings}>
+            <IconGear size={15} />
+            设置
           </button>
-        </Show>
-        <button class="settings-btn" onClick={props.onOpenSettings}>
-          <IconGear size={15} />
-          设置
-        </button>
+          <button class="settings-btn" onClick={props.onOpenAchievements}>
+            <IconTrophy size={15} />
+            成就
+            <Show when={state.unseenAchievementIds.length > 0}>
+              <span class="sidebar-badge">{state.unseenAchievementIds.length}</span>
+            </Show>
+          </button>
+        </div>
       </div>
 
       <Show when={tmenu()}>

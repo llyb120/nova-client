@@ -10,6 +10,7 @@ import {
   ensureModelOptions,
   modelChoices,
   normalizeUnifiedMode,
+  refreshQuota,
   refreshRelayStatus,
   setState,
   setTheme,
@@ -18,9 +19,7 @@ import {
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker } from "./ConfigSelects";
 import { IconX } from "./icons";
-import { AchievementBadge } from "./AchievementBadge";
 import type {
-  Achievement,
   AgentInstructionTarget,
   AgentKind,
   CliStatus,
@@ -38,32 +37,8 @@ function projectPathKey(path: string): string {
   return path.replace(/\\/g, "/").toLowerCase();
 }
 
-const ACHIEVEMENT_IMAGE_CACHE_KEY = "nova.achievementImageRefresh";
-
-function createAchievementImageCacheKey(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function loadAchievementImageCacheKey(): string {
-  const saved = localStorage.getItem(ACHIEVEMENT_IMAGE_CACHE_KEY);
-  if (saved) return saved;
-
-  const created = createAchievementImageCacheKey();
-  localStorage.setItem(ACHIEVEMENT_IMAGE_CACHE_KEY, created);
-  return created;
-}
-
-function reloadAchievementImage(url: string, cacheKey: string): string {
-  const hashIndex = url.indexOf("#");
-  const resource = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
-  const hash = hashIndex >= 0 ? url.slice(hashIndex) : "";
-  const encodedCacheKey = encodeURIComponent(cacheKey);
-  const existingKey = /([?&])_nova_refresh=[^&#]*/;
-  if (existingKey.test(resource)) {
-    return `${resource.replace(existingKey, `$1_nova_refresh=${encodedCacheKey}`)}${hash}`;
-  }
-  const separator = resource.includes("?") ? "&" : "?";
-  return `${resource}${separator}_nova_refresh=${encodedCacheKey}${hash}`;
+function quotaPercent(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)));
 }
 
 const DEFAULT_RELAY_SERVER = "";
@@ -144,7 +119,6 @@ type SettingsTab =
   | "instructions"
   | "appearance"
   | "team"
-  | "achievements"
   | "memory"
   | "worktree"
   | "skills"
@@ -160,7 +134,6 @@ const TABS: { id: SettingsTab; name: string }[] = [
   { id: "memory", name: "记忆检索" },
   { id: "worktree", name: "Worktree" },
   { id: "skills", name: "Skills" },
-  { id: "achievements", name: "成就" },
   { id: "about", name: "关于" },
 ];
 
@@ -238,10 +211,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [globalInstructionsMsg, setGlobalInstructionsMsg] = createSignal("");
   const [verifying, setVerifying] = createSignal(false);
   const [verifyMsg, setVerifyMsg] = createSignal("");
-  const [achievements, setAchievements] = createSignal<Achievement[]>([]);
-  const [achievementsLoading, setAchievementsLoading] = createSignal(false);
-  const [achievementsError, setAchievementsError] = createSignal("");
-  let achievementImageCacheKey = loadAchievementImageCacheKey();
   const [showLogs, setShowLogs] = createSignal(false);
   const [saving, setSaving] = createSignal(false);
   const [restarting, setRestarting] = createSignal(false);
@@ -250,6 +219,16 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [cliLoading, setCliLoading] = createSignal(false);
   const [upgradingCli, setUpgradingCli] = createSignal<AgentKind | null>(null);
   const [cliMessages, setCliMessages] = createSignal<Partial<Record<AgentKind, string>>>({});
+  const [quotaRefreshing, setQuotaRefreshing] = createSignal(false);
+
+  const reloadQuota = async () => {
+    setQuotaRefreshing(true);
+    try {
+      await refreshQuota();
+    } finally {
+      setQuotaRefreshing(false);
+    }
+  };
 
   const restartAgents = async () => {
     setRestarting(true);
@@ -499,51 +478,18 @@ export function SettingsModal(props: { onClose: () => void }) {
     }
   };
 
-  let cliStatusesLoaded = false;
+  let backendsLoaded = false;
   createEffect(() => {
-    if (tab() === "backends" && !cliStatusesLoaded) {
-      cliStatusesLoaded = true;
-      void refreshCliStatuses();
-    }
+    if (tab() !== "backends" || backendsLoaded) return;
+    backendsLoaded = true;
+    void refreshCliStatuses();
+    void reloadQuota();
   });
 
   createEffect(() => {
     if (tab() !== "team") return;
     void loadRoamingFolders();
     for (const kind of quotaShareKinds()) void ensureModelOptions(kind);
-  });
-
-  const refreshAchievements = async (reloadImages = false) => {
-    setAchievementsLoading(true);
-    setAchievementsError("");
-    try {
-      if (!state.settings?.relayToken?.trim() && !relayToken().trim()) {
-        setAchievements([]);
-        setAchievementsError("请先在「团队」中配置中转站 token，成就由服务器按身份授予。");
-        return;
-      }
-      if (reloadImages) {
-        setAchievements([]);
-        achievementImageCacheKey = createAchievementImageCacheKey();
-        localStorage.setItem(ACHIEVEMENT_IMAGE_CACHE_KEY, achievementImageCacheKey);
-      }
-      const list = await api.listAchievements();
-      setAchievements(list.map((achievement) => ({
-        ...achievement,
-        imageUrl: achievement.imageUrl
-          ? reloadAchievementImage(achievement.imageUrl, achievementImageCacheKey)
-          : achievement.imageUrl,
-      })));
-    } catch (error) {
-      setAchievements([]);
-      setAchievementsError(`加载失败：${String(error)}`);
-    } finally {
-      setAchievementsLoading(false);
-    }
-  };
-
-  createEffect(() => {
-    if (tab() === "achievements") void refreshAchievements();
   });
 
   createEffect(() => {
@@ -1116,6 +1062,31 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </div>
               </div>
               <ProxyField value={devinProxy()} onInput={setDevinProxy} />
+              <div class="backend-quota-row">
+                <span class="field-label">额度</span>
+                <Show
+                  when={state.quota}
+                  fallback={<span class="field-hint">{quotaRefreshing() ? "读取中…" : "暂不可用"}</span>}
+                >
+                  <span classList={{ "backend-quota-value": true, low: state.quota!.dailyPercent < 20 }}>
+                    日 {quotaPercent(state.quota!.dailyPercent)}%
+                  </span>
+                  <span classList={{ "backend-quota-value": true, low: state.quota!.weeklyPercent < 20 }}>
+                    周 {quotaPercent(state.quota!.weeklyPercent)}%
+                  </span>
+                  <Show when={state.quota!.flexCredits != null}>
+                    <span class="backend-quota-value">积分 {state.quota!.flexCredits}</span>
+                  </Show>
+                </Show>
+                <button
+                  type="button"
+                  class="link-btn backend-quota-refresh"
+                  disabled={quotaRefreshing()}
+                  onClick={() => void reloadQuota()}
+                >
+                  {quotaRefreshing() ? "刷新中…" : "刷新"}
+                </button>
+              </div>
             </div>
 
             <div class="backend-card">
@@ -1623,52 +1594,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </For>
               </div>
             </div>
-          </Show>
-
-          {/* ===== 成就 ===== */}
-          <Show when={tab() === "achievements"}>
-            <section class="settings-group achv-section">
-              <h3 class="settings-group-title">我的成就</h3>
-              <p class="settings-group-desc">
-                成就由中转站按你的身份授予。连接团队后可在此查看已解锁的徽章。
-              </p>
-              <div class="achv-toolbar">
-                <span class="field-hint">
-                  {achievementsLoading()
-                    ? "加载中…"
-                    : achievements().length > 0
-                      ? `已解锁 ${achievements().length} 项`
-                      : "暂无成就"}
-                </span>
-                <button
-                  type="button"
-                  class="link-btn"
-                  disabled={achievementsLoading()}
-                  onClick={() => void refreshAchievements(true)}
-                >
-                  刷新
-                </button>
-              </div>
-              <Show when={achievementsError()}>
-                <div class="field-hint achv-error">{achievementsError()}</div>
-              </Show>
-              <Show
-                when={achievements().length > 0}
-                fallback={
-                  <div class="sel-empty">
-                    {achievementsLoading()
-                      ? "正在从服务器读取成就…"
-                      : achievementsError()
-                        ? "未能加载成就"
-                        : "暂未获得成就"}
-                  </div>
-                }
-              >
-                <div class="achv-grid">
-                  <For each={achievements()}>{(a) => <AchievementBadge achievement={a} />}</For>
-                </div>
-              </Show>
-            </section>
           </Show>
 
           {/* ===== 记忆检索 ===== */}
