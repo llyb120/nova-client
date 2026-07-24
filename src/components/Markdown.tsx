@@ -4,6 +4,7 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createSignal, onCleanup, untrack } from "solid-js";
 import { api } from "../ipc";
 import { state } from "../store";
+import { createFileContextMenu } from "./FileContextMenu";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -204,6 +205,7 @@ function cachedRenderMarkdown(src: string, markFiles: boolean): string {
 }
 
 export function Markdown(props: { text: string; markFiles?: boolean; live?: boolean }) {
+  const fileMenu = createFileContextMenu();
   // 平滑出字层：shown 是 props.text 的一个前缀，按节拍逐步追上目标。
   // 初始即为完整文本——历史消息、非流式内容立即全量显示，不做动画。
   const [shown, setShown] = createSignal(props.text);
@@ -283,6 +285,12 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
     );
   });
 
+  const onContextMenu = (e: MouseEvent) => {
+    const file = (e.target as HTMLElement).closest<HTMLButtonElement>(".md-file-ref");
+    const path = file?.dataset.path;
+    if (path) fileMenu.open(e, path);
+  };
+
   const onClick = (e: MouseEvent) => {
     const target = e.target as HTMLElement;
     const btn = target.closest<HTMLButtonElement>(".code-copy");
@@ -320,9 +328,12 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   // md-seg 为 display:contents（不产生盒子），布局与单容器完全一致。
   // 稳定段直接经 insertAdjacentHTML 追加 DOM（已渲染的节点从不重建），尾部走响应式重渲。
   return (
-    <div class="markdown" onClick={onClick}>
-      <div class="md-seg" ref={stableRef} />
-      <div class="md-seg" innerHTML={tailHtml()} />
-    </div>
+    <>
+      <div class="markdown" onClick={onClick} onContextMenu={onContextMenu}>
+        <div class="md-seg" ref={stableRef} />
+        <div class="md-seg" innerHTML={tailHtml()} />
+      </div>
+      <fileMenu.Menu />
+    </>
   );
 }

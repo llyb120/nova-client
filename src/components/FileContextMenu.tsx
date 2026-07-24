@@ -53,7 +53,7 @@ export function createFileContextMenu() {
           }}
         >
           <IconFolder size={13} />
-          在资源管理器中打开
+          打开所在目录
         </button>
       </div>
     </Show>

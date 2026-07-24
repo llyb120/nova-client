@@ -2,14 +2,20 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { createSignal, For, Match, Show, Switch } from "solid-js";
 import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
 import type { Item, PromptImage } from "../types";
+import { createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconPencil } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { Markdown } from "./Markdown";
 import { ToolCallCard } from "./ToolCallCard";
 
+function attachmentPath(img: PromptImage): string | undefined {
+  if (img.data || !img.uri) return undefined;
+  return decodeURI(img.uri.replace(/^file:\/+/, ""));
+}
+
 function attachmentSrc(img: PromptImage): string {
   if (img.data) return `data:${img.mimeType};base64,${img.data}`;
-  return convertFileSrc(decodeURI((img.uri ?? "").replace(/^file:\/+/, "")));
+  return convertFileSrc(attachmentPath(img) ?? "");
 }
 
 function normalizeThoughtMarkdown(text: string): string {
@@ -35,7 +41,13 @@ function UserMessage(props: { item: Extract<Item, { type: "user" }> }) {
   const [draft, setDraft] = createSignal("");
   // 编辑时附件可见可管理：保留原图、可粘贴新增、可移除
   const attach = createImageAttachments();
+  const fileMenu = createFileContextMenu();
   const running = () => !!(state.currentId && state.running[state.currentId]);
+
+  const openAttachmentMenu = (event: MouseEvent, image: PromptImage) => {
+    const path = attachmentPath(image);
+    if (path) fileMenu.open(event, path);
+  };
 
   const startEdit = () => {
     setDraft(props.item.text);
@@ -103,13 +115,22 @@ function UserMessage(props: { item: Extract<Item, { type: "user" }> }) {
                   <Show
                     when={img.mimeType.startsWith("image/")}
                     fallback={
-                      <span class="bubble-file" title={img.name}>
+                      <span
+                        class="bubble-file"
+                        title={img.name}
+                        onContextMenu={(event) => openAttachmentMenu(event, img)}
+                      >
                         <IconFile size={15} />
                         {img.name}
                       </span>
                     }
                   >
-                    <img src={attachmentSrc(img)} alt={img.name} title={img.name} />
+                    <img
+                      src={attachmentSrc(img)}
+                      alt={img.name}
+                      title={img.name}
+                      onContextMenu={(event) => openAttachmentMenu(event, img)}
+                    />
                   </Show>
                 )}
               </For>
@@ -117,6 +138,7 @@ function UserMessage(props: { item: Extract<Item, { type: "user" }> }) {
           </Show>
           {props.item.text}
         </div>
+        <fileMenu.Menu />
       </Show>
     </div>
   );
