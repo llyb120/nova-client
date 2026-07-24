@@ -63,29 +63,36 @@ function emitContent(message) {
   for (const item of assistantItems(message)) send({ type: "item", item });
 }
 
-function emitStreamEvent(message, stream) {
+function streamEventItem(message, stream) {
   const event = message.event;
   if (event.type === "message_start") {
     stream.messageId = event.message.id;
     stream.blocks.clear();
-    return;
+    return null;
   }
   if (event.type === "content_block_start") {
     const block = event.content_block;
-    if (block.type === "text" || block.type === "thinking") {
-      const text = block.type === "text" ? block.text : block.thinking;
-      stream.blocks.set(event.index, { type: block.type, text });
-      if (text) send({ type: "item", item: { id: `${stream.messageId}-${event.index}`, type: block.type === "text" ? "agent_message" : "reasoning", text } });
-    }
-    return;
+    if (block.type !== "text" && block.type !== "thinking") return null;
+    const text = block.type === "text" ? block.text : block.thinking;
+    stream.blocks.set(event.index, { type: block.type, text });
+    if (!text) return null;
+    return {
+      id: `${stream.messageId}-${event.index}`,
+      type: block.type === "text" ? "agent_message" : "reasoning",
+      text,
+    };
   }
-  if (event.type !== "content_block_delta") return;
+  if (event.type !== "content_block_delta") return null;
   const delta = event.delta;
-  if (delta.type !== "text_delta" && delta.type !== "thinking_delta") return;
+  if (delta.type !== "text_delta" && delta.type !== "thinking_delta") return null;
   const block = stream.blocks.get(event.index) ?? { type: delta.type === "text_delta" ? "text" : "thinking", text: "" };
   block.text += delta.type === "text_delta" ? delta.text : delta.thinking;
   stream.blocks.set(event.index, block);
-  send({ type: "item", item: { id: `${stream.messageId}-${event.index}`, type: block.type === "text" ? "agent_message" : "reasoning", text: block.text } });
+  return {
+    id: `${stream.messageId}-${event.index}`,
+    type: block.type === "text" ? "agent_message" : "reasoning",
+    text: block.text,
+  };
 }
 
 async function runPrompt(lines, request) {
@@ -135,7 +142,10 @@ async function runPrompt(lines, request) {
       sessionId = message.session_id;
       send({ type: "ready", sessionId });
     }
-    else if (message.type === "stream_event") emitStreamEvent(message, stream);
+    else if (message.type === "stream_event") {
+      const item = streamEventItem(message, stream);
+      if (item) send({ type: "item", item });
+    }
     else if (message.type === "assistant") {
       checkpoint = message.uuid;
       emitContent(message);
@@ -197,4 +207,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { assistantItems, permissionModeFor, promptMessages, resolveCodeBuddyCliPath };
+export { assistantItems, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem };
