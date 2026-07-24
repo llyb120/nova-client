@@ -1940,7 +1940,8 @@ button {
   right: 12px;
   bottom: calc(100% + 8px);
   z-index: 8;
-  max-height: min(360px, calc(100vh - 180px));
+  /* Fallback before JS clamps to space above the composer */
+  max-height: min(360px, 45vh);
   overflow-y: auto;
   overscroll-behavior: contain;
   border: 1px solid var(--border-light);
@@ -2002,7 +2003,7 @@ button {
   white-space: nowrap;
 }
 .prompt-history-menu {
-  max-height: min(300px, calc(100vh - 180px));
+  max-height: min(300px, 40vh);
 }
 .prompt-history-item {
   display: flex;
@@ -2099,7 +2100,7 @@ button {
   .slash-menu {
     left: 8px;
     right: 8px;
-    max-height: min(280px, calc(100vh - 140px));
+    max-height: min(280px, 40vh);
   }
   .slash-item {
     grid-template-columns: minmax(0, 1fr) auto;

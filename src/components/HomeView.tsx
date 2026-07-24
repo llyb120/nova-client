@@ -36,6 +36,7 @@ import { IconClue, IconFolder, IconLogo, IconSend, IconUsers, IconX } from "./ic
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
+import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 import { TypewriterText } from "./TypewriterText";
 
@@ -175,6 +176,23 @@ export function HomeView() {
     slashMenuRef
       ?.querySelector(".slash-item.active")
       ?.scrollIntoView({ block: "nearest" });
+  });
+
+  // Slash menu opens upward; clamp height to space above the composer.
+  createEffect(() => {
+    if (slashQuery() === null) return;
+    void slashSuggestions().length;
+    const sync = () => fitSlashMenuHeight(slashMenuRef);
+    const frame = requestAnimationFrame(sync);
+    const host = textareaRef?.closest(".composer, .home-composer");
+    const ro = host instanceof HTMLElement ? new ResizeObserver(sync) : undefined;
+    if (host instanceof HTMLElement) ro?.observe(host);
+    window.addEventListener("resize", sync);
+    onCleanup(() => {
+      cancelAnimationFrame(frame);
+      ro?.disconnect();
+      window.removeEventListener("resize", sync);
+    });
   });
 
   const prewarmCurrent = (target: PrewarmTarget = {}) => {

@@ -18,6 +18,7 @@ import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconFile, IconSend, IconStop, IconUsers } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
+import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 
 type PromptHistoryItem = {
@@ -242,6 +243,29 @@ export function Composer() {
     historyMenuRef
       ?.querySelector(".prompt-history-item.active")
       ?.scrollIntoView({ block: "nearest" });
+  });
+
+  // Slash / history menus open upward; clamp height to space above the composer.
+  createEffect(() => {
+    const slashOpen = slashQuery() !== null;
+    const historyIsOpen = historyOpen();
+    if (!slashOpen && !historyIsOpen) return;
+    void slashSuggestions().length;
+    void promptHistory().length;
+    const sync = () => {
+      if (slashOpen) fitSlashMenuHeight(slashMenuRef);
+      if (historyIsOpen) fitSlashMenuHeight(historyMenuRef, { maxHeight: 300 });
+    };
+    const frame = requestAnimationFrame(sync);
+    const host = textareaRef?.closest(".composer, .home-composer");
+    const ro = host instanceof HTMLElement ? new ResizeObserver(sync) : undefined;
+    if (host instanceof HTMLElement) ro?.observe(host);
+    window.addEventListener("resize", sync);
+    onCleanup(() => {
+      cancelAnimationFrame(frame);
+      ro?.disconnect();
+      window.removeEventListener("resize", sync);
+    });
   });
 
   createEffect(
