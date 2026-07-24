@@ -17,8 +17,11 @@ const CMD_REAL: &str = "NOVA_SHELL_SHIM_CMD_REAL";
 const POWERSHELL_REAL: &str = "NOVA_SHELL_SHIM_POWERSHELL_REAL";
 const PWSH_REAL: &str = "NOVA_SHELL_SHIM_PWSH_REAL";
 const BASH_REAL: &str = "NOVA_SHELL_SHIM_BASH_REAL";
+const SHELL_SHIM_ENABLED: &str = "NOVA_WINDOWS_SHELL_SHIM";
 const BASH_SHIM: &str = "NOVA_SHELL_SHIM_BASH";
+const CMD_SHIM: &str = "NOVA_SHELL_SHIM_CMD";
 const POWERSHELL_SHIM: &str = "NOVA_SHELL_SHIM_POWERSHELL";
+const PWSH_SHIM: &str = "NOVA_SHELL_SHIM_PWSH";
 
 #[derive(Clone)]
 struct ShellShim {
@@ -172,13 +175,15 @@ pub(crate) fn apply(
     launch_env: &HashMap<String, String>,
 ) -> Result<(), String> {
     let shim = SHELL_SHIM.get_or_init(|| init(app, launch_env)).clone()?;
+    command.env(SHELL_SHIM_ENABLED, "1");
     command.env(CMD_REAL, &shim.cmd);
     command.env(POWERSHELL_REAL, &shim.powershell);
-    // Alkaid 的命令工具直接用绝对路径启动 PowerShell，单纯覆盖 PATH 无法拦截。
-    // powershell.exe 别名在 init 中无条件创建，因此这里始终可用。
+    // 部分后端会用绝对路径启动 shell，单纯覆盖 PATH / ComSpec 无法拦截。
+    command.env(CMD_SHIM, shim.dir.join("cmd.exe"));
     command.env(POWERSHELL_SHIM, shim.dir.join("powershell.exe"));
     if let Some(pwsh) = shim.pwsh.as_ref() {
         command.env(PWSH_REAL, pwsh);
+        command.env(PWSH_SHIM, shim.dir.join("pwsh.exe"));
     }
     if let Some(bash) = shim.bash.as_ref() {
         command.env(BASH_REAL, bash);

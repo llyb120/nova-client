@@ -1,11 +1,41 @@
 import { createInterface } from "node:readline";
 import { Agent, Cursor } from "@cursor/sdk";
-import { execFile } from "node:child_process";
+import childProcess, { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
-import { extname, join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { promisify } from "node:util";
+
+const WINDOWS_SHELL_SHIMS = {
+  "bash.exe": "NOVA_SHELL_SHIM_BASH",
+  "cmd.exe": "NOVA_SHELL_SHIM_CMD",
+  "powershell.exe": "NOVA_SHELL_SHIM_POWERSHELL",
+  "pwsh.exe": "NOVA_SHELL_SHIM_PWSH",
+};
+
+function cursorShellProgram(program, env = process.env) {
+  if (process.platform !== "win32" || typeof program !== "string") return program;
+  const shim = env[WINDOWS_SHELL_SHIMS[basename(program).toLowerCase()]];
+  return shim || program;
+}
+
+function installWindowsShellSpawnGuard() {
+  if (process.platform !== "win32" || process.env.NOVA_WINDOWS_SHELL_SHIM !== "1") return;
+  const spawn = childProcess.spawn;
+  childProcess.spawn = (program, args, options) => {
+    const hiddenOptions = { ...(Array.isArray(args) ? options : args), windowsHide: true };
+    return Array.isArray(args)
+      ? spawn(cursorShellProgram(program), args, hiddenOptions)
+      : spawn(cursorShellProgram(program), hiddenOptions);
+  };
+  // Cursor SDK was evaluated by the static import above. Synchronizing the built-in named
+  // exports updates its cached `spawn` binding without modifying the third-party package.
+  syncBuiltinESMExports();
+}
+
+installWindowsShellSpawnGuard();
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const execFileAsync = promisify(execFile);
@@ -975,6 +1005,7 @@ export {
   createMessageState,
   createSlimMemory,
   cursorModelOptions,
+  cursorShellProgram,
   cursorTodoPlan,
   contextTokensFromUsage,
   extractTurnConclusion,
