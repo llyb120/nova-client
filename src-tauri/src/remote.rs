@@ -55,6 +55,9 @@ struct RemoteThreadMeta {
     model: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_thread_id: Option<String>,
+    created_at: i64,
     updated_at: i64,
     running: bool,
 }
@@ -81,6 +84,9 @@ struct RemoteThreadDelta {
     agent_kind: String,
     model: String,
     mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_thread_id: Option<String>,
+    created_at: i64,
     updated_at: i64,
     running: bool,
     plan: Value,
@@ -710,6 +716,8 @@ fn thread_metas(app: &AppHandle) -> Vec<RemoteThreadMeta> {
             agent_kind: t.agent_kind.as_str().to_string(),
             model: t.model.clone().unwrap_or_default(),
             mode: t.mode.clone().unwrap_or_default(),
+            parent_thread_id: t.parent_thread_id.clone(),
+            created_at: t.created_at,
             updated_at: t.updated_at,
             running: is_running(&state, t),
         })
@@ -863,7 +871,18 @@ fn remote_permissions(app: &AppHandle) -> Vec<Value> {
 fn catalog_signature_for(metas: &[RemoteThreadMeta]) -> String {
     let rows: Vec<_> = metas
         .iter()
-        .map(|m| (&m.id, &m.title, &m.cwd, &m.agent_kind, &m.model, &m.mode))
+        .map(|m| {
+            (
+                &m.id,
+                &m.title,
+                &m.cwd,
+                &m.agent_kind,
+                &m.model,
+                &m.mode,
+                &m.parent_thread_id,
+                m.created_at,
+            )
+        })
         .collect();
     serde_json::to_string(&rows).unwrap_or_default()
 }
@@ -1013,6 +1032,8 @@ fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<Re
         agent_kind: current.agent_kind.as_str().to_string(),
         model: current.model.clone().unwrap_or_default(),
         mode: current.mode.clone().unwrap_or_default(),
+        parent_thread_id: current.parent_thread_id.clone(),
+        created_at: current.created_at,
         updated_at: current.updated_at,
         running: is_running(&state, current),
         plan: current.plan.clone().unwrap_or(Value::Null),
