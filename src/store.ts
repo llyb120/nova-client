@@ -1397,6 +1397,9 @@ export async function sendPrompt(
     await api.delegateEmployeeWork(id, employeeId, text, images);
     return;
   }
+  // Fire 阶段在暂停后，或已经产出过判断后，仍允许用户从该会话补充提示继续流程。
+  // 本轮正常结束时会重新进入自动验收，而不是退化成不受跟踪的普通会话。
+  const resumedFireStep = resumeFireRelay(id);
   // 继续发提示词时：若用户滚在中部，立刻跳到底（无过渡动画）
   bumpChatScrollToBottom();
   setState("proposedPlan", null);
@@ -1404,6 +1407,10 @@ export async function sendPrompt(
   try {
     await api.sendPrompt(id, text, images);
   } catch (e) {
+    if (resumedFireStep && fireRelaySteps.get(id) === resumedFireStep) {
+      fireRelaySteps.delete(id);
+      suspendedFireRelaySteps.set(id, resumedFireStep);
+    }
     setState("running", id, false);
     throw e;
   }
@@ -1418,6 +1425,12 @@ type FireRelayStep = {
 };
 
 const fireRelaySteps = new Map<string, FireRelayStep>();
+// 中断不丢弃 Fire 上下文。用户在阶段再次发言时可重新挂回自动验收流程，
+// 同时避免网络错误把一次尚未完成的响应误当成最终结论送去判断。
+const suspendedFireRelaySteps = new Map<string, FireRelayStep>();
+// 正常结束的阶段也保留流程身份。否则它一旦创建判断会话便会从 fireRelaySteps
+// 删除，用户回到该阶段补充内容时只能进行普通对话，后续结果不会再触发验收。
+const fireRelayStepHistory = new Map<string, FireRelayStep>();
 const FIRE_MAX_ATTEMPTS = 20;
 
 type ParsedFireInput = {
@@ -1450,6 +1463,53 @@ function fireConclusion(thread: Thread): string {
       item.type === "assistant" && !!item.text.trim())?.text.trim() ?? "（会话没有给出结论）";
 }
 
+function fireWorkPrompt(goal: string, previousVerdict?: string): string {
+  const resultNote = `最终回复保持简短、只写可核实的信息：完成结果、实际改动的文件或产物、验证结果；只有确实存在时才写未完成项或阻塞。不要复述任务、输出泛泛总结或编造后续建议。`;
+
+  if (!previousVerdict) {
+    return `直接在当前项目中完成下面的目标，不要只给建议或方案。开始前先检查项目现状、已有实现和未提交改动，在已有基础上推进并避免覆盖现有成果。\n\n目标：\n${goal}\n\n${resultNote}`;
+  }
+
+  return `这是一个独立的后续执行阶段，你看不到之前阶段的完整对话。先检查当前项目状态、版本控制差异和相关文件，确认已有成果；不要从零重做，只处理上次验收明确指出的未满足项。验收内容是线索而不是项目事实，修改前请自行核实。\n\n目标：\n${goal}\n\n上次验收结果：\n${previousVerdict}\n\n${resultNote}`;
+}
+
+function fireJudgePrompt(step: FireRelayStep, conclusion: string): string {
+  const criteria = step.acceptanceCriteria
+    ? `以下验收规则具有最高优先级且每一条都必须满足：\n${step.acceptanceCriteria}\n\n逐条核验这些规则；任何一条不满足或无法从项目状态中确认，都必须判定为不符合。目标描述和执行阶段说明不能替代、弱化或改写验收规则。`
+    : `根据目标逐项核验实际完成情况；任何关键要求不满足或无法确认，都必须判定为不符合。`;
+  return `你是独立验收者，不要继续实现或修改任务。\n\n目标：\n${step.goal}\n\n${criteria}\n\n执行阶段的最终说明（仅作为定位线索，不是完成证据）：\n${conclusion}\n\n请检查当前项目的实际状态、版本控制差异、相关文件和可用的验证结果，不要依据执行阶段回复的篇幅、格式或自述做判断。必须主动选择成本最低且足以覆盖改动的验证方式，并检查目标产物在实际使用场景中的错误信号，例如编译或类型错误、测试失败、启动或运行异常、控制台报错、无效 API 调用以及关键交互不可用。只要存在与本次目标相关的未解释错误、验证失败，或因错误导致关键行为无法验证，就必须判定为不符合；不得因为部分功能存在、界面看似完成或执行阶段声称完成而放宽。若受环境限制无法执行必要验证，也应判定为无法确认而不符合，并说明限制。\n\n回复应简洁：先给出逐条验收结果；若不符合，只列出未满足项、依据和下一阶段需要采取的具体动作；若符合，只列出实际执行过的验证及关键证据。不要复述无关的阶段总结。最后必须单独输出一行 FIRE_ACCEPTED 或 FIRE_REJECTED，且该标记必须是回复的最后一行。`;
+}
+
+function fireStepTitle(step: FireRelayStep, status = ""): string {
+  let base: string;
+  if (step.role === "judge") {
+    base = `[Fire] 判断 ${step.attempt}`;
+  } else if (step.attempt === 1) {
+    base = `[Fire] 目标 · ${step.goal.slice(0, 28)}`;
+  } else {
+    base = `[Fire] 阶段 ${step.attempt}`;
+  }
+  return status ? `${base} · ${status}` : base;
+}
+
+function resumeFireRelay(threadId: string): FireRelayStep | null {
+  if (fireRelaySteps.has(threadId)) return null;
+  const step = suspendedFireRelaySteps.get(threadId) ?? fireRelayStepHistory.get(threadId);
+  if (!step) return null;
+
+  // 同一任务已有阶段正在运行时，不从历史会话并行启动第二条自动流程。
+  const rootIsActive = [...fireRelaySteps.values()].some(
+    (active) => active.rootId === step.rootId,
+  );
+  if (rootIsActive) return null;
+
+  suspendedFireRelaySteps.delete(threadId);
+  fireRelaySteps.set(threadId, step);
+  // 标题恢复不应阻塞用户刚提交的继续提示。
+  void api.renameThread(threadId, fireStepTitle(step)).then(refreshThreads).catch(() => {});
+  return step;
+}
+
 async function createFireThread(
   step: FireRelayStep,
   title: string,
@@ -1471,6 +1531,7 @@ async function createFireThread(
   );
   await api.renameThread(thread.id, title);
   fireRelaySteps.set(thread.id, step);
+  fireRelayStepHistory.set(thread.id, step);
   await refreshThreads();
   await openThread(thread.id);
   setState("running", thread.id, true);
@@ -1488,7 +1549,7 @@ async function advanceFireRelay(threadId: string) {
     await createFireThread(
       { ...step, role: "judge" },
       `[Fire] 判断 ${step.attempt}`,
-      `你是独立验收者。判断下面会话的结论是否真正完成目标，不要继续执行任务。\n\n目标：\n${step.goal}${step.acceptanceCriteria ? `\n\n验收规则：\n${step.acceptanceCriteria}` : ""}\n\n待验收结论：\n${conclusion}\n\n必须在回复最后单独输出一行 FIRE_ACCEPTED 或 FIRE_REJECTED；此前说明判断理由，标准从严。`,
+      fireJudgePrompt(step, conclusion),
     );
     return;
   }
@@ -1515,17 +1576,19 @@ async function advanceFireRelay(threadId: string) {
       attempt: step.attempt + 1,
     },
     `[Fire] 阶段 ${step.attempt + 1}`,
-    `继续完成以下目标。上一次验收未通过；请根据验收结论修正问题并给出可验收的最终结论。\n\n目标：\n${step.goal}\n\n验收结论：\n${verdict}`,
+    fireWorkPrompt(step.goal, verdict),
   );
 }
 
-async function stopFireRelay(threadId: string) {
+async function suspendFireRelay(threadId: string, manual: boolean) {
   const step = fireRelaySteps.get(threadId);
   if (!step) return;
   fireRelaySteps.delete(threadId);
-  await api.renameThread(threadId, `[Fire] ${step.role === "judge" ? "判断" : "阶段"} ${step.attempt} · 已中断`);
+  suspendedFireRelaySteps.set(threadId, step);
+  await api.renameThread(threadId, fireStepTitle(step, manual ? "已中断" : "异常中断"));
   await refreshThreads();
-  await api.notifyFireDone(threadId, false);
+  // 手动停止仍代表本次 Fire 已结束；异常（例如网络错误）只暂停，不误报完成。
+  if (manual) await api.notifyFireDone(threadId, false);
 }
 
 export async function startFireRelay(goal: string, acceptanceCriteria: string | null = null) {
@@ -1543,15 +1606,18 @@ export async function startFireRelay(goal: string, acceptanceCriteria: string | 
   await api.setThreadMode(rootId, "build");
   if (state.currentId === rootId) setState("mode", "build");
   await api.renameThread(rootId, `[Fire] 目标 · ${trimmed.slice(0, 28)}`);
-  fireRelaySteps.set(rootId, {
+  suspendedFireRelaySteps.delete(rootId);
+  const rootStep: FireRelayStep = {
     rootId,
     goal: trimmed,
     acceptanceCriteria,
     role: "work",
     attempt: 1,
-  });
+  };
+  fireRelaySteps.set(rootId, rootStep);
+  fireRelayStepHistory.set(rootId, rootStep);
   await refreshThreads();
-  await sendPrompt(trimmed);
+  await sendPrompt(fireWorkPrompt(trimmed));
 }
 
 /** ChatView 订阅：发送新提示词时强制滚到底 */
@@ -1916,10 +1982,14 @@ export async function initStore() {
     if (e.payload.running) preloadThreadSnapshot(e.payload.threadId);
     else {
       if (fireRelaySteps.has(e.payload.threadId)) {
-        const interrupted = e.payload.stopReason === "cancelled" || e.payload.stopReason === "force_cancelled";
-        const action = interrupted
-          ? stopFireRelay(e.payload.threadId)
-          : advanceFireRelay(e.payload.threadId);
+        const reason = e.payload.stopReason;
+        const manuallyInterrupted = reason === "cancelled" || reason === "force_cancelled";
+        const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
+        // 只有明确正常收尾才进入判断。网络、进程或模型错误均暂停在当前阶段，
+        // 用户补充提示或发送“继续”后，会从这一阶段恢复完整 Fire 流程。
+        const action = completedNormally
+          ? advanceFireRelay(e.payload.threadId)
+          : suspendFireRelay(e.payload.threadId, manuallyInterrupted);
         void action.catch((error) => console.error("Fire relay failed", error));
       }
       if (
