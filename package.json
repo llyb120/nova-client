@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite",
     "dev:tauri": "npm run build:sdk-bridges && vite",
-    "build": "npm run build:sdk-bridges && vite build",
+    "build": "npm run build:sdk-bridges:release && vite build",
     "build:sdk-bridges": "npm run build:opencode-bridge && npm run build:alkaid-bridge && npm run build:codex-bridge && npm run build:codebuddy-bridge && npm run build:claude-bridge && npm run build:cursor-bridge",
+    "build:sdk-bridges:release": "npm run build:opencode-bridge -- --minify && npm run build:alkaid-bridge -- --minify && npm run build:codex-bridge -- --minify && npm run build:codebuddy-bridge -- --minify && npm run build:claude-bridge -- --minify && npm run build:cursor-bridge -- --minify",
     "build:opencode-bridge": "esbuild scripts/opencode-bridge.mjs --bundle --platform=node --format=cjs --outfile=src-tauri/resources/opencode-bridge.cjs",
     "build:alkaid-bridge": "esbuild scripts/alkaid-bridge.mjs --bundle --platform=node --format=esm --banner:js=\"import{createRequire as __novaCreateRequire}from'node:module';const require=__novaCreateRequire(import.meta.url);\" --outfile=src-tauri/resources/alkaid-bridge.mjs",
     "build:codex-bridge": "esbuild scripts/codex-bridge.mjs --bundle --platform=node --format=esm --outfile=src-tauri/resources/codex-bridge.mjs",
