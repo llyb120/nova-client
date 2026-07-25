@@ -1,4 +1,4 @@
-use crate::threads::{now_ms, Thread};
+use crate::threads::{now_ms, Item, Thread};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
@@ -7,6 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 const STORE_VERSION: u32 = 1;
+/// 非 Git 目录使用固定基准；这类时间点保存的是目录内所有普通文件的完整快照。
+const DIRECTORY_BASE: &str = "nova-directory-v1";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +78,13 @@ fn store_version() -> u32 {
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct PromptSummary {
+    pub id: u64,
+    pub text: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct CheckpointSummary {
     pub id: String,
     pub parent_id: Option<String>,
@@ -84,6 +93,7 @@ pub struct CheckpointSummary {
     pub created_at: i64,
     pub changed_files: usize,
     pub automatic: bool,
+    pub prompts: Vec<PromptSummary>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -204,10 +214,20 @@ fn git_text(cwd: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn repository_identity(cwd: &Path) -> Result<(PathBuf, String), String> {
-    let root = git_text(cwd, &["rev-parse", "--show-toplevel"])?;
-    let root = PathBuf::from(root.trim());
-    let head = git_text(&root, &["rev-parse", "--verify", "HEAD"])?;
-    Ok((root, head.trim().to_string()))
+    // 优先沿用 Git 的 HEAD 作为稳定基准。目录不是仓库、Git 未安装，或仓库尚无
+    // 首次提交时，退化成普通目录快照，使秒表在任意项目目录都可用。
+    if let Ok(root) = git_text(cwd, &["rev-parse", "--show-toplevel"]) {
+        let root = PathBuf::from(root.trim());
+        if let Ok(head) = git_text(&root, &["rev-parse", "--verify", "HEAD"]) {
+            return Ok((root, head.trim().to_string()));
+        }
+    }
+    let root =
+        fs::canonicalize(cwd).map_err(|e| format!("无法访问工作目录 {}：{e}", cwd.display()))?;
+    if !root.is_dir() {
+        return Err(format!("工作目录不是文件夹：{}", root.display()));
+    }
+    Ok((root, DIRECTORY_BASE.into()))
 }
 
 fn safe_relative(path: &str) -> Result<PathBuf, String> {
@@ -292,12 +312,63 @@ fn executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
+fn directory_files(root: &Path) -> Result<Vec<String>, String> {
+    fn visit(root: &Path, directory: &Path, paths: &mut Vec<String>) -> Result<(), String> {
+        let children = fs::read_dir(directory)
+            .map_err(|e| format!("读取目录失败 {}：{e}", directory.display()))?;
+        for child in children {
+            let child =
+                child.map_err(|e| format!("读取目录项失败 {}：{e}", directory.display()))?;
+            let path = child.path();
+            // 尚无首次提交的 Git 仓库也走目录模式，绝不能把 Git 内部对象纳入快照。
+            if child.file_name() == ".git" {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|e| format!("读取文件属性失败 {}：{e}", path.display()))?;
+            // 不跟随链接，也不改动套接字等特殊文件；恢复时这些路径会原样保留。
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                visit(root, &path, paths)?;
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| format!("文件不在工作目录中：{}", path.display()))?;
+                let relative = relative
+                    .to_str()
+                    .ok_or_else(|| format!("目录包含非 UTF-8 路径：{}", path.display()))?
+                    .replace('\\', "/");
+                safe_relative(&relative)?;
+                paths.push(relative);
+            }
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    visit(root, root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
 fn capture_manifest(data_dir: &Path, root: &Path, head: &str) -> Result<Vec<PatchEntry>, String> {
+    let directory_snapshot = head == DIRECTORY_BASE;
+    let paths = if directory_snapshot {
+        directory_files(root)?
+    } else {
+        changed_paths(root)?
+    };
     let mut entries = Vec::new();
-    for path in changed_paths(root)? {
+    for path in paths {
         let relative = safe_relative(&path)?;
         let absolute = root.join(&relative);
-        let base = base_file(root, head, &path)?;
+        let base = if directory_snapshot {
+            None
+        } else {
+            base_file(root, head, &path)?
+        };
         let (base_blob, base_executable) = match base {
             Some((bytes, mode)) => (Some(put_blob(data_dir, &bytes)?), mode),
             None => (None, false),
@@ -348,6 +419,18 @@ fn view_for(timeline: &Timeline, thread_id: &str) -> TimelineView {
                 created_at: checkpoint.created_at,
                 changed_files: checkpoint.entries.len(),
                 automatic: checkpoint.automatic,
+                prompts: checkpoint
+                    .thread_snapshot
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::User { id, text, .. } => Some(PromptSummary {
+                            id: *id,
+                            text: text.clone(),
+                        }),
+                        _ => None,
+                    })
+                    .collect(),
             })
             .collect(),
     }
@@ -362,6 +445,18 @@ fn timeline_index(store: &StoreFile, thread_id: &str) -> Option<usize> {
                 .iter()
                 .any(|checkpoint| checkpoint.source_thread_id == thread_id)
     })
+}
+
+fn latest_prompt_title(thread: &Thread) -> String {
+    thread
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            Item::User { text, .. } if !text.trim().is_empty() => Some(text.trim().to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| thread.title.clone())
 }
 
 fn append_checkpoint(
@@ -387,11 +482,8 @@ fn append_checkpoint(
         id: id.clone(),
         parent_id,
         source_thread_id: thread.id.clone(),
-        title: if automatic {
-            "跳转前自动保存".into()
-        } else {
-            thread.title.clone()
-        },
+        // 时间树节点始终用用户提示词命名，便于在右侧直接识别会话分支。
+        title: latest_prompt_title(thread),
         created_at: now_ms(),
         repo_root: root.to_string_lossy().to_string(),
         base_head: head,
@@ -434,6 +526,74 @@ pub fn get_timeline(data_dir: &Path, thread_id: &str) -> Result<Option<TimelineV
     Ok(timeline_index(&store, thread_id).map(|index| view_for(&store.timelines[index], thread_id)))
 }
 
+pub fn checkpoint_preview(
+    data_dir: &Path,
+    thread_id: &str,
+    checkpoint_id: &str,
+) -> Result<Thread, String> {
+    let store = load_store(data_dir)?;
+    let index = timeline_index(&store, thread_id).ok_or("会话没有时光机时间线")?;
+    store.timelines[index]
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == checkpoint_id)
+        .map(|checkpoint| checkpoint.thread_snapshot.clone())
+        .ok_or_else(|| "时间点不存在".into())
+}
+
+/// 编辑历史消息前同时保存“共同历史”和“原会话”两个节点，再把当前会话的头指回
+/// 共同历史。编辑后的会话因此从共同历史继续，原来的后续则成为一条可恢复的旁支。
+pub fn record_edit_fork(
+    data_dir: &Path,
+    thread: &Thread,
+    item_id: u64,
+) -> Result<TimelineView, String> {
+    let item_index = thread
+        .items
+        .iter()
+        .position(|item| item.id() == item_id)
+        .ok_or("待编辑消息不存在")?;
+    let fork_prompt = match &thread.items[item_index] {
+        Item::User { text, .. } => text.trim().to_string(),
+        _ => return Err("待编辑消息不是用户提示词".into()),
+    };
+    let mut base_thread = thread.clone();
+    base_thread.items.truncate(item_index);
+    base_thread.plan = None;
+    base_thread.updated_at = now_ms();
+
+    let mut store = load_store(data_dir)?;
+    let index = match timeline_index(&store, &thread.id) {
+        Some(index) => index,
+        None => {
+            store.timelines.push(Timeline {
+                id: uuid::Uuid::new_v4().to_string(),
+                root_thread_id: thread.id.clone(),
+                thread_ids: vec![thread.id.clone()],
+                thread_heads: HashMap::new(),
+                current_checkpoint_id: None,
+                checkpoints: Vec::new(),
+            });
+            store.timelines.len() - 1
+        }
+    };
+    let timeline = &mut store.timelines[index];
+    let base_id = append_checkpoint(data_dir, timeline, &base_thread, true)?;
+    if let Some(checkpoint) = timeline.checkpoints.last_mut() {
+        checkpoint.title = fork_prompt.clone();
+    }
+    append_checkpoint(data_dir, timeline, thread, true)?;
+    if let Some(checkpoint) = timeline.checkpoints.last_mut() {
+        checkpoint.title = fork_prompt;
+    }
+    timeline
+        .thread_heads
+        .insert(thread.id.clone(), base_id.clone());
+    timeline.current_checkpoint_id = Some(base_id);
+    save_store(data_dir, &store)?;
+    Ok(view_for(&store.timelines[index], &thread.id))
+}
+
 fn set_executable(path: &Path, value: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -448,7 +608,7 @@ fn set_executable(path: &Path, value: bool) -> Result<(), String> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .map_err(|e| format!("恢复文件权限失败：{e}"))?;
     }
-    let _ = value;
+    let _ = (path, value);
     Ok(())
 }
 
@@ -559,6 +719,7 @@ pub fn restore_checkpoint(
     data_dir: &Path,
     checkpoint_id: &str,
     current_thread: &Thread,
+    restore_files: bool,
 ) -> Result<(Thread, RestoreResult), String> {
     let mut store = load_store(data_dir)?;
     let timeline_index = store
@@ -582,9 +743,7 @@ pub fn restore_checkpoint(
             .get(&current_thread.id)
             .map(String::as_str)
             .or(timeline.current_checkpoint_id.as_deref());
-        if current_head == Some(checkpoint_id) {
-            false
-        } else if let Some(current_id) = current_head {
+        if let Some(current_id) = current_head {
             let current_checkpoint = timeline.checkpoints.iter().find(|cp| cp.id == current_id);
             current_checkpoint.map_or(true, |cp| {
                 serde_json::to_value(&cp.thread_snapshot.items).ok()
@@ -608,7 +767,9 @@ pub fn restore_checkpoint(
     }
 
     let target = store.timelines[timeline_index].checkpoints[checkpoint_index].clone();
-    restore_manifest(data_dir, &target)?;
+    if restore_files {
+        restore_manifest(data_dir, &target)?;
+    }
 
     let mut thread = target.thread_snapshot.clone();
     thread.id = uuid::Uuid::new_v4().to_string();
@@ -648,6 +809,155 @@ mod tests {
         assert!(safe_relative("../secret").is_err());
         assert!(safe_relative("/tmp/secret").is_err());
         assert!(safe_relative("src/main.rs").is_ok());
+    }
+
+    #[test]
+    fn snapshots_and_restores_a_directory_without_git() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-dir-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let data = root.join("data");
+        fs::create_dir_all(project.join("nested")).unwrap();
+        fs::write(project.join("kept.txt"), b"first\n").unwrap();
+        fs::write(project.join("nested/removed-later.txt"), b"present\n").unwrap();
+
+        let thread = Thread::new(
+            project.to_string_lossy().to_string(),
+            crate::threads::AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        let first = create_checkpoint(&data, &thread).unwrap();
+        let first_id = first.current_checkpoint_id.unwrap();
+
+        fs::write(project.join("kept.txt"), b"second\n").unwrap();
+        fs::remove_file(project.join("nested/removed-later.txt")).unwrap();
+        fs::write(project.join("added-later.txt"), b"new\n").unwrap();
+        create_checkpoint(&data, &thread).unwrap();
+
+        restore_checkpoint(&data, &first_id, &thread, true).unwrap();
+        assert_eq!(fs::read(project.join("kept.txt")).unwrap(), b"first\n");
+        assert_eq!(
+            fs::read(project.join("nested/removed-later.txt")).unwrap(),
+            b"present\n"
+        );
+        assert!(!project.join("added-later.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn crossing_timeline_without_checkpoint_restore_keeps_workspace_files() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-no-file-restore-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let data = root.join("data");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("file.txt"), b"checkpoint\n").unwrap();
+
+        let thread = Thread::new(
+            project.to_string_lossy().to_string(),
+            crate::threads::AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        let checkpoint = create_checkpoint(&data, &thread).unwrap();
+        let checkpoint_id = checkpoint.current_checkpoint_id.unwrap();
+        fs::write(project.join("file.txt"), b"current workspace\n").unwrap();
+
+        restore_checkpoint(&data, &checkpoint_id, &thread, false).unwrap();
+        assert_eq!(
+            fs::read(project.join("file.txt")).unwrap(),
+            b"current workspace\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn editing_a_prompt_creates_a_named_branch_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-edit-tree-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let data = root.join("data");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("file.txt"), b"working\n").unwrap();
+        let mut thread = Thread::new(
+            project.to_string_lossy().to_string(),
+            crate::threads::AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        thread.items.push(Item::User {
+            id: 1,
+            text: "实现右侧时间树".into(),
+            ts: now_ms(),
+            images: Vec::new(),
+        });
+
+        let view = record_edit_fork(&data, &thread, 1).unwrap();
+        assert_eq!(view.checkpoints.len(), 2);
+        assert_eq!(view.checkpoints[0].title, "实现右侧时间树");
+        assert_eq!(view.checkpoints[1].title, "实现右侧时间树");
+        assert_eq!(
+            view.checkpoints[1].parent_id.as_deref(),
+            Some(view.checkpoints[0].id.as_str())
+        );
+        assert_eq!(
+            view.current_checkpoint_id.as_deref(),
+            Some(view.checkpoints[0].id.as_str())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn jumping_to_the_current_branch_point_preserves_workspace_as_a_child() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-current-head-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let data = root.join("data");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("file.txt"), b"branch point\n").unwrap();
+        let thread = Thread::new(
+            project.to_string_lossy().to_string(),
+            crate::threads::AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        let first = create_checkpoint(&data, &thread).unwrap();
+        let first_id = first.current_checkpoint_id.unwrap();
+
+        fs::write(project.join("file.txt"), b"current workspace\n").unwrap();
+        let (_, restored) = restore_checkpoint(&data, &first_id, &thread, true).unwrap();
+        assert_eq!(
+            fs::read(project.join("file.txt")).unwrap(),
+            b"branch point\n"
+        );
+        let saved_workspace = restored
+            .timeline
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id != first_id)
+            .expect("当前工作区应在跳转前自动保存");
+        assert_eq!(
+            saved_workspace.parent_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -697,7 +1007,7 @@ mod tests {
         let second_id = second.current_checkpoint_id.unwrap();
         assert_ne!(first_id, second_id);
 
-        let (fork, restored) = restore_checkpoint(&data, &first_id, &thread).unwrap();
+        let (fork, restored) = restore_checkpoint(&data, &first_id, &thread, true).unwrap();
         assert_eq!(
             fs::read(repo.join("tracked.txt")).unwrap(),
             b"checkpoint-a\n"

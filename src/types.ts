@@ -131,6 +131,11 @@ export interface ThreadMeta {
 }
 
 /** 用户随 prompt 带上的附件。图片可带 base64，普通文件走 file:// resource_link。 */
+export interface TimeMachinePrompt {
+  id: number;
+  text: string;
+}
+
 export interface TimeMachineCheckpoint {
   id: string;
   parentId?: string | null;
@@ -139,6 +144,7 @@ export interface TimeMachineCheckpoint {
   createdAt: number;
   changedFiles: number;
   automatic: boolean;
+  prompts: TimeMachinePrompt[];
 }
 
 export interface TimeMachineTimeline {
@@ -364,6 +370,8 @@ export interface Settings {
   windowsShellShimEnabled: boolean;
   /** Vega 精简上下文：仅保留用户提示词与结论，旧轮次自动摘要 */
   vegaSlimContextEnabled: boolean;
+  /** 穿越时光机时间线时是否还原 checkpoint 中的工作目录文件 */
+  checkpointEnabled: boolean;
   defaultMode: string;
   /** 自动生成会话标题所用后端（devin/codex/codebuddy/...，空 = devin） */
   titleModelAgent: string;

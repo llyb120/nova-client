@@ -2617,6 +2617,16 @@ fn get_time_machine_timeline(
 }
 
 #[tauri::command]
+fn get_time_machine_checkpoint_preview(
+    state: State<'_, AppState>,
+    thread_id: String,
+    checkpoint_id: String,
+) -> Result<Thread, String> {
+    let _guard = state.time_machine_lock.lock().unwrap();
+    time_machine::checkpoint_preview(&state.config_dir, &thread_id, &checkpoint_id)
+}
+
+#[tauri::command]
 fn restore_time_machine_checkpoint(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -2635,8 +2645,13 @@ fn restore_time_machine_checkpoint(
         }
         thread.clone()
     };
-    let (thread, result) =
-        time_machine::restore_checkpoint(&state.config_dir, &checkpoint_id, &current)?;
+    let restore_files = state.settings.lock().unwrap().checkpoint_enabled;
+    let (thread, result) = time_machine::restore_checkpoint(
+        &state.config_dir,
+        &checkpoint_id,
+        &current,
+        restore_files,
+    )?;
     {
         let mut store = state.store.lock().unwrap();
         store.threads.push(thread);
@@ -3189,6 +3204,8 @@ fn truncate_thread(
     if running_by_id(&state, &thread_id) {
         return Err("会话正在运行，请先停止".into());
     }
+    // 与手动恢复保持相同的锁顺序，保证编辑分叉和恢复不会交叉写时间线或项目文件。
+    let _time_machine_guard = state.time_machine_lock.lock().unwrap();
     let (agent_kind, cwd, old_session_id, retained_turns, checkpoint, is_quota) = {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
@@ -3197,6 +3214,13 @@ fn truncate_thread(
             .iter()
             .position(|i| i.id() == item_id && matches!(i, Item::User { .. }))
             .ok_or("该消息不存在或不是用户消息")?;
+        if !thread.title.starts_with("[Fire]")
+            && !thread.is_roaming_guest()
+            && thread.roaming_role.is_none()
+            && thread.worktree.is_none()
+        {
+            time_machine::record_edit_fork(&state.config_dir, thread, item_id)?;
+        }
         let checkpoint = thread.checkpoint_before(item_id);
         let old_session_id = thread.acp_session_id.clone();
         thread.items.truncate(idx);
@@ -5491,6 +5515,7 @@ pub fn run() {
             open_url,
             create_time_machine_checkpoint,
             get_time_machine_timeline,
+            get_time_machine_checkpoint_preview,
             restore_time_machine_checkpoint,
             rename_thread,
             notify_fire_done,

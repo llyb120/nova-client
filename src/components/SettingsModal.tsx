@@ -154,6 +154,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [vegaSlimContextEnabled, setVegaSlimContextEnabled] = createSignal(
     s?.vegaSlimContextEnabled ?? false,
   );
+  const [checkpointEnabled, setCheckpointEnabled] = createSignal(
+    s?.checkpointEnabled ?? false,
+  );
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
   const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
@@ -399,6 +402,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     codexProxy: codexProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
     vegaSlimContextEnabled: vegaSlimContextEnabled(),
+    checkpointEnabled: checkpointEnabled(),
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
     claudecodeProxy: claudecodeProxy().trim(),
@@ -976,6 +980,24 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </label>
                 <span class="field-hint">
                   开启后会增强上下文体验和速度，但可能存在上下文丢失的风险。
+                </span>
+              </div>
+            </section>
+
+            <section class="settings-group">
+              <h3 class="settings-group-title">时光机</h3>
+              <div class="field">
+                <span class="field-label">启用 Checkpoint</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={checkpointEnabled()}
+                    onChange={(e) => setCheckpointEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  开启后，从其他时间线继续对话时会把工作目录文件还原到对应时间点。默认关闭；关闭时只切换会话历史，不修改当前文件。
                 </span>
               </div>
             </section>

@@ -882,6 +882,8 @@ button {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* 禁止滚动到边界后的橡皮筋回弹和向外层继续传递滚动。 */
+  overscroll-behavior: none;
   /* 防止浏览器滚动锚定在虚拟列表卸挂时把位置拽回去，导致发送后钉底失效 */
   overflow-anchor: none;
   user-select: text;
@@ -1039,96 +1041,210 @@ button {
   50% { opacity: .35; transform: scale(.72); }
 }
 
-/* 应用自己维护的仓库 checkpoint 树；浮在对话底部，不创建 Git branch/commit/stash。 */
+/* 右侧时光机沿用紧凑单线样式；分支按列展开，当前时间线始终固定在最左侧。 */
 .repo-time-machine {
-  position: absolute;
+  position: relative;
   z-index: 8;
-  left: 50%;
-  bottom: 12px;
-  transform: translateX(-50%);
+  flex: 0 0 var(--time-width, 64px);
+  width: var(--time-width, 64px);
+  max-width: 168px;
+  min-height: 0;
   display: flex;
-  align-items: center;
-  gap: 9px;
-  max-width: min(72%, 760px);
-  padding: 7px 10px;
-  border: 1px solid color-mix(in srgb, var(--border-strong) 72%, transparent);
-  border-radius: 999px;
+  flex-direction: column;
+  border-left: 1px solid var(--border-light);
   color: var(--text-muted);
-  background: color-mix(in srgb, var(--bg-panel) 66%, transparent);
-  box-shadow: 0 8px 30px rgba(0, 0, 0, .16);
-  backdrop-filter: blur(14px);
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  transition: width .16s ease, flex-basis .16s ease;
 }
 .repo-time-machine-label {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 5px;
+  justify-content: center;
+  gap: 4px;
   flex: 0 0 auto;
-  padding-right: 8px;
-  border-right: 1px solid var(--border-light);
+  min-height: 52px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border-light);
   color: var(--text-faint);
-  font-size: 10px;
+  font-size: 9px;
+  letter-spacing: .08em;
   white-space: nowrap;
 }
 .repo-time-machine-track {
-  display: flex;
-  align-items: center;
   min-width: 0;
+  min-height: 0;
+  flex: 1;
   overflow-x: auto;
-  padding: 5px 2px;
-  scrollbar-width: none;
+  overflow-y: auto;
+  padding: 6px 5px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
-.repo-time-machine-track::-webkit-scrollbar { display: none; }
-.repo-time-node {
-  --branch-depth: 0;
+.repo-time-graph {
   position: relative;
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  flex: 0 0 31px;
-  height: 24px;
-  color: var(--text-faint);
-  transform: translateY(calc((var(--branch-depth) - 1) * 2px));
+  min-width: 100%;
+  min-height: 100%;
 }
-.repo-time-node:not(:first-child)::before {
+.repo-time-graph::before {
   content: "";
   position: absolute;
-  right: calc(100% - 4px);
-  width: 22px;
-  height: 1px;
-  background: var(--border-strong);
+  top: 20px;
+  bottom: 0;
+  left: 17.5px;
+  width: 1px;
+  background: linear-gradient(to bottom, var(--accent), var(--border-strong) 70%, var(--border));
+  opacity: .48;
+}
+.repo-time-edges {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+.repo-time-edges path {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1px;
   opacity: .7;
 }
-.repo-time-branch {
+.repo-time-edges path.current {
+  stroke: var(--accent);
+  opacity: .48;
+}
+.repo-time-node {
   position: absolute;
-  left: -5px;
-  top: -7px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
   color: var(--text-faint);
-  font: 9px/1 var(--mono);
+  transform: translate(-10px, -10px);
+  overflow: visible;
 }
 .repo-time-dot {
-  position: relative;
-  z-index: 1;
-  width: 9px;
-  height: 9px;
-  border: 2px solid color-mix(in srgb, var(--bg-panel) 80%, transparent);
+  display: grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  border: 2px solid var(--bg);
   border-radius: 50%;
-  background: var(--text-faint);
+  color: var(--bg);
+  background: var(--text-muted);
   box-shadow: 0 0 0 1px var(--border-strong);
-}
-.repo-time-node small {
-  font: 8px/1 var(--mono);
+  font: 7.5px/1 var(--mono);
+  transition: transform .16s, color .16s, background .16s, box-shadow .16s;
 }
 .repo-time-node:hover,
-.repo-time-node.active {
+.repo-time-node.previewing,
+.repo-time-node.selected,
+.repo-time-node.active,
+.repo-time-node.current-path {
   color: var(--accent);
 }
 .repo-time-node:hover .repo-time-dot,
-.repo-time-node.active .repo-time-dot {
+.repo-time-node.previewing .repo-time-dot,
+.repo-time-node.selected .repo-time-dot,
+.repo-time-node.active .repo-time-dot,
+.repo-time-node.current-path .repo-time-dot {
   background: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent), 0 0 9px color-mix(in srgb, var(--accent) 55%, transparent);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 10px color-mix(in srgb, var(--accent) 65%, transparent);
+}
+.repo-time-node:hover .repo-time-dot,
+.repo-time-node.previewing .repo-time-dot,
+.repo-time-node.active .repo-time-dot {
+  transform: scale(1.25);
+}
+.repo-time-node.off-current-path {
+  opacity: .72;
+}
+.repo-time-node:disabled {
+  cursor: wait;
+  opacity: .5;
 }
 .repo-time-node.restoring .repo-time-dot {
   animation: time-now-pulse .8s ease-in-out infinite;
+}
+.repo-time-now {
+  display: flex;
+  align-items: center;
+  align-self: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  margin: 8px 0 12px;
+  padding: 5px 7px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 9.5px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.repo-time-now:hover,
+.repo-time-now.active {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-dim);
+}
+.repo-time-now-pulse {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.repo-time-now.active .repo-time-now-pulse {
+  box-shadow: 0 0 7px var(--accent);
+  animation: time-now-pulse 1.8s ease-in-out infinite;
+}
+.transcript {
+  transition: opacity .16s ease;
+}
+.transcript.checkpoint-preview-fading {
+  opacity: .12;
+}
+.time-jump-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 178px;
+  padding: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .28);
+}
+.time-jump-menu button {
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 11px;
+  text-align: left;
+}
+.time-jump-menu button:hover {
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+.checkpoint-preview-banner {
+  position: sticky;
+  cursor: pointer;
+  z-index: 5;
+  top: 8px;
+  align-self: center;
+  margin-bottom: 8px;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
+  box-shadow: 0 5px 18px rgba(0, 0, 0, .12);
+  font-size: 10px;
+  backdrop-filter: blur(10px);
+}
+.checkpoint-preview-banner:hover {
+  border-color: color-mix(in srgb, var(--accent) 58%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-panel));
 }
 
 .stage-rail {

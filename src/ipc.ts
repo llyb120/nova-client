@@ -54,6 +54,8 @@ export const api = {
     invoke<TimeMachineTimeline>("create_time_machine_checkpoint", { threadId }),
   getTimeMachineTimeline: (threadId: string) =>
     invoke<TimeMachineTimeline | null>("get_time_machine_timeline", { threadId }),
+  getTimeMachineCheckpointPreview: (threadId: string, checkpointId: string) =>
+    invoke<Thread>("get_time_machine_checkpoint_preview", { threadId, checkpointId }),
   restoreTimeMachineCheckpoint: (threadId: string, checkpointId: string) =>
     invoke<TimeMachineRestoreResult>("restore_time_machine_checkpoint", { threadId, checkpointId }),
   listProjects: () => invoke<ProjectEntry[]>("list_projects"),

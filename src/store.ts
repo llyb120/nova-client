@@ -1372,7 +1372,7 @@ export async function sendPrompt(
   images: PromptImage[] = [],
   employeeId?: string | null,
 ) {
-  const id = state.currentId;
+  let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
   // 统一在 store 层处理内置命令：首页首条提示和会话内 Composer 都走这里。
   // 只在 Composer 拦截会漏掉“新建会话后立即发送”的首页路径。
@@ -1385,6 +1385,16 @@ export async function sendPrompt(
   }
   if (/^\/target(?:\s|$)/i.test(builtInInput)) {
     throw new Error("/target 只能与 /fire 一起发送");
+  }
+  // 在历史分支预览中追加提示词时才发生时间跳跃：先恢复该分支，再把新提示词
+  // 发送到恢复出的会话。仅浏览或点击当前时间线不会恢复会话。
+  if (timeMachineEditTarget?.threadId === id) {
+    const target = timeMachineEditTarget;
+    timeMachineEditTarget = null;
+    const restored = await api.restoreTimeMachineCheckpoint(id, target.checkpointId);
+    await refreshThreads();
+    await openThread(restored.threadId);
+    id = restored.threadId;
   }
   const thread = state.threads.find((t) => t.id === id);
   if (thread?.employeeId && !thread.mindThread) {
@@ -1637,8 +1647,18 @@ export async function startFireRelay(goal: string, acceptanceCriteria: string | 
 
 /** ChatView 订阅：发送新提示词时强制滚到底 */
 const [chatScrollToBottomTick, setChatScrollToBottomTick] = createSignal(0);
+const [timeMachineChangedTick, setTimeMachineChangedTick] = createSignal(0);
+let timeMachineEditTarget: { threadId: string; checkpointId: string } | null = null;
+export function setTimeMachineEditTarget(
+  target: { threadId: string; checkpointId: string } | null,
+) {
+  timeMachineEditTarget = target;
+}
 export function chatScrollToBottomSignal() {
   return chatScrollToBottomTick();
+}
+export function timeMachineChangedSignal() {
+  return timeMachineChangedTick();
 }
 function bumpChatScrollToBottom() {
   setChatScrollToBottomTick((n) => n + 1);
@@ -1665,8 +1685,18 @@ async function sendPromptTo(threadId: string, text: string, images: PromptImage[
 
 /** 编辑历史用户消息并从该处重新开始：界面立即更新，SDK restore/fork 在后端排队完成后再发送。 */
 export async function editUserMessage(itemId: number, text: string, images: PromptImage[] = []) {
-  const id = state.currentId;
+  let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
+  // 历史分支预览中发生编辑时，先恢复对应快照；随后的 truncate_thread 会自动
+  // 从被编辑提示词处截断并创建新分支，无需用户先手动执行时间跳跃。
+  if (timeMachineEditTarget?.threadId === id) {
+    const target = timeMachineEditTarget;
+    timeMachineEditTarget = null;
+    const restored = await api.restoreTimeMachineCheckpoint(id, target.checkpointId);
+    await refreshThreads();
+    await openThread(restored.threadId);
+    id = restored.threadId;
+  }
   const targetIndex = state.items.findIndex((item) => item.id === itemId);
   const retained = targetIndex < 0 ? state.items : state.items.slice(0, targetIndex);
   // 临时 id 只存在于前端；后端 restore 完成、发出真实 user item 后由快照/事件替换。
@@ -1688,6 +1718,7 @@ export async function editUserMessage(itemId: number, text: string, images: Prom
   for (let attempt = 0; ; attempt++) {
     try {
       await api.truncateThread(id, itemId, text, images);
+      setTimeMachineChangedTick((n) => n + 1);
       break;
     } catch (e) {
       if (attempt >= 10) {
