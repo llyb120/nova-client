@@ -1554,10 +1554,21 @@ async function createFireThread(
   fireRelayStepHistory.set(thread.id, step);
   latestFireThreadByRoot.set(step.rootId, thread.id);
   await refreshThreads();
-  await openThread(thread.id);
+  // 用户正在看这条 Fire 链时才切到新阶段；看别的会话时后台继续跑。
+  if (isViewingFireChain(step.rootId)) await openThread(thread.id);
   setState("running", thread.id, true);
   await api.sendPrompt(thread.id, prompt);
   return thread.id;
+}
+
+function isViewingFireChain(rootId: string): boolean {
+  const currentId = state.currentId;
+  if (!currentId) return false;
+  if (currentId === rootId) return true;
+  const step = fireRelayStepHistory.get(currentId)
+    ?? fireRelaySteps.get(currentId)
+    ?? suspendedFireRelaySteps.get(currentId);
+  return step?.rootId === rootId;
 }
 
 async function advanceFireRelay(threadId: string) {
