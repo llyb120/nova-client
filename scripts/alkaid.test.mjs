@@ -630,6 +630,9 @@ test("system prompt keeps stable Alkaid policy before dynamic cwd/skills", () =>
   assert.ok(stableIndex >= 0);
   assert.ok(separatorIndex > stableIndex);
   assert.ok(cwdIndex > separatorIndex);
+  assert.match(prompt, /回复默认简洁，保留完整技术信息/);
+  assert.match(prompt, /省略寒暄、自我指代、问题复述/);
+  assert.match(prompt, /用户明确要求详细说明时再展开/);
   assert.match(prompt, /必须在一次 read_files 调用中合并读取/);
   assert.match(prompt, /禁止连续调用多个 read/);
 });
