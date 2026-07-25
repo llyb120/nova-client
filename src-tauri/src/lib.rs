@@ -3672,13 +3672,17 @@ async fn apply_runtime_settings(
             || s.codebuddy_path != settings.codebuddy_path
             || s.codebuddy_proxy != settings.codebuddy_proxy
             || s.codebuddy_enabled != settings.codebuddy_enabled;
+        // API Key 也是 bridge 的启动环境：改了必须重启后端并重拉模型列表，
+        // 否则新 Key 要等下次开应用才生效。
         let restart_claudecode = restart_all_agents
             || s.claudecode_path != settings.claudecode_path
             || s.claudecode_proxy != settings.claudecode_proxy
+            || s.claudecode_sdk_api_key != settings.claudecode_sdk_api_key
             || s.claudecode_enabled != settings.claudecode_enabled;
         let restart_cursor = restart_all_agents
             || s.cursor_path != settings.cursor_path
             || s.cursor_proxy != settings.cursor_proxy
+            || s.cursor_sdk_api_key != settings.cursor_sdk_api_key
             || s.cursor_enabled != settings.cursor_enabled;
         let restart_opencode = restart_all_agents
             || s.opencode_path != settings.opencode_path
@@ -3722,12 +3726,15 @@ async fn apply_runtime_settings(
     }
     if restart_codebuddy {
         state.codebuddyplus.shutdown();
+        state.codebuddyplus.refresh_model_options_soon();
     }
     if restart_claudecode {
         state.claudeplus.shutdown();
+        state.claudeplus.refresh_model_options_soon();
     }
     if restart_cursor {
         state.cursorplus.shutdown();
+        state.cursorplus.refresh_model_options_soon();
     }
     if restart_opencode {
         state.opencodeplus.shutdown();

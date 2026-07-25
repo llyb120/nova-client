@@ -174,6 +174,7 @@ export function isRetryableAlkaidProviderError(error) {
   return [
     "terminated",
     "fetch failed",
+    "connection error",
     "socket hang up",
     "econnreset",
     "etimedout",

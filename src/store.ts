@@ -418,12 +418,20 @@ export function reasoningEffortChoices(
 
 const modelOptionsLoading = new Set<AgentKind>();
 
+/** store 的对象赋值是浅合并，占位里的 pending 不会被后来的真实列表冲掉，必须显式复位。 */
+function setModelOptions(agentKind: AgentKind, opts: ModelOptions | null) {
+  setState("modelOptions", agentKind, opts && { pending: false, ...opts });
+}
+
 export async function ensureModelOptions(agentKind: AgentKind) {
-  if (state.modelOptions[agentKind] || modelOptionsLoading.has(agentKind)) return;
+  // pending 是后端「还没拉到」的占位：缓存它会让填完 API Key 后永远停在空列表，
+  // 所以只有拿到真实列表才算加载完成。
+  const cached = state.modelOptions[agentKind];
+  if ((cached && !cached.pending) || modelOptionsLoading.has(agentKind)) return;
   modelOptionsLoading.add(agentKind);
   try {
     const opts = await api.getModelOptions(agentKind);
-    setState("modelOptions", agentKind, opts);
+    setModelOptions(agentKind, opts);
     // 选项就绪后回填友好名，供下次冷启动触发器使用
     const model = lastUsed.model(agentKind);
     const name = modelChoices(agentKind).find((c) => c.value === model)?.name;
@@ -1415,7 +1423,10 @@ export async function sendPrompt(
   setState("proposedPlan", null);
   setState("running", id, true);
   try {
-    await api.sendPrompt(id, text, images);
+    // 判断阶段被重新唤起时仍然只是验收者：补充内容要并入本轮核验，实现工作交给
+    // 下一个执行阶段，否则判断会话会自己动手改项目。
+    const outbound = resumedFireStep?.role === "judge" ? fireJudgeResumePrompt(text) : text;
+    await api.sendPrompt(id, outbound, images);
   } catch (e) {
     if (resumedFireStep && fireRelaySteps.get(id) === resumedFireStep) {
       fireRelaySteps.delete(id);
@@ -1492,6 +1503,10 @@ function fireJudgePrompt(step: FireRelayStep, conclusion: string): string {
     ? `以下验收规则具有最高优先级且每一条都必须满足：\n${step.acceptanceCriteria}\n\n逐条核验这些规则；任何一条不满足或无法从项目状态中确认，都必须判定为不符合。目标描述和执行阶段说明不能替代、弱化或改写验收规则。`
     : `根据目标逐项核验实际完成情况；任何关键要求不满足或无法确认，都必须判定为不符合。`;
   return `你是独立验收者，不要继续实现或修改任务。\n\n目标：\n${step.goal}\n\n${criteria}\n\n执行阶段的最终说明（仅作为定位线索，不是完成证据）：\n${conclusion}\n\n请检查当前项目的实际状态、版本控制差异、相关文件和可用的验证结果，不要依据执行阶段回复的篇幅、格式或自述做判断。必须主动选择成本最低且足以覆盖改动的验证方式，并检查目标产物在实际使用场景中的错误信号，例如编译或类型错误、测试失败、启动或运行异常、控制台报错、无效 API 调用以及关键交互不可用。只要存在与本次目标相关的未解释错误、验证失败，或因错误导致关键行为无法验证，就必须判定为不符合；不得因为部分功能存在、界面看似完成或执行阶段声称完成而放宽。若受环境限制无法执行必要验证，也应判定为无法确认而不符合，并说明限制。\n\n回复应简洁：先给出逐条验收结果；若不符合，只列出未满足项、依据和下一阶段需要采取的具体动作；若符合，只列出实际执行过的验证及关键证据。不要复述无关的阶段总结。最后必须单独输出一行 FIRE_ACCEPTED 或 FIRE_REJECTED，且该标记必须是回复的最后一行。`;
+}
+
+function fireJudgeResumePrompt(text: string): string {
+  return `当前会话仍处于 Fire 自动验收流程的判断阶段：你只做核验，不要实现功能、修改文件或执行任何写操作，需要改动的部分会由下一个执行阶段完成。\n\n用户补充：\n${text}\n\n请结合该补充重新核验当前项目的实际状态；补充中若包含新的要求，同样纳入本次核验，未满足即判定为不符合，并写清未满足项和下一阶段需要采取的具体动作。最后必须单独输出一行 FIRE_ACCEPTED 或 FIRE_REJECTED，且该标记必须是回复的最后一行。`;
 }
 
 function fireStepTitle(step: FireRelayStep, status = ""): string {
@@ -2077,12 +2092,12 @@ export async function initStore() {
   await listen<OptionsEvent>("acp:options", (e) => {
     const payload = e.payload;
     if ("options" in payload && "agentKind" in payload) {
-      setState("modelOptions", payload.agentKind, payload.options);
+      setModelOptions(payload.agentKind, payload.options);
       const model = lastUsed.model(payload.agentKind);
       const name = modelChoices(payload.agentKind).find((c) => c.value === model)?.name;
       if (model && name) lastUsed.setModelName(payload.agentKind, name);
     } else {
-      setState("modelOptions", "devin", payload as ModelOptions);
+      setModelOptions("devin", payload as ModelOptions);
     }
   });
 

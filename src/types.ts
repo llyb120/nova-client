@@ -314,6 +314,8 @@ export interface ModelOptions {
     currentModeId?: string;
     availableModes?: { id: string; name: string }[];
   } | null;
+  /** 后端还没拿到真实列表时给的占位；拿到之前不要当作已加载缓存住。 */
+  pending?: boolean;
 }
 
 export interface PermissionOption {

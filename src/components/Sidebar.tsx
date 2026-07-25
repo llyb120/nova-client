@@ -2,7 +2,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
-import { firstWakeDoChild } from "../threadDisplay";
+import { firstWakeDoChild, latestFireStage } from "../threadDisplay";
 import type { ThreadMeta, Worktree } from "../types";
 import {
   checkAndStageUpdate,
@@ -389,7 +389,11 @@ export function Sidebar(props: {
           parent: childCount > 0,
           starred: !!(t.starred || mergedChild?.starred),
         }}
-        onClick={() => void openHistoryThread(activeThread.id)}
+        onClick={() =>
+          void openHistoryThread(
+            latestFireStage(state.threads, activeThread)?.id ?? activeThread.id,
+          )
+        }
         onContextMenu={(e) => {
           e.preventDefault();
           if (activeThread.worktree?.path) {

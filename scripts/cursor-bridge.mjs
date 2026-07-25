@@ -699,18 +699,29 @@ function parseCliModels(output) {
     });
 }
 
+function cliModelsCommand(program, platform = process.platform) {
+  if (platform !== "win32") return [program, ["--list-models"]];
+  const extension = extname(program).toLowerCase();
+  if (extension === ".ps1") {
+    const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"];
+    return ["powershell.exe", [...args, program, "--list-models"]];
+  }
+  if (extension === ".exe") return [program, ["--list-models"]];
+  // cursor-agent 在 Windows 上装成 .cmd：Node ≥20.12 拒绝直接 spawn .cmd/.bat（EINVAL），
+  // 裸命令名也不会按 PATHEXT 解析（ENOENT）。两种情况都必须交给 cmd.exe。
+  return ["cmd.exe", ["/d", "/s", "/c", program, "--list-models"]];
+}
+
 async function cliModels() {
   const program = process.env.NOVA_CURSOR_PATH || "cursor-agent";
-  const executable = process.platform === "win32" && program.toLowerCase().endsWith(".ps1")
-    ? "powershell.exe"
-    : program;
-  const args = executable === program
-    ? ["--list-models"]
-    : ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", program, "--list-models"];
+  const [executable, args] = cliModelsCommand(program);
   const { stdout } = await execFileAsync(executable, args, {
     encoding: "utf8",
     maxBuffer: 1024 * 1024,
     windowsHide: true,
+  }).catch((error) => {
+    const detail = String(error.stderr || error.message || error).trim();
+    throw new Error(`执行 ${program} --list-models 失败：${detail}`);
   });
   const models = parseCliModels(stdout);
   if (!models.length) throw new Error("Cursor CLI 未返回模型列表");
@@ -718,11 +729,20 @@ async function cliModels() {
 }
 
 async function modelOptions() {
+  // 两条来源都失败时必须把原因抛出去，否则用户只会看到一个空列表，无从判断是
+  // Key 无效、网络不通还是 CLI 没装。
+  const failures = [];
+  const record = (source) => (error) => {
+    failures.push(`${source}：${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  };
   let models;
   if (process.env.CURSOR_API_KEY) {
-    models = await Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY }).catch(() => undefined);
+    models = await Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY })
+      .catch(record("API Key"));
   }
-  models ??= await cliModels();
+  models ??= await cliModels().catch(record("Cursor CLI"));
+  if (!models) throw new Error(failures.join("；") || "未配置 Cursor API Key，且未安装 cursor-agent");
   return {
     novaCursorModelSchema: 2,
     configOptions: [{
@@ -999,6 +1019,7 @@ if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => {
 
 export {
   CursorStartupTimeout,
+  cliModelsCommand,
   compactConversation,
   completePendingTools,
   compressSlimMemory,

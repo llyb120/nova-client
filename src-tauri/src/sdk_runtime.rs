@@ -522,6 +522,23 @@ impl SdkManager {
         *self.model_options.lock().unwrap() = Some(value);
     }
 
+    /// 后端启动配置（API Key / 可执行文件 / 代理）变化后，缓存的模型列表就过期了，
+    /// 必须立刻用新配置重拉，成功后由 EV_OPTIONS 推给前端。否则用户填完 API Key
+    /// 也只能看到空列表，直到下次重启应用。
+    /// 不先清内存：旧缓存继续服务前端，拉到新列表后再覆盖。
+    pub fn refresh_model_options_soon(self: &Arc<Self>) {
+        self.model_options_revalidated
+            .store(false, Ordering::SeqCst);
+        // 旧配置的探测可能仍在飞行中，等它退出 refreshing 闸门再用新配置重拉。
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            while manager.model_options_refreshing.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            manager.spawn_revalidate_model_options();
+        });
+    }
+
     /// 应用 nova-server 定向下发的 Alkaid 配置。配置只驻留内存；当前运行轮次不打断，
     /// 后续 bridge 首包携带它并由 JS 侧以本地 config.jsonc 覆盖合并。
     pub fn set_alkaid_server_config(self: &Arc<Self>, config: Option<Value>) {
@@ -536,27 +553,19 @@ impl SdkManager {
             *current = config;
         }
         self.alkaid_config_generation.fetch_add(1, Ordering::SeqCst);
+        // 换了服务端配置，旧模型列表可能整批失效，先清空再重拉。
         *self.model_options.lock().unwrap() = None;
-        self.model_options_revalidated
-            .store(false, Ordering::SeqCst);
         let _ = self.app.emit(
             EV_OPTIONS,
             json!({
                 "agentKind": AgentKind::Alkaid.as_str(),
-                "options": self.empty_model_options(),
+                "options": self.pending_model_options(),
             }),
         );
         for mut bridge in std::mem::take(&mut *self.idle_children.lock().unwrap()).into_values() {
             kill_child(&mut bridge.child);
         }
-        // 若旧配置的模型探测仍在进行，等它退出 refreshing 闸门后再用新配置重拉。
-        let manager = self.clone();
-        tauri::async_runtime::spawn(async move {
-            while manager.model_options_refreshing.load(Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            manager.spawn_revalidate_model_options();
-        });
+        self.refresh_model_options_soon();
     }
 
     fn with_alkaid_server_config(&self, mut request: Value) -> Value {
@@ -584,7 +593,13 @@ impl SdkManager {
         }
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = manager.refresh_model_options().await;
+            if let Err(error) = manager.refresh_model_options().await {
+                // 静默失败会让用户以为「配了 Key 也没有模型」，把原因落到日志里。
+                let _ = manager.app.emit(
+                    EV_LOG,
+                    format!("[{}] 拉取模型列表失败：{error}", manager.adapter.label()),
+                );
+            }
             manager
                 .model_options_refreshing
                 .store(false, Ordering::SeqCst);
@@ -597,11 +612,21 @@ impl SdkManager {
             return Ok(value);
         }
         self.spawn_revalidate_model_options();
-        Ok(self.empty_model_options())
+        Ok(self.pending_model_options())
     }
 
     fn empty_model_options(&self) -> Value {
         self.adapter.empty_model_options()
+    }
+
+    /// 真实列表还没拉到时给前端的占位。带 pending 标记，前端才知道这不是最终结果，
+    /// 下次打开选择器可以再问一次，而不是把空列表当成已加载缓存住。
+    fn pending_model_options(&self) -> Value {
+        let mut value = self.empty_model_options();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("pending".into(), Value::Bool(true));
+        }
+        value
     }
 
     async fn refresh_model_options(&self) -> Result<Value, String> {

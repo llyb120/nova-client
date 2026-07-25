@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
 const {
   CursorStartupTimeout,
+  cliModelsCommand,
   compactConversation,
   completePendingTools,
   compressSlimMemory,
@@ -85,6 +86,18 @@ assert.equal(cursorShellProgram("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\
   ? "C:\\Nova\\shim\\powershell.exe"
   : "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
 assert.equal(cursorShellProgram("tool.exe", { NOVA_SHELL_SHIM_POWERSHELL: "shim.exe" }), "tool.exe");
+// Windows 不能直接 spawn .cmd/.bat（EINVAL），裸命令名也不走 PATHEXT（ENOENT）。
+assert.deepEqual(cliModelsCommand("C:\\Users\\me\\cursor-agent.cmd", "win32"),
+  ["cmd.exe", ["/d", "/s", "/c", "C:\\Users\\me\\cursor-agent.cmd", "--list-models"]]);
+assert.deepEqual(cliModelsCommand("cursor-agent", "win32"),
+  ["cmd.exe", ["/d", "/s", "/c", "cursor-agent", "--list-models"]]);
+assert.deepEqual(cliModelsCommand("C:\\Program Files\\cursor-agent.exe", "win32"),
+  ["C:\\Program Files\\cursor-agent.exe", ["--list-models"]]);
+assert.deepEqual(cliModelsCommand("C:\\Users\\me\\cursor-agent.ps1", "win32"), ["powershell.exe", [
+  "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+  "C:\\Users\\me\\cursor-agent.ps1", "--list-models",
+]]);
+assert.deepEqual(cliModelsCommand("cursor-agent", "darwin"), ["cursor-agent", ["--list-models"]]);
 assert.deepEqual(parseCliModels("Available models\r\n\r\nauto - Auto (default)\r\ncursor-grok-4.5-high - Cursor Grok 4.5\r\ncomposer-2.5-fast - Composer 2.5 Fast\r\n"), [
   { id: "cursor-grok-4.5-high", displayName: "Cursor Grok 4.5" },
   { id: "composer-2.5-fast", displayName: "Composer 2.5 Fast" },
