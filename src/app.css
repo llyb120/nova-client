@@ -899,6 +899,67 @@ button {
   min-width: 0;
 }
 
+/* Canvas transcript host fills the chat body; scrolling is simulated inside CanvasDOM. */
+.chat-transcript-host {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.chat-transcript-host.checkpoint-preview-fading .transcript-canvas {
+  opacity: 0.12;
+}
+.transcript-canvas {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  user-select: none;
+}
+.transcript-canvas-el {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  outline: none;
+  cursor: default;
+}
+.transcript-canvas-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0 0;
+}
+.transcript-canvas-overlay > .checkpoint-preview-banner,
+.transcript-canvas-overlay > .transcript-hint,
+.transcript-canvas-overlay > .canvas-user-edit,
+.transcript-canvas-overlay > .transcript-canvas-permissions {
+  pointer-events: auto;
+}
+.transcript-canvas-permissions {
+  margin-top: auto;
+  width: min(980px, 100%);
+  padding: 0 clamp(14px, 3vw, 28px) 8px;
+}
+.canvas-user-edit {
+  position: absolute;
+  z-index: 5;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 10px 12px;
+  box-shadow: var(--shadow-md);
+  max-width: calc(100% - 24px);
+}
+
 /* 会话时光机：Vega 已持有完整上下文，因此把每轮提示词变成可穿梭的时间刻度。 */
 .time-rail {
   position: relative;
