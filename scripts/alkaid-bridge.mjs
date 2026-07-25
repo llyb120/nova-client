@@ -2,8 +2,8 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
-import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext } from "./alkaid-slim-memory.mjs";
+import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -178,10 +178,15 @@ async function prompt(request, commands) {
     });
     if (compacted) memory.contextTokens = 0;
   }
+  const stripsCompletedReasoning = slimContext
+    && (resolved.model.api?.startsWith("openai") || resolved.model.api === "azure-openai-responses");
   let nativeMessages;
   if (!slimContext) nativeMessages = await loadMessages(request.sessionId);
   else if (memory.pendingMessages?.length) nativeMessages = memory.pendingMessages;
-  else nativeMessages = useFullContext ? memory.fullMessages : [];
+  else {
+    nativeMessages = useFullContext ? memory.fullMessages : [];
+    if (stripsCompletedReasoning) nativeMessages = stripCompletedOpenAIReasoning(nativeMessages);
+  }
   const runtime = await createAlkaidAgent({
     cwd: request.cwd,
     model: resolved.model,
@@ -204,6 +209,18 @@ async function prompt(request, commands) {
   let activeTools = 0;
   const idleTimeout = createAlkaidIdleTimeout({ onTimeout: () => runtime.agent.abort() });
   const toolItems = new Map();
+  let commandBusy = false;
+  let commandRevision = 0;
+  const steeringMessages = [];
+  const settlePendingInput = async () => {
+    // stdin delivery and the provider's final event can race. Require one quiet interval after
+    // the most recently processed command so a late steer is visible to hasQueuedMessages().
+    let observedRevision;
+    do {
+      observedRevision = commandRevision;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } while (commandBusy || commandRevision !== observedRevision);
+  };
   runtime.agent.subscribe((event) => {
     if (event.type === "message_end" && event.message.role === "assistant") {
       usage = mergeAlkaidUsage(usage, event.message.usage);
@@ -256,13 +273,20 @@ async function prompt(request, commands) {
         return;
       }
       if (command.action === "steer") {
-        const message = await alkaidUserMessage(command.parts);
-        const textPart = message.content.find((part) => part.type === "text");
-        if (textPart) {
-          if (slimContext) appendSlimTurn(memory, textPart.text);
-          textPart.text = await expandAlkaidSkillCommand(textPart.text, runtime.skills);
+        commandBusy = true;
+        try {
+          const message = await alkaidUserMessage(command.parts);
+          const textPart = message.content.find((part) => part.type === "text");
+          if (textPart) {
+            if (slimContext) appendSlimTurn(memory, textPart.text);
+            textPart.text = await expandAlkaidSkillCommand(textPart.text, runtime.skills);
+          }
+          runtime.agent.steer(message);
+          steeringMessages.push(message);
+          commandRevision += 1;
+        } finally {
+          commandBusy = false;
         }
-        runtime.agent.steer(message);
       }
     }
   })().catch((error) => send({ type: "error", message: error instanceof Error ? error.message : String(error) }));
@@ -273,6 +297,8 @@ async function prompt(request, commands) {
     const outcome = await runAlkaidPromptWithRetry(runtime.agent, promptText, input.images, {
       isCancelled: () => cancelled,
       runAttempt: (operation) => idleTimeout.run(operation),
+      settlePendingInput,
+      prepareRetry: () => restoreAlkaidSteeringForRetry(runtime.agent, steeringMessages),
       onRetry: ({ attempt, error }) => {
         send({
           type: "timing",
@@ -303,7 +329,10 @@ async function prompt(request, commands) {
             ? measuredTokens < maxContextTokens
             : JSON.stringify(runtime.agent.state.messages).length < maxContextChars;
           if (memory.turns.length < 10 && belowCapacity) {
-            memory.fullMessages = structuredClone(runtime.agent.state.messages);
+            const completedMessages = structuredClone(runtime.agent.state.messages);
+            memory.fullMessages = stripsCompletedReasoning
+              ? stripCompletedOpenAIReasoning(completedMessages)
+              : completedMessages;
           } else {
             // Enter stage two without summarizing yet. Its own usage is measured on the next turn.
             memory.contextStage = "slim";

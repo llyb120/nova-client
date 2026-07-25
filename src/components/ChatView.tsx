@@ -1,11 +1,19 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
-import { compactThread, chatScrollToBottomSignal, openThread, setState, state } from "../store";
-import type { Item, Thread } from "../types";
+import {
+  compactThread,
+  chatScrollToBottomSignal,
+  openThread,
+  setState,
+  setTimeMachineEditTarget,
+  state,
+  timeMachineChangedSignal,
+} from "../store";
+import type { Item, Thread, TimeMachineCheckpoint, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar } from "./icons";
+import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { PlanCard } from "./PlanCard";
@@ -14,35 +22,51 @@ import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
 
 interface VirtualObserverPool {
-  observer: IntersectionObserver;
-  callbacks: Map<Element, () => void>;
+  intersectionObserver: IntersectionObserver;
+  resizeObserver: ResizeObserver;
+  intersectionCallbacks: Map<Element, () => void>;
+  resizeCallbacks: Map<Element, () => void>;
 }
 
 const virtualObserverPools = new WeakMap<HTMLElement, VirtualObserverPool>();
 
 const virtualBuffer = (root: HTMLElement) => Math.max(1200, root.clientHeight * 2);
 
-/** 同一个滚动根只创建一个 IO；无论会话有多少轮，观察器数量都保持为 1。 */
-function observeVirtualGroup(root: HTMLElement, element: Element, callback: () => void) {
+/** 同一个滚动根只创建一组观察器；轮次再多也不新增 IO / ResizeObserver 实例。 */
+function observeVirtualGroup(
+  root: HTMLElement,
+  element: Element,
+  intersectionCallback: () => void,
+  resizeCallback: () => void,
+) {
   let pool = virtualObserverPools.get(root);
   if (!pool) {
-    const callbacks = new Map<Element, () => void>();
-    const observer = new IntersectionObserver(
+    const intersectionCallbacks = new Map<Element, () => void>();
+    const resizeCallbacks = new Map<Element, () => void>();
+    const intersectionObserver = new IntersectionObserver(
       (entries) => {
-        for (const entry of entries) callbacks.get(entry.target)?.();
+        for (const entry of entries) intersectionCallbacks.get(entry.target)?.();
       },
       { root, rootMargin: `${virtualBuffer(root)}px 0px` },
     );
-    pool = { observer, callbacks };
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) resizeCallbacks.get(entry.target)?.();
+    });
+    pool = { intersectionObserver, resizeObserver, intersectionCallbacks, resizeCallbacks };
     virtualObserverPools.set(root, pool);
   }
-  pool.callbacks.set(element, callback);
-  pool.observer.observe(element);
+  pool.intersectionCallbacks.set(element, intersectionCallback);
+  pool.resizeCallbacks.set(element, resizeCallback);
+  pool.intersectionObserver.observe(element);
+  pool.resizeObserver.observe(element);
   return () => {
-    pool!.observer.unobserve(element);
-    pool!.callbacks.delete(element);
-    if (pool!.callbacks.size === 0) {
-      pool!.observer.disconnect();
+    pool!.intersectionObserver.unobserve(element);
+    pool!.resizeObserver.unobserve(element);
+    pool!.intersectionCallbacks.delete(element);
+    pool!.resizeCallbacks.delete(element);
+    if (pool!.intersectionCallbacks.size === 0) {
+      pool!.intersectionObserver.disconnect();
+      pool!.resizeObserver.disconnect();
       virtualObserverPools.delete(root);
     }
   };
@@ -57,6 +81,7 @@ function observeVirtualGroup(root: HTMLElement, element: Element, callback: () =
  */
 function VirtualGroup(props: {
   group: Group;
+  index: number;
   active: boolean;
   /** 列表最后一组：始终挂载，保证新提示词有真实高度可供吸底 */
   keepMounted?: boolean;
@@ -133,15 +158,12 @@ function VirtualGroup(props: {
     if (!ref) return;
     const root = props.scrollEl();
     if (!root) return;
-    const stopObserving = observeVirtualGroup(root, ref, syncMounted);
-    const ro = new ResizeObserver(() => rememberHeight());
-    ro.observe(ref);
+    const stopObserving = observeVirtualGroup(root, ref, syncMounted, rememberHeight);
     // scroll 事件可以通过命中测试直接唤醒当前视口内的占位，并同步修正锚点。
     ref.mountVirtualGroup = mountContent;
     syncMounted();
     onCleanup(() => {
       stopObserving();
-      ro.disconnect();
       if (ref) delete ref.mountVirtualGroup;
     });
   });
@@ -155,6 +177,7 @@ function VirtualGroup(props: {
     <div
       ref={ref}
       class="vgroup"
+      data-group-index={props.index}
       // 仅卸载时使用缓存高度。挂载后必须恢复自然高度，否则内容折叠时旧 min-height
       // 会反过来撑住观察目标，ResizeObserver 无法测到变矮后的真实尺寸。
       style={height() > 0 && !mounted() ? { height: `${height()}px` } : undefined}
@@ -194,6 +217,7 @@ export function ChatView() {
   let innerRef: HTMLDivElement | undefined;
   const [stickToBottom, setStickToBottom] = createSignal(true);
   let scrollQueued = false;
+  let scrollFrame = 0;
   let lastScrollTop = 0;
   let lastVirtualMountTop = Number.NaN;
   let pointerActive = false;
@@ -202,16 +226,74 @@ export function ChatView() {
     state.permissions.filter((p) => p.threadId === state.currentId),
   );
 
+  const [previewItems, setPreviewItems] = createSignal<Item[] | null>(null);
+  const [previewCheckpointId, setPreviewCheckpointId] = createSignal<string | null>(null);
+  const [previewFading, setPreviewFading] = createSignal(false);
+  let previewRequest = 0;
+  let previewTimer: ReturnType<typeof setTimeout> | undefined;
+  const displayedItems = () => previewItems() ?? (state.items as Item[]);
   const groups = createMemo<ReturnType<typeof groupItems>>(
-    (prev) => groupItems(state.items as Item[], prev),
+    (prev) => groupItems(displayedItems(), prev),
     [],
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
   const lastGroupIndex = () => groups().length - 1;
+  const timeStops = createMemo(() => {
+    let turn = 0;
+    return groups().flatMap((group, index) => {
+      if (!group.user) return [];
+      turn++;
+      const text = group.user.text.replace(/\s+/g, " ").trim();
+      return [{ index, turn, label: text || `第 ${turn} 轮` }];
+    });
+  });
+  const [activeTimeIndex, setActiveTimeIndex] = createSignal(-1);
+  const latestTimeIndex = () => timeStops().at(-1)?.index ?? -1;
+
+  const syncTimeCursor = () => {
+    if (!scrollRef || !innerRef) return;
+    const stops = timeStops();
+    if (stops.length === 0) {
+      setActiveTimeIndex(-1);
+      return;
+    }
+    const elements = innerRef.querySelectorAll<HTMLElement>(":scope > .vgroup");
+    const top = scrollRef.getBoundingClientRect().top + 32;
+    let low = 0;
+    let high = stops.length;
+    // 时间点与分组都按垂直位置排序；二分把每帧的布局读取从 O(n) 降为 O(log n)。
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      const element = elements[stops[middle].index];
+      if (element && element.getBoundingClientRect().top <= top) low = middle + 1;
+      else high = middle;
+    }
+    setActiveTimeIndex(stops[Math.max(0, low - 1)].index);
+  };
+
+  const travelTo = (index: number) => {
+    const element = innerRef?.querySelector<VirtualGroupElement>(
+      `.vgroup[data-group-index="${index}"]`,
+    );
+    if (!element) return;
+    cancelBottomFollow();
+    element.mountVirtualGroup?.();
+    requestAnimationFrame(() => {
+      element.scrollIntoView({ block: "start" });
+      syncTimeCursor();
+    });
+  };
+
+  const returnToNow = () => {
+    enableBottomFollow();
+    setActiveTimeIndex(latestTimeIndex());
+  };
 
   /**
-   * IO 回调是异步的，拖动滚动条跨很长距离时可能晚一帧。先用命中测试找到一个锚点，
-   * 再沿 DOM 上下连续唤醒整个视口和两屏缓冲区；不会像坐标采样那样漏掉短分组。
+   * IO 回调是异步的，拖动滚动条跨很长距离时可能晚一帧。WebView2 的命中测试在合成器
+   * 快速滚动期间还可能停留在旧位置，因此不能依赖 elementFromPoint 找锚点。这里直接按
+   * wrapper 的当前几何位置二分出首个候选，再同步挂载视口和两屏缓冲区，避免工具详情占位
+   * 在快速滑动时整屏留白。
    */
   const mountVisibleVirtualGroups = (force = false) => {
     if (!scrollRef || !innerRef) return;
@@ -223,50 +305,29 @@ export function ChatView() {
     ) {
       return;
     }
-    const rootRect = scrollRef.getBoundingClientRect();
-    const x = Math.min(
-      rootRect.right - 1,
-      Math.max(rootRect.left + 1, rootRect.left + rootRect.width / 2),
-    );
-    const sampleY = [
-      rootRect.top + 1,
-      rootRect.top + rootRect.height / 2,
-      rootRect.bottom - 1,
-    ];
-    let anchor: VirtualGroupElement | undefined;
-    for (const y of sampleY) {
-      const hit = document.elementFromPoint(x, y)?.closest<VirtualGroupElement>(".vgroup");
-      if (hit && innerRef.contains(hit)) {
-        anchor = hit;
-        break;
-      }
-    }
-    if (!anchor) return;
+
+    const elements = innerRef.querySelectorAll<VirtualGroupElement>(":scope > .vgroup");
+    if (elements.length === 0) return;
     lastVirtualMountTop = scrollRef.scrollTop;
 
+    const rootRect = scrollRef.getBoundingClientRect();
     const top = rootRect.top - virtualBuffer(scrollRef);
     const bottom = rootRect.bottom + virtualBuffer(scrollRef);
-    const mount = (element: Element) => {
-      if (element instanceof HTMLDivElement && element.classList.contains("vgroup")) {
-        (element as VirtualGroupElement).mountVirtualGroup?.();
-      }
-    };
-    mount(anchor);
-    for (
-      let element = anchor.previousElementSibling;
-      element;
-      element = element.previousElementSibling
-    ) {
-      if (element.getBoundingClientRect().bottom < top) break;
-      mount(element);
+
+    // 分组在文档流中严格按垂直位置递增，先二分跳过缓冲区上方的绝大多数占位。
+    let low = 0;
+    let high = elements.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (elements[middle].getBoundingClientRect().bottom < top) low = middle + 1;
+      else high = middle;
     }
-    for (
-      let element = anchor.nextElementSibling;
-      element;
-      element = element.nextElementSibling
-    ) {
+
+    // mountContent 会同步恢复真实 DOM；每次重新读取位置，兼容缓存高度与真实高度有差异。
+    for (let index = low; index < elements.length; index++) {
+      const element = elements[index];
       if (element.getBoundingClientRect().top > bottom) break;
-      mount(element);
+      element.mountVirtualGroup?.();
     }
   };
 
@@ -297,8 +358,9 @@ export function ChatView() {
     pointerActive = true;
   };
 
-  const handleTranscriptScroll = () => {
+  const processTranscriptScroll = () => {
     mountVisibleVirtualGroups();
+    syncTimeCursor();
     const currentTop = scrollRef?.scrollTop ?? 0;
     const atBottom = isAtBottom();
     if (stickToBottom()) {
@@ -308,6 +370,15 @@ export function ChatView() {
       setStickToBottom(true);
     }
     lastScrollTop = currentTop;
+  };
+
+  // WebView2 一帧可能派发多次 scroll；几何读取与响应式更新最多每帧执行一次。
+  const handleTranscriptScroll = () => {
+    if (scrollFrame) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      processTranscriptScroll();
+    });
   };
 
   const pinBottom = () => {
@@ -339,7 +410,11 @@ export function ChatView() {
   };
 
   const finishPointerInteraction = () => {
-    handleTranscriptScroll();
+    if (scrollFrame) {
+      cancelAnimationFrame(scrollFrame);
+      scrollFrame = 0;
+    }
+    processTranscriptScroll();
     pointerActive = false;
     if (stickToBottom()) scheduleBottomPin();
   };
@@ -396,6 +471,7 @@ export function ChatView() {
     window.addEventListener("pointercancel", finishPointerInteraction, true);
     onCleanup(() => {
       ro.disconnect();
+      if (scrollFrame) cancelAnimationFrame(scrollFrame);
       window.removeEventListener("keydown", handleScrollKey, true);
       window.removeEventListener("pointerup", finishPointerInteraction, true);
       window.removeEventListener("pointercancel", finishPointerInteraction, true);
@@ -405,9 +481,18 @@ export function ChatView() {
   // 切换会话时从底部开始；后续尺寸变化由 ResizeObserver 持续对齐。
   createEffect((prevId: string | null | undefined) => {
     const id = state.currentId;
-    if (id !== prevId) enableBottomFollow();
+    if (id !== prevId) {
+      enableBottomFollow();
+      setActiveTimeIndex(latestTimeIndex());
+    }
     return id;
   }, undefined);
+
+  // 会话加载和新增轮次后，让“现在”刻度跟随最新用户轮次；回看过去时不抢走光标。
+  createEffect(() => {
+    const latest = latestTimeIndex();
+    if (stickToBottom()) setActiveTimeIndex(latest);
+  });
 
   // 主动发送新提示词时重新进入吸底，无动画直接显示最新内容。
   createEffect(() => {
@@ -419,6 +504,21 @@ export function ChatView() {
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   const [showShare, setShowShare] = createSignal(false);
+  const [timeline, setTimeline] = createSignal<TimeMachineTimeline | null>(null);
+  const [restoringCheckpoint] = createSignal<string | null>(null);
+
+  createEffect(() => {
+    const threadId = state.currentId;
+    void timeMachineChangedSignal();
+    setTimeline(null);
+    setPreviewItems(null);
+    setPreviewCheckpointId(null);
+    setTimeMachineEditTarget(null);
+    if (!threadId) return;
+    void api.getTimeMachineTimeline(threadId).then((value) => {
+      if (state.currentId === threadId) setTimeline(value);
+    }).catch(() => {});
+  });
 
   const currentMeta = createMemo(() =>
     state.threads.find((t) => t.id === state.currentId),
@@ -488,6 +588,198 @@ export function ChatView() {
     setEditing(true);
   };
 
+  type GraphNode = {
+    id: string;
+    checkpoint: TimeMachineCheckpoint | null;
+    previewCheckpoint: TimeMachineCheckpoint | null;
+    promptCount: number;
+    currentPromptIndex: number | null;
+    title: string;
+    x: number;
+    y: number;
+    current: boolean;
+    onCurrentPath: boolean;
+  };
+  type PromptTreeNode = Omit<GraphNode, "x" | "y"> & { children: PromptTreeNode[] };
+  const timelineGraph = createMemo(() => {
+    const checkpoints = timeline()?.checkpoints ?? [];
+    const root: PromptTreeNode = {
+      id: "__time_root__",
+      checkpoint: null,
+      previewCheckpoint: null,
+      promptCount: 0,
+      currentPromptIndex: null,
+      title: "会话开始",
+      current: false,
+      onCurrentPath: true,
+      children: [],
+    };
+    const insertPath = (
+      prompts: Array<{ id: number; text: string }>,
+      checkpoint: TimeMachineCheckpoint | null,
+      current: boolean,
+    ): PromptTreeNode => {
+      let parent = root;
+      if (prompts.length === 0 && checkpoint) {
+        root.checkpoint = checkpoint;
+        root.previewCheckpoint = checkpoint;
+      }
+      prompts.forEach((prompt, index) => {
+        const key = `${prompt.id}:${prompt.text}`;
+        let node = parent.children.find((child) => child.id === `${parent.id}/${key}`);
+        if (!node) {
+          node = {
+            id: `${parent.id}/${key}`,
+            checkpoint: null,
+            previewCheckpoint: checkpoint,
+            promptCount: index + 1,
+            currentPromptIndex: null,
+            title: prompt.text.trim() || `第 ${index + 1} 条提示词`,
+            current: false,
+            onCurrentPath: false,
+            children: [],
+          };
+          parent.children.push(node);
+        }
+        if (!node.previewCheckpoint && checkpoint) node.previewCheckpoint = checkpoint;
+        if (current) {
+          node.onCurrentPath = true;
+          node.currentPromptIndex = index;
+        }
+        parent = node;
+      });
+      if (checkpoint && prompts.length > 0) parent.checkpoint = checkpoint;
+      return parent;
+    };
+    for (const checkpoint of checkpoints) insertPath(checkpoint.prompts, checkpoint, false);
+    const currentPrompts = state.items.flatMap((item) =>
+      item.type === "user" ? [{ id: item.id, text: item.text }] : [],
+    );
+    const currentEnd = insertPath(currentPrompts, null, true);
+    currentEnd.current = true;
+
+    // 当前时间线固定占最左一列；每条旁支只在分叉时申请新列，之后沿该列向下。
+    const nodes: GraphNode[] = [];
+    const edgeIds: Array<{ from: string; to: string }> = [];
+    let nextLane = 1;
+    let maxPromptCount = currentPrompts.length;
+    const place = (node: PromptTreeNode, lane: number) => {
+      const nodeLane = node.onCurrentPath ? 0 : lane;
+      maxPromptCount = Math.max(maxPromptCount, node.promptCount);
+      nodes.push({ ...node, x: 18 + nodeLane * 26, y: 20 + (node.promptCount - 1) * 32 });
+
+      const children = [...node.children].sort(
+        (left, right) => Number(right.onCurrentPath) - Number(left.onCurrentPath),
+      );
+      let continuedBranch = false;
+      for (const child of children) {
+        edgeIds.push({ from: node.id, to: child.id });
+        if (child.onCurrentPath) {
+          place(child, 0);
+        } else if (!node.onCurrentPath && !continuedBranch) {
+          continuedBranch = true;
+          place(child, nodeLane);
+        } else {
+          place(child, nextLane++);
+        }
+      }
+    };
+    const roots = [...root.children].sort(
+      (left, right) => Number(right.onCurrentPath) - Number(left.onCurrentPath),
+    );
+    for (const node of roots) place(node, node.onCurrentPath ? 0 : nextLane++);
+
+    const positions = new Map(nodes.map((node) => [node.id, node]));
+    const nowY = 20 + Math.max(1, maxPromptCount) * 32;
+    const laneCount = Math.max(1, nextLane);
+    return {
+      nodes,
+      edges: edgeIds.flatMap((edge) => {
+        const from = positions.get(edge.from);
+        const to = positions.get(edge.to);
+        return from && to ? [{ from, to, current: from.onCurrentPath && to.onCurrentPath }] : [];
+      }),
+      laneCount,
+      width: Math.max(46, 18 + (laneCount - 1) * 26 + 28),
+      height: nowY + 28,
+    };
+  });
+  const switchPreview = (items: Item[] | null, checkpointId: string | null) => {
+    if (previewTimer) clearTimeout(previewTimer);
+    setPreviewFading(true);
+    previewTimer = setTimeout(() => {
+      setPreviewItems(items);
+      setPreviewCheckpointId(checkpointId);
+      requestAnimationFrame(() => setPreviewFading(false));
+    }, 90);
+  };
+  const itemsThroughPrompt = (items: Item[], promptCount: number) => {
+    if (promptCount <= 0) return [];
+    let seen = 0;
+    for (let index = 0; index < items.length; index++) {
+      if (items[index].type !== "user") continue;
+      seen++;
+      if (seen > promptCount) return items.slice(0, index);
+    }
+    return items;
+  };
+  const previewGraphNode = async (node: GraphNode) => {
+    const threadId = state.currentId;
+    if (!threadId || restoringCheckpoint()) return;
+    if (node.onCurrentPath) {
+      switchPreview(itemsThroughPrompt(state.items as Item[], node.promptCount), node.id);
+      return;
+    }
+    const checkpoint = node.previewCheckpoint;
+    if (!checkpoint) return;
+    const request = ++previewRequest;
+    try {
+      const preview = await api.getTimeMachineCheckpointPreview(threadId, checkpoint.id);
+      if (request === previewRequest && state.currentId === threadId) {
+        switchPreview(itemsThroughPrompt(preview.items as Item[], node.promptCount), node.id);
+      }
+    } catch {
+      // hover 预览失败不打断用户；右键时间跳跃时仍会显示真实恢复错误。
+    }
+  };
+  const scrollToCurrentPrompt = (promptIndex: number) => {
+    const scroll = () => {
+      const stop = timeStops()[promptIndex];
+      if (stop) travelTo(stop.index);
+    };
+    // 已经位于当前时间线时只滚动，不触发会话内容重绘。
+    if (!previewItems()) {
+      scroll();
+      return;
+    }
+
+    // 从旁支预览切回主线时，先恢复当前会话，再在新 DOM 中定位提示词。
+    previewRequest++;
+    if (previewTimer) clearTimeout(previewTimer);
+    setTimeMachineEditTarget(null);
+    setPreviewFading(true);
+    previewTimer = setTimeout(() => {
+      setPreviewItems(null);
+      setPreviewCheckpointId(null);
+      requestAnimationFrame(() => {
+        setPreviewFading(false);
+        requestAnimationFrame(scroll);
+      });
+    }, 90);
+  };
+  const returnToCurrentTimeline = () => {
+    previewRequest++;
+    if (previewTimer) clearTimeout(previewTimer);
+    setTimeMachineEditTarget(null);
+    setPreviewItems(null);
+    setPreviewCheckpointId(null);
+    setPreviewFading(false);
+    returnToNow();
+  };
+  onCleanup(() => {
+    previewRequest++;
+    if (previewTimer) clearTimeout(previewTimer);
+  });
   // 漫游 guest：召回会话——host 自动把完整快照 Flow 回来，收件箱里选项目接收
   const [recalling, setRecalling] = createSignal(false);
   const recall = async () => {
@@ -654,13 +946,24 @@ export function ChatView() {
       <div class="chat-body">
        <div
         class="transcript"
+        classList={{ "checkpoint-preview": !!previewItems(), "checkpoint-preview-fading": previewFading() }}
         ref={scrollRef}
         onScroll={handleTranscriptScroll}
         onWheel={handleWheel}
         onPointerDown={handlePointerDown}
       >
         <div class="transcript-inner" ref={innerRef}>
-          <Show when={state.items.length === 0 && !state.loadingThread}>
+          <Show when={previewCheckpointId()}>
+            <button
+              type="button"
+              class="checkpoint-preview-banner"
+              title="回到当前时间线和最新消息"
+              onClick={returnToCurrentTimeline}
+            >
+              回到当前时间线
+            </button>
+          </Show>
+          <Show when={displayedItems().length === 0 && !state.loadingThread}>
             <div class="transcript-hint">
               在下方输入任务，{agentLabel(state.agentKind)} 将在{" "}
               <code>{cwdDisplay()}</code> 中工作。
@@ -672,6 +975,7 @@ export function ChatView() {
               {(g, i) => (
                 <VirtualGroup
                   group={g}
+                  index={i()}
                   // 运行中所有尚未闭合的轮次都保持活跃：补充提示词会新开一组，
                   // 若只标最后一组，前面仍在跑的工具/输出会像已停止。
                   active={isRunning() && !g.turn}
@@ -685,6 +989,77 @@ export function ChatView() {
           <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
         </div>
       </div>
+      <Show when={timeStops().length > 0 && !isFireThread()}>
+        <aside
+          class="repo-time-machine"
+          aria-label="会话与工作目录分支时间线"
+          style={`--time-width:${Math.max(64, 38 + Math.min(5, timelineGraph().laneCount) * 26)}px`}
+        >
+          <div class="repo-time-machine-label">
+            <IconStopwatch size={17} />
+            <span>{restoringCheckpoint() ? "跳转中…" : "时光机"}</span>
+          </div>
+          <div class="repo-time-machine-track">
+            <div
+              class="repo-time-graph"
+              style={{ width: `${timelineGraph().width}px`, height: `${timelineGraph().height}px` }}
+            >
+              <svg class="repo-time-edges" width={timelineGraph().width} height={timelineGraph().height} aria-hidden="true">
+                <For each={timelineGraph().edges}>
+                  {(edge) => (
+                    <path
+                      classList={{ current: edge.current }}
+                      d={`M ${edge.from.x} ${edge.from.y} C ${edge.from.x} ${edge.from.y + 16}, ${edge.to.x} ${edge.to.y - 16}, ${edge.to.x} ${edge.to.y}`}
+                    />
+                  )}
+                </For>
+              </svg>
+              <For each={timelineGraph().nodes}>
+                {(node) => (
+                  <button
+                    type="button"
+                    class="repo-time-node"
+                    classList={{
+                      active: node.current,
+                      selected: node.id === timeline()?.currentCheckpointId,
+                      previewing: node.id === previewCheckpointId(),
+                      restoring: node.id === restoringCheckpoint(),
+                      "current-path": node.onCurrentPath,
+                      "off-current-path": !node.onCurrentPath,
+                    }}
+                    style={{ left: `${node.x}px`, top: `${node.y}px` }}
+                    title={node.title}
+                    disabled={!!restoringCheckpoint()}
+                    onClick={() => {
+                      if (node.currentPromptIndex !== null) {
+                        scrollToCurrentPrompt(node.currentPromptIndex);
+                      } else if (node.previewCheckpoint) {
+                        setTimeMachineEditTarget({
+                          threadId: state.currentId!,
+                          checkpointId: node.previewCheckpoint.id,
+                        });
+                        void previewGraphNode(node);
+                      }
+                    }}
+                  >
+                    <span class="repo-time-dot">{node.promptCount}</span>
+                  </button>
+                )}
+              </For>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="repo-time-now"
+            classList={{ active: stickToBottom() && !previewItems() }}
+            title="回到当前时间线的最新消息"
+            onClick={() => previewItems() ? returnToCurrentTimeline() : returnToNow()}
+          >
+            <span class="repo-time-now-pulse" />
+            现在
+          </button>
+        </aside>
+      </Show>
       <Show when={stageThreads().length > 1}>
         <aside class="stage-rail" aria-label="会话阶段导航">
           <div class="stage-rail-count">{stageThreads().length} 个事件</div>
