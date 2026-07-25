@@ -14,35 +14,51 @@ import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
 
 interface VirtualObserverPool {
-  observer: IntersectionObserver;
-  callbacks: Map<Element, () => void>;
+  intersectionObserver: IntersectionObserver;
+  resizeObserver: ResizeObserver;
+  intersectionCallbacks: Map<Element, () => void>;
+  resizeCallbacks: Map<Element, () => void>;
 }
 
 const virtualObserverPools = new WeakMap<HTMLElement, VirtualObserverPool>();
 
 const virtualBuffer = (root: HTMLElement) => Math.max(1200, root.clientHeight * 2);
 
-/** 同一个滚动根只创建一个 IO；无论会话有多少轮，观察器数量都保持为 1。 */
-function observeVirtualGroup(root: HTMLElement, element: Element, callback: () => void) {
+/** 同一个滚动根只创建一组观察器；轮次再多也不新增 IO / ResizeObserver 实例。 */
+function observeVirtualGroup(
+  root: HTMLElement,
+  element: Element,
+  intersectionCallback: () => void,
+  resizeCallback: () => void,
+) {
   let pool = virtualObserverPools.get(root);
   if (!pool) {
-    const callbacks = new Map<Element, () => void>();
-    const observer = new IntersectionObserver(
+    const intersectionCallbacks = new Map<Element, () => void>();
+    const resizeCallbacks = new Map<Element, () => void>();
+    const intersectionObserver = new IntersectionObserver(
       (entries) => {
-        for (const entry of entries) callbacks.get(entry.target)?.();
+        for (const entry of entries) intersectionCallbacks.get(entry.target)?.();
       },
       { root, rootMargin: `${virtualBuffer(root)}px 0px` },
     );
-    pool = { observer, callbacks };
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) resizeCallbacks.get(entry.target)?.();
+    });
+    pool = { intersectionObserver, resizeObserver, intersectionCallbacks, resizeCallbacks };
     virtualObserverPools.set(root, pool);
   }
-  pool.callbacks.set(element, callback);
-  pool.observer.observe(element);
+  pool.intersectionCallbacks.set(element, intersectionCallback);
+  pool.resizeCallbacks.set(element, resizeCallback);
+  pool.intersectionObserver.observe(element);
+  pool.resizeObserver.observe(element);
   return () => {
-    pool!.observer.unobserve(element);
-    pool!.callbacks.delete(element);
-    if (pool!.callbacks.size === 0) {
-      pool!.observer.disconnect();
+    pool!.intersectionObserver.unobserve(element);
+    pool!.resizeObserver.unobserve(element);
+    pool!.intersectionCallbacks.delete(element);
+    pool!.resizeCallbacks.delete(element);
+    if (pool!.intersectionCallbacks.size === 0) {
+      pool!.intersectionObserver.disconnect();
+      pool!.resizeObserver.disconnect();
       virtualObserverPools.delete(root);
     }
   };
@@ -134,15 +150,12 @@ function VirtualGroup(props: {
     if (!ref) return;
     const root = props.scrollEl();
     if (!root) return;
-    const stopObserving = observeVirtualGroup(root, ref, syncMounted);
-    const ro = new ResizeObserver(() => rememberHeight());
-    ro.observe(ref);
+    const stopObserving = observeVirtualGroup(root, ref, syncMounted, rememberHeight);
     // scroll 事件可以通过命中测试直接唤醒当前视口内的占位，并同步修正锚点。
     ref.mountVirtualGroup = mountContent;
     syncMounted();
     onCleanup(() => {
       stopObserving();
-      ro.disconnect();
       if (ref) delete ref.mountVirtualGroup;
     });
   });
@@ -196,6 +209,7 @@ export function ChatView() {
   let innerRef: HTMLDivElement | undefined;
   const [stickToBottom, setStickToBottom] = createSignal(true);
   let scrollQueued = false;
+  let scrollFrame = 0;
   let lastScrollTop = 0;
   let lastVirtualMountTop = Number.NaN;
   let pointerActive = false;
@@ -223,17 +237,24 @@ export function ChatView() {
   const latestTimeIndex = () => timeStops().at(-1)?.index ?? -1;
 
   const syncTimeCursor = () => {
-    if (!scrollRef) return;
-    const top = scrollRef.getBoundingClientRect().top + 32;
-    let current = timeStops()[0]?.index ?? -1;
-    for (const stop of timeStops()) {
-      const element = innerRef?.querySelector<HTMLElement>(
-        `.vgroup[data-group-index="${stop.index}"]`,
-      );
-      if (element && element.getBoundingClientRect().top <= top) current = stop.index;
-      else if (element) break;
+    if (!scrollRef || !innerRef) return;
+    const stops = timeStops();
+    if (stops.length === 0) {
+      setActiveTimeIndex(-1);
+      return;
     }
-    setActiveTimeIndex(current);
+    const elements = innerRef.querySelectorAll<HTMLElement>(":scope > .vgroup");
+    const top = scrollRef.getBoundingClientRect().top + 32;
+    let low = 0;
+    let high = stops.length;
+    // 时间点与分组都按垂直位置排序；二分把每帧的布局读取从 O(n) 降为 O(log n)。
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      const element = elements[stops[middle].index];
+      if (element && element.getBoundingClientRect().top <= top) low = middle + 1;
+      else high = middle;
+    }
+    setActiveTimeIndex(stops[Math.max(0, low - 1)].index);
   };
 
   const travelTo = (index: number) => {
@@ -323,7 +344,7 @@ export function ChatView() {
     pointerActive = true;
   };
 
-  const handleTranscriptScroll = () => {
+  const processTranscriptScroll = () => {
     mountVisibleVirtualGroups();
     syncTimeCursor();
     const currentTop = scrollRef?.scrollTop ?? 0;
@@ -335,6 +356,15 @@ export function ChatView() {
       setStickToBottom(true);
     }
     lastScrollTop = currentTop;
+  };
+
+  // WebView2 一帧可能派发多次 scroll；几何读取与响应式更新最多每帧执行一次。
+  const handleTranscriptScroll = () => {
+    if (scrollFrame) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      processTranscriptScroll();
+    });
   };
 
   const pinBottom = () => {
@@ -366,7 +396,11 @@ export function ChatView() {
   };
 
   const finishPointerInteraction = () => {
-    handleTranscriptScroll();
+    if (scrollFrame) {
+      cancelAnimationFrame(scrollFrame);
+      scrollFrame = 0;
+    }
+    processTranscriptScroll();
     pointerActive = false;
     if (stickToBottom()) scheduleBottomPin();
   };
@@ -423,6 +457,7 @@ export function ChatView() {
     window.addEventListener("pointercancel", finishPointerInteraction, true);
     onCleanup(() => {
       ro.disconnect();
+      if (scrollFrame) cancelAnimationFrame(scrollFrame);
       window.removeEventListener("keydown", handleScrollKey, true);
       window.removeEventListener("pointerup", finishPointerInteraction, true);
       window.removeEventListener("pointercancel", finishPointerInteraction, true);
