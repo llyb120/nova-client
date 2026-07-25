@@ -255,8 +255,10 @@ export function ChatView() {
   };
 
   /**
-   * IO 回调是异步的，拖动滚动条跨很长距离时可能晚一帧。先用命中测试找到一个锚点，
-   * 再沿 DOM 上下连续唤醒整个视口和两屏缓冲区；不会像坐标采样那样漏掉短分组。
+   * IO 回调是异步的，拖动滚动条跨很长距离时可能晚一帧。WebView2 的命中测试在合成器
+   * 快速滚动期间还可能停留在旧位置，因此不能依赖 elementFromPoint 找锚点。这里直接按
+   * wrapper 的当前几何位置二分出首个候选，再同步挂载视口和两屏缓冲区，避免工具详情占位
+   * 在快速滑动时整屏留白。
    */
   const mountVisibleVirtualGroups = (force = false) => {
     if (!scrollRef || !innerRef) return;
@@ -268,50 +270,29 @@ export function ChatView() {
     ) {
       return;
     }
-    const rootRect = scrollRef.getBoundingClientRect();
-    const x = Math.min(
-      rootRect.right - 1,
-      Math.max(rootRect.left + 1, rootRect.left + rootRect.width / 2),
-    );
-    const sampleY = [
-      rootRect.top + 1,
-      rootRect.top + rootRect.height / 2,
-      rootRect.bottom - 1,
-    ];
-    let anchor: VirtualGroupElement | undefined;
-    for (const y of sampleY) {
-      const hit = document.elementFromPoint(x, y)?.closest<VirtualGroupElement>(".vgroup");
-      if (hit && innerRef.contains(hit)) {
-        anchor = hit;
-        break;
-      }
-    }
-    if (!anchor) return;
+
+    const elements = innerRef.querySelectorAll<VirtualGroupElement>(":scope > .vgroup");
+    if (elements.length === 0) return;
     lastVirtualMountTop = scrollRef.scrollTop;
 
+    const rootRect = scrollRef.getBoundingClientRect();
     const top = rootRect.top - virtualBuffer(scrollRef);
     const bottom = rootRect.bottom + virtualBuffer(scrollRef);
-    const mount = (element: Element) => {
-      if (element instanceof HTMLDivElement && element.classList.contains("vgroup")) {
-        (element as VirtualGroupElement).mountVirtualGroup?.();
-      }
-    };
-    mount(anchor);
-    for (
-      let element = anchor.previousElementSibling;
-      element;
-      element = element.previousElementSibling
-    ) {
-      if (element.getBoundingClientRect().bottom < top) break;
-      mount(element);
+
+    // 分组在文档流中严格按垂直位置递增，先二分跳过缓冲区上方的绝大多数占位。
+    let low = 0;
+    let high = elements.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (elements[middle].getBoundingClientRect().bottom < top) low = middle + 1;
+      else high = middle;
     }
-    for (
-      let element = anchor.nextElementSibling;
-      element;
-      element = element.nextElementSibling
-    ) {
+
+    // mountContent 会同步恢复真实 DOM；每次重新读取位置，兼容缓存高度与真实高度有差异。
+    for (let index = low; index < elements.length; index++) {
+      const element = elements[index];
       if (element.getBoundingClientRect().top > bottom) break;
-      mount(element);
+      element.mountVirtualGroup?.();
     }
   };
 
