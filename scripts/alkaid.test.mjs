@@ -33,6 +33,7 @@ import {
   OPENAI_TOOL_OUTPUT_MAX_CHARS,
   OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
   resolveAlkaidShellConfig,
+  restoreAlkaidSteeringForRetry,
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
@@ -308,6 +309,88 @@ test("provider stream disconnects retry silently and preserve context", async ()
   assert.equal(isRetryableAlkaidProviderError("HTTP 429 Too Many Requests"), true);
   assert.equal(isRetryableAlkaidProviderError("rate limit exceeded"), true);
   assert.equal(isRetryableAlkaidProviderError("HTTP 401 unauthorized"), false);
+});
+
+test("a steer queued at the provider completion boundary is not ignored", async () => {
+  const original = { role: "user", content: [{ type: "text", text: "original" }], timestamp: Date.now() };
+  const first = { role: "assistant", content: [{ type: "text", text: "first answer" }], stopReason: "stop" };
+  const steer = { role: "user", content: [{ type: "text", text: "latest instruction" }], timestamp: Date.now() };
+  const final = { role: "assistant", content: [{ type: "text", text: "followed latest" }], stopReason: "stop" };
+  let queued = false;
+  let injected = false;
+  let continues = 0;
+  const agent = {
+    state: { messages: [] },
+    async prompt() { this.state.messages.push(original, first); },
+    hasQueuedMessages() { return queued; },
+    async continue() {
+      continues += 1;
+      queued = false;
+      this.state.messages.push(steer, final);
+    },
+  };
+  const outcome = await runAlkaidPromptWithRetry(agent, "original", [], {
+    settlePendingInput: async () => {
+      if (!injected) {
+        injected = true;
+        queued = true;
+      }
+    },
+  });
+  assert.equal(continues, 1);
+  assert.equal(outcome.last, final);
+  assert.deepEqual(agent.state.messages, [original, first, steer, final]);
+});
+
+test("timeout retry preserves a steer that was already injected before thinking stalled", async () => {
+  const original = { role: "user", content: [{ type: "text", text: "original" }] };
+  const earlier = { role: "assistant", content: [{ type: "text", text: "earlier" }], stopReason: "stop" };
+  const latest = { role: "user", content: [{ type: "text", text: "latest instruction" }] };
+  let preparedTail;
+  const agent = {
+    state: { messages: [] },
+    async prompt() {
+      this.state.messages.push(
+        original,
+        earlier,
+        latest,
+        { role: "assistant", content: [{ type: "thinking", thinking: "stalled" }], stopReason: "toolUse" },
+      );
+      return new Promise(() => {});
+    },
+    abort() {
+      this.state.messages.push({ role: "assistant", content: [], stopReason: "aborted" });
+    },
+    async continue() {
+      assert.equal(this.state.messages.at(-1), latest);
+      this.state.messages.push({ role: "assistant", content: [{ type: "text", text: "used latest" }], stopReason: "stop" });
+    },
+  };
+  const idleTimeout = createAlkaidIdleTimeout({ timeoutMs: 5, onTimeout: () => agent.abort() });
+  const outcome = await runAlkaidPromptWithRetry(agent, "original", [], {
+    retryDelaysMs: [0],
+    sleep: async () => {},
+    runAttempt: (operation) => idleTimeout.run(operation),
+    prepareRetry: () => { preparedTail = agent.state.messages.at(-1); },
+  });
+  assert.equal(preparedTail, latest);
+  assert.equal(outcome.last.content[0].text, "used latest");
+  assert.deepEqual(agent.state.messages, [original, earlier, latest, outcome.last]);
+});
+
+test("timeout retry rebuilds steering that was still queued in the aborted run", () => {
+  const injected = { role: "user", content: [{ type: "text", text: "already injected" }] };
+  const queued = { role: "user", content: [{ type: "text", text: "still queued" }] };
+  const restored = [];
+  let cleared = 0;
+  const agent = {
+    state: { messages: [injected] },
+    clearSteeringQueue() { cleared += 1; },
+    steer(message) { restored.push(message); },
+  };
+  assert.equal(restoreAlkaidSteeringForRetry(agent, [injected, queued]), 1);
+  assert.equal(cleared, 1);
+  assert.deepEqual(restored, [queued]);
 });
 
 test("provider inactivity aborts and retries automatically", async () => {

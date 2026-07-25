@@ -190,6 +190,21 @@ export function isRetryableAlkaidProviderError(error) {
   ].some((fragment) => message.includes(fragment));
 }
 
+export function restoreAlkaidSteeringForRetry(agent, steeringMessages = []) {
+  const transcript = new Set(agent.state.messages);
+  // Rebuild PI's private steering queue from bridge-owned messages. A prompt already injected
+  // into the transcript stays there; a prompt still waiting in the old run is queued again.
+  // This makes timeout recovery independent of queue state left behind by the aborted run.
+  agent.clearSteeringQueue?.();
+  let restored = 0;
+  for (const message of steeringMessages) {
+    if (transcript.has(message)) continue;
+    agent.steer(message);
+    restored += 1;
+  }
+  return restored;
+}
+
 export function createAlkaidIdleTimeout(options = {}) {
   const timeoutMs = options.timeoutMs ?? ALKAID_PROVIDER_IDLE_TIMEOUT_MS;
   const onTimeout = options.onTimeout ?? (() => {});
@@ -283,7 +298,19 @@ export async function runAlkaidPromptWithRetry(agent, input, images, options = {
       last?.role === "assistant" && last.stopReason === "error" ? last.errorMessage : undefined
     );
     if (!providerError) {
-      return { last, retries, cancelled: last?.role === "assistant" && last.stopReason === "aborted" };
+      const cancelled = last?.role === "assistant" && last.stopReason === "aborted";
+      // A steer can arrive after PI's final queue poll but before the run settles. Give the
+      // bridge reader a short quiescence window, then drain anything queued instead of ending
+      // the turn and silently orphaning the user's latest prompt. This is especially likely
+      // around an idle-timeout retry because the turn stays open across multiple provider runs.
+      if (!cancelled && !isCancelled()) {
+        await options.settlePendingInput?.();
+        if (typeof agent.hasQueuedMessages === "function" && agent.hasQueuedMessages()) {
+          operation = () => agent.continue();
+          continue;
+        }
+      }
+      return { last, retries, cancelled };
     }
     if (retries >= retryDelaysMs.length || !isRetryableAlkaidProviderError(providerError)) {
       if (thrownError) throw thrownError;
@@ -297,6 +324,9 @@ export async function runAlkaidPromptWithRetry(agent, input, images, options = {
     } else if (last?.role === "assistant") {
       agent.state.messages = agent.state.messages.slice(0, -1);
     }
+    // The aborted provider run may have consumed a steer into the transcript or left it in
+    // PI's private queue. Let the bridge reconstruct that state before continue() starts.
+    await options.prepareRetry?.({ attempt: retries + 1, error: providerError });
     options.onRetry?.({ attempt: retries + 1, error: providerError });
     await sleep(retryDelaysMs[retries]);
     retries += 1;
