@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
-import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import {
   alkaidPromptInput,
   alkaidSkillsRoot,
@@ -201,6 +201,36 @@ test("Vega slim context keeps 10 conclusions and preserves interrupted prompts",
     userPrompts: ["interrupted prompt", "replacement prompt"],
     conclusion: "latest conclusion",
   });
+});
+
+test("Vega slim context removes completed OpenAI reasoning without breaking tool result call ids", () => {
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "inspect" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "private summary", thinkingSignature: "{\"id\":\"rs_1\"}" },
+        { type: "toolCall", id: "call_1|fc_1", name: "read", arguments: { path: "a.txt" } },
+      ],
+    },
+    { role: "toolResult", toolCallId: "call_1|fc_1", content: [{ type: "text", text: "contents" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "final reasoning" },
+        { type: "text", text: "done" },
+      ],
+    },
+  ];
+
+  const stripped = stripCompletedOpenAIReasoning(messages);
+  assert.deepEqual(stripped[1].content, [
+    { type: "toolCall", id: "call_1", name: "read", arguments: { path: "a.txt" } },
+  ]);
+  assert.equal(stripped[2], messages[2]);
+  assert.deepEqual(stripped[3].content, [{ type: "text", text: "done" }]);
+  assert.equal(messages[1].content[0].type, "thinking");
+  assert.equal(messages[1].content[1].id, "call_1|fc_1");
 });
 
 test("Vega slim context keeps an interrupted turn as native messages", () => {

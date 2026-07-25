@@ -126,6 +126,33 @@ export async function compactSlimMemory(
   return true;
 }
 
+/**
+ * Completed OpenAI turns do not need to replay exposed reasoning summaries/state. Responses tool
+ * calls also carry an item id paired with that reasoning item, so drop the item-id suffix while
+ * retaining the call id used by the matching tool result. Call this only for completed turns;
+ * interrupted/native trajectories must remain untouched.
+ */
+export function stripCompletedOpenAIReasoning(messages) {
+  return (messages ?? []).map((message) => {
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
+    let changed = false;
+    const content = [];
+    for (const block of message.content) {
+      if (block?.type === "thinking") {
+        changed = true;
+        continue;
+      }
+      if (block?.type === "toolCall" && typeof block.id === "string" && block.id.includes("|")) {
+        changed = true;
+        content.push({ ...block, id: block.id.split("|", 1)[0] });
+      } else {
+        content.push(block);
+      }
+    }
+    return changed ? { ...message, content } : message;
+  });
+}
+
 export function contextTokensFromMessages(messages) {
   let tokens = 0;
   for (const message of messages ?? []) {
