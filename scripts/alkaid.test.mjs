@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
-import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import {
   alkaidPromptInput,
   alkaidSkillsRoot,
@@ -33,6 +33,7 @@ import {
   OPENAI_TOOL_OUTPUT_MAX_CHARS,
   OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
   resolveAlkaidShellConfig,
+  restoreAlkaidSteeringForRetry,
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
@@ -202,6 +203,36 @@ test("Vega slim context keeps 10 conclusions and preserves interrupted prompts",
   });
 });
 
+test("Vega slim context removes completed OpenAI reasoning without breaking tool result call ids", () => {
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "inspect" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "private summary", thinkingSignature: "{\"id\":\"rs_1\"}" },
+        { type: "toolCall", id: "call_1|fc_1", name: "read", arguments: { path: "a.txt" } },
+      ],
+    },
+    { role: "toolResult", toolCallId: "call_1|fc_1", content: [{ type: "text", text: "contents" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "final reasoning" },
+        { type: "text", text: "done" },
+      ],
+    },
+  ];
+
+  const stripped = stripCompletedOpenAIReasoning(messages);
+  assert.deepEqual(stripped[1].content, [
+    { type: "toolCall", id: "call_1", name: "read", arguments: { path: "a.txt" } },
+  ]);
+  assert.equal(stripped[2], messages[2]);
+  assert.deepEqual(stripped[3].content, [{ type: "text", text: "done" }]);
+  assert.equal(messages[1].content[0].type, "thinking");
+  assert.equal(messages[1].content[1].id, "call_1|fc_1");
+});
+
 test("Vega slim context keeps an interrupted turn as native messages", () => {
   const memory = createSlimMemory();
   appendSlimTurn(memory, "completed prompt");
@@ -308,6 +339,88 @@ test("provider stream disconnects retry silently and preserve context", async ()
   assert.equal(isRetryableAlkaidProviderError("HTTP 429 Too Many Requests"), true);
   assert.equal(isRetryableAlkaidProviderError("rate limit exceeded"), true);
   assert.equal(isRetryableAlkaidProviderError("HTTP 401 unauthorized"), false);
+});
+
+test("a steer queued at the provider completion boundary is not ignored", async () => {
+  const original = { role: "user", content: [{ type: "text", text: "original" }], timestamp: Date.now() };
+  const first = { role: "assistant", content: [{ type: "text", text: "first answer" }], stopReason: "stop" };
+  const steer = { role: "user", content: [{ type: "text", text: "latest instruction" }], timestamp: Date.now() };
+  const final = { role: "assistant", content: [{ type: "text", text: "followed latest" }], stopReason: "stop" };
+  let queued = false;
+  let injected = false;
+  let continues = 0;
+  const agent = {
+    state: { messages: [] },
+    async prompt() { this.state.messages.push(original, first); },
+    hasQueuedMessages() { return queued; },
+    async continue() {
+      continues += 1;
+      queued = false;
+      this.state.messages.push(steer, final);
+    },
+  };
+  const outcome = await runAlkaidPromptWithRetry(agent, "original", [], {
+    settlePendingInput: async () => {
+      if (!injected) {
+        injected = true;
+        queued = true;
+      }
+    },
+  });
+  assert.equal(continues, 1);
+  assert.equal(outcome.last, final);
+  assert.deepEqual(agent.state.messages, [original, first, steer, final]);
+});
+
+test("timeout retry preserves a steer that was already injected before thinking stalled", async () => {
+  const original = { role: "user", content: [{ type: "text", text: "original" }] };
+  const earlier = { role: "assistant", content: [{ type: "text", text: "earlier" }], stopReason: "stop" };
+  const latest = { role: "user", content: [{ type: "text", text: "latest instruction" }] };
+  let preparedTail;
+  const agent = {
+    state: { messages: [] },
+    async prompt() {
+      this.state.messages.push(
+        original,
+        earlier,
+        latest,
+        { role: "assistant", content: [{ type: "thinking", thinking: "stalled" }], stopReason: "toolUse" },
+      );
+      return new Promise(() => {});
+    },
+    abort() {
+      this.state.messages.push({ role: "assistant", content: [], stopReason: "aborted" });
+    },
+    async continue() {
+      assert.equal(this.state.messages.at(-1), latest);
+      this.state.messages.push({ role: "assistant", content: [{ type: "text", text: "used latest" }], stopReason: "stop" });
+    },
+  };
+  const idleTimeout = createAlkaidIdleTimeout({ timeoutMs: 5, onTimeout: () => agent.abort() });
+  const outcome = await runAlkaidPromptWithRetry(agent, "original", [], {
+    retryDelaysMs: [0],
+    sleep: async () => {},
+    runAttempt: (operation) => idleTimeout.run(operation),
+    prepareRetry: () => { preparedTail = agent.state.messages.at(-1); },
+  });
+  assert.equal(preparedTail, latest);
+  assert.equal(outcome.last.content[0].text, "used latest");
+  assert.deepEqual(agent.state.messages, [original, earlier, latest, outcome.last]);
+});
+
+test("timeout retry rebuilds steering that was still queued in the aborted run", () => {
+  const injected = { role: "user", content: [{ type: "text", text: "already injected" }] };
+  const queued = { role: "user", content: [{ type: "text", text: "still queued" }] };
+  const restored = [];
+  let cleared = 0;
+  const agent = {
+    state: { messages: [injected] },
+    clearSteeringQueue() { cleared += 1; },
+    steer(message) { restored.push(message); },
+  };
+  assert.equal(restoreAlkaidSteeringForRetry(agent, [injected, queued]), 1);
+  assert.equal(cleared, 1);
+  assert.deepEqual(restored, [queued]);
 });
 
 test("provider inactivity aborts and retries automatically", async () => {
@@ -630,9 +743,10 @@ test("system prompt keeps stable Alkaid policy before dynamic cwd/skills", () =>
   assert.ok(stableIndex >= 0);
   assert.ok(separatorIndex > stableIndex);
   assert.ok(cwdIndex > separatorIndex);
-  assert.match(prompt, /回复默认简洁，保留完整技术信息/);
-  assert.match(prompt, /省略寒暄、自我指代、问题复述/);
-  assert.match(prompt, /用户明确要求详细说明时再展开/);
+  assert.match(prompt, /回复默认简洁专业，使用完整句子并保留必要解释/);
+  assert.match(prompt, /省略寒暄、套话、复述、工具旁白和重复总结/);
+  assert.match(prompt, /简单问题简答，复杂问题按需展开/);
+  assert.match(prompt, /按用户要求增减细节/);
   assert.match(prompt, /必须在一次 read_files 调用中合并读取/);
   assert.match(prompt, /禁止连续调用多个 read/);
 });

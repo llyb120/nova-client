@@ -190,6 +190,21 @@ export function isRetryableAlkaidProviderError(error) {
   ].some((fragment) => message.includes(fragment));
 }
 
+export function restoreAlkaidSteeringForRetry(agent, steeringMessages = []) {
+  const transcript = new Set(agent.state.messages);
+  // Rebuild PI's private steering queue from bridge-owned messages. A prompt already injected
+  // into the transcript stays there; a prompt still waiting in the old run is queued again.
+  // This makes timeout recovery independent of queue state left behind by the aborted run.
+  agent.clearSteeringQueue?.();
+  let restored = 0;
+  for (const message of steeringMessages) {
+    if (transcript.has(message)) continue;
+    agent.steer(message);
+    restored += 1;
+  }
+  return restored;
+}
+
 export function createAlkaidIdleTimeout(options = {}) {
   const timeoutMs = options.timeoutMs ?? ALKAID_PROVIDER_IDLE_TIMEOUT_MS;
   const onTimeout = options.onTimeout ?? (() => {});
@@ -283,7 +298,19 @@ export async function runAlkaidPromptWithRetry(agent, input, images, options = {
       last?.role === "assistant" && last.stopReason === "error" ? last.errorMessage : undefined
     );
     if (!providerError) {
-      return { last, retries, cancelled: last?.role === "assistant" && last.stopReason === "aborted" };
+      const cancelled = last?.role === "assistant" && last.stopReason === "aborted";
+      // A steer can arrive after PI's final queue poll but before the run settles. Give the
+      // bridge reader a short quiescence window, then drain anything queued instead of ending
+      // the turn and silently orphaning the user's latest prompt. This is especially likely
+      // around an idle-timeout retry because the turn stays open across multiple provider runs.
+      if (!cancelled && !isCancelled()) {
+        await options.settlePendingInput?.();
+        if (typeof agent.hasQueuedMessages === "function" && agent.hasQueuedMessages()) {
+          operation = () => agent.continue();
+          continue;
+        }
+      }
+      return { last, retries, cancelled };
     }
     if (retries >= retryDelaysMs.length || !isRetryableAlkaidProviderError(providerError)) {
       if (thrownError) throw thrownError;
@@ -297,6 +324,9 @@ export async function runAlkaidPromptWithRetry(agent, input, images, options = {
     } else if (last?.role === "assistant") {
       agent.state.messages = agent.state.messages.slice(0, -1);
     }
+    // The aborted provider run may have consumed a steer into the transcript or left it in
+    // PI's private queue. Let the bridge reconstruct that state before continue() starts.
+    await options.prepareRetry?.({ attempt: retries + 1, error: providerError });
     options.onRetry?.({ attempt: retries + 1, error: providerError });
     await sleep(retryDelaysMs[retries]);
     retries += 1;
@@ -527,7 +557,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
 
   const stableParts = [
     "你是 Vega：高效、简单、面向软件工程结果。",
-    "回复默认简洁，保留完整技术信息。直接给结论或结果；省略寒暄、自我指代、问题复述、无关背景、工具调用旁白和重复总结。能用短句或短列表就不用长段落；简单问题尽量一两句。除非用户要求，不用装饰性表格，不粘贴长日志，只引用决定性错误。代码、命令、API 名称和错误原文保持准确。不得为简短牺牲正确性、安全警告、不可逆操作确认或必要步骤；用户明确要求详细说明时再展开。",
+    "回复默认简洁专业，使用完整句子并保留必要解释。先给结论，再给行动所需信息。省略寒暄、套话、复述、工具旁白和重复总结。简单问题简答，复杂问题按需展开。不用装饰性表格或长日志，只引关键错误。代码、命令、API 和错误原文须准确；安全警告、不可逆操作确认和必要步骤不得省略。按用户要求增减细节。",
     `Available tools:\n${toolLines.join("\n")}`,
     "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。每次准备读取前，先汇总当前已知目标：仅有一个目标时使用 read；同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，必须在一次 read_files 调用中合并读取，并为每个文件分别设置必要的 offset/limit。禁止连续调用多个 read，也禁止用并行封装的多个 read 代替 read_files；想按顺序理解文件不构成读取依赖。只有后一个目标的路径或读取范围必须由前一次结果确定、目标不是 UTF-8 文本，或当前确实仅需一个文件时，才使用 read。后续新发现多个独立文本目标时，下一读取阶段仍须合并使用 read_files。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；大文件禁止无目的全量读取。修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
     "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；Git 仓库中搜索已跟踪文件时优先使用 `git grep`，需要搜索未跟踪文件时使用 `rg`，并默认遵守 `.gitignore`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。",
