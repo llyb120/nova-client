@@ -17,6 +17,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -33,6 +34,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
 const REMOTE_WS_COMPRESS_AT: usize = 1024;
 const REMOTE_WS_MAX_PAYLOAD: u64 = 32 << 20;
 const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
+static NEXT_REMOTE_REQUEST_ID: AtomicI64 = AtomicI64::new(1);
 /// 首次连接只预热最新会话；其余历史按点击请求，兼顾首屏速度与流量。
 const PREFETCH_RECENT: usize = 1;
 const REMOTE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
@@ -272,14 +274,16 @@ async fn remote_socket_once(
     // 恢复后再次短暂断线，仍可能沿用 30 秒退避，表现为远控长时间离线。
     *backoff = Duration::from_secs(1);
     let (mut writer, mut reader) = socket.split();
-    let mut request_id = 0i64;
     let mut pending: Option<(i64, oneshot::Sender<Result<ServerResponse, String>>)> = None;
 
     loop {
         tokio::select! {
             request = requests.recv(), if pending.is_none() => {
                 let Some(request) = request else { return Ok(()); };
-                request_id = request_id.saturating_add(1).max(1);
+                // requestId 不能在 WebSocket 重连后从 1 重新开始。服务端可能在新连接上
+                // 补发旧连接排队的 device 帧；若 id 碰撞，会把推送误认成当前 sync 响应，
+                // 随后真正的响应又进入 pull 队列，造成修订倒退和历史快照错配。
+                let request_id = next_remote_request_id();
                 let frame = json!({ "op": "sync", "requestId": request_id, "body": request.body });
                 let message = encode_remote_frame(&frame)?;
                 if let Err(error) = writer.send(message).await {
@@ -329,6 +333,12 @@ async fn remote_socket_once(
             }
         }
     }
+}
+
+fn next_remote_request_id() -> i64 {
+    NEXT_REMOTE_REQUEST_ID
+        .fetch_add(1, Ordering::Relaxed)
+        .max(1)
 }
 
 fn encode_remote_frame(frame: &Value) -> Result<Message, String> {
@@ -1190,6 +1200,7 @@ fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<Re
         }
     }
     let state = app.state::<AppState>();
+    let running = is_running(&state, current);
     Some(RemoteThreadDelta {
         id: current.id.clone(),
         title: current.title.clone(),
@@ -1199,14 +1210,24 @@ fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<Re
         mode: current.mode.clone().unwrap_or_default(),
         parent_thread_id: current.parent_thread_id.clone(),
         created_at: current.created_at,
-        updated_at: current.updated_at,
-        running: is_running(&state, current),
+        // 流式输出期间 updated_at 会高频变化。若每拍都同步，手机端按更新时间排序的
+        // 会话会反复跳到列表顶部，并可能打断正在查看的历史会话；结束时再提交最终时间。
+        updated_at: remote_delta_updated_at(previous, current, running),
+        running,
         plan: current.plan.clone().unwrap_or(Value::Null),
         base: thread_checkpoint(previous),
         checkpoint: thread_checkpoint(current),
         item_count: current.items.len(),
         items: changed,
     })
+}
+
+fn remote_delta_updated_at(previous: &Thread, current: &Thread, running: bool) -> i64 {
+    if running {
+        previous.updated_at
+    } else {
+        current.updated_at
+    }
 }
 
 #[cfg(test)]
@@ -1360,6 +1381,24 @@ mod tests {
         assert_eq!(command.images[0].name, "screen.png");
         assert_eq!(command.images[0].mime_type, "image/png");
         assert_eq!(command.images[0].data.as_deref(), Some("aW1hZ2U="));
+    }
+
+    #[test]
+    fn remote_request_ids_do_not_reset_between_connections() {
+        let first = next_remote_request_id();
+        let second = next_remote_request_id();
+        assert!(second > first);
+    }
+
+    #[test]
+    fn running_delta_keeps_sort_timestamp_stable_until_completion() {
+        let mut previous = Thread::new("C:/work".into(), AgentKind::Codex, None, None, None, false);
+        previous.updated_at = 10;
+        let mut current = previous.clone();
+        current.updated_at = 20;
+
+        assert_eq!(remote_delta_updated_at(&previous, &current, true), 10);
+        assert_eq!(remote_delta_updated_at(&previous, &current, false), 20);
     }
 
     #[test]
