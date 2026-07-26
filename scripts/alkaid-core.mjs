@@ -149,16 +149,23 @@ export async function alkaidPromptInput(parts = []) {
   return { text: textParts.join("\n\n"), images };
 }
 
+export function messagesWithPendingAlkaidPrompt(messages, input, timestamp = Date.now()) {
+  return [
+    ...structuredClone(messages ?? []),
+    {
+      role: "user",
+      content: [
+        ...(input.text ? [{ type: "text", text: input.text }] : []),
+        ...(input.images ?? []),
+      ],
+      timestamp,
+    },
+  ];
+}
+
 export async function alkaidUserMessage(parts = []) {
   const input = await alkaidPromptInput(parts);
-  return {
-    role: "user",
-    content: [
-      ...(input.text ? [{ type: "text", text: input.text }] : []),
-      ...input.images,
-    ],
-    timestamp: Date.now(),
-  };
+  return messagesWithPendingAlkaidPrompt([], input)[0];
 }
 
 export class AlkaidProviderIdleTimeoutError extends Error {

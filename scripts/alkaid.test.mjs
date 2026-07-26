@@ -31,6 +31,7 @@ import {
   loadAlkaidAgentInstructions,
   loadAlkaidSkills,
   mergeAlkaidUsage,
+  messagesWithPendingAlkaidPrompt,
   OPENAI_TOOL_OUTPUT_MAX_CHARS,
   OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
   resolveAlkaidShellConfig,
@@ -250,6 +251,27 @@ test("Vega slim context keeps an interrupted turn as native messages", () => {
   assert.match(compactContext, /completed conclusion/);
   assert.doesNotMatch(compactContext, /interrupted prompt|current prompt/);
   assert.equal(memory.pendingMessages[1].content[0].name, "read");
+});
+
+test("Vega checkpoints a prompt before agent startup without replaying it in the active transcript", () => {
+  const previous = [{ role: "assistant", content: [{ type: "text", text: "earlier result" }], stopReason: "stop" }];
+  const pending = messagesWithPendingAlkaidPrompt(previous, {
+    text: "failed request",
+    images: [{ type: "image", data: "image-data", mimeType: "image/png" }],
+  }, 123);
+
+  assert.equal(previous.length, 1);
+  assert.deepEqual(pending, [
+    previous[0],
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "failed request" },
+        { type: "image", data: "image-data", mimeType: "image/png" },
+      ],
+      timestamp: 123,
+    },
+  ]);
 });
 
 test("Vega slim context keeps complete early messages until its turn or token threshold", () => {

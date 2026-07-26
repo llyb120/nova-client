@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ALKAID_PROVIDER_IDLE_TIMEOUT_MS, alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { ALKAID_PROVIDER_IDLE_TIMEOUT_MS, alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, messagesWithPendingAlkaidPrompt, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
 import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
@@ -187,6 +187,20 @@ async function prompt(request, commands) {
   else {
     nativeMessages = useFullContext ? memory.fullMessages : [];
     if (stripsCompletedReasoning) nativeMessages = stripCompletedOpenAIReasoning(nativeMessages);
+  }
+  // Persist the request before provider/agent initialization. The runtime must still receive the
+  // previous transcript, otherwise the same request would be replayed once by history and once by
+  // prompt(). If initialization or streaming fails, the next turn can resume from this checkpoint.
+  const pendingMessages = messagesWithPendingAlkaidPrompt(nativeMessages, input);
+  if (slimContext) {
+    memory.pendingMessages = pendingMessages;
+    await saveSlimMemory(sessionId, memory).catch((error) => {
+      process.stderr.write(`Vega pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+  } else {
+    await saveMessages(sessionId, pendingMessages).catch((error) => {
+      process.stderr.write(`Vega pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
   }
   const runtime = await createAlkaidAgent({
     cwd: request.cwd,
@@ -430,6 +444,23 @@ async function prompt(request, commands) {
       cancelled: outcome.cancelled,
       usage,
     });
+  } catch (error) {
+    // Keep the exact native trajectory when one exists; the pre-initialization checkpoint above
+    // remains available when agent creation itself failed before this try block was entered.
+    const failedMessages = runtime.agent.state.messages.length > nativeMessages.length
+      ? runtime.agent.state.messages
+      : pendingMessages;
+    if (slimContext) {
+      memory.pendingMessages = structuredClone(failedMessages);
+      await saveSlimMemory(sessionId, memory).catch((saveError) => {
+        process.stderr.write(`Vega failed-turn persistence failed: ${saveError instanceof Error ? saveError.message : String(saveError)}\n`);
+      });
+    } else {
+      await saveMessages(sessionId, failedMessages).catch((saveError) => {
+        process.stderr.write(`Vega failed-turn persistence failed: ${saveError instanceof Error ? saveError.message : String(saveError)}\n`);
+      });
+    }
+    throw error;
   } finally {
     if (slimContext) await saveSlimMemory(sessionId, memory).catch(() => {});
     await diagnosticLog.flush();
