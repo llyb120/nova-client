@@ -15,7 +15,7 @@ import type { AgentKind, PromptImage } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
-import { IconFile, IconSend, IconStop, IconUsers } from "./icons";
+import { IconFile, IconSend, IconStop, IconUndo, IconUsers } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
@@ -28,6 +28,10 @@ type PromptHistoryItem = {
   images: PromptImage[];
 };
 
+type QueuedPrompt = PromptHistoryItem & {
+  threadId: string;
+};
+
 const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
 
 export function Composer() {
@@ -38,6 +42,9 @@ export function Composer() {
   const [sentHistory, setSentHistory] = createSignal<PromptHistoryItem[]>([]);
   const [historyOpen, setHistoryOpen] = createSignal(false);
   const [activeHistoryIndex, setActiveHistoryIndex] = createSignal(0);
+  const [queuedPrompts, setQueuedPrompts] = createSignal<QueuedPrompt[]>([]);
+  const [dispatchingQueueIds, setDispatchingQueueIds] = createSignal<Set<string>>(new Set());
+  const [failedQueueIds, setFailedQueueIds] = createSignal<Set<string>>(new Set());
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
@@ -285,27 +292,104 @@ export function Composer() {
 
   onCleanup(() => rememberPromptDraft(text(), attach.images()));
 
-  // 支持引导的后端运行中可继续发送：原生注入或打断后新 turn（Cursor slim memory）。
-  const submit = () => {
-    const value = text().trim();
-    if (empty()) return;
-    if (running() && !supportsSteer()) return;
-    const images = attach.images();
+  const currentQueuedPrompts = createMemo(() => {
     const currentId = state.currentId;
-    if (currentId && value) {
-      const now = Date.now();
-      const snapshot = images.map((img) => ({ ...img }));
-      setSentHistory((items) => [
-        { id: `${currentId}:sent:${now}`, text: value, ts: now, images: snapshot },
-        ...items.filter((item) => item.text !== value || !item.id.startsWith(`${currentId}:`)),
-      ].slice(0, 80));
-    }
+    return currentId ? queuedPrompts().filter((item) => item.threadId === currentId) : [];
+  });
+
+  const rememberSentPrompt = (currentId: string, value: string, images: PromptImage[]) => {
+    if (!value) return;
+    const now = Date.now();
+    const snapshot = images.map((image) => ({ ...image }));
+    setSentHistory((items) => [
+      { id: `${currentId}:sent:${now}`, text: value, ts: now, images: snapshot },
+      ...items.filter((item) => item.text !== value || !item.id.startsWith(`${currentId}:`)),
+    ].slice(0, 80));
+  };
+
+  const clearInput = () => {
     setText("");
     setHistoryOpen(false);
     attach.clear();
     if (textareaRef) textareaRef.style.height = "auto";
-    const employeeId = isNewOrdinaryThread() ? selectedEmployee()?.id ?? null : null;
+  };
+
+  const dispatchQueuedPrompt = async (item: QueuedPrompt, steerNow = false) => {
+    if (dispatchingQueueIds().has(item.id)) return;
+    if (steerNow && running() && !supportsSteer()) return;
+    setFailedQueueIds((ids) => {
+      const next = new Set(ids);
+      next.delete(item.id);
+      return next;
+    });
+    setDispatchingQueueIds((ids) => new Set(ids).add(item.id));
+    try {
+      await sendPrompt(item.text, item.images);
+      setQueuedPrompts((items) => items.filter((queued) => queued.id !== item.id));
+    } catch (error) {
+      console.error("发送排队提示词失败", error);
+      setFailedQueueIds((ids) => new Set(ids).add(item.id));
+    } finally {
+      setDispatchingQueueIds((ids) => {
+        const next = new Set(ids);
+        next.delete(item.id);
+        return next;
+      });
+    }
+  };
+
+  // 当前任务正常或异常收尾后，按先进先出自动投递下一条；后续提示继续等待各自前一轮结束。
+  createEffect(() => {
+    const first = currentQueuedPrompts()[0];
+    if (
+      !first ||
+      running() ||
+      dispatchingQueueIds().has(first.id) ||
+      failedQueueIds().has(first.id)
+    ) return;
+    void dispatchQueuedPrompt(first);
+  });
+
+  const withdrawQueuedPrompt = (item: QueuedPrompt) => {
+    setQueuedPrompts((items) => items.filter((queued) => queued.id !== item.id));
+    setFailedQueueIds((ids) => {
+      const next = new Set(ids);
+      next.delete(item.id);
+      return next;
+    });
+    const existing = text();
+    const restored = existing.trim() ? `${item.text}\n${existing}` : item.text;
+    setText(restored);
+    attach.set([...item.images, ...attach.images()]);
+    setHistoryOpen(false);
+    setSlashStart(null);
+    setCursor(restored.length);
+    queueMicrotask(() => {
+      textareaRef?.focus();
+      textareaRef?.setSelectionRange(restored.length, restored.length);
+      resizeInput();
+    });
+  };
+
+  // 运行中第一次回车只排队；队列可立即引导，或在当前任务结束后自动发送。
+  const submit = () => {
+    const value = text().trim();
+    if (empty()) return;
+    const images = attach.images().map((image) => ({ ...image }));
+    const currentId = state.currentId;
+    if (!currentId) return;
+    rememberSentPrompt(currentId, value, images);
+    clearInput();
     setEmployeeMenuOpen(false);
+    if (running()) {
+      const now = Date.now();
+      setQueuedPrompts((items) => [
+        ...items,
+        { id: `${currentId}:queued:${now}:${items.length}`, threadId: currentId, text: value, ts: now, images },
+      ]);
+      return;
+    }
+    const employeeId = isNewOrdinaryThread() ? selectedEmployee()?.id ?? null : null;
     void sendPrompt(value, images, employeeId);
   };
 
@@ -417,6 +501,11 @@ export function Composer() {
     }
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
+      const firstQueued = currentQueuedPrompts()[0];
+      if (empty() && firstQueued) {
+        void dispatchQueuedPrompt(firstQueued, true);
+        return;
+      }
       submit();
     }
   };
@@ -440,6 +529,51 @@ export function Composer() {
       <noteFlow.Notes />
       <ExclusiveChatMark token={state.roamingPeer || state.settings?.relayToken || ""} />
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
+      <Show when={currentQueuedPrompts().length > 0}>
+        <div class="prompt-queue" aria-label="待发送提示词">
+          <div class="prompt-queue-head">
+            <span>待发送</span>
+            <small>当前任务结束后自动发送</small>
+          </div>
+          <For each={currentQueuedPrompts()}>
+            {(item, index) => (
+              <div
+                class="prompt-queue-item"
+                classList={{ failed: failedQueueIds().has(item.id) }}
+              >
+                <span class="prompt-queue-index">{index() + 1}</span>
+                <span class="prompt-queue-text" title={item.text}>{item.text || "附件"}</span>
+                <Show when={item.images.length > 0}>
+                  <span class="prompt-history-attach" title={`${item.images.length} 个附件`}>
+                    <IconFile size={12} />
+                    {item.images.length}
+                  </span>
+                </Show>
+                <button
+                  type="button"
+                  class="prompt-queue-action"
+                  disabled={dispatchingQueueIds().has(item.id)}
+                  onClick={() => withdrawQueuedPrompt(item)}
+                  title="撤回到输入框"
+                >
+                  <IconUndo size={13} />
+                  撤回
+                </button>
+                <button
+                  type="button"
+                  class="prompt-queue-action send-now"
+                  disabled={dispatchingQueueIds().has(item.id) || (running() && !supportsSteer())}
+                  onClick={() => void dispatchQueuedPrompt(item, true)}
+                  title={failedQueueIds().has(item.id) ? "重试发送" : "立即作为引导发送"}
+                >
+                  <IconSend size={13} />
+                  {dispatchingQueueIds().has(item.id) ? "发送中" : "发送"}
+                </button>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
       <Show when={slashQuery() !== null}>
         <div ref={slashMenuRef} class="slash-menu">
           <div class="slash-menu-head">
@@ -500,11 +634,9 @@ export function Composer() {
         class="composer-input"
         placeholder={
           running()
-            ? supportsLiveSteer()
-              ? `${providerName()} 正在工作…输入并回车可实时引导`
-              : supportsInterruptSteer()
-                ? `${providerName()} 正在工作…输入并回车可引导（将打断当前轮继续）`
-                : `${providerName()} 正在工作…请先停止，再发送下一轮`
+            ? supportsSteer()
+              ? `${providerName()} 正在工作…输入并回车加入队列；输入为空时回车可立即引导`
+              : `${providerName()} 正在工作…输入并回车加入队列，任务结束后自动发送`
             : `给 ${providerName()} 下达任务，Enter 发送，Shift+Enter 换行，可粘贴或拖入文件`
         }
         value={text()}
@@ -585,17 +717,9 @@ export function Composer() {
         </span>
         <button
           class="composer-btn send"
-          disabled={empty() || (running() && !supportsSteer())}
+          disabled={empty()}
           onClick={submit}
-          title={
-            running() && supportsLiveSteer()
-              ? "发送并引导当前任务"
-              : running() && supportsInterruptSteer()
-                ? "打断当前轮并以引导继续"
-                : running()
-                  ? "请先停止当前轮次"
-                  : "发送"
-          }
+          title={running() ? "加入提示词队列" : "发送"}
         >
           <IconSend size={16} />
         </button>
