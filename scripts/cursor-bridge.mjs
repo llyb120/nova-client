@@ -73,7 +73,8 @@ function isRetryableCursorError(error) {
     if (typeof current === "object") {
       seen.add(current);
       if (current.isRetryable === true) return true;
-      if (["unavailable", "timeout", "rate_limit", "internal"].includes(String(current.code).toLowerCase())) {
+      const code = String(current.code ?? "").toLowerCase();
+      if (["unavailable", "timeout", "rate_limit", "internal", "aborted", "8", "10", "13", "14"].includes(code)) {
         return true;
       }
       for (const key of ["message", "rawMessage", "details"]) {
@@ -85,8 +86,15 @@ function isRetryableCursorError(error) {
       break;
     }
   }
-  return /API key exchange endpoint|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|\b429\b|\b5\d\d\b/i
+  return /API key exchange endpoint|fetch failed|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|socket hang up|other side closed|premature close|network connection lost|\b429\b|\b5\d\d\b/i
     .test(details.join("\n"));
+}
+
+function shouldSilentRetryCursorTurn(error, { producedOutput = false, attempt = 0, maxRetries = CURSOR_SILENT_RETRIES } = {}) {
+  // Only restart turns that never emitted UI output; otherwise a silent retry would duplicate deltas.
+  return !producedOutput
+    && attempt < maxRetries
+    && (error instanceof CursorStartupTimeout || isRetryableCursorError(error));
 }
 
 async function createCursorAgent(options, sdk = Agent, retryDelaysMs = CURSOR_CREATE_RETRY_DELAYS_MS) {
@@ -95,9 +103,8 @@ async function createCursorAgent(options, sdk = Agent, retryDelaysMs = CURSOR_CR
       return await sdk.create(options);
     } catch (error) {
       if (attempt >= retryDelaysMs.length || !isRetryableCursorError(error)) throw error;
-      const delayMs = retryDelaysMs[attempt];
-      process.stderr.write(`Cursor SDK initialization failed temporarily; retrying in ${delayMs}ms (${attempt + 1}/${retryDelaysMs.length})\n`);
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      // Keep create retries silent: Nova surfaces stderr as bridge failures.
+      await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
     }
   }
 }
@@ -565,7 +572,7 @@ async function recoverTimedOutAgent(
   // Slim-memory mode prefers a fresh agent so poisoned checkpoints are never resumed.
   if (createFresh) {
     return {
-      agent: await withTimeout(sdk.create(options), timeoutMs, "create"),
+      agent: await withTimeout(createCursorAgent(options, sdk), timeoutMs, "create"),
       history: "",
       replaced: true,
     };
@@ -578,7 +585,7 @@ async function recoverTimedOutAgent(
     };
   } catch {
     return {
-      agent: await withTimeout(sdk.create(options), timeoutMs, "create"),
+      agent: await withTimeout(createCursorAgent(options, sdk), timeoutMs, "create"),
       history: await recoveryHistory(runs.items, timeoutMs),
       replaced: true,
     };
@@ -924,7 +931,7 @@ function createAgentPrewarm(sdk = Agent, { enabled = prewarmEnabled() } = {}) {
     const entry = { fingerprint, agent: null, promise: null };
     entry.promise = (async () => {
       try {
-        const agent = await sdk.create(options);
+        const agent = await createCursorAgent(options, sdk);
         if (slot !== entry) {
           try { agent.close(); } catch { /* discarded */ }
           return null;
@@ -961,7 +968,7 @@ function createAgentPrewarm(sdk = Agent, { enabled = prewarmEnabled() } = {}) {
       discard();
     }
 
-    const agent = await sdk.create(options);
+    const agent = await createCursorAgent(options, sdk);
     ensure(fingerprint, options);
     return { agent, source: "live", fingerprint };
   }
@@ -1219,13 +1226,16 @@ async function main() {
           send({ type: "done", usage: turnUsage });
           completed = true;
         } catch (error) {
-          const retryable = error instanceof CursorStartupTimeout && !producedOutput && attempt < CURSOR_SILENT_RETRIES;
+          const retryable = shouldSilentRetryCursorTurn(error, { producedOutput, attempt });
           if (!retryable) {
             await preserveActiveTurn?.();
             throw error;
           }
           attemptActive = false;
-          sendTiming("silent_retry", turnStartedAt, { attempt: attempt + 1 });
+          sendTiming("silent_retry", turnStartedAt, {
+            attempt: attempt + 1,
+            reason: error instanceof CursorStartupTimeout ? "startup_timeout" : "retryable_error",
+          });
           const recovery = await recoverTimedOutAgent(
             agent,
             activeRun,
@@ -1286,6 +1296,7 @@ export {
   isEditFilesTool,
   isNovaDenyTaskHook,
   isRetryableCursorError,
+  shouldSilentRetryCursorTurn,
   isSlimMemoryEmpty,
   mapDelta,
   mapMessage,

@@ -29,6 +29,7 @@ const {
   isEditFilesTool,
   isNovaDenyTaskHook,
   isRetryableCursorError,
+  shouldSilentRetryCursorTurn,
   isSlimMemoryEmpty,
   mapDelta,
   mapMessage,
@@ -234,6 +235,28 @@ assert.equal(threadMemoryKey(undefined), undefined);
 assert.equal(isRetryableCursorError({ isRetryable: true, code: "unavailable" }), true);
 assert.equal(isRetryableCursorError(new TypeError("Failed to connect to API key exchange endpoint: fetch failed")), true);
 assert.equal(isRetryableCursorError(new Error("Invalid API key")), false);
+assert.equal(isRetryableCursorError({
+  rawMessage: "read ECONNRESET",
+  code: 10,
+  cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+}), true);
+assert.equal(isRetryableCursorError({ code: "aborted", message: "stream aborted" }), true);
+assert.equal(shouldSilentRetryCursorTurn(
+  Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+  { producedOutput: false, attempt: 0 },
+), true);
+assert.equal(shouldSilentRetryCursorTurn(
+  Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+  { producedOutput: true, attempt: 0 },
+), false);
+assert.equal(shouldSilentRetryCursorTurn(
+  new CursorStartupTimeout("stream startup"),
+  { producedOutput: false, attempt: 0 },
+), true);
+assert.equal(shouldSilentRetryCursorTurn(
+  new Error("Invalid API key"),
+  { producedOutput: false, attempt: 0 },
+), false);
 let createAttempts = 0;
 const createdAgent = { agentId: "created" };
 assert.equal(await createCursorAgent({}, {
