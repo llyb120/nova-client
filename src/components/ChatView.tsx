@@ -5,12 +5,13 @@ import {
   compactThread,
   chatScrollToBottomSignal,
   openThread,
+  refreshThreads,
   setState,
   setTimeMachineEditTarget,
   state,
   timeMachineChangedSignal,
 } from "../store";
-import type { Item, Thread, TimeMachineCheckpoint, TimeMachineTimeline } from "../types";
+import type { Item, Thread, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { Composer } from "./Composer";
 import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
@@ -505,7 +506,7 @@ export function ChatView() {
   const [draft, setDraft] = createSignal("");
   const [showShare, setShowShare] = createSignal(false);
   const [timeline, setTimeline] = createSignal<TimeMachineTimeline | null>(null);
-  const [restoringCheckpoint] = createSignal<string | null>(null);
+  const [restoringCheckpoint, setRestoringCheckpoint] = createSignal<string | null>(null);
 
   createEffect(() => {
     const threadId = state.currentId;
@@ -594,6 +595,7 @@ export function ChatView() {
     previewCheckpoint: TimeMachineCheckpoint | null;
     promptCount: number;
     currentPromptIndex: number | null;
+    branchPrompts: TimeMachinePrompt[];
     title: string;
     x: number;
     y: number;
@@ -601,6 +603,8 @@ export function ChatView() {
     onCurrentPath: boolean;
   };
   type PromptTreeNode = Omit<GraphNode, "x" | "y"> & { children: PromptTreeNode[] };
+  type ContextDeleteMode = "to-start" | "up" | "self" | "down" | "to-end";
+  const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number; node: GraphNode } | null>(null);
   const timelineGraph = createMemo(() => {
     const checkpoints = timeline()?.checkpoints ?? [];
     const root: PromptTreeNode = {
@@ -609,6 +613,7 @@ export function ChatView() {
       previewCheckpoint: null,
       promptCount: 0,
       currentPromptIndex: null,
+      branchPrompts: [],
       title: "会话开始",
       current: false,
       onCurrentPath: true,
@@ -634,6 +639,7 @@ export function ChatView() {
             previewCheckpoint: checkpoint,
             promptCount: index + 1,
             currentPromptIndex: null,
+            branchPrompts: prompts,
             title: prompt.text.trim() || `第 ${index + 1} 条提示词`,
             current: false,
             onCurrentPath: false,
@@ -642,9 +648,11 @@ export function ChatView() {
           parent.children.push(node);
         }
         if (!node.previewCheckpoint && checkpoint) node.previewCheckpoint = checkpoint;
+        if (checkpoint && !current) node.branchPrompts = prompts;
         if (current) {
           node.onCurrentPath = true;
           node.currentPromptIndex = index;
+          node.branchPrompts = prompts;
         }
         parent = node;
       });
@@ -776,6 +784,55 @@ export function ChatView() {
     setPreviewCheckpointId(null);
     setPreviewFading(false);
     returnToNow();
+  };
+  const contextPrompts = (node: GraphNode, mode: ContextDeleteMode, count = 0) => {
+    const prompts = node.branchPrompts;
+    const index = Math.max(0, Math.min(prompts.length - 1, node.promptCount - 1));
+    if (mode === "to-start") return prompts.slice(0, index);
+    if (mode === "up") return prompts.slice(Math.max(0, index - count), index);
+    if (mode === "self") return prompts.slice(index, index + 1);
+    if (mode === "down") return prompts.slice(index + 1, index + 1 + count);
+    return prompts.slice(index + 1);
+  };
+  const deleteContext = async (node: GraphNode, mode: ContextDeleteMode) => {
+    let count = 0;
+    if (mode === "up" || mode === "down") {
+      const raw = window.prompt(mode === "up" ? "向上删除多少个节点？" : "向下删除多少个节点？", "1");
+      if (raw === null) return;
+      count = Number.parseInt(raw, 10);
+      if (!Number.isFinite(count) || count <= 0) {
+        await message("请输入大于 0 的整数", { kind: "error" });
+        return;
+      }
+    }
+    const prompts = contextPrompts(node, mode, count);
+    setContextMenu(null);
+    if (prompts.length === 0) return;
+    if (!window.confirm(`确定删除 ${prompts.length} 个上下文节点？该操作会立即重组世界线，并使旧摘要失效。`)) {
+      return;
+    }
+    let threadId = state.currentId;
+    if (!threadId || restoringCheckpoint()) return;
+    setRestoringCheckpoint(node.id);
+    try {
+      if (!node.onCurrentPath && node.previewCheckpoint) {
+        const restored = await api.restoreTimeMachineCheckpoint(threadId, node.previewCheckpoint.id);
+        await refreshThreads();
+        await openThread(restored.threadId);
+        threadId = restored.threadId;
+      }
+      const result = await api.deleteTimeMachineContext(threadId, prompts);
+      setTimeline(result.timeline);
+      setTimeMachineEditTarget(null);
+      setPreviewItems(null);
+      setPreviewCheckpointId(null);
+      await refreshThreads();
+      await openThread(result.threadId);
+    } catch (error) {
+      await message(String(error), { kind: "error" });
+    } finally {
+      setRestoringCheckpoint(null);
+    }
   };
   onCleanup(() => {
     previewRequest++;
@@ -1032,6 +1089,7 @@ export function ChatView() {
                     title={node.title}
                     disabled={!!restoringCheckpoint()}
                     onClick={() => {
+                      setContextMenu(null);
                       if (node.currentPromptIndex !== null) {
                         scrollToCurrentPrompt(node.currentPromptIndex);
                       } else if (node.previewCheckpoint) {
@@ -1041,6 +1099,11 @@ export function ChatView() {
                         });
                         void previewGraphNode(node);
                       }
+                    }}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setContextMenu({ x: event.clientX, y: event.clientY, node });
                     }}
                   >
                     <span class="repo-time-dot">{node.promptCount}</span>
@@ -1060,6 +1123,27 @@ export function ChatView() {
             现在
           </button>
         </aside>
+      </Show>
+      <Show when={contextMenu()} keyed>
+        {(menu) => (
+          <div class="repo-time-context-backdrop" onMouseDown={() => setContextMenu(null)}>
+            <div
+              class="repo-time-context-menu"
+              style={{
+                left: `${Math.max(8, Math.min(menu.x, window.innerWidth - 188))}px`,
+                top: `${Math.max(8, Math.min(menu.y, window.innerHeight - 230))}px`,
+              }}
+              onMouseDown={(event) => event.stopPropagation()}
+            >
+              <button disabled={contextPrompts(menu.node, "to-start").length === 0} onClick={() => void deleteContext(menu.node, "to-start")}>删除到开始</button>
+              <button disabled={contextPrompts(menu.node, "up", 1).length === 0} onClick={() => void deleteContext(menu.node, "up")}>向上删除 n 个</button>
+              <button onClick={() => void deleteContext(menu.node, "self")}>删除自身</button>
+              <button disabled={contextPrompts(menu.node, "down", 1).length === 0} onClick={() => void deleteContext(menu.node, "down")}>向下删除 N 个</button>
+              <button disabled={contextPrompts(menu.node, "to-end").length === 0} onClick={() => void deleteContext(menu.node, "to-end")}>删除到结尾</button>
+              <div class="repo-time-context-hint">除“删除自身”外均不包含当前节点</div>
+            </div>
+          </div>
+        )}
       </Show>
       <Show when={stageThreads().length > 1}>
         <aside class="stage-rail" aria-label="会话阶段导航">

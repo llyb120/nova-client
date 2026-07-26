@@ -1665,6 +1665,11 @@ async fn create_thread(
         state.relay.publish_folders();
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
+#[tauri::command]
+fn directory_exists(path: String) -> bool {
+    Path::new(path.trim()).is_dir()
+}
+
     Ok(thread)
 }
 
@@ -2630,6 +2635,22 @@ fn restore_time_machine_checkpoint(
     thread_id: String,
     checkpoint_id: String,
 ) -> Result<time_machine::RestoreResult, String> {
+        restore_files,
+    )?;
+    {
+        let mut store = state.store.lock().unwrap();
+        if current.is_roaming_guest() {
+            let existing = store.get_mut(&current.id).ok_or("漫游会话不存在")?;
+            *existing = thread;
+        } else {
+            store.threads.push(thread);
+        }
+        store.save();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    Ok(result)
+}
+
     let _guard = state.time_machine_lock.lock().unwrap();
     let current = {
         let store = state.store.lock().unwrap();
@@ -2646,20 +2667,83 @@ fn restore_time_machine_checkpoint(
         &state.config_dir,
         &checkpoint_id,
         &current,
-        restore_files,
-    )?;
-    {
+#[tauri::command]
+fn delete_time_machine_context(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    prompts: Vec<time_machine::PromptSummary>,
+) -> Result<time_machine::RestoreResult, String> {
+    if prompts.is_empty() {
+        return Err("没有可删除的上下文节点".into());
+    }
+    if running_by_id(&state, &thread_id) {
+        return Err("会话正在运行，请先停止".into());
+    }
+    let _guard = state.time_machine_lock.lock().unwrap();
+    let (agent_kind, timeline) = {
         let mut store = state.store.lock().unwrap();
+        let current = store.get(&thread_id).ok_or("会话不存在")?;
         if current.is_roaming_guest() {
-            let existing = store.get_mut(&current.id).ok_or("漫游会话不存在")?;
-            *existing = thread;
-        } else {
-            store.threads.push(thread);
+            return Err("漫游会话暂不支持手动删除上下文".into());
         }
+        let mut edited = current.clone();
+        if time_machine::remove_prompt_turns(&mut edited, &prompts) == 0 {
+            return Err("所选上下文节点已不存在，请刷新世界线后重试".into());
+        }
+        edited.acp_session_id = None;
+        edited.provider_checkpoints.clear();
+        edited.pending_native_restore = None;
+        edited.codex_usage_snapshot = None;
+        edited.handoff_from = edited
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::User { .. }))
+            .then(|| edited.agent_kind.clone());
+        if !edited
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::User { .. }))
+        {
+            edited.title = "新会话".into();
+        }
+        let timeline =
+            time_machine::rewrite_after_context_edit(&state.config_dir, &edited, &prompts)?;
+        let agent_kind = edited.agent_kind.clone();
+        *store.get_mut(&thread_id).ok_or("会话不存在")? = edited;
         store.save();
+        (agent_kind, timeline)
+    };
+
+    // Vega / Cursor 的下一轮会从编辑后的 transcript 直接重建精简上下文；其余后端
+    // 作废原生 session，并通过一次无感接力在新 session 中继续。旧压缩摘要也随之失效。
+    match agent_kind {
+        AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&thread_id),
+        AgentKind::Devin => state.acp.forget_session_of_thread(&thread_id),
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            state.codexplus.forget_session_of_thread(&thread_id)
+        }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            state.codebuddyplus.forget_session_of_thread(&thread_id)
+        }
+        AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&thread_id),
+        AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&thread_id),
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            state.opencodeplus.forget_session_of_thread(&thread_id)
+        }
+    }
+    if let Some(runtime) = state.borrowed_runtime(&thread_id) {
+        match runtime.manager {
+            BorrowedManager::Acp(manager) => manager.forget_session_of_thread(&thread_id),
+            BorrowedManager::Sdk(manager) => manager.forget_session_of_thread(&thread_id),
+            BorrowedManager::OpenCode(manager) => manager.forget_session_of_thread(&thread_id),
+        }
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
-    Ok(result)
+    Ok(time_machine::RestoreResult {
+        thread_id,
+        timeline,
+    })
 }
 
 #[tauri::command]
@@ -5535,6 +5619,7 @@ pub fn run() {
             report_activity,
             show_main_window,
             take_restore_thread,
+            delete_time_machine_context,
             signature_pending,
             create_thread,
             delete_thread,
@@ -5583,6 +5668,7 @@ pub fn run() {
             refresh_relay_peers,
             list_achievements,
             get_relay_inbox,
+            directory_exists,
             share_thread,
             advanced_share,
             summarize_clue,
