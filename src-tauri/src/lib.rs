@@ -3918,14 +3918,6 @@ fn get_relay_peers(state: State<'_, AppState>) -> Value {
     state.relay.peers()
 }
 
-/// 主动联网刷新在线名单（供前端定时兜底）：直接查服务端 roster 并更新缓存/通知前端，
-/// 不依赖 SSE presence 推送，能自愈丢失的 presence（「别人看不到你 / 少一个人」）。
-#[tauri::command]
-async fn refresh_relay_peers(state: State<'_, AppState>) -> Result<Value, String> {
-    state.relay.refresh_peers().await;
-    Ok(state.relay.peers())
-}
-
 /// 从中转站拉取当前用户已解锁的成就。
 #[tauri::command]
 async fn list_achievements(state: State<'_, AppState>) -> Result<Vec<relay::Achievement>, String> {
@@ -5649,7 +5641,6 @@ pub fn run() {
             get_relay_status,
             verify_relay,
             get_relay_peers,
-            refresh_relay_peers,
             list_achievements,
             get_relay_inbox,
             share_thread,

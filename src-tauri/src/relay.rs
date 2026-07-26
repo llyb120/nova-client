@@ -602,41 +602,6 @@ impl RelayManager {
         Ok(body.achievements)
     }
 
-    /// 主动从服务端拉取一次在线名单，更新缓存并通知前端。
-    /// 前端定时器用它做「兜底刷新」——定时器平时读的是本地 presence 缓存，
-    /// 一旦某次 presence 推送丢失，名单会长时间停在旧状态；这里直接查服务端 roster，
-    /// 不依赖 WebSocket 单次推送，既能自愈丢失的 presence，也能在长连接尚未连上时先显示在线名单。
-    pub async fn refresh_peers(&self) {
-        let Some((server, token, name)) = self.cfg() else {
-            *self.peers.lock().unwrap() = json!([]);
-            let _ = self.app.emit(EV_RELAY_PEERS, json!([]));
-            return;
-        };
-        let resp = self
-            .http
-            .get(format!("{server}/v2/peers"))
-            .header("Authorization", format!("Bearer {token}"))
-            .header("X-Relay-Name-Encoded", urlencode(&name))
-            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
-            .header("X-Relay-Device", &self.device_id)
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await;
-        let Ok(resp) = resp else { return };
-        if !resp.status().is_success() {
-            return;
-        }
-        let Ok(body) = resp.json::<Value>().await else {
-            return;
-        };
-        // 保留服务端返回的完整名单（含自己）：天线在线名单要显示自己（前端标注「我」）。
-        // 漫游/分享侧各自会用自己的 token 排除自己，不受此影响。
-        let peers = relay_display_peers(body.get("peers").cloned().unwrap_or(json!([])));
-        self.retain_online_quota_leases(&peers);
-        *self.peers.lock().unwrap() = peers.clone();
-        let _ = self.app.emit(EV_RELAY_PEERS, peers);
-    }
-
     pub fn inbox_list(&self) -> Vec<Share> {
         self.inbox.lock().unwrap().clone()
     }

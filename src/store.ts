@@ -543,18 +543,6 @@ export async function refreshRelayStatus() {
   }
 }
 
-export async function refreshPeers() {
-  try {
-    // 走联网刷新：直接查服务端 roster，不依赖 SSE presence 推送。
-    // 此前读的是本地缓存（只被 SSE presence 更新），一旦某次 presence 推送丢失，
-    // 在线名单会长时间停在旧状态（表现为「别人看不到你 / 少一个人」）；也能在 SSE 尚未
-    // 连上时就先显示名单，加快入网体感。
-    setState("peers", normalizePeers(await api.refreshRelayPeers()));
-  } catch {
-    // 忽略（保留上次名单）
-  }
-}
-
 export function clueMentionPeers(): Peer[] {
   const ownToken = state.settings?.relayToken ?? "";
   const firstGroup =
@@ -2295,7 +2283,6 @@ export async function initStore() {
   await listen<RelayStatus>("relay:status", (e) => {
     setState("relay", e.payload);
     if (e.payload.connected) {
-      void refreshPeers();
       void refreshInbox();
       // 重连后强制校准：离线期间对端可能已调整共享模型，旧 peerModels 不能继续复用。
       preloadPeerModels(true);
@@ -2395,11 +2382,16 @@ export async function initStore() {
     persistThemeToBackend(state.theme);
   }
 
-  // 团队/漫游：settings 一就绪就立刻刷新中转站状态/名单/收件箱/漫游目录。关键是排在下面较慢的
-  // getStatus 之前——此前这几行排在 Promise.all(getStatus) 之后，被 getStatus 拖到数秒后才执行，
-  // 表现为「启动后天线图标 / 自己的在线状态好久才出现」。现在紧跟 settings，第一时间点亮。
+  // 团队/漫游：settings 一就绪就立刻刷新中转状态并读取本地 presence 缓存；
+  // 在线名单随后完全由 /v2/ws 的 presence 首包和变更推送维护，不再轮询 /v2/peers。
   void refreshRelayStatus();
-  void refreshPeers().then(() => preloadPeerModels());
+  void api
+    .getRelayPeers()
+    .then((peers) => {
+      setState("peers", normalizePeers(peers));
+      preloadPeerModels();
+    })
+    .catch(() => {});
   void refreshInbox();
   // 成就后台预拉：有新成就时侧栏入口直接亮角标，不必等用户打开成就页
   void refreshAchievements();
@@ -2434,13 +2426,6 @@ export async function initStore() {
     void refreshQuota();
     if (!state.modelCosts) void refreshModelCosts();
   }, 10 * 60 * 1000);
-
-  // 在线名单联网兜底：每 30 秒主动查一次服务端 roster。SSE presence 只在有人上下线时推送，
-  // 且推送可能因通道瞬时拥塞被丢弃；这个定时器直接联网刷新，确保「别人看不到你 / 少一个人」
-  // 最多 30 秒自愈，也能在 SSE 尚未连上的启动初期尽快显示名单。
-  setInterval(() => {
-    if (state.relay.enabled) void refreshPeers().then(() => preloadPeerModels());
-  }, 30 * 1000);
 
   // 漫游模型后台静默「更新」：每 5 分钟强制刷新一轮在线队友的模型列表，
   // 让对端后端配置变化（启用/关闭某后端、换模型）能被及时同步，而无需用户手动重试。
