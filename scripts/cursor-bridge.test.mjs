@@ -36,6 +36,7 @@ const {
   messageWithToolPolicy,
   modelSelection,
   novaDenyTaskHookCommand,
+  pendingTurnContext,
   promptMessage,
   recordSlimTurn,
   recoverTimedOutAgent,
@@ -316,6 +317,14 @@ interruptedMemory.pendingTurn = interruptedContext;
 assert.equal(isSlimMemoryEmpty(interruptedMemory), false);
 assert.match(messageWithSlimMemory("Continue", interruptedMemory), /complete working context/);
 assert.match(messageWithSlimMemory("Continue", interruptedMemory), /Assistant reasoning/);
+const failedBeforeSdkStart = pendingTurnContext("", "Inspect the repository");
+assert.match(failedBeforeSdkStart, /^User:\nInspect the repository$/);
+const failedAgain = pendingTurnContext(failedBeforeSdkStart, "go on");
+assert.match(failedAgain, /^User:\nInspect the repository/);
+assert.match(failedAgain, /User:\ngo on$/);
+const failedWithTrace = pendingTurnContext(failedBeforeSdkStart, "go on", interruptedState);
+assert.match(failedWithTrace, /Inspect the repository/);
+assert.match(failedWithTrace, /Assistant reasoning/);
 
 const seeded = createSlimMemory();
 ingestCompactHistory(seeded, compactConversation(conversation));

@@ -244,6 +244,11 @@ function formatInterruptedTurn(userMessage, state) {
   return formatTurnTrace(userMessage, state, { includeThinking: true });
 }
 
+function pendingTurnContext(previousPending, userMessage, state) {
+  const current = formatInterruptedTurn(userMessage, state);
+  return [String(previousPending ?? "").trim(), current].filter(Boolean).join("\n\n");
+}
+
 function formatCompletedTurn(userMessage, state) {
   return formatTurnTrace(userMessage, state, { includeThinking: false });
 }
@@ -940,19 +945,27 @@ async function main() {
           customTools: createCursorFilesystemTools(request.cwd, { readOnly }),
         },
       };
+      const originalMessage = await promptMessage(request.parts);
+      // Build the SDK prompt before marking this turn pending, otherwise it would replay itself.
+      // Persist first so even Agent.create/SDK initialization failures retain the user's request.
+      const previousPendingTurn = memory.pendingTurn;
+      const message = messageWithToolPolicy(messageWithSlimMemory(originalMessage, memory), { readOnly });
+      memory.pendingTurn = pendingTurnContext(previousPendingTurn, originalMessage);
+      await saveSlimMemory(memoryKey, memory).catch((error) => {
+        process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      });
       agent = await Agent.create(options);
       send({ type: "ready", sessionId: sessionKey });
-      const originalMessage = await promptMessage(request.parts);
-      // Tool policy must ride every prompt: fresh Agent per turn + no systemPrompt field.
-      let message = messageWithToolPolicy(messageWithSlimMemory(originalMessage, memory), { readOnly });
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
         const state = createMessageState();
         preserveActiveTurn = async () => {
-          const pendingTurn = formatInterruptedTurn(originalMessage, state);
+          const pendingTurn = pendingTurnContext(previousPendingTurn, originalMessage, state);
           if (!pendingTurn) return;
           memory.pendingTurn = pendingTurn;
-          await saveSlimMemory(memoryKey, memory);
+          await saveSlimMemory(memoryKey, memory).catch((error) => {
+            process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          });
         };
         const turnStartedAt = performance.now();
         let attemptActive = true;
@@ -1055,7 +1068,10 @@ async function main() {
           completed = true;
         } catch (error) {
           const retryable = error instanceof CursorStartupTimeout && !producedOutput && attempt < CURSOR_SILENT_RETRIES;
-          if (!retryable) throw error;
+          if (!retryable) {
+            await preserveActiveTurn?.();
+            throw error;
+          }
           attemptActive = false;
           sendTiming("silent_retry", turnStartedAt, { attempt: attempt + 1 });
           const recovery = await recoverTimedOutAgent(
@@ -1067,7 +1083,7 @@ async function main() {
             true,
           );
           agent = recovery.agent;
-          message = messageWithToolPolicy(messageWithSlimMemory(originalMessage, memory), { readOnly });
+          // Retry the exact prompt built before this turn was marked pending, avoiding self-replay.
           // Keep the stable slim-memory session key; do not promote ephemeral agent ids.
           send({ type: "ready", sessionId: sessionKey });
           activeRun = undefined;
@@ -1111,6 +1127,7 @@ export {
   formatCompletedTurn,
   formatInterruptedTurn,
   formatSlimMemory,
+  pendingTurnContext,
   ingestCompactHistory,
   isEditFilesTool,
   isNovaDenyTaskHook,
