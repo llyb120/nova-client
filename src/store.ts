@@ -1374,18 +1374,8 @@ export async function sendPrompt(
 ) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
-  // 统一在 store 层处理内置命令：首页首条提示和会话内 Composer 都走这里。
-  // 只在 Composer 拦截会漏掉“新建会话后立即发送”的首页路径。
-  const builtInInput = text.trim();
-  if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
-    if (images.length > 0) throw new Error("/fire 暂不支持附件");
-    const parsed = parseFireInput(builtInInput);
-    await startFireRelay(parsed.goal, parsed.acceptanceCriteria);
-    return;
-  }
-  if (/^\/target(?:\s|$)/i.test(builtInInput)) {
-    throw new Error("/target 只能与 /fire 一起发送");
-  }
+  // 内置命令优先于员工交办/账本，避免 /fire 被当成普通交办内容。
+  if (await tryBuiltinPrompt(id, text, images)) return;
   // 在历史分支预览中追加提示词时才发生时间跳跃：先恢复该分支，再把新提示词
   // 发送到恢复出的会话。仅浏览或点击当前时间线不会恢复会话。
   if (timeMachineEditTarget?.threadId === id) {
@@ -1407,21 +1397,57 @@ export async function sendPrompt(
     await api.delegateEmployeeWork(id, employeeId, text, images);
     return;
   }
+  await deliverPrompt(id, text, images);
+}
+
+/** 处理 /fire 等内置命令。返回 true 表示已消费，调用方不应再发给模型。 */
+async function tryBuiltinPrompt(
+  threadId: string,
+  text: string,
+  images: PromptImage[],
+): Promise<boolean> {
+  const builtInInput = text.trim();
+  if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
+    if (images.length > 0) throw new Error("/fire 暂不支持附件");
+    const parsed = parseFireInput(builtInInput);
+    await startFireRelay(parsed.goal, parsed.acceptanceCriteria, threadId);
+    return true;
+  }
+  if (/^\/target(?:\s|$)/i.test(builtInInput)) {
+    throw new Error("/target 只能与 /fire 一起发送");
+  }
+  return false;
+}
+
+/** 创建会话 / 暂存前提前校验内置命令，避免 worktree 建完才发现 /fire 非法。 */
+export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
+  const builtInInput = text.trim();
+  if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
+    if (images.length > 0) throw new Error("/fire 暂不支持附件");
+    parseFireInput(builtInInput);
+    return;
+  }
+  if (/^\/target(?:\s|$)/i.test(builtInInput)) {
+    throw new Error("/target 只能与 /fire 一起发送");
+  }
+}
+
+/** 向指定会话投递普通提示词（含 Fire 阶段续跑）。不处理内置命令。 */
+async function deliverPrompt(threadId: string, text: string, images: PromptImage[]) {
   // Fire 阶段在暂停后，或已经产出过判断后，仍允许用户从该会话补充提示继续流程。
   // 本轮正常结束时会重新进入自动验收，而不是退化成不受跟踪的普通会话。
-  const resumedFireStep = resumeFireRelay(id);
-  // 继续发提示词时：若用户滚在中部，立刻跳到底（无过渡动画）
-  bumpChatScrollToBottom();
+  const resumedFireStep = resumeFireRelay(threadId);
+  if (state.currentId === threadId) bumpChatScrollToBottom();
   setState("proposedPlan", null);
-  setState("running", id, true);
+  setState("running", threadId, true);
   try {
-    await api.sendPrompt(id, text, images);
+    await api.sendPrompt(threadId, text, images);
   } catch (e) {
-    if (resumedFireStep && fireRelaySteps.get(id) === resumedFireStep) {
-      fireRelaySteps.delete(id);
-      suspendedFireRelaySteps.set(id, resumedFireStep);
+    if (resumedFireStep && fireRelaySteps.get(threadId) === resumedFireStep) {
+      fireRelaySteps.delete(threadId);
+      suspendedFireRelaySteps.set(threadId, resumedFireStep);
     }
-    setState("running", id, false);
+    setState("running", threadId, false);
     throw e;
   }
 }
@@ -1625,8 +1651,12 @@ async function suspendFireRelay(threadId: string, manual: boolean) {
   if (manual) await api.notifyFireDone(threadId, false);
 }
 
-export async function startFireRelay(goal: string, acceptanceCriteria: string | null = null) {
-  const rootId = state.currentId;
+export async function startFireRelay(
+  goal: string,
+  acceptanceCriteria: string | null = null,
+  threadId?: string | null,
+) {
+  const rootId = threadId ?? state.currentId;
   const trimmed = goal.trim();
   if (!rootId || !trimmed) throw new Error("请在 /fire 后输入目标");
   // 首页刚创建会话后会立即发送首条提示，此时异步 refreshThreads 可能尚未完成；
@@ -1653,7 +1683,25 @@ export async function startFireRelay(goal: string, acceptanceCriteria: string | 
   fireRelayStepHistory.set(rootId, rootStep);
   latestFireThreadByRoot.set(rootId, rootId);
   await refreshThreads();
-  await sendPrompt(fireWorkPrompt(trimmed));
+  // 远程或其它非 Composer 入口启动时，用户可能正在看别的会话；必须发到 rootId。
+  if (state.currentId === rootId) bumpChatScrollToBottom();
+  setState("proposedPlan", null);
+  setState("running", rootId, true);
+  try {
+    await api.sendPrompt(rootId, fireWorkPrompt(trimmed), []);
+  } catch (e) {
+    if (fireRelaySteps.get(rootId) === rootStep) {
+      fireRelaySteps.delete(rootId);
+      suspendedFireRelaySteps.set(rootId, rootStep);
+    }
+    setState("running", rootId, false);
+    throw e;
+  }
+}
+
+async function handleFireStart(threadId: string, text: string) {
+  const parsed = parseFireInput(text.trim());
+  await startFireRelay(parsed.goal, parsed.acceptanceCriteria, threadId);
 }
 
 /** ChatView 订阅：发送新提示词时强制滚到底 */
@@ -1682,15 +1730,18 @@ export function stashWorktreePrompt(threadId: string, text: string, images: Prom
   pendingWorktreePrompts.set(threadId, { text, images });
 }
 
-/** 向指定会话发送（不依赖 currentId），用于 worktree 就绪后补发首条提示词 */
-async function sendPromptTo(threadId: string, text: string, images: PromptImage[]) {
+/**
+ * 向指定会话发送（不依赖 currentId）。
+ * 所有「已知 threadId 的提示词投递」应走这里，以便统一拦截 /fire 等内置命令
+ * （worktree 就绪补发、以及未来其它非 Composer 入口）。
+ */
+export async function sendPromptTo(threadId: string, text: string, images: PromptImage[]) {
   if (!text.trim() && images.length === 0) return;
-  if (state.currentId === threadId) bumpChatScrollToBottom();
-  setState("running", threadId, true);
   try {
-    await api.sendPrompt(threadId, text, images);
-  } catch {
-    setState("running", threadId, false);
+    if (await tryBuiltinPrompt(threadId, text, images)) return;
+    await deliverPrompt(threadId, text, images);
+  } catch (e) {
+    console.error("sendPromptTo failed", e);
   }
 }
 
@@ -2036,8 +2087,11 @@ export async function initStore() {
 
   await listen<TurnEvent>("acp:turn", (e) => {
     setState("running", e.payload.threadId, e.payload.running);
-    if (e.payload.running) preloadThreadSnapshot(e.payload.threadId);
-    else {
+    if (e.payload.running) {
+      preloadThreadSnapshot(e.payload.threadId);
+      // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
+      resumeFireRelay(e.payload.threadId);
+    } else {
       if (fireRelaySteps.has(e.payload.threadId)) {
         const reason = e.payload.stopReason;
         const manuallyInterrupted = reason === "cancelled" || reason === "force_cancelled";
@@ -2057,6 +2111,12 @@ export async function initStore() {
         void openThread(e.payload.threadId);
       }
     }
+  });
+
+  await listen<{ threadId: string; text: string }>("fire:start", (e) => {
+    void handleFireStart(e.payload.threadId, e.payload.text).catch((error) =>
+      console.error("Fire start failed", error),
+    );
   });
 
   await listen<PermissionRequest>("acp:permission", (e) => {

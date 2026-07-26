@@ -3025,6 +3025,11 @@ pub(crate) fn dispatch_prompt(
     if text.is_empty() && images.is_empty() {
         return Err("内容不能为空".into());
     }
+    // 内置 /fire：任意入口（IPC、远程、后台重发、worktree 补发若未在前端拦截等）
+    // 都交前端编排，禁止把字面量丢给模型。
+    if remote::route_fire_command(app, &thread_id, &text, &images)? {
+        return Ok(());
+    }
     let (agent_kind, is_guest, is_quota, employee_id, mind_thread) = {
         let store = state.store.lock().unwrap();
         let t = store.get(&thread_id).ok_or("线程不存在")?;
