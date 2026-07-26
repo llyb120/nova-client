@@ -1,5 +1,6 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { Portal } from "solid-js/web";
 import { api } from "../ipc";
 import {
   compactThread,
@@ -1126,27 +1127,29 @@ export function ChatView() {
           </button>
         </aside>
       </Show>
-      <Show when={contextMenu()} keyed>
-        {(menu) => (
-          <div class="repo-time-context-backdrop" onMouseDown={() => setContextMenu(null)}>
-            <div
-              class="repo-time-context-menu"
-              style={{
-                left: `${Math.max(8, Math.min(menu.x, window.innerWidth - 188))}px`,
-                top: `${Math.max(8, Math.min(menu.y, window.innerHeight - 230))}px`,
-              }}
-              onMouseDown={(event) => event.stopPropagation()}
-            >
-              <button disabled={contextPrompts(menu.node, "to-start").length === 0} onClick={() => void deleteContext(menu.node, "to-start")}>删除到开始</button>
-              <button disabled={contextPrompts(menu.node, "up", 1).length === 0} onClick={() => void deleteContext(menu.node, "up")}>向上删除 n 个</button>
-              <button onClick={() => void deleteContext(menu.node, "self")}>删除自身</button>
-              <button disabled={contextPrompts(menu.node, "down", 1).length === 0} onClick={() => void deleteContext(menu.node, "down")}>向下删除 N 个</button>
-              <button disabled={contextPrompts(menu.node, "to-end").length === 0} onClick={() => void deleteContext(menu.node, "to-end")}>删除到结尾</button>
-              <div class="repo-time-context-hint">除“删除自身”外均不包含当前节点</div>
+      <Portal>
+        <Show when={contextMenu()} keyed>
+          {(menu) => (
+            <div class="repo-time-context-backdrop" onMouseDown={() => setContextMenu(null)}>
+              <div
+                class="repo-time-context-menu"
+                style={{
+                  left: `${Math.max(8, Math.min(menu.x, window.innerWidth - 210))}px`,
+                  top: `${Math.max(8, Math.min(menu.y, window.innerHeight - 250))}px`,
+                }}
+                onMouseDown={(event) => event.stopPropagation()}
+              >
+                <button disabled={contextPrompts(menu.node, "to-start").length === 0} onClick={() => void deleteContext(menu.node, "to-start")}>删除到开始</button>
+                <button disabled={contextPrompts(menu.node, "up", 1).length === 0} onClick={() => void deleteContext(menu.node, "up")}>向上删除 n 个</button>
+                <button onClick={() => void deleteContext(menu.node, "self")}>删除自身</button>
+                <button disabled={contextPrompts(menu.node, "down", 1).length === 0} onClick={() => void deleteContext(menu.node, "down")}>向下删除 N 个</button>
+                <button disabled={contextPrompts(menu.node, "to-end").length === 0} onClick={() => void deleteContext(menu.node, "to-end")}>删除到结尾</button>
+                <div class="repo-time-context-hint">除“删除自身”外均不包含当前节点</div>
+              </div>
             </div>
-          </div>
-        )}
-      </Show>
+          )}
+        </Show>
+      </Portal>
       <Show when={showStageRail()}>
         <aside class="stage-rail" aria-label="会话阶段导航">
           <div class="stage-rail-count">{stageThreads().length} 个事件</div>

@@ -4,26 +4,28 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
-const STORE_VERSION: u32 = 1;
-/// 非 Git 目录使用固定基准；这类时间点保存的是目录内所有普通文件的完整快照。
-const DIRECTORY_BASE: &str = "nova-directory-v1";
-/// 漫游 guest 的工作目录位于对端，本机世界线只保存会话快照；文件快照由 host 侧记录。
-const REMOTE_BASE: &str = "nova-remote-v1";
+const STORE_VERSION: u32 = 2;
+const IGNORED_DIRECTORIES: &[&str] = &[
+    ".git",
+    ".nova",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".cache",
+    ".next",
+    ".turbo",
+    "coverage",
+];
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchEntry {
     pub path: String,
-    /// HEAD 中不存在表示这是未跟踪文件。
-    pub base_blob: Option<String>,
-    /// 当前不存在表示这个时间点删除了该文件。
-    pub target_blob: Option<String>,
+    pub blob: String,
     #[serde(default)]
-    pub base_executable: bool,
-    #[serde(default)]
-    pub target_executable: bool,
+    pub executable: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -34,8 +36,7 @@ struct Checkpoint {
     source_thread_id: String,
     title: String,
     created_at: i64,
-    repo_root: String,
-    base_head: String,
+    workspace_root: String,
     entries: Vec<PatchEntry>,
     thread_snapshot: Thread,
     #[serde(default)]
@@ -128,7 +129,12 @@ fn load_store(data_dir: &Path) -> Result<StoreFile, String> {
         return Ok(StoreFile::default());
     }
     let bytes = fs::read(&path).map_err(|e| format!("读取世界线数据失败：{e}"))?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("解析世界线数据失败：{e}"))
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("解析世界线数据失败：{e}"))?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(STORE_VERSION as u64) {
+        return Ok(StoreFile::default());
+    }
+    serde_json::from_value(value).map_err(|e| format!("解析世界线数据失败：{e}"))
 }
 
 fn save_store(data_dir: &Path, store: &StoreFile) -> Result<(), String> {
@@ -192,44 +198,13 @@ fn get_blob(data_dir: &Path, hash: &str) -> Result<Vec<u8>, String> {
     fs::read(object_path(data_dir, hash)).map_err(|e| format!("读取世界线对象 {hash} 失败：{e}"))
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|e| format!("无法执行 git：{e}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if error.is_empty() {
-            format!("git {} 执行失败", args.join(" "))
-        } else {
-            error
-        })
-    }
-}
-
-fn git_text(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    String::from_utf8(git(cwd, args)?).map_err(|_| "git 返回了非 UTF-8 路径，暂不支持该仓库".into())
-}
-
-fn repository_identity(cwd: &Path) -> Result<(PathBuf, String), String> {
-    // 优先沿用 Git 的 HEAD 作为稳定基准。目录不是仓库、Git 未安装，或仓库尚无
-    // 首次提交时，退化成普通目录快照，使秒表在任意项目目录都可用。
-    if let Ok(root) = git_text(cwd, &["rev-parse", "--show-toplevel"]) {
-        let root = PathBuf::from(root.trim());
-        if let Ok(head) = git_text(&root, &["rev-parse", "--verify", "HEAD"]) {
-            return Ok((root, head.trim().to_string()));
-        }
-    }
+fn workspace_root(cwd: &Path) -> Result<PathBuf, String> {
     let root =
         fs::canonicalize(cwd).map_err(|e| format!("无法访问工作目录 {}：{e}", cwd.display()))?;
     if !root.is_dir() {
         return Err(format!("工作目录不是文件夹：{}", root.display()));
     }
-    Ok((root, DIRECTORY_BASE.into()))
+    Ok(root)
 }
 
 fn safe_relative(path: &str) -> Result<PathBuf, String> {
@@ -240,67 +215,9 @@ fn safe_relative(path: &str) -> Result<PathBuf, String> {
             .components()
             .any(|part| !matches!(part, Component::Normal(_)))
     {
-        return Err(format!("仓库包含不安全路径：{path}"));
+        return Err(format!("工作区包含不安全路径：{path}"));
     }
     Ok(candidate)
-}
-
-fn changed_paths(root: &Path) -> Result<Vec<String>, String> {
-    let bytes = git(
-        root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )?;
-    let chunks: Vec<&[u8]> = bytes
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .collect();
-    let mut paths = BTreeSet::new();
-    let mut index = 0;
-    while index < chunks.len() {
-        let entry = chunks[index];
-        if entry.len() < 4 || entry[2] != b' ' {
-            return Err("无法解析 git status 输出".into());
-        }
-        let status = &entry[..2];
-        let path = std::str::from_utf8(&entry[3..])
-            .map_err(|_| "仓库包含非 UTF-8 路径，暂不支持创建时间点")?;
-        safe_relative(path)?;
-        paths.insert(path.replace('\\', "/"));
-        if status.contains(&b'R') || status.contains(&b'C') {
-            index += 1;
-            let old = chunks.get(index).ok_or("无法解析 git 重命名状态")?;
-            let old = std::str::from_utf8(old)
-                .map_err(|_| "仓库包含非 UTF-8 路径，暂不支持创建时间点")?;
-            safe_relative(old)?;
-            paths.insert(old.replace('\\', "/"));
-        }
-        index += 1;
-    }
-    Ok(paths.into_iter().collect())
-}
-
-fn base_file(root: &Path, head: &str, path: &str) -> Result<Option<(Vec<u8>, bool)>, String> {
-    let tree = git_text(root, &["ls-tree", head, "--", path])?;
-    let Some(tree_entry) = tree.lines().next() else {
-        return Ok(None);
-    };
-    if tree_entry.starts_with("120000 ") {
-        return Err(format!("世界线第一版暂不支持符号链接：{path}"));
-    }
-    if tree_entry.starts_with("160000 ") {
-        return Err(format!("世界线第一版暂不支持子模块：{path}"));
-    }
-    let spec = format!("{head}:{path}");
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["show", "--no-ext-diff", &spec])
-        .output()
-        .map_err(|e| format!("无法读取 Git 基准文件 {path}：{e}"))?;
-    if !output.status.success() {
-        return Err(format!("无法读取 Git 基准文件：{path}"));
-    }
-    Ok(Some((output.stdout, tree_entry.starts_with("100755 "))))
 }
 
 #[cfg(unix)]
@@ -322,17 +239,19 @@ fn directory_files(root: &Path) -> Result<Vec<String>, String> {
             let child =
                 child.map_err(|e| format!("读取目录项失败 {}：{e}", directory.display()))?;
             let path = child.path();
-            // 尚无首次提交的 Git 仓库也走目录模式，绝不能把 Git 内部对象纳入快照。
-            if child.file_name() == ".git" {
-                continue;
-            }
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|e| format!("读取文件属性失败 {}：{e}", path.display()))?;
-            // 不跟随链接，也不改动套接字等特殊文件；恢复时这些路径会原样保留。
             if metadata.file_type().is_symlink() {
                 continue;
             }
             if metadata.is_dir() {
+                let name = child.file_name();
+                if IGNORED_DIRECTORIES
+                    .iter()
+                    .any(|ignored| name == std::ffi::OsStr::new(ignored))
+                {
+                    continue;
+                }
                 visit(root, &path, paths)?;
             } else if metadata.is_file() {
                 let relative = path
@@ -355,47 +274,18 @@ fn directory_files(root: &Path) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
-fn capture_manifest(data_dir: &Path, root: &Path, head: &str) -> Result<Vec<PatchEntry>, String> {
-    let directory_snapshot = head == DIRECTORY_BASE;
-    let paths = if directory_snapshot {
-        directory_files(root)?
-    } else {
-        changed_paths(root)?
-    };
+fn capture_manifest(data_dir: &Path, root: &Path) -> Result<Vec<PatchEntry>, String> {
     let mut entries = Vec::new();
-    for path in paths {
-        let relative = safe_relative(&path)?;
-        let absolute = root.join(&relative);
-        let base = if directory_snapshot {
-            None
-        } else {
-            base_file(root, head, &path)?
-        };
-        let (base_blob, base_executable) = match base {
-            Some((bytes, mode)) => (Some(put_blob(data_dir, &bytes)?), mode),
-            None => (None, false),
-        };
-        let (target_blob, target_executable) = match fs::symlink_metadata(&absolute) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(format!("世界线第一版暂不支持符号链接：{path}"));
-                }
-                if !metadata.is_file() {
-                    return Err(format!("世界线第一版暂不支持子模块或特殊文件：{path}"));
-                }
-                let bytes = fs::read(&absolute)
-                    .map_err(|e| format!("读取变动文件失败 {}：{e}", absolute.display()))?;
-                (Some(put_blob(data_dir, &bytes)?), executable(&metadata))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, false),
-            Err(error) => return Err(format!("读取文件属性失败 {}：{error}", absolute.display())),
-        };
+    for path in directory_files(root)? {
+        let absolute = root.join(safe_relative(&path)?);
+        let metadata = fs::symlink_metadata(&absolute)
+            .map_err(|e| format!("读取文件属性失败 {}：{e}", absolute.display()))?;
+        let bytes = fs::read(&absolute)
+            .map_err(|e| format!("读取工作区文件失败 {}：{e}", absolute.display()))?;
         entries.push(PatchEntry {
             path,
-            base_blob,
-            target_blob,
-            base_executable,
-            target_executable,
+            blob: put_blob(data_dir, &bytes)?,
+            executable: executable(&metadata),
         });
     }
     Ok(entries)
@@ -467,23 +357,22 @@ fn append_checkpoint(
     thread: &Thread,
     automatic: bool,
 ) -> Result<String, String> {
-    // 漫游 guest 只有对端路径和会话镜像，不能在本机读取工作区。host 会为真实工作目录
-    // 保存自己的文件快照；guest 时间线仍完整保存对话分支，并在恢复时保持远端路由。
+    // 漫游 guest 的工作目录位于对端，本机只保存会话快照。
     let remote = thread.is_roaming_guest();
-    let (root, head) = if remote {
-        (PathBuf::from(&thread.cwd), REMOTE_BASE.to_string())
+    let root = if remote {
+        PathBuf::from(&thread.cwd)
     } else {
-        repository_identity(Path::new(&thread.cwd))?
+        workspace_root(Path::new(&thread.cwd))?
     };
     if let Some(first) = timeline.checkpoints.first() {
-        if first.repo_root != root.to_string_lossy() || first.base_head != head {
-            return Err("仓库目录或 HEAD 已变化，不能继续写入原世界线时间线".into());
+        if first.workspace_root != root.to_string_lossy() {
+            return Err("工作目录已变化，不能继续写入原世界线时间线".into());
         }
     }
     let entries = if remote {
         Vec::new()
     } else {
-        capture_manifest(data_dir, &root, &head)?
+        capture_manifest(data_dir, &root)?
     };
     let id = uuid::Uuid::new_v4().to_string();
     let parent_id = timeline
@@ -498,8 +387,7 @@ fn append_checkpoint(
         // 时间树节点始终用用户提示词命名，便于在右侧直接识别会话分支。
         title: latest_prompt_title(thread),
         created_at: now_ms(),
-        repo_root: root.to_string_lossy().to_string(),
-        base_head: head,
+        workspace_root: root.to_string_lossy().to_string(),
         entries,
         thread_snapshot: thread.clone(),
         automatic,
@@ -765,12 +653,8 @@ fn write_blob(
 }
 
 fn restore_manifest(data_dir: &Path, checkpoint: &Checkpoint) -> Result<(), String> {
-    let root = PathBuf::from(&checkpoint.repo_root);
-    let (_, current_head) = repository_identity(&root)?;
-    if current_head != checkpoint.base_head {
-        return Err("仓库 HEAD 已变化。为避免覆盖其他版本，已取消跳转".into());
-    }
-    let current_entries = capture_manifest(data_dir, &root, &current_head)?;
+    let root = workspace_root(Path::new(&checkpoint.workspace_root))?;
+    let current_entries = capture_manifest(data_dir, &root)?;
     let current: HashMap<&str, &PatchEntry> = current_entries
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
@@ -805,16 +689,9 @@ fn restore_manifest(data_dir: &Path, checkpoint: &Checkpoint) -> Result<(), Stri
 
     let apply = || -> Result<(), String> {
         for path in &paths {
-            if let Some(entry) = target.get(path) {
-                match &entry.target_blob {
-                    Some(hash) => write_blob(data_dir, &root, path, hash, entry.target_executable)?,
-                    None => remove_path(&root.join(safe_relative(path)?))?,
-                }
-            } else if let Some(entry) = current.get(path) {
-                match &entry.base_blob {
-                    Some(hash) => write_blob(data_dir, &root, path, hash, entry.base_executable)?,
-                    None => remove_path(&root.join(safe_relative(path)?))?,
-                }
+            match target.get(path) {
+                Some(entry) => write_blob(data_dir, &root, path, &entry.blob, entry.executable)?,
+                None => remove_path(&root.join(safe_relative(path)?))?,
             }
         }
         Ok(())
@@ -869,7 +746,7 @@ pub fn restore_checkpoint(
                 serde_json::to_value(&cp.thread_snapshot.items).ok()
                     != serde_json::to_value(&current_thread.items).ok()
                     || cp.thread_snapshot.plan != current_thread.plan
-                    || capture_manifest(data_dir, Path::new(&cp.repo_root), &cp.base_head)
+                    || capture_manifest(data_dir, Path::new(&cp.workspace_root))
                         .map(|entries| entries != cp.entries)
                         .unwrap_or(true)
             })
@@ -887,7 +764,7 @@ pub fn restore_checkpoint(
     }
 
     let target = store.timelines[timeline_index].checkpoints[checkpoint_index].clone();
-    if restore_files && target.base_head != REMOTE_BASE {
+    if restore_files && !current_thread.is_roaming_guest() {
         restore_manifest(data_dir, &target)?;
     }
 
@@ -967,9 +844,47 @@ mod tests {
         assert_eq!(prompts[0].id, first.id());
         assert_eq!(prompts[0].text, "first");
         assert_eq!(prompts[1].text, "third");
-        assert!(!thread.items.iter().any(|item| {
-            matches!(item, Item::System { text, .. } if text == "second result")
-        }));
+        assert!(!thread
+            .items
+            .iter()
+            .any(|item| { matches!(item, Item::System { text, .. } if text == "second result") }));
+    }
+
+    #[test]
+    fn old_worldline_store_is_discarded_without_migration() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-old-store-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        fs::create_dir_all(time_machine_dir(&data)).unwrap();
+        fs::write(
+            store_path(&data),
+            br#"{"version":1,"timelines":[{"id":"old"}]}"#,
+        )
+        .unwrap();
+
+        let store = load_store(&data).unwrap();
+        assert_eq!(store.version, STORE_VERSION);
+        assert!(store.timelines.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_snapshot_ignores_generated_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-ignore-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::write(root.join("src/main.ts"), b"source").unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), b"dependency").unwrap();
+        fs::write(root.join(".git/objects/object"), b"git").unwrap();
+
+        assert_eq!(directory_files(&root).unwrap(), vec!["src/main.ts"]);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1161,25 +1076,7 @@ mod tests {
         let repo = root.join("repo");
         let data = root.join("data");
         fs::create_dir_all(&repo).unwrap();
-        let run = |args: &[&str]| {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        run(&["init"]);
-        run(&["config", "user.email", "time-machine@example.invalid"]);
-        run(&["config", "user.name", "Time Machine Test"]);
         fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
-        run(&["add", "tracked.txt"]);
-        run(&["commit", "-m", "base"]);
 
         let thread = Thread::new(
             repo.to_string_lossy().to_string(),
