@@ -52,7 +52,7 @@ const mockSettings = {
   devinPath: "", acpArgs: "", devinProxy: "", codebuddyPath: "", codebuddyProxy: "",
   claudecodePath: "", claudecodeProxy: "", claudecodeSdkApiKey: "", cursorProxy: "",
   cursorPath: "", cursorSdkApiKey: "", opencodePath: "", opencodeProxy: "",
-  codexPath: "", codexProxy: "", windowsShellShimEnabled: false,
+  codexPath: "", codexProxy: "", vegaProxy: "", windowsShellShimEnabled: false,
   defaultMode: "build", titleModelAgent: "", titleModel: "", shareModelAgent: "",
   shareModel: "", editor: "cursor", theme: "", historyDisplayMode: "project",
   relayServer: "", relayToken: "", relayGroups: "", remoteControlEnabled: false,

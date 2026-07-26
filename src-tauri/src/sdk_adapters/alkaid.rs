@@ -21,10 +21,10 @@ impl SdkAdapter for AlkaidAdapter {
         )
     }
 
-    fn launch_config(&self, _settings: &Settings) -> LaunchConfig {
+    fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
             program: "node".into(),
-            proxy: String::new(),
+            proxy: settings.vega_proxy.clone(),
             path_env: "ALKAID_RUNTIME",
             api_key: None,
         }

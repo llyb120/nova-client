@@ -610,6 +610,7 @@ fn config(app: &AppHandle) -> Option<RemoteConfig> {
         .unwrap_or_else(|| "Nova".into());
     let proxy = crate::server::configured_proxy().unwrap_or_else(|| {
         [
+            &s.vega_proxy,
             &s.devin_proxy,
             &s.codex_proxy,
             &s.codebuddy_proxy,

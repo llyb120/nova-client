@@ -147,6 +147,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [opencodePath, setOpencodePath] = createSignal(s?.opencodePath ?? "opencode");
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
+  const [vegaProxy, setVegaProxy] = createSignal(s?.vegaProxy ?? "");
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
@@ -400,6 +401,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     opencodePath: opencodePath().trim() || "opencode",
     codexPath: codexPath().trim() || "codex",
     codexProxy: codexProxy().trim(),
+    vegaProxy: vegaProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
     vegaSlimContextEnabled: vegaSlimContextEnabled(),
     checkpointEnabled: checkpointEnabled(),
@@ -1044,6 +1046,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <span class="fixed-integration">PI</span>
                 <span class="field-hint">复用本机 Codex provider 凭据，支持并行文件工具、MCP 与 Skills。</span>
               </div>
+              <ProxyField value={vegaProxy()} onInput={setVegaProxy} />
             </div>
 
             <div class="backend-card">

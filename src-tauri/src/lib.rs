@@ -3657,6 +3657,7 @@ async fn apply_runtime_settings(
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
     let (
+        restart_vega,
         restart_devin,
         restart_codebuddy,
         restart_claudecode,
@@ -3668,6 +3669,9 @@ async fn apply_runtime_settings(
         recheck_availability,
     ) = {
         let mut s = state.settings.lock().unwrap();
+        let restart_vega = restart_all_agents
+            || s.vega_proxy != settings.vega_proxy
+            || s.alkaid_enabled != settings.alkaid_enabled;
         let restart_devin = restart_all_agents
             || s.devin_path != settings.devin_path
             || s.acp_args != settings.acp_args
@@ -3714,6 +3718,7 @@ async fn apply_runtime_settings(
             s.save(&state.config_dir);
         }
         (
+            restart_vega,
             restart_devin,
             restart_codebuddy,
             restart_claudecode,
@@ -3725,6 +3730,10 @@ async fn apply_runtime_settings(
             recheck_availability,
         )
     };
+    if restart_vega {
+        state.alkaid.shutdown();
+        state.alkaid.refresh_model_options_soon();
+    }
     if restart_devin {
         // 杀掉当前进程，下次发消息时用新配置重启（历史会话靠 session/load 恢复）
         state.acp.kill_conn().await;

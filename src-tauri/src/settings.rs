@@ -48,6 +48,8 @@ pub struct Settings {
     pub codex_args: String,
     /// Codex 代理地址（空 = 不覆盖环境变量）
     pub codex_proxy: String,
+    /// Vega provider 代理地址（空 = 不覆盖环境变量）
+    pub vega_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
     /// Vega 使用类似 Cursor 的精简上下文：仅携带用户提示词和轮次结论，并自动摘要旧轮次。
@@ -143,6 +145,7 @@ impl Default for Settings {
             codex_path: "codex".into(),
             codex_args: "app-server --stdio".into(),
             codex_proxy: String::new(),
+            vega_proxy: String::new(),
             windows_shell_shim_enabled: false,
             vega_slim_context_enabled: false,
             checkpoint_enabled: false,

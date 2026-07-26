@@ -368,6 +368,8 @@ export interface Settings {
   opencodeProxy: string;
   codexPath: string;
   codexProxy: string;
+  /** Vega provider 代理地址 */
+  vegaProxy: string;
   /** Windows shell 启动 shim（保存后重启应用生效） */
   windowsShellShimEnabled: boolean;
   /** Vega 精简上下文：仅保留用户提示词与结论，旧轮次自动摘要 */

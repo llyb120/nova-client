@@ -62,9 +62,9 @@ const HELP: &str = r#"Nova Headless Server
   relay-server, token, groups, name, proxy, default-mode
   devin-path, codex-path, codex-args, codebuddy-path, claude-path,
   cursor-path, opencode-path
-  devin-proxy, codex-proxy, codebuddy-proxy, claude-proxy,
+  vega-proxy, devin-proxy, codex-proxy, codebuddy-proxy, claude-proxy,
   cursor-proxy, opencode-proxy
-  devin-enabled, codex-enabled, codebuddy-enabled, claude-enabled,
+  vega-enabled, devin-enabled, codex-enabled, codebuddy-enabled, claude-enabled,
   cursor-enabled, opencode-enabled
   env.<NAME>（例如 config.toml 中自定义 provider 的 env_key）
 
@@ -295,6 +295,7 @@ fn show_config(show_token: bool) -> Result<(), String> {
         "environment": environment,
         "defaultMode": settings.default_mode,
         "agents": {
+            "vega": { "enabled": settings.alkaid_enabled, "proxy": settings.vega_proxy },
             "devin": { "enabled": settings.devin_enabled, "path": settings.devin_path, "proxy": settings.devin_proxy },
             "codex": { "enabled": settings.codex_enabled, "path": settings.codex_path, "args": settings.codex_args, "proxy": settings.codex_proxy },
             "codebuddy": { "enabled": settings.codebuddy_enabled, "path": settings.codebuddy_path, "proxy": settings.codebuddy_proxy },
@@ -347,12 +348,14 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
             "claude-path" => settings.claudecode_path = value.into(),
             "cursor-path" => settings.cursor_path = value.into(),
             "opencode-path" => settings.opencode_path = value.into(),
+            "vega-proxy" => settings.vega_proxy = value.into(),
             "devin-proxy" => settings.devin_proxy = value.into(),
             "codex-proxy" => settings.codex_proxy = value.into(),
             "codebuddy-proxy" => settings.codebuddy_proxy = value.into(),
             "claude-proxy" => settings.claudecode_proxy = value.into(),
             "cursor-proxy" => settings.cursor_proxy = value.into(),
             "opencode-proxy" => settings.opencode_proxy = value.into(),
+            "vega-enabled" => settings.alkaid_enabled = parse_bool(value)?,
             "devin-enabled" => settings.devin_enabled = parse_bool(value)?,
             "codex-enabled" => settings.codex_enabled = parse_bool(value)?,
             "codebuddy-enabled" => settings.codebuddy_enabled = parse_bool(value)?,

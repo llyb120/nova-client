@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ALKAID_PROVIDER_IDLE_TIMEOUT_MS, alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, messagesWithPendingAlkaidPrompt, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { ALKAID_PROVIDER_IDLE_TIMEOUT_ENABLED, ALKAID_PROVIDER_IDLE_TIMEOUT_MS, alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, messagesWithPendingAlkaidPrompt, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
 import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
@@ -226,7 +226,11 @@ async function prompt(request, commands) {
   let commandBusy = false;
   let commandRevision = 0;
   const steeringMessages = [];
-  const diagnosticLog = createAlkaidDiagnosticLog(dataRoot);
+  // Timeout diagnostics are paused together with the provider idle timeout. Keep the recorder and
+  // payload below intact so both can be restored by changing the feature flag in alkaid-core.mjs.
+  const diagnosticLog = ALKAID_PROVIDER_IDLE_TIMEOUT_ENABLED
+    ? createAlkaidDiagnosticLog(dataRoot)
+    : { record() {}, async flush() {} };
   const requestStartedAt = Date.now();
   let providerAttemptStartedAt = requestStartedAt;
   let providerAttempt = 0;
@@ -244,6 +248,7 @@ async function prompt(request, commands) {
     toolEnds: 0,
   };
   const idleTimeout = createAlkaidIdleTimeout({
+    timeoutMs: ALKAID_PROVIDER_IDLE_TIMEOUT_ENABLED ? ALKAID_PROVIDER_IDLE_TIMEOUT_MS : 0,
     onTimeout: () => {
       const messages = runtime.agent.state.messages;
       diagnosticLog.record({

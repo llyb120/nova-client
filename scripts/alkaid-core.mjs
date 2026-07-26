@@ -26,6 +26,8 @@ export const OPENAI_TOOL_OUTPUT_MAX_CHARS = 10_485_760;
 export const OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS = OPENAI_TOOL_OUTPUT_MAX_CHARS - 512;
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1000, 3000];
 export const ALKAID_PROVIDER_IDLE_TIMEOUT_MS = 120_000;
+// Temporarily disabled: keep the timeout implementation available for controlled re-enablement.
+export const ALKAID_PROVIDER_IDLE_TIMEOUT_ENABLED = false;
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const SKILL_COMPRESSION_MIN_COUNT = 4;
 const IMAGE_MEDIA_TYPES = {
