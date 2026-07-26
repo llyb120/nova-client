@@ -27,6 +27,9 @@ const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
 /// 首次连接只预热最新会话；其余历史按点击请求，兼顾首屏速度与流量。
 const PREFETCH_RECENT: usize = 1;
 const REMOTE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// `/fire` 由前端编排（阶段会话 / 验收循环）；Rust 只负责拦截并投递。
+/// 任意会进入 `dispatch_prompt` 的来源（IPC、远程、后台重发等）共用此事件。
+pub const EV_FIRE_START: &str = "fire:start";
 
 #[derive(Clone, PartialEq, Eq)]
 struct RemoteConfig {
@@ -1049,6 +1052,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fire_command_detection_matches_frontend() {
+        assert!(is_fire_command("/fire"));
+        assert!(is_fire_command("/FIRE do it"));
+        assert!(is_fire_command("/fire\nline"));
+        assert!(!is_fire_command("/firefox"));
+        assert!(!is_fire_command("fire now"));
+        assert!(is_target_only_command("/target rules"));
+        assert!(!is_target_only_command("/fire\n/target rules"));
+    }
+
+    #[test]
+    fn fire_input_validation_requires_goal_and_single_target() {
+        assert!(validate_fire_input("/fire").is_err());
+        assert!(validate_fire_input("/fire   ").is_err());
+        assert!(validate_fire_input("/fire ship it").is_ok());
+        assert!(validate_fire_input("/fire ship it\n/target must pass tests").is_ok());
+        assert!(validate_fire_input("/fire ship it\n/target").is_err());
+        assert!(validate_fire_input("/fire ship it\n/target a\n/target b").is_err());
+    }
+
+    #[test]
     fn model_signature_does_not_depend_on_hashmap_order() {
         let mut left = HashMap::new();
         left.insert("codex".to_string(), json!({ "models": ["gpt-5"] }));
@@ -1818,7 +1842,125 @@ fn send_prompt(
     }
     // 复用本地聊天的唯一分发入口：运行中的 Alkaid/Codex/Devin 走原生引导，
     // Cursor 走打断后新 turn（Agent.create + slim memory），与桌面输入框保持一致。
+    // `/fire` 在 dispatch_prompt 内统一拦截，远程与其它入口行为一致。
     crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), images)
+}
+
+/// 识别并投递 `/fire`。`Ok(true)` 表示已交给前端；`Ok(false)` 表示非 Fire 指令。
+/// 供 `dispatch_prompt` 调用，覆盖 IPC / 远程 / 后台重发等全部入口。
+pub(crate) fn route_fire_command(
+    app: &AppHandle,
+    thread_id: &str,
+    text: &str,
+    images: &[PromptImage],
+) -> Result<bool, String> {
+    let trimmed = text.trim();
+    if is_target_only_command(trimmed) {
+        return Err("/target 只能与 /fire 一起发送".into());
+    }
+    if !is_fire_command(trimmed) {
+        return Ok(false);
+    }
+    if crate::server::is_headless() {
+        return Err("/fire 在无界面（headless）模式下暂不支持".into());
+    }
+    if !images.is_empty() {
+        return Err("/fire 暂不支持附件".into());
+    }
+    // 与前端 startFireRelay 对齐的前置校验，避免无效事件进入 UI。
+    validate_fire_input(trimmed)?;
+    {
+        let state = app.state::<AppState>();
+        let store = state.store.lock().unwrap();
+        let thread = store.get(thread_id).ok_or("会话不存在")?;
+        if thread.employee_id.is_some()
+            || thread.mind_thread
+            || thread.roaming_role.is_some()
+            || thread.quota_peer_name.is_some()
+        {
+            return Err("/fire 仅支持本地普通会话".into());
+        }
+        if is_running(&state, thread) {
+            return Err("请等待当前会话结束后再启动 /fire".into());
+        }
+    }
+    let _ = app.emit(
+        EV_FIRE_START,
+        json!({ "threadId": thread_id, "text": trimmed }),
+    );
+    Ok(true)
+}
+
+fn is_fire_command(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 5 || !bytes[..5].eq_ignore_ascii_case(b"/fire") {
+        return false;
+    }
+    bytes.len() == 5 || matches!(bytes[5], b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn is_target_only_command(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 7 || !bytes[..7].eq_ignore_ascii_case(b"/target") {
+        return false;
+    }
+    bytes.len() == 7 || matches!(bytes[7], b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn validate_fire_input(input: &str) -> Result<(), String> {
+    let body = strip_fire_prefix(input);
+    let mut target_starts = Vec::new();
+    let lower = body.to_ascii_lowercase();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i + 7 <= bytes.len() {
+        let at_line_start = i == 0 || bytes[i - 1] == b'\n';
+        if at_line_start && lower.as_bytes()[i..i + 7] == *b"/target" {
+            let after = i + 7;
+            if after == bytes.len() || matches!(bytes[after], b' ' | b'\t' | b'\n' | b'\r') {
+                target_starts.push(i);
+                i = after;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if target_starts.len() > 1 {
+        return Err("每个 /fire 只能指定一次 /target".into());
+    }
+    if let Some(start) = target_starts.first().copied() {
+        let goal = body[..start].trim();
+        if goal.is_empty() {
+            return Err("请在 /fire 后输入目标".into());
+        }
+        let after_keyword = body[start + 7..].trim_start_matches([' ', '\t']);
+        if after_keyword.trim().is_empty() {
+            return Err("请在 /target 后输入验收规则".into());
+        }
+        return Ok(());
+    }
+    if body.trim().is_empty() {
+        return Err("请在 /fire 后输入目标".into());
+    }
+    Ok(())
+}
+
+fn strip_fire_prefix(input: &str) -> &str {
+    let bytes = input.as_bytes();
+    if bytes.len() < 5 || !bytes[..5].eq_ignore_ascii_case(b"/fire") {
+        return input;
+    }
+    let mut rest = &input[5..];
+    if let Some(stripped) = rest.strip_prefix("\r\n") {
+        return stripped;
+    }
+    if let Some(stripped) = rest.strip_prefix('\n').or_else(|| rest.strip_prefix('\r')) {
+        return stripped;
+    }
+    while let Some(stripped) = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('\t')) {
+        rest = stripped;
+    }
+    rest
 }
 
 async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {

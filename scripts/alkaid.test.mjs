@@ -316,9 +316,10 @@ test("usage is accumulated across every model request in an agent turn", () => {
   assert.equal(mergeAlkaidUsage(undefined, undefined), undefined);
 });
 
-test("provider stream disconnects retry silently and preserve context", async () => {
+test("incomplete OpenAI response streams retry silently and preserve context", async () => {
   const user = { role: "user", content: [{ type: "text", text: "work" }], timestamp: Date.now() };
-  const failed = { role: "assistant", content: [], stopReason: "error", errorMessage: "terminated" };
+  const failure = "OpenAI Responses stream ended before a terminal response event";
+  const failed = { role: "assistant", content: [], stopReason: "error", errorMessage: failure };
   const completed = { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" };
   const retries = [];
   const agent = {
@@ -334,7 +335,8 @@ test("provider stream disconnects retry silently and preserve context", async ()
   assert.equal(outcome.last, completed);
   assert.equal(outcome.retries, 1);
   assert.deepEqual(agent.state.messages, [user, completed]);
-  assert.deepEqual(retries, ["1:terminated", 1000]);
+  assert.deepEqual(retries, [`1:${failure}`, 1000]);
+  assert.equal(isRetryableAlkaidProviderError(failure), true);
   assert.equal(isRetryableAlkaidProviderError("TypeError: terminated"), true);
   assert.equal(isRetryableAlkaidProviderError("Connection error."), true);
   assert.equal(isRetryableAlkaidProviderError("HTTP 429 Too Many Requests"), true);

@@ -23,7 +23,8 @@ impl SdkAdapter for CursorAdapter {
 
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
-            program: settings.cursor_path.clone(),
+            // Cursor 仅依赖 Node.js 运行官方 SDK bridge，不再读取本机 cursor-agent。
+            program: "node".into(),
             proxy: settings.cursor_proxy.clone(),
             path_env: "NOVA_CURSOR_PATH",
             api_key: (!settings.cursor_sdk_api_key.is_empty())

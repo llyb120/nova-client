@@ -144,7 +144,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [acpArgs, setAcpArgs] = createSignal(s?.acpArgs ?? "acp");
   const [codebuddyPath, setCodebuddyPath] = createSignal(s?.codebuddyPath ?? "codebuddy");
   const [claudecodePath, setClaudecodePath] = createSignal(s?.claudecodePath ?? "claude");
-  const [cursorPath, setCursorPath] = createSignal(s?.cursorPath ?? "cursor-agent");
   const [opencodePath, setOpencodePath] = createSignal(s?.opencodePath ?? "opencode");
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
@@ -396,7 +395,8 @@ export function SettingsModal(props: { onClose: () => void }) {
     acpArgs: acpArgs().trim() || "acp",
     codebuddyPath: codebuddyPath().trim() || "codebuddy",
     claudecodePath: claudecodePath().trim() || "claude",
-    cursorPath: cursorPath().trim() || "cursor-agent",
+    // Cursor 仅走官方 SDK，不再依赖本机 cursor-agent；保留字段兼容旧配置。
+    cursorPath: s?.cursorPath?.trim() || "cursor-agent",
     opencodePath: opencodePath().trim() || "opencode",
     codexPath: codexPath().trim() || "codex",
     codexProxy: codexProxy().trim(),
@@ -985,7 +985,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             </section>
 
             <section class="settings-group">
-              <h3 class="settings-group-title">时光机</h3>
+              <h3 class="settings-group-title">世界线</h3>
               <div class="field">
                 <span class="field-label">启用 Checkpoint</span>
                 <label class="backend-switch">
@@ -1226,9 +1226,6 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge cursor`}>{agentLabel("cursor")}</span>
-                <Show when={backendMissing("cursor")}>
-                  <span class="backend-missing">未检测到 CLI</span>
-                </Show>
                 <label class="backend-switch">
                   <input
                     type="checkbox"
@@ -1239,21 +1236,9 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <CliManager
-                status={cliStatuses().cursor}
-                loading={cliLoading()}
-                busy={upgradingCli() !== null}
-                upgrading={upgradingCli() === "cursor"}
-                message={cliMessages().cursor}
-                onUpgrade={() => void upgradeCli("cursor")}
-              />
               <div class="backend-config-row">
                 <span class="fixed-integration">SDK</span>
                 <div class="backend-fields">
-                  <label class="backend-field">
-                    <span class="field-label">可执行文件</span>
-                    <input class="field-input" value={cursorPath()} onInput={(e) => setCursorPath(e.currentTarget.value)} placeholder="cursor-agent" />
-                  </label>
                   <label class="backend-field backend-field-wide">
                     <span class="field-label">Cursor API Key</span>
                     <input class="field-input" value={cursorSdkApiKey()} onInput={(e) => setCursorSdkApiKey(e.currentTarget.value)} placeholder="留空使用 CURSOR_API_KEY" />

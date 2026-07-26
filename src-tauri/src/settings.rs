@@ -28,7 +28,7 @@ pub struct Settings {
     pub claudecode_proxy: String,
     /// Claude Agent SDK API Key；空 = 使用环境/provider 凭据。
     pub claudecode_sdk_api_key: String,
-    /// Cursor CLI（cursor-agent）可执行文件路径（默认 cursor-agent，依赖 PATH）
+    /// 兼容旧配置；Cursor 后端已改为仅使用官方 SDK，不再依赖本机 CLI
     pub cursor_path: String,
     /// 旧版 Cursor ACP 启动参数，仅用于兼容已有设置。
     pub cursor_args: String,
@@ -52,7 +52,7 @@ pub struct Settings {
     pub windows_shell_shim_enabled: bool,
     /// Vega 使用类似 Cursor 的精简上下文：仅携带用户提示词和轮次结论，并自动摘要旧轮次。
     pub vega_slim_context_enabled: bool,
-    /// 穿越时光机时间线时是否还原 checkpoint 中的工作目录文件。
+    /// 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件。
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,

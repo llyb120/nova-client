@@ -1,29 +1,42 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
 const {
   CursorStartupTimeout,
-  cliModelsCommand,
   compactConversation,
   completePendingTools,
   compressSlimMemory,
   contextTokensFromUsage,
+  createCursorFilesystemTools,
   createMessageState,
   createSlimMemory,
+  cursorBatchToolPolicy,
+  cursorCavemanPolicy,
+  cursorPromptPrefix,
   cursorModelOptions,
   cursorShellProgram,
   cursorTodoPlan,
+  ensureGlobalTaskDenyHooks,
   extractTurnConclusion,
+  formatCompletedTurn,
   formatInterruptedTurn,
   formatSlimMemory,
   ingestCompactHistory,
+  isEditFilesTool,
+  isNovaDenyTaskHook,
   isSlimMemoryEmpty,
   mapDelta,
   mapMessage,
+  mergeNovaTaskDenyHooks,
   messageWithRecoveryContext,
   messageWithSlimMemory,
+  messageWithToolPolicy,
   modelSelection,
-  parseCliModels,
+  novaDenyTaskHookCommand,
+  pendingTurnContext,
   promptMessage,
   recordSlimTurn,
   recoverTimedOutAgent,
@@ -86,22 +99,6 @@ assert.equal(cursorShellProgram("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\
   ? "C:\\Nova\\shim\\powershell.exe"
   : "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
 assert.equal(cursorShellProgram("tool.exe", { NOVA_SHELL_SHIM_POWERSHELL: "shim.exe" }), "tool.exe");
-// Windows 不能直接 spawn .cmd/.bat（EINVAL），裸命令名也不走 PATHEXT（ENOENT）。
-assert.deepEqual(cliModelsCommand("C:\\Users\\me\\cursor-agent.cmd", "win32"),
-  ["cmd.exe", ["/d", "/s", "/c", "C:\\Users\\me\\cursor-agent.cmd", "--list-models"]]);
-assert.deepEqual(cliModelsCommand("cursor-agent", "win32"),
-  ["cmd.exe", ["/d", "/s", "/c", "cursor-agent", "--list-models"]]);
-assert.deepEqual(cliModelsCommand("C:\\Program Files\\cursor-agent.exe", "win32"),
-  ["C:\\Program Files\\cursor-agent.exe", ["--list-models"]]);
-assert.deepEqual(cliModelsCommand("C:\\Users\\me\\cursor-agent.ps1", "win32"), ["powershell.exe", [
-  "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
-  "C:\\Users\\me\\cursor-agent.ps1", "--list-models",
-]]);
-assert.deepEqual(cliModelsCommand("cursor-agent", "darwin"), ["cursor-agent", ["--list-models"]]);
-assert.deepEqual(parseCliModels("Available models\r\n\r\nauto - Auto (default)\r\ncursor-grok-4.5-high - Cursor Grok 4.5\r\ncomposer-2.5-fast - Composer 2.5 Fast\r\n"), [
-  { id: "cursor-grok-4.5-high", displayName: "Cursor Grok 4.5" },
-  { id: "composer-2.5-fast", displayName: "Composer 2.5 Fast" },
-]);
 assert.deepEqual(modelSelection("cursor-grok-4.5-high-fast"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("grok-4.5-high-false"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] });
 assert.deepEqual(modelSelection("composer-2.5-fast"), { id: "composer-2.5", params: [{ id: "fast", value: "true" }] });
@@ -289,6 +286,7 @@ assert.deepEqual(slimMessage.images, [{ data: "image", mimeType: "image/png" }])
 assert.equal(messageWithSlimMemory("only current", createSlimMemory()), "only current");
 
 const interruptedState = createMessageState();
+mapMessage({ type: "thinking", run_id: "interrupted", text: "Need to inspect the file first." }, interruptedState);
 mapMessage({ type: "assistant", run_id: "interrupted", message: { content: [{ type: "text", text: "I inspected the file." }] } }, interruptedState);
 mapMessage({
   type: "tool_call",
@@ -300,14 +298,33 @@ mapMessage({
 }, interruptedState);
 const interruptedContext = formatInterruptedTurn("Fix the unfinished change", interruptedState);
 assert.match(interruptedContext, /Fix the unfinished change/);
+assert.match(interruptedContext, /Assistant reasoning:\nNeed to inspect the file first/);
 assert.match(interruptedContext, /I inspected the file/);
 assert.match(interruptedContext, /read_file/);
 assert.match(interruptedContext, /src\/app\.ts/);
 assert.match(interruptedContext, /answer = 42/);
+const completedContext = formatCompletedTurn("Fix the unfinished change", interruptedState);
+assert.match(completedContext, /Fix the unfinished change/);
+assert.match(completedContext, /I inspected the file/);
+assert.match(completedContext, /read_file/);
+assert.doesNotMatch(completedContext, /Assistant reasoning/);
+assert.doesNotMatch(completedContext, /Need to inspect the file first/);
+const completedMemory = createSlimMemory();
+completedMemory.fullTurns = [completedContext];
+assert.doesNotMatch(formatSlimMemory(completedMemory), /Assistant reasoning/);
 const interruptedMemory = createSlimMemory();
 interruptedMemory.pendingTurn = interruptedContext;
 assert.equal(isSlimMemoryEmpty(interruptedMemory), false);
 assert.match(messageWithSlimMemory("Continue", interruptedMemory), /complete working context/);
+assert.match(messageWithSlimMemory("Continue", interruptedMemory), /Assistant reasoning/);
+const failedBeforeSdkStart = pendingTurnContext("", "Inspect the repository");
+assert.match(failedBeforeSdkStart, /^User:\nInspect the repository$/);
+const failedAgain = pendingTurnContext(failedBeforeSdkStart, "go on");
+assert.match(failedAgain, /^User:\nInspect the repository/);
+assert.match(failedAgain, /User:\ngo on$/);
+const failedWithTrace = pendingTurnContext(failedBeforeSdkStart, "go on", interruptedState);
+assert.match(failedWithTrace, /Inspect the repository/);
+assert.match(failedWithTrace, /Assistant reasoning/);
 
 const seeded = createSlimMemory();
 ingestCompactHistory(seeded, compactConversation(conversation));
@@ -356,3 +373,130 @@ assert.equal(
   extractTurnConclusion(conclusionState, {}),
   "Final answer from the assistant.",
 );
+
+const mergedHooks = mergeNovaTaskDenyHooks({
+  version: 1,
+  hooks: {
+    afterFileEdit: [{ command: "./hooks/format.sh" }],
+    preToolUse: [
+      { command: "echo keep-me", matcher: "Shell" },
+      { command: "node ./hooks/nova-deny-task.mjs", matcher: "Task", failClosed: false },
+    ],
+  },
+});
+assert.equal(mergedHooks.hooks.afterFileEdit[0].command, "./hooks/format.sh");
+assert.equal(mergedHooks.hooks.preToolUse.find((entry) => entry.matcher === "Shell")?.command, "echo keep-me");
+assert.equal(mergedHooks.hooks.preToolUse.filter(isNovaDenyTaskHook).length, 1);
+assert.deepEqual(mergedHooks.hooks.preToolUse.find(isNovaDenyTaskHook), {
+  command: novaDenyTaskHookCommand(),
+  failClosed: true,
+  matcher: "Task",
+});
+assert.deepEqual(mergedHooks.hooks.subagentStart, [{
+  command: novaDenyTaskHookCommand(),
+  failClosed: true,
+}]);
+
+const cursorDir = await mkdtemp(join(tmpdir(), "nova-cursor-hooks-"));
+try {
+  const ensured = await ensureGlobalTaskDenyHooks(cursorDir);
+  const written = JSON.parse(await readFile(ensured.hooksPath, "utf8"));
+  const script = await readFile(ensured.scriptPath, "utf8");
+  assert.match(script, /permission: "deny"/);
+  assert.equal(written.hooks.preToolUse[0].matcher, "Task");
+  assert.equal(written.hooks.subagentStart[0].command, novaDenyTaskHookCommand());
+  const again = await ensureGlobalTaskDenyHooks(cursorDir);
+  assert.deepEqual(again.config.hooks.preToolUse, written.hooks.preToolUse);
+} finally {
+  await rm(cursorDir, { recursive: true, force: true });
+}
+
+assert.match(cursorBatchToolPolicy(), /read_files/);
+assert.match(cursorBatchToolPolicy(), /edit_files/);
+assert.match(cursorBatchToolPolicy(), /git grep/);
+assert.doesNotMatch(cursorBatchToolPolicy({ readOnly: true }), /edit_files/);
+assert.match(cursorBatchToolPolicy({ readOnly: true }), /plan\/read-only/);
+assert.match(cursorCavemanPolicy(), /回复默认简洁专业/);
+assert.match(cursorCavemanPolicy(), /先给结论/);
+assert.doesNotMatch(cursorCavemanPolicy(), /Respond terse like smart caveman/);
+assert.match(cursorPromptPrefix(), /read_files/);
+assert.match(cursorPromptPrefix(), /回复默认简洁专业/);
+assert.match(cursorPromptPrefix({ readOnly: true }), /plan\/read-only/);
+assert.doesNotMatch(cursorPromptPrefix({ readOnly: true }), /edit_files/);
+const policyMessage = messageWithToolPolicy("Add animation", { readOnly: false });
+assert.match(policyMessage, /read_files/);
+assert.match(policyMessage, /回复默认简洁专业/);
+assert.match(policyMessage, /Add animation$/);
+const slimWithPolicy = messageWithToolPolicy(messageWithSlimMemory("Continue", slim), { readOnly: false });
+assert.match(slimWithPolicy, /read_files/);
+assert.match(slimWithPolicy, /回复默认简洁专业/);
+assert.match(slimWithPolicy, /Changed the lighting/);
+assert.match(slimWithPolicy, /Current request:\nContinue$/);
+assert.equal(isEditFilesTool("edit_files"), true);
+assert.equal(isEditFilesTool("mcp__custom-user-tools__edit_files"), true);
+assert.equal(isEditFilesTool("read_files"), false);
+const editFilesState = createMessageState();
+const editFilesItem = mapMessage({
+  type: "tool_call",
+  call_id: "edit-batch",
+  name: "edit_files",
+  status: "running",
+  args: { files: [{ path: "a.ts", edits: [{ oldText: "a", newText: "b" }] }] },
+}, editFilesState)[0];
+assert.equal(editFilesItem.type, "file_change");
+assert.deepEqual(editFilesItem.changes, [{ path: "a.ts", kind: "update" }]);
+
+const batchCwd = await mkdtemp(join(tmpdir(), "nova-cursor-batch-"));
+try {
+  await Promise.all([
+    writeFile(join(batchCwd, "a.txt"), "A"),
+    writeFile(join(batchCwd, "b.txt"), "B"),
+  ]);
+  const agentTools = createCursorFilesystemTools(batchCwd);
+  assert.equal(typeof agentTools.read_files.execute, "function");
+  assert.equal(typeof agentTools.edit_files.execute, "function");
+  const readOnlyTools = createCursorFilesystemTools(batchCwd, { readOnly: true });
+  assert.equal(readOnlyTools.edit_files, undefined);
+  const read = JSON.parse(await agentTools.read_files.execute({ paths: ["a.txt", "b.txt"] }));
+  assert.deepEqual(read, [
+    { path: "a.txt", content: "A" },
+    { path: "b.txt", content: "B" },
+  ]);
+  await agentTools.edit_files.execute({
+    files: [
+      { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] },
+      { path: "b.txt", edits: [{ oldText: "B", newText: "BB" }] },
+    ],
+  });
+  assert.deepEqual(await Promise.all([
+    readFile(join(batchCwd, "a.txt"), "utf8"),
+    readFile(join(batchCwd, "b.txt"), "utf8"),
+  ]), ["AA", "BB"]);
+  await assert.rejects(() => agentTools.edit_files.execute({
+    files: [
+      { path: "a.txt", edits: [{ oldText: "AA", newText: "changed" }] },
+      { path: "b.txt", edits: [{ oldText: "missing", newText: "changed" }] },
+    ],
+  }), /Could not find/);
+  assert.deepEqual(await Promise.all([
+    readFile(join(batchCwd, "a.txt"), "utf8"),
+    readFile(join(batchCwd, "b.txt"), "utf8"),
+  ]), ["AA", "BB"]);
+
+  await writeFile(join(batchCwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
+  const first = JSON.parse(await agentTools.read_files.execute({ paths: ["large.txt"] }))[0];
+  assert.equal(first.content.split("\n").length, 200);
+  assert.equal(first.nextOffset, 201);
+  const parent = await mkdtemp(join(tmpdir(), "nova-cursor-paths-"));
+  const workspace = join(parent, "workspace");
+  await mkdir(workspace);
+  const outside = join(parent, "outside.txt");
+  await writeFile(outside, "outside");
+  const pathTools = createCursorFilesystemTools(workspace);
+  assert.deepEqual(JSON.parse(await pathTools.read_files.execute({ paths: [outside] })), [
+    { path: outside, content: "outside" },
+  ]);
+  await rm(parent, { recursive: true, force: true });
+} finally {
+  await rm(batchCwd, { recursive: true, force: true });
+}

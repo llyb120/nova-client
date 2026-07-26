@@ -997,7 +997,7 @@ export function ChatView() {
         >
           <div class="repo-time-machine-label">
             <IconStopwatch size={17} />
-            <span>{restoringCheckpoint() ? "跳转中…" : "时光机"}</span>
+            <span>{restoringCheckpoint() ? "跳转中…" : "世界线"}</span>
           </div>
           <div class="repo-time-machine-track">
             <div

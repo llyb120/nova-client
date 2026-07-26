@@ -360,7 +360,7 @@ export interface Settings {
   claudecodeProxy: string;
   claudecodeSdkApiKey: string;
   cursorProxy: string;
-  /** Cursor CLI 可执行文件 */
+  /** 兼容旧配置；Cursor 后端仅使用官方 SDK，不再依赖本机 CLI */
   cursorPath: string;
   cursorSdkApiKey: string;
   /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */
@@ -372,7 +372,7 @@ export interface Settings {
   windowsShellShimEnabled: boolean;
   /** Vega 精简上下文：仅保留用户提示词与结论，旧轮次自动摘要 */
   vegaSlimContextEnabled: boolean;
-  /** 穿越时光机时间线时是否还原 checkpoint 中的工作目录文件 */
+  /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
   checkpointEnabled: boolean;
   defaultMode: string;
   /** 自动生成会话标题所用后端（devin/codex/codebuddy/...，空 = devin） */

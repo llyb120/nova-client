@@ -73,11 +73,6 @@ fn script_installer(url: &str) -> (String, Vec<String>) {
     powershell_script_installer(url, false)
 }
 
-#[cfg(windows)]
-fn elevated_powershell_script_installer(url: &str) -> (String, Vec<String>) {
-    powershell_script_installer(url, true)
-}
-
 #[cfg(not(windows))]
 fn script_installer(url: &str) -> (String, Vec<String>) {
     (
@@ -190,29 +185,18 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
                 proxy: settings.claudecode_proxy.clone(),
             }
         }
-        AgentKind::Cursor => {
-            let program = configured_cli_program(
-                &settings.cursor_path,
-                &["cursor-agent", "agent"],
-                "cursor-agent",
-            );
-            #[cfg(windows)]
-            let (install_program, install_args) =
-                elevated_powershell_script_installer("https://cursor.com/install?win32=true");
-            #[cfg(not(windows))]
-            let (install_program, install_args) = script_installer("https://cursor.com/install");
-            CliSpec {
-                kind: kind.clone(),
-                cli_name: "cursor-agent-cli",
-                program: program.clone(),
-                version_args: vec!["--version".into()],
-                install_program,
-                install_args,
-                upgrade_program: program,
-                upgrade_args: vec!["update".into()],
-                proxy: settings.cursor_proxy.clone(),
-            }
-        }
+        AgentKind::Cursor => CliSpec {
+            // Cursor 仅走官方 SDK（Node bridge），不再探测/安装 cursor-agent。
+            kind: kind.clone(),
+            cli_name: "cursor-sdk",
+            program: "node".into(),
+            version_args: vec!["--version".into()],
+            install_program: String::new(),
+            install_args: Vec::new(),
+            upgrade_program: String::new(),
+            upgrade_args: Vec::new(),
+            proxy: settings.cursor_proxy.clone(),
+        },
         AgentKind::OpenCode | AgentKind::OpenCodePlus => {
             let program =
                 configured_cli_program(&settings.opencode_path, &["opencode"], "opencode");
@@ -240,7 +224,6 @@ fn all_specs(settings: &Settings) -> Vec<CliSpec> {
         AgentKind::CodeBuddy,
         AgentKind::CodeBuddyPlus,
         AgentKind::ClaudeCode,
-        AgentKind::Cursor,
         AgentKind::OpenCode,
         AgentKind::OpenCodePlus,
     ]
@@ -650,6 +633,12 @@ pub async fn upgrade(
     settings: &Settings,
     operation_id: &str,
 ) -> Result<CliStatus, String> {
+    if matches!(kind, AgentKind::Cursor | AgentKind::Alkaid) {
+        return Err(format!(
+            "{} 后端仅使用官方 SDK，无需安装或升级 CLI",
+            kind.label()
+        ));
+    }
     let spec = spec_for(&kind, settings);
     let installed = resolve_program_on_path(&spec.program).is_some();
     let action = if installed { "升级" } else { "安装" };
@@ -772,6 +761,10 @@ pub fn cancel(state: &AppState, operation_id: &str) -> bool {
 }
 
 pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
+    // Cursor / Alkaid 由内置 Node bridge + SDK 驱动，不依赖本机 agent CLI。
+    if matches!(kind, AgentKind::Cursor | AgentKind::Alkaid) {
+        return true;
+    }
     let spec = spec_for(kind, settings);
     resolve_program_on_path(&spec.program).is_some()
 }
@@ -838,25 +831,25 @@ fn refresh_cli_search_path() {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn windows_script_installers_open_visible_powershell_and_cursor_elevates() {
+    fn cursor_is_sdk_only_and_skips_cli_install() {
+        assert!(is_installed(&AgentKind::Cursor, &Settings::default()));
+        assert!(!all_specs(&Settings::default())
+            .iter()
+            .any(|spec| matches!(spec.kind, AgentKind::Cursor)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_script_installers_open_visible_powershell() {
         let settings = Settings::default();
-        let cursor = spec_for(&AgentKind::Cursor, &settings);
         let devin = spec_for(&AgentKind::Devin, &settings);
-        let cursor_args = cursor.install_args.join(" ");
         let devin_args = devin.install_args.join(" ");
 
-        assert_eq!(
-            std::path::Path::new(&cursor.install_program)
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some("powershell.exe")
-        );
-        assert!(std::path::Path::new(&cursor.install_program).is_absolute());
         assert_eq!(
             std::path::Path::new(&devin.install_program)
                 .file_name()
@@ -864,33 +857,12 @@ mod tests {
             Some("powershell.exe")
         );
         assert!(std::path::Path::new(&devin.install_program).is_absolute());
-        assert!(cursor_args.contains("Start-Process"));
         assert!(devin_args.contains("Start-Process"));
-        assert!(cursor_args.contains("Join-Path $PSHOME 'powershell.exe'"));
         assert!(devin_args.contains("Join-Path $PSHOME 'powershell.exe'"));
-        assert!(cursor_args.contains("$ErrorActionPreference='Stop'"));
         assert!(devin_args.contains("$ErrorActionPreference='Stop'"));
-        assert!(cursor_args.contains("-WindowStyle Normal"));
         assert!(devin_args.contains("-WindowStyle Normal"));
-        assert!(cursor_args.contains("-Verb RunAs"));
-        assert!(cursor_args.contains("-EncodedCommand"));
         assert!(!devin_args.contains("-Verb RunAs"));
         assert!(devin_args.contains("-EncodedCommand"));
-        assert!(!cursor_args.contains("-WindowStyle Hidden"));
         assert!(!devin_args.contains("-WindowStyle Hidden"));
-    }
-
-    #[test]
-    fn cursor_installer_uses_resolvable_windows_powershell() {
-        let cursor = spec_for(&AgentKind::Cursor, &Settings::default());
-
-        assert_eq!(
-            std::path::Path::new(&cursor.install_program)
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some("powershell.exe")
-        );
-        assert!(std::path::Path::new(&cursor.install_program).is_absolute());
-        assert!(resolve_program_on_path(&cursor.install_program).is_some());
     }
 }

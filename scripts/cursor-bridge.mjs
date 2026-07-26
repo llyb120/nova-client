@@ -1,12 +1,12 @@
 import { createInterface } from "node:readline";
 import { Agent, Cursor } from "@cursor/sdk";
-import childProcess, { execFile } from "node:child_process";
+import childProcess from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
-import { promisify } from "node:util";
+import { createCursorFilesystemTools, cursorPromptPrefix } from "./cursor-filesystem-tools.mjs";
 
 const WINDOWS_SHELL_SHIMS = {
   "bash.exe": "NOVA_SHELL_SHIM_BASH",
@@ -38,7 +38,6 @@ function installWindowsShellSpawnGuard() {
 installWindowsShellSpawnGuard();
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
-const execFileAsync = promisify(execFile);
 const TERMINAL_RUN_STATUSES = new Set(["completed", "finished", "error", "failed", "cancelled", "expired"]);
 const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTUP_TIMEOUT_MS, 120_000);
 const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
@@ -50,10 +49,70 @@ const CURSOR_CONTEXT_THRESHOLD = Math.max(2_000, Math.floor(CURSOR_CONTEXT_WINDO
 const CURSOR_CONTEXT_CHAR_THRESHOLD = Math.max(8_000, Math.floor(CURSOR_CONTEXT_WINDOW * 0.8));
 const CURSOR_SLIM_MEMORY_DIR = process.env.NOVA_CURSOR_SLIM_MEMORY_DIR
   || join(process.env.NOVA_DATA_DIR || join(homedir(), ".nova"), "cursor-slim-memory");
+const CURSOR_USER_DIR = process.env.NOVA_CURSOR_USER_DIR || join(homedir(), ".cursor");
+const NOVA_DENY_TASK_SCRIPT = "nova-deny-task.mjs";
+const NOVA_DENY_TASK_MARKER = "nova-deny-task";
+const NOVA_DENY_TASK_SCRIPT_SOURCE = `process.stdout.write(JSON.stringify({
+  permission: "deny",
+  user_message: "Task / subagent tool is disabled by Nova.",
+  agent_message: "The Task tool is disabled by Nova global Cursor hooks. Do the work yourself with the available tools (Shell, Read, Write, Grep, etc.) instead of spawning a subagent."
+}));
+`;
 
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value ?? "", 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function isNovaDenyTaskHook(entry) {
+  return typeof entry?.command === "string" && entry.command.includes(NOVA_DENY_TASK_MARKER);
+}
+
+function novaDenyTaskHookCommand() {
+  return `node ./hooks/${NOVA_DENY_TASK_SCRIPT}`;
+}
+
+function mergeNovaTaskDenyHooks(config = {}) {
+  const hooks = { ...(config.hooks && typeof config.hooks === "object" ? config.hooks : {}) };
+  const denyEntry = {
+    command: novaDenyTaskHookCommand(),
+    failClosed: true,
+  };
+  const taskEntry = { ...denyEntry, matcher: "Task" };
+  const preToolUse = (Array.isArray(hooks.preToolUse) ? hooks.preToolUse : [])
+    .filter((entry) => !isNovaDenyTaskHook(entry));
+  preToolUse.push(taskEntry);
+  hooks.preToolUse = preToolUse;
+  const subagentStart = (Array.isArray(hooks.subagentStart) ? hooks.subagentStart : [])
+    .filter((entry) => !isNovaDenyTaskHook(entry));
+  subagentStart.push(denyEntry);
+  hooks.subagentStart = subagentStart;
+  return {
+    version: Number.isFinite(config.version) ? config.version : 1,
+    ...config,
+    hooks,
+  };
+}
+
+async function ensureGlobalTaskDenyHooks(cursorDir = CURSOR_USER_DIR) {
+  const hooksDir = join(cursorDir, "hooks");
+  const scriptPath = join(hooksDir, NOVA_DENY_TASK_SCRIPT);
+  const hooksPath = join(cursorDir, "hooks.json");
+  await mkdir(hooksDir, { recursive: true });
+  await writeFile(scriptPath, NOVA_DENY_TASK_SCRIPT_SOURCE, "utf8");
+  let existing = {};
+  try {
+    existing = JSON.parse(await readFile(hooksPath, "utf8"));
+    if (!existing || typeof existing !== "object" || Array.isArray(existing)) existing = {};
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      process.stderr.write(`Cursor hooks.json unreadable; rewriting Nova Task deny: ${error instanceof Error ? error.message : String(error)}\n`);
+      existing = {};
+    }
+  }
+  const next = mergeNovaTaskDenyHooks(existing);
+  await writeFile(hooksPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  return { hooksPath, scriptPath, config: next };
 }
 
 class CursorStartupTimeout extends Error {
@@ -151,14 +210,24 @@ function formatSlimMemory(memory) {
   return sections.join("\n");
 }
 
-function formatInterruptedTurn(userMessage, state) {
+/**
+ * Format a turn trajectory for slim-memory. Completed turns omit thinking (same policy as Vega
+ * super-context): only interrupted/native trajectories should replay exposed reasoning.
+ */
+function formatTurnTrace(userMessage, state, { includeThinking = false } = {}) {
   const sections = [];
   const prompt = String(messageText(userMessage)).trim();
   if (prompt) sections.push(`User:\n${prompt}`);
   for (const entry of state?.trace ?? []) {
-    if (entry.kind === "assistant" || entry.kind === "thinking") {
+    if (entry.kind === "thinking") {
+      if (!includeThinking) continue;
       const text = String(entry.text ?? "").trim();
-      if (text) sections.push(`${entry.kind === "assistant" ? "Assistant" : "Assistant reasoning"}:\n${text}`);
+      if (text) sections.push(`Assistant reasoning:\n${text}`);
+      continue;
+    }
+    if (entry.kind === "assistant") {
+      const text = String(entry.text ?? "").trim();
+      if (text) sections.push(`Assistant:\n${text}`);
       continue;
     }
     if (entry.kind !== "tool") continue;
@@ -169,6 +238,19 @@ function formatInterruptedTurn(userMessage, state) {
     sections.push(details.join("\n"));
   }
   return sections.join("\n\n");
+}
+
+function formatInterruptedTurn(userMessage, state) {
+  return formatTurnTrace(userMessage, state, { includeThinking: true });
+}
+
+function pendingTurnContext(previousPending, userMessage, state) {
+  const current = formatInterruptedTurn(userMessage, state);
+  return [String(previousPending ?? "").trim(), current].filter(Boolean).join("\n\n");
+}
+
+function formatCompletedTurn(userMessage, state) {
+  return formatTurnTrace(userMessage, state, { includeThinking: false });
 }
 
 function safeJson(value) {
@@ -192,6 +274,17 @@ function messageWithSlimMemory(message, memory) {
     "Current request:",
   ].join("\n");
   return withMessageText(message, `${prefix}\n${messageText(message)}`);
+}
+
+/**
+ * Attach Vega-style batch FS / search policy + concise reply style on every user turn.
+ * Cursor has no durable systemPrompt, and Nova creates a fresh Agent per prompt,
+ * so this cannot be "first message only".
+ */
+function messageWithToolPolicy(message, options = {}) {
+  const prefix = cursorPromptPrefix(options);
+  if (!prefix) return message;
+  return withMessageText(message, `${prefix}\n\n${messageText(message)}`);
 }
 
 function messageWithRecoveryContext(message, history) {
@@ -426,7 +519,10 @@ async function recoverTimedOutAgent(
   const options = {
     apiKey: process.env.CURSOR_API_KEY,
     model: modelSelection(request.model),
-    local: { cwd: request.cwd },
+    local: {
+      cwd: request.cwd,
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+    },
   };
   // Slim-memory mode prefers a fresh agent so poisoned checkpoints are never resumed.
   if (createFresh) {
@@ -501,7 +597,10 @@ async function sendPromptWithRecovery(
   const resumedAgent = await sdk.resume(agentId, {
     apiKey: process.env.CURSOR_API_KEY,
     model: modelSelection(request.model),
-    local: { cwd: request.cwd },
+    local: {
+      cwd: request.cwd,
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+    },
   });
   emitTiming("agent_resume", resumeStartedAt);
   const finalSendStartedAt = performance.now();
@@ -538,19 +637,32 @@ function appendText(state, runId, type, text) {
   return { id, type: type === "assistant" ? "agent_message" : "reasoning", text: combined };
 }
 
+function isEditFilesTool(name) {
+  const tool = String(name ?? "");
+  return tool === "edit_files" || tool.endsWith("__edit_files") || tool.endsWith("/edit_files");
+}
+
 function mapTool(state, callId, name, status, args, result) {
   const previous = state.tools.get(callId);
   if (previous && previous.status !== "in_progress" && status === "running") return null;
   if (!previous) state.activeTextType = null;
+  const tool = name ?? previous?.tool;
+  const arguments_ = args ?? previous?.arguments;
   const item = {
     id: callId,
-    type: "mcp_tool_call",
+    type: isEditFilesTool(tool) ? "file_change" : "mcp_tool_call",
     server: "Cursor",
-    tool: name ?? previous?.tool,
-    arguments: args ?? previous?.arguments,
+    tool,
+    arguments: arguments_,
     result: result ?? previous?.result,
     status: status === "error" ? "failed" : status === "running" ? "in_progress" : "completed",
   };
+  if (item.type === "file_change") {
+    const files = Array.isArray(arguments_?.files) ? arguments_.files : [];
+    item.changes = files
+      .map((file) => ({ path: typeof file?.path === "string" ? file.path : "", kind: "update" }))
+      .filter((change) => change.path);
+  }
   state.tools.set(callId, item);
   let trace = state.trace.find((entry) => entry.id === callId);
   if (!trace) {
@@ -688,61 +800,21 @@ function cursorModelOptions(models) {
     options.findIndex((candidate) => candidate.value === option.value) === index);
 }
 
-function parseCliModels(output) {
-  return output
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .split(/\r?\n/)
-    .flatMap((line) => {
-      const match = line.trim().match(/^(\S+)\s+-\s+(.+?)(?:\s+\(default\))?$/);
-      if (!match || match[1].toLowerCase() === "auto") return [];
-      return [{ id: match[1], displayName: match[2] }];
-    });
-}
-
-function cliModelsCommand(program, platform = process.platform) {
-  if (platform !== "win32") return [program, ["--list-models"]];
-  const extension = extname(program).toLowerCase();
-  if (extension === ".ps1") {
-    const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"];
-    return ["powershell.exe", [...args, program, "--list-models"]];
-  }
-  if (extension === ".exe") return [program, ["--list-models"]];
-  // cursor-agent 在 Windows 上装成 .cmd：Node ≥20.12 拒绝直接 spawn .cmd/.bat（EINVAL），
-  // 裸命令名也不会按 PATHEXT 解析（ENOENT）。两种情况都必须交给 cmd.exe。
-  return ["cmd.exe", ["/d", "/s", "/c", program, "--list-models"]];
-}
-
-async function cliModels() {
-  const program = process.env.NOVA_CURSOR_PATH || "cursor-agent";
-  const [executable, args] = cliModelsCommand(program);
-  const { stdout } = await execFileAsync(executable, args, {
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024,
-    windowsHide: true,
-  }).catch((error) => {
-    const detail = String(error.stderr || error.message || error).trim();
-    throw new Error(`执行 ${program} --list-models 失败：${detail}`);
-  });
-  const models = parseCliModels(stdout);
-  if (!models.length) throw new Error("Cursor CLI 未返回模型列表");
-  return models;
-}
-
 async function modelOptions() {
-  // 两条来源都失败时必须把原因抛出去，否则用户只会看到一个空列表，无从判断是
-  // Key 无效、网络不通还是 CLI 没装。
-  const failures = [];
-  const record = (source) => (error) => {
-    failures.push(`${source}：${error instanceof Error ? error.message : String(error)}`);
-    return undefined;
-  };
-  let models;
-  if (process.env.CURSOR_API_KEY) {
-    models = await Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY })
-      .catch(record("API Key"));
+  const apiKey = process.env.CURSOR_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error("未配置 Cursor API Key，请在设置 → 模型后端中填写");
   }
-  models ??= await cliModels().catch(record("Cursor CLI"));
-  if (!models) throw new Error(failures.join("；") || "未配置 Cursor API Key，且未安装 cursor-agent");
+  let models;
+  try {
+    models = await Cursor.models.list({ apiKey });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Cursor SDK 拉取模型失败：${detail}`);
+  }
+  if (!Array.isArray(models)) {
+    throw new Error("Cursor SDK 未返回模型列表");
+  }
   return {
     novaCursorModelSchema: 2,
     configOptions: [{
@@ -794,6 +866,10 @@ async function promptMessage(parts) {
 }
 
 async function main() {
+  // Cursor has no built-in Task toggle; install user-global deny hooks before any Agent.create.
+  await ensureGlobalTaskDenyHooks().catch((error) => {
+    process.stderr.write(`Cursor global Task-deny hooks failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  });
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   const requests = [];
   let wake;
@@ -859,23 +935,37 @@ async function main() {
         }
       }
 
+      const readOnly = request.mode === "plan";
       const options = {
         apiKey: process.env.CURSOR_API_KEY,
         model: modelSelection(request.model),
-        local: { cwd: request.cwd },
+        local: {
+          cwd: request.cwd,
+          // Vega-style batch FS tools; inlined via SDK (unlike hooks, which are file-only).
+          customTools: createCursorFilesystemTools(request.cwd, { readOnly }),
+        },
       };
+      const originalMessage = await promptMessage(request.parts);
+      // Build the SDK prompt before marking this turn pending, otherwise it would replay itself.
+      // Persist first so even Agent.create/SDK initialization failures retain the user's request.
+      const previousPendingTurn = memory.pendingTurn;
+      const message = messageWithToolPolicy(messageWithSlimMemory(originalMessage, memory), { readOnly });
+      memory.pendingTurn = pendingTurnContext(previousPendingTurn, originalMessage);
+      await saveSlimMemory(memoryKey, memory).catch((error) => {
+        process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      });
       agent = await Agent.create(options);
       send({ type: "ready", sessionId: sessionKey });
-      const originalMessage = await promptMessage(request.parts);
-      let message = messageWithSlimMemory(originalMessage, memory);
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
         const state = createMessageState();
         preserveActiveTurn = async () => {
-          const pendingTurn = formatInterruptedTurn(originalMessage, state);
+          const pendingTurn = pendingTurnContext(previousPendingTurn, originalMessage, state);
           if (!pendingTurn) return;
           memory.pendingTurn = pendingTurn;
-          await saveSlimMemory(memoryKey, memory);
+          await saveSlimMemory(memoryKey, memory).catch((error) => {
+            process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          });
         };
         const turnStartedAt = performance.now();
         let attemptActive = true;
@@ -946,7 +1036,8 @@ async function main() {
           memory.pendingTurn = "";
           recordSlimTurn(memory, originalMessage, extractTurnConclusion(state, result));
           if (memory.contextStage === "full") {
-            memory.fullTurns.push(formatInterruptedTurn(originalMessage, state));
+            // Completed full-stage turns keep tools/assistant text but drop thinking, matching Vega.
+            memory.fullTurns.push(formatCompletedTurn(originalMessage, state));
           }
           const turnUsage = usage ?? result.usage;
           const measuredTokens = contextTokensFromUsage(turnUsage);
@@ -977,7 +1068,10 @@ async function main() {
           completed = true;
         } catch (error) {
           const retryable = error instanceof CursorStartupTimeout && !producedOutput && attempt < CURSOR_SILENT_RETRIES;
-          if (!retryable) throw error;
+          if (!retryable) {
+            await preserveActiveTurn?.();
+            throw error;
+          }
           attemptActive = false;
           sendTiming("silent_retry", turnStartedAt, { attempt: attempt + 1 });
           const recovery = await recoverTimedOutAgent(
@@ -989,7 +1083,7 @@ async function main() {
             true,
           );
           agent = recovery.agent;
-          message = messageWithSlimMemory(originalMessage, memory);
+          // Retry the exact prompt built before this turn was marked pending, avoiding self-replay.
           // Keep the stable slim-memory session key; do not promote ephemeral agent ids.
           send({ type: "ready", sessionId: sessionKey });
           activeRun = undefined;
@@ -1019,7 +1113,6 @@ if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => {
 
 export {
   CursorStartupTimeout,
-  cliModelsCommand,
   compactConversation,
   completePendingTools,
   compressSlimMemory,
@@ -1029,17 +1122,24 @@ export {
   cursorShellProgram,
   cursorTodoPlan,
   contextTokensFromUsage,
+  ensureGlobalTaskDenyHooks,
   extractTurnConclusion,
+  formatCompletedTurn,
   formatInterruptedTurn,
   formatSlimMemory,
+  pendingTurnContext,
   ingestCompactHistory,
+  isEditFilesTool,
+  isNovaDenyTaskHook,
   isSlimMemoryEmpty,
   mapDelta,
   mapMessage,
+  mergeNovaTaskDenyHooks,
   messageWithRecoveryContext,
   messageWithSlimMemory,
+  messageWithToolPolicy,
   modelSelection,
-  parseCliModels,
+  novaDenyTaskHookCommand,
   promptMessage,
   recordSlimTurn,
   recoverTimedOutAgent,
@@ -1050,3 +1150,10 @@ export {
   threadMemoryKey,
   withTimeout,
 };
+
+export {
+  createCursorFilesystemTools,
+  cursorBatchToolPolicy,
+  cursorCavemanPolicy,
+  cursorPromptPrefix,
+} from "./cursor-filesystem-tools.mjs";

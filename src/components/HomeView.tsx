@@ -27,6 +27,7 @@ import {
   setView,
   state,
   stashWorktreePrompt,
+  assertBuiltinPrompt,
 } from "../store";
 import type { AgentKind, Peer } from "../types";
 import { agentLabel } from "../utils";
@@ -490,7 +491,9 @@ export function HomeView() {
         if (clue) clearPendingClueCard();
         await sendPrompt(t, images);
       } else if (wtOn) {
-        // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词
+        // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词。
+        // 先校验 /fire，避免建完 worktree 才因语法错误失败。
+        assertBuiltinPrompt(t, images);
         const id = await createThread(
           cwd(),
           agentKind(),
