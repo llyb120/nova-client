@@ -879,6 +879,110 @@ async function modelOptions() {
   };
 }
 
+function agentFingerprint(request) {
+  const model = String(request?.model ?? "");
+  const cwd = String(request?.cwd ?? "");
+  const mode = request?.mode === "plan" ? "plan" : "agent";
+  return `${model}\0${cwd}\0${mode}`;
+}
+
+function agentCreateOptions(request) {
+  const readOnly = request?.mode === "plan";
+  return {
+    apiKey: process.env.CURSOR_API_KEY,
+    model: modelSelection(request?.model),
+    local: {
+      cwd: request?.cwd,
+      // Vega-style batch FS tools; inlined via SDK (unlike hooks, which are file-only).
+      customTools: createCursorFilesystemTools(request?.cwd, { readOnly }),
+    },
+  };
+}
+
+function prewarmEnabled(env = process.env) {
+  return env.NOVA_CURSOR_PREWARM !== "0";
+}
+
+// Single-slot idle Agent prewarm: keep one unused Agent.create() ready for the last
+// model/cwd/mode fingerprint. Consume → refill immediately; matching in-flight creates
+// are awaited instead of starting a parallel cold create.
+function createAgentPrewarm(sdk = Agent, { enabled = prewarmEnabled() } = {}) {
+  let slot = null;
+
+  function discard() {
+    const current = slot;
+    slot = null;
+    if (current?.agent) {
+      try { current.agent.close(); } catch { /* already closed */ }
+    }
+  }
+
+  function ensure(fingerprint, options) {
+    if (!enabled) return;
+    if (slot?.fingerprint === fingerprint && (slot.agent || slot.promise)) return;
+    discard();
+    const entry = { fingerprint, agent: null, promise: null };
+    entry.promise = (async () => {
+      try {
+        const agent = await sdk.create(options);
+        if (slot !== entry) {
+          try { agent.close(); } catch { /* discarded */ }
+          return null;
+        }
+        entry.agent = agent;
+        entry.promise = null;
+        return agent;
+      } catch (error) {
+        if (slot === entry) slot = null;
+        process.stderr.write(`Cursor agent prewarm failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        return null;
+      }
+    })();
+    slot = entry;
+  }
+
+  async function acquire(request) {
+    const fingerprint = agentFingerprint(request);
+    const options = agentCreateOptions(request);
+
+    const take = (agent, source) => {
+      if (slot?.fingerprint === fingerprint) slot = null;
+      ensure(fingerprint, options);
+      return { agent, source, fingerprint };
+    };
+
+    if (enabled && slot?.fingerprint === fingerprint) {
+      if (slot.agent) return take(slot.agent, "prewarm");
+      if (slot.promise) {
+        const agent = await slot.promise;
+        if (agent) return take(agent, "prewarm_wait");
+      }
+    } else if (slot && slot.fingerprint !== fingerprint) {
+      discard();
+    }
+
+    const agent = await sdk.create(options);
+    ensure(fingerprint, options);
+    return { agent, source: "live", fingerprint };
+  }
+
+  return {
+    acquire,
+    ensure,
+    discard,
+    close: discard,
+    get snapshot() {
+      return slot
+        ? {
+          fingerprint: slot.fingerprint,
+          ready: Boolean(slot.agent),
+          pending: Boolean(slot.promise),
+        }
+        : null;
+    },
+  };
+}
+
 async function generateTitle(request) {
   const agent = await createCursorAgent({
     apiKey: process.env.CURSOR_API_KEY,
@@ -949,6 +1053,7 @@ async function main() {
   let sessionKey;
   let memoryKey;
   let memory = createSlimMemory();
+  const prewarm = createAgentPrewarm(Agent);
   while (!closed || requests.length) {
     if (!requests.length) await new Promise((resolve) => { wake = resolve; });
     const request = requests.shift();
@@ -988,15 +1093,6 @@ async function main() {
       }
 
       const readOnly = request.mode === "plan";
-      const options = {
-        apiKey: process.env.CURSOR_API_KEY,
-        model: modelSelection(request.model),
-        local: {
-          cwd: request.cwd,
-          // Vega-style batch FS tools; inlined via SDK (unlike hooks, which are file-only).
-          customTools: createCursorFilesystemTools(request.cwd, { readOnly }),
-        },
-      };
       const originalMessage = await promptMessage(request.parts);
       // Build the SDK prompt before marking this turn pending, otherwise it would replay itself.
       // Persist first so even Agent.create/SDK initialization failures retain the user's request.
@@ -1006,10 +1102,11 @@ async function main() {
       await saveSlimMemory(memoryKey, memory).catch((error) => {
         process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
       });
-      // A new Fire stage starts a new bridge immediately after the previous stage. Cursor's
-      // API-key exchange can be briefly unavailable during that handoff; retry initialization
-      // in-process so the automatic chain is not suspended by a transient network failure.
-      agent = await createCursorAgent(options);
+      // Prefer idle prewarm Agent.create; refill immediately after consume.
+      const acquireStartedAt = performance.now();
+      const acquired = await prewarm.acquire(request);
+      agent = acquired.agent;
+      sendTiming("agent_acquire", acquireStartedAt, { source: acquired.source });
       send({ type: "ready", sessionId: sessionKey });
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
@@ -1158,6 +1255,7 @@ async function main() {
     }
   }
   agent?.close();
+  prewarm.close();
 }
 
 if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => {
@@ -1206,6 +1304,10 @@ export {
   summarizeSlimMemory,
   threadMemoryKey,
   withTimeout,
+  agentFingerprint,
+  agentCreateOptions,
+  createAgentPrewarm,
+  prewarmEnabled,
 };
 
 export {

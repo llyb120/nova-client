@@ -45,6 +45,8 @@ const {
   sendPromptWithRecovery,
   threadMemoryKey,
   withTimeout,
+  agentFingerprint,
+  createAgentPrewarm,
 } = await import("./cursor-bridge.mjs");
 const state = createMessageState();
 
@@ -127,6 +129,87 @@ assert.deepEqual(modelSelection("grok-4.5-high-false"), { id: "grok-4.5", params
 assert.deepEqual(modelSelection("composer-2.5-fast"), { id: "composer-2.5", params: [{ id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("gpt-5.6-sol"), { id: "gpt-5.6-sol" });
 assert.deepEqual(modelSelection("grok-4.5::effort=high&fast=false"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] });
+assert.equal(
+  agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a", mode: "agent" }),
+  agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a" }),
+);
+assert.notEqual(
+  agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a", mode: "plan" }),
+  agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a", mode: "agent" }),
+);
+{
+  let createCount = 0;
+  const created = [];
+  const deferred = [];
+  const sdk = {
+    create: async (options) => {
+      createCount += 1;
+      let resolve;
+      const gate = new Promise((r) => { resolve = r; });
+      deferred.push(resolve);
+      await gate;
+      const agent = {
+        agentId: `prewarm-${createCount}`,
+        options,
+        closed: false,
+        close() { this.closed = true; },
+      };
+      created.push(agent);
+      return agent;
+    },
+  };
+  const prewarm = createAgentPrewarm(sdk, { enabled: true });
+  const req = { model: "composer-2.5-fast", cwd: "/tmp/ws", mode: "agent" };
+  async function waitReady() {
+    for (let i = 0; i < 10; i++) {
+      if (prewarm.snapshot?.ready) return;
+      await Promise.resolve();
+    }
+    assert.equal(prewarm.snapshot?.ready, true);
+  }
+
+  const firstPromise = prewarm.acquire(req);
+  assert.equal(createCount, 1);
+  deferred.shift()();
+  const first = await firstPromise;
+  assert.equal(first.source, "live");
+  assert.equal(first.agent.agentId, "prewarm-1");
+  // Consume/live path immediately starts the refill create.
+  assert.equal(createCount, 2);
+  assert.equal(prewarm.snapshot?.pending, true);
+
+  const secondPromise = prewarm.acquire(req);
+  assert.equal(createCount, 2);
+  deferred.shift()();
+  const second = await secondPromise;
+  assert.equal(second.source, "prewarm_wait");
+  assert.equal(second.agent.agentId, "prewarm-2");
+  // Refill again as soon as the warm slot is consumed.
+  assert.equal(createCount, 3);
+  deferred.shift()();
+  await waitReady();
+
+  const third = await prewarm.acquire(req);
+  assert.equal(third.source, "prewarm");
+  assert.equal(third.agent.agentId, "prewarm-3");
+  assert.equal(createCount, 4);
+
+  const mismatchedPromise = prewarm.acquire({ model: "gpt-5.6-sol", cwd: "/tmp/ws", mode: "agent" });
+  // Mismatch discards the pending refill and starts a live create for the new fingerprint.
+  assert.equal(createCount, 5);
+  deferred.shift()();
+  for (let i = 0; i < 10 && !created[3]?.closed; i++) await Promise.resolve();
+  assert.equal(created[3].closed, true);
+  deferred.shift()();
+  const fourth = await mismatchedPromise;
+  assert.equal(fourth.source, "live");
+  assert.equal(fourth.agent.agentId, "prewarm-5");
+  assert.equal(createCount, 6);
+  deferred.shift()();
+  await waitReady();
+  prewarm.close();
+  assert.equal(created[5].closed, true);
+}
 assert.deepEqual(cursorModelOptions([
   { id: "auto", displayName: "Auto" },
   { id: "default", displayName: "Auto" },
