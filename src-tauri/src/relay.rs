@@ -1638,31 +1638,25 @@ impl RelayManager {
         } else {
             make_scratch_dir()?
         };
-        // 后端优先用调用方传入的；为空回退设置里的「分享后端」，再兜底 Devin
+        // 后端优先用调用方临时选择；为空回退统一轻量级模型，再兜底 Vega。
         let agent_kind = {
             let raw = if agent.trim().is_empty() {
                 let state = self.app.state::<AppState>();
                 let s = state.settings.lock().unwrap();
-                s.share_model_agent.trim().to_string()
+                s.lightweight_model_agent.trim().to_string()
             } else {
                 agent.trim().to_string()
             };
-            AgentKind::from_str(&raw).unwrap_or(AgentKind::Devin)
+            AgentKind::from_str(&raw).unwrap_or(AgentKind::Alkaid)
         };
-        // 模型优先用调用方传入的；为空回退设置里的「分享默认模型」；Devin 再兜底 swe-1.6
+        // 模型优先用调用方临时选择；为空回退统一轻量级模型。
         let model = if model.trim().is_empty() {
             let state = self.app.state::<AppState>();
-            let s = state
-                .settings
-                .lock()
-                .unwrap()
-                .share_model
-                .trim()
-                .to_string();
-            if s.is_empty() && agent_kind == AgentKind::Devin {
-                "swe-1.6".to_string()
+            let settings = state.settings.lock().unwrap();
+            if AgentKind::from_str(&settings.lightweight_model_agent) == Some(agent_kind.clone()) {
+                settings.lightweight_model.trim().to_string()
             } else {
-                s
+                String::new()
             }
         } else {
             model.trim().to_string()
