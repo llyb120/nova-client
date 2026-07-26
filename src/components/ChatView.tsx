@@ -1,5 +1,5 @@
 import { message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import {
   compactThread,
@@ -12,22 +12,215 @@ import {
 } from "../store";
 import type { Item, Thread, TimeMachineCheckpoint, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
-import {
-  CanvasTranscript,
-  type CanvasTranscriptHandle,
-} from "./canvas-transcript/CanvasTranscript";
 import { Composer } from "./Composer";
 import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
+import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { PlanCard } from "./PlanCard";
 import { ShareModal } from "./ShareModal";
 import { TypewriterText } from "./TypewriterText";
-import { fmtTokens, type Group, groupItems } from "./TurnGroup";
+import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
+
+interface VirtualObserverPool {
+  intersectionObserver: IntersectionObserver;
+  resizeObserver: ResizeObserver;
+  intersectionCallbacks: Map<Element, () => void>;
+  resizeCallbacks: Map<Element, () => void>;
+}
+
+const virtualObserverPools = new WeakMap<HTMLElement, VirtualObserverPool>();
+
+const virtualBuffer = (root: HTMLElement) => Math.max(1200, root.clientHeight * 2);
+
+/** 同一个滚动根只创建一组观察器；轮次再多也不新增 IO / ResizeObserver 实例。 */
+function observeVirtualGroup(
+  root: HTMLElement,
+  element: Element,
+  intersectionCallback: () => void,
+  resizeCallback: () => void,
+) {
+  let pool = virtualObserverPools.get(root);
+  if (!pool) {
+    const intersectionCallbacks = new Map<Element, () => void>();
+    const resizeCallbacks = new Map<Element, () => void>();
+    const intersectionObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) intersectionCallbacks.get(entry.target)?.();
+      },
+      { root, rootMargin: `${virtualBuffer(root)}px 0px` },
+    );
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) resizeCallbacks.get(entry.target)?.();
+    });
+    pool = { intersectionObserver, resizeObserver, intersectionCallbacks, resizeCallbacks };
+    virtualObserverPools.set(root, pool);
+  }
+  pool.intersectionCallbacks.set(element, intersectionCallback);
+  pool.resizeCallbacks.set(element, resizeCallback);
+  pool.intersectionObserver.observe(element);
+  pool.resizeObserver.observe(element);
+  return () => {
+    pool!.intersectionObserver.unobserve(element);
+    pool!.resizeObserver.unobserve(element);
+    pool!.intersectionCallbacks.delete(element);
+    pool!.resizeCallbacks.delete(element);
+    if (pool!.intersectionCallbacks.size === 0) {
+      pool!.intersectionObserver.disconnect();
+      pool!.resizeObserver.disconnect();
+      virtualObserverPools.delete(root);
+    }
+  };
+}
+
+/**
+ * transcript 虚拟化包裹层：长会话若把每一轮（含 Markdown 结论、工具卡片、diff）都常驻
+ * DOM，节点数随会话线性增长，WebView2 渲染进程内存单调上涨直至崩溃。这里给每个轮次套一层
+ * 轻量 wrapper（始终存在，成本仅一个 div），用 IntersectionObserver 判断是否临近视口：
+ * 远离视口时卸载内部重内容、用等高占位撑住（滚动位置不跳），滚回来再挂载。
+ * 正在流式输出的当前轮（active）与列表末组永不卸载，避免高度剧变 / 发送后钉底失效。
+ */
+function VirtualGroup(props: {
+  group: Group;
+  index: number;
+  active: boolean;
+  /** 列表最后一组：始终挂载，保证新提示词有真实高度可供吸底 */
+  keepMounted?: boolean;
+  scrollEl: () => HTMLElement | undefined;
+  /** 已挂载内容在视口上方变高/变矮时补偿 scrollTop，保持正在阅读的内容不跳 */
+  compensateHeight: (delta: number) => void;
+}) {
+  let ref: VirtualGroupElement | undefined;
+  const [visible, setVisible] = createSignal(true);
+  const [height, setHeight] = createSignal(0);
+  const mounted = () => visible() || props.active || !!props.keepMounted;
+
+  const rememberHeight = () => {
+    if (!ref || !mounted()) return;
+    const h = ref.getBoundingClientRect().height;
+    const prev = height();
+    if (h <= 0 || Math.abs(prev - h) <= 0.5) return;
+
+    // 浏览器滚动锚定被禁用后，视口上方内容的真实尺寸变化必须由虚拟列表自己补偿。
+    // 首次测量时内容本来就在正常流里，不能重复补；只修正已有占位高度的差值。
+    const root = props.scrollEl();
+    const aboveViewport =
+      !!root && ref.getBoundingClientRect().bottom <= root.getBoundingClientRect().top;
+    setHeight(h);
+    if (prev > 0 && aboveViewport) props.compensateHeight(h - prev);
+  };
+
+  /** 挂回视口上方的占位时，立即补偿真实高度差，避免一次小滚动产生大幅跳跃。 */
+  const mountContent = () => {
+    if (!ref || visible()) return;
+    const root = props.scrollEl();
+    const before = ref.getBoundingClientRect();
+    const aboveViewport = !!root && before.bottom <= root.getBoundingClientRect().top;
+    setVisible(true);
+
+    const h = ref.getBoundingClientRect().height;
+    const prev = height();
+    if (h > 0 && Math.abs(h - prev) > 0.5) {
+      setHeight(h);
+      if (prev > 0 && aboveViewport) props.compensateHeight(h - prev);
+    }
+  };
+
+  /**
+   * 不直接信任 IntersectionObserver 传来的 entry：快速程序化滚动时，WebView2 可能在
+   * 回调执行前已经滚到了新位置，旧 entry 会把当前视口里的轮次误卸载成一整块空白。
+   * 每次都用当前几何位置复核，并由父级滚动 tick 再兜一层。
+   */
+  const syncMounted = () => {
+    if (!ref || props.active || props.keepMounted) {
+      mountContent();
+      return;
+    }
+    const root = props.scrollEl();
+    if (!root) {
+      // 找不到滚动根时宁可保留 DOM，不能把内容变成无法恢复的空占位。
+      setVisible(true);
+      return;
+    }
+    const rect = ref.getBoundingClientRect();
+    const rootRect = root.getBoundingClientRect();
+    const buffer = virtualBuffer(root);
+    const nearViewport =
+      rect.bottom >= rootRect.top - buffer && rect.top <= rootRect.bottom + buffer;
+    if (nearViewport) {
+      mountContent();
+    } else {
+      rememberHeight();
+      setVisible(false);
+    }
+  };
+
+  onMount(() => {
+    if (!ref) return;
+    const root = props.scrollEl();
+    if (!root) return;
+    const stopObserving = observeVirtualGroup(root, ref, syncMounted, rememberHeight);
+    // scroll 事件可以通过命中测试直接唤醒当前视口内的占位，并同步修正锚点。
+    ref.mountVirtualGroup = mountContent;
+    syncMounted();
+    onCleanup(() => {
+      stopObserving();
+      if (ref) delete ref.mountVirtualGroup;
+    });
+  });
+
+  // keepMounted / active 变为 true 时立即挂回；普通滚动交给 IO 和视口命中唤醒处理。
+  createEffect(() => {
+    if (props.active || props.keepMounted) mountContent();
+  });
+
+  return (
+    <div
+      ref={ref}
+      class="vgroup"
+      data-group-index={props.index}
+      // 仅卸载时使用缓存高度。挂载后必须恢复自然高度，否则内容折叠时旧 min-height
+      // 会反过来撑住观察目标，ResizeObserver 无法测到变矮后的真实尺寸。
+      style={height() > 0 && !mounted() ? { height: `${height()}px` } : undefined}
+    >
+      <Show when={mounted()}>
+        <TurnGroup group={props.group} active={props.active} />
+      </Show>
+    </div>
+  );
+}
+
+interface VirtualGroupElement extends HTMLDivElement {
+  mountVirtualGroup?: () => void;
+}
+
+interface TranscriptSegmentProps {
+  stage: "Wake" | "Do";
+  threadId: string;
+  agentKind: Thread["agentKind"];
+  model?: string | null;
+}
+
+function TranscriptSegment(props: TranscriptSegmentProps) {
+  return (
+    <div class="transcript-segment" data-thread-id={props.threadId}>
+      <span class={`agent-badge ${props.agentKind}`}>{props.stage}</span>
+      <span class="transcript-segment-agent">{agentLabel(props.agentKind)}</span>
+      <span class="transcript-segment-model" title={props.model || "默认模型"}>
+        {props.model || "默认模型"}
+      </span>
+    </div>
+  );
+}
 
 export function ChatView() {
-  let canvasHandle: CanvasTranscriptHandle | undefined;
+  let scrollRef: HTMLDivElement | undefined;
+  let innerRef: HTMLDivElement | undefined;
   const [stickToBottom, setStickToBottom] = createSignal(true);
   let scrollQueued = false;
+  let scrollFrame = 0;
+  let lastScrollTop = 0;
+  let lastVirtualMountTop = Number.NaN;
+  let pointerActive = false;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -44,6 +237,7 @@ export function ChatView() {
     [],
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
+  const lastGroupIndex = () => groups().length - 1;
   const timeStops = createMemo(() => {
     let turn = 0;
     return groups().flatMap((group, index) => {
@@ -57,28 +251,37 @@ export function ChatView() {
   const latestTimeIndex = () => timeStops().at(-1)?.index ?? -1;
 
   const syncTimeCursor = () => {
-    if (!canvasHandle) return;
+    if (!scrollRef || !innerRef) return;
     const stops = timeStops();
     if (stops.length === 0) {
       setActiveTimeIndex(-1);
       return;
     }
-    const top = canvasHandle.scrollTop() + 32;
+    const elements = innerRef.querySelectorAll<HTMLElement>(":scope > .vgroup");
+    const top = scrollRef.getBoundingClientRect().top + 32;
     let low = 0;
     let high = stops.length;
+    // 时间点与分组都按垂直位置排序；二分把每帧的布局读取从 O(n) 降为 O(log n)。
     while (low < high) {
       const middle = (low + high) >> 1;
-      const offset = canvasHandle.getGroupOffset(stops[middle].index);
-      if (offset != null && offset <= top) low = middle + 1;
+      const element = elements[stops[middle].index];
+      if (element && element.getBoundingClientRect().top <= top) low = middle + 1;
       else high = middle;
     }
     setActiveTimeIndex(stops[Math.max(0, low - 1)].index);
   };
 
   const travelTo = (index: number) => {
+    const element = innerRef?.querySelector<VirtualGroupElement>(
+      `.vgroup[data-group-index="${index}"]`,
+    );
+    if (!element) return;
     cancelBottomFollow();
-    canvasHandle?.scrollToGroup(index);
-    requestAnimationFrame(() => syncTimeCursor());
+    element.mountVirtualGroup?.();
+    requestAnimationFrame(() => {
+      element.scrollIntoView({ block: "start" });
+      syncTimeCursor();
+    });
   };
 
   const returnToNow = () => {
@@ -86,12 +289,112 @@ export function ChatView() {
     setActiveTimeIndex(latestTimeIndex());
   };
 
-  const cancelBottomFollow = () => setStickToBottom(false);
+  /**
+   * IO 回调是异步的，拖动滚动条跨很长距离时可能晚一帧。WebView2 的命中测试在合成器
+   * 快速滚动期间还可能停留在旧位置，因此不能依赖 elementFromPoint 找锚点。这里直接按
+   * wrapper 的当前几何位置二分出首个候选，再同步挂载视口和两屏缓冲区，避免工具详情占位
+   * 在快速滑动时整屏留白。
+   */
+  const mountVisibleVirtualGroups = (force = false) => {
+    if (!scrollRef || !innerRef) return;
+    const viewportHeight = scrollRef.clientHeight;
+    if (
+      !force &&
+      Number.isFinite(lastVirtualMountTop) &&
+      Math.abs(scrollRef.scrollTop - lastVirtualMountTop) < viewportHeight / 3
+    ) {
+      return;
+    }
 
-  const pinBottom = () => {
-    canvasHandle?.pinBottom();
+    const elements = innerRef.querySelectorAll<VirtualGroupElement>(":scope > .vgroup");
+    if (elements.length === 0) return;
+    lastVirtualMountTop = scrollRef.scrollTop;
+
+    const rootRect = scrollRef.getBoundingClientRect();
+    const top = rootRect.top - virtualBuffer(scrollRef);
+    const bottom = rootRect.bottom + virtualBuffer(scrollRef);
+
+    // 分组在文档流中严格按垂直位置递增，先二分跳过缓冲区上方的绝大多数占位。
+    let low = 0;
+    let high = elements.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (elements[middle].getBoundingClientRect().bottom < top) low = middle + 1;
+      else high = middle;
+    }
+
+    // mountContent 会同步恢复真实 DOM；每次重新读取位置，兼容缓存高度与真实高度有差异。
+    for (let index = low; index < elements.length; index++) {
+      const element = elements[index];
+      if (element.getBoundingClientRect().top > bottom) break;
+      element.mountVirtualGroup?.();
+    }
   };
 
+  const maxScrollTop = () =>
+    scrollRef ? Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight) : 0;
+
+  const isAtBottom = () => !scrollRef || maxScrollTop() - scrollRef.scrollTop <= 1;
+
+  const cancelBottomFollow = () => setStickToBottom(false);
+
+  const isToolDetailScroll = (target: EventTarget | null) =>
+    target instanceof Element && !!target.closest(".tool-output, .tool-raw");
+
+  const handleWheel = (event: WheelEvent) => {
+    // 工具详情有独立滚动区，内部滚动不应改变外层会话的吸底状态。
+    if (isToolDetailScroll(event.target)) return;
+    if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
+    if (event.deltaY > 0 && isAtBottom()) {
+      if (!stickToBottom()) enableBottomFollow();
+      return;
+    }
+    if (event.deltaY !== 0) cancelBottomFollow();
+  };
+
+  const handlePointerDown = (event: PointerEvent) => {
+    // 仅跟踪外层滚动区的指针交互；拖动工具详情滚动条不能暂停吸底。
+    if (isToolDetailScroll(event.target)) return;
+    pointerActive = true;
+  };
+
+  const processTranscriptScroll = () => {
+    mountVisibleVirtualGroups();
+    syncTimeCursor();
+    const currentTop = scrollRef?.scrollTop ?? 0;
+    const atBottom = isAtBottom();
+    if (stickToBottom()) {
+      // 流式布局和虚拟分组高度变化也会触发 scroll；只有指针拖动时才把位移视为用户操作。
+      if (pointerActive && !atBottom && currentTop !== lastScrollTop) cancelBottomFollow();
+    } else if (atBottom && currentTop > lastScrollTop) {
+      setStickToBottom(true);
+    }
+    lastScrollTop = currentTop;
+  };
+
+  // WebView2 一帧可能派发多次 scroll；几何读取与响应式更新最多每帧执行一次。
+  const handleTranscriptScroll = () => {
+    if (scrollFrame) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      processTranscriptScroll();
+    });
+  };
+
+  const pinBottom = () => {
+    if (!scrollRef || !stickToBottom() || pointerActive) return;
+    scrollRef.scrollTop = maxScrollTop();
+    lastScrollTop = scrollRef.scrollTop;
+    mountVisibleVirtualGroups(true);
+  };
+
+  const compensateVirtualHeight = (delta: number) => {
+    if (!scrollRef || Math.abs(delta) <= 0.5) return;
+    scrollRef.scrollTop += delta;
+    lastScrollTop = scrollRef.scrollTop;
+  };
+
+  // 合并同一轮内容变化，并在下一次绘制前直接钉底；不做滚动动画或多帧追赶。
   const scheduleBottomPin = () => {
     if (scrollQueued) return;
     scrollQueued = true;
@@ -104,6 +407,16 @@ export function ChatView() {
   const enableBottomFollow = () => {
     setStickToBottom(true);
     scheduleBottomPin();
+  };
+
+  const finishPointerInteraction = () => {
+    if (scrollFrame) {
+      cancelAnimationFrame(scrollFrame);
+      scrollFrame = 0;
+    }
+    processTranscriptScroll();
+    pointerActive = false;
+    if (stickToBottom()) scheduleBottomPin();
   };
 
   // 会话累计 token 用量
@@ -121,6 +434,48 @@ export function ChatView() {
     if (last && "text" in last) void (last as { text: string }).text.length;
     void permissions().length;
     scheduleBottomPin();
+  });
+
+  onMount(() => {
+    if (!innerRef || !scrollRef) return;
+    const ro = new ResizeObserver(() => {
+      scheduleBottomPin();
+    });
+    ro.observe(innerRef);
+    ro.observe(scrollRef);
+
+    const scrollUpKeys = new Set(["ArrowUp", "PageUp", "Home"]);
+    const scrollDownKeys = new Set(["ArrowDown", "PageDown", "End"]);
+    const handleScrollKey = (event: KeyboardEvent) => {
+      const scrollsUp = scrollUpKeys.has(event.key) || (event.key === " " && event.shiftKey);
+      const scrollsDown = scrollDownKeys.has(event.key) || (event.key === " " && !event.shiftKey);
+      if (event.altKey || event.ctrlKey || event.metaKey || (!scrollsUp && !scrollsDown)) return;
+      if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
+      const target = event.target;
+      if (target instanceof Node && target !== document.body && !scrollRef?.contains(target)) return;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
+      ) return;
+      if (isToolDetailScroll(target)) return;
+      if (scrollsDown) {
+        if (isAtBottom()) {
+          if (!stickToBottom()) enableBottomFollow();
+          return;
+        }
+      }
+      cancelBottomFollow();
+    };
+    window.addEventListener("keydown", handleScrollKey, true);
+    window.addEventListener("pointerup", finishPointerInteraction, true);
+    window.addEventListener("pointercancel", finishPointerInteraction, true);
+    onCleanup(() => {
+      ro.disconnect();
+      if (scrollFrame) cancelAnimationFrame(scrollFrame);
+      window.removeEventListener("keydown", handleScrollKey, true);
+      window.removeEventListener("pointerup", finishPointerInteraction, true);
+      window.removeEventListener("pointercancel", finishPointerInteraction, true);
+    });
   });
 
   // 切换会话时从底部开始；后续尺寸变化由 ResizeObserver 持续对齐。
@@ -590,25 +945,50 @@ export function ChatView() {
 
       <div class="chat-body">
        <div
-        class="chat-transcript-host"
+        class="transcript"
         classList={{ "checkpoint-preview": !!previewItems(), "checkpoint-preview-fading": previewFading() }}
-       >
-        <CanvasTranscript
-          groups={groups()}
-          isRunning={isRunning()}
-          permissions={permissions()}
-          previewBanner={!!previewCheckpointId()}
-          onReturnToTimeline={returnToCurrentTimeline}
-          emptyHintCwd={cwdDisplay()}
-          loadingThread={!!state.loadingThread}
-          stickToBottom={stickToBottom}
-          setStickToBottom={setStickToBottom}
-          onScroll={() => syncTimeCursor()}
-          ref={(h) => {
-            canvasHandle = h;
-          }}
-        />
-       </div>
+        ref={scrollRef}
+        onScroll={handleTranscriptScroll}
+        onWheel={handleWheel}
+        onPointerDown={handlePointerDown}
+      >
+        <div class="transcript-inner" ref={innerRef}>
+          <Show when={previewCheckpointId()}>
+            <button
+              type="button"
+              class="checkpoint-preview-banner"
+              title="回到当前时间线和最新消息"
+              onClick={returnToCurrentTimeline}
+            >
+              回到当前时间线
+            </button>
+          </Show>
+          <Show when={displayedItems().length === 0 && !state.loadingThread}>
+            <div class="transcript-hint">
+              在下方输入任务，{agentLabel(state.agentKind)} 将在{" "}
+              <code>{cwdDisplay()}</code> 中工作。
+            </div>
+          </Show>
+          <Show keyed when={state.currentId}>
+
+            <For each={groups()}>
+              {(g, i) => (
+                <VirtualGroup
+                  group={g}
+                  index={i()}
+                  // 运行中所有尚未闭合的轮次都保持活跃：补充提示词会新开一组，
+                  // 若只标最后一组，前面仍在跑的工具/输出会像已停止。
+                  active={isRunning() && !g.turn}
+                  keepMounted={i() === lastGroupIndex()}
+                  scrollEl={() => scrollRef}
+                  compensateHeight={compensateVirtualHeight}
+                />
+              )}
+            </For>
+          </Show>
+          <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
+        </div>
+      </div>
       <Show when={timeStops().length > 0 && !isFireThread()}>
         <aside
           class="repo-time-machine"
