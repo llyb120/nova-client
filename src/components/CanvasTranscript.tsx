@@ -375,9 +375,13 @@ function itemNode(item: Item, active: boolean, p: Palette, rebuild: () => void,
     const children = state.currentId && !state.running[state.currentId]
       ? [button("", { width: 28, height: 26, padding: [6, 7], color: p.faint,
           margin: [0, 5], borderRadius: 6, leadingIcon: "edit", iconColor: p.faint,
-          hoverBackground: p.hover }, () => edit(item, bubble)), bubble]
+          opacity: 0, hoverOpacity: 1, hoverBackground: p.hover, hoverColor: p.text },
+          () => edit(item, bubble)), bubble]
       : [bubble];
-    return block({ display: "flex", flexDirection: "row", justifyContent: "flex-end", alignItems: "center", margin: [20, 0, 16] }, "", children);
+    const row = block({ display: "flex", flexDirection: "row", justifyContent: "flex-end",
+      alignItems: "center", margin: [20, 0, 16] }, "", children);
+    row._editHoverRoot = true;
+    return row;
   }
   if (item.type === "assistant") {
     if (item.text.trim() === "None") return null;
@@ -730,9 +734,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   };
 
   const handle: CanvasTranscriptHandle = {
-    scrollToBottom() { if (!root) return; keepBottom = true; root._scrollY = root._maxScrollY; renderer?.requestRender(); emitScroll(false); },
-    scrollToGroup(index) { const node = groupNodes[index]; if (!root || !node) return; keepBottom = false; root._scrollY = Math.max(0, Math.min(root._maxScrollY, node._y - 20)); renderer?.requestRender(); emitScroll(false); },
-    scrollBy(delta) { if (!root) return; keepBottom = false; root._scrollY = Math.max(0, Math.min(root._maxScrollY, root._scrollY + delta)); renderer?.requestRender(); emitScroll(true); },
+    scrollToBottom() { if (!root) return; keepBottom = true; root._scrollY = root._maxScrollY; renderer?.invalidate(false); emitScroll(false); },
+    scrollToGroup(index) { const node = groupNodes[index]; if (!root || !node) return; keepBottom = false; root._scrollY = Math.max(0, Math.min(root._maxScrollY, node._y - 20)); renderer?.invalidate(false); emitScroll(false); },
+    scrollBy(delta) { if (!root) return; keepBottom = false; root._scrollY = Math.max(0, Math.min(root._maxScrollY, root._scrollY + delta)); renderer?.invalidate(false); emitScroll(true); },
     isAtBottom() { return !root || root._maxScrollY - root._scrollY <= 2; },
     scrollTop() { return root?._scrollY ?? 0; }, maxScrollTop() { return root?._maxScrollY ?? 0; },
     activeGroup() { if (!root) return -1; const y = root._scrollY + 32; let active = -1; groupNodes.forEach((node, index) => { if (node._y <= y) active = index; }); return active; },

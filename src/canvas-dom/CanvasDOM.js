@@ -3,7 +3,7 @@
 
 import { Node, h } from './Node.js';
 import { layout } from './layout.js';
-import { paint, hitTextPosition, paintSelection, selectionText, collectTextNodes } from './painter.js';
+import { paint, hitTextPosition, paintSelection, selectionText, collectTextNodes, treeHasBusyStatus } from './painter.js';
 import { hitTest, findScrollable, scrollBy } from './interaction.js';
 import { parseMarkdown } from './markdown.js';
 
@@ -22,8 +22,10 @@ export class CanvasDOM {
 
     this._rafId = 0;
     this._dirty = true;
+    this._needsLayout = true;
     this._caretOn = true;
     this._caretTimer = 0;
+    this._spinPhase = 0;
 
     // interaction state
     this._hoverNode = null;
@@ -55,6 +57,7 @@ export class CanvasDOM {
     this._loadImages(node);
     // 布局必须与树替换同步完成。否则点击展开到下一帧之间，新根的 maxScroll 仍为 0，
     // 吸底、时间线定位或紧接着发生的滚轮事件会把位置错误地夹到顶部。
+    this._needsLayout = true;
     this._render();
     this._dirty = false;
   }
@@ -65,6 +68,12 @@ export class CanvasDOM {
     this.canvas.width = this.width * this.dpr;
     this.canvas.height = this.height * this.dpr;
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.invalidate(true);
+  }
+
+  /** @param {boolean} [needsLayout=true] hover/busy/caret 等仅重绘，不重排。 */
+  invalidate(needsLayout = true) {
+    if (needsLayout) this._needsLayout = true;
     this._dirty = true;
     this.requestRender();
   }
@@ -98,6 +107,7 @@ export class CanvasDOM {
         if (n.hasStreamPending()) n.revealStream(speed);
         else this._streamingNodes.delete(n);
       }
+      this._needsLayout = true;
       this._dirty = true;
     }
     // caret blink
@@ -107,19 +117,27 @@ export class CanvasDOM {
       this._caretTimer = now;
       this._dirty = true;
     }
+    const busy = this.root && treeHasBusyStatus(this.root);
+    if (busy) {
+      this._spinPhase = (now / 800) % 1;
+      this._dirty = true;
+    }
     if (this._dirty) {
       this._render();
       this._dirty = false;
     }
-    if (this._velocityX || this._velocityY || this._focusedNode || this._streamingNodes.size > 0) {
+    if (this._velocityX || this._velocityY || this._focusedNode || this._streamingNodes.size > 0 || busy) {
       this.requestRender();
     }
   };
 
   _render() {
     if (!this.root) return;
-    layout(this.root, 0, 0, this.width, this.height);
-    this._clampScrollTree(this.root);
+    if (this._needsLayout) {
+      layout(this.root, 0, 0, this.width, this.height);
+      this._clampScrollTree(this.root);
+      this._needsLayout = false;
+    }
     this.ctx.clearRect(0, 0, this.width, this.height);
     paint(this.ctx, this.root, 0, 0, this.width, this.height, this);
     // selection overlay (drawn after text so highlight sits on top)
@@ -143,8 +161,7 @@ export class CanvasDOM {
       img.onload = () => {
         node._img = img;
         node._imgLoaded = true;
-        this._dirty = true;
-        this.requestRender();
+        this.invalidate(true);
       };
       img.onerror = () => { node._imgLoaded = false; };
       img.src = node.style.src;
@@ -199,8 +216,7 @@ export class CanvasDOM {
           endNode: pos.node,
           endOffset: pos.offset
         });
-        this._dirty = true;
-        this.requestRender();
+        this.invalidate(false);
       }
       return;
     }
@@ -216,8 +232,7 @@ export class CanvasDOM {
       this._lastDragY = y;
       this._lastDragX = x;
       this._lastDragTime = now;
-      this._dirty = true;
-      this.requestRender();
+      this.invalidate(false);
       return;
     }
     const hit = this.root ? hitTest(this.root, x, y) : null;
@@ -232,8 +247,7 @@ export class CanvasDOM {
       } else {
         this.canvas.style.cursor = 'default';
       }
-      this._dirty = true;
-      this.requestRender();
+      this.invalidate(false);
     } else if (hit) {
       // update cursor for text selection
       const isInteractive = hit.tag === 'button' || hit.tag === 'input' || (hit.tag === 'a' && hit.style.href);
@@ -288,8 +302,7 @@ export class CanvasDOM {
           };
           this.canvas.setAttribute('tabindex', '0');
           this.canvas.focus();
-          this._dirty = true;
-          this.requestRender();
+          this.invalidate(false);
           return;
         }
       }
@@ -309,12 +322,10 @@ export class CanvasDOM {
       } else {
         this._selection = null;
       }
-      this._dirty = true;
-      this.requestRender();
+      this.invalidate(false);
     } else {
       this._selection = null;
-      this._dirty = true;
-      this.requestRender();
+      this.invalidate(false);
     }
   };
 
@@ -330,8 +341,7 @@ export class CanvasDOM {
           && this._selection.startOffset === this._selection.endOffset) {
         this._selection = null;
       }
-      this._dirty = true;
-      this.requestRender();
+      this.invalidate(false);
     }
     if (this._dragging) {
       this._dragging = false;
@@ -340,16 +350,14 @@ export class CanvasDOM {
         this._scrollTarget = null;
       }
     }
-    this._dirty = true;
-    this.requestRender();
+    this.invalidate(false);
   };
 
   _onMouseLeave = () => {
     if (this._hoverNode) {
       this._hoverNode._hover = false;
       this._hoverNode = null;
-      this._dirty = true;
-      this.requestRender();
+      this.invalidate(false);
     }
   };
 
@@ -365,9 +373,8 @@ export class CanvasDOM {
         this._scrollTarget = scroller;
         this._velocityX = e.deltaX * 0.5;
         this._velocityY = e.deltaY * 0.5;
-        this._dirty = true;
         this._emit('scroll', scroller);
-        this.requestRender();
+        this.invalidate(false);
       }
     }
   };
@@ -392,9 +399,8 @@ export class CanvasDOM {
       if (v.length) {
         this._focusedNode.style.value = v.slice(0, -1);
         this._focusedNode._dirty = true;
-        this._dirty = true;
         this._emit('input', this._focusedNode);
-        this.requestRender();
+        this.invalidate(true);
       }
     } else if (e.key === 'Enter') {
       e.preventDefault();
@@ -406,11 +412,10 @@ export class CanvasDOM {
     if (!this._focusedNode || this._focusedNode.tag !== 'input' || !text) return;
     this._focusedNode.style.value = (this._focusedNode.style.value || '') + text;
     this._focusedNode._dirty = true;
-    this._dirty = true;
     this._caretOn = true;
     this._caretTimer = performance.now();
     this._emit('input', this._focusedNode);
-    this.requestRender();
+    this.invalidate(true);
   }
 
   _onKeyPress = (e) => {
@@ -438,8 +443,7 @@ export class CanvasDOM {
     if (this._focusedNode) {
       this._focusedNode._focused = false;
       this._focusedNode = null;
-      this._dirty = true;
-      this.requestRender();
+      this.invalidate(false);
     }
   };
 
@@ -505,8 +509,7 @@ export class CanvasDOM {
   clearSelection() {
     if (this._selection) {
       this._selection = null;
-      this._dirty = true;
-      this.requestRender();
+      this.invalidate(false);
     }
   }
 
@@ -516,8 +519,7 @@ export class CanvasDOM {
   streamTo(node, chunk, { typewriter = false } = {}) {
     node.appendStream(chunk, { typewriter });
     if (typewriter) this._streamingNodes.add(node);
-    this._dirty = true;
-    this.requestRender();
+    this.invalidate(true);
     return node;
   }
 
@@ -533,8 +535,7 @@ export class CanvasDOM {
     container._dirty = true;
     let p = container.parent;
     while (p) { p._dirty = true; p = p.parent; }
-    this._dirty = true;
-    this.requestRender();
+    this.invalidate(true);
     return container;
   }
 
@@ -545,8 +546,7 @@ export class CanvasDOM {
   finishAllStreams() {
     for (const n of this._streamingNodes) n.finishStream();
     this._streamingNodes.clear();
-    this._dirty = true;
-    this.requestRender();
+    this.invalidate(true);
   }
 
   destroy() {

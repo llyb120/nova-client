@@ -30,6 +30,7 @@ const DEFAULT_STYLE = {
   borderColor: '#000000',
   overflow: 'visible', // visible | hidden | scroll | auto
   opacity: 1,
+  hoverOpacity: null,
   // flex container
   flexDirection: 'row', // row | column
   flexWrap: 'nowrap', // nowrap | wrap

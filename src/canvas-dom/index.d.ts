@@ -12,6 +12,8 @@ export interface CanvasStyle {
   hoverBackground?: string;
   activeBackground?: string;
   hoverColor?: string;
+  hoverOpacity?: number | null;
+  opacity?: number;
   leadingIcon?: string;
   leadingChevron?: boolean | null;
   iconColor?: string;
@@ -42,6 +44,7 @@ export class Node {
   _controlLines?: string[];
   _wrappedLines?: string[];
   _layoutStable?: boolean;
+  _editHoverRoot?: boolean;
   appendChild(child: Node): Node;
   removeChild(child: Node): Node;
   setStyle(patch: CanvasStyle): void;
@@ -60,6 +63,7 @@ export class CanvasDOM {
   setRoot(node: Node): void;
   resize(width?: number, height?: number): void;
   requestRender(): void;
+  invalidate(needsLayout?: boolean): void;
   on(type: string, callback: (node: Node) => void): void;
   hasFocusedInput(): boolean;
   destroy(): void;

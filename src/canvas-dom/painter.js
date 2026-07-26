@@ -64,10 +64,47 @@ function roundRect(ctx, x, y, w, h, radius) {
   ctx.closePath();
 }
 
+function isUnder(node, ancestor) {
+  let current = node;
+  while (current) {
+    if (current === ancestor) return true;
+    current = current.parent;
+  }
+  return false;
+}
+
+function findEditHoverRoot(node) {
+  let current = node;
+  while (current) {
+    if (current._editHoverRoot) return current;
+    current = current.parent;
+  }
+  return null;
+}
+
+export function treeHasBusyStatus(node) {
+  if (node?.style?.trailingStatus === 'busy') return true;
+  if (!node?.children) return false;
+  for (const child of node.children) {
+    if (treeHasBusyStatus(child)) return true;
+  }
+  return false;
+}
+
 // Paint a node. clipX/clipY/clipW/clipH define the visible clip rect (already in screen coords).
 export function paint(ctx, node, clipX, clipY, clipW, clipH, renderer) {
   const s = node.style;
-  if (s.display === 'none' || s.opacity <= 0) return;
+  if (s.display === 'none') return;
+
+  // Effective opacity: hoverOpacity can reveal nodes with opacity:0 (e.g. edit button).
+  let opacity = s.opacity;
+  if (s.hoverOpacity != null) {
+    const hoverRoot = findEditHoverRoot(node);
+    const hovered = node._hover
+      || (renderer?._hoverNode && hoverRoot && isUnder(renderer._hoverNode, hoverRoot));
+    opacity = hovered ? s.hoverOpacity : s.opacity;
+  }
+  if (opacity <= 0) return;
 
   const x = node._x, y = node._y, w = node._width, h = node._height;
   // cull
@@ -77,7 +114,7 @@ export function paint(ctx, node, clipX, clipY, clipW, clipH, renderer) {
   }
 
   ctx.save();
-  if (s.opacity < 1) ctx.globalAlpha *= s.opacity;
+  if (opacity < 1) ctx.globalAlpha *= opacity;
 
   // background and border: inline 由片段绘制，控件由 paintControl 处理 hover/focus 状态。
   const isInline = s.display === 'inline';
@@ -161,6 +198,9 @@ function paintText(ctx, node, x, y, maxW, renderer) {
   ctx.textBaseline = 'top';
   const text = String(node.textContent || '');
   const lines = node._wrappedLines || wrapText(text, maxW, fs, ff, s.whiteSpace, fw, fst);
+  // CSS line-height 把半 leading 分到字形上下；canvas top baseline 若不补偿，
+  // 多余行距会全部堆在底部，看起来像多了一截 padding-bottom。
+  const halfLeading = Math.max(0, (lh - fs) / 2);
   // 只提交视口内的 fillText；完整行几何仍保留给选择和复制。
   const lines2 = [];
   const { sy } = getScrollOffset(node);
@@ -171,15 +211,16 @@ function paintText(ctx, node, x, y, maxW, renderer) {
     const lineText = lines[i];
     let tx = x;
     const lineY = y + i * lh;
+    const textY = lineY + halfLeading;
     const lineW = measureText(lineText, fs, ff, fw, fst);
     if (s.textAlign === 'center') tx = x + (maxW - lineW) / 2;
     else if (s.textAlign === 'right') tx = x + (maxW - lineW);
     const visible = lineY >= visibleTop && lineY <= visibleBottom;
-    if (visible) ctx.fillText(lineText, tx, lineY);
+    if (visible) ctx.fillText(lineText, tx, textY);
     if (visible && s.textDecoration === 'underline') {
-      ctx.fillRect(tx, lineY + fs, lineW, Math.max(1, fs / 12));
+      ctx.fillRect(tx, textY + fs, lineW, Math.max(1, fs / 12));
     } else if (visible && s.textDecoration === 'line-through') {
-      ctx.fillRect(tx, lineY + fs * 0.55, lineW, Math.max(1, fs / 12));
+      ctx.fillRect(tx, textY + fs * 0.55, lineW, Math.max(1, fs / 12));
     }
     lines2.push({ text: lineText, x: tx, y: lineY, w: lineW, fs, lh, offset });
     offset += lineText.length;
@@ -221,15 +262,17 @@ function paintInlineText(ctx, node) {
   }
   ctx.fillStyle = s.color;
 
-  // Draw text and decorations per-fragment
+  // Draw text and decorations per-fragment（半 leading，与 paintText / CSS 对齐）
+  const halfLeading = Math.max(0, (lh - fs) / 2);
   for (const ln of node._textLines) {
+    const textY = ln.y + halfLeading;
     if (ln.text) {
-      ctx.fillText(ln.text, ln.x, ln.y);
+      ctx.fillText(ln.text, ln.x, textY);
     }
     if (s.textDecoration === 'underline') {
-      ctx.fillRect(ln.x, ln.y + fs, ln.w, Math.max(1, fs / 12));
+      ctx.fillRect(ln.x, textY + fs, ln.w, Math.max(1, fs / 12));
     } else if (s.textDecoration === 'line-through') {
-      ctx.fillRect(ln.x, ln.y + fs * 0.55, ln.w, Math.max(1, fs / 12));
+      ctx.fillRect(ln.x, textY + fs * 0.55, ln.w, Math.max(1, fs / 12));
     }
   }
 }
@@ -376,11 +419,13 @@ function paintControl(ctx, node, x, y, w, h, renderer) {
     if (s.trailingStatus === 'failed') {
       ctx.beginPath(); ctx.arc(cx, y + h / 2, 3.5, 0, Math.PI * 2); ctx.fill();
     } else {
-      ctx.globalAlpha = 0.3;
+      // 与 .spinner 一致：12px 环、2px 线宽、持续旋转。
+      const angle = ((renderer?._spinPhase || 0) % 1) * Math.PI * 2;
+      ctx.globalAlpha = 0.26;
       ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(cx, y + h / 2, 5, 0, Math.PI * 2); ctx.stroke();
       ctx.globalAlpha = 1;
-      ctx.beginPath(); ctx.arc(cx, y + h / 2, 5, -Math.PI / 2, Math.PI * .15); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, y + h / 2, 5, angle - Math.PI / 2, angle + Math.PI * .15); ctx.stroke();
     }
     ctx.restore();
     trailingX -= 20;
@@ -573,7 +618,8 @@ export function paintSelection(ctx, root, sel) {
       const fst = n.style.fontStyle || 'normal';
       const x0 = (ln.x - sx) + measureText(ln.text.slice(0, a), fs, ff, fw, fst);
       const x1 = (ln.x - sx) + measureText(ln.text.slice(0, b), fs, ff, fw, fst);
-      ctx.fillRect(x0, ln.y - sy, Math.max(1, x1 - x0), ln.fs);
+      const halfLeading = Math.max(0, ((ln.lh || fs) - fs) / 2);
+      ctx.fillRect(x0, ln.y - sy + halfLeading, Math.max(1, x1 - x0), ln.fs);
     }
   }
   ctx.restore();
