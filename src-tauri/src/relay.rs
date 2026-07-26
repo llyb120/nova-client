@@ -914,6 +914,7 @@ impl RelayManager {
             // guest -> host
             "roaming.create" => self.on_roaming_create(&env),
             "roaming.prompt" => self.on_roaming_prompt(&env),
+            "roaming.truncate" => self.on_roaming_truncate(&env),
             "roaming.cancel" => self.on_roaming_cancel(&env),
             "roaming.permission_response" => self.on_roaming_permission_response(&env),
             "roaming.config" => self.on_roaming_config(&env),
@@ -2418,6 +2419,29 @@ impl RelayManager {
         Ok(())
     }
 
+    /// guest：编辑历史消息前通知 host 在同一位置截断真实会话。随后普通 prompt
+    /// 仍走 roaming.prompt；中转站对同一连接保序，因此 host 会先完成状态重置。
+    pub fn guest_truncate(self: &Arc<Self>, thread_id: &str, item_id: u64) -> Result<(), String> {
+        let (peer, host_thread_id) = self.roaming_route(thread_id)?;
+        // truncate_thread 已在本地完成截断。把保留历史一并发送，使 guest 从旁支恢复后
+        // 编辑时，即使该消息已不在 host 当前路径上，host 也能切到同一共同历史。
+        let retained_items = {
+            let state = self.app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            store.get(thread_id).ok_or("线程不存在")?.items.clone()
+        };
+        self.spawn_send(
+            peer,
+            "roaming.truncate",
+            json!({
+                "hostThreadId": host_thread_id,
+                "itemId": item_id,
+                "retainedItems": retained_items,
+            }),
+        );
+        Ok(())
+    }
+
     pub fn guest_cancel(self: &Arc<Self>, thread_id: &str) -> Result<(), String> {
         let (peer, host_thread_id) = {
             let state = self.app.state::<AppState>();
@@ -3033,6 +3057,71 @@ impl RelayManager {
         let state = self.app.state::<AppState>();
         let allowed = crate::current_roaming_project_folders(state.inner());
         is_allowed_roaming_path(&allowed, folder)
+    }
+
+    fn on_roaming_truncate(&self, env: &InEnvelope) {
+        let host_thread_id = env.data["hostThreadId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let Some(item_id) = env.data["itemId"].as_u64() else {
+            return;
+        };
+        if !self.ensure_hosted(&host_thread_id) {
+            return;
+        }
+        let guest = self.hosted.lock().unwrap().get(&host_thread_id).cloned();
+        if !guest.is_some_and(|guest| guest.token == env.from) {
+            return;
+        }
+
+        let retained_items: Vec<Item> =
+            match serde_json::from_value(env.data["retainedItems"].clone()) {
+                Ok(items) => items,
+                Err(_) => return,
+            };
+        let state = self.app.state::<AppState>();
+        let _time_machine_guard = state.time_machine_lock.lock().unwrap();
+        {
+            let mut store = state.store.lock().unwrap();
+            let Some(thread) = store.get_mut(&host_thread_id) else {
+                return;
+            };
+            // 当前路径仍包含目标消息时精确记录共同历史与原旁支；从 guest 的旧旁支
+            // 跳回时目标可能已不在 host 当前路径，此时至少先保存当前路径再切换镜像。
+            let recorded = thread
+                .items
+                .iter()
+                .any(|item| item.id() == item_id && matches!(item, Item::User { .. }))
+                && crate::time_machine::record_edit_fork(&state.config_dir, thread, item_id)
+                    .is_ok();
+            if !recorded
+                && crate::time_machine::create_checkpoint(&state.config_dir, thread).is_err()
+            {
+                return;
+            }
+            thread.items = retained_items;
+            thread.plan = None;
+            thread.acp_session_id = None;
+            thread.pending_native_restore = None;
+            thread.codex_usage_snapshot = None;
+            thread
+                .provider_checkpoints
+                .retain(|checkpoint| checkpoint.user_item_id < item_id);
+            thread.handoff_from = (!thread.items.is_empty()).then(|| thread.agent_kind.clone());
+            thread.updated_at = now_ms();
+            store.save();
+        }
+        // 远端原生会话已不再对应截断后的历史，下一条 prompt 必须从接力上下文启动。
+        state.acp.forget_session_of_thread(&host_thread_id);
+        state.codex.forget_session_of_thread(&host_thread_id);
+        state.codexplus.forget_session_of_thread(&host_thread_id);
+        state
+            .codebuddyplus
+            .forget_session_of_thread(&host_thread_id);
+        state.claudeplus.forget_session_of_thread(&host_thread_id);
+        state.cursorplus.forget_session_of_thread(&host_thread_id);
+        state.opencodeplus.forget_session_of_thread(&host_thread_id);
     }
 
     fn on_roaming_prompt(&self, env: &InEnvelope) {
