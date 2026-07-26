@@ -909,6 +909,12 @@ button {
   height: 100%;
   outline: none;
   touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.transcript-canvas-only:focus,
+.transcript-canvas-only:focus-visible {
+  outline: none;
+  box-shadow: none;
 }
 .canvas-prompt-editor {
   position: absolute;

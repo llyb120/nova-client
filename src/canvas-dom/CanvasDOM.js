@@ -3,17 +3,19 @@
 
 import { Node, h } from './Node.js';
 import { layout } from './layout.js';
-import { paint, hitTextPosition, paintSelection, selectionText, collectTextNodes, treeHasBusyStatus, treeHasBusyStatusVisible, hoverPaintTarget, nodeScreenBounds, findNodeTitle } from './painter.js';
+import { paint, hitTextPosition, paintSelection, selectionText, collectTextNodes, treeHasBusyStatus, treeHasBusyStatusVisible, collectBusyStatusVisible, hoverPaintTarget, nodeScreenBounds, findNodeTitle } from './painter.js';
 import { hitTest, findScrollable, scrollBy } from './interaction.js';
 import { parseMarkdown } from './markdown.js';
 
 export { Node, h };
-export { measureText } from './layout.js';
+export { measureText, LAYOUT_REV } from './layout.js';
 export { parseMarkdown };
 
 export class CanvasDOM {
   constructor(canvas, options = {}) {
     this.canvas = canvas;
+    // Keep focusable for copy shortcuts; hide browser focus ring.
+    canvas.style.outline = 'none';
     this.ctx = canvas.getContext('2d', { alpha: true });
     this.root = null;
     this.dpr = options.dpr || (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
@@ -32,6 +34,12 @@ export class CanvasDOM {
     this._lastSpinFrame = -1;
     this._busyProbeFrame = -1;
     this._hasBusy = false;
+    this._fullPaint = false;
+    this._paintScrollX = 0;
+    this._paintScrollY = 0;
+    this._paintScrollValid = false;
+    this._blitCanvas = null;
+    this._blitCtx = null;
 
     // interaction state
     this._hoverNode = null;
@@ -67,29 +75,52 @@ export class CanvasDOM {
     this._hoverOnly = false;
     this._hoverDirtyNodes = null;
     this._hasBusy = false;
+    this._fullPaint = true;
+    this._paintScrollValid = false;
     this._render();
     this._dirty = false;
   }
 
+  /** @returns {boolean} true if the backing-store size changed */
   resize(w, h) {
-    this.width = w || this.canvas.clientWidth || this.canvas.width;
-    this.height = h || this.canvas.clientHeight || this.canvas.height;
-    this.canvas.width = this.width * this.dpr;
-    this.canvas.height = this.height * this.dpr;
+    const width = Math.max(1, w || this.canvas.clientWidth || this.canvas.width || 1);
+    const height = Math.max(1, h || this.canvas.clientHeight || this.canvas.height || 1);
+    const bw = Math.max(1, Math.round(width * this.dpr));
+    const bh = Math.max(1, Math.round(height * this.dpr));
+    if (this.width === width && this.height === height && this.canvas.width === bw && this.canvas.height === bh) {
+      return false;
+    }
+    this.width = width;
+    this.height = height;
+    // 赋值 canvas.width/height 会立刻清空位图；若等到下一帧 RAF 再画，合成器会闪一帧空白。
+    this.canvas.width = bw;
+    this.canvas.height = bh;
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.invalidate(true);
+    this._needsLayout = true;
+    this._hoverOnly = false;
+    this._hoverDirtyNodes = null;
+    this._fullPaint = true;
+    this._paintScrollValid = false;
+    if (this.root) {
+      this._render();
+      this._dirty = false;
+    } else {
+      this._dirty = true;
+    }
+    return true;
   }
 
   /** @param {boolean} [needsLayout=true] hover/busy/caret 等仅重绘，不重排。 */
   invalidate(needsLayout = true) {
     if (needsLayout) this._needsLayout = true;
     this._dirty = true;
+    this._fullPaint = true;
     this._hoverOnly = false;
     this._hoverDirtyNodes = null;
     this.requestRender();
   }
 
-  /** 仅 hover 视觉变化：尽量脏矩形重绘，避免整画布 clear+paint。 */
+  /** 仅局部视觉变化：合并脏节点，尽量脏矩形重绘，避免整画布 clear+paint。 */
   _invalidateHover(nodes) {
     const list = [];
     const seen = new Set();
@@ -99,15 +130,60 @@ export class CanvasDOM {
       list.push(node);
     }
     this._dirty = true;
-    if (!this._rafId || this._hoverOnly) {
-      this._hoverOnly = true;
-      this._hoverDirtyNodes = list;
+    if (!this._rafId || this._hoverOnly || !this._fullPaint) {
+      if (!this._fullPaint) this._hoverOnly = true;
+      if (!this._hoverDirtyNodes || !this._hoverDirtyNodes.length) {
+        this._hoverDirtyNodes = list;
+      } else if (list.length) {
+        for (const node of this._hoverDirtyNodes) seen.add(node.id);
+        for (const node of list) {
+          if (seen.has(node.id)) continue;
+          seen.add(node.id);
+          this._hoverDirtyNodes.push(node);
+        }
+      }
     } else {
-      // 已有全量重绘在排队，不要降级成 hover-only。
+      // 已有全量重绘在排队：保留/合并脏节点，供滚动 blit 后补绘。
       this._hoverOnly = false;
-      this._hoverDirtyNodes = null;
+      if (!this._hoverDirtyNodes || !this._hoverDirtyNodes.length) {
+        this._hoverDirtyNodes = list;
+      } else if (list.length) {
+        for (const node of this._hoverDirtyNodes) seen.add(node.id);
+        for (const node of list) {
+          if (seen.has(node.id)) continue;
+          this._hoverDirtyNodes.push(node);
+        }
+      }
     }
     this.requestRender();
+  }
+
+  /** 在当前 tick 内把节点并入脏矩形路径（不再额外排队 RAF）。 */
+  _markPaintNodes(nodes) {
+    if (this._selection || this._needsLayout) {
+      this._fullPaint = true;
+      this._hoverOnly = false;
+      this._hoverDirtyNodes = null;
+      this._dirty = true;
+      return;
+    }
+    const list = [];
+    const seen = new Set();
+    for (const node of nodes || []) {
+      if (!node || seen.has(node.id)) continue;
+      seen.add(node.id);
+      list.push(node);
+    }
+    if (!list.length) return;
+    this._dirty = true;
+    if (!this._hoverDirtyNodes) this._hoverDirtyNodes = [];
+    for (const node of this._hoverDirtyNodes) seen.add(node.id);
+    for (const node of list) {
+      if (seen.has(node.id)) continue;
+      this._hoverDirtyNodes.push(node);
+    }
+    // 全量帧（滚动/流式/invalidate）不降级；否则走脏矩形。
+    if (!this._fullPaint) this._hoverOnly = true;
   }
 
   requestRender() {
@@ -129,6 +205,7 @@ export class CanvasDOM {
           this._velocityY = 0;
         }
         this._dirty = true;
+        this._fullPaint = true;
         this._hoverOnly = false;
         if (moved) this._emit('scroll', t);
       }
@@ -142,22 +219,26 @@ export class CanvasDOM {
       }
       this._needsLayout = true;
       this._dirty = true;
+      this._fullPaint = true;
       this._hoverOnly = false;
     }
-    // caret blink
+    // caret blink：只重绘输入框区域
     const now = performance.now();
     if (this._focusedNode && now - this._caretTimer > 530) {
       this._caretOn = !this._caretOn;
       this._caretTimer = now;
-      this._dirty = true;
-      this._hoverOnly = false;
+      this._markPaintNodes([this._focusedNode]);
     }
     // busy 转圈降到约 20fps；仅视口内 busy 才触发绘制，避免长会话空转全量重绘。
     let keepBusyTick = false;
     let visibleBusy = false;
+    let viewTop = 0;
+    let viewBottom = 0;
     if (this.root) {
       const sy = this.root._scrollY || 0;
-      visibleBusy = treeHasBusyStatusVisible(this.root, sy - 80, sy + this.height + 80);
+      viewTop = sy - 80;
+      viewBottom = sy + this.height + 80;
+      visibleBusy = treeHasBusyStatusVisible(this.root, viewTop, viewBottom);
       if (visibleBusy) {
         this._hasBusy = true;
         keepBusyTick = true;
@@ -177,13 +258,13 @@ export class CanvasDOM {
       if (frame !== this._lastSpinFrame) {
         this._lastSpinFrame = frame;
         this._spinPhase = (now / 800) % 1;
-        this._dirty = true;
-        this._hoverOnly = false;
+        this._markPaintNodes(collectBusyStatusVisible(this.root, viewTop, viewBottom));
       }
     }
     if (this._dirty) {
       this._render();
       this._dirty = false;
+      this._fullPaint = false;
       this._hoverOnly = false;
       this._hoverDirtyNodes = null;
     }
@@ -199,28 +280,25 @@ export class CanvasDOM {
       this._clampScrollTree(this.root);
       this._needsLayout = false;
       this._hoverOnly = false;
+      this._fullPaint = true;
+      this._paintScrollValid = false;
     }
-    // 有选区时不做脏矩形：选区是半透明叠加，局部重绘会叠加深色。
-    const hoverOnly = !this._selection
-      && this._hoverOnly && this._hoverDirtyNodes && this._hoverDirtyNodes.length;
-    if (hoverOnly) {
-      const pad = 3;
-      for (const node of this._hoverDirtyNodes) {
-        const b = nodeScreenBounds(node);
-        if (!b) continue;
-        const x = Math.max(0, Math.floor(b.x - pad));
-        const y = Math.max(0, Math.floor(b.y - pad));
-        const w = Math.min(this.width - x, Math.ceil(b.w + pad * 2));
-        const h = Math.min(this.height - y, Math.ceil(b.h + pad * 2));
-        if (w <= 0 || h <= 0) continue;
-        this.ctx.save();
-        this.ctx.beginPath();
-        this.ctx.rect(x, y, w, h);
-        this.ctx.clip();
-        this.ctx.clearRect(x, y, w, h);
-        paint(this.ctx, this.root, x, y, w, h, this);
-        this.ctx.restore();
-      }
+    const sx = this.root._scrollX || 0;
+    const sy = this.root._scrollY || 0;
+    const dirtyNodes = !this._selection
+      && this._hoverDirtyNodes && this._hoverDirtyNodes.length
+      ? this._hoverDirtyNodes : null;
+    const dsy = sy - this._paintScrollY;
+    const dsx = sx - this._paintScrollX;
+    const canBlitScroll = !this._selection && this._paintScrollValid
+      && dsx === 0 && dsy !== 0 && Math.abs(dsy) < this.height;
+    const localOnly = !!(dirtyNodes && this._hoverOnly && !this._fullPaint);
+
+    if (canBlitScroll) {
+      this._blitRootScroll(dsy);
+      if (dirtyNodes) this._paintDirtyNodes(dirtyNodes);
+    } else if (localOnly) {
+      this._paintDirtyNodes(dirtyNodes);
     } else {
       this.ctx.clearRect(0, 0, this.width, this.height);
       paint(this.ctx, this.root, 0, 0, this.width, this.height, this);
@@ -229,6 +307,89 @@ export class CanvasDOM {
     if (this._selection) {
       paintSelection(this.ctx, this.root, this._selection);
     }
+    this._paintScrollX = sx;
+    this._paintScrollY = sy;
+    this._paintScrollValid = true;
+  }
+
+  _paintDirtyNodes(nodes) {
+    const pad = 3;
+    for (const node of nodes || []) {
+      const b = nodeScreenBounds(node);
+      if (!b) continue;
+      const x = Math.max(0, Math.floor(b.x - pad));
+      const y = Math.max(0, Math.floor(b.y - pad));
+      const w = Math.min(this.width - x, Math.ceil(b.w + pad * 2));
+      const h = Math.min(this.height - y, Math.ceil(b.h + pad * 2));
+      if (w <= 0 || h <= 0) continue;
+      this.ctx.save();
+      this.ctx.beginPath();
+      this.ctx.rect(x, y, w, h);
+      this.ctx.clip();
+      this.ctx.clearRect(x, y, w, h);
+      paint(this.ctx, this.root, x, y, w, h, this);
+      this.ctx.restore();
+    }
+  }
+
+  _ensureBlitCanvas() {
+    const bw = this.canvas.width;
+    const bh = this.canvas.height;
+    if (!this._blitCanvas) {
+      this._blitCanvas = document.createElement('canvas');
+      this._blitCtx = this._blitCanvas.getContext('2d');
+    }
+    if (this._blitCanvas.width !== bw || this._blitCanvas.height !== bh) {
+      this._blitCanvas.width = bw;
+      this._blitCanvas.height = bh;
+    }
+    return this._blitCtx;
+  }
+
+  /**
+   * 根滚动：把上一帧位图平移，只重绘露出的水平条带 + 右侧滚动条槽。
+   * 避免滚轮/惯性时每帧整树 clear+paint。
+   */
+  _blitRootScroll(dsy) {
+    if (!this._blitCtx && typeof document === 'undefined') return false;
+    const blit = this._ensureBlitCanvas();
+    if (!blit) return false;
+    const bw = this.canvas.width;
+    const bh = this.canvas.height;
+    const dpr = this.dpr || 1;
+    // 经离屏缓冲拷贝，避免同源 canvas 重叠 drawImage 的未定义行为。
+    blit.setTransform(1, 0, 0, 1, 0, 0);
+    blit.clearRect(0, 0, bw, bh);
+    blit.drawImage(this.canvas, 0, 0);
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    this.ctx.clearRect(0, 0, bw, bh);
+    // scrollY 增大 → 内容上移
+    this.ctx.drawImage(this._blitCanvas, 0, Math.round(-dsy * dpr));
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const bandY = dsy > 0 ? this.height - dsy : 0;
+    const bandH = Math.abs(dsy);
+    this.ctx.save();
+    this.ctx.beginPath();
+    this.ctx.rect(0, bandY, this.width, bandH);
+    this.ctx.clip();
+    this.ctx.clearRect(0, bandY, this.width, bandH);
+    paint(this.ctx, this.root, 0, bandY, this.width, bandH, this);
+    this.ctx.restore();
+
+    // 滚动条槽是屏坐标固定的，平移后必须重绘，否则拇指位置错位。
+    const trackW = (this.root.style.scrollbarWidth || 4) + 8;
+    const gx = Math.max(0, this.width - trackW);
+    if (trackW > 0 && this.root._maxScrollY > 0) {
+      this.ctx.save();
+      this.ctx.beginPath();
+      this.ctx.rect(gx, 0, trackW, this.height);
+      this.ctx.clip();
+      this.ctx.clearRect(gx, 0, trackW, this.height);
+      paint(this.ctx, this.root, gx, 0, trackW, this.height, this);
+      this.ctx.restore();
+    }
+    return true;
   }
 
   _clampScrollTree(node) {

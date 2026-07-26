@@ -54,6 +54,7 @@ export class Node {
 }
 
 export function h(tag: string, style?: CanvasStyle, textContent?: string, children?: Node[]): Node;
+export const LAYOUT_REV: number;
 export function measureText(text: string, fontSize?: number, fontFamily?: string, fontWeight?: string | number, fontStyle?: string): number;
 export function parseMarkdown(markdown: string, baseStyle?: CanvasStyle): Node;
 

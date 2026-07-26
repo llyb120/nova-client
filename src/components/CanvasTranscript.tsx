@@ -6,7 +6,7 @@ import { api } from "../ipc";
 import { editUserMessage, isExpanded, respondPermission, state, toggleExpanded } from "../store";
 import type { Item, PermissionRequest, ToolItem, UserItem } from "../types";
 import { displayToolTitle, stripAnsi } from "../utils";
-import { CanvasDOM, h, measureText, Node, parseMarkdown } from "../canvas-dom/CanvasDOM.js";
+import { CanvasDOM, h, LAYOUT_REV, measureText, Node, parseMarkdown } from "../canvas-dom/CanvasDOM.js";
 import { relPath } from "./EditedFilesCard";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
@@ -552,6 +552,8 @@ function groupNode(group: Group, index: number, running: boolean, p: Palette, re
   const process = firstConclusion < 0 ? group.body
     : [...group.body.slice(0, firstConclusion), ...group.body.slice(lastConclusion + 1)];
   const conclusion = firstConclusion < 0 ? [] : group.body.slice(firstConclusion, lastConclusion + 1);
+  // 与 TurnGroup.activeBodyId 一致：优先 busy 项；否则回退到末项，
+  // 否则思考从「思考中…」切到正文后不再 active，折叠住看不到流式输出。
   let activeBodyId = -1;
   if (active) {
     for (let i = group.body.length - 1; i >= 0; i--) {
@@ -562,6 +564,7 @@ function groupNode(group: Group, index: number, running: boolean, p: Palette, re
         break;
       }
     }
+    if (activeBodyId < 0 && group.body.length) activeBodyId = group.body[group.body.length - 1].id;
   }
   if (group.turn && process.length) {
     const key = `turn-${group.turn.id ?? group.user?.id ?? process[0]?.id ?? 0}`;
@@ -712,7 +715,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const contentWidth = Math.max(1, outerWidth - horizontal * 2);
     const p = { ...palette(), columnWidth: contentWidth };
     const side = Math.max(0, (width - outerWidth) / 2) + horizontal;
-    const renderKey = `${contentWidth}:${fontEpoch}:${document.documentElement.dataset.theme}:${props.running}:${editing()?.id ?? ""}:${JSON.stringify(state.expanded)}`;
+    const renderKey = `${contentWidth}:${fontEpoch}:${LAYOUT_REV}:${document.documentElement.dataset.theme}:${props.running}:${editing()?.id ?? ""}:${JSON.stringify(state.expanded)}`;
     root = h("div", { width, height, overflow: "auto", display: "flex", flexDirection: "column",
       background: p.bg, padding: [24, side, 16], color: p.text, fontFamily: p.sans,
       fontSize: 14, scrollbarTrack: "transparent",
@@ -786,8 +789,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     renderer.resize(canvas.clientWidth, canvas.clientHeight);
     props.ref?.(handle);
     resizeObserver = new ResizeObserver(() => {
-      renderer?.resize(canvas!.clientWidth, canvas!.clientHeight);
-      scheduleRebuild();
+      if (!canvas || !renderer) return;
+      const changed = renderer.resize(canvas.clientWidth, canvas.clientHeight);
+      if (!changed) return;
+      // 与 buffer 清空同一同步回合内 rebuild/setRoot，避免 RAF 空窗闪屏。
+      if (rebuildFrame) {
+        cancelAnimationFrame(rebuildFrame);
+        rebuildFrame = 0;
+      }
+      rebuild();
     });
     resizeObserver.observe(canvas);
     themeObserver = new MutationObserver(scheduleRebuild);

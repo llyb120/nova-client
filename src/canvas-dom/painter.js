@@ -149,6 +149,18 @@ export function treeHasBusyStatusVisible(node, viewTop, viewBottom) {
   return false;
 }
 
+/** 收集视口附近 busy 控件，供转圈时脏矩形重绘。 */
+export function collectBusyStatusVisible(node, viewTop, viewBottom, out = []) {
+  if (!node) return out;
+  if (node.style?.display === 'none') return out;
+  const y = node._y;
+  const h = node._height;
+  if (h > 0 && (y + h < viewTop || y > viewBottom)) return out;
+  if (node.style?.trailingStatus === 'busy') out.push(node);
+  for (const child of node.children) collectBusyStatusVisible(child, viewTop, viewBottom, out);
+  return out;
+}
+
 // Paint a node. clipX/clipY/clipW/clipH define the visible clip rect (already in screen coords).
 export function paint(ctx, node, clipX, clipY, clipW, clipH, renderer) {
   const s = node.style;

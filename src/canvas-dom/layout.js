@@ -72,14 +72,35 @@ export function measureText(text, fontSize, fontFamily, fontWeight, fontStyle) {
   return width;
 }
 
+/** 仅平移已布局子树的几何（含 inline 片段），避免闭合轮次在上方高度变化时整树重测。 */
+function shiftLayoutTree(node, dx, dy) {
+  if (!dx && !dy) return;
+  node._x += dx;
+  node._y += dy;
+  if (node._textLines) {
+    for (const frag of node._textLines) {
+      frag.x += dx;
+      frag.y += dy;
+    }
+  }
+  for (const child of node.children) shiftLayoutTree(child, dx, dy);
+}
+
+/** 布局算法版本：变更时强制已缓存的 _layoutStable 子树重新排版（避免 HMR/旧几何残留）。 */
+export const LAYOUT_REV = 4;
+
 // Layout a node within a content box (x, y, width, height available).
 // Returns the node's outer height consumed (including margin).
 export function layout(node, x, y, availW, availH) {
   const s = node.style;
-  // 已闭合轮次的节点树不可再变化。位置和宽度也未变时直接复用完整布局结果，
+  // 已闭合轮次的节点树不可再变化。宽度未变时复用布局；仅 Y 变化则平移子树。
   // 流式尾部更新无需重新测量全部历史文本。
-  if (node._layoutStable && node._layoutInputX === x && node._layoutInputY === y
+  if (node._layoutStable && node._layoutRev === LAYOUT_REV && node._layoutInputX === x
       && node._layoutInputWidth === availW && node._outerHeight != null) {
+    if (node._layoutInputY !== y) {
+      shiftLayoutTree(node, 0, y - node._layoutInputY);
+      node._layoutInputY = y;
+    }
     return node._outerHeight;
   }
 
@@ -229,6 +250,7 @@ export function layout(node, x, y, availW, availH) {
 
   const outerHeight = height + m.t + m.b;
   if (node._layoutStable) {
+    node._layoutRev = LAYOUT_REV;
     node._layoutInputX = x;
     node._layoutInputY = y;
     node._layoutInputWidth = availW;
@@ -334,16 +356,16 @@ function layoutInlineRun(run, innerX, startY, innerW, availH) {
       x += cw;
       maxW = Math.max(maxW, x - innerX);
     } else {
-      // inline text: word-level line breaking
+      // inline text: 先按空白分词，放不下的词（中文长句/路径）再按字符折行，
+      // 与 wrapText 对齐；否则整段贴在一行会凸出容器。
       const fs = cs.fontSize || 14;
       const ff = cs.fontFamily || 'sans-serif';
       const fw = cs.fontWeight || 'normal';
       const fst = cs.fontStyle || 'normal';
       const text = child.textContent || '';
       const childLH = fs * (cs.lineHeight || 1.4);
-
-      // Split into tokens (words and whitespace), preserving whitespace
       const tokens = text.split(/(\s+)/).filter(t => t.length > 0);
+      const lineLimit = innerX + innerW;
 
       let lineText = '';
       let lineStartX = x;
@@ -353,41 +375,8 @@ function layoutInlineRun(run, innerX, startY, innerW, availH) {
       let childMaxX = -Infinity;
       let childMinY = Infinity;
 
-      for (const token of tokens) {
-        const tokenW = measureText(token, fs, ff, fw, fst);
-        const tokenFullW = tokenW + cp.l + cp.r;
-
-        // Wrap if token doesn't fit and we have content on current line
-        if (x + tokenFullW > innerX + innerW + 0.001 && lineText.length > 0 && /\S/.test(token)) {
-          // Flush current line fragment
-          const lineW = measureText(lineText, fs, ff, fw, fst);
-          const fragX = lineStartX + cp.l;
-          const fragY = y + cm.t + cp.t;
-          fragments.push({ text: lineText, x: fragX, y: fragY, w: lineW, fs, lh: childLH, offset });
-          offset += lineText.length;
-          childMinX = Math.min(childMinX, fragX);
-          childMaxX = Math.max(childMaxX, fragX + lineW);
-          childMinY = Math.min(childMinY, fragY);
-          // Start new line
-          x = innerX;
-          y += lineH;
-          lineIdx++;
-          lineText = '';
-          lineStartX = x;
-        }
-
-        if (lineText === '') {
-          lineStartX = x;
-          lineText = token;
-        } else {
-          lineText += token;
-        }
-        x += tokenFullW;
-        maxW = Math.max(maxW, x - innerX);
-      }
-
-      // Flush remaining text
-      if (lineText) {
+      const flushLine = () => {
+        if (!lineText) return;
         const lineW = measureText(lineText, fs, ff, fw, fst);
         const fragX = lineStartX + cp.l;
         const fragY = y + cm.t + cp.t;
@@ -396,13 +385,51 @@ function layoutInlineRun(run, innerX, startY, innerW, availH) {
         childMinX = Math.min(childMinX, fragX);
         childMaxX = Math.max(childMaxX, fragX + lineW);
         childMinY = Math.min(childMinY, fragY);
+        lineText = '';
+      };
+
+      const breakLine = () => {
+        flushLine();
+        x = innerX;
+        y += lineH;
+        lineIdx++;
+        lineStartX = x;
+      };
+
+      for (const token of tokens) {
+        const tokenW = measureText(token, fs, ff, fw, fst);
+
+        // 当前行已有内容且本词放不下：先换行（空白不强制换行）
+        if (lineText.length > 0 && /\S/.test(token) && x + tokenW > lineLimit + 0.001) {
+          breakLine();
+        }
+
+        if (lineText === '') lineStartX = x;
+
+        // 整词能放下（或纯空白）：直接追加
+        if (x + tokenW <= lineLimit + 0.001 || !/\S/.test(token)) {
+          lineText += token;
+          x += tokenW;
+          maxW = Math.max(maxW, x - innerX);
+          continue;
+        }
+
+        // 超长无空格 token：按字符拆分（与 wrapText 一致）
+        for (const ch of Array.from(token)) {
+          const charW = measureText(ch, fs, ff, fw, fst);
+          if (lineText && x + charW > lineLimit + 0.001) breakLine();
+          if (lineText === '') lineStartX = x;
+          lineText += ch;
+          x += charW;
+          maxW = Math.max(maxW, x - innerX);
+        }
       }
 
-      // Store fragments for painting and hit testing
+      flushLine();
+
       child._textLines = fragments.length > 0 ? fragments
         : [{ text: '', x: x + cp.l, y: y + cm.t + cp.t, w: 0, fs, lh: childLH, offset: 0 }];
 
-      // Set bounding box for hit testing
       child._x = (childMinX !== Infinity ? childMinX : x) - cm.l - cp.l;
       child._y = (childMinY !== Infinity ? childMinY : y) - cm.t - cp.t;
       child._width = childMaxX !== -Infinity ? (childMaxX - childMinX) + cp.l + cp.r : 0;
@@ -594,26 +621,15 @@ function parseFlex(flex) {
   return { grow: 0, shrink: 0, basis: 'auto' };
 }
 
-// Simple text wrapping using canvas measureText via a shared context.
+// Simple text wrapping via shared measureText cache (avoids repeated canvas measure).
 export function wrapText(text, maxW, fontSize, fontFamily, whiteSpace, fontWeight = 'normal', fontStyle = 'normal') {
   if (whiteSpace === 'nowrap') return [String(text)];
   if (whiteSpace === 'pre') return String(text).split('\n');
-  const ctx = measureCtx();
+  const fs = fontSize || 14;
+  const ff = fontFamily || 'sans-serif';
+  const fw = fontWeight || 'normal';
+  const fst = fontStyle || 'normal';
   const lines = [];
-  if (!ctx) {
-    // fallback: char-based
-    let cur = '';
-    for (const ch of String(text)) {
-      cur += ch;
-      if (cur.length * fontSize * 0.6 > maxW) {
-        lines.push(cur);
-        cur = '';
-      }
-    }
-    if (cur) lines.push(cur);
-    return lines.length ? lines : [''];
-  }
-  ctx.font = `${fontStyle || 'normal'} ${fontWeight || 'normal'} ${fontSize}px ${fontFamily}`;
   const preserveWhitespace = whiteSpace === 'pre-wrap';
   const paragraphs = String(text).split('\n');
   for (const para of paragraphs) {
@@ -622,7 +638,7 @@ export function wrapText(text, maxW, fontSize, fontFamily, whiteSpace, fontWeigh
     let curWidth = 0;
     for (const word of words) {
       let w = word;
-      const wordWidth = ctx.measureText(w).width;
+      const wordWidth = measureText(w, fs, ff, fw, fst);
       if (curWidth + wordWidth <= maxW) {
         cur += w;
         curWidth += wordWidth;
@@ -636,7 +652,7 @@ export function wrapText(text, maxW, fontSize, fontFamily, whiteSpace, fontWeigh
       }
       // 无空格命令/路径按字符拆分。只测每个字符一次，避免超长命令 O(n²)。
       for (const ch of Array.from(w)) {
-        const charWidth = ctx.measureText(ch).width;
+        const charWidth = measureText(ch, fs, ff, fw, fst);
         if (cur && curWidth + charWidth > maxW) {
           lines.push(cur);
           cur = ch;
