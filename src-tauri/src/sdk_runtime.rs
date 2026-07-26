@@ -275,14 +275,20 @@ impl SdkManager {
             }
         }
         parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
-        let vega_slim_context = self.adapter.agent_kind() == AgentKind::Alkaid
-            && self
-                .app
-                .state::<AppState>()
-                .settings
-                .lock()
-                .unwrap()
-                .vega_slim_context_enabled;
+        let (vega_slim_context, lightweight_model) = if self.adapter.agent_kind()
+            == AgentKind::Alkaid
+        {
+            let app_state = self.app.state::<AppState>();
+            let settings = app_state.settings.lock().unwrap();
+            (
+                settings.vega_slim_context_enabled,
+                (AgentKind::from_str(&settings.lightweight_model_agent) == Some(AgentKind::Alkaid))
+                    .then(|| settings.lightweight_model.trim().to_string())
+                    .filter(|model| !model.is_empty()),
+            )
+        } else {
+            (false, None)
+        };
         let mut request = json!({
             "action": "prompt",
             "threadId": thread_id,
@@ -293,6 +299,7 @@ impl SdkManager {
             "mode": mode,
             "reasoningEffort": reasoning_effort,
             "vegaSlimContext": vega_slim_context,
+            "lightweightModel": lightweight_model,
             "parts": parts
         });
         let mut outcome = self

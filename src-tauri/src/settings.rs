@@ -58,15 +58,12 @@ pub struct Settings {
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,
-    /// 自动生成会话标题所用的后端（devin/codex/codebuddy/...，空 = devin）。
-    /// 与新建会话一致：可任选后端，标题统一在此后端生成（Codex/不可用时回退线程自身后端）。
-    pub title_model_agent: String,
-    /// 自动生成会话标题所用模型（须为 title_model_agent 后端的模型；空 = 用该后端会话默认模型）
-    pub title_model: String,
-    /// 高级分享「处理/总结」所用的后端（devin/codex/codebuddy/...，空 = devin）
-    pub share_model_agent: String,
-    /// 高级分享「处理/总结」的默认模型（须为 share_model_agent 后端的模型；空 = Devin 时兜底 swe-1.6）
-    pub share_model: String,
+    /// 标题、快速总结、摘要和上下文压缩等辅助任务使用的轻量级模型后端。
+    #[serde(alias = "titleModelAgent")]
+    pub lightweight_model_agent: String,
+    /// 轻量级模型 id；失败时辅助任务回退到发起任务的原模型。
+    #[serde(alias = "titleModel")]
+    pub lightweight_model: String,
     /// 打开文件用的编辑器命令（cursor / code / zed / windsurf 等，依赖 PATH）
     pub editor: String,
     /// 界面皮肤（ink-dark / ink-light，空 = 未设置，由前端 localStorage 迁移）
@@ -150,10 +147,8 @@ impl Default for Settings {
             vega_slim_context_enabled: false,
             checkpoint_enabled: false,
             default_mode: String::new(),
-            title_model_agent: "devin".into(),
-            title_model: "swe-1-6".into(),
-            share_model_agent: "devin".into(),
-            share_model: "swe-1.6".into(),
+            lightweight_model_agent: "alkaid".into(),
+            lightweight_model: String::new(),
             editor: "code".into(),
             theme: String::new(),
             history_display_mode: "project".into(),
@@ -202,6 +197,16 @@ mod tests {
     #[test]
     fn vega_slim_context_is_disabled_by_default() {
         assert!(!Settings::default().vega_slim_context_enabled);
+    }
+
+    #[test]
+    fn legacy_title_model_migrates_to_lightweight_model() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"titleModelAgent":"codex","titleModel":"gpt-5-mini"}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.lightweight_model_agent, "codex");
+        assert_eq!(settings.lightweight_model, "gpt-5-mini");
     }
 
     #[test]

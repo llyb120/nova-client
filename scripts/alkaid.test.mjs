@@ -9,7 +9,7 @@ import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
 import { ALKAID_PROVIDER_DIAGNOSTIC_LOG, alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
-import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import {
   alkaidPromptInput,
   alkaidSkillsRoot,
@@ -319,6 +319,12 @@ test("Vega slim context measures the largest native request instead of cumulativ
     { role: "assistant", usage: { input: 100, output: 20, cacheRead: 300, cacheWrite: 40 } },
     { role: "assistant", usage: { totalTokens: 900, input: 500, output: 30 } },
   ]), 900);
+});
+
+test("Vega estimates tokens from the rebuilt compact context", () => {
+  assert.equal(estimateContextTokens("abcdefgh"), 2);
+  assert.equal(estimateContextTokens("摘要内容"), 4);
+  assert.equal(estimateContextTokens("abcd摘要"), 3);
 });
 
 test("Vega slim context also compresses at the context character limit", async () => {

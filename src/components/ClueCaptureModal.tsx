@@ -235,7 +235,7 @@ export function ClueCaptureModal(props: {
                 type="button"
                 class="btn secondary clue-ai-summary-btn"
                 disabled={busy() || summarizing()}
-                title="使用设置里的高级分享模型总结本会话核心内容"
+                title="使用设置里的轻量级模型总结本会话核心内容，失败时回退到会话原模型"
                 onClick={() => void runAiSummary()}
               >
                 {summarizing() ? "总结中…" : "AI 总结"}

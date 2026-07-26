@@ -15,7 +15,7 @@ Vega 是一个基于 pi agent core 的轻量 coding agent，目标是少往返�
 - 支持并行连接多个 MCP stdio server，并把工具映射为 `mcp__<server>__<tool>`。
 - 本机配置读取 `~/.nova/alkaid/config.jsonc`（OpenCode 风格），可与服务端下发配置合并；密钥仅从进程环境 / `{env:NAME}` 解析。
 - 已作为独立的 `alkaid` 后端接入桌面端；后端选择顺序为“收藏 → Vega → 其他后端”。
-- 会话消息持久化到 `~/.nova/alkaid/sessions`，支持跨 bridge 进程续接多轮上下文。开启“超级上下文”时，OpenAI/GPT 已完成轮次不再回传 reasoning；当前轮次及中断后续做所需的原生工具轨迹仍完整保留。
+- 会话消息持久化到 `~/.nova/alkaid/sessions`，支持跨 bridge 进程续接多轮上下文。开启“超级上下文”时，OpenAI/GPT 已完成轮次不再回传 reasoning；当前轮次及中断后续做所需的原生工具轨迹仍完整保留。重组后的提示词/结论上下文按实际用量或保守估算计数，达到模型窗口 60% 时压缩，且压缩阈值最低为 150k tokens；优先使用设置中的轻量级模型，失败后回退当前会话模型。
 - Plan 模式不暴露写文件工具；Build 模式开放并行读写。
 
 ## 服务端配置同步
