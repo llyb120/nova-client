@@ -10,6 +10,7 @@ const {
   completePendingTools,
   compressSlimMemory,
   contextTokensFromUsage,
+  createCursorAgent,
   createCursorFilesystemTools,
   createMessageState,
   createSlimMemory,
@@ -27,6 +28,7 @@ const {
   ingestCompactHistory,
   isEditFilesTool,
   isNovaDenyTaskHook,
+  isRetryableCursorError,
   isSlimMemoryEmpty,
   mapDelta,
   mapMessage,
@@ -81,6 +83,27 @@ const deltaTool = mapDelta({ type: "tool-call-started", callId: "read", toolCall
 assert.equal(deltaTool.status, "in_progress");
 assert.deepEqual(deltaTool.arguments, { path: "README.md" });
 assert.equal(mapDelta({ type: "tool-call-completed", callId: "read", toolCall: { type: "read", result: { status: "success", value: "ok" } } }, deltaState, "delta").status, "completed");
+const mcpTool = mapDelta({
+  type: "tool-call-started",
+  callId: "mcp-read",
+  toolCall: {
+    type: "mcp",
+    args: {
+      args: { paths: [{ path: "src/a.ts", offset: 10, limit: 20 }] },
+      providerIdentifier: "custom-user-tools",
+      toolName: "read_files",
+    },
+  },
+}, deltaState, "delta");
+assert.equal(mcpTool.tool, "read_files");
+assert.deepEqual(mcpTool.arguments, { paths: [{ path: "src/a.ts", offset: 10, limit: 20 }] });
+const completedMcpTool = mapDelta({
+  type: "tool-call-completed",
+  callId: "mcp-read",
+  toolCall: { type: "mcp", result: { status: "success", value: { content: [{ type: "text", text: "ok" }] } } },
+}, deltaState, "delta");
+assert.equal(completedMcpTool.tool, "read_files");
+assert.deepEqual(completedMcpTool.result, { content: [{ type: "text", text: "ok" }] });
 assert.deepEqual(cursorTodoPlan({ type: "updateTodos", args: { todos: [
   { content: " Inspect repository ", status: "completed" },
   { content: "Implement fix", status: "inProgress" },
@@ -125,6 +148,19 @@ assert.equal(threadMemoryKey("thread-a"), "nova-thread-thread-a");
 assert.notEqual(threadMemoryKey("thread-a"), threadMemoryKey("thread-b"));
 assert.match(threadMemoryKey("../unsafe/thread"), /^nova-thread-[a-f0-9]{64}$/);
 assert.equal(threadMemoryKey(undefined), undefined);
+assert.equal(isRetryableCursorError({ isRetryable: true, code: "unavailable" }), true);
+assert.equal(isRetryableCursorError(new TypeError("Failed to connect to API key exchange endpoint: fetch failed")), true);
+assert.equal(isRetryableCursorError(new Error("Invalid API key")), false);
+let createAttempts = 0;
+const createdAgent = { agentId: "created" };
+assert.equal(await createCursorAgent({}, {
+  create: async () => {
+    createAttempts += 1;
+    if (createAttempts < 3) throw Object.assign(new Error("fetch failed"), { isRetryable: true });
+    return createdAgent;
+  },
+}, [0, 0]), createdAgent);
+assert.equal(createAttempts, 3);
 
 const recoveryCalls = [];
 let sendAttempts = 0;

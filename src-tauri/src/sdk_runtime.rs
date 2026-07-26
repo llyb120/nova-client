@@ -1885,6 +1885,22 @@ mod tests {
         assert_eq!(read.title, "Cursor / read · C:/Users/1/Desktop/1.xlsx");
         assert_eq!(read.kind, "read");
         assert_eq!(read.locations[0]["path"], "C:/Users/1/Desktop/1.xlsx");
+
+        let read_files = tool_call(&json!({
+            "id": "read-files", "type": "mcp_tool_call", "server": "Cursor", "tool": "mcp",
+            "arguments": {
+                "args": { "paths": [
+                    { "path": "src/a.ts", "offset": 10, "limit": 20 },
+                    "src/b.ts"
+                ] },
+                "providerIdentifier": "custom-user-tools",
+                "toolName": "read_files"
+            }, "status": "completed"
+        }));
+        assert_eq!(read_files.title, "Cursor / read_files · src/a.ts");
+        assert_eq!(read_files.kind, "read");
+        assert_eq!(read_files.locations[0]["path"], "src/a.ts");
+        assert_eq!(read_files.locations[1]["path"], "src/b.ts");
     }
 
     #[test]
@@ -2042,8 +2058,18 @@ fn tool_call(value: &Value) -> ToolCall {
         }
         "mcp_tool_call" => {
             let server = value.get("server").and_then(Value::as_str).unwrap_or("MCP");
-            let tool = value.get("tool").and_then(Value::as_str).unwrap_or("tool");
-            let arguments = value.get("arguments");
+            let raw_arguments = value.get("arguments");
+            let envelope = raw_arguments.filter(|arguments| {
+                arguments.get("toolName").and_then(Value::as_str).is_some()
+            });
+            let tool = envelope
+                .and_then(|arguments| arguments.get("toolName"))
+                .and_then(Value::as_str)
+                .or_else(|| value.get("tool").and_then(Value::as_str))
+                .unwrap_or("tool");
+            let arguments = envelope
+                .and_then(|arguments| arguments.get("args"))
+                .or(raw_arguments);
             let detail = match tool {
                 "shell" => arguments.and_then(|args| args.get("command")),
                 "read" | "edit" | "write" | "delete" | "ls" => {
@@ -2052,14 +2078,43 @@ fn tool_call(value: &Value) -> ToolCall {
                 "glob" => arguments.and_then(|args| args.get("globPattern")),
                 "grep" => arguments.and_then(|args| args.get("pattern")),
                 "semSearch" => arguments.and_then(|args| args.get("query")),
+                "read_files" => arguments
+                    .and_then(|args| args.get("paths"))
+                    .and_then(Value::as_array)
+                    .and_then(|paths| paths.first())
+                    .and_then(|path| {
+                        if path.is_string() {
+                            Some(path)
+                        } else {
+                            path.get("path")
+                        }
+                    }),
                 _ => None,
             }
             .and_then(Value::as_str)
             .map(compact_tool_detail)
             .filter(|detail| !detail.is_empty());
-            let path = arguments
-                .and_then(|args| args.get("path"))
-                .and_then(Value::as_str);
+            let locations = arguments
+                .and_then(|args| args.get("paths"))
+                .and_then(Value::as_array)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|path| {
+                            path.as_str()
+                                .or_else(|| path.get("path").and_then(Value::as_str))
+                        })
+                        .map(|path| json!({ "path": path }))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|locations| !locations.is_empty())
+                .or_else(|| {
+                    arguments
+                        .and_then(|args| args.get("path"))
+                        .and_then(Value::as_str)
+                        .map(|path| vec![json!({ "path": path })])
+                })
+                .unwrap_or_default();
             let result = value.get("result").or_else(|| value.get("error")).cloned();
             let output = value
                 .get("error")
@@ -2076,15 +2131,14 @@ fn tool_call(value: &Value) -> ToolCall {
                 ),
                 match tool {
                     "shell" => "execute",
-                    "read" => "read",
-                    "edit" | "write" => "edit",
+                    "read" | "read_files" => "read",
+                    "edit" | "write" | "edit_files" => "edit",
                     "delete" => "delete",
                     "glob" | "grep" | "semSearch" | "ls" => "search",
                     "createPlan" | "updateTodos" => "think",
                     _ => "other",
                 },
-                path.map(|path| vec![json!({ "path": path })])
-                    .unwrap_or_default(),
+                locations,
                 arguments.cloned(),
                 result,
                 output.map(text_content).unwrap_or_default(),

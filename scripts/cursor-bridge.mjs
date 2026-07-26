@@ -42,6 +42,7 @@ const TERMINAL_RUN_STATUSES = new Set(["completed", "finished", "error", "failed
 const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTUP_TIMEOUT_MS, 120_000);
 const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
+const CURSOR_CREATE_RETRY_DELAYS_MS = [1_000, 3_000, 7_000];
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
 const CURSOR_SLIM_MEMORY_TURNS = positiveInteger(process.env.NOVA_CURSOR_SLIM_MEMORY_TURNS, 10);
 const CURSOR_CONTEXT_WINDOW = positiveInteger(process.env.NOVA_CURSOR_CONTEXT_WINDOW, 128_000);
@@ -62,6 +63,43 @@ const NOVA_DENY_TASK_SCRIPT_SOURCE = `process.stdout.write(JSON.stringify({
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value ?? "", 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function isRetryableCursorError(error) {
+  const seen = new Set();
+  const details = [];
+  let current = error;
+  while (current && !seen.has(current)) {
+    if (typeof current === "object") {
+      seen.add(current);
+      if (current.isRetryable === true) return true;
+      if (["unavailable", "timeout", "rate_limit", "internal"].includes(String(current.code).toLowerCase())) {
+        return true;
+      }
+      for (const key of ["message", "rawMessage", "details"]) {
+        if (current[key] != null) details.push(String(current[key]));
+      }
+      current = current.cause;
+    } else {
+      details.push(String(current));
+      break;
+    }
+  }
+  return /API key exchange endpoint|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|\b429\b|\b5\d\d\b/i
+    .test(details.join("\n"));
+}
+
+async function createCursorAgent(options, sdk = Agent, retryDelaysMs = CURSOR_CREATE_RETRY_DELAYS_MS) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await sdk.create(options);
+    } catch (error) {
+      if (attempt >= retryDelaysMs.length || !isRetryableCursorError(error)) throw error;
+      const delayMs = retryDelaysMs[attempt];
+      process.stderr.write(`Cursor SDK initialization failed temporarily; retrying in ${delayMs}ms (${attempt + 1}/${retryDelaysMs.length})\n`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
 }
 
 function isNovaDenyTaskHook(entry) {
@@ -642,19 +680,33 @@ function isEditFilesTool(name) {
   return tool === "edit_files" || tool.endsWith("__edit_files") || tool.endsWith("/edit_files");
 }
 
+function isMcpEnvelope(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && typeof value.toolName === "string";
+}
+
 function mapTool(state, callId, name, status, args, result) {
   const previous = state.tools.get(callId);
   if (previous && previous.status !== "in_progress" && status === "running") return null;
   if (!previous) state.activeTextType = null;
-  const tool = name ?? previous?.tool;
-  const arguments_ = args ?? previous?.arguments;
+  const envelope = isMcpEnvelope(args) ? args : undefined;
+  const genericMcpName = ["mcp", "callMcpTool", "call_mcp_tool"].includes(String(name ?? ""));
+  const tool = envelope?.toolName ?? (genericMcpName ? previous?.tool : name) ?? previous?.tool;
+  const arguments_ = envelope
+    ? envelope.args
+    : (args ?? previous?.arguments);
+  const resultEnvelope = result ?? previous?.result;
+  const normalizedResult = (envelope || genericMcpName) && resultEnvelope?.status === "success"
+    && Object.prototype.hasOwnProperty.call(resultEnvelope, "value")
+    ? resultEnvelope.value
+    : resultEnvelope;
   const item = {
     id: callId,
     type: isEditFilesTool(tool) ? "file_change" : "mcp_tool_call",
     server: "Cursor",
     tool,
     arguments: arguments_,
-    result: result ?? previous?.result,
+    result: normalizedResult,
     status: status === "error" ? "failed" : status === "running" ? "in_progress" : "completed",
   };
   if (item.type === "file_change") {
@@ -828,7 +880,7 @@ async function modelOptions() {
 }
 
 async function generateTitle(request) {
-  const agent = await Agent.create({
+  const agent = await createCursorAgent({
     apiKey: process.env.CURSOR_API_KEY,
     model: modelSelection(request.model),
     local: { cwd: request.cwd },
@@ -954,7 +1006,10 @@ async function main() {
       await saveSlimMemory(memoryKey, memory).catch((error) => {
         process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
       });
-      agent = await Agent.create(options);
+      // A new Fire stage starts a new bridge immediately after the previous stage. Cursor's
+      // API-key exchange can be briefly unavailable during that handoff; retry initialization
+      // in-process so the automatic chain is not suspended by a transient network failure.
+      agent = await createCursorAgent(options);
       send({ type: "ready", sessionId: sessionKey });
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
@@ -1122,6 +1177,7 @@ export {
   cursorShellProgram,
   cursorTodoPlan,
   contextTokensFromUsage,
+  createCursorAgent,
   ensureGlobalTaskDenyHooks,
   extractTurnConclusion,
   formatCompletedTurn,
@@ -1131,6 +1187,7 @@ export {
   ingestCompactHistory,
   isEditFilesTool,
   isNovaDenyTaskHook,
+  isRetryableCursorError,
   isSlimMemoryEmpty,
   mapDelta,
   mapMessage,
