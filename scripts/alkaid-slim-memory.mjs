@@ -153,6 +153,19 @@ export function stripCompletedOpenAIReasoning(messages) {
   });
 }
 
+export function estimateContextTokens(text) {
+  let ascii = 0;
+  let nonAscii = 0;
+  for (const char of String(text ?? "")) {
+    if (char.codePointAt(0) <= 0x7f) ascii += 1;
+    else nonAscii += 1;
+  }
+  // Common provider tokenizers average roughly four ASCII characters per token, while CJK and
+  // other non-ASCII text are commonly close to one token per character. This is intentionally
+  // conservative when the provider has not reported usage for the rebuilt context yet.
+  return Math.ceil(ascii / 4) + nonAscii;
+}
+
 export function contextTokensFromMessages(messages) {
   let tokens = 0;
   for (const message of messages ?? []) {

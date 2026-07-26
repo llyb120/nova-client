@@ -93,7 +93,7 @@ export interface CaptureClueResult {
   card: ClueCard;
 }
 
-/** 线索 AI 总结：高级分享模型产出的标题与内容 */
+/** 线索 AI 总结：轻量级模型（失败时回退原模型）产出的标题与内容 */
 export interface ClueAiSummary {
   title: string;
   content: string;
@@ -377,14 +377,10 @@ export interface Settings {
   /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
   checkpointEnabled: boolean;
   defaultMode: string;
-  /** 自动生成会话标题所用后端（devin/codex/codebuddy/...，空 = devin） */
-  titleModelAgent: string;
-  /** 自动生成会话标题所用模型（须为 titleModelAgent 后端的模型；空 = 该后端会话默认模型） */
-  titleModel: string;
-  /** 高级分享「处理/总结」所用后端（devin/codex/codebuddy/...，空 = devin） */
-  shareModelAgent: string;
-  /** 高级分享「处理/总结」的默认模型（须为 shareModelAgent 后端的模型；空 = Devin 时 swe-1.6） */
-  shareModel: string;
+  /** 标题、快速总结、摘要和压缩等辅助任务所用后端 */
+  lightweightModelAgent: string;
+  /** 辅助任务所用轻量级模型；失败时回退到任务原模型 */
+  lightweightModel: string;
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */
   editor: string;
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */

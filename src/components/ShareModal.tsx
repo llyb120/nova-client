@@ -19,11 +19,11 @@ export function ShareModal(props: {
   const [mode, setMode] = createSignal<Mode>(props.initialMode ?? "clue");
   const [target, setTarget] = createSignal<string>("");
   const [prompt, setPrompt] = createSignal("总结这段会话的要点");
-  // 高级分享在本机处理，后端 + 模型从下拉选择（默认取设置里的「分享后端 / 分享模型」）
+  // 高级分享仍可临时选择处理模型，默认使用统一的轻量级模型。
   const [agent, setAgent] = createSignal<AgentKind>(
-    (state.settings?.shareModelAgent as AgentKind) || "devin",
+    (state.settings?.lightweightModelAgent as AgentKind) || "alkaid",
   );
-  const [model, setModel] = createSignal(state.settings?.shareModel || "swe-1.6");
+  const [model, setModel] = createSignal(state.settings?.lightweightModel || "");
   const [busy, setBusy] = createSignal(false);
   const [done, setDone] = createSignal<string | null>(null);
 

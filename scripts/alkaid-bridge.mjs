@@ -4,7 +4,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ALKAID_PROVIDER_IDLE_TIMEOUT_ENABLED, ALKAID_PROVIDER_IDLE_TIMEOUT_MS, alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, messagesWithPendingAlkaidPrompt, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
-import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -124,7 +124,6 @@ async function prompt(request, commands) {
   const slimContext = request.vegaSlimContext === true;
   let memory = createSlimMemory();
   let useFullContext = false;
-  let enteredSlimStage = false;
   let maxContextTokens = Number.POSITIVE_INFINITY;
   let maxContextChars = Number.POSITIVE_INFINITY;
   if (slimContext) {
@@ -132,8 +131,8 @@ async function prompt(request, commands) {
     if (!memory.summary && !memory.turns.length && request.sessionId) {
       seedSlimMemoryFromMessages(memory, await loadMessages(request.sessionId));
     }
-    maxContextTokens = Math.max(2_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.8));
-    maxContextChars = Math.max(8_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.8));
+    maxContextTokens = Math.max(150_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.6));
+    maxContextChars = Math.max(8_000, maxContextTokens * 4);
     useFullContext = shouldUseFullContext(memory, maxContextTokens, maxContextChars);
     if (!useFullContext && memory.contextStage === "full") {
       // Stage one only drops native thinking/tool trajectories. Token usage from that native
@@ -141,41 +140,57 @@ async function prompt(request, commands) {
       memory.contextStage = "slim";
       memory.contextTokens = 0;
       memory.fullMessages = [];
-      enteredSlimStage = true;
     }
     appendSlimTurn(memory, input.text);
-    const compacted = !enteredSlimStage && await compactSlimMemory(memory, async (earlier) => {
-      const summaryRuntime = await createAlkaidAgent({
-        cwd: request.cwd,
-        model: resolved.model,
-        apiKey: resolved.apiKey,
-        thinkingLevel: resolved.thinkingLevel ?? request.reasoningEffort,
-      });
-      let summary = "";
-      summaryRuntime.agent.subscribe((event) => {
-        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-          summary += event.assistantMessageEvent.delta;
+    // Capacity decisions must use the rebuilt summary/prompt/conclusion context, not token usage
+    // from the discarded native reasoning and tool trajectory.
+    const rebuiltContextTokens = estimateContextTokens(formatSlimMemory(memory));
+    const compacted = await compactSlimMemory(memory, async (earlier) => {
+      const summaryPrompt = [
+        "请把下面较早的会话记忆压缩成供另一个编码 Agent 使用的摘要。",
+        "保留用户意图、决策、改动文件、关键标识、约束和未完成事项；不要照抄对话或添加评论。",
+        "",
+        earlier,
+      ].join("\n");
+      const summarizeWith = async (summaryModel) => {
+        const summaryRuntime = await createAlkaidAgent({
+          cwd: request.cwd,
+          model: summaryModel.model,
+          apiKey: summaryModel.apiKey,
+          thinkingLevel: summaryModel.thinkingLevel ?? request.reasoningEffort,
+        });
+        let summary = "";
+        summaryRuntime.agent.subscribe((event) => {
+          if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+            summary += event.assistantMessageEvent.delta;
+          }
+        });
+        try {
+          await summaryRuntime.agent.prompt(summaryPrompt);
+          if (!summary.trim()) throw new Error("摘要模型没有返回内容");
+          return summary;
+        } finally {
+          await summaryRuntime.close();
         }
-      });
+      };
+      let lightweight;
       try {
-        await summaryRuntime.agent.prompt([
-          "请把下面较早的会话记忆压缩成供另一个编码 Agent 使用的摘要。",
-          "保留用户意图、决策、改动文件、关键标识、约束和未完成事项；不要照抄对话或添加评论。",
-          "",
-          earlier,
-        ].join("\n"));
-        return summary;
-      } finally {
-        await summaryRuntime.close();
+        lightweight = request.lightweightModel
+          ? resolveAlkaidModel(config, request.lightweightModel)
+          : resolved;
+        return await summarizeWith(lightweight);
+      } catch (error) {
+        const currentWasAttempted = lightweight
+          && lightweight.model.provider === resolved.model.provider
+          && lightweight.model.id === resolved.model.id;
+        if (currentWasAttempted) throw error;
+        return summarizeWith(resolved);
       }
     }, {
-      // Stage two is capacity-based: only summarize after prompt/conclusion memory itself reaches
-      // the limit. The turn threshold is exclusively a stage-one transition trigger.
       maxTurns: Number.POSITIVE_INFINITY,
-      currentTokens: memory.contextStage === "slim" ? memory.contextTokens : 0,
+      currentTokens: rebuiltContextTokens,
       maxTokens: maxContextTokens,
-      // Keep the character estimate only when the provider reports no token usage.
-      maxChars: memory.contextTokens > 0 ? Number.POSITIVE_INFINITY : maxContextChars,
+      maxChars: Number.POSITIVE_INFINITY,
     });
     if (compacted) memory.contextTokens = 0;
   }

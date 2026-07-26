@@ -736,7 +736,7 @@ export async function addClueComment(
   await refreshClueGroups();
 }
 
-/** 用高级分享模型总结会话，供线索表单填入 */
+/** 用轻量级模型总结会话，失败时回退原模型，供线索表单填入 */
 export async function summarizeClue(threadId: string) {
   return api.summarizeClue(threadId);
 }
