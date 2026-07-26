@@ -1179,15 +1179,17 @@ button {
 }
 .repo-time-context-menu {
   position: fixed;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
-  min-width: 168px;
-  max-width: min(220px, calc(100vw - 16px));
+  width: 184px;
+  max-width: calc(100vw - 16px);
   padding: 5px;
   border: 1px solid var(--border-strong);
   border-radius: 9px;
-  background: var(--bg-elevated);
-  box-shadow: 0 12px 34px rgba(0, 0, 0, .28);
+  background-color: var(--bg-float);
+  opacity: 1;
+  box-shadow: var(--shadow-lg);
 }
 .repo-time-context-menu button {
   padding: 7px 9px;
