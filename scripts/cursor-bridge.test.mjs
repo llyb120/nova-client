@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 process.env.NOVA_CURSOR_BRIDGE_TEST = "1";
 const {
@@ -12,16 +15,21 @@ const {
   cursorModelOptions,
   cursorShellProgram,
   cursorTodoPlan,
+  ensureGlobalTaskDenyHooks,
   extractTurnConclusion,
+  formatCompletedTurn,
   formatInterruptedTurn,
   formatSlimMemory,
   ingestCompactHistory,
+  isNovaDenyTaskHook,
   isSlimMemoryEmpty,
   mapDelta,
   mapMessage,
+  mergeNovaTaskDenyHooks,
   messageWithRecoveryContext,
   messageWithSlimMemory,
   modelSelection,
+  novaDenyTaskHookCommand,
   parseCliModels,
   promptMessage,
   recordSlimTurn,
@@ -276,6 +284,7 @@ assert.deepEqual(slimMessage.images, [{ data: "image", mimeType: "image/png" }])
 assert.equal(messageWithSlimMemory("only current", createSlimMemory()), "only current");
 
 const interruptedState = createMessageState();
+mapMessage({ type: "thinking", run_id: "interrupted", text: "Need to inspect the file first." }, interruptedState);
 mapMessage({ type: "assistant", run_id: "interrupted", message: { content: [{ type: "text", text: "I inspected the file." }] } }, interruptedState);
 mapMessage({
   type: "tool_call",
@@ -287,14 +296,25 @@ mapMessage({
 }, interruptedState);
 const interruptedContext = formatInterruptedTurn("Fix the unfinished change", interruptedState);
 assert.match(interruptedContext, /Fix the unfinished change/);
+assert.match(interruptedContext, /Assistant reasoning:\nNeed to inspect the file first/);
 assert.match(interruptedContext, /I inspected the file/);
 assert.match(interruptedContext, /read_file/);
 assert.match(interruptedContext, /src\/app\.ts/);
 assert.match(interruptedContext, /answer = 42/);
+const completedContext = formatCompletedTurn("Fix the unfinished change", interruptedState);
+assert.match(completedContext, /Fix the unfinished change/);
+assert.match(completedContext, /I inspected the file/);
+assert.match(completedContext, /read_file/);
+assert.doesNotMatch(completedContext, /Assistant reasoning/);
+assert.doesNotMatch(completedContext, /Need to inspect the file first/);
+const completedMemory = createSlimMemory();
+completedMemory.fullTurns = [completedContext];
+assert.doesNotMatch(formatSlimMemory(completedMemory), /Assistant reasoning/);
 const interruptedMemory = createSlimMemory();
 interruptedMemory.pendingTurn = interruptedContext;
 assert.equal(isSlimMemoryEmpty(interruptedMemory), false);
 assert.match(messageWithSlimMemory("Continue", interruptedMemory), /complete working context/);
+assert.match(messageWithSlimMemory("Continue", interruptedMemory), /Assistant reasoning/);
 
 const seeded = createSlimMemory();
 ingestCompactHistory(seeded, compactConversation(conversation));
@@ -343,3 +363,40 @@ assert.equal(
   extractTurnConclusion(conclusionState, {}),
   "Final answer from the assistant.",
 );
+
+const mergedHooks = mergeNovaTaskDenyHooks({
+  version: 1,
+  hooks: {
+    afterFileEdit: [{ command: "./hooks/format.sh" }],
+    preToolUse: [
+      { command: "echo keep-me", matcher: "Shell" },
+      { command: "node ./hooks/nova-deny-task.mjs", matcher: "Task", failClosed: false },
+    ],
+  },
+});
+assert.equal(mergedHooks.hooks.afterFileEdit[0].command, "./hooks/format.sh");
+assert.equal(mergedHooks.hooks.preToolUse.find((entry) => entry.matcher === "Shell")?.command, "echo keep-me");
+assert.equal(mergedHooks.hooks.preToolUse.filter(isNovaDenyTaskHook).length, 1);
+assert.deepEqual(mergedHooks.hooks.preToolUse.find(isNovaDenyTaskHook), {
+  command: novaDenyTaskHookCommand(),
+  failClosed: true,
+  matcher: "Task",
+});
+assert.deepEqual(mergedHooks.hooks.subagentStart, [{
+  command: novaDenyTaskHookCommand(),
+  failClosed: true,
+}]);
+
+const cursorDir = await mkdtemp(join(tmpdir(), "nova-cursor-hooks-"));
+try {
+  const ensured = await ensureGlobalTaskDenyHooks(cursorDir);
+  const written = JSON.parse(await readFile(ensured.hooksPath, "utf8"));
+  const script = await readFile(ensured.scriptPath, "utf8");
+  assert.match(script, /permission: "deny"/);
+  assert.equal(written.hooks.preToolUse[0].matcher, "Task");
+  assert.equal(written.hooks.subagentStart[0].command, novaDenyTaskHookCommand());
+  const again = await ensureGlobalTaskDenyHooks(cursorDir);
+  assert.deepEqual(again.config.hooks.preToolUse, written.hooks.preToolUse);
+} finally {
+  await rm(cursorDir, { recursive: true, force: true });
+}

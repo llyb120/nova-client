@@ -50,10 +50,70 @@ const CURSOR_CONTEXT_THRESHOLD = Math.max(2_000, Math.floor(CURSOR_CONTEXT_WINDO
 const CURSOR_CONTEXT_CHAR_THRESHOLD = Math.max(8_000, Math.floor(CURSOR_CONTEXT_WINDOW * 0.8));
 const CURSOR_SLIM_MEMORY_DIR = process.env.NOVA_CURSOR_SLIM_MEMORY_DIR
   || join(process.env.NOVA_DATA_DIR || join(homedir(), ".nova"), "cursor-slim-memory");
+const CURSOR_USER_DIR = process.env.NOVA_CURSOR_USER_DIR || join(homedir(), ".cursor");
+const NOVA_DENY_TASK_SCRIPT = "nova-deny-task.mjs";
+const NOVA_DENY_TASK_MARKER = "nova-deny-task";
+const NOVA_DENY_TASK_SCRIPT_SOURCE = `process.stdout.write(JSON.stringify({
+  permission: "deny",
+  user_message: "Task / subagent tool is disabled by Nova.",
+  agent_message: "The Task tool is disabled by Nova global Cursor hooks. Do the work yourself with the available tools (Shell, Read, Write, Grep, etc.) instead of spawning a subagent."
+}));
+`;
 
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value ?? "", 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function isNovaDenyTaskHook(entry) {
+  return typeof entry?.command === "string" && entry.command.includes(NOVA_DENY_TASK_MARKER);
+}
+
+function novaDenyTaskHookCommand() {
+  return `node ./hooks/${NOVA_DENY_TASK_SCRIPT}`;
+}
+
+function mergeNovaTaskDenyHooks(config = {}) {
+  const hooks = { ...(config.hooks && typeof config.hooks === "object" ? config.hooks : {}) };
+  const denyEntry = {
+    command: novaDenyTaskHookCommand(),
+    failClosed: true,
+  };
+  const taskEntry = { ...denyEntry, matcher: "Task" };
+  const preToolUse = (Array.isArray(hooks.preToolUse) ? hooks.preToolUse : [])
+    .filter((entry) => !isNovaDenyTaskHook(entry));
+  preToolUse.push(taskEntry);
+  hooks.preToolUse = preToolUse;
+  const subagentStart = (Array.isArray(hooks.subagentStart) ? hooks.subagentStart : [])
+    .filter((entry) => !isNovaDenyTaskHook(entry));
+  subagentStart.push(denyEntry);
+  hooks.subagentStart = subagentStart;
+  return {
+    version: Number.isFinite(config.version) ? config.version : 1,
+    ...config,
+    hooks,
+  };
+}
+
+async function ensureGlobalTaskDenyHooks(cursorDir = CURSOR_USER_DIR) {
+  const hooksDir = join(cursorDir, "hooks");
+  const scriptPath = join(hooksDir, NOVA_DENY_TASK_SCRIPT);
+  const hooksPath = join(cursorDir, "hooks.json");
+  await mkdir(hooksDir, { recursive: true });
+  await writeFile(scriptPath, NOVA_DENY_TASK_SCRIPT_SOURCE, "utf8");
+  let existing = {};
+  try {
+    existing = JSON.parse(await readFile(hooksPath, "utf8"));
+    if (!existing || typeof existing !== "object" || Array.isArray(existing)) existing = {};
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      process.stderr.write(`Cursor hooks.json unreadable; rewriting Nova Task deny: ${error instanceof Error ? error.message : String(error)}\n`);
+      existing = {};
+    }
+  }
+  const next = mergeNovaTaskDenyHooks(existing);
+  await writeFile(hooksPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  return { hooksPath, scriptPath, config: next };
 }
 
 class CursorStartupTimeout extends Error {
@@ -151,14 +211,24 @@ function formatSlimMemory(memory) {
   return sections.join("\n");
 }
 
-function formatInterruptedTurn(userMessage, state) {
+/**
+ * Format a turn trajectory for slim-memory. Completed turns omit thinking (same policy as Vega
+ * super-context): only interrupted/native trajectories should replay exposed reasoning.
+ */
+function formatTurnTrace(userMessage, state, { includeThinking = false } = {}) {
   const sections = [];
   const prompt = String(messageText(userMessage)).trim();
   if (prompt) sections.push(`User:\n${prompt}`);
   for (const entry of state?.trace ?? []) {
-    if (entry.kind === "assistant" || entry.kind === "thinking") {
+    if (entry.kind === "thinking") {
+      if (!includeThinking) continue;
       const text = String(entry.text ?? "").trim();
-      if (text) sections.push(`${entry.kind === "assistant" ? "Assistant" : "Assistant reasoning"}:\n${text}`);
+      if (text) sections.push(`Assistant reasoning:\n${text}`);
+      continue;
+    }
+    if (entry.kind === "assistant") {
+      const text = String(entry.text ?? "").trim();
+      if (text) sections.push(`Assistant:\n${text}`);
       continue;
     }
     if (entry.kind !== "tool") continue;
@@ -169,6 +239,14 @@ function formatInterruptedTurn(userMessage, state) {
     sections.push(details.join("\n"));
   }
   return sections.join("\n\n");
+}
+
+function formatInterruptedTurn(userMessage, state) {
+  return formatTurnTrace(userMessage, state, { includeThinking: true });
+}
+
+function formatCompletedTurn(userMessage, state) {
+  return formatTurnTrace(userMessage, state, { includeThinking: false });
 }
 
 function safeJson(value) {
@@ -774,6 +852,10 @@ async function promptMessage(parts) {
 }
 
 async function main() {
+  // Cursor has no built-in Task toggle; install user-global deny hooks before any Agent.create.
+  await ensureGlobalTaskDenyHooks().catch((error) => {
+    process.stderr.write(`Cursor global Task-deny hooks failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  });
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   const requests = [];
   let wake;
@@ -926,7 +1008,8 @@ async function main() {
           memory.pendingTurn = "";
           recordSlimTurn(memory, originalMessage, extractTurnConclusion(state, result));
           if (memory.contextStage === "full") {
-            memory.fullTurns.push(formatInterruptedTurn(originalMessage, state));
+            // Completed full-stage turns keep tools/assistant text but drop thinking, matching Vega.
+            memory.fullTurns.push(formatCompletedTurn(originalMessage, state));
           }
           const turnUsage = usage ?? result.usage;
           const measuredTokens = contextTokensFromUsage(turnUsage);
@@ -1008,16 +1091,21 @@ export {
   cursorShellProgram,
   cursorTodoPlan,
   contextTokensFromUsage,
+  ensureGlobalTaskDenyHooks,
   extractTurnConclusion,
+  formatCompletedTurn,
   formatInterruptedTurn,
   formatSlimMemory,
   ingestCompactHistory,
+  isNovaDenyTaskHook,
   isSlimMemoryEmpty,
   mapDelta,
   mapMessage,
+  mergeNovaTaskDenyHooks,
   messageWithRecoveryContext,
   messageWithSlimMemory,
   modelSelection,
+  novaDenyTaskHookCommand,
   parseCliModels,
   promptMessage,
   recordSlimTurn,
