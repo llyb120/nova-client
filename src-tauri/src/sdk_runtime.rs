@@ -584,7 +584,15 @@ impl SdkManager {
         }
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = manager.refresh_model_options().await;
+            if let Err(error) = manager.refresh_model_options().await {
+                let _ = manager.app.emit(
+                    EV_LOG,
+                    format!(
+                        "[{}] 拉取模型列表失败：{error}",
+                        manager.adapter.label()
+                    ),
+                );
+            }
             manager
                 .model_options_refreshing
                 .store(false, Ordering::SeqCst);

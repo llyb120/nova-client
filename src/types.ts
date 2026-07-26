@@ -358,7 +358,7 @@ export interface Settings {
   claudecodeProxy: string;
   claudecodeSdkApiKey: string;
   cursorProxy: string;
-  /** Cursor CLI 可执行文件 */
+  /** 兼容旧配置；Cursor 后端仅使用官方 SDK，不再依赖本机 CLI */
   cursorPath: string;
   cursorSdkApiKey: string;
   /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */

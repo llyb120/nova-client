@@ -28,7 +28,7 @@ pub struct Settings {
     pub claudecode_proxy: String,
     /// Claude Agent SDK API Key；空 = 使用环境/provider 凭据。
     pub claudecode_sdk_api_key: String,
-    /// Cursor CLI（cursor-agent）可执行文件路径（默认 cursor-agent，依赖 PATH）
+    /// 兼容旧配置；Cursor 后端已改为仅使用官方 SDK，不再依赖本机 CLI
     pub cursor_path: String,
     /// 旧版 Cursor ACP 启动参数，仅用于兼容已有设置。
     pub cursor_args: String,

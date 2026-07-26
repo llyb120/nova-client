@@ -1,12 +1,11 @@
 import { createInterface } from "node:readline";
 import { Agent, Cursor } from "@cursor/sdk";
-import childProcess, { execFile } from "node:child_process";
+import childProcess from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
-import { promisify } from "node:util";
 import { createCursorFilesystemTools, cursorPromptPrefix } from "./cursor-filesystem-tools.mjs";
 
 const WINDOWS_SHELL_SHIMS = {
@@ -39,7 +38,6 @@ function installWindowsShellSpawnGuard() {
 installWindowsShellSpawnGuard();
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
-const execFileAsync = promisify(execFile);
 const TERMINAL_RUN_STATUSES = new Set(["completed", "finished", "error", "failed", "cancelled", "expired"]);
 const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTUP_TIMEOUT_MS, 120_000);
 const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
@@ -797,41 +795,21 @@ function cursorModelOptions(models) {
     options.findIndex((candidate) => candidate.value === option.value) === index);
 }
 
-function parseCliModels(output) {
-  return output
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .split(/\r?\n/)
-    .flatMap((line) => {
-      const match = line.trim().match(/^(\S+)\s+-\s+(.+?)(?:\s+\(default\))?$/);
-      if (!match || match[1].toLowerCase() === "auto") return [];
-      return [{ id: match[1], displayName: match[2] }];
-    });
-}
-
-async function cliModels() {
-  const program = process.env.NOVA_CURSOR_PATH || "cursor-agent";
-  const executable = process.platform === "win32" && program.toLowerCase().endsWith(".ps1")
-    ? "powershell.exe"
-    : program;
-  const args = executable === program
-    ? ["--list-models"]
-    : ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", program, "--list-models"];
-  const { stdout } = await execFileAsync(executable, args, {
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024,
-    windowsHide: true,
-  });
-  const models = parseCliModels(stdout);
-  if (!models.length) throw new Error("Cursor CLI 未返回模型列表");
-  return models;
-}
-
 async function modelOptions() {
-  let models;
-  if (process.env.CURSOR_API_KEY) {
-    models = await Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY }).catch(() => undefined);
+  const apiKey = process.env.CURSOR_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error("未配置 Cursor API Key，请在设置 → 模型后端中填写");
   }
-  models ??= await cliModels();
+  let models;
+  try {
+    models = await Cursor.models.list({ apiKey });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Cursor SDK 拉取模型失败：${detail}`);
+  }
+  if (!Array.isArray(models)) {
+    throw new Error("Cursor SDK 未返回模型列表");
+  }
   return {
     novaCursorModelSchema: 2,
     configOptions: [{
@@ -1145,7 +1123,6 @@ export {
   messageWithToolPolicy,
   modelSelection,
   novaDenyTaskHookCommand,
-  parseCliModels,
   promptMessage,
   recordSlimTurn,
   recoverTimedOutAgent,

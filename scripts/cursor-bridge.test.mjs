@@ -36,7 +36,6 @@ const {
   messageWithToolPolicy,
   modelSelection,
   novaDenyTaskHookCommand,
-  parseCliModels,
   promptMessage,
   recordSlimTurn,
   recoverTimedOutAgent,
@@ -99,10 +98,6 @@ assert.equal(cursorShellProgram("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\
   ? "C:\\Nova\\shim\\powershell.exe"
   : "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
 assert.equal(cursorShellProgram("tool.exe", { NOVA_SHELL_SHIM_POWERSHELL: "shim.exe" }), "tool.exe");
-assert.deepEqual(parseCliModels("Available models\r\n\r\nauto - Auto (default)\r\ncursor-grok-4.5-high - Cursor Grok 4.5\r\ncomposer-2.5-fast - Composer 2.5 Fast\r\n"), [
-  { id: "cursor-grok-4.5-high", displayName: "Cursor Grok 4.5" },
-  { id: "composer-2.5-fast", displayName: "Composer 2.5 Fast" },
-]);
 assert.deepEqual(modelSelection("cursor-grok-4.5-high-fast"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("grok-4.5-high-false"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] });
 assert.deepEqual(modelSelection("composer-2.5-fast"), { id: "composer-2.5", params: [{ id: "fast", value: "true" }] });
