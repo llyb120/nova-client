@@ -226,7 +226,7 @@ async fn remote_socket_loop(
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        let result = remote_socket_once(&cfg, &mut requests, &incoming).await;
+        let result = remote_socket_once(&cfg, &mut requests, &incoming, &mut backoff).await;
         if requests.is_closed() {
             return;
         }
@@ -243,6 +243,7 @@ async fn remote_socket_once(
     cfg: &RemoteConfig,
     requests: &mut mpsc::UnboundedReceiver<RemoteWsRequest>,
     incoming: &mpsc::UnboundedSender<Result<ServerResponse, String>>,
+    backoff: &mut Duration,
 ) -> Result<(), String> {
     let url = remote_websocket_url(&cfg.server)?;
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
@@ -267,6 +268,9 @@ async fn remote_socket_once(
         .await
         .map_err(|_| "建立远控 WebSocket 超时（20s）".to_string())?
         .map_err(|e| e.to_string())?;
+    // 一旦握手成功，上一轮网络故障积累的退避立即失效。否则无头客户端
+    // 恢复后再次短暂断线，仍可能沿用 30 秒退避，表现为远控长时间离线。
+    *backoff = Duration::from_secs(1);
     let (mut writer, mut reader) = socket.split();
     let mut request_id = 0i64;
     let mut pending: Option<(i64, oneshot::Sender<Result<ServerResponse, String>>)> = None;
