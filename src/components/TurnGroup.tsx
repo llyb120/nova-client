@@ -82,7 +82,7 @@ export function groupItems(items: Item[], prev: Group[] = []): Group[] {
     }
   }
 
-  // 重建出的尾部分组若内容与旧对象一致，复用旧对象身份，避免下游 <For>/VirtualGroup
+  // 重建出的尾部分组若内容与旧对象一致，复用旧对象身份，避免下游 <For>
   // 无谓重挂载（保留展开态、DOM、滚动位置）。
   for (let j = rebuiltStart; j < result.length; j++) {
     const prevGroup = prev[j];

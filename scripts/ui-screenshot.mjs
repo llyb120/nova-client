@@ -62,6 +62,7 @@ const mockSettings = {
   claudecodeIntegration: "sdk", cursorIntegration: "sdk", opencodeIntegration: "sdk",
   worktreeDir: "", sessionAutoCleanupEnabled: false, sessionAutoCleanupHours: 720,
   semanticEnabled: false, embedEndpoint: "", embedModel: "", embedApiKey: "",
+  modelFavorites: [],
 };
 
 // @tauri-apps/api 走 window.__TAURI_INTERNALS__.invoke；给个最小 mock 让前端在纯浏览器里跑起来
@@ -84,6 +85,9 @@ const tauriMock = `
         list_roaming_folders: [],
         list_worktrees: [],
         list_skills: [],
+        list_employees: [],
+        list_employee_tasks: [],
+        get_model_options: null,
         get_skills_dir: "D:/skills",
         get_global_agent_instructions: { content: "", path: "", targets: [] },
         semantic_status: { ok: false, dim: 0 },

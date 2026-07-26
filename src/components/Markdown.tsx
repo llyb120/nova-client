@@ -172,8 +172,8 @@ function renderMarkdown(src: string, markFiles: boolean): string {
   return markFiles && FILE_REFERENCE_CANDIDATE_RE.test(src) ? withFileReferences(html) : html;
 }
 
-// 虚拟列表会反复卸载/挂载历史消息。缓存净化后的 HTML，避免每次滚回去都重新执行
-// marked + DOMPurify；按 JS 字符串约 2 bytes/字符限制在约 8 MiB，远小于常驻 DOM 的成本。
+// 缓存净化后的 HTML，避免时间线预览或会话切换时重复执行 marked + DOMPurify；
+// 按 JS 字符串约 2 bytes/字符限制在约 8 MiB。
 const MARKDOWN_CACHE_LIMIT = 8 * 1024 * 1024;
 const markdownCache = new Map<string, { html: string; size: number }>();
 let markdownCacheSize = 0;

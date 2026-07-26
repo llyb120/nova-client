@@ -884,7 +884,7 @@ button {
   overflow-y: auto;
   /* 禁止滚动到边界后的橡皮筋回弹和向外层继续传递滚动。 */
   overscroll-behavior: none;
-  /* 防止浏览器滚动锚定在虚拟列表卸挂时把位置拽回去，导致发送后钉底失效 */
+  /* 流式内容增长由会话吸底逻辑统一处理，避免浏览器锚定与其竞争。 */
   overflow-anchor: none;
   user-select: text;
 }
@@ -895,8 +895,58 @@ button {
   min-height: 0;
   display: flex;
 }
-.chat-body > .transcript {
+.canvas-transcript-host {
+  position: relative;
+  flex: 1;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+.transcript-canvas-only {
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+  touch-action: none;
+}
+.canvas-prompt-editor {
+  position: absolute;
+  z-index: 5;
+  min-width: 260px;
+  max-width: calc(100% - 28px);
+  padding: 12px 14px;
+  border: 1px solid var(--border-light);
+  border-radius: 14px;
+  background: var(--bg-panel);
+}
+.canvas-prompt-editor textarea {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  max-height: 32vh;
+  resize: vertical;
+  padding: 0;
+  border: none;
+  outline: none;
+  color: var(--text);
+  background: none;
+  font: inherit;
+  line-height: 1.55;
+  user-select: text;
+}
+.canvas-prompt-editor textarea:focus { border-color: var(--accent); }
+.canvas-prompt-editor > div {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 9px;
+}
+.canvas-prompt-editor > div > span {
+  margin-right: auto;
+  color: var(--text-faint);
+  font-size: 11px;
 }
 
 /* 会话时光机：Vega 已持有完整上下文，因此把每轮提示词变成可穿梭的时间刻度。 */
@@ -1041,20 +1091,20 @@ button {
   50% { opacity: .35; transform: scale(.72); }
 }
 
-/* 右侧时光机沿用紧凑单线样式；分支按列展开，当前时间线始终固定在最左侧。 */
+/* 右侧时光机固定占用紧凑宽度。分支图在内部横向滚动，避免异步时间线到达后
+   改变主内容列宽度，导致 Canvas 重新换行并出现“刚打开正常、随后挤在一起”。 */
 .repo-time-machine {
   position: relative;
   z-index: 8;
-  flex: 0 0 var(--time-width, 64px);
-  width: var(--time-width, 64px);
-  max-width: 168px;
+  flex: 0 0 64px;
+  width: 64px;
+  max-width: 64px;
   min-height: 0;
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--border-light);
   color: var(--text-muted);
   background: color-mix(in srgb, var(--bg) 94%, transparent);
-  transition: width .16s ease, flex-basis .16s ease;
 }
 .repo-time-machine-label {
   display: flex;
@@ -1346,12 +1396,6 @@ button {
   white-space: nowrap;
   color: var(--text-dim);
   font-family: var(--mono);
-}
-
-/* transcript 虚拟化 wrapper：不参与 flex 收缩，卸载时用等高占位撑住滚动高度 */
-.vgroup {
-  flex: 0 0 auto;
-  scroll-margin-top: 20px;
 }
 
 .transcript-hint {
