@@ -125,24 +125,24 @@ fn load_store(data_dir: &Path) -> Result<StoreFile, String> {
     if !path.exists() {
         return Ok(StoreFile::default());
     }
-    let bytes = fs::read(&path).map_err(|e| format!("读取时光机数据失败：{e}"))?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("解析时光机数据失败：{e}"))
+    let bytes = fs::read(&path).map_err(|e| format!("读取世界线数据失败：{e}"))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("解析世界线数据失败：{e}"))
 }
 
 fn save_store(data_dir: &Path, store: &StoreFile) -> Result<(), String> {
     let dir = time_machine_dir(data_dir);
-    fs::create_dir_all(&dir).map_err(|e| format!("创建时光机目录失败：{e}"))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("创建世界线目录失败：{e}"))?;
     let path = store_path(data_dir);
     let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
-    let bytes = serde_json::to_vec(store).map_err(|e| format!("序列化时光机数据失败：{e}"))?;
-    fs::write(&tmp, bytes).map_err(|e| format!("写入时光机数据失败：{e}"))?;
+    let bytes = serde_json::to_vec(store).map_err(|e| format!("序列化世界线数据失败：{e}"))?;
+    fs::write(&tmp, bytes).map_err(|e| format!("写入世界线数据失败：{e}"))?;
     match fs::rename(&tmp, &path) {
         Ok(()) => Ok(()),
         Err(_) if path.exists() => {
             // Windows 不允许 rename 覆盖已有文件；先保留旧文件备份，提交成功后再删除。
             let backup = path.with_extension("json.backup");
             let _ = fs::remove_file(&backup);
-            fs::rename(&path, &backup).map_err(|e| format!("备份时光机数据失败：{e}"))?;
+            fs::rename(&path, &backup).map_err(|e| format!("备份世界线数据失败：{e}"))?;
             match fs::rename(&tmp, &path) {
                 Ok(()) => {
                     let _ = fs::remove_file(backup);
@@ -150,11 +150,11 @@ fn save_store(data_dir: &Path, store: &StoreFile) -> Result<(), String> {
                 }
                 Err(error) => {
                     let _ = fs::rename(&backup, &path);
-                    Err(format!("提交时光机数据失败：{error}"))
+                    Err(format!("提交世界线数据失败：{error}"))
                 }
             }
         }
-        Err(error) => Err(format!("提交时光机数据失败：{error}")),
+        Err(error) => Err(format!("提交世界线数据失败：{error}")),
     }
 }
 
@@ -172,22 +172,22 @@ fn put_blob(data_dir: &Path, bytes: &[u8]) -> Result<String, String> {
     if path.exists() {
         return Ok(hash);
     }
-    let parent = path.parent().ok_or("无效的时光机对象路径")?;
-    fs::create_dir_all(parent).map_err(|e| format!("创建时光机对象目录失败：{e}"))?;
+    let parent = path.parent().ok_or("无效的世界线对象路径")?;
+    fs::create_dir_all(parent).map_err(|e| format!("创建世界线对象目录失败：{e}"))?;
     let tmp = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    fs::write(&tmp, bytes).map_err(|e| format!("写入时光机对象失败：{e}"))?;
+    fs::write(&tmp, bytes).map_err(|e| format!("写入世界线对象失败：{e}"))?;
     match fs::rename(&tmp, &path) {
         Ok(()) => Ok(hash),
         Err(_) if path.exists() => {
             let _ = fs::remove_file(tmp);
             Ok(hash)
         }
-        Err(e) => Err(format!("提交时光机对象失败：{e}")),
+        Err(e) => Err(format!("提交世界线对象失败：{e}")),
     }
 }
 
 fn get_blob(data_dir: &Path, hash: &str) -> Result<Vec<u8>, String> {
-    fs::read(object_path(data_dir, hash)).map_err(|e| format!("读取时光机对象 {hash} 失败：{e}"))
+    fs::read(object_path(data_dir, hash)).map_err(|e| format!("读取世界线对象 {hash} 失败：{e}"))
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -283,10 +283,10 @@ fn base_file(root: &Path, head: &str, path: &str) -> Result<Option<(Vec<u8>, boo
         return Ok(None);
     };
     if tree_entry.starts_with("120000 ") {
-        return Err(format!("时光机第一版暂不支持符号链接：{path}"));
+        return Err(format!("世界线第一版暂不支持符号链接：{path}"));
     }
     if tree_entry.starts_with("160000 ") {
-        return Err(format!("时光机第一版暂不支持子模块：{path}"));
+        return Err(format!("世界线第一版暂不支持子模块：{path}"));
     }
     let spec = format!("{head}:{path}");
     let output = Command::new("git")
@@ -376,10 +376,10 @@ fn capture_manifest(data_dir: &Path, root: &Path, head: &str) -> Result<Vec<Patc
         let (target_blob, target_executable) = match fs::symlink_metadata(&absolute) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
-                    return Err(format!("时光机第一版暂不支持符号链接：{path}"));
+                    return Err(format!("世界线第一版暂不支持符号链接：{path}"));
                 }
                 if !metadata.is_file() {
-                    return Err(format!("时光机第一版暂不支持子模块或特殊文件：{path}"));
+                    return Err(format!("世界线第一版暂不支持子模块或特殊文件：{path}"));
                 }
                 let bytes = fs::read(&absolute)
                     .map_err(|e| format!("读取变动文件失败 {}：{e}", absolute.display()))?;
@@ -468,7 +468,7 @@ fn append_checkpoint(
     let (root, head) = repository_identity(Path::new(&thread.cwd))?;
     if let Some(first) = timeline.checkpoints.first() {
         if first.repo_root != root.to_string_lossy() || first.base_head != head {
-            return Err("仓库目录或 HEAD 已变化，不能继续写入原时光机时间线".into());
+            return Err("仓库目录或 HEAD 已变化，不能继续写入原世界线时间线".into());
         }
     }
     let entries = capture_manifest(data_dir, &root, &head)?;
@@ -532,7 +532,7 @@ pub fn checkpoint_preview(
     checkpoint_id: &str,
 ) -> Result<Thread, String> {
     let store = load_store(data_dir)?;
-    let index = timeline_index(&store, thread_id).ok_or("会话没有时光机时间线")?;
+    let index = timeline_index(&store, thread_id).ok_or("会话没有世界线时间线")?;
     store.timelines[index]
         .checkpoints
         .iter()

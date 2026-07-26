@@ -985,7 +985,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             </section>
 
             <section class="settings-group">
-              <h3 class="settings-group-title">时光机</h3>
+              <h3 class="settings-group-title">世界线</h3>
               <div class="field">
                 <span class="field-label">启用 Checkpoint</span>
                 <label class="backend-switch">

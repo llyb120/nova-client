@@ -122,7 +122,7 @@ pub struct AppState {
     pub cli_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 编辑历史消息后正在后台 restore/fork、等待自动重发的会话。
     pub pending_prompt_restores: Mutex<HashSet<String>>,
-    /// 仓库时光机的创建/恢复互斥；同一进程内禁止两个恢复事务交叉写文件。
+    /// 仓库世界线的创建/恢复互斥；同一进程内禁止两个恢复事务交叉写文件。
     pub time_machine_lock: Mutex<()>,
     /// 网页远控尚待处理的权限请求（requestKey -> 原始事件）。
     pub remote_permissions: Mutex<HashMap<String, Value>>,
@@ -2600,7 +2600,7 @@ fn create_time_machine_checkpoint(
             return Err("请等待当前会话执行结束后再创建时间点".into());
         }
         if thread.is_roaming_guest() || thread.roaming_role.is_some() || thread.worktree.is_some() {
-            return Err("时光机目前只支持当前分支上的本地普通会话".into());
+            return Err("世界线目前只支持当前分支上的本地普通会话".into());
         }
         thread.clone()
     };
@@ -2641,7 +2641,7 @@ fn restore_time_machine_checkpoint(
             return Err("请等待当前会话执行结束后再跳转".into());
         }
         if thread.is_roaming_guest() || thread.roaming_role.is_some() || thread.worktree.is_some() {
-            return Err("时光机目前只支持当前分支上的本地普通会话".into());
+            return Err("世界线目前只支持当前分支上的本地普通会话".into());
         }
         thread.clone()
     };

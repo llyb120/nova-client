@@ -899,7 +899,7 @@ button {
   min-width: 0;
 }
 
-/* 会话时光机：Vega 已持有完整上下文，因此把每轮提示词变成可穿梭的时间刻度。 */
+/* 会话世界线：Vega 已持有完整上下文，因此把每轮提示词变成可穿梭的时间刻度。 */
 .time-rail {
   position: relative;
   z-index: 3;
@@ -1041,7 +1041,7 @@ button {
   50% { opacity: .35; transform: scale(.72); }
 }
 
-/* 右侧时光机沿用紧凑单线样式；分支按列展开，当前时间线始终固定在最左侧。 */
+/* 右侧世界线沿用紧凑单线样式；分支按列展开，当前时间线始终固定在最左侧。 */
 .repo-time-machine {
   position: relative;
   z-index: 8;

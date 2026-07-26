@@ -52,7 +52,7 @@ pub struct Settings {
     pub windows_shell_shim_enabled: bool,
     /// Vega 使用类似 Cursor 的精简上下文：仅携带用户提示词和轮次结论，并自动摘要旧轮次。
     pub vega_slim_context_enabled: bool,
-    /// 穿越时光机时间线时是否还原 checkpoint 中的工作目录文件。
+    /// 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件。
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,
