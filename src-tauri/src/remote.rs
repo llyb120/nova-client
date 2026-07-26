@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -33,6 +33,8 @@ const COMMAND_WATCH_DURATION: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
 const REMOTE_WS_COMPRESS_AT: usize = 1024;
 const REMOTE_WS_MAX_PAYLOAD: u64 = 32 << 20;
+const REMOTE_WS_PING_INTERVAL: Duration = Duration::from_secs(15);
+const REMOTE_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
 static NEXT_REMOTE_REQUEST_ID: AtomicI64 = AtomicI64::new(1);
 /// 首次连接只预热最新会话；其余历史按点击请求，兼顾首屏速度与流量。
@@ -275,6 +277,11 @@ async fn remote_socket_once(
     *backoff = Duration::from_secs(1);
     let (mut writer, mut reader) = socket.split();
     let mut pending: Option<(i64, oneshot::Sender<Result<ServerResponse, String>>)> = None;
+    let mut last_received = Instant::now();
+    let mut ping = interval(REMOTE_WS_PING_INTERVAL);
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // interval 的首个 tick 会立即触发；先消费掉，避免握手完成后立刻发送无意义 ping。
+    ping.tick().await;
 
     loop {
         tokio::select! {
@@ -292,12 +299,23 @@ async fn remote_socket_once(
                 }
                 pending = Some((request_id, request.reply));
             }
+            _ = ping.tick() => {
+                if last_received.elapsed() >= REMOTE_WS_IDLE_TIMEOUT {
+                    return Err("远控 WebSocket 接收空闲超时（45s 无心跳/数据）".into());
+                }
+                writer
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             message = reader.next() => {
                 let message = match message {
                     Some(Ok(message)) => message,
                     Some(Err(error)) => return Err(error.to_string()),
                     None => return Ok(()),
                 };
+                // 任意合法 WebSocket 帧都证明连接仍活跃；Pong 会在这里刷新看门狗。
+                last_received = Instant::now();
                 let text = match message {
                     Message::Text(text) => text.to_string(),
                     Message::Binary(bytes) => decode_remote_binary(bytes.as_ref())?,
