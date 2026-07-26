@@ -175,14 +175,10 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [defaultMode, setDefaultMode] = createSignal(
     normalizeUnifiedMode(s?.defaultMode) ?? s?.defaultMode ?? "",
   );
-  const [titleAgent, setTitleAgent] = createSignal<AgentKind>(
-    (s?.titleModelAgent as AgentKind) || "devin",
+  const [lightweightAgent, setLightweightAgent] = createSignal<AgentKind>(
+    (s?.lightweightModelAgent as AgentKind) || "alkaid",
   );
-  const [titleModel, setTitleModel] = createSignal(s?.titleModel ?? "swe-1-6");
-  const [shareAgent, setShareAgent] = createSignal<AgentKind>(
-    (s?.shareModelAgent as AgentKind) || "devin",
-  );
-  const [shareModel, setShareModel] = createSignal(s?.shareModel ?? "swe-1.6");
+  const [lightweightModel, setLightweightModel] = createSignal(s?.lightweightModel ?? "");
   const [editor, setEditor] = createSignal(s?.editor ?? "code");
   const [sessionAutoCleanupEnabled, setSessionAutoCleanupEnabled] = createSignal(
     s?.sessionAutoCleanupEnabled ?? false,
@@ -431,10 +427,8 @@ export function SettingsModal(props: { onClose: () => void }) {
     cursorSdkApiKey: cursorSdkApiKey().trim(),
     opencodeProxy: opencodeProxy().trim(),
     defaultMode: defaultMode(),
-    titleModelAgent: titleAgent(),
-    titleModel: titleModel().trim(),
-    shareModelAgent: shareAgent(),
-    shareModel: shareModel().trim(),
+    lightweightModelAgent: lightweightAgent(),
+    lightweightModel: lightweightModel().trim(),
     editor: editor().trim() || "code",
     theme: state.theme,
     relayServer: relayServer().trim(),
@@ -928,48 +922,24 @@ export function SettingsModal(props: { onClose: () => void }) {
             </section>
 
             <section class="settings-group">
-              <h3 class="settings-group-title">标题与分享模型</h3>
+              <h3 class="settings-group-title">轻量级模型</h3>
               <p class="settings-group-desc">
-                与新建会话同款的模型选择器，可任选任意已启用后端下的模型，不再限定
-                Devin。
+                用于标题生成、快速总结、摘要和上下文压缩等辅助任务；调用失败时自动回退到任务原模型。
               </p>
               <div class="field">
-                <span class="field-label">标题生成模型</span>
+                <span class="field-label">轻量级模型</span>
                 <ModelPicker
-                  agentKind={titleAgent()}
+                  agentKind={lightweightAgent()}
                   agentKinds={titleAgentKinds()}
-                  model={titleModel()}
+                  model={lightweightModel()}
                   onPickModel={(a, m) => {
-                    setTitleAgent(a);
-                    setTitleModel(m);
+                    setLightweightAgent(a);
+                    setLightweightModel(m);
                   }}
-                  prefix="标题模型"
-                  title="标题生成模型"
+                  prefix="轻量模型"
+                  title="轻量级模型"
                   portal
                 />
-                <span class="field-hint">
-                  自动为新会话生成标题时所用的轻量模型。标题统一在所选后端生成；选
-                  Codex 或该后端不可用时，自动回退到会话所在后端。
-                </span>
-              </div>
-
-              <div class="field">
-                <span class="field-label">高级分享处理模型</span>
-                <ModelPicker
-                  agentKind={shareAgent()}
-                  agentKinds={enabledAgentKinds()}
-                  model={shareModel()}
-                  onPickModel={(a, m) => {
-                    setShareAgent(a);
-                    setShareModel(m);
-                  }}
-                  prefix="分享模型"
-                  title="高级分享处理模型"
-                  portal
-                />
-                <span class="field-hint">
-                  高级分享「按提示词处理/总结会话」时的默认后端与模型。分享时仍可临时改选。
-                </span>
               </div>
             </section>
 

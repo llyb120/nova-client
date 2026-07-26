@@ -169,7 +169,7 @@ impl AppState {
         self.acp.clone()
     }
 
-    /// 统一的会话标题生成入口：把标题任务路由到设置里的「标题后端 + 标题模型」。
+    /// 统一的会话标题生成入口：优先路由到设置里的轻量级模型。
     /// - 配置后端已启用且有 ACP 管理器（Codex 无）：用它并下发标题模型；
     /// - 否则回退到线程自身后端（origin），此时不下发模型（模型 id 与后端绑定、不通用）。
     /// origin 为触发标题的线程所在后端，仅在回退时使用。
@@ -183,8 +183,8 @@ impl AppState {
         let (agent_raw, model) = {
             let s = self.settings.lock().unwrap();
             (
-                s.title_model_agent.trim().to_string(),
-                s.title_model.trim().to_string(),
+                s.lightweight_model_agent.trim().to_string(),
+                s.lightweight_model.trim().to_string(),
             )
         };
         if AgentKind::from_str(&agent_raw) == Some(AgentKind::OpenCode)
@@ -3897,40 +3897,40 @@ struct ClueAiSummary {
     content: String,
 }
 
-/// 用高级分享模型总结会话核心内容，供线索表单填入（不分享、不切换当前会话）
+/// 优先用轻量级模型总结会话核心内容，失败时回退到原会话模型。
 #[tauri::command]
 async fn summarize_clue(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<ClueAiSummary, String> {
-    let (src_cwd, transcript, fallback_title) = {
+    let (src_cwd, transcript, fallback_title, origin_agent, origin_model) = {
         let store = state.store.lock().unwrap();
         let t = store.get(&thread_id).ok_or("线程不存在")?;
         (
             t.cwd.clone(),
             relay::build_transcript(&t.items),
             t.title.clone(),
+            t.agent_kind.clone(),
+            t.model.clone(),
         )
     };
     if transcript.trim().is_empty() {
         return Err("会话还没有内容可总结".into());
     }
 
-    let (agent_kind, model_opt) = {
+    let (lightweight_agent, lightweight_model) = {
         let s = state.settings.lock().unwrap();
-        let agent_kind = AgentKind::from_str(&s.share_model_agent).unwrap_or(AgentKind::Devin);
-        let model = {
-            let m = s.share_model.trim().to_string();
-            if m.is_empty() && agent_kind == AgentKind::Devin {
-                "swe-1.6".to_string()
-            } else {
-                m
-            }
-        };
-        let model_opt = if model.is_empty() { None } else { Some(model) };
-        (agent_kind, model_opt)
+        (
+            AgentKind::from_str(&s.lightweight_model_agent).unwrap_or(AgentKind::Alkaid),
+            (!s.lightweight_model.trim().is_empty())
+                .then(|| s.lightweight_model.trim().to_string()),
+        )
     };
+    let mut attempts = vec![(lightweight_agent, lightweight_model)];
+    if attempts[0].0 != origin_agent || attempts[0].1 != origin_model {
+        attempts.push((origin_agent, origin_model));
+    }
 
     let cwd = if std::path::Path::new(&src_cwd).is_dir() {
         src_cwd
@@ -3940,17 +3940,6 @@ async fn summarize_clue(
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
         dir.to_string_lossy().to_string()
     };
-
-    let mut thread = Thread::new(cwd, agent_kind.clone(), model_opt, None, None, true);
-    thread.title = "线索 AI 总结".into();
-    let run_id = thread.id.clone();
-    {
-        let mut store = state.store.lock().unwrap();
-        store.threads.push(thread);
-        store.save();
-    }
-    let _ = app.emit(acp::EV_THREADS, json!({}));
-
     let seed = format!(
         "请总结下面这段会话的核心内容，用于保存为「线索」。\n\
          严格按以下格式输出，不要其它前言或解释：\n\n\
@@ -3960,28 +3949,43 @@ async fn summarize_clue(
          ----\n会话记录：\n\n{transcript}"
     );
 
-    employees::run_employee_prompt(&agent_kind, &app, run_id.clone(), seed).await;
+    let mut raw = None;
+    for (agent_kind, model_opt) in attempts {
+        let mut thread = Thread::new(cwd.clone(), agent_kind.clone(), model_opt, None, None, true);
+        thread.title = "线索 AI 总结".into();
+        let run_id = thread.id.clone();
+        {
+            let mut store = state.store.lock().unwrap();
+            store.threads.push(thread);
+            store.save();
+        }
+        let _ = app.emit(acp::EV_THREADS, json!({}));
+        employees::run_employee_prompt(&agent_kind, &app, run_id.clone(), seed.clone()).await;
+        let output = employees::last_employee_assistant(&app, &run_id)
+            .filter(|text| !text.trim().is_empty());
 
-    let raw = employees::last_employee_assistant(&app, &run_id)
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| "总结失败：模型没有返回内容".to_string())?;
-
-    // 清理临时会话，避免污染列表
-    {
-        let mut store = state.store.lock().unwrap();
-        store.threads.retain(|t| t.id != run_id);
-        store.save();
+        // 每次尝试后都清理辅助会话；轻量模型失败时再用原会话模型重试。
+        {
+            let mut store = state.store.lock().unwrap();
+            store.threads.retain(|t| t.id != run_id);
+            store.save();
+        }
+        state.acp.forget_session_of_thread(&run_id);
+        state.codex.forget_session_of_thread(&run_id);
+        state.alkaid.forget_session_of_thread(&run_id);
+        state.codexplus.forget_session_of_thread(&run_id);
+        state.codebuddyplus.forget_session_of_thread(&run_id);
+        state.claudeplus.forget_session_of_thread(&run_id);
+        state.cursorplus.forget_session_of_thread(&run_id);
+        state.opencodeplus.forget_session_of_thread(&run_id);
+        let _ = app.emit(acp::EV_THREADS, json!({}));
+        if output.is_some() {
+            raw = output;
+            break;
+        }
     }
-    state.acp.forget_session_of_thread(&run_id);
-    state.codex.forget_session_of_thread(&run_id);
-    state.alkaid.forget_session_of_thread(&run_id);
-    state.codexplus.forget_session_of_thread(&run_id);
-    state.codebuddyplus.forget_session_of_thread(&run_id);
-    state.claudeplus.forget_session_of_thread(&run_id);
-    state.cursorplus.forget_session_of_thread(&run_id);
-    state.opencodeplus.forget_session_of_thread(&run_id);
-    let _ = app.emit(acp::EV_THREADS, json!({}));
 
+    let raw = raw.ok_or_else(|| "总结失败：轻量模型和原模型均没有返回内容".to_string())?;
     Ok(parse_clue_ai_summary(&raw, &fallback_title))
 }
 
