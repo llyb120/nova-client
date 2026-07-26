@@ -165,11 +165,25 @@ function restyleMarkdown(
   for (const child of node.children) restyleMarkdown(child, p, next, node.tag);
 }
 
-function markdown(text: string, p: Palette): Node {
+function normalizeThoughtMarkdown(text: string): string {
+  // Older OpenCode sessions joined adjacent reasoning parts as **A****B**.
+  return state.agentKind === "opencode"
+    ? text.replace(/(\S)\*{4}(?=\S)/g, "$1**\n\n**")
+    : text;
+}
+
+function markdown(
+  text: string,
+  p: Palette,
+  opts: { fontSize?: number; lineHeight?: number; color?: string } = {},
+): Node {
+  const fontSize = opts.fontSize ?? 14;
+  const lineHeight = opts.lineHeight ?? 1.7;
+  const color = opts.color ?? p.text;
   const node = parseMarkdown(text, {
-    width: "100%", color: p.text, fontFamily: p.sans, fontSize: 14, lineHeight: 1.7,
+    width: "100%", color, fontFamily: p.sans, fontSize, lineHeight,
   });
-  restyleMarkdown(node, p);
+  restyleMarkdown(node, p, { size: fontSize, lineHeight, weight: "normal", color });
   const last = node.children.at(-1);
   if (last?.tag === "p") last.style.margin = 0;
   return node;
@@ -398,7 +412,11 @@ function itemNode(item: Item, active: boolean, p: Palette, rebuild: () => void,
         toggleExpanded(key, !open); rebuild();
       }),
       ...(open ? [block({ margin: [6, 0, 0], padding: [8, 14], border: [0, 0, 0, 2],
-        borderColor: p.borderLight, color: p.dim, fontSize: 13 }, "", [markdown(item.text, p)])] : []),
+        borderColor: p.borderLight, color: p.dim, fontSize: 13 }, "", [
+        markdown(normalizeThoughtMarkdown(item.text), p, {
+          fontSize: 13, lineHeight: 1.6, color: p.dim,
+        }),
+      ])] : []),
     ]);
   }
   if (item.type === "tool") return tool(item, active, p, rebuild);
@@ -549,11 +567,23 @@ function groupNode(group: Group, index: number, running: boolean, p: Palette, re
     const key = `turn-${group.turn.id ?? group.user?.id ?? process[0]?.id ?? 0}`;
     const open = state.expanded[key] ?? process.some((it) => state.expanded[String(it.id)]);
     const label = ["已处理", fmtDuration(group.turn.durationMs), group.turn.totalTokens ? `· ${fmtTokens(group.turn.totalTokens)} tokens` : ""].filter(Boolean).join(" ");
-    result.appendChild(button(label, { color: p.dim, fontSize: 13, padding: [4, 8],
+    const foldBtn = button(label, { color: p.dim, fontSize: 13, padding: [4, 8],
       margin: [12, 0, 2, -8], borderRadius: 7, trailingChevron: open,
       chevronColor: p.faint, hoverBackground: p.hover }, () => {
       toggleExpanded(key, !open); rebuild();
-    }));
+    });
+    const turn = group.turn;
+    if (turn.totalTokens) {
+      // 与 TurnGroup.tokenTitle 一致：悬停展示互斥的读写/缓存明细。
+      const cacheRead = turn.cacheReadTokens ?? 0;
+      const cacheWrite = turn.cacheWriteTokens ?? 0;
+      const read = Math.max(0, (turn.inputTokens ?? 0) - cacheRead - cacheWrite);
+      const parts = [`读取 ${fmtTokens(read)}`, `写入 ${fmtTokens(turn.outputTokens ?? 0)}`];
+      if (turn.cacheReadTokens != null) parts.push(`缓存读取 ${fmtTokens(cacheRead)}`);
+      if (turn.cacheWriteTokens != null) parts.push(`缓存写入 ${fmtTokens(cacheWrite)}`);
+      foldBtn.title = `${parts.join(" / ")} tokens`;
+    }
+    result.appendChild(foldBtn);
     if (open) {
       const processBody = block({ margin: [4, 0, 6], padding: [2, 0, 2, 12],
         border: [0, 0, 0, 2], borderColor: p.border });

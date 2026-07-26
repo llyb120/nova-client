@@ -73,7 +73,7 @@ function isUnder(node, ancestor) {
   return false;
 }
 
-function findEditHoverRoot(node) {
+export function findEditHoverRoot(node) {
   let current = node;
   while (current) {
     if (current._editHoverRoot) return current;
@@ -82,11 +82,69 @@ function findEditHoverRoot(node) {
   return null;
 }
 
+/** Hover 是否会产生可见变化；用于跳过 Markdown 文本上的无效全量重绘。 */
+export function hoverPaintTarget(node) {
+  if (!node) return null;
+  const editRoot = findEditHoverRoot(node);
+  let interactive = null;
+  let current = node;
+  while (current) {
+    const s = current.style;
+    if (current.tag === 'button' || current.tag === 'input' || current.tag === 'a'
+        || s.hoverBackground || s.hoverOpacity != null || s.hoverDecoration || s.hoverColor) {
+      interactive = current;
+      break;
+    }
+    current = current.parent;
+  }
+  const dirty = editRoot || interactive;
+  if (!dirty) return null;
+  return {
+    key: `${editRoot ? editRoot.id : 0}:${interactive ? interactive.id : 0}`,
+    dirty,
+  };
+}
+
+export function nodeScreenBounds(node) {
+  if (!node) return null;
+  const { sx, sy } = getScrollOffset(node);
+  return {
+    x: node._x - sx,
+    y: node._y - sy,
+    w: node._width,
+    h: node._height,
+  };
+}
+
+export function findNodeTitle(node) {
+  let current = node;
+  while (current) {
+    if (current.title) return String(current.title);
+    current = current.parent;
+  }
+  return '';
+}
+
 export function treeHasBusyStatus(node) {
   if (node?.style?.trailingStatus === 'busy') return true;
   if (!node?.children) return false;
   for (const child of node.children) {
     if (treeHasBusyStatus(child)) return true;
+  }
+  return false;
+}
+
+/** 仅扫描视口附近的节点，避免 busy 时每帧 DFS 整棵历史树。 */
+export function treeHasBusyStatusVisible(node, viewTop, viewBottom) {
+  if (!node) return false;
+  if (node.style?.display === 'none') return false;
+  const y = node._y;
+  const h = node._height;
+  // 尚未布局或尺寸未知时保守继续检查。
+  if (h > 0 && (y + h < viewTop || y > viewBottom)) return false;
+  if (node.style?.trailingStatus === 'busy') return true;
+  for (const child of node.children) {
+    if (treeHasBusyStatusVisible(child, viewTop, viewBottom)) return true;
   }
   return false;
 }
@@ -522,7 +580,7 @@ function shade(color, percent) {
 // Compute accumulated scroll offset from all scrollable ancestors of a node.
 // _textLines store layout (pre-scroll) coordinates; subtracting this offset
 // converts them to screen coordinates for hit testing and selection painting.
-function getScrollOffset(node) {
+export function getScrollOffset(node) {
   let sx = 0, sy = 0;
   let p = node.parent;
   while (p) {

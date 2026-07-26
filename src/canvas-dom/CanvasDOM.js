@@ -3,7 +3,7 @@
 
 import { Node, h } from './Node.js';
 import { layout } from './layout.js';
-import { paint, hitTextPosition, paintSelection, selectionText, collectTextNodes, treeHasBusyStatus } from './painter.js';
+import { paint, hitTextPosition, paintSelection, selectionText, collectTextNodes, treeHasBusyStatus, treeHasBusyStatusVisible, hoverPaintTarget, nodeScreenBounds, findNodeTitle } from './painter.js';
 import { hitTest, findScrollable, scrollBy } from './interaction.js';
 import { parseMarkdown } from './markdown.js';
 
@@ -23,9 +23,15 @@ export class CanvasDOM {
     this._rafId = 0;
     this._dirty = true;
     this._needsLayout = true;
+    this._hoverOnly = false;
+    this._hoverDirtyNodes = null;
+    this._hoverPaintKey = null;
     this._caretOn = true;
     this._caretTimer = 0;
     this._spinPhase = 0;
+    this._lastSpinFrame = -1;
+    this._busyProbeFrame = -1;
+    this._hasBusy = false;
 
     // interaction state
     this._hoverNode = null;
@@ -58,6 +64,9 @@ export class CanvasDOM {
     // 布局必须与树替换同步完成。否则点击展开到下一帧之间，新根的 maxScroll 仍为 0，
     // 吸底、时间线定位或紧接着发生的滚轮事件会把位置错误地夹到顶部。
     this._needsLayout = true;
+    this._hoverOnly = false;
+    this._hoverDirtyNodes = null;
+    this._hasBusy = false;
     this._render();
     this._dirty = false;
   }
@@ -75,6 +84,29 @@ export class CanvasDOM {
   invalidate(needsLayout = true) {
     if (needsLayout) this._needsLayout = true;
     this._dirty = true;
+    this._hoverOnly = false;
+    this._hoverDirtyNodes = null;
+    this.requestRender();
+  }
+
+  /** 仅 hover 视觉变化：尽量脏矩形重绘，避免整画布 clear+paint。 */
+  _invalidateHover(nodes) {
+    const list = [];
+    const seen = new Set();
+    for (const node of nodes || []) {
+      if (!node || seen.has(node.id)) continue;
+      seen.add(node.id);
+      list.push(node);
+    }
+    this._dirty = true;
+    if (!this._rafId || this._hoverOnly) {
+      this._hoverOnly = true;
+      this._hoverDirtyNodes = list;
+    } else {
+      // 已有全量重绘在排队，不要降级成 hover-only。
+      this._hoverOnly = false;
+      this._hoverDirtyNodes = null;
+    }
     this.requestRender();
   }
 
@@ -97,6 +129,7 @@ export class CanvasDOM {
           this._velocityY = 0;
         }
         this._dirty = true;
+        this._hoverOnly = false;
         if (moved) this._emit('scroll', t);
       }
     }
@@ -109,6 +142,7 @@ export class CanvasDOM {
       }
       this._needsLayout = true;
       this._dirty = true;
+      this._hoverOnly = false;
     }
     // caret blink
     const now = performance.now();
@@ -116,17 +150,44 @@ export class CanvasDOM {
       this._caretOn = !this._caretOn;
       this._caretTimer = now;
       this._dirty = true;
+      this._hoverOnly = false;
     }
-    const busy = this.root && treeHasBusyStatus(this.root);
-    if (busy) {
-      this._spinPhase = (now / 800) % 1;
-      this._dirty = true;
+    // busy 转圈降到约 20fps；仅视口内 busy 才触发绘制，避免长会话空转全量重绘。
+    let keepBusyTick = false;
+    let visibleBusy = false;
+    if (this.root) {
+      const sy = this.root._scrollY || 0;
+      visibleBusy = treeHasBusyStatusVisible(this.root, sy - 80, sy + this.height + 80);
+      if (visibleBusy) {
+        this._hasBusy = true;
+        keepBusyTick = true;
+      } else {
+        const probe = Math.floor(now / 250);
+        if (probe !== this._busyProbeFrame) {
+          this._busyProbeFrame = probe;
+          this._hasBusy = treeHasBusyStatus(this.root);
+        }
+        keepBusyTick = this._hasBusy;
+      }
+    } else {
+      this._hasBusy = false;
+    }
+    if (visibleBusy) {
+      const frame = Math.floor(now / 50);
+      if (frame !== this._lastSpinFrame) {
+        this._lastSpinFrame = frame;
+        this._spinPhase = (now / 800) % 1;
+        this._dirty = true;
+        this._hoverOnly = false;
+      }
     }
     if (this._dirty) {
       this._render();
       this._dirty = false;
+      this._hoverOnly = false;
+      this._hoverDirtyNodes = null;
     }
-    if (this._velocityX || this._velocityY || this._focusedNode || this._streamingNodes.size > 0 || busy) {
+    if (this._velocityX || this._velocityY || this._focusedNode || this._streamingNodes.size > 0 || keepBusyTick) {
       this.requestRender();
     }
   };
@@ -137,9 +198,33 @@ export class CanvasDOM {
       layout(this.root, 0, 0, this.width, this.height);
       this._clampScrollTree(this.root);
       this._needsLayout = false;
+      this._hoverOnly = false;
     }
-    this.ctx.clearRect(0, 0, this.width, this.height);
-    paint(this.ctx, this.root, 0, 0, this.width, this.height, this);
+    // 有选区时不做脏矩形：选区是半透明叠加，局部重绘会叠加深色。
+    const hoverOnly = !this._selection
+      && this._hoverOnly && this._hoverDirtyNodes && this._hoverDirtyNodes.length;
+    if (hoverOnly) {
+      const pad = 3;
+      for (const node of this._hoverDirtyNodes) {
+        const b = nodeScreenBounds(node);
+        if (!b) continue;
+        const x = Math.max(0, Math.floor(b.x - pad));
+        const y = Math.max(0, Math.floor(b.y - pad));
+        const w = Math.min(this.width - x, Math.ceil(b.w + pad * 2));
+        const h = Math.min(this.height - y, Math.ceil(b.h + pad * 2));
+        if (w <= 0 || h <= 0) continue;
+        this.ctx.save();
+        this.ctx.beginPath();
+        this.ctx.rect(x, y, w, h);
+        this.ctx.clip();
+        this.ctx.clearRect(x, y, w, h);
+        paint(this.ctx, this.root, x, y, w, h, this);
+        this.ctx.restore();
+      }
+    } else {
+      this.ctx.clearRect(0, 0, this.width, this.height);
+      paint(this.ctx, this.root, 0, 0, this.width, this.height, this);
+    }
     // selection overlay (drawn after text so highlight sits on top)
     if (this._selection) {
       paintSelection(this.ctx, this.root, this._selection);
@@ -237,6 +322,7 @@ export class CanvasDOM {
     }
     const hit = this.root ? hitTest(this.root, x, y) : null;
     if (hit !== this._hoverNode) {
+      const prevTarget = hoverPaintTarget(this._hoverNode);
       if (this._hoverNode) this._hoverNode._hover = false;
       this._hoverNode = hit;
       if (hit) {
@@ -247,7 +333,13 @@ export class CanvasDOM {
       } else {
         this.canvas.style.cursor = 'default';
       }
-      this.invalidate(false);
+      const nextTarget = hoverPaintTarget(hit);
+      const title = findNodeTitle(hit);
+      if (this.canvas.title !== title) this.canvas.title = title;
+      if ((prevTarget?.key || null) !== (nextTarget?.key || null)) {
+        this._hoverPaintKey = nextTarget?.key || null;
+        this._invalidateHover([prevTarget?.dirty, nextTarget?.dirty]);
+      }
     } else if (hit) {
       // update cursor for text selection
       const isInteractive = hit.tag === 'button' || hit.tag === 'input' || (hit.tag === 'a' && hit.style.href);
@@ -355,9 +447,14 @@ export class CanvasDOM {
 
   _onMouseLeave = () => {
     if (this._hoverNode) {
+      const prevTarget = hoverPaintTarget(this._hoverNode);
       this._hoverNode._hover = false;
       this._hoverNode = null;
-      this.invalidate(false);
+      this._hoverPaintKey = null;
+      if (this.canvas.title) this.canvas.title = '';
+      if (prevTarget) this._invalidateHover([prevTarget.dirty]);
+    } else if (this.canvas.title) {
+      this.canvas.title = '';
     }
   };
 

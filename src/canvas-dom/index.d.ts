@@ -45,6 +45,8 @@ export class Node {
   _wrappedLines?: string[];
   _layoutStable?: boolean;
   _editHoverRoot?: boolean;
+  /** Native-like tooltip; CanvasDOM mirrors it onto canvas.title while hovered. */
+  title?: string;
   appendChild(child: Node): Node;
   removeChild(child: Node): Node;
   setStyle(patch: CanvasStyle): void;

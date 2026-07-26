@@ -47,14 +47,29 @@ function measureCtx() {
   return _measureCtx;
 }
 
+const _measureCache = new Map();
+const MEASURE_CACHE_MAX = 4096;
+
 export function measureText(text, fontSize, fontFamily, fontWeight, fontStyle) {
+  const str = String(text);
+  const fs = fontSize || 14;
+  const ff = fontFamily || 'sans-serif';
+  const fw = fontWeight || 'normal';
+  const fst = fontStyle || 'normal';
+  const key = fst + '|' + fw + '|' + fs + '|' + ff + '|' + str;
+  const cached = _measureCache.get(key);
+  if (cached != null) return cached;
   const ctx = measureCtx();
+  let width;
   if (!ctx) {
-    // fallback estimate
-    return String(text).length * (fontSize || 14) * 0.6;
+    width = str.length * fs * 0.6;
+  } else {
+    ctx.font = `${fst} ${fw} ${fs}px ${ff}`;
+    width = ctx.measureText(str).width;
   }
-  ctx.font = `${fontStyle || 'normal'} ${fontWeight || 'normal'} ${fontSize || 14}px ${fontFamily || 'sans-serif'}`;
-  return ctx.measureText(String(text)).width;
+  if (_measureCache.size >= MEASURE_CACHE_MAX) _measureCache.clear();
+  _measureCache.set(key, width);
+  return width;
 }
 
 // Layout a node within a content box (x, y, width, height available).
