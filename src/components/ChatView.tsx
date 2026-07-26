@@ -525,6 +525,7 @@ export function ChatView() {
     state.threads.find((t) => t.id === state.currentId),
   );
   const isFireThread = () => /^\[Fire\]/.test(currentMeta()?.title ?? "");
+  const showTimeMachine = () => timeStops().length > 0 && !isFireThread();
   const stageThreads = createMemo(() => {
     const current = currentMeta();
     if (!current) return [];
@@ -544,6 +545,7 @@ export function ChatView() {
     const chain = state.threads.filter((thread) => rootOf(thread).id === root.id);
     return chain.sort((a, b) => a.createdAt - b.createdAt);
   });
+  const showStageRail = () => stageThreads().length > 1;
   const stageName = (thread: (typeof state.threads)[number]) => {
     if (/\]\s*Wake/.test(thread.title)) return "Wake";
     if (/\]\s*Do/.test(thread.title)) return "Do";
@@ -713,6 +715,7 @@ export function ChatView() {
       height: nowY + 28,
     };
   });
+  const timeMachineWidth = () => Math.max(64, 38 + Math.min(5, timelineGraph().laneCount) * 26);
   const switchPreview = (items: Item[] | null, checkpointId: string | null) => {
     if (previewTimer) clearTimeout(previewTimer);
     setPreviewFading(true);
@@ -863,7 +866,7 @@ export function ChatView() {
   };
 
   return (
-    <main class="chat">
+    <main class="chat" style={`--time-width:${timeMachineWidth()}px`}>
       <header class="chat-head">
         <Show
           when={editing()}
@@ -1047,11 +1050,10 @@ export function ChatView() {
           <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
         </div>
       </div>
-      <Show when={timeStops().length > 0 && !isFireThread()}>
+      <Show when={showTimeMachine()}>
         <aside
           class="repo-time-machine"
           aria-label="会话与工作目录分支时间线"
-          style={`--time-width:${Math.max(64, 38 + Math.min(5, timelineGraph().laneCount) * 26)}px`}
         >
           <div class="repo-time-machine-label">
             <IconStopwatch size={17} />
@@ -1145,7 +1147,7 @@ export function ChatView() {
           </div>
         )}
       </Show>
-      <Show when={stageThreads().length > 1}>
+      <Show when={showStageRail()}>
         <aside class="stage-rail" aria-label="会话阶段导航">
           <div class="stage-rail-count">{stageThreads().length} 个事件</div>
           <For each={stageThreads()}>
@@ -1166,9 +1168,15 @@ export function ChatView() {
       </Show>
       </div>
 
-      <footer class="chat-foot">
+      <footer
+        class="chat-foot"
+        classList={{
+          "has-time-machine": showTimeMachine(),
+          "has-stage-rail": showStageRail(),
+        }}
+      >
         <Show when={state.plan && state.plan.length > 0}>
-          <div classList={{ "fire-plan-inline": isFireThread() && stageThreads().length > 1 }}>
+          <div classList={{ "fire-plan-inline": isFireThread() && showStageRail() }}>
             <PlanCard plan={state.plan!} />
           </div>
         </Show>
