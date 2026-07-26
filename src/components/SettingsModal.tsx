@@ -916,7 +916,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   onInput={(e) => setSessionAutoCleanupHours(Number(e.currentTarget.value))}
                 />
                 <span class="field-hint">
-                  仅清理普通会话；超时后先移入回收站，保留同样时长才彻底删除。
+                  仅清理普通会话；超时后先移入回收站，保留同样时长才彻底删除。周六、周日不计入保留时长，但仍会执行清理检查。
                 </span>
               </label>
             </section>

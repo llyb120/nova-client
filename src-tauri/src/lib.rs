@@ -336,16 +336,7 @@ fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
     session_cleanup_is_expired(updated_at, now, hours)
 }
 
-fn is_session_auto_cleanup_day(weekday: chrono::Weekday) -> bool {
-    !matches!(weekday, chrono::Weekday::Sat | chrono::Weekday::Sun)
-}
-
 fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
-    use chrono::Datelike;
-
-    if !is_session_auto_cleanup_day(chrono::Local::now().weekday()) {
-        return 0;
-    }
     let state = app.state::<AppState>();
     let hours = {
         let settings = state.settings.lock().unwrap();
@@ -453,8 +444,8 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
 #[cfg(test)]
 mod session_auto_cleanup_tests {
     use super::{
-        is_normal_thread_for_auto_cleanup, is_session_auto_cleanup_day, is_starrable_thread,
-        thread_is_expired, tree_contains_starred_thread, AgentKind, Thread,
+        is_normal_thread_for_auto_cleanup, is_starrable_thread, thread_is_expired,
+        tree_contains_starred_thread, AgentKind, Thread,
     };
     use std::collections::HashSet;
 
@@ -527,13 +518,6 @@ mod session_auto_cleanup_tests {
         let starred = HashSet::from(["child".to_string()]);
 
         assert!(tree_contains_starred_thread(&tree, &starred));
-    }
-
-    #[test]
-    fn session_auto_cleanup_skips_weekends() {
-        assert!(is_session_auto_cleanup_day(chrono::Weekday::Fri));
-        assert!(!is_session_auto_cleanup_day(chrono::Weekday::Sat));
-        assert!(!is_session_auto_cleanup_day(chrono::Weekday::Sun));
     }
 }
 
