@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,8 +10,12 @@ const {
   completePendingTools,
   compressSlimMemory,
   contextTokensFromUsage,
+  createCursorFilesystemTools,
   createMessageState,
   createSlimMemory,
+  cursorBatchToolPolicy,
+  cursorCavemanPolicy,
+  cursorPromptPrefix,
   cursorModelOptions,
   cursorShellProgram,
   cursorTodoPlan,
@@ -21,6 +25,7 @@ const {
   formatInterruptedTurn,
   formatSlimMemory,
   ingestCompactHistory,
+  isEditFilesTool,
   isNovaDenyTaskHook,
   isSlimMemoryEmpty,
   mapDelta,
@@ -28,6 +33,7 @@ const {
   mergeNovaTaskDenyHooks,
   messageWithRecoveryContext,
   messageWithSlimMemory,
+  messageWithToolPolicy,
   modelSelection,
   novaDenyTaskHookCommand,
   parseCliModels,
@@ -399,4 +405,94 @@ try {
   assert.deepEqual(again.config.hooks.preToolUse, written.hooks.preToolUse);
 } finally {
   await rm(cursorDir, { recursive: true, force: true });
+}
+
+assert.match(cursorBatchToolPolicy(), /read_files/);
+assert.match(cursorBatchToolPolicy(), /edit_files/);
+assert.match(cursorBatchToolPolicy(), /git grep/);
+assert.doesNotMatch(cursorBatchToolPolicy({ readOnly: true }), /edit_files/);
+assert.match(cursorBatchToolPolicy({ readOnly: true }), /plan\/read-only/);
+assert.match(cursorCavemanPolicy(), /回复默认简洁专业/);
+assert.match(cursorCavemanPolicy(), /先给结论/);
+assert.doesNotMatch(cursorCavemanPolicy(), /Respond terse like smart caveman/);
+assert.match(cursorPromptPrefix(), /read_files/);
+assert.match(cursorPromptPrefix(), /回复默认简洁专业/);
+assert.match(cursorPromptPrefix({ readOnly: true }), /plan\/read-only/);
+assert.doesNotMatch(cursorPromptPrefix({ readOnly: true }), /edit_files/);
+const policyMessage = messageWithToolPolicy("Add animation", { readOnly: false });
+assert.match(policyMessage, /read_files/);
+assert.match(policyMessage, /回复默认简洁专业/);
+assert.match(policyMessage, /Add animation$/);
+const slimWithPolicy = messageWithToolPolicy(messageWithSlimMemory("Continue", slim), { readOnly: false });
+assert.match(slimWithPolicy, /read_files/);
+assert.match(slimWithPolicy, /回复默认简洁专业/);
+assert.match(slimWithPolicy, /Changed the lighting/);
+assert.match(slimWithPolicy, /Current request:\nContinue$/);
+assert.equal(isEditFilesTool("edit_files"), true);
+assert.equal(isEditFilesTool("mcp__custom-user-tools__edit_files"), true);
+assert.equal(isEditFilesTool("read_files"), false);
+const editFilesState = createMessageState();
+const editFilesItem = mapMessage({
+  type: "tool_call",
+  call_id: "edit-batch",
+  name: "edit_files",
+  status: "running",
+  args: { files: [{ path: "a.ts", edits: [{ oldText: "a", newText: "b" }] }] },
+}, editFilesState)[0];
+assert.equal(editFilesItem.type, "file_change");
+assert.deepEqual(editFilesItem.changes, [{ path: "a.ts", kind: "update" }]);
+
+const batchCwd = await mkdtemp(join(tmpdir(), "nova-cursor-batch-"));
+try {
+  await Promise.all([
+    writeFile(join(batchCwd, "a.txt"), "A"),
+    writeFile(join(batchCwd, "b.txt"), "B"),
+  ]);
+  const agentTools = createCursorFilesystemTools(batchCwd);
+  assert.equal(typeof agentTools.read_files.execute, "function");
+  assert.equal(typeof agentTools.edit_files.execute, "function");
+  const readOnlyTools = createCursorFilesystemTools(batchCwd, { readOnly: true });
+  assert.equal(readOnlyTools.edit_files, undefined);
+  const read = JSON.parse(await agentTools.read_files.execute({ paths: ["a.txt", "b.txt"] }));
+  assert.deepEqual(read, [
+    { path: "a.txt", content: "A" },
+    { path: "b.txt", content: "B" },
+  ]);
+  await agentTools.edit_files.execute({
+    files: [
+      { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] },
+      { path: "b.txt", edits: [{ oldText: "B", newText: "BB" }] },
+    ],
+  });
+  assert.deepEqual(await Promise.all([
+    readFile(join(batchCwd, "a.txt"), "utf8"),
+    readFile(join(batchCwd, "b.txt"), "utf8"),
+  ]), ["AA", "BB"]);
+  await assert.rejects(() => agentTools.edit_files.execute({
+    files: [
+      { path: "a.txt", edits: [{ oldText: "AA", newText: "changed" }] },
+      { path: "b.txt", edits: [{ oldText: "missing", newText: "changed" }] },
+    ],
+  }), /Could not find/);
+  assert.deepEqual(await Promise.all([
+    readFile(join(batchCwd, "a.txt"), "utf8"),
+    readFile(join(batchCwd, "b.txt"), "utf8"),
+  ]), ["AA", "BB"]);
+
+  await writeFile(join(batchCwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
+  const first = JSON.parse(await agentTools.read_files.execute({ paths: ["large.txt"] }))[0];
+  assert.equal(first.content.split("\n").length, 200);
+  assert.equal(first.nextOffset, 201);
+  const parent = await mkdtemp(join(tmpdir(), "nova-cursor-paths-"));
+  const workspace = join(parent, "workspace");
+  await mkdir(workspace);
+  const outside = join(parent, "outside.txt");
+  await writeFile(outside, "outside");
+  const pathTools = createCursorFilesystemTools(workspace);
+  assert.deepEqual(JSON.parse(await pathTools.read_files.execute({ paths: [outside] })), [
+    { path: outside, content: "outside" },
+  ]);
+  await rm(parent, { recursive: true, force: true });
+} finally {
+  await rm(batchCwd, { recursive: true, force: true });
 }

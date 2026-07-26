@@ -7,6 +7,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { promisify } from "node:util";
+import { createCursorFilesystemTools, cursorPromptPrefix } from "./cursor-filesystem-tools.mjs";
 
 const WINDOWS_SHELL_SHIMS = {
   "bash.exe": "NOVA_SHELL_SHIM_BASH",
@@ -272,6 +273,17 @@ function messageWithSlimMemory(message, memory) {
   return withMessageText(message, `${prefix}\n${messageText(message)}`);
 }
 
+/**
+ * Attach Vega-style batch FS / search policy + concise reply style on every user turn.
+ * Cursor has no durable systemPrompt, and Nova creates a fresh Agent per prompt,
+ * so this cannot be "first message only".
+ */
+function messageWithToolPolicy(message, options = {}) {
+  const prefix = cursorPromptPrefix(options);
+  if (!prefix) return message;
+  return withMessageText(message, `${prefix}\n\n${messageText(message)}`);
+}
+
 function messageWithRecoveryContext(message, history) {
   if (!history) return message;
   const prefix = [
@@ -504,7 +516,10 @@ async function recoverTimedOutAgent(
   const options = {
     apiKey: process.env.CURSOR_API_KEY,
     model: modelSelection(request.model),
-    local: { cwd: request.cwd },
+    local: {
+      cwd: request.cwd,
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+    },
   };
   // Slim-memory mode prefers a fresh agent so poisoned checkpoints are never resumed.
   if (createFresh) {
@@ -579,7 +594,10 @@ async function sendPromptWithRecovery(
   const resumedAgent = await sdk.resume(agentId, {
     apiKey: process.env.CURSOR_API_KEY,
     model: modelSelection(request.model),
-    local: { cwd: request.cwd },
+    local: {
+      cwd: request.cwd,
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+    },
   });
   emitTiming("agent_resume", resumeStartedAt);
   const finalSendStartedAt = performance.now();
@@ -616,19 +634,32 @@ function appendText(state, runId, type, text) {
   return { id, type: type === "assistant" ? "agent_message" : "reasoning", text: combined };
 }
 
+function isEditFilesTool(name) {
+  const tool = String(name ?? "");
+  return tool === "edit_files" || tool.endsWith("__edit_files") || tool.endsWith("/edit_files");
+}
+
 function mapTool(state, callId, name, status, args, result) {
   const previous = state.tools.get(callId);
   if (previous && previous.status !== "in_progress" && status === "running") return null;
   if (!previous) state.activeTextType = null;
+  const tool = name ?? previous?.tool;
+  const arguments_ = args ?? previous?.arguments;
   const item = {
     id: callId,
-    type: "mcp_tool_call",
+    type: isEditFilesTool(tool) ? "file_change" : "mcp_tool_call",
     server: "Cursor",
-    tool: name ?? previous?.tool,
-    arguments: args ?? previous?.arguments,
+    tool,
+    arguments: arguments_,
     result: result ?? previous?.result,
     status: status === "error" ? "failed" : status === "running" ? "in_progress" : "completed",
   };
+  if (item.type === "file_change") {
+    const files = Array.isArray(arguments_?.files) ? arguments_.files : [];
+    item.changes = files
+      .map((file) => ({ path: typeof file?.path === "string" ? file.path : "", kind: "update" }))
+      .filter((change) => change.path);
+  }
   state.tools.set(callId, item);
   let trace = state.trace.find((entry) => entry.id === callId);
   if (!trace) {
@@ -921,15 +952,21 @@ async function main() {
         }
       }
 
+      const readOnly = request.mode === "plan";
       const options = {
         apiKey: process.env.CURSOR_API_KEY,
         model: modelSelection(request.model),
-        local: { cwd: request.cwd },
+        local: {
+          cwd: request.cwd,
+          // Vega-style batch FS tools; inlined via SDK (unlike hooks, which are file-only).
+          customTools: createCursorFilesystemTools(request.cwd, { readOnly }),
+        },
       };
       agent = await Agent.create(options);
       send({ type: "ready", sessionId: sessionKey });
       const originalMessage = await promptMessage(request.parts);
-      let message = messageWithSlimMemory(originalMessage, memory);
+      // Tool policy must ride every prompt: fresh Agent per turn + no systemPrompt field.
+      let message = messageWithToolPolicy(messageWithSlimMemory(originalMessage, memory), { readOnly });
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
         const state = createMessageState();
@@ -1052,7 +1089,7 @@ async function main() {
             true,
           );
           agent = recovery.agent;
-          message = messageWithSlimMemory(originalMessage, memory);
+          message = messageWithToolPolicy(messageWithSlimMemory(originalMessage, memory), { readOnly });
           // Keep the stable slim-memory session key; do not promote ephemeral agent ids.
           send({ type: "ready", sessionId: sessionKey });
           activeRun = undefined;
@@ -1097,6 +1134,7 @@ export {
   formatInterruptedTurn,
   formatSlimMemory,
   ingestCompactHistory,
+  isEditFilesTool,
   isNovaDenyTaskHook,
   isSlimMemoryEmpty,
   mapDelta,
@@ -1104,6 +1142,7 @@ export {
   mergeNovaTaskDenyHooks,
   messageWithRecoveryContext,
   messageWithSlimMemory,
+  messageWithToolPolicy,
   modelSelection,
   novaDenyTaskHookCommand,
   parseCliModels,
@@ -1117,3 +1156,10 @@ export {
   threadMemoryKey,
   withTimeout,
 };
+
+export {
+  createCursorFilesystemTools,
+  cursorBatchToolPolicy,
+  cursorCavemanPolicy,
+  cursorPromptPrefix,
+} from "./cursor-filesystem-tools.mjs";
