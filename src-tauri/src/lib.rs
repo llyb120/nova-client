@@ -1649,11 +1649,6 @@ async fn create_thread(
         state.relay.publish_folders();
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
-#[tauri::command]
-fn directory_exists(path: String) -> bool {
-    Path::new(path.trim()).is_dir()
-}
-
     Ok(thread)
 }
 
@@ -1668,6 +1663,11 @@ fn scratch_dir() -> Result<String, String> {
     let dir = std::env::temp_dir().join(SCRATCH_MARK).join(name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
     Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn directory_exists(path: String) -> bool {
+    Path::new(path.trim()).is_dir()
 }
 
 /// 判断目录是否 git 仓库：前端据此决定「在 worktree 中执行」开关是否可用。
@@ -2619,22 +2619,6 @@ fn restore_time_machine_checkpoint(
     thread_id: String,
     checkpoint_id: String,
 ) -> Result<time_machine::RestoreResult, String> {
-        restore_files,
-    )?;
-    {
-        let mut store = state.store.lock().unwrap();
-        if current.is_roaming_guest() {
-            let existing = store.get_mut(&current.id).ok_or("漫游会话不存在")?;
-            *existing = thread;
-        } else {
-            store.threads.push(thread);
-        }
-        store.save();
-    }
-    let _ = app.emit(acp::EV_THREADS, json!({}));
-    Ok(result)
-}
-
     let _guard = state.time_machine_lock.lock().unwrap();
     let current = {
         let store = state.store.lock().unwrap();
@@ -2651,6 +2635,22 @@ fn restore_time_machine_checkpoint(
         &state.config_dir,
         &checkpoint_id,
         &current,
+        restore_files,
+    )?;
+    {
+        let mut store = state.store.lock().unwrap();
+        if current.is_roaming_guest() {
+            let existing = store.get_mut(&current.id).ok_or("漫游会话不存在")?;
+            *existing = thread;
+        } else {
+            store.threads.push(thread);
+        }
+        store.save();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    Ok(result)
+}
+
 #[tauri::command]
 fn delete_time_machine_context(
     app: tauri::AppHandle,
@@ -5603,7 +5603,6 @@ pub fn run() {
             report_activity,
             show_main_window,
             take_restore_thread,
-            delete_time_machine_context,
             signature_pending,
             create_thread,
             delete_thread,
@@ -5620,6 +5619,7 @@ pub fn run() {
             get_time_machine_timeline,
             get_time_machine_checkpoint_preview,
             restore_time_machine_checkpoint,
+            delete_time_machine_context,
             rename_thread,
             notify_fire_done,
             set_thread_model,
@@ -5652,7 +5652,6 @@ pub fn run() {
             refresh_relay_peers,
             list_achievements,
             get_relay_inbox,
-            directory_exists,
             share_thread,
             advanced_share,
             summarize_clue,
@@ -5669,6 +5668,7 @@ pub fn run() {
             recall_roaming_thread,
             request_peer_models,
             respond_roam_request,
+            directory_exists,
             is_git_repo,
             list_branches,
             request_peer_branches,
