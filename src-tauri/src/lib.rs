@@ -3621,6 +3621,11 @@ fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
+fn refresh_environment_variables() -> Result<usize, String> {
+    path_env::refresh_process_environment()
+}
+
+#[tauri::command]
 fn get_global_agent_instructions(
     state: State<'_, AppState>,
 ) -> agent_config::GlobalAgentInstructions {
@@ -5554,6 +5559,7 @@ pub fn run() {
             respond_permission,
             get_settings,
             set_settings,
+            refresh_environment_variables,
             get_global_agent_instructions,
             set_global_agent_instructions,
             get_backend_availability,

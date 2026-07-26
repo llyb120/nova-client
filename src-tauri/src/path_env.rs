@@ -20,6 +20,20 @@ pub fn init_process_path() {
     init_macos_process_path();
 }
 
+/// Refresh the current process environment from the Windows system and current-user registry.
+/// Values from the user key override system values; `Path` keeps both scopes, matching Windows'
+/// environment-block behavior. Existing process-only variables are left untouched.
+pub fn refresh_process_environment() -> Result<usize, String> {
+    #[cfg(windows)]
+    {
+        refresh_windows_process_environment()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("刷新环境变量仅支持 Windows".into())
+    }
+}
+
 #[cfg(any(windows, target_os = "macos", test))]
 fn merge_paths<'a>(groups: impl IntoIterator<Item = &'a OsStr>) -> Option<OsString> {
     let mut seen = HashSet::<PathBuf>::new();
@@ -58,6 +72,152 @@ fn init_windows_process_path() {
 fn fallback_windows_path(home: Option<PathBuf>) -> Option<OsString> {
     let home = home?;
     std::env::join_paths([home.join(".local/bin"), home.join(".opencode/bin")]).ok()
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct RegistryEnvironmentValue {
+    name: String,
+    value: String,
+    expandable: bool,
+}
+
+#[cfg(windows)]
+fn refresh_windows_process_environment() -> Result<usize, String> {
+    use std::collections::HashMap;
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    const SYSTEM_ENVIRONMENT: &str =
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    const USER_ENVIRONMENT: &str = r"Environment";
+
+    let system = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(SYSTEM_ENVIRONMENT)
+        .map_err(|error| format!("读取系统环境变量注册表失败：{error}"))?;
+    let user = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(USER_ENVIRONMENT)
+        .map_err(|error| format!("读取用户环境变量注册表失败：{error}"))?;
+
+    let system_values = read_registry_environment(&system, "系统")?;
+    let user_values = read_registry_environment(&user, "用户")?;
+    let mut values = HashMap::<String, RegistryEnvironmentValue>::new();
+    for value in system_values {
+        values.insert(value.name.to_uppercase(), value);
+    }
+    for value in user_values {
+        let key = value.name.to_uppercase();
+        if key == "PATH" {
+            if let Some(system_path) = values.get_mut(&key) {
+                if !system_path.value.is_empty() && !value.value.is_empty() {
+                    system_path.value.push(';');
+                }
+                system_path.value.push_str(&value.value);
+                system_path.expandable |= value.expandable;
+                continue;
+            }
+        }
+        values.insert(key, value);
+    }
+
+    // Registry expandable strings commonly refer to process-only values such as SystemRoot and
+    // USERPROFILE. Seed expansion with the current block, then overlay the fresh registry values.
+    let mut expansion_environment: HashMap<String, String> = std::env::vars()
+        .map(|(name, value)| (name.to_uppercase(), value))
+        .collect();
+    for (key, value) in &values {
+        expansion_environment.insert(key.clone(), value.value.clone());
+    }
+
+    let mut expanded_values = Vec::with_capacity(values.len());
+    for (key, value) in values {
+        let expanded = if value.expandable {
+            expand_windows_environment_value(&value.value, &expansion_environment)
+        } else {
+            value.value
+        };
+        expansion_environment.insert(key, expanded.clone());
+        expanded_values.push((value.name, expanded));
+    }
+
+    for (name, value) in &expanded_values {
+        std::env::set_var(name, value);
+    }
+
+    // Preserve Nova's native CLI fallback directories when replacing the inherited Path.
+    if let (Some(registry_path), Some(fallback)) = (
+        std::env::var_os("PATH"),
+        fallback_windows_path(std::env::var_os("USERPROFILE").map(PathBuf::from)),
+    ) {
+        if let Some(path) = merge_paths([registry_path.as_os_str(), fallback.as_os_str()]) {
+            std::env::set_var("PATH", path);
+        }
+    }
+
+    Ok(expanded_values.len())
+}
+
+#[cfg(windows)]
+fn read_registry_environment(
+    key: &winreg::RegKey,
+    scope: &str,
+) -> Result<Vec<RegistryEnvironmentValue>, String> {
+    use winreg::enums::{REG_EXPAND_SZ, REG_SZ};
+    use winreg::types::FromRegValue;
+
+    let mut values = Vec::new();
+    for entry in key.enum_values() {
+        let (name, raw) = entry.map_err(|error| format!("枚举{scope}环境变量失败：{error}"))?;
+        if raw.vtype != REG_SZ && raw.vtype != REG_EXPAND_SZ {
+            continue;
+        }
+        let value = String::from_reg_value(&raw)
+            .map_err(|error| format!("读取{scope}环境变量 {name} 失败：{error}"))?;
+        values.push(RegistryEnvironmentValue {
+            name,
+            value,
+            expandable: raw.vtype == REG_EXPAND_SZ,
+        });
+    }
+    Ok(values)
+}
+
+#[cfg(windows)]
+fn expand_windows_environment_value(
+    value: &str,
+    environment: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut result = value.to_string();
+    for _ in 0..8 {
+        let mut output = String::with_capacity(result.len());
+        let mut rest = result.as_str();
+        let mut changed = false;
+        while let Some(begin) = rest.find('%') {
+            output.push_str(&rest[..begin]);
+            let after_begin = &rest[begin + 1..];
+            let Some(end) = after_begin.find('%') else {
+                output.push_str(&rest[begin..]);
+                rest = "";
+                break;
+            };
+            let name = &after_begin[..end];
+            if let Some(replacement) = environment.get(&name.to_uppercase()) {
+                output.push_str(replacement);
+                changed = true;
+            } else {
+                output.push('%');
+                output.push_str(name);
+                output.push('%');
+            }
+            rest = &after_begin[end + 1..];
+        }
+        output.push_str(rest);
+        if !changed || output == result {
+            return output;
+        }
+        result = output;
+    }
+    result
 }
 
 #[cfg(any(target_os = "macos", test))]

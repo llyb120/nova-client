@@ -198,6 +198,7 @@ export const api = {
     invoke<void>("respond_permission", { requestKey, optionId }),
   getSettings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
+  refreshEnvironmentVariables: () => invoke<number>("refresh_environment_variables"),
   getGlobalAgentInstructions: () =>
     invoke<GlobalAgentInstructions>("get_global_agent_instructions"),
   setGlobalAgentInstructions: (content: string, enabledAgentKinds: AgentKind[]) =>

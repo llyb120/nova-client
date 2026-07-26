@@ -218,6 +218,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [saving, setSaving] = createSignal(false);
   const [restarting, setRestarting] = createSignal(false);
   const [restartMsg, setRestartMsg] = createSignal("");
+  const [environmentRefreshing, setEnvironmentRefreshing] = createSignal(false);
+  const [environmentRefreshMsg, setEnvironmentRefreshMsg] = createSignal("");
+  const [environmentRefreshFailed, setEnvironmentRefreshFailed] = createSignal(false);
   const [cliStatuses, setCliStatuses] = createSignal<Partial<Record<AgentKind, CliStatus>>>({});
   const [cliLoading, setCliLoading] = createSignal(false);
   const [upgradingCli, setUpgradingCli] = createSignal<AgentKind | null>(null);
@@ -244,6 +247,21 @@ export function SettingsModal(props: { onClose: () => void }) {
       setRestartMsg(`重启失败：${String(e)}`);
     } finally {
       setRestarting(false);
+    }
+  };
+
+  const refreshEnvironmentVariables = async () => {
+    setEnvironmentRefreshing(true);
+    setEnvironmentRefreshMsg("");
+    setEnvironmentRefreshFailed(false);
+    try {
+      const count = await api.refreshEnvironmentVariables();
+      setEnvironmentRefreshMsg(`已刷新 ${count} 个环境变量`);
+    } catch (e) {
+      setEnvironmentRefreshFailed(true);
+      setEnvironmentRefreshMsg(`刷新失败：${String(e)}`);
+    } finally {
+      setEnvironmentRefreshing(false);
     }
   };
 
@@ -951,6 +969,31 @@ export function SettingsModal(props: { onClose: () => void }) {
                 />
                 <span class="field-hint">
                   高级分享「按提示词处理/总结会话」时的默认后端与模型。分享时仍可临时改选。
+                </span>
+              </div>
+            </section>
+
+            <section class="settings-group">
+              <h3 class="settings-group-title">环境变量</h3>
+              <div class="field">
+                <span class="field-label">刷新 Windows 环境变量</span>
+                <button
+                  type="button"
+                  class="btn secondary"
+                  style={{ "align-self": "flex-start" }}
+                  disabled={environmentRefreshing()}
+                  onClick={() => void refreshEnvironmentVariables()}
+                >
+                  {environmentRefreshing() ? "刷新中…" : "刷新环境变量"}
+                </button>
+                <Show when={environmentRefreshMsg()}>
+                  <span class={`relay-verify ${environmentRefreshFailed() ? "bad" : "ok"}`}>
+                    {environmentRefreshMsg()}
+                  </span>
+                </Show>
+                <span class="field-hint">
+                  从 Windows 注册表重新读取系统和当前用户环境变量，并覆盖 Nova
+                  启动时继承的同名变量。之后新启动的 agent 进程会使用新值。
                 </span>
               </div>
             </section>
