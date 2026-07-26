@@ -1,7 +1,7 @@
 use crate::threads::{now_ms, Item, Thread};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -78,7 +78,7 @@ fn store_version() -> u32 {
     STORE_VERSION
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptSummary {
     pub id: u64,
@@ -554,6 +554,113 @@ pub fn checkpoint_preview(
         .ok_or_else(|| "时间点不存在".into())
 }
 
+fn prompt_signature(item: &Item) -> Option<PromptSummary> {
+    match item {
+        Item::User { id, text, .. } => Some(PromptSummary {
+            id: *id,
+            text: text.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// 删除指定用户提示词所属的完整轮次：从该 user item 起，直到下一条 user item 之前。
+/// 使用 id + text 双重匹配，避免历史分叉复用 item id 时误删另一条已编辑分支。
+pub fn remove_prompt_turns(thread: &mut Thread, prompts: &[PromptSummary]) -> usize {
+    let targets: HashSet<PromptSummary> = prompts.iter().cloned().collect();
+    if targets.is_empty() {
+        return 0;
+    }
+    let mut removed_prompts = 0;
+    let mut drop_turn = false;
+    thread.items.retain(|item| {
+        if let Some(prompt) = prompt_signature(item) {
+            drop_turn = targets.contains(&prompt);
+            if drop_turn {
+                removed_prompts += 1;
+            }
+        }
+        !drop_turn
+    });
+    if removed_prompts > 0 {
+        thread.plan = None;
+        thread.updated_at = now_ms();
+    }
+    removed_prompts
+}
+
+fn checkpoint_prompt_path(checkpoint: &Checkpoint) -> Vec<PromptSummary> {
+    checkpoint
+        .thread_snapshot
+        .items
+        .iter()
+        .filter_map(prompt_signature)
+        .collect()
+}
+
+/// 上下文被手动编辑后，同步改写所有包含目标节点的快照，并按新的提示词前缀关系
+/// 重建 checkpoint 父子关系。这样右侧世界线不会把已删除节点作为幽灵旁支继续展示。
+pub fn rewrite_after_context_edit(
+    data_dir: &Path,
+    thread: &Thread,
+    prompts: &[PromptSummary],
+) -> Result<TimelineView, String> {
+    let mut store = load_store(data_dir)?;
+    let index = match timeline_index(&store, &thread.id) {
+        Some(index) => index,
+        None => {
+            store.timelines.push(Timeline {
+                id: uuid::Uuid::new_v4().to_string(),
+                root_thread_id: thread.id.clone(),
+                thread_ids: vec![thread.id.clone()],
+                thread_heads: HashMap::new(),
+                current_checkpoint_id: None,
+                checkpoints: Vec::new(),
+            });
+            store.timelines.len() - 1
+        }
+    };
+    let timeline = &mut store.timelines[index];
+    for checkpoint in &mut timeline.checkpoints {
+        if remove_prompt_turns(&mut checkpoint.thread_snapshot, prompts) > 0 {
+            checkpoint.thread_snapshot.acp_session_id = None;
+            checkpoint.thread_snapshot.provider_checkpoints.clear();
+            checkpoint.thread_snapshot.pending_native_restore = None;
+            checkpoint.thread_snapshot.codex_usage_snapshot = None;
+            checkpoint.thread_snapshot.handoff_from =
+                Some(checkpoint.thread_snapshot.agent_kind.clone());
+            checkpoint.title = latest_prompt_title(&checkpoint.thread_snapshot);
+        }
+    }
+
+    append_checkpoint(data_dir, timeline, thread, true)?;
+
+    // 删除中间节点后，旧 parentId 可能指向不再是前缀的路径。按当前快照内容重新组装树。
+    let paths: Vec<Vec<PromptSummary>> = timeline
+        .checkpoints
+        .iter()
+        .map(checkpoint_prompt_path)
+        .collect();
+    for child_index in 0..timeline.checkpoints.len() {
+        let child = &paths[child_index];
+        let mut parent: Option<(usize, usize)> = None;
+        for candidate_index in 0..child_index {
+            let candidate = &paths[candidate_index];
+            if candidate.len() <= child.len()
+                && child.starts_with(candidate)
+                && parent.map_or(true, |(_, len)| candidate.len() >= len)
+            {
+                parent = Some((candidate_index, candidate.len()));
+            }
+        }
+        let parent_id =
+            parent.map(|(parent_index, _)| timeline.checkpoints[parent_index].id.clone());
+        timeline.checkpoints[child_index].parent_id = parent_id;
+    }
+    save_store(data_dir, &store)?;
+    Ok(view_for(&store.timelines[index], &thread.id))
+}
+
 /// 编辑历史消息前同时保存“共同历史”和“原会话”两个节点，再把当前会话的头指回
 /// 共同历史。编辑后的会话因此从共同历史继续，原来的后续则成为一条可恢复的旁支。
 pub fn record_edit_fork(
@@ -828,6 +935,41 @@ mod tests {
         assert!(safe_relative("../secret").is_err());
         assert!(safe_relative("/tmp/secret").is_err());
         assert!(safe_relative("src/main.rs").is_ok());
+    }
+
+    #[test]
+    fn removes_complete_prompt_turns_and_keeps_neighboring_context() {
+        let mut thread = Thread::new(
+            ".".into(),
+            crate::threads::AgentKind::Alkaid,
+            None,
+            None,
+            None,
+            false,
+        );
+        let first = thread.push_user("first".into(), Vec::new());
+        thread.push_system("first result".into(), "info");
+        let second = thread.push_user("second".into(), Vec::new());
+        thread.push_system("second result".into(), "info");
+        thread.push_user("third".into(), Vec::new());
+
+        let removed = remove_prompt_turns(
+            &mut thread,
+            &[PromptSummary {
+                id: second.id(),
+                text: "second".into(),
+            }],
+        );
+
+        assert_eq!(removed, 1);
+        let prompts: Vec<_> = thread.items.iter().filter_map(prompt_signature).collect();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].id, first.id());
+        assert_eq!(prompts[0].text, "first");
+        assert_eq!(prompts[1].text, "third");
+        assert!(!thread.items.iter().any(|item| {
+            matches!(item, Item::System { text, .. } if text == "second result")
+        }));
     }
 
     #[test]

@@ -1172,6 +1172,46 @@ button {
 .repo-time-node.restoring .repo-time-dot {
   animation: time-now-pulse .8s ease-in-out infinite;
 }
+.repo-time-context-backdrop {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+}
+.repo-time-context-menu {
+  position: fixed;
+  display: flex;
+  flex-direction: column;
+  min-width: 168px;
+  max-width: min(220px, calc(100vw - 16px));
+  padding: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--bg-elevated);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .28);
+}
+.repo-time-context-menu button {
+  padding: 7px 9px;
+  border-radius: 6px;
+  color: var(--text);
+  text-align: left;
+  font-size: 12px;
+}
+.repo-time-context-menu button:hover:not(:disabled) {
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+.repo-time-context-menu button:disabled {
+  color: var(--text-faint);
+  opacity: .45;
+}
+.repo-time-context-hint {
+  margin-top: 4px;
+  padding: 6px 8px 3px;
+  border-top: 1px solid var(--border-light);
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.35;
+}
 .repo-time-now {
   display: flex;
   align-items: center;

@@ -30,7 +30,7 @@ import {
   assertBuiltinPrompt,
 } from "../store";
 import type { AgentKind, Peer } from "../types";
-import { agentLabel } from "../utils";
+import { agentLabel, isScratch } from "../utils";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconClue, IconFolder, IconLogo, IconSend, IconUsers, IconX } from "./icons";
@@ -42,6 +42,7 @@ import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 import { TypewriterText } from "./TypewriterText";
 
 const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
+const LAST_NEW_THREAD_PROJECT_KEY = "fd:lastNewThreadProject";
 
 /** codex 风格草稿首页：输入任务 + 选择项目/模型/模式，回车即开干 */
 export function HomeView() {
@@ -400,6 +401,8 @@ export function HomeView() {
   const selectProject = (p: string, warm = false) => {
     setRoam(null); // 选了本地项目就退出漫游
     setCwd(p);
+    if (isScratch(p)) localStorage.removeItem(LAST_NEW_THREAD_PROJECT_KEY);
+    else localStorage.setItem(LAST_NEW_THREAD_PROJECT_KEY, p);
     if (warm) prewarmCurrent({ cwd: p });
   };
 
@@ -413,15 +416,27 @@ export function HomeView() {
     });
   };
 
-  onMount(ensureScratchProject);
+  const restoreLastProject = async () => {
+    const remembered = localStorage.getItem(LAST_NEW_THREAD_PROJECT_KEY)?.trim();
+    if (remembered) {
+      try {
+        if (await api.directoryExists(remembered)) {
+          selectProject(remembered);
+          return;
+        }
+      } catch {
+        // 目录校验不可用时按“不存在”处理，避免新会话卡在无效路径。
+      }
+      localStorage.removeItem(LAST_NEW_THREAD_PROJECT_KEY);
+    }
+    ensureScratchProject();
+  };
+
+  onMount(() => void restoreLastProject());
   // 每次进入新会话页都强制校准在线队友的共享模型，避免沿用旧 peerModels 缓存。
   onMount(() => preloadPeerModels(true));
   onCleanup(() => {
     if (!submittingPrompt) rememberPromptDraft(text(), attach.images());
-  });
-
-  createEffect(() => {
-    if (state.currentId === null) ensureScratchProject();
   });
 
   const onInput = (e: InputEvent) => {

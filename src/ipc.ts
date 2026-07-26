@@ -35,6 +35,7 @@ import type {
   Status,
   Thread,
   ThreadMeta,
+  TimeMachinePrompt,
   TimeMachineRestoreResult,
   TimeMachineTimeline,
   UpdateInfo,
@@ -58,11 +59,14 @@ export const api = {
     invoke<Thread>("get_time_machine_checkpoint_preview", { threadId, checkpointId }),
   restoreTimeMachineCheckpoint: (threadId: string, checkpointId: string) =>
     invoke<TimeMachineRestoreResult>("restore_time_machine_checkpoint", { threadId, checkpointId }),
+  deleteTimeMachineContext: (threadId: string, prompts: TimeMachinePrompt[]) =>
+    invoke<TimeMachineRestoreResult>("delete_time_machine_context", { threadId, prompts }),
   listProjects: () => invoke<ProjectEntry[]>("list_projects"),
   removeProject: (cwd: string) => invoke<void>("remove_project", { cwd }),
   prewarm: (cwd: string, agentKind: AgentKind, model?: string | null, mode?: string | null) =>
     invoke<void>("prewarm", { cwd, agentKind, model, mode }),
   scratchDir: () => invoke<string>("scratch_dir"),
+  directoryExists: (path: string) => invoke<boolean>("directory_exists", { path }),
   getQuota: () => invoke<Quota>("get_quota"),
   getModelCosts: () => invoke<Record<string, ModelCost>>("get_model_costs"),
   checkUpdate: () => invoke<UpdateInfo>("check_update"),
