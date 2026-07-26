@@ -2599,9 +2599,6 @@ fn create_time_machine_checkpoint(
         if is_running(&state, thread) {
             return Err("请等待当前会话执行结束后再创建时间点".into());
         }
-        if thread.is_roaming_guest() || thread.roaming_role.is_some() || thread.worktree.is_some() {
-            return Err("世界线目前只支持当前分支上的本地普通会话".into());
-        }
         thread.clone()
     };
     time_machine::create_checkpoint(&state.config_dir, &thread)
@@ -2640,12 +2637,11 @@ fn restore_time_machine_checkpoint(
         if is_running(&state, thread) {
             return Err("请等待当前会话执行结束后再跳转".into());
         }
-        if thread.is_roaming_guest() || thread.roaming_role.is_some() || thread.worktree.is_some() {
-            return Err("世界线目前只支持当前分支上的本地普通会话".into());
-        }
         thread.clone()
     };
-    let restore_files = state.settings.lock().unwrap().checkpoint_enabled;
+    // 漫游 guest 的工作目录在对端；本机只恢复会话镜像，文件时间点由 host 管理。
+    let restore_files =
+        state.settings.lock().unwrap().checkpoint_enabled && !current.is_roaming_guest();
     let (thread, result) = time_machine::restore_checkpoint(
         &state.config_dir,
         &checkpoint_id,
@@ -2654,7 +2650,12 @@ fn restore_time_machine_checkpoint(
     )?;
     {
         let mut store = state.store.lock().unwrap();
-        store.threads.push(thread);
+        if current.is_roaming_guest() {
+            let existing = store.get_mut(&current.id).ok_or("漫游会话不存在")?;
+            *existing = thread;
+        } else {
+            store.threads.push(thread);
+        }
         store.save();
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
@@ -3211,7 +3212,7 @@ fn truncate_thread(
     }
     // 与手动恢复保持相同的锁顺序，保证编辑分叉和恢复不会交叉写时间线或项目文件。
     let _time_machine_guard = state.time_machine_lock.lock().unwrap();
-    let (agent_kind, cwd, old_session_id, retained_turns, checkpoint, is_quota) = {
+    let (agent_kind, cwd, old_session_id, retained_turns, checkpoint, is_quota, is_guest) = {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
         let idx = thread
@@ -3219,13 +3220,10 @@ fn truncate_thread(
             .iter()
             .position(|i| i.id() == item_id && matches!(i, Item::User { .. }))
             .ok_or("该消息不存在或不是用户消息")?;
-        if !thread.title.starts_with("[Fire]")
-            && !thread.is_roaming_guest()
-            && thread.roaming_role.is_none()
-            && thread.worktree.is_none()
-        {
+        if !thread.title.starts_with("[Fire]") {
             time_machine::record_edit_fork(&state.config_dir, thread, item_id)?;
         }
+        let is_guest = thread.is_roaming_guest();
         let checkpoint = thread.checkpoint_before(item_id);
         let old_session_id = thread.acp_session_id.clone();
         thread.items.truncate(idx);
@@ -3277,10 +3275,16 @@ fn truncate_thread(
             retained_turns,
             checkpoint,
             thread.is_quota_borrowed(),
+            is_guest,
         );
         store.save();
         result
     };
+    // guest 的真实 agent 会话在 host。释放本地 store 锁后再查路由，避免重入锁；
+    // 顺序队列保证 truncate 消息先于稍后自动发送的 prompt 到达。
+    if is_guest {
+        state.relay.guest_truncate(&thread_id, item_id)?;
+    }
     state.acp.forget_session_of_thread(&thread_id);
     state.codex.forget_session_of_thread(&thread_id);
     state.codexplus.forget_session_of_thread(&thread_id);

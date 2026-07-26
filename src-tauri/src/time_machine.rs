@@ -9,6 +9,8 @@ use std::process::Command;
 const STORE_VERSION: u32 = 1;
 /// 非 Git 目录使用固定基准；这类时间点保存的是目录内所有普通文件的完整快照。
 const DIRECTORY_BASE: &str = "nova-directory-v1";
+/// 漫游 guest 的工作目录位于对端，本机世界线只保存会话快照；文件快照由 host 侧记录。
+const REMOTE_BASE: &str = "nova-remote-v1";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -465,13 +467,24 @@ fn append_checkpoint(
     thread: &Thread,
     automatic: bool,
 ) -> Result<String, String> {
-    let (root, head) = repository_identity(Path::new(&thread.cwd))?;
+    // 漫游 guest 只有对端路径和会话镜像，不能在本机读取工作区。host 会为真实工作目录
+    // 保存自己的文件快照；guest 时间线仍完整保存对话分支，并在恢复时保持远端路由。
+    let remote = thread.is_roaming_guest();
+    let (root, head) = if remote {
+        (PathBuf::from(&thread.cwd), REMOTE_BASE.to_string())
+    } else {
+        repository_identity(Path::new(&thread.cwd))?
+    };
     if let Some(first) = timeline.checkpoints.first() {
         if first.repo_root != root.to_string_lossy() || first.base_head != head {
             return Err("仓库目录或 HEAD 已变化，不能继续写入原世界线时间线".into());
         }
     }
-    let entries = capture_manifest(data_dir, &root, &head)?;
+    let entries = if remote {
+        Vec::new()
+    } else {
+        capture_manifest(data_dir, &root, &head)?
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let parent_id = timeline
         .thread_heads
@@ -767,12 +780,18 @@ pub fn restore_checkpoint(
     }
 
     let target = store.timelines[timeline_index].checkpoints[checkpoint_index].clone();
-    if restore_files {
+    if restore_files && target.base_head != REMOTE_BASE {
         restore_manifest(data_dir, &target)?;
     }
 
     let mut thread = target.thread_snapshot.clone();
-    thread.id = uuid::Uuid::new_v4().to_string();
+    // guest 的 host 路由绑定现有 guest thread id；恢复时原位替换镜像，不能生成一个
+    // 收不到 host 增量的新 id。普通本地/host/worktree 会话仍创建独立会话分支。
+    thread.id = if current_thread.is_roaming_guest() {
+        current_thread.id.clone()
+    } else {
+        uuid::Uuid::new_v4().to_string()
+    };
     thread.acp_session_id = None;
     thread.provider_checkpoints.clear();
     thread.pending_native_restore = None;
@@ -846,6 +865,39 @@ mod tests {
             b"present\n"
         );
         assert!(!project.join("added-later.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn roaming_guest_timeline_does_not_require_local_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-roaming-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        let mut thread = Thread::new(
+            "/path/that/only/exists/on/host".into(),
+            crate::threads::AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        thread.roaming_role = Some("guest".into());
+        thread.roaming_peer = Some("peer".into());
+        thread.roaming_remote_id = Some("host-thread".into());
+        thread.items.push(Item::User {
+            id: 1,
+            text: "远端任务".into(),
+            ts: now_ms(),
+            images: Vec::new(),
+        });
+
+        let view = record_edit_fork(&data, &thread, 1).unwrap();
+        let checkpoint_id = view.current_checkpoint_id.unwrap();
+        let (restored, _) = restore_checkpoint(&data, &checkpoint_id, &thread, true).unwrap();
+        assert_eq!(restored.id, thread.id);
+        assert_eq!(restored.roaming_remote_id, thread.roaming_remote_id);
         let _ = fs::remove_dir_all(root);
     }
 
