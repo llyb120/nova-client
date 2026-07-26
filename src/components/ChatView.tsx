@@ -700,7 +700,8 @@ export function ChatView() {
         return from && to ? [{ from, to, current: from.onCurrentPath && to.onCurrentPath }] : [];
       }),
       laneCount,
-      width: Math.max(46, 18 + (laneCount - 1) * 26 + 28),
+      // 左右各留约 8px（节点中心 18、半宽 10），避免图内容偏左、右侧多出一截空白
+      width: 36 + (laneCount - 1) * 26,
       height: nowY + 28,
     };
   });
