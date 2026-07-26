@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
+import { ALKAID_PROVIDER_DIAGNOSTIC_LOG, alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
 import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import {
   alkaidPromptInput,
@@ -314,6 +315,23 @@ test("usage is accumulated across every model request in an agent turn", () => {
   const total = mergeAlkaidUsage(first, { input: 500, output: 30, cacheRead: 200, cacheWrite: 0 });
   assert.deepEqual(total, { input: 600, output: 50, cacheRead: 500, cacheWrite: 40 });
   assert.equal(mergeAlkaidUsage(undefined, undefined), undefined);
+});
+
+test("timeout diagnostics write JSONL only when explicitly recorded", async () => {
+  const root = await mkdtemp(join(tmpdir(), "alkaid-diagnostics-"));
+  const log = createAlkaidDiagnosticLog(root);
+  await log.flush();
+  await assert.rejects(readFile(log.path, "utf8"), { code: "ENOENT" });
+
+  log.record({ event: "provider_stream_idle_timeout", timeoutMs: 120000 });
+  log.record({ event: "provider_stream_idle_timeout", timeoutMs: 120000, attempt: 2 });
+  await log.flush();
+  const lines = (await readFile(join(root, "logs", ALKAID_PROVIDER_DIAGNOSTIC_LOG), "utf8")).trim().split("\n");
+  assert.deepEqual(lines.map(JSON.parse), [
+    { event: "provider_stream_idle_timeout", timeoutMs: 120000 },
+    { event: "provider_stream_idle_timeout", timeoutMs: 120000, attempt: 2 },
+  ]);
+  assert.equal(alkaidDiagnosticEndpoint("https://user:secret@example.com/private?token=secret"), "https://example.com");
 });
 
 test("incomplete OpenAI response streams retry silently and preserve context", async () => {

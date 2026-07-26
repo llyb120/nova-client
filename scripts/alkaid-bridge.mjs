@@ -2,7 +2,8 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { ALKAID_PROVIDER_IDLE_TIMEOUT_MS, alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
+import { alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
 import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
@@ -207,11 +208,67 @@ async function prompt(request, commands) {
   let cancelled = false;
   let usage;
   let activeTools = 0;
-  const idleTimeout = createAlkaidIdleTimeout({ onTimeout: () => runtime.agent.abort() });
   const toolItems = new Map();
   let commandBusy = false;
   let commandRevision = 0;
   const steeringMessages = [];
+  const diagnosticLog = createAlkaidDiagnosticLog(dataRoot);
+  const requestStartedAt = Date.now();
+  let providerAttemptStartedAt = requestStartedAt;
+  let providerAttempt = 0;
+  let retryAttempt = 0;
+  let attemptActivityBaseline = {};
+  const providerActivity = {
+    lastEvent: "request_created",
+    messageStarts: 0,
+    messageEnds: 0,
+    textDeltas: 0,
+    thinkingDeltas: 0,
+    textChars: 0,
+    thinkingChars: 0,
+    toolStarts: 0,
+    toolEnds: 0,
+  };
+  const idleTimeout = createAlkaidIdleTimeout({
+    onTimeout: () => {
+      const messages = runtime.agent.state.messages;
+      diagnosticLog.record({
+        timestamp: new Date().toISOString(),
+        event: "provider_stream_idle_timeout",
+        timeoutMs: ALKAID_PROVIDER_IDLE_TIMEOUT_MS,
+        requestElapsedMs: Date.now() - requestStartedAt,
+        attemptElapsedMs: Date.now() - providerAttemptStartedAt,
+        sessionId,
+        provider: resolved.model.provider,
+        model: resolved.model.id,
+        api: resolved.model.api,
+        endpoint: alkaidDiagnosticEndpoint(resolved.model.baseUrl),
+        thinkingLevel: resolved.thinkingLevel ?? request.reasoningEffort ?? null,
+        providerAttempt,
+        retryAttempt,
+        activity: { ...providerActivity },
+        attemptActivity: Object.fromEntries(Object.entries(providerActivity).map(([key, value]) => [
+          key,
+          typeof value === "number" ? value - (attemptActivityBaseline[key] ?? 0) : value,
+        ])),
+        activeTools,
+        commandBusy,
+        queuedSteeringMessages: steeringMessages.length,
+        messageCount: messages.length,
+        messageTail: messages.slice(-8).map((message) => ({
+          role: message.role,
+          stopReason: message.stopReason ?? null,
+          contentParts: Array.isArray(message.content) ? message.content.length : 0,
+          contentTypes: Array.isArray(message.content)
+            ? message.content.map((part) => part?.type ?? "unknown")
+            : [],
+          hasError: Boolean(message.errorMessage),
+        })),
+        process: { pid: process.pid, node: process.version, platform: process.platform, arch: process.arch },
+      });
+      runtime.agent.abort();
+    },
+  });
   const settlePendingInput = async () => {
     // stdin delivery and the provider's final event can race. Require one quiet interval after
     // the most recently processed command so a late steer is visible to hasQueuedMessages().
@@ -223,9 +280,16 @@ async function prompt(request, commands) {
   };
   runtime.agent.subscribe((event) => {
     if (event.type === "message_end" && event.message.role === "assistant") {
+      providerActivity.lastEvent = "message_end";
+      providerActivity.messageEnds += 1;
       usage = mergeAlkaidUsage(usage, event.message.usage);
     }
     if (event.type === "message_start" && event.message.role === "assistant") {
+      attemptActivityBaseline = { ...providerActivity };
+      providerActivity.lastEvent = "message_start";
+      providerActivity.messageStarts += 1;
+      providerAttempt += 1;
+      providerAttemptStartedAt = Date.now();
       idleTimeout.touch();
       text = "";
       thinking = "";
@@ -236,20 +300,30 @@ async function prompt(request, commands) {
         thinkingId = `thinking-${randomUUID()}`;
       }
     } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      providerActivity.lastEvent = "text_delta";
+      providerActivity.textDeltas += 1;
+      providerActivity.textChars += event.assistantMessageEvent.delta.length;
       idleTimeout.touch();
       text += event.assistantMessageEvent.delta;
       send({ type: "item", item: { id: assistantId, type: "agent_message", text } });
     } else if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_delta") {
+      providerActivity.lastEvent = "thinking_delta";
+      providerActivity.thinkingDeltas += 1;
+      providerActivity.thinkingChars += event.assistantMessageEvent.delta.length;
       idleTimeout.touch();
       thinking += event.assistantMessageEvent.delta;
       send({ type: "item", item: { id: thinkingId, type: "reasoning", text: thinking } });
     } else if (event.type === "tool_execution_start") {
+      providerActivity.lastEvent = "tool_execution_start";
+      providerActivity.toolStarts += 1;
       activeTools += 1;
       idleTimeout.pause();
       const item = startedToolItem(event);
       toolItems.set(event.toolCallId, item);
       send({ type: "item", item });
     } else if (event.type === "tool_execution_end") {
+      providerActivity.lastEvent = "tool_execution_end";
+      providerActivity.toolEnds += 1;
       activeTools = Math.max(0, activeTools - 1);
       if (activeTools === 0) idleTimeout.resume();
       const item = toolItems.get(event.toolCallId);
@@ -300,6 +374,7 @@ async function prompt(request, commands) {
       settlePendingInput,
       prepareRetry: () => restoreAlkaidSteeringForRetry(runtime.agent, steeringMessages),
       onRetry: ({ attempt, error }) => {
+        retryAttempt = attempt;
         send({
           type: "timing",
           phase: "provider_retry",
@@ -357,6 +432,7 @@ async function prompt(request, commands) {
     });
   } finally {
     if (slimContext) await saveSlimMemory(sessionId, memory).catch(() => {});
+    await diagnosticLog.flush();
     await runtime.close();
   }
 }
