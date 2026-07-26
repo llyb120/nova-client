@@ -47,6 +47,12 @@ struct IdleBridge {
     stderr: Arc<Mutex<Vec<String>>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadEventsOutcome {
+    Completed,
+    Superseded,
+}
+
 pub struct SdkManager {
     app: AppHandle,
     adapter: Arc<dyn SdkAdapter>,
@@ -717,14 +723,17 @@ impl SdkManager {
         run_epoch: u64,
     ) -> Result<(), String> {
         let request = self.with_alkaid_server_config(request);
-        let mut bridge = self
+        let cached_bridge = self
             .adapter
             .keeps_bridge_alive()
             .then(|| self.idle_children.lock().unwrap().remove(thread_id))
-            .flatten()
-            .map(Ok)
-            .unwrap_or_else(|| self.spawn_idle_bridge(cwd))?;
-        let pid = bridge.child.id();
+            .flatten();
+        let reused_cached_bridge = cached_bridge.is_some();
+        let mut bridge = match cached_bridge {
+            Some(bridge) => bridge,
+            None => self.spawn_idle_bridge(cwd)?,
+        };
+        let mut pid = bridge.child.id();
         self.running_children.lock().unwrap().insert(
             thread_id.to_string(),
             RunningBridge {
@@ -732,24 +741,61 @@ impl SdkManager {
                 pid,
             },
         );
-        if let Err(error) = write_line(&bridge.stdin, &request).await {
-            self.running_children.lock().unwrap().remove(thread_id);
+        if let Err(first_error) = write_line(&bridge.stdin, &request).await {
+            {
+                let mut running = self.running_children.lock().unwrap();
+                if running
+                    .get(thread_id)
+                    .is_some_and(|running_bridge| running_bridge.pid == pid)
+                {
+                    running.remove(thread_id);
+                }
+            }
             kill_child(&mut bridge.child);
-            return Err(error);
+            // A kept-alive Cursor bridge can exit between turns (or while an interrupted turn is
+            // being replaced). Treat that cached pipe as stale and retry once with a fresh bridge.
+            if !reused_cached_bridge || !self.is_current_run(thread_id, run_epoch) {
+                return Err(first_error);
+            }
+            bridge = self.spawn_idle_bridge(cwd)?;
+            pid = bridge.child.id();
+            self.running_children.lock().unwrap().insert(
+                thread_id.to_string(),
+                RunningBridge {
+                    stdin: bridge.stdin.clone(),
+                    pid,
+                },
+            );
+            if let Err(error) = write_line(&bridge.stdin, &request).await {
+                let mut running = self.running_children.lock().unwrap();
+                if running
+                    .get(thread_id)
+                    .is_some_and(|running_bridge| running_bridge.pid == pid)
+                {
+                    running.remove(thread_id);
+                }
+                drop(running);
+                kill_child(&mut bridge.child);
+                return Err(error);
+            }
         }
-        let result = self
+        let event_result = self
             .read_events(thread_id, user_item_id, run_epoch, &mut bridge.stdout)
             .await;
-        {
+        let completed = matches!(&event_result, Ok(ReadEventsOutcome::Completed));
+        let still_owned = {
             let mut running = self.running_children.lock().unwrap();
             if running
                 .get(thread_id)
-                .is_some_and(|bridge| bridge.pid == pid)
+                .is_some_and(|running_bridge| running_bridge.pid == pid)
             {
                 running.remove(thread_id);
+                true
+            } else {
+                false
             }
-        }
-        let result = result.map_err(|error| {
+        };
+        let result = event_result.map(|_| ()).map_err(|error| {
             let status = bridge
                 .child
                 .try_wait()
@@ -771,14 +817,25 @@ impl SdkManager {
             )
         });
         let reusable = self.adapter.keeps_bridge_alive()
-            && result.is_ok()
+            && completed
+            && still_owned
             && bridge.child.try_wait().ok().flatten().is_none();
         if reusable {
-            self.idle_children
-                .lock()
-                .unwrap()
-                .insert(thread_id.to_string(), bridge);
-        } else if result.is_err() {
+            // `done` clears this run's epoch before event reading returns. Holding the epoch lock
+            // while caching closes the window where a newer run could start and miss this bridge.
+            let epochs = self.run_epochs.lock().unwrap();
+            if epochs.contains_key(thread_id) {
+                drop(epochs);
+                kill_child(&mut bridge.child);
+            } else {
+                self.idle_children
+                    .lock()
+                    .unwrap()
+                    .insert(thread_id.to_string(), bridge);
+            }
+        } else if result.is_err() || !still_owned || !completed {
+            // Superseded runs can return successfully after observing their invalidated epoch, but
+            // their bridge is being cancelled and must never be cached for the replacement turn.
             kill_child(&mut bridge.child);
         }
         result
@@ -829,7 +886,7 @@ impl SdkManager {
         user_item_id: u64,
         run_epoch: u64,
         stdout: &mut BufReader<tokio::process::ChildStdout>,
-    ) -> Result<(), String> {
+    ) -> Result<ReadEventsOutcome, String> {
         let mut lines = stdout.lines();
         let mut item_ids = HashMap::new();
         while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
@@ -850,7 +907,7 @@ impl SdkManager {
                 }
             }
             if !self.is_current_run(thread_id, run_epoch) {
-                return Ok(());
+                return Ok(ReadEventsOutcome::Superseded);
             }
             match event_type {
                 Some("ready") => {}
@@ -885,7 +942,7 @@ impl SdkManager {
                         "end_turn"
                     };
                     self.finish_turn_if_current(thread_id, run_epoch, stop_reason, usage);
-                    return Ok(());
+                    return Ok(ReadEventsOutcome::Completed);
                 }
                 _ => {}
             }
