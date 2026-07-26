@@ -1373,6 +1373,14 @@ fn bridge_path(app: &AppHandle, adapter: &dyn SdkAdapter) -> Result<PathBuf, Str
         std::fs::write(&path, bridge)
             .map_err(|e| format!("释放 {} bridge 失败：{e}", adapter.label()))?;
     }
+    for (sidecar_name, sidecar) in adapter.bridge_sidecars() {
+        let sidecar_path = dir.join(sidecar_name);
+        if std::fs::read(&sidecar_path).ok().as_deref() != Some(sidecar) {
+            std::fs::write(&sidecar_path, sidecar).map_err(|e| {
+                format!("释放 {} sidecar {sidecar_name} 失败：{e}", adapter.label())
+            })?;
+        }
+    }
     Ok(path)
 }
 

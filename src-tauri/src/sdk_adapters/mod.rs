@@ -28,6 +28,11 @@ pub trait SdkAdapter: Send + Sync {
     fn launch_config(&self, settings: &Settings) -> LaunchConfig;
     fn permission_prefix(&self) -> &'static str;
 
+    /// Extra files written next to the bridge in `~/.nova/runtime/`.
+    fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
+        &[]
+    }
+
     fn uses_codex_model_routing(&self) -> bool {
         false
     }

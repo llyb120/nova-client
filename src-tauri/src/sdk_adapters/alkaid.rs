@@ -21,6 +21,10 @@ impl SdkAdapter for AlkaidAdapter {
         )
     }
 
+    fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
+        &[("photon_rs_bg.wasm", include_bytes!("../../resources/photon_rs_bg.wasm"))]
+    }
+
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
             program: "node".into(),
