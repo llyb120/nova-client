@@ -219,7 +219,7 @@ export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
   let transcriptRef: CanvasTranscriptHandle | undefined;
-  const useCanvas = () => state.settings?.chatViewRender === "canvas";
+  const useCanvas = () => state.settings?.chatViewRender !== "dom";
   const [stickToBottom, setStickToBottom] = createSignal(true);
   let scrollQueued = false;
   let scrollFrame = 0;

@@ -70,7 +70,7 @@ pub struct Settings {
     pub theme: String,
     /// 会话历史展示方式（project / time）。
     pub history_display_mode: String,
-    /// 聊天视图渲染方式（dom / canvas；默认 dom）。
+    /// 聊天视图渲染方式（dom / canvas；默认 canvas）。
     pub chat_view_render: String,
     /// 团队/漫游中转服务地址（空 = 关闭团队/漫游功能）
     pub relay_server: String,
@@ -154,7 +154,7 @@ impl Default for Settings {
             editor: "code".into(),
             theme: String::new(),
             history_display_mode: "project".into(),
-            chat_view_render: "dom".into(),
+            chat_view_render: "canvas".into(),
             relay_server: DEFAULT_RELAY_SERVER.into(),
             relay_token: String::new(),
             relay_groups: String::new(),
@@ -278,9 +278,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_chat_view_render_defaults_to_dom() {
+    fn missing_chat_view_render_defaults_to_canvas() {
         let settings: Settings = serde_json::from_str(r#"{"theme":"ink-dark"}"#).unwrap();
-        assert_eq!(settings.chat_view_render, "dom");
+        assert_eq!(settings.chat_view_render, "canvas");
     }
 
     #[test]

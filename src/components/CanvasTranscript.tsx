@@ -81,23 +81,36 @@ function measure(text: string, fs: number, ff: string, fw = "400"): number {
 
 function wrapText(text: string, maxW: number, fs: number, ff: string, fw = "400"): string[] {
   const lines: string[] = [];
-  for (const para of text.split("\n")) {
-    const words = para.split(/(\s+)/);
+  const safeMax = Math.max(1, maxW);
+  for (const para of text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
+    // Keep intentional empty paragraphs as a single blank line; skip wrapping empty tokens
+    // into extra space-only lines that inflate bubble height.
+    if (para === "") { lines.push(""); continue; }
+    const words = para.split(/(\s+)/).filter((w, i, arr) => w !== "" || arr.length === 1);
     let cur = "", curW = 0;
     for (const word of words) {
+      // Don't start a line with whitespace — matches typical pre-wrap soft-wrap feel
+      // and avoids a blank-looking line when a space is pushed after a wrap.
+      if (!cur && /^\s+$/.test(word)) continue;
       const ww = measure(word, fs, ff, fw);
-      if (curW + ww <= maxW) { cur += word; curW += ww; continue; }
-      if (cur) { lines.push(cur.trimEnd()); cur = ""; curW = 0; }
+      if (curW + ww <= safeMax) { cur += word; curW += ww; continue; }
+      // Word won't fit: fill remaining space on this line char-by-char first
+      // (CJK soft-wrap), instead of flushing `cur` and starting the word on the next line.
+      if (/^\s+$/.test(word)) {
+        if (cur) { lines.push(cur.trimEnd()); cur = ""; curW = 0; }
+        continue;
+      }
       for (const ch of Array.from(word)) {
         const cw = measure(ch, fs, ff, fw);
-        if (cur && curW + cw > maxW) { lines.push(cur); cur = ch; curW = cw; }
+        if (cur && curW + cw > safeMax) { lines.push(cur); cur = ch; curW = cw; }
         else { cur += ch; curW += cw; }
       }
     }
-    lines.push(cur || "");
+    lines.push(cur.trimEnd());
   }
   while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-  return lines;
+  while (lines.length > 1 && lines[0] === "") lines.shift();
+  return lines.length ? lines : [""];
 }
 
 // Match DOM .bubble-images img: max-width 240px; max-height 180px
@@ -576,6 +589,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let rafId = 0;
   let lastWheelTime = 0;
 
+  // custom scrollbar drag (drawn on canvas; not a DOM control)
+  let scrollDragging = false;
+  let scrollDragGrab = 0;
+
   // spinner
   let spinPhase = 0;
   let hasBusy = false;
@@ -650,6 +667,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const result: Block[] = [];
     groupYs = [];
     let y = 24;
+    // DOM adjacent vertical margins collapse; canvas must emulate or user bubbles
+    // stack 20+16 gaps and look full of blank space between short prompts.
+    let pendingBottom = 0;
+    const gapBefore = (top: number) => {
+      y += Math.max(pendingBottom, top);
+      pendingBottom = 0;
+    };
+    const setBottom = (bottom: number) => { pendingBottom = bottom; };
+    const flushBottom = () => { y += pendingBottom; pendingBottom = 0; };
 
     if (!props.groups.length) {
       result.push({ kind: "hint", id: 0, groupIdx: 0, x: side, y, w: contentW, h: 60,
@@ -691,17 +717,24 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       // user message: .msg-user margin 20px 0 16px; bubble max-width 85%
       if (g.user) {
         const item = g.user;
-        y += 20; // top margin
+        gapBefore(20); // top margin (collapses with previous bottom)
         if (item.id !== editing()?.id) {
           const maxBubble = contentW * 0.85;
-          const textLines = item.text ? wrapText(item.text, maxBubble - 34, 14, p.sans) : [];
-          const lh = 14 * 1.6;
-          const textH = textLines.length * lh;
-          const textW = textLines.reduce((m, l) => Math.max(m, measure(l, 14, p.sans)), 0);
           // DOM .bubble-images: flex-wrap, img max 240×180, gap 6, margin-bottom 6
           const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH } =
             layoutBubbleImages(item.images, maxBubble - 32, loadImage);
-          const bubbleW = Math.min(maxBubble, Math.max(72, textW + 34, imgUsedW + 32));
+          // Size to content like DOM (no artificial min-width that leaves empty bubble space).
+          // Re-wrap at the final inner width so height matches painted lines.
+          const lh = 14 * 1.6;
+          let textLines = item.text ? wrapText(item.text, maxBubble - 34, 14, p.sans) : [];
+          let textW = textLines.reduce((m, l) => Math.max(m, measure(l, 14, p.sans)), 0);
+          let bubbleW = Math.min(maxBubble, Math.max(textW + 34, imgUsedW + 32, imgH ? 72 : 34));
+          if (item.text) {
+            textLines = wrapText(item.text, Math.max(1, bubbleW - 34), 14, p.sans);
+            textW = textLines.reduce((m, l) => Math.max(m, measure(l, 14, p.sans)), 0);
+            bubbleW = Math.min(maxBubble, Math.max(textW + 34, imgUsedW + 32, imgH ? 72 : 34));
+          }
+          const textH = textLines.length * lh;
           const bubbleH = Math.max(30, textH + imgH + 20); // padding 10*2
           const bx = side + contentW - bubbleW;
 
@@ -712,6 +745,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             // border-radius: 14px; border-bottom-right-radius: 6px
             borderRadius: [14, 14, 6, 14], fontSize: 14, lineHeight: 1.6, font: p.sans,
             selectable: true, hoverKey: `user-${item.id}`,
+            _lines: textLines,
             data: { images: item.images, editItem: item, imageLayouts } });
 
           // .user-edit-btn: padding 5px, margin 0 2px 4px 0, align-self flex-end
@@ -726,17 +760,20 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
                 setEditing(item);
               } });
           }
-          y += bubbleH + 16; // bottom margin
+          y += bubbleH;
+          setBottom(16); // bottom margin
         } else {
           editLayoutY = y;
           editLayoutSide = side;
           editLayoutW = contentW;
-          y += 150 + 16;
+          y += 150;
+          setBottom(16);
         }
       }
 
       // .turn-actual-model: margin -8px 0 8px auto; padding 2px 7px; border-radius 999
       if (g.turn?.actualModel) {
+        flushBottom();
         const tag = `实际模型：${g.turn.actualModel}`;
         const tw = measure(tag, 11, p.mono) + 14; // padding 2*7
         result.push({ kind: "actual-model", id: g.turn.id, groupIdx: gi,
@@ -747,14 +784,25 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         y += 18; // -8 top absorbed + 8 bottom + content ~18
       }
 
-      const lastConc = g.body.findLastIndex(it => it.type === "assistant" || it.type === "system");
-      let firstConc = lastConc;
-      if (firstConc >= 0) {
-        while (firstConc > 0 && (g.body[firstConc - 1].type === "assistant" || g.body[firstConc - 1].type === "system"))
-          firstConc--;
+      // Match DOM (TurnGroup): only split conclusion after the turn is finalized.
+      // Mid-stream progress assistant/system lines must stay in original order.
+      let process = g.body;
+      let conclusion: typeof g.body = [];
+      if (g.turn) {
+        const lastConc = g.body.findLastIndex(it => it.type === "assistant" || it.type === "system");
+        let firstConc = lastConc;
+        if (firstConc >= 0) {
+          while (firstConc > 0 && (g.body[firstConc - 1].type === "assistant" || g.body[firstConc - 1].type === "system"))
+            firstConc--;
+        }
+        if (firstConc >= 0) {
+          process = [...g.body.slice(0, firstConc), ...g.body.slice(lastConc + 1)];
+          conclusion = g.body.slice(firstConc, lastConc + 1);
+        }
       }
-      const process = firstConc < 0 ? g.body : [...g.body.slice(0, firstConc), ...g.body.slice(lastConc + 1)];
-      const conclusion = firstConc < 0 ? [] : g.body.slice(firstConc, lastConc + 1);
+
+      // Body content follows: commit user bottom margin (don't defer past fold/assistant).
+      if ((g.turn && process.length) || process.length > 0 || conclusion.length > 0) flushBottom();
 
       if (g.turn && process.length) {
         const foldKey = `turn-${g.turn.id ?? g.user?.id ?? process[0]?.id ?? 0}`;
@@ -806,6 +854,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
     }
 
+    flushBottom();
     blocks = result;
     totalHeight = y + 16;
 
@@ -895,7 +944,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
 
     if (item.type === "assistant") {
-      if (item.text.trim() === "None") return y;
+      const trimmed = item.text.trim();
+      // Skip empty / placeholder replies so they don't leave blank gaps between user prompts.
+      if (!trimmed || trimmed === "None") return y;
       // .msg-assistant: margin 14px 0; line-height 1.7
       y += 14;
       const mdBlocks = parseMarkdownBlocks(item.text);
@@ -1284,27 +1335,31 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const open = b.data?.open as boolean;
     const isThought = b.kind === "thought-toggle";
     // fold: padding 4px 8px, gap 6; thought: padding 3px 6px, gap 5
+    // IconChevron size=12 (viewBox 0 0 24 24) — same slot as DOM so glyphs align with 14px tool icons
     const padL = isThought ? 6 : 8;
     const gap = isThought ? 5 : 6;
+    const iconSize = 12;
     const color = hover && b.hoverColor ? b.hoverColor : (b.color || p.dim);
 
     ctx.save();
     ctx.strokeStyle = isThought ? (hover ? p.dim : p.faint) : p.faint;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 2;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    const s = iconSize / 24;
+    ctx.translate(bx + padL, by + (b.h - iconSize) / 2);
+    ctx.scale(s, s);
     ctx.beginPath();
-    const cx = bx + padL + 4;
-    const cy = by + b.h / 2;
-    if (open) { ctx.moveTo(cx - 3, cy - 1.5); ctx.lineTo(cx, cy + 1.5); ctx.lineTo(cx + 3, cy - 1.5); }
-    else { ctx.moveTo(cx - 1.5, cy - 3); ctx.lineTo(cx + 1.5, cy); ctx.lineTo(cx - 1.5, cy + 3); }
+    // IconChevron paths: open "m6 9 6 6 6-6" / closed "m9 6 6 6-6 6"
+    if (open) { ctx.moveTo(6, 9); ctx.lineTo(12, 15); ctx.lineTo(18, 9); }
+    else { ctx.moveTo(9, 6); ctx.lineTo(15, 12); ctx.lineTo(9, 18); }
     ctx.stroke();
     ctx.restore();
 
     ctx.font = `${b.fontSize}px ${b.font}`;
     ctx.fillStyle = color;
     ctx.textBaseline = "middle";
-    ctx.fillText(b.text!, bx + padL + 8 + gap, snap(by + b.h / 2));
+    ctx.fillText(b.text!, bx + padL + iconSize + gap, snap(by + b.h / 2));
   }
 
   function paintToolHeader(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette) {
@@ -1746,14 +1801,61 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.restore();
   }
 
-  function paintScrollbar(ctx: CanvasRenderingContext2D) {
-    const trackW = 4, trackX = viewW - trackW - 3;
+  function scrollbarGeom() {
+    if (maxScroll <= 0 || viewH <= 0 || totalHeight <= 0) return null;
+    const trackW = 4;
+    const trackX = viewW - trackW - 3;
+    // Wider hit target than the 4px visual thumb.
+    const hitPad = 6;
+    const hitX = trackX - hitPad;
+    const hitW = trackW + hitPad * 2;
     const ratio = viewH / totalHeight;
     const thumbH = Math.max(20, viewH * ratio);
-    const thumbY = (scrollY / maxScroll) * (viewH - thumbH);
+    const travel = Math.max(0, viewH - thumbH);
+    const thumbY = travel > 0 ? (scrollY / maxScroll) * travel : 0;
+    return { trackW, trackX, hitX, hitW, thumbH, thumbY, travel };
+  }
+
+  function paintScrollbar(ctx: CanvasRenderingContext2D) {
+    const g = scrollbarGeom();
+    if (!g) return;
     ctx.fillStyle = pal.scroll;
-    roundRect(ctx, trackX, thumbY, trackW, thumbH, 3);
+    roundRect(ctx, g.trackX, g.thumbY, g.trackW, g.thumbH, 3);
     ctx.fill();
+  }
+
+  function hitScrollbar(clientX: number, clientY: number): "thumb" | "track" | null {
+    const g = scrollbarGeom();
+    if (!g) return null;
+    const rect = canvasEl.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    if (x < g.hitX || x > g.hitX + g.hitW || y < 0 || y > viewH) return null;
+    if (y >= g.thumbY && y <= g.thumbY + g.thumbH) return "thumb";
+    return "track";
+  }
+
+  function applyScrollY(next: number, user: boolean) {
+    scrollY = Math.max(0, Math.min(maxScroll, next));
+    keepBottom = maxScroll - scrollY <= 2;
+    if (editing()) {
+      setEditStyle({
+        left: `${editLayoutSide}px`,
+        top: `${Math.max(8, editLayoutY - scrollY)}px`,
+        width: `${editLayoutW}px`
+      });
+    }
+    props.onScroll?.(scrollY, maxScroll, user);
+    paintAll();
+  }
+
+  function scrollFromPointerY(clientY: number) {
+    const g = scrollbarGeom();
+    if (!g || g.travel <= 0) return;
+    const rect = canvasEl.getBoundingClientRect();
+    const y = clientY - rect.top;
+    const thumbY = Math.max(0, Math.min(g.travel, y - scrollDragGrab));
+    applyScrollY((thumbY / g.travel) * maxScroll, true);
   }
 
   // ─── Interaction ───────────────────────────────────────────────────────────
@@ -1807,6 +1909,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function onMouseMove(e: MouseEvent) {
+    if (scrollDragging) {
+      scrollFromPointerY(e.clientY);
+      return;
+    }
     if (selecting) {
       const pos = hitTextPosition(e.clientX, e.clientY);
       if (pos && selStart) {
@@ -1814,6 +1920,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           endBlock: pos.block, endOffset: pos.offset };
         paintAll();
       }
+      return;
+    }
+    if (hitScrollbar(e.clientX, e.clientY)) {
+      if (hoverBlockIdx !== -1) {
+        hoverBlockIdx = -1;
+        paintAll();
+      }
+      canvasEl.style.cursor = "default";
       return;
     }
     const idx = hitTest(e.clientX, e.clientY);
@@ -1825,8 +1939,49 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
   }
 
+  function endScrollDrag() {
+    if (!scrollDragging) return;
+    scrollDragging = false;
+    document.removeEventListener("mousemove", onScrollDragMove);
+    document.removeEventListener("mouseup", onScrollDragUp);
+  }
+
+  function onScrollDragMove(e: MouseEvent) {
+    if (!scrollDragging) return;
+    scrollFromPointerY(e.clientY);
+  }
+
+  function onScrollDragUp(_e: MouseEvent) {
+    endScrollDrag();
+  }
+
   function onMouseDown(e: MouseEvent) {
+    if (e.button !== 0) return;
     velocityY = 0;
+
+    const sb = hitScrollbar(e.clientX, e.clientY);
+    if (sb) {
+      e.preventDefault();
+      const g = scrollbarGeom();
+      if (!g) return;
+      const rect = canvasEl.getBoundingClientRect();
+      const y = e.clientY - rect.top;
+      if (sb === "track") {
+        scrollDragGrab = g.thumbH / 2;
+        scrollFromPointerY(e.clientY);
+      } else {
+        scrollDragGrab = Math.max(0, Math.min(g.thumbH, y - g.thumbY));
+      }
+      scrollDragging = true;
+      selecting = false;
+      selection = null;
+      canvasEl.style.cursor = "default";
+      document.addEventListener("mousemove", onScrollDragMove);
+      document.addEventListener("mouseup", onScrollDragUp);
+      paintAll();
+      return;
+    }
+
     const idx = hitTest(e.clientX, e.clientY);
     const b = idx >= 0 ? blocks[idx] : null;
 
@@ -1846,6 +2001,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function onMouseUp(_e: MouseEvent) {
+    if (scrollDragging) {
+      endScrollDrag();
+      return;
+    }
     if (selecting) {
       selecting = false;
       if (selection && selection.startBlock === selection.endBlock && selection.startOffset === selection.endOffset) {
@@ -1857,6 +2016,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function onClick(e: MouseEvent) {
+    if (hitScrollbar(e.clientX, e.clientY)) return;
     const idx = hitTest(e.clientX, e.clientY);
     const b = idx >= 0 ? blocks[idx] : null;
     if (b?.clickAction && !selecting) b.clickAction();
@@ -2032,6 +2192,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       canvasEl.removeEventListener("click", onClick);
       canvasEl.removeEventListener("wheel", onWheel);
       canvasEl.removeEventListener("copy", onCopy);
+      endScrollDrag();
     });
   });
 

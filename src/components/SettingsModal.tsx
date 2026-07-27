@@ -190,7 +190,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     s?.historyDisplayMode === "time" ? "time" : "project",
   );
   const [chatViewRender, setChatViewRender] = createSignal<"dom" | "canvas">(
-    s?.chatViewRender === "canvas" ? "canvas" : "dom",
+    s?.chatViewRender === "dom" ? "dom" : "canvas",
   );
   // server 留空回退默认地址；这里也预填，避免误存成空导致团队/漫游被静默关闭
   const [relayServer, setRelayServer] = createSignal(s?.relayServer || DEFAULT_RELAY_SERVER);
@@ -993,14 +993,14 @@ export function SettingsModal(props: { onClose: () => void }) {
                   class="field-input"
                   value={chatViewRender()}
                   onChange={(e) =>
-                    setChatViewRender(e.currentTarget.value === "canvas" ? "canvas" : "dom")
+                    setChatViewRender(e.currentTarget.value === "dom" ? "dom" : "canvas")
                   }
                 >
-                  <option value="dom">DOM（默认）</option>
-                  <option value="canvas">Canvas</option>
+                  <option value="canvas">Canvas（默认）</option>
+                  <option value="dom">DOM</option>
                 </select>
                 <span class="field-hint">
-                  DOM 选区/复制更可靠；Canvas 在超长会话时更省 DOM 节点、滚动更轻。保存后立即生效。
+                  Canvas 在超长会话时更省 DOM 节点、滚动更轻；DOM 选区/复制更可靠。可随时切换，保存后立即生效。
                 </span>
               </label>
             </section>
