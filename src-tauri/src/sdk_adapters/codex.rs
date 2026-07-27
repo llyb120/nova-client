@@ -27,6 +27,7 @@ impl SdkAdapter for CodexAdapter {
             proxy: settings.codex_proxy.clone(),
             path_env: "NOVA_CODEX_PATH",
             api_key: None,
+            extra_env: Vec::new(),
         }
     }
 

@@ -11,15 +11,18 @@ import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createReadStream, existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
+import { searchSessionHistory } from "./session-history-search.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match pi coding tools: keep read_files outputs usable without blowing the context window. */
-const READ_FILES_MAX_BYTES = 50 * 1024;
+const READ_FILES_MAX_BYTES = 32 * 1024;
+/** Reasonix-style per-tool context budget. Full oversized text is archived before truncation. */
+export const TOOL_OUTPUT_CONTEXT_MAX_BYTES = 32 * 1024;
 /** OpenAI Responses API hard limit for function_call_output.output string length. */
 export const OPENAI_TOOL_OUTPUT_MAX_CHARS = 10_485_760;
 /** Leave room for a truncation notice before the API rejects the request. */
@@ -50,6 +53,66 @@ export function clampToolOutputText(text, maxChars = OPENAI_TOOL_OUTPUT_SAFE_MAX
   const notice = `\n\n…[truncated: tool output exceeded ${maxChars} chars; original length ${value.length}]`;
   const keep = Math.max(0, maxChars - notice.length);
   return `${value.slice(0, keep)}${notice}`;
+}
+
+function safeArchiveSegment(value) {
+  return String(value ?? "tool").replace(/[^A-Za-z0-9_.-]+/g, "-").slice(0, 96) || "tool";
+}
+
+function truncateUtf8TailToBytes(text, maxBytes) {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let start = Math.max(0, text.length - maxBytes);
+  let slice = text.slice(start);
+  while (start < text.length && Buffer.byteLength(slice, "utf8") > maxBytes) {
+    start += Math.max(1, Math.ceil((slice.length * 0.1)));
+    slice = text.slice(start);
+  }
+  while (start > 0 && Buffer.byteLength(text.slice(start - 1), "utf8") <= maxBytes) start -= 1;
+  return text.slice(start);
+}
+
+function headTailUtf8(text, maxBytes, notice) {
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(notice, "utf8"));
+  const headBudget = Math.ceil(budget * 0.6);
+  const tailBudget = Math.max(0, budget - headBudget);
+  return `${truncateUtf8ToBytes(text, headBudget)}${notice}${truncateUtf8TailToBytes(text, tailBudget)}`;
+}
+
+/** Archive oversized text tool output and return a stable head/tail placeholder for model context. */
+export async function governToolResult(result, options = {}) {
+  const maxBytes = options.maxBytes ?? TOOL_OUTPUT_CONTEXT_MAX_BYTES;
+  if (!result || !Array.isArray(result.content)) return result;
+  const text = result.content
+    .filter((part) => part?.type === "text")
+    .map((part) => String(part.text ?? ""))
+    .join("\n");
+  const originalBytes = Buffer.byteLength(text, "utf8");
+  if (originalBytes <= maxBytes) return result;
+
+  let archivePath;
+  if (options.archiveDir) {
+    await mkdir(options.archiveDir, { recursive: true });
+    archivePath = join(
+      options.archiveDir,
+      `${safeArchiveSegment(options.toolCallId)}-${safeArchiveSegment(options.toolName)}.txt`,
+    );
+    await writeFile(archivePath, text, "utf8");
+  }
+  const location = archivePath ? ` archived at ${archivePath}; use read with offset/limit to inspect it` : "";
+  const notice = `\n\n…[elided tool result — ${originalBytes} bytes${location}]\n\n`;
+  const governed = headTailUtf8(text, maxBytes, notice);
+  return {
+    ...result,
+    content: [
+      { type: "text", text: governed },
+      ...result.content.filter((part) => part?.type !== "text"),
+    ],
+    details: {
+      ...(result.details && typeof result.details === "object" ? result.details : {}),
+      archivedToolOutput: archivePath,
+      originalBytes,
+    },
+  };
 }
 
 function truncateUtf8ToBytes(text, maxBytes) {
@@ -388,7 +451,7 @@ export function createFilesystemTools(cwd, editTool = null) {
   const tools = [
     {
       name: "read_files",
-      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行（且不超过约 50KB）。请为每个文件按需指定 offset/limit，并用返回的 nextOffset 继续读取。`,
+      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行（且不超过约 32KB）。请为每个文件按需指定 offset/limit，并用返回的 nextOffset 继续读取。`,
       parameters: Type.Object({
         paths: Type.Array(Type.Union([
           Type.String(),
@@ -564,6 +627,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
         ? "- bash: 执行 PowerShell 命令"
         : "- bash: 执行 Bash 命令",
     options.readOnly ? null : "- edit / write: 单文件编辑或写入",
+    "- search_session_history: 按需检索本地跨会话历史，只返回少量相关片段",
   ].filter(Boolean);
 
   const stableParts = [
@@ -699,12 +763,44 @@ export async function createAlkaidAgent(options = {}) {
     : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell } });
   const editTool = codingTools.find((tool) => tool.name === "edit");
   const batchTools = createFilesystemTools(cwd, editTool);
-  const tools = [...batchTools, ...codingTools, ...mcp.tools];
+  const historyRoots = [
+    join(alkaidDataRoot(), "sessions"),
+    join(dirname(alkaidDataRoot()), "cursor-slim-memory"),
+  ];
+  const historyTool = {
+    name: "search_session_history",
+    description: "按需检索 Vega/Cursor 本地历史会话。仅在当前上下文缺少旧决策或用户明确要求查找历史时使用；返回 BM25 风格排序的少量片段。",
+    parameters: Type.Object({
+      query: Type.String({ minLength: 1 }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+    }),
+    async execute(_toolCallId, { query, limit }) {
+      return textResult(JSON.stringify(await searchSessionHistory(historyRoots, query, {
+        limit,
+        currentSessionId: options.sessionId,
+      })));
+    },
+  };
+  const rawTools = [...batchTools, ...codingTools, historyTool, ...mcp.tools];
+  const archiveDir = options.sessionId
+    ? join(alkaidDataRoot(), "tool-results", safeArchiveSegment(options.sessionId))
+    : undefined;
+  const tools = rawTools.map((tool) => ({
+    ...tool,
+    async execute(toolCallId, params, signal, onUpdate) {
+      const result = await tool.execute(toolCallId, params, signal, onUpdate);
+      return governToolResult(result, {
+        archiveDir,
+        toolCallId,
+        toolName: tool.name,
+      });
+    },
+  }));
   const agentInstructions = await loadAlkaidAgentInstructions(options.agentInstructionsPath);
   const customInstructions = [agentInstructions.trim(), options.systemPrompt?.trim()]
     .filter(Boolean)
     .join("\n\n");
-  const systemPrompt = buildAlkaidSystemPrompt({
+  const systemPrompt = options.systemPromptSnapshot || buildAlkaidSystemPrompt({
     cwd,
     skills,
     readOnly: options.readOnly,
@@ -744,5 +840,16 @@ export async function createAlkaidAgent(options = {}) {
       return changed ? next : undefined;
     },
   });
-  return { agent, close: () => mcp.close(), skills, toolCount: tools.length };
+  return {
+    agent,
+    close: () => mcp.close(),
+    skills,
+    toolCount: tools.length,
+    systemPrompt,
+    toolShape: tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description ?? "",
+      parameters: tool.parameters ?? tool.inputSchema ?? null,
+    })),
+  };
 }

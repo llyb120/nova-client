@@ -29,6 +29,11 @@ impl SdkAdapter for CursorAdapter {
             path_env: "NOVA_CURSOR_PATH",
             api_key: (!settings.cursor_sdk_api_key.is_empty())
                 .then(|| ("CURSOR_API_KEY", settings.cursor_sdk_api_key.clone())),
+            extra_env: vec![(
+                "NOVA_CURSOR_MODEL_CONTEXTS",
+                serde_json::to_string(&settings.cursor_model_contexts)
+                    .unwrap_or_else(|_| "[]".into()),
+            )],
         }
     }
 

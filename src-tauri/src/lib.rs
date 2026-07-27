@@ -3235,8 +3235,8 @@ pub(crate) fn dispatch_prompt(
             });
         }
         AgentKind::Cursor => {
-            // 每轮 Agent.create + slim memory：运行中引导 = 静默打断后开新 turn，
-            // 不是往当前 Cursor agent 注入（无原生 steer）。
+            // Cursor 复用同一 live Agent session；运行中引导仍需静默打断后开新 turn，
+            // 因为 Cursor SDK 没有原生 steer。
             let mgr = state.cursorplus.clone();
             if mgr.is_running(&thread_id) {
                 tauri::async_runtime::spawn(async move {
@@ -3769,6 +3769,7 @@ async fn apply_runtime_settings(
             || s.cursor_path != settings.cursor_path
             || s.cursor_proxy != settings.cursor_proxy
             || s.cursor_sdk_api_key != settings.cursor_sdk_api_key
+            || s.cursor_model_contexts != settings.cursor_model_contexts
             || s.cursor_enabled != settings.cursor_enabled;
         let restart_opencode = restart_all_agents
             || s.opencode_path != settings.opencode_path

@@ -43,6 +43,19 @@ function quotaPercent(value: number): number {
 
 const DEFAULT_RELAY_SERVER = "";
 const RELAY_SERVER_PLACEHOLDER = "http://127.0.0.1:8320";
+const CURSOR_CONTEXT_WINDOW_OPTIONS = [
+  { value: 16_000, label: "16K tokens" },
+  { value: 32_000, label: "32K tokens" },
+  { value: 64_000, label: "64K tokens" },
+  { value: 100_000, label: "100K tokens" },
+  { value: 128_000, label: "128K tokens" },
+  { value: 200_000, label: "200K tokens" },
+  { value: 256_000, label: "256K tokens" },
+  { value: 400_000, label: "400K tokens" },
+  { value: 512_000, label: "512K tokens" },
+  { value: 1_000_000, label: "1M tokens" },
+  { value: 2_000_000, label: "2M tokens" },
+];
 
 /** 统一会话模式（与 store.UNIFIED_MODES 一致，带说明文案） */
 const UNIFIED_MODE_OPTIONS = [
@@ -151,9 +164,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
-  const [vegaSlimContextEnabled, setVegaSlimContextEnabled] = createSignal(
-    s?.vegaSlimContextEnabled ?? false,
-  );
   const [checkpointEnabled, setCheckpointEnabled] = createSignal(
     s?.checkpointEnabled ?? false,
   );
@@ -163,6 +173,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [claudecodeSdkApiKey, setClaudecodeSdkApiKey] = createSignal(s?.claudecodeSdkApiKey ?? "");
   const [cursorProxy, setCursorProxy] = createSignal(s?.cursorProxy ?? "");
   const [cursorSdkApiKey, setCursorSdkApiKey] = createSignal(s?.cursorSdkApiKey ?? "");
+  const [cursorModelContexts, setCursorModelContexts] = createSignal(
+    (s?.cursorModelContexts ?? []).map((rule) => ({ ...rule })),
+  );
   const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
   const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
   const [alkaidEnabled, setAlkaidEnabled] = createSignal(s?.alkaidEnabled !== false);
@@ -299,6 +312,16 @@ export function SettingsModal(props: { onClose: () => void }) {
       return [...current, key];
     });
   };
+  const updateCursorModelContext = (index: number, patch: { prefix?: string; contextWindow?: number }) => {
+    setCursorModelContexts((current) => current.map((rule, ruleIndex) =>
+      ruleIndex === index ? { ...rule, ...patch } : rule));
+  };
+  const addCursorModelContext = () => {
+    setCursorModelContexts((current) => [...current, { prefix: "", contextWindow: 128_000 }]);
+  };
+  const removeCursorModelContext = (index: number) => {
+    setCursorModelContexts((current) => current.filter((_, ruleIndex) => ruleIndex !== index));
+  };
 
   let roamingFoldersLoaded = false;
   const loadRoamingFolders = async () => {
@@ -420,7 +443,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     codexProxy: codexProxy().trim(),
     vegaProxy: vegaProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
-    vegaSlimContextEnabled: vegaSlimContextEnabled(),
     checkpointEnabled: checkpointEnabled(),
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
@@ -428,6 +450,9 @@ export function SettingsModal(props: { onClose: () => void }) {
     claudecodeSdkApiKey: claudecodeSdkApiKey().trim(),
     cursorProxy: cursorProxy().trim(),
     cursorSdkApiKey: cursorSdkApiKey().trim(),
+    cursorModelContexts: cursorModelContexts()
+      .map((rule) => ({ prefix: rule.prefix.trim(), contextWindow: rule.contextWindow }))
+      .filter((rule) => rule.prefix.length > 0),
     opencodeProxy: opencodeProxy().trim(),
     defaultMode: defaultMode(),
     lightweightModelAgent: lightweightAgent(),
@@ -1006,24 +1031,6 @@ export function SettingsModal(props: { onClose: () => void }) {
             </section>
 
             <section class="settings-group">
-              <h3 class="settings-group-title">Vega 上下文</h3>
-              <div class="field">
-                <span class="field-label">超级上下文</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={vegaSlimContextEnabled()}
-                    onChange={(e) => setVegaSlimContextEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-                <span class="field-hint">
-                  开启后会增强上下文体验和速度，但可能存在上下文丢失的风险。
-                </span>
-              </div>
-            </section>
-
-            <section class="settings-group">
               <h3 class="settings-group-title">世界线</h3>
               <div class="field">
                 <span class="field-label">启用 Checkpoint</span>
@@ -1286,6 +1293,57 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </div>
               </div>
               <ProxyField value={cursorProxy()} onInput={setCursorProxy} />
+              <div class="cursor-context-config">
+                <div class="cursor-context-head">
+                  <div>
+                    <div class="field-label">模型上下文窗口</div>
+                    <div class="field-hint">按模型 ID 前缀匹配，最长前缀优先；未匹配时使用 128K。</div>
+                  </div>
+                  <button type="button" class="btn secondary cursor-context-add" onClick={addCursorModelContext}>
+                    添加
+                  </button>
+                </div>
+                <Show when={cursorModelContexts().length > 0} fallback={
+                  <div class="cursor-context-empty">暂无自定义规则。</div>
+                }>
+                  <div class="cursor-context-list">
+                    <For each={cursorModelContexts()}>
+                      {(rule, index) => (
+                        <div class="cursor-context-row">
+                          <input
+                            class="field-input"
+                            value={rule.prefix}
+                            onInput={(event) => updateCursorModelContext(index(), { prefix: event.currentTarget.value })}
+                            placeholder="模型前缀，如 claude-4"
+                            aria-label="Cursor 模型前缀"
+                          />
+                          <select
+                            class="field-input"
+                            value={String(rule.contextWindow)}
+                            onChange={(event) => updateCursorModelContext(index(), {
+                              contextWindow: Number(event.currentTarget.value),
+                            })}
+                            aria-label="Cursor 模型上下文窗口"
+                          >
+                            <For each={CURSOR_CONTEXT_WINDOW_OPTIONS}>
+                              {(option) => <option value={option.value}>{option.label}</option>}
+                            </For>
+                          </select>
+                          <button
+                            type="button"
+                            class="icon-btn cursor-context-remove"
+                            onClick={() => removeCursorModelContext(index())}
+                            aria-label="删除模型上下文规则"
+                            title="删除"
+                          >
+                            <IconX size={14} />
+                          </button>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </div>
             </div>
 
             <div class="backend-card">

@@ -31,6 +31,7 @@ impl SdkAdapter for AlkaidAdapter {
             proxy: settings.vega_proxy.clone(),
             path_env: "ALKAID_RUNTIME",
             api_key: None,
+            extra_env: Vec::new(),
         }
     }
 

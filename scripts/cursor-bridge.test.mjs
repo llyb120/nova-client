@@ -9,6 +9,7 @@ const {
   compactConversation,
   completePendingTools,
   compressSlimMemory,
+  contextPressureTier,
   contextTokensFromUsage,
   createCursorAgent,
   createCursorFilesystemTools,
@@ -18,6 +19,8 @@ const {
   cursorCavemanPolicy,
   cursorPromptPrefix,
   cursorModelOptions,
+  cursorContextWindow,
+  parseCursorModelContextRules,
   cursorShellProgram,
   cursorTodoPlan,
   ensureGlobalTaskDenyHooks,
@@ -43,10 +46,12 @@ const {
   promptMessage,
   recordSlimTurn,
   recoverTimedOutAgent,
+  seedSlimMemoryFromSession,
   sendPromptWithRecovery,
   threadMemoryKey,
   withTimeout,
   agentFingerprint,
+  canReuseAgentSession,
   createAgentPrewarm,
 } = await import("./cursor-bridge.mjs");
 const state = createMessageState();
@@ -138,6 +143,17 @@ assert.notEqual(
   agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a", mode: "plan" }),
   agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a", mode: "agent" }),
 );
+const reusableRequest = { model: "grok-4.5-high-fast", cwd: "/tmp/a", mode: "agent" };
+const reusableSession = { sessionKey: "thread-a", fingerprint: agentFingerprint(reusableRequest) };
+assert.equal(canReuseAgentSession({ agentId: "live" }, reusableSession, reusableRequest, "thread-a"), true);
+assert.equal(canReuseAgentSession(undefined, reusableSession, reusableRequest, "thread-a"), false);
+assert.equal(canReuseAgentSession({ agentId: "live" }, reusableSession, reusableRequest, "thread-b"), false);
+assert.equal(canReuseAgentSession(
+  { agentId: "live" },
+  reusableSession,
+  { ...reusableRequest, mode: "plan" },
+  "thread-a",
+), false);
 {
   let createCount = 0;
   const created = [];
@@ -303,7 +319,7 @@ assert.deepEqual(recoveryCalls, ["cancel:stale"]);
 assert.deepEqual(timingPhases, ["send_active_run", "active_run_cleanup", "send_retry"]);
 
 let fallbackAttempts = 0;
-const resumedRun = { id: "resumed-run" };
+const recreatedRun = { id: "recreated-run" };
 const fallbackAgent = {
   agentId: "agent-2",
   send: async () => {
@@ -312,15 +328,32 @@ const fallbackAgent = {
   },
   close: () => recoveryCalls.push("fallback-close"),
 };
-const resumedAgent = { send: async () => resumedRun };
+let recreatedMessage;
+const recreatedAgent = {
+  send: async (message) => {
+    recreatedMessage = message;
+    return recreatedRun;
+  },
+};
 const fallbackSdk = {
   listRuns: async () => ({ items: [{ id: "queued", status: "queued" }] }),
   cancelRun: async (id) => recoveryCalls.push(`cancel:${id}`),
-  resume: async () => resumedAgent,
+  resume: async () => assert.fail("wedged live sessions must not resume checkpoints"),
+  create: async () => recreatedAgent,
 };
-const fallback = await sendPromptWithRecovery(fallbackAgent, { cwd: "." }, "continue", {}, fallbackSdk, () => {});
-assert.equal(fallback.agent, resumedAgent);
-assert.equal(fallback.run, resumedRun);
+const fallback = await sendPromptWithRecovery(
+  fallbackAgent,
+  { cwd: "." },
+  "incremental",
+  {},
+  fallbackSdk,
+  () => {},
+  "complete bootstrap",
+);
+assert.equal(fallback.agent, recreatedAgent);
+assert.equal(fallback.run, recreatedRun);
+assert.equal(fallback.replaced, true);
+assert.equal(recreatedMessage, "complete bootstrap");
 assert.equal(fallbackAttempts, 2);
 
 await assert.rejects(
@@ -371,6 +404,21 @@ assert.equal(compactConversation(conversation), [
   "Assistant: Changed the lighting.",
 ].join("\n\n"));
 assert.ok(compactConversation(conversation, 40).endsWith("Assistant: Changed the lighting."));
+const seededMemory = createSlimMemory();
+assert.equal(await seedSlimMemoryFromSession(
+  seededMemory,
+  "legacy-session",
+  { cwd: "." },
+  {
+    resume: async () => assert.fail("history seeding must not resume checkpoints"),
+    listRuns: async () => ({ items: [{
+      status: "finished",
+      createdAt: 1,
+      conversation: async () => conversation,
+    }] }),
+  },
+), true);
+assert.match(formatSlimMemory(seededMemory), /Created the first version/);
 const recoveredMessage = messageWithRecoveryContext(
   { text: "Add animation", images: [{ data: "image", mimeType: "image/png" }] },
   compactConversation(conversation),
@@ -402,7 +450,6 @@ const freshRecovery = await recoverTimedOutAgent(
   { cwd: ".", model: "grok-4.5-high-fast" },
   freshSdk,
   100,
-  true,
 );
 assert.equal(freshRecovery.agent, freshAgent);
 assert.equal(freshRecovery.replaced, true);
@@ -417,15 +464,25 @@ assert.deepEqual(slim.turns, [
   { userPrompt: "Build a restaurant", conclusion: "Created the first version." },
   { userPrompt: "Make it bright", conclusion: "Changed the lighting." },
 ]);
-assert.match(formatSlimMemory(slim), /Recent turns/);
+assert.match(formatSlimMemory(slim), /## Conversation/);
 const slimMessage = messageWithSlimMemory(
   { text: "Add animation", images: [{ data: "image", mimeType: "image/png" }] },
   slim,
 );
 assert.match(slimMessage.text, /Changed the lighting/);
-assert.match(slimMessage.text, /Current request:\nAdd animation$/);
+assert.match(slimMessage.text, /User:\nAdd animation$/);
 assert.deepEqual(slimMessage.images, [{ data: "image", mimeType: "image/png" }]);
-assert.equal(messageWithSlimMemory("only current", createSlimMemory()), "only current");
+assert.match(messageWithSlimMemory("only current", createSlimMemory()), /## Conversation\n\nUser:\nonly current$/);
+
+const appendOnly = createSlimMemory();
+const firstPrompt = messageWithSlimMemory("First request", appendOnly);
+recordSlimTurn(appendOnly, "First request", "First conclusion");
+const secondPrompt = messageWithSlimMemory("Second request", appendOnly);
+assert.ok(secondPrompt.startsWith(firstPrompt));
+assert.equal(secondPrompt.slice(firstPrompt.length), "\nAssistant:\nFirst conclusion\n\nUser:\nSecond request");
+const firstPolicyPrompt = messageWithToolPolicy(firstPrompt, { readOnly: false });
+const secondPolicyPrompt = messageWithToolPolicy(secondPrompt, { readOnly: false });
+assert.ok(secondPolicyPrompt.startsWith(firstPolicyPrompt));
 
 const interruptedState = createMessageState();
 mapMessage({ type: "thinking", run_id: "interrupted", text: "Need to inspect the file first." }, interruptedState);
@@ -451,14 +508,14 @@ assert.match(completedContext, /I inspected the file/);
 assert.match(completedContext, /read_file/);
 assert.doesNotMatch(completedContext, /Assistant reasoning/);
 assert.doesNotMatch(completedContext, /Need to inspect the file first/);
-const completedMemory = createSlimMemory();
-completedMemory.fullTurns = [completedContext];
-assert.doesNotMatch(formatSlimMemory(completedMemory), /Assistant reasoning/);
 const interruptedMemory = createSlimMemory();
 interruptedMemory.pendingTurn = interruptedContext;
 assert.equal(isSlimMemoryEmpty(interruptedMemory), false);
-assert.match(messageWithSlimMemory("Continue", interruptedMemory), /complete working context/);
-assert.match(messageWithSlimMemory("Continue", interruptedMemory), /Assistant reasoning/);
+const interruptedPrompt = messageWithSlimMemory("Fix the unfinished change", createSlimMemory());
+const resumedPrompt = messageWithSlimMemory("Continue", interruptedMemory);
+assert.ok(resumedPrompt.startsWith(interruptedPrompt));
+assert.match(resumedPrompt, /complete working context/);
+assert.match(resumedPrompt, /Assistant reasoning/);
 const failedBeforeSdkStart = pendingTurnContext("", "Inspect the repository");
 assert.match(failedBeforeSdkStart, /^User:\nInspect the repository$/);
 const failedAgain = pendingTurnContext(failedBeforeSdkStart, "go on");
@@ -479,9 +536,8 @@ const compressible = createSlimMemory();
 for (let index = 1; index <= 10; index += 1) {
   recordSlimTurn(compressible, `user prompt ${index}`, `conclusion ${index}`);
 }
-compressible.contextStage = "slim";
 assert.equal(
-  await compressSlimMemory(compressible, async () => assert.fail("stage one must not summarize"), {
+  await compressSlimMemory(compressible, async () => assert.fail("below threshold must not summarize"), {
     currentTokens: 0,
     maxTokens: 750,
     maxChars: 100_000,
@@ -497,13 +553,53 @@ assert.equal(await compressSlimMemory(compressible, async (input) => {
 assert.match(summaryInput, /user prompt 1/);
 assert.match(summaryInput, /user prompt 10/);
 assert.doesNotMatch(summaryInput, /latest user prompt/);
-assert.equal(compressible.summary, "Summary of the first ten turns.");
+assert.deepEqual(compressible.digests, ["Summary of the first ten turns."]);
+assert.deepEqual(compressible.preservedUserPrompts.slice(0, 2), ["user prompt 1", "user prompt 2"]);
+assert.match(formatSlimMemory(compressible), /### Preserved user requests/);
 assert.deepEqual(compressible.turns, [{
   userPrompt: "latest user prompt must remain exact",
   conclusion: "latest conclusion",
 }]);
-assert.equal(contextTokensFromUsage({ totalTokens: 900, inputTokens: 800 }), 900);
-assert.equal(contextTokensFromUsage({ input_tokens: 700, output_tokens: 50 }), 750);
+recordSlimTurn(compressible, "next prompt", "next conclusion");
+assert.equal(await compressSlimMemory(compressible, async () => "Second frozen digest.", {
+  currentTokens: 750,
+  maxTokens: 750,
+}), true);
+assert.deepEqual(compressible.digests, ["Summary of the first ten turns.", "Second frozen digest."]);
+recordSlimTurn(compressible, "third prompt", "third conclusion");
+assert.equal(await compressSlimMemory(compressible, async () => assert.fail("stuck compaction must pause"), {
+  currentTokens: 750,
+  maxTokens: 750,
+}), false);
+assert.equal(compressible.compactStuck, true);
+assert.equal(await compressSlimMemory(compressible, async () => assert.fail("below threshold must reset without summarizing"), {
+  currentTokens: 1,
+  maxTokens: 750,
+}), false);
+assert.equal(compressible.compactStuck, false);
+assert.equal(compressible.consecutiveCompactions, 0);
+assert.equal(contextPressureTier(499, 1_000), "normal");
+assert.equal(contextPressureTier(500, 1_000), "warn");
+assert.equal(contextPressureTier(600, 1_000), "snip");
+assert.equal(contextPressureTier(800, 1_000), "elide");
+assert.equal(contextPressureTier(900, 1_000), "force");
+const contextRules = parseCursorModelContextRules(JSON.stringify([
+  { prefix: "claude", contextWindow: 200_000 },
+  { prefix: "claude-4.5", contextWindow: 1_000_000 },
+  { prefix: "", contextWindow: 64_000 },
+  { prefix: "broken", contextWindow: 0 },
+]));
+assert.deepEqual(contextRules, [
+  { prefix: "claude-4.5", contextWindow: 1_000_000 },
+  { prefix: "claude", contextWindow: 200_000 },
+]);
+assert.equal(cursorContextWindow("Claude-4.5-Sonnet", contextRules), 1_000_000);
+assert.equal(cursorContextWindow("claude-4-sonnet", contextRules), 200_000);
+assert.equal(cursorContextWindow("gpt-5", contextRules, 128_000), 128_000);
+assert.deepEqual(parseCursorModelContextRules("not-json"), []);
+assert.equal(contextTokensFromUsage({ totalTokens: 900, outputTokens: 100, inputTokens: 800 }), 800);
+assert.equal(contextTokensFromUsage({ input_tokens: 700, output_tokens: 50 }), 700);
+assert.equal(contextTokensFromUsage({ inputTokens: 100, cacheReadTokens: 600, cacheWriteTokens: 100 }), 800);
 
 const conclusionState = createMessageState();
 conclusionState.texts.set("run-assistant-1", "Final answer from the assistant.");
@@ -573,7 +669,7 @@ const slimWithPolicy = messageWithToolPolicy(messageWithSlimMemory("Continue", s
 assert.match(slimWithPolicy, /read_files/);
 assert.match(slimWithPolicy, /回复默认简洁专业/);
 assert.match(slimWithPolicy, /Changed the lighting/);
-assert.match(slimWithPolicy, /Current request:\nContinue$/);
+assert.match(slimWithPolicy, /User:\nContinue$/);
 assert.equal(isEditFilesTool("edit_files"), true);
 assert.equal(isEditFilesTool("mcp__custom-user-tools__edit_files"), true);
 assert.equal(isEditFilesTool("read_files"), false);

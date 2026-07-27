@@ -19,6 +19,7 @@ pub struct LaunchConfig {
     pub proxy: String,
     pub path_env: &'static str,
     pub api_key: Option<(&'static str, String)>,
+    pub extra_env: Vec<(&'static str, String)>,
 }
 
 pub trait SdkAdapter: Send + Sync {

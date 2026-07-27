@@ -2058,7 +2058,7 @@ fn send_prompt(
         }
     }
     // 复用本地聊天的唯一分发入口：运行中的 Alkaid/Codex/Devin 走原生引导，
-    // Cursor 走打断后新 turn（Agent.create + slim memory），与桌面输入框保持一致。
+    // Cursor 走打断后新 turn并继续复用 live Agent session，与桌面输入框保持一致。
     // `/fire` 在 dispatch_prompt 内统一拦截，远程与其它入口行为一致。
     crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), images)
 }

@@ -27,6 +27,7 @@ impl SdkAdapter for CodeBuddyAdapter {
             proxy: settings.codebuddy_proxy.clone(),
             path_env: "NOVA_CODEBUDDY_PATH",
             api_key: None,
+            extra_env: Vec::new(),
         }
     }
 

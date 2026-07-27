@@ -28,6 +28,7 @@ impl SdkAdapter for ClaudeAdapter {
             path_env: "NOVA_CLAUDE_PATH",
             api_key: (!settings.claudecode_sdk_api_key.is_empty())
                 .then(|| ("ANTHROPIC_API_KEY", settings.claudecode_sdk_api_key.clone())),
+            extra_env: Vec::new(),
         }
     }
 

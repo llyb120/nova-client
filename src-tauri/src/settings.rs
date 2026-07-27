@@ -5,6 +5,15 @@ use std::path::PathBuf;
 /// 默认中转服务地址。relay_server 为空时回退到它；空字符串表示必须用户自填。
 pub const DEFAULT_RELAY_SERVER: &str = "";
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorModelContextRule {
+    /// 不区分大小写的 Cursor 模型 id 前缀。
+    pub prefix: String,
+    /// 模型上下文窗口，单位 token。
+    pub context_window: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -36,6 +45,8 @@ pub struct Settings {
     pub cursor_proxy: String,
     /// Cursor SDK API Key；空 = 使用 CURSOR_API_KEY 环境变量。
     pub cursor_sdk_api_key: String,
+    /// Cursor 模型 id 前缀到上下文窗口的映射；最长前缀优先。
+    pub cursor_model_contexts: Vec<CursorModelContextRule>,
     /// OpenCode CLI 可执行文件路径（默认 opencode，依赖 PATH）
     pub opencode_path: String,
     /// 旧版 OpenCode ACP 启动参数，仅用于兼容已有设置。
@@ -52,8 +63,6 @@ pub struct Settings {
     pub vega_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
-    /// Vega 使用类似 Cursor 的精简上下文：仅携带用户提示词和轮次结论，并自动摘要旧轮次。
-    pub vega_slim_context_enabled: bool,
     /// 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件。
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
@@ -138,6 +147,7 @@ impl Default for Settings {
             cursor_args: "acp".into(),
             cursor_proxy: String::new(),
             cursor_sdk_api_key: String::new(),
+            cursor_model_contexts: Vec::new(),
             opencode_path: "opencode".into(),
             opencode_args: "acp".into(),
             opencode_proxy: String::new(),
@@ -146,7 +156,6 @@ impl Default for Settings {
             codex_proxy: String::new(),
             vega_proxy: String::new(),
             windows_shell_shim_enabled: false,
-            vega_slim_context_enabled: false,
             checkpoint_enabled: false,
             default_mode: String::new(),
             lightweight_model_agent: "alkaid".into(),
@@ -198,11 +207,6 @@ mod tests {
     }
 
     #[test]
-    fn vega_slim_context_is_disabled_by_default() {
-        assert!(!Settings::default().vega_slim_context_enabled);
-    }
-
-    #[test]
     fn legacy_title_model_migrates_to_lightweight_model() {
         let settings: Settings = serde_json::from_str(
             r#"{"titleModelAgent":"codex","titleModel":"gpt-5-mini"}"#,
@@ -215,6 +219,17 @@ mod tests {
     #[test]
     fn checkpoint_file_restore_is_disabled_by_default() {
         assert!(!Settings::default().checkpoint_enabled);
+    }
+
+    #[test]
+    fn cursor_model_context_rules_round_trip() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"cursorModelContexts":[{"prefix":"claude-4","contextWindow":200000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.cursor_model_contexts.len(), 1);
+        assert_eq!(settings.cursor_model_contexts[0].prefix, "claude-4");
+        assert_eq!(settings.cursor_model_contexts[0].context_window, 200_000);
     }
 
     #[test]

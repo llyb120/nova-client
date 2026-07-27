@@ -275,19 +275,14 @@ impl SdkManager {
             }
         }
         parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
-        let (vega_slim_context, lightweight_model) = if self.adapter.agent_kind()
-            == AgentKind::Alkaid
-        {
+        let lightweight_model = if self.adapter.agent_kind() == AgentKind::Alkaid {
             let app_state = self.app.state::<AppState>();
             let settings = app_state.settings.lock().unwrap();
-            (
-                settings.vega_slim_context_enabled,
-                (AgentKind::from_str(&settings.lightweight_model_agent) == Some(AgentKind::Alkaid))
-                    .then(|| settings.lightweight_model.trim().to_string())
-                    .filter(|model| !model.is_empty()),
-            )
+            (AgentKind::from_str(&settings.lightweight_model_agent) == Some(AgentKind::Alkaid))
+                .then(|| settings.lightweight_model.trim().to_string())
+                .filter(|model| !model.is_empty())
         } else {
-            (false, None)
+            None
         };
         let mut request = json!({
             "action": "prompt",
@@ -298,7 +293,6 @@ impl SdkManager {
             "model": model,
             "mode": mode,
             "reasoningEffort": reasoning_effort,
-            "vegaSlimContext": vega_slim_context,
             "lightweightModel": lightweight_model,
             "parts": parts
         });
@@ -385,7 +379,7 @@ impl SdkManager {
     }
 
     /// 支持原生 steer 的 SDK 直接把用户消息排入当前 Agent run；其他 SDK
-    /// （如 Cursor：每轮 Agent.create + slim memory）仍静默结束当前流，再开新 turn。
+    /// （如 Cursor：复用 live Agent session，但无原生 steer）仍静默结束当前流，再开新 turn。
     pub async fn steer_prompt(
         self: &Arc<Self>,
         thread_id: String,
@@ -1014,6 +1008,7 @@ impl SdkManager {
             command.envs(&self.launch_env);
         }
         apply_proxy_env(&mut command, &launch.proxy);
+        command.envs(launch.extra_env);
         if self.launch_env.is_empty() {
             if let Some((name, value)) = launch.api_key {
                 command.env(name, value);

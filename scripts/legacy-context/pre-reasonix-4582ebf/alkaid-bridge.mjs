@@ -1,14 +1,13 @@
 import { createInterface } from "node:readline";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ALKAID_PROVIDER_IDLE_TIMEOUT_ENABLED, ALKAID_PROVIDER_IDLE_TIMEOUT_MS, alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, messagesWithPendingAlkaidPrompt, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
-import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
-const stableHash = (value) => createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex").slice(0, 16);
 const dataRoot = alkaidDataRoot();
 const sessionRoot = join(dataRoot, "sessions");
 const sessionPath = (sessionId) => {
@@ -52,29 +51,12 @@ async function loadSlimMemory(sessionId) {
     const parsed = JSON.parse(await readFile(slimMemoryPath(sessionId), "utf8"));
     return Array.isArray(parsed?.turns)
       ? {
-          ...createSlimMemory(),
-          digests: Array.isArray(parsed.digests)
-            ? parsed.digests.map(String).filter(Boolean)
-            : String(parsed.summary ?? "").trim() ? [String(parsed.summary).trim()] : [],
-          preservedUserPrompts: Array.isArray(parsed.preservedUserPrompts)
-            ? parsed.preservedUserPrompts.map(String).filter(Boolean)
-            : [],
+          summary: String(parsed.summary ?? ""),
           turns: parsed.turns,
           pendingMessages: Array.isArray(parsed.pendingMessages) ? parsed.pendingMessages : [],
           fullMessages: Array.isArray(parsed.fullMessages) ? parsed.fullMessages : [],
           contextTokens: Number(parsed.contextTokens) || 0,
           contextStage: parsed.contextStage === "slim" ? "slim" : "full",
-          contextTier: ["normal", "warn", "snip", "elide", "force"].includes(parsed.contextTier)
-            ? parsed.contextTier
-            : "normal",
-          rewriteVersion: Number(parsed.rewriteVersion) || 0,
-          systemPromptSnapshot: String(parsed.systemPromptSnapshot ?? ""),
-          systemFingerprint: String(parsed.systemFingerprint ?? ""),
-          systemPromptHash: String(parsed.systemPromptHash ?? ""),
-          toolSchemaHash: String(parsed.toolSchemaHash ?? ""),
-          lastShapeRewriteVersion: Number(parsed.lastShapeRewriteVersion) || 0,
-          consecutiveCompactions: Number(parsed.consecutiveCompactions) || 0,
-          compactStuck: parsed.compactStuck === true,
         }
       : createSlimMemory();
   } catch {
@@ -83,14 +65,23 @@ async function loadSlimMemory(sessionId) {
 }
 
 async function saveSlimMemory(sessionId, memory) {
-  await saveJson(slimMemoryPath(sessionId), { version: 3, ...memory });
+  await saveJson(slimMemoryPath(sessionId), { version: 1, ...memory });
 }
 
 function messageWithSlimMemory(text, memory) {
   const context = formatSlimMemory(memoryWithoutCurrent(memory, {
     pendingMessages: memory.pendingMessages?.length > 0,
   }));
-  return `${context}\n\nUser:\n${text}`;
+  if (!context) return text;
+  return [
+    "请仅使用下面的精简记忆延续会话。完整工具轨迹和原始对话已被有意省略。",
+    "不要要求用户重复之前的要求；结合记忆和当前请求继续工作。",
+    "",
+    context,
+    "",
+    "当前请求：",
+    text,
+  ].join("\n");
 }
 
 function startedToolItem(event) {
@@ -130,44 +121,25 @@ async function prompt(request, commands) {
   const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
   const resolved = resolveAlkaidModel(config, request.model);
   const sessionId = request.sessionId || randomUUID();
-  // Reasonix-style context is Vega's canonical session model, not an optional request mode.
-  const slimContext = true;
+  const slimContext = request.vegaSlimContext === true;
   let memory = createSlimMemory();
   let useFullContext = false;
   let maxContextTokens = Number.POSITIVE_INFINITY;
   let maxContextChars = Number.POSITIVE_INFINITY;
-  let contextWindow = Number.POSITIVE_INFINITY;
   if (slimContext) {
     memory = await loadSlimMemory(sessionId);
-    if (!memory.digests.length && !memory.turns.length && request.sessionId) {
+    if (!memory.summary && !memory.turns.length && request.sessionId) {
       seedSlimMemoryFromMessages(memory, await loadMessages(request.sessionId));
     }
-    const systemFingerprint = stableHash({ cwd: request.cwd, mode: request.mode === "plan" ? "plan" : "agent" });
-    if (memory.systemFingerprint && memory.systemFingerprint !== systemFingerprint) {
-      memory.systemPromptSnapshot = "";
-      memory.rewriteVersion = (memory.rewriteVersion ?? 0) + 1;
-    }
-    memory.systemFingerprint = systemFingerprint;
-
-    contextWindow = Math.max(2_000, Number(resolved.model.contextWindow ?? 128_000));
-    maxContextTokens = Math.max(2_000, Math.floor(contextWindow * 0.8));
-    const forceContextTokens = Math.max(2_000, Math.floor(contextWindow * 0.9));
-    maxContextChars = Math.max(8_000, forceContextTokens * 4);
-    const pressure = contextPressureTier(memory.contextTokens, contextWindow);
-    if (memory.contextStage === "full" && ["snip", "elide", "force"].includes(pressure)) {
-      const compactedTools = compactNativeToolResults(memory.fullMessages, pressure);
-      if (compactedTools.changed) {
-        memory.fullMessages = compactedTools.messages;
-        memory.rewriteVersion = (memory.rewriteVersion ?? 0) + 1;
-      }
-    }
-    memory.contextTier = pressure;
-    useFullContext = shouldUseFullContext(memory, forceContextTokens, maxContextChars);
+    maxContextTokens = Math.max(150_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.6));
+    maxContextChars = Math.max(8_000, maxContextTokens * 4);
+    useFullContext = shouldUseFullContext(memory, maxContextTokens, maxContextChars);
     if (!useFullContext && memory.contextStage === "full") {
+      // Stage one only drops native thinking/tool trajectories. Token usage from that native
+      // request must not immediately trigger stage-two summarization.
       memory.contextStage = "slim";
       memory.contextTokens = 0;
       memory.fullMessages = [];
-      memory.rewriteVersion = (memory.rewriteVersion ?? 0) + 1;
     }
     appendSlimTurn(memory, input.text);
     // Capacity decisions must use the rebuilt summary/prompt/conclusion context, not token usage
@@ -252,34 +224,10 @@ async function prompt(request, commands) {
     thinkingLevel: resolved.thinkingLevel ?? request.reasoningEffort,
     mcpServers: await mcpServers(),
     sessionId,
-    systemPromptSnapshot: memory.systemPromptSnapshot,
     // Early turns and interrupted work retain the native message/tool trajectory. Once either
     // threshold is reached, compact memory replaces completed trajectories as usual.
     messages: nativeMessages,
     readOnly: request.mode === "plan",
-  });
-  if (!memory.systemPromptSnapshot) memory.systemPromptSnapshot = runtime.systemPrompt;
-  const systemPromptHash = stableHash(runtime.systemPrompt);
-  const toolSchemaHash = stableHash(runtime.toolShape);
-  const cacheMissReasons = [];
-  if (memory.systemPromptHash && memory.systemPromptHash !== systemPromptHash) cacheMissReasons.push("system_changed");
-  if (memory.toolSchemaHash && memory.toolSchemaHash !== toolSchemaHash) cacheMissReasons.push("tools_changed");
-  if ((memory.lastShapeRewriteVersion ?? 0) !== (memory.rewriteVersion ?? 0)) cacheMissReasons.push("history_rewritten");
-  memory.systemPromptHash = systemPromptHash;
-  memory.toolSchemaHash = toolSchemaHash;
-  memory.lastShapeRewriteVersion = memory.rewriteVersion ?? 0;
-  send({
-    type: "timing",
-    phase: "context_shape",
-    elapsedMs: 0,
-    contextTier: memory.contextTier,
-    rewriteVersion: memory.rewriteVersion ?? 0,
-    cacheMissReasons,
-    systemPromptHash,
-    toolSchemaHash,
-    historyHash: stableHash(formatSlimMemory(memoryWithoutCurrent(memory, {
-      pendingMessages: memory.pendingMessages?.length > 0,
-    }))),
   });
   let text = "";
   let thinking = "";
@@ -486,27 +434,19 @@ async function prompt(request, commands) {
         const measuredTokens = contextTokensFromMessages(runtime.agent.state.messages);
         if (memory.contextStage === "full") {
           memory.contextTokens = measuredTokens;
-          const forceContextTokens = Math.max(2_000, Math.floor(contextWindow * 0.9));
           const belowCapacity = measuredTokens > 0
-            ? measuredTokens < forceContextTokens
+            ? measuredTokens < maxContextTokens
             : JSON.stringify(runtime.agent.state.messages).length < maxContextChars;
-          if (belowCapacity) {
+          if (memory.turns.length < 10 && belowCapacity) {
             const completedMessages = structuredClone(runtime.agent.state.messages);
-            const strippedMessages = stripsCompletedReasoning
+            memory.fullMessages = stripsCompletedReasoning
               ? stripCompletedOpenAIReasoning(completedMessages)
               : completedMessages;
-            const pressure = contextPressureTier(measuredTokens, contextWindow);
-            const compactedTools = compactNativeToolResults(strippedMessages, pressure);
-            memory.fullMessages = compactedTools.messages;
-            memory.contextTier = pressure;
-            if (compactedTools.changed) memory.rewriteVersion = (memory.rewriteVersion ?? 0) + 1;
           } else {
-            // 90% is the hard boundary: start a compact frozen-digest epoch before overflow.
+            // Enter stage two without summarizing yet. Its own usage is measured on the next turn.
             memory.contextStage = "slim";
-            memory.contextTier = "force";
             memory.contextTokens = 0;
             memory.fullMessages = [];
-            memory.rewriteVersion = (memory.rewriteVersion ?? 0) + 1;
           }
         } else {
           memory.contextTokens = measuredTokens;
@@ -518,24 +458,6 @@ async function prompt(request, commands) {
       await saveSlimMemory(sessionId, memory);
     } else {
       await saveMessages(sessionId, runtime.agent.state.messages);
-    }
-    if (usage) {
-      const inputTokens = Number(usage.input) || 0;
-      const cacheReadTokens = Number(usage.cacheRead) || 0;
-      const cacheWriteTokens = Number(usage.cacheWrite) || 0;
-      const cacheDenominator = inputTokens >= cacheReadTokens + cacheWriteTokens
-        ? inputTokens
-        : inputTokens + cacheReadTokens + cacheWriteTokens;
-      send({
-        type: "timing",
-        phase: "cache_shape",
-        elapsedMs: 0,
-        inputTokens,
-        cacheReadTokens,
-        cacheWriteTokens,
-        cacheHitRate: cacheDenominator > 0 ? cacheReadTokens / cacheDenominator : 0,
-        rewriteVersion: memory.rewriteVersion ?? 0,
-      });
     }
     send({
       type: "done",

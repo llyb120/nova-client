@@ -4253,6 +4253,55 @@ button {
   min-width: 0;
 }
 
+.cursor-context-config {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+.cursor-context-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cursor-context-head .field-hint,
+.cursor-context-empty {
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.cursor-context-add {
+  flex: none;
+  min-height: 28px;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.cursor-context-list {
+  display: grid;
+  gap: 6px;
+}
+
+.cursor-context-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(120px, 180px) 30px;
+  align-items: center;
+  gap: 8px;
+}
+
+.cursor-context-row .field-input {
+  min-width: 0;
+}
+
+.cursor-context-remove {
+  width: 30px;
+  height: 30px;
+}
+
 @media (max-width: 680px) {
   .backend-config-row {
     align-items: stretch;
@@ -4278,6 +4327,10 @@ button {
 
   .backend-proxy-field .field-label {
     text-align: left;
+  }
+
+  .cursor-context-row {
+    grid-template-columns: minmax(0, 1fr) minmax(110px, 0.7fr) 30px;
   }
 }
 

@@ -1,21 +1,13 @@
+export const VEGA_SLIM_MEMORY_TURNS = 10;
+
 export function createSlimMemory() {
   return {
-    digests: [],
-    preservedUserPrompts: [],
+    summary: "",
     turns: [],
     pendingMessages: [],
     fullMessages: [],
     contextTokens: 0,
     contextStage: "full",
-    contextTier: "normal",
-    rewriteVersion: 0,
-    systemPromptSnapshot: "",
-    systemFingerprint: "",
-    systemPromptHash: "",
-    toolSchemaHash: "",
-    lastShapeRewriteVersion: 0,
-    consecutiveCompactions: 0,
-    compactStuck: false,
   };
 }
 
@@ -66,22 +58,14 @@ export function normalizeSlimMemory(memory) {
     }
   }
   if (pendingPrompts.length) normalized.push({ userPrompts: pendingPrompts, conclusion: "" });
-  const legacySummary = String(memory.summary ?? "").trim();
-  memory.digests = Array.isArray(memory.digests)
-    ? memory.digests.map(String).map((value) => value.trim()).filter(Boolean)
-    : legacySummary ? [legacySummary] : [];
-  memory.preservedUserPrompts = Array.isArray(memory.preservedUserPrompts)
-    ? memory.preservedUserPrompts.map(String).map((value) => value.trim()).filter(Boolean)
-    : [];
   memory.turns = normalized;
-  delete memory.summary;
+  memory.summary = String(memory.summary ?? "").trim();
   return memory;
 }
 
 export function memoryWithoutCurrent(memory, { pendingMessages = false } = {}) {
   const normalized = normalizeSlimMemory({
-    digests: structuredClone(memory.digests ?? []),
-    preservedUserPrompts: structuredClone(memory.preservedUserPrompts ?? []),
+    summary: memory.summary,
     turns: structuredClone(memory.turns ?? []),
   });
   const latest = normalized.turns.at(-1);
@@ -97,23 +81,14 @@ export function memoryWithoutCurrent(memory, { pendingMessages = false } = {}) {
 
 export function formatSlimMemory(memory) {
   const normalized = normalizeSlimMemory(memory);
-  const sections = [
-    "请使用下面的只追加会话记录继续工作。不要要求用户重复之前的要求。",
-    "",
-    "## Conversation",
-  ];
-  if (normalized.preservedUserPrompts.length) {
-    sections.push("", "### Preserved user requests");
-    normalized.preservedUserPrompts.forEach((prompt) => sections.push(`User:\n${prompt}`));
-  }
-  if (normalized.digests.length) {
-    sections.push("", "### Frozen digests");
-    normalized.digests.forEach((digest, index) => sections.push(`Digest ${index + 1}:\n${digest}`));
-  }
-  for (const turn of normalized.turns) {
-    for (const prompt of turn.userPrompts) sections.push("", `User:\n${prompt}`);
-    if (turn.conclusion) sections.push(`Assistant:\n${turn.conclusion}`);
-  }
+  const sections = [];
+  if (normalized.summary) sections.push("## 更早轮次摘要", normalized.summary);
+  if (normalized.turns.length) sections.push("## 最近轮次");
+  normalized.turns.forEach((turn, index) => {
+    sections.push(`### 轮次 ${index + 1}`);
+    for (const prompt of turn.userPrompts) sections.push(`用户提示：${prompt}`);
+    if (turn.conclusion) sections.push(`结论：${turn.conclusion}`);
+  });
   return sections.join("\n");
 }
 
@@ -121,50 +96,33 @@ export async function compactSlimMemory(
   memory,
   summarize,
   {
-    maxTurns = Number.POSITIVE_INFINITY,
+    maxTurns = VEGA_SLIM_MEMORY_TURNS,
     maxChars = Number.POSITIVE_INFINITY,
     currentTokens = 0,
     maxTokens = Number.POSITIVE_INFINITY,
   } = {},
 ) {
   normalizeSlimMemory(memory);
-  const formatted = formatSlimMemory({ digests: memory.digests, turns: structuredClone(memory.turns) });
+  const formatted = formatSlimMemory({ summary: memory.summary, turns: structuredClone(memory.turns) });
   const withinTurnLimit = memory.turns.length <= maxTurns;
   const belowCharacterLimit = !Number.isFinite(maxChars) || formatted.length < maxChars;
   const belowTokenLimit = !Number.isFinite(maxTokens) || currentTokens < maxTokens;
-  if (withinTurnLimit && belowCharacterLimit && belowTokenLimit) {
-    memory.consecutiveCompactions = 0;
-    memory.compactStuck = false;
-    return false;
-  }
-  if (memory.compactStuck || memory.turns.length < 2) return false;
-  if ((memory.consecutiveCompactions ?? 0) >= 2) {
-    memory.compactStuck = true;
-    return false;
-  }
+  if (withinTurnLimit && belowCharacterLimit && belowTokenLimit) return false;
 
-  // Preserve the latest completed turn, or the latest completion plus following interrupted
-  // prompts. Older frozen digests never participate in a replacement summary.
+  // The latest conclusion and every prompt after it are invariant. Prefer retaining up to 10
+  // complete recent turns; if the model limit is already exceeded, summarize all older turns.
   const protectedCount = memory.turns.at(-1)?.conclusion ? 1 : Math.min(2, memory.turns.length);
+  // Match Cursor's policy: once the threshold is crossed, summarize every older complete turn
+  // rather than repeatedly shaving off a single turn. The newest conclusion (or the newest
+  // conclusion plus all following interrupted prompts) remains verbatim.
   const split = memory.turns.length - protectedCount;
   if (split <= 0) return false;
 
-  const compactedTurns = memory.turns.slice(0, split);
-  const preservedPrompts = compactedTurns
-    .flatMap((turn) => turn.userPrompts ?? [])
-    .filter((prompt) => prompt.length <= 2_000 && !memory.preservedUserPrompts.includes(prompt));
-  const earlier = {
-    digests: [],
-    preservedUserPrompts: [],
-    turns: compactedTurns.map((turn) => ({ userPrompts: turn.userPrompts, conclusion: turn.conclusion })),
-  };
-  const digest = String(await summarize(formatSlimMemory(earlier)) ?? "").trim();
-  if (!digest) return false;
-  memory.preservedUserPrompts.push(...preservedPrompts);
-  memory.digests.push(digest);
+  const earlier = { summary: memory.summary, turns: memory.turns.slice(0, split) };
+  const summary = String(await summarize(formatSlimMemory(earlier)) ?? "").trim();
+  if (!summary) return false;
+  memory.summary = summary;
   memory.turns = memory.turns.slice(split);
-  memory.rewriteVersion = (memory.rewriteVersion ?? 0) + 1;
-  memory.consecutiveCompactions = (memory.consecutiveCompactions ?? 0) + 1;
   return true;
 }
 
@@ -215,71 +173,26 @@ export function contextTokensFromMessages(messages) {
     const usage = message.usage;
     // Each assistant request reports the context size at that point. The latest/largest request,
     // not the sum across tool calls, is the value that should be compared with the context window.
-    const total = Number(usage.totalTokens ?? usage.total_tokens) || 0;
-    const output = Number(usage.output ?? usage.outputTokens ?? usage.output_tokens) || 0;
-    const input = Number(usage.input) || 0;
-    const cached = (Number(usage.cacheRead) || 0) + (Number(usage.cacheWrite) || 0);
-    // Some providers include cached tokens in `input`, while others report them separately.
-    const measured = total > output ? total - output : (input >= cached ? input : input + cached);
+    const measured = Number(usage.totalTokens ?? usage.total_tokens)
+      || ["input", "output", "cacheRead", "cacheWrite"]
+        .reduce((total, key) => total + (Number(usage[key]) || 0), 0);
     tokens = Math.max(tokens, measured);
   }
   return tokens;
 }
 
-export function contextPressureTier(currentTokens, contextWindow) {
-  if (!(currentTokens > 0) || !(contextWindow > 0)) return "normal";
-  const ratio = currentTokens / contextWindow;
-  if (ratio >= 0.9) return "force";
-  if (ratio >= 0.8) return "elide";
-  if (ratio >= 0.6) return "snip";
-  if (ratio >= 0.5) return "warn";
-  return "normal";
-}
-
-function compactToolText(text, tier, toolCallId) {
-  const value = String(text ?? "");
-  if (value.includes("[elided tool result")) return value;
-  if (tier === "snip" && Buffer.byteLength(value, "utf8") <= 8 * 1024) return value;
-  const bytes = Buffer.byteLength(value, "utf8");
-  const id = toolCallId ? ` ${toolCallId}` : "";
-  if (tier === "elide" || tier === "force") {
-    return `[elided tool result${id} — ${bytes} bytes; re-run the tool if needed]`;
-  }
-  const head = value.slice(0, 3_000);
-  const tail = value.slice(-2_000);
-  return `${head}\n\n…[snipped older tool result${id} — ${bytes} bytes]…\n\n${tail}`;
-}
-
-/** Apply one-way, stable compaction to older native tool results before summary is necessary. */
-export function compactNativeToolResults(messages, tier, { preserveRecent = 6 } = {}) {
-  if (!["snip", "elide", "force"].includes(tier)) return { messages, changed: false };
-  const cutoff = Math.max(0, (messages?.length ?? 0) - preserveRecent);
-  let changed = false;
-  const next = (messages ?? []).map((message, index) => {
-    if (index >= cutoff || message?.role !== "toolResult" || !Array.isArray(message.content)) return message;
-    let contentChanged = false;
-    const content = message.content.map((part) => {
-      if (part?.type !== "text") return part;
-      const text = compactToolText(part.text, tier, message.toolCallId);
-      if (text === part.text) return part;
-      contentChanged = true;
-      return { ...part, text };
-    });
-    if (!contentChanged) return message;
-    changed = true;
-    return { ...message, content };
-  });
-  return { messages: changed ? next : messages, changed };
-}
-
 export function shouldUseFullContext(memory, maxContextTokens, maxContextChars = Number.POSITIVE_INFINITY) {
   if (memory.pendingMessages?.length) return true;
   if (memory.contextStage === "slim") return false;
-  if (!(memory.fullMessages?.length > 0)) return (memory.turns?.length ?? 0) === 0;
+  const turnCount = memory.turns?.length ?? 0;
+  if (turnCount === 0) return true;
   const measuredTokens = memory.contextTokens ?? 0;
-  return measuredTokens > 0
+  const belowCapacity = measuredTokens > 0
     ? measuredTokens < maxContextTokens
-    : JSON.stringify(memory.fullMessages).length < maxContextChars;
+    : JSON.stringify(memory.fullMessages ?? []).length < maxContextChars;
+  return turnCount < VEGA_SLIM_MEMORY_TURNS
+    && belowCapacity
+    && memory.fullMessages?.length > 0;
 }
 
 export function seedSlimMemoryFromMessages(memory, messages) {

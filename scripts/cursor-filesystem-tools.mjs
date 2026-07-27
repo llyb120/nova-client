@@ -1,12 +1,14 @@
 import { createReadStream } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
+import { searchSessionHistory } from "./session-history-search.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
-const READ_FILES_MAX_BYTES = 50 * 1024;
+const READ_FILES_MAX_BYTES = 32 * 1024;
 
 function truncateUtf8ToBytes(text, maxBytes) {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
@@ -88,7 +90,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
   const readOnly = options.readOnly === true;
   const tools = {
     read_files: {
-      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 Read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行（且不超过约 50KB）。请为每个文件按需指定 offset/limit，并用返回的 nextOffset 继续读取。`,
+      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 Read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行（且不超过约 32KB）。请为每个文件按需指定 offset/limit，并用返回的 nextOffset 继续读取。`,
       inputSchema: {
         type: "object",
         properties: {
@@ -120,6 +122,26 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         }));
         return JSON.stringify(results);
       },
+    },
+  };
+
+  const novaRoot = process.env.NOVA_DATA_DIR || join(homedir(), ".nova");
+  tools.search_session_history = {
+    description: "按需检索 Vega/Cursor 本地历史会话。仅在当前上下文缺少旧决策或用户明确要求查找历史时使用；返回 BM25 风格排序的少量片段。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", minLength: 1 },
+        limit: { type: "integer", minimum: 1, maximum: 10 },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    async execute({ query, limit }) {
+      return JSON.stringify(await searchSessionHistory([
+        join(novaRoot, "alkaid", "sessions"),
+        join(novaRoot, "cursor-slim-memory"),
+      ], query, { limit }));
     },
   };
 
@@ -217,7 +239,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
 export function cursorBatchToolPolicy(options = {}) {
   const readOnly = options.readOnly === true;
   const lines = [
-    "You have Nova batch tools read_files"
+    "You have Nova batch tools read_files / search_session_history"
       + (readOnly ? "" : " / edit_files")
       + " plus Cursor built-in Read, Shell, Grep"
       + (readOnly ? "" : ", Write/Edit")

@@ -347,6 +347,13 @@ export interface PermissionRequest {
   questions?: QuestionInfo[];
 }
 
+export interface CursorModelContextRule {
+  /** Case-insensitive model id prefix, for example `claude-4` or `gpt-5`. */
+  prefix: string;
+  /** Model context window in tokens. */
+  contextWindow: number;
+}
+
 export interface Settings {
   devinPath: string;
   acpArgs: string;
@@ -363,6 +370,8 @@ export interface Settings {
   /** 兼容旧配置；Cursor 后端仅使用官方 SDK，不再依赖本机 CLI */
   cursorPath: string;
   cursorSdkApiKey: string;
+  /** Cursor 模型 id 前缀到上下文窗口的映射；最长前缀优先。 */
+  cursorModelContexts: CursorModelContextRule[];
   /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */
   opencodePath: string;
   opencodeProxy: string;
@@ -372,8 +381,6 @@ export interface Settings {
   vegaProxy: string;
   /** Windows shell 启动 shim（保存后重启应用生效） */
   windowsShellShimEnabled: boolean;
-  /** Vega 精简上下文：仅保留用户提示词与结论，旧轮次自动摘要 */
-  vegaSlimContextEnabled: boolean;
   /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
   checkpointEnabled: boolean;
   defaultMode: string;

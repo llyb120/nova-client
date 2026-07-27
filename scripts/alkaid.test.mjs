@@ -9,7 +9,7 @@ import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
 import { ALKAID_PROVIDER_DIAGNOSTIC_LOG, alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
-import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import {
   alkaidPromptInput,
   alkaidSkillsRoot,
@@ -26,6 +26,7 @@ import {
   expandAlkaidSkillCommand,
   findWindowsPowerShell,
   formatAlkaidSkillsPrompt,
+  governToolResult,
   injectOpenAIPromptCacheKey,
   isRetryableAlkaidProviderError,
   loadAlkaidAgentInstructions,
@@ -34,11 +35,13 @@ import {
   messagesWithPendingAlkaidPrompt,
   OPENAI_TOOL_OUTPUT_MAX_CHARS,
   OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+  TOOL_OUTPUT_CONTEXT_MAX_BYTES,
   resolveAlkaidShellConfig,
   restoreAlkaidSteeringForRetry,
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
+import { searchSessionHistory } from "./session-history-search.mjs";
 
 const configuredModel = {
   id: "gpt-test",
@@ -175,17 +178,19 @@ test("native steering messages preserve text and images", async () => {
   assert.equal(typeof message.timestamp, "number");
 });
 
-test("Vega slim context keeps 10 conclusions and preserves interrupted prompts", async () => {
+test("Vega context stays append-only and preserves interrupted prompts", async () => {
   const memory = createSlimMemory();
   for (let index = 1; index <= 10; index += 1) {
     appendSlimTurn(memory, `prompt ${index}`);
     setLatestConclusion(memory, [{ type: "text", text: `conclusion ${index}` }]);
   }
-  assert.equal(await compactSlimMemory(memory, async () => assert.fail("10 turns must remain")), false);
+  assert.equal(await compactSlimMemory(memory, async () => assert.fail("turn count must not compact")), false);
+  const firstPrompt = formatSlimMemory(memory);
 
   appendSlimTurn(memory, "interrupted prompt");
   appendSlimTurn(memory, "replacement prompt");
   const sentContext = formatSlimMemory(memoryWithoutCurrent(memory));
+  assert.ok(sentContext.startsWith(firstPrompt));
   assert.match(sentContext, /interrupted prompt/);
   assert.doesNotMatch(sentContext, /replacement prompt/);
   setLatestConclusion(memory, [{ type: "text", text: "latest conclusion" }]);
@@ -193,11 +198,13 @@ test("Vega slim context keeps 10 conclusions and preserves interrupted prompts",
   let summaryInput = "";
   assert.equal(await compactSlimMemory(memory, async (input) => {
     summaryInput = input;
-    return "older summary";
-  }), true);
+    return "older digest";
+  }, { currentTokens: 800, maxTokens: 800 }), true);
   assert.match(summaryInput, /prompt 1/);
   assert.doesNotMatch(summaryInput, /latest conclusion/);
-  assert.equal(memory.summary, "older summary");
+  assert.deepEqual(memory.digests, ["older digest"]);
+  assert.deepEqual(memory.preservedUserPrompts.slice(0, 2), ["prompt 1", "prompt 2"]);
+  assert.match(formatSlimMemory(memory), /### Preserved user requests/);
   assert.equal(memory.turns.length, 1);
   assert.deepEqual(memory.turns[0], {
     userPrompts: ["interrupted prompt", "replacement prompt"],
@@ -274,7 +281,7 @@ test("Vega checkpoints a prompt before agent startup without replaying it in the
   ]);
 });
 
-test("Vega slim context keeps complete early messages until its turn or token threshold", () => {
+test("Vega keeps complete native messages until the capacity threshold", () => {
   const memory = createSlimMemory();
   memory.fullMessages = [{ role: "user", content: "full tool trajectory" }];
   memory.contextTokens = 749;
@@ -283,8 +290,8 @@ test("Vega slim context keeps complete early messages until its turn or token th
   memory.contextTokens = 750;
   assert.equal(shouldUseFullContext(memory, 750), false);
   memory.contextTokens = 1;
-  while (memory.turns.length < 10) appendSlimTurn(memory, `prompt ${memory.turns.length}`);
-  assert.equal(shouldUseFullContext(memory, 1_000), false);
+  while (memory.turns.length < 20) appendSlimTurn(memory, `prompt ${memory.turns.length}`);
+  assert.equal(shouldUseFullContext(memory, 1_000), true);
   memory.contextStage = "slim";
   memory.contextTokens = 0;
   assert.equal(shouldUseFullContext(memory, 1_000), false);
@@ -310,15 +317,58 @@ test("Vega slim context uses separate thresholds for trajectory removal and summ
     currentTokens: memory.contextTokens,
     maxTokens: 750,
   }), true);
-  assert.equal(memory.summary, "stage two summary");
+  assert.deepEqual(memory.digests, ["stage two summary"]);
   assert.deepEqual(memory.turns.map((turn) => turn.conclusion), ["conclusion 11"]);
 });
 
-test("Vega slim context measures the largest native request instead of cumulative turn usage", () => {
+test("Vega session history search is bounded, ranked, and excludes the active session", async () => {
+  const root = await mkdtemp(join(tmpdir(), "vega-history-search-"));
+  await writeFile(join(root, "active.slim.json"), JSON.stringify({
+    turns: [{ userPrompt: "Cursor checkpoint", conclusion: "active result" }],
+  }));
+  await writeFile(join(root, "relevant.slim.json"), JSON.stringify({
+    preservedUserPrompts: ["优化 Cursor checkpoint 缓存"],
+    digests: ["采用 append-only session"],
+    turns: [],
+  }));
+  await writeFile(join(root, "other.slim.json"), JSON.stringify({
+    turns: [{ userPrompt: "change button color", conclusion: "done" }],
+  }));
+  const results = await searchSessionHistory([root], "Cursor checkpoint", {
+    currentSessionId: "active",
+    limit: 2,
+  });
+  assert.equal(results[0].sessionId, "relevant");
+  assert.match(results[0].snippet, /append-only|checkpoint/);
+  assert.doesNotMatch(JSON.stringify(results), /active result/);
+});
+
+test("Vega context pressure uses Reasonix-style 50/60/80/90 tiers", () => {
+  assert.equal(contextPressureTier(499, 1_000), "normal");
+  assert.equal(contextPressureTier(500, 1_000), "warn");
+  assert.equal(contextPressureTier(600, 1_000), "snip");
+  assert.equal(contextPressureTier(800, 1_000), "elide");
+  assert.equal(contextPressureTier(900, 1_000), "force");
+});
+
+test("Vega progressively compacts only older native tool results", () => {
+  const messages = [
+    { role: "toolResult", toolCallId: "old", content: [{ type: "text", text: "x".repeat(12_000) }] },
+    ...Array.from({ length: 6 }, (_, index) => ({ role: "assistant", content: `recent-${index}` })),
+  ];
+  const snipped = compactNativeToolResults(messages, "snip");
+  assert.equal(snipped.changed, true);
+  assert.match(snipped.messages[0].content[0].text, /snipped older tool result old/);
+  const elided = compactNativeToolResults(messages, "elide");
+  assert.match(elided.messages[0].content[0].text, /^\[elided tool result old/);
+  assert.equal(elided.messages.at(-1), messages.at(-1));
+});
+
+test("Vega context measures the largest input request without generated output", () => {
   assert.equal(contextTokensFromMessages([
     { role: "assistant", usage: { input: 100, output: 20, cacheRead: 300, cacheWrite: 40 } },
     { role: "assistant", usage: { totalTokens: 900, input: 500, output: 30 } },
-  ]), 900);
+  ]), 870);
 });
 
 test("Vega estimates tokens from the rebuilt compact context", () => {
@@ -334,7 +384,7 @@ test("Vega slim context also compresses at the context character limit", async (
     setLatestConclusion(memory, [{ type: "text", text: `conclusion ${index}` }]);
   }
   assert.equal(await compactSlimMemory(memory, async () => "size summary", { maxChars: 80 }), true);
-  assert.equal(memory.summary, "size summary");
+  assert.deepEqual(memory.digests, ["size summary"]);
   assert.deepEqual(memory.turns.map((turn) => turn.conclusion), ["conclusion 3"]);
 });
 
@@ -847,6 +897,20 @@ test("clampOpenAIPayloadToolOutputs trims Responses and Completions tool outputs
   assert.equal(clampOpenAIPayloadToolOutputs({ input: [{ type: "function_call_output", output: "ok" }] }), undefined);
 });
 
+test("oversized tool results are archived with a bounded head/tail context", async () => {
+  const root = await mkdtemp(join(tmpdir(), "alkaid-tool-archive-"));
+  const original = `head-${"x".repeat(TOOL_OUTPUT_CONTEXT_MAX_BYTES * 2)}-tail`;
+  const governed = await governToolResult({ content: [{ type: "text", text: original }] }, {
+    archiveDir: root,
+    toolCallId: "call/1",
+    toolName: "bash",
+  });
+  assert.ok(Buffer.byteLength(governed.content[0].text, "utf8") <= TOOL_OUTPUT_CONTEXT_MAX_BYTES);
+  assert.match(governed.content[0].text, /elided tool result/);
+  assert.match(governed.content[0].text, /use read with offset\/limit/);
+  assert.equal(await readFile(governed.details.archivedToolOutput, "utf8"), original);
+});
+
 test("batch reads truncate oversized lines by byte budget", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-bytes-"));
   const hugeLine = "z".repeat(80 * 1024);
@@ -854,7 +918,7 @@ test("batch reads truncate oversized lines by byte budget", async () => {
   const [readFiles] = createFilesystemTools(cwd);
   const first = JSON.parse((await readFiles.execute("1", { paths: ["wide.txt"] })).content[0].text)[0];
   assert.equal(first.truncated, true);
-  assert.ok(Buffer.byteLength(first.content, "utf8") <= 50 * 1024);
+  assert.ok(Buffer.byteLength(first.content, "utf8") <= 32 * 1024);
   assert.ok(first.content.length < hugeLine.length);
   assert.equal(first.nextOffset, 2);
 });
@@ -897,6 +961,24 @@ test("plan mode exposes no write tool", async () => {
     assert.equal(runtime.agent.state.thinkingLevel, "off");
     assert.deepEqual(runtime.agent.state.tools.slice(0, 5).map((tool) => tool.name), ["read_files", "read", "grep", "find", "ls"]);
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "edit_files"));
+    assert(runtime.agent.state.tools.some((tool) => tool.name === "search_session_history"));
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("Vega can freeze the complete system/environment prompt for a session epoch", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "alkaid-system-snapshot-"));
+  const runtime = await createAlkaidAgent({
+    cwd,
+    readOnly: true,
+    model: configuredModel,
+    systemPromptSnapshot: "frozen-system-snapshot",
+  });
+  try {
+    assert.equal(runtime.systemPrompt, "frozen-system-snapshot");
+    assert.equal(runtime.agent.state.systemPrompt, "frozen-system-snapshot");
+    assert(runtime.toolShape.some((tool) => tool.name === "search_session_history"));
   } finally {
     await runtime.close();
   }
@@ -1045,7 +1127,7 @@ test("bridge aborts cleanly and persists resumable context", async () => {
   assert.equal(exitCode, 0, `events: ${JSON.stringify(events)}\nstderr: ${stderr}`);
   assert(Date.now() - cancelStartedAt < 1000);
   assert(events.some((event) => event.type === "done" && event.cancelled === true));
-  const messages = JSON.parse(await readFile(join(dataRoot, "sessions", "abort-test.json"), "utf8"));
-  assert.equal(messages[0].role, "user");
-  assert.equal(messages.at(-1).stopReason, "aborted");
+  const memory = JSON.parse(await readFile(join(dataRoot, "sessions", "abort-test.slim.json"), "utf8"));
+  assert.equal(memory.pendingMessages[0].role, "user");
+  assert.equal(memory.pendingMessages.at(-1).stopReason, "aborted");
 });

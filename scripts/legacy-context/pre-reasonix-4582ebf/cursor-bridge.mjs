@@ -44,9 +44,10 @@ const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOV
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
 const CURSOR_CREATE_RETRY_DELAYS_MS = [1_000, 3_000, 7_000];
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
-const CURSOR_DEFAULT_CONTEXT_WINDOW = positiveInteger(process.env.NOVA_CURSOR_CONTEXT_WINDOW, 128_000);
-const CURSOR_MODEL_CONTEXT_RULES = parseCursorModelContextRules(process.env.NOVA_CURSOR_MODEL_CONTEXTS);
-const CURSOR_TRACE_TOOL_OUTPUT_MAX_CHARS = 32 * 1024;
+const CURSOR_SLIM_MEMORY_TURNS = positiveInteger(process.env.NOVA_CURSOR_SLIM_MEMORY_TURNS, 10);
+const CURSOR_CONTEXT_WINDOW = positiveInteger(process.env.NOVA_CURSOR_CONTEXT_WINDOW, 128_000);
+const CURSOR_CONTEXT_THRESHOLD = Math.max(2_000, Math.floor(CURSOR_CONTEXT_WINDOW * 0.8));
+const CURSOR_CONTEXT_CHAR_THRESHOLD = Math.max(8_000, Math.floor(CURSOR_CONTEXT_WINDOW * 0.8));
 const CURSOR_SLIM_MEMORY_DIR = process.env.NOVA_CURSOR_SLIM_MEMORY_DIR
   || join(process.env.NOVA_DATA_DIR || join(homedir(), ".nova"), "cursor-slim-memory");
 const CURSOR_USER_DIR = process.env.NOVA_CURSOR_USER_DIR || join(homedir(), ".cursor");
@@ -58,44 +59,6 @@ const NOVA_DENY_TASK_SCRIPT_SOURCE = `process.stdout.write(JSON.stringify({
   agent_message: "The Task tool is disabled by Nova global Cursor hooks. Do the work yourself with the available tools (Shell, Read, Write, Grep, etc.) instead of spawning a subagent."
 }));
 `;
-
-function stableHash(value) {
-  return createHash("sha256")
-    .update(typeof value === "string" ? value : JSON.stringify(value))
-    .digest("hex")
-    .slice(0, 16);
-}
-
-function parseCursorModelContextRules(value) {
-  try {
-    const parsed = JSON.parse(value || "[]");
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .map((rule) => ({
-        prefix: String(rule?.prefix ?? "").trim().toLowerCase(),
-        contextWindow: positiveInteger(rule?.contextWindow, 0),
-      }))
-      .filter((rule) => rule.prefix && rule.contextWindow >= 2_000)
-      .sort((left, right) => right.prefix.length - left.prefix.length);
-  } catch {
-    return [];
-  }
-}
-
-function cursorContextWindow(model, rules = CURSOR_MODEL_CONTEXT_RULES, fallback = CURSOR_DEFAULT_CONTEXT_WINDOW) {
-  const modelId = String(model ?? "").trim().toLowerCase();
-  return rules.find((rule) => modelId.startsWith(rule.prefix))?.contextWindow ?? fallback;
-}
-
-function contextPressureTier(currentTokens, contextWindow = CURSOR_DEFAULT_CONTEXT_WINDOW) {
-  if (!(currentTokens > 0) || !(contextWindow > 0)) return "normal";
-  const ratio = currentTokens / contextWindow;
-  if (ratio >= 0.9) return "force";
-  if (ratio >= 0.8) return "elide";
-  if (ratio >= 0.6) return "snip";
-  if (ratio >= 0.5) return "warn";
-  return "normal";
-}
 
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value ?? "", 10);
@@ -244,23 +207,17 @@ function compactConversation(turns, maxChars = CURSOR_RECOVERY_CONTEXT_CHARS) {
 
 function createSlimMemory() {
   return {
-    digests: [],
-    preservedUserPrompts: [],
+    summary: "",
     turns: [],
     pendingTurn: "",
+    fullTurns: [],
     contextTokens: 0,
-    contextTier: "normal",
-    rewriteVersion: 0,
-    policyHash: "",
-    toolSchemaHash: "",
-    lastShapeRewriteVersion: 0,
-    consecutiveCompactions: 0,
-    compactStuck: false,
+    contextStage: "full",
   };
 }
 
 function isSlimMemoryEmpty(memory) {
-  return !(memory?.digests?.length || memory?.turns?.length || memory?.pendingTurn);
+  return !(memory?.summary || memory?.turns?.length || memory?.pendingTurn || memory?.fullTurns?.length);
 }
 
 function messageText(message) {
@@ -272,34 +229,27 @@ function withMessageText(message, text) {
 }
 
 function formatSlimMemory(memory) {
-  const sections = [
-    "Continue this conversation using the append-only transcript below.",
-    "Prior full chat checkpoints and completed tool traces are intentionally omitted.",
-    "Do not ask the user to repeat earlier requests; use the transcript and latest user message.",
-    "",
-    "## Conversation",
-  ];
-  if (memory.preservedUserPrompts?.length) {
-    sections.push("", "### Preserved user requests");
-    memory.preservedUserPrompts.forEach((prompt) => sections.push(`User:\n${prompt}`));
-  }
-  if (memory.digests?.length) {
-    sections.push("", "### Frozen digests");
-    memory.digests.forEach((digest, index) => sections.push(`Digest ${index + 1}:\n${digest}`));
-  }
-  for (const turn of memory.turns ?? []) {
-    sections.push("", `User:\n${turn.userPrompt}`);
-    if (turn.conclusion) sections.push(`Assistant:\n${turn.conclusion}`);
+  const sections = [];
+  if (memory.contextStage !== "slim" && memory.fullTurns?.length) {
+    sections.push("## Complete earlier turns");
+    memory.fullTurns.forEach((turn, index) => sections.push(`### Turn ${index + 1}`, turn));
+  } else {
+    if (memory.summary) sections.push("## Summary of earlier turns", memory.summary);
+    if (memory.turns?.length) {
+      if (sections.length) sections.push("");
+      sections.push("## Recent turns");
+      memory.turns.forEach((turn, index) => {
+        sections.push(`### Turn ${index + 1}`, `User: ${turn.userPrompt}`);
+        if (turn.conclusion) sections.push(`Conclusion: ${turn.conclusion}`);
+      });
+    }
   }
   if (memory.pendingTurn) {
-    // Replay the failed prompt at the exact location where it appeared previously, then append its
-    // recovered trajectory and continuation hint. Do not insert a heading before it: that would
-    // invalidate the otherwise reusable prefix after an interrupted turn.
+    if (sections.length) sections.push("");
     sections.push(
-      "",
+      "## Interrupted turn (complete working context)",
+      "This turn did not produce a conclusion. Continue from its assistant and tool trace instead of starting over.",
       memory.pendingTurn,
-      "",
-      "[Interrupted turn: complete working context above. Continue from its assistant and tool trace instead of starting over.]",
     );
   }
   return sections.join("\n");
@@ -349,26 +299,26 @@ function formatCompletedTurn(userMessage, state) {
 }
 
 function safeJson(value) {
-  let text;
-  if (typeof value === "string") text = value;
-  else {
-    try {
-      text = JSON.stringify(value);
-    } catch {
-      text = String(value);
-    }
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
   }
-  if (text.length <= CURSOR_TRACE_TOOL_OUTPUT_MAX_CHARS) return text;
-  const notice = `\n…[elided Cursor tool trace — ${text.length} chars; re-run the tool if needed]…\n`;
-  const budget = CURSOR_TRACE_TOOL_OUTPUT_MAX_CHARS - notice.length;
-  return `${text.slice(0, Math.ceil(budget * 0.6))}${notice}${text.slice(-Math.floor(budget * 0.4))}`;
 }
 
 function messageWithSlimMemory(message, memory) {
-  // Always use the same envelope, including on the first turn. After a successful turn the next
-  // prompt is the previous prompt plus only `Assistant` and `User` suffixes, so provider prefix
-  // caches can reuse every byte before the newly appended content.
-  return withMessageText(message, `${formatSlimMemory(memory)}\n\nUser:\n${messageText(message)}`);
+  if (isSlimMemoryEmpty(memory)) return message;
+  const prefix = [
+    "Continue this conversation using only the compact memory below.",
+    "Prior tool traces and full chat checkpoints are intentionally omitted.",
+    "Do not ask the user to repeat earlier requests; use the memory and current request.",
+    "",
+    formatSlimMemory(memory),
+    "",
+    "Current request:",
+  ].join("\n");
+  return withMessageText(message, `${prefix}\n${messageText(message)}`);
 }
 
 /**
@@ -397,16 +347,11 @@ function messageWithRecoveryContext(message, history) {
 
 function contextTokensFromUsage(usage) {
   if (!usage || typeof usage !== "object") return 0;
-  // Context occupancy excludes generated output but includes cached input. Prefer total-output when
-  // available because providers disagree on whether `inputTokens` already includes cache reads.
   const total = Number(usage.totalTokens ?? usage.total_tokens);
-  const output = Number(usage.outputTokens ?? usage.output_tokens) || 0;
-  if (total > output) return total - output;
-  const input = Number(usage.inputTokens ?? usage.input_tokens) || 0;
-  const cacheRead = Number(usage.cacheReadTokens ?? usage.cache_read_tokens) || 0;
-  const cacheWrite = Number(usage.cacheWriteTokens ?? usage.cache_write_tokens) || 0;
-  const cached = cacheRead + cacheWrite;
-  return input >= cached ? input : input + cached;
+  if (total > 0) return total;
+  return ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]
+    .reduce((sum, key) => sum + (Number(usage[key]) || 0), 0);
 }
 
 function extractTurnConclusion(state, result) {
@@ -427,44 +372,29 @@ function recordSlimTurn(memory, userMessage, conclusion) {
 }
 
 async function compressSlimMemory(memory, summarize, {
-  maxChars = Math.max(32_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.8 * 4)),
+  maxChars = CURSOR_CONTEXT_CHAR_THRESHOLD,
   currentTokens = memory.contextTokens ?? 0,
-  maxTokens = Math.max(2_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.8)),
+  maxTokens = CURSOR_CONTEXT_THRESHOLD,
 } = {}) {
-  const formattedLength = formatSlimMemory({ ...memory, pendingTurn: "" }).length;
+  const formattedLength = formatSlimMemory({ ...memory, pendingTurn: "", contextStage: "slim" }).length;
   const belowCapacity = currentTokens > 0
     ? currentTokens < maxTokens
     : formattedLength < maxChars;
-  if (belowCapacity) {
-    memory.consecutiveCompactions = 0;
-    memory.compactStuck = false;
-    return false;
-  }
-  if (memory.compactStuck || memory.turns.length < 2) return false;
-  if ((memory.consecutiveCompactions ?? 0) >= 2) {
-    // A tiny effective window can otherwise rewrite the prefix every turn forever. Freeze the
-    // current shape and let the provider reject naturally rather than permanently defeating cache.
-    memory.compactStuck = true;
-    return false;
-  }
+  if (memory.contextStage !== "slim" || belowCapacity || memory.turns.length < 2) return false;
   const latestTurn = memory.turns.at(-1);
-  const compactedTurns = memory.turns.slice(0, -1);
-  const preservedPrompts = compactedTurns
-    .map((turn) => String(turn.userPrompt ?? "").trim())
-    .filter((prompt) => prompt && prompt.length <= 2_000 && !memory.preservedUserPrompts.includes(prompt));
-  const earlierTurns = { ...createSlimMemory(), turns: compactedTurns };
-  const digest = String(await summarize(formatSlimMemory(earlierTurns)) ?? "").trim();
-  if (!digest) return false;
-  // Digests accumulate and are immutable. Never roll an old digest into a replacement summary.
-  memory.preservedUserPrompts.push(...preservedPrompts);
-  memory.digests.push(digest);
+  const earlier = {
+    summary: memory.summary,
+    turns: memory.turns.slice(0, -1),
+  };
+  const summary = String(await summarize(formatSlimMemory(earlier)) ?? "").trim();
+  if (!summary) return false;
+  memory.summary = summary;
+  // Compression is turn-based. The latest user prompt is always retained verbatim.
   memory.turns = [latestTurn];
-  memory.rewriteVersion = (memory.rewriteVersion ?? 0) + 1;
-  memory.consecutiveCompactions = (memory.consecutiveCompactions ?? 0) + 1;
   return true;
 }
 
-async function summarizeSlimMemory(memory, request, sdk = Agent, compressionOptions = {}) {
+async function summarizeSlimMemory(memory, request, sdk = Agent) {
   return compressSlimMemory(memory, async (earlierTurns) => {
     const agent = await sdk.create({
       apiKey: process.env.CURSOR_API_KEY,
@@ -485,7 +415,7 @@ async function summarizeSlimMemory(memory, request, sdk = Agent, compressionOpti
     } finally {
       agent.close();
     }
-  }, compressionOptions);
+  });
 }
 
 function slimMemoryPath(sessionKey) {
@@ -509,30 +439,17 @@ async function loadSlimMemory(sessionKey) {
   try {
     const parsed = JSON.parse(await readFile(slimMemoryPath(sessionKey), "utf8"));
     if (Array.isArray(parsed?.turns)) {
-      const legacySummary = String(parsed.summary ?? "").trim();
       return {
-        ...createSlimMemory(),
-        digests: Array.isArray(parsed.digests)
-          ? parsed.digests.map(String).filter(Boolean)
-          : legacySummary ? [legacySummary] : [],
-        preservedUserPrompts: Array.isArray(parsed.preservedUserPrompts)
-          ? parsed.preservedUserPrompts.map(String).filter(Boolean)
-          : [],
+        summary: String(parsed.summary ?? ""),
         turns: parsed.turns.map((turn) => ({
           userPrompt: String(turn?.userPrompt ?? ""),
           conclusion: String(turn?.conclusion ?? ""),
         })),
         pendingTurn: String(parsed.pendingTurn ?? ""),
+        fullTurns: Array.isArray(parsed.fullTurns) ? parsed.fullTurns.map(String) : [],
         contextTokens: Number(parsed.contextTokens) || 0,
-        contextTier: ["normal", "warn", "snip", "elide", "force"].includes(parsed.contextTier)
-          ? parsed.contextTier
-          : "normal",
-        rewriteVersion: Number(parsed.rewriteVersion) || 0,
-        policyHash: String(parsed.policyHash ?? ""),
-        toolSchemaHash: String(parsed.toolSchemaHash ?? ""),
-        lastShapeRewriteVersion: Number(parsed.lastShapeRewriteVersion) || 0,
-        consecutiveCompactions: Number(parsed.consecutiveCompactions) || 0,
-        compactStuck: parsed.compactStuck === true,
+        // Older files only contain prompt/conclusion memory and must resume directly in stage two.
+        contextStage: parsed.contextStage === "full" ? "full" : "slim",
       };
     }
     // Migrate the first slim-memory format, which stored prompts and conclusions separately.
@@ -540,6 +457,7 @@ async function loadSlimMemory(sessionKey) {
     const conclusions = Array.isArray(parsed?.conclusions) ? parsed.conclusions : [];
     return {
       ...createSlimMemory(),
+      contextStage: "slim",
       turns: Array.from({ length: Math.max(prompts.length, conclusions.length) }, (_, index) => ({
         userPrompt: String(prompts[index] ?? ""),
         conclusion: String(conclusions[index] ?? ""),
@@ -554,19 +472,13 @@ async function saveSlimMemory(sessionKey, memory) {
   if (!sessionKey) return;
   await mkdir(CURSOR_SLIM_MEMORY_DIR, { recursive: true });
   await writeFile(slimMemoryPath(sessionKey), `${JSON.stringify({
-    version: 6,
-    digests: memory.digests ?? [],
-    preservedUserPrompts: memory.preservedUserPrompts ?? [],
+    version: 4,
+    summary: memory.summary ?? "",
     turns: memory.turns ?? [],
     pendingTurn: memory.pendingTurn ?? "",
+    fullTurns: memory.fullTurns ?? [],
     contextTokens: memory.contextTokens ?? 0,
-    contextTier: memory.contextTier ?? "normal",
-    rewriteVersion: memory.rewriteVersion ?? 0,
-    policyHash: memory.policyHash ?? "",
-    toolSchemaHash: memory.toolSchemaHash ?? "",
-    lastShapeRewriteVersion: memory.lastShapeRewriteVersion ?? 0,
-    consecutiveCompactions: memory.consecutiveCompactions ?? 0,
-    compactStuck: memory.compactStuck === true,
+    contextStage: memory.contextStage ?? "full",
   })}\n`, "utf8");
 }
 
@@ -586,9 +498,14 @@ function ingestCompactHistory(memory, history) {
 
 async function seedSlimMemoryFromSession(memory, sessionId, request, sdk = Agent) {
   if (!sessionId || !isSlimMemoryEmpty(memory)) return false;
+  const options = {
+    apiKey: process.env.CURSOR_API_KEY,
+    model: modelSelection(request.model),
+    local: { cwd: request.cwd },
+  };
+  let agent;
   try {
-    // Read completed run transcripts directly. Resuming the checkpoint only to inspect history is
-    // both slow and unnecessary, and can restore poisoned executor state.
+    agent = await withTimeout(sdk.resume(sessionId, options), CURSOR_RECOVERY_TIMEOUT_MS, "resume");
     const runs = await withTimeout(
       sdk.listRuns(sessionId, { runtime: "local", cwd: request.cwd }),
       CURSOR_RECOVERY_TIMEOUT_MS,
@@ -596,9 +513,12 @@ async function seedSlimMemoryFromSession(memory, sessionId, request, sdk = Agent
     ).catch(() => ({ items: [] }));
     const history = await recoveryHistory(runs.items);
     ingestCompactHistory(memory, history);
+    if (!isSlimMemoryEmpty(memory)) memory.contextStage = "slim";
     return !isSlimMemoryEmpty(memory);
   } catch {
     return false;
+  } finally {
+    agent?.close?.();
   }
 }
 
@@ -624,6 +544,7 @@ async function recoverTimedOutAgent(
   request,
   sdk = Agent,
   timeoutMs = CURSOR_RECOVERY_TIMEOUT_MS,
+  createFresh = true,
 ) {
   const agentId = agent.agentId;
   await withTimeout(Promise.resolve(activeRun?.cancel?.()), timeoutMs, "cancel").catch(() => {});
@@ -648,11 +569,27 @@ async function recoverTimedOutAgent(
       customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
     },
   };
-  return {
-    agent: await withTimeout(createCursorAgent(options, sdk), timeoutMs, "create"),
-    history: "",
-    replaced: true,
-  };
+  // Slim-memory mode prefers a fresh agent so poisoned checkpoints are never resumed.
+  if (createFresh) {
+    return {
+      agent: await withTimeout(createCursorAgent(options, sdk), timeoutMs, "create"),
+      history: "",
+      replaced: true,
+    };
+  }
+  try {
+    return {
+      agent: await withTimeout(sdk.resume(agentId, options), timeoutMs, "resume"),
+      history: "",
+      replaced: false,
+    };
+  } catch {
+    return {
+      agent: await withTimeout(createCursorAgent(options, sdk), timeoutMs, "create"),
+      history: await recoveryHistory(runs.items, timeoutMs),
+      replaced: true,
+    };
+  }
 }
 
 function sendTiming(phase, startedAt, details = {}) {
@@ -670,7 +607,6 @@ async function sendPromptWithRecovery(
   options,
   sdk = Agent,
   emitTiming = sendTiming,
-  bootstrapMessage = message,
 ) {
   const sendStartedAt = performance.now();
   try {
@@ -700,16 +636,22 @@ async function sendPromptWithRecovery(
     emitTiming("send_retry_active_run", retryStartedAt);
   }
 
-  // The live session is still wedged after cancelling its active runs. Do not pay checkpoint-resume
-  // latency or inherit poisoned runtime state: recreate once and bootstrap from Vega's transcript.
-  const recreateStartedAt = performance.now();
+  const resumeStartedAt = performance.now();
+  const agentId = agent.agentId;
   agent.close();
-  const freshAgent = await createCursorAgent(agentCreateOptions(request), sdk);
-  emitTiming("agent_recreate", recreateStartedAt);
+  const resumedAgent = await sdk.resume(agentId, {
+    apiKey: process.env.CURSOR_API_KEY,
+    model: modelSelection(request.model),
+    local: {
+      cwd: request.cwd,
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+    },
+  });
+  emitTiming("agent_resume", resumeStartedAt);
   const finalSendStartedAt = performance.now();
-  const run = await freshAgent.send(bootstrapMessage, options);
-  emitTiming("send_after_recreate", finalSendStartedAt);
-  return { agent: freshAgent, run, replaced: true };
+  const run = await resumedAgent.send(message, options);
+  emitTiming("send_after_resume", finalSendStartedAt);
+  return { agent: resumedAgent, run };
 }
 
 function createMessageState() {
@@ -951,22 +893,6 @@ function agentFingerprint(request) {
   return `${model}\0${cwd}\0${mode}`;
 }
 
-function canReuseAgentSession(agent, session, request, sessionKey) {
-  return Boolean(agent
-    && session
-    && session.sessionKey === sessionKey
-    && session.fingerprint === agentFingerprint(request));
-}
-
-function cursorToolShape(request) {
-  const tools = createCursorFilesystemTools(request?.cwd, { readOnly: request?.mode === "plan" });
-  return Object.entries(tools).map(([name, tool]) => ({
-    name,
-    description: tool.description ?? "",
-    inputSchema: tool.inputSchema ?? null,
-  }));
-}
-
 function agentCreateOptions(request) {
   const readOnly = request?.mode === "plan";
   return {
@@ -1134,7 +1060,6 @@ async function main() {
     wake?.();
   });
   let agent;
-  let agentSession;
   let sessionKey;
   let memoryKey;
   let memory = createSlimMemory();
@@ -1154,9 +1079,12 @@ async function main() {
       }
       if (request.action !== "prompt") throw new Error(`Unknown action: ${request.action}`);
 
-      // The kept-alive bridge is owned by one Vega thread, so retain its live Cursor Agent between
-      // completed turns. A changed thread/model/cwd/mode starts a new session and bootstraps it from
-      // Vega's canonical slim memory; normal matching turns send only the new user message.
+      // Each user turn gets a fresh Cursor agent. Multi-turn continuity is carried by
+      // slim memory (user prompts + conclusions), not by resuming full SDK checkpoints.
+      if (agent) {
+        agent.close();
+        agent = undefined;
+      }
       const ownedThreadKey = threadMemoryKey(request.threadId);
       const nextSessionKey = ownedThreadKey || request.sessionId || sessionKey || randomUUID();
       const nextMemoryKey = ownedThreadKey || nextSessionKey;
@@ -1176,42 +1104,19 @@ async function main() {
 
       const readOnly = request.mode === "plan";
       const originalMessage = await promptMessage(request.parts);
-      const contextWindow = cursorContextWindow(request.model);
-      const contextThreshold = Math.max(2_000, Math.floor(contextWindow * 0.8));
-      const contextForceThreshold = Math.max(2_000, Math.floor(contextWindow * 0.9));
-      const contextCharThreshold = Math.max(32_000, Math.floor(contextWindow * 0.8 * 4));
-      const reuseSession = canReuseAgentSession(agent, agentSession, request, sessionKey);
-      // A newly created/recovered Agent receives Vega's complete compact transcript once. A live
-      // matching Agent already owns that history, so replaying it would duplicate every old turn.
-      const bootstrapMessage = messageWithToolPolicy(
-        messageWithSlimMemory(originalMessage, memory),
-        { readOnly },
-      );
-      let message = reuseSession
-        ? messageWithToolPolicy(originalMessage, { readOnly })
-        : bootstrapMessage;
       // Build the SDK prompt before marking this turn pending, otherwise it would replay itself.
       // Persist first so even Agent.create/SDK initialization failures retain the user's request.
       const previousPendingTurn = memory.pendingTurn;
+      const message = messageWithToolPolicy(messageWithSlimMemory(originalMessage, memory), { readOnly });
       memory.pendingTurn = pendingTurnContext(previousPendingTurn, originalMessage);
       await saveSlimMemory(memoryKey, memory).catch((error) => {
         process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
       });
+      // Prefer idle prewarm Agent.create; refill immediately after consume.
       const acquireStartedAt = performance.now();
-      if (reuseSession) {
-        sendTiming("agent_acquire", acquireStartedAt, { source: "session" });
-      } else {
-        if (agent) {
-          agent.close();
-          agent = undefined;
-          agentSession = undefined;
-        }
-        // Prefer the idle prewarm Agent.create only when a live session cannot be reused.
-        const acquired = await prewarm.acquire(request);
-        agent = acquired.agent;
-        agentSession = { sessionKey, fingerprint: acquired.fingerprint };
-        sendTiming("agent_acquire", acquireStartedAt, { source: acquired.source });
-      }
+      const acquired = await prewarm.acquire(request);
+      agent = acquired.agent;
+      sendTiming("agent_acquire", acquireStartedAt, { source: acquired.source });
       send({ type: "ready", sessionId: sessionKey });
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
@@ -1250,15 +1155,7 @@ async function main() {
         };
         try {
           const promptResult = await withTimeout(
-            sendPromptWithRecovery(
-              agent,
-              request,
-              message,
-              sendOptions,
-              Agent,
-              sendTiming,
-              bootstrapMessage,
-            ),
+            sendPromptWithRecovery(agent, request, message, sendOptions),
             CURSOR_STARTUP_TIMEOUT_MS,
             "send",
           );
@@ -1298,66 +1195,32 @@ async function main() {
           if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
           memory.pendingTurn = "";
           recordSlimTurn(memory, originalMessage, extractTurnConclusion(state, result));
+          if (memory.contextStage === "full") {
+            // Completed full-stage turns keep tools/assistant text but drop thinking, matching Vega.
+            memory.fullTurns.push(formatCompletedTurn(originalMessage, state));
+          }
           const turnUsage = usage ?? result.usage;
-          memory.contextTokens = contextTokensFromUsage(turnUsage);
-          memory.contextTier = contextPressureTier(memory.contextTokens, contextWindow);
-          const inputTokens = Number(turnUsage?.inputTokens ?? turnUsage?.input_tokens) || 0;
-          const cacheReadTokens = Number(turnUsage?.cacheReadTokens ?? turnUsage?.cache_read_tokens) || 0;
-          const cacheWriteTokens = Number(turnUsage?.cacheWriteTokens ?? turnUsage?.cache_write_tokens) || 0;
-          const cacheDenominator = inputTokens >= cacheReadTokens + cacheWriteTokens
-            ? inputTokens
-            : inputTokens + cacheReadTokens + cacheWriteTokens;
-          const policyHash = stableHash(cursorPromptPrefix({ readOnly }));
-          const toolSchemaHash = stableHash(cursorToolShape(request));
-          const cacheMissReasons = [];
-          if (memory.policyHash && memory.policyHash !== policyHash) cacheMissReasons.push("system_changed");
-          if (memory.toolSchemaHash && memory.toolSchemaHash !== toolSchemaHash) cacheMissReasons.push("tools_changed");
-          if ((memory.lastShapeRewriteVersion ?? 0) !== (memory.rewriteVersion ?? 0)) cacheMissReasons.push("history_rewritten");
-          memory.policyHash = policyHash;
-          memory.toolSchemaHash = toolSchemaHash;
-          memory.lastShapeRewriteVersion = memory.rewriteVersion ?? 0;
-          send({
-            type: "timing",
-            phase: "context_shape",
-            elapsedMs: 0,
-            contextTier: memory.contextTier,
-            contextWindow,
-            rewriteVersion: memory.rewriteVersion ?? 0,
-            cacheMissReasons,
-            policyHash,
-            toolSchemaHash,
-            historyHash: stableHash(formatSlimMemory(memory)),
-            inputTokens,
-            cacheReadTokens,
-            cacheWriteTokens,
-            cacheHitRate: cacheDenominator > 0 ? cacheReadTokens / cacheDenominator : 0,
-          });
-          let compacted = false;
-          if (["elide", "force"].includes(memory.contextTier)) {
-            compacted = await summarizeSlimMemory(memory, request, Agent, {
-              maxChars: contextCharThreshold,
-              currentTokens: memory.contextTokens,
-              maxTokens: contextThreshold,
-            }).catch((error) => {
-              process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
-              return false;
-            });
+          const measuredTokens = contextTokensFromUsage(turnUsage);
+          if (memory.contextStage === "full") {
+            const fullContextChars = formatSlimMemory(memory).length;
+            if (memory.turns.length >= CURSOR_SLIM_MEMORY_TURNS
+              || (measuredTokens > 0 && measuredTokens >= CURSOR_CONTEXT_THRESHOLD)
+              || (measuredTokens === 0 && fullContextChars >= CURSOR_CONTEXT_CHAR_THRESHOLD)) {
+              // Stage one removes completed thinking/tool traces without summarizing conclusions.
+              memory.contextStage = "slim";
+              memory.contextTokens = 0;
+              memory.fullTurns = [];
+            } else {
+              memory.contextTokens = measuredTokens;
+            }
+          } else {
+            memory.contextTokens = measuredTokens;
+          }
+          await summarizeSlimMemory(memory, request).then((compacted) => {
             if (compacted) memory.contextTokens = 0;
-          }
-          // Cursor's live Agent owns native history. A compacted canonical epoch only takes effect
-          // after rotating that Agent; at 90% rotate even if summarization failed to avoid overflow.
-          if (compacted || memory.contextTier === "force" || memory.contextTokens >= contextForceThreshold) {
-            agent.close();
-            agent = undefined;
-            agentSession = undefined;
-            send({
-              type: "timing",
-              phase: "context_epoch_rotated",
-              elapsedMs: 0,
-              reason: compacted ? "compacted" : "force_threshold",
-              rewriteVersion: memory.rewriteVersion ?? 0,
-            });
-          }
+          }).catch((error) => {
+            process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          });
           await saveSlimMemory(memoryKey, memory).catch((error) => {
             process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
@@ -1380,12 +1243,10 @@ async function main() {
             request,
             Agent,
             CURSOR_RECOVERY_TIMEOUT_MS,
+            true,
           );
           agent = recovery.agent;
-          agentSession = { sessionKey, fingerprint: agentFingerprint(request) };
-          // A timeout recovery creates a fresh Agent, so bootstrap it with the complete Vega
-          // transcript. The prompt was built before this turn became pending, avoiding self-replay.
-          if (recovery.replaced) message = bootstrapMessage;
+          // Retry the exact prompt built before this turn was marked pending, avoiding self-replay.
           // Keep the stable slim-memory session key; do not promote ephemeral agent ids.
           send({ type: "ready", sessionId: sessionKey });
           activeRun = undefined;
@@ -1395,16 +1256,13 @@ async function main() {
         }
       }
     } catch (error) {
-      // Never carry a possibly poisoned live Agent across a failed prompt. Configuration/model-list
-      // failures do not affect the retained conversation session.
-      if (request.action === "prompt" && agent) {
-        agent.close();
-        agent = undefined;
-        agentSession = undefined;
-      }
       send({ ok: false, error: error instanceof Error ? error.message : String(error) });
     } finally {
       activeRun = undefined;
+      if (agent) {
+        agent.close();
+        agent = undefined;
+      }
     }
   }
   agent?.close();
@@ -1459,13 +1317,7 @@ export {
   threadMemoryKey,
   withTimeout,
   agentFingerprint,
-  canReuseAgentSession,
   agentCreateOptions,
-  contextPressureTier,
-  cursorContextWindow,
-  parseCursorModelContextRules,
-  cursorToolShape,
-  stableHash,
   createAgentPrewarm,
   prewarmEnabled,
 };
