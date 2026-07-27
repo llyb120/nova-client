@@ -5,7 +5,7 @@ import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from ".
 import { displayToolTitle, stripAnsi } from "../utils";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
-import { fmtDuration, fmtTokens } from "./TurnGroup";
+import { fmtDuration, fmtTokens, turnTokenTitle } from "./TurnGroup";
 
 // ─── Public interface ────────────────────────────────────────────────────────
 
@@ -79,40 +79,94 @@ function measure(text: string, fs: number, ff: string, fw = "400"): number {
   return w;
 }
 
-function wrapText(text: string, maxW: number, fs: number, ff: string, fw = "400"): string[] {
-  const lines: string[] = [];
-  const safeMax = Math.max(1, maxW);
-  for (const para of text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
-    // Keep intentional empty paragraphs as a single blank line; skip wrapping empty tokens
-    // into extra space-only lines that inflate bubble height.
-    if (para === "") { lines.push(""); continue; }
-    const words = para.split(/(\s+)/).filter((w, i, arr) => w !== "" || arr.length === 1);
-    let cur = "", curW = 0;
-    for (const word of words) {
-      // Don't start a line with whitespace — matches typical pre-wrap soft-wrap feel
-      // and avoids a blank-looking line when a space is pushed after a wrap.
-      if (!cur && /^\s+$/.test(word)) continue;
-      const ww = measure(word, fs, ff, fw);
-      if (curW + ww <= safeMax) { cur += word; curW += ww; continue; }
-      // Word won't fit: fill remaining space on this line char-by-char first
-      // (CJK soft-wrap), instead of flushing `cur` and starting the word on the next line.
-      if (/^\s+$/.test(word)) {
-        if (cur) { lines.push(cur.trimEnd()); cur = ""; curW = 0; }
-        continue;
-      }
-      for (const ch of Array.from(word)) {
-        const cw = measure(ch, fs, ff, fw);
-        if (cur && curW + cw > safeMax) { lines.push(cur); cur = ch; curW = cw; }
-        else { cur += ch; curW += cw; }
-      }
-    }
-    lines.push(cur.trimEnd());
-  }
-  while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-  while (lines.length > 1 && lines[0] === "") lines.shift();
-  return lines.length ? lines : [""];
+/** Soft-wrapped line plus per-UTF16-unit offsets into the original (normalized) string. */
+interface WrappedLine { text: string; offsets: number[] }
+
+function pushTrimmedLine(lines: WrappedLine[], text: string, offsets: number[]) {
+  let end = text.length;
+  while (end > 0 && /\s/.test(text.charAt(end - 1))) end--;
+  lines.push({ text: text.slice(0, end), offsets: offsets.slice(0, end) });
 }
 
+/**
+ * Wrap like wrapText, but keep original-string offsets for each kept character.
+ * Critical for styled paint: wrapText drops `\n` / trimmed spaces, while charStyles
+ * is indexed by the full plain text — without offsets, inline code/bold runs shift
+ * (e.g. first char of each `code` falls outside the pill).
+ */
+function wrapTextIndexed(text: string, maxW: number, fs: number, ff: string, fw = "400"): WrappedLine[] {
+  const lines: WrappedLine[] = [];
+  const safeMax = Math.max(1, maxW);
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const paras = normalized.split("\n");
+  let base = 0;
+  for (let pi = 0; pi < paras.length; pi++) {
+    const para = paras[pi];
+    // Keep intentional empty paragraphs as a single blank line.
+    if (para === "") {
+      lines.push({ text: "", offsets: [] });
+      if (pi < paras.length - 1) base += 1; // consume the separating `\n`
+      continue;
+    }
+    const tokens: { start: number; text: string }[] = [];
+    const re = /(\s+)/g;
+    let last = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(para)) !== null) {
+      if (m.index > last) tokens.push({ start: base + last, text: para.slice(last, m.index) });
+      tokens.push({ start: base + m.index, text: m[0] });
+      last = m.index + m[0].length;
+    }
+    if (last < para.length) tokens.push({ start: base + last, text: para.slice(last) });
+    if (!tokens.length) tokens.push({ start: base, text: para });
+
+    let cur = "", curOffs: number[] = [], curW = 0;
+    for (const token of tokens) {
+      // Don't start a line with whitespace — matches typical pre-wrap soft-wrap feel.
+      if (!cur && /^\s+$/.test(token.text)) continue;
+      const ww = measure(token.text, fs, ff, fw);
+      if (curW + ww <= safeMax) {
+        cur += token.text;
+        for (let ci = 0; ci < token.text.length; ci++) curOffs.push(token.start + ci);
+        curW += ww;
+        continue;
+      }
+      // Word won't fit: fill remaining space on this line char-by-char first
+      // (CJK soft-wrap), instead of flushing `cur` and starting the word on the next line.
+      if (/^\s+$/.test(token.text)) {
+        if (cur) { pushTrimmedLine(lines, cur, curOffs); cur = ""; curOffs = []; curW = 0; }
+        continue;
+      }
+      let ci = 0;
+      for (const ch of Array.from(token.text)) {
+        const off = token.start + ci;
+        const cw = measure(ch, fs, ff, fw);
+        if (cur && curW + cw > safeMax) {
+          lines.push({ text: cur, offsets: curOffs });
+          cur = ch;
+          curOffs = [];
+          for (let k = 0; k < ch.length; k++) curOffs.push(off + k);
+          curW = cw;
+        } else {
+          cur += ch;
+          for (let k = 0; k < ch.length; k++) curOffs.push(off + k);
+          curW += cw;
+        }
+        ci += ch.length;
+      }
+    }
+    pushTrimmedLine(lines, cur, curOffs);
+    base += para.length;
+    if (pi < paras.length - 1) base += 1; // skip `\n` — not present in any line
+  }
+  while (lines.length > 1 && lines[lines.length - 1].text === "") lines.pop();
+  while (lines.length > 1 && lines[0].text === "") lines.shift();
+  return lines.length ? lines : [{ text: "", offsets: [] }];
+}
+
+function wrapText(text: string, maxW: number, fs: number, ff: string, fw = "400"): string[] {
+  return wrapTextIndexed(text, maxW, fs, ff, fw).map((l) => l.text);
+}
 // Match DOM .bubble-images img: max-width 240px; max-height 180px
 // Scale uniformly by original aspect ratio to fit within max W or H (never stretch).
 const BUBBLE_IMG_MAX_W = 240;
@@ -500,8 +554,11 @@ interface Block {
   font?: string; fontSize?: number; fontWeight?: string; lineHeight?: number;
   clickAction?: () => void; hoverBg?: string; hoverColor?: string; hoverKey?: string;
   cursor?: string; selectable?: boolean;
+  /** 原生 title 提示（如 token 明细） */
+  title?: string;
   data?: Record<string, unknown>;
   _lines?: string[];
+  _wrapped?: WrappedLine[];
   _charStyles?: Array<{ bold?: boolean; italic?: boolean; code?: boolean; link?: string }>;
   _charXs?: number[][];
   _lineWidths?: number[];
@@ -813,6 +870,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         });
         const label = ["已处理", fmtDuration(g.turn.durationMs),
           g.turn.totalTokens ? `· ${fmtTokens(g.turn.totalTokens)} tokens` : ""].filter(Boolean).join(" ");
+        const tokenTip = turnTokenTitle(g.turn);
 
         // .turn-fold: padding 4px 8px; margin 12px 0 2px -8px; font 13; gap 6
         const foldW = measure(label, 13, p.sans) + 8 + 6 + 12 + 8; // padL + gap + chev + padR
@@ -821,6 +879,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           x: side + proseOff - 8, y, w: Math.min(400, foldW), h: 26,
           text: label, color: p.dim, fontSize: 13, font: p.sans,
           hoverBg: p.hover, hoverColor: p.text, borderRadius: 7, cursor: "pointer",
+          title: tokenTip,
           data: { open, foldKey },
           clickAction: () => { toggleExpanded(foldKey, !open); } });
         y += 26 + 2;
@@ -1535,7 +1594,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
 
     const plainText = b.text || segmentsPlainText(segments);
-    const wrappedLines = b._lines || (b._lines = wrapText(plainText, maxW, fs, ff, baseFw));
+    const wrapped = b._wrapped || (b._wrapped = wrapTextIndexed(plainText, maxW, fs, ff, baseFw));
+    b._lines = wrapped.map((l) => l.text);
 
     let charStyles = b._charStyles;
     if (!charStyles) {
@@ -1548,22 +1608,24 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       b._charStyles = charStyles;
     }
 
+    const styleAt = (absOff: number | undefined) =>
+      absOff == null ? {} : (charStyles![absOff] || {});
+
     // Pre-compute charX and lineWidths once per rebuild (cached in block)
     let cachedCharXs = b._charXs;
     let cachedLineWidths = b._lineWidths;
     if (!cachedCharXs) {
       cachedCharXs = [];
       cachedLineWidths = [];
-      let off = 0;
-      for (let li = 0; li < wrappedLines.length; li++) {
-        const line = wrappedLines[li];
+      for (let li = 0; li < wrapped.length; li++) {
+        const { text: line, offsets } = wrapped[li];
         const charX: number[] = new Array(line.length + 1);
         let cx = 0, ri = 0;
         while (ri < line.length) {
-          const cs = charStyles[off + ri] || {};
+          const cs = styleAt(offsets[ri]);
           let runEnd = ri + 1;
           while (runEnd < line.length) {
-            const ns = charStyles[off + runEnd] || {};
+            const ns = styleAt(offsets[runEnd]);
             if (ns.bold !== cs.bold || ns.italic !== cs.italic || ns.code !== cs.code || ns.link !== cs.link) break;
             runEnd++;
           }
@@ -1582,15 +1644,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         charX[line.length] = cx;
         cachedCharXs.push(charX);
         cachedLineWidths!.push(cx);
-        off += line.length;
       }
       b._charXs = cachedCharXs;
       b._lineWidths = cachedLineWidths;
     }
 
     let globalOffset = 0;
-    for (let li = 0; li < wrappedLines.length; li++) {
-      const line = wrappedLines[li];
+    for (let li = 0; li < wrapped.length; li++) {
+      const { text: line, offsets } = wrapped[li];
       const ty = by + li * lh;
       const tySnap = snap(ty + halfLead);
       const charX = cachedCharXs[li];
@@ -1598,13 +1659,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const lineEntry: TextLine = { text: line, x: startX, y: ty + scrollY, w: lineW, offset: globalOffset, fs, lh, charX };
       b.textLines.push(lineEntry);
 
-      // Render styled runs
+      // Render styled runs — look up styles via original offsets (not packed line index)
       let cx = 0, ri = 0;
       while (ri < line.length) {
-        const cs = charStyles[globalOffset + ri] || {};
+        const cs = styleAt(offsets[ri]);
         let runEnd = ri + 1;
         while (runEnd < line.length) {
-          const ns = charStyles[globalOffset + runEnd] || {};
+          const ns = styleAt(offsets[runEnd]);
           if (ns.bold !== cs.bold || ns.italic !== cs.italic || ns.code !== cs.code || ns.link !== cs.link) break;
           runEnd++;
         }
@@ -1928,6 +1989,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         paintAll();
       }
       canvasEl.style.cursor = "default";
+      if (canvasEl.title) canvasEl.title = "";
       return;
     }
     const idx = hitTest(e.clientX, e.clientY);
@@ -1935,6 +1997,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       hoverBlockIdx = idx;
       const b = idx >= 0 ? blocks[idx] : null;
       canvasEl.style.cursor = b?.cursor || (b?.selectable ? "text" : "default");
+      canvasEl.title = b?.title ?? "";
       paintAll();
     }
   }
@@ -2163,7 +2226,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const mo = new MutationObserver(rebuild);
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
+    function onMouseLeave() {
+      if (scrollDragging || selecting) return;
+      if (hoverBlockIdx !== -1) {
+        hoverBlockIdx = -1;
+        paintAll();
+      }
+      canvasEl.style.cursor = "default";
+      if (canvasEl.title) canvasEl.title = "";
+    }
+
     canvasEl.addEventListener("mousemove", onMouseMove);
+    canvasEl.addEventListener("mouseleave", onMouseLeave);
     canvasEl.addEventListener("mousedown", onMouseDown);
     canvasEl.addEventListener("mouseup", onMouseUp);
     canvasEl.addEventListener("click", onClick);
@@ -2187,6 +2261,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
       if (rafId) cancelAnimationFrame(rafId);
       canvasEl.removeEventListener("mousemove", onMouseMove);
+      canvasEl.removeEventListener("mouseleave", onMouseLeave);
       canvasEl.removeEventListener("mousedown", onMouseDown);
       canvasEl.removeEventListener("mouseup", onMouseUp);
       canvasEl.removeEventListener("click", onClick);
