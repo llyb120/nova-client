@@ -21,9 +21,11 @@ export interface CanvasTranscriptHandle {
 }
 
 interface CanvasTranscriptProps {
+  threadId: string | null;
   groups: Group[];
   permissions: PermissionRequest[];
   running: boolean;
+  loading: boolean;
   emptyHint: string;
   preview: boolean;
   onReturnToCurrent: () => void;
@@ -404,8 +406,9 @@ function parseMarkdownBlocks(md: string): MdBlock[] {
       }
       continue;
     }
-    if (/^\s*\d+\.\s+/.test(line)) {
-      let n = 1;
+    const orderedListStart = line.match(/^\s*(\d+)\.\s+/);
+    if (orderedListStart) {
+      let n = Number(orderedListStart[1]);
       while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
         const itemText = lines[i].replace(/^\s*\d+\.\s+/, "");
         blocks.push({ type: "list-item", segments: tokenizeInline(itemText), ordered: true, prefix: `${n}.` });
@@ -697,11 +700,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   // per-block scroll for clipped tool-content（按内容身份记，避免 rebuild 丢位置）
   const blockScrolls = new Map<string, number>();
   let rebuildRaf = 0;
-  let prefixCacheSig = "";
-  let prefixCacheBlocks: Block[] = [];
-  let prefixCacheHeight = 0;
-  let prefixCacheGroupYs: number[] = [];
-  let prefixCacheUntil = 0;
+  interface PrefixLayoutCache {
+    sig: string;
+    blocks: Block[];
+    height: number;
+    groupYs: number[];
+    until: number;
+  }
+  const prefixLayoutCaches = new Map<string, PrefixLayoutCache>();
+  let layoutGeneration = 0;
+  let renderedThreadId = props.threadId;
 
   // selection state
   let selection: Selection | null = null;
@@ -749,11 +757,26 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }).join(",");
   }
 
+  function textSig(text: string): string {
+    // Keep cache checks bounded: scanning every character here blocks session switches
+    // before the chunked layout has a chance to yield to the browser.
+    let hash = 2166136261;
+    const sampleCount = Math.min(64, text.length);
+    for (let i = 0; i < sampleCount; i++) {
+      const index = sampleCount === text.length
+        ? i
+        : Math.floor(i * (text.length - 1) / Math.max(1, sampleCount - 1));
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `${text.length}:${hash >>> 0}`;
+  }
+
   function closedGroupSig(g: Group): string {
     const foldKey = g.turn ? `turn-${g.turn.id ?? g.user?.id ?? 0}` : "";
     const foldOpen = foldKey ? !!(state.expanded[foldKey] ?? false) : false;
     const parts = [
-      g.user ? `u:${g.user.id}:${g.user.text}:${userImagesSig(g.user.images)}` : "-",
+      g.user ? `u:${g.user.id}:${textSig(g.user.text)}:${userImagesSig(g.user.images)}` : "-",
       g.turn
         ? `t:${g.turn.id}:${g.turn.durationMs}:${g.turn.totalTokens ?? ""}:${g.turn.actualModel ?? ""}:${foldOpen}`
         : "-",
@@ -765,7 +788,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         );
       } else if ("text" in item) {
         parts.push(
-          `${item.type}:${item.id}:${(item as { text: string }).text}:${!!state.expanded[`thought-${item.id}`]}`,
+          `${item.type}:${item.id}:${textSig((item as { text: string }).text)}:${!!state.expanded[`thought-${item.id}`]}`,
         );
       } else {
         parts.push(`${item.type}:${item.id}`);
@@ -774,9 +797,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     return parts.join("|");
   }
 
-  function computeLayout() {
+  async function computeLayout(generation: number): Promise<boolean> {
     const p = pal;
     const W = viewW;
+    const groups = props.groups;
+    const running = props.running;
+    const threadId = props.threadId;
     // CSS vw unit = window.innerWidth, not element width
     const vw = window.innerWidth;
     // .chat-foot: padding: 10px clamp(14px, 3vw, 24px) 16px
@@ -789,8 +815,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const proseW = contentW;
     const proseOff = 0;
     const result: Block[] = [];
-    groupYs = [];
+    const nextGroupYs: number[] = [];
     let y = 24;
+    let chunkStartedAt = performance.now();
     // DOM adjacent vertical margins collapse; canvas must emulate or user bubbles
     // stack 20+16 gaps and look full of blank space between short prompts.
     let pendingBottom = 0;
@@ -801,42 +828,44 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const setBottom = (bottom: number) => { pendingBottom = bottom; };
     const flushBottom = () => { y += pendingBottom; pendingBottom = 0; };
 
-    if (!props.groups.length) {
+    if (!groups.length) {
       result.push({ kind: "hint", id: 0, groupIdx: 0, x: side, y, w: contentW, h: 60,
-        text: props.emptyHint, color: p.faint, fontSize: 13, font: p.sans, selectable: true });
+        text: props.loading ? "正在加载会话…" : props.emptyHint,
+        color: p.faint, fontSize: 13, font: p.sans, selectable: !props.loading });
       y += 60;
-      blocks = result; totalHeight = y + 16;
-      prefixCacheSig = "";
-      prefixCacheUntil = 0;
-      prefixCacheBlocks = [];
-      prefixCacheGroupYs = [];
-      prefixCacheHeight = 0;
-      return;
+      if (generation !== layoutGeneration) return false;
+      groupYs = nextGroupYs;
+      blocks = result;
+      totalHeight = y + 16;
+      return true;
     }
 
     // 已闭合轮次布局缓存：流式输出时只重算尾部，大幅降低每帧布局成本
     let closedUntil = 0;
     const closedSigs: string[] = [];
-    for (let i = 0; i < props.groups.length; i++) {
-      if (!props.groups[i].turn) break;
-      closedSigs.push(closedGroupSig(props.groups[i]));
+    for (let i = 0; i < groups.length; i++) {
+      if (!groups[i].turn) break;
+      closedSigs.push(closedGroupSig(groups[i]));
       closedUntil = i + 1;
     }
     const prefixSig = `${Math.round(W)}|${p.bg}|${p.text}|${closedSigs.join("||")}`;
-    const reusePrefix =
-      closedUntil > 0 && prefixSig === prefixCacheSig && prefixCacheUntil === closedUntil;
+    const cacheKey = threadId ?? "";
+    const prefixCache = prefixLayoutCaches.get(cacheKey);
+    const reusePrefix = closedUntil > 0
+      && prefixCache?.sig === prefixSig
+      && prefixCache.until === closedUntil;
     let gi = 0;
-    if (reusePrefix) {
-      for (const b of prefixCacheBlocks) result.push(b);
-      groupYs = prefixCacheGroupYs.slice();
-      y = prefixCacheHeight;
+    if (reusePrefix && prefixCache) {
+      for (const b of prefixCache.blocks) result.push(b);
+      nextGroupYs.push(...prefixCache.groupYs);
+      y = prefixCache.height;
       gi = closedUntil;
     }
 
-    for (; gi < props.groups.length; gi++) {
-      const g = props.groups[gi];
-      groupYs.push(y);
-      const active = props.running && !g.turn;
+    for (; gi < groups.length; gi++) {
+      const g = groups[gi];
+      nextGroupYs.push(y);
+      const active = running && !g.turn;
 
       // user message: .msg-user margin 20px 0 16px; bubble max-width 85%
       if (g.user) {
@@ -978,27 +1007,37 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       for (const item of conclusion) {
         y = layoutItem(item, result, gi, side, proseOff, contentW, proseW, y, false);
       }
+
+      // Keep each frame responsive while laying out a previously unseen long thread.
+      if (gi + 1 < groups.length && performance.now() - chunkStartedAt >= 8) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        if (generation !== layoutGeneration || props.threadId !== threadId) return false;
+        chunkStartedAt = performance.now();
+      }
     }
 
     flushBottom();
+    if (generation !== layoutGeneration || props.threadId !== threadId) return false;
+    groupYs = nextGroupYs;
     blocks = result;
     totalHeight = y + 16;
 
-    if (closedUntil > 0) {
-      if (!reusePrefix) {
-        prefixCacheSig = prefixSig;
-        prefixCacheUntil = closedUntil;
-        prefixCacheBlocks = result.filter((b) => b.groupIdx < closedUntil);
-        prefixCacheGroupYs = groupYs.slice(0, closedUntil);
-        prefixCacheHeight = closedUntil < props.groups.length ? groupYs[closedUntil] : y;
+    if (closedUntil > 0 && !reusePrefix && cacheKey) {
+      prefixLayoutCaches.delete(cacheKey);
+      prefixLayoutCaches.set(cacheKey, {
+        sig: prefixSig,
+        until: closedUntil,
+        blocks: result.filter((b) => b.groupIdx < closedUntil),
+        groupYs: nextGroupYs.slice(0, closedUntil),
+        height: closedUntil < groups.length ? nextGroupYs[closedUntil] : y,
+      });
+      while (prefixLayoutCaches.size > 3) {
+        const oldest = prefixLayoutCaches.keys().next().value;
+        if (oldest == null) break;
+        prefixLayoutCaches.delete(oldest);
       }
-    } else {
-      prefixCacheSig = "";
-      prefixCacheUntil = 0;
-      prefixCacheBlocks = [];
-      prefixCacheGroupYs = [];
-      prefixCacheHeight = 0;
     }
+    return true;
   }
 
   function layoutItem(item: Item, result: Block[], gi: number, pad: number,
@@ -2240,11 +2279,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // ─── Rebuild / effects ─────────────────────────────────────────────────────
 
-  function rebuild() {
+  async function rebuild() {
+    const generation = ++layoutGeneration;
     pal = readPalette();
     const oldScroll = scrollY;
     const wasBottom = keepBottom || maxScroll - scrollY <= 2;
-    computeLayout();
+    if (!await computeLayout(generation)) return;
     const liveKeys = new Set(
       blocks.filter((b) => b.data?.clipped).map((b) => blockScrollKey(b)),
     );
@@ -2265,11 +2305,19 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     paintAll();
   }
 
-  function scheduleRebuild() {
+  function scheduleRebuild(afterPaint = false) {
     if (rebuildRaf) return;
     rebuildRaf = requestAnimationFrame(() => {
+      if (afterPaint) {
+        // Let the loading state reach the screen before starting an uncached layout.
+        rebuildRaf = requestAnimationFrame(() => {
+          rebuildRaf = 0;
+          void rebuild();
+        });
+        return;
+      }
       rebuildRaf = 0;
-      rebuild();
+      void rebuild();
     });
   }
 
@@ -2289,9 +2337,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   onMount(() => {
     resizeCanvas();
-    rebuild();
+    void rebuild();
 
-    const ro = new ResizeObserver(() => { resizeCanvas(); rebuild(); });
+    const ro = new ResizeObserver(() => { resizeCanvas(); void rebuild(); });
     ro.observe(canvasEl);
 
     // Rebuild fallback-font measurements after bundled web fonts become available.
@@ -2300,7 +2348,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       scheduleRebuild();
     });
 
-    const mo = new MutationObserver(rebuild);
+    const mo = new MutationObserver(() => { void rebuild(); });
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
     function onMouseLeave() {
@@ -2349,19 +2397,51 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   });
 
   createEffect(() => {
-    // track reactive dependencies
+    // Read reactive fields without concatenating full message text into temporary strings.
+    const threadId = props.threadId;
     for (const g of props.groups) {
-      if (g.user) void `${g.user.text}:${g.user.images?.length ?? 0}`;
+      if (g.user) {
+        void g.user.text;
+        void g.user.images?.length;
+      }
       for (const item of g.body) {
         if ("text" in item) void item.text;
-        if (item.type === "tool") void `${item.status}:${item.title}:${item.content.length}:${item.locations.length}`;
+        if (item.type === "tool") {
+          void item.status;
+          void item.title;
+          void item.content.length;
+          void item.locations.length;
+        }
       }
-      if (g.turn) void `${g.turn.durationMs}:${g.turn.totalTokens ?? ""}`;
+      if (g.turn) {
+        void g.turn.durationMs;
+        void g.turn.totalTokens;
+      }
     }
-    props.running; props.preview;
+    void props.running;
+    void props.loading;
+    void props.preview;
     JSON.stringify(state.expanded);
     void editing()?.id;
-    scheduleRebuild();
+    const switchedThread = threadId !== renderedThreadId;
+    if (switchedThread) {
+      renderedThreadId = threadId;
+      layoutGeneration++;
+      velocityY = 0;
+      selection = null;
+      groupYs = [];
+      scrollY = 0;
+      maxScroll = 0;
+      blocks = [{
+        kind: "hint", id: 0, groupIdx: 0,
+        x: Math.max(24, viewW * 0.1), y: 32, w: Math.max(0, viewW * 0.8), h: 40,
+        text: "正在渲染会话…", color: pal.faint, fontSize: 13, font: pal.sans,
+        selectable: false,
+      }];
+      totalHeight = viewH;
+      if (canvasEl) paintAll();
+    }
+    scheduleRebuild(switchedThread);
   });
 
   const saveEdit = () => {

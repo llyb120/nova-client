@@ -1098,9 +1098,11 @@ export function ChatView() {
         >
           <CanvasTranscript
             ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
+            threadId={state.currentId}
             groups={groups()}
             permissions={permissions()}
             running={isRunning()}
+            loading={state.loadingThread}
             preview={!!previewCheckpointId()}
             onReturnToCurrent={returnToCurrentTimeline}
             onScroll={(top, max, user) => {
