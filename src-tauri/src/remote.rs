@@ -1,7 +1,7 @@
 //! server 侧远程会话客户端。
 //!
-//! 通过普通 HTTP `/v2/remote/sync` 上行；空闲命令复用 `/v2/events` 主 SSE，
-//! 忙时按需开启 `/v2/remote/events` 辅助 SSE。上下行并行，长连接不阻塞状态上传。
+//! 通过普通 HTTP `/v2/remote/sync` 上行；`/v2/remote/events` 作为远控命令主 SSE，
+//! `/v2/events` 冗余分流。上下行并行，长连接不阻塞状态上传。
 //! 网页端刚打开（bootstrap state）时服务端会 refreshRequested，唤醒桌面补发。
 //! 每个运行会话独立维护基线：首包快照，中间与收尾只发变化条目（约 400ms 一拍）。
 //! 服务端会回传当前查看会话的轻量校验点；发现缺包或修订错位时只补对应会话。
@@ -218,7 +218,7 @@ impl RemoteTransport {
             .unwrap_or_else(|| Err("远控事件通道已关闭".into()))
     }
 
-    fn start_aux_sse(&self) -> tauri::async_runtime::JoinHandle<()> {
+    fn start_command_sse(&self) -> tauri::async_runtime::JoinHandle<()> {
         tauri::async_runtime::spawn(remote_sse_loop(
             self.cfg.clone(),
             self.http.clone(),
@@ -227,8 +227,8 @@ impl RemoteTransport {
     }
 }
 
-/// 主 `/v2/events` SSE 的远控分流订阅者。空闲时只保留主 SSE；忙时 remote.rs
-/// 再按需开启辅助 SSE，避免长期占用第二条长连接。
+/// 主 `/v2/events` SSE 的远控分流订阅者。独立 `/v2/remote/events` 是远控命令的
+/// 可靠主通道；这里保留分流作为迁移期冗余，command id 会过滤重复命令。
 static MAIN_SSE_SUBSCRIBERS: OnceLock<
     StdMutex<Vec<mpsc::UnboundedSender<Result<ServerResponse, String>>>>,
 > = OnceLock::new();
@@ -391,7 +391,7 @@ pub fn start(app: AppHandle) {
 async fn run(app: AppHandle) {
     let mut last_cfg: Option<RemoteConfig> = None;
     let mut transport: Option<RemoteTransport> = None;
-    let mut aux_sse_task: Option<tauri::async_runtime::JoinHandle<()>> = None;
+    let mut command_sse_task: Option<tauri::async_runtime::JoinHandle<()>> = None;
     let (pull_tx, mut pull_rx) = mpsc::unbounded_channel();
     let mut pull_task: Option<tauri::async_runtime::JoinHandle<()>> = None;
     let mut pull_generation = 0u64;
@@ -417,7 +417,7 @@ async fn run(app: AppHandle) {
             if let Some(task) = pull_task.take() {
                 task.abort();
             }
-            if let Some(task) = aux_sse_task.take() {
+            if let Some(task) = command_sse_task.take() {
                 task.abort();
             }
             transport = None;
@@ -440,11 +440,13 @@ async fn run(app: AppHandle) {
             if let Some(task) = pull_task.take() {
                 task.abort();
             }
-            if let Some(task) = aux_sse_task.take() {
+            if let Some(task) = command_sse_task.take() {
                 task.abort();
             }
             pull_generation = pull_generation.wrapping_add(1);
-            transport = Some(start_transport(cfg.clone()));
+            let next_transport = start_transport(cfg.clone());
+            command_sse_task = Some(next_transport.start_command_sse());
+            transport = Some(next_transport);
             last_cfg = Some(cfg.clone());
             requested.clear();
             revision = 0;
@@ -518,19 +520,6 @@ async fn run(app: AppHandle) {
             .map(|(id, thread)| (id.clone(), thread_running(&app, thread)))
             .collect();
         let any_running = running_now.values().any(|running| *running);
-        let need_aux_sse = any_running || !command_watch.is_empty();
-        if need_aux_sse && aux_sse_task.is_none() {
-            aux_sse_task = Some(
-                transport
-                    .as_ref()
-                    .expect("remote transport")
-                    .start_aux_sse(),
-            );
-        } else if !need_aux_sse {
-            if let Some(task) = aux_sse_task.take() {
-                task.abort();
-            }
-        }
         let metas = thread_metas(&app);
         let next_catalog_signature = catalog_signature_for(&metas);
         let catalog_changed = next_catalog_signature != catalog_signature;
