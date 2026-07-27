@@ -14,6 +14,7 @@ import {
 } from "../store";
 import type { Item, Thread, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
+import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
 import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
@@ -217,6 +218,7 @@ function TranscriptSegment(props: TranscriptSegmentProps) {
 export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
+  let transcriptRef: CanvasTranscriptHandle | undefined;
   const [stickToBottom, setStickToBottom] = createSignal(true);
   let scrollQueued = false;
   let scrollFrame = 0;
@@ -253,37 +255,21 @@ export function ChatView() {
   const latestTimeIndex = () => timeStops().at(-1)?.index ?? -1;
 
   const syncTimeCursor = () => {
-    if (!scrollRef || !innerRef) return;
+    if (!transcriptRef) return;
     const stops = timeStops();
-    if (stops.length === 0) {
-      setActiveTimeIndex(-1);
-      return;
+    if (stops.length === 0) { setActiveTimeIndex(-1); return; }
+    const groupIndex = transcriptRef.activeGroup();
+    let best = 0;
+    for (let i = 0; i < stops.length; i++) {
+      if (stops[i].index <= groupIndex) best = stops[i].index;
     }
-    const elements = innerRef.querySelectorAll<HTMLElement>(":scope > .vgroup");
-    const top = scrollRef.getBoundingClientRect().top + 32;
-    let low = 0;
-    let high = stops.length;
-    // 时间点与分组都按垂直位置排序；二分把每帧的布局读取从 O(n) 降为 O(log n)。
-    while (low < high) {
-      const middle = (low + high) >> 1;
-      const element = elements[stops[middle].index];
-      if (element && element.getBoundingClientRect().top <= top) low = middle + 1;
-      else high = middle;
-    }
-    setActiveTimeIndex(stops[Math.max(0, low - 1)].index);
+    setActiveTimeIndex(best);
   };
 
   const travelTo = (index: number) => {
-    const element = innerRef?.querySelector<VirtualGroupElement>(
-      `.vgroup[data-group-index="${index}"]`,
-    );
-    if (!element) return;
     cancelBottomFollow();
-    element.mountVirtualGroup?.();
-    requestAnimationFrame(() => {
-      element.scrollIntoView({ block: "start" });
-      syncTimeCursor();
-    });
+    transcriptRef?.scrollToGroup(index);
+    syncTimeCursor();
   };
 
   const returnToNow = () => {
@@ -333,70 +319,28 @@ export function ChatView() {
     }
   };
 
-  const maxScrollTop = () =>
-    scrollRef ? Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight) : 0;
+  const maxScrollTop = () => transcriptRef?.maxScrollTop() ?? 0;
 
-  const isAtBottom = () => !scrollRef || maxScrollTop() - scrollRef.scrollTop <= 1;
+  const isAtBottom = () => transcriptRef?.isAtBottom() ?? true;
 
   const cancelBottomFollow = () => setStickToBottom(false);
 
   const isToolDetailScroll = (target: EventTarget | null) =>
     target instanceof Element && !!target.closest(".tool-output, .tool-raw");
 
-  const handleWheel = (event: WheelEvent) => {
-    // 工具详情有独立滚动区，内部滚动不应改变外层会话的吸底状态。
-    if (isToolDetailScroll(event.target)) return;
-    if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
-    if (event.deltaY > 0 && isAtBottom()) {
-      if (!stickToBottom()) enableBottomFollow();
-      return;
-    }
-    if (event.deltaY !== 0) cancelBottomFollow();
-  };
-
-  const handlePointerDown = (event: PointerEvent) => {
-    // 仅跟踪外层滚动区的指针交互；拖动工具详情滚动条不能暂停吸底。
-    if (isToolDetailScroll(event.target)) return;
-    pointerActive = true;
-  };
-
-  const processTranscriptScroll = () => {
-    mountVisibleVirtualGroups();
-    syncTimeCursor();
-    const currentTop = scrollRef?.scrollTop ?? 0;
-    const atBottom = isAtBottom();
-    if (stickToBottom()) {
-      // 流式布局和虚拟分组高度变化也会触发 scroll；只有指针拖动时才把位移视为用户操作。
-      if (pointerActive && !atBottom && currentTop !== lastScrollTop) cancelBottomFollow();
-    } else if (atBottom && currentTop > lastScrollTop) {
-      setStickToBottom(true);
-    }
-    lastScrollTop = currentTop;
-  };
-
-  // WebView2 一帧可能派发多次 scroll；几何读取与响应式更新最多每帧执行一次。
-  const handleTranscriptScroll = () => {
-    if (scrollFrame) return;
-    scrollFrame = requestAnimationFrame(() => {
-      scrollFrame = 0;
-      processTranscriptScroll();
-    });
-  };
+  const handleWheel = (_event: WheelEvent) => {};
+  const handlePointerDown = (_event: PointerEvent) => {};
+  const processTranscriptScroll = () => { syncTimeCursor(); };
+  const handleTranscriptScroll = () => { processTranscriptScroll(); };
 
   const pinBottom = () => {
-    if (!scrollRef || !stickToBottom() || pointerActive) return;
-    scrollRef.scrollTop = maxScrollTop();
-    lastScrollTop = scrollRef.scrollTop;
-    mountVisibleVirtualGroups(true);
+    if (!stickToBottom() || pointerActive) return;
+    transcriptRef?.scrollToBottom();
+    lastScrollTop = transcriptRef?.scrollTop() ?? 0;
   };
 
-  const compensateVirtualHeight = (delta: number) => {
-    if (!scrollRef || Math.abs(delta) <= 0.5) return;
-    scrollRef.scrollTop += delta;
-    lastScrollTop = scrollRef.scrollTop;
-  };
+  const compensateVirtualHeight = (_delta: number) => {};
 
-  // 合并同一轮内容变化，并在下一次绘制前直接钉底；不做滚动动画或多帧追赶。
   const scheduleBottomPin = () => {
     if (scrollQueued) return;
     scrollQueued = true;
@@ -412,11 +356,6 @@ export function ChatView() {
   };
 
   const finishPointerInteraction = () => {
-    if (scrollFrame) {
-      cancelAnimationFrame(scrollFrame);
-      scrollFrame = 0;
-    }
-    processTranscriptScroll();
     pointerActive = false;
     if (stickToBottom()) scheduleBottomPin();
   };
@@ -439,40 +378,22 @@ export function ChatView() {
   });
 
   onMount(() => {
-    if (!innerRef || !scrollRef) return;
-    const ro = new ResizeObserver(() => {
-      scheduleBottomPin();
-    });
-    ro.observe(innerRef);
-    ro.observe(scrollRef);
-
     const scrollUpKeys = new Set(["ArrowUp", "PageUp", "Home"]);
     const scrollDownKeys = new Set(["ArrowDown", "PageDown", "End"]);
     const handleScrollKey = (event: KeyboardEvent) => {
       const scrollsUp = scrollUpKeys.has(event.key) || (event.key === " " && event.shiftKey);
       const scrollsDown = scrollDownKeys.has(event.key) || (event.key === " " && !event.shiftKey);
-      if (event.altKey || event.ctrlKey || event.metaKey || (!scrollsUp && !scrollsDown)) return;
-      if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
-      const target = event.target;
-      if (target instanceof Node && target !== document.body && !scrollRef?.contains(target)) return;
-      if (
-        target instanceof HTMLElement &&
-        (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
-      ) return;
-      if (isToolDetailScroll(target)) return;
-      if (scrollsDown) {
-        if (isAtBottom()) {
-          if (!stickToBottom()) enableBottomFollow();
-          return;
-        }
-      }
-      cancelBottomFollow();
+      if (event.altKey || event.ctrlKey || event.metaKey || transcriptRef?.hasFocusedInput()) return;
+      if (!scrollsUp && !scrollsDown) return;
+      const delta = scrollsDown ? 100 : -100;
+      transcriptRef?.scrollBy(delta);
+      if (scrollsDown && isAtBottom() && !stickToBottom()) enableBottomFollow();
+      else if (!isAtBottom()) cancelBottomFollow();
     };
     window.addEventListener("keydown", handleScrollKey, true);
     window.addEventListener("pointerup", finishPointerInteraction, true);
     window.addEventListener("pointercancel", finishPointerInteraction, true);
     onCleanup(() => {
-      ro.disconnect();
       if (scrollFrame) cancelAnimationFrame(scrollFrame);
       window.removeEventListener("keydown", handleScrollKey, true);
       window.removeEventListener("pointerup", finishPointerInteraction, true);
@@ -1008,51 +929,22 @@ export function ChatView() {
       <div class="chat-shell">
         <div class="chat-primary">
       <div class="chat-body">
-       <div
-        class="transcript"
-        classList={{ "checkpoint-preview": !!previewItems(), "checkpoint-preview-fading": previewFading() }}
-        ref={scrollRef}
-        onScroll={handleTranscriptScroll}
-        onWheel={handleWheel}
-        onPointerDown={handlePointerDown}
-      >
-        <div class="transcript-inner" ref={innerRef}>
-          <Show when={previewCheckpointId()}>
-            <button
-              type="button"
-              class="checkpoint-preview-banner"
-              title="回到当前时间线和最新消息"
-              onClick={returnToCurrentTimeline}
-            >
-              回到当前时间线
-            </button>
-          </Show>
-          <Show when={displayedItems().length === 0 && !state.loadingThread}>
-            <div class="transcript-hint">
-              在下方输入任务，{agentLabel(state.agentKind)} 将在{" "}
-              <code>{cwdDisplay()}</code> 中工作。
-            </div>
-          </Show>
-          <Show keyed when={state.currentId}>
-
-            <For each={groups()}>
-              {(g, i) => (
-                <VirtualGroup
-                  group={g}
-                  index={i()}
-                  // 运行中所有尚未闭合的轮次都保持活跃：补充提示词会新开一组，
-                  // 若只标最后一组，前面仍在跑的工具/输出会像已停止。
-                  active={isRunning() && !g.turn}
-                  keepMounted={i() === lastGroupIndex()}
-                  scrollEl={() => scrollRef}
-                  compensateHeight={compensateVirtualHeight}
-                />
-              )}
-            </For>
-          </Show>
-          <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
-        </div>
-      </div>
+        <CanvasTranscript
+          ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
+          groups={groups()}
+          permissions={permissions()}
+          running={isRunning()}
+          preview={!!previewCheckpointId()}
+          onReturnToCurrent={returnToCurrentTimeline}
+          onScroll={(top, max, user) => {
+            if (user) {
+              setStickToBottom(max - top <= 2);
+              lastScrollTop = top;
+            }
+            syncTimeCursor();
+          }}
+          emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
+        />
       </div>
 
       <footer class="chat-foot">

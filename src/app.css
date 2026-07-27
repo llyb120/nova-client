@@ -913,6 +913,59 @@ button {
   min-width: 0;
 }
 
+/* Canvas 会话区：占满 chat-body，仅编辑态用 DOM overlay */
+.canvas-transcript-host {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+.transcript-canvas-only {
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+  cursor: default;
+  -webkit-font-smoothing: antialiased;
+  font-smooth: always;
+}
+.canvas-prompt-editor {
+  position: absolute;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-light);
+  border-radius: 14px;
+  padding: 12px 14px;
+  box-sizing: border-box;
+}
+.canvas-prompt-editor textarea {
+  background: none;
+  border: none;
+  outline: none;
+  resize: vertical;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.6;
+  min-height: 48px;
+  user-select: text;
+}
+.canvas-prompt-editor > div:last-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.canvas-prompt-editor > div:last-child > span {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
 /* 会话世界线：Vega 已持有完整上下文，因此把每轮提示词变成可穿梭的时间刻度。 */
 .time-rail {
   position: relative;
