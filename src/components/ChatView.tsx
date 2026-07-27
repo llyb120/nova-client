@@ -1005,6 +1005,8 @@ export function ChatView() {
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
       </Show>
 
+      <div class="chat-shell">
+        <div class="chat-primary">
       <div class="chat-body">
        <div
         class="transcript"
@@ -1051,6 +1053,17 @@ export function ChatView() {
           <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
         </div>
       </div>
+      </div>
+
+      <footer class="chat-foot">
+        <Show when={state.plan && state.plan.length > 0}>
+          <PlanCard plan={state.plan!} />
+        </Show>
+        <PlanActionCard />
+        <Composer />
+      </footer>
+        </div>
+
       <Show when={showTimeMachine()}>
         <aside
           class="repo-time-machine"
@@ -1170,22 +1183,6 @@ export function ChatView() {
         </aside>
       </Show>
       </div>
-
-      <footer
-        class="chat-foot"
-        classList={{
-          "has-time-machine": showTimeMachine(),
-          "has-stage-rail": showStageRail(),
-        }}
-      >
-        <Show when={state.plan && state.plan.length > 0}>
-          <div classList={{ "fire-plan-inline": isFireThread() && showStageRail() }}>
-            <PlanCard plan={state.plan!} />
-          </div>
-        </Show>
-        <PlanActionCard />
-        <Composer />
-      </footer>
     </main>
   );
 }
