@@ -87,7 +87,7 @@ function shiftLayoutTree(node, dx, dy) {
 }
 
 /** 布局算法版本：变更时强制已缓存的 _layoutStable 子树重新排版（避免 HMR/旧几何残留）。 */
-export const LAYOUT_REV = 4;
+export const LAYOUT_REV = 5;
 
 // Layout a node within a content box (x, y, width, height available).
 // Returns the node's outer height consumed (including margin).
@@ -434,6 +434,12 @@ function layoutInlineRun(run, innerX, startY, innerW, availH) {
       child._y = (childMinY !== Infinity ? childMinY : y) - cm.t - cp.t;
       child._width = childMaxX !== -Infinity ? (childMaxX - childMinX) + cp.l + cp.r : 0;
       child._height = fragments.length * lineH + cp.t + cp.b + cm.t + cm.b;
+
+      // 与 paintInlineText 一致：灰底/边框按 padding+border 外扩，布局游标也要推进，
+      // 否则后续英文会画进上一段 inline code 的背景里。
+      const cb = edges(cs.border);
+      x += cp.l + cp.r + cb.l + cb.r;
+      maxW = Math.max(maxW, x - innerX);
     }
   }
   return { lineHeight: lineH, lineCount: lineIdx + 1, maxW };
