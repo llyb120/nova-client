@@ -81,6 +81,8 @@ function measure(text: string, fs: number, ff: string, fw = "400"): number {
 
 /** Soft-wrapped line plus per-UTF16-unit offsets into the original (normalized) string. */
 interface WrappedLine { text: string; offsets: number[] }
+interface CharStyle { bold?: boolean; italic?: boolean; code?: boolean; link?: string }
+type LineMeasurer = (text: string, offsets: number[]) => number;
 
 function pushTrimmedLine(lines: WrappedLine[], text: string, offsets: number[]) {
   let end = text.length;
@@ -94,9 +96,17 @@ function pushTrimmedLine(lines: WrappedLine[], text: string, offsets: number[]) 
  * is indexed by the full plain text — without offsets, inline code/bold runs shift
  * (e.g. first char of each `code` falls outside the pill).
  */
-function wrapTextIndexed(text: string, maxW: number, fs: number, ff: string, fw = "400"): WrappedLine[] {
+function wrapTextIndexed(
+  text: string,
+  maxW: number,
+  fs: number,
+  ff: string,
+  fw = "400",
+  customMeasure?: LineMeasurer,
+): WrappedLine[] {
   const lines: WrappedLine[] = [];
   const safeMax = Math.max(1, maxW);
+  const lineWidth: LineMeasurer = customMeasure || ((value) => measure(value, fs, ff, fw));
   const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const paras = normalized.split("\n");
   let base = 0;
@@ -124,11 +134,14 @@ function wrapTextIndexed(text: string, maxW: number, fs: number, ff: string, fw 
     for (const token of tokens) {
       // Don't start a line with whitespace — matches typical pre-wrap soft-wrap feel.
       if (!cur && /^\s+$/.test(token.text)) continue;
-      const ww = measure(token.text, fs, ff, fw);
-      if (curW + ww <= safeMax) {
-        cur += token.text;
-        for (let ci = 0; ci < token.text.length; ci++) curOffs.push(token.start + ci);
-        curW += ww;
+      const tokenOffs = Array.from({ length: token.text.length }, (_, ci) => token.start + ci);
+      const joined = cur + token.text;
+      const joinedOffs = curOffs.concat(tokenOffs);
+      const joinedW = lineWidth(joined, joinedOffs);
+      if (joinedW <= safeMax) {
+        cur = joined;
+        curOffs = joinedOffs;
+        curW = joinedW;
         continue;
       }
       // Word won't fit: fill remaining space on this line char-by-char first
@@ -140,17 +153,19 @@ function wrapTextIndexed(text: string, maxW: number, fs: number, ff: string, fw 
       let ci = 0;
       for (const ch of Array.from(token.text)) {
         const off = token.start + ci;
-        const cw = measure(ch, fs, ff, fw);
-        if (cur && curW + cw > safeMax) {
+        const chOffs = Array.from({ length: ch.length }, (_, k) => off + k);
+        const candidate = cur + ch;
+        const candidateOffs = curOffs.concat(chOffs);
+        const candidateW = lineWidth(candidate, candidateOffs);
+        if (cur && candidateW > safeMax) {
           lines.push({ text: cur, offsets: curOffs });
           cur = ch;
-          curOffs = [];
-          for (let k = 0; k < ch.length; k++) curOffs.push(off + k);
-          curW = cw;
+          curOffs = chOffs;
+          curW = lineWidth(ch, chOffs);
         } else {
-          cur += ch;
-          for (let k = 0; k < ch.length; k++) curOffs.push(off + k);
-          curW += cw;
+          cur = candidate;
+          curOffs = candidateOffs;
+          curW = candidateW;
         }
         ci += ch.length;
       }
@@ -166,6 +181,58 @@ function wrapTextIndexed(text: string, maxW: number, fs: number, ff: string, fw 
 
 function wrapText(text: string, maxW: number, fs: number, ff: string, fw = "400"): string[] {
   return wrapTextIndexed(text, maxW, fs, ff, fw).map((l) => l.text);
+}
+
+function segmentCharStyles(segments: TextSegment[]): CharStyle[] {
+  const styles: CharStyle[] = [];
+  for (const seg of segments) {
+    for (let i = 0; i < seg.text.length; i++) {
+      styles.push({ bold: seg.bold, italic: seg.italic, code: seg.code, link: seg.link });
+    }
+  }
+  return styles;
+}
+
+function wrapStyledTextIndexed(
+  text: string,
+  segments: TextSegment[],
+  maxW: number,
+  fs: number,
+  ff: string,
+  mono: string,
+  baseFw = "400",
+  styles = segmentCharStyles(segments),
+): WrappedLine[] {
+  const measureLine: LineMeasurer = (line, offsets) => {
+    let width = 0;
+    let start = 0;
+    while (start < line.length) {
+      const style = styles[offsets[start]] || {};
+      let end = start + 1;
+      while (end < line.length) {
+        const next = styles[offsets[end]] || {};
+        if (next.bold !== style.bold || next.italic !== style.italic || next.code !== style.code || next.link !== style.link) break;
+        end++;
+      }
+      width += measure(line.slice(start, end), style.code ? 12.5 : fs, style.code ? mono : ff, style.bold ? "bold" : baseFw);
+      if (style.code) width += 12;
+      start = end;
+    }
+    return width;
+  };
+  return wrapTextIndexed(text, maxW, fs, ff, baseFw, measureLine);
+}
+
+function wrapStyledText(
+  text: string,
+  segments: TextSegment[],
+  maxW: number,
+  fs: number,
+  ff: string,
+  mono: string,
+  baseFw = "400",
+): string[] {
+  return wrapStyledTextIndexed(text, segments, maxW, fs, ff, mono, baseFw).map((line) => line.text);
 }
 // Match DOM .bubble-images img: max-width 240px; max-height 180px
 // Scale uniformly by original aspect ratio to fit within max W or H (never stretch).
@@ -979,7 +1046,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             });
           } else {
             const plain = segmentsPlainText(mb.segments);
-            const lines = wrapText(plain, proseW - 28, 13, p.sans);
+            const lines = wrapStyledText(plain, mb.segments, proseW - 28, 13, p.sans, p.mono);
             const lh = 13 * 1.6;
             const pH = lines.length * lh;
             result.push({ kind: "md-paragraph", id: item.id, groupIdx: gi,
@@ -1030,7 +1097,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const hLevel = mb.level || 1;
           const hFs = hLevel === 1 ? 17.5 : hLevel === 2 ? 16.1 : 14.7;
           const plain = segmentsPlainText(mb.segments);
-          const hLines = wrapText(plain, proseW, hFs, p.sans, "bold");
+          const hLines = wrapStyledText(plain, mb.segments, proseW, hFs, p.sans, p.mono, "bold");
           const hLh = hFs * 1.3;
           const hH = hLines.length * hLh;
           y += 16;
@@ -1041,7 +1108,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           y += hH + 8;
         } else if (mb.type === "blockquote") {
           const plain = segmentsPlainText(mb.segments);
-          const bLines = wrapText(plain, proseW - 15, 14, p.sans);
+          const bLines = wrapStyledText(plain, mb.segments, proseW - 15, 14, p.sans, p.mono);
           const bLh = 14 * 1.6;
           const bH = bLines.length * bLh + 4;
           result.push({ kind: "md-blockquote", id: item.id, groupIdx: gi,
@@ -1053,7 +1120,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         } else if (mb.type === "list-item") {
           const plain = segmentsPlainText(mb.segments);
           const indent = 22;
-          const liLines = wrapText(plain, proseW - indent, 14, p.sans);
+          const liLines = wrapStyledText(plain, mb.segments, proseW - indent, 14, p.sans, p.mono);
           const liLh = 14 * 1.7;
           const liH = liLines.length * liLh;
           result.push({ kind: "md-list-item", id: item.id, groupIdx: gi,
@@ -1066,7 +1133,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           y = layoutMdTable(mb, result, item.id, gi, x, y, proseW, p);
         } else {
           const plain = segmentsPlainText(mb.segments);
-          const pLines = wrapText(plain, proseW, 14, p.sans);
+          const pLines = wrapStyledText(plain, mb.segments, proseW, 14, p.sans, p.mono);
           const pLh = 14 * 1.7;
           const pH = pLines.length * pLh;
           result.push({ kind: "md-paragraph", id: item.id, groupIdx: gi,
@@ -1594,19 +1661,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
 
     const plainText = b.text || segmentsPlainText(segments);
-    const wrapped = b._wrapped || (b._wrapped = wrapTextIndexed(plainText, maxW, fs, ff, baseFw));
-    b._lines = wrapped.map((l) => l.text);
-
     let charStyles = b._charStyles;
     if (!charStyles) {
-      charStyles = [];
-      for (const seg of segments) {
-        for (let si = 0; si < seg.text.length; si++) {
-          charStyles.push({ bold: seg.bold, italic: seg.italic, code: seg.code, link: seg.link });
-        }
-      }
+      charStyles = segmentCharStyles(segments);
       b._charStyles = charStyles;
     }
+    const wrapped = b._wrapped || (b._wrapped = wrapStyledTextIndexed(
+      plainText, segments, maxW, fs, ff, pal.mono, baseFw, charStyles,
+    ));
+    b._lines = wrapped.map((l) => l.text);
 
     const styleAt = (absOff: number | undefined) =>
       absOff == null ? {} : (charStyles![absOff] || {});
