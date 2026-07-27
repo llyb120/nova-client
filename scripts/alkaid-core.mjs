@@ -252,6 +252,7 @@ export function isRetryableAlkaidProviderError(error) {
     "etimedout",
     "econnaborted",
     "epipe",
+    "request timed out",
     "und_err_socket",
     "premature close",
     "other side closed",
