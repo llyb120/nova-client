@@ -167,14 +167,46 @@ interface TextSegment {
   link?: string;
 }
 
+interface MdTableCell {
+  segments: TextSegment[];
+}
+
 interface MdBlock {
-  type: "paragraph" | "heading" | "code" | "list-item" | "blockquote" | "hr";
+  type: "paragraph" | "heading" | "code" | "list-item" | "blockquote" | "hr" | "table";
   segments: TextSegment[];
   level?: number;
   lang?: string;
   ordered?: boolean;
   prefix?: string;
   raw?: string;
+  rows?: MdTableCell[][];
+  aligns?: Array<"left" | "center" | "right">;
+}
+
+function splitTableRow(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map(c => c.trim());
+}
+
+function isTableSeparator(line: string): boolean {
+  if (!line.includes("|")) return false;
+  const cells = splitTableRow(line);
+  return cells.length > 0 && cells.every(c => /^:?-{1,}:?$/.test(c.trim()));
+}
+
+function parseTableAlign(cell: string): "left" | "center" | "right" {
+  const t = cell.trim();
+  const left = t.startsWith(":");
+  const right = t.endsWith(":");
+  if (left && right) return "center";
+  if (right) return "right";
+  return "left";
+}
+
+function isTableStart(lines: string[], i: number): boolean {
+  return i + 1 < lines.length && lines[i].includes("|") && isTableSeparator(lines[i + 1]);
 }
 
 function tokenizeInline(text: string): TextSegment[] {
@@ -247,12 +279,35 @@ function parseMarkdownBlocks(md: string): MdBlock[] {
       }
       continue;
     }
+    if (isTableStart(lines, i)) {
+      const headerCells = splitTableRow(line).map(c => ({ segments: tokenizeInline(c) }));
+      const aligns = splitTableRow(lines[i + 1]).map(parseTableAlign);
+      while (aligns.length < headerCells.length) aligns.push("left");
+      const rows: MdTableCell[][] = [headerCells];
+      i += 2;
+      while (i < lines.length) {
+        const l = lines[i];
+        if (/^\s*$/.test(l) || isTableSeparator(l) || /^\s{0,3}(`{3,}|~{3,})/.test(l)
+          || /^(#{1,6})\s+/.test(l) || /^>\s?/.test(l) || /^\s*[-*+]\s+/.test(l)
+          || /^\s*\d+\.\s+/.test(l) || /^\s*([-*_])\1{2,}\s*$/.test(l) || !l.includes("|")) break;
+        const cells = splitTableRow(l).map(c => ({ segments: tokenizeInline(c) }));
+        while (cells.length < headerCells.length) cells.push({ segments: [{ text: "" }] });
+        rows.push(cells.slice(0, headerCells.length));
+        i++;
+      }
+      const plain = rows.map(r => r.map(c => segmentsPlainText(c.segments)).join("\t")).join("\n");
+      blocks.push({
+        type: "table", segments: [{ text: plain }], rows, aligns: aligns.slice(0, headerCells.length), raw: plain,
+      });
+      continue;
+    }
     if (/^\s*$/.test(line)) { i++; continue; }
     const buf: string[] = [line]; i++;
     while (i < lines.length) {
       const l = lines[i];
       if (/^\s*$/.test(l) || /^\s{0,3}(`{3,}|~{3,})/.test(l) || /^(#{1,6})\s+/.test(l) || /^>\s?/.test(l)
-        || /^\s*[-*+]\s+/.test(l) || /^\s*\d+\.\s+/.test(l) || /^\s*([-*_])\1{2,}\s*$/.test(l)) break;
+        || /^\s*[-*+]\s+/.test(l) || /^\s*\d+\.\s+/.test(l) || /^\s*([-*_])\1{2,}\s*$/.test(l)
+        || isTableStart(lines, i)) break;
       buf.push(l); i++;
     }
     blocks.push({ type: "paragraph", segments: tokenizeInline(buf.join("\n")) });
@@ -262,6 +317,70 @@ function parseMarkdownBlocks(md: string): MdBlock[] {
 
 function segmentsPlainText(segments: TextSegment[]): string {
   return segments.map(s => s.text).join("");
+}
+
+const TABLE_FS = 13;
+const TABLE_PAD_X = 10;
+const TABLE_PAD_Y = 5;
+const TABLE_LH = 1.45;
+
+function layoutMdTable(
+  mb: MdBlock,
+  result: Block[],
+  itemId: number,
+  gi: number,
+  x: number,
+  y: number,
+  proseW: number,
+  p: Palette,
+  opts?: { color?: string; fontSize?: number },
+): number {
+  const rows = mb.rows;
+  if (!rows?.length) return y;
+  const fs = opts?.fontSize ?? TABLE_FS;
+  const color = opts?.color ?? p.text;
+  const aligns = mb.aligns || [];
+  const colCount = rows[0].length;
+  const colWidths = new Array(colCount).fill(0);
+  for (let r = 0; r < rows.length; r++) {
+    const fw = r === 0 ? "600" : "400";
+    for (let c = 0; c < colCount; c++) {
+      const plain = segmentsPlainText(rows[r][c]?.segments || []);
+      colWidths[c] = Math.max(colWidths[c], measure(plain, fs, p.sans, fw) + TABLE_PAD_X * 2);
+    }
+  }
+  let totalW = colWidths.reduce((a, b) => a + b, 0);
+  if (totalW > proseW && totalW > 0) {
+    const scale = proseW / totalW;
+    for (let c = 0; c < colCount; c++) colWidths[c] = Math.max(24, colWidths[c] * scale);
+    totalW = colWidths.reduce((a, b) => a + b, 0);
+  }
+  const cellLines: string[][][] = [];
+  const rowHeights: number[] = [];
+  for (let r = 0; r < rows.length; r++) {
+    const fw = r === 0 ? "600" : "400";
+    const linesPerCell: string[][] = [];
+    let maxLines = 1;
+    for (let c = 0; c < colCount; c++) {
+      const plain = segmentsPlainText(rows[r][c]?.segments || []);
+      const maxW = Math.max(1, colWidths[c] - TABLE_PAD_X * 2);
+      const lines = wrapText(plain, maxW, fs, p.sans, fw);
+      linesPerCell.push(lines.length ? lines : [""]);
+      maxLines = Math.max(maxLines, linesPerCell[c].length);
+    }
+    cellLines.push(linesPerCell);
+    rowHeights.push(maxLines * fs * TABLE_LH + TABLE_PAD_Y * 2);
+  }
+  const tableH = rowHeights.reduce((a, b) => a + b, 0);
+  const tableW = Math.min(proseW, totalW);
+  const plain = mb.raw || rows.map(r => r.map(c => segmentsPlainText(c.segments)).join("\t")).join("\n");
+  result.push({
+    kind: "md-table", id: itemId, groupIdx: gi,
+    x, y, w: tableW, h: tableH,
+    text: plain, color, fontSize: fs, font: p.sans, selectable: true,
+    data: { rows, aligns, colWidths, cellLines, rowHeights, border: p.border },
+  });
+  return y + tableH + 10;
 }
 
 // ─── Tool icon SVG paths (stroke-based, viewBox 0 0 24 24) ──────────────────
@@ -746,6 +865,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               borderRadius: 6, fontSize: 12, lineHeight: 1.55, font: p.mono,
               selectable: true, data: { padX: 12, padY: 10 } });
             thY += codeH + 8;
+          } else if (mb.type === "table") {
+            thY = layoutMdTable(mb, result, item.id, gi, x + 14, thY, proseW - 28, p, {
+              color: p.dim, fontSize: 12,
+            });
           } else {
             const plain = segmentsPlainText(mb.segments);
             const lines = wrapText(plain, proseW - 28, 13, p.sans);
@@ -829,6 +952,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             lineHeight: 1.7, font: p.sans, selectable: true,
             data: { prefix: mb.prefix, indent } });
           y += liH + 3;
+        } else if (mb.type === "table") {
+          y = layoutMdTable(mb, result, item.id, gi, x, y, proseW, p);
         } else {
           const plain = segmentsPlainText(mb.segments);
           const pLines = wrapText(plain, proseW, 14, p.sans);
@@ -1072,6 +1197,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           break;
         case "md-code":
           paintCodeBlock(ctx, b, bx, by, p);
+          break;
+        case "md-table":
+          paintMdTable(ctx, b, bx, by, p);
           break;
         case "md-hr":
           ctx.fillStyle = b.bg || p.border;
@@ -1485,6 +1613,75 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.restore();
   }
 
+  function paintMdTable(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette) {
+    const fs = b.fontSize || TABLE_FS;
+    const ff = b.font || p.sans;
+    const colWidths = (b.data?.colWidths as number[]) || [];
+    const cellLines = (b.data?.cellLines as string[][][]) || [];
+    const rowHeights = (b.data?.rowHeights as number[]) || [];
+    const aligns = (b.data?.aligns as Array<"left" | "center" | "right">) || [];
+    const border = (b.data?.border as string) || p.border;
+    const textLines: TextLine[] = [];
+    let charOff = 0;
+    let rowY = by;
+    let absRowY = b.y;
+
+    for (let r = 0; r < cellLines.length; r++) {
+      const rh = rowHeights[r] || fs * TABLE_LH + TABLE_PAD_Y * 2;
+      let cellX = bx;
+      if (r === 0) {
+        ctx.fillStyle = p.panel;
+        ctx.globalAlpha = 0.55;
+        ctx.fillRect(bx, rowY, b.w, rh);
+        ctx.globalAlpha = 1;
+      }
+      for (let c = 0; c < colWidths.length; c++) {
+        const cw = colWidths[c];
+        const lines = cellLines[r]?.[c] || [""];
+        const fw = r === 0 ? "600" : "400";
+        const align = aligns[c] || "left";
+        ctx.strokeStyle = border;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(cellX + 0.5, rowY + 0.5, cw - 1, rh - 1);
+        ctx.fillStyle = b.color || p.text;
+        ctx.font = `${fw} ${fs}px ${ff}`;
+        ctx.textBaseline = "top";
+        const lineH = fs * TABLE_LH;
+        const contentH = lines.length * lineH;
+        const textTop = rowY + Math.max(TABLE_PAD_Y, (rh - contentH) / 2);
+        const absTextTop = absRowY + Math.max(TABLE_PAD_Y, (rh - contentH) / 2);
+        for (let li = 0; li < lines.length; li++) {
+          const line = lines[li];
+          const tw = measure(line, fs, ff, fw);
+          let tx = cellX + TABLE_PAD_X;
+          if (align === "center") tx = cellX + (cw - tw) / 2;
+          else if (align === "right") tx = cellX + cw - TABLE_PAD_X - tw;
+          ctx.fillText(line, tx, snap(textTop + li * lineH));
+          // Per cell visual line: selection hit/paint follows column x, not row-joined text
+          const charX: number[] = new Array(line.length + 1);
+          for (let ci = 0; ci <= line.length; ci++) {
+            charX[ci] = measure(line.slice(0, ci), fs, ff, fw);
+          }
+          textLines.push({
+            text: line,
+            x: tx,
+            y: absTextTop + li * lineH,
+            w: tw,
+            offset: charOff,
+            fs,
+            lh: lineH,
+            charX,
+          });
+          charOff += line.length + 1;
+        }
+        cellX += cw;
+      }
+      rowY += rh;
+      absRowY += rh;
+    }
+    b.textLines = textLines;
+  }
+
   function paintEditIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, color: string) {
     ctx.save();
     ctx.strokeStyle = color;
@@ -1507,10 +1704,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (!selection) return;
     ctx.save();
     ctx.fillStyle = "rgba(74, 144, 217, 0.35)";
-    const from = Math.min(selection.startBlock, selection.endBlock);
-    const to = Math.max(selection.startBlock, selection.endBlock);
-    const fromOff = selection.startBlock <= selection.endBlock ? selection.startOffset : selection.endOffset;
-    const toOff = selection.startBlock <= selection.endBlock ? selection.endOffset : selection.startOffset;
+    // 同 block 内从下往上也要按 offset 判向，否则 fromOff>toOff 导致高亮宽度为负
+    const forward =
+      selection.startBlock < selection.endBlock ||
+      (selection.startBlock === selection.endBlock && selection.startOffset <= selection.endOffset);
+    const from = forward ? selection.startBlock : selection.endBlock;
+    const to = forward ? selection.endBlock : selection.startBlock;
+    const fromOff = forward ? selection.startOffset : selection.endOffset;
+    const toOff = forward ? selection.endOffset : selection.startOffset;
     for (let i = from; i <= to; i++) {
       const b = blocks[i];
       if (!b?.textLines || !b.selectable) continue;
@@ -1573,32 +1774,36 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const rect = canvasEl.getBoundingClientRect();
     const mx = clientX - rect.left;
     const my = clientY - rect.top + scrollY;
+    let best: { block: number; offset: number; xDist: number } | null = null;
     for (let i = 0; i < blocks.length; i++) {
       const b = blocks[i];
       if (!b.textLines || !b.selectable) continue;
       if (b.data?.clipped && (my < b.y || my >= b.y + b.h)) continue;
       for (const ln of b.textLines) {
         if (b.data?.clipped && (ln.y + ln.lh <= b.y || ln.y >= b.y + b.h)) continue;
-        if (my >= ln.y && my < ln.y + ln.lh) {
-          let off = ln.offset + ln.text.length;
-          if (ln.charX) {
-            for (let c = 0; c < ln.text.length; c++) {
-              const left = ln.x + ln.charX[c];
-              const right = ln.x + ln.charX[c + 1];
-              if (mx < (left + right) / 2) { off = ln.offset + c; break; }
-            }
-          } else {
-            for (let c = 0; c < ln.text.length; c++) {
-              const left = ln.x + measure(ln.text.slice(0, c), ln.fs, b.font || pal.sans, b.fontWeight);
-              const right = ln.x + measure(ln.text.slice(0, c + 1), ln.fs, b.font || pal.sans, b.fontWeight);
-              if (mx < (left + right) / 2) { off = ln.offset + c; break; }
-            }
+        if (my < ln.y || my >= ln.y + ln.lh) continue;
+        // 表格同行多列共享同一 y：按水平距离选最近行，避免永远命中左侧单元格
+        const lineRight = ln.x + Math.max(ln.w, 1);
+        const xDist = mx < ln.x ? ln.x - mx : mx > lineRight ? mx - lineRight : 0;
+        if (best && xDist >= best.xDist) continue;
+        let off = ln.offset + ln.text.length;
+        if (ln.charX) {
+          for (let c = 0; c < ln.text.length; c++) {
+            const left = ln.x + ln.charX[c];
+            const right = ln.x + ln.charX[c + 1];
+            if (mx < (left + right) / 2) { off = ln.offset + c; break; }
           }
-          return { block: i, offset: off };
+        } else {
+          for (let c = 0; c < ln.text.length; c++) {
+            const left = ln.x + measure(ln.text.slice(0, c), ln.fs, b.font || pal.sans, b.fontWeight);
+            const right = ln.x + measure(ln.text.slice(0, c + 1), ln.fs, b.font || pal.sans, b.fontWeight);
+            if (mx < (left + right) / 2) { off = ln.offset + c; break; }
+          }
         }
+        best = { block: i, offset: off, xDist };
       }
     }
-    return null;
+    return best ? { block: best.block, offset: best.offset } : null;
   }
 
   function onMouseMove(e: MouseEvent) {
