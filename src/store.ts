@@ -2383,7 +2383,7 @@ export async function initStore() {
   }
 
   // 团队/漫游：settings 一就绪就立刻刷新中转状态并读取本地 presence 缓存；
-  // 在线名单随后完全由 /v2/ws 的 presence 首包和变更推送维护，不再轮询 /v2/peers。
+  // 在线名单随后完全由 /v2/events SSE 的 presence 首包和变更推送维护，不再轮询 /v2/peers。
   void refreshRelayStatus();
   void api
     .getRelayPeers()

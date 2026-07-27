@@ -1,7 +1,7 @@
 # Nova Headless Server
 
 Nova Server 在没有桌面环境的 Linux 主机上运行完整 Nova 后端，并通过现有中转服务接受
-Nova Web 的远程控制。服务器只发起出站 HTTPS/WebSocket 连接，无需开放 Nova 入站端口。
+Nova Web 的远程控制。服务器只发起出站 HTTPS 连接（普通 HTTP 上行 + SSE 下行），无需开放 Nova 入站端口。
 
 ## 依赖
 

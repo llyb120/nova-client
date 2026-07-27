@@ -20,7 +20,7 @@ Vega 是一个基于 pi agent core 的轻量 coding agent，目标是少往返�
 
 ## 服务端配置同步
 
-`nova-server` 可按团队 token 前缀通过 v2 WebSocket 定向下发 Vega 配置。客户端收到后只保存在运行内存，并按“服务端配置为基线、本地 `~/.nova/alkaid/config.jsonc` 递归覆盖”的规则合并；不会把服务端配置或合并结果写回磁盘。服务端配置变化会清空并重新探测 Vega 模型列表，当前正在执行的轮次不被打断，后续 bridge 使用新配置。
+`nova-server` 可按团队 token 前缀通过 v2 SSE 定向下发 Vega 配置。客户端收到后只保存在运行内存，并按“服务端配置为基线、本地 `~/.nova/alkaid/config.jsonc` 递归覆盖”的规则合并；不会把服务端配置或合并结果写回磁盘。服务端配置变化会清空并重新探测 Vega 模型列表，当前正在执行的轮次不被打断，后续 bridge 使用新配置。
 
 服务端配置中的密钥建议继续写成 `{env:NAME}`；对应环境变量必须注入客户端 Nova 进程，服务端不会代替客户端保存运行凭据。
 

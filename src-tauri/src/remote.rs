@@ -1,42 +1,33 @@
 //! server 侧远程会话客户端。
 //!
-//! 通过独立的 `/v2/remote/ws` 长连接同步状态与接收命令；连上后先推一次快照。
+//! 通过普通 HTTP `/v2/remote/sync` 上行；空闲命令复用 `/v2/events` 主 SSE，
+//! 忙时按需开启 `/v2/remote/events` 辅助 SSE。上下行并行，长连接不阻塞状态上传。
 //! 网页端刚打开（bootstrap state）时服务端会 refreshRequested，唤醒桌面补发。
 //! 每个运行会话独立维护基线：首包快照，中间与收尾只发变化条目（约 400ms 一拍）。
 //! 服务端会回传当前查看会话的轻量校验点；发现缺包或修订错位时只补对应会话。
 //! 打开历史会话走一次性 kind=threads 轻量包（不重传 models/projects）；仅首连预热最新会话。
-//! 工具条目只同步展示摘要，大帧使用 gzip WebSocket 二进制消息。
+//! 工具条目只同步展示摘要，大 HTTP 请求使用 gzip；大 SSE 事件使用逐事件 gzip+base64。
 
+use crate::http_stream::{decode_sse_json, SseDecoder, SSE_IDLE_TIMEOUT_SECS};
 use crate::relay::{gzip_json, resolve_relay_server};
 use crate::threads::{AgentKind, Item, PromptImage, Thread};
 use crate::{delete_thread, is_running, AppState, SCRATCH_MARK};
 use base64::Engine;
-use flate2::read::GzDecoder;
-use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{sleep, timeout};
 
 const ACTIVE_INTERVAL: Duration = Duration::from_millis(400);
+const IDLE_CONFIG_INTERVAL: Duration = Duration::from_secs(5);
 const COMMAND_WATCH_DURATION: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
-const REMOTE_WS_COMPRESS_AT: usize = 1024;
-const REMOTE_WS_MAX_PAYLOAD: u64 = 32 << 20;
-const REMOTE_WS_PING_INTERVAL: Duration = Duration::from_secs(15);
-const REMOTE_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const REMOTE_HTTP_COMPRESS_AT: usize = 1024;
 const REMOTE_SCRATCH_PATH: &str = "__nova_scratch__";
-static NEXT_REMOTE_REQUEST_ID: AtomicI64 = AtomicI64::new(1);
 /// 首次连接只预热最新会话；其余历史按点击请求，兼顾首屏速度与流量。
 const PREFETCH_RECENT: usize = 1;
 const REMOTE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
@@ -164,6 +155,7 @@ struct CommandResult {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Clone)]
 struct ServerResponse {
     #[serde(default, deserialize_with = "deserialize_null_default")]
     commands: Vec<RemoteCommand>,
@@ -179,27 +171,42 @@ struct ServerResponse {
     thread_checkpoints: HashMap<String, ThreadCheckpoint>,
 }
 
-struct RemoteWsRequest {
-    body: Value,
-    reply: oneshot::Sender<Result<ServerResponse, String>>,
-}
-
 #[derive(Clone)]
 struct RemoteTransport {
-    requests: mpsc::UnboundedSender<RemoteWsRequest>,
+    cfg: RemoteConfig,
+    http: reqwest::Client,
+    incoming_tx: mpsc::UnboundedSender<Result<ServerResponse, String>>,
     incoming: Arc<Mutex<mpsc::UnboundedReceiver<Result<ServerResponse, String>>>>,
 }
 
 impl RemoteTransport {
     async fn sync(&self, body: Value) -> Result<ServerResponse, String> {
-        let (tx, rx) = oneshot::channel();
-        self.requests
-            .send(RemoteWsRequest { body, reply: tx })
-            .map_err(|_| "远控 WebSocket 已关闭".to_string())?;
-        timeout(REQUEST_TIMEOUT, rx)
-            .await
-            .map_err(|_| "等待远控 WebSocket 响应超时".to_string())?
-            .map_err(|_| "远控 WebSocket 已断开".to_string())?
+        let raw = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+        let mut request = self
+            .http
+            .post(remote_sync_url(&self.cfg.server)?)
+            .header("Authorization", format!("Bearer {}", self.cfg.token))
+            .header(
+                "X-Relay-Name-Encoded",
+                crate::relay::urlencode(&self.cfg.name),
+            )
+            .header("X-Relay-Device", &self.cfg.device_id)
+            .header("Content-Type", "application/json")
+            .timeout(REQUEST_TIMEOUT);
+        request = if raw.len() >= REMOTE_HTTP_COMPRESS_AT {
+            request
+                .header("Content-Encoding", "gzip")
+                .body(gzip_json(&body)?)
+        } else {
+            request.body(raw)
+        };
+        let response = request.send().await.map_err(|e| e.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("远控同步返回 HTTP {status}"));
+        }
+        let value: Value = response.json().await.map_err(|e| e.to_string())?;
+        parse_remote_response(value)
     }
 
     async fn pull(&self) -> Result<ServerResponse, String> {
@@ -208,197 +215,165 @@ impl RemoteTransport {
             .await
             .recv()
             .await
-            .unwrap_or_else(|| Err("远控 WebSocket 已关闭".into()))
+            .unwrap_or_else(|| Err("远控事件通道已关闭".into()))
+    }
+
+    fn start_aux_sse(&self) -> tauri::async_runtime::JoinHandle<()> {
+        tauri::async_runtime::spawn(remote_sse_loop(
+            self.cfg.clone(),
+            self.http.clone(),
+            self.incoming_tx.clone(),
+        ))
     }
 }
 
-fn start_transport(cfg: RemoteConfig) -> (RemoteTransport, tauri::async_runtime::JoinHandle<()>) {
-    let (request_tx, request_rx) = mpsc::unbounded_channel();
-    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-    let transport = RemoteTransport {
-        requests: request_tx,
-        incoming: Arc::new(Mutex::new(incoming_rx)),
-    };
-    let task = tauri::async_runtime::spawn(remote_socket_loop(cfg, request_rx, incoming_tx));
-    (transport, task)
+/// 主 `/v2/events` SSE 的远控分流订阅者。空闲时只保留主 SSE；忙时 remote.rs
+/// 再按需开启辅助 SSE，避免长期占用第二条长连接。
+static MAIN_SSE_SUBSCRIBERS: OnceLock<
+    StdMutex<Vec<mpsc::UnboundedSender<Result<ServerResponse, String>>>>,
+> = OnceLock::new();
+
+pub(crate) fn publish_main_sse(value: Value) {
+    let response = parse_remote_response(value);
+    let subscribers = MAIN_SSE_SUBSCRIBERS.get_or_init(|| StdMutex::new(Vec::new()));
+    subscribers
+        .lock()
+        .unwrap()
+        .retain(|subscriber| subscriber.send(response.clone()).is_ok());
 }
 
-async fn remote_socket_loop(
+fn start_transport(cfg: RemoteConfig) -> RemoteTransport {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .tcp_keepalive(Duration::from_secs(20));
+    if !cfg.proxy.trim().is_empty() {
+        if let Ok(proxy) = reqwest::Proxy::all(cfg.proxy.trim()) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    let http = builder.build().unwrap_or_default();
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+    MAIN_SSE_SUBSCRIBERS
+        .get_or_init(|| StdMutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(incoming_tx.clone());
+    RemoteTransport {
+        cfg,
+        http,
+        incoming_tx,
+        incoming: Arc::new(Mutex::new(incoming_rx)),
+    }
+}
+
+async fn remote_sse_loop(
     cfg: RemoteConfig,
-    mut requests: mpsc::UnboundedReceiver<RemoteWsRequest>,
+    http: reqwest::Client,
     incoming: mpsc::UnboundedSender<Result<ServerResponse, String>>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        let result = remote_socket_once(&cfg, &mut requests, &incoming, &mut backoff).await;
-        if requests.is_closed() {
+        let result = remote_sse_once(&cfg, &http, &incoming, &mut backoff).await;
+        if incoming.is_closed() {
             return;
         }
-        let error = result
-            .err()
-            .unwrap_or_else(|| "远控 WebSocket 已断开".into());
+        let error = result.err().unwrap_or_else(|| "远控 SSE 已断开".into());
         let _ = incoming.send(Err(error));
-        sleep(backoff).await;
+        let jitter = Duration::from_millis((crate::threads::now_ms() % 500) as u64);
+        sleep(backoff + jitter).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
-async fn remote_socket_once(
+async fn remote_sse_once(
     cfg: &RemoteConfig,
-    requests: &mut mpsc::UnboundedReceiver<RemoteWsRequest>,
+    http: &reqwest::Client,
     incoming: &mpsc::UnboundedSender<Result<ServerResponse, String>>,
     backoff: &mut Duration,
 ) -> Result<(), String> {
-    let url = remote_websocket_url(&cfg.server)?;
-    let mut request = url.into_client_request().map_err(|e| e.to_string())?;
-    let headers = request.headers_mut();
-    headers.insert(
-        "Authorization",
-        HeaderValue::from_str(&format!("Bearer {}", cfg.token)).map_err(|e| e.to_string())?,
-    );
-    headers.insert(
-        "X-Relay-Name-Encoded",
-        HeaderValue::from_str(&crate::relay::urlencode(&cfg.name)).map_err(|e| e.to_string())?,
-    );
-    headers.insert(
-        "X-Relay-Device",
-        HeaderValue::from_str(&cfg.device_id).map_err(|e| e.to_string())?,
-    );
-    headers.insert(
-        "Sec-WebSocket-Protocol",
-        HeaderValue::from_static("nova.remote.v2"),
-    );
-    let (socket, _) = timeout(Duration::from_secs(20), connect_async(request))
+    let request = http
+        .get(remote_events_url(&cfg.server)?)
+        .header("Authorization", format!("Bearer {}", cfg.token))
+        .header("X-Relay-Name-Encoded", crate::relay::urlencode(&cfg.name))
+        .header("X-Relay-Device", &cfg.device_id)
+        .header("Accept", "text/event-stream")
+        .header("Accept-Encoding", "identity")
+        .header("X-Nova-SSE-Lane", "auxiliary")
+        .header("X-Nova-SSE-Encoding", "gzip-base64")
+        .header("Cache-Control", "no-cache");
+    let mut response = timeout(Duration::from_secs(20), request.send())
         .await
-        .map_err(|_| "建立远控 WebSocket 超时（20s）".to_string())?
+        .map_err(|_| "建立远控 SSE 超时（20s）".to_string())?
         .map_err(|e| e.to_string())?;
-    // 一旦握手成功，上一轮网络故障积累的退避立即失效。否则无头客户端
-    // 恢复后再次短暂断线，仍可能沿用 30 秒退避，表现为远控长时间离线。
+    if !response.status().is_success() {
+        return Err(format!("远控 SSE 返回 HTTP {}", response.status()));
+    }
+    // 握手成功即重置历史退避；后续短断线可在约 1 秒内自愈。
     *backoff = Duration::from_secs(1);
-    let (mut writer, mut reader) = socket.split();
-    let mut pending: Option<(i64, oneshot::Sender<Result<ServerResponse, String>>)> = None;
-    let mut last_received = Instant::now();
-    let mut ping = interval(REMOTE_WS_PING_INTERVAL);
-    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // interval 的首个 tick 会立即触发；先消费掉，避免握手完成后立刻发送无意义 ping。
-    ping.tick().await;
-
+    let mut decoder = SseDecoder::new();
     loop {
-        tokio::select! {
-            request = requests.recv(), if pending.is_none() => {
-                let Some(request) = request else { return Ok(()); };
-                // requestId 不能在 WebSocket 重连后从 1 重新开始。服务端可能在新连接上
-                // 补发旧连接排队的 device 帧；若 id 碰撞，会把推送误认成当前 sync 响应，
-                // 随后真正的响应又进入 pull 队列，造成修订倒退和历史快照错配。
-                let request_id = next_remote_request_id();
-                let frame = json!({ "op": "sync", "requestId": request_id, "body": request.body });
-                let message = encode_remote_frame(&frame)?;
-                if let Err(error) = writer.send(message).await {
-                    let _ = request.reply.send(Err(error.to_string()));
-                    return Err(error.to_string());
-                }
-                pending = Some((request_id, request.reply));
-            }
-            _ = ping.tick() => {
-                if last_received.elapsed() >= REMOTE_WS_IDLE_TIMEOUT {
-                    return Err("远控 WebSocket 接收空闲超时（45s 无心跳/数据）".into());
-                }
-                writer
-                    .send(Message::Ping(Vec::new().into()))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            message = reader.next() => {
-                let message = match message {
-                    Some(Ok(message)) => message,
-                    Some(Err(error)) => return Err(error.to_string()),
-                    None => return Ok(()),
-                };
-                // 任意合法 WebSocket 帧都证明连接仍活跃；Pong 会在这里刷新看门狗。
-                last_received = Instant::now();
-                let text = match message {
-                    Message::Text(text) => text.to_string(),
-                    Message::Binary(bytes) => decode_remote_binary(bytes.as_ref())?,
-                    Message::Ping(payload) => {
-                        writer.send(Message::Pong(payload)).await.map_err(|e| e.to_string())?;
-                        continue;
+        let chunk =
+            match timeout(Duration::from_secs(SSE_IDLE_TIMEOUT_SECS), response.chunk()).await {
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => {
+                    for event in decoder.finish()? {
+                        let value = decode_sse_json(&event)?;
+                        let _ = incoming.send(parse_remote_response(value));
                     }
-                    Message::Pong(_) => continue,
-                    Message::Close(_) => return Ok(()),
-                    _ => continue,
-                };
-                let frame: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-                if frame["op"] == "error" {
-                    let error = frame["error"].as_str().unwrap_or("远控 WebSocket 协议错误").to_string();
-                    if let Some((_, reply)) = pending.take() {
-                        let _ = reply.send(Err(error));
-                    }
-                    continue;
+                    return Ok(());
                 }
-                if frame["op"] != "device" {
-                    continue;
+                Ok(Err(error)) => return Err(error.to_string()),
+                Err(_) => {
+                    return Err(format!(
+                        "远控 SSE 接收空闲超时（{}s 无心跳/数据）",
+                        SSE_IDLE_TIMEOUT_SECS
+                    ))
                 }
-                let response: ServerResponse = serde_json::from_value(frame["response"].clone())
-                    .map_err(|e| e.to_string())?;
-                let id = frame["requestId"].as_i64().unwrap_or(0);
-                if pending.as_ref().is_some_and(|(pending_id, _)| *pending_id == id) {
-                    if let Some((_, reply)) = pending.take() {
-                        let _ = reply.send(Ok(response));
-                    }
-                } else {
-                    let _ = incoming.send(Ok(response));
-                }
-            }
+            };
+        for event in decoder.push(&chunk)? {
+            let value = decode_sse_json(&event)?;
+            let _ = incoming.send(parse_remote_response(value));
         }
     }
 }
 
-fn next_remote_request_id() -> i64 {
-    NEXT_REMOTE_REQUEST_ID
-        .fetch_add(1, Ordering::Relaxed)
-        .max(1)
-}
-
-fn encode_remote_frame(frame: &Value) -> Result<Message, String> {
-    let text = serde_json::to_string(frame).map_err(|e| e.to_string())?;
-    if text.len() < REMOTE_WS_COMPRESS_AT {
-        return Ok(Message::Text(text.into()));
+fn parse_remote_response(value: Value) -> Result<ServerResponse, String> {
+    if value.get("op").and_then(Value::as_str) == Some("error") {
+        return Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("远控 HTTP/SSE 协议错误")
+            .to_string());
     }
-    Ok(Message::Binary(gzip_json(frame)?.into()))
-}
-
-fn decode_remote_binary(payload: &[u8]) -> Result<String, String> {
-    if payload.len() < 2 || payload[0] != 0x1f || payload[1] != 0x8b {
-        if payload.len() as u64 > REMOTE_WS_MAX_PAYLOAD {
-            return Err("远控 WebSocket 载荷过大".into());
-        }
-        return String::from_utf8(payload.to_vec()).map_err(|e| e.to_string());
-    }
-    let decoder = GzDecoder::new(payload);
-    let mut text = String::new();
-    decoder
-        .take(REMOTE_WS_MAX_PAYLOAD + 1)
-        .read_to_string(&mut text)
-        .map_err(|e| e.to_string())?;
-    if text.len() as u64 > REMOTE_WS_MAX_PAYLOAD {
-        return Err("远控 WebSocket 解压后载荷过大".into());
-    }
-    Ok(text)
-}
-
-fn remote_websocket_url(server: &str) -> Result<String, String> {
-    let base = if let Some(rest) = server.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = server.strip_prefix("http://") {
-        format!("ws://{rest}")
+    let payload = if matches!(
+        value.get("op").and_then(Value::as_str),
+        Some("device" | "remote.device")
+    ) || value.get("response").is_some()
+    {
+        value.get("response").cloned().unwrap_or(Value::Null)
     } else {
-        return Err("中转站地址必须以 http:// 或 https:// 开头".into());
+        value
     };
-    Ok(format!("{}/v2/remote/ws", base.trim_end_matches('/')))
+    serde_json::from_value(payload).map_err(|e| e.to_string())
+}
+
+fn remote_sync_url(server: &str) -> Result<String, String> {
+    remote_http_url(server, "/v2/remote/sync")
+}
+
+fn remote_events_url(server: &str) -> Result<String, String> {
+    remote_http_url(server, "/v2/remote/events")
+}
+
+fn remote_http_url(server: &str, path: &str) -> Result<String, String> {
+    if !server.starts_with("http://") && !server.starts_with("https://") {
+        return Err("中转站地址必须以 http:// 或 https:// 开头".into());
+    }
+    Ok(format!("{}{path}", server.trim_end_matches('/')))
 }
 
 /// 兼容旧服务端把空集合编码成 `null`。协议升级期间不能因为一个空字段让整条
-/// 长轮询响应解析失败，否则历史会话的按需同步请求永远到不了客户端。
+/// HTTP/SSE 响应解析失败，否则历史会话的按需同步请求永远到不了客户端。
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -416,7 +391,7 @@ pub fn start(app: AppHandle) {
 async fn run(app: AppHandle) {
     let mut last_cfg: Option<RemoteConfig> = None;
     let mut transport: Option<RemoteTransport> = None;
-    let mut transport_task: Option<tauri::async_runtime::JoinHandle<()>> = None;
+    let mut aux_sse_task: Option<tauri::async_runtime::JoinHandle<()>> = None;
     let (pull_tx, mut pull_rx) = mpsc::unbounded_channel();
     let mut pull_task: Option<tauri::async_runtime::JoinHandle<()>> = None;
     let mut pull_generation = 0u64;
@@ -442,7 +417,7 @@ async fn run(app: AppHandle) {
             if let Some(task) = pull_task.take() {
                 task.abort();
             }
-            if let Some(task) = transport_task.take() {
+            if let Some(task) = aux_sse_task.take() {
                 task.abort();
             }
             transport = None;
@@ -465,18 +440,16 @@ async fn run(app: AppHandle) {
             if let Some(task) = pull_task.take() {
                 task.abort();
             }
-            if let Some(task) = transport_task.take() {
+            if let Some(task) = aux_sse_task.take() {
                 task.abort();
             }
             pull_generation = pull_generation.wrapping_add(1);
-            let (next_transport, next_task) = start_transport(cfg.clone());
-            transport = Some(next_transport);
-            transport_task = Some(next_task);
+            transport = Some(start_transport(cfg.clone()));
             last_cfg = Some(cfg.clone());
             requested.clear();
             revision = 0;
             previous.clear();
-            // 连上中转站后立刻推一次快照，避免空闲长轮询时网页端打开仍是空列表。
+            // 连上中转站后立刻推一次快照，避免网页端打开时仍是空列表。
             force_full = true;
             ack_id = 0;
             processed_id = 0;
@@ -545,6 +518,19 @@ async fn run(app: AppHandle) {
             .map(|(id, thread)| (id.clone(), thread_running(&app, thread)))
             .collect();
         let any_running = running_now.values().any(|running| *running);
+        let need_aux_sse = any_running || !command_watch.is_empty();
+        if need_aux_sse && aux_sse_task.is_none() {
+            aux_sse_task = Some(
+                transport
+                    .as_ref()
+                    .expect("remote transport")
+                    .start_aux_sse(),
+            );
+        } else if !need_aux_sse {
+            if let Some(task) = aux_sse_task.take() {
+                task.abort();
+            }
+        }
         let metas = thread_metas(&app);
         let next_catalog_signature = catalog_signature_for(&metas);
         let catalog_changed = next_catalog_signature != catalog_signature;
@@ -579,7 +565,7 @@ async fn run(app: AppHandle) {
 
         if !want_upload {
             if any_running || !command_watch.is_empty() {
-                // 内容同步继续按活动间隔检查；服务端命令由独立长轮询并发领取，
+                // 内容同步继续按活动间隔检查；服务端命令由独立 SSE 并发领取，
                 // 不会再被一个长任务或无可见输出的工具调用挡住。
                 sleep(ACTIVE_INTERVAL).await;
                 continue;
@@ -607,9 +593,9 @@ async fn run(app: AppHandle) {
                         }
                     }
                 }
-                // 管理指令可能在独立进程里改掉 Relay 地址/Token。定期回到循环顶部
-                // 重读 live settings，并在配置变化时主动 abort 旧长轮询。
-                _ = sleep(Duration::from_millis(250)) => {}
+                // 管理指令可能在独立进程里改掉 Relay 地址/Token。低频回到循环顶部
+                // 重读 live settings，并在配置变化时主动 abort 旧 SSE。
+                _ = sleep(IDLE_CONFIG_INTERVAL) => {}
             }
             continue;
         }
@@ -1402,13 +1388,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_request_ids_do_not_reset_between_connections() {
-        let first = next_remote_request_id();
-        let second = next_remote_request_id();
-        assert!(second > first);
-    }
-
-    #[test]
     fn running_delta_keeps_sort_timestamp_stable_until_completion() {
         let mut previous = Thread::new("C:/work".into(), AgentKind::Codex, None, None, None, false);
         previous.updated_at = 10;
@@ -1420,31 +1399,31 @@ mod tests {
     }
 
     #[test]
-    fn remote_websocket_url_uses_dedicated_endpoint() {
+    fn remote_http_urls_use_dedicated_endpoints() {
         assert_eq!(
-            remote_websocket_url("https://relay.example/base/").unwrap(),
-            "wss://relay.example/base/v2/remote/ws"
+            remote_sync_url("https://relay.example/base/").unwrap(),
+            "https://relay.example/base/v2/remote/sync"
         );
         assert_eq!(
-            remote_websocket_url("http://127.0.0.1:8320").unwrap(),
-            "ws://127.0.0.1:8320/v2/remote/ws"
+            remote_events_url("http://127.0.0.1:8320").unwrap(),
+            "http://127.0.0.1:8320/v2/remote/events"
         );
     }
 
     #[test]
-    fn remote_websocket_frames_compress_only_large_payloads() {
-        let small = json!({"op": "sync"});
-        assert!(matches!(
-            encode_remote_frame(&small).unwrap(),
-            Message::Text(_)
-        ));
-
-        let large = json!({"text": "x".repeat(REMOTE_WS_COMPRESS_AT * 2)});
-        let Message::Binary(payload) = encode_remote_frame(&large).unwrap() else {
-            panic!("大远控帧应使用 gzip 二进制消息");
-        };
-        let decoded = decode_remote_binary(payload.as_ref()).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&decoded).unwrap(), large);
+    fn remote_response_accepts_http_and_sse_envelopes() {
+        let raw = json!({"revision": 2, "commands": []});
+        assert_eq!(parse_remote_response(raw).unwrap().revision, 2);
+        let wrapped = json!({
+            "op": "device",
+            "response": {"revision": 3, "commands": []}
+        });
+        assert_eq!(parse_remote_response(wrapped).unwrap().revision, 3);
+        let main_sse = json!({
+            "op": "remote.device",
+            "response": {"revision": 4, "commands": []}
+        });
+        assert_eq!(parse_remote_response(main_sse).unwrap().revision, 4);
     }
 
     #[test]

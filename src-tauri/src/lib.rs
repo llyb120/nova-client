@@ -8,6 +8,7 @@ mod codex_radar;
 mod credential_roaming;
 mod employees;
 mod gitwt;
+mod http_stream;
 mod marks;
 mod mind;
 mod model_cache;

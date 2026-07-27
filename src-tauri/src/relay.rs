@@ -1,6 +1,6 @@
 //! 团队分享 + 漫游模式的中转客户端。
 //!
-//! 连接关系：v2 WebSocket 单连接双向收发。
+//! 连接关系：v2 普通 HTTP 上行 + SSE 下行。
 //! 身份用永久 token 区分（设置里配置）。
 //!
 //! 三种能力：
@@ -10,20 +10,19 @@
 //!    guest 只接收展示。host 复用本地 acp/codex 管理器执行，所有产生的 update/turn/
 //!    permission 事件由 lib.rs 的事件监听转发回 guest。
 //!
-//! 断线重连：WebSocket 断开后指数退避重连；每条定向消息有服务端分配的 seq，重连时带
-//! since=<最后 seq> 补发漏掉的消息，保证不丢、不影响使用。
+//! 断线重连：SSE 断开后指数退避重连；每条定向消息有服务端分配的 seq，重连时带
+//! since=<最后 seq> 补发漏掉的消息，保证不丢、不影响使用。HTTP 上行使用 messageId 幂等重试。
 
 use crate::clues::{CaptureClueResult, ClueContextSnapshot, ClueNodeGroup, EV_CLUES};
 use crate::credential_roaming::CredentialBundle;
+use crate::http_stream::{decode_sse_json, SseDecoder, SSE_IDLE_TIMEOUT_SECS};
 use crate::settings::Settings;
 use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, Worktree};
 use crate::AppState;
 use base64::Engine;
-use flate2::read::{DeflateDecoder, GzDecoder};
+use flate2::read::DeflateDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use futures_util::stream::SplitSink;
-use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -34,18 +33,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::{sleep, timeout, Duration, Instant};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use x25519_dalek::StaticSecret;
 
 use crate::acp::{EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS, EV_TURN, EV_UPDATE};
-
-type RelayWsWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 pub const EV_RELAY_STATUS: &str = "relay:status";
 pub const EV_RELAY_PEERS: &str = "relay:peers";
@@ -389,15 +381,13 @@ pub struct RelayManager {
     http: reqwest::Client,
     device_id: String,
     connected: AtomicBool,
-    /// v2 WebSocket 是否已经就绪。
+    /// v2 SSE 下行是否已经就绪。
     protocol_v2: AtomicBool,
     /// 本次客户端进程的协议纪元，配合 messageId 识别重试和进程重启。
     epoch: String,
     /// 最近一次 v2 服务端纪元；服务端重启后游标自动归零重放。
     server_epoch: StdMutex<String>,
-    /// v2 WebSocket 写半边；读循环独立运行并完成 ACK waiter。
-    ws_writer: tokio::sync::Mutex<Option<RelayWsWriter>>,
-    pending_ws_acks: StdMutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
+    /// SSE 恢复通知；HTTP 上行在下行重新注册在线状态后继续发送。
     v2_ready: Notify,
     last_seq: AtomicI64,
     last_persist: StdMutex<Instant>,
@@ -428,7 +418,7 @@ pub struct RelayManager {
     quota_lease_flights: StdMutex<HashMap<QuotaLeaseKey, Vec<QuotaLeaseWaiter>>>,
     /// 高级分享：本机处理线程 id -> 处理完成后要分享给谁
     advanced: StdMutex<HashMap<String, String>>,
-    /// guest 侧落盘节流：流式期间不要每条增量都写整个 store（会拖慢 WebSocket 消费）
+    /// guest 侧落盘节流：流式期间不要每条增量都写整个 store（会拖慢 SSE 消费）
     last_store_save: StdMutex<Instant>,
     /// guest 侧每个漫游会话最近一次收到 host 事件的时间，看门狗据此判断是否卡住
     guest_activity: StdMutex<HashMap<String, Instant>>,
@@ -451,7 +441,7 @@ impl RelayManager {
         let device_id = read_or_create_device_id(&config_dir);
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
-            // HTTP 客户端用于 v2 REST 辅助接口；长连接存活由 WebSocket Ping/Pong 检测。
+            // SSE 与普通 HTTP 共用连接池；SSE 由应用层 heartbeat/空闲超时检测存活。
             .tcp_keepalive(Duration::from_secs(20))
             .build()
             .unwrap_or_default();
@@ -465,8 +455,6 @@ impl RelayManager {
             protocol_v2: AtomicBool::new(false),
             epoch: uuid::Uuid::new_v4().to_string(),
             server_epoch: StdMutex::new(server_epoch),
-            ws_writer: tokio::sync::Mutex::new(None),
-            pending_ws_acks: StdMutex::new(HashMap::new()),
             v2_ready: Notify::new(),
             last_seq: AtomicI64::new(last_seq),
             last_persist: StdMutex::new(Instant::now()),
@@ -713,99 +701,88 @@ impl RelayManager {
         }
     }
 
-    async fn clear_v2(&self, reason: &str) {
+    fn clear_v2(&self) {
         self.protocol_v2.store(false, Ordering::SeqCst);
-        self.ws_writer.lock().await.take();
-        let pending: Vec<oneshot::Sender<Result<Value, String>>> = self
-            .pending_ws_acks
-            .lock()
-            .unwrap()
-            .drain()
-            .map(|(_, tx)| tx)
-            .collect();
-        for tx in pending {
-            let _ = tx.send(Err(reason.to_string()));
-        }
     }
 
     async fn connect_once(&self, server: &str, token: &str, name: &str) -> Result<(), String> {
-        self.clear_v2("v2 连接正在重建").await;
+        self.clear_v2();
         let since = self.last_seq.load(Ordering::SeqCst);
         let previous_epoch = self.server_epoch.lock().unwrap().clone();
-        let url = websocket_url(server, since, &previous_epoch)?;
-        let mut request = url.into_client_request().map_err(|e| e.to_string())?;
-        let headers = request.headers_mut();
-        headers.insert(
-            "Authorization",
-            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| e.to_string())?,
-        );
-        headers.insert(
-            "X-Relay-Name-Encoded",
-            HeaderValue::from_str(&urlencode(name)).map_err(|e| e.to_string())?,
-        );
-        headers.insert(
-            "X-Relay-Groups-Encoded",
-            HeaderValue::from_str(&urlencode(&self.groups_csv())).map_err(|e| e.to_string())?,
-        );
-        headers.insert(
-            "X-Relay-Device",
-            HeaderValue::from_str(&self.device_id).map_err(|e| e.to_string())?,
-        );
-        headers.insert(
-            "Sec-WebSocket-Protocol",
-            HeaderValue::from_static("nova.v2"),
-        );
-
-        let (socket, _) = timeout(Duration::from_secs(20), connect_async(request))
+        let url = sse_url(server, since, &previous_epoch)?;
+        let request = self
+            .http
+            .get(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Relay-Name-Encoded", urlencode(name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
+            .header("X-Relay-Device", &self.device_id)
+            .header("Accept", "text/event-stream")
+            .header("Accept-Encoding", "identity")
+            .header("X-Nova-SSE-Topics", "relay,remote")
+            // 大事件逐条 gzip+base64，避免整条 SSE gzip 被反向代理缓冲。
+            .header("X-Nova-SSE-Encoding", "gzip-base64")
+            .header("Cache-Control", "no-cache");
+        let mut response = timeout(Duration::from_secs(20), request.send())
             .await
-            .map_err(|_| "建立 v2 WebSocket 超时（20s）".to_string())?
+            .map_err(|_| "建立 v2 SSE 超时（20s）".to_string())?
             .map_err(|e| e.to_string())?;
-        let (writer, mut reader) = socket.split();
-        *self.ws_writer.lock().await = Some(writer);
+        if !response.status().is_success() {
+            return Err(format!("v2 SSE 返回 HTTP {}", response.status()));
+        }
+
         self.protocol_v2.store(true, Ordering::SeqCst);
         self.v2_ready.notify_waiters();
         self.set_connected(true);
-        self.log("[relay] 已通过 v2 WebSocket 连接中转站".into());
+        self.log("[relay] 已通过 v2 HTTP + SSE 连接中转站".into());
         self.publish_folders();
         self.rebuild_hosted();
         self.resync_guest_threads();
 
+        let mut decoder = SseDecoder::new();
         let result = loop {
-            let incoming = match timeout(Duration::from_secs(40), reader.next()).await {
-                Ok(Some(Ok(message))) => message,
-                Ok(Some(Err(error))) => break Err(error.to_string()),
-                Ok(None) => break Ok(()),
-                Err(_) => break Err("v2 接收空闲超时（40s 无心跳/数据）".into()),
+            let chunk =
+                match timeout(Duration::from_secs(SSE_IDLE_TIMEOUT_SECS), response.chunk()).await {
+                    Ok(Ok(Some(chunk))) => chunk,
+                    Ok(Ok(None)) => {
+                        break decoder
+                            .finish()
+                            .and_then(|events| self.consume_v2_sse_events(events));
+                    }
+                    Ok(Err(error)) => break Err(error.to_string()),
+                    Err(_) => {
+                        break Err(format!(
+                            "v2 SSE 接收空闲超时（{}s 无心跳/数据）",
+                            SSE_IDLE_TIMEOUT_SECS
+                        ))
+                    }
+                };
+            let events = match decoder.push(&chunk) {
+                Ok(events) => events,
+                Err(error) => break Err(error),
             };
-            match incoming {
-                Message::Text(text) => self.on_v2_frame(text.as_str()),
-                Message::Binary(bytes) => {
-                    if let Some(text) = decode_v2_binary(bytes.as_ref()) {
-                        self.on_v2_frame(&text);
-                    }
-                }
-                Message::Ping(payload) => {
-                    let mut guard = self.ws_writer.lock().await;
-                    let Some(writer) = guard.as_mut() else {
-                        break Err("v2 写通道已关闭".into());
-                    };
-                    if let Err(error) = writer.send(Message::Pong(payload)).await {
-                        break Err(error.to_string());
-                    }
-                }
-                Message::Pong(_) => {}
-                Message::Close(_) => break Ok(()),
-                _ => {}
+            if let Err(error) = self.consume_v2_sse_events(events) {
+                break Err(error);
             }
         };
-        self.clear_v2("v2 连接已断开").await;
+        self.clear_v2();
         result
     }
 
-    fn on_v2_frame(&self, text: &str) {
-        let Ok(frame) = serde_json::from_str::<Value>(text) else {
+    fn consume_v2_sse_events(&self, events: Vec<String>) -> Result<(), String> {
+        for event in events {
+            self.on_v2_frame(decode_sse_json(&event)?);
+        }
+        Ok(())
+    }
+
+    fn on_v2_frame(&self, frame: Value) {
+        // 主 SSE 同时承载低频远控命令。remote.rs 忙时会按需开启辅助 SSE；
+        // command id 与 revision 去重使主/辅切换窗口内的重复事件安全。
+        if matches!(frame["op"].as_str(), Some("device" | "remote.device")) {
+            crate::remote::publish_main_sse(frame);
             return;
-        };
+        }
         match frame["op"].as_str().unwrap_or_default() {
             "ready" => {
                 if let Some(last_seq) = frame["lastSeq"].as_i64() {
@@ -823,20 +800,6 @@ impl RelayManager {
                 }
             }
             "alkaid.config" => self.apply_alkaid_config(&frame["data"]),
-            "ack" => {
-                let Some(message_id) = frame["messageId"].as_str() else {
-                    return;
-                };
-                let waiter = self.pending_ws_acks.lock().unwrap().remove(message_id);
-                if let Some(waiter) = waiter {
-                    let result = if let Some(error) = frame["error"].as_str() {
-                        Err(error.to_string())
-                    } else {
-                        Ok(frame)
-                    };
-                    let _ = waiter.send(result);
-                }
-            }
             "event" => {
                 let Ok(mut env) = serde_json::from_value::<InEnvelope>(frame["event"].clone())
                 else {
@@ -875,6 +838,7 @@ impl RelayManager {
             }
             "clue.mentioned" => self.on_clue_mentioned(&env),
             "alkaid.config" => self.apply_alkaid_config(&env.data),
+            "remote.device" => crate::remote::publish_main_sse(env.data),
             "share" => self.on_share(&env),
             // guest -> host
             "roaming.create" => self.on_roaming_create(&env),
@@ -1023,11 +987,11 @@ impl RelayManager {
         }
         timeout(Duration::from_secs(30), notified)
             .await
-            .map_err(|_| "等待 v2 WebSocket 连接恢复超时".to_string())?;
+            .map_err(|_| "等待 v2 SSE 连接恢复超时".to_string())?;
         if self.protocol_v2.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err("v2 WebSocket 尚未连接".into())
+            Err("v2 SSE 尚未连接".into())
         }
     }
 
@@ -1049,8 +1013,8 @@ impl RelayManager {
         kind: &str,
         data: Value,
     ) -> Result<Value, String> {
+        let (server, token, name) = self.cfg().ok_or("未配置中转站 token")?;
         let thread_id = relay_thread_id(&data);
-        let (reply, wait) = oneshot::channel();
         let frame = json!({
             "version": 2,
             "op": "send",
@@ -1062,36 +1026,35 @@ impl RelayManager {
             "data": data,
         });
         let encoded = serde_json::to_vec(&frame).map_err(|e| e.to_string())?;
-        let outbound = if encoded.len() >= 1024 {
-            Message::Binary(gzip_json(&frame)?.into())
+        let mut request = self
+            .http
+            .post(format!("{server}/v2/send"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Relay-Name-Encoded", urlencode(&name))
+            .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
+            .header("X-Relay-Device", &self.device_id)
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(30));
+        request = if encoded.len() >= 1024 {
+            request
+                .header("Content-Encoding", "gzip")
+                .body(gzip_json(&frame)?)
         } else {
-            let text = String::from_utf8(encoded).map_err(|e| e.to_string())?;
-            Message::Text(text.into())
+            request.body(encoded)
         };
-        self.pending_ws_acks
-            .lock()
-            .unwrap()
-            .insert(message_id.to_string(), reply);
-        let send_result = {
-            let mut guard = self.ws_writer.lock().await;
-            let Some(writer) = guard.as_mut() else {
-                self.pending_ws_acks.lock().unwrap().remove(message_id);
-                return Err("v2 WebSocket 尚未连接".into());
-            };
-            writer.send(outbound).await
-        };
-        if let Err(error) = send_result {
-            self.pending_ws_acks.lock().unwrap().remove(message_id);
+        let response = request.send().await.map_err(|e| e.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("v2 send 返回 HTTP {status}"));
+        }
+        if status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(json!({ "op": "ack", "messageId": message_id }));
+        }
+        let ack: Value = response.json().await.map_err(|e| e.to_string())?;
+        if let Some(error) = ack.get("error").and_then(Value::as_str) {
             return Err(error.to_string());
         }
-        match timeout(Duration::from_secs(30), wait).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("v2 ACK 通道已关闭".into()),
-            Err(_) => {
-                self.pending_ws_acks.lock().unwrap().remove(message_id);
-                Err("等待 v2 ACK 超时".into())
-            }
-        }
+        Ok(ack)
     }
 
     // ---- 共享协作账本（跨机器去重/互斥/接力，仲裁在中转站）----
@@ -2643,7 +2606,7 @@ impl RelayManager {
     }
 
     /// host：收到分支请求，列出该目录所在仓库的本地分支 + 当前分支回给对端。
-    /// git 是同步阻塞命令，丢到独立线程执行，避免卡住 WebSocket 分发。
+    /// git 是同步阻塞命令，丢到独立线程执行，避免卡住 SSE 分发。
     fn on_roaming_branches_request(&self, env: &InEnvelope) {
         let to = env.from.clone();
         let folder = env.data["folder"].as_str().unwrap_or_default().to_string();
@@ -3872,7 +3835,7 @@ impl RelayManager {
         }
         self.touch_guest_activity(&thread_id);
         // 一次性应用整批；落盘做节流（流式期间每条增量都把整个 store 写盘会拖慢
-        // WebSocket 消费，导致中转缓冲溢出丢消息、卡 loading、思考残缺）。最终一致性由
+        // SSE 消费，导致中转缓冲溢出丢消息、卡 loading、思考残缺）。最终一致性由
         // 轮次结束快照 + 重连重同步兜底，所以这里漏存几条流式增量是安全的。
         {
             let state = self.app.state::<AppState>();
@@ -4187,22 +4150,6 @@ fn maybe_decompress(data: &mut Value) {
     }
 }
 
-fn decode_v2_binary(bytes: &[u8]) -> Option<String> {
-    const MAX_DECOMPRESSED: u64 = 32 * 1024 * 1024;
-    if bytes.starts_with(&[0x1f, 0x8b]) {
-        let decoder = GzDecoder::new(bytes);
-        let mut limited = decoder.take(MAX_DECOMPRESSED + 1);
-        let mut out = Vec::new();
-        limited.read_to_end(&mut out).ok()?;
-        if out.len() as u64 > MAX_DECOMPRESSED {
-            return None;
-        }
-        String::from_utf8(out).ok()
-    } else {
-        std::str::from_utf8(bytes).ok().map(str::to_string)
-    }
-}
-
 pub(crate) fn gzip_json(value: &Value) -> Result<Vec<u8>, String> {
     let raw = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
@@ -4427,17 +4374,13 @@ fn resolve_relay_asset_url(server: &str, url: Option<String>) -> Option<String> 
     Some(format!("{base}{path}"))
 }
 
-fn websocket_url(server: &str, since: i64, server_epoch: &str) -> Result<String, String> {
-    let base = if let Some(rest) = server.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = server.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
+fn sse_url(server: &str, since: i64, server_epoch: &str) -> Result<String, String> {
+    if !server.starts_with("http://") && !server.starts_with("https://") {
         return Err("中转站地址必须以 http:// 或 https:// 开头".into());
-    };
+    }
     Ok(format!(
-        "{}/v2/ws?since={since}&serverEpoch={}",
-        base.trim_end_matches('/'),
+        "{}/v2/events?since={since}&serverEpoch={}",
+        server.trim_end_matches('/'),
         urlencode(server_epoch),
     ))
 }
@@ -4504,27 +4447,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn v2_websocket_url_keeps_cursor_and_server_epoch() {
+    fn v2_sse_url_keeps_cursor_and_server_epoch() {
         assert_eq!(
-            websocket_url("https://relay.example/base", 42, "epoch/a").unwrap(),
-            "wss://relay.example/base/v2/ws?since=42&serverEpoch=epoch%2Fa"
+            sse_url("https://relay.example/base", 42, "epoch/a").unwrap(),
+            "https://relay.example/base/v2/events?since=42&serverEpoch=epoch%2Fa"
         );
         assert_eq!(
-            websocket_url("http://127.0.0.1:8320/", 0, "").unwrap(),
-            "ws://127.0.0.1:8320/v2/ws?since=0&serverEpoch="
+            sse_url("http://127.0.0.1:8320/", 0, "").unwrap(),
+            "http://127.0.0.1:8320/v2/events?since=0&serverEpoch="
         );
     }
 
     #[test]
-    fn v2_gzip_binary_round_trips_and_rejects_oversize() {
+    fn v2_http_gzip_round_trips() {
         let value = json!({ "text": "x".repeat(4096) });
         let compressed = gzip_json(&value).unwrap();
-        let decoded = decode_v2_binary(&compressed).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&decoded).unwrap(), value);
-
-        let huge = json!({ "text": "x".repeat(33 * 1024 * 1024) });
-        let compressed = gzip_json(&huge).unwrap();
-        assert!(decode_v2_binary(&compressed).is_none());
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&decoded).unwrap(), value);
     }
 
     #[test]
