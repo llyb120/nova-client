@@ -46,6 +46,8 @@ export function Composer() {
   const [queuedPrompts, setQueuedPrompts] = createSignal<QueuedPrompt[]>([]);
   const [dispatchingQueueIds, setDispatchingQueueIds] = createSignal<Set<string>>(new Set());
   const [failedQueueIds, setFailedQueueIds] = createSignal<Set<string>>(new Set());
+  /** 用户主动停止后挂起自动投递，队列保留供手动发送或撤回。 */
+  const [queueHeldThreadIds, setQueueHeldThreadIds] = createSignal<Set<string>>(new Set());
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
@@ -138,6 +140,24 @@ export function Composer() {
     document.addEventListener("pointerdown", closeEmployeeMenu);
     onCleanup(() => document.removeEventListener("pointerdown", closeEmployeeMenu));
   });
+  const holdPromptQueue = (threadId: string | null | undefined) => {
+    if (!threadId) return;
+    setQueueHeldThreadIds((ids) => {
+      if (ids.has(threadId)) return ids;
+      const next = new Set(ids);
+      next.add(threadId);
+      return next;
+    });
+  };
+  const releasePromptQueue = (threadId: string | null | undefined) => {
+    if (!threadId) return;
+    setQueueHeldThreadIds((ids) => {
+      if (!ids.has(threadId)) return ids;
+      const next = new Set(ids);
+      next.delete(threadId);
+      return next;
+    });
+  };
   const requestStop = () => {
     const thread = state.threads.find((item) => item.id === state.currentId);
     if (thread?.employeeId && !thread.mindThread) {
@@ -145,11 +165,13 @@ export function Composer() {
       setStopDialogOpen(true);
       return;
     }
+    holdPromptQueue(state.currentId);
     void cancelTurn();
   };
   const confirmEmployeeStop = () => {
     const reason = stopReason().trim();
     setStopDialogOpen(false);
+    holdPromptQueue(state.currentId);
     void cancelTurn(reason);
   };
   // 进行中 / 漫游会话不开放跨后端切换，退回当前后端单选；否则可在已启用后端间切换
@@ -297,6 +319,10 @@ export function Composer() {
     const currentId = state.currentId;
     return currentId ? queuedPrompts().filter((item) => item.threadId === currentId) : [];
   });
+  const currentQueueHeld = createMemo(() => {
+    const currentId = state.currentId;
+    return !!(currentId && queueHeldThreadIds().has(currentId));
+  });
 
   const rememberSentPrompt = (currentId: string, value: string, images: PromptImage[]) => {
     if (!value) return;
@@ -318,6 +344,8 @@ export function Composer() {
   const dispatchQueuedPrompt = async (item: QueuedPrompt, steerNow = false) => {
     if (dispatchingQueueIds().has(item.id)) return;
     if (steerNow && running() && !supportsSteer()) return;
+    // 用户主动发送或恢复队列后，允许后续条目在回合结束后继续自动投递。
+    releasePromptQueue(item.threadId);
     setFailedQueueIds((ids) => {
       const next = new Set(ids);
       next.delete(item.id);
@@ -344,12 +372,15 @@ export function Composer() {
     }
   };
 
-  // 当前任务正常或异常收尾后，按先进先出自动投递下一条；后续提示继续等待各自前一轮结束。
+  // 当前任务正常或异常收尾后，按先进先出自动投递下一条；用户主动停止后挂起，需手动发送或撤回。
   createEffect(() => {
     const first = currentQueuedPrompts()[0];
+    const currentId = state.currentId;
     if (
       !first ||
+      !currentId ||
       running() ||
+      queueHeldThreadIds().has(currentId) ||
       dispatchingQueueIds().has(first.id) ||
       failedQueueIds().has(first.id)
     ) return;
@@ -361,6 +392,7 @@ export function Composer() {
       const next = items.filter((queued) => queued.id !== item.id);
       const pending = next.some((queued) => queued.threadId === item.threadId);
       void api.setPromptQueuePending(item.threadId, pending);
+      if (!pending) releasePromptQueue(item.threadId);
       return next;
     });
     setFailedQueueIds((ids) => {
@@ -401,6 +433,7 @@ export function Composer() {
       void api.setPromptQueuePending(currentId, true);
       return;
     }
+    releasePromptQueue(currentId);
     const employeeId = isNewOrdinaryThread() ? selectedEmployee()?.id ?? null : null;
     void sendPrompt(value, images, employeeId);
   };
@@ -545,7 +578,7 @@ export function Composer() {
         <div class="prompt-queue" aria-label="待发送提示词">
           <div class="prompt-queue-head">
             <span>待发送</span>
-            <small>当前任务结束后自动发送</small>
+            <small>{currentQueueHeld() ? "已停止，可手动发送或撤回" : "当前任务结束后自动发送"}</small>
           </div>
           <For each={currentQueuedPrompts()}>
             {(item, index) => (
