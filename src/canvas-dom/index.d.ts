@@ -56,6 +56,7 @@ export class Node {
 export function h(tag: string, style?: CanvasStyle, textContent?: string, children?: Node[]): Node;
 export const LAYOUT_REV: number;
 export function measureText(text: string, fontSize?: number, fontFamily?: string, fontWeight?: string | number, fontStyle?: string): number;
+export function wrapText(text: string, maxWidth: number, fontSize?: number, fontFamily?: string, whiteSpace?: string, fontWeight?: string | number, fontStyle?: string): string[];
 export function parseMarkdown(markdown: string, baseStyle?: CanvasStyle): Node;
 
 export class CanvasDOM {
@@ -63,8 +64,9 @@ export class CanvasDOM {
   root: Node | null;
   width: number;
   height: number;
+  dpr: number;
   setRoot(node: Node): void;
-  resize(width?: number, height?: number): void;
+  resize(width?: number, height?: number, opts?: { deferPaint?: boolean }): boolean;
   requestRender(): void;
   invalidate(needsLayout?: boolean): void;
   on(type: string, callback: (node: Node) => void): void;

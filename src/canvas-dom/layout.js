@@ -87,7 +87,7 @@ function shiftLayoutTree(node, dx, dy) {
 }
 
 /** 布局算法版本：变更时强制已缓存的 _layoutStable 子树重新排版（避免 HMR/旧几何残留）。 */
-export const LAYOUT_REV = 5;
+export const LAYOUT_REV = 6;
 
 // Layout a node within a content box (x, y, width, height available).
 // Returns the node's outer height consumed (including margin).
@@ -630,11 +630,16 @@ function parseFlex(flex) {
 // Simple text wrapping via shared measureText cache (avoids repeated canvas measure).
 export function wrapText(text, maxW, fontSize, fontFamily, whiteSpace, fontWeight = 'normal', fontStyle = 'normal') {
   if (whiteSpace === 'nowrap') return [String(text)];
-  if (whiteSpace === 'pre') return String(text).split('\n');
   const fs = fontSize || 14;
   const ff = fontFamily || 'sans-serif';
   const fw = fontWeight || 'normal';
   const fst = fontStyle || 'normal';
+  // 末尾单独的空行（常见于 fence 收尾换行）会多占一整行行高，看起来像多余 padding-bottom。
+  const stripTrailingEmpty = (lines) => {
+    while (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+    return lines;
+  };
+  if (whiteSpace === 'pre') return stripTrailingEmpty(String(text).split('\n'));
   const lines = [];
   const preserveWhitespace = whiteSpace === 'pre-wrap';
   const paragraphs = String(text).split('\n');
@@ -671,5 +676,5 @@ export function wrapText(text, maxW, fontSize, fontFamily, whiteSpace, fontWeigh
     }
     lines.push(cur || '');
   }
-  return lines;
+  return stripTrailingEmpty(lines);
 }

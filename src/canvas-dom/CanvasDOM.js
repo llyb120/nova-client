@@ -8,7 +8,7 @@ import { hitTest, findScrollable, scrollBy } from './interaction.js';
 import { parseMarkdown } from './markdown.js';
 
 export { Node, h };
-export { measureText, LAYOUT_REV } from './layout.js';
+export { measureText, wrapText, LAYOUT_REV } from './layout.js';
 export { parseMarkdown };
 
 export class CanvasDOM {
@@ -40,6 +40,9 @@ export class CanvasDOM {
     this._paintScrollValid = false;
     this._blitCanvas = null;
     this._blitCtx = null;
+    // 尺寸变化时先离屏画完再写入可见 canvas，避免 width 赋值清空后露出空白帧。
+    this._pendingBw = 0;
+    this._pendingBh = 0;
 
     // interaction state
     this._hoverNode = null;
@@ -81,33 +84,57 @@ export class CanvasDOM {
     this._dirty = false;
   }
 
-  /** @returns {boolean} true if the backing-store size changed */
-  resize(w, h) {
+  /**
+   * @param {number} [w]
+   * @param {number} [h]
+   * @param {{ deferPaint?: boolean }} [opts] deferPaint：只更新逻辑尺寸，由随后的 setRoot/rebuild 一次绘制并提交缓冲。
+   * @returns {boolean} true if the backing-store size changed
+   */
+  resize(w, h, opts = {}) {
     const width = Math.max(1, w || this.canvas.clientWidth || this.canvas.width || 1);
     const height = Math.max(1, h || this.canvas.clientHeight || this.canvas.height || 1);
     const bw = Math.max(1, Math.round(width * this.dpr));
     const bh = Math.max(1, Math.round(height * this.dpr));
-    if (this.width === width && this.height === height && this.canvas.width === bw && this.canvas.height === bh) {
+    if (this.width === width && this.height === height
+        && this.canvas.width === bw && this.canvas.height === bh
+        && !this._pendingBw) {
       return false;
     }
     this.width = width;
     this.height = height;
-    // 赋值 canvas.width/height 会立刻清空位图；若等到下一帧 RAF 再画，合成器会闪一帧空白。
-    this.canvas.width = bw;
-    this.canvas.height = bh;
-    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    // 不在此处写入 canvas.width（会立刻清空可见位图）；先记下目标，离屏画完再 _commitBufferSize。
+    this._pendingBw = bw;
+    this._pendingBh = bh;
     this._needsLayout = true;
     this._hoverOnly = false;
     this._hoverDirtyNodes = null;
     this._fullPaint = true;
     this._paintScrollValid = false;
+    if (opts.deferPaint) {
+      this._dirty = true;
+      return true;
+    }
     if (this.root) {
       this._render();
       this._dirty = false;
     } else {
+      this._commitBufferSize();
       this._dirty = true;
     }
     return true;
+  }
+
+  /** 把挂起的缓冲尺寸提交到可见 canvas，并复位变换。 */
+  _commitBufferSize() {
+    const bw = this._pendingBw || this.canvas.width;
+    const bh = this._pendingBh || this.canvas.height;
+    this._pendingBw = 0;
+    this._pendingBh = 0;
+    if (this.canvas.width !== bw || this.canvas.height !== bh) {
+      this.canvas.width = bw;
+      this.canvas.height = bh;
+    }
+    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
   }
 
   /** @param {boolean} [needsLayout=true] hover/busy/caret 等仅重绘，不重排。 */
@@ -118,6 +145,18 @@ export class CanvasDOM {
     this._hoverOnly = false;
     this._hoverDirtyNodes = null;
     this.requestRender();
+  }
+
+  /**
+   * 滚动重绘：根节点走 blit/全量路径；嵌套 overflow（工具详情等）只脏矩形重绘该节点，
+   * 避免每次滚轮都 clear+整树 paint 造成卡顿。
+   */
+  _invalidateScroll(scroller) {
+    if (!scroller || scroller === this.root) {
+      this.invalidate(false);
+      return;
+    }
+    this._invalidateHover([scroller]);
   }
 
   /** 仅局部视觉变化：合并脏节点，尽量脏矩形重绘，避免整画布 clear+paint。 */
@@ -204,10 +243,13 @@ export class CanvasDOM {
           this._velocityX = 0;
           this._velocityY = 0;
         }
-        this._dirty = true;
-        this._fullPaint = true;
-        this._hoverOnly = false;
-        if (moved) this._emit('scroll', t);
+        if (moved) {
+          this._invalidateScroll(t);
+          this._emit('scroll', t);
+        } else {
+          this._velocityX = 0;
+          this._velocityY = 0;
+        }
       }
     }
     // typewriter streaming: reveal a few chars per frame
@@ -294,22 +336,54 @@ export class CanvasDOM {
       && dsx === 0 && dsy !== 0 && Math.abs(dsy) < this.height;
     const localOnly = !!(dirtyNodes && this._hoverOnly && !this._fullPaint);
 
+    let painted = false;
+    let holdScrollMirror = false;
+    let selectionPainted = false;
     if (canBlitScroll) {
-      this._blitRootScroll(dsy);
-      if (dirtyNodes) this._paintDirtyNodes(dirtyNodes);
+      painted = this._blitRootScroll(dsy);
+      if (painted) {
+        if (dirtyNodes) this._paintDirtyNodes(dirtyNodes);
+      } else {
+        // 亚像素：保留位图且不要退回全量重绘，等累计到整像素再 blit。
+        holdScrollMirror = true;
+      }
     } else if (localOnly) {
       this._paintDirtyNodes(dirtyNodes);
+      painted = true;
     } else {
-      this.ctx.clearRect(0, 0, this.width, this.height);
-      paint(this.ctx, this.root, 0, 0, this.width, this.height, this);
+      // 先画到离屏缓冲；有挂起尺寸时等画完再提交可见 canvas，避免清空后长 paint 闪白。
+      const blit = typeof document !== 'undefined' ? this._ensureBlitCanvas() : null;
+      if (blit) {
+        const dpr = this.dpr || 1;
+        blit.setTransform(dpr, 0, 0, dpr, 0, 0);
+        blit.clearRect(0, 0, this.width, this.height);
+        paint(blit, this.root, 0, 0, this.width, this.height, this);
+        if (this._selection) {
+          paintSelection(blit, this.root, this._selection);
+          selectionPainted = true;
+        }
+        this._commitBufferSize();
+        this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+        this.ctx.imageSmoothingEnabled = false;
+        this.ctx.drawImage(this._blitCanvas, 0, 0);
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        painted = true;
+      } else {
+        this._commitBufferSize();
+        this.ctx.clearRect(0, 0, this.width, this.height);
+        paint(this.ctx, this.root, 0, 0, this.width, this.height, this);
+        painted = true;
+      }
     }
     // selection overlay (drawn after text so highlight sits on top)
-    if (this._selection) {
+    if (this._selection && !selectionPainted) {
       paintSelection(this.ctx, this.root, this._selection);
     }
-    this._paintScrollX = sx;
-    this._paintScrollY = sy;
-    this._paintScrollValid = true;
+    if (!holdScrollMirror) {
+      this._paintScrollX = sx;
+      this._paintScrollY = sy;
+      this._paintScrollValid = true;
+    }
   }
 
   _paintDirtyNodes(nodes) {
@@ -333,11 +407,11 @@ export class CanvasDOM {
   }
 
   _ensureBlitCanvas() {
-    const bw = this.canvas.width;
-    const bh = this.canvas.height;
+    const bw = this._pendingBw || this.canvas.width;
+    const bh = this._pendingBh || this.canvas.height;
     if (!this._blitCanvas) {
       this._blitCanvas = document.createElement('canvas');
-      this._blitCtx = this._blitCanvas.getContext('2d');
+      this._blitCtx = this._blitCanvas.getContext('2d', { alpha: false });
     }
     if (this._blitCanvas.width !== bw || this._blitCanvas.height !== bh) {
       this._blitCanvas.width = bw;
@@ -357,18 +431,22 @@ export class CanvasDOM {
     const bw = this.canvas.width;
     const bh = this.canvas.height;
     const dpr = this.dpr || 1;
+    const pixelDsy = Math.round(dsy * dpr);
+    // 亚像素滚动本帧无可见位移：不推进 _paintScrollY，累计到整像素再 blit。
+    if (!pixelDsy) return false;
     // 经离屏缓冲拷贝，避免同源 canvas 重叠 drawImage 的未定义行为。
+    // 全幅 drawImage 会覆盖目标像素，无需先 clearRect（滚动热路径上省一次全屏清除）。
     blit.setTransform(1, 0, 0, 1, 0, 0);
-    blit.clearRect(0, 0, bw, bh);
+    blit.imageSmoothingEnabled = false;
     blit.drawImage(this.canvas, 0, 0);
     this.ctx.setTransform(1, 0, 0, 1, 0, 0);
-    this.ctx.clearRect(0, 0, bw, bh);
-    // scrollY 增大 → 内容上移
-    this.ctx.drawImage(this._blitCanvas, 0, Math.round(-dsy * dpr));
+    this.ctx.imageSmoothingEnabled = false;
+    // scrollY 增大 → 内容上移；露出的条带稍后按 CSS 像素重绘。
+    this.ctx.drawImage(this._blitCanvas, 0, -pixelDsy);
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const bandY = dsy > 0 ? this.height - dsy : 0;
-    const bandH = Math.abs(dsy);
+    const bandH = Math.abs(pixelDsy) / dpr;
+    const bandY = dsy > 0 ? this.height - bandH : 0;
     this.ctx.save();
     this.ctx.beginPath();
     this.ctx.rect(0, bandY, this.width, bandH);
@@ -478,7 +556,7 @@ export class CanvasDOM {
       this._lastDragY = y;
       this._lastDragX = x;
       this._lastDragTime = now;
-      this.invalidate(false);
+      this._invalidateScroll(this._scrollTarget);
       return;
     }
     const hit = this.root ? hitTest(this.root, x, y) : null;
@@ -632,7 +710,7 @@ export class CanvasDOM {
         this._velocityX = e.deltaX * 0.5;
         this._velocityY = e.deltaY * 0.5;
         this._emit('scroll', scroller);
-        this.invalidate(false);
+        this._invalidateScroll(scroller);
       }
     }
   };

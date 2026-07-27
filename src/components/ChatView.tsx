@@ -72,8 +72,9 @@ export function ChatView() {
   });
   const [activeTimeIndex, setActiveTimeIndex] = createSignal(-1);
   const latestTimeIndex = () => timeStops().at(-1)?.index ?? -1;
+  let timeCursorFrame = 0;
 
-  const syncTimeCursor = () => {
+  const syncTimeCursorNow = () => {
     const stops = timeStops();
     if (!transcriptRef || stops.length === 0) {
       setActiveTimeIndex(stops.length ? stops[0].index : -1);
@@ -88,14 +89,25 @@ export function ChatView() {
     setActiveTimeIndex(active);
   };
 
+  // 滚轮/惯性会连续触发 onScroll；合并到每帧一次，避免时光机状态拖慢外层滚动。
+  const syncTimeCursor = () => {
+    if (timeCursorFrame) return;
+    timeCursorFrame = requestAnimationFrame(() => {
+      timeCursorFrame = 0;
+      syncTimeCursorNow();
+    });
+  };
+
   const travelTo = (index: number) => {
     cancelBottomFollow();
     transcriptRef?.scrollToGroup(index);
-    syncTimeCursor();
+    if (timeCursorFrame) { cancelAnimationFrame(timeCursorFrame); timeCursorFrame = 0; }
+    syncTimeCursorNow();
   };
 
   const returnToNow = () => {
     enableBottomFollow();
+    if (timeCursorFrame) { cancelAnimationFrame(timeCursorFrame); timeCursorFrame = 0; }
     setActiveTimeIndex(latestTimeIndex());
   };
 
@@ -470,6 +482,7 @@ export function ChatView() {
   onCleanup(() => {
     previewRequest++;
     if (previewTimer) clearTimeout(previewTimer);
+    if (timeCursorFrame) cancelAnimationFrame(timeCursorFrame);
   });
   // 漫游 guest：召回会话——host 自动把完整快照 Flow 回来，收件箱里选项目接收
   const [recalling, setRecalling] = createSignal(false);

@@ -6,7 +6,7 @@ import { api } from "../ipc";
 import { editUserMessage, isExpanded, respondPermission, state, toggleExpanded } from "../store";
 import type { Item, PermissionRequest, ToolItem, UserItem } from "../types";
 import { displayToolTitle, stripAnsi } from "../utils";
-import { CanvasDOM, h, LAYOUT_REV, measureText, Node, parseMarkdown } from "../canvas-dom/CanvasDOM.js";
+import { CanvasDOM, h, LAYOUT_REV, Node, parseMarkdown, wrapText } from "../canvas-dom/CanvasDOM.js";
 import { relPath } from "./EditedFilesCard";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
@@ -55,6 +55,10 @@ type Palette = {
   mono: string;
   sans: string;
   columnWidth: number;
+  /** 正文/Markdown 栏宽；与下方输入框同宽。气泡仍用满 columnWidth 贴右。 */
+  proseWidth: number;
+  /** 正文相对内容列左缘的额外左移，使左右与 `.composer` 对齐。 */
+  proseOffset: number;
 };
 
 function palette(): Palette {
@@ -72,8 +76,27 @@ function palette(): Palette {
     green: value("--green", "#8ec489"), blue: value("--blue", "#7aa2f2"),
     scroll: value("--scroll", "#2e333d"),
     mono: value("--mono", "monospace"),
-    sans: value("--sans", "sans-serif"), columnWidth: 980,
+    sans: value("--sans", "sans-serif"), columnWidth: 980, proseWidth: 980, proseOffset: 0,
   };
+}
+
+/** 助手正文与下方 `.composer` 同宽同左右；时光机占宽时不能只在画布内居中 980。 */
+function measureProseColumn(
+  canvasEl: HTMLCanvasElement,
+  contentLeft: number,
+  contentWidth: number,
+): { width: number; offset: number } {
+  const composer = canvasEl.closest(".chat")?.querySelector(".chat-foot .composer") as HTMLElement | null;
+  if (composer) {
+    const canvasRect = canvasEl.getBoundingClientRect();
+    const box = composer.getBoundingClientRect();
+    const offset = Math.max(0, Math.round(box.left - canvasRect.left - contentLeft));
+    const width = Math.max(1, Math.min(contentWidth - offset, Math.round(box.width)));
+    return { width, offset };
+  }
+  const vw = typeof window !== "undefined" ? window.innerWidth : contentWidth;
+  const width = Math.min(980, Math.max(720, vw * 0.78), contentWidth);
+  return { width, offset: Math.max(0, Math.round((contentWidth - width) / 2)) };
 }
 
 // DOM div 的默认 width 是 auto；强塞 100% 会在存在左右 margin 时比 CSS 多占一截。
@@ -115,16 +138,19 @@ function restyleMarkdown(
     node.style.lineHeight = 1.7;
     node.style.margin = [16, 0, 8, 0];
   } else if (node.tag === "pre") {
-    next = { ...inherited, size: 12.5 };
+    // 与 DOM .markdown pre / tool-output 对齐：pre-wrap 保缩进与换行，1.55 行高避免
+    // 继承正文 1.7 时底部像多出一截 padding；外层 margin-bottom 10 才看得出来。
+    next = { ...inherited, size: 12.5, lineHeight: 1.55 };
     node.style.fontFamily = p.mono;
     node.style.fontSize = 12.5;
+    node.style.lineHeight = 1.55;
     node.style.background = p.panel;
     node.style.border = 1;
     node.style.borderColor = p.border;
     node.style.borderRadius = 10;
     node.style.padding = [12, 14];
     node.style.margin = [0, 0, 10, 0];
-    node.style.whiteSpace = "normal";
+    node.style.whiteSpace = "pre-wrap";
     node.style.color = p.text;
   } else if (node.tag === "code") {
     next = { ...inherited, size: 12.5 };
@@ -180,12 +206,15 @@ function markdown(
   const fontSize = opts.fontSize ?? 14;
   const lineHeight = opts.lineHeight ?? 1.7;
   const color = opts.color ?? p.text;
+  // 栏宽与下方输入框对齐（见 proseWidth / proseOffset），避免宽屏左贴齐、输入框居中错位。
   const node = parseMarkdown(text, {
-    width: "100%", color, fontFamily: p.sans, fontSize, lineHeight,
+    width: Math.min(p.proseWidth || 980, p.columnWidth || 980),
+    color, fontFamily: p.sans, fontSize, lineHeight,
   });
   restyleMarkdown(node, p, { size: fontSize, lineHeight, weight: "normal", color });
   const last = node.children.at(-1);
   if (last?.tag === "p") last.style.margin = 0;
+  if (p.proseOffset) node.style.margin = [0, 0, 0, p.proseOffset];
   return node;
 }
 
@@ -354,6 +383,25 @@ function tool(item: ToolItem, active: boolean, p: Palette, rebuild: () => void):
   return block({ margin: [1, 0] }, "", children);
 }
 
+function fittedUserBubbleWidth(text: string, maxOuterWidth: number, fontFamily: string): number {
+  const chrome = 34; // 左右 padding 32px + border 2px
+  const maxInnerWidth = Math.max(1, maxOuterWidth - chrome);
+  // 行尾空格不可见，不应参与气泡宽度；同时统一 CRLF，避免把 \r 当成可见字符测量。
+  const visibleText = text.replace(/\r\n?/g, "\n").replace(/[ \t]+$/gm, "");
+  const lineCountAtMax = wrapText(visibleText, maxInnerWidth, 14, fontFamily,
+    "pre-wrap", "normal", "normal").length;
+  // 在不增加行数的前提下收窄到最小宽度，避免长消息触发 max-width 后留下大片行尾空白。
+  let low = 1;
+  let high = maxInnerWidth;
+  while (high - low > 1) {
+    const mid = (low + high) / 2;
+    const lines = wrapText(visibleText, mid, 14, fontFamily, "pre-wrap", "normal", "normal");
+    if (lines.length <= lineCountAtMax) high = mid;
+    else low = mid;
+  }
+  return Math.min(maxOuterWidth, Math.max(72, Math.ceil(high) + chrome));
+}
+
 function itemNode(item: Item, active: boolean, p: Palette, rebuild: () => void,
   edit: (item: UserItem, bubble: Node) => void, editingId?: number): Node | null {
   if (item.type === "turn") return null;
@@ -373,17 +421,16 @@ function itemNode(item: Item, active: boolean, p: Palette, rebuild: () => void,
       }
       bubbleChildren.push(strip);
     }
-    if (item.text) bubbleChildren.push(block({ color: p.text, fontSize: 14, lineHeight: 1.6,
-      whiteSpace: "pre-wrap", textAlign: "left" }, item.text));
-    const textWidth = Math.max(0, ...item.text.split("\n").map((line) =>
-      measureText(line, 14, p.sans, "normal", "normal")));
-    const attachmentWidth = item.images?.length ? Math.min(640, item.images.length * 157) : 0;
-    // 内容宽度 + 32px padding + 2px border；按整数像素扩到可容纳宽度，避免短提示词临界换行。
-    const bubbleWidth = Math.min(p.columnWidth * .85,
-      Math.max(72, Math.ceil(textWidth) + 35, attachmentWidth + 34));
+    if (item.text) bubbleChildren.push(block({ color: p.text, fontFamily: p.sans, fontSize: 14,
+      lineHeight: 1.6, whiteSpace: "pre-wrap", textAlign: "left" }, item.text));
+    const maxBubbleWidth = p.columnWidth * .85;
+    const textWidth = item.text ? fittedUserBubbleWidth(item.text, maxBubbleWidth, p.sans) : 72;
+    const attachmentWidth = item.images?.length ? Math.min(640, item.images.length * 157) + 34 : 0;
+    // 文本按实际换行结果收紧；附件仍保留所需宽度，二者都不超过内容列 85%。
+    const bubbleWidth = Math.min(maxBubbleWidth, Math.max(textWidth, attachmentWidth));
     const bubble = block({ width: bubbleWidth, padding: [10, 16], background: p.accentDim,
       border: 1, borderColor: `color-mix(in srgb, ${p.accent} 26%, transparent)`,
-      borderRadius: [14, 14, 6, 14],
+      borderRadius: [14, 14, 6, 14], fontFamily: p.sans,
       color: p.text, fontSize: 14, lineHeight: 1.6, textAlign: "left" }, "", bubbleChildren);
     if (item.id === editingId) return block({ height: 150, margin: [20, 0, 16] });
     const children = state.currentId && !state.running[state.currentId]
@@ -392,20 +439,25 @@ function itemNode(item: Item, active: boolean, p: Palette, rebuild: () => void,
           opacity: 0, hoverOpacity: 1, hoverBackground: p.hover, hoverColor: p.text },
           () => edit(item, bubble)), bubble]
       : [bubble];
-    const row = block({ display: "flex", flexDirection: "row", justifyContent: "flex-end",
-      alignItems: "center", margin: [20, 0, 16] }, "", children);
+    // width:100% 保证 flex-end 有完整主轴，气泡贴内容列右缘（否则行会缩成内容宽，看起来偏左、右侧空一大块）。
+    const row = block({ width: "100%", display: "flex", flexDirection: "row",
+      justifyContent: "flex-end", alignItems: "center", margin: [20, 0, 16] }, "", children);
     row._editHoverRoot = true;
     return row;
   }
   if (item.type === "assistant") {
     if (item.text.trim() === "None") return null;
+    // markdown 自带 proseOffset；外层只保留上下边距。
     return block({ margin: [14, 0] }, "", [markdown(item.text, p)]);
   }
   if (item.type === "thought") {
-    if (item.text === "思考中…") return block({ margin: [6, 0], color: p.faint, fontSize: 13 }, "◌  思考中…");
+    const thoughtOffset = p.proseOffset || 0;
+    if (item.text === "思考中…") {
+      return block({ margin: [6, 0, 6, thoughtOffset], color: p.faint, fontSize: 13 }, "◌  思考中…");
+    }
     const key = `thought-${item.id}`;
     const open = isExpanded(key, active);
-    return block({ margin: [6, 0] }, "", [
+    return block({ width: p.proseWidth, margin: [6, 0, 6, thoughtOffset] }, "", [
       button("思考过程", { color: p.faint, fontSize: 12, padding: [3, 6],
         borderRadius: 6, leadingChevron: open, chevronColor: p.faint,
         hoverBackground: p.hover, hoverColor: p.dim }, () => {
@@ -413,7 +465,8 @@ function itemNode(item: Item, active: boolean, p: Palette, rebuild: () => void,
       }),
       ...(open ? [block({ margin: [6, 0, 0], padding: [8, 14], border: [0, 0, 0, 2],
         borderColor: p.borderLight, color: p.dim, fontSize: 13 }, "", [
-        markdown(normalizeThoughtMarkdown(item.text), p, {
+        // 外层已偏移；思考正文不再叠一次 proseOffset。
+        markdown(normalizeThoughtMarkdown(item.text), { ...p, proseOffset: 0 }, {
           fontSize: 13, lineHeight: 1.6, color: p.dim,
         }),
       ])] : []),
@@ -522,6 +575,30 @@ function editedFilesNode(body: Item[], undoneKey: string, p: Palette, rebuild: (
     }, () => openFile(edit.path)));
   });
   return card;
+}
+
+/** 只编码本轮展开相关 key，避免展开一处工具/思考就让全部历史轮次缓存失效。 */
+function groupExpandFingerprint(group: Group): string {
+  const exp = state.expanded;
+  const parts: string[] = [];
+  const push = (key: string) => {
+    const value = exp[key];
+    if (value !== undefined) parts.push(`${key}:${value ? 1 : 0}`);
+  };
+  if (group.turn) {
+    const foldKey = `turn-${group.turn.id ?? group.user?.id ?? group.body[0]?.id ?? 0}`;
+    push(foldKey);
+    push(`undone-${foldKey}`);
+  }
+  for (const item of group.body) {
+    push(String(item.id));
+    if (item.type === "thought") push(`thought-${item.id}`);
+    if (item.type === "tool") {
+      push(`tool-${item.id}`);
+      push(`tool-raw-${item.id}`);
+    }
+  }
+  return parts.join(",");
 }
 
 function groupNode(group: Group, index: number, running: boolean, p: Palette, rebuild: () => void,
@@ -680,6 +757,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let resizeObserver: ResizeObserver | undefined;
   let themeObserver: MutationObserver | undefined;
   let rebuildFrame = 0;
+  /** 同步 rebuild（点击展开等）后吞掉同轮 effect 的 scheduleRebuild，避免次帧再 clear+paint 闪一下。 */
+  let skipScheduledRebuild = false;
   let fontEpoch = 0;
   let fontLoadGeneration = 0;
   let fontLoadHandler: (() => void) | undefined;
@@ -700,22 +779,32 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (node._scrollKey) node._scrollY = nestedScrollPositions.get(node._scrollKey) ?? 0;
     for (const child of node.children) restoreNestedScroll(child);
   };
-  const rebuild = () => {
+  const rebuild = (fromSchedule = false) => {
     if (!canvas || !renderer) return;
+    if (rebuildFrame) {
+      cancelAnimationFrame(rebuildFrame);
+      rebuildFrame = 0;
+    }
+    // 点击展开等同步路径：让随后同轮 createEffect 的 scheduleRebuild 直接返回，避免次帧重复全量绘制闪屏。
+    if (!fromSchedule) {
+      skipScheduledRebuild = true;
+      queueMicrotask(() => { skipScheduledRebuild = false; });
+    }
     rememberNestedScroll(root);
     const oldTop = root?._scrollY ?? 0;
     const wasBottom = keepBottom || !root || root._maxScrollY - oldTop <= 2;
     const width = Math.max(1, canvas.clientWidth);
     const height = Math.max(1, canvas.clientHeight);
-    // 精确复刻 .transcript-inner：max-width: clamp(720px, 78vw, 980px)，
-    // padding-inline: clamp(14px, 3vw, 28px)，且全局 box-sizing 为 border-box。
-    const horizontal = Math.max(14, Math.min(28, window.innerWidth * .03));
-    const outerMax = Math.max(720, Math.min(980, window.innerWidth * .78));
-    const outerWidth = Math.min(width, outerMax);
-    const contentWidth = Math.max(1, outerWidth - horizontal * 2);
-    const p = { ...palette(), columnWidth: contentWidth };
-    const side = Math.max(0, (width - outerWidth) / 2) + horizontal;
-    const renderKey = `${contentWidth}:${fontEpoch}:${LAYOUT_REV}:${document.documentElement.dataset.theme}:${props.running}:${editing()?.id ?? ""}:${JSON.stringify(state.expanded)}`;
+    // Canvas 已处于侧栏与时光机之间：用满画布宽度给气泡贴右；助手正文与下方输入框同宽同左右。
+    const horizontal = Math.max(16, Math.min(36, width * .03));
+    const contentWidth = Math.max(1, width - horizontal * 2);
+    const side = horizontal;
+    const prose = measureProseColumn(canvas, side, contentWidth);
+    const proseWidth = prose.width;
+    const proseOffset = prose.offset;
+    const p = { ...palette(), columnWidth: contentWidth, proseWidth, proseOffset };
+    // 不含全局 expanded/running：闭合轮按组指纹缓存，展开一处不踢掉其余历史树。
+    const baseKey = `${contentWidth}:${proseWidth}:${proseOffset}:${fontEpoch}:${LAYOUT_REV}:${document.documentElement.dataset.theme}:${editing()?.id ?? ""}`;
     root = h("div", { width, height, overflow: "auto", display: "flex", flexDirection: "column",
       background: p.bg, padding: [24, side, 16], color: p.text, fontFamily: p.sans,
       fontSize: 14, scrollbarTrack: "transparent",
@@ -726,8 +815,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (!props.groups.length) root.appendChild(block({ padding: [40, 0], color: p.faint, fontSize: 13, textAlign: "center", lineHeight: 1.8 }, props.emptyHint));
     props.groups.forEach((group, index) => {
       // 已闭合轮次不可再流式变化：复用其 Canvas 节点树，避免每个 delta 都重解析全部历史 Markdown。
+      const cacheKey = group.turn ? `${baseKey}:${groupExpandFingerprint(group)}` : "";
       const cached = group.turn ? groupCache.get(group) : undefined;
-      let node = cached?.key === renderKey ? cached.node : undefined;
+      let node = cached?.key === cacheKey ? cached.node : undefined;
       if (!node) {
         node = groupNode(group, index, props.running, p, rebuild, (item, bubble) => {
           setDraft(item.text);
@@ -741,7 +831,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         }, editing()?.id);
         if (group.turn) {
           node._layoutStable = true;
-          groupCache.set(group, { key: renderKey, node });
+          groupCache.set(group, { key: cacheKey, node });
         }
       }
       node._groupIndex = index;
@@ -759,10 +849,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // 流式 delta、ResizeObserver 和主题变化可能在同一帧连续到达；合并为一次建树/布局/绘制。
   const scheduleRebuild = () => {
+    if (skipScheduledRebuild) {
+      skipScheduledRebuild = false;
+      return;
+    }
     if (rebuildFrame) return;
     rebuildFrame = requestAnimationFrame(() => {
       rebuildFrame = 0;
-      rebuild();
+      rebuild(true);
     });
   };
 
@@ -778,7 +872,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   onMount(() => {
     if (!canvas) return;
-    renderer = new CanvasDOM(canvas, { dpr: Math.min(devicePixelRatio || 1, 2) });
+    // 不封顶 dpr：高分屏封到 2 会让字形被放大采样，看起来发糊。
+    renderer = new CanvasDOM(canvas, { dpr: devicePixelRatio || 1 });
     renderer.on("click", (node) => node._action?.());
     renderer.on("input", (node) => node._input?.(String(node.style.value ?? "")));
     renderer.on("scroll", (node) => {
@@ -790,9 +885,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     props.ref?.(handle);
     resizeObserver = new ResizeObserver(() => {
       if (!canvas || !renderer) return;
-      const changed = renderer.resize(canvas.clientWidth, canvas.clientHeight);
+      const nextDpr = devicePixelRatio || 1;
+      if (renderer.dpr !== nextDpr) renderer.dpr = nextDpr;
+      // deferPaint：先更新逻辑尺寸，由 rebuild/setRoot 离屏画完再提交缓冲，避免先清空再慢绘闪一下。
+      const changed = renderer.resize(canvas.clientWidth, canvas.clientHeight, { deferPaint: true });
       if (!changed) return;
-      // 与 buffer 清空同一同步回合内 rebuild/setRoot，避免 RAF 空窗闪屏。
       if (rebuildFrame) {
         cancelAnimationFrame(rebuildFrame);
         rebuildFrame = 0;

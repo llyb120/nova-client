@@ -2,6 +2,12 @@
 
 import { wrapText, measureText } from './layout.js';
 
+/** 把 CSS 像素坐标落到设备像素网格，避免半 leading / 分数 dpr 让 fillText 发糊。 */
+function snapPx(v, dpr) {
+  const s = dpr > 0 ? dpr : 1;
+  return Math.round(v * s) / s;
+}
+
 function pad(p) {
   if (typeof p === 'number') return { t: p, r: p, b: p, l: p };
   if (Array.isArray(p)) {
@@ -237,14 +243,31 @@ export function paint(ctx, node, clipX, clipY, clipW, clipH, renderer) {
     // text content
     if (node.textContent) {
       if (isInline && node._textLines && node._textLines.length > 0) {
-        paintInlineText(ctx, node);
+        paintInlineText(ctx, node, renderer);
       } else {
         paintText(ctx, node, innerX, innerY, w - be.l - be.r - p.l - p.r, renderer);
       }
     }
     // children
+    // overflow 节点把子树裁剪窗口收窄到自身可见内容带，避免长工具输出/diff 按整画布误判可见。
+    let childClipX = clipX + sx;
+    let childClipY = clipY + sy;
+    let childClipW = clipW;
+    let childClipH = clipH;
+    if (clip) {
+      const vx = x + sx;
+      const vy = y + sy;
+      const x0 = Math.max(childClipX, vx);
+      const y0 = Math.max(childClipY, vy);
+      const x1 = Math.min(childClipX + childClipW, vx + w);
+      const y1 = Math.min(childClipY + childClipH, vy + h);
+      childClipX = x0;
+      childClipY = y0;
+      childClipW = Math.max(0, x1 - x0);
+      childClipH = Math.max(0, y1 - y0);
+    }
     for (const child of node.children) {
-      paint(ctx, child, clipX + sx, clipY + sy, clipW, clipH, renderer);
+      paint(ctx, child, childClipX, childClipY, childClipW, childClipH, renderer);
     }
   }
 
@@ -272,10 +295,15 @@ function paintText(ctx, node, x, y, maxW, renderer) {
   // 多余行距会全部堆在底部，看起来像多了一截 padding-bottom。
   const halfLeading = Math.max(0, (lh - fs) / 2);
   // 只提交视口内的 fillText；完整行几何仍保留给选择和复制。
+  // 祖先 scroll + 自身 scroll 都要计入，否则 overflow:auto 工具输出滚到底后行被误裁成空白。
   const lines2 = [];
-  const { sy } = getScrollOffset(node);
-  const visibleTop = sy - lh;
-  const visibleBottom = sy + (renderer?.height || Infinity) + lh;
+  const ownSy = node._scrollY || 0;
+  const totalSy = getScrollOffset(node).sy + ownSy;
+  const canvasH = renderer?.height || Infinity;
+  const localTop = y + ownSy;
+  const localBottom = localTop + (node._height || canvasH);
+  const visibleTop = Math.max(totalSy, localTop) - lh;
+  const visibleBottom = Math.min(totalSy + canvasH, localBottom) + lh;
   let offset = 0;
   for (let i = 0; i < lines.length; i++) {
     const lineText = lines[i];
@@ -286,11 +314,14 @@ function paintText(ctx, node, x, y, maxW, renderer) {
     if (s.textAlign === 'center') tx = x + (maxW - lineW) / 2;
     else if (s.textAlign === 'right') tx = x + (maxW - lineW);
     const visible = lineY >= visibleTop && lineY <= visibleBottom;
-    if (visible) ctx.fillText(lineText, tx, textY);
+    const dpr = renderer?.dpr || 1;
+    const sx = snapPx(tx, dpr);
+    const sy = snapPx(textY, dpr);
+    if (visible) ctx.fillText(lineText, sx, sy);
     if (visible && s.textDecoration === 'underline') {
-      ctx.fillRect(tx, textY + fs, lineW, Math.max(1, fs / 12));
+      ctx.fillRect(sx, sy + fs, lineW, Math.max(1, fs / 12));
     } else if (visible && s.textDecoration === 'line-through') {
-      ctx.fillRect(tx, textY + fs * 0.55, lineW, Math.max(1, fs / 12));
+      ctx.fillRect(sx, sy + fs * 0.55, lineW, Math.max(1, fs / 12));
     }
     lines2.push({ text: lineText, x: tx, y: lineY, w: lineW, fs, lh, offset });
     offset += lineText.length;
@@ -301,7 +332,7 @@ function paintText(ctx, node, x, y, maxW, renderer) {
 // Paint inline text using pre-computed _textLines from layoutInlineRun.
 // Draws background/border per-fragment (per line) and text at fragment positions.
 // _textLines are in layout coordinates; ctx has already been translated for scroll.
-function paintInlineText(ctx, node) {
+function paintInlineText(ctx, node, renderer) {
   const s = node.style;
   const fs = s.fontSize || 14;
   const ff = s.fontFamily || 'sans-serif';
@@ -309,6 +340,7 @@ function paintInlineText(ctx, node) {
   const fst = s.fontStyle || 'normal';
   const p = pad(s.padding);
   const lh = fs * (s.lineHeight || 1.4);
+  const dpr = renderer?.dpr || 1;
   ctx.font = `${fst} ${fw} ${fs}px ${ff}`;
   ctx.textBaseline = 'top';
   ctx.fillStyle = s.color;
@@ -336,13 +368,15 @@ function paintInlineText(ctx, node) {
   const halfLeading = Math.max(0, (lh - fs) / 2);
   for (const ln of node._textLines) {
     const textY = ln.y + halfLeading;
+    const sx = snapPx(ln.x, dpr);
+    const sy = snapPx(textY, dpr);
     if (ln.text) {
-      ctx.fillText(ln.text, ln.x, textY);
+      ctx.fillText(ln.text, sx, sy);
     }
     if (s.textDecoration === 'underline') {
-      ctx.fillRect(ln.x, textY + fs, ln.w, Math.max(1, fs / 12));
+      ctx.fillRect(sx, sy + fs, ln.w, Math.max(1, fs / 12));
     } else if (s.textDecoration === 'line-through') {
-      ctx.fillRect(ln.x, textY + fs * 0.55, ln.w, Math.max(1, fs / 12));
+      ctx.fillRect(sx, sy + fs * 0.55, ln.w, Math.max(1, fs / 12));
     }
   }
 }
