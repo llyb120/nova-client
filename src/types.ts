@@ -387,6 +387,8 @@ export interface Settings {
   theme: string;
   /** 会话历史展示方式（按项目 / 按时间） */
   historyDisplayMode: "project" | "time";
+  /** 聊天视图渲染方式（dom / canvas；默认 dom） */
+  chatViewRender: "dom" | "canvas";
   /** 团队/漫游中转服务地址（空 = 关闭团队/漫游） */
   relayServer: string;
   /** 团队/漫游身份 token（永久，用以区分每个人） */

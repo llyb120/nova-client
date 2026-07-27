@@ -54,7 +54,7 @@ const mockSettings = {
   cursorPath: "", cursorSdkApiKey: "", opencodePath: "", opencodeProxy: "",
   codexPath: "", codexProxy: "", vegaProxy: "", windowsShellShimEnabled: false,
   defaultMode: "build", lightweightModelAgent: "alkaid", lightweightModel: "",
-  editor: "cursor", theme: "", historyDisplayMode: "project",
+  editor: "cursor", theme: "", historyDisplayMode: "project", chatViewRender: "dom",
   relayServer: "", relayToken: "", relayGroups: "", remoteControlEnabled: false,
   quotaSharedModels: [], devinEnabled: true, codexEnabled: true,
   codebuddyEnabled: false, claudecodeEnabled: false, cursorEnabled: false,

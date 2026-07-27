@@ -121,8 +121,13 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
     `turn-${props.group.turn?.id ?? props.group.user?.id ?? props.group.body[0]?.id ?? 0}`;
   // 运行中用户手动展开过本轮的某个详情（工具/思考）时，结束后该轮保持展开；
   // 未显式点过折叠行（undefined）才走这个自动判断，点过的以用户操作为准
+  // 与 ToolCallCard / thought 一致：工具用 tool-${id}，思考用 thought-${id}
   const bodyExpanded = () =>
-    props.group.body.some((it) => state.expanded[String(it.id)]);
+    props.group.body.some((it) => {
+      if (it.type === "tool") return !!state.expanded[`tool-${it.id}`];
+      if (it.type === "thought") return !!state.expanded[`thought-${it.id}`];
+      return !!state.expanded[String(it.id)];
+    });
   const open = () => state.expanded[foldKey()] ?? bodyExpanded();
   const foldable = () => !!props.group.turn && !props.active;
 

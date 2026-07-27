@@ -100,6 +100,63 @@ function wrapText(text: string, maxW: number, fs: number, ff: string, fw = "400"
   return lines;
 }
 
+// Match DOM .bubble-images img: max-width 240px; max-height 180px
+// Scale uniformly by original aspect ratio to fit within max W or H (never stretch).
+const BUBBLE_IMG_MAX_W = 240;
+const BUBBLE_IMG_MAX_H = 180;
+const BUBBLE_IMG_GAP = 6;
+const BUBBLE_IMG_MARGIN_BOTTOM = 6;
+
+function promptImageSrc(img: PromptImage): string {
+  return img.data
+    ? `data:${img.mimeType};base64,${img.data}`
+    : convertFileSrc(decodeURI((img.uri ?? "").replace(/^file:\/\/+/, "")));
+}
+
+function bubbleImageSize(el: HTMLImageElement | null | undefined): { w: number; h: number } {
+  const nw = el?.naturalWidth ?? 0;
+  const nh = el?.naturalHeight ?? 0;
+  if (!nw || !nh) return { w: 160, h: 120 };
+  const scale = Math.min(1, BUBBLE_IMG_MAX_W / nw, BUBBLE_IMG_MAX_H / nh);
+  return { w: Math.max(1, Math.round(nw * scale)), h: Math.max(1, Math.round(nh * scale)) };
+}
+
+interface BubbleImageLayout {
+  dx: number; dy: number; w: number; h: number; img: PromptImage;
+}
+
+function layoutBubbleImages(
+  images: PromptImage[] | undefined,
+  maxInnerW: number,
+  load: (img: PromptImage) => HTMLImageElement | null,
+): { layouts: BubbleImageLayout[]; usedW: number; stackH: number } {
+  const layouts: BubbleImageLayout[] = [];
+  let usedW = 0;
+  let stackH = 0;
+  if (!images?.length) return { layouts, usedW, stackH };
+
+  let x = 0;
+  let y = 0;
+  let rowH = 0;
+  for (const img of images) {
+    if (!img.mimeType.startsWith("image/")) continue;
+    const size = bubbleImageSize(load(img));
+    if (x > 0 && x + size.w > maxInnerW) {
+      usedW = Math.max(usedW, x - BUBBLE_IMG_GAP);
+      y += rowH + BUBBLE_IMG_GAP;
+      x = 0;
+      rowH = 0;
+    }
+    layouts.push({ dx: 16 + x, dy: 10 + y, w: size.w, h: size.h, img });
+    x += size.w + BUBBLE_IMG_GAP;
+    rowH = Math.max(rowH, size.h);
+  }
+  if (!layouts.length) return { layouts, usedW, stackH };
+  usedW = Math.max(usedW, x > 0 ? x - BUBBLE_IMG_GAP : 0);
+  stackH = y + rowH + BUBBLE_IMG_MARGIN_BOTTOM;
+  return { layouts, usedW, stackH };
+}
+
 // ─── Markdown parser ─────────────────────────────────────────────────────────
 
 interface TextSegment {
@@ -326,21 +383,39 @@ interface Selection {
 }
 
 function selectionText(blocks: Block[], sel: Selection): string {
-  const from = Math.min(sel.startBlock, sel.endBlock);
-  const to = Math.max(sel.startBlock, sel.endBlock);
-  let fromOff = sel.startBlock <= sel.endBlock ? sel.startOffset : sel.endOffset;
-  let toOff = sel.startBlock <= sel.endBlock ? sel.endOffset : sel.startOffset;
-  if (sel.startBlock > sel.endBlock) { fromOff = sel.endOffset; toOff = sel.startOffset; }
-  let out = "";
+  const forward =
+    sel.startBlock < sel.endBlock ||
+    (sel.startBlock === sel.endBlock && sel.startOffset <= sel.endOffset);
+  const from = forward ? sel.startBlock : sel.endBlock;
+  const to = forward ? sel.endBlock : sel.startBlock;
+  const fromOff = forward ? sel.startOffset : sel.endOffset;
+  const toOff = forward ? sel.endOffset : sel.startOffset;
+  const parts: string[] = [];
   for (let i = from; i <= to; i++) {
     const b = blocks[i];
-    if (!b?.text || !b.selectable) continue;
+    if (!b?.selectable) continue;
     const sOff = i === from ? fromOff : 0;
-    const eOff = i === to ? toOff : b.text.length;
-    out += b.text.slice(sOff, eOff);
-    if (i < to) out += "\n";
+    const eOff = i === to ? toOff : Number.POSITIVE_INFINITY;
+    // 选区 offset 来自 textLines（含 wrap/trim），不能直接 slice 原始 b.text
+    if (b.textLines?.length) {
+      const lineParts: string[] = [];
+      for (const ln of b.textLines) {
+        const lineEnd = ln.offset + ln.text.length;
+        if (eOff <= ln.offset || sOff >= lineEnd) continue;
+        const a = Math.max(0, sOff - ln.offset);
+        const c = Math.min(ln.text.length, eOff - ln.offset);
+        lineParts.push(ln.text.slice(a, c));
+      }
+      if (lineParts.length) parts.push(lineParts.join("\n"));
+    } else if (b.text) {
+      parts.push(b.text.slice(sOff, Math.min(eOff, b.text.length)));
+    }
   }
-  return out;
+  return parts.join("\n");
+}
+
+function blockScrollKey(b: Block): string {
+  return `${b.kind}:${b.id}:${b.text?.length ?? 0}:${(b.data?.fullH as number) ?? b.h}`;
 }
 
 // ─── Main component ──────────────────────────────────────────────────────────
@@ -363,8 +438,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let hoverBlockIdx = -1;
   let cursorStyle = "default";
 
-  // per-block scroll for clipped tool-content
-  const blockScrolls = new Map<number, number>();
+  // per-block scroll for clipped tool-content（按内容身份记，避免 rebuild 丢位置）
+  const blockScrolls = new Map<string, number>();
+  let rebuildRaf = 0;
+  let prefixCacheSig = "";
+  let prefixCacheBlocks: Block[] = [];
+  let prefixCacheHeight = 0;
+  let prefixCacheGroupYs: number[] = [];
+  let prefixCacheUntil = 0;
 
   // selection state
   let selection: Selection | null = null;
@@ -396,6 +477,43 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   let editLayoutY = 0, editLayoutSide = 0, editLayoutW = 0;
 
+  function userImagesSig(images: PromptImage[] | undefined): string {
+    if (!images?.length) return "0";
+    return images.map((img) => {
+      if (!img.mimeType.startsWith("image/")) return `file:${img.name}`;
+      const el = imgCache.get(promptImageSrc(img));
+      const loaded = !!(el as unknown as { _loaded?: boolean } | undefined)?._loaded;
+      if (!el || !loaded || !el.naturalWidth || !el.naturalHeight) return "pending";
+      // Include natural size so layout cache invalidates when aspect-correct size is known.
+      return `${el.naturalWidth}x${el.naturalHeight}`;
+    }).join(",");
+  }
+
+  function closedGroupSig(g: Group): string {
+    const foldKey = g.turn ? `turn-${g.turn.id ?? g.user?.id ?? 0}` : "";
+    const foldOpen = foldKey ? !!(state.expanded[foldKey] ?? false) : false;
+    const parts = [
+      g.user ? `u:${g.user.id}:${g.user.text}:${userImagesSig(g.user.images)}` : "-",
+      g.turn
+        ? `t:${g.turn.id}:${g.turn.durationMs}:${g.turn.totalTokens ?? ""}:${g.turn.actualModel ?? ""}:${foldOpen}`
+        : "-",
+    ];
+    for (const item of g.body) {
+      if (item.type === "tool") {
+        parts.push(
+          `tool:${item.id}:${item.status}:${item.title}:${item.content.length}:${item.locations.length}:${!!state.expanded[`tool-${item.id}`]}`,
+        );
+      } else if ("text" in item) {
+        parts.push(
+          `${item.type}:${item.id}:${(item as { text: string }).text}:${!!state.expanded[`thought-${item.id}`]}`,
+        );
+      } else {
+        parts.push(`${item.type}:${item.id}`);
+      }
+    }
+    return parts.join("|");
+  }
+
   function computeLayout() {
     const p = pal;
     const W = viewW;
@@ -403,7 +521,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const vw = window.innerWidth;
     // .chat-foot: padding: 10px clamp(14px, 3vw, 24px) 16px
     // max-width: clamp(720px, 78vw, 980px); margin: 0 auto; box-sizing: border-box
-    const pad = Math.max(14, Math.min(24, vw * 0.03));
+    // +10px 左右内边距，避免绘图主体贴边
+    const pad = Math.max(14, Math.min(24, vw * 0.03)) + 10;
     const boxW = Math.min(W, Math.min(980, Math.max(720, vw * 0.78)));
     const side = Math.max(0, (W - boxW) / 2) + pad;
     const contentW = boxW - pad * 2;
@@ -417,10 +536,35 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       result.push({ kind: "hint", id: 0, groupIdx: 0, x: side, y, w: contentW, h: 60,
         text: props.emptyHint, color: p.faint, fontSize: 13, font: p.sans, selectable: true });
       y += 60;
-      blocks = result; totalHeight = y + 16; return;
+      blocks = result; totalHeight = y + 16;
+      prefixCacheSig = "";
+      prefixCacheUntil = 0;
+      prefixCacheBlocks = [];
+      prefixCacheGroupYs = [];
+      prefixCacheHeight = 0;
+      return;
     }
 
-    for (let gi = 0; gi < props.groups.length; gi++) {
+    // 已闭合轮次布局缓存：流式输出时只重算尾部，大幅降低每帧布局成本
+    let closedUntil = 0;
+    const closedSigs: string[] = [];
+    for (let i = 0; i < props.groups.length; i++) {
+      if (!props.groups[i].turn) break;
+      closedSigs.push(closedGroupSig(props.groups[i]));
+      closedUntil = i + 1;
+    }
+    const prefixSig = `${Math.round(W)}|${p.bg}|${p.text}|${closedSigs.join("||")}`;
+    const reusePrefix =
+      closedUntil > 0 && prefixSig === prefixCacheSig && prefixCacheUntil === closedUntil;
+    let gi = 0;
+    if (reusePrefix) {
+      for (const b of prefixCacheBlocks) result.push(b);
+      groupYs = prefixCacheGroupYs.slice();
+      y = prefixCacheHeight;
+      gi = closedUntil;
+    }
+
+    for (; gi < props.groups.length; gi++) {
       const g = props.groups[gi];
       groupYs.push(y);
       const active = props.running && !g.turn;
@@ -434,10 +578,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const textLines = item.text ? wrapText(item.text, maxBubble - 34, 14, p.sans) : [];
           const lh = 14 * 1.6;
           const textH = textLines.length * lh;
-          const imgH = item.images?.length ? 96 + 8 : 0;
-          const bubbleH = Math.max(30, textH + imgH + 20); // padding 10*2
           const textW = textLines.reduce((m, l) => Math.max(m, measure(l, 14, p.sans)), 0);
-          const bubbleW = Math.min(maxBubble, Math.max(72, textW + 34));
+          // DOM .bubble-images: flex-wrap, img max 240×180, gap 6, margin-bottom 6
+          const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH } =
+            layoutBubbleImages(item.images, maxBubble - 32, loadImage);
+          const bubbleW = Math.min(maxBubble, Math.max(72, textW + 34, imgUsedW + 32));
+          const bubbleH = Math.max(30, textH + imgH + 20); // padding 10*2
           const bx = side + contentW - bubbleW;
 
           result.push({ kind: "user-bubble", id: item.id, groupIdx: gi,
@@ -447,7 +593,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             // border-radius: 14px; border-bottom-right-radius: 6px
             borderRadius: [14, 14, 6, 14], fontSize: 14, lineHeight: 1.6, font: p.sans,
             selectable: true, hoverKey: `user-${item.id}`,
-            data: { images: item.images, editItem: item } });
+            data: { images: item.images, editItem: item, imageLayouts } });
 
           // .user-edit-btn: padding 5px, margin 0 2px 4px 0, align-self flex-end
           if (state.currentId && !state.running[state.currentId]) {
@@ -493,7 +639,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
       if (g.turn && process.length) {
         const foldKey = `turn-${g.turn.id ?? g.user?.id ?? process[0]?.id ?? 0}`;
-        const open = state.expanded[foldKey] ?? process.some(it => state.expanded[String(it.id)]);
+        const open = state.expanded[foldKey] ?? process.some((it) => {
+          if (it.type === "tool") return !!state.expanded[`tool-${it.id}`];
+          if (it.type === "thought") return !!state.expanded[`thought-${it.id}`];
+          return !!state.expanded[String(it.id)];
+        });
         const label = ["已处理", fmtDuration(g.turn.durationMs),
           g.turn.totalTokens ? `· ${fmtTokens(g.turn.totalTokens)} tokens` : ""].filter(Boolean).join(" ");
 
@@ -539,6 +689,22 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     blocks = result;
     totalHeight = y + 16;
+
+    if (closedUntil > 0) {
+      if (!reusePrefix) {
+        prefixCacheSig = prefixSig;
+        prefixCacheUntil = closedUntil;
+        prefixCacheBlocks = result.filter((b) => b.groupIdx < closedUntil);
+        prefixCacheGroupYs = groupYs.slice(0, closedUntil);
+        prefixCacheHeight = closedUntil < props.groups.length ? groupYs[closedUntil] : y;
+      }
+    } else {
+      prefixCacheSig = "";
+      prefixCacheUntil = 0;
+      prefixCacheBlocks = [];
+      prefixCacheGroupYs = [];
+      prefixCacheHeight = 0;
+    }
   }
 
   function layoutItem(item: Item, result: Block[], gi: number, pad: number,
@@ -945,31 +1111,30 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function paintUserBubble(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette, hover: boolean) {
-    const item = b.data?.editItem as UserItem | undefined;
-    // images
-    if (item?.images?.length) {
-      let ix = bx + 16;
-      for (const img of item.images) {
-        if (img.mimeType.startsWith("image/")) {
-          const cached = loadImage(img);
-          if (cached) {
-            ctx.save();
-            roundRect(ctx, ix, by + 10, 80, 60, 7);
-            ctx.clip();
-            ctx.drawImage(cached, ix, by + 10, 80, 60);
-            ctx.restore();
-          }
-          ix += 87;
-        }
-      }
+    const imageLayouts = (b.data?.imageLayouts as BubbleImageLayout[] | undefined) ?? [];
+    for (const layout of imageLayouts) {
+      const cached = loadImage(layout.img);
+      if (!cached) continue;
+      // Always draw with aspect-correct size; stale layout slots trigger rebuild.
+      const size = bubbleImageSize(cached);
+      if (size.w !== layout.w || size.h !== layout.h) scheduleRebuild();
+      const ix = bx + layout.dx;
+      const iy = by + layout.dy;
+      ctx.save();
+      roundRect(ctx, ix, iy, size.w, size.h, 10);
+      ctx.clip();
+      ctx.drawImage(cached, ix, iy, size.w, size.h);
+      ctx.restore();
     }
 
-    // text
+    // text — left-aligned under images (DOM .user-bubble)
     if (b.text) {
       const fs = b.fontSize || 14;
       const ff = b.font || p.sans;
       const lh = fs * (b.lineHeight || 1.6);
-      const imgOffset = item?.images?.length ? 78 : 0;
+      const imgOffset = imageLayouts.length
+        ? Math.max(...imageLayouts.map((l) => l.dy + l.h)) - 10 + BUBBLE_IMG_MARGIN_BOTTOM
+        : 0;
       ctx.font = `${fs}px ${ff}`;
       ctx.fillStyle = b.color || p.text;
       ctx.textBaseline = "top";
@@ -1016,41 +1181,50 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function paintToolHeader(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette) {
     const { open, busy, hasBody, kind, status } = b.data as { open: boolean; busy: boolean; hasBody: boolean; kind: string; status: string };
-    // padding 3px 8px; gap 8 between icon and title
+    // padding 3px 8px; gap 8 — match DOM .tool-line: icon → title → busy → chevron
     const padX = 8;
+    const gap = 8;
+    const midY = snap(by + b.h / 2);
 
     // icon (14px) at left
     drawToolIcon(ctx, kind, bx + padX, by + (b.h - 14) / 2, 14, p.faint);
 
-    // label after icon + gap 8
-    const textX = bx + padX + 14 + 8;
+    // label after icon + gap 8; reserve trailing icons so long titles ellipsize
+    const textX = bx + padX + 14 + gap;
+    let trailReserve = padX;
+    if (busy || status === "failed") trailReserve += gap + 12;
+    if (hasBody) trailReserve += gap + 12;
     ctx.font = `${b.fontSize}px ${b.font}`;
     ctx.fillStyle = b.color || p.dim;
     ctx.textBaseline = "middle";
-    const maxTextW = b.w - (textX - bx) - 40;
+    const maxTextW = Math.max(20, b.w - (textX - bx) - trailReserve);
     let label = b.text!;
     if (measure(label, b.fontSize!, b.font!) > maxTextW) {
       while (label.length > 1 && measure(label + "…", b.fontSize!, b.font!) > maxTextW) label = label.slice(0, -1);
       label += "…";
     }
-    ctx.fillText(label, textX, snap(by + b.h / 2));
+    ctx.fillText(label, textX, midY);
 
-    // trailing status / chevron at right (padding-right 8)
-    const rx = bx + b.w - padX - 6;
+    // trailing status / chevron sit after the label (not flush-right)
+    let nextX = textX + measure(label, b.fontSize!, b.font!) + gap;
     if (busy) {
       hasBusy = true;
+      const cx = nextX + 6;
       const angle = spinPhase * Math.PI * 2;
       ctx.save();
       ctx.strokeStyle = p.blue;
       ctx.lineWidth = 2;
       ctx.globalAlpha = 0.26;
-      ctx.beginPath(); ctx.arc(rx, by + b.h / 2, 5, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, midY, 5, 0, Math.PI * 2); ctx.stroke();
       ctx.globalAlpha = 1;
-      ctx.beginPath(); ctx.arc(rx, by + b.h / 2, 5, angle - Math.PI / 2, angle + Math.PI * 0.15); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, midY, 5, angle - Math.PI / 2, angle + Math.PI * 0.15); ctx.stroke();
       ctx.restore();
+      nextX += 12 + gap;
     } else if (status === "failed") {
+      const cx = nextX + 3.5;
       ctx.fillStyle = p.red;
-      ctx.beginPath(); ctx.arc(rx, by + b.h / 2, 3.5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx, midY, 3.5, 0, Math.PI * 2); ctx.fill();
+      nextX += 7 + gap;
     }
 
     if (hasBody) {
@@ -1060,10 +1234,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
       ctx.beginPath();
-      const chevX = busy || status === "failed" ? rx - 16 : rx;
-      const chevY = by + b.h / 2;
-      if (open) { ctx.moveTo(chevX - 3, chevY - 1.5); ctx.lineTo(chevX, chevY + 1.5); ctx.lineTo(chevX + 3, chevY - 1.5); }
-      else { ctx.moveTo(chevX - 1.5, chevY - 3); ctx.lineTo(chevX + 1.5, chevY); ctx.lineTo(chevX - 1.5, chevY + 3); }
+      const chevX = nextX + 6;
+      if (open) { ctx.moveTo(chevX - 3, midY - 1.5); ctx.lineTo(chevX, midY + 1.5); ctx.lineTo(chevX + 3, midY - 1.5); }
+      else { ctx.moveTo(chevX - 1.5, midY - 3); ctx.lineTo(chevX + 1.5, midY); ctx.lineTo(chevX - 1.5, midY + 3); }
       ctx.stroke();
       ctx.restore();
     }
@@ -1078,7 +1251,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const padX = (b.data?.padX as number) ?? (b.bg ? 10 : 0);
     const padY = (b.data?.padY as number) ?? (b.bg ? 8 : 0);
     const clipped = b.data?.clipped as boolean | undefined;
-    const bScroll = (clipped && blockIdx != null) ? (blockScrolls.get(blockIdx) || 0) : 0;
+    const bScroll = clipped ? (blockScrolls.get(blockScrollKey(b)) || 0) : 0;
 
     // left border for thought body
     if (b.data?.borderLeft) {
@@ -1342,10 +1515,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const b = blocks[i];
       if (!b?.textLines || !b.selectable) continue;
       const sOff = i === from ? fromOff : 0;
-      const eOff = i === to ? toOff : (b.text?.length ?? 0);
+      const eOff = i === to ? toOff : Number.POSITIVE_INFINITY;
+      const clipped = !!b.data?.clipped;
+      if (clipped) {
+        ctx.save();
+        roundRect(ctx, b.x, b.y - scrollY, b.w, b.h, b.borderRadius || 0);
+        ctx.clip();
+      }
       for (const ln of b.textLines) {
         const lineEnd = ln.offset + ln.text.length;
         if (eOff <= ln.offset || sOff >= lineEnd) continue;
+        // 工具详情内部滚动后，裁切区外的行不再画高亮，避免漂到卡片上方
+        if (clipped && (ln.y + ln.lh <= b.y || ln.y >= b.y + b.h)) continue;
         const a = Math.max(0, sOff - ln.offset);
         const bEnd = Math.min(ln.text.length, eOff - ln.offset);
         let x0: number, x1: number;
@@ -1359,6 +1540,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         const halfLead = (ln.lh - ln.fs) / 2;
         ctx.fillRect(x0, ln.y - scrollY + halfLead, x1 - x0, ln.fs);
       }
+      if (clipped) ctx.restore();
     }
     ctx.restore();
   }
@@ -1394,7 +1576,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (let i = 0; i < blocks.length; i++) {
       const b = blocks[i];
       if (!b.textLines || !b.selectable) continue;
+      if (b.data?.clipped && (my < b.y || my >= b.y + b.h)) continue;
       for (const ln of b.textLines) {
+        if (b.data?.clipped && (ln.y + ln.lh <= b.y || ln.y >= b.y + b.h)) continue;
         if (my >= ln.y && my < ln.y + ln.lh) {
           let off = ln.offset + ln.text.length;
           if (ln.charX) {
@@ -1485,10 +1669,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         if (b.data?.clipped && b.kind === "tool-content") {
           const fullH = (b.data.fullH as number) || b.h;
           const maxBlockScroll = fullH - b.h;
-          const curScroll = blockScrolls.get(idx) || 0;
+          const key = blockScrollKey(b);
+          const curScroll = blockScrolls.get(key) || 0;
           const newScroll = Math.max(0, Math.min(maxBlockScroll, curScroll + dy));
           if (newScroll !== curScroll) {
-            blockScrolls.set(idx, newScroll);
+            blockScrolls.set(key, newScroll);
             paintAll();
             return;
           }
@@ -1543,13 +1728,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   // ─── Image loading ─────────────────────────────────────────────────────────
 
   function loadImage(img: PromptImage): HTMLImageElement | null {
-    const src = img.data ? `data:${img.mimeType};base64,${img.data}`
-      : convertFileSrc(decodeURI((img.uri ?? "").replace(/^file:\/\/+/, "")));
+    const src = promptImageSrc(img);
     let el = imgCache.get(src);
     if (el) return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
     el = new Image();
     (el as unknown as { _loaded?: boolean })._loaded = false;
-    el.onload = () => { (el as unknown as { _loaded?: boolean })._loaded = true; paintAll(); };
+    el.onload = () => { (el as unknown as { _loaded?: boolean })._loaded = true; scheduleRebuild(); };
     el.src = src;
     imgCache.set(src, el);
     return null;
@@ -1559,10 +1743,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function rebuild() {
     pal = readPalette();
-    blockScrolls.clear();
     const oldScroll = scrollY;
     const wasBottom = keepBottom || maxScroll - scrollY <= 2;
     computeLayout();
+    const liveKeys = new Set(
+      blocks.filter((b) => b.data?.clipped).map((b) => blockScrollKey(b)),
+    );
+    for (const key of [...blockScrolls.keys()]) {
+      if (!liveKeys.has(key)) blockScrolls.delete(key);
+    }
     maxScroll = Math.max(0, totalHeight - viewH);
     if (wasBottom) scrollY = maxScroll;
     else scrollY = Math.max(0, Math.min(maxScroll, oldScroll));
@@ -1575,6 +1764,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
     props.onScroll?.(scrollY, maxScroll, false);
     paintAll();
+  }
+
+  function scheduleRebuild() {
+    if (rebuildRaf) return;
+    rebuildRaf = requestAnimationFrame(() => {
+      rebuildRaf = 0;
+      rebuild();
+    });
   }
 
   function resizeCanvas() {
@@ -1622,6 +1819,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     onCleanup(() => {
       ro.disconnect();
       mo.disconnect();
+      if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
+      if (rafId) cancelAnimationFrame(rafId);
       canvasEl.removeEventListener("mousemove", onMouseMove);
       canvasEl.removeEventListener("mousedown", onMouseDown);
       canvasEl.removeEventListener("mouseup", onMouseUp);
@@ -1644,7 +1843,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     props.running; props.preview;
     JSON.stringify(state.expanded);
     void editing()?.id;
-    rebuild();
+    scheduleRebuild();
   });
 
   const saveEdit = () => {

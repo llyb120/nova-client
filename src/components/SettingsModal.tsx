@@ -189,6 +189,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
   );
+  const [chatViewRender, setChatViewRender] = createSignal<"dom" | "canvas">(
+    s?.chatViewRender === "canvas" ? "canvas" : "dom",
+  );
   // server 留空回退默认地址；这里也预填，避免误存成空导致团队/漫游被静默关闭
   const [relayServer, setRelayServer] = createSignal(s?.relayServer || DEFAULT_RELAY_SERVER);
   const [relayToken, setRelayToken] = createSignal(s?.relayToken ?? "");
@@ -453,6 +456,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
     historyDisplayMode: historyDisplayMode(),
+    chatViewRender: chatViewRender(),
     semanticEnabled: semanticEnabled(),
     embedEndpoint: embedEndpoint().trim(),
     embedModel: embedModel().trim(),
@@ -981,6 +985,26 @@ export function SettingsModal(props: { onClose: () => void }) {
 
           {/* ===== 高级 ===== */}
           <Show when={tab() === "advanced"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">聊天视图</h3>
+              <label class="field">
+                <span class="field-label">渲染方式</span>
+                <select
+                  class="field-input"
+                  value={chatViewRender()}
+                  onChange={(e) =>
+                    setChatViewRender(e.currentTarget.value === "canvas" ? "canvas" : "dom")
+                  }
+                >
+                  <option value="dom">DOM（默认）</option>
+                  <option value="canvas">Canvas</option>
+                </select>
+                <span class="field-hint">
+                  DOM 选区/复制更可靠；Canvas 在超长会话时更省 DOM 节点、滚动更轻。保存后立即生效。
+                </span>
+              </label>
+            </section>
+
             <section class="settings-group">
               <h3 class="settings-group-title">Vega 上下文</h3>
               <div class="field">
