@@ -2548,6 +2548,11 @@ fn open_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_prompt_queue_pending(thread_id: String, pending: bool) {
+    sys_notify::set_prompt_queue_pending(&thread_id, pending);
+}
+
+#[tauri::command]
 fn notify_fire_done(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -2567,13 +2572,7 @@ fn notify_fire_done(
     } else {
         "Fire 已结束，但目标仍未通过验收"
     };
-    sys_notify::notify_thread_done_unfiltered(
-        &app,
-        &thread_id,
-        &title,
-        body,
-        acp::EV_NOTIFY_OPEN,
-    );
+    sys_notify::notify_thread_done_unfiltered(&app, &thread_id, &title, body, acp::EV_NOTIFY_OPEN);
     Ok(())
 }
 
@@ -5615,6 +5614,7 @@ pub fn run() {
             delete_time_machine_context,
             rename_thread,
             notify_fire_done,
+            set_prompt_queue_pending,
             set_thread_model,
             set_thread_mode,
             set_thread_reasoning_effort,

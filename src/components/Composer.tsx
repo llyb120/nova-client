@@ -1,4 +1,5 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import { api } from "../ipc";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
   cancelTurn,
@@ -324,6 +325,11 @@ export function Composer() {
     });
     setDispatchingQueueIds((ids) => new Set(ids).add(item.id));
     try {
+      const hasMore = queuedPrompts().some(
+        (queued) => queued.threadId === item.threadId && queued.id !== item.id,
+      );
+      // 必须先更新后端标记再发下一轮，避免最后一轮仍被当作队列中间轮次。
+      await api.setPromptQueuePending(item.threadId, hasMore);
       await sendPrompt(item.text, item.images);
       setQueuedPrompts((items) => items.filter((queued) => queued.id !== item.id));
     } catch (error) {
@@ -351,7 +357,12 @@ export function Composer() {
   });
 
   const withdrawQueuedPrompt = (item: QueuedPrompt) => {
-    setQueuedPrompts((items) => items.filter((queued) => queued.id !== item.id));
+    setQueuedPrompts((items) => {
+      const next = items.filter((queued) => queued.id !== item.id);
+      const pending = next.some((queued) => queued.threadId === item.threadId);
+      void api.setPromptQueuePending(item.threadId, pending);
+      return next;
+    });
     setFailedQueueIds((ids) => {
       const next = new Set(ids);
       next.delete(item.id);
@@ -387,6 +398,7 @@ export function Composer() {
         ...items,
         { id: `${currentId}:queued:${now}:${items.length}`, threadId: currentId, text: value, ts: now, images },
       ]);
+      void api.setPromptQueuePending(currentId, true);
       return;
     }
     const employeeId = isNewOrdinaryThread() ? selectedEmployee()?.id ?? null : null;

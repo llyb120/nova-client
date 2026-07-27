@@ -1,7 +1,24 @@
 //! 跨平台系统通知：Windows 用 WinRT Toast（可点击回调），macOS 用 osascript。
 
 use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, UserAttentionType};
+
+fn prompt_queued_threads() -> &'static Mutex<HashSet<String>> {
+    static THREADS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    THREADS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 记录前端提示词队列状态。队列未清空时，中间轮次结束不发送完成通知。
+pub fn set_prompt_queue_pending(thread_id: &str, pending: bool) {
+    let mut threads = prompt_queued_threads().lock().unwrap();
+    if pending {
+        threads.insert(thread_id.to_string());
+    } else {
+        threads.remove(thread_id);
+    }
+}
 
 /// 聚焦主窗口（显示、取消最小化、请求注意、尽量设为前台）。
 pub fn focus_main_window(app: &AppHandle) {
@@ -78,8 +95,8 @@ pub fn show(
 /// 任务结束通知：点击（Windows）跳转到会话。
 pub fn notify_thread_done(app: &AppHandle, thread_id: &str, title: &str, body: &str, event: &str) {
     // Fire 的执行与判断阶段会连续结束；中间阶段不逐个打扰，最终结果由
-    // `notify_fire_done` 显式发送一次。
-    if title.starts_with("[Fire]") {
+    // `notify_fire_done` 显式发送一次。提示词队列同理，只通知最后一轮。
+    if title.starts_with("[Fire]") || prompt_queued_threads().lock().unwrap().contains(thread_id) {
         return;
     }
     notify_thread_done_unfiltered(app, thread_id, title, body, event);
