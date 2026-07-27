@@ -1665,12 +1665,13 @@ async fn create_thread(
         state.relay.publish_folders();
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
+
+    Ok(thread)
+}
+
 #[tauri::command]
 fn directory_exists(path: String) -> bool {
     Path::new(path.trim()).is_dir()
-}
-
-    Ok(thread)
 }
 
 /// 为「不使用项目」的会话新建一个空的临时目录
@@ -2635,22 +2636,6 @@ fn restore_time_machine_checkpoint(
     thread_id: String,
     checkpoint_id: String,
 ) -> Result<time_machine::RestoreResult, String> {
-        restore_files,
-    )?;
-    {
-        let mut store = state.store.lock().unwrap();
-        if current.is_roaming_guest() {
-            let existing = store.get_mut(&current.id).ok_or("漫游会话不存在")?;
-            *existing = thread;
-        } else {
-            store.threads.push(thread);
-        }
-        store.save();
-    }
-    let _ = app.emit(acp::EV_THREADS, json!({}));
-    Ok(result)
-}
-
     let _guard = state.time_machine_lock.lock().unwrap();
     let current = {
         let store = state.store.lock().unwrap();
@@ -2667,6 +2652,22 @@ fn restore_time_machine_checkpoint(
         &state.config_dir,
         &checkpoint_id,
         &current,
+        restore_files,
+    )?;
+    {
+        let mut store = state.store.lock().unwrap();
+        if current.is_roaming_guest() {
+            let existing = store.get_mut(&current.id).ok_or("漫游会话不存在")?;
+            *existing = thread;
+        } else {
+            store.threads.push(thread);
+        }
+        store.save();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    Ok(result)
+}
+
 #[tauri::command]
 fn delete_time_machine_context(
     app: tauri::AppHandle,
