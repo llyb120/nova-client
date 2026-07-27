@@ -409,6 +409,12 @@ function contextTokensFromUsage(usage) {
   return input >= cached ? input : input + cached;
 }
 
+function cursorRunUsage(result, lastTurnUsage) {
+  // Stream usage is emitted once per model turn, while wait() reports the cumulative
+  // usage for the whole run. A tool-using prompt can contain several model turns.
+  return result?.usage ?? lastTurnUsage;
+}
+
 function extractTurnConclusion(state, result) {
   const fromResult = String(result?.result ?? "").trim();
   if (fromResult) return fromResult;
@@ -1298,7 +1304,7 @@ async function main() {
           if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
           memory.pendingTurn = "";
           recordSlimTurn(memory, originalMessage, extractTurnConclusion(state, result));
-          const turnUsage = usage ?? result.usage;
+          const turnUsage = cursorRunUsage(result, usage);
           memory.contextTokens = contextTokensFromUsage(turnUsage);
           memory.contextTier = contextPressureTier(memory.contextTokens, contextWindow);
           const inputTokens = Number(turnUsage?.inputTokens ?? turnUsage?.input_tokens) || 0;
@@ -1428,6 +1434,7 @@ export {
   cursorShellProgram,
   cursorTodoPlan,
   contextTokensFromUsage,
+  cursorRunUsage,
   createCursorAgent,
   ensureGlobalTaskDenyHooks,
   extractTurnConclusion,

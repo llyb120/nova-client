@@ -20,6 +20,7 @@ const {
   cursorPromptPrefix,
   cursorModelOptions,
   cursorContextWindow,
+  cursorRunUsage,
   parseCursorModelContextRules,
   cursorShellProgram,
   cursorTodoPlan,
@@ -600,6 +601,13 @@ assert.deepEqual(parseCursorModelContextRules("not-json"), []);
 assert.equal(contextTokensFromUsage({ totalTokens: 900, outputTokens: 100, inputTokens: 800 }), 800);
 assert.equal(contextTokensFromUsage({ input_tokens: 700, output_tokens: 50 }), 700);
 assert.equal(contextTokensFromUsage({ inputTokens: 100, cacheReadTokens: 600, cacheWriteTokens: 100 }), 800);
+const lastCursorTurnUsage = { totalTokens: 300 };
+const cumulativeCursorRunUsage = { totalTokens: 900 };
+assert.equal(
+  cursorRunUsage({ usage: cumulativeCursorRunUsage }, lastCursorTurnUsage),
+  cumulativeCursorRunUsage,
+);
+assert.equal(cursorRunUsage({}, lastCursorTurnUsage), lastCursorTurnUsage);
 
 const conclusionState = createMessageState();
 conclusionState.texts.set("run-assistant-1", "Final answer from the assistant.");
