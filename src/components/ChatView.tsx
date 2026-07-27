@@ -1126,18 +1126,18 @@ export function ChatView() {
                   </button>
                 )}
               </For>
+              <button
+                type="button"
+                class="repo-time-now"
+                classList={{ active: stickToBottom() && !previewItems() }}
+                title="回到当前时间线的最新消息"
+                onClick={() => previewItems() ? returnToCurrentTimeline() : returnToNow()}
+              >
+                <span class="repo-time-now-pulse" />
+                现在
+              </button>
             </div>
           </div>
-          <button
-            type="button"
-            class="repo-time-now"
-            classList={{ active: stickToBottom() && !previewItems() }}
-            title="回到当前时间线的最新消息"
-            onClick={() => previewItems() ? returnToCurrentTimeline() : returnToNow()}
-          >
-            <span class="repo-time-now-pulse" />
-            现在
-          </button>
         </aside>
       </Show>
       <Portal>
