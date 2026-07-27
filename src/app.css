@@ -2279,6 +2279,7 @@ button {
   position: absolute;
   left: 18px;
   bottom: calc(100% + 4px);
+  z-index: 7;
   width: 172px;
   height: 22px;
   overflow: hidden;
