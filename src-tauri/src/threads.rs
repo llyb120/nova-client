@@ -1380,6 +1380,12 @@ pub fn render_handoff_context(
                     turn_users.push(block);
                 }
             }
+            Item::Thought { text, .. } if index >= unfinished_item_start => {
+                let t = truncate_middle(text.trim(), HANDOFF_ASSISTANT_MAX);
+                if !t.trim().is_empty() {
+                    blocks.push(format!("{from_label} 推理：\n{t}"));
+                }
+            }
             Item::Assistant { text, .. } => {
                 let t = truncate_middle(text.trim(), HANDOFF_ASSISTANT_MAX);
                 if !t.trim().is_empty() {
@@ -1811,6 +1817,43 @@ mod tests {
         assert!(context.contains("提示 1"));
         assert!(context.contains("结论 10"));
         assert!(!context.contains("工具轨迹"));
+    }
+
+    #[test]
+    fn handoff_keeps_reasoning_from_an_interrupted_turn() {
+        let items = vec![
+            Item::User {
+                id: 1,
+                text: "检查并修复问题".into(),
+                ts: now_ms(),
+                images: Vec::new(),
+            },
+            Item::Thought {
+                id: 2,
+                text: "需要先读取配置文件".into(),
+                ts: now_ms(),
+            },
+            Item::Tool {
+                id: 3,
+                ts: now_ms(),
+                call: ToolCall {
+                    tool_call_id: "read-1".into(),
+                    title: "read".into(),
+                    kind: "read".into(),
+                    status: "completed".into(),
+                    content: vec![serde_json::json!({ "type": "content", "content": "关键配置" })],
+                    locations: Vec::new(),
+                    raw_input: Some(serde_json::json!({ "path": "config.json" })),
+                    raw_output: None,
+                },
+            },
+        ];
+
+        let context = render_handoff_context(&items, None, "Cursor+", "Cursor+").unwrap();
+
+        assert!(context.contains("Cursor+ 推理：\n需要先读取配置文件"));
+        assert!(context.contains("检查并修复问题"));
+        assert!(context.contains("read"));
     }
 
     #[test]

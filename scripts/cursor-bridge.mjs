@@ -1042,10 +1042,13 @@ async function main() {
   lines.on("line", (line) => {
     const request = JSON.parse(line);
     if (request.action === "cancel") {
-      // Persist the unfinished prompt, assistant output and tool trace before Rust tears down the
-      // bridge. Cursor has no native cross-Agent message restore, so the next fresh Agent receives
-      // this exact working context as part of slim memory.
-      void Promise.resolve(preserveActiveTurn?.()).finally(() => activeRun?.cancel());
+      // Update bridge memory immediately, but keep persistence and SDK cancellation off the user
+      // path. Rust also injects its streamed transcript into the replacement prompt, so this write
+      // is crash recovery rather than a handoff barrier.
+      void Promise.resolve(preserveActiveTurn?.()).catch((error) => {
+        process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      });
+      void Promise.resolve(activeRun?.cancel()).catch(() => {});
       return;
     }
     requests.push(request);
@@ -1118,13 +1121,11 @@ async function main() {
       let completed = false;
       for (let attempt = 0; attempt <= CURSOR_SILENT_RETRIES && !completed; attempt += 1) {
         const state = createMessageState();
-        preserveActiveTurn = async () => {
+        preserveActiveTurn = () => {
           const pendingTurn = pendingTurnContext(previousPendingTurn, originalMessage, state);
-          if (!pendingTurn) return;
+          if (!pendingTurn) return undefined;
           memory.pendingTurn = pendingTurn;
-          await saveSlimMemory(memoryKey, memory).catch((error) => {
-            process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
-          });
+          return saveSlimMemory(memoryKey, memory);
         };
         const turnStartedAt = performance.now();
         let attemptActive = true;

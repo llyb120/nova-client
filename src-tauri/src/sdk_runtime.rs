@@ -466,10 +466,12 @@ impl SdkManager {
             .get(thread_id)
             .map(|bridge| (bridge.stdin.clone(), bridge.pid));
         if let Some((stdin, pid)) = bridge {
-            let _ = write_line(&stdin, &json!({ "action": "cancel" })).await;
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Bridge cancellation and persistence are best-effort only. The replacement prompt
+            // receives the already-streamed transcript from Thread, so do not wait for SDK cleanup.
             if let Some(pid) = pid {
                 crate::acp::kill_process_tree(pid);
+            } else {
+                let _ = write_line(&stdin, &json!({ "action": "cancel" })).await;
             }
             self.running_children.lock().unwrap().remove(thread_id);
         }
@@ -482,6 +484,10 @@ impl SdkManager {
             for item in complete_pending_tools(thread) {
                 let _ = self.emit_update(thread_id, &item);
             }
+            // Force the replacement prompt through Nova's handoff renderer. This captures the
+            // interrupted user message plus all assistant/tool events already streamed to Thread,
+            // independently of the cancelled provider run or its asynchronous memory file.
+            thread.handoff_from = Some(self.adapter.agent_kind());
         }
         store.save();
     }
