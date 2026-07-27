@@ -1292,14 +1292,22 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   const snap = (v: number) => Math.round(v * dpr) / dpr;
 
+  function fillTextCrisp(ctx: CanvasRenderingContext2D, text: string, x: number, y: number) {
+    ctx.fillText(text, snap(x), snap(y));
+  }
+
   function paintAll() {
     const canvas = canvasEl;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d")!;
+    // The transcript is opaque; avoiding an alpha surface improves Chromium's text compositing.
+    const ctx = canvas.getContext("2d", { alpha: false })!;
     const p = pal;
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, viewW, viewH);
+    ctx.textRendering = "optimizeLegibility";
+    ctx.fontKerning = "normal";
+    ctx.fillStyle = p.bg;
+    ctx.fillRect(0, 0, viewW, viewH);
 
     const visTop = scrollY - 50;
     const visBot = scrollY + viewH + 50;
@@ -1394,7 +1402,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           ctx.font = `${b.fontSize}px ${b.font}`;
           ctx.fillStyle = b.color!;
           ctx.textBaseline = "middle";
-          ctx.fillText(b.text!, bx, snap(by + b.h / 2));
+          fillTextCrisp(ctx, b.text!, bx, by + b.h / 2);
           break;
         case "process-border":
         case "tool-body-border":
@@ -1450,7 +1458,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       for (let i = 0; i < lines.length; i++) {
         const tx = bx + 16;
         const ty = by + 10 + imgOffset + i * lh;
-        ctx.fillText(lines[i], tx, snap(ty + halfLead));
+        fillTextCrisp(ctx, lines[i], tx, ty + halfLead);
         b.textLines.push({ text: lines[i], x: tx, y: ty + scrollY, w: measure(lines[i], fs, ff), offset, fs, lh });
         offset += lines[i].length;
       }
@@ -1485,7 +1493,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.font = `${b.fontSize}px ${b.font}`;
     ctx.fillStyle = color;
     ctx.textBaseline = "middle";
-    ctx.fillText(b.text!, bx + padL + iconSize + gap, snap(by + b.h / 2));
+    fillTextCrisp(ctx, b.text!, bx + padL + iconSize + gap, by + b.h / 2);
   }
 
   function paintToolHeader(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette) {
@@ -1512,7 +1520,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       while (label.length > 1 && measure(label + "…", b.fontSize!, b.font!) > maxTextW) label = label.slice(0, -1);
       label += "…";
     }
-    ctx.fillText(label, textX, midY);
+    fillTextCrisp(ctx, label, textX, midY);
 
     // trailing status / chevron sit after the label (not flush-right)
     let nextX = textX + measure(label, b.fontSize!, b.font!) + gap;
@@ -1588,7 +1596,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         const tx = innerX;
         const ty = by + padY + i * lh - bScroll;
         if (ty + lh > by - 10 && ty < by + b.h + 10) {
-          ctx.fillText(lines[i], tx, snap(ty + halfLead));
+          fillTextCrisp(ctx, lines[i], tx, ty + halfLead);
           if (hover && b.data?.underlineOnHover) {
             const tw = measure(lines[i], fs, ff, fw);
             ctx.fillRect(tx, snap(ty + halfLead) + fs, tw, 1);
@@ -1641,7 +1649,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (prefix) {
       ctx.font = `${fs}px ${ff}`;
       ctx.fillStyle = b.color || pal.text;
-      ctx.fillText(prefix, bx, snap(by + halfLead));
+      fillTextCrisp(ctx, prefix, bx, by + halfLead);
     }
 
     if (!segments || segments.length === 0) {
@@ -1652,7 +1660,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         let offset = 0;
         for (let i = 0; i < lines.length; i++) {
           const ty = by + i * lh;
-          ctx.fillText(lines[i], startX, snap(ty + halfLead));
+          fillTextCrisp(ctx, lines[i], startX, ty + halfLead);
           b.textLines.push({ text: lines[i], x: startX, y: ty + scrollY, w: measure(lines[i], fs, ff, baseFw), offset, fs, lh });
           offset += lines[i].length;
         }
@@ -1752,7 +1760,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
         ctx.fillStyle = cs.link ? pal.blue : (b.color || pal.text);
         ctx.font = `${segStyle} ${segFw} ${segFs}px ${segFf}`;
-        ctx.fillText(run, startX + cx + codePad, tySnap);
+        fillTextCrisp(ctx, run, startX + cx + codePad, tySnap);
         if (cs.link) {
           ctx.fillRect(startX + cx + codePad, tySnap + segFs + 1, rw, 1);
         }
@@ -1785,7 +1793,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const tx = bx + padX;
       const ty = by + padY + i * lh;
       if (ty + lh < by - 10 || ty > by + b.h + 10) { offset += lines[i].length + 1; continue; }
-      ctx.fillText(lines[i], tx, snap(ty + halfLead));
+      fillTextCrisp(ctx, lines[i], tx, ty + halfLead);
       b.textLines.push({ text: lines[i], x: tx, y: ty + scrollY, w: measure(lines[i], fs, ff), offset, fs, lh });
       offset += lines[i].length + 1;
     }
@@ -1835,7 +1843,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           let tx = cellX + TABLE_PAD_X;
           if (align === "center") tx = cellX + (cw - tw) / 2;
           else if (align === "right") tx = cellX + cw - TABLE_PAD_X - tw;
-          ctx.fillText(line, tx, snap(textTop + li * lineH));
+          fillTextCrisp(ctx, line, tx, textTop + li * lineH);
           // Per cell visual line: selection hit/paint follows column x, not row-joined text
           const charX: number[] = new Array(line.length + 1);
           for (let ci = 0; ci <= line.length; ci++) {
@@ -2285,6 +2293,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     const ro = new ResizeObserver(() => { resizeCanvas(); rebuild(); });
     ro.observe(canvasEl);
+
+    // Rebuild fallback-font measurements after bundled web fonts become available.
+    void document.fonts.ready.then(() => {
+      _mCache.clear();
+      scheduleRebuild();
+    });
 
     const mo = new MutationObserver(rebuild);
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
