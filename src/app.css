@@ -4776,6 +4776,10 @@ body,
   color: var(--text-dim);
   position: relative;
 }
+.head-badge > svg {
+  display: block;
+  flex-shrink: 0;
+}
 button.head-badge:hover {
   background: var(--bg-hover);
   color: var(--text);
@@ -4787,9 +4791,14 @@ button.head-badge:hover {
   color: var(--text-faint);
 }
 .relay-count {
+  display: inline-flex;
+  align-items: center;
+  height: 14px; /* 与 IconBroadcast size={14} 同高 */
   font-size: 10.5px;
   font-weight: 600;
   line-height: 1;
+  /* Inter 等字体数字墨水在 em 盒偏上；几何居中会看起来比图标高 */
+  transform: translateY(1.5px);
 }
 
 /* 天线图标 hover：展示本群组在线的人 */
@@ -4876,9 +4885,13 @@ button.head-badge:hover {
   50% { opacity: 0.45; }
 }
 .badge-count {
+  display: inline-flex;
+  align-items: center;
+  height: 14px;
   font-size: 10.5px;
   font-weight: 600;
   line-height: 1;
+  transform: translateY(1.5px);
 }
 
 .ctx-sep {
