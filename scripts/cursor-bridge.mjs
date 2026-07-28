@@ -43,6 +43,7 @@ const TERMINAL_RUN_STATUSES = new Set(["completed", "finished", "error", "failed
 const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTUP_TIMEOUT_MS, 120_000);
 const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
+const CURSOR_SILENT_RETRY_DELAYS_MS = [1_000, 3_000];
 const CURSOR_CREATE_RETRY_DELAYS_MS = [1_000, 3_000, 7_000];
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
 const CURSOR_DEFAULT_CONTEXT_WINDOW = positiveInteger(process.env.NOVA_CURSOR_CONTEXT_WINDOW, 128_000);
@@ -124,7 +125,7 @@ function isRetryableCursorError(error) {
       break;
     }
   }
-  return /API key exchange endpoint|fetch failed|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|socket hang up|other side closed|premature close|network connection lost|\b429\b|\b5\d\d\b/i
+  return /API key exchange endpoint|fetch failed|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|socket hang up|other side closed|premature close|network connection lost|NGHTTP2_REFUSED_STREAM|\b429\b|\b5\d\d\b/i
     .test(details.join("\n"));
 }
 
@@ -1454,10 +1455,16 @@ async function main() {
             throw error;
           }
           attemptActive = false;
+          const retryDelayMs = CURSOR_SILENT_RETRY_DELAYS_MS[attempt]
+            ?? CURSOR_SILENT_RETRY_DELAYS_MS.at(-1);
           sendTiming("silent_retry", turnStartedAt, {
             attempt: attempt + 1,
+            delayMs: retryDelayMs,
             reason: error instanceof CursorStartupTimeout ? "startup_timeout" : "retryable_error",
           });
+          if (retryDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+          }
           const recovery = await recoverTimedOutAgent(
             agent,
             activeRun,

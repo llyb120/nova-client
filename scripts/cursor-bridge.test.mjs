@@ -260,6 +260,13 @@ assert.equal(isRetryableCursorError({
   cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
 }), true);
 assert.equal(isRetryableCursorError({ code: "aborted", message: "stream aborted" }), true);
+assert.equal(isRetryableCursorError({
+  rawMessage: "Stream closed with error code NGHTTP2_REFUSED_STREAM",
+  code: 13,
+  cause: Object.assign(new Error("Stream closed with error code NGHTTP2_REFUSED_STREAM"), {
+    code: "ERR_HTTP2_STREAM_ERROR",
+  }),
+}), true);
 assert.equal(shouldSilentRetryCursorTurn(
   Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
   { producedOutput: false, attempt: 0 },
