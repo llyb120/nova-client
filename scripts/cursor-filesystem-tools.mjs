@@ -218,13 +218,14 @@ export function createCursorFilesystemTools(cwd, options = {}) {
           const reason = writes[failed].reason;
           throw reason instanceof Error ? reason : new Error(String(reason));
         }
-        return {
-          content: [{ type: "text", text: `已并行智能编辑 ${prepared.length} 个文件` }],
-          structuredContent: {
-            paths: prepared.map((file) => file.path),
-            matches: prepared.map((file) => ({ path: file.path, edits: file.matches })),
-          },
-        };
+        // Return a JSON string (same as read_files). Object returns with nested
+        // undefined break Cursor SDK/MCP protobuf Value decoding even after a
+        // successful write, which made edit_files look "always failed".
+        return JSON.stringify({
+          message: `已并行智能编辑 ${prepared.length} 个文件`,
+          paths: prepared.map((file) => file.path),
+          matches: prepared.map((file) => ({ path: file.path, edits: file.matches })),
+        });
       },
     };
   }

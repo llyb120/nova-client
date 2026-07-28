@@ -177,7 +177,12 @@ function fuzzyCandidates(targetLines, patternLines) {
 function locateEdit(content, oldText, path, editIndex, totalEdits) {
   if (!oldText) throw new Error(`${totalEdits === 1 ? "oldText" : `edits[${editIndex}].oldText`} must not be empty in ${path}.`);
   const exact = findOccurrences(content, oldText);
-  if (exact.length === 1) return { index: exact[0], length: oldText.length, mode: "exact", newTextRebaser: (text) => text };
+  if (exact.length === 1) {
+    const index = exact[0];
+    // Exact matches previously omitted line; Cursor protobuf cannot encode undefined.
+    const line = content.slice(0, index).split("\n").length - 1;
+    return { index, length: oldText.length, mode: "exact", line, newTextRebaser: (text) => text };
+  }
   if (exact.length > 1) throw new Error(`Found ${exact.length} occurrences of ${totalEdits === 1 ? "the text" : `edits[${editIndex}]`} in ${path}. Add context to make oldText unique.`);
 
   const table = buildLineTable(content);
@@ -252,10 +257,11 @@ export function applySmartEdits(content, edits, path) {
   if (output === content) throw new Error(`No changes made to ${path}.`);
   return {
     content: output,
+    // Omit undefined fields — Cursor SDK/MCP encodes results as protobuf Value.
     matches: matches.map(({ editIndex, mode, line }) => ({
       editIndex,
       mode,
-      line: line === undefined ? undefined : line + 1,
+      ...(line === undefined ? {} : { line: line + 1 }),
     })),
   };
 }
