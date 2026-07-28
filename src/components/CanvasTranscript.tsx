@@ -716,10 +716,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let selecting = false;
   let selStart: { block: number; offset: number } | null = null;
 
-  // scroll physics
-  let velocityY = 0;
+  // render loop (busy spinners)
   let rafId = 0;
-  let lastWheelTime = 0;
 
   // custom scrollbar drag (drawn on canvas; not a DOM control)
   let scrollDragging = false;
@@ -2130,7 +2128,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function onMouseDown(e: MouseEvent) {
     if (e.button !== 0) return;
-    velocityY = 0;
 
     const sb = hitScrollbar(e.clientX, e.clientY);
     if (sb) {
@@ -2221,8 +2218,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     scrollY = Math.max(0, Math.min(maxScroll, scrollY + dy));
     keepBottom = maxScroll - scrollY <= 2;
-    velocityY = dy * 0.3;
-    lastWheelTime = performance.now();
     if (editing()) {
       setEditStyle({
         left: `${editLayoutSide}px`,
@@ -2242,7 +2237,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     e.clipboardData?.setData("text/plain", text);
   }
 
-  // ─── Scroll physics & render loop ─────────────────────────────────────────
+  // ─── Render loop ──────────────────────────────────────────────────────────
 
   function requestRender() {
     if (rafId) return;
@@ -2251,16 +2246,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function tick() {
     rafId = 0;
-    if (Math.abs(velocityY) > 0.5) {
-      scrollY = Math.max(0, Math.min(maxScroll, scrollY + velocityY));
-      velocityY *= 0.92;
-      keepBottom = maxScroll - scrollY <= 2;
-      props.onScroll?.(scrollY, maxScroll, true);
-      paintAll();
-      requestRender();
-    } else if (hasBusy) {
-      paintAll();
-    }
+    if (hasBusy) paintAll();
   }
 
   // ─── Image loading ─────────────────────────────────────────────────────────
@@ -2427,7 +2413,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (switchedThread) {
       renderedThreadId = threadId;
       layoutGeneration++;
-      velocityY = 0;
       selection = null;
       groupYs = [];
       scrollY = 0;
