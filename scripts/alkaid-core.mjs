@@ -11,10 +11,11 @@ import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createReadStream, existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { Readable } from "node:stream";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { searchSessionHistory } from "./session-history-search.mjs";
 
@@ -410,8 +411,58 @@ export async function runAlkaidPromptWithRetry(agent, input, images, options = {
   }
 }
 
+function swapUtf16Bytes(buffer) {
+  const swapped = Buffer.from(buffer);
+  for (let i = 0; i + 1 < swapped.length; i += 2) {
+    [swapped[i], swapped[i + 1]] = [swapped[i + 1], swapped[i]];
+  }
+  return swapped;
+}
+
+function detectTextEncoding(buffer) {
+  if (buffer[0] === 0xff && buffer[1] === 0xfe) return { encoding: "utf16le", bomBytes: 2 };
+  if (buffer[0] === 0xfe && buffer[1] === 0xff) return { encoding: "utf16be", bomBytes: 2 };
+  if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) return { encoding: "utf8", bomBytes: 3 };
+
+  // Infer BOM-less UTF-16 only when NUL bytes strongly alternate. This avoids
+  // treating ordinary UTF-8 text containing an occasional NUL as UTF-16.
+  const sampleLength = Math.min(buffer.length, 512);
+  let evenNuls = 0;
+  let oddNuls = 0;
+  for (let i = 0; i < sampleLength; i += 1) {
+    if (buffer[i] !== 0) continue;
+    if (i % 2 === 0) evenNuls += 1;
+    else oddNuls += 1;
+  }
+  const pairs = Math.floor(sampleLength / 2);
+  if (pairs >= 4 && oddNuls / pairs > 0.6 && evenNuls / pairs < 0.1) return { encoding: "utf16le", bomBytes: 0 };
+  if (pairs >= 4 && evenNuls / pairs > 0.6 && oddNuls / pairs < 0.1) return { encoding: "utf16be", bomBytes: 0 };
+  return { encoding: "utf8", bomBytes: 0 };
+}
+
+export function decodeTextBuffer(buffer) {
+  const { encoding, bomBytes } = detectTextEncoding(buffer);
+  const content = buffer.subarray(bomBytes);
+  return encoding === "utf16be"
+    ? swapUtf16Bytes(content).toString("utf16le")
+    : content.toString(encoding);
+}
+
 async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES, maxBytes = READ_FILES_MAX_BYTES) {
-  const input = createReadStream(path, { encoding: "utf8" });
+  let input;
+  const file = await open(path, "r");
+  try {
+    const sample = Buffer.alloc(512);
+    const { bytesRead } = await file.read(sample, 0, sample.length, 0);
+    const { encoding, bomBytes } = detectTextEncoding(sample.subarray(0, bytesRead));
+    if (encoding === "utf16be") {
+      input = createReadStreamFromText(decodeTextBuffer(await readFile(path)));
+    } else {
+      input = createReadStream(path, { encoding, start: bomBytes });
+    }
+  } finally {
+    await file.close();
+  }
   const lines = createInterface({ input, crlfDelay: Infinity });
   const content = [];
   let lineNumber = 0;
@@ -445,6 +496,10 @@ async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES,
     truncated,
     nextOffset: truncated ? offset + Math.max(content.length, 1) : undefined,
   };
+}
+
+function createReadStreamFromText(text) {
+  return Readable.from([text]);
 }
 
 export function createFilesystemTools(cwd, editTool = null) {
@@ -759,9 +814,21 @@ export async function createAlkaidAgent(options = {}) {
   const mcp = await connectMcpServers(options.mcpServers, cwd);
   const detectedShellConfig = options.readOnly ? null : (options.shellConfig ?? detectAlkaidShellConfig());
   const shellConfig = detectedShellConfig && resolveAlkaidShellConfig(detectedShellConfig);
+  const readOperations = {
+    access,
+    async readFile(path) {
+      const buffer = await readFile(path);
+      return IMAGE_MEDIA_TYPES[extname(path).toLowerCase()]
+        ? buffer
+        : Buffer.from(decodeTextBuffer(buffer), "utf8");
+    },
+    detectImageMimeType(path) {
+      return IMAGE_MEDIA_TYPES[extname(path).toLowerCase()];
+    },
+  };
   const codingTools = options.readOnly
-    ? createReadOnlyTools(cwd)
-    : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell } });
+    ? createReadOnlyTools(cwd, { read: { operations: readOperations } })
+    : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell }, read: { operations: readOperations } });
   const editTool = codingTools.find((tool) => tool.name === "edit");
   const batchTools = createFilesystemTools(cwd, editTool);
   const historyRoots = [

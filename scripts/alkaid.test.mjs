@@ -23,6 +23,7 @@ import {
   createAlkaidAgent,
   createAlkaidIdleTimeout,
   createFilesystemTools,
+  decodeTextBuffer,
   detectAlkaidShellConfig,
   expandAlkaidSkillCommand,
   findWindowsPowerShell,
@@ -630,6 +631,12 @@ test("provider retries stop after the configured hidden attempts", async () => {
   assert.equal(agent.state.messages.length, 2);
 });
 
+test("text decoding handles PowerShell UTF-16 output", () => {
+  const text = "diff --git a/chat.tsx b/chat.tsx\r\n你好";
+  assert.equal(decodeTextBuffer(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")])), text);
+  assert.equal(decodeTextBuffer(Buffer.from(text, "utf16le")), text);
+});
+
 test("tool display tolerates malformed edit_files arguments", () => {
   const item = startedToolItem({
     toolCallId: "edit-1",
@@ -650,6 +657,11 @@ test("batch file tools remain available as Alkaid enhancements", async () => {
     { path: "a.txt", content: "A" },
     { path: "b.txt", content: "B" },
   ]);
+  const utf16Path = join(cwd, "powershell.diff");
+  const utf16Text = "diff --git a/a.txt b/a.txt\r\n你好";
+  await writeFile(utf16Path, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(utf16Text, "utf16le")]));
+  const utf16Read = JSON.parse((await readFiles.execute("utf16", { paths: ["powershell.diff"] })).content[0].text)[0];
+  assert.equal(utf16Read.content, utf16Text.replace(/\r\n/g, "\n"));
   await editFiles.execute("2", { files: [
     { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] },
     { path: "b.txt", edits: [{ oldText: "B", newText: "BB" }] },
