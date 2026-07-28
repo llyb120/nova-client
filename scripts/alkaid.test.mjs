@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendil-works/pi-coding-agent";
+import { startedToolItem } from "./alkaid-bridge-common.mjs";
 import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
 import { ALKAID_PROVIDER_DIAGNOSTIC_LOG, alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
 import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
@@ -627,6 +628,16 @@ test("provider retries stop after the configured hidden attempts", async () => {
   assert.equal(outcome.retries, 2);
   assert.equal(outcome.last.errorMessage, "terminated");
   assert.equal(agent.state.messages.length, 2);
+});
+
+test("tool display tolerates malformed edit_files arguments", () => {
+  const item = startedToolItem({
+    toolCallId: "edit-1",
+    toolName: "edit_files",
+    args: { files: { path: "a.txt" } },
+  });
+  assert.equal(item.type, "file_change");
+  assert.deepEqual(item.changes, []);
 });
 
 test("batch file tools remain available as Alkaid enhancements", async () => {

@@ -46,6 +46,7 @@ export function saveMessages(sessionId, messages) {
 
 export function startedToolItem(event) {
   const fileChange = event.toolName === "edit" || event.toolName === "write" || event.toolName === "edit_files";
+  const args = event.args && typeof event.args === "object" ? event.args : {};
   let type = "mcp_tool_call";
   let command;
   let server = "Vega";
@@ -53,14 +54,17 @@ export function startedToolItem(event) {
   let changes;
   if (event.toolName === "bash") {
     type = "command_execution";
-    command = event.args.command;
+    command = args.command;
   } else if (event.toolName.startsWith("mcp__")) {
     [, server, tool] = event.toolName.split("__");
   } else if (fileChange) {
     type = "file_change";
-    changes = event.toolName === "edit_files"
-      ? (event.args.files ?? []).map((file) => ({ path: file.path, kind: "update" }))
-      : [{ path: event.args.path, kind: "update" }];
+    const files = event.toolName === "edit_files"
+      ? (Array.isArray(args.files) ? args.files : [])
+      : [args];
+    changes = files
+      .filter((file) => file && typeof file.path === "string")
+      .map((file) => ({ path: file.path, kind: "update" }));
   }
   return {
     id: event.toolCallId,
