@@ -1445,6 +1445,7 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
     if (resumedFireStep && fireRelaySteps.get(threadId) === resumedFireStep) {
       fireRelaySteps.delete(threadId);
       suspendedFireRelaySteps.set(threadId, resumedFireStep);
+      persistFireRelayState();
     }
     setState("running", threadId, false);
     throw e;
@@ -1470,7 +1471,60 @@ const fireRelayStepHistory = new Map<string, FireRelayStep>();
 // 分叉流程，也避免中断事件遗留的 active 记录挡住最后阶段恢复。
 const latestFireThreadByRoot = new Map<string, string>();
 const completedFireRoots = new Set<string>();
+const FIRE_RELAY_STATE_KEY = "fd:fireRelayState:v1";
 const FIRE_MAX_ATTEMPTS = 20;
+
+type PersistedFireRelayState = {
+  steps: [string, FireRelayStep][];
+  latest: [string, string][];
+  completed: string[];
+};
+
+function persistFireRelayState() {
+  const steps = new Map(fireRelayStepHistory);
+  for (const [threadId, step] of fireRelaySteps) steps.set(threadId, step);
+  for (const [threadId, step] of suspendedFireRelaySteps) steps.set(threadId, step);
+  const snapshot: PersistedFireRelayState = {
+    steps: [...steps],
+    latest: [...latestFireThreadByRoot],
+    completed: [...completedFireRoots],
+  };
+  try {
+    localStorage.setItem(FIRE_RELAY_STATE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // 持久化失败不能打断当前 Fire 流程；本次窗口内仍由内存状态继续跟踪。
+  }
+}
+
+function restoreFireRelayState() {
+  try {
+    const snapshot = JSON.parse(
+      localStorage.getItem(FIRE_RELAY_STATE_KEY) ?? "null",
+    ) as PersistedFireRelayState | null;
+    if (!snapshot || !Array.isArray(snapshot.steps) || !Array.isArray(snapshot.latest)) return;
+    for (const [threadId, step] of snapshot.steps) {
+      if (
+        !threadId || !step?.rootId || !step.goal ||
+        (step.role !== "work" && step.role !== "judge") ||
+        !Number.isInteger(step.attempt)
+      ) continue;
+      // 重启时不能假定上次正在执行的 turn 已正常结束，统一按暂停恢复，避免把
+      // 半截回复直接送去验收；用户继续该会话后仍会回到完整 Fire 流程。
+      suspendedFireRelaySteps.set(threadId, step);
+      fireRelayStepHistory.set(threadId, step);
+    }
+    for (const [rootId, threadId] of snapshot.latest) {
+      if (rootId && threadId) latestFireThreadByRoot.set(rootId, threadId);
+    }
+    if (Array.isArray(snapshot.completed)) {
+      for (const rootId of snapshot.completed) if (rootId) completedFireRoots.add(rootId);
+    }
+  } catch {
+    localStorage.removeItem(FIRE_RELAY_STATE_KEY);
+  }
+}
+
+restoreFireRelayState();
 
 type ParsedFireInput = {
   goal: string;
@@ -1556,6 +1610,7 @@ function resumeFireRelay(threadId: string): FireRelayStep | null {
     // 标题恢复不应阻塞用户刚提交的提示。
     void api.renameThread(threadId, fireStepTitle(step)).then(refreshThreads).catch(() => {});
   }
+  persistFireRelayState();
   return step;
 }
 
@@ -1582,6 +1637,7 @@ async function createFireThread(
   fireRelaySteps.set(thread.id, step);
   fireRelayStepHistory.set(thread.id, step);
   latestFireThreadByRoot.set(step.rootId, thread.id);
+  persistFireRelayState();
   await refreshThreads();
   // 用户正在看这条 Fire 链时才切到新阶段；看别的会话时后台继续跑。
   if (isViewingFireChain(step.rootId)) await openThread(thread.id);
@@ -1604,6 +1660,7 @@ async function advanceFireRelay(threadId: string) {
   const step = fireRelaySteps.get(threadId);
   if (!step) return;
   fireRelaySteps.delete(threadId);
+  persistFireRelayState();
   const thread = await api.getThread(threadId);
   if (step.role === "work") {
     const conclusion = fireConclusion(thread);
@@ -1618,6 +1675,7 @@ async function advanceFireRelay(threadId: string) {
   const verdict = fireConclusion(thread);
   if (/FIRE_ACCEPTED\s*$/i.test(verdict)) {
     completedFireRoots.add(step.rootId);
+    persistFireRelayState();
     await api.renameThread(thread.id, `[Fire] 判断 ${step.attempt} · 符合`);
     await refreshThreads();
     await api.notifyFireDone(thread.id, true);
@@ -1625,6 +1683,7 @@ async function advanceFireRelay(threadId: string) {
   }
   if (step.attempt >= FIRE_MAX_ATTEMPTS) {
     completedFireRoots.add(step.rootId);
+    persistFireRelayState();
     await api.renameThread(thread.id, `[Fire] 判断 ${step.attempt} · 已停止`);
     await refreshThreads();
     await api.notifyFireDone(thread.id, false);
@@ -1648,10 +1707,10 @@ async function suspendFireRelay(threadId: string, manual: boolean) {
   if (!step) return;
   fireRelaySteps.delete(threadId);
   suspendedFireRelaySteps.set(threadId, step);
-  await api.renameThread(threadId, fireStepTitle(step, manual ? "已中断" : "异常中断"));
+  persistFireRelayState();
+  await api.renameThread(threadId, fireStepTitle(step, manual ? "已暂停" : "异常暂停"));
   await refreshThreads();
-  // 手动停止仍代表本次 Fire 已结束；异常（例如网络错误）只暂停，不误报完成。
-  if (manual) await api.notifyFireDone(threadId, false);
+  // 手动停止和异常都只暂停当前阶段，不结束 Fire。用户继续发送后会恢复自动验收。
 }
 
 export async function startFireRelay(
@@ -1685,6 +1744,7 @@ export async function startFireRelay(
   fireRelaySteps.set(rootId, rootStep);
   fireRelayStepHistory.set(rootId, rootStep);
   latestFireThreadByRoot.set(rootId, rootId);
+  persistFireRelayState();
   await refreshThreads();
   // 远程或其它非 Composer 入口启动时，用户可能正在看别的会话；必须发到 rootId。
   if (state.currentId === rootId) bumpChatScrollToBottom();
@@ -1696,6 +1756,7 @@ export async function startFireRelay(
     if (fireRelaySteps.get(rootId) === rootStep) {
       fireRelaySteps.delete(rootId);
       suspendedFireRelaySteps.set(rootId, rootStep);
+      persistFireRelayState();
     }
     setState("running", rootId, false);
     throw e;
