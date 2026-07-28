@@ -327,6 +327,19 @@ impl SdkManager {
                 format!("{} 请求失败：{error}", self.adapter.label()),
                 "error",
             );
+            // Cursor super context keeps its own completed-history lifecycle. Treat an SDK error
+            // as an unfinished same-agent handoff so the next prompt also receives the failed user
+            // request and every assistant/tool item that reached Thread before the bridge exited.
+            let state = self.app.state::<AppState>();
+            let cursor_super_context = self.adapter.agent_kind() == AgentKind::Cursor
+                && state.settings.lock().unwrap().cursor_context_mode == "super";
+            if cursor_super_context {
+                let mut store = state.store.lock().unwrap();
+                if let Some(thread) = store.get_mut(&thread_id) {
+                    thread.handoff_from = Some(AgentKind::Cursor);
+                }
+                store.save();
+            }
         }
         self.finish_turn_if_current(
             &thread_id,
