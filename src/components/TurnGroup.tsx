@@ -110,9 +110,16 @@ export function turnTokenTitle(t: TurnItem | undefined | null): string | undefin
 
   // inputTokens 是总输入量，包含缓存命中和缓存写入。悬浮明细拆成
   // 四个互斥类别，避免把缓存 token 同时算进“读取”和缓存项。
+  // 「读取」「写入」只表示未命中缓存的输入 / 模型输出。
+  const input = t.inputTokens ?? 0;
   const cacheRead = t.cacheReadTokens ?? 0;
   const cacheWrite = t.cacheWriteTokens ?? 0;
-  const read = Math.max(0, (t.inputTokens ?? 0) - cacheRead - cacheWrite);
+  const cached = cacheRead + cacheWrite;
+  // 旧 Cursor 轮次曾把 cache 加进 inputTokens 两次（≈ uncached + 2*cache）。
+  let read = Math.max(0, input - cached);
+  if (cached > 0 && input >= cached * 2) {
+    read = Math.max(0, input - cached * 2);
+  }
   const parts = [
     `读取 ${fmtTokens(read)}`,
     `写入 ${fmtTokens(t.outputTokens ?? 0)}`,

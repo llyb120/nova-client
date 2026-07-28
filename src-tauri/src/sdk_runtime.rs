@@ -1762,6 +1762,30 @@ mod tests {
     }
 
     #[test]
+    fn cursor_usage_does_not_double_count_inclusive_input_tokens() {
+        // inputTokens already includes cache; totalTokens ≈ input + output.
+        let raw = json!({
+            "inputTokens": 440,
+            "outputTokens": 20,
+            "cacheReadTokens": 300,
+            "cacheWriteTokens": 40,
+            "totalTokens": 460
+        });
+        let (usage, _) = CursorAdapter.normalize_usage(Some(&raw), None, None);
+
+        assert_eq!(
+            usage,
+            Some(json!({
+                "inputTokens": 440,
+                "outputTokens": 20,
+                "totalTokens": 460,
+                "cacheReadTokens": 300,
+                "cacheWriteTokens": 40
+            }))
+        );
+    }
+
+    #[test]
     fn claude_style_usage_includes_cached_input_and_rejects_partial_data() {
         let raw = json!({
             "input_tokens": 100,

@@ -1029,7 +1029,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                     setVegaContextMode(e.currentTarget.value === "super" ? "super" : "default")
                   }
                 >
-                  <option value="default">默认（Reasonix）</option>
+                  <option value="default">默认</option>
                   <option value="super">超级（旧版超级上下文）</option>
                 </select>
                 <span class="field-hint">
@@ -1045,7 +1045,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                     setCursorContextMode(e.currentTarget.value === "super" ? "super" : "default")
                   }
                 >
-                  <option value="default">默认（Reasonix）</option>
+                  <option value="default">默认</option>
                   <option value="super">超级（旧版超级上下文）</option>
                 </select>
                 <span class="field-hint">

@@ -22,6 +22,7 @@ const {
   cursorContextWindow,
   cursorRunUsage,
   mergeCursorUsage,
+  normalizeCursorUsageForNova,
   parseCursorModelContextRules,
   cursorShellProgram,
   cursorTodoPlan,
@@ -637,6 +638,54 @@ assert.equal(cursorRunUsage({ usage: { totalTokens: 0 } }, cumulativeCursorRunUs
 // Occupancy must track the latest model turn, not the summed billing total.
 assert.equal(contextTokensFromUsage(lastCursorTurnUsage), 300);
 assert.equal(contextTokensFromUsage(cumulativeCursorRunUsage), 570);
+// Exclusive fields stay exclusive; inclusive inputTokens are stripped before Nova adds cache.
+assert.deepEqual(
+  normalizeCursorUsageForNova({
+    inputTokens: 100,
+    outputTokens: 20,
+    cacheReadTokens: 200,
+    cacheWriteTokens: 0,
+    totalTokens: 320,
+  }),
+  {
+    inputTokens: 100,
+    outputTokens: 20,
+    cacheReadTokens: 200,
+    cacheWriteTokens: 0,
+    totalTokens: 320,
+  },
+);
+assert.deepEqual(
+  normalizeCursorUsageForNova({
+    inputTokens: 300,
+    outputTokens: 20,
+    cacheReadTokens: 200,
+    cacheWriteTokens: 0,
+    totalTokens: 320,
+  }),
+  {
+    inputTokens: 100,
+    outputTokens: 20,
+    cacheReadTokens: 200,
+    cacheWriteTokens: 0,
+    totalTokens: 320,
+  },
+);
+assert.deepEqual(
+  normalizeCursorUsageForNova({
+    inputTokens: 124_616,
+    outputTokens: 1_653,
+    cacheReadTokens: 114_816,
+    cacheWriteTokens: 0,
+  }),
+  {
+    inputTokens: 9_800,
+    outputTokens: 1_653,
+    cacheReadTokens: 114_816,
+    cacheWriteTokens: 0,
+    totalTokens: 126_269,
+  },
+);
 
 const conclusionState = createMessageState();
 conclusionState.texts.set("run-assistant-1", "Final answer from the assistant.");

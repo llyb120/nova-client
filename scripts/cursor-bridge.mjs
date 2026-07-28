@@ -450,6 +450,42 @@ function cursorRunUsage(result, accumulatedStreamUsage) {
   return accumulatedStreamUsage;
 }
 
+/**
+ * Normalize Cursor usage to disjoint fields before Nova's adapter adds cache into inputTokens.
+ * Some payloads already include cache in inputTokens (total ≈ input+output); others keep
+ * input/cache mutually exclusive (total ≈ input+output+cache). Always emit the exclusive shape.
+ */
+function normalizeCursorUsageForNova(usage) {
+  if (!usage || typeof usage !== "object") return usage;
+  const input = cursorUsageField(usage, "inputTokens", "input_tokens");
+  const output = cursorUsageField(usage, "outputTokens", "output_tokens");
+  const cacheRead = cursorUsageField(usage, "cacheReadTokens", "cache_read_tokens");
+  const cacheWrite = cursorUsageField(usage, "cacheWriteTokens", "cache_write_tokens");
+  const cached = cacheRead + cacheWrite;
+  const reportedTotal = Number(usage.totalTokens ?? usage.total_tokens) || 0;
+
+  let uncached = input;
+  if (cached > 0) {
+    const exclusiveTotal = input + output + cached;
+    const inclusiveTotal = input + output;
+    const inclusiveLikely = reportedTotal > 0
+      ? Math.abs(reportedTotal - inclusiveTotal) < Math.abs(reportedTotal - exclusiveTotal)
+      : input >= cached;
+    if (inclusiveLikely) uncached = Math.max(0, input - cached);
+  }
+
+  const normalized = {
+    inputTokens: uncached,
+    outputTokens: output,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: cacheWrite,
+    totalTokens: uncached + output + cacheRead + cacheWrite,
+  };
+  const reasoning = cursorUsageField(usage, "reasoningTokens", "reasoning_tokens");
+  if (reasoning > 0) normalized.reasoningTokens = reasoning;
+  return normalized;
+}
+
 function extractTurnConclusion(state, result) {
   const fromResult = String(result?.result ?? "").trim();
   if (fromResult) return fromResult;
@@ -1409,7 +1445,7 @@ async function main() {
           await saveSlimMemory(memoryKey, memory).catch((error) => {
             process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
-          send({ type: "done", usage: turnUsage });
+          send({ type: "done", usage: normalizeCursorUsageForNova(turnUsage) });
           completed = true;
         } catch (error) {
           const retryable = shouldSilentRetryCursorTurn(error, { producedOutput, attempt });
@@ -1496,6 +1532,7 @@ export {
   contextTokensFromUsage,
   cursorRunUsage,
   mergeCursorUsage,
+  normalizeCursorUsageForNova,
   createCursorAgent,
   ensureGlobalTaskDenyHooks,
   extractTurnConclusion,
