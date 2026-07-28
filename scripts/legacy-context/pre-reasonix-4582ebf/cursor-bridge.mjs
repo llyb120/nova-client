@@ -45,9 +45,10 @@ const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RET
 const CURSOR_CREATE_RETRY_DELAYS_MS = [1_000, 3_000, 7_000];
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
 const CURSOR_SLIM_MEMORY_TURNS = positiveInteger(process.env.NOVA_CURSOR_SLIM_MEMORY_TURNS, 10);
-const CURSOR_CONTEXT_WINDOW = positiveInteger(process.env.NOVA_CURSOR_CONTEXT_WINDOW, 128_000);
-const CURSOR_CONTEXT_THRESHOLD = Math.max(2_000, Math.floor(CURSOR_CONTEXT_WINDOW * 0.8));
-const CURSOR_CONTEXT_CHAR_THRESHOLD = Math.max(8_000, Math.floor(CURSOR_CONTEXT_WINDOW * 0.8));
+const CURSOR_DEFAULT_CONTEXT_WINDOW = positiveInteger(process.env.NOVA_CURSOR_CONTEXT_WINDOW, 128_000);
+const CURSOR_MODEL_CONTEXT_RULES = parseCursorModelContextRules(process.env.NOVA_CURSOR_MODEL_CONTEXTS);
+const CURSOR_CONTEXT_THRESHOLD = Math.max(2_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.75));
+const CURSOR_CONTEXT_CHAR_THRESHOLD = Math.max(8_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.75));
 const CURSOR_SLIM_MEMORY_DIR = process.env.NOVA_CURSOR_SLIM_MEMORY_DIR
   || join(process.env.NOVA_DATA_DIR || join(homedir(), ".nova"), "cursor-slim-memory");
 const CURSOR_USER_DIR = process.env.NOVA_CURSOR_USER_DIR || join(homedir(), ".cursor");
@@ -63,6 +64,36 @@ const NOVA_DENY_TASK_SCRIPT_SOURCE = `process.stdout.write(JSON.stringify({
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value ?? "", 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function parseCursorModelContextRules(value) {
+  try {
+    const parsed = JSON.parse(value || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((rule) => ({
+        prefix: String(rule?.prefix ?? "").trim().toLowerCase(),
+        contextWindow: positiveInteger(rule?.contextWindow, 0),
+      }))
+      .filter((rule) => rule.prefix && rule.contextWindow >= 2_000)
+      .sort((left, right) => right.prefix.length - left.prefix.length);
+  } catch {
+    return [];
+  }
+}
+
+function cursorContextWindow(model, rules = CURSOR_MODEL_CONTEXT_RULES, fallback = CURSOR_DEFAULT_CONTEXT_WINDOW) {
+  const modelId = String(model ?? "").trim().toLowerCase();
+  return rules.find((rule) => modelId.includes(rule.prefix))?.contextWindow ?? fallback;
+}
+
+function contextThresholdsForModel(model) {
+  const contextWindow = cursorContextWindow(model);
+  return {
+    contextWindow,
+    maxTokens: Math.max(2_000, Math.floor(contextWindow * 0.75)),
+    maxChars: Math.max(8_000, Math.floor(contextWindow * 0.75)),
+  };
 }
 
 function isRetryableCursorError(error) {
@@ -395,6 +426,7 @@ async function compressSlimMemory(memory, summarize, {
 }
 
 async function summarizeSlimMemory(memory, request, sdk = Agent) {
+  const { maxTokens, maxChars } = contextThresholdsForModel(request?.model);
   return compressSlimMemory(memory, async (earlierTurns) => {
     const agent = await sdk.create({
       apiKey: process.env.CURSOR_API_KEY,
@@ -415,6 +447,10 @@ async function summarizeSlimMemory(memory, request, sdk = Agent) {
     } finally {
       agent.close();
     }
+  }, {
+    maxChars,
+    maxTokens,
+    currentTokens: memory.contextTokens ?? 0,
   });
 }
 
@@ -1104,6 +1140,7 @@ async function main() {
 
       const readOnly = request.mode === "plan";
       const originalMessage = await promptMessage(request.parts);
+      const { maxTokens: contextThreshold, maxChars: contextCharThreshold } = contextThresholdsForModel(request.model);
       // Build the SDK prompt before marking this turn pending, otherwise it would replay itself.
       // Persist first so even Agent.create/SDK initialization failures retain the user's request.
       const previousPendingTurn = memory.pendingTurn;
@@ -1204,8 +1241,8 @@ async function main() {
           if (memory.contextStage === "full") {
             const fullContextChars = formatSlimMemory(memory).length;
             if (memory.turns.length >= CURSOR_SLIM_MEMORY_TURNS
-              || (measuredTokens > 0 && measuredTokens >= CURSOR_CONTEXT_THRESHOLD)
-              || (measuredTokens === 0 && fullContextChars >= CURSOR_CONTEXT_CHAR_THRESHOLD)) {
+              || (measuredTokens > 0 && measuredTokens >= contextThreshold)
+              || (measuredTokens === 0 && fullContextChars >= contextCharThreshold)) {
               // Stage one removes completed thinking/tool traces without summarizing conclusions.
               memory.contextStage = "slim";
               memory.contextTokens = 0;
@@ -1286,6 +1323,9 @@ export {
   cursorShellProgram,
   cursorTodoPlan,
   contextTokensFromUsage,
+  contextThresholdsForModel,
+  cursorContextWindow,
+  parseCursorModelContextRules,
   createCursorAgent,
   ensureGlobalTaskDenyHooks,
   extractTurnConclusion,

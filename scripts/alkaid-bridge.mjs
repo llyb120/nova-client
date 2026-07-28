@@ -152,7 +152,7 @@ async function prompt(request, commands) {
     memory.systemFingerprint = systemFingerprint;
 
     contextWindow = Math.max(2_000, Number(resolved.model.contextWindow ?? 128_000));
-    maxContextTokens = Math.max(2_000, Math.floor(contextWindow * 0.8));
+    maxContextTokens = Math.max(2_000, Math.floor(contextWindow * 0.75));
     const forceContextTokens = Math.max(2_000, Math.floor(contextWindow * 0.9));
     maxContextChars = Math.max(8_000, forceContextTokens * 4);
     const pressure = contextPressureTier(memory.contextTokens, contextWindow);

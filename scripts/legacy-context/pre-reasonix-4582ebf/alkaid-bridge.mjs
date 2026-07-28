@@ -131,7 +131,7 @@ async function prompt(request, commands) {
     if (!memory.summary && !memory.turns.length && request.sessionId) {
       seedSlimMemoryFromMessages(memory, await loadMessages(request.sessionId));
     }
-    maxContextTokens = Math.max(150_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.6));
+    maxContextTokens = Math.max(150_000, Math.floor(Number(resolved.model.contextWindow ?? 128_000) * 0.75));
     maxContextChars = Math.max(8_000, maxContextTokens * 4);
     useFullContext = shouldUseFullContext(memory, maxContextTokens, maxContextChars);
     if (!useFullContext && memory.contextStage === "full") {

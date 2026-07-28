@@ -505,9 +505,9 @@ function recordSlimTurn(memory, userMessage, conclusion) {
 }
 
 async function compressSlimMemory(memory, summarize, {
-  maxChars = Math.max(32_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.8 * 4)),
+  maxChars = Math.max(32_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.75 * 4)),
   currentTokens = memory.contextTokens ?? 0,
-  maxTokens = Math.max(2_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.8)),
+  maxTokens = Math.max(2_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.75)),
 } = {}) {
   const formattedLength = formatSlimMemory({ ...memory, pendingTurn: "" }).length;
   const belowCapacity = currentTokens > 0
@@ -1255,9 +1255,9 @@ async function main() {
       const readOnly = request.mode === "plan";
       const originalMessage = await promptMessage(request.parts);
       const contextWindow = cursorContextWindow(request.model);
-      const contextThreshold = Math.max(2_000, Math.floor(contextWindow * 0.8));
+      const contextThreshold = Math.max(2_000, Math.floor(contextWindow * 0.75));
       const contextForceThreshold = Math.max(2_000, Math.floor(contextWindow * 0.9));
-      const contextCharThreshold = Math.max(32_000, Math.floor(contextWindow * 0.8 * 4));
+      const contextCharThreshold = Math.max(32_000, Math.floor(contextWindow * 0.75 * 4));
       const reuseSession = canReuseAgentSession(agent, agentSession, request, sessionKey);
       // A newly created/recovered Agent receives Vega's complete compact transcript once. A live
       // matching Agent already owns that history, so replaying it would duplicate every old turn.
