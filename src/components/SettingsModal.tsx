@@ -1,7 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import {
   checkAndStageUpdate,
@@ -1297,7 +1297,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <div class="cursor-context-head">
                   <div>
                     <div class="field-label">模型上下文窗口</div>
-                    <div class="field-hint">按模型 ID 前缀匹配，最长前缀优先；未匹配时使用 128K。</div>
+                    <div class="field-hint">按模型 ID 包含匹配，最长匹配串优先；未匹配时使用 128K。</div>
                   </div>
                   <button type="button" class="btn secondary cursor-context-add" onClick={addCursorModelContext}>
                     添加
@@ -1307,20 +1307,20 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="cursor-context-empty">暂无自定义规则。</div>
                 }>
                   <div class="cursor-context-list">
-                    <For each={cursorModelContexts()}>
+                    <Index each={cursorModelContexts()}>
                       {(rule, index) => (
                         <div class="cursor-context-row">
                           <input
                             class="field-input"
-                            value={rule.prefix}
-                            onInput={(event) => updateCursorModelContext(index(), { prefix: event.currentTarget.value })}
-                            placeholder="模型前缀，如 claude-4"
-                            aria-label="Cursor 模型前缀"
+                            value={rule().prefix}
+                            onInput={(event) => updateCursorModelContext(index, { prefix: event.currentTarget.value })}
+                            placeholder="模型匹配串，如 claude-4"
+                            aria-label="Cursor 模型匹配串"
                           />
                           <select
                             class="field-input"
-                            value={String(rule.contextWindow)}
-                            onChange={(event) => updateCursorModelContext(index(), {
+                            value={String(rule().contextWindow)}
+                            onChange={(event) => updateCursorModelContext(index, {
                               contextWindow: Number(event.currentTarget.value),
                             })}
                             aria-label="Cursor 模型上下文窗口"
@@ -1332,7 +1332,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                           <button
                             type="button"
                             class="icon-btn cursor-context-remove"
-                            onClick={() => removeCursorModelContext(index())}
+                            onClick={() => removeCursorModelContext(index)}
                             aria-label="删除模型上下文规则"
                             title="删除"
                           >
@@ -1340,7 +1340,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                           </button>
                         </div>
                       )}
-                    </For>
+                    </Index>
                   </div>
                 </Show>
               </div>

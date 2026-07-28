@@ -8,7 +8,7 @@ pub const DEFAULT_RELAY_SERVER: &str = "";
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorModelContextRule {
-    /// 不区分大小写的 Cursor 模型 id 前缀。
+    /// 不区分大小写的 Cursor 模型 id 匹配串（包含匹配）。
     pub prefix: String,
     /// 模型上下文窗口，单位 token。
     pub context_window: u32,
@@ -45,7 +45,7 @@ pub struct Settings {
     pub cursor_proxy: String,
     /// Cursor SDK API Key；空 = 使用 CURSOR_API_KEY 环境变量。
     pub cursor_sdk_api_key: String,
-    /// Cursor 模型 id 前缀到上下文窗口的映射；最长前缀优先。
+    /// Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。
     pub cursor_model_contexts: Vec<CursorModelContextRule>,
     /// OpenCode CLI 可执行文件路径（默认 opencode，依赖 PATH）
     pub opencode_path: String,

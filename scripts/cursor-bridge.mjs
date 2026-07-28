@@ -84,7 +84,7 @@ function parseCursorModelContextRules(value) {
 
 function cursorContextWindow(model, rules = CURSOR_MODEL_CONTEXT_RULES, fallback = CURSOR_DEFAULT_CONTEXT_WINDOW) {
   const modelId = String(model ?? "").trim().toLowerCase();
-  return rules.find((rule) => modelId.startsWith(rule.prefix))?.contextWindow ?? fallback;
+  return rules.find((rule) => modelId.includes(rule.prefix))?.contextWindow ?? fallback;
 }
 
 function contextPressureTier(currentTokens, contextWindow = CURSOR_DEFAULT_CONTEXT_WINDOW) {
@@ -409,10 +409,44 @@ function contextTokensFromUsage(usage) {
   return input >= cached ? input : input + cached;
 }
 
-function cursorRunUsage(result, lastTurnUsage) {
+function cursorUsageField(usage, camel, snake) {
+  return Number(usage?.[camel] ?? usage?.[snake]) || 0;
+}
+
+/** Field-wise sum matching Cursor SDK `sumTokenUsage` (input/cache fields are disjoint). */
+function mergeCursorUsage(total, usage) {
+  if (!usage || typeof usage !== "object") return total;
+  const merged = {
+    inputTokens: cursorUsageField(total, "inputTokens", "input_tokens")
+      + cursorUsageField(usage, "inputTokens", "input_tokens"),
+    outputTokens: cursorUsageField(total, "outputTokens", "output_tokens")
+      + cursorUsageField(usage, "outputTokens", "output_tokens"),
+    cacheReadTokens: cursorUsageField(total, "cacheReadTokens", "cache_read_tokens")
+      + cursorUsageField(usage, "cacheReadTokens", "cache_read_tokens"),
+    cacheWriteTokens: cursorUsageField(total, "cacheWriteTokens", "cache_write_tokens")
+      + cursorUsageField(usage, "cacheWriteTokens", "cache_write_tokens"),
+  };
+  merged.totalTokens = merged.inputTokens + merged.outputTokens
+    + merged.cacheReadTokens + merged.cacheWriteTokens;
+  const reasoning = cursorUsageField(total, "reasoningTokens", "reasoning_tokens")
+    + cursorUsageField(usage, "reasoningTokens", "reasoning_tokens");
+  if (reasoning > 0) merged.reasoningTokens = reasoning;
+  return merged;
+}
+
+function cursorUsageTotal(usage) {
+  if (!usage || typeof usage !== "object") return 0;
+  const total = Number(usage.totalTokens ?? usage.total_tokens);
+  if (total > 0) return total;
+  return contextTokensFromUsage(usage) + cursorUsageField(usage, "outputTokens", "output_tokens");
+}
+
+function cursorRunUsage(result, accumulatedStreamUsage) {
   // Stream usage is emitted once per model turn, while wait() reports the cumulative
-  // usage for the whole run. A tool-using prompt can contain several model turns.
-  return result?.usage ?? lastTurnUsage;
+  // usage for the whole run. Prefer the run total for billing; fall back to a summed stream.
+  const fromResult = result?.usage;
+  if (cursorUsageTotal(fromResult) > 0) return fromResult;
+  return accumulatedStreamUsage;
 }
 
 function extractTurnConclusion(state, result) {
@@ -1270,7 +1304,8 @@ async function main() {
           );
           agent = promptResult.agent;
           activeRun = promptResult.run;
-          let usage;
+          let lastStreamUsage;
+          let accumulatedStreamUsage;
           const streamStartedAt = performance.now();
           const streamTask = (async () => {
             for await (const streamMessage of activeRun.stream()) {
@@ -1282,7 +1317,10 @@ async function main() {
               if (items.length || plan) markActivity();
               for (const item of items) send({ type: "item", item });
               if (plan) send({ type: "plan", plan });
-              if (streamMessage.type === "usage") usage = streamMessage.usage;
+              if (streamMessage.type === "usage") {
+                lastStreamUsage = streamMessage.usage;
+                accumulatedStreamUsage = mergeCursorUsage(accumulatedStreamUsage, streamMessage.usage);
+              }
             }
           })();
           // Cursor occasionally leaves a local run pending forever without yielding even one
@@ -1304,12 +1342,15 @@ async function main() {
           if (result.status === "error") throw new Error(result.error?.message || "Cursor turn failed");
           memory.pendingTurn = "";
           recordSlimTurn(memory, originalMessage, extractTurnConclusion(state, result));
-          const turnUsage = cursorRunUsage(result, usage);
-          memory.contextTokens = contextTokensFromUsage(turnUsage);
+          // Billing = whole-run cumulative usage. Occupancy = latest model turn only;
+          // summing every tool-loop input would far exceed the live context window.
+          const turnUsage = cursorRunUsage(result, accumulatedStreamUsage);
+          const occupancyUsage = lastStreamUsage ?? turnUsage;
+          memory.contextTokens = contextTokensFromUsage(occupancyUsage);
           memory.contextTier = contextPressureTier(memory.contextTokens, contextWindow);
-          const inputTokens = Number(turnUsage?.inputTokens ?? turnUsage?.input_tokens) || 0;
-          const cacheReadTokens = Number(turnUsage?.cacheReadTokens ?? turnUsage?.cache_read_tokens) || 0;
-          const cacheWriteTokens = Number(turnUsage?.cacheWriteTokens ?? turnUsage?.cache_write_tokens) || 0;
+          const inputTokens = Number(occupancyUsage?.inputTokens ?? occupancyUsage?.input_tokens) || 0;
+          const cacheReadTokens = Number(occupancyUsage?.cacheReadTokens ?? occupancyUsage?.cache_read_tokens) || 0;
+          const cacheWriteTokens = Number(occupancyUsage?.cacheWriteTokens ?? occupancyUsage?.cache_write_tokens) || 0;
           const cacheDenominator = inputTokens >= cacheReadTokens + cacheWriteTokens
             ? inputTokens
             : inputTokens + cacheReadTokens + cacheWriteTokens;
@@ -1435,6 +1476,7 @@ export {
   cursorTodoPlan,
   contextTokensFromUsage,
   cursorRunUsage,
+  mergeCursorUsage,
   createCursorAgent,
   ensureGlobalTaskDenyHooks,
   extractTurnConclusion,

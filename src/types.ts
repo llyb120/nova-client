@@ -348,7 +348,7 @@ export interface PermissionRequest {
 }
 
 export interface CursorModelContextRule {
-  /** Case-insensitive model id prefix, for example `claude-4` or `gpt-5`. */
+  /** Case-insensitive substring matched against model id, for example `claude-4` or `gpt-5`. */
   prefix: string;
   /** Model context window in tokens. */
   contextWindow: number;
@@ -370,7 +370,7 @@ export interface Settings {
   /** 兼容旧配置；Cursor 后端仅使用官方 SDK，不再依赖本机 CLI */
   cursorPath: string;
   cursorSdkApiKey: string;
-  /** Cursor 模型 id 前缀到上下文窗口的映射；最长前缀优先。 */
+  /** Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。 */
   cursorModelContexts: CursorModelContextRule[];
   /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */
   opencodePath: string;

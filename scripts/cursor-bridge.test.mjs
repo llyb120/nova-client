@@ -21,6 +21,7 @@ const {
   cursorModelOptions,
   cursorContextWindow,
   cursorRunUsage,
+  mergeCursorUsage,
   parseCursorModelContextRules,
   cursorShellProgram,
   cursorTodoPlan,
@@ -596,18 +597,46 @@ assert.deepEqual(contextRules, [
 ]);
 assert.equal(cursorContextWindow("Claude-4.5-Sonnet", contextRules), 1_000_000);
 assert.equal(cursorContextWindow("claude-4-sonnet", contextRules), 200_000);
+assert.equal(cursorContextWindow("acme-claude-lite", contextRules), 200_000);
 assert.equal(cursorContextWindow("gpt-5", contextRules, 128_000), 128_000);
 assert.deepEqual(parseCursorModelContextRules("not-json"), []);
 assert.equal(contextTokensFromUsage({ totalTokens: 900, outputTokens: 100, inputTokens: 800 }), 800);
 assert.equal(contextTokensFromUsage({ input_tokens: 700, output_tokens: 50 }), 700);
 assert.equal(contextTokensFromUsage({ inputTokens: 100, cacheReadTokens: 600, cacheWriteTokens: 100 }), 800);
-const lastCursorTurnUsage = { totalTokens: 300 };
-const cumulativeCursorRunUsage = { totalTokens: 900 };
+const lastCursorTurnUsage = {
+  inputTokens: 100,
+  outputTokens: 20,
+  cacheReadTokens: 200,
+  cacheWriteTokens: 0,
+  totalTokens: 320,
+};
+const earlierCursorTurnUsage = {
+  inputTokens: 80,
+  outputTokens: 10,
+  cacheReadTokens: 150,
+  cacheWriteTokens: 40,
+  totalTokens: 280,
+};
+const cumulativeCursorRunUsage = {
+  inputTokens: 180,
+  outputTokens: 30,
+  cacheReadTokens: 350,
+  cacheWriteTokens: 40,
+  totalTokens: 600,
+};
+assert.deepEqual(
+  mergeCursorUsage(earlierCursorTurnUsage, lastCursorTurnUsage),
+  cumulativeCursorRunUsage,
+);
 assert.equal(
   cursorRunUsage({ usage: cumulativeCursorRunUsage }, lastCursorTurnUsage),
   cumulativeCursorRunUsage,
 );
-assert.equal(cursorRunUsage({}, lastCursorTurnUsage), lastCursorTurnUsage);
+assert.equal(cursorRunUsage({}, cumulativeCursorRunUsage), cumulativeCursorRunUsage);
+assert.equal(cursorRunUsage({ usage: { totalTokens: 0 } }, cumulativeCursorRunUsage), cumulativeCursorRunUsage);
+// Occupancy must track the latest model turn, not the summed billing total.
+assert.equal(contextTokensFromUsage(lastCursorTurnUsage), 300);
+assert.equal(contextTokensFromUsage(cumulativeCursorRunUsage), 570);
 
 const conclusionState = createMessageState();
 conclusionState.texts.set("run-assistant-1", "Final answer from the assistant.");
