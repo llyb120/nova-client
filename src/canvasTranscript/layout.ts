@@ -116,6 +116,7 @@ export interface View {
 export interface DocSection {
   top: number;
   blocks: Block[];
+  hasSpinner: boolean;
 }
 
 export interface Doc {
@@ -131,6 +132,13 @@ export interface Doc {
   boxes: { box: ScrollBox; top: number }[];
   regions: { region: Region; top: number }[];
   charTotal: number;
+  /** 增量装配：前 stableSections 个 section 的 lines/boxes/regions/charN 可复用 */
+  stableSections: number;
+  stableCharN: number;
+  stableBlockId: number;
+  /** 每个 section 边界处的累积 charN 和 blockId（用于增量装配 O(1) 查找） */
+  sectionCharN: number[];
+  sectionBlockId: number[];
 }
 
 export interface GroupLayout {
@@ -313,6 +321,34 @@ function paintCopyButton(
 /* ===== Markdown ===== */
 
 type MkToken = { type: string; [k: string]: unknown };
+
+/** 缓存 marked.lexer 结果，避免流式期间对未变前缀重复解析 */
+const lexerCache = new Map<string, MkToken[]>();
+let lexerCacheSize = 0;
+const LEXER_CACHE_LIMIT = 4 * 1024 * 1024; // 4MB
+
+function cachedLexer(src: string): MkToken[] {
+  const hit = lexerCache.get(src);
+  if (hit) return hit;
+  let tokens: MkToken[];
+  try {
+    tokens = marked.lexer(src) as unknown as MkToken[];
+  } catch {
+    tokens = [{ type: "paragraph", text: src, tokens: [{ type: "text", text: src }] }];
+  }
+  const size = src.length * 4;
+  if (size < LEXER_CACHE_LIMIT / 2) {
+    lexerCache.set(src, tokens);
+    lexerCacheSize += size;
+    while (lexerCacheSize > LEXER_CACHE_LIMIT) {
+      const oldest = lexerCache.keys().next().value;
+      if (oldest === undefined) break;
+      lexerCacheSize -= oldest.length * 4;
+      lexerCache.delete(oldest);
+    }
+  }
+  return tokens;
+}
 
 interface InlineSt {
   bold?: boolean;
@@ -800,12 +836,7 @@ function mdFlowTokens(flow: Flow, tokens: MkToken[], opts: MdOpts, inList: boole
 
 function markdownBlocks(flow: Flow, src: string, opts: MdOpts): void {
   if (!src) return;
-  let tokens: MkToken[];
-  try {
-    tokens = marked.lexer(src) as unknown as MkToken[];
-  } catch {
-    tokens = [{ type: "paragraph", text: src, tokens: [{ type: "text", text: src }] }];
-  }
+  const tokens = cachedLexer(src);
   mdFlowTokens(flow, tokens, opts, false);
 }
 
@@ -2431,17 +2462,101 @@ export function assembleDoc(
   permSections: { top: number; layout: GroupLayout }[],
   hintSection: { top: number; layout: GroupLayout } | null,
   height: number,
+  prev?: Doc | null,
 ): Doc {
+  const allSections = [...groupSections, ...permSections];
+  if (hintSection) allSections.push(hintSection);
+
+  // 增量装配：检测前缀多少个 section 的 layout 对象未变
+  let stableSections = 0;
+  let charN = 0;
+  let blockId = 0;
+  if (prev && prev.sectionCharN.length > 0) {
+    const maxStable = Math.min(prev.sections.length, allSections.length);
+    for (let i = 0; i < maxStable; i++) {
+      if (prev.sections[i].blocks !== allSections[i].layout.blocks) break;
+      stableSections = i + 1;
+    }
+    if (stableSections > 0) {
+      // O(1) 查找稳定前缀末尾的累积值
+      charN = prev.sectionCharN[stableSections - 1];
+      blockId = prev.sectionBlockId[stableSections - 1];
+    }
+  }
+
   const sections: DocSection[] = [];
   const lines: { line: TLine; top: number }[] = [];
   const copyOrder: { line: TLine; top: number; box?: ScrollBox }[] = [];
   const boxes: { box: ScrollBox; top: number }[] = [];
   const regions: { region: Region; top: number }[] = [];
-  let charN = 0;
-  let blockId = 0;
+  const sectionCharN: number[] = [];
+  const sectionBlockId: number[] = [];
   let hasSpinner = false;
+
+  // 复用稳定前缀的索引数据（O(1) 切片，不遍历）
+  if (stableSections > 0 && prev) {
+    for (let i = 0; i < stableSections; i++) sections.push(prev.sections[i]);
+    hasSpinner = prev.sections.slice(0, stableSections).some(s => s.hasSpinner);
+    // 复用 prev 的 lines/copyOrder/boxes/regions 中属于稳定前缀的部分
+    // 用 sectionCharN 边界定位：稳定前缀的最后一个 section 的 top
+    const stableTopMax = stableSections < prev.sections.length
+      ? prev.sections[stableSections].top
+      : Infinity;
+    // 二分查找 prev.lines 中 top < stableTopMax 的范围
+    const prevLines = prev.lines;
+    let hi = prevLines.length;
+    if (stableTopMax < Infinity) {
+      let lo = 0;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (prevLines[mid].top < stableTopMax) lo = mid + 1;
+        else hi = mid;
+      }
+    }
+    for (let i = 0; i < hi; i++) lines.push(prevLines[i]);
+    // copyOrder/boxes/regions 同样用 top 边界切片
+    const prevCopy = prev.copyOrder;
+    let hiC = prevCopy.length;
+    if (stableTopMax < Infinity) {
+      let lo = 0;
+      while (lo < hiC) {
+        const mid = (lo + hiC) >> 1;
+        if (prevCopy[mid].top < stableTopMax) lo = mid + 1;
+        else hiC = mid;
+      }
+    }
+    for (let i = 0; i < hiC; i++) copyOrder.push(prevCopy[i]);
+    const prevBoxes = prev.boxes;
+    let hiB = prevBoxes.length;
+    if (stableTopMax < Infinity) {
+      let lo = 0;
+      while (lo < hiB) {
+        const mid = (lo + hiB) >> 1;
+        if (prevBoxes[mid].top < stableTopMax) lo = mid + 1;
+        else hiB = mid;
+      }
+    }
+    for (let i = 0; i < hiB; i++) boxes.push(prevBoxes[i]);
+    const prevRegions = prev.regions;
+    let hiR = prevRegions.length;
+    if (stableTopMax < Infinity) {
+      let lo = 0;
+      while (lo < hiR) {
+        const mid = (lo + hiR) >> 1;
+        if (prevRegions[mid].top < stableTopMax) lo = mid + 1;
+        else hiR = mid;
+      }
+    }
+    for (let i = 0; i < hiR; i++) regions.push(prevRegions[i]);
+    // 填充稳定前缀的 sectionCharN/sectionBlockId
+    for (let i = 0; i < stableSections; i++) {
+      sectionCharN.push(prev.sectionCharN[i]);
+      sectionBlockId.push(prev.sectionBlockId[i]);
+    }
+  }
+
   const pushSection = (top: number, layout: GroupLayout) => {
-    sections.push({ top, blocks: layout.blocks });
+    sections.push({ top, blocks: layout.blocks, hasSpinner: layout.hasSpinner });
     if (layout.hasSpinner) hasSpinner = true;
     for (const block of layout.blocks) {
       const hasLines = block.lines.length > 0;
@@ -2473,10 +2588,14 @@ export function assembleDoc(
       }
       for (const region of block.regions) regions.push({ region, top });
     }
+    sectionCharN.push(charN);
+    sectionBlockId.push(blockId);
   };
-  for (const s of groupSections) pushSection(s.top, s.layout);
-  for (const s of permSections) pushSection(s.top, s.layout);
-  if (hintSection) pushSection(hintSection.top, hintSection.layout);
+
+  for (let i = stableSections; i < allSections.length; i++) {
+    pushSection(allSections[i].top, allSections[i].layout);
+  }
+
   return {
     sections,
     groupTops: groupSections.map((s) => s.top),
@@ -2487,10 +2606,15 @@ export function assembleDoc(
     boxes,
     regions,
     charTotal: charN,
+    stableSections,
+    stableCharN: charN,
+    stableBlockId: blockId,
+    sectionCharN,
+    sectionBlockId,
   };
 }
 
-/** 生成用于分组布局缓存的展开态签名（读取 state.expanded 会被 Solid 跟踪） */
+/** 生成用于分组布局缓存的签名：展开态 + 内容指纹（最后一条 item 的 text 长度） */
 export function groupCacheSig(group: Group): string {
   const foldId = group.turn?.id ?? group.user?.id ?? group.body[0]?.id ?? 0;
   const keys = [`turn-${foldId}`, `undone-turn-${foldId}`];
@@ -2499,5 +2623,13 @@ export function groupCacheSig(group: Group): string {
   }
   let sig = "";
   for (const k of keys) sig += state.expanded[k] ? "1" : "0";
+  // 内容指纹：最后一条 assistant/thought 的 text 长度 + user text 长度
+  // 流式期间 text 增长 → sig 变 → 缓存失效 → 重布局
+  // 非流式期间 text 不变 → sig 不变 → 缓存命中 → 跳过布局
+  const last = group.body[group.body.length - 1];
+  if (last && (last.type === "assistant" || last.type === "thought")) {
+    sig += `:${last.text.length}`;
+  }
+  if (group.user) sig += `:u${group.user.text.length}`;
   return sig;
 }

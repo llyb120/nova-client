@@ -11,7 +11,12 @@ import type { Group } from "../components/TurnGroup";
 import { api } from "../ipc";
 import { editUserMessage, isExpanded, respondPermission, toggleExpanded } from "../store";
 import type { PermissionRequest, PromptImage, RevertChange, UserItem } from "../types";
-import { type Action, getTheme, measure, roundRectPath } from "./base";
+import {
+  type Action,
+  getTheme,
+  measure,
+  roundRectPath,
+} from "./base";
 import {
   type Doc,
   type GroupLayout,
@@ -153,6 +158,20 @@ export function TranscriptCanvas(props: {
     return item.text;
   };
 
+  /** 流式期间限制布局重建频率：每 100ms 最多一次，避免 marked.lexer 每帧跑 */
+  let layoutDirty = false;
+  let layoutThrottleTimer: number | undefined;
+  const scheduleLayoutRebuild = () => {
+    if (layoutThrottleTimer !== undefined) return;
+    layoutThrottleTimer = window.setTimeout(() => {
+      layoutThrottleTimer = undefined;
+      if (layoutDirty) {
+        layoutDirty = false;
+        bump();
+      }
+    }, 100);
+  };
+
   const revealStep = () => {
     revealTimer = undefined;
     let changed = false;
@@ -178,11 +197,15 @@ export function TranscriptCanvas(props: {
       changed = true;
       if (end < target.length) pending = true;
     }
-    if (changed) bump();
+    if (changed) {
+      layoutDirty = true;
+      scheduleLayoutRebuild();
+    }
     if (pending) revealTimer = window.setTimeout(revealStep, 33);
   };
 
-  const observeReveals = () => {
+  /** 只在 groups 引用变化时同步 reveal 目标，不在每次 rebuild 里跑 */
+  const syncReveals = () => {
     revealTargets.clear();
     for (const g of props.groups) {
       for (const it of g.body) {
@@ -201,6 +224,11 @@ export function TranscriptCanvas(props: {
     }
     if (needs && revealTimer === undefined) revealTimer = window.setTimeout(revealStep, 33);
   };
+  // groups 变化时同步 reveal 目标（独立于 rebuild）
+  createEffect(() => {
+    void props.groups;
+    syncReveals();
+  });
 
   /* ===== 权限卡片临时答案状态 ===== */
   const permState: PermState = {
@@ -251,14 +279,13 @@ export function TranscriptCanvas(props: {
       cwd: props.hintCwd,
     };
 
-    observeReveals();
-
     const groups = props.groups;
     const running = props.running;
     const last = groups.length - 1;
     const groupSections: { top: number; layout: GroupLayout }[] = [];
     let y = 24;
     const seen = new Set<Group>();
+    let anyLayoutChanged = !doc; // first build always assembles
     groups.forEach((g, i) => {
       seen.add(g);
       const active = running && !g.turn;
@@ -269,6 +296,7 @@ export function TranscriptCanvas(props: {
         const layout = layoutGroup(g, env, active);
         entry = { sig, width: colW, active, running, media, layout };
         groupCache.set(g, entry);
+        anyLayoutChanged = true;
       }
       groupSections.push({ top: y, layout: entry.layout });
       y += entry.layout.height;
@@ -282,6 +310,7 @@ export function TranscriptCanvas(props: {
       const layout = layoutPermission(req, env);
       permSections.push({ top: y, layout });
       y += layout.height;
+      anyLayoutChanged = true; // permissions always re-layout (small count, cheap)
     }
 
     let hintSection: { top: number; layout: GroupLayout } | null = null;
@@ -291,16 +320,29 @@ export function TranscriptCanvas(props: {
       y = Math.max(y, 24 + layout.height);
     }
 
-    doc = assembleDoc(groupSections, permSections, hintSection, y + 16);
+    if (anyLayoutChanged) {
+      doc = assembleDoc(groupSections, permSections, hintSection, y + 16, doc);
+    } else if (doc) {
+      doc.height = y + 16;
+    }
 
-    const max = Math.max(0, doc.height - h);
+    const max = Math.max(0, (doc?.height ?? 0) - h);
     if (props.stickToBottom && !pointerActive) scrollTop = max;
     else scrollTop = Math.min(scrollTop, max);
     setViewTop(scrollTop);
     requestRender();
   };
 
-  createEffect(rebuild);
+  let rebuildQueued = false;
+  const scheduleRebuild = () => {
+    if (rebuildQueued) return;
+    rebuildQueued = true;
+    requestAnimationFrame(() => {
+      rebuildQueued = false;
+      rebuild();
+    });
+  };
+  createEffect(scheduleRebuild);
 
   /* ===== 绘制 ===== */
   const requestRender = () => {
@@ -362,6 +404,12 @@ export function TranscriptCanvas(props: {
       copied,
     };
     for (const section of doc.sections) {
+      if (section.blocks.length === 0) continue;
+      const firstBlock = section.blocks[0];
+      const lastBlock = section.blocks[section.blocks.length - 1];
+      const secTop = section.top + firstBlock.y;
+      const secBot = section.top + lastBlock.y + lastBlock.h;
+      if (secBot < baseView.top || secTop > baseView.bottom) continue;
       ctx.save();
       ctx.translate(0, -scrollTop + section.top);
       const local: View = { ...baseView, top: baseView.top - section.top, bottom: baseView.bottom - section.top };
@@ -1117,6 +1165,7 @@ export function TranscriptCanvas(props: {
       window.removeEventListener("pointerup", finishPointer, true);
       window.removeEventListener("pointercancel", finishPointer, true);
       if (revealTimer !== undefined) window.clearTimeout(revealTimer);
+      if (layoutThrottleTimer !== undefined) window.clearTimeout(layoutThrottleTimer);
     });
   });
 

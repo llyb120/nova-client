@@ -221,6 +221,11 @@ export function getTheme(): ThemeColors {
   return colors;
 }
 
+/** 主题切换时强制失效缓存 */
+export function invalidateTheme(): void {
+  themeCache = null;
+}
+
 /* ===== 矢量图标（与 icons.tsx 的 feather 风格 path 一致，Path2D 直绘） ===== */
 
 const ICON_PATHS: Record<string, string[]> = {
@@ -463,7 +468,73 @@ export interface WrapOpts {
   preWrap?: boolean;
 }
 
+/**
+ * mode:"all" + preWrap 的快速路径：不创建 per-char atom，直接按行+宽度贪心切分。
+ * 对于 5000 字符的工具输出，避免创建 5000 个临时对象。
+ */
+function wrapAllFast(seg: Seg, maxW: number, lineH: number, mainFont: string): LLine[] {
+  const asc = baselineOf(lineH, mainFont);
+  const f = seg.f;
+  const color = seg.color;
+  const flags = seg.flags ?? 0;
+  const text = seg.t;
+  const lines: LLine[] = [];
+
+  const pushLine = (s: number, e: number, w: number) => {
+    if (s === e) {
+      lines.push({ runs: [], w: 0, h: lineH, asc });
+    } else {
+      lines.push({ runs: [{ seg, s, e, x: 0, w }], w, h: lineH, asc });
+    }
+  };
+
+  let i = 0;
+  while (i < text.length) {
+    // 找下一个换行符
+    const nl = text.indexOf("\n", i);
+    const lineEnd = nl === -1 ? text.length : nl;
+    const lineText = text.slice(i, lineEnd);
+
+    if (lineText.length === 0) {
+      pushLine(i, i, 0);
+      i = lineEnd + 1;
+      continue;
+    }
+
+    const lineW = measure(lineText, f);
+    if (lineW <= maxW) {
+      pushLine(i, lineEnd, lineW);
+    } else {
+      // 超宽行：贪心按字符宽度切分（等宽字体下可用二分加速）
+      let cs = i;
+      while (cs < lineEnd) {
+        // 二分找最大前缀宽度 <= maxW
+        let lo = 1;
+        let hi = lineEnd - cs;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1;
+          if (measure(text.slice(cs, cs + mid), f) <= maxW) lo = mid;
+          else hi = mid - 1;
+        }
+        const ce = cs + lo;
+        const w = measure(text.slice(cs, ce), f);
+        pushLine(cs, ce, w);
+        cs = ce;
+      }
+    }
+    i = lineEnd + 1;
+    if (nl === -1) break;
+  }
+  if (lines.length === 0) lines.push({ runs: [], w: 0, h: lineH, asc });
+  return lines;
+}
+
 export function wrapSegs(segs: Seg[], maxW: number, lineH: number, mainFont: string, opts: WrapOpts = {}): LLine[] {
+  // 快速路径：mode:"all" + preWrap 且只有单 seg 无 chip（代码块/工具输出/diff 行）
+  // 不创建 per-char atom，直接按行+宽度贪心切分，避免 GC 风暴
+  if ((opts.mode ?? "word") === "all" && opts.preWrap && segs.length === 1 && !segs[0].chip) {
+    return wrapAllFast(segs[0], maxW, lineH, mainFont);
+  }
   const atoms = buildAtoms(segs, maxW, opts.mode ?? "word", !!opts.preWrap);
   const asc = baselineOf(lineH, mainFont);
   const lines: LLine[] = [];
