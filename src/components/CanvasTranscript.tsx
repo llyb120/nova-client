@@ -114,6 +114,7 @@ function wrapTextIndexed(
   let base = 0;
   for (let pi = 0; pi < paras.length; pi++) {
     const para = paras[pi];
+    const paraLineStart = lines.length;
     // Keep intentional empty paragraphs as a single blank line.
     if (para === "") {
       lines.push({ text: "", offsets: [] });
@@ -172,7 +173,9 @@ function wrapTextIndexed(
         ci += ch.length;
       }
     }
-    pushTrimmedLine(lines, cur, curOffs);
+    // A trailing whitespace token can overflow after the paragraph's content was
+    // already flushed. Do not turn that discarded whitespace into a blank line.
+    if (cur || lines.length === paraLineStart) pushTrimmedLine(lines, cur, curOffs);
     base += para.length;
     if (pi < paras.length - 1) base += 1; // skip `\n` — not present in any line
   }
