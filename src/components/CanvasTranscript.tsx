@@ -1122,9 +1122,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         for (const mb of mdBl) {
           if (mb.type === "code") {
             const codeText = mb.raw || segmentsPlainText(mb.segments);
-            const codeLines = wrapText(codeText, proseW - 42, 12, p.mono);
+            // Match paintCodeBlock: innerW = (proseW - 14) - padX*2
+            const codeLines = wrapText(codeText, proseW - 38, 12, p.mono);
             const codeLh = 12 * 1.55;
-            const codeH = codeLines.length * codeLh + 24;
+            const codeH = codeLines.length * codeLh + 20; // padY 10*2
             result.push({ kind: "md-code", id: item.id, groupIdx: gi,
               x: x + 14, y: thY, w: proseW - 14, h: codeH,
               text: codeText, color: p.dim, bg: p.sidebar, border: p.border,
@@ -1869,6 +1870,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const ff = b.font || p.mono;
     const lh = fs * (b.lineHeight || 1.55);
     const halfLead = (lh - fs) / 2;
+    const innerW = Math.max(1, b.w - padX * 2);
 
     ctx.save();
     roundRect(ctx, bx, by, b.w, b.h, b.borderRadius || 8);
@@ -1877,16 +1879,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.font = `${fs}px ${ff}`;
     ctx.fillStyle = b.color || p.text;
     ctx.textBaseline = "top";
-    const lines = (b.text || "").split("\n");
+    // Soft-wrap long lines (layout already sizes height via wrapText); do not rely on hard \n only.
+    const lines = b._lines || (b._lines = wrapText(b.text || "", innerW, fs, ff));
     b.textLines = [];
     let offset = 0;
     for (let i = 0; i < lines.length; i++) {
       const tx = bx + padX;
       const ty = by + padY + i * lh;
-      if (ty + lh < by - 10 || ty > by + b.h + 10) { offset += lines[i].length + 1; continue; }
-      fillTextCrisp(ctx, lines[i], tx, ty + halfLead);
+      if (ty + lh >= by - 10 && ty <= by + b.h + 10) {
+        fillTextCrisp(ctx, lines[i], tx, ty + halfLead);
+      }
       b.textLines.push({ text: lines[i], x: tx, y: ty + scrollY, w: measure(lines[i], fs, ff), offset, fs, lh });
-      offset += lines[i].length + 1;
+      offset += lines[i].length;
     }
     ctx.restore();
   }
