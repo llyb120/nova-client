@@ -12,6 +12,7 @@ import { ShareInboxModal } from "./components/ShareInboxModal";
 import { Sidebar } from "./components/Sidebar";
 import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
+import "./promptQueue";
 import { initStore, state } from "./store";
 
 function SettingsLoadingModal(props: { onClose: () => void }) {

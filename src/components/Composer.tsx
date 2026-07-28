@@ -1,6 +1,17 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
-import { api } from "../ipc";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
+import {
+  dispatchQueuedPrompt,
+  dispatchingQueueIds,
+  enqueuePrompt,
+  failedQueueIds,
+  holdPromptQueue,
+  queueHeldThreadIds,
+  queuedPrompts,
+  type QueuedPrompt,
+  releasePromptQueue,
+  removeQueuedPrompt,
+} from "../promptQueue";
 import {
   cancelTurn,
   enabledAgentKinds,
@@ -29,10 +40,6 @@ type PromptHistoryItem = {
   images: PromptImage[];
 };
 
-type QueuedPrompt = PromptHistoryItem & {
-  threadId: string;
-};
-
 const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
 
 export function Composer() {
@@ -43,11 +50,6 @@ export function Composer() {
   const [sentHistory, setSentHistory] = createSignal<PromptHistoryItem[]>([]);
   const [historyOpen, setHistoryOpen] = createSignal(false);
   const [activeHistoryIndex, setActiveHistoryIndex] = createSignal(0);
-  const [queuedPrompts, setQueuedPrompts] = createSignal<QueuedPrompt[]>([]);
-  const [dispatchingQueueIds, setDispatchingQueueIds] = createSignal<Set<string>>(new Set());
-  const [failedQueueIds, setFailedQueueIds] = createSignal<Set<string>>(new Set());
-  /** 用户主动停止后挂起自动投递，队列保留供手动发送或撤回。 */
-  const [queueHeldThreadIds, setQueueHeldThreadIds] = createSignal<Set<string>>(new Set());
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
@@ -140,24 +142,6 @@ export function Composer() {
     document.addEventListener("pointerdown", closeEmployeeMenu);
     onCleanup(() => document.removeEventListener("pointerdown", closeEmployeeMenu));
   });
-  const holdPromptQueue = (threadId: string | null | undefined) => {
-    if (!threadId) return;
-    setQueueHeldThreadIds((ids) => {
-      if (ids.has(threadId)) return ids;
-      const next = new Set(ids);
-      next.add(threadId);
-      return next;
-    });
-  };
-  const releasePromptQueue = (threadId: string | null | undefined) => {
-    if (!threadId) return;
-    setQueueHeldThreadIds((ids) => {
-      if (!ids.has(threadId)) return ids;
-      const next = new Set(ids);
-      next.delete(threadId);
-      return next;
-    });
-  };
   const requestStop = () => {
     const thread = state.threads.find((item) => item.id === state.currentId);
     if (thread?.employeeId && !thread.mindThread) {
@@ -341,65 +325,13 @@ export function Composer() {
     if (textareaRef) textareaRef.style.height = "auto";
   };
 
-  const dispatchQueuedPrompt = async (item: QueuedPrompt, steerNow = false) => {
-    if (dispatchingQueueIds().has(item.id)) return;
+  const sendQueuedPromptNow = (item: QueuedPrompt, steerNow = false) => {
     if (steerNow && running() && !supportsSteer()) return;
-    // 用户主动发送或恢复队列后，允许后续条目在回合结束后继续自动投递。
-    releasePromptQueue(item.threadId);
-    setFailedQueueIds((ids) => {
-      const next = new Set(ids);
-      next.delete(item.id);
-      return next;
-    });
-    setDispatchingQueueIds((ids) => new Set(ids).add(item.id));
-    try {
-      const hasMore = queuedPrompts().some(
-        (queued) => queued.threadId === item.threadId && queued.id !== item.id,
-      );
-      // 必须先更新后端标记再发下一轮，避免最后一轮仍被当作队列中间轮次。
-      await api.setPromptQueuePending(item.threadId, hasMore);
-      await sendPrompt(item.text, item.images);
-      setQueuedPrompts((items) => items.filter((queued) => queued.id !== item.id));
-    } catch (error) {
-      console.error("发送排队提示词失败", error);
-      setFailedQueueIds((ids) => new Set(ids).add(item.id));
-    } finally {
-      setDispatchingQueueIds((ids) => {
-        const next = new Set(ids);
-        next.delete(item.id);
-        return next;
-      });
-    }
+    void dispatchQueuedPrompt(item, steerNow);
   };
 
-  // 当前任务正常或异常收尾后，按先进先出自动投递下一条；用户主动停止后挂起，需手动发送或撤回。
-  createEffect(() => {
-    const first = currentQueuedPrompts()[0];
-    const currentId = state.currentId;
-    if (
-      !first ||
-      !currentId ||
-      running() ||
-      queueHeldThreadIds().has(currentId) ||
-      dispatchingQueueIds().has(first.id) ||
-      failedQueueIds().has(first.id)
-    ) return;
-    void dispatchQueuedPrompt(first);
-  });
-
   const withdrawQueuedPrompt = (item: QueuedPrompt) => {
-    setQueuedPrompts((items) => {
-      const next = items.filter((queued) => queued.id !== item.id);
-      const pending = next.some((queued) => queued.threadId === item.threadId);
-      void api.setPromptQueuePending(item.threadId, pending);
-      if (!pending) releasePromptQueue(item.threadId);
-      return next;
-    });
-    setFailedQueueIds((ids) => {
-      const next = new Set(ids);
-      next.delete(item.id);
-      return next;
-    });
+    removeQueuedPrompt(item.id);
     const existing = text();
     const restored = existing.trim() ? `${item.text}\n${existing}` : item.text;
     setText(restored);
@@ -425,12 +357,7 @@ export function Composer() {
     clearInput();
     setEmployeeMenuOpen(false);
     if (running()) {
-      const now = Date.now();
-      setQueuedPrompts((items) => [
-        ...items,
-        { id: `${currentId}:queued:${now}:${items.length}`, threadId: currentId, text: value, ts: now, images },
-      ]);
-      void api.setPromptQueuePending(currentId, true);
+      enqueuePrompt(currentId, value, images);
       return;
     }
     releasePromptQueue(currentId);
@@ -548,7 +475,7 @@ export function Composer() {
       e.preventDefault();
       const firstQueued = currentQueuedPrompts()[0];
       if (empty() && firstQueued) {
-        void dispatchQueuedPrompt(firstQueued, true);
+        sendQueuedPromptNow(firstQueued, true);
         return;
       }
       submit();
@@ -608,7 +535,7 @@ export function Composer() {
                   type="button"
                   class="prompt-queue-action send-now"
                   disabled={dispatchingQueueIds().has(item.id) || (running() && !supportsSteer())}
-                  onClick={() => void dispatchQueuedPrompt(item, true)}
+                  onClick={() => sendQueuedPromptNow(item, true)}
                   title={failedQueueIds().has(item.id) ? "重试发送" : "立即作为引导发送"}
                 >
                   <IconSend size={13} />

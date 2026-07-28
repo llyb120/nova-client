@@ -1740,12 +1740,8 @@ export function stashWorktreePrompt(threadId: string, text: string, images: Prom
  */
 export async function sendPromptTo(threadId: string, text: string, images: PromptImage[]) {
   if (!text.trim() && images.length === 0) return;
-  try {
-    if (await tryBuiltinPrompt(threadId, text, images)) return;
-    await deliverPrompt(threadId, text, images);
-  } catch (e) {
-    console.error("sendPromptTo failed", e);
-  }
+  if (await tryBuiltinPrompt(threadId, text, images)) return;
+  await deliverPrompt(threadId, text, images);
 }
 
 /** 编辑历史用户消息并从该处重新开始：界面立即更新，SDK restore/fork 在后端排队完成后再发送。 */
@@ -2344,7 +2340,11 @@ export async function initStore() {
         if (state.currentId === id) setState("cwd", t.cwd);
       });
     }
-    if (p) void sendPromptTo(id, p.text, p.images);
+    if (p) {
+      void sendPromptTo(id, p.text, p.images).catch((e) => {
+        console.error("sendPromptTo failed", e);
+      });
+    }
   });
   // 本地 worktree 后台创建失败：丢弃暂存提示词（会话里已有错误系统消息）
   await listen<{ threadId: string; error?: string }>("acp:worktree-failed", (e) => {
