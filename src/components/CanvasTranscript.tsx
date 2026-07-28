@@ -732,6 +732,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   const [editStyle, setEditStyle] = createSignal<Record<string, string>>({});
   const [draft, setDraft] = createSignal("");
   const editAttachments = createImageAttachments();
+  let editHostEl: HTMLDivElement | undefined;
+  let editResizeObserver: ResizeObserver | undefined;
 
   // group Y positions for scrollToGroup
   let groupYs: number[] = [];
@@ -741,7 +743,55 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // ─── Layout ────────────────────────────────────────────────────────────────
 
-  let editLayoutY = 0, editLayoutSide = 0, editLayoutW = 0;
+  let editLayoutY = 0, editLayoutSide = 0, editLayoutW = 0, editLayoutH = 150;
+
+  function editRowCount(text: string): number {
+    return Math.min(10, Math.max(2, (text.match(/\n/g)?.length ?? 0) + 1));
+  }
+
+  function estimateEditHeight(text: string, imageCount: number): number {
+    // Match .canvas-prompt-editor chrome: pad 12*2, gap 10, actions ~32, optional image strip.
+    const rows = editRowCount(text);
+    const textH = Math.min(240, rows * 14 * 1.6);
+    const imgH = imageCount > 0 ? 52 : 0;
+    const gaps = 10 + (imageCount > 0 ? 10 : 0);
+    return Math.ceil(24 + imgH + textH + 32 + gaps);
+  }
+
+  function applyEditStyle() {
+    if (!editing()) return;
+    setEditStyle({
+      left: `${editLayoutSide}px`,
+      top: `${Math.max(8, editLayoutY - scrollY)}px`,
+      width: `${editLayoutW}px`,
+    });
+  }
+
+  function syncEditSlotHeight() {
+    const el = editHostEl;
+    if (!el || !editing()) return;
+    const h = Math.ceil(el.getBoundingClientRect().height);
+    if (h > 0 && Math.abs(h - editLayoutH) > 1) {
+      editLayoutH = h;
+      scheduleRebuild();
+    }
+  }
+
+  function bindEditHost(el: HTMLDivElement) {
+    editHostEl = el;
+    editResizeObserver?.disconnect();
+    editResizeObserver = new ResizeObserver(() => syncEditSlotHeight());
+    editResizeObserver.observe(el);
+    queueMicrotask(() => syncEditSlotHeight());
+  }
+
+  function clearEditing() {
+    editResizeObserver?.disconnect();
+    editResizeObserver = undefined;
+    editHostEl = undefined;
+    editLayoutH = 150;
+    setEditing(null);
+  }
 
   function userImagesSig(images: PromptImage[] | undefined): string {
     if (!images?.length) return "0";
@@ -838,11 +888,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       return true;
     }
 
-    // 已闭合轮次布局缓存：流式输出时只重算尾部，大幅降低每帧布局成本
+    // 已闭合轮次布局缓存：流式输出时只重算尾部，大幅降低每帧布局成本。
+    // 编辑中的用户消息所在组及其之后不能复用缓存，否则会叠画旧气泡且占位高度不准。
     let closedUntil = 0;
     const closedSigs: string[] = [];
+    const editingId = editing()?.id ?? null;
     for (let i = 0; i < groups.length; i++) {
       if (!groups[i].turn) break;
+      if (editingId != null && groups[i].user?.id === editingId) break;
       closedSigs.push(closedGroupSig(groups[i]));
       closedUntil = i + 1;
     }
@@ -908,6 +961,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               clickAction: () => {
                 setDraft(item.text);
                 editAttachments.set(item.images ?? []);
+                editLayoutH = estimateEditHeight(item.text, item.images?.length ?? 0);
                 setEditing(item);
               } });
           }
@@ -917,7 +971,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           editLayoutY = y;
           editLayoutSide = side;
           editLayoutW = contentW;
-          y += 150;
+          y += editLayoutH;
           setBottom(16);
         }
       }
@@ -2007,13 +2061,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   function applyScrollY(next: number, user: boolean) {
     scrollY = Math.max(0, Math.min(maxScroll, next));
     keepBottom = maxScroll - scrollY <= 2;
-    if (editing()) {
-      setEditStyle({
-        left: `${editLayoutSide}px`,
-        top: `${Math.max(8, editLayoutY - scrollY)}px`,
-        width: `${editLayoutW}px`
-      });
-    }
+    applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, user);
     paintAll();
   }
@@ -2218,13 +2266,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     scrollY = Math.max(0, Math.min(maxScroll, scrollY + dy));
     keepBottom = maxScroll - scrollY <= 2;
-    if (editing()) {
-      setEditStyle({
-        left: `${editLayoutSide}px`,
-        top: `${Math.max(8, editLayoutY - scrollY)}px`,
-        width: `${editLayoutW}px`
-      });
-    }
+    applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, true);
     paintAll();
   }
@@ -2280,13 +2322,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     maxScroll = Math.max(0, totalHeight - viewH);
     if (wasBottom) scrollY = maxScroll;
     else scrollY = Math.max(0, Math.min(maxScroll, oldScroll));
-    if (editing()) {
-      setEditStyle({
-        left: `${editLayoutSide}px`,
-        top: `${Math.max(8, editLayoutY - scrollY)}px`,
-        width: `${editLayoutW}px`
-      });
-    }
+    applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, false);
     paintAll();
   }
@@ -2358,9 +2394,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     canvasEl.addEventListener("copy", onCopy);
 
     props.ref?.({
-      scrollToBottom() { keepBottom = true; scrollY = maxScroll; paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
-      scrollToGroup(idx) { if (groupYs[idx] != null) { scrollY = Math.max(0, Math.min(maxScroll, groupYs[idx] - 20)); keepBottom = false; paintAll(); props.onScroll?.(scrollY, maxScroll, false); } },
-      scrollBy(delta) { scrollY = Math.max(0, Math.min(maxScroll, scrollY + delta)); keepBottom = maxScroll - scrollY <= 2; paintAll(); props.onScroll?.(scrollY, maxScroll, true); },
+      scrollToBottom() { keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
+      scrollToGroup(idx) { if (groupYs[idx] != null) { scrollY = Math.max(0, Math.min(maxScroll, groupYs[idx] - 20)); keepBottom = false; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); } },
+      scrollBy(delta) { scrollY = Math.max(0, Math.min(maxScroll, scrollY + delta)); keepBottom = maxScroll - scrollY <= 2; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, true); },
       isAtBottom() { return maxScroll - scrollY <= 2; },
       scrollTop() { return scrollY; },
       maxScrollTop() { return maxScroll; },
@@ -2371,6 +2407,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     onCleanup(() => {
       ro.disconnect();
       mo.disconnect();
+      editResizeObserver?.disconnect();
+      editResizeObserver = undefined;
+      editHostEl = undefined;
       if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
       if (rafId) cancelAnimationFrame(rafId);
       canvasEl.removeEventListener("mousemove", onMouseMove);
@@ -2436,7 +2475,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const text = draft().trim();
     const images = editAttachments.images();
     if (!item || (!text && !images.length)) return;
-    setEditing(null);
+    clearEditing();
     void editUserMessage(item.id, text, images);
   };
 
@@ -2444,21 +2483,28 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     <div class="canvas-transcript-host" ref={hostEl}>
       <canvas ref={canvasEl} class="transcript-canvas-only" tabindex="0" aria-label="会话记录" />
       {editing() && (
-        <div class="canvas-prompt-editor" style={editStyle()}>
+        <div class="canvas-prompt-editor" style={editStyle()} ref={bindEditHost}>
           <ImageAttachmentStrip images={editAttachments.images()} onRemove={editAttachments.remove} />
           <textarea
             value={draft()}
+            rows={editRowCount(draft())}
             onPaste={editAttachments.onPaste}
             onInput={(e) => setDraft(e.currentTarget.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); saveEdit(); }
-              if (e.key === "Escape") setEditing(null);
+              if (e.key === "Escape") clearEditing();
             }}
-            ref={(el) => queueMicrotask(() => { el.focus(); el.setSelectionRange(el.value.length, el.value.length); })}
+            ref={(el) => queueMicrotask(() => {
+              el.focus();
+              // Defer caret jump so huge prompts don't block first paint of the editor.
+              requestAnimationFrame(() => {
+                try { el.setSelectionRange(el.value.length, el.value.length); } catch { /* ignore */ }
+              });
+            })}
           />
           <div>
             <span>发送后将从此处重新开始会话</span>
-            <button class="btn secondary small" onClick={() => setEditing(null)}>取消</button>
+            <button class="btn secondary small" onClick={() => clearEditing()}>取消</button>
             <button class="btn primary small" onClick={saveEdit}>发送</button>
           </div>
         </div>

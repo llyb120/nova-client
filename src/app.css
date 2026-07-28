@@ -937,6 +937,8 @@ button {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  max-height: calc(100% - 16px);
+  overflow: hidden;
   background: var(--bg-panel);
   border: 1px solid var(--border-light);
   border-radius: 14px;
@@ -953,6 +955,8 @@ button {
   font-size: 14px;
   line-height: 1.6;
   min-height: 48px;
+  max-height: min(240px, 36vh);
+  overflow: auto;
   user-select: text;
 }
 .canvas-prompt-editor > div:last-child {
