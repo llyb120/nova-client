@@ -2619,6 +2619,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (switchedThread) {
       renderedThreadId = threadId;
       layoutGeneration++;
+      clearEditing();
       selection = null;
       groupYs = [];
       scrollY = 0;
