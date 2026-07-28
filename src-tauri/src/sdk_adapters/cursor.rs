@@ -21,13 +21,6 @@ impl SdkAdapter for CursorAdapter {
         )
     }
 
-    fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
-        &[(
-            "cursor-super-context-bridge.mjs",
-            include_bytes!("../../resources/cursor-super-context-bridge.mjs"),
-        )]
-    }
-
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
             // Cursor 仅依赖 Node.js 运行官方 SDK bridge，不再读取本机 cursor-agent。

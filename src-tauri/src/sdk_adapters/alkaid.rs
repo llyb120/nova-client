@@ -27,10 +27,6 @@ impl SdkAdapter for AlkaidAdapter {
                 "photon_rs_bg.wasm",
                 include_bytes!("../../resources/photon_rs_bg.wasm"),
             ),
-            (
-                "alkaid-super-context-bridge.mjs",
-                include_bytes!("../../resources/alkaid-super-context-bridge.mjs"),
-            ),
         ]
     }
 
