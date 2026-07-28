@@ -5,7 +5,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
-import { basename, extname, join } from "node:path";
+import { dirname, basename, extname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createCursorFilesystemTools, cursorPromptPrefix } from "./cursor-filesystem-tools.mjs";
 
 const WINDOWS_SHELL_SHIMS = {
@@ -1458,11 +1459,29 @@ async function main() {
   prewarm.close();
 }
 
-if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-  send({ ok: false, error: error instanceof Error ? error.message : String(error) });
-  process.exitCode = 1;
-});
+async function runSuperContextBridge() {
+  const bridgePath = join(dirname(fileURLToPath(import.meta.url)), "cursor-super-context-bridge.mjs");
+  const child = childProcess.spawn(process.execPath, [bridgePath], {
+    stdio: "inherit",
+    env: { ...process.env, NOVA_CONTEXT_MODE: "" },
+    windowsHide: true,
+  });
+  const result = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  if (result.signal) throw new Error(`Cursor 超级上下文 bridge 被信号 ${result.signal} 终止`);
+  if (result.code !== 0) process.exitCode = result.code ?? 1;
+}
+
+if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") {
+  const bridgeMain = process.env.NOVA_CONTEXT_MODE === "super" ? runSuperContextBridge : main;
+  bridgeMain().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    send({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    process.exitCode = 1;
+  });
+}
 
 export {
   CursorStartupTimeout,

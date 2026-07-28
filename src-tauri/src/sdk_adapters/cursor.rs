@@ -21,6 +21,13 @@ impl SdkAdapter for CursorAdapter {
         )
     }
 
+    fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
+        &[(
+            "cursor-super-context-bridge.mjs",
+            include_bytes!("../../resources/cursor-super-context-bridge.mjs"),
+        )]
+    }
+
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
             // Cursor 仅依赖 Node.js 运行官方 SDK bridge，不再读取本机 cursor-agent。
@@ -29,11 +36,14 @@ impl SdkAdapter for CursorAdapter {
             path_env: "NOVA_CURSOR_PATH",
             api_key: (!settings.cursor_sdk_api_key.is_empty())
                 .then(|| ("CURSOR_API_KEY", settings.cursor_sdk_api_key.clone())),
-            extra_env: vec![(
-                "NOVA_CURSOR_MODEL_CONTEXTS",
-                serde_json::to_string(&settings.cursor_model_contexts)
-                    .unwrap_or_else(|_| "[]".into()),
-            )],
+            extra_env: vec![
+                (
+                    "NOVA_CURSOR_MODEL_CONTEXTS",
+                    serde_json::to_string(&settings.cursor_model_contexts)
+                        .unwrap_or_else(|_| "[]".into()),
+                ),
+                ("NOVA_CONTEXT_MODE", settings.cursor_context_mode.clone()),
+            ],
         }
     }
 

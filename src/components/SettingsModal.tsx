@@ -176,6 +176,12 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [cursorModelContexts, setCursorModelContexts] = createSignal(
     (s?.cursorModelContexts ?? []).map((rule) => ({ ...rule })),
   );
+  const [vegaContextMode, setVegaContextMode] = createSignal<"default" | "super">(
+    s?.vegaContextMode === "super" ? "super" : "default",
+  );
+  const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
+    s?.cursorContextMode === "super" ? "super" : "default",
+  );
   const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
   const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
   const [alkaidEnabled, setAlkaidEnabled] = createSignal(s?.alkaidEnabled !== false);
@@ -453,6 +459,8 @@ export function SettingsModal(props: { onClose: () => void }) {
     cursorModelContexts: cursorModelContexts()
       .map((rule) => ({ prefix: rule.prefix.trim(), contextWindow: rule.contextWindow }))
       .filter((rule) => rule.prefix.length > 0),
+    vegaContextMode: vegaContextMode(),
+    cursorContextMode: cursorContextMode(),
     opencodeProxy: opencodeProxy().trim(),
     defaultMode: defaultMode(),
     lightweightModelAgent: lightweightAgent(),
@@ -1010,6 +1018,42 @@ export function SettingsModal(props: { onClose: () => void }) {
 
           {/* ===== 高级 ===== */}
           <Show when={tab() === "advanced"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">上下文机制</h3>
+              <label class="field">
+                <span class="field-label">Vega 上下文</span>
+                <select
+                  class="field-input"
+                  value={vegaContextMode()}
+                  onChange={(e) =>
+                    setVegaContextMode(e.currentTarget.value === "super" ? "super" : "default")
+                  }
+                >
+                  <option value="default">默认（Reasonix）</option>
+                  <option value="super">超级（旧版超级上下文）</option>
+                </select>
+                <span class="field-hint">
+                  默认使用当前的 append-only 会话、分级压缩和 frozen digest；超级切换到改造前备份的 Vega 超级上下文实现。
+                </span>
+              </label>
+              <label class="field">
+                <span class="field-label">Cursor 上下文</span>
+                <select
+                  class="field-input"
+                  value={cursorContextMode()}
+                  onChange={(e) =>
+                    setCursorContextMode(e.currentTarget.value === "super" ? "super" : "default")
+                  }
+                >
+                  <option value="default">默认（Reasonix）</option>
+                  <option value="super">超级（旧版超级上下文）</option>
+                </select>
+                <span class="field-hint">
+                  默认复用 live Cursor session；超级切换到改造前备份的 fresh Agent、compact memory 与自动摘要实现。
+                </span>
+              </label>
+            </section>
+
             <section class="settings-group">
               <h3 class="settings-group-title">聊天视图</h3>
               <label class="field">

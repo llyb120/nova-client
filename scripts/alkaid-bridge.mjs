@@ -1,7 +1,9 @@
 import { createInterface } from "node:readline";
 import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { ALKAID_PROVIDER_IDLE_TIMEOUT_ENABLED, ALKAID_PROVIDER_IDLE_TIMEOUT_MS, alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, messagesWithPendingAlkaidPrompt, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
 import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
@@ -587,21 +589,40 @@ async function title(request) {
   }
 }
 
-const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-try {
-  const commands = lines[Symbol.asyncIterator]();
-  const first = await commands.next();
-  if (first.done) throw new Error("Vega bridge 缺少请求");
-  const request = JSON.parse(first.value);
-  if (request.action === "prompt") await prompt(request, commands);
-  else if (request.action === "models") {
-    const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
-    send({ ok: true, data: { configOptions: [{ id: "model", name: "Model", currentValue: defaultAlkaidModel(config), options: alkaidModelOptions(config) }], modes: null } });
-  } else if (request.action === "title") await title(request);
-  else throw new Error(`Vega bridge 不支持 action: ${request.action}`);
-} catch (error) {
-  send({ ok: false, error: error instanceof Error ? error.message : String(error) });
-  process.exitCode = 1;
-} finally {
-  lines.close();
+async function runSuperContextBridge() {
+  const bridgePath = join(dirname(fileURLToPath(import.meta.url)), "alkaid-super-context-bridge.mjs");
+  const child = spawn(process.execPath, [bridgePath], {
+    stdio: "inherit",
+    env: { ...process.env, NOVA_CONTEXT_MODE: "" },
+    windowsHide: true,
+  });
+  const result = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  if (result.signal) throw new Error(`Vega 超级上下文 bridge 被信号 ${result.signal} 终止`);
+  if (result.code !== 0) process.exitCode = result.code ?? 1;
+}
+
+if (process.env.NOVA_CONTEXT_MODE === "super") {
+  await runSuperContextBridge();
+} else {
+  const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  try {
+    const commands = lines[Symbol.asyncIterator]();
+    const first = await commands.next();
+    if (first.done) throw new Error("Vega bridge 缺少请求");
+    const request = JSON.parse(first.value);
+    if (request.action === "prompt") await prompt(request, commands);
+    else if (request.action === "models") {
+      const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
+      send({ ok: true, data: { configOptions: [{ id: "model", name: "Model", currentValue: defaultAlkaidModel(config), options: alkaidModelOptions(config) }], modes: null } });
+    } else if (request.action === "title") await title(request);
+    else throw new Error(`Vega bridge 不支持 action: ${request.action}`);
+  } catch (error) {
+    send({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    process.exitCode = 1;
+  } finally {
+    lines.close();
+  }
 }

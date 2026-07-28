@@ -47,6 +47,10 @@ pub struct Settings {
     pub cursor_sdk_api_key: String,
     /// Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。
     pub cursor_model_contexts: Vec<CursorModelContextRule>,
+    /// Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。
+    pub vega_context_mode: String,
+    /// Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。
+    pub cursor_context_mode: String,
     /// OpenCode CLI 可执行文件路径（默认 opencode，依赖 PATH）
     pub opencode_path: String,
     /// 旧版 OpenCode ACP 启动参数，仅用于兼容已有设置。
@@ -148,6 +152,8 @@ impl Default for Settings {
             cursor_proxy: String::new(),
             cursor_sdk_api_key: String::new(),
             cursor_model_contexts: Vec::new(),
+            vega_context_mode: "default".into(),
+            cursor_context_mode: "default".into(),
             opencode_path: "opencode".into(),
             opencode_args: "acp".into(),
             opencode_proxy: String::new(),
@@ -208,10 +214,9 @@ mod tests {
 
     #[test]
     fn legacy_title_model_migrates_to_lightweight_model() {
-        let settings: Settings = serde_json::from_str(
-            r#"{"titleModelAgent":"codex","titleModel":"gpt-5-mini"}"#,
-        )
-        .unwrap();
+        let settings: Settings =
+            serde_json::from_str(r#"{"titleModelAgent":"codex","titleModel":"gpt-5-mini"}"#)
+                .unwrap();
         assert_eq!(settings.lightweight_model_agent, "codex");
         assert_eq!(settings.lightweight_model, "gpt-5-mini");
     }
@@ -230,6 +235,18 @@ mod tests {
         assert_eq!(settings.cursor_model_contexts.len(), 1);
         assert_eq!(settings.cursor_model_contexts[0].prefix, "claude-4");
         assert_eq!(settings.cursor_model_contexts[0].context_window, 200_000);
+    }
+
+    #[test]
+    fn context_modes_default_and_round_trip() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.vega_context_mode, "default");
+        assert_eq!(defaults.cursor_context_mode, "default");
+        let settings: Settings =
+            serde_json::from_str(r#"{"vegaContextMode":"super","cursorContextMode":"super"}"#)
+                .unwrap();
+        assert_eq!(settings.vega_context_mode, "super");
+        assert_eq!(settings.cursor_context_mode, "super");
     }
 
     #[test]
@@ -374,6 +391,12 @@ impl Settings {
         settings.claudecode_integration = "sdk".into();
         settings.cursor_integration = "sdk".into();
         settings.opencode_integration = "sdk".into();
+        if settings.vega_context_mode != "super" {
+            settings.vega_context_mode = "default".into();
+        }
+        if settings.cursor_context_mode != "super" {
+            settings.cursor_context_mode = "default".into();
+        }
         settings
     }
 

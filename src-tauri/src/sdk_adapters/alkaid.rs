@@ -22,7 +22,16 @@ impl SdkAdapter for AlkaidAdapter {
     }
 
     fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
-        &[("photon_rs_bg.wasm", include_bytes!("../../resources/photon_rs_bg.wasm"))]
+        &[
+            (
+                "photon_rs_bg.wasm",
+                include_bytes!("../../resources/photon_rs_bg.wasm"),
+            ),
+            (
+                "alkaid-super-context-bridge.mjs",
+                include_bytes!("../../resources/alkaid-super-context-bridge.mjs"),
+            ),
+        ]
     }
 
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
@@ -31,7 +40,7 @@ impl SdkAdapter for AlkaidAdapter {
             proxy: settings.vega_proxy.clone(),
             path_env: "ALKAID_RUNTIME",
             api_key: None,
-            extra_env: Vec::new(),
+            extra_env: vec![("NOVA_CONTEXT_MODE", settings.vega_context_mode.clone())],
         }
     }
 

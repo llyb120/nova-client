@@ -372,6 +372,10 @@ export interface Settings {
   cursorSdkApiKey: string;
   /** Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。 */
   cursorModelContexts: CursorModelContextRule[];
+  /** Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
+  vegaContextMode: "default" | "super";
+  /** Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
+  cursorContextMode: "default" | "super";
   /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */
   opencodePath: string;
   opencodeProxy: string;

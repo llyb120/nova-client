@@ -3748,6 +3748,7 @@ async fn apply_runtime_settings(
         let mut s = state.settings.lock().unwrap();
         let restart_vega = restart_all_agents
             || s.vega_proxy != settings.vega_proxy
+            || s.vega_context_mode != settings.vega_context_mode
             || s.alkaid_enabled != settings.alkaid_enabled;
         let restart_devin = restart_all_agents
             || s.devin_path != settings.devin_path
@@ -3770,6 +3771,7 @@ async fn apply_runtime_settings(
             || s.cursor_proxy != settings.cursor_proxy
             || s.cursor_sdk_api_key != settings.cursor_sdk_api_key
             || s.cursor_model_contexts != settings.cursor_model_contexts
+            || s.cursor_context_mode != settings.cursor_context_mode
             || s.cursor_enabled != settings.cursor_enabled;
         let restart_opencode = restart_all_agents
             || s.opencode_path != settings.opencode_path
