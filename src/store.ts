@@ -1801,6 +1801,9 @@ export async function cancelTurn(stopReason?: string, deleteWork = false) {
   const id = state.currentId;
   if (!id) return;
   await api.cancelTurn(id, stopReason, deleteWork);
+  // 部分后端的取消调用会先返回，结束事件稍后才到；主动释放前端忙碌态，
+  // 避免停止成功后历史消息仍被 running 门控，必须切换会话才能编辑。
+  setState("running", id, false);
 }
 
 /** 手动压缩当前会话上下文（仅 Codex）：把长历史浓缩为摘要，加快后续响应。
