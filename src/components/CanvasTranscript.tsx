@@ -692,10 +692,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let viewW = 0, viewH = 0;
   let dpr = devicePixelRatio || 1;
   let keepBottom = true;
+  /** Expand/collapse near bottom: keep the clicked header fixed in view instead of stick-to-bottom. */
+  let scrollLock: { kind: string; id: number; viewOffset: number } | null = null;
 
   // hover state
   let hoverBlockIdx = -1;
   let cursorStyle = "default";
+  /** code-copy-btn feedback: hoverKey → hide-after timestamp */
+  const copiedCodeUntil = new Map<string, number>();
 
   // per-block scroll for clipped tool-content（按内容身份记，避免 rebuild 丢位置）
   const blockScrolls = new Map<string, number>();
@@ -820,9 +824,23 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     return `${text.length}:${hash >>> 0}`;
   }
 
+  function bodyExpandedFor(items: Item[]): boolean {
+    return items.some((it) => {
+      if (it.type === "tool") return !!state.expanded[`tool-${it.id}`];
+      if (it.type === "thought") return !!state.expanded[`thought-${it.id}`];
+      return !!state.expanded[String(it.id)];
+    });
+  }
+
   function closedGroupSig(g: Group): string {
-    const foldKey = g.turn ? `turn-${g.turn.id ?? g.user?.id ?? 0}` : "";
-    const foldOpen = foldKey ? !!(state.expanded[foldKey] ?? false) : false;
+    // foldKey / open must match layout — a narrower key or ignoring bodyExpanded
+    // lets prefix cache reuse an expanded fold after the user collapsed it.
+    const foldKey = g.turn
+      ? `turn-${g.turn.id ?? g.user?.id ?? g.body[0]?.id ?? 0}`
+      : "";
+    const foldOpen = foldKey
+      ? !!(state.expanded[foldKey] ?? bodyExpandedFor(g.body))
+      : false;
     const parts = [
       g.user ? `u:${g.user.id}:${textSig(g.user.text)}:${userImagesSig(g.user.images)}` : "-",
       g.turn
@@ -1011,11 +1029,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
       if (g.turn && process.length) {
         const foldKey = `turn-${g.turn.id ?? g.user?.id ?? process[0]?.id ?? 0}`;
-        const open = state.expanded[foldKey] ?? process.some((it) => {
-          if (it.type === "tool") return !!state.expanded[`tool-${it.id}`];
-          if (it.type === "thought") return !!state.expanded[`thought-${it.id}`];
-          return !!state.expanded[String(it.id)];
-        });
+        const open = state.expanded[foldKey] ?? bodyExpandedFor(process);
         const label = ["已处理", fmtDuration(g.turn.durationMs),
           g.turn.totalTokens ? `· ${fmtTokens(g.turn.totalTokens)} tokens` : ""].filter(Boolean).join(" ");
         const tokenTip = turnTokenTitle(g.turn);
@@ -1029,7 +1043,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           hoverBg: p.hover, hoverColor: p.text, borderRadius: 7, cursor: "pointer",
           title: tokenTip,
           data: { open, foldKey },
-          clickAction: () => { toggleExpanded(foldKey, !open); } });
+          // Read live open — cached blocks must not toggle with a stale layout-time flag.
+          clickAction: () => {
+            const cur = state.expanded[foldKey] ?? bodyExpandedFor(process);
+            toggleExpanded(foldKey, !cur);
+          } });
         y += 26 + 2;
 
         if (open) {
@@ -1092,6 +1110,57 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     return true;
   }
 
+  function pushMdCodeBlock(
+    result: Block[],
+    opts: {
+      id: number; groupIdx: number;
+      x: number; y: number; w: number; h: number;
+      text: string; color: string; bg: string; border: string;
+      borderRadius: number; fontSize: number; lineHeight: number; font: string;
+      padX: number; padY: number; lang?: string; hoverKey: string;
+    },
+  ) {
+    const p = pal;
+    result.push({
+      kind: "md-code", id: opts.id, groupIdx: opts.groupIdx,
+      x: opts.x, y: opts.y, w: opts.w, h: opts.h,
+      text: opts.text, color: opts.color, bg: opts.bg, border: opts.border,
+      borderRadius: opts.borderRadius, fontSize: opts.fontSize,
+      lineHeight: opts.lineHeight, font: opts.font,
+      selectable: true, hoverKey: opts.hoverKey,
+      data: { padX: opts.padX, padY: opts.padY, lang: opts.lang },
+    });
+    // Match DOM .code-copy: top/right 7px, padding 5px, icon 13 → ~24px hit target
+    const btn = 24;
+    const inset = 7;
+    const copyKey = opts.hoverKey;
+    const codeText = opts.text;
+    result.push({
+      kind: "code-copy-btn",
+      id: opts.id, groupIdx: opts.groupIdx,
+      x: opts.x + opts.w - inset - btn,
+      y: opts.y + inset,
+      w: btn, h: btn,
+      bg: p.panel, border: p.borderLight, hoverBg: p.hover,
+      borderRadius: 6, cursor: "pointer",
+      hoverKey: opts.hoverKey,
+      title: "复制",
+      data: { copyKey },
+      clickAction: () => {
+        void navigator.clipboard.writeText(codeText);
+        copiedCodeUntil.set(copyKey, performance.now() + 1200);
+        paintAll();
+        window.setTimeout(() => {
+          const until = copiedCodeUntil.get(copyKey);
+          if (until != null && until <= performance.now()) {
+            copiedCodeUntil.delete(copyKey);
+            paintAll();
+          }
+        }, 1220);
+      },
+    });
+  }
+
   function layoutItem(item: Item, result: Block[], gi: number, pad: number,
     proseOff: number, contentW: number, proseW: number, y: number, active: boolean): number {
     const p = pal;
@@ -1113,12 +1182,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         text: "思考过程", color: p.faint, fontSize: 12, font: p.sans,
         hoverBg: p.hover, hoverColor: p.dim, borderRadius: 6, cursor: "pointer",
         data: { open, key },
-        clickAction: () => { toggleExpanded(key, !open); } });
+        clickAction: () => { toggleExpanded(key, !isExpanded(key, false)); } });
       y += 6 + 24;
       if (open) {
         // .thought-body: margin-top 6px; padding 8px 14px; border-left 2px border-light
         const mdBl = parseMarkdownBlocks(item.text);
         let thY = y + 6 + 8; // margin + padding
+        let codeIdx = 0;
         for (const mb of mdBl) {
           if (mb.type === "code") {
             const codeText = mb.raw || segmentsPlainText(mb.segments);
@@ -1126,11 +1196,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             const codeLines = wrapText(codeText, proseW - 38, 12, p.mono);
             const codeLh = 12 * 1.55;
             const codeH = codeLines.length * codeLh + 20; // padY 10*2
-            result.push({ kind: "md-code", id: item.id, groupIdx: gi,
+            pushMdCodeBlock(result, {
+              id: item.id, groupIdx: gi,
               x: x + 14, y: thY, w: proseW - 14, h: codeH,
               text: codeText, color: p.dim, bg: p.sidebar, border: p.border,
               borderRadius: 6, fontSize: 12, lineHeight: 1.55, font: p.mono,
-              selectable: true, data: { padX: 12, padY: 10 } });
+              padX: 12, padY: 10, hoverKey: `md-code-${item.id}-t${codeIdx++}`,
+            });
             thY += codeH + 8;
           } else if (mb.type === "table") {
             thY = layoutMdTable(mb, result, item.id, gi, x + 14, thY, proseW - 28, p, {
@@ -1179,11 +1251,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const codeLines = wrapText(codeText, proseW - 28, 12.5, p.mono);
           const codeLh = 12.5 * 1.55;
           const codeH = codeLines.length * codeLh + 24; // padding 12*2
-          result.push({ kind: "md-code", id: item.id, groupIdx: gi,
+          pushMdCodeBlock(result, {
+            id: item.id, groupIdx: gi,
             x, y, w: proseW, h: codeH,
             text: codeText, color: p.text, bg: p.panel, border: p.border,
             borderRadius: 8, fontSize: 12.5, lineHeight: 1.55, font: p.mono,
-            selectable: true, data: { padX: 14, padY: 12, lang: mb.lang } });
+            padX: 14, padY: 12, lang: mb.lang,
+            hoverKey: `md-code-${item.id}-${mi}`,
+          });
           y += codeH + 10;
         } else if (mb.type === "heading") {
           const hLevel = mb.level || 1;
@@ -1279,7 +1354,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       fontSize: 12, font: p.mono, hoverBg: p.hover, borderRadius: 7,
       cursor: hasBody ? "pointer" : "default",
       data: { open, busy, hasBody, kind: item.kind, status: item.status },
-      clickAction: hasBody ? () => { toggleExpanded(key, !open); } : undefined });
+      clickAction: hasBody ? () => {
+        const liveBusy = item.status === "pending" || item.status === "in_progress";
+        toggleExpanded(key, !isExpanded(key, liveBusy));
+      } : undefined });
     y += 1 + toolH + 1;
 
     if (open && hasBody) {
@@ -1419,12 +1497,24 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
       ctx.save();
 
-      // background — hoverBg for interactive blocks; edit-btn only visible on hover
+      // background — hoverBg for interactive blocks; edit/copy btns only visible on hover (or copied)
       if (b.kind === "edit-btn") {
         if (isHover) {
           ctx.fillStyle = b.hoverBg || pal.hover;
           roundRect(ctx, bx, by, b.w, b.h, b.borderRadius || 6);
           ctx.fill();
+        }
+      } else if (b.kind === "code-copy-btn") {
+        const copied = (copiedCodeUntil.get(b.hoverKey || "") || 0) > performance.now();
+        if (isHover || copied) {
+          const btnHover = i === hoverBlockIdx;
+          ctx.fillStyle = btnHover ? (b.hoverBg || pal.hover) : (b.bg || pal.panel);
+          roundRect(ctx, bx, by, b.w, b.h, b.borderRadius || 6);
+          ctx.fill();
+          ctx.strokeStyle = b.border || pal.borderLight;
+          ctx.lineWidth = 1;
+          roundRect(ctx, bx + 0.5, by + 0.5, b.w - 1, b.h - 1, b.borderRadius || 6);
+          ctx.stroke();
         }
       } else {
         const bg = isHover && b.hoverBg ? b.hoverBg : b.bg;
@@ -1440,7 +1530,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
 
       // border
-      if (b.border && b.kind !== "edit-btn") {
+      if (b.border && b.kind !== "edit-btn" && b.kind !== "code-copy-btn") {
         ctx.strokeStyle = b.border;
         ctx.lineWidth = 1;
         if (b.borderRadius) {
@@ -1459,6 +1549,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         case "edit-btn":
           if (isHover) paintEditIcon(ctx, bx + 5, by + 5, 13, isHover ? p.text : p.faint);
           break;
+        case "code-copy-btn": {
+          const copied = (copiedCodeUntil.get(b.hoverKey || "") || 0) > performance.now();
+          if (isHover || copied) {
+            const btnHover = i === hoverBlockIdx;
+            const color = copied ? p.accent : (btnHover ? p.text : p.faint);
+            if (copied) paintCheckIcon(ctx, bx + 5.5, by + 5.5, 13, color);
+            else paintCopyIcon(ctx, bx + 5.5, by + 5.5, 13, color);
+          }
+          break;
+        }
         case "fold":
         case "thought-toggle":
           paintFoldToggle(ctx, b, bx, by, p, !!isHover);
@@ -1982,6 +2082,49 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.restore();
   }
 
+  function paintCopyIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, color: string) {
+    // IconCopy: rect 9,9 13x13 rx2 + path M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const s = size / 24;
+    ctx.translate(x, y);
+    ctx.scale(s, s);
+    roundRect(ctx, 9, 9, 13, 13, 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(5, 15);
+    ctx.lineTo(4, 15);
+    ctx.quadraticCurveTo(2, 15, 2, 13);
+    ctx.lineTo(2, 4);
+    ctx.quadraticCurveTo(2, 2, 4, 2);
+    ctx.lineTo(13, 2);
+    ctx.quadraticCurveTo(15, 2, 15, 4);
+    ctx.lineTo(15, 5);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function paintCheckIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, color: string) {
+    // IconCheck: M20 6 9 17l-5-5
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const s = size / 24;
+    ctx.translate(x, y);
+    ctx.scale(s, s);
+    ctx.beginPath();
+    ctx.moveTo(20, 6);
+    ctx.lineTo(9, 17);
+    ctx.lineTo(4, 12);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   function paintSelection(ctx: CanvasRenderingContext2D) {
     if (!selection) return;
     ctx.save();
@@ -2241,7 +2384,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (hitScrollbar(e.clientX, e.clientY)) return;
     const idx = hitTest(e.clientX, e.clientY);
     const b = idx >= 0 ? blocks[idx] : null;
-    if (b?.clickAction && !selecting) b.clickAction();
+    if (b?.clickAction && !selecting) {
+      // Fold / thought / tool expands insert content below the header. If we were
+      // stick-to-bottom, rebuild would pin scrollY to the new maxScroll and shove
+      // the header upward — lock the header's viewport offset instead.
+      if (b.kind === "fold" || b.kind === "thought-toggle" || b.kind === "tool-header") {
+        keepBottom = false;
+        scrollLock = { kind: b.kind, id: b.id, viewOffset: b.y - scrollY };
+      }
+      b.clickAction();
+    }
   }
 
   function onWheel(e: WheelEvent) {
@@ -2315,7 +2467,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const generation = ++layoutGeneration;
     pal = readPalette();
     const oldScroll = scrollY;
-    const wasBottom = keepBottom || maxScroll - scrollY <= 2;
+    const lock = scrollLock;
+    scrollLock = null;
+    const wasBottom = !lock && (keepBottom || maxScroll - scrollY <= 2);
     if (!await computeLayout(generation)) return;
     const liveKeys = new Set(
       blocks.filter((b) => b.data?.clipped).map((b) => blockScrollKey(b)),
@@ -2324,8 +2478,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (!liveKeys.has(key)) blockScrolls.delete(key);
     }
     maxScroll = Math.max(0, totalHeight - viewH);
-    if (wasBottom) scrollY = maxScroll;
-    else scrollY = Math.max(0, Math.min(maxScroll, oldScroll));
+    if (lock) {
+      const match = blocks.find((x) => x.kind === lock.kind && x.id === lock.id);
+      const y = match?.y ?? oldScroll + lock.viewOffset;
+      scrollY = Math.max(0, Math.min(maxScroll, y - lock.viewOffset));
+    } else if (wasBottom) {
+      scrollY = maxScroll;
+    } else {
+      scrollY = Math.max(0, Math.min(maxScroll, oldScroll));
+    }
     applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, false);
     paintAll();
