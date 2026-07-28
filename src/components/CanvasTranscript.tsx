@@ -2313,10 +2313,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (w === viewW && h === viewH && dpr === devicePixelRatio) return;
     dpr = devicePixelRatio || 1;
     viewW = w; viewH = h;
+    // alpha:false 缓冲在改尺寸后会被清空成不透明黑；立刻重绘，避免布局异步完成前的黑闪。
     canvasEl.width = Math.round(w * dpr);
     canvasEl.height = Math.round(h * dpr);
     maxScroll = Math.max(0, totalHeight - viewH);
     if (keepBottom) scrollY = maxScroll;
+    paintAll();
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────────────────────
