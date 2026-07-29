@@ -43,5 +43,13 @@ implementation for every non-LLM computation.
   root/name sorting approximate node's ICU/UTF-16 collation with byte order
   (exact for ASCII; punctuation/non-ASCII may differ). OS error *messages* are
   not parity-checked (libuv vs `io::Error`); error presence is.
-- M3: agent loop, steering, event contract matching `AlkaidAdapter`.
+- M3 (in progress): agent runtime port. Message construction
+  (`createErrorToolResult`, `createToolResultMessage`) and the `runLoop` state
+  machine (`runAgentLoop`/`runLoop`: two-level steering/follow-up loop,
+  sequential tool scheduling, event emission) are ported and verified
+  end-to-end against node's real `runAgentLoop` driven by a scripted mock LLM
+  and mock tools (plain text, single/double tool calls, unknown tool, error
+  stop). The LLM boundary is abstracted (`StreamFn`/`ToolFn`) and timestamps
+  are injected, since node uses non-deterministic `Date.now()`. Streaming
+  deltas, parallel tool execution, and the `Agent` lifecycle wrapper land next.
 - M4: wire into the Vega path and remove the node bridge runtime dependency.

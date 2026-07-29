@@ -14,6 +14,7 @@ import { formatSize, truncateHead, truncateTail, truncateLine } from "../node_mo
 import { resolvePath, normalizePath } from "../node_modules/@earendil-works/pi-coding-agent/dist/utils/paths.js";
 import { createWriteTool } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/write.js";
 import { createLsTool } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/ls.js";
+import { runAgentLoop } from "../node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -367,6 +368,106 @@ out.skillsPrompt = skillCases.map((skills) => ({
   })) },
   expected: core.formatAlkaidSkillsPrompt(skills),
 }));
+
+// --- agent loop (end-to-end with a mock LLM + mock tools) ---
+const assistantMsg = (content, stopReason) => ({
+  role: "assistant",
+  content,
+  api: "test-api", provider: "test-provider", model: "test-model",
+  usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  stopReason,
+  timestamp: 1000,
+});
+const textMsg = (text, stopReason = "end_turn") => assistantMsg([{ type: "text", text }], stopReason);
+const toolCallMsg = (id, name, args) => assistantMsg([{ type: "toolCall", id, name, arguments: args }], "tool_calls");
+const userMsg = (text) => ({ role: "user", content: [{ type: "text", text }], timestamp: 500 });
+
+// Mock stream: yields start+done and resolves result() to the scripted message.
+const makeStreamFn = (responses) => {
+  let call = 0;
+  return async () => {
+    const message = responses[call] ?? textMsg("(no more responses)");
+    call += 1;
+    return {
+      async *[Symbol.asyncIterator]() {
+        yield { type: "start", partial: message };
+        yield { type: "done" };
+      },
+      async result() { return message; },
+    };
+  };
+};
+
+const stripTimestamps = (value) => {
+  if (Array.isArray(value)) return value.map(stripTimestamps);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "timestamp") continue;
+      out[k] = stripTimestamps(v);
+    }
+    return out;
+  }
+  return value;
+};
+
+const runScenario = async ({ prompts, responses, tools, toolResults }) => {
+  const context = {
+    systemPrompt: "You are a test agent.",
+    messages: [],
+    tools: tools ?? [],
+  };
+  const config = {
+    model: { id: "test-model", provider: "test-provider", api: "test-api" },
+    convertToLlm: (messages) => messages.filter((m) => ["user", "assistant", "toolResult"].includes(m.role)),
+    toolExecution: "sequential",
+  };
+  const events = [];
+  const toolFn = (name, args) => {
+    const result = toolResults?.[name] ?? { content: [{ type: "text", text: `ran ${name}` }], details: {} };
+    return result;
+  };
+  // Wrap tools so execute() uses toolFn (pi execute signature: (id, args)).
+  const wrappedTools = (tools ?? []).map((t) => ({ ...t, execute: async (_id, args) => toolFn(t.name, args) }));
+  context.tools = wrappedTools;
+  const streamFn = makeStreamFn(responses);
+  const finalMessages = await runAgentLoop(prompts, context, config, async (event) => {
+    events.push(event);
+  }, undefined, streamFn);
+  return { events: stripTimestamps(events), finalMessages: stripTimestamps(finalMessages) };
+};
+
+const agentScenarios = [
+  { name: "plain_text", prompts: [userMsg("hello")], responses: [textMsg("hi there")], tools: [] },
+  { name: "one_tool_call", prompts: [userMsg("echo hi")],
+    responses: [toolCallMsg("call_1", "echo", { text: "hi" }), textMsg("done")],
+    tools: [{ name: "echo", description: "echo", parameters: {} }],
+    toolResults: { echo: { content: [{ type: "text", text: "echo: hi" }], details: { echoed: true } } } },
+  { name: "unknown_tool", prompts: [userMsg("use ghost")],
+    responses: [toolCallMsg("call_2", "ghost", {}), textMsg("recovered")],
+    tools: [{ name: "echo", description: "echo", parameters: {} }] },
+  { name: "error_stop", prompts: [userMsg("fail")],
+    responses: [assistantMsg([{ type: "text", text: "" }], "error")], tools: [] },
+  { name: "two_tool_calls", prompts: [userMsg("two")],
+    responses: [assistantMsg([{ type: "toolCall", id: "a", name: "echo", arguments: { text: "1" } }, { type: "toolCall", id: "b", name: "echo", arguments: { text: "2" } }], "tool_calls"), textMsg("done")],
+    tools: [{ name: "echo", description: "echo", parameters: {} }],
+    toolResults: { echo: { content: [{ type: "text", text: "ok" }], details: {} } } },
+];
+out.agentLoop = [];
+for (const scenario of agentScenarios) {
+  const result = await runScenario(scenario);
+  out.agentLoop.push({
+    input: {
+      name: scenario.name,
+      systemPrompt: "You are a test agent.",
+      prompts: scenario.prompts,
+      responses: scenario.responses,
+      tools: (scenario.tools ?? []).map((t) => ({ name: t.name })),
+      toolResults: scenario.toolResults ?? {},
+    },
+    expected: result,
+  });
+}
 
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");

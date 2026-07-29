@@ -4,13 +4,14 @@
 
 use base64::Engine;
 use pi_core::{
+    agent::{run_agent_loop, LoopConfig, LoopContext},
     apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
     clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, format_alkaid_skills_prompt,
     format_size, govern_text, inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path,
     read_files_one, resolve_to_cwd, truncate_head, truncate_line, truncate_tail, write_tool,
     NormalizeOptions, ReadRequest, ShellConfig, Skill, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const GOLDEN: &str = include_str!("../testdata/golden.json");
 
@@ -187,6 +188,82 @@ fn parse_normalize_options(value: &Value) -> NormalizeOptions {
         strip_at_prefix: get("stripAtPrefix").and_then(Value::as_bool).unwrap_or(false),
         expand_tilde: get("expandTilde").and_then(Value::as_bool).unwrap_or(true),
         home_dir: get("homeDir").and_then(Value::as_str).map(String::from),
+    }
+}
+
+fn strip_timestamps(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(strip_timestamps).collect()),
+        Value::Object(map) => {
+            let mut cleaned = serde_json::Map::new();
+            for (key, item) in map {
+                if key == "timestamp" {
+                    continue;
+                }
+                cleaned.insert(key.clone(), strip_timestamps(item));
+            }
+            Value::Object(cleaned)
+        }
+        other => other.clone(),
+    }
+}
+
+#[test]
+fn parity_agent_loop() {
+    for case in golden()["agentLoop"].as_array().unwrap() {
+        let input = &case["input"];
+        let name = input["name"].as_str().unwrap();
+        let system_prompt = input["systemPrompt"].as_str().unwrap().to_string();
+        let prompts: Vec<Value> = input["prompts"].as_array().unwrap().iter().cloned().collect();
+        let responses: Vec<Value> = input["responses"].as_array().unwrap().iter().cloned().collect();
+        let tools: Vec<Value> = input["tools"].as_array().unwrap().iter().cloned().collect();
+        let tool_results = input["toolResults"].clone();
+
+        let mut context = LoopContext {
+            system_prompt,
+            messages: Vec::new(),
+            tools,
+        };
+        let mut config = LoopConfig {
+            get_steering_messages: None,
+            get_follow_up_messages: None,
+            timestamp: 9999,
+        };
+
+        let mut events: Vec<Value> = Vec::new();
+        let mut emit = |event: Value| events.push(event);
+        let mut stream_fn = |index: usize, _llm_context: &Value| -> Value {
+            responses
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| json!({ "role": "assistant", "content": [], "stopReason": "end_turn" }))
+        };
+        let mut tool_fn = |tool_name: &str, _args: &Value| -> (Value, bool) {
+            match tool_results.get(tool_name) {
+                Some(result) => (result.clone(), false),
+                None => (
+                    json!({ "content": [{ "type": "text", "text": format!("ran {tool_name}") }], "details": {} }),
+                    false,
+                ),
+            }
+        };
+
+        let final_messages =
+            run_agent_loop(&prompts, &mut context, &mut config, &mut emit, &mut stream_fn, &mut tool_fn);
+
+        let events_stripped: Vec<Value> = events.iter().map(strip_timestamps).collect();
+        let final_stripped: Vec<Value> = final_messages.iter().map(strip_timestamps).collect();
+
+        assert_eq!(
+            events_stripped,
+            case["expected"]["events"].as_array().unwrap().clone(),
+            "agent loop events: {name}"
+        );
+        assert_eq!(
+            final_stripped,
+            case["expected"]["finalMessages"].as_array().unwrap().clone(),
+            "agent loop finalMessages: {name}"
+        );
     }
 }
 
