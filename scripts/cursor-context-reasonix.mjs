@@ -368,16 +368,11 @@ function messageWithRecoveryContext(message, history) {
 
 function contextTokensFromUsage(usage) {
   if (!usage || typeof usage !== "object") return 0;
-  // Context occupancy excludes generated output but includes cached input. Prefer total-output when
-  // available because providers disagree on whether `inputTokens` already includes cache reads.
-  const total = Number(usage.totalTokens ?? usage.total_tokens);
-  const output = Number(usage.outputTokens ?? usage.output_tokens) || 0;
-  if (total > output) return total - output;
+  // Cursor input already includes cache reads; cache writes are reported inside output but also
+  // become input context. Exclude uncached model output and count each cache category once.
   const input = Number(usage.inputTokens ?? usage.input_tokens) || 0;
-  const cacheRead = Number(usage.cacheReadTokens ?? usage.cache_read_tokens) || 0;
   const cacheWrite = Number(usage.cacheWriteTokens ?? usage.cache_write_tokens) || 0;
-  const cached = cacheRead + cacheWrite;
-  return input >= cached ? input : input + cached;
+  return input + cacheWrite;
 }
 
 function cursorUsageField(usage, camel, snake) {
@@ -420,36 +415,21 @@ function cursorRunUsage(result, accumulatedStreamUsage) {
   return accumulatedStreamUsage;
 }
 
-/**
- * Normalize Cursor usage to disjoint fields before Nova's adapter adds cache into inputTokens.
- * Some payloads already include cache in inputTokens (total ≈ input+output); others keep
- * input/cache mutually exclusive (total ≈ input+output+cache). Always emit the exclusive shape.
- */
+/** Cursor input includes cache reads and output includes cache writes; emit disjoint fields. */
 function normalizeCursorUsageForNova(usage) {
   if (!usage || typeof usage !== "object") return usage;
   const input = cursorUsageField(usage, "inputTokens", "input_tokens");
   const output = cursorUsageField(usage, "outputTokens", "output_tokens");
   const cacheRead = cursorUsageField(usage, "cacheReadTokens", "cache_read_tokens");
   const cacheWrite = cursorUsageField(usage, "cacheWriteTokens", "cache_write_tokens");
-  const cached = cacheRead + cacheWrite;
-  const reportedTotal = Number(usage.totalTokens ?? usage.total_tokens) || 0;
-
-  let uncached = input;
-  if (cached > 0) {
-    const exclusiveTotal = input + output + cached;
-    const inclusiveTotal = input + output;
-    const inclusiveLikely = reportedTotal > 0
-      ? Math.abs(reportedTotal - inclusiveTotal) < Math.abs(reportedTotal - exclusiveTotal)
-      : input >= cached;
-    if (inclusiveLikely) uncached = Math.max(0, input - cached);
-  }
-
+  const uncachedInput = Math.max(0, input - cacheRead);
+  const uncachedOutput = Math.max(0, output - cacheWrite);
   const normalized = {
-    inputTokens: uncached,
-    outputTokens: output,
+    inputTokens: uncachedInput,
+    outputTokens: uncachedOutput,
     cacheReadTokens: cacheRead,
     cacheWriteTokens: cacheWrite,
-    totalTokens: uncached + output + cacheRead + cacheWrite,
+    totalTokens: uncachedInput + uncachedOutput + cacheRead + cacheWrite,
   };
   const reasoning = cursorUsageField(usage, "reasoningTokens", "reasoning_tokens");
   if (reasoning > 0) normalized.reasoningTokens = reasoning;

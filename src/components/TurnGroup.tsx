@@ -114,12 +114,7 @@ export function turnTokenTitle(t: TurnItem | undefined | null): string | undefin
   const input = t.inputTokens ?? 0;
   const cacheRead = t.cacheReadTokens ?? 0;
   const cacheWrite = t.cacheWriteTokens ?? 0;
-  const cached = cacheRead + cacheWrite;
-  // 旧 Cursor 轮次曾把 cache 加进 inputTokens 两次（≈ uncached + 2*cache）。
-  let read = Math.max(0, input - cached);
-  if (cached > 0 && input >= cached * 2) {
-    read = Math.max(0, input - cached * 2);
-  }
+  const read = Math.max(0, input - cacheRead - cacheWrite);
   const parts = [
     `读取 ${fmtTokens(read)}`,
     `写入 ${fmtTokens(t.outputTokens ?? 0)}`,

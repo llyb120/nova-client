@@ -348,11 +348,65 @@ function messageWithRecoveryContext(message, history) {
 
 function contextTokensFromUsage(usage) {
   if (!usage || typeof usage !== "object") return 0;
+  const input = Number(usage.inputTokens ?? usage.input_tokens) || 0;
+  const cacheWrite = Number(usage.cacheWriteTokens ?? usage.cache_write_tokens) || 0;
+  return input + cacheWrite;
+}
+
+function cursorUsageField(usage, camel, snake) {
+  return Number(usage?.[camel] ?? usage?.[snake]) || 0;
+}
+
+function mergeCursorUsage(total, usage) {
+  if (!usage || typeof usage !== "object") return total;
+  const merged = {
+    inputTokens: cursorUsageField(total, "inputTokens", "input_tokens")
+      + cursorUsageField(usage, "inputTokens", "input_tokens"),
+    outputTokens: cursorUsageField(total, "outputTokens", "output_tokens")
+      + cursorUsageField(usage, "outputTokens", "output_tokens"),
+    cacheReadTokens: cursorUsageField(total, "cacheReadTokens", "cache_read_tokens")
+      + cursorUsageField(usage, "cacheReadTokens", "cache_read_tokens"),
+    cacheWriteTokens: cursorUsageField(total, "cacheWriteTokens", "cache_write_tokens")
+      + cursorUsageField(usage, "cacheWriteTokens", "cache_write_tokens"),
+  };
+  merged.totalTokens = merged.inputTokens + merged.outputTokens
+    + merged.cacheReadTokens + merged.cacheWriteTokens;
+  const reasoning = cursorUsageField(total, "reasoningTokens", "reasoning_tokens")
+    + cursorUsageField(usage, "reasoningTokens", "reasoning_tokens");
+  if (reasoning > 0) merged.reasoningTokens = reasoning;
+  return merged;
+}
+
+function cursorUsageTotal(usage) {
+  if (!usage || typeof usage !== "object") return 0;
   const total = Number(usage.totalTokens ?? usage.total_tokens);
   if (total > 0) return total;
-  return ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
-    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]
-    .reduce((sum, key) => sum + (Number(usage[key]) || 0), 0);
+  return contextTokensFromUsage(usage) + cursorUsageField(usage, "outputTokens", "output_tokens");
+}
+
+function cursorRunUsage(result, accumulatedStreamUsage) {
+  const fromResult = result?.usage;
+  return cursorUsageTotal(fromResult) > 0 ? fromResult : accumulatedStreamUsage;
+}
+
+function normalizeCursorUsageForNova(usage) {
+  if (!usage || typeof usage !== "object") return usage;
+  const input = cursorUsageField(usage, "inputTokens", "input_tokens");
+  const output = cursorUsageField(usage, "outputTokens", "output_tokens");
+  const cacheRead = cursorUsageField(usage, "cacheReadTokens", "cache_read_tokens");
+  const cacheWrite = cursorUsageField(usage, "cacheWriteTokens", "cache_write_tokens");
+  const uncachedInput = Math.max(0, input - cacheRead);
+  const uncachedOutput = Math.max(0, output - cacheWrite);
+  const normalized = {
+    inputTokens: uncachedInput,
+    outputTokens: uncachedOutput,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: cacheWrite,
+    totalTokens: uncachedInput + uncachedOutput + cacheRead + cacheWrite,
+  };
+  const reasoning = cursorUsageField(usage, "reasoningTokens", "reasoning_tokens");
+  if (reasoning > 0) normalized.reasoningTokens = reasoning;
+  return normalized;
 }
 
 function extractTurnConclusion(state, result) {
@@ -936,7 +990,8 @@ async function main() {
           );
           agent = promptResult.agent;
           activeRun = promptResult.run;
-          let usage;
+          let lastStreamUsage;
+          let accumulatedStreamUsage;
           const streamStartedAt = performance.now();
           const streamTask = (async () => {
             for await (const streamMessage of activeRun.stream()) {
@@ -948,7 +1003,10 @@ async function main() {
               if (items.length || plan) markActivity();
               for (const item of items) send({ type: "item", item });
               if (plan) send({ type: "plan", plan });
-              if (streamMessage.type === "usage") usage = streamMessage.usage;
+              if (streamMessage.type === "usage") {
+                lastStreamUsage = streamMessage.usage;
+                accumulatedStreamUsage = mergeCursorUsage(accumulatedStreamUsage, streamMessage.usage);
+              }
             }
           })();
           // Cursor occasionally leaves a local run pending forever without yielding even one
@@ -974,8 +1032,10 @@ async function main() {
             // Completed full-stage turns keep tools/assistant text but drop thinking, matching Vega.
             memory.fullTurns.push(formatCompletedTurn(originalMessage, state));
           }
-          const turnUsage = usage ?? result.usage;
-          const measuredTokens = contextTokensFromUsage(turnUsage);
+          // A Cursor run can contain several model turns around tool calls. Bill the complete run,
+          // but use only the latest model turn to estimate live context occupancy.
+          const turnUsage = cursorRunUsage(result, accumulatedStreamUsage);
+          const measuredTokens = contextTokensFromUsage(lastStreamUsage ?? turnUsage);
           if (memory.contextStage === "full") {
             const fullContextChars = formatSlimMemory(memory).length;
             if (memory.turns.length >= CURSOR_SLIM_MEMORY_TURNS
@@ -999,7 +1059,7 @@ async function main() {
           await saveSlimMemory(memoryKey, memory).catch((error) => {
             process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
-          send({ type: "done", usage: turnUsage });
+          send({ type: "done", usage: normalizeCursorUsageForNova(turnUsage) });
           completed = true;
         } catch (error) {
           const retryable = shouldSilentRetryCursorTurn(error, { producedOutput, attempt });
@@ -1057,6 +1117,9 @@ export {
   cursorShellProgram,
   cursorTodoPlan,
   contextTokensFromUsage,
+  cursorRunUsage,
+  mergeCursorUsage,
+  normalizeCursorUsageForNova,
   contextThresholdsForModel,
   cursorContextWindow,
   parseCursorModelContextRules,

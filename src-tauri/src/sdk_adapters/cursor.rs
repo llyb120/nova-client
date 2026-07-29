@@ -81,25 +81,11 @@ impl SdkAdapter for CursorAdapter {
         };
         let cache_read = usage.get("cacheReadTokens").and_then(Value::as_u64);
         let cache_write = usage.get("cacheWriteTokens").and_then(Value::as_u64);
-        let cached = cache_read
-            .unwrap_or(0)
+        // The bridge removes Cursor's input/cache-read and output/cache-write overlaps first.
+        // Nova stores aggregate inputTokens, so add both disjoint cache categories once here.
+        let input = input
+            .saturating_add(cache_read.unwrap_or(0))
             .saturating_add(cache_write.unwrap_or(0));
-        // Cursor payloads disagree on whether inputTokens already includes cache. Prefer
-        // totalTokens to detect inclusive input; otherwise treat fields as disjoint.
-        let already_includes_cache = if cached == 0 {
-            false
-        } else if let Some(total) = usage.get("totalTokens").and_then(Value::as_u64) {
-            let exclusive_total = input.saturating_add(output).saturating_add(cached);
-            let inclusive_total = input.saturating_add(output);
-            inclusive_total.abs_diff(total) < exclusive_total.abs_diff(total)
-        } else {
-            input >= cached
-        };
-        let input = if already_includes_cache {
-            input
-        } else {
-            input.saturating_add(cached)
-        };
         (
             Some(canonical_usage(input, output, cache_read, cache_write)),
             None,

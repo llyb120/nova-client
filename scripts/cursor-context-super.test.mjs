@@ -10,6 +10,9 @@ const {
   completePendingTools,
   compressSlimMemory,
   contextTokensFromUsage,
+  cursorRunUsage,
+  mergeCursorUsage,
+  normalizeCursorUsageForNova,
   createCursorAgent,
   createCursorFilesystemTools,
   createMessageState,
@@ -502,8 +505,37 @@ assert.deepEqual(compressible.turns, [{
   userPrompt: "latest user prompt must remain exact",
   conclusion: "latest conclusion",
 }]);
-assert.equal(contextTokensFromUsage({ totalTokens: 900, inputTokens: 800 }), 900);
-assert.equal(contextTokensFromUsage({ input_tokens: 700, output_tokens: 50 }), 750);
+assert.equal(contextTokensFromUsage({ totalTokens: 900, outputTokens: 100, inputTokens: 800 }), 800);
+assert.equal(contextTokensFromUsage({ input_tokens: 700, output_tokens: 50 }), 700);
+assert.equal(contextTokensFromUsage({ inputTokens: 700, cacheWriteTokens: 100 }), 800);
+const firstModelTurnUsage = {
+  inputTokens: 100,
+  outputTokens: 20,
+  cacheReadTokens: 200,
+  cacheWriteTokens: 40,
+};
+const lastModelTurnUsage = {
+  inputTokens: 120,
+  outputTokens: 30,
+  cacheReadTokens: 240,
+  cacheWriteTokens: 0,
+};
+const completeRunUsage = {
+  inputTokens: 220,
+  outputTokens: 50,
+  cacheReadTokens: 440,
+  cacheWriteTokens: 40,
+  totalTokens: 750,
+};
+assert.deepEqual(mergeCursorUsage(firstModelTurnUsage, lastModelTurnUsage), completeRunUsage);
+assert.equal(cursorRunUsage({ usage: completeRunUsage }, lastModelTurnUsage), completeRunUsage);
+assert.equal(cursorRunUsage({}, completeRunUsage), completeRunUsage);
+assert.deepEqual(normalizeCursorUsageForNova(completeRunUsage), {
+  ...completeRunUsage,
+  inputTokens: 0,
+  outputTokens: 10,
+  totalTokens: 490,
+});
 
 const conclusionState = createMessageState();
 conclusionState.texts.set("run-assistant-1", "Final answer from the assistant.");

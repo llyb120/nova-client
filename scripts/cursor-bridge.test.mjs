@@ -637,27 +637,27 @@ assert.equal(cursorContextWindow("gpt-5", contextRules, 128_000), 128_000);
 assert.deepEqual(parseCursorModelContextRules("not-json"), []);
 assert.equal(contextTokensFromUsage({ totalTokens: 900, outputTokens: 100, inputTokens: 800 }), 800);
 assert.equal(contextTokensFromUsage({ input_tokens: 700, output_tokens: 50 }), 700);
-assert.equal(contextTokensFromUsage({ inputTokens: 100, cacheReadTokens: 600, cacheWriteTokens: 100 }), 800);
+assert.equal(contextTokensFromUsage({ inputTokens: 700, cacheReadTokens: 600, cacheWriteTokens: 100 }), 800);
 const lastCursorTurnUsage = {
-  inputTokens: 100,
+  inputTokens: 300,
   outputTokens: 20,
   cacheReadTokens: 200,
   cacheWriteTokens: 0,
-  totalTokens: 320,
+  totalTokens: 520,
 };
 const earlierCursorTurnUsage = {
-  inputTokens: 80,
-  outputTokens: 10,
+  inputTokens: 230,
+  outputTokens: 50,
   cacheReadTokens: 150,
   cacheWriteTokens: 40,
-  totalTokens: 280,
+  totalTokens: 470,
 };
 const cumulativeCursorRunUsage = {
-  inputTokens: 180,
-  outputTokens: 30,
+  inputTokens: 530,
+  outputTokens: 70,
   cacheReadTokens: 350,
   cacheWriteTokens: 40,
-  totalTokens: 600,
+  totalTokens: 990,
 };
 assert.deepEqual(
   mergeCursorUsage(earlierCursorTurnUsage, lastCursorTurnUsage),
@@ -672,37 +672,21 @@ assert.equal(cursorRunUsage({ usage: { totalTokens: 0 } }, cumulativeCursorRunUs
 // Occupancy must track the latest model turn, not the summed billing total.
 assert.equal(contextTokensFromUsage(lastCursorTurnUsage), 300);
 assert.equal(contextTokensFromUsage(cumulativeCursorRunUsage), 570);
-// Exclusive fields stay exclusive; inclusive inputTokens are stripped before Nova adds cache.
-assert.deepEqual(
-  normalizeCursorUsageForNova({
-    inputTokens: 100,
-    outputTokens: 20,
-    cacheReadTokens: 200,
-    cacheWriteTokens: 0,
-    totalTokens: 320,
-  }),
-  {
-    inputTokens: 100,
-    outputTokens: 20,
-    cacheReadTokens: 200,
-    cacheWriteTokens: 0,
-    totalTokens: 320,
-  },
-);
+// Cursor input/output overlap their cache categories; normalize them before Nova aggregates input.
 assert.deepEqual(
   normalizeCursorUsageForNova({
     inputTokens: 300,
-    outputTokens: 20,
+    outputTokens: 60,
     cacheReadTokens: 200,
-    cacheWriteTokens: 0,
-    totalTokens: 320,
+    cacheWriteTokens: 40,
+    totalTokens: 600,
   }),
   {
     inputTokens: 100,
     outputTokens: 20,
     cacheReadTokens: 200,
-    cacheWriteTokens: 0,
-    totalTokens: 320,
+    cacheWriteTokens: 40,
+    totalTokens: 360,
   },
 );
 assert.deepEqual(
@@ -710,13 +694,13 @@ assert.deepEqual(
     inputTokens: 124_616,
     outputTokens: 1_653,
     cacheReadTokens: 114_816,
-    cacheWriteTokens: 0,
+    cacheWriteTokens: 40,
   }),
   {
     inputTokens: 9_800,
-    outputTokens: 1_653,
+    outputTokens: 1_613,
     cacheReadTokens: 114_816,
-    cacheWriteTokens: 0,
+    cacheWriteTokens: 40,
     totalTokens: 126_269,
   },
 );
