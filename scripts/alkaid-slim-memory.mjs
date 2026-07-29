@@ -282,6 +282,37 @@ export function shouldUseFullContext(memory, maxContextTokens, maxContextChars =
     : JSON.stringify(memory.fullMessages).length < maxContextChars;
 }
 
+/**
+ * Replace completed native history with canonical slim memory while retaining the active user
+ * turn and every assistant/tool message produced after it. This mirrors Reasonix's forced fold:
+ * completed history is the cache-reset region, while in-flight work remains verbatim.
+ */
+export function rebaseNativeContextForSlimMemory(messages, activeTurnStart, memory) {
+  const source = messages ?? [];
+  const start = Number.isInteger(activeTurnStart) ? activeTurnStart : -1;
+  if (start <= 0 || start >= source.length || source[start]?.role !== "user") {
+    return { messages: source, changed: false };
+  }
+  const compactContext = formatSlimMemory(memoryWithoutCurrent(memory, { pendingMessages: true }));
+  const current = structuredClone(source[start]);
+  if (typeof current.content === "string") {
+    current.content = `${compactContext}\n\nUser:\n${current.content}`;
+  } else if (Array.isArray(current.content)) {
+    const firstText = current.content.findIndex((part) => part?.type === "text");
+    if (firstText >= 0) {
+      current.content[firstText] = {
+        ...current.content[firstText],
+        text: `${compactContext}\n\nUser:\n${String(current.content[firstText].text ?? "")}`,
+      };
+    } else {
+      current.content.unshift({ type: "text", text: compactContext });
+    }
+  } else {
+    current.content = [{ type: "text", text: compactContext }];
+  }
+  return { messages: [current, ...structuredClone(source.slice(start + 1))], changed: true };
+}
+
 export function seedSlimMemoryFromMessages(memory, messages) {
   for (const message of messages ?? []) {
     if (message?.role === "user") appendSlimTurn(memory, textContent(message.content));

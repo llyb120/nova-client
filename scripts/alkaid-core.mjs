@@ -871,6 +871,13 @@ export async function createAlkaidAgent(options = {}) {
     toolExecution: "parallel",
     steeringMode: "all",
     sessionId,
+    prepareNextTurnWithContext: options.prepareNextTurnWithContext
+      ? async (context, signal) => {
+          const update = await options.prepareNextTurnWithContext(context, signal);
+          if (update?.context?.messages) agent.state.messages = update.context.messages;
+          return update;
+        }
+      : undefined,
     onPayload: (payload, model) => {
       const modelApi = model?.api ?? api;
       if (modelApi !== "openai-completions" && modelApi !== "openai-responses") return undefined;

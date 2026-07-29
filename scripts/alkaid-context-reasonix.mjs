@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { ALKAID_PROVIDER_IDLE_TIMEOUT_ENABLED, ALKAID_PROVIDER_IDLE_TIMEOUT_MS, alkaidPromptInput, alkaidUserMessage, createAlkaidAgent, createAlkaidIdleTimeout, expandAlkaidSkillCommand, mergeAlkaidUsage, messagesWithPendingAlkaidPrompt, restoreAlkaidSteeringForRetry, runAlkaidPromptWithRetry } from "./alkaid-core.mjs";
 import { alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
-import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, rebaseNativeContextForSlimMemory, seedSlimMemoryFromMessages, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import { loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 function stableHash(value) {
@@ -165,12 +165,16 @@ async function prompt(request, commands) {
   const stripsCompletedReasoning = slimContext
     && (resolved.model.api?.startsWith("openai") || resolved.model.api === "azure-openai-responses");
   let nativeMessages;
+  const resumedPendingTurn = slimContext && memory.pendingMessages?.length > 0;
   if (!slimContext) nativeMessages = await loadMessages(request.sessionId);
-  else if (memory.pendingMessages?.length) nativeMessages = memory.pendingMessages;
+  else if (resumedPendingTurn) nativeMessages = memory.pendingMessages;
   else {
     nativeMessages = useFullContext ? memory.fullMessages : [];
     if (stripsCompletedReasoning) nativeMessages = stripCompletedOpenAIReasoning(nativeMessages);
   }
+  // A recovered interrupted trajectory is itself active work and must not be folded as completed
+  // history. Fresh turns may fold everything before their newly appended user message.
+  let activeTurnStart = resumedPendingTurn ? 0 : nativeMessages.length;
   // Persist the request before provider/agent initialization. The runtime must still receive the
   // previous transcript, otherwise the same request would be replayed once by history and once by
   // prompt(). If initialization or streaming fails, the next turn can resume from this checkpoint.
@@ -196,6 +200,55 @@ async function prompt(request, commands) {
     // Early turns and interrupted work retain the native message/tool trajectory. Once either
     // threshold is reached, compact memory replaces completed trajectories as usual.
     messages: nativeMessages,
+    prepareNextTurnWithContext: slimContext
+      ? async ({ message, toolResults, context }) => {
+          // Reasonix performs context maintenance after every model/tool round, before the next
+          // provider request. Waiting for agent_end lets a long single task overflow mid-turn.
+          if (!toolResults?.length) return undefined;
+          const measuredTokens = contextTokensFromMessages([message]);
+          if (!(measuredTokens > 0)) return undefined;
+          const pressure = contextPressureTier(measuredTokens, contextWindow);
+          memory.contextTokens = measuredTokens;
+          memory.contextTier = pressure;
+          let messages = context.messages;
+          let changed = false;
+
+          if (["snip", "elide", "force"].includes(pressure)) {
+            const compactedTools = compactNativeToolResults(messages, pressure);
+            if (compactedTools.changed) {
+              messages = compactedTools.messages;
+              changed = true;
+            }
+          }
+          if (pressure === "force" && activeTurnStart > 0) {
+            const rebased = rebaseNativeContextForSlimMemory(messages, activeTurnStart, memory);
+            if (rebased.changed) {
+              messages = rebased.messages;
+              activeTurnStart = 0;
+              memory.contextStage = "slim";
+              memory.fullMessages = [];
+              memory.contextTokens = estimateContextTokens(formatSlimMemory(memory));
+              changed = true;
+            }
+          }
+          if (!changed) return undefined;
+
+          memory.rewriteVersion = (memory.rewriteVersion ?? 0) + 1;
+          memory.pendingMessages = structuredClone(messages);
+          await saveSlimMemory(sessionId, memory).catch((error) => {
+            process.stderr.write(`Vega mid-turn context persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          });
+          send({
+            type: "timing",
+            phase: "mid_turn_context_rewrite",
+            elapsedMs: 0,
+            contextTier: pressure,
+            measuredTokens,
+            rewriteVersion: memory.rewriteVersion,
+          });
+          return { context: { ...context, messages } };
+        }
+      : undefined,
     readOnly: request.mode === "plan",
   });
   if (!memory.systemPromptSnapshot) memory.systemPromptSnapshot = runtime.systemPrompt;

@@ -10,7 +10,7 @@ import { createCodingTools, createReadOnlyTools, getShellConfig } from "@earendi
 import { startedToolItem } from "./alkaid-bridge-common.mjs";
 import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
 import { ALKAID_PROVIDER_DIAGNOSTIC_LOG, alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
-import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
+import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, rebaseNativeContextForSlimMemory, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import {
   alkaidPromptInput,
   alkaidSkillsRoot,
@@ -341,6 +341,32 @@ test("Vega progressively compacts only older native tool results", () => {
   const elided = compactNativeToolResults(messages, "elide");
   assert.match(elided.messages[0].content[0].text, /^\[elided tool result old/);
   assert.equal(elided.messages.at(-1), messages.at(-1));
+});
+
+test("Vega force-folds completed history but keeps the active native trajectory", () => {
+  const memory = createSlimMemory();
+  appendSlimTurn(memory, "completed request");
+  setLatestConclusion(memory, "completed conclusion");
+  appendSlimTurn(memory, "active request");
+  memory.pendingMessages = [{ role: "user", content: [{ type: "text", text: "active request" }] }];
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "completed request" }] },
+    { role: "assistant", content: [{ type: "text", text: "old native trajectory" }] },
+    { role: "user", content: [{ type: "text", text: "active request" }, { type: "image", data: "image" }] },
+    { role: "assistant", content: [{ type: "toolCall", id: "call", name: "read", arguments: {} }] },
+    { role: "toolResult", toolCallId: "call", content: [{ type: "text", text: "current result" }] },
+  ];
+  const rebased = rebaseNativeContextForSlimMemory(messages, 2, memory);
+  assert.equal(rebased.changed, true);
+  assert.equal(rebased.messages.length, 3);
+  assert.match(rebased.messages[0].content[0].text, /completed request/);
+  assert.match(rebased.messages[0].content[0].text, /completed conclusion/);
+  assert.match(rebased.messages[0].content[0].text, /active request$/);
+  assert.equal(rebased.messages[0].content[1].type, "image");
+  assert.equal(rebased.messages[1].content[0].type, "toolCall");
+  assert.equal(rebased.messages[2].content[0].text, "current result");
+  assert.doesNotMatch(JSON.stringify(rebased.messages), /old native trajectory/);
+  assert.equal(rebaseNativeContextForSlimMemory(messages, 0, memory).changed, false);
 });
 
 test("Vega context measures the largest input request without generated output", () => {
