@@ -31,6 +31,7 @@ mod threads;
 mod time_machine;
 mod updater;
 mod vega_native;
+mod vega_provider;
 #[cfg(windows)]
 mod windows_shell_shim;
 
