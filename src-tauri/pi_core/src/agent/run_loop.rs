@@ -44,6 +44,10 @@ pub struct LoopConfig<'a> {
     pub get_steering_messages: Option<Box<QueueFn<'a>>>,
     pub get_follow_up_messages: Option<Box<QueueFn<'a>>>,
     pub timestamp: u64,
+    /// When true, a batch of tool calls emits all `tool_execution_start` events,
+    /// runs the tools, emits all `tool_execution_end` events, then emits the
+    /// `toolResult` messages in order (node `executeToolCallsParallel`).
+    pub parallel: bool,
 }
 
 fn drain(queue: &mut Option<Box<QueueFn>>) -> Vec<Value> {
@@ -159,9 +163,58 @@ fn stream_assistant_response(
     final_message
 }
 
-/// Execute one tool call, emitting `tool_execution_start`/`end` and the
-/// `toolResult` message pair. Mirrors the sequential path of node
-/// `executeToolCalls`.
+/// A finalized tool call: identity plus result, used to order parallel batches.
+struct FinalizedTool {
+    id: String,
+    name: String,
+    result: Value,
+    is_error: bool,
+}
+
+fn emit_tool_start(emit: &mut dyn FnMut(Value), tool_call: &Value) {
+    let id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
+    let name = tool_call.get("name").and_then(Value::as_str).unwrap_or("");
+    let args = tool_call.get("arguments").cloned().unwrap_or(json!({}));
+    emit(json!({ "type": "tool_execution_start", "toolCallId": id, "toolName": name, "args": args }));
+}
+
+/// Run a tool call without emitting events (the node `prepareToolCall` +
+/// `executePreparedToolCall` core, minus hooks).
+fn run_tool_call(context: &LoopContext, tool_call: &Value, tool_fn: &mut ToolFn) -> FinalizedTool {
+    let id = tool_call.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = tool_call.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let args = tool_call.get("arguments").cloned().unwrap_or(json!({}));
+    let (result, is_error) = if has_tool(context, &name) {
+        tool_fn(&name, &args)
+    } else {
+        (create_error_tool_result(&format!("Tool {name} not found")), true)
+    };
+    FinalizedTool { id, name, result, is_error }
+}
+
+fn emit_tool_end(emit: &mut dyn FnMut(Value), finalized: &FinalizedTool) {
+    emit(json!({ "type": "tool_execution_end", "toolCallId": finalized.id, "toolName": finalized.name, "result": finalized.result, "isError": finalized.is_error }));
+}
+
+/// Build the `toolResult` message and emit its `message_start`/`message_end`.
+fn emit_tool_result_message(
+    emit: &mut dyn FnMut(Value),
+    finalized: &FinalizedTool,
+    timestamp: u64,
+) -> Value {
+    let message = create_tool_result_message(
+        &finalized.id,
+        &finalized.name,
+        &finalized.result,
+        finalized.is_error,
+        timestamp,
+    );
+    emit(json!({ "type": "message_start", "message": message }));
+    emit(json!({ "type": "message_end", "message": message }));
+    message
+}
+
+/// Execute one tool call sequentially: start, run, end, then result message.
 fn execute_one_tool(
     context: &LoopContext,
     tool_call: &Value,
@@ -169,24 +222,10 @@ fn execute_one_tool(
     emit: &mut dyn FnMut(Value),
     timestamp: u64,
 ) -> Value {
-    let id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
-    let name = tool_call.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = tool_call.get("arguments").cloned().unwrap_or(json!({}));
-
-    emit(json!({ "type": "tool_execution_start", "toolCallId": id, "toolName": name, "args": args }));
-
-    let (result, is_error) = if has_tool(context, name) {
-        tool_fn(name, &args)
-    } else {
-        (create_error_tool_result(&format!("Tool {name} not found")), true)
-    };
-
-    emit(json!({ "type": "tool_execution_end", "toolCallId": id, "toolName": name, "result": result, "isError": is_error }));
-
-    let message = create_tool_result_message(id, name, &result, is_error, timestamp);
-    emit(json!({ "type": "message_start", "message": message }));
-    emit(json!({ "type": "message_end", "message": message }));
-    message
+    emit_tool_start(emit, tool_call);
+    let finalized = run_tool_call(context, tool_call, tool_fn);
+    emit_tool_end(emit, &finalized);
+    emit_tool_result_message(emit, &finalized, timestamp)
 }
 
 /// Port of `runAgentLoop`: append the prompts, emit the opening events, then
@@ -266,10 +305,29 @@ fn run_loop_body(
             let mut tool_results: Vec<Value> = Vec::new();
             has_more_tool_calls = false;
             if !tool_calls.is_empty() {
-                for tool_call in &tool_calls {
-                    let result_message =
-                        execute_one_tool(context, tool_call, tool_fn, emit, config.timestamp);
-                    tool_results.push(result_message);
+                if config.parallel {
+                    // Phase 1: emit every start first (node emits all starts in
+                    // the prepare loop before any execution settles).
+                    for tool_call in &tool_calls {
+                        emit_tool_start(emit, tool_call);
+                    }
+                    // Phase 2: run each tool and emit its end.
+                    let mut finalized: Vec<FinalizedTool> = Vec::new();
+                    for tool_call in &tool_calls {
+                        let done = run_tool_call(context, tool_call, tool_fn);
+                        emit_tool_end(emit, &done);
+                        finalized.push(done);
+                    }
+                    // Phase 3: result messages in call order.
+                    for done in &finalized {
+                        tool_results.push(emit_tool_result_message(emit, done, config.timestamp));
+                    }
+                } else {
+                    for tool_call in &tool_calls {
+                        let result_message =
+                            execute_one_tool(context, tool_call, tool_fn, emit, config.timestamp);
+                        tool_results.push(result_message);
+                    }
                 }
                 has_more_tool_calls = true;
                 for result in &tool_results {

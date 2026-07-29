@@ -436,7 +436,7 @@ const stripTimestamps = (value) => {
   return value;
 };
 
-const runScenario = async ({ prompts, responses, tools, toolResults }) => {
+const runScenario = async ({ prompts, responses, tools, toolResults, toolExecution }) => {
   const context = {
     systemPrompt: "You are a test agent.",
     messages: [],
@@ -445,7 +445,7 @@ const runScenario = async ({ prompts, responses, tools, toolResults }) => {
   const config = {
     model: { id: "test-model", provider: "test-provider", api: "test-api" },
     convertToLlm: (messages) => messages.filter((m) => ["user", "assistant", "toolResult"].includes(m.role)),
-    toolExecution: "sequential",
+    toolExecution: toolExecution ?? "sequential",
   };
   const events = [];
   const toolFn = (name, args) => {
@@ -480,6 +480,11 @@ const agentScenarios = [
   { name: "streaming_text", prompts: [userMsg("stream")],
     responses: [{ deltas: ["Hel", "lo, ", "world!"], final: textMsg("Hello, world!") }],
     tools: [] },
+  { name: "parallel_two_tools", prompts: [userMsg("two parallel")],
+    responses: [assistantMsg([{ type: "toolCall", id: "a", name: "echo", arguments: { text: "1" } }, { type: "toolCall", id: "b", name: "echo", arguments: { text: "2" } }], "tool_calls"), textMsg("done")],
+    tools: [{ name: "echo", description: "echo", parameters: {} }],
+    toolResults: { echo: { content: [{ type: "text", text: "ok" }], details: {} } },
+    toolExecution: "parallel" },
 ];
 out.agentLoop = [];
 for (const scenario of agentScenarios) {
@@ -492,6 +497,7 @@ for (const scenario of agentScenarios) {
       responses: scenario.responses,
       tools: (scenario.tools ?? []).map((t) => ({ name: t.name })),
       toolResults: scenario.toolResults ?? {},
+      toolExecution: scenario.toolExecution ?? "sequential",
     },
     expected: result,
   });

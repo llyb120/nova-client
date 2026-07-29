@@ -324,10 +324,12 @@ fn parity_agent_loop() {
             messages: Vec::new(),
             tools,
         };
+        let parallel = input["toolExecution"].as_str() == Some("parallel");
         let mut config = LoopConfig {
             get_steering_messages: None,
             get_follow_up_messages: None,
             timestamp: 9999,
+            parallel,
         };
 
         let mut events: Vec<Value> = Vec::new();

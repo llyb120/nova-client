@@ -84,6 +84,8 @@ pub struct Agent {
     follow_up_queue: PendingMessageQueue,
     listeners: Vec<Box<dyn FnMut(&Value)>>,
     pub session_id: Option<String>,
+    /// Tool execution strategy: true mirrors alkaid's `toolExecution: "parallel"`.
+    pub parallel_tools: bool,
 }
 
 impl Agent {
@@ -94,6 +96,7 @@ impl Agent {
             follow_up_queue: PendingMessageQueue::new(follow_up_mode),
             listeners: Vec::new(),
             session_id: None,
+            parallel_tools: false,
         }
     }
 
@@ -240,6 +243,7 @@ impl Agent {
             get_steering_messages: Some(Box::new(move || steering.drain())),
             get_follow_up_messages: Some(Box::new(move || follow_up.drain())),
             timestamp,
+            parallel: self.parallel_tools,
         };
 
         let mut events: Vec<Value> = Vec::new();
