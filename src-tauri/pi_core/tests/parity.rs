@@ -6,8 +6,9 @@ use base64::Engine;
 use pi_core::{
     apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
     clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, format_size, govern_text,
-    inject_openai_prompt_cache_key, merge_usage, read_files_one, truncate_head, truncate_line,
-    truncate_tail, ReadRequest, ShellConfig, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+    inject_openai_prompt_cache_key, merge_usage, normalize_path, read_files_one, resolve_to_cwd,
+    truncate_head, truncate_line, truncate_tail, NormalizeOptions, ReadRequest, ShellConfig,
+    OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
 use serde_json::Value;
 
@@ -172,6 +173,48 @@ fn parity_merge_usage() {
                 case["input"]
             ),
         }
+    }
+}
+
+fn parse_normalize_options(value: &Value) -> NormalizeOptions {
+    let obj = value.as_object();
+    let get = |key: &str| obj.and_then(|o| o.get(key));
+    NormalizeOptions {
+        trim: get("trim").and_then(Value::as_bool).unwrap_or(false),
+        normalize_unicode_spaces: get("normalizeUnicodeSpaces")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        strip_at_prefix: get("stripAtPrefix").and_then(Value::as_bool).unwrap_or(false),
+        expand_tilde: get("expandTilde").and_then(Value::as_bool).unwrap_or(true),
+        home_dir: get("homeDir").and_then(Value::as_str).map(String::from),
+    }
+}
+
+#[test]
+fn parity_resolve_to_cwd() {
+    for case in golden()["resolveToCwd"].as_array().unwrap() {
+        let input = case["input"]["input"].as_str().unwrap();
+        let base = case["input"]["base"].as_str().unwrap();
+        assert_eq!(
+            resolve_to_cwd(input, base),
+            case["expected"].as_str().unwrap(),
+            "resolveToCwd {:?}",
+            case["input"]
+        );
+    }
+}
+
+#[test]
+fn parity_normalize_path() {
+    for case in golden()["normalizePath"].as_array().unwrap() {
+        let input = case["input"]["input"].as_str().unwrap();
+        let options = parse_normalize_options(&case["input"]["options"]);
+        assert_eq!(
+            normalize_path(input, &options),
+            case["expected"].as_str().unwrap(),
+            "normalizePath {:?}",
+            case["input"]
+        );
     }
 }
 

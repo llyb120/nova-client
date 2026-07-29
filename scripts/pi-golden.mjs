@@ -11,6 +11,7 @@
 import * as core from "./alkaid-core.mjs";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { formatSize, truncateHead, truncateTail, truncateLine } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/truncate.js";
+import { resolvePath, normalizePath } from "../node_modules/@earendil-works/pi-coding-agent/dist/utils/paths.js";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -226,6 +227,51 @@ out.truncateLine = [
   ["a😀b😀c😀d", 4],
   ["", 5],
 ].map(([line, maxChars]) => ({ input: { line, maxChars }, expected: truncateLine(line, maxChars) }));
+
+// --- path resolution ---
+const cwdOpt = { normalizeUnicodeSpaces: true, stripAtPrefix: true };
+const resolveCases = [
+  ["foo", "/base"],
+  ["../foo", "/base/sub"],
+  ["/abs/path", "/base"],
+  ["./foo", "/base"],
+  ["foo/../bar", "/base"],
+  ["@foo", "/base"],
+  ["foo\u00A0bar", "/base"],
+  ["a//b", "/base"],
+  ["", "/base"],
+  [".", "/base"],
+  ["..", "/base/sub"],
+  ["../..", "/base/sub/deep"],
+  ["/", "/base"],
+  ["foo/", "/base"],
+  ["./", "/base"],
+  ["foo/./bar", "/base"],
+  ["\u2003padded\u3000", "/base"],
+  ["@/abs/x", "/base"],
+  ["sub/dir/file.txt", "/home/u/proj"],
+];
+out.resolveToCwd = resolveCases.map(([input, base]) => ({
+  input: { input, base },
+  expected: resolvePath(input, base, cwdOpt),
+}));
+
+const normalizeCases = [
+  ["~", { homeDir: "/HOME" }],
+  ["~/docs", { homeDir: "/HOME" }],
+  ["~/a/../b", { homeDir: "/HOME" }],
+  ["@~/x", { normalizeUnicodeSpaces: true, stripAtPrefix: true, expandTilde: false }],
+  ["plain", {}],
+  ["  spaced  ", { trim: true }],
+  ["  spaced  ", {}],
+  ["a\u00A0b\u3000c", { normalizeUnicodeSpaces: true }],
+  ["@mention", { stripAtPrefix: true }],
+  ["@mention", {}],
+];
+out.normalizePath = normalizeCases.map(([input, options]) => ({
+  input: { input, options },
+  expected: normalizePath(input, options),
+}));
 
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");

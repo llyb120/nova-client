@@ -8,6 +8,7 @@
 //! provider streaming land in later milestones.
 
 pub mod encoding;
+pub mod paths;
 pub mod payload;
 pub mod prompt;
 pub mod read;
@@ -16,6 +17,7 @@ pub mod text;
 pub mod truncate;
 
 pub use encoding::{decode_text_buffer, detect_text_encoding, swap_utf16_bytes, Encoding};
+pub use paths::{normalize_path, resolve_path, resolve_to_cwd, NormalizeOptions};
 pub use payload::{
     clamp_openai_payload_tool_outputs, clamp_prompt_cache_key, inject_openai_prompt_cache_key,
     merge_usage, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH,
