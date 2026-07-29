@@ -12,6 +12,8 @@ import * as core from "./alkaid-core.mjs";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { formatSize, truncateHead, truncateTail, truncateLine } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/truncate.js";
 import { resolvePath, normalizePath } from "../node_modules/@earendil-works/pi-coding-agent/dist/utils/paths.js";
+import { createWriteTool } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/write.js";
+import { createLsTool } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/ls.js";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -272,6 +274,58 @@ out.normalizePath = normalizeCases.map(([input, options]) => ({
   input: { input, options },
   expected: normalizePath(input, options),
 }));
+
+// --- write tool ---
+import { mkdirSync } from "node:fs";
+const writeRoot = mkdtempSync(join(tmpdir(), "piwrite-"));
+const writeTool = createWriteTool(writeRoot, {});
+const writeCases = [
+  { path: "new/nested/file.txt", content: "hello" },
+  { path: "cjk.txt", content: "中文😀" },
+  { path: "empty.txt", content: "" },
+  { path: "overwrite.txt", content: "first" },
+];
+const writeGolden = [];
+for (const { path, content } of writeCases) {
+  const res = await writeTool.execute("call", { path, content });
+  writeGolden.push({ input: { path, content }, expected: { ok: true, text: res.content[0].text } });
+}
+// Overwrite again to confirm last-write-wins message shape.
+const over = await writeTool.execute("call", { path: "overwrite.txt", content: "second longer" });
+writeGolden.push({ input: { path: "overwrite.txt", content: "second longer" }, expected: { ok: true, text: over.content[0].text } });
+out.writeTool = writeGolden;
+
+// --- ls tool ---
+const lsRoot = mkdtempSync(join(tmpdir(), "pils-"));
+for (const name of ["apple", "Banana", "cherry", "file10", "file2"]) writeFileSync(join(lsRoot, name), "x");
+mkdirSync(join(lsRoot, "Zulu"));
+mkdirSync(join(lsRoot, "alpha"));
+const emptyDir = join(lsRoot, "emptydir");
+mkdirSync(emptyDir);
+const manyDir = join(lsRoot, "many");
+mkdirSync(manyDir);
+for (let i = 1; i <= 5; i++) writeFileSync(join(manyDir, `e${i}`), "x");
+writeFileSync(join(lsRoot, "afile"), "x");
+
+const lsTool = createLsTool(lsRoot, {});
+const lsGolden = [];
+const lsRun = async (input) => {
+  try {
+    const res = await lsTool.execute("call", input);
+    return { ok: true, text: res.content[0].text, details: res.details ?? null };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+};
+lsGolden.push({ input: { cwd: lsRoot, args: { path: "." } }, expected: await lsRun({ path: "." }) });
+lsGolden.push({ input: { cwd: lsRoot, args: { path: "emptydir" } }, expected: await lsRun({ path: "emptydir" }) });
+lsGolden.push({ input: { cwd: lsRoot, args: { path: "many", limit: 3 } }, expected: await lsRun({ path: "many", limit: 3 }) });
+lsGolden.push({ input: { cwd: lsRoot, args: { path: "many" } }, expected: await lsRun({ path: "many" }) });
+// Deterministic error: absolute missing path (message is tool-constructed, no temp path).
+lsGolden.push({ input: { cwd: lsRoot, args: { path: "/pi-fixed-cwd/missing" } }, expected: await lsRun({ path: "/pi-fixed-cwd/missing" }) });
+// Not-a-directory: real file; compare presence only (message embeds a random temp path).
+lsGolden.push({ input: { cwd: lsRoot, args: { path: "afile" } }, expected: { ok: false, errorPrefix: "Not a directory:" } });
+out.lsTool = lsGolden;
 
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");

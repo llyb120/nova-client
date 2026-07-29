@@ -6,9 +6,9 @@ use base64::Engine;
 use pi_core::{
     apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
     clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, format_size, govern_text,
-    inject_openai_prompt_cache_key, merge_usage, normalize_path, read_files_one, resolve_to_cwd,
-    truncate_head, truncate_line, truncate_tail, NormalizeOptions, ReadRequest, ShellConfig,
-    OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+    inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path, read_files_one,
+    resolve_to_cwd, truncate_head, truncate_line, truncate_tail, write_tool, NormalizeOptions,
+    ReadRequest, ShellConfig, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
 use serde_json::Value;
 
@@ -188,6 +188,79 @@ fn parse_normalize_options(value: &Value) -> NormalizeOptions {
         expand_tilde: get("expandTilde").and_then(Value::as_bool).unwrap_or(true),
         home_dir: get("homeDir").and_then(Value::as_str).map(String::from),
     }
+}
+
+#[test]
+fn parity_write_tool() {
+    let base = std::env::temp_dir().join(format!("pi_write_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    for case in golden()["writeTool"].as_array().unwrap() {
+        let path = case["input"]["path"].as_str().unwrap();
+        let content = case["input"]["content"].as_str().unwrap();
+        let got = write_tool(base.to_str().unwrap(), path, content)
+            .unwrap_or_else(|e| panic!("write failed: {e}"));
+        assert_eq!(
+            got,
+            case["expected"]["text"].as_str().unwrap(),
+            "write {:?}",
+            case["input"]
+        );
+        let written = std::fs::read_to_string(base.join(path)).unwrap();
+        assert_eq!(written, content, "write content {:?}", case["input"]);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn parity_ls_tool() {
+    let base = std::env::temp_dir().join(format!("pi_ls_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    for name in ["apple", "Banana", "cherry", "file10", "file2", "afile"] {
+        std::fs::write(base.join(name), "x").unwrap();
+    }
+    for dir in ["Zulu", "alpha", "emptydir", "many"] {
+        std::fs::create_dir_all(base.join(dir)).unwrap();
+    }
+    for i in 1..=5 {
+        std::fs::write(base.join("many").join(format!("e{i}")), "x").unwrap();
+    }
+    let cwd = base.to_str().unwrap().to_string();
+
+    for case in golden()["lsTool"].as_array().unwrap() {
+        let expected = &case["expected"];
+        let args = &case["input"]["args"];
+        let path = args["path"].as_str();
+        let limit = args["limit"].as_u64().map(|v| v as usize);
+        let got = ls_tool(&cwd, path, limit);
+        if expected["ok"].as_bool().unwrap() {
+            let out = got.unwrap_or_else(|e| panic!("ls expected ok, got {e}: {:?}", args));
+            assert_eq!(out.text, expected["text"].as_str().unwrap(), "ls text {:?}", args);
+            match &out.details {
+                Some(details) => {
+                    assert_eq!(details, &expected["details"], "ls details {:?}", args)
+                }
+                None => assert!(
+                    expected["details"].is_null(),
+                    "ls details expected null {:?}",
+                    args
+                ),
+            }
+        } else if let Some(prefix) = expected.get("errorPrefix").and_then(Value::as_str) {
+            let error = got.err().unwrap_or_else(|| panic!("ls expected error {:?}", args));
+            assert!(error.starts_with(prefix), "ls error prefix: {error}");
+        } else {
+            let error = got.err().unwrap_or_else(|| panic!("ls expected error {:?}", args));
+            assert_eq!(
+                error,
+                expected["error"].as_str().unwrap(),
+                "ls error {:?}",
+                args
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]

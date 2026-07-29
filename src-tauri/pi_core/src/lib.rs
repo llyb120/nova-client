@@ -8,6 +8,7 @@
 //! provider streaming land in later milestones.
 
 pub mod encoding;
+pub mod ls;
 pub mod paths;
 pub mod payload;
 pub mod prompt;
@@ -15,8 +16,10 @@ pub mod read;
 pub mod smart_edit;
 pub mod text;
 pub mod truncate;
+pub mod write;
 
 pub use encoding::{decode_text_buffer, detect_text_encoding, swap_utf16_bytes, Encoding};
+pub use ls::{ls_tool, LsOutput};
 pub use paths::{normalize_path, resolve_path, resolve_to_cwd, NormalizeOptions};
 pub use payload::{
     clamp_openai_payload_tool_outputs, clamp_prompt_cache_key, inject_openai_prompt_cache_key,
@@ -32,6 +35,7 @@ pub use truncate::{
     format_size, truncate_head, truncate_line, truncate_tail, TruncateLineResult, Truncation,
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH,
 };
+pub use write::write_tool;
 pub use text::{
     clamp_tool_output_text, govern_text, head_tail_utf8, safe_archive_segment,
     truncate_utf8_tail_to_bytes, truncate_utf8_to_bytes, utf16_len, utf8_byte_len, Governed,
