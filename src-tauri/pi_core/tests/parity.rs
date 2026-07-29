@@ -5,10 +5,11 @@
 use base64::Engine;
 use pi_core::{
     agent::{run_agent_loop, Agent, AgentState, LoopConfig, LoopContext, StreamTurn},
-    apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
-    clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, format_alkaid_skills_prompt,
-    format_size, govern_text, inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path,
-    read_files_one, resolve_to_cwd, truncate_head, truncate_line, truncate_tail, write_tool,
+    aggregated_output, apply_smart_edits, build_system_prompt,
+    clamp_openai_payload_tool_outputs, clamp_prompt_cache_key, clamp_tool_output_text,
+    completed_tool_item, decode_text_buffer, format_alkaid_skills_prompt, format_size, govern_text,
+    inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path, read_files_one,
+    resolve_to_cwd, started_tool_item, truncate_head, truncate_line, truncate_tail, write_tool,
     NormalizeOptions, ReadRequest, ShellConfig, Skill, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
 use serde_json::{json, Value};
@@ -243,6 +244,31 @@ fn strip_timestamps(value: &Value) -> Value {
         }
         other => other.clone(),
     }
+}
+
+#[test]
+fn parity_bridge_tool_item() {
+    let success_end = json!({ "result": { "content": [{ "type": "text", "text": "line1" }, { "type": "text", "text": "line2" }] }, "isError": false });
+    let failed_end = json!({ "result": { "content": [{ "type": "text", "text": "boom" }] }, "isError": true });
+    for case in golden()["bridgeToolItem"].as_array().unwrap() {
+        let event = &case["input"]["event"];
+        let started = started_tool_item(event);
+        assert_eq!(&started, &case["expected"]["started"], "started {:?}", event);
+        let completed = completed_tool_item(&started, &success_end);
+        assert_eq!(
+            &completed,
+            &case["expected"]["completed"],
+            "completed {:?}",
+            event
+        );
+        let failed = completed_tool_item(&started, &failed_end);
+        assert_eq!(&failed, &case["expected"]["failed"], "failed {:?}", event);
+    }
+    assert_eq!(
+        aggregated_output(Some(&json!({ "content": [{ "text": "a" }, { "text": "b" }] }))),
+        "a\nb"
+    );
+    assert_eq!(aggregated_output(None), "");
 }
 
 #[test]

@@ -16,6 +16,7 @@ import { createWriteTool } from "../node_modules/@earendil-works/pi-coding-agent
 import { createLsTool } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/ls.js";
 import { runAgentLoop } from "../node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js";
 import { Agent } from "../node_modules/@earendil-works/pi-agent-core/dist/agent.js";
+import { startedToolItem } from "./alkaid-bridge-common.mjs";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -554,6 +555,36 @@ for (const scenario of agentClassScenarios) {
     expected: result,
   });
 }
+
+// --- bridge protocol translation (tool items) ---
+const endItem = (started, endEvent) => {
+  const output = endEvent.result?.content?.map((p) => p.text ?? "").join("\n") ?? "";
+  return {
+    ...started,
+    status: endEvent.isError ? "failed" : "completed",
+    aggregated_output: output,
+    result: endEvent.isError ? undefined : endEvent.result,
+    error: endEvent.isError ? { message: output } : undefined,
+  };
+};
+const bridgeStartCases = [
+  { toolCallId: "c1", toolName: "bash", args: { command: "ls -la" } },
+  { toolCallId: "c2", toolName: "read", args: { path: "foo.txt" } },
+  { toolCallId: "c3", toolName: "edit", args: { path: "a.rs", edits: [{ oldText: "x", newText: "y" }] } },
+  { toolCallId: "c4", toolName: "edit_files", args: { files: [{ path: "a.rs", edits: [] }, { path: "b.rs", edits: [] }] } },
+  { toolCallId: "c5", toolName: "write", args: { path: "new.txt", content: "hi" } },
+  { toolCallId: "c6", toolName: "mcp__github__create_issue", args: { title: "bug" } },
+  { toolCallId: "c7", toolName: "grep", args: { pattern: "foo" } },
+  { toolCallId: "c8", toolName: "bash", args: null },
+  { toolCallId: "c9", toolName: "edit_files", args: { files: "notarray" } },
+];
+out.bridgeToolItem = bridgeStartCases.map((event) => {
+  const started = startedToolItem(event);
+  const endEvent = { result: { content: [{ type: "text", text: "line1" }, { type: "text", text: "line2" }] }, isError: false };
+  const completed = endItem(started, endEvent);
+  const failed = endItem(started, { result: { content: [{ type: "text", text: "boom" }] }, isError: true });
+  return { input: { event }, expected: { started, completed, failed } };
+});
 
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");
