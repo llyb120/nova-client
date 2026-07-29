@@ -15,19 +15,17 @@ impl SdkAdapter for AlkaidAdapter {
     }
 
     fn bridge(&self) -> (&'static str, &'static [u8]) {
-        (
-            "alkaid-bridge.mjs",
-            include_bytes!("../../resources/alkaid-bridge.mjs"),
-        )
+        // Native Rust bridge: no Node script is shipped. The SDK manager locates the
+        // prebuilt `vega-bridge` binary via `native_bridge_path` when is_native_bridge().
+        ("vega-bridge", b"")
+    }
+
+    fn is_native_bridge(&self) -> bool {
+        true
     }
 
     fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
-        &[
-            (
-                "photon_rs_bg.wasm",
-                include_bytes!("../../resources/photon_rs_bg.wasm"),
-            ),
-        ]
+        &[]
     }
 
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {

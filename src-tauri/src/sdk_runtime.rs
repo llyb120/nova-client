@@ -995,6 +995,37 @@ impl SdkManager {
             let settings = state.settings.lock().unwrap();
             self.adapter.launch_config(&settings)
         };
+        if self.adapter.is_native_bridge() {
+            let binary = native_bridge_path(&self.app, self.adapter.as_ref())?;
+            let mut command = Command::new(&binary);
+            command
+                .current_dir(cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
+            if !self.launch_env.is_empty() {
+                crate::credential_roaming::isolate_borrowed_command(&mut command);
+                command.envs(&self.launch_env);
+            }
+            apply_proxy_env(&mut command, &launch.proxy);
+            command.envs(launch.extra_env);
+            if self.launch_env.is_empty() {
+                if let Some((name, value)) = launch.api_key {
+                    command.env(name, value);
+                }
+            }
+            #[cfg(windows)]
+            if self.app.state::<AppState>().windows_shell_shim_enabled {
+                crate::windows_shell_shim::apply(&self.app, &mut command, &self.launch_env)
+                    .map_err(|e| format!("应用 Windows shell shim 失败：{e}"))?;
+            }
+            #[cfg(windows)]
+            command.creation_flags(0x0800_0000);
+            return command
+                .spawn()
+                .map_err(|e| format!("启动 {} 原生 bridge 失败：{e}", self.adapter.label()));
+        }
         let program = resolve_program_on_path(&launch.program)
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or(launch.program);
@@ -1396,6 +1427,58 @@ fn bridge_path(app: &AppHandle, adapter: &dyn SdkAdapter) -> Result<PathBuf, Str
         }
     }
     Ok(path)
+}
+
+/// Locate the prebuilt native Vega bridge binary (`vega-bridge`).
+///
+/// Search order: `NOVA_VEGA_BRIDGE` env → sibling of the current executable →
+/// `~/.nova/runtime/vega-bridge` (packaging may copy it here) → dev workspace
+/// `vega-bridge/target/{release,debug}/vega-bridge`.
+fn native_bridge_path(app: &AppHandle, adapter: &dyn SdkAdapter) -> Result<PathBuf, String> {
+    let exe_name = adapter.bridge().0;
+    let bin_name = if cfg!(windows) {
+        format!("{exe_name}.exe")
+    } else {
+        exe_name.to_string()
+    };
+    if let Ok(path) = std::env::var("NOVA_VEGA_BRIDGE") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(&bin_name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+        // Dev workspace: walk up from the executable to find <repo>/vega-bridge/target/...
+        let mut ancestor = exe.parent().map(|p| p.to_path_buf());
+        while let Some(dir) = ancestor {
+            let dev = dir.join("vega-bridge").join("target");
+            for profile in ["release", "debug"] {
+                let candidate = dev.join(profile).join(&bin_name);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+            ancestor = dir.parent().map(|p| p.to_path_buf());
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+        }
+    }
+    let runtime_candidate = crate::nova_data_dir(app).join("runtime").join(&bin_name);
+    if runtime_candidate.is_file() {
+        return Ok(runtime_candidate);
+    }
+    Err(format!(
+        "未找到 {} 原生 bridge 二进制（{}）；请先构建 vega-bridge 或设置 NOVA_VEGA_BRIDGE",
+        adapter.label(),
+        bin_name
+    ))
 }
 
 fn prompt_parts(adapter: &dyn SdkAdapter, text: &str, images: &[PromptImage]) -> Vec<Value> {

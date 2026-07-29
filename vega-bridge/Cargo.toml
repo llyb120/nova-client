@@ -1,0 +1,28 @@
+[package]
+name = "vega-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Vega (pi core) coding agent bridge — Rust port of the Node alkaid bridge"
+
+[[bin]]
+name = "vega-bridge"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["io-util", "io-std", "process", "rt-multi-thread", "macros", "time", "fs", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "native-tls", "stream", "system-proxy", "socks"] }
+futures-util = "0.3"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+base64 = "0.22"
+regex = "1"
+
+[profile.release]
+strip = true
+lto = true
+
+[dev-dependencies]
+tempfile = "3"

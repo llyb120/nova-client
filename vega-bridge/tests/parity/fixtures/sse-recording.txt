@@ -1,0 +1,20 @@
+data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}
+
+data: {"type":"response.output_text.delta","delta":"Hello"}
+
+data: {"type":"response.output_text.delta","delta":" World"}
+
+data: {"type":"response.reasoning.delta","delta":"thinking about it"}
+
+data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"read"}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call_1","delta":"{\"path\":"}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call_1","delta":"\"a.rs\"}"}
+
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.rs\"}"}}
+
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":100,"output_tokens":50,"cached_input_tokens":10}}}
+
+data: [DONE]
+

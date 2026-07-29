@@ -1,0 +1,41 @@
+[
+  {
+    "id": "exact-single",
+    "path": "a.rs",
+    "content": "fn main() {\n    println!(\"hi\");\n}\n",
+    "edits": [{ "oldText": "println!(\"hi\")", "newText": "println!(\"bye\")" }]
+  },
+  {
+    "id": "rstrip-trailing-ws",
+    "path": "a.py",
+    "content": "def foo():\n    return 1\n",
+    "edits": [{ "oldText": "    return 1   ", "newText": "    return 2" }]
+  },
+  {
+    "id": "two-edits-non-overlapping",
+    "path": "a.rs",
+    "content": "a=1\nb=2\nc=3\n",
+    "edits": [
+      { "oldText": "a=1", "newText": "a=10" },
+      { "oldText": "c=3", "newText": "c=30" }
+    ]
+  },
+  {
+    "id": "ambiguous-rejects",
+    "path": "a.rs",
+    "content": "a\nb\na\n",
+    "edits": [{ "oldText": "a", "newText": "c" }]
+  },
+  {
+    "id": "no-changes-rejects",
+    "path": "a.rs",
+    "content": "hello\n",
+    "edits": [{ "oldText": "hello", "newText": "hello" }]
+  },
+  {
+    "id": "empty-oldtext-rejects",
+    "path": "a.rs",
+    "content": "x",
+    "edits": [{ "oldText": "", "newText": "y" }]
+  }
+]

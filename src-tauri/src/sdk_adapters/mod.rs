@@ -38,6 +38,12 @@ pub trait SdkAdapter: Send + Sync {
         false
     }
 
+    /// Native Rust bridge: when true, the SDK manager launches the adapter's prebuilt
+    /// binary directly instead of `node <bridge.mjs>`. Used by the Rust Vega bridge.
+    fn is_native_bridge(&self) -> bool {
+        false
+    }
+
     fn generates_title(&self) -> bool {
         false
     }
