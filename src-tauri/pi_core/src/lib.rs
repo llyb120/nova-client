@@ -7,6 +7,7 @@
 //! usage merging, and text-encoding detection. The agent loop, tools, and
 //! provider streaming land in later milestones.
 
+pub mod agent;
 pub mod encoding;
 pub mod ls;
 pub mod paths;
