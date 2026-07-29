@@ -10,6 +10,7 @@
 pub mod encoding;
 pub mod payload;
 pub mod prompt;
+pub mod smart_edit;
 pub mod text;
 
 pub use encoding::{decode_text_buffer, detect_text_encoding, swap_utf16_bytes, Encoding};
@@ -18,6 +19,7 @@ pub use payload::{
     merge_usage, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH,
 };
 pub use prompt::{build_system_prompt, ShellConfig, ShellKind};
+pub use smart_edit::{apply_smart_edits, SmartMatch, SmartResult};
 pub use text::{
     clamp_tool_output_text, govern_text, head_tail_utf8, safe_archive_segment,
     truncate_utf8_tail_to_bytes, truncate_utf8_to_bytes, utf16_len, utf8_byte_len, Governed,

@@ -9,6 +9,7 @@
 // NOTE: mergeAlkaidUsage mutates its `total` argument in place, so inputs are
 // deep-cloned before being recorded and before being passed to the function.
 import * as core from "./alkaid-core.mjs";
+import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -94,6 +95,50 @@ const promptCases = [
   [{ cwd: "/x", skills: [], readOnly: false, shellConfig: { shell: "powershell.exe", args: ["-c"], kind: "powershell" }, systemPrompt: "custom instr" }],
 ];
 out.buildAlkaidSystemPrompt = promptCases.map(([options]) => ({ input: { options: structuredClone(options) }, expected: core.buildAlkaidSystemPrompt(options) }));
+
+// --- applySmartEdits ---
+const smartCases = [
+  // exact single line
+  { content: "alpha\nbeta\ngamma\n", edits: [["beta", "BETA"]], path: "a.txt" },
+  // exact multi-line
+  { content: "fn main() {\n    let x = 1;\n    println!(\"hi\");\n}\n", edits: [["    let x = 1;\n    println!(\"hi\");", "    let y = 2;"]], path: "b.rs" },
+  // duplicate exact -> error
+  { content: "foo\nbar\nfoo\n", edits: [["foo", "baz"]], path: "c.txt" },
+  // empty oldText -> error
+  { content: "abc\n", edits: [["", "x"]], path: "d.txt" },
+  // rstrip: oldText has trailing spaces not in content
+  { content: "line one\nkeep me\nline three\n", edits: [["keep me   ", "changed"]], path: "e.txt" },
+  // unicode: smart quotes in oldText, ascii in content
+  { content: "say \"hello\" now\n", edits: [["say “hello” now", "say “bye” now"]], path: "f.txt" },
+  // relative-indent: same shape, deeper indentation in content
+  { content: "outer\n        inner_a\n        inner_b\nend\n", edits: [["    inner_a\n    inner_b", "    inner_x\n    inner_y"]], path: "g.txt" },
+  // fuzzy: one token differs
+  { content: "def compute_total(items):\n    total = sum(items)\n    return total\n", edits: [["def compute_sum(items):\n    total = sum(items)\n    return total", "def compute_total(items):\n    total = sum(items)\n    return round(total)"]], path: "h.py" },
+  // rebase indent: newText indented to oldText, matched region deeper
+  { content: "begin\n        stmt_one\n        stmt_two\nfinish\n", edits: [["stmt_one\nstmt_two", "stmt_one\nstmt_extra\nstmt_two"]], path: "i.txt" },
+  // overlap -> error
+  { content: "aaaa bbbb cccc\n", edits: [["aaaa bbbb", "X"], ["bbbb cccc", "Y"]], path: "j.txt" },
+  // no change -> error
+  { content: "same\n", edits: [["same", "same"]], path: "k.txt" },
+  // non-ASCII exact + edit
+  { content: "第一行\n第二行\n第三行\n", edits: [["第二行", "第二行（改）"]], path: "l.txt" },
+  // emoji exact
+  { content: "start\n🎉 party 🎉\nend\n", edits: [["🎉 party 🎉", "🚀 launch 🚀"]], path: "m.txt" },
+  // multiple non-overlapping edits
+  { content: "one\ntwo\nthree\nfour\n", edits: [["one", "ONE"], ["three", "THREE"]], path: "n.txt" },
+  // ambiguous rstrip -> error (two identical trimmed lines)
+  { content: "dup  \nmid\ndup\n", edits: [["dup", "zap"]], path: "o.txt" },
+  // CRLF normalization in edits
+  { content: "p\nq\nr\n", edits: [["q\r\n", "Q\r\n"]], path: "p.txt" },
+];
+out.smartEdit = smartCases.map(({ content, edits, path }) => {
+  try {
+    const result = applySmartEdits(content, edits.map(([oldText, newText]) => ({ oldText, newText })), path);
+    return { input: { content, edits, path }, expected: { ok: true, content: result.content, matches: result.matches } };
+  } catch (error) {
+    return { input: { content, edits, path }, expected: { ok: false, error: error instanceof Error ? error.message : String(error) } };
+  }
+});
 
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");

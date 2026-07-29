@@ -4,9 +4,9 @@
 
 use base64::Engine;
 use pi_core::{
-    build_system_prompt, clamp_openai_payload_tool_outputs, clamp_prompt_cache_key,
-    clamp_tool_output_text, decode_text_buffer, govern_text, inject_openai_prompt_cache_key,
-    merge_usage, ShellConfig, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+    apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
+    clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, govern_text,
+    inject_openai_prompt_cache_key, merge_usage, ShellConfig, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
 use serde_json::Value;
 
@@ -170,6 +170,79 @@ fn parity_merge_usage() {
                 "mergeAlkaidUsage expected null for {:?}",
                 case["input"]
             ),
+        }
+    }
+}
+
+#[test]
+fn parity_apply_smart_edits() {
+    for case in golden()["smartEdit"].as_array().unwrap() {
+        let content = case["input"]["content"].as_str().unwrap();
+        let path = case["input"]["path"].as_str().unwrap();
+        let edits: Vec<(String, String)> = case["input"]["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pair| {
+                let pair = pair.as_array().unwrap();
+                (
+                    pair[0].as_str().unwrap().to_string(),
+                    pair[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let got = apply_smart_edits(content, &edits, path);
+        let expected = &case["expected"];
+        if expected["ok"].as_bool().unwrap() {
+            let result = got.unwrap_or_else(|error| {
+                panic!("smartEdit {:?} expected ok, got error: {error}", case["input"])
+            });
+            assert_eq!(
+                result.content,
+                expected["content"].as_str().unwrap(),
+                "smartEdit content {:?}",
+                case["input"]
+            );
+            let exp_matches = expected["matches"].as_array().unwrap();
+            assert_eq!(
+                result.matches.len(),
+                exp_matches.len(),
+                "smartEdit matches len {:?}",
+                case["input"]
+            );
+            for (got_match, exp_match) in result.matches.iter().zip(exp_matches) {
+                assert_eq!(
+                    got_match.edit_index,
+                    exp_match["editIndex"].as_u64().unwrap() as usize,
+                    "smartEdit editIndex {:?}",
+                    case["input"]
+                );
+                assert_eq!(
+                    got_match.mode,
+                    exp_match["mode"].as_str().unwrap(),
+                    "smartEdit mode {:?}",
+                    case["input"]
+                );
+                let exp_line = exp_match
+                    .get("line")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize);
+                assert_eq!(
+                    got_match.line, exp_line,
+                    "smartEdit line {:?}",
+                    case["input"]
+                );
+            }
+        } else {
+            let error = got.err().unwrap_or_else(|| {
+                panic!("smartEdit {:?} expected error, got ok", case["input"])
+            });
+            assert_eq!(
+                error,
+                expected["error"].as_str().unwrap(),
+                "smartEdit error {:?}",
+                case["input"]
+            );
         }
     }
 }

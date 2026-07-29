@@ -27,7 +27,9 @@ implementation for every non-LLM computation.
 - M1 (done): text governance/truncation, OpenAI payload transforms (cache key
   injection, output clamping), usage merging, encoding detection, system prompt
   assembly — all covered by differential tests.
-- M2 (next): coding tools (`read`/`read_files`/`edit`/`edit_files`/`write`/
-  `bash`/`grep`/`find`/`ls`) and skill formatting.
+- M2 (in progress): `edit_files` smart-edit locator/applier (exact → rstrip →
+  unicode → relative-indent → fuzzy cascade, ambiguity/overlap rejection,
+  indentation rebasing) ported and parity-tested, including CJK and emoji
+  content. Next: `read`/`read_files` line reading and the remaining tools.
 - M3: agent loop, steering, event contract matching `AlkaidAdapter`.
 - M4: wire into the Vega path and remove the node bridge runtime dependency.
