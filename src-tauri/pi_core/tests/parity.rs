@@ -4,7 +4,7 @@
 
 use base64::Engine;
 use pi_core::{
-    agent::{run_agent_loop, LoopConfig, LoopContext, StreamTurn},
+    agent::{run_agent_loop, Agent, AgentState, LoopConfig, LoopContext, StreamTurn},
     apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
     clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, format_alkaid_skills_prompt,
     format_size, govern_text, inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path,
@@ -242,6 +242,69 @@ fn strip_timestamps(value: &Value) -> Value {
             Value::Object(cleaned)
         }
         other => other.clone(),
+    }
+}
+
+#[test]
+fn parity_agent_class() {
+    for case in golden()["agentClass"].as_array().unwrap() {
+        let input = &case["input"];
+        let name = input["name"].as_str().unwrap();
+        let prompt_text = input["promptText"].as_str().unwrap();
+        let responses: Vec<Value> = input["responses"].as_array().unwrap().iter().cloned().collect();
+        let tools: Vec<Value> = input["tools"].as_array().unwrap().iter().cloned().collect();
+        let tool_results = input["toolResults"].clone();
+        let steer_before: Vec<Value> = input["steerBefore"].as_array().unwrap().iter().cloned().collect();
+
+        let state = AgentState::new(
+            "You are a test agent.",
+            json!({ "id": "test-model", "provider": "test-provider", "api": "test-api" }),
+            tools,
+            vec![],
+        );
+        let mut agent = Agent::new(state, "all", "one-at-a-time");
+        for message in steer_before {
+            agent.steer(message);
+        }
+
+        let mut stream_fn = |index: usize, _llm_context: &Value| -> StreamTurn {
+            let entry = responses
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| json!({ "role": "assistant", "content": [], "stopReason": "end_turn" }));
+            build_stream_turn(&entry)
+        };
+        let mut tool_fn = |tool_name: &str, _args: &Value| -> (Value, bool) {
+            match tool_results.get(tool_name) {
+                Some(result) => (result.clone(), false),
+                None => (
+                    json!({ "content": [{ "type": "text", "text": format!("ran {tool_name}") }], "details": {} }),
+                    false,
+                ),
+            }
+        };
+
+        let events = agent.prompt(&json!(prompt_text), &[], 9999, &mut stream_fn, &mut tool_fn);
+
+        let events_stripped: Vec<Value> = events.iter().map(strip_timestamps).collect();
+        let final_stripped: Vec<Value> = agent.state.messages.iter().map(strip_timestamps).collect();
+
+        assert_eq!(
+            events_stripped,
+            case["expected"]["events"].as_array().unwrap().clone(),
+            "agent class events: {name}"
+        );
+        assert_eq!(
+            final_stripped,
+            case["expected"]["finalMessages"].as_array().unwrap().clone(),
+            "agent class finalMessages: {name}"
+        );
+        let expected_error = case["expected"]["errorMessage"].as_str();
+        assert_eq!(
+            agent.state.error_message.as_deref(),
+            expected_error,
+            "agent class errorMessage: {name}"
+        );
     }
 }
 

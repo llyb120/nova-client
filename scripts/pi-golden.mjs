@@ -15,6 +15,7 @@ import { resolvePath, normalizePath } from "../node_modules/@earendil-works/pi-c
 import { createWriteTool } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/write.js";
 import { createLsTool } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/ls.js";
 import { runAgentLoop } from "../node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js";
+import { Agent } from "../node_modules/@earendil-works/pi-agent-core/dist/agent.js";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -491,6 +492,58 @@ for (const scenario of agentScenarios) {
       responses: scenario.responses,
       tools: (scenario.tools ?? []).map((t) => ({ name: t.name })),
       toolResults: scenario.toolResults ?? {},
+    },
+    expected: result,
+  });
+}
+
+// --- Agent wrapper (stateful: steering queue + state reduction) ---
+const runAgentClassScenario = async ({ promptText, responses, tools, toolResults, steerBefore }) => {
+  const events = [];
+  const toolFn = (name) => toolResults?.[name] ?? { content: [{ type: "text", text: `ran ${name}` }], details: {} };
+  const wrappedTools = (tools ?? []).map((t) => ({ ...t, execute: async (_id, _args) => toolFn(t.name) }));
+  const agent = new Agent({
+    initialState: {
+      systemPrompt: "You are a test agent.",
+      model: { id: "test-model", provider: "test-provider", api: "test-api" },
+      tools: wrappedTools,
+      messages: [],
+    },
+    streamFn: makeStreamFn(responses),
+    steeringMode: "all",
+    toolExecution: "sequential",
+  });
+  agent.subscribe(async (event) => { events.push(event); });
+  for (const message of steerBefore ?? []) agent.steer(message);
+  await agent.prompt(promptText);
+  return {
+    events: stripTimestamps(events),
+    finalMessages: stripTimestamps(agent.state.messages),
+    errorMessage: agent.state.errorMessage ?? null,
+  };
+};
+
+const agentClassScenarios = [
+  { name: "agent_plain", promptText: "hello", responses: [textMsg("hi there")], tools: [] },
+  { name: "agent_steering", promptText: "hello",
+    steerBefore: [userMsg("steered input")],
+    responses: [textMsg("response after steer")], tools: [] },
+  { name: "agent_tool", promptText: "echo hi",
+    responses: [toolCallMsg("call_1", "echo", { text: "hi" }), textMsg("done")],
+    tools: [{ name: "echo", description: "echo", parameters: {} }],
+    toolResults: { echo: { content: [{ type: "text", text: "echo: hi" }], details: {} } } },
+];
+out.agentClass = [];
+for (const scenario of agentClassScenarios) {
+  const result = await runAgentClassScenario(scenario);
+  out.agentClass.push({
+    input: {
+      name: scenario.name,
+      promptText: scenario.promptText,
+      responses: scenario.responses,
+      tools: (scenario.tools ?? []).map((t) => ({ name: t.name })),
+      toolResults: scenario.toolResults ?? {},
+      steerBefore: scenario.steerBefore ?? [],
     },
     expected: result,
   });

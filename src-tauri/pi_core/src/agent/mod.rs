@@ -5,8 +5,10 @@
 //! lifecycle wrapper. The LLM boundary is abstracted so parity tests can drive
 //! it with a deterministic mock stream.
 
+pub mod agent;
 pub mod messages;
 pub mod run_loop;
 
+pub use agent::{Agent, AgentState, PendingMessageQueue};
 pub use messages::{create_error_tool_result, create_tool_result_message};
 pub use run_loop::{run_agent_loop, LoopConfig, LoopContext, StreamTurn};
