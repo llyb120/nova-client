@@ -8,9 +8,10 @@ use pi_core::{
     aggregated_output, apply_edits_to_normalized_content, apply_smart_edits, build_system_prompt,
     clamp_openai_payload_tool_outputs, clamp_prompt_cache_key, clamp_tool_output_text,
     completed_tool_item, decode_text_buffer, format_alkaid_skills_prompt, format_size, govern_text,
-    inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path, read_files_one,
-    resolve_to_cwd, started_tool_item, truncate_head, truncate_line, truncate_tail, write_tool,
-    NormalizeOptions, ReadRequest, ShellConfig, Skill, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+    inject_openai_prompt_cache_key, ls_tool, merge_compat_defaults, merge_config, merge_usage,
+    normalize_path, parse_jsonc, read_files_one, resolve_model, resolve_to_cwd, started_tool_item,
+    truncate_head, truncate_line, truncate_tail, write_tool, NormalizeOptions, ReadRequest,
+    ShellConfig, Skill, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
 use serde_json::{json, Value};
 
@@ -243,6 +244,76 @@ fn strip_timestamps(value: &Value) -> Value {
             Value::Object(cleaned)
         }
         other => other.clone(),
+    }
+}
+
+#[test]
+fn parity_parse_jsonc() {
+    for case in golden()["parseJsonc"].as_array().unwrap() {
+        let text = case["input"]["text"].as_str().unwrap();
+        let got = parse_jsonc(text).unwrap_or_else(|e| panic!("parseJsonc failed: {e}"));
+        assert_eq!(&got, &case["expected"], "parseJsonc {:?}", text);
+    }
+}
+
+#[test]
+fn parity_merge_config() {
+    for case in golden()["mergeConfig"].as_array().unwrap() {
+        let server = &case["input"]["server"];
+        let local = &case["input"]["local"];
+        assert_eq!(
+            &merge_config(server, local),
+            &case["expected"],
+            "mergeConfig {:?}",
+            case["input"]
+        );
+    }
+}
+
+fn env_map(config: &Value) -> std::collections::HashMap<String, String> {
+    config
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn parity_resolve_model() {
+    for case in golden()["resolveModel"].as_array().unwrap() {
+        let config = &case["input"]["config"];
+        let selection = case["input"]["selection"].as_str().unwrap();
+        let env = env_map(config);
+        let got = resolve_model(config, selection, &env);
+        let expected = &case["expected"];
+        if expected["ok"].as_bool().unwrap() {
+            let result = got
+                .unwrap_or_else(|e| panic!("resolveModel {selection} expected ok, got: {e}"));
+            assert_eq!(&result, &expected["result"], "resolveModel {selection}");
+        } else {
+            let error = got
+                .err()
+                .unwrap_or_else(|| panic!("resolveModel {selection} expected error"));
+            assert_eq!(error, expected["error"].as_str().unwrap(), "resolveModel {selection}");
+        }
+    }
+}
+
+#[test]
+fn parity_compat_defaults() {
+    for case in golden()["compatDefaults"].as_array().unwrap() {
+        let api = case["input"]["api"].as_str().unwrap();
+        let model_id = case["input"]["modelId"].as_str().unwrap();
+        let base_url = case["input"]["baseUrl"].as_str().unwrap();
+        let existing = case["input"]["existing"].clone();
+        let existing_ref = if existing.is_null() { None } else { Some(&existing) };
+        let got = merge_compat_defaults(api, model_id, base_url, existing_ref);
+        let got = if got.is_null() { Value::Null } else { got };
+        assert_eq!(&got, &case["expected"], "compatDefaults {:?}", case["input"]);
     }
 }
 

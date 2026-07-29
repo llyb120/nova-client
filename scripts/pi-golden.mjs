@@ -18,6 +18,7 @@ import { runAgentLoop } from "../node_modules/@earendil-works/pi-agent-core/dist
 import { Agent } from "../node_modules/@earendil-works/pi-agent-core/dist/agent.js";
 import { startedToolItem } from "./alkaid-bridge-common.mjs";
 import { applyEditsToNormalizedContent } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/edit-diff.js";
+import { parseJsonc, mergeAlkaidConfig, resolveAlkaidModel, mergeAlkaidCompatDefaults } from "./alkaid-config.mjs";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -620,6 +621,67 @@ out.editDiff = editDiffCases.map(({ content, edits, path }) => {
     return { input: { content, edits, path }, expected: { ok: false, error: error instanceof Error ? error.message : String(error) } };
   }
 });
+
+// --- alkaid config resolution ---
+out.parseJsonc = [
+  '{\n  // comment\n  "a": 1, /* block */\n  "b": [1, 2,],\n}',
+  '{"url": "http://x", // trailing\n}',
+  '{"s": "a,// not comment",}',
+].map((text) => ({ input: { text }, expected: parseJsonc(text) }));
+
+out.mergeConfig = [
+  [{ provider: { a: { baseURL: "s", models: { m: { name: "S" } } } } }, { provider: { a: { models: { m: { name: "L" } } } } }],
+  [{ x: 1, y: [1, 2] }, { y: [3], z: 2 }],
+  [null, { a: 1 }],
+  [{ a: 1 }, "notobj"],
+].map(([server, local]) => ({ input: { server, local }, expected: mergeAlkaidConfig(server, local) }));
+
+const alkaidConfig = {
+  env: { KEY: "secret-key", URL: "https://api.example.com" },
+  provider: {
+    openrouter: {
+      npm: "@openai/openai-compatible",
+      options: { baseURL: "{env:URL}/v1", apiKey: "{env:KEY}" },
+      models: {
+        "gpt-4o": { name: "GPT-4o", modalities: { input: ["text", "image"] }, limit: { context: 200000, output: 16000 } },
+        "deepseek-chat": { name: "DeepSeek", reasoning: true, variants: { low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" } } },
+      },
+    },
+    anthropic: {
+      npm: "@anthropic-ai/sdk",
+      options: { baseURL: "https://api.anthropic.com", apiKey: "sk-ant" },
+      models: { "claude-sonnet-5": { name: "Claude Sonnet 5" } },
+    },
+  },
+};
+const alkaidResolveCases = [
+  [alkaidConfig, "openrouter/gpt-4o"],
+  [alkaidConfig, "openrouter/deepseek-chat/variant/high"],
+  [alkaidConfig, "anthropic/claude-sonnet-5"],
+  [alkaidConfig, "openrouter/missing"],
+  [alkaidConfig, "ghost/model"],
+  [alkaidConfig, "openrouter/deepseek-chat/variant/max"],
+  [alkaidConfig, "noseparator"],
+];
+out.resolveModel = alkaidResolveCases.map(([config, selection]) => {
+  try {
+    return { input: { config, selection }, expected: { ok: true, result: resolveAlkaidModel(config, selection) } };
+  } catch (error) {
+    return { input: { config, selection }, expected: { ok: false, error: error instanceof Error ? error.message : String(error) } };
+  }
+});
+
+out.compatDefaults = [
+  ["openai-completions", "some-model", "https://proxy.example.com", undefined],
+  ["openai-completions", "some-model", "https://api.openai.com", undefined],
+  ["openai-completions", "deepseek-v3", "https://proxy.example.com", undefined],
+  ["openai-completions", "kimi-k3", "https://proxy.example.com", undefined],
+  ["anthropic-messages", "claude-sonnet-5", "https://api.anthropic.com", undefined],
+  ["anthropic-messages", "claude-sonnet-5", "https://proxy.example.com", { forceAdaptiveThinking: false }],
+].map(([api, modelId, baseUrl, existing]) => ({
+  input: { api, modelId, baseUrl, existing: existing ?? null },
+  expected: mergeAlkaidCompatDefaults(api, modelId, baseUrl, existing) ?? null,
+}));
 
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");

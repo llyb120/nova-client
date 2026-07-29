@@ -7,7 +7,7 @@
 //! fixtures. `bash`, `grep`, and `find` shell out to the real programs; their
 //! output is environment-dependent and therefore not byte-parity-checked.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::{json, Value};
@@ -461,9 +461,6 @@ fn run_capture(mut cmd: Command) -> (Value, bool) {
 pub fn tool_fn_for(tools: &NativeTools) -> impl FnMut(&str, &Value) -> (Value, bool) + '_ {
     move |name: &str, args: &Value| tools.execute(name, args)
 }
-
-#[allow(unused)]
-fn _path_ref(_: &Path) {}
 
 #[cfg(test)]
 mod tests {

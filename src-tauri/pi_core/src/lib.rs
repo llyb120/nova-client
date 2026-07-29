@@ -8,6 +8,7 @@
 //! provider streaming land in later milestones.
 
 pub mod agent;
+pub mod alkaid_config;
 pub mod bridge;
 pub mod edit_diff;
 pub mod encoding;
@@ -25,6 +26,10 @@ pub mod truncate;
 pub mod write;
 
 pub use encoding::{decode_text_buffer, detect_text_encoding, swap_utf16_bytes, Encoding};
+pub use alkaid_config::{
+    merge_compat_defaults, merge_config, parse_jsonc, provider_api, resolve_env, resolve_model,
+    strip_json_comments, strip_trailing_commas,
+};
 pub use bridge::{aggregated_output, completed_tool_item, started_tool_item, ProtocolAccumulator};
 pub use edit_diff::{
     apply_edits_to_normalized_content, detect_line_ending, normalize_for_fuzzy_match,
