@@ -22,7 +22,7 @@ pub mod truncate;
 pub mod write;
 
 pub use encoding::{decode_text_buffer, detect_text_encoding, swap_utf16_bytes, Encoding};
-pub use bridge::{aggregated_output, completed_tool_item, started_tool_item};
+pub use bridge::{aggregated_output, completed_tool_item, started_tool_item, ProtocolAccumulator};
 pub use ls::{ls_tool, LsOutput};
 pub use paths::{normalize_path, resolve_path, resolve_to_cwd, NormalizeOptions};
 pub use payload::{
