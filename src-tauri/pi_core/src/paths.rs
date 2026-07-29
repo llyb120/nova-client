@@ -110,6 +110,22 @@ fn is_absolute(path: &str) -> bool {
     path.starts_with('/')
 }
 
+/// Port of node `path.dirname` for POSIX paths.
+pub fn dirname(path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_string();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    match trimmed.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(idx) => trimmed[..idx].to_string(),
+        None => ".".to_string(),
+    }
+}
+
 /// Port of `resolvePath(input, baseDir, options)`: normalize both, then
 /// lexically resolve `input` against `baseDir` (or treat it as absolute).
 pub fn resolve_path(input: &str, base_dir: &str, options: &NormalizeOptions) -> String {

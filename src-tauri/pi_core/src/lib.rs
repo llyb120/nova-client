@@ -13,6 +13,7 @@ pub mod paths;
 pub mod payload;
 pub mod prompt;
 pub mod read;
+pub mod skills;
 pub mod smart_edit;
 pub mod text;
 pub mod truncate;
@@ -29,6 +30,10 @@ pub use prompt::{build_system_prompt, ShellConfig, ShellKind};
 pub use read::{
     read_file_text, read_files_one, read_text_lines, ReadLines, ReadRequest,
     DEFAULT_BATCH_READ_LINES, READ_FILES_MAX_BYTES,
+};
+pub use skills::{
+    format_alkaid_skills_prompt, format_skills_for_prompt, format_skills_for_prompt_compressed,
+    Skill,
 };
 pub use smart_edit::{apply_smart_edits, SmartMatch, SmartResult};
 pub use truncate::{

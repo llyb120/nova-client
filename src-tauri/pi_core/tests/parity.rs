@@ -5,10 +5,10 @@
 use base64::Engine;
 use pi_core::{
     apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
-    clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, format_size, govern_text,
-    inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path, read_files_one,
-    resolve_to_cwd, truncate_head, truncate_line, truncate_tail, write_tool, NormalizeOptions,
-    ReadRequest, ShellConfig, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+    clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, format_alkaid_skills_prompt,
+    format_size, govern_text, inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path,
+    read_files_one, resolve_to_cwd, truncate_head, truncate_line, truncate_tail, write_tool,
+    NormalizeOptions, ReadRequest, ShellConfig, Skill, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
 use serde_json::Value;
 
@@ -187,6 +187,29 @@ fn parse_normalize_options(value: &Value) -> NormalizeOptions {
         strip_at_prefix: get("stripAtPrefix").and_then(Value::as_bool).unwrap_or(false),
         expand_tilde: get("expandTilde").and_then(Value::as_bool).unwrap_or(true),
         home_dir: get("homeDir").and_then(Value::as_str).map(String::from),
+    }
+}
+
+#[test]
+fn parity_skills_prompt() {
+    for case in golden()["skillsPrompt"].as_array().unwrap() {
+        let skills: Vec<Skill> = case["input"]["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| Skill {
+                name: s["name"].as_str().unwrap().to_string(),
+                description: s["description"].as_str().unwrap().to_string(),
+                file_path: s["filePath"].as_str().unwrap().to_string(),
+                disable_model_invocation: s["disableModelInvocation"].as_bool().unwrap(),
+            })
+            .collect();
+        assert_eq!(
+            format_alkaid_skills_prompt(&skills),
+            case["expected"].as_str().unwrap(),
+            "skillsPrompt {:?}",
+            case["input"]
+        );
     }
 }
 

@@ -27,20 +27,21 @@ implementation for every non-LLM computation.
 - M1 (done): text governance/truncation, OpenAI payload transforms (cache key
   injection, output clamping), usage merging, encoding detection, system prompt
   assembly — all covered by differential tests.
-- M2 (in progress): `edit_files` smart-edit locator/applier (exact → rstrip →
+- M2 (done): `edit_files` smart-edit locator/applier (exact → rstrip →
   unicode → relative-indent → fuzzy cascade, ambiguity/overlap rejection,
   indentation rebasing); `read`/`read_files` line reading (encoding detection,
   offset/limit, 32KB byte budget, truncation/`nextOffset`); the shared
   truncation utilities (`formatSize`, `truncateHead`, `truncateTail`,
   `truncateLine`) used by grep/find/ls/bash; path resolution (`normalizePath`,
-  `resolvePath`, `resolveToCwd` with lexical `..`/`.` normalization,
-  Unicode-space folding, `@`-prefix stripping, `~` expansion); and the `write`
-  and `ls` tools — all ported and parity-tested, including CJK and emoji
-  content. `formatSize` reproduces JS `toFixed(1)` round-half-up via integer
-  arithmetic; `write` reproduces the JS UTF-16 `content.length` count. `ls`
-  sorting approximates node's ICU `localeCompare` with lowercase-first byte
-  order (exact for ASCII letters/digits; punctuation/non-ASCII may differ). OS
-  error *messages* are not parity-checked (libuv vs `io::Error`); error
-  presence is. Next: skill formatting, then the agent loop.
+  `resolvePath`, `resolveToCwd`, `dirname` with lexical `..`/`.`
+  normalization, Unicode-space folding, `@`-prefix stripping, `~` expansion);
+  the `write` and `ls` tools; and skill prompt formatting (XML block and
+  compressed by-root listing, XML escaping, `disableModelInvocation` filter) —
+  all ported and parity-tested, including CJK and emoji content. `formatSize`
+  reproduces JS `toFixed(1)` round-half-up via integer arithmetic; `write`
+  reproduces the JS UTF-16 `content.length` count. `ls` sorting and skill
+  root/name sorting approximate node's ICU/UTF-16 collation with byte order
+  (exact for ASCII; punctuation/non-ASCII may differ). OS error *messages* are
+  not parity-checked (libuv vs `io::Error`); error presence is.
 - M3: agent loop, steering, event contract matching `AlkaidAdapter`.
 - M4: wire into the Vega path and remove the node bridge runtime dependency.

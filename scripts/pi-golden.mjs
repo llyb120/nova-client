@@ -327,6 +327,47 @@ lsGolden.push({ input: { cwd: lsRoot, args: { path: "/pi-fixed-cwd/missing" } },
 lsGolden.push({ input: { cwd: lsRoot, args: { path: "afile" } }, expected: { ok: false, errorPrefix: "Not a directory:" } });
 out.lsTool = lsGolden;
 
+// --- skill formatting ---
+const skill = (name, description, filePath, disableModelInvocation = false) => ({
+  name, description, filePath, disableModelInvocation,
+});
+const skillCases = [
+  [],
+  [skill("deploy", "Deploy the app", "/skills/deploy/SKILL.md")],
+  [
+    skill("alpha", "First", "/skills/alpha/SKILL.md"),
+    skill("beta", "Second", "/skills/beta/SKILL.md"),
+    skill("gamma", "Third", "/skills/gamma/SKILL.md"),
+  ],
+  [
+    skill("delta", "Fourth", "/skills/delta/SKILL.md"),
+    skill("alpha", "First", "/skills/alpha/SKILL.md"),
+    skill("beta", "Second", "/skills/beta/SKILL.md"),
+    skill("gamma", "Third", "/skills/gamma/SKILL.md"),
+  ],
+  [
+    skill("zeta", "Z", "/work/zeta/SKILL.md"),
+    skill("alpha", "A", "/skills/alpha/SKILL.md"),
+    skill("beta", "B", "/skills/beta/SKILL.md"),
+    skill("eta", "H", "/work/eta/SKILL.md"),
+    skill("theta", "T", "/work/theta/SKILL.md"),
+  ],
+  [
+    skill("visible", "Shown", "/skills/visible/SKILL.md"),
+    skill("hidden", "Not shown", "/skills/hidden/SKILL.md", true),
+  ],
+  [
+    skill("xml<&>\"'", "desc & <tag> \"q\" 'a'", "/skills/x/SKILL.md"),
+  ],
+];
+out.skillsPrompt = skillCases.map((skills) => ({
+  input: { skills: skills.map((s) => ({
+    name: s.name, description: s.description, filePath: s.filePath,
+    disableModelInvocation: s.disableModelInvocation,
+  })) },
+  expected: core.formatAlkaidSkillsPrompt(skills),
+}));
+
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");
 for (const k of Object.keys(out)) console.log(" ", k, out[k].length);
