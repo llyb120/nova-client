@@ -15,6 +15,7 @@ pub mod ls;
 pub mod paths;
 pub mod payload;
 pub mod prompt;
+pub mod provider;
 pub mod read;
 pub mod skills;
 pub mod smart_edit;
@@ -36,6 +37,10 @@ pub use payload::{
     merge_usage, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH,
 };
 pub use prompt::{build_system_prompt, ShellConfig, ShellKind};
+pub use provider::{
+    build_openai_chat_request, map_finish_reason, pi_message_to_openai, pi_tools_to_openai,
+    OpenAiChatAccumulator,
+};
 pub use read::{
     read_file_text, read_files_one, read_text_lines, ReadLines, ReadRequest,
     DEFAULT_BATCH_READ_LINES, READ_FILES_MAX_BYTES,
