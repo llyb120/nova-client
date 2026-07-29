@@ -335,6 +335,23 @@ export function TranscriptCanvas(props: {
 
   let rebuildQueued = false;
   const scheduleRebuild = () => {
+    // 必须在 effect 同步体内读取所有响应式信号，否则 Solid 不跟踪依赖
+    void props.groups;
+    void props.permissions;
+    void props.running;
+    void props.showHint;
+    void props.hintCwd;
+    void props.threadId;
+    void props.previewBanner;
+    void props.fading;
+    void props.stickToBottom;
+    void viewW();
+    void viewH();
+    void relayoutTick();
+    void mediaTick();
+    void permTick();
+    void editState();
+
     if (rebuildQueued) return;
     rebuildQueued = true;
     requestAnimationFrame(() => {
