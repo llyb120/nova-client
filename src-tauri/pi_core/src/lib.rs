@@ -1,0 +1,26 @@
+//! `pi_core` — a Rust port of the deterministic core of the node pi-agent that
+//! powers the Vega/Alkaid backend. The goal is byte-for-byte output parity with
+//! `scripts/alkaid-core.mjs` for every non-LLM computation, verified by the
+//! differential golden vectors in `testdata/golden.json`.
+//!
+//! Scope (milestone M1): text governance/truncation, OpenAI payload transforms,
+//! usage merging, and text-encoding detection. The agent loop, tools, and
+//! provider streaming land in later milestones.
+
+pub mod encoding;
+pub mod payload;
+pub mod prompt;
+pub mod text;
+
+pub use encoding::{decode_text_buffer, detect_text_encoding, swap_utf16_bytes, Encoding};
+pub use payload::{
+    clamp_openai_payload_tool_outputs, clamp_prompt_cache_key, inject_openai_prompt_cache_key,
+    merge_usage, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH,
+};
+pub use prompt::{build_system_prompt, ShellConfig, ShellKind};
+pub use text::{
+    clamp_tool_output_text, govern_text, head_tail_utf8, safe_archive_segment,
+    truncate_utf8_tail_to_bytes, truncate_utf8_to_bytes, utf16_len, utf8_byte_len, Governed,
+    OPENAI_TOOL_OUTPUT_MAX_CHARS, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+    TOOL_OUTPUT_CONTEXT_MAX_BYTES,
+};

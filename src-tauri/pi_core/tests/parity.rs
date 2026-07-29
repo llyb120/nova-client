@@ -1,0 +1,219 @@
+//! Differential parity tests against golden vectors produced by the real node
+//! implementation (`scripts/alkaid-core.mjs`). Regenerate with the oracle in the
+//! milestone docs; `cargo test` itself needs no node.
+
+use base64::Engine;
+use pi_core::{
+    build_system_prompt, clamp_openai_payload_tool_outputs, clamp_prompt_cache_key,
+    clamp_tool_output_text, decode_text_buffer, govern_text, inject_openai_prompt_cache_key,
+    merge_usage, ShellConfig, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+};
+use serde_json::Value;
+
+const GOLDEN: &str = include_str!("../testdata/golden.json");
+
+fn golden() -> Value {
+    serde_json::from_str(GOLDEN).expect("golden.json parses")
+}
+
+/// Mimic JS `String(x)` coercion for scalar JSON inputs.
+fn coerce_str(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn opt_str(value: &Value) -> Option<&str> {
+    value.as_str()
+}
+
+#[test]
+fn parity_clamp_tool_output_text() {
+    for case in golden()["clampToolOutputText"].as_array().unwrap() {
+        let text = coerce_str(&case["input"]["text"]);
+        let max = case["input"]["maxChars"].as_u64().unwrap() as usize;
+        let got = clamp_tool_output_text(Some(&text), max);
+        assert_eq!(
+            got,
+            case["expected"].as_str().unwrap(),
+            "clampToolOutputText input {:?}",
+            case["input"]
+        );
+    }
+}
+
+#[test]
+fn parity_clamp_tool_output_text_default_max() {
+    // The default maxChars path must agree with the constant's JS value.
+    assert_eq!(OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS, 10_485_248);
+    let short = "hello";
+    assert_eq!(
+        clamp_tool_output_text(Some(short), OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS),
+        short
+    );
+}
+
+#[test]
+fn parity_govern_tool_result() {
+    for case in golden()["governToolResult"].as_array().unwrap() {
+        let text = case["input"]["text"].as_str().unwrap();
+        let max_bytes = case["input"]["maxBytes"].as_u64().unwrap() as usize;
+        let expected_text = case["expected"]["text"].as_str().unwrap();
+        match govern_text(text, max_bytes, None) {
+            Some(governed) => {
+                assert_eq!(
+                    governed.text, expected_text,
+                    "govern text maxBytes={max_bytes} input_len={}",
+                    text.len()
+                );
+                assert_eq!(
+                    governed.original_bytes,
+                    case["expected"]["details"]["originalBytes"].as_u64().unwrap() as usize,
+                    "govern originalBytes maxBytes={max_bytes}"
+                );
+                assert!(governed.archived_path.is_none());
+            }
+            None => {
+                // Unchanged path: node returns the original text verbatim.
+                assert_eq!(
+                    text, expected_text,
+                    "govern unchanged maxBytes={max_bytes}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn parity_clamp_prompt_cache_key() {
+    for case in golden()["clampPromptCacheKey"].as_array().unwrap() {
+        let key = opt_str(&case["input"]["key"]);
+        let got = clamp_prompt_cache_key(key);
+        let expected = &case["expected"];
+        match got {
+            Some(value) => assert_eq!(
+                &Value::String(value),
+                expected,
+                "clampPromptCacheKey {:?}",
+                case["input"]
+            ),
+            None => assert!(
+                expected.is_null(),
+                "clampPromptCacheKey expected null for {:?}",
+                case["input"]
+            ),
+        }
+    }
+}
+
+#[test]
+fn parity_inject_openai_prompt_cache_key() {
+    for case in golden()["injectOpenAIPromptCacheKey"].as_array().unwrap() {
+        let payload = &case["input"]["payload"];
+        let session_id = opt_str(&case["input"]["sessionId"]);
+        let got = inject_openai_prompt_cache_key(payload, session_id);
+        let expected = &case["expected"];
+        match got {
+            Some(value) => assert_eq!(
+                &value, expected,
+                "injectOpenAIPromptCacheKey {:?}",
+                case["input"]
+            ),
+            None => assert!(
+                expected.is_null(),
+                "injectOpenAIPromptCacheKey expected null for {:?}",
+                case["input"]
+            ),
+        }
+    }
+}
+
+#[test]
+fn parity_clamp_openai_payload_tool_outputs() {
+    for case in golden()["clampOpenAIPayloadToolOutputs"].as_array().unwrap() {
+        let payload = &case["input"]["payload"];
+        let max = case["input"]["maxChars"].as_u64().unwrap() as usize;
+        let got = clamp_openai_payload_tool_outputs(payload, max);
+        let expected = &case["expected"];
+        match got {
+            Some(value) => assert_eq!(
+                &value, expected,
+                "clampOpenAIPayloadToolOutputs {:?}",
+                case["input"]
+            ),
+            None => assert!(
+                expected.is_null(),
+                "clampOpenAIPayloadToolOutputs expected null for {:?}",
+                case["input"]
+            ),
+        }
+    }
+}
+
+#[test]
+fn parity_merge_usage() {
+    for case in golden()["mergeAlkaidUsage"].as_array().unwrap() {
+        let total = case["input"]["total"].clone();
+        let usage = case["input"]["usage"].clone();
+        let total_ref = if total.is_null() { None } else { Some(&total) };
+        let usage_ref = if usage.is_null() { None } else { Some(&usage) };
+        let got = merge_usage(total_ref, usage_ref);
+        let expected = &case["expected"];
+        match got {
+            Some(value) => assert_eq!(&value, expected, "mergeAlkaidUsage {:?}", case["input"]),
+            None => assert!(
+                expected.is_null(),
+                "mergeAlkaidUsage expected null for {:?}",
+                case["input"]
+            ),
+        }
+    }
+}
+
+#[test]
+fn parity_build_system_prompt() {
+    for case in golden()["buildAlkaidSystemPrompt"].as_array().unwrap() {
+        let options = &case["input"]["options"];
+        let cwd = options["cwd"].as_str().unwrap();
+        let read_only = options["readOnly"].as_bool().unwrap();
+        let shell_config: Option<ShellConfig> = if options["shellConfig"].is_null() {
+            None
+        } else {
+            Some(serde_json::from_value(options["shellConfig"].clone()).unwrap())
+        };
+        let skills = options["skills"].as_array().unwrap();
+        assert!(
+            skills.is_empty(),
+            "M1 golden only covers empty skills; non-empty is M2"
+        );
+        let system_prompt = options["systemPrompt"].as_str().unwrap_or("");
+        let got = build_system_prompt(cwd, read_only, shell_config.as_ref(), "", system_prompt);
+        assert_eq!(
+            got,
+            case["expected"].as_str().unwrap(),
+            "buildAlkaidSystemPrompt {:?}",
+            options
+        );
+    }
+}
+
+#[test]
+fn parity_decode_text_buffer() {
+    let engine = base64::engine::general_purpose::STANDARD;
+    for case in golden()["decodeTextBuffer"].as_array().unwrap() {
+        let bytes = engine
+            .decode(case["input"]["base64"].as_str().unwrap())
+            .unwrap();
+        let got = decode_text_buffer(&bytes);
+        assert_eq!(
+            got,
+            case["expected"].as_str().unwrap(),
+            "decodeTextBuffer {:?}",
+            case["input"]
+        );
+    }
+}
