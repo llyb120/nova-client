@@ -30,6 +30,7 @@ mod sys_notify;
 mod threads;
 mod time_machine;
 mod updater;
+mod vega_native;
 #[cfg(windows)]
 mod windows_shell_shim;
 
