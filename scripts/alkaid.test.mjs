@@ -43,7 +43,6 @@ import {
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
-import { searchSessionHistory } from "./session-history-search.mjs";
 
 const configuredModel = {
   id: "gpt-test",
@@ -321,28 +320,6 @@ test("Vega slim context uses separate thresholds for trajectory removal and summ
   }), true);
   assert.deepEqual(memory.digests, ["stage two summary"]);
   assert.deepEqual(memory.turns.map((turn) => turn.conclusion), ["conclusion 11"]);
-});
-
-test("Vega session history search is bounded, ranked, and excludes the active session", async () => {
-  const root = await mkdtemp(join(tmpdir(), "vega-history-search-"));
-  await writeFile(join(root, "active.slim.json"), JSON.stringify({
-    turns: [{ userPrompt: "Cursor checkpoint", conclusion: "active result" }],
-  }));
-  await writeFile(join(root, "relevant.slim.json"), JSON.stringify({
-    preservedUserPrompts: ["优化 Cursor checkpoint 缓存"],
-    digests: ["采用 append-only session"],
-    turns: [],
-  }));
-  await writeFile(join(root, "other.slim.json"), JSON.stringify({
-    turns: [{ userPrompt: "change button color", conclusion: "done" }],
-  }));
-  const results = await searchSessionHistory([root], "Cursor checkpoint", {
-    currentSessionId: "active",
-    limit: 2,
-  });
-  assert.equal(results[0].sessionId, "relevant");
-  assert.match(results[0].snippet, /append-only|checkpoint/);
-  assert.doesNotMatch(JSON.stringify(results), /active result/);
 });
 
 test("Vega context pressure uses Reasonix-style 50/60/80/90 tiers", () => {
@@ -986,7 +963,6 @@ test("plan mode exposes no write tool", async () => {
     assert.equal(runtime.agent.state.thinkingLevel, "off");
     assert.deepEqual(runtime.agent.state.tools.slice(0, 5).map((tool) => tool.name), ["read_files", "read", "grep", "find", "ls"]);
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "edit_files"));
-    assert(runtime.agent.state.tools.some((tool) => tool.name === "search_session_history"));
   } finally {
     await runtime.close();
   }
@@ -1003,7 +979,6 @@ test("Vega can freeze the complete system/environment prompt for a session epoch
   try {
     assert.equal(runtime.systemPrompt, "frozen-system-snapshot");
     assert.equal(runtime.agent.state.systemPrompt, "frozen-system-snapshot");
-    assert(runtime.toolShape.some((tool) => tool.name === "search_session_history"));
   } finally {
     await runtime.close();
   }

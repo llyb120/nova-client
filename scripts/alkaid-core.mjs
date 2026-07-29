@@ -17,7 +17,6 @@ import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
-import { searchSessionHistory } from "./session-history-search.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -684,7 +683,6 @@ export function buildAlkaidSystemPrompt(options = {}) {
         ? "- bash: 执行 PowerShell 命令"
         : "- bash: 执行 Bash 命令",
     options.readOnly ? null : "- edit / write: 单文件编辑或写入",
-    "- search_session_history: 按需检索本地跨会话历史，只返回少量相关片段",
   ].filter(Boolean);
 
   const stableParts = [
@@ -832,25 +830,7 @@ export async function createAlkaidAgent(options = {}) {
     : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell }, read: { operations: readOperations } });
   const editTool = codingTools.find((tool) => tool.name === "edit");
   const batchTools = createFilesystemTools(cwd, editTool);
-  const historyRoots = [
-    join(alkaidDataRoot(), "sessions"),
-    join(dirname(alkaidDataRoot()), "cursor-slim-memory"),
-  ];
-  const historyTool = {
-    name: "search_session_history",
-    description: "按需检索 Vega/Cursor 本地历史会话。仅在当前上下文缺少旧决策或用户明确要求查找历史时使用；返回 BM25 风格排序的少量片段。",
-    parameters: Type.Object({
-      query: Type.String({ minLength: 1 }),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
-    }),
-    async execute(_toolCallId, { query, limit }) {
-      return textResult(JSON.stringify(await searchSessionHistory(historyRoots, query, {
-        limit,
-        currentSessionId: options.sessionId,
-      })));
-    },
-  };
-  const rawTools = [...batchTools, ...codingTools, historyTool, ...mcp.tools];
+  const rawTools = [...batchTools, ...codingTools, ...mcp.tools];
   const archiveDir = options.sessionId
     ? join(alkaidDataRoot(), "tool-results", safeArchiveSegment(options.sessionId))
     : undefined;

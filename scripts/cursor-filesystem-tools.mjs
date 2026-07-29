@@ -1,10 +1,8 @@
 import { createReadStream } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
-import { searchSessionHistory } from "./session-history-search.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -138,26 +136,6 @@ export function createCursorFilesystemTools(cwd, options = {}) {
     },
   };
 
-  const novaRoot = process.env.NOVA_DATA_DIR || join(homedir(), ".nova");
-  tools.search_session_history = {
-    description: "按需检索 Vega/Cursor 本地历史会话。仅在当前上下文缺少旧决策或用户明确要求查找历史时使用；返回 BM25 风格排序的少量片段。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", minLength: 1 },
-        limit: { type: "integer", minimum: 1, maximum: 10 },
-      },
-      required: ["query"],
-      additionalProperties: false,
-    },
-    async execute({ query, limit }) {
-      return JSON.stringify(await searchSessionHistory([
-        join(novaRoot, "alkaid", "sessions"),
-        join(novaRoot, "cursor-slim-memory"),
-      ], query, { limit }));
-    },
-  };
-
   if (!readOnly) {
     tools.edit_files = {
       description: "并行智能编辑多个互不依赖的文件。每段 oldLines/newLines 必须按行传为 JSON 字符串数组（不要把多行内容塞进一个字符串），以避开 Cursor 对多行工具参数的解析缺陷。先精确匹配，再智能定位；歧义或重叠时拒绝，所有文件验证成功后才并行写入。",
@@ -268,7 +246,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
 export function cursorBatchToolPolicy(options = {}) {
   const readOnly = options.readOnly === true;
   const lines = [
-    "You have Nova batch tools read_files / search_session_history"
+    "You have Nova batch tool read_files"
       + (readOnly ? "" : " / edit_files")
       + " plus Cursor built-in Read, Shell, Grep"
       + (readOnly ? "" : ", Write/Edit")
