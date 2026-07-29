@@ -4,7 +4,7 @@
 
 use base64::Engine;
 use pi_core::{
-    agent::{run_agent_loop, LoopConfig, LoopContext},
+    agent::{run_agent_loop, LoopConfig, LoopContext, StreamTurn},
     apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
     clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, format_alkaid_skills_prompt,
     format_size, govern_text, inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path,
@@ -191,6 +191,43 @@ fn parse_normalize_options(value: &Value) -> NormalizeOptions {
     }
 }
 
+/// Mirror of the node generator's `buildStreamEvents`: turn a scripted response
+/// entry into a `StreamTurn`. An entry with `deltas` produces `start` +
+/// `text_delta` events (with an accumulating partial) + `done`; a plain message
+/// produces `start` + `done`.
+fn build_stream_turn(entry: &Value) -> StreamTurn {
+    if let (Some(deltas), Some(final_message)) = (
+        entry.get("deltas").and_then(Value::as_array),
+        entry.get("final"),
+    ) {
+        let mut events = Vec::new();
+        let mut text = String::new();
+        let partial = |text: &str| -> Value {
+            let mut message = final_message.clone();
+            message["content"] = json!([{ "type": "text", "text": text }]);
+            message
+        };
+        events.push(json!({ "type": "start", "partial": partial("") }));
+        for delta in deltas {
+            text.push_str(delta.as_str().unwrap_or(""));
+            events.push(json!({ "type": "text_delta", "delta": delta, "partial": partial(&text) }));
+        }
+        events.push(json!({ "type": "done" }));
+        StreamTurn {
+            events,
+            result: final_message.clone(),
+        }
+    } else {
+        StreamTurn {
+            events: vec![
+                json!({ "type": "start", "partial": entry }),
+                json!({ "type": "done" }),
+            ],
+            result: entry.clone(),
+        }
+    }
+}
+
 fn strip_timestamps(value: &Value) -> Value {
     match value {
         Value::Array(items) => Value::Array(items.iter().map(strip_timestamps).collect()),
@@ -232,11 +269,12 @@ fn parity_agent_loop() {
 
         let mut events: Vec<Value> = Vec::new();
         let mut emit = |event: Value| events.push(event);
-        let mut stream_fn = |index: usize, _llm_context: &Value| -> Value {
-            responses
+        let mut stream_fn = |index: usize, _llm_context: &Value| -> StreamTurn {
+            let entry = responses
                 .get(index)
                 .cloned()
-                .unwrap_or_else(|| json!({ "role": "assistant", "content": [], "stopReason": "end_turn" }))
+                .unwrap_or_else(|| json!({ "role": "assistant", "content": [], "stopReason": "end_turn" }));
+            build_stream_turn(&entry)
         };
         let mut tool_fn = |tool_name: &str, _args: &Value| -> (Value, bool) {
             match tool_results.get(tool_name) {

@@ -25,9 +25,17 @@ pub struct LoopContext {
 /// where `result` is the `{ content, details, ... }` object.
 pub type ToolFn<'a> = dyn FnMut(&str, &Value) -> (Value, bool) + 'a;
 
+/// One LLM turn as seen by the loop: the raw provider stream events (matching
+/// node's `start`/`*_delta`/`done`/`error` shapes) plus the finalized assistant
+/// message that `response.result()` resolves to.
+pub struct StreamTurn {
+    pub events: Vec<Value>,
+    pub result: Value,
+}
+
 /// The LLM boundary: given the call index (0-based) and the LLM context
-/// (`{ systemPrompt, messages, tools }`), produce the next assistant message.
-pub type StreamFn<'a> = dyn FnMut(usize, &Value) -> Value + 'a;
+/// (`{ systemPrompt, messages, tools }`), produce the next turn's stream.
+pub type StreamFn<'a> = dyn FnMut(usize, &Value) -> StreamTurn + 'a;
 
 /// Queued-message provider used for steering/follow-up injection.
 pub type QueueFn<'a> = dyn FnMut() -> Vec<Value> + 'a;
@@ -75,6 +83,80 @@ fn default_convert_to_llm(messages: &[Value]) -> Vec<Value> {
         })
         .cloned()
         .collect()
+}
+
+/// Port of `streamAssistantResponse`: drive the provider stream, emitting
+/// `message_start` on `start`, `message_update` for each delta, and
+/// `message_end` on `done`/`error`, while maintaining the running partial
+/// message in the transcript. Returns the finalized assistant message.
+fn stream_assistant_response(
+    context: &mut LoopContext,
+    emit: &mut dyn FnMut(Value),
+    stream_fn: &mut StreamFn,
+    call_index: usize,
+    llm_context: &Value,
+) -> Value {
+    let turn = stream_fn(call_index, llm_context);
+    let mut added_partial = false;
+
+    for event in &turn.events {
+        match event.get("type").and_then(Value::as_str) {
+            Some("start") => {
+                let partial = event.get("partial").cloned().unwrap_or_else(|| json!({}));
+                context.messages.push(partial.clone());
+                added_partial = true;
+                emit(json!({ "type": "message_start", "message": partial }));
+            }
+            Some(
+                "text_start"
+                | "text_delta"
+                | "text_end"
+                | "thinking_start"
+                | "thinking_delta"
+                | "thinking_end"
+                | "toolcall_start"
+                | "toolcall_delta"
+                | "toolcall_end",
+            ) => {
+                if added_partial {
+                    if let Some(partial) = event.get("partial") {
+                        let last = context.messages.len() - 1;
+                        context.messages[last] = partial.clone();
+                        emit(json!({
+                            "type": "message_update",
+                            "assistantMessageEvent": event,
+                            "message": partial,
+                        }));
+                    }
+                }
+            }
+            Some("done") | Some("error") => {
+                let final_message = turn.result.clone();
+                if added_partial {
+                    let last = context.messages.len() - 1;
+                    context.messages[last] = final_message.clone();
+                } else {
+                    context.messages.push(final_message.clone());
+                    emit(json!({ "type": "message_start", "message": final_message }));
+                }
+                emit(json!({ "type": "message_end", "message": final_message }));
+                return final_message;
+            }
+            _ => {}
+        }
+    }
+
+    // Stream ended without an explicit done/error event.
+    let final_message = turn.result.clone();
+    if added_partial {
+        let last = context.messages.len() - 1;
+        context.messages[last] = final_message.clone();
+    } else {
+        context.messages.push(final_message.clone());
+        emit(json!({ "type": "message_start", "message": final_message }));
+    }
+    emit(json!({ "type": "message_end", "message": final_message }));
+    final_message
 }
 
 /// Execute one tool call, emitting `tool_execution_start`/`end` and the
@@ -168,12 +250,10 @@ fn run_loop_body(
                 "messages": default_convert_to_llm(&context.messages),
                 "tools": context.tools,
             });
-            let message = stream_fn(call_index, &llm_context);
+            let message =
+                stream_assistant_response(context, emit, stream_fn, call_index, &llm_context);
             call_index += 1;
-            context.messages.push(message.clone());
             new_messages.push(message.clone());
-            emit(json!({ "type": "message_start", "message": message }));
-            emit(json!({ "type": "message_end", "message": message }));
 
             let stop_reason = message.get("stopReason").and_then(Value::as_str).unwrap_or("");
             if stop_reason == "error" || stop_reason == "aborted" {

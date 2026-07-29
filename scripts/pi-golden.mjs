@@ -383,17 +383,41 @@ const toolCallMsg = (id, name, args) => assistantMsg([{ type: "toolCall", id, na
 const userMsg = (text) => ({ role: "user", content: [{ type: "text", text }], timestamp: 500 });
 
 // Mock stream: yields start+done and resolves result() to the scripted message.
+// A response entry may be a plain assistant message, or `{ deltas: [..], final: msg }`
+// to exercise text_delta streaming with an accumulating partial message.
+const buildStreamEvents = (entry) => {
+  if (entry && entry.deltas) {
+    const events = [];
+    let text = "";
+    const partial = () => ({ ...entry.final, content: [{ type: "text", text }] });
+    events.push({ type: "start", partial: partial() });
+    for (const delta of entry.deltas) {
+      text += delta;
+      events.push({ type: "text_delta", delta, partial: partial() });
+    }
+    events.push({ type: "done" });
+    return { events, result: entry.final };
+  }
+  return {
+    events: [
+      { type: "start", partial: entry },
+      { type: "done" },
+    ],
+    result: entry,
+  };
+};
+
 const makeStreamFn = (responses) => {
   let call = 0;
   return async () => {
-    const message = responses[call] ?? textMsg("(no more responses)");
+    const entry = responses[call] ?? textMsg("(no more responses)");
     call += 1;
+    const { events, result } = buildStreamEvents(entry);
     return {
       async *[Symbol.asyncIterator]() {
-        yield { type: "start", partial: message };
-        yield { type: "done" };
+        for (const event of events) yield event;
       },
-      async result() { return message; },
+      async result() { return result; },
     };
   };
 };
@@ -452,6 +476,9 @@ const agentScenarios = [
     responses: [assistantMsg([{ type: "toolCall", id: "a", name: "echo", arguments: { text: "1" } }, { type: "toolCall", id: "b", name: "echo", arguments: { text: "2" } }], "tool_calls"), textMsg("done")],
     tools: [{ name: "echo", description: "echo", parameters: {} }],
     toolResults: { echo: { content: [{ type: "text", text: "ok" }], details: {} } } },
+  { name: "streaming_text", prompts: [userMsg("stream")],
+    responses: [{ deltas: ["Hel", "lo, ", "world!"], final: textMsg("Hello, world!") }],
+    tools: [] },
 ];
 out.agentLoop = [];
 for (const scenario of agentScenarios) {
