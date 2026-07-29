@@ -10,6 +10,7 @@
 // deep-cloned before being recorded and before being passed to the function.
 import * as core from "./alkaid-core.mjs";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
+import { formatSize, truncateHead, truncateTail, truncateLine } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/truncate.js";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -179,6 +180,52 @@ for (const { fileName, bytes, request } of readCases) {
   });
 }
 out.readFiles = readGolden;
+
+// --- truncate utilities ---
+out.formatSize = [
+  0, 1, 512, 1023, 1024, 1280, 1536, 1792, 2048, 1587, 1588,
+  51200, 1023 * 1024, 1048575, 1048576, 1280 * 1024, 1536 * 1024,
+  5 * 1024 * 1024, 10 * 1024 * 1024 + 512 * 1024,
+].map((bytes) => ({ input: { bytes }, expected: formatSize(bytes) }));
+
+const headCases = [
+  ["a\nb\nc", {}],
+  ["l1\nl2\nl3\nl4\nl5", { maxLines: 2 }],
+  ["aaaa\nbbbb\ncccc", { maxBytes: 10 }],
+  ["x".repeat(100), { maxBytes: 10 }],
+  ["", {}],
+  ["single", {}],
+  ["trailing\n", {}],
+  ["中文行\n第二行\n第三行", { maxBytes: 12 }],
+  ["line1\nline2\nline3\nline4", { maxLines: 2, maxBytes: 100 }],
+  ["a".repeat(60000), {}],
+];
+out.truncateHead = headCases.map(([content, options]) => ({
+  input: { content, options },
+  expected: truncateHead(content, options),
+}));
+
+const tailCases = [
+  ["l1\nl2\nl3\nl4\nl5", { maxLines: 2 }],
+  ["short\n" + "y".repeat(100), { maxBytes: 20 }],
+  ["a\nb\nc", {}],
+  ["", {}],
+  ["中文\n" + "字".repeat(100), { maxBytes: 30 }],
+  ["e1\ne2\ne3\ne4\ne5\ne6", { maxLines: 3 }],
+];
+out.truncateTail = tailCases.map(([content, options]) => ({
+  input: { content, options },
+  expected: truncateTail(content, options),
+}));
+
+out.truncateLine = [
+  ["short", 10],
+  ["z".repeat(20), 10],
+  ["exactly10c", 10],
+  ["中文".repeat(10), 6],
+  ["a😀b😀c😀d", 4],
+  ["", 5],
+].map(([line, maxChars]) => ({ input: { line, maxChars }, expected: truncateLine(line, maxChars) }));
 
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");

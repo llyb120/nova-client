@@ -29,10 +29,13 @@ implementation for every non-LLM computation.
   assembly — all covered by differential tests.
 - M2 (in progress): `edit_files` smart-edit locator/applier (exact → rstrip →
   unicode → relative-indent → fuzzy cascade, ambiguity/overlap rejection,
-  indentation rebasing) and `read`/`read_files` line reading (encoding
-  detection, offset/limit, 32KB byte budget, truncation/`nextOffset`) ported and
-  parity-tested, including CJK and emoji content. OS error *messages* are not
+  indentation rebasing); `read`/`read_files` line reading (encoding detection,
+  offset/limit, 32KB byte budget, truncation/`nextOffset`); and the shared
+  truncation utilities (`formatSize`, `truncateHead`, `truncateTail`,
+  `truncateLine`) used by grep/find/ls/bash — all ported and parity-tested,
+  including CJK and emoji content. `formatSize` reproduces JS `toFixed(1)`
+  round-half-up via integer arithmetic. OS error *messages* are not
   parity-checked (libuv vs `io::Error`); error presence is. Next: `write`,
-  `bash`, `grep`/`find`/`ls`, and skill formatting.
+  `ls`, path resolution, and skill formatting.
 - M3: agent loop, steering, event contract matching `AlkaidAdapter`.
 - M4: wire into the Vega path and remove the node bridge runtime dependency.

@@ -5,9 +5,9 @@
 use base64::Engine;
 use pi_core::{
     apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
-    clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, govern_text,
-    inject_openai_prompt_cache_key, merge_usage, read_files_one, ReadRequest, ShellConfig,
-    OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+    clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, format_size, govern_text,
+    inject_openai_prompt_cache_key, merge_usage, read_files_one, truncate_head, truncate_line,
+    truncate_tail, ReadRequest, ShellConfig, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
 use serde_json::Value;
 
@@ -172,6 +172,56 @@ fn parity_merge_usage() {
                 case["input"]
             ),
         }
+    }
+}
+
+#[test]
+fn parity_format_size() {
+    for case in golden()["formatSize"].as_array().unwrap() {
+        let bytes = case["input"]["bytes"].as_u64().unwrap() as usize;
+        assert_eq!(
+            format_size(bytes),
+            case["expected"].as_str().unwrap(),
+            "formatSize {bytes}"
+        );
+    }
+}
+
+fn truncation_options(case: &Value) -> (Option<usize>, Option<usize>) {
+    let options = &case["input"]["options"];
+    (
+        options["maxLines"].as_u64().map(|v| v as usize),
+        options["maxBytes"].as_u64().map(|v| v as usize),
+    )
+}
+
+#[test]
+fn parity_truncate_head() {
+    for case in golden()["truncateHead"].as_array().unwrap() {
+        let content = case["input"]["content"].as_str().unwrap();
+        let (max_lines, max_bytes) = truncation_options(case);
+        let got = serde_json::to_value(truncate_head(content, max_lines, max_bytes)).unwrap();
+        assert_eq!(&got, &case["expected"], "truncateHead {:?}", case["input"]);
+    }
+}
+
+#[test]
+fn parity_truncate_tail() {
+    for case in golden()["truncateTail"].as_array().unwrap() {
+        let content = case["input"]["content"].as_str().unwrap();
+        let (max_lines, max_bytes) = truncation_options(case);
+        let got = serde_json::to_value(truncate_tail(content, max_lines, max_bytes)).unwrap();
+        assert_eq!(&got, &case["expected"], "truncateTail {:?}", case["input"]);
+    }
+}
+
+#[test]
+fn parity_truncate_line() {
+    for case in golden()["truncateLine"].as_array().unwrap() {
+        let line = case["input"]["line"].as_str().unwrap();
+        let max_chars = case["input"]["maxChars"].as_u64().map(|v| v as usize);
+        let got = serde_json::to_value(truncate_line(line, max_chars)).unwrap();
+        assert_eq!(&got, &case["expected"], "truncateLine {:?}", case["input"]);
     }
 }
 
