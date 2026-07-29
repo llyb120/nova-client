@@ -591,8 +591,8 @@ assert.deepEqual(editFilesItem.changes, [{ path: "a.ts", kind: "update" }]);
 const batchCwd = await mkdtemp(join(tmpdir(), "nova-cursor-batch-"));
 try {
   await Promise.all([
-    writeFile(join(batchCwd, "a.txt"), "A"),
-    writeFile(join(batchCwd, "b.txt"), "B"),
+    writeFile(join(batchCwd, "a.txt"), "A\nconst quoted = \"x\";"),
+    writeFile(join(batchCwd, "b.txt"), "B\npath = C:\\tmp"),
   ]);
   const agentTools = createCursorFilesystemTools(batchCwd);
   assert.equal(typeof agentTools.read_files.execute, "function");
@@ -601,29 +601,29 @@ try {
   assert.equal(readOnlyTools.edit_files, undefined);
   const read = JSON.parse(await agentTools.read_files.execute({ paths: ["a.txt", "b.txt"] }));
   assert.deepEqual(read, [
-    { path: "a.txt", content: "A" },
-    { path: "b.txt", content: "B" },
+    { path: "a.txt", content: "A\nconst quoted = \"x\";" },
+    { path: "b.txt", content: "B\npath = C:\\tmp" },
   ]);
   await agentTools.edit_files.execute({
     files: [
-      { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] },
-      { path: "b.txt", edits: [{ oldText: "B", newText: "BB" }] },
+      { path: "a.txt", edits: [{ oldLines: ["A", "const quoted = \"x\";"], newLines: ["AA", "const quoted = \"y\";"] }] },
+      { path: "b.txt", edits: [{ oldLines: ["B", "path = C:\\tmp"], newLines: ["BB", "path = D:\\work"] }] },
     ],
   });
   assert.deepEqual(await Promise.all([
     readFile(join(batchCwd, "a.txt"), "utf8"),
     readFile(join(batchCwd, "b.txt"), "utf8"),
-  ]), ["AA", "BB"]);
+  ]), ["AA\nconst quoted = \"y\";", "BB\npath = D:\\work"]);
   await assert.rejects(() => agentTools.edit_files.execute({
     files: [
-      { path: "a.txt", edits: [{ oldText: "AA", newText: "changed" }] },
-      { path: "b.txt", edits: [{ oldText: "missing", newText: "changed" }] },
+      { path: "a.txt", edits: [{ oldLines: ["AA"], newLines: ["changed"] }] },
+      { path: "b.txt", edits: [{ oldLines: ["missing"], newLines: ["changed"] }] },
     ],
   }), /Could not find/);
   assert.deepEqual(await Promise.all([
     readFile(join(batchCwd, "a.txt"), "utf8"),
     readFile(join(batchCwd, "b.txt"), "utf8"),
-  ]), ["AA", "BB"]);
+  ]), ["AA\nconst quoted = \"y\";", "BB\npath = D:\\work"]);
 
   await writeFile(join(batchCwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
   const first = JSON.parse(await agentTools.read_files.execute({ paths: ["large.txt"] }))[0];

@@ -28,6 +28,19 @@ function resolveInputPath(root, input) {
   return resolve(root, input);
 }
 
+function textEditFromLines(edit, fileIndex, editIndex) {
+  const oldLines = edit?.oldLines;
+  const newLines = edit?.newLines;
+  const valid = Array.isArray(oldLines) && oldLines.length > 0
+    && Array.isArray(newLines) && newLines.length > 0
+    && oldLines.every((line) => typeof line === "string")
+    && newLines.every((line) => typeof line === "string");
+  if (!valid) {
+    throw new Error(`files[${fileIndex}].edits[${editIndex}] requires non-empty string arrays oldLines/newLines`);
+  }
+  return { oldText: oldLines.join("\n"), newText: newLines.join("\n") };
+}
+
 async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES, maxBytes = READ_FILES_MAX_BYTES) {
   const input = createReadStream(path, { encoding: "utf8" });
   const lines = createInterface({ input, crlfDelay: Infinity });
@@ -147,7 +160,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
 
   if (!readOnly) {
     tools.edit_files = {
-      description: "并行智能编辑多个互不依赖的文件。先精确匹配，再通过稀有行锚点按 rstrip、Unicode、相对缩进和保守模糊评分逐级定位；歧义或重叠时拒绝，所有文件验证成功后才并行写入。",
+      description: "并行智能编辑多个互不依赖的文件。每段 oldLines/newLines 必须按行传为 JSON 字符串数组（不要把多行内容塞进一个字符串），以避开 Cursor 对多行工具参数的解析缺陷。先精确匹配，再智能定位；歧义或重叠时拒绝，所有文件验证成功后才并行写入。",
       inputSchema: {
         type: "object",
         properties: {
@@ -164,10 +177,20 @@ export function createCursorFilesystemTools(cwd, options = {}) {
                   items: {
                     type: "object",
                     properties: {
-                      oldText: { type: "string" },
-                      newText: { type: "string" },
+                      oldLines: {
+                        type: "array",
+                        minItems: 1,
+                        items: { type: "string" },
+                        description: "待替换文本，每个数组元素严格对应一行；用末尾空字符串表示结尾换行。",
+                      },
+                      newLines: {
+                        type: "array",
+                        minItems: 1,
+                        items: { type: "string" },
+                        description: "替换后文本，每个数组元素严格对应一行；用末尾空字符串表示结尾换行。",
+                      },
                     },
-                    required: ["oldText", "newText"],
+                    required: ["oldLines", "newLines"],
                     additionalProperties: false,
                   },
                 },
@@ -182,14 +205,19 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
       async execute({ files }) {
         const list = Array.isArray(files) ? files : [];
+        if (list.length === 0) throw new Error("edit_files requires a non-empty files array");
         const grouped = new Map();
-        for (const file of list) {
+        for (const [fileIndex, file] of list.entries()) {
           const requestPath = String(file?.path ?? "");
-          const edits = Array.isArray(file?.edits) ? file.edits : [];
+          const inputEdits = Array.isArray(file?.edits) ? file.edits : [];
+          if (!requestPath || inputEdits.length === 0) {
+            throw new Error(`files[${fileIndex}] requires path and a non-empty edits array`);
+          }
+          const edits = inputEdits.map((edit, editIndex) => textEditFromLines(edit, fileIndex, editIndex));
           const target = resolveInputPath(root, requestPath);
           const existing = grouped.get(target);
           if (existing) existing.edits.push(...edits);
-          else grouped.set(target, { path: requestPath, target, edits: [...edits] });
+          else grouped.set(target, { path: requestPath, target, edits });
         }
         const targets = [...grouped.values()];
 
