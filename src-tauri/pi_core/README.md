@@ -29,7 +29,10 @@ implementation for every non-LLM computation.
   assembly — all covered by differential tests.
 - M2 (in progress): `edit_files` smart-edit locator/applier (exact → rstrip →
   unicode → relative-indent → fuzzy cascade, ambiguity/overlap rejection,
-  indentation rebasing) ported and parity-tested, including CJK and emoji
-  content. Next: `read`/`read_files` line reading and the remaining tools.
+  indentation rebasing) and `read`/`read_files` line reading (encoding
+  detection, offset/limit, 32KB byte budget, truncation/`nextOffset`) ported and
+  parity-tested, including CJK and emoji content. OS error *messages* are not
+  parity-checked (libuv vs `io::Error`); error presence is. Next: `write`,
+  `bash`, `grep`/`find`/`ls`, and skill formatting.
 - M3: agent loop, steering, event contract matching `AlkaidAdapter`.
 - M4: wire into the Vega path and remove the node bridge runtime dependency.

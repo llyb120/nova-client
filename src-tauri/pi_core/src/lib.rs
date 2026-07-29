@@ -10,6 +10,7 @@
 pub mod encoding;
 pub mod payload;
 pub mod prompt;
+pub mod read;
 pub mod smart_edit;
 pub mod text;
 
@@ -19,6 +20,10 @@ pub use payload::{
     merge_usage, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH,
 };
 pub use prompt::{build_system_prompt, ShellConfig, ShellKind};
+pub use read::{
+    read_file_text, read_files_one, read_text_lines, ReadLines, ReadRequest,
+    DEFAULT_BATCH_READ_LINES, READ_FILES_MAX_BYTES,
+};
 pub use smart_edit::{apply_smart_edits, SmartMatch, SmartResult};
 pub use text::{
     clamp_tool_output_text, govern_text, head_tail_utf8, safe_archive_segment,

@@ -140,6 +140,46 @@ out.smartEdit = smartCases.map(({ content, edits, path }) => {
   }
 });
 
+// --- read_files (via the real tool) ---
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const utf16le = (s) => Buffer.from(s, "utf16le");
+const readRoot = mkdtempSync(join(tmpdir(), "piread-"));
+const readFilesTool = core.createFilesystemTools(readRoot, null).find((t) => t.name === "read_files");
+
+const le = (s) => Buffer.from(s, "utf8");
+const readCases = [
+  { fileName: "ascii.txt", bytes: le("line1\nline2\nline3\n"), request: { path: "ascii.txt" } },
+  { fileName: "ascii.txt", bytes: le("line1\nline2\nline3\n"), request: { path: "ascii.txt", offset: 2, limit: 1 } },
+  { fileName: "ascii.txt", bytes: le("line1\nline2\nline3\n"), request: { path: "ascii.txt", offset: 10 } },
+  { fileName: "multi.txt", bytes: le("l1\nl2\nl3\nl4\n"), request: { path: "multi.txt", limit: 2 } },
+  { fileName: "empty.txt", bytes: le(""), request: { path: "empty.txt" } },
+  { fileName: "crlf.txt", bytes: le("a\r\nb\r\nc"), request: { path: "crlf.txt" } },
+  { fileName: "utf8bom.txt", bytes: Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), le("héllo\nwörld\n")]), request: { path: "utf8bom.txt" } },
+  { fileName: "utf16le.txt", bytes: Buffer.concat([Buffer.from([0xff, 0xfe]), utf16le("hi\nyo")]), request: { path: "utf16le.txt" } },
+  { fileName: "utf16be.txt", bytes: Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from("hi\nyo", "utf16le").swap16()]), request: { path: "utf16be.txt" } },
+  { fileName: "bomless16.txt", bytes: utf16le("abcd\nefgh\nijkl"), request: { path: "bomless16.txt" } },
+  { fileName: "chinese.txt", bytes: le("第一行\n第二行\n第三行\n"), request: { path: "chinese.txt", offset: 2 } },
+  { fileName: "longline.txt", bytes: le("a".repeat(40000) + "\nsecond\n"), request: { path: "longline.txt" } },
+  { fileName: "absent.txt", bytes: null, request: { path: "absent.txt" } },
+];
+const readGolden = [];
+for (const { fileName, bytes, request } of readCases) {
+  if (bytes) writeFileSync(join(readRoot, fileName), bytes);
+  const res = await readFilesTool.execute("call", { paths: [request] });
+  const element = JSON.parse(res.content[0].text)[0];
+  const expected = "error" in element
+    ? { ok: false }
+    : { ok: true, result: element };
+  readGolden.push({
+    input: { fileName, fileBase64: bytes ? bytes.toString("base64") : null, request },
+    expected,
+  });
+}
+out.readFiles = readGolden;
+
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");
 for (const k of Object.keys(out)) console.log(" ", k, out[k].length);

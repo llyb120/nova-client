@@ -6,7 +6,8 @@ use base64::Engine;
 use pi_core::{
     apply_smart_edits, build_system_prompt, clamp_openai_payload_tool_outputs,
     clamp_prompt_cache_key, clamp_tool_output_text, decode_text_buffer, govern_text,
-    inject_openai_prompt_cache_key, merge_usage, ShellConfig, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
+    inject_openai_prompt_cache_key, merge_usage, read_files_one, ReadRequest, ShellConfig,
+    OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
 use serde_json::Value;
 
@@ -172,6 +173,48 @@ fn parity_merge_usage() {
             ),
         }
     }
+}
+
+#[test]
+fn parity_read_files() {
+    let engine = base64::engine::general_purpose::STANDARD;
+    let base = std::env::temp_dir().join(format!("pi_read_test_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    for (i, case) in golden()["readFiles"].as_array().unwrap().iter().enumerate() {
+        let dir = base.join(format!("case_{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_name = case["input"]["fileName"].as_str().unwrap();
+        if let Some(b64) = case["input"]["fileBase64"].as_str() {
+            std::fs::write(dir.join(file_name), engine.decode(b64).unwrap()).unwrap();
+        }
+        let request = &case["input"]["request"];
+        let req = ReadRequest {
+            path: request["path"].as_str().unwrap().to_string(),
+            offset: request["offset"].as_u64().map(|v| v as usize),
+            limit: request["limit"].as_u64().map(|v| v as usize),
+        };
+        let got = read_files_one(&dir, &req);
+        let expected = &case["expected"];
+        if expected["ok"].as_bool().unwrap() {
+            assert_eq!(
+                &got,
+                &expected["result"],
+                "readFiles case {i} {:?}",
+                case["input"]
+            );
+        } else {
+            assert!(
+                got.get("error").is_some(),
+                "readFiles case {i} expected error, got {got}"
+            );
+            assert_eq!(
+                got.get("path").and_then(Value::as_str),
+                Some(req.path.as_str()),
+                "readFiles case {i} error path",
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
