@@ -351,6 +351,9 @@ export function TranscriptCanvas(props: {
     void mediaTick();
     void permTick();
     void editState();
+    // 跟踪展开/折叠状态：groupCacheSig 读取 state.expanded[k]，
+    // 必须在 effect 同步体内调用才能被 Solid 跟踪
+    for (const g of props.groups) groupCacheSig(g);
 
     if (rebuildQueued) return;
     rebuildQueued = true;
