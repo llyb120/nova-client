@@ -259,6 +259,7 @@ export function isRetryableAlkaidProviderError(error) {
     "other side closed",
     "network connection lost",
     "stream ended before a terminal response event",
+    "stream ended without finish_reason",
     "idle timeout",
     "429",
     "too many requests",

@@ -384,6 +384,7 @@ test("incomplete OpenAI response streams retry silently and preserve context", a
   assert.deepEqual(agent.state.messages, [user, completed]);
   assert.deepEqual(retries, [`1:${failure}`, 1000]);
   assert.equal(isRetryableAlkaidProviderError(failure), true);
+  assert.equal(isRetryableAlkaidProviderError("Stream ended without finish_reason"), true);
   assert.equal(isRetryableAlkaidProviderError("TypeError: terminated"), true);
   assert.equal(isRetryableAlkaidProviderError("Connection error."), true);
   assert.equal(isRetryableAlkaidProviderError("HTTP 429 Too Many Requests"), true);
