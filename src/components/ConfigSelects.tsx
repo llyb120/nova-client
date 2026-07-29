@@ -204,7 +204,7 @@ export function ModelPicker(props: {
   allowDefault?: boolean;
   /** 「默认」入口的显示名 */
   defaultLabel?: string;
-  /** 显示模型收藏入口（仅新会话选择器使用）。 */
+  /** 显示模型收藏入口。 */
   favorites?: boolean;
 }) {
   const kinds = createMemo(() => props.agentKinds ?? [props.agentKind]);

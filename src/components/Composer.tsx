@@ -633,6 +633,7 @@ export function Composer() {
             onPickModel={(k, m) => void pickThreadModel(k, m)}
             onMode={(v) => void setThreadMode(v)}
             anchorTo=".composer"
+            favorites
           />
         </Show>
         <span class="bar-spacer" />
