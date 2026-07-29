@@ -5,7 +5,7 @@
 use base64::Engine;
 use pi_core::{
     agent::{run_agent_loop, Agent, AgentState, LoopConfig, LoopContext, StreamTurn},
-    aggregated_output, apply_smart_edits, build_system_prompt,
+    aggregated_output, apply_edits_to_normalized_content, apply_smart_edits, build_system_prompt,
     clamp_openai_payload_tool_outputs, clamp_prompt_cache_key, clamp_tool_output_text,
     completed_tool_item, decode_text_buffer, format_alkaid_skills_prompt, format_size, govern_text,
     inject_openai_prompt_cache_key, ls_tool, merge_usage, normalize_path, read_files_one,
@@ -243,6 +243,54 @@ fn strip_timestamps(value: &Value) -> Value {
             Value::Object(cleaned)
         }
         other => other.clone(),
+    }
+}
+
+#[test]
+fn parity_edit_diff() {
+    for case in golden()["editDiff"].as_array().unwrap() {
+        let content = case["input"]["content"].as_str().unwrap();
+        let path = case["input"]["path"].as_str().unwrap();
+        let edits: Vec<(String, String)> = case["input"]["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pair| {
+                let pair = pair.as_array().unwrap();
+                (
+                    pair[0].as_str().unwrap().to_string(),
+                    pair[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let got = apply_edits_to_normalized_content(content, &edits, path);
+        let expected = &case["expected"];
+        if expected["ok"].as_bool().unwrap() {
+            let result = got
+                .unwrap_or_else(|e| panic!("editDiff {:?} expected ok, got error: {e}", case["input"]));
+            assert_eq!(
+                result.new_content,
+                expected["newContent"].as_str().unwrap(),
+                "editDiff newContent {:?}",
+                case["input"]
+            );
+            assert_eq!(
+                result.base_content,
+                expected["baseContent"].as_str().unwrap(),
+                "editDiff baseContent {:?}",
+                case["input"]
+            );
+        } else {
+            let error = got
+                .err()
+                .unwrap_or_else(|| panic!("editDiff {:?} expected error, got ok", case["input"]));
+            assert_eq!(
+                error,
+                expected["error"].as_str().unwrap(),
+                "editDiff error {:?}",
+                case["input"]
+            );
+        }
     }
 }
 

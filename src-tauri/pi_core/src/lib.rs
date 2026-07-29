@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod bridge;
+pub mod edit_diff;
 pub mod encoding;
 pub mod ls;
 pub mod paths;
@@ -23,6 +24,10 @@ pub mod write;
 
 pub use encoding::{decode_text_buffer, detect_text_encoding, swap_utf16_bytes, Encoding};
 pub use bridge::{aggregated_output, completed_tool_item, started_tool_item, ProtocolAccumulator};
+pub use edit_diff::{
+    apply_edits_to_normalized_content, detect_line_ending, normalize_for_fuzzy_match,
+    normalize_to_lf, restore_line_endings, strip_bom, EditResult,
+};
 pub use ls::{ls_tool, LsOutput};
 pub use paths::{normalize_path, resolve_path, resolve_to_cwd, NormalizeOptions};
 pub use payload::{

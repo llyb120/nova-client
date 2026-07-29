@@ -17,6 +17,7 @@ import { createLsTool } from "../node_modules/@earendil-works/pi-coding-agent/di
 import { runAgentLoop } from "../node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js";
 import { Agent } from "../node_modules/@earendil-works/pi-agent-core/dist/agent.js";
 import { startedToolItem } from "./alkaid-bridge-common.mjs";
+import { applyEditsToNormalizedContent } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/edit-diff.js";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -584,6 +585,40 @@ out.bridgeToolItem = bridgeStartCases.map((event) => {
   const completed = endItem(started, endEvent);
   const failed = endItem(started, { result: { content: [{ type: "text", text: "boom" }] }, isError: true });
   return { input: { event }, expected: { started, completed, failed } };
+});
+
+// --- single-file edit algorithm (edit-diff.js) ---
+const editDiffCases = [
+  { content: "alpha\nbeta\ngamma\n", edits: [["beta", "BETA"]], path: "a.txt" },
+  { content: "fn main() {\n    let x = 1;\n}\n", edits: [["    let x = 1;", "    let y = 2;"]], path: "b.rs" },
+  // fuzzy: trailing whitespace in content not in oldText
+  { content: "keep me   \nother\n", edits: [["keep me", "changed"]], path: "c.txt" },
+  // fuzzy: smart quotes in oldText, ascii in content
+  { content: "say \"hi\" now\n", edits: [["say “hi” now", "say “bye” now"]], path: "d.txt" },
+  // duplicate -> error
+  { content: "foo\nbar\nfoo\n", edits: [["foo", "baz"]], path: "e.txt" },
+  // not found -> error
+  { content: "abc\n", edits: [["xyz", "q"]], path: "f.txt" },
+  // empty oldText -> error
+  { content: "abc\n", edits: [["", "q"]], path: "g.txt" },
+  // no change -> error
+  { content: "same\n", edits: [["same", "same"]], path: "h.txt" },
+  // overlap -> error
+  { content: "aaaa bbbb cccc\n", edits: [["aaaa bbbb", "X"], ["bbbb cccc", "Y"]], path: "i.txt" },
+  // multiple non-overlapping
+  { content: "one\ntwo\nthree\n", edits: [["one", "ONE"], ["three", "THREE"]], path: "j.txt" },
+  // CJK exact
+  { content: "第一行\n第二行\n", edits: [["第二行", "改"]], path: "k.txt" },
+  // fuzzy preserves unchanged line bytes (trailing ws on a non-edited line stays)
+  { content: "lineA   \nlineB\nlineC   \n", edits: [["lineB", "lineB2"]], path: "l.txt" },
+];
+out.editDiff = editDiffCases.map(({ content, edits, path }) => {
+  try {
+    const result = applyEditsToNormalizedContent(content, edits.map(([oldText, newText]) => ({ oldText, newText })), path);
+    return { input: { content, edits, path }, expected: { ok: true, baseContent: result.baseContent, newContent: result.newContent } };
+  } catch (error) {
+    return { input: { content, edits, path }, expected: { ok: false, error: error instanceof Error ? error.message : String(error) } };
+  }
 });
 
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
