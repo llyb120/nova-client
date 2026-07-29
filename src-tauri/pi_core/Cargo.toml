@@ -15,3 +15,6 @@ unicode-normalization = "0.1.25"
 [lib]
 name = "pi_core"
 crate-type = ["rlib"]
+
+[dev-dependencies]
+tempfile = "3.27.0"

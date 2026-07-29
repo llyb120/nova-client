@@ -19,6 +19,7 @@ pub mod read;
 pub mod skills;
 pub mod smart_edit;
 pub mod text;
+pub mod tools;
 pub mod truncate;
 pub mod write;
 
@@ -44,6 +45,7 @@ pub use skills::{
     Skill,
 };
 pub use smart_edit::{apply_smart_edits, SmartMatch, SmartResult};
+pub use tools::{tool_fn_for, NativeTools};
 pub use truncate::{
     format_size, truncate_head, truncate_line, truncate_tail, TruncateLineResult, Truncation,
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH,
