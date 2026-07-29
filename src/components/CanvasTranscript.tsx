@@ -1664,19 +1664,28 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const open = b.data?.open as boolean;
     const isThought = b.kind === "thought-toggle";
     // fold: padding 4px 8px, gap 6; thought: padding 3px 6px, gap 5
-    // IconChevron size=12 (viewBox 0 0 24 24) — same slot as DOM so glyphs align with 14px tool icons
+    // DOM 的已处理行是「文字 → chevron」，思考行仍是「chevron → 文字」。
     const padL = isThought ? 6 : 8;
     const gap = isThought ? 5 : 6;
     const iconSize = 12;
     const color = hover && b.hoverColor ? b.hoverColor : (b.color || p.dim);
 
+    ctx.font = `${b.fontSize}px ${b.font}`;
+    ctx.fillStyle = color;
+    ctx.textBaseline = "middle";
+    const textX = isThought ? bx + padL + iconSize + gap : bx + padL;
+    fillTextCrisp(ctx, b.text!, textX, by + b.h / 2);
+
+    const iconX = isThought
+      ? bx + padL
+      : textX + measure(b.text!, b.fontSize!, b.font!) + gap;
     ctx.save();
     ctx.strokeStyle = isThought ? (hover ? p.dim : p.faint) : p.faint;
     ctx.lineWidth = 2;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     const s = iconSize / 24;
-    ctx.translate(bx + padL, by + (b.h - iconSize) / 2);
+    ctx.translate(iconX, by + (b.h - iconSize) / 2);
     ctx.scale(s, s);
     ctx.beginPath();
     // IconChevron paths: open "m6 9 6 6 6-6" / closed "m9 6 6 6-6 6"
@@ -1684,11 +1693,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     else { ctx.moveTo(9, 6); ctx.lineTo(15, 12); ctx.lineTo(9, 18); }
     ctx.stroke();
     ctx.restore();
-
-    ctx.font = `${b.fontSize}px ${b.font}`;
-    ctx.fillStyle = color;
-    ctx.textBaseline = "middle";
-    fillTextCrisp(ctx, b.text!, bx + padL + iconSize + gap, by + b.h / 2);
   }
 
   function paintToolHeader(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette) {
