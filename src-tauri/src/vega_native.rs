@@ -182,6 +182,69 @@ pub async fn run_native_turn_async(
     .map_err(|error| format!("native Vega turn panicked: {error}"))?
 }
 
+/// Resolve just the `ProviderConfig` for a model selection (config load +
+/// model resolution), without loading skills/tools. Used for the Reasonix
+/// summary turn's lightweight model.
+pub fn resolve_provider_config(
+    data_dir: &Path,
+    server_config: Option<&Value>,
+    model_selection: &str,
+) -> Result<ProviderConfig, String> {
+    let config = load_alkaid_config(data_dir, server_config)?;
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let resolved = resolve_model(&config, model_selection, &env)?;
+    let model = resolved.get("model").cloned().unwrap_or(json!({}));
+    let api_key = resolved.get("apiKey").and_then(Value::as_str).map(String::from);
+    Ok(ProviderConfig {
+        api: model.get("api").and_then(Value::as_str).unwrap_or("").to_string(),
+        base_url: model.get("baseUrl").and_then(Value::as_str).unwrap_or("").to_string(),
+        model_id: model.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+        provider: model.get("provider").and_then(Value::as_str).unwrap_or("").to_string(),
+        api_key,
+    })
+}
+
+/// Run a lightweight, tool-free native turn and return the assistant's text.
+/// Used by the Reasonix digest compaction to summarize older turns. The summary
+/// model is `summary_provider`; the prompt is sent with no tools and no history
+/// so the model produces a plain text digest.
+pub async fn run_summary_turn_async(
+    client: reqwest::Client,
+    summary_provider: ProviderConfig,
+    summary_prompt: String,
+) -> Result<String, String> {
+    let model = json!({
+        "id": summary_provider.model_id,
+        "provider": summary_provider.provider,
+        "api": summary_provider.api,
+    });
+    let config = NativeTurnConfig {
+        system_prompt: String::new(),
+        model,
+        tools: Vec::new(),
+        history: Vec::new(),
+        session_id: None,
+        timestamp: now_millis(),
+        parallel_tools: false,
+    };
+    let native_tools = NativeTools::new(PathBuf::from("."));
+    let output =
+        run_native_turn_async(client, summary_provider, config, summary_prompt, native_tools)
+            .await?;
+    // Concatenate the text of the final assistant message(s).
+    let text = output
+        .messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(text)
+}
+
 /// Load and merge the Vega config: `config.jsonc` under `{data_dir}/alkaid`,
 /// with the server-provided config as the baseline (port of `loadAlkaidConfig`).
 pub fn load_alkaid_config(data_dir: &Path, server_config: Option<&Value>) -> Result<Value, String> {

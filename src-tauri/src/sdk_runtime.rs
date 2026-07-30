@@ -297,6 +297,7 @@ impl SdkManager {
                     &parts,
                     session_id.clone(),
                     mode.as_deref().unwrap_or(""),
+                    lightweight_model.as_deref(),
                     user_item_id,
                     run_epoch,
                 )
@@ -795,6 +796,7 @@ impl SdkManager {
         parts: &[Value],
         session_id: Option<String>,
         mode: &str,
+        lightweight_model: Option<&str>,
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
@@ -847,7 +849,7 @@ impl SdkManager {
             .and_then(Value::as_f64)
             .unwrap_or(128_000.0)
             .max(2_000.0);
-        let _max_context_tokens = ((context_window * 0.75).floor() as u64).max(2_000);
+        let max_context_tokens = ((context_window * 0.75).floor() as u64).max(2_000);
         let force_context_tokens = ((context_window * 0.9).floor() as u64).max(2_000);
         let max_context_chars = ((force_context_tokens * 4).max(8_000)) as usize;
         let pressure = pi_core::context_pressure_tier(memory.context_tokens as f64, context_window);
@@ -869,11 +871,83 @@ impl SdkManager {
             memory.rewrite_version += 1;
         }
         memory.append_turn(&input_text);
-        // NOTE: `compactSlimMemory` (folding old turns into an LLM digest) is the
-        // one Reasonix step not yet wired here: its `summarize` callback is an
-        // async native turn that needs the plan/apply split around the LLM call.
-        // The deterministic context management above is fully active; digest
-        // compaction is the documented remaining piece.
+        // Digest compaction: fold older turns into an LLM summary when the
+        // rebuilt record exceeds the token budget. The summary is itself a
+        // tool-free native turn against the lightweight model (falling back to
+        // the main model), matching the bridge's `compactSlimMemory` callback.
+        let rebuilt_context_tokens =
+            pi_core::estimate_context_tokens(&memory.format());
+        let compact_options = pi_core::CompactOptions {
+            max_turns: None,
+            max_chars: None,
+            current_tokens: rebuilt_context_tokens,
+            max_tokens: Some(max_context_tokens),
+        };
+        if let Some(plan) = pi_core::plan_compaction(&mut memory, compact_options) {
+            let summary_prompt = format!(
+                "请把下面较早的会话记忆压缩成供另一个编码 Agent 使用的摘要。\n保留用户意图、决策、改动文件、关键标识、约束和未完成事项；不要照抄对话或添加评论。\n\n{}",
+                plan.earlier_text
+            );
+            let summary_result = async {
+                let lightweight = lightweight_model
+                    .map(|selection| {
+                        crate::vega_native::resolve_provider_config(
+                            &data_dir,
+                            server_config.as_ref(),
+                            selection,
+                        )
+                    })
+                    .transpose()?;
+                let main_provider = crate::vega_native::resolve_provider_config(
+                    &data_dir,
+                    server_config.as_ref(),
+                    &selection,
+                )?;
+                let same_as_main = lightweight
+                    .as_ref()
+                    .map(|p| p.provider == main_provider.provider && p.model_id == main_provider.model_id)
+                    .unwrap_or(true);
+                // Try the lightweight model first; fall back to the main model
+                // unless the lightweight attempt already was the main model.
+                if let Some(lightweight) = lightweight {
+                    match crate::vega_native::run_summary_turn_async(
+                        reqwest::Client::new(),
+                        lightweight,
+                        summary_prompt.clone(),
+                    )
+                    .await
+                    {
+                        Ok(digest) => return Ok::<String, String>(digest),
+                        Err(error) => {
+                            if same_as_main {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                crate::vega_native::run_summary_turn_async(
+                    reqwest::Client::new(),
+                    main_provider,
+                    summary_prompt,
+                )
+                .await
+            }
+            .await;
+            match summary_result {
+                Ok(digest) => {
+                    if pi_core::apply_compaction(&mut memory, &plan, &digest) {
+                        memory.context_tokens = 0;
+                    }
+                }
+                Err(error) => {
+                    // A failed summary is non-fatal: keep the full record and
+                    // retry compaction on a later turn (the bridge behaves the
+                    // same — a thrown summary surfaces as a turn error, but here
+                    // we degrade gracefully rather than failing the user turn).
+                    eprintln!("Vega digest compaction skipped: {error}");
+                }
+            }
+        }
 
         // Freeze/record the system prompt snapshot for cache stability.
         if !memory.system_prompt_snapshot.is_empty() {

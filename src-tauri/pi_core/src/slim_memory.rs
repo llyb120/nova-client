@@ -755,3 +755,173 @@ where
     memory.consecutive_compactions += 1;
     true
 }
+
+/// A planned compaction awaiting an LLM digest. Produced by
+/// [`plan_compaction`], consumed by [`apply_compaction`].
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    /// The formatted earlier-turns text to send to the summary model.
+    pub earlier_text: String,
+    preserved_prompts: Vec<String>,
+    split: usize,
+}
+
+/// The decision half of [`compact_slim_memory`], split out so the caller can
+/// run the async LLM `summarize` between planning and applying. Normalizes the
+/// memory and returns `Some(plan)` when a compaction is warranted (carrying the
+/// text to summarize), or `None` when no compaction is needed/possible (having
+/// already reset the stuck/consecutive counters where the JS does).
+pub fn plan_compaction(memory: &mut SlimMemory, options: CompactOptions) -> Option<CompactionPlan> {
+    memory.normalize_in_place();
+    let formatted = format_slim_memory(&json!({
+        "digests": memory.digests,
+        "turns": memory.turns,
+    }));
+    let within_turn_limit = match options.max_turns {
+        Some(max) => memory.turns.len() <= max,
+        None => true,
+    };
+    let below_character_limit = match options.max_chars {
+        Some(max) => formatted.len() < max,
+        None => true,
+    };
+    let below_token_limit = match options.max_tokens {
+        Some(max) => options.current_tokens < max,
+        None => true,
+    };
+    if within_turn_limit && below_character_limit && below_token_limit {
+        memory.consecutive_compactions = 0;
+        memory.compact_stuck = false;
+        return None;
+    }
+    if memory.compact_stuck || memory.turns.len() < 2 {
+        return None;
+    }
+    if memory.consecutive_compactions >= 2 {
+        memory.compact_stuck = true;
+        return None;
+    }
+    let protected_count = if memory
+        .turns
+        .last()
+        .map(|turn| !turn.conclusion.is_empty())
+        .unwrap_or(false)
+    {
+        1
+    } else {
+        memory.turns.len().min(2)
+    };
+    let split = memory.turns.len() - protected_count;
+    if split == 0 {
+        return None;
+    }
+    let compacted_turns: Vec<Turn> = memory.turns[..split].to_vec();
+    let mut preserved_prompts: Vec<String> = Vec::new();
+    for turn in &compacted_turns {
+        for prompt in &turn.user_prompts {
+            if prompt.chars().count() <= 2_000 && !memory.preserved_user_prompts.contains(prompt) {
+                preserved_prompts.push(prompt.clone());
+            }
+        }
+    }
+    let earlier = NormalizedMemory {
+        digests: Vec::new(),
+        preserved_user_prompts: Vec::new(),
+        turns: compacted_turns,
+    };
+    Some(CompactionPlan {
+        earlier_text: format_normalized(&earlier),
+        preserved_prompts,
+        split,
+    })
+}
+
+/// Apply a digest to a planned compaction (the mutation half of
+/// [`compact_slim_memory`]). Returns whether the compaction was applied (false
+/// if the digest was empty, matching the JS).
+pub fn apply_compaction(memory: &mut SlimMemory, plan: &CompactionPlan, digest: &str) -> bool {
+    let digest = digest.trim().to_string();
+    if digest.is_empty() {
+        return false;
+    }
+    memory.preserved_user_prompts.extend(plan.preserved_prompts.clone());
+    memory.digests.push(digest);
+    memory.turns = memory.turns.split_off(plan.split);
+    memory.rewrite_version += 1;
+    memory.consecutive_compactions += 1;
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory_with_turns(n: usize) -> SlimMemory {
+        let mut m = SlimMemory::new();
+        for i in 1..=n {
+            m.turns.push(Turn {
+                user_prompts: vec![format!("prompt {i}")],
+                conclusion: format!("conclusion {i}"),
+            });
+        }
+        m
+    }
+
+    #[test]
+    fn plan_apply_matches_compact_slim_memory() {
+        let opts = CompactOptions {
+            max_turns: Some(3),
+            max_chars: None,
+            current_tokens: 0,
+            max_tokens: None,
+        };
+        // Reference: the monolithic function with a stub digest.
+        let mut reference = memory_with_turns(5);
+        let ref_compacted = compact_slim_memory(&mut reference, opts, |_| "STUB".to_string());
+
+        // Split: plan, then apply with the same stub digest.
+        let mut split = memory_with_turns(5);
+        let plan = plan_compaction(&mut split, opts);
+        let split_compacted = match &plan {
+            Some(plan) => apply_compaction(&mut split, plan, "STUB"),
+            None => false,
+        };
+
+        assert_eq!(ref_compacted, split_compacted);
+        assert_eq!(reference, split);
+        // The plan's earlier_text is non-empty and contains the folded turns.
+        let plan = plan.unwrap();
+        assert!(plan.earlier_text.contains("prompt 1"));
+        assert!(plan.earlier_text.contains("conclusion 1"));
+    }
+
+    #[test]
+    fn plan_returns_none_when_within_limits() {
+        let mut m = memory_with_turns(2);
+        let opts = CompactOptions {
+            max_turns: Some(10),
+            max_chars: None,
+            current_tokens: 0,
+            max_tokens: None,
+        };
+        assert!(plan_compaction(&mut m, opts).is_none());
+        // Counters reset like the JS.
+        assert_eq!(m.consecutive_compactions, 0);
+        assert!(!m.compact_stuck);
+    }
+
+    #[test]
+    fn apply_with_empty_digest_is_noop() {
+        let mut m = memory_with_turns(5);
+        let opts = CompactOptions {
+            max_turns: Some(3),
+            max_chars: None,
+            current_tokens: 0,
+            max_tokens: None,
+        };
+        let plan = plan_compaction(&mut m, opts).unwrap();
+        let before = m.clone();
+        assert!(!apply_compaction(&mut m, &plan, "   "));
+        assert_eq!(m, before);
+    }
+}

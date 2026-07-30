@@ -64,11 +64,11 @@ pub use skills_discovery::{
     expand_skill_command, load_skills_from_dir, parse_frontmatter, strip_skill_frontmatter,
 };
 pub use slim_memory::{
-    compact_native_tool_results, compact_slim_memory, context_pressure_tier,
+    apply_compaction, compact_native_tool_results, compact_slim_memory, context_pressure_tier,
     context_tokens_from_messages, estimate_context_tokens, format_normalized, format_slim_memory,
-    memory_without_current, normalize_value, rebase_native_context_for_slim_memory,
+    memory_without_current, normalize_value, plan_compaction, rebase_native_context_for_slim_memory,
     seed_slim_memory_from_messages, should_use_full_context, strip_completed_openai_reasoning,
-    text_content, CompactOptions, NormalizedMemory, SlimMemory, Turn,
+    text_content, CompactionPlan, CompactOptions, NormalizedMemory, SlimMemory, Turn,
 };
 pub use smart_edit::{apply_smart_edits, SmartMatch, SmartResult};
 pub use tools::{tool_fn_for, NativeTools};
