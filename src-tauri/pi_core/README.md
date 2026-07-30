@@ -45,11 +45,26 @@ implementation for every non-LLM computation.
 - M4 (done, deterministic part): the bridge protocol glue — `startedToolItem`,
   the `tool_execution_end` handler, and the `ProtocolAccumulator` that assembles
   the full item stream (text/thinking accumulation, usage merging, tool item
-  lifecycle). Wired into `nova_lib` via `src/vega_native.rs::run_native_turn`,
-  which compiles cleanly.
+  lifecycle).
+- M5 (done): the native tool executor (`NativeTools`) — dispatches
+  `read`/`read_files`/`edit`/`edit_files`/`write`/`ls` to the ported logic plus
+  `std` I/O, and `bash`/`grep`/`find` to subprocesses. Fixture-tested.
+- M6 (done): OpenAI Chat Completions provider conversion (`provider.rs`) —
+  pi↔OpenAI message/tool conversion, request building, and an SSE-chunk
+  accumulator producing a `StreamTurn`. Unit-tested without a live provider.
+- M7 (done): the async provider transport (`nova_lib/src/vega_provider.rs`) over
+  `reqwest` + the shared `SseDecoder`, and `run_native_turn_async` which runs the
+  sync loop on a blocking thread while its `StreamFn` blocks on the transport.
+- M8 (done): Vega config resolution (`alkaid_config.rs`) — `parseJsonc`,
+  `mergeAlkaidConfig`, `providerApi`, `resolveEnv`, `mergeAlkaidCompatDefaults`,
+  `resolveAlkaidModel`. Golden-tested.
+- M9 (done): the feature-gated production seam — `native-vega` cargo feature,
+  `prepare_native_turn` (config → `ProviderConfig` + system prompt + tool defs),
+  and `sdk_runtime::run_prompt_native` routing the Alkaid adapter in-process when
+  the feature is enabled. Compiles in both configurations; off by default.
 
-All 35 tests (12 unit + 23 differential) are green and `cargo test` needs no
-node.
+All 55 tests (27 unit + 28 differential) are green and `cargo test` needs no
+node. `nova_lib` compiles with 0 errors both with and without `native-vega`.
 
 ## Function map (node → Rust)
 
@@ -69,6 +84,9 @@ node.
 | `pi-agent-core` `agent-loop.js` (`runAgentLoop`/`runLoop`/streaming/tools) | `agent/run_loop.rs` |
 | `pi-agent-core` `agent.js` (`Agent`, queues, lifecycle) | `agent/agent.rs` |
 | `alkaid-bridge-common.mjs` `startedToolItem` + reasonix subscribe handler | `bridge.rs` |
+| tool execution (read/edit/write/ls/bash/grep/find dispatch) | `tools.rs` |
+| `pi-ai` openai-completions message/SSE conversion | `provider.rs` |
+| `alkaid-config.mjs` config/model resolution | `alkaid_config.rs` |
 
 ## Verified parity boundaries (honest limits)
 
@@ -84,20 +102,24 @@ node.
 
 ## Remaining work (outside the verifiable scope)
 
-The only substantial piece not ported is the **LLM provider transport** —
-`@earendil-works/pi-ai` (~33k lines: `openai-completions`, `openai-responses`,
-`anthropic-messages`, `google-generative-ai`, with SSE streaming). This is the
-"大模型" boundary explicitly excluded from the parity requirement and cannot be
-differentially tested without live providers.
+The deterministic core, the native tool executor, the OpenAI Chat Completions
+transport, the Vega config resolution, and the feature-gated `sdk_runtime` seam
+are all in place. What remains is inherently online / production-cutover work
+that cannot be differentially tested here:
 
-To finish "去掉 node 依赖":
-
-1. Implement a `StreamFn` over `reqwest` for each provider protocol (reuse the
-   existing `http_stream::SseDecoder`), converting SSE chunks into the
-   `StreamTurn` events `run_loop` consumes.
-2. Build the native tool executors (`ToolFn`) on top of `pi_core`'s ported tool
-   logic plus real filesystem/shell I/O.
-3. In `sdk_runtime`, add a native `AlkaidAdapter` path that calls
-   `vega_native::run_native_turn` and forwards `items` through the existing
-   event pipeline, behind a feature flag for gray-release against the node
-   bridge; then remove `resources/alkaid-bridge.mjs` and the `node` spawn.
+1. **Other provider protocols.** `openai-completions` is implemented;
+   `openai-responses`, `anthropic-messages`, and `google-generative-ai` are
+   explicit extension points in `vega_provider.rs` (part of the excluded `pi-ai`
+   surface, ~33k lines).
+2. **Skills + MCP.** `prepare_native_turn` does not yet load skills from disk
+   (the system prompt's skills section is empty) or connect MCP servers, both of
+   which the node bridge does via `pi-coding-agent`.
+3. **Session-history continuity.** `run_prompt_native` starts each turn from an
+   empty transcript; mapping the thread store's persisted messages into pi
+   messages (and the `restoreAt`/time-machine flow) is not yet wired.
+4. **Live-provider verification + gray-release.** Enable `native-vega`, exercise
+   real turns against each provider, and compare against the node bridge before
+   flipping the default.
+5. **Retire the node bridge.** Only after the above: remove
+   `resources/alkaid-bridge.mjs` and the `node` spawn in `spawn_bridge`. The
+   bridge is intentionally left in place and remains the default path.
