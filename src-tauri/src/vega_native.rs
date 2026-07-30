@@ -19,6 +19,8 @@ use pi_core::agent::{Agent, AgentState, StreamFn, StreamTurn, ToolFn};
 use pi_core::alkaid_config::{merge_config, parse_jsonc, resolve_model};
 use pi_core::bridge::ProtocolAccumulator;
 use pi_core::prompt::{build_system_prompt, ShellConfig, ShellKind};
+use pi_core::skills::{format_alkaid_skills_prompt, Skill};
+use pi_core::skills_discovery::load_skills_from_dir;
 use pi_core::tools::NativeTools;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -405,6 +407,58 @@ pub struct NativeVegaSetup {
     pub provider: ProviderConfig,
     pub turn_config: NativeTurnConfig,
     pub native_tools: NativeTools,
+    /// Discovered skills, retained so the caller can expand `/skill:<name>`.
+    pub skills: Vec<Skill>,
+}
+
+/// Port of `loadAlkaidAgentInstructions`: read `AGENTS.md`, empty when absent.
+fn load_agent_instructions(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => format!("[读取 Vega AGENTS.md 失败：{error}]"),
+    }
+}
+
+/// Detect the shell config (port of `detectAlkaidShellConfig` +
+/// `resolveAlkaidShellConfig`): PowerShell on Windows when available, otherwise
+/// Bash, with `NOVA_SHELL_SHIM_*` overrides applied.
+fn detect_shell_config() -> ShellConfig {
+    let is_windows = cfg!(target_os = "windows");
+    if is_windows {
+        let shim = std::env::var("NOVA_SHELL_SHIM_POWERSHELL").ok().filter(|s| !s.is_empty());
+        if let Some(shell) = shim.or_else(find_windows_powershell) {
+            return ShellConfig {
+                shell,
+                kind: ShellKind::Powershell,
+            };
+        }
+    }
+    let shim = std::env::var("NOVA_SHELL_SHIM_BASH").ok().filter(|s| !s.is_empty());
+    let shell = shim
+        .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/bin/bash".to_string());
+    ShellConfig {
+        shell,
+        kind: ShellKind::Bash,
+    }
+}
+
+fn find_windows_powershell() -> Option<String> {
+    for root in [std::env::var("SystemRoot").ok(), std::env::var("windir").ok()]
+        .into_iter()
+        .flatten()
+    {
+        let candidate = Path::new(&root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 /// Resolve the Vega config into a runnable native setup (port of the
@@ -421,7 +475,6 @@ pub fn prepare_native_turn(
     history: Vec<Value>,
     session_id: Option<String>,
     read_only: bool,
-    shell: &str,
 ) -> Result<NativeVegaSetup, String> {
     let config = load_alkaid_config(data_dir, server_config)?;
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -440,12 +493,26 @@ pub fn prepare_native_turn(
     let shell_config = if read_only {
         None
     } else {
-        Some(ShellConfig {
-            shell: shell.to_string(),
-            kind: ShellKind::Bash,
-        })
+        Some(detect_shell_config())
     };
-    let system_prompt = build_system_prompt(cwd, read_only, shell_config.as_ref(), "", "");
+    // Skills are discovered from `{data_dir}/alkaid/skills` (port of
+    // `loadAlkaidSkills`); AGENTS.md supplies custom instructions.
+    let skills_root = data_dir.join("alkaid").join("skills");
+    let skills = load_skills_from_dir(&skills_root);
+    let skills_prompt = format_alkaid_skills_prompt(&skills);
+    let agent_instructions = load_agent_instructions(&data_dir.join("alkaid").join("AGENTS.md"));
+    let custom_instructions = [agent_instructions.trim().to_string()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let system_prompt = build_system_prompt(
+        cwd,
+        read_only,
+        shell_config.as_ref(),
+        &skills_prompt,
+        &custom_instructions,
+    );
     let tool_definitions = native_tool_definitions(read_only);
     let native_tools = NativeTools::new(PathBuf::from(cwd));
 
@@ -463,5 +530,6 @@ pub fn prepare_native_turn(
         provider,
         turn_config,
         native_tools,
+        skills,
     })
 }

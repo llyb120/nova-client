@@ -296,6 +296,7 @@ impl SdkManager {
                     model.as_deref(),
                     &parts,
                     session_id.clone(),
+                    mode.as_deref().unwrap_or(""),
                     user_item_id,
                     run_epoch,
                 )
@@ -793,6 +794,7 @@ impl SdkManager {
         model_selection: Option<&str>,
         parts: &[Value],
         session_id: Option<String>,
+        mode: &str,
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
@@ -804,6 +806,7 @@ impl SdkManager {
         let data_dir = nova_data_dir(&self.app);
         let server_config = self.alkaid_server_config.lock().unwrap().clone();
         let selection = model_selection.unwrap_or("").to_string();
+        let read_only = mode == "plan";
         // Session-history continuity is not yet mapped from the thread store; the
         // native turn starts from an empty transcript (documented gap).
         let setup = crate::vega_native::prepare_native_turn(
@@ -813,9 +816,9 @@ impl SdkManager {
             &selection,
             Vec::new(),
             session_id,
-            false,
-            "/bin/bash",
+            read_only,
         )?;
+        let prompt_text = pi_core::expand_skill_command(&prompt_text, &setup.skills);
         let client = reqwest::Client::new();
         let output = crate::vega_native::run_native_turn_async(
             client,

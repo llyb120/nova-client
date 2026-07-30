@@ -19,6 +19,7 @@ pub mod prompt;
 pub mod provider;
 pub mod read;
 pub mod skills;
+pub mod skills_discovery;
 pub mod slim_memory;
 pub mod smart_edit;
 pub mod text;
@@ -54,6 +55,9 @@ pub use read::{
 pub use skills::{
     format_alkaid_skills_prompt, format_skills_for_prompt, format_skills_for_prompt_compressed,
     Skill,
+};
+pub use skills_discovery::{
+    expand_skill_command, load_skills_from_dir, parse_frontmatter, strip_skill_frontmatter,
 };
 pub use slim_memory::{
     compact_native_tool_results, compact_slim_memory, context_pressure_tier,
