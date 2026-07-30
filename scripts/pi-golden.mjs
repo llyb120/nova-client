@@ -19,6 +19,7 @@ import { Agent } from "../node_modules/@earendil-works/pi-agent-core/dist/agent.
 import { startedToolItem } from "./alkaid-bridge-common.mjs";
 import { applyEditsToNormalizedContent } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/edit-diff.js";
 import { parseJsonc, mergeAlkaidConfig, resolveAlkaidModel, mergeAlkaidCompatDefaults } from "./alkaid-config.mjs";
+import * as slim from "./alkaid-slim-memory.mjs";
 import { writeFileSync } from "node:fs";
 
 const out = {};
@@ -682,6 +683,178 @@ out.compatDefaults = [
   input: { api, modelId, baseUrl, existing: existing ?? null },
   expected: mergeAlkaidCompatDefaults(api, modelId, baseUrl, existing) ?? null,
 }));
+
+// --- reasonix slim-memory (deterministic context management) ---
+// `compactSlimMemory` takes an async `summarize` callback (the only LLM boundary
+// in this module); the vectors use a fixed stub digest so the decision logic and
+// state transitions are fully deterministic and parity-testable.
+out.slimMemory = {};
+const BIG = 1_000_000_000;
+
+out.slimMemory.estimateContextTokens = [
+  "", "hello", "hello world", "中文", "a中b", "😀", "abc中文😀", "x".repeat(100),
+].map((text) => ({ input: { text }, expected: slim.estimateContextTokens(text) }));
+
+out.slimMemory.contextPressureTier = [
+  [0, 100000], [100, 100000], [50000, 100000], [55000, 100000], [65000, 100000],
+  [85000, 100000], [95000, 100000], [100, 0], [0, 0], [128000, 128000], [1, 2],
+].map(([currentTokens, contextWindow]) => ({
+  input: { currentTokens, contextWindow },
+  expected: slim.contextPressureTier(currentTokens, contextWindow),
+}));
+
+const usageMsg = (usage, role = "assistant") => ({ role, usage });
+out.slimMemory.contextTokensFromMessages = [
+  [],
+  [usageMsg({ totalTokens: 1000, output: 200 })],
+  [usageMsg({ input: 500, cacheRead: 100, cacheWrite: 50 })],
+  [usageMsg({ totalTokens: 1000, output: 200 }), usageMsg({ totalTokens: 3000, output: 400 })],
+  [usageMsg({ input: 300, cacheRead: 500 })],
+  [{ role: "user" }, usageMsg({ totalTokens: 50, output: 100 })],
+  [usageMsg({ total_tokens: 700, output_tokens: 100 })],
+].map((messages) => ({ input: { messages }, expected: slim.contextTokensFromMessages(messages) }));
+
+out.slimMemory.stripCompletedOpenAIReasoning = [
+  [],
+  [{ role: "assistant", content: [{ type: "thinking", thinking: "x" }, { type: "text", text: "hi" }] }],
+  [{ role: "assistant", content: [{ type: "toolCall", id: "call_1|item_9", name: "bash", arguments: {} }] }],
+  [{ role: "assistant", content: [{ type: "toolCall", id: "plain", name: "read", arguments: {} }] }],
+  [{ role: "user", content: [{ type: "text", text: "keep" }] }],
+  [{ role: "assistant", content: "string content" }],
+].map((messages) => ({ input: { messages }, expected: slim.stripCompletedOpenAIReasoning(messages) }));
+
+const toolResultMsg = (id, text) => ({ role: "toolResult", toolCallId: id, content: [{ type: "text", text }] });
+const bigText = "y".repeat(9000);
+const cntrMessages = [
+  toolResultMsg("t1", bigText),
+  toolResultMsg("t2", "z".repeat(100)),
+  { role: "user", content: [{ type: "text", text: "u" }] },
+  toolResultMsg("t3", bigText),
+  toolResultMsg("t4", "already [elided tool result — 5 bytes; re-run the tool if needed]"),
+  toolResultMsg("t5", bigText),
+  toolResultMsg("t6", bigText),
+  toolResultMsg("t7", bigText),
+];
+out.slimMemory.compactNativeToolResults = ["normal", "warn", "snip", "elide", "force"].map((tier) => ({
+  input: { messages: structuredClone(cntrMessages), tier, preserveRecent: 6 },
+  expected: slim.compactNativeToolResults(structuredClone(cntrMessages), tier, { preserveRecent: 6 }),
+}));
+out.slimMemory.compactNativeToolResults.push({
+  input: { messages: structuredClone(cntrMessages), tier: "snip", preserveRecent: 2 },
+  expected: slim.compactNativeToolResults(structuredClone(cntrMessages), "snip", { preserveRecent: 2 }),
+});
+
+out.slimMemory.createSlimMemory = [{ input: {}, expected: slim.createSlimMemory() }];
+
+function buildMemory() {
+  const m = slim.createSlimMemory();
+  slim.appendSlimTurn(m, "first prompt");
+  slim.setLatestConclusion(m, [{ type: "text", text: "first conclusion" }]);
+  slim.appendSlimTurn(m, "second prompt");
+  slim.setLatestConclusion(m, "second conclusion");
+  slim.appendSlimTurn(m, "interrupted prompt");
+  return m;
+}
+
+out.slimMemory.appendAndConclusion = [{ input: {}, expected: (() => {
+  const m = slim.createSlimMemory();
+  slim.appendSlimTurn(m, "  padded prompt  ");
+  slim.setLatestConclusion(m, "conclusion text");
+  slim.setLatestConclusion(m, "");
+  slim.appendSlimTurn(m, "");
+  slim.setLatestConclusion(m, [{ type: "text", text: "" }, { type: "text", text: "real" }]);
+  return m;
+})() }];
+
+out.slimMemory.normalizeSlimMemory = [{
+  input: { memory: { summary: "legacy summary", turns: [
+    { userPrompt: "old singular" },
+    { userPrompts: ["a"], conclusion: "c" },
+    { userPrompts: ["dangling"] },
+  ] } },
+  expected: slim.normalizeSlimMemory({ summary: "legacy summary", turns: [
+    { userPrompt: "old singular" },
+    { userPrompts: ["a"], conclusion: "c" },
+    { userPrompts: ["dangling"] },
+  ] }),
+}];
+
+out.slimMemory.formatSlimMemory = [buildMemory(), {
+  ...slim.createSlimMemory(),
+  digests: ["digest one", "digest two"],
+  preservedUserPrompts: ["keep me"],
+  turns: [{ userPrompts: ["p1", "p2"], conclusion: "c1" }],
+}].map((memory) => ({ input: { memory }, expected: slim.formatSlimMemory(memory) }));
+
+out.slimMemory.memoryWithoutCurrent = [false, true].map((pendingMessages) => ({
+  input: { memory: buildMemory(), pendingMessages },
+  expected: slim.memoryWithoutCurrent(buildMemory(), { pendingMessages }),
+}));
+
+out.slimMemory.shouldUseFullContext = [
+  [{ ...slim.createSlimMemory() }, 96000, BIG],
+  [{ ...slim.createSlimMemory(), turns: [{ userPrompts: ["p"], conclusion: "" }] }, 96000, BIG],
+  [{ ...slim.createSlimMemory(), fullMessages: [{ role: "user" }], contextTokens: 1000, contextStage: "full" }, 96000, BIG],
+  [{ ...slim.createSlimMemory(), fullMessages: [{ role: "user" }], contextTokens: 99000, contextStage: "full" }, 96000, BIG],
+  [{ ...slim.createSlimMemory(), contextStage: "slim", fullMessages: [{ role: "user" }], contextTokens: 10 }, 96000, BIG],
+  [{ ...slim.createSlimMemory(), pendingMessages: [{ role: "user" }], contextStage: "slim" }, 96000, BIG],
+  [{ ...slim.createSlimMemory(), fullMessages: [{ role: "user", content: "small" }], contextTokens: 0, contextStage: "full" }, 96000, 1000000],
+].map(([memory, maxContextTokens, maxContextChars]) => ({
+  input: { memory, maxContextTokens, maxContextChars },
+  expected: slim.shouldUseFullContext(memory, maxContextTokens, maxContextChars),
+}));
+
+const rebaseMessages = [
+  { role: "user", content: [{ type: "text", text: "old q" }] },
+  { role: "assistant", content: [{ type: "text", text: "old a" }] },
+  { role: "user", content: [{ type: "text", text: "current q" }] },
+  { role: "assistant", content: [{ type: "text", text: "current a" }] },
+];
+const rebaseMemory = buildMemory();
+out.slimMemory.rebaseNativeContextForSlimMemory = [
+  { messages: structuredClone(rebaseMessages), activeTurnStart: 2 },
+  { messages: structuredClone(rebaseMessages), activeTurnStart: 0 },
+  { messages: structuredClone(rebaseMessages), activeTurnStart: 3 },
+  { messages: structuredClone(rebaseMessages), activeTurnStart: 99 },
+  { messages: [{ role: "assistant", content: "x" }, { role: "user", content: "string content" }], activeTurnStart: 1 },
+  { messages: [{ role: "assistant", content: "x" }, { role: "user", content: [{ type: "image", data: "d" }] }], activeTurnStart: 1 },
+].map(({ messages, activeTurnStart }) => ({
+  input: { messages, activeTurnStart, memory: structuredClone(rebaseMemory) },
+  expected: slim.rebaseNativeContextForSlimMemory(messages, activeTurnStart, structuredClone(rebaseMemory)),
+}));
+
+const seedMessages = [
+  { role: "user", content: [{ type: "text", text: "q1" }] },
+  { role: "assistant", content: [{ type: "text", text: "a1" }], stopReason: "end_turn", usage: { totalTokens: 500, output: 100 } },
+  { role: "user", content: [{ type: "text", text: "q2" }] },
+  { role: "assistant", content: [{ type: "text", text: "err" }], stopReason: "error" },
+];
+out.slimMemory.seedSlimMemoryFromMessages = [{
+  input: { messages: structuredClone(seedMessages) },
+  expected: slim.seedSlimMemoryFromMessages(slim.createSlimMemory(), structuredClone(seedMessages)),
+}];
+
+function memoryWithTurns(n, extra = {}) {
+  const m = slim.createSlimMemory();
+  for (let i = 1; i <= n; i++) m.turns.push({ userPrompts: [`prompt ${i}`], conclusion: `conclusion ${i}` });
+  return { ...m, ...extra };
+}
+const STUB = "STUB-DIGEST";
+async function compactCase(memory, options) {
+  const clone = structuredClone(memory);
+  const compacted = await slim.compactSlimMemory(clone, async () => STUB, options);
+  return { input: { memory: structuredClone(memory), options, stubDigest: STUB }, expected: { compacted, memory: clone } };
+}
+out.slimMemory.compactSlimMemory = await Promise.all([
+  compactCase(memoryWithTurns(3), { maxTurns: 10, currentTokens: 0, maxTokens: BIG, maxChars: BIG }),
+  compactCase(memoryWithTurns(5), { maxTurns: 3, currentTokens: 0, maxTokens: BIG, maxChars: BIG }),
+  compactCase(memoryWithTurns(3), { maxTurns: BIG, currentTokens: 90000, maxTokens: 80000, maxChars: BIG }),
+  compactCase(memoryWithTurns(3), { maxTurns: BIG, currentTokens: 0, maxTokens: BIG, maxChars: 10 }),
+  compactCase(memoryWithTurns(1), { maxTurns: 0, currentTokens: 0, maxTokens: BIG, maxChars: BIG }),
+  compactCase(memoryWithTurns(3, { compactStuck: true }), { maxTurns: 0, currentTokens: 0, maxTokens: BIG, maxChars: BIG }),
+  compactCase(memoryWithTurns(3, { consecutiveCompactions: 2 }), { maxTurns: 0, currentTokens: 0, maxTokens: BIG, maxChars: BIG }),
+  compactCase((() => { const m = memoryWithTurns(3); m.turns.push({ userPrompts: ["dangling"], conclusion: "" }); return m; })(), { maxTurns: 2, currentTokens: 0, maxTokens: BIG, maxChars: BIG }),
+]);
 
 writeFileSync("src-tauri/pi_core/testdata/golden.json", JSON.stringify(out));
 console.log("wrote src-tauri/pi_core/testdata/golden.json", JSON.stringify(out).length, "bytes");

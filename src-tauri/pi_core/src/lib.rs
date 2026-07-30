@@ -19,6 +19,7 @@ pub mod prompt;
 pub mod provider;
 pub mod read;
 pub mod skills;
+pub mod slim_memory;
 pub mod smart_edit;
 pub mod text;
 pub mod tools;
@@ -53,6 +54,13 @@ pub use read::{
 pub use skills::{
     format_alkaid_skills_prompt, format_skills_for_prompt, format_skills_for_prompt_compressed,
     Skill,
+};
+pub use slim_memory::{
+    compact_native_tool_results, compact_slim_memory, context_pressure_tier,
+    context_tokens_from_messages, estimate_context_tokens, format_normalized, format_slim_memory,
+    memory_without_current, normalize_value, rebase_native_context_for_slim_memory,
+    seed_slim_memory_from_messages, should_use_full_context, strip_completed_openai_reasoning,
+    text_content, CompactOptions, NormalizedMemory, SlimMemory, Turn,
 };
 pub use smart_edit::{apply_smart_edits, SmartMatch, SmartResult};
 pub use tools::{tool_fn_for, NativeTools};

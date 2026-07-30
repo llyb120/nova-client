@@ -13,6 +13,12 @@ use pi_core::{
     truncate_head, truncate_line, truncate_tail, write_tool, NormalizeOptions, ReadRequest,
     ShellConfig, Skill, OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
 };
+use pi_core::{
+    compact_native_tool_results, compact_slim_memory, context_pressure_tier,
+    context_tokens_from_messages, estimate_context_tokens, format_slim_memory, memory_without_current,
+    normalize_value, rebase_native_context_for_slim_memory, seed_slim_memory_from_messages,
+    should_use_full_context, strip_completed_openai_reasoning, CompactOptions, SlimMemory,
+};
 use serde_json::{json, Value};
 
 const GOLDEN: &str = include_str!("../testdata/golden.json");
@@ -844,6 +850,187 @@ fn parity_decode_text_buffer() {
             case["expected"].as_str().unwrap(),
             "decodeTextBuffer {:?}",
             case["input"]
+        );
+    }
+}
+
+#[test]
+fn parity_slim_memory() {
+    let sm = &golden()["slimMemory"];
+
+    for case in sm["estimateContextTokens"].as_array().unwrap() {
+        let text = case["input"]["text"].as_str().unwrap();
+        assert_eq!(
+            estimate_context_tokens(text),
+            case["expected"].as_u64().unwrap(),
+            "estimateContextTokens {:?}",
+            text
+        );
+    }
+
+    for case in sm["contextPressureTier"].as_array().unwrap() {
+        let current = case["input"]["currentTokens"].as_f64().unwrap();
+        let window = case["input"]["contextWindow"].as_f64().unwrap();
+        assert_eq!(
+            context_pressure_tier(current, window),
+            case["expected"].as_str().unwrap(),
+            "contextPressureTier {:?}",
+            case["input"]
+        );
+    }
+
+    for case in sm["contextTokensFromMessages"].as_array().unwrap() {
+        let messages: Vec<Value> = case["input"]["messages"].as_array().unwrap().clone();
+        assert_eq!(
+            context_tokens_from_messages(&messages),
+            case["expected"].as_u64().unwrap(),
+            "contextTokensFromMessages {:?}",
+            case["input"]
+        );
+    }
+
+    for case in sm["stripCompletedOpenAIReasoning"].as_array().unwrap() {
+        let messages: Vec<Value> = case["input"]["messages"].as_array().unwrap().clone();
+        assert_eq!(
+            strip_completed_openai_reasoning(&messages),
+            *case["expected"].as_array().unwrap(),
+            "stripCompletedOpenAIReasoning {:?}",
+            case["input"]
+        );
+    }
+
+    for case in sm["compactNativeToolResults"].as_array().unwrap() {
+        let messages: Vec<Value> = case["input"]["messages"].as_array().unwrap().clone();
+        let tier = case["input"]["tier"].as_str().unwrap();
+        let preserve = case["input"]["preserveRecent"].as_u64().unwrap() as usize;
+        let (msgs, changed) = compact_native_tool_results(&messages, tier, preserve);
+        assert_eq!(
+            msgs,
+            *case["expected"]["messages"].as_array().unwrap(),
+            "compactNativeToolResults messages {:?}",
+            case["input"]
+        );
+        assert_eq!(
+            changed,
+            case["expected"]["changed"].as_bool().unwrap(),
+            "compactNativeToolResults changed {:?}",
+            case["input"]
+        );
+    }
+
+    assert_eq!(
+        serde_json::to_value(SlimMemory::new()).unwrap(),
+        sm["createSlimMemory"][0]["expected"],
+        "createSlimMemory"
+    );
+
+    let mut m = SlimMemory::new();
+    m.append_turn("  padded prompt  ");
+    m.set_latest_conclusion(&json!("conclusion text"));
+    m.set_latest_conclusion(&json!(""));
+    m.append_turn("");
+    m.set_latest_conclusion(&json!([{ "type": "text", "text": "" }, { "type": "text", "text": "real" }]));
+    assert_eq!(
+        serde_json::to_value(&m).unwrap(),
+        sm["appendAndConclusion"][0]["expected"],
+        "appendAndConclusion"
+    );
+
+    for case in sm["normalizeSlimMemory"].as_array().unwrap() {
+        let normalized = normalize_value(&case["input"]["memory"]);
+        assert_eq!(
+            serde_json::to_value(&normalized).unwrap(),
+            case["expected"],
+            "normalizeSlimMemory {:?}",
+            case["input"]
+        );
+    }
+
+    for case in sm["formatSlimMemory"].as_array().unwrap() {
+        assert_eq!(
+            format_slim_memory(&case["input"]["memory"]),
+            case["expected"].as_str().unwrap(),
+            "formatSlimMemory {:?}",
+            case["input"]
+        );
+    }
+
+    for case in sm["memoryWithoutCurrent"].as_array().unwrap() {
+        let pending = case["input"]["pendingMessages"].as_bool().unwrap();
+        let result = memory_without_current(&case["input"]["memory"], pending);
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            case["expected"],
+            "memoryWithoutCurrent {:?}",
+            case["input"]
+        );
+    }
+
+    for case in sm["shouldUseFullContext"].as_array().unwrap() {
+        let memory: SlimMemory = serde_json::from_value(case["input"]["memory"].clone()).unwrap();
+        let max_tokens = case["input"]["maxContextTokens"].as_u64().unwrap();
+        let max_chars = case["input"]["maxContextChars"].as_u64().map(|v| v as usize);
+        assert_eq!(
+            should_use_full_context(&memory, max_tokens, max_chars),
+            case["expected"].as_bool().unwrap(),
+            "shouldUseFullContext {:?}",
+            case["input"]
+        );
+    }
+
+    for case in sm["rebaseNativeContextForSlimMemory"].as_array().unwrap() {
+        let messages: Vec<Value> = case["input"]["messages"].as_array().unwrap().clone();
+        let start = case["input"]["activeTurnStart"].as_i64().unwrap();
+        let (msgs, changed) =
+            rebase_native_context_for_slim_memory(&messages, start, &case["input"]["memory"]);
+        assert_eq!(
+            msgs,
+            *case["expected"]["messages"].as_array().unwrap(),
+            "rebaseNativeContextForSlimMemory messages {:?}",
+            case["input"]
+        );
+        assert_eq!(
+            changed,
+            case["expected"]["changed"].as_bool().unwrap(),
+            "rebaseNativeContextForSlimMemory changed {:?}",
+            case["input"]
+        );
+    }
+
+    let seed_messages: Vec<Value> = sm["seedSlimMemoryFromMessages"][0]["input"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let mut seeded = SlimMemory::new();
+    seed_slim_memory_from_messages(&mut seeded, &seed_messages);
+    assert_eq!(
+        serde_json::to_value(&seeded).unwrap(),
+        sm["seedSlimMemoryFromMessages"][0]["expected"],
+        "seedSlimMemoryFromMessages"
+    );
+
+    for case in sm["compactSlimMemory"].as_array().unwrap() {
+        let mut memory: SlimMemory = serde_json::from_value(case["input"]["memory"].clone()).unwrap();
+        let opts = &case["input"]["options"];
+        let options = CompactOptions {
+            max_turns: Some(opts["maxTurns"].as_u64().unwrap() as usize),
+            max_chars: Some(opts["maxChars"].as_u64().unwrap() as usize),
+            current_tokens: opts["currentTokens"].as_u64().unwrap(),
+            max_tokens: Some(opts["maxTokens"].as_u64().unwrap()),
+        };
+        let stub = case["input"]["stubDigest"].as_str().unwrap().to_string();
+        let compacted = compact_slim_memory(&mut memory, options, move |_| stub.clone());
+        assert_eq!(
+            compacted,
+            case["expected"]["compacted"].as_bool().unwrap(),
+            "compactSlimMemory compacted {:?}",
+            opts
+        );
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            case["expected"]["memory"],
+            "compactSlimMemory memory {:?}",
+            opts
         );
     }
 }
