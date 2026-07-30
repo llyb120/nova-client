@@ -99,9 +99,10 @@ function isRetryableCursorError(error) {
 }
 
 function shouldSilentRetryCursorTurn(error, { producedOutput = false, attempt = 0, maxRetries = CURSOR_SILENT_RETRIES } = {}) {
-  // Only restart turns that never emitted UI output; otherwise a silent retry would duplicate deltas.
-  return !producedOutput
-    && attempt < maxRetries
+  // After UI output, the caller continues with "go on" plus interrupted pending-turn context
+  // (same as a manual go-on) instead of replaying the original prompt.
+  void producedOutput;
+  return attempt < maxRetries
     && (error instanceof CursorStartupTimeout || isRetryableCursorError(error));
 }
 
@@ -1172,12 +1173,22 @@ async function main() {
             throw error;
           }
           attemptActive = false;
+          const continueAfterOutput = producedOutput;
           const retryDelayMs = CURSOR_SILENT_RETRY_DELAYS_MS[attempt]
             ?? CURSOR_SILENT_RETRY_DELAYS_MS.at(-1);
+          // Match a manual "go on": persist the interrupted trajectory, then continue from it.
+          if (continueAfterOutput) {
+            await preserveActiveTurn?.();
+            message = messageWithToolPolicy(
+              messageWithSlimMemory("go on", memory),
+              { readOnly },
+            );
+          }
           sendTiming("silent_retry", turnStartedAt, {
             attempt: attempt + 1,
             delayMs: retryDelayMs,
             reason: error instanceof CursorStartupTimeout ? "startup_timeout" : "retryable_error",
+            continueWith: continueAfterOutput ? "go_on" : "same_prompt",
           });
           if (retryDelayMs > 0) {
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
@@ -1191,9 +1202,9 @@ async function main() {
           );
           agent = recovery.agent;
           agentSession = { sessionKey, fingerprint: agentFingerprint(request) };
-          // A timeout recovery creates a fresh Agent, so bootstrap it with the complete Vega
-          // transcript. The prompt was built before this turn became pending, avoiding self-replay.
-          if (recovery.replaced) message = bootstrapMessage;
+          // Fresh Agent with no prior UI output bootstraps the full transcript. After UI output,
+          // keep the "go on" prompt built above (interrupted pending-turn already in slim-memory).
+          if (recovery.replaced && !continueAfterOutput) message = bootstrapMessage;
           // Keep the stable slim-memory session key; do not promote ephemeral agent ids.
           send({ type: "ready", sessionId: sessionKey });
           activeRun = undefined;

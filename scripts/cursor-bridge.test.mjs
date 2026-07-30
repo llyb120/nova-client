@@ -301,7 +301,7 @@ assert.equal(shouldSilentRetryCursorTurn(
 assert.equal(shouldSilentRetryCursorTurn(
   Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
   { producedOutput: true, attempt: 0 },
-), false);
+), true);
 assert.equal(shouldSilentRetryCursorTurn(
   new CursorStartupTimeout("stream startup"),
   { producedOutput: false, attempt: 0 },
