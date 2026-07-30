@@ -92,9 +92,10 @@ function isRetryableCursorError(error) {
 }
 
 function shouldSilentRetryCursorTurn(error, { producedOutput = false, attempt = 0, maxRetries = CURSOR_SILENT_RETRIES } = {}) {
-  // Only restart turns that never emitted UI output; otherwise a silent retry would duplicate deltas.
-  return !producedOutput
-    && attempt < maxRetries
+  // After UI output, the caller continues with "go on" plus interrupted pending-turn context
+  // (same as a manual go-on) instead of replaying the original prompt.
+  void producedOutput;
+  return attempt < maxRetries
     && (error instanceof CursorStartupTimeout || isRetryableCursorError(error));
 }
 
@@ -936,7 +937,7 @@ async function main() {
       // Build the SDK prompt before marking this turn pending, otherwise it would replay itself.
       // Persist first so even Agent.create/SDK initialization failures retain the user's request.
       const previousPendingTurn = memory.pendingTurn;
-      const message = messageWithToolPolicy(messageWithSlimMemory(originalMessage, memory), { readOnly });
+      let message = messageWithToolPolicy(messageWithSlimMemory(originalMessage, memory), { readOnly });
       memory.pendingTurn = pendingTurnContext(previousPendingTurn, originalMessage);
       await saveSlimMemory(memoryKey, memory).catch((error) => {
         process.stderr.write(`Cursor pending-turn persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -1068,9 +1069,19 @@ async function main() {
             throw error;
           }
           attemptActive = false;
+          const continueAfterOutput = producedOutput;
+          // Match a manual "go on": persist the interrupted trajectory, then continue from it.
+          if (continueAfterOutput) {
+            await preserveActiveTurn?.();
+            message = messageWithToolPolicy(
+              messageWithSlimMemory("go on", memory),
+              { readOnly },
+            );
+          }
           sendTiming("silent_retry", turnStartedAt, {
             attempt: attempt + 1,
             reason: error instanceof CursorStartupTimeout ? "startup_timeout" : "retryable_error",
+            continueWith: continueAfterOutput ? "go_on" : "same_prompt",
           });
           const recovery = await recoverTimedOutAgent(
             agent,
@@ -1081,7 +1092,7 @@ async function main() {
             true,
           );
           agent = recovery.agent;
-          // Retry the exact prompt built before this turn was marked pending, avoiding self-replay.
+          // No-output retries keep the exact pre-pending prompt; after UI output, keep "go on".
           // Keep the stable slim-memory session key; do not promote ephemeral agent ids.
           send({ type: "ready", sessionId: sessionKey });
           activeRun = undefined;
