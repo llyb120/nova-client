@@ -1254,7 +1254,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         const mb = mdBlocks[mi];
         if (mb.type === "hr") {
           result.push({ kind: "md-hr", id: item.id, groupIdx: gi,
-            x, y, w: proseW, h: 25, bg: p.border });
+            x, y, w: proseW, h: 25 });
           y += 25;
         } else if (mb.type === "code") {
           const codeText = mb.raw || segmentsPlainText(mb.segments);
