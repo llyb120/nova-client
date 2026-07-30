@@ -284,6 +284,35 @@ impl SdkManager {
         } else {
             None
         };
+        // Native Vega path (feature-gated): run in-process instead of spawning
+        // the node bridge. Off by default; the node bridge stays the production
+        // path until the native transport is verified against live providers.
+        #[cfg(feature = "native-vega")]
+        if self.adapter.agent_kind() == AgentKind::Alkaid {
+            let outcome = self
+                .run_prompt_native(
+                    &thread_id,
+                    &cwd,
+                    model.as_deref(),
+                    &parts,
+                    session_id.clone(),
+                    user_item_id,
+                    run_epoch,
+                )
+                .await;
+            if !self.is_current_run(&thread_id, run_epoch) {
+                return;
+            }
+            if let Err(error) = outcome {
+                self.push_system(
+                    &thread_id,
+                    format!("{} 请求失败：{error}", self.adapter.label()),
+                    "error",
+                );
+                self.finish_turn_if_current(&thread_id, run_epoch, "error", None);
+            }
+            return;
+        }
         let mut request = json!({
             "action": "prompt",
             "threadId": thread_id,
@@ -751,6 +780,61 @@ impl SdkManager {
             &String::from_utf8_lossy(&output.stdout),
             self.adapter.label(),
         )
+    }
+
+    /// Native Vega path (feature-gated): run the agent in-process via `pi_core`
+    /// instead of spawning the node alkaid bridge. Off by default; see the
+    /// `native-vega` cargo feature.
+    #[cfg(feature = "native-vega")]
+    async fn run_prompt_native(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+        model_selection: Option<&str>,
+        parts: &[Value],
+        session_id: Option<String>,
+        user_item_id: u64,
+        run_epoch: u64,
+    ) -> Result<(), String> {
+        let prompt_text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let data_dir = nova_data_dir(&self.app);
+        let server_config = self.alkaid_server_config.lock().unwrap().clone();
+        let selection = model_selection.unwrap_or("").to_string();
+        // Session-history continuity is not yet mapped from the thread store; the
+        // native turn starts from an empty transcript (documented gap).
+        let setup = crate::vega_native::prepare_native_turn(
+            &data_dir,
+            cwd,
+            server_config.as_ref(),
+            &selection,
+            Vec::new(),
+            session_id,
+            false,
+            "/bin/bash",
+        )?;
+        let client = reqwest::Client::new();
+        let output = crate::vega_native::run_native_turn_async(
+            client,
+            setup.provider,
+            setup.turn_config,
+            prompt_text,
+            setup.native_tools,
+        )
+        .await?;
+        if !self.is_current_run(thread_id, run_epoch) {
+            return Ok(());
+        }
+        let mut item_ids = HashMap::new();
+        for envelope in &output.items {
+            self.apply_item(thread_id, &envelope["item"], &mut item_ids);
+        }
+        self.finish_turn_if_current(thread_id, run_epoch, "end_turn", output.usage);
+        let _ = user_item_id;
+        Ok(())
     }
 
     async fn run_prompt_bridge(

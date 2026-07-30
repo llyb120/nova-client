@@ -16,8 +16,13 @@
 #![allow(dead_code)]
 
 use pi_core::agent::{Agent, AgentState, StreamFn, StreamTurn, ToolFn};
+use pi_core::alkaid_config::{merge_config, parse_jsonc, resolve_model};
 use pi_core::bridge::ProtocolAccumulator;
+use pi_core::prompt::{build_system_prompt, ShellConfig, ShellKind};
+use pi_core::tools::NativeTools;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::vega_provider::{stream_turn, ProviderConfig};
 
@@ -173,4 +178,290 @@ pub async fn run_native_turn_async(
     })
     .await
     .map_err(|error| format!("native Vega turn panicked: {error}"))?
+}
+
+/// Load and merge the Vega config: `config.jsonc` under `{data_dir}/alkaid`,
+/// with the server-provided config as the baseline (port of `loadAlkaidConfig`).
+pub fn load_alkaid_config(data_dir: &Path, server_config: Option<&Value>) -> Result<Value, String> {
+    let config_path = data_dir.join("alkaid").join("config.jsonc");
+    let local = match std::fs::read_to_string(&config_path) {
+        Ok(text) => parse_jsonc(&text)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => {
+            return Err(format!(
+                "读取 Vega 配置失败：{error}"
+            ))
+        }
+    };
+    let merged = match server_config {
+        Some(server) => merge_config(server, &local),
+        None => local,
+    };
+    if merged.get("provider").and_then(Value::as_object).map_or(true, |p| p.is_empty()) {
+        return Err(format!("未找到 Vega 配置：{}", config_path.display()));
+    }
+    Ok(merged)
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The tool definitions advertised to the LLM (name/description/parameters).
+/// Mirrors the alkaid tool set: batch `read_files`/`edit_files` plus the
+/// pi-coding-agent `read`/`edit`/`write`/`bash`/`grep`/`find`/`ls`.
+pub fn native_tool_definitions(read_only: bool) -> Vec<Value> {
+    let mut tools = vec![
+        json!({
+            "name": "read_files",
+            "description": "并行读取多个 UTF-8 文本文件（可带 offset/limit）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "anyOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "offset": { "type": "integer", "minimum": 1 },
+                                        "limit": { "type": "integer", "minimum": 1, "maximum": 2000 }
+                                    },
+                                    "required": ["path"]
+                                }
+                            ]
+                        }
+                    }
+                },
+                "required": ["paths"]
+            }
+        }),
+        json!({
+            "name": "read",
+            "description": "Read the contents of a file. Use offset/limit for large files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "offset": { "type": "number" },
+                    "limit": { "type": "number" }
+                },
+                "required": ["path"]
+            }
+        }),
+    ];
+    if read_only {
+        tools.push(json!({
+            "name": "grep",
+            "description": "Search file contents for a pattern (respects .gitignore).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string" },
+                    "path": { "type": "string" },
+                    "glob": { "type": "string" },
+                    "ignoreCase": { "type": "boolean" },
+                    "literal": { "type": "boolean" }
+                },
+                "required": ["pattern"]
+            }
+        }));
+        tools.push(json!({
+            "name": "find",
+            "description": "Find files by glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": { "pattern": { "type": "string" }, "path": { "type": "string" } },
+                "required": ["pattern"]
+            }
+        }));
+        tools.push(json!({
+            "name": "ls",
+            "description": "List directory contents.",
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "limit": { "type": "number" } }
+            }
+        }));
+        return tools;
+    }
+    tools.push(json!({
+        "name": "edit_files",
+        "description": "并行智能编辑多个互不依赖的已有文件（精确优先、锚点定位、歧义拒绝）。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "edits": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "oldText": { "type": "string" },
+                                        "newText": { "type": "string" }
+                                    },
+                                    "required": ["oldText", "newText"]
+                                }
+                            }
+                        },
+                        "required": ["path", "edits"]
+                    }
+                }
+            },
+            "required": ["files"]
+        }
+    }));
+    tools.push(json!({
+        "name": "edit",
+        "description": "Edit a single file using exact text replacement.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "oldText": { "type": "string" },
+                            "newText": { "type": "string" }
+                        },
+                        "required": ["oldText", "newText"]
+                    }
+                }
+            },
+            "required": ["path", "edits"]
+        }
+    }));
+    tools.push(json!({
+        "name": "write",
+        "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
+        "parameters": {
+            "type": "object",
+            "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+            "required": ["path", "content"]
+        }
+    }));
+    tools.push(json!({
+        "name": "bash",
+        "description": "Execute a bash command in the current working directory.",
+        "parameters": {
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        }
+    }));
+    tools.push(json!({
+        "name": "grep",
+        "description": "Search file contents for a pattern (respects .gitignore).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+                "path": { "type": "string" },
+                "glob": { "type": "string" },
+                "ignoreCase": { "type": "boolean" },
+                "literal": { "type": "boolean" }
+            },
+            "required": ["pattern"]
+        }
+    }));
+    tools.push(json!({
+        "name": "find",
+        "description": "Find files by glob pattern.",
+        "parameters": {
+            "type": "object",
+            "properties": { "pattern": { "type": "string" }, "path": { "type": "string" } },
+            "required": ["pattern"]
+        }
+    }));
+    tools.push(json!({
+        "name": "ls",
+        "description": "List directory contents.",
+        "parameters": {
+            "type": "object",
+            "properties": { "path": { "type": "string" }, "limit": { "type": "number" } }
+        }
+    }));
+    tools
+}
+
+/// Everything `sdk_runtime` needs to run a native Vega turn.
+pub struct NativeVegaSetup {
+    pub provider: ProviderConfig,
+    pub turn_config: NativeTurnConfig,
+    pub native_tools: NativeTools,
+}
+
+/// Resolve the Vega config into a runnable native setup (port of the
+/// `createAlkaidAgent` configuration step, minus skill loading and MCP).
+///
+/// Known gaps for production parity: skills are not loaded from disk (the
+/// system prompt's skills section is empty) and MCP servers are not connected.
+/// These are documented remaining steps before the node bridge is retired.
+pub fn prepare_native_turn(
+    data_dir: &Path,
+    cwd: &str,
+    server_config: Option<&Value>,
+    model_selection: &str,
+    history: Vec<Value>,
+    session_id: Option<String>,
+    read_only: bool,
+    shell: &str,
+) -> Result<NativeVegaSetup, String> {
+    let config = load_alkaid_config(data_dir, server_config)?;
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let resolved = resolve_model(&config, model_selection, &env)?;
+    let model = resolved.get("model").cloned().unwrap_or(json!({}));
+    let api_key = resolved.get("apiKey").and_then(Value::as_str).map(String::from);
+
+    let provider = ProviderConfig {
+        api: model.get("api").and_then(Value::as_str).unwrap_or("").to_string(),
+        base_url: model.get("baseUrl").and_then(Value::as_str).unwrap_or("").to_string(),
+        model_id: model.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+        provider: model.get("provider").and_then(Value::as_str).unwrap_or("").to_string(),
+        api_key,
+    };
+
+    let shell_config = if read_only {
+        None
+    } else {
+        Some(ShellConfig {
+            shell: shell.to_string(),
+            kind: ShellKind::Bash,
+        })
+    };
+    let system_prompt = build_system_prompt(cwd, read_only, shell_config.as_ref(), "", "");
+    let tool_definitions = native_tool_definitions(read_only);
+    let native_tools = NativeTools::new(PathBuf::from(cwd));
+
+    let turn_config = NativeTurnConfig {
+        system_prompt,
+        model,
+        tools: tool_definitions,
+        history,
+        session_id,
+        timestamp: now_millis(),
+        parallel_tools: true,
+    };
+
+    Ok(NativeVegaSetup {
+        provider,
+        turn_config,
+        native_tools,
+    })
 }
