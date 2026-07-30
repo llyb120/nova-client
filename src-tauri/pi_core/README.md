@@ -62,9 +62,29 @@ implementation for every non-LLM computation.
   `prepare_native_turn` (config → `ProviderConfig` + system prompt + tool defs),
   and `sdk_runtime::run_prompt_native` routing the Alkaid adapter in-process when
   the feature is enabled. Compiles in both configurations; off by default.
+- M10 (done, deterministic + orchestration): the Reasonix context-management
+  port and its wiring. **M10a** `slim_memory.rs` — full port of
+  `alkaid-slim-memory.mjs` (`SlimMemory` state, append/conclusion/normalize,
+  `formatSlimMemory`, `memoryWithoutCurrent`, `estimateContextTokens`,
+  `contextPressureTier`, `contextTokensFromMessages`,
+  `stripCompletedOpenAIReasoning`, `compactNativeToolResults`,
+  `shouldUseFullContext`, `rebaseNativeContextForSlimMemory`,
+  `seedSlimMemoryFromMessages`, and the `compactSlimMemory` decision logic with
+  the `summarize` callback as the injected LLM boundary). **M10b**
+  `skills_discovery.rs` — pi-coding-agent skill discovery (`SKILL.md` stops
+  recursion, root `.md` loaded, `node_modules`/dot skipped), minimal frontmatter
+  parser, `stripSkillFrontmatter`, `expandAlkaidSkillCommand`; `prepare_native_turn`
+  now loads skills + `AGENTS.md`, detects the shell, and honors `read_only`.
+  **M10c** `vega_reasonix.rs` + `run_prompt_native` — session IO
+  (`<id>.slim.json`), `stableHash` fingerprinting, pending-prompt checkpoint,
+  slim-record prompt prefix, and the per-turn flow (capacity tiers, pressure
+  compaction, full/slim switching, snapshot freeze, conclusion/capacity/error
+  persistence). This fixes the prior empty-transcript-per-turn gap (multi-turn
+  memory now works natively).
 
-All 55 tests (27 unit + 28 differential) are green and `cargo test` needs no
-node. `nova_lib` compiles with 0 errors both with and without `native-vega`.
+All 61 pi_core tests (32 unit + 29 differential) are green and `cargo test`
+needs no node. `nova_lib` compiles with 0 errors both with and without
+`native-vega`.
 
 ## Function map (node → Rust)
 
@@ -103,23 +123,28 @@ node. `nova_lib` compiles with 0 errors both with and without `native-vega`.
 ## Remaining work (outside the verifiable scope)
 
 The deterministic core, the native tool executor, the OpenAI Chat Completions
-transport, the Vega config resolution, and the feature-gated `sdk_runtime` seam
-are all in place. What remains is inherently online / production-cutover work
-that cannot be differentially tested here:
+transport, the Vega config resolution, the Reasonix slim-memory port + per-turn
+orchestration, native skill discovery, and the feature-gated `sdk_runtime` seam
+are all in place. What remains is either large additional porting or inherently
+online / production-cutover work that cannot be differentially tested here:
 
 1. **Other provider protocols.** `openai-completions` is implemented;
-   `openai-responses`, `anthropic-messages`, and `google-generative-ai` are
-   explicit extension points in `vega_provider.rs` (part of the excluded `pi-ai`
-   surface, ~33k lines).
-2. **Skills + MCP.** `prepare_native_turn` does not yet load skills from disk
-   (the system prompt's skills section is empty) or connect MCP servers, both of
-   which the node bridge does via `pi-coding-agent`.
-3. **Session-history continuity.** `run_prompt_native` starts each turn from an
-   empty transcript; mapping the thread store's persisted messages into pi
-   messages (and the `restoreAt`/time-machine flow) is not yet wired.
-4. **Live-provider verification + gray-release.** Enable `native-vega`, exercise
+   `openai-responses`, `anthropic-messages` (~1k lines: cache control, thinking
+   signatures, tool references), and `google-generative-ai` are explicit
+   extension points in `vega_provider.rs` (part of the excluded `pi-ai` surface).
+2. **Reasonix digest compaction + mid-turn hook.** `compactSlimMemory`'s LLM
+   `summarize` is not yet wired (needs a plan/apply split around the async
+   summary turn), and the agent loop does not yet expose the
+   `prepareNextTurnWithContext` hook the bridge uses for mid-turn context
+   maintenance. The between-turn capacity logic is fully active.
+3. **MCP.** `prepare_native_turn` does not connect MCP servers (needs a stdio
+   JSON-RPC client); the node bridge does this via `pi-coding-agent`.
+4. **Pass-through completeness.** `read_only` and shell are wired; images,
+   `reasoningEffort`/`thinkingLevel`, and `lightweightModel` are not yet carried
+   through the native provider request.
+5. **Live-provider verification + gray-release.** Enable `native-vega`, exercise
    real turns against each provider, and compare against the node bridge before
    flipping the default.
-5. **Retire the node bridge.** Only after the above: remove
+6. **Retire the node bridge.** Only after the above: remove
    `resources/alkaid-bridge.mjs` and the `node` spawn in `spawn_bridge`. The
    bridge is intentionally left in place and remains the default path.
