@@ -317,6 +317,7 @@ interface MdBlock {
   lang?: string;
   ordered?: boolean;
   prefix?: string;
+  listDepth?: number;
   raw?: string;
   rows?: MdTableCell[][];
   aligns?: Array<"left" | "center" | "right">;
@@ -379,12 +380,15 @@ function parseMarkdownBlocks(md: string): MdBlock[] {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    const fence = line.match(/^\s{0,3}(`{3,}|~{3,})\s*(.*?)\s*$/);
+    // Be lenient with model-generated indentation. CommonMark only allows up to
+    // three leading spaces, but treating deeper-indented fences as prose leaves
+    // literal backticks and turns the text between them into inline code.
+    const fence = line.match(/^\s*(`{3,}|~{3,})\s*(.*?)\s*$/);
     if (fence) {
       const fenceChar = fence[1][0];
       const fenceLen = fence[1].length;
       const lang = fence[2].split(/\s/)[0] || "";
-      const closeRe = new RegExp(`^\\s{0,3}${fenceChar === '`' ? '`' : '~'}{${fenceLen},}\\s*$`);
+      const closeRe = new RegExp(`^\\s*${fenceChar === '`' ? '`' : '~'}{${fenceLen},}\\s*$`);
       const buf: string[] = [];
       i++;
       while (i < lines.length && !closeRe.test(lines[i])) { buf.push(lines[i]); i++; }
@@ -401,21 +405,24 @@ function parseMarkdownBlocks(md: string): MdBlock[] {
       blocks.push({ type: "blockquote", segments: tokenizeInline(buf.join("\n")) });
       continue;
     }
-    if (/^\s*[-*+]\s+/.test(line)) {
-      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
-        const itemText = lines[i].replace(/^\s*[-*+]\s+/, "");
-        blocks.push({ type: "list-item", segments: tokenizeInline(itemText), prefix: "•" });
+    const listStart = line.match(/^(\s*)([-*+]|(\d+)[.)])\s+(.*)$/);
+    if (listStart) {
+      const indentStack: number[] = [];
+      while (i < lines.length) {
+        const item = lines[i].match(/^(\s*)([-*+]|(\d+)[.)])\s+(.*)$/);
+        if (!item) break;
+        const indent = item[1].replace(/\t/g, "    ").length;
+        while (indentStack.length && indentStack[indentStack.length - 1] > indent) indentStack.pop();
+        if (!indentStack.length || indentStack[indentStack.length - 1] < indent) indentStack.push(indent);
+        const ordered = item[3] !== undefined;
+        blocks.push({
+          type: "list-item",
+          segments: tokenizeInline(item[4]),
+          ordered,
+          prefix: ordered ? `${item[3]}.` : "•",
+          listDepth: indentStack.length - 1,
+        });
         i++;
-      }
-      continue;
-    }
-    const orderedListStart = line.match(/^\s*(\d+)\.\s+/);
-    if (orderedListStart) {
-      let n = Number(orderedListStart[1]);
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-        const itemText = lines[i].replace(/^\s*\d+\.\s+/, "");
-        blocks.push({ type: "list-item", segments: tokenizeInline(itemText), ordered: true, prefix: `${n}.` });
-        n++; i++;
       }
       continue;
     }
@@ -427,9 +434,9 @@ function parseMarkdownBlocks(md: string): MdBlock[] {
       i += 2;
       while (i < lines.length) {
         const l = lines[i];
-        if (/^\s*$/.test(l) || isTableSeparator(l) || /^\s{0,3}(`{3,}|~{3,})/.test(l)
+        if (/^\s*$/.test(l) || isTableSeparator(l) || /^\s*(`{3,}|~{3,})/.test(l)
           || /^(#{1,6})\s+/.test(l) || /^>\s?/.test(l) || /^\s*[-*+]\s+/.test(l)
-          || /^\s*\d+\.\s+/.test(l) || /^\s*([-*_])\1{2,}\s*$/.test(l) || !l.includes("|")) break;
+          || /^\s*\d+[.)]\s+/.test(l) || /^\s*([-*_])\1{2,}\s*$/.test(l) || !l.includes("|")) break;
         const cells = splitTableRow(l).map(c => ({ segments: tokenizeInline(c) }));
         while (cells.length < headerCells.length) cells.push({ segments: [{ text: "" }] });
         rows.push(cells.slice(0, headerCells.length));
@@ -445,8 +452,8 @@ function parseMarkdownBlocks(md: string): MdBlock[] {
     const buf: string[] = [line]; i++;
     while (i < lines.length) {
       const l = lines[i];
-      if (/^\s*$/.test(l) || /^\s{0,3}(`{3,}|~{3,})/.test(l) || /^(#{1,6})\s+/.test(l) || /^>\s?/.test(l)
-        || /^\s*[-*+]\s+/.test(l) || /^\s*\d+\.\s+/.test(l) || /^\s*([-*_])\1{2,}\s*$/.test(l)
+      if (/^\s*$/.test(l) || /^\s*(`{3,}|~{3,})/.test(l) || /^(#{1,6})\s+/.test(l) || /^>\s?/.test(l)
+        || /^\s*[-*+]\s+/.test(l) || /^\s*\d+[.)]\s+/.test(l) || /^\s*([-*_])\1{2,}\s*$/.test(l)
         || isTableStart(lines, i)) break;
       buf.push(l); i++;
     }
@@ -1289,7 +1296,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           y += bH + 10;
         } else if (mb.type === "list-item") {
           const plain = segmentsPlainText(mb.segments);
-          const indent = 22;
+          const listDepth = mb.listDepth || 0;
+          const prefixOffset = listDepth * 22;
+          const indent = prefixOffset + 22;
           const liLines = wrapStyledText(plain, mb.segments, proseW - indent, 14, p.sans, p.mono);
           const liLh = 14 * 1.7;
           const liH = liLines.length * liLh;
@@ -1297,7 +1306,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             x, y, w: proseW, h: liH,
             text: plain, segments: mb.segments, color: p.text, fontSize: 14,
             lineHeight: 1.7, font: p.sans, selectable: true,
-            data: { prefix: mb.prefix, indent } });
+            data: { prefix: mb.prefix, prefixOffset, indent } });
           y += liH + 3;
         } else if (mb.type === "table") {
           y = layoutMdTable(mb, result, item.id, gi, x, y, proseW, p);
@@ -1833,6 +1842,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const segments = b.segments;
     const indent = (b.data?.indent as number) || 0;
     const prefix = b.data?.prefix as string | undefined;
+    const prefixOffset = (b.data?.prefixOffset as number) || 0;
     const isBq = b.kind === "md-blockquote";
 
     if (isBq && b.data?.borderLeft) {
@@ -1848,7 +1858,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (prefix) {
       ctx.font = `${fs}px ${ff}`;
       ctx.fillStyle = b.color || pal.text;
-      fillTextCrisp(ctx, prefix, bx, by + halfLead);
+      fillTextCrisp(ctx, prefix, bx + prefixOffset, by + halfLead);
     }
 
     if (!segments || segments.length === 0) {
