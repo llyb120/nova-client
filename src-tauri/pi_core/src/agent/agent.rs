@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use super::run_loop::{run_agent_loop, LoopConfig, LoopContext, StreamFn, ToolFn};
+use super::run_loop::{run_agent_loop, LoopConfig, LoopContext, PrepareNextTurnFn, StreamFn, ToolFn};
 
 /// Port of `PendingMessageQueue`: FIFO queue whose `drain` returns everything
 /// (`"all"`) or a single message (`"one-at-a-time"`).
@@ -86,6 +86,9 @@ pub struct Agent {
     pub session_id: Option<String>,
     /// Tool execution strategy: true mirrors alkaid's `toolExecution: "parallel"`.
     pub parallel_tools: bool,
+    /// Optional mid-turn context-maintenance hook (Reasonix). Taken by
+    /// `run_continuation` and passed into the loop config; `None` by default.
+    pub prepare_next_turn: Option<Box<PrepareNextTurnFn<'static>>>,
 }
 
 impl Agent {
@@ -97,6 +100,7 @@ impl Agent {
             listeners: Vec::new(),
             session_id: None,
             parallel_tools: false,
+            prepare_next_turn: None,
         }
     }
 
@@ -242,6 +246,7 @@ impl Agent {
         let mut config = LoopConfig {
             get_steering_messages: Some(Box::new(move || steering.drain())),
             get_follow_up_messages: Some(Box::new(move || follow_up.drain())),
+            prepare_next_turn: self.prepare_next_turn.take(),
             timestamp,
             parallel: self.parallel_tools,
         };

@@ -983,7 +983,77 @@ impl SdkManager {
         } else {
             reasonix::message_with_slim_memory(&expanded_text, &memory)
         };
+        // Reasonix `activeTurnStart`: a resumed pending trajectory is active from
+        // index 0; otherwise the in-flight work starts after the prior history.
+        let active_turn_start = if resumed { 0usize } else { native_messages.len() };
         setup.turn_config.history = native_messages;
+
+        // --- Mid-turn context maintenance hook (Reasonix) ---
+        // Shares the slim memory with the post-turn logic via Arc<Mutex>; the
+        // hook runs inside the blocking loop between tool rounds.
+        let memory = std::sync::Arc::new(std::sync::Mutex::new(memory));
+        let active_turn_start = std::sync::Arc::new(std::sync::Mutex::new(active_turn_start));
+        let hook = {
+            let hook_memory = std::sync::Arc::clone(&memory);
+            let hook_active = std::sync::Arc::clone(&active_turn_start);
+            let hook_session = session_id.clone();
+            let hook_data_dir = data_dir.clone();
+            let hook_window = context_window;
+            let hook: Box<pi_core::agent::PrepareNextTurnFn<'static>> =
+                Box::new(move |message, tool_results, context| {
+                    if tool_results.is_empty() {
+                        return;
+                    }
+                    let measured =
+                        pi_core::context_tokens_from_messages(std::slice::from_ref(message));
+                    if measured == 0 {
+                        return;
+                    }
+                    let pressure = pi_core::context_pressure_tier(measured as f64, hook_window);
+                    let mut mem = hook_memory.lock().unwrap();
+                    mem.context_tokens = measured;
+                    mem.context_tier = pressure.to_string();
+                    let mut messages = context.messages.clone();
+                    let mut changed = false;
+                    if matches!(pressure, "snip" | "elide" | "force") {
+                        let (compacted, ch) =
+                            pi_core::compact_native_tool_results(&messages, pressure, 6);
+                        if ch {
+                            messages = compacted;
+                            changed = true;
+                        }
+                    }
+                    let mut active = hook_active.lock().unwrap();
+                    if pressure == "force" && *active > 0 {
+                        let mem_value = serde_json::to_value(&*mem).unwrap_or(Value::Null);
+                        let (rebased, ch) = pi_core::rebase_native_context_for_slim_memory(
+                            &messages,
+                            *active as i64,
+                            &mem_value,
+                        );
+                        if ch {
+                            messages = rebased;
+                            *active = 0;
+                            mem.context_stage = "slim".to_string();
+                            mem.full_messages = Vec::new();
+                            mem.context_tokens = 0;
+                            changed = true;
+                        }
+                    }
+                    if !changed {
+                        return;
+                    }
+                    context.messages = messages.clone();
+                    mem.rewrite_version += 1;
+                    mem.pending_messages = messages;
+                    let _ = crate::vega_reasonix::save_slim_memory(
+                        &hook_data_dir,
+                        &hook_session,
+                        &mem,
+                    );
+                });
+            hook
+        };
 
         // --- Run the turn ---
         let client = reqwest::Client::new();
@@ -993,8 +1063,12 @@ impl SdkManager {
             setup.turn_config,
             prompt_text,
             setup.native_tools,
+            Some(hook),
         )
         .await;
+
+        // Re-acquire the (possibly mid-turn-mutated) memory for post-turn logic.
+        let mut memory = memory.lock().unwrap();
 
         // --- Reasonix post-turn persistence ---
         match &turn_result {

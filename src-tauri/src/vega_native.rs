@@ -15,7 +15,7 @@
 //! final call site lands with the provider transport.
 #![allow(dead_code)]
 
-use pi_core::agent::{Agent, AgentState, StreamFn, StreamTurn, ToolFn};
+use pi_core::agent::{Agent, AgentState, PrepareNextTurnFn, StreamFn, StreamTurn, ToolFn};
 use pi_core::alkaid_config::{merge_config, parse_jsonc, resolve_model};
 use pi_core::bridge::ProtocolAccumulator;
 use pi_core::prompt::{build_system_prompt, ShellConfig, ShellKind};
@@ -61,6 +61,7 @@ pub fn run_native_turn(
     prompt_text: &str,
     stream_fn: &mut StreamFn,
     tool_fn: &mut ToolFn,
+    prepare_next_turn: Option<Box<PrepareNextTurnFn<'static>>>,
 ) -> NativeTurnOutput {
     let state = AgentState::new(
         &config.system_prompt,
@@ -71,6 +72,7 @@ pub fn run_native_turn(
     let mut agent = Agent::new(state, "all", "one-at-a-time");
     agent.parallel_tools = config.parallel_tools;
     agent.session_id = config.session_id;
+    agent.prepare_next_turn = prepare_next_turn;
 
     let events = agent.prompt(
         &Value::String(prompt_text.to_string()),
@@ -130,6 +132,7 @@ pub async fn run_native_turn_async(
     config: NativeTurnConfig,
     prompt_text: String,
     native_tools: pi_core::tools::NativeTools,
+    prepare_next_turn: Option<Box<PrepareNextTurnFn<'static>>>,
 ) -> Result<NativeTurnOutput, String> {
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
@@ -176,6 +179,7 @@ pub async fn run_native_turn_async(
             &prompt_text,
             &mut stream_fn,
             &mut tool_fn,
+            prepare_next_turn,
         ))
     })
     .await
@@ -228,9 +232,15 @@ pub async fn run_summary_turn_async(
         parallel_tools: false,
     };
     let native_tools = NativeTools::new(PathBuf::from("."));
-    let output =
-        run_native_turn_async(client, summary_provider, config, summary_prompt, native_tools)
-            .await?;
+    let output = run_native_turn_async(
+        client,
+        summary_provider,
+        config,
+        summary_prompt,
+        native_tools,
+        None,
+    )
+    .await?;
     // Concatenate the text of the final assistant message(s).
     let text = output
         .messages

@@ -479,6 +479,7 @@ fn parity_agent_loop() {
         let mut config = LoopConfig {
             get_steering_messages: None,
             get_follow_up_messages: None,
+            prepare_next_turn: None,
             timestamp: 9999,
             parallel,
         };

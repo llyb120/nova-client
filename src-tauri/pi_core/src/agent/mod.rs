@@ -11,4 +11,6 @@ pub mod run_loop;
 
 pub use agent::{Agent, AgentState, PendingMessageQueue};
 pub use messages::{create_error_tool_result, create_tool_result_message};
-pub use run_loop::{run_agent_loop, LoopConfig, LoopContext, StreamFn, StreamTurn, ToolFn};
+pub use run_loop::{
+    run_agent_loop, LoopConfig, LoopContext, PrepareNextTurnFn, StreamFn, StreamTurn, ToolFn,
+};

@@ -40,9 +40,19 @@ pub type StreamFn<'a> = dyn FnMut(usize, &Value) -> StreamTurn + 'a;
 /// Queued-message provider used for steering/follow-up injection.
 pub type QueueFn<'a> = dyn FnMut() -> Vec<Value> + 'a;
 
+/// Optional mid-turn context-maintenance hook (port of the JS Agent's
+/// `prepareNextTurnWithContext`). Called after a batch of tool results is
+/// appended to `context.messages` and before the next provider request, with
+/// the assistant `message` and the `tool_results`. It may mutate
+/// `context.messages` (e.g. compact tool results or rebase to slim memory).
+/// `None` (the default) leaves the loop unchanged.
+pub type PrepareNextTurnFn<'a> = dyn FnMut(&Value, &[Value], &mut LoopContext) + Send + 'a;
+
 pub struct LoopConfig<'a> {
     pub get_steering_messages: Option<Box<QueueFn<'a>>>,
     pub get_follow_up_messages: Option<Box<QueueFn<'a>>>,
+    /// Mid-turn context-maintenance hook; see [`PrepareNextTurnFn`].
+    pub prepare_next_turn: Option<Box<PrepareNextTurnFn<'a>>>,
     pub timestamp: u64,
     /// When true, a batch of tool calls emits all `tool_execution_start` events,
     /// runs the tools, emits all `tool_execution_end` events, then emits the
@@ -333,6 +343,14 @@ fn run_loop_body(
                 for result in &tool_results {
                     context.messages.push(result.clone());
                     new_messages.push(result.clone());
+                }
+            }
+
+            // Mid-turn context maintenance (Reasonix): compact/rebase the
+            // transcript between tool rounds, before the next provider request.
+            if !tool_results.is_empty() {
+                if let Some(hook) = config.prepare_next_turn.as_mut() {
+                    hook(&message, &tool_results, context);
                 }
             }
 
