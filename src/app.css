@@ -319,12 +319,15 @@ button {
 }
 
 .composer-btn.clue {
-  color: var(--text-dim);
+  color: var(--text-muted);
+  background: var(--bg-active);
+  border: 1px solid var(--border);
 }
 .composer-btn.clue:hover,
 .composer-btn.clue.active {
   color: var(--accent);
-  background: var(--accent-dim);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-active));
 }
 .clue-context-chip {
   display: inline-flex;

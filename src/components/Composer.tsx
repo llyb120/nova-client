@@ -14,20 +14,25 @@ import {
 } from "../promptQueue";
 import {
   cancelTurn,
+  clueCardById,
+  clueCurrentVersion,
+  closeThread,
   enabledAgentKinds,
   ensureModelOptions,
   ensurePeerModels,
+  openClueCard,
   pickThreadModel,
   refreshSlashCommands,
   sendPrompt,
   setThreadMode,
+  setView,
   state,
 } from "../store";
 import type { AgentKind, PromptImage } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
-import { IconFile, IconSend, IconStop, IconUndo, IconUsers } from "./icons";
+import { IconClue, IconFile, IconSend, IconStop, IconUndo, IconUsers } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
@@ -116,6 +121,23 @@ export function Composer() {
       !state.loadingThread &&
       !running() &&
       !state.items.some((item) => item.type === "user");
+  };
+  const activeClue = createMemo(() => {
+    const cardId = state.threads.find((item) => item.id === state.currentId)?.activeClueCardId;
+    if (!cardId) return null;
+    const card = clueCardById(cardId);
+    const version = card ? clueCurrentVersion(card) : undefined;
+    return { id: cardId, title: version?.title || "未命名线索" };
+  });
+  const openEvidenceChain = () => {
+    const clue = activeClue();
+    if (clue) {
+      openClueCard(clue.id);
+      return;
+    }
+    // ChatView 优先于 view：必须先关闭会话才能进入证据链页（与侧栏一致）。
+    closeThread();
+    setView("clues");
   };
   const pickEmployee = (employeeId: string | null) => {
     setSelectedEmployeeId(employeeId);
@@ -501,6 +523,16 @@ export function Composer() {
       <noteFlow.Notes />
       <ExclusiveChatMark token={state.roamingPeer || state.settings?.relayToken || ""} />
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
+      <Show when={activeClue()}>
+        {(clue) => (
+          <div class="clue-context-chip" title={`本会话引用线索：${clue().title}`}>
+            <IconClue size={13} />
+            <span class="clue-context-label">证据链</span>
+            <span class="clue-context-separator" aria-hidden="true" />
+            <span class="clue-context-title">{clue().title}</span>
+          </div>
+        )}
+      </Show>
       <Show when={currentQueuedPrompts().length > 0}>
         <div class="prompt-queue" aria-label="待发送提示词">
           <div class="prompt-queue-head">
@@ -637,6 +669,15 @@ export function Composer() {
           />
         </Show>
         <span class="bar-spacer" />
+        <button
+          type="button"
+          class="composer-btn clue"
+          classList={{ active: !!activeClue() }}
+          title={activeClue() ? "查看本会话证据链" : "打开证据链"}
+          onClick={openEvidenceChain}
+        >
+          <IconClue size={16} />
+        </button>
         <Show when={isNewOrdinaryThread() && state.employees.length > 0}>
           <div ref={employeePickerRef} class="composer-employee-picker">
             <Show when={employeeMenuOpen()}>
