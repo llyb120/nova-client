@@ -1,12 +1,14 @@
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent } from "../node_modules/@earendil-works/pi-agent-core/dist/agent.js";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import {
   createCodingTools,
   createReadOnlyTools,
+} from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js";
+import {
   formatSkillsForPrompt,
-  getShellConfig,
   loadSkillsFromDir,
-} from "@earendil-works/pi-coding-agent";
+} from "../node_modules/@earendil-works/pi-coding-agent/dist/core/skills.js";
+import { getShellConfig } from "../node_modules/@earendil-works/pi-coding-agent/dist/utils/shell.js";
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
