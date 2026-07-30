@@ -32,6 +32,7 @@ mod time_machine;
 mod updater;
 mod vega_native;
 mod vega_provider;
+mod vega_reasonix;
 #[cfg(windows)]
 mod windows_shell_shim;
 

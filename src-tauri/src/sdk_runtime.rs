@@ -798,7 +798,9 @@ impl SdkManager {
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
-        let prompt_text = parts
+        use crate::vega_reasonix as reasonix;
+
+        let input_text = parts
             .iter()
             .filter_map(|part| part.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
@@ -807,27 +809,182 @@ impl SdkManager {
         let server_config = self.alkaid_server_config.lock().unwrap().clone();
         let selection = model_selection.unwrap_or("").to_string();
         let read_only = mode == "plan";
-        // Session-history continuity is not yet mapped from the thread store; the
-        // native turn starts from an empty transcript (documented gap).
-        let setup = crate::vega_native::prepare_native_turn(
+
+        // Resolve config/model/skills/tools with an empty transcript; the
+        // Reasonix decisions below fill in the real history and prompt prefix.
+        let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mut setup = crate::vega_native::prepare_native_turn(
             &data_dir,
             cwd,
             server_config.as_ref(),
             &selection,
             Vec::new(),
-            session_id,
+            Some(session_id.clone()),
             read_only,
         )?;
-        let prompt_text = pi_core::expand_skill_command(&prompt_text, &setup.skills);
+        let expanded_text = pi_core::expand_skill_command(&input_text, &setup.skills);
+
+        // --- Reasonix pre-turn context management ---
+        let mut memory = reasonix::load_slim_memory(&data_dir, &session_id);
+        if memory.digests.is_empty() && memory.turns.is_empty() {
+            let legacy = reasonix::load_legacy_messages(&data_dir, &session_id);
+            if !legacy.is_empty() {
+                pi_core::seed_slim_memory_from_messages(&mut memory, &legacy);
+            }
+        }
+        let mode_kind = if read_only { "plan" } else { "agent" };
+        let fingerprint = reasonix::stable_hash(&json!({ "cwd": cwd, "mode": mode_kind }));
+        if !memory.system_fingerprint.is_empty() && memory.system_fingerprint != fingerprint {
+            memory.system_prompt_snapshot = String::new();
+            memory.rewrite_version += 1;
+        }
+        memory.system_fingerprint = fingerprint;
+
+        let context_window = setup
+            .turn_config
+            .model
+            .get("contextWindow")
+            .and_then(Value::as_f64)
+            .unwrap_or(128_000.0)
+            .max(2_000.0);
+        let _max_context_tokens = ((context_window * 0.75).floor() as u64).max(2_000);
+        let force_context_tokens = ((context_window * 0.9).floor() as u64).max(2_000);
+        let max_context_chars = ((force_context_tokens * 4).max(8_000)) as usize;
+        let pressure = pi_core::context_pressure_tier(memory.context_tokens as f64, context_window);
+        if memory.context_stage == "full" && matches!(pressure, "snip" | "elide" | "force") {
+            let (compacted, changed) =
+                pi_core::compact_native_tool_results(&memory.full_messages, pressure, 6);
+            if changed {
+                memory.full_messages = compacted;
+                memory.rewrite_version += 1;
+            }
+        }
+        memory.context_tier = pressure.to_string();
+        let use_full_context =
+            pi_core::should_use_full_context(&memory, force_context_tokens, Some(max_context_chars));
+        if !use_full_context && memory.context_stage == "full" {
+            memory.context_stage = "slim".to_string();
+            memory.context_tokens = 0;
+            memory.full_messages = Vec::new();
+            memory.rewrite_version += 1;
+        }
+        memory.append_turn(&input_text);
+        // NOTE: `compactSlimMemory` (folding old turns into an LLM digest) is the
+        // one Reasonix step not yet wired here: its `summarize` callback is an
+        // async native turn that needs the plan/apply split around the LLM call.
+        // The deterministic context management above is fully active; digest
+        // compaction is the documented remaining piece.
+
+        // Freeze/record the system prompt snapshot for cache stability.
+        if !memory.system_prompt_snapshot.is_empty() {
+            setup.turn_config.system_prompt = memory.system_prompt_snapshot.clone();
+        } else {
+            memory.system_prompt_snapshot = setup.turn_config.system_prompt.clone();
+        }
+
+        let api = setup.provider.api.clone();
+        let strips_reasoning = api.starts_with("openai") || api == "azure-openai-responses";
+        let resumed = !memory.pending_messages.is_empty();
+        let mut native_messages = if resumed {
+            memory.pending_messages.clone()
+        } else if use_full_context {
+            memory.full_messages.clone()
+        } else {
+            Vec::new()
+        };
+        if strips_reasoning {
+            native_messages = pi_core::strip_completed_openai_reasoning(&native_messages);
+        }
+        // Pending checkpoint (prior transcript + the new user turn) for resume.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        memory.pending_messages =
+            reasonix::messages_with_pending_prompt(&native_messages, &input_text, &[], timestamp);
+        let _ = reasonix::save_slim_memory(&data_dir, &session_id, &memory);
+
+        let prompt_text = if use_full_context {
+            expanded_text.clone()
+        } else {
+            reasonix::message_with_slim_memory(&expanded_text, &memory)
+        };
+        setup.turn_config.history = native_messages;
+
+        // --- Run the turn ---
         let client = reqwest::Client::new();
-        let output = crate::vega_native::run_native_turn_async(
+        let turn_result = crate::vega_native::run_native_turn_async(
             client,
             setup.provider,
             setup.turn_config,
             prompt_text,
             setup.native_tools,
         )
-        .await?;
+        .await;
+
+        // --- Reasonix post-turn persistence ---
+        match &turn_result {
+            Ok(output) => {
+                let final_messages = output.messages.clone();
+                let last = final_messages.last();
+                let completed = last.map_or(false, |m| {
+                    m.get("role").and_then(Value::as_str) == Some("assistant")
+                        && m.get("stopReason").and_then(Value::as_str) != Some("error")
+                });
+                if completed {
+                    if let Some(last) = last {
+                        memory.set_latest_conclusion(&last.get("content").cloned().unwrap_or(Value::Null));
+                    }
+                    memory.pending_messages = Vec::new();
+                    let measured = pi_core::context_tokens_from_messages(&final_messages);
+                    if memory.context_stage == "full" {
+                        memory.context_tokens = measured;
+                        let below_capacity = if measured > 0 {
+                            measured < force_context_tokens
+                        } else {
+                            serde_json::to_string(&final_messages).map_or(true, |s| s.len() < max_context_chars)
+                        };
+                        if below_capacity {
+                            let mut completed_messages = final_messages.clone();
+                            if strips_reasoning {
+                                completed_messages =
+                                    pi_core::strip_completed_openai_reasoning(&completed_messages);
+                            }
+                            let pressure2 =
+                                pi_core::context_pressure_tier(measured as f64, context_window);
+                            let (compacted, changed) =
+                                pi_core::compact_native_tool_results(&completed_messages, pressure2, 6);
+                            memory.full_messages = compacted;
+                            memory.context_tier = pressure2.to_string();
+                            if changed {
+                                memory.rewrite_version += 1;
+                            }
+                        } else {
+                            memory.context_stage = "slim".to_string();
+                            memory.context_tier = "force".to_string();
+                            memory.context_tokens = 0;
+                            memory.full_messages = Vec::new();
+                            memory.rewrite_version += 1;
+                        }
+                    } else {
+                        memory.context_tokens = measured;
+                        memory.full_messages = Vec::new();
+                    }
+                } else {
+                    // Provider error surfaced as an assistant error message: keep
+                    // the trajectory as pending so the next turn can resume it.
+                    memory.pending_messages = final_messages;
+                }
+                let _ = reasonix::save_slim_memory(&data_dir, &session_id, &memory);
+            }
+            Err(_) => {
+                // Failed before/without a transcript update: the pre-turn pending
+                // checkpoint already on disk stands. Re-persist defensively.
+                let _ = reasonix::save_slim_memory(&data_dir, &session_id, &memory);
+            }
+        }
+
+        let output = turn_result?;
         if !self.is_current_run(thread_id, run_epoch) {
             return Ok(());
         }
