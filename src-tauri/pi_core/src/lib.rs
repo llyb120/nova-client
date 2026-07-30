@@ -17,6 +17,9 @@ pub mod paths;
 pub mod payload;
 pub mod prompt;
 pub mod provider;
+pub mod provider_anthropic;
+pub mod provider_google;
+pub mod provider_responses;
 pub mod read;
 pub mod skills;
 pub mod skills_discovery;
@@ -24,6 +27,7 @@ pub mod slim_memory;
 pub mod smart_edit;
 pub mod text;
 pub mod tools;
+pub mod transform;
 pub mod truncate;
 pub mod write;
 

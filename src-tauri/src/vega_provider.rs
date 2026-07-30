@@ -5,9 +5,8 @@
 //! and SSE folding live in `pi_core::provider` (unit-tested); this module adds
 //! the thin async HTTP layer using `reqwest` and the shared `SseDecoder`.
 //!
-//! Currently implements `openai-completions` (Chat Completions), the dominant
-//! Vega provider API. Other protocols (`openai-responses`, `anthropic-messages`,
-//! `google-generative-ai`) are extension points returning an explicit error.
+//! Currently implements `openai-completions` (Chat Completions),
+//! `anthropic-messages`, `openai-responses`, and `google-generative-ai`.
 //!
 //! The transport collects the full stream and returns a `StreamTurn`; the agent
 //! loop then replays the events. Progressive per-token UI streaming would
@@ -18,6 +17,9 @@ use pi_core::payload::{
     clamp_openai_payload_tool_outputs, inject_openai_prompt_cache_key,
 };
 use pi_core::provider::{build_openai_chat_request, OpenAiChatAccumulator};
+use pi_core::provider_anthropic::{build_anthropic_request, AnthropicAccumulator};
+use pi_core::provider_google::{build_google_request, GoogleAccumulator};
+use pi_core::provider_responses::{build_openai_responses_request, ResponsesAccumulator};
 use pi_core::text::OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS;
 use serde_json::Value;
 
@@ -47,6 +49,16 @@ pub async fn stream_turn(
     match config.api.as_str() {
         "openai-completions" => {
             stream_openai_chat(client, config, system_prompt, messages, tools, session_id).await
+        }
+        "anthropic-messages" => {
+            stream_anthropic(client, config, system_prompt, messages, tools, session_id).await
+        }
+        "openai-responses" => {
+            stream_openai_responses(client, config, system_prompt, messages, tools, session_id)
+                .await
+        }
+        "google-generative-ai" => {
+            stream_google(client, config, system_prompt, messages, tools).await
         }
         other => Err(format!(
             "native Vega transport does not yet implement provider api: {other}"
@@ -96,6 +108,213 @@ async fn stream_openai_chat(
         OpenAiChatAccumulator::new(&config.model_id, &config.provider, &config.api);
 
     let feed = |accumulator: &mut OpenAiChatAccumulator, events: Vec<String>| {
+        for event in events {
+            let trimmed = event.trim();
+            if trimmed.is_empty() || trimmed == "[DONE]" {
+                continue;
+            }
+            if let Ok(json) = decode_sse_json(trimmed) {
+                accumulator.add_chunk(&json);
+            }
+        }
+    };
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("Vega provider stream error: {error}"))?
+    {
+        let events = decoder.push(&chunk).map_err(|error| error.to_string())?;
+        feed(&mut accumulator, events);
+    }
+    let events = decoder.finish().map_err(|error| error.to_string())?;
+    feed(&mut accumulator, events);
+
+    Ok(accumulator.finish())
+}
+
+/// Anthropic Messages transport: POST `{baseUrl}/v1/messages`, SSE with a
+/// `type` field per event. Auth via `x-api-key` + `anthropic-version`.
+async fn stream_anthropic(
+    client: &reqwest::Client,
+    config: &ProviderConfig,
+    system_prompt: &str,
+    messages: &[Value],
+    tools: &[Value],
+    session_id: Option<&str>,
+) -> Result<StreamTurn, String> {
+    let model = serde_json::json!({
+        "id": config.model_id,
+        "provider": config.provider,
+        "api": config.api,
+    });
+    let body = build_anthropic_request(&model, system_prompt, messages, tools, session_id);
+
+    let url = format!("{}/v1/messages", config.base_url.trim_end_matches('/'));
+    let mut request = client
+        .post(&url)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body);
+    if let Some(key) = &config.api_key {
+        request = request.header("x-api-key", key);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| format!("Vega provider request failed: {error}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Vega provider error {status}: {text}"));
+    }
+
+    let mut decoder = SseDecoder::new();
+    let mut accumulator =
+        AnthropicAccumulator::new(&config.model_id, &config.provider, &config.api);
+
+    let feed = |accumulator: &mut AnthropicAccumulator, events: Vec<String>| {
+        for event in events {
+            let trimmed = event.trim();
+            if trimmed.is_empty() || trimmed == "[DONE]" {
+                continue;
+            }
+            if let Ok(json) = decode_sse_json(trimmed) {
+                accumulator.add_event(&json);
+            }
+        }
+    };
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("Vega provider stream error: {error}"))?
+    {
+        let events = decoder.push(&chunk).map_err(|error| error.to_string())?;
+        feed(&mut accumulator, events);
+    }
+    let events = decoder.finish().map_err(|error| error.to_string())?;
+    feed(&mut accumulator, events);
+
+    Ok(accumulator.finish())
+}
+
+/// OpenAI Responses transport: POST `{baseUrl}/responses`, SSE with a `type`
+/// field per event. Bearer auth.
+async fn stream_openai_responses(
+    client: &reqwest::Client,
+    config: &ProviderConfig,
+    system_prompt: &str,
+    messages: &[Value],
+    tools: &[Value],
+    session_id: Option<&str>,
+) -> Result<StreamTurn, String> {
+    let model = serde_json::json!({
+        "id": config.model_id,
+        "provider": config.provider,
+        "api": config.api,
+    });
+    let body = build_openai_responses_request(&model, system_prompt, messages, tools, session_id);
+
+    let url = format!("{}/responses", config.base_url.trim_end_matches('/'));
+    let mut request = client.post(&url).json(&body);
+    if let Some(key) = &config.api_key {
+        request = request.bearer_auth(key);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| format!("Vega provider request failed: {error}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Vega provider error {status}: {text}"));
+    }
+
+    let mut decoder = SseDecoder::new();
+    let mut accumulator =
+        ResponsesAccumulator::new(&config.model_id, &config.provider, &config.api);
+
+    let feed = |accumulator: &mut ResponsesAccumulator, events: Vec<String>| {
+        for event in events {
+            let trimmed = event.trim();
+            if trimmed.is_empty() || trimmed == "[DONE]" {
+                continue;
+            }
+            if let Ok(json) = decode_sse_json(trimmed) {
+                accumulator.add_event(&json);
+            }
+        }
+    };
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("Vega provider stream error: {error}"))?
+    {
+        let events = decoder.push(&chunk).map_err(|error| error.to_string())?;
+        feed(&mut accumulator, events);
+    }
+    let events = decoder.finish().map_err(|error| error.to_string())?;
+    feed(&mut accumulator, events);
+
+    Ok(accumulator.finish())
+}
+
+/// Google Generative AI transport: POST
+/// `{baseUrl}/v1beta/models/{model}:streamGenerateContent?alt=sse`, SSE chunks.
+/// Auth via `x-goog-api-key`.
+async fn stream_google(
+    client: &reqwest::Client,
+    config: &ProviderConfig,
+    system_prompt: &str,
+    messages: &[Value],
+    tools: &[Value],
+) -> Result<StreamTurn, String> {
+    let model = serde_json::json!({
+        "id": config.model_id,
+        "provider": config.provider,
+        "api": config.api,
+    });
+    let body = build_google_request(&model, system_prompt, messages, tools);
+    // The request builder returns { model, contents, config }; the HTTP body is
+    // { contents, ...config } with systemInstruction/tools/thinkingConfig lifted.
+    let contents = body.get("contents").cloned().unwrap_or(serde_json::json!([]));
+    let config_obj = body.get("config").cloned().unwrap_or(serde_json::json!({}));
+    let mut http_body = serde_json::json!({ "contents": contents });
+    if let (Some(obj), Some(cfg)) = (http_body.as_object_mut(), config_obj.as_object()) {
+        for (key, value) in cfg {
+            obj.insert(key.clone(), value.clone());
+        }
+    }
+
+    let base = config.base_url.trim_end_matches('/');
+    let url = if base.contains("/v1beta") || base.contains("/v1") {
+        format!("{}/models/{}:streamGenerateContent?alt=sse", base, config.model_id)
+    } else {
+        format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, config.model_id)
+    };
+    let mut request = client.post(&url).json(&http_body);
+    if let Some(key) = &config.api_key {
+        request = request.header("x-goog-api-key", key);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| format!("Vega provider request failed: {error}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Vega provider error {status}: {text}"));
+    }
+
+    let mut decoder = SseDecoder::new();
+    let mut accumulator =
+        GoogleAccumulator::new(&config.model_id, &config.provider, &config.api);
+
+    let feed = |accumulator: &mut GoogleAccumulator, events: Vec<String>| {
         for event in events {
             let trimmed = event.trim();
             if trimmed.is_empty() || trimmed == "[DONE]" {
