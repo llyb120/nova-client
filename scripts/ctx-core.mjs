@@ -80,8 +80,11 @@ export function contextBundle({ keywords, budget = 700, ctx = 12, maxFiles = 12 
   out.push('');
 
   let used = 0;
+  const coveredHit = [];
+  const neighborList = [];
   const assemble = (f, tag) => {
     if (!existsSync(`${root}/${f}`)) return;
+    coveredHit.push(f);
     const lines = fileLines(root, f);
     const total = lines.length;
     out.push(`----- [${tag}] ${f}  (${total} 行) -----`);
@@ -109,6 +112,7 @@ export function contextBundle({ keywords, budget = 700, ctx = 12, maxFiles = 12 
   out.push('# ===== 1 跳扩展文件(仅大纲) =====');
   for (const f of extra) {
     if (!existsSync(`${root}/${f}`)) continue;
+    neighborList.push(f);
     if (used >= budget) { out.push('(预算耗尽, 剩余邻居仅列名于末尾)'); break; }
     out.push(`----- [NEIGHBOR] ${f} -----`);
     rgSym(root, f).split('\n').slice(0, 30).forEach(l => out.push('  ' + cleanSym(l)));
@@ -118,6 +122,19 @@ export function contextBundle({ keywords, budget = 700, ctx = 12, maxFiles = 12 
 
   out.push('# ===== 未展开文件(可追加) =====');
   for (const [f] of ranked.slice(maxFiles)) out.push(`    ${f}`);
+
+  out.push('', '# ===== 使用约束（必读 / USAGE CONSTRAINT — read this）=====');
+  out.push('以下 [HIT] 文件已提供符号大纲 + 关键命中段，等同于已读取：');
+  for (const f of coveredHit) out.push(`  - ${f}`);
+  out.push('禁止对上述 [HIT] 文件再调用 read / read_files 读取全文或已展示的行段；直接基于以上内容作答或编辑。');
+  out.push('若确需 [HIT] 文件未展示的行范围，按全局 read/read_files 规则只读缺失段：单个文件用 read 带 offset/limit，两个及以上合并为一次 read_files 并各自带 offset/limit；不得读全文。');
+  out.push('[NEIGHBOR] 文件仅含大纲，需要其实现细节时可按需读取；未展开文件同理。');
+  out.push('判定步骤：调用 read/read_files 前，先核对目标路径是否在上列 [HIT] 清单中；若在，跳过读取。');
+  out.push('若以上上下文仍不足，优先用更大 budget 重新调用 context_bundle，而非逐文件 read。');
+  out.push('The [HIT] files listed above already include symbol outlines + key hit segments and count as READ.');
+  out.push('Do NOT call read/read_files on them for full text or already-shown ranges; answer/edit from the content above.');
+  out.push('If you need an unseen range of [HIT] files, read only the missing segments per the global read/read_files rule: use read with offset/limit for a single file, or merge two or more into one read_files call with per-file offset/limit; never read the whole file.');
+  out.push('Before any read/read_files, check whether the target path is in the [HIT] list above; if yes, skip the read.');
   return out.join('\n');
 }
 
@@ -152,7 +169,7 @@ export function findSymbol({ name }, root = repoRoot()) {
 export const TOOLS = [
   {
     name: 'context_bundle',
-    description: '按关键词/符号一次性打包相关代码上下文(命中文件分层装配 + 1跳调用邻居)。用于在分析/修改前快速获取代码全貌, 减少逐步读取。',
+    description: '按关键词/符号一次性打包相关代码上下文(命中文件分层装配 + 1跳调用邻居)。输出末尾的 [HIT] 清单等同于已读取，禁止对这些文件再 read/read_files。用于在分析/修改前快速获取代码全貌, 减少逐步读取。',
     inputSchema: {
       type: 'object',
       properties: {

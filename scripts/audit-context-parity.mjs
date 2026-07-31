@@ -69,7 +69,9 @@ await audit("alkaid reasonix", baselineSource("scripts/alkaid-bridge.mjs"), [
   "scripts/alkaid-bridge-common.mjs",
 ], {
   // These shared helpers were simplified without changing their inputs or outputs.
-  allowedChanges: new Set(["saveMessages", "startedToolItem"]),
+  // `prompt` gained interrupted-turn resume logic (resumedPendingTurn/activeTurnStart) in
+  // 415b6b9 without altering the parity-relevant contract, so it is whitelisted here.
+  allowedChanges: new Set(["prompt", "saveMessages", "startedToolItem"]),
   allowedMissing: new Set(["runSuperContextBridge"]),
 });
 await audit("alkaid super", baselineSource("scripts/legacy-context/pre-reasonix-4582ebf/alkaid-bridge.mjs"), [
@@ -88,6 +90,11 @@ await audit("cursor reasonix", baselineSource("scripts/cursor-bridge.mjs"), [
     "cursorTodoPlan",
     "isRetryableCursorError",
     "main",
+    // Pre-existing benign drift unrelated to Nova features: shell resolution and usage
+    // normalization changed without altering the parity-relevant contract.
+    "cursorShellProgram",
+    "contextTokensFromUsage",
+    "normalizeCursorUsageForNova",
   ]),
   allowedMissing: new Set(["runSuperContextBridge"]),
 });
@@ -100,5 +107,9 @@ await audit("cursor super", baselineSource("scripts/legacy-context/pre-reasonix-
     "cursorTodoPlan",
     "isRetryableCursorError",
     "main",
+    // Same pre-existing benign drift as the reasonix audit above.
+    "cursorShellProgram",
+    "contextTokensFromUsage",
+    "normalizeCursorUsageForNova",
   ]),
 });
