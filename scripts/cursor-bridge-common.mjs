@@ -101,6 +101,47 @@ function installWindowsShellSpawnGuard() {
 
 installWindowsShellSpawnGuard();
 
+/** Cursor SDK NAL stall detector aborts with DOMException AbortError; that can escape the
+ *  awaited run chain on a timer and kill the bridge process before turn-level retry runs. */
+export function isCursorStallAbortError(error) {
+  const seen = new Set();
+  let current = error;
+  while (current && !seen.has(current)) {
+    if (typeof current !== "object") {
+      return /This operation was aborted/i.test(String(current));
+    }
+    seen.add(current);
+    if (String(current.name ?? "") === "AbortError") return true;
+    // DOMException.ABORT_ERR === 20
+    if (current.code === 20 || String(current.code ?? "") === "20") return true;
+    const text = String(current.message ?? current.rawMessage ?? "");
+    if (/This operation was aborted/i.test(text)) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+function installCursorStallAbortGuard() {
+  // Tests import bridge modules; do not override Node's default crash behavior there.
+  if (process.env.NOVA_CURSOR_BRIDGE_TEST === "1") return;
+  if (globalThis.__novaCursorStallAbortGuardInstalled) return;
+  globalThis.__novaCursorStallAbortGuardInstalled = true;
+
+  process.on("unhandledRejection", (reason) => {
+    if (isCursorStallAbortError(reason)) return;
+    process.stderr.write(`Unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}\n`);
+    process.exit(1);
+  });
+
+  process.on("uncaughtException", (error) => {
+    if (isCursorStallAbortError(error)) return;
+    process.stderr.write(`Uncaught exception: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}
+
+installCursorStallAbortGuard();
+
 export function createMessageState() {
   return {
     activeTextType: null,

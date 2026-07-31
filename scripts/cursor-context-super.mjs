@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { Agent } from "@cursor/sdk";
-import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isEditFilesTool, mapDelta, mapMessage, modelOptions, modelSelection } from "./cursor-bridge-common.mjs";
+import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isCursorStallAbortError, isEditFilesTool, mapDelta, mapMessage, modelOptions, modelSelection } from "./cursor-bridge-common.mjs";
 import { createCursorFilesystemTools, cursorPromptPrefix } from "./cursor-filesystem-tools.mjs";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -12,6 +12,7 @@ const TERMINAL_RUN_STATUSES = new Set(["completed", "finished", "error", "failed
 const CURSOR_STARTUP_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_STARTUP_TIMEOUT_MS, 120_000);
 const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_TIMEOUT_MS, 15_000);
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
+const CURSOR_SILENT_RETRY_DELAYS_MS = [1_000, 3_000];
 const CURSOR_CREATE_RETRY_DELAYS_MS = [1_000, 3_000, 7_000];
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
 const CURSOR_SLIM_MEMORY_TURNS = positiveInteger(process.env.NOVA_CURSOR_SLIM_MEMORY_TURNS, 10);
@@ -67,6 +68,8 @@ function contextThresholdsForModel(model) {
 }
 
 function isRetryableCursorError(error) {
+  // SDK stall detector / AbortController.abort() → DOMException AbortError.
+  if (isCursorStallAbortError(error)) return true;
   const seen = new Set();
   const details = [];
   let current = error;
@@ -1070,6 +1073,8 @@ async function main() {
           }
           attemptActive = false;
           const continueAfterOutput = producedOutput;
+          const retryDelayMs = CURSOR_SILENT_RETRY_DELAYS_MS[attempt]
+            ?? CURSOR_SILENT_RETRY_DELAYS_MS.at(-1);
           // Match a manual "go on": persist the interrupted trajectory, then continue from it.
           if (continueAfterOutput) {
             await preserveActiveTurn?.();
@@ -1080,9 +1085,17 @@ async function main() {
           }
           sendTiming("silent_retry", turnStartedAt, {
             attempt: attempt + 1,
-            reason: error instanceof CursorStartupTimeout ? "startup_timeout" : "retryable_error",
+            delayMs: retryDelayMs,
+            reason: error instanceof CursorStartupTimeout
+              ? "startup_timeout"
+              : isCursorStallAbortError(error)
+                ? "stall_abort"
+                : "retryable_error",
             continueWith: continueAfterOutput ? "go_on" : "same_prompt",
           });
+          if (retryDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+          }
           const recovery = await recoverTimedOutAgent(
             agent,
             activeRun,

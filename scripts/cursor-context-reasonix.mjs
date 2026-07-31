@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { Agent } from "@cursor/sdk";
-import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isEditFilesTool, mapDelta, mapMessage, modelOptions, modelSelection } from "./cursor-bridge-common.mjs";
+import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isCursorStallAbortError, isEditFilesTool, mapDelta, mapMessage, modelOptions, modelSelection } from "./cursor-bridge-common.mjs";
 import { createCursorFilesystemTools, cursorPromptPrefix } from "./cursor-filesystem-tools.mjs";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -74,6 +74,8 @@ function positiveInteger(value, fallback) {
 }
 
 function isRetryableCursorError(error) {
+  // SDK stall detector / AbortController.abort() → DOMException AbortError.
+  if (isCursorStallAbortError(error)) return true;
   const seen = new Set();
   const details = [];
   let current = error;
@@ -1187,7 +1189,11 @@ async function main() {
           sendTiming("silent_retry", turnStartedAt, {
             attempt: attempt + 1,
             delayMs: retryDelayMs,
-            reason: error instanceof CursorStartupTimeout ? "startup_timeout" : "retryable_error",
+            reason: error instanceof CursorStartupTimeout
+              ? "startup_timeout"
+              : isCursorStallAbortError(error)
+                ? "stall_abort"
+                : "retryable_error",
             continueWith: continueAfterOutput ? "go_on" : "same_prompt",
           });
           if (retryDelayMs > 0) {

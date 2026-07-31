@@ -330,6 +330,15 @@ assert.equal(isRetryableCursorError({
     code: "ERR_HTTP2_STREAM_ERROR",
   }),
 }), true);
+const stallAbort = new DOMException("This operation was aborted", "AbortError");
+assert.equal(isRetryableCursorError(stallAbort), true);
+assert.equal(shouldSilentRetryCursorTurn(stallAbort, { producedOutput: false, attempt: 0 }), true);
+assert.equal(shouldSilentRetryCursorTurn(stallAbort, { producedOutput: true, attempt: 0 }), true);
+assert.equal(shouldSilentRetryCursorTurn(stallAbort, { producedOutput: false, attempt: 2 }), false);
+assert.equal(isRetryableCursorError({
+  message: "wrapper",
+  cause: stallAbort,
+}), true);
 assert.equal(shouldSilentRetryCursorTurn(
   Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
   { producedOutput: false, attempt: 0 },

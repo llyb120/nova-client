@@ -83,10 +83,22 @@ await audit("cursor reasonix", baselineSource("scripts/cursor-bridge.mjs"), [
   "scripts/cursor-context-reasonix.mjs",
   "scripts/cursor-bridge-common.mjs",
 ], {
-  allowedChanges: new Set(["installWindowsShellSpawnGuard", "cursorTodoPlan"]),
+  allowedChanges: new Set([
+    "installWindowsShellSpawnGuard",
+    "cursorTodoPlan",
+    "isRetryableCursorError",
+    "main",
+  ]),
   allowedMissing: new Set(["runSuperContextBridge"]),
 });
 await audit("cursor super", baselineSource("scripts/legacy-context/pre-reasonix-4582ebf/cursor-bridge.mjs"), [
   "scripts/cursor-context-super.mjs",
   "scripts/cursor-bridge-common.mjs",
-], { allowedChanges: new Set(["installWindowsShellSpawnGuard", "cursorTodoPlan"]) });
+], {
+  allowedChanges: new Set([
+    "installWindowsShellSpawnGuard",
+    "cursorTodoPlan",
+    "isRetryableCursorError",
+    "main",
+  ]),
+});
