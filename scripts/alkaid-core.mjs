@@ -16,6 +16,7 @@ import { createReadStream, existsSync } from "node:fs";
 import { access, mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
+import { contextBundle, findSymbol } from "./ctx-core.mjs";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
@@ -539,6 +540,31 @@ export function createFilesystemTools(cwd, editTool = null) {
       },
     },
   ];
+  tools.push(
+    {
+      name: "context_bundle",
+      description: "按关键词/符号一次性打包相关代码上下文：命中文件按相关度分层装配（小文件全文、大文件给符号大纲+命中段），并附 1 跳调用邻居大纲。用于在分析或修改前快速获取代码全貌，避免逐文件试探式读取。基于 git grep + rg，无需预建索引。",
+      parameters: Type.Object({
+        keywords: Type.Array(Type.String(), { minItems: 1, description: "关键词或符号名列表" }),
+        budget: Type.Optional(Type.Integer({ minimum: 100, maximum: 4000, description: "总行数预算，默认 700" })),
+        ctx: Type.Optional(Type.Integer({ minimum: 0, maximum: 60, description: "命中行上下文半径，默认 12" })),
+        maxFiles: Type.Optional(Type.Integer({ minimum: 1, maximum: 40, description: "核心命中文件上限，默认 12" })),
+      }),
+      async execute(_id, params) {
+        return textResult(contextBundle(params ?? {}, root));
+      },
+    },
+    {
+      name: "find_symbol",
+      description: "快速定位符号在仓库中的所有出现位置（文件:行号），基于 git grep。用于在读取/修改前确认符号分布。",
+      parameters: Type.Object({
+        name: Type.String({ description: "符号名" }),
+      }),
+      async execute(_id, params) {
+        return textResult(findSymbol(params ?? {}, root));
+      },
+    },
+  );
   if (editTool) {
     tools.push({
       name: "edit_files",

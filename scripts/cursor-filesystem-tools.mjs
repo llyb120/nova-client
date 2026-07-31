@@ -1,6 +1,7 @@
 import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { contextBundle, findSymbol } from "./ctx-core.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -79,7 +80,8 @@ const PATH_OR_RANGE_SCHEMA = {
 
 /**
  * Vega-style batch FS tools for Cursor SDK `local.customTools`.
- * Only exposes read_files — edit_files is intentionally omitted because Cursor
+ * Exposes read_files plus code-context tools (context_bundle, find_symbol).
+ * edit_files is intentionally omitted because Cursor
  * CallMcpTool truncates/mangles large or heavily-escaped arguments.
  * Use Cursor built-in Write / StrReplace / Edit for mutations.
  */
@@ -119,6 +121,35 @@ export function createCursorFilesystemTools(cwd, options = {}) {
           }
         }));
         return JSON.stringify(results);
+      },
+    },
+    context_bundle: {
+      description: "按关键词/符号一次性打包相关代码上下文：命中文件按相关度分层装配（小文件全文、大文件给符号大纲+命中段），并附 1 跳调用邻居大纲。用于在分析或修改前快速获取代码全貌，避免逐文件试探式读取。基于 git grep + rg，无需预建索引。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          keywords: { type: "array", minItems: 1, items: { type: "string" }, description: "关键词或符号名列表" },
+          budget: { type: "integer", minimum: 100, maximum: 4000, description: "总行数预算，默认 700" },
+          ctx: { type: "integer", minimum: 0, maximum: 60, description: "命中行上下文半径，默认 12" },
+          maxFiles: { type: "integer", minimum: 1, maximum: 40, description: "核心命中文件上限，默认 12" },
+        },
+        required: ["keywords"],
+        additionalProperties: false,
+      },
+      async execute(params) {
+        return contextBundle(params ?? {}, root);
+      },
+    },
+    find_symbol: {
+      description: "快速定位符号在仓库中的所有出现位置（文件:行号），基于 git grep。用于在读取/修改前确认符号分布。",
+      inputSchema: {
+        type: "object",
+        properties: { name: { type: "string", description: "符号名" } },
+        required: ["name"],
+        additionalProperties: false,
+      },
+      async execute(params) {
+        return findSymbol(params ?? {}, root);
       },
     },
   };
