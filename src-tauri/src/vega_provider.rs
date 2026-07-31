@@ -46,6 +46,62 @@ pub async fn stream_turn(
     tools: &[Value],
     session_id: Option<&str>,
 ) -> Result<StreamTurn, String> {
+    // Port of alkaid's provider retry: transient/network errors are retried with
+    // backoff delays [1000, 3000]ms (up to 2 retries), matching
+    // `runAlkaidPromptWithRetry` + `DEFAULT_PROVIDER_RETRY_DELAYS_MS`.
+    const RETRY_DELAYS_MS: [u64; 2] = [1000, 3000];
+    let mut attempt = 0;
+    loop {
+        match stream_turn_once(client, config, system_prompt, messages, tools, session_id).await {
+            Ok(turn) => return Ok(turn),
+            Err(error) => {
+                if attempt < RETRY_DELAYS_MS.len() && is_retryable_provider_error(&error) {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAYS_MS[attempt]))
+                        .await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Port of `isRetryableAlkaidProviderError`: substring match on the error text.
+pub fn is_retryable_provider_error(error: &str) -> bool {
+    const FRAGMENTS: &[&str] = &[
+        "terminated",
+        "fetch failed",
+        "connection error",
+        "socket hang up",
+        "econnreset",
+        "etimedout",
+        "econnaborted",
+        "epipe",
+        "request timed out",
+        "und_err_socket",
+        "premature close",
+        "other side closed",
+        "network connection lost",
+        "stream ended before a terminal response event",
+        "stream ended without finish_reason",
+        "idle timeout",
+        "429",
+        "too many requests",
+        "rate limit",
+    ];
+    let message = error.to_lowercase();
+    FRAGMENTS.iter().any(|fragment| message.contains(fragment))
+}
+
+async fn stream_turn_once(
+    client: &reqwest::Client,
+    config: &ProviderConfig,
+    system_prompt: &str,
+    messages: &[Value],
+    tools: &[Value],
+    session_id: Option<&str>,
+) -> Result<StreamTurn, String> {
     match config.api.as_str() {
         "openai-completions" => {
             stream_openai_chat(client, config, system_prompt, messages, tools, session_id).await
@@ -338,4 +394,19 @@ async fn stream_google(
     feed(&mut accumulator, events);
 
     Ok(accumulator.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_retryable_provider_error;
+
+    #[test]
+    fn classifies_retryable_errors() {
+        assert!(is_retryable_provider_error("request failed: 429 Too Many Requests"));
+        assert!(is_retryable_provider_error("connection reset (ECONNRESET)"));
+        assert!(is_retryable_provider_error("stream ended before a terminal response event"));
+        assert!(is_retryable_provider_error("Rate limit exceeded"));
+        assert!(!is_retryable_provider_error("Vega provider error 401: unauthorized"));
+        assert!(!is_retryable_provider_error("invalid api key"));
+    }
 }
