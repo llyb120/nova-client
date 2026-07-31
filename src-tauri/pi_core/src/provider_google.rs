@@ -427,3 +427,55 @@ impl GoogleAccumulator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folds_text_function_call_and_usage() {
+        let mut acc = GoogleAccumulator::new("gemini-x", "google", "google-generative-ai");
+        acc.add_chunk(&json!({ "candidates": [{ "content": { "parts": [{ "text": "Hello" }] } }] }));
+        acc.add_chunk(&json!({ "candidates": [{ "content": { "parts": [{ "text": " there" }] } }] }));
+        acc.add_chunk(&json!({ "candidates": [{ "content": { "parts": [{ "functionCall": { "name": "bash", "args": { "command": "ls" } } }] } }] }));
+        acc.add_chunk(&json!({ "candidates": [{ "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": 12, "candidatesTokenCount": 6, "totalTokenCount": 18 } }));
+        let turn = acc.finish();
+
+        // Tool call present → toolUse.
+        assert_eq!(turn.result["stopReason"], "toolUse");
+        let content = turn.result["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Hello there");
+        assert_eq!(content[1]["type"], "toolCall");
+        assert_eq!(content[1]["name"], "bash");
+        assert_eq!(content[1]["arguments"]["command"], "ls");
+        assert_eq!(turn.result["usage"]["input"], 12);
+        assert_eq!(turn.result["usage"]["output"], 6);
+        assert_eq!(turn.result["usage"]["totalTokens"], 18);
+    }
+
+    #[test]
+    fn thinking_part_is_distinct_block() {
+        let mut acc = GoogleAccumulator::new("gemini-x", "google", "google-generative-ai");
+        acc.add_chunk(&json!({ "candidates": [{ "content": { "parts": [{ "text": "reasoning", "thought": true }] } }] }));
+        acc.add_chunk(&json!({ "candidates": [{ "content": { "parts": [{ "text": "answer" }] } }] }));
+        let turn = acc.finish();
+        let content = turn.result["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "reasoning");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "answer");
+    }
+
+    #[test]
+    fn request_has_contents_tools_and_thinking() {
+        let model = json!({ "id": "gemini-x", "provider": "google", "api": "google-generative-ai", "reasoning": true, "thinkingLevel": "high" });
+        let tools = vec![json!({ "name": "bash", "description": "run", "parameters": { "type": "object" } })];
+        let body = build_google_request(&model, "sys", &[], &tools, 2048);
+        assert_eq!(body["model"], "gemini-x");
+        assert_eq!(body["config"]["systemInstruction"], "sys");
+        assert_eq!(body["config"]["maxOutputTokens"], 2048);
+        assert_eq!(body["config"]["tools"][0]["functionDeclarations"][0]["name"], "bash");
+        assert_eq!(body["config"]["thinkingConfig"]["thinkingLevel"], "HIGH");
+    }
+}

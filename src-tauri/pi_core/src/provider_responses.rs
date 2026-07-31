@@ -482,3 +482,53 @@ impl ResponsesAccumulator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folds_message_function_call_and_usage() {
+        let mut acc = ResponsesAccumulator::new("gpt-x", "openai", "openai-responses");
+        acc.add_event(&json!({ "type": "response.created", "response": { "id": "resp_1" } }));
+        acc.add_event(&json!({ "type": "response.output_item.added", "output_index": 0, "item": { "type": "message" } }));
+        acc.add_event(&json!({ "type": "response.output_text.delta", "output_index": 0, "delta": "Hi" }));
+        acc.add_event(&json!({ "type": "response.output_text.delta", "output_index": 0, "delta": "!" }));
+        acc.add_event(&json!({ "type": "response.output_item.added", "output_index": 1, "item": { "type": "function_call", "call_id": "call_1", "id": "fc_1", "name": "read" } }));
+        acc.add_event(&json!({ "type": "response.function_call_arguments.delta", "output_index": 1, "delta": "{\"path\":" }));
+        acc.add_event(&json!({ "type": "response.function_call_arguments.done", "output_index": 1, "arguments": "{\"path\":\"a.rs\"}" }));
+        acc.add_event(&json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "input_tokens": 20, "output_tokens": 7, "total_tokens": 27 } } }));
+        let turn = acc.finish();
+
+        // Tool call present → stopReason promoted to toolUse.
+        assert_eq!(turn.result["stopReason"], "toolUse");
+        let content = turn.result["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Hi!");
+        assert_eq!(content[1]["type"], "toolCall");
+        assert_eq!(content[1]["name"], "read");
+        assert_eq!(content[1]["id"], "call_1|fc_1");
+        assert_eq!(content[1]["arguments"]["path"], "a.rs");
+        assert_eq!(turn.result["usage"]["input"], 20);
+        assert_eq!(turn.result["usage"]["output"], 7);
+        assert_eq!(turn.result["usage"]["totalTokens"], 27);
+    }
+
+    #[test]
+    fn request_uses_developer_role_and_max_output() {
+        let model = json!({ "id": "gpt-x", "provider": "openai", "api": "openai-responses", "reasoning": true });
+        let body = build_openai_responses_request(&model, "sys", &[], &[], Some("sess"), 100);
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["content"], "sys");
+        assert_eq!(body["max_output_tokens"], 100);
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["prompt_cache_key"], "sess");
+    }
+
+    #[test]
+    fn clamps_min_output_tokens() {
+        let model = json!({ "id": "gpt-x", "provider": "openai", "api": "openai-responses" });
+        let body = build_openai_responses_request(&model, "", &[], &[], None, 4);
+        assert_eq!(body["max_output_tokens"], 16);
+    }
+}

@@ -343,6 +343,8 @@ pub struct AnthropicAccumulator {
     thinking: String,
     thinking_signature: String,
     tool_calls: Vec<ToolCallAcc>,
+    /// Maps an SSE block index to a `tool_calls` position.
+    tool_index: Vec<Option<usize>>,
     stop_reason: String,
     error_message: Option<String>,
     usage: Option<Value>,
@@ -461,11 +463,16 @@ impl AnthropicAccumulator {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        while self.tool_calls.len() <= index {
-                            self.tool_calls.push(ToolCallAcc::default());
+                        let pos = self.tool_calls.len();
+                        self.tool_calls.push(ToolCallAcc {
+                            id,
+                            name,
+                            partial_json: String::new(),
+                        });
+                        while self.tool_index.len() <= index {
+                            self.tool_index.push(None);
                         }
-                        self.tool_calls[index].id = id;
-                        self.tool_calls[index].name = name;
+                        self.tool_index[index] = Some(pos);
                     }
                     _ => {}
                 }
@@ -498,8 +505,8 @@ impl AnthropicAccumulator {
                             .pointer("/delta/partial_json")
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        if index < self.tool_calls.len() {
-                            self.tool_calls[index].partial_json.push_str(delta);
+                        if let Some(Some(pos)) = self.tool_index.get(index) {
+                            self.tool_calls[*pos].partial_json.push_str(delta);
                         }
                     }
                     "signature_delta" => {
@@ -527,11 +534,17 @@ impl AnthropicAccumulator {
     }
 
     fn merge_usage(&mut self, usage: &Value) {
-        let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-        let output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-        let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0);
-        let cache_write =
-            usage.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+        // Only override fields present (non-null) in this event, preserving
+        // earlier values (e.g. input_tokens from message_start when a proxy
+        // omits it in message_delta) — matching the node accumulator.
+        let prev_input = self.usage.as_ref().and_then(|u| u.get("input")).and_then(Value::as_u64).unwrap_or(0);
+        let prev_output = self.usage.as_ref().and_then(|u| u.get("output")).and_then(Value::as_u64).unwrap_or(0);
+        let prev_cache_read = self.usage.as_ref().and_then(|u| u.get("cacheRead")).and_then(Value::as_u64).unwrap_or(0);
+        let prev_cache_write = self.usage.as_ref().and_then(|u| u.get("cacheWrite")).and_then(Value::as_u64).unwrap_or(0);
+        let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(prev_input);
+        let output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(prev_output);
+        let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(prev_cache_read);
+        let cache_write = usage.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(prev_cache_write);
         let total = input + output + cache_read + cache_write;
         self.usage = Some(json!({
             "input": input,
@@ -554,5 +567,63 @@ impl AnthropicAccumulator {
             events: self.events,
             result,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folds_text_tool_and_usage() {
+        let mut acc = AnthropicAccumulator::new("claude-x", "anthropic", "anthropic-messages");
+        acc.add_event(&json!({ "type": "message_start", "message": { "usage": { "input_tokens": 10, "output_tokens": 1 } } }));
+        acc.add_event(&json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text" } }));
+        acc.add_event(&json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Hello" } }));
+        acc.add_event(&json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": " world" } }));
+        acc.add_event(&json!({ "type": "content_block_stop", "index": 0 }));
+        acc.add_event(&json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "tu_1", "name": "bash" } }));
+        acc.add_event(&json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "{\"command\":" } }));
+        acc.add_event(&json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "\"ls\"}" } }));
+        acc.add_event(&json!({ "type": "content_block_stop", "index": 1 }));
+        acc.add_event(&json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 5 } }));
+        acc.add_event(&json!({ "type": "message_stop" }));
+        let turn = acc.finish();
+
+        assert_eq!(turn.result["stopReason"], "toolUse");
+        let content = turn.result["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Hello world");
+        assert_eq!(content[1]["type"], "toolCall");
+        assert_eq!(content[1]["name"], "bash");
+        assert_eq!(content[1]["arguments"]["command"], "ls");
+        // usage: input 10, output 5 (message_delta overrides), total = 10+5.
+        assert_eq!(turn.result["usage"]["input"], 10);
+        assert_eq!(turn.result["usage"]["output"], 5);
+        assert_eq!(turn.result["usage"]["totalTokens"], 15);
+        // Stream events include a start, text deltas, and a done.
+        assert!(turn.events.iter().any(|e| e["type"] == "start"));
+        assert!(turn.events.iter().any(|e| e["type"] == "done"));
+    }
+
+    #[test]
+    fn maps_stop_reasons() {
+        assert_eq!(map_anthropic_stop_reason("end_turn"), ("stop", None));
+        assert_eq!(map_anthropic_stop_reason("max_tokens"), ("length", None));
+        assert_eq!(map_anthropic_stop_reason("tool_use"), ("toolUse", None));
+        assert_eq!(map_anthropic_stop_reason("refusal").0, "error");
+    }
+
+    #[test]
+    fn request_has_system_cache_and_tools() {
+        let model = json!({ "id": "claude-x", "provider": "anthropic", "api": "anthropic-messages", "reasoning": false });
+        let tools = vec![json!({ "name": "bash", "description": "run", "parameters": { "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] } })];
+        let body = build_anthropic_request(&model, "You are Vega.", &[], &tools, None, 4096);
+        assert_eq!(body["model"], "claude-x");
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["system"][0]["text"], "You are Vega.");
+        assert!(body["system"][0]["cache_control"].is_object());
+        assert_eq!(body["tools"][0]["name"], "bash");
+        assert_eq!(body["tools"][0]["input_schema"]["required"][0], "command");
     }
 }
