@@ -54,16 +54,53 @@ pub struct NativeTurnOutput {
 }
 
 /// Run one native Vega turn.
+/// A live native turn's control surface, registered in `SdkRuntime` so
+/// `cancel`/`steer_prompt` can reach an in-process turn (the node bridge gets
+/// these via its stdin command channel).
+pub struct NativeRunController {
+    /// Cancel flag; the stream function checks it between provider calls and
+    /// races it against the in-flight transport.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Steering user messages queued by `steer_prompt`, drained into the agent
+    /// loop between tool rounds.
+    pub steer_queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>,
+}
+
+/// Build a `StreamTurn` carrying an `aborted`-stop assistant message so the
+/// loop terminates cleanly on cancel.
+fn aborted_turn(provider: &ProviderConfig) -> StreamTurn {
+    let message = json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "" }],
+        "api": provider.api,
+        "provider": provider.provider,
+        "model": provider.model_id,
+        "stopReason": "aborted",
+        "errorMessage": "cancelled",
+    });
+    StreamTurn {
+        events: vec![
+            json!({ "type": "start", "partial": message }),
+            json!({ "type": "done" }),
+        ],
+        result: message,
+    }
+}
+
 ///
 /// `stream_fn` is the injected LLM transport; `tool_fn` executes tools natively.
 /// The agent's emitted events are replayed through a `ProtocolAccumulator` to
-/// produce the protocol item stream the backend expects.
+/// produce the protocol item stream the backend expects. When `emit_item` is
+/// provided, each newly produced protocol item is forwarded immediately
+/// (progressive streaming); otherwise items are only collected.
 pub fn run_native_turn(
     config: NativeTurnConfig,
     prompt_text: &str,
     stream_fn: &mut StreamFn,
     tool_fn: &mut ToolFn,
     prepare_next_turn: Option<Box<PrepareNextTurnFn<'static>>>,
+    steer_queue: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>>,
+    mut emit_item: Option<&mut dyn FnMut(Value)>,
 ) -> NativeTurnOutput {
     let state = AgentState::new(
         &config.system_prompt,
@@ -75,6 +112,8 @@ pub fn run_native_turn(
     agent.parallel_tools = config.parallel_tools;
     agent.session_id = config.session_id;
     agent.prepare_next_turn = prepare_next_turn;
+    // Drain queued steering messages into the agent between tool rounds.
+    agent.steer_queue = steer_queue;
 
     let events = agent.prompt(
         &Value::String(prompt_text.to_string()),
@@ -86,7 +125,13 @@ pub fn run_native_turn(
 
     let mut accumulator = ProtocolAccumulator::new();
     for event in &events {
+        let before = accumulator.items.len();
         accumulator.on_event(event);
+        if let Some(emit) = emit_item.as_mut() {
+            for item in accumulator.items[before..].iter().cloned() {
+                emit(item);
+            }
+        }
     }
     let usage = accumulator.usage.clone();
     let items = accumulator.finish();
@@ -136,12 +181,30 @@ pub async fn run_native_turn_async(
     native_tools: pi_core::tools::NativeTools,
     prepare_next_turn: Option<Box<PrepareNextTurnFn<'static>>>,
     mcp_hub: Option<std::sync::Arc<crate::mcp::McpHub>>,
-) -> Result<NativeTurnOutput, String> {
+    controller: Option<std::sync::Arc<NativeRunController>>,
+) -> Result<
+    (
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+        tokio::task::JoinHandle<Result<NativeTurnOutput, String>>,
+    ),
+    String,
+> {
+    let (item_tx, item_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
+    let join = tokio::task::spawn_blocking(move || {
         let session_id = config.session_id.clone();
         let tool_handle = handle.clone();
+        let cancel = controller.as_ref().map(|c| std::sync::Arc::clone(&c.cancel));
+        let steer_queue = controller.as_ref().map(|c| std::sync::Arc::clone(&c.steer_queue));
         let mut stream_fn = move |_index: usize, llm_context: &Value| -> StreamTurn {
+            // Honor cancel before starting a new provider call.
+            if cancel
+                .as_ref()
+                .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(false)
+            {
+                return aborted_turn(&provider);
+            }
             let messages = llm_context
                 .get("messages")
                 .and_then(Value::as_array)
@@ -159,19 +222,31 @@ pub async fn run_native_turn_async(
                 .unwrap_or_default();
             let client = client.clone();
             let provider_for_call = provider.clone();
+            let provider_for_abort = provider.clone();
             let provider_for_error = provider.clone();
             let session_id = session_id.clone();
+            let cancel = cancel.clone();
             handle
                 .block_on(async move {
-                    stream_turn(
+                    let transport = stream_turn(
                         &client,
                         &provider_for_call,
                         &system_prompt,
                         &messages,
                         &tools,
                         session_id.as_deref(),
-                    )
-                    .await
+                    );
+                    match cancel {
+                        // Race the transport against the cancel flag so an
+                        // in-flight request aborts promptly on cancel.
+                        Some(flag) => {
+                            tokio::select! {
+                                result = transport => result,
+                                _ = wait_for_cancel(flag) => Ok(aborted_turn(&provider_for_abort)),
+                            }
+                        }
+                        None => transport.await,
+                    }
                 })
                 .unwrap_or_else(|error| error_turn(&error, &provider_for_error))
         };
@@ -186,16 +261,30 @@ pub async fn run_native_turn_async(
             }
             native_tools.execute(name, args)
         };
+        let mut emit = move |item: Value| {
+            let _ = item_tx.send(item);
+        };
         Ok::<NativeTurnOutput, String>(run_native_turn(
             config,
             &prompt_text,
             &mut stream_fn,
             &mut tool_fn,
             prepare_next_turn,
+            steer_queue,
+            Some(&mut emit),
         ))
-    })
-    .await
-    .map_err(|error| format!("native Vega turn panicked: {error}"))?
+    });
+    Ok((item_rx, join))
+}
+
+/// Resolve when the cancel flag is set (polling). Used to race the transport.
+async fn wait_for_cancel(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    loop {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Resolve just the `ProviderConfig` for a model selection (config load +
@@ -245,7 +334,7 @@ pub async fn run_summary_turn_async(
         parallel_tools: false,
     };
     let native_tools = NativeTools::new(PathBuf::from("."));
-    let output = run_native_turn_async(
+    let (_item_rx, join) = run_native_turn_async(
         client,
         summary_provider,
         config,
@@ -253,8 +342,12 @@ pub async fn run_summary_turn_async(
         native_tools,
         None,
         None,
+        None,
     )
     .await?;
+    let output = join
+        .await
+        .map_err(|error| format!("summary turn panicked: {error}"))??;
     // Concatenate the text of the final assistant message(s).
     let text = output
         .messages

@@ -70,6 +70,9 @@ pub struct SdkManager {
     alkaid_config_generation: AtomicU64,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
+    /// In-process native Vega turns keyed by thread_id, so `cancel`/`steer_prompt`
+    /// can reach them (the node bridge gets these via its stdin channel).
+    native_runs: Mutex<HashMap<String, std::sync::Arc<crate::vega_native::NativeRunController>>>,
 }
 
 impl SdkManager {
@@ -98,6 +101,7 @@ impl SdkManager {
             alkaid_config_generation: AtomicU64::new(0),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
+            native_runs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -385,6 +389,14 @@ impl SdkManager {
         if self.is_running(thread_id) {
             self.push_system(thread_id, "已停止当前任务。".into(), "warn");
         }
+        // In-process native Vega turn: signal its controller and let the loop
+        // wind down (the stream function aborts the in-flight provider call).
+        if let Some(controller) = self.native_runs.lock().unwrap().get(thread_id).cloned() {
+            controller
+                .cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
         let bridge = self
             .running_children
             .lock()
@@ -447,6 +459,38 @@ impl SdkManager {
         text: String,
         images: Vec<PromptImage>,
     ) {
+        // In-process native Vega turn: push the steering message onto the
+        // controller's queue (drained into the agent loop between tool rounds).
+        if let Some(controller) = self.native_runs.lock().unwrap().get(thread_id).cloned() {
+            {
+                let state = self.app.state::<AppState>();
+                let mut store = state.store.lock().unwrap();
+                if let Some(thread) = store.get_mut(thread_id) {
+                    let item = thread.push_user(text.clone(), images.clone());
+                    let _ = self.emit_update(thread_id, &item);
+                    store.save();
+                }
+            }
+            let parts = prompt_parts(self.adapter.as_ref(), &text, &images);
+            let content: Vec<Value> = parts
+                .iter()
+                .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("text") => Some(json!({
+                        "type": "text",
+                        "text": part.get("text").and_then(Value::as_str).unwrap_or(""),
+                    })),
+                    Some("image_data") => Some(json!({
+                        "type": "image",
+                        "data": part.get("data").and_then(Value::as_str).unwrap_or(""),
+                        "mimeType": part.get("mime").and_then(Value::as_str).unwrap_or("image/png"),
+                    })),
+                    _ => None,
+                })
+                .collect();
+            let message = json!({ "role": "user", "content": content });
+            controller.steer_queue.lock().unwrap().push_back(message);
+            return;
+        }
         // set_running 早于 bridge 注册，极快的补充提示可能命中这个短窗口；稍候 bridge 就绪。
         let mut stdin = None;
         for _ in 0..20 {
@@ -790,7 +834,7 @@ impl SdkManager {
     /// `native-vega` cargo feature.
     #[cfg(feature = "native-vega")]
     async fn run_prompt_native(
-        &self,
+        self: &Arc<Self>,
         thread_id: &str,
         cwd: &str,
         model_selection: Option<&str>,
@@ -1102,9 +1146,23 @@ impl SdkManager {
             }
         };
 
-        // --- Run the turn ---
+        // --- Run the turn (streaming + steerable/cancellable) ---
+        // Register a controller so `cancel`/`steer_prompt` can reach this
+        // in-process turn, and spawn a consumer that applies items to the
+        // thread as they stream in (progressive UI updates).
+        let controller = std::sync::Arc::new(crate::vega_native::NativeRunController {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            steer_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+        });
+        self.native_runs
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), std::sync::Arc::clone(&controller));
+
         let client = reqwest::Client::new();
-        let turn_result = crate::vega_native::run_native_turn_async(
+        let launched = crate::vega_native::run_native_turn_async(
             client,
             setup.provider,
             setup.turn_config,
@@ -1112,8 +1170,38 @@ impl SdkManager {
             setup.native_tools,
             Some(hook),
             mcp_hub,
+            Some(std::sync::Arc::clone(&controller)),
         )
         .await;
+
+        // Stream items to the thread concurrently while the turn runs: a
+        // consumer task applies each item as it arrives (progressive UI), and
+        // completes when the blocking turn drops its sender.
+        let turn_result = match launched {
+            Ok((mut item_rx, join)) => {
+                let consumer_self = self.clone();
+                let consumer_thread = thread_id.to_string();
+                let consumer = tokio::spawn(async move {
+                    let mut item_ids = HashMap::new();
+                    while let Some(envelope) = item_rx.recv().await {
+                        if !consumer_self.is_current_run(&consumer_thread, run_epoch) {
+                            break;
+                        }
+                        consumer_self.apply_item(
+                            &consumer_thread,
+                            &envelope["item"],
+                            &mut item_ids,
+                        );
+                    }
+                });
+                let result = join
+                    .await
+                    .map_err(|error| format!("native Vega turn panicked: {error}"))?;
+                let _ = consumer.await;
+                result
+            }
+            Err(error) => Err(error),
+        };
 
         // Re-acquire the (possibly mid-turn-mutated) memory for post-turn logic.
         let mut memory = memory.lock().unwrap();
@@ -1180,15 +1268,20 @@ impl SdkManager {
             }
         }
 
+        // Unregister the controller now the turn is done.
+        self.native_runs.lock().unwrap().remove(thread_id);
+
         let output = turn_result?;
         if !self.is_current_run(thread_id, run_epoch) {
             return Ok(());
         }
-        let mut item_ids = HashMap::new();
-        for envelope in &output.items {
-            self.apply_item(thread_id, &envelope["item"], &mut item_ids);
-        }
-        self.finish_turn_if_current(thread_id, run_epoch, "end_turn", output.usage);
+        // A cancelled turn ends with an `aborted` assistant message.
+        let cancelled = output.messages.last().map_or(false, |m| {
+            m.get("stopReason").and_then(Value::as_str) == Some("aborted")
+        })
+        || controller.cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
+        self.finish_turn_if_current(thread_id, run_epoch, stop_reason, output.usage);
         let _ = user_item_id;
         Ok(())
     }

@@ -89,6 +89,11 @@ pub struct Agent {
     /// Optional mid-turn context-maintenance hook (Reasonix). Taken by
     /// `run_continuation` and passed into the loop config; `None` by default.
     pub prepare_next_turn: Option<Box<PrepareNextTurnFn<'static>>>,
+    /// Optional shared steering queue for in-process control (native Vega):
+    /// messages pushed here are drained into the loop between tool rounds,
+    /// mirroring `steer`. `None` by default (parity tests unaffected).
+    pub steer_queue:
+        Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>>,
 }
 
 impl Agent {
@@ -101,6 +106,7 @@ impl Agent {
             session_id: None,
             parallel_tools: false,
             prepare_next_turn: None,
+            steer_queue: None,
         }
     }
 
@@ -243,8 +249,24 @@ impl Agent {
             mode: self.follow_up_queue.mode.clone(),
         };
 
+        // Steering drain: the pre-queued steering messages, plus (for native
+        // Vega) any messages an external controller pushes to the shared queue.
+        let steering_queue = self.steer_queue.clone();
+        let steering_drain: Box<super::run_loop::QueueFn> = match steering_queue {
+            Some(queue) => Box::new(move || {
+                let mut messages = steering.drain();
+                if let Ok(mut q) = queue.lock() {
+                    while let Some(message) = q.pop_front() {
+                        messages.push(message);
+                    }
+                }
+                messages
+            }),
+            None => Box::new(move || steering.drain()),
+        };
+
         let mut config = LoopConfig {
-            get_steering_messages: Some(Box::new(move || steering.drain())),
+            get_steering_messages: Some(steering_drain),
             get_follow_up_messages: Some(Box::new(move || follow_up.drain())),
             prepare_next_turn: self.prepare_next_turn.take(),
             timestamp,
