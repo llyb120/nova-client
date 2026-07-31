@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { Agent } from "@cursor/sdk";
-import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isCursorStallAbortError, isEditFilesTool, mapDelta, mapMessage, modelOptions, modelSelection } from "./cursor-bridge-common.mjs";
+import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isCursorStallAbortError, isEditFilesTool, isRetryableCursorError, mapDelta, mapMessage, modelOptions, modelSelection } from "./cursor-bridge-common.mjs";
 import { createCursorFilesystemTools, cursorPromptPrefix } from "./cursor-filesystem-tools.mjs";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -65,33 +65,6 @@ function contextThresholdsForModel(model) {
     maxTokens: Math.max(2_000, Math.floor(contextWindow * 0.75)),
     maxChars: Math.max(8_000, Math.floor(contextWindow * 0.75)),
   };
-}
-
-function isRetryableCursorError(error) {
-  // SDK stall detector / AbortController.abort() → DOMException AbortError.
-  if (isCursorStallAbortError(error)) return true;
-  const seen = new Set();
-  const details = [];
-  let current = error;
-  while (current && !seen.has(current)) {
-    if (typeof current === "object") {
-      seen.add(current);
-      if (current.isRetryable === true) return true;
-      const code = String(current.code ?? "").toLowerCase();
-      if (["unavailable", "timeout", "rate_limit", "internal", "aborted", "8", "10", "13", "14"].includes(code)) {
-        return true;
-      }
-      for (const key of ["message", "rawMessage", "details"]) {
-        if (current[key] != null) details.push(String(current[key]));
-      }
-      current = current.cause;
-    } else {
-      details.push(String(current));
-      break;
-    }
-  }
-  return /API key exchange endpoint|fetch failed|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|socket hang up|other side closed|premature close|network connection lost|\b429\b|\b5\d\d\b/i
-    .test(details.join("\n"));
 }
 
 function shouldSilentRetryCursorTurn(error, { producedOutput = false, attempt = 0, maxRetries = CURSOR_SILENT_RETRIES } = {}) {

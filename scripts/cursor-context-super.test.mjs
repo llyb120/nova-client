@@ -276,6 +276,16 @@ assert.equal(isRetryableCursorError({
   cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
 }), true);
 assert.equal(isRetryableCursorError({ code: "aborted", message: "stream aborted" }), true);
+assert.equal(isRetryableCursorError({
+  rawMessage: "Stream closed with error code NGHTTP2_REFUSED_STREAM",
+  code: 13,
+  cause: Object.assign(new Error("Stream closed with error code NGHTTP2_REFUSED_STREAM"), {
+    code: "ERR_HTTP2_STREAM_ERROR",
+  }),
+}), true);
+assert.equal(isRetryableCursorError(new Error(
+  "ConnectError: [unknown] [internal] Stream closed with error code NGHTTP2_REFUSED_STREAM",
+)), true);
 const stallAbort = new DOMException("This operation was aborted", "AbortError");
 assert.equal(isRetryableCursorError(stallAbort), true);
 assert.equal(shouldSilentRetryCursorTurn(stallAbort, { producedOutput: false, attempt: 0 }), true);

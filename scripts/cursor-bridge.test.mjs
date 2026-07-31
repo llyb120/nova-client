@@ -72,12 +72,14 @@ for (const name of [
   "cursorShellProgram",
   "cursorTodoPlan",
   "isEditFilesTool",
+  "isRetryableCursorError",
   "mapDelta",
   "mapMessage",
   "modelSelection",
 ]) {
   assert.strictEqual(superContext[name], commonContext[name]);
 }
+assert.strictEqual(isRetryableCursorError, commonContext.isRetryableCursorError);
 assert.equal(typeof superContext.runContextBridge, "function");
 assert.deepEqual(superContext.contextThresholdsForModel("unknown"), {
   contextWindow: 128_000,
@@ -326,6 +328,10 @@ assert.equal(isRetryableCursorError({
     code: "ERR_HTTP2_STREAM_ERROR",
   }),
 }), true);
+// ConnectError text from Cursor SDK team-privacy / Grep side channels.
+assert.equal(isRetryableCursorError(new Error(
+  "ConnectError: [unknown] [internal] Stream closed with error code NGHTTP2_REFUSED_STREAM",
+)), true);
 const stallAbort = new DOMException("This operation was aborted", "AbortError");
 assert.equal(isRetryableCursorError(stallAbort), true);
 assert.equal(shouldSilentRetryCursorTurn(stallAbort, { producedOutput: false, attempt: 0 }), true);

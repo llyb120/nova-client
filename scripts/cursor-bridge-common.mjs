@@ -120,20 +120,53 @@ export function isCursorStallAbortError(error) {
   return false;
 }
 
+/** Transient Cursor/Connect transport failures that turn-level silent retry already knows how to
+ *  recover from. Shared so the process guard and prompt loop classify the same errors. */
+export function isRetryableCursorError(error) {
+  // SDK stall detector / AbortController.abort() → DOMException AbortError.
+  if (isCursorStallAbortError(error)) return true;
+  const seen = new Set();
+  const details = [];
+  let current = error;
+  while (current && !seen.has(current)) {
+    if (typeof current === "object") {
+      seen.add(current);
+      if (current.isRetryable === true) return true;
+      const code = String(current.code ?? "").toLowerCase();
+      if (["unavailable", "timeout", "rate_limit", "internal", "aborted", "8", "10", "13", "14"].includes(code)) {
+        return true;
+      }
+      for (const key of ["message", "rawMessage", "details"]) {
+        if (current[key] != null) details.push(String(current[key]));
+      }
+      current = current.cause;
+    } else {
+      details.push(String(current));
+      break;
+    }
+  }
+  return /API key exchange endpoint|fetch failed|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|socket hang up|other side closed|premature close|network connection lost|NGHTTP2_REFUSED_STREAM|\b429\b|\b5\d\d\b/i
+    .test(details.join("\n"));
+}
+
 function installCursorStallAbortGuard() {
   // Tests import bridge modules; do not override Node's default crash behavior there.
   if (process.env.NOVA_CURSOR_BRIDGE_TEST === "1") return;
   if (globalThis.__novaCursorStallAbortGuardInstalled) return;
   globalThis.__novaCursorStallAbortGuardInstalled = true;
 
+  // Stall aborts and transient SDK side-channel failures (e.g. team-privacy checks during Grep
+  // that reject as unhandled ConnectError / NGHTTP2_REFUSED_STREAM) must not kill the bridge.
+  // Turn-level silent retry covers awaited prompt failures; writing stderr here would still
+  // surface as a Nova bridge failure even if we kept the process alive.
   process.on("unhandledRejection", (reason) => {
-    if (isCursorStallAbortError(reason)) return;
+    if (isRetryableCursorError(reason)) return;
     process.stderr.write(`Unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}\n`);
     process.exit(1);
   });
 
   process.on("uncaughtException", (error) => {
-    if (isCursorStallAbortError(error)) return;
+    if (isRetryableCursorError(error)) return;
     process.stderr.write(`Uncaught exception: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
     process.exit(1);
   });
