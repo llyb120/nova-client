@@ -13,7 +13,8 @@ import { Sidebar } from "./components/Sidebar";
 import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
 import "./promptQueue";
-import { initStore, state } from "./store";
+import { mountSessionShortcuts } from "./sessionShortcuts";
+import { initStore, openNewSession, state } from "./store";
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -38,6 +39,12 @@ export default function App() {
   const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
+
+  // 快速新会话快捷键在任意页面生效（与侧栏「新对话」一致，会话中继承目录/模型）。
+  mountSessionShortcuts({
+    allowedActions: ["newSession"],
+    onNewSession: () => openNewSession(),
+  });
 
   onMount(() => {
     void initStore();

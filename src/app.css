@@ -4388,6 +4388,18 @@ button {
   display: flex;
 }
 
+.session-shortcut-target-none {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 30px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .session-shortcut-row .field-input,
 .session-shortcut-keys,
 .session-shortcut-row .pill {

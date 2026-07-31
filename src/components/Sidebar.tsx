@@ -9,6 +9,7 @@ import {
   closeThread,
   deleteProjectThreads,
   deleteThread,
+  openNewSession,
   openThread,
   pendingDecisionCount,
   setView,
@@ -110,7 +111,7 @@ export function Sidebar(props: {
     setView(view);
     closeThread();
   };
-  const openHome = () => switchView("home");
+  const openHome = () => openNewSession();
   const openClues = () => switchView("clues");
   const openEmployees = () => switchView("employees");
   const openWorkbench = () => switchView("workbench");

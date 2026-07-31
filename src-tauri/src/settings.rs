@@ -21,9 +21,9 @@ pub struct SessionShortcut {
     pub id: String,
     /// 规范化按键，如 Ctrl+1 / Alt+P。
     pub keys: String,
-    /// selectProject | selectModel
+    /// selectProject | selectModel | newSession
     pub action: String,
-    /// 项目绝对路径，或 `<agentKind>:<modelId>`。
+    /// 项目绝对路径、`<agentKind>:<modelId>` / roam/quota 编码；newSession 可为空。
     pub target: String,
 }
 

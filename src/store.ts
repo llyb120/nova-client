@@ -25,6 +25,7 @@ import type {
   ModeChoice,
   Peer,
   PeerModels,
+  PendingNewSessionSeed,
   PermissionRequest,
   PlanEntry,
   ProjectEntry,
@@ -166,6 +167,8 @@ interface AppStore {
   clueGroups: ClueNodeGroup[];
   /** 从证据链跳到新会话时暂存的根线索。 */
   pendingClueCard: { id: string; title: string } | null;
+  /** 从当前会话点「新会话」时暂存的目录/模型，供 HomeView 继承。 */
+  pendingNewSessionSeed: PendingNewSessionSeed | null;
   /** 系统提醒点击后，请证据链定位到指定卡片。 */
   clueOpenRequest: string | null;
   /** 收到的线索 @ 提醒；打开对应卡片后清除。 */
@@ -248,6 +251,7 @@ export const [state, setState] = createStore<AppStore>({
   view: "home",
   clueGroups: [],
   pendingClueCard: null,
+  pendingNewSessionSeed: null,
   clueOpenRequest: null,
   unreadClueMentions: [],
   employees: [],
@@ -763,6 +767,42 @@ export function startSessionFromClue(card: ClueCard) {
 
 export function clearPendingClueCard() {
   setState("pendingClueCard", null);
+}
+
+/** 打开新会话页；若当前在会话中，把工作目录与模型带给 HomeView。 */
+export function openNewSession() {
+  const id = state.currentId;
+  if (id) {
+    const meta = state.threads.find((thread) => thread.id === id);
+    const cwd = meta?.worktree?.repo || state.cwd;
+    const seed: PendingNewSessionSeed = {
+      cwd,
+      agentKind: state.agentKind,
+      model: state.model,
+      mode: state.mode,
+      reasoningEffort: state.reasoningEffort,
+      roam: null,
+      quotaPeerToken: null,
+    };
+    if (meta?.roamingRole === "guest" && state.roamingPeer) {
+      seed.roam = { peerToken: state.roamingPeer, folder: state.cwd };
+      seed.cwd = state.cwd;
+    } else if (meta?.quotaPeerName && state.roamingPeer) {
+      seed.quotaPeerToken = state.roamingPeer;
+    }
+    setState("pendingNewSessionSeed", seed);
+  } else {
+    setState("pendingNewSessionSeed", null);
+  }
+  closeThread();
+  setView("home");
+}
+
+/** HomeView 挂载时取走一次继承种子。 */
+export function takePendingNewSessionSeed(): PendingNewSessionSeed | null {
+  const seed = state.pendingNewSessionSeed;
+  if (seed) setState("pendingNewSessionSeed", null);
+  return seed;
 }
 
 export function openClueCard(cardId: string) {

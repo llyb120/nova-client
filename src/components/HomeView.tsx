@@ -27,6 +27,7 @@ import {
   setView,
   state,
   stashWorktreePrompt,
+  takePendingNewSessionSeed,
   assertBuiltinPrompt,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
@@ -47,19 +48,22 @@ const LAST_NEW_THREAD_PROJECT_KEY = "fd:lastNewThreadProject";
 
 /** codex 风格草稿首页：输入任务 + 选择项目/模型/模式，回车即开干 */
 export function HomeView() {
+  const sessionSeed = takePendingNewSessionSeed();
   const [text, setText] = createSignal("");
   const [cursor, setCursor] = createSignal(0);
   const [slashStart, setSlashStart] = createSignal<number | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
   const attach = createImageAttachments({ enableFileDrop: true });
   const noteFlow = createNoteFlow();
-  const [cwd, setCwd] = createSignal("");
-  const [agentKind, setAgentKind] = createSignal<AgentKind>(
-    resolveEnabledAgentKind(lastUsed.agentKind()),
+  const [cwd, setCwd] = createSignal(
+    sessionSeed && !sessionSeed.roam ? sessionSeed.cwd : "",
   );
-  // 默认沿用上一次使用的模型/模式
-  const [model, setModel] = createSignal(lastUsed.model(agentKind()));
-  const [mode, setMode] = createSignal(lastUsed.mode(agentKind()));
+  const [agentKind, setAgentKind] = createSignal<AgentKind>(
+    resolveEnabledAgentKind(sessionSeed?.agentKind ?? lastUsed.agentKind()),
+  );
+  // 默认沿用上一次使用的模型/模式；从会话进入时优先继承当前会话。
+  const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(agentKind()));
+  const [mode, setMode] = createSignal(sessionSeed?.mode ?? lastUsed.mode(agentKind()));
   const [busy, setBusy] = createSignal(false);
   const [employeeMenuOpen, setEmployeeMenuOpen] = createSignal(false);
   const [selectedEmployeeId, setSelectedEmployeeId] = createSignal<string | null>(
@@ -89,7 +93,9 @@ export function HomeView() {
   // 仅当用户真正键入时才按关键字过滤；预填/选中的分支名不应把列表过滤到只剩自己
   const [branchFiltering, setBranchFiltering] = createSignal(false);
   let wtBranchRef: HTMLInputElement | undefined;
-  let modeTouched = false;
+  let modeTouched = !!sessionSeed?.mode;
+  // 漫游首次同步时优先保留从当前会话继承的模型。
+  let preferSeedModelOnRoamSync = !!sessionSeed?.roam && !!sessionSeed.model;
   let lastPrewarmKey = "";
   let lastRoamModelSyncKey = "";
   let scratchLoading = false;
@@ -356,7 +362,14 @@ export function HomeView() {
       const remoteModel = source?.configOptions?.find((option) => option.id === "model")
         ?.currentValue;
       let nextModel = models.find((item) => item.value)?.value ?? models[0]?.value ?? "";
-      if (remoteModel && models.some((item) => item.value === remoteModel)) {
+      if (
+        preferSeedModelOnRoamSync &&
+        model() &&
+        models.some((item) => item.value === model())
+      ) {
+        nextModel = model();
+        preferSeedModelOnRoamSync = false;
+      } else if (remoteModel && models.some((item) => item.value === remoteModel)) {
         nextModel = remoteModel;
       }
       setModel(nextModel);
@@ -472,7 +485,37 @@ export function HomeView() {
     ensureScratchProject();
   };
 
-  onMount(() => void restoreLastProject());
+  onMount(() => {
+    if (!sessionSeed) {
+      void restoreLastProject();
+      return;
+    }
+    if (sessionSeed.roam) {
+      const peer = state.peers.find((item) => item.token === sessionSeed.roam!.peerToken);
+      if (
+        peer?.online &&
+        peer.folders.some((folder) => folder.path === sessionSeed.roam!.folder)
+      ) {
+        setQuotaPeer(null);
+        setRoam({ peer, folder: sessionSeed.roam.folder });
+        ensurePeerModels(peer.token, true);
+        return;
+      }
+      void restoreLastProject();
+      return;
+    }
+    if (sessionSeed.cwd) selectProject(sessionSeed.cwd);
+    else void restoreLastProject();
+    if (sessionSeed.quotaPeerToken) {
+      const peer = roamingPeers().find((item) => item.token === sessionSeed.quotaPeerToken);
+      if (peer) {
+        pickModelCombined(sessionSeed.agentKind, sessionSeed.model, {
+          token: peer.token,
+          name: peer.name,
+        });
+      }
+    }
+  });
   // 每次进入新会话页都强制校准在线队友的共享模型，避免沿用旧 peerModels 缓存。
   onMount(() => preloadPeerModels(true));
   onCleanup(() => {

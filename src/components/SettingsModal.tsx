@@ -449,10 +449,19 @@ export function SettingsModal(props: { onClose: () => void }) {
       .map((item): SessionShortcut => ({
         id: item.id || newSessionShortcutId(),
         keys: item.keys.trim(),
-        action: item.action === "selectProject" ? "selectProject" : "selectModel",
+        action:
+          item.action === "selectProject"
+            ? "selectProject"
+            : item.action === "newSession"
+              ? "newSession"
+              : "selectModel",
         target: item.target.trim(),
       }))
-      .filter((item) => item.keys.length > 0 && item.target.length > 0);
+      .filter((item) => {
+        if (!item.keys) return false;
+        if (item.action === "newSession") return true;
+        return item.target.length > 0;
+      });
 
   const shortcutSharedModels = createMemo<SharedModelSource[]>(() =>
     roamingPeers()
@@ -1115,7 +1124,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换到指定项目或模型。新建会话页两者均生效；会话中仅模型切换有效。
+                      一键切换项目/模型，或快速新会话。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用，会话中会继承当前目录与模型。
                     </div>
                   </div>
                   <button
@@ -1154,8 +1163,14 @@ export function SettingsModal(props: { onClose: () => void }) {
                               value={item().action}
                               onChange={(event) => {
                                 const action = event.currentTarget.value as SessionShortcutAction;
+                                const nextAction: SessionShortcutAction =
+                                  action === "selectProject"
+                                    ? "selectProject"
+                                    : action === "newSession"
+                                      ? "newSession"
+                                      : "selectModel";
                                 updateSessionShortcut(index, {
-                                  action: action === "selectProject" ? "selectProject" : "selectModel",
+                                  action: nextAction,
                                   target: "",
                                 });
                               }}
@@ -1163,40 +1178,48 @@ export function SettingsModal(props: { onClose: () => void }) {
                             >
                               <option value="selectModel">选择模型</option>
                               <option value="selectProject">选择项目</option>
+                              <option value="newSession">快速新会话</option>
                             </select>
                             <div class="session-shortcut-target">
                               <Show
-                                when={item().action === "selectProject"}
+                                when={item().action === "newSession"}
                                 fallback={
-                                  <ModelPicker
-                                    agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "alkaid")}
-                                    agentKinds={enabledAgentKinds()}
-                                    model={modelTarget()?.model ?? ""}
-                                    sharedModels={shortcutSharedModels()}
-                                    quotaPeerToken={modelTarget()?.peerToken}
-                                    onPickModel={(agentKind, model, quotaPeer) =>
-                                      updateSessionShortcut(index, {
-                                        target: quotaPeer
-                                          ? encodeQuotaModelTarget(quotaPeer.token, agentKind, model)
-                                          : encodeModelTarget(agentKind, model),
-                                      })
+                                  <Show
+                                    when={item().action === "selectProject"}
+                                    fallback={
+                                      <ModelPicker
+                                        agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "alkaid")}
+                                        agentKinds={enabledAgentKinds()}
+                                        model={modelTarget()?.model ?? ""}
+                                        sharedModels={shortcutSharedModels()}
+                                        quotaPeerToken={modelTarget()?.peerToken}
+                                        onPickModel={(agentKind, model, quotaPeer) =>
+                                          updateSessionShortcut(index, {
+                                            target: quotaPeer
+                                              ? encodeQuotaModelTarget(quotaPeer.token, agentKind, model)
+                                              : encodeModelTarget(agentKind, model),
+                                          })
+                                        }
+                                        title="快捷键目标模型"
+                                        portal
+                                      />
                                     }
-                                    title="快捷键目标模型"
-                                    portal
-                                  />
+                                  >
+                                    <ProjectPicker
+                                      value={roamTarget() ? "" : item().target}
+                                      roam={roamTarget()}
+                                      onChange={(path) => updateSessionShortcut(index, { target: path })}
+                                      onPickRoaming={(peer, folder) =>
+                                        updateSessionShortcut(index, {
+                                          target: encodeRoamTarget(peer.token, folder),
+                                        })
+                                      }
+                                      portal
+                                    />
+                                  </Show>
                                 }
                               >
-                                <ProjectPicker
-                                  value={roamTarget() ? "" : item().target}
-                                  roam={roamTarget()}
-                                  onChange={(path) => updateSessionShortcut(index, { target: path })}
-                                  onPickRoaming={(peer, folder) =>
-                                    updateSessionShortcut(index, {
-                                      target: encodeRoamTarget(peer.token, folder),
-                                    })
-                                  }
-                                  portal
-                                />
+                                <div class="session-shortcut-target-none">任意页 · 继承当前目录与模型</div>
                               </Show>
                             </div>
                             <button

@@ -126,15 +126,16 @@ export function findSessionShortcut(
 /** 在组件 setup 阶段调用：挂全局 capture keydown，按 allowedActions 执行回调。 */
 export function mountSessionShortcuts(options: {
   allowedActions: readonly SessionShortcutAction[];
-  onSelectProject: (
+  onSelectProject?: (
     path: string,
     roam?: { peerToken: string; folder: string } | null,
   ) => void;
-  onSelectModel: (
+  onSelectModel?: (
     agentKind: AgentKind,
     model: string,
     quotaPeer?: { token: string; name: string } | null,
   ) => void;
+  onNewSession?: () => void;
 }): void {
   const allowed = new Set(options.allowedActions);
   const onKeyDown = (event: KeyboardEvent) => {
@@ -144,19 +145,26 @@ export function mountSessionShortcuts(options: {
     const shortcuts = state.settings?.sessionShortcuts ?? [];
     if (shortcuts.length === 0) return;
     const hit = findSessionShortcut(event, shortcuts);
-    if (!hit?.keys || !hit.target) return;
+    if (!hit?.keys) return;
     if (!allowed.has(hit.action)) return;
+    if (hit.action !== "newSession" && !hit.target) return;
     if (isEditableTarget(event.target) && !shortcutHasModifier(hit.keys)) return;
 
+    if (hit.action === "newSession") {
+      event.preventDefault();
+      event.stopPropagation();
+      options.onNewSession?.();
+      return;
+    }
     if (hit.action === "selectProject") {
       event.preventDefault();
       event.stopPropagation();
       const roam = parseRoamTarget(hit.target);
       if (roam) {
-        options.onSelectProject(roam.folder, roam);
+        options.onSelectProject?.(roam.folder, roam);
         return;
       }
-      options.onSelectProject(hit.target, null);
+      options.onSelectProject?.(hit.target, null);
       return;
     }
     if (hit.action === "selectModel") {
@@ -170,7 +178,7 @@ export function mountSessionShortcuts(options: {
             name: state.peers.find((peer) => peer.token === parsed.peerToken)?.name ?? "队友",
           }
         : null;
-      options.onSelectModel(parsed.agentKind, parsed.model, quotaPeer);
+      options.onSelectModel?.(parsed.agentKind, parsed.model, quotaPeer);
     }
   };
 

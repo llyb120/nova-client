@@ -354,16 +354,27 @@ export interface CursorModelContextRule {
   contextWindow: number;
 }
 
-export type SessionShortcutAction = "selectProject" | "selectModel";
+export type SessionShortcutAction = "selectProject" | "selectModel" | "newSession";
 
-/** 会话快捷键：一键切到指定项目或模型。 */
+/** 会话快捷键：一键切到指定项目或模型，或快速新会话。 */
 export interface SessionShortcut {
   id: string;
   /** 规范化按键，如 Ctrl+1 / Alt+P。 */
   keys: string;
   action: SessionShortcutAction;
-  /** 本地项目路径、roam/quota 编码，或 agentKind:model。 */
+  /** 本地项目路径、roam/quota 编码，或 agentKind:model；newSession 可为空。 */
   target: string;
+}
+
+/** 从当前会话进入新会话页时暂存的目录/模型，供 HomeView 继承。 */
+export interface PendingNewSessionSeed {
+  cwd: string;
+  agentKind: AgentKind;
+  model: string;
+  mode: string;
+  reasoningEffort: string;
+  roam: { peerToken: string; folder: string } | null;
+  quotaPeerToken: string | null;
 }
 
 export interface Settings {
