@@ -81,8 +81,19 @@ implementation for every non-LLM computation.
   compaction, full/slim switching, snapshot freeze, conclusion/capacity/error
   persistence). This fixes the prior empty-transcript-per-turn gap (multi-turn
   memory now works natively).
+- M10d–h (done): the remaining production surfaces. **M10d** the other three
+  provider protocols — `transform.rs` (shared cross-provider message
+  normalization), `provider_anthropic.rs`, `provider_responses.rs`,
+  `provider_google.rs` (request building + SSE/chunk accumulators), all
+  dispatched from `vega_provider::stream_turn`. **M10e** Reasonix digest
+  compaction wired via a `plan_compaction`/`apply_compaction` split around the
+  async lightweight-model summary turn. **M10f** the mid-turn
+  `prepareNextTurnWithContext` hook in the agent loop (optional, parity-safe),
+  wired to Reasonix per-round tool-result compaction + slim rebase. **M10g**
+  prompt-image pass-through and a minimal MCP stdio client (`mcp.rs`).
+  **M10h** `reasoningEffort` threaded into each provider's thinking config.
 
-All 61 pi_core tests (32 unit + 29 differential) are green and `cargo test`
+All 64 pi_core tests (35 unit + 29 differential) are green and `cargo test`
 needs no node. `nova_lib` compiles with 0 errors both with and without
 `native-vega`.
 
@@ -106,6 +117,13 @@ needs no node. `nova_lib` compiles with 0 errors both with and without
 | `alkaid-bridge-common.mjs` `startedToolItem` + reasonix subscribe handler | `bridge.rs` |
 | tool execution (read/edit/write/ls/bash/grep/find dispatch) | `tools.rs` |
 | `pi-ai` openai-completions message/SSE conversion | `provider.rs` |
+| `pi-ai` anthropic-messages message/SSE conversion | `provider_anthropic.rs` |
+| `pi-ai` openai-responses message/SSE conversion | `provider_responses.rs` |
+| `pi-ai` google-generative-ai message/chunk conversion | `provider_google.rs` |
+| `pi-ai` `transform-messages.js` cross-provider normalization | `transform.rs` |
+| `alkaid-slim-memory.mjs` Reasonix context management | `slim_memory.rs` |
+| `pi-coding-agent` skill discovery + `/skill:` expansion | `skills_discovery.rs` |
+| `alkaid-core.mjs` `connectMcpServers`/`mcpResult` | `nova_lib/src/mcp.rs` |
 | `alkaid-config.mjs` config/model resolution | `alkaid_config.rs` |
 
 ## Verified parity boundaries (honest limits)
@@ -122,29 +140,28 @@ needs no node. `nova_lib` compiles with 0 errors both with and without
 
 ## Remaining work (outside the verifiable scope)
 
-The deterministic core, the native tool executor, the OpenAI Chat Completions
-transport, the Vega config resolution, the Reasonix slim-memory port + per-turn
-orchestration, native skill discovery, and the feature-gated `sdk_runtime` seam
-are all in place. What remains is either large additional porting or inherently
-online / production-cutover work that cannot be differentially tested here:
+The deterministic core, the native tool executor, all four provider protocols
+(`openai-completions`, `anthropic-messages`, `openai-responses`,
+`google-generative-ai`), the Vega config resolution, the full Reasonix port
+(slim-memory + between-turn orchestration + mid-turn hook + digest compaction),
+native skill discovery, prompt images, reasoning-effort pass-through, the MCP
+stdio client, and the feature-gated `sdk_runtime` seam are all in place. What
+remains is inherently online / production-cutover work that cannot be
+differentially tested here:
 
-1. **Other provider protocols.** `openai-completions` is implemented;
-   `openai-responses`, `anthropic-messages` (~1k lines: cache control, thinking
-   signatures, tool references), and `google-generative-ai` are explicit
-   extension points in `vega_provider.rs` (part of the excluded `pi-ai` surface).
-2. **Reasonix digest compaction + mid-turn hook.** `compactSlimMemory`'s LLM
-   `summarize` is not yet wired (needs a plan/apply split around the async
-   summary turn), and the agent loop does not yet expose the
-   `prepareNextTurnWithContext` hook the bridge uses for mid-turn context
-   maintenance. The between-turn capacity logic is fully active.
-3. **MCP.** `prepare_native_turn` does not connect MCP servers (needs a stdio
-   JSON-RPC client); the node bridge does this via `pi-coding-agent`.
-4. **Pass-through completeness.** `read_only` and shell are wired; images,
-   `reasoningEffort`/`thinkingLevel`, and `lightweightModel` are not yet carried
-   through the native provider request.
-5. **Live-provider verification + gray-release.** Enable `native-vega`, exercise
-   real turns against each provider, and compare against the node bridge before
-   flipping the default.
-6. **Retire the node bridge.** Only after the above: remove
-   `resources/alkaid-bridge.mjs` and the `node` spawn in `spawn_bridge`. The
-   bridge is intentionally left in place and remains the default path.
+1. **Live-provider verification + gray-release.** Enable `native-vega`, exercise
+   real turns against each of the four providers, and compare against the node
+   bridge before flipping the default. The three new transports and the MCP
+   client compile but have not been run against live endpoints.
+2. **MCP live verification.** `mcp.rs` needs a running MCP server to validate
+   the initialize/list/call handshake end to end.
+3. **Retire the node bridge.** Only after the above: remove
+   `resources/alkaid-bridge.mjs` and the `node` spawn in `spawn_bridge`, and
+   drop the `@earendil-works/pi-*` packages from `package.json`. The bridge is
+   intentionally left in place and remains the default path.
+
+Known minor parity gaps (documented, non-blocking): UTF-16 vs scalar slicing in
+the slim-memory compaction heuristic and `should_use_full_context`'s capacity
+check (exact for ASCII/BMP); the three new provider accumulators are unit-shaped
+but not yet golden-diffed against node (only `openai-completions` and the
+deterministic core have differential vectors).
