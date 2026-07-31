@@ -21,7 +21,7 @@ use pi_core::provider_anthropic::{build_anthropic_request, AnthropicAccumulator}
 use pi_core::provider_google::{build_google_request, GoogleAccumulator};
 use pi_core::provider_responses::{build_openai_responses_request, ResponsesAccumulator};
 use pi_core::text::OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::http_stream::{decode_sse_json, SseDecoder};
 
@@ -35,6 +35,10 @@ pub struct ProviderConfig {
     pub model_id: String,
     pub provider: String,
     pub api_key: Option<String>,
+    /// Per-million-token cost rates (input/output/cacheRead/cacheWrite).
+    pub cost: Value,
+    /// Model output token limit (`limit.output`).
+    pub max_tokens: u64,
 }
 
 /// Run one provider turn and return the collected stream.
@@ -102,7 +106,7 @@ async fn stream_turn_once(
     tools: &[Value],
     session_id: Option<&str>,
 ) -> Result<StreamTurn, String> {
-    match config.api.as_str() {
+    let mut turn = match config.api.as_str() {
         "openai-completions" => {
             stream_openai_chat(client, config, system_prompt, messages, tools, session_id).await
         }
@@ -119,7 +123,36 @@ async fn stream_turn_once(
         other => Err(format!(
             "native Vega transport does not yet implement provider api: {other}"
         )),
-    }
+    }?;
+    // Attach token cost (port of pi-ai `calculateCost`) to the final usage.
+    attach_cost(&mut turn.result, &config.cost);
+    Ok(turn)
+}
+
+/// Port of pi-ai `calculateCost`: fill `usage.cost` from per-million-token rates.
+pub fn attach_cost(message: &mut Value, cost_rates: &Value) {
+    let rate = |key: &str| cost_rates.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+    let (input, output, cache_read, cache_write) = {
+        let usage = message.get("usage");
+        (
+            usage.and_then(|u| u.get("input")).and_then(Value::as_f64).unwrap_or(0.0),
+            usage.and_then(|u| u.get("output")).and_then(Value::as_f64).unwrap_or(0.0),
+            usage.and_then(|u| u.get("cacheRead")).and_then(Value::as_f64).unwrap_or(0.0),
+            usage.and_then(|u| u.get("cacheWrite")).and_then(Value::as_f64).unwrap_or(0.0),
+        )
+    };
+    let input_cost = input / 1_000_000.0 * rate("input");
+    let output_cost = output / 1_000_000.0 * rate("output");
+    let cache_read_cost = cache_read / 1_000_000.0 * rate("cacheRead");
+    let cache_write_cost = cache_write / 1_000_000.0 * rate("cacheWrite");
+    let total = input_cost + output_cost + cache_read_cost + cache_write_cost;
+    message["usage"]["cost"] = json!({
+        "input": input_cost,
+        "output": output_cost,
+        "cacheRead": cache_read_cost,
+        "cacheWrite": cache_write_cost,
+        "total": total,
+    });
 }
 
 async fn stream_openai_chat(
@@ -204,7 +237,7 @@ async fn stream_anthropic(
         "provider": config.provider,
         "api": config.api,
     });
-    let body = build_anthropic_request(&model, system_prompt, messages, tools, session_id);
+    let body = build_anthropic_request(&model, system_prompt, messages, tools, session_id, config.max_tokens);
 
     let url = format!("{}/v1/messages", config.base_url.trim_end_matches('/'));
     let mut request = client
@@ -270,7 +303,7 @@ async fn stream_openai_responses(
         "provider": config.provider,
         "api": config.api,
     });
-    let body = build_openai_responses_request(&model, system_prompt, messages, tools, session_id);
+    let body = build_openai_responses_request(&model, system_prompt, messages, tools, session_id, config.max_tokens);
 
     let url = format!("{}/responses", config.base_url.trim_end_matches('/'));
     let mut request = client.post(&url).json(&body);
@@ -333,7 +366,7 @@ async fn stream_google(
         "provider": config.provider,
         "api": config.api,
     });
-    let body = build_google_request(&model, system_prompt, messages, tools);
+    let body = build_google_request(&model, system_prompt, messages, tools, config.max_tokens);
     // The request builder returns { model, contents, config }; the HTTP body is
     // { contents, ...config } with systemInstruction/tools/thinkingConfig lifted.
     let contents = body.get("contents").cloned().unwrap_or(serde_json::json!([]));

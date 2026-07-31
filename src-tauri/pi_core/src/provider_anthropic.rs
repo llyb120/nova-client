@@ -240,6 +240,7 @@ pub fn build_anthropic_request(
     messages: &[Value],
     tools: &[Value],
     session_id: Option<&str>,
+    max_tokens: u64,
 ) -> Value {
     let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
     let provider = model.get("provider").and_then(Value::as_str).unwrap_or("");
@@ -268,7 +269,10 @@ pub fn build_anthropic_request(
     body.insert("stream".to_string(), json!(true));
     body.insert(
         "max_tokens".to_string(),
-        model.get("maxTokens").cloned().unwrap_or(json!(8192)),
+        model
+            .get("maxTokens")
+            .cloned()
+            .unwrap_or_else(|| json!(max_tokens)),
     );
     if !system_prompt.is_empty() {
         body.insert(

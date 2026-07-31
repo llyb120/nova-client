@@ -193,6 +193,7 @@ pub fn build_google_request(
     system_prompt: &str,
     messages: &[Value],
     tools: &[Value],
+    max_tokens: u64,
 ) -> Value {
     let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
     let provider = model.get("provider").and_then(Value::as_str).unwrap_or("");
@@ -214,6 +215,7 @@ pub fn build_google_request(
     let (system_instruction, contents) = convert_google_messages(model, system_prompt, &transformed);
 
     let mut config = json!({});
+    config["maxOutputTokens"] = json!(max_tokens);
     if let Some(si) = system_instruction {
         config["systemInstruction"] = json!(si);
     }

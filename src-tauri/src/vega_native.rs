@@ -386,6 +386,8 @@ pub fn resolve_provider_config(
         model_id: model.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
         provider: model.get("provider").and_then(Value::as_str).unwrap_or("").to_string(),
         api_key,
+        cost: model.get("cost").cloned().unwrap_or(json!({})),
+        max_tokens: model.get("maxTokens").and_then(Value::as_u64).unwrap_or(32000),
     })
 }
 
@@ -749,6 +751,8 @@ pub fn prepare_native_turn(
         model_id: model.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
         provider: model.get("provider").and_then(Value::as_str).unwrap_or("").to_string(),
         api_key,
+        cost: model.get("cost").cloned().unwrap_or(json!({})),
+        max_tokens: model.get("maxTokens").and_then(Value::as_u64).unwrap_or(32000),
     };
 
     let shell_config = if read_only {

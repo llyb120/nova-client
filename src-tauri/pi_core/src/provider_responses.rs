@@ -203,6 +203,7 @@ pub fn build_openai_responses_request(
     messages: &[Value],
     tools: &[Value],
     session_id: Option<&str>,
+    max_tokens: u64,
 ) -> Value {
     let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
     let provider = model.get("provider").and_then(Value::as_str).unwrap_or("");
@@ -236,6 +237,8 @@ pub fn build_openai_responses_request(
     if !responses_tools.is_empty() {
         body["tools"] = Value::Array(responses_tools);
     }
+    // OpenAI Responses rejects max_output_tokens below 16.
+    body["max_output_tokens"] = json!(max_tokens.max(16));
     if model.get("reasoning").and_then(Value::as_bool).unwrap_or(false) {
         let effort = model
             .get("thinkingLevel")
