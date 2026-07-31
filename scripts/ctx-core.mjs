@@ -127,13 +127,13 @@ export function contextBundle({ keywords, budget = 700, ctx = 12, maxFiles = 12 
   out.push('以下 [HIT] 文件已提供符号大纲 + 关键命中段，等同于已读取：');
   for (const f of coveredHit) out.push(`  - ${f}`);
   out.push('禁止对上述 [HIT] 文件再调用 read / read_files 读取全文或已展示的行段；直接基于以上内容作答或编辑。');
-  out.push('若确需 [HIT] 文件未展示的行范围，按全局 read/read_files 规则只读缺失段：单个文件用 read 带 offset/limit，两个及以上合并为一次 read_files 并各自带 offset/limit；不得读全文。');
+  out.push('确需未展示行时只补缺失段：单个范围用 read，多个范围（含同文件多块）合并为一次 read_files，禁读全文。');
   out.push('[NEIGHBOR] 文件仅含大纲，需要其实现细节时可按需读取；未展开文件同理。');
   out.push('判定步骤：调用 read/read_files 前，先核对目标路径是否在上列 [HIT] 清单中；若在，跳过读取。');
-  out.push('若以上上下文仍不足，优先用更大 budget 重新调用 context_bundle，而非逐文件 read。');
+  out.push('若以上上下文仍不足，优先用更大 budget 重新调用 fast_context，而非逐文件 read。');
   out.push('The [HIT] files listed above already include symbol outlines + key hit segments and count as READ.');
   out.push('Do NOT call read/read_files on them for full text or already-shown ranges; answer/edit from the content above.');
-  out.push('If you need an unseen range of [HIT] files, read only the missing segments per the global read/read_files rule: use read with offset/limit for a single file, or merge two or more into one read_files call with per-file offset/limit; never read the whole file.');
+  out.push('Need unseen lines? Read only the gaps: one range → read, multiple ranges (incl. several blocks of one file) → one read_files; never the whole file.');
   out.push('Before any read/read_files, check whether the target path is in the [HIT] list above; if yes, skip the read.');
   return out.join('\n');
 }
@@ -157,18 +157,22 @@ export function codeMap(_args = {}, root = repoRoot()) {
   return out.join('\n');
 }
 
-// ---------- find_symbol ----------
-export function findSymbol({ name }, root = repoRoot()) {
-  if (!name) return '错误: name 不能为空';
-  const lines = gitGrep(root, `\\b${name}\\b`).split('\n')
-    .filter(l => l && !EXCLUDE.test(l.split(':')[0]));
-  return `# 符号定位: ${name}  [${shortHead(root)}]\n` + lines.slice(0, 40).join('\n');
+// ---------- find_symbols ----------
+export function findSymbols({ names }, root = repoRoot()) {
+  if (!Array.isArray(names) || names.length === 0) return '错误: names 不能为空';
+  const rev = shortHead(root);
+  const sections = names.map(name => {
+    const lines = gitGrep(root, `\\b${name}\\b`).split('\n')
+      .filter(l => l && !EXCLUDE.test(l.split(':')[0]));
+    return `## ${name}\n` + (lines.slice(0, 40).join('\n') || '(无命中)');
+  });
+  return `# 符号定位 [${rev}]\n` + sections.join('\n\n');
 }
 
 // ---------- 工具 schema + 分发 (供两个封装共用) ----------
 export const TOOLS = [
   {
-    name: 'context_bundle',
+    name: 'fast_context',
     description: '按关键词/符号一次性打包相关代码上下文(命中文件分层装配 + 1跳调用邻居)。输出末尾的 [HIT] 清单等同于已读取，禁止对这些文件再 read/read_files。用于在分析/修改前快速获取代码全貌, 减少逐步读取。',
     inputSchema: {
       type: 'object',
@@ -187,21 +191,21 @@ export const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
-    name: 'find_symbol',
-    description: '快速定位某个符号在仓库中的所有出现位置(文件:行号)。',
+    name: 'find_symbols',
+    description: '并行定位多个符号在仓库中的所有出现位置(文件:行号)。',
     inputSchema: {
       type: 'object',
-      properties: { name: { type: 'string', description: '符号名' } },
-      required: ['name'],
+      properties: { names: { type: 'array', items: { type: 'string' }, minItems: 1, description: '符号名列表' } },
+      required: ['names'],
     },
   },
 ];
 
 export function callTool(name, args) {
   switch (name) {
-    case 'context_bundle': return contextBundle(args ?? {});
+    case 'fast_context': return contextBundle(args ?? {});
     case 'code_map': return codeMap(args ?? {});
-    case 'find_symbol': return findSymbol(args ?? {});
+    case 'find_symbols': return findSymbols(args ?? {});
     default: throw new Error(`未知工具: ${name}`);
   }
 }

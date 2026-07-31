@@ -1,7 +1,7 @@
 import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { contextBundle, findSymbol } from "./ctx-core.mjs";
+import { contextBundle, findSymbols } from "./ctx-core.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -80,7 +80,7 @@ const PATH_OR_RANGE_SCHEMA = {
 
 /**
  * Vega-style batch FS tools for Cursor SDK `local.customTools`.
- * Exposes read_files plus code-context tools (context_bundle, find_symbol).
+ * Exposes read_files plus code-context tools (fast_context, find_symbols).
  * edit_files is intentionally omitted because Cursor
  * CallMcpTool truncates/mangles large or heavily-escaped arguments.
  * Use Cursor built-in Write / StrReplace / Edit for mutations.
@@ -125,7 +125,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
     },
     ...(fastContext ? {
-    context_bundle: {
+    fast_context: {
       description: "按关键词/符号一次性打包相关代码上下文：命中文件按相关度分层装配（小文件全文、大文件给符号大纲+命中段），并附 1 跳调用邻居大纲。用于在分析或修改前快速获取代码全貌，避免逐文件试探式读取。基于 git grep + rg，无需预建索引。",
       inputSchema: {
         type: "object",
@@ -142,16 +142,16 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         return contextBundle(params ?? {}, root);
       },
     },
-    find_symbol: {
-      description: "快速定位符号在仓库中的所有出现位置（文件:行号），基于 git grep。用于在读取/修改前确认符号分布。",
+    find_symbols: {
+      description: "并行定位多个符号在仓库中的所有出现位置（文件:行号），基于 git grep。用于在读取/修改前确认符号分布。",
       inputSchema: {
         type: "object",
-        properties: { name: { type: "string", description: "符号名" } },
-        required: ["name"],
+        properties: { names: { type: "array", minItems: 1, items: { type: "string" }, description: "符号名列表" } },
+        required: ["names"],
         additionalProperties: false,
       },
       async execute(params) {
-        return findSymbol(params ?? {}, root);
+        return findSymbols(params ?? {}, root);
       },
     },
     } : {}),
@@ -174,7 +174,7 @@ export function cursorBatchToolPolicy(options = {}) {
         ? ""
         : " For edits, use Cursor built-in Write/Edit/StrReplace; do not expect a Nova edit_files tool."),
     (fastContext
-      ? "Search and traversal must be cost-bounded. When you need to understand a symbol/keyword's distribution and surrounding code, prefer context_bundle (one call returns layered file contents + 1-hop neighbor outlines) or find_symbol (locations only); they use git grep + rg internally and are more efficient than multiple manual searches. "
+      ? "Search and traversal must be cost-bounded. When you need to understand a symbol/keyword's distribution and surrounding code, prefer fast_context (one call returns layered file contents + 1-hop neighbor outlines) or find_symbols (locate multiple symbols in parallel); they use git grep + rg internally and are more efficient than multiple manual searches. "
       : "Search and traversal must be cost-bounded. ") + "Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `git grep` for tracked files; use `rg` when untracked files matter, and honor `.gitignore` by default. Cursor Grep is also allowed. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];
   if (readOnly) {
