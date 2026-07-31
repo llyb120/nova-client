@@ -24,6 +24,7 @@ impl SdkAdapter for ClaudeAdapter {
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
             program: settings.claudecode_path.clone(),
+            native_bridge: false,
             proxy: settings.claudecode_proxy.clone(),
             path_env: "NOVA_CLAUDE_PATH",
             api_key: (!settings.claudecode_sdk_api_key.is_empty())

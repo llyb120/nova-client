@@ -176,6 +176,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [cursorModelContexts, setCursorModelContexts] = createSignal(
     (s?.cursorModelContexts ?? []).map((rule) => ({ ...rule })),
   );
+  const [vegaEngine, setVegaEngine] = createSignal<"rust" | "typescript">(
+    s?.vegaEngine === "rust" ? "rust" : "typescript",
+  );
   const [vegaContextMode, setVegaContextMode] = createSignal<"default" | "super">(
     s?.vegaContextMode === "super" ? "super" : "default",
   );
@@ -459,6 +462,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     cursorModelContexts: cursorModelContexts()
       .map((rule) => ({ prefix: rule.prefix.trim(), contextWindow: rule.contextWindow }))
       .filter((rule) => rule.prefix.length > 0),
+    vegaEngine: vegaEngine(),
     vegaContextMode: vegaContextMode(),
     cursorContextMode: cursorContextMode(),
     opencodeProxy: opencodeProxy().trim(),
@@ -1018,6 +1022,24 @@ export function SettingsModal(props: { onClose: () => void }) {
 
           {/* ===== 高级 ===== */}
           <Show when={tab() === "advanced"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">Vega 引擎</h3>
+              <label class="field">
+                <span class="field-label">Agent 引擎</span>
+                <select
+                  class="field-input"
+                  value={vegaEngine()}
+                  onChange={(e) => setVegaEngine(e.currentTarget.value === "typescript" ? "typescript" : "rust")}
+                >
+                  <option value="rust">Rust 原生（预览，无 Node）</option>
+                  <option value="typescript">TypeScript Pi（默认）</option>
+                </select>
+                <span class="field-hint">
+                  Rust 原生实现使用内嵌 Pi SDK，不依赖 Node；TypeScript Pi 保留为机制等价的回退实现。切换后会重启 Vega。
+                </span>
+              </label>
+            </section>
+
             <section class="settings-group">
               <h3 class="settings-group-title">上下文机制</h3>
               <label class="field">

@@ -203,6 +203,10 @@ fn main() {
     // 后端线程启动前恢复，否则已安装的 codex、npx 等都会被误判为不可用。
     nova_lib::init_process_path();
 
+    if nova_lib::maybe_run_alkaid_native_bridge() {
+        return;
+    }
+
     if let Some(result) = nova_lib::maybe_run_server_command() {
         if let Err(error) = result {
             eprintln!("Nova server 命令失败：{error}");

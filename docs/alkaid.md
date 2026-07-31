@@ -1,18 +1,19 @@
-# Vega（pi core）
+# Vega（Pi bridge）
 
-Vega 是一个基于 pi agent core 的轻量 coding agent，目标是少往返、低复杂度和默认并行。
+Vega 是一个基于 Pi 的轻量 coding agent，目标是少往返、低复杂度和默认并行。桌面端可在 Nova 进程中嵌入 [pi_agent_rust](https://github.com/Dicklesworthstone/pi_agent_rust) SDK，并以自身可执行文件的隐藏子命令运行无 Node 的原生 bridge；原 TypeScript Pi bridge 保留并暂作为默认引擎，直到原生机制契约全部对齐。
 
 ## 当前能力
 
-- 使用 `@earendil-works/pi-agent-core` / `pi-ai` / `pi-coding-agent`（0.81+），工具执行策略固定为 `parallel`。
-- `read_files`：同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，强制合并为单次并行读取，禁止拆成多个原生 `read`。
-- `edit_files`：两个及以上互不依赖的已有文件走单次并行智能编辑。每个文件先精确匹配，再以稀有行倒排索引生成候选，依次尝试行尾空白、Unicode、相对缩进及保守的行/token 模糊评分；多个近似候选、低置信度或编辑重叠时拒绝。所有目标都在不可变快照上定位成功后才并行写入，并保留 BOM、换行风格和匹配位置的缩进。
+- Rust 原生引擎通过 `pi::sdk` 进程内接入，沿用 Nova NDJSON 契约，并原生实现模型配置、native memory、上下文分级、事件卡片、取消与 steer；不启动 Node 或外部 `pi` CLI。
+- TypeScript 回退引擎继续使用 `@earendil-works/pi-agent-core` / `pi-ai` / `pi-coding-agent`（0.81+），工具执行策略固定为 `parallel`。
+- TypeScript 引擎保留 `read_files`：同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，强制合并为单次并行读取，禁止拆成多个原生 `read`。Rust 引擎使用原生 `read` / `grep` / `find` / `ls` 并允许并行工具调用。
+- TypeScript 引擎保留 `edit_files`：两个及以上互不依赖的已有文件走单次并行智能编辑。每个文件先精确匹配，再以稀有行倒排索引生成候选，依次尝试行尾空白、Unicode、相对缩进及保守的行/token 模糊评分；多个近似候选、低置信度或编辑重叠时拒绝。所有目标都在不可变快照上定位成功后才并行写入，并保留 BOM、换行风格和匹配位置的缩进。Rust 引擎使用原生 `edit` / `write` / `hashline_edit`。
 - `read_files` / `edit_files` 支持访问工作区内外的相对或绝对路径，便于处理用户明确指定的外部文件。`edit_files` 会合并解析到同一文件的多个目标项，由智能 patch 算法统一判断定位歧义和编辑重叠。
 - Skills 使用 pi 的 `loadSkillsFromDir` + Agent Skills 标准目录格式；根目录为 `~/.nova/alkaid/skills`。输入 `/skill:<name>` 可补全并显式调用 skill；普通任务中模型也可按需用 `read` / `read_files` 加载完整 `SKILL.md`（不再提供自定义 `load_skill` 工具）。
 - 系统提示词：Vega 策略（批量读写、最小读取、改后验证、shell 语法约束）为稳态前缀；`cwd` / skills 目录为动态后缀，便于 provider prompt/KV cache 命中。skills ≥ 4 时压缩目录体积。
 - 命令终端：Windows 直接使用 PowerShell（`System32` 自带或 PATH 上的 `powershell.exe`，桌面端启用 shell shim 时按 kind 经 `NOVA_SHELL_SHIM_POWERSHELL` / `NOVA_SHELL_SHIM_BASH` 无窗口启动），找不到 PowerShell 时兜底回退 bash 探测；macOS / Linux 维持 bash。
 - Provider 缓存：默认 `cacheRetention: "long"`，为 OpenAI 兼容请求补齐 `prompt_cache_key`（session id）；第三方 OpenAI/Anthropic 兼容代理默认开启 `sendSessionAffinityHeaders`（不覆盖用户显式配置）。
-- 支持并行连接多个 MCP stdio server，并把工具映射为 `mcp__<server>__<tool>`。
+- 两种引擎都支持多个 MCP stdio server，并把工具映射为 `mcp__<server>__<tool>`；Rust 原生 bridge 直接实现 MCP initialize、`tools/list` 与 `tools/call`。
 - 本机配置读取 `~/.nova/alkaid/config.jsonc`（OpenCode 风格），可与服务端下发配置合并；密钥仅从进程环境 / `{env:NAME}` 解析。
 - 已作为独立的 `alkaid` 后端接入桌面端；后端选择顺序为“收藏 → Vega → 其他后端”。
 - 会话消息持久化到 `~/.nova/alkaid/sessions`，支持跨 bridge 进程续接多轮上下文。开启“超级上下文”时，OpenAI/GPT 已完成轮次不再回传 reasoning；当前轮次及中断后续做所需的原生工具轨迹仍完整保留。重组后的提示词/结论上下文按实际用量或保守估算计数，达到模型窗口 60% 时压缩，且压缩阈值最低为 150k tokens；优先使用设置中的轻量级模型，失败后回退当前会话模型。
@@ -24,9 +25,15 @@ Vega 是一个基于 pi agent core 的轻量 coding agent，目标是少往返�
 
 服务端配置中的密钥建议继续写成 `{env:NAME}`；对应环境变量必须注入客户端 Nova 进程，服务端不会代替客户端保存运行凭据。
 
+## 引擎切换
+
+“设置 → 高级 → Vega 引擎”提供“Rust 原生（预览）”和“TypeScript Pi”两项，切换后 Nova 会重启 Vega。Rust SDK 已固定为 Cargo git revision 并编译进 Nova，不要求安装外部 `pi` 可执行文件。
+
+Rust bridge 会为每个进程在 `~/.nova/alkaid/native-runtime` 生成临时 `models.json`，将现有 Vega provider/model 配置翻译给内嵌 SDK；进程关闭后删除。
+
 ## 本机运行
 
-当前机器的 provider 凭据变量必须已注入当前 shell。Vega 不会读取、打印或保存密钥值。
+当前机器的 provider 凭据变量必须已注入当前 shell。Vega 不会打印或持久保存密钥；Rust bridge 通过内存中的 `SessionOptions.api_key` 向内嵌 SDK 传递当前 provider 凭据，临时 `models.json` 不含密钥。`npm run alkaid` 直接运行 TypeScript bridge，桌面端当前默认使用 TypeScript Pi，也可显式切换 Rust 原生预览。
 
 ```bash
 npm run alkaid -- --prompt "请只回复 Vega OK"

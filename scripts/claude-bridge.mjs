@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline";
-import { existsSync } from "node:fs";
+import { existsSync, writeSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
@@ -7,18 +7,63 @@ const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
 function claudePathOverride() {
   const path = process.env.NOVA_CLAUDE_PATH;
-  if (process.platform !== "win32" || !path || path.toLowerCase().endsWith(".exe")) return path || undefined;
+  if (!path) return undefined;
+  if (process.platform !== "win32") return path;
+  if (path.toLowerCase().endsWith(".exe")) return existsSync(path) ? path : undefined;
   const roots = new Set();
   if (isAbsolute(path)) roots.add(dirname(path));
   if (process.env.APPDATA) roots.add(join(process.env.APPDATA, "npm"));
-  if (process.env.USERPROFILE) roots.add(join(process.env.USERPROFILE, "AppData", "Roaming", "npm"));
+  if (process.env.USERPROFILE) {
+    roots.add(join(process.env.USERPROFILE, "AppData", "Roaming", "npm"));
+    roots.add(join(process.env.USERPROFILE, ".local", "bin"));
+  }
+  if (process.env.LOCALAPPDATA) {
+    roots.add(join(process.env.LOCALAPPDATA, "Programs", "claude"));
+    roots.add(join(process.env.LOCALAPPDATA, "claude"));
+  }
   if (process.env.npm_config_prefix) roots.add(process.env.npm_config_prefix);
   for (const root of (process.env.PATH ?? "").split(delimiter)) {
-    if (root && (existsSync(join(root, "claude.cmd")) || existsSync(join(root, "claude.ps1")))) roots.add(root);
+    if (!root) continue;
+    if (existsSync(join(root, "claude.exe"))) return join(root, "claude.exe");
+    if (existsSync(join(root, "claude.cmd")) || existsSync(join(root, "claude.ps1"))) roots.add(root);
   }
   return [...roots]
-    .map((root) => join(root, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"))
+    .flatMap((root) => [
+      join(root, "claude.exe"),
+      join(root, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"),
+    ])
     .find(existsSync);
+}
+
+function createStderrCollector() {
+  const chunks = [];
+  return {
+    push(data) {
+      chunks.push(data);
+      const joined = chunks.join("");
+      if (joined.length > 8_000) {
+        chunks.length = 0;
+        chunks.push(joined.slice(-4_000));
+      }
+    },
+    text() {
+      return chunks.join("").trim().slice(-4_000);
+    },
+  };
+}
+
+function failBridge(error, stderrText = "") {
+  const message = error instanceof Error ? error.message : String(error);
+  const detail = stderrText ? `${message}\n${stderrText}` : message;
+  try {
+    writeSync(1, `${JSON.stringify({ ok: false, error: detail })}\n`);
+  } catch {
+    /* stdout may already be closed */
+  }
+  if (stderrText) {
+    try { writeSync(2, `${stderrText}\n`); } catch { /* ignore */ }
+  }
+  process.exit(1);
 }
 
 function claudeModelOptions(models) {
@@ -103,13 +148,20 @@ function assistantItems(message, streamedBlocks) {
   });
 }
 
+function queryOptions(request, { stderr } = {}) {
+  return {
+    cwd: request.cwd,
+    pathToClaudeCodeExecutable: claudePathOverride(),
+    settingSources: ["user", "project", "local"],
+    ...(stderr ? { stderr } : {}),
+  };
+}
+
 async function modelOptions(request) {
+  const stderr = createStderrCollector();
   const activeQuery = query({
     prompt: "",
-    options: {
-      cwd: request.cwd,
-      pathToClaudeCodeExecutable: claudePathOverride(),
-    },
+    options: queryOptions(request, { stderr: (data) => stderr.push(data) }),
   });
   try {
     const models = await activeQuery.supportedModels();
@@ -122,6 +174,11 @@ async function modelOptions(request) {
       }],
       modes: null,
     };
+  } catch (error) {
+    const detail = stderr.text();
+    throw detail
+      ? new Error(`${error instanceof Error ? error.message : String(error)}\n${detail}`)
+      : error;
   } finally {
     activeQuery.close();
   }
@@ -143,6 +200,7 @@ async function main() {
   const pending = new Map();
   const stream = { messageId: "message", blocks: new Map() };
   const streamedBlocks = new Set();
+  const stderr = createStderrCollector();
   let sessionId = request.sessionId;
   let checkpoint;
   void (async () => {
@@ -157,45 +215,56 @@ async function main() {
     }
   })();
   const prompt = promptText(request.parts);
-  for await (const message of query({
-    prompt,
-    options: {
-      cwd: request.cwd,
-      resume: request.sessionId || undefined,
-      resumeSessionAt: request.restoreAt || undefined,
-      forkSession: Boolean(request.restoreAt),
-      model: selection.model,
-      effort: selection.effort,
-      includePartialMessages: true,
-      permissionMode: request.mode === "plan" ? "plan" : "default",
-      abortController: controller,
-      pathToClaudeCodeExecutable: claudePathOverride(),
-      canUseTool: (tool, input, options) => new Promise((resolve) => {
-        pending.set(options.toolUseID, resolve);
-        send({ type: "permission", permission: { id: options.toolUseID, permission: tool, metadata: input } });
-      }),
-    },
-  })) {
-    if (message.type === "system" && message.subtype === "init") {
-      sessionId = message.session_id;
-      send({ type: "ready", sessionId });
+  try {
+    for await (const message of query({
+      prompt,
+      options: {
+        ...queryOptions(request, {
+          stderr: (data) => {
+            stderr.push(data);
+            try { process.stderr.write(data); } catch { /* ignore */ }
+          },
+        }),
+        resume: request.sessionId || undefined,
+        resumeSessionAt: request.restoreAt || undefined,
+        forkSession: Boolean(request.restoreAt),
+        model: selection.model,
+        effort: selection.effort,
+        includePartialMessages: true,
+        permissionMode: request.mode === "plan" ? "plan" : "default",
+        abortController: controller,
+        canUseTool: (tool, input, options) => new Promise((resolve) => {
+          pending.set(options.toolUseID, resolve);
+          send({ type: "permission", permission: { id: options.toolUseID, permission: tool, metadata: input } });
+        }),
+      },
+    })) {
+      if (message.type === "system" && message.subtype === "init") {
+        sessionId = message.session_id;
+        send({ type: "ready", sessionId });
+      }
+      if (message.type === "stream_event") {
+        const item = streamEventItem(message, stream, streamedBlocks);
+        if (item) send({ type: "item", item });
+      }
+      if (message.type === "assistant") {
+        checkpoint = message.uuid;
+        for (const item of assistantItems(message, streamedBlocks)) send({ type: "item", item });
+      }
+      if (message.type === "result") {
+        if (message.is_error) throw new Error(message.errors?.join("\n") || "Claude turn failed");
+        if (sessionId && checkpoint) send({ type: "checkpoint", sessionId, position: checkpoint });
+        send({ type: "done", usage: message.usage });
+      }
     }
-    if (message.type === "stream_event") {
-      const item = streamEventItem(message, stream, streamedBlocks);
-      if (item) send({ type: "item", item });
-    }
-    if (message.type === "assistant") {
-      checkpoint = message.uuid;
-      for (const item of assistantItems(message, streamedBlocks)) send({ type: "item", item });
-    }
-    if (message.type === "result") {
-      if (message.is_error) throw new Error(message.errors?.join("\n") || "Claude turn failed");
-      if (sessionId && checkpoint) send({ type: "checkpoint", sessionId, position: checkpoint });
-      send({ type: "done", usage: message.usage });
-    }
+  } catch (error) {
+    const detail = stderr.text();
+    throw detail
+      ? new Error(`${error instanceof Error ? error.message : String(error)}\n${detail}`)
+      : error;
   }
 }
 
-if (process.env.NOVA_CLAUDE_BRIDGE_TEST !== "1") main().catch((error) => { send({ ok: false, error: error instanceof Error ? error.message : String(error) }); process.exitCode = 1; });
+if (process.env.NOVA_CLAUDE_BRIDGE_TEST !== "1") main().catch((error) => failBridge(error));
 
 export { assistantItems, claudeModelOptions, claudeModelSelection, promptText, streamEventItem };

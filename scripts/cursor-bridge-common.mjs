@@ -210,6 +210,15 @@ export function modelSelection(selected) {
   return { id: segments.join("-"), ...(params.length ? { params } : {}) };
 }
 
+/** Local Cursor SDK agents reject Auto / missing model; require an explicit id. */
+export function requireLocalModelSelection(selected) {
+  const model = modelSelection(selected);
+  if (!model?.id) {
+    throw new Error("Cursor+ 本地模式需要显式选择模型；Auto 不可用，请在模型列表中选择具体模型");
+  }
+  return model;
+}
+
 export function encodeModelVariant(model, variant) {
   const params = new URLSearchParams(variant.params.map((param) => [param.id, param.value]));
   const definitions = new Map((model.parameters ?? []).map((param) => [param.id, param]));
@@ -228,7 +237,7 @@ export function encodeModelVariant(model, variant) {
 }
 
 export function cursorModelOptions(models) {
-  const options = [{ value: "", name: "Auto（Cursor 默认）" }];
+  const options = [{ value: "", name: "Auto（需改选具体模型）" }];
   for (const model of models) {
     if (!model.id || ["auto", "default"].includes(model.id.toLowerCase())) continue;
     if (model.variants?.length) {

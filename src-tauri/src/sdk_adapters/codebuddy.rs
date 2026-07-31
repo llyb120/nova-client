@@ -24,6 +24,7 @@ impl SdkAdapter for CodeBuddyAdapter {
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
             program: settings.codebuddy_path.clone(),
+            native_bridge: false,
             proxy: settings.codebuddy_proxy.clone(),
             path_env: "NOVA_CODEBUDDY_PATH",
             api_key: None,

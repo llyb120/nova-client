@@ -165,6 +165,9 @@ assert.deepEqual(modelSelection("grok-4.5-high-false"), { id: "grok-4.5", params
 assert.deepEqual(modelSelection("composer-2.5-fast"), { id: "composer-2.5", params: [{ id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("gpt-5.6-sol"), { id: "gpt-5.6-sol" });
 assert.deepEqual(modelSelection("grok-4.5::effort=high&fast=false"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] });
+assert.deepEqual(commonContext.requireLocalModelSelection("composer-2.5"), { id: "composer-2.5" });
+assert.throws(() => commonContext.requireLocalModelSelection(""), /显式选择模型/);
+assert.throws(() => commonContext.requireLocalModelSelection(undefined), /显式选择模型/);
 assert.equal(
   agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a", mode: "agent" }),
   agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a" }),
@@ -268,7 +271,7 @@ assert.deepEqual(cursorModelOptions([
     { displayName: "Cursor Grok 4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] },
   ] },
 ]), [
-  { value: "", name: "Auto（Cursor 默认）" },
+  { value: "", name: "Auto（需改选具体模型）" },
   { value: "grok-4.5::effort=high&fast=false", name: "Cursor Grok 4.5 High", description: undefined },
   { value: "grok-4.5::effort=high&fast=true", name: "Cursor Grok 4.5 High Fast", description: undefined },
 ]);
@@ -344,7 +347,7 @@ const recoverySdk = {
 const timingPhases = [];
 const recovered = await sendPromptWithRecovery(
   recoverableAgent,
-  { cwd: "." },
+  { cwd: ".", model: "grok-4.5-high-fast" },
   "continue",
   {},
   recoverySdk,
@@ -380,7 +383,7 @@ const fallbackSdk = {
 };
 const fallback = await sendPromptWithRecovery(
   fallbackAgent,
-  { cwd: "." },
+  { cwd: ".", model: "grok-4.5-high-fast" },
   "incremental",
   {},
   fallbackSdk,

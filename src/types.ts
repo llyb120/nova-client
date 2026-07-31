@@ -372,6 +372,8 @@ export interface Settings {
   cursorSdkApiKey: string;
   /** Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。 */
   cursorModelContexts: CursorModelContextRule[];
+  /** Vega Agent 引擎：内嵌 Rust Pi SDK 或 Node/TypeScript Pi。 */
+  vegaEngine: "rust" | "typescript";
   /** Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
   vegaContextMode: "default" | "super";
   /** Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */

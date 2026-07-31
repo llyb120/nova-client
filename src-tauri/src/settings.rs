@@ -47,6 +47,8 @@ pub struct Settings {
     pub cursor_sdk_api_key: String,
     /// Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。
     pub cursor_model_contexts: Vec<CursorModelContextRule>,
+    /// Vega Agent 引擎：rust = 内嵌 pi_agent_rust SDK，typescript = Node/TypeScript Pi。
+    pub vega_engine: String,
     /// Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。
     pub vega_context_mode: String,
     /// Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。
@@ -152,6 +154,7 @@ impl Default for Settings {
             cursor_proxy: String::new(),
             cursor_sdk_api_key: String::new(),
             cursor_model_contexts: Vec::new(),
+            vega_engine: "typescript".into(),
             vega_context_mode: "default".into(),
             cursor_context_mode: "default".into(),
             opencode_path: "opencode".into(),
@@ -240,6 +243,7 @@ mod tests {
     #[test]
     fn context_modes_default_and_round_trip() {
         let defaults = Settings::default();
+        assert_eq!(defaults.vega_engine, "typescript");
         assert_eq!(defaults.vega_context_mode, "default");
         assert_eq!(defaults.cursor_context_mode, "default");
         let settings: Settings =
@@ -391,6 +395,9 @@ impl Settings {
         settings.claudecode_integration = "sdk".into();
         settings.cursor_integration = "sdk".into();
         settings.opencode_integration = "sdk".into();
+        if settings.vega_engine != "rust" {
+            settings.vega_engine = "typescript".into();
+        }
         if settings.vega_context_mode != "super" {
             settings.vega_context_mode = "default".into();
         }

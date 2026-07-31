@@ -225,7 +225,7 @@ assert.deepEqual(cursorModelOptions([
     { displayName: "Cursor Grok 4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] },
   ] },
 ]), [
-  { value: "", name: "Auto（Cursor 默认）" },
+  { value: "", name: "Auto（需改选具体模型）" },
   { value: "grok-4.5::effort=high&fast=false", name: "Cursor Grok 4.5 High", description: undefined },
   { value: "grok-4.5::effort=high&fast=true", name: "Cursor Grok 4.5 High Fast", description: undefined },
 ]);
@@ -294,7 +294,7 @@ const recoverySdk = {
 const timingPhases = [];
 const recovered = await sendPromptWithRecovery(
   recoverableAgent,
-  { cwd: "." },
+  { cwd: ".", model: "grok-4.5-high-fast" },
   "continue",
   {},
   recoverySdk,
@@ -321,7 +321,7 @@ const fallbackSdk = {
   cancelRun: async (id) => recoveryCalls.push(`cancel:${id}`),
   resume: async () => resumedAgent,
 };
-const fallback = await sendPromptWithRecovery(fallbackAgent, { cwd: "." }, "continue", {}, fallbackSdk, () => {});
+const fallback = await sendPromptWithRecovery(fallbackAgent, { cwd: ".", model: "grok-4.5-high-fast" }, "continue", {}, fallbackSdk, () => {});
 assert.equal(fallback.agent, resumedAgent);
 assert.equal(fallback.run, resumedRun);
 assert.equal(fallbackAttempts, 2);

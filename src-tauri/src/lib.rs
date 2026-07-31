@@ -1,5 +1,6 @@
 mod acp;
 mod agent_config;
+mod alkaid_native;
 mod cli;
 mod cli_manager;
 mod clues;
@@ -36,6 +37,7 @@ mod windows_shell_shim;
 /// 临时会话目录的统一父目录名（前端据此识别并显示「临时会话」）
 pub const SCRATCH_MARK: &str = "Nova-scratch";
 
+pub use alkaid_native::maybe_run as maybe_run_alkaid_native_bridge;
 pub use path_env::init_process_path;
 pub use server::configure_from_args as configure_server_mode;
 pub use server::maybe_run_management_command as maybe_run_server_command;
@@ -3748,6 +3750,7 @@ async fn apply_runtime_settings(
         let mut s = state.settings.lock().unwrap();
         let restart_vega = restart_all_agents
             || s.vega_proxy != settings.vega_proxy
+            || s.vega_engine != settings.vega_engine
             || s.vega_context_mode != settings.vega_context_mode
             || s.alkaid_enabled != settings.alkaid_enabled;
         let restart_devin = restart_all_agents

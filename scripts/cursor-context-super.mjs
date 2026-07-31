@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { Agent } from "@cursor/sdk";
-import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isEditFilesTool, mapDelta, mapMessage, modelOptions, modelSelection } from "./cursor-bridge-common.mjs";
+import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isEditFilesTool, mapDelta, mapMessage, modelOptions, modelSelection, requireLocalModelSelection } from "./cursor-bridge-common.mjs";
 import { createCursorFilesystemTools, cursorPromptPrefix } from "./cursor-filesystem-tools.mjs";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -455,7 +455,7 @@ async function summarizeSlimMemory(memory, request, sdk = Agent) {
   return compressSlimMemory(memory, async (earlierTurns) => {
     const agent = await sdk.create({
       apiKey: process.env.CURSOR_API_KEY,
-      model: modelSelection(request.model),
+      model: requireLocalModelSelection(request.model),
       local: { cwd: request.cwd },
     });
     try {
@@ -561,7 +561,7 @@ async function seedSlimMemoryFromSession(memory, sessionId, request, sdk = Agent
   if (!sessionId || !isSlimMemoryEmpty(memory)) return false;
   const options = {
     apiKey: process.env.CURSOR_API_KEY,
-    model: modelSelection(request.model),
+    model: requireLocalModelSelection(request.model),
     local: { cwd: request.cwd },
   };
   let agent;
@@ -624,7 +624,7 @@ async function recoverTimedOutAgent(
   agent.close();
   const options = {
     apiKey: process.env.CURSOR_API_KEY,
-    model: modelSelection(request.model),
+    model: requireLocalModelSelection(request.model),
     local: {
       cwd: request.cwd,
       customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
@@ -702,7 +702,7 @@ async function sendPromptWithRecovery(
   agent.close();
   const resumedAgent = await sdk.resume(agentId, {
     apiKey: process.env.CURSOR_API_KEY,
-    model: modelSelection(request.model),
+    model: requireLocalModelSelection(request.model),
     local: {
       cwd: request.cwd,
       customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
@@ -726,7 +726,7 @@ function agentCreateOptions(request) {
   const readOnly = request?.mode === "plan";
   return {
     apiKey: process.env.CURSOR_API_KEY,
-    model: modelSelection(request?.model),
+    model: requireLocalModelSelection(request?.model),
     local: {
       cwd: request?.cwd,
       // Vega-style batch FS tools; inlined via SDK (unlike hooks, which are file-only).
@@ -822,7 +822,7 @@ function createAgentPrewarm(sdk = Agent, { enabled = prewarmEnabled() } = {}) {
 async function generateTitle(request) {
   const agent = await createCursorAgent({
     apiKey: process.env.CURSOR_API_KEY,
-    model: modelSelection(request.model),
+    model: requireLocalModelSelection(request.model),
     local: { cwd: request.cwd },
   });
   try {

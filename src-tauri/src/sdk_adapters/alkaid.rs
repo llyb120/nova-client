@@ -33,6 +33,7 @@ impl SdkAdapter for AlkaidAdapter {
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
             program: "node".into(),
+            native_bridge: settings.vega_engine == "rust",
             proxy: settings.vega_proxy.clone(),
             path_env: "ALKAID_RUNTIME",
             api_key: None,

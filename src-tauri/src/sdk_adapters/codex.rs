@@ -24,6 +24,7 @@ impl SdkAdapter for CodexAdapter {
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
             program: settings.codex_path.clone(),
+            native_bridge: false,
             proxy: settings.codex_proxy.clone(),
             path_env: "NOVA_CODEX_PATH",
             api_key: None,

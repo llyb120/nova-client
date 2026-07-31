@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 pub struct LaunchConfig {
     pub program: String,
+    pub native_bridge: bool,
     pub proxy: String,
     pub path_env: &'static str,
     pub api_key: Option<(&'static str, String)>,

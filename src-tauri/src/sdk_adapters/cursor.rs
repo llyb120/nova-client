@@ -25,6 +25,7 @@ impl SdkAdapter for CursorAdapter {
         LaunchConfig {
             // Cursor 仅依赖 Node.js 运行官方 SDK bridge，不再读取本机 cursor-agent。
             program: "node".into(),
+            native_bridge: false,
             proxy: settings.cursor_proxy.clone(),
             path_env: "NOVA_CURSOR_PATH",
             api_key: (!settings.cursor_sdk_api_key.is_empty())
@@ -58,7 +59,7 @@ impl SdkAdapter for CursorAdapter {
                 "id": "model",
                 "name": "Model",
                 "currentValue": "",
-                "options": [{ "value": "", "name": "Auto（Cursor 默认）" }],
+                "options": [{ "value": "", "name": "Auto（需改选具体模型）" }],
             }],
             "modes": null,
         })

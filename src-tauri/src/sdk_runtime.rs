@@ -302,7 +302,13 @@ impl SdkManager {
         if !self.is_current_run(&thread_id, run_epoch) {
             return;
         }
-        if outcome.is_err() && native_restore.is_some() {
+        // Native restore failures, and Claude resume of a stale/corrupt session, should fall back
+        // to a fresh prompt that still carries Nova's handoff/context text.
+        let retry_without_session = outcome.is_err()
+            && (native_restore.is_some()
+                || (self.adapter.agent_kind() == AgentKind::ClaudeCode
+                    && session_id.as_ref().is_some_and(|id| !id.is_empty())));
+        if retry_without_session {
             self.forget_session_of_thread(&thread_id);
             self.clear_session_id(&thread_id);
             let mut fallback_parts = Vec::new();
@@ -998,16 +1004,24 @@ impl SdkManager {
         let program = resolve_program_on_path(&launch.program)
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or(launch.program);
-        let node = resolve_program_on_path("node").ok_or_else(|| {
-            format!(
-                "未找到 Node.js，{} 需要 Node.js 运行官方 SDK",
-                self.adapter.label()
-            )
-        })?;
-        let bridge = bridge_path(&self.app, self.adapter.as_ref())?;
-        let mut command = Command::new(node);
+        let (runtime, bridge_arg) = if launch.native_bridge {
+            let runtime = std::env::current_exe()
+                .map_err(|e| format!("定位 {} Rust bridge 失败：{e}", self.adapter.label()))?;
+            (runtime, Some("--alkaid-native-bridge".into()))
+        } else {
+            let node = resolve_program_on_path("node").ok_or_else(|| {
+                format!(
+                    "未找到 Node.js，{} 需要 Node.js 运行官方 SDK",
+                    self.adapter.label()
+                )
+            })?;
+            (node, Some(bridge_path(&self.app, self.adapter.as_ref())?))
+        };
+        let mut command = Command::new(runtime);
+        if let Some(arg) = bridge_arg {
+            command.arg(arg);
+        }
         command
-            .arg(bridge)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1038,7 +1052,7 @@ impl SdkManager {
         command.creation_flags(0x0800_0000);
         command
             .spawn()
-            .map_err(|e| format!("启动 {} Node bridge 失败：{e}", self.adapter.label()))
+            .map_err(|e| format!("启动 {} bridge 失败：{e}", self.adapter.label()))
     }
 
     fn save_session_id(&self, thread_id: &str, session_id: &str) {
