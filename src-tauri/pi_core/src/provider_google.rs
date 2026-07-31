@@ -221,7 +221,18 @@ pub fn build_google_request(
         config["tools"] = pi_tools_to_google(tools);
     }
     if model.get("reasoning").and_then(Value::as_bool).unwrap_or(false) {
-        config["thinkingConfig"] = json!({ "includeThoughts": true });
+        let mut thinking_config = json!({ "includeThoughts": true });
+        if let Some(level) = model.get("thinkingLevel").and_then(Value::as_str) {
+            let mapped = match level {
+                "minimal" => "MINIMAL",
+                "low" => "LOW",
+                "medium" => "MEDIUM",
+                "high" => "HIGH",
+                _ => "HIGH",
+            };
+            thinking_config["thinkingLevel"] = json!(mapped);
+        }
+        config["thinkingConfig"] = thinking_config;
     }
     json!({
         "model": model_id,

@@ -237,7 +237,15 @@ pub fn build_openai_responses_request(
         body["tools"] = Value::Array(responses_tools);
     }
     if model.get("reasoning").and_then(Value::as_bool).unwrap_or(false) {
-        body["reasoning"] = json!({ "effort": "medium", "summary": "auto" });
+        let effort = model
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .map(|level| match level {
+                "minimal" => "low",
+                other => other,
+            })
+            .unwrap_or("medium");
+        body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
     body

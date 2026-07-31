@@ -298,6 +298,7 @@ impl SdkManager {
                     session_id.clone(),
                     mode.as_deref().unwrap_or(""),
                     lightweight_model.as_deref(),
+                    reasoning_effort.as_deref(),
                     user_item_id,
                     run_epoch,
                 )
@@ -797,6 +798,7 @@ impl SdkManager {
         session_id: Option<String>,
         mode: &str,
         lightweight_model: Option<&str>,
+        reasoning_effort: Option<&str>,
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
@@ -846,6 +848,13 @@ impl SdkManager {
             read_only,
         )?;
         setup.turn_config.images = prompt_images;
+        // Honor the requested reasoning effort: the provider builders read
+        // `thinkingLevel` on the model to size thinking budget/effort.
+        if let Some(effort) = reasoning_effort {
+            if !effort.is_empty() {
+                setup.turn_config.model["thinkingLevel"] = json!(effort);
+            }
+        }
         let expanded_text = pi_core::expand_skill_command(&input_text, &setup.skills);
 
         // --- Reasonix pre-turn context management ---

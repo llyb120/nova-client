@@ -287,12 +287,28 @@ pub fn build_anthropic_request(
             .and_then(|c| c.get("forceAdaptiveThinking"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let level = model
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .unwrap_or("high");
         if force_adaptive {
+            let effort = match level {
+                "minimal" | "low" => "low",
+                "medium" => "medium",
+                _ => "high",
+            };
             body.insert("thinking".to_string(), json!({ "type": "adaptive", "display": "summarized" }));
+            body.insert("output_config".to_string(), json!({ "effort": effort }));
         } else {
+            let budget = match level {
+                "minimal" => 1024,
+                "low" => 2048,
+                "medium" => 8192,
+                _ => 32768,
+            };
             body.insert(
                 "thinking".to_string(),
-                json!({ "type": "enabled", "budget_tokens": 1024, "display": "summarized" }),
+                json!({ "type": "enabled", "budget_tokens": budget, "display": "summarized" }),
             );
         }
     }
