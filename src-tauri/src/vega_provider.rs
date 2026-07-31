@@ -23,7 +23,7 @@ use pi_core::provider_responses::{build_openai_responses_request, ResponsesAccum
 use pi_core::text::OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS;
 use serde_json::{json, Value};
 
-use crate::http_stream::{decode_sse_json, SseDecoder};
+use crate::http_stream::{decode_sse_json, SseDecoder, SSE_IDLE_TIMEOUT_SECS};
 
 /// Provider endpoint configuration resolved from the Vega config.
 #[derive(Clone)]
@@ -39,6 +39,51 @@ pub struct ProviderConfig {
     pub cost: Value,
     /// Model output token limit (`limit.output`).
     pub max_tokens: u64,
+}
+
+/// Port of alkaid's provider idle timeout: read SSE chunks with a per-chunk
+/// idle deadline (the codebase-wide `SSE_IDLE_TIMEOUT_SECS`), erroring when the
+/// stream stalls. Each decoded event is passed to `feed`. Mirrors the pattern
+/// in `relay.rs`/`remote.rs`.
+async fn run_sse_stream<F>(response: &mut reqwest::Response, mut feed: F) -> Result<(), String>
+where
+    F: FnMut(Value),
+{
+    let mut decoder = SseDecoder::new();
+    let mut consume = |events: Vec<String>| {
+        for event in events {
+            let trimmed = event.trim();
+            if trimmed.is_empty() || trimmed == "[DONE]" {
+                continue;
+            }
+            if let Ok(json) = decode_sse_json(trimmed) {
+                feed(json);
+            }
+        }
+    };
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(SSE_IDLE_TIMEOUT_SECS),
+            response.chunk(),
+        )
+        .await
+        {
+            Ok(Ok(Some(chunk))) => {
+                let events = decoder.push(&chunk).map_err(|e| e.to_string())?;
+                consume(events);
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => return Err(format!("Vega provider stream error: {error}")),
+            Err(_) => {
+                return Err(format!(
+                    "Vega provider stream idle timeout after {SSE_IDLE_TIMEOUT_SECS}s"
+                ))
+            }
+        }
+    }
+    let events = decoder.finish().map_err(|e| e.to_string())?;
+    consume(events);
+    Ok(())
 }
 
 /// Run one provider turn and return the collected stream.
@@ -192,33 +237,9 @@ async fn stream_openai_chat(
         return Err(format!("Vega provider error {status}: {text}"));
     }
 
-    let mut decoder = SseDecoder::new();
     let mut accumulator =
         OpenAiChatAccumulator::new(&config.model_id, &config.provider, &config.api);
-
-    let feed = |accumulator: &mut OpenAiChatAccumulator, events: Vec<String>| {
-        for event in events {
-            let trimmed = event.trim();
-            if trimmed.is_empty() || trimmed == "[DONE]" {
-                continue;
-            }
-            if let Ok(json) = decode_sse_json(trimmed) {
-                accumulator.add_chunk(&json);
-            }
-        }
-    };
-
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("Vega provider stream error: {error}"))?
-    {
-        let events = decoder.push(&chunk).map_err(|error| error.to_string())?;
-        feed(&mut accumulator, events);
-    }
-    let events = decoder.finish().map_err(|error| error.to_string())?;
-    feed(&mut accumulator, events);
-
+    run_sse_stream(&mut response, |json| accumulator.add_chunk(&json)).await?;
     Ok(accumulator.finish())
 }
 
@@ -258,33 +279,9 @@ async fn stream_anthropic(
         return Err(format!("Vega provider error {status}: {text}"));
     }
 
-    let mut decoder = SseDecoder::new();
     let mut accumulator =
         AnthropicAccumulator::new(&config.model_id, &config.provider, &config.api);
-
-    let feed = |accumulator: &mut AnthropicAccumulator, events: Vec<String>| {
-        for event in events {
-            let trimmed = event.trim();
-            if trimmed.is_empty() || trimmed == "[DONE]" {
-                continue;
-            }
-            if let Ok(json) = decode_sse_json(trimmed) {
-                accumulator.add_event(&json);
-            }
-        }
-    };
-
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("Vega provider stream error: {error}"))?
-    {
-        let events = decoder.push(&chunk).map_err(|error| error.to_string())?;
-        feed(&mut accumulator, events);
-    }
-    let events = decoder.finish().map_err(|error| error.to_string())?;
-    feed(&mut accumulator, events);
-
+    run_sse_stream(&mut response, |json| accumulator.add_event(&json)).await?;
     Ok(accumulator.finish())
 }
 
@@ -321,33 +318,9 @@ async fn stream_openai_responses(
         return Err(format!("Vega provider error {status}: {text}"));
     }
 
-    let mut decoder = SseDecoder::new();
     let mut accumulator =
         ResponsesAccumulator::new(&config.model_id, &config.provider, &config.api);
-
-    let feed = |accumulator: &mut ResponsesAccumulator, events: Vec<String>| {
-        for event in events {
-            let trimmed = event.trim();
-            if trimmed.is_empty() || trimmed == "[DONE]" {
-                continue;
-            }
-            if let Ok(json) = decode_sse_json(trimmed) {
-                accumulator.add_event(&json);
-            }
-        }
-    };
-
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("Vega provider stream error: {error}"))?
-    {
-        let events = decoder.push(&chunk).map_err(|error| error.to_string())?;
-        feed(&mut accumulator, events);
-    }
-    let events = decoder.finish().map_err(|error| error.to_string())?;
-    feed(&mut accumulator, events);
-
+    run_sse_stream(&mut response, |json| accumulator.add_event(&json)).await?;
     Ok(accumulator.finish())
 }
 
@@ -399,33 +372,9 @@ async fn stream_google(
         return Err(format!("Vega provider error {status}: {text}"));
     }
 
-    let mut decoder = SseDecoder::new();
     let mut accumulator =
         GoogleAccumulator::new(&config.model_id, &config.provider, &config.api);
-
-    let feed = |accumulator: &mut GoogleAccumulator, events: Vec<String>| {
-        for event in events {
-            let trimmed = event.trim();
-            if trimmed.is_empty() || trimmed == "[DONE]" {
-                continue;
-            }
-            if let Ok(json) = decode_sse_json(trimmed) {
-                accumulator.add_chunk(&json);
-            }
-        }
-    };
-
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("Vega provider stream error: {error}"))?
-    {
-        let events = decoder.push(&chunk).map_err(|error| error.to_string())?;
-        feed(&mut accumulator, events);
-    }
-    let events = decoder.finish().map_err(|error| error.to_string())?;
-    feed(&mut accumulator, events);
-
+    run_sse_stream(&mut response, |json| accumulator.add_chunk(&json)).await?;
     Ok(accumulator.finish())
 }
 
