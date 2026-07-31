@@ -44,6 +44,7 @@ import type {
   UpdateProgress,
 } from "./types";
 import { isScratch, scratchParent } from "./utils";
+import { buildIntegrateModelPrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
@@ -1453,6 +1454,12 @@ async function tryBuiltinPrompt(
     await startFireRelay(parsed.goal, parsed.acceptanceCriteria, threadId);
     return true;
   }
+  if (/^\/setup(?:\s|$)/i.test(builtInInput)) {
+    const goal = builtInInput.replace(/^\/setup(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+    if (!goal) throw new Error("请在 /setup 后输入要接入的模型，例如 /setup qwen3.8");
+    await deliverPrompt(threadId, buildIntegrateModelPrompt(goal), images);
+    return true;
+  }
   if (/^\/target(?:\s|$)/i.test(builtInInput)) {
     throw new Error("/target 只能与 /fire 一起发送");
   }
@@ -1465,6 +1472,11 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
     if (images.length > 0) throw new Error("/fire 暂不支持附件");
     parseFireInput(builtInInput);
+    return;
+  }
+  if (/^\/setup(?:\s|$)/i.test(builtInInput)) {
+    const goal = builtInInput.replace(/^\/setup(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+    if (!goal) throw new Error("请在 /setup 后输入要接入的模型，例如 /setup qwen3.8");
     return;
   }
   if (/^\/target(?:\s|$)/i.test(builtInInput)) {

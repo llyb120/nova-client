@@ -39,6 +39,12 @@ export function getSlashSuggestions(
       kind: "Nova",
       input: "/target ",
     },
+    {
+      name: "setup",
+      description: "把一个模型 / provider 接入 Vega：/setup 模型名",
+      kind: "Nova",
+      input: "/setup ",
+    },
   ];
   return [...builtins, ...commands]
     .map((c) => commandToSuggestion(agentKind, c))
