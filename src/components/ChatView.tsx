@@ -21,7 +21,6 @@ import { Composer } from "./Composer";
 import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
-import { PlanCard } from "./PlanCard";
 import { ShareModal } from "./ShareModal";
 import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
@@ -1130,9 +1129,7 @@ export function ChatView() {
       </div>
 
       <footer class="chat-foot">
-        <Show when={state.plan && state.plan.length > 0}>
-          <PlanCard plan={state.plan!} />
-        </Show>
+        {/* 暂时隐藏「计划」面板；内部 plan 状态与事件仍照常更新 */}
         <PlanActionCard />
         <Composer />
       </footer>
