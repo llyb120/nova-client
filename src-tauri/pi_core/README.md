@@ -92,10 +92,24 @@ implementation for every non-LLM computation.
   wired to Reasonix per-round tool-result compaction + slim rebase. **M10g**
   prompt-image pass-through and a minimal MCP stdio client (`mcp.rs`).
   **M10h** `reasoningEffort` threaded into each provider's thinking config.
+- M11 (done): production-behavior parity with the node bridge. **M11a**
+  progressive streaming (each protocol item forwarded as produced via a channel
+  + concurrent consumer task) and in-process steer/cancel (`NativeRunController`
+  registered per thread; cancel races the in-flight transport, steer drains into
+  the loop between tool rounds). **M11b** tool-result governance + disk archiving
+  (`govern_tool_result`; `ToolFn` gains the call id). **M11c** provider retry with
+  the node backoff delays + retryable-error classification. **M11d** token-cost
+  calculation (`attach_cost`) + per-provider `max_tokens` enforcement. **M11e**
+  SSE stream idle timeout (45s, shared `run_sse_stream`). **M11f** the legacy
+  super-context mode (`super_memory.rs` + `run_prompt_native_super`, selected by
+  `vega_context_mode == "super"`). **M11g** fixture tests for the three new
+  accumulators (caught + fixed an Anthropic tool-index bug and a usage-merge bug).
 
-All 64 pi_core tests (35 unit + 29 differential) are green and `cargo test`
+All 78 pi_core tests (49 unit + 29 differential) are green and `cargo test`
 needs no node. `nova_lib` compiles with 0 errors both with and without
-`native-vega`.
+`native-vega`. (One unrelated pre-existing nova test,
+`path_env::windows_fallback_includes_claude_and_opencode_native_bins`, fails on
+this Linux host independent of the native path.)
 
 ## Function map (node → Rust)
 
@@ -144,15 +158,18 @@ The deterministic core, the native tool executor, all four provider protocols
 (`openai-completions`, `anthropic-messages`, `openai-responses`,
 `google-generative-ai`), the Vega config resolution, the full Reasonix port
 (slim-memory + between-turn orchestration + mid-turn hook + digest compaction),
-native skill discovery, prompt images, reasoning-effort pass-through, the MCP
-stdio client, and the feature-gated `sdk_runtime` seam are all in place. What
-remains is inherently online / production-cutover work that cannot be
-differentially tested here:
+the legacy super-context mode, native skill discovery, prompt images,
+reasoning-effort pass-through, the MCP stdio client, progressive streaming,
+in-process steer/cancel, provider retry, tool-result governance + archiving,
+token-cost calculation, the SSE idle timeout, and the feature-gated
+`sdk_runtime` seam are all in place. What remains is inherently online /
+production-cutover work that cannot be differentially tested here:
 
 1. **Live-provider verification + gray-release.** Enable `native-vega`, exercise
    real turns against each of the four providers, and compare against the node
    bridge before flipping the default. The three new transports and the MCP
-   client compile but have not been run against live endpoints.
+   client compile and are fixture-tested but have not been run against live
+   endpoints.
 2. **MCP live verification.** `mcp.rs` needs a running MCP server to validate
    the initialize/list/call handshake end to end.
 3. **Retire the node bridge.** Only after the above: remove
@@ -160,8 +177,17 @@ differentially tested here:
    drop the `@earendil-works/pi-*` packages from `package.json`. The bridge is
    intentionally left in place and remains the default path.
 
+Deferred advanced provider features (niche / auth-variant, not part of the
+core Vega workflow, deliberately out of scope): Anthropic OAuth / Claude-Code
+stealth headers, deferred tools + tool references, session-affinity headers,
+fine-grained tool-streaming beta, `clampMaxTokensToContext`/
+`adjustMaxTokensForThinking` (native uses fixed thinking budgets), OpenAI
+Responses service-tier pricing + tool search, Google Vertex AI, and a
+user-facing temperature control (Vega's request carries no temperature).
+
 Known minor parity gaps (documented, non-blocking): UTF-16 vs scalar slicing in
 the slim-memory compaction heuristic and `should_use_full_context`'s capacity
-check (exact for ASCII/BMP); the three new provider accumulators are unit-shaped
-but not yet golden-diffed against node (only `openai-completions` and the
-deterministic core have differential vectors).
+check (exact for ASCII/BMP); the three new provider accumulators are
+fixture-tested but not golden-diffed against node (only `openai-completions`
+and the deterministic core have differential vectors — regenerating golden
+vectors needs `node_modules`, which is not installed in this environment).
