@@ -19,6 +19,40 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::text::utf16_len;
+
+/// Take the first `n` UTF-16 code units of a string (port of JS `.slice(0, n)`).
+/// Stops before a surrogate pair that would exceed `n` (Rust strings cannot
+/// hold lone surrogates; the boundary difference is documented).
+fn utf16_head(s: &str, n: usize) -> String {
+    let mut units = 0;
+    let mut end = 0;
+    for (i, ch) in s.char_indices() {
+        let len = ch.len_utf16();
+        if units + len > n {
+            break;
+        }
+        units += len;
+        end = i + ch.len_utf8();
+    }
+    s[..end].to_string()
+}
+
+/// Take the last `n` UTF-16 code units of a string (port of JS `.slice(-n)`).
+fn utf16_tail(s: &str, n: usize) -> String {
+    let mut units = 0;
+    let mut start = s.len();
+    for (i, ch) in s.char_indices().rev() {
+        let len = ch.len_utf16();
+        if units + len > n {
+            break;
+        }
+        units += len;
+        start = i;
+    }
+    s[start..].to_string()
+}
+
 /// One conversation turn: the verbatim user prompts that led to a conclusion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -505,8 +539,8 @@ fn compact_tool_text(text: &str, tier: &str, tool_call_id: Option<&str>) -> Stri
     if tier == "elide" || tier == "force" {
         return format!("[elided tool result{id} — {bytes} bytes; re-run the tool if needed]");
     }
-    let head: String = text.chars().take(3_000).collect();
-    let tail: String = text.chars().rev().take(2_000).collect::<Vec<_>>().into_iter().rev().collect();
+    let head = utf16_head(text, 3_000);
+    let tail = utf16_tail(text, 2_000);
     format!("{head}\n\n…[snipped older tool result{id} — {bytes} bytes]…\n\n{tail}")
 }
 
@@ -593,7 +627,7 @@ pub fn should_use_full_context(
     } else {
         let serialized = serde_json::to_string(&memory.full_messages).unwrap_or_default();
         match max_context_chars {
-            Some(max) => serialized.len() < max,
+            Some(max) => utf16_len(&serialized) < max,
             None => true,
         }
     }
@@ -697,7 +731,7 @@ where
         None => true,
     };
     let below_character_limit = match options.max_chars {
-        Some(max) => formatted.len() < max,
+        Some(max) => utf16_len(&formatted) < max,
         None => true,
     };
     let below_token_limit = match options.max_tokens {
@@ -734,7 +768,7 @@ where
     let mut preserved_prompts: Vec<String> = Vec::new();
     for turn in &compacted_turns {
         for prompt in &turn.user_prompts {
-            if prompt.chars().count() <= 2_000 && !memory.preserved_user_prompts.contains(prompt) {
+            if utf16_len(prompt) <= 2_000 && !memory.preserved_user_prompts.contains(prompt) {
                 preserved_prompts.push(prompt.clone());
             }
         }
@@ -782,7 +816,7 @@ pub fn plan_compaction(memory: &mut SlimMemory, options: CompactOptions) -> Opti
         None => true,
     };
     let below_character_limit = match options.max_chars {
-        Some(max) => formatted.len() < max,
+        Some(max) => utf16_len(&formatted) < max,
         None => true,
     };
     let below_token_limit = match options.max_tokens {
@@ -819,7 +853,7 @@ pub fn plan_compaction(memory: &mut SlimMemory, options: CompactOptions) -> Opti
     let mut preserved_prompts: Vec<String> = Vec::new();
     for turn in &compacted_turns {
         for prompt in &turn.user_prompts {
-            if prompt.chars().count() <= 2_000 && !memory.preserved_user_prompts.contains(prompt) {
+            if utf16_len(prompt) <= 2_000 && !memory.preserved_user_prompts.contains(prompt) {
                 preserved_prompts.push(prompt.clone());
             }
         }
@@ -923,5 +957,44 @@ mod tests {
         let before = m.clone();
         assert!(!apply_compaction(&mut m, &plan, "   "));
         assert_eq!(m, before);
+    }
+}
+
+#[cfg(test)]
+mod utf16_tests {
+    use super::*;
+
+    #[test]
+    fn utf16_head_counts_code_units_not_code_points() {
+        // "😀" is 1 code point but 2 UTF-16 code units.
+        let s = "a😀b";
+        // UTF-16: a(1) 😀(2) b(1) = 4 units total.
+        assert_eq!(utf16_len(s), 4);
+        // Head 2 units: "a" + first half of 😀 → stops before the pair (can't split).
+        assert_eq!(utf16_head(s, 2), "a");
+        // Head 3 units: "a😀" (1+2=3).
+        assert_eq!(utf16_head(s, 3), "a😀");
+        // Head 4: full string.
+        assert_eq!(utf16_head(s, 4), "a😀b");
+    }
+
+    #[test]
+    fn utf16_tail_counts_code_units_not_code_points() {
+        let s = "a😀b";
+        // Tail 2 units: "b" + can't fit 😀 (would be 3) → just "b".
+        assert_eq!(utf16_tail(s, 1), "b");
+        // Tail 3: "😀b" (2+1=3).
+        assert_eq!(utf16_tail(s, 3), "😀b");
+    }
+
+    #[test]
+    fn compact_tool_text_uses_utf16_boundaries() {
+        // Build a string > 8KB with emoji near the 3000 UTF-16-unit boundary.
+        let filler = "x".repeat(2998);
+        let text = format!("{filler}😀{}", "y".repeat(6000));
+        let result = compact_tool_text(&text, "snip", None);
+        // The head should be ~3000 UTF-16 units (stops before the emoji pair at 2999-3000).
+        assert!(result.contains("…[snipped older tool result"));
+        assert!(result.starts_with(&filler));
     }
 }

@@ -10,6 +10,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::text::utf16_len;
+
 /// Default recent-turn retention before compaction (`VEGA_SLIM_MEMORY_TURNS`).
 pub const VEGA_SLIM_MEMORY_TURNS: usize = 10;
 
@@ -250,7 +252,7 @@ pub fn should_use_full_context(
     } else {
         let serialized = serde_json::to_string(&memory.full_messages).unwrap_or_default();
         match max_context_chars {
-            Some(max) => serialized.len() < max,
+            Some(max) => utf16_len(&serialized) < max,
             None => true,
         }
     }
@@ -351,7 +353,7 @@ pub fn plan_super_compaction(
     let max_turns = options.max_turns.unwrap_or(VEGA_SLIM_MEMORY_TURNS);
     let within_turn_limit = memory.turns.len() <= max_turns;
     let below_character_limit = match options.max_chars {
-        Some(max) => formatted.len() < max,
+        Some(max) => utf16_len(&formatted) < max,
         None => true,
     };
     let below_token_limit = match options.max_tokens {
