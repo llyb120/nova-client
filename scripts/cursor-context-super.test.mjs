@@ -128,6 +128,38 @@ assert.equal(cursorShellProgram("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\
   ? "C:\\Nova\\shim\\powershell.exe"
   : "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
 assert.equal(cursorShellProgram("tool.exe", { NOVA_SHELL_SHIM_POWERSHELL: "shim.exe" }), "tool.exe");
+{
+  const root = await mkdtemp(join(tmpdir(), "nova-cursor-shell-env-"));
+  const psDir = join(root, "System32", "WindowsPowerShell", "v1.0");
+  await mkdir(psDir, { recursive: true });
+  const ps = join(psDir, "powershell.exe");
+  await writeFile(ps, "ps");
+  const missingPwsh = join(root, "missing", "pwsh.exe");
+  const realPwsh = join(root, "real-pwsh.exe");
+  await writeFile(realPwsh, "pwsh");
+  assert.equal(
+    cursorShellProgram(missingPwsh, { SystemRoot: root, PATH: "" }),
+    process.platform === "win32" ? ps : missingPwsh,
+  );
+  assert.equal(
+    cursorShellProgram(missingPwsh, {
+      NOVA_SHELL_SHIM_PWSH_REAL: realPwsh,
+      SystemRoot: root,
+      PATH: "",
+    }),
+    process.platform === "win32" ? realPwsh : missingPwsh,
+  );
+  assert.equal(
+    cursorShellProgram(missingPwsh, {
+      NOVA_SHELL_SHIM_PWSH: "C:\\Nova\\shim\\pwsh.exe",
+      NOVA_SHELL_SHIM_PWSH_REAL: realPwsh,
+      SystemRoot: root,
+      PATH: "",
+    }),
+    process.platform === "win32" ? "C:\\Nova\\shim\\pwsh.exe" : missingPwsh,
+  );
+  await rm(root, { recursive: true, force: true });
+}
 assert.deepEqual(modelSelection("cursor-grok-4.5-high-fast"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("grok-4.5-high-false"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] });
 assert.deepEqual(modelSelection("composer-2.5-fast"), { id: "composer-2.5", params: [{ id: "fast", value: "true" }] });

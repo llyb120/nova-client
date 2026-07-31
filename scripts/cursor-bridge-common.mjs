@@ -1,6 +1,7 @@
 import childProcess from "node:child_process";
+import { existsSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { basename } from "node:path";
+import { basename, delimiter, join } from "node:path";
 import { Cursor } from "@cursor/sdk";
 
 const WINDOWS_SHELL_SHIMS = {
@@ -10,19 +11,87 @@ const WINDOWS_SHELL_SHIMS = {
   "pwsh.exe": "NOVA_SHELL_SHIM_PWSH",
 };
 
+const WINDOWS_SHELL_REALS = {
+  "bash.exe": "NOVA_SHELL_SHIM_BASH_REAL",
+  "cmd.exe": "NOVA_SHELL_SHIM_CMD_REAL",
+  "powershell.exe": "NOVA_SHELL_SHIM_POWERSHELL_REAL",
+  "pwsh.exe": "NOVA_SHELL_SHIM_PWSH_REAL",
+};
+
+function envPathValue(env) {
+  return Object.entries(env).find(([key]) => key.toLowerCase() === "path")?.[1] ?? "";
+}
+
+function findExecutableOnPath(name, env) {
+  for (const dir of envPathValue(env).split(delimiter).filter(Boolean)) {
+    const candidate = join(dir, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+// 未开启 shim 时，从父进程注入的 *_REAL 或 SystemRoot / PATH / ProgramFiles* 解析真实 shell。
+export function resolveWindowsShellFromEnv(name, env = process.env) {
+  const real = env[WINDOWS_SHELL_REALS[name]];
+  if (real && existsSync(real)) return real;
+
+  if (name === "cmd.exe") {
+    for (const root of [env.SystemRoot, env.windir].filter(Boolean)) {
+      const candidate = join(root, "System32", "cmd.exe");
+      if (existsSync(candidate)) return candidate;
+    }
+    return findExecutableOnPath("cmd.exe", env);
+  }
+
+  if (name === "powershell.exe") {
+    for (const root of [env.SystemRoot, env.windir].filter(Boolean)) {
+      const candidate = join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      if (existsSync(candidate)) return candidate;
+    }
+    return findExecutableOnPath("powershell.exe", env);
+  }
+
+  if (name === "pwsh.exe") {
+    const onPath = findExecutableOnPath("pwsh.exe", env);
+    if (onPath) return onPath;
+    for (const key of ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]) {
+      const root = env[key];
+      if (!root) continue;
+      const candidate = join(root, "PowerShell", "7", "pwsh.exe");
+      if (existsSync(candidate)) return candidate;
+    }
+    // Cursor SDK 常硬编码 pwsh；本机未安装时回退到 Windows PowerShell。
+    return resolveWindowsShellFromEnv("powershell.exe", env);
+  }
+
+  if (name === "bash.exe") return findExecutableOnPath("bash.exe", env);
+  return null;
+}
+
 export function cursorShellProgram(program, env = process.env) {
   if (process.platform !== "win32" || typeof program !== "string") return program;
-  const shim = env[WINDOWS_SHELL_SHIMS[basename(program).toLowerCase()]];
-  return shim || program;
+  const name = basename(program).toLowerCase();
+  const shimKey = WINDOWS_SHELL_SHIMS[name];
+  if (!shimKey) return program;
+  const shim = env[shimKey];
+  if (shim) return shim;
+  // 未开启 shim（无 SHIM_*）：可用绝对路径保持不变，缺失时从环境变量解析。
+  if (existsSync(program)) return program;
+  return resolveWindowsShellFromEnv(name, env) || program;
 }
 
 function installWindowsShellSpawnGuard() {
-  if (process.platform !== "win32" || process.env.NOVA_WINDOWS_SHELL_SHIM !== "1") return;
+  if (process.platform !== "win32") return;
   const spawn = childProcess.spawn;
+  const hideWindows = process.env.NOVA_WINDOWS_SHELL_SHIM === "1";
   childProcess.spawn = (program, args, options) => {
-    const hiddenOptions = { ...(Array.isArray(args) ? options : args), windowsHide: true };
-    if (Array.isArray(args)) return spawn(cursorShellProgram(program), args, hiddenOptions);
-    return spawn(cursorShellProgram(program), hiddenOptions);
+    const resolved = cursorShellProgram(program);
+    if (Array.isArray(args)) {
+      const opts = hideWindows ? { ...options, windowsHide: true } : options;
+      return spawn(resolved, args, opts);
+    }
+    const opts = hideWindows ? { ...args, windowsHide: true } : args;
+    return spawn(resolved, opts);
   };
   // Cursor SDK is evaluated before this module body. Keep its named spawn binding synchronized
   // with the guarded built-in implementation without modifying the installed package.
