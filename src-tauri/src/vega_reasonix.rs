@@ -147,6 +147,46 @@ pub fn save_legacy_messages(data_dir: &Path, session_id: &str, messages: &[Value
     Ok(())
 }
 
+/// Load the per-session super-context memory; absent/corrupt files yield fresh.
+pub fn load_super_memory(data_dir: &Path, session_id: &str) -> pi_core::SuperMemory {
+    let Ok(path) = slim_memory_path(data_dir, session_id) else {
+        return pi_core::SuperMemory::new();
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return pi_core::SuperMemory::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+        return pi_core::SuperMemory::new();
+    };
+    if parsed.get("turns").and_then(Value::as_array).is_some() {
+        serde_json::from_value::<pi_core::SuperMemory>(parsed)
+            .unwrap_or_else(|_| pi_core::SuperMemory::new())
+    } else {
+        pi_core::SuperMemory::new()
+    }
+}
+
+/// Atomically persist the super-context memory as `{version:1, ...memory}`.
+pub fn save_super_memory(
+    data_dir: &Path,
+    session_id: &str,
+    memory: &pi_core::SuperMemory,
+) -> Result<(), String> {
+    let path = slim_memory_path(data_dir, session_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建会话目录失败：{e}"))?;
+    }
+    let mut stored = serde_json::to_value(memory).map_err(|e| e.to_string())?;
+    if let Some(obj) = stored.as_object_mut() {
+        obj.insert("version".to_string(), json!(1));
+    }
+    let body = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, &body).map_err(|e| format!("写入会话失败：{e}"))?;
+    fs::rename(&temp, &path).map_err(|e| format!("保存会话失败：{e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

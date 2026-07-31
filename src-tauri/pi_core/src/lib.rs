@@ -25,6 +25,7 @@ pub mod skills;
 pub mod skills_discovery;
 pub mod slim_memory;
 pub mod smart_edit;
+pub mod super_memory;
 pub mod text;
 pub mod tools;
 pub mod transform;
@@ -69,6 +70,14 @@ pub use slim_memory::{
     memory_without_current, normalize_value, plan_compaction, rebase_native_context_for_slim_memory,
     seed_slim_memory_from_messages, should_use_full_context, strip_completed_openai_reasoning,
     text_content, CompactionPlan, CompactOptions, NormalizedMemory, SlimMemory, Turn,
+};
+pub use super_memory::{
+    apply_super_compaction, context_tokens_from_messages as super_context_tokens_from_messages,
+    estimate_context_tokens as super_estimate_context_tokens, format_super_memory,
+    memory_without_current as super_memory_without_current, message_with_super_memory,
+    plan_super_compaction, seed_super_memory_from_messages,
+    should_use_full_context as super_should_use_full_context, SuperCompactOptions, SuperMemory,
+    SuperTurn, VEGA_SLIM_MEMORY_TURNS,
 };
 pub use smart_edit::{apply_smart_edits, SmartMatch, SmartResult};
 pub use tools::{tool_fn_for, NativeTools};

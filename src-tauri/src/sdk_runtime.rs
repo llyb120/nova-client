@@ -848,6 +848,29 @@ impl SdkManager {
     ) -> Result<(), String> {
         use crate::vega_reasonix as reasonix;
 
+        // Context mode: "super" uses the legacy super-context memory; everything
+        // else uses the canonical Reasonix path below.
+        let context_mode = {
+            let app_state = self.app.state::<AppState>();
+            let settings = app_state.settings.lock().unwrap();
+            settings.vega_context_mode.clone()
+        };
+        if context_mode == "super" {
+            return self
+                .run_prompt_native_super(
+                    thread_id,
+                    cwd,
+                    model_selection,
+                    parts,
+                    session_id,
+                    mode,
+                    reasoning_effort,
+                    user_item_id,
+                    run_epoch,
+                )
+                .await;
+        }
+
         let input_text = parts
             .iter()
             .filter_map(|part| part.get("text").and_then(Value::as_str))
@@ -1287,6 +1310,271 @@ impl SdkManager {
             m.get("stopReason").and_then(Value::as_str) == Some("aborted")
         })
         || controller.cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
+        self.finish_turn_if_current(thread_id, run_epoch, stop_reason, output.usage);
+        let _ = user_item_id;
+        Ok(())
+    }
+
+    /// Super-context native path (legacy `NOVA_CONTEXT_MODE=super`), mirroring
+    /// `alkaid-context-super.mjs`: a single rolling summary instead of Reasonix's
+    /// frozen digests, 10-turn retention, and no mid-turn hook.
+    #[cfg(feature = "native-vega")]
+    async fn run_prompt_native_super(
+        self: &Arc<Self>,
+        thread_id: &str,
+        cwd: &str,
+        model_selection: Option<&str>,
+        parts: &[Value],
+        session_id: Option<String>,
+        mode: &str,
+        reasoning_effort: Option<&str>,
+        user_item_id: u64,
+        run_epoch: u64,
+    ) -> Result<(), String> {
+        use crate::vega_reasonix as reasonix;
+
+        let input_text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let prompt_images: Vec<Value> = parts
+            .iter()
+            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                Some("image_data") => Some(json!({
+                    "type": "image",
+                    "data": part.get("data").and_then(Value::as_str).unwrap_or(""),
+                    "mimeType": part.get("mime").and_then(Value::as_str).unwrap_or("image/png"),
+                })),
+                Some("local_image") => {
+                    let path = part.get("path").and_then(Value::as_str).unwrap_or("");
+                    let mime = image_mime_from_path(path)?;
+                    let bytes = std::fs::read(path).ok()?;
+                    use base64::Engine;
+                    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    Some(json!({ "type": "image", "data": data, "mimeType": mime }))
+                }
+                _ => None,
+            })
+            .collect();
+        let data_dir = nova_data_dir(&self.app);
+        let server_config = self.alkaid_server_config.lock().unwrap().clone();
+        let selection = model_selection.unwrap_or("").to_string();
+        let read_only = mode == "plan";
+
+        let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mut setup = crate::vega_native::prepare_native_turn(
+            &data_dir,
+            cwd,
+            server_config.as_ref(),
+            &selection,
+            Vec::new(),
+            Some(session_id.clone()),
+            read_only,
+        )?;
+        setup.turn_config.images = prompt_images;
+        if let Some(effort) = reasoning_effort {
+            if !effort.is_empty() {
+                setup.turn_config.model["thinkingLevel"] = json!(effort);
+            }
+        }
+        let expanded_text = pi_core::expand_skill_command(&input_text, &setup.skills);
+
+        // --- Super memory pre-turn ---
+        let mut memory = crate::vega_reasonix::load_super_memory(&data_dir, &session_id);
+        if memory.summary.is_empty() && memory.turns.is_empty() {
+            let legacy = reasonix::load_legacy_messages(&data_dir, &session_id);
+            if !legacy.is_empty() {
+                pi_core::seed_super_memory_from_messages(&mut memory, &legacy);
+            }
+        }
+        let context_window = setup
+            .turn_config
+            .model
+            .get("contextWindow")
+            .and_then(Value::as_f64)
+            .unwrap_or(128_000.0)
+            .max(2_000.0);
+        let force_context_tokens = ((context_window * 0.9).floor() as u64).max(2_000);
+        let max_context_chars = ((force_context_tokens * 4).max(8_000)) as usize;
+        let use_full_context =
+            pi_core::super_should_use_full_context(&memory, force_context_tokens, Some(max_context_chars));
+        if !use_full_context && memory.context_stage == "full" {
+            memory.context_stage = "slim".to_string();
+            memory.context_tokens = 0;
+            memory.full_messages = Vec::new();
+        }
+        memory.append_turn(&input_text);
+        // Digest compaction (rolling summary) via the lightweight/main model.
+        let rebuilt = pi_core::super_estimate_context_tokens(&memory.format());
+        let compact_options = pi_core::SuperCompactOptions {
+            max_turns: None,
+            max_chars: None,
+            current_tokens: rebuilt,
+            max_tokens: Some(force_context_tokens),
+        };
+        if let Some(plan) = pi_core::plan_super_compaction(&mut memory, compact_options) {
+            let summary_prompt = format!(
+                "请把下面较早的会话记忆压缩成供另一个编码 Agent 使用的摘要。\n保留用户意图、决策、改动文件、关键标识、约束和未完成事项；不要照抄对话或添加评论。\n\n{}",
+                plan.earlier_text
+            );
+            let summary_result = async {
+                let main_provider = crate::vega_native::resolve_provider_config(
+                    &data_dir,
+                    server_config.as_ref(),
+                    &selection,
+                )?;
+                crate::vega_native::run_summary_turn_async(
+                    reqwest::Client::new(),
+                    main_provider,
+                    summary_prompt,
+                )
+                .await
+            }
+            .await;
+            match summary_result {
+                Ok(summary) => {
+                    if pi_core::apply_super_compaction(&mut memory, &plan, &summary) {
+                        memory.context_tokens = 0;
+                    }
+                }
+                Err(error) => eprintln!("Vega super compaction skipped: {error}"),
+            }
+        }
+
+        let api = setup.provider.api.clone();
+        let strips_reasoning = api.starts_with("openai") || api == "azure-openai-responses";
+        let resumed = !memory.pending_messages.is_empty();
+        let mut native_messages = if resumed {
+            memory.pending_messages.clone()
+        } else if use_full_context {
+            memory.full_messages.clone()
+        } else {
+            Vec::new()
+        };
+        if strips_reasoning {
+            native_messages = pi_core::strip_completed_openai_reasoning(&native_messages);
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        memory.pending_messages =
+            reasonix::messages_with_pending_prompt(&native_messages, &input_text, &[], timestamp);
+        let _ = crate::vega_reasonix::save_super_memory(&data_dir, &session_id, &memory);
+
+        let prompt_text = if use_full_context {
+            expanded_text.clone()
+        } else {
+            pi_core::message_with_super_memory(&expanded_text, &memory)
+        };
+        setup.turn_config.history = native_messages;
+
+        // --- MCP + controller + streaming turn (shared machinery) ---
+        let mcp_servers = crate::mcp::load_mcp_config(&data_dir);
+        let mcp_hub = if mcp_servers.is_empty() {
+            None
+        } else {
+            let hub = crate::mcp::McpHub::connect(mcp_servers, cwd).await;
+            if hub.is_empty() {
+                None
+            } else {
+                setup.turn_config.tools.extend(hub.tool_definitions());
+                Some(std::sync::Arc::new(hub))
+            }
+        };
+        let controller = std::sync::Arc::new(crate::vega_native::NativeRunController {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            steer_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+        });
+        self.native_runs
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), std::sync::Arc::clone(&controller));
+        let archive_dir = data_dir
+            .join("alkaid")
+            .join("tool-results")
+            .join(pi_core::safe_archive_segment(Some(&session_id)));
+        let launched = crate::vega_native::run_native_turn_async(
+            reqwest::Client::new(),
+            setup.provider,
+            setup.turn_config,
+            prompt_text,
+            setup.native_tools,
+            None,
+            mcp_hub,
+            Some(std::sync::Arc::clone(&controller)),
+            Some(archive_dir),
+        )
+        .await;
+        let turn_result = match launched {
+            Ok((mut item_rx, join)) => {
+                let consumer_self = self.clone();
+                let consumer_thread = thread_id.to_string();
+                let consumer = tokio::spawn(async move {
+                    let mut item_ids = HashMap::new();
+                    while let Some(envelope) = item_rx.recv().await {
+                        if !consumer_self.is_current_run(&consumer_thread, run_epoch) {
+                            break;
+                        }
+                        consumer_self.apply_item(&consumer_thread, &envelope["item"], &mut item_ids);
+                    }
+                });
+                let result = join
+                    .await
+                    .map_err(|error| format!("native Vega turn panicked: {error}"))?;
+                let _ = consumer.await;
+                result
+            }
+            Err(error) => Err(error),
+        };
+
+        // --- Post-turn persistence ---
+        match &turn_result {
+            Ok(output) => {
+                let final_messages = output.messages.clone();
+                let last = final_messages.last();
+                let completed = last.map_or(false, |m| {
+                    m.get("role").and_then(Value::as_str) == Some("assistant")
+                        && m.get("stopReason").and_then(Value::as_str) != Some("error")
+                });
+                if completed {
+                    if let Some(last) = last {
+                        memory.set_latest_conclusion(
+                            &last.get("content").cloned().unwrap_or(Value::Null),
+                        );
+                    }
+                    memory.pending_messages = Vec::new();
+                    memory.context_tokens =
+                        pi_core::super_context_tokens_from_messages(&final_messages);
+                    memory.full_messages = if use_full_context {
+                        final_messages.clone()
+                    } else {
+                        Vec::new()
+                    };
+                } else {
+                    memory.pending_messages = final_messages;
+                }
+                let _ = crate::vega_reasonix::save_super_memory(&data_dir, &session_id, &memory);
+            }
+            Err(_) => {
+                let _ = crate::vega_reasonix::save_super_memory(&data_dir, &session_id, &memory);
+            }
+        }
+        self.native_runs.lock().unwrap().remove(thread_id);
+
+        let output = turn_result?;
+        if !self.is_current_run(thread_id, run_epoch) {
+            return Ok(());
+        }
+        let cancelled = output.messages.last().map_or(false, |m| {
+            m.get("stopReason").and_then(Value::as_str) == Some("aborted")
+        }) || controller
+            .cancel
+            .load(std::sync::atomic::Ordering::SeqCst);
         let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
         self.finish_turn_if_current(thread_id, run_epoch, stop_reason, output.usage);
         let _ = user_item_id;
