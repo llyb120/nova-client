@@ -18,8 +18,8 @@ const ALKAID_BRIDGE_BANNER = [
   "import{createRequire as __novaCreateRequire}from'node:module';",
   "import{fileURLToPath as __novaFileURLToPath}from'node:url';",
   "import{dirname as __novaDirname}from'node:path';",
-  "const __filename=__novaFileURLToPath(import.meta.url);",
-  "const __dirname=__novaDirname(__filename);",
+  "const __novaFilename=__novaFileURLToPath(import.meta.url);",
+  "const __dirname=__novaDirname(__novaFilename);",
   "const require=__novaCreateRequire(import.meta.url);",
 ].join("");
 
