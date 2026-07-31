@@ -7,6 +7,7 @@ Vega 是一个基于 pi agent core 的轻量 coding agent，目标是少往返�
 - 使用 `@earendil-works/pi-agent-core` / `pi-ai` / `pi-coding-agent`（0.81+），工具执行策略固定为 `parallel`。
 - `read_files`：同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，强制合并为单次并行读取，禁止拆成多个原生 `read`。
 - `edit_files`：两个及以上互不依赖的已有文件走单次并行智能编辑。每个文件先精确匹配，再以稀有行倒排索引生成候选，依次尝试行尾空白、Unicode、相对缩进及保守的行/token 模糊评分；多个近似候选、低置信度或编辑重叠时拒绝。所有目标都在不可变快照上定位成功后才并行写入，并保留 BOM、换行风格和匹配位置的缩进。
+- Cursor 通道上的 `edit_files` 另支持 escape-resistant 入参：`files`（小改内联）与 `filesB64`（同结构 JSON 的 Base64，抗引号/反引号/中文）。二者互斥；体积策略约以 `JSON.stringify(files) < 2500` 为软上限——轻转义用 `files`，重转义或达到阈值用 `filesB64`（编码后仍可能受 Cursor `CallMcpTool` ~4KB 截断，过大则拆成更小 hunk 或退回内置 `StrReplace`/`Write`）。`arguments` 必须是 JSON 对象，禁止再包一层字符串。
 - `read_files` / `edit_files` 支持访问工作区内外的相对或绝对路径，便于处理用户明确指定的外部文件。`edit_files` 会合并解析到同一文件的多个目标项，由智能 patch 算法统一判断定位歧义和编辑重叠。
 - Skills 使用 pi 的 `loadSkillsFromDir` + Agent Skills 标准目录格式；根目录为 `~/.nova/alkaid/skills`。输入 `/skill:<name>` 可补全并显式调用 skill；普通任务中模型也可按需用 `read` / `read_files` 加载完整 `SKILL.md`（不再提供自定义 `load_skill` 工具）。
 - 系统提示词：Vega 策略（批量读写、最小读取、改后验证、shell 语法约束）为稳态前缀；`cwd` / skills 目录为动态后缀，便于 provider prompt/KV cache 命中。skills ≥ 4 时压缩目录体积。

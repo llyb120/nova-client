@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { basename, delimiter, join } from "node:path";
 import { Cursor } from "@cursor/sdk";
+import { editFilesPathsFromArgs } from "./cursor-filesystem-tools.mjs";
 
 const WINDOWS_SHELL_SHIMS = {
   "bash.exe": "NOVA_SHELL_SHIM_BASH",
@@ -163,10 +164,8 @@ export function mapTool(state, callId, name, status, args, result) {
     status: status === "error" ? "failed" : status === "running" ? "in_progress" : "completed",
   };
   if (item.type === "file_change") {
-    const files = Array.isArray(arguments_?.files) ? arguments_.files : [];
-    item.changes = files
-      .map((file) => ({ path: typeof file?.path === "string" ? file.path : "", kind: "update" }))
-      .filter((change) => change.path);
+    item.changes = editFilesPathsFromArgs(arguments_)
+      .map((path) => ({ path, kind: "update" }));
   }
   state.tools.set(callId, item);
   let trace = state.trace.find((entry) => entry.id === callId);
