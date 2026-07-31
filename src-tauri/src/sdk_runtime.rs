@@ -1256,7 +1256,7 @@ impl SdkManager {
                         let below_capacity = if measured > 0 {
                             measured < force_context_tokens
                         } else {
-                            serde_json::to_string(&final_messages).map_or(true, |s| s.len() < max_context_chars)
+                            serde_json::to_string(&final_messages).map_or(true, |s| pi_core::utf16_len(&s) < max_context_chars)
                         };
                         if below_capacity {
                             let mut completed_messages = final_messages.clone();
