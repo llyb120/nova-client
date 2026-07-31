@@ -537,6 +537,11 @@ export function HomeView() {
   });
   // 每次进入新会话页都强制校准在线队友的共享模型，避免沿用旧 peerModels 缓存。
   onMount(() => preloadPeerModels(true));
+  // 快捷键/侧栏「新会话」后聚焦首页输入框（含已在首页、组件未重挂载的情况）。
+  createEffect(() => {
+    if (state.homeComposerFocusAt <= 0) return;
+    queueMicrotask(() => textareaRef?.focus());
+  });
   onCleanup(() => {
     if (!submittingPrompt) rememberPromptDraft(text(), attach.images());
   });

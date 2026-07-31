@@ -169,6 +169,8 @@ interface AppStore {
   pendingClueCard: { id: string; title: string } | null;
   /** 从当前会话点「新会话」时暂存的目录/模型，供 HomeView 继承。 */
   pendingNewSessionSeed: PendingNewSessionSeed | null;
+  /** 打开新会话页后递增，HomeView 据此聚焦输入框。 */
+  homeComposerFocusAt: number;
   /** 系统提醒点击后，请证据链定位到指定卡片。 */
   clueOpenRequest: string | null;
   /** 收到的线索 @ 提醒；打开对应卡片后清除。 */
@@ -252,6 +254,7 @@ export const [state, setState] = createStore<AppStore>({
   clueGroups: [],
   pendingClueCard: null,
   pendingNewSessionSeed: null,
+  homeComposerFocusAt: 0,
   clueOpenRequest: null,
   unreadClueMentions: [],
   employees: [],
@@ -796,6 +799,7 @@ export function openNewSession() {
   }
   closeThread();
   setView("home");
+  setState("homeComposerFocusAt", Date.now());
 }
 
 /** HomeView 挂载时取走一次继承种子。 */
