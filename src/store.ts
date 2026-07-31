@@ -1877,6 +1877,11 @@ export async function editUserMessage(itemId: number, text: string, images: Prom
   });
   setState("expanded", reconcile({}));
   setState("running", id, true);
+  // 先置 running 再解挂：停止留下的 hold 否则会挡住本轮结束后的队列自动投递。
+  // 必须在 running=true 之后释放，避免解挂瞬间把仍停留在队列里的条目立刻发出。
+  // 动态导入避免 store ↔ promptQueue 循环依赖。
+  const { releasePromptQueue } = await import("./promptQueue");
+  releasePromptQueue(id);
   bumpChatScrollToBottom();
   // 「停止 → 立刻编辑重发」的竞态：后端 cancel 可能尚未完成，truncate 会被
   // 「会话正在运行」校验拒绝，直接抛错会让这次编辑静默丢失（表现为第一次发送失败）。

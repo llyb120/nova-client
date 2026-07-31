@@ -56,6 +56,7 @@ export function enqueuePrompt(threadId: string, text: string, images: PromptImag
 
 export function removeQueuedPrompt(itemId: string): QueuedPrompt | null {
   let removed: QueuedPrompt | null = null;
+  let shouldReleaseHold = false;
   setQueuedPrompts((items) => {
     const next = items.filter((queued) => {
       if (queued.id !== itemId) return true;
@@ -65,10 +66,13 @@ export function removeQueuedPrompt(itemId: string): QueuedPrompt | null {
     if (removed) {
       const pending = next.some((queued) => queued.threadId === removed!.threadId);
       void api.setPromptQueuePending(removed.threadId, pending);
-      if (!pending) releasePromptQueue(removed.threadId);
+      // 必须在 setQueuedPrompts 提交后再 release：更新器内改 hold 会触发
+      // dispatcher，此时 queuedPrompts 仍是旧值，撤回会被误当成发送。
+      shouldReleaseHold = !pending;
     }
     return next;
   });
+  if (removed && shouldReleaseHold) releasePromptQueue(removed.threadId);
   setFailedQueueIds((ids) => {
     if (!ids.has(itemId)) return ids;
     const next = new Set(ids);
