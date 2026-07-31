@@ -12,6 +12,7 @@ import {
   releasePromptQueue,
   removeQueuedPrompt,
 } from "../promptQueue";
+import { mountSessionShortcuts } from "../sessionShortcuts";
 import {
   cancelTurn,
   clueCardById,
@@ -81,6 +82,30 @@ export function Composer() {
   createEffect(() => {
     text();
     resizeInput();
+  });
+
+  const insertShortcutText = (snippet: string): boolean => {
+    if (!textareaRef || document.activeElement !== textareaRef) return false;
+    const start = textareaRef.selectionStart ?? text().length;
+    const end = textareaRef.selectionEnd ?? start;
+    const next = `${text().slice(0, start)}${snippet}${text().slice(end)}`;
+    const nextCursor = start + snippet.length;
+    setText(next);
+    setCursor(nextCursor);
+    setHistoryOpen(false);
+    queueMicrotask(() => {
+      if (!textareaRef) return;
+      textareaRef.focus();
+      textareaRef.setSelectionRange(nextCursor, nextCursor);
+      updateSlashState(textareaRef, true);
+      resizeInput();
+    });
+    return true;
+  };
+
+  mountSessionShortcuts({
+    allowedActions: ["insertText"],
+    onInsertText: insertShortcutText,
   });
 
   onCleanup(() => {

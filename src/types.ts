@@ -354,15 +354,19 @@ export interface CursorModelContextRule {
   contextWindow: number;
 }
 
-export type SessionShortcutAction = "selectProject" | "selectModel" | "newSession";
+export type SessionShortcutAction =
+  | "selectProject"
+  | "selectModel"
+  | "newSession"
+  | "insertText";
 
-/** 会话快捷键：一键切到指定项目或模型，或快速新会话。 */
+/** 会话快捷键：一键切到指定项目或模型、快速新会话，或向输入框插入文本。 */
 export interface SessionShortcut {
   id: string;
   /** 规范化按键，如 Ctrl+1 / Alt+P。 */
   keys: string;
   action: SessionShortcutAction;
-  /** 本地项目路径、roam/quota 编码，或 agentKind:model；newSession 可为空。 */
+  /** 本地项目路径、roam/quota 编码、agentKind:model，或 insertText 的插入内容；newSession 可为空。 */
   target: string;
 }
 

@@ -14,16 +14,16 @@ pub struct CursorModelContextRule {
     pub context_window: u32,
 }
 
-/// 新建会话 / 会话页快捷键：一键切到指定项目或模型。
+/// 新建会话 / 会话页快捷键：一键切到指定项目或模型、快速新会话，或插入文本。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionShortcut {
     pub id: String,
     /// 规范化按键，如 Ctrl+1 / Alt+P。
     pub keys: String,
-    /// selectProject | selectModel | newSession
+    /// selectProject | selectModel | newSession | insertText
     pub action: String,
-    /// 项目绝对路径、`<agentKind>:<modelId>` / roam/quota 编码；newSession 可为空。
+    /// 项目绝对路径、`<agentKind>:<modelId>` / roam/quota 编码，或 insertText 文本；newSession 可为空。
     pub target: String,
 }
 

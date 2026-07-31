@@ -136,6 +136,8 @@ export function mountSessionShortcuts(options: {
     quotaPeer?: { token: string; name: string } | null,
   ) => void;
   onNewSession?: () => void;
+  /** 返回 true 表示已插入到当前会话输入框。 */
+  onInsertText?: (text: string) => boolean;
 }): void {
   const allowed = new Set(options.allowedActions);
   const onKeyDown = (event: KeyboardEvent) => {
@@ -148,8 +150,23 @@ export function mountSessionShortcuts(options: {
     if (!hit?.keys) return;
     if (!allowed.has(hit.action)) return;
     if (hit.action !== "newSession" && !hit.target) return;
-    if (isEditableTarget(event.target) && !shortcutHasModifier(hit.keys)) return;
+    // insertText 仅在输入框内生效，允许无修饰键；其它动作在可编辑区需 Ctrl/Alt/Meta。
+    if (
+      hit.action !== "insertText" &&
+      isEditableTarget(event.target) &&
+      !shortcutHasModifier(hit.keys)
+    ) {
+      return;
+    }
 
+    if (hit.action === "insertText") {
+      if (!isEditableTarget(event.target)) return;
+      const handled = options.onInsertText?.(hit.target) ?? false;
+      if (!handled) return;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (hit.action === "newSession") {
       event.preventDefault();
       event.stopPropagation();

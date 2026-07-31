@@ -454,7 +454,9 @@ export function SettingsModal(props: { onClose: () => void }) {
             ? "selectProject"
             : item.action === "newSession"
               ? "newSession"
-              : "selectModel",
+              : item.action === "insertText"
+                ? "insertText"
+                : "selectModel",
         target: item.target.trim(),
       }))
       .filter((item) => {
@@ -1124,7 +1126,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型，或快速新会话。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用，会话中会继承当前目录与模型。
+                      一键切换项目/模型、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效。
                     </div>
                   </div>
                   <button
@@ -1168,7 +1170,9 @@ export function SettingsModal(props: { onClose: () => void }) {
                                     ? "selectProject"
                                     : action === "newSession"
                                       ? "newSession"
-                                      : "selectModel";
+                                      : action === "insertText"
+                                        ? "insertText"
+                                        : "selectModel";
                                 updateSessionShortcut(index, {
                                   action: nextAction,
                                   target: "",
@@ -1179,42 +1183,59 @@ export function SettingsModal(props: { onClose: () => void }) {
                               <option value="selectModel">选择模型</option>
                               <option value="selectProject">选择项目</option>
                               <option value="newSession">快速新会话</option>
+                              <option value="insertText">快捷输入</option>
                             </select>
                             <div class="session-shortcut-target">
                               <Show
                                 when={item().action === "newSession"}
                                 fallback={
                                   <Show
-                                    when={item().action === "selectProject"}
+                                    when={item().action === "insertText"}
                                     fallback={
-                                      <ModelPicker
-                                        agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "alkaid")}
-                                        agentKinds={enabledAgentKinds()}
-                                        model={modelTarget()?.model ?? ""}
-                                        sharedModels={shortcutSharedModels()}
-                                        quotaPeerToken={modelTarget()?.peerToken}
-                                        onPickModel={(agentKind, model, quotaPeer) =>
-                                          updateSessionShortcut(index, {
-                                            target: quotaPeer
-                                              ? encodeQuotaModelTarget(quotaPeer.token, agentKind, model)
-                                              : encodeModelTarget(agentKind, model),
-                                          })
+                                      <Show
+                                        when={item().action === "selectProject"}
+                                        fallback={
+                                          <ModelPicker
+                                            agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "alkaid")}
+                                            agentKinds={enabledAgentKinds()}
+                                            model={modelTarget()?.model ?? ""}
+                                            sharedModels={shortcutSharedModels()}
+                                            quotaPeerToken={modelTarget()?.peerToken}
+                                            onPickModel={(agentKind, model, quotaPeer) =>
+                                              updateSessionShortcut(index, {
+                                                target: quotaPeer
+                                                  ? encodeQuotaModelTarget(quotaPeer.token, agentKind, model)
+                                                  : encodeModelTarget(agentKind, model),
+                                              })
+                                            }
+                                            title="快捷键目标模型"
+                                            portal
+                                          />
                                         }
-                                        title="快捷键目标模型"
-                                        portal
-                                      />
+                                      >
+                                        <ProjectPicker
+                                          value={roamTarget() ? "" : item().target}
+                                          roam={roamTarget()}
+                                          onChange={(path) => updateSessionShortcut(index, { target: path })}
+                                          onPickRoaming={(peer, folder) =>
+                                            updateSessionShortcut(index, {
+                                              target: encodeRoamTarget(peer.token, folder),
+                                            })
+                                          }
+                                          portal
+                                        />
+                                      </Show>
                                     }
                                   >
-                                    <ProjectPicker
-                                      value={roamTarget() ? "" : item().target}
-                                      roam={roamTarget()}
-                                      onChange={(path) => updateSessionShortcut(index, { target: path })}
-                                      onPickRoaming={(peer, folder) =>
-                                        updateSessionShortcut(index, {
-                                          target: encodeRoamTarget(peer.token, folder),
-                                        })
+                                    <input
+                                      class="field-input"
+                                      type="text"
+                                      value={item().target}
+                                      placeholder="要插入的文本"
+                                      onInput={(event) =>
+                                        updateSessionShortcut(index, { target: event.currentTarget.value })
                                       }
-                                      portal
+                                      aria-label="快捷输入内容"
                                     />
                                   </Show>
                                 }

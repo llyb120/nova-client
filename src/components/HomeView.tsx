@@ -420,8 +420,27 @@ export function HomeView() {
     if (warm) prewarmCurrent({ cwd: p });
   };
 
+  const insertShortcutText = (snippet: string): boolean => {
+    if (!textareaRef || document.activeElement !== textareaRef) return false;
+    const start = textareaRef.selectionStart ?? text().length;
+    const end = textareaRef.selectionEnd ?? start;
+    const next = `${text().slice(0, start)}${snippet}${text().slice(end)}`;
+    const nextCursor = start + snippet.length;
+    setText(next);
+    setCursor(nextCursor);
+    queueMicrotask(() => {
+      if (!textareaRef) return;
+      textareaRef.focus();
+      textareaRef.setSelectionRange(nextCursor, nextCursor);
+      updateSlashState(textareaRef, true);
+      resizeInput();
+    });
+    return true;
+  };
+
   mountSessionShortcuts({
-    allowedActions: ["selectProject", "selectModel"],
+    allowedActions: ["selectProject", "selectModel", "insertText"],
+    onInsertText: insertShortcutText,
     onSelectProject: (path, roam) => {
       if (roam) {
         const peer = state.peers.find((item) => item.token === roam.peerToken);
