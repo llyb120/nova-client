@@ -20,10 +20,6 @@ const {
   createCursorFilesystemTools,
   createMessageState,
   createSlimMemory,
-  EDIT_FILES_INLINE_CHAR_LIMIT,
-  decodeFilesB64,
-  editFilesPathsFromArgs,
-  recommendEditFilesTransport,
   cursorBatchToolPolicy,
   cursorCavemanPolicy,
   cursorPromptPrefix,
@@ -800,8 +796,6 @@ try {
 
 assert.match(cursorBatchToolPolicy(), /read_files/);
 assert.match(cursorBatchToolPolicy(), /edit_files/);
-assert.match(cursorBatchToolPolicy(), /filesB64/);
-assert.doesNotMatch(cursorBatchToolPolicy(), /filesPath/);
 assert.match(cursorBatchToolPolicy(), /git grep/);
 assert.doesNotMatch(cursorBatchToolPolicy({ readOnly: true }), /edit_files/);
 assert.match(cursorBatchToolPolicy({ readOnly: true }), /plan\/read-only/);
@@ -871,50 +865,6 @@ try {
     readFile(join(batchCwd, "a.txt"), "utf8"),
     readFile(join(batchCwd, "b.txt"), "utf8"),
   ]), ["AA\nconst quoted = \"y\";", "BB\npath = D:\\work"]);
-
-  assert.equal(recommendEditFilesTransport([
-    { path: "a.txt", edits: [{ oldLines: ["x"], newLines: ["y"] }] },
-  ]), "files");
-  assert.equal(recommendEditFilesTransport([
-    { path: "a.go", edits: [{ oldLines: ["s := `json:\"x\"`"], newLines: ["s := `json:\"y\"`"] }] },
-  ]), "filesB64");
-  assert.equal(recommendEditFilesTransport([{
-    path: "big.txt",
-    edits: [{ oldLines: [Array(EDIT_FILES_INLINE_CHAR_LIMIT).fill("a").join("")], newLines: ["b"] }],
-  }]), "filesB64");
-
-  const b64Files = [
-    { path: "a.txt", edits: [{ oldLines: ["AA", "const quoted = \"y\";"], newLines: ["AAA", "const quoted = \"z\";"] }] },
-    { path: "b.txt", edits: [{ oldLines: ["BB", "path = D:\\work"], newLines: ["BBB", "path = E:\\work"] }] },
-  ];
-  const filesB64 = Buffer.from(JSON.stringify(b64Files), "utf8").toString("base64");
-  assert.deepEqual(decodeFilesB64(filesB64), b64Files);
-  assert.deepEqual(editFilesPathsFromArgs({ filesB64 }), ["a.txt", "b.txt"]);
-  const b64Mapped = mapMessage({
-    type: "tool_call",
-    call_id: "edit-b64",
-    name: "edit_files",
-    status: "running",
-    args: { filesB64 },
-  }, createMessageState())[0];
-  assert.deepEqual(b64Mapped.changes, [
-    { path: "a.txt", kind: "update" },
-    { path: "b.txt", kind: "update" },
-  ]);
-  await agentTools.edit_files.execute({ filesB64 });
-  assert.deepEqual(await Promise.all([
-    readFile(join(batchCwd, "a.txt"), "utf8"),
-    readFile(join(batchCwd, "b.txt"), "utf8"),
-  ]), ["AAA\nconst quoted = \"z\";", "BBB\npath = E:\\work"]);
-
-  await assert.rejects(
-    () => agentTools.edit_files.execute({ files: b64Files, filesB64 }),
-    /only one of files or filesB64/,
-  );
-  await assert.rejects(
-    () => agentTools.edit_files.execute({}),
-    /exactly one of files or filesB64/,
-  );
 
   await writeFile(join(batchCwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
   const first = JSON.parse(await agentTools.read_files.execute({ paths: ["large.txt"] }))[0];

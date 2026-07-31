@@ -8,13 +8,6 @@ const DEFAULT_BATCH_READ_LINES = 200;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
 const READ_FILES_MAX_BYTES = 32 * 1024;
 
-/**
- * Soft ceiling for inline `files` / `filesB64` on the Cursor CallMcpTool channel.
- * Transcripts show truncation near ~3900–4400 chars when arguments are stringified;
- * keep encoded payloads comfortably under that.
- */
-export const EDIT_FILES_INLINE_CHAR_LIMIT = 2500;
-
 function truncateUtf8ToBytes(text, maxBytes) {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   let end = Math.min(text.length, maxBytes);
@@ -44,105 +37,6 @@ function textEditFromLines(edit, fileIndex, editIndex) {
     throw new Error(`files[${fileIndex}].edits[${editIndex}] requires non-empty string arrays oldLines/newLines`);
   }
   return { oldText: oldLines.join("\n"), newText: newLines.join("\n") };
-}
-
-function normalizeFilesList(value, label) {
-  let list = value;
-  if (value && typeof value === "object" && !Array.isArray(value) && Array.isArray(value.files)) {
-    list = value.files;
-  }
-  if (!Array.isArray(list) || list.length === 0) {
-    throw new Error(`${label} must resolve to a non-empty files array`);
-  }
-  return list;
-}
-
-function decodeStrictBase64Utf8(b64, label) {
-  if (typeof b64 !== "string" || !b64.trim()) {
-    throw new Error(`${label} must be a non-empty base64 string`);
-  }
-  const cleaned = b64.replace(/\s+/g, "");
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
-    throw new Error(`${label} is not valid base64`);
-  }
-  const buf = Buffer.from(cleaned, "base64");
-  const roundTrip = buf.toString("base64").replace(/=+$/, "");
-  const input = cleaned.replace(/=+$/, "");
-  if (roundTrip !== input) {
-    throw new Error(`${label} failed base64 round-trip`);
-  }
-  return buf.toString("utf8");
-}
-
-/** Decode `filesB64` (UTF-8 JSON of files[] or { files: [...] }). */
-export function decodeFilesB64(filesB64) {
-  const text = decodeStrictBase64Utf8(filesB64, "filesB64");
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (error) {
-    throw new Error(`filesB64 JSON parse failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  return normalizeFilesList(parsed, "filesB64");
-}
-
-/**
- * Size-based transport hint for agents (and tests).
- * - files: small plain inline object under the char budget
- * - filesB64: escape-heavy content, or JSON at/over the soft budget (Base64 expands ~33%)
- * Oversize past the Cursor channel: split into smaller hunks or fall back to built-in StrReplace/Write.
- */
-function editFilesContentEscapeHeavy(files) {
-  for (const file of Array.isArray(files) ? files : []) {
-    for (const edit of Array.isArray(file?.edits) ? file.edits : []) {
-      for (const line of [...(edit?.oldLines ?? []), ...(edit?.newLines ?? [])]) {
-        if (typeof line === "string" && /[`"'\\\u4e00-\u9fff]/.test(line)) return true;
-      }
-    }
-  }
-  return false;
-}
-
-export function recommendEditFilesTransport(files, options = {}) {
-  const list = Array.isArray(files) ? files : [];
-  const json = JSON.stringify(list);
-  const chars = Buffer.byteLength(json, "utf8");
-  const limit = Number.isFinite(options.inlineCharLimit) ? options.inlineCharLimit : EDIT_FILES_INLINE_CHAR_LIMIT;
-  if (chars >= limit || editFilesContentEscapeHeavy(list)) return "filesB64";
-  return "files";
-}
-
-export function editFilesPathsFromArgs(args) {
-  try {
-    if (!args || typeof args !== "object") return [];
-    if (Array.isArray(args.files)) {
-      return args.files
-        .map((file) => (typeof file?.path === "string" ? file.path : ""))
-        .filter(Boolean);
-    }
-    if (typeof args.filesB64 === "string") {
-      return decodeFilesB64(args.filesB64)
-        .map((file) => (typeof file?.path === "string" ? file.path : ""))
-        .filter(Boolean);
-    }
-  } catch {
-    return [];
-  }
-  return [];
-}
-
-/** Resolve exactly one of files | filesB64 into a files array. */
-export async function resolveEditFilesList(args, _root = process.cwd()) {
-  const input = args && typeof args === "object" ? args : {};
-  const present = ["files", "filesB64"].filter((key) => input[key] != null && input[key] !== "");
-  if (present.length === 0) {
-    throw new Error("edit_files requires exactly one of files or filesB64");
-  }
-  if (present.length > 1) {
-    throw new Error(`edit_files accepts only one of files or filesB64 (got ${present.join(", ")})`);
-  }
-  if (present[0] === "files") return normalizeFilesList(input.files, "files");
-  return decodeFilesB64(input.filesB64);
 }
 
 async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES, maxBytes = READ_FILES_MAX_BYTES) {
@@ -198,38 +92,6 @@ const PATH_OR_RANGE_SCHEMA = {
   ],
 };
 
-const EDIT_FILES_ITEM_SCHEMA = {
-  type: "object",
-  properties: {
-    path: { type: "string" },
-    edits: {
-      type: "array",
-      minItems: 1,
-      items: {
-        type: "object",
-        properties: {
-          oldLines: {
-            type: "array",
-            minItems: 1,
-            items: { type: "string" },
-            description: "待替换文本，每个数组元素严格对应一行；用末尾空字符串表示结尾换行。",
-          },
-          newLines: {
-            type: "array",
-            minItems: 1,
-            items: { type: "string" },
-            description: "替换后文本，每个数组元素严格对应一行；用末尾空字符串表示结尾换行。",
-          },
-        },
-        required: ["oldLines", "newLines"],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ["path", "edits"],
-  additionalProperties: false,
-};
-
 /**
  * Vega-style batch FS tools for Cursor SDK `local.customTools`.
  * Plan / read-only mode omits edit_files.
@@ -276,31 +138,52 @@ export function createCursorFilesystemTools(cwd, options = {}) {
 
   if (!readOnly) {
     tools.edit_files = {
-      description: [
-        "并行智能编辑多个互不依赖的文件。",
-        "CallMcpTool 的 arguments 必须是 JSON 对象（禁止再包一层 JSON 字符串）。",
-        "二选一入参：files（小改内联行数组）、filesB64（UTF-8 JSON 的 Base64，抗引号/反引号/中文转义）。",
-        `体积策略：估计 JSON.stringify(files) < ${EDIT_FILES_INLINE_CHAR_LIMIT} 且无重转义时用 files；同体积但含大量引号/反引号/中文，或达到阈值时用 filesB64（Shell/node 编码后只传该字符串）。编码后仍可能受 ~4KB 通道截断：拆成更小 hunk，或退回内置 StrReplace/Write。不要先写 sidecar JSON 再传路径。`,
-        "先精确匹配，再智能定位；歧义或重叠时拒绝，所有文件验证成功后才并行写入。",
-      ].join(""),
+      description: "并行智能编辑多个互不依赖的文件。每段 oldLines/newLines 必须按行传为 JSON 字符串数组（不要把多行内容塞进一个字符串），以避开 Cursor 对多行工具参数的解析缺陷。先精确匹配，再智能定位；歧义或重叠时拒绝，所有文件验证成功后才并行写入。",
       inputSchema: {
         type: "object",
         properties: {
           files: {
             type: "array",
             minItems: 1,
-            items: EDIT_FILES_ITEM_SCHEMA,
-            description: `小改内联：JSON 体积建议 < ${EDIT_FILES_INLINE_CHAR_LIMIT} 字符；与 filesB64 互斥。`,
-          },
-          filesB64: {
-            type: "string",
-            description: `files 数组（或 {files:[...]}）的 UTF-8 JSON Base64。抗转义；编码后仍可能受 ~4KB 通道截断，过大请拆 hunk 或改用内置编辑。与 files 互斥。`,
+            items: {
+              type: "object",
+              properties: {
+                path: { type: "string" },
+                edits: {
+                  type: "array",
+                  minItems: 1,
+                  items: {
+                    type: "object",
+                    properties: {
+                      oldLines: {
+                        type: "array",
+                        minItems: 1,
+                        items: { type: "string" },
+                        description: "待替换文本，每个数组元素严格对应一行；用末尾空字符串表示结尾换行。",
+                      },
+                      newLines: {
+                        type: "array",
+                        minItems: 1,
+                        items: { type: "string" },
+                        description: "替换后文本，每个数组元素严格对应一行；用末尾空字符串表示结尾换行。",
+                      },
+                    },
+                    required: ["oldLines", "newLines"],
+                    additionalProperties: false,
+                  },
+                },
+              },
+              required: ["path", "edits"],
+              additionalProperties: false,
+            },
           },
         },
+        required: ["files"],
         additionalProperties: false,
       },
-      async execute(args) {
-        const list = await resolveEditFilesList(args, root);
+      async execute({ files }) {
+        const list = Array.isArray(files) ? files : [];
+        if (list.length === 0) throw new Error("edit_files requires a non-empty files array");
         const grouped = new Map();
         for (const [fileIndex, file] of list.entries()) {
           const requestPath = String(file?.path ?? "");
@@ -371,8 +254,7 @@ export function cursorBatchToolPolicy(options = {}) {
     "Before each read phase, inventory known targets: if there is only one target, use Read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call Read repeatedly, and do not use parallel wrappers of multiple Read calls instead of read_files. Wanting to understand files in order is not a read dependency. Use Read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. When location is unknown, search first (see below), then read near hits. Do not dump large files blindly."
       + (readOnly
         ? ""
-        : " When editing two or more independent existing files, you must use edit_files; merge multiple edits for the same file into one files[] entry. Serialize tool calls only when there is a real dependency or overlapping targets."
-          + ` edit_files CallMcpTool arguments MUST be a JSON object (never a stringified JSON blob). Choose exactly one transport by size/escaping: (1) files — small inline line-arrays when JSON.stringify(files) is under ~${EDIT_FILES_INLINE_CHAR_LIMIT} chars and escaping is light; (2) filesB64 — heavy quotes/backticks/Chinese, or JSON at/over that soft budget: Shell/node-encode the UTF-8 JSON of files[] (or {files:[...]}) as Base64 and pass only that string. If the encoded payload still risks ~4KB truncation, split into smaller hunks or fall back to built-in StrReplace/Write. Never write a sidecar JSON just to pass a path. Never combine files and filesB64.`),
+        : " When editing two or more independent existing files, you must use edit_files; merge multiple edits for the same file into one files[] entry. Serialize tool calls only when there is a real dependency or overlapping targets."),
     "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `git grep` for tracked files; use `rg` when untracked files matter, and honor `.gitignore` by default. Cursor Grep is also allowed. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];
   if (readOnly) {

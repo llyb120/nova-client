@@ -1188,9 +1188,4 @@ export {
   cursorBatchToolPolicy,
   cursorCavemanPolicy,
   cursorPromptPrefix,
-  EDIT_FILES_INLINE_CHAR_LIMIT,
-  decodeFilesB64,
-  editFilesPathsFromArgs,
-  recommendEditFilesTransport,
-  resolveEditFilesList,
 } from "./cursor-filesystem-tools.mjs";
