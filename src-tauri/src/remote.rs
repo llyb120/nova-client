@@ -35,6 +35,13 @@ const REMOTE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// 任意会进入 `dispatch_prompt` 的来源（IPC、远程、后台重发等）共用此事件。
 pub const EV_FIRE_START: &str = "fire:start";
 
+/// 远程提示词队列条目：目标会话正忙时暂存，回合结束后按 FIFO 自动投递。
+#[derive(Clone)]
+struct QueuedRemotePrompt {
+    text: String,
+    images: Vec<PromptImage>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct RemoteConfig {
     server: String,
@@ -411,6 +418,8 @@ async fn run(app: AppHandle) {
     // 远程命令通过异步任务启动。初始快照可能先看到 running=false，随后任务才登记运行；
     // 在这段窗口内主动跟踪命令涉及的会话，避免释放基线后漏掉整个短任务。
     let mut command_watch: HashMap<String, Instant> = HashMap::new();
+    // 提示词队列：目标会话正忙时暂存远程 send 命令，回合结束后按 FIFO 自动投递。
+    let mut prompt_queue: HashMap<String, Vec<QueuedRemotePrompt>> = HashMap::new();
 
     loop {
         let Some(cfg) = config(&app) else {
@@ -432,6 +441,7 @@ async fn run(app: AppHandle) {
             model_signature.clear();
             permission_signature.clear();
             command_watch.clear();
+            prompt_queue.clear();
             // 设置页开启后尽快生效；关闭时命令执行入口还会再次校验开关。
             sleep(Duration::from_secs(1)).await;
             continue;
@@ -461,6 +471,7 @@ async fn run(app: AppHandle) {
             model_signature.clear();
             permission_signature.clear();
             command_watch.clear();
+            prompt_queue.clear();
         }
 
         while let Ok((generation, result)) = pull_rx.try_recv() {
@@ -480,6 +491,7 @@ async fn run(app: AppHandle) {
                     &mut results,
                     &mut requested,
                     &mut command_watch,
+                    &mut prompt_queue,
                 )
                 .await;
             }
@@ -576,6 +588,7 @@ async fn run(app: AppHandle) {
                                     &mut results,
                                     &mut requested,
                                     &mut command_watch,
+                                    &mut prompt_queue,
                                 )
                                 .await;
                             }
@@ -714,6 +727,21 @@ async fn run(app: AppHandle) {
                             );
                             if completed_after_baseline {
                                 command_watch.remove(id);
+                                // 回合结束：按 FIFO 投递该会话的下一条排队提示词。
+                                if let Some(next) = prompt_queue
+                                    .get_mut(id)
+                                    .and_then(|q| (!q.is_empty()).then(|| q.remove(0)))
+                                {
+                                    if prompt_queue.get(id).map_or(true, |q| q.is_empty()) {
+                                        prompt_queue.remove(id);
+                                    }
+                                    let _ = send_prompt(app, id, &next.text, next.images);
+                                    command_watch.insert(
+                                        id.clone(),
+                                        Instant::now() + COMMAND_WATCH_DURATION,
+                                    );
+                                    requested.insert(id.clone());
+                                }
                             }
                         }
                     }
@@ -737,6 +765,7 @@ async fn run(app: AppHandle) {
                     &mut results,
                     &mut requested,
                     &mut command_watch,
+                    &mut prompt_queue,
                 )
                 .await;
             }
@@ -773,6 +802,7 @@ async fn apply_pull_response(
     results: &mut Vec<CommandResult>,
     requested: &mut HashSet<String>,
     command_watch: &mut HashMap<String, Instant>,
+    prompt_queue: &mut HashMap<String, Vec<QueuedRemotePrompt>>,
 ) {
     // pull 与内容上传并发，较早发出的 pull 可能晚于一次 sync 返回。修订号只能前进；
     // 命令 id 自带去重，因此无论响应修订新旧都可以安全处理。
@@ -793,6 +823,7 @@ async fn apply_pull_response(
         results,
         requested,
         command_watch,
+        prompt_queue,
     )
     .await;
 }
@@ -1466,12 +1497,13 @@ async fn process_commands(
     results: &mut Vec<CommandResult>,
     requested: &mut HashSet<String>,
     command_watch: &mut HashMap<String, Instant>,
+    prompt_queue: &mut HashMap<String, Vec<QueuedRemotePrompt>>,
 ) {
     for cmd in commands {
         if cmd.id <= *processed_id {
             continue;
         }
-        let result = execute_command(app, &cmd).await;
+        let result = execute_command(app, &cmd, prompt_queue).await;
         *processed_id = cmd.id;
         *ack_id = cmd.id;
         if result.ok && !result.thread_id.is_empty() {
@@ -1487,7 +1519,11 @@ async fn process_commands(
     }
 }
 
-async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult {
+async fn execute_command(
+    app: &AppHandle,
+    cmd: &RemoteCommand,
+    prompt_queue: &mut HashMap<String, Vec<QueuedRemotePrompt>>,
+) -> CommandResult {
     let fail = |error: String| CommandResult {
         id: cmd.id,
         ok: false,
@@ -1513,10 +1549,34 @@ async fn execute_command(app: &AppHandle, cmd: &RemoteCommand) -> CommandResult 
             Ok(id) => ok_thread(id),
             Err(e) => fail(e),
         },
-        "send" => match send_prompt(app, &cmd.thread_id, &cmd.text, cmd.images.clone()) {
-            Ok(()) => ok_thread(cmd.thread_id.clone()),
-            Err(e) => fail(e),
-        },
+        "send" => {
+            // 目标会话正忙时入队，回合结束后由同步循环按 FIFO 自动投递。
+            let busy = {
+                let state = app.state::<AppState>();
+                let store = state.store.lock().unwrap();
+                store
+                    .get(&cmd.thread_id)
+                    .map(|t| is_running(&state, t))
+                    .unwrap_or(false)
+            } || prompt_queue.contains_key(&cmd.thread_id);
+            if busy {
+                if cmd.text.trim().is_empty() && cmd.images.is_empty() {
+                    return fail("内容和附件不能同时为空".into());
+                }
+                prompt_queue.entry(cmd.thread_id.clone()).or_default().push(
+                    QueuedRemotePrompt {
+                        text: cmd.text.clone(),
+                        images: cmd.images.clone(),
+                    },
+                );
+                ok_thread(cmd.thread_id.clone())
+            } else {
+                match send_prompt(app, &cmd.thread_id, &cmd.text, cmd.images.clone()) {
+                    Ok(()) => ok_thread(cmd.thread_id.clone()),
+                    Err(e) => fail(e),
+                }
+            }
+        }
         "stop" => match stop_thread(app, &cmd.thread_id).await {
             Ok(()) => ok_thread(cmd.thread_id.clone()),
             Err(e) => fail(e),
