@@ -87,6 +87,7 @@ const PATH_OR_RANGE_SCHEMA = {
  */
 export function createCursorFilesystemTools(cwd, options = {}) {
   void options;
+  const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
   const root = resolve(cwd);
   return {
     read_files: {
@@ -123,6 +124,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         return JSON.stringify(results);
       },
     },
+    ...(fastContext ? {
     context_bundle: {
       description: "按关键词/符号一次性打包相关代码上下文：命中文件按相关度分层装配（小文件全文、大文件给符号大纲+命中段），并附 1 跳调用邻居大纲。用于在分析或修改前快速获取代码全貌，避免逐文件试探式读取。基于 git grep + rg，无需预建索引。",
       inputSchema: {
@@ -152,6 +154,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         return findSymbol(params ?? {}, root);
       },
     },
+    } : {}),
   };
 }
 
@@ -161,6 +164,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
  */
 export function cursorBatchToolPolicy(options = {}) {
   const readOnly = options.readOnly === true;
+  const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
   const lines = [
     "You have Nova batch tool read_files plus Cursor built-in Read, Shell, Grep"
       + (readOnly ? "" : ", Write/Edit")
@@ -169,7 +173,9 @@ export function cursorBatchToolPolicy(options = {}) {
       + (readOnly
         ? ""
         : " For edits, use Cursor built-in Write/Edit/StrReplace; do not expect a Nova edit_files tool."),
-    "Search and traversal must be cost-bounded. When you need to understand a symbol/keyword's distribution and surrounding code, prefer context_bundle (one call returns layered file contents + 1-hop neighbor outlines) or find_symbol (locations only); they use git grep + rg internally and are more efficient than multiple manual searches. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `git grep` for tracked files; use `rg` when untracked files matter, and honor `.gitignore` by default. Cursor Grep is also allowed. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
+    (fastContext
+      ? "Search and traversal must be cost-bounded. When you need to understand a symbol/keyword's distribution and surrounding code, prefer context_bundle (one call returns layered file contents + 1-hop neighbor outlines) or find_symbol (locations only); they use git grep + rg internally and are more efficient than multiple manual searches. "
+      : "Search and traversal must be cost-bounded. ") + "Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `git grep` for tracked files; use `rg` when untracked files matter, and honor `.gitignore` by default. Cursor Grep is also allowed. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];
   if (readOnly) {
     lines.push("Current mode is plan/read-only: analyze only; do not modify files.");

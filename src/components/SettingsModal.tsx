@@ -258,6 +258,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [checkpointEnabled, setCheckpointEnabled] = createSignal(
     s?.checkpointEnabled ?? false,
   );
+  const [fastContextEnabled, setFastContextEnabled] = createSignal(
+    s?.fastContextEnabled ?? true,
+  );
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
   const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
@@ -600,6 +603,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     vegaProxy: vegaProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
     checkpointEnabled: checkpointEnabled(),
+    fastContextEnabled: fastContextEnabled(),
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
     claudecodeProxy: claudecodeProxy().trim(),
@@ -1355,6 +1359,20 @@ export function SettingsModal(props: { onClose: () => void }) {
                   默认复用 live Cursor session；超级切换到改造前备份的 fresh Agent、compact memory 与自动摘要实现。
                 </span>
               </label>
+              <div class="field">
+                <span class="field-label">Fast Context 上下文检索</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={fastContextEnabled()}
+                    onChange={(e) => setFastContextEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  启用后为 Vega / Cursor 注入 context_bundle / find_symbol 工具，用于一次性打包相关代码上下文；关闭则不附带这两个工具。默认启用。
+                </span>
+              </div>
             </section>
 
             <section class="settings-group">

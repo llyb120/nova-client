@@ -36,7 +36,13 @@ impl SdkAdapter for AlkaidAdapter {
             proxy: settings.vega_proxy.clone(),
             path_env: "ALKAID_RUNTIME",
             api_key: None,
-            extra_env: vec![("NOVA_CONTEXT_MODE", settings.vega_context_mode.clone())],
+            extra_env: vec![
+                ("NOVA_CONTEXT_MODE", settings.vega_context_mode.clone()),
+                (
+                    "NOVA_FAST_CONTEXT",
+                    if settings.fast_context_enabled { "1" } else { "0" }.into(),
+                ),
+            ],
         }
     }
 

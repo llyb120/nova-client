@@ -462,6 +462,8 @@ export interface Settings {
   sessionAutoCleanupHours: number;
   /** 语义检索开关（关 = 内置 BM25 关键词检索） */
   semanticEnabled: boolean;
+  /** 启用 Fast Context 上下文检索工具（context_bundle / find_symbol）。 */
+  fastContextEnabled: boolean;
   /** embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434） */
   embedEndpoint: string;
   /** embedding 模型名（如 bge-m3 / nomic-embed-text / text-embedding-3-small） */

@@ -505,7 +505,8 @@ function createReadStreamFromText(text) {
   return Readable.from([text]);
 }
 
-export function createFilesystemTools(cwd, editTool = null) {
+export function createFilesystemTools(cwd, editTool = null, opts = {}) {
+  const fastContext = opts.fastContext !== false && process.env.NOVA_FAST_CONTEXT !== "0";
   const root = resolve(cwd);
   const tools = [
     {
@@ -540,7 +541,7 @@ export function createFilesystemTools(cwd, editTool = null) {
       },
     },
   ];
-  tools.push(
+  if (fastContext) tools.push(
     {
       name: "context_bundle",
       description: "按关键词/符号一次性打包相关代码上下文：命中文件按相关度分层装配（小文件全文、大文件给符号大纲+命中段），并附 1 跳调用邻居大纲。用于在分析或修改前快速获取代码全貌，避免逐文件试探式读取。基于 git grep + rg，无需预建索引。",
@@ -701,6 +702,7 @@ export async function loadAlkaidAgentInstructions(path = join(alkaidDataRoot(), 
 export function buildAlkaidSystemPrompt(options = {}) {
   const cwd = (options.cwd ?? process.cwd()).replace(/\\/g, "/");
   const skills = options.skills ?? [];
+  const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
   const toolLines = [
     `- read_files: 并行读取多个 UTF-8 文本文件（可带 offset/limit）`,
     options.readOnly ? null : "- edit_files: 并行智能编辑多个互不依赖的已有文件（精确优先、锚点定位、歧义拒绝）",
@@ -710,8 +712,8 @@ export function buildAlkaidSystemPrompt(options = {}) {
       : options.shellConfig?.kind === "powershell"
         ? "- bash: 执行 PowerShell 命令"
         : "- bash: 执行 Bash 命令",
-    "- context_bundle: 按关键词一次性打包相关代码上下文（命中文件分层装配 + 1 跳邻居大纲）",
-    "- find_symbol: 快速定位符号在仓库中的所有出现位置（文件:行号）",
+    fastContext ? "- context_bundle: 按关键词一次性打包相关代码上下文（命中文件分层装配 + 1 跳邻居大纲）" : null,
+    fastContext ? "- find_symbol: 快速定位符号在仓库中的所有出现位置（文件:行号）" : null,
     options.readOnly ? null : "- edit / write: 单文件编辑或写入",
   ].filter(Boolean);
 
@@ -720,7 +722,9 @@ export function buildAlkaidSystemPrompt(options = {}) {
     "回复默认简洁专业，使用完整句子并保留必要解释。先给结论，再给行动所需信息。省略寒暄、套话、复述、工具旁白和重复总结。简单问题简答，复杂问题按需展开。不用装饰性表格或长日志，只引关键错误。代码、命令、API 和错误原文须准确；安全警告、不可逆操作确认和必要步骤不得省略。按用户要求增减细节。",
     `Available tools:\n${toolLines.join("\n")}`,
     "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。每次准备读取前，先汇总当前已知目标：仅有一个目标时使用 read；同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，必须在一次 read_files 调用中合并读取，并为每个文件分别设置必要的 offset/limit。禁止连续调用多个 read，也禁止用并行封装的多个 read 代替 read_files；想按顺序理解文件不构成读取依赖。只有后一个目标的路径或读取范围必须由前一次结果确定、目标不是 UTF-8 文本，或当前确实仅需一个文件时，才使用 read。后续新发现多个独立文本目标时，下一读取阶段仍须合并使用 read_files。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；大文件禁止无目的全量读取。修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
-    "搜索与遍历必须成本有界。需要理解某个符号/关键词在仓库中的分布和上下文时，优先使用 context_bundle（一次调用即可获得命中文件分层内容 + 邻居大纲）或 find_symbol（仅定位出现位置）；它们基于 git grep + rg，比手动多轮搜索更高效。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；Git 仓库中搜索已跟踪文件时优先使用 `git grep`，需要搜索未跟踪文件时使用 `rg`，并默认遵守 `.gitignore`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。",
+    (fastContext
+      ? "搜索与遍历必须成本有界。需要理解某个符号/关键词在仓库中的分布和上下文时，优先使用 context_bundle（一次调用即可获得命中文件分层内容 + 邻居大纲）或 find_symbol（仅定位出现位置）；它们基于 git grep + rg，比手动多轮搜索更高效。"
+      : "搜索与遍历必须成本有界。") + "禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；Git 仓库中搜索已跟踪文件时优先使用 `git grep`，需要搜索未跟踪文件时使用 `rg`，并默认遵守 `.gitignore`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
     "完成修改后，优先根据版本控制 diff 按需确定受影响单元及直接使用方，并执行成本最低且有效的验证；禁止遍历或列出完整仓库、无依据扩大范围，纯文档类改动可说明依据后跳过测试，无法验证时须报告原因、建议命令及剩余风险。",
     options.shellConfig
