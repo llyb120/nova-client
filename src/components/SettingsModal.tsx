@@ -10,19 +10,35 @@ import {
   ensureModelOptions,
   modelChoices,
   normalizeUnifiedMode,
+  preloadPeerModels,
   refreshQuota,
   refreshRelayStatus,
+  roamingPeers,
   setState,
   setTheme,
   state,
 } from "../store";
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
-import { ModelPicker } from "./ConfigSelects";
+import { ModelPicker, type SharedModelSource } from "./ConfigSelects";
 import { IconX } from "./icons";
+import { ProjectPicker } from "./ProjectPicker";
+import {
+  encodeModelTarget,
+  encodeQuotaModelTarget,
+  encodeRoamTarget,
+  formatShortcutKeys,
+  newSessionShortcutId,
+  parseModelTarget,
+  parseRoamTarget,
+  setShortcutCaptureActive,
+} from "../sessionShortcuts";
 import type {
   AgentInstructionTarget,
   AgentKind,
   CliStatus,
+  Peer,
+  SessionShortcut,
+  SessionShortcutAction,
   Settings,
   SkillInfo,
   WorktreeRecord,
@@ -35,6 +51,24 @@ function threadGroupName(cwd: string): string {
 
 function projectPathKey(path: string): string {
   return path.replace(/\\/g, "/").toLowerCase();
+}
+
+function resolveShortcutRoam(target: string): { peer: Peer; folder: string } | null {
+  const parsed = parseRoamTarget(target);
+  if (!parsed) return null;
+  const peer = state.peers.find((item) => item.token === parsed.peerToken);
+  return {
+    peer:
+      peer ??
+      ({
+        token: parsed.peerToken,
+        name: "队友",
+        online: false,
+        folders: [],
+        lastSeen: 0,
+      } satisfies Peer),
+    folder: parsed.folder,
+  };
 }
 
 function quotaPercent(value: number): number {
@@ -62,6 +96,63 @@ const UNIFIED_MODE_OPTIONS = [
   { id: "build", name: "Build（放开全部权限，自动执行）" },
   { id: "plan", name: "Plan（只规划不执行）" },
 ];
+
+/** 点击后按下组合键录制快捷键。 */
+function ShortcutKeyCapture(props: {
+  value: string;
+  onChange: (keys: string) => void;
+}) {
+  const [recording, setRecording] = createSignal(false);
+  let listener: ((event: KeyboardEvent) => void) | null = null;
+
+  const stopRecording = () => {
+    if (listener) {
+      window.removeEventListener("keydown", listener, true);
+      listener = null;
+    }
+    setShortcutCaptureActive(false);
+    setRecording(false);
+  };
+
+  const startRecording = () => {
+    stopRecording();
+    setShortcutCaptureActive(true);
+    setRecording(true);
+    listener = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.key === "Escape") {
+        stopRecording();
+        return;
+      }
+      const keys = formatShortcutKeys(event);
+      if (!keys) return;
+      props.onChange(keys);
+      stopRecording();
+    };
+    window.addEventListener("keydown", listener, true);
+  };
+
+  onCleanup(() => stopRecording());
+
+  return (
+    <button
+      type="button"
+      classList={{
+        "btn secondary session-shortcut-keys": true,
+        recording: recording(),
+      }}
+      onClick={() => {
+        if (recording()) stopRecording();
+        else startRecording();
+      }}
+      aria-label="录制快捷键"
+      title={recording() ? "按下组合键，Esc 取消" : "点击后按下组合键"}
+    >
+      {recording() ? "按下按键…" : props.value || "录制按键"}
+    </button>
+  );
+}
 
 /** 后端代理输入框（每个后端进程可单独走代理） */
 function ProxyField(props: { value: string; onInput: (v: string) => void }) {
@@ -175,6 +266,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [cursorSdkApiKey, setCursorSdkApiKey] = createSignal(s?.cursorSdkApiKey ?? "");
   const [cursorModelContexts, setCursorModelContexts] = createSignal(
     (s?.cursorModelContexts ?? []).map((rule) => ({ ...rule })),
+  );
+  const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(
+    (s?.sessionShortcuts ?? []).map((item) => ({ ...item })),
   );
   const [vegaContextMode, setVegaContextMode] = createSignal<"default" | "super">(
     s?.vegaContextMode === "super" ? "super" : "default",
@@ -328,6 +422,51 @@ export function SettingsModal(props: { onClose: () => void }) {
   const removeCursorModelContext = (index: number) => {
     setCursorModelContexts((current) => current.filter((_, ruleIndex) => ruleIndex !== index));
   };
+  const updateSessionShortcut = (
+    index: number,
+    patch: Partial<Pick<SessionShortcut, "keys" | "action" | "target">>,
+  ) => {
+    setSessionShortcuts((current) =>
+      current.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item)),
+    );
+  };
+  const addSessionShortcut = () => {
+    setSessionShortcuts((current) => [
+      ...current,
+      {
+        id: newSessionShortcutId(),
+        keys: "",
+        action: "selectModel",
+        target: "",
+      },
+    ]);
+  };
+  const removeSessionShortcut = (index: number) => {
+    setSessionShortcuts((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  };
+  const draftSessionShortcuts = (): SessionShortcut[] =>
+    sessionShortcuts()
+      .map((item) => ({
+        id: item.id || newSessionShortcutId(),
+        keys: item.keys.trim(),
+        action: item.action === "selectProject" ? "selectProject" : "selectModel",
+        target: item.target.trim(),
+      }))
+      .filter((item) => item.keys.length > 0 && item.target.length > 0);
+
+  const shortcutSharedModels = createMemo<SharedModelSource[]>(() =>
+    roamingPeers()
+      .map((peer) => ({
+        peer: { token: peer.token, name: peer.name },
+        options: state.peerModels[peer.token]?.sharedOptions ?? {},
+      }))
+      .filter((source) => Object.keys(source.options).length > 0),
+  );
+
+  createEffect(() => {
+    if (sessionShortcuts().length === 0) return;
+    preloadPeerModels();
+  });
 
   let roamingFoldersLoaded = false;
   const loadRoamingFolders = async () => {
@@ -473,6 +612,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     remoteControlEnabled: remoteControlEnabled(),
     quotaSharedModels: quotaSharedModels(),
     modelFavorites: state.settings?.modelFavorites ?? [],
+    sessionShortcuts: draftSessionShortcuts(),
     devinEnabled: devinEnabled(),
     alkaidEnabled: alkaidEnabled(),
     codexEnabled: codexEnabled(),
@@ -820,6 +960,19 @@ export function SettingsModal(props: { onClose: () => void }) {
   });
 
   const save = async () => {
+    const draftedShortcuts = draftSessionShortcuts();
+    const keyCounts = new Map<string, number>();
+    for (const item of draftedShortcuts) {
+      const key = item.keys.toLowerCase();
+      keyCounts.set(key, (keyCounts.get(key) ?? 0) + 1);
+    }
+    if ([...keyCounts.values()].some((count) => count > 1)) {
+      await message("会话快捷键存在重复按键，请修改后再保存。", {
+        title: "保存设置失败",
+        kind: "error",
+      });
+      return;
+    }
     setSaving(true);
     const settings = draftSettings();
     settings.relayToken = relayToken().trim();
@@ -956,6 +1109,112 @@ export function SettingsModal(props: { onClose: () => void }) {
                   仅清理普通会话；超时后先移入回收站，保留同样时长才彻底删除。周六、周日不计入保留时长，但仍会执行清理检查。
                 </span>
               </label>
+
+              <div class="session-shortcut-config">
+                <div class="session-shortcut-head">
+                  <div class="session-shortcut-copy">
+                    <div class="field-label">会话快捷键</div>
+                    <div class="field-hint">
+                      一键切换到指定项目或模型。新建会话页两者均生效；会话中仅模型切换有效。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    class="btn secondary session-shortcut-add"
+                    onClick={addSessionShortcut}
+                  >
+                    添加
+                  </button>
+                </div>
+                <Show
+                  when={sessionShortcuts().length > 0}
+                  fallback={<div class="session-shortcut-empty">暂无快捷键，点击右上角添加。</div>}
+                >
+                  <div class="session-shortcut-list">
+                    <div class="session-shortcut-cols" aria-hidden="true">
+                      <span>按键</span>
+                      <span>动作</span>
+                      <span>目标</span>
+                      <span />
+                    </div>
+                    <Index each={sessionShortcuts()}>
+                      {(item, index) => {
+                        const modelTarget = () =>
+                          item().action === "selectModel" ? parseModelTarget(item().target) : null;
+                        const roamTarget = () =>
+                          item().action === "selectProject" ? resolveShortcutRoam(item().target) : null;
+                        return (
+                          <div class="session-shortcut-row">
+                            <ShortcutKeyCapture
+                              value={item().keys}
+                              onChange={(keys) => updateSessionShortcut(index, { keys })}
+                            />
+                            <select
+                              class="field-input session-shortcut-action"
+                              value={item().action}
+                              onChange={(event) => {
+                                const action = event.currentTarget.value as SessionShortcutAction;
+                                updateSessionShortcut(index, {
+                                  action: action === "selectProject" ? "selectProject" : "selectModel",
+                                  target: "",
+                                });
+                              }}
+                              aria-label="快捷键动作"
+                            >
+                              <option value="selectModel">选择模型</option>
+                              <option value="selectProject">选择项目</option>
+                            </select>
+                            <div class="session-shortcut-target">
+                              <Show
+                                when={item().action === "selectProject"}
+                                fallback={
+                                  <ModelPicker
+                                    agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "alkaid")}
+                                    agentKinds={enabledAgentKinds()}
+                                    model={modelTarget()?.model ?? ""}
+                                    sharedModels={shortcutSharedModels()}
+                                    quotaPeerToken={modelTarget()?.peerToken}
+                                    onPickModel={(agentKind, model, quotaPeer) =>
+                                      updateSessionShortcut(index, {
+                                        target: quotaPeer
+                                          ? encodeQuotaModelTarget(quotaPeer.token, agentKind, model)
+                                          : encodeModelTarget(agentKind, model),
+                                      })
+                                    }
+                                    title="快捷键目标模型"
+                                    portal
+                                  />
+                                }
+                              >
+                                <ProjectPicker
+                                  value={roamTarget() ? "" : item().target}
+                                  roam={roamTarget()}
+                                  onChange={(path) => updateSessionShortcut(index, { target: path })}
+                                  onPickRoaming={(peer, folder) =>
+                                    updateSessionShortcut(index, {
+                                      target: encodeRoamTarget(peer.token, folder),
+                                    })
+                                  }
+                                  portal
+                                />
+                              </Show>
+                            </div>
+                            <button
+                              type="button"
+                              class="icon-btn session-shortcut-remove"
+                              onClick={() => removeSessionShortcut(index)}
+                              aria-label="删除会话快捷键"
+                              title="删除"
+                            >
+                              <IconX size={14} />
+                            </button>
+                          </div>
+                        );
+                      }}
+                    </Index>
+                  </div>
+                </Show>
+              </div>
             </section>
 
             <section class="settings-group">

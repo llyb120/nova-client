@@ -29,6 +29,7 @@ import {
   stashWorktreePrompt,
   assertBuiltinPrompt,
 } from "../store";
+import { mountSessionShortcuts } from "../sessionShortcuts";
 import type { AgentKind, Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
@@ -405,6 +406,45 @@ export function HomeView() {
     else localStorage.setItem(LAST_NEW_THREAD_PROJECT_KEY, p);
     if (warm) prewarmCurrent({ cwd: p });
   };
+
+  mountSessionShortcuts({
+    allowedActions: ["selectProject", "selectModel"],
+    onSelectProject: (path, roam) => {
+      if (roam) {
+        const peer = state.peers.find((item) => item.token === roam.peerToken);
+        if (!peer?.online) {
+          void message(`队友不在线，无法漫游：${peer?.name ?? "未知队友"}`, { kind: "error" });
+          return;
+        }
+        if (!peer.folders.some((folder) => folder.path === roam.folder)) {
+          void message(`对方未共享该目录：${roam.folder}`, { kind: "error" });
+          return;
+        }
+        setQuotaPeer(null);
+        setRoam({ peer, folder: roam.folder });
+        ensurePeerModels(peer.token, true);
+        return;
+      }
+      void (async () => {
+        try {
+          if (!(await api.directoryExists(path))) {
+            void message(`项目目录不存在：${path}`, { kind: "error" });
+            return;
+          }
+        } catch {
+          // 目录校验不可用时仍尝试切换。
+        }
+        selectProject(path, true);
+      })();
+    },
+    onSelectModel: (next, modelId, quotaPeer) => {
+      if (quotaPeer && !roamingPeers().some((peer) => peer.token === quotaPeer.token)) {
+        void message(`队友不在线，无法使用共享模型：${quotaPeer.name}`, { kind: "error" });
+        return;
+      }
+      pickModelCombined(next, modelId, quotaPeer);
+    },
+  });
 
   const ensureScratchProject = () => {
     if (cwd() || scratchLoading) return;

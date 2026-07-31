@@ -6,12 +6,14 @@ import {
   compactThread,
   chatScrollToBottomSignal,
   openThread,
+  pickThreadModel,
   refreshThreads,
   setState,
   setTimeMachineEditTarget,
   state,
   timeMachineChangedSignal,
 } from "../store";
+import { mountSessionShortcuts } from "../sessionShortcuts";
 import type { Item, Thread, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
@@ -221,6 +223,16 @@ export function ChatView() {
   let transcriptRef: CanvasTranscriptHandle | undefined;
   const useCanvas = () => state.settings?.chatViewRender !== "dom";
   const [stickToBottom, setStickToBottom] = createSignal(true);
+
+  mountSessionShortcuts({
+    allowedActions: ["selectModel"],
+    onSelectProject: () => {},
+    onSelectModel: (agentKind, model, quotaPeer) => {
+      // 进行中的会话不支持额度租借切换（与 Composer 一致）。
+      if (quotaPeer) return;
+      void pickThreadModel(agentKind, model);
+    },
+  });
   let scrollQueued = false;
   let scrollFrame = 0;
   let lastScrollTop = 0;

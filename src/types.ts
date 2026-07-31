@@ -354,6 +354,18 @@ export interface CursorModelContextRule {
   contextWindow: number;
 }
 
+export type SessionShortcutAction = "selectProject" | "selectModel";
+
+/** 会话快捷键：一键切到指定项目或模型。 */
+export interface SessionShortcut {
+  id: string;
+  /** 规范化按键，如 Ctrl+1 / Alt+P。 */
+  keys: string;
+  action: SessionShortcutAction;
+  /** 本地项目路径、roam/quota 编码，或 agentKind:model。 */
+  target: string;
+}
+
 export interface Settings {
   devinPath: string;
   acpArgs: string;
@@ -412,6 +424,8 @@ export interface Settings {
   quotaSharedModels: string[];
   /** 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>` */
   modelFavorites: string[];
+  /** 会话快捷键：按键一键切换项目或模型 */
+  sessionShortcuts: SessionShortcut[];
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
   alkaidEnabled: boolean;

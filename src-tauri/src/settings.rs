@@ -14,6 +14,19 @@ pub struct CursorModelContextRule {
     pub context_window: u32,
 }
 
+/// 新建会话 / 会话页快捷键：一键切到指定项目或模型。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionShortcut {
+    pub id: String,
+    /// 规范化按键，如 Ctrl+1 / Alt+P。
+    pub keys: String,
+    /// selectProject | selectModel
+    pub action: String,
+    /// 项目绝对路径，或 `<agentKind>:<modelId>`。
+    pub target: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -98,6 +111,8 @@ pub struct Settings {
     pub quota_shared_models: Vec<String>,
     /// 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>`。
     pub model_favorites: Vec<String>,
+    /// 会话快捷键：按键一键切换项目或模型。
+    pub session_shortcuts: Vec<SessionShortcut>,
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
@@ -176,6 +191,7 @@ impl Default for Settings {
             remote_control_enabled: false,
             quota_shared_models: Vec::new(),
             model_favorites: Vec::new(),
+            session_shortcuts: Vec::new(),
             devin_enabled: false,
             alkaid_enabled: true,
             codex_enabled: false,
@@ -235,6 +251,18 @@ mod tests {
         assert_eq!(settings.cursor_model_contexts.len(), 1);
         assert_eq!(settings.cursor_model_contexts[0].prefix, "claude-4");
         assert_eq!(settings.cursor_model_contexts[0].context_window, 200_000);
+    }
+
+    #[test]
+    fn session_shortcuts_round_trip() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"sessionShortcuts":[{"id":"a","keys":"Ctrl+1","action":"selectModel","target":"codex:gpt-5.6"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.session_shortcuts.len(), 1);
+        assert_eq!(settings.session_shortcuts[0].keys, "Ctrl+1");
+        assert_eq!(settings.session_shortcuts[0].action, "selectModel");
+        assert_eq!(settings.session_shortcuts[0].target, "codex:gpt-5.6");
     }
 
     #[test]
