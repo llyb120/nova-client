@@ -185,9 +185,11 @@ fine-grained tool-streaming beta, `clampMaxTokensToContext`/
 Responses service-tier pricing + tool search, Google Vertex AI, and a
 user-facing temperature control (Vega's request carries no temperature).
 
-Known minor parity gaps (documented, non-blocking): UTF-16 vs scalar slicing in
-the slim-memory compaction heuristic and `should_use_full_context`'s capacity
-check (exact for ASCII/BMP); the three new provider accumulators are
-fixture-tested but not golden-diffed against node (only `openai-completions`
-and the deterministic core have differential vectors — regenerating golden
-vectors needs `node_modules`, which is not installed in this environment).
+Known minor parity gaps (documented, non-blocking): the three new provider
+accumulators are fixture-tested but not golden-diffed against node (only
+`openai-completions` and the deterministic core have differential vectors —
+regenerating golden vectors needs `node_modules`, which is not installed in
+this environment). The previously documented UTF-16 vs scalar/UTF-8 slicing
+differences in the slim-memory compaction heuristics have been fixed (M11h):
+all length checks and head/tail slices now use UTF-16 code units, matching JS
+exactly.
