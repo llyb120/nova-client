@@ -807,6 +807,27 @@ impl SdkManager {
             .filter_map(|part| part.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("\n\n");
+        // Extract prompt images (port of `alkaidPromptInput`): `image_data` parts
+        // carry base64 directly; `local_image` parts are read from disk.
+        let prompt_images: Vec<Value> = parts
+            .iter()
+            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                Some("image_data") => Some(json!({
+                    "type": "image",
+                    "data": part.get("data").and_then(Value::as_str).unwrap_or(""),
+                    "mimeType": part.get("mime").and_then(Value::as_str).unwrap_or("image/png"),
+                })),
+                Some("local_image") => {
+                    let path = part.get("path").and_then(Value::as_str).unwrap_or("");
+                    let mime = image_mime_from_path(path)?;
+                    let bytes = std::fs::read(path).ok()?;
+                    use base64::Engine;
+                    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    Some(json!({ "type": "image", "data": data, "mimeType": mime }))
+                }
+                _ => None,
+            })
+            .collect();
         let data_dir = nova_data_dir(&self.app);
         let server_config = self.alkaid_server_config.lock().unwrap().clone();
         let selection = model_selection.unwrap_or("").to_string();
@@ -824,6 +845,7 @@ impl SdkManager {
             Some(session_id.clone()),
             read_only,
         )?;
+        setup.turn_config.images = prompt_images;
         let expanded_text = pi_core::expand_skill_command(&input_text, &setup.skills);
 
         // --- Reasonix pre-turn context management ---
@@ -1055,6 +1077,22 @@ impl SdkManager {
             hook
         };
 
+        // --- MCP servers (optional) ---
+        // Connect configured MCP servers and advertise their tools as
+        // `mcp__<server>__<tool>`. Failures degrade gracefully (skipped).
+        let mcp_servers = crate::mcp::load_mcp_config(&data_dir);
+        let mcp_hub = if mcp_servers.is_empty() {
+            None
+        } else {
+            let hub = crate::mcp::McpHub::connect(mcp_servers, cwd).await;
+            if hub.is_empty() {
+                None
+            } else {
+                setup.turn_config.tools.extend(hub.tool_definitions());
+                Some(std::sync::Arc::new(hub))
+            }
+        };
+
         // --- Run the turn ---
         let client = reqwest::Client::new();
         let turn_result = crate::vega_native::run_native_turn_async(
@@ -1064,6 +1102,7 @@ impl SdkManager {
             prompt_text,
             setup.native_tools,
             Some(hook),
+            mcp_hub,
         )
         .await;
 
@@ -1813,6 +1852,21 @@ fn prompt_parts(adapter: &dyn SdkAdapter, text: &str, images: &[PromptImage]) ->
         }
     }
     parts
+}
+
+/// Map an image file extension to its MIME type (port of alkaid's
+/// `IMAGE_MEDIA_TYPES` lookup). Returns `None` for non-image extensions.
+fn image_mime_from_path(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
 }
 
 async fn write_line(

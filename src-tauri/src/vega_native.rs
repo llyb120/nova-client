@@ -34,6 +34,8 @@ pub struct NativeTurnConfig {
     pub model: Value,
     pub tools: Vec<Value>,
     pub history: Vec<Value>,
+    /// Prompt images in pi format (`{type:"image", data, mimeType}`).
+    pub images: Vec<Value>,
     pub session_id: Option<String>,
     /// Stands in for `Date.now()`; pass a fixed value for reproducible runs.
     pub timestamp: u64,
@@ -76,7 +78,7 @@ pub fn run_native_turn(
 
     let events = agent.prompt(
         &Value::String(prompt_text.to_string()),
-        &[],
+        &config.images,
         config.timestamp,
         stream_fn,
         tool_fn,
@@ -133,10 +135,12 @@ pub async fn run_native_turn_async(
     prompt_text: String,
     native_tools: pi_core::tools::NativeTools,
     prepare_next_turn: Option<Box<PrepareNextTurnFn<'static>>>,
+    mcp_hub: Option<std::sync::Arc<crate::mcp::McpHub>>,
 ) -> Result<NativeTurnOutput, String> {
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let session_id = config.session_id.clone();
+        let tool_handle = handle.clone();
         let mut stream_fn = move |_index: usize, llm_context: &Value| -> StreamTurn {
             let messages = llm_context
                 .get("messages")
@@ -172,6 +176,14 @@ pub async fn run_native_turn_async(
                 .unwrap_or_else(|error| error_turn(&error, &provider_for_error))
         };
         let mut tool_fn = move |name: &str, args: &Value| -> (Value, bool) {
+            if name.starts_with("mcp__") {
+                if let Some(hub) = mcp_hub.as_ref() {
+                    let hub = std::sync::Arc::clone(hub);
+                    let args = args.clone();
+                    let name = name.to_string();
+                    return tool_handle.block_on(async move { hub.call_tool(&name, &args).await });
+                }
+            }
             native_tools.execute(name, args)
         };
         Ok::<NativeTurnOutput, String>(run_native_turn(
@@ -227,6 +239,7 @@ pub async fn run_summary_turn_async(
         model,
         tools: Vec::new(),
         history: Vec::new(),
+        images: Vec::new(),
         session_id: None,
         timestamp: now_millis(),
         parallel_tools: false,
@@ -238,6 +251,7 @@ pub async fn run_summary_turn_async(
         config,
         summary_prompt,
         native_tools,
+        None,
         None,
     )
     .await?;
@@ -594,6 +608,7 @@ pub fn prepare_native_turn(
         model,
         tools: tool_definitions,
         history,
+        images: Vec::new(),
         session_id,
         timestamp: now_millis(),
         parallel_tools: true,

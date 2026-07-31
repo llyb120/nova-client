@@ -9,6 +9,7 @@ mod credential_roaming;
 mod employees;
 mod gitwt;
 mod http_stream;
+mod mcp;
 mod marks;
 mod mind;
 mod model_cache;
