@@ -735,7 +735,7 @@ async fn run(app: AppHandle) {
                                     if prompt_queue.get(id).map_or(true, |q| q.is_empty()) {
                                         prompt_queue.remove(id);
                                     }
-                                    let _ = send_prompt(app, id, &next.text, next.images);
+                                    let _ = send_prompt(&app, id, &next.text, next.images);
                                     command_watch.insert(
                                         id.clone(),
                                         Instant::now() + COMMAND_WATCH_DURATION,
