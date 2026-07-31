@@ -627,9 +627,10 @@ try {
 }
 
 assert.match(cursorBatchToolPolicy(), /read_files/);
-assert.match(cursorBatchToolPolicy(), /edit_files/);
+assert.doesNotMatch(cursorBatchToolPolicy(), /must use edit_files/);
+assert.match(cursorBatchToolPolicy(), /Write\/Edit\/StrReplace/);
 assert.match(cursorBatchToolPolicy(), /git grep/);
-assert.doesNotMatch(cursorBatchToolPolicy({ readOnly: true }), /edit_files/);
+assert.doesNotMatch(cursorBatchToolPolicy({ readOnly: true }), /Write\/Edit/);
 assert.match(cursorBatchToolPolicy({ readOnly: true }), /plan\/read-only/);
 assert.match(cursorCavemanPolicy(), /回复默认简洁专业/);
 assert.match(cursorCavemanPolicy(), /先给结论/);
@@ -637,7 +638,7 @@ assert.doesNotMatch(cursorCavemanPolicy(), /Respond terse like smart caveman/);
 assert.match(cursorPromptPrefix(), /read_files/);
 assert.match(cursorPromptPrefix(), /回复默认简洁专业/);
 assert.match(cursorPromptPrefix({ readOnly: true }), /plan\/read-only/);
-assert.doesNotMatch(cursorPromptPrefix({ readOnly: true }), /edit_files/);
+assert.doesNotMatch(cursorPromptPrefix({ readOnly: true }), /Write\/Edit\/StrReplace/);
 const policyMessage = messageWithToolPolicy("Add animation", { readOnly: false });
 assert.match(policyMessage, /read_files/);
 assert.match(policyMessage, /回复默认简洁专业/);
@@ -669,7 +670,7 @@ try {
   ]);
   const agentTools = createCursorFilesystemTools(batchCwd);
   assert.equal(typeof agentTools.read_files.execute, "function");
-  assert.equal(typeof agentTools.edit_files.execute, "function");
+  assert.equal(agentTools.edit_files, undefined);
   const readOnlyTools = createCursorFilesystemTools(batchCwd, { readOnly: true });
   assert.equal(readOnlyTools.edit_files, undefined);
   const read = JSON.parse(await agentTools.read_files.execute({ paths: ["a.txt", "b.txt"] }));
@@ -677,26 +678,6 @@ try {
     { path: "a.txt", content: "A\nconst quoted = \"x\";" },
     { path: "b.txt", content: "B\npath = C:\\tmp" },
   ]);
-  await agentTools.edit_files.execute({
-    files: [
-      { path: "a.txt", edits: [{ oldLines: ["A", "const quoted = \"x\";"], newLines: ["AA", "const quoted = \"y\";"] }] },
-      { path: "b.txt", edits: [{ oldLines: ["B", "path = C:\\tmp"], newLines: ["BB", "path = D:\\work"] }] },
-    ],
-  });
-  assert.deepEqual(await Promise.all([
-    readFile(join(batchCwd, "a.txt"), "utf8"),
-    readFile(join(batchCwd, "b.txt"), "utf8"),
-  ]), ["AA\nconst quoted = \"y\";", "BB\npath = D:\\work"]);
-  await assert.rejects(() => agentTools.edit_files.execute({
-    files: [
-      { path: "a.txt", edits: [{ oldLines: ["AA"], newLines: ["changed"] }] },
-      { path: "b.txt", edits: [{ oldLines: ["missing"], newLines: ["changed"] }] },
-    ],
-  }), /Could not find/);
-  assert.deepEqual(await Promise.all([
-    readFile(join(batchCwd, "a.txt"), "utf8"),
-    readFile(join(batchCwd, "b.txt"), "utf8"),
-  ]), ["AA\nconst quoted = \"y\";", "BB\npath = D:\\work"]);
 
   await writeFile(join(batchCwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
   const first = JSON.parse(await agentTools.read_files.execute({ paths: ["large.txt"] }))[0];
