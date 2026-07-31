@@ -374,6 +374,8 @@ export interface Settings {
   cursorModelContexts: CursorModelContextRule[];
   /** Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
   vegaContextMode: "default" | "super";
+  /** Vega agent 后端：native = Rust 原生 agent，pi = Node bridge（原版 pi-agent）。 */
+  vegaAgentBackend: "native" | "pi";
   /** Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
   cursorContextMode: "default" | "super";
   /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */

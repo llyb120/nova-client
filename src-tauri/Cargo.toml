@@ -9,10 +9,9 @@ name = "nova_lib"
 crate-type = ["rlib"]
 
 [features]
-# Compile the native Rust Vega agent path (pi_core) as an alternative to the
-# node alkaid bridge. Off by default: the node bridge remains the production
-# path until the native transport is verified against live providers.
-native-vega = []
+# The native Rust Vega agent path (pi_core) is always compiled. Runtime
+# selection between native and the node pi bridge is controlled by the
+# `vega_agent_backend` setting ("native" | "pi").
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

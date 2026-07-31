@@ -49,6 +49,8 @@ pub struct Settings {
     pub cursor_model_contexts: Vec<CursorModelContextRule>,
     /// Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。
     pub vega_context_mode: String,
+    /// Vega agent 后端：native = Rust 原生 agent，pi = Node bridge（原版 pi-agent）。
+    pub vega_agent_backend: String,
     /// Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。
     pub cursor_context_mode: String,
     /// OpenCode CLI 可执行文件路径（默认 opencode，依赖 PATH）
@@ -153,6 +155,7 @@ impl Default for Settings {
             cursor_sdk_api_key: String::new(),
             cursor_model_contexts: Vec::new(),
             vega_context_mode: "default".into(),
+            vega_agent_backend: "native".into(),
             cursor_context_mode: "default".into(),
             opencode_path: "opencode".into(),
             opencode_args: "acp".into(),
@@ -393,6 +396,9 @@ impl Settings {
         settings.opencode_integration = "sdk".into();
         if settings.vega_context_mode != "super" {
             settings.vega_context_mode = "default".into();
+        }
+        if settings.vega_agent_backend != "pi" {
+            settings.vega_agent_backend = "native".into();
         }
         if settings.cursor_context_mode != "super" {
             settings.cursor_context_mode = "default".into();

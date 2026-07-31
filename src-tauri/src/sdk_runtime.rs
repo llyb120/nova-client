@@ -288,11 +288,14 @@ impl SdkManager {
         } else {
             None
         };
-        // Native Vega path (feature-gated): run in-process instead of spawning
-        // the node bridge. Off by default; the node bridge stays the production
-        // path until the native transport is verified against live providers.
-        #[cfg(feature = "native-vega")]
-        if self.adapter.agent_kind() == AgentKind::Alkaid {
+        // Native Vega path: run in-process instead of spawning the node bridge.
+        // Controlled by the `vega_agent_backend` setting ("native" | "pi").
+        let use_native = {
+            let app_state = self.app.state::<AppState>();
+            let settings = app_state.settings.lock().unwrap();
+            settings.vega_agent_backend != "pi"
+        };
+        if use_native && self.adapter.agent_kind() == AgentKind::Alkaid {
             let outcome = self
                 .run_prompt_native(
                     &thread_id,
@@ -829,10 +832,9 @@ impl SdkManager {
         )
     }
 
-    /// Native Vega path (feature-gated): run the agent in-process via `pi_core`
-    /// instead of spawning the node alkaid bridge. Off by default; see the
-    /// `native-vega` cargo feature.
-    #[cfg(feature = "native-vega")]
+    /// Native Vega path: run the agent in-process via `pi_core` instead of
+    /// spawning the node alkaid bridge. Selected at runtime by the
+    /// `vega_agent_backend` setting ("native" = this path, "pi" = node bridge).
     async fn run_prompt_native(
         self: &Arc<Self>,
         thread_id: &str,
@@ -1319,7 +1321,6 @@ impl SdkManager {
     /// Super-context native path (legacy `NOVA_CONTEXT_MODE=super`), mirroring
     /// `alkaid-context-super.mjs`: a single rolling summary instead of Reasonix's
     /// frozen digests, 10-turn retention, and no mid-turn hook.
-    #[cfg(feature = "native-vega")]
     async fn run_prompt_native_super(
         self: &Arc<Self>,
         thread_id: &str,

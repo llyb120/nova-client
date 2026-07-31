@@ -179,6 +179,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [vegaContextMode, setVegaContextMode] = createSignal<"default" | "super">(
     s?.vegaContextMode === "super" ? "super" : "default",
   );
+  const [vegaAgentBackend, setVegaAgentBackend] = createSignal<"native" | "pi">(
+    s?.vegaAgentBackend === "pi" ? "pi" : "native",
+  );
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
     s?.cursorContextMode === "super" ? "super" : "default",
   );
@@ -460,6 +463,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       .map((rule) => ({ prefix: rule.prefix.trim(), contextWindow: rule.contextWindow }))
       .filter((rule) => rule.prefix.length > 0),
     vegaContextMode: vegaContextMode(),
+    vegaAgentBackend: vegaAgentBackend(),
     cursorContextMode: cursorContextMode(),
     opencodeProxy: opencodeProxy().trim(),
     defaultMode: defaultMode(),
@@ -1034,6 +1038,22 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </select>
                 <span class="field-hint">
                   默认使用当前的 append-only 会话、分级压缩和 frozen digest；超级切换到改造前备份的 Vega 超级上下文实现。
+                </span>
+              </label>
+              <label class="field">
+                <span class="field-label">Vega Agent 后端</span>
+                <select
+                  class="field-input"
+                  value={vegaAgentBackend()}
+                  onChange={(e) =>
+                    setVegaAgentBackend(e.currentTarget.value === "pi" ? "pi" : "native")
+                  }
+                >
+                  <option value="native">原生（Rust）</option>
+                  <option value="pi">PI（Node bridge）</option>
+                </select>
+                <span class="field-hint">
+                  原生使用 Rust 内置 agent（无需 Node.js）；PI 使用原版 node pi-agent bridge。切换后下一轮对话生效。
                 </span>
               </label>
               <label class="field">
