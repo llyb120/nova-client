@@ -446,7 +446,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   };
   const draftSessionShortcuts = (): SessionShortcut[] =>
     sessionShortcuts()
-      .map((item) => ({
+      .map((item): SessionShortcut => ({
         id: item.id || newSessionShortcutId(),
         keys: item.keys.trim(),
         action: item.action === "selectProject" ? "selectProject" : "selectModel",
