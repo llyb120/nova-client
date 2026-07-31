@@ -23,7 +23,7 @@ pub struct LoopContext {
 
 /// A tool executor: given a tool name and arguments, produce `(result, isError)`
 /// where `result` is the `{ content, details, ... }` object.
-pub type ToolFn<'a> = dyn FnMut(&str, &Value) -> (Value, bool) + 'a;
+pub type ToolFn<'a> = dyn FnMut(&str, &str, &Value) -> (Value, bool) + 'a;
 
 /// One LLM turn as seen by the loop: the raw provider stream events (matching
 /// node's `start`/`*_delta`/`done`/`error` shapes) plus the finalized assistant
@@ -195,7 +195,7 @@ fn run_tool_call(context: &LoopContext, tool_call: &Value, tool_fn: &mut ToolFn)
     let name = tool_call.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     let args = tool_call.get("arguments").cloned().unwrap_or(json!({}));
     let (result, is_error) = if has_tool(context, &name) {
-        tool_fn(&name, &args)
+        tool_fn(&id, &name, &args)
     } else {
         (create_error_tool_result(&format!("Tool {name} not found")), true)
     };

@@ -458,8 +458,8 @@ fn run_capture(mut cmd: Command) -> (Value, bool) {
 }
 
 /// Convenience adapter matching the agent `ToolFn` signature.
-pub fn tool_fn_for(tools: &NativeTools) -> impl FnMut(&str, &Value) -> (Value, bool) + '_ {
-    move |name: &str, args: &Value| tools.execute(name, args)
+pub fn tool_fn_for(tools: &NativeTools) -> impl FnMut(&str, &str, &Value) -> (Value, bool) + '_ {
+    move |_id: &str, name: &str, args: &Value| tools.execute(name, args)
 }
 
 #[cfg(test)]

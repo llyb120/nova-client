@@ -425,7 +425,7 @@ fn parity_agent_class() {
                 .unwrap_or_else(|| json!({ "role": "assistant", "content": [], "stopReason": "end_turn" }));
             build_stream_turn(&entry)
         };
-        let mut tool_fn = |tool_name: &str, _args: &Value| -> (Value, bool) {
+        let mut tool_fn = |_id: &str, tool_name: &str, _args: &Value| -> (Value, bool) {
             match tool_results.get(tool_name) {
                 Some(result) => (result.clone(), false),
                 None => (
@@ -493,7 +493,7 @@ fn parity_agent_loop() {
                 .unwrap_or_else(|| json!({ "role": "assistant", "content": [], "stopReason": "end_turn" }));
             build_stream_turn(&entry)
         };
-        let mut tool_fn = |tool_name: &str, _args: &Value| -> (Value, bool) {
+        let mut tool_fn = |_id: &str, tool_name: &str, _args: &Value| -> (Value, bool) {
             match tool_results.get(tool_name) {
                 Some(result) => (result.clone(), false),
                 None => (

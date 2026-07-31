@@ -143,6 +143,76 @@ pub fn run_native_turn(
     }
 }
 
+/// Port of alkaid `governToolResult`: when a tool result's combined text exceeds
+/// the context byte budget, archive the full text to disk (when an archive dir
+/// is configured) and replace it with a head+tail elision carrying a pointer.
+pub fn govern_tool_result(
+    mut result: Value,
+    tool_call_id: Option<&str>,
+    tool_name: &str,
+    archive_dir: Option<&Path>,
+) -> Value {
+    use pi_core::text::{govern_text, safe_archive_segment, TOOL_OUTPUT_CONTEXT_MAX_BYTES};
+    let content = match result.get("content").and_then(Value::as_array) {
+        Some(content) => content.clone(),
+        None => return result,
+    };
+    let text = content
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let governed = match archive_dir {
+        Some(dir) => {
+            if text.len() > TOOL_OUTPUT_CONTEXT_MAX_BYTES {
+                let _ = std::fs::create_dir_all(dir);
+                let file_name = format!(
+                    "{}-{}.txt",
+                    safe_archive_segment(tool_call_id),
+                    safe_archive_segment(Some(tool_name))
+                );
+                let path = dir.join(file_name);
+                let archive_path = if std::fs::write(&path, &text).is_ok() {
+                    Some(path.to_string_lossy().to_string())
+                } else {
+                    None
+                };
+                govern_text(&text, TOOL_OUTPUT_CONTEXT_MAX_BYTES, archive_path.as_deref())
+            } else {
+                None
+            }
+        }
+        None => govern_text(&text, TOOL_OUTPUT_CONTEXT_MAX_BYTES, None),
+    };
+    let Some(governed) = governed else {
+        return result;
+    };
+    // Rebuild content: governed text first, then the non-text parts.
+    let mut new_content: Vec<Value> = vec![json!({ "type": "text", "text": governed.text })];
+    for part in &content {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            new_content.push(part.clone());
+        }
+    }
+    result["content"] = Value::Array(new_content);
+    let mut details = result
+        .get("details")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    details.insert(
+        "archivedToolOutput".to_string(),
+        governed
+            .archived_path
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    details.insert("originalBytes".to_string(), json!(governed.original_bytes));
+    result["details"] = Value::Object(details);
+    result
+}
+
 /// Build a `StreamTurn` carrying a provider error as an `error`-stop assistant
 /// message, so the loop terminates and surfaces the message like node does.
 fn error_turn(error: &str, provider: &ProviderConfig) -> StreamTurn {
@@ -182,6 +252,7 @@ pub async fn run_native_turn_async(
     prepare_next_turn: Option<Box<PrepareNextTurnFn<'static>>>,
     mcp_hub: Option<std::sync::Arc<crate::mcp::McpHub>>,
     controller: Option<std::sync::Arc<NativeRunController>>,
+    archive_dir: Option<PathBuf>,
 ) -> Result<
     (
         tokio::sync::mpsc::UnboundedReceiver<Value>,
@@ -250,16 +321,25 @@ pub async fn run_native_turn_async(
                 })
                 .unwrap_or_else(|error| error_turn(&error, &provider_for_error))
         };
-        let mut tool_fn = move |name: &str, args: &Value| -> (Value, bool) {
-            if name.starts_with("mcp__") {
+        let mut tool_fn = move |id: &str, name: &str, args: &Value| -> (Value, bool) {
+            let (result, is_error) = if name.starts_with("mcp__") {
                 if let Some(hub) = mcp_hub.as_ref() {
                     let hub = std::sync::Arc::clone(hub);
                     let args = args.clone();
                     let name = name.to_string();
-                    return tool_handle.block_on(async move { hub.call_tool(&name, &args).await });
+                    tool_handle.block_on(async move { hub.call_tool(&name, &args).await })
+                } else {
+                    native_tools.execute(name, args)
                 }
-            }
-            native_tools.execute(name, args)
+            } else {
+                native_tools.execute(name, args)
+            };
+            // Port of alkaid's per-tool `governToolResult`: clamp oversized
+            // outputs and archive the full text to disk.
+            (
+                govern_tool_result(result, Some(id), name, archive_dir.as_deref()),
+                is_error,
+            )
         };
         let mut emit = move |item: Value| {
             let _ = item_tx.send(item);
@@ -340,6 +420,7 @@ pub async fn run_summary_turn_async(
         config,
         summary_prompt,
         native_tools,
+        None,
         None,
         None,
         None,

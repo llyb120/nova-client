@@ -1162,6 +1162,12 @@ impl SdkManager {
             .insert(thread_id.to_string(), std::sync::Arc::clone(&controller));
 
         let client = reqwest::Client::new();
+        // Tool-result archive dir (port of alkaid's `{dataRoot}/tool-results/
+        // {sessionId}`) for governToolResult to spill oversized outputs.
+        let archive_dir = data_dir
+            .join("alkaid")
+            .join("tool-results")
+            .join(pi_core::safe_archive_segment(Some(&session_id)));
         let launched = crate::vega_native::run_native_turn_async(
             client,
             setup.provider,
@@ -1171,6 +1177,7 @@ impl SdkManager {
             Some(hook),
             mcp_hub,
             Some(std::sync::Arc::clone(&controller)),
+            Some(archive_dir),
         )
         .await;
 
