@@ -35,7 +35,10 @@ const REMOTE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// 任意会进入 `dispatch_prompt` 的来源（IPC、远程、后台重发等）共用此事件。
 pub const EV_FIRE_START: &str = "fire:start";
 
-/// 远程提示词队列条目：目标会话正忙时暂存，回合结束后按 FIFO 自动投递。
+/// 远程 send 在会话忙碌时交给前端 `promptQueue` 展示并 FIFO 投递。
+pub const EV_PROMPT_QUEUE_ENQUEUE: &str = "prompt-queue:enqueue";
+
+/// 远程提示词队列条目：无界面（headless）时暂存，回合结束后按 FIFO 自动投递。
 #[derive(Clone)]
 struct QueuedRemotePrompt {
     text: String,
@@ -727,23 +730,37 @@ async fn run(app: AppHandle) {
                             );
                             if completed_after_baseline {
                                 command_watch.remove(id);
-                                // 回合结束：按 FIFO 投递该会话的下一条排队提示词。
-                                if let Some(next) = prompt_queue
-                                    .get_mut(id)
-                                    .and_then(|q| (!q.is_empty()).then(|| q.remove(0)))
-                                {
-                                    if prompt_queue.get(id).map_or(true, |q| q.is_empty()) {
-                                        prompt_queue.remove(id);
-                                    }
-                                    let _ = send_prompt(&app, id, &next.text, next.images);
-                                    command_watch.insert(
-                                        id.clone(),
-                                        Instant::now() + COMMAND_WATCH_DURATION,
-                                    );
-                                    requested.insert(id.clone());
-                                }
+                            }
+                            // 空闲且无在途投递时排水：不依赖 running→idle 边沿，
+                            // 避免 send 失败或漏掉边沿后队列永久卡住。
+                            let idle = !running_now.get(id).copied().unwrap_or(false);
+                            if idle && !command_watch.contains_key(id) {
+                                dispatch_next_queued_prompt(
+                                    &app,
+                                    id,
+                                    &mut prompt_queue,
+                                    &mut command_watch,
+                                    &mut next_requested,
+                                );
                             }
                         }
+                    }
+                    // 已入队但本拍未上传的会话也要尝试排水。
+                    let queued_ids: Vec<String> = prompt_queue.keys().cloned().collect();
+                    for id in queued_ids {
+                        if sent_ids.contains(&id) || command_watch.contains_key(&id) {
+                            continue;
+                        }
+                        if running_now.get(&id).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        dispatch_next_queued_prompt(
+                            &app,
+                            &id,
+                            &mut prompt_queue,
+                            &mut command_watch,
+                            &mut next_requested,
+                        );
                     }
                     if sent_catalog && !resp.resync {
                         catalog_signature = next_catalog_signature;
@@ -1592,7 +1609,10 @@ async fn execute_command(
             Err(e) => fail(e),
         },
         "send" => {
-            // 目标会话正忙时入队，回合结束后由同步循环按 FIFO 自动投递。
+            if cmd.text.trim().is_empty() && cmd.images.is_empty() {
+                return fail("内容和附件不能同时为空".into());
+            }
+            // 目标会话正忙（或 headless 侧仍有未投递队列）时入队，回合结束后 FIFO 投递。
             let busy = {
                 let state = app.state::<AppState>();
                 let store = state.store.lock().unwrap();
@@ -1602,8 +1622,23 @@ async fn execute_command(
                     .unwrap_or(false)
             } || prompt_queue.contains_key(&cmd.thread_id);
             if busy {
-                if cmd.text.trim().is_empty() && cmd.images.is_empty() {
-                    return fail("内容和附件不能同时为空".into());
+                // 有界面时交给前端 promptQueue：可显示撤回/发送，并与桌面输入共用一条队列。
+                if !crate::server::is_headless() {
+                    let _ = app.emit(
+                        EV_PROMPT_QUEUE_ENQUEUE,
+                        json!({
+                            "threadId": cmd.thread_id,
+                            "text": cmd.text,
+                            "images": cmd.images,
+                        }),
+                    );
+                    return CommandResult {
+                        id: cmd.id,
+                        ok: true,
+                        error: String::new(),
+                        thread_id: cmd.thread_id.clone(),
+                        data: Some(json!({ "queued": true })),
+                    };
                 }
                 prompt_queue.entry(cmd.thread_id.clone()).or_default().push(
                     QueuedRemotePrompt {
@@ -1611,7 +1646,13 @@ async fn execute_command(
                         images: cmd.images.clone(),
                     },
                 );
-                ok_thread(cmd.thread_id.clone())
+                CommandResult {
+                    id: cmd.id,
+                    ok: true,
+                    error: String::new(),
+                    thread_id: cmd.thread_id.clone(),
+                    data: Some(json!({ "queued": true })),
+                }
             } else {
                 match send_prompt(app, &cmd.thread_id, &cmd.text, cmd.images.clone()) {
                     Ok(()) => ok_thread(cmd.thread_id.clone()),
@@ -2140,6 +2181,47 @@ fn make_scratch_dir() -> Result<String, String> {
     let dir = std::env::temp_dir().join(SCRATCH_MARK).join(name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
     Ok(dir.to_string_lossy().to_string())
+}
+
+/// 在会话空闲时投递一条 headless 远程排队提示词；失败则放回队首并短暂退避。
+fn dispatch_next_queued_prompt(
+    app: &AppHandle,
+    thread_id: &str,
+    prompt_queue: &mut HashMap<String, Vec<QueuedRemotePrompt>>,
+    command_watch: &mut HashMap<String, Instant>,
+    requested: &mut HashSet<String>,
+) -> bool {
+    let Some(next) = prompt_queue
+        .get_mut(thread_id)
+        .and_then(|q| (!q.is_empty()).then(|| q.remove(0)))
+    else {
+        return false;
+    };
+    if prompt_queue
+        .get(thread_id)
+        .map_or(true, |q| q.is_empty())
+    {
+        prompt_queue.remove(thread_id);
+    }
+    match send_prompt(app, thread_id, &next.text, next.images.clone()) {
+        Ok(()) => {
+            command_watch.insert(
+                thread_id.to_string(),
+                Instant::now() + COMMAND_WATCH_DURATION,
+            );
+            requested.insert(thread_id.to_string());
+            true
+        }
+        Err(_) => {
+            prompt_queue
+                .entry(thread_id.to_string())
+                .or_default()
+                .insert(0, next);
+            // 避免投递失败时每拍狂重试。
+            command_watch.insert(thread_id.to_string(), Instant::now() + Duration::from_secs(2));
+            false
+        }
+    }
 }
 
 fn send_prompt(

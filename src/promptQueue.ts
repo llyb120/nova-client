@@ -1,3 +1,4 @@
+import { listen } from "@tauri-apps/api/event";
 import { createEffect, createRoot, createSignal } from "solid-js";
 import { api } from "./ipc";
 import { sendPrompt, sendPromptTo, state } from "./store";
@@ -130,14 +131,31 @@ function startPromptQueueDispatcher() {
 
       for (const item of items) {
         if (seenThreads.has(item.threadId)) continue;
-        seenThreads.add(item.threadId);
-        if (held.has(item.threadId)) continue;
-        if (state.running[item.threadId]) continue;
+        // 挂起/运行中：本会话后面的条目都先别动。
+        if (held.has(item.threadId) || state.running[item.threadId]) {
+          seenThreads.add(item.threadId);
+          continue;
+        }
+        // 失败或发送中的队首跳过，继续尝试同一会话的下一条，避免后面永久卡住。
         if (dispatching.has(item.id) || failed.has(item.id)) continue;
+        seenThreads.add(item.threadId);
         void dispatchQueuedPrompt(item);
       }
     });
   });
 }
 
+/** 远程控制忙碌时入队：与桌面 Composer 共用同一条提示词队列和操作界面。 */
+function startRemotePromptQueueBridge() {
+  void listen<{ threadId: string; text: string; images?: PromptImage[] }>(
+    "prompt-queue:enqueue",
+    (event) => {
+      const threadId = event.payload?.threadId;
+      if (!threadId) return;
+      enqueuePrompt(threadId, event.payload.text || "", event.payload.images || []);
+    },
+  );
+}
+
 startPromptQueueDispatcher();
+startRemotePromptQueueBridge();
