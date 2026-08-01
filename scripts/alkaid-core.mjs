@@ -16,7 +16,7 @@ import { createReadStream, existsSync } from "node:fs";
 import { access, mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
-import { contextBundle, findSymbols } from "./ctx-core.mjs";
+import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
@@ -26,6 +26,8 @@ const DEFAULT_BATCH_READ_LINES = 200;
 const READ_FILES_MAX_BYTES = 32 * 1024;
 /** Reasonix-style per-tool context budget. Full oversized text is archived before truncation. */
 export const TOOL_OUTPUT_CONTEXT_MAX_BYTES = 32 * 1024;
+/** fast_context packs intentionally exceed the default 32KB so one-shot edit context survives. */
+export const FAST_CONTEXT_OUTPUT_MAX_BYTES = 96 * 1024;
 /** OpenAI Responses API hard limit for function_call_output.output string length. */
 export const OPENAI_TOOL_OUTPUT_MAX_CHARS = 10_485_760;
 /** Leave room for a truncation notice before the API rejects the request. */
@@ -544,25 +546,32 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
   if (fastContext) tools.push(
     {
       name: "fast_context",
-      description: "按关键词/符号一次性打包相关代码上下文：命中文件按相关度分层装配（小文件全文、大文件给符号大纲+命中段），并附 1 跳调用邻居大纲。用于在分析或修改前快速获取代码全貌，避免逐文件试探式读取。基于 git grep + rg，无需预建索引。",
+      description: FAST_CONTEXT_DESCRIPTION,
       parameters: Type.Object({
-        keywords: Type.Array(Type.String(), { minItems: 1, description: "关键词或符号名列表" }),
-        budget: Type.Optional(Type.Integer({ minimum: 100, maximum: 4000, description: "总行数预算，默认 700" })),
-        ctx: Type.Optional(Type.Integer({ minimum: 0, maximum: 60, description: "命中行上下文半径，默认 12" })),
-        maxFiles: Type.Optional(Type.Integer({ minimum: 1, maximum: 40, description: "核心命中文件上限，默认 12" })),
+        keywords: Type.Array(Type.String(), { minItems: 1, description: "关键词或符号名，建议 2–6 个" }),
+        intent: Type.Optional(Type.Union([
+          Type.Literal("edit"),
+          Type.Literal("explain"),
+          Type.Literal("locate"),
+        ], { description: "默认 edit：定义体优先；explain 更宽；locate 只定位" })),
+        pathHints: Type.Optional(Type.Array(Type.String(), { description: "可选目录/文件前缀加权" })),
+        maxChars: Type.Optional(Type.Integer({ minimum: 4000, maximum: 80000, description: "字符预算；默认 edit=48000 explain=36000 locate=16000" })),
+        budget: Type.Optional(Type.Integer({ minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，近似映射为 maxChars" })),
+        ctx: Type.Optional(Type.Integer({ minimum: 0, maximum: 60, description: "兼容旧参数：命中上下文半径" })),
+        maxFiles: Type.Optional(Type.Integer({ minimum: 1, maximum: 40, description: "兼容旧参数：核心文件软顶" })),
       }),
       async execute(_id, params) {
-        return textResult(contextBundle(params ?? {}, root));
+        return textResult(await contextBundle(params ?? {}, root));
       },
     },
     {
       name: "find_symbols",
-      description: "并行定位多个符号在仓库中的所有出现位置（文件:行号），基于 git grep。用于在读取/修改前确认符号分布。",
+      description: "并行定位多个符号在仓库中的所有出现位置（文件:行号）。只要行号不要正文时用；需要上下文用 fast_context。",
       parameters: Type.Object({
         names: Type.Array(Type.String(), { minItems: 1, description: "符号名列表" }),
       }),
       async execute(_id, params) {
-        return textResult(findSymbols(params ?? {}, root));
+        return textResult(await findSymbols(params ?? {}, root));
       },
     },
   );
@@ -712,8 +721,8 @@ export function buildAlkaidSystemPrompt(options = {}) {
       : options.shellConfig?.kind === "powershell"
         ? "- bash: 执行 PowerShell 命令"
         : "- bash: 执行 Bash 命令",
-    fastContext ? "- fast_context: 按关键词一次性打包相关代码上下文（命中文件分层装配 + 1 跳邻居大纲）" : null,
-    fastContext ? "- find_symbols: 并行定位多个符号在仓库中的所有出现位置（文件:行号）" : null,
+    fastContext ? "- fast_context: 一次打包定义体 + 1 跳邻居 + 覆盖表；仅按 gaps/next_reads 补读" : null,
+    fastContext ? "- find_symbols: 并行定位多个符号出现位置（只要行号时用）" : null,
     options.readOnly ? null : "- edit / write: 单文件编辑或写入",
   ].filter(Boolean);
 
@@ -723,7 +732,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
     `Available tools:\n${toolLines.join("\n")}`,
     "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。每次准备读取前，先汇总当前已知目标：仅有一个目标时使用 read；同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，必须在一次 read_files 调用中合并读取，并为每个文件分别设置必要的 offset/limit。禁止连续调用多个 read，也禁止用并行封装的多个 read 代替 read_files；想按顺序理解文件不构成读取依赖。只有后一个目标的路径或读取范围必须由前一次结果确定、目标不是 UTF-8 文本，或当前确实仅需一个文件时，才使用 read。后续新发现多个独立文本目标时，下一读取阶段仍须合并使用 read_files。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；大文件禁止无目的全量读取。修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
     (fastContext
-      ? "搜索与遍历必须成本有界。需要理解某个符号/关键词在仓库中的分布和上下文时，优先使用 fast_context（一次调用即可获得命中文件分层内容 + 邻居大纲）或 find_symbols（并行定位多个符号出现位置）；它们基于 git grep + rg，比手动多轮搜索更高效。"
+      ? "搜索与遍历必须成本有界。需要理解某个符号/关键词在仓库中的分布和上下文时，优先使用 fast_context（一次打包定义体+邻居+覆盖表）或 find_symbols（只要行号）；coverage 已覆盖段禁止再读，缺口合并一次 read_files。"
       : "搜索与遍历必须成本有界。") + "禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；Git 仓库中搜索已跟踪文件时优先使用 `git grep`，需要搜索未跟踪文件时使用 `rg`，并默认遵守 `.gitignore`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
     "完成修改后，优先根据版本控制 diff 按需确定受影响单元及直接使用方，并执行成本最低且有效的验证；禁止遍历或列出完整仓库、无依据扩大范围，纯文档类改动可说明依据后跳过测试，无法验证时须报告原因、建议命令及剩余风险。",
@@ -876,6 +885,7 @@ export async function createAlkaidAgent(options = {}) {
         archiveDir,
         toolCallId,
         toolName: tool.name,
+        maxBytes: tool.name === "fast_context" ? FAST_CONTEXT_OUTPUT_MAX_BYTES : undefined,
       });
     },
   }));

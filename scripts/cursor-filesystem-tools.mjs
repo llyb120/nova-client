@@ -1,7 +1,7 @@
 import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { contextBundle, findSymbols } from "./ctx-core.mjs";
+import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -126,24 +126,27 @@ export function createCursorFilesystemTools(cwd, options = {}) {
     },
     ...(fastContext ? {
     fast_context: {
-      description: "按关键词/符号一次性打包相关代码上下文：命中文件按相关度分层装配（小文件全文、大文件给符号大纲+命中段），并附 1 跳调用邻居大纲。用于在分析或修改前快速获取代码全貌，避免逐文件试探式读取。基于 git grep + rg，无需预建索引。",
+      description: FAST_CONTEXT_DESCRIPTION,
       inputSchema: {
         type: "object",
         properties: {
-          keywords: { type: "array", minItems: 1, items: { type: "string" }, description: "关键词或符号名列表" },
-          budget: { type: "integer", minimum: 100, maximum: 4000, description: "总行数预算，默认 700" },
-          ctx: { type: "integer", minimum: 0, maximum: 60, description: "命中行上下文半径，默认 12" },
-          maxFiles: { type: "integer", minimum: 1, maximum: 40, description: "核心命中文件上限，默认 12" },
+          keywords: { type: "array", minItems: 1, items: { type: "string" }, description: "关键词或符号名，建议 2–6 个" },
+          intent: { type: "string", enum: ["edit", "explain", "locate"], description: "默认 edit：定义体优先；explain 更宽；locate 只定位" },
+          pathHints: { type: "array", items: { type: "string" }, description: "可选目录/文件前缀加权" },
+          maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "字符预算；默认 edit=48000 explain=36000 locate=16000" },
+          budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，近似映射为 maxChars" },
+          ctx: { type: "integer", minimum: 0, maximum: 60, description: "兼容旧参数：命中上下文半径" },
+          maxFiles: { type: "integer", minimum: 1, maximum: 40, description: "兼容旧参数：核心文件软顶" },
         },
         required: ["keywords"],
         additionalProperties: false,
       },
       async execute(params) {
-        return contextBundle(params ?? {}, root);
+        return await contextBundle(params ?? {}, root);
       },
     },
     find_symbols: {
-      description: "并行定位多个符号在仓库中的所有出现位置（文件:行号），基于 git grep。用于在读取/修改前确认符号分布。",
+      description: "并行定位多个符号在仓库中的所有出现位置（文件:行号）。只要行号不要正文时用；需要上下文用 fast_context。",
       inputSchema: {
         type: "object",
         properties: { names: { type: "array", minItems: 1, items: { type: "string" }, description: "符号名列表" } },
@@ -151,7 +154,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         additionalProperties: false,
       },
       async execute(params) {
-        return findSymbols(params ?? {}, root);
+        return await findSymbols(params ?? {}, root);
       },
     },
     } : {}),
@@ -174,7 +177,7 @@ export function cursorBatchToolPolicy(options = {}) {
         ? ""
         : " For edits, use Cursor built-in Write/Edit/StrReplace; do not expect a Nova edit_files tool."),
     (fastContext
-      ? "Search and traversal must be cost-bounded. When you need to understand a symbol/keyword's distribution and surrounding code, prefer fast_context (one call returns layered file contents + 1-hop neighbor outlines) or find_symbols (locate multiple symbols in parallel); they use git grep + rg internally and are more efficient than multiple manual searches. "
+      ? "Search and traversal must be cost-bounded. When you need to understand a symbol/keyword's distribution and surrounding code, prefer fast_context (one call packs definition bodies + 1-hop neighbors + coverage table) or find_symbols (locations only). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with one read_files. "
       : "Search and traversal must be cost-bounded. ") + "Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `git grep` for tracked files; use `rg` when untracked files matter, and honor `.gitignore` by default. Cursor Grep is also allowed. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];
   if (readOnly) {
