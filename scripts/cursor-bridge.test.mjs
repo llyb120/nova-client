@@ -14,6 +14,7 @@ const {
   compactConversation,
   completePendingTools,
   compressSlimMemory,
+  slimMemoryNeedsCompression,
   contextPressureTier,
   contextTokensFromUsage,
   createCursorAgent,
@@ -662,6 +663,17 @@ assert.equal(await compressSlimMemory(compressible, async () => assert.fail("bel
 }), false);
 assert.equal(compressible.compactStuck, false);
 assert.equal(compressible.consecutiveCompactions, 0);
+assert.equal(slimMemoryNeedsCompression(createSlimMemory(), {
+  currentTokens: 1,
+  maxTokens: 750,
+}), false);
+{
+  const needs = createSlimMemory();
+  for (let index = 1; index <= 3; index += 1) {
+    recordSlimTurn(needs, `prompt ${index}`, `conclusion ${index}`);
+  }
+  assert.equal(slimMemoryNeedsCompression(needs, { currentTokens: 750, maxTokens: 750 }), true);
+}
 assert.equal(contextPressureTier(499, 1_000), "normal");
 assert.equal(contextPressureTier(500, 1_000), "warn");
 assert.equal(contextPressureTier(600, 1_000), "snip");

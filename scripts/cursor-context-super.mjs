@@ -403,6 +403,38 @@ function recordSlimTurn(memory, userMessage, conclusion) {
   return memory;
 }
 
+const pendingSlimCompactions = new Map();
+
+function scheduleSlimCompaction(memoryKey, work) {
+  if (!memoryKey) return Promise.resolve(false);
+  const previous = pendingSlimCompactions.get(memoryKey) ?? Promise.resolve(false);
+  const next = previous.catch(() => false).then(work);
+  pendingSlimCompactions.set(memoryKey, next);
+  next.finally(() => {
+    if (pendingSlimCompactions.get(memoryKey) === next) pendingSlimCompactions.delete(memoryKey);
+  });
+  return next;
+}
+
+async function awaitPendingSlimCompaction(memoryKey) {
+  if (!memoryKey) return false;
+  const pending = pendingSlimCompactions.get(memoryKey);
+  if (!pending) return false;
+  return pending.catch(() => false);
+}
+
+function slimMemoryNeedsCompression(memory, {
+  maxChars = CURSOR_CONTEXT_CHAR_THRESHOLD,
+  currentTokens = memory.contextTokens ?? 0,
+  maxTokens = CURSOR_CONTEXT_THRESHOLD,
+} = {}) {
+  const formattedLength = formatSlimMemory({ ...memory, pendingTurn: "", contextStage: "slim" }).length;
+  const belowCapacity = currentTokens > 0
+    ? currentTokens < maxTokens
+    : formattedLength < maxChars;
+  return memory.contextStage === "slim" && !belowCapacity && memory.turns.length >= 2;
+}
+
 async function compressSlimMemory(memory, summarize, {
   maxChars = CURSOR_CONTEXT_CHAR_THRESHOLD,
   currentTokens = memory.contextTokens ?? 0,
@@ -894,9 +926,11 @@ async function main() {
       const nextSessionKey = ownedThreadKey || request.sessionId || sessionKey || randomUUID();
       const nextMemoryKey = ownedThreadKey || nextSessionKey;
       if (nextSessionKey !== sessionKey || nextMemoryKey !== memoryKey) {
+        await awaitPendingSlimCompaction(memoryKey);
         if (memoryKey) await saveSlimMemory(memoryKey, memory);
         sessionKey = nextSessionKey;
         memoryKey = nextMemoryKey;
+        await awaitPendingSlimCompaction(memoryKey);
         memory = await loadSlimMemory(memoryKey);
         // Legacy provider-session memory is deliberately not loaded here: if Cursor reused or
         // mis-restored that id, importing it would reproduce the exact cross-thread leak this
@@ -910,6 +944,26 @@ async function main() {
       const readOnly = request.mode === "plan";
       const originalMessage = await promptMessage(request.parts);
       const { maxTokens: contextThreshold, maxChars: contextCharThreshold } = contextThresholdsForModel(request.model);
+      // Prefer the previous turn's silent background compaction; await before sending so a
+      // follow-up prompt never races a half-written summary. Below-capacity work is a no-op.
+      const compactStartedAt = performance.now();
+      const deferredCompacted = await awaitPendingSlimCompaction(memoryKey);
+      const compactedAtPrompt = await summarizeSlimMemory(memory, request).then((compacted) => {
+        if (compacted) memory.contextTokens = 0;
+        return compacted;
+      }).catch((error) => {
+        process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        return false;
+      });
+      if (compactedAtPrompt) {
+        await saveSlimMemory(memoryKey, memory).catch((error) => {
+          process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        });
+      }
+      sendTiming("slim_memory_compact", compactStartedAt, {
+        compacted: Boolean(compactedAtPrompt || deferredCompacted),
+        deferred: Boolean(deferredCompacted),
+      });
       // Build the SDK prompt before marking this turn pending, otherwise it would replay itself.
       // Persist first so even Agent.create/SDK initialization failures retain the user's request.
       const previousPendingTurn = memory.pendingTurn;
@@ -1028,16 +1082,39 @@ async function main() {
           } else {
             memory.contextTokens = measuredTokens;
           }
-          await summarizeSlimMemory(memory, request).then((compacted) => {
-            if (compacted) memory.contextTokens = 0;
-          }).catch((error) => {
-            process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
-          });
+          // Stage/token bookkeeping only before done. LLM summarization is scheduled afterwards
+          // so the UI can clear running immediately; the next prompt awaits that promise.
           await saveSlimMemory(memoryKey, memory).catch((error) => {
             process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
           send({ type: "done", usage: normalizeCursorUsageForNova(turnUsage) });
           completed = true;
+          if (slimMemoryNeedsCompression(memory, {
+            maxChars: contextCharThreshold,
+            currentTokens: memory.contextTokens,
+            maxTokens: contextThreshold,
+          })) {
+            const compactKey = memoryKey;
+            const compactRequest = request;
+            scheduleSlimCompaction(compactKey, async () => {
+              const started = performance.now();
+              try {
+                const compacted = await summarizeSlimMemory(memory, compactRequest);
+                if (compacted) {
+                  memory.contextTokens = 0;
+                  await saveSlimMemory(compactKey, memory).catch((error) => {
+                    process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+                  });
+                }
+                sendTiming("slim_memory_compact", started, { compacted, deferred: true });
+                return compacted;
+              } catch (error) {
+                process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
+                sendTiming("slim_memory_compact", started, { compacted: false, deferred: true });
+                return false;
+              }
+            });
+          }
         } catch (error) {
           const retryable = shouldSilentRetryCursorTurn(error, { producedOutput, attempt });
           if (!retryable) {

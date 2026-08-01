@@ -429,6 +429,41 @@ function recordSlimTurn(memory, userMessage, conclusion) {
   return memory;
 }
 
+const pendingSlimCompactions = new Map();
+
+function scheduleSlimCompaction(memoryKey, work) {
+  if (!memoryKey) return Promise.resolve(false);
+  const previous = pendingSlimCompactions.get(memoryKey) ?? Promise.resolve(false);
+  const next = previous.catch(() => false).then(work);
+  pendingSlimCompactions.set(memoryKey, next);
+  next.finally(() => {
+    if (pendingSlimCompactions.get(memoryKey) === next) pendingSlimCompactions.delete(memoryKey);
+  });
+  return next;
+}
+
+async function awaitPendingSlimCompaction(memoryKey) {
+  if (!memoryKey) return false;
+  const pending = pendingSlimCompactions.get(memoryKey);
+  if (!pending) return false;
+  return pending.catch(() => false);
+}
+
+function slimMemoryNeedsCompression(memory, {
+  maxChars = Math.max(32_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.75 * 4)),
+  currentTokens = memory.contextTokens ?? 0,
+  maxTokens = Math.max(2_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.75)),
+} = {}) {
+  const formattedLength = formatSlimMemory({ ...memory, pendingTurn: "" }).length;
+  const belowCapacity = currentTokens > 0
+    ? currentTokens < maxTokens
+    : formattedLength < maxChars;
+  if (belowCapacity) return false;
+  if (memory.compactStuck || memory.turns.length < 2) return false;
+  if ((memory.consecutiveCompactions ?? 0) >= 2) return false;
+  return true;
+}
+
 async function compressSlimMemory(memory, summarize, {
   maxChars = Math.max(32_000, Math.floor(CURSOR_DEFAULT_CONTEXT_WINDOW * 0.75 * 4)),
   currentTokens = memory.contextTokens ?? 0,
@@ -932,9 +967,11 @@ async function main() {
       const nextSessionKey = ownedThreadKey || request.sessionId || sessionKey || randomUUID();
       const nextMemoryKey = ownedThreadKey || nextSessionKey;
       if (nextSessionKey !== sessionKey || nextMemoryKey !== memoryKey) {
+        await awaitPendingSlimCompaction(memoryKey);
         if (memoryKey) await saveSlimMemory(memoryKey, memory);
         sessionKey = nextSessionKey;
         memoryKey = nextMemoryKey;
+        await awaitPendingSlimCompaction(memoryKey);
         memory = await loadSlimMemory(memoryKey);
         // Legacy provider-session memory is deliberately not loaded here: if Cursor reused or
         // mis-restored that id, importing it would reproduce the exact cross-thread leak this
@@ -951,6 +988,42 @@ async function main() {
       const contextThreshold = Math.max(2_000, Math.floor(contextWindow * 0.75));
       const contextForceThreshold = Math.max(2_000, Math.floor(contextWindow * 0.9));
       const contextCharThreshold = Math.max(32_000, Math.floor(contextWindow * 0.75 * 4));
+      const compressionOptions = {
+        maxChars: contextCharThreshold,
+        currentTokens: memory.contextTokens,
+        maxTokens: contextThreshold,
+      };
+      // Prefer the previous turn's silent background compaction. Await it before sending so a
+      // follow-up prompt never races a half-written digest; below-capacity work is a no-op.
+      const compactStartedAt = performance.now();
+      const deferredCompacted = await awaitPendingSlimCompaction(memoryKey);
+      const compactedAtPrompt = await summarizeSlimMemory(memory, request, Agent, compressionOptions)
+        .catch((error) => {
+          process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          return false;
+        });
+      if (compactedAtPrompt) {
+        memory.contextTokens = 0;
+        if (agent) {
+          agent.close();
+          agent = undefined;
+          agentSession = undefined;
+        }
+        send({
+          type: "timing",
+          phase: "context_epoch_rotated",
+          elapsedMs: 0,
+          reason: "compacted",
+          rewriteVersion: memory.rewriteVersion ?? 0,
+        });
+        await saveSlimMemory(memoryKey, memory).catch((error) => {
+          process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        });
+      }
+      sendTiming("slim_memory_compact", compactStartedAt, {
+        compacted: Boolean(compactedAtPrompt || deferredCompacted),
+        deferred: Boolean(deferredCompacted),
+      });
       const reuseSession = canReuseAgentSession(agent, agentSession, request, sessionKey);
       // A newly created/recovered Agent receives Vega's complete compact transcript once. A live
       // matching Agent already owns that history, so replaying it would duplicate every old turn.
@@ -1110,29 +1183,22 @@ async function main() {
             cacheWriteTokens,
             cacheHitRate: cacheDenominator > 0 ? cacheReadTokens / cacheDenominator : 0,
           });
-          let compacted = false;
-          if (["elide", "force"].includes(memory.contextTier)) {
-            compacted = await summarizeSlimMemory(memory, request, Agent, {
-              maxChars: contextCharThreshold,
-              currentTokens: memory.contextTokens,
-              maxTokens: contextThreshold,
-            }).catch((error) => {
-              process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
-              return false;
-            });
-            if (compacted) memory.contextTokens = 0;
-          }
-          // Cursor's live Agent owns native history. A compacted canonical epoch only takes effect
-          // after rotating that Agent; at 90% rotate even if summarization failed to avoid overflow.
-          if (compacted || memory.contextTier === "force" || memory.contextTokens >= contextForceThreshold) {
+          // Under pressure, drop the live native trajectory immediately (Cursor cannot elide
+          // in-SDK tool results mid-session). Clear occupancy so capacity checks use slim memory.
+          // LLM summarization is scheduled after done so the UI can clear running immediately.
+          if (
+            ["elide", "force"].includes(memory.contextTier)
+            || memory.contextTokens >= contextForceThreshold
+          ) {
             agent.close();
             agent = undefined;
             agentSession = undefined;
+            memory.contextTokens = 0;
             send({
               type: "timing",
               phase: "context_epoch_rotated",
               elapsedMs: 0,
-              reason: compacted ? "compacted" : "force_threshold",
+              reason: memory.contextTier === "elide" ? "elide" : "force_threshold",
               rewriteVersion: memory.rewriteVersion ?? 0,
             });
           }
@@ -1141,6 +1207,50 @@ async function main() {
           });
           send({ type: "done", usage: normalizeCursorUsageForNova(turnUsage) });
           completed = true;
+          const postDoneCompression = {
+            maxChars: contextCharThreshold,
+            currentTokens: memory.contextTokens,
+            maxTokens: contextThreshold,
+          };
+          if (slimMemoryNeedsCompression(memory, postDoneCompression)) {
+            const compactKey = memoryKey;
+            const compactRequest = request;
+            scheduleSlimCompaction(compactKey, async () => {
+              const started = performance.now();
+              try {
+                const compacted = await summarizeSlimMemory(
+                  memory,
+                  compactRequest,
+                  Agent,
+                  postDoneCompression,
+                );
+                if (compacted) {
+                  memory.contextTokens = 0;
+                  if (agent) {
+                    agent.close();
+                    agent = undefined;
+                    agentSession = undefined;
+                  }
+                  send({
+                    type: "timing",
+                    phase: "context_epoch_rotated",
+                    elapsedMs: 0,
+                    reason: "compacted",
+                    rewriteVersion: memory.rewriteVersion ?? 0,
+                  });
+                  await saveSlimMemory(compactKey, memory).catch((error) => {
+                    process.stderr.write(`Cursor slim-memory persistence failed: ${error instanceof Error ? error.message : String(error)}\n`);
+                  });
+                }
+                sendTiming("slim_memory_compact", started, { compacted, deferred: true });
+                return compacted;
+              } catch (error) {
+                process.stderr.write(`Cursor slim-memory compression failed: ${error instanceof Error ? error.message : String(error)}\n`);
+                sendTiming("slim_memory_compact", started, { compacted: false, deferred: true });
+                return false;
+              }
+            });
+          }
         } catch (error) {
           const retryable = shouldSilentRetryCursorTurn(error, { producedOutput, attempt });
           if (!retryable) {
@@ -1216,6 +1326,7 @@ export {
   compactConversation,
   completePendingTools,
   compressSlimMemory,
+  slimMemoryNeedsCompression,
   createMessageState,
   createSlimMemory,
   cursorModelOptions,
