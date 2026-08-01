@@ -804,11 +804,11 @@ async fn apply_pull_response(
     command_watch: &mut HashMap<String, Instant>,
     prompt_queue: &mut HashMap<String, Vec<QueuedRemotePrompt>>,
 ) {
-    // pull 与内容上传并发，较早发出的 pull 可能晚于一次 sync 返回。修订号只能前进；
-    // 命令 id 自带去重，因此无论响应修订新旧都可以安全处理。
-    if response.need_full && response.revision >= *revision {
-        *revision = response.revision;
-        *force_full = true;
+    // pull/SSE 与内容上传并发，较早发出的事件可能晚于一次 sync 返回。
+    // 普通修订只能前进；但 needFull 表示服务端已丢弃快照（例如重启后
+    // revision 归零），必须无条件接受，否则本地高 revision 会把信号吃掉，
+    // 空闲桌面永远不会重传全量，只能靠重启客户端恢复。
+    if apply_device_revision(&response, revision, force_full) {
         previous.clear();
         requested.extend(reconcile_response(app, &response, previous));
     } else if !response.need_full && response.revision >= *revision {
@@ -826,6 +826,20 @@ async fn apply_pull_response(
         prompt_queue,
     )
     .await;
+}
+
+/// 接受服务端设备修订。`need_full` 表示快照已失效，即使 revision 回退也要采纳。
+fn apply_device_revision(
+    response: &ServerResponse,
+    revision: &mut i64,
+    force_full: &mut bool,
+) -> bool {
+    if !response.need_full {
+        return false;
+    }
+    *revision = response.revision;
+    *force_full = true;
+    true
 }
 
 fn error_backoff(error: &str) -> Duration {
@@ -1383,6 +1397,34 @@ mod tests {
         assert!(response.requested_thread_ids.is_empty());
         assert!(response.thread_checkpoints.is_empty());
         assert_eq!(response.revision, 3);
+    }
+
+    #[test]
+    fn need_full_accepts_revision_reset_after_server_restart() {
+        let response = ServerResponse {
+            commands: Vec::new(),
+            requested_thread_ids: Vec::new(),
+            need_full: true,
+            revision: 0,
+            resync: false,
+            thread_checkpoints: HashMap::new(),
+        };
+        let mut revision = 42;
+        let mut force_full = false;
+        assert!(apply_device_revision(&response, &mut revision, &mut force_full));
+        assert_eq!(revision, 0);
+        assert!(force_full);
+
+        let stale = ServerResponse {
+            need_full: false,
+            revision: 1,
+            ..response
+        };
+        let mut revision = 42;
+        let mut force_full = false;
+        assert!(!apply_device_revision(&stale, &mut revision, &mut force_full));
+        assert_eq!(revision, 42);
+        assert!(!force_full);
     }
 
     #[test]

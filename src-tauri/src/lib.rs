@@ -2577,6 +2577,30 @@ fn notify_fire_done(
 }
 
 #[tauri::command]
+fn notify_workflow_done(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    success: bool,
+) -> Result<(), String> {
+    let title = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(&thread_id).ok_or("线程不存在")?;
+        if !(thread.title.starts_with("[Fire]") || thread.title.starts_with("[WF]")) {
+            return Err("不是工作流会话".into());
+        }
+        thread.title.clone()
+    };
+    let body = if success {
+        "工作流已完成，点击查看结果"
+    } else {
+        "工作流已结束，但未通过最终阶段"
+    };
+    sys_notify::notify_thread_done_unfiltered(&app, &thread_id, &title, body, acp::EV_NOTIFY_OPEN);
+    Ok(())
+}
+
+#[tauri::command]
 fn create_time_machine_checkpoint(
     state: State<'_, AppState>,
     thread_id: String,
@@ -5617,6 +5641,7 @@ pub fn run() {
             delete_time_machine_context,
             rename_thread,
             notify_fire_done,
+            notify_workflow_done,
             set_prompt_queue_pending,
             set_thread_model,
             set_thread_mode,

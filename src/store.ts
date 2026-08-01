@@ -44,6 +44,15 @@ import type {
   UpdateProgress,
 } from "./types";
 import { isScratch, scratchParent } from "./utils";
+import {
+  handleTurnEnd as handleWorkflowTurnEnd,
+  handleTurnStart as handleWorkflowTurnStart,
+  initWorkflowRuntime,
+  preparePrompt as prepareWorkflowPrompt,
+  startWorkflow,
+  suspendActive as suspendWorkflowActive,
+} from "./workflow/runtime";
+import { findTriggeredWorkflow, findWorkflowByName } from "./workflow/storage";
 import { buildIntegrateModelPrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
@@ -163,7 +172,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "clues" | "employees" | "workbench";
+  view: "home" | "clues" | "employees" | "workbench" | "workflows";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
   clueGroups: ClueNodeGroup[];
   /** 从证据链跳到新会话时暂存的根线索。 */
@@ -678,7 +687,7 @@ export async function refreshRoamingFolders() {
 // ===== 数字员工 =====
 
 /** 切换主区域视图。不影响已打开的会话（currentId 优先）。 */
-export function setView(view: "home" | "clues" | "employees" | "workbench") {
+export function setView(view: "home" | "clues" | "employees" | "workbench" | "workflows") {
   setState("view", view);
 }
 
@@ -1454,16 +1463,40 @@ async function tryBuiltinPrompt(
     await startFireRelay(parsed.goal, parsed.acceptanceCriteria, threadId);
     return true;
   }
+  if (/^\/run(?:\s|$)/i.test(builtInInput)) {
+    if (images.length > 0) throw new Error("/run 暂不支持附件");
+    const parsed = parseRunInput(builtInInput);
+    await startWorkflow(parsed.workflowId, { goal: parsed.goal }, threadId);
+    return true;
+  }
   if (/^\/setup(?:\s|$)/i.test(builtInInput)) {
     const goal = builtInInput.replace(/^\/setup(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /setup 后输入要接入的模型，例如 /setup qwen3.8");
     await deliverPrompt(threadId, buildIntegrateModelPrompt(goal), images);
     return true;
   }
+  // 触发条件：提示词命中某工作流的 slash/contains/regex 触发器时自动启动。
+  const triggered = findTriggeredWorkflow(builtInInput);
+  if (triggered) {
+    await startWorkflow(triggered.id, { goal: triggered.goal }, threadId);
+    return true;
+  }
   if (/^\/target(?:\s|$)/i.test(builtInInput)) {
     throw new Error("/target 只能与 /fire 一起发送");
   }
   return false;
+}
+
+/** 解析 /run <工作流名> <目标>。工作流名取第一个空白分隔的词，其余为目标。 */
+function parseRunInput(input: string): { workflowId: string; goal: string } {
+  const body = input.replace(/^\/run(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+  if (!body) throw new Error("请在 /run 后输入工作流名称和目标");
+  const [nameToken, ...rest] = body.split(/\s+/);
+  const goal = rest.join(" ").trim();
+  const workflow = findWorkflowByName(nameToken);
+  if (!workflow) throw new Error(`找不到名为「${nameToken}」的工作流，可在设置·工作流中查看`);
+  if (!goal) throw new Error("请在 /run <工作流名> 后输入目标");
+  return { workflowId: workflow.id, goal };
 }
 
 /** 创建会话 / 暂存前提前校验内置命令，避免 worktree 建完才发现 /fire 非法。 */
@@ -1489,19 +1522,25 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
   // Fire 阶段在暂停后，或已经产出过判断后，仍允许用户从该会话补充提示继续流程。
   // 本轮正常结束时会重新进入自动验收，而不是退化成不受跟踪的普通会话。
   const resumedFireStep = resumeFireRelay(threadId);
+  // 非 Fire 会话再尝试挂回通用工作流；只读阶段会改写为续跑提示。
+  const workflowOutbound = resumedFireStep ? null : prepareWorkflowPrompt(threadId, text);
   if (state.currentId === threadId) bumpChatScrollToBottom();
   setState("proposedPlan", null);
   setState("running", threadId, true);
   try {
     // 判断阶段被重新唤起时仍然只是验收者：补充内容要并入本轮核验，实现工作交给
     // 下一个执行阶段，否则判断会话会自己动手改项目。
-    const outbound = resumedFireStep?.role === "judge" ? fireJudgeResumePrompt(text) : text;
+    const outbound = resumedFireStep?.role === "judge"
+      ? fireJudgeResumePrompt(text)
+      : workflowOutbound ?? text;
     await api.sendPrompt(threadId, outbound, images);
   } catch (e) {
     if (resumedFireStep && fireRelaySteps.get(threadId) === resumedFireStep) {
       fireRelaySteps.delete(threadId);
       suspendedFireRelaySteps.set(threadId, resumedFireStep);
       persistFireRelayState();
+    } else if (workflowOutbound !== null) {
+      suspendWorkflowActive(threadId);
     }
     setState("running", threadId, false);
     throw e;
@@ -1581,6 +1620,17 @@ function restoreFireRelayState() {
 }
 
 restoreFireRelayState();
+
+// 通用工作流运行时（/run）：复用会话接力模式，与 /fire 专用路径并存。
+initWorkflowRuntime({
+  currentId: () => state.currentId,
+  isRunning: (id) => !!state.running[id],
+  setRunning: (id, v) => setState("running", id, v),
+  refreshThreads: () => refreshThreads(),
+  openThread: (id) => openThread(id),
+  bumpScrollToBottom: () => bumpChatScrollToBottom(),
+  clearProposedPlan: () => setState("proposedPlan", null),
+});
 
 type ParsedFireInput = {
   goal: string;
@@ -2215,6 +2265,7 @@ export async function initStore() {
       preloadThreadSnapshot(e.payload.threadId);
       // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
       resumeFireRelay(e.payload.threadId);
+      handleWorkflowTurnStart(e.payload.threadId);
     } else {
       if (fireRelaySteps.has(e.payload.threadId)) {
         const reason = e.payload.stopReason;
@@ -2227,6 +2278,8 @@ export async function initStore() {
           : suspendFireRelay(e.payload.threadId, manuallyInterrupted);
         void action.catch((error) => console.error("Fire relay failed", error));
       }
+      // 通用工作流（/run）与 Fire 互斥：非 Fire 会话才会被其接管。
+      handleWorkflowTurnEnd(e.payload.threadId, e.payload.stopReason);
       if (
         e.payload.threadId === state.currentId &&
         state.items.some((item) => item.id < 0)

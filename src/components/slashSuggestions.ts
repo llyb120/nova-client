@@ -40,6 +40,12 @@ export function getSlashSuggestions(
       input: "/target ",
     },
     {
+      name: "run",
+      description: "运行一个已配置的工作流：/run 工作流名 目标",
+      kind: "Nova",
+      input: "/run ",
+    },
+    {
       name: "setup",
       description: "把一个模型 / provider 接入 Vega：/setup 模型名",
       kind: "Nova",

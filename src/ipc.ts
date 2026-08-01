@@ -187,6 +187,8 @@ export const api = {
     invoke<void>("rename_thread", { threadId, title }),
   notifyFireDone: (threadId: string, success: boolean) =>
     invoke<void>("notify_fire_done", { threadId, success }),
+  notifyWorkflowDone: (threadId: string, success: boolean) =>
+    invoke<void>("notify_workflow_done", { threadId, success }),
   setPromptQueuePending: (threadId: string, pending: boolean) =>
     invoke<void>("set_prompt_queue_pending", { threadId, pending }),
   sendPrompt: (threadId: string, text: string, images: PromptImage[] = []) =>

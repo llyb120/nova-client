@@ -12,6 +12,7 @@ import { ShareInboxModal } from "./components/ShareInboxModal";
 import { Sidebar } from "./components/Sidebar";
 import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
+import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
 import { mountSessionShortcuts } from "./sessionShortcuts";
 import { initStore, openNewSession, state } from "./store";
@@ -71,6 +72,7 @@ export default function App() {
       <Show
         when={state.currentId}
         fallback={
+          <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
             <Show when={state.view === "employees"} fallback={
               <Show when={state.view === "workbench"} fallback={<HomeView />}>
@@ -81,6 +83,9 @@ export default function App() {
             </Show>
           }>
             <EvidenceChainView />
+          </Show>
+          }>
+            <WorkflowsView />
           </Show>
         }
       >

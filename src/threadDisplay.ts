@@ -9,7 +9,8 @@ function isDoThread(thread: ThreadMeta): boolean {
 }
 
 function isFireThread(thread: ThreadMeta): boolean {
-  return /^\[Fire\]/.test(thread.title);
+  // 同时覆盖内置 Fire 与通用工作流（/run）产生的接力链。
+  return /^\[(?:Fire|WF)\]/.test(thread.title);
 }
 
 /**

@@ -107,7 +107,7 @@ export function Sidebar(props: {
     return decisions + active;
   });
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "employees" | "workbench") => {
+  const switchView = (view: "home" | "clues" | "employees" | "workbench" | "workflows") => {
     setView(view);
     closeThread();
   };
@@ -115,6 +115,7 @@ export function Sidebar(props: {
   const openClues = () => switchView("clues");
   const openEmployees = () => switchView("employees");
   const openWorkbench = () => switchView("workbench");
+  const openWorkflows = () => switchView("workflows");
 
   // 数字员工（配置）/ 御书房（日常）视图下，左侧切换为「员工会话」这一卷。
   const isEmployeeView = () => state.view === "employees" || state.view === "workbench";
@@ -574,6 +575,15 @@ export function Sidebar(props: {
               title="普通模式：查看你自己的会话"
             >
               普通模式
+            </button>
+            <button
+              class="mode-seg-btn"
+              classList={{ active: state.view === "workflows" }}
+              onClick={openWorkflows}
+              title="配置可编排的工作流：阶段接力、转移条件与提示词模板"
+            >
+              <IconMerge size={14} />
+              工作流
             </button>
             <button
               class="mode-seg-btn"
