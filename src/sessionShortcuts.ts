@@ -17,6 +17,24 @@ export function newSessionShortcutId(): string {
     : `sc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+/** 内置：Esc 终止当前回合（非设置项，用户配置一律忽略）。 */
+export const BUILTIN_STOP_SESSION_SHORTCUT: SessionShortcut = {
+  id: "default-stop-session",
+  keys: "Escape",
+  action: "stopSession",
+  target: "",
+};
+
+/** 运行时合并内置 Esc 终止；剥离历史配置里的 stopSession。 */
+export function withDefaultSessionShortcuts(
+  shortcuts: SessionShortcut[],
+): SessionShortcut[] {
+  return [
+    ...shortcuts.filter((item) => item.action !== "stopSession"),
+    { ...BUILTIN_STOP_SESSION_SHORTCUT },
+  ];
+}
+
 export function encodeModelTarget(agentKind: AgentKind, model: string): string {
   return `${agentKind}:${encodeURIComponent(model)}`;
 }
@@ -138,21 +156,24 @@ export function mountSessionShortcuts(options: {
   onNewSession?: () => void;
   /** 返回 true 表示已插入到当前会话输入框。 */
   onInsertText?: (text: string) => boolean;
+  /** 返回 true 表示已终止当前回合（例如正在运行且未被其它 Esc 用途占用）。 */
+  onStopSession?: () => boolean;
 }): void {
   const allowed = new Set(options.allowedActions);
   const onKeyDown = (event: KeyboardEvent) => {
     if (shortcutCaptureActive || event.defaultPrevented || event.isComposing || event.repeat) {
       return;
     }
-    const shortcuts = state.settings?.sessionShortcuts ?? [];
+    const shortcuts = withDefaultSessionShortcuts(state.settings?.sessionShortcuts ?? []);
     if (shortcuts.length === 0) return;
     const hit = findSessionShortcut(event, shortcuts);
     if (!hit?.keys) return;
     if (!allowed.has(hit.action)) return;
-    if (hit.action !== "newSession" && !hit.target) return;
-    // insertText 仅在输入框内生效，允许无修饰键；其它动作在可编辑区需 Ctrl/Alt/Meta。
+    if (hit.action !== "newSession" && hit.action !== "stopSession" && !hit.target) return;
+    // insertText / stopSession 允许无修饰键；其它动作在可编辑区需 Ctrl/Alt/Meta。
     if (
       hit.action !== "insertText" &&
+      hit.action !== "stopSession" &&
       isEditableTarget(event.target) &&
       !shortcutHasModifier(hit.keys)
     ) {
@@ -162,6 +183,13 @@ export function mountSessionShortcuts(options: {
     if (hit.action === "insertText") {
       if (!isEditableTarget(event.target)) return;
       const handled = options.onInsertText?.(hit.target) ?? false;
+      if (!handled) return;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (hit.action === "stopSession") {
+      const handled = options.onStopSession?.() ?? false;
       if (!handled) return;
       event.preventDefault();
       event.stopPropagation();

@@ -358,9 +358,11 @@ export type SessionShortcutAction =
   | "selectProject"
   | "selectModel"
   | "newSession"
-  | "insertText";
+  | "insertText"
+  /** 内置 Esc 终止，仅运行时使用，不可在设置中配置。 */
+  | "stopSession";
 
-/** 会话快捷键：一键切到指定项目或模型、快速新会话，或向输入框插入文本。 */
+/** 会话快捷键：一键切到指定项目或模型、快速新会话、插入文本。 */
 export interface SessionShortcut {
   id: string;
   /** 规范化按键，如 Ctrl+1 / Alt+P。 */
@@ -462,7 +464,7 @@ export interface Settings {
   sessionAutoCleanupHours: number;
   /** 语义检索开关（关 = 内置 BM25 关键词检索） */
   semanticEnabled: boolean;
-  /** 启用 Fast Context 上下文检索工具（context_bundle / find_symbol）。 */
+  /** 启用 Fast Context 上下文检索工具（fast_context / find_symbols）。 */
   fastContextEnabled: boolean;
   /** embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434） */
   embedEndpoint: string;

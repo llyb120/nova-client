@@ -103,11 +103,6 @@ export function Composer() {
     return true;
   };
 
-  mountSessionShortcuts({
-    allowedActions: ["insertText"],
-    onInsertText: insertShortcutText,
-  });
-
   onCleanup(() => {
     if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
   });
@@ -205,6 +200,20 @@ export function Composer() {
     holdPromptQueue(state.currentId);
     void cancelTurn(reason);
   };
+
+  mountSessionShortcuts({
+    allowedActions: ["insertText", "stopSession"],
+    onInsertText: insertShortcutText,
+    onStopSession: () => {
+      if (historyOpen() || slashQuery() !== null || stopDialogOpen()) return false;
+      if (!running()) return false;
+      requestStop();
+      return true;
+    },
+  });
+
+  const stopShortcutLabel = () => "停止 (Esc)";
+
   // 进行中 / 漫游会话不开放跨后端切换，退回当前后端单选；否则可在已启用后端间切换
   const isGuest = () =>
     (state.threads.find((t) => t.id === state.currentId)?.roamingRole ?? null) === "guest";
@@ -748,7 +757,7 @@ export function Composer() {
           <button
             class="composer-btn stop"
             onClick={requestStop}
-            title="停止"
+            title={running() ? stopShortcutLabel() : "停止"}
             disabled={!running()}
           >
             <IconStop size={16} />

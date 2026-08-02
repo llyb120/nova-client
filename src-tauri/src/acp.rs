@@ -5,6 +5,7 @@ use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, ToolCall};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{AppHandle, Emitter, Manager};
@@ -28,7 +29,7 @@ pub const EV_NOTIFY_OPEN: &str = "acp:notify-open";
 const LOG_CAP: usize = 800;
 const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
 
-/// Devin 多路复用后端的唯一共享连接（所有线程共用一条连接、一个进程）。
+/// 模型探测、命令探测和标题生成共用的辅助连接。
 const SHARED_KEY: &str = "__shared__";
 
 pub struct PendingPermission {
@@ -56,8 +57,9 @@ struct TitleJob {
 }
 
 pub struct AcpConn {
-    /// 该连接在连接池中的键（Devin 固定为 SHARED）。
+    /// 该连接在连接池中的键；用户线程独立，辅助任务使用 SHARED。
     key: String,
+    read_only: bool,
     label: &'static str,
     stdin_tx: mpsc::UnboundedSender<String>,
     pending: StdMutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
@@ -316,7 +318,7 @@ pub struct AcpManager {
     launch_env: HashMap<String, String>,
     /// 额度租借实例的权限请求作用域，避免不同进程的递增 RPC id 发生碰撞。
     permission_scope: String,
-    /// Devin 只使用 SHARED 键，一条连接多路复用所有 session。
+    /// 用户线程各用独立连接，以便按项目/模式注入 Devin 本地 MCP 配置；辅助任务共用 SHARED。
     slots: StdMutex<HashMap<String, Arc<TokioMutex<Option<Arc<AcpConn>>>>>>,
     /// 存活连接计数：spawn 成功 +1、连接关闭 -1；用于 connected() 与断连广播（归零才广播）。
     alive_conns: AtomicU64,
@@ -329,9 +331,6 @@ pub struct AcpManager {
     /// 诊断：session/prompt 发出时刻 → 用于测量「首响应延迟」(session_id)
     prompt_sent_at: StdMutex<HashMap<String, std::time::Instant>>,
     pending_permissions: StdMutex<HashMap<String, PendingPermission>>,
-    /// 预热好的空 session：cwd → sessionId（仅 Devin，走 SHARED 连接）
-    prewarmed: StdMutex<HashMap<String, String>>,
-    prewarming: StdMutex<HashSet<String>>,
     /// 串行化同一线程上的 session 建立操作
     thread_locks: StdMutex<HashMap<String, Arc<TokioMutex<()>>>>,
     /// devin 返回的可用模型/模式（来自 session/new 响应）
@@ -370,8 +369,6 @@ impl AcpManager {
             turn_started: StdMutex::new(HashMap::new()),
             prompt_sent_at: StdMutex::new(HashMap::new()),
             pending_permissions: StdMutex::new(HashMap::new()),
-            prewarmed: StdMutex::new(HashMap::new()),
-            prewarming: StdMutex::new(HashSet::new()),
             thread_locks: StdMutex::new(HashMap::new()),
             model_options: StdMutex::new(None),
             model_options_revalidated: AtomicBool::new(false),
@@ -388,13 +385,22 @@ impl AcpManager {
         self.running_threads.lock().unwrap().contains(thread_id)
     }
 
-    /// ACP session 不挂 Nova MCP；数字员工工具统一走 CLI。
-    fn mcp_servers_for_thread(&self, _thread_id: Option<&str>) -> Value {
-        json!([])
+    fn conn_key_for_thread(&self, thread_id: &str) -> String {
+        format!("thread:{thread_id}")
     }
 
-    fn conn_key_for_thread(&self, _thread_id: &str) -> String {
-        SHARED_KEY.to_string()
+    fn thread_is_read_only(&self, conn_key: &str) -> bool {
+        let Some(thread_id) = conn_key.strip_prefix("thread:") else {
+            return false;
+        };
+        let state = self.app.state::<AppState>();
+        let store = state.store.lock().unwrap();
+        store
+            .get(thread_id)
+            .and_then(|thread| thread.mode.as_deref())
+            .map(unify_mode_id)
+            .as_deref()
+            == Some("plan")
     }
 
     fn aux_key(&self) -> String {
@@ -613,7 +619,7 @@ impl AcpManager {
         let _ = self.app.emit(EV_LOG, line);
     }
 
-    /// 杀掉 Devin 共享连接并清空全局路由。
+    /// 杀掉全部 Devin 连接并清空全局路由。
     /// 用于「重启 agent」「改配置」「应用退出」等需要彻底重置的场景。
     pub async fn kill_conn(&self) {
         let slots: Vec<_> = self.slots.lock().unwrap().drain().map(|(_, v)| v).collect();
@@ -624,8 +630,6 @@ impl AcpManager {
         }
         self.routes.lock().unwrap().clear();
         self.loading_sessions.lock().unwrap().clear();
-        self.prewarmed.lock().unwrap().clear();
-        self.prewarming.lock().unwrap().clear();
         self.pending_permissions.lock().unwrap().clear();
         self.title_jobs.lock().unwrap().clear();
         self.prompt_sent_at.lock().unwrap().clear();
@@ -730,7 +734,7 @@ impl AcpManager {
         self: &Arc<Self>,
         settings: &Settings,
         conn_key: &str,
-        _want_cwd: Option<&str>,
+        want_cwd: Option<&str>,
     ) -> Result<Arc<AcpConn>, String> {
         let program = settings.devin_path.clone();
         let args_str = settings.acp_args.clone();
@@ -742,6 +746,20 @@ impl AcpManager {
             c.args(args_str.split_whitespace());
             c
         };
+        if let Some(cwd) = want_cwd.filter(|_| conn_key.starts_with("thread:")) {
+            let launch_dir = prepare_devin_nova_tools_config(
+                &self.app,
+                conn_key,
+                cwd,
+                settings.fast_context_enabled,
+                self.thread_is_read_only(conn_key),
+            )?;
+            cmd.current_dir(&launch_dir);
+            self.push_log(format!(
+                "[nova] Devin 使用本地 nova-tools MCP 配置：{}",
+                launch_dir.display()
+            ));
+        }
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -782,6 +800,7 @@ impl AcpManager {
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
         let conn = Arc::new(AcpConn {
             key: conn_key.to_string(),
+            read_only: self.thread_is_read_only(conn_key),
             label: self.kind.label(),
             stdin_tx,
             pending: StdMutex::new(HashMap::new()),
@@ -935,13 +954,9 @@ impl AcpManager {
         }
         // 清理本连接键的会话路由 / 活跃会话 / 回放标记 / 计时 / 会话计数
         self.clear_sessions_of_key(&key);
-        // 辅助（或 Devin 的共享）连接关闭时，跑在其上的标题任务作废、预热缓存清空
+        // 辅助连接关闭时，跑在其上的标题任务作废。
         if key == self.aux_key() {
             self.title_jobs.lock().unwrap().clear();
-        }
-        if key == SHARED_KEY {
-            self.prewarmed.lock().unwrap().clear();
-            self.prewarming.lock().unwrap().clear();
         }
         self.push_log(format!(
             "[nova] {} acp 连接已退出（key={key}）",
@@ -1609,65 +1624,9 @@ impl AcpManager {
         );
     }
 
-    /// 预热：提前为某个项目目录创建空 session，消除首条消息的建会话延迟
+    /// Devin 的项目级 MCP 配置绑定到用户线程进程，不能跨线程安全复用预热 session。
     pub async fn prewarm(self: &Arc<Self>, cwd: String) {
-        // 拿闸门前先粗筛：已预热好/正在预热就别再排队
-        {
-            let warmed = self.prewarmed.lock().unwrap();
-            let warming = self.prewarming.lock().unwrap();
-            if warmed.contains_key(&cwd) || warming.contains(&cwd) {
-                return;
-            }
-        }
-        // 这里只有共享连接后端会走到；Devin 等返回 None、保持多路复用。
-        {
-            let warmed = self.prewarmed.lock().unwrap();
-            let mut warming = self.prewarming.lock().unwrap();
-            if warmed.contains_key(&cwd) || !warming.insert(cwd.clone()) {
-                return;
-            }
-        }
-        let result = async {
-            let conn = self.ensure_conn_for(SHARED_KEY, None).await?;
-            let resp = conn
-                .request(
-                    "session/new",
-                    json!({
-                        "cwd": cwd,
-                        "mcpServers": []
-                    }),
-                    Some(Duration::from_secs(180)),
-                )
-                .await?;
-            self.capture_options(&resp);
-            let sid = resp["sessionId"]
-                .as_str()
-                .map(|s| s.to_string())
-                .ok_or_else(|| "session/new 未返回 sessionId".to_string())?;
-            Ok::<String, String>(sid)
-        }
-        .await;
-        self.prewarming.lock().unwrap().remove(&cwd);
-        match result {
-            Ok(sid) => {
-                self.push_log(format!("[nova] 预热完成 {cwd} → {sid}"));
-                self.prewarmed.lock().unwrap().insert(cwd, sid);
-            }
-            Err(e) => self.push_log(format!("[nova] 预热失败 {cwd}: {e}")),
-        }
-    }
-
-    async fn take_prewarmed_session(&self, cwd: &str) -> Option<String> {
-        for _ in 0..200 {
-            if let Some(sid) = self.prewarmed.lock().unwrap().remove(cwd) {
-                return Some(sid);
-            }
-            if !self.prewarming.lock().unwrap().contains(cwd) {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        None
+        let _ = (self, cwd);
     }
 
     /// 确保线程的 ACP session 就绪（按需建立/恢复），返回 sessionId
@@ -1686,7 +1645,7 @@ impl AcpManager {
                 thread.mode.clone(),
             )
         };
-        // Devin 的所有线程共用 SHARED 连接（多路复用）。
+        // 每个用户线程使用独立 Devin 连接，使本地 MCP 的项目根目录和只读模式互不串扰。
         let key = self.conn_key_for_thread(thread_id);
         let conn = self.ensure_conn_for(&key, Some(&cwd)).await?;
 
@@ -1716,7 +1675,7 @@ impl AcpManager {
                             json!({
                                 "sessionId": sid,
                                 "cwd": cwd,
-                                "mcpServers": self.mcp_servers_for_thread(Some(thread_id))
+                                "mcpServers": []
                             }),
                             Some(Duration::from_secs(300)),
                         )
@@ -1759,21 +1718,7 @@ impl AcpManager {
                 }
             }
             None => {
-                // 优先消费预热好的 session
-                let sid = match self.take_prewarmed_session(&cwd).await {
-                    Some(sid) => {
-                        self.routes.lock().unwrap().insert(
-                            sid.clone(),
-                            Route {
-                                thread_id: thread_id.to_string(),
-                                applied_model: None,
-                                applied_mode: None,
-                            },
-                        );
-                        sid
-                    }
-                    None => self.new_session_for(&conn, &key, thread_id, &cwd).await?,
-                };
+                let sid = self.new_session_for(&conn, &key, thread_id, &cwd).await?;
                 {
                     let state = self.app.state::<AppState>();
                     let mut store = state.store.lock().unwrap();
@@ -2070,6 +2015,20 @@ impl AcpManager {
         let Some(conn) = self.conn_for_key(&key).await else {
             return;
         };
+        let want_read_only = mode.as_deref().map(unify_mode_id).as_deref() == Some("plan");
+        if conn.read_only != want_read_only {
+            self.routes.lock().unwrap().remove(&sid);
+            if let Some(slot) = self.slot_opt(&key) {
+                if let Some(conn) = slot.lock().await.take() {
+                    conn.kill();
+                }
+            }
+            self.slots.lock().unwrap().remove(&key);
+            self.push_log(format!(
+                "[nova] Devin 模式读写权限变化，已重启线程连接以刷新 nova-tools（thread={thread_id}）"
+            ));
+            return;
+        }
         self.apply_session_config(&conn, &key, &sid, model, mode)
             .await;
     }
@@ -2112,7 +2071,7 @@ impl AcpManager {
                     "session/new",
                     json!({
                         "cwd": cwd,
-                        "mcpServers": self.mcp_servers_for_thread(Some(thread_id))
+                        "mcpServers": []
                     }),
                     Some(Duration::from_secs(180)),
                 )
@@ -2341,15 +2300,38 @@ impl AcpManager {
     }
 
     fn build_user_prompt_blocks(
+        &self,
+        thread_id: &str,
         text: &str,
         images: &[PromptImage],
         include_runtime_guidance: bool,
     ) -> Vec<Value> {
         let mut prompt = Self::build_prompt_blocks(text, images);
+        let mut guidance = Vec::new();
         if include_runtime_guidance {
-            if let Some(guidance) = devin_runtime_guidance() {
-                prompt.insert(0, json!({ "type": "text", "text": guidance }));
-            }
+            let (fast_context, read_only) = {
+                let state = self.app.state::<AppState>();
+                let fast_context = state.settings.lock().unwrap().fast_context_enabled;
+                let read_only = {
+                    let store = state.store.lock().unwrap();
+                    store
+                        .get(thread_id)
+                        .and_then(|t| t.mode.as_deref())
+                        .map(unify_mode_id)
+                        .as_deref()
+                        == Some("plan")
+                };
+                (fast_context, read_only)
+            };
+            guidance.push(nova_tools_prompt_guidance(fast_context, read_only));
+        }
+        // Shell 解释器由 Devin 的执行层选择，且可能在同一 Windows 会话中切换。
+        // 每轮带上短契约，旧 session 也能立即纠正 Bash / PowerShell 混用。
+        if let Some(runtime) = devin_runtime_guidance() {
+            guidance.push(runtime.to_string());
+        }
+        if !guidance.is_empty() {
+            prompt.insert(0, json!({ "type": "text", "text": guidance.join("\n\n") }));
         }
         prompt
     }
@@ -2476,7 +2458,8 @@ impl AcpManager {
         let conn_key = self.conn_key_for_thread(thread_id);
         // ensure_session 返回后进程可能恰好退出；交给下面的重建分支恢复。
         let mut conn = self.conn_for_key(&conn_key).await;
-        let mut prompt = Self::build_user_prompt_blocks(text, images, include_runtime_guidance);
+        let mut prompt =
+            self.build_user_prompt_blocks(thread_id, text, images, include_runtime_guidance);
         if let Some(ctx) = handoff {
             prompt.insert(0, json!({ "type": "text", "text": ctx }));
         }
@@ -2692,7 +2675,6 @@ impl AcpManager {
             }
         }
 
-        // Devin 共享连接上多 session 复用。
         let Some(session_id) = session_id else {
             // 还没建立 session 就要停（如卡在 session/new）：直接本地结束
             if self.is_running(thread_id) {
@@ -2752,6 +2734,16 @@ impl AcpManager {
             .unwrap()
             .retain(|_, r| r.thread_id != thread_id);
         self.thread_locks.lock().unwrap().remove(thread_id);
+        let key = self.conn_key_for_thread(thread_id);
+        let mgr = self.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(slot) = mgr.slot_opt(&key) {
+                if let Some(conn) = slot.lock().await.take() {
+                    conn.kill();
+                }
+            }
+            mgr.slots.lock().unwrap().remove(&key);
+        });
     }
 }
 
@@ -2929,10 +2921,174 @@ fn pick_fallback_mode_id(unified: &str, known: &[String]) -> Option<String> {
     })
 }
 
+const NOVA_TOOLS_MCP_JS: &[u8] = include_bytes!("../resources/nova-tools-mcp.mjs");
+
+fn materialize_nova_tools_mcp(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = nova_data_dir(app).join("runtime");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 runtime 目录失败：{e}"))?;
+    let path = dir.join("nova-tools-mcp.mjs");
+    if std::fs::read(&path).ok().as_deref() != Some(NOVA_TOOLS_MCP_JS) {
+        std::fs::write(&path, NOVA_TOOLS_MCP_JS)
+            .map_err(|e| format!("写入 nova-tools-mcp.mjs 失败：{e}"))?;
+    }
+    Ok(path)
+}
+
+fn devin_nova_tools_config(
+    node: &std::path::Path,
+    script: &std::path::Path,
+    cwd: &str,
+    fast_context: bool,
+    read_only: bool,
+) -> Value {
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "NOVA_FAST_CONTEXT".into(),
+        Value::String(if fast_context { "1" } else { "0" }.into()),
+    );
+    env.insert("NOVA_TOOLS_CWD".into(), Value::String(cwd.into()));
+    if read_only {
+        env.insert("NOVA_TOOLS_READ_ONLY".into(), Value::String("1".into()));
+    }
+    json!({
+        "mcpServers": {
+            "nova-tools": {
+                "command": node.to_string_lossy(),
+                "args": [script.to_string_lossy()],
+                "env": env,
+                "transport": "stdio"
+            }
+        }
+    })
+}
+
+/// Devin 3000.2.17 会启动 `session/new.mcpServers` 中的 stdio 进程，却不会把它加入
+/// mcp_list_tools / mcp_call_tool 的实际注册表。把同一配置写入隔离启动目录的项目级配置，
+/// 可兼容当前缺陷；未来版本也会按正常的本地 MCP 配置路径工作。
+fn prepare_devin_nova_tools_config(
+    app: &AppHandle,
+    conn_key: &str,
+    cwd: &str,
+    fast_context: bool,
+    read_only: bool,
+) -> Result<PathBuf, String> {
+    let script = materialize_nova_tools_mcp(app)?;
+    let node = resolve_program_on_path("node")
+        .ok_or_else(|| "未找到 Node.js，无法挂载 nova-tools MCP".to_string())?;
+    let safe_key: String = conn_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let launch_dir = nova_data_dir(app)
+        .join("runtime")
+        .join("devin-mcp")
+        .join(safe_key);
+    let config_dir = launch_dir.join(".devin");
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|e| format!("创建 Devin MCP 配置目录失败：{e}"))?;
+    let config = devin_nova_tools_config(&node, &script, cwd, fast_context, read_only);
+    let bytes = serde_json::to_vec_pretty(&config)
+        .map_err(|e| format!("序列化 Devin MCP 配置失败：{e}"))?;
+    let path = config_dir.join("config.local.json");
+    if std::fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
+        std::fs::write(&path, bytes).map_err(|e| format!("写入 Devin MCP 配置失败：{e}"))?;
+    }
+    Ok(launch_dir)
+}
+
+#[cfg(test)]
+mod nova_tools_config_tests {
+    use super::devin_nova_tools_config;
+    use std::path::Path;
+
+    #[test]
+    fn devin_local_config_registers_nova_tools_with_project_policy() {
+        let config = devin_nova_tools_config(
+            Path::new("C:/node.exe"),
+            Path::new("C:/nova-tools.mjs"),
+            "D:/repo",
+            true,
+            true,
+        );
+        let server = &config["mcpServers"]["nova-tools"];
+        assert_eq!(server["transport"], "stdio");
+        assert_eq!(server["env"]["NOVA_TOOLS_CWD"], "D:/repo");
+        assert_eq!(server["env"]["NOVA_FAST_CONTEXT"], "1");
+        assert_eq!(server["env"]["NOVA_TOOLS_READ_ONLY"], "1");
+    }
+
+    #[test]
+    fn devin_nova_tools_guidance_requires_wrapper_server_name() {
+        let guidance = super::nova_tools_prompt_guidance(true, false);
+        assert!(guidance.contains("ROUTING RULE — apply this before choosing any tool"));
+        assert!(guidance.contains("never select read_files, fast_context, find_symbols, or edit_files"));
+        assert!(guidance.contains("only valid execution path"));
+        assert!(guidance.contains("generic mcp_call_tool wrapper"));
+        assert!(guidance.contains("Set server_name to the top-level string \"nova-tools\""));
+        assert!(guidance.contains("\"server_name\":\"nova-tools\""));
+        assert!(guidance.contains("wording such as `use/call read_files`"));
+        assert!(guidance.contains("do not call mcp_list_tools merely to discover them"));
+        assert!(guidance.contains("Never repeat a malformed call unchanged"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_devin_guidance_does_not_mix_powershell_with_default_bash() {
+        let guidance = super::devin_runtime_guidance().unwrap();
+        assert!(guidance.contains("default command interpreter may be `/usr/bin/bash`"));
+        assert!(guidance.contains("powershell.exe -NoProfile -NonInteractive -Command"));
+        assert!(guidance.contains("Do not mix Bash pipelines/operators with PowerShell cmdlets"));
+    }
+}
+
+/// First-prompt guidance for Nova MCP tools attached to Devin ACP sessions.
+fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
+    let mut tools = String::from("read_files");
+    if fast_context {
+        tools.push_str(", fast_context, find_symbols");
+    }
+    if !read_only {
+        tools.push_str(", edit_files");
+    }
+    let mut lines = vec![
+        format!(
+            "ROUTING RULE — apply this before choosing any tool: never select read_files, fast_context, find_symbols, or edit_files as the tool call itself. Select Devin's top-level mcp_call_tool first, then route to server nova-tools. You have Nova MCP endpoints on server nova-tools ({tools}) plus Devin built-in tools. Those endpoint names are NOT top-level callable Devin tools; a direct invocation produces `Unknown tool ... This tool is not available.` Your only valid execution path for a Nova endpoint is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string \"nova-tools\" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: {{\"server_name\":\"nova-tools\",\"tool_name\":\"fast_context\",\"arguments\":{{\"query\":\"cursor\"}}}}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as `use/call read_files` means `call mcp_call_tool with server_name nova-tools and tool_name read_files`; it never authorizes a direct tool call. If a direct call reports `Unknown tool`, retry once through mcp_call_tool. If parsing reports missing field `server_name`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints."
+        ),
+        format!(
+            "Before each read phase, inventory known targets: if there is only one target, use Devin's native read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call native read repeatedly, and do not use parallel wrappers of multiple native reads instead of read_files. Wanting to understand files in order is not a read dependency. Use native read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. {}Do not dump large files blindly. {}",
+            if fast_context {
+                "When location is unknown, you must call only fast_context (or find_symbols if you only need line numbers); then read only coverage gaps / next_reads. "
+            } else {
+                "When location is unknown, search first (see below), then read near hits. "
+            },
+            if read_only {
+                "For edits, use Devin native edit tools; do not expect a Nova edit_files tool in this mode."
+            } else {
+                "When modifying two or more independent existing files, you must use edit_files; merge multiple edits for the same file into that file's edits array. Single-file edits may use Devin native edit tools."
+            }
+        ),
+        if fast_context {
+            "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only fast_context (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`) or find_symbols (locations only). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with one read_files. After fast_context/find_symbols, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside fast_context. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that fast_context did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
+        } else {
+            "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
+        },
+    ];
+    if read_only {
+        lines.push("Current mode is plan/read-only: analyze only; do not modify files.".into());
+    }
+    lines.join("\n")
+}
+
 #[cfg(windows)]
 fn devin_runtime_guidance() -> Option<&'static str> {
     Some(
-        "Runtime note for this local Devin session: shell commands run on Windows through PowerShell. Use PowerShell syntax for command execution. Prefer `Get-ChildItem -Force` over `ls -la`, `Get-Content` over `cat` when flags are needed, `$env:NAME` for environment variables, and Windows-compatible paths. Do not assume Git Bash or bash syntax unless you explicitly run `bash -lc \"...\"`.",
+        "Windows shell contract for this local Devin session (hard constraint): Devin's native command tool is hosted on Windows but its default command interpreter may be `/usr/bin/bash` (Git Bash/MSYS), not PowerShell. Never place PowerShell cmdlets such as `Get-ChildItem`, `Select-Object`, `Get-Content`, `Where-Object`, or `$env:NAME` directly in a default shell command. For ordinary repository commands, use portable Bash syntax and forward-slash paths, for example `pwd`, `ls -la`, `cat file`, `rg pattern src`, `git status --short`, `command -v node`, and `$NAME`. Do not use Bash to recursively search when Nova fast_context/find_symbols/read_files already covers the task. When Windows-specific behavior or PowerShell cmdlets are genuinely required, invoke PowerShell explicitly as `powershell.exe -NoProfile -NonInteractive -Command \"...\"`; inside that quoted script use PowerShell syntax and `$env:NAME`. Do not mix Bash pipelines/operators with PowerShell cmdlets in the same command. If a command fails with `/usr/bin/bash: ...: command not found`, correct the shell mismatch immediately instead of retrying the same syntax.",
     )
 }
 

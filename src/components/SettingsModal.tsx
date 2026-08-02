@@ -271,7 +271,9 @@ export function SettingsModal(props: { onClose: () => void }) {
     (s?.cursorModelContexts ?? []).map((rule) => ({ ...rule })),
   );
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(
-    (s?.sessionShortcuts ?? []).map((item) => ({ ...item })),
+    (s?.sessionShortcuts ?? [])
+      .filter((item) => item.action !== "stopSession")
+      .map((item) => ({ ...item })),
   );
   const [vegaContextMode, setVegaContextMode] = createSignal<"default" | "super">(
     s?.vegaContextMode === "super" ? "super" : "default",
@@ -464,6 +466,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       }))
       .filter((item) => {
         if (!item.keys) return false;
+        if (item.action === "stopSession") return false;
         if (item.action === "newSession") return true;
         return item.target.length > 0;
       });
@@ -1130,7 +1133,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效。
+                      一键切换项目/模型、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与终止回合有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效。默认 Esc 终止当前回合。
                     </div>
                   </div>
                   <button
@@ -1370,7 +1373,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  启用后为 Vega / Cursor 注入 context_bundle / find_symbol 工具，用于一次性打包相关代码上下文；关闭则不附带这两个工具。默认启用。
+                  启用后为 Vega / Cursor / Devin 注入 fast_context / find_symbols 工具，用于一次性打包相关代码上下文；关闭则不附带这两个工具。Devin 另始终挂载 read_files / edit_files（Plan 模式不含 edit_files）。默认启用。
                 </span>
               </div>
             </section>

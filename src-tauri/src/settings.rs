@@ -14,7 +14,8 @@ pub struct CursorModelContextRule {
     pub context_window: u32,
 }
 
-/// 新建会话 / 会话页快捷键：一键切到指定项目或模型、快速新会话，或插入文本。
+/// 新建会话 / 会话页快捷键：一键切到指定项目或模型、快速新会话、插入文本。
+/// Esc 终止回合为内置行为，不作为可配置项。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionShortcut {
@@ -141,7 +142,7 @@ pub struct Settings {
     pub session_auto_cleanup_hours: u32,
     /// 语义检索开关（关 = 用内置 BM25 关键词检索；开需配置下面的 embedding 服务）
     pub semantic_enabled: bool,
-    /// 启用 Fast Context：为 Vega / Cursor 注入 context_bundle / find_symbol 上下文检索工具；关闭则不附带。
+    /// 启用 Fast Context：为 Vega / Cursor / Devin 注入 fast_context / find_symbols 上下文检索工具；关闭则不附带。
     pub fast_context_enabled: bool,
     /// embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434）
     pub embed_endpoint: String,
