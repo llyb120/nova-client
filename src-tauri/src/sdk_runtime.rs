@@ -1016,9 +1016,6 @@ impl SdkManager {
             // Node bridges also persist app-owned state. Pin them to the same profile-specific
             // root as Rust so debug builds never fall back to the release ~/.nova directory.
             .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
-        if let Ok(executable) = std::env::current_exe() {
-            command.env("NOVA_TOOLS_NATIVE_EXE", executable);
-        }
         if !self.launch_env.is_empty() {
             crate::credential_roaming::isolate_borrowed_command(&mut command);
             command.envs(&self.launch_env);
@@ -1385,6 +1382,7 @@ fn bridge_path(app: &AppHandle, adapter: &dyn SdkAdapter) -> Result<PathBuf, Str
     let dir = crate::nova_data_dir(app).join("runtime");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("创建 {} 运行目录失败：{e}", adapter.label()))?;
+    crate::nova_tools_napi_asset::materialize(&dir)?;
     let path = dir.join(name);
     if std::fs::read(&path).ok().as_deref() != Some(bridge) {
         std::fs::write(&path, bridge)

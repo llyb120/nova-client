@@ -52,6 +52,7 @@ src-tauri/target/
 src-tauri/resources/*.mjs
 src-tauri/resources/*.cjs
 src-tauri/resources/*.wasm
+src-tauri/resources/*.node
 
 # 打包输出（Nova 更新包 nova-x.y.z.zip）
 release/

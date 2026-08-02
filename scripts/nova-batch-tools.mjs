@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
-import { callNativeToolOrFallback } from "./nova-native-tools.mjs";
+import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 2000;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -157,7 +157,7 @@ export function createNovaBatchTools(cwd, options = {}) {
         const requested = Array.isArray(params.paths) ? params.paths : params.files;
         const list = Array.isArray(requested) ? requested : [];
         if (!list.length) throw new Error("read_files 需要非空 paths（也兼容 files）");
-        const results = await callNativeToolOrFallback("read_files", root, { paths: list }, async () =>
+        const results = await callNapiToolOrFallback("read_files", root, { paths: list }, async () =>
           Promise.all(list.map(async (input) => {
             const request = typeof input === "string" ? { path: input } : (input ?? {});
             const requestPath = String(request.path ?? "");
@@ -201,7 +201,7 @@ export function createNovaBatchTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = normalizeFastContextArgs(params);
-        return await callNativeToolOrFallback("fast_context", root, args, () => contextBundle(args, root));
+        return await contextBundle(args, root);
       },
     };
     tools.find_symbols = {
@@ -226,7 +226,7 @@ export function createNovaBatchTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = normalizeFindSymbolsArgs(params);
-        return await callNativeToolOrFallback("find_symbols", root, args, () => findSymbols(args, root));
+        return await findSymbols(args, root);
       },
     };
   }
@@ -268,8 +268,8 @@ export function createNovaBatchTools(cwd, options = {}) {
       },
       async execute({ files }) {
         const list = Array.isArray(files) ? files : [];
-        return JSON.stringify(await callNativeToolOrFallback("edit_files", root, { files: list }, async () => {
-        const grouped = new Map();
+        return JSON.stringify(await callNapiToolOrFallback("edit_files", root, { files: list }, async () => {
+          const grouped = new Map();
         for (const file of list) {
           const requestPath = String(file?.path ?? "");
           const target = resolveInputPath(root, requestPath);
@@ -302,11 +302,11 @@ export function createNovaBatchTools(cwd, options = {}) {
           const reason = writes[failed].reason;
           throw reason instanceof Error ? reason : new Error(String(reason));
         }
-        return {
-          message: `已并行智能编辑 ${prepared.length} 个文件`,
-          paths: prepared.map((file) => file.path),
-          matches: prepared.map((file) => ({ path: file.path, edits: file.matches })),
-        };
+          return {
+            message: `已并行智能编辑 ${prepared.length} 个文件`,
+            paths: prepared.map((file) => file.path),
+            matches: prepared.map((file) => ({ path: file.path, edits: file.matches })),
+          };
         }));
       },
     };

@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
-import { callNativeToolOrFallback } from "./nova-native-tools.mjs";
+import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 2000;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -107,7 +107,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
       async execute({ paths }) {
         const list = Array.isArray(paths) ? paths : [];
-        const results = await callNativeToolOrFallback("read_files", root, { paths: list }, async () =>
+        const results = await callNapiToolOrFallback("read_files", root, { paths: list }, async () =>
           Promise.all(list.map(async (input) => {
             const request = typeof input === "string" ? { path: input } : (input ?? {});
             const requestPath = String(request.path ?? "");
@@ -142,7 +142,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = params ?? {};
-        return await callNativeToolOrFallback("fast_context", root, args, () => contextBundle(args, root));
+        return await contextBundle(args, root);
       },
     },
     find_symbols: {
@@ -155,7 +155,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = params ?? {};
-        return await callNativeToolOrFallback("find_symbols", root, args, () => findSymbols(args, root));
+        return await findSymbols(args, root);
       },
     },
     } : {}),
