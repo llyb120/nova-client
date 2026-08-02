@@ -334,14 +334,19 @@ test("fast_context: task 描述提词可独立检索命中", async () => {
   }
 });
 
-test("fast_context: 中文 task 可独立提词检索命中", async () => {
+test("fast_context: 中文 task 用通用 n-gram 检索，不依赖限定词表", async () => {
   const dir = await fixture({
     "src/settings.ts": "export const 设置面板 = { label: '快速上下文开关' };\n",
+    "src/support.ts": "export const 支持中心 = { label: '问题反馈处理器' };\n",
   });
   try {
-    const out = await contextBundle({ task: "给设置面板增加一个快速上下文开关" }, dir);
-    assert.match(out, /export const 设置面板/);
-    assert.match(out, /快速上下文开关/);
+    const settings = await contextBundle({ task: "给设置面板增加一个快速上下文开关" }, dir);
+    assert.match(settings, /export const 设置面板/);
+    assert.match(settings, /快速上下文开关/);
+
+    const domainWords = await contextBundle({ task: "检查支持中心的问题反馈处理器" }, dir);
+    assert.match(domainWords, /export const 支持中心/);
+    assert.match(domainWords, /问题反馈处理器/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -1588,70 +1588,39 @@ fn is_han(value: char) -> bool {
     )
 }
 
-fn trim_cjk_task_phrase(value: &str) -> String {
-    const PREFIX: &[char] = &['请', '给', '把', '将', '在', '对', '为', '从', '让'];
-    const SUFFIX: &[char] = &['的', '中', '里', '上', '下', '内', '外', '吗', '呢', '吧'];
-    value
-        .trim_start_matches(PREFIX)
-        .trim_end_matches(SUFFIX)
-        .to_string()
-}
-
 fn task_tokens(task: &str) -> Vec<String> {
+    const MAX_TASK_TOKENS: usize = 1250;
+    const CJK_NGRAM_MIN: usize = 2;
+    const CJK_NGRAM_MAX: usize = 5;
     static ASCII_TOKEN: OnceLock<Regex> = OnceLock::new();
-    const CJK_STOP: &[&str] = &[
-        "请帮我",
-        "帮我",
-        "添加",
-        "增加",
-        "新增",
-        "修改",
-        "实现",
-        "处理",
-        "支持",
-        "调整",
-        "修复",
-        "优化",
-        "重构",
-        "一个",
-        "这个",
-        "目前",
-        "是否",
-        "对于",
-        "功能",
-        "问题",
-    ];
     let token_re = ASCII_TOKEN.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]{3,}").unwrap());
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut add = |token: String| {
         let lower = token.to_lowercase();
-        if !token.is_empty() && out.len() < 5 && !stop_word(&lower) && seen.insert(lower) {
+        if !token.is_empty()
+            && out.len() < MAX_TASK_TOKENS
+            && !stop_word(&lower)
+            && seen.insert(lower)
+        {
             out.push(token);
         }
     };
     for found in token_re.find_iter(task) {
         add(found.as_str().to_string());
     }
-    let mut cleaned = task.to_string();
-    for word in CJK_STOP {
-        cleaned = cleaned.replace(word, " ");
-    }
-    let mut phrase = String::new();
-    let flush = |phrase: &mut String, add: &mut dyn FnMut(String)| {
-        let value = trim_cjk_task_phrase(phrase);
+    let mut phrase = Vec::new();
+    let flush = |phrase: &mut Vec<char>, add: &mut dyn FnMut(String)| {
+        if phrase.len() >= CJK_NGRAM_MIN {
+            for size in (CJK_NGRAM_MIN..=CJK_NGRAM_MAX.min(phrase.len())).rev() {
+                for chars in phrase.windows(size) {
+                    add(chars.iter().collect());
+                }
+            }
+        }
         phrase.clear();
-        let chars = value.chars().collect::<Vec<_>>();
-        if chars.len() < 2 {
-            return;
-        }
-        add(value);
-        if chars.len() > 5 {
-            add(chars[..5].iter().collect());
-            add(chars[chars.len() - 5..].iter().collect());
-        }
     };
-    for ch in cleaned.chars() {
+    for ch in task.chars() {
         if is_han(ch) {
             phrase.push(ch);
         } else {
@@ -3339,11 +3308,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     #[test]
-    fn chinese_task_extracts_searchable_phrases() {
-        assert_eq!(
-            task_tokens("给设置面板增加一个快速上下文开关"),
-            vec!["设置面板", "快速上下文开关", "快速上下文", "上下文开关"]
-        );
+    fn chinese_task_extracts_generic_ngrams_without_stop_words() {
+        let tokens = task_tokens("检查支持中心的问题反馈处理器");
+        assert!(tokens.iter().any(|token| token == "支持中心"));
+        assert!(tokens.iter().any(|token| token == "问题反馈"));
+        assert!(tokens.iter().any(|token| token == "处理器"));
+        assert!(tokens.len() <= 1250);
     }
 
     #[test]
