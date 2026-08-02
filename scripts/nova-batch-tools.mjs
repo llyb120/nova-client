@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
 import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
+import { callContextToolOrLocal } from "./nova-context-client.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 2000;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -201,7 +202,7 @@ export function createNovaBatchTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = normalizeFastContextArgs(params);
-        return await contextBundle(args, root);
+        return await callContextToolOrLocal("fast_context", root, args, () => contextBundle(args, root));
       },
     };
     tools.find_symbols = {
@@ -226,7 +227,7 @@ export function createNovaBatchTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = normalizeFindSymbolsArgs(params);
-        return await findSymbols(args, root);
+        return await callContextToolOrLocal("find_symbols", root, args, () => findSymbols(args, root));
       },
     };
   }

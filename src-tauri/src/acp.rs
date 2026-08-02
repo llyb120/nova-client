@@ -775,6 +775,14 @@ impl AcpManager {
         // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 不覆盖）
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
         cmd.envs(&self.launch_env);
+        {
+            let state = self.app.state::<AppState>();
+            cmd.env(
+                "NOVA_CONTEXT_SERVICE_ENDPOINT",
+                state.context_service.endpoint(),
+            )
+            .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token());
+        }
         // 微型 GUI helper 统一覆盖各后端绕过父进程 flags 的 cmd/powershell/pwsh 孙进程。
         #[cfg(windows)]
         if self.app.state::<AppState>().windows_shell_shim_enabled {
@@ -2941,6 +2949,8 @@ fn devin_nova_tools_config(
     cwd: &str,
     fast_context: bool,
     read_only: bool,
+    context_endpoint: &str,
+    context_token: &str,
 ) -> Value {
     let mut env = serde_json::Map::new();
     env.insert(
@@ -2948,6 +2958,14 @@ fn devin_nova_tools_config(
         Value::String(if fast_context { "1" } else { "0" }.into()),
     );
     env.insert("NOVA_TOOLS_CWD".into(), Value::String(cwd.into()));
+    env.insert(
+        "NOVA_CONTEXT_SERVICE_ENDPOINT".into(),
+        Value::String(context_endpoint.into()),
+    );
+    env.insert(
+        "NOVA_CONTEXT_SERVICE_TOKEN".into(),
+        Value::String(context_token.into()),
+    );
     if read_only {
         env.insert("NOVA_TOOLS_READ_ONLY".into(), Value::String("1".into()));
     }
@@ -2993,7 +3011,16 @@ fn prepare_devin_nova_tools_config(
     let config_dir = launch_dir.join(".devin");
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("创建 Devin MCP 配置目录失败：{e}"))?;
-    let config = devin_nova_tools_config(&node, &script, cwd, fast_context, read_only);
+    let state = app.state::<AppState>();
+    let config = devin_nova_tools_config(
+        &node,
+        &script,
+        cwd,
+        fast_context,
+        read_only,
+        state.context_service.endpoint(),
+        state.context_service.token(),
+    );
     let bytes = serde_json::to_vec_pretty(&config)
         .map_err(|e| format!("序列化 Devin MCP 配置失败：{e}"))?;
     let path = config_dir.join("config.local.json");
@@ -3016,12 +3043,19 @@ mod nova_tools_config_tests {
             "D:/repo",
             true,
             true,
+            "test-endpoint",
+            "test-token",
         );
         let server = &config["mcpServers"]["nova-tools"];
         assert_eq!(server["transport"], "stdio");
         assert_eq!(server["env"]["NOVA_TOOLS_CWD"], "D:/repo");
         assert_eq!(server["env"]["NOVA_FAST_CONTEXT"], "1");
         assert_eq!(server["env"]["NOVA_TOOLS_READ_ONLY"], "1");
+        assert_eq!(
+            server["env"]["NOVA_CONTEXT_SERVICE_ENDPOINT"],
+            "test-endpoint"
+        );
+        assert_eq!(server["env"]["NOVA_CONTEXT_SERVICE_TOKEN"], "test-token");
     }
 
     #[test]

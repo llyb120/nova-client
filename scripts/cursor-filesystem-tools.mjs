@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
 import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
+import { callContextToolOrLocal } from "./nova-context-client.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 2000;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -142,7 +143,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = params ?? {};
-        return await contextBundle(args, root);
+        return await callContextToolOrLocal("fast_context", root, args, () => contextBundle(args, root));
       },
     },
     find_symbols: {
@@ -155,7 +156,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = params ?? {};
-        return await findSymbols(args, root);
+        return await callContextToolOrLocal("find_symbols", root, args, () => findSymbols(args, root));
       },
     },
     } : {}),

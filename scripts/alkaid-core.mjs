@@ -21,6 +21,7 @@ import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
+import { callContextToolOrLocal } from "./nova-context-client.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 2000;
 /** Match pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -558,7 +559,8 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
         maxBytes: Type.Optional(Type.Integer({ minimum: 8192, maximum: 65536, description: "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" })),
       }),
       async execute(_id, params) {
-        return textResult(await contextBundle(params ?? {}, root));
+        const args = params ?? {};
+        return textResult(await callContextToolOrLocal("fast_context", root, args, () => contextBundle(args, root)));
       },
     },
     {
@@ -568,7 +570,8 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
         names: Type.Array(Type.String(), { minItems: 1, description: "符号名列表" }),
       }),
       async execute(_id, params) {
-        return textResult(await findSymbols(params ?? {}, root));
+        const args = params ?? {};
+        return textResult(await callContextToolOrLocal("find_symbols", root, args, () => findSymbols(args, root)));
       },
     },
   );

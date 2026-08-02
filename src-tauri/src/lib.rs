@@ -5,6 +5,7 @@ mod cli_manager;
 mod clues;
 mod codex;
 mod codex_radar;
+mod context_service;
 mod credential_roaming;
 mod employees;
 mod gitwt;
@@ -87,6 +88,8 @@ pub struct AppState {
     /// 共享标记账本：员工协作时对外部实体（需求单等）做去重/互斥/接力
     pub marks: Mutex<marks::MarkStore>,
     pub vectors: Mutex<semantic::VectorStore>,
+    /// 全部 Node bridge 共用的唯一 fast_context/find_symbols JS 进程。
+    pub(crate) context_service: context_service::ContextService,
     pub acp: Arc<AcpManager>,
     /// OpenCode 官方 SDK 对应的 HTTP API 后端，不经过 ACP。
     pub opencodeplus: Arc<OpenCodeSdkManager>,
@@ -5311,6 +5314,7 @@ pub fn run() {
             let notices = notice::NoticeStore::load(&dir);
             let marks = marks::MarkStore::load(&dir);
             let vectors = semantic::VectorStore::load(&dir);
+            let context_service = context_service::ContextService::start(&dir)?;
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
@@ -5339,6 +5343,7 @@ pub fn run() {
                 notices: Mutex::new(notices),
                 marks: Mutex::new(marks),
                 vectors: Mutex::new(vectors),
+                context_service,
                 acp,
                 opencodeplus,
                 codex,
