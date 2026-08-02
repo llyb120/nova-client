@@ -250,6 +250,73 @@ test("fast_context: 大符号体默认整给, 无 partial; 预算放不下时降
   }
 });
 
+test("fast_context: 修改计划会从目标体反向检索错误处理方", async () => {
+  const filler = Array.from({ length: 130 }, (_, i) => `export const PAD_${i} = ${i};`).join("\n");
+  const dir = await fixture({
+    "src/auth/refreshSession.ts": [
+      "import { SessionExpiredError } from './errors';",
+      "export function refreshSession(token) {",
+      "  if (!token) throw new SessionExpiredError('expired');",
+      "  return token;",
+      "}",
+      filler,
+    ].join("\n"),
+    "src/auth/errors.ts": "export class SessionExpiredError extends Error {}\n",
+    "src/ui/sessionBoundary.ts": [
+      "import { SessionExpiredError } from '../auth/errors';",
+      "export function handleSessionFailure(error) {",
+      "  if (error instanceof SessionExpiredError) return 'login';",
+      "  throw error;",
+      "}",
+    ].join("\n"),
+  });
+  try {
+    const plain = await contextBundle({ keywords: ["refreshSession"] }, dir);
+    assert.doesNotMatch(plain, /export function handleSessionFailure/);
+    const planned = await contextBundle({
+      keywords: ["refreshSession"],
+      task: "修改 refreshSession 的失败和错误处理，保持会话过期行为",
+    }, dir);
+    assert.match(planned, /export function handleSessionFailure/);
+    assert.match(planned, /SessionExpiredError/);
+    assert.match(planned, /## PROOF \(任务闭包检查\)/);
+    assert.match(planned, /错误处理: 已闭合/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("fast_context: 任务闭包会展开二层导入依赖并输出缺口证明", async () => {
+  const filler = Array.from({ length: 120 }, (_, i) => `export const PAD_${i} = ${i};`).join("\n");
+  const dir = await fixture({
+    "src/target.ts": [
+      "import { buildEnvelope } from './helper';",
+      "export function targetFlow(value) { return buildEnvelope(value); }",
+      filler,
+    ].join("\n"),
+    "src/helper.ts": [
+      "import { ResultEnvelope } from './types';",
+      "export function buildEnvelope(value) { return new ResultEnvelope(value); }",
+    ].join("\n"),
+    "src/types.ts": [
+      "export class ResultEnvelope {",
+      "  constructor(value) { this.value = value; }",
+      "}",
+    ].join("\n"),
+  });
+  try {
+    const out = await contextBundle({ keywords: ["targetFlow"] }, dir);
+    assert.match(out, /buildEnvelope/);
+    assert.match(out, /ResultEnvelope/);
+    assert.match(out, /\[dep2\]/);
+    assert.match(out, /## PROOF \(任务闭包检查\)/);
+    assert.match(out, /目标定义: 已闭合/);
+    assert.match(out, /依赖定义: 已闭合/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("fast_context: task 描述提词可独立检索命中", async () => {
   const dir = await fixture({
     "src/pipe.ts": [

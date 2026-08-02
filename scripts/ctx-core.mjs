@@ -233,6 +233,40 @@ function taskTokens(task) {
   return out;
 }
 
+/** 先从任务预测会改到哪类关系，再从目标单元反向提取需要检索的符号。 */
+function retrievalPlan(task) {
+  const text = String(task ?? '').toLowerCase();
+  const has = (...words) => words.some((word) => text.includes(word));
+  return {
+    errors: has('错误', '失败', '异常', 'error', 'exception', 'fail', 'throw', 'catch'),
+    callers: has('调用方', '兼容', 'api', '返回', 'return', 'caller', '签名'),
+    tests: has('测试', '回归', 'test', 'spec'),
+    config: has('配置', '设置', 'config', 'setting', 'option'),
+    state: has('状态', '会话', '缓存', '并发', '锁', 'state', 'session', 'cache', 'concurr', 'lock', 'mutex'),
+  };
+}
+
+function planTermsFromBodies(plan, bodies, existing) {
+  const wanted = [];
+  const seen = new Set([...existing].map((term) => term.toLowerCase()));
+  const patterns = [];
+  if (plan.errors) patterns.push(/(?:Error|Exception|Failure)$/);
+  if (plan.config) patterns.push(/(?:Config|Settings|Options?)$/);
+  if (plan.state) patterns.push(/(?:State|Store|Session|Cache|Lock|Mutex|Queue)$/);
+  if (!patterns.length) return wanted;
+  for (const body of bodies) {
+    for (const match of body.matchAll(IDENT_RE)) {
+      const name = match[0];
+      const low = name.toLowerCase();
+      if (seen.has(low) || STOP.has(low) || !patterns.some((pattern) => pattern.test(name))) continue;
+      seen.add(low);
+      wanted.push(name);
+      if (wanted.length >= MAX_TASK_TOKENS) return wanted;
+    }
+  }
+  return wanted;
+}
+
 // ---------------------------------------------------------------- 单元定位
 
 /**
@@ -429,6 +463,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     .filter(Boolean))].slice(0, MAX_KEYWORDS);
   const task = String(args?.task ?? '').trim().slice(0, 300);
   const tTokens = taskTokens(task).filter((t) => !keywords.some((k) => k.toLowerCase() === t.toLowerCase()));
+  const planIntent = retrievalPlan(task);
   const wantFiles = [...new Set((Array.isArray(args?.files) ? args.files : [])
     .map((f) => String(f ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, ''))
     .filter(Boolean))].slice(0, 6);
@@ -449,7 +484,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   for (const r of rows) for (const k of terms) if (r.text.includes(k)) hitTerm.add(k);
   const missing = terms.filter((k) => !hitTerm.has(k));
   let looseKw = [];
-  if (missing.length && hitTerm.size) {
+  if (missing.length) {
     const extra = await searchText(root, missing, { ignoreCase: true });
     if (extra.length) {
       rows = rows.concat(extra);
@@ -461,27 +496,30 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   const hits = new Map();
   /** @type {Map<string, number>} */
   const kwCount = new Map();
-  for (const r of rows) {
-    let e = hits.get(r.file);
-    if (!e) {
-      e = { lns: new Map(), kws: new Set() };
-      hits.set(r.file, e);
-    }
-    if (!e.lns.has(r.ln) && e.lns.size >= MAX_HITS_PER_FILE) continue;
-    let cell = e.lns.get(r.ln);
-    if (!cell) {
-      cell = { kws: new Set(), text: r.text };
-      e.lns.set(r.ln, cell);
-    }
-    const low = r.text.toLowerCase();
-    for (const k of terms) {
-      if (r.text.includes(k) || low.includes(k.toLowerCase())) {
-        cell.kws.add(k);
-        e.kws.add(k);
-        kwCount.set(k, (kwCount.get(k) ?? 0) + 1);
+  const ingestRows = (newRows, matchTerms = terms) => {
+    for (const r of newRows) {
+      let e = hits.get(r.file);
+      if (!e) {
+        e = { lns: new Map(), kws: new Set() };
+        hits.set(r.file, e);
+      }
+      if (!e.lns.has(r.ln) && e.lns.size >= MAX_HITS_PER_FILE) continue;
+      let cell = e.lns.get(r.ln);
+      if (!cell) {
+        cell = { kws: new Set(), text: r.text };
+        e.lns.set(r.ln, cell);
+      }
+      const low = r.text.toLowerCase();
+      for (const k of matchTerms) {
+        if (r.text.includes(k) || low.includes(k.toLowerCase())) {
+          cell.kws.add(k);
+          e.kws.add(k);
+          kwCount.set(k, (kwCount.get(k) ?? 0) + 1);
+        }
       }
     }
-  }
+  };
+  ingestRows(rows);
 
   const subjectTerms = [...keywords, ...tTokens].map((t) => t.toLowerCase()).filter((t) => t.length >= 4);
   const isSubject = (file) => {
@@ -507,17 +545,42 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     priorityFiles,
     matchTerms: terms,
     mode: 'focused',
-    dependencyDepth: 1,
+    dependencyDepth: 2,
   });
 
   const missedAll = keywords.filter((k) => !kwCount.has(k));
   const seeds = seedDefs(index, keywords);
+
+  // 计划驱动二次检索：先看目标定义体，再搜索错误/配置/状态符号的处理方。
+  // 这样可找到“不引用目标函数、只处理其 Error/State/Config”的关键上下文。
+  const seedBodies = [];
+  for (const d of seeds) {
+    const src = readSource(root, index, d.file);
+    if (src) seedBodies.push(src.lines.slice(d.ln - 1, d.end).join('\n'));
+  }
+  const plannedTerms = planTermsFromBodies(planIntent, seedBodies, terms);
+  if (plannedTerms.length) {
+    const plannedRows = await searchText(root, plannedTerms);
+    terms.push(...plannedTerms);
+    ingestRows(plannedRows, plannedTerms);
+  }
+
   if (!hits.size && !wantFiles.length && !seeds.length) {
     return `# CTX @${rev}\n无命中: ${terms.join(' ')}\n提示: 换更短的符号名/字符串片段，或改用 find_symbols / grep 定位后用 read。`;
   }
 
   // ---- 文件排名
   const seedFiles = new Set(seeds.map((d) => d.file));
+  const seedNames = [...new Set(seeds.map((d) => d.name))];
+  const relationBonus = (file, e) => {
+    const referencesSeed = [...e.lns.values()].some((cell) => seedNames.some((name) => cell.text.includes(name)));
+    const callsSeed = [...e.lns.values()].some((cell) => seedNames.some((name) => cell.text.includes(`${name}(`)));
+    let bonus = 0;
+    if (planIntent.callers && callsSeed) bonus += 180;
+    if (planIntent.tests && referencesSeed && NOISE_PATH.test(file)) bonus += 220;
+    if (plannedTerms.some((term) => [...e.lns.values()].some((cell) => cell.text.includes(term)))) bonus += 140;
+    return bonus;
+  };
   // 查询词命中文件名（不含扩展名之外的 basename 子串）→ 该文件就是查询主体
   const ranked = [...hits.entries()].map(([file, e]) => {
     let s = scoreFilePrior(file);
@@ -526,6 +589,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     if (seedFiles.has(file)) s += 120;
     if (isSubject(file)) s += 600;
     if (wantFiles.includes(file)) s += 500;
+    s += relationBonus(file, e);
     return { file, e, score: s };
   }).sort((a, b) => b.score - a.score);
 
@@ -548,7 +612,10 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   // 追加后重排，保证 wantFiles > 主题文件 > 其余命中
   ranked.sort((a, b) => b.score - a.score);
 
-  let candidates = ranked.filter((r) => isCodeFile(r.file) || wantFiles.includes(r.file)).slice(0, MAX_CANDIDATES);
+  const candidateLimit = Math.min(20, MAX_CANDIDATES + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 8192) * 2);
+  const fileLimit = Math.min(12, MAX_FILES + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 16384) * 2);
+  const unitsPerFile = Math.min(8, MAX_UNITS_PER_FILE + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 16384));
+  let candidates = ranked.filter((r) => isCodeFile(r.file) || wantFiles.includes(r.file)).slice(0, candidateLimit);
   // 全是非代码文件时（配置/文档命中）也要展开，否则模型只拿到一堆位置还得自己去读
   if (!candidates.length) candidates = ranked.slice(0, 3);
 
@@ -620,6 +687,16 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     }
     for (const g of grouped.values()) {
       const size = g.end - g.ln + 1;
+      const body = src.lines.slice(g.ln - 1, g.end).join('\n');
+      const referencesSeed = seedNames.some((name) => body.includes(name));
+      const callsSeed = seedNames.some((name) => body.includes(`${name}(`));
+      const plannedRelation = plannedTerms.some((name) => body.includes(name));
+      g.role = g.tag === 'def' ? 'target'
+        : planIntent.tests && NOISE_PATH.test(file) && referencesSeed ? 'test'
+          : planIntent.errors && plannedRelation ? 'handler'
+            : planIntent.callers && callsSeed ? 'caller'
+              : 'related';
+      g.required = g.role === 'target' || g.role === 'handler' || g.role === 'caller' || g.role === 'test';
       let s = score * 0.35;
       for (const k of g.kws) s += 45 * KW_WEIGHT(kwCount.get(k) ?? 1) * (keywords.includes(k) ? 1 : 0.5);
       s += Math.min(g.hits.length, 6) * 8;
@@ -627,16 +704,19 @@ export async function contextBundle(args = {}, root = repoRoot()) {
       if (g.unit && /^(fn|method|class|type)$/.test(g.unit.kind)) s += 20;
       // task token 与单元正文的重叠度
       if (tLow.length) {
-        const body = src.lines.slice(g.ln - 1, g.end).join('\n').toLowerCase();
-        for (const t of tLow) if (body.includes(t)) s += 15;
+        const bodyLow = body.toLowerCase();
+        for (const t of tLow) if (bodyLow.includes(t)) s += 15;
       }
+      if (g.required) s += 260;
       if (size > 150) s -= (size - 150) / 8;
       if ((fileRank.get(file) ?? 9) < 2) s += 12;
       g.score = s;
+      const estimatedBytes = Math.max(96, Buffer.byteLength(body, 'utf8'));
+      g.utility = s / Math.max(1, estimatedBytes / 1024);
       units.push(g);
     }
   }
-  units.sort((a, b) => b.score - a.score);
+  units.sort((a, b) => Number(b.required) - Number(a.required) || b.utility - a.utility || b.score - a.score);
 
   // ---- 装配
   // planned 只累计代码正文的估算字节（渲染时的头/尾开销另算），避免重复计数。
@@ -749,8 +829,8 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     if (!src) continue;
     const p = plan.get(u.file);
     if (p?.full) continue;
-    if (plan.size >= MAX_FILES && !p) continue;
-    if ((p?.blocks.length ?? 0) >= MAX_UNITS_PER_FILE) continue;
+    if (plan.size >= fileLimit && !p) continue;
+    if ((p?.blocks.length ?? 0) >= unitsPerFile) continue;
     if (u.hits.length && u.hits.every((ln) => covers(u.file, ln))) continue;
 
     // 小文件直接整给
@@ -771,7 +851,8 @@ export async function contextBundle(args = {}, root = repoRoot()) {
       if (u.unit) pushSig(u.file, u.ln, u.unit.sig);
       continue;
     }
-    planFile(u.file, 'edit').blocks.push({ ranges, label: u.label, tag: u.tag });
+    const outputTag = u.role === 'target' ? 'def' : u.role === 'related' ? u.tag : u.role;
+    planFile(u.file, 'edit').blocks.push({ ranges, label: u.label, tag: outputTag, score: u.score, required: u.required });
     take(cost, lines);
   }
 
@@ -784,7 +865,24 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     for (const [a, b] of shownRanges(file)) unitTexts.push({ file, text: src.lines.slice(a - 1, b).join('\n') });
     for (const s of src.syms) if (covers(file, s.ln)) ownedKeys.add(`${file}:${s.ln}`);
   }
-  const deps = collectDeps(index, unitTexts, ownedKeys, new Set([...keywords, ...tTokens]));
+  const depQueue = collectDeps(index, unitTexts, ownedKeys, new Set([...keywords, ...tTokens]));
+  const deps = [];
+  const depSeen = new Set();
+  for (let depth = 0; depth < 2 && depQueue.length; depth++) {
+    const wave = depQueue.splice(0);
+    const nextTexts = [];
+    for (const d of wave) {
+      const key = `${d.def.file}:${d.def.ln}`;
+      if (depSeen.has(key) || (depth > 0 && d.def.exp === false)) continue;
+      depSeen.add(key);
+      deps.push({ ...d, depth });
+      const src = readSource(root, index, d.def.file);
+      if (src) nextTexts.push({ file: d.def.file, text: src.lines.slice(d.def.ln - 1, d.def.end).join('\n') });
+    }
+    if (depth < 1 && nextTexts.length) {
+      for (const d of collectDeps(index, nextTexts, new Set([...ownedKeys, ...depSeen]), new Set([...keywords, ...tTokens]))) depQueue.push(d);
+    }
+  }
   for (const d of deps) {
     const file = d.def.file;
     if (plan.get(file)?.full) continue;
@@ -806,7 +904,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
       pushSig(file, d.def.ln, d.def.sig);
       continue;
     }
-    planFile(file, 'dep').blocks.push({ ranges, label: `${d.def.kind} ${d.name}`, tag: 'dep' });
+    planFile(file, 'dep').blocks.push({ ranges, label: `${d.def.kind} ${d.name}`, tag: d.depth ? 'dep2' : 'dep', score: 120 - d.depth * 30, required: d.depth === 0 });
     take(cost, lines);
   }
 
@@ -842,8 +940,13 @@ export async function contextBundle(args = {}, root = repoRoot()) {
         plan.delete(file);
         return true;
       }
-      const block = p.blocks.pop();
-      if (!block) continue;
+      const removable = p.blocks
+        .map((block, index) => ({ block, index }))
+        .filter(({ block }) => !block.required)
+        .sort((a, b) => (a.block.score ?? 0) - (b.block.score ?? 0))[0]
+        ?? p.blocks.map((block, index) => ({ block, index })).sort((a, b) => (a.block.score ?? 0) - (b.block.score ?? 0))[0];
+      if (!removable) continue;
+      const [block] = p.blocks.splice(removable.index, 1);
       downgradeRangesToSig(file, block.ranges);
       if (!p.blocks.length) plan.delete(file);
       return true;
@@ -903,7 +1006,6 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   }
 
   // ---- IMPACT（向上）：未展示的引用/调用行，单行清单
-  const seedNames = [...new Set(seeds.map((d) => d.name))];
   const kwSet = new Set(keywords);
   const refs = [];
   let totalRefs = 0;
@@ -923,6 +1025,21 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     for (const r of refs) push(r);
     push('');
   }
+  const proof = [];
+  const targetCount = units.filter((u) => u.role === 'target' && covers(u.file, u.ln)).length;
+  const callerCount = units.filter((u) => u.role === 'caller' && covers(u.file, u.ln)).length;
+  const handlerCount = units.filter((u) => u.role === 'handler' && covers(u.file, u.ln)).length;
+  const testCount = units.filter((u) => u.role === 'test' && covers(u.file, u.ln)).length;
+  const depCount = [...plan.values()].reduce((n, p) => n + (p.section === 'dep' ? p.blocks.length : 0), 0);
+  proof.push(`目标定义: ${targetCount ? `已闭合 ${targetCount}` : '缺口'}`);
+  proof.push(`依赖定义: ${depCount ? `已闭合 ${depCount}` : '未发现'}`);
+  if (planIntent.errors) proof.push(`错误处理: ${handlerCount ? `已闭合 ${handlerCount}` : '缺口'}`);
+  if (planIntent.callers) proof.push(`关键调用方: ${callerCount ? `已闭合 ${callerCount}` : '缺口'}`);
+  if (planIntent.tests) proof.push(`相关测试: ${testCount ? `已闭合 ${testCount}` : '缺口'}`);
+  push('## PROOF (任务闭包检查)');
+  for (const item of proof) push(item);
+  push('');
+
   if (sigList.length) {
     push('## SIG (预算内放不下或最终回退的定义, 仅签名)');
     for (const d of sigList) push(`${d.file}:${d.ln} ${d.sig}`);
@@ -940,7 +1057,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   const body = out.join('\n');
   const shownLines = order.reduce((sum, file) => sum + shownRanges(file).reduce((n, [a, b]) => n + b - a + 1, 0), 0);
   head[0] += `  ${order.length}文件/${blockCount}块 ${shownLines}行 ${(Buffer.byteLength(body, 'utf8') / 1024).toFixed(1)}KB`;
-  head.push('# 契约: 以上均为完整单元/完整文件，可直接据此编辑；已展示行段禁止重读。SIG/IMPACT 仅索引，确需其函数体时按 path:ln 精确补读。');
+  head.push('# 契约: 已按修改计划构建符号关系、计算任务闭包并做缺口证明；正文均为完整单元/完整文件。已展示行段禁止重读。');
   for (const n of notes) head.push(`# ${n}`);
   head.push('');
 

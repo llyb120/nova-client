@@ -104,6 +104,8 @@ struct Block {
     end: usize,
     label: String,
     tag: &'static str,
+    score: f64,
+    required: bool,
 }
 
 #[derive(Clone)]
@@ -128,6 +130,9 @@ struct UnitCandidate {
     keywords: HashSet<String>,
     unit: Option<Symbol>,
     seed_weight: usize,
+    role: &'static str,
+    required: bool,
+    utility: f64,
 }
 
 static MEMO: OnceLock<Mutex<HashMap<String, DiskCache>>> = OnceLock::new();
@@ -1383,6 +1388,87 @@ fn noise_path(file: &str) -> bool {
         .is_match(file)
 }
 
+#[derive(Default)]
+struct RetrievalPlan {
+    errors: bool,
+    callers: bool,
+    tests: bool,
+    config: bool,
+    state: bool,
+}
+
+fn retrieval_plan(task: &str) -> RetrievalPlan {
+    let text = task.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|word| text.contains(word));
+    RetrievalPlan {
+        errors: has(&[
+            "错误",
+            "失败",
+            "异常",
+            "error",
+            "exception",
+            "fail",
+            "throw",
+            "catch",
+        ]),
+        callers: has(&["调用方", "兼容", "api", "返回", "return", "caller", "签名"]),
+        tests: has(&["测试", "回归", "test", "spec"]),
+        config: has(&["配置", "设置", "config", "setting", "option"]),
+        state: has(&[
+            "状态", "会话", "缓存", "并发", "锁", "state", "session", "cache", "concurr", "lock",
+            "mutex",
+        ]),
+    }
+}
+
+fn plan_terms_from_bodies(
+    plan: &RetrievalPlan,
+    bodies: &[String],
+    existing: &[String],
+) -> Vec<String> {
+    if !plan.errors && !plan.config && !plan.state {
+        return Vec::new();
+    }
+    static IDENT: OnceLock<Regex> = OnceLock::new();
+    let ident = IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*").unwrap());
+    let mut seen = existing
+        .iter()
+        .map(|term| term.to_lowercase())
+        .collect::<HashSet<_>>();
+    let mut out = Vec::new();
+    for body in bodies {
+        for found in ident.find_iter(body) {
+            let name = found.as_str();
+            let lower = name.to_lowercase();
+            let wanted = (plan.errors
+                && (name.ends_with("Error")
+                    || name.ends_with("Exception")
+                    || name.ends_with("Failure")))
+                || (plan.config
+                    && (name.ends_with("Config")
+                        || name.ends_with("Settings")
+                        || name.ends_with("Option")
+                        || name.ends_with("Options")))
+                || (plan.state
+                    && (name.ends_with("State")
+                        || name.ends_with("Store")
+                        || name.ends_with("Session")
+                        || name.ends_with("Cache")
+                        || name.ends_with("Lock")
+                        || name.ends_with("Mutex")
+                        || name.ends_with("Queue")));
+            if !wanted || stop_word(&lower) || !seen.insert(lower) {
+                continue;
+            }
+            out.push(name.to_string());
+            if out.len() >= 5 {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 fn score_path(file: &str) -> i64 {
     let mut score = 0;
     if !is_code_file(file) {
@@ -1906,6 +1992,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             break;
         }
     }
+    let plan_intent = retrieval_plan(&task);
     let mut file_seen = HashSet::new();
     let files: Vec<String> = params
         .get("files")
@@ -1962,7 +2049,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .cloned()
         .collect::<Vec<_>>();
     let mut loose_kw = Vec::new();
-    if !missing.is_empty() && !exact_hits.is_empty() {
+    if !missing.is_empty() {
         let extra = search_text(root, &missing, true, false, &all);
         for term in &missing {
             let lower = term.to_lowercase();
@@ -2095,7 +2182,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     }
     let wanted: HashSet<_> = candidates.iter().map(|value| value.0.clone()).collect();
     let stage = Instant::now();
-    let (index, _) = build_index(root, Some(&wanted), 1, Some(&all));
+    let (index, _) = build_index(root, Some(&wanted), 2, Some(&all));
     trace("fast_context.index", stage);
     let stage = Instant::now();
     let mut def_names = index.defs.keys().cloned().collect::<Vec<_>>();
@@ -2130,9 +2217,52 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             }
         }
     }
+    // 计划驱动二次检索：先看目标定义体，再搜索错误/配置/状态符号的处理方。
+    let seed_bodies = seeds
+        .iter()
+        .filter_map(|(definition, _, _)| {
+            source(root, &definition.file, index.files.get(&definition.file))
+                .map(|src| src.lines[definition.symbol.ln - 1..definition.symbol.end].join("\n"))
+        })
+        .collect::<Vec<_>>();
+    let planned_terms = plan_terms_from_bodies(&plan_intent, &seed_bodies, &terms);
+    if !planned_terms.is_empty() {
+        let planned_rows = search_text(root, &planned_terms, false, false, &all);
+        terms.extend(planned_terms.iter().cloned());
+        for row in planned_rows {
+            if !hit_files.contains_key(&row.file) {
+                hit_order.push(row.file.clone());
+            }
+            let lower = row.text.to_lowercase();
+            for term in &planned_terms {
+                if row.text.contains(term) || lower.contains(&term.to_lowercase()) {
+                    file_keywords
+                        .entry(row.file.clone())
+                        .or_default()
+                        .insert(term.clone());
+                    line_keywords
+                        .entry((row.file.clone(), row.ln))
+                        .or_default()
+                        .insert(term.clone());
+                    *keyword_counts.entry(term.clone()).or_default() += 1;
+                }
+            }
+            let file_rows = hit_files.entry(row.file.clone()).or_default();
+            if !file_rows.iter().any(|existing| existing.ln == row.ln)
+                && file_rows.len() < MAX_HITS_PER_FILE
+            {
+                file_rows.push(row);
+            }
+        }
+    }
+
     let seed_files = seeds
         .iter()
         .map(|(definition, _, _)| definition.file.clone())
+        .collect::<HashSet<_>>();
+    let seed_names = seeds
+        .iter()
+        .map(|(_, name, _)| name.clone())
         .collect::<HashSet<_>>();
     let mut ordered_seed_files = seed_files.iter().cloned().collect::<Vec<_>>();
     ordered_seed_files.sort();
@@ -2163,6 +2293,26 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             if files.contains(file) {
                 score += 500.0;
             }
+            let references_seed = rows
+                .iter()
+                .any(|row| seed_names.iter().any(|name| row.text.contains(name)));
+            let calls_seed = rows.iter().any(|row| {
+                seed_names
+                    .iter()
+                    .any(|name| row.text.contains(&format!("{name}(")))
+            });
+            if plan_intent.callers && calls_seed {
+                score += 180.0;
+            }
+            if plan_intent.tests && references_seed && noise_path(file) {
+                score += 220.0;
+            }
+            if rows
+                .iter()
+                .any(|row| planned_terms.iter().any(|term| row.text.contains(term)))
+            {
+                score += 140.0;
+            }
             (file.clone(), score)
         })
         .collect::<Vec<_>>();
@@ -2182,10 +2332,15 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         }
     }
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let candidate_limit =
+        (MAX_CANDIDATES + hard.saturating_sub(DEFAULT_HARD_BYTES) / 8192 * 2).min(20);
+    let file_limit = (MAX_FILES + hard.saturating_sub(DEFAULT_HARD_BYTES) / 16384 * 2).min(12);
+    let units_per_file =
+        (MAX_UNITS_PER_FILE + hard.saturating_sub(DEFAULT_HARD_BYTES) / 16384).min(8);
     let mut final_candidates = ranked
         .iter()
         .filter(|(file, _)| is_code_file(file) || files.contains(file))
-        .take(MAX_CANDIDATES)
+        .take(candidate_limit)
         .cloned()
         .collect::<Vec<_>>();
     if final_candidates.is_empty() {
@@ -2246,6 +2401,9 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                         keywords: HashSet::new(),
                         unit: owned_unit,
                         seed_weight: 0,
+                        role: "related",
+                        required: false,
+                        utility: 0.0,
                     },
                 ));
                 grouped.len() - 1
@@ -2293,6 +2451,9 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                         keywords: HashSet::new(),
                         unit: Some(unit),
                         seed_weight: 0,
+                        role: "related",
+                        required: false,
+                        utility: 0.0,
                     },
                 ));
                 grouped.len() - 1
@@ -2302,6 +2463,24 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         }
         for (_, mut unit) in grouped {
             let size = unit.end - unit.start + 1;
+            let body = source.lines[unit.start - 1..unit.end].join("\n");
+            let references_seed = seed_names.iter().any(|name| body.contains(name));
+            let calls_seed = seed_names
+                .iter()
+                .any(|name| body.contains(&format!("{name}(")));
+            let planned_relation = planned_terms.iter().any(|name| body.contains(name));
+            unit.role = if unit.tag == "def" {
+                "target"
+            } else if plan_intent.tests && noise_path(file) && references_seed {
+                "test"
+            } else if plan_intent.errors && planned_relation {
+                "handler"
+            } else if plan_intent.callers && calls_seed {
+                "caller"
+            } else {
+                "related"
+            };
+            unit.required = matches!(unit.role, "target" | "handler" | "caller" | "test");
             let mut score = *file_score * 0.35;
             for keyword in &unit.keywords {
                 let count = *keyword_counts.get(keyword).unwrap_or(&1);
@@ -2330,14 +2509,15 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 score += 20.0;
             }
             if !task_tokens.is_empty() {
-                let body = source.lines[unit.start - 1..unit.end]
-                    .join("\n")
-                    .to_lowercase();
+                let body_lower = body.to_lowercase();
                 for token in &task_tokens {
-                    if body.contains(token) {
+                    if body_lower.contains(token) {
                         score += 15.0;
                     }
                 }
+            }
+            if unit.required {
+                score += 260.0;
             }
             if size > 150 {
                 score -= (size - 150) as f64 / 8.0;
@@ -2346,13 +2526,24 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 score += 12.0;
             }
             unit.score = score;
+            let estimated_bytes = body.len().max(96) as f64;
+            unit.utility = score / (estimated_bytes / 1024.0).max(1.0);
             units.push(unit);
         }
     }
     units.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.required
+            .cmp(&a.required)
+            .then_with(|| {
+                b.utility
+                    .partial_cmp(&a.utility)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     let mut plans = Vec::<PlannedFile>::new();
     let mut sigs = Vec::<(String, usize, String)>::new();
@@ -2507,11 +2698,17 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 end: symbol.end.min(source.lines.len()),
                 label: unit_label(&chain, &symbol),
                 tag: "hit",
+                score: 0.0,
+                required: false,
             });
             used += lines;
             used_bytes += cost;
         }
     }
+    let closure_roles = units
+        .iter()
+        .map(|unit| (unit.file.clone(), unit.start, unit.role))
+        .collect::<Vec<_>>();
     for unit in units {
         let Some(source) = sources.get(&unit.file).cloned() else {
             continue;
@@ -2520,10 +2717,10 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         if plan_index.is_some_and(|index| plans[index].full) {
             continue;
         }
-        if plan_index.is_none() && plans.len() >= MAX_FILES {
+        if plan_index.is_none() && plans.len() >= file_limit {
             continue;
         }
-        if plan_index.is_some_and(|index| plans[index].blocks.len() >= MAX_UNITS_PER_FILE) {
+        if plan_index.is_some_and(|index| plans[index].blocks.len() >= units_per_file) {
             continue;
         }
         if !unit.hits.is_empty()
@@ -2579,13 +2776,19 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             start: unit.start,
             end: unit.end.min(source.lines.len()),
             label: unit.label,
-            tag: unit.tag,
+            tag: match unit.role {
+                "target" => "def",
+                "related" => unit.tag,
+                role => role,
+            },
+            score: unit.score,
+            required: unit.required,
         });
         used += lines;
         used_bytes += cost;
     }
     let original_count = plans.len();
-    let owned: HashSet<_> = plans
+    let mut owned: HashSet<_> = plans
         .iter()
         .flat_map(|p| {
             p.source
@@ -2600,66 +2803,73 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .chain(terms.iter().skip(keywords.len()))
         .cloned()
         .collect::<HashSet<_>>();
-    let deps = collect_dependencies(&index, &plans, &owned, &keyword_set);
-    for (dep_name, def) in deps {
-        if plans
-            .iter()
-            .filter(|p| p.section == "dep")
-            .map(|p| &p.file)
-            .collect::<HashSet<_>>()
-            .len()
-            >= MAX_DEP_FILES
-            && !plans.iter().any(|p| p.file == def.file)
-        {
-            push_sig(&mut sigs, &def.file, def.symbol.ln, &def.symbol.sig);
-            continue;
-        }
-        let Some(src) = source(root, &def.file, index.files.get(&def.file)) else {
-            continue;
-        };
-        let n = def.symbol.end - def.symbol.ln + 1;
-        let bytes = range_cost(&src, def.symbol.ln, def.symbol.end);
-        if used + n > budget || used_bytes + bytes > soft_bytes {
-            push_sig(&mut sigs, &def.file, def.symbol.ln, &def.symbol.sig);
-            continue;
-        }
-        used += n;
-        used_bytes += bytes;
-        if let Some(plan) = plans.iter_mut().find(|p| p.file == def.file) {
-            plan.blocks.push(Block {
-                start: def.symbol.ln,
-                end: def.symbol.end,
-                label: format!("{} {}", def.symbol.kind, dep_name),
-                tag: "dep",
-            });
-        } else {
-            plans.push(PlannedFile {
-                file: def.file,
-                source: src,
-                section: "dep",
-                full: false,
-                blocks: vec![Block {
+    let mut dep_seen = HashSet::<(String, usize)>::new();
+    for dep_depth in 0..2 {
+        let deps = collect_dependencies(&index, &plans, &owned, &keyword_set);
+        let mut added = false;
+        for (dep_name, def) in deps {
+            let dep_key = (def.file.clone(), def.symbol.ln);
+            if dep_seen.contains(&dep_key) || (dep_depth > 0 && !def.symbol.exp) {
+                continue;
+            }
+            dep_seen.insert(dep_key.clone());
+            if plans
+                .iter()
+                .filter(|p| p.section == "dep")
+                .map(|p| &p.file)
+                .collect::<HashSet<_>>()
+                .len()
+                >= MAX_DEP_FILES
+                && !plans.iter().any(|p| p.file == def.file)
+            {
+                push_sig(&mut sigs, &def.file, def.symbol.ln, &def.symbol.sig);
+                continue;
+            }
+            let Some(src) = source(root, &def.file, index.files.get(&def.file)) else {
+                continue;
+            };
+            let n = def.symbol.end - def.symbol.ln + 1;
+            let bytes = range_cost(&src, def.symbol.ln, def.symbol.end);
+            if used + n > budget || used_bytes + bytes > soft_bytes {
+                push_sig(&mut sigs, &def.file, def.symbol.ln, &def.symbol.sig);
+                continue;
+            }
+            used += n;
+            used_bytes += bytes;
+            if let Some(plan) = plans.iter_mut().find(|p| p.file == def.file) {
+                plan.blocks.push(Block {
                     start: def.symbol.ln,
                     end: def.symbol.end,
                     label: format!("{} {}", def.symbol.kind, dep_name),
-                    tag: "dep",
-                }],
-                rank: 99,
-            });
+                    tag: if dep_depth == 0 { "dep" } else { "dep2" },
+                    score: 120.0 - dep_depth as f64 * 30.0,
+                    required: dep_depth == 0,
+                });
+            } else {
+                plans.push(PlannedFile {
+                    file: def.file,
+                    source: src,
+                    section: "dep",
+                    full: false,
+                    blocks: vec![Block {
+                        start: def.symbol.ln,
+                        end: def.symbol.end,
+                        label: format!("{} {}", def.symbol.kind, dep_name),
+                        tag: if dep_depth == 0 { "dep" } else { "dep2" },
+                        score: 120.0 - dep_depth as f64 * 30.0,
+                        required: dep_depth == 0,
+                    }],
+                    rank: 99,
+                });
+            }
+            owned.insert(dep_key);
+            added = true;
+        }
+        if !added {
+            break;
         }
     }
-    let seed_names = index
-        .defs
-        .keys()
-        .filter(|name| {
-            keywords.iter().any(|keyword| {
-                name.as_str() == keyword
-                    || name.eq_ignore_ascii_case(keyword)
-                    || (keyword.len() >= 5 && name.to_lowercase().contains(&keyword.to_lowercase()))
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let seed_names = seed_names.into_iter().collect::<Vec<_>>();
     let render = |plans: &Vec<PlannedFile>,
                   sigs: &Vec<(String, usize, String)>,
                   impact_limit: usize,
@@ -2720,13 +2930,9 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                             block.end,
                             block.label,
                             if block.tag == "hit" {
-                                ""
+                                "".into()
                             } else {
-                                if block.tag == "dep" {
-                                    " [dep]"
-                                } else {
-                                    " [def]"
-                                }
+                                format!(" [{}]", block.tag)
                             }
                         ));
                         body.extend(
@@ -2817,6 +3023,81 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             body.extend(impacts);
             body.push(String::new());
         }
+        let target_count = seeds
+            .iter()
+            .filter(|(definition, _, _)| {
+                plans
+                    .iter()
+                    .any(|plan| plan.file == definition.file && covered(plan, definition.symbol.ln))
+            })
+            .count();
+        let dep_count = plans
+            .iter()
+            .filter(|plan| plan.section == "dep")
+            .map(|plan| plan.blocks.len())
+            .sum::<usize>();
+        let role_count = |role: &str| {
+            closure_roles
+                .iter()
+                .filter(|(file, start, unit_role)| {
+                    *unit_role == role
+                        && plans
+                            .iter()
+                            .any(|plan| plan.file == *file && covered(plan, *start))
+                })
+                .count()
+        };
+        body.push("## PROOF (任务闭包检查)".into());
+        body.push(format!(
+            "目标定义: {}",
+            if target_count > 0 {
+                format!("已闭合 {target_count}")
+            } else {
+                "缺口".into()
+            }
+        ));
+        body.push(format!(
+            "依赖定义: {}",
+            if dep_count > 0 {
+                format!("已闭合 {dep_count}")
+            } else {
+                "未发现".into()
+            }
+        ));
+        if plan_intent.errors {
+            let count = role_count("handler");
+            body.push(format!(
+                "错误处理: {}",
+                if count > 0 {
+                    format!("已闭合 {count}")
+                } else {
+                    "缺口".into()
+                }
+            ));
+        }
+        if plan_intent.callers {
+            let count = role_count("caller");
+            body.push(format!(
+                "关键调用方: {}",
+                if count > 0 {
+                    format!("已闭合 {count}")
+                } else {
+                    "缺口".into()
+                }
+            ));
+        }
+        if plan_intent.tests {
+            let count = role_count("test");
+            body.push(format!(
+                "相关测试: {}",
+                if count > 0 {
+                    format!("已闭合 {count}")
+                } else {
+                    "缺口".into()
+                }
+            ));
+        }
+        body.push(String::new());
         if !sigs.is_empty() {
             body.push("## SIG (预算内放不下或最终回退的定义, 仅签名)".into());
             for (file, line, sig) in sigs {
@@ -2865,7 +3146,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                     .sum::<usize>()
             })
             .sum::<usize>();
-        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 契约: 以上均为完整单元/完整文件，可直接据此编辑；已展示行段禁止重读。SIG/IMPACT 仅索引，确需其函数体时按 path:ln 精确补读。",
+        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 契约: 已按修改计划构建符号关系、计算任务闭包并做缺口证明；正文均为完整单元/完整文件。已展示行段禁止重读。",
             if keywords.is_empty() { String::new() } else { format!("q={}", keywords.join(",")) },
             if task.is_empty() { String::new() } else { format!(" task=\"{}\"", js_utf16_slice(&task, 80)) },
             if files.is_empty() { String::new() } else { format!(" files={}", files.join(",")) },
@@ -2924,7 +3205,13 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 .blocks
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, block)| block.start)
+                .min_by(|(_, a), (_, b)| {
+                    a.required.cmp(&b.required).then_with(|| {
+                        a.score
+                            .partial_cmp(&b.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                })
                 .map(|(position, _)| position);
             if let Some(position) = block {
                 let block = plans[index].blocks.remove(position);
@@ -3026,6 +3313,80 @@ mod tests {
         assert!(out.contains("@@ 3-5 fn targetFn [def]"), "{out}");
         assert!(out.contains("## DEPS"), "{out}");
         assert!(out.contains("export function helperFn"), "{out}");
+    }
+
+    #[test]
+    fn plan_searches_error_handlers_from_target_body() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src/auth")).unwrap();
+        fs::create_dir_all(d.path().join("src/ui")).unwrap();
+        let filler = (0..130)
+            .map(|i| format!("export const PAD_{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            d.path().join("src/auth/refreshSession.ts"),
+            format!("import {{ SessionExpiredError }} from './errors';\nexport function refreshSession(token) {{\n  if (!token) throw new SessionExpiredError('expired');\n  return token;\n}}\n{filler}"),
+        ).unwrap();
+        fs::write(
+            d.path().join("src/auth/errors.ts"),
+            "export class SessionExpiredError extends Error {}\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("src/ui/sessionBoundary.ts"),
+            "import { SessionExpiredError } from '../auth/errors';\nexport function handleSessionFailure(error) {\n  if (error instanceof SessionExpiredError) return 'login';\n  throw error;\n}\n",
+        ).unwrap();
+
+        let plain =
+            fast_context(d.path(), serde_json::json!({"keywords":["refreshSession"]})).unwrap();
+        assert!(
+            !plain.contains("export function handleSessionFailure"),
+            "{plain}"
+        );
+        let planned = fast_context(
+            d.path(),
+            serde_json::json!({
+                "keywords":["refreshSession"],
+                "task":"修改 refreshSession 的失败和错误处理，保持会话过期行为"
+            }),
+        )
+        .unwrap();
+        assert!(
+            planned.contains("export function handleSessionFailure"),
+            "{planned}"
+        );
+        assert!(planned.contains("SessionExpiredError"), "{planned}");
+        assert!(planned.contains("## PROOF (任务闭包检查)"), "{planned}");
+        assert!(planned.contains("错误处理: 已闭合"), "{planned}");
+    }
+
+    #[test]
+    fn task_closure_packs_second_level_import_dependency() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        let filler = (0..120)
+            .map(|i| format!("export const PAD_{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            d.path().join("src/target.ts"),
+            format!("import {{ buildEnvelope }} from './helper';\nexport function targetFlow(value) {{ return buildEnvelope(value); }}\n{filler}"),
+        ).unwrap();
+        fs::write(
+            d.path().join("src/helper.ts"),
+            "import { ResultEnvelope } from './types';\nexport function buildEnvelope(value) { return new ResultEnvelope(value); }\n",
+        ).unwrap();
+        fs::write(
+            d.path().join("src/types.ts"),
+            "export class ResultEnvelope {\n  constructor(value) { this.value = value; }\n}\n",
+        )
+        .unwrap();
+        let out = fast_context(d.path(), serde_json::json!({"keywords":["targetFlow"]})).unwrap();
+        assert!(out.contains("buildEnvelope"), "{out}");
+        assert!(out.contains("ResultEnvelope"), "{out}");
+        assert!(out.contains("[dep2]"), "{out}");
+        assert!(out.contains("## PROOF (任务闭包检查)"), "{out}");
     }
 
     #[test]
