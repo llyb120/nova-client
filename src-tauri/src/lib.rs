@@ -5229,7 +5229,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             #[cfg(windows)]
-            spawn_single_instance_focus_listener(app.handle());
+            {
+                spawn_single_instance_focus_listener(app.handle());
+                path_env::refresh_process_environment_in_background();
+            }
 
             // 数据目录必须最先确定，后续窗口还原/更新都要读取其中的 marker。
             let dir = nova_data_dir(app.handle());

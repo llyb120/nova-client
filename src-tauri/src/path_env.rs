@@ -34,6 +34,16 @@ pub fn refresh_process_environment() -> Result<usize, String> {
     }
 }
 
+/// 启动后在独立线程刷新一次 Windows 环境块。失败静默忽略，不阻塞应用初始化。
+#[cfg(windows)]
+pub(crate) fn refresh_process_environment_in_background() {
+    let _ = std::thread::Builder::new()
+        .name("nova-env-refresh".into())
+        .spawn(|| {
+            let _ = refresh_windows_process_environment();
+        });
+}
+
 #[cfg(any(windows, target_os = "macos", test))]
 fn merge_paths<'a>(groups: impl IntoIterator<Item = &'a OsStr>) -> Option<OsString> {
     let mut seen = HashSet::<PathBuf>::new();
