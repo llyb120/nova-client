@@ -1,9 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { contextBundle, findSymbols } from "./ctx-core.mjs";
+import { contextBundle, findSymbols, resolveRgBin } from "./ctx-core.mjs";
 
 test("contextBundle rejects empty keywords", async () => {
   assert.equal(await contextBundle({ keywords: [] }), "错误: keywords 不能为空");
+});
+
+test("resolveRgBin prefers system or packaged rg when available", () => {
+  const bin = resolveRgBin();
+  if (bin) assert.match(String(bin), /rg/);
+});
+
+test("search falls back to system grep when forced", async () => {
+  const prev = process.env.CTX_SEARCH_ENGINE;
+  process.env.CTX_SEARCH_ENGINE = "grep";
+  try {
+    const out = await findSymbols({ names: ["contextBundle"] });
+    assert.match(out, /## contextBundle/);
+    assert.match(out, /scripts\/ctx-core\.mjs/);
+  } finally {
+    if (prev === undefined) delete process.env.CTX_SEARCH_ENGINE;
+    else process.env.CTX_SEARCH_ENGINE = prev;
+  }
 });
 
 test("contextBundle edit pack includes coverage and definition body", async () => {

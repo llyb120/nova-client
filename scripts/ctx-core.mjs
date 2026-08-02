@@ -5,11 +5,15 @@
 //   scripts/cursor-filesystem-tools.mjs  Cursor MCP 工具
 //
 // Pipeline: Discover → Rank → Expand → Pack → Cover
-// 检索引擎: git grep + 内存符号窗（子进程并行），全程无 LLM、无预建索引。
+// 检索引擎: 默认 rg（尊重 .gitignore；可选 @vscode/ripgrep）→ git grep → 系统 grep；
+// 内存符号窗 + 子进程并行；全程无 LLM、无预建索引。
 
 import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 export function repoRoot() {
   if (process.env.CTX_ROOT) return process.env.CTX_ROOT;
@@ -44,6 +48,37 @@ const NEIGHBOR_CAP = 12;
 const NEIGHBOR_THIN_CAP = 4;
 const WALL_MS = 4500;
 const PROC_TIMEOUT_MS = 1800;
+const RG_GLOBS = [
+  '!**/node_modules/**',
+  '!**/dist/**',
+  '!**/target/**',
+  '!**/src-tauri/target/**',
+  '!**/package-lock.json',
+  '!*.png',
+  '!*.jpg',
+  '!*.jpeg',
+  '!*.gif',
+  '!*.webp',
+  '!*.ico',
+  '!*.woff',
+  '!*.woff2',
+  '!*.ttf',
+  '!*.bin',
+];
+
+/** @type {string|null|undefined} */
+let rgBinCache;
+/** @type {boolean|undefined} */
+let gitAvailCache;
+
+const GREP_EXCLUDE_DIRS = [
+  'node_modules',
+  'dist',
+  'target',
+  'src-tauri/target',
+  '.git',
+  '.cursor',
+];
 
 function runAsync(root, cmd, args, timeoutMs = PROC_TIMEOUT_MS) {
   return new Promise((resolve) => {
@@ -58,6 +93,135 @@ function runAsync(root, cmd, args, timeoutMs = PROC_TIMEOUT_MS) {
       },
     );
   });
+}
+
+/** Resolve rg binary: PATH → optional @vscode/ripgrep → null. */
+export function resolveRgBin() {
+  if (rgBinCache !== undefined) return rgBinCache;
+  try {
+    execFileSync('rg', ['--version'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1500,
+    });
+    return (rgBinCache = 'rg');
+  } catch {
+    /* try packaged binary */
+  }
+  try {
+    const mod = require('@vscode/ripgrep');
+    const rgPath = mod?.rgPath;
+    if (rgPath && existsSync(rgPath)) return (rgBinCache = rgPath);
+  } catch {
+    /* optional dependency */
+  }
+  return (rgBinCache = null);
+}
+
+/** True when git binary exists and `root` is inside a work tree. */
+export function gitSearchAvailable(root) {
+  if (gitAvailCache === false) return false;
+  try {
+    execFileSync('git', ['--version'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1500,
+    });
+  } catch {
+    return (gitAvailCache = false);
+  }
+  try {
+    const inside = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1500,
+    }).trim();
+    if (inside === 'true') {
+      gitAvailCache = true;
+      return true;
+    }
+  } catch {
+    /* not a git work tree */
+  }
+  return false;
+}
+
+function forcedSearchEngine() {
+  const v = String(process.env.CTX_SEARCH_ENGINE || '').trim().toLowerCase();
+  if (v === 'rg' || v === 'git' || v === 'grep') return v;
+  return null;
+}
+
+function lineHasWord(text, name) {
+  if (!name || !text.includes(name)) return false;
+  return new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(text);
+}
+
+function dedupeHits(parts) {
+  const out = [];
+  const seen = new Set();
+  for (const hits of parts) {
+    for (const h of hits) {
+      if (EXCLUDE.test(h.file)) continue;
+      const key = `${h.file}:${h.line}:${h.text}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(h);
+    }
+  }
+  return out;
+}
+
+async function searchWithGitGrep(root, list, word) {
+  const parts = await mapPool(list, Math.min(6, list.length), async (p) => {
+    const args = word ? ['grep', '-nIw', '--', p] : ['grep', '-nI', '--', p];
+    return parseGrepLines(await runAsync(root, 'git', args));
+  });
+  return dedupeHits(parts);
+}
+
+/** Last-resort recursive grep with hard excludes (no .gitignore awareness). */
+async function searchWithSystemGrep(root, list, word) {
+  const parts = await mapPool(list, Math.min(6, list.length), async (p) => {
+    const args = ['-rnI', '-F', '--color=never'];
+    if (word) args.push('-w');
+    for (const dir of GREP_EXCLUDE_DIRS) args.push(`--exclude-dir=${dir}`);
+    args.push('-e', p, '.');
+    return parseGrepLines(await runAsync(root, 'grep', args));
+  });
+  return dedupeHits(parts);
+}
+
+/**
+ * Repo text search.
+ * Prefer one rg invocation (gitignore-aware, includes untracked) → git grep → system grep.
+ * `CTX_SEARCH_ENGINE=rg|git|grep` can force a backend for tests/diagnostics.
+ */
+async function searchText(root, patterns, { word = false } = {}) {
+  const list = [...new Set((patterns || []).map((p) => String(p ?? '')).filter(Boolean))];
+  if (!list.length) return [];
+
+  const forced = forcedSearchEngine();
+
+  if (!forced || forced === 'rg') {
+    const rg = resolveRgBin();
+    if (rg) {
+      const args = ['-n', '--no-heading', '--color', 'never', '-F'];
+      if (word) args.push('-w');
+      for (const p of list) args.push('-e', p);
+      for (const g of RG_GLOBS) args.push('--glob', g);
+      args.push('.');
+      return parseGrepLines(await runAsync(root, rg, args)).filter((h) => !EXCLUDE.test(h.file));
+    }
+    if (forced === 'rg') return [];
+  }
+
+  if (forced === 'git' || (!forced && gitSearchAvailable(root))) {
+    return searchWithGitGrep(root, list, word);
+  }
+
+  return searchWithSystemGrep(root, list, word);
 }
 
 async function mapPool(items, concurrency, fn) {
@@ -117,6 +281,11 @@ function pathHintBonus(path, pathHints) {
   return bonus;
 }
 
+function normalizeRepoPath(file) {
+  if (!file) return file;
+  return file.replace(/^\.\//, '');
+}
+
 function parseGrepLines(text) {
   const out = [];
   for (const line of text.split('\n')) {
@@ -125,7 +294,7 @@ function parseGrepLines(text) {
     if (i1 <= 0) continue;
     const i2 = line.indexOf(':', i1 + 1);
     if (i2 <= i1) continue;
-    const file = line.slice(0, i1);
+    const file = normalizeRepoPath(line.slice(0, i1));
     const lineNo = Number(line.slice(i1 + 1, i2));
     if (!file || !Number.isFinite(lineNo)) continue;
     out.push({ file, line: lineNo, text: line.slice(i2 + 1) });
@@ -133,9 +302,8 @@ function parseGrepLines(text) {
   return out;
 }
 
-async function discoverKeyword(root, kw) {
-  const stdout = await runAsync(root, 'git', ['grep', '-nI', '--', kw]);
-  return parseGrepLines(stdout).filter((h) => !EXCLUDE.test(h.file));
+async function discoverKeywords(root, keywords) {
+  return searchText(root, keywords, { word: false });
 }
 
 function scoreFile(rec, pathHints) {
@@ -369,22 +537,28 @@ async function discoverNeighbors(root, coreFiles, corePaths, keywords = []) {
     if (symbolNames.length >= 16) break;
   }
   const neighHits = new Map();
-  await mapPool(symbolNames, 8, async (name) => {
-    const stdout = await runAsync(root, 'git', ['grep', '-nIw', '--', name]);
-    for (const h of parseGrepLines(stdout).slice(0, 8)) {
+  const chunks = [];
+  for (let i = 0; i < symbolNames.length; i += 8) chunks.push(symbolNames.slice(i, i + 8));
+  await mapPool(chunks, Math.min(4, Math.max(1, chunks.length)), async (chunk) => {
+    const hits = await searchText(root, chunk, { word: true });
+    for (const h of hits) {
       if (
         EXCLUDE.test(h.file)
         || NEIGHBOR_EXCLUDE.test(h.file)
         || TEST_PATH.test(h.file)
         || corePaths.has(h.file)
       ) continue;
+      const matched = chunk.filter((name) => lineHasWord(h.text, name));
+      if (!matched.length) continue;
       let rec = neighHits.get(h.file);
       if (!rec) {
-        rec = { path: h.file, hitLines: new Set(), symbols: new Set() };
+        rec = { path: h.file, hitLines: new Set(), symbols: new Set(), hitCount: 0 };
         neighHits.set(h.file, rec);
       }
+      if (rec.hitCount >= 8) continue;
+      rec.hitCount++;
       rec.hitLines.add(h.line);
-      rec.symbols.add(name);
+      for (const name of matched) rec.symbols.add(name);
     }
   });
   const ranked = [...neighHits.values()]
@@ -641,22 +815,24 @@ export async function contextBundle(params = {}, root = repoRoot()) {
   const t0 = Date.now();
   const commit = shortHead(root);
 
-  const perKw = await mapPool(keywords, Math.min(6, keywords.length), (kw) => discoverKeyword(root, kw));
+  const allHits = await discoverKeywords(root, keywords);
   const files = new Map();
-  keywords.forEach((kw, i) => {
-    for (const h of perKw[i] || []) {
-      let rec = files.get(h.file);
-      if (!rec) {
-        rec = {
-          path: h.file,
-          hitLines: new Set(),
-          keywords: new Set(),
-          defHits: 0,
-          mentionOnly: true,
-        };
-        files.set(h.file, rec);
-      }
-      rec.hitLines.add(h.line);
+  for (const h of allHits) {
+    const matchedKws = keywords.filter((kw) => h.text.includes(kw));
+    if (!matchedKws.length) continue;
+    let rec = files.get(h.file);
+    if (!rec) {
+      rec = {
+        path: h.file,
+        hitLines: new Set(),
+        keywords: new Set(),
+        defHits: 0,
+        mentionOnly: true,
+      };
+      files.set(h.file, rec);
+    }
+    rec.hitLines.add(h.line);
+    for (const kw of matchedKws) {
       rec.keywords.add(kw);
       if (DEF_LINE_RE.test(h.text) && h.text.includes(kw)) {
         rec.defHits++;
@@ -665,7 +841,7 @@ export async function contextBundle(params = {}, root = repoRoot()) {
         rec.mentionOnly = false;
       }
     }
-  });
+  }
 
   if (files.size === 0) return `无命中: ${keywords.join(' ')}`;
 
@@ -773,16 +949,19 @@ export function codeMap(_args = {}, root = repoRoot()) {
 export async function findSymbols({ names }, root = repoRoot()) {
   if (!Array.isArray(names) || names.length === 0) return '错误: names 不能为空';
   const rev = shortHead(root);
-  const sections = await mapPool(names, Math.min(8, names.length), async (name) => {
-    const stdout = await runAsync(root, 'git', ['grep', '-nI', '--', `\\b${name}\\b`]);
-    const lines = stdout.split('\n').filter((l) => l && !EXCLUDE.test(l.split(':')[0]));
-    return `## ${name}\n` + (lines.slice(0, 40).join('\n') || '(无命中)');
+  const hits = await searchText(root, names, { word: true });
+  const sections = names.map((name) => {
+    const lines = hits
+      .filter((h) => lineHasWord(h.text, name))
+      .slice(0, 40)
+      .map((h) => `${h.file}:${h.line}:${h.text}`);
+    return `## ${name}\n` + (lines.join('\n') || '(无命中)');
   });
   return `# 符号定位 [${rev}]\n` + sections.join('\n\n');
 }
 
 export const FAST_CONTEXT_DESCRIPTION =
-  '分析/修改前未知分布时必须先调用：一次打包定义体+1跳邻居+覆盖表。coverage 中 FULL/BODY.covered 禁止再读；禁止对已打包关键词再用 rg/Grep/git grep 重搜；仅按 gaps/next_reads 补读（多缺口合并 read_files）。intent: edit|explain|locate。';
+  '分析/修改前未知分布时必须先调用：一次打包定义体+1跳邻居+覆盖表（内部已用 rg，尊重 .gitignore）。coverage 中 FULL/BODY.covered 禁止再读；禁止对已打包关键词再用 Shell/Grep/rg/git grep 重搜；仅按 gaps/next_reads 补读（多缺口合并 read_files）。intent: edit|explain|locate。';
 
 export const TOOLS = [
   {
