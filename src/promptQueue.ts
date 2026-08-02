@@ -145,8 +145,14 @@ function startPromptQueueDispatcher() {
           seenThreads.add(item.threadId);
           continue;
         }
-        // 失败或发送中的队首跳过，继续尝试同一会话的下一条，避免后面永久卡住。
-        if (dispatching.has(item.id) || failed.has(item.id)) continue;
+        // 发送中的队首必须占住整个会话；否则 dispatching 状态触发 effect 重跑时，
+        // 会在 running 尚未置位前把同一会话的下一条也并发发出。
+        if (dispatching.has(item.id)) {
+          seenThreads.add(item.threadId);
+          continue;
+        }
+        // 失败的条目允许跳过，避免后续队列永久卡住。
+        if (failed.has(item.id)) continue;
         seenThreads.add(item.threadId);
         void dispatchQueuedPrompt(item);
       }
