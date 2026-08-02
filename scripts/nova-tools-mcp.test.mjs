@@ -104,7 +104,8 @@ test("devin policy mentions nova-tools and read_files", () => {
     assert.match(policy, /wording such as `use\/call read_files`/);
     assert.match(policy, /do not call mcp_list_tools merely to discover them/);
     assert.match(policy, /Never repeat a malformed call unchanged/);
-    assert.match(policy, /Never continue merely to clear truncated/);
+    assert.match(policy, /never invent arbitrary 100\/200-line pages/);
+    assert.match(policy, /Never sequentially page through a whole file/);
   } finally {
     if (prev === undefined) delete process.env.NOVA_FAST_CONTEXT;
     else process.env.NOVA_FAST_CONTEXT = prev;

@@ -813,7 +813,8 @@ try {
 }
 
 assert.match(cursorBatchToolPolicy(), /read_files/);
-assert.match(cursorBatchToolPolicy(), /Never continue merely to clear truncated/);
+assert.match(cursorBatchToolPolicy(), /never invent arbitrary 100\/200-line pages/);
+assert.match(cursorBatchToolPolicy(), /Never sequentially page through a whole file/);
 assert.doesNotMatch(cursorBatchToolPolicy(), /must use edit_files/);
 assert.match(cursorBatchToolPolicy(), /Write\/Edit\/StrReplace/);
 if (process.env.NOVA_FAST_CONTEXT !== "0") {
