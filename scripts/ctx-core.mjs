@@ -87,6 +87,7 @@ const MAX_KEYWORDS = 5;
 const MAX_TASK_TOKENS = 1250;
 const CJK_NGRAM_MIN = 2;
 const CJK_NGRAM_MAX = 5;
+const MAX_GRAPH_TERMS = 12;
 const MAX_HIT_LINES = 6000;
 const MAX_HITS_PER_FILE = 60;
 const MAX_LINE_CHARS = 240;
@@ -248,6 +249,7 @@ function retrievalPlan(task) {
   const text = String(task ?? '').toLowerCase();
   const has = (...words) => words.some((word) => text.includes(word));
   return {
+    active: Boolean(String(task ?? '').trim()),
     errors: has('错误', '失败', '异常', 'error', 'exception', 'fail', 'throw', 'catch'),
     callers: has('调用方', '兼容', 'api', '返回', 'return', 'caller', '签名'),
     tests: has('测试', '回归', 'test', 'spec'),
@@ -256,25 +258,39 @@ function retrievalPlan(task) {
   };
 }
 
-function planTermsFromBodies(plan, bodies, existing) {
-  const wanted = [];
-  const seen = new Set([...existing].map((term) => term.toLowerCase()));
-  const patterns = [];
-  if (plan.errors) patterns.push(/(?:Error|Exception|Failure)$/);
-  if (plan.config) patterns.push(/(?:Config|Settings|Options?)$/);
-  if (plan.state) patterns.push(/(?:State|Store|Session|Cache|Lock|Mutex|Queue)$/);
-  if (!patterns.length) return wanted;
-  for (const body of bodies) {
-    for (const match of body.matchAll(IDENT_RE)) {
+function planTermsFromBodies(plan, index, bodies, existing) {
+  if (!plan.active) return [];
+  const blocked = new Set([...existing].map((term) => term.toLowerCase()));
+  const candidates = new Map();
+  for (const { file, text } of bodies) {
+    const locals = new Set([...text.matchAll(LOCAL_DECL_RE)].map((match) => match[1]));
+    for (const match of text.matchAll(IDENT_RE)) {
       const name = match[0];
       const low = name.toLowerCase();
-      if (seen.has(low) || STOP.has(low) || !patterns.some((pattern) => pattern.test(name))) continue;
-      seen.add(low);
-      wanted.push(name);
-      if (wanted.length >= MAX_TASK_TOKENS) return wanted;
+      if (name.length < 3 || blocked.has(low) || STOP.has(low) || locals.has(name)) continue;
+      if (match.index > 0 && text[match.index - 1] === '.') continue;
+      const def = resolveRef(index, name, file);
+      if (!def) continue; // 只沿可解析定义边扩图，不把普通文本 token 当关系
+      const prefix = text.slice(Math.max(0, match.index - 40), match.index);
+      const suffix = text.slice(match.index + name.length, match.index + name.length + 8);
+      const call = /^\s*(?:<[^>]*>)?\s*\(/.test(suffix);
+      let score = 12 + (call ? 12 : 0) + (/^[A-Z]/.test(name) ? 5 : 0);
+      // 任务类型只调整边权，不再决定哪些符号允许进入关系图。
+      if (plan.errors && /(?:throw|catch|instanceof|reject|fail|new)\s*$/i.test(prefix)) score += 24;
+      if (plan.callers && call) score += 8;
+      if (plan.config && /(?:Config|Settings|Options?|Policy)$/i.test(name)) score += 6;
+      if (plan.state && /(?:State|Store|Session|Cache|Lock|Mutex|Queue|Manager)$/i.test(name)) score += 6;
+      const current = candidates.get(name);
+      if (current) {
+        current.score += score;
+        current.refs += 1;
+      } else candidates.set(name, { name, score, refs: 1 });
     }
   }
-  return wanted;
+  return [...candidates.values()]
+    .sort((a, b) => b.score - a.score || b.refs - a.refs || a.name.localeCompare(b.name))
+    .slice(0, MAX_GRAPH_TERMS)
+    .map((entry) => entry.name);
 }
 
 // ---------------------------------------------------------------- 单元定位
@@ -566,9 +582,9 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   const seedBodies = [];
   for (const d of seeds) {
     const src = readSource(root, index, d.file);
-    if (src) seedBodies.push(src.lines.slice(d.ln - 1, d.end).join('\n'));
+    if (src) seedBodies.push({ file: d.file, text: src.lines.slice(d.ln - 1, d.end).join('\n') });
   }
-  const plannedTerms = planTermsFromBodies(planIntent, seedBodies, terms);
+  const plannedTerms = planTermsFromBodies(planIntent, index, seedBodies, terms);
   if (plannedTerms.length) {
     const plannedRows = await searchText(root, plannedTerms);
     terms.push(...plannedTerms);
@@ -1041,6 +1057,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   const handlerCount = units.filter((u) => u.role === 'handler' && covers(u.file, u.ln)).length;
   const testCount = units.filter((u) => u.role === 'test' && covers(u.file, u.ln)).length;
   const depCount = [...plan.values()].reduce((n, p) => n + (p.section === 'dep' ? p.blocks.length : 0), 0);
+  proof.push(`符号关系: ${plannedTerms.length ? `已解析 ${plannedTerms.length}` : '无可解析扩展边'}`);
   proof.push(`目标定义: ${targetCount ? `已闭合 ${targetCount}` : '缺口'}`);
   proof.push(`依赖定义: ${depCount ? `已闭合 ${depCount}` : '未发现'}`);
   if (planIntent.errors) proof.push(`错误处理: ${handlerCount ? `已闭合 ${handlerCount}` : '缺口'}`);

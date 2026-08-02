@@ -286,6 +286,39 @@ test("fast_context: 修改计划会从目标体反向检索错误处理方", asy
   }
 });
 
+test("fast_context: 关系图不靠 Error/Config/State 后缀也能反查处理方", async () => {
+  const filler = Array.from({ length: 125 }, (_, i) => `export const PAD_${i} = ${i};`).join("\n");
+  const dir = await fixture({
+    "src/auth/authorize.ts": [
+      "import { AuthFault } from './faults';",
+      "export function authorize(token) {",
+      "  if (!token) throw new AuthFault('denied');",
+      "  return token;",
+      "}",
+      filler,
+    ].join("\n"),
+    "src/auth/faults.ts": "export class AuthFault { constructor(message) { this.message = message; } }\n",
+    "src/ui/authBoundary.ts": [
+      "import { AuthFault } from '../auth/faults';",
+      "export function routeFault(reason) {",
+      "  if (reason instanceof AuthFault) return 'login';",
+      "  return 'unknown';",
+      "}",
+    ].join("\n"),
+  });
+  try {
+    const out = await contextBundle({
+      keywords: ["authorize"],
+      task: "修改 authorize 的失败处理",
+    }, dir);
+    assert.match(out, /export function routeFault/);
+    assert.match(out, /符号关系: 已解析/);
+    assert.match(out, /错误处理: 已闭合/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("fast_context: 任务闭包会展开二层导入依赖并输出缺口证明", async () => {
   const filler = Array.from({ length: 120 }, (_, i) => `export const PAD_${i} = ${i};`).join("\n");
   const dir = await fixture({

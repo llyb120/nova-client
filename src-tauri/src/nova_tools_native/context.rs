@@ -38,6 +38,7 @@ const MAX_FILES: usize = 6;
 const MAX_DEPS: usize = 8;
 const MAX_DEP_FILES: usize = 4;
 const MAX_IMPACT: usize = 20;
+const MAX_GRAPH_TERMS: usize = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Symbol {
@@ -1390,6 +1391,7 @@ fn noise_path(file: &str) -> bool {
 
 #[derive(Default)]
 struct RetrievalPlan {
+    active: bool,
     errors: bool,
     callers: bool,
     tests: bool,
@@ -1401,6 +1403,7 @@ fn retrieval_plan(task: &str) -> RetrievalPlan {
     let text = task.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|word| text.contains(word));
     RetrievalPlan {
+        active: !task.trim().is_empty(),
         errors: has(&[
             "错误",
             "失败",
@@ -1423,50 +1426,100 @@ fn retrieval_plan(task: &str) -> RetrievalPlan {
 
 fn plan_terms_from_bodies(
     plan: &RetrievalPlan,
-    bodies: &[String],
+    index: &IndexView,
+    bodies: &[(String, String)],
     existing: &[String],
 ) -> Vec<String> {
-    if !plan.errors && !plan.config && !plan.state {
+    if !plan.active {
         return Vec::new();
     }
     static IDENT: OnceLock<Regex> = OnceLock::new();
+    static LOCAL: OnceLock<Regex> = OnceLock::new();
     let ident = IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*").unwrap());
-    let mut seen = existing
+    let local = LOCAL.get_or_init(|| Regex::new(r"\b(?:const|let|var|function|fn|struct|enum|class|type|interface)\s+([A-Za-z_$][\w$]*)").unwrap());
+    let blocked = existing
         .iter()
         .map(|term| term.to_lowercase())
         .collect::<HashSet<_>>();
-    let mut out = Vec::new();
-    for body in bodies {
+    let mut candidates = HashMap::<String, (i64, usize)>::new();
+    for (file, body) in bodies {
+        let locals = local
+            .captures_iter(body)
+            .map(|captures| captures[1].to_string())
+            .collect::<HashSet<_>>();
         for found in ident.find_iter(body) {
             let name = found.as_str();
             let lower = name.to_lowercase();
-            let wanted = (plan.errors
-                && (name.ends_with("Error")
-                    || name.ends_with("Exception")
-                    || name.ends_with("Failure")))
-                || (plan.config
-                    && (name.ends_with("Config")
-                        || name.ends_with("Settings")
-                        || name.ends_with("Option")
-                        || name.ends_with("Options")))
-                || (plan.state
-                    && (name.ends_with("State")
-                        || name.ends_with("Store")
-                        || name.ends_with("Session")
-                        || name.ends_with("Cache")
-                        || name.ends_with("Lock")
-                        || name.ends_with("Mutex")
-                        || name.ends_with("Queue")));
-            if !wanted || stop_word(&lower) || !seen.insert(lower) {
+            if name.len() < 3
+                || blocked.contains(&lower)
+                || stop_word(&lower)
+                || locals.contains(name)
+                || (found.start() > 0 && body.as_bytes()[found.start() - 1] == b'.')
+                || resolve_ref(index, name, file).is_none()
+            {
                 continue;
             }
-            out.push(name.to_string());
-            if out.len() >= 5 {
-                return out;
+            let prefix = body[..found.start()]
+                .chars()
+                .rev()
+                .take(40)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            let suffix = body[found.end()..].chars().take(8).collect::<String>();
+            let call = suffix.trim_start().starts_with('(') || suffix.trim_start().starts_with('<');
+            let mut score = 12
+                + if call { 12 } else { 0 }
+                + if name.chars().next().is_some_and(char::is_uppercase) {
+                    5
+                } else {
+                    0
+                };
+            let prefix_lower = prefix.to_lowercase();
+            if plan.errors
+                && ["throw", "catch", "instanceof", "reject", "fail", "new"]
+                    .iter()
+                    .any(|word| prefix_lower.trim_end().ends_with(word))
+            {
+                score += 24;
             }
+            if plan.callers && call {
+                score += 8;
+            }
+            if plan.config
+                && ["Config", "Settings", "Option", "Options", "Policy"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+            {
+                score += 6;
+            }
+            if plan.state
+                && [
+                    "State", "Store", "Session", "Cache", "Lock", "Mutex", "Queue", "Manager",
+                ]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+            {
+                score += 6;
+            }
+            let entry = candidates.entry(name.to_string()).or_insert((0, 0));
+            entry.0 += score;
+            entry.1 += 1;
         }
     }
-    out
+    let mut ranked = candidates.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1 .0
+            .cmp(&a.1 .0)
+            .then_with(|| b.1 .1.cmp(&a.1 .1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked
+        .into_iter()
+        .take(MAX_GRAPH_TERMS)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 fn score_path(file: &str) -> i64 {
@@ -2261,11 +2314,15 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     let seed_bodies = seeds
         .iter()
         .filter_map(|(definition, _, _)| {
-            source(root, &definition.file, index.files.get(&definition.file))
-                .map(|src| src.lines[definition.symbol.ln - 1..definition.symbol.end].join("\n"))
+            source(root, &definition.file, index.files.get(&definition.file)).map(|src| {
+                (
+                    definition.file.clone(),
+                    src.lines[definition.symbol.ln - 1..definition.symbol.end].join("\n"),
+                )
+            })
         })
         .collect::<Vec<_>>();
-    let planned_terms = plan_terms_from_bodies(&plan_intent, &seed_bodies, &terms);
+    let planned_terms = plan_terms_from_bodies(&plan_intent, &index, &seed_bodies, &terms);
     if !planned_terms.is_empty() {
         let planned_rows = search_text(root, &planned_terms, false, false, &all);
         terms.extend(planned_terms.iter().cloned());
@@ -3089,6 +3146,14 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         };
         body.push("## PROOF (任务闭包检查)".into());
         body.push(format!(
+            "符号关系: {}",
+            if planned_terms.is_empty() {
+                "无可解析扩展边".into()
+            } else {
+                format!("已解析 {}", planned_terms.len())
+            }
+        ));
+        body.push(format!(
             "目标定义: {}",
             if target_count > 0 {
                 format!("已闭合 {target_count}")
@@ -3408,6 +3473,38 @@ mod tests {
         assert!(planned.contains("SessionExpiredError"), "{planned}");
         assert!(planned.contains("## PROOF (任务闭包检查)"), "{planned}");
         assert!(planned.contains("错误处理: 已闭合"), "{planned}");
+    }
+
+    #[test]
+    fn relation_graph_does_not_require_semantic_name_suffixes() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src/auth")).unwrap();
+        fs::create_dir_all(d.path().join("src/ui")).unwrap();
+        let filler = (0..125)
+            .map(|i| format!("export const PAD_{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            d.path().join("src/auth/authorize.ts"),
+            format!("import {{ AuthFault }} from './faults';\nexport function authorize(token) {{\n  if (!token) throw new AuthFault('denied');\n  return token;\n}}\n{filler}"),
+        ).unwrap();
+        fs::write(
+            d.path().join("src/auth/faults.ts"),
+            "export class AuthFault { constructor(message) { this.message = message; } }\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("src/ui/authBoundary.ts"),
+            "import { AuthFault } from '../auth/faults';\nexport function routeFault(reason) {\n  if (reason instanceof AuthFault) return 'login';\n  return 'unknown';\n}\n",
+        ).unwrap();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":["authorize"],"task":"修改 authorize 的失败处理"}),
+        )
+        .unwrap();
+        assert!(out.contains("export function routeFault"), "{out}");
+        assert!(out.contains("符号关系: 已解析"), "{out}");
+        assert!(out.contains("错误处理: 已闭合"), "{out}");
     }
 
     #[test]
