@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { codeMap, contextBundle, findSymbols } from "./ctx-core.mjs";
 import { callNativeTool, closeNativeToolsClient, decodeMessagePack, encodeMessagePack, mayFallbackFromNative } from "./nova-native-tools.mjs";
 
 test("MessagePack codec round-trips source-heavy RPC values without JSON escaping", () => {
@@ -57,5 +59,103 @@ test("native sidecar serves read/edit/context over framed MessagePack", { skip: 
   } finally {
     closeNativeToolsClient();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("native context tools are byte-for-byte compatible with the Node backend", { skip: !process.env.NOVA_TOOLS_NATIVE_EXE }, async () => {
+  const fixture = async (files) => {
+    const root = await mkdtemp(join(tmpdir(), "nova-context-parity-"));
+    for (const [relative, content] of Object.entries(files)) {
+      const absolute = join(root, relative);
+      await mkdir(join(absolute, ".."), { recursive: true });
+      await writeFile(absolute, content);
+    }
+    const git = (...args) => execFileSync("git", args, { cwd: root, stdio: "ignore", windowsHide: true });
+    git("init", "-q");
+    git("config", "user.email", "native-parity@nova.local");
+    git("config", "user.name", "Nova Native Parity");
+    git("add", "-A");
+    git("commit", "-qm", "fixture");
+    return root;
+  };
+  const filler = Array.from({ length: 160 }, (_, index) => `export const PAD_${index} = ${index};`).join("\n");
+  const cases = [
+    {
+      name: "definition and imported dependency",
+      files: {
+        "src/target.ts": `import { helperFn } from './helper';\n\nexport function targetFn(input: string) {\n  const cleaned = input.trim();\n  return helperFn(cleaned);\n}\n\n${filler}`,
+        "src/helper.ts": "export function helperFn(value: string) {\n  return `${value}!`;\n}\n",
+      },
+      params: { keywords: ["targetFn"] },
+    },
+    {
+      name: "impact ordering and unexpanded files",
+      files: Object.fromEntries([
+        ...Array.from({ length: 12 }, (_, index) => [`src/f${index}.ts`, `export function f${index}() {\n  return sharedFlag;\n}\n`]),
+        ["src/flag.ts", "export const sharedFlag = true;\n"],
+      ]),
+      params: { keywords: ["sharedFlag"] },
+    },
+    {
+      name: "task tokens, ignored stop words and nested unit selection",
+      files: {
+        "src/pipeline.ts": [
+          "export function renderPipeline() {",
+          "  function inner() {",
+          "    return TARGET_INNER;",
+          "  }",
+          ...Array.from({ length: 120 }, (_, index) => `  const pad${index} = ${index};`),
+          "  return inner();",
+          "}",
+        ].join("\n"),
+      },
+      params: { task: "with then 调整 renderPipeline TARGET_INNER 的渲染逻辑" },
+    },
+    {
+      name: "non-code search hit and Unicode clipping",
+      files: {
+        "settings.toml": "feature_key = \"enabled\"\nother = 1\n",
+        "src/中文.ts": `export function unicodeTarget() {\n  const value = '${"你".repeat(260)}';\n  return value;\n}`,
+      },
+      params: { keywords: ["unicodeTarget", "feature_key"] },
+    },
+    {
+      name: "hard budget whole-block fallback",
+      files: Object.fromEntries(Array.from({ length: 8 }, (_, file) => [
+        `src/f${file}.ts`,
+        `export function bounded${file}() {\n${Array.from({ length: 35 }, (_, line) => `  const value_${file}_${line} = ${line};`).join("\n")}\n  return 1;\n}`,
+      ])),
+      params: { keywords: ["bounded"], maxBytes: 8192 },
+    },
+  ];
+  try {
+    for (const item of cases) {
+      const root = await fixture(item.files);
+      try {
+        const node = await contextBundle(item.params, root);
+        const native = await callNativeTool("fast_context", root, item.params);
+        assert.equal(native, node, item.name);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+    const root = await fixture({
+      "src/a.ts": "export function pick() {\n  return 1;\n}\n",
+      "src/b.ts": "import { pick } from './a';\nexport const value = pick();\n",
+    });
+    try {
+      assert.equal(
+        await callNativeTool("find_symbols", root, { names: ["pick", "missingSymbol"] }),
+        await findSymbols({ names: ["pick", "missingSymbol"] }, root),
+      );
+      assert.equal(
+        await callNativeTool("code_map", root, { scope: "src/" }),
+        await codeMap({ scope: "src/" }, root),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  } finally {
+    closeNativeToolsClient();
   }
 });

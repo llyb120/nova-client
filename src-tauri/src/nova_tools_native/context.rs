@@ -2,17 +2,23 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-const CACHE_VERSION: u32 = 1;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+const CACHE_VERSION: u32 = 10;
 const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_WALK_FILES: usize = 30_000;
+const MAX_WALK_FILES: usize = 8_000;
 const MAX_HITS_PER_FILE: usize = 60;
 const MAX_HIT_LINES: usize = 6_000;
 const MAX_LINE_CHARS: usize = 240;
@@ -23,6 +29,7 @@ const DEFAULT_BUDGET: usize = 600;
 const MIN_BUDGET: usize = 100;
 const MAX_BUDGET: usize = 1200;
 const MAX_CANDIDATES: usize = 8;
+const MAX_UNITS_PER_FILE: usize = 4;
 const FULL_FILE_MAX: usize = 100;
 const EXPLICIT_FULL_MAX: usize = 300;
 const SUBJECT_FULL_MAX: usize = 800;
@@ -97,7 +104,6 @@ struct Block {
     end: usize,
     label: String,
     tag: &'static str,
-    score: i64,
 }
 
 #[derive(Clone)]
@@ -110,14 +116,39 @@ struct PlannedFile {
     rank: usize,
 }
 
+#[derive(Clone)]
+struct UnitCandidate {
+    file: String,
+    start: usize,
+    end: usize,
+    label: String,
+    tag: &'static str,
+    score: f64,
+    hits: Vec<usize>,
+    keywords: HashSet<String>,
+    unit: Option<Symbol>,
+    seed_weight: usize,
+}
+
 static MEMO: OnceLock<Mutex<HashMap<String, DiskCache>>> = OnceLock::new();
+
+fn trace(label: &str, start: Instant) {
+    if std::env::var_os("NOVA_TOOLS_NATIVE_PROFILE").is_some() {
+        eprintln!(
+            "[nova-tools-profile] {label}: {:.2}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
 
 fn normalize_root(root: &Path) -> String {
     let value = root
         .canonicalize()
         .unwrap_or_else(|_| root.to_path_buf())
         .to_string_lossy()
-        .replace('\\', "/");
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .to_string();
     if cfg!(windows) {
         value.to_lowercase()
     } else {
@@ -125,9 +156,21 @@ fn normalize_root(root: &Path) -> String {
     }
 }
 
-fn cache_path(root: &Path) -> PathBuf {
+fn workspace_cache_key(root: &Path) -> String {
     let normalized = normalize_root(root);
     let key = format!("{:x}", Sha256::digest(normalized.as_bytes()));
+    key[..16].to_string()
+}
+
+fn cache_location_label(root: &Path) -> String {
+    format!(
+        "$NOVA_DATA_DIR/codemap/{}/cache.json",
+        workspace_cache_key(root)
+    )
+}
+
+fn cache_path(root: &Path) -> PathBuf {
+    let key = workspace_cache_key(root);
     let data = std::env::var_os("NOVA_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -136,9 +179,7 @@ fn cache_path(root: &Path) -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".nova")
         });
-    data.join("codemap-v3-native")
-        .join(&key[..16])
-        .join("index.bin")
+    data.join("codemap-v3-native").join(key).join("index.bin")
 }
 
 fn metadata_stamp(path: &Path) -> Option<(u64, u128)> {
@@ -176,18 +217,20 @@ fn load_cache(root: &Path) -> DiskCache {
     }
 }
 
-fn store_cache(root: &Path, cache: DiskCache) {
-    if let Ok(bytes) = bincode::serialize(&cache) {
-        let path = cache_path(root);
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-        if fs::write(&temp, bytes).is_ok() {
-            if path.exists() {
-                let _ = fs::remove_file(&path);
+fn store_cache(root: &Path, cache: DiskCache, persist: bool) {
+    if persist {
+        if let Ok(bytes) = bincode::serialize(&cache) {
+            let path = cache_path(root);
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
             }
-            let _ = fs::rename(&temp, &path);
+            let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+            if fs::write(&temp, bytes).is_ok() {
+                if path.exists() {
+                    let _ = fs::remove_file(&path);
+                }
+                let _ = fs::rename(&temp, &path);
+            }
         }
     }
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
@@ -234,36 +277,40 @@ fn is_code_file(file: &str) -> bool {
             | "cpp"
             | "hpp"
             | "swift"
-            | "rb"
             | "php"
-    ) && !lower.contains("/node_modules/")
-        && !lower.contains("/target/")
+            | "scala"
+            | "dart"
+            | "m"
+            | "mm"
+            | "zig"
+    ) && !lower.contains("src-tauri/target")
+        && !lower.contains("node_modules")
+        && !lower.contains("package-lock")
+        && !lower.ends_with(".png")
         && !lower.contains("/dist/")
         && !lower.contains("/coverage/")
-        && !lower.contains("/vendor/")
+        && !lower.ends_with(".min.js")
+        && !lower.ends_with(".lock")
+        && !lower.contains(".generated.")
 }
 
-fn list_code_files(root: &Path) -> Vec<String> {
-    if let Ok(output) = Command::new("git")
-        .args(["ls-files", "-c", "-o", "--exclude-standard", "-z"])
+fn hidden_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+fn run_command(root: &Path, program: &str, args: &[String]) -> Option<Vec<u8>> {
+    hidden_command(program)
+        .args(args)
         .current_dir(root)
         .output()
-    {
-        if output.status.success() {
-            let mut files: Vec<_> = output
-                .stdout
-                .split(|b| *b == 0)
-                .filter_map(|raw| std::str::from_utf8(raw).ok())
-                .map(normalize_rel)
-                .filter(|f| is_code_file(f))
-                .collect();
-            files.sort();
-            files.dedup();
-            if !files.is_empty() {
-                return files;
-            }
-        }
-    }
+        .ok()
+        .map(|output| output.stdout)
+}
+
+fn walk_code_files(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
     let walker = WalkDir::new(root)
         .follow_links(false)
@@ -275,20 +322,22 @@ fn list_code_files(root: &Path) -> Vec<String> {
             if !entry.file_type().is_dir() {
                 return true;
             }
-            !matches!(
-                entry.file_name().to_str().unwrap_or(""),
-                ".git"
-                    | "node_modules"
-                    | "target"
-                    | "dist"
-                    | "coverage"
-                    | "vendor"
-                    | "build"
-                    | "out"
-                    | ".venv"
-                    | "venv"
-                    | "__pycache__"
-            )
+            let name = entry.file_name().to_str().unwrap_or("");
+            !name.starts_with('.')
+                && !matches!(
+                    name,
+                    "node_modules"
+                        | "target"
+                        | "dist"
+                        | "coverage"
+                        | ".git"
+                        | ".venv"
+                        | "venv"
+                        | "__pycache__"
+                        | "build"
+                        | "out"
+                        | "vendor"
+                )
         });
     for entry in walker.filter_map(Result::ok).take(MAX_WALK_FILES) {
         if !entry.file_type().is_file() {
@@ -301,29 +350,177 @@ fn list_code_files(root: &Path) -> Vec<String> {
             }
         }
     }
-    files.sort();
     files
 }
 
-fn rev(root: &Path, args: &[&str]) -> String {
-    Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+fn list_code_files(root: &Path) -> Vec<String> {
+    const EXTENSIONS: &[&str] = &[
+        "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts",
+        "swift", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "cs", "php", "scala", "dart",
+        "m", "mm", "zig", "vue", "svelte", "py", "pyi",
+    ];
+    let mut args = vec![
+        "ls-files".into(),
+        "-c".into(),
+        "-o".into(),
+        "--exclude-standard".into(),
+        "-z".into(),
+        "--".into(),
+    ];
+    args.extend(EXTENSIONS.iter().map(|extension| format!("*.{extension}")));
+    if let Some(stdout) = run_command(root, "git", &args) {
+        let mut seen = HashSet::new();
+        let files: Vec<_> = stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|raw| std::str::from_utf8(raw).ok())
+            .map(normalize_rel)
+            .filter(|file| is_code_file(file) && seen.insert(file.clone()))
+            .collect();
+        if !files.is_empty() {
+            return files;
+        }
+    }
+    walk_code_files(root)
+}
+
+fn git_value(root: &Path, args: &[&str]) -> String {
+    let args = args
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    run_command(root, "git", &args)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown".into())
 }
 
-fn parse_rg_line(line: &str) -> Option<SearchRow> {
-    let mut parts = line.splitn(3, ':');
-    let file = normalize_rel(parts.next()?);
-    let ln = parts.next()?.parse().ok()?;
-    let text = parts.next()?.to_string();
-    Some(SearchRow { file, ln, text })
+fn short_rev(root: &Path) -> String {
+    git_value(root, &["rev-parse", "--short", "HEAD"])
+}
+
+fn git_head(root: &Path) -> (String, String) {
+    (
+        git_value(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        short_rev(root),
+    )
+}
+
+fn excluded_search_path(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    lower.contains("src-tauri/target")
+        || lower.contains("node_modules")
+        || lower.contains("package-lock")
+        || lower.ends_with(".png")
+        || lower.contains("/dist/")
+        || lower.starts_with("dist/")
+        || lower.contains("/coverage/")
+        || lower.starts_with("coverage/")
+        || lower.ends_with(".min.js")
+        || lower.ends_with(".lock")
+        || lower.contains(".generated.")
+}
+
+fn parse_search_rows(bytes: Vec<u8>) -> Vec<SearchRow> {
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    let mut rows = text
+        .lines()
+        .filter_map(|line| {
+            let first = line.find(':')?;
+            let second = line[first + 1..].find(':')? + first + 1;
+            let file = normalize_rel(&line[..first]);
+            let ln = line[first + 1..second].parse().ok()?;
+            (!file.is_empty() && !excluded_search_path(&file)).then(|| SearchRow {
+                file,
+                ln,
+                text: line[second + 1..].to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.ln.cmp(&b.ln))
+            .then(a.text.cmp(&b.text))
+    });
+    rows.truncate(MAX_HIT_LINES);
+    rows
+}
+
+fn search_in_process(
+    root: &Path,
+    terms: &[String],
+    ignore_case: bool,
+    word: bool,
+) -> Vec<SearchRow> {
+    let files = list_code_files(root);
+    let needles = terms
+        .iter()
+        .map(|term| {
+            if ignore_case {
+                term.to_lowercase()
+            } else {
+                term.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let word_res = if word {
+        terms
+            .iter()
+            .filter_map(|term| {
+                Regex::new(&format!(
+                    r"(?{}:\b{}\b)",
+                    if ignore_case { "i" } else { "" },
+                    regex::escape(term)
+                ))
+                .ok()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut parts = Vec::with_capacity(files.len());
+    for file in files {
+        let Ok(text) = fs::read_to_string(root.join(&file)) else {
+            parts.push(Vec::new());
+            continue;
+        };
+        let mut rows = Vec::new();
+        for (index, line) in text.split('\n').enumerate() {
+            let hay = if ignore_case {
+                line.to_lowercase()
+            } else {
+                line.to_string()
+            };
+            let matched = if word {
+                word_res.iter().any(|regex| regex.is_match(line))
+            } else {
+                needles.iter().any(|needle| hay.contains(needle))
+            };
+            if matched {
+                rows.push(SearchRow {
+                    file: file.clone(),
+                    ln: index + 1,
+                    text: line.to_string(),
+                });
+                if rows.len() >= MAX_HITS_PER_FILE {
+                    break;
+                }
+            }
+        }
+        parts.push(rows);
+    }
+    let mut rows = parts.into_iter().flatten().collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.ln.cmp(&b.ln))
+            .then(a.text.cmp(&b.text))
+    });
+    rows.truncate(MAX_HIT_LINES);
+    rows
 }
 
 fn search_text(
@@ -331,127 +528,135 @@ fn search_text(
     terms: &[String],
     ignore_case: bool,
     word: bool,
-    files: &[String],
+    _files: &[String],
 ) -> Vec<SearchRow> {
+    let mut seen = HashSet::new();
+    let terms = terms
+        .iter()
+        .filter(|term| !term.is_empty() && seen.insert((*term).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
     if terms.is_empty() {
         return Vec::new();
     }
-    let mut cmd = Command::new("rg");
-    cmd.current_dir(root).args([
-        "-n",
-        "--no-heading",
-        "--color",
-        "never",
-        "-F",
-        "--path-separator",
-        "/",
-        "--max-count",
-        &MAX_HITS_PER_FILE.to_string(),
-    ]);
-    if ignore_case {
-        cmd.arg("-i");
-    }
-    if word {
-        cmd.arg("-w");
-    }
-    for term in terms {
-        cmd.args(["-e", term]);
-    }
-    for glob in [
-        "!**/node_modules/**",
-        "!**/dist/**",
-        "!**/target/**",
-        "!**/coverage/**",
-        "!**/vendor/**",
-    ] {
-        cmd.args(["--glob", glob]);
-    }
-    cmd.arg(".");
-    if let Ok(output) = cmd.output() {
-        if output.status.success() || output.status.code() == Some(1) {
-            if let Ok(text) = String::from_utf8(output.stdout) {
-                return text
-                    .lines()
-                    .filter_map(parse_rg_line)
-                    .take(MAX_HIT_LINES)
-                    .collect();
-            }
+    static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    let rg_available =
+        *RG_AVAILABLE.get_or_init(|| run_command(root, "rg", &["--version".into()]).is_some());
+    if rg_available {
+        let mut args = vec![
+            "-n".into(),
+            "--no-heading".into(),
+            "--color".into(),
+            "never".into(),
+            "-F".into(),
+            "--max-count".into(),
+            MAX_HITS_PER_FILE.to_string(),
+        ];
+        if ignore_case {
+            args.push("-i".into());
+        }
+        if word {
+            args.push("-w".into());
+        }
+        for term in &terms {
+            args.push("-e".into());
+            args.push(term.clone());
+        }
+        for glob in [
+            "!**/node_modules/**",
+            "!**/dist/**",
+            "!**/target/**",
+            "!**/coverage/**",
+            "!**/package-lock.json",
+            "!*.png",
+            "!*.jpg",
+            "!*.jpeg",
+            "!*.gif",
+            "!*.webp",
+            "!*.ico",
+            "!*.woff",
+            "!*.woff2",
+            "!*.ttf",
+            "!*.bin",
+        ] {
+            args.push("--glob".into());
+            args.push(glob.into());
+        }
+        args.push(".".into());
+        if let Some(stdout) = run_command(root, "rg", &args) {
+            return parse_search_rows(stdout);
         }
     }
-    let needles: Vec<_> = terms
-        .iter()
-        .map(|t| {
-            if ignore_case {
-                t.to_lowercase()
-            } else {
-                t.clone()
-            }
-        })
-        .collect();
-    let word_res: Vec<_> = if word {
-        terms
-            .iter()
-            .filter_map(|t| {
-                Regex::new(&format!(
-                    r"(?{}:\b{}\b)",
-                    if ignore_case { "i" } else { "" },
-                    regex::escape(t)
-                ))
-                .ok()
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut rows = Vec::new();
-    for file in files {
-        let Ok(text) = fs::read_to_string(root.join(file)) else {
-            continue;
-        };
-        let mut count = 0;
-        for (i, line) in text.lines().enumerate() {
-            let matched = if word {
-                word_res.iter().any(|re| re.is_match(line))
-            } else {
-                let hay = if ignore_case {
-                    line.to_lowercase()
-                } else {
-                    line.to_string()
-                };
-                needles.iter().any(|needle| hay.contains(needle))
-            };
-            if matched {
-                rows.push(SearchRow {
-                    file: file.clone(),
-                    ln: i + 1,
-                    text: line.to_string(),
-                });
-                count += 1;
-                if count >= MAX_HITS_PER_FILE || rows.len() >= MAX_HIT_LINES {
-                    break;
-                }
-            }
+    let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
+    if inside == "true" {
+        let mut args = vec!["grep".into(), "-nI".into(), "--untracked".into()];
+        if ignore_case {
+            args.push("-i".into());
         }
-        if rows.len() >= MAX_HIT_LINES {
-            break;
+        if word {
+            args.push("-w".into());
+        }
+        args.push("-F".into());
+        for term in &terms {
+            args.push("-e".into());
+            args.push(term.clone());
+        }
+        args.push("--".into());
+        if let Some(stdout) = run_command(root, "git", &args) {
+            return parse_search_rows(stdout);
         }
     }
-    rows
+    search_in_process(root, &terms, ignore_case, word)
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum LexState {
     Code,
-    Single,
     Double,
     Template,
     BlockComment,
     Raw(usize),
 }
 
+fn regex_literal_allowed(output: &str) -> bool {
+    let trimmed = output.trim_end();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let last = trimmed.chars().last().unwrap_or('\0');
+    if matches!(
+        last,
+        '(' | ','
+            | '='
+            | ':'
+            | '['
+            | '!'
+            | '&'
+            | '|'
+            | '?'
+            | '{'
+            | ';'
+            | '+'
+            | '*'
+            | '%'
+            | '~'
+            | '^'
+    ) {
+        return true;
+    }
+    static KEYWORD: OnceLock<Regex> = OnceLock::new();
+    KEYWORD
+        .get_or_init(|| {
+            Regex::new(r"\b(?:return|case|typeof|instanceof|in|of|do|else|yield|await|new)$")
+                .unwrap()
+        })
+        .is_match(trimmed)
+}
+
 fn stripped_depth(lines: &[String], rust: bool) -> (Vec<String>, Vec<usize>, Vec<usize>) {
     let mut state = LexState::Code;
     let mut depth = 0usize;
+    let mut template_stack = Vec::<usize>::new();
     let mut starts = Vec::with_capacity(lines.len());
     let mut after = Vec::with_capacity(lines.len());
     let mut code = Vec::with_capacity(lines.len());
@@ -468,17 +673,6 @@ fn stripped_depth(lines: &[String], rust: bool) -> (Vec<String>, Vec<usize>, Vec
                     if c == '*' && next == '/' {
                         state = LexState::Code;
                         i += 2;
-                    } else {
-                        i += 1;
-                    }
-                    continue;
-                }
-                LexState::Single => {
-                    if c == '\\' {
-                        i += 2;
-                    } else if c == '\'' {
-                        state = LexState::Code;
-                        i += 1;
                     } else {
                         i += 1;
                     }
@@ -501,6 +695,11 @@ fn stripped_depth(lines: &[String], rust: bool) -> (Vec<String>, Vec<usize>, Vec
                     } else if c == '`' {
                         state = LexState::Code;
                         i += 1;
+                    } else if c == '$' && next == '{' {
+                        template_stack.push(depth);
+                        depth += 1;
+                        state = LexState::Code;
+                        i += 2;
                     } else {
                         i += 1;
                     }
@@ -525,7 +724,41 @@ fn stripped_depth(lines: &[String], rust: bool) -> (Vec<String>, Vec<usize>, Vec
                 i += 2;
                 continue;
             }
-            if rust && c == 'r' {
+            if c == '/' && regex_literal_allowed(&out) {
+                let mut cursor = i + 1;
+                let mut class = false;
+                let mut closed = false;
+                while cursor < chars.len() {
+                    let value = chars[cursor];
+                    if value == '\\' {
+                        cursor += 2;
+                        continue;
+                    }
+                    if class {
+                        if value == ']' {
+                            class = false;
+                        }
+                    } else if value == '[' {
+                        class = true;
+                    } else if value == '/' {
+                        closed = true;
+                        break;
+                    }
+                    cursor += 1;
+                }
+                if closed {
+                    while cursor + 1 < chars.len() && chars[cursor + 1].is_ascii_lowercase() {
+                        cursor += 1;
+                    }
+                    i = cursor + 1;
+                    continue;
+                }
+            }
+            if c == 'r'
+                && !chars
+                    .get(i.wrapping_sub(1))
+                    .is_some_and(|previous| previous.is_ascii_alphanumeric() || *previous == '_')
+            {
                 let mut hashes = 0;
                 while chars.get(i + 1 + hashes) == Some(&'#') {
                     hashes += 1;
@@ -547,16 +780,18 @@ fn stripped_depth(lines: &[String], rust: bool) -> (Vec<String>, Vec<usize>, Vec
                 continue;
             }
             if c == '\'' {
-                if rust {
-                    let tail: String = chars[i..].iter().take(5).collect();
-                    if Regex::new(r"^'(\\.|[^\\'])'").unwrap().is_match(&tail) {
-                        state = LexState::Single;
-                    } else {
-                        out.push(c);
-                    }
+                let char_literal_end = if chars.get(i + 1) == Some(&'\\') {
+                    i + 3
                 } else {
-                    state = LexState::Single;
+                    i + 2
+                };
+                let char_literal = chars.get(char_literal_end) == Some(&'\'')
+                    && chars.get(i + 1).is_some_and(|next| *next != '\'');
+                if char_literal {
+                    i = char_literal_end + 1;
+                    continue;
                 }
+                out.push(c);
                 i += 1;
                 continue;
             }
@@ -565,14 +800,27 @@ fn stripped_depth(lines: &[String], rust: bool) -> (Vec<String>, Vec<usize>, Vec
                 out.push(c);
             } else if c == '}' {
                 depth = depth.saturating_sub(1);
-                out.push(c);
+                if template_stack.last().is_some_and(|saved| *saved == depth) {
+                    template_stack.pop();
+                    state = LexState::Template;
+                } else {
+                    out.push(c);
+                }
             } else {
                 out.push(c);
             }
             i += 1;
         }
-        if matches!(state, LexState::Single | LexState::Double) && !rust && !line.ends_with('\\') {
-            state = LexState::Code;
+        if matches!(state, LexState::Double) {
+            let slash_count = line
+                .chars()
+                .rev()
+                .take_while(|value| *value == '\\')
+                .count();
+            let continued = rust || slash_count % 2 == 1;
+            if !continued {
+                state = LexState::Code;
+            }
         }
         code.push(out);
         after.push(depth);
@@ -582,7 +830,7 @@ fn stripped_depth(lines: &[String], rust: bool) -> (Vec<String>, Vec<usize>, Vec
 
 fn signature(line: &str) -> String {
     let compact = line.split_whitespace().collect::<Vec<_>>().join(" ");
-    compact.chars().take(180).collect()
+    js_utf16_slice(&compact, 120)
 }
 
 fn declaration(text: &str, depth: usize) -> Option<(String, String)> {
@@ -595,8 +843,10 @@ fn declaration(text: &str, depth: usize) -> Option<(String, String)> {
         (Regex::new(r"^macro_rules!\s+([A-Za-z_]\w*)").unwrap(), "macro"),
         (Regex::new(r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)").unwrap(), "class"),
         (Regex::new(r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)").unwrap(), "fn"),
-        (Regex::new(r"^(?:export\s+)?(?:declare\s+)?(?:interface|namespace|enum|type)\s+([A-Za-z_$][\w$]*)").unwrap(), "type"),
-        (Regex::new(r"^(?:export\s+)?(?:declare\s+)?(?:const|let|var|static)\s+([A-Za-z_$][\w$]*)").unwrap(), "const"),
+        (Regex::new(r"^(?:export\s+)?(?:declare\s+)?(?:interface|namespace)\s+([A-Za-z_$][\w$]*)").unwrap(), "type"),
+        (Regex::new(r"^(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+([A-Za-z_$][\w$]*)").unwrap(), "type"),
+        (Regex::new(r"^(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)").unwrap(), "type"),
+        (Regex::new(r"^(?:export\s+)?(?:pub(?:\([^)]*\))?\s+)?(?:declare\s+)?(?:const|let|var|static)\s+([A-Za-z_$][\w$]*)").unwrap(), "const"),
     ]);
     for (re, kind) in decls {
         if let Some(c) = re.captures(text) {
@@ -606,20 +856,57 @@ fn declaration(text: &str, depth: usize) -> Option<(String, String)> {
     if depth > 0 {
         static METHOD: OnceLock<Regex> = OnceLock::new();
         let re = METHOD.get_or_init(|| Regex::new(r"^(?:(?:public|private|protected|readonly|static|async|get|set|override|abstract)\s+)*\*?\s*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\(").unwrap());
-        if let Some(c) = re.captures(text) {
-            if !matches!(
-                &c[1],
-                "if" | "for"
+        let control = |name: &str| {
+            matches!(
+                name,
+                "if" | "else"
+                    | "for"
                     | "while"
                     | "switch"
+                    | "case"
                     | "catch"
+                    | "try"
+                    | "do"
                     | "return"
                     | "match"
                     | "loop"
                     | "function"
                     | "new"
-            ) {
-                return Some((c[1].to_string(), "method".into()));
+                    | "typeof"
+                    | "await"
+                    | "yield"
+                    | "throw"
+                    | "with"
+                    | "in"
+                    | "of"
+                    | "as"
+                    | "is"
+                    | "let"
+                    | "const"
+                    | "var"
+                    | "import"
+                    | "export"
+                    | "require"
+                    | "super"
+                    | "this"
+                    | "self"
+                    | "and"
+                    | "or"
+                    | "not"
+            )
+        };
+        if let Some(captures) = re.captures(text) {
+            if !control(&captures[1]) {
+                return Some((captures[1].to_string(), "method".into()));
+            }
+        }
+        static PROP_BLOCK: OnceLock<Regex> = OnceLock::new();
+        let prop = PROP_BLOCK.get_or_init(|| {
+            Regex::new(r"^([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?(?:function\b|\(|\{|$)").unwrap()
+        });
+        if let Some(captures) = prop.captures(text) {
+            if !control(&captures[1]) {
+                return Some((captures[1].to_string(), "prop".into()));
             }
         }
     }
@@ -628,8 +915,12 @@ fn declaration(text: &str, depth: usize) -> Option<(String, String)> {
 
 fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
     let mut out = Vec::new();
+    if file.ends_with(".py") || file.ends_with(".pyi") {
+        return out;
+    }
     if file.ends_with(".rs") {
-        let re = Regex::new(r"(?m)^\s*(?:pub\s+)?use\s+([^;]+);").unwrap();
+        static RUST_USE: OnceLock<Regex> = OnceLock::new();
+        let re = RUST_USE.get_or_init(|| Regex::new(r"(?m)^\s*(?:pub\s+)?use\s+([^;]+);").unwrap());
         for cap in re.captures_iter(text) {
             let raw = cap[1].trim();
             if let Some(open) = raw.rfind("::{") {
@@ -642,6 +933,9 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
                     } else {
                         (part, part)
                     };
+                    if matches!(orig, "self" | "crate" | "super") {
+                        continue;
+                    }
                     out.push(ImportRef {
                         name: local.into(),
                         from: format!("{base}::{orig}"),
@@ -655,6 +949,9 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
                 } else {
                     (part, part)
                 };
+                if matches!(orig, "self" | "crate" | "super") {
+                    continue;
+                }
                 out.push(ImportRef {
                     name: local.into(),
                     from: format!("{}::{orig}", &raw[..pos]),
@@ -663,47 +960,72 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
         }
         return out;
     }
-    let re =
-        Regex::new(r#"(?ms)^\s*import\s+(?:type\s+)?(.+?)\s+from\s*['\"]([^'\"]+)['\"]"#).unwrap();
+    static JS_IMPORT: OnceLock<Regex> = OnceLock::new();
+    static JS_NAMESPACE: OnceLock<Regex> = OnceLock::new();
+    static JS_NAMED: OnceLock<Regex> = OnceLock::new();
+    static JS_IDENT: OnceLock<Regex> = OnceLock::new();
+    static JS_REEXPORT: OnceLock<Regex> = OnceLock::new();
+    let re = JS_IMPORT.get_or_init(|| {
+        Regex::new(r#"(?ms)^\s*import\s+(?:type\s+)?(.+?)\s+from\s*['\"]([^'\"]+)['\"]"#).unwrap()
+    });
+    let namespace_re =
+        JS_NAMESPACE.get_or_init(|| Regex::new(r"\*\s+as\s+([A-Za-z_$][\w$]*)").unwrap());
+    let named_re = JS_NAMED.get_or_init(|| Regex::new(r"\{([^}]*)\}").unwrap());
+    let ident_re = JS_IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][\w$]*").unwrap());
+    let reexport_re = JS_REEXPORT.get_or_init(|| {
+        Regex::new(r#"(?m)^\s*export\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['\"]([^'\"]+)['\"]"#)
+            .unwrap()
+    });
+    let push_named = |out: &mut Vec<ImportRef>, body: &str, spec: &str| {
+        for part in body
+            .split(',')
+            .map(|value| value.trim().trim_start_matches("type "))
+            .filter(|value| !value.is_empty())
+        {
+            let pieces = part.split_whitespace().collect::<Vec<_>>();
+            let name = if pieces.len() == 3 && pieces[1] == "as" {
+                pieces[2]
+            } else {
+                part
+            };
+            if ident_re
+                .find(name)
+                .is_some_and(|found| found.as_str() == name)
+            {
+                out.push(ImportRef {
+                    name: name.into(),
+                    from: spec.into(),
+                });
+            }
+        }
+    };
     for cap in re.captures_iter(text) {
         let mut body = cap[1].trim().to_string();
+        if body.starts_with('(') {
+            continue;
+        }
         let spec = cap[2].to_string();
-        if let Some(ns) = Regex::new(r"\*\s+as\s+([A-Za-z_$][\w$]*)")
-            .unwrap()
-            .captures(&body)
-        {
+        if let Some(ns) = namespace_re.captures(&body) {
             out.push(ImportRef {
                 name: ns[1].into(),
                 from: spec.clone(),
             });
+            body = body.replacen(ns.get(0).unwrap().as_str(), "", 1);
         }
-        if let Some(named) = Regex::new(r"\{([^}]*)\}").unwrap().captures(&body) {
-            for part in named[1]
-                .split(',')
-                .map(|v| v.trim().trim_start_matches("type "))
-                .filter(|v| !v.is_empty())
-            {
-                let pieces: Vec<_> = part.split_whitespace().collect();
-                let name = if pieces.len() == 3 && pieces[1] == "as" {
-                    pieces[2]
-                } else {
-                    part
-                };
-                if Regex::new(r"^[A-Za-z_$][\w$]*$").unwrap().is_match(name) {
-                    out.push(ImportRef {
-                        name: name.into(),
-                        from: spec.clone(),
-                    });
-                }
-            }
-            body = body.replace(named.get(0).unwrap().as_str(), "");
+        if let Some(named) = named_re.captures(&body) {
+            push_named(&mut out, &named[1], &spec);
+            body = body.replacen(named.get(0).unwrap().as_str(), "", 1);
         }
-        if let Some(def) = Regex::new(r"[A-Za-z_$][\w$]*").unwrap().find(&body) {
+        let rest = body.replace(',', " ");
+        if let Some(def) = ident_re.find(&rest) {
             out.push(ImportRef {
                 name: def.as_str().into(),
                 from: spec,
             });
         }
+    }
+    for captures in reexport_re.captures_iter(text) {
+        push_named(&mut out, &captures[1], &captures[2]);
     }
     out
 }
@@ -717,7 +1039,10 @@ fn scan_source(text: &str, file: &str) -> FileEntry {
         lines.pop();
     }
     if file.ends_with(".py") || file.ends_with(".pyi") {
-        let re = Regex::new(r"^([ \t]*)(?:async[ \t]+)?(def|class)[ \t]+([A-Za-z_]\w*)").unwrap();
+        static PY_DECL: OnceLock<Regex> = OnceLock::new();
+        let re = PY_DECL.get_or_init(|| {
+            Regex::new(r"^([ \t]*)(?:async[ \t]+)?(def|class)[ \t]+([A-Za-z_]\w*)").unwrap()
+        });
         let mut syms = Vec::new();
         for i in 0..lines.len() {
             let Some(cap) = re.captures(&lines[i]) else {
@@ -773,26 +1098,38 @@ fn scan_source(text: &str, file: &str) -> FileEntry {
         let Some((name, kind)) = declaration(stripped, depth) else {
             continue;
         };
-        let mut open = None;
-        if after[i] > depth {
-            open = Some(i);
+        let current = code[i].trim_end();
+        let end = if after[i] <= depth && current.ends_with([';', ',']) {
+            i
         } else {
-            for j in i + 1..(i + 14).min(lines.len()) {
+            let mut open = None;
+            let mut early_end = None;
+            for j in i..(i + 14).min(lines.len()) {
                 if after[j] > depth {
                     open = Some(j);
                     break;
                 }
-                if code[j].trim().is_empty() || code[j].trim_end().ends_with([';', ',']) {
-                    break;
+                if j > i {
+                    let value = code[j].trim_end();
+                    if value.ends_with([';', ',']) {
+                        early_end = Some(j);
+                        break;
+                    }
+                    if value.trim().is_empty() {
+                        early_end = Some(j - 1);
+                        break;
+                    }
                 }
             }
-        }
-        let end = if let Some(open) = open {
-            (open..lines.len())
-                .find(|j| after[*j] <= depth)
-                .unwrap_or(lines.len() - 1)
-        } else {
-            i
+            if let Some(end) = early_end {
+                end
+            } else if let Some(open) = open {
+                (open..lines.len())
+                    .find(|j| after[*j] <= depth)
+                    .unwrap_or(lines.len() - 1)
+            } else {
+                i
+            }
         };
         if kind == "method" && end == i && !stripped.trim_end().ends_with(['(', '{']) {
             continue;
@@ -897,19 +1234,23 @@ fn build_index(
     root: &Path,
     wanted: Option<&HashSet<String>>,
     dependency_depth: usize,
+    known_files: Option<&[String]>,
 ) -> (IndexView, Vec<String>) {
-    let all = list_code_files(root);
+    let all = known_files
+        .map(<[String]>::to_vec)
+        .unwrap_or_else(|| list_code_files(root));
     let all_set: HashSet<_> = all.iter().cloned().collect();
     let mut cache = load_cache(root);
     let mut targets: HashSet<String> = wanted.cloned().unwrap_or_else(|| all_set.clone());
     let mut frontier: Vec<String> = targets.iter().cloned().collect();
+    let mut dirty = false;
     for depth in 0..=dependency_depth {
         let current = frontier;
         frontier = Vec::new();
         for file in current {
             let path = root.join(&file);
             let Some((size, modified_ns)) = metadata_stamp(&path) else {
-                cache.files.remove(&file);
+                dirty |= cache.files.remove(&file).is_some();
                 continue;
             };
             let stale = cache
@@ -923,6 +1264,7 @@ fn build_index(
                     entry.size = size;
                     entry.modified_ns = modified_ns;
                     cache.files.insert(file.clone(), entry);
+                    dirty = true;
                 }
             }
             if depth < dependency_depth {
@@ -942,33 +1284,40 @@ fn build_index(
         }
     }
     if wanted.is_none() {
+        let before = cache.files.len();
         cache.files.retain(|f, _| all_set.contains(f));
+        dirty |= cache.files.len() != before;
     }
-    let selected: HashMap<_, _> = cache
-        .files
-        .iter()
-        .filter(|(f, _)| wanted.is_none() || targets.contains(*f))
-        .map(|(f, e)| (f.clone(), e.clone()))
-        .collect();
-    store_cache(root, cache);
+    let selected = cache.files.clone();
+    store_cache(root, cache, dirty);
     let mut view = IndexView {
         files: selected,
         ..Default::default()
     };
-    for (file, entry) in &view.files {
+    let mut indexed_files = view.files.keys().cloned().collect::<Vec<_>>();
+    indexed_files.sort();
+    for file in &indexed_files {
+        let entry = &view.files[file];
         for symbol in &entry.syms {
-            if symbol.kind != "prop" && symbol.depth <= 1 {
-                view.defs
-                    .entry(symbol.name.clone())
-                    .or_default()
-                    .push(Definition {
-                        file: file.clone(),
-                        symbol: symbol.clone(),
-                    });
+            if symbol.kind == "prop" || symbol.depth > 1 {
+                continue;
             }
+            if symbol.depth == 1
+                && !matches!(symbol.kind.as_str(), "fn" | "method" | "type" | "class")
+            {
+                continue;
+            }
+            view.defs
+                .entry(symbol.name.clone())
+                .or_default()
+                .push(Definition {
+                    file: file.clone(),
+                    symbol: symbol.clone(),
+                });
         }
     }
-    for (file, entry) in &view.files {
+    for file in &indexed_files {
+        let entry = &view.files[file];
         let mut imports = HashMap::new();
         for import in &entry.imports {
             if let Some(target) = resolve_specifier(&import.from, file, &all_set) {
@@ -979,15 +1328,15 @@ fn build_index(
             view.imports.insert(file.clone(), imports);
         }
     }
+    for definitions in view.defs.values_mut() {
+        definitions.sort_by(|a, b| a.file.cmp(&b.file).then(a.symbol.ln.cmp(&b.symbol.ln)));
+    }
     (view, all)
 }
 
 fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> {
     let text = fs::read_to_string(root.join(file)).ok()?;
-    let mut lines: Vec<_> = text
-        .split('\n')
-        .map(|v| v.trim_end_matches('\r').to_string())
-        .collect();
+    let mut lines: Vec<_> = text.split('\n').map(str::to_string).collect();
     if lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
@@ -999,34 +1348,141 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
     Some(Source { lines, syms })
 }
 
+fn js_utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
+fn js_utf16_slice(value: &str, units: usize) -> String {
+    let utf16 = value.encode_utf16().take(units).collect::<Vec<_>>();
+    String::from_utf16_lossy(&utf16)
+}
+
 fn clip(line: &str) -> String {
-    if line.chars().count() <= MAX_LINE_CHARS {
+    let length = js_utf16_len(line);
+    if length <= MAX_LINE_CHARS {
         line.into()
     } else {
-        format!("{}…", line.chars().take(MAX_LINE_CHARS).collect::<String>())
+        format!(
+            "{}…(+{}c)",
+            js_utf16_slice(line, MAX_LINE_CHARS),
+            length - MAX_LINE_CHARS
+        )
     }
 }
-fn contains_word(text: &str, word: &str) -> bool {
-    Regex::new(&format!(r"\b{}\b", regex::escape(word))).is_ok_and(|r| r.is_match(text))
+
+fn range_cost(source: &Source, start: usize, end: usize) -> usize {
+    48 + source.lines[start - 1..end]
+        .iter()
+        .map(|line| clip(line).len() + 1)
+        .sum::<usize>()
 }
+fn noise_path(file: &str) -> bool {
+    static NOISE: OnceLock<Regex> = OnceLock::new();
+    NOISE
+        .get_or_init(|| Regex::new(r"(?i)\.(test|spec)\.[^.]+$|/__tests__/|/tests?/").unwrap())
+        .is_match(file)
+}
+
 fn score_path(file: &str) -> i64 {
-    let mut s = 0;
-    if file.contains("/src/") || file.starts_with("src/") {
-        s += 14;
+    let mut score = 0;
+    if !is_code_file(file) {
+        score -= 90;
+    }
+    if noise_path(file) {
+        score -= 55;
+    }
+    if file.contains("scripts/legacy-context") {
+        score -= 60;
+    }
+    if file.starts_with("src/") || file.starts_with("src-tauri/src/") {
+        score += 14;
     }
     if file.starts_with("scripts/") {
-        s += 10;
+        score += 10;
     }
-    if file.contains("test") || file.contains("spec") {
-        s -= 55;
+    let lower = file.to_ascii_lowercase();
+    if lower.ends_with(".md")
+        || lower.ends_with(".json")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".txt")
+    {
+        score -= 40;
     }
-    s
+    score
 }
+fn unit_for_hit<'a>(symbols: &'a [Symbol], line: usize) -> (Option<&'a Symbol>, Vec<&'a Symbol>) {
+    let mut chain = symbols
+        .iter()
+        .filter(|symbol| symbol.ln <= line && symbol.end >= line)
+        .collect::<Vec<_>>();
+    chain.sort_by_key(|symbol| (symbol.depth, symbol.ln));
+    let span = |symbol: &Symbol| symbol.end - symbol.ln + 1;
+    let mut picked = chain
+        .iter()
+        .rev()
+        .find(|symbol| span(symbol) >= 12)
+        .copied()
+        .or_else(|| chain.last().copied());
+    if picked.is_some_and(|symbol| span(symbol) > 80) {
+        if let Some(compact) = chain.iter().rev().find(|symbol| {
+            let size = span(symbol);
+            size >= 4 && size <= 80
+        }) {
+            picked = Some(*compact);
+        }
+    }
+    (picked, chain)
+}
+
+fn unit_label(chain: &[&Symbol], unit: &Symbol) -> String {
+    let mut parts = chain
+        .iter()
+        .filter(|symbol| symbol.depth < unit.depth)
+        .rev()
+        .take(2)
+        .map(|symbol| symbol.name.clone())
+        .collect::<Vec<_>>();
+    parts.reverse();
+    parts.push(if matches!(unit.kind.as_str(), "prop" | "method") {
+        unit.name.clone()
+    } else {
+        format!("{} {}", unit.kind, unit.name)
+    });
+    parts.join(" > ")
+}
+
+fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_unstable();
+    let mut merged = Vec::new();
+    let (mut start, mut end) = ranges[0];
+    for (next_start, next_end) in ranges.into_iter().skip(1) {
+        if next_start <= end + 1 {
+            end = end.max(next_end);
+        } else {
+            merged.push((start, end));
+            start = next_start;
+            end = next_end;
+        }
+    }
+    merged.push((start, end));
+    merged
+}
+
 fn shown_ranges(plan: &PlannedFile) -> Vec<(usize, usize)> {
     if plan.full {
         vec![(1, plan.source.lines.len())]
     } else {
-        plan.blocks.iter().map(|b| (b.start, b.end)).collect()
+        merge_ranges(
+            plan.blocks
+                .iter()
+                .map(|block| (block.start, block.end))
+                .collect(),
+        )
     }
 }
 fn covered(plan: &PlannedFile, line: usize) -> bool {
@@ -1035,7 +1491,246 @@ fn covered(plan: &PlannedFile, line: usize) -> bool {
         .any(|(a, b)| line >= *a && line <= *b)
 }
 
+fn stop_word(value: &str) -> bool {
+    matches!(
+        value,
+        "self"
+            | "this"
+            | "true"
+            | "false"
+            | "null"
+            | "none"
+            | "some"
+            | "void"
+            | "undefined"
+            | "async"
+            | "await"
+            | "const"
+            | "let"
+            | "var"
+            | "function"
+            | "return"
+            | "export"
+            | "import"
+            | "from"
+            | "default"
+            | "class"
+            | "extends"
+            | "implements"
+            | "interface"
+            | "type"
+            | "enum"
+            | "struct"
+            | "trait"
+            | "impl"
+            | "pub"
+            | "crate"
+            | "super"
+            | "match"
+            | "while"
+            | "break"
+            | "continue"
+            | "else"
+            | "catch"
+            | "throw"
+            | "typeof"
+            | "instanceof"
+            | "string"
+            | "number"
+            | "boolean"
+            | "object"
+            | "symbol"
+            | "bigint"
+            | "never"
+            | "unknown"
+            | "any"
+            | "array"
+            | "promise"
+            | "record"
+            | "partial"
+            | "readonly"
+            | "static"
+            | "public"
+            | "private"
+            | "protected"
+            | "delete"
+            | "error"
+            | "result"
+            | "option"
+            | "vec"
+            | "hashmap"
+            | "value"
+            | "data"
+            | "text"
+            | "name"
+            | "path"
+            | "file"
+            | "line"
+            | "lines"
+            | "args"
+            | "options"
+            | "opts"
+            | "params"
+            | "props"
+            | "state"
+            | "index"
+            | "item"
+            | "items"
+            | "json"
+            | "utf8"
+            | "length"
+            | "push"
+            | "slice"
+            | "split"
+            | "join"
+            | "test"
+            | "exec"
+            | "clone"
+            | "unwrap"
+            | "expect"
+            | "into"
+            | "iter"
+            | "collect"
+            | "format"
+            | "println"
+            | "console"
+            | "process"
+            | "require"
+            | "with"
+            | "then"
+            | "when"
+            | "that"
+    )
+}
+
+fn resolve_ref<'a>(index: &'a IndexView, name: &str, from_file: &str) -> Option<&'a Definition> {
+    if let Some(entry) = index.files.get(from_file) {
+        if let Some(symbol) = entry
+            .syms
+            .iter()
+            .find(|symbol| symbol.name == name && symbol.depth == 0 && symbol.kind != "prop")
+        {
+            return index.defs.get(name)?.iter().find(|definition| {
+                definition.file == from_file && definition.symbol.ln == symbol.ln
+            });
+        }
+    }
+    let target = index.imports.get(from_file)?.get(name)?;
+    index
+        .defs
+        .get(name)?
+        .iter()
+        .find(|definition| &definition.file == target)
+}
+
+fn collect_dependencies(
+    index: &IndexView,
+    plans: &[PlannedFile],
+    owned: &HashSet<(String, usize)>,
+    keywords: &HashSet<String>,
+) -> Vec<(String, Definition)> {
+    static IDENT: OnceLock<Regex> = OnceLock::new();
+    static LOCAL: OnceLock<Regex> = OnceLock::new();
+    let ident = IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*").unwrap());
+    let local = LOCAL.get_or_init(|| Regex::new(r"\b(?:const|let|var|function|fn|struct|enum|class|type|interface)\s+([A-Za-z_$][\w$]*)").unwrap());
+    #[derive(Clone)]
+    struct Seen {
+        name: String,
+        count: usize,
+        call: bool,
+        files: Vec<String>,
+    }
+    let mut seen = Vec::<Seen>::new();
+    let mut positions = HashMap::<String, usize>::new();
+    let mut locals = HashSet::<String>::new();
+    for plan in plans {
+        let mut text = String::new();
+        for (start, end) in shown_ranges(plan) {
+            text.push_str(&plan.source.lines[start - 1..end].join("\n"));
+        }
+        for captures in local.captures_iter(&text) {
+            locals.insert(captures[1].to_string());
+        }
+        for found in ident.find_iter(&text) {
+            let name = found.as_str();
+            if name.len() < 4 || stop_word(&name.to_lowercase()) {
+                continue;
+            }
+            if found.start() > 0 && text.as_bytes()[found.start() - 1] == b'.' {
+                continue;
+            }
+            let after = text.as_bytes().get(found.end()).copied();
+            let call = matches!(after, Some(b'(' | b'<'));
+            if let Some(position) = positions.get(name).copied() {
+                let entry = &mut seen[position];
+                entry.count += 1;
+                entry.call |= call;
+                if !entry.files.contains(&plan.file) {
+                    entry.files.push(plan.file.clone());
+                }
+            } else {
+                positions.insert(name.to_string(), seen.len());
+                seen.push(Seen {
+                    name: name.into(),
+                    count: 1,
+                    call,
+                    files: vec![plan.file.clone()],
+                });
+            }
+        }
+    }
+    let mut candidates = Vec::<(String, Definition, i64, usize)>::new();
+    for info in seen {
+        if keywords.contains(&info.name) || locals.contains(&info.name) {
+            continue;
+        }
+        let mut definition = None;
+        for file in &info.files {
+            if let Some(found) = resolve_ref(index, &info.name, file) {
+                definition = Some(found.clone());
+                break;
+            }
+        }
+        let Some(definition) = definition else {
+            continue;
+        };
+        if owned.contains(&(definition.file.clone(), definition.symbol.ln))
+            || matches!(definition.symbol.kind.as_str(), "mod" | "impl")
+        {
+            continue;
+        }
+        let size = definition.symbol.end - definition.symbol.ln + 1;
+        let mut score = info.count as i64 * 3 + if info.call { 8 } else { 0 };
+        if size <= 40 {
+            score += 6;
+        }
+        if definition.file.starts_with("src/")
+            || definition.file.starts_with("src-tauri/src/")
+            || definition.file.starts_with("scripts/")
+        {
+            score += 3;
+        }
+        candidates.push((info.name, definition, score, size));
+    }
+    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut per_file = HashMap::<String, usize>::new();
+    let mut picked = Vec::new();
+    for (name, definition, _, _) in candidates {
+        if picked.len() >= MAX_DEPS {
+            break;
+        }
+        let count = per_file.entry(definition.file.clone()).or_default();
+        if *count >= 3 {
+            continue;
+        }
+        *count += 1;
+        picked.push((name, definition));
+    }
+    picked
+}
+
 pub fn find_symbols(root: &Path, params: Value) -> Result<String, String> {
+    let mut seen_names = HashSet::new();
     let names: Vec<String> = params
         .get("names")
         .and_then(Value::as_array)
@@ -1043,27 +1738,30 @@ pub fn find_symbols(root: &Path, params: Value) -> Result<String, String> {
         .flatten()
         .filter_map(Value::as_str)
         .map(str::trim)
-        .filter(|v| !v.is_empty())
+        .filter(|value| !value.is_empty() && seen_names.insert((*value).to_string()))
         .take(12)
         .map(str::to_string)
         .collect();
     if names.is_empty() {
         return Ok("错误: names 不能为空".into());
     }
-    let all = list_code_files(root);
-    let rows = search_text(root, &names, false, true, &all);
+    let (all, rows, revision) = std::thread::scope(|scope| {
+        let files = scope.spawn(|| list_code_files(root));
+        let search = scope.spawn(|| search_text(root, &names, false, true, &[]));
+        let revision = scope.spawn(|| short_rev(root));
+        (
+            files.join().unwrap_or_default(),
+            search.join().unwrap_or_default(),
+            revision.join().unwrap_or_else(|_| "unknown".into()),
+        )
+    });
     let wanted: HashSet<_> = rows.iter().map(|r| r.file.clone()).collect();
-    let (index, _) = build_index(root, Some(&wanted), 0);
-    let mut out = vec![format!(
-        "# 符号定位 @{}",
-        rev(root, &["rev-parse", "--short", "HEAD"])
-    )];
+    let (index, _) = build_index(root, Some(&wanted), 0, Some(&all));
+    let mut out = vec![format!("# 符号定位 @{revision}")];
     for name in names {
         let defs = index.defs.get(&name).cloned().unwrap_or_default();
-        let hits: Vec<_> = rows
-            .iter()
-            .filter(|r| contains_word(&r.text, &name))
-            .collect();
+        let word_re = Regex::new(&format!(r"\b{}\b", regex::escape(&name))).unwrap();
+        let hits: Vec<_> = rows.iter().filter(|r| word_re.is_match(&r.text)).collect();
         out.push(String::new());
         out.push(format!(
             "## {name}  defs={} refs={}",
@@ -1076,17 +1774,20 @@ pub fn find_symbols(root: &Path, params: Value) -> Result<String, String> {
                 d.file, d.symbol.ln, d.symbol.end, d.symbol.sig
             ));
         }
-        for h in hits
+        let rest = hits
             .iter()
             .filter(|h| !defs.iter().any(|d| d.file == h.file && d.symbol.ln == h.ln))
-            .take(24)
-        {
+            .collect::<Vec<_>>();
+        for h in rest.iter().take(24) {
             out.push(format!(
                 "    {}:{} {}",
                 h.file,
                 h.ln,
-                h.text.trim().chars().take(110).collect::<String>()
+                js_utf16_slice(h.text.trim(), 110)
             ));
+        }
+        if rest.len() > 24 {
+            out.push(format!("    … +{}", rest.len() - 24));
         }
         if defs.is_empty() && hits.is_empty() {
             out.push("(无命中)".into());
@@ -1103,7 +1804,7 @@ pub fn code_map(root: &Path, params: Value) -> Result<String, String> {
             .unwrap_or("")
             .trim(),
     );
-    let (index, _) = build_index(root, None, 0);
+    let (index, _) = build_index(root, None, 0, None);
     let mut files: Vec<_> = index
         .files
         .keys()
@@ -1125,11 +1826,11 @@ pub fn code_map(root: &Path, params: Value) -> Result<String, String> {
         .file_name()
         .and_then(|v| v.to_str())
         .unwrap_or("workspace");
-    let branch = rev(root, &["rev-parse", "--abbrev-ref", "HEAD"]);
-    let revision = rev(root, &["rev-parse", "--short", "HEAD"]);
+    let (branch, revision) = git_head(root);
     let mut out = vec![format!(
-        "# CODEMAP {name} @{branch} {revision}  {} files  cache: native-bincode",
-        files.len()
+        "# CODEMAP {name} @{branch} {revision}  {} files  cache: {}",
+        files.len(),
+        cache_location_label(root)
     )];
     if scope.is_empty() {
         out.push("# 行数 符号数 文件  (要看符号大纲请带 scope=<目录前缀>)".into());
@@ -1165,19 +1866,18 @@ pub fn code_map(root: &Path, params: Value) -> Result<String, String> {
 }
 
 pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
-    let mut keywords: Vec<String> = params
+    let mut keyword_seen = HashSet::new();
+    let keywords: Vec<String> = params
         .get("keywords")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
         .map(str::trim)
-        .filter(|v| !v.is_empty())
+        .filter(|value| !value.is_empty() && keyword_seen.insert((*value).to_string()))
         .take(5)
         .map(str::to_string)
         .collect();
-    keywords.sort();
-    keywords.dedup();
     let task = params
         .get("task")
         .and_then(Value::as_str)
@@ -1186,21 +1886,35 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .chars()
         .take(300)
         .collect::<String>();
-    let token_re = Regex::new(r"[A-Za-z_$][\w$]{3,}").unwrap();
+    static TASK_TOKEN: OnceLock<Regex> = OnceLock::new();
+    let token_re = TASK_TOKEN.get_or_init(|| Regex::new(r"[A-Za-z_$][\w$]{3,}").unwrap());
     let mut terms = keywords.clone();
-    for m in token_re.find_iter(&task).take(5) {
-        if !terms.iter().any(|v| v.eq_ignore_ascii_case(m.as_str())) {
-            terms.push(m.as_str().into());
+    let mut task_seen = HashSet::new();
+    let mut task_count = 0usize;
+    for found in token_re.find_iter(&task) {
+        let token = found.as_str();
+        let lower = token.to_lowercase();
+        if stop_word(&lower)
+            || !task_seen.insert(lower)
+            || terms.iter().any(|value| value.eq_ignore_ascii_case(token))
+        {
+            continue;
+        }
+        terms.push(token.into());
+        task_count += 1;
+        if task_count >= 5 {
+            break;
         }
     }
+    let mut file_seen = HashSet::new();
     let files: Vec<String> = params
         .get("files")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(normalize_rel)
-        .filter(|v| !v.is_empty())
+        .map(|value| normalize_rel(value.trim()))
+        .filter(|value| !value.is_empty() && file_seen.insert(value.clone()))
         .take(6)
         .collect();
     if terms.is_empty() && files.is_empty() {
@@ -1217,24 +1931,94 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_HARD_BYTES as u64) as usize;
     let hard = hard.clamp(MIN_HARD_BYTES, MAX_HARD_BYTES);
-    let all = list_code_files(root);
-    let mut rows = search_text(root, &terms, false, false, &all);
+    let soft_bytes = hard * 64 / 100;
+    let total_start = Instant::now();
+    let stage = Instant::now();
+    let (mut all, mut rows, revision) = std::thread::scope(|scope| {
+        let files = scope.spawn(|| list_code_files(root));
+        let search = scope.spawn(|| {
+            if terms.is_empty() {
+                Vec::new()
+            } else {
+                search_text(root, &terms, false, false, &[])
+            }
+        });
+        let revision = scope.spawn(|| short_rev(root));
+        (
+            files.join().unwrap_or_default(),
+            search.join().unwrap_or_default(),
+            revision.join().unwrap_or_else(|_| "unknown".into()),
+        )
+    });
+    trace("fast_context.search_and_files", stage);
     let exact_hits: HashSet<_> = terms
         .iter()
         .filter(|term| rows.iter().any(|row| row.text.contains(term.as_str())))
         .cloned()
         .collect();
-    if !exact_hits.is_empty() && exact_hits.len() < terms.len() {
-        let missing = terms
-            .iter()
-            .filter(|term| !exact_hits.contains(*term))
-            .cloned()
-            .collect::<Vec<_>>();
-        rows.extend(search_text(root, &missing, true, false, &all));
+    let missing = terms
+        .iter()
+        .filter(|term| !exact_hits.contains(*term))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut loose_kw = Vec::new();
+    if !missing.is_empty() && !exact_hits.is_empty() {
+        let extra = search_text(root, &missing, true, false, &all);
+        for term in &missing {
+            let lower = term.to_lowercase();
+            if extra
+                .iter()
+                .any(|row| row.text.to_lowercase().contains(&lower))
+            {
+                loose_kw.push(term.clone());
+            }
+        }
+        rows.extend(extra);
+    }
+    let missed_all = keywords
+        .iter()
+        .filter(|keyword| {
+            !rows
+                .iter()
+                .any(|row| row.text.to_lowercase().contains(&keyword.to_lowercase()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for file in rows.iter().map(|row| &row.file).chain(files.iter()) {
+        if !all.contains(file) && root.join(file).is_file() && is_code_file(file) {
+            all.push(file.clone());
+        }
     }
     let mut hit_files: HashMap<String, Vec<SearchRow>> = HashMap::new();
+    let mut file_keywords = HashMap::<String, HashSet<String>>::new();
+    let mut line_keywords = HashMap::<(String, usize), HashSet<String>>::new();
+    let mut keyword_counts = HashMap::<String, usize>::new();
+    let mut hit_order = Vec::new();
     for row in rows {
-        hit_files.entry(row.file.clone()).or_default().push(row);
+        if !hit_files.contains_key(&row.file) {
+            hit_order.push(row.file.clone());
+        }
+        let lower = row.text.to_lowercase();
+        for term in &terms {
+            if row.text.contains(term) || lower.contains(&term.to_lowercase()) {
+                file_keywords
+                    .entry(row.file.clone())
+                    .or_default()
+                    .insert(term.clone());
+                line_keywords
+                    .entry((row.file.clone(), row.ln))
+                    .or_default()
+                    .insert(term.clone());
+                *keyword_counts.entry(term.clone()).or_default() += 1;
+            }
+        }
+        let file_rows = hit_files.entry(row.file.clone()).or_default();
+        if file_rows.iter().any(|existing| existing.ln == row.ln)
+            || file_rows.len() >= MAX_HITS_PER_FILE
+        {
+            continue;
+        }
+        file_rows.push(row);
     }
     let subject: HashSet<_> = all
         .iter()
@@ -1246,16 +2030,39 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         })
         .cloned()
         .collect();
-    let definition_line = Regex::new(r"^\s*(?:(?:pub(?:\([^)]*\))?|export|async|unsafe|default|static|const|move)\s+)*(?:fn|struct|enum|trait|impl|type|class|interface|function|def|mod)\b").unwrap();
-    let mut ranked: Vec<(String, i64)> = hit_files
+    static DEFINITION_LINE: OnceLock<Regex> = OnceLock::new();
+    let definition_line = DEFINITION_LINE.get_or_init(|| Regex::new(r"^\s*(?:(?:pub(?:\([^)]*\))?|export|async|unsafe|default|static|const|move)\s+)*(?:fn|struct|enum|trait|impl|type|class|interface|function|def|mod)\b").unwrap());
+    let mut preliminary: Vec<(String, i64)> = hit_order
         .iter()
+        .filter_map(|f| hit_files.get(f).map(|rows| (f, rows)))
         .map(|(f, r)| {
             (
                 f.clone(),
                 score_path(f)
                     + r.len().min(8) as i64 * 4
+                    + file_keywords
+                        .get(f)
+                        .map(|set| {
+                            set.iter()
+                                .map(|term| {
+                                    let count = *keyword_counts.get(term).unwrap_or(&1);
+                                    let weight = if count <= 40 {
+                                        1.0
+                                    } else if count <= 200 {
+                                        0.6
+                                    } else {
+                                        0.25
+                                    };
+                                    (30.0
+                                        * weight
+                                        * if keywords.contains(term) { 1.0 } else { 0.5 })
+                                        as i64
+                                })
+                                .sum::<i64>()
+                        })
+                        .unwrap_or(0)
                     + if r.iter().any(|row| definition_line.is_match(&row.text)) {
-                        160
+                        120
                     } else {
                         0
                     }
@@ -1264,41 +2071,481 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             )
         })
         .collect();
-    for f in files.iter().chain(subject.iter()) {
-        if !ranked.iter().any(|(x, _)| x == f) {
-            ranked.push((f.clone(), if files.contains(f) { 1000 } else { 550 }));
+    for f in files
+        .iter()
+        .chain(all.iter().filter(|file| subject.contains(*file)))
+    {
+        if !preliminary.iter().any(|(x, _)| x == f) {
+            preliminary.push((f.clone(), if files.contains(f) { 1000 } else { 550 }));
         }
     }
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
-    ranked.dedup_by(|a, b| a.0 == b.0);
-    if ranked.is_empty() {
-        return Ok(format!("# CTX @{}\n无命中: {}\n提示: 换更短的符号名/字符串片段，或改用 find_symbols / grep 定位后用 read。",rev(root,&["rev-parse","--short","HEAD"]),terms.join(" ")));
+    preliminary.sort_by(|a, b| b.1.cmp(&a.1));
+    preliminary.dedup_by(|a, b| a.0 == b.0);
+    if preliminary.is_empty() {
+        return Ok(format!("# CTX @{}\n无命中: {}\n提示: 换更短的符号名/字符串片段，或改用 find_symbols / grep 定位后用 read。",short_rev(root),terms.join(" ")));
     }
-    let wanted: HashSet<_> = ranked
+    let mut candidates = preliminary
         .iter()
+        .filter(|(file, _)| is_code_file(file) || files.contains(file))
         .take(MAX_CANDIDATES)
-        .map(|v| v.0.clone())
-        .collect();
-    let (index, _) = build_index(root, Some(&wanted), 1);
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = preliminary.iter().take(3).cloned().collect();
+    }
+    let wanted: HashSet<_> = candidates.iter().map(|value| value.0.clone()).collect();
+    let stage = Instant::now();
+    let (index, _) = build_index(root, Some(&wanted), 1, Some(&all));
+    trace("fast_context.index", stage);
+    let stage = Instant::now();
+    let mut def_names = index.defs.keys().cloned().collect::<Vec<_>>();
+    def_names.sort();
+    let mut seeds = Vec::<(Definition, String, usize)>::new();
+    let mut seed_positions = HashMap::<(String, usize), usize>::new();
+    for keyword in &keywords {
+        let lower = keyword.to_lowercase();
+        for name in &def_names {
+            let weight = if name == keyword {
+                3
+            } else if name.to_lowercase() == lower {
+                2
+            } else if keyword.len() >= 5 && name.to_lowercase().contains(&lower) {
+                1
+            } else {
+                0
+            };
+            if weight == 0 {
+                continue;
+            }
+            for definition in index.defs.get(name).into_iter().flatten() {
+                let key = (definition.file.clone(), definition.symbol.ln);
+                if let Some(position) = seed_positions.get(&key).copied() {
+                    if seeds[position].2 < weight {
+                        seeds[position] = (definition.clone(), name.clone(), weight);
+                    }
+                } else {
+                    seed_positions.insert(key, seeds.len());
+                    seeds.push((definition.clone(), name.clone(), weight));
+                }
+            }
+        }
+    }
+    let seed_files = seeds
+        .iter()
+        .map(|(definition, _, _)| definition.file.clone())
+        .collect::<HashSet<_>>();
+    let mut ordered_seed_files = seed_files.iter().cloned().collect::<Vec<_>>();
+    ordered_seed_files.sort();
+    let mut ranked = hit_order
+        .iter()
+        .filter_map(|file| hit_files.get(file).map(|rows| (file, rows)))
+        .map(|(file, rows)| {
+            let mut score = score_path(file) as f64 + rows.len().min(8) as f64 * 4.0;
+            if let Some(values) = file_keywords.get(file) {
+                for term in values {
+                    let count = *keyword_counts.get(term).unwrap_or(&1);
+                    let weight = if count <= 40 {
+                        1.0
+                    } else if count <= 200 {
+                        0.6
+                    } else {
+                        0.25
+                    };
+                    score += 30.0 * weight * if keywords.contains(term) { 1.0 } else { 0.5 };
+                }
+            }
+            if seed_files.contains(file) {
+                score += 120.0;
+            }
+            if subject.contains(file) {
+                score += 600.0;
+            }
+            if files.contains(file) {
+                score += 500.0;
+            }
+            (file.clone(), score)
+        })
+        .collect::<Vec<_>>();
+    for file in files.iter().rev() {
+        if !ranked.iter().any(|(existing, _)| existing == file) {
+            ranked.insert(0, (file.clone(), 1000.0));
+        }
+    }
+    for file in &ordered_seed_files {
+        if !ranked.iter().any(|(existing, _)| existing == file) {
+            ranked.push((file.clone(), 100.0));
+        }
+    }
+    for file in &all {
+        if subject.contains(file) && !ranked.iter().any(|(existing, _)| existing == file) {
+            ranked.push((file.clone(), 550.0));
+        }
+    }
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut final_candidates = ranked
+        .iter()
+        .filter(|(file, _)| is_code_file(file) || files.contains(file))
+        .take(MAX_CANDIDATES)
+        .cloned()
+        .collect::<Vec<_>>();
+    if final_candidates.is_empty() {
+        final_candidates = ranked.iter().take(3).cloned().collect();
+    }
+    let mut sources = HashMap::<String, Source>::new();
+    for (file, _) in &final_candidates {
+        if let Some(source) = source(root, file, index.files.get(file)) {
+            sources.insert(file.clone(), source);
+        }
+    }
+    let file_rank = final_candidates
+        .iter()
+        .enumerate()
+        .map(|(rank, (file, _))| (file.clone(), rank))
+        .collect::<HashMap<_, _>>();
+    let task_tokens = terms
+        .iter()
+        .skip(keywords.len())
+        .map(|value| value.to_lowercase())
+        .collect::<Vec<_>>();
+    let mut units = Vec::<UnitCandidate>::new();
+    for (file, file_score) in &final_candidates {
+        let Some(source) = sources.get(file) else {
+            continue;
+        };
+        let mut grouped = Vec::<(String, UnitCandidate)>::new();
+        for hit in hit_files.get(file).into_iter().flatten() {
+            if hit.ln > source.lines.len() {
+                continue;
+            }
+            let (unit, chain) = unit_for_hit(&source.syms, hit.ln);
+            let (key, start, end, label, owned_unit) = if let Some(symbol) = unit {
+                (
+                    format!("{}-{}", symbol.ln, symbol.end),
+                    symbol.ln,
+                    symbol.end,
+                    unit_label(&chain, symbol),
+                    Some(symbol.clone()),
+                )
+            } else {
+                let start = hit.ln.saturating_sub(8).max(1);
+                let end = (hit.ln + 8).min(source.lines.len());
+                (format!("w{}", hit.ln / 20), start, end, String::new(), None)
+            };
+            let position = grouped.iter().position(|(existing, _)| existing == &key);
+            let index = position.unwrap_or_else(|| {
+                grouped.push((
+                    key,
+                    UnitCandidate {
+                        file: file.clone(),
+                        start,
+                        end,
+                        label,
+                        tag: "hit",
+                        score: 0.0,
+                        hits: Vec::new(),
+                        keywords: HashSet::new(),
+                        unit: owned_unit,
+                        seed_weight: 0,
+                    },
+                ));
+                grouped.len() - 1
+            });
+            grouped[index].1.hits.push(hit.ln);
+            if let Some(values) = line_keywords.get(&(file.clone(), hit.ln)) {
+                grouped[index].1.keywords.extend(values.iter().cloned());
+            }
+        }
+        for (definition, _, weight) in &seeds {
+            if definition.file != *file {
+                continue;
+            }
+            let key = format!("{}-{}", definition.symbol.ln, definition.symbol.end);
+            let position = grouped.iter().position(|(existing, _)| existing == &key);
+            let index = position.unwrap_or_else(|| {
+                let mut chain = source
+                    .syms
+                    .iter()
+                    .filter(|symbol| {
+                        symbol.ln <= definition.symbol.ln && symbol.end >= definition.symbol.end
+                    })
+                    .collect::<Vec<_>>();
+                chain.sort_by_key(|symbol| (symbol.depth, symbol.ln));
+                let unit = chain
+                    .last()
+                    .copied()
+                    .cloned()
+                    .unwrap_or_else(|| definition.symbol.clone());
+                let label = unit_label(&chain, &unit);
+                grouped.push((
+                    key,
+                    UnitCandidate {
+                        file: file.clone(),
+                        start: definition.symbol.ln,
+                        end: definition.symbol.end,
+                        label: if label.is_empty() {
+                            format!("{} {}", definition.symbol.kind, definition.symbol.name)
+                        } else {
+                            label
+                        },
+                        tag: "hit",
+                        score: 0.0,
+                        hits: Vec::new(),
+                        keywords: HashSet::new(),
+                        unit: Some(unit),
+                        seed_weight: 0,
+                    },
+                ));
+                grouped.len() - 1
+            });
+            grouped[index].1.tag = "def";
+            grouped[index].1.seed_weight = grouped[index].1.seed_weight.max(*weight);
+        }
+        for (_, mut unit) in grouped {
+            let size = unit.end - unit.start + 1;
+            let mut score = *file_score * 0.35;
+            for keyword in &unit.keywords {
+                let count = *keyword_counts.get(keyword).unwrap_or(&1);
+                let weight = if count <= 40 {
+                    1.0
+                } else if count <= 200 {
+                    0.6
+                } else {
+                    0.25
+                };
+                score += 45.0 * weight * if keywords.contains(keyword) { 1.0 } else { 0.5 };
+            }
+            score += unit.hits.len().min(6) as f64 * 8.0;
+            if unit.tag == "def" {
+                score += if unit.seed_weight >= 3 {
+                    200.0
+                } else if unit.seed_weight == 2 {
+                    120.0
+                } else {
+                    30.0
+                };
+            }
+            if unit.unit.as_ref().is_some_and(|symbol| {
+                matches!(symbol.kind.as_str(), "fn" | "method" | "class" | "type")
+            }) {
+                score += 20.0;
+            }
+            if !task_tokens.is_empty() {
+                let body = source.lines[unit.start - 1..unit.end]
+                    .join("\n")
+                    .to_lowercase();
+                for token in &task_tokens {
+                    if body.contains(token) {
+                        score += 15.0;
+                    }
+                }
+            }
+            if size > 150 {
+                score -= (size - 150) as f64 / 8.0;
+            }
+            if *file_rank.get(file).unwrap_or(&9) < 2 {
+                score += 12.0;
+            }
+            unit.score = score;
+            units.push(unit);
+        }
+    }
+    units.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut plans = Vec::<PlannedFile>::new();
     let mut sigs = Vec::<(String, usize, String)>::new();
     let mut used = 0usize;
-    for (rank, (file, _)) in ranked.iter().take(MAX_FILES).enumerate() {
-        let Some(src) = source(root, file, index.files.get(file)) else {
+    let mut used_bytes = 0usize;
+    let push_sig = |sigs: &mut Vec<(String, usize, String)>, file: &str, line: usize, sig: &str| {
+        if sig.len() >= 3
+            && !sigs
+                .iter()
+                .any(|(existing, existing_line, _)| existing == file && *existing_line == line)
+        {
+            sigs.push((file.into(), line, sig.into()));
+        }
+    };
+    for file in &files {
+        let Some(source) = sources.get(file).cloned() else {
             continue;
         };
-        let hits = hit_files.get(file).cloned().unwrap_or_default();
-        let explicit = files.contains(file);
-        let subj = subject.contains(file) && !file.contains("test") && !file.contains("spec");
-        if (explicit && src.lines.len() <= EXPLICIT_FULL_MAX)
-            || (subj && src.lines.len() <= SUBJECT_FULL_MAX)
-            || (src.lines.len() <= FULL_FILE_MAX && rank < 3)
+        if source.lines.len() > EXPLICIT_FULL_MAX {
+            continue;
+        }
+        let cost = range_cost(&source, 1, source.lines.len());
+        if used + source.lines.len() <= budget && used_bytes + cost <= soft_bytes {
+            used += source.lines.len();
+            used_bytes += cost;
+            plans.push(PlannedFile {
+                file: file.clone(),
+                source,
+                section: "edit",
+                full: true,
+                blocks: Vec::new(),
+                rank: *file_rank.get(file).unwrap_or(&99),
+            });
+        }
+    }
+    let subject_list = final_candidates
+        .iter()
+        .map(|(file, _)| file)
+        .filter(|file| subject.contains(*file) && !noise_path(file) && sources.contains_key(*file))
+        .cloned()
+        .collect::<Vec<_>>();
+    for file in &subject_list {
+        let Some(source) = sources.get(file).cloned() else {
+            continue;
+        };
+        if source.lines.len() > SUBJECT_FULL_MAX
+            || plans.iter().any(|plan| plan.file == *file && plan.full)
         {
-            if used + src.lines.len() <= budget {
-                used += src.lines.len();
+            continue;
+        }
+        let cost = range_cost(&source, 1, source.lines.len());
+        if used + source.lines.len() <= budget && used_bytes + cost <= soft_bytes {
+            used += source.lines.len();
+            used_bytes += cost;
+            plans.push(PlannedFile {
+                file: file.clone(),
+                source,
+                section: "edit",
+                full: true,
+                blocks: Vec::new(),
+                rank: *file_rank.get(file).unwrap_or(&99),
+            });
+        }
+    }
+    for file in &subject_list {
+        if plans.iter().any(|plan| plan.file == *file && plan.full) {
+            continue;
+        }
+        let Some(source) = sources.get(file).cloned() else {
+            continue;
+        };
+        if !plans.iter().any(|plan| plan.file == *file) {
+            plans.push(PlannedFile {
+                file: file.clone(),
+                source: source.clone(),
+                section: "edit",
+                full: false,
+                blocks: Vec::new(),
+                rank: *file_rank.get(file).unwrap_or(&99),
+            });
+        }
+        let plan_index = plans.iter().position(|plan| plan.file == *file).unwrap();
+        let hit_lines = hit_files
+            .get(file)
+            .map(|rows| rows.iter().map(|row| row.ln).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut eligible = source
+            .syms
+            .iter()
+            .filter(|symbol| {
+                if symbol.depth > 1
+                    || (symbol.kind == "const" && symbol.end == symbol.ln)
+                    || matches!(
+                        symbol.name.to_ascii_lowercase().as_str(),
+                        "test" | "tests" | "spec"
+                    )
+                {
+                    return false;
+                }
+                !source.syms.iter().any(|parent| {
+                    parent.ln <= symbol.ln
+                        && parent.end >= symbol.end
+                        && parent.depth < symbol.depth
+                        && matches!(
+                            parent.name.to_ascii_lowercase().as_str(),
+                            "test" | "tests" | "spec"
+                        )
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        eligible.sort_by_key(|symbol| {
+            (
+                !hit_lines
+                    .iter()
+                    .any(|line| *line >= symbol.ln && *line <= symbol.end),
+                symbol.ln,
+            )
+        });
+        for symbol in eligible {
+            if plans[plan_index].blocks.len() >= MAX_SUBJECT_UNITS {
+                break;
+            }
+            if plans[plan_index]
+                .blocks
+                .iter()
+                .any(|block| symbol.ln >= block.start && symbol.end <= block.end)
+            {
+                continue;
+            }
+            let lines = symbol.end - symbol.ln + 1;
+            let cost = range_cost(&source, symbol.ln, symbol.end.min(source.lines.len()));
+            if used + lines > budget || used_bytes + cost > soft_bytes {
+                if symbol.depth == 0 {
+                    push_sig(&mut sigs, file, symbol.ln, &symbol.sig);
+                }
+                continue;
+            }
+            let mut chain = source
+                .syms
+                .iter()
+                .filter(|parent| {
+                    parent.ln <= symbol.ln
+                        && parent.end >= symbol.end
+                        && parent.depth < symbol.depth
+                })
+                .collect::<Vec<_>>();
+            chain.sort_by_key(|parent| (parent.depth, parent.ln));
+            chain.push(&symbol);
+            plans[plan_index].blocks.push(Block {
+                start: symbol.ln,
+                end: symbol.end.min(source.lines.len()),
+                label: unit_label(&chain, &symbol),
+                tag: "hit",
+            });
+            used += lines;
+            used_bytes += cost;
+        }
+    }
+    for unit in units {
+        let Some(source) = sources.get(&unit.file).cloned() else {
+            continue;
+        };
+        let plan_index = plans.iter().position(|plan| plan.file == unit.file);
+        if plan_index.is_some_and(|index| plans[index].full) {
+            continue;
+        }
+        if plan_index.is_none() && plans.len() >= MAX_FILES {
+            continue;
+        }
+        if plan_index.is_some_and(|index| plans[index].blocks.len() >= MAX_UNITS_PER_FILE) {
+            continue;
+        }
+        if !unit.hits.is_empty()
+            && unit
+                .hits
+                .iter()
+                .all(|line| plan_index.is_some_and(|index| covered(&plans[index], *line)))
+        {
+            continue;
+        }
+        if plan_index.is_none()
+            && source.lines.len() <= FULL_FILE_MAX
+            && (*file_rank.get(&unit.file).unwrap_or(&9) < 3 || unit.tag == "def")
+        {
+            let cost = range_cost(&source, 1, source.lines.len());
+            if used + source.lines.len() <= budget && used_bytes + cost <= soft_bytes {
+                used += source.lines.len();
+                used_bytes += cost;
+                let rank = *file_rank.get(&unit.file).unwrap_or(&99);
                 plans.push(PlannedFile {
-                    file: file.clone(),
-                    source: src,
+                    file: unit.file,
+                    source,
                     section: "edit",
                     full: true,
                     blocks: Vec::new(),
@@ -1307,132 +2554,35 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 continue;
             }
         }
-        let mut blocks = BTreeMap::<(usize, usize), Block>::new();
-        for hit in &hits {
-            let chain: Vec<_> = src
-                .syms
-                .iter()
-                .filter(|s| s.ln <= hit.ln && s.end >= hit.ln)
-                .collect();
-            if let Some(sym) = chain.last() {
-                blocks.entry((sym.ln, sym.end)).or_insert(Block {
-                    start: sym.ln,
-                    end: sym.end,
-                    label: format!("{} {}", sym.kind, sym.name),
-                    tag: if keywords.iter().any(|keyword| {
-                        sym.name.eq_ignore_ascii_case(keyword)
-                            || (keyword.len() >= 5
-                                && sym.name.to_lowercase().contains(&keyword.to_lowercase()))
-                    }) {
-                        "def"
-                    } else {
-                        "hit"
-                    },
-                    score: 100,
-                });
-            } else {
-                let a = hit.ln.saturating_sub(8).max(1);
-                let b = (hit.ln + 8).min(src.lines.len());
-                blocks.entry((a, b)).or_insert(Block {
-                    start: a,
-                    end: b,
-                    label: String::new(),
-                    tag: "hit",
-                    score: 20,
-                });
+        let lines = unit.end - unit.start + 1;
+        let cost = range_cost(&source, unit.start, unit.end.min(source.lines.len()));
+        if used + lines > budget || used_bytes + cost > soft_bytes {
+            if let Some(symbol) = &unit.unit {
+                push_sig(&mut sigs, &unit.file, unit.start, &symbol.sig);
             }
+            continue;
         }
-        for kw in &keywords {
-            for sym in src.syms.iter().filter(|s| {
-                s.name.eq_ignore_ascii_case(kw)
-                    || kw.len() >= 5 && s.name.to_lowercase().contains(&kw.to_lowercase())
-            }) {
-                blocks.entry((sym.ln, sym.end)).or_insert(Block {
-                    start: sym.ln,
-                    end: sym.end,
-                    label: format!("{} {}", sym.kind, sym.name),
-                    tag: "def",
-                    score: 200,
-                });
-            }
-        }
-        if subj {
-            let hit_lines = hits.iter().map(|hit| hit.ln).collect::<Vec<_>>();
-            for sym in src
-                .syms
-                .iter()
-                .filter(|symbol| {
-                    symbol.depth <= 1
-                        && !(symbol.kind == "const" && symbol.ln == symbol.end)
-                        && !matches!(
-                            symbol.name.to_ascii_lowercase().as_str(),
-                            "test" | "tests" | "spec"
-                        )
-                })
-                .take(MAX_SUBJECT_UNITS)
-            {
-                let has_hit = hit_lines
-                    .iter()
-                    .any(|line| *line >= sym.ln && *line <= sym.end);
-                blocks.entry((sym.ln, sym.end)).or_insert(Block {
-                    start: sym.ln,
-                    end: sym.end,
-                    label: format!("{} {}", sym.kind, sym.name),
-                    tag: "hit",
-                    score: if has_hit { 140 } else { 60 },
-                });
-            }
-        }
-        let mut selected = Vec::new();
-        let mut options: Vec<_> = blocks.into_values().collect();
-        options.sort_by(|a, b| b.score.cmp(&a.score));
-        for block in options {
-            let n = block.end - block.start + 1;
-            if used + n <= budget {
-                used += n;
-                selected.push(block);
-            } else {
-                if let Some(sym) = src.syms.iter().find(|s| s.ln == block.start) {
-                    sigs.push((file.clone(), sym.ln, sym.sig.clone()));
-                }
-            }
-        }
-        if !selected.is_empty() {
+        let index = if let Some(index) = plan_index {
+            index
+        } else {
             plans.push(PlannedFile {
-                file: file.clone(),
-                source: src,
+                file: unit.file.clone(),
+                source: source.clone(),
                 section: "edit",
                 full: false,
-                blocks: selected,
-                rank,
+                blocks: Vec::new(),
+                rank: *file_rank.get(&unit.file).unwrap_or(&99),
             });
-        }
-    }
-    // Candidate definitions excluded by the file cap remain actionable through SIG.
-    for (file, _) in ranked
-        .iter()
-        .skip(MAX_FILES)
-        .take(MAX_CANDIDATES - MAX_FILES)
-    {
-        if let Some(entry) = index.files.get(file) {
-            for symbol in &entry.syms {
-                if symbol.depth > 1
-                    || !keywords.iter().any(|keyword| {
-                        symbol.name.eq_ignore_ascii_case(keyword)
-                            || (keyword.len() >= 5
-                                && symbol.name.to_lowercase().contains(&keyword.to_lowercase()))
-                    })
-                {
-                    continue;
-                }
-                if !sigs
-                    .iter()
-                    .any(|(existing_file, line, _)| existing_file == file && *line == symbol.ln)
-                {
-                    sigs.push((file.clone(), symbol.ln, symbol.sig.clone()));
-                }
-            }
-        }
+            plans.len() - 1
+        };
+        plans[index].blocks.push(Block {
+            start: unit.start,
+            end: unit.end.min(source.lines.len()),
+            label: unit.label,
+            tag: unit.tag,
+        });
+        used += lines;
+        used_bytes += cost;
     }
     let original_count = plans.len();
     let owned: HashSet<_> = plans
@@ -1445,48 +2595,13 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 .map(move |s| (p.file.clone(), s.ln))
         })
         .collect();
-    let mut deps = Vec::<Definition>::new();
-    for plan in plans.clone() {
-        let mut text = String::new();
-        for (a, b) in shown_ranges(&plan) {
-            for line in &plan.source.lines[a - 1..b] {
-                text.push_str(line);
-                text.push('\n');
-            }
-        }
-        for cap in Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]{3,}")
-            .unwrap()
-            .find_iter(&text)
-        {
-            let name = cap.as_str();
-            let local = index.defs.get(name).and_then(|defs| {
-                defs.iter()
-                    .find(|definition| definition.file == plan.file && definition.symbol.depth == 0)
-            });
-            let target = index.imports.get(&plan.file).and_then(|m| m.get(name));
-            let def = local.or_else(|| {
-                target.and_then(|f| {
-                    index
-                        .defs
-                        .get(name)
-                        .and_then(|v| v.iter().find(|d| &d.file == f))
-                })
-            });
-            if let Some(def) = def {
-                if !owned.contains(&(def.file.clone(), def.symbol.ln))
-                    && !deps
-                        .iter()
-                        .any(|d| d.file == def.file && d.symbol.ln == def.symbol.ln)
-                {
-                    deps.push(def.clone());
-                    if deps.len() >= MAX_DEPS {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    for def in deps {
+    let keyword_set = keywords
+        .iter()
+        .chain(terms.iter().skip(keywords.len()))
+        .cloned()
+        .collect::<HashSet<_>>();
+    let deps = collect_dependencies(&index, &plans, &owned, &keyword_set);
+    for (dep_name, def) in deps {
         if plans
             .iter()
             .filter(|p| p.section == "dep")
@@ -1496,25 +2611,26 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             >= MAX_DEP_FILES
             && !plans.iter().any(|p| p.file == def.file)
         {
-            sigs.push((def.file, def.symbol.ln, def.symbol.sig));
+            push_sig(&mut sigs, &def.file, def.symbol.ln, &def.symbol.sig);
             continue;
         }
         let Some(src) = source(root, &def.file, index.files.get(&def.file)) else {
             continue;
         };
         let n = def.symbol.end - def.symbol.ln + 1;
-        if used + n > budget {
-            sigs.push((def.file, def.symbol.ln, def.symbol.sig));
+        let bytes = range_cost(&src, def.symbol.ln, def.symbol.end);
+        if used + n > budget || used_bytes + bytes > soft_bytes {
+            push_sig(&mut sigs, &def.file, def.symbol.ln, &def.symbol.sig);
             continue;
         }
         used += n;
+        used_bytes += bytes;
         if let Some(plan) = plans.iter_mut().find(|p| p.file == def.file) {
             plan.blocks.push(Block {
                 start: def.symbol.ln,
                 end: def.symbol.end,
-                label: format!("{} {}", def.symbol.kind, def.symbol.name),
+                label: format!("{} {}", def.symbol.kind, dep_name),
                 tag: "dep",
-                score: 10,
             });
         } else {
             plans.push(PlannedFile {
@@ -1525,18 +2641,39 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 blocks: vec![Block {
                     start: def.symbol.ln,
                     end: def.symbol.end,
-                    label: format!("{} {}", def.symbol.kind, def.symbol.name),
+                    label: format!("{} {}", def.symbol.kind, dep_name),
                     tag: "dep",
-                    score: 10,
                 }],
                 rank: 99,
             });
         }
     }
-    let render = |plans: &Vec<PlannedFile>, sigs: &Vec<(String, usize, String)>| {
+    let seed_names = index
+        .defs
+        .keys()
+        .filter(|name| {
+            keywords.iter().any(|keyword| {
+                name.as_str() == keyword
+                    || name.eq_ignore_ascii_case(keyword)
+                    || (keyword.len() >= 5 && name.to_lowercase().contains(&keyword.to_lowercase()))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let render = |plans: &Vec<PlannedFile>,
+                  sigs: &Vec<(String, usize, String)>,
+                  impact_limit: usize,
+                  compact_index: bool| {
         let mut body = Vec::new();
+        let mut order = plans.iter().collect::<Vec<_>>();
+        order.sort_by_key(|plan| plan.rank);
+        let mut block_count = 0usize;
         for section in ["edit", "dep"] {
-            let group: Vec<_> = plans.iter().filter(|p| p.section == section).collect();
+            let group = order
+                .iter()
+                .copied()
+                .filter(|plan| plan.section == section)
+                .collect::<Vec<_>>();
             if group.is_empty() {
                 continue;
             }
@@ -1545,12 +2682,19 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             } else {
                 "## DEPS (依赖定义, 完整单元)".into()
             });
-            for p in group {
-                if p.full {
-                    body.push(format!("### {} ({}L) FULL", p.file, p.source.lines.len()));
-                    body.extend(p.source.lines.iter().map(|l| clip(l)));
+            for plan in group {
+                if plan.full {
+                    body.push(format!(
+                        "### {} ({}L) FULL",
+                        plan.file,
+                        plan.source.lines.len()
+                    ));
+                    body.extend(plan.source.lines.iter().map(|line| clip(line)));
+                    block_count += 1;
                 } else {
-                    let ranges = shown_ranges(p)
+                    let mut ranges = shown_ranges(plan);
+                    ranges.sort_unstable();
+                    let shown = ranges
                         .iter()
                         .map(|(a, b)| {
                             if a == b {
@@ -1562,54 +2706,112 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                         .collect::<Vec<_>>()
                         .join(",");
                     body.push(format!(
-                        "### {} ({}L) shown={ranges}",
-                        p.file,
-                        p.source.lines.len()
+                        "### {} ({}L) shown={shown}",
+                        plan.file,
+                        plan.source.lines.len()
                     ));
-                    let mut blocks = p.blocks.clone();
-                    blocks.sort_by_key(|b| b.start);
-                    for b in blocks {
+                    let mut blocks = plan.blocks.clone();
+                    blocks.sort_by_key(|block| block.start);
+                    for block in blocks {
+                        block_count += 1;
                         body.push(format!(
                             "@@ {}-{} {}{}",
-                            b.start,
-                            b.end,
-                            b.label,
-                            if b.tag == "hit" {
+                            block.start,
+                            block.end,
+                            block.label,
+                            if block.tag == "hit" {
                                 ""
                             } else {
-                                if b.tag == "dep" {
+                                if block.tag == "dep" {
                                     " [dep]"
                                 } else {
                                     " [def]"
                                 }
                             }
                         ));
-                        body.extend(p.source.lines[b.start - 1..b.end].iter().map(|l| clip(l)));
+                        body.extend(
+                            plan.source.lines[block.start - 1..block.end]
+                                .iter()
+                                .map(|line| clip(line)),
+                        );
+                    }
+                    let rest = plan
+                        .source
+                        .syms
+                        .iter()
+                        .filter(|symbol| {
+                            symbol.depth == 0
+                                && !covered(plan, symbol.ln)
+                                && !(symbol.kind == "const" && symbol.end == symbol.ln)
+                        })
+                        .map(|symbol| {
+                            format!(
+                                "{} {}{}",
+                                symbol.ln,
+                                if symbol.kind == "impl" { "impl " } else { "" },
+                                symbol.name
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let subject_file = subject.contains(&plan.file);
+                    let cap = if subject_file {
+                        24
+                    } else if plan.rank < 1 {
+                        8
+                    } else {
+                        0
+                    };
+                    if !rest.is_empty() && cap > 0 {
+                        let shown_rest = rest.iter().take(cap).cloned().collect::<Vec<_>>();
+                        body.push(format!(
+                            "~ {}{}",
+                            shown_rest.join(" | "),
+                            if rest.len() > cap {
+                                format!(" | +{}", rest.len() - cap)
+                            } else {
+                                String::new()
+                            }
+                        ));
                     }
                 }
                 body.push(String::new());
             }
         }
         let mut impacts = Vec::new();
-        for (file, rows) in &hit_files {
+        let mut total_refs = 0usize;
+        for (file, _) in &ranked {
+            let Some(rows) = hit_files.get(file) else {
+                continue;
+            };
             for row in rows {
-                if plans.iter().any(|p| p.file == *file && covered(p, row.ln)) {
+                if plans
+                    .iter()
+                    .any(|plan| plan.file == *file && covered(plan, row.ln))
+                {
                     continue;
                 }
-                if impacts.len() < MAX_IMPACT {
+                let seed_ref = if seed_names.is_empty() {
+                    keywords.iter().any(|keyword| row.text.contains(keyword))
+                } else {
+                    seed_names.iter().any(|name| row.text.contains(name))
+                };
+                if !seed_ref {
+                    continue;
+                }
+                total_refs += 1;
+                if impacts.len() < impact_limit {
                     impacts.push(format!(
                         "{}:{} {}",
                         file,
                         row.ln,
-                        row.text.trim().chars().take(120).collect::<String>()
+                        js_utf16_slice(row.text.trim(), 120)
                     ));
                 }
             }
         }
         if !impacts.is_empty() {
             body.push(format!(
-                "## IMPACT (调用方/引用清单 {}/{}, 仅行; 确需函数体按 path:ln 补读)",
-                impacts.len(),
+                "## IMPACT (调用方/引用清单 {}/{total_refs}, 仅行; 确需函数体按 path:ln 补读)",
                 impacts.len()
             ));
             body.extend(impacts);
@@ -1617,74 +2819,160 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         }
         if !sigs.is_empty() {
             body.push("## SIG (预算内放不下或最终回退的定义, 仅签名)".into());
-            for (f, l, s) in sigs {
-                body.push(format!("{f}:{l} {s}"));
+            for (file, line, sig) in sigs {
+                body.push(format!("{file}:{line} {sig}"));
             }
             body.push(String::new());
         }
-        let blocks: usize = plans
+        let mut notes = Vec::new();
+        if !compact_index {
+            if !missed_all.is_empty() {
+                notes.push(format!("未命中关键词: {}", missed_all.join(" ")));
+            }
+            if !loose_kw.is_empty() {
+                notes.push(format!("忽略大小写才命中: {}", loose_kw.join(" ")));
+            }
+            let unexpanded = ranked
+                .iter()
+                .filter(|(file, _)| !plans.iter().any(|plan| plan.file == *file))
+                .map(|(file, _)| file)
+                .collect::<Vec<_>>();
+            if !unexpanded.is_empty() {
+                notes.push(format!(
+                    "其它命中文件(未展开): {}{}",
+                    unexpanded
+                        .iter()
+                        .take(10)
+                        .copied()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    if unexpanded.len() > 10 {
+                        format!(" +{}", unexpanded.len() - 10)
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+        }
+        let content = body.join("\n");
+        let shown_lines = order
             .iter()
-            .map(|p| if p.full { 1 } else { p.blocks.len() })
-            .sum();
-        let lines: usize = plans
-            .iter()
-            .map(|p| {
-                shown_ranges(p)
+            .map(|plan| {
+                shown_ranges(plan)
                     .iter()
                     .map(|(a, b)| b - a + 1)
                     .sum::<usize>()
             })
-            .sum();
-        let mut head = format!(
-            "# CTX {}{}{} @{}  {}文件/{}块 {}行",
-            if keywords.is_empty() {
-                "".into()
-            } else {
-                format!("q={}", keywords.join(","))
-            },
-            if task.is_empty() {
-                "".into()
-            } else {
-                format!(" task=\"{}\"", task.chars().take(80).collect::<String>())
-            },
-            if files.is_empty() {
-                "".into()
-            } else {
-                format!(" files={}", files.join(","))
-            },
-            rev(root, &["rev-parse", "--short", "HEAD"]),
-            plans.len(),
-            blocks,
-            lines
-        );
-        let content = body.join("\n");
-        head.push_str(&format!(" {:.1}KB\n# 契约: 以上均为完整单元/完整文件，可直接据此编辑；已展示行段禁止重读。SIG/IMPACT 仅索引，确需其函数体时按 path:ln 精确补读。\n\n",content.len()as f64/1024.0));
+            .sum::<usize>();
+        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 契约: 以上均为完整单元/完整文件，可直接据此编辑；已展示行段禁止重读。SIG/IMPACT 仅索引，确需其函数体时按 path:ln 精确补读。",
+            if keywords.is_empty() { String::new() } else { format!("q={}", keywords.join(",")) },
+            if task.is_empty() { String::new() } else { format!(" task=\"{}\"", js_utf16_slice(&task, 80)) },
+            if files.is_empty() { String::new() } else { format!(" files={}", files.join(",")) },
+            revision, order.len(), block_count, shown_lines, content.len() as f64 / 1024.0);
+        for note in notes {
+            head.push_str(&format!("\n# {note}"));
+        }
+        head.push_str("\n\n");
         format!("{head}{content}")
     };
-    let mut text = render(&plans, &sigs);
-    while text.len() > hard && !plans.is_empty() {
-        let idx = plans
+    trace("fast_context.plan", stage);
+    let render_start = Instant::now();
+    let mut impact_limit = MAX_IMPACT;
+    let mut compact_index = false;
+    let mut text = render(&plans, &sigs, impact_limit, compact_index);
+    while text.len() > hard {
+        let Some(index) = plans
             .iter()
             .enumerate()
-            .max_by_key(|(_, p)| (if p.section == "dep" { 1 } else { 0 }, p.rank))
-            .map(|(i, _)| i)
-            .unwrap();
-        let mut p = plans.remove(idx);
-        if p.full {
-            for s in p.source.syms.iter().filter(|s| s.depth <= 1) {
-                sigs.push((p.file.clone(), s.ln, s.sig.clone()));
+            .filter(|(_, plan)| plan.full || !plan.blocks.is_empty())
+            .max_by_key(|(_, plan)| (if plan.section == "dep" { 1 } else { 0 }, plan.rank))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        if plans[index].full {
+            let removed = plans.remove(index);
+            let mut found = false;
+            for symbol in removed
+                .source
+                .syms
+                .iter()
+                .filter(|symbol| symbol.depth <= 1 && !symbol.sig.is_empty())
+            {
+                if !sigs
+                    .iter()
+                    .any(|(file, line, _)| file == &removed.file && *line == symbol.ln)
+                {
+                    sigs.push((removed.file.clone(), symbol.ln, symbol.sig.clone()));
+                }
+                found = true;
             }
-        } else if let Some(block) = p.blocks.pop() {
-            if let Some(s) = p.source.syms.iter().find(|s| s.ln == block.start) {
-                sigs.push((p.file.clone(), s.ln, s.sig.clone()));
+            if !found {
+                let sig = removed
+                    .source
+                    .lines
+                    .first()
+                    .map(|line| js_utf16_slice(line.trim(), 120))
+                    .unwrap_or_default();
+                if !sig.is_empty() {
+                    sigs.push((removed.file, 1, sig));
+                }
             }
-            if !p.blocks.is_empty() {
-                plans.push(p);
+        } else {
+            let block = plans[index]
+                .blocks
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, block)| block.start)
+                .map(|(position, _)| position);
+            if let Some(position) = block {
+                let block = plans[index].blocks.remove(position);
+                let file = plans[index].file.clone();
+                let source = &plans[index].source;
+                let mut found = false;
+                for symbol in source.syms.iter().filter(|symbol| {
+                    symbol.depth <= 1
+                        && symbol.ln >= block.start
+                        && symbol.end <= block.end
+                        && !symbol.sig.is_empty()
+                }) {
+                    if !sigs
+                        .iter()
+                        .any(|(existing, line, _)| existing == &file && *line == symbol.ln)
+                    {
+                        sigs.push((file.clone(), symbol.ln, symbol.sig.clone()));
+                    }
+                    found = true;
+                }
+                if !found {
+                    let sig = source
+                        .lines
+                        .get(block.start - 1)
+                        .map(|line| js_utf16_slice(line.trim(), 120))
+                        .unwrap_or_default();
+                    if !sig.is_empty() {
+                        sigs.push((file.clone(), block.start, sig));
+                    }
+                }
+            }
+            if plans[index].blocks.is_empty() {
+                plans.remove(index);
             }
         }
-        text = render(&plans, &sigs);
+        text = render(&plans, &sigs, impact_limit, compact_index);
+    }
+    while text.len() > hard && impact_limit > 0 {
+        impact_limit = impact_limit.saturating_sub(5);
+        text = render(&plans, &sigs, impact_limit, compact_index);
+    }
+    if text.len() > hard {
+        compact_index = true;
+        text = render(&plans, &sigs, impact_limit, compact_index);
     }
     let _ = original_count;
+    trace("fast_context.render", render_start);
+    trace("fast_context.total", total_start);
     Ok(text)
 }
 
@@ -1790,6 +3078,57 @@ mod tests {
         for block in out.split("@@ ").skip(1) {
             assert!(block.contains("\n}"), "{block}");
         }
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let args = args
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        let status = hidden_command("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn git_head_matches_git_rev_parse() {
+        let d = tempdir().unwrap();
+        git(d.path(), &["init", "-q"]);
+        git(
+            d.path(),
+            &["config", "user.email", "native-test@nova.local"],
+        );
+        git(d.path(), &["config", "user.name", "Nova Native Test"]);
+        fs::write(d.path().join("a.ts"), "export const value = 1;\n").unwrap();
+        git(d.path(), &["add", "-A"]);
+        git(d.path(), &["commit", "-qm", "fixture"]);
+        let (branch, revision) = git_head(d.path());
+        assert_eq!(
+            branch,
+            git_value(d.path(), &["rev-parse", "--abbrev-ref", "HEAD"])
+        );
+        assert_eq!(
+            revision,
+            git_value(d.path(), &["rev-parse", "--short", "HEAD"])
+        );
+    }
+
+    #[test]
+    fn file_listing_matches_git_tracked_and_untracked_ignore_rules() {
+        let d = tempdir().unwrap();
+        git(d.path(), &["init", "-q"]);
+        fs::create_dir(d.path().join("src")).unwrap();
+        fs::write(d.path().join(".gitignore"), "ignored.ts\n").unwrap();
+        fs::write(d.path().join("ignored.ts"), "export const hidden = 1;\n").unwrap();
+        fs::write(d.path().join("src/a.ts"), "export const visible = 1;\n").unwrap();
+        let first = list_code_files(d.path());
+        assert!(first.contains(&"src/a.ts".to_string()));
+        assert!(!first.contains(&"ignored.ts".to_string()));
+        fs::write(d.path().join("src/new.ts"), "export const fresh = 1;\n").unwrap();
+        assert!(list_code_files(d.path()).contains(&"src/new.ts".to_string()));
     }
 
     #[test]

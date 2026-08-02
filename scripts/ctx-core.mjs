@@ -147,7 +147,7 @@ function rowsFromText(text) {
     const p = parseGrepLine(line);
     if (p && !EXCLUDE.test(p.file)) rows.push(p);
   }
-  return rows;
+  return rows.sort((a, b) => Buffer.compare(Buffer.from(a.file), Buffer.from(b.file)) || a.ln - b.ln || Buffer.compare(Buffer.from(a.text), Buffer.from(b.text)));
 }
 
 async function searchInProcess(root, terms, ignoreCase, word) {
@@ -168,7 +168,9 @@ async function searchInProcess(root, terms, ignoreCase, word) {
     }
     return out;
   });
-  return parts.flat().slice(0, MAX_HIT_LINES);
+  return parts.flat()
+    .sort((a, b) => Buffer.compare(Buffer.from(a.file), Buffer.from(b.file)) || a.ln - b.ln || Buffer.compare(Buffer.from(a.text), Buffer.from(b.text)))
+    .slice(0, MAX_HIT_LINES);
 }
 
 /** 统一仓库文本检索：单次批量 rg → git grep → 有界进程内扫描。 */
@@ -539,7 +541,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     }
   }
   // 主题文件可能正文零命中（查询词只在文件名里），必须成为候选
-  for (const f of Object.keys(index.files)) {
+  for (const f of Object.keys(index.files).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
     if (!isSubject(f) || ranked.some((r) => r.file === f)) continue;
     ranked.push({ file: f, e: { lns: new Map(), kws: new Set() }, score: 550 });
   }

@@ -825,7 +825,7 @@ async function scanIntoCache(root, cache, files) {
 function buildIndexView(cache, allFiles, complete, stats) {
   /** @type {Map<string, any[]>} */
   const defs = new Map();
-  for (const [file, entry] of Object.entries(cache.files)) {
+  for (const [file, entry] of Object.entries(cache.files).sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
     for (const s of entry.syms) {
       if (s.kind === 'prop' || s.depth > 1) continue;
       if (s.depth === 1 && !/^(fn|method|type|class)$/.test(s.kind)) continue;
@@ -841,7 +841,7 @@ function buildIndexView(cache, allFiles, complete, stats) {
   const fileSet = new Set(allFiles);
   /** @type {Map<string, Map<string, string>>} */
   const imports = new Map();
-  for (const [file, entry] of Object.entries(cache.files)) {
+  for (const [file, entry] of Object.entries(cache.files).sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
     if (!entry.imports?.length) continue;
     const m = new Map();
     for (const imp of entry.imports) {
