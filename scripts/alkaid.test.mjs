@@ -872,6 +872,7 @@ test("system prompt keeps stable Alkaid policy before dynamic cwd/skills", () =>
   assert.ok(separatorIndex > stableIndex);
   assert.ok(cwdIndex > separatorIndex);
   assert.match(prompt, /Respond terse like smart caveman/);
+  assert.match(prompt, /不要为了消除 truncated 读取剩余内容/);
   assert.match(prompt, /默认 full：去冠词、套话、寒暄、模糊措辞；断句可/);
   assert.match(prompt, /跟随用户主语言压缩文风/);
   assert.match(prompt, /按用户要求增减细节/);

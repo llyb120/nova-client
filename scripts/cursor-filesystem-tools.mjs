@@ -92,7 +92,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
   const root = resolve(cwd);
   return {
     read_files: {
-      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 Read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行（且不超过约 32KB）。请为每个文件按需指定 offset/limit，并用返回的 nextOffset 继续读取。`,
+      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 Read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行（且不超过约 32KB）。请为每个文件按需指定 offset/limit。nextOffset 仅供按需续读；truncated 只表示仍有后续内容。不要为了消除 truncated 读取剩余内容，仅当当前任务缺少必要上下文时继续。`,
       inputSchema: {
         type: "object",
         properties: {
@@ -173,7 +173,7 @@ export function cursorBatchToolPolicy(options = {}) {
     "You have Nova batch tool read_files plus Cursor built-in Read, Shell, Grep"
       + (readOnly ? "" : ", Write/Edit")
       + ". The following tool-selection rules are hard constraints.",
-      "Before each read phase, inventory known targets: if there is only one target, use Read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call Read repeatedly, and do not use parallel wrappers of multiple Read calls instead of read_files. Wanting to understand files in order is not a read dependency. Use Read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. "
+      "Before each read phase, inventory known targets: if there is only one target, use Read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call Read repeatedly, and do not use parallel wrappers of multiple Read calls instead of read_files. Wanting to understand files in order is not a read dependency. Use Read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. A returned nextOffset is only for on-demand continuation; truncated only means more content exists. Never continue merely to clear truncated. Continue only when the current task still lacks required context. "
         + (fastContext
           ? "When edit distribution is unknown and you need complete cross-file context, call fast_context once (or find_symbols for definitions/references only). Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
           : "When location is unknown, search first (see below), then read near hits. ")
