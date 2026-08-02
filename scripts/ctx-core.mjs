@@ -84,6 +84,9 @@ const MAX_OUTLINE_OTHER = 0;
 const MAX_CANDIDATES = 8;
 const MAX_KEYWORDS = 5;
 const MAX_TASK_TOKENS = 5;
+const CJK_TASK_STOP_RE = /(?:请帮我|帮我|添加|增加|新增|修改|实现|处理|支持|调整|修复|优化|重构|一个|这个|目前|是否|对于|功能|问题)/gu;
+const CJK_TASK_PREFIX_RE = /^(?:请|给|把|将|在|对|为|从|让)+/u;
+const CJK_TASK_SUFFIX_RE = /(?:的|中|里|上|下|内|外|吗|呢|吧)+$/u;
 const MAX_HIT_LINES = 6000;
 const MAX_HITS_PER_FILE = 60;
 const MAX_LINE_CHARS = 240;
@@ -218,16 +221,29 @@ function scoreFilePrior(file) {
   return s;
 }
 
-/** task 自然语言描述里的标识符 token（ camelCase / snake_case / 路径片段），用于补充检索与排序。 */
+/** task 自然语言描述里的标识符与中文短语，用于补充检索与排序。 */
 function taskTokens(task) {
   const out = [];
   const seen = new Set();
-  for (const m of String(task ?? '').matchAll(/[A-Za-z_$][\w$]{3,}/g)) {
-    const t = m[0];
+  const add = (token) => {
+    const t = String(token ?? '').trim();
     const low = t.toLowerCase();
-    if (seen.has(low) || STOP.has(low)) continue;
+    if (!t || seen.has(low) || STOP.has(low) || out.length >= MAX_TASK_TOKENS) return;
     seen.add(low);
     out.push(t);
+  };
+  const text = String(task ?? '');
+  for (const m of text.matchAll(/[A-Za-z_$][\w$]{3,}/g)) add(m[0]);
+  const cleaned = text.replace(CJK_TASK_STOP_RE, ' ');
+  for (const m of cleaned.matchAll(/[\p{Script=Han}]{2,}/gu)) {
+    const phrase = m[0].replace(CJK_TASK_PREFIX_RE, '').replace(CJK_TASK_SUFFIX_RE, '');
+    if ([...phrase].length < 2) continue;
+    add(phrase);
+    const chars = [...phrase];
+    if (chars.length > 5) {
+      add(chars.slice(0, 5).join(''));
+      add(chars.slice(-5).join(''));
+    }
     if (out.length >= MAX_TASK_TOKENS) break;
   }
   return out;

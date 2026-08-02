@@ -1577,6 +1577,91 @@ fn covered(plan: &PlannedFile, line: usize) -> bool {
         .any(|(a, b)| line >= *a && line <= *b)
 }
 
+fn is_han(value: char) -> bool {
+    matches!(
+        value as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2FA1F
+            | 0x30000..=0x323AF
+    )
+}
+
+fn trim_cjk_task_phrase(value: &str) -> String {
+    const PREFIX: &[char] = &['请', '给', '把', '将', '在', '对', '为', '从', '让'];
+    const SUFFIX: &[char] = &['的', '中', '里', '上', '下', '内', '外', '吗', '呢', '吧'];
+    value
+        .trim_start_matches(PREFIX)
+        .trim_end_matches(SUFFIX)
+        .to_string()
+}
+
+fn task_tokens(task: &str) -> Vec<String> {
+    static ASCII_TOKEN: OnceLock<Regex> = OnceLock::new();
+    const CJK_STOP: &[&str] = &[
+        "请帮我",
+        "帮我",
+        "添加",
+        "增加",
+        "新增",
+        "修改",
+        "实现",
+        "处理",
+        "支持",
+        "调整",
+        "修复",
+        "优化",
+        "重构",
+        "一个",
+        "这个",
+        "目前",
+        "是否",
+        "对于",
+        "功能",
+        "问题",
+    ];
+    let token_re = ASCII_TOKEN.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]{3,}").unwrap());
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add = |token: String| {
+        let lower = token.to_lowercase();
+        if !token.is_empty() && out.len() < 5 && !stop_word(&lower) && seen.insert(lower) {
+            out.push(token);
+        }
+    };
+    for found in token_re.find_iter(task) {
+        add(found.as_str().to_string());
+    }
+    let mut cleaned = task.to_string();
+    for word in CJK_STOP {
+        cleaned = cleaned.replace(word, " ");
+    }
+    let mut phrase = String::new();
+    let flush = |phrase: &mut String, add: &mut dyn FnMut(String)| {
+        let value = trim_cjk_task_phrase(phrase);
+        phrase.clear();
+        let chars = value.chars().collect::<Vec<_>>();
+        if chars.len() < 2 {
+            return;
+        }
+        add(value);
+        if chars.len() > 5 {
+            add(chars[..5].iter().collect());
+            add(chars[chars.len() - 5..].iter().collect());
+        }
+    };
+    for ch in cleaned.chars() {
+        if is_han(ch) {
+            phrase.push(ch);
+        } else {
+            flush(&mut phrase, &mut add);
+        }
+    }
+    flush(&mut phrase, &mut add);
+    out
+}
+
 fn stop_word(value: &str) -> bool {
     matches!(
         value,
@@ -1972,24 +2057,10 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .chars()
         .take(300)
         .collect::<String>();
-    static TASK_TOKEN: OnceLock<Regex> = OnceLock::new();
-    let token_re = TASK_TOKEN.get_or_init(|| Regex::new(r"[A-Za-z_$][\w$]{3,}").unwrap());
     let mut terms = keywords.clone();
-    let mut task_seen = HashSet::new();
-    let mut task_count = 0usize;
-    for found in token_re.find_iter(&task) {
-        let token = found.as_str();
-        let lower = token.to_lowercase();
-        if stop_word(&lower)
-            || !task_seen.insert(lower)
-            || terms.iter().any(|value| value.eq_ignore_ascii_case(token))
-        {
-            continue;
-        }
-        terms.push(token.into());
-        task_count += 1;
-        if task_count >= 5 {
-            break;
+    for token in task_tokens(&task) {
+        if !terms.iter().any(|value| value.eq_ignore_ascii_case(&token)) {
+            terms.push(token);
         }
     }
     let plan_intent = retrieval_plan(&task);
@@ -3267,6 +3338,14 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn chinese_task_extracts_searchable_phrases() {
+        assert_eq!(
+            task_tokens("给设置面板增加一个快速上下文开关"),
+            vec!["设置面板", "快速上下文开关", "快速上下文", "上下文开关"]
+        );
+    }
+
     #[test]
     fn scanner_tracks_js_blocks() {
         let e = scan_source(

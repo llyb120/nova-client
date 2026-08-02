@@ -334,6 +334,19 @@ test("fast_context: task 描述提词可独立检索命中", async () => {
   }
 });
 
+test("fast_context: 中文 task 可独立提词检索命中", async () => {
+  const dir = await fixture({
+    "src/settings.ts": "export const 设置面板 = { label: '快速上下文开关' };\n",
+  });
+  try {
+    const out = await contextBundle({ task: "给设置面板增加一个快速上下文开关" }, dir);
+    assert.match(out, /export const 设置面板/);
+    assert.match(out, /快速上下文开关/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("fast_context: 未展开引用进 IMPACT 清单", async () => {
   const many = {};
   for (let i = 0; i < 12; i++) {
