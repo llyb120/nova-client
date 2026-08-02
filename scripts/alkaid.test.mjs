@@ -1063,11 +1063,18 @@ test("build mode confirms and uses the detected Bash shell", async () => {
   const runtime = await createAlkaidAgent({ cwd, model: configuredModel, shellConfig });
   try {
     assert.equal(runtime.agent.steeringMode, "all");
-    assert.deepEqual(runtime.agent.state.tools.slice(0, 2).map((tool) => tool.name), ["read_files", "edit_files"]);
+    const toolNames = runtime.agent.state.tools.map((tool) => tool.name);
+    assert.equal(toolNames[0], "read_files");
+    assert(toolNames.includes("edit_files"));
+    if (process.env.NOVA_FAST_CONTEXT !== "0") assert(toolNames.includes("fast_context"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "load_skill"));
     assert.match(runtime.agent.state.systemPrompt, /读取内容遵循最小必要原则.*已知目标行范围时，只读取相关行段/);
-    assert.match(runtime.agent.state.systemPrompt, /未知目标位置时，必须只调用 fast_context/);
+    if (process.env.NOVA_FAST_CONTEXT !== "0") {
+      assert.match(runtime.agent.state.systemPrompt, /未知修改分布且需要完整编辑上下文时，调用一次 fast_context/);
+    } else {
+      assert.doesNotMatch(runtime.agent.state.systemPrompt, /fast_context/);
+    }
     assert.match(runtime.agent.state.systemPrompt, /两个及以上路径已知.*必须在一次 read_files 调用中合并读取/);
     assert.match(runtime.agent.state.systemPrompt, /禁止连续调用多个 read/);
     assert.match(runtime.agent.state.systemPrompt, /禁止用并行封装的多个 read 代替 read_files/);
@@ -1075,9 +1082,13 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.match(runtime.agent.state.systemPrompt, /后续新发现多个独立文本目标.*仍须合并使用 read_files/);
     assert.match(runtime.agent.state.systemPrompt, /为每个文件分别设置必要的 offset\/limit/);
     assert.match(runtime.agent.state.systemPrompt, /禁止使用 `grep -r` 或 `grep -R`.*无排除的递归搜索/);
-    assert.match(runtime.agent.state.systemPrompt, /必须只调用 fast_context.*禁止对同一批关键词再用/);
-    assert.match(runtime.agent.state.systemPrompt, /rg 已内化进 fast_context/);
-    assert.match(runtime.agent.state.systemPrompt, /兜底搜索默认遵守 `\.gitignore`/);
+    if (process.env.NOVA_FAST_CONTEXT !== "0") {
+      assert.match(runtime.agent.state.systemPrompt, /路径和行段已明确时直接 read\/read_files.*未知修改分布.*调用一次 fast_context/);
+      assert.match(runtime.agent.state.systemPrompt, /内部批量 rg 与增量符号索引/);
+      assert.match(runtime.agent.state.systemPrompt, /兜底搜索默认遵守 `\.gitignore`/);
+    } else {
+      assert.match(runtime.agent.state.systemPrompt, /优先使用 `rg`（遵守 `\.gitignore`）/);
+    }
     assert.doesNotMatch(runtime.agent.state.systemPrompt, /优先使用 `git grep`/);
     assert.doesNotMatch(runtime.agent.state.systemPrompt, /必须搜索未跟踪文件/);
     assert.match(runtime.agent.state.systemPrompt, /输出截断只限制结果展示，不属于工作量限制/);

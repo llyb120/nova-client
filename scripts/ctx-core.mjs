@@ -1,998 +1,1039 @@
 // ctx-core.mjs — 上下文检索核心逻辑 (纯模块, 无协议)
 //
-// 被两个薄封装复用:
-//   scripts/alkaid-core.mjs              Vega / Alkaid 内置工具
-//   scripts/cursor-filesystem-tools.mjs  Cursor MCP 工具
+// 被薄封装复用:
+//   scripts/alkaid-core.mjs
+//   scripts/cursor-filesystem-tools.mjs
 //
-// Pipeline: Discover → Rank → Expand → Pack → Cover
-// 检索引擎: 默认 rg（尊重 .gitignore；可选 @vscode/ripgrep）→ git grep → 系统 grep；
-// 内存符号窗 + 子进程并行；全程无 LLM、无预建索引。
+// 设计目标: 一次 fast_context 就拿到"可直接动手"的完整上下文，不再需要补读。
+//   1. 符号闭包 + 完整单元: 命中落到最内层符号单元并输出完整单元体；自动沿
+//      import/use 精确解析依赖定义并完整打包（向下），同时把调用方/引用列成
+//      IMPACT 清单（向上）。绝不输出半截代码——没有 partial 概念。
+//   2. 预算放不下的定义降级为 ## SIG 签名清单，模型明确知道缺什么、在哪里，
+//      只有真需要其函数体时才按 path:ln 精确补读。
+//   3. 检索一轮 batched rg（不可用时回退 git grep / 有界进程内扫描），符号结构与
+//      import 映射来自增量索引 (scripts/ctx-index.mjs)，热路径典型 <200ms。
+//   4. task 自然语言描述提取标识符 token，既补充检索词，也参与单元排序。
 
-import { execFile, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { join } from 'node:path';
+import {
+  EXCLUDE,
+  LEGACY_PATH,
+  NOISE_PATH,
+  SRC_PATH,
+  cacheLocationLabel,
+  cleanupNovaCodemap,
+  getIndex,
+  isCodeFile,
+  listCodeFiles,
+  mapPool,
+  normalizeWorkspaceRoot,
+  novaDataRoot,
+  resolveRef,
+  run,
+  scanSource,
+} from './ctx-index.mjs';
 
 const require = createRequire(import.meta.url);
+
+export { cleanupNovaCodemap, normalizeWorkspaceRoot, novaDataRoot, scanSource };
 
 export function repoRoot() {
   if (process.env.CTX_ROOT) return process.env.CTX_ROOT;
   try {
-    return execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      encoding: 'utf8',
-      maxBuffer: 1024 * 1024,
-    }).trim() || process.cwd();
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
   } catch {
     return process.cwd();
   }
 }
 
-const EXCLUDE = /(?:^|\/)(?:node_modules|dist|target|src-tauri\/target)(?:\/|$)|package-lock|\.png$|\.jpg$|\.jpeg$|\.gif$|\.webp$|\.ico$|\.woff2?$|\.ttf$|\.bin$/i;
-const NEIGHBOR_EXCLUDE = /\.md$|\.github\/|\.yml$|\.yaml$|\.json$|\.toml$|docs\/|scripts\/legacy-context/;
-const TEST_PATH = /(?:^|\/)(?:tests?|__tests__|spec)(?:\/|$)|(?:\.|\b)(?:test|spec)\.[^.\/]+$/i;
-const CONFIG_PATH = /\.(?:toml|json|ya?ml|ini|env|lock)$/i;
-const SOURCE_EXT = /\.(?:rs|ts|tsx|js|jsx|mjs|cjs|go|py|java|kt|swift|c|cc|cpp|h|hpp)$/i;
+// ---------------------------------------------------------------- 预算 / 阈值
 
-const DEF_LINE_RE = /^\s*(?:(?:pub(?:\([^)]*\))?|export|async|unsafe|default|static|const|move)\s+)*(?:fn|struct|enum|trait|impl|type|class|interface|function|def|mod)\b/;
-const SYM_START_RE = /^(\s*)(?:(?:pub(?:\([^)]*\))?|export|async|unsafe|default|static|const|move)\s+)*(?:(?:fn|struct|enum|trait|type|class|interface|function|def|mod)\s+([A-Za-z_][\w]*)|(impl)(?:\s*<[^>]+>)?\s+(?:(?:[\w:]+)\s+for\s+)?([A-Za-z_][\w:]*))/;
-
-const INTENT_CHARS = { edit: 32_000, explain: 24_000, locate: 12_000 };
-const HARD_MAX_CHARS = 80_000;
-const FULL_ALWAYS = 120;
-const FULL_HIGH_SCORE = 220;
-const HIGH_SCORE = 10;
-const MAX_WINDOW_LINES = 180;
-const MERGE_GAP = 15;
-const CORE_SOFT_CAP = 12;
-const NEIGHBOR_CAP = 12;
-const NEIGHBOR_THIN_CAP = 4;
-const DISCOVERY_MAX_MATCHES_PER_FILE = 128;
-const WALL_MS = 4500;
-const PROC_TIMEOUT_MS = 1800;
+const DEFAULT_BUDGET = 600;
+const MIN_BUDGET = 100;
+const MAX_BUDGET = 1200;
+const DEFAULT_HARD_BYTES = 32 * 1024;
+const MIN_HARD_BYTES = 8 * 1024;
+const MAX_HARD_BYTES = 64 * 1024;
+/** 正文只使用输出预算的一部分，给契约、IMPACT、SIG 和未展开清单留出空间。 */
+const SOFT_BYTES_RATIO = 0.64;
+/** 每个 `@@` 行段头的固定开销，计入预算，避免多块碎片把总量顶穿。 */
+const RANGE_HEADER_BYTES = 48;
+const MAX_FILES = 6;
+const MAX_UNITS_PER_FILE = 4;
+/** 命中所在单元至少要有这么多行才算"有分析价值"，否则上浮到父单元。 */
+const MIN_UNIT_LINES = 12;
+/** 超过这么多行的单元视为大单元：优先取更内层的紧凑单元（仍是完整单元）。 */
+const BIG_UNIT_LINES = 80;
+const MAX_DEP_FILES = 4;
+/** 小文件直接整给，彻底消除"还要不要补读"的疑虑。 */
+const FULL_FILE_MAX = 100;
+/** files 参数点名的文件整给的上限。 */
+const EXPLICIT_FULL_MAX = 300;
+/** 文件名命中查询词的主题文件：≤此行数尝试整给，超出则按文件顺序通读打包单元。 */
+const SUBJECT_FULL_MAX = 800;
+const MAX_SUBJECT_UNITS = 30;
+const SUBJECT_OUTLINE_CAP = 24;
+const MAX_DEPS = 8;
+const MAX_DEPS_PER_FILE = 3;
+const MAX_IMPACT = 20;
+const MAX_OUTLINE_TOP = 8;
+const MAX_OUTLINE_OTHER = 0;
+const MAX_CANDIDATES = 8;
+const MAX_KEYWORDS = 5;
+const MAX_TASK_TOKENS = 5;
+const MAX_HIT_LINES = 6000;
+const MAX_HITS_PER_FILE = 60;
+const MAX_LINE_CHARS = 240;
+const SEARCH_DEF_RE = /^\s*(?:(?:pub(?:\([^)]*\))?|export|async|unsafe|default|static|const|move)\s+)*(?:fn|struct|enum|trait|impl|type|class|interface|function|def|mod)\b/;
 const RG_GLOBS = [
-  '!**/node_modules/**',
-  '!**/dist/**',
-  '!**/target/**',
-  '!**/src-tauri/target/**',
-  '!**/package-lock.json',
-  '!*.png',
-  '!*.jpg',
-  '!*.jpeg',
-  '!*.gif',
-  '!*.webp',
-  '!*.ico',
-  '!*.woff',
-  '!*.woff2',
-  '!*.ttf',
-  '!*.bin',
+  '!**/node_modules/**', '!**/dist/**', '!**/target/**', '!**/coverage/**',
+  '!**/package-lock.json', '!*.png', '!*.jpg', '!*.jpeg', '!*.gif', '!*.webp',
+  '!*.ico', '!*.woff', '!*.woff2', '!*.ttf', '!*.bin',
 ];
 
-/** @type {string|null|undefined} */
+const KW_WEIGHT = (n) => (n <= 40 ? 1 : n <= 200 ? 0.6 : 0.25);
 let rgBinCache;
-/** @type {boolean|undefined} */
-let gitAvailCache;
-const wordRegexCache = new Map();
+let gitAvailableCache;
 
-const GREP_EXCLUDE_DIRS = [
-  'node_modules',
-  'dist',
-  'target',
-  'src-tauri/target',
-  '.git',
-  '.cursor',
-];
+// ---------------------------------------------------------------- 检索
 
-function runAsync(root, cmd, args, timeoutMs = PROC_TIMEOUT_MS) {
-  return new Promise((resolve) => {
-    execFile(
-      cmd,
-      args,
-      { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
-      (err, stdout) => {
-        if (stdout) return resolve(stdout);
-        if (err?.stdout) return resolve(String(err.stdout));
-        resolve('');
-      },
-    );
-  });
+function normalizeRepoPath(file) {
+  return String(file ?? '').replace(/\\/g, '/').replace(/^\.\//, '');
 }
 
-/** Resolve rg binary: PATH → optional @vscode/ripgrep → null. */
+function parseGrepLine(line) {
+  const i1 = line.indexOf(':');
+  if (i1 < 0) return null;
+  const i2 = line.indexOf(':', i1 + 1);
+  if (i2 < 0) return null;
+  const file = normalizeRepoPath(line.slice(0, i1));
+  const ln = Number(line.slice(i1 + 1, i2));
+  if (!file || !Number.isFinite(ln)) return null;
+  return { file, ln, text: line.slice(i2 + 1) };
+}
+
+/** PATH 中的 rg 优先；桌面包可回退到可选的 @vscode/ripgrep。 */
 export function resolveRgBin() {
   if (rgBinCache !== undefined) return rgBinCache;
   try {
-    execFileSync('rg', ['--version'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 1500,
-    });
+    execFileSync('rg', ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500 });
     return (rgBinCache = 'rg');
-  } catch {
-    /* try packaged binary */
-  }
+  } catch { /* try packaged rg */ }
   try {
-    const mod = require('@vscode/ripgrep');
-    const rgPath = mod?.rgPath;
+    const rgPath = require('@vscode/ripgrep')?.rgPath;
     if (rgPath && existsSync(rgPath)) return (rgBinCache = rgPath);
-  } catch {
-    /* optional dependency */
-  }
+  } catch { /* optional dependency */ }
   return (rgBinCache = null);
 }
 
-/** True when git binary exists and `root` is inside a work tree. */
-export function gitSearchAvailable(root) {
-  if (gitAvailCache === false) return false;
-  try {
-    execFileSync('git', ['--version'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 1500,
-    });
-  } catch {
-    return (gitAvailCache = false);
-  }
+function gitSearchAvailable(root) {
+  if (gitAvailableCache === false) return false;
   try {
     const inside = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 1500,
+      cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500,
     }).trim();
-    if (inside === 'true') {
-      gitAvailCache = true;
-      return true;
-    }
-  } catch {
-    /* not a git work tree */
-  }
+    if (inside === 'true') return (gitAvailableCache = true);
+  } catch { /* non-git workspace */ }
   return false;
 }
 
-function forcedSearchEngine() {
-  const v = String(process.env.CTX_SEARCH_ENGINE || '').trim().toLowerCase();
-  if (v === 'rg' || v === 'git' || v === 'grep') return v;
-  return null;
-}
-
-function lineHasWord(text, name) {
-  if (!name || !text.includes(name)) return false;
-  let re = wordRegexCache.get(name);
-  if (!re) {
-    if (wordRegexCache.size >= 256) wordRegexCache.clear();
-    re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-    wordRegexCache.set(name, re);
+function rowsFromText(text) {
+  const rows = [];
+  for (const line of String(text ?? '').split('\n')) {
+    if (!line || rows.length >= MAX_HIT_LINES) continue;
+    const p = parseGrepLine(line);
+    if (p && !EXCLUDE.test(p.file)) rows.push(p);
   }
-  return re.test(text);
+  return rows;
 }
 
-function dedupeHits(parts) {
+async function searchInProcess(root, terms, ignoreCase, word) {
+  const files = await listCodeFiles(root);
+  const needles = terms.map((term) => ignoreCase ? term.toLowerCase() : term);
+  const wordRes = word
+    ? terms.map((term) => new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, ignoreCase ? 'i' : ''))
+    : null;
+  const parts = await mapPool(files, 8, async (file) => {
+    let text;
+    try { text = readFileSync(join(root, file), 'utf8'); } catch { return []; }
+    const out = [];
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length && out.length < MAX_HITS_PER_FILE; i++) {
+      const hay = ignoreCase ? lines[i].toLowerCase() : lines[i];
+      const matched = word ? wordRes.some((re) => re.test(lines[i])) : needles.some((n) => hay.includes(n));
+      if (matched) out.push({ file, ln: i + 1, text: lines[i] });
+    }
+    return out;
+  });
+  return parts.flat().slice(0, MAX_HIT_LINES);
+}
+
+/** 统一仓库文本检索：单次批量 rg → git grep → 有界进程内扫描。 */
+export async function searchText(root, terms, { ignoreCase = false, word = false } = {}) {
+  const list = [...new Set(terms.map((term) => String(term ?? '')).filter(Boolean))];
+  if (!list.length) return [];
+  const rg = resolveRgBin();
+  if (rg) {
+    const args = ['-n', '--no-heading', '--color', 'never', '-F', '--max-count', String(MAX_HITS_PER_FILE)];
+    if (ignoreCase) args.push('-i');
+    if (word) args.push('-w');
+    for (const term of list) args.push('-e', term);
+    for (const glob of RG_GLOBS) args.push('--glob', glob);
+    args.push('.');
+    return rowsFromText(await run(root, rg, args));
+  }
+  if (gitSearchAvailable(root)) {
+    const args = ['grep', '-nI', '--untracked'];
+    if (ignoreCase) args.push('-i');
+    if (word) args.push('-w');
+    args.push('-F');
+    for (const term of list) args.push('-e', term);
+    args.push('--');
+    return rowsFromText(await run(root, 'git', args));
+  }
+  return searchInProcess(root, list, ignoreCase, word);
+}
+
+function resolveOutputBudget(args) {
+  const requested = Number(args?.maxBytes ?? args?.maxChars);
+  const hardBytes = Number.isFinite(requested)
+    ? Math.max(MIN_HARD_BYTES, Math.min(MAX_HARD_BYTES, Math.floor(requested)))
+    : DEFAULT_HARD_BYTES;
+  return { hardBytes, softBytes: Math.floor(hardBytes * SOFT_BYTES_RATIO) };
+}
+
+function scoreFilePrior(file) {
+  let s = 0;
+  if (!isCodeFile(file)) s -= 90;
+  if (NOISE_PATH.test(file)) s -= 55;
+  if (LEGACY_PATH.test(file)) s -= 60;
+  if (SRC_PATH.test(file)) s += 14;
+  if (/^scripts\//.test(file)) s += 10;
+  if (/\.(md|json|ya?ml|toml|txt)$/i.test(file)) s -= 40;
+  return s;
+}
+
+/** task 自然语言描述里的标识符 token（ camelCase / snake_case / 路径片段），用于补充检索与排序。 */
+function taskTokens(task) {
   const out = [];
   const seen = new Set();
-  for (const hits of parts) {
-    for (const h of hits) {
-      if (EXCLUDE.test(h.file)) continue;
-      const key = `${h.file}:${h.line}:${h.text}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(h);
-    }
+  for (const m of String(task ?? '').matchAll(/[A-Za-z_$][\w$]{3,}/g)) {
+    const t = m[0];
+    const low = t.toLowerCase();
+    if (seen.has(low) || STOP.has(low)) continue;
+    seen.add(low);
+    out.push(t);
+    if (out.length >= MAX_TASK_TOKENS) break;
   }
   return out;
 }
 
-async function searchWithGitGrep(root, list, word) {
-  const parts = await mapPool(list, Math.min(6, list.length), async (p) => {
-    const args = word ? ['grep', '-nIw', '--', p] : ['grep', '-nI', '--', p];
-    return parseGrepLines(await runAsync(root, 'git', args));
-  });
-  return dedupeHits(parts);
-}
-
-/** Last-resort recursive grep with hard excludes (no .gitignore awareness). */
-async function searchWithSystemGrep(root, list, word, maxCount) {
-  const parts = await mapPool(list, Math.min(6, list.length), async (p) => {
-    const args = ['-rnI', '-F', '--color=never'];
-    if (word) args.push('-w');
-    if (maxCount > 0) args.push('-m', String(maxCount));
-    for (const dir of GREP_EXCLUDE_DIRS) args.push(`--exclude-dir=${dir}`);
-    args.push('-e', p, '.');
-    return parseGrepLines(await runAsync(root, 'grep', args));
-  });
-  return dedupeHits(parts);
-}
+// ---------------------------------------------------------------- 单元定位
 
 /**
- * Repo text search.
- * Prefer one rg invocation (gitignore-aware, includes untracked) → git grep → system grep.
- * `CTX_SEARCH_ENGINE=rg|git|grep` can force a backend for tests/diagnostics.
+ * 命中行 → 输出单元。优先最内层且有分析价值的单元；大单元则回落到内层紧凑单元。
+ * @returns {{ unit: any | null, chain: any[] }}
  */
-async function searchText(root, patterns, { word = false, maxCount = 0 } = {}) {
-  const list = [...new Set((patterns || []).map((p) => String(p ?? '')).filter(Boolean))];
-  if (!list.length) return [];
-
-  const forced = forcedSearchEngine();
-
-  if (!forced || forced === 'rg') {
-    const rg = resolveRgBin();
-    if (rg) {
-      const args = ['-n', '--no-heading', '--color', 'never', '-F'];
-      if (word) args.push('-w');
-      if (maxCount > 0) args.push('--max-count', String(maxCount));
-      for (const p of list) args.push('-e', p);
-      for (const g of RG_GLOBS) args.push('--glob', g);
-      args.push('.');
-      return parseGrepLines(await runAsync(root, rg, args)).filter((h) => !EXCLUDE.test(h.file));
+function unitForHit(syms, ln) {
+  const chain = syms.filter((s) => s.ln <= ln && s.end >= ln).sort((a, b) => a.depth - b.depth || a.ln - b.ln);
+  const span = (s) => s.end - s.ln + 1;
+  let pick = null;
+  for (let i = chain.length - 1; i >= 0; i--) {
+    if (span(chain[i]) >= MIN_UNIT_LINES) {
+      pick = chain[i];
+      break;
     }
-    if (forced === 'rg') return [];
   }
-
-  if (forced === 'git' || (!forced && gitSearchAvailable(root))) {
-    return searchWithGitGrep(root, list, word);
-  }
-
-  return searchWithSystemGrep(root, list, word, maxCount);
-}
-
-async function mapPool(items, concurrency, fn) {
-  const list = [...items];
-  if (list.length === 0) return [];
-  const results = new Array(list.length);
-  let next = 0;
-  const workers = Array.from(
-    { length: Math.min(Math.max(1, concurrency), list.length) },
-    async () => {
-      while (true) {
-        const i = next++;
-        if (i >= list.length) return;
-        results[i] = await fn(list[i], i);
+  if (!pick) pick = chain[chain.length - 1] ?? null;
+  if (pick && span(pick) > BIG_UNIT_LINES) {
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const n = span(chain[i]);
+      if (n >= 4 && n <= BIG_UNIT_LINES) {
+        pick = chain[i];
+        break;
       }
-    },
-  );
-  await Promise.all(workers);
-  return results;
-}
-
-function shortHead(root) {
-  try {
-    return execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
-  } catch {
-    return 'unknown';
+    }
   }
+  return { unit: pick, chain };
 }
 
-function resolveMaxChars({ intent = 'edit', maxChars, budget, ctx, maxFiles } = {}) {
-  const base = INTENT_CHARS[intent] ?? INTENT_CHARS.edit;
-  let chars = Number.isFinite(maxChars) ? maxChars : base;
-  if (!Number.isFinite(maxChars) && Number.isFinite(budget)) {
-    const radius = Number.isFinite(ctx) ? ctx : 12;
-    chars = Math.min(HARD_MAX_CHARS, Math.max(8_000, Math.floor(budget * Math.max(40, radius * 3))));
-  }
-  if (Number.isFinite(maxFiles) && maxFiles > 0 && maxFiles < CORE_SOFT_CAP) {
-    chars = Math.min(chars, Math.max(12_000, maxFiles * 4_000));
-  }
-  return Math.max(4_000, Math.min(HARD_MAX_CHARS, Math.floor(chars)));
+function unitLabel(chain, unit) {
+  if (!unit) return '';
+  const path = chain.filter((s) => s.depth < unit.depth).slice(-2).map((s) => s.name);
+  const own = unit.kind === 'prop' || unit.kind === 'method' ? unit.name : `${unit.kind} ${unit.name}`;
+  return [...path, own].join(' > ');
 }
 
-function adaptiveMaxChars(params, intent, chars, { hitCount, fileCount, definitionFiles }) {
-  // Explicit compatibility/budget controls are contracts; only tune default requests.
-  if (Number.isFinite(params.maxChars) || Number.isFinite(params.budget) || Number.isFinite(params.maxFiles)) return chars;
-  if (intent === 'locate') return chars;
-  const broad = fileCount >= 8 || hitCount >= 240 || definitionFiles >= 3;
-  const veryBroad = fileCount >= 24 || hitCount >= 1_000 || definitionFiles >= 8;
-  if (intent === 'edit') return Math.max(chars, veryBroad ? 48_000 : broad ? 40_000 : chars);
-  if (intent === 'explain') return Math.max(chars, veryBroad ? 36_000 : broad ? 30_000 : chars);
-  return chars;
-}
-
-function classifyPath(path) {
-  if (TEST_PATH.test(path)) return 'test';
-  if (CONFIG_PATH.test(path) || /(^|\/)(?:settings|config|Cargo\.toml|package\.json)/i.test(path)) return 'config';
-  return 'other';
-}
-
-function pathHintBonus(path, pathHints) {
-  if (!pathHints?.length) return 0;
-  let bonus = 0;
-  for (const hint of pathHints) {
-    if (!hint) continue;
-    if (path === hint || path.startsWith(hint.replace(/\/?$/, '/'))) bonus += 6;
-    else if (path.includes(hint)) bonus += 3;
-  }
-  return bonus;
-}
-
-function normalizeRepoPath(file) {
-  if (!file) return file;
-  return file.replace(/^\.\//, '');
-}
-
-function parseGrepLines(text) {
+/** @param {[number, number][]} ranges */
+function mergeRanges(ranges) {
+  if (!ranges.length) return [];
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  /** @type {[number, number][]} */
   const out = [];
-  for (const line of text.split('\n')) {
-    if (!line) continue;
-    const i1 = line.indexOf(':');
-    if (i1 <= 0) continue;
-    const i2 = line.indexOf(':', i1 + 1);
-    if (i2 <= i1) continue;
-    const file = normalizeRepoPath(line.slice(0, i1));
-    const lineNo = Number(line.slice(i1 + 1, i2));
-    if (!file || !Number.isFinite(lineNo)) continue;
-    out.push({ file, line: lineNo, text: line.slice(i2 + 1) });
+  let [s, e] = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    const [a, b] = sorted[i];
+    if (a <= e + 1) e = Math.max(e, b);
+    else {
+      out.push([s, e]);
+      s = a;
+      e = b;
+    }
   }
+  out.push([s, e]);
   return out;
 }
 
-async function discoverKeywords(root, keywords) {
-  // Keep enough tail hits for definitions that follow many ordinary references while
-  // still bounding generic-keyword IPC and parsing costs.
-  return searchText(root, keywords, { word: false, maxCount: DISCOVERY_MAX_MATCHES_PER_FILE });
-}
+const fmtRanges = (rs) => rs.map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(',');
 
-function scoreFile(rec, pathHints) {
-  const kind = classifyPath(rec.path);
-  let score = Math.min(12, rec.hitLines.size) * 1.5;
-  score += Math.min(8, rec.keywords.size) * 2;
-  if (rec.defHits > 0) score += 8 + Math.min(4, rec.defHits);
-  score += pathHintBonus(rec.path, pathHints);
-  if (SOURCE_EXT.test(rec.path)) score += 3;
-  if (kind === 'test') score -= 4;
-  if (kind === 'config') score -= 2;
-  if (rec.mentionOnly && rec.defHits === 0) score -= 3;
-  rec.kind = rec.defHits > 0 ? 'def' : kind === 'other' ? 'use' : kind;
-  rec.score = score;
-  return rec;
-}
+/** 大纲条目：`行号 名字`；impl 带 kind 以区分同名 struct。 */
+const outlineEntry = (s) => `${s.ln} ${s.kind === 'impl' ? 'impl ' : ''}${s.name}`;
 
-function extractSymbolStarts(lines) {
-  const starts = [];
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(SYM_START_RE);
-    if (!m) continue;
-    const name = m[2] || m[4] || m[3] || 'symbol';
-    starts.push({ line: i + 1, name: String(name).replace(/:.*/, ''), indent: m[1].length });
-  }
-  return starts;
-}
-
-function windowEnd(lines, startLine, nextStartLine) {
-  // Next-symbol boundary is the reliable closer. Brace-balancing is unsafe in JS/TS
-  // because regex literals, templates, and `= {}` defaults routinely confuse scanners.
-  if (nextStartLine) return nextStartLine - 1;
-  return lines.length;
-}
-
-function hitToWindow(hitLine, starts, lines) {
-  let idx = -1;
-  for (let i = 0; i < starts.length; i++) {
-    if (starts[i].line <= hitLine) idx = i;
-    else break;
-  }
-  if (idx < 0) {
-    return {
-      start: Math.max(1, hitLine - 20),
-      end: Math.min(lines.length, hitLine + 20),
-      name: null,
-      partial: false,
-    };
-  }
-  const start = starts[idx].line;
-  const next = starts[idx + 1]?.line;
-  const end = windowEnd(lines, start, next);
-  if (end - start + 1 > MAX_WINDOW_LINES) {
-    const localStart = Math.max(start, hitLine - 20);
-    const localEnd = Math.min(end, hitLine + 20);
-    return {
-      start,
-      end,
-      name: starts[idx].name,
-      partial: true,
-      slices: [
-        { start, end: Math.min(end, start + 15) },
-        { start: localStart, end: localEnd },
-      ],
-    };
-  }
-  return { start, end, name: starts[idx].name, partial: false };
-}
-
-function mergeSlices(slices) {
-  const sorted = [...slices].sort((a, b) => a.start - b.start);
-  const out = [];
-  for (const s of sorted) {
-    const last = out[out.length - 1];
-    if (!last || s.start > last.end + MERGE_GAP) out.push({ ...s });
-    else last.end = Math.max(last.end, s.end);
-  }
-  return out;
-}
-
-function mergeWindows(windows) {
-  if (!windows.length) return [];
-  const sorted = [...windows].sort((a, b) => a.start - b.start);
-  const out = [];
-  for (const w of sorted) {
-    const last = out[out.length - 1];
-    if (!last) {
-      out.push({ ...w, slices: w.slices ? [...w.slices] : null });
-      continue;
-    }
-    if (w.start <= last.end + MERGE_GAP) {
-      last.end = Math.max(last.end, w.end);
-      last.partial = last.partial || w.partial;
-      if (w.name && !last.name) last.name = w.name;
-      if (w.slices || last.slices) {
-        last.slices = mergeSlices([
-          ...(last.slices || [{ start: last.start, end: last.end }]),
-          ...(w.slices || [{ start: w.start, end: w.end }]),
-        ]);
-        last.partial = true;
-      }
-    } else {
-      out.push({ ...w, slices: w.slices ? [...w.slices] : null });
-    }
-  }
-  return out;
-}
-
-function coveredRanges(windows, total) {
-  const ranges = [];
-  for (const w of windows) {
-    if (w.partial && w.slices) {
-      for (const s of w.slices) ranges.push([s.start, s.end]);
-    } else {
-      ranges.push([w.start, w.end]);
-    }
-  }
-  ranges.sort((a, b) => a[0] - b[0]);
-  const merged = [];
-  for (const r of ranges) {
-    const last = merged[merged.length - 1];
-    if (!last || r[0] > last[1] + 1) merged.push([...r]);
-    else last[1] = Math.max(last[1], r[1]);
-  }
-  const gaps = [];
-  let cursor = 1;
-  for (const [a, b] of merged) {
-    if (cursor < a) gaps.push([cursor, a - 1]);
-    cursor = Math.max(cursor, b + 1);
-  }
-  if (cursor <= total) gaps.push([cursor, total]);
-  return { covered: merged, gaps };
-}
-
-function formatRangeList(ranges) {
-  return ranges.map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(',');
-}
-
-function clipText(text, maxChars) {
-  if (text.length <= maxChars) return { text, clipped: false };
-  return { text: `${text.slice(0, Math.max(0, maxChars - 20))}\n…[clipped]`, clipped: true };
-}
-
-function renderLines(lines, start, end) {
-  const out = [];
-  const lo = Math.max(1, start);
-  const hi = Math.min(lines.length, end);
-  for (let i = lo; i <= hi; i++) out.push(`${String(i).padStart(6)}  ${lines[i - 1]}`);
-  return out.join('\n');
-}
-
-function outlineFromStarts(starts, limit = 40) {
-  return starts.slice(0, limit).map((s) => `  L${s.line}  ${s.name}`).join('\n');
-}
-
-function hitRelevantToKeywords(hitLine, window, lines, keywords) {
-  const lineText = lines[hitLine - 1] ?? '';
-  const onDef = DEF_LINE_RE.test(lineText) && keywords.some((k) => lineText.includes(k));
-  if (onDef) return 'def';
-  if (window.name && keywords.some((k) => window.name === k || window.name.includes(k) || k.includes(window.name))) {
-    return 'named';
-  }
-  return 'mention';
-}
-
-async function expandFile(root, rec, keywords = []) {
-  const abs = `${root}/${rec.path}`;
+/** 读源码 + 拿符号表；索引与磁盘不一致时（刚被改过）就地重扫，保证行段永不错位。 */
+function readSource(root, index, file) {
+  const abs = join(root, file);
   if (!existsSync(abs)) return null;
-  let content;
+  let text;
   try {
-    content = await readFile(abs, 'utf8');
+    text = readFileSync(abs, 'utf8');
   } catch {
     return null;
   }
-  const lines = content.split('\n');
-  const total = lines.length;
-  const starts = extractSymbolStarts(lines);
-  const hitLines = [...rec.hitLines].sort((a, b) => a - b);
-  const windows = [];
-  for (const hl of hitLines) {
-    const full = hitToWindow(hl, starts, lines);
-    const rel = hitRelevantToKeywords(hl, full, lines, keywords);
-    if (rel === 'mention') {
-      // Keep local evidence only; do not inflate unrelated enclosing symbols.
-      windows.push({
-        start: Math.max(1, hl - 12),
-        end: Math.min(total, hl + 12),
-        name: full.name,
-        partial: false,
-      });
-    } else {
-      windows.push(full);
-    }
-  }
-  const merged = mergeWindows(windows);
-  const high = rec.score >= HIGH_SCORE;
-  const mode = total <= FULL_ALWAYS || (high && total <= FULL_HIGH_SCORE)
-    ? 'full'
-    : merged.length
-      ? 'body'
-      : 'outline';
-  // Seed neighbors only from query-related/enclosing symbols. Using every top-level
-  // symbol in a core file creates noisy extra repository scans and unrelated neighbors.
-  const preferred = starts
-    .map((s) => s.name)
-    .filter((name) => name && keywords.some((k) => name === k || name.includes(k) || k.includes(name)));
-  const enclosing = merged.map((w) => w.name).filter(Boolean);
-  const symbols = [...new Set([...preferred, ...enclosing])];
-  return {
-    path: rec.path,
-    score: rec.score,
-    kind: rec.kind,
-    lines,
-    total,
-    starts,
-    windows: merged,
-    mode,
-    symbols,
-  };
+  const raw = text.split('\n');
+  const lines = raw.length > 1 && raw[raw.length - 1] === '' ? raw.slice(0, -1) : raw;
+  const entry = index.files[file];
+  const syms = entry && entry.total === lines.length ? entry.syms : scanSource(text, file).syms;
+  return { lines, total: lines.length, syms };
 }
 
-async function discoverNeighbors(root, coreFiles, corePaths, keywords = []) {
-  const symbolNames = [];
-  for (const kw of keywords) {
-    if (/^[A-Za-z_][\w]{3,}$/.test(kw) && !symbolNames.includes(kw)) symbolNames.push(kw);
-  }
-  for (const f of coreFiles.slice(0, 5)) {
-    for (const name of f.symbols.slice(0, 12)) {
-      if (name.length < 4) continue;
-      if (!symbolNames.includes(name)) symbolNames.push(name);
-      if (symbolNames.length >= 16) break;
-    }
-    if (symbolNames.length >= 16) break;
-  }
-  if (!symbolNames.length) return [];
-  const neighHits = new Map();
-  // rg accepts many fixed-string patterns in one process. A single bounded scan is
-  // materially faster than spawning one process per chunk, especially on Windows.
-  const hits = await searchText(root, symbolNames, { word: true, maxCount: 24 });
-  for (const h of hits) {
-    if (
-      EXCLUDE.test(h.file)
-      || NEIGHBOR_EXCLUDE.test(h.file)
-      || TEST_PATH.test(h.file)
-      || corePaths.has(h.file)
-    ) continue;
-    const matched = symbolNames.filter((name) => lineHasWord(h.text, name));
-    if (!matched.length) continue;
-    let rec = neighHits.get(h.file);
-    if (!rec) {
-      rec = { path: h.file, hitLines: new Set(), symbols: new Set(), hitCount: 0 };
-      neighHits.set(h.file, rec);
-    }
-    if (rec.hitCount >= 8) continue;
-    rec.hitCount++;
-    rec.hitLines.add(h.line);
-    for (const name of matched) rec.symbols.add(name);
-  }
-  const ranked = [...neighHits.values()]
-    .map((r) => ({ ...r, score: r.hitLines.size + r.symbols.size * 2 }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, NEIGHBOR_CAP);
+// ---------------------------------------------------------------- 依赖符号
 
-  const expanded = await mapPool(ranked, 8, async (rec) => {
-    const abs = `${root}/${rec.path}`;
-    if (!existsSync(abs)) return null;
-    let content;
-    try {
-      content = await readFile(abs, 'utf8');
-    } catch {
-      return null;
-    }
-    const lines = content.split('\n');
-    const starts = extractSymbolStarts(lines);
-    const windows = mergeWindows([...rec.hitLines].map((hl) => hitToWindow(hl, starts, lines))).slice(0, 2);
-    return {
-      path: rec.path,
-      score: rec.score,
-      lines,
-      total: lines.length,
-      starts,
-      windows,
-      symbols: [...rec.symbols],
-    };
-  });
-  return expanded.filter(Boolean);
-}
+const STOP = new Set([
+  'self', 'this', 'true', 'false', 'null', 'none', 'some', 'void', 'undefined', 'async', 'await',
+  'const', 'let', 'var', 'function', 'return', 'export', 'import', 'from', 'default', 'class',
+  'extends', 'implements', 'interface', 'type', 'enum', 'struct', 'trait', 'impl', 'pub', 'crate',
+  'super', 'match', 'while', 'break', 'continue', 'else', 'catch', 'throw', 'typeof', 'instanceof',
+  'string', 'number', 'boolean', 'object', 'symbol', 'bigint', 'never', 'unknown', 'any', 'array',
+  'promise', 'record', 'partial', 'readonly', 'static', 'public', 'private', 'protected', 'delete',
+  'error', 'result', 'option', 'vec', 'hashmap', 'value', 'data', 'text', 'name', 'path', 'file',
+  'line', 'lines', 'args', 'options', 'opts', 'params', 'props', 'state', 'index', 'item', 'items',
+  'json', 'utf8', 'length', 'push', 'slice', 'split', 'join', 'test', 'exec', 'clone', 'unwrap',
+  'expect', 'into', 'iter', 'collect', 'format', 'println', 'console', 'process', 'require',
+  'with', 'then', 'else', 'when', 'that', 'this', 'true', 'false',
+]);
 
-function packBundle({
-  keywords,
-  intent,
-  maxChars,
-  commit,
-  rankedMeta,
-  core,
-  neighbors,
-  omitted,
-}) {
-  // Definition bodies are the highest-value evidence. Coverage/rank are compact metadata,
-  // and neighbors should not crowd core implementations out of the same output budget.
-  const coverBudget = Math.floor(maxChars * 0.12);
-  const headerBudget = Math.floor(maxChars * 0.04);
-  const neighborBudget = intent === 'locate' ? 0 : Math.floor(maxChars * 0.18);
-  const coreBudget = Math.max(2000, maxChars - coverBudget - headerBudget - neighborBudget);
-
-  const header = [];
-  header.push('# fast_context');
-  header.push(`query: ${keywords.join(' ')} | intent: ${intent} | commit: ${commit} | chars: 0/${maxChars}`);
-  header.push('');
-  header.push('## rank');
-  for (const r of rankedMeta.slice(0, 24)) {
-    header.push(`  ${String(Math.round(r.score)).padStart(4)}  ${r.path}           ${r.kind}`);
-  }
-  header.push('');
-
-  const coreOut = ['## core'];
-  const coverage = { full: [], body: [], outline: [], omitted: omitted.slice(0, 30) };
-  const nextReads = [];
-  let coreUsed = 0;
-
-  for (const f of core) {
-    if (coreUsed >= coreBudget) {
-      coverage.omitted.push(`${f.path} (budget)`);
-      continue;
-    }
-    const remain = coreBudget - coreUsed;
-
-    if (f.mode === 'full') {
-      const block = [`----- [FULL] ${f.path} (${f.total} lines) -----`, renderLines(f.lines, 1, f.total), ''].join('\n');
-      const { text, clipped } = clipText(block, remain);
-      coreOut.push(text);
-      coreUsed += text.length;
-      coverage.full.push(f.path);
-      if (clipped) {
-        nextReads.push({
-          path: f.path,
-          offset: Math.min(f.total, Math.max(1, Math.floor(remain / 40))),
-          limit: 200,
-          note: 'FULL 被字符预算截断',
-        });
-      }
-      continue;
-    }
-
-    if (f.mode === 'outline' || !f.lines?.length) {
-      const hitLines = (f.windows || []).flatMap((w) => (w.slices || [{ start: w.start, end: w.end }]));
-      const parts = [`----- [OUTLINE] ${f.path} -----`, outlineFromStarts(f.starts, 40) || '  (none)'];
-      if (hitLines.length && f.lines?.length) {
-        parts.push('  # anchors');
-        for (const s of hitLines.slice(0, 8)) parts.push(renderLines(f.lines, s.start, s.end));
-      } else if (hitLines.length) {
-        parts.push('  # anchors');
-        for (const s of hitLines.slice(0, 8)) parts.push(`  L${s.start}`);
-      }
-      parts.push('');
-      const { text } = clipText(parts.join('\n'), remain);
-      coreOut.push(text);
-      coreUsed += text.length;
-      coverage.outline.push(f.path);
-      nextReads.push({ path: f.path, offset: 1, limit: 80, note: '仅大纲/锚点' });
-      continue;
-    }
-
-    const parts = [
-      `----- [BODY] ${f.path} -----`,
-      '  # outline (top symbols)',
-      outlineFromStarts(f.starts, 30) || '  (none)',
-      '  # windows',
-    ];
-    const { covered, gaps } = coveredRanges(f.windows, f.total);
-    for (const w of f.windows) {
-      if (w.partial && w.slices) {
-        parts.push(`  L${w.start}-L${w.end}  (${w.name || 'symbol'}, partial)`);
-        for (const s of w.slices) {
-          parts.push(renderLines(f.lines, s.start, s.end));
-          parts.push('  ...');
-        }
-      } else {
-        parts.push(`  L${w.start}-L${w.end}${w.name ? `  (${w.name})` : ''}`);
-        parts.push(renderLines(f.lines, w.start, w.end));
-      }
-      parts.push('');
-    }
-    const block = `${parts.join('\n')}\n`;
-    const { text, clipped } = clipText(block, remain);
-    coreOut.push(text);
-    coreUsed += text.length;
-    coverage.body.push({
-      path: f.path,
-      covered: formatRangeList(covered),
-      gaps: formatRangeList(gaps),
-      partial: f.windows.some((w) => w.partial) || clipped,
-    });
-    for (const [a, b] of gaps.slice(0, 3)) {
-      if (b - a + 1 < 3) continue;
-      nextReads.push({
-        path: f.path,
-        offset: a,
-        limit: Math.min(200, b - a + 1),
-        note: clipped ? '正文截断后的缺口' : '窗间缺口',
-      });
-    }
-  }
-
-  const neighOut = ['## neighbors'];
-  let neighUsed = 0;
-  let thinCount = 0;
-  for (const n of neighbors) {
-    if (neighUsed >= neighborBudget) {
-      coverage.outline.push(n.path);
-      continue;
-    }
-    const remain = neighborBudget - neighUsed;
-    const wantThin = thinCount < NEIGHBOR_THIN_CAP && n.windows.length > 0;
-    if (wantThin) {
-      const sym = n.symbols[0] || n.windows[0]?.name || 'symbol';
-      const parts = [`----- [THIN] ${n.path} :: ${sym} -----`];
-      for (const w of n.windows.slice(0, 2)) {
-        const slices = w.partial && w.slices ? w.slices : [{ start: w.start, end: w.end }];
-        for (const s of slices) parts.push(renderLines(n.lines, s.start, Math.min(s.end, s.start + 40)));
-      }
-      parts.push('');
-      const { text } = clipText(parts.join('\n'), remain);
-      neighOut.push(text);
-      neighUsed += text.length;
-      thinCount++;
-      const { covered, gaps } = coveredRanges(n.windows, n.total);
-      coverage.body.push({
-        path: n.path,
-        covered: formatRangeList(covered),
-        gaps: formatRangeList(gaps),
-        partial: true,
-      });
-      for (const [a, b] of gaps.slice(0, 1)) {
-        nextReads.push({ path: n.path, offset: a, limit: Math.min(80, b - a + 1), note: '邻居实现' });
-      }
-    } else {
-      const block = [`----- [OUTLINE] ${n.path} -----`, outlineFromStarts(n.starts, 25) || '  (none)', ''].join('\n');
-      const { text } = clipText(block, remain);
-      neighOut.push(text);
-      neighUsed += text.length;
-      coverage.outline.push(n.path);
-      if (intent === 'edit' || intent === 'explain') {
-        nextReads.push({ path: n.path, offset: 1, limit: 80, note: '邻居仅大纲' });
-      }
-    }
-  }
-  if (neighOut.length === 1) neighOut.push('(none)');
-
-  const coverOut = ['## coverage'];
-  coverOut.push('FULL:');
-  for (const p of coverage.full) coverOut.push(`  - ${p}`);
-  if (!coverage.full.length) coverOut.push('  (none)');
-  coverOut.push('BODY:');
-  for (const b of coverage.body) {
-    coverOut.push(`  - ${b.path}  covered: ${b.covered || '-'}  gaps: ${b.gaps || '-'}${b.partial ? '  (partial)' : ''}`);
-  }
-  if (!coverage.body.length) coverOut.push('  (none)');
-  coverOut.push('OUTLINE:');
-  for (const p of coverage.outline) coverOut.push(`  - ${p}`);
-  if (!coverage.outline.length) coverOut.push('  (none)');
-  coverOut.push('OMITTED:');
-  for (const p of coverage.omitted) coverOut.push(`  - ${p}`);
-  if (!coverage.omitted.length) coverOut.push('  (none)');
-  coverOut.push('');
-  coverOut.push('## next_reads');
-  const uniqReads = [];
-  const seenRead = new Set();
-  for (const r of nextReads) {
-    const key = `${r.path}@${r.offset}:${r.limit}`;
-    if (seenRead.has(key)) continue;
-    seenRead.add(key);
-    uniqReads.push(r);
-  }
-  if (!uniqReads.length) coverOut.push('  (none)');
-  else {
-    for (const r of uniqReads.slice(0, 12)) {
-      coverOut.push(`  - {path: ${r.path}, offset: ${r.offset}, limit: ${r.limit}}  # ${r.note}`);
-    }
-  }
-  coverOut.push('');
-  coverOut.push('## rules');
-  coverOut.push('已覆盖路径/行段视为已读，禁止再 read。');
-  coverOut.push('仅允许按 next_reads 或 coverage.gaps 补读；多缺口合并一次 read_files。');
-  coverOut.push('仍不足时增大 maxChars 或收窄 keywords/pathHints 重调 fast_context，禁止无范围全文读。');
-
-  let body = [...header, ...coreOut, '', ...neighOut, '', ...coverOut].join('\n');
-  body = body.replace(/chars: 0\//, `chars: ${body.length}/`);
-  if (body.length > maxChars) {
-    const keepRules = coverOut.join('\n');
-    const room = Math.max(0, maxChars - keepRules.length - 80);
-    body = `${body.slice(0, room)}\n\n…[pack clipped to maxChars]\n\n${keepRules}`;
-    body = body.replace(/chars: \d+\//, `chars: ${body.length}/`);
-  }
-  return body;
-}
+const IDENT_RE = /[A-Za-z_$][A-Za-z0-9_$]*/g;
+const LOCAL_DECL_RE = /\b(?:const|let|var|function|fn|struct|enum|class|type|interface)\s+([A-Za-z_$][\w$]*)/g;
 
 /**
- * One-shot context pack: ranked defs + neighbor thin/outlines + coverage table.
- * @returns {Promise<string>}
+ * 从已选单元文本里找依赖符号，用索引的 import 映射精确解析定义位置（resolveRef：
+ * 同文件 > import 来源文件 > 全局唯一定义）。零额外检索开销。
  */
-export async function contextBundle(params = {}, root = repoRoot()) {
-  const keywords = params.keywords;
-  if (!Array.isArray(keywords) || keywords.length === 0) return '错误: keywords 不能为空';
-  const intent = ['edit', 'explain', 'locate'].includes(params.intent) ? params.intent : 'edit';
-  const pathHints = Array.isArray(params.pathHints) ? params.pathHints : [];
-  const requestedMaxChars = resolveMaxChars({ ...params, intent });
-  const softCoreCap = Number.isFinite(params.maxFiles)
-    ? Math.max(1, Math.min(CORE_SOFT_CAP, params.maxFiles))
-    : CORE_SOFT_CAP;
-
-  const t0 = Date.now();
-  const commit = shortHead(root);
-
-  const allHits = await discoverKeywords(root, keywords);
-  const files = new Map();
-  for (const h of allHits) {
-    const matchedKws = keywords.filter((kw) => h.text.includes(kw));
-    if (!matchedKws.length) continue;
-    let rec = files.get(h.file);
-    if (!rec) {
-      rec = {
-        path: h.file,
-        hitLines: new Set(),
-        keywords: new Set(),
-        defHits: 0,
-        mentionOnly: true,
-      };
-      files.set(h.file, rec);
+function collectDeps(index, unitTexts, ownedKeys, keywordSet) {
+  /** @type {Map<string, { n: number, call: boolean, from: Set<string> }>} */
+  const seen = new Map();
+  const locals = new Set();
+  for (const { file, text } of unitTexts) {
+    for (const m of text.matchAll(LOCAL_DECL_RE)) locals.add(m[1]);
+    for (const m of text.matchAll(IDENT_RE)) {
+      const name = m[0];
+      if (name.length < 4 || STOP.has(name.toLowerCase())) continue;
+      const before = m.index > 0 ? text[m.index - 1] : '';
+      if (before === '.') continue;
+      const after = text[m.index + name.length];
+      const call = after === '(' || after === '<';
+      const e = seen.get(name);
+      if (e) {
+        e.n += 1;
+        e.call = e.call || call;
+        e.from.add(file);
+      } else seen.set(name, { n: 1, call, from: new Set([file]) });
     }
-    rec.hitLines.add(h.line);
-    for (const kw of matchedKws) {
-      rec.keywords.add(kw);
-      if (DEF_LINE_RE.test(h.text) && h.text.includes(kw)) {
-        rec.defHits++;
-        rec.mentionOnly = false;
-      } else if (!/^\s*(?:\/\/|#|\/\*|\*|["'])/.test(h.text)) {
-        rec.mentionOnly = false;
+  }
+  const out = [];
+  for (const [name, info] of seen) {
+    if (keywordSet.has(name) || locals.has(name)) continue;
+    let def = null;
+    for (const f of info.from) {
+      def = resolveRef(index, name, f);
+      if (def) break;
+    }
+    if (!def || ownedKeys.has(`${def.file}:${def.ln}`)) continue;
+    if (def.kind === 'mod' || def.kind === 'impl') continue;
+    const size = def.end - def.ln + 1;
+    let score = info.n * 3 + (info.call ? 8 : 0);
+    if (size <= 40) score += 6;
+    if (SRC_PATH.test(def.file) || /^scripts\//.test(def.file)) score += 3;
+    out.push({ name, def, score, size });
+  }
+  out.sort((a, b) => b.score - a.score);
+  const picked = [];
+  /** @type {Map<string, number>} */
+  const perFile = new Map();
+  for (const d of out) {
+    if (picked.length >= MAX_DEPS) break;
+    const n = perFile.get(d.def.file) ?? 0;
+    if (n >= MAX_DEPS_PER_FILE) continue;
+    perFile.set(d.def.file, n + 1);
+    picked.push(d);
+  }
+  return picked;
+}
+
+// ---------------------------------------------------------------- 种子符号
+
+/**
+ * keywords 与索引 defs 的名字匹配：精确(3) > 忽略大小写(2) > 名字包含关键词(1, 词长≥5)。
+ * @returns {{ file: string, ln: number, end: number, kind: string, name: string, sig: string, w: number }[]}
+ */
+function seedDefs(index, keywords) {
+  /** @type {Map<string, any>} */
+  const out = new Map();
+  const add = (d, name, w) => {
+    const key = `${d.file}:${d.ln}`;
+    const cur = out.get(key);
+    if (!cur || cur.w < w) out.set(key, { ...d, name, w });
+  };
+  for (const kw of keywords) {
+    for (const d of index.defs.get(kw) ?? []) add(d, kw, 3);
+    const low = kw.toLowerCase();
+    if (low === kw && kw.length < 3) continue;
+    for (const [name, arr] of index.defs) {
+      const nl = name.toLowerCase();
+      if (nl === low) {
+        if (name !== kw) for (const d of arr) add(d, name, 2);
+      } else if (kw.length >= 5 && nl.includes(low)) {
+        for (const d of arr) add(d, name, 1);
+      }
+    }
+  }
+  return [...out.values()];
+}
+
+// ---------------------------------------------------------------- 主流程
+
+/**
+ * fast_context: 一次调用产出可直接动手的完整多文件上下文。
+ * 输出契约：EDIT/DEPS 全是完整单元或完整文件；放不下的定义进 SIG（仅签名）；
+ * 调用方/引用进 IMPACT（仅行）。不存在 partial。
+ * @param {{ keywords?: string[], task?: string, files?: string[], budget?: number, maxBytes?: number, maxChars?: number }} args
+ */
+export async function contextBundle(args = {}, root = repoRoot()) {
+  const keywords = [...new Set((Array.isArray(args?.keywords) ? args.keywords : [])
+    .map((k) => String(k ?? '').trim())
+    .filter(Boolean))].slice(0, MAX_KEYWORDS);
+  const task = String(args?.task ?? '').trim().slice(0, 300);
+  const tTokens = taskTokens(task).filter((t) => !keywords.some((k) => k.toLowerCase() === t.toLowerCase()));
+  const wantFiles = [...new Set((Array.isArray(args?.files) ? args.files : [])
+    .map((f) => String(f ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, ''))
+    .filter(Boolean))].slice(0, 6);
+  const terms = [...keywords, ...tTokens];
+  if (!terms.length && !wantFiles.length) return '错误: 需要 keywords / task / files 至少其一';
+  const budget = Math.max(MIN_BUDGET, Math.min(Number(args?.budget) || DEFAULT_BUDGET, MAX_BUDGET));
+  const { hardBytes, softBytes } = resolveOutputBudget(args);
+
+  const [rows0, rev0] = await Promise.all([
+    terms.length ? searchText(root, terms) : Promise.resolve([]),
+    run(root, 'git', ['rev-parse', '--short', 'HEAD']).then((s) => s.trim()),
+  ]);
+  const rev = rev0 || 'unknown';
+
+  // 只有部分检索词零命中时，补一轮大小写不敏感检索（一次进程）
+  let rows = rows0;
+  const hitTerm = new Set();
+  for (const r of rows) for (const k of terms) if (r.text.includes(k)) hitTerm.add(k);
+  const missing = terms.filter((k) => !hitTerm.has(k));
+  let looseKw = [];
+  if (missing.length && hitTerm.size) {
+    const extra = await searchText(root, missing, { ignoreCase: true });
+    if (extra.length) {
+      rows = rows.concat(extra);
+      looseKw = missing.filter((k) => extra.some((r) => r.text.toLowerCase().includes(k.toLowerCase())));
+    }
+  }
+
+  /** @type {Map<string, { lns: Map<number, { kws: Set<string>, text: string }>, kws: Set<string> }>} */
+  const hits = new Map();
+  /** @type {Map<string, number>} */
+  const kwCount = new Map();
+  for (const r of rows) {
+    let e = hits.get(r.file);
+    if (!e) {
+      e = { lns: new Map(), kws: new Set() };
+      hits.set(r.file, e);
+    }
+    if (!e.lns.has(r.ln) && e.lns.size >= MAX_HITS_PER_FILE) continue;
+    let cell = e.lns.get(r.ln);
+    if (!cell) {
+      cell = { kws: new Set(), text: r.text };
+      e.lns.set(r.ln, cell);
+    }
+    const low = r.text.toLowerCase();
+    for (const k of terms) {
+      if (r.text.includes(k) || low.includes(k.toLowerCase())) {
+        cell.kws.add(k);
+        e.kws.add(k);
+        kwCount.set(k, (kwCount.get(k) ?? 0) + 1);
       }
     }
   }
 
-  if (files.size === 0) return `无命中: ${keywords.join(' ')}`;
+  const subjectTerms = [...keywords, ...tTokens].map((t) => t.toLowerCase()).filter((t) => t.length >= 4);
+  const isSubject = (file) => {
+    if (!subjectTerms.length) return false;
+    const base = file.split('/').pop().toLowerCase();
+    return subjectTerms.some((t) => base.includes(t));
+  };
 
-  const ranked = [...files.values()]
-    .map((r) => scoreFile(r, pathHints))
-    .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
-  const maxChars = adaptiveMaxChars(params, intent, requestedMaxChars, {
-    hitCount: allHits.length,
-    fileCount: ranked.length,
-    definitionFiles: ranked.filter((r) => r.defHits > 0).length,
+  // 先用纯搜索结果做轻量排名，只索引最可能进入 EDIT 的文件；IMPACT 仍保留全量命中行。
+  const preliminary = [...hits.entries()].map(([file, e]) => {
+    let score = scoreFilePrior(file) + Math.min(e.lns.size, 8) * 4;
+    for (const k of e.kws) score += 30 * KW_WEIGHT(kwCount.get(k) ?? 1) * (keywords.includes(k) ? 1 : 0.5);
+    if ([...e.lns.values()].some((cell) => SEARCH_DEF_RE.test(cell.text))) score += 120;
+    if (isSubject(file)) score += 600;
+    if (wantFiles.includes(file)) score += 500;
+    return { file, score };
+  }).sort((a, b) => b.score - a.score);
+  const priorityFiles = [...new Set([
+    ...wantFiles,
+    ...preliminary.slice(0, MAX_CANDIDATES).map((r) => r.file),
+  ])];
+  const index = await getIndex(root, {
+    priorityFiles,
+    matchTerms: terms,
+    mode: 'focused',
+    dependencyDepth: 1,
   });
 
-  const timedOut = () => Date.now() - t0 > WALL_MS;
-  const locateOnly = intent === 'locate' || timedOut();
+  const missedAll = keywords.filter((k) => !kwCount.has(k));
+  const seeds = seedDefs(index, keywords);
+  if (!hits.size && !wantFiles.length && !seeds.length) {
+    return `# CTX @${rev}\n无命中: ${terms.join(' ')}\n提示: 换更短的符号名/字符串片段，或改用 find_symbols / grep 定位后用 read。`;
+  }
 
-  const coreCandidates = ranked.slice(0, softCoreCap);
-  const omitted = ranked.slice(softCoreCap).map((r) => `${r.path} (low score)`);
+  // ---- 文件排名
+  const seedFiles = new Set(seeds.map((d) => d.file));
+  // 查询词命中文件名（不含扩展名之外的 basename 子串）→ 该文件就是查询主体
+  const ranked = [...hits.entries()].map(([file, e]) => {
+    let s = scoreFilePrior(file);
+    for (const k of e.kws) s += 30 * KW_WEIGHT(kwCount.get(k) ?? 1) * (keywords.includes(k) ? 1 : 0.5);
+    s += Math.min(e.lns.size, 8) * 4;
+    if (seedFiles.has(file)) s += 120;
+    if (isSubject(file)) s += 600;
+    if (wantFiles.includes(file)) s += 500;
+    return { file, e, score: s };
+  }).sort((a, b) => b.score - a.score);
 
-  let core = [];
-  let neighbors = [];
-
-  if (locateOnly) {
-    core = (await mapPool(coreCandidates.slice(0, 8), 8, async (rec) => {
-      const abs = `${root}/${rec.path}`;
-      let lines = [];
-      try {
-        if (existsSync(abs)) lines = (await readFile(abs, 'utf8')).split('\n');
-      } catch { /* ignore */ }
-      const hitLines = [...rec.hitLines].sort((a, b) => a - b);
-      const starts = lines.length ? extractSymbolStarts(lines) : hitLines.slice(0, 20).map((line) => ({ line, name: `hit@${line}`, indent: 0 }));
-      return {
-        path: rec.path,
-        score: rec.score,
-        kind: rec.kind,
-        lines,
-        total: lines.length,
-        starts: starts.slice(0, 40),
-        windows: hitLines.slice(0, 8).map((line) => ({
-          start: line,
-          end: line,
-          name: null,
-          partial: true,
-          slices: [{ start: line, end: line }],
-        })),
-        mode: 'outline',
-        symbols: [],
-      };
-    })).filter(Boolean);
-  } else {
-    core = (await mapPool(coreCandidates, 12, (rec) => expandFile(root, rec, keywords))).filter(Boolean);
-    core.sort((a, b) => b.score - a.score);
-    for (const c of core) {
-      if (c.mode === 'outline' && c.windows.length) c.mode = 'body';
+  for (const f of wantFiles) {
+    if (!hits.has(f)) {
+      ranked.unshift({ file: f, e: { lns: new Map(), kws: new Set() }, score: 1000 });
     }
-    if (!timedOut()) {
-      const corePaths = new Set(core.map((c) => c.path));
-      neighbors = await discoverNeighbors(root, core, corePaths, keywords);
+  }
+  // 种子定义所在文件即使没进命中（名字匹配但正文命中在别处）也要成为候选
+  for (const f of seedFiles) {
+    if (!ranked.some((r) => r.file === f)) {
+      ranked.push({ file: f, e: { lns: new Map(), kws: new Set() }, score: 100 });
+    }
+  }
+  // 主题文件可能正文零命中（查询词只在文件名里），必须成为候选
+  for (const f of Object.keys(index.files)) {
+    if (!isSubject(f) || ranked.some((r) => r.file === f)) continue;
+    ranked.push({ file: f, e: { lns: new Map(), kws: new Set() }, score: 550 });
+  }
+  // 追加后重排，保证 wantFiles > 主题文件 > 其余命中
+  ranked.sort((a, b) => b.score - a.score);
+
+  let candidates = ranked.filter((r) => isCodeFile(r.file) || wantFiles.includes(r.file)).slice(0, MAX_CANDIDATES);
+  // 全是非代码文件时（配置/文档命中）也要展开，否则模型只拿到一堆位置还得自己去读
+  if (!candidates.length) candidates = ranked.slice(0, 3);
+
+  // ---- 读取候选文件
+  /** @type {Map<string, { lines: string[], total: number, syms: any[] }>} */
+  const srcs = new Map();
+  await mapPool(candidates, 8, async ({ file }) => {
+    const src = readSource(root, index, file);
+    if (src) srcs.set(file, src);
+  });
+
+  // ---- 候选单元
+  /** @type {{ file: string, ln: number, end: number, label: string, tag: string, score: number, hits: number[], kws: Set<string>, unit: any }[]} */
+  const units = [];
+  const fileRank = new Map(candidates.map((c, i) => [c.file, i]));
+  const tLow = tTokens.map((t) => t.toLowerCase());
+  for (const { file, e, score } of candidates) {
+    const src = srcs.get(file);
+    if (!src) continue;
+    /** @type {Map<string, any>} */
+    const grouped = new Map();
+    for (const [ln, cell] of e.lns) {
+      if (ln > src.total) continue;
+      const { unit, chain } = unitForHit(src.syms, ln);
+      const key = unit ? `${unit.ln}-${unit.end}` : `w${Math.floor(ln / 20)}`;
+      let g = grouped.get(key);
+      if (!g) {
+        // 无符号边界的文件（配置/文档等）：以命中行为中心的完整窗口即"单元"
+        const lo = Math.max(1, ln - 8);
+        const hi = Math.min(src.total, ln + 8);
+        g = {
+          file,
+          ln: unit ? unit.ln : lo,
+          end: unit ? unit.end : hi,
+          label: unit ? unitLabel(chain, unit) : '',
+          unit,
+          tag: 'hit',
+          hits: [],
+          kws: new Set(),
+        };
+        grouped.set(key, g);
+      }
+      g.hits.push(ln);
+      for (const k of cell.kws) g.kws.add(k);
+    }
+    // 种子定义直接成为候选单元（即使该定义行没有正文命中）
+    for (const d of seeds) {
+      if (d.file !== file) continue;
+      const key = `${d.ln}-${d.end}`;
+      let g = grouped.get(key);
+      if (!g) {
+        const chain = src.syms
+          .filter((s) => s.ln <= d.ln && s.end >= d.end)
+          .sort((a, b) => a.depth - b.depth || a.ln - b.ln);
+        g = {
+          file,
+          ln: d.ln,
+          end: d.end,
+          label: unitLabel(chain, chain[chain.length - 1]) || `${d.kind} ${d.name}`,
+          unit: chain[chain.length - 1] ?? null,
+          tag: 'hit',
+          hits: [],
+          kws: new Set(),
+        };
+        grouped.set(key, g);
+      }
+      g.tag = 'def';
+      g.seedW = Math.max(g.seedW ?? 0, d.w);
+    }
+    for (const g of grouped.values()) {
+      const size = g.end - g.ln + 1;
+      let s = score * 0.35;
+      for (const k of g.kws) s += 45 * KW_WEIGHT(kwCount.get(k) ?? 1) * (keywords.includes(k) ? 1 : 0.5);
+      s += Math.min(g.hits.length, 6) * 8;
+      if (g.tag === 'def') s += (g.seedW ?? 1) >= 3 ? 200 : (g.seedW ?? 1) === 2 ? 120 : 30;
+      if (g.unit && /^(fn|method|class|type)$/.test(g.unit.kind)) s += 20;
+      // task token 与单元正文的重叠度
+      if (tLow.length) {
+        const body = src.lines.slice(g.ln - 1, g.end).join('\n').toLowerCase();
+        for (const t of tLow) if (body.includes(t)) s += 15;
+      }
+      if (size > 150) s -= (size - 150) / 8;
+      if ((fileRank.get(file) ?? 9) < 2) s += 12;
+      g.score = s;
+      units.push(g);
+    }
+  }
+  units.sort((a, b) => b.score - a.score);
+
+  // ---- 装配
+  // planned 只累计代码正文的估算字节（渲染时的头/尾开销另算），避免重复计数。
+  let planned = 0;
+  let usedLines = 0;
+  const clip = (line) => (line.length > MAX_LINE_CHARS
+    ? `${line.slice(0, MAX_LINE_CHARS)}…(+${line.length - MAX_LINE_CHARS}c)`
+    : line);
+  const costOf = (file, ranges) => {
+    const src = srcs.get(file);
+    let n = 0;
+    for (const [a, b] of ranges) {
+      n += RANGE_HEADER_BYTES;
+      for (let i = a; i <= b; i++) n += Buffer.byteLength(clip(src.lines[i - 1] ?? ''), 'utf8') + 1;
+    }
+    return n;
+  };
+
+  /** @type {Map<string, { full: boolean, section: string, blocks: { ranges: [number,number][], label: string, tag: string }[] }>} */
+  const plan = new Map();
+  /** @type {{ file: string, ln: number, sig: string }[]} 预算内放不下的定义，仅签名 */
+  const sigList = [];
+  const planFile = (file, section) => {
+    let p = plan.get(file);
+    if (!p) {
+      p = { full: false, section, blocks: [] };
+      plan.set(file, p);
+    }
+    return p;
+  };
+  const shownRanges = (file) => {
+    const p = plan.get(file);
+    if (!p) return [];
+    if (p.full) return [[1, srcs.get(file).total]];
+    return mergeRanges(p.blocks.flatMap((b) => b.ranges));
+  };
+  const covers = (file, ln) => shownRanges(file).some(([a, b]) => ln >= a && ln <= b);
+
+  const fitsBudget = (cost, lines) => planned + cost <= softBytes && usedLines + lines <= budget;
+  const take = (cost, lines) => {
+    planned += cost;
+    usedLines += lines;
+  };
+
+  const countLines = (ranges) => ranges.reduce((n, [a, b]) => n + (b - a + 1), 0);
+  const pushSig = (file, ln, sig) => {
+    if (!sig || sig.length < 3) return;
+    if (!sigList.some((x) => x.file === file && x.ln === ln)) sigList.push({ file, ln, sig });
+  };
+
+  // 显式指定的文件优先整读，保证"点名要的东西一次到手"
+  for (const f of wantFiles) {
+    const src = srcs.get(f);
+    if (!src || src.total > EXPLICIT_FULL_MAX) continue;
+    const cost = costOf(f, [[1, src.total]]);
+    if (!fitsBudget(cost, src.total)) continue;
+    planFile(f, 'edit').full = true;
+    take(cost, src.total);
+  }
+
+  // 主题文件（文件名命中查询词）：查询主体就是文件本身，预算优先给它。
+  // 分两相：先给所有 ≤SUBJECT_FULL_MAX 的主题文件整给（小主题不被大主题挤掉），
+  // 装不下的大主题再按「含命中单元优先、其余按文件顺序」通读打包（主流程一次拿全），
+  // 放不下的顶层单元进 SIG，未打包的在渲染时用大纲行兜底。测试文件不当主题。
+  const subjectList = candidates.map((c) => c.file).filter((f) => isSubject(f) && !NOISE_PATH.test(f) && srcs.has(f));
+  for (const f of subjectList) {
+    const src = srcs.get(f);
+    if (src.total > SUBJECT_FULL_MAX || plan.get(f)?.full) continue;
+    const cost = costOf(f, [[1, src.total]]);
+    if (fitsBudget(cost, src.total)) {
+      planFile(f, 'edit').full = true;
+      take(cost, src.total);
+    }
+  }
+  for (const f of subjectList) {
+    const src = srcs.get(f);
+    if (plan.get(f)?.full) continue;
+    const p = planFile(f, 'edit');
+    const packed = (s) => p.blocks.some((b) => b.ranges.some(([a, bb]) => s.ln >= a && s.end <= bb));
+    const hitEntry = hits.get(f);
+    const hitLns = hitEntry ? [...hitEntry.lns.keys()] : [];
+    const eligible = src.syms.filter((s) => {
+      if (s.depth > 1 || (s.kind === 'const' && s.end === s.ln)) return false;
+      if (/^(tests?|spec)$/i.test(s.name)) return false;
+      const chain = src.syms.filter((x) => x.ln <= s.ln && x.end >= s.end && x.depth < s.depth);
+      return !chain.some((x) => /^(tests?|spec)$/i.test(x.name));
+    });
+    const hasHit = (s) => hitLns.some((ln) => ln >= s.ln && ln <= s.end);
+    eligible.sort((a, b) => (Number(hasHit(b)) - Number(hasHit(a))) || (a.ln - b.ln));
+    for (const s of eligible) {
+      if (p.blocks.length >= MAX_SUBJECT_UNITS) break;
+      if (packed(s)) continue;
+      const chain = src.syms
+        .filter((x) => x.ln <= s.ln && x.end >= s.end && x.depth < s.depth)
+        .sort((a, b) => a.depth - b.depth || a.ln - b.ln);
+      const ranges = [[s.ln, Math.min(s.end, src.total)]];
+      const cost = costOf(f, ranges);
+      const lines = countLines(ranges);
+      if (!fitsBudget(cost, lines)) {
+        if (s.depth === 0) pushSig(f, s.ln, s.sig);
+        continue;
+      }
+      p.blocks.push({ ranges, label: unitLabel(chain, s) || `${s.kind} ${s.name}`, tag: 'hit' });
+      take(cost, lines);
     }
   }
 
-  return packBundle({
-    keywords,
-    intent: locateOnly && intent !== 'locate' ? 'locate' : intent,
-    maxChars: intent === 'locate' || locateOnly ? Math.min(maxChars, INTENT_CHARS.locate) : maxChars,
-    commit,
-    rankedMeta: ranked,
-    core,
-    neighbors: intent === 'locate' || locateOnly ? [] : neighbors,
-    omitted,
-  });
+  for (const u of units) {
+    const src = srcs.get(u.file);
+    if (!src) continue;
+    const p = plan.get(u.file);
+    if (p?.full) continue;
+    if (plan.size >= MAX_FILES && !p) continue;
+    if ((p?.blocks.length ?? 0) >= MAX_UNITS_PER_FILE) continue;
+    if (u.hits.length && u.hits.every((ln) => covers(u.file, ln))) continue;
+
+    // 小文件直接整给
+    if (!p && src.total <= FULL_FILE_MAX && ((fileRank.get(u.file) ?? 9) < 3 || u.tag === 'def')) {
+      const cost = costOf(u.file, [[1, src.total]]);
+      if (fitsBudget(cost, src.total)) {
+        planFile(u.file, 'edit').full = true;
+        take(cost, src.total);
+        continue;
+      }
+    }
+
+    // 只给完整单元；放不进预算就降级到 SIG（仅真实符号），绝不截断代码
+    const ranges = [[u.ln, Math.min(u.end, src.total)]];
+    const cost = costOf(u.file, ranges);
+    const lines = countLines(ranges);
+    if (!fitsBudget(cost, lines)) {
+      if (u.unit) pushSig(u.file, u.ln, u.unit.sig);
+      continue;
+    }
+    planFile(u.file, 'edit').blocks.push({ ranges, label: u.label, tag: u.tag });
+    take(cost, lines);
+  }
+
+  // ---- 依赖闭包（向下）：沿 import 映射精确解析，完整打包定义体
+  const hitFileCount = plan.size;
+  const ownedKeys = new Set();
+  const unitTexts = [];
+  for (const file of plan.keys()) {
+    const src = srcs.get(file);
+    for (const [a, b] of shownRanges(file)) unitTexts.push({ file, text: src.lines.slice(a - 1, b).join('\n') });
+    for (const s of src.syms) if (covers(file, s.ln)) ownedKeys.add(`${file}:${s.ln}`);
+  }
+  const deps = collectDeps(index, unitTexts, ownedKeys, new Set([...keywords, ...tTokens]));
+  for (const d of deps) {
+    const file = d.def.file;
+    if (plan.get(file)?.full) continue;
+    if (!plan.has(file) && plan.size >= hitFileCount + MAX_DEP_FILES) {
+      pushSig(file, d.def.ln, d.def.sig);
+      continue;
+    }
+    let src = srcs.get(file);
+    if (!src) {
+      src = readSource(root, index, file);
+      if (!src) continue;
+      srcs.set(file, src);
+    }
+    if (covers(file, d.def.ln)) continue;
+    const ranges = [[d.def.ln, Math.min(d.def.end, src.total)]];
+    const cost = costOf(file, ranges);
+    const lines = countLines(ranges);
+    if (!fitsBudget(cost, lines)) {
+      pushSig(file, d.def.ln, d.def.sig);
+      continue;
+    }
+    planFile(file, 'dep').blocks.push({ ranges, label: `${d.def.kind} ${d.name}`, tag: 'dep' });
+    take(cost, lines);
+  }
+
+  // 最终硬预算也只移除完整 block/file，并把被移除定义降级到 SIG。
+  const downgradeRangesToSig = (file, ranges) => {
+    const src = srcs.get(file);
+    if (!src) return;
+    let found = false;
+    for (const s of src.syms) {
+      if (!s.sig || s.depth > 1) continue;
+      if (!ranges.some(([a, b]) => s.ln >= a && s.end <= b)) continue;
+      pushSig(file, s.ln, s.sig);
+      found = true;
+    }
+    if (!found) {
+      const line = ranges[0]?.[0];
+      const sig = line ? String(src.lines[line - 1] ?? '').trim().slice(0, 120) : '';
+      pushSig(file, line, sig);
+    }
+  };
+  const dropLowestPriorityBlock = () => {
+    const order = [...plan.keys()].sort((a, b) => {
+      const sa = plan.get(a).section === 'dep' ? 1 : 0;
+      const sb = plan.get(b).section === 'dep' ? 1 : 0;
+      return sb - sa || (fileRank.get(b) ?? 99) - (fileRank.get(a) ?? 99);
+    });
+    for (const file of order) {
+      const p = plan.get(file);
+      const src = srcs.get(file);
+      if (!p || !src) continue;
+      if (p.full) {
+        downgradeRangesToSig(file, [[1, src.total]]);
+        plan.delete(file);
+        return true;
+      }
+      const block = p.blocks.pop();
+      if (!block) continue;
+      downgradeRangesToSig(file, block.ranges);
+      if (!p.blocks.length) plan.delete(file);
+      return true;
+    }
+    return false;
+  };
+
+  let impactLimit = MAX_IMPACT;
+  let compactIndex = false;
+  const renderOutput = () => {
+    const out = [];
+    const push = (line) => out.push(line);
+    const order = [...plan.keys()].sort((a, b) => (fileRank.get(a) ?? 99) - (fileRank.get(b) ?? 99));
+    const head = [];
+    head.push(`# CTX ${keywords.length ? `q=${keywords.join(',')}` : ''}${task ? ` task="${task.slice(0, 80)}"` : ''}${wantFiles.length ? ` files=${wantFiles.join(',')}` : ''} @${rev}`);
+    let blockCount = 0;
+    const renderFile = (file) => {
+    const p = plan.get(file);
+    const src = srcs.get(file);
+    const shown = shownRanges(file);
+    if (p.full) {
+      push(`### ${file} (${src.total}L) FULL`);
+      for (const l of src.lines) push(clip(l));
+      blockCount += 1;
+    } else {
+      push(`### ${file} (${src.total}L) shown=${fmtRanges(shown)}`);
+      p.blocks.sort((x, y) => x.ranges[0][0] - y.ranges[0][0]);
+      for (const b of p.blocks) {
+        blockCount += 1;
+        for (const [a, bb] of b.ranges) {
+          push(`@@ ${a}-${bb} ${b.label}${b.tag !== 'hit' ? ` [${b.tag}]` : ''}`);
+          for (let i = a; i <= bb; i++) push(clip(src.lines[i - 1] ?? ''));
+        }
+      }
+      // 同文件未展示的顶层符号：给一行索引，避免模型为"看看还有什么"而整读；主题文件给全大纲
+      const rest = src.syms
+        .filter((s) => s.depth === 0 && !covers(file, s.ln) && !(s.kind === 'const' && s.end === s.ln))
+        .map(outlineEntry);
+      const cap = isSubject(file) ? SUBJECT_OUTLINE_CAP : (fileRank.get(file) ?? 9) < 1 ? MAX_OUTLINE_TOP : MAX_OUTLINE_OTHER;
+      if (rest.length && cap > 0) {
+        const shownRest = rest.slice(0, cap);
+        push(`~ ${shownRest.join(' | ')}${rest.length > cap ? ` | +${rest.length - cap}` : ''}`);
+      }
+    }
+    push('');
+  };
+
+  const editFiles = order.filter((f) => plan.get(f).section === 'edit');
+  const depFiles = order.filter((f) => plan.get(f).section === 'dep');
+  if (editFiles.length) {
+    push('## EDIT');
+    for (const f of editFiles) renderFile(f);
+  }
+  if (depFiles.length) {
+    push('## DEPS (依赖定义, 完整单元)');
+    for (const f of depFiles) renderFile(f);
+  }
+
+  // ---- IMPACT（向上）：未展示的引用/调用行，单行清单
+  const seedNames = [...new Set(seeds.map((d) => d.name))];
+  const kwSet = new Set(keywords);
+  const refs = [];
+  let totalRefs = 0;
+  for (const { file, e } of ranked) {
+    for (const [ln, cell] of e.lns) {
+      if (plan.has(file) && covers(file, ln)) continue;
+      const isSeedRef = seedNames.length
+        ? seedNames.some((n) => cell.text.includes(n))
+        : [...kwSet].some((k) => cell.text.includes(k));
+      if (!isSeedRef) continue;
+      totalRefs += 1;
+      if (refs.length < impactLimit) refs.push(`${file}:${ln} ${cell.text.trim().slice(0, 120)}`);
+    }
+  }
+  if (refs.length) {
+    push(`## IMPACT (调用方/引用清单 ${refs.length}/${totalRefs}, 仅行; 确需函数体按 path:ln 补读)`);
+    for (const r of refs) push(r);
+    push('');
+  }
+  if (sigList.length) {
+    push('## SIG (预算内放不下或最终回退的定义, 仅签名)');
+    for (const d of sigList) push(`${d.file}:${d.ln} ${d.sig}`);
+    push('');
+  }
+
+  const notes = [];
+  if (!compactIndex) {
+    if (missedAll.length) notes.push(`未命中关键词: ${missedAll.join(' ')}`);
+    if (looseKw.length) notes.push(`忽略大小写才命中: ${looseKw.join(' ')}`);
+    const unexpanded = ranked.filter((r) => !plan.has(r.file)).map((r) => r.file);
+    if (unexpanded.length) notes.push(`其它命中文件(未展开): ${unexpanded.slice(0, 10).join(' ')}${unexpanded.length > 10 ? ` +${unexpanded.length - 10}` : ''}`);
+  }
+
+  const body = out.join('\n');
+  const shownLines = order.reduce((sum, file) => sum + shownRanges(file).reduce((n, [a, b]) => n + b - a + 1, 0), 0);
+  head[0] += `  ${order.length}文件/${blockCount}块 ${shownLines}行 ${(Buffer.byteLength(body, 'utf8') / 1024).toFixed(1)}KB`;
+  head.push('# 契约: 以上均为完整单元/完整文件，可直接据此编辑；已展示行段禁止重读。SIG/IMPACT 仅索引，确需其函数体时按 path:ln 精确补读。');
+  for (const n of notes) head.push(`# ${n}`);
+  head.push('');
+
+    return `${head.join('\n')}\n${body}`;
+  };
+
+  let text = renderOutput();
+  while (Buffer.byteLength(text, 'utf8') > hardBytes && dropLowestPriorityBlock()) {
+    text = renderOutput();
+  }
+  // 所有回退定义必须保留在 SIG；若索引开销仍超限，只收敛 IMPACT 行数。
+  while (Buffer.byteLength(text, 'utf8') > hardBytes && impactLimit > 0) {
+    impactLimit = Math.max(0, impactLimit - 5);
+    text = renderOutput();
+  }
+  if (Buffer.byteLength(text, 'utf8') > hardBytes) {
+    compactIndex = true;
+    text = renderOutput();
+  }
+  return text;
 }
 
-// ---------- code_map ----------
-export function codeMap(_args = {}, root = repoRoot()) {
-  let files = '';
-  try {
-    files = execFileSync('git', ['ls-files', '*.rs', '*.ts', '*.tsx', '*.mjs'], {
-      cwd: root,
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024,
-    });
-  } catch {
-    files = '';
-  }
-  const list = files.split('\n').filter((f) => f && !EXCLUDE.test(f));
+// ---------------------------------------------------------------- code_map
+
+export async function codeMap(args = {}, root = repoRoot()) {
+  const index = await getIndex(root);
+  const scope = String(args?.scope ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  const files = Object.keys(index.files).filter((f) => !scope || f.startsWith(scope)).sort();
+  if (!files.length) return `# CODEMAP\n无匹配文件${scope ? `: ${scope}` : ''}`;
+  const [rev, br] = await Promise.all([
+    run(root, 'git', ['rev-parse', '--short', 'HEAD']).then((s) => s.trim()),
+    run(root, 'git', ['rev-parse', '--abbrev-ref', 'HEAD']).then((s) => s.trim()),
+  ]);
   const out = [];
-  let branch = 'HEAD';
-  try {
-    branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
-  } catch { /* ignore */ }
-  out.push(`# CODEMAP — ${root.split('/').pop()} @ ${branch}`, '');
-  out.push('## 文件 (行数)');
-  for (const f of list) {
-    if (!existsSync(`${root}/${f}`)) continue;
-    const n = readFileSync(`${root}/${f}`, 'utf8').split('\n').length;
-    out.push(`${String(n).padStart(6)}  ${f}`);
-  }
-  out.push('', '## 符号大纲');
-  for (const f of list) {
-    if (!existsSync(`${root}/${f}`)) continue;
-    const lines = readFileSync(`${root}/${f}`, 'utf8').split('\n');
-    const starts = extractSymbolStarts(lines);
-    if (!starts.length) continue;
-    out.push('', `### ${f}`, ...starts.map((s) => `L${s.line}  ${s.name}`));
+  const repoName = root.replace(/\\/g, '/').split('/').pop();
+  out.push(`# CODEMAP ${repoName} @${br} ${rev}  ${files.length} files  cache: ${cacheLocationLabel(root)}`);
+  if (scope) {
+    out.push(`# scope=${scope}  (每个文件: 行数 + 顶层符号)`);
+    for (const f of files) {
+      const e = index.files[f];
+      const syms = e.syms.filter((s) => s.depth === 0).map(outlineEntry);
+      out.push(`## ${f} (${e.total}L)`);
+      if (syms.length) out.push(syms.join(' | '));
+    }
+  } else {
+    out.push('# 行数 符号数 文件  (要看符号大纲请带 scope=<目录前缀>)');
+    for (const f of files) {
+      const e = index.files[f];
+      const n = e.syms.filter((s) => s.depth === 0).length;
+      out.push(`${String(e.total).padStart(6)} ${String(n).padStart(4)}  ${f}`);
+    }
   }
   return out.join('\n');
 }
 
-// ---------- find_symbols ----------
-export async function findSymbols({ names }, root = repoRoot()) {
-  if (!Array.isArray(names) || names.length === 0) return '错误: names 不能为空';
-  const rev = shortHead(root);
-  const hits = await searchText(root, names, { word: true });
-  const sections = names.map((name) => {
-    const lines = hits
-      .filter((h) => lineHasWord(h.text, name))
-      .slice(0, 40)
-      .map((h) => `${h.file}:${h.line}:${h.text}`);
-    return `## ${name}\n` + (lines.join('\n') || '(无命中)');
+// ---------------------------------------------------------------- find_symbols
+
+export async function findSymbols({ names } = {}, root = repoRoot()) {
+  const list = [...new Set((Array.isArray(names) ? names : []).map((n) => String(n ?? '').trim()).filter(Boolean))].slice(0, 12);
+  if (!list.length) return '错误: names 不能为空';
+  const rows = await searchText(root, list, { word: true });
+  const index = await getIndex(root, {
+    priorityFiles: [...new Set(rows.map((r) => r.file))],
+    matchTerms: list,
+    mode: 'focused',
+    dependencyDepth: 0,
   });
-  return `# 符号定位 [${rev}]\n` + sections.join('\n\n');
+  /** @type {Map<string, { file: string, ln: number, text: string }[]>} */
+  const refs = new Map();
+  for (const p of rows) {
+    for (const n of list) {
+      if (!new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(p.text)) continue;
+      const arr = refs.get(n) ?? [];
+      if (arr.length < 400) arr.push({ file: p.file, ln: p.ln, text: p.text });
+      refs.set(n, arr);
+    }
+  }
+  const out = [`# 符号定位 @${(await run(root, 'git', ['rev-parse', '--short', 'HEAD'])).trim()}`];
+  for (const n of list) {
+    const defs = index.defs.get(n) ?? [];
+    const hits = refs.get(n) ?? [];
+    out.push('', `## ${n}  defs=${defs.length} refs=${hits.length}`);
+    for (const d of defs.slice(0, 6)) out.push(`DEF ${d.file}:${d.ln}-${d.end} ${d.sig}`);
+    const rest = hits.filter((h) => !defs.some((d) => d.file === h.file && d.ln === h.ln));
+    for (const h of rest.slice(0, 24)) out.push(`    ${h.file}:${h.ln} ${h.text.trim().slice(0, 110)}`);
+    if (rest.length > 24) out.push(`    … +${rest.length - 24}`);
+    if (!defs.length && !hits.length) out.push('(无命中)');
+  }
+  return out.join('\n');
 }
 
+// ---------------------------------------------------------------- 工具 schema
+
 export const FAST_CONTEXT_DESCRIPTION =
-  '分析/修改前未知分布时必须先调用：一次打包定义体+1跳邻居+覆盖表（内部已用 rg，尊重 .gitignore）。coverage 中 FULL/BODY.covered 禁止再读；禁止对已打包关键词再用 Shell/Grep/rg/git grep 重搜；仅按 gaps/next_reads 补读（多缺口合并 read_files）。intent: edit|explain|locate。';
+  '未知修改分布时调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单。输出无 partial；已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读。路径和行段已知时直接 read/read_files，不要调用本工具。';
 
 export const TOOLS = [
   {
@@ -1001,28 +1042,28 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        keywords: { type: 'array', items: { type: 'string' }, minItems: 1, description: '关键词或符号名，建议 2–6 个' },
-        intent: { type: 'string', enum: ['edit', 'explain', 'locate'], description: '默认 edit：定义体优先；explain 更宽；locate 只定位' },
-        pathHints: { type: 'array', items: { type: 'string' }, description: '可选目录/文件前缀加权' },
-        maxChars: { type: 'number', description: '字符预算；基础默认 edit=32000 explain=24000 locate=12000，宽查询自动扩容，硬顶 80000' },
-        budget: { type: 'number', description: '兼容旧参数：行预算，近似映射为 maxChars' },
-        ctx: { type: 'number', description: '兼容旧参数：命中上下文半径' },
-        maxFiles: { type: 'number', description: '兼容旧参数：核心文件软顶' },
+        keywords: { type: 'array', items: { type: 'string' }, description: '1-5 个符号/关键词' },
+        task: { type: 'string', description: '一句话任务描述（用于提词与排序），如 "给设置面板加一个开关"' },
+        files: { type: 'array', items: { type: 'string' }, description: '已知必看路径（可与 keywords 同用）' },
+        budget: { type: 'number', description: '代码行预算，默认 600，范围 100-1200' },
+        maxBytes: { type: 'number', description: '输出硬预算，默认 32768，范围 8192-65536；仅完整文件/单元边界收敛' },
       },
-      required: ['keywords'],
     },
   },
   {
     name: 'code_map',
-    description: '生成整个仓库的符号地图(文件行数 + 各文件符号大纲)。用于建立整体架构认知。',
-    inputSchema: { type: 'object', properties: {} },
+    description: '仓库文件清单；带 scope 给该目录顶层符号大纲。仅需全局结构时用。',
+    inputSchema: {
+      type: 'object',
+      properties: { scope: { type: 'string', description: '目录前缀' } },
+    },
   },
   {
     name: 'find_symbols',
-    description: '并行定位多个符号在仓库中的所有出现位置(文件:行号)。只要行号不要正文时用；需要上下文用 fast_context。',
+    description: '只要定义/引用位置、不要代码正文时用（比 fast_context 轻）。',
     inputSchema: {
       type: 'object',
-      properties: { names: { type: 'array', items: { type: 'string' }, minItems: 1, description: '符号名列表' } },
+      properties: { names: { type: 'array', items: { type: 'string' }, minItems: 1, description: '符号名' } },
       required: ['names'],
     },
   },

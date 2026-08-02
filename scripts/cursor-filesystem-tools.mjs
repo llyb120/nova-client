@@ -130,15 +130,12 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       inputSchema: {
         type: "object",
         properties: {
-          keywords: { type: "array", minItems: 1, items: { type: "string" }, description: "关键词或符号名，建议 2–6 个" },
-          intent: { type: "string", enum: ["edit", "explain", "locate"], description: "默认 edit：定义体优先；explain 更宽；locate 只定位" },
-          pathHints: { type: "array", items: { type: "string" }, description: "可选目录/文件前缀加权" },
-          maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "字符预算；基础默认 edit=32000 explain=24000 locate=12000，宽查询自动扩容" },
-          budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，近似映射为 maxChars" },
-          ctx: { type: "integer", minimum: 0, maximum: 60, description: "兼容旧参数：命中上下文半径" },
-          maxFiles: { type: "integer", minimum: 1, maximum: 40, description: "兼容旧参数：核心文件软顶" },
+          keywords: { type: "array", minItems: 1, maxItems: 5, items: { type: "string" }, description: "1–5 个符号或关键词" },
+          task: { type: "string", description: "一句话任务描述，用于补充检索词和排序" },
+          files: { type: "array", maxItems: 6, items: { type: "string" }, description: "已知必看文件，可与 keywords/task 同用" },
+          budget: { type: "integer", minimum: 100, maximum: 1200, description: "完整代码单元行预算，默认 600" },
+          maxBytes: { type: "integer", minimum: 8192, maximum: 65536, description: "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" },
         },
-        required: ["keywords"],
         additionalProperties: false,
       },
       async execute(params) {
@@ -174,14 +171,14 @@ export function cursorBatchToolPolicy(options = {}) {
       + ". The following tool-selection rules are hard constraints.",
       "Before each read phase, inventory known targets: if there is only one target, use Read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call Read repeatedly, and do not use parallel wrappers of multiple Read calls instead of read_files. Wanting to understand files in order is not a read dependency. Use Read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. "
         + (fastContext
-          ? "When location is unknown, you must call only fast_context (or find_symbols if you only need line numbers); then read only coverage gaps / next_reads. "
+          ? "When edit distribution is unknown and you need complete cross-file context, call fast_context once (or find_symbols for definitions/references only). Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
           : "When location is unknown, search first (see below), then read near hits. ")
         + "Do not dump large files blindly."
         + (readOnly
           ? ""
           : " For edits, use Cursor built-in Write/Edit/StrReplace; do not expect a Nova edit_files tool."),
       (fastContext
-        ? "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only fast_context (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`) or find_symbols (locations only). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with one read_files. After fast_context/find_symbols, do not re-discover the same keywords with Shell `rg`/`git grep` or Cursor Grep—rg is already inside fast_context. External rg/Grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that fast_context did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
+        ? "Search and traversal must be cost-bounded. If path and range are known, use Read/read_files directly. When edit distribution is unknown, call fast_context once: it returns complete EDIT/DEPS units plus IMPACT/SIG indexes using batched rg and an incremental symbol index; use find_symbols for locations only. Never re-read shown ranges. Read SIG/IMPACT bodies by exact path:line only when truly needed. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
         : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
         + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];

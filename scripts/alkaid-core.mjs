@@ -26,8 +26,8 @@ const DEFAULT_BATCH_READ_LINES = 200;
 const READ_FILES_MAX_BYTES = 32 * 1024;
 /** Reasonix-style per-tool context budget. Full oversized text is archived before truncation. */
 export const TOOL_OUTPUT_CONTEXT_MAX_BYTES = 32 * 1024;
-/** fast_context packs intentionally exceed the default 32KB so one-shot edit context survives. */
-export const FAST_CONTEXT_OUTPUT_MAX_BYTES = 96 * 1024;
+/** fast_context has its own complete-unit budget (default 32KB, explicit max 64KB). */
+export const FAST_CONTEXT_OUTPUT_MAX_BYTES = 64 * 1024;
 /** OpenAI Responses API hard limit for function_call_output.output string length. */
 export const OPENAI_TOOL_OUTPUT_MAX_CHARS = 10_485_760;
 /** Leave room for a truncation notice before the API rejects the request. */
@@ -548,17 +548,11 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
       name: "fast_context",
       description: FAST_CONTEXT_DESCRIPTION,
       parameters: Type.Object({
-        keywords: Type.Array(Type.String(), { minItems: 1, description: "关键词或符号名，建议 2–6 个" }),
-        intent: Type.Optional(Type.Union([
-          Type.Literal("edit"),
-          Type.Literal("explain"),
-          Type.Literal("locate"),
-        ], { description: "默认 edit：定义体优先；explain 更宽；locate 只定位" })),
-        pathHints: Type.Optional(Type.Array(Type.String(), { description: "可选目录/文件前缀加权" })),
-        maxChars: Type.Optional(Type.Integer({ minimum: 4000, maximum: 80000, description: "字符预算；基础默认 edit=32000 explain=24000 locate=12000，宽查询自动扩容" })),
-        budget: Type.Optional(Type.Integer({ minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，近似映射为 maxChars" })),
-        ctx: Type.Optional(Type.Integer({ minimum: 0, maximum: 60, description: "兼容旧参数：命中上下文半径" })),
-        maxFiles: Type.Optional(Type.Integer({ minimum: 1, maximum: 40, description: "兼容旧参数：核心文件软顶" })),
+        keywords: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 5, description: "1–5 个符号或关键词" })),
+        task: Type.Optional(Type.String({ description: "一句话任务描述，用于补充检索词和排序" })),
+        files: Type.Optional(Type.Array(Type.String(), { maxItems: 6, description: "已知必看文件，可与 keywords/task 同用" })),
+        budget: Type.Optional(Type.Integer({ minimum: 100, maximum: 1200, description: "完整代码单元行预算，默认 600" })),
+        maxBytes: Type.Optional(Type.Integer({ minimum: 8192, maximum: 65536, description: "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" })),
       }),
       async execute(_id, params) {
         return textResult(await contextBundle(params ?? {}, root));
@@ -721,7 +715,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
       : options.shellConfig?.kind === "powershell"
         ? "- bash: 执行 PowerShell 命令"
         : "- bash: 执行 Bash 命令",
-    fastContext ? "- fast_context: 一次打包定义体 + 1 跳邻居 + 覆盖表（内部 rg）；仅按 gaps/next_reads 补读，禁止对已打包关键词重搜" : null,
+    fastContext ? "- fast_context: 一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG（内部批量 rg + 增量符号索引）" : null,
     fastContext ? "- find_symbols: 并行定位多个符号出现位置（只要行号时用）" : null,
     options.readOnly ? null : "- edit / write: 单文件编辑或写入",
   ].filter(Boolean);
@@ -732,11 +726,11 @@ export function buildAlkaidSystemPrompt(options = {}) {
     `Available tools:\n${toolLines.join("\n")}`,
       "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。每次准备读取前，先汇总当前已知目标：仅有一个目标时使用 read；同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，必须在一次 read_files 调用中合并读取，并为每个文件分别设置必要的 offset/limit。禁止连续调用多个 read，也禁止用并行封装的多个 read 代替 read_files；想按顺序理解文件不构成读取依赖。只有后一个目标的路径或读取范围必须由前一次结果确定、目标不是 UTF-8 文本，或当前确实仅需一个文件时，才使用 read。后续新发现多个独立文本目标时，下一读取阶段仍须合并使用 read_files。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。"
         + (fastContext
-          ? "未知目标位置时，必须只调用 fast_context（只要行号时用 find_symbols），再仅按 coverage/next_reads 读取必要上下文；"
+          ? "未知修改分布且需要完整编辑上下文时，调用一次 fast_context（只要定义/引用行号时用 find_symbols）；已展示范围禁止重读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
           : "未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；")
         + "大文件禁止无目的全量读取。修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
       (fastContext
-        ? "搜索与遍历必须成本有界。需要理解某个符号/关键词在仓库中的分布和上下文时，必须只调用 fast_context（一次打包定义体+邻居+覆盖表；内部已用 rg，遵守 `.gitignore`）或 find_symbols（只要行号）；coverage 已覆盖段禁止再读，缺口合并一次 read_files。调用 fast_context/find_symbols 之后，禁止对同一批关键词再用 bash 中的 `rg`/`git grep` 或内置 grep 重新发现——rg 已内化进 fast_context。仅在以下情况允许外部搜索兜底：(1) next_reads/gaps 仍不足；(2) 任务明确要求做 fast_context 未覆盖的、已限定范围的字面量搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
+        ? "搜索与遍历必须成本有界。路径和行段已明确时直接 read/read_files，不要先调用 fast_context；未知修改分布且需要跨文件完整上下文时调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引），只要定义/引用位置时用 find_symbols。fast_context 已展示范围禁止重读；SIG/IMPACT 仅在确需其函数体时精确补读。调用后禁止对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
         : "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。")
         + "除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",

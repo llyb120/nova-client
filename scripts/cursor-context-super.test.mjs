@@ -639,9 +639,13 @@ try {
 assert.match(cursorBatchToolPolicy(), /read_files/);
 assert.doesNotMatch(cursorBatchToolPolicy(), /must use edit_files/);
 assert.match(cursorBatchToolPolicy(), /Write\/Edit\/StrReplace/);
-assert.match(cursorBatchToolPolicy(), /must call only fast_context/);
-assert.match(cursorBatchToolPolicy(), /do not re-discover the same keywords/);
-assert.match(cursorBatchToolPolicy(), /rg is already inside fast_context/);
+if (process.env.NOVA_FAST_CONTEXT !== "0") {
+  assert.match(cursorBatchToolPolicy(), /call fast_context once/);
+  assert.match(cursorBatchToolPolicy(), /Do not re-discover the same keywords/);
+  assert.match(cursorBatchToolPolicy(), /batched rg and an incremental symbol index/);
+} else {
+  assert.doesNotMatch(cursorBatchToolPolicy(), /fast_context/);
+}
 assert.doesNotMatch(cursorBatchToolPolicy(), /Cursor Grep is also allowed/);
 assert.doesNotMatch(cursorBatchToolPolicy(), /you must search untracked files/);
 assert.doesNotMatch(cursorBatchToolPolicy({ readOnly: true }), /Write\/Edit/);
