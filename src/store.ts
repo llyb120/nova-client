@@ -175,6 +175,8 @@ interface AppStore {
   view: "home" | "clues" | "employees" | "workbench" | "workflows";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
   clueGroups: ClueNodeGroup[];
+  /** 证据链面板当前选中的线索，供快捷新会话自动引用。 */
+  selectedClueCardId: string | null;
   /** 从证据链跳到新会话时暂存的根线索。 */
   pendingClueCard: { id: string; title: string } | null;
   /** 从当前会话点「新会话」时暂存的目录/模型，供 HomeView 继承。 */
@@ -262,6 +264,7 @@ export const [state, setState] = createStore<AppStore>({
   titleTyping: {},
   view: "home",
   clueGroups: [],
+  selectedClueCardId: null,
   pendingClueCard: null,
   pendingNewSessionSeed: null,
   homeComposerFocusAt: 0,
@@ -782,8 +785,19 @@ export function clearPendingClueCard() {
   setState("pendingClueCard", null);
 }
 
+export function setSelectedClueCardId(cardId: string | null) {
+  setState("selectedClueCardId", cardId);
+}
+
 /** 打开新会话页；若当前在会话中，把工作目录与模型带给 HomeView。 */
 export function openNewSession() {
+  if (state.view === "clues" && state.selectedClueCardId) {
+    const card = clueCardById(state.selectedClueCardId);
+    if (card) {
+      const version = clueCurrentVersion(card);
+      setState("pendingClueCard", { id: card.id, title: version?.title || "未命名线索" });
+    }
+  }
   const id = state.currentId;
   if (id) {
     const meta = state.threads.find((thread) => thread.id === id);

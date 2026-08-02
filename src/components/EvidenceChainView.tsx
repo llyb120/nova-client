@@ -16,6 +16,7 @@ import {
   stackClues,
   startSessionFromClue,
   state,
+  setSelectedClueCardId,
 } from "../store";
 import type { ClueCard, ClueComment, ClueNodeGroup } from "../types";
 import { ClueCaptureModal } from "./ClueCaptureModal";
@@ -967,6 +968,10 @@ export function EvidenceChainView() {
       setCommentBusy(false);
     }
   };
+
+  createEffect(() => {
+    setSelectedClueCardId(selectedCardId());
+  });
 
   createEffect(() => {
     const cardId = selectedCardId();

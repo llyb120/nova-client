@@ -1133,7 +1133,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与终止回合有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效。默认 Esc 终止当前回合。
+                      一键切换项目/模型、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与终止回合有效；快速新会话任意页可用，在证据链中会自动引用当前线索；快捷输入仅在会话输入框聚焦时生效。默认 Esc 终止当前回合。
                     </div>
                   </div>
                   <button
