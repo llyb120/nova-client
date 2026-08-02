@@ -782,7 +782,7 @@ export async function findSymbols({ names }, root = repoRoot()) {
 }
 
 export const FAST_CONTEXT_DESCRIPTION =
-  '分析/修改前未知分布时先调用：一次打包定义体+1跳邻居+覆盖表。coverage 中 FULL/BODY.covered 禁止再读；仅按 gaps/next_reads 补读（多缺口合并 read_files）。intent: edit|explain|locate。';
+  '分析/修改前未知分布时必须先调用：一次打包定义体+1跳邻居+覆盖表。coverage 中 FULL/BODY.covered 禁止再读；禁止对已打包关键词再用 rg/Grep/git grep 重搜；仅按 gaps/next_reads 补读（多缺口合并 read_files）。intent: edit|explain|locate。';
 
 export const TOOLS = [
   {

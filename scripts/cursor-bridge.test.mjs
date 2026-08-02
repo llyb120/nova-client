@@ -815,7 +815,9 @@ try {
 assert.match(cursorBatchToolPolicy(), /read_files/);
 assert.doesNotMatch(cursorBatchToolPolicy(), /must use edit_files/);
 assert.match(cursorBatchToolPolicy(), /Write\/Edit\/StrReplace/);
-assert.match(cursorBatchToolPolicy(), /git grep/);
+assert.match(cursorBatchToolPolicy(), /must call fast_context first/);
+assert.match(cursorBatchToolPolicy(), /do not re-discover the same keywords/);
+assert.doesNotMatch(cursorBatchToolPolicy(), /Cursor Grep is also allowed/);
 assert.doesNotMatch(cursorBatchToolPolicy({ readOnly: true }), /Write\/Edit/);
 assert.match(cursorBatchToolPolicy({ readOnly: true }), /plan\/read-only/);
 assert.match(cursorCavemanPolicy(), /回复默认简洁专业/);
