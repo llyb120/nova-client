@@ -40,18 +40,27 @@ export function releasePromptQueue(threadId: string | null | undefined) {
   });
 }
 
-export function enqueuePrompt(threadId: string, text: string, images: PromptImage[]) {
+export function enqueuePrompt(
+  threadId: string,
+  text: string,
+  images: PromptImage[],
+  id?: string,
+) {
   const now = Date.now();
-  setQueuedPrompts((items) => [
-    ...items,
-    {
-      id: `${threadId}:queued:${now}:${items.length}`,
-      threadId,
-      text,
-      ts: now,
-      images: images.map((image) => ({ ...image })),
-    },
-  ]);
+  const itemId = id?.trim() || `${threadId}:queued:${now}:${Math.random().toString(36).slice(2, 8)}`;
+  setQueuedPrompts((items) => {
+    if (items.some((queued) => queued.id === itemId)) return items;
+    return [
+      ...items,
+      {
+        id: itemId,
+        threadId,
+        text,
+        ts: now,
+        images: images.map((image) => ({ ...image })),
+      },
+    ];
+  });
   void api.setPromptQueuePending(threadId, true);
 }
 
@@ -147,12 +156,32 @@ function startPromptQueueDispatcher() {
 
 /** 远程控制忙碌时入队：与桌面 Composer 共用同一条提示词队列和操作界面。 */
 function startRemotePromptQueueBridge() {
-  void listen<{ threadId: string; text: string; images?: PromptImage[] }>(
+  void listen<{ threadId: string; text: string; images?: PromptImage[]; id?: string }>(
     "prompt-queue:enqueue",
     (event) => {
       const threadId = event.payload?.threadId;
       if (!threadId) return;
-      enqueuePrompt(threadId, event.payload.text || "", event.payload.images || []);
+      enqueuePrompt(
+        threadId,
+        event.payload.text || "",
+        event.payload.images || [],
+        event.payload.id,
+      );
+    },
+  );
+  void listen<{ threadId?: string; id: string }>("prompt-queue:remove", (event) => {
+    const id = event.payload?.id;
+    if (!id) return;
+    removeQueuedPrompt(id);
+  });
+  void listen<{ threadId?: string; id: string; steerNow?: boolean }>(
+    "prompt-queue:send-now",
+    (event) => {
+      const id = event.payload?.id;
+      if (!id) return;
+      const item = queuedPrompts().find((queued) => queued.id === id);
+      if (!item) return;
+      void dispatchQueuedPrompt(item, !!event.payload?.steerNow);
     },
   );
 }

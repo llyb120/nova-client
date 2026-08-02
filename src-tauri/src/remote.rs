@@ -37,10 +37,15 @@ pub const EV_FIRE_START: &str = "fire:start";
 
 /// 远程 send 在会话忙碌时交给前端 `promptQueue` 展示并 FIFO 投递。
 pub const EV_PROMPT_QUEUE_ENQUEUE: &str = "prompt-queue:enqueue";
+/// 远程网页撤回排队提示词。
+pub const EV_PROMPT_QUEUE_REMOVE: &str = "prompt-queue:remove";
+/// 远程网页立即发送排队提示词（运行中走引导）。
+pub const EV_PROMPT_QUEUE_SEND_NOW: &str = "prompt-queue:send-now";
 
 /// 远程提示词队列条目：无界面（headless）时暂存，回合结束后按 FIFO 自动投递。
 #[derive(Clone)]
 struct QueuedRemotePrompt {
+    id: String,
     text: String,
     images: Vec<PromptImage>,
 }
@@ -148,6 +153,9 @@ struct RemoteCommand {
     request_key: String,
     #[serde(default)]
     option_id: String,
+    /// 网页侧生成的排队条目 id，用于撤回 / 立刻发送与桌面队列对齐。
+    #[serde(default)]
+    queue_id: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -1622,6 +1630,19 @@ async fn execute_command(
                     .unwrap_or(false)
             } || prompt_queue.contains_key(&cmd.thread_id);
             if busy {
+                let queue_id = if cmd.queue_id.trim().is_empty() {
+                    format!(
+                        "{}:queued:{}:{}",
+                        cmd.thread_id,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0),
+                        prompt_queue.get(&cmd.thread_id).map(|q| q.len()).unwrap_or(0)
+                    )
+                } else {
+                    cmd.queue_id.clone()
+                };
                 // 有界面时交给前端 promptQueue：可显示撤回/发送，并与桌面输入共用一条队列。
                 if !crate::server::is_headless() {
                     let _ = app.emit(
@@ -1630,6 +1651,7 @@ async fn execute_command(
                             "threadId": cmd.thread_id,
                             "text": cmd.text,
                             "images": cmd.images,
+                            "id": queue_id,
                         }),
                     );
                     return CommandResult {
@@ -1637,11 +1659,12 @@ async fn execute_command(
                         ok: true,
                         error: String::new(),
                         thread_id: cmd.thread_id.clone(),
-                        data: Some(json!({ "queued": true })),
+                        data: Some(json!({ "queued": true, "queueId": queue_id })),
                     };
                 }
                 prompt_queue.entry(cmd.thread_id.clone()).or_default().push(
                     QueuedRemotePrompt {
+                        id: queue_id.clone(),
                         text: cmd.text.clone(),
                         images: cmd.images.clone(),
                     },
@@ -1651,12 +1674,72 @@ async fn execute_command(
                     ok: true,
                     error: String::new(),
                     thread_id: cmd.thread_id.clone(),
-                    data: Some(json!({ "queued": true })),
+                    data: Some(json!({ "queued": true, "queueId": queue_id })),
                 }
             } else {
                 match send_prompt(app, &cmd.thread_id, &cmd.text, cmd.images.clone()) {
                     Ok(()) => ok_thread(cmd.thread_id.clone()),
                     Err(e) => fail(e),
+                }
+            }
+        }
+        "queue_withdraw" => {
+            let queue_id = cmd.queue_id.trim();
+            if cmd.thread_id.trim().is_empty() || queue_id.is_empty() {
+                return fail("缺少队列条目".into());
+            }
+            if !crate::server::is_headless() {
+                let _ = app.emit(
+                    EV_PROMPT_QUEUE_REMOVE,
+                    json!({ "threadId": cmd.thread_id, "id": queue_id }),
+                );
+                return ok_thread(cmd.thread_id.clone());
+            }
+            let Some(queue) = prompt_queue.get_mut(&cmd.thread_id) else {
+                return fail("队列条目不存在".into());
+            };
+            let before = queue.len();
+            queue.retain(|item| item.id != queue_id);
+            if queue.len() == before {
+                return fail("队列条目不存在".into());
+            }
+            if queue.is_empty() {
+                prompt_queue.remove(&cmd.thread_id);
+            }
+            ok_thread(cmd.thread_id.clone())
+        }
+        "queue_send_now" => {
+            let queue_id = cmd.queue_id.trim();
+            if cmd.thread_id.trim().is_empty() || queue_id.is_empty() {
+                return fail("缺少队列条目".into());
+            }
+            if !crate::server::is_headless() {
+                let _ = app.emit(
+                    EV_PROMPT_QUEUE_SEND_NOW,
+                    json!({
+                        "threadId": cmd.thread_id,
+                        "id": queue_id,
+                        "steerNow": true,
+                    }),
+                );
+                return ok_thread(cmd.thread_id.clone());
+            }
+            let Some(queue) = prompt_queue.get_mut(&cmd.thread_id) else {
+                return fail("队列条目不存在".into());
+            };
+            let Some(index) = queue.iter().position(|item| item.id == queue_id) else {
+                return fail("队列条目不存在".into());
+            };
+            let next = queue.remove(index);
+            if queue.is_empty() {
+                prompt_queue.remove(&cmd.thread_id);
+            }
+            match send_prompt(app, &cmd.thread_id, &next.text, next.images.clone()) {
+                Ok(()) => ok_thread(cmd.thread_id.clone()),
+                Err(e) => {
+                    let q = prompt_queue.entry(cmd.thread_id.clone()).or_default();
+                    q.insert(index.min(q.len()), next);
+                    fail(e)
                 }
             }
         }
