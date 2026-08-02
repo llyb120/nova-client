@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 const STORE_VERSION: u32 = 2;
+// 世界线只管理源码/配置等常规文件。大型构建产物可能单个数百 MB；同步读取、哈希会让
+// Tauri 命令长时间占住执行线程。它们在创建与恢复快照时都被排除，因此不会被误删。
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
     ".nova",
@@ -280,6 +283,9 @@ fn capture_manifest(data_dir: &Path, root: &Path) -> Result<Vec<PatchEntry>, Str
         let absolute = root.join(safe_relative(&path)?);
         let metadata = fs::symlink_metadata(&absolute)
             .map_err(|e| format!("读取文件属性失败 {}：{e}", absolute.display()))?;
+        if metadata.len() > MAX_SNAPSHOT_FILE_BYTES {
+            continue;
+        }
         let bytes = fs::read(&absolute)
             .map_err(|e| format!("读取工作区文件失败 {}：{e}", absolute.display()))?;
         entries.push(PatchEntry {
@@ -351,12 +357,11 @@ fn latest_prompt_title(thread: &Thread) -> String {
         .unwrap_or_else(|| thread.title.clone())
 }
 
-fn append_checkpoint(
+fn checkpoint_workspace(
     data_dir: &Path,
-    timeline: &mut Timeline,
+    timeline: &Timeline,
     thread: &Thread,
-    automatic: bool,
-) -> Result<String, String> {
+) -> Result<(PathBuf, Vec<PatchEntry>), String> {
     // 漫游 guest 的工作目录位于对端，本机只保存会话快照。
     let remote = thread.is_roaming_guest();
     let root = if remote {
@@ -374,6 +379,16 @@ fn append_checkpoint(
     } else {
         capture_manifest(data_dir, &root)?
     };
+    Ok((root, entries))
+}
+
+fn append_checkpoint_captured(
+    timeline: &mut Timeline,
+    thread: &Thread,
+    automatic: bool,
+    root: &Path,
+    entries: Vec<PatchEntry>,
+) -> String {
     let id = uuid::Uuid::new_v4().to_string();
     let parent_id = timeline
         .thread_heads
@@ -398,7 +413,19 @@ fn append_checkpoint(
     timeline.thread_heads.insert(thread.id.clone(), id.clone());
     timeline.current_checkpoint_id = Some(id.clone());
     timeline.checkpoints.push(checkpoint);
-    Ok(id)
+    id
+}
+
+fn append_checkpoint(
+    data_dir: &Path,
+    timeline: &mut Timeline,
+    thread: &Thread,
+    automatic: bool,
+) -> Result<String, String> {
+    let (root, entries) = checkpoint_workspace(data_dir, timeline, thread)?;
+    Ok(append_checkpoint_captured(
+        timeline, thread, automatic, &root, entries,
+    ))
 }
 
 pub fn create_checkpoint(data_dir: &Path, thread: &Thread) -> Result<TimelineView, String> {
@@ -586,11 +613,14 @@ pub fn record_edit_fork(
         }
     };
     let timeline = &mut store.timelines[index];
-    let base_id = append_checkpoint(data_dir, timeline, &base_thread, true)?;
+    // 共同历史和原会话记录的是同一瞬间的工作区。只扫描、读取、哈希一次；此前大型工作区
+    // 会被完整处理两遍，编辑重发看起来像应用立即卡死。
+    let (root, entries) = checkpoint_workspace(data_dir, timeline, thread)?;
+    let base_id = append_checkpoint_captured(timeline, &base_thread, true, &root, entries.clone());
     if let Some(checkpoint) = timeline.checkpoints.last_mut() {
         checkpoint.title = fork_prompt.clone();
     }
-    append_checkpoint(data_dir, timeline, thread, true)?;
+    append_checkpoint_captured(timeline, thread, true, &root, entries);
     if let Some(checkpoint) = timeline.checkpoints.last_mut() {
         checkpoint.title = fork_prompt;
     }
@@ -884,6 +914,56 @@ mod tests {
         fs::write(root.join(".git/objects/object"), b"git").unwrap();
 
         assert_eq!(directory_files(&root).unwrap(), vec!["src/main.ts"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn large_files_stay_outside_snapshot_and_restore_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-large-file-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let data = root.join("data");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("source.txt"), b"checkpoint").unwrap();
+        let large = project.join("debug-bin.exe");
+        let file = fs::File::create(&large).unwrap();
+        file.set_len(MAX_SNAPSHOT_FILE_BYTES + 1).unwrap();
+        drop(file);
+
+        let thread = Thread::new(
+            project.to_string_lossy().to_string(),
+            crate::threads::AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        let checkpoint = create_checkpoint(&data, &thread).unwrap();
+        let checkpoint_id = checkpoint.current_checkpoint_id.unwrap();
+        fs::write(project.join("source.txt"), b"current").unwrap();
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().write(true).open(&large).unwrap();
+            file.write_all(b"large file remains unmanaged").unwrap();
+        }
+
+        restore_checkpoint(&data, &checkpoint_id, &thread, true).unwrap();
+        assert_eq!(fs::read(project.join("source.txt")).unwrap(), b"checkpoint");
+        assert_eq!(
+            fs::metadata(&large).unwrap().len(),
+            MAX_SNAPSHOT_FILE_BYTES + 1
+        );
+        {
+            use std::io::Read;
+            let mut prefix = vec![0; b"large file remains unmanaged".len()];
+            fs::File::open(&large)
+                .unwrap()
+                .read_exact(&mut prefix)
+                .unwrap();
+            assert_eq!(prefix, b"large file remains unmanaged");
+        }
         let _ = fs::remove_dir_all(root);
     }
 
