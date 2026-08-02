@@ -1,6 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
+import * as QRCode from "qrcode";
 import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import {
@@ -317,6 +318,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [remoteControlEnabled, setRemoteControlEnabled] = createSignal(
     s?.remoteControlEnabled ?? false,
   );
+  const [remoteQr, setRemoteQr] = createSignal<{ url: string; dataUrl: string } | null>(null);
   const [quotaSharedModels, setQuotaSharedModels] = createSignal<string[]>(s?.quotaSharedModels ?? []);
   const [roamingFolders, setRoamingFolders] = createSignal<string[]>(state.roamingFolders);
   const [roamingFoldersLoading, setRoamingFoldersLoading] = createSignal(false);
@@ -1020,6 +1022,29 @@ export function SettingsModal(props: { onClose: () => void }) {
       await message(String(error), { title: "保存设置失败", kind: "error" });
     } finally {
       setSaving(false);
+    }
+  };
+
+  const openRemoteQr = async () => {
+    const server = relayServer().trim().replace(/\/+$/, "");
+    const token = relayToken().trim();
+    if (!server || !token) {
+      await message("请先填写中转站地址和身份 token。", {
+        title: "无法生成远控二维码",
+        kind: "warning",
+      });
+      return;
+    }
+    const url = `${server}/remote?token=${token}`;
+    try {
+      const dataUrl = await QRCode.toDataURL(url, {
+        width: 280,
+        margin: 1,
+        errorCorrectionLevel: "M",
+      });
+      setRemoteQr({ url, dataUrl });
+    } catch (error) {
+      await message(String(error), { title: "生成远控二维码失败", kind: "error" });
     }
   };
 
@@ -1957,16 +1982,28 @@ export function SettingsModal(props: { onClose: () => void }) {
             </label>
 
             <div class="field">
-              <label
-                style={{ display: "flex", "align-items": "center", gap: "8px" }}
-              >
-                <input
-                  type="checkbox"
-                  checked={remoteControlEnabled()}
-                  onChange={(event) => setRemoteControlEnabled(event.currentTarget.checked)}
-                />
-                <span>允许 server 端远程控制</span>
-              </label>
+              <div class="remote-control-row">
+                <label class="remote-control-toggle">
+                  <input
+                    type="checkbox"
+                    checked={remoteControlEnabled()}
+                    onChange={(event) => setRemoteControlEnabled(event.currentTarget.checked)}
+                  />
+                  <span>允许 server 端远程控制</span>
+                </label>
+                <button
+                  type="button"
+                  class="btn secondary small"
+                  disabled={
+                    !remoteControlEnabled() ||
+                    !relayServer().trim() ||
+                    !relayToken().trim()
+                  }
+                  onClick={() => void openRemoteQr()}
+                >
+                  远控二维码
+                </button>
+              </div>
               <span class="field-hint">
                 默认关闭。手动开启并保存后，server 端才可查看会话、读取项目文件或发送远程操作。
               </span>
@@ -2419,6 +2456,26 @@ export function SettingsModal(props: { onClose: () => void }) {
           </button>
         </div>
       </div>
+
+      <Show when={remoteQr()}>
+        {(qr) => (
+          <div class="modal-backdrop remote-qr-backdrop" onClick={() => setRemoteQr(null)}>
+            <div class="modal remote-qr-modal" onClick={(event) => event.stopPropagation()}>
+              <div class="modal-head">
+                <span>远控二维码</span>
+                <button class="icon-btn" onClick={() => setRemoteQr(null)}>
+                  <IconX size={16} />
+                </button>
+              </div>
+              <div class="modal-body remote-qr-body">
+                <img src={qr().dataUrl} alt="远控二维码" />
+                <span class="field-hint">使用手机扫码打开中转站远控页面。</span>
+                <code class="remote-qr-url">{qr().url}</code>
+              </div>
+            </div>
+          </div>
+        )}
+      </Show>
     </div>
   );
 }

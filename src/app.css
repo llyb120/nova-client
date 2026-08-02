@@ -8694,6 +8694,46 @@ button.head-badge:hover {
   0%,100% { filter: drop-shadow(0 0 2px color-mix(in srgb, var(--accent) 45%, transparent)); }
   50% { filter: drop-shadow(0 0 9px color-mix(in srgb, var(--accent) 70%, transparent)); }
 }
+
+.remote-control-row,
+.remote-control-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.remote-control-row {
+  justify-content: space-between;
+}
+.remote-qr-backdrop {
+  z-index: 110;
+}
+.remote-qr-modal {
+  width: 360px;
+}
+.remote-qr-body {
+  align-items: center;
+  text-align: center;
+}
+.remote-qr-body img {
+  width: 280px;
+  max-width: 100%;
+  aspect-ratio: 1;
+  border-radius: 8px;
+  background: #fff;
+}
+.remote-qr-url {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 9px 10px;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-input);
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: left;
+}
+
 .wf-node-handle { transition: r 0.12s, fill 0.12s; opacity: 0.55; }
 .wf-node:hover .wf-node-handle { opacity: 1; }
 .wf-edge-line { transition: stroke 0.15s, stroke-width 0.15s; }
