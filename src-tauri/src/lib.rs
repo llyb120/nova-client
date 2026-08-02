@@ -13,6 +13,7 @@ mod marks;
 mod mind;
 mod model_cache;
 mod notice;
+pub mod nova_tools_native;
 mod opencode_sdk;
 mod path_env;
 mod quota;

@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { callNativeToolOrFallback } from "./nova-native-tools.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -156,21 +157,22 @@ export function createNovaBatchTools(cwd, options = {}) {
         const requested = Array.isArray(params.paths) ? params.paths : params.files;
         const list = Array.isArray(requested) ? requested : [];
         if (!list.length) throw new Error("read_files 需要非空 paths（也兼容 files）");
-        const results = await Promise.all(list.map(async (input) => {
-          const request = typeof input === "string" ? { path: input } : (input ?? {});
-          const requestPath = String(request.path ?? "");
-          try {
-            const path = resolveInputPath(root, requestPath);
-            const result = await readTextLines(path, request.offset, request.limit);
-            return {
-              path: requestPath,
-              content: result.content,
-              ...(result.truncated ? { truncated: true, nextOffset: result.nextOffset } : {}),
-            };
-          } catch (error) {
-            return { path: requestPath, error: error instanceof Error ? error.message : String(error) };
-          }
-        }));
+        const results = await callNativeToolOrFallback("read_files", root, { paths: list }, async () =>
+          Promise.all(list.map(async (input) => {
+            const request = typeof input === "string" ? { path: input } : (input ?? {});
+            const requestPath = String(request.path ?? "");
+            try {
+              const path = resolveInputPath(root, requestPath);
+              const result = await readTextLines(path, request.offset, request.limit);
+              return {
+                path: requestPath,
+                content: result.content,
+                ...(result.truncated ? { truncated: true, nextOffset: result.nextOffset } : {}),
+              };
+            } catch (error) {
+              return { path: requestPath, error: error instanceof Error ? error.message : String(error) };
+            }
+          })));
         return JSON.stringify(results);
       },
     },
@@ -198,7 +200,8 @@ export function createNovaBatchTools(cwd, options = {}) {
         additionalProperties: false,
       },
       async execute(params) {
-        return await contextBundle(normalizeFastContextArgs(params), root);
+        const args = normalizeFastContextArgs(params);
+        return await callNativeToolOrFallback("fast_context", root, args, () => contextBundle(args, root));
       },
     };
     tools.find_symbols = {
@@ -222,7 +225,8 @@ export function createNovaBatchTools(cwd, options = {}) {
         additionalProperties: false,
       },
       async execute(params) {
-        return await findSymbols(normalizeFindSymbolsArgs(params), root);
+        const args = normalizeFindSymbolsArgs(params);
+        return await callNativeToolOrFallback("find_symbols", root, args, () => findSymbols(args, root));
       },
     };
   }
@@ -264,6 +268,7 @@ export function createNovaBatchTools(cwd, options = {}) {
       },
       async execute({ files }) {
         const list = Array.isArray(files) ? files : [];
+        return JSON.stringify(await callNativeToolOrFallback("edit_files", root, { files: list }, async () => {
         const grouped = new Map();
         for (const file of list) {
           const requestPath = String(file?.path ?? "");
@@ -297,11 +302,12 @@ export function createNovaBatchTools(cwd, options = {}) {
           const reason = writes[failed].reason;
           throw reason instanceof Error ? reason : new Error(String(reason));
         }
-        return JSON.stringify({
+        return {
           message: `已并行智能编辑 ${prepared.length} 个文件`,
           paths: prepared.map((file) => file.path),
           matches: prepared.map((file) => ({ path: file.path, edits: file.matches })),
-        });
+        };
+        }));
       },
     };
   }

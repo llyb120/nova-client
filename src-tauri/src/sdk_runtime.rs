@@ -1016,6 +1016,9 @@ impl SdkManager {
             // Node bridges also persist app-owned state. Pin them to the same profile-specific
             // root as Rust so debug builds never fall back to the release ~/.nova directory.
             .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
+        if let Ok(executable) = std::env::current_exe() {
+            command.env("NOVA_TOOLS_NATIVE_EXE", executable);
+        }
         if !self.launch_env.is_empty() {
             crate::credential_roaming::isolate_borrowed_command(&mut command);
             command.envs(&self.launch_env);

@@ -775,6 +775,9 @@ impl AcpManager {
         // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 不覆盖）
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
         cmd.envs(&self.launch_env);
+        if let Ok(executable) = std::env::current_exe() {
+            cmd.env("NOVA_TOOLS_NATIVE_EXE", executable);
+        }
         // 微型 GUI helper 统一覆盖各后端绕过父进程 flags 的 cmd/powershell/pwsh 孙进程。
         #[cfg(windows)]
         if self.app.state::<AppState>().windows_shell_shim_enabled {

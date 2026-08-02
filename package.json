@@ -23,6 +23,7 @@
     "alkaid": "node scripts/alkaid.mjs",
     "test:alkaid": "node --test scripts/alkaid.test.mjs",
     "test:nova-tools-mcp": "node --test scripts/nova-tools-mcp.test.mjs",
+    "test:nova-tools-native": "node --test scripts/nova-native-tools.test.mjs",
     "test:context-parity": "node scripts/audit-context-parity.mjs && node scripts/alkaid-context-super.test.mjs && node scripts/cursor-context-super.test.mjs"
   },
   "devDependencies": {

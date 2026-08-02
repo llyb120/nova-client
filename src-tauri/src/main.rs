@@ -199,6 +199,12 @@ fn should_enforce_single_instance() -> bool {
 }
 
 fn main() {
+    // 同一 Nova 二进制兼作常驻原生工具 sidecar。必须在 GUI、单实例和 CLI
+    // 初始化之前接管 stdio，stdout 只允许输出长度前缀 MessagePack 帧。
+    if nova_lib::nova_tools_native::maybe_run_from_args() {
+        return;
+    }
+
     // Finder / Dock 启动的 macOS .app 不继承终端 PATH。必须在任何 CLI 探测或
     // 后端线程启动前恢复，否则已安装的 codex、npx 等都会被误判为不可用。
     nova_lib::init_process_path();

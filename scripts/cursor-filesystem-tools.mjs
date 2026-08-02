@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { callNativeToolOrFallback } from "./nova-native-tools.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -106,21 +107,22 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
       async execute({ paths }) {
         const list = Array.isArray(paths) ? paths : [];
-        const results = await Promise.all(list.map(async (input) => {
-          const request = typeof input === "string" ? { path: input } : (input ?? {});
-          const requestPath = String(request.path ?? "");
-          try {
-            const path = resolveInputPath(root, requestPath);
-            const result = await readTextLines(path, request.offset, request.limit);
-            return {
-              path: requestPath,
-              content: result.content,
-              ...(result.truncated ? { truncated: true, nextOffset: result.nextOffset } : {}),
-            };
-          } catch (error) {
-            return { path: requestPath, error: error instanceof Error ? error.message : String(error) };
-          }
-        }));
+        const results = await callNativeToolOrFallback("read_files", root, { paths: list }, async () =>
+          Promise.all(list.map(async (input) => {
+            const request = typeof input === "string" ? { path: input } : (input ?? {});
+            const requestPath = String(request.path ?? "");
+            try {
+              const path = resolveInputPath(root, requestPath);
+              const result = await readTextLines(path, request.offset, request.limit);
+              return {
+                path: requestPath,
+                content: result.content,
+                ...(result.truncated ? { truncated: true, nextOffset: result.nextOffset } : {}),
+              };
+            } catch (error) {
+              return { path: requestPath, error: error instanceof Error ? error.message : String(error) };
+            }
+          })));
         return JSON.stringify(results);
       },
     },
@@ -139,7 +141,8 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         additionalProperties: false,
       },
       async execute(params) {
-        return await contextBundle(params ?? {}, root);
+        const args = params ?? {};
+        return await callNativeToolOrFallback("fast_context", root, args, () => contextBundle(args, root));
       },
     },
     find_symbols: {
@@ -151,7 +154,8 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         additionalProperties: false,
       },
       async execute(params) {
-        return await findSymbols(params ?? {}, root);
+        const args = params ?? {};
+        return await callNativeToolOrFallback("find_symbols", root, args, () => findSymbols(args, root));
       },
     },
     } : {}),

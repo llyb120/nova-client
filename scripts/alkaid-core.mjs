@@ -20,6 +20,7 @@ import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
+import { callNativeTool, mayFallbackFromNative } from "./nova-native-tools.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 200;
 /** Match pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -525,6 +526,12 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
         ]), { minItems: 1 }),
       }),
       async execute(_id, { paths }) {
+        try {
+          const results = await callNativeTool("read_files", root, { paths });
+          return textResult(JSON.stringify(results), { count: results.length });
+        } catch (error) {
+          if (!mayFallbackFromNative("read_files", error)) throw error;
+        }
         const results = await Promise.all(paths.map(async (input) => {
           const request = typeof input === "string" ? { path: input } : input;
           try {
@@ -555,7 +562,10 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
         maxBytes: Type.Optional(Type.Integer({ minimum: 8192, maximum: 65536, description: "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" })),
       }),
       async execute(_id, params) {
-        return textResult(await contextBundle(params ?? {}, root));
+        const args = params ?? {};
+        try { return textResult(await callNativeTool("fast_context", root, args)); }
+        catch (error) { if (!mayFallbackFromNative("fast_context", error)) throw error; }
+        return textResult(await contextBundle(args, root));
       },
     },
     {
@@ -565,7 +575,10 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
         names: Type.Array(Type.String(), { minItems: 1, description: "符号名列表" }),
       }),
       async execute(_id, params) {
-        return textResult(await findSymbols(params ?? {}, root));
+        const args = params ?? {};
+        try { return textResult(await callNativeTool("find_symbols", root, args)); }
+        catch (error) { if (!mayFallbackFromNative("find_symbols", error)) throw error; }
+        return textResult(await findSymbols(args, root));
       },
     },
   );
@@ -580,6 +593,13 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
         }), { minItems: 1 }),
       }),
       async execute(_id, { files }, signal) {
+        if (signal?.aborted) throw new Error("Operation aborted");
+        try {
+          const result = await callNativeTool("edit_files", root, { files });
+          return textResult(result.message, { paths: result.paths, matches: result.matches });
+        } catch (error) {
+          if (!mayFallbackFromNative("edit_files", error)) throw error;
+        }
         const grouped = new Map();
         for (const file of files) {
           const target = resolveEditPath(root, file.path);
