@@ -555,7 +555,7 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
           Type.Literal("locate"),
         ], { description: "默认 edit：定义体优先；explain 更宽；locate 只定位" })),
         pathHints: Type.Optional(Type.Array(Type.String(), { description: "可选目录/文件前缀加权" })),
-        maxChars: Type.Optional(Type.Integer({ minimum: 4000, maximum: 80000, description: "字符预算；默认 edit=48000 explain=36000 locate=16000" })),
+        maxChars: Type.Optional(Type.Integer({ minimum: 4000, maximum: 80000, description: "字符预算；基础默认 edit=32000 explain=24000 locate=12000，宽查询自动扩容" })),
         budget: Type.Optional(Type.Integer({ minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，近似映射为 maxChars" })),
         ctx: Type.Optional(Type.Integer({ minimum: 0, maximum: 60, description: "兼容旧参数：命中上下文半径" })),
         maxFiles: Type.Optional(Type.Integer({ minimum: 1, maximum: 40, description: "兼容旧参数：核心文件软顶" })),

@@ -133,7 +133,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
           keywords: { type: "array", minItems: 1, items: { type: "string" }, description: "关键词或符号名，建议 2–6 个" },
           intent: { type: "string", enum: ["edit", "explain", "locate"], description: "默认 edit：定义体优先；explain 更宽；locate 只定位" },
           pathHints: { type: "array", items: { type: "string" }, description: "可选目录/文件前缀加权" },
-          maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "字符预算；默认 edit=48000 explain=36000 locate=16000" },
+          maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "字符预算；基础默认 edit=32000 explain=24000 locate=12000，宽查询自动扩容" },
           budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，近似映射为 maxChars" },
           ctx: { type: "integer", minimum: 0, maximum: 60, description: "兼容旧参数：命中上下文半径" },
           maxFiles: { type: "integer", minimum: 1, maximum: 40, description: "兼容旧参数：核心文件软顶" },

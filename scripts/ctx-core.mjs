@@ -36,7 +36,7 @@ const SOURCE_EXT = /\.(?:rs|ts|tsx|js|jsx|mjs|cjs|go|py|java|kt|swift|c|cc|cpp|h
 const DEF_LINE_RE = /^\s*(?:(?:pub(?:\([^)]*\))?|export|async|unsafe|default|static|const|move)\s+)*(?:fn|struct|enum|trait|impl|type|class|interface|function|def|mod)\b/;
 const SYM_START_RE = /^(\s*)(?:(?:pub(?:\([^)]*\))?|export|async|unsafe|default|static|const|move)\s+)*(?:(?:fn|struct|enum|trait|type|class|interface|function|def|mod)\s+([A-Za-z_][\w]*)|(impl)(?:\s*<[^>]+>)?\s+(?:(?:[\w:]+)\s+for\s+)?([A-Za-z_][\w:]*))/;
 
-const INTENT_CHARS = { edit: 48_000, explain: 36_000, locate: 16_000 };
+const INTENT_CHARS = { edit: 32_000, explain: 24_000, locate: 12_000 };
 const HARD_MAX_CHARS = 80_000;
 const FULL_ALWAYS = 120;
 const FULL_HIGH_SCORE = 220;
@@ -46,6 +46,7 @@ const MERGE_GAP = 15;
 const CORE_SOFT_CAP = 12;
 const NEIGHBOR_CAP = 12;
 const NEIGHBOR_THIN_CAP = 4;
+const DISCOVERY_MAX_MATCHES_PER_FILE = 128;
 const WALL_MS = 4500;
 const PROC_TIMEOUT_MS = 1800;
 const RG_GLOBS = [
@@ -70,6 +71,7 @@ const RG_GLOBS = [
 let rgBinCache;
 /** @type {boolean|undefined} */
 let gitAvailCache;
+const wordRegexCache = new Map();
 
 const GREP_EXCLUDE_DIRS = [
   'node_modules',
@@ -155,7 +157,13 @@ function forcedSearchEngine() {
 
 function lineHasWord(text, name) {
   if (!name || !text.includes(name)) return false;
-  return new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(text);
+  let re = wordRegexCache.get(name);
+  if (!re) {
+    if (wordRegexCache.size >= 256) wordRegexCache.clear();
+    re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+    wordRegexCache.set(name, re);
+  }
+  return re.test(text);
 }
 
 function dedupeHits(parts) {
@@ -182,10 +190,11 @@ async function searchWithGitGrep(root, list, word) {
 }
 
 /** Last-resort recursive grep with hard excludes (no .gitignore awareness). */
-async function searchWithSystemGrep(root, list, word) {
+async function searchWithSystemGrep(root, list, word, maxCount) {
   const parts = await mapPool(list, Math.min(6, list.length), async (p) => {
     const args = ['-rnI', '-F', '--color=never'];
     if (word) args.push('-w');
+    if (maxCount > 0) args.push('-m', String(maxCount));
     for (const dir of GREP_EXCLUDE_DIRS) args.push(`--exclude-dir=${dir}`);
     args.push('-e', p, '.');
     return parseGrepLines(await runAsync(root, 'grep', args));
@@ -198,7 +207,7 @@ async function searchWithSystemGrep(root, list, word) {
  * Prefer one rg invocation (gitignore-aware, includes untracked) → git grep → system grep.
  * `CTX_SEARCH_ENGINE=rg|git|grep` can force a backend for tests/diagnostics.
  */
-async function searchText(root, patterns, { word = false } = {}) {
+async function searchText(root, patterns, { word = false, maxCount = 0 } = {}) {
   const list = [...new Set((patterns || []).map((p) => String(p ?? '')).filter(Boolean))];
   if (!list.length) return [];
 
@@ -209,6 +218,7 @@ async function searchText(root, patterns, { word = false } = {}) {
     if (rg) {
       const args = ['-n', '--no-heading', '--color', 'never', '-F'];
       if (word) args.push('-w');
+      if (maxCount > 0) args.push('--max-count', String(maxCount));
       for (const p of list) args.push('-e', p);
       for (const g of RG_GLOBS) args.push('--glob', g);
       args.push('.');
@@ -221,7 +231,7 @@ async function searchText(root, patterns, { word = false } = {}) {
     return searchWithGitGrep(root, list, word);
   }
 
-  return searchWithSystemGrep(root, list, word);
+  return searchWithSystemGrep(root, list, word, maxCount);
 }
 
 async function mapPool(items, concurrency, fn) {
@@ -264,6 +274,17 @@ function resolveMaxChars({ intent = 'edit', maxChars, budget, ctx, maxFiles } = 
   return Math.max(4_000, Math.min(HARD_MAX_CHARS, Math.floor(chars)));
 }
 
+function adaptiveMaxChars(params, intent, chars, { hitCount, fileCount, definitionFiles }) {
+  // Explicit compatibility/budget controls are contracts; only tune default requests.
+  if (Number.isFinite(params.maxChars) || Number.isFinite(params.budget) || Number.isFinite(params.maxFiles)) return chars;
+  if (intent === 'locate') return chars;
+  const broad = fileCount >= 8 || hitCount >= 240 || definitionFiles >= 3;
+  const veryBroad = fileCount >= 24 || hitCount >= 1_000 || definitionFiles >= 8;
+  if (intent === 'edit') return Math.max(chars, veryBroad ? 48_000 : broad ? 40_000 : chars);
+  if (intent === 'explain') return Math.max(chars, veryBroad ? 36_000 : broad ? 30_000 : chars);
+  return chars;
+}
+
 function classifyPath(path) {
   if (TEST_PATH.test(path)) return 'test';
   if (CONFIG_PATH.test(path) || /(^|\/)(?:settings|config|Cargo\.toml|package\.json)/i.test(path)) return 'config';
@@ -303,7 +324,9 @@ function parseGrepLines(text) {
 }
 
 async function discoverKeywords(root, keywords) {
-  return searchText(root, keywords, { word: false });
+  // Keep enough tail hits for definitions that follow many ordinary references while
+  // still bounding generic-keyword IPC and parsing costs.
+  return searchText(root, keywords, { word: false, maxCount: DISCOVERY_MAX_MATCHES_PER_FILE });
 }
 
 function scoreFile(rec, pathHints) {
@@ -505,11 +528,13 @@ async function expandFile(root, rec, keywords = []) {
     : merged.length
       ? 'body'
       : 'outline';
-  // Prefer symbol names that match query keywords when seeding neighbors.
+  // Seed neighbors only from query-related/enclosing symbols. Using every top-level
+  // symbol in a core file creates noisy extra repository scans and unrelated neighbors.
   const preferred = starts
     .map((s) => s.name)
     .filter((name) => name && keywords.some((k) => name === k || name.includes(k) || k.includes(name)));
-  const symbols = [...new Set([...preferred, ...starts.map((s) => s.name).filter(Boolean)])];
+  const enclosing = merged.map((w) => w.name).filter(Boolean);
+  const symbols = [...new Set([...preferred, ...enclosing])];
   return {
     path: rec.path,
     score: rec.score,
@@ -536,31 +561,30 @@ async function discoverNeighbors(root, coreFiles, corePaths, keywords = []) {
     }
     if (symbolNames.length >= 16) break;
   }
+  if (!symbolNames.length) return [];
   const neighHits = new Map();
-  const chunks = [];
-  for (let i = 0; i < symbolNames.length; i += 8) chunks.push(symbolNames.slice(i, i + 8));
-  await mapPool(chunks, Math.min(4, Math.max(1, chunks.length)), async (chunk) => {
-    const hits = await searchText(root, chunk, { word: true });
-    for (const h of hits) {
-      if (
-        EXCLUDE.test(h.file)
-        || NEIGHBOR_EXCLUDE.test(h.file)
-        || TEST_PATH.test(h.file)
-        || corePaths.has(h.file)
-      ) continue;
-      const matched = chunk.filter((name) => lineHasWord(h.text, name));
-      if (!matched.length) continue;
-      let rec = neighHits.get(h.file);
-      if (!rec) {
-        rec = { path: h.file, hitLines: new Set(), symbols: new Set(), hitCount: 0 };
-        neighHits.set(h.file, rec);
-      }
-      if (rec.hitCount >= 8) continue;
-      rec.hitCount++;
-      rec.hitLines.add(h.line);
-      for (const name of matched) rec.symbols.add(name);
+  // rg accepts many fixed-string patterns in one process. A single bounded scan is
+  // materially faster than spawning one process per chunk, especially on Windows.
+  const hits = await searchText(root, symbolNames, { word: true, maxCount: 24 });
+  for (const h of hits) {
+    if (
+      EXCLUDE.test(h.file)
+      || NEIGHBOR_EXCLUDE.test(h.file)
+      || TEST_PATH.test(h.file)
+      || corePaths.has(h.file)
+    ) continue;
+    const matched = symbolNames.filter((name) => lineHasWord(h.text, name));
+    if (!matched.length) continue;
+    let rec = neighHits.get(h.file);
+    if (!rec) {
+      rec = { path: h.file, hitLines: new Set(), symbols: new Set(), hitCount: 0 };
+      neighHits.set(h.file, rec);
     }
-  });
+    if (rec.hitCount >= 8) continue;
+    rec.hitCount++;
+    rec.hitLines.add(h.line);
+    for (const name of matched) rec.symbols.add(name);
+  }
   const ranked = [...neighHits.values()]
     .map((r) => ({ ...r, score: r.hitLines.size + r.symbols.size * 2 }))
     .sort((a, b) => b.score - a.score)
@@ -601,9 +625,11 @@ function packBundle({
   neighbors,
   omitted,
 }) {
-  const coverBudget = Math.floor(maxChars * 0.15);
-  const headerBudget = Math.floor(maxChars * 0.05);
-  const neighborBudget = intent === 'locate' ? 0 : Math.floor(maxChars * 0.25);
+  // Definition bodies are the highest-value evidence. Coverage/rank are compact metadata,
+  // and neighbors should not crowd core implementations out of the same output budget.
+  const coverBudget = Math.floor(maxChars * 0.12);
+  const headerBudget = Math.floor(maxChars * 0.04);
+  const neighborBudget = intent === 'locate' ? 0 : Math.floor(maxChars * 0.18);
   const coreBudget = Math.max(2000, maxChars - coverBudget - headerBudget - neighborBudget);
 
   const header = [];
@@ -611,7 +637,7 @@ function packBundle({
   header.push(`query: ${keywords.join(' ')} | intent: ${intent} | commit: ${commit} | chars: 0/${maxChars}`);
   header.push('');
   header.push('## rank');
-  for (const r of rankedMeta.slice(0, 40)) {
+  for (const r of rankedMeta.slice(0, 24)) {
     header.push(`  ${String(Math.round(r.score)).padStart(4)}  ${r.path}           ${r.kind}`);
   }
   header.push('');
@@ -807,7 +833,7 @@ export async function contextBundle(params = {}, root = repoRoot()) {
   if (!Array.isArray(keywords) || keywords.length === 0) return '错误: keywords 不能为空';
   const intent = ['edit', 'explain', 'locate'].includes(params.intent) ? params.intent : 'edit';
   const pathHints = Array.isArray(params.pathHints) ? params.pathHints : [];
-  const maxChars = resolveMaxChars({ ...params, intent });
+  const requestedMaxChars = resolveMaxChars({ ...params, intent });
   const softCoreCap = Number.isFinite(params.maxFiles)
     ? Math.max(1, Math.min(CORE_SOFT_CAP, params.maxFiles))
     : CORE_SOFT_CAP;
@@ -848,6 +874,11 @@ export async function contextBundle(params = {}, root = repoRoot()) {
   const ranked = [...files.values()]
     .map((r) => scoreFile(r, pathHints))
     .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+  const maxChars = adaptiveMaxChars(params, intent, requestedMaxChars, {
+    hitCount: allHits.length,
+    fileCount: ranked.length,
+    definitionFiles: ranked.filter((r) => r.defHits > 0).length,
+  });
 
   const timedOut = () => Date.now() - t0 > WALL_MS;
   const locateOnly = intent === 'locate' || timedOut();
@@ -973,7 +1004,7 @@ export const TOOLS = [
         keywords: { type: 'array', items: { type: 'string' }, minItems: 1, description: '关键词或符号名，建议 2–6 个' },
         intent: { type: 'string', enum: ['edit', 'explain', 'locate'], description: '默认 edit：定义体优先；explain 更宽；locate 只定位' },
         pathHints: { type: 'array', items: { type: 'string' }, description: '可选目录/文件前缀加权' },
-        maxChars: { type: 'number', description: '字符预算；默认 edit=48000 explain=36000 locate=16000，硬顶 80000' },
+        maxChars: { type: 'number', description: '字符预算；基础默认 edit=32000 explain=24000 locate=12000，宽查询自动扩容，硬顶 80000' },
         budget: { type: 'number', description: '兼容旧参数：行预算，近似映射为 maxChars' },
         ctx: { type: 'number', description: '兼容旧参数：命中上下文半径' },
         maxFiles: { type: 'number', description: '兼容旧参数：核心文件软顶' },

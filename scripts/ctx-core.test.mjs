@@ -31,6 +31,7 @@ test("contextBundle edit pack includes coverage and definition body", async () =
     pathHints: ["scripts/"],
   });
   assert.match(out, /^# fast_context/m);
+  assert.match(out, /chars: \d+\/(?:32000|40000|48000)/);
   assert.match(out, /## coverage/);
   assert.match(out, /## next_reads/);
   assert.match(out, /## rules/);
@@ -39,6 +40,16 @@ test("contextBundle edit pack includes coverage and definition body", async () =
   assert.match(out, /function mapPool|async function mapPool/);
   assert.ok(out.length > 4000);
   assert.ok(out.length <= 80_000);
+});
+
+test("explicit maxChars bypasses adaptive expansion", async () => {
+  const out = await contextBundle({
+    keywords: ["fast_context", "next_reads", "coverage", "maxChars"],
+    intent: "edit",
+    maxChars: 18_000,
+  });
+  assert.match(out, /chars: \d+\/18000/);
+  assert.ok(out.length <= 18_000);
 });
 
 test("contextBundle locate stays outline-focused", async () => {
