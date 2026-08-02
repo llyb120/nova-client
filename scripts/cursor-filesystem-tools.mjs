@@ -4,7 +4,7 @@ import { createInterface } from "node:readline";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
 import { callNativeToolOrFallback } from "./nova-native-tools.mjs";
 
-const DEFAULT_BATCH_READ_LINES = 200;
+const DEFAULT_BATCH_READ_LINES = 2000;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
 const READ_FILES_MAX_BYTES = 32 * 1024;
 

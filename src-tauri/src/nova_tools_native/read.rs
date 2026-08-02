@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-const DEFAULT_LINES: usize = 200;
+const DEFAULT_LINES: usize = 2000;
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 32 * 1024;
 

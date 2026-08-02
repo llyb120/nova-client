@@ -22,7 +22,7 @@ import { Readable } from "node:stream";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { callNativeTool, mayFallbackFromNative } from "./nova-native-tools.mjs";
 
-const DEFAULT_BATCH_READ_LINES = 200;
+const DEFAULT_BATCH_READ_LINES = 2000;
 /** Match pi coding tools: keep read_files outputs usable without blowing the context window. */
 const READ_FILES_MAX_BYTES = 32 * 1024;
 /** Reasonix-style per-tool context budget. Full oversized text is archived before truncation. */
