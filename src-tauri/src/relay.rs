@@ -3010,6 +3010,7 @@ impl RelayManager {
             };
         let state = self.app.state::<AppState>();
         let _time_machine_guard = state.time_machine_lock.lock().unwrap();
+        let capture_workspace = state.settings.lock().unwrap().checkpoint_enabled;
         {
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&host_thread_id) else {
@@ -3021,10 +3022,20 @@ impl RelayManager {
                 .items
                 .iter()
                 .any(|item| item.id() == item_id && matches!(item, Item::User { .. }))
-                && crate::time_machine::record_edit_fork(&state.config_dir, thread, item_id)
-                    .is_ok();
+                && crate::time_machine::record_edit_fork(
+                    &state.config_dir,
+                    thread,
+                    item_id,
+                    capture_workspace,
+                )
+                .is_ok();
             if !recorded
-                && crate::time_machine::create_checkpoint(&state.config_dir, thread).is_err()
+                && crate::time_machine::create_checkpoint(
+                    &state.config_dir,
+                    thread,
+                    capture_workspace,
+                )
+                .is_err()
             {
                 return;
             }

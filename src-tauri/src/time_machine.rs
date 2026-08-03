@@ -41,6 +41,9 @@ struct Checkpoint {
     created_at: i64,
     workspace_root: String,
     entries: Vec<PatchEntry>,
+    /// 旧数据均来自文件快照；关闭 Checkpoint 后新节点只保存会话，不扫描工作区。
+    #[serde(default = "default_true")]
+    workspace_captured: bool,
     thread_snapshot: Thread,
     #[serde(default)]
     automatic: bool,
@@ -80,6 +83,10 @@ impl Default for StoreFile {
 
 fn store_version() -> u32 {
     STORE_VERSION
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -361,25 +368,32 @@ fn checkpoint_workspace(
     data_dir: &Path,
     timeline: &Timeline,
     thread: &Thread,
-) -> Result<(PathBuf, Vec<PatchEntry>), String> {
-    // 漫游 guest 的工作目录位于对端，本机只保存会话快照。
-    let remote = thread.is_roaming_guest();
-    let root = if remote {
-        PathBuf::from(&thread.cwd)
-    } else {
+    capture_workspace: bool,
+) -> Result<(PathBuf, Vec<PatchEntry>, bool), String> {
+    // 漫游 guest 的工作目录位于对端；关闭 Checkpoint 时也只保存会话快照。
+    let workspace_captured = capture_workspace && !thread.is_roaming_guest();
+    let root = if workspace_captured {
         workspace_root(Path::new(&thread.cwd))?
+    } else {
+        PathBuf::from(&thread.cwd)
     };
-    if let Some(first) = timeline.checkpoints.first() {
-        if first.workspace_root != root.to_string_lossy() {
-            return Err("工作目录已变化，不能继续写入原世界线时间线".into());
+    if workspace_captured {
+        if let Some(first) = timeline
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.workspace_captured)
+        {
+            if first.workspace_root != root.to_string_lossy() {
+                return Err("工作目录已变化，不能继续写入原世界线时间线".into());
+            }
         }
     }
-    let entries = if remote {
-        Vec::new()
-    } else {
+    let entries = if workspace_captured {
         capture_manifest(data_dir, &root)?
+    } else {
+        Vec::new()
     };
-    Ok((root, entries))
+    Ok((root, entries, workspace_captured))
 }
 
 fn append_checkpoint_captured(
@@ -388,6 +402,7 @@ fn append_checkpoint_captured(
     automatic: bool,
     root: &Path,
     entries: Vec<PatchEntry>,
+    workspace_captured: bool,
 ) -> String {
     let id = uuid::Uuid::new_v4().to_string();
     let parent_id = timeline
@@ -404,6 +419,7 @@ fn append_checkpoint_captured(
         created_at: now_ms(),
         workspace_root: root.to_string_lossy().to_string(),
         entries,
+        workspace_captured,
         thread_snapshot: thread.clone(),
         automatic,
     };
@@ -421,14 +437,25 @@ fn append_checkpoint(
     timeline: &mut Timeline,
     thread: &Thread,
     automatic: bool,
+    capture_workspace: bool,
 ) -> Result<String, String> {
-    let (root, entries) = checkpoint_workspace(data_dir, timeline, thread)?;
+    let (root, entries, workspace_captured) =
+        checkpoint_workspace(data_dir, timeline, thread, capture_workspace)?;
     Ok(append_checkpoint_captured(
-        timeline, thread, automatic, &root, entries,
+        timeline,
+        thread,
+        automatic,
+        &root,
+        entries,
+        workspace_captured,
     ))
 }
 
-pub fn create_checkpoint(data_dir: &Path, thread: &Thread) -> Result<TimelineView, String> {
+pub fn create_checkpoint(
+    data_dir: &Path,
+    thread: &Thread,
+    capture_workspace: bool,
+) -> Result<TimelineView, String> {
     let mut store = load_store(data_dir)?;
     let index = match timeline_index(&store, &thread.id) {
         Some(index) => index,
@@ -444,7 +471,13 @@ pub fn create_checkpoint(data_dir: &Path, thread: &Thread) -> Result<TimelineVie
             store.timelines.len() - 1
         }
     };
-    append_checkpoint(data_dir, &mut store.timelines[index], thread, false)?;
+    append_checkpoint(
+        data_dir,
+        &mut store.timelines[index],
+        thread,
+        false,
+        capture_workspace,
+    )?;
     save_store(data_dir, &store)?;
     Ok(view_for(&store.timelines[index], &thread.id))
 }
@@ -519,6 +552,7 @@ pub fn rewrite_after_context_edit(
     data_dir: &Path,
     thread: &Thread,
     prompts: &[PromptSummary],
+    capture_workspace: bool,
 ) -> Result<TimelineView, String> {
     let mut store = load_store(data_dir)?;
     let index = match timeline_index(&store, &thread.id) {
@@ -548,7 +582,7 @@ pub fn rewrite_after_context_edit(
         }
     }
 
-    append_checkpoint(data_dir, timeline, thread, true)?;
+    append_checkpoint(data_dir, timeline, thread, true, capture_workspace)?;
 
     // 删除中间节点后，旧 parentId 可能指向不再是前缀的路径。按当前快照内容重新组装树。
     let paths: Vec<Vec<PromptSummary>> = timeline
@@ -582,6 +616,7 @@ pub fn record_edit_fork(
     data_dir: &Path,
     thread: &Thread,
     item_id: u64,
+    capture_workspace: bool,
 ) -> Result<TimelineView, String> {
     let item_index = thread
         .items
@@ -615,12 +650,20 @@ pub fn record_edit_fork(
     let timeline = &mut store.timelines[index];
     // 共同历史和原会话记录的是同一瞬间的工作区。只扫描、读取、哈希一次；此前大型工作区
     // 会被完整处理两遍，编辑重发看起来像应用立即卡死。
-    let (root, entries) = checkpoint_workspace(data_dir, timeline, thread)?;
-    let base_id = append_checkpoint_captured(timeline, &base_thread, true, &root, entries.clone());
+    let (root, entries, workspace_captured) =
+        checkpoint_workspace(data_dir, timeline, thread, capture_workspace)?;
+    let base_id = append_checkpoint_captured(
+        timeline,
+        &base_thread,
+        true,
+        &root,
+        entries.clone(),
+        workspace_captured,
+    );
     if let Some(checkpoint) = timeline.checkpoints.last_mut() {
         checkpoint.title = fork_prompt.clone();
     }
-    append_checkpoint_captured(timeline, thread, true, &root, entries);
+    append_checkpoint_captured(timeline, thread, true, &root, entries, workspace_captured);
     if let Some(checkpoint) = timeline.checkpoints.last_mut() {
         checkpoint.title = fork_prompt;
     }
@@ -776,9 +819,11 @@ pub fn restore_checkpoint(
                 serde_json::to_value(&cp.thread_snapshot.items).ok()
                     != serde_json::to_value(&current_thread.items).ok()
                     || cp.thread_snapshot.plan != current_thread.plan
-                    || capture_manifest(data_dir, Path::new(&cp.workspace_root))
-                        .map(|entries| entries != cp.entries)
-                        .unwrap_or(true)
+                    || (restore_files
+                        && cp.workspace_captured
+                        && capture_manifest(data_dir, Path::new(&cp.workspace_root))
+                            .map(|entries| entries != cp.entries)
+                            .unwrap_or(true))
             })
         } else {
             true
@@ -790,11 +835,12 @@ pub fn restore_checkpoint(
             &mut store.timelines[timeline_index],
             current_thread,
             true,
+            restore_files,
         )?;
     }
 
     let target = store.timelines[timeline_index].checkpoints[checkpoint_index].clone();
-    if restore_files && !current_thread.is_roaming_guest() {
+    if restore_files && target.workspace_captured && !current_thread.is_roaming_guest() {
         restore_manifest(data_dir, &target)?;
     }
 
@@ -940,7 +986,7 @@ mod tests {
             None,
             false,
         );
-        let checkpoint = create_checkpoint(&data, &thread).unwrap();
+        let checkpoint = create_checkpoint(&data, &thread, true).unwrap();
         let checkpoint_id = checkpoint.current_checkpoint_id.unwrap();
         fs::write(project.join("source.txt"), b"current").unwrap();
         {
@@ -987,13 +1033,13 @@ mod tests {
             None,
             false,
         );
-        let first = create_checkpoint(&data, &thread).unwrap();
+        let first = create_checkpoint(&data, &thread, true).unwrap();
         let first_id = first.current_checkpoint_id.unwrap();
 
         fs::write(project.join("kept.txt"), b"second\n").unwrap();
         fs::remove_file(project.join("nested/removed-later.txt")).unwrap();
         fs::write(project.join("added-later.txt"), b"new\n").unwrap();
-        create_checkpoint(&data, &thread).unwrap();
+        create_checkpoint(&data, &thread, true).unwrap();
 
         restore_checkpoint(&data, &first_id, &thread, true).unwrap();
         assert_eq!(fs::read(project.join("kept.txt")).unwrap(), b"first\n");
@@ -1002,6 +1048,39 @@ mod tests {
             b"present\n"
         );
         assert!(!project.join("added-later.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabled_checkpoint_records_timeline_without_reading_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-disabled-checkpoint-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        let mut thread = Thread::new(
+            root.join("missing-project").to_string_lossy().to_string(),
+            crate::threads::AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        thread.items.push(Item::User {
+            id: 1,
+            text: "只保存会话分叉".into(),
+            ts: now_ms(),
+            images: Vec::new(),
+        });
+
+        let view = record_edit_fork(&data, &thread, 1, false).unwrap();
+        assert_eq!(view.checkpoints.len(), 2);
+
+        let store = load_store(&data).unwrap();
+        assert!(store.timelines[0]
+            .checkpoints
+            .iter()
+            .all(|checkpoint| !checkpoint.workspace_captured && checkpoint.entries.is_empty()));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1030,7 +1109,7 @@ mod tests {
             images: Vec::new(),
         });
 
-        let view = record_edit_fork(&data, &thread, 1).unwrap();
+        let view = record_edit_fork(&data, &thread, 1, true).unwrap();
         let checkpoint_id = view.current_checkpoint_id.unwrap();
         let (restored, _) = restore_checkpoint(&data, &checkpoint_id, &thread, true).unwrap();
         assert_eq!(restored.id, thread.id);
@@ -1057,7 +1136,7 @@ mod tests {
             None,
             false,
         );
-        let checkpoint = create_checkpoint(&data, &thread).unwrap();
+        let checkpoint = create_checkpoint(&data, &thread, true).unwrap();
         let checkpoint_id = checkpoint.current_checkpoint_id.unwrap();
         fs::write(project.join("file.txt"), b"current workspace\n").unwrap();
 
@@ -1094,7 +1173,7 @@ mod tests {
             images: Vec::new(),
         });
 
-        let view = record_edit_fork(&data, &thread, 1).unwrap();
+        let view = record_edit_fork(&data, &thread, 1, true).unwrap();
         assert_eq!(view.checkpoints.len(), 2);
         assert_eq!(view.checkpoints[0].title, "实现右侧时间树");
         assert_eq!(view.checkpoints[1].title, "实现右侧时间树");
@@ -1127,7 +1206,7 @@ mod tests {
             None,
             false,
         );
-        let first = create_checkpoint(&data, &thread).unwrap();
+        let first = create_checkpoint(&data, &thread, true).unwrap();
         let first_id = first.current_checkpoint_id.unwrap();
 
         fs::write(project.join("file.txt"), b"current workspace\n").unwrap();
@@ -1168,13 +1247,13 @@ mod tests {
         );
         fs::write(repo.join("tracked.txt"), b"checkpoint-a\n").unwrap();
         fs::write(repo.join("new-a.txt"), b"new-a\n").unwrap();
-        let first = create_checkpoint(&data, &thread).unwrap();
+        let first = create_checkpoint(&data, &thread, true).unwrap();
         let first_id = first.current_checkpoint_id.unwrap();
 
         fs::write(repo.join("tracked.txt"), b"checkpoint-b\n").unwrap();
         fs::remove_file(repo.join("new-a.txt")).unwrap();
         fs::write(repo.join("new-b.txt"), b"new-b\n").unwrap();
-        let second = create_checkpoint(&data, &thread).unwrap();
+        let second = create_checkpoint(&data, &thread, true).unwrap();
         let second_id = second.current_checkpoint_id.unwrap();
         assert_ne!(first_id, second_id);
 
@@ -1192,7 +1271,7 @@ mod tests {
         );
 
         fs::write(repo.join("tracked.txt"), b"fork\n").unwrap();
-        let forked = create_checkpoint(&data, &fork).unwrap();
+        let forked = create_checkpoint(&data, &fork, true).unwrap();
         let latest = forked.checkpoints.last().unwrap();
         assert_eq!(latest.parent_id.as_deref(), Some(first_id.as_str()));
         let _ = fs::remove_dir_all(root);

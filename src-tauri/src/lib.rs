@@ -2618,7 +2618,8 @@ fn create_time_machine_checkpoint(
         }
         thread.clone()
     };
-    time_machine::create_checkpoint(&state.config_dir, &thread)
+    let capture_workspace = state.settings.lock().unwrap().checkpoint_enabled;
+    time_machine::create_checkpoint(&state.config_dir, &thread, capture_workspace)
 }
 
 #[tauri::command]
@@ -2693,6 +2694,7 @@ fn delete_time_machine_context(
         return Err("会话正在运行，请先停止".into());
     }
     let _guard = state.time_machine_lock.lock().unwrap();
+    let capture_workspace = state.settings.lock().unwrap().checkpoint_enabled;
     let (agent_kind, timeline) = {
         let mut store = state.store.lock().unwrap();
         let current = store.get(&thread_id).ok_or("会话不存在")?;
@@ -2719,8 +2721,12 @@ fn delete_time_machine_context(
         {
             edited.title = "新会话".into();
         }
-        let timeline =
-            time_machine::rewrite_after_context_edit(&state.config_dir, &edited, &prompts)?;
+        let timeline = time_machine::rewrite_after_context_edit(
+            &state.config_dir,
+            &edited,
+            &prompts,
+            capture_workspace,
+        )?;
         let agent_kind = edited.agent_kind.clone();
         *store.get_mut(&thread_id).ok_or("会话不存在")? = edited;
         store.save();
@@ -3308,6 +3314,7 @@ fn truncate_thread(
     }
     // 与手动恢复保持相同的锁顺序，保证编辑分叉和恢复不会交叉写时间线或项目文件。
     let _time_machine_guard = state.time_machine_lock.lock().unwrap();
+    let capture_workspace = state.settings.lock().unwrap().checkpoint_enabled;
     let (agent_kind, cwd, old_session_id, retained_turns, checkpoint, is_quota, is_guest) = {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
@@ -3317,7 +3324,7 @@ fn truncate_thread(
             .position(|i| i.id() == item_id && matches!(i, Item::User { .. }))
             .ok_or("该消息不存在或不是用户消息")?;
         if !thread.title.starts_with("[Fire]") {
-            time_machine::record_edit_fork(&state.config_dir, thread, item_id)?;
+            time_machine::record_edit_fork(&state.config_dir, thread, item_id, capture_workspace)?;
         }
         let is_guest = thread.is_roaming_guest();
         let checkpoint = thread.checkpoint_before(item_id);
