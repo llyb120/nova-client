@@ -1895,9 +1895,27 @@ function bumpChatScrollToBottom() {
 
 /** 本地 worktree 会话：worktree 在后台创建，暂存首条提示词，就绪后（acp:worktree-ready）再自动发送 */
 const pendingWorktreePrompts = new Map<string, { text: string; images: PromptImage[] }>();
+
+function flushWorktreePrompt(threadId: string) {
+  const prompt = pendingWorktreePrompts.get(threadId);
+  if (!prompt) return;
+  pendingWorktreePrompts.delete(threadId);
+  void sendPromptTo(threadId, prompt.text, prompt.images).catch((error) => {
+    console.error("sendPromptTo failed", error);
+  });
+}
+
 export function stashWorktreePrompt(threadId: string, text: string, images: PromptImage[]) {
   if (!text.trim() && images.length === 0) return;
   pendingWorktreePrompts.set(threadId, { text, images });
+  // create_thread 可能直接复用已就绪的 worktree，或后台 ready 事件可能先于 invoke 返回。
+  // 主动核对持久化状态，避免首条提示词永远留在暂存 Map。
+  void api
+    .getThread(threadId)
+    .then((thread) => {
+      if (thread.worktree && thread.cwd === thread.worktree.path) flushWorktreePrompt(threadId);
+    })
+    .catch((error) => console.error("getThread after worktree creation failed", error));
 }
 
 /**
@@ -2507,19 +2525,13 @@ export async function initStore() {
   // 本地 worktree 后台创建就绪：切到 worktree 的 cwd 已由后端回写，这里补发暂存的首条提示词
   await listen<{ threadId: string }>("acp:worktree-ready", (e) => {
     const id = e.payload.threadId;
-    const p = pendingWorktreePrompts.get(id);
-    pendingWorktreePrompts.delete(id);
     void refreshThreads();
     if (state.currentId === id) {
       void api.getThread(id).then((t) => {
         if (state.currentId === id) setState("cwd", t.cwd);
       });
     }
-    if (p) {
-      void sendPromptTo(id, p.text, p.images).catch((e) => {
-        console.error("sendPromptTo failed", e);
-      });
-    }
+    flushWorktreePrompt(id);
   });
   // 本地 worktree 后台创建失败：丢弃暂存提示词（会话里已有错误系统消息）
   await listen<{ threadId: string; error?: string }>("acp:worktree-failed", (e) => {
