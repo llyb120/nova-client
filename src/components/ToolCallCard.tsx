@@ -134,6 +134,31 @@ function toolSummary(item: ToolItem): string {
   return rawPreview(item.rawInput) || rawPreview(item.rawOutput);
 }
 
+function inputValue(input: unknown, keys: string[]): string {
+  if (!isRecord(input)) return "";
+  for (const key of keys) {
+    const value = compactValue(input[key]);
+    if (value) return value;
+  }
+  return "";
+}
+
+function isCommandTool(item: ToolItem): boolean {
+  const title = stripAnsi(item.title || "").trim();
+  return item.kind === "execute" || /^(?:ran|run|running|execute(?:d|ing)?) command$/i.test(title);
+}
+
+function headlineDetail(item: ToolItem): string {
+  if (isCommandTool(item)) return inputValue(item.rawInput, ["command", "cmd"]);
+  return inputValue(item.rawInput, ["path", "file_path", "query", "q", "url", "symbol"]);
+}
+
+function isTrivialSuccessOutput(item: ToolItem, block: ToolContent): boolean {
+  if (item.status !== "completed" || block.type !== "content") return false;
+  const inner = (block as { content?: { type?: string; text?: string } }).content;
+  return inner?.type === "text" && /^Exited with code 0\.?$/i.test(stripAnsi(inner.text ?? "").trim());
+}
+
 function DiffView(props: {
   path: string;
   oldText?: string | null;
@@ -239,21 +264,25 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
     !!props.active || props.item.status === "pending" || props.item.status === "in_progress";
   const open = () => isExpanded(key(), defaultOpen());
   const showRaw = () => isExpanded(rawKey());
+  const content = createMemo(() =>
+    props.item.content.filter((block) => !isTrivialSuccessOutput(props.item, block)),
+  );
   const hasBody = createMemo(
     () =>
-      props.item.content.length > 0 ||
+      content().length > 0 ||
       props.item.locations.length > 0 ||
       props.item.rawInput !== undefined ||
       props.item.rawOutput !== undefined,
   );
   const visibleContent = createMemo(() =>
-    props.item.content.some((block) => {
+    content().some((block) => {
       if (block.type !== "content") return true;
       const inner = (block as { content?: { type?: string; text?: string } }).content;
       return inner?.type !== "text" || isUsefulText(inner.text);
     }),
   );
   const summary = createMemo(() => toolSummary(props.item));
+  const detail = createMemo(() => headlineDetail(props.item));
 
   // 文件编辑统计 +N -N（codex 风格）
   const stats = createMemo(() => {
@@ -288,6 +317,9 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
         <span class="tool-title" title={label()}>
           {label()}
         </span>
+        <Show when={detail()}>
+          <span class="tool-headline-detail" title={detail()}>{detail()}</span>
+        </Show>
         <Show when={stats().add + stats().del > 0}>
           <span class="tool-stats">
             <span class="stat-add">+{stats().add}</span>
@@ -327,7 +359,7 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
               </For>
             </div>
           </Show>
-          <Index each={props.item.content}>
+          <Index each={content()}>
             {(block, index) => (
               <ContentBlock
                 block={block()}

@@ -1805,6 +1805,21 @@ button {
   color: var(--red);
 }
 
+.tool-headline-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.tool-title + .tool-headline-detail {
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+
 .tool-stats {
   display: inline-flex;
   gap: 6px;
