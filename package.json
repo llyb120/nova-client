@@ -29,7 +29,9 @@
     "test:nova-tools-napi": "node --test scripts/nova-napi-tools.test.mjs",
     "test:nova-context-service": "node --test scripts/nova-context-service.test.mjs",
     "test:context-parity": "node scripts/audit-context-parity.mjs && node scripts/alkaid-context-super.test.mjs && node scripts/cursor-context-super.test.mjs",
-    "eval:context": "node scripts/ctx-core.eval.mjs"
+    "eval:context": "node scripts/ctx-core.eval.mjs",
+    "test:native-context-differential": "node scripts/audit-native-context-random.mjs",
+    "audit:native-context": "node scripts/audit-native-context.mjs && npm run test:native-context-differential"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.2",

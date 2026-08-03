@@ -929,7 +929,12 @@ export async function getIndex(root, {
 
   // focused 模式不为判断“完整”而 stat 全仓；只有 full 模式且文件清单均已有条目才开放全局唯一回退。
   const complete = mode !== 'focused' && list.every((file) => Boolean(cache.files[file]));
-  return buildIndexView(cache, list, complete, {
+  // Focused results must depend on this request, not whichever files an older process happened to
+  // leave in the shared disk cache. Keep the full cache for reuse, but expose only requested/deps.
+  const viewCache = mode === 'focused'
+    ? { ...cache, files: Object.fromEntries(Object.entries(cache.files).filter(([file]) => requested.has(file))) }
+    : cache;
+  return buildIndexView(viewCache, list, complete, {
     scanned,
     pending: Math.max(0, list.length - Object.keys(cache.files).filter((file) => fileSet.has(file)).length),
     total: list.length,

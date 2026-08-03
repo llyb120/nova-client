@@ -1,6 +1,6 @@
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { codeMap, contextBundle, findSymbols } from "./ctx-core.mjs";
+import { callNapiTool } from "./nova-napi-tools.mjs";
 
 const endpoint = String(process.env.NOVA_CONTEXT_SERVICE_ENDPOINT ?? "").trim();
 const token = String(process.env.NOVA_CONTEXT_SERVICE_TOKEN ?? "");
@@ -26,11 +26,9 @@ async function dispatch(request) {
     case "ping":
       return { pid: process.pid, transport: "nova-context-jsonl-v1" };
     case "fast_context":
-      return contextBundle(params, root);
     case "find_symbols":
-      return findSymbols(params, root);
     case "code_map":
-      return codeMap(params, root);
+      return callNapiTool(request.method, root, params);
     default:
       throw new Error(`unknown context service method: ${request.method}`);
   }

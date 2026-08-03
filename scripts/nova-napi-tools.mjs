@@ -57,7 +57,10 @@ export async function callNapiTool(method, root, params) {
   const native = loadBinding();
   if (method === "read_files") return native.readFiles(resolve(root), params ?? {});
   if (method === "edit_files") return native.editFiles(resolve(root), params ?? {});
-  throw new Error(`unknown N-API filesystem tool: ${method}`);
+  if (method === "fast_context") return native.fastContext(resolve(root), params ?? {});
+  if (method === "find_symbols") return native.findSymbols(resolve(root), params ?? {});
+  if (method === "code_map") return native.codeMap(resolve(root), params ?? {});
+  throw new Error(`unknown N-API tool: ${method}`);
 }
 
 export async function callNapiToolOrFallback(method, root, params, fallback) {

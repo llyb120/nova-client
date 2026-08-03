@@ -18,6 +18,7 @@ impl ContextService {
         let runtime_dir = data_dir.join("runtime");
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|e| format!("创建 context service 运行目录失败：{e}"))?;
+        crate::nova_tools_napi_asset::materialize(&runtime_dir)?;
         let script = runtime_dir.join("nova-context-service.mjs");
         if std::fs::read(&script).ok().as_deref() != Some(SERVICE_JS) {
             std::fs::write(&script, SERVICE_JS)

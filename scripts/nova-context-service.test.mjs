@@ -7,9 +7,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { callGlobalContextTool } from "./nova-context-client.mjs";
+import { contextBundle } from "./ctx-core.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
+const bundledService = join(scriptsDir, "..", "src-tauri", "resources", "nova-context-service.mjs");
 
 async function waitForFile(path, timeout = 5000) {
   const deadline = Date.now() + timeout;
@@ -38,7 +40,7 @@ test("different Node processes share one global context service", async () => {
     NOVA_CONTEXT_PARENT_PID: String(process.pid),
     NOVA_DATA_DIR: join(root, "data"),
   };
-  const service = spawn(process.execPath, [join(scriptsDir, "nova-context-service.mjs")], {
+  const service = spawn(process.execPath, [bundledService], {
     env,
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -56,8 +58,10 @@ test("different Node processes share one global context service", async () => {
     assert.equal(Number.parseInt(first.stdout, 10), servicePid);
     assert.equal(Number.parseInt(second.stdout, 10), servicePid);
 
-    const context = await callGlobalContextTool("fast_context", root, { keywords: ["sharedTarget"] });
+    const params = { keywords: ["sharedTarget"] };
+    const context = await callGlobalContextTool("fast_context", root, params);
     assert.match(context, /sharedTarget/);
+    assert.equal(context, await contextBundle(params, root));
   } finally {
     service.kill();
     await new Promise((done) => service.once("exit", done));
