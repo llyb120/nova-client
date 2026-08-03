@@ -22,7 +22,6 @@ const {
   createMessageState,
   createSlimMemory,
   cursorBatchToolPolicy,
-  cursorCavemanPolicy,
   cursorPromptPrefix,
   cursorModelOptions,
   cursorContextWindow,
@@ -829,21 +828,17 @@ assert.doesNotMatch(cursorBatchToolPolicy(), /Cursor Grep is also allowed/);
 assert.doesNotMatch(cursorBatchToolPolicy(), /you must search untracked files/);
 assert.doesNotMatch(cursorBatchToolPolicy({ readOnly: true }), /Write\/Edit/);
 assert.match(cursorBatchToolPolicy({ readOnly: true }), /plan\/read-only/);
-assert.match(cursorCavemanPolicy(), /Respond terse like smart caveman/);
-assert.match(cursorCavemanPolicy(), /默认 full/);
-assert.match(cursorCavemanPolicy(), /先给结论/);
-assert.doesNotMatch(cursorCavemanPolicy(), /使用完整句子/);
 assert.match(cursorPromptPrefix(), /read_files/);
-assert.match(cursorPromptPrefix(), /Respond terse like smart caveman/);
+assert.doesNotMatch(cursorPromptPrefix(), /smart caveman/);
 assert.match(cursorPromptPrefix({ readOnly: true }), /plan\/read-only/);
 assert.doesNotMatch(cursorPromptPrefix({ readOnly: true }), /Write\/Edit\/StrReplace/);
 const policyMessage = messageWithToolPolicy("Add animation", { readOnly: false });
 assert.match(policyMessage, /read_files/);
-assert.match(policyMessage, /Respond terse like smart caveman/);
+assert.doesNotMatch(policyMessage, /smart caveman/);
 assert.match(policyMessage, /Add animation$/);
 const slimWithPolicy = messageWithToolPolicy(messageWithSlimMemory("Continue", slim), { readOnly: false });
 assert.match(slimWithPolicy, /read_files/);
-assert.match(slimWithPolicy, /Respond terse like smart caveman/);
+assert.doesNotMatch(slimWithPolicy, /smart caveman/);
 assert.match(slimWithPolicy, /Changed the lighting/);
 assert.match(slimWithPolicy, /User:\nContinue$/);
 assert.equal(isEditFilesTool("edit_files"), true);

@@ -801,11 +801,8 @@ test("system prompt keeps stable Alkaid policy before dynamic cwd/skills", () =>
   assert.ok(stableIndex >= 0);
   assert.ok(separatorIndex > stableIndex);
   assert.ok(cwdIndex > separatorIndex);
-  assert.match(prompt, /Respond terse like smart caveman/);
-  assert.match(prompt, /默认 full：去冠词、套话、寒暄、模糊措辞；断句可/);
-  assert.match(prompt, /跟随用户主语言压缩文风/);
-  assert.match(prompt, /按用户要求增减细节/);
-  assert.doesNotMatch(prompt, /使用完整句子/);
+  assert.doesNotMatch(prompt, /smart caveman/);
+  assert.doesNotMatch(prompt, /默认 full：去冠词/);
   assert.match(prompt, /必须在一次 read_files 调用中合并读取/);
   assert.match(prompt, /禁止连续调用多个 read/);
 });

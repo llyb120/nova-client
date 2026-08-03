@@ -1236,6 +1236,5 @@ export {
 export {
   createCursorFilesystemTools,
   cursorBatchToolPolicy,
-  cursorCavemanPolicy,
   cursorPromptPrefix,
 } from "./cursor-filesystem-tools.mjs";

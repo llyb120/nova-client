@@ -182,16 +182,7 @@ export function cursorBatchToolPolicy(options = {}) {
   return lines.join("\n");
 }
 
-/**
- * Vega-style caveman full reply policy (same text as Alkaid/Vega system prompt).
- * Attached every turn: no durable systemPrompt; fresh Agent each send.
- * Intensity matches JuliusBrussee/caveman SKILL.md `full` (default).
- */
-export function cursorCavemanPolicy() {
-  return "Respond terse like smart caveman. All technical substance stay. Only fluff die. 默认 full：去冠词、套话、寒暄、模糊措辞；断句可；短同义词。技术实质全留。先给结论，再给行动所需信息。无工具旁白，无装饰表格/emoji，长日志只引关键行。代码、命令、API、错误原文须准确。跟随用户主语言压缩文风，不强制英文。安全警告、不可逆确认、多步顺序易歧义、压缩造成技术歧义、用户要求澄清时恢复完整句；其余保持 caveman。按用户要求增减细节。";
-}
-
-/** Combined every-turn prompt prefix: batch FS/search policy + caveman style. */
+/** Every-turn prompt prefix: batch FS/search policy. */
 export function cursorPromptPrefix(options = {}) {
-  return [cursorBatchToolPolicy(options), cursorCavemanPolicy()].filter(Boolean).join("\n\n");
+  return cursorBatchToolPolicy(options);
 }
