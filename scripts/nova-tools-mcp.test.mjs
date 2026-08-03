@@ -72,11 +72,13 @@ test("read_files accepts paths and common files alias; edit_files round-trips", 
     const tools = createNovaBatchTools(dir, { fastContext: false, includeEditFiles: true });
     assert.equal(tools.read_files.inputSchema.required, undefined);
     assert.equal(tools.read_files.inputSchema.anyOf.length, 2);
-    const read = JSON.parse(await tools.read_files.execute({ paths: ["a.txt", "b.txt"] }));
-    assert.equal(read[0].content, "hello");
-    assert.equal(read[1].content, "world");
-    const aliased = JSON.parse(await tools.read_files.execute({ files: [{ path: "a.txt", offset: 1, limit: 1 }] }));
-    assert.equal(aliased[0].content, "hello");
+    const read = await tools.read_files.execute({ paths: ["a.txt", "b.txt"] });
+    assert.match(read, /<file path="a.txt"/);
+    assert.match(read, /<!\[CDATA\[hello\]\]>/);
+    assert.match(read, /<!\[CDATA\[world\]\]>/);
+    const aliased = await tools.read_files.execute({ files: [{ path: "a.txt", offset: 1, limit: 1 }] });
+    assert.match(aliased, /stop-reason="eof"/);
+    assert.match(aliased, /<!\[CDATA\[hello\]\]>/);
     await tools.edit_files.execute({
       files: [{ path: "a.txt", edits: [{ oldText: "hello", newText: "hola" }] }],
     });
@@ -105,7 +107,8 @@ test("devin policy only mentions enabled tools", () => {
     assert.match(policy, /do not call mcp_list_tools merely to discover them/);
     assert.match(policy, /Never repeat a malformed call unchanged/);
     assert.match(policy, /never invent arbitrary 100\/200-line pages/);
-    assert.match(policy, /Never sequentially page through a whole file/);
+    assert.match(policy, /returns XML and only complete lines/);
+    assert.match(policy, /instead of mechanically paging/);
 
     const disabledPolicy = novaDevinBatchToolPolicy({ fastContext: false, includeEditFiles: true });
     assert.doesNotMatch(disabledPolicy, /fast_context/);

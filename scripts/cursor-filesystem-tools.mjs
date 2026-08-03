@@ -4,24 +4,11 @@ import { createInterface } from "node:readline";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
 import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
+import { formatReadFilesXml, readFilesPerFileBudget } from "./read-files-output.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 2000;
 /** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
 const READ_FILES_MAX_BYTES = 32 * 1024;
-
-function truncateUtf8ToBytes(text, maxBytes) {
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  let end = Math.min(text.length, maxBytes);
-  let slice = text.slice(0, end);
-  while (end > 0 && Buffer.byteLength(slice, "utf8") > maxBytes) {
-    end = Math.floor(end * 0.9);
-    slice = text.slice(0, end);
-  }
-  while (end < text.length && Buffer.byteLength(text.slice(0, end + 1), "utf8") <= maxBytes) {
-    end += 1;
-  }
-  return text.slice(0, end);
-}
 
 function resolveInputPath(root, input) {
   return resolve(root, input);
@@ -32,35 +19,41 @@ async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES,
   const lines = createInterface({ input, crlfDelay: Infinity });
   const content = [];
   let lineNumber = 0;
-  let truncated = false;
+  let hasMore = false;
+  let stopReason = "eof";
+  let lineBytes;
   let byteCount = 0;
   try {
     for await (const line of lines) {
       lineNumber += 1;
       if (lineNumber < offset) continue;
       if (content.length === limit) {
-        truncated = true;
+        hasMore = true;
+        stopReason = "lineLimit";
         break;
       }
       const separatorBytes = content.length > 0 ? 1 : 0;
-      const lineBytes = Buffer.byteLength(line, "utf8");
-      if (byteCount + separatorBytes + lineBytes > maxBytes) {
-        truncated = true;
-        const remaining = maxBytes - byteCount - separatorBytes;
-        if (remaining > 0) content.push(truncateUtf8ToBytes(line, remaining));
+      const currentLineBytes = Buffer.byteLength(line, "utf8");
+      if (byteCount + separatorBytes + currentLineBytes > maxBytes) {
+        hasMore = true;
+        stopReason = content.length === 0 ? "longLine" : "byteBudget";
+        if (content.length === 0) lineBytes = currentLineBytes;
         break;
       }
       content.push(line);
-      byteCount += separatorBytes + lineBytes;
+      byteCount += separatorBytes + currentLineBytes;
     }
   } finally {
     lines.close();
     input.destroy();
   }
   return {
-    content: content.join("\n"),
-    truncated,
-    nextOffset: truncated ? offset + Math.max(content.length, 1) : undefined,
+    content: content.join("\n"), startLine: offset,
+    ...(content.length ? { endLine: offset + content.length - 1 } : {}),
+    linesRead: content.length, bytesRead: byteCount, maxContentBytes: maxBytes,
+    hasMore, rangeComplete: !["byteBudget", "longLine"].includes(stopReason), stopReason,
+    ...(hasMore ? { nextOffset: offset + content.length } : {}),
+    ...(lineBytes === undefined ? {} : { lineBytes }),
   };
 }
 
@@ -93,7 +86,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
   const root = resolve(cwd);
   return {
     read_files: {
-      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 Read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行（且不超过约 32KB）。请为每个文件按需指定 offset/limit。未知精确目标范围时省略 limit，使用默认 2000 行；禁止随意选择 100/200 行小分页。仅已知精确目标范围时使用较小 limit。必要的 nextOffset 续读也应省略 limit 或使用 2000。nextOffset 仅供按需续读；truncated 只表示仍有后续内容。不要为了消除 truncated 顺序读完整个文件，仅当当前任务缺少必要上下文时继续；需要理解大文件整体结构时改用 fast_context/find_symbols。`,
+      description: `并行读取多个 UTF-8 文本文件；返回 XML。整次正文池约 48KB，按文件数分配，只返回完整行。stop-reason=eof|lineLimit|byteBudget|longLine；next-offset 指向首条未返回行。has-more 不要求继续；byteBudget/longLine 后先缩小范围或定位，禁止机械翻页。默认每文件前 ${DEFAULT_BATCH_READ_LINES} 行。`,
       inputSchema: {
         type: "object",
         properties: {
@@ -108,23 +101,19 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
       async execute({ paths }) {
         const list = Array.isArray(paths) ? paths : [];
+        const maxBytes = readFilesPerFileBudget(list.length);
         const results = await callNapiToolOrFallback("read_files", root, { paths: list }, async () =>
           Promise.all(list.map(async (input) => {
             const request = typeof input === "string" ? { path: input } : (input ?? {});
             const requestPath = String(request.path ?? "");
             try {
               const path = resolveInputPath(root, requestPath);
-              const result = await readTextLines(path, request.offset, request.limit);
-              return {
-                path: requestPath,
-                content: result.content,
-                ...(result.truncated ? { truncated: true, nextOffset: result.nextOffset } : {}),
-              };
+              return { path: requestPath, ...await readTextLines(path, request.offset, request.limit, maxBytes) };
             } catch (error) {
               return { path: requestPath, error: error instanceof Error ? error.message : String(error) };
             }
           })));
-        return JSON.stringify(results);
+        return formatReadFilesXml(results);
       },
     },
     ...(fastContext ? {
@@ -174,7 +163,7 @@ export function cursorBatchToolPolicy(options = {}) {
     "You have Nova batch tool read_files plus Cursor built-in Read, Shell, Grep"
       + (readOnly ? "" : ", Write/Edit")
       + ". The following tool-selection rules are hard constraints.",
-      "Before each read phase, inventory known targets: if there is only one target, use Read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call Read repeatedly, and do not use parallel wrappers of multiple Read calls instead of read_files. Wanting to understand files in order is not a read dependency. Use Read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. When the exact target range is unknown, omit limit so read_files uses its 2000-line default; never invent arbitrary 100/200-line pages. Use a smaller limit only for a known exact range. A necessary nextOffset continuation must also omit limit or use 2000. A returned nextOffset is only for on-demand continuation; truncated only means more content exists. Never sequentially page through a whole file merely to clear truncated. Continue only when the current task still lacks required context; use fast_context/find_symbols to understand a large file's structure. "
+      "Before each read phase, inventory known targets: if there is only one target, use Read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call Read repeatedly, and do not use parallel wrappers of multiple Read calls instead of read_files. Wanting to understand files in order is not a read dependency. Use Read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. When the exact target range is unknown, omit limit so read_files uses its 2000-line default; never invent arbitrary 100/200-line pages. Use a smaller limit only for a known exact range. read_files returns XML and only complete lines. has-more only means the file continues. For stop-reason byteBudget/longLine, next-offset identifies the first unread line; narrow or locate the target instead of mechanically paging. Continue only when the task explicitly needs contiguous text; use fast_context/find_symbols for large-file structure. "
         + (fastContext
           ? "When edit distribution is unknown and you need complete cross-file context, call fast_context once (or find_symbols for definitions/references only). Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
           : "When location is unknown, search first (see below), then read near hits. ")

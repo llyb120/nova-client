@@ -22,6 +22,7 @@ import { Readable } from "node:stream";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
+import { formatReadFilesXml, readFilesPerFileBudget, READ_FILES_OUTPUT_MAX_BYTES } from "./read-files-output.mjs";
 
 const DEFAULT_BATCH_READ_LINES = 2000;
 /** Match pi coding tools: keep read_files outputs usable without blowing the context window. */
@@ -473,26 +474,29 @@ async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES,
   const lines = createInterface({ input, crlfDelay: Infinity });
   const content = [];
   let lineNumber = 0;
-  let truncated = false;
+  let hasMore = false;
+  let stopReason = "eof";
+  let lineBytes;
   let byteCount = 0;
   try {
     for await (const line of lines) {
       lineNumber += 1;
       if (lineNumber < offset) continue;
       if (content.length === limit) {
-        truncated = true;
+        hasMore = true;
+        stopReason = "lineLimit";
         break;
       }
       const separatorBytes = content.length > 0 ? 1 : 0;
-      const lineBytes = Buffer.byteLength(line, "utf8");
-      if (byteCount + separatorBytes + lineBytes > maxBytes) {
-        truncated = true;
-        const remaining = maxBytes - byteCount - separatorBytes;
-        if (remaining > 0) content.push(truncateUtf8ToBytes(line, remaining));
+      const currentLineBytes = Buffer.byteLength(line, "utf8");
+      if (byteCount + separatorBytes + currentLineBytes > maxBytes) {
+        hasMore = true;
+        stopReason = content.length === 0 ? "longLine" : "byteBudget";
+        if (content.length === 0) lineBytes = currentLineBytes;
         break;
       }
       content.push(line);
-      byteCount += separatorBytes + lineBytes;
+      byteCount += separatorBytes + currentLineBytes;
     }
   } finally {
     lines.close();
@@ -500,8 +504,16 @@ async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES,
   }
   return {
     content: content.join("\n"),
-    truncated,
-    nextOffset: truncated ? offset + Math.max(content.length, 1) : undefined,
+    startLine: offset,
+    ...(content.length ? { endLine: offset + content.length - 1 } : {}),
+    linesRead: content.length,
+    bytesRead: byteCount,
+    maxContentBytes: maxBytes,
+    hasMore,
+    rangeComplete: stopReason !== "byteBudget" && stopReason !== "longLine",
+    stopReason,
+    ...(hasMore ? { nextOffset: offset + content.length } : {}),
+    ...(lineBytes === undefined ? {} : { lineBytes }),
   };
 }
 
@@ -515,7 +527,7 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
   const tools = [
     {
       name: "read_files",
-      description: `同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时必须调用一次本工具，不得拆成多个 read；内部并行、流式读取，默认每个文件读取前 ${DEFAULT_BATCH_READ_LINES} 行（且不超过约 32KB）。请为每个文件按需指定 offset/limit。未知精确目标范围时省略 limit，使用默认 2000 行；禁止随意选择 100/200 行小分页。仅已知精确目标范围时使用较小 limit。必要的 nextOffset 续读也应省略 limit 或使用 2000。nextOffset 仅供按需续读；truncated 只表示仍有后续内容。不要为了消除 truncated 顺序读完整个文件，仅当当前任务缺少必要上下文时继续；需要理解大文件整体结构时改用 fast_context/find_symbols。`,
+      description: `并行读取多个 UTF-8 文本文件；模型输出为 XML。整次正文池约 48KB，按文件数分配；只返回完整行。stop-reason=eof|lineLimit|byteBudget|longLine；next-offset 永远指向首条未返回行。has-more 不要求继续读取；遇到 byteBudget/longLine 应先缩小范围或用 fast_context/find_symbols 定位，禁止机械翻完整文件。默认每文件前 ${DEFAULT_BATCH_READ_LINES} 行；已知范围才设置较小 limit。`,
       parameters: Type.Object({
         paths: Type.Array(Type.Union([
           Type.String(),
@@ -527,23 +539,19 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
         ]), { minItems: 1 }),
       }),
       async execute(_id, { paths }) {
+        const maxBytes = readFilesPerFileBudget(paths.length);
         const results = await callNapiToolOrFallback("read_files", root, { paths }, () =>
           Promise.all(paths.map(async (input) => {
             const request = typeof input === "string" ? { path: input } : input;
             try {
               const path = resolveInputPath(root, request.path);
-              const result = await readTextLines(path, request.offset, request.limit);
-              return {
-                path: request.path,
-                content: result.content,
-                ...(result.truncated ? { truncated: true, nextOffset: result.nextOffset } : {}),
-              };
+              return { path: request.path, ...await readTextLines(path, request.offset, request.limit, maxBytes) };
             } catch (error) {
               return { path: request.path, error: error instanceof Error ? error.message : String(error) };
             }
           })),
         );
-        return textResult(JSON.stringify(results), { count: results.length });
+        return textResult(formatReadFilesXml(results), { count: results.length, format: "xml" });
       },
     },
   ];
@@ -735,7 +743,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
     "你是 Vega：高效、简单、面向软件工程结果。",
     "Respond terse like smart caveman. All technical substance stay. Only fluff die. 默认 full：去冠词、套话、寒暄、模糊措辞；断句可；短同义词。技术实质全留。先给结论，再给行动所需信息。无工具旁白，无装饰表格/emoji，长日志只引关键行。代码、命令、API、错误原文须准确。跟随用户主语言压缩文风，不强制英文。安全警告、不可逆确认、多步顺序易歧义、压缩造成技术歧义、用户要求澄清时恢复完整句；其余保持 caveman。按用户要求增减细节。",
     `Available tools:\n${toolLines.join("\n")}`,
-      "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。每次准备读取前，先汇总当前已知目标：仅有一个目标时使用 read；同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，必须在一次 read_files 调用中合并读取，并为每个文件分别设置必要的 offset/limit。禁止连续调用多个 read，也禁止用并行封装的多个 read 代替 read_files；想按顺序理解文件不构成读取依赖。只有后一个目标的路径或读取范围必须由前一次结果确定、目标不是 UTF-8 文本，或当前确实仅需一个文件时，才使用 read。后续新发现多个独立文本目标时，下一读取阶段仍须合并使用 read_files。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。未知精确目标范围时，read_files 必须省略 limit 以使用默认 2000 行，禁止随意选择 100/200 行小分页；仅已知精确目标范围时使用较小 limit。必要的 nextOffset 续读也应省略 limit 或使用 2000。nextOffset 仅供按需续读；truncated 只表示仍有后续内容。不要为了消除 truncated 顺序读完整个文件，仅当当前任务缺少必要上下文时继续；需要理解大文件整体结构时改用 fast_context/find_symbols。"
+      "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。每次准备读取前，先汇总当前已知目标：仅有一个目标时使用 read；同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，必须在一次 read_files 调用中合并读取，并为每个文件分别设置必要的 offset/limit。禁止连续调用多个 read，也禁止用并行封装的多个 read 代替 read_files；想按顺序理解文件不构成读取依赖。只有后一个目标的路径或读取范围必须由前一次结果确定、目标不是 UTF-8 文本，或当前确实仅需一个文件时，才使用 read。后续新发现多个独立文本目标时，下一读取阶段仍须合并使用 read_files。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。未知精确目标范围时，read_files 必须省略 limit 以使用默认 2000 行，禁止随意选择 100/200 行小分页；仅已知精确目标范围时使用较小 limit。read_files 返回 XML；has-more 只表示文件仍有后文。stop-reason=byteBudget/longLine 时 next-offset 指向首条未返回行，应先缩小范围或定位，禁止机械分页；仅任务确需连续正文时续读。需要理解大文件整体结构时改用 fast_context/find_symbols。"
         + (fastContext
           ? "未知修改分布且需要完整编辑上下文时，调用一次 fast_context（只要定义/引用行号时用 find_symbols）；已展示范围禁止重读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
           : "未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；")
@@ -895,7 +903,9 @@ export async function createAlkaidAgent(options = {}) {
         archiveDir,
         toolCallId,
         toolName: tool.name,
-        maxBytes: tool.name === "fast_context" ? FAST_CONTEXT_OUTPUT_MAX_BYTES : undefined,
+        maxBytes: tool.name === "read_files"
+          ? READ_FILES_OUTPUT_MAX_BYTES
+          : tool.name === "fast_context" ? FAST_CONTEXT_OUTPUT_MAX_BYTES : undefined,
       });
     },
   }));

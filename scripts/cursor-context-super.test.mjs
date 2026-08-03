@@ -692,25 +692,22 @@ try {
   assert.equal(agentTools.edit_files, undefined);
   const readOnlyTools = createCursorFilesystemTools(batchCwd, { readOnly: true });
   assert.equal(readOnlyTools.edit_files, undefined);
-  const read = JSON.parse(await agentTools.read_files.execute({ paths: ["a.txt", "b.txt"] }));
-  assert.deepEqual(read, [
-    { path: "a.txt", content: "A\nconst quoted = \"x\";" },
-    { path: "b.txt", content: "B\npath = C:\\tmp" },
-  ]);
+  const read = await agentTools.read_files.execute({ paths: ["a.txt", "b.txt"] });
+  assert.match(read, /<file path="a.txt"/);
+  assert.match(read, /<!\[CDATA\[A\nconst quoted = "x";\]\]>/);
+  assert.match(read, /<!\[CDATA\[B\npath = C:\\tmp\]\]>/);
 
   await writeFile(join(batchCwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
-  const first = JSON.parse(await agentTools.read_files.execute({ paths: ["large.txt"] }))[0];
-  assert.equal(first.content.split("\n").length, 200);
-  assert.equal(first.nextOffset, 201);
+  const first = await agentTools.read_files.execute({ paths: [{ path: "large.txt", limit: 200 }] });
+  assert.match(first, /end-line="200" lines-read="200"/);
+  assert.match(first, /next-offset="201" range-complete="true" stop-reason="lineLimit"/);
   const parent = await mkdtemp(join(tmpdir(), "nova-cursor-paths-"));
   const workspace = join(parent, "workspace");
   await mkdir(workspace);
   const outside = join(parent, "outside.txt");
   await writeFile(outside, "outside");
   const pathTools = createCursorFilesystemTools(workspace);
-  assert.deepEqual(JSON.parse(await pathTools.read_files.execute({ paths: [outside] })), [
-    { path: outside, content: "outside" },
-  ]);
+  assert.match(await pathTools.read_files.execute({ paths: [outside] }), /<!\[CDATA\[outside\]\]>/);
   await rm(parent, { recursive: true, force: true });
 } finally {
   await rm(batchCwd, { recursive: true, force: true });

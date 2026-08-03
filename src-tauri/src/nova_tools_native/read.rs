@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 const DEFAULT_LINES: usize = 2000;
 const MAX_LINES: usize = 2000;
-const MAX_BYTES: usize = 32 * 1024;
+const CONTENT_POOL_BYTES: usize = 48 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -79,24 +79,15 @@ fn detect_encoding(sample: &[u8]) -> Encoding {
     Encoding::Utf8(0)
 }
 
-fn truncate_utf8(value: &str, max: usize) -> &str {
-    if value.len() <= max {
-        return value;
-    }
-    let mut end = max;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
-fn paginate<I>(lines: I, offset: usize, limit: usize) -> Result<Value, String>
+fn paginate<I>(lines: I, offset: usize, limit: usize, max_bytes: usize) -> Result<Value, String>
 where
     I: IntoIterator<Item = Result<String, String>>,
 {
     let mut rows = Vec::new();
     let mut bytes = 0usize;
-    let mut truncated = false;
+    let mut has_more = false;
+    let mut stop_reason = "eof";
+    let mut long_line_bytes = None;
     for (index, line) in lines.into_iter().enumerate() {
         let line_number = index + 1;
         let line = line?;
@@ -104,30 +95,46 @@ where
             continue;
         }
         if rows.len() == limit {
-            truncated = true;
+            has_more = true;
+            stop_reason = "lineLimit";
             break;
         }
         let separator = usize::from(!rows.is_empty());
-        if bytes + separator + line.len() > MAX_BYTES {
-            truncated = true;
-            let remain = MAX_BYTES.saturating_sub(bytes + separator);
-            if remain > 0 {
-                rows.push(truncate_utf8(&line, remain).to_string());
+        if bytes + separator + line.len() > max_bytes {
+            has_more = true;
+            stop_reason = if rows.is_empty() { "longLine" } else { "byteBudget" };
+            if rows.is_empty() {
+                long_line_bytes = Some(line.len());
             }
             break;
         }
         bytes += separator + line.len();
         rows.push(line);
     }
-    let mut value = json!({ "content": rows.join("\n") });
-    if truncated {
-        value["truncated"] = Value::Bool(true);
-        value["nextOffset"] = json!(offset + rows.len().max(1));
+    let lines_read = rows.len();
+    let mut value = json!({
+        "content": rows.join("\n"),
+        "startLine": offset,
+        "linesRead": lines_read,
+        "bytesRead": bytes,
+        "maxContentBytes": max_bytes,
+        "hasMore": has_more,
+        "rangeComplete": !matches!(stop_reason, "byteBudget" | "longLine"),
+        "stopReason": stop_reason,
+    });
+    if lines_read > 0 {
+        value["endLine"] = json!(offset + lines_read - 1);
+    }
+    if has_more {
+        value["nextOffset"] = json!(offset + lines_read);
+    }
+    if let Some(line_bytes) = long_line_bytes {
+        value["lineBytes"] = json!(line_bytes);
     }
     Ok(value)
 }
 
-fn utf8_lines(mut file: File, bom: usize, offset: usize, limit: usize) -> Result<Value, String> {
+fn utf8_lines(mut file: File, bom: usize, offset: usize, limit: usize, max_bytes: usize) -> Result<Value, String> {
     if bom > 0 {
         file.seek(SeekFrom::Start(bom as u64))
             .map_err(|e| e.to_string())?;
@@ -143,6 +150,7 @@ fn utf8_lines(mut file: File, bom: usize, offset: usize, limit: usize) -> Result
         }),
         offset,
         limit,
+        max_bytes,
     )
 }
 
@@ -152,6 +160,7 @@ fn utf16_lines(
     bom: usize,
     offset: usize,
     limit: usize,
+    max_bytes: usize,
 ) -> Result<Value, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     let body = bytes.get(bom..).ok_or("invalid UTF-16 BOM")?;
@@ -174,10 +183,11 @@ fn utf16_lines(
             .map(|line| Ok(line.trim_end_matches('\r').to_string())),
         offset,
         limit,
+        max_bytes,
     )
 }
 
-fn read_one(root: &Path, request: PathRequest) -> Value {
+fn read_one(root: &Path, request: PathRequest, max_bytes: usize) -> Value {
     let (display, offset, limit) = match request {
         PathRequest::Path(path) => (path, 1, DEFAULT_LINES),
         PathRequest::Range {
@@ -197,9 +207,9 @@ fn read_one(root: &Path, request: PathRequest) -> Value {
         let count = file.read(&mut sample).map_err(|e| e.to_string())?;
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let mut value = match detect_encoding(&sample[..count]) {
-            Encoding::Utf8(bom) => utf8_lines(file, bom, offset, limit)?,
-            Encoding::Utf16Le(bom) => utf16_lines(&target, true, bom, offset, limit)?,
-            Encoding::Utf16Be(bom) => utf16_lines(&target, false, bom, offset, limit)?,
+            Encoding::Utf8(bom) => utf8_lines(file, bom, offset, limit, max_bytes)?,
+            Encoding::Utf16Le(bom) => utf16_lines(&target, true, bom, offset, limit, max_bytes)?,
+            Encoding::Utf16Be(bom) => utf16_lines(&target, false, bom, offset, limit, max_bytes)?,
         };
         value["path"] = Value::String(display.clone());
         Ok(value)
@@ -214,6 +224,7 @@ pub fn read_files(root: &Path, params: Value) -> Result<Value, String> {
         return Err("paths must not be empty".into());
     }
     let count = params.paths.len();
+    let per_file_bytes = CONTENT_POOL_BYTES / count.max(1);
     let workers = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(2)
@@ -230,7 +241,7 @@ pub fn read_files(root: &Path, params: Value) -> Result<Value, String> {
                     break;
                 }
                 let request = requests.lock().unwrap()[index].take().unwrap();
-                let value = read_one(root, request);
+                let value = read_one(root, request, per_file_bytes);
                 results.lock().unwrap()[index] = Some(value);
             });
         }

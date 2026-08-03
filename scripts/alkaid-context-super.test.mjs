@@ -593,15 +593,14 @@ test("batch file tools remain available as Alkaid enhancements", async () => {
   const editTool = createCodingTools(cwd).find((tool) => tool.name === "edit");
   const [readFiles, editFiles] = createFilesystemTools(cwd, editTool);
   const read = await readFiles.execute("1", { paths: ["a.txt", "b.txt"] });
-  assert.deepEqual(JSON.parse(read.content[0].text), [
-    { path: "a.txt", content: "A" },
-    { path: "b.txt", content: "B" },
-  ]);
+  assert.match(read.content[0].text, /<file path="a.txt"/);
+  assert.match(read.content[0].text, /<!\[CDATA\[A\]\]>/);
+  assert.match(read.content[0].text, /<!\[CDATA\[B\]\]>/);
   const utf16Path = join(cwd, "powershell.diff");
   const utf16Text = "diff --git a/a.txt b/a.txt\r\n你好";
   await writeFile(utf16Path, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(utf16Text, "utf16le")]));
-  const utf16Read = JSON.parse((await readFiles.execute("utf16", { paths: ["powershell.diff"] })).content[0].text)[0];
-  assert.equal(utf16Read.content, utf16Text.replace(/\r\n/g, "\n"));
+  const utf16Read = (await readFiles.execute("utf16", { paths: ["powershell.diff"] })).content[0].text;
+  assert.match(utf16Read, /<!\[CDATA\[diff --git a\/a.txt b\/a.txt\n你好\]\]>/);
   await editFiles.execute("2", { files: [
     { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] },
     { path: "b.txt", edits: [{ oldText: "B", newText: "BB" }] },
@@ -668,16 +667,14 @@ test("batch reads stream large files in pages", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-page-"));
   await writeFile(join(cwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
   const [readFiles] = createFilesystemTools(cwd);
-  const first = JSON.parse((await readFiles.execute("1", { paths: ["large.txt"] })).content[0].text)[0];
-  assert.equal(first.content.split("\n").length, 200);
-  assert.equal(first.nextOffset, 201);
-  assert.equal(first.truncated, true);
-  const second = JSON.parse((await readFiles.execute("2", {
-    paths: [{ path: "large.txt", offset: first.nextOffset, limit: 20 }],
-  })).content[0].text)[0];
-  assert.equal(second.content.split("\n").length, 20);
-  assert.equal(second.content.split("\n")[0], "line-201");
-  assert.equal(second.nextOffset, 221);
+  const first = (await readFiles.execute("1", { paths: [{ path: "large.txt", limit: 200 }] })).content[0].text;
+  assert.match(first, /end-line="200" lines-read="200"/);
+  assert.match(first, /next-offset="201" range-complete="true" stop-reason="lineLimit"/);
+  const second = (await readFiles.execute("2", {
+    paths: [{ path: "large.txt", offset: 201, limit: 20 }],
+  })).content[0].text;
+  assert.match(second, /start-line="201" end-line="220" lines-read="20"/);
+  assert.match(second, /<!\[CDATA\[line-201/);
 });
 
 test("batch file tools allow absolute paths outside the workspace", async () => {
@@ -693,9 +690,7 @@ test("batch file tools allow absolute paths outside the workspace", async () => 
   const editTool = codingTools.find((tool) => tool.name === "edit");
   const [readFiles, editFiles] = createFilesystemTools(cwd, editTool);
   assert.match((await nativeRead.execute("1", { path: outside })).content[0].text, /outside/);
-  assert.deepEqual(JSON.parse((await readFiles.execute("2", { paths: [outside] })).content[0].text), [
-    { path: outside, content: "outside" },
-  ]);
+  assert.match((await readFiles.execute("2", { paths: [outside] })).content[0].text, /<!\[CDATA\[outside\]\]>/);
   const absoluteInside = join(cwd, "x.txt");
   await editFiles.execute("3", { files: [
     { path: absoluteInside, edits: [{ oldText: "x", newText: "inside" }] },
@@ -867,11 +862,11 @@ test("batch reads truncate oversized lines by byte budget", async () => {
   const hugeLine = "z".repeat(80 * 1024);
   await writeFile(join(cwd, "wide.txt"), `${hugeLine}\nline-2`);
   const [readFiles] = createFilesystemTools(cwd);
-  const first = JSON.parse((await readFiles.execute("1", { paths: ["wide.txt"] })).content[0].text)[0];
-  assert.equal(first.truncated, true);
-  assert.ok(Buffer.byteLength(first.content, "utf8") <= 50 * 1024);
-  assert.ok(first.content.length < hugeLine.length);
-  assert.equal(first.nextOffset, 2);
+  const first = (await readFiles.execute("1", { paths: ["wide.txt"] })).content[0].text;
+  assert.match(first, /lines-read="0" bytes-read="0"/);
+  assert.match(first, /next-offset="1" range-complete="false" stop-reason="longLine"/);
+  assert.match(first, /line-bytes="\d+"/);
+  assert.ok(Buffer.byteLength(first, "utf8") < 64 * 1024);
 });
 
 test("compat defaults enable session affinity for openai-compatible proxies", () => {
