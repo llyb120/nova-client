@@ -1022,7 +1022,8 @@ export function SettingsModal(props: { onClose: () => void }) {
       });
       return;
     }
-    const url = `${server}/remote?token=${token}`;
+    // 必须用 /remote/（带尾斜杠）：服务端把 /remote 307 到 /remote/ 时不会保留 query，token 会被丢掉。
+    const url = `${server}/remote/?token=${encodeURIComponent(token)}`;
     try {
       const dataUrl = await QRCode.toDataURL(url, {
         width: 280,
