@@ -2343,6 +2343,30 @@ button {
   border-color: color-mix(in srgb, var(--accent) 55%, transparent);
   box-shadow: var(--shadow-md), 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent), var(--inset-hi);
 }
+.workflow-manual-review {
+  margin: -4px 0 10px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border-light));
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--bg-float) 92%, var(--accent) 8%);
+}
+.workflow-manual-review-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+.workflow-manual-review-head span {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.workflow-manual-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
 .composer.is-dragging,
 .home-composer.is-dragging {
   border-color: var(--accent);

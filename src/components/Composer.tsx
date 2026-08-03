@@ -31,6 +31,11 @@ import {
 } from "../store";
 import type { AgentKind, PromptImage } from "../types";
 import { agentLabel } from "../utils";
+import {
+  chooseManualWorkflowTransition,
+  manualWorkflowReview,
+  workflowReviewRevision,
+} from "../workflow/runtime";
 import { ConfigSelects } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconClue, IconFile, IconSend, IconStop, IconUndo, IconUsers } from "./icons";
@@ -56,6 +61,7 @@ export function Composer() {
   const [sentHistory, setSentHistory] = createSignal<PromptHistoryItem[]>([]);
   const [historyOpen, setHistoryOpen] = createSignal(false);
   const [activeHistoryIndex, setActiveHistoryIndex] = createSignal(0);
+  const [choosingWorkflowRoute, setChoosingWorkflowRoute] = createSignal(false);
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
@@ -538,6 +544,24 @@ export function Composer() {
     }
   };
 
+  const manualReview = createMemo(() => {
+    workflowReviewRevision();
+    return state.currentId ? manualWorkflowReview(state.currentId) : null;
+  });
+
+  const chooseWorkflowRoute = async (transitionId: string) => {
+    const threadId = state.currentId;
+    if (!threadId || choosingWorkflowRoute()) return;
+    setChoosingWorkflowRoute(true);
+    try {
+      await chooseManualWorkflowTransition(threadId, transitionId);
+    } catch (error) {
+      console.error("Workflow manual transition failed", error);
+    } finally {
+      setChoosingWorkflowRoute(false);
+    }
+  };
+
   const onInput = (e: InputEvent) => {
     const el = e.currentTarget as HTMLTextAreaElement;
     const typedSlash = e.inputType === "insertText" && e.data === "/";
@@ -557,6 +581,30 @@ export function Composer() {
       <noteFlow.Notes />
       <ExclusiveChatMark token={state.roamingPeer || state.settings?.relayToken || ""} />
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
+      <Show when={manualReview()}>
+        {(review) => (
+          <div class="workflow-manual-review">
+            <div class="workflow-manual-review-head">
+              <strong>等待人工审核</strong>
+              <span>选择下一步</span>
+            </div>
+            <div class="workflow-manual-review-actions">
+              <For each={review().transitions}>
+                {(transition) => (
+                  <button
+                    type="button"
+                    class="btn secondary small"
+                    disabled={choosingWorkflowRoute()}
+                    onClick={() => void chooseWorkflowRoute(transition.id)}
+                  >
+                    {transition.label}
+                  </button>
+                )}
+              </For>
+            </div>
+          </div>
+        )}
+      </Show>
       <Show when={activeClue()}>
         {(clue) => (
           <div class="clue-context-chip" title={`本会话引用线索：${clue().title}`}>
