@@ -2335,8 +2335,15 @@ impl AcpManager {
         }
         // Shell 解释器由 Devin 的执行层选择，且可能在同一 Windows 会话中切换。
         // 每轮带上短契约，旧 session 也能立即纠正 Bash / PowerShell 混用。
-        if let Some(runtime) = devin_runtime_guidance() {
-            guidance.push(runtime.to_string());
+        let fast_context = self
+            .app
+            .state::<AppState>()
+            .settings
+            .lock()
+            .unwrap()
+            .fast_context_enabled;
+        if let Some(runtime) = devin_runtime_guidance(fast_context) {
+            guidance.push(runtime);
         }
         if !guidance.is_empty() {
             prompt.insert(0, json!({ "type": "text", "text": guidance.join("\n\n") }));
@@ -3062,7 +3069,9 @@ mod nova_tools_config_tests {
     fn devin_nova_tools_guidance_requires_wrapper_server_name() {
         let guidance = super::nova_tools_prompt_guidance(true, false);
         assert!(guidance.contains("ROUTING RULE — apply this before choosing any tool"));
-        assert!(guidance.contains("never select read_files, fast_context, find_symbols, or edit_files"));
+        assert!(
+            guidance.contains("never select read_files, fast_context, find_symbols, edit_files")
+        );
         assert!(guidance.contains("only valid execution path"));
         assert!(guidance.contains("generic mcp_call_tool wrapper"));
         assert!(guidance.contains("Set server_name to the top-level string \"nova-tools\""));
@@ -3074,13 +3083,23 @@ mod nova_tools_config_tests {
         assert!(guidance.contains("Never sequentially page through a whole file"));
     }
 
+    #[test]
+    fn disabled_fast_context_is_absent_from_devin_guidance() {
+        let guidance = super::nova_tools_prompt_guidance(false, false);
+        assert!(!guidance.contains("fast_context"));
+        assert!(!guidance.contains("find_symbols"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_devin_guidance_does_not_mix_powershell_with_default_bash() {
-        let guidance = super::devin_runtime_guidance().unwrap();
+        let guidance = super::devin_runtime_guidance(true).unwrap();
         assert!(guidance.contains("default command interpreter may be `/usr/bin/bash`"));
         assert!(guidance.contains("powershell.exe -NoProfile -NonInteractive -Command"));
         assert!(guidance.contains("Do not mix Bash pipelines/operators with PowerShell cmdlets"));
+        assert!(!super::devin_runtime_guidance(false)
+            .unwrap()
+            .contains("fast_context"));
     }
 }
 
@@ -3093,14 +3112,19 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
     if !read_only {
         tools.push_str(", edit_files");
     }
+    let example = if fast_context {
+        r#"{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}"#
+    } else {
+        r#"{"server_name":"nova-tools","tool_name":"read_files","arguments":{"paths":["src/example.ts"]}}"#
+    };
     let mut lines = vec![
         format!(
-            "ROUTING RULE — apply this before choosing any tool: never select read_files, fast_context, find_symbols, or edit_files as the tool call itself. Select Devin's top-level mcp_call_tool first, then route to server nova-tools. You have Nova MCP endpoints on server nova-tools ({tools}) plus Devin built-in tools. Those endpoint names are NOT top-level callable Devin tools; a direct invocation produces `Unknown tool ... This tool is not available.` Your only valid execution path for a Nova endpoint is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string \"nova-tools\" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: {{\"server_name\":\"nova-tools\",\"tool_name\":\"fast_context\",\"arguments\":{{\"query\":\"cursor\"}}}}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as `use/call read_files` means `call mcp_call_tool with server_name nova-tools and tool_name read_files`; it never authorizes a direct tool call. If a direct call reports `Unknown tool`, retry once through mcp_call_tool. If parsing reports missing field `server_name`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints."
+            "ROUTING RULE — apply this before choosing any tool: never select {tools} as the tool call itself. Select Devin's top-level mcp_call_tool first, then route to server nova-tools. You have Nova MCP endpoints on server nova-tools ({tools}) plus Devin built-in tools. Those endpoint names are NOT top-level callable Devin tools; a direct invocation produces `Unknown tool ... This tool is not available.` Your only valid execution path for a Nova endpoint is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string \"nova-tools\" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: {example}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as `use/call read_files` means `call mcp_call_tool with server_name nova-tools and tool_name read_files`; it never authorizes a direct tool call. If a direct call reports `Unknown tool`, retry once through mcp_call_tool. If parsing reports missing field `server_name`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints."
         ),
         format!(
-            "Before each read phase, inventory known targets: if there is only one target, use Devin's native read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call native read repeatedly, and do not use parallel wrappers of multiple native reads instead of read_files. Wanting to understand files in order is not a read dependency. Use native read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. When the exact target range is unknown, omit limit so read_files uses its 2000-line default; never invent arbitrary 100/200-line pages. Use a smaller limit only for a known exact range. A necessary nextOffset continuation must also omit limit or use 2000. A returned nextOffset is only for on-demand continuation; truncated only means more content exists. Never sequentially page through a whole file merely to clear truncated. Continue only when the current task still lacks required context; use fast_context/find_symbols to understand a large file's structure. {}Do not dump large files blindly. {}",
+            "Before each read phase, inventory known targets: if there is only one target, use Devin's native read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call native read repeatedly, and do not use parallel wrappers of multiple native reads instead of read_files. Wanting to understand files in order is not a read dependency. Use native read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. When the exact target range is unknown, omit limit so read_files uses its 2000-line default; never invent arbitrary 100/200-line pages. Use a smaller limit only for a known exact range. A necessary nextOffset continuation must also omit limit or use 2000. A returned nextOffset is only for on-demand continuation; truncated only means more content exists. Never sequentially page through a whole file merely to clear truncated. Continue only when the current task still lacks required context. {}Do not dump large files blindly. {}",
             if fast_context {
-                "When location is unknown, you must call only fast_context (or find_symbols if you only need line numbers); then read only coverage gaps / next_reads. "
+                "Use fast_context/find_symbols to understand a large file's structure. When location is unknown, you must call only fast_context (or find_symbols if you only need line numbers); then read only coverage gaps / next_reads. "
             } else {
                 "When location is unknown, search first (see below), then read near hits. "
             },
@@ -3123,14 +3147,19 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
 }
 
 #[cfg(windows)]
-fn devin_runtime_guidance() -> Option<&'static str> {
-    Some(
-        "Windows shell contract for this local Devin session (hard constraint): Devin's native command tool is hosted on Windows but its default command interpreter may be `/usr/bin/bash` (Git Bash/MSYS), not PowerShell. Never place PowerShell cmdlets such as `Get-ChildItem`, `Select-Object`, `Get-Content`, `Where-Object`, or `$env:NAME` directly in a default shell command. For ordinary repository commands, use portable Bash syntax and forward-slash paths, for example `pwd`, `ls -la`, `cat file`, `rg pattern src`, `git status --short`, `command -v node`, and `$NAME`. Do not use Bash to recursively search when Nova fast_context/find_symbols/read_files already covers the task. When Windows-specific behavior or PowerShell cmdlets are genuinely required, invoke PowerShell explicitly as `powershell.exe -NoProfile -NonInteractive -Command \"...\"`; inside that quoted script use PowerShell syntax and `$env:NAME`. Do not mix Bash pipelines/operators with PowerShell cmdlets in the same command. If a command fails with `/usr/bin/bash: ...: command not found`, correct the shell mismatch immediately instead of retrying the same syntax.",
-    )
+fn devin_runtime_guidance(fast_context: bool) -> Option<String> {
+    let search_guidance = if fast_context {
+        " Do not use Bash to recursively search when Nova fast_context/find_symbols/read_files already covers the task."
+    } else {
+        ""
+    };
+    Some(format!(
+        "Windows shell contract for this local Devin session (hard constraint): Devin's native command tool is hosted on Windows but its default command interpreter may be `/usr/bin/bash` (Git Bash/MSYS), not PowerShell. Never place PowerShell cmdlets such as `Get-ChildItem`, `Select-Object`, `Get-Content`, `Where-Object`, or `$env:NAME` directly in a default shell command. For ordinary repository commands, use portable Bash syntax and forward-slash paths, for example `pwd`, `ls -la`, `cat file`, `rg pattern src`, `git status --short`, `command -v node`, and `$NAME`.{search_guidance} When Windows-specific behavior or PowerShell cmdlets are genuinely required, invoke PowerShell explicitly as `powershell.exe -NoProfile -NonInteractive -Command \"...\"`; inside that quoted script use PowerShell syntax and `$env:NAME`. Do not mix Bash pipelines/operators with PowerShell cmdlets in the same command. If a command fails with `/usr/bin/bash: ...: command not found`, correct the shell mismatch immediately instead of retrying the same syntax."
+    ))
 }
 
 #[cfg(not(windows))]
-fn devin_runtime_guidance() -> Option<&'static str> {
+fn devin_runtime_guidance(_fast_context: bool) -> Option<String> {
     None
 }
 

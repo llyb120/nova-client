@@ -86,7 +86,7 @@ test("read_files accepts paths and common files alias; edit_files round-trips", 
   }
 });
 
-test("devin policy mentions nova-tools and read_files", () => {
+test("devin policy only mentions enabled tools", () => {
   const prev = process.env.NOVA_FAST_CONTEXT;
   delete process.env.NOVA_FAST_CONTEXT;
   try {
@@ -106,6 +106,10 @@ test("devin policy mentions nova-tools and read_files", () => {
     assert.match(policy, /Never repeat a malformed call unchanged/);
     assert.match(policy, /never invent arbitrary 100\/200-line pages/);
     assert.match(policy, /Never sequentially page through a whole file/);
+
+    const disabledPolicy = novaDevinBatchToolPolicy({ fastContext: false, includeEditFiles: true });
+    assert.doesNotMatch(disabledPolicy, /fast_context/);
+    assert.doesNotMatch(disabledPolicy, /find_symbols/);
   } finally {
     if (prev === undefined) delete process.env.NOVA_FAST_CONTEXT;
     else process.env.NOVA_FAST_CONTEXT = prev;
