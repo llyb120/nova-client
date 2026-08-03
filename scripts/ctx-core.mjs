@@ -490,6 +490,8 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   const task = String(args?.task ?? '').trim().slice(0, 300);
   const tTokens = taskTokens(task).filter((t) => !keywords.some((k) => k.toLowerCase() === t.toLowerCase()));
   const planIntent = retrievalPlan(task);
+  // 编辑任务默认把调用方和测试当候选闭包；只有任务明确要求时才升为 required。
+  const inferRelations = planIntent.active;
   const wantFiles = [...new Set((Array.isArray(args?.files) ? args.files : [])
     .map((f) => String(f ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, ''))
     .filter(Boolean))].slice(0, 6);
@@ -571,11 +573,17 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     priorityFiles,
     matchTerms: terms,
     mode: 'focused',
-    dependencyDepth: 2,
+    dependencyDepth: 3,
   });
 
   const missedAll = keywords.filter((k) => !kwCount.has(k));
-  const seeds = seedDefs(index, keywords);
+  // task-only 调用也应建立目标定义。只纳入有限数量的 ASCII 标识符，避免中文
+  // n-gram 和自然语言词把 defs 全表匹配放大成二次扫描。
+  const seedTerms = [...new Set([
+    ...keywords,
+    ...tTokens.filter((term) => /^[A-Za-z_$][\w$]{2,}$/.test(term)).slice(0, MAX_GRAPH_TERMS),
+  ])];
+  const seeds = seedDefs(index, seedTerms);
 
   // 计划驱动二次检索：先看目标定义体，再搜索错误/配置/状态符号的处理方。
   // 这样可找到“不引用目标函数、只处理其 Error/State/Config”的关键上下文。
@@ -602,8 +610,8 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     const referencesSeed = [...e.lns.values()].some((cell) => seedNames.some((name) => cell.text.includes(name)));
     const callsSeed = [...e.lns.values()].some((cell) => seedNames.some((name) => cell.text.includes(`${name}(`)));
     let bonus = 0;
-    if (planIntent.callers && callsSeed) bonus += 180;
-    if (planIntent.tests && referencesSeed && NOISE_PATH.test(file)) bonus += 220;
+    if ((planIntent.callers || inferRelations) && callsSeed) bonus += 180;
+    if ((planIntent.tests || inferRelations) && referencesSeed && NOISE_PATH.test(file)) bonus += 220;
     if (plannedTerms.some((term) => [...e.lns.values()].some((cell) => cell.text.includes(term)))) bonus += 140;
     return bonus;
   };
@@ -638,8 +646,10 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   // 追加后重排，保证 wantFiles > 主题文件 > 其余命中
   ranked.sort((a, b) => b.score - a.score);
 
-  const candidateLimit = Math.min(20, MAX_CANDIDATES + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 8192) * 2);
-  const fileLimit = Math.min(12, MAX_FILES + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 16384) * 2);
+  const baseCandidateLimit = MAX_CANDIDATES + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 8192) * 2;
+  const candidateLimit = Math.min(20, Math.max(16, baseCandidateLimit));
+  const baseFileLimit = MAX_FILES + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 16384) * 2;
+  const fileLimit = Math.min(12, Math.max(8, baseFileLimit));
   const unitsPerFile = Math.min(8, MAX_UNITS_PER_FILE + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 16384));
   let candidates = ranked.filter((r) => isCodeFile(r.file) || wantFiles.includes(r.file)).slice(0, candidateLimit);
   // 全是非代码文件时（配置/文档命中）也要展开，否则模型只拿到一堆位置还得自己去读
@@ -718,11 +728,13 @@ export async function contextBundle(args = {}, root = repoRoot()) {
       const callsSeed = seedNames.some((name) => body.includes(`${name}(`));
       const plannedRelation = plannedTerms.some((name) => body.includes(name));
       g.role = g.tag === 'def' ? 'target'
-        : planIntent.tests && NOISE_PATH.test(file) && referencesSeed ? 'test'
+        : (planIntent.tests || inferRelations) && NOISE_PATH.test(file) && referencesSeed ? 'test'
           : planIntent.errors && plannedRelation ? 'handler'
-            : planIntent.callers && callsSeed ? 'caller'
+            : (planIntent.callers || inferRelations) && callsSeed ? 'caller'
               : 'related';
-      g.required = g.role === 'target' || g.role === 'handler' || g.role === 'caller' || g.role === 'test';
+      // caller/test 的 required 是行为类别义务，不是“所有引用都必须展开”；
+      // 子模覆盖会保留每类代表，其余留在 IMPACT。
+      g.required = g.role === 'target' || (g.role === 'handler' && planIntent.errors);
       let s = score * 0.35;
       for (const k of g.kws) s += 45 * KW_WEIGHT(kwCount.get(k) ?? 1) * (keywords.includes(k) ? 1 : 0.5);
       s += Math.min(g.hits.length, 6) * 8;
@@ -737,12 +749,59 @@ export async function contextBundle(args = {}, root = repoRoot()) {
       if (size > 150) s -= (size - 150) / 8;
       if ((fileRank.get(file) ?? 9) < 2) s += 12;
       g.score = s;
+      g.body = body;
       const estimatedBytes = Math.max(96, Buffer.byteLength(body, 'utf8'));
+      g.estimatedBytes = estimatedBytes;
       g.utility = s / Math.max(1, estimatedBytes / 1024);
       units.push(g);
     }
   }
-  units.sort((a, b) => Number(b.required) - Number(a.required) || b.utility - a.utility || b.score - a.score);
+  // 子模覆盖：按新增闭包义务/字节选择，不让同构调用方和重复文本命中垄断预算。
+  {
+    const remaining = [...units];
+    const ordered = [];
+    const covered = new Set();
+    const behavior = (unit) => {
+      if (unit.role !== 'caller') return unit.role;
+      if (/\b(?:try|catch)\b/.test(unit.body)) return 'caller:error';
+      if (seedNames.some((name) => new RegExp(`\\breturn\\s+await\\s+${name}\\s*\\(`).test(unit.body))) return 'caller:await';
+      if (seedNames.some((name) => new RegExp(`\\breturn\\s+${name}\\s*\\(`).test(unit.body))) return 'caller:return';
+      if (/\bawait\b/.test(unit.body)) return 'caller:await-consume';
+      return 'caller:invoke';
+    };
+    const features = (unit) => {
+      const out = new Map();
+      if (unit.role === 'target') out.set(`target:${unit.file}:${unit.ln}`, 120);
+      else if (unit.role === 'handler') out.set('handler', 85);
+      else if (unit.role === 'test') out.set('test', 70);
+      else if (unit.role === 'caller') out.set(behavior(unit), 65);
+      for (const keyword of unit.kws) out.set(`term:${keyword.toLowerCase()}`, 12);
+      if (unit.role === 'related') out.set(`related:${unit.file}`, 6);
+      return out;
+    };
+    while (remaining.length) {
+      let bestIndex = 0;
+      let bestValue = -Infinity;
+      for (let index = 0; index < remaining.length; index += 1) {
+        const unit = remaining[index];
+        let gain = unit.required ? 1000 : 0;
+        for (const [feature, weight] of features(unit)) if (!covered.has(feature)) gain += weight;
+        if (NOISE_PATH.test(unit.file) && unit.role !== 'test') gain -= 50;
+        const value = gain / Math.max(1, unit.estimatedBytes / 1024) + unit.score / 1000;
+        if (value > bestValue) {
+          bestValue = value;
+          bestIndex = index;
+        }
+      }
+      const [picked] = remaining.splice(bestIndex, 1);
+      const pickedFeatures = features(picked);
+      picked.behaviorNovel = picked.role !== 'caller'
+        || [...pickedFeatures.keys()].some((feature) => feature.startsWith('caller:') && !covered.has(feature));
+      ordered.push(picked);
+      for (const feature of pickedFeatures.keys()) covered.add(feature);
+    }
+    units.splice(0, units.length, ...ordered);
+  }
 
   // ---- 装配
   // planned 只累计代码正文的估算字节（渲染时的头/尾开销另算），避免重复计数。
@@ -781,7 +840,13 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   };
   const covers = (file, ln) => shownRanges(file).some(([a, b]) => ln >= a && ln <= b);
 
-  const fitsBudget = (cost, lines) => planned + cost <= softBytes && usedLines + lines <= budget;
+  // required 闭包单元不能仅因兼容行预算被降成 SIG；仍受更高的正文字节上限和
+  // 最终 hardBytes 回退保护。普通相关单元继续遵守 softBytes + 行预算。
+  const requiredBytes = Math.max(softBytes, Math.floor(hardBytes * 0.86));
+  const fitsBudget = (cost, lines, required = false) => (
+    planned + cost <= (required ? requiredBytes : softBytes)
+    && (required || usedLines + lines <= budget)
+  );
   const take = (cost, lines) => {
     planned += cost;
     usedLines += lines;
@@ -807,7 +872,9 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   // 分两相：先给所有 ≤SUBJECT_FULL_MAX 的主题文件整给（小主题不被大主题挤掉），
   // 装不下的大主题再按「含命中单元优先、其余按文件顺序」通读打包（主流程一次拿全），
   // 放不下的顶层单元进 SIG，未打包的在渲染时用大纲行兜底。测试文件不当主题。
-  const subjectList = candidates.map((c) => c.file).filter((f) => isSubject(f) && !NOISE_PATH.test(f) && srcs.has(f));
+  // 已有明确 seed 时，先保证目标闭包；文件名主题扩展不能抢走目标、调用方和依赖预算。
+  // 仅文件名命中、没有可解析 seed 时，保留原来的主题文件通读行为。
+  const subjectList = candidates.map((c) => c.file).filter((f) => !seeds.length && isSubject(f) && !NOISE_PATH.test(f) && srcs.has(f));
   for (const f of subjectList) {
     const src = srcs.get(f);
     if (src.total > SUBJECT_FULL_MAX || plan.get(f)?.full) continue;
@@ -851,6 +918,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   }
 
   for (const u of units) {
+    if (u.role === 'caller' && !u.required && u.behaviorNovel === false) continue;
     const src = srcs.get(u.file);
     if (!src) continue;
     const p = plan.get(u.file);
@@ -873,7 +941,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     const ranges = [[u.ln, Math.min(u.end, src.total)]];
     const cost = costOf(u.file, ranges);
     const lines = countLines(ranges);
-    if (!fitsBudget(cost, lines)) {
+    if (!fitsBudget(cost, lines, u.required)) {
       if (u.unit) pushSig(u.file, u.ln, u.unit.sig);
       continue;
     }
@@ -894,7 +962,8 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   const depQueue = collectDeps(index, unitTexts, ownedKeys, new Set([...keywords, ...tTokens]));
   const deps = [];
   const depSeen = new Set();
-  for (let depth = 0; depth < 2 && depQueue.length; depth++) {
+  const dependencyWaves = 3;
+  for (let depth = 0; depth < dependencyWaves && depQueue.length; depth++) {
     const wave = depQueue.splice(0);
     const nextTexts = [];
     for (const d of wave) {
@@ -905,7 +974,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
       const src = readSource(root, index, d.def.file);
       if (src) nextTexts.push({ file: d.def.file, text: src.lines.slice(d.def.ln - 1, d.def.end).join('\n') });
     }
-    if (depth < 1 && nextTexts.length) {
+    if (depth + 1 < dependencyWaves && nextTexts.length) {
       for (const d of collectDeps(index, nextTexts, new Set([...ownedKeys, ...depSeen]), new Set([...keywords, ...tTokens]))) depQueue.push(d);
     }
   }
@@ -926,7 +995,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     const ranges = [[d.def.ln, Math.min(d.def.end, src.total)]];
     const cost = costOf(file, ranges);
     const lines = countLines(ranges);
-    if (!fitsBudget(cost, lines)) {
+    if (!fitsBudget(cost, lines, d.depth === 0)) {
       pushSig(file, d.def.ln, d.def.sig);
       continue;
     }
@@ -1053,9 +1122,12 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   }
   const proof = [];
   const targetCount = units.filter((u) => u.role === 'target' && covers(u.file, u.ln)).length;
-  const callerCount = units.filter((u) => u.role === 'caller' && covers(u.file, u.ln)).length;
-  const handlerCount = units.filter((u) => u.role === 'handler' && covers(u.file, u.ln)).length;
-  const testCount = units.filter((u) => u.role === 'test' && covers(u.file, u.ln)).length;
+  const coveredRoleCount = (role) => new Set(units
+    .filter((u) => u.role === role && covers(u.file, u.ln))
+    .map((u) => u.file)).size;
+  const callerCount = coveredRoleCount('caller');
+  const handlerCount = coveredRoleCount('handler');
+  const testCount = coveredRoleCount('test');
   const depCount = [...plan.values()].reduce((n, p) => n + (p.section === 'dep' ? p.blocks.length : 0), 0);
   proof.push(`符号关系: ${plannedTerms.length ? `已解析 ${plannedTerms.length}` : '无可解析扩展边'}`);
   proof.push(`目标定义: ${targetCount ? `已闭合 ${targetCount}` : '缺口'}`);

@@ -22,6 +22,59 @@ async function waitForFile(path, timeout = 5000) {
   throw new Error(`timed out waiting for ${path}`);
 }
 
+test("fast_context prioritizes resolved targets and lets required units exceed line budget", async () => {
+  const root = await mkdtemp(join(tmpdir(), "nova-context-priority-"));
+  try {
+    const body = Array.from({ length: 140 }, (_, index) => `  const value_${index} = ${index};`).join("\n");
+    const filler = Array.from({ length: 830 }, (_, index) => `export const PAD_${index} = ${index};`).join("\n");
+    await writeFile(join(root, "large_target.ts"), `export function requiredTarget() {\n${body}\n  return value_139;\n}\n${filler}\nexport function unrelatedLaterFlow() { return 1; }\n`);
+
+    const output = await contextBundle({
+      task: "inspect requiredTarget implementation",
+      budget: 100,
+      maxBytes: 32768,
+    }, root);
+    assert.match(output, /@@ 1-143 fn requiredTarget \[def\]/);
+    assert.match(output, /return value_139;\n}/);
+    assert.doesNotMatch(output, /export function unrelatedLaterFlow/);
+    assert.match(output, /目标定义: 已闭合/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fast_context closes third-level dependencies and samples caller behaviors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "nova-context-graph-"));
+  try {
+    await writeFile(join(root, "target.ts"), "import { stageOne } from './stageOne';\nexport function targetApi(input) { return stageOne(input); }\n");
+    await writeFile(join(root, "stageOne.ts"), "import { stageTwo } from './stageTwo';\nexport function stageOne(input) { return stageTwo(input); }\n");
+    await writeFile(join(root, "stageTwo.ts"), "import { stageThree } from './stageThree';\nexport function stageTwo(input) { return stageThree(input); }\n");
+    await writeFile(join(root, "stageThree.ts"), "export function stageThree(input) { return `DEPTH_THREE:${input}`; }\n");
+    for (let index = 0; index < 4; index += 1) {
+      await writeFile(join(root, `duplicate${index}.ts`), `import { targetApi } from './target';\nexport function duplicate${index}(input) { const value = targetApi(input); return value; }\n`);
+    }
+    await writeFile(join(root, "returnCaller.ts"), "import { targetApi } from './target';\nexport function returnCaller(input) { return targetApi(input); }\n");
+    await writeFile(join(root, "awaitCaller.ts"), "import { targetApi } from './target';\nexport async function awaitCaller(input) { return await targetApi(input); }\n");
+    await writeFile(join(root, "errorCaller.ts"), "import { targetApi } from './target';\nexport function errorCaller(input) { try { return targetApi(input); } catch { return null; } }\n");
+
+    const output = await contextBundle({
+      keywords: ["targetApi"],
+      task: "修改 targetApi 签名并保持调用方兼容",
+      budget: 180,
+      maxBytes: 12288,
+    }, root);
+    assert.match(output, /DEPTH_THREE/);
+    assert.match(output, /export function returnCaller/);
+    assert.match(output, /export async function awaitCaller/);
+    assert.match(output, /export function errorCaller/);
+    const expanded = output.split("## IMPACT")[0];
+    const duplicateBodies = [...expanded.matchAll(/export function duplicate\d/g)].length;
+    assert.ok(duplicateBodies <= 2, `duplicate callers consumed budget: ${duplicateBodies}\n${output}`);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("different Node processes share one global context service", async () => {
   const root = await mkdtemp(join(tmpdir(), "nova-context-service-"));
   const endpoint = process.platform === "win32"
