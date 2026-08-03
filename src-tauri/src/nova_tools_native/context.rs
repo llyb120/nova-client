@@ -136,7 +136,7 @@ struct UnitCandidate {
     utility: f64,
     body: String,
     estimated_bytes: usize,
-    behavior_novel: bool,
+    obligation: Option<String>,
 }
 
 static MEMO: OnceLock<Mutex<HashMap<String, DiskCache>>> = OnceLock::new();
@@ -1610,6 +1610,16 @@ fn unit_label(chain: &[&Symbol], unit: &Symbol) -> String {
     parts.join(" > ")
 }
 
+fn contains_ascii_word(text: &str, needle: &str) -> bool {
+    text.match_indices(needle).any(|(start, value)| {
+        let before = text[..start].chars().next_back();
+        let end = start + value.len();
+        let after = text[end..].chars().next();
+        let is_word = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+        before.is_none_or(|ch| !is_word(ch)) && after.is_none_or(|ch| !is_word(ch))
+    })
+}
+
 fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     if ranges.is_empty() {
         return ranges;
@@ -2563,7 +2573,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                         utility: 0.0,
                         body: String::new(),
                         estimated_bytes: 96,
-                        behavior_novel: true,
+                        obligation: None,
                     },
                 ));
                 grouped.len() - 1
@@ -2616,7 +2626,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                         utility: 0.0,
                         body: String::new(),
                         estimated_bytes: 96,
-                        behavior_novel: true,
+                        obligation: None,
                     },
                 ));
                 grouped.len() - 1
@@ -2710,7 +2720,9 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         } else if unit.role == "test" {
             features.push(("test".into(), 70.0));
         } else if unit.role == "caller" {
-            let behavior = if unit.body.contains("try") || unit.body.contains("catch") {
+            let behavior = if contains_ascii_word(&unit.body, "try")
+                || contains_ascii_word(&unit.body, "catch")
+            {
                 "caller:error"
             } else if seed_names
                 .iter()
@@ -2761,12 +2773,16 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             }
         }
         let mut picked = remaining.remove(best_index);
-        let picked_features = unit_features(&picked);
-        picked.behavior_novel = picked.role != "caller"
-            || picked_features.iter().any(|(feature, _)| {
-                feature.starts_with("caller:") && !covered_features.contains(feature)
-            });
-        for (feature, _) in picked_features {
+        picked.obligation = if picked.role == "caller" {
+            unit_features(&picked)
+                .into_iter()
+                .find_map(|(feature, _)| feature.starts_with("caller:").then_some(feature))
+        } else if picked.role == "test" {
+            Some("test".into())
+        } else {
+            None
+        };
+        for (feature, _) in unit_features(&picked) {
             covered_features.insert(feature);
         }
         units.push(picked);
@@ -2942,8 +2958,15 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .iter()
         .map(|unit| (unit.file.clone(), unit.start, unit.role))
         .collect::<Vec<_>>();
+    // 行为覆盖只能在单元实际进入 plan 后提交。显式要求 caller/test 时，每个调用行为
+    // 类别/测试类别的首个可装入代表获得 required 预算和结构上限豁免。
+    let mut packed_obligations = HashSet::<String>::new();
     for unit in units {
-        if unit.role == "caller" && !unit.required && !unit.behavior_novel {
+        if unit
+            .obligation
+            .as_ref()
+            .is_some_and(|value| packed_obligations.contains(value))
+        {
             continue;
         }
         let Some(source) = sources.get(&unit.file).cloned() else {
@@ -2951,12 +2974,21 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         };
         let plan_index = plans.iter().position(|plan| plan.file == unit.file);
         if plan_index.is_some_and(|index| plans[index].full) {
+            if let Some(obligation) = unit.obligation {
+                packed_obligations.insert(obligation);
+            }
             continue;
         }
-        if plan_index.is_none() && plans.len() >= file_limit {
+        let required_representative = unit.obligation.is_some()
+            && ((unit.role == "caller" && plan_intent.callers)
+                || (unit.role == "test" && plan_intent.tests));
+        let effective_required = unit.required || required_representative;
+        if plan_index.is_none() && plans.len() >= file_limit && !required_representative {
             continue;
         }
-        if plan_index.is_some_and(|index| plans[index].blocks.len() >= units_per_file) {
+        if plan_index.is_some_and(|index| plans[index].blocks.len() >= units_per_file)
+            && !required_representative
+        {
             continue;
         }
         if !unit.hits.is_empty()
@@ -2965,6 +2997,9 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 .iter()
                 .all(|line| plan_index.is_some_and(|index| covered(&plans[index], *line)))
         {
+            if let Some(obligation) = unit.obligation {
+                packed_obligations.insert(obligation);
+            }
             continue;
         }
         if plan_index.is_none()
@@ -2972,10 +3007,21 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             && (*file_rank.get(&unit.file).unwrap_or(&9) < 3 || unit.tag == "def")
         {
             let cost = range_cost(&source, 1, source.lines.len());
-            if used + source.lines.len() <= budget && used_bytes + cost <= soft_bytes {
+            let required_bytes = soft_bytes.max(hard * 86 / 100);
+            if (effective_required || used + source.lines.len() <= budget)
+                && used_bytes + cost
+                    <= if effective_required {
+                        required_bytes
+                    } else {
+                        soft_bytes
+                    }
+            {
                 used += source.lines.len();
                 used_bytes += cost;
                 let rank = *file_rank.get(&unit.file).unwrap_or(&99);
+                if let Some(obligation) = unit.obligation {
+                    packed_obligations.insert(obligation);
+                }
                 plans.push(PlannedFile {
                     file: unit.file,
                     source,
@@ -2990,9 +3036,9 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         let lines = unit.end - unit.start + 1;
         let cost = range_cost(&source, unit.start, unit.end.min(source.lines.len()));
         let required_bytes = soft_bytes.max(hard * 86 / 100);
-        if (!unit.required && used + lines > budget)
+        if (!effective_required && used + lines > budget)
             || used_bytes + cost
-                > if unit.required {
+                > if effective_required {
                     required_bytes
                 } else {
                     soft_bytes
@@ -3026,10 +3072,13 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 role => role,
             },
             score: unit.score,
-            required: unit.required,
+            required: effective_required,
         });
         used += lines;
         used_bytes += cost;
+        if let Some(obligation) = unit.obligation {
+            packed_obligations.insert(obligation);
+        }
     }
     let original_count = plans.len();
     let owned: HashSet<_> = plans
@@ -3765,6 +3814,48 @@ mod tests {
         .unwrap();
         assert!(out.contains("@@ 1-143 fn requiredTarget [def]"), "{out}");
         assert!(out.contains("return value_139;\n}"), "{out}");
+    }
+
+    #[test]
+    fn explicit_callers_and_tests_get_representatives_under_tight_line_budget() {
+        let d = tempdir().unwrap();
+        let target_body = (0..120)
+            .map(|i| format!("  const target_{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            d.path().join("target.ts"),
+            format!("export function targetApi(input) {{\n{target_body}\n  return input;\n}}\n"),
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("entryCaller.ts"),
+            "import { targetApi } from './target';\nexport function entryCaller(input) { const entry = targetApi(input); return entry; }\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("errorCaller.ts"),
+            "import { targetApi } from './target';\nexport function errorCaller(input) { try { return targetApi(input); } catch { return null; } }\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("target.test.ts"),
+            "import { targetApi } from './target';\nexport function targetContract() { return targetApi('x') === 'x'; }\n",
+        )
+        .unwrap();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({
+                "keywords":["targetApi"],
+                "task":"修改 targetApi 签名，检查调用方和测试",
+                "budget":100,
+                "maxBytes":12288
+            }),
+        )
+        .unwrap();
+        assert!(out.contains("export function entryCaller"), "{out}");
+        assert!(out.contains("export function errorCaller"), "{out}");
+        assert!(out.contains("export function targetContract"), "{out}");
     }
 
     #[test]

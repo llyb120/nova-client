@@ -75,6 +75,29 @@ test("fast_context closes third-level dependencies and samples caller behaviors"
   }
 });
 
+test("fast_context guarantees explicit caller/test representatives under tight line budget", async () => {
+  const root = await mkdtemp(join(tmpdir(), "nova-context-obligations-"));
+  try {
+    const targetBody = Array.from({ length: 120 }, (_, index) => `  const target_${index} = ${index};`).join("\n");
+    await writeFile(join(root, "target.ts"), `export function targetApi(input) {\n${targetBody}\n  return input;\n}\n`);
+    await writeFile(join(root, "entryCaller.ts"), "import { targetApi } from './target';\nexport function entryCaller(input) { const entry = targetApi(input); return entry; }\n");
+    await writeFile(join(root, "errorCaller.ts"), "import { targetApi } from './target';\nexport function errorCaller(input) { try { return targetApi(input); } catch { return null; } }\n");
+    await writeFile(join(root, "target.test.ts"), "import { targetApi } from './target';\nexport function targetContract() { return targetApi('x') === 'x'; }\n");
+
+    const output = await contextBundle({
+      keywords: ["targetApi"],
+      task: "修改 targetApi 签名，检查调用方和测试",
+      budget: 100,
+      maxBytes: 12288,
+    }, root);
+    assert.match(output, /export function entryCaller/);
+    assert.match(output, /export function errorCaller/);
+    assert.match(output, /export function targetContract/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("different Node processes share one global context service", async () => {
   const root = await mkdtemp(join(tmpdir(), "nova-context-service-"));
   const endpoint = process.platform === "win32"
