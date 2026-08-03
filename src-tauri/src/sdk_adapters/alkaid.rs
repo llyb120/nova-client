@@ -22,12 +22,10 @@ impl SdkAdapter for AlkaidAdapter {
     }
 
     fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
-        &[
-            (
-                "photon_rs_bg.wasm",
-                include_bytes!("../../resources/photon_rs_bg.wasm"),
-            ),
-        ]
+        &[(
+            "photon_rs_bg.wasm",
+            include_bytes!("../../resources/photon_rs_bg.wasm"),
+        )]
     }
 
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
@@ -40,7 +38,12 @@ impl SdkAdapter for AlkaidAdapter {
                 ("NOVA_CONTEXT_MODE", settings.vega_context_mode.clone()),
                 (
                     "NOVA_FAST_CONTEXT",
-                    if settings.fast_context_enabled { "1" } else { "0" }.into(),
+                    if settings.fast_context_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
                 ),
             ],
         }

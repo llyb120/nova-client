@@ -622,10 +622,7 @@ impl SdkManager {
             if let Err(error) = manager.refresh_model_options().await {
                 let _ = manager.app.emit(
                     EV_LOG,
-                    format!(
-                        "[{}] 拉取模型列表失败：{error}",
-                        manager.adapter.label()
-                    ),
+                    format!("[{}] 拉取模型列表失败：{error}", manager.adapter.label()),
                 );
             }
             manager
@@ -2098,9 +2095,8 @@ fn tool_call(value: &Value) -> ToolCall {
         "mcp_tool_call" => {
             let server = value.get("server").and_then(Value::as_str).unwrap_or("MCP");
             let raw_arguments = value.get("arguments");
-            let envelope = raw_arguments.filter(|arguments| {
-                arguments.get("toolName").and_then(Value::as_str).is_some()
-            });
+            let envelope = raw_arguments
+                .filter(|arguments| arguments.get("toolName").and_then(Value::as_str).is_some());
             let tool = envelope
                 .and_then(|arguments| arguments.get("toolName"))
                 .and_then(Value::as_str)

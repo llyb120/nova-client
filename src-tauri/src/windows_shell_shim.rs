@@ -313,7 +313,8 @@ mod tests {
 
     #[test]
     fn installs_cursor_compatible_bash_alias_under_git_bin() {
-        let root = std::env::temp_dir().join(format!("nova-shell-shim-git-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("nova-shell-shim-git-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let helper = write_helper(&root).unwrap();
         let bash_dir = cursor_compatible_bash_shim_dir(&root);

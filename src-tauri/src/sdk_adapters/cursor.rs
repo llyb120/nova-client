@@ -38,7 +38,12 @@ impl SdkAdapter for CursorAdapter {
                 ("NOVA_CONTEXT_MODE", settings.cursor_context_mode.clone()),
                 (
                     "NOVA_FAST_CONTEXT",
-                    if settings.fast_context_enabled { "1" } else { "0" }.into(),
+                    if settings.fast_context_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
                 ),
             ],
         }

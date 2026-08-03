@@ -1436,7 +1436,11 @@ mod tests {
         };
         let mut revision = 42;
         let mut force_full = false;
-        assert!(apply_device_revision(&response, &mut revision, &mut force_full));
+        assert!(apply_device_revision(
+            &response,
+            &mut revision,
+            &mut force_full
+        ));
         assert_eq!(revision, 0);
         assert!(force_full);
 
@@ -1447,7 +1451,11 @@ mod tests {
         };
         let mut revision = 42;
         let mut force_full = false;
-        assert!(!apply_device_revision(&stale, &mut revision, &mut force_full));
+        assert!(!apply_device_revision(
+            &stale,
+            &mut revision,
+            &mut force_full
+        ));
         assert_eq!(revision, 42);
         assert!(!force_full);
     }
@@ -1638,7 +1646,10 @@ async fn execute_command(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis())
                             .unwrap_or(0),
-                        prompt_queue.get(&cmd.thread_id).map(|q| q.len()).unwrap_or(0)
+                        prompt_queue
+                            .get(&cmd.thread_id)
+                            .map(|q| q.len())
+                            .unwrap_or(0)
                     )
                 } else {
                     cmd.queue_id.clone()
@@ -1662,13 +1673,14 @@ async fn execute_command(
                         data: Some(json!({ "queued": true, "queueId": queue_id })),
                     };
                 }
-                prompt_queue.entry(cmd.thread_id.clone()).or_default().push(
-                    QueuedRemotePrompt {
+                prompt_queue
+                    .entry(cmd.thread_id.clone())
+                    .or_default()
+                    .push(QueuedRemotePrompt {
                         id: queue_id.clone(),
                         text: cmd.text.clone(),
                         images: cmd.images.clone(),
-                    },
-                );
+                    });
                 CommandResult {
                     id: cmd.id,
                     ok: true,
@@ -2280,10 +2292,7 @@ fn dispatch_next_queued_prompt(
     else {
         return false;
     };
-    if prompt_queue
-        .get(thread_id)
-        .map_or(true, |q| q.is_empty())
-    {
+    if prompt_queue.get(thread_id).map_or(true, |q| q.is_empty()) {
         prompt_queue.remove(thread_id);
     }
     match send_prompt(app, thread_id, &next.text, next.images.clone()) {
@@ -2301,7 +2310,10 @@ fn dispatch_next_queued_prompt(
                 .or_default()
                 .insert(0, next);
             // 避免投递失败时每拍狂重试。
-            command_watch.insert(thread_id.to_string(), Instant::now() + Duration::from_secs(2));
+            command_watch.insert(
+                thread_id.to_string(),
+                Instant::now() + Duration::from_secs(2),
+            );
             false
         }
     }

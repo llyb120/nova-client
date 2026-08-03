@@ -183,9 +183,9 @@ fn strip_duplicate_raw_output(value: Value, display: &str) -> Option<Value> {
         }
         Value::Object(mut object) => {
             let text_block = object.get("text").and_then(Value::as_str).is_some()
-                && object.keys().all(|key| {
-                    matches!(key.as_str(), "type" | "text" | "mimeType" | "mime_type")
-                });
+                && object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "text" | "mimeType" | "mime_type"));
             if text_block && same_output_text(&Value::Object(object.clone()), display) {
                 return None;
             }
@@ -1178,10 +1178,12 @@ impl ThreadStore {
                     return None;
                 }
                 fs::read_to_string(&path).ok().and_then(|text| {
-                    serde_json::from_str::<Thread>(&text).ok().map(|mut thread| {
-                        deduplicate_thread_outputs(&mut thread);
-                        thread
-                    })
+                    serde_json::from_str::<Thread>(&text)
+                        .ok()
+                        .map(|mut thread| {
+                            deduplicate_thread_outputs(&mut thread);
+                            thread
+                        })
                 })
             })
             .collect();
