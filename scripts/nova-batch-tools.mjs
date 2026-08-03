@@ -1,79 +1,13 @@
-import { createReadStream } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { createInterface } from "node:readline";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
 import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
-import { formatReadFilesXml, readFilesPerFileBudget } from "./read-files-output.mjs";
-
-const DEFAULT_BATCH_READ_LINES = 2000;
-/** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
-const READ_FILES_MAX_BYTES = 32 * 1024;
 
 function resolveInputPath(root, input) {
   return resolve(root, input);
 }
-
-async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES, maxBytes = READ_FILES_MAX_BYTES) {
-  const input = createReadStream(path, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  const content = [];
-  let lineNumber = 0;
-  let hasMore = false;
-  let stopReason = "eof";
-  let lineBytes;
-  let byteCount = 0;
-  try {
-    for await (const line of lines) {
-      lineNumber += 1;
-      if (lineNumber < offset) continue;
-      if (content.length === limit) {
-        hasMore = true;
-        stopReason = "lineLimit";
-        break;
-      }
-      const separatorBytes = content.length > 0 ? 1 : 0;
-      const currentLineBytes = Buffer.byteLength(line, "utf8");
-      if (byteCount + separatorBytes + currentLineBytes > maxBytes) {
-        hasMore = true;
-        stopReason = content.length === 0 ? "longLine" : "byteBudget";
-        if (content.length === 0) lineBytes = currentLineBytes;
-        break;
-      }
-      content.push(line);
-      byteCount += separatorBytes + currentLineBytes;
-    }
-  } finally {
-    lines.close();
-    input.destroy();
-  }
-  return {
-    content: content.join("\n"), startLine: offset,
-    ...(content.length ? { endLine: offset + content.length - 1 } : {}),
-    linesRead: content.length, bytesRead: byteCount, maxContentBytes: maxBytes,
-    hasMore, rangeComplete: !["byteBudget", "longLine"].includes(stopReason), stopReason,
-    ...(hasMore ? { nextOffset: offset + content.length } : {}),
-    ...(lineBytes === undefined ? {} : { lineBytes }),
-  };
-}
-
-const PATH_OR_RANGE_SCHEMA = {
-  anyOf: [
-    { type: "string" },
-    {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        offset: { type: "integer", minimum: 1 },
-        limit: { type: "integer", minimum: 1, maximum: 2000 },
-      },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  ],
-};
 
 function fastContextEnabled(options = {}) {
   if (typeof options.fastContext === "boolean") return options.fastContext;
@@ -115,6 +49,7 @@ export function normalizeFindSymbolsArgs(params = {}) {
 
 /**
  * Shared Nova batch FS / context tools for Cursor customTools and Devin ACP MCP.
+ * read_files is intentionally omitted; use host native read.
  * @param {string} cwd
  * @param {{ readOnly?: boolean, fastContext?: boolean, includeEditFiles?: boolean }} [options]
  */
@@ -125,48 +60,7 @@ export function createNovaBatchTools(cwd, options = {}) {
   const root = resolve(cwd);
 
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
-  const tools = {
-    read_files: {
-      description: `远程 MCP 端点，只能通过 Devin 顶层 mcp_call_tool 调用。返回 XML；整次正文池约 48KB，按文件数分配，只返回完整行。stop-reason=eof|lineLimit|byteBudget|longLine；next-offset 指向首条未返回行。has-more 不要求继续；byteBudget/longLine 后先缩小范围或定位，禁止机械翻页。默认每文件前 ${DEFAULT_BATCH_READ_LINES} 行。`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          paths: {
-            type: "array",
-            minItems: 1,
-            items: PATH_OR_RANGE_SCHEMA,
-            description: "首选参数：文件路径或带 offset/limit 的读取范围",
-          },
-          files: {
-            type: "array",
-            minItems: 1,
-            items: PATH_OR_RANGE_SCHEMA,
-            description: "兼容别名；语义与 paths 完全相同",
-          },
-        },
-        anyOf: [{ required: ["paths"] }, { required: ["files"] }],
-        additionalProperties: false,
-      },
-      async execute(params = {}) {
-        const requested = Array.isArray(params.paths) ? params.paths : params.files;
-        const list = Array.isArray(requested) ? requested : [];
-        if (!list.length) throw new Error("read_files 需要非空 paths（也兼容 files）");
-        const maxBytes = readFilesPerFileBudget(list.length);
-        const results = await callNapiToolOrFallback("read_files", root, { paths: list }, async () =>
-          Promise.all(list.map(async (input) => {
-            const request = typeof input === "string" ? { path: input } : (input ?? {});
-            const requestPath = String(request.path ?? "");
-            try {
-              const path = resolveInputPath(root, requestPath);
-              return { path: requestPath, ...await readTextLines(path, request.offset, request.limit, maxBytes) };
-            } catch (error) {
-              return { path: requestPath, error: error instanceof Error ? error.message : String(error) };
-            }
-          })));
-        return formatReadFilesXml(results);
-      },
-    },
-  };
+  const tools = {};
 
   if (fastContext) {
     tools.fast_context = {
@@ -312,24 +206,30 @@ export function novaDevinBatchToolPolicy(options = {}) {
   const readOnly = readOnlyEnabled(options);
   const fastContext = fastContextEnabled(options);
   const includeEditFiles = options.includeEditFiles !== false && !readOnly;
-  const toolNames = ["read_files"];
+  const toolNames = [];
   if (fastContext) toolNames.push("fast_context", "find_symbols");
   if (includeEditFiles) toolNames.push("edit_files");
   const example = fastContext
     ? '{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}'
-    : '{"server_name":"nova-tools","tool_name":"read_files","arguments":{"paths":["src/example.ts"]}}';
+    : includeEditFiles
+      ? '{"server_name":"nova-tools","tool_name":"edit_files","arguments":{"files":[{"path":"src/example.ts","edits":[{"oldText":"a","newText":"b"}]}]}}'
+      : '{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}';
+  const novaToolsPhrase = toolNames.length
+    ? `You have Nova MCP endpoints from server nova-tools (${toolNames.join(", ")}) plus Devin built-in tools. In this Devin version, ${toolNames.join(", ")} are remote MCP tool names, NOT top-level callable Devin tools.`
+    : "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools.";
+  const callExampleName = fastContext ? "fast_context" : includeEditFiles ? "edit_files" : "fast_context";
   const lines = [
-    `ROUTING RULE — before choosing any tool: Nova endpoints must NEVER be selected as direct tool calls. Select Devin's top-level mcp_call_tool first, then pass server_name="nova-tools" and the endpoint name in tool_name. You have Nova MCP endpoints from server nova-tools (${toolNames.join(", ")}) plus Devin built-in tools. In this Devin version, ${toolNames.join(", ")} are remote MCP tool names, NOT top-level callable Devin tools. Never select or invoke any of those names directly, even after mcp_list_tools lists them; a direct invocation produces \`Unknown tool ... This tool is not available.\` Your only valid execution path for a Nova tool is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string "nova-tools" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: ${example}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as \`use/call read_files\` means \`call mcp_call_tool with server_name nova-tools and tool_name read_files\`; it never authorizes a direct tool call. If a direct call reports \`Unknown tool\`, retry once through mcp_call_tool. If parsing reports missing field \`server_name\`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints.`,
-    "Before each read phase, inventory known targets: if there is only one target, use Devin's native read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call native read repeatedly, and do not use parallel wrappers of multiple native reads instead of read_files. Wanting to understand files in order is not a read dependency. Use native read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. When the exact target range is unknown, omit limit so read_files uses its 2000-line default; never invent arbitrary 100/200-line pages. Use a smaller limit only for a known exact range. read_files returns XML and only complete lines. has-more only means the file continues. For stop-reason byteBudget/longLine, next-offset identifies the first unread line; narrow or locate the target instead of mechanically paging. Continue only when the task explicitly needs contiguous text. "
+    `ROUTING RULE — before choosing any tool: Nova endpoints must NEVER be selected as direct tool calls. Select Devin's top-level mcp_call_tool first, then pass server_name="nova-tools" and the endpoint name in tool_name. ${novaToolsPhrase} Never select or invoke any of those names directly, even after mcp_list_tools lists them; a direct invocation produces \`Unknown tool ... This tool is not available.\` Your only valid execution path for a Nova tool is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string "nova-tools" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: ${example}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as \`use/call ${callExampleName}\` means \`call mcp_call_tool with server_name nova-tools and tool_name ${callExampleName}\`; it never authorizes a direct tool call. If a direct call reports \`Unknown tool\`, retry once through mcp_call_tool. If parsing reports missing field \`server_name\`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints.`,
+    "Prefer minimal reads via Devin native read: when line ranges are known, read only those segments; expand nearby context only as needed. "
       + (fastContext
-        ? "Use fast_context/find_symbols to understand a large file's structure. When location is unknown, you must call only fast_context (or find_symbols if you only need line numbers); then read only coverage gaps / next_reads. "
+        ? "When location is unknown, you must call only fast_context (or find_symbols if you only need line numbers); then read only coverage gaps / next_reads with native read. "
         : "When location is unknown, search first (see below), then read near hits. ")
       + "Do not dump large files blindly."
       + (includeEditFiles
         ? " When modifying two or more independent existing files, you must use edit_files; merge multiple edits for the same file into that file's edits array. Single-file edits may use Devin native edit tools."
         : " For edits, use Devin native edit tools; do not expect a Nova edit_files tool in this mode."),
     (fastContext
-      ? "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only fast_context (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`) or find_symbols (locations only). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with one read_files. After fast_context/find_symbols, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside fast_context. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that fast_context did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
+      ? "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only fast_context (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`) or find_symbols (locations only). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with Devin native read. After fast_context/find_symbols, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside fast_context. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that fast_context did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
       : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
       + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];

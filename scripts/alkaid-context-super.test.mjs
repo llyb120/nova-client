@@ -587,20 +587,13 @@ test("text decoding handles PowerShell UTF-16 output", () => {
   assert.equal(decodeTextBuffer(Buffer.from(text, "utf16le")), text);
 });
 
-test("batch file tools remain available as Alkaid enhancements", async () => {
+test("batch edit_files remains available as Alkaid enhancement", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-"));
   await Promise.all([writeFile(join(cwd, "a.txt"), "A"), writeFile(join(cwd, "b.txt"), "B")]);
   const editTool = createCodingTools(cwd).find((tool) => tool.name === "edit");
-  const [readFiles, editFiles] = createFilesystemTools(cwd, editTool);
-  const read = await readFiles.execute("1", { paths: ["a.txt", "b.txt"] });
-  assert.match(read.content[0].text, /<file path="a.txt"/);
-  assert.match(read.content[0].text, /<!\[CDATA\[A\]\]>/);
-  assert.match(read.content[0].text, /<!\[CDATA\[B\]\]>/);
-  const utf16Path = join(cwd, "powershell.diff");
-  const utf16Text = "diff --git a/a.txt b/a.txt\r\n你好";
-  await writeFile(utf16Path, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(utf16Text, "utf16le")]));
-  const utf16Read = (await readFiles.execute("utf16", { paths: ["powershell.diff"] })).content[0].text;
-  assert.match(utf16Read, /<!\[CDATA\[diff --git a\/a.txt b\/a.txt\n你好\]\]>/);
+  const tools = createFilesystemTools(cwd, editTool);
+  assert.equal(tools.some((tool) => tool.name === "read_files"), false);
+  const editFiles = tools.find((tool) => tool.name === "edit_files");
   await editFiles.execute("2", { files: [
     { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] },
     { path: "b.txt", edits: [{ oldText: "B", newText: "BB" }] },
@@ -655,7 +648,7 @@ test("batch smart edits validate every file before writing", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-smart-transaction-"));
   await Promise.all([writeFile(join(cwd, "a.txt"), "alpha"), writeFile(join(cwd, "b.txt"), "beta")]);
   const editTool = createCodingTools(cwd).find((tool) => tool.name === "edit");
-  const [, editFiles] = createFilesystemTools(cwd, editTool);
+  const editFiles = createFilesystemTools(cwd, editTool).find((tool) => tool.name === "edit_files");
   await assert.rejects(() => editFiles.execute("1", { files: [
     { path: "a.txt", edits: [{ oldText: "alpha", newText: "changed" }] },
     { path: "b.txt", edits: [{ oldText: "missing", newText: "changed" }] },
@@ -663,21 +656,7 @@ test("batch smart edits validate every file before writing", async () => {
   assert.deepEqual(await Promise.all([readFile(join(cwd, "a.txt"), "utf8"), readFile(join(cwd, "b.txt"), "utf8")]), ["alpha", "beta"]);
 });
 
-test("batch reads stream large files in pages", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-page-"));
-  await writeFile(join(cwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
-  const [readFiles] = createFilesystemTools(cwd);
-  const first = (await readFiles.execute("1", { paths: [{ path: "large.txt", limit: 200 }] })).content[0].text;
-  assert.match(first, /end-line="200" lines-read="200"/);
-  assert.match(first, /next-offset="201" range-complete="true" stop-reason="lineLimit"/);
-  const second = (await readFiles.execute("2", {
-    paths: [{ path: "large.txt", offset: 201, limit: 20 }],
-  })).content[0].text;
-  assert.match(second, /start-line="201" end-line="220" lines-read="20"/);
-  assert.match(second, /<!\[CDATA\[line-201/);
-});
-
-test("batch file tools allow absolute paths outside the workspace", async () => {
+test("batch edit_files allow absolute paths outside the workspace", async () => {
   const parent = await mkdtemp(join(tmpdir(), "alkaid-paths-"));
   const cwd = join(parent, "workspace");
   await mkdir(cwd);
@@ -688,9 +667,8 @@ test("batch file tools allow absolute paths outside the workspace", async () => 
   const codingTools = createCodingTools(cwd);
   const nativeRead = codingTools.find((tool) => tool.name === "read");
   const editTool = codingTools.find((tool) => tool.name === "edit");
-  const [readFiles, editFiles] = createFilesystemTools(cwd, editTool);
+  const editFiles = createFilesystemTools(cwd, editTool).find((tool) => tool.name === "edit_files");
   assert.match((await nativeRead.execute("1", { path: outside })).content[0].text, /outside/);
-  assert.match((await readFiles.execute("2", { paths: [outside] })).content[0].text, /<!\[CDATA\[outside\]\]>/);
   const absoluteInside = join(cwd, "x.txt");
   await editFiles.execute("3", { files: [
     { path: absoluteInside, edits: [{ oldText: "x", newText: "inside" }] },
@@ -711,6 +689,7 @@ test("batch file tools allow absolute paths outside the workspace", async () => 
     { path: absoluteInside, edits: [{ oldText: "beta\nGAMMA", newText: "second" }] },
   ] }), /overlap/);
 });
+
 
 test("skills are discovered via pi loadSkillsFromDir", async () => {
   const root = await mkdtemp(join(tmpdir(), "nova-skills-test-"));
@@ -803,8 +782,10 @@ test("system prompt keeps stable Alkaid policy before dynamic cwd/skills", () =>
   assert.ok(cwdIndex > separatorIndex);
   assert.doesNotMatch(prompt, /smart caveman/);
   assert.doesNotMatch(prompt, /默认 full：去冠词/);
-  assert.match(prompt, /必须在一次 read_files 调用中合并读取/);
-  assert.match(prompt, /禁止连续调用多个 read/);
+  assert.doesNotMatch(prompt, /不要使用 read_files/);
+  assert.match(prompt, /读取内容遵循最小必要原则/);
+  assert.match(prompt, /已知多个独立路径时，同轮并行发多个 read/);
+  assert.doesNotMatch(prompt, /必须在一次 read_files 调用中合并读取/);
 });
 
 test("openai prompt_cache_key fallback clamps session ids", () => {
@@ -854,18 +835,6 @@ test("clampOpenAIPayloadToolOutputs trims Responses and Completions tool outputs
   assert.equal(clampOpenAIPayloadToolOutputs({ input: [{ type: "function_call_output", output: "ok" }] }), undefined);
 });
 
-test("batch reads truncate oversized lines by byte budget", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-bytes-"));
-  const hugeLine = "z".repeat(80 * 1024);
-  await writeFile(join(cwd, "wide.txt"), `${hugeLine}\nline-2`);
-  const [readFiles] = createFilesystemTools(cwd);
-  const first = (await readFiles.execute("1", { paths: ["wide.txt"] })).content[0].text;
-  assert.match(first, /lines-read="0" bytes-read="0"/);
-  assert.match(first, /next-offset="1" range-complete="false" stop-reason="longLine"/);
-  assert.match(first, /line-bytes="\d+"/);
-  assert.ok(Buffer.byteLength(first, "utf8") < 64 * 1024);
-});
-
 test("compat defaults enable session affinity for openai-compatible proxies", () => {
   const compat = mergeAlkaidCompatDefaults(
     "openai-completions",
@@ -902,7 +871,12 @@ test("plan mode exposes no write tool", async () => {
   const runtime = await createAlkaidAgent({ cwd, readOnly: true, model: configuredModel });
   try {
     assert.equal(runtime.agent.state.thinkingLevel, "off");
-    assert.deepEqual(runtime.agent.state.tools.slice(0, 5).map((tool) => tool.name), ["read_files", "read", "grep", "find", "ls"]);
+    const planNames = runtime.agent.state.tools.map((tool) => tool.name);
+    assert.equal(planNames.includes("read_files"), false);
+    assert.ok(planNames.includes("read"));
+    assert.ok(planNames.includes("grep"));
+    assert.ok(planNames.includes("find"));
+    assert.ok(planNames.includes("ls"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "edit_files"));
   } finally {
     await runtime.close();
@@ -962,26 +936,23 @@ test("build mode confirms and uses the detected Bash shell", async () => {
   try {
     assert.equal(runtime.agent.steeringMode, "all");
     const toolNames = runtime.agent.state.tools.map((tool) => tool.name);
-    assert.equal(toolNames[0], "read_files");
+    assert.equal(toolNames.includes("read_files"), false);
     assert(toolNames.includes("edit_files"));
     if (process.env.NOVA_FAST_CONTEXT !== "0") assert(toolNames.includes("fast_context"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "load_skill"));
     assert.match(runtime.agent.state.systemPrompt, /读取内容遵循最小必要原则.*已知目标行范围时，只读取相关行段/);
+    assert.doesNotMatch(runtime.agent.state.systemPrompt, /不要使用 read_files/);
+    assert.match(runtime.agent.state.systemPrompt, /已知多个独立路径时，同轮并行发多个 read/);
     if (process.env.NOVA_FAST_CONTEXT !== "0") {
       assert.match(runtime.agent.state.systemPrompt, /未知修改分布且需要完整编辑上下文时，调用一次 fast_context/);
     } else {
       assert.doesNotMatch(runtime.agent.state.systemPrompt, /fast_context/);
     }
-    assert.match(runtime.agent.state.systemPrompt, /两个及以上路径已知.*必须在一次 read_files 调用中合并读取/);
-    assert.match(runtime.agent.state.systemPrompt, /禁止连续调用多个 read/);
-    assert.match(runtime.agent.state.systemPrompt, /禁止用并行封装的多个 read 代替 read_files/);
-    assert.match(runtime.agent.state.systemPrompt, /按顺序理解文件不构成读取依赖/);
-    assert.match(runtime.agent.state.systemPrompt, /后续新发现多个独立文本目标.*仍须合并使用 read_files/);
-    assert.match(runtime.agent.state.systemPrompt, /为每个文件分别设置必要的 offset\/limit/);
+    assert.doesNotMatch(runtime.agent.state.systemPrompt, /必须在一次 read_files 调用中合并读取/);
     assert.match(runtime.agent.state.systemPrompt, /禁止使用 `grep -r` 或 `grep -R`.*无排除的递归搜索/);
     if (process.env.NOVA_FAST_CONTEXT !== "0") {
-      assert.match(runtime.agent.state.systemPrompt, /路径和行段已明确时直接 read\/read_files.*未知修改分布.*调用一次 fast_context/);
+      assert.match(runtime.agent.state.systemPrompt, /路径和行段已明确时直接 read，不要先调用 fast_context/);
       assert.match(runtime.agent.state.systemPrompt, /内部批量 rg 与增量符号索引/);
       assert.match(runtime.agent.state.systemPrompt, /兜底搜索默认遵守 `\.gitignore`/);
     } else {

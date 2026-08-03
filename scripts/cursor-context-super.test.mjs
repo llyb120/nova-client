@@ -635,7 +635,8 @@ try {
   await rm(cursorDir, { recursive: true, force: true });
 }
 
-assert.match(cursorBatchToolPolicy(), /read_files/);
+assert.doesNotMatch(cursorBatchToolPolicy(), /You have Nova batch tool read_files/);
+assert.doesNotMatch(cursorBatchToolPolicy(), /Do not use read_files even if it appears/);
 assert.doesNotMatch(cursorBatchToolPolicy(), /must use edit_files/);
 assert.match(cursorBatchToolPolicy(), /Write\/Edit\/StrReplace/);
 if (process.env.NOVA_FAST_CONTEXT !== "0") {
@@ -649,16 +650,17 @@ assert.doesNotMatch(cursorBatchToolPolicy(), /Cursor Grep is also allowed/);
 assert.doesNotMatch(cursorBatchToolPolicy(), /you must search untracked files/);
 assert.doesNotMatch(cursorBatchToolPolicy({ readOnly: true }), /Write\/Edit/);
 assert.match(cursorBatchToolPolicy({ readOnly: true }), /plan\/read-only/);
-assert.match(cursorPromptPrefix(), /read_files/);
+assert.doesNotMatch(cursorPromptPrefix(), /You have Nova batch tool read_files/);
+assert.doesNotMatch(cursorPromptPrefix(), /Do not use read_files even if it appears/);
 assert.doesNotMatch(cursorPromptPrefix(), /smart caveman/);
 assert.match(cursorPromptPrefix({ readOnly: true }), /plan\/read-only/);
 assert.doesNotMatch(cursorPromptPrefix({ readOnly: true }), /Write\/Edit\/StrReplace/);
 const policyMessage = messageWithToolPolicy("Add animation", { readOnly: false });
-assert.match(policyMessage, /read_files/);
+assert.doesNotMatch(policyMessage, /Do not use read_files even if it appears/);
 assert.doesNotMatch(policyMessage, /smart caveman/);
 assert.match(policyMessage, /Add animation$/);
 const slimWithPolicy = messageWithToolPolicy(messageWithSlimMemory("Continue", slim), { readOnly: false });
-assert.match(slimWithPolicy, /read_files/);
+assert.doesNotMatch(slimWithPolicy, /Do not use read_files even if it appears/);
 assert.doesNotMatch(slimWithPolicy, /smart caveman/);
 assert.match(slimWithPolicy, /Changed the lighting/);
 assert.match(slimWithPolicy, /Current request:\nContinue$/);
@@ -678,32 +680,16 @@ assert.deepEqual(editFilesItem.changes, [{ path: "a.ts", kind: "update" }]);
 
 const batchCwd = await mkdtemp(join(tmpdir(), "nova-cursor-batch-"));
 try {
-  await Promise.all([
-    writeFile(join(batchCwd, "a.txt"), "A\nconst quoted = \"x\";"),
-    writeFile(join(batchCwd, "b.txt"), "B\npath = C:\\tmp"),
-  ]);
   const agentTools = createCursorFilesystemTools(batchCwd);
-  assert.equal(typeof agentTools.read_files.execute, "function");
+  assert.equal(agentTools.read_files, undefined);
   assert.equal(agentTools.edit_files, undefined);
+  if (process.env.NOVA_FAST_CONTEXT !== "0") {
+    assert.equal(typeof agentTools.fast_context.execute, "function");
+    assert.equal(typeof agentTools.find_symbols.execute, "function");
+  }
   const readOnlyTools = createCursorFilesystemTools(batchCwd, { readOnly: true });
   assert.equal(readOnlyTools.edit_files, undefined);
-  const read = await agentTools.read_files.execute({ paths: ["a.txt", "b.txt"] });
-  assert.match(read, /<file path="a.txt"/);
-  assert.match(read, /<!\[CDATA\[A\nconst quoted = "x";\]\]>/);
-  assert.match(read, /<!\[CDATA\[B\npath = C:\\tmp\]\]>/);
-
-  await writeFile(join(batchCwd, "large.txt"), Array.from({ length: 250 }, (_, index) => `line-${index + 1}`).join("\n"));
-  const first = await agentTools.read_files.execute({ paths: [{ path: "large.txt", limit: 200 }] });
-  assert.match(first, /end-line="200" lines-read="200"/);
-  assert.match(first, /next-offset="201" range-complete="true" stop-reason="lineLimit"/);
-  const parent = await mkdtemp(join(tmpdir(), "nova-cursor-paths-"));
-  const workspace = join(parent, "workspace");
-  await mkdir(workspace);
-  const outside = join(parent, "outside.txt");
-  await writeFile(outside, "outside");
-  const pathTools = createCursorFilesystemTools(workspace);
-  assert.match(await pathTools.read_files.execute({ paths: [outside] }), /<!\[CDATA\[outside\]\]>/);
-  await rm(parent, { recursive: true, force: true });
+  assert.equal(readOnlyTools.read_files, undefined);
 } finally {
   await rm(batchCwd, { recursive: true, force: true });
 }

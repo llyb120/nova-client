@@ -1357,7 +1357,7 @@ export async function findSymbols({ names } = {}, root = repoRoot()) {
 // ---------------------------------------------------------------- 工具 schema
 
 export const FAST_CONTEXT_DESCRIPTION =
-  '未知修改分布时调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单。输出无 partial；已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读。路径和行段已知时直接 read/read_files，不要调用本工具。';
+  '未知修改分布时调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单。输出无 partial；已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读。路径和行段已知时直接 read，不要调用本工具。';
 
 export const TOOLS = [
   {

@@ -1,6 +1,6 @@
 /**
  * Nova batch tools MCP stdio server for Devin ACP (session/new mcpServers).
- * Tools: read_files, optional fast_context/find_symbols, optional edit_files.
+ * Tools: optional fast_context/find_symbols, optional edit_files.
  *
  * Env:
  *   NOVA_FAST_CONTEXT=0     — omit fast_context / find_symbols

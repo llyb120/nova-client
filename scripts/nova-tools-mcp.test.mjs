@@ -10,14 +10,14 @@ import {
   novaDevinBatchToolPolicy,
 } from "./nova-batch-tools.mjs";
 
-test("createNovaBatchTools exposes read/context/edit by default", () => {
+test("createNovaBatchTools exposes context/edit by default", () => {
   const prev = process.env.NOVA_FAST_CONTEXT;
   const prevRo = process.env.NOVA_TOOLS_READ_ONLY;
   delete process.env.NOVA_FAST_CONTEXT;
   delete process.env.NOVA_TOOLS_READ_ONLY;
   try {
     const tools = createNovaBatchTools(process.cwd(), { includeEditFiles: true });
-    assert.equal(typeof tools.read_files.execute, "function");
+    assert.equal(tools.read_files, undefined);
     assert.equal(typeof tools.fast_context.execute, "function");
     assert.equal(typeof tools.find_symbols.execute, "function");
     assert.equal(typeof tools.edit_files.execute, "function");
@@ -36,7 +36,7 @@ test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
     const tools = createNovaBatchTools(process.cwd(), { includeEditFiles: true });
     assert.equal(tools.fast_context, undefined);
     assert.equal(tools.find_symbols, undefined);
-    assert.equal(typeof tools.read_files.execute, "function");
+    assert.equal(tools.read_files, undefined);
     assert.equal(typeof tools.edit_files.execute, "function");
   } finally {
     if (prev === undefined) delete process.env.NOVA_FAST_CONTEXT;
@@ -64,21 +64,12 @@ test("context tool schemas accept common model argument aliases", () => {
   assert.equal(tools.find_symbols.inputSchema.anyOf.length, 5);
 });
 
-test("read_files accepts paths and common files alias; edit_files round-trips", async () => {
+test("edit_files round-trips", async () => {
   const dir = mkdtempSync(join(tmpdir(), "nova-tools-"));
   try {
     writeFileSync(join(dir, "a.txt"), "hello\n");
-    writeFileSync(join(dir, "b.txt"), "world\n");
     const tools = createNovaBatchTools(dir, { fastContext: false, includeEditFiles: true });
-    assert.equal(tools.read_files.inputSchema.required, undefined);
-    assert.equal(tools.read_files.inputSchema.anyOf.length, 2);
-    const read = await tools.read_files.execute({ paths: ["a.txt", "b.txt"] });
-    assert.match(read, /<file path="a.txt"/);
-    assert.match(read, /<!\[CDATA\[hello\]\]>/);
-    assert.match(read, /<!\[CDATA\[world\]\]>/);
-    const aliased = await tools.read_files.execute({ files: [{ path: "a.txt", offset: 1, limit: 1 }] });
-    assert.match(aliased, /stop-reason="eof"/);
-    assert.match(aliased, /<!\[CDATA\[hello\]\]>/);
+    assert.equal(tools.read_files, undefined);
     await tools.edit_files.execute({
       files: [{ path: "a.txt", edits: [{ oldText: "hello", newText: "hola" }] }],
     });
@@ -94,7 +85,7 @@ test("devin policy only mentions enabled tools", () => {
   try {
     const policy = novaDevinBatchToolPolicy({ includeEditFiles: true });
     assert.match(policy, /nova-tools/);
-    assert.match(policy, /read_files/);
+    assert.doesNotMatch(policy, /Do not use read_files even if a stale Devin MCP listing still shows it/);
     assert.match(policy, /edit_files/);
     assert.match(policy, /fast_context/);
     assert.match(policy, /ROUTING RULE — before choosing any tool/);
@@ -103,16 +94,16 @@ test("devin policy only mentions enabled tools", () => {
     assert.match(policy, /generic mcp_call_tool wrapper/);
     assert.match(policy, /Set server_name to the top-level string "nova-tools"/);
     assert.match(policy, /"server_name":"nova-tools"/);
-    assert.match(policy, /wording such as `use\/call read_files`/);
+    assert.match(policy, /wording such as `use\/call fast_context`/);
     assert.match(policy, /do not call mcp_list_tools merely to discover them/);
     assert.match(policy, /Never repeat a malformed call unchanged/);
-    assert.match(policy, /never invent arbitrary 100\/200-line pages/);
-    assert.match(policy, /returns XML and only complete lines/);
-    assert.match(policy, /instead of mechanically paging/);
+    assert.doesNotMatch(policy, /never invent arbitrary 100\/200-line pages/);
+    assert.doesNotMatch(policy, /returns XML and only complete lines/);
 
     const disabledPolicy = novaDevinBatchToolPolicy({ fastContext: false, includeEditFiles: true });
     assert.doesNotMatch(disabledPolicy, /fast_context/);
     assert.doesNotMatch(disabledPolicy, /find_symbols/);
+    assert.doesNotMatch(disabledPolicy, /Do not use read_files even if a stale Devin MCP listing still shows it/);
   } finally {
     if (prev === undefined) delete process.env.NOVA_FAST_CONTEXT;
     else process.env.NOVA_FAST_CONTEXT = prev;

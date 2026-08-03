@@ -12,21 +12,15 @@ import { getShellConfig } from "../node_modules/@earendil-works/pi-coding-agent/
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
-import { createInterface } from "node:readline";
-import { Readable } from "node:stream";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
-import { formatReadFilesXml, readFilesPerFileBudget, READ_FILES_OUTPUT_MAX_BYTES } from "./read-files-output.mjs";
 
-const DEFAULT_BATCH_READ_LINES = 2000;
-/** Match pi coding tools: keep read_files outputs usable without blowing the context window. */
-const READ_FILES_MAX_BYTES = 32 * 1024;
 /** Reasonix-style per-tool context budget. Full oversized text is archived before truncation. */
 export const TOOL_OUTPUT_CONTEXT_MAX_BYTES = 32 * 1024;
 /** fast_context has its own complete-unit budget (default 32KB, explicit max 64KB). */
@@ -456,105 +450,10 @@ export function decodeTextBuffer(buffer) {
     : content.toString(encoding);
 }
 
-async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES, maxBytes = READ_FILES_MAX_BYTES) {
-  let input;
-  const file = await open(path, "r");
-  try {
-    const sample = Buffer.alloc(512);
-    const { bytesRead } = await file.read(sample, 0, sample.length, 0);
-    const { encoding, bomBytes } = detectTextEncoding(sample.subarray(0, bytesRead));
-    if (encoding === "utf16be") {
-      input = createReadStreamFromText(decodeTextBuffer(await readFile(path)));
-    } else {
-      input = createReadStream(path, { encoding, start: bomBytes });
-    }
-  } finally {
-    await file.close();
-  }
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  const content = [];
-  let lineNumber = 0;
-  let hasMore = false;
-  let stopReason = "eof";
-  let lineBytes;
-  let byteCount = 0;
-  try {
-    for await (const line of lines) {
-      lineNumber += 1;
-      if (lineNumber < offset) continue;
-      if (content.length === limit) {
-        hasMore = true;
-        stopReason = "lineLimit";
-        break;
-      }
-      const separatorBytes = content.length > 0 ? 1 : 0;
-      const currentLineBytes = Buffer.byteLength(line, "utf8");
-      if (byteCount + separatorBytes + currentLineBytes > maxBytes) {
-        hasMore = true;
-        stopReason = content.length === 0 ? "longLine" : "byteBudget";
-        if (content.length === 0) lineBytes = currentLineBytes;
-        break;
-      }
-      content.push(line);
-      byteCount += separatorBytes + currentLineBytes;
-    }
-  } finally {
-    lines.close();
-    input.destroy();
-  }
-  return {
-    content: content.join("\n"),
-    startLine: offset,
-    ...(content.length ? { endLine: offset + content.length - 1 } : {}),
-    linesRead: content.length,
-    bytesRead: byteCount,
-    maxContentBytes: maxBytes,
-    hasMore,
-    rangeComplete: stopReason !== "byteBudget" && stopReason !== "longLine",
-    stopReason,
-    ...(hasMore ? { nextOffset: offset + content.length } : {}),
-    ...(lineBytes === undefined ? {} : { lineBytes }),
-  };
-}
-
-function createReadStreamFromText(text) {
-  return Readable.from([text]);
-}
-
 export function createFilesystemTools(cwd, editTool = null, opts = {}) {
   const fastContext = opts.fastContext !== false && process.env.NOVA_FAST_CONTEXT !== "0";
   const root = resolve(cwd);
-  const tools = [
-    {
-      name: "read_files",
-      description: `并行读取多个 UTF-8 文本文件；模型输出为 XML。整次正文池约 48KB，按文件数分配；只返回完整行。stop-reason=eof|lineLimit|byteBudget|longLine；next-offset 永远指向首条未返回行。has-more 不要求继续读取；遇到 byteBudget/longLine 应先缩小范围或用 fast_context/find_symbols 定位，禁止机械翻完整文件。默认每文件前 ${DEFAULT_BATCH_READ_LINES} 行；已知范围才设置较小 limit。`,
-      parameters: Type.Object({
-        paths: Type.Array(Type.Union([
-          Type.String(),
-          Type.Object({
-            path: Type.String(),
-            offset: Type.Optional(Type.Integer({ minimum: 1 })),
-            limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000 })),
-          }),
-        ]), { minItems: 1 }),
-      }),
-      async execute(_id, { paths }) {
-        const maxBytes = readFilesPerFileBudget(paths.length);
-        const results = await callNapiToolOrFallback("read_files", root, { paths }, () =>
-          Promise.all(paths.map(async (input) => {
-            const request = typeof input === "string" ? { path: input } : input;
-            try {
-              const path = resolveInputPath(root, request.path);
-              return { path: request.path, ...await readTextLines(path, request.offset, request.limit, maxBytes) };
-            } catch (error) {
-              return { path: request.path, error: error instanceof Error ? error.message : String(error) };
-            }
-          })),
-        );
-        return textResult(formatReadFilesXml(results), { count: results.length, format: "xml" });
-      },
-    },
-  ];
+  const tools = [];
   if (fastContext) tools.push(
     {
       name: "fast_context",
@@ -726,7 +625,6 @@ export function buildAlkaidSystemPrompt(options = {}) {
   const skills = options.skills ?? [];
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
   const toolLines = [
-    `- read_files: 并行读取多个 UTF-8 文本文件（可带 offset/limit）`,
     options.readOnly ? null : "- edit_files: 并行智能编辑多个互不依赖的已有文件（精确优先、锚点定位、歧义拒绝）",
     "- read: 读取单个文件",
     options.readOnly
@@ -742,13 +640,13 @@ export function buildAlkaidSystemPrompt(options = {}) {
   const stableParts = [
     "你是 Vega：高效、简单、面向软件工程结果。",
     `Available tools:\n${toolLines.join("\n")}`,
-      "你拥有批量增强 read_files、edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。每次准备读取前，先汇总当前已知目标：仅有一个目标时使用 read；同一读取阶段已有两个及以上路径已知、互不依赖的 UTF-8 文本目标时，必须在一次 read_files 调用中合并读取，并为每个文件分别设置必要的 offset/limit。禁止连续调用多个 read，也禁止用并行封装的多个 read 代替 read_files；想按顺序理解文件不构成读取依赖。只有后一个目标的路径或读取范围必须由前一次结果确定、目标不是 UTF-8 文本，或当前确实仅需一个文件时，才使用 read。后续新发现多个独立文本目标时，下一读取阶段仍须合并使用 read_files。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。未知精确目标范围时，read_files 必须省略 limit 以使用默认 2000 行，禁止随意选择 100/200 行小分页；仅已知精确目标范围时使用较小 limit。read_files 返回 XML；has-more 只表示文件仍有后文。stop-reason=byteBudget/longLine 时 next-offset 指向首条未返回行，应先缩小范围或定位，禁止机械分页；仅任务确需连续正文时续读。需要理解大文件整体结构时改用 fast_context/find_symbols。"
+      "你拥有批量增强 edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 fast_context/find_symbols。"
         + (fastContext
           ? "未知修改分布且需要完整编辑上下文时，调用一次 fast_context（只要定义/引用行号时用 find_symbols）；已展示范围禁止重读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
           : "未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；")
-        + "大文件禁止无目的全量读取。修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。仅在存在先后依赖或目标重叠时串行调用工具。",
+        + "大文件禁止无目的全量读取。修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。",
       (fastContext
-        ? "搜索与遍历必须成本有界。路径和行段已明确时直接 read/read_files，不要先调用 fast_context；未知修改分布且需要跨文件完整上下文时调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引），只要定义/引用位置时用 find_symbols。fast_context 已展示范围禁止重读；SIG/IMPACT 仅在确需其函数体时精确补读。调用后禁止对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
+        ? "搜索与遍历必须成本有界。路径和行段已明确时直接 read，不要先调用 fast_context；未知修改分布且需要跨文件完整上下文时调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引），只要定义/引用位置时用 find_symbols。fast_context 已展示范围禁止重读；SIG/IMPACT 仅在确需其函数体时精确补读。调用后禁止对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
         : "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。")
         + "除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
@@ -902,9 +800,7 @@ export async function createAlkaidAgent(options = {}) {
         archiveDir,
         toolCallId,
         toolName: tool.name,
-        maxBytes: tool.name === "read_files"
-          ? READ_FILES_OUTPUT_MAX_BYTES
-          : tool.name === "fast_context" ? FAST_CONTEXT_OUTPUT_MAX_BYTES : undefined,
+        maxBytes: tool.name === "fast_context" ? FAST_CONTEXT_OUTPUT_MAX_BYTES : undefined,
       });
     },
   }));

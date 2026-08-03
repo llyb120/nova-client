@@ -1,81 +1,11 @@
-import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
-import { createInterface } from "node:readline";
 import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
-import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
-import { formatReadFilesXml, readFilesPerFileBudget } from "./read-files-output.mjs";
-
-const DEFAULT_BATCH_READ_LINES = 2000;
-/** Match Vega / pi coding tools: keep read_files outputs usable without blowing the context window. */
-const READ_FILES_MAX_BYTES = 32 * 1024;
-
-function resolveInputPath(root, input) {
-  return resolve(root, input);
-}
-
-async function readTextLines(path, offset = 1, limit = DEFAULT_BATCH_READ_LINES, maxBytes = READ_FILES_MAX_BYTES) {
-  const input = createReadStream(path, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  const content = [];
-  let lineNumber = 0;
-  let hasMore = false;
-  let stopReason = "eof";
-  let lineBytes;
-  let byteCount = 0;
-  try {
-    for await (const line of lines) {
-      lineNumber += 1;
-      if (lineNumber < offset) continue;
-      if (content.length === limit) {
-        hasMore = true;
-        stopReason = "lineLimit";
-        break;
-      }
-      const separatorBytes = content.length > 0 ? 1 : 0;
-      const currentLineBytes = Buffer.byteLength(line, "utf8");
-      if (byteCount + separatorBytes + currentLineBytes > maxBytes) {
-        hasMore = true;
-        stopReason = content.length === 0 ? "longLine" : "byteBudget";
-        if (content.length === 0) lineBytes = currentLineBytes;
-        break;
-      }
-      content.push(line);
-      byteCount += separatorBytes + currentLineBytes;
-    }
-  } finally {
-    lines.close();
-    input.destroy();
-  }
-  return {
-    content: content.join("\n"), startLine: offset,
-    ...(content.length ? { endLine: offset + content.length - 1 } : {}),
-    linesRead: content.length, bytesRead: byteCount, maxContentBytes: maxBytes,
-    hasMore, rangeComplete: !["byteBudget", "longLine"].includes(stopReason), stopReason,
-    ...(hasMore ? { nextOffset: offset + content.length } : {}),
-    ...(lineBytes === undefined ? {} : { lineBytes }),
-  };
-}
-
-const PATH_OR_RANGE_SCHEMA = {
-  anyOf: [
-    { type: "string" },
-    {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        offset: { type: "integer", minimum: 1 },
-        limit: { type: "integer", minimum: 1, maximum: 2000 },
-      },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  ],
-};
 
 /**
  * Vega-style batch FS tools for Cursor SDK `local.customTools`.
- * Exposes read_files plus code-context tools (fast_context, find_symbols).
+ * Exposes code-context tools (fast_context, find_symbols).
+ * read_files is intentionally omitted; use Cursor built-in Read.
  * edit_files is intentionally omitted because Cursor
  * CallMcpTool truncates/mangles large or heavily-escaped arguments.
  * Use Cursor built-in Write / StrReplace / Edit for mutations.
@@ -84,39 +14,8 @@ export function createCursorFilesystemTools(cwd, options = {}) {
   void options;
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
   const root = resolve(cwd);
+  if (!fastContext) return {};
   return {
-    read_files: {
-      description: `并行读取多个 UTF-8 文本文件；返回 XML。整次正文池约 48KB，按文件数分配，只返回完整行。stop-reason=eof|lineLimit|byteBudget|longLine；next-offset 指向首条未返回行。has-more 不要求继续；byteBudget/longLine 后先缩小范围或定位，禁止机械翻页。默认每文件前 ${DEFAULT_BATCH_READ_LINES} 行。`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          paths: {
-            type: "array",
-            minItems: 1,
-            items: PATH_OR_RANGE_SCHEMA,
-          },
-        },
-        required: ["paths"],
-        additionalProperties: false,
-      },
-      async execute({ paths }) {
-        const list = Array.isArray(paths) ? paths : [];
-        const maxBytes = readFilesPerFileBudget(list.length);
-        const results = await callNapiToolOrFallback("read_files", root, { paths: list }, async () =>
-          Promise.all(list.map(async (input) => {
-            const request = typeof input === "string" ? { path: input } : (input ?? {});
-            const requestPath = String(request.path ?? "");
-            try {
-              const path = resolveInputPath(root, requestPath);
-              return { path: requestPath, ...await readTextLines(path, request.offset, request.limit, maxBytes) };
-            } catch (error) {
-              return { path: requestPath, error: error instanceof Error ? error.message : String(error) };
-            }
-          })));
-        return formatReadFilesXml(results);
-      },
-    },
-    ...(fastContext ? {
     fast_context: {
       description: FAST_CONTEXT_DESCRIPTION,
       inputSchema: {
@@ -148,7 +47,6 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         return await callContextToolOrLocal("find_symbols", root, args, () => findSymbols(args, root));
       },
     },
-    } : {}),
   };
 }
 
@@ -160,21 +58,22 @@ export function cursorBatchToolPolicy(options = {}) {
   const readOnly = options.readOnly === true;
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
   const lines = [
-    "You have Nova batch tool read_files plus Cursor built-in Read, Shell, Grep"
+    "You have Cursor built-in Read, Shell, Grep"
+      + (fastContext ? " plus Nova tools fast_context and find_symbols" : "")
       + (readOnly ? "" : ", Write/Edit")
       + ". The following tool-selection rules are hard constraints.",
-      "Before each read phase, inventory known targets: if there is only one target, use Read; when two or more independent UTF-8 text paths are already known in the same read phase, you must merge them into one read_files call and set per-file offset/limit as needed. Do not call Read repeatedly, and do not use parallel wrappers of multiple Read calls instead of read_files. Wanting to understand files in order is not a read dependency. Use Read only when a later path/range depends on a prior result, the target is not UTF-8 text, or only one file is needed. When later independent text targets appear, the next read phase must again use read_files. Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. When the exact target range is unknown, omit limit so read_files uses its 2000-line default; never invent arbitrary 100/200-line pages. Use a smaller limit only for a known exact range. read_files returns XML and only complete lines. has-more only means the file continues. For stop-reason byteBudget/longLine, next-offset identifies the first unread line; narrow or locate the target instead of mechanically paging. Continue only when the task explicitly needs contiguous text; use fast_context/find_symbols for large-file structure. "
-        + (fastContext
-          ? "When edit distribution is unknown and you need complete cross-file context, call fast_context once (or find_symbols for definitions/references only). Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
-          : "When location is unknown, search first (see below), then read near hits. ")
-        + "Do not dump large files blindly."
-        + (readOnly
-          ? ""
-          : " For edits, use Cursor built-in Write/Edit/StrReplace; do not expect a Nova edit_files tool."),
-      (fastContext
-        ? "Search and traversal must be cost-bounded. If path and range are known, use Read/read_files directly. When edit distribution is unknown, call fast_context once: it returns complete EDIT/DEPS units plus IMPACT/SIG indexes using batched rg and an incremental symbol index; use find_symbols for locations only. Never re-read shown ranges. Read SIG/IMPACT bodies by exact path:line only when truly needed. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
-        : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
-        + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
+    "Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. "
+      + (fastContext
+        ? "When edit distribution is unknown and you need complete cross-file context, call fast_context once (or find_symbols for definitions/references only). Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
+        : "When location is unknown, search first (see below), then read near hits. ")
+      + "Do not dump large files blindly."
+      + (readOnly
+        ? ""
+        : " For edits, use Cursor built-in Write/Edit/StrReplace; do not expect a Nova edit_files tool."),
+    (fastContext
+      ? "Search and traversal must be cost-bounded. If path and range are known, use Read directly. When edit distribution is unknown, call fast_context once: it returns complete EDIT/DEPS units plus IMPACT/SIG indexes using batched rg and an incremental symbol index; use find_symbols for locations only. Never re-read shown ranges. Read SIG/IMPACT bodies by exact path:line only when truly needed. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
+      : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
+      + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];
   if (readOnly) {
     lines.push("Current mode is plan/read-only: analyze only; do not modify files.");
