@@ -794,9 +794,8 @@ export async function contextBundle(args = {}, root = repoRoot()) {
         }
       }
       const [picked] = remaining.splice(bestIndex, 1);
+      picked.obligation = picked.role === 'caller' ? behavior(picked) : picked.role === 'test' ? 'test' : null;
       const pickedFeatures = features(picked);
-      picked.behaviorNovel = picked.role !== 'caller'
-        || [...pickedFeatures.keys()].some((feature) => feature.startsWith('caller:') && !covered.has(feature));
       ordered.push(picked);
       for (const feature of pickedFeatures.keys()) covered.add(feature);
     }
@@ -917,37 +916,55 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     }
   }
 
+  // 行为覆盖只能在单元实际进入 plan 后提交。显式要求 caller/test 时，每个调用行为
+  // 类别/测试类别的首个可装入代表获得 required 预算和结构上限豁免。
+  const packedObligations = new Set();
+  const obligationRequested = (u) => (
+    (u.role === 'caller' && planIntent.callers)
+    || (u.role === 'test' && planIntent.tests)
+  );
   for (const u of units) {
-    if (u.role === 'caller' && !u.required && u.behaviorNovel === false) continue;
+    const obligation = u.obligation;
+    if (obligation && packedObligations.has(obligation)) continue;
     const src = srcs.get(u.file);
     if (!src) continue;
     const p = plan.get(u.file);
-    if (p?.full) continue;
-    if (plan.size >= fileLimit && !p) continue;
-    if ((p?.blocks.length ?? 0) >= unitsPerFile) continue;
-    if (u.hits.length && u.hits.every((ln) => covers(u.file, ln))) continue;
+    if (p?.full) {
+      if (obligation) packedObligations.add(obligation);
+      continue;
+    }
+    const requiredRepresentative = Boolean(obligation && obligationRequested(u));
+    const effectiveRequired = u.required || requiredRepresentative;
+    if (plan.size >= fileLimit && !p && !requiredRepresentative) continue;
+    if ((p?.blocks.length ?? 0) >= unitsPerFile && !requiredRepresentative) continue;
+    if (u.hits.length && u.hits.every((ln) => covers(u.file, ln))) {
+      if (obligation) packedObligations.add(obligation);
+      continue;
+    }
 
     // 小文件直接整给
     if (!p && src.total <= FULL_FILE_MAX && ((fileRank.get(u.file) ?? 9) < 3 || u.tag === 'def')) {
       const cost = costOf(u.file, [[1, src.total]]);
-      if (fitsBudget(cost, src.total)) {
+      if (fitsBudget(cost, src.total, effectiveRequired)) {
         planFile(u.file, 'edit').full = true;
         take(cost, src.total);
+        if (obligation) packedObligations.add(obligation);
         continue;
       }
     }
 
-    // 只给完整单元；放不进预算就降级到 SIG（仅真实符号），绝不截断代码
+    // 只给完整单元；失败不提交行为覆盖，允许后续同类较小候选补位。
     const ranges = [[u.ln, Math.min(u.end, src.total)]];
     const cost = costOf(u.file, ranges);
     const lines = countLines(ranges);
-    if (!fitsBudget(cost, lines, u.required)) {
+    if (!fitsBudget(cost, lines, effectiveRequired)) {
       if (u.unit) pushSig(u.file, u.ln, u.unit.sig);
       continue;
     }
     const outputTag = u.role === 'target' ? 'def' : u.role === 'related' ? u.tag : u.role;
-    planFile(u.file, 'edit').blocks.push({ ranges, label: u.label, tag: outputTag, score: u.score, required: u.required });
+    planFile(u.file, 'edit').blocks.push({ ranges, label: u.label, tag: outputTag, score: u.score, required: effectiveRequired });
     take(cost, lines);
+    if (obligation) packedObligations.add(obligation);
   }
 
   // ---- 依赖闭包（向下）：沿 import 映射精确解析，完整打包定义体
