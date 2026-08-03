@@ -17,6 +17,7 @@ const SOURCE_EXTENSIONS = new Set([
   ".lua", ".mjs", ".php", ".py", ".rb", ".rs", ".scala", ".swift", ".ts", ".tsx", ".vue",
 ]);
 const ANSI_ESCAPE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+const NON_PRODUCTION_SOURCE = /(?:^|\/)(?:docs?|examples?|fixtures?)\/|(?:^|\/)readme(?:\.|$)|\.(?:test|spec|eval|bench)\.[^.]+$|\/(?:__tests__|tests?|benches?)\//i;
 
 function argument(name, fallback = "") {
   const prefix = `${name}=`;
@@ -53,6 +54,7 @@ async function trackedSourceSnapshot(repositoryRoot) {
 async function exactHitPaths(root, paths) {
   const hits = [];
   for (const path of paths) {
+    if (NON_PRODUCTION_SOURCE.test(path)) continue;
     if ((await readFile(join(root, path), "utf8")).includes("addCompare")) hits.push(path);
   }
   return hits;

@@ -6,7 +6,7 @@ import { codeMap, contextBundle, findSymbols } from "./ctx-core.mjs";
 import { callNapiTool } from "./nova-napi-tools.mjs";
 
 const seed = Number.parseInt(process.env.NOVA_CONTEXT_FUZZ_SEED ?? "20250308", 10) >>> 0;
-const caseCount = Math.max(1, Number.parseInt(process.env.NOVA_CONTEXT_FUZZ_CASES ?? "32", 10) || 32);
+const caseCount = Math.max(1, Number.parseInt(process.env.NOVA_CONTEXT_FUZZ_CASES ?? "64", 10) || 64);
 const caseStart = Math.max(0, Number.parseInt(process.env.NOVA_CONTEXT_FUZZ_START ?? "0", 10) || 0);
 const keepFailures = process.env.NOVA_CONTEXT_FUZZ_KEEP === "1";
 
@@ -83,7 +83,7 @@ function makeRepository(index) {
   ].join("\n");
   files[`config/settings${index}.toml`] = `feature_${index} = true\nlabel = "随机-${index}"\n`;
 
-  const keywordCount = integer(random, 1, Math.min(3, symbols.length));
+  const keywordCount = integer(random, 1, Math.min(5, symbols.length));
   const keywords = sample(random, symbols, keywordCount);
   const params = pick(random, [
     { keywords },

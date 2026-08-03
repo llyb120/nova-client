@@ -242,6 +242,30 @@ test("fast_context: 显式 camelCase 可经 snake_case 字符串桥建立种子�
   }
 });
 
+test("fast_context: 框架事件字符串桥补齐 emit/listen 两端", async () => {
+  const dir = await fixture({
+    "src/publisher.ts": [
+      "import { emit } from '@tauri-apps/api/event';",
+      "export function publishRefresh(payload) { return emit('workspace-refresh', payload); }",
+    ].join("\n"),
+    "src/subscriber.ts": [
+      "import { listen } from '@tauri-apps/api/event';",
+      "export function subscribeRefresh(handler) { return listen('workspace-refresh', handler); }",
+    ].join("\n"),
+  });
+  try {
+    const out = await contextBundle({
+      keywords: ["workspace-refresh"],
+      task: "修改 workspace-refresh 事件，检查 emit 和 listen 调用方",
+    }, dir);
+    assert.doesNotMatch(out, /# CTX MISS/);
+    assert.match(out, /emit\('workspace-refresh'/);
+    assert.match(out, /listen\('workspace-refresh'/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("fast_context: Rust use 路径的依赖同样精确闭包", async () => {
   const filler = Array.from({ length: 160 }, (_, i) => `pub const PAD_${i}: u8 = ${i % 256};`).join("\n");
   const dir = await fixture({

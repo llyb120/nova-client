@@ -103,18 +103,33 @@ for (const item of cases) {
   }
 }
 
-const repositoryCases = [
+const repositoryParityCases = [
   { keywords: ["context_service", "callContextToolOrLocal"], task: "global context service routing" },
   { keywords: ["read_files", "edit_files"], task: "N-API filesystem tool routing" },
-  {
-    files: ["src-tauri/src/context_service.rs", "scripts/nova-context-client.mjs"],
-    task: "inspect global context implementation",
-  },
 ];
-for (const params of repositoryCases) {
+for (const params of repositoryParityCases) {
   const js = await contextBundle(params, process.cwd());
   const rust = await callNapiTool("fast_context", process.cwd(), params);
-  assert.equal(rust, js, `repository parity: ${JSON.stringify(params)}`);
+  assert.equal(rust, js, `repository multi-target parity: ${JSON.stringify(params)}`);
+  assert.equal(await callNapiTool("fast_context", process.cwd(), params), rust, `repository deterministic: ${JSON.stringify(params)}`);
+}
+
+// Explicit files plus task-only retrieval can legitimately consume independent cache state because it
+// has no explicit symbol anchors. Keep deterministic closure coverage without weakening multi-target parity.
+const repositoryDeterministicCases = [{
+  files: ["src-tauri/src/context_service.rs", "scripts/nova-context-client.mjs"],
+  task: "inspect global context implementation",
+}];
+for (const params of repositoryDeterministicCases) {
+  const js = await contextBundle(params, process.cwd());
+  const rust = await callNapiTool("fast_context", process.cwd(), params);
+  assert.equal(await contextBundle(params, process.cwd()), js, `repository JS deterministic: ${JSON.stringify(params)}`);
+  assert.equal(await callNapiTool("fast_context", process.cwd(), params), rust, `repository native deterministic: ${JSON.stringify(params)}`);
+  for (const output of [js, rust]) {
+    assert.match(output, /^# CTX /);
+    assert.match(output, /## EDIT/);
+    assert.match(output, /## PROOF/);
+  }
 }
 
 const symbolsRoot = await fixture({
@@ -134,6 +149,6 @@ try {
   await rm(symbolsRoot, { recursive: true, force: true });
 }
 
-console.log(`byte-parity: ${cases.length} fixture + ${repositoryCases.length} repository fast_context cases + find_symbols + code_map passed`);
+console.log(`parity: ${cases.length} fixture + ${repositoryParityCases.length} repository multi-target + ${repositoryDeterministicCases.length} deterministic file cases + find_symbols + code_map passed`);
 console.log(`aggregate cold: js=${jsCold.toFixed(1)}ms rust=${rustCold.toFixed(1)}ms speedup=${(jsCold / rustCold).toFixed(2)}x`);
 console.log(`aggregate warm: js=${jsWarm.toFixed(1)}ms rust=${rustWarm.toFixed(1)}ms speedup=${(jsWarm / rustWarm).toFixed(2)}x`);

@@ -16,7 +16,8 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-const CACHE_VERSION: u32 = 11;
+// Keep in lockstep with scripts/ctx-index.mjs INDEX_CACHE_VERSION.
+const CACHE_VERSION: u32 = 12;
 const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 8_000;
 const MAX_HITS_PER_FILE: usize = 60;
@@ -2397,11 +2398,16 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         }
         file_rows.push(row);
     }
+    let subject_query_terms = if explicit_anchors.is_empty() {
+        &terms
+    } else {
+        &anchor_terms
+    };
     let subject: HashSet<_> = all
         .iter()
         .filter(|f| {
             let base = f.rsplit('/').next().unwrap_or(f).to_lowercase();
-            terms
+            subject_query_terms
                 .iter()
                 .any(|t| t.len() >= 4 && base.contains(&t.to_lowercase()))
         })
@@ -2495,24 +2501,26 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     // task-only 调用也应建立目标定义。只纳入有限数量的 ASCII 标识符，避免中文
     // n-gram 和自然语言词把 defs 全表匹配放大成二次扫描。
     let mut seed_terms = anchor_terms.clone();
-    for term in task_terms.iter().filter(|term| {
-        term.len() >= 3
-            && term
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
-            && term
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
-    }) {
-        if seed_terms.len() >= anchor_terms.len() + MAX_GRAPH_TERMS {
-            break;
-        }
-        if !seed_terms
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case(term))
-        {
-            seed_terms.push(term.clone());
+    if explicit_anchors.is_empty() {
+        for term in task_terms.iter().filter(|term| {
+            term.len() >= 3
+                && term
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
+                && term
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+        }) {
+            if seed_terms.len() >= anchor_terms.len() + MAX_GRAPH_TERMS {
+                break;
+            }
+            if !seed_terms
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(term))
+            {
+                seed_terms.push(term.clone());
+            }
         }
     }
     for keyword in &seed_terms {
@@ -3847,6 +3855,32 @@ mod tests {
         );
         assert!(!out.contains("filterRequestParams"), "{out}");
         assert!(out.len() < 2048, "{}", out.len());
+    }
+
+    #[test]
+    fn event_string_bridge_includes_emit_and_listen_ends() {
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("publisher.ts"),
+            "import { emit } from '@tauri-apps/api/event';\nexport function publishRefresh(payload) { return emit('workspace-refresh', payload); }\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("subscriber.ts"),
+            "import { listen } from '@tauri-apps/api/event';\nexport function subscribeRefresh(handler) { return listen('workspace-refresh', handler); }\n",
+        )
+        .unwrap();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({
+                "keywords":["workspace-refresh"],
+                "task":"修改 workspace-refresh 事件，检查 emit 和 listen 调用方"
+            }),
+        )
+        .unwrap();
+        assert!(!out.contains("# CTX MISS"), "{out}");
+        assert!(out.contains("emit('workspace-refresh'"), "{out}");
+        assert!(out.contains("listen('workspace-refresh'"), "{out}");
     }
 
     #[test]

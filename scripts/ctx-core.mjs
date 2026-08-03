@@ -629,7 +629,9 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   };
   ingestRows(rows);
 
-  const subjectTerms = [...keywords, ...tTokens].map((t) => t.toLowerCase()).filter((t) => t.length >= 4);
+  const subjectTerms = (explicitAnchors.length ? anchorTerms : [...keywords, ...tTokens])
+    .map((t) => t.toLowerCase())
+    .filter((t) => t.length >= 4);
   const isSubject = (file) => {
     if (!subjectTerms.length) return false;
     const base = file.split('/').pop().toLowerCase();
@@ -661,10 +663,11 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     : !kwCount.has(keyword));
   // task-only 调用也应建立目标定义。显式符号加入常见命名变体；自然语言只纳入
   // 少量合法 ASCII 标识符，避免 defs 全表模糊匹配膨胀。
-  const seedTerms = [...new Set([
-    ...anchorTerms,
-    ...tTokens.filter((term) => /^[A-Za-z_$][\w$]{2,}$/.test(term)).slice(0, MAX_GRAPH_TERMS),
-  ])].slice(0, Math.max(MAX_GRAPH_TERMS, anchorTerms.length));
+  const taskSeedTerms = explicitAnchors.length
+    ? []
+    : tTokens.filter((term) => /^[A-Za-z_$][\w$]{2,}$/.test(term)).slice(0, MAX_GRAPH_TERMS);
+  const seedTerms = [...new Set([...anchorTerms, ...taskSeedTerms])]
+    .slice(0, Math.max(MAX_GRAPH_TERMS, anchorTerms.length));
   const seeds = seedDefs(index, seedTerms);
 
   // 计划驱动二次检索：先看目标定义体，再搜索错误/配置/状态符号的处理方。
