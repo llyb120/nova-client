@@ -1,14 +1,14 @@
 /**
  * 可配置工作流：类型与纯逻辑（模板渲染、转移求值、校验）。
  *
- * 设计复用现有 /fire 的「会话接力」运行时：一个阶段 = 一个独立会话，阶段之间靠
- * 上一阶段的最终结论文本 + 标记/正则做转移判断。本文件只包含与 store 无关的纯逻辑，
- * 运行时（建会话、发提示词、turn 事件驱动、暂停/恢复、持久化）在 store.ts。
+ * 设计复用现有 /fire 的「会话接力」运行时：一个节点 = 一个独立会话。引擎自动把
+ * 上一节点结论交给下一节点，并为分支连线补充不可见路由标识；用户只需配置节点提示词
+ * 与连线判断提示词。本文件只包含与 store 无关的纯逻辑。
  */
 
-/** 终止伪阶段：流程成功结束。 */
+/** 终止伪节点：只表示流程到达结束状态。 */
 export const WF_DONE = "$done";
-/** 终止伪阶段：流程以失败结束。 */
+/** 旧数据兼容别名；画布与新配置不再暴露失败结束节点。 */
 export const WF_FAIL = "$fail";
 
 /**
@@ -31,9 +31,13 @@ export type WorkflowTransitionWhen =
 
 export interface WorkflowTransition {
   id: string;
+  /** 旧版显式匹配规则；新建连线由引擎自动维护，不需要用户配置。 */
   when: WorkflowTransitionWhen;
-  /** 目标阶段 id，或 $done / $fail。 */
+  /** 目标节点 id，或 $done。旧数据中的 $fail 视为同一个结束状态。 */
   to: string;
+  /** 连线判断提示词。存在多个出口时，引擎据此要求当前节点选择下一跳。 */
+  prompt?: string;
+  /** 旧版画布标签，继续兼容已有工作流。 */
   label?: string;
 }
 
@@ -51,7 +55,9 @@ export interface WorkflowStageDef {
   /** 可选：覆盖该阶段会话模式（如 build / plan）。 */
   mode?: string;
   model?: string | null;
-  /** 该阶段只做核验、不写代码；用户在其上补充消息时走「只读续跑」提示。 */
+  /** 节点完成后暂停，由用户人工选择下一条连线；引擎不自动判断。 */
+  manualReview?: boolean;
+  /** 旧配置兼容字段。 */
   reviewOnly?: boolean;
   transitions: WorkflowTransition[];
   /** 画布坐标。 */
@@ -91,6 +97,20 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** 引擎注入的分支标识。用户无需看到或配置。 */
+export function workflowRouteMarker(transitionId: string): string {
+  return `[[NOVA_WORKFLOW_ROUTE:${transitionId}]]`;
+}
+
+/** 连线用于模型判断的自然语言提示；兼容旧 label / marker / regex 配置。 */
+export function workflowTransitionPrompt(transition: WorkflowTransition): string {
+  const prompt = transition.prompt?.trim() || transition.label?.trim();
+  if (prompt) return prompt;
+  if (transition.when.kind === "marker") return `结论以 ${transition.when.value} 结束`;
+  if (transition.when.kind === "regex") return `结论匹配 ${transition.when.value}`;
+  return "";
+}
+
 /** 渲染 {{var}} 模板；未知变量替换为空串。 */
 export function renderTemplate(
   template: string,
@@ -110,9 +130,18 @@ export function evalTransition(
   stage: WorkflowStageDef,
   conclusion: string,
 ): WorkflowTransition | null {
+  // 新版隐式路由优先。即使旧数据中的 when=always，也不会抢走模型已选择的分支。
+  for (const transition of stage.transitions) {
+    if (conclusion.trimEnd().endsWith(workflowRouteMarker(transition.id))) return transition;
+  }
+  const usesImplicitRouting =
+    stage.transitions.length > 1 && stage.transitions.some((transition) => transition.prompt !== undefined);
   for (const transition of stage.transitions) {
     const when = transition.when;
-    if (when.kind === "always") return transition;
+    if (when.kind === "always") {
+      if (!usesImplicitRouting) return transition;
+      continue;
+    }
     if (when.kind === "marker") {
       const marker = when.value.trim();
       if (marker && new RegExp(`${escapeRegExp(marker)}\\s*$`, "i").test(conclusion)) {
@@ -149,12 +178,18 @@ export function validateWorkflow(def: WorkflowDef): string[] {
     if (!stage.promptTemplate.trim()) {
       errors.push(`阶段「${stage.name || stage.id}」的提示词模板为空`);
     }
+    if (stage.manualReview && stage.transitions.length === 0) {
+      errors.push(`人工审核节点「${stage.name || stage.id}」至少需要一条连线`);
+    }
   }
   if (!ids.has(def.entry)) errors.push(`起始阶段不存在：${def.entry}`);
   for (const stage of def.stages) {
     for (const transition of stage.transitions) {
       if (!isTerminal(transition.to) && !ids.has(transition.to)) {
         errors.push(`阶段「${stage.name}」的转移指向不存在的阶段：${transition.to}`);
+      }
+      if (stage.transitions.length > 1 && !workflowTransitionPrompt(transition)) {
+        errors.push(`节点「${stage.name}」存在多个出口，请填写每条连线的判断提示词`);
       }
     }
   }

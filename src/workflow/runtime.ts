@@ -5,24 +5,21 @@
  * 与 store.ts 解耦：store 通过 initWorkflowRuntime 注入少量 UI/状态能力，避免循环依赖。
  * /fire 仍走 store 里的原有专用路径；本运行时驱动 /run 启动的内置与自定义工作流。
  */
+import { createSignal } from "solid-js";
 import { api } from "../ipc";
 import type { Thread, Item } from "../types";
-import {
-  builtinPromptResolvers,
-  builtinResumeResolvers,
-  builtinTitleResolvers,
-  type BuiltinStageContext,
-} from "./builtin";
 import { getWorkflow } from "./storage";
 import {
   evalTransition,
   isTerminal,
   renderTemplate,
   validateWorkflow,
-  WF_DONE,
+  workflowRouteMarker,
+  workflowTransitionPrompt,
   type WorkflowDef,
   type WorkflowRunStep,
   type WorkflowStageDef,
+  type WorkflowTransition,
 } from "./types";
 
 export interface WorkflowHost {
@@ -42,12 +39,16 @@ const suspendedRuns = new Map<string, WorkflowRunStep>();
 const runHistory = new Map<string, WorkflowRunStep>();
 const latestThreadByRoot = new Map<string, string>();
 const completedRoots = new Set<string>();
+const pendingManualReviews = new Set<string>();
+const [workflowReviewRevision, setWorkflowReviewRevision] = createSignal(0);
+export { workflowReviewRevision };
 const RUNS_KEY = "fd:workflowRuns:v1";
 
 type PersistedRuns = {
   runs: [string, WorkflowRunStep][];
   latest: [string, string][];
   completed: string[];
+  manualReviews?: string[];
 };
 
 export function initWorkflowRuntime(injected: WorkflowHost): void {
@@ -68,6 +69,7 @@ function persistRuns(): void {
     runs: [...runs],
     latest: [...latestThreadByRoot],
     completed: [...completedRoots],
+    manualReviews: [...pendingManualReviews],
   };
   try {
     localStorage.setItem(RUNS_KEY, JSON.stringify(snapshot));
@@ -90,6 +92,10 @@ function restoreRuns(): void {
       if (rootId && threadId) latestThreadByRoot.set(rootId, threadId);
     }
     for (const rootId of snapshot.completed ?? []) if (rootId) completedRoots.add(rootId);
+    for (const threadId of snapshot.manualReviews ?? []) {
+      if (threadId) pendingManualReviews.add(threadId);
+    }
+    setWorkflowReviewRevision((value) => value + 1);
   } catch {
     localStorage.removeItem(RUNS_KEY);
   }
@@ -107,38 +113,50 @@ function stageConclusion(thread: Thread): string {
   );
 }
 
+type WorkflowStageContext = {
+  vars: Record<string, string>;
+  prev: string;
+  attempt: number;
+};
+
 function resolvePrompt(
-  def: WorkflowDef,
+  _def: WorkflowDef,
   stage: WorkflowStageDef,
-  ctx: BuiltinStageContext,
+  ctx: WorkflowStageContext,
 ): string {
-  const resolver = builtinPromptResolvers[def.id]?.[stage.id];
-  if (resolver) return resolver(ctx);
-  return renderTemplate(stage.promptTemplate, {
+  const base = renderTemplate(stage.promptTemplate, {
+    ...ctx.vars,
+    prev: ctx.prev,
+    attempt: ctx.attempt,
+  }).trim();
+  const handoff = [
+    ctx.vars.goal?.trim() ? `工作流目标：\n${ctx.vars.goal.trim()}` : "",
+    ctx.prev.trim() ? `上一节点结论：\n${ctx.prev.trim()}` : "",
+  ].filter(Boolean);
+  const routes = stage.transitions;
+  const routing = routes.length > 1 && !stage.manualReview
+    ? `完成当前节点任务后，必须根据实际结论选择且只选择一个下一跳。将对应标识单独放在回复最后一行，标识后不要再输出内容：\n${routes
+        .map((transition) => `- ${workflowTransitionPrompt(transition)}\n  ${workflowRouteMarker(transition.id)}`)
+        .join("\n")}`
+    : "";
+  return [base, ...handoff, routing].filter(Boolean).join("\n\n");
+}
+
+function resolveTitle(
+  _def: WorkflowDef,
+  stage: WorkflowStageDef,
+  ctx: WorkflowStageContext,
+  status = "",
+): string {
+  const base = renderTemplate(stage.titleTemplate ?? `[WF] ${stage.name} · 第{{attempt}}次`, {
     ...ctx.vars,
     prev: ctx.prev,
     attempt: ctx.attempt,
   });
-}
-
-function resolveTitle(
-  def: WorkflowDef,
-  stage: WorkflowStageDef,
-  ctx: BuiltinStageContext,
-  status = "",
-): string {
-  const resolver = builtinTitleResolvers[def.id]?.[stage.id];
-  const base = resolver
-    ? resolver(ctx)
-    : renderTemplate(stage.titleTemplate ?? `[WF] ${stage.name} · 第{{attempt}}次`, {
-        ...ctx.vars,
-        prev: ctx.prev,
-        attempt: ctx.attempt,
-      });
   return status ? `${base} · ${status}` : base;
 }
 
-function runContext(run: WorkflowRunStep, prev: string): BuiltinStageContext {
+function runContext(run: WorkflowRunStep, prev: string): WorkflowStageContext {
   return { vars: run.vars, prev, attempt: run.attempts[run.stageId] ?? 1 };
 }
 
@@ -183,6 +201,50 @@ async function createStageThread(
   await api.sendPrompt(thread.id, prompt, []);
 }
 
+async function followTransition(
+  threadId: string,
+  run: WorkflowRunStep,
+  def: WorkflowDef,
+  stage: WorkflowStageDef,
+  conclusion: string,
+  transition: WorkflowTransition,
+): Promise<void> {
+  const h = requireHost();
+  if (isTerminal(transition.to)) {
+    completedRoots.add(run.rootId);
+    pendingManualReviews.delete(threadId);
+    persistRuns();
+    setWorkflowReviewRevision((value) => value + 1);
+    await api.renameThread(threadId, resolveTitle(def, stage, runContext(run, conclusion), "完成"));
+    await h.refreshThreads();
+    void api.notifyWorkflowDone(threadId, true).catch(() => {});
+    return;
+  }
+
+  const next = def.stages.find((candidate) => candidate.id === transition.to);
+  if (!next) return;
+  if (run.stageCount + 1 > def.maxTotalStages) {
+    completedRoots.add(run.rootId);
+    pendingManualReviews.delete(threadId);
+    persistRuns();
+    setWorkflowReviewRevision((value) => value + 1);
+    await api.renameThread(threadId, resolveTitle(def, stage, runContext(run, conclusion), "已停止"));
+    await h.refreshThreads();
+    void api.notifyWorkflowDone(threadId, false).catch(() => {});
+    return;
+  }
+
+  pendingManualReviews.delete(threadId);
+  suspendedRuns.delete(threadId);
+  run.stageId = next.id;
+  run.stageCount += 1;
+  run.attempts[next.id] = (run.attempts[next.id] ?? 0) + 1;
+  persistRuns();
+  setWorkflowReviewRevision((value) => value + 1);
+  const ctx = runContext(run, conclusion);
+  await createStageThread(run, next, resolveTitle(def, next, ctx), resolvePrompt(def, next, ctx));
+}
+
 /** turn 正常结束后推进流程。 */
 async function advanceWorkflow(threadId: string): Promise<void> {
   const h = requireHost();
@@ -197,7 +259,20 @@ async function advanceWorkflow(threadId: string): Promise<void> {
 
   const thread = await api.getThread(threadId);
   const conclusion = stageConclusion(thread);
-  const transition = evalTransition(stage, conclusion);
+  if (stage.manualReview) {
+    suspendedRuns.set(threadId, run);
+    pendingManualReviews.add(threadId);
+    persistRuns();
+    setWorkflowReviewRevision((value) => value + 1);
+    await api.renameThread(threadId, resolveTitle(def, stage, runContext(run, conclusion), "待人工审核"));
+    await h.refreshThreads();
+    return;
+  }
+
+  // 单出口直接接力；多出口由引擎注入的标识选择。旧工作流仍兼容 marker/regex。
+  const transition = stage.transitions.length === 1
+    ? stage.transitions[0]
+    : evalTransition(stage, conclusion);
 
   if (!transition) {
     // 没有任何转移命中：停在当前阶段等用户补充。
@@ -208,39 +283,7 @@ async function advanceWorkflow(threadId: string): Promise<void> {
     return;
   }
 
-  if (isTerminal(transition.to)) {
-    const success = transition.to === WF_DONE;
-    completedRoots.add(run.rootId);
-    persistRuns();
-    await api.renameThread(
-      threadId,
-      resolveTitle(def, stage, runContext(run, conclusion), success ? "完成" : "已停止"),
-    );
-    await h.refreshThreads();
-    void api.notifyWorkflowDone(threadId, success).catch(() => {});
-    return;
-  }
-
-  const next = def.stages.find((s) => s.id === transition.to);
-  if (!next) return;
-
-  if (run.stageCount + 1 > def.maxTotalStages) {
-    completedRoots.add(run.rootId);
-    persistRuns();
-    await api.renameThread(
-      threadId,
-      resolveTitle(def, stage, runContext(run, conclusion), "已停止"),
-    );
-    await h.refreshThreads();
-    void api.notifyWorkflowDone(threadId, false).catch(() => {});
-    return;
-  }
-
-  run.stageId = next.id;
-  run.stageCount += 1;
-  run.attempts[next.id] = (run.attempts[next.id] ?? 0) + 1;
-  const ctx = runContext(run, conclusion);
-  await createStageThread(run, next, resolveTitle(def, next, ctx), resolvePrompt(def, next, ctx));
+  await followTransition(threadId, run, def, stage, conclusion, transition);
 }
 
 function suspendWorkflow(threadId: string, manual: boolean): void {
@@ -273,8 +316,9 @@ function reattach(threadId: string): WorkflowRunStep | null {
     }
   }
   const wasSuspended = suspendedRuns.delete(threadId);
+  const wasManualReview = pendingManualReviews.delete(threadId);
   activeRuns.set(threadId, run);
-  if (wasSuspended || wasCompleted) {
+  if (wasSuspended || wasCompleted || wasManualReview) {
     const def = getWorkflow(run.workflowId);
     const stage = def?.stages.find((s) => s.id === run.stageId);
     if (def && stage) {
@@ -285,6 +329,7 @@ function reattach(threadId: string): WorkflowRunStep | null {
     }
   }
   persistRuns();
+  if (wasManualReview) setWorkflowReviewRevision((value) => value + 1);
   return run;
 }
 
@@ -365,20 +410,43 @@ export function handleTurnEnd(threadId: string, stopReason: string | null | unde
   return true;
 }
 
-/**
- * 用户在某会话补充消息时调用：重新挂回流程，并对只读阶段做续跑提示改写。
- * 返回应发送的文本；非工作流会话返回 null。
- */
+/** 用户在工作流最新会话补充消息时重新挂回流程；非工作流会话返回 null。 */
 export function preparePrompt(threadId: string, text: string): string | null {
-  const run = reattach(threadId);
-  if (!run) return null;
-  const def = getWorkflow(run.workflowId);
-  const stage = def?.stages.find((s) => s.id === run.stageId);
-  if (def && stage?.reviewOnly) {
-    const resolver = builtinResumeResolvers[def.id]?.[stage.id];
-    if (resolver) return resolver(text);
-  }
-  return text;
+  return reattach(threadId) ? text : null;
+}
+
+export interface ManualWorkflowReview {
+  stageName: string;
+  transitions: { id: string; label: string }[];
+}
+
+export function manualWorkflowReview(threadId: string): ManualWorkflowReview | null {
+  if (!pendingManualReviews.has(threadId)) return null;
+  const run = suspendedRuns.get(threadId) ?? runHistory.get(threadId);
+  const def = run ? getWorkflow(run.workflowId) : undefined;
+  const stage = def?.stages.find((candidate) => candidate.id === run?.stageId);
+  if (!run || !def || !stage?.manualReview) return null;
+  return {
+    stageName: stage.name,
+    transitions: stage.transitions.map((transition) => ({
+      id: transition.id,
+      label: workflowTransitionPrompt(transition) || (isTerminal(transition.to) ? "结束" : def.stages.find((candidate) => candidate.id === transition.to)?.name ?? "下一步"),
+    })),
+  };
+}
+
+export async function chooseManualWorkflowTransition(
+  threadId: string,
+  transitionId: string,
+): Promise<void> {
+  if (!pendingManualReviews.has(threadId)) throw new Error("当前节点不在等待人工审核");
+  const run = suspendedRuns.get(threadId) ?? runHistory.get(threadId);
+  const def = run ? getWorkflow(run.workflowId) : undefined;
+  const stage = def?.stages.find((candidate) => candidate.id === run?.stageId);
+  const transition = stage?.transitions.find((candidate) => candidate.id === transitionId);
+  if (!run || !def || !stage || !transition) throw new Error("人工审核选项已失效");
+  const thread = await api.getThread(threadId);
+  await followTransition(threadId, run, def, stage, stageConclusion(thread), transition);
 }
 
 export function isActive(threadId: string): boolean {

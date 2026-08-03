@@ -11,11 +11,9 @@ import {
   newWorkflowId,
   validateWorkflow,
   WF_DONE,
-  WF_FAIL,
   type WorkflowDef,
   type WorkflowStageDef,
   type WorkflowTransition,
-  type WorkflowTrigger,
 } from "../workflow/types";
 
 function clone<T>(value: T): T {
@@ -34,12 +32,12 @@ function blankWorkflow(): WorkflowDef {
       {
         id: stageId,
         name: "执行",
-        promptTemplate: "请在当前项目中完成下面的目标：\n\n{{goal}}\n\n完成后简短汇报实际改动与验证结果。",
+        promptTemplate: "完成当前节点负责的任务，并给出可供下一节点继续处理的明确结论。",
         mode: "build",
-        reviewOnly: false,
+        manualReview: false,
         x: 80,
         y: 140,
-        transitions: [{ id: newWorkflowId("t"), when: { kind: "always" }, to: WF_DONE, label: "完成" }],
+        transitions: [{ id: newWorkflowId("t"), when: { kind: "always" }, to: WF_DONE, prompt: "结束" }],
       },
     ],
   };
@@ -53,11 +51,10 @@ export function WorkflowSettingsPanel() {
   const [selectedTransitionId, setSelectedTransitionId] = createSignal<string | null>(null);
   const [msg, setMsg] = createSignal("");
 
-  // 布局状态：抽屉 / 工具条折叠 / 编辑弹窗 / 触发器弹窗。
+  // 布局状态：抽屉 / 工具条折叠 / 编辑弹窗。
   const [drawerOpen, setDrawerOpen] = createSignal(false);
   const [barCollapsed, setBarCollapsed] = createSignal(false);
   const [inspectorOpen, setInspectorOpen] = createSignal(false);
-  const [triggerOpen, setTriggerOpen] = createSignal(false);
 
   const reload = () => setList(listWorkflows());
 
@@ -102,9 +99,9 @@ export function WorkflowSettingsPanel() {
     const stage: WorkflowStageDef = {
       id: newWorkflowId("s"),
       name: `阶段 ${d.stages.length + 1}`,
-      promptTemplate: "{{goal}}\n\n上一阶段结论：\n{{prev}}",
+      promptTemplate: "完成当前节点负责的任务，并给出可供下一节点继续处理的明确结论。",
       mode: "build",
-      reviewOnly: false,
+      manualReview: false,
       x: 120 + d.stages.length * 40,
       y: 160 + d.stages.length * 40,
       transitions: [],
@@ -149,7 +146,7 @@ export function WorkflowSettingsPanel() {
   function addTransition(stageId: string) {
     const d = draft();
     if (!d) return;
-    const transition: WorkflowTransition = { id: newWorkflowId("t"), when: { kind: "always" }, to: WF_DONE, label: "" };
+    const transition: WorkflowTransition = { id: newWorkflowId("t"), when: { kind: "always" }, to: WF_DONE, prompt: "" };
     setDraft({ ...d, stages: d.stages.map((s) => (s.id === stageId ? { ...s, transitions: [...s.transitions, transition] } : s)) });
     setSelectedTransitionId(transition.id);
   }
@@ -160,16 +157,6 @@ export function WorkflowSettingsPanel() {
         : d,
     );
     if (selectedTransitionId() === transitionId) setSelectedTransitionId(null);
-  }
-
-  function addTrigger() {
-    setDraft((d) => (d ? { ...d, triggers: [...(d.triggers ?? []), { kind: "slash", command: "" }] } : d));
-  }
-  function patchTrigger(index: number, trigger: WorkflowTrigger) {
-    setDraft((d) => (d ? { ...d, triggers: (d.triggers ?? []).map((t, i) => (i === index ? trigger : t)) } : d));
-  }
-  function deleteTrigger(index: number) {
-    setDraft((d) => (d ? { ...d, triggers: (d.triggers ?? []).filter((_, i) => i !== index) } : d));
   }
 
   function save() {
@@ -233,8 +220,7 @@ export function WorkflowSettingsPanel() {
     if (!d) return [];
     return [
       ...d.stages.map((s) => ({ value: s.id, label: `→ ${s.name || s.id}` })),
-      { value: WF_DONE, label: "→ 成功结束" },
-      { value: WF_FAIL, label: "→ 失败结束" },
+      { value: WF_DONE, label: "→ 结束" },
     ];
   });
 
@@ -353,39 +339,6 @@ export function WorkflowSettingsPanel() {
                   title="工作流名称"
                 />
                 <span class="wf-bar-sep" />
-                <label class="wf-inline-label" title="起始阶段">
-                  起点
-                  <select
-                    class="field-input wf-select"
-                    value={d().entry}
-                    disabled={d().builtin}
-                    onChange={(e) => patchDraft({ entry: e.currentTarget.value })}
-                  >
-                    <For each={d().stages}>{(s) => <option value={s.id}>{s.name || s.id}</option>}</For>
-                  </select>
-                </label>
-                <label class="wf-inline-label" title="整条链最多创建的阶段会话数">
-                  上限
-                  <input
-                    class="field-input wf-number"
-                    type="number"
-                    min={1}
-                    value={d().maxTotalStages}
-                    disabled={d().builtin}
-                    onInput={(e) => patchDraft({ maxTotalStages: Math.max(1, Number(e.currentTarget.value) || 1) })}
-                  />
-                </label>
-                <span class="wf-bar-sep" />
-                <button
-                  class="wf-chip"
-                  classList={{ active: triggerOpen() }}
-                  disabled={d().builtin}
-                  onClick={() => setTriggerOpen(true)}
-                  title="触发条件：满足即自动启动"
-                >
-                  触发器
-                  <span class="wf-chip-count">{(d().triggers ?? []).length}</span>
-                </button>
                 <button
                   class="wf-chip"
                   classList={{ active: inspectorOpen() }}
@@ -458,28 +411,6 @@ export function WorkflowSettingsPanel() {
                           <div class="wf-transition focused">
                             <select
                               class="field-input wf-select"
-                              value={tv().transition.when.kind}
-                              disabled={draft()!.builtin}
-                              onChange={(e) => {
-                                const kind = e.currentTarget.value as "always" | "marker" | "regex";
-                                patchTransition(tv().stage.id, tv().transition.id, { when: kind === "always" ? { kind } : { kind, value: "" } });
-                              }}
-                            >
-                              <option value="always">总是</option>
-                              <option value="marker">结尾标记</option>
-                              <option value="regex">正则</option>
-                            </select>
-                            <Show when={tv().transition.when.kind !== "always"}>
-                              <input
-                                class="field-input wf-cond-value"
-                                value={(tv().transition.when as { value?: string }).value ?? ""}
-                                disabled={draft()!.builtin}
-                                placeholder={tv().transition.when.kind === "marker" ? "如 DONE" : "正则"}
-                                onInput={(e) => patchTransition(tv().stage.id, tv().transition.id, { when: { kind: tv().transition.when.kind, value: e.currentTarget.value } as WorkflowTransition["when"] })}
-                              />
-                            </Show>
-                            <select
-                              class="field-input wf-select"
                               value={tv().transition.to}
                               disabled={draft()!.builtin}
                               onChange={(e) => patchTransition(tv().stage.id, tv().transition.id, { to: e.currentTarget.value })}
@@ -488,13 +419,14 @@ export function WorkflowSettingsPanel() {
                             </select>
                             <input
                               class="field-input wf-edge-label-input"
-                              value={tv().transition.label ?? ""}
+                              value={tv().transition.prompt ?? tv().transition.label ?? ""}
                               disabled={draft()!.builtin}
-                              placeholder="标签"
-                              onInput={(e) => patchTransition(tv().stage.id, tv().transition.id, { label: e.currentTarget.value })}
+                              placeholder="什么时候走这条连线"
+                              onInput={(e) => patchTransition(tv().stage.id, tv().transition.id, { prompt: e.currentTarget.value })}
                             />
                             <button class="btn danger small" disabled={draft()!.builtin} onClick={() => deleteTransition(tv().stage.id, tv().transition.id)}>×</button>
                           </div>
+                          <div class="field-hint">存在多个出口时，引擎会隐式要求当前节点判断并输出路由标识。</div>
                         </div>
                       )}
                     </Show>
@@ -510,9 +442,20 @@ export function WorkflowSettingsPanel() {
                           placeholder="阶段名称"
                         />
                         <button class="btn small secondary" disabled={draft()!.builtin || draft()!.entry === stage().id} onClick={() => patchDraft({ entry: stage().id })}>
-                          设为起点
+                          设为首节点
                         </button>
                       </div>
+
+                      <label class="wf-check">
+                        <input
+                          type="checkbox"
+                          checked={!!stage().manualReview}
+                          disabled={draft()!.builtin}
+                          onChange={(e) => patchStage(stage().id, { manualReview: e.currentTarget.checked })}
+                        />
+                        人工审核
+                      </label>
+                      <span class="field-hint">开启后，节点完成时暂停，不由模型判断；用户在会话底部手动选择下一条连线。</span>
 
                       <label class="wf-field">
                         <span>提示词模板</span>
@@ -523,36 +466,13 @@ export function WorkflowSettingsPanel() {
                           value={stage().promptTemplate}
                           onInput={(e) => patchStage(stage().id, { promptTemplate: e.currentTarget.value })}
                         />
-                        <span class="field-hint">变量：{"{{goal}} {{criteria}} {{prev}} {{attempt}}"}</span>
+                        <span class="field-hint">引擎会自动补充工作流目标、上一节点结论和跳转要求。模板变量仍兼容：{"{{goal}} {{criteria}} {{prev}} {{attempt}}"}</span>
                       </label>
-
-                      <div class="wf-inspector-row">
-                        <label class="wf-field">
-                          <span>模式</span>
-                          <select
-                            class="field-input wf-select"
-                            value={stage().mode ?? "build"}
-                            disabled={draft()!.builtin}
-                            onChange={(e) => patchStage(stage().id, { mode: e.currentTarget.value })}
-                          >
-                            <For each={["build", "plan", "ask"]}>{(m) => <option value={m}>{m}</option>}</For>
-                          </select>
-                        </label>
-                        <label class="wf-check">
-                          <input
-                            type="checkbox"
-                            checked={!!stage().reviewOnly}
-                            disabled={draft()!.builtin}
-                            onChange={(e) => patchStage(stage().id, { reviewOnly: e.currentTarget.checked })}
-                          />
-                          只读核验阶段
-                        </label>
-                      </div>
                     </div>
 
                     <div class="wf-modal-section">
                       <div class="wf-transitions-head">
-                        <span class="wf-modal-section-title">转移（按顺序求值）</span>
+                        <span class="wf-modal-section-title">连线</span>
                         <button class="link-btn" disabled={draft()!.builtin} onClick={() => addTransition(stage().id)}>+ 添加</button>
                       </div>
                       <For each={stage().transitions}>
@@ -563,28 +483,6 @@ export function WorkflowSettingsPanel() {
                           >
                             <select
                               class="field-input wf-select"
-                              value={t.when.kind}
-                              disabled={draft()!.builtin}
-                              onChange={(e) => {
-                                const kind = e.currentTarget.value as "always" | "marker" | "regex";
-                                patchTransition(stage().id, t.id, { when: kind === "always" ? { kind } : { kind, value: "" } });
-                              }}
-                            >
-                              <option value="always">总是</option>
-                              <option value="marker">结尾标记</option>
-                              <option value="regex">正则</option>
-                            </select>
-                            <Show when={t.when.kind !== "always"}>
-                              <input
-                                class="field-input wf-cond-value"
-                                value={(t.when as { value?: string }).value ?? ""}
-                                disabled={draft()!.builtin}
-                                placeholder={t.when.kind === "marker" ? "如 DONE" : "正则"}
-                                onInput={(e) => patchTransition(stage().id, t.id, { when: { kind: t.when.kind, value: e.currentTarget.value } as WorkflowTransition["when"] })}
-                              />
-                            </Show>
-                            <select
-                              class="field-input wf-select"
                               value={t.to}
                               disabled={draft()!.builtin}
                               onChange={(e) => patchTransition(stage().id, t.id, { to: e.currentTarget.value })}
@@ -593,10 +491,10 @@ export function WorkflowSettingsPanel() {
                             </select>
                             <input
                               class="field-input wf-edge-label-input"
-                              value={t.label ?? ""}
+                              value={t.prompt ?? t.label ?? ""}
                               disabled={draft()!.builtin}
-                              placeholder="标签"
-                              onInput={(e) => patchTransition(stage().id, t.id, { label: e.currentTarget.value })}
+                              placeholder="什么时候走这条连线"
+                              onInput={(e) => patchTransition(stage().id, t.id, { prompt: e.currentTarget.value })}
                             />
                             <button class="btn danger small" disabled={draft()!.builtin} onClick={(e) => { e.stopPropagation(); deleteTransition(stage().id, t.id); }}>×</button>
                           </div>
@@ -618,63 +516,6 @@ export function WorkflowSettingsPanel() {
         </div>
       </Show>
 
-      {/* 触发条件弹窗 */}
-      <Show when={triggerOpen() && draft()}>
-        <div class="modal-backdrop wf-modal-backdrop" onClick={() => setTriggerOpen(false)}>
-          <div class="modal wf-modal wf-trigger-modal" onClick={(e) => e.stopPropagation()}>
-            <div class="modal-head">
-              <span>触发条件</span>
-              <button class="icon-btn" onClick={() => setTriggerOpen(false)}><IconX size={16} /></button>
-            </div>
-            <div class="modal-body">
-              <div class="wf-triggers-sub wf-modal-lead">满足任一即自动启动该工作流，无需 /run。</div>
-              <Show
-                when={(draft()!.triggers ?? []).length > 0}
-                fallback={<div class="wf-triggers-empty">暂无触发器，仅能用 /run 启动。</div>}
-              >
-                <For each={draft()!.triggers ?? []}>
-                  {(t, idx) => (
-                    <div class="wf-trigger-row">
-                      <select
-                        class="field-input wf-select wf-trigger-kind"
-                        value={t.kind}
-                        disabled={draft()!.builtin}
-                        onChange={(e) => {
-                          const kind = e.currentTarget.value as WorkflowTrigger["kind"];
-                          patchTrigger(idx(), kind === "slash" ? { kind, command: "" } : kind === "contains" ? { kind, text: "" } : { kind, pattern: "" });
-                        }}
-                      >
-                        <option value="slash">指令 /cmd</option>
-                        <option value="contains">包含文本</option>
-                        <option value="regex">正则</option>
-                      </select>
-                      <Show when={t.kind === "slash"}>
-                        <span class="wf-trigger-slash">/</span>
-                        <input class="field-input wf-trigger-value" value={(t as { command: string }).command} disabled={draft()!.builtin} placeholder="fix" onInput={(e) => patchTrigger(idx(), { kind: "slash", command: e.currentTarget.value })} />
-                      </Show>
-                      <Show when={t.kind === "contains"}>
-                        <input class="field-input wf-trigger-value" value={(t as { text: string }).text} disabled={draft()!.builtin} placeholder="提示词中包含的文本" onInput={(e) => patchTrigger(idx(), { kind: "contains", text: e.currentTarget.value })} />
-                      </Show>
-                      <Show when={t.kind === "regex"}>
-                        <input class="field-input wf-trigger-value" value={(t as { pattern: string }).pattern} disabled={draft()!.builtin} placeholder="正则表达式" onInput={(e) => patchTrigger(idx(), { kind: "regex", pattern: e.currentTarget.value })} />
-                      </Show>
-                      <button class="btn danger small" disabled={draft()!.builtin} onClick={() => deleteTrigger(idx())}>×</button>
-                    </div>
-                  )}
-                </For>
-              </Show>
-              <div class="field-hint">
-                指令触发形如 <code>/fix 修登录</code>；包含/正则会匹配整条提示词。过于宽泛的包含或正则可能误触发普通对话，请谨慎。
-              </div>
-              <div class="wf-modal-foot">
-                <span class="wf-zoom-spacer" />
-                <button class="btn secondary small" disabled={draft()!.builtin} onClick={addTrigger}>+ 添加触发器</button>
-                <button class="btn primary small" onClick={() => setTriggerOpen(false)}>完成</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </Show>
     </div>
   );
 }

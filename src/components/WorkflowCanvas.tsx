@@ -3,7 +3,6 @@ import {
   isTerminal,
   newWorkflowId,
   WF_DONE,
-  WF_FAIL,
   type WorkflowDef,
   type WorkflowStageDef,
   type WorkflowTransition,
@@ -58,15 +57,32 @@ export function WorkflowCanvas(props: Props) {
 
   const center = (s: WorkflowStageDef): Point => ({ x: s.x + NODE_W / 2, y: s.y + NODE_H / 2 });
 
-  function terminalPos(target: string): Point {
-    const maxX = stages().reduce((m, s) => Math.max(m, s.x + NODE_W), 0);
-    const baseX = Math.max(maxX + 140, 440);
-    return target === WF_FAIL ? { x: baseX, y: 250 } : { x: baseX, y: 110 };
+  function startPos(): Point {
+    const entry = stageById(props.def.entry) ?? stages()[0];
+    return entry
+      ? { x: entry.x - TERM_W - 110, y: entry.y + (NODE_H - TERM_H) / 2 }
+      : { x: 20, y: 110 };
   }
-  const terminalCenter = (target: string): Point => {
-    const p = terminalPos(target);
+  function terminalPos(): Point {
+    const maxX = stages().reduce((m, s) => Math.max(m, s.x + NODE_W), 0);
+    const averageY = stages().length > 0
+      ? stages().reduce((sum, stage) => sum + stage.y + NODE_H / 2, 0) / stages().length
+      : 130;
+    return { x: Math.max(maxX + 140, 440), y: averageY - TERM_H / 2 };
+  }
+  const terminalCenter = (_target: string): Point => {
+    const p = terminalPos();
     return { x: p.x + TERM_W / 2, y: p.y + TERM_H / 2 };
   };
+  const startRoute = createMemo(() => {
+    const entry = stageById(props.def.entry) ?? stages()[0];
+    if (!entry) return null;
+    const start = startPos();
+    const from = { x: start.x + TERM_W, y: start.y + TERM_H / 2 };
+    const to = { x: entry.x, y: entry.y + NODE_H / 2 };
+    const dx = Math.max(36, Math.abs(to.x - from.x) / 2);
+    return `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${to.x - dx} ${to.y}, ${to.x} ${to.y}`;
+  });
 
   function toWorld(clientX: number, clientY: number): Point {
     const rect = svgRef?.getBoundingClientRect();
@@ -254,7 +270,7 @@ export function WorkflowCanvas(props: Props) {
     const from = connectFrom();
     setConnectFrom(null); setConnectPos(null);
     if (!from || from === to) return;
-    const transition: WorkflowTransition = { id: newWorkflowId("t"), when: { kind: "always" }, to, label: "" };
+    const transition: WorkflowTransition = { id: newWorkflowId("t"), when: { kind: "always" }, to, prompt: "" };
     props.onChange({ ...props.def, stages: stages().map((s) => (s.id === from ? { ...s, transitions: [...s.transitions, transition] } : s)) });
     props.onSelectTransition(transition.id);
   }
@@ -313,8 +329,10 @@ export function WorkflowCanvas(props: Props) {
               >
                 <path class="wf-edge-hit" d={edge.d} />
                 <path class="wf-edge-line" d={edge.d} marker-end="url(#wf-arrow)" />
-                <Show when={edge.transition.label}>
-                  <text class="wf-edge-label" x={edge.label.x} y={edge.label.y}>{edge.transition.label}</text>
+                <Show when={edge.transition.prompt || edge.transition.label}>
+                  <text class="wf-edge-label" x={edge.label.x} y={edge.label.y}>
+                    {(edge.transition.prompt || edge.transition.label || "").slice(0, 18)}
+                  </text>
                 </Show>
               </g>
             )}
@@ -330,17 +348,18 @@ export function WorkflowCanvas(props: Props) {
             }}
           </Show>
 
-          <For each={[WF_DONE, WF_FAIL]}>
-            {(target) => {
-              const pos = () => terminalPos(target);
-              return (
-                <g class="wf-terminal" classList={{ fail: target === WF_FAIL }} transform={`translate(${pos().x},${pos().y})`} onPointerDown={(e) => onTerminalPointerDown(e, target)}>
-                  <rect class="wf-terminal-box" width={TERM_W} height={TERM_H} rx={20} />
-                  <text class="wf-terminal-text" x={TERM_W / 2} y={25}>{target === WF_FAIL ? "失败结束" : "成功结束"}</text>
-                </g>
-              );
-            }}
-          </For>
+          {/* 开始/结束只表达流程状态，不承载配置或业务语义。 */}
+          <Show when={startRoute()}>
+            <path class="wf-edge-line" d={startRoute()!} marker-end="url(#wf-arrow)" />
+          </Show>
+          <g class="wf-terminal" transform={`translate(${startPos().x},${startPos().y})`}>
+            <rect class="wf-terminal-box" width={TERM_W} height={TERM_H} rx={20} />
+            <text class="wf-terminal-text" x={TERM_W / 2} y={25}>开始</text>
+          </g>
+          <g class="wf-terminal" transform={`translate(${terminalPos().x},${terminalPos().y})`} onPointerDown={(e) => onTerminalPointerDown(e, WF_DONE)}>
+            <rect class="wf-terminal-box" width={TERM_W} height={TERM_H} rx={20} />
+            <text class="wf-terminal-text" x={TERM_W / 2} y={25}>结束</text>
+          </g>
 
           <For each={stages()}>
             {(stage) => (
@@ -355,7 +374,9 @@ export function WorkflowCanvas(props: Props) {
               >
                 <rect class="wf-node-box" width={NODE_W} height={NODE_H} rx={10} />
                 <text class="wf-node-name" x={NODE_W / 2} y={24}>{stage.name || "（未命名）"}</text>
-                <text class="wf-node-sub" x={NODE_W / 2} y={42}>{stage.reviewOnly ? "只读核验" : `${stage.transitions.length} 条转移`}</text>
+                <text class="wf-node-sub" x={NODE_W / 2} y={42}>
+                  {stage.manualReview ? `人工审核 · ${stage.transitions.length} 条连线` : `${stage.transitions.length} 条连线`}
+                </text>
                 <Show when={props.def.entry === stage.id}><text class="wf-node-entry" x={10} y={-6}>起点</text></Show>
                 <circle class="wf-node-handle" cx={NODE_W} cy={NODE_H / 2} r={8} onPointerDown={(e) => { e.stopPropagation(); startConnect(stage.id); }}>
                   <title>拖出连线</title>
