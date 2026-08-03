@@ -61,7 +61,7 @@ const MAX_HARD_BYTES = 64 * 1024;
 const SOFT_BYTES_RATIO = 0.64;
 /** 每个 `@@` 行段头的固定开销，计入预算，避免多块碎片把总量顶穿。 */
 const RANGE_HEADER_BYTES = 48;
-const MAX_FILES = 6;
+const MAX_FILES = 4;
 const MAX_UNITS_PER_FILE = 4;
 /** 命中所在单元至少要有这么多行才算"有分析价值"，否则上浮到父单元。 */
 const MIN_UNIT_LINES = 12;
@@ -83,9 +83,10 @@ const MAX_OUTLINE_TOP = 8;
 const MAX_OUTLINE_OTHER = 0;
 const MAX_CANDIDATES = 8;
 const MAX_KEYWORDS = 5;
-// task 最长 300 字；中文 2–5 gram 最多 1190 个，加少量 ASCII 标识符后仍有硬上限。
-const MAX_TASK_TOKENS = 1250;
-const CJK_NGRAM_MIN = 2;
+// task 只提供少量检索/排序词；完整中文滑窗会污染召回并放大 rg 参数。
+const MAX_TASK_TOKENS = 24;
+const MAX_ASCII_TASK_TOKENS = 8;
+const CJK_NGRAM_MIN = 3;
 const CJK_NGRAM_MAX = 5;
 const MAX_GRAPH_TERMS = 12;
 const MAX_HIT_LINES = 6000;
@@ -154,8 +155,8 @@ function rowsFromText(text) {
   return rows.sort((a, b) => Buffer.compare(Buffer.from(a.file), Buffer.from(b.file)) || a.ln - b.ln || Buffer.compare(Buffer.from(a.text), Buffer.from(b.text)));
 }
 
-async function searchInProcess(root, terms, ignoreCase, word) {
-  const files = await listCodeFiles(root);
+async function searchInProcess(root, terms, ignoreCase, word, scopedFiles = []) {
+  const files = scopedFiles.length ? scopedFiles : await listCodeFiles(root);
   const needles = terms.map((term) => ignoreCase ? term.toLowerCase() : term);
   const wordRes = word
     ? terms.map((term) => new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, ignoreCase ? 'i' : ''))
@@ -178,17 +179,38 @@ async function searchInProcess(root, terms, ignoreCase, word) {
 }
 
 /** 统一仓库文本检索：单次批量 rg → git grep → 有界进程内扫描。 */
-export async function searchText(root, terms, { ignoreCase = false, word = false } = {}) {
-  const list = [...new Set(terms.map((term) => String(term ?? '')).filter(Boolean))];
+export async function searchText(root, terms, { ignoreCase = false, word = false, files = [] } = {}) {
+  const seen = new Set();
+  const list = terms
+    .map((term) => String(term ?? ''))
+    .filter((term) => {
+      if (!term) return false;
+      const key = ignoreCase ? term.toLowerCase() : term;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   if (!list.length) return [];
+  const scopedFiles = [...new Set(files
+    .map((file) => String(file ?? '').replace(/\\/g, '/').replace(/^\.\//, ''))
+    .filter(Boolean))];
+  // 分块限定路径，避免 Windows 命令行上限；不因候选多而退化回全仓搜索。
+  if (scopedFiles.length > 128) {
+    const chunks = [];
+    for (let start = 0; start < scopedFiles.length; start += 128) chunks.push(scopedFiles.slice(start, start + 128));
+    const parts = await mapPool(chunks, 4, (chunk) => searchText(root, list, { ignoreCase, word, files: chunk }));
+    return parts.flat()
+      .sort((a, b) => Buffer.compare(Buffer.from(a.file), Buffer.from(b.file)) || a.ln - b.ln || Buffer.compare(Buffer.from(a.text), Buffer.from(b.text)))
+      .slice(0, MAX_HIT_LINES);
+  }
   const rg = resolveRgBin();
   if (rg) {
-    const args = ['-n', '--no-heading', '--color', 'never', '-F', '--max-count', String(MAX_HITS_PER_FILE)];
+    const args = ['-n', '--with-filename', '--no-heading', '--color', 'never', '-F', '--max-count', String(MAX_HITS_PER_FILE)];
     if (ignoreCase) args.push('-i');
     if (word) args.push('-w');
     for (const term of list) args.push('-e', term);
     for (const glob of RG_GLOBS) args.push('--glob', glob);
-    args.push('.');
+    args.push(...(scopedFiles.length ? scopedFiles : ['.']));
     return rowsFromText(await run(root, rg, args));
   }
   if (gitSearchAvailable(root)) {
@@ -197,10 +219,10 @@ export async function searchText(root, terms, { ignoreCase = false, word = false
     if (word) args.push('-w');
     args.push('-F');
     for (const term of list) args.push('-e', term);
-    args.push('--');
+    args.push('--', ...scopedFiles);
     return rowsFromText(await run(root, 'git', args));
   }
-  return searchInProcess(root, list, ignoreCase, word);
+  return searchInProcess(root, list, ignoreCase, word, scopedFiles);
 }
 
 function resolveOutputBudget(args) {
@@ -222,7 +244,7 @@ function scoreFilePrior(file) {
   return s;
 }
 
-/** task 里的 ASCII 标识符与中文字符 n-gram。中文不依赖词典、停用词或固定句式。 */
+/** task 里的少量 ASCII 标识符与高信息中文片段。其余自然语言只表达意图。 */
 function taskTokens(task) {
   const out = [];
   const seen = new Set();
@@ -234,14 +256,79 @@ function taskTokens(task) {
     out.push(t);
   };
   const text = String(task ?? '');
-  for (const m of text.matchAll(/[A-Za-z_$][\w$]{3,}/g)) add(m[0]);
-  for (const m of text.matchAll(/[\p{Script=Han}]{2,}/gu)) {
+  let asciiCount = 0;
+  for (const m of text.matchAll(/[A-Za-z_$][\w$]{3,}/g)) {
+    if (asciiCount >= MAX_ASCII_TASK_TOKENS) break;
+    const before = out.length;
+    add(m[0]);
+    if (out.length > before) asciiCount += 1;
+  }
+  for (const m of text.matchAll(/[\p{Script=Han}]{3,}/gu)) {
     const chars = [...m[0]];
+    add(chars.slice(-CJK_NGRAM_MIN).join(''));
     for (let size = Math.min(CJK_NGRAM_MAX, chars.length); size >= CJK_NGRAM_MIN; size--) {
       for (let start = 0; start + size <= chars.length; start++) add(chars.slice(start, start + size).join(''));
     }
   }
   return out;
+}
+
+const EXPLICIT_ANCHOR_RE = /^[A-Za-z_$][A-Za-z0-9_$-]{2,}$/;
+const ANCHOR_NOISE_PATH = /(?:^|\/)(?:docs?|examples?|fixtures?)\/|(?:^|\/)readme(?:\.|$)|\.(?:test|spec|eval|bench)\.[^.]+$|\/(?:__tests__|tests?|benches?)\//i;
+
+function namingVariants(value) {
+  const original = String(value ?? '').trim();
+  if (!EXPLICIT_ANCHOR_RE.test(original)) return [original].filter(Boolean);
+  const words = original
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .split(/[-_$]+/)
+    .filter(Boolean)
+    .map((word) => word.toLowerCase());
+  if (!words.length) return [original];
+  const pascal = words.map((word) => word[0].toUpperCase() + word.slice(1)).join('');
+  return [...new Set([
+    original,
+    words.join('_'),
+    words.join('-'),
+    `${words[0]}${pascal.slice(words[0].length)}`,
+    pascal,
+  ])];
+}
+
+function productionAnchorHit(rows, keyword) {
+  const variants = namingVariants(keyword).map((value) => value.toLowerCase());
+  return rows.some((row) => {
+    if (!isCodeFile(row.file) || ANCHOR_NOISE_PATH.test(row.file)) return false;
+    const line = row.text.toLowerCase();
+    return variants.some((variant) => line.includes(variant));
+  });
+}
+
+function sourceScope(file) {
+  const normalized = normalizeRepoPath(file);
+  if (normalized.startsWith('src-tauri/src/')) return 'src-tauri/src/';
+  const slash = normalized.indexOf('/');
+  return slash < 0 ? '' : normalized.slice(0, slash + 1);
+}
+
+function filesInSourceScopes(allFiles, seedFiles) {
+  const scopes = [...new Set(seedFiles.map(sourceScope))];
+  if (!scopes.length || scopes.includes('')) return allFiles;
+  return allFiles.filter((file) => scopes.some((scope) => file.startsWith(scope)));
+}
+
+function compactEvidenceMiss(revision, keywords, task) {
+  return [
+    `# CTX MISS @${revision}`,
+    `query: ${keywords.join(',')}`,
+    ...(task ? [`task: ${task}`] : []),
+    'status: no production definition or reference',
+    'evidence: exact/ignore-case/naming-variant search found 0 production occurrences; test/eval/doc mentions ignored',
+    'checked: symbol names, references, snake/kebab/pascal variants, string bindings',
+    'fallback: disabled; natural-language task terms cannot establish an explicit edit target',
+    'next: provide the missing source/path or correct the symbol name',
+  ].join('\n');
 }
 
 /** 先从任务预测会改到哪类关系，再从目标单元反向提取需要检索的符号。 */
@@ -490,35 +577,28 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   const task = String(args?.task ?? '').trim().slice(0, 300);
   const tTokens = taskTokens(task).filter((t) => !keywords.some((k) => k.toLowerCase() === t.toLowerCase()));
   const planIntent = retrievalPlan(task);
-  // 编辑任务默认把调用方和测试当候选闭包；只有任务明确要求时才升为 required。
-  const inferRelations = planIntent.active;
   const wantFiles = [...new Set((Array.isArray(args?.files) ? args.files : [])
     .map((f) => String(f ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, ''))
     .filter(Boolean))].slice(0, 6);
-  const terms = [...keywords, ...tTokens];
+  const explicitAnchors = keywords.filter((keyword) => EXPLICIT_ANCHOR_RE.test(keyword));
+  const anchorTerms = [...new Set(keywords.flatMap(namingVariants))];
+  const terms = [...new Set([...anchorTerms, ...tTokens])];
+  const initialTerms = explicitAnchors.length ? anchorTerms : terms;
   if (!terms.length && !wantFiles.length) return '错误: 需要 keywords / task / files 至少其一';
   const budget = Math.max(MIN_BUDGET, Math.min(Number(args?.budget) || DEFAULT_BUDGET, MAX_BUDGET));
   const { hardBytes, softBytes } = resolveOutputBudget(args);
 
-  const [rows0, rev0] = await Promise.all([
-    terms.length ? searchText(root, terms) : Promise.resolve([]),
+  const [rows, rev0] = await Promise.all([
+    initialTerms.length ? searchText(root, initialTerms, { ignoreCase: true }) : Promise.resolve([]),
     run(root, 'git', ['rev-parse', '--short', 'HEAD']).then((s) => s.trim()),
   ]);
   const rev = rev0 || 'unknown';
-
-  // 只有部分检索词零命中时，补一轮大小写不敏感检索（一次进程）
-  let rows = rows0;
-  const hitTerm = new Set();
-  for (const r of rows) for (const k of terms) if (r.text.includes(k)) hitTerm.add(k);
-  const missing = terms.filter((k) => !hitTerm.has(k));
-  let looseKw = [];
-  if (missing.length) {
-    const extra = await searchText(root, missing, { ignoreCase: true });
-    if (extra.length) {
-      rows = rows.concat(extra);
-      looseKw = missing.filter((k) => extra.some((r) => r.text.toLowerCase().includes(k.toLowerCase())));
-    }
+  const resolvedAnchors = explicitAnchors.filter((keyword) => productionAnchorHit(rows, keyword));
+  if (explicitAnchors.length && !resolvedAnchors.length && !wantFiles.length) {
+    return compactEvidenceMiss(rev, explicitAnchors, task);
   }
+  const looseKw = keywords.filter((keyword) => productionAnchorHit(rows, keyword)
+    && !rows.some((row) => !ANCHOR_NOISE_PATH.test(row.file) && row.text.includes(keyword)));
 
   /** @type {Map<string, { lns: Map<number, { kws: Set<string>, text: string }>, kws: Set<string> }>} */
   const hits = new Map();
@@ -564,7 +644,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     if (isSubject(file)) score += 600;
     if (wantFiles.includes(file)) score += 500;
     return { file, score };
-  }).sort((a, b) => b.score - a.score);
+  }).sort((a, b) => b.score - a.score || Buffer.compare(Buffer.from(a.file), Buffer.from(b.file)));
   const priorityFiles = [...new Set([
     ...wantFiles,
     ...preliminary.slice(0, MAX_CANDIDATES).map((r) => r.file),
@@ -576,13 +656,15 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     dependencyDepth: 3,
   });
 
-  const missedAll = keywords.filter((k) => !kwCount.has(k));
-  // task-only 调用也应建立目标定义。只纳入有限数量的 ASCII 标识符，避免中文
-  // n-gram 和自然语言词把 defs 全表匹配放大成二次扫描。
+  const missedAll = keywords.filter((keyword) => EXPLICIT_ANCHOR_RE.test(keyword)
+    ? !productionAnchorHit(rows, keyword)
+    : !kwCount.has(keyword));
+  // task-only 调用也应建立目标定义。显式符号加入常见命名变体；自然语言只纳入
+  // 少量合法 ASCII 标识符，避免 defs 全表模糊匹配膨胀。
   const seedTerms = [...new Set([
-    ...keywords,
+    ...anchorTerms,
     ...tTokens.filter((term) => /^[A-Za-z_$][\w$]{2,}$/.test(term)).slice(0, MAX_GRAPH_TERMS),
-  ])];
+  ])].slice(0, Math.max(MAX_GRAPH_TERMS, anchorTerms.length));
   const seeds = seedDefs(index, seedTerms);
 
   // 计划驱动二次检索：先看目标定义体，再搜索错误/配置/状态符号的处理方。
@@ -594,7 +676,8 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   }
   const plannedTerms = planTermsFromBodies(planIntent, index, seedBodies, terms);
   if (plannedTerms.length) {
-    const plannedRows = await searchText(root, plannedTerms);
+    const expansionFiles = filesInSourceScopes(index.allFiles ?? [], seedBodies.map((body) => body.file));
+    const plannedRows = await searchText(root, plannedTerms, { files: expansionFiles });
     terms.push(...plannedTerms);
     ingestRows(plannedRows, plannedTerms);
   }
@@ -610,8 +693,8 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     const referencesSeed = [...e.lns.values()].some((cell) => seedNames.some((name) => cell.text.includes(name)));
     const callsSeed = [...e.lns.values()].some((cell) => seedNames.some((name) => cell.text.includes(`${name}(`)));
     let bonus = 0;
-    if ((planIntent.callers || inferRelations) && callsSeed) bonus += 180;
-    if ((planIntent.tests || inferRelations) && referencesSeed && NOISE_PATH.test(file)) bonus += 220;
+    if (planIntent.callers && callsSeed) bonus += 180;
+    if (planIntent.tests && referencesSeed && NOISE_PATH.test(file)) bonus += 220;
     if (plannedTerms.some((term) => [...e.lns.values()].some((cell) => cell.text.includes(term)))) bonus += 140;
     return bonus;
   };
@@ -625,7 +708,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     if (wantFiles.includes(file)) s += 500;
     s += relationBonus(file, e);
     return { file, e, score: s };
-  }).sort((a, b) => b.score - a.score);
+  }).sort((a, b) => b.score - a.score || Buffer.compare(Buffer.from(a.file), Buffer.from(b.file)));
 
   for (const f of wantFiles) {
     if (!hits.has(f)) {
@@ -644,14 +727,17 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     ranked.push({ file: f, e: { lns: new Map(), kws: new Set() }, score: 550 });
   }
   // 追加后重排，保证 wantFiles > 主题文件 > 其余命中
-  ranked.sort((a, b) => b.score - a.score);
+  ranked.sort((a, b) => b.score - a.score || Buffer.compare(Buffer.from(a.file), Buffer.from(b.file)));
 
   const baseCandidateLimit = MAX_CANDIDATES + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 8192) * 2;
-  const candidateLimit = Math.min(20, Math.max(16, baseCandidateLimit));
+  const candidateLimit = Math.min(12, Math.max(MAX_CANDIDATES, baseCandidateLimit));
   const baseFileLimit = MAX_FILES + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 16384) * 2;
-  const fileLimit = Math.min(12, Math.max(8, baseFileLimit));
+  const fileLimit = Math.min(8, Math.max(MAX_FILES, baseFileLimit));
   const unitsPerFile = Math.min(8, MAX_UNITS_PER_FILE + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 16384));
-  let candidates = ranked.filter((r) => isCodeFile(r.file) || wantFiles.includes(r.file)).slice(0, candidateLimit);
+  let candidates = ranked
+    .filter((r) => (isCodeFile(r.file) || wantFiles.includes(r.file))
+      && (planIntent.tests || !NOISE_PATH.test(r.file) || wantFiles.includes(r.file) || seedFiles.has(r.file)))
+    .slice(0, candidateLimit);
   // 全是非代码文件时（配置/文档命中）也要展开，否则模型只拿到一堆位置还得自己去读
   if (!candidates.length) candidates = ranked.slice(0, 3);
 
@@ -728,9 +814,9 @@ export async function contextBundle(args = {}, root = repoRoot()) {
       const callsSeed = seedNames.some((name) => body.includes(`${name}(`));
       const plannedRelation = plannedTerms.some((name) => body.includes(name));
       g.role = g.tag === 'def' ? 'target'
-        : (planIntent.tests || inferRelations) && NOISE_PATH.test(file) && referencesSeed ? 'test'
+        : planIntent.tests && NOISE_PATH.test(file) && referencesSeed ? 'test'
           : planIntent.errors && plannedRelation ? 'handler'
-            : (planIntent.callers || inferRelations) && callsSeed ? 'caller'
+            : planIntent.callers && callsSeed ? 'caller'
               : 'related';
       // caller/test 的 required 是行为类别义务，不是“所有引用都必须展开”；
       // 子模覆盖会保留每类代表，其余留在 IMPACT。
@@ -1120,21 +1206,21 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   // ---- IMPACT（向上）：未展示的引用/调用行，单行清单
   const kwSet = new Set(keywords);
   const refs = [];
-  let totalRefs = 0;
-  for (const { file, e } of ranked) {
+  const impactEntries = ranked.filter(({ file }) => (planIntent.callers || planIntent.tests || !seeds.length)
+    && (planIntent.tests || !NOISE_PATH.test(file)));
+  for (const { file, e } of impactEntries) {
     for (const [ln, cell] of e.lns) {
       if (plan.has(file) && covers(file, ln)) continue;
       const isSeedRef = seedNames.length
         ? seedNames.some((n) => cell.text.includes(n))
         : [...kwSet].some((k) => cell.text.includes(k));
-      if (!isSeedRef) continue;
-      totalRefs += 1;
-      if (refs.length < impactLimit) refs.push(`${file}:${ln} ${cell.text.trim().slice(0, 120)}`);
+      if (isSeedRef) refs.push(`${file}:${ln} ${cell.text.trim().slice(0, 120)}`);
     }
   }
+  refs.sort();
   if (refs.length) {
-    push(`## IMPACT (调用方/引用清单 ${refs.length}/${totalRefs}, 仅行; 确需函数体按 path:ln 补读)`);
-    for (const r of refs) push(r);
+    push(`## IMPACT (调用方/引用清单 ${Math.min(refs.length, impactLimit)}/${refs.length}, 仅行; 确需函数体按 path:ln 补读)`);
+    for (const r of refs.slice(0, impactLimit)) push(r);
     push('');
   }
   const proof = [];
@@ -1166,7 +1252,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   if (!compactIndex) {
     if (missedAll.length) notes.push(`未命中关键词: ${missedAll.join(' ')}`);
     if (looseKw.length) notes.push(`忽略大小写才命中: ${looseKw.join(' ')}`);
-    const unexpanded = ranked.filter((r) => !plan.has(r.file)).map((r) => r.file);
+    const unexpanded = ranked.filter((r) => !plan.has(r.file)).map((r) => r.file).sort();
     if (unexpanded.length) notes.push(`其它命中文件(未展开): ${unexpanded.slice(0, 10).join(' ')}${unexpanded.length > 10 ? ` +${unexpanded.length - 10}` : ''}`);
   }
 

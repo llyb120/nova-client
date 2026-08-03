@@ -34,7 +34,7 @@ const FULL_FILE_MAX: usize = 100;
 const EXPLICIT_FULL_MAX: usize = 300;
 const SUBJECT_FULL_MAX: usize = 800;
 const MAX_SUBJECT_UNITS: usize = 30;
-const MAX_FILES: usize = 6;
+const MAX_FILES: usize = 4;
 const MAX_DEPS: usize = 8;
 const MAX_DEP_FILES: usize = 4;
 const MAX_IMPACT: usize = 20;
@@ -464,8 +464,13 @@ fn search_in_process(
     terms: &[String],
     ignore_case: bool,
     word: bool,
+    scoped_files: &[String],
 ) -> Vec<SearchRow> {
-    let files = list_code_files(root);
+    let files = if scoped_files.is_empty() {
+        list_code_files(root)
+    } else {
+        scoped_files.to_vec()
+    };
     let needles = terms
         .iter()
         .map(|term| {
@@ -538,16 +543,37 @@ fn search_text(
     terms: &[String],
     ignore_case: bool,
     word: bool,
-    _files: &[String],
+    files: &[String],
 ) -> Vec<SearchRow> {
     let mut seen = HashSet::new();
     let terms = terms
         .iter()
-        .filter(|term| !term.is_empty() && seen.insert((*term).clone()))
+        .filter(|term| {
+            let key = if ignore_case {
+                term.to_lowercase()
+            } else {
+                (*term).clone()
+            };
+            !term.is_empty() && seen.insert(key)
+        })
         .cloned()
         .collect::<Vec<_>>();
     if terms.is_empty() {
         return Vec::new();
+    }
+    if files.len() > 128 {
+        let mut rows = files
+            .chunks(128)
+            .flat_map(|chunk| search_text(root, &terms, ignore_case, word, chunk))
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then(a.ln.cmp(&b.ln))
+                .then(a.text.cmp(&b.text))
+        });
+        rows.truncate(MAX_HIT_LINES);
+        return rows;
     }
     static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
     let rg_available =
@@ -555,6 +581,7 @@ fn search_text(
     if rg_available {
         let mut args = vec![
             "-n".into(),
+            "--with-filename".into(),
             "--no-heading".into(),
             "--color".into(),
             "never".into(),
@@ -592,7 +619,11 @@ fn search_text(
             args.push("--glob".into());
             args.push(glob.into());
         }
-        args.push(".".into());
+        if files.is_empty() {
+            args.push(".".into());
+        } else {
+            args.extend(files.iter().cloned());
+        }
         if let Some(stdout) = run_command(root, "rg", &args) {
             return parse_search_rows(stdout);
         }
@@ -612,11 +643,12 @@ fn search_text(
             args.push(term.clone());
         }
         args.push("--".into());
+        args.extend(files.iter().cloned());
         if let Some(stdout) = run_command(root, "git", &args) {
             return parse_search_rows(stdout);
         }
     }
-    search_in_process(root, &terms, ignore_case, word)
+    search_in_process(root, &terms, ignore_case, word, files)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1670,8 +1702,9 @@ fn is_han(value: char) -> bool {
 }
 
 fn task_tokens(task: &str) -> Vec<String> {
-    const MAX_TASK_TOKENS: usize = 1250;
-    const CJK_NGRAM_MIN: usize = 2;
+    const MAX_TASK_TOKENS: usize = 24;
+    const MAX_ASCII_TASK_TOKENS: usize = 8;
+    const CJK_NGRAM_MIN: usize = 3;
     const CJK_NGRAM_MAX: usize = 5;
     static ASCII_TOKEN: OnceLock<Regex> = OnceLock::new();
     let token_re = ASCII_TOKEN.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]{3,}").unwrap());
@@ -1687,12 +1720,13 @@ fn task_tokens(task: &str) -> Vec<String> {
             out.push(token);
         }
     };
-    for found in token_re.find_iter(task) {
+    for found in token_re.find_iter(task).take(MAX_ASCII_TASK_TOKENS) {
         add(found.as_str().to_string());
     }
     let mut phrase = Vec::new();
     let flush = |phrase: &mut Vec<char>, add: &mut dyn FnMut(String)| {
         if phrase.len() >= CJK_NGRAM_MIN {
+            add(phrase[phrase.len() - CJK_NGRAM_MIN..].iter().collect());
             for size in (CJK_NGRAM_MIN..=CJK_NGRAM_MAX.min(phrase.len())).rev() {
                 for chars in phrase.windows(size) {
                     add(chars.iter().collect());
@@ -1710,6 +1744,122 @@ fn task_tokens(task: &str) -> Vec<String> {
     }
     flush(&mut phrase, &mut add);
     out
+}
+
+fn explicit_anchor(value: &str) -> bool {
+    static ANCHOR: OnceLock<Regex> = OnceLock::new();
+    ANCHOR
+        .get_or_init(|| Regex::new(r"^[A-Za-z_$][A-Za-z0-9_$-]{2,}$").unwrap())
+        .is_match(value)
+}
+
+fn naming_variants(value: &str) -> Vec<String> {
+    if !explicit_anchor(value) {
+        return (!value.is_empty())
+            .then(|| value.to_string())
+            .into_iter()
+            .collect();
+    }
+    static ACRONYM: OnceLock<Regex> = OnceLock::new();
+    static CAMEL: OnceLock<Regex> = OnceLock::new();
+    let separated = ACRONYM
+        .get_or_init(|| Regex::new(r"([A-Z]+)([A-Z][a-z])").unwrap())
+        .replace_all(value, "$1_$2");
+    let separated = CAMEL
+        .get_or_init(|| Regex::new(r"([a-z0-9])([A-Z])").unwrap())
+        .replace_all(&separated, "$1_$2");
+    let words = separated
+        .split(['-', '_', '$'])
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        return vec![value.to_string()];
+    }
+    let pascal = words
+        .iter()
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<String>();
+    let camel = words[0].clone() + &pascal[words[0].len()..];
+    let mut seen = HashSet::new();
+    [
+        value.to_string(),
+        words.join("_"),
+        words.join("-"),
+        camel,
+        pascal,
+    ]
+    .into_iter()
+    .filter(|variant| seen.insert(variant.clone()))
+    .collect()
+}
+
+fn anchor_noise_path(file: &str) -> bool {
+    static NOISE: OnceLock<Regex> = OnceLock::new();
+    NOISE
+        .get_or_init(|| Regex::new(r"(?i)(?:^|/)(?:docs?|examples?|fixtures?)/|(?:^|/)readme(?:\.|$)|\.(?:test|spec|eval|bench)\.[^.]+$|/(?:__tests__|tests?|benches?)/").unwrap())
+        .is_match(file)
+}
+
+fn production_anchor_hit(rows: &[SearchRow], keyword: &str) -> bool {
+    let variants = naming_variants(keyword)
+        .into_iter()
+        .map(|variant| variant.to_lowercase())
+        .collect::<Vec<_>>();
+    rows.iter().any(|row| {
+        if !is_code_file(&row.file) || anchor_noise_path(&row.file) {
+            return false;
+        }
+        let line = row.text.to_lowercase();
+        variants.iter().any(|variant| line.contains(variant))
+    })
+}
+
+fn source_scope(file: &str) -> &str {
+    if file.starts_with("src-tauri/src/") {
+        "src-tauri/src/"
+    } else {
+        file.find('/').map(|slash| &file[..=slash]).unwrap_or("")
+    }
+}
+
+fn files_in_source_scopes(all: &[String], seed_files: &[String]) -> Vec<String> {
+    let scopes = seed_files
+        .iter()
+        .map(|file| source_scope(file))
+        .collect::<HashSet<_>>();
+    if scopes.is_empty() || scopes.contains("") {
+        return all.to_vec();
+    }
+    all.iter()
+        .filter(|file| scopes.iter().any(|scope| file.starts_with(scope)))
+        .cloned()
+        .collect()
+}
+
+fn compact_evidence_miss(revision: &str, keywords: &[String], task: &str) -> String {
+    let mut lines = vec![
+        format!("# CTX MISS @{revision}"),
+        format!("query: {}", keywords.join(",")),
+    ];
+    if !task.is_empty() {
+        lines.push(format!("task: {task}"));
+    }
+    lines.extend([
+        "status: no production definition or reference".into(),
+        "evidence: exact/ignore-case/naming-variant search found 0 production occurrences; test/eval/doc mentions ignored".into(),
+        "checked: symbol names, references, snake/kebab/pascal variants, string bindings".into(),
+        "fallback: disabled; natural-language task terms cannot establish an explicit edit target"
+            .into(),
+        "next: provide the missing source/path or correct the symbol name".into(),
+    ]);
+    lines.join("\n")
 }
 
 fn stop_word(value: &str) -> bool {
@@ -2108,17 +2258,41 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .chars()
         .take(300)
         .collect::<String>();
-    let mut terms = keywords.clone();
-    for token in task_tokens(&task) {
-        if !terms.iter().any(|value| value.eq_ignore_ascii_case(&token)) {
-            terms.push(token);
+    let task_terms = task_tokens(&task)
+        .into_iter()
+        .filter(|token| {
+            !keywords
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(token))
+        })
+        .collect::<Vec<_>>();
+    let mut anchor_terms = Vec::new();
+    for keyword in &keywords {
+        for variant in naming_variants(keyword) {
+            if !anchor_terms
+                .iter()
+                .any(|value: &String| value.eq_ignore_ascii_case(&variant))
+            {
+                anchor_terms.push(variant);
+            }
         }
     }
-    let task_terms = terms
+    let mut terms = anchor_terms.clone();
+    for token in &task_terms {
+        if !terms.iter().any(|value| value.eq_ignore_ascii_case(token)) {
+            terms.push(token.clone());
+        }
+    }
+    let explicit_anchors = keywords
         .iter()
-        .skip(keywords.len())
+        .filter(|keyword| explicit_anchor(keyword))
         .cloned()
         .collect::<Vec<_>>();
+    let initial_terms = if explicit_anchors.is_empty() {
+        &terms
+    } else {
+        &anchor_terms
+    };
     let plan_intent = retrieval_plan(&task);
     let mut file_seen = HashSet::new();
     let files: Vec<String> = params
@@ -2148,13 +2322,13 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     let soft_bytes = hard * 64 / 100;
     let total_start = Instant::now();
     let stage = Instant::now();
-    let (mut all, mut rows, revision) = std::thread::scope(|scope| {
+    let (mut all, rows, revision) = std::thread::scope(|scope| {
         let files = scope.spawn(|| list_code_files(root));
         let search = scope.spawn(|| {
-            if terms.is_empty() {
+            if initial_terms.is_empty() {
                 Vec::new()
             } else {
-                search_text(root, &terms, false, false, &[])
+                search_text(root, initial_terms, true, false, &[])
             }
         });
         let revision = scope.spawn(|| short_rev(root));
@@ -2165,37 +2339,26 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         )
     });
     trace("fast_context.search_and_files", stage);
-    let exact_hits: HashSet<_> = terms
+    let resolved_anchors = explicit_anchors
         .iter()
-        .filter(|term| rows.iter().any(|row| row.text.contains(term.as_str())))
-        .cloned()
-        .collect();
-    let missing = terms
-        .iter()
-        .filter(|term| !exact_hits.contains(*term))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut loose_kw = Vec::new();
-    if !missing.is_empty() {
-        let extra = search_text(root, &missing, true, false, &all);
-        for term in &missing {
-            let lower = term.to_lowercase();
-            if extra
-                .iter()
-                .any(|row| row.text.to_lowercase().contains(&lower))
-            {
-                loose_kw.push(term.clone());
-            }
-        }
-        rows.extend(extra);
+        .filter(|keyword| production_anchor_hit(&rows, keyword))
+        .count();
+    if !explicit_anchors.is_empty() && resolved_anchors == 0 && files.is_empty() {
+        return Ok(compact_evidence_miss(&revision, &explicit_anchors, &task));
     }
-    let missed_all = keywords
+    let loose_kw = keywords
         .iter()
         .filter(|keyword| {
-            !rows
-                .iter()
-                .any(|row| row.text.to_lowercase().contains(&keyword.to_lowercase()))
+            production_anchor_hit(&rows, keyword)
+                && !rows
+                    .iter()
+                    .any(|row| !anchor_noise_path(&row.file) && row.text.contains(keyword.as_str()))
         })
+        .cloned()
+        .collect::<Vec<_>>();
+    let missed_all = keywords
+        .iter()
+        .filter(|keyword| !production_anchor_hit(&rows, keyword))
         .cloned()
         .collect::<Vec<_>>();
     for file in rows.iter().map(|row| &row.file).chain(files.iter()) {
@@ -2293,7 +2456,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             preliminary.push((f.clone(), if files.contains(f) { 1000 } else { 550 }));
         }
     }
-    preliminary.sort_by(|a, b| b.1.cmp(&a.1));
+    preliminary.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     preliminary.dedup_by(|a, b| a.0 == b.0);
     if preliminary.is_empty() {
         return Ok(format!("# CTX @{}\n无命中: {}\n提示: 换更短的符号名/字符串片段，或改用 find_symbols / grep 定位后用 read。",short_rev(root),terms.join(" ")));
@@ -2331,7 +2494,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     let mut seed_positions = HashMap::<(String, usize), usize>::new();
     // task-only 调用也应建立目标定义。只纳入有限数量的 ASCII 标识符，避免中文
     // n-gram 和自然语言词把 defs 全表匹配放大成二次扫描。
-    let mut seed_terms = keywords.clone();
+    let mut seed_terms = anchor_terms.clone();
     for term in task_terms.iter().filter(|term| {
         term.len() >= 3
             && term
@@ -2342,7 +2505,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
     }) {
-        if seed_terms.len() >= keywords.len() + MAX_GRAPH_TERMS {
+        if seed_terms.len() >= anchor_terms.len() + MAX_GRAPH_TERMS {
             break;
         }
         if !seed_terms
@@ -2394,7 +2557,12 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .collect::<Vec<_>>();
     let planned_terms = plan_terms_from_bodies(&plan_intent, &index, &seed_bodies, &terms);
     if !planned_terms.is_empty() {
-        let planned_rows = search_text(root, &planned_terms, false, false, &all);
+        let seed_body_files = seed_bodies
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<Vec<_>>();
+        let expansion_files = files_in_source_scopes(&all, &seed_body_files);
+        let planned_rows = search_text(root, &planned_terms, false, false, &expansion_files);
         terms.extend(planned_terms.iter().cloned());
         for row in planned_rows {
             if !hit_files.contains_key(&row.file) {
@@ -2468,10 +2636,10 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                     .iter()
                     .any(|name| row.text.contains(&format!("{name}(")))
             });
-            if (plan_intent.callers || plan_intent.active) && calls_seed {
+            if plan_intent.callers && calls_seed {
                 score += 180.0;
             }
-            if (plan_intent.tests || plan_intent.active) && references_seed && noise_path(file) {
+            if plan_intent.tests && references_seed && noise_path(file) {
                 score += 220.0;
             }
             if rows
@@ -2498,16 +2666,26 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             ranked.push((file.clone(), 550.0));
         }
     }
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let base_candidate_limit = MAX_CANDIDATES + hard.saturating_sub(DEFAULT_HARD_BYTES) / 8192 * 2;
-    let candidate_limit = base_candidate_limit.max(16).min(20);
+    let candidate_limit = base_candidate_limit.max(MAX_CANDIDATES).min(12);
     let base_file_limit = MAX_FILES + hard.saturating_sub(DEFAULT_HARD_BYTES) / 16384 * 2;
-    let file_limit = base_file_limit.max(8).min(12);
+    let file_limit = base_file_limit.max(MAX_FILES).min(8);
     let units_per_file =
         (MAX_UNITS_PER_FILE + hard.saturating_sub(DEFAULT_HARD_BYTES) / 16384).min(8);
     let mut final_candidates = ranked
         .iter()
-        .filter(|(file, _)| is_code_file(file) || files.contains(file))
+        .filter(|(file, _)| {
+            (is_code_file(file) || files.contains(file))
+                && (plan_intent.tests
+                    || !noise_path(file)
+                    || files.contains(file)
+                    || seed_files.contains(file))
+        })
         .take(candidate_limit)
         .cloned()
         .collect::<Vec<_>>();
@@ -2644,14 +2822,11 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             let planned_relation = planned_terms.iter().any(|name| body.contains(name));
             unit.role = if unit.tag == "def" {
                 "target"
-            } else if (plan_intent.tests || plan_intent.active)
-                && noise_path(file)
-                && references_seed
-            {
+            } else if plan_intent.tests && noise_path(file) && references_seed {
                 "test"
             } else if plan_intent.errors && planned_relation {
                 "handler"
-            } else if (plan_intent.callers || plan_intent.active) && calls_seed {
+            } else if plan_intent.callers && calls_seed {
                 "caller"
             } else {
                 "related"
@@ -3310,8 +3485,10 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             }
         }
         let mut impacts = Vec::new();
-        let mut total_refs = 0usize;
-        for (file, _) in &ranked {
+        for (file, _) in ranked.iter().filter(|(file, _)| {
+            (plan_intent.callers || plan_intent.tests || seeds.is_empty())
+                && (plan_intent.tests || !noise_path(file))
+        }) {
             let Some(rows) = hit_files.get(file) else {
                 continue;
             };
@@ -3327,11 +3504,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 } else {
                     seed_names.iter().any(|name| row.text.contains(name))
                 };
-                if !seed_ref {
-                    continue;
-                }
-                total_refs += 1;
-                if impacts.len() < impact_limit {
+                if seed_ref {
                     impacts.push(format!(
                         "{}:{} {}",
                         file,
@@ -3341,12 +3514,14 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 }
             }
         }
+        impacts.sort();
         if !impacts.is_empty() {
             body.push(format!(
-                "## IMPACT (调用方/引用清单 {}/{total_refs}, 仅行; 确需函数体按 path:ln 补读)",
+                "## IMPACT (调用方/引用清单 {}/{}, 仅行; 确需函数体按 path:ln 补读)",
+                impacts.len().min(impact_limit),
                 impacts.len()
             ));
-            body.extend(impacts);
+            body.extend(impacts.into_iter().take(impact_limit));
             body.push(String::new());
         }
         let target_count = seeds
@@ -3449,11 +3624,12 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             if !loose_kw.is_empty() {
                 notes.push(format!("忽略大小写才命中: {}", loose_kw.join(" ")));
             }
-            let unexpanded = ranked
+            let mut unexpanded = ranked
                 .iter()
                 .filter(|(file, _)| !plans.iter().any(|plan| plan.file == *file))
                 .map(|(file, _)| file)
                 .collect::<Vec<_>>();
+            unexpanded.sort();
             if !unexpanded.is_empty() {
                 notes.push(format!(
                     "其它命中文件(未展开): {}{}",
@@ -3614,7 +3790,7 @@ mod tests {
         assert!(tokens.iter().any(|token| token == "支持中心"));
         assert!(tokens.iter().any(|token| token == "问题反馈"));
         assert!(tokens.iter().any(|token| token == "处理器"));
-        assert!(tokens.len() <= 1250);
+        assert!(tokens.len() <= 24);
     }
 
     #[test]
@@ -3640,6 +3816,62 @@ mod tests {
         assert!(out.contains("export function target"));
         assert!(out.contains("\n}"));
         assert!(!out.contains("partial"));
+    }
+
+    #[test]
+    fn explicit_symbol_miss_stops_before_task_fallback() {
+        let d = tempdir().unwrap();
+        let anchor = ["add", "Compare"].concat();
+        fs::write(
+            d.path().join("filter.ts"),
+            "export function filterRequestParams(value) { return value; }\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("compare.test.ts"),
+            format!("export const requestedName = '{anchor}';\n"),
+        )
+        .unwrap();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({
+                "keywords":[anchor],
+                "task":"修复接口参数过滤问题；定位实现、调用方和测试"
+            }),
+        )
+        .unwrap();
+        assert!(out.starts_with("# CTX MISS"), "{out}");
+        assert!(
+            out.contains("status: no production definition or reference"),
+            "{out}"
+        );
+        assert!(!out.contains("filterRequestParams"), "{out}");
+        assert!(out.len() < 2048, "{}", out.len());
+    }
+
+    #[test]
+    fn scoped_search_only_returns_requested_files() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/a.ts"),
+            "export const bridge = 'shared';\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("src/b.ts"),
+            "export const bridge = 'shared';\n",
+        )
+        .unwrap();
+        let rows = search_text(
+            d.path(),
+            &["shared".into()],
+            false,
+            false,
+            &["src/b.ts".into()],
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].file, "src/b.ts");
     }
 
     #[test]
@@ -3792,7 +4024,11 @@ mod tests {
         assert!(out.contains("### src/zebra_engine.ts"), "{out}");
         assert!(out.contains("export function zebraMarker"), "{out}");
         assert!(!out.contains("export function laterFlow"), "{out}");
-        assert!(out.find("src/zebra_engine.ts") < out.find("src/zebra.test.ts"));
+        assert!(!out.contains("### src/zebra.test.ts"), "{out}");
+        assert!(
+            out.contains("其它命中文件(未展开): src/zebra.test.ts"),
+            "{out}"
+        );
     }
 
     #[test]

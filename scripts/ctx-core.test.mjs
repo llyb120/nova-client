@@ -196,6 +196,52 @@ test("fast_context: 命中给完整符号体, 跨文件 import 依赖定义完�
   }
 });
 
+test("fast_context: 显式符号未命中时返回 compact evidence miss，不被任务泛词带偏", async () => {
+  const missingAnchor = ["add", "Compare"].join("");
+  const dir = await fixture({
+    "src/filter.ts": "export function filterRequestParams(value) { return value; }\n",
+    "src/compare.test.ts": `export const requestedName = '${missingAnchor}';\n`,
+  });
+  try {
+    const out = await contextBundle({
+      keywords: [missingAnchor],
+      task: `修复 ${missingAnchor} 接口参数过滤问题；定位实现、调用方和测试`,
+    }, dir);
+    assert.match(out, /^# CTX MISS/m);
+    assert.match(out, /status: no production definition or reference/);
+    assert.match(out, /test\/eval\/doc mentions ignored/);
+    assert.doesNotMatch(out, /filterRequestParams/);
+    assert.ok(Buffer.byteLength(out, "utf8") < 2048, out);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("fast_context: 显式 camelCase 可经 snake_case 字符串桥建立种子并闭包", async () => {
+  const camelAnchor = ["add", "Compare"].join("");
+  const dir = await fixture({
+    "src/ipc.ts": [
+      "import { invoke } from '@tauri-apps/api/core';",
+      "export function submitCompare(request) { return invoke('add_compare', { request }); }",
+    ].join("\n"),
+    "src-tauri/src/lib.rs": [
+      "#[tauri::command]",
+      "pub fn add_compare(request: String) -> String { request }",
+    ].join("\n"),
+  });
+  try {
+    const out = await contextBundle({
+      keywords: [camelAnchor],
+      task: `修改 ${camelAnchor} API，检查调用方`,
+    }, dir);
+    assert.doesNotMatch(out, /# CTX MISS/);
+    assert.match(out, /pub fn add_compare/);
+    assert.match(out, /invoke\('add_compare'/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("fast_context: Rust use 路径的依赖同样精确闭包", async () => {
   const filler = Array.from({ length: 160 }, (_, i) => `pub const PAD_${i}: u8 = ${i % 256};`).join("\n");
   const dir = await fixture({
@@ -448,7 +494,7 @@ test("fast_context: 文件名命中的主题文件优先打包, 正文零命中�
   }
 });
 
-test("fast_context: 大主题文件按命中优先通读打包, 测试文件不抢预算", async () => {
+test("fast_context: 解析到目标定义后不通读同名大文件，测试引用只留 IMPACT", async () => {
   const filler = Array.from({ length: 830 }, (_, i) => `export const PAD_${i} = ${i};`).join("\n");
   const dir = await fixture({
     "src/zebra_engine.ts": [
@@ -469,13 +515,14 @@ test("fast_context: 大主题文件按命中优先通读打包, 测试文件不�
   });
   try {
     const out = await contextBundle({ keywords: ["zebra"] }, dir);
-    // 大主题（>800L）不整给，但命中单元与无命中单元都打包，且无 partial
+    // 高置信目标存在时只给目标单元；同文件无关单元和未请求测试不抢正文预算。
     assert.match(out, /### src\/zebra_engine\.ts \(838L\) shown=/);
     assert.match(out, /export function zebraMarker/);
-    assert.match(out, /export function laterFlow/);
+    assert.doesNotMatch(out, /export function laterFlow/);
+    assert.match(out, /~ 836 laterFlow/);
+    assert.doesNotMatch(out, /### src\/zebra\.test\.ts/);
+    assert.match(out, /其它命中文件\(未展开\): src\/zebra\.test\.ts/);
     assert.doesNotMatch(out, /partial/);
-    // 主题文件排在测试文件之前
-    assert.ok(out.indexOf("### src/zebra_engine.ts") < out.indexOf("### src/zebra.test.ts"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -532,6 +579,19 @@ test("searchText: fast_context 与 find_symbols 共用批量搜索抽象", async
     const rows = await searchText(dir, ["sharedSearch"], { word: true });
     assert.equal(rows.length, 2);
     assert.deepEqual([...new Set(rows.map((r) => r.file))].sort(), ["src/a.ts", "src/b.ts"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("searchText: files 可把后续图扩张限定到候选文件", async () => {
+  const dir = await fixture({
+    "src/a.ts": "export const bridge = 'shared';\n",
+    "src/b.ts": "export const bridge = 'shared';\n",
+  });
+  try {
+    const rows = await searchText(dir, ["shared"], { files: ["src/b.ts"] });
+    assert.deepEqual([...new Set(rows.map((row) => row.file))], ["src/b.ts"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -600,8 +660,7 @@ test("fast_context: maxBytes 只在完整边界收敛且不产生半截标记", 
     const out = await contextBundle({ keywords: ["bounded"], maxBytes: 8192 }, dir);
     assert.ok(Buffer.byteLength(out, "utf8") <= 8192);
     assert.doesNotMatch(out, /\[truncated\]|partial/);
-    assert.match(out, /## SIG/);
-    assert.match(out, /src\/f\d+\.ts:1 export function bounded\d+\(\)/);
+    assert.match(out, /## SIG|其它命中文件\(未展开\)/);
     for (const block of out.split(/^@@ /m).slice(1)) {
       assert.match(block, /\n\}/, "每个输出函数单元必须包含闭合花括号");
     }

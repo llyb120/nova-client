@@ -30,6 +30,10 @@
     "test:nova-context-service": "node --test scripts/nova-context-service.test.mjs",
     "test:context-parity": "node scripts/audit-context-parity.mjs && node scripts/alkaid-context-super.test.mjs && node scripts/cursor-context-super.test.mjs",
     "eval:context": "node scripts/ctx-core.eval.mjs",
+    "eval:context-strategies": "node scripts/ctx-strategy.eval.mjs",
+    "eval:context-strategies:devin": "node scripts/ctx-strategy.eval.mjs --live --model=swe-1-6",
+    "eval:addcompare-real": "node scripts/addcompare-real.eval.mjs",
+    "eval:addcompare-real:devin": "node scripts/addcompare-real.eval.mjs --live --model=swe-1-6",
     "test:native-context-differential": "node scripts/audit-native-context-random.mjs",
     "audit:native-context": "node scripts/audit-native-context.mjs && npm run test:native-context-differential"
   },
