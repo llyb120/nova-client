@@ -783,7 +783,7 @@ export function clearPendingClueCard() {
 }
 
 /** 打开新会话页；若当前在会话中，把工作目录与模型带给 HomeView。 */
-export function openNewSession() {
+export function openNewSession(quote = "") {
   const id = state.currentId;
   if (id) {
     const meta = state.threads.find((thread) => thread.id === id);
@@ -796,6 +796,7 @@ export function openNewSession() {
       reasoningEffort: state.reasoningEffort,
       roam: null,
       quotaPeerToken: null,
+      quote: quote.trim(),
     };
     if (meta?.roamingRole === "guest" && state.roamingPeer) {
       seed.roam = { peerToken: state.roamingPeer, folder: state.cwd };

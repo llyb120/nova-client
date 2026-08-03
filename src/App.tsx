@@ -14,6 +14,7 @@ import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
 import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
+import { selectedChatText } from "./chatSelection";
 import { mountSessionShortcuts } from "./sessionShortcuts";
 import { initStore, openNewSession, state } from "./store";
 
@@ -44,7 +45,7 @@ export default function App() {
   // 快速新会话快捷键在任意页面生效（与侧栏「新对话」一致，会话中继承目录/模型）。
   mountSessionShortcuts({
     allowedActions: ["newSession"],
-    onNewSession: () => openNewSession(),
+    onNewSession: () => openNewSession(selectedChatText()),
   });
 
   onMount(() => {

@@ -381,6 +381,8 @@ export interface PendingNewSessionSeed {
   reasoningEffort: string;
   roam: { peerToken: string; folder: string } | null;
   quotaPeerToken: string | null;
+  /** 快捷键触发时，聊天记录中选中的引用文本。 */
+  quote: string;
 }
 
 export interface Settings {

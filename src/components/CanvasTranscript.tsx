@@ -1,5 +1,6 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, stripAnsi } from "../utils";
@@ -2368,6 +2369,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const b = idx >= 0 ? blocks[idx] : null;
 
     if (b?.selectable) {
+      clearCanvasChatSelection();
       const pos = hitTextPosition(e.clientX, e.clientY);
       if (pos) {
         selecting = true;
@@ -2379,6 +2381,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
     }
     selection = null;
+    clearCanvasChatSelection();
     paintAll();
   }
 
@@ -2392,6 +2395,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (selection && selection.startBlock === selection.endBlock && selection.startOffset === selection.endOffset) {
         selection = null;
       }
+      if (selection) setCanvasChatSelection(selectionText(blocks, selection));
+      else clearCanvasChatSelection();
       paintAll();
       return;
     }
@@ -2602,6 +2607,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       canvasEl.removeEventListener("wheel", onWheel);
       canvasEl.removeEventListener("copy", onCopy);
       endScrollDrag();
+      clearCanvasChatSelection();
     });
   });
 

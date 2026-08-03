@@ -50,6 +50,7 @@ const LAST_NEW_THREAD_PROJECT_KEY = "fd:lastNewThreadProject";
 export function HomeView() {
   const sessionSeed = takePendingNewSessionSeed();
   const [text, setText] = createSignal("");
+  const [quote, setQuote] = createSignal(sessionSeed?.quote ?? "");
   const [cursor, setCursor] = createSignal(0);
   const [slashStart, setSlashStart] = createSignal<number | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
@@ -571,6 +572,8 @@ export function HomeView() {
     opts: { ephemeral?: boolean; worktree?: boolean; branch?: string; base?: string } = {},
   ) => {
     const t = text().trim();
+    const quoted = quote().trim();
+    const prompt = quoted ? `<nova_quote>\n${quoted}\n</nova_quote>\n\n${t}` : t;
     const images = attach.images();
     const target = roam();
     const quota = quotaPeer();
@@ -600,18 +603,18 @@ export function HomeView() {
           agentKind(),
           model(),
           mode(),
-          t,
+          prompt,
           clue?.id ?? "",
           wtOn,
           branch,
           base,
         );
         if (clue) clearPendingClueCard();
-        await sendPrompt(t, images);
+        await sendPrompt(prompt, images);
       } else if (quota) {
         await createQuotaThread(quota, cwd(), agentKind(), model(), mode(), clue?.id ?? "");
         if (clue) clearPendingClueCard();
-        await sendPrompt(t, images);
+        await sendPrompt(prompt, images);
       } else if (wtOn) {
         // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词。
         // 先校验 /fire，避免建完 worktree 才因语法错误失败。
@@ -629,7 +632,7 @@ export function HomeView() {
           clue?.id ?? "",
         );
         if (clue) clearPendingClueCard();
-        stashWorktreePrompt(id, t, images);
+        stashWorktreePrompt(id, prompt, images);
       } else {
         const ephemeral = opts.ephemeral ?? false;
         await createThread(
@@ -646,9 +649,10 @@ export function HomeView() {
         );
         if (!ephemeral) lastUsed.setModel(agentKind(), model());
         if (clue) clearPendingClueCard();
-        await sendPrompt(t, images, employeeId);
+        await sendPrompt(prompt, images, employeeId);
       }
       setText("");
+      setQuote("");
       setSlashStart(null);
       setRoam(null);
       setQuotaPeer(null);
@@ -854,6 +858,22 @@ export function HomeView() {
             token={roam()?.peer.token || state.settings?.relayToken || ""}
           />
           <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
+          <Show when={quote()}>
+            <div class="clue-context-chip" title={quote()}>
+              <IconClue size={13} />
+              <span class="clue-context-label">会话引用</span>
+              <span class="clue-context-separator" aria-hidden="true" />
+              <span class="clue-context-title">{quote()}</span>
+              <button
+                type="button"
+                aria-label="移除会话引用"
+                title="移除会话引用"
+                onClick={() => setQuote("")}
+              >
+                <IconX size={12} />
+              </button>
+            </div>
+          </Show>
           <Show when={state.pendingClueCard}>
             {(clue) => (
               <div class="clue-context-chip" title={`引用线索：${clue().title}`}>
