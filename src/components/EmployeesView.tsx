@@ -5,7 +5,6 @@ import { api } from "../ipc";
 import {
   enabledAgentKinds,
   ensureModelOptions,
-  modeChoices,
   refreshEmployees,
   resolveAvailableModel,
   setView,
@@ -363,13 +362,8 @@ export function EmployeesView() {
     void ensureModelOptions(fMindAgent());
     const nextMind = resolveAvailableModel(fMindAgent(), fMindModel());
     if (nextMind !== fMindModel()) setFMindModel(nextMind);
-    // 运行权限必须是该后端真实支持的模式，否则会话创建/设置模式时后端会报错（巡查出错的根因）。
-    // 与新会话一致：空值/非法值（如把 Devin 的 accept-edits 用到 Codex 上）回退到第一项，
-    // 保证所见即所存、且始终把合法 mode 发给后端。
-    const modes = modeChoices(k);
-    if (modes.length > 0 && !modes.some((m) => m.id === fMode())) {
-      setFMode(modes[0].id);
-    }
+    // 运行权限固定 Build；Plan 仅由会话内 /plan 启动，不在员工配置里选择。
+    setFMode("build");
   });
 
   const resetForm = () => {
@@ -421,7 +415,7 @@ export function EmployeesView() {
     setFWorkDays(e.workHours?.days?.length ? [...e.workHours.days] : [1, 2, 3, 4, 5]);
     setFEnabled(e.enabled);
     setFAllowWorktree(e.allowWorktree ?? false);
-    setFMode(e.mode ?? "");
+    setFMode("build");
     setFDirective(e.directive);
     setFMarkScope(e.markScope);
     setFSharedLedger(e.sharedLedger);
@@ -441,7 +435,7 @@ export function EmployeesView() {
     setFErr("");
     try {
       const editId = editingId();
-      const mode = fMode().trim() || null;
+      const mode = "build";
       const model = fModel().trim() || null;
       const heartbeatAgentKind = fHeartbeatAgent();
       const heartbeatModel = fHeartbeatModel().trim() || null;
@@ -1071,24 +1065,22 @@ export function EmployeesView() {
               </label>
 
               <label class="field">
-                <span class="field-label">工作模型与运行权限</span>
+                <span class="field-label">工作模型</span>
                 <div class="emp-config-row">
                   <ConfigSelects
                     agentKind={fAgent()}
                     agentKinds={enabledAgentKinds()}
                     model={fModel()}
-                    mode={fMode()}
                     onPickModel={(k, m) => {
                       setFAgent(k);
                       setFModel(m);
                     }}
-                    onMode={setFMode}
                     portal
                   />
                 </div>
                 <span class="emp-field-hint">
-                  和新会话完全一样：模型下拉里直接选后端与模型；无人值守建议权限选「全自动 ·
-                  Bypass」，员工执行时不再弹确认。
+                  和新会话完全一样：模型下拉里直接选后端与模型。运行权限固定为
+                  Build（全自动执行）；需要规划时在会话里用 /plan。
                 </span>
               </label>
 

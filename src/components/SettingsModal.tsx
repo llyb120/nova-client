@@ -10,7 +10,6 @@ import {
   enabledAgentKinds,
   ensureModelOptions,
   modelChoices,
-  normalizeUnifiedMode,
   preloadPeerModels,
   refreshQuota,
   refreshRelayStatus,
@@ -90,12 +89,6 @@ const CURSOR_CONTEXT_WINDOW_OPTIONS = [
   { value: 512_000, label: "512K tokens" },
   { value: 1_000_000, label: "1M tokens" },
   { value: 2_000_000, label: "2M tokens" },
-];
-
-/** 统一会话模式（与 store.UNIFIED_MODES 一致，带说明文案） */
-const UNIFIED_MODE_OPTIONS = [
-  { id: "build", name: "Build（放开全部权限，自动执行）" },
-  { id: "plan", name: "Plan（只规划不执行）" },
 ];
 
 /** 点击后按下组合键录制快捷键。 */
@@ -290,10 +283,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [claudecodeEnabled, setClaudecodeEnabled] = createSignal(s?.claudecodeEnabled !== false);
   const [cursorEnabled, setCursorEnabled] = createSignal(s?.cursorEnabled !== false);
   const [opencodeEnabled, setOpencodeEnabled] = createSignal(s?.opencodeEnabled !== false);
-  // 旧值（bypass 等）归一到统一模式 build/plan
-  const [defaultMode, setDefaultMode] = createSignal(
-    normalizeUnifiedMode(s?.defaultMode) ?? s?.defaultMode ?? "",
-  );
+  // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
   const [lightweightAgent, setLightweightAgent] = createSignal<AgentKind>(
     (s?.lightweightModelAgent as AgentKind) || "alkaid",
   );
@@ -621,7 +611,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     vegaContextMode: vegaContextMode(),
     cursorContextMode: cursorContextMode(),
     opencodeProxy: opencodeProxy().trim(),
-    defaultMode: defaultMode(),
+    defaultMode: "build",
     lightweightModelAgent: lightweightAgent(),
     lightweightModel: lightweightModel().trim(),
     editor: editor().trim() || "code",
@@ -746,9 +736,6 @@ export function SettingsModal(props: { onClose: () => void }) {
       setDeleting(false);
     }
   };
-
-  // 统一模式：全后端只有 Build / Plan 两种（Rust 侧翻译成各后端真实模式 id）
-  const modes = () => UNIFIED_MODE_OPTIONS;
 
   // worktree 管理
   const [worktreeDir, setWorktreeDir] = createSignal(s?.worktreeDir ?? "");
@@ -1077,21 +1064,6 @@ export function SettingsModal(props: { onClose: () => void }) {
           <Show when={tab() === "general"}>
             <section class="settings-group">
               <h3 class="settings-group-title">会话</h3>
-              <label class="field">
-                <span class="field-label">新会话默认模式</span>
-                <select
-                  class="field-input"
-                  value={defaultMode()}
-                  onChange={(e) => setDefaultMode(e.currentTarget.value)}
-                >
-                  <option value="">跟随 agent 默认</option>
-                  <For each={modes()}>{(m) => <option value={m.id}>{m.name}</option>}</For>
-                </select>
-                <span class="field-hint">
-                  新建会话未手动选择模式时使用。Build 等价原 Bypass Permissions（全部自动批准）。
-                </span>
-              </label>
-
               <label class="field">
                 <span class="field-label">会话历史展示方式</span>
                 <select

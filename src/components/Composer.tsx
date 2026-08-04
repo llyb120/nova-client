@@ -25,7 +25,6 @@ import {
   pickThreadModel,
   refreshSlashCommands,
   sendPrompt,
-  setThreadMode,
   setView,
   state,
 } from "../store";
@@ -742,10 +741,8 @@ export function Composer() {
             agentKind={state.agentKind}
             agentKinds={agentKinds()}
             model={state.model}
-            mode={state.mode}
             modelSource={usesPeerModels() ? guestModelSource : undefined}
             onPickModel={(k, m) => void pickThreadModel(k, m)}
-            onMode={(v) => void setThreadMode(v)}
             anchorTo=".composer"
             favorites
           />

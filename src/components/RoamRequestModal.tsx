@@ -15,7 +15,7 @@ export function RoamRequestModal() {
   const [prompt, setPrompt] = createSignal("");
   const [folder, setFolder] = createSignal("");
   const [model, setModel] = createSignal("");
-  const [mode, setMode] = createSignal("");
+  const [mode, setMode] = createSignal("build");
   const [worktree, setWorktree] = createSignal(false);
   const [worktreeBranch, setWorktreeBranch] = createSignal("");
   const [worktreeBase, setWorktreeBase] = createSignal("");
@@ -27,7 +27,7 @@ export function RoamRequestModal() {
     setPrompt(req.prompt ?? "");
     setFolder(req.folder);
     setModel(req.model ?? "");
-    setMode(req.mode ?? "");
+    setMode("build");
     setWorktree(req.worktree ?? false);
     setWorktreeBranch(req.worktreeBranch ?? "");
     setWorktreeBase(req.worktreeBase ?? "");
@@ -143,10 +143,8 @@ export function RoamRequestModal() {
                   <ConfigSelects
                     agentKind={req().agentKind}
                     model={model()}
-                    mode={mode()}
                     portal
                     onPickModel={(_, value) => setModel(value)}
-                    onMode={setMode}
                   />
                 </div>
               </Show>

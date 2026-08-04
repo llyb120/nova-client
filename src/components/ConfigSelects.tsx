@@ -3,9 +3,7 @@ import {
   ALL_AGENT_KINDS,
   ensureModelOptions,
   lastUsed,
-  modeChoices,
   modelChoices,
-  normalizeUnifiedMode,
   resolveAvailableModel,
   state,
 } from "../store";
@@ -308,14 +306,12 @@ export function ConfigSelects(props: {
   /** 可切换的后端列表（已启用）；提供后始终展示后端一级，再按需加载其模型 */
   agentKinds?: AgentKind[];
   model: string;
-  mode: string;
-  /** 模型/模式选项来源（漫游时用对端列表）；不传则用本机全局列表 */
+  /** 模型选项来源（漫游时用对端列表）；不传则用本机全局列表 */
   modelSource?: ModelOptionsSource;
   sharedModels?: SharedModelSource[];
   quotaPeerToken?: string | null;
   /** 一次性提交「后端 + 模型」；单后端时 agentKind 即当前后端 */
   onPickModel: (agentKind: AgentKind, model: string, quotaPeer?: QuotaModelPeer | null) => void;
-  onMode: (v: string) => void;
   /** 浮层是否用 Portal 渲染到 body（在弹窗/受限容器里避免被裁剪） */
   portal?: boolean;
   /** 浮层水平对齐到最近的祖先容器（如 composer），见 SearchSelect.anchorTo */
@@ -323,47 +319,18 @@ export function ConfigSelects(props: {
   /** 显示模型收藏入口。 */
   favorites?: boolean;
 }) {
-  const sourceOf = (k: AgentKind) => props.modelSource?.(k);
-
-  const modeOptions = createMemo(() =>
-    modeChoices(props.agentKind, sourceOf(props.agentKind)).map((m) => ({
-      value: m.id,
-      label: m.name,
-    })),
-  );
-
-  // 有效模式值：命中当前值则用它；旧值（bypass 等）归一到统一模式；否则回退第一项（Build）
-  const modeValue = createMemo(() => {
-    const opts = modeChoices(props.agentKind, sourceOf(props.agentKind));
-    if (props.mode && opts.some((m) => m.id === props.mode)) return props.mode;
-    const norm = normalizeUnifiedMode(props.mode);
-    if (norm && opts.some((m) => m.id === norm)) return norm;
-    return opts[0]?.id ?? "";
-  });
-
   return (
-    <>
-      <SearchSelect
-        prefix="模式"
-        title="会话模式"
-        value={modeValue()}
-        options={modeOptions()}
-        onChange={props.onMode}
-        portal={props.portal}
-        anchorTo={props.anchorTo}
-      />
-      <ModelPicker
-        agentKind={props.agentKind}
-        agentKinds={props.agentKinds}
-        model={props.model}
-        modelSource={props.modelSource}
-        sharedModels={props.sharedModels}
-        quotaPeerToken={props.quotaPeerToken}
-        onPickModel={props.onPickModel}
-        portal={props.portal}
-        anchorTo={props.anchorTo}
-        favorites={props.favorites}
-      />
-    </>
+    <ModelPicker
+      agentKind={props.agentKind}
+      agentKinds={props.agentKinds}
+      model={props.model}
+      modelSource={props.modelSource}
+      sharedModels={props.sharedModels}
+      quotaPeerToken={props.quotaPeerToken}
+      onPickModel={props.onPickModel}
+      portal={props.portal}
+      anchorTo={props.anchorTo}
+      favorites={props.favorites}
+    />
   );
 }

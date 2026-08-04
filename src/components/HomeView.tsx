@@ -14,9 +14,7 @@ import {
   ensurePeerModels,
   lastUsed,
   peerBranchKey,
-  modeChoices,
   modelChoices,
-  normalizeUnifiedMode,
   openThread,
   preloadPeerModels,
   refreshSlashCommands,
@@ -62,9 +60,9 @@ export function HomeView() {
   const [agentKind, setAgentKind] = createSignal<AgentKind>(
     resolveEnabledAgentKind(sessionSeed?.agentKind ?? lastUsed.agentKind()),
   );
-  // 默认沿用上一次使用的模型/模式；从会话进入时优先继承当前会话。
+  // 默认沿用上一次使用的模型；模式固定 Build（Plan 仅由 /plan 启动）。
   const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(agentKind()));
-  const [mode, setMode] = createSignal(sessionSeed?.mode ?? lastUsed.mode(agentKind()));
+  const [mode, setMode] = createSignal("build");
   const [busy, setBusy] = createSignal(false);
   const [employeeMenuOpen, setEmployeeMenuOpen] = createSignal(false);
   const [selectedEmployeeId, setSelectedEmployeeId] = createSignal<string | null>(
@@ -94,7 +92,6 @@ export function HomeView() {
   // 仅当用户真正键入时才按关键字过滤；预填/选中的分支名不应把列表过滤到只剩自己
   const [branchFiltering, setBranchFiltering] = createSignal(false);
   let wtBranchRef: HTMLInputElement | undefined;
-  let modeTouched = !!sessionSeed?.mode;
   // 漫游首次同步时优先保留从当前会话继承的模型。
   let preferSeedModelOnRoamSync = !!sessionSeed?.roam && !!sessionSeed.model;
   let lastPrewarmKey = "";
@@ -233,42 +230,28 @@ export function HomeView() {
     lastUsed.setModel(agentKind(), v);
     prewarmCurrent({ model: v });
   };
-  const pickMode = (v: string) => {
-    modeTouched = true;
-    setMode(v);
-    lastUsed.setMode(agentKind(), v);
-    prewarmCurrent({ mode: v });
-  };
   const pickModelAgent = (next: AgentKind) => {
     if (next === agentKind()) return;
     const nextModel = resolveAvailableModel(next, lastUsed.model(next));
-    const nextMode = lastUsed.mode(next);
     setAgentKind(next);
     setModel(nextModel);
-    setMode(nextMode);
-    modeTouched = false;
+    setMode("build");
     if (!usesPeerModels()) {
       void ensureModelOptions(next);
       void refreshSlashCommands(next);
     }
-    prewarmCurrent({ agentKind: next, model: nextModel, mode: nextMode });
+    prewarmCurrent({ agentKind: next, model: nextModel, mode: "build" });
   };
-  // 三级菜单一次性提交「后端 + 模型」：跨后端时连同模式一起切换，同后端时仅换模型
+  // 三级菜单一次性提交「后端 + 模型」：跨后端时切后端，同后端时仅换模型
   const pickModelCombined = (next: AgentKind, m: string, borrowed?: QuotaModelPeer | null) => {
     if (borrowed) {
       const peer = roamingPeers().find((item) => item.token === borrowed.token);
       if (!peer) return;
-      const source = state.peerModels[peer.token]?.sharedOptions[next] ?? null;
-      const nextModes = modeChoices(next, source);
-      const nextMode = nextModes.some((item) => item.id === mode())
-        ? mode()
-        : (nextModes[0]?.id ?? "");
       setRoam(null);
       setQuotaPeer(peer);
       setAgentKind(next);
       setModel(m);
-      setMode(nextMode);
-      modeTouched = false;
+      setMode("build");
       void api
         .prepareQuotaLease(peer.token, next, m)
         .catch((error) => console.warn("额度租约预热失败", error));
@@ -279,19 +262,17 @@ export function HomeView() {
       pickModel(m);
       return;
     }
-    const nextMode = lastUsed.mode(next);
     setAgentKind(next);
-    setMode(nextMode);
-    modeTouched = false;
+    setMode("build");
     if (!usesPeerModels()) {
       void ensureModelOptions(next);
       void refreshSlashCommands(next);
     }
     setModel(m);
-    prewarmCurrent({ agentKind: next, model: m, mode: nextMode });
+    prewarmCurrent({ agentKind: next, model: m, mode: "build" });
   };
 
-  // ===== 漫游：用对端（host）的模型/模式列表，而不是本机的（本机模型对方可能没有）=====
+  // ===== 漫游：用对端（host）的模型列表，而不是本机的（本机模型对方可能没有）=====
   const roaming = () => !!roam();
   const quotaBorrowing = () => !!quotaPeer();
   const usesPeerModels = () => roaming();
@@ -305,7 +286,7 @@ export function HomeView() {
   // ConfigSelects 的后端列表：漫游用对端已启用的后端，否则本机已启用的
   const configAgentKinds = () =>
     usesPeerModels() ? peerModels()?.backends ?? [] : enabledAgentKinds();
-  // 模型/模式选项来源：漫游取对端列表（缺失返回 null → 空列表），否则用本机全局
+  // 模型选项来源：漫游取对端列表（缺失返回 null → 空列表），否则用本机全局
   const peerModelSource = (k: AgentKind) => peerModels()?.options[k] ?? null;
   const quotaSharedModelSources = createMemo<SharedModelSource[]>(() =>
     roamingPeers()
@@ -315,21 +296,6 @@ export function HomeView() {
       }))
       .filter((source) => Object.keys(source.options).length > 0),
   );
-
-  // 没有历史/无效选择时的模式默认：优先设置里的默认（旧值如 bypass 归一到 build），
-  // 否则用第一项（Build）。漫游单独处理。
-  createEffect(() => {
-    if (usesPeerModels() || quotaBorrowing() || modeTouched) return;
-    const opts = modeChoices(agentKind());
-    if (opts.length === 0) return;
-    if (!mode() || !opts.some((m) => m.id === mode())) {
-      const def =
-        normalizeUnifiedMode(state.settings?.defaultMode) ?? state.settings?.defaultMode;
-      if (def && opts.some((m) => m.id === def)) setMode(def);
-      else setMode(opts[0].id);
-    }
-  });
-
   // 空值才落到可用项；已有选择即使暂不在列表也保留（Cursor 目录未就绪等中间态不应重置成 Auto）。
   createEffect(() => {
     if (usesPeerModels() || quotaBorrowing()) return;
@@ -377,8 +343,7 @@ export function HomeView() {
     } else if (!models.some((item) => item.value === model())) {
       setModel(models.find((item) => item.value)?.value ?? models[0]?.value ?? "");
     }
-    const modes = modeChoices(backend, source);
-    if (!modes.some((item) => item.id === mode())) setMode(modes[0]?.id ?? "");
+    setMode("build");
   });
 
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
@@ -955,12 +920,10 @@ export function HomeView() {
                 agentKind={agentKind()}
                 agentKinds={configAgentKinds()}
                 model={model()}
-                mode={mode()}
                 modelSource={usesPeerModels() ? peerModelSource : undefined}
                 sharedModels={usesPeerModels() ? undefined : quotaSharedModelSources()}
                 quotaPeerToken={quotaPeer()?.token}
                 onPickModel={pickModelCombined}
-                onMode={pickMode}
                 anchorTo=".home-composer"
                 favorites
               />

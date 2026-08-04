@@ -53,7 +53,7 @@ import {
   suspendActive as suspendWorkflowActive,
 } from "./workflow/runtime";
 import { findTriggeredWorkflow, findWorkflowByName } from "./workflow/storage";
-import { buildIntegrateModelPrompt } from "./builtinPrompts";
+import { buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
@@ -366,15 +366,11 @@ export function resolveAvailableModel(
   return choices.find((c) => c.value)?.value ?? choices[0]?.value ?? "";
 }
 
-/** 统一会话模式：全部后端只暴露 Build（放开全部权限执行）/ Plan（只规划不执行）两种，
- *  发送时由 Rust 侧翻译成各后端的真实模式 id（bypass / bypassPermissions / agent / build …）。 */
-export const UNIFIED_MODES: ModeChoice[] = [
-  { id: "build", name: "Build" },
-  { id: "plan", name: "Plan" },
-];
+/** 界面可选会话模式：仅 Build。Plan 不进选择器，只由 /plan 隐式启动；
+ *  发送时由 Rust 侧把 build 翻译成各后端真实模式 id（bypass / bypassPermissions / agent …）。 */
+export const UNIFIED_MODES: ModeChoice[] = [{ id: "build", name: "Build" }];
 
-/** 可选会话模式列表。所有后端（含漫游对端）统一返回 Build / Plan。
- *  参数保留是为了兼容既有调用点（历史上按后端上报列表区分）。 */
+/** 可选会话模式列表（界面用）。参数保留以兼容既有调用点。 */
 export function modeChoices(
   _agentKind: AgentKind = state.agentKind,
   _source?: ModelOptions | null,
@@ -382,11 +378,14 @@ export function modeChoices(
   return UNIFIED_MODES;
 }
 
-/** 旧模式值 → 统一模式 id。识别不了（如 accept-edits / ask）返回 undefined，由调用方回退。 */
-export function normalizeUnifiedMode(m?: string | null): "build" | "plan" | undefined {
+/** 旧模式值 → 统一模式 id。Plan 已废弃，一律归一为 Build。识别不了返回 undefined。 */
+export function normalizeUnifiedMode(m?: string | null): "build" | undefined {
   if (!m) return undefined;
-  if (m.toLowerCase() === "plan") return "plan";
-  if (["build", "bypass", "bypassPermissions", "agent", "dontAsk", "fullAccess"].includes(m)) {
+  if (
+    ["build", "bypass", "bypassPermissions", "agent", "dontAsk", "fullAccess", "plan"].includes(
+      m.toLowerCase(),
+    )
+  ) {
     return "build";
   }
   return undefined;
@@ -1141,20 +1140,9 @@ function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileIte
 }
 
 /** Plan 模式且已结束的会话：从最后一轮助手正文恢复「实施此计划」按钮 */
-function recoverProposedPlan(thread: Thread): string | null {
-  if (normalizeUnifiedMode(thread.mode) !== "plan") return null;
-  if (state.running[thread.id]) return null;
-  let lastAssistant: string | null = null;
-  for (let i = thread.items.length - 1; i >= 0; i--) {
-    const item = thread.items[i];
-    if (item.type === "turn") continue;
-    if (item.type === "user") break;
-    if (item.type === "assistant" && item.text.trim()) {
-      lastAssistant = item.text;
-      break;
-    }
-  }
-  return lastAssistant;
+function recoverProposedPlan(_thread: Thread): string | null {
+  // Plan 模式已废弃；proposed plan 仅在当轮流式 proposed_plan 事件中展示。
+  return null;
 }
 
 export async function openThread(id: string) {
@@ -1328,8 +1316,9 @@ export const lastUsed = {
     if (!resolved) return;
     if (agentKind === lastUsed.agentKind()) localStorage.setItem("fd:lastUsedModelName", resolved);
   },
-  setMode: (agentKind: AgentKind, v: string) =>
-    localStorage.setItem(`fd:${agentKind}:lastMode`, v),
+  setMode: (agentKind: AgentKind, v: string) => {
+    localStorage.setItem(`fd:${agentKind}:lastMode`, v);
+  },
   setReasoningEffort: (agentKind: AgentKind, v: string) =>
     localStorage.setItem(`fd:${agentKind}:lastReasoningEffort`, v),
 };
@@ -1451,13 +1440,20 @@ export async function sendPrompt(
   await deliverPrompt(id, text, images);
 }
 
-/** 处理 /fire 等内置命令。返回 true 表示已消费，调用方不应再发给模型。 */
+/** 处理 /fire、/plan 等内置命令。返回 true 表示已消费，调用方不应再发给模型。 */
 async function tryBuiltinPrompt(
   threadId: string,
   text: string,
   images: PromptImage[],
 ): Promise<boolean> {
   const builtInInput = text.trim();
+  if (/^\/plan(?:\s|$)/i.test(builtInInput)) {
+    const goal = builtInInput.replace(/^\/plan(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+    if (!goal) throw new Error("请在 /plan 后输入规划目标，例如 /plan 设计登录流程");
+    // 不切入 Plan 模式：仅静默展开为「先规划、少追问」提示词，仍走 Build。
+    await deliverPrompt(threadId, buildPlanPrompt(goal), images);
+    return true;
+  }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
     if (images.length > 0) throw new Error("/fire 暂不支持附件");
     const parsed = parseFireInput(builtInInput);
@@ -1503,6 +1499,11 @@ function parseRunInput(input: string): { workflowId: string; goal: string } {
 /** 创建会话 / 暂存前提前校验内置命令，避免 worktree 建完才发现 /fire 非法。 */
 export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   const builtInInput = text.trim();
+  if (/^\/plan(?:\s|$)/i.test(builtInInput)) {
+    const goal = builtInInput.replace(/^\/plan(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+    if (!goal) throw new Error("请在 /plan 后输入规划目标，例如 /plan 设计登录流程");
+    return;
+  }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
     if (images.length > 0) throw new Error("/fire 暂不支持附件");
     parseFireInput(builtInInput);
@@ -1518,13 +1519,25 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   }
 }
 
-/** 向指定会话投递普通提示词（含 Fire 阶段续跑）。不处理内置命令。 */
+/** 向指定会话投递普通提示词（含 Fire 阶段续跑）。不处理内置命令。一律 Build。 */
 async function deliverPrompt(threadId: string, text: string, images: PromptImage[]) {
   // Fire 阶段在暂停后，或已经产出过判断后，仍允许用户从该会话补充提示继续流程。
   // 本轮正常结束时会重新进入自动验收，而不是退化成不受跟踪的普通会话。
   const resumedFireStep = resumeFireRelay(threadId);
   // 非 Fire 会话再尝试挂回通用工作流；只读阶段会改写为续跑提示。
   const workflowOutbound = resumedFireStep ? null : prepareWorkflowPrompt(threadId, text);
+  const currentMode =
+    state.currentId === threadId
+      ? state.mode
+      : (state.threads.find((t) => t.id === threadId)?.mode ?? "");
+  // 一律 Build：含历史 Plan 会话、以及后端原生 bypass/agent 等。
+  if ((currentMode || "").toLowerCase() !== "build") {
+    await api.setThreadMode(threadId, "build");
+    if (state.currentId === threadId) {
+      setState("mode", "build");
+      lastUsed.setMode(state.agentKind, "build");
+    }
+  }
   if (state.currentId === threadId) bumpChatScrollToBottom();
   setState("proposedPlan", null);
   setState("running", threadId, true);
@@ -2135,8 +2148,8 @@ function applyOp(op: UpdateOp) {
   }
   if (op.t === "mode") {
     flushPendingStreamUpdates();
-    // 后端偶发上报原生 id（bypass/agent…），归一成 Build/Plan 再进 UI
-    const mode = normalizeUnifiedMode(op.mode) ?? op.mode;
+    // 后端偶发上报原生 id（bypass/agent/plan…），一律归一成 Build
+    const mode = normalizeUnifiedMode(op.mode) ?? "build";
     setState("mode", mode);
     lastUsed.setMode(state.agentKind, mode);
     return;

@@ -7,6 +7,17 @@
  */
 
 /**
+ * 展开 `/plan <目标>`：在 Build 模式下静默注入「先出计划、少追问」指令。
+ * 不再切入 Plan 模式；只是把斜杠命令翻译成一段自包含提示词。
+ */
+export function buildPlanPrompt(goal: string): string {
+  return `请针对以下目标给出完整实施计划。直接规划并写出可执行步骤，不要先就方案细节反复追问澄清；有不确定处请在计划中写明假设后继续。
+
+目标：
+${goal}`;
+}
+
+/**
  * 展开 `/setup <目标>`：指导 agent 把一个模型 / provider 接入 Vega（alkaid 后端）。
  * 提示词内嵌 ~/.nova/alkaid/config.jsonc 的真实结构与约束，agent 照此编辑即可。
  */

@@ -28,6 +28,12 @@ export function getSlashSuggestions(
 ): SlashSuggestion[] {
   const builtins: SlashCommand[] = [
     {
+      name: "plan",
+      description: "先出实施计划（少追问），仍在 Build 下发送",
+      kind: "Nova",
+      input: "/plan ",
+    },
+    {
       name: "fire",
       description: "分阶段执行，并用独立会话反复验收直到目标达成",
       kind: "Nova",
