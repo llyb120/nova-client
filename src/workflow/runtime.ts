@@ -174,6 +174,7 @@ async function createStageThread(
   stage: WorkflowStageDef,
   title: string,
   prompt: string,
+  originThreadId?: string,
 ): Promise<void> {
   const h = requireHost();
   const root = await api.getThread(run.rootId);
@@ -196,6 +197,17 @@ async function createStageThread(
   latestThreadByRoot.set(run.rootId, thread.id);
   persistRuns();
   await h.refreshThreads();
+  // 竞态保护：若在等待期间用户的干预消息已把原阶段重新挂回流程，放弃新阶段，
+  // 避免同一运行态被两个会话同时驱动导致链分叉；原阶段回合结束后会重新推进。
+  if (originThreadId && activeRuns.get(originThreadId) === run) {
+    activeRuns.delete(thread.id);
+    runHistory.delete(thread.id);
+    latestThreadByRoot.set(run.rootId, originThreadId);
+    persistRuns();
+    await api.deleteThread(thread.id).catch(() => {});
+    await h.refreshThreads();
+    return;
+  }
   if (isViewingChain(run.rootId)) await h.openThread(thread.id);
   h.setRunning(thread.id, true);
   await api.sendPrompt(thread.id, prompt, []);
@@ -242,7 +254,13 @@ async function followTransition(
   persistRuns();
   setWorkflowReviewRevision((value) => value + 1);
   const ctx = runContext(run, conclusion);
-  await createStageThread(run, next, resolveTitle(def, next, ctx), resolvePrompt(def, next, ctx));
+  await createStageThread(
+    run,
+    next,
+    resolveTitle(def, next, ctx),
+    resolvePrompt(def, next, ctx),
+    threadId,
+  );
 }
 
 /** turn 正常结束后推进流程。 */
@@ -255,9 +273,17 @@ async function advanceWorkflow(threadId: string): Promise<void> {
 
   const def = getWorkflow(run.workflowId);
   const stage = def?.stages.find((s) => s.id === run.stageId);
-  if (!def || !stage) return;
+  if (!def || !stage) {
+    // 工作流定义已被删除/修改：清掉幽灵条目，避免后续消息被挂到不存在的流程上。
+    runHistory.delete(threadId);
+    persistRuns();
+    return;
+  }
 
   const thread = await api.getThread(threadId);
+  // 用户中途干预（排队消息已把本阶段重新挂回）时让位给那一回合：
+  // 新结论会并入干预内容，回合结束后会再次走到这里推进。
+  if (activeRuns.has(threadId)) return;
   const conclusion = stageConclusion(thread);
   if (stage.manualReview) {
     suspendedRuns.set(threadId, run);
@@ -349,6 +375,18 @@ export function startWorkflow(
   if (errors.length > 0) return Promise.reject(new Error(errors.join("；")));
   const entry = def.stages.find((s) => s.id === def.entry);
   if (!entry) return Promise.reject(new Error("起始阶段不存在"));
+  // 该会话属于未完成的工作流链时禁止再次启动（/run 或自动触发器）：
+  // 否则会覆盖现有运行态，旧链尖端仍会继续推进，造成同一 root 下双链交缠。
+  const existing =
+    activeRuns.get(rootId) ?? suspendedRuns.get(rootId) ?? runHistory.get(rootId);
+  if (existing && !completedRoots.has(existing.rootId)) {
+    const existingName = getWorkflow(existing.workflowId)?.name ?? "未完成的工作流";
+    return Promise.reject(
+      new Error(
+        `该会话仍在工作流「${existingName}」中：继续流程请在链的最新会话直接补充消息；要启动新工作流请新建会话`,
+      ),
+    );
+  }
 
   return (async () => {
     const root = await api.getThread(rootId);
