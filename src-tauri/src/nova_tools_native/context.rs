@@ -17,7 +17,7 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 // Keep in lockstep with scripts/ctx-index.mjs INDEX_CACHE_VERSION.
-const CACHE_VERSION: u32 = 13;
+const CACHE_VERSION: u32 = 14;
 const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 8_000;
 const MAX_HITS_PER_FILE: usize = 60;
@@ -46,6 +46,13 @@ const MAX_DEPS: usize = 8;
 const MAX_DEP_FILES: usize = 4;
 const MAX_IMPACT: usize = 20;
 const MAX_GRAPH_TERMS: usize = 12;
+/// 反向图增量补丁的变更数上限：超过则整图重建（补丁是 O(变更数 × 边数)）。
+const REVERSE_FULL_REBUILD_CHANGES: usize = 64;
+/// 缓存变更数低于该值时跳过磁盘写回，只更新内存 MEMO：整仓缓存的全量序列化
+/// 成本随仓库线性增长，下次冷启动重扫这几个文件更划算。首次建缓存不受此限制。
+const PERSIST_MIN_CHANGED: usize = 16;
+/// 目录 scope 检索时限定代码文件扩展名的 rg glob（与 is_code_file 的扩展名集合一致）。
+const CODE_FILES_GLOB: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,rs,py,pyi,go,java,kt,kts,cs,c,h,cc,cpp,hpp,swift,php,scala,dart,m,mm,zig}";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Symbol {
@@ -81,6 +88,9 @@ struct DiskCache {
     version: u32,
     root: String,
     files: HashMap<String, FileEntry>,
+    /// 反向 import 图随缓存持久化：无文件变更的调用直接复用，不再每次全量重建。
+    #[serde(default)]
+    reverse: HashMap<String, Vec<ReverseImport>>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +114,7 @@ struct IndexView {
 }
 
 /// 反向 import 图的一条边：importer 文件以本地名 local 引用了目标文件。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReverseImport {
     importer: String,
     local: String,
@@ -259,6 +269,7 @@ fn load_cache(root: &Path) -> DiskCache {
         version: CACHE_VERSION,
         root: key,
         files: HashMap::new(),
+        reverse: HashMap::new(),
     }
 }
 
@@ -574,6 +585,74 @@ fn search_in_process(
     rows
 }
 
+fn rg_available(root: &Path) -> bool {
+    static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *RG_AVAILABLE.get_or_init(|| run_command(root, "rg", &["--version".into()]).is_some())
+}
+
+/// 单次 rg 检索。paths 为空时搜整个仓库；code_glob 为 true 时用扩展名 glob
+/// 限定代码文件。rg 不可用或执行失败返回 None。
+fn rg_search(
+    root: &Path,
+    terms: &[String],
+    ignore_case: bool,
+    word: bool,
+    paths: &[String],
+    code_glob: bool,
+) -> Option<Vec<SearchRow>> {
+    let mut args = vec![
+        "-n".into(),
+        "--with-filename".into(),
+        "--no-heading".into(),
+        "--color".into(),
+        "never".into(),
+        "-F".into(),
+        "--max-count".into(),
+        MAX_HITS_PER_FILE.to_string(),
+    ];
+    if ignore_case {
+        args.push("-i".into());
+    }
+    if word {
+        args.push("-w".into());
+    }
+    for term in terms {
+        args.push("-e".into());
+        args.push(term.clone());
+    }
+    for glob in [
+        "!**/node_modules/**",
+        "!**/dist/**",
+        "!**/target/**",
+        "!**/coverage/**",
+        "!**/package-lock.json",
+        "!*.png",
+        "!*.jpg",
+        "!*.jpeg",
+        "!*.gif",
+        "!*.webp",
+        "!*.ico",
+        "!*.woff",
+        "!*.woff2",
+        "!*.ttf",
+        "!*.bin",
+    ] {
+        args.push("--glob".into());
+        args.push(glob.into());
+    }
+    if code_glob {
+        args.push("--glob".into());
+        args.push(CODE_FILES_GLOB.into());
+    }
+    if paths.is_empty() {
+        args.push(".".into());
+    } else {
+        args.extend(paths.iter().cloned());
+    }
+    let stdout = run_command(root, "rg", &args)?;
+    Some(parse_search_rows(stdout))
+}
+
 fn search_text(
     root: &Path,
     terms: &[String],
@@ -611,58 +690,8 @@ fn search_text(
         rows.truncate(MAX_HIT_LINES);
         return rows;
     }
-    static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
-    let rg_available =
-        *RG_AVAILABLE.get_or_init(|| run_command(root, "rg", &["--version".into()]).is_some());
-    if rg_available {
-        let mut args = vec![
-            "-n".into(),
-            "--with-filename".into(),
-            "--no-heading".into(),
-            "--color".into(),
-            "never".into(),
-            "-F".into(),
-            "--max-count".into(),
-            MAX_HITS_PER_FILE.to_string(),
-        ];
-        if ignore_case {
-            args.push("-i".into());
-        }
-        if word {
-            args.push("-w".into());
-        }
-        for term in &terms {
-            args.push("-e".into());
-            args.push(term.clone());
-        }
-        for glob in [
-            "!**/node_modules/**",
-            "!**/dist/**",
-            "!**/target/**",
-            "!**/coverage/**",
-            "!**/package-lock.json",
-            "!*.png",
-            "!*.jpg",
-            "!*.jpeg",
-            "!*.gif",
-            "!*.webp",
-            "!*.ico",
-            "!*.woff",
-            "!*.woff2",
-            "!*.ttf",
-            "!*.bin",
-        ] {
-            args.push("--glob".into());
-            args.push(glob.into());
-        }
-        if files.is_empty() {
-            args.push(".".into());
-        } else {
-            args.extend(files.iter().cloned());
-        }
-        if let Some(stdout) = run_command(root, "rg", &args) {
-            return parse_search_rows(stdout);
-        }
+    if let Some(rows) = rg_search(root, &terms, ignore_case, word, files, false) {
+        return rows;
     }
     let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
     if inside == "true" {
@@ -1328,6 +1357,32 @@ fn resolve_specifier(spec: &str, from: &str, files: &HashSet<String>) -> Option<
     try_base(parts.join("/"))
 }
 
+/// 反向 import 图由全量缓存（含历史扫描）构建，让一次调用就能利用仓库级
+/// import 关系；个别条目可能陈旧，消费侧读当前文件验证 local 名的 import
+/// 行后再采信。
+fn reverse_from_files(files: &HashMap<String, FileEntry>, all_set: &HashSet<String>) -> ReverseMap {
+    let mut reverse: ReverseMap = HashMap::new();
+    for (file, entry) in files {
+        for import in &entry.imports {
+            if let Some(target) = resolve_specifier(&import.from, file, all_set) {
+                reverse
+                    .entry(target)
+                    .or_default()
+                    .push(ReverseImport {
+                        importer: file.clone(),
+                        local: import.name.clone(),
+                        orig: import.orig.clone(),
+                    });
+            }
+        }
+    }
+    for edges in reverse.values_mut() {
+        edges.sort_by(|a, b| a.importer.cmp(&b.importer).then(a.local.cmp(&b.local)));
+        edges.dedup_by(|a, b| a.importer == b.importer && a.local == b.local);
+    }
+    reverse
+}
+
 fn build_index(
     root: &Path,
     wanted: Option<&HashSet<String>>,
@@ -1339,16 +1394,24 @@ fn build_index(
         .unwrap_or_else(|| list_code_files(root));
     let all_set: HashSet<_> = all.iter().cloned().collect();
     let mut cache = load_cache(root);
+    let initially_empty = cache.files.is_empty();
     let mut targets: HashSet<String> = wanted.cloned().unwrap_or_else(|| all_set.clone());
     let mut frontier: Vec<String> = targets.iter().cloned().collect();
     let mut dirty = false;
+    let mut changed = 0usize;
+    let mut removed_files: Vec<String> = Vec::new();
+    let mut rescanned_files: Vec<String> = Vec::new();
     for depth in 0..=dependency_depth {
         let current = frontier;
         frontier = Vec::new();
         for file in current {
             let path = root.join(&file);
             let Some((size, modified_ns)) = metadata_stamp(&path) else {
-                dirty |= cache.files.remove(&file).is_some();
+                if cache.files.remove(&file).is_some() {
+                    dirty = true;
+                    changed += 1;
+                    removed_files.push(file.clone());
+                }
                 continue;
             };
             let stale = cache
@@ -1363,6 +1426,8 @@ fn build_index(
                     entry.modified_ns = modified_ns;
                     cache.files.insert(file.clone(), entry);
                     dirty = true;
+                    changed += 1;
+                    rescanned_files.push(file.clone());
                 }
             }
             if depth < dependency_depth {
@@ -1382,9 +1447,20 @@ fn build_index(
         }
     }
     if wanted.is_none() {
-        let before = cache.files.len();
-        cache.files.retain(|f, _| all_set.contains(f));
-        dirty |= cache.files.len() != before;
+        let pruned: Vec<String> = cache
+            .files
+            .keys()
+            .filter(|file| !all_set.contains(*file))
+            .cloned()
+            .collect();
+        for file in &pruned {
+            cache.files.remove(file);
+        }
+        if !pruned.is_empty() {
+            dirty = true;
+            changed += pruned.len();
+            removed_files.extend(pruned);
+        }
     }
     // Focused results must depend on this request, not files left by older cache history.
     // Persist the full incremental cache, but expose only the requested dependency closure.
@@ -1398,28 +1474,43 @@ fn build_index(
     } else {
         cache.files.clone()
     };
-    // 反向图基于全量缓存（含历史扫描），让一次调用就能利用仓库级 import 关系；
-    // 个别条目可能陈旧，消费侧读当前文件验证 local 名的 import 行后再采信。
-    let mut reverse: ReverseMap = HashMap::new();
-    for (file, entry) in &cache.files {
-        for import in &entry.imports {
-            if let Some(target) = resolve_specifier(&import.from, file, &all_set) {
-                reverse
-                    .entry(target)
-                    .or_default()
-                    .push(ReverseImport {
-                        importer: file.clone(),
-                        local: import.name.clone(),
-                        orig: import.orig.clone(),
-                    });
+    // 反向图随缓存持久化：无文件变更的调用直接复用，不再每次
+    // O(全部 import × resolve_specifier) 全量重建；有变更时增量补丁（删旧边、
+    // 加新边），变更数超阈值才整图重建。
+    if changed == 0 && cache.reverse.is_empty() && !cache.files.is_empty() {
+        cache.reverse = reverse_from_files(&cache.files, &all_set);
+    } else if changed >= REVERSE_FULL_REBUILD_CHANGES {
+        cache.reverse = reverse_from_files(&cache.files, &all_set);
+    } else if changed > 0 {
+        for file in removed_files.iter().chain(rescanned_files.iter()) {
+            for edges in cache.reverse.values_mut() {
+                edges.retain(|edge| edge.importer != *file);
             }
         }
+        cache.reverse.retain(|_, edges| !edges.is_empty());
+        for file in &rescanned_files {
+            if let Some(entry) = cache.files.get(file) {
+                for import in &entry.imports {
+                    if let Some(target) = resolve_specifier(&import.from, file, &all_set) {
+                        cache.reverse.entry(target).or_default().push(ReverseImport {
+                            importer: file.clone(),
+                            local: import.name.clone(),
+                            orig: import.orig.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        for edges in cache.reverse.values_mut() {
+            edges.sort_by(|a, b| a.importer.cmp(&b.importer).then(a.local.cmp(&b.local)));
+            edges.dedup_by(|a, b| a.importer == b.importer && a.local == b.local);
+        }
     }
-    for edges in reverse.values_mut() {
-        edges.sort_by(|a, b| a.importer.cmp(&b.importer).then(a.local.cmp(&b.local)));
-        edges.dedup_by(|a, b| a.importer == b.importer && a.local == b.local);
-    }
-    store_cache(root, cache, dirty);
+    let reverse = cache.reverse.clone();
+    // 少量变更只更新内存 MEMO，跳过整仓缓存的全量序列化写盘；下次冷启动
+    // 重扫这几个文件即可。首次建缓存（initially_empty）不受此限。
+    let persist = dirty && (changed >= PERSIST_MIN_CHANGED || initially_empty);
+    store_cache(root, cache, persist);
     let mut view = IndexView {
         files: selected,
         ..Default::default()
@@ -1927,18 +2018,54 @@ fn source_scope(file: &str) -> &str {
     }
 }
 
-fn files_in_source_scopes(all: &[String], seed_files: &[String]) -> Vec<String> {
-    let scopes = seed_files
-        .iter()
-        .map(|file| source_scope(file))
-        .collect::<HashSet<_>>();
-    if scopes.is_empty() || scopes.contains("") {
-        return all.to_vec();
+/// 种子文件的目录 scope 集合（source_scope 语义）。任一种子文件位于仓库根
+///（无目录 scope）时返回 None，退回全仓检索，保持旧 files_in_source_scopes
+/// 含 "" 时全量展开的语义。
+fn scope_dirs(seed_files: &[String]) -> Option<Vec<String>> {
+    let mut dirs = HashSet::<String>::new();
+    for file in seed_files {
+        let scope = source_scope(file);
+        if scope.is_empty() {
+            return None;
+        }
+        dirs.insert(scope.to_string());
     }
-    all.iter()
-        .filter(|file| scopes.iter().any(|scope| file.starts_with(scope)))
-        .cloned()
-        .collect()
+    if dirs.is_empty() {
+        return None;
+    }
+    let mut list = dirs.into_iter().collect::<Vec<_>>();
+    list.sort();
+    Some(list)
+}
+
+/// 按目录 scope 检索：把目录直接作为 rg 的搜索路径，单进程完成（替代过去把
+/// 展开后的整份文件列表按 128 个切片、逐片起 rg 的做法）。None = 全仓。
+/// 两种情形都用扩展名 glob 限定代码文件，与旧的按 all 展开过滤语义一致。
+/// rg 不可用时把目录展开成代码文件列表退回 search_text。
+fn search_text_scopes(
+    root: &Path,
+    terms: &[String],
+    ignore_case: bool,
+    word: bool,
+    dirs: Option<&[String]>,
+) -> Vec<SearchRow> {
+    if rg_available(root) {
+        let rows = match dirs {
+            Some(dirs) if !dirs.is_empty() => rg_search(root, terms, ignore_case, word, dirs, true),
+            _ => rg_search(root, terms, ignore_case, word, &[], true),
+        };
+        if let Some(rows) = rows {
+            return rows;
+        }
+    }
+    let files = match dirs {
+        Some(dirs) if !dirs.is_empty() => list_code_files(root)
+            .into_iter()
+            .filter(|file| dirs.iter().any(|dir| file.starts_with(dir)))
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    search_text(root, terms, ignore_case, word, &files)
 }
 
 fn compact_evidence_miss(
@@ -3133,13 +3260,59 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         })
         .collect::<Vec<_>>();
     let planned_terms = plan_terms_from_bodies(&plan_intent, &index, &seed_bodies, &terms);
+    // 反向图 discover 兜底的词根预取：把所有种子目标的文件名词根合并成一次批量
+    // 检索（原先每个种子目标单独全仓搜一次，串行）。
+    let mut discover_stems = Vec::<String>::new();
+    {
+        let mut seen_targets = HashSet::<String>::new();
+        for (definition, _, _) in &seeds {
+            if !seen_targets.insert(definition.file.clone()) {
+                continue;
+            }
+            let base = definition.file.rsplit('/').next().unwrap_or(&definition.file);
+            let stem = base
+                .rsplit_once('.')
+                .map(|(stem, _)| stem)
+                .unwrap_or(base)
+                .to_string();
+            if stem.len() >= 3
+                && !discover_stems
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(&stem))
+            {
+                discover_stems.push(stem);
+            }
+        }
+    }
+    let seed_body_files = seed_bodies
+        .iter()
+        .map(|(file, _)| file.clone())
+        .collect::<Vec<_>>();
+    let planned_scope = scope_dirs(&seed_body_files);
+    // 计划驱动的二次检索与反向图词根检索互相独立，并行执行。
+    let search_stage = Instant::now();
+    let (planned_rows, discover_rows) = std::thread::scope(|scope| {
+        let planned = scope.spawn(|| {
+            if planned_terms.is_empty() {
+                Vec::<SearchRow>::new()
+            } else {
+                search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())
+            }
+        });
+        let stems = scope.spawn(|| {
+            if discover_stems.is_empty() {
+                Vec::<SearchRow>::new()
+            } else {
+                search_text(root, &discover_stems, true, false, &[])
+            }
+        });
+        (
+            planned.join().unwrap_or_default(),
+            stems.join().unwrap_or_default(),
+        )
+    });
+    trace("fast_context.plan_search", search_stage);
     if !planned_terms.is_empty() {
-        let seed_body_files = seed_bodies
-            .iter()
-            .map(|(file, _)| file.clone())
-            .collect::<Vec<_>>();
-        let expansion_files = files_in_source_scopes(&all, &seed_body_files);
-        let planned_rows = search_text(root, &planned_terms, false, false, &expansion_files);
         terms.extend(planned_terms.iter().cloned());
         for row in planned_rows {
             if !hit_files.contains_key(&row.file) {
@@ -3170,6 +3343,22 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     // 二次检索后词频已变，重建稀有度表供 ranked 的主题加分使用。
     let term_freq = term_freq_map(&keyword_counts);
 
+    // 批量词根检索结果按词根分组（词匹配大小写不敏感）：discover 优先从这里
+    // 取行，只有动态发现的中转目标才退回单独检索。
+    let stem_lowers = discover_stems
+        .iter()
+        .map(|stem| stem.to_lowercase())
+        .collect::<Vec<_>>();
+    let mut stem_rows = HashMap::<String, Vec<SearchRow>>::new();
+    for row in discover_rows {
+        let lower = row.text.to_lowercase();
+        for (index, stem) in discover_stems.iter().enumerate() {
+            if lower.contains(&stem_lowers[index]) {
+                stem_rows.entry(stem.clone()).or_default().push(row.clone());
+            }
+        }
+    }
+
     // 特性① 反向 import 图：精确调用方发现。文本检索看不见别名调用点
     //（import { a as b } 之后调用 b(...)）和 barrel 改名透传（export { a as c }），
     // import 边把这些调用行作为精确命中注入，角色/IMPACT 打 [import图] 标记。
@@ -3199,8 +3388,13 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 .unwrap_or(base)
                 .to_string();
             if stem.len() >= 3 && searched.insert(target.to_string()) {
+                // 种子目标的词根行来自预取的批量检索；动态发现的中转目标才单独补搜。
+                let rows = stem_rows
+                    .get(&stem)
+                    .cloned()
+                    .unwrap_or_else(|| search_text(root, &[stem.clone()], true, false, &[]));
                 let mut seen_files = HashSet::<String>::new();
-                for row in search_text(root, &[stem.clone()], true, false, &[]) {
+                for row in rows {
                     if row.file == target || !is_code_file(&row.file) {
                         continue;
                     }
