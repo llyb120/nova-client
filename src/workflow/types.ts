@@ -71,6 +71,10 @@ export interface WorkflowDef {
   version: number;
   /** 内置工作流（代码定义，不可删除，可复制为自定义）。 */
   builtin?: boolean;
+  /** 团队分享：分享该工作流的队友展示名（接收后带上，标识团队来源）。 */
+  sharedBy?: string;
+  /** 接收团队分享的时间戳（ms），仅用于展示。 */
+  sharedAt?: number;
   /** 是否启用（可被选择/触发/运行）；字段缺失视为启用。开关独立持久化，内置工作流也可切换。 */
   enabled?: boolean;
   /** 起始阶段 id。 */

@@ -1,14 +1,18 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { WorkflowCanvas } from "./WorkflowCanvas";
-import { IconChevron, IconMerge, IconPencil, IconPlus, IconX } from "./icons";
+import { IconBroadcast, IconChevron, IconMerge, IconPencil, IconPlus, IconShare, IconX } from "./icons";
 import { BUILTIN_WORKFLOWS } from "../workflow/builtin";
 import {
+  acceptSharedWorkflow,
   deleteUserWorkflow,
   isWorkflowEnabled,
   listWorkflows,
   saveWorkflow,
   setWorkflowEnabled,
 } from "../workflow/storage";
+import { api } from "../ipc";
+import { refreshWorkflowInbox, state } from "../store";
+import type { IncomingWorkflowShare, Peer } from "../types";
 import {
   newWorkflowId,
   validateWorkflow,
@@ -58,6 +62,13 @@ export function WorkflowSettingsPanel() {
   const [barCollapsed, setBarCollapsed] = createSignal(false);
   const [stageModalOpen, setStageModalOpen] = createSignal(false);
   const [edgeModalOpen, setEdgeModalOpen] = createSignal(false);
+
+  // 团队分享：把当前工作流定向发给队友；队友分享来的工作流在抽屉收件箱里接收。
+  const [shareOpen, setShareOpen] = createSignal(false);
+  const [shareTarget, setShareTarget] = createSignal("");
+  const [shareBusy, setShareBusy] = createSignal(false);
+  const myToken = () => state.settings?.relayToken ?? "";
+  const peers = createMemo<Peer[]>(() => state.peers.filter((p) => p.token !== myToken()));
 
   const reload = () => setList(listWorkflows());
 
@@ -216,6 +227,50 @@ export function WorkflowSettingsPanel() {
     select(null);
   }
 
+  /** 把当前工作流分享给选中的队友（分享的是当前画布内容，含未保存改动）。 */
+  async function submitShare() {
+    const d = draft();
+    const to = shareTarget();
+    if (!d || !to) return;
+    const errs = validateWorkflow(d);
+    if (errs.length > 0) {
+      setMsg(errs.join("；"));
+      setShareOpen(false);
+      return;
+    }
+    setShareBusy(true);
+    try {
+      await api.shareWorkflow(d, to);
+      const name = state.peers.find((p) => p.token === to)?.name ?? to;
+      setShareOpen(false);
+      setMsg(`已把「${d.name}」分享给 ${name}，对方在工作流页接收`);
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setShareBusy(false);
+    }
+  }
+
+  /** 接收队友分享的工作流：入库后新会话即可选择，重复分享会原地更新。 */
+  async function acceptShared(share: IncomingWorkflowShare) {
+    try {
+      const def = await api.acceptRelayWorkflowShare(share.id);
+      const saved = acceptSharedWorkflow(def, share.fromName);
+      reload();
+      await refreshWorkflowInbox();
+      select(saved.id);
+      setMsg(`已接收「${saved.name}」，新会话的工作流选择里可直接使用`);
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : String(e));
+      void refreshWorkflowInbox();
+    }
+  }
+
+  async function declineShared(id: string) {
+    await api.declineRelayWorkflowShare(id);
+    await refreshWorkflowInbox();
+  }
+
   // 双击画布节点/连线 → 打开编辑弹窗。
   function openStageModal(id: string) {
     setSelectedStageId(id);
@@ -275,6 +330,27 @@ export function WorkflowSettingsPanel() {
               删除
             </button>
           </div>
+          <Show when={state.workflowInbox.length > 0}>
+            <div class="wf-inbox">
+              <div class="wf-inbox-title">
+                <IconBroadcast size={13} /> 团队分享的工作流（{state.workflowInbox.length}）
+              </div>
+              <For each={state.workflowInbox}>
+                {(s) => (
+                  <div class="wf-inbox-item">
+                    <div class="wf-inbox-info">
+                      <span class="wf-list-name">{s.def.name}</span>
+                      <span class="field-hint">来自 {s.fromName} · {s.def.stages.length} 个阶段</span>
+                    </div>
+                    <div class="wf-inbox-actions">
+                      <button class="btn small primary" onClick={() => void acceptShared(s)}>接收</button>
+                      <button class="btn danger small" onClick={() => void declineShared(s.id)}>忽略</button>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </div>
+          </Show>
           <div class="wf-list">
             <For each={list()}>
               {(wf) => (
@@ -284,6 +360,9 @@ export function WorkflowSettingsPanel() {
                 >
                   <span class="wf-list-name">{wf.name}</span>
                   <Show when={wf.builtin}><span class="wf-badge">内置</span></Show>
+                  <Show when={wf.sharedBy}>
+                    <span class="wf-badge wf-badge-team" title={`来自 ${wf.sharedBy} 的分享`}>团队</span>
+                  </Show>
                   <Show when={!isWorkflowEnabled(wf)}>
                     <span class="wf-badge wf-badge-off">已停用</span>
                   </Show>
@@ -390,6 +469,14 @@ export function WorkflowSettingsPanel() {
                 <Show when={d().builtin}><span class="wf-badge">内置只读</span></Show>
                 <button class="btn secondary small" onClick={() => select(d().id)} title="放弃未保存改动">撤销</button>
                 <button class="btn primary small" disabled={d().builtin} onClick={save}>保存</button>
+                <button
+                  class="btn secondary small"
+                  disabled={d().builtin}
+                  onClick={() => { setShareTarget(""); setShareOpen(true); }}
+                  title="把这个工作流分享给队友（内置工作流人人都有，无需分享）"
+                >
+                  <IconShare size={13} /> 分享
+                </button>
                 <button class="wf-bar-toggle" onClick={() => setBarCollapsed(true)} title="收起工具条">
                   <IconChevron size={14} />
                 </button>
@@ -526,6 +613,58 @@ export function WorkflowSettingsPanel() {
             </div>
           </div>
         )}
+      </Show>
+
+      {/* 工作流分享：选择队友 */}
+      <Show when={shareOpen() && draft()}>
+        <div class="modal-backdrop wf-modal-backdrop" onClick={() => setShareOpen(false)}>
+          <div class="modal wf-modal" onClick={(e) => e.stopPropagation()}>
+            <div class="modal-head">
+              <span>分享工作流「{draft()?.name}」</span>
+              <button class="icon-btn" onClick={() => setShareOpen(false)}><IconX size={16} /></button>
+            </div>
+            <div class="modal-body">
+              <Show
+                when={state.relay.connected}
+                fallback={
+                  <div class="inbox-empty">
+                    <IconBroadcast size={26} />
+                    <p>未连接到团队中转站</p>
+                    <p class="field-hint">先在设置里填写 token，再分享给队友。</p>
+                  </div>
+                }
+              >
+                <p class="field-hint">分享当前画布上的工作流内容（含未保存改动）；对方接收后进入其工作流库，可直接选择运行。</p>
+                <Show when={peers().length > 0} fallback={<p class="field-hint">暂时没有其他成员。</p>}>
+                  <div class="share-peers">
+                    <For each={peers()}>
+                      {(p) => (
+                        <button
+                          class={`peer-row ${shareTarget() === p.token ? "active" : ""}`}
+                          onClick={() => setShareTarget(p.token)}
+                        >
+                          <span class={`peer-dot ${p.online ? "on" : "off"}`} />
+                          <span class="peer-name">{p.name}</span>
+                          <span class="peer-action">{p.online ? "在线" : "离线"}</span>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </Show>
+            </div>
+            <div class="modal-foot">
+              <button class="btn secondary" disabled={shareBusy()} onClick={() => setShareOpen(false)}>取消</button>
+              <button
+                class="btn primary"
+                disabled={shareBusy() || !state.relay.connected || !shareTarget()}
+                onClick={() => void submitShare()}
+              >
+                {shareBusy() ? "发送中…" : "分享"}
+              </button>
+            </div>
+          </div>
+        </div>
       </Show>
 
     </div>

@@ -17,6 +17,7 @@ import type {
   EmployeeTask,
   IncomingRoamRequest,
   IncomingShare,
+  IncomingWorkflowShare,
   Item,
   Mark,
   ModelChoice,
@@ -154,6 +155,8 @@ interface AppStore {
   peerBranches: Record<string, BranchList>;
   /** 收到的待接收分享 */
   inbox: IncomingShare[];
+  /** 收到的待接收工作流分享（团队分享的工作流，接收后进入本地工作流库） */
+  workflowInbox: IncomingWorkflowShare[];
   /** 我的成就（中转站按身份授予）；未配置团队 token 时为空 */
   achievements: Achievement[];
   /** 成就列表是否已完成首次拉取（区分「加载中」与「暂无成就」） */
@@ -252,6 +255,7 @@ export const [state, setState] = createStore<AppStore>({
   peerModels: {},
   peerBranches: {},
   inbox: [],
+  workflowInbox: [],
   achievements: [],
   achievementsLoaded: false,
   achievementsError: "",
@@ -579,6 +583,14 @@ export function clueMentionPeers(): Peer[] {
 export async function refreshInbox() {
   try {
     setState("inbox", await api.getRelayInbox());
+  } catch {
+    // 忽略
+  }
+}
+
+export async function refreshWorkflowInbox() {
+  try {
+    setState("workflowInbox", await api.getRelayWorkflowInbox());
   } catch {
     // 忽略
   }
@@ -2591,6 +2603,7 @@ export async function initStore() {
     setState("relay", e.payload);
     if (e.payload.connected) {
       void refreshInbox();
+      void refreshWorkflowInbox();
       // 重连后强制校准：离线期间对端可能已调整共享模型，旧 peerModels 不能继续复用。
       preloadPeerModels(true);
     }
@@ -2636,6 +2649,10 @@ export async function initStore() {
     const hasNewRecall = e.payload.some((s) => s.recall && !known.has(s.id));
     setState("inbox", e.payload);
     if (hasNewRecall) setState("inboxPromptAt", Date.now());
+  });
+  // 队友分享的工作流到达：进入工作流收件箱，在「工作流」页接收
+  await listen<IncomingWorkflowShare[]>("relay:workflow-inbox", (e) => {
+    setState("workflowInbox", e.payload);
   });
   // 本地 worktree 后台创建就绪：切到 worktree 的 cwd 已由后端回写，这里补发暂存的首条提示词
   await listen<{ threadId: string }>("acp:worktree-ready", (e) => {
@@ -2698,6 +2715,7 @@ export async function initStore() {
     })
     .catch(() => {});
   void refreshInbox();
+  void refreshWorkflowInbox();
   // 成就后台预拉：有新成就时侧栏入口直接亮角标，不必等用户打开成就页
   void refreshAchievements();
   void refreshRoamingFolders();

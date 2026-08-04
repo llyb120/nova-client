@@ -1,3 +1,5 @@
+import type { WorkflowDef } from "./workflow/types";
+
 export type AgentKind = "alkaid" | "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
 
 export interface SlashCommand {
@@ -630,6 +632,15 @@ export interface IncomingShare {
   activeClueCardId?: string | null;
   /** 漫游召回自动回传的快照（收件箱标注「召回」并自动弹出） */
   recall?: boolean;
+  ts: number;
+}
+
+/** 团队分享：队友分享过来的工作流，待接收进本地工作流库 */
+export interface IncomingWorkflowShare {
+  id: string;
+  from: string;
+  fromName: string;
+  def: WorkflowDef;
   ts: number;
 }
 

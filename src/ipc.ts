@@ -16,6 +16,7 @@ import type {
   EmployeeTask,
   GlobalAgentInstructions,
   IncomingShare,
+  IncomingWorkflowShare,
   Mark,
   MindSnapshot,
   ModelCost,
@@ -43,6 +44,7 @@ import type {
   WorkHours,
   WorktreeRecord,
 } from "./types";
+import type { WorkflowDef } from "./workflow/types";
 
 function fileUriPath(uri: string) {
   const path = decodeURI(uri.replace(/^file:\/\//, ""));
@@ -267,6 +269,14 @@ export const api = {
   acceptShare: (id: string, cwd: string, ephemeral = false) =>
     invoke<string>("accept_share", { id, cwd, ephemeral }),
   declineShare: (id: string) => invoke<void>("decline_share", { id }),
+  // 工作流分享：把工作流定义定向发给队友 / 接收队友分享的工作流
+  shareWorkflow: (workflow: WorkflowDef, to: string) =>
+    invoke<void>("share_workflow", { workflow, to }),
+  getRelayWorkflowInbox: () => invoke<IncomingWorkflowShare[]>("get_relay_workflow_inbox"),
+  acceptRelayWorkflowShare: (id: string) =>
+    invoke<WorkflowDef>("accept_relay_workflow_share", { id }),
+  declineRelayWorkflowShare: (id: string) =>
+    invoke<void>("decline_relay_workflow_share", { id }),
   listRoamingFolders: () => invoke<string[]>("list_roaming_folders"),
   isFolderRoaming: (cwd: string) => invoke<boolean>("is_folder_roaming", { cwd }),
   setFolderRoaming: (cwd: string, allowed: boolean) =>

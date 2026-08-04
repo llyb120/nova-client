@@ -42,6 +42,8 @@ use crate::acp::{EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS, EV_TURN, EV_
 pub const EV_RELAY_STATUS: &str = "relay:status";
 pub const EV_RELAY_PEERS: &str = "relay:peers";
 pub const EV_RELAY_INBOX: &str = "relay:inbox";
+/// 工作流分享收件箱变化
+pub const EV_RELAY_WORKFLOW_INBOX: &str = "relay:workflow-inbox";
 /// guest 侧：收到对端（host）回传的可选模型/模式列表，前端据此缓存并在漫游时选用对方的模型
 pub const EV_RELAY_PEER_MODELS: &str = "relay:peer-models";
 /// guest 侧：收到对端某目录的本地分支列表，worktree「基于分支」下拉据此填充
@@ -345,6 +347,18 @@ pub struct Share {
     pub ts: i64,
 }
 
+/// 一条待接收的工作流分享（队友通过中转站定向发来）
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowShare {
+    pub id: String,
+    pub from: String,
+    pub from_name: String,
+    /// 完整的工作流定义（前端 WorkflowDef 的 JSON）
+    pub def: Value,
+    pub ts: i64,
+}
+
 fn accepted_share_mode(recall: bool, default_mode: &str) -> Option<String> {
     recall
         .then(|| default_mode.to_string())
@@ -393,6 +407,8 @@ pub struct RelayManager {
     last_persist: StdMutex<Instant>,
     peers: StdMutex<Value>,
     inbox: StdMutex<Vec<Share>>,
+    /// 工作流分享收件箱：待本机用户接收进本地工作流库
+    workflow_inbox: StdMutex<Vec<WorkflowShare>>,
     /// host 侧：hostThreadId -> guest
     hosted: StdMutex<HashMap<String, RoamGuest>>,
     /// host 侧漫游提示词的取消代次。收到 cancel 时递增；尚未真正进入 manager 的旧任务
@@ -438,6 +454,7 @@ impl RelayManager {
     pub fn new(app: AppHandle, config_dir: PathBuf) -> Arc<Self> {
         let (last_seq, server_epoch) = read_relay_state(&config_dir);
         let inbox = read_inbox(&config_dir);
+        let workflow_inbox = read_workflow_inbox(&config_dir);
         let device_id = read_or_create_device_id(&config_dir);
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
@@ -460,6 +477,7 @@ impl RelayManager {
             last_persist: StdMutex::new(Instant::now()),
             peers: StdMutex::new(json!([])),
             inbox: StdMutex::new(inbox),
+            workflow_inbox: StdMutex::new(workflow_inbox),
             hosted: StdMutex::new(HashMap::new()),
             host_prompt_epochs: StdMutex::new(HashMap::new()),
             guest_perms: StdMutex::new(HashMap::new()),
@@ -840,6 +858,7 @@ impl RelayManager {
             "alkaid.config" => self.apply_alkaid_config(&env.data),
             "remote.device" => crate::remote::publish_main_sse(env.data),
             "share" => self.on_share(&env),
+            "workflow" => self.on_workflow(&env),
             // guest -> host
             "roaming.create" => self.on_roaming_create(&env),
             "roaming.prompt" => self.on_roaming_prompt(&env),
@@ -1533,6 +1552,87 @@ impl RelayManager {
             persist_inbox(&self.config_dir, &inbox);
         }
         self.emit_inbox();
+    }
+
+    // ===== 工作流分享：把工作流定义定向发给队友，对方接收后进入其工作流库 =====
+
+    /// 把工作流定义分享给指定队友。def 为前端完整的 WorkflowDef JSON。
+    pub fn share_workflow(&self, def: &Value, to: &str) -> Result<(), String> {
+        if self.cfg().is_none() {
+            return Err("未配置团队中转站".into());
+        }
+        let name = def
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if name.is_empty() {
+            return Err("工作流名称为空，无法分享".into());
+        }
+        let stage_count = def
+            .get("stages")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if stage_count == 0 {
+            return Err("工作流没有阶段，无法分享".into());
+        }
+        self.enqueue(to.to_string(), "workflow", def.clone());
+        Ok(())
+    }
+
+    fn on_workflow(&self, env: &InEnvelope) {
+        // 轻量校验，避免无效消息污染收件箱
+        let stages = env.data.get("stages").and_then(|v| v.as_array());
+        if stages.map(|a| a.is_empty()).unwrap_or(true) {
+            return;
+        }
+        let share = WorkflowShare {
+            id: uuid::Uuid::new_v4().to_string(),
+            from: env.from.clone(),
+            from_name: env.from_name.clone(),
+            def: env.data.clone(),
+            ts: now_ms(),
+        };
+        {
+            let mut inbox = self.workflow_inbox.lock().unwrap();
+            inbox.push(share);
+            persist_workflow_inbox(&self.config_dir, &inbox);
+        }
+        self.emit_workflow_inbox();
+    }
+
+    pub fn workflow_inbox_list(&self) -> Vec<WorkflowShare> {
+        self.workflow_inbox.lock().unwrap().clone()
+    }
+
+    fn emit_workflow_inbox(&self) {
+        let _ = self
+            .app
+            .emit(EV_RELAY_WORKFLOW_INBOX, self.workflow_inbox_list());
+    }
+
+    /// 接收一条工作流分享：从收件箱移除并返回定义，由前端写入本地工作流库。
+    pub fn accept_workflow_share(&self, id: &str) -> Result<Value, String> {
+        let mut inbox = self.workflow_inbox.lock().unwrap();
+        let idx = inbox
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or("该工作流分享已失效")?;
+        let share = inbox.remove(idx);
+        persist_workflow_inbox(&self.config_dir, &inbox);
+        drop(inbox);
+        self.emit_workflow_inbox();
+        Ok(share.def)
+    }
+
+    pub fn decline_workflow_share(&self, id: &str) {
+        {
+            let mut inbox = self.workflow_inbox.lock().unwrap();
+            inbox.retain(|s| s.id != id);
+            persist_workflow_inbox(&self.config_dir, &inbox);
+        }
+        self.emit_workflow_inbox();
     }
 
     /// 高级分享：用指定模型（默认 swe-1.6）对会话执行一段提示词，
@@ -4450,6 +4550,20 @@ fn persist_inbox(dir: &PathBuf, inbox: &[Share]) {
     let _ = std::fs::create_dir_all(dir);
     if let Ok(json) = serde_json::to_string_pretty(inbox) {
         let _ = std::fs::write(dir.join("relay-inbox.json"), json);
+    }
+}
+
+fn read_workflow_inbox(dir: &PathBuf) -> Vec<WorkflowShare> {
+    std::fs::read_to_string(dir.join("relay-workflow-inbox.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<WorkflowShare>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn persist_workflow_inbox(dir: &PathBuf, inbox: &[WorkflowShare]) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(json) = serde_json::to_string_pretty(inbox) {
+        let _ = std::fs::write(dir.join("relay-workflow-inbox.json"), json);
     }
 }
 
