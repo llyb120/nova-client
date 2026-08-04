@@ -1138,7 +1138,8 @@ fn remove_project(state: State<'_, AppState>, cwd: String) {
     state.relay.publish_folders();
 }
 
-/// 预热某个项目目录的 agent session（草稿页选定项目时调用）
+/// 预热某个项目目录的 agent（草稿页选定项目/模型/模式时调用）：
+/// Devin 预热 ACP session；SDK 后端（Cursor）预热 idle bridge 与 Agent.create。
 #[tauri::command]
 fn prewarm(
     state: State<'_, AppState>,
@@ -1159,14 +1160,21 @@ fn prewarm(
         mode.filter(|s| !s.is_empty())
             .or(Some(default_mode).filter(|s| !s.is_empty()))
     };
-    if agent_kind != AgentKind::Devin {
+    if agent_kind == AgentKind::Devin {
+        let mgr = state.acp.clone();
+        tauri::async_runtime::spawn(async move {
+            mgr.prewarm(cwd).await;
+        });
         return;
     }
-    let _ = (model, mode);
-    let mgr = state.acp.clone();
-    tauri::async_runtime::spawn(async move {
-        mgr.prewarm(cwd).await;
-    });
+    // SDK 后端：把 Node bridge 启动与 Agent.create 提前到空闲期，首轮不再冷启动。
+    let manager: Option<Arc<SdkManager>> = match agent_kind {
+        AgentKind::Cursor => Some(state.cursorplus.clone()),
+        _ => None,
+    };
+    if let Some(manager) = manager {
+        manager.prewarm_idle(cwd, model.unwrap_or_default(), mode.unwrap_or_default());
+    }
 }
 
 fn clean_frontmatter_value(value: &str) -> String {

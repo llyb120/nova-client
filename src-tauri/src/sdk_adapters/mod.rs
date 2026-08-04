@@ -46,6 +46,12 @@ pub trait SdkAdapter: Send + Sync {
         false
     }
 
+    /// 是否支持在首条消息前预热 idle bridge 与 Agent（草稿页空闲期调用，
+    /// 把进程启动与 Agent.create 移出首轮关键路径）。
+    fn supports_idle_prewarm(&self) -> bool {
+        false
+    }
+
     fn supports_native_steer(&self) -> bool {
         false
     }

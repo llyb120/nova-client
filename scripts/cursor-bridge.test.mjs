@@ -290,6 +290,23 @@ assert.equal(canReuseAgentSession(
   await waitReady();
   prewarm.close();
   assert.equal(created[5].closed, true);
+
+  // waitFor: bounded settle used by the explicit "prewarm" bridge action.
+  const prewarmWait = createAgentPrewarm(sdk, { enabled: true });
+  const waitFingerprint = agentFingerprint(req);
+  prewarmWait.ensure(waitFingerprint, { model: req.model });
+  assert.equal(createCount, 7);
+  // In-flight create: a bounded wait times out to not-ready.
+  assert.deepEqual(await prewarmWait.waitFor(waitFingerprint, 30), { ready: false });
+  deferred.shift()();
+  assert.deepEqual(await prewarmWait.waitFor(waitFingerprint, 1_000), { ready: true });
+  // A replaced fingerprint reports not-ready so the caller can move on.
+  prewarmWait.ensure(agentFingerprint({ ...req, model: "other-model" }), { model: "other-model" });
+  assert.equal(createCount, 8);
+  assert.deepEqual(await prewarmWait.waitFor(waitFingerprint, 1_000), { ready: false });
+  deferred.shift()();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  prewarmWait.close();
 }
 assert.deepEqual(cursorModelOptions([
   { id: "auto", displayName: "Auto" },

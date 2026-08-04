@@ -61,6 +61,10 @@ impl SdkAdapter for CursorAdapter {
         true
     }
 
+    fn supports_idle_prewarm(&self) -> bool {
+        true
+    }
+
     fn empty_model_options(&self) -> Value {
         json!({
             "configOptions": [{

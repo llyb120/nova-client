@@ -14,6 +14,7 @@ const CURSOR_RECOVERY_TIMEOUT_MS = positiveInteger(process.env.NOVA_CURSOR_RECOV
 const CURSOR_SILENT_RETRIES = positiveInteger(process.env.NOVA_CURSOR_SILENT_RETRIES, 2);
 const CURSOR_SILENT_RETRY_DELAYS_MS = [1_000, 3_000];
 const CURSOR_CREATE_RETRY_DELAYS_MS = [1_000, 3_000, 7_000];
+const CURSOR_PREWARM_WAIT_MS = positiveInteger(process.env.NOVA_CURSOR_PREWARM_WAIT_MS, 30_000);
 const CURSOR_RECOVERY_CONTEXT_CHARS = positiveInteger(process.env.NOVA_CURSOR_RECOVERY_CONTEXT_CHARS, 24_000);
 const CURSOR_SLIM_MEMORY_TURNS = positiveInteger(process.env.NOVA_CURSOR_SLIM_MEMORY_TURNS, 10);
 const CURSOR_DEFAULT_CONTEXT_WINDOW = positiveInteger(process.env.NOVA_CURSOR_CONTEXT_WINDOW, 128_000);
@@ -810,10 +811,23 @@ function createAgentPrewarm(sdk = Agent, { enabled = prewarmEnabled() } = {}) {
     return { agent, source: "live", fingerprint };
   }
 
+  // Bounded wait until the fingerprint's Agent.create settles (ready, replaced, or failed).
+  // Only the explicit prewarm action needs this; the prompt path awaits the slot via acquire().
+  async function waitFor(fingerprint, timeoutMs = CURSOR_PREWARM_WAIT_MS) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!slot || slot.fingerprint !== fingerprint) return { ready: false };
+      if (slot.agent) return { ready: true };
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return { ready: Boolean(slot?.agent && slot.fingerprint === fingerprint) };
+  }
+
   return {
     acquire,
     ensure,
     discard,
+    waitFor,
     close: discard,
     get snapshot() {
       return slot
@@ -912,6 +926,20 @@ async function main() {
       }
       if (request.action === "title") {
         send({ ok: true, data: await generateTitle(request) });
+        continue;
+      }
+      if (request.action === "prewarm") {
+        // Nova idle-time warmup (draft page): create the Agent for this model/cwd/mode ahead of
+        // time so the first prompt hits the prewarm slot instead of paying Agent.create inline.
+        const prewarmStartedAt = performance.now();
+        const fingerprint = agentFingerprint(request);
+        prewarm.ensure(fingerprint, agentCreateOptions(request));
+        const settled = await prewarm.waitFor(fingerprint);
+        send({
+          type: "prewarmed",
+          ready: settled.ready,
+          elapsedMs: Math.round(performance.now() - prewarmStartedAt),
+        });
         continue;
       }
       if (request.action !== "prompt") throw new Error(`Unknown action: ${request.action}`);

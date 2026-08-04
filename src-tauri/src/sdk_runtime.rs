@@ -20,6 +20,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 
+/// 预热保留位：idle_children 里不属于任何线程的预热 bridge 用这个键存放，
+/// 新线程首轮 prompt 直接认领，避免 Node 启动 + Agent.create 冷启动。
+const PREWARM_KEY: &str = "__nova_prewarm__";
+
 fn is_codex_model_resume_warning(value: &Value) -> bool {
     if value.get("type").and_then(Value::as_str) != Some("error") {
         return false;
@@ -59,6 +63,9 @@ pub struct SdkManager {
     launch_env: HashMap<String, String>,
     running_children: Mutex<HashMap<String, RunningBridge>>,
     idle_children: Mutex<HashMap<String, IdleBridge>>,
+    /// 最新一次预热请求（后到覆盖先到）；持有 prewarm_gate 的循环负责逐个消化。
+    prewarm_pending: Mutex<Option<Value>>,
+    prewarm_gate: tokio::sync::Mutex<()>,
     running: Mutex<HashSet<String>>,
     turn_started: Mutex<HashMap<String, Instant>>,
     pending_permissions: Mutex<HashMap<String, (String, String)>>,
@@ -88,6 +95,8 @@ impl SdkManager {
             launch_env,
             running_children: Mutex::new(HashMap::new()),
             idle_children: Mutex::new(HashMap::new()),
+            prewarm_pending: Mutex::new(None),
+            prewarm_gate: tokio::sync::Mutex::new(()),
             running: Mutex::new(HashSet::new()),
             turn_started: Mutex::new(HashMap::new()),
             pending_permissions: Mutex::new(HashMap::new()),
@@ -762,7 +771,12 @@ impl SdkManager {
         let cached_bridge = self
             .adapter
             .keeps_bridge_alive()
-            .then(|| self.idle_children.lock().unwrap().remove(thread_id))
+            .then(|| {
+                let mut idle = self.idle_children.lock().unwrap();
+                idle.remove(thread_id)
+                    // 新线程首轮：认领草稿页空闲期预热好的 bridge（进程 + Agent 已就绪）。
+                    .or_else(|| idle.remove(PREWARM_KEY))
+            })
             .flatten();
         let reused_cached_bridge = cached_bridge.is_some();
         let mut bridge = match cached_bridge {
@@ -914,6 +928,102 @@ impl SdkManager {
             stdout: BufReader::new(stdout),
             stderr: stderr_lines,
         })
+    }
+
+    /// 草稿页空闲期预热：提前拉起 bridge（Node 进程）并完成 SDK Agent.create，
+    /// 把首轮关键路径上的进程启动与 Agent 创建开销提前到用户还在选项目/模型时。
+    /// 最新请求生效：模型/cwd/模式连续变化时，飞行中的循环会接着处理最新一条。
+    pub fn prewarm_idle(self: &Arc<Self>, cwd: String, model: String, mode: String) {
+        if !self.adapter.supports_idle_prewarm() || model.trim().is_empty() {
+            return;
+        }
+        let request = json!({
+            "action": "prewarm",
+            "cwd": cwd,
+            "model": model,
+            "mode": mode,
+        });
+        *self.prewarm_pending.lock().unwrap() = Some(request);
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            manager.prewarm_idle_loop().await;
+        });
+    }
+
+    async fn prewarm_idle_loop(&self) {
+        // 已有一个循环在飞时直接退出：它每轮都会取走最新的 pending 请求。
+        let Ok(_gate) = self.prewarm_gate.try_lock() else {
+            return;
+        };
+        loop {
+            let Some(request) = self.prewarm_pending.lock().unwrap().take() else {
+                break;
+            };
+            let cwd = request["cwd"].as_str().unwrap_or_default().to_string();
+            let label = self.adapter.label();
+            match self.prewarm_once(&cwd, &request).await {
+                Ok((ready, elapsed_ms)) => {
+                    let _ = self.app.emit(
+                        EV_LOG,
+                        format!("[{label}][timing] prewarm {elapsed_ms}ms ready={ready}"),
+                    );
+                }
+                Err(error) => {
+                    let _ = self
+                        .app
+                        .emit(EV_LOG, format!("[{label}] 预热失败：{error}"));
+                }
+            }
+        }
+    }
+
+    async fn prewarm_once(&self, cwd: &str, request: &Value) -> Result<(bool, u64), String> {
+        let mut bridge = match self.idle_children.lock().unwrap().remove(PREWARM_KEY) {
+            Some(bridge) => bridge,
+            None => self.spawn_idle_bridge(cwd)?,
+        };
+        if let Err(error) = write_line(&bridge.stdin, request).await {
+            kill_child(&mut bridge.child);
+            return Err(error);
+        }
+        let read = async {
+            let stdout = &mut bridge.stdout;
+            let mut lines = stdout.lines();
+            while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+                let event: Value = serde_json::from_str(&line)
+                    .map_err(|e| format!("解析预热事件失败：{e}；输出：{line}"))?;
+                if event.get("ok").and_then(Value::as_bool) == Some(false) {
+                    return Err(event["error"]
+                        .as_str()
+                        .unwrap_or("SDK bridge 预热失败")
+                        .to_string());
+                }
+                if event.get("type").and_then(Value::as_str) == Some("prewarmed") {
+                    let ready = event.get("ready").and_then(Value::as_bool).unwrap_or(false);
+                    let elapsed_ms = event.get("elapsedMs").and_then(Value::as_u64).unwrap_or(0);
+                    return Ok((ready, elapsed_ms));
+                }
+            }
+            Err("bridge 在预热完成前退出".to_string())
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(45), read).await;
+        match outcome {
+            Ok(Ok(result)) => {
+                self.idle_children
+                    .lock()
+                    .unwrap()
+                    .insert(PREWARM_KEY.to_string(), bridge);
+                Ok(result)
+            }
+            Ok(Err(error)) => {
+                kill_child(&mut bridge.child);
+                Err(error)
+            }
+            Err(_) => {
+                kill_child(&mut bridge.child);
+                Err("预热超时".to_string())
+            }
+        }
     }
 
     async fn read_events(
