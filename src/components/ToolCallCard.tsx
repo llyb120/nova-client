@@ -240,7 +240,9 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
   const open = () => isExpanded(key(), defaultOpen());
   const showRaw = () => isExpanded(rawKey());
   const content = createMemo(() =>
-    props.item.content.filter((block) => !isTrivialToolOutput(props.item, block)),
+    props.item.content.filter(
+      (block) => !(state.agentKind === "devin" && isTrivialToolOutput(props.item, block)),
+    ),
   );
   const hasBody = createMemo(
     () =>
@@ -257,7 +259,8 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
     }),
   );
   const summary = createMemo(() => toolSummary(props.item));
-  const detail = createMemo(() => toolHeadlineDetail(props.item));
+  const devinOnly = () => state.agentKind === "devin";
+  const detail = createMemo(() => (devinOnly() ? toolHeadlineDetail(props.item) : ""));
 
   // 文件编辑统计 +N -N（codex 风格）
   const stats = createMemo(() => {

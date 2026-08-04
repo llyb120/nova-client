@@ -1354,12 +1354,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const busy = item.status === "pending" || item.status === "in_progress";
     const defaultOpen = active || busy;
     const open = isExpanded(key, defaultOpen);
-    const contentBlocks = item.content.filter((block) => !isTrivialToolOutput(item, block));
+    // 摘要展示优化仅对 Devin 生效（对齐 DOM ToolCallCard）
+    const isDevin = state.agentKind === "devin";
+    const contentBlocks = isDevin
+      ? item.content.filter((block) => !isTrivialToolOutput(item, block))
+      : item.content;
     const hasBody = contentBlocks.length > 0 || item.locations.length > 0
       || item.rawInput !== undefined || item.rawOutput !== undefined;
 
     const label = displayToolTitle(stripAnsi(item.title || item.kind));
-    const detail = toolHeadlineDetail(item);
+    const detail = isDevin ? toolHeadlineDetail(item) : "";
     // .tool-row margin 1px 0; .tool-line padding 3px 8px; min-height 26; gap 8
     const toolH = 26;
 
