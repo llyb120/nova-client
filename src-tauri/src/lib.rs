@@ -46,7 +46,7 @@ use acp::AcpManager;
 use codex::CodexManager;
 use credential_roaming::{BorrowedManager, BorrowedRuntime};
 use opencode_sdk::OpenCodeSdkManager;
-use relay::{RelayManager, Share};
+use relay::{RelayManager, Share, WorkflowShare};
 use sdk_adapters::{AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter};
 use sdk_runtime::SdkManager;
 use serde_json::{json, Value};
@@ -4287,6 +4287,28 @@ fn decline_share(state: State<'_, AppState>, id: String) {
     state.relay.decline_share(&id);
 }
 
+/// 把工作流定义分享给指定队友（对方接收后进入其工作流库）
+#[tauri::command]
+fn share_workflow(state: State<'_, AppState>, workflow: Value, to: String) -> Result<(), String> {
+    state.relay.share_workflow(&workflow, &to)
+}
+
+#[tauri::command]
+fn get_relay_workflow_inbox(state: State<'_, AppState>) -> Vec<WorkflowShare> {
+    state.relay.workflow_inbox_list()
+}
+
+/// 接收队友分享的工作流：返回定义 JSON，由前端写入本地工作流库
+#[tauri::command]
+fn accept_relay_workflow_share(state: State<'_, AppState>, id: String) -> Result<Value, String> {
+    state.relay.accept_workflow_share(&id)
+}
+
+#[tauri::command]
+fn decline_relay_workflow_share(state: State<'_, AppState>, id: String) {
+    state.relay.decline_workflow_share(&id);
+}
+
 #[tauri::command]
 fn list_roaming_folders(state: State<'_, AppState>) -> Vec<String> {
     current_roaming_project_folders(state.inner())
@@ -5834,6 +5856,10 @@ pub fn run() {
             summarize_clue,
             accept_share,
             decline_share,
+            share_workflow,
+            get_relay_workflow_inbox,
+            accept_relay_workflow_share,
+            decline_relay_workflow_share,
             list_roaming_folders,
             is_folder_roaming,
             set_folder_roaming,

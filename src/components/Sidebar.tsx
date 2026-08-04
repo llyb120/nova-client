@@ -580,10 +580,17 @@ export function Sidebar(props: {
               class="mode-seg-btn"
               classList={{ active: state.view === "workflows" }}
               onClick={openWorkflows}
-              title="配置可编排的工作流：阶段接力、转移条件与提示词模板"
+              title={
+                state.workflowInbox.length > 0
+                  ? `有 ${state.workflowInbox.length} 个队友分享的工作流待接收`
+                  : "配置可编排的工作流：阶段接力、转移条件与提示词模板"
+              }
             >
               <IconMerge size={14} />
               工作流
+              <Show when={state.workflowInbox.length > 0}>
+                <span class="badge-count">{state.workflowInbox.length}</span>
+              </Show>
             </button>
             <button
               class="mode-seg-btn"

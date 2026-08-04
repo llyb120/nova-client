@@ -8674,6 +8674,13 @@ button.head-badge:hover {
 .wf-list-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wf-badge { font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--bg-hover); color: var(--text-muted); flex: 0 0 auto; }
 .wf-badge-off { color: var(--text-faint); border: 1px solid var(--border); background: transparent; }
+.wf-badge-team { color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); background: transparent; }
+/* 团队分享收件箱（抽屉内） */
+.wf-inbox { display: flex; flex-direction: column; gap: 6px; padding-bottom: 8px; margin-bottom: 4px; border-bottom: 1px solid var(--border); }
+.wf-inbox-title { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--accent); }
+.wf-inbox-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--r-sm); }
+.wf-inbox-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.wf-inbox-actions { display: flex; gap: 6px; flex: 0 0 auto; }
 .wf-builtin-clone { display: flex; flex-direction: column; gap: 2px; }
 .wf-run-hint { margin-top: auto; }
 

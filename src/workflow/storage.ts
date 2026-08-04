@@ -2,6 +2,7 @@
  * 用户自定义工作流的持久化（localStorage）。内置工作流来自代码，不存这里。
  */
 import { BUILTIN_WORKFLOWS, getBuiltinWorkflow, WORKFLOW_WAKE_DO_ID } from "./builtin";
+import { validateWorkflow } from "./types";
 import type { WorkflowDef, WorkflowTrigger } from "./types";
 
 const WORKFLOWS_KEY = "fd:workflows:v1";
@@ -79,6 +80,24 @@ export function saveWorkflow(def: WorkflowDef): void {
 
 export function deleteUserWorkflow(id: string): void {
   writeUserWorkflows(readUserWorkflows().filter((w) => w.id !== id));
+}
+
+/**
+ * 接收队友分享的工作流：去掉内置标记、记录团队来源后入库。
+ * 保持原 id，同一工作流再次分享 = 原地更新；接收后默认启用，新会话可直接选择。
+ */
+export function acceptSharedWorkflow(def: WorkflowDef, fromName: string): WorkflowDef {
+  const copy: WorkflowDef = JSON.parse(JSON.stringify(def)) as WorkflowDef;
+  copy.builtin = false;
+  const errors = validateWorkflow(copy);
+  if (errors.length > 0) {
+    throw new Error(`分享的工作流不合法：${errors.join("；")}`);
+  }
+  copy.sharedBy = fromName || copy.sharedBy || "队友";
+  copy.sharedAt = Date.now();
+  copy.enabled = true;
+  saveWorkflow(copy);
+  return copy;
 }
 
 /** 数字员工配置的工作流名称（空/已删除回落默认内置「Wake → Do」）。 */

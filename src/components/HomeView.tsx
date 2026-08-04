@@ -997,10 +997,15 @@ export function HomeView() {
                             active: selectedWorkflowId() === wf.id,
                           }}
                           onClick={() => pickWorkflow(wf.id)}
+                          title={wf.sharedBy ? `来自 ${wf.sharedBy} 的团队分享` : undefined}
                         >
                           <span>{wf.name}</span>
                           <small>
-                            {wf.builtin ? "内置" : "自定义"} · {wf.stages.length} 个节点
+                            {wf.sharedBy
+                              ? `团队 · ${wf.sharedBy}`
+                              : wf.builtin
+                                ? "内置"
+                                : "自定义"} · {wf.stages.length} 个节点
                           </small>
                         </button>
                       )}
