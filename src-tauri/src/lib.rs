@@ -2338,6 +2338,89 @@ fn open_clue_attachment(
     open_path_default(&abs)
 }
 
+/// 按扩展名猜测附件 MIME 类型（选择本地文件作附件时使用）。
+fn guess_attachment_mime_type(name: &str) -> String {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "json" => "application/json",
+        "md" => "text/markdown",
+        "txt" => "text/plain",
+        "html" => "text/html",
+        "css" => "text/css",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    };
+    mime.to_string()
+}
+
+/// 读取本地文件并转换为内嵌（base64）线索附件，供线索弹窗「添加附件」选择任意文件。
+#[tauri::command]
+fn read_local_attachment(path: String) -> Result<clues::ClueAttachment, String> {
+    const MAX_SIZE: u64 = 20 * 1024 * 1024;
+    let abs = std::path::PathBuf::from(&path);
+    let meta = std::fs::metadata(&abs).map_err(|error| format!("读取文件失败：{error}"))?;
+    if !meta.is_file() {
+        return Err("只能选择文件作为附件".into());
+    }
+    if meta.len() > MAX_SIZE {
+        return Err("附件过大：单个附件不能超过 20MB".into());
+    }
+    let bytes = std::fs::read(&abs).map_err(|error| format!("读取文件失败：{error}"))?;
+    let name = abs
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("attachment")
+        .to_string();
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(clues::ClueAttachment {
+        mime_type: guess_attachment_mime_type(&name),
+        name,
+        data: Some(data),
+        uri: None,
+        size: Some(meta.len()),
+    })
+}
+
+/// 把线索附件保存到指定路径（下载）：内嵌 base64 数据先还原，路径附件直接复制。
+#[tauri::command]
+fn save_clue_attachment(
+    data: Option<String>,
+    path: Option<String>,
+    target: String,
+) -> Result<(), String> {
+    let bytes = if let Some(data) = data.filter(|value| !value.is_empty()) {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|error| format!("附件数据损坏：{error}"))?
+    } else if let Some(path) = path.filter(|value| !value.is_empty()) {
+        std::fs::read(path).map_err(|error| format!("读取附件原文件失败：{error}"))?
+    } else {
+        return Err("附件没有可下载的数据".into());
+    };
+    let target = std::path::PathBuf::from(target);
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("创建下载目录失败：{error}"))?;
+        }
+    }
+    std::fs::write(&target, bytes).map_err(|error| format!("保存附件失败：{error}"))
+}
+
 /// 撤销目标：一个文件回滚到本轮编辑前的内容
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5698,6 +5781,8 @@ pub fn run() {
             open_in_editor,
             open_file_default,
             open_clue_attachment,
+            read_local_attachment,
+            save_clue_attachment,
             revert_file_changes,
             open_in_explorer,
             open_in_terminal,

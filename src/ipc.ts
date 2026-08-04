@@ -174,6 +174,16 @@ export const api = {
       data: attachment.data ?? null,
       path: attachment.uri ? fileUriPath(attachment.uri) : null,
     }),
+  /** 读取本地文件为内嵌（base64）线索附件。 */
+  readLocalAttachment: (path: string) =>
+    invoke<ClueAttachment>("read_local_attachment", { path }),
+  /** 把线索附件保存（下载）到指定路径。 */
+  saveClueAttachment: (attachment: ClueAttachment, target: string) =>
+    invoke<void>("save_clue_attachment", {
+      data: attachment.data ?? null,
+      path: attachment.uri ? fileUriPath(attachment.uri) : null,
+      target,
+    }),
   revertFileChanges: (threadId: string, changes: RevertChange[]) =>
     invoke<RevertResult>("revert_file_changes", { threadId, changes }),
   setThreadModel: (threadId: string, model: string | null) =>

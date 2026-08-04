@@ -1,5 +1,5 @@
 import { message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
   captureClue,
   clueCardById,
@@ -8,7 +8,8 @@ import {
   state,
   summarizeClue,
 } from "../store";
-import { IconClue, IconX } from "./icons";
+import { IconClue, IconPaperclip, IconX } from "./icons";
+import { setFileDropBlocked } from "../utils";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { MentionPicker } from "./MentionPicker";
 
@@ -50,8 +51,16 @@ export function ClueCaptureModal(props: {
   );
   const [busy, setBusy] = createSignal(false);
   const [summarizing, setSummarizing] = createSignal(false);
+  const [pickingFiles, setPickingFiles] = createSignal(false);
   const [mentionTokens, setMentionTokens] = createSignal<string[]>([]);
-  const attachments = createImageAttachments({ acceptAllPasteFiles: true });
+  const attachments = createImageAttachments({
+    acceptAllPasteFiles: true,
+    enableFileDrop: true,
+    dropIgnoresBlock: true,
+  });
+  // 弹窗打开期间独占文件拖放：屏蔽底层会话输入区的拖入，避免一次拖放被两处重复接收
+  onMount(() => setFileDropBlocked(true));
+  onCleanup(() => setFileDropBlocked(false));
   const mentionPeers = createMemo(clueMentionPeers);
   const targetCard = createMemo(() => clueCardById(targetCardId()));
   const targetCardTitle = createMemo(() => {
@@ -112,6 +121,18 @@ export function ClueCaptureModal(props: {
     }
   };
 
+  const pickAttachments = async () => {
+    if (busy() || summarizing() || pickingFiles()) return;
+    setPickingFiles(true);
+    try {
+      await attachments.pickFiles();
+    } catch (error) {
+      await message(String(error), { kind: "error" });
+    } finally {
+      setPickingFiles(false);
+    }
+  };
+
   const submit = async () => {
     if (!title().trim() || !content().trim() || busy() || summarizing()) return;
     let nextPlacement = placement();
@@ -144,7 +165,11 @@ export function ClueCaptureModal(props: {
 
   const body = (
     <>
-      <div class="modal-body" onPaste={attachments.onPaste}>
+      <div
+        class="modal-body clue-drop-zone"
+        classList={{ "is-dragging": attachments.dragging() }}
+        onPaste={attachments.onPaste}
+      >
         <Show when={!props.sessionMode}>
           <div class="clue-placement">
             <button
@@ -254,7 +279,18 @@ export function ClueCaptureModal(props: {
             images={attachments.images()}
             onRemove={attachments.remove}
           />
-          <span class="field-hint">在此弹窗中粘贴图片或文件，会随线索版本一并保存。</span>
+          <div class="clue-attach-row">
+            <button
+              type="button"
+              class="btn secondary small clue-add-attachment-btn"
+              disabled={busy() || summarizing() || pickingFiles()}
+              onClick={() => void pickAttachments()}
+            >
+              <IconPaperclip size={13} />
+              {pickingFiles() ? "读取中…" : "添加附件"}
+            </button>
+            <span class="field-hint">可直接粘贴图片或文件，也可选择本地文件，会随线索版本一并保存。</span>
+          </div>
         </label>
 
         <div class="field">

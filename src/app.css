@@ -6275,14 +6275,12 @@ button.head-badge:hover {
   gap: 8px;
 }
 .clue-attachment {
+  position: relative;
   min-width: 0;
   height: 86px;
   padding: 9px;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 9px;
@@ -6297,6 +6295,18 @@ button.head-badge:hover {
 .clue-attachment.image {
   height: 112px;
   padding: 5px;
+}
+.clue-attachment-open {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: inherit;
+}
+.clue-attachment.image .clue-attachment-open {
   justify-content: space-between;
 }
 .clue-attachment img {
@@ -6312,6 +6322,15 @@ button.head-badge:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11px;
+}
+.clue-attachment-download {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  z-index: 1;
+  padding: 3px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-input) 82%, transparent);
 }
 .clue-detail-actions {
   display: flex;
@@ -6390,6 +6409,38 @@ button.head-badge:hover {
 .clue-ai-summary-btn {
   padding: 4px 10px;
   font-size: 12px;
+}
+.clue-attach-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.clue-drop-zone {
+  position: relative;
+}
+.clue-drop-zone.is-dragging {
+  border-color: var(--accent);
+}
+.clue-drop-zone.is-dragging::after {
+  content: "松手添加文件";
+  position: absolute;
+  inset: 8px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed color-mix(in srgb, var(--accent) 62%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  color: var(--text);
+  font-size: 13px;
+  pointer-events: none;
+  z-index: 2;
+}
+.clue-add-attachment-btn {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
 }
 .clue-placement {
   display: grid;

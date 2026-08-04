@@ -1,6 +1,8 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { api } from "../ipc";
 import type { PromptImage } from "../types";
 import { isFileDropBlocked } from "../utils";
 import { IconFile, IconX } from "./icons";
@@ -87,7 +89,12 @@ export function attachmentPreviewSrc(image: PromptImage) {
 
 /** 附件状态：粘贴图片走 base64，拖入文件走 Tauri file path。 */
 export function createImageAttachments(
-  options: { enableFileDrop?: boolean; acceptAllPasteFiles?: boolean } = {},
+  options: {
+    enableFileDrop?: boolean;
+    acceptAllPasteFiles?: boolean;
+    /** 最前层（如弹窗）独占拖放：忽略全局 fileDropBlocked，由自己接管文件拖入。 */
+    dropIgnoresBlock?: boolean;
+  } = {},
 ) {
   const [images, setImages] = createSignal<PromptImage[]>([]);
   const [dragging, setDragging] = createSignal(false);
@@ -127,7 +134,7 @@ export function createImageAttachments(
     try {
       void getCurrentWebview()
         .onDragDropEvent((event) => {
-          if (isFileDropBlocked()) {
+          if (isFileDropBlocked() && !options.dropIgnoresBlock) {
             if (event.payload.type === "drop" || event.payload.type === "leave") {
               setDragging(false);
             }
@@ -162,7 +169,21 @@ export function createImageAttachments(
   /** 用已有附件初始化（编辑历史消息时复制一份，避免引用 store 节点） */
   const set = (imgs: PromptImage[]) => setImages(imgs.map((img) => ({ ...img })));
 
-  return { images, dragging, onPaste, remove, clear, set };
+  /** 通过系统文件对话框选择本地文件，读取为内嵌附件（不限图片类型）。 */
+  const pickFiles = async () => {
+    const picked = await openDialog({ multiple: true, title: "选择要附加的文件" });
+    const paths = (Array.isArray(picked) ? picked : picked ? [picked] : []).filter(
+      (item): item is string => typeof item === "string" && item.length > 0,
+    );
+    if (paths.length === 0) return;
+    const added: PromptImage[] = [];
+    for (const path of paths) {
+      added.push(await api.readLocalAttachment(path));
+    }
+    if (added.length > 0) setImages((prev) => [...prev, ...added]);
+  };
+
+  return { images, dragging, onPaste, remove, clear, set, pickFiles };
 }
 
 export function ImageAttachmentStrip(props: {

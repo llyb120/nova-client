@@ -1,4 +1,4 @@
-import { confirm, message } from "@tauri-apps/plugin-dialog";
+import { confirm, message, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import {
@@ -17,10 +17,10 @@ import {
   startSessionFromClue,
   state,
 } from "../store";
-import type { ClueCard, ClueComment, ClueNodeGroup } from "../types";
+import type { ClueAttachment, ClueCard, ClueComment, ClueNodeGroup } from "../types";
 import { ClueCaptureModal } from "./ClueCaptureModal";
 import { attachmentPreviewSrc } from "./ImageAttachmentStrip";
-import { IconClue, IconFile, IconMove, IconPlus } from "./icons";
+import { IconClue, IconDownload, IconFile, IconMove, IconPlus } from "./icons";
 import { MentionPicker } from "./MentionPicker";
 
 type Placement = "update" | "parallel" | "new";
@@ -893,6 +893,19 @@ export function EvidenceChainView() {
     }
   };
 
+  const downloadAttachment = async (attachment: ClueAttachment) => {
+    try {
+      const target = await saveDialog({
+        title: "保存附件",
+        defaultPath: attachment.name || "attachment",
+      });
+      if (!target) return;
+      await api.saveClueAttachment(attachment, target);
+    } catch (error) {
+      await message(String(error), { title: "下载失败", kind: "error" });
+    }
+  };
+
   const selectCard = (cardId: string, event: MouseEvent) => {
     if (!event.ctrlKey && !event.metaKey) {
       selectOnly(cardId);
@@ -1240,31 +1253,43 @@ export function EvidenceChainView() {
                       <div class="clue-attachment-grid">
                         <For each={version()?.attachments ?? []}>
                           {(attachment) => (
-                            <button
-                              type="button"
+                            <div
                               classList={{
                                 "clue-attachment": true,
                                 image: attachment.mimeType.startsWith("image/"),
                               }}
-                              title={`打开 ${attachment.name}`}
-                              onClick={() =>
-                                void api.openClueAttachment(attachment).catch((error) =>
-                                  message(String(error), { kind: "error" }),
-                                )
-                              }
                             >
-                              <Show
-                                when={attachment.mimeType.startsWith("image/")}
-                                fallback={<IconFile size={28} />}
+                              <button
+                                type="button"
+                                class="clue-attachment-open"
+                                title={`打开 ${attachment.name}`}
+                                onClick={() =>
+                                  void api.openClueAttachment(attachment).catch((error) =>
+                                    message(String(error), { kind: "error" }),
+                                  )
+                                }
                               >
-                                <img
-                                  src={attachmentPreviewSrc(attachment)}
-                                  alt={attachment.name}
-                                  draggable={false}
-                                />
-                              </Show>
-                              <span>{attachment.name}</span>
-                            </button>
+                                <Show
+                                  when={attachment.mimeType.startsWith("image/")}
+                                  fallback={<IconFile size={28} />}
+                                >
+                                  <img
+                                    src={attachmentPreviewSrc(attachment)}
+                                    alt={attachment.name}
+                                    draggable={false}
+                                  />
+                                </Show>
+                                <span>{attachment.name}</span>
+                              </button>
+                              <button
+                                type="button"
+                                class="icon-btn clue-attachment-download"
+                                title={`下载 ${attachment.name}`}
+                                onClick={() => void downloadAttachment(attachment)}
+                              >
+                                <IconDownload size={13} />
+                              </button>
+                            </div>
                           )}
                         </For>
                       </div>
