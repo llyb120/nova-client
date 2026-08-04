@@ -4679,42 +4679,62 @@ button {
   color: var(--green);
 }
 
-.quota-share-models {
-  display: grid;
-  gap: 10px;
+/* ===== 团队共享：逐行添加列表（漫游项目 / 共享模型额度） ===== */
+.share-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   margin-top: 8px;
 }
-.quota-share-backend {
-  padding: 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--bg) 62%, transparent);
-}
-.quota-share-backend-title {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-  color: var(--text-dim);
-  font-size: 12px;
-}
-.quota-share-options {
+.share-row {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-  gap: 6px 12px;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 6px;
 }
-.quota-share-option {
+.share-row .proj-picker,
+.share-row .search-select,
+.share-row .pill {
+  width: 100%;
+  min-width: 0;
+}
+.share-row .pill {
+  display: inline-flex;
+  justify-content: space-between;
+  gap: 6px;
+  max-width: none;
+  background: var(--bg-input);
+  border: 1px solid var(--border-light);
+  color: var(--text);
+}
+.share-row .pill:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+.share-row .pill-text {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  color: var(--text);
+}
+.share-row-remove {
+  justify-self: center;
+}
+.share-row-plus {
   display: flex;
   align-items: center;
-  gap: 7px;
-  min-width: 0;
-  color: var(--text);
-  font-size: 12px;
+  justify-content: center;
+  color: var(--text-faint);
 }
-.quota-share-option span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.share-row-add .pill {
+  border-style: dashed;
+}
+.share-empty {
+  padding: 9px 11px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--text-faint);
+  font-size: 12px;
 }
 
 .modal-foot {
