@@ -35,6 +35,7 @@ import {
   manualWorkflowReview,
   workflowReviewRevision,
 } from "../workflow/runtime";
+import { employeeWorkflowName } from "../workflow/storage";
 import { ConfigSelects } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconClue, IconFile, IconSend, IconStop, IconUndo, IconUsers } from "./icons";
@@ -784,7 +785,7 @@ export function Composer() {
                       onClick={() => pickEmployee(employee.id)}
                     >
                       <span>{employee.name}</span>
-                      <small>Wake → Do · Dream 生效</small>
+                      <small>{employeeWorkflowName(employee.workflowId)} · Dream 生效</small>
                     </button>
                   )}
                 </For>

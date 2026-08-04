@@ -19,6 +19,8 @@ import type {
   WorkHours,
 } from "../types";
 import { agentLabel } from "../utils";
+import { listWorkflows, employeeWorkflowName } from "../workflow/storage";
+import { WORKFLOW_WAKE_DO_ID } from "../workflow/builtin";
 import { ConfigSelects, ModelPicker } from "./ConfigSelects";
 import {
   IconCheck,
@@ -310,6 +312,9 @@ export function EmployeesView() {
   const [fMarkScope, setFMarkScope] = createSignal("");
   const [fSharedLedger, setFSharedLedger] = createSignal(false);
   const [fPartners, setFPartners] = createSignal<Partner[]>([]);
+  // 配置工作流：空 = 默认内置「Wake → Do」（原来数字员工的两步走示例）
+  const [fWorkflowId, setFWorkflowId] = createSignal(WORKFLOW_WAKE_DO_ID);
+  const workflowChoices = createMemo(() => listWorkflows());
   const [fBusy, setFBusy] = createSignal(false);
   const [fErr, setFErr] = createSignal("");
 
@@ -388,6 +393,7 @@ export function EmployeesView() {
     setFMarkScope("");
     setFSharedLedger(false);
     setFPartners([]);
+    setFWorkflowId(WORKFLOW_WAKE_DO_ID);
     setFErr("");
   };
 
@@ -420,6 +426,7 @@ export function EmployeesView() {
     setFMarkScope(e.markScope);
     setFSharedLedger(e.sharedLedger);
     setFPartners((e.partners ?? []).map((p) => ({ ...p })));
+    setFWorkflowId((e.workflowId ?? "").trim() || WORKFLOW_WAKE_DO_ID);
     setFErr("");
     setShowForm(true);
   };
@@ -478,6 +485,7 @@ export function EmployeesView() {
           markScope,
           sharedLedger,
           partners,
+          workflowId: fWorkflowId(),
         });
         await refreshEmployees();
         selectEmp(editId);
@@ -502,6 +510,7 @@ export function EmployeesView() {
           markScope,
           sharedLedger,
           partners,
+          workflowId: fWorkflowId(),
         });
         await refreshEmployees();
         selectEmp(emp.id);
@@ -715,7 +724,7 @@ export function EmployeesView() {
         fallback={
           <div class="emp-empty">
             <p>还没有数字员工。</p>
-            <p class="emp-empty-sub">新建一名员工，配置岗位说明书和常驻职责。工作目录会在每次 Wake 时动态确定。</p>
+            <p class="emp-empty-sub">新建一名员工，配置岗位说明书和常驻职责。员工按配置的工作流推进（默认内置 Wake → Do 示例）。</p>
             <button class="btn primary big" onClick={openCreate}>
               <IconPlus size={16} />
               新建第一名员工
@@ -769,7 +778,7 @@ export function EmployeesView() {
                     <span class={`emp-dot ${emp().enabled ? "on" : "off"}`} />
                     <span class="emp-detail-name">{emp().name}</span>
                     <span class={`agent-badge ${emp().agentKind}`}>{agentLabel(emp().agentKind)}</span>
-                    <span class="emp-detail-cwd" title="普通模式沿用当前项目；其他模式由 Wake 查找">
+                    <span class="emp-detail-cwd" title="普通模式沿用当前项目；其他模式由工作流首阶段确定">
                       动态工作目录
                     </span>
                     <Show
@@ -790,6 +799,12 @@ export function EmployeesView() {
                         {workHoursSummary(emp().workHours)}
                       </span>
                     </Show>
+                    <span
+                      class="emp-detail-hb"
+                      title="员工按该工作流推进；在编辑页可更换，或在「工作流」页自定义"
+                    >
+                      工作流：{employeeWorkflowName(emp().workflowId)}
+                    </span>
                     <Show when={isSleeping(emp()) && emp().heartbeatEnabled !== false}>
                       <span
                         class="emp-sleep-badge"
@@ -1094,6 +1109,23 @@ export function EmployeesView() {
                 <span class="emp-field-hint">
                   只控制能力边界。员工会结合任务、知识与经验，自行决定在当前分支工作、切独立分支或使用
                   worktree。
+                </span>
+              </label>
+
+              <label class="field">
+                <span class="field-label">工作流</span>
+                <select
+                  class="field-input"
+                  value={fWorkflowId()}
+                  onChange={(e) => setFWorkflowId(e.currentTarget.value)}
+                >
+                  <For each={workflowChoices()}>
+                    {(wf) => <option value={wf.id}>{wf.name}</option>}
+                  </For>
+                </select>
+                <span class="emp-field-hint">
+                  员工接到工作后按该工作流推进，不再自动跑固定的 Wake → Do 两步。默认内置「开工预检 →
+                  开发（Wake → Do）」即原来的两步走示例；可在「工作流」页复制或自定义新流程。
                 </span>
               </label>
 

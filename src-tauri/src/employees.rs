@@ -33,6 +33,8 @@ pub const EV_TASKS: &str = "tasks:changed";
 pub const EV_DECISIONS: &str = "decisions:changed";
 /// 系统通知点击「员工上奏」时发给前端：直达御书房。
 pub const EV_DECISIONS_OPEN: &str = "decisions:open";
+/// 员工工作轮次移交前端工作流运行时：payload { employeeId, threadId, goal }。
+pub const EV_EMPLOYEE_WORKFLOW: &str = "employees:workflow-request";
 /// 讨论/协作账本认领的租约（同 directive）：够长覆盖多轮开发 + 等待用户决策。
 const DISCUSS_LEASE_MS: i64 = 2 * 60 * 60 * 1000;
 
@@ -180,6 +182,10 @@ pub struct Employee {
     /// 与 mark_scope 解耦——即使不自主找活也可以预先指定协作关系。
     #[serde(default)]
     pub partners: Vec<Partner>,
+    /// 配置的工作流 id（前端工作流库）。空 = 默认内置「Wake → Do」工作流。
+    /// 员工由配置的工作流驱动：后端不再自动跑 Wake→Do 两步，而是建会话交给前端工作流运行时。
+    #[serde(default)]
+    pub workflow_id: String,
     /// 上次心跳执行时间（ms）
     #[serde(default)]
     pub last_heartbeat_ms: i64,
@@ -1496,6 +1502,7 @@ pub fn create_employee(
     mark_scope: Option<String>,
     shared_ledger: Option<bool>,
     partners: Option<Vec<Partner>>,
+    workflow_id: Option<String>,
 ) -> Result<Employee, String> {
     let name = name.trim().to_string();
     let cwd = cwd.trim().to_string();
@@ -1525,6 +1532,7 @@ pub fn create_employee(
         mark_scope: mark_scope.unwrap_or_default().trim().to_string(),
         shared_ledger: shared_ledger.unwrap_or(false),
         partners: partners.unwrap_or_default(),
+        workflow_id: workflow_id.unwrap_or_default().trim().to_string(),
         last_heartbeat_ms: 0,
         mind_event_seeded_at: 0,
         created_at: now,
@@ -1553,6 +1561,7 @@ pub fn update_employee(app: &AppHandle, mut emp: Employee) -> Result<(), String>
     emp.heartbeat_secs = emp.heartbeat_secs.max(10);
     emp.directive = emp.directive.trim().to_string();
     emp.mark_scope = emp.mark_scope.trim().to_string();
+    emp.workflow_id = emp.workflow_id.trim().to_string();
     // 上班时间：start/end 任一为空视为「未设置」，回落 7×24。
     emp.work_hours = emp
         .work_hours
@@ -3693,6 +3702,127 @@ fn employee_for_mark(app: &AppHandle, emp: &Employee, scope: &str, mark: &Mark) 
 }
 
 fn run_cycle(app: AppHandle, mut emp: Employee, manual: bool) {
+    // 同一员工同一时间只允许一个运行中会话：已有会话在跑就跳过（不重置心跳，下次再试）。
+    if employee_has_running_thread(&app, &emp.id) {
+        return;
+    }
+    let now = now_ms();
+    {
+        let state = app.state::<AppState>();
+        let mut employees = state.employees.lock().unwrap();
+        if let Some(e) = employees.get_mut(&emp.id) {
+            e.last_heartbeat_ms = now;
+            e.updated_at = now;
+        }
+        employees.save();
+    }
+    let _ = app.emit(EV_EMPLOYEES, json!({}));
+
+    let Some(cwd) = runtime_cwd(&app, Some(&emp.cwd)) else {
+        return;
+    };
+    emp.cwd = cwd;
+
+    // 员工由配置的工作流驱动（空 = 默认内置「Wake → Do」示例）：
+    // 后端不再自动跑 Wake→Do 两步，建一个工作流根会话后移交给前端工作流运行时。
+    // 待消费批复（御书房朱批 / Mind 上奏）与账本待办单都会并入本轮 goal；
+    // 有批复时不受上班时段限制（像人一样立刻起来领旨）。
+    tauri::async_runtime::spawn(async move {
+        let edict = drain_notice_injections(&app, &emp.id);
+        if !edict.trim().is_empty() {
+            let _ = app.emit(EV_DECISIONS, json!({}));
+        }
+        if !manual && !within_work_hours(&emp) && edict.trim().is_empty() {
+            return;
+        }
+        let scope = emp_scope(&emp);
+        let use_shared = emp.shared_ledger && app.state::<AppState>().relay.is_configured();
+        let mut goal = String::new();
+        let mut images: Vec<PromptImage> = Vec::new();
+        if let Some(m) = ledger_marks(&app, use_shared, &scope)
+            .await
+            .into_iter()
+            .filter(|m| m.status == "open")
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+        {
+            images = m.images.clone();
+            // 认领后账本不再重复派给心跳轮次；工作流本身不维护账本状态，该单保持 claimed。
+            let (outcome, _) = ledger_claim_one(&app, use_shared, &scope, &m.key, &m.title, &emp).await;
+            if outcome == ClaimOutcome::Acquired {
+                let _ = app.emit(EV_MARKS, json!({}));
+                goal = if m.note.trim().is_empty() {
+                    m.title
+                } else {
+                    format!("{}\n{}", m.title, m.note)
+                };
+            } else {
+                images.clear();
+            }
+        }
+        if !edict.trim().is_empty() {
+            goal = if goal.trim().is_empty() {
+                edict
+            } else {
+                format!("{goal}\n\n【主管批复】\n{edict}")
+            };
+        }
+        emit_workflow_round(&app, &emp, &goal, images);
+    });
+}
+
+/// 消费该员工全部待消费的批复注入（御书房朱批 / Mind 上奏），拼接成文本。
+fn drain_notice_injections(app: &AppHandle, employee_id: &str) -> String {
+    let keys: Vec<(String, String)> = {
+        let state = app.state::<AppState>();
+        let notices = state.notices.lock().unwrap();
+        let prefix = format!("{employee_id}\u{1}");
+        notices
+            .injections
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .filter_map(|k| {
+                let mut parts = k.split('\u{1}');
+                parts.next(); // 员工 id
+                let scope = parts.next()?.to_string();
+                let key = parts.next()?.to_string();
+                Some((scope, key))
+            })
+            .collect()
+    };
+    let mut texts: Vec<String> = Vec::new();
+    for (scope, key) in keys {
+        if let Some(text) = crate::notice::take_injection(app, employee_id, &scope, &key) {
+            texts.push(text);
+        }
+    }
+    texts.join("\n\n")
+}
+
+/// 建一个本轮的工作流根会话，并移交前端工作流运行时推进。
+/// `goal` 为空 = 自主轮次（前端按常驻职责组织 goal）；`images` 随首阶段提示词发送。
+fn emit_workflow_round(app: &AppHandle, emp: &Employee, goal: &str, images: Vec<PromptImage>) {
+    if employee_has_running_thread(app, &emp.id) {
+        return;
+    }
+    let thread_id = new_thread_full(
+        app,
+        emp,
+        &format!("[{}] 工作流", emp.name),
+        emp.cwd.clone(),
+        emp.agent_kind.clone(),
+        emp.model.clone(),
+        emp.mode.clone(),
+        false,
+    );
+    let _ = app.emit(
+        EV_EMPLOYEE_WORKFLOW,
+        json!({ "employeeId": emp.id, "threadId": thread_id, "goal": goal, "images": images }),
+    );
+}
+
+/// 旧版后端自主工作循环（Wake→Do 两步 + 巡查）。员工已改为配置工作流驱动，此路径保留备查。
+#[allow(dead_code)]
+fn run_cycle_legacy(app: AppHandle, mut emp: Employee, manual: bool) {
     // 同一员工同一时间只允许一个运行中会话：已有会话在跑就跳过（不重置心跳，下次再试）。
     if employee_has_running_thread(&app, &emp.id) {
         return;
@@ -6558,8 +6688,9 @@ pub async fn register_ledger_item(
     Ok(())
 }
 
-/// 从普通会话点名数字员工。普通会话只落用户原文；内部岗位、记忆和 Wake/Do 提示
-/// 全部留在员工后台会话，避免普通聊天界面出现大段系统提示。
+/// 从普通会话点名数字员工。普通会话只落用户原文；工作过程留在员工自己的会话里，
+/// 避免普通聊天界面出现大段系统提示。员工由配置的工作流驱动（默认内置「Wake → Do」），
+/// 不再走后端 Wake→Do 两步：建一个工作流根会话，以用户原文为 goal 移交前端工作流运行时。
 pub async fn delegate_employee_work(
     app: &AppHandle,
     thread_id: String,
@@ -6567,42 +6698,38 @@ pub async fn delegate_employee_work(
     content: String,
     images: Vec<PromptImage>,
 ) -> Result<(), String> {
-    let (cwd, do_config, item) = {
+    let (cwd, item, emp) = {
         let state = app.state::<AppState>();
-        if state.employees.lock().unwrap().get(&employee_id).is_none() {
-            return Err("员工不存在".into());
-        }
+        let emp = state
+            .employees
+            .lock()
+            .unwrap()
+            .get(&employee_id)
+            .cloned()
+            .ok_or("员工不存在")?;
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("会话不存在")?;
         if thread.employee_id.is_some() {
             return Err("该入口只用于普通会话".into());
         }
         let cwd = thread.cwd.clone();
-        let do_config = (
-            thread.agent_kind.clone(),
-            thread.model.clone(),
-            thread.mode.clone(),
-        );
         let item = thread.push_user(content.clone(), images.clone());
         store.save();
-        (cwd, do_config, item)
+        (cwd, item, emp)
     };
     let _ = app.emit(
         crate::acp::EV_UPDATE,
         json!({ "threadId": thread_id, "op": { "t": "upsert", "item": item } }),
     );
     let _ = app.emit(crate::acp::EV_THREADS, json!({}));
-    register_ledger_item(
-        app,
-        employee_id,
-        String::new(),
-        content,
-        images,
-        Some(cwd),
-        Some(thread_id),
-        Some(do_config),
-    )
-    .await
+    crate::mind::preempt_for_work(app, &employee_id);
+    // 工作目录沿用点名会话的项目；goal 取用户原文，附件随首阶段提示词一起进入工作流。
+    let mut work_emp = emp;
+    if Path::new(&cwd).is_dir() {
+        work_emp.cwd = cwd;
+    }
+    emit_workflow_round(app, &work_emp, content.trim(), images);
+    Ok(())
 }
 
 /// 该会话是否仍存在（用户可能已删除员工会话）。复用前校验，避免往已删除的会话发消息。

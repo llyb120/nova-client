@@ -7,8 +7,8 @@
  */
 import { createSignal } from "solid-js";
 import { api } from "../ipc";
-import type { Thread, Item } from "../types";
-import { getWorkflow } from "./storage";
+import type { PromptImage, Thread, Item } from "../types";
+import { getWorkflow, isWorkflowEnabled } from "./storage";
 import {
   evalTransition,
   isTerminal,
@@ -130,6 +130,7 @@ function resolvePrompt(
     attempt: ctx.attempt,
   }).trim();
   const handoff = [
+    ctx.vars.context?.trim() ? ctx.vars.context.trim() : "",
     ctx.vars.goal?.trim() ? `工作流目标：\n${ctx.vars.goal.trim()}` : "",
     ctx.prev.trim() ? `上一节点结论：\n${ctx.prev.trim()}` : "",
   ].filter(Boolean);
@@ -367,10 +368,15 @@ export function startWorkflow(
   workflowId: string,
   vars: Record<string, string>,
   rootId: string,
+  /** 首节点附件：会话输入即首节点输入，图片随首阶段提示词一起发送。 */
+  images: PromptImage[] = [],
 ): Promise<void> {
   const h = requireHost();
   const def = getWorkflow(workflowId);
   if (!def) return Promise.reject(new Error("找不到工作流"));
+  if (!isWorkflowEnabled(def)) {
+    return Promise.reject(new Error(`工作流「${def.name}」已停用，请在工作流页启用后再运行`));
+  }
   const errors = validateWorkflow(def);
   if (errors.length > 0) return Promise.reject(new Error(errors.join("；")));
   const entry = def.stages.find((s) => s.id === def.entry);
@@ -390,8 +396,9 @@ export function startWorkflow(
 
   return (async () => {
     const root = await api.getThread(rootId);
-    if (root.employeeId || root.roamingRole || root.quotaPeerName) {
-      throw new Error("工作流仅支持本地普通会话");
+    // 漫游/额度会话的执行位置不在本机，无法由本地工作流驱动；员工会话允许作为工作流根。
+    if (root.roamingRole || root.quotaPeerName) {
+      throw new Error("工作流仅支持本地会话");
     }
     if (h.isRunning(rootId)) throw new Error("请等待当前会话结束后再启动工作流");
 
@@ -420,7 +427,7 @@ export function startWorkflow(
     h.clearProposedPlan();
     h.setRunning(rootId, true);
     try {
-      await api.sendPrompt(rootId, resolvePrompt(def, entry, ctx), []);
+      await api.sendPrompt(rootId, resolvePrompt(def, entry, ctx), images);
     } catch (e) {
       if (activeRuns.get(rootId) === run) {
         activeRuns.delete(rootId);
@@ -489,6 +496,14 @@ export async function chooseManualWorkflowTransition(
 
 export function isActive(threadId: string): boolean {
   return activeRuns.has(threadId);
+}
+
+/** 所有进行中/暂停运行的链根会话 id（数字员工按员工会话去重轮次用）。 */
+export function runRootIds(): string[] {
+  const roots = new Set<string>();
+  for (const run of activeRuns.values()) roots.add(run.rootId);
+  for (const run of suspendedRuns.values()) roots.add(run.rootId);
+  return [...roots];
 }
 
 /** sendPrompt 失败时由 store 调用，把当前阶段挂起。 */

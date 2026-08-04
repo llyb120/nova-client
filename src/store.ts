@@ -49,10 +49,12 @@ import {
   handleTurnStart as handleWorkflowTurnStart,
   initWorkflowRuntime,
   preparePrompt as prepareWorkflowPrompt,
+  runRootIds as workflowRunRootIds,
   startWorkflow,
   suspendActive as suspendWorkflowActive,
 } from "./workflow/runtime";
-import { findTriggeredWorkflow, findWorkflowByName } from "./workflow/storage";
+import { findTriggeredWorkflow, findWorkflowByName, getWorkflow, isWorkflowEnabled } from "./workflow/storage";
+import { WORKFLOW_WAKE_DO_ID } from "./workflow/builtin";
 import { buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
@@ -1411,9 +1413,15 @@ export async function sendPrompt(
   text: string,
   images: PromptImage[] = [],
   employeeId?: string | null,
+  workflowId?: string | null,
 ) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
+  // 新会话页选择了工作流：会话输入就是首节点输入，文本作为 goal、图片作为首节点附件。
+  if (workflowId) {
+    await startWorkflow(workflowId, { goal: text.trim() }, id, images);
+    return;
+  }
   // 内置命令优先于员工交办/账本，避免 /fire 被当成普通交办内容。
   if (await tryBuiltinPrompt(id, text, images)) return;
   // 在历史分支预览中追加提示词时才发生时间跳跃：先恢复该分支，再把新提示词
@@ -1428,16 +1436,91 @@ export async function sendPrompt(
   }
   const thread = state.threads.find((t) => t.id === id);
   if (thread?.employeeId && !thread.mindThread) {
+    // 员工会话里的补充输入：先尝试挂回进行中的工作流（含附件），否则开启新一轮工作流。
+    if (prepareWorkflowPrompt(id, text) !== null) {
+      await deliverPrompt(id, text, images);
+      return;
+    }
+    const employee = state.employees.find((e) => e.id === thread.employeeId);
+    if (employee) {
+      await startEmployeeWorkflow(employee, id, text.trim(), images);
+      return;
+    }
     await api.registerLedgerItem(thread.employeeId, text, images);
     return;
   }
   if (employeeId) {
-    // 普通会话只保存用户输入；岗位说明、记忆、Wake/Do 等内部提示留在后台员工会话。
+    // 普通会话只保存用户输入；岗位说明、记忆与工作流内部提示留在后台员工会话。
     bumpChatScrollToBottom();
     await api.delegateEmployeeWork(id, employeeId, text, images);
     return;
   }
   await deliverPrompt(id, text, images);
+}
+
+/** 解析员工配置的工作流（空 = 默认内置「Wake → Do」），在指定员工会话上开启一轮工作。 */
+export async function startEmployeeWorkflow(
+  employee: Employee,
+  threadId: string,
+  goal: string,
+  images: PromptImage[] = [],
+): Promise<void> {
+  const configured = (employee.workflowId ?? "").trim();
+  let workflowId = configured || WORKFLOW_WAKE_DO_ID;
+  // 自定义工作流已删除或被停用 → 回落默认内置工作流，保证员工总能开工。
+  const resolved = getWorkflow(workflowId);
+  if (!resolved || !isWorkflowEnabled(resolved)) workflowId = WORKFLOW_WAKE_DO_ID;
+  const context = [
+    employee.charter.trim() ? `岗位说明书：\n${employee.charter.trim()}` : "",
+    employee.directive.trim() ? `常驻职责：\n${employee.directive.trim()}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  await startWorkflow(workflowId, { goal, context }, threadId, images);
+}
+
+/** 后端移交的员工工作轮次（心跳 / 立即执行 / 交办）：在新建的工作流根会话上启动配置的工作流。 */
+async function handleEmployeeWorkflowRequest(payload: {
+  employeeId: string;
+  threadId: string;
+  goal: string;
+  images?: PromptImage[];
+}): Promise<void> {
+  await refreshThreads(); // 后端刚建的根会话可能还没进列表
+  const employee = state.employees.find((e) => e.id === payload.employeeId);
+  if (!employee || !employee.enabled) return;
+  // 去重：该员工已有进行中/暂停的工作流链时不再开新轮，避免重复开工；
+  // 顺手丢弃后端为本轮新建的空根会话，避免侧栏堆积空壳。
+  const roots = new Set(workflowRunRootIds());
+  if (state.threads.some((t) => t.employeeId === employee.id && roots.has(t.id))) {
+    try {
+      const spawned = await api.getThread(payload.threadId);
+      if (spawned.items.length === 0) await api.deleteThread(payload.threadId);
+    } catch {
+      // 会话已被其他路径清理
+    }
+    await refreshThreads();
+    return;
+  }
+  if (state.running[payload.threadId]) return;
+  const goal =
+    payload.goal.trim() ||
+    (employee.directive.trim()
+      ? `按常驻职责自主推进一轮工作。\n常驻职责：${employee.directive.trim()}`
+      : "自主巡查一轮：看看有没有需要处理的工作并推进。");
+  try {
+    await startEmployeeWorkflow(employee, payload.threadId, goal, payload.images ?? []);
+  } catch (error) {
+    // 启动失败（如工作流被删且默认流被停用）：丢弃本轮新建的空根会话，避免侧栏留空壳。
+    try {
+      const spawned = await api.getThread(payload.threadId);
+      if (spawned.items.length === 0) await api.deleteThread(payload.threadId);
+      await refreshThreads();
+    } catch {
+      // 会话已被其他路径清理
+    }
+    throw error;
+  }
 }
 
 /** 处理 /fire、/plan 等内置命令。返回 true 表示已消费，调用方不应再发给模型。 */
@@ -1461,9 +1544,8 @@ async function tryBuiltinPrompt(
     return true;
   }
   if (/^\/run(?:\s|$)/i.test(builtInInput)) {
-    if (images.length > 0) throw new Error("/run 暂不支持附件");
     const parsed = parseRunInput(builtInInput);
-    await startWorkflow(parsed.workflowId, { goal: parsed.goal }, threadId);
+    await startWorkflow(parsed.workflowId, { goal: parsed.goal }, threadId, images);
     return true;
   }
   if (/^\/setup(?:\s|$)/i.test(builtInInput)) {
@@ -1475,7 +1557,7 @@ async function tryBuiltinPrompt(
   // 触发条件：提示词命中某工作流的 slash/contains/regex 触发器时自动启动。
   const triggered = findTriggeredWorkflow(builtInInput);
   if (triggered) {
-    await startWorkflow(triggered.id, { goal: triggered.goal }, threadId);
+    await startWorkflow(triggered.id, { goal: triggered.goal }, threadId, images);
     return true;
   }
   if (/^\/target(?:\s|$)/i.test(builtInInput)) {
@@ -1906,20 +1988,32 @@ function bumpChatScrollToBottom() {
 }
 
 /** 本地 worktree 会话：worktree 在后台创建，暂存首条提示词，就绪后（acp:worktree-ready）再自动发送 */
-const pendingWorktreePrompts = new Map<string, { text: string; images: PromptImage[] }>();
+const pendingWorktreePrompts = new Map<
+  string,
+  { text: string; images: PromptImage[]; workflowId?: string | null }
+>();
 
 function flushWorktreePrompt(threadId: string) {
   const prompt = pendingWorktreePrompts.get(threadId);
   if (!prompt) return;
   pendingWorktreePrompts.delete(threadId);
-  void sendPromptTo(threadId, prompt.text, prompt.images).catch((error) => {
-    console.error("sendPromptTo failed", error);
+  // 新会话页选了工作流：就绪后直接启动工作流（goal 为暂存提示词），否则按普通提示词发送。
+  const action = prompt.workflowId
+    ? startWorkflow(prompt.workflowId, { goal: prompt.text.trim() }, threadId, prompt.images)
+    : sendPromptTo(threadId, prompt.text, prompt.images);
+  void action.catch((error) => {
+    console.error("worktree prompt flush failed", error);
   });
 }
 
-export function stashWorktreePrompt(threadId: string, text: string, images: PromptImage[]) {
+export function stashWorktreePrompt(
+  threadId: string,
+  text: string,
+  images: PromptImage[],
+  workflowId?: string | null,
+) {
   if (!text.trim() && images.length === 0) return;
-  pendingWorktreePrompts.set(threadId, { text, images });
+  pendingWorktreePrompts.set(threadId, { text, images, workflowId: workflowId ?? null });
   // create_thread 可能直接复用已就绪的 worktree，或后台 ready 事件可能先于 invoke 返回。
   // 主动核对持久化状态，避免首条提示词永远留在暂存 Map。
   void api
@@ -2433,6 +2527,15 @@ export async function initStore() {
   await listen("employees:changed", () => {
     void refreshEmployees();
   });
+  // 员工工作轮次移交：后端不再自动跑 Wake→Do，改为建会话后由前端工作流运行时推进
+  await listen<{ employeeId: string; threadId: string; goal: string; images?: PromptImage[] }>(
+    "employees:workflow-request",
+    (e) => {
+      void handleEmployeeWorkflowRequest(e.payload).catch((error) =>
+        console.error("Employee workflow request failed", error),
+      );
+    },
+  );
   await listen("tasks:changed", () => {
     void refreshEmployeeTasks();
   });

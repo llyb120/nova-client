@@ -383,6 +383,7 @@ export const api = {
     markScope: string;
     sharedLedger: boolean;
     partners: Partner[];
+    workflowId?: string;
   }) => invoke<Employee>("create_employee", p),
   updateEmployee: (employee: Employee) => invoke<void>("update_employee", { employee }),
   deleteEmployee: (id: string) => invoke<void>("delete_employee", { id }),
@@ -398,7 +399,7 @@ export const api = {
   /** 交办：把一个具体单子登记到该员工账本的「待处理」（无需标题，直接填内容），员工唤起后自行侦察认领 */
   registerLedgerItem: (employeeId: string, content: string, images: PromptImage[] = []) =>
     invoke<void>("register_ledger_item", { employeeId, title: "", brief: content, images }),
-  /** 普通会话临时交给数字员工：界面只记录用户原文，内部走 Wake → Do。 */
+  /** 普通会话临时交给数字员工：界面只记录用户原文，内部以员工配置的工作流推进（默认内置 Wake → Do）。 */
   delegateEmployeeWork: (
     threadId: string,
     employeeId: string,

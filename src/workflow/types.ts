@@ -71,6 +71,8 @@ export interface WorkflowDef {
   version: number;
   /** 内置工作流（代码定义，不可删除，可复制为自定义）。 */
   builtin?: boolean;
+  /** 是否启用（可被选择/触发/运行）；字段缺失视为启用。开关独立持久化，内置工作流也可切换。 */
+  enabled?: boolean;
   /** 起始阶段 id。 */
   entry: string;
   /** 全局保险丝：整条链最多创建的阶段会话总数。 */

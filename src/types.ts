@@ -755,6 +755,8 @@ export interface Employee {
   sharedLedger: boolean;
   /** 讨论伙伴：开发中需要协议约定时自动联动的其他数字员工 */
   partners: Partner[];
+  /** 配置的工作流 id；空 = 默认内置「Wake → Do」工作流。员工由工作流驱动，不再自动跑后端 Wake→Do */
+  workflowId?: string;
   /** 上次心跳执行时间（ms） */
   lastHeartbeatMs: number;
   /** 旧记忆补种为 Mind 事件的进度时间 */

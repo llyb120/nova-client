@@ -4550,6 +4550,7 @@ fn create_employee(
     mark_scope: Option<String>,
     shared_ledger: Option<bool>,
     partners: Option<Vec<employees::Partner>>,
+    workflow_id: Option<String>,
 ) -> Result<employees::Employee, String> {
     employees::create_employee(
         &app,
@@ -4573,6 +4574,7 @@ fn create_employee(
         mark_scope,
         shared_ledger,
         partners,
+        workflow_id,
     )
 }
 

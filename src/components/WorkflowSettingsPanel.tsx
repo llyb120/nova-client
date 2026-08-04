@@ -4,8 +4,10 @@ import { IconChevron, IconMerge, IconPencil, IconPlus, IconX } from "./icons";
 import { BUILTIN_WORKFLOWS } from "../workflow/builtin";
 import {
   deleteUserWorkflow,
+  isWorkflowEnabled,
   listWorkflows,
   saveWorkflow,
+  setWorkflowEnabled,
 } from "../workflow/storage";
 import {
   newWorkflowId,
@@ -58,6 +60,20 @@ export function WorkflowSettingsPanel() {
   const [edgeModalOpen, setEdgeModalOpen] = createSignal(false);
 
   const reload = () => setList(listWorkflows());
+
+  // 启用状态独立于定义持久化（内置工作流也可切换），保存后立即生效。
+  const wfEnabled = createMemo(() => {
+    const d = draft();
+    return d ? isWorkflowEnabled(d) : true;
+  });
+  function toggleEnabled() {
+    const d = draft();
+    if (!d) return;
+    const next = !isWorkflowEnabled(d);
+    setWorkflowEnabled(d.id, next);
+    reload();
+    setMsg(next ? "已启用" : "已停用：新会话选择、/run 与触发条件均不再出现");
+  }
 
   const select = (id: string | null) => {
     setSelectedId(id);
@@ -268,6 +284,9 @@ export function WorkflowSettingsPanel() {
                 >
                   <span class="wf-list-name">{wf.name}</span>
                   <Show when={wf.builtin}><span class="wf-badge">内置</span></Show>
+                  <Show when={!isWorkflowEnabled(wf)}>
+                    <span class="wf-badge wf-badge-off">已停用</span>
+                  </Show>
                 </div>
               )}
             </For>
@@ -337,6 +356,19 @@ export function WorkflowSettingsPanel() {
                   placeholder="工作流名称"
                   title="工作流名称"
                 />
+                <span class="wf-bar-sep" />
+                <button
+                  class="wf-chip"
+                  classList={{ active: wfEnabled() }}
+                  onClick={toggleEnabled}
+                  title={
+                    wfEnabled()
+                      ? "已启用：出现在新会话选择与 /run 中，触发条件生效。点击停用"
+                      : "已停用：新会话选择、/run 与触发条件均不出现。点击启用"
+                  }
+                >
+                  {wfEnabled() ? "已启用" : "已停用"}
+                </button>
                 <span class="wf-bar-sep" />
                 <button
                   class="wf-chip"

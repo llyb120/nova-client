@@ -31,9 +31,11 @@ import {
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import type { AgentKind, Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
+import { enabledWorkflows, employeeWorkflowName } from "../workflow/storage";
+import type { WorkflowDef } from "../workflow/types";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
-import { IconClue, IconFolder, IconLogo, IconSend, IconUsers, IconX } from "./icons";
+import { IconClue, IconFolder, IconLogo, IconMerge, IconSend, IconUsers, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
@@ -73,6 +75,21 @@ export function HomeView() {
       (employee) => employee.id === selectedEmployeeId() && employee.enabled,
     ) ?? null,
   );
+  // 工作流：新会话页选定后，发送时以输入内容为 goal、本会话为根启动流程（等效 /run）。
+  // 与数字员工、漫游/额度互斥，仅对本地普通会话生效。
+  const [workflowMenuOpen, setWorkflowMenuOpen] = createSignal(false);
+  const [selectedWorkflowId, setSelectedWorkflowId] = createSignal<string | null>(null);
+  const selectedWorkflow = createMemo<WorkflowDef | null>(() => {
+    const id = selectedWorkflowId();
+    if (!id) return null;
+    // 已停用的工作流不展示也不可选：一旦在别处被停用，这里的选中自动失效。
+    return enabledWorkflows().find((workflow) => workflow.id === id) ?? null;
+  });
+  // 每次打开菜单都重新读取 localStorage，保证工作流编辑器改动后列表最新；只列启用的。
+  const workflowChoices = createMemo<WorkflowDef[]>(() => {
+    workflowMenuOpen();
+    return enabledWorkflows();
+  });
   const [quotaCancelling, setQuotaCancelling] = createSignal(false);
   // 漫游目标：选中队友目录后在对方机器上执行，本机只接收
   const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
@@ -101,6 +118,7 @@ export function HomeView() {
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let employeePickerRef: HTMLDivElement | undefined;
+  let workflowPickerRef: HTMLDivElement | undefined;
   type PrewarmTarget = {
     cwd?: string;
     agentKind?: AgentKind;
@@ -118,7 +136,15 @@ export function HomeView() {
     setSelectedEmployeeId(employeeId);
     if (employeeId) localStorage.setItem(LAST_EMPLOYEE_KEY, employeeId);
     else localStorage.removeItem(LAST_EMPLOYEE_KEY);
+    if (employeeId) setSelectedWorkflowId(null);
     setEmployeeMenuOpen(false);
+  };
+
+  const pickWorkflow = (workflowId: string | null) => {
+    setSelectedWorkflowId(workflowId);
+    // 与数字员工互斥：工作流只能在本地普通会话中运行。
+    if (workflowId) pickEmployee(null);
+    setWorkflowMenuOpen(false);
   };
 
   createEffect(() => {
@@ -130,7 +156,10 @@ export function HomeView() {
     ) {
       pickEmployee(null);
     }
-    if (roam() || quotaPeer()) setEmployeeMenuOpen(false);
+    if (roam() || quotaPeer()) {
+      setEmployeeMenuOpen(false);
+      setWorkflowMenuOpen(false);
+    }
   });
 
   onMount(() => {
@@ -138,8 +167,16 @@ export function HomeView() {
       if (!employeeMenuOpen() || employeePickerRef?.contains(event.target as Node)) return;
       setEmployeeMenuOpen(false);
     };
+    const closeWorkflowMenu = (event: PointerEvent) => {
+      if (!workflowMenuOpen() || workflowPickerRef?.contains(event.target as Node)) return;
+      setWorkflowMenuOpen(false);
+    };
     document.addEventListener("pointerdown", closeEmployeeMenu);
-    onCleanup(() => document.removeEventListener("pointerdown", closeEmployeeMenu));
+    document.addEventListener("pointerdown", closeWorkflowMenu);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", closeEmployeeMenu);
+      document.removeEventListener("pointerdown", closeWorkflowMenu);
+    });
   });
 
   createEffect(() => {
@@ -546,6 +583,8 @@ export function HomeView() {
     const target = roam();
     const quota = quotaPeer();
     const employeeId = !target && !quota ? selectedEmployee()?.id ?? null : null;
+    // 新会话页选定的工作流：只对本地普通会话生效，与漫游/额度/员工互斥。
+    const workflow = !target && !quota && !employeeId ? selectedWorkflow() : null;
     const clue = state.pendingClueCard;
     if (
       (!t && images.length === 0) ||
@@ -600,7 +639,7 @@ export function HomeView() {
           clue?.id ?? "",
         );
         if (clue) clearPendingClueCard();
-        stashWorktreePrompt(id, prompt, images);
+        stashWorktreePrompt(id, prompt, images, workflow?.id ?? null);
       } else {
         const ephemeral = opts.ephemeral ?? false;
         await createThread(
@@ -617,13 +656,14 @@ export function HomeView() {
         );
         if (!ephemeral) lastUsed.setModel(agentKind(), model());
         if (clue) clearPendingClueCard();
-        await sendPrompt(prompt, images, employeeId);
+        await sendPrompt(prompt, images, employeeId, workflow?.id ?? null);
       }
       setText("");
       setQuote("");
       setSlashStart(null);
       setRoam(null);
       setQuotaPeer(null);
+      setSelectedWorkflowId(null);
       attach.clear();
       clearPendingClueCard();
       if (textareaRef) textareaRef.style.height = "auto";
@@ -932,6 +972,56 @@ export function HomeView() {
               />
             </Show>
             <span class="bar-spacer" />
+            <Show when={!roam() && !quotaPeer()}>
+              <div ref={workflowPickerRef} class="composer-workflow-picker">
+                <Show when={workflowMenuOpen()}>
+                  <div class="composer-workflow-menu">
+                    <div class="composer-workflow-head">本次会话运行的工作流</div>
+                    <button
+                      type="button"
+                      classList={{
+                        "composer-workflow-item": true,
+                        active: !selectedWorkflowId(),
+                      }}
+                      onClick={() => pickWorkflow(null)}
+                    >
+                      <span>普通会话</span>
+                      <small>不运行工作流，直接执行任务</small>
+                    </button>
+                    <For each={workflowChoices()}>
+                      {(wf) => (
+                        <button
+                          type="button"
+                          classList={{
+                            "composer-workflow-item": true,
+                            active: selectedWorkflowId() === wf.id,
+                          }}
+                          onClick={() => pickWorkflow(wf.id)}
+                        >
+                          <span>{wf.name}</span>
+                          <small>
+                            {wf.builtin ? "内置" : "自定义"} · {wf.stages.length} 个节点
+                          </small>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+                <button
+                  type="button"
+                  class="composer-btn workflow"
+                  classList={{ active: !!selectedWorkflow() }}
+                  onClick={() => setWorkflowMenuOpen((open) => !open)}
+                  title={
+                    selectedWorkflow()
+                      ? `工作流：${selectedWorkflow()!.name}`
+                      : "选择用哪个工作流运行本次任务"
+                  }
+                >
+                  <IconMerge size={16} />
+                </button>
+              </div>
+            </Show>
             <button
               type="button"
               class="composer-btn clue"
@@ -967,7 +1057,7 @@ export function HomeView() {
                           onClick={() => pickEmployee(employee.id)}
                         >
                           <span>{employee.name}</span>
-                          <small>Wake → Do · Dream 生效</small>
+                          <small>{employeeWorkflowName(employee.workflowId)} · Dream 生效</small>
                         </button>
                       )}
                     </For>
@@ -992,6 +1082,7 @@ export function HomeView() {
               class="composer-btn send"
               disabled={
                 (!text().trim() && attach.images().length === 0) ||
+                (!!selectedWorkflow() && !text().trim() && attach.images().length === 0) ||
                 (!cwd() && !roam()) ||
                 busy() ||
                 !peerReady() ||

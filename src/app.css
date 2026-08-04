@@ -2801,24 +2801,29 @@ button {
 .composer-btn.stop:hover {
   background: color-mix(in srgb, var(--red) 20%, transparent);
 }
-.composer-employee-picker {
+.composer-employee-picker,
+.composer-workflow-picker {
   position: relative;
   display: flex;
   align-items: center;
   gap: 6px;
 }
-.composer-btn.employee {
+.composer-btn.employee,
+.composer-btn.workflow {
   color: var(--text-muted);
   background: var(--bg-active);
   border: 1px solid var(--border);
 }
 .composer-btn.employee:hover,
-.composer-btn.employee.active {
+.composer-btn.employee.active,
+.composer-btn.workflow:hover,
+.composer-btn.workflow.active {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-active));
 }
-.composer-employee-menu {
+.composer-employee-menu,
+.composer-workflow-menu {
   position: absolute;
   z-index: 40;
   right: 0;
@@ -2832,12 +2837,14 @@ button {
   background: var(--bg-float);
   box-shadow: var(--shadow-lg);
 }
-.composer-employee-head {
+.composer-employee-head,
+.composer-workflow-head {
   padding: 6px 8px;
   color: var(--text-faint);
   font-size: 11px;
 }
-.composer-employee-item {
+.composer-employee-item,
+.composer-workflow-item {
   width: 100%;
   display: flex;
   flex-direction: column;
@@ -2849,13 +2856,17 @@ button {
   text-align: left;
 }
 .composer-employee-item:hover,
-.composer-employee-item.active {
+.composer-employee-item.active,
+.composer-workflow-item:hover,
+.composer-workflow-item.active {
   background: var(--bg-active);
 }
-.composer-employee-item.active > span {
+.composer-employee-item.active > span,
+.composer-workflow-item.active > span {
   color: var(--accent);
 }
-.composer-employee-item small {
+.composer-employee-item small,
+.composer-workflow-item small {
   color: var(--text-faint);
   font-size: 11px;
 }
@@ -8662,6 +8673,7 @@ button.head-badge:hover {
 .wf-list-item.active { border-color: var(--accent); background: var(--accent-dim); }
 .wf-list-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wf-badge { font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--bg-hover); color: var(--text-muted); flex: 0 0 auto; }
+.wf-badge-off { color: var(--text-faint); border: 1px solid var(--border); background: transparent; }
 .wf-builtin-clone { display: flex; flex-direction: column; gap: 2px; }
 .wf-run-hint { margin-top: auto; }
 

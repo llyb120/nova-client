@@ -1,7 +1,7 @@
 /**
  * 用户自定义工作流的持久化（localStorage）。内置工作流来自代码，不存这里。
  */
-import { BUILTIN_WORKFLOWS, getBuiltinWorkflow } from "./builtin";
+import { BUILTIN_WORKFLOWS, getBuiltinWorkflow, WORKFLOW_WAKE_DO_ID } from "./builtin";
 import type { WorkflowDef, WorkflowTrigger } from "./types";
 
 const WORKFLOWS_KEY = "fd:workflows:v1";
@@ -24,6 +24,40 @@ export function listWorkflows(): WorkflowDef[] {
   return [...BUILTIN_WORKFLOWS, ...readUserWorkflows()];
 }
 
+// ---------------------------------------------------------------------------
+// 启用开关：独立于定义持久化，内置工作流（saveWorkflow 拒绝覆盖）也可切换。
+// ---------------------------------------------------------------------------
+
+const ENABLED_KEY = "fd:workflowEnabled:v1";
+
+function readEnabledOverrides(): Record<string, boolean> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(ENABLED_KEY) ?? "{}");
+    return raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, boolean>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 启用/停用工作流；立即生效（独立于工作流定义的保存）。 */
+export function setWorkflowEnabled(id: string, enabled: boolean): void {
+  const overrides = readEnabledOverrides();
+  overrides[id] = enabled;
+  localStorage.setItem(ENABLED_KEY, JSON.stringify(overrides));
+}
+
+/** 工作流是否启用：字段缺失视为启用，独立存储的覆盖优先。 */
+export function isWorkflowEnabled(def: WorkflowDef): boolean {
+  return readEnabledOverrides()[def.id] ?? def.enabled !== false;
+}
+
+/** 仅启用的工作流（新会话选择、/run、触发条件匹配均只在这里取）。 */
+export function enabledWorkflows(): WorkflowDef[] {
+  return listWorkflows().filter(isWorkflowEnabled);
+}
+
 export function getWorkflow(id: string): WorkflowDef | undefined {
   return getBuiltinWorkflow(id) ?? readUserWorkflows().find((w) => w.id === id);
 }
@@ -31,7 +65,7 @@ export function getWorkflow(id: string): WorkflowDef | undefined {
 /** 按名称查找（/run 命令用），大小写不敏感。 */
 export function findWorkflowByName(name: string): WorkflowDef | undefined {
   const needle = name.trim().toLowerCase();
-  return listWorkflows().find((w) => w.name.trim().toLowerCase() === needle);
+  return enabledWorkflows().find((w) => w.name.trim().toLowerCase() === needle);
 }
 
 export function saveWorkflow(def: WorkflowDef): void {
@@ -45,6 +79,14 @@ export function saveWorkflow(def: WorkflowDef): void {
 
 export function deleteUserWorkflow(id: string): void {
   writeUserWorkflows(readUserWorkflows().filter((w) => w.id !== id));
+}
+
+/** 数字员工配置的工作流名称（空/已删除回落默认内置「Wake → Do」）。 */
+export function employeeWorkflowName(workflowId: string | null | undefined): string {
+  const id = (workflowId ?? "").trim() || WORKFLOW_WAKE_DO_ID;
+  return (
+    getWorkflow(id)?.name ?? getBuiltinWorkflow(WORKFLOW_WAKE_DO_ID)?.name ?? "Wake → Do"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +130,8 @@ export function matchTrigger(text: string, trigger: WorkflowTrigger): string | n
  * 返回首个命中的工作流与 goal；无命中返回 null。
  */
 export function findTriggeredWorkflow(text: string): TriggerHit | null {
-  const list = listWorkflows();
+  // 停用的工作流不参与自动触发。
+  const list = enabledWorkflows();
   for (const wf of list) {
     for (const trigger of wf.triggers ?? []) {
       if (trigger.kind !== "slash") continue;
