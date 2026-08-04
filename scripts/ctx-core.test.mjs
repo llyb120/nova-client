@@ -196,6 +196,46 @@ test("fast_context: 命中给完整符号体, 跨文件 import 依赖定义完�
   }
 });
 
+test("fast_context: 部分锚点臆造但短语泛词命中时软降级检索，头部标注未命中锚点", async () => {
+  const dir = await fixture({
+    "src/store.ts": [
+      "export const UNIFIED_MODES = [{ id: 'build', name: 'Build' }, { id: 'plan', name: 'Plan' }];",
+      "export function modeChoices() { return UNIFIED_MODES; }",
+      "export function setThreadMode(mode) { return UNIFIED_MODES.find((m) => m.id === mode); }",
+    ].join("\n"),
+  });
+  try {
+    const out = await contextBundle({
+      keywords: ["plan mode", "PlanMode", "agentMode"],
+      task: "Remove plan mode UI selection; keep only build as default",
+    }, dir);
+    assert.doesNotMatch(out, /^# CTX MISS/m);
+    assert.match(out, /modeChoices/);
+    assert.match(out, /UNIFIED_MODES/);
+    assert.match(out, /未命中关键词: [^\n]*PlanMode/);
+    assert.match(out, /未命中关键词: [^\n]*agentMode/);
+    assert.doesNotMatch(out, /未命中关键词: [^\n]*plan mode/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("fast_context: 硬 MISS 时给出 did-you-mean 相近生产符号建议", async () => {
+  const dir = await fixture({
+    "src/components/PlanCard.tsx": "export function PlanCard(props) { return props.plan; }\n",
+    "src/store.ts": "export const proposedPlan = null;\nexport function dismissProposedPlan() {}\n",
+  });
+  try {
+    const out = await contextBundle({ keywords: ["PlanMode"], task: "switch to plan mode" }, dir);
+    assert.match(out, /^# CTX MISS/m);
+    assert.match(out, /status: no production definition or reference/);
+    assert.match(out, /did-you-mean: [^\n]*PlanCard \(src\/components\/PlanCard\.tsx:1\)/);
+    assert.ok(Buffer.byteLength(out, "utf8") < 2048, out);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("fast_context: 显式符号未命中时返回 compact evidence miss，不被任务泛词带偏", async () => {
   const missingAnchor = ["add", "Compare"].join("");
   const dir = await fixture({

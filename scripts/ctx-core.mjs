@@ -318,7 +318,7 @@ function filesInSourceScopes(allFiles, seedFiles) {
   return allFiles.filter((file) => scopes.some((scope) => file.startsWith(scope)));
 }
 
-function compactEvidenceMiss(revision, keywords, task) {
+function compactEvidenceMiss(revision, keywords, task, suggestions = []) {
   return [
     `# CTX MISS @${revision}`,
     `query: ${keywords.join(',')}`,
@@ -326,9 +326,50 @@ function compactEvidenceMiss(revision, keywords, task) {
     'status: no production definition or reference',
     'evidence: exact/ignore-case/naming-variant search found 0 production occurrences; test/eval/doc mentions ignored',
     'checked: symbol names, references, snake/kebab/pascal variants, string bindings',
+    ...(suggestions.length ? [`did-you-mean: ${suggestions.join(', ')}`] : []),
     'fallback: disabled; natural-language task terms cannot establish an explicit edit target',
-    'next: provide the missing source/path or correct the symbol name',
+    'next: provide the missing source/path or correct the symbol name; or retry with a did-you-mean symbol / known entry file via files',
   ].join('\n');
+}
+
+const DID_YOU_MEAN_MAX = 6;
+/** 锚点拆词参与建议的最短词长：更短的泛词（add/get/mode 之外）噪声大且检索贵。 */
+const DID_YOU_MEAN_MIN_WORD = 4;
+
+/**
+ * 硬 MISS 时的"你是不是想找"：把未命中锚点拆成词，一次批量检索后从命中行提取
+ * 包含这些词的真实标识符，按覆盖词数/频次/是否定义行打分。只给生产代码里的
+ * 符号；测试/文档命中不算。找不到相近符号时返回空，MISS 保持原样。
+ */
+async function suggestSymbols(root, anchors) {
+  const words = [...new Set(anchors
+    .flatMap((anchor) => namingVariants(anchor))
+    .flatMap((variant) => variant.toLowerCase().split(/[^a-z0-9]+/))
+    .filter((word) => word.length >= DID_YOU_MEAN_MIN_WORD && !STOP.has(word)))].slice(0, 8);
+  if (!words.length) return [];
+  const rows = await searchText(root, words, { ignoreCase: true });
+  /** @type {Map<string, { name: string, hits: number, words: Set<string>, where: string, def: boolean }>} */
+  const scored = new Map();
+  for (const row of rows) {
+    if (!isCodeFile(row.file) || ANCHOR_NOISE_PATH.test(row.file)) continue;
+    for (const match of row.text.matchAll(/[A-Za-z_$][\w$]{2,}/g)) {
+      const name = match[0];
+      const low = name.toLowerCase();
+      if (low.length < 5 || words.includes(low) || STOP.has(low)) continue;
+      const matched = words.filter((word) => low.includes(word));
+      if (!matched.length) continue;
+      const cur = scored.get(name) ?? { name, hits: 0, words: new Set(), where: `${row.file}:${row.ln}`, def: false };
+      cur.hits += 1;
+      for (const word of matched) cur.words.add(word);
+      if (SEARCH_DEF_RE.test(row.text)) cur.def = true;
+      scored.set(name, cur);
+    }
+  }
+  return [...scored.values()]
+    .map((item) => ({ ...item, score: item.words.size * 10 + Math.min(item.hits, 5) + (item.def ? 4 : 0) }))
+    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+    .slice(0, DID_YOU_MEAN_MAX)
+    .map((item) => `${item.name} (${item.where})`);
 }
 
 /** 先从任务预测会改到哪类关系，再从目标单元反向提取需要检索的符号。 */
@@ -581,7 +622,21 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     .map((f) => String(f ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, ''))
     .filter(Boolean))].slice(0, 6);
   const explicitAnchors = keywords.filter((keyword) => EXPLICIT_ANCHOR_RE.test(keyword));
-  const anchorTerms = [...new Set(keywords.flatMap(namingVariants))];
+  // 短语关键词（含空白）本身不是可检索锚点：拆成单词参与检索与命中判定，
+  // 避免 "plan mode" 这类自然语言短语整体零命中把真实泛词也拖进 MISS。
+  const phraseWords = (keyword) => (/\s/.test(keyword)
+    ? keyword.split(/\s+/).filter((part) => part.length >= 2 && EXPLICIT_ANCHOR_RE.test(part))
+    : []);
+  const keywordHit = (keyword) => {
+    const words = phraseWords(keyword);
+    return words.length
+      ? words.some((word) => productionAnchorHit(rows, word))
+      : productionAnchorHit(rows, keyword);
+  };
+  const anchorTerms = [...new Set(keywords.flatMap((keyword) => {
+    const words = phraseWords(keyword);
+    return words.length ? words.flatMap(namingVariants) : namingVariants(keyword);
+  }))];
   const terms = [...new Set([...anchorTerms, ...tTokens])];
   const initialTerms = explicitAnchors.length ? anchorTerms : terms;
   if (!terms.length && !wantFiles.length) return '错误: 需要 keywords / task / files 至少其一';
@@ -594,8 +649,11 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   ]);
   const rev = rev0 || 'unknown';
   const resolvedAnchors = explicitAnchors.filter((keyword) => productionAnchorHit(rows, keyword));
-  if (explicitAnchors.length && !resolvedAnchors.length && !wantFiles.length) {
-    return compactEvidenceMiss(rev, explicitAnchors, task);
+  // 软降级：显式锚点全灭但其它关键词（如短语拆出的泛词）命中生产代码时继续检索，
+  // 未命中锚点由头部"未命中关键词"标注；只有全部关键词零命中才硬 MISS（附 did-you-mean）。
+  if (explicitAnchors.length && !resolvedAnchors.length && !wantFiles.length
+    && !keywords.some(keywordHit)) {
+    return compactEvidenceMiss(rev, explicitAnchors, task, await suggestSymbols(root, explicitAnchors));
   }
   const looseKw = keywords.filter((keyword) => productionAnchorHit(rows, keyword)
     && !rows.some((row) => !ANCHOR_NOISE_PATH.test(row.file) && row.text.includes(keyword)));
@@ -631,11 +689,36 @@ export async function contextBundle(args = {}, root = repoRoot()) {
 
   const subjectTerms = (explicitAnchors.length ? anchorTerms : [...keywords, ...tTokens])
     .map((t) => t.toLowerCase())
-    .filter((t) => t.length >= 4);
-  const isSubject = (file) => {
-    if (!subjectTerms.length) return false;
-    const base = file.split('/').pop().toLowerCase();
-    return subjectTerms.some((t) => base.includes(t));
+    .filter((t) => t.length >= 4 && !/[^\p{L}\p{N}_$]/u.test(t));
+  // 文件名按分隔符与 camelCase 切段，查询词须完整命中一个段才算主题文件。
+  // 避免短泛词 mode 因子串匹配 model_cache.rs / tmp_search_model_merge.js 造成噪声。
+  const fileSegments = (file) => file.split('/').pop().replace(/\.[^.]*$/, '')
+    .split(/[^A-Za-z0-9]+/)
+    .flatMap((part) => part.split(/(?<=[a-z0-9])(?=[A-Z])/))
+    .map((s) => s.toLowerCase())
+    .filter(Boolean);
+  // 命中行数（大小写变体取最大），衡量词稀有度；二次检索后需 freqCache.clear()。
+  const freqCache = new Map();
+  const freqOf = (term) => {
+    if (!freqCache.has(term)) {
+      let n = 0;
+      for (const [k, count] of kwCount) if (k.toLowerCase() === term) n = Math.max(n, count);
+      freqCache.set(term, n);
+    }
+    return freqCache.get(term);
+  };
+  // 主题加分按词稀有度衰减：build/mode 这类命中数百上千行的泛词，仅凭文件名
+  // 不能把 build.rs / build.bat 顶进 EDIT 槽位；低频符号名仍拿满分。
+  const SUBJECT_BONUS = 600;
+  const subjectMatch = (file) => {
+    if (!subjectTerms.length) return 0;
+    const segs = fileSegments(file);
+    let best = 0;
+    for (const t of subjectTerms) {
+      if (!segs.includes(t)) continue;
+      best = Math.max(best, SUBJECT_BONUS * Math.max(0.2, Math.min(1, 80 / Math.max(freqOf(t), 1))));
+    }
+    return best;
   };
 
   // 先用纯搜索结果做轻量排名，只索引最可能进入 EDIT 的文件；IMPACT 仍保留全量命中行。
@@ -643,7 +726,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     let score = scoreFilePrior(file) + Math.min(e.lns.size, 8) * 4;
     for (const k of e.kws) score += 30 * KW_WEIGHT(kwCount.get(k) ?? 1) * (keywords.includes(k) ? 1 : 0.5);
     if ([...e.lns.values()].some((cell) => SEARCH_DEF_RE.test(cell.text))) score += 120;
-    if (isSubject(file)) score += 600;
+    score += subjectMatch(file);
     if (wantFiles.includes(file)) score += 500;
     return { file, score };
   }).sort((a, b) => b.score - a.score || Buffer.compare(Buffer.from(a.file), Buffer.from(b.file)));
@@ -658,15 +741,21 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     dependencyDepth: 3,
   });
 
-  const missedAll = keywords.filter((keyword) => EXPLICIT_ANCHOR_RE.test(keyword)
-    ? !productionAnchorHit(rows, keyword)
-    : !kwCount.has(keyword));
+  const missedAll = keywords.filter((keyword) => {
+    const words = phraseWords(keyword);
+    if (words.length) return !words.some((word) => productionAnchorHit(rows, word) || kwCount.has(word));
+    return EXPLICIT_ANCHOR_RE.test(keyword) ? !productionAnchorHit(rows, keyword) : !kwCount.has(keyword);
+  });
   // task-only 调用也应建立目标定义。显式符号加入常见命名变体；自然语言只纳入
   // 少量合法 ASCII 标识符，避免 defs 全表模糊匹配膨胀。
   const taskSeedTerms = explicitAnchors.length
     ? []
     : tTokens.filter((term) => /^[A-Za-z_$][\w$]{2,}$/.test(term)).slice(0, MAX_GRAPH_TERMS);
+  // 高频泛词（如 build/mode 命中数百行）不作为种子：其“定义”多半是无关同名函数，
+  // 会经由 plannedTerms 二次检索把 build 脚本等噪声反馈回排名。
+  const SEED_FREQ_CAP = 200;
   const seedTerms = [...new Set([...anchorTerms, ...taskSeedTerms])]
+    .filter((term) => freqOf(term.toLowerCase()) <= SEED_FREQ_CAP)
     .slice(0, Math.max(MAX_GRAPH_TERMS, anchorTerms.length));
   const seeds = seedDefs(index, seedTerms);
 
@@ -683,6 +772,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     const plannedRows = await searchText(root, plannedTerms, { files: expansionFiles });
     terms.push(...plannedTerms);
     ingestRows(plannedRows, plannedTerms);
+    freqCache.clear(); // 词频已变，subjectMatch 重新计算稀有度
   }
 
   if (!hits.size && !wantFiles.length && !seeds.length) {
@@ -707,7 +797,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
     for (const k of e.kws) s += 30 * KW_WEIGHT(kwCount.get(k) ?? 1) * (keywords.includes(k) ? 1 : 0.5);
     s += Math.min(e.lns.size, 8) * 4;
     if (seedFiles.has(file)) s += 120;
-    if (isSubject(file)) s += 600;
+    s += subjectMatch(file);
     if (wantFiles.includes(file)) s += 500;
     s += relationBonus(file, e);
     return { file, e, score: s };
@@ -724,13 +814,21 @@ export async function contextBundle(args = {}, root = repoRoot()) {
       ranked.push({ file: f, e: { lns: new Map(), kws: new Set() }, score: 100 });
     }
   }
-  // 主题文件可能正文零命中（查询词只在文件名里），必须成为候选
+  // 主题文件可能正文零命中（查询词只在文件名里），必须成为候选。
+  // 仅限名字有区分度（加分≥300）的文件：泛词同名且正文零命中的文件纯属噪声。
   for (const f of Object.keys(index.files).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-    if (!isSubject(f) || ranked.some((r) => r.file === f)) continue;
+    if (subjectMatch(f) < 300 || ranked.some((r) => r.file === f)) continue;
     ranked.push({ file: f, e: { lns: new Map(), kws: new Set() }, score: 550 });
   }
   // 追加后重排，保证 wantFiles > 主题文件 > 其余命中
   ranked.sort((a, b) => b.score - a.score || Buffer.compare(Buffer.from(a.file), Buffer.from(b.file)));
+
+  if (process.env.CTX_DEBUG_RANK) {
+    const fmt = (r) => `${String(Math.round(r.score)).padStart(6)} ${r.file}  kws=${[...r.e.kws].slice(0, 8).join(',')}`;
+    console.error(`[rank] subjectTerms=${subjectTerms.join(',')}`);
+    console.error(`[rank] kwFreq=${[...kwCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([k, n]) => `${k}:${n}`).join(' ')}`);
+    console.error(ranked.slice(0, 16).map(fmt).join('\n'));
+  }
 
   const baseCandidateLimit = MAX_CANDIDATES + Math.floor(Math.max(0, hardBytes - DEFAULT_HARD_BYTES) / 8192) * 2;
   const candidateLimit = Math.min(12, Math.max(MAX_CANDIDATES, baseCandidateLimit));
@@ -962,7 +1060,8 @@ export async function contextBundle(args = {}, root = repoRoot()) {
   // 放不下的顶层单元进 SIG，未打包的在渲染时用大纲行兜底。测试文件不当主题。
   // 已有明确 seed 时，先保证目标闭包；文件名主题扩展不能抢走目标、调用方和依赖预算。
   // 仅文件名命中、没有可解析 seed 时，保留原来的主题文件通读行为。
-  const subjectList = candidates.map((c) => c.file).filter((f) => !seeds.length && isSubject(f) && !NOISE_PATH.test(f) && srcs.has(f));
+  // 仅名字有区分度（加分≥300）才当查询主体通读；泛词同名文件不享受整读预算。
+  const subjectList = candidates.map((c) => c.file).filter((f) => !seeds.length && subjectMatch(f) >= 300 && !NOISE_PATH.test(f) && srcs.has(f));
   for (const f of subjectList) {
     const src = srcs.get(f);
     if (src.total > SUBJECT_FULL_MAX || plan.get(f)?.full) continue;
@@ -1186,7 +1285,7 @@ export async function contextBundle(args = {}, root = repoRoot()) {
       const rest = src.syms
         .filter((s) => s.depth === 0 && !covers(file, s.ln) && !(s.kind === 'const' && s.end === s.ln))
         .map(outlineEntry);
-      const cap = isSubject(file) ? SUBJECT_OUTLINE_CAP : (fileRank.get(file) ?? 9) < 1 ? MAX_OUTLINE_TOP : MAX_OUTLINE_OTHER;
+      const cap = subjectMatch(file) >= 300 ? SUBJECT_OUTLINE_CAP : (fileRank.get(file) ?? 9) < 1 ? MAX_OUTLINE_TOP : MAX_OUTLINE_OTHER;
       if (rest.length && cap > 0) {
         const shownRest = rest.slice(0, cap);
         push(`~ ${shownRest.join(' | ')}${rest.length > cap ? ` | +${rest.length - cap}` : ''}`);

@@ -35,6 +35,12 @@ const FULL_FILE_MAX: usize = 100;
 const EXPLICIT_FULL_MAX: usize = 300;
 const SUBJECT_FULL_MAX: usize = 800;
 const MAX_SUBJECT_UNITS: usize = 30;
+const SUBJECT_BONUS: f64 = 600.0;
+/// 高频泛词（命中行数超过该值）不作为种子定义，避免同名函数把噪声反馈回排名。
+const SEED_FREQ_CAP: usize = 200;
+const DID_YOU_MEAN_MAX: usize = 6;
+/// 锚点拆词参与建议的最短词长：更短的泛词噪声大且检索贵。
+const DID_YOU_MEAN_MIN_WORD: usize = 4;
 const MAX_FILES: usize = 4;
 const MAX_DEPS: usize = 8;
 const MAX_DEP_FILES: usize = 4;
@@ -1763,12 +1769,14 @@ fn naming_variants(value: &str) -> Vec<String> {
     }
     static ACRONYM: OnceLock<Regex> = OnceLock::new();
     static CAMEL: OnceLock<Regex> = OnceLock::new();
+    // 替换串里的 $1_ 会被当成名为 "1_" 的分组（下划线是 name 字符）而替换成空，
+    // 必须用 ${1}_${2} 显式界定，否则 camelCase 锚点的 snake/kebab 变体全部丢失。
     let separated = ACRONYM
         .get_or_init(|| Regex::new(r"([A-Z]+)([A-Z][a-z])").unwrap())
-        .replace_all(value, "$1_$2");
+        .replace_all(value, "${1}_${2}");
     let separated = CAMEL
         .get_or_init(|| Regex::new(r"([a-z0-9])([A-Z])").unwrap())
-        .replace_all(&separated, "$1_$2");
+        .replace_all(&separated, "${1}_${2}");
     let words = separated
         .split(['-', '_', '$'])
         .filter(|word| !word.is_empty())
@@ -1822,6 +1830,28 @@ fn production_anchor_hit(rows: &[SearchRow], keyword: &str) -> bool {
     })
 }
 
+/// 短语关键词（含空白）拆成可检索单词；非短语返回空。
+fn phrase_words(keyword: &str) -> Vec<String> {
+    if !keyword.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    keyword
+        .split_whitespace()
+        .filter(|part| part.len() >= 2 && explicit_anchor(part))
+        .map(str::to_string)
+        .collect()
+}
+
+/// 软降级命中判定：短语关键词看拆出的单词是否命中生产代码。
+fn keyword_hit(rows: &[SearchRow], keyword: &str) -> bool {
+    let words = phrase_words(keyword);
+    if words.is_empty() {
+        production_anchor_hit(rows, keyword)
+    } else {
+        words.iter().any(|word| production_anchor_hit(rows, word))
+    }
+}
+
 fn source_scope(file: &str) -> &str {
     if file.starts_with("src-tauri/src/") {
         "src-tauri/src/"
@@ -1844,7 +1874,12 @@ fn files_in_source_scopes(all: &[String], seed_files: &[String]) -> Vec<String> 
         .collect()
 }
 
-fn compact_evidence_miss(revision: &str, keywords: &[String], task: &str) -> String {
+fn compact_evidence_miss(
+    revision: &str,
+    keywords: &[String],
+    task: &str,
+    suggestions: &[String],
+) -> String {
     let mut lines = vec![
         format!("# CTX MISS @{revision}"),
         format!("query: {}", keywords.join(",")),
@@ -1856,11 +1891,169 @@ fn compact_evidence_miss(revision: &str, keywords: &[String], task: &str) -> Str
         "status: no production definition or reference".into(),
         "evidence: exact/ignore-case/naming-variant search found 0 production occurrences; test/eval/doc mentions ignored".into(),
         "checked: symbol names, references, snake/kebab/pascal variants, string bindings".into(),
+    ]);
+    if !suggestions.is_empty() {
+        lines.push(format!("did-you-mean: {}", suggestions.join(", ")));
+    }
+    lines.extend([
         "fallback: disabled; natural-language task terms cannot establish an explicit edit target"
             .into(),
-        "next: provide the missing source/path or correct the symbol name".into(),
+        "next: provide the missing source/path or correct the symbol name; or retry with a did-you-mean symbol / known entry file via files".into(),
     ]);
     lines.join("\n")
+}
+
+/// 硬 MISS 时的"你是不是想找"：把未命中锚点拆成词，一次批量检索后从命中行提取
+/// 包含这些词的真实标识符，按覆盖词数/频次/是否定义行打分。只给生产代码里的
+/// 符号；测试/文档命中不算。找不到相近符号时返回空，MISS 保持原样。
+fn suggest_symbols(root: &Path, anchors: &[String]) -> Vec<String> {
+    let mut words = Vec::<String>::new();
+    for anchor in anchors {
+        for variant in naming_variants(anchor) {
+            for word in variant
+                .to_lowercase()
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty())
+            {
+                if word.len() >= DID_YOU_MEAN_MIN_WORD
+                    && !stop_word(word)
+                    && !words.iter().any(|existing| existing == word)
+                {
+                    words.push(word.to_string());
+                }
+            }
+        }
+    }
+    words.truncate(8);
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let rows = search_text(root, &words, true, false, &[]);
+    static IDENT: OnceLock<Regex> = OnceLock::new();
+    let ident = IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][\w$]{2,}").unwrap());
+    static DEF_LINE: OnceLock<Regex> = OnceLock::new();
+    let def_line = DEF_LINE.get_or_init(|| Regex::new(r"^\s*(?:(?:pub(?:\([^)]*\))?|export|async|unsafe|default|static|const|move)\s+)*(?:fn|struct|enum|trait|impl|type|class|interface|function|def|mod)\b").unwrap());
+    struct Scored {
+        hits: usize,
+        words: HashSet<String>,
+        location: String,
+        def: bool,
+    }
+    let mut scored = HashMap::<String, Scored>::new();
+    for row in &rows {
+        if !is_code_file(&row.file) || anchor_noise_path(&row.file) {
+            continue;
+        }
+        for found in ident.find_iter(&row.text) {
+            let name = found.as_str();
+            let low = name.to_lowercase();
+            if low.len() < 5 || words.contains(&low) || stop_word(&low) {
+                continue;
+            }
+            let matched = words
+                .iter()
+                .filter(|word| low.contains(word.as_str()))
+                .collect::<Vec<_>>();
+            if matched.is_empty() {
+                continue;
+            }
+            let entry = scored.entry(name.to_string()).or_insert_with(|| Scored {
+                hits: 0,
+                words: HashSet::new(),
+                location: format!("{}:{}", row.file, row.ln),
+                def: false,
+            });
+            entry.hits += 1;
+            for word in matched {
+                entry.words.insert(word.clone());
+            }
+            if def_line.is_match(&row.text) {
+                entry.def = true;
+            }
+        }
+    }
+    let score_of =
+        |item: &Scored| item.words.len() * 10 + item.hits.min(5) + usize::from(item.def) * 4;
+    let mut list = scored.into_iter().collect::<Vec<_>>();
+    list.sort_by(|(a_name, a), (b_name, b)| {
+        score_of(b).cmp(&score_of(a)).then_with(|| a_name.cmp(b_name))
+    });
+    list.truncate(DID_YOU_MEAN_MAX);
+    list.into_iter()
+        .map(|(name, item)| format!("{name} ({})", item.location))
+        .collect()
+}
+
+/// 文件名按分隔符与 camelCase 切段，查询词须完整命中一个段才算主题文件，
+/// 避免短泛词 mode 子串匹配 model_cache.rs 之类文件造成噪声。
+fn file_segments(file: &str) -> Vec<String> {
+    let base = file.rsplit('/').next().unwrap_or(file);
+    let stem = base.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(base);
+    let mut segments = Vec::new();
+    for part in stem.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        let chars: Vec<char> = part.chars().collect();
+        let mut piece = String::new();
+        for (index, ch) in chars.iter().enumerate() {
+            let prev = if index > 0 { Some(chars[index - 1]) } else { None };
+            if ch.is_ascii_uppercase()
+                && prev.map_or(false, |p| p.is_ascii_lowercase() || p.is_ascii_digit())
+            {
+                if !piece.is_empty() {
+                    segments.push(piece.to_lowercase());
+                }
+                piece = String::new();
+            }
+            piece.push(*ch);
+        }
+        if !piece.is_empty() {
+            segments.push(piece.to_lowercase());
+        }
+    }
+    segments
+}
+
+/// 词频表：大小写变体取最大命中行数，衡量词稀有度。
+fn term_freq_map(counts: &HashMap<String, usize>) -> HashMap<String, usize> {
+    let mut freq = HashMap::new();
+    for (key, n) in counts {
+        let low = key.to_lowercase();
+        freq.entry(low)
+            .and_modify(|value: &mut usize| *value = (*value).max(*n))
+            .or_insert(*n);
+    }
+    freq
+}
+
+/// 主题加分按词稀有度衰减：build/mode 这类命中数百上千行的泛词，仅凭文件名
+/// 不能把 build.rs / build.bat 顶进 EDIT 槽位；低频符号名仍拿满分。
+fn subject_match(
+    file: &str,
+    subject_terms: &[String],
+    term_freq: &HashMap<String, usize>,
+) -> f64 {
+    if subject_terms.is_empty() {
+        return 0.0;
+    }
+    let segments = file_segments(file);
+    let mut best = 0.0_f64;
+    for term in subject_terms {
+        if !segments.iter().any(|segment| segment == term) {
+            continue;
+        }
+        let freq = term_freq.get(term).copied().unwrap_or(0).max(1) as f64;
+        best = best.max(SUBJECT_BONUS * (80.0 / freq).clamp(0.2, 1.0));
+    }
+    best
+}
+
+fn is_subject_file(file: &str, subject_terms: &[String]) -> bool {
+    if subject_terms.is_empty() {
+        return false;
+    }
+    let segments = file_segments(file);
+    subject_terms
+        .iter()
+        .any(|term| segments.iter().any(|segment| segment == term))
 }
 
 fn stop_word(value: &str) -> bool {
@@ -2269,7 +2462,18 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .collect::<Vec<_>>();
     let mut anchor_terms = Vec::new();
     for keyword in &keywords {
-        for variant in naming_variants(keyword) {
+        // 短语关键词（含空白）本身不是可检索锚点：拆成单词参与检索与命中判定，
+        // 避免 "plan mode" 这类自然语言短语整体零命中把真实泛词也拖进 MISS。
+        let words = phrase_words(keyword);
+        let variants = if words.is_empty() {
+            naming_variants(keyword)
+        } else {
+            words
+                .iter()
+                .flat_map(|word| naming_variants(word))
+                .collect::<Vec<_>>()
+        };
+        for variant in variants {
             if !anchor_terms
                 .iter()
                 .any(|value: &String| value.eq_ignore_ascii_case(&variant))
@@ -2344,8 +2548,19 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .iter()
         .filter(|keyword| production_anchor_hit(&rows, keyword))
         .count();
-    if !explicit_anchors.is_empty() && resolved_anchors == 0 && files.is_empty() {
-        return Ok(compact_evidence_miss(&revision, &explicit_anchors, &task));
+    // 软降级：显式锚点全灭但其它关键词（如短语拆出的泛词）命中生产代码时继续检索，
+    // 未命中锚点由头部"未命中关键词"标注；只有全部关键词零命中才硬 MISS（附 did-you-mean）。
+    if !explicit_anchors.is_empty()
+        && resolved_anchors == 0
+        && files.is_empty()
+        && !keywords.iter().any(|keyword| keyword_hit(&rows, keyword))
+    {
+        return Ok(compact_evidence_miss(
+            &revision,
+            &explicit_anchors,
+            &task,
+            &suggest_symbols(root, &explicit_anchors),
+        ));
     }
     let loose_kw = keywords
         .iter()
@@ -2357,11 +2572,19 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         })
         .cloned()
         .collect::<Vec<_>>();
-    let missed_all = keywords
+    // 预先记录哪些关键词（或短语拆出的单词）命中生产代码，供 ingest 之后判定 missed_all。
+    let production_hits: HashSet<String> = keywords
         .iter()
-        .filter(|keyword| !production_anchor_hit(&rows, keyword))
-        .cloned()
-        .collect::<Vec<_>>();
+        .flat_map(|keyword| {
+            let words = phrase_words(keyword);
+            if words.is_empty() {
+                vec![keyword.clone()]
+            } else {
+                words
+            }
+        })
+        .filter(|term| production_anchor_hit(&rows, term))
+        .collect();
     for file in rows.iter().map(|row| &row.file).chain(files.iter()) {
         if !all.contains(file) && root.join(file).is_file() && is_code_file(file) {
             all.push(file.clone());
@@ -2398,21 +2621,42 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         }
         file_rows.push(row);
     }
-    let subject_query_terms = if explicit_anchors.is_empty() {
+    // 短语关键词按拆出的单词判定命中；非锚点关键词看是否出现在命中行。
+    let missed_all = keywords
+        .iter()
+        .filter(|keyword| {
+            let words = phrase_words(keyword);
+            if !words.is_empty() {
+                return !words.iter().any(|word| {
+                    production_hits.contains(word) || keyword_counts.contains_key(word)
+                });
+            }
+            if explicit_anchor(keyword) {
+                !production_hits.contains(*keyword)
+            } else {
+                !keyword_counts.contains_key(*keyword)
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let subject_source = if explicit_anchors.is_empty() {
         &terms
     } else {
         &anchor_terms
     };
-    let subject: HashSet<_> = all
-        .iter()
-        .filter(|f| {
-            let base = f.rsplit('/').next().unwrap_or(f).to_lowercase();
-            subject_query_terms
-                .iter()
-                .any(|t| t.len() >= 4 && base.contains(&t.to_lowercase()))
-        })
-        .cloned()
-        .collect();
+    let mut subject_terms = Vec::<String>::new();
+    for term in subject_source {
+        let low = term.to_lowercase();
+        if js_utf16_len(&low) >= 4
+            && low
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+            && !subject_terms.contains(&low)
+        {
+            subject_terms.push(low);
+        }
+    }
+    let term_freq = term_freq_map(&keyword_counts);
     static DEFINITION_LINE: OnceLock<Regex> = OnceLock::new();
     let definition_line = DEFINITION_LINE.get_or_init(|| Regex::new(r"^\s*(?:(?:pub(?:\([^)]*\))?|export|async|unsafe|default|static|const|move)\s+)*(?:fn|struct|enum|trait|impl|type|class|interface|function|def|mod)\b").unwrap());
     let mut preliminary: Vec<(String, i64)> = hit_order
@@ -2449,15 +2693,15 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                     } else {
                         0
                     }
-                    + if subject.contains(f) { 600 } else { 0 }
+                    + subject_match(f, &subject_terms, &term_freq) as i64
                     + if files.contains(f) { 500 } else { 0 },
             )
         })
         .collect();
-    for f in files
-        .iter()
-        .chain(all.iter().filter(|file| subject.contains(*file)))
-    {
+    for f in files.iter().chain(
+        all.iter()
+            .filter(|file| subject_match(file, &subject_terms, &term_freq) >= 300.0),
+    ) {
         if !preliminary.iter().any(|(x, _)| x == f) {
             preliminary.push((f.clone(), if files.contains(f) { 1000 } else { 550 }));
         }
@@ -2477,15 +2721,9 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         candidates = preliminary.iter().take(3).cloned().collect();
     }
     let mut wanted: HashSet<_> = candidates.iter().map(|value| value.0.clone()).collect();
-    let subject_terms = terms
-        .iter()
-        .map(|term| term.to_lowercase())
-        .filter(|term| js_utf16_len(term) >= 4)
-        .collect::<Vec<_>>();
     if !subject_terms.is_empty() {
         for file in &all {
-            let base = file.rsplit('/').next().unwrap_or(file).to_lowercase();
-            if subject_terms.iter().any(|term| base.contains(term)) {
+            if is_subject_file(file, &subject_terms) {
                 wanted.insert(file.clone());
             }
         }
@@ -2523,6 +2761,11 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             }
         }
     }
+    // 高频泛词（如 build/mode 命中数百行）不作为种子：其"定义"多半是无关同名函数，
+    // 会经由 plannedTerms 二次检索把 build 脚本等噪声反馈回排名。
+    seed_terms.retain(|term| {
+        term_freq.get(&term.to_lowercase()).copied().unwrap_or(0) <= SEED_FREQ_CAP
+    });
     for keyword in &seed_terms {
         let lower = keyword.to_lowercase();
         for name in &def_names {
@@ -2598,6 +2841,8 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             }
         }
     }
+    // 二次检索后词频已变，重建稀有度表供 ranked 的主题加分使用。
+    let term_freq = term_freq_map(&keyword_counts);
 
     let seed_files = seeds
         .iter()
@@ -2630,9 +2875,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             if seed_files.contains(file) {
                 score += 120.0;
             }
-            if subject.contains(file) {
-                score += 600.0;
-            }
+            score += subject_match(file, &subject_terms, &term_freq);
             if files.contains(file) {
                 score += 500.0;
             }
@@ -2669,8 +2912,11 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             ranked.push((file.clone(), 100.0));
         }
     }
+    // 仅限名字有区分度（加分≥300）的文件：泛词同名且正文零命中的文件纯属噪声。
     for file in &all {
-        if subject.contains(file) && !ranked.iter().any(|(existing, _)| existing == file) {
+        if subject_match(file, &subject_terms, &term_freq) >= 300.0
+            && !ranked.iter().any(|(existing, _)| existing == file)
+        {
             ranked.push((file.clone(), 550.0));
         }
     }
@@ -3011,7 +3257,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .map(|(file, _)| file)
         .filter(|file| {
             seeds.is_empty()
-                && subject.contains(*file)
+                && subject_match(file, &subject_terms, &term_freq) >= 300.0
                 && !noise_path(file)
                 && sources.contains_key(*file)
         })
@@ -3468,7 +3714,8 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                             )
                         })
                         .collect::<Vec<_>>();
-                    let subject_file = subject.contains(&plan.file);
+                    let subject_file =
+                        subject_match(&plan.file, &subject_terms, &term_freq) >= 300.0;
                     let cap = if subject_file {
                         24
                     } else if plan.rank < 1 {
@@ -3855,6 +4102,98 @@ mod tests {
         );
         assert!(!out.contains("filterRequestParams"), "{out}");
         assert!(out.len() < 2048, "{}", out.len());
+    }
+
+    #[test]
+    fn invented_anchor_with_phrase_words_soft_degrades() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/store.ts"),
+            "export const UNIFIED_MODES = [{ id: 'build', name: 'Build' }, { id: 'plan', name: 'Plan' }];\nexport function modeChoices() { return UNIFIED_MODES; }\nexport function setThreadMode(mode) { return UNIFIED_MODES.find((m) => m.id === mode); }\n",
+        )
+        .unwrap();
+        // 锚点拼接构造：字面量写进本文件会污染真实仓库的召回评测（production_anchor_hit 命中）
+        let invented_p = ["Plan", "Mode"].concat();
+        let invented_a = ["agent", "Mode"].concat();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({
+                "keywords":["plan mode", invented_p, invented_a],
+                "task":"Remove plan mode UI selection; keep only build as default"
+            }),
+        )
+        .unwrap();
+        assert!(!out.starts_with("# CTX MISS"), "{out}");
+        assert!(out.contains("modeChoices"), "{out}");
+        assert!(out.contains("UNIFIED_MODES"), "{out}");
+        // 臆造锚点如实标注；短语泛词 plan mode 不算未命中
+        let note = out
+            .lines()
+            .find(|line| line.contains("未命中关键词"))
+            .unwrap_or_default();
+        assert!(note.contains(&invented_p) && note.contains(&invented_a), "{out}");
+        assert!(!note.contains("plan mode"), "{out}");
+    }
+
+    #[test]
+    fn hard_miss_suggests_similar_production_symbols() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src/components")).unwrap();
+        fs::write(
+            d.path().join("src/components/PlanCard.tsx"),
+            "export function PlanCard(props) { return props.plan; }\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("src/store.ts"),
+            "export const proposedPlan = null;\nexport function dismissProposedPlan() {}\n",
+        )
+        .unwrap();
+        let invented_p = ["Plan", "Mode"].concat();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":[invented_p], "task":"switch to plan mode"}),
+        )
+        .unwrap();
+        assert!(out.starts_with("# CTX MISS"), "{out}");
+        assert!(
+            out.contains("status: no production definition or reference"),
+            "{out}"
+        );
+        assert!(
+            out.contains("PlanCard (src/components/PlanCard.tsx:1)"),
+            "{out}"
+        );
+        assert!(out.len() < 2048, "{out}");
+    }
+
+    #[test]
+    fn subject_match_requires_full_segment_and_decays_with_frequency() {
+        let terms = vec!["mode".to_string(), "build".to_string(), "plan".to_string()];
+        // mode 不是 model 的完整段：不匹配
+        assert_eq!(
+            subject_match("src-tauri/src/model_cache.rs", &terms, &HashMap::new()),
+            0.0
+        );
+        assert_eq!(
+            subject_match("tmp_search_model_merge.js", &terms, &HashMap::new()),
+            0.0
+        );
+        // 稀有词满分
+        let rare = vec!["suggestions".to_string()];
+        assert_eq!(
+            subject_match("src/components/slashSuggestions.ts", &rare, &HashMap::new()),
+            600.0
+        );
+        // 高频泛词衰减到不足主题通读阈值
+        let mut freq = HashMap::new();
+        freq.insert("build".to_string(), 223);
+        freq.insert("plan".to_string(), 428);
+        let damped = subject_match("src-tauri/build.rs", &terms, &freq);
+        assert!(damped < 300.0 && damped >= 100.0, "{damped}");
+        // camelCase 切段后仍可命中
+        assert!(subject_match("src/components/PlanActionCard.tsx", &terms, &freq) > 0.0);
     }
 
     #[test]
