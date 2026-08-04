@@ -8809,3 +8809,20 @@ button.head-badge:hover {
 .wf-edge-line { transition: stroke 0.15s, stroke-width 0.15s; }
 .wf-edge:hover .wf-edge-line { stroke: var(--accent); stroke-width: 2.6; }
 .wf-edge-label { paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; }
+
+/* ===== canvas transcript (qwen)：feat/glm_canvas 分支的独立 canvas 渲染，样式与默认 canvas 互不影响 ===== */
+.transcript-canvas-host {
+  position: relative;
+  overflow: hidden;
+}
+.transcript-canvas-host > canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.canvas-float {
+  position: absolute;
+  z-index: 6;
+}

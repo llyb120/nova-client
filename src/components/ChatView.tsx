@@ -19,6 +19,7 @@ import {
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import type { AgentKind, Item, Thread, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
+import { TranscriptCanvas, type TranscriptCanvasApi } from "../canvasTranscript/TranscriptCanvas";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
 import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
@@ -224,7 +225,13 @@ export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
   let transcriptRef: CanvasTranscriptHandle | undefined;
-  const useCanvas = () => state.settings?.chatViewRender !== "dom";
+  let qwenApi: TranscriptCanvasApi | null = null;
+  const renderMode = () => state.settings?.chatViewRender ?? "canvas";
+  /** master 默认 canvas 渲染 */
+  const useCanvas = () => renderMode() === "canvas";
+  /** canvas(qwen)：feat/glm_canvas 分支的独立 canvas 渲染，与默认 canvas 互不影响 */
+  const useQwenCanvas = () => renderMode() === "canvas_qwen";
+  const useAnyCanvas = () => renderMode() !== "dom";
   const [stickToBottom, setStickToBottom] = createSignal(true);
 
   mountSessionShortcuts({
@@ -273,6 +280,11 @@ export function ChatView() {
   const syncTimeCursor = () => {
     const stops = timeStops();
     if (stops.length === 0) { setActiveTimeIndex(-1); return; }
+    if (useQwenCanvas()) {
+      // qwen canvas 内部自管滚动且不暴露当前分组位置；吸底时光标跟随最新轮次
+      if (stickToBottom()) setActiveTimeIndex(latestTimeIndex());
+      return;
+    }
     if (useCanvas()) {
       if (!transcriptRef) return;
       const groupIndex = transcriptRef.activeGroup();
@@ -299,6 +311,10 @@ export function ChatView() {
 
   const travelTo = (index: number) => {
     cancelBottomFollow();
+    if (useQwenCanvas()) {
+      qwenApi?.scrollToGroup(index);
+      return;
+    }
     if (useCanvas()) {
       transcriptRef?.scrollToGroup(index);
       syncTimeCursor();
@@ -327,7 +343,7 @@ export function ChatView() {
    * 在快速滑动时整屏留白。
    */
   const mountVisibleVirtualGroups = (force = false) => {
-    if (useCanvas() || !scrollRef || !innerRef) return;
+    if (useAnyCanvas() || !scrollRef || !innerRef) return;
     const viewportHeight = scrollRef.clientHeight;
     if (
       !force &&
@@ -363,14 +379,18 @@ export function ChatView() {
   const maxScrollTop = () =>
     useCanvas()
       ? (transcriptRef?.maxScrollTop() ?? 0)
-      : scrollRef
-        ? Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight)
-        : 0;
+      : useQwenCanvas()
+        ? 0
+        : scrollRef
+          ? Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight)
+          : 0;
 
   const isAtBottom = () =>
     useCanvas()
       ? (transcriptRef?.isAtBottom() ?? true)
-      : !scrollRef || maxScrollTop() - scrollRef.scrollTop <= 1;
+      : useQwenCanvas()
+        ? stickToBottom()
+        : !scrollRef || maxScrollTop() - scrollRef.scrollTop <= 1;
 
   const cancelBottomFollow = () => setStickToBottom(false);
 
@@ -378,7 +398,7 @@ export function ChatView() {
     target instanceof Element && !!target.closest(".tool-output, .tool-raw");
 
   const handleWheel = (event: WheelEvent) => {
-    if (useCanvas()) return;
+    if (useAnyCanvas()) return;
     if (isToolDetailScroll(event.target)) return;
     if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
     if (event.deltaY > 0 && isAtBottom()) {
@@ -389,13 +409,13 @@ export function ChatView() {
   };
 
   const handlePointerDown = (event: PointerEvent) => {
-    if (useCanvas()) return;
+    if (useAnyCanvas()) return;
     if (isToolDetailScroll(event.target)) return;
     pointerActive = true;
   };
 
   const processTranscriptScroll = () => {
-    if (useCanvas()) {
+    if (useAnyCanvas()) {
       syncTimeCursor();
       return;
     }
@@ -421,6 +441,7 @@ export function ChatView() {
 
   const pinBottom = () => {
     if (!stickToBottom() || pointerActive) return;
+    if (useQwenCanvas()) return; // qwen canvas 依据 stickToBottom prop 自行钉底
     if (useCanvas()) {
       transcriptRef?.scrollToBottom();
       lastScrollTop = transcriptRef?.scrollTop() ?? 0;
@@ -433,7 +454,7 @@ export function ChatView() {
   };
 
   const compensateVirtualHeight = (delta: number) => {
-    if (useCanvas() || !scrollRef || Math.abs(delta) <= 0.5) return;
+    if (useAnyCanvas() || !scrollRef || Math.abs(delta) <= 0.5) return;
     scrollRef.scrollTop += delta;
     lastScrollTop = scrollRef.scrollTop;
   };
@@ -453,7 +474,7 @@ export function ChatView() {
   };
 
   const finishPointerInteraction = () => {
-    if (!useCanvas() && scrollFrame) {
+    if (!useAnyCanvas() && scrollFrame) {
       cancelAnimationFrame(scrollFrame);
       scrollFrame = 0;
       processTranscriptScroll();
@@ -487,6 +508,7 @@ export function ChatView() {
       const scrollsDown = scrollDownKeys.has(event.key) || (event.key === " " && !event.shiftKey);
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       if (!scrollsUp && !scrollsDown) return;
+      if (useQwenCanvas()) return; // qwen canvas 自带键盘滚动处理
       if (useCanvas()) {
         if (transcriptRef?.hasFocusedInput()) return;
         const delta = scrollsDown ? 100 : -100;
@@ -534,6 +556,7 @@ export function ChatView() {
     const id = state.currentId;
     if (id !== prevId) {
       enableBottomFollow();
+      if (useQwenCanvas()) qwenApi?.enableBottomFollow();
       setActiveTimeIndex(latestTimeIndex());
     }
     return id;
@@ -541,7 +564,7 @@ export function ChatView() {
 
   // 切换 DOM / Canvas 渲染后重新吸底，避免滚动状态串到另一套视图。
   createEffect((prevMode: string) => {
-    const mode = useCanvas() ? "canvas" : "dom";
+    const mode = renderMode();
     if (prevMode && prevMode !== mode) enableBottomFollow();
     return mode;
   }, "");
@@ -1106,7 +1129,7 @@ export function ChatView() {
         <div class="chat-primary">
       <div class="chat-body">
         <Show
-          when={useCanvas()}
+          when={renderMode() !== "dom"}
           fallback={
             <div
               class="transcript"
@@ -1152,24 +1175,44 @@ export function ChatView() {
             </div>
           }
         >
-          <CanvasTranscript
-            ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
-            threadId={state.currentId}
-            groups={groups()}
-            permissions={permissions()}
-            running={isRunning()}
-            loading={state.loadingThread}
-            preview={!!previewCheckpointId()}
-            onReturnToCurrent={returnToCurrentTimeline}
-            onScroll={(top, max, user) => {
-              if (user) {
-                setStickToBottom(max - top <= 2);
-                lastScrollTop = top;
-              }
-              syncTimeCursor();
-            }}
-            emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
-          />
+          <Show
+            when={useQwenCanvas()}
+            fallback={
+              <CanvasTranscript
+                ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
+                threadId={state.currentId}
+                groups={groups()}
+                permissions={permissions()}
+                running={isRunning()}
+                loading={state.loadingThread}
+                preview={!!previewCheckpointId()}
+                onReturnToCurrent={returnToCurrentTimeline}
+                onScroll={(top, max, user) => {
+                  if (user) {
+                    setStickToBottom(max - top <= 2);
+                    lastScrollTop = top;
+                  }
+                  syncTimeCursor();
+                }}
+                emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
+              />
+            }
+          >
+            <TranscriptCanvas
+              groups={groups()}
+              permissions={permissions()}
+              running={isRunning()}
+              showHint={displayedItems().length === 0 && !state.loadingThread}
+              hintCwd={cwdDisplay()}
+              threadId={state.currentId ?? ""}
+              previewBanner={!!previewCheckpointId()}
+              fading={previewFading()}
+              stickToBottom={stickToBottom()}
+              onStickChange={setStickToBottom}
+              onReturnToTimeline={returnToCurrentTimeline}
+              onApi={(a) => { qwenApi = a; scheduleBottomPin(); }}
+            />
+          </Show>
         </Show>
       </div>
 

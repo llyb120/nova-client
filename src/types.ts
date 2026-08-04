@@ -437,8 +437,8 @@ export interface Settings {
   theme: string;
   /** 会话历史展示方式（按项目 / 按时间） */
   historyDisplayMode: "project" | "time";
-  /** 聊天视图渲染方式（dom / canvas；默认 canvas） */
-  chatViewRender: "dom" | "canvas";
+  /** 聊天视图渲染方式（dom / canvas / canvas_qwen；默认 canvas；canvas_qwen 为 GLM canvas 渲染，与默认 canvas 实现相互独立） */
+  chatViewRender: "dom" | "canvas" | "canvas_qwen";
   /** 团队/漫游中转服务地址（空 = 关闭团队/漫游） */
   relayServer: string;
   /** 团队/漫游身份 token（永久，用以区分每个人） */
