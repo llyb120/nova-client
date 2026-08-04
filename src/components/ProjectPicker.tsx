@@ -29,6 +29,9 @@ export function ProjectPicker(props: {
   onPickRoaming?: (peer: Peer, folder: string) => void;
   /** 下拉框向下展开（默认向上，适配底部 composer） */
   popDown?: boolean;
+  /** 仅允许选择自己的本地项目：隐藏临时会话、条目移除与「使用现有文件夹」入口
+   *  （漫游分组由是否传 onPickRoaming 决定）。 */
+  ownOnly?: boolean;
   /** Portal + fixed，避免被设置弹窗滚动区裁剪，并按可用空间翻转 */
   portal?: boolean;
 }) {
@@ -210,14 +213,16 @@ export function ProjectPicker(props: {
         onInput={(e) => setQuery(e.currentTarget.value)}
       />
       <div class="proj-list">
-        <div
-          class={`proj-item scratch ${props.value && isScratch(props.value) ? "active" : ""}`}
-          onClick={() => void useScratch()}
-          title="不关联项目，在系统临时目录新建一个空目录作为工作区"
-        >
-          <IconPlus size={13} />
-          <span class="proj-name">临时会话（不使用项目）</span>
-        </div>
+        <Show when={!props.ownOnly}>
+          <div
+            class={`proj-item scratch ${props.value && isScratch(props.value) ? "active" : ""}`}
+            onClick={() => void useScratch()}
+            title="不关联项目，在系统临时目录新建一个空目录作为工作区"
+          >
+            <IconPlus size={13} />
+            <span class="proj-name">临时会话（不使用项目）</span>
+          </div>
+        </Show>
         <For each={filtered()}>
           {(p) => (
             <div
@@ -237,16 +242,18 @@ export function ProjectPicker(props: {
                 </span>
               </Show>
               <span class="proj-path">{p.path}</span>
-              <button
-                class="proj-remove"
-                title="从列表移除（不删除文件）"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void api.removeProject(p.path).then(refreshProjects);
-                }}
-              >
-                <IconX size={12} />
-              </button>
+              <Show when={!props.ownOnly}>
+                <button
+                  class="proj-remove"
+                  title="从列表移除（不删除文件）"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void api.removeProject(p.path).then(refreshProjects);
+                  }}
+                >
+                  <IconX size={12} />
+                </button>
+              </Show>
             </div>
           )}
         </For>
@@ -286,10 +293,12 @@ export function ProjectPicker(props: {
           </For>
         </Show>
       </div>
-      <button class="proj-browse" onClick={() => void browse()}>
-        <IconPlus size={13} />
-        使用现有文件夹…
-      </button>
+      <Show when={!props.ownOnly}>
+        <button class="proj-browse" onClick={() => void browse()}>
+          <IconPlus size={13} />
+          使用现有文件夹…
+        </button>
+      </Show>
     </div>
   );
 

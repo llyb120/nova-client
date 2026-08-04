@@ -5,11 +5,11 @@ import * as QRCode from "qrcode";
 import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import {
+  ALL_AGENT_KINDS,
   checkAndStageUpdate,
   deleteThreads,
   enabledAgentKinds,
   ensureModelOptions,
-  modelChoices,
   preloadPeerModels,
   refreshQuota,
   refreshRelayStatus,
@@ -20,7 +20,7 @@ import {
 } from "../store";
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker, type SharedModelSource } from "./ConfigSelects";
-import { IconX } from "./icons";
+import { IconPlus, IconX } from "./icons";
 import { ProjectPicker } from "./ProjectPicker";
 import {
   encodeModelTarget,
@@ -51,6 +51,15 @@ function threadGroupName(cwd: string): string {
 
 function projectPathKey(path: string): string {
   return path.replace(/\\/g, "/").toLowerCase();
+}
+
+/** 解析共享模型额度的键 `<agentKind>:<modelId>`；非法键返回 null。 */
+function parseQuotaShareKey(key: string): { kind: AgentKind; model: string } | null {
+  const i = key.indexOf(":");
+  if (i <= 0) return null;
+  const kind = key.slice(0, i) as AgentKind;
+  if (!ALL_AGENT_KINDS.includes(kind)) return null;
+  return { kind, model: key.slice(i + 1) };
 }
 
 function resolveShortcutRoam(target: string): { peer: Peer; folder: string } | null {
@@ -316,6 +325,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [quotaSharedModels, setQuotaSharedModels] = createSignal<string[]>(s?.quotaSharedModels ?? []);
   const [roamingFolders, setRoamingFolders] = createSignal<string[]>(state.roamingFolders);
   const [roamingFoldersLoading, setRoamingFoldersLoading] = createSignal(false);
+  // 「添加一行」式共享模型选择器的草稿状态：选完即加入列表并复位为空。
+  const [draftShareKind, setDraftShareKind] = createSignal<AgentKind | null>(null);
+  const [draftShareModel, setDraftShareModel] = createSignal("");
   const [globalInstructions, setGlobalInstructions] = createSignal("");
   const [globalInstructionsPath, setGlobalInstructionsPath] = createSignal("");
   const [globalInstructionTargets, setGlobalInstructionTargets] = createSignal<
@@ -405,14 +417,29 @@ export function SettingsModal(props: { onClose: () => void }) {
   );
 
   const quotaShareKey = (kind: AgentKind, model: string) => `${kind}:${model}`;
-  const toggleQuotaSharedModel = (kind: AgentKind, model: string, checked: boolean) => {
+  const addQuotaSharedModel = (kind: AgentKind, model: string) => {
+    if (!model) return;
     const key = quotaShareKey(kind, model);
+    setQuotaSharedModels((current) => (current.includes(key) ? current : [...current, key]));
+    // 记住上次选择的后端，连续添加时不用每次重新选后端
+    setDraftShareKind(kind);
+    setDraftShareModel("");
+  };
+  const replaceQuotaSharedModel = (oldKey: string, kind: AgentKind, model: string) => {
+    const key = quotaShareKey(kind, model);
+    if (key === oldKey) return;
     setQuotaSharedModels((current) => {
-      if (!checked) return current.filter((item) => item !== key);
-      if (current.includes(key)) return current;
-      return [...current, key];
+      // 目标已在列表中：移除旧行避免重复
+      if (current.includes(key)) return current.filter((item) => item !== oldKey);
+      return current.map((item) => (item === oldKey ? key : item));
     });
   };
+  const removeQuotaSharedModelAt = (index: number) => {
+    setQuotaSharedModels((current) => current.filter((_, i) => i !== index));
+  };
+  /** 行选择器的后端列表：已启用后端 + 该行自身的后端（后端被停用后旧行仍可展示/移除） */
+  const quotaRowKinds = (kind: AgentKind): AgentKind[] =>
+    quotaShareKinds().includes(kind) ? quotaShareKinds() : [...quotaShareKinds(), kind];
   const updateCursorModelContext = (index: number, patch: { prefix?: string; contextWindow?: number }) => {
     setCursorModelContexts((current) => current.map((rule, ruleIndex) =>
       ruleIndex === index ? { ...rule, ...patch } : rule));
@@ -493,19 +520,36 @@ export function SettingsModal(props: { onClose: () => void }) {
       setRoamingFoldersLoading(false);
     }
   };
-  const roamingProjectSelected = (path: string) => {
-    const key = projectPathKey(path);
-    return roamingFolders().some((folder) => projectPathKey(folder) === key);
-  };
-  const toggleRoamingProject = (path: string, checked: boolean) => {
+  const addRoamingFolder = (path: string) => {
+    if (!path) return;
     setRoamingFolders((current) => {
       const key = projectPathKey(path);
-      const next = current.filter((folder) => projectPathKey(folder) !== key);
-      return checked ? [...next, path] : next;
+      return current.some((folder) => projectPathKey(folder) === key) ? current : [...current, path];
     });
   };
-  const selectedRoamingProjectCount = createMemo(
-    () => state.projects.filter((project) => roamingProjectSelected(project.path)).length,
+  const replaceRoamingFolder = (oldPath: string, newPath: string) => {
+    if (!newPath) return;
+    const oldKey = projectPathKey(oldPath);
+    const newKey = projectPathKey(newPath);
+    if (oldKey === newKey) return;
+    setRoamingFolders((current) => {
+      if (current.some((folder) => projectPathKey(folder) === newKey)) {
+        // 目标已在列表中：移除旧行避免重复
+        return current.filter((folder) => projectPathKey(folder) !== oldKey);
+      }
+      return current.map((folder) => (projectPathKey(folder) === oldKey ? newPath : folder));
+    });
+  };
+  const removeRoamingFolderAt = (index: number) => {
+    setRoamingFolders((current) => current.filter((_, i) => i !== index));
+  };
+  /** 本地项目全部已共享时隐藏添加入口，避免重复选择无反馈 */
+  const allProjectsShared = createMemo(
+    () =>
+      state.projects.length > 0 &&
+      state.projects.every((project) =>
+        roamingFolders().some((folder) => projectPathKey(folder) === projectPathKey(project.path)),
+      ),
   );
 
   let globalInstructionsLoaded = false;
@@ -1993,7 +2037,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="field">
               <span class="field-label">允许漫游的项目</span>
               <span class="field-hint">
-                只能从你当前已有的本地项目中选择；未列入项目列表的目录不会展示给队友，也不会接受漫游请求。每次请求仍需你在本机确认。
+                每次添加一行，只能选择你自己的本地项目；未列入的目录不会展示给队友，也不会接受漫游请求。每次请求仍需你在本机确认。
               </span>
               <Show
                 when={!roamingFoldersLoading()}
@@ -2003,87 +2047,111 @@ export function SettingsModal(props: { onClose: () => void }) {
                   when={state.projects.length > 0}
                   fallback={<div class="sel-empty">当前没有可共享的本地项目。</div>}
                 >
-                  <div class="wt-dir-row">
-                    <span class="field-hint">
-                      已允许 {selectedRoamingProjectCount()} / {state.projects.length} 个项目
-                    </span>
-                  </div>
-                  <div class="wt-list">
-                    <For each={state.projects}>
-                      {(project) => (
-                        <label class="wt-row" title={project.path}>
-                          <div class="wt-row-main">
-                            <input
-                              type="checkbox"
-                              checked={roamingProjectSelected(project.path)}
-                              onChange={(event) =>
-                                toggleRoamingProject(project.path, event.currentTarget.checked)
-                              }
-                            />
-                            <span class="wt-branch">{threadGroupName(project.path)}</span>
-                            <Show when={project.worktree}>
-                              <span class="wt-tag">⎇ {project.worktree!.branch}</span>
-                            </Show>
-                          </div>
-                          <div class="wt-row-sub">
-                            <span class="wt-path">{project.path}</span>
-                          </div>
-                        </label>
+                  <div class="share-list">
+                    <Index each={roamingFolders()}>
+                      {(folder, index) => (
+                        <div class="share-row" title={folder()}>
+                          <ProjectPicker
+                            value={folder()}
+                            onChange={(path) => replaceRoamingFolder(folder(), path)}
+                            ownOnly
+                            portal
+                          />
+                          <button
+                            type="button"
+                            class="icon-btn share-row-remove"
+                            title="移除该项目"
+                            aria-label="移除该项目"
+                            onClick={() => removeRoamingFolderAt(index)}
+                          >
+                            <IconX size={14} />
+                          </button>
+                        </div>
                       )}
-                    </For>
+                    </Index>
+                    <Show when={roamingFolders().length === 0}>
+                      <div class="share-empty">尚未共享任何项目，用下方选择器添加一行。</div>
+                    </Show>
+                    <Show when={!allProjectsShared()}>
+                      <div class="share-row share-row-add">
+                        <ProjectPicker
+                          value=""
+                          onChange={(path) => addRoamingFolder(path)}
+                          ownOnly
+                          portal
+                        />
+                        <span class="share-row-plus" title="选择项目后自动加入列表">
+                          <IconPlus size={13} />
+                        </span>
+                      </div>
+                    </Show>
                   </div>
                 </Show>
               </Show>
             </div>
 
             <div class="field">
-              <span class="field-label">共享模型额度（可多选）</span>
+              <span class="field-label">共享模型额度</span>
               <span class="field-hint">
-                选中的模型会以“我的 Cursor”这类一级分类出现在队友的新会话模型选择器中。首次选择时会安全同步并预热额度租约；取消勾选后，旧缓存中的入口也无法再使用。
+                每次添加一行；共享的模型会以“我的 Cursor”这类一级分类出现在队友的新会话模型选择器中。首次添加会安全同步并预热额度租约；移除后，旧缓存中的入口也无法再使用。
               </span>
-              <div class="quota-share-models">
-                <For each={quotaShareKinds()}>
-                  {(kind) => {
-                    const choices = () => modelChoices(kind);
-                    return (
-                      <section class="quota-share-backend">
-                        <div class="quota-share-backend-title">
-                          <span class={`agent-badge ${kind}`}>{agentLabel(kind)}</span>
-                          <span>{choices().length} 个模型</span>
-                        </div>
-                        <Show
-                          when={choices().length > 0}
-                          fallback={<div class="field-hint">暂无模型，请先安装并登录对应 CLI。</div>}
-                        >
-                          <div class="quota-share-options">
-                            <For each={choices()}>
-                              {(choice) => {
-                                const key = quotaShareKey(kind, choice.value);
-                                return (
-                                  <label class="quota-share-option" title={choice.value}>
-                                    <input
-                                      type="checkbox"
-                                      checked={quotaSharedModels().includes(key)}
-                                      onChange={(event) =>
-                                        toggleQuotaSharedModel(
-                                          kind,
-                                          choice.value,
-                                          event.currentTarget.checked,
-                                        )
-                                      }
-                                    />
-                                    <span>{choice.name}</span>
-                                  </label>
-                                );
-                              }}
-                            </For>
-                          </div>
+              <Show
+                when={quotaShareKinds().length > 0}
+                fallback={<div class="sel-empty">暂无可共享的后端，请先在「后端」页启用。</div>}
+              >
+                <div class="share-list">
+                  <Index each={quotaSharedModels()}>
+                    {(key, index) => {
+                      const parsed = () => parseQuotaShareKey(key());
+                      return (
+                        <Show when={parsed()}>
+                          {(entry) => (
+                            <div class="share-row" title={key()}>
+                              <ModelPicker
+                                agentKind={entry().kind}
+                                agentKinds={quotaRowKinds(entry().kind)}
+                                model={entry().model}
+                                onPickModel={(kind, model) =>
+                                  replaceQuotaSharedModel(key(), kind, model)
+                                }
+                                title="共享模型"
+                                portal
+                              />
+                              <button
+                                type="button"
+                                class="icon-btn share-row-remove"
+                                title="移除该模型"
+                                aria-label="移除该模型"
+                                onClick={() => removeQuotaSharedModelAt(index)}
+                              >
+                                <IconX size={14} />
+                              </button>
+                            </div>
+                          )}
                         </Show>
-                      </section>
-                    );
-                  }}
-                </For>
-              </div>
+                      );
+                    }}
+                  </Index>
+                  <Show when={quotaSharedModels().length === 0}>
+                    <div class="share-empty">尚未共享任何模型，用下方选择器添加一行。</div>
+                  </Show>
+                  <div class="share-row share-row-add">
+                    <ModelPicker
+                      agentKind={draftShareKind() ?? (quotaShareKinds()[0] ?? "cursor")}
+                      agentKinds={quotaShareKinds()}
+                      model={draftShareModel()}
+                      allowDefault
+                      defaultLabel="选择要共享的模型"
+                      onPickModel={(kind, model) => addQuotaSharedModel(kind, model)}
+                      title="添加共享模型"
+                      portal
+                    />
+                    <span class="share-row-plus" title="选择模型后自动加入列表">
+                      <IconPlus size={13} />
+                    </span>
+                  </div>
+                </div>
+              </Show>
             </div>
           </Show>
 
