@@ -34,7 +34,7 @@ export function buildIntegrateModelPrompt(goal: string): string {
   "provider": {
     "<providerId>": {
       "npm": "@ai-sdk/openai-compatible",   // Anthropic 用含 anthropic 的包；Google 用含 google 的包；api 可省略（由 npm 推导）
-      "options": { "baseURL": "https://.../v1", "apiKey": "{env:环境变量名}" },
+      "options": { "baseURL": "https://.../v1", "apiKey": "sk-..." },
       "models": {
         "<modelId>": { "reasoning": true, "limit": { "context": 131072, "output": 8192 } }
       }
@@ -45,12 +45,12 @@ export function buildIntegrateModelPrompt(goal: string): string {
 
 ## 步骤
 1. 先读取现有 ~/.nova/alkaid/config.jsonc；不存在则新建为 \`{ "provider": {} }\`。
-2. 确定「${goal}」的接入信息：baseURL、精确模型 id、是否推理模型、上下文/输出窗口、API key 的环境变量名。
+2. 确定「${goal}」的接入信息：baseURL、精确模型 id、是否推理模型、上下文/输出窗口、API key。
    - **凡是不能从当前工作区或我给出的信息中确定的参数（尤其是上下文/输出窗口、模型特有能力或配置），必须联网搜索官方文档确认，禁止凭记忆臆测。** 搜索后仍无法确认的，列出待确认项向我询问，不要填入猜测值。
-   - 常见示例：DashScope（通义千问，OpenAI 兼容）baseURL 为 https://dashscope.aliyuncs.com/compatible-mode/v1，环境变量 DASHSCOPE_API_KEY。
+   - 常见示例：DashScope（通义千问，OpenAI 兼容）baseURL 为 https://dashscope.aliyuncs.com/compatible-mode/v1。
 3. 在 provider 下新增或更新一个 provider 块；如需设为默认，把顶层 model 更新为 \`<providerId>/<modelId>\`。
-4. apiKey 必须写成 \`{env:环境变量名}\`，严禁写入明文密钥。
-5. 完成后告诉我：需在启动 Nova 的 shell 注入该环境变量（Windows PowerShell 用 \`$env:变量名="..."\`），并在桌面端重启 Vega 以重新探测模型列表。
+4. apiKey 直接明文写入配置文件即可。
+5. 完成后告诉我：在桌面端重启 Vega 以重新探测模型列表。
 
 ## 验证
 改动后若当前工作区就是 Nova 仓库，可冒烟测试：\`npm run alkaid -- --prompt "请只回复 Vega OK"\`；否则提示我在桌面端重启 Vega 后确认新模型出现在模型列表。`;
