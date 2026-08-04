@@ -617,6 +617,25 @@ impl OpenCodeSdkManager {
                 command.env("PATH", path);
             }
         }
+        {
+            let state = self.app.state::<AppState>();
+            command.env(
+                "NOVA_FAST_CONTEXT",
+                if state.settings.lock().unwrap().fast_context_enabled {
+                    "1"
+                } else {
+                    "0"
+                },
+            );
+            match crate::acp::materialize_nova_tools_mcp(&self.app) {
+                Ok(script) => {
+                    command.env("NOVA_TOOLS_MCP_SCRIPT", script);
+                }
+                Err(error) => {
+                    eprintln!("nova-tools MCP 物化失败，OpenCode+ 会话将不附带 Nova 工具：{error}");
+                }
+            }
+        }
         apply_proxy_env(&mut command, &proxy);
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);

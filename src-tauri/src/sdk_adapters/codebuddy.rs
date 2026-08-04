@@ -39,6 +39,10 @@ impl SdkAdapter for CodeBuddyAdapter {
         true
     }
 
+    fn uses_nova_tools_mcp(&self) -> bool {
+        true
+    }
+
     fn normalize_usage(
         &self,
         usage: Option<&Value>,
@@ -65,5 +69,17 @@ impl SdkAdapter for CodeBuddyAdapter {
             Some(canonical_usage(input, output, cache_read, cache_write)),
             None,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CodeBuddyAdapter;
+    use crate::sdk_adapters::{CursorAdapter, SdkAdapter};
+
+    #[test]
+    fn codebuddy_mounts_nova_tools_mcp_but_cursor_keeps_its_own() {
+        assert!(CodeBuddyAdapter.uses_nova_tools_mcp());
+        assert!(!CursorAdapter.uses_nova_tools_mcp());
     }
 }

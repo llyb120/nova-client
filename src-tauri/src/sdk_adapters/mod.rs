@@ -42,6 +42,12 @@ pub trait SdkAdapter: Send + Sync {
         false
     }
 
+    /// Whether the host should mount the Reasonix tool layer (nova-tools MCP:
+    /// fast_context / find_symbols / edit_files) for this backend.
+    fn uses_nova_tools_mcp(&self) -> bool {
+        false
+    }
+
     fn keeps_bridge_alive(&self) -> bool {
         false
     }

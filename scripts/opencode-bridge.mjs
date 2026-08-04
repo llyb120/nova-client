@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline";
 import { createOpencode } from "@opencode-ai/sdk/v2";
+import { novaToolsAttached, novaToolsPolicy, opencodeNovaTools, prefixFirstTextPart } from "./nova-tools-policy.mjs";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -47,7 +48,7 @@ async function oneShot(client, request) {
         description: command.description ?? "",
       }));
     case "title": {
-      const sessionId = await ensureSession(client);
+      const { id: sessionId } = await ensureSession(client);
       const body = { parts: [{ type: "text", text: request.prompt }] };
       if (request.model) body.model = request.model;
       if (request.variant) body.variant = request.variant;
@@ -74,11 +75,11 @@ async function oneShot(client, request) {
 async function ensureSession(client, sessionId) {
   if (sessionId) {
     const existing = await client.session.get({ sessionID: sessionId });
-    if (!existing.error) return sessionId;
+    if (!existing.error) return { id: sessionId, created: false };
   }
   const created = await client.session.create();
   if (created.error) throw new Error(JSON.stringify(created.error));
-  return created.data.id;
+  return { id: created.data.id, created: true };
 }
 
 async function removeEmptyAssistantMessages(client, sessionId) {
@@ -251,7 +252,7 @@ function startPrompt(client, sessionId, request) {
 }
 
 async function runPrompt(client, lines, request) {
-  const sessionId = await ensureSession(client, request.sessionId);
+  const { id: sessionId, created } = await ensureSession(client, request.sessionId);
   if (sessionId === request.sessionId) await removeEmptyAssistantMessages(client, sessionId);
   const subscription = await client.event.subscribe();
   send({ type: "ready", sessionId });
@@ -289,7 +290,13 @@ async function runPrompt(client, lines, request) {
     }
   })();
 
-  prompts.start(startPrompt(client, sessionId, request));
+  // Reasonix tool layer: opencode keeps its own transcript, so the Vega policy
+  // rides the first user message of a fresh session once; nova-tools MCP comes
+  // from the server config.
+  const initialRequest = created && !request.command && novaToolsAttached(request)
+    ? { ...request, parts: prefixFirstTextPart(request.parts, novaToolsPolicy({ readOnly: request.mode === "plan" })) }
+    : request;
+  prompts.start(startPrompt(client, sessionId, initialRequest));
 
   const assistantMessages = new Set();
   const pendingParts = new Map();
@@ -362,7 +369,10 @@ async function main() {
   let opencode;
   try {
     const request = await readRequest(lines);
-    opencode = await createOpencode({ hostname: "127.0.0.1", port: 0, timeout: 10_000 });
+    const serverOptions = { hostname: "127.0.0.1", port: 0, timeout: 10_000 };
+    const novaConfig = opencodeNovaTools(request);
+    if (Object.keys(novaConfig).length > 0) serverOptions.config = novaConfig;
+    opencode = await createOpencode(serverOptions);
     const { client } = opencode;
     if (request.action === "prompt") {
       await runPrompt(client, lines, request);

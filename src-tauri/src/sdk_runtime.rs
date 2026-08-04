@@ -1021,6 +1021,27 @@ impl SdkManager {
                     state.context_service.endpoint(),
                 )
                 .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token());
+            if self.adapter.uses_nova_tools_mcp() {
+                command.env(
+                    "NOVA_FAST_CONTEXT",
+                    if state.settings.lock().unwrap().fast_context_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    },
+                );
+                match crate::acp::materialize_nova_tools_mcp(&self.app) {
+                    Ok(script) => {
+                        command.env("NOVA_TOOLS_MCP_SCRIPT", script);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "nova-tools MCP 物化失败，{} 会话将不附带 Nova 工具：{error}",
+                            self.adapter.label()
+                        );
+                    }
+                }
+            }
         }
         if !self.launch_env.is_empty() {
             crate::credential_roaming::isolate_borrowed_command(&mut command);

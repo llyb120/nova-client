@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { win32 } from "node:path";
 import { createInterface } from "node:readline";
 import { query, unstable_v2_createSession } from "@tencent-ai/agent-sdk";
+import { codebuddyNovaTools } from "./nova-tools-policy.mjs";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -118,6 +119,9 @@ async function runPrompt(lines, request) {
       }
     }
   })();
+  // Reasonix tool layer: nova-tools MCP (fast_context / find_symbols / edit_files)
+  // plus the Vega tool-selection policy appended to the CodeBuddy system prompt.
+  const novaTools = codebuddyNovaTools(request);
   activeQuery = query({
     prompt: promptMessages(request),
     options: {
@@ -131,6 +135,8 @@ async function runPrompt(lines, request) {
       pathToCodebuddyCode: cliPath,
       stderr: (data) => process.stderr.write(data),
       permissionMode: permissionModeFor(request.mode),
+      ...(novaTools.mcpServers ? { mcpServers: novaTools.mcpServers } : {}),
+      ...(novaTools.systemPrompt ? { systemPrompt: novaTools.systemPrompt } : {}),
       canUseTool: (tool, toolInput, options) => new Promise((resolve) => {
         pending.set(options.toolUseID, resolve);
         send({ type: "permission", permission: { id: options.toolUseID, permission: tool, metadata: toolInput } });

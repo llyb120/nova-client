@@ -2938,7 +2938,7 @@ fn pick_fallback_mode_id(unified: &str, known: &[String]) -> Option<String> {
 
 const NOVA_TOOLS_MCP_JS: &[u8] = include_bytes!("../resources/nova-tools-mcp.mjs");
 
-fn materialize_nova_tools_mcp(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn materialize_nova_tools_mcp(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = nova_data_dir(app).join("runtime");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 runtime 目录失败：{e}"))?;
     crate::nova_tools_napi_asset::materialize(&dir)?;

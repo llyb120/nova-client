@@ -25,6 +25,7 @@
     "alkaid": "node scripts/alkaid.mjs",
     "test:alkaid": "node --test scripts/alkaid.test.mjs",
     "test:nova-tools-mcp": "node --test scripts/nova-tools-mcp.test.mjs",
+    "test:nova-tools-policy": "node --test scripts/nova-tools-policy.test.mjs",
     "test:nova-tools-native": "npm run test:nova-tools-napi",
     "test:nova-tools-napi": "node --test scripts/nova-napi-tools.test.mjs",
     "test:nova-context-service": "node --test scripts/nova-context-service.test.mjs",

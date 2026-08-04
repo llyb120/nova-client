@@ -142,7 +142,7 @@ pub struct Settings {
     pub session_auto_cleanup_hours: u32,
     /// 语义检索开关（关 = 用内置 BM25 关键词检索；开需配置下面的 embedding 服务）
     pub semantic_enabled: bool,
-    /// 启用 Fast Context：为 Vega / Cursor / Devin 注入 fast_context / find_symbols 上下文检索工具；关闭则不附带。
+    /// 启用 Fast Context：为 Vega / Cursor / Devin / CodeBuddy / OpenCode 注入 fast_context / find_symbols 上下文检索工具；关闭则不附带。
     pub fast_context_enabled: bool,
     /// embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434）
     pub embed_endpoint: String,
