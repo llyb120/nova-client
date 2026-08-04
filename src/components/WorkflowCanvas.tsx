@@ -57,12 +57,6 @@ export function WorkflowCanvas(props: Props) {
 
   const center = (s: WorkflowStageDef): Point => ({ x: s.x + NODE_W / 2, y: s.y + NODE_H / 2 });
 
-  function startPos(): Point {
-    const entry = stageById(props.def.entry) ?? stages()[0];
-    return entry
-      ? { x: entry.x - TERM_W - 110, y: entry.y + (NODE_H - TERM_H) / 2 }
-      : { x: 20, y: 110 };
-  }
   function terminalPos(): Point {
     const maxX = stages().reduce((m, s) => Math.max(m, s.x + NODE_W), 0);
     const averageY = stages().length > 0
@@ -74,16 +68,6 @@ export function WorkflowCanvas(props: Props) {
     const p = terminalPos();
     return { x: p.x + TERM_W / 2, y: p.y + TERM_H / 2 };
   };
-  const startRoute = createMemo(() => {
-    const entry = stageById(props.def.entry) ?? stages()[0];
-    if (!entry) return null;
-    const start = startPos();
-    const from = { x: start.x + TERM_W, y: start.y + TERM_H / 2 };
-    const to = { x: entry.x, y: entry.y + NODE_H / 2 };
-    const dx = Math.max(36, Math.abs(to.x - from.x) / 2);
-    return `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${to.x - dx} ${to.y}, ${to.x} ${to.y}`;
-  });
-
   function toWorld(clientX: number, clientY: number): Point {
     const rect = svgRef?.getBoundingClientRect();
     const left = rect?.left ?? 0;
@@ -348,14 +332,7 @@ export function WorkflowCanvas(props: Props) {
             }}
           </Show>
 
-          {/* 开始/结束只表达流程状态，不承载配置或业务语义。 */}
-          <Show when={startRoute()}>
-            <path class="wf-edge-line" d={startRoute()!} marker-end="url(#wf-arrow)" />
-          </Show>
-          <g class="wf-terminal" transform={`translate(${startPos().x},${startPos().y})`}>
-            <rect class="wf-terminal-box" width={TERM_W} height={TERM_H} rx={20} />
-            <text class="wf-terminal-text" x={TERM_W / 2} y={25}>开始</text>
-          </g>
+          {/* 结束只表达流程状态；首节点由节点上的「起点」标记表达，在阶段编辑里设置。 */}
           <g class="wf-terminal" transform={`translate(${terminalPos().x},${terminalPos().y})`} onPointerDown={(e) => onTerminalPointerDown(e, WF_DONE)}>
             <rect class="wf-terminal-box" width={TERM_W} height={TERM_H} rx={20} />
             <text class="wf-terminal-text" x={TERM_W / 2} y={25}>结束</text>

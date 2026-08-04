@@ -51,10 +51,11 @@ export function WorkflowSettingsPanel() {
   const [selectedTransitionId, setSelectedTransitionId] = createSignal<string | null>(null);
   const [msg, setMsg] = createSignal("");
 
-  // 布局状态：抽屉 / 工具条折叠 / 编辑弹窗。
+  // 布局状态：抽屉 / 工具条折叠 / 阶段与连线各自独立的编辑弹窗。
   const [drawerOpen, setDrawerOpen] = createSignal(false);
   const [barCollapsed, setBarCollapsed] = createSignal(false);
-  const [inspectorOpen, setInspectorOpen] = createSignal(false);
+  const [stageModalOpen, setStageModalOpen] = createSignal(false);
+  const [edgeModalOpen, setEdgeModalOpen] = createSignal(false);
 
   const reload = () => setList(listWorkflows());
 
@@ -63,7 +64,8 @@ export function WorkflowSettingsPanel() {
     setSelectedStageId(null);
     setSelectedTransitionId(null);
     setMsg("");
-    setInspectorOpen(false);
+    setStageModalOpen(false);
+    setEdgeModalOpen(false);
     const found = list().find((w) => w.id === id);
     setDraft(found ? clone(found) : null);
   };
@@ -108,7 +110,9 @@ export function WorkflowSettingsPanel() {
     };
     setDraft({ ...d, stages: [...d.stages, stage] });
     setSelectedStageId(stage.id);
-    setInspectorOpen(true);
+    setSelectedTransitionId(null);
+    setStageModalOpen(true);
+    setEdgeModalOpen(false);
   }
 
   function deleteStage(stageId: string) {
@@ -125,7 +129,7 @@ export function WorkflowSettingsPanel() {
     setDraft({ ...d, stages, entry });
     if (selectedStageId() === stageId) {
       setSelectedStageId(null);
-      setInspectorOpen(false);
+      setStageModalOpen(false);
     }
   }
 
@@ -142,13 +146,6 @@ export function WorkflowSettingsPanel() {
           }
         : d,
     );
-  }
-  function addTransition(stageId: string) {
-    const d = draft();
-    if (!d) return;
-    const transition: WorkflowTransition = { id: newWorkflowId("t"), when: { kind: "always" }, to: WF_DONE, prompt: "" };
-    setDraft({ ...d, stages: d.stages.map((s) => (s.id === stageId ? { ...s, transitions: [...s.transitions, transition] } : s)) });
-    setSelectedTransitionId(transition.id);
   }
   function deleteTransition(stageId: string, transitionId: string) {
     setDraft((d) =>
@@ -207,12 +204,14 @@ export function WorkflowSettingsPanel() {
   function openStageModal(id: string) {
     setSelectedStageId(id);
     setSelectedTransitionId(null);
-    setInspectorOpen(true);
+    setStageModalOpen(true);
+    setEdgeModalOpen(false);
   }
   function openEdgeModal(stageId: string, id: string) {
     setSelectedStageId(stageId);
     setSelectedTransitionId(id);
-    setInspectorOpen(true);
+    setEdgeModalOpen(true);
+    setStageModalOpen(false);
   }
 
   const targetOptions = createMemo(() => {
@@ -341,8 +340,13 @@ export function WorkflowSettingsPanel() {
                 <span class="wf-bar-sep" />
                 <button
                   class="wf-chip"
-                  classList={{ active: inspectorOpen() }}
-                  onClick={() => setInspectorOpen(true)}
+                  classList={{ active: stageModalOpen() || edgeModalOpen() }}
+                  onClick={() => {
+                    const tv = selectedTransitionView();
+                    if (tv) openEdgeModal(tv.stage.id, tv.transition.id);
+                    else if (selectedStage()) openStageModal(selectedStage()!.id);
+                    else setStageModalOpen(true);
+                  }}
                   title="编辑选中的阶段或连线（也可双击画布节点/连线）"
                 >
                   <IconPencil size={13} /> 编辑
@@ -377,60 +381,25 @@ export function WorkflowSettingsPanel() {
         )}
       </Show>
 
-      {/* 阶段 / 连线 编辑弹窗 */}
-      <Show when={inspectorOpen() && draft()}>
-        <div class="modal-backdrop wf-modal-backdrop" onClick={() => setInspectorOpen(false)}>
+      {/* 阶段编辑弹窗（与连线弹窗相互独立） */}
+      <Show when={stageModalOpen() && draft()}>
+        <div class="modal-backdrop wf-modal-backdrop" onClick={() => setStageModalOpen(false)}>
           <div class="modal wf-modal wf-inspector-modal" onClick={(e) => e.stopPropagation()}>
             <div class="modal-head">
-              <span>
-                <Show when={selectedTransitionView()} fallback="编辑阶段">
-                  编辑连线
-                </Show>
-              </span>
-              <button class="icon-btn" onClick={() => setInspectorOpen(false)}><IconX size={16} /></button>
+              <span>编辑阶段</span>
+              <button class="icon-btn" onClick={() => setStageModalOpen(false)}><IconX size={16} /></button>
             </div>
             <div class="modal-body">
               <Show
                 when={selectedStage()}
                 fallback={
                   <div class="wf-inspector-empty">
-                    在画布中双击一个阶段或连线来编辑；或先单击选中再打开本窗口。拖动手柄圆圈可连线。
-                    <div style={{ "margin-top": "12px" }}>
-                      <button class="btn secondary small" disabled={draft()!.builtin} onClick={addStage}>+ 添加阶段</button>
-                    </div>
+                    在画布中双击节点来编辑；或先单击选中再打开本窗口。添加阶段请使用顶部工具条的「阶段」按钮。
                   </div>
                 }
               >
                 {(stage) => (
                   <div class="wf-stage-editor">
-                    {/* 若当前聚焦某条连线，先突出该连线编辑 */}
-                    <Show when={selectedTransitionView()}>
-                      {(tv) => (
-                        <div class="wf-modal-section">
-                          <div class="wf-modal-section-title">连线 · 来自「{tv().stage.name}」</div>
-                          <div class="wf-transition focused">
-                            <select
-                              class="field-input wf-select"
-                              value={tv().transition.to}
-                              disabled={draft()!.builtin}
-                              onChange={(e) => patchTransition(tv().stage.id, tv().transition.id, { to: e.currentTarget.value })}
-                            >
-                              <For each={targetOptions()}>{(opt) => <option value={opt.value}>{opt.label}</option>}</For>
-                            </select>
-                            <input
-                              class="field-input wf-edge-label-input"
-                              value={tv().transition.prompt ?? tv().transition.label ?? ""}
-                              disabled={draft()!.builtin}
-                              placeholder="什么时候走这条连线"
-                              onInput={(e) => patchTransition(tv().stage.id, tv().transition.id, { prompt: e.currentTarget.value })}
-                            />
-                            <button class="btn danger small" disabled={draft()!.builtin} onClick={() => deleteTransition(tv().stage.id, tv().transition.id)}>×</button>
-                          </div>
-                          <div class="field-hint">存在多个出口时，引擎会隐式要求当前节点判断并输出路由标识。</div>
-                        </div>
-                      )}
-                    </Show>
-
                     <div class="wf-modal-section">
                       <div class="wf-modal-section-title">阶段</div>
                       <div class="wf-inspector-row">
@@ -470,43 +439,10 @@ export function WorkflowSettingsPanel() {
                       </label>
                     </div>
 
-                    <div class="wf-modal-section">
-                      <div class="wf-transitions-head">
-                        <span class="wf-modal-section-title">连线</span>
-                        <button class="link-btn" disabled={draft()!.builtin} onClick={() => addTransition(stage().id)}>+ 添加</button>
-                      </div>
-                      <For each={stage().transitions}>
-                        {(t) => (
-                          <div
-                            classList={{ "wf-transition": true, selected: selectedTransitionId() === t.id }}
-                            onClick={() => setSelectedTransitionId(t.id)}
-                          >
-                            <select
-                              class="field-input wf-select"
-                              value={t.to}
-                              disabled={draft()!.builtin}
-                              onChange={(e) => patchTransition(stage().id, t.id, { to: e.currentTarget.value })}
-                            >
-                              <For each={targetOptions()}>{(opt) => <option value={opt.value}>{opt.label}</option>}</For>
-                            </select>
-                            <input
-                              class="field-input wf-edge-label-input"
-                              value={t.prompt ?? t.label ?? ""}
-                              disabled={draft()!.builtin}
-                              placeholder="什么时候走这条连线"
-                              onInput={(e) => patchTransition(stage().id, t.id, { prompt: e.currentTarget.value })}
-                            />
-                            <button class="btn danger small" disabled={draft()!.builtin} onClick={(e) => { e.stopPropagation(); deleteTransition(stage().id, t.id); }}>×</button>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-
                     <div class="wf-modal-foot">
                       <button class="btn danger small" disabled={draft()!.builtin} onClick={() => deleteStage(stage().id)}>删除该阶段</button>
                       <span class="wf-zoom-spacer" />
-                      <button class="btn secondary small" disabled={draft()!.builtin} onClick={addStage}>+ 添加阶段</button>
-                      <button class="btn primary small" onClick={() => setInspectorOpen(false)}>完成</button>
+                      <button class="btn primary small" onClick={() => setStageModalOpen(false)}>完成</button>
                     </div>
                   </div>
                 )}
@@ -514,6 +450,50 @@ export function WorkflowSettingsPanel() {
             </div>
           </div>
         </div>
+      </Show>
+
+      {/* 连线编辑弹窗（与阶段弹窗相互独立） */}
+      <Show when={edgeModalOpen() && selectedTransitionView()}>
+        {(tv) => (
+          <div class="modal-backdrop wf-modal-backdrop" onClick={() => setEdgeModalOpen(false)}>
+            <div class="modal wf-modal wf-inspector-modal" onClick={(e) => e.stopPropagation()}>
+              <div class="modal-head">
+                <span>编辑连线 · 来自「{tv().stage.name}」</span>
+                <button class="icon-btn" onClick={() => setEdgeModalOpen(false)}><IconX size={16} /></button>
+              </div>
+              <div class="modal-body">
+                <div class="wf-stage-editor">
+                  <div class="wf-modal-section">
+                    <div class="wf-transition focused">
+                      <select
+                        class="field-input wf-select"
+                        value={tv().transition.to}
+                        disabled={draft()!.builtin}
+                        onChange={(e) => patchTransition(tv().stage.id, tv().transition.id, { to: e.currentTarget.value })}
+                      >
+                        <For each={targetOptions()}>{(opt) => <option value={opt.value}>{opt.label}</option>}</For>
+                      </select>
+                      <input
+                        class="field-input wf-edge-label-input"
+                        value={tv().transition.prompt ?? tv().transition.label ?? ""}
+                        disabled={draft()!.builtin}
+                        placeholder="什么时候走这条连线"
+                        onInput={(e) => patchTransition(tv().stage.id, tv().transition.id, { prompt: e.currentTarget.value })}
+                      />
+                    </div>
+                    <div class="field-hint">存在多个出口时，引擎会隐式要求当前节点判断并输出路由标识。</div>
+                  </div>
+
+                  <div class="wf-modal-foot">
+                    <button class="btn danger small" disabled={draft()!.builtin} onClick={() => deleteTransition(tv().stage.id, tv().transition.id)}>删除该连线</button>
+                    <span class="wf-zoom-spacer" />
+                    <button class="btn primary small" onClick={() => setEdgeModalOpen(false)}>完成</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </Show>
 
     </div>
