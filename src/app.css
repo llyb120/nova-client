@@ -1246,6 +1246,37 @@ button {
 .repo-time-node.restoring .repo-time-dot {
   animation: time-now-pulse .8s ease-in-out infinite;
 }
+/* 时光笔记：在世界线标题下方的小按钮 */
+.repo-time-notes {
+  margin-top: 2px;
+  padding: 2px 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 9px;
+  letter-spacing: .08em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color .16s, border-color .16s;
+}
+.repo-time-notes:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.repo-time-notes:disabled {
+  opacity: .45;
+  cursor: default;
+}
+/* 结局标记：成功绿、失败红，直接给节点点上色 */
+.repo-time-node.outcome-success .repo-time-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 1px var(--green);
+}
+.repo-time-node.outcome-failure .repo-time-dot {
+  background: var(--red);
+  box-shadow: 0 0 0 1px var(--red);
+}
 .repo-time-context-backdrop {
   position: fixed;
   z-index: 2147483000;

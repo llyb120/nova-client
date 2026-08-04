@@ -2664,6 +2664,26 @@ fn get_time_machine_timeline(
 }
 
 #[tauri::command]
+fn get_time_machine_training_digest(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<time_machine::TrainingDigest, String> {
+    let _guard = state.time_machine_lock.lock().unwrap();
+    time_machine::timeline_training_digest(&state.config_dir, &thread_id)
+}
+
+#[tauri::command]
+fn set_time_machine_checkpoint_outcome(
+    state: State<'_, AppState>,
+    thread_id: String,
+    checkpoint_id: String,
+    outcome: Option<String>,
+) -> Result<time_machine::TimelineView, String> {
+    let _guard = state.time_machine_lock.lock().unwrap();
+    time_machine::set_checkpoint_outcome(&state.config_dir, &thread_id, &checkpoint_id, outcome)
+}
+
+#[tauri::command]
 fn get_time_machine_checkpoint_preview(
     state: State<'_, AppState>,
     thread_id: String,
@@ -5684,6 +5704,8 @@ pub fn run() {
             open_url,
             create_time_machine_checkpoint,
             get_time_machine_timeline,
+            get_time_machine_training_digest,
+            set_time_machine_checkpoint_outcome,
             get_time_machine_checkpoint_preview,
             restore_time_machine_checkpoint,
             delete_time_machine_context,

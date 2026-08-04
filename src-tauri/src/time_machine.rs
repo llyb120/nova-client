@@ -47,6 +47,9 @@ struct Checkpoint {
     thread_snapshot: Thread,
     #[serde(default)]
     automatic: bool,
+    /// 用户对该分支结局的标记（"success" / "failure"），仅作为蒸馏经验的提示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -107,6 +110,17 @@ pub struct CheckpointSummary {
     pub changed_files: usize,
     pub automatic: bool,
     pub prompts: Vec<PromptSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+/// 世界线「时光笔记」材料：分支树摘要写入文件，只把路径交给训练会话，
+/// 让 agent 自己读文件探索；另附 skills 安装目录。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingDigest {
+    pub digest_path: String,
+    pub skills_dir: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -324,6 +338,7 @@ fn view_for(timeline: &Timeline, thread_id: &str) -> TimelineView {
                 created_at: checkpoint.created_at,
                 changed_files: checkpoint.entries.len(),
                 automatic: checkpoint.automatic,
+                outcome: checkpoint.outcome.clone(),
                 prompts: checkpoint
                     .thread_snapshot
                     .items
@@ -422,6 +437,7 @@ fn append_checkpoint_captured(
         workspace_captured,
         thread_snapshot: thread.clone(),
         automatic,
+        outcome: None,
     };
     if !timeline.thread_ids.iter().any(|id| id == &thread.id) {
         timeline.thread_ids.push(thread.id.clone());
@@ -879,6 +895,238 @@ pub fn restore_checkpoint(
     ))
 }
 
+/// 给指定时间点打结局标记（"success" / "failure"）；传 None 清除标记。
+pub fn set_checkpoint_outcome(
+    data_dir: &Path,
+    thread_id: &str,
+    checkpoint_id: &str,
+    outcome: Option<String>,
+) -> Result<TimelineView, String> {
+    let mut store = load_store(data_dir)?;
+    let index = timeline_index(&store, thread_id).ok_or("会话没有世界线时间线")?;
+    let checkpoint = store.timelines[index]
+        .checkpoints
+        .iter_mut()
+        .find(|checkpoint| checkpoint.id == checkpoint_id)
+        .ok_or("时间点不存在")?;
+    checkpoint.outcome = outcome;
+    save_store(data_dir, &store)?;
+    Ok(view_for(&store.timelines[index], thread_id))
+}
+
+// ---- 世界线经验蒸馏：把整棵分支树完整导出为训练材料，不做任何截断 ----
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn format_local_time(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| ms.to_string())
+}
+
+fn item_type_tag(item: &Item) -> &'static str {
+    match item {
+        Item::User { .. } => "user",
+        Item::Assistant { .. } => "assistant",
+        Item::Thought { .. } => "thought",
+        Item::Tool { .. } => "tool",
+        Item::System { .. } => "system",
+        Item::Turn { .. } => "turn",
+    }
+}
+
+/// 父子快照的最长公共前缀长度；前缀之后的条目即该分支相对父节点的新增轨迹。
+/// 历史分叉会复用 item id，因此同时比对 id 与条目类型。
+fn common_prefix_len(parent: &[Item], child: &[Item]) -> usize {
+    parent
+        .iter()
+        .zip(child.iter())
+        .take_while(|(a, b)| a.id() == b.id() && item_type_tag(a) == item_type_tag(b))
+        .count()
+}
+
+fn tool_output_text(content: &[serde_json::Value]) -> String {
+    let mut parts = Vec::new();
+    for value in content {
+        match value {
+            serde_json::Value::String(text) => parts.push(text.clone()),
+            serde_json::Value::Object(object) => {
+                if let Some(text) = object.get("text").and_then(serde_json::Value::as_str) {
+                    parts.push(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
+fn item_digest(item: &Item) -> Option<String> {
+    match item {
+        Item::User { text, .. } => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(format!("- [用户指令] {text}"))
+            }
+        }
+        Item::Assistant { text, .. } => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(format!("- [助手] {text}"))
+            }
+        }
+        Item::Tool { call, .. } => {
+            let mut line = format!("- [工具|{}|{}] {}", call.kind, call.status, call.title);
+            let failed = call.status != "completed"
+                && call.status != "in_progress"
+                && call.status != "pending";
+            if failed {
+                let output = tool_output_text(&call.content);
+                let output = output.trim();
+                if !output.is_empty() {
+                    line.push_str(&format!("；输出：{output}"));
+                }
+            }
+            Some(line)
+        }
+        Item::System { .. } | Item::Thought { .. } | Item::Turn { .. } => None,
+    }
+}
+
+fn outcome_label(outcome: &Option<String>) -> &'static str {
+    match outcome.as_deref() {
+        Some("success") => "，用户标记：成功",
+        Some("failure") => "，用户标记：失败",
+        _ => "",
+    }
+}
+
+/// 生成整条世界线的「时光笔记」材料并写入文件：
+/// 分支树 + 每个节点相对父节点的新增轨迹摘要。
+pub fn timeline_training_digest(
+    data_dir: &Path,
+    thread_id: &str,
+) -> Result<TrainingDigest, String> {
+    let store = load_store(data_dir)?;
+    let index = timeline_index(&store, thread_id).ok_or("会话没有世界线时间线")?;
+    let timeline = &store.timelines[index];
+    if timeline.checkpoints.is_empty() {
+        return Err("世界线还没有时间点，无法记录时光笔记".into());
+    }
+
+    let skills_dir = crate::skills::ensure_skills_dir(data_dir)
+        .to_string_lossy()
+        .to_string();
+    let first = &timeline.checkpoints[0];
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# 时光笔记材料\n\n- 项目工作目录：{}\n- 时间点总数：{}\n- 节点以 8 位短号标识，树与详情一一对应。\n",
+        first.thread_snapshot.cwd,
+        timeline.checkpoints.len()
+    ));
+
+    // 分支树：按存储顺序构建父子关系，从根节点 DFS 输出缩进树。
+    let ids: Vec<&str> = timeline
+        .checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.id.as_str())
+        .collect();
+    let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (checkpoint_index, checkpoint) in timeline.checkpoints.iter().enumerate() {
+        match checkpoint
+            .parent_id
+            .as_deref()
+            .filter(|parent_id| ids.contains(parent_id))
+        {
+            Some(parent_id) => children.entry(parent_id).or_default().push(checkpoint_index),
+            None => roots.push(checkpoint_index),
+        }
+    }
+    out.push_str("\n## 世界线树\n\n");
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|index| (*index, 0)).collect();
+    while let Some((checkpoint_index, depth)) = stack.pop() {
+        let checkpoint = &timeline.checkpoints[checkpoint_index];
+        out.push_str(&format!(
+            "{}- #{} 「{}」（{}{}）\n",
+            "  ".repeat(depth),
+            short_id(&checkpoint.id),
+            checkpoint.title.trim(),
+            format_local_time(checkpoint.created_at),
+            outcome_label(&checkpoint.outcome),
+        ));
+        if let Some(kids) = children.get(checkpoint.id.as_str()) {
+            for kid in kids.iter().rev() {
+                stack.push((*kid, depth + 1));
+            }
+        }
+    }
+
+    // 逐节点详情：只保留相对父节点的新增条目，避免共同历史重复占用篇幅。
+    out.push_str("\n## 各节点相对父节点的新增轨迹\n");
+    let by_id: HashMap<&str, &Checkpoint> = timeline
+        .checkpoints
+        .iter()
+        .map(|checkpoint| (checkpoint.id.as_str(), checkpoint))
+        .collect();
+    for checkpoint in &timeline.checkpoints {
+        let edge_start = checkpoint
+            .parent_id
+            .as_deref()
+            .and_then(|parent_id| by_id.get(parent_id))
+            .map(|parent| {
+                common_prefix_len(
+                    &parent.thread_snapshot.items,
+                    &checkpoint.thread_snapshot.items,
+                )
+            })
+            .unwrap_or(0);
+        let edge = &checkpoint.thread_snapshot.items[edge_start.min(checkpoint.thread_snapshot.items.len())..];
+        out.push_str(&format!(
+            "\n### #{} 「{}」{}\n",
+            short_id(&checkpoint.id),
+            checkpoint.title.trim(),
+            outcome_label(&checkpoint.outcome),
+        ));
+        if edge.is_empty() {
+            out.push_str("- （无新增轨迹）\n");
+            continue;
+        }
+        let mut shown = 0;
+        for item in edge {
+            if let Some(line) = item_digest(item) {
+                out.push_str(&line);
+                out.push('\n');
+                shown += 1;
+            }
+        }
+        if shown == 0 {
+            out.push_str("- （仅思考/内部事件，无可展示轨迹）\n");
+        }
+    }
+
+    // 材料写盘，训练会话只拿路径自行读文件探索，提示词不内嵌内容。
+    let notes_dir = time_machine_dir(data_dir).join("training-notes");
+    fs::create_dir_all(&notes_dir).map_err(|e| format!("创建时光笔记目录失败：{e}"))?;
+    let digest_path = notes_dir.join(format!("{thread_id}.md"));
+    fs::write(&digest_path, &out).map_err(|e| format!("写入时光笔记材料失败：{e}"))?;
+
+    Ok(TrainingDigest {
+        digest_path: digest_path.to_string_lossy().to_string(),
+        skills_dir,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1274,6 +1522,61 @@ mod tests {
         let forked = create_checkpoint(&data, &fork, true).unwrap();
         let latest = forked.checkpoints.last().unwrap();
         assert_eq!(latest.parent_id.as_deref(), Some(first_id.as_str()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn training_digest_covers_tree_edges_and_outcome_labels() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-digest-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let data = root.join("data");
+        fs::create_dir_all(&project).unwrap();
+
+        let mut thread = Thread::new(
+            project.to_string_lossy().to_string(),
+            crate::threads::AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        thread.push_user("实现登录功能".into(), Vec::new());
+        thread.items.push(Item::Assistant {
+            id: thread.next_item_id(),
+            text: "已实现登录".into(),
+            ts: now_ms(),
+        });
+        let first = create_checkpoint(&data, &thread, false).unwrap();
+        let first_id = first.current_checkpoint_id.unwrap();
+
+        // 当前分支继续走成功路线
+        thread.push_user("补上测试".into(), Vec::new());
+        create_checkpoint(&data, &thread, false).unwrap();
+
+        // 从第一个节点分叉出失败路线
+        let (mut fork, _) = restore_checkpoint(&data, &first_id, &thread, false).unwrap();
+        fork.push_user("直接重写整个模块".into(), Vec::new());
+        create_checkpoint(&data, &fork, false).unwrap();
+        let fork_view = get_timeline(&data, &fork.id).unwrap().unwrap();
+        let failure_id = fork_view.current_checkpoint_id.unwrap();
+        set_checkpoint_outcome(&data, &fork.id, &failure_id, Some("failure".into())).unwrap();
+
+        let digest = timeline_training_digest(&data, &thread.id).unwrap();
+        let content = fs::read_to_string(&digest.digest_path).unwrap();
+        assert!(content.contains("# 时光笔记材料"));
+        assert!(content.contains("## 世界线树"));
+        assert!(content.contains("实现登录功能"));
+        assert!(content.contains("补上测试"));
+        assert!(content.contains("直接重写整个模块"));
+        assert!(content.contains("用户标记：失败"));
+        assert!(content.contains("项目工作目录"));
+        assert!(!digest.skills_dir.is_empty());
+        // 再次生成应覆盖同名文件，不产生多余副本
+        let again = timeline_training_digest(&data, &thread.id).unwrap();
+        assert_eq!(again.digest_path, digest.digest_path);
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -2,19 +2,22 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { api } from "../ipc";
+import { buildTimeNotesPrompt } from "../builtinPrompts";
 import {
   compactThread,
   chatScrollToBottomSignal,
+  createThread,
   openThread,
   pickThreadModel,
   refreshThreads,
+  sendPrompt,
   setState,
   setTimeMachineEditTarget,
   state,
   timeMachineChangedSignal,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
-import type { Item, Thread, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
+import type { AgentKind, Item, Thread, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
@@ -22,6 +25,7 @@ import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconSto
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { ShareModal } from "./ShareModal";
+import { TimeNotesModal } from "./TimeNotesModal";
 import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
 
@@ -850,6 +854,40 @@ export function ChatView() {
     if (mode === "down") return prompts.slice(index + 1, index + 1 + count);
     return prompts.slice(index + 1);
   };
+  const [showTimeNotes, setShowTimeNotes] = createSignal(false);
+  const startTimeNotes = async (skillName: string, agentKind: AgentKind, model: string) => {
+    const threadId = state.currentId;
+    if (!threadId || restoringCheckpoint()) return;
+    // 还没有任何时间点时先给当前状态补一个，让整段会话轨迹成为可分析的材料。
+    // timeline 为 null 可能只是还在加载，先重拉一次再决定是否需要补建。
+    let timelineValue = timeline();
+    if (!timelineValue) {
+      timelineValue = await api.getTimeMachineTimeline(threadId);
+      setTimeline(timelineValue);
+    }
+    if (!timelineValue || timelineValue.checkpoints.length === 0) {
+      timelineValue = await api.createTimeMachineCheckpoint(threadId);
+      setTimeline(timelineValue);
+    }
+    const prepared = await api.getTimeMachineTrainingDigest(threadId);
+    const meta = state.threads.find((t) => t.id === threadId);
+    const cwd = meta?.cwd ?? state.cwd;
+    setShowTimeNotes(false);
+    await createThread(cwd, agentKind, model, state.mode, "", false);
+    await sendPrompt(buildTimeNotesPrompt(skillName, prepared.digestPath, prepared.skillsDir));
+  };
+  const markOutcome = async (node: GraphNode, outcome: string | null) => {
+    const checkpoint = node.checkpoint ?? node.previewCheckpoint;
+    const threadId = state.currentId;
+    if (!checkpoint || !threadId) return;
+    setContextMenu(null);
+    try {
+      const updated = await api.setTimeMachineCheckpointOutcome(threadId, checkpoint.id, outcome);
+      setTimeline(updated);
+    } catch (error) {
+      await message(String(error), { kind: "error" });
+    }
+  };
   const deleteContext = async (node: GraphNode, mode: ContextDeleteMode) => {
     let count = 0;
     if (mode === "up" || mode === "down") {
@@ -1056,6 +1094,13 @@ export function ChatView() {
       <Show when={showShare() && state.currentId}>
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
       </Show>
+      <Show when={showTimeNotes() && state.currentId}>
+        <TimeNotesModal
+          defaultName={state.title.trim()}
+          onConfirm={startTimeNotes}
+          onClose={() => setShowTimeNotes(false)}
+        />
+      </Show>
 
       <div class="chat-shell">
         <div class="chat-primary">
@@ -1143,6 +1188,15 @@ export function ChatView() {
           <div class="repo-time-machine-label">
             <IconStopwatch size={17} />
             <span>{restoringCheckpoint() ? "跳转中…" : "世界线"}</span>
+            <button
+              type="button"
+              class="repo-time-notes"
+              title="把这条世界线的经验沉淀为一个 skill：新开一个训练会话自行阅读并逐级分析"
+              disabled={!!restoringCheckpoint()}
+              onClick={() => setShowTimeNotes(true)}
+            >
+              时光笔记
+            </button>
           </div>
           <div class="repo-time-machine-track">
             <div
@@ -1171,6 +1225,8 @@ export function ChatView() {
                       restoring: node.id === restoringCheckpoint(),
                       "current-path": node.onCurrentPath,
                       "off-current-path": !node.onCurrentPath,
+                      "outcome-success": (node.checkpoint ?? node.previewCheckpoint)?.outcome === "success",
+                      "outcome-failure": (node.checkpoint ?? node.previewCheckpoint)?.outcome === "failure",
                     }}
                     style={{ left: `${node.x}px`, top: `${node.y}px` }}
                     title={node.title}
@@ -1223,6 +1279,14 @@ export function ChatView() {
                 }}
                 onMouseDown={(event) => event.stopPropagation()}
               >
+                <Show when={menu.node.checkpoint ?? menu.node.previewCheckpoint}>
+                  <button onClick={() => void markOutcome(menu.node, "success")}>标记成功</button>
+                  <button onClick={() => void markOutcome(menu.node, "failure")}>标记失败</button>
+                  <Show when={(menu.node.checkpoint ?? menu.node.previewCheckpoint)?.outcome}>
+                    <button onClick={() => void markOutcome(menu.node, null)}>清除结局标记</button>
+                  </Show>
+                  <div class="repo-time-context-hint">结局标记会作为时光笔记的提示</div>
+                </Show>
                 <button disabled={contextPrompts(menu.node, "to-start").length === 0} onClick={() => void deleteContext(menu.node, "to-start")}>删除到开始</button>
                 <button disabled={contextPrompts(menu.node, "up", 1).length === 0} onClick={() => void deleteContext(menu.node, "up")}>向上删除 n 个</button>
                 <button onClick={() => void deleteContext(menu.node, "self")}>删除自身</button>

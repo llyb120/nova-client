@@ -145,6 +145,14 @@ export interface TimeMachineCheckpoint {
   changedFiles: number;
   automatic: boolean;
   prompts: TimeMachinePrompt[];
+  /** 用户对该分支结局的标记："success" / "failure"，未标记时缺省。 */
+  outcome?: string | null;
+}
+
+/** 世界线「时光笔记」材料：分支树摘要文件路径 + skills 安装目录。 */
+export interface TimeMachineTrainingDigest {
+  digestPath: string;
+  skillsDir: string;
 }
 
 export interface TimeMachineTimeline {

@@ -38,6 +38,7 @@ import type {
   TimeMachinePrompt,
   TimeMachineRestoreResult,
   TimeMachineTimeline,
+  TimeMachineTrainingDigest,
   UpdateInfo,
   WorkHours,
   WorktreeRecord,
@@ -55,6 +56,18 @@ export const api = {
     invoke<TimeMachineTimeline>("create_time_machine_checkpoint", { threadId }),
   getTimeMachineTimeline: (threadId: string) =>
     invoke<TimeMachineTimeline | null>("get_time_machine_timeline", { threadId }),
+  getTimeMachineTrainingDigest: (threadId: string) =>
+    invoke<TimeMachineTrainingDigest>("get_time_machine_training_digest", { threadId }),
+  setTimeMachineCheckpointOutcome: (
+    threadId: string,
+    checkpointId: string,
+    outcome: string | null,
+  ) =>
+    invoke<TimeMachineTimeline>("set_time_machine_checkpoint_outcome", {
+      threadId,
+      checkpointId,
+      outcome,
+    }),
   getTimeMachineCheckpointPreview: (threadId: string, checkpointId: string) =>
     invoke<Thread>("get_time_machine_checkpoint_preview", { threadId, checkpointId }),
   restoreTimeMachineCheckpoint: (threadId: string, checkpointId: string) =>
