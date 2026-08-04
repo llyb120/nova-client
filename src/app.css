@@ -1246,9 +1246,9 @@ button {
 .repo-time-node.restoring .repo-time-dot {
   animation: time-now-pulse .8s ease-in-out infinite;
 }
-/* 时光笔记：在世界线标题下方的小按钮 */
+/* 时光笔记：在秒表图标上方的小按钮 */
 .repo-time-notes {
-  margin-top: 2px;
+  margin-bottom: 2px;
   padding: 2px 7px;
   border: 1px solid var(--border-strong);
   border-radius: 999px;

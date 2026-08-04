@@ -1186,8 +1186,6 @@ export function ChatView() {
           aria-label="会话与工作目录分支时间线"
         >
           <div class="repo-time-machine-label">
-            <IconStopwatch size={17} />
-            <span>{restoringCheckpoint() ? "跳转中…" : "世界线"}</span>
             <button
               type="button"
               class="repo-time-notes"
@@ -1197,6 +1195,8 @@ export function ChatView() {
             >
               时光笔记
             </button>
+            <IconStopwatch size={17} />
+            <span>{restoringCheckpoint() ? "跳转中…" : "世界线"}</span>
           </div>
           <div class="repo-time-machine-track">
             <div
