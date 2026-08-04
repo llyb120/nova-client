@@ -3,7 +3,7 @@ import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
-import { displayToolTitle, stripAnsi } from "../utils";
+import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
 import { fmtDuration, fmtTokens, turnTokenTitle } from "./TurnGroup";
@@ -861,7 +861,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (const item of g.body) {
       if (item.type === "tool") {
         parts.push(
-          `tool:${item.id}:${item.status}:${item.title}:${item.content.length}:${item.locations.length}:${!!state.expanded[`tool-${item.id}`]}`,
+          `tool:${item.id}:${item.status}:${item.title}:${item.content.length}:${item.locations.length}:${item.rawInput !== undefined}:${!!state.expanded[`tool-${item.id}`]}`,
         );
       } else if ("text" in item) {
         parts.push(
@@ -1354,10 +1354,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const busy = item.status === "pending" || item.status === "in_progress";
     const defaultOpen = active || busy;
     const open = isExpanded(key, defaultOpen);
-    const hasBody = item.content.length > 0 || item.locations.length > 0
+    const contentBlocks = item.content.filter((block) => !isTrivialToolOutput(item, block));
+    const hasBody = contentBlocks.length > 0 || item.locations.length > 0
       || item.rawInput !== undefined || item.rawOutput !== undefined;
 
     const label = displayToolTitle(stripAnsi(item.title || item.kind));
+    const detail = toolHeadlineDetail(item);
     // .tool-row margin 1px 0; .tool-line padding 3px 8px; min-height 26; gap 8
     const toolH = 26;
 
@@ -1366,7 +1368,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       text: label, color: item.status === "failed" ? p.red : p.dim,
       fontSize: 12, font: p.mono, hoverBg: p.hover, borderRadius: 7,
       cursor: hasBody ? "pointer" : "default",
-      data: { open, busy, hasBody, kind: item.kind, status: item.status },
+      data: { open, busy, hasBody, kind: item.kind, status: item.status, detail },
       clickAction: hasBody ? () => {
         const liveBusy = item.status === "pending" || item.status === "in_progress";
         toggleExpanded(key, !isExpanded(key, liveBusy));
@@ -1407,7 +1409,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
 
       // content: .tool-output padding 10px; line-height 1.55; max-height 320
-      for (const content of item.content) {
+      for (const content of contentBlocks) {
         if (content.type === "diff") {
           const diff = content as { type: "diff"; path: string; oldText?: string | null; newText: string };
           const preview = (diff.oldText ?? "").slice(0, 200) + "\n→\n" + diff.newText.slice(0, 200);
@@ -1706,7 +1708,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function paintToolHeader(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette) {
-    const { open, busy, hasBody, kind, status } = b.data as { open: boolean; busy: boolean; hasBody: boolean; kind: string; status: string };
+    const { open, busy, hasBody, kind, status, detail } = b.data as { open: boolean; busy: boolean; hasBody: boolean; kind: string; status: string; detail?: string };
     // padding 3px 8px; gap 8 — match DOM .tool-line: icon → title → busy → chevron
     const padX = 8;
     const gap = 8;
@@ -1724,15 +1726,43 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.fillStyle = b.color || p.dim;
     ctx.textBaseline = "middle";
     const maxTextW = Math.max(20, b.w - (textX - bx) - trailReserve);
+    // 有 detail 时标题只占部分宽度，给详情文本留空间（对齐 DOM .tool-headline-detail）
+    const labelMaxW = detail ? Math.max(60, Math.floor(maxTextW * 0.45)) : maxTextW;
     let label = b.text!;
-    if (measure(label, b.fontSize!, b.font!) > maxTextW) {
-      while (label.length > 1 && measure(label + "…", b.fontSize!, b.font!) > maxTextW) label = label.slice(0, -1);
+    if (measure(label, b.fontSize!, b.font!) > labelMaxW) {
+      while (label.length > 1 && measure(label + "…", b.fontSize!, b.font!) > labelMaxW) label = label.slice(0, -1);
       label += "…";
     }
     fillTextCrisp(ctx, label, textX, midY);
 
+    const labelW = measure(label, b.fontSize!, b.font!);
+    // detail：标题后 gap 8 + 1px 分隔线 + padding 8（对齐 DOM .tool-title + .tool-headline-detail）
+    if (detail) {
+      const sepX = textX + labelW + gap;
+      const detailX = sepX + 1 + 8;
+      const detailMaxW = bx + b.w - trailReserve - detailX;
+      if (detailMaxW > 24) {
+        let text = detail;
+        if (measure(text, b.fontSize!, b.font!) > detailMaxW) {
+          while (text.length > 1 && measure(text + "…", b.fontSize!, b.font!) > detailMaxW) text = text.slice(0, -1);
+          text += "…";
+        }
+        ctx.save();
+        ctx.strokeStyle = p.border;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        const sx = snap(sepX);
+        ctx.moveTo(sx, midY - 6);
+        ctx.lineTo(sx, midY + 6);
+        ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = p.faint;
+        fillTextCrisp(ctx, text, detailX, midY);
+      }
+    }
+
     // trailing status / chevron sit after the label (not flush-right)
-    let nextX = textX + measure(label, b.fontSize!, b.font!) + gap;
+    let nextX = textX + labelW + gap;
     if (busy) {
       hasBusy = true;
       const cx = nextX + 6;

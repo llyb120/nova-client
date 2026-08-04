@@ -4,7 +4,7 @@ import { createEffect, createMemo, createSignal, For, Index, Match, Show, Switch
 import { api } from "../ipc";
 import { isExpanded, state, toggleExpanded } from "../store";
 import type { ToolContent, ToolItem } from "../types";
-import { displayToolTitle, stripAnsi } from "../utils";
+import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { createFileContextMenu } from "./FileContextMenu";
 import { relPath } from "./EditedFilesCard";
 import { IconCheck, IconChevron, IconCopy, toolIcon } from "./icons";
@@ -134,31 +134,6 @@ function toolSummary(item: ToolItem): string {
   return rawPreview(item.rawInput) || rawPreview(item.rawOutput);
 }
 
-function inputValue(input: unknown, keys: string[]): string {
-  if (!isRecord(input)) return "";
-  for (const key of keys) {
-    const value = compactValue(input[key]);
-    if (value) return value;
-  }
-  return "";
-}
-
-function isCommandTool(item: ToolItem): boolean {
-  const title = stripAnsi(item.title || "").trim();
-  return item.kind === "execute" || /^(?:ran|run|running|execute(?:d|ing)?) command$/i.test(title);
-}
-
-function headlineDetail(item: ToolItem): string {
-  if (isCommandTool(item)) return inputValue(item.rawInput, ["command", "cmd"]);
-  return inputValue(item.rawInput, ["path", "file_path", "query", "q", "url", "symbol"]);
-}
-
-function isTrivialSuccessOutput(item: ToolItem, block: ToolContent): boolean {
-  if (item.status !== "completed" || block.type !== "content") return false;
-  const inner = (block as { content?: { type?: string; text?: string } }).content;
-  return inner?.type === "text" && /^Exited with code 0\.?$/i.test(stripAnsi(inner.text ?? "").trim());
-}
-
 function DiffView(props: {
   path: string;
   oldText?: string | null;
@@ -265,7 +240,7 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
   const open = () => isExpanded(key(), defaultOpen());
   const showRaw = () => isExpanded(rawKey());
   const content = createMemo(() =>
-    props.item.content.filter((block) => !isTrivialSuccessOutput(props.item, block)),
+    props.item.content.filter((block) => !isTrivialToolOutput(props.item, block)),
   );
   const hasBody = createMemo(
     () =>
@@ -282,7 +257,7 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
     }),
   );
   const summary = createMemo(() => toolSummary(props.item));
-  const detail = createMemo(() => headlineDetail(props.item));
+  const detail = createMemo(() => toolHeadlineDetail(props.item));
 
   // 文件编辑统计 +N -N（codex 风格）
   const stats = createMemo(() => {
