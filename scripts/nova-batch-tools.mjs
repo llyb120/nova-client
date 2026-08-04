@@ -1,8 +1,8 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
-import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
-import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
+import { findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { callNapiTool, callNapiToolOrFallback } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
 
 function resolveInputPath(root, input) {
@@ -74,6 +74,7 @@ export function createNovaBatchTools(cwd, options = {}) {
           files: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "明确要纳入上下文的仓库相对文件路径" },
           maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "输出字符预算，通常无需设置" },
           budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，通常无需设置" },
+          coupling: { type: "boolean", description: "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" },
         },
         anyOf: [
           { required: ["keywords"] },
@@ -85,7 +86,8 @@ export function createNovaBatchTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = normalizeFastContextArgs(params);
-        return await callContextToolOrLocal("fast_context", root, args, () => contextBundle(args, root));
+        // fast_context 只有 Rust native 实现（JS 镜像已移除）；无全局 service 时直走 native。
+    return await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
       },
     };
     tools.find_symbols = {

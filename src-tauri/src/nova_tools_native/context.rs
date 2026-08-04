@@ -17,7 +17,7 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 // Keep in lockstep with scripts/ctx-index.mjs INDEX_CACHE_VERSION.
-const CACHE_VERSION: u32 = 12;
+const CACHE_VERSION: u32 = 13;
 const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 8_000;
 const MAX_HITS_PER_FILE: usize = 60;
@@ -62,6 +62,9 @@ struct Symbol {
 struct ImportRef {
     name: String,
     from: String,
+    /// `import { a as b }` / `use x::a as b` 里的原始名 a；非别名导入为 None。
+    /// 反向 import 图用它把别名调用点归到真实符号上。
+    orig: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +103,18 @@ struct IndexView {
     imports: HashMap<String, HashMap<String, String>>,
 }
 
+/// 反向 import 图的一条边：importer 文件以本地名 local 引用了目标文件。
+#[derive(Debug, Clone)]
+struct ReverseImport {
+    importer: String,
+    local: String,
+    orig: Option<String>,
+}
+
+/// 目标文件 → 引用方清单。由全量增量缓存构建（不限于本次闭包），
+/// 使用方按当前文件内容复核，陈旧条目自然失效。
+type ReverseMap = HashMap<String, Vec<ReverseImport>>;
+
 #[derive(Clone)]
 struct Source {
     lines: Vec<String>,
@@ -124,6 +139,20 @@ struct PlannedFile {
     full: bool,
     blocks: Vec<Block>,
     rank: usize,
+}
+
+/// 打包期因 soft 字节顶被暂缓的块；回填阶段按序补回。
+struct Deferred {
+    file: String,
+    block: Block,
+    rank: usize,
+}
+
+/// shrink 期被删的内容：整个 FULL 文件或单个块。删除顺序即价值升序，
+/// 回填时后删的（相对高价值）优先补回。
+enum Dropped {
+    Full(PlannedFile),
+    Block(String, Block),
 }
 
 #[derive(Clone)]
@@ -988,6 +1017,7 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
                     out.push(ImportRef {
                         name: local.into(),
                         from: format!("{base}::{orig}"),
+                        orig: (orig != local).then(|| orig.to_string()),
                     });
                 }
             } else if let Some(pos) = raw.rfind("::") {
@@ -1004,6 +1034,7 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
                 out.push(ImportRef {
                     name: local.into(),
                     from: format!("{}::{orig}", &raw[..pos]),
+                    orig: (orig != local).then(|| orig.to_string()),
                 });
             }
         }
@@ -1032,10 +1063,10 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
             .filter(|value| !value.is_empty())
         {
             let pieces = part.split_whitespace().collect::<Vec<_>>();
-            let name = if pieces.len() == 3 && pieces[1] == "as" {
-                pieces[2]
+            let (orig_name, name) = if pieces.len() == 3 && pieces[1] == "as" {
+                (pieces[0], pieces[2])
             } else {
-                part
+                (part, part)
             };
             if ident_re
                 .find(name)
@@ -1044,6 +1075,7 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
                 out.push(ImportRef {
                     name: name.into(),
                     from: spec.into(),
+                    orig: (orig_name != name).then(|| orig_name.to_string()),
                 });
             }
         }
@@ -1058,6 +1090,7 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
             out.push(ImportRef {
                 name: ns[1].into(),
                 from: spec.clone(),
+                orig: None,
             });
             body = body.replacen(ns.get(0).unwrap().as_str(), "", 1);
         }
@@ -1070,6 +1103,7 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
             out.push(ImportRef {
                 name: def.as_str().into(),
                 from: spec,
+                orig: None,
             });
         }
     }
@@ -1237,6 +1271,18 @@ fn resolve_specifier(spec: &str, from: &str, files: &HashSet<String>) -> Option<
             let dirs: Vec<_> = from.split('/').collect();
             let pos = dirs.iter().rposition(|v| *v == "src")?;
             base.extend(dirs[..=pos].iter().map(|v| v.to_string()));
+        } else if !matches!(segs.first(), Some(&"self") | Some(&"super"))
+            && segs.first().is_some_and(|seg| {
+                !matches!(*seg, "std" | "core" | "alloc")
+                    && seg.chars().next().is_some_and(|ch| ch.is_lowercase())
+            })
+            && from.split('/').any(|dir| dir == "src")
+        {
+            // Rust 2018 裸路径（如 `use server::foo`）：按 crate 根目录解析。
+            // 外部 crate 名在仓库里没有对应 src/<crate>/ 路径，解析自然落空。
+            let dirs: Vec<_> = from.split('/').collect();
+            let pos = dirs.iter().rposition(|v| *v == "src")?;
+            base.extend(dirs[..=pos].iter().map(|v| v.to_string()));
         } else if matches!(segs.first(), Some(&"self") | Some(&"super")) {
             base.extend(
                 from.split('/').collect::<Vec<_>>()[..from.split('/').count() - 1]
@@ -1287,7 +1333,7 @@ fn build_index(
     wanted: Option<&HashSet<String>>,
     dependency_depth: usize,
     known_files: Option<&[String]>,
-) -> (IndexView, Vec<String>) {
+) -> (IndexView, Vec<String>, ReverseMap) {
     let all = known_files
         .map(<[String]>::to_vec)
         .unwrap_or_else(|| list_code_files(root));
@@ -1352,6 +1398,27 @@ fn build_index(
     } else {
         cache.files.clone()
     };
+    // 反向图基于全量缓存（含历史扫描），让一次调用就能利用仓库级 import 关系；
+    // 个别条目可能陈旧，消费侧读当前文件验证 local 名的 import 行后再采信。
+    let mut reverse: ReverseMap = HashMap::new();
+    for (file, entry) in &cache.files {
+        for import in &entry.imports {
+            if let Some(target) = resolve_specifier(&import.from, file, &all_set) {
+                reverse
+                    .entry(target)
+                    .or_default()
+                    .push(ReverseImport {
+                        importer: file.clone(),
+                        local: import.name.clone(),
+                        orig: import.orig.clone(),
+                    });
+            }
+        }
+    }
+    for edges in reverse.values_mut() {
+        edges.sort_by(|a, b| a.importer.cmp(&b.importer).then(a.local.cmp(&b.local)));
+        edges.dedup_by(|a, b| a.importer == b.importer && a.local == b.local);
+    }
     store_cache(root, cache, dirty);
     let mut view = IndexView {
         files: selected,
@@ -1394,7 +1461,7 @@ fn build_index(
     for definitions in view.defs.values_mut() {
         definitions.sort_by(|a, b| a.file.cmp(&b.file).then(a.symbol.ln.cmp(&b.symbol.ln)));
     }
-    (view, all)
+    (view, all, reverse)
 }
 
 fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> {
@@ -1972,11 +2039,28 @@ fn suggest_symbols(root: &Path, anchors: &[String]) -> Vec<String> {
             }
         }
     }
-    let score_of =
-        |item: &Scored| item.words.len() * 10 + item.hits.min(5) + usize::from(item.def) * 4;
+    // typo 感知：与某个锚点编辑距离 ≤2 的候选提到最前，让“modeChoics”这类
+    // 拼写错误的真身排在仅共享词根的远亲前面，也给自动锚点更正提供候选。
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    let normalized_anchors = anchors.iter().map(|a| normalize(a)).collect::<Vec<_>>();
+    let score_of = |name: &str, item: &Scored| {
+        let base = item.words.len() * 10 + item.hits.min(5) + usize::from(item.def) * 4;
+        let close = normalized_anchors.iter().any(|anchor| {
+            !anchor.is_empty() && levenshtein(anchor, &normalize(name), 3) <= 2
+        });
+        base + usize::from(close) * 100
+    };
     let mut list = scored.into_iter().collect::<Vec<_>>();
     list.sort_by(|(a_name, a), (b_name, b)| {
-        score_of(b).cmp(&score_of(a)).then_with(|| a_name.cmp(b_name))
+        score_of(b_name, b)
+            .cmp(&score_of(a_name, a))
+            .then_with(|| a_name.cmp(b_name))
     });
     list.truncate(DID_YOU_MEAN_MAX);
     list.into_iter()
@@ -2193,6 +2277,7 @@ fn collect_dependencies(
     plans: &[PlannedFile],
     owned: &HashSet<(String, usize)>,
     keywords: &HashSet<String>,
+    priority: &HashSet<String>,
 ) -> Vec<(String, Definition)> {
     static IDENT: OnceLock<Regex> = OnceLock::new();
     static LOCAL: OnceLock<Regex> = OnceLock::new();
@@ -2267,6 +2352,11 @@ fn collect_dependencies(
         }
         let size = definition.symbol.end - definition.symbol.ln + 1;
         let mut score = info.count as i64 * 3 + if info.call { 8 } else { 0 };
+        // 种子签名里的类型名提权：改签名/改 API 的任务里它就是必看依赖，
+        // 不能输给正文里一票普通 helper 调用。
+        if priority.contains(&info.name) {
+            score += 30;
+        }
         if size <= 40 {
             score += 6;
         }
@@ -2293,6 +2383,80 @@ fn collect_dependencies(
         picked.push((name, definition));
     }
     picked
+}
+
+/// git 共改耦合：种子文件近 120 次触及提交里的高频共改文件（可选开关），抓文本
+/// 零耦合的关联文件（DI 注册表、路由表、配套样式）。只给提示，不占 EDIT 预算。
+fn co_changed_files(
+    root: &Path,
+    seed_files: &[String],
+    exclude: &HashSet<String>,
+    limit: usize,
+) -> Vec<(String, usize)> {
+    if seed_files.is_empty() {
+        return Vec::new();
+    }
+    // 注意不能一步 `git log --name-only -- <path>`：pathspec 会把展示的文件名也
+    // 限制在路径内，共改文件根本不会出现。先按 pathspec 取触及种子文件的提交
+    //（便宜），再 git show 这些提交的完整文件清单（只算相关提交的 diff）。
+    let mut sha_args = vec![
+        "log".to_string(),
+        "--format=%H".to_string(),
+        "-n".to_string(),
+        "120".to_string(),
+        "--".to_string(),
+    ];
+    sha_args.extend(seed_files.iter().take(4).cloned());
+    let Some(bytes) = run_command(root, "git", &sha_args) else {
+        return Vec::new();
+    };
+    let shas = String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.len() >= 7 && line.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if shas.is_empty() {
+        return Vec::new();
+    }
+    let mut show_args = vec![
+        "show".to_string(),
+        "--format=".to_string(),
+        "--name-only".to_string(),
+        "--no-renames".to_string(),
+    ];
+    show_args.extend(shas);
+    let Some(bytes) = run_command(root, "git", &show_args) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let seeds = seed_files.iter().take(4).collect::<HashSet<_>>();
+    let mut counts = HashMap::<String, usize>::new();
+    for commit in text.split("\n\n") {
+        let files = commit
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(normalize_rel)
+            .collect::<Vec<_>>();
+        if !files.iter().any(|file| seeds.contains(file)) {
+            continue;
+        }
+        for file in files {
+            if seeds.contains(&file)
+                || exclude.contains(&file)
+                || !is_code_file(&file)
+                || !root.join(&file).is_file()
+            {
+                continue;
+            }
+            *counts.entry(file).or_default() += 1;
+        }
+    }
+    let mut list = counts.into_iter().collect::<Vec<_>>();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    list.truncate(limit);
+    list
 }
 
 pub fn find_symbols(root: &Path, params: Value) -> Result<String, String> {
@@ -2322,7 +2486,7 @@ pub fn find_symbols(root: &Path, params: Value) -> Result<String, String> {
         )
     });
     let wanted: HashSet<_> = rows.iter().map(|r| r.file.clone()).collect();
-    let (index, _) = build_index(root, Some(&wanted), 0, Some(&all));
+    let (index, _, _) = build_index(root, Some(&wanted), 0, Some(&all));
     let mut out = vec![format!("# 符号定位 @{revision}")];
     for name in names {
         let defs = index.defs.get(&name).cloned().unwrap_or_default();
@@ -2370,7 +2534,7 @@ pub fn code_map(root: &Path, params: Value) -> Result<String, String> {
             .unwrap_or("")
             .trim(),
     );
-    let (index, _) = build_index(root, None, 0, None);
+    let (index, _, _) = build_index(root, None, 0, None);
     let mut files: Vec<_> = index
         .files
         .keys()
@@ -2431,7 +2595,169 @@ pub fn code_map(root: &Path, params: Value) -> Result<String, String> {
     Ok(out.join("\n"))
 }
 
+/// 回填辅助：把块补回已有 plan 或为其新建 plan（源从 candidates/索引按需读）。
+/// 返回 Some(是否新建了 plan)；重复/整文件已展示/无源时返回 None。
+fn backfill_block(
+    root: &Path,
+    index: &IndexView,
+    sources: &HashMap<String, Source>,
+    plans: &mut Vec<PlannedFile>,
+    sigs: &mut Vec<(String, usize, String)>,
+    file: &str,
+    block: &Block,
+    rank: usize,
+) -> Option<bool> {
+    if let Some(position) = plans
+        .iter()
+        .position(|plan| plan.file == file && !plan.full)
+    {
+        if plans[position]
+            .blocks
+            .iter()
+            .any(|existing| existing.start == block.start && existing.end == block.end)
+        {
+            return None;
+        }
+        plans[position].blocks.push(block.clone());
+        sigs.retain(|(sig_file, ln, _)| {
+            !(sig_file == file && *ln >= block.start && *ln <= block.end)
+        });
+        return Some(false);
+    }
+    if plans.iter().any(|plan| plan.file == file) {
+        return None;
+    }
+    let src = sources
+        .get(file)
+        .cloned()
+        .or_else(|| source(root, file, index.files.get(file)))?;
+    plans.push(PlannedFile {
+        file: file.to_string(),
+        source: src,
+        section: if matches!(block.tag, "dep" | "dep2") {
+            "dep"
+        } else {
+            "edit"
+        },
+        full: false,
+        blocks: vec![block.clone()],
+        rank,
+    });
+    sigs.retain(|(sig_file, ln, _)| {
+        !(sig_file == file && *ln >= block.start && *ln <= block.end)
+    });
+    Some(true)
+}
+
 pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
+    let out = fast_context_run(root, &params)?;
+    if params
+        .get("_anchorRetry")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(out);
+    }
+    // 特性② typo 自动更正：硬 MISS 且 did-you-mean 里有编辑距离足够小的真实符号时，
+    // 视为锚点 typo，自动替换重试一次；重试仍 MISS 则返回原始 MISS（附建议）。
+    let Some((anchor, suggestion)) = anchor_correction(&out, &params) else {
+        return Ok(out);
+    };
+    let mut retry = params.clone();
+    if let Some(values) = retry.get_mut("keywords").and_then(Value::as_array_mut) {
+        for value in values.iter_mut() {
+            if value.as_str() == Some(anchor.as_str()) {
+                *value = Value::String(suggestion.clone());
+            }
+        }
+    }
+    if let Some(object) = retry.as_object_mut() {
+        object.insert("_anchorRetry".into(), Value::Bool(true));
+    }
+    let retried = fast_context_run(root, &retry)?;
+    if retried.starts_with("# CTX MISS") {
+        return Ok(out);
+    }
+    Ok(format!(
+        "# 锚点更正: {anchor} → {suggestion} (自动降级重试, 原锚点无生产命中)\n{retried}"
+    ))
+}
+
+/// 硬 MISS 输出里的 did-you-mean 与显式锚点做编辑距离匹配：够像就视为 typo，
+/// 返回 (原锚点, 建议符号) 供自动更正重试。
+fn anchor_correction(out: &str, params: &Value) -> Option<(String, String)> {
+    if !out.starts_with("# CTX MISS") {
+        return None;
+    }
+    let line = out.lines().find(|line| line.starts_with("did-you-mean: "))?;
+    let suggestions = line["did-you-mean: ".len()..]
+        .split(", ")
+        .filter_map(|item| item.split_whitespace().next())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let anchors = params
+        .get("keywords")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|keyword| explicit_anchor(keyword))
+        .collect::<Vec<_>>();
+    for anchor in &anchors {
+        for suggestion in &suggestions {
+            if similar_enough(anchor, suggestion) {
+                return Some((anchor.to_string(), suggestion.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// 归一化（小写字母数字）后编辑距离 ≤1 视为 typo；距离 2 仅接受更长符号
+///（避免锚点被相差 2 的远亲符号劫持，错纠正反而制造幻觉锚点）。
+fn similar_enough(anchor: &str, suggestion: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    let a = normalize(anchor);
+    let b = normalize(suggestion);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let distance = levenshtein(&a, &b, 3);
+    distance == 1 || (distance == 2 && a.chars().count().max(b.chars().count()) >= 12)
+}
+
+/// 带上限的 Levenshtein：任一行最小值超 cap 即提前返回 cap+1。
+fn levenshtein(a: &str, b: &str, cap: usize) -> usize {
+    let a = a.chars().collect::<Vec<_>>();
+    let b = b.chars().collect::<Vec<_>>();
+    if a.len().abs_diff(b.len()) > cap {
+        return cap + 1;
+    }
+    let mut prev = (0..=b.len()).collect::<Vec<_>>();
+    for (i, ca) in a.iter().enumerate() {
+        let mut row = vec![i + 1; b.len() + 1];
+        let mut min = row[0];
+        for (j, cb) in b.iter().enumerate() {
+            row[j + 1] = (prev[j] + usize::from(ca != cb))
+                .min(prev[j + 1] + 1)
+                .min(row[j] + 1);
+            min = min.min(row[j + 1]);
+        }
+        if min > cap {
+            return cap + 1;
+        }
+        prev = row;
+    }
+    prev[b.len()]
+}
+
+fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let mut keyword_seen = HashSet::new();
     let keywords: Vec<String> = params
         .get("keywords")
@@ -2729,7 +3055,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         }
     }
     let stage = Instant::now();
-    let (index, _) = build_index(root, Some(&wanted), 3, Some(&all));
+    let (index, _, reverse) = build_index(root, Some(&wanted), 3, Some(&all));
     trace("fast_context.index", stage);
     let stage = Instant::now();
     let mut def_names = index.defs.keys().cloned().collect::<Vec<_>>();
@@ -2844,6 +3170,182 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     // 二次检索后词频已变，重建稀有度表供 ranked 的主题加分使用。
     let term_freq = term_freq_map(&keyword_counts);
 
+    // 特性① 反向 import 图：精确调用方发现。文本检索看不见别名调用点
+    //（import { a as b } 之后调用 b(...)）和 barrel 改名透传（export { a as c }），
+    // import 边把这些调用行作为精确命中注入，角色/IMPACT 打 [import图] 标记。
+    // 深度 2 仅经“未本地定义种子名且 import 了种子名”的中转文件（re-export），
+    // 避免把无关同名引用当成调用方。缓存条目可能陈旧：读当前文件验证 import 行。
+    let mut graph_rows = HashSet::<(String, usize)>::new();
+    let mut exact_callers = HashMap::<String, HashSet<String>>::new();
+    // 文本检索看不见的调用方（别名调用 / barrel 透传）：子模覆盖时按文件独立成类，
+    // 不被同行为类别的普通调用方代表挤掉；普通 import 调用方仍按行为类别去重。
+    let mut invisible_callers = HashSet::<String>::new();
+    const MAX_GRAPH_IMPORTERS: usize = 12;
+    const MAX_GRAPH_ROWS_PER_FILE: usize = 6;
+    if !seeds.is_empty() {
+        let all_paths = all.iter().cloned().collect::<HashSet<_>>();
+        let mut searched_targets = HashSet::<String>::new();
+        // 发现 target 的引用方：反向图（增量缓存）+ 词根搜索兜底（冷启动时
+        // 未扫描过的引用方不在缓存里，用文件名词根搜 import 行再精确解析）。
+        let discover = |target: &str,
+                        searched: &mut HashSet<String>,
+                        reverse: &ReverseMap|
+         -> Vec<ReverseImport> {
+            let mut edges = reverse.get(target).cloned().unwrap_or_default();
+            let base = target.rsplit('/').next().unwrap_or(target);
+            let stem = base
+                .rsplit_once('.')
+                .map(|(stem, _)| stem)
+                .unwrap_or(base)
+                .to_string();
+            if stem.len() >= 3 && searched.insert(target.to_string()) {
+                let mut seen_files = HashSet::<String>::new();
+                for row in search_text(root, &[stem.clone()], true, false, &[]) {
+                    if row.file == target || !is_code_file(&row.file) {
+                        continue;
+                    }
+                    let line = &row.text;
+                    if !(line.contains("import")
+                        || line.contains("use ")
+                        || line.contains("export"))
+                    {
+                        continue;
+                    }
+                    // 词根必须出现在模块说明符位置，才值得整文件解析 import 表
+                    let specifier_like = line.contains(&format!("'{stem}"))
+                        || line.contains(&format!("\"{stem}"))
+                        || line.contains(&format!("/{stem}"))
+                        || line.contains(&format!("::{stem}"))
+                        || line.contains(&format!("/{stem}."));
+                    if !specifier_like || !seen_files.insert(row.file.clone()) {
+                        continue;
+                    }
+                    let Ok(text) = fs::read_to_string(root.join(&row.file)) else {
+                        continue;
+                    };
+                    for import in extract_imports(&text, &row.file) {
+                        if resolve_specifier(&import.from, &row.file, &all_paths).as_deref()
+                            == Some(target)
+                        {
+                            edges.push(ReverseImport {
+                                importer: row.file.clone(),
+                                local: import.name,
+                                orig: import.orig,
+                            });
+                        }
+                    }
+                }
+            }
+            edges.sort_by(|a, b| a.importer.cmp(&b.importer).then(a.local.cmp(&b.local)));
+            edges.dedup_by(|a, b| a.importer == b.importer && a.local == b.local);
+            edges
+        };
+        // (种子名, 中转文件, 引用方, 引用方本地名, 深度)
+        let mut graph_queue = Vec::<(String, String, String, String, usize)>::new();
+        let mut graph_seen = HashSet::<(String, String)>::new();
+        for (definition, name, _) in &seeds {
+            for edge in discover(&definition.file, &mut searched_targets, &reverse) {
+                if edge.local == *name || edge.orig.as_deref() == Some(name.as_str()) {
+                    graph_queue.push((
+                        name.clone(),
+                        definition.file.clone(),
+                        edge.importer.clone(),
+                        edge.local.clone(),
+                        0,
+                    ));
+                }
+            }
+        }
+        let mut cursor = 0usize;
+        while cursor < graph_queue.len() {
+            let (seed_name, via, importer, local, depth) = graph_queue[cursor].clone();
+            cursor += 1;
+            if importer == via || !graph_seen.insert((importer.clone(), local.clone())) {
+                continue;
+            }
+            if !exact_callers.contains_key(&importer) && exact_callers.len() >= MAX_GRAPH_IMPORTERS {
+                continue;
+            }
+            if !is_code_file(&importer) || !root.join(&importer).is_file() {
+                continue;
+            }
+            let Some(src) = source(root, &importer, index.files.get(&importer)) else {
+                continue;
+            };
+            // 复核：当前文件必须仍存在提及 local 名的 import/use/export 行（剔除陈旧缓存）。
+            let has_import_line = src.lines.iter().any(|line| {
+                (line.contains("import") || line.contains("use ") || line.contains("export"))
+                    && contains_ascii_word(line, &local)
+            });
+            if !has_import_line {
+                continue;
+            }
+            // 深度 2：经由未本地定义种子名的中转文件（re-export barrel）继续追踪。
+            if depth == 0
+                && !src.syms.iter().any(|symbol| {
+                    symbol.name == seed_name && symbol.depth <= 1 && symbol.kind != "prop"
+                })
+            {
+                for edge in discover(&importer, &mut searched_targets, &reverse) {
+                    if edge.local == local || edge.orig.as_deref() == Some(local.as_str()) {
+                        graph_queue.push((
+                            seed_name.clone(),
+                            importer.clone(),
+                            edge.importer.clone(),
+                            edge.local.clone(),
+                            1,
+                        ));
+                    }
+                }
+            }
+            if depth > 0 || local != seed_name {
+                invisible_callers.insert(importer.clone());
+            }
+            exact_callers
+                .entry(importer.clone())
+                .or_default()
+                .insert(local.clone());
+            let mut added = 0usize;
+            for (row_index, line) in src.lines.iter().enumerate() {
+                if added >= MAX_GRAPH_ROWS_PER_FILE {
+                    break;
+                }
+                if !contains_ascii_word(line, &local) {
+                    continue;
+                }
+                let ln = row_index + 1;
+                if !hit_files.contains_key(&importer) {
+                    hit_order.push(importer.clone());
+                }
+                let file_rows = hit_files.entry(importer.clone()).or_default();
+                if file_rows.iter().any(|row| row.ln == ln)
+                    || file_rows.len() >= MAX_HITS_PER_FILE
+                {
+                    continue;
+                }
+                file_rows.push(SearchRow {
+                    file: importer.clone(),
+                    ln,
+                    text: line.clone(),
+                });
+                file_keywords
+                    .entry(importer.clone())
+                    .or_default()
+                    .insert(seed_name.clone());
+                line_keywords
+                    .entry((importer.clone(), ln))
+                    .or_default()
+                    .insert(seed_name.clone());
+                *keyword_counts.entry(seed_name.clone()).or_default() += 1;
+                graph_rows.insert((importer.clone(), ln));
+                added += 1;
+            }
+            if !all.contains(&importer) {
+                all.push(importer.clone());
+            }
+        }
+    }
+
     let seed_files = seeds
         .iter()
         .map(|(definition, _, _)| definition.file.clone())
@@ -2878,6 +3380,9 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             score += subject_match(file, &subject_terms, &term_freq);
             if files.contains(file) {
                 score += 500.0;
+            }
+            if exact_callers.contains_key(file) {
+                score += if plan_intent.callers { 170.0 } else { 70.0 };
             }
             let references_seed = rows
                 .iter()
@@ -2925,6 +3430,22 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
+    // 特性④ git 共改耦合（可选开关）：抓文本零耦合的关联文件（DI 注册表、路由表、
+    // 配套样式）。只出提示行，不占 EDIT 预算。
+    let coupling_files = if params
+        .get("coupling")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !ordered_seed_files.is_empty()
+    {
+        let exclude = ranked
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<HashSet<_>>();
+        co_changed_files(root, &ordered_seed_files, &exclude, 3)
+    } else {
+        Vec::new()
+    };
     let base_candidate_limit = MAX_CANDIDATES + hard.saturating_sub(DEFAULT_HARD_BYTES) / 8192 * 2;
     let candidate_limit = base_candidate_limit.max(MAX_CANDIDATES).min(12);
     let base_file_limit = MAX_FILES + hard.saturating_sub(DEFAULT_HARD_BYTES) / 16384 * 2;
@@ -2963,6 +3484,13 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .collect::<Vec<_>>();
     let mut units = Vec::<UnitCandidate>::new();
     for (file, file_score) in &final_candidates {
+        if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
+            eprintln!(
+                "[ctx] candidate {file} score={file_score:.1} hits={} src={}",
+                hit_files.get(file).map(|rows| rows.len()).unwrap_or(0),
+                sources.contains_key(file)
+            );
+        }
         let Some(source) = sources.get(file) else {
             continue;
         };
@@ -3067,12 +3595,23 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             grouped[index].1.seed_weight = grouped[index].1.seed_weight.max(*weight);
         }
         for (_, mut unit) in grouped {
+            if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
+                eprintln!(
+                    "[ctx] grouped {}:{}-{} hits={:?}",
+                    unit.file, unit.start, unit.end, unit.hits
+                );
+            }
             let size = unit.end - unit.start + 1;
             let body = source.lines[unit.start - 1..unit.end].join("\n");
             let references_seed = seed_names.iter().any(|name| body.contains(name));
             let calls_seed = seed_names
                 .iter()
-                .any(|name| body.contains(&format!("{name}(")));
+                .any(|name| body.contains(&format!("{name}(")))
+                || exact_callers.get(file).is_some_and(|locals| {
+                    locals
+                        .iter()
+                        .any(|local| body.contains(&format!("{local}(")))
+                });
             let planned_relation = planned_terms.iter().any(|name| body.contains(name));
             unit.role = if unit.tag == "def" {
                 "target"
@@ -3149,26 +3688,32 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         } else if unit.role == "test" {
             features.push(("test".into(), 70.0));
         } else if unit.role == "caller" {
-            let behavior = if contains_ascii_word(&unit.body, "try")
-                || contains_ascii_word(&unit.body, "catch")
-            {
-                "caller:error"
-            } else if seed_names
-                .iter()
-                .any(|name| unit.body.contains(&format!("return await {name}(")))
-            {
-                "caller:await"
-            } else if seed_names
-                .iter()
-                .any(|name| unit.body.contains(&format!("return {name}(")))
-            {
-                "caller:return"
-            } else if unit.body.contains("await") {
-                "caller:await-consume"
+            if invisible_callers.contains(&unit.file) {
+                // 文本不可见的精确调用方按文件独立成类：它们有别名/透传证据，
+                // 不应被同行为类别的普通调用方代表挤掉。
+                features.push((format!("caller:exact:{}", unit.file), 70.0));
             } else {
-                "caller:invoke"
-            };
-            features.push((behavior.into(), 65.0));
+                let behavior = if contains_ascii_word(&unit.body, "try")
+                    || contains_ascii_word(&unit.body, "catch")
+                {
+                    "caller:error"
+                } else if seed_names
+                    .iter()
+                    .any(|name| unit.body.contains(&format!("return await {name}(")))
+                {
+                    "caller:await"
+                } else if seed_names
+                    .iter()
+                    .any(|name| unit.body.contains(&format!("return {name}(")))
+                {
+                    "caller:return"
+                } else if unit.body.contains("await") {
+                    "caller:await-consume"
+                } else {
+                    "caller:invoke"
+                };
+                features.push((behavior.into(), 65.0));
+            }
         }
         for keyword in &unit.keywords {
             features.push((format!("term:{}", keyword.to_lowercase()), 12.0));
@@ -3218,6 +3763,8 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     }
     let mut plans = Vec::<PlannedFile>::new();
     let mut sigs = Vec::<(String, usize, String)>::new();
+    let mut deferred = Vec::<Deferred>::new();
+    let mut dropped = Vec::<Dropped>::new();
     let mut used = 0usize;
     let mut used_bytes = 0usize;
     let push_sig = |sigs: &mut Vec<(String, usize, String)>, file: &str, line: usize, sig: &str| {
@@ -3383,6 +3930,9 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             used_bytes += cost;
         }
     }
+    if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
+        eprintln!("[ctx] total units after greedy: {}", units.len());
+    }
     let closure_roles = units
         .iter()
         .map(|unit| (unit.file.clone(), unit.start, unit.role))
@@ -3412,6 +3962,15 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             && ((unit.role == "caller" && plan_intent.callers)
                 || (unit.role == "test" && plan_intent.tests));
         let effective_required = unit.required || required_representative;
+        if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
+            eprintln!(
+                "[ctx] unit {}:{}-{} role={} tag={} obl={:?} req={} plan_idx={:?} hits={:?} score={:.1}",
+                unit.file, unit.start, unit.end, unit.role, unit.tag, unit.obligation,
+                effective_required,
+                plans.iter().position(|plan| plan.file == unit.file),
+                unit.hits, unit.score
+            );
+        }
         if plan_index.is_none() && plans.len() >= file_limit && !required_representative {
             continue;
         }
@@ -3476,6 +4035,22 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             if let Some(symbol) = &unit.unit {
                 push_sig(&mut sigs, &unit.file, unit.start, &symbol.sig);
             }
+            deferred.push(Deferred {
+                file: unit.file.clone(),
+                block: Block {
+                    start: unit.start,
+                    end: unit.end.min(source.lines.len()),
+                    label: unit.label.clone(),
+                    tag: match unit.role {
+                        "target" => "def",
+                        "related" => unit.tag,
+                        role => role,
+                    },
+                    score: unit.score,
+                    required: effective_required,
+                },
+                rank: *file_rank.get(&unit.file).unwrap_or(&99),
+            });
             continue;
         }
         let index = if let Some(index) = plan_index {
@@ -3525,8 +4100,26 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
         .chain(task_terms.iter())
         .cloned()
         .collect::<HashSet<_>>();
+    // 特性③ 种子签名里的类型名是“改签名”类任务的必看依赖：提权进入 DEPS。
+    let mut sig_terms = HashSet::<String>::new();
+    {
+        static SIG_IDENT: OnceLock<Regex> = OnceLock::new();
+        let ident = SIG_IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*").unwrap());
+        for (definition, _, _) in &seeds {
+            for found in ident.find_iter(&definition.symbol.sig) {
+                let name = found.as_str();
+                if name.len() >= 4
+                    && !stop_word(&name.to_lowercase())
+                    && !keyword_set.contains(name)
+                    && !seed_names.contains(name)
+                {
+                    sig_terms.insert(name.to_string());
+                }
+            }
+        }
+    }
     let mut dep_seen = HashSet::<(String, usize)>::new();
-    let mut dep_queue = collect_dependencies(&index, &plans, &owned, &keyword_set);
+    let mut dep_queue = collect_dependencies(&index, &plans, &owned, &keyword_set, &sig_terms);
     let mut dependencies = Vec::<(String, Definition, usize)>::new();
     for dep_depth in 0..3 {
         let wave = std::mem::take(&mut dep_queue);
@@ -3566,6 +4159,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 &next_plans,
                 &excluded,
                 &keyword_set,
+                &sig_terms,
             ));
         }
     }
@@ -3593,6 +4187,18 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             || used_bytes + bytes > if required { required_bytes } else { soft_bytes }
         {
             push_sig(&mut sigs, &def.file, def.symbol.ln, &def.symbol.sig);
+            deferred.push(Deferred {
+                file: def.file.clone(),
+                block: Block {
+                    start: def.symbol.ln,
+                    end: def.symbol.end,
+                    label: format!("{} {}", def.symbol.kind, dep_name),
+                    tag: if dep_depth == 0 { "dep" } else { "dep2" },
+                    score: 120.0 - dep_depth as f64 * 30.0,
+                    required,
+                },
+                rank: *file_rank.get(&def.file).unwrap_or(&99),
+            });
             continue;
         }
         used += n;
@@ -3648,9 +4254,15 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 "## DEPS (依赖定义, 完整单元)".into()
             });
             for plan in group {
+                // import 图精确调用方（别名/透传证据）在文件头打标，无论正文是否覆盖
+                let exact_mark = if exact_callers.contains_key(&plan.file) {
+                    " [import图]"
+                } else {
+                    ""
+                };
                 if plan.full {
                     body.push(format!(
-                        "### {} ({}L) FULL",
+                        "### {} ({}L) FULL{exact_mark}",
                         plan.file,
                         plan.source.lines.len()
                     ));
@@ -3671,7 +4283,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                         .collect::<Vec<_>>()
                         .join(",");
                     body.push(format!(
-                        "### {} ({}L) shown={shown}",
+                        "### {} ({}L) shown={shown}{exact_mark}",
                         plan.file,
                         plan.source.lines.len()
                     ));
@@ -3754,17 +4366,19 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                 {
                     continue;
                 }
+                let graph_hit = graph_rows.contains(&(file.clone(), row.ln));
                 let seed_ref = if seed_names.is_empty() {
                     keywords.iter().any(|keyword| row.text.contains(keyword))
                 } else {
-                    seed_names.iter().any(|name| row.text.contains(name))
+                    seed_names.iter().any(|name| row.text.contains(name)) || graph_hit
                 };
                 if seed_ref {
                     impacts.push(format!(
-                        "{}:{} {}",
+                        "{}:{} {}{}",
                         file,
                         row.ln,
-                        js_utf16_slice(row.text.trim(), 120)
+                        js_utf16_slice(row.text.trim(), 120),
+                        if graph_hit { " [import图]" } else { "" }
                     ));
                 }
             }
@@ -3879,6 +4493,16 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
             if !loose_kw.is_empty() {
                 notes.push(format!("忽略大小写才命中: {}", loose_kw.join(" ")));
             }
+            if !coupling_files.is_empty() {
+                notes.push(format!(
+                    "共改耦合(git): {}",
+                    coupling_files
+                        .iter()
+                        .map(|(file, count)| format!("{file} ({count}x)"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
             let mut unexpanded = ranked
                 .iter()
                 .filter(|(file, _)| !plans.iter().any(|plan| plan.file == *file))
@@ -3964,9 +4588,10 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                     .map(|line| js_utf16_slice(line.trim(), 120))
                     .unwrap_or_default();
                 if !sig.is_empty() {
-                    sigs.push((removed.file, 1, sig));
+                    sigs.push((removed.file.clone(), 1, sig));
                 }
             }
+            dropped.push(Dropped::Full(removed));
         } else {
             let block = plans[index]
                 .blocks
@@ -4014,6 +4639,7 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
                         sigs.push((file.clone(), block.start, sig));
                     }
                 }
+                dropped.push(Dropped::Block(file, block));
             }
             if plans[index].blocks.is_empty() {
                 plans.remove(index);
@@ -4028,6 +4654,103 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     if text.len() > hard {
         compact_index = true;
         text = render(&plans, &sigs, impact_limit, compact_index);
+    }
+    // 特性⑤ 预算回填：shrink 只删不补、打包按 soft 封顶，当 IMPACT/SIG/表头开销
+    // 小于预留时输出会显著低于硬顶。把 shrink 删掉的（后删=相对高价值优先）与
+    // 打包暂缓的块按序补回，直到贴近硬顶；补不进的回退，继续试下一个。
+    if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
+        eprintln!(
+            "[ctx] backfill: text={} hard={} dropped={} deferred={}",
+            text.len(),
+            hard,
+            dropped.len(),
+            deferred.len()
+        );
+    }
+    if text.len() < hard * 9 / 10 {
+        while let Some(item) = dropped.pop() {
+            if text.len() >= hard * 9 / 10 {
+                break;
+            }
+            match item {
+                Dropped::Full(plan) => {
+                    if plans.iter().any(|existing| existing.file == plan.file) {
+                        continue;
+                    }
+                    let file = plan.file.clone();
+                    plans.push(plan);
+                    let trial = render(&plans, &sigs, impact_limit, compact_index);
+                    if trial.len() <= hard {
+                        text = trial;
+                    } else {
+                        plans.retain(|existing| existing.file != file);
+                    }
+                }
+                Dropped::Block(file, block) => {
+                    let created = backfill_block(
+                        root,
+                        &index,
+                        &sources,
+                        &mut plans,
+                        &mut sigs,
+                        &file,
+                        &block,
+                        99,
+                    );
+                    let Some(created) = created else {
+                        continue;
+                    };
+                    let trial = render(&plans, &sigs, impact_limit, compact_index);
+                    if trial.len() <= hard {
+                        text = trial;
+                    } else if let Some(position) = plans
+                        .iter()
+                        .position(|plan| plan.file == file && !plan.full)
+                    {
+                        plans[position]
+                            .blocks
+                            .retain(|existing| {
+                                !(existing.start == block.start && existing.end == block.end)
+                            });
+                        if created && plans[position].blocks.is_empty() {
+                            plans.remove(position);
+                        }
+                    }
+                }
+            }
+        }
+        for item in &deferred {
+            if text.len() >= hard * 9 / 10 {
+                break;
+            }
+            let created = backfill_block(
+                root,
+                &index,
+                &sources,
+                &mut plans,
+                &mut sigs,
+                &item.file,
+                &item.block,
+                item.rank,
+            );
+            let Some(created) = created else {
+                continue;
+            };
+            let trial = render(&plans, &sigs, impact_limit, compact_index);
+            if trial.len() <= hard {
+                text = trial;
+            } else if let Some(position) = plans
+                .iter()
+                .position(|plan| plan.file == item.file && !plan.full)
+            {
+                plans[position].blocks.retain(|existing| {
+                    !(existing.start == item.block.start && existing.end == item.block.end)
+                });
+                if created && plans[position].blocks.is_empty() {
+                    plans.remove(position);
+                }
+            }
+        }
     }
     let _ = original_count;
     trace("fast_context.render", render_start);
@@ -4586,5 +5309,202 @@ mod tests {
         let map = code_map(d.path(), serde_json::json!({"scope":"src/"})).unwrap();
         assert!(map.contains("## src/a.ts (3L)"), "{map}");
         assert!(map.contains("1 pick"), "{map}");
+    }
+
+    #[test]
+    fn reverse_import_graph_finds_alias_and_barrel_callers() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/core.ts"),
+            "export interface WidgetConfig {\n  title: string;\n}\nexport function renderWidget(config: WidgetConfig) {\n  return config.title;\n}\n",
+        )
+        .unwrap();
+        // 别名调用：文本检索只能命中 import 行，命中不到 showWidget( 调用点
+        fs::write(
+            d.path().join("src/alias.ts"),
+            "import { renderWidget as showWidget } from './core';\n\nexport function mountAliasPanel(config) {\n  return showWidget(config);\n}\n",
+        )
+        .unwrap();
+        // barrel 改名透传：deep.ts 全文不出现 renderWidget，纯文本检索完全不可见
+        fs::write(
+            d.path().join("src/barrel.ts"),
+            "export { renderWidget as widget } from './core';\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("src/deep.ts"),
+            "import { widget } from './barrel';\n\nexport function mountB(config) {\n  return widget(config);\n}\n",
+        )
+        .unwrap();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":["renderWidget"],"task":"找出所有调用方 caller 兼容"}),
+        )
+        .unwrap();
+        assert!(out.contains("renderWidget"), "{out}");
+        assert!(out.contains("showWidget("), "{out}");
+        assert!(out.contains("mountB"), "{out}");
+        assert!(out.contains("widget("), "{out}");
+        assert!(out.contains("[import图]"), "{out}");
+    }
+
+    #[test]
+    fn typo_anchor_auto_corrects_and_retries() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/store.ts"),
+            "export const UNIFIED_MODES = ['build'];\nexport function modeChoices() { return UNIFIED_MODES; }\n",
+        )
+        .unwrap();
+        // 锚点拼接构造：字面量写进本文件会污染真实仓库的召回评测（production_anchor_hit 命中）
+        let typo = ["mode", "Choics"].concat();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":[typo],"task":"switch mode handling"}),
+        )
+        .unwrap();
+        assert!(!out.starts_with("# CTX MISS"), "{out}");
+        assert!(out.contains("锚点更正"), "{out}");
+        assert!(out.contains("modeChoices"), "{out}");
+        // 距离远的锚点不重试，保持 MISS
+        let far = ["agent", "Mode"].concat();
+        let miss = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":[far],"task":"switch agent mode"}),
+        )
+        .unwrap();
+        assert!(miss.starts_with("# CTX MISS"), "{miss}");
+    }
+
+    #[test]
+    fn similar_enough_thresholds() {
+        // 锚点拼接构造：字面量写进本文件会污染真实仓库的召回评测
+        let typo = ["mode", "Choics"].concat();
+        let far = ["agent", "Mode"].concat();
+        assert!(similar_enough(&typo, "modeChoices"));
+        assert!(similar_enough("fastContex", "fast_context"));
+        assert!(!similar_enough(&far, "modeChoices"));
+        assert!(!similar_enough("ab", "xyz"));
+    }
+
+    #[test]
+    fn signature_types_get_dependency_priority() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/types.ts"),
+            "export interface WidgetConfig {\n  title: string;\n  mode: string;\n  retries: number;\n}\n",
+        )
+        .unwrap();
+        let mut imports = vec!["import { WidgetConfig } from './types';".to_string()];
+        let mut calls = Vec::new();
+        for i in 0..10 {
+            fs::write(
+                d.path().join(format!("src/h{i}.ts")),
+                format!("export function helperAlpha{i}(value) {{\n  return value + {i};\n}}\n"),
+            )
+            .unwrap();
+            imports.push(format!("import {{ helperAlpha{i} }} from './h{i}';"));
+            calls.push(format!("  acc = helperAlpha{i}(acc);"));
+        }
+        fs::write(
+            d.path().join("src/service.ts"),
+            format!(
+                "{}\n\nexport function mountWidget(config: WidgetConfig) {{\n  let acc = config.retries;\n{}\n  return acc;\n}}\n",
+                imports.join("\n"),
+                calls.join("\n")
+            ),
+        )
+        .unwrap();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":["mountWidget"],"task":"修改挂载入口签名"}),
+        )
+        .unwrap();
+        assert!(out.contains("## DEPS"), "{out}");
+        assert!(out.contains("### src/types.ts"), "{out}");
+    }
+
+    #[test]
+    fn backfill_restores_deferred_blocks_within_hard_cap() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/core.ts"),
+            "export function alphaTarget(v) {\n  return v * 2;\n}\n",
+        )
+        .unwrap();
+        // 3 文件 × 4 调用函数：总量远超 8KB 硬顶，打包按 soft 封顶后暂缓一批，
+        // 回填应在硬顶内补回。文件数/每文件单元数都不触发结构性上限。
+        for m in 0..3 {
+            let mut units = vec!["import { alphaTarget } from './core';\n".to_string()];
+            for n in 0..4 {
+                let pad = (0..22)
+                    .map(|i| format!("  const pad{m}_{n}_{i} = \"padding-value-{m}-{n}-{i}-aaaaaaaaaaaaaaaaaaaaaaaa\";"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                units.push(format!(
+                    "export function useTarget{m}_{n}() {{\n  // block-{m}-{n}-marker\n{pad}\n  return alphaTarget({n});\n}}\n"
+                ));
+            }
+            fs::write(d.path().join(format!("src/mod{m}.ts")), units.join("\n")).unwrap();
+        }
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({
+                "keywords":["alphaTarget"],
+                "maxBytes":8192
+            }),
+        )
+        .unwrap();
+        assert!(out.len() <= 8192, "{}", out.len());
+        let markers = (0..3)
+            .flat_map(|m| (0..4).map(move |n| (m, n)))
+            .filter(|(m, n)| out.contains(&format!("block-{m}-{n}-marker")))
+            .count();
+        assert!(markers >= 5, "markers={markers}\n{out}");
+    }
+
+    #[test]
+    fn coupling_note_lists_co_changed_files() {
+        let d = tempdir().unwrap();
+        git(d.path(), &["init", "-q"]);
+        git(
+            d.path(),
+            &["config", "user.email", "native-test@nova.local"],
+        );
+        git(d.path(), &["config", "user.name", "Nova Native Test"]);
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        for round in 0..3 {
+            fs::write(
+                d.path().join("src/core.ts"),
+                format!("export function coupledTarget() {{\n  return {round};\n}}\n"),
+            )
+            .unwrap();
+            // registry.ts 与 core.ts 文本零耦合，但历史上总是同提交变更
+            fs::write(
+                d.path().join("src/registry.ts"),
+                format!("export const registryVersion = {round};\n"),
+            )
+            .unwrap();
+            git(d.path(), &["add", "-A"]);
+            git(d.path(), &["commit", "-qm", "change"]);
+        }
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":["coupledTarget"],"coupling":true}),
+        )
+        .unwrap();
+        assert!(out.contains("共改耦合(git)"), "{out}");
+        assert!(out.contains("registry.ts"), "{out}");
+        // 默认关闭：无提示行
+        let plain = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":["coupledTarget"]}),
+        )
+        .unwrap();
+        assert!(!plain.contains("共改耦合(git)"), "{plain}");
     }
 }

@@ -2,8 +2,11 @@ import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { codeMap, contextBundle, findSymbols } from "./ctx-core.mjs";
+import { codeMap, findSymbols } from "./ctx-core.mjs";
 import { callNapiTool } from "./nova-napi-tools.mjs";
+
+// fast_context 的唯一实现是 Rust native（JS 镜像已移除）：fast_context 校验
+// native 输出确定性（同参两跑一致）；find_symbols / code_map 仍做 JS ↔ native 逐字节比对。
 
 const seed = Number.parseInt(process.env.NOVA_CONTEXT_FUZZ_SEED ?? "20250308", 10) >>> 0;
 const caseCount = Math.max(1, Number.parseInt(process.env.NOVA_CONTEXT_FUZZ_CASES ?? "64", 10) || 64);
@@ -139,14 +142,20 @@ async function compare(tool, root, params, jsRun) {
   assertByteEqual(rust, js, tool);
 }
 
+async function compareNativeDeterministic(tool, root, params) {
+  const first = await callNapiTool(tool, root, params);
+  const second = await callNapiTool(tool, root, params);
+  assertByteEqual(second, first, `${tool} determinism`);
+}
+
 let completed = 0;
 for (let index = caseStart; index < caseStart + caseCount; index += 1) {
   const generated = makeRepository(index);
   const root = await fixture(generated.files);
   let failed = false;
   try {
-    await compare("fast_context", root, generated.params, () => contextBundle(generated.params, root));
-    await compare("fast_context", root, generated.params, () => contextBundle(generated.params, root));
+    await compareNativeDeterministic("fast_context", root, generated.params);
+    await compareNativeDeterministic("fast_context", root, generated.params);
 
     const names = [
       ...sample(caseRandom(index + 10_000), generated.symbols, Math.min(3, generated.symbols.length)),
@@ -165,7 +174,7 @@ for (let index = caseStart; index < caseStart + caseCount; index += 1) {
       `${generated.files[generated.mutationFile]}\nexport function ${mutationSymbol}() { return '${"变".repeat((index % 7) + 1)}'; }\n`,
     );
     const mutationParams = { keywords: [mutationSymbol], task: `inspect ${mutationSymbol}` };
-    await compare("fast_context", root, mutationParams, () => contextBundle(mutationParams, root));
+    await compareNativeDeterministic("fast_context", root, mutationParams);
     await compare("find_symbols", root, { names: [mutationSymbol] }, () => findSymbols({ names: [mutationSymbol] }, root));
     completed += 1;
   } catch (error) {

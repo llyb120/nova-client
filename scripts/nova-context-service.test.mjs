@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -7,7 +8,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { callGlobalContextTool } from "./nova-context-client.mjs";
-import { contextBundle } from "./ctx-core.mjs";
+import { callNapiTool } from "./nova-napi-tools.mjs";
+
+// fast_context 的唯一实现是 Rust native（JS 镜像已移除）。
+const fastContextNative = (args, root) => callNapiTool("fast_context", root, args ?? {});
 
 const execFileAsync = promisify(execFile);
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
@@ -29,7 +33,7 @@ test("fast_context prioritizes resolved targets and lets required units exceed l
     const filler = Array.from({ length: 830 }, (_, index) => `export const PAD_${index} = ${index};`).join("\n");
     await writeFile(join(root, "large_target.ts"), `export function requiredTarget() {\n${body}\n  return value_139;\n}\n${filler}\nexport function unrelatedLaterFlow() { return 1; }\n`);
 
-    const output = await contextBundle({
+    const output = await fastContextNative({
       task: "inspect requiredTarget implementation",
       budget: 100,
       maxBytes: 32768,
@@ -57,7 +61,7 @@ test("fast_context closes third-level dependencies and samples caller behaviors"
     await writeFile(join(root, "awaitCaller.ts"), "import { targetApi } from './target';\nexport async function awaitCaller(input) { return await targetApi(input); }\n");
     await writeFile(join(root, "errorCaller.ts"), "import { targetApi } from './target';\nexport function errorCaller(input) { try { return targetApi(input); } catch { return null; } }\n");
 
-    const output = await contextBundle({
+    const output = await fastContextNative({
       keywords: ["targetApi"],
       task: "修改 targetApi 签名并保持调用方兼容",
       budget: 180,
@@ -84,7 +88,7 @@ test("fast_context guarantees explicit caller/test representatives under tight l
     await writeFile(join(root, "errorCaller.ts"), "import { targetApi } from './target';\nexport function errorCaller(input) { try { return targetApi(input); } catch { return null; } }\n");
     await writeFile(join(root, "target.test.ts"), "import { targetApi } from './target';\nexport function targetContract() { return targetApi('x') === 'x'; }\n");
 
-    const output = await contextBundle({
+    const output = await fastContextNative({
       keywords: ["targetApi"],
       task: "修改 targetApi 签名，检查调用方和测试",
       budget: 100,
@@ -98,7 +102,11 @@ test("fast_context guarantees explicit caller/test representatives under tight l
   }
 });
 
-test("different Node processes share one global context service", async () => {
+test("different Node processes share one global context service", async (t) => {
+  if (!existsSync(bundledService)) {
+    t.skip(`bundled service not built: ${bundledService} (run npm run build:nova-context-service)`);
+    return;
+  }
   const root = await mkdtemp(join(tmpdir(), "nova-context-service-"));
   const endpoint = process.platform === "win32"
     ? `\\\\.\\pipe\\nova-context-test-${process.pid}-${Date.now()}`
@@ -137,10 +145,14 @@ test("different Node processes share one global context service", async () => {
     const params = { keywords: ["sharedTarget"] };
     const context = await callGlobalContextTool("fast_context", root, params);
     assert.match(context, /sharedTarget/);
-    assert.equal(context, await contextBundle(params, root));
+    assert.equal(context, await fastContextNative(params, root));
   } finally {
+    // 先挂 exit 监听再 kill：进程可能已退出（如构建产物缺失），事后挂监听会永等。
+    const exited = service.exitCode !== null || service.signalCode !== null
+      ? Promise.resolve()
+      : new Promise((done) => service.once("exit", done));
     service.kill();
-    await new Promise((done) => service.once("exit", done));
+    await exited;
     if (previousEndpoint === undefined) delete process.env.NOVA_CONTEXT_SERVICE_ENDPOINT;
     else process.env.NOVA_CONTEXT_SERVICE_ENDPOINT = previousEndpoint;
     if (previousToken === undefined) delete process.env.NOVA_CONTEXT_SERVICE_TOKEN;

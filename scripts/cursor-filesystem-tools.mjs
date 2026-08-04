@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
-import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { callNapiTool } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
 
 /**
@@ -25,13 +26,15 @@ export function createCursorFilesystemTools(cwd, options = {}) {
           task: { type: "string", description: "一句话任务描述，用于补充检索词和排序" },
           files: { type: "array", maxItems: 6, items: { type: "string" }, description: "已知必看文件，可与 keywords/task 同用" },
           budget: { type: "integer", minimum: 100, maximum: 1200, description: "完整代码单元行预算，默认 600" },
-          maxBytes: { type: "integer", minimum: 8192, maximum: 65536, description: "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" },
+          maxBytes: { type: "integer", minimum: 8192, maximum: 65536, description: "输出硬预算，默认 32768；仅按完整文�?单元边界收敛" },
+          coupling: { type: "boolean", description: "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" },
         },
         additionalProperties: false,
       },
       async execute(params) {
         const args = params ?? {};
-        return await callContextToolOrLocal("fast_context", root, args, () => contextBundle(args, root));
+        // fast_context 只有 Rust native 实现（JS 镜像已移除）；无全局 service 时直走 native。
+        return await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
       },
     },
     find_symbols: {

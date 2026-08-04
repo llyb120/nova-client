@@ -46,7 +46,7 @@ const SIG_MAX_CHARS = 120;
 
 // Keep in lockstep with native context.rs CACHE_VERSION. Shared versioning prevents one backend
 // from ranking stale symbols after scanner/query changes while the other rebuilt its own cache.
-export const INDEX_CACHE_VERSION = 12;
+export const INDEX_CACHE_VERSION = 13;
 const INDEX_CACHE_NAME = 'cache.json';
 const INDEX_DIR_NAME = 'codemap';
 const INDEX_MAX_BYTES = 20 * 1024 * 1024;

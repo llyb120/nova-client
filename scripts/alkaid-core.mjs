@@ -16,9 +16,9 @@ import { existsSync } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
-import { contextBundle, findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
 import { applySmartEdits } from "./alkaid-smart-edit.mjs";
-import { callNapiToolOrFallback } from "./nova-napi-tools.mjs";
+import { callNapiTool, callNapiToolOrFallback } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
 
 /** Reasonix-style per-tool context budget. Full oversized text is archived before truncation. */
@@ -463,11 +463,13 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
         task: Type.Optional(Type.String({ description: "一句话任务描述，用于补充检索词和排序" })),
         files: Type.Optional(Type.Array(Type.String(), { maxItems: 6, description: "已知必看文件，可与 keywords/task 同用" })),
         budget: Type.Optional(Type.Integer({ minimum: 100, maximum: 1200, description: "完整代码单元行预算，默认 600" })),
-        maxBytes: Type.Optional(Type.Integer({ minimum: 8192, maximum: 65536, description: "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" })),
+        maxBytes: Type.Optional(Type.Integer({ minimum: 8192, maximum: 65536, description: "输出硬预算，默认 32768；仅按完整文�?单元边界收敛" })),
+        coupling: Type.Optional(Type.Boolean({ description: "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" })),
       }),
       async execute(_id, params) {
         const args = params ?? {};
-        return textResult(await callContextToolOrLocal("fast_context", root, args, () => contextBundle(args, root)));
+        // fast_context 只有 Rust native 实现（JS 镜像已移除）；无全局 service 时直走 native。
+        return textResult(await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args)));
       },
     },
     {
