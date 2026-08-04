@@ -1526,10 +1526,8 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
   const resumedFireStep = resumeFireRelay(threadId);
   // 非 Fire 会话再尝试挂回通用工作流；只读阶段会改写为续跑提示。
   const workflowOutbound = resumedFireStep ? null : prepareWorkflowPrompt(threadId, text);
-  const currentMode =
-    state.currentId === threadId
-      ? state.mode
-      : (state.threads.find((t) => t.id === threadId)?.mode ?? "");
+  // ThreadMeta 不持久化 mode：非当前会话按未知处理，无条件在后端置为 build。
+  const currentMode = state.currentId === threadId ? state.mode : "";
   // 一律 Build：含历史 Plan 会话、以及后端原生 bypass/agent 等。
   if ((currentMode || "").toLowerCase() !== "build") {
     await api.setThreadMode(threadId, "build");
