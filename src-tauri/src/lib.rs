@@ -1367,13 +1367,16 @@ fn precheck_worktree_branch(repo: &str, branch: &str, base: &str) -> Result<bool
 }
 
 /// 同一仓库和分支已有 Nova 管理的 worktree 时直接复用，避免再次 `git worktree add`。
+/// 分支已被 git 检出到链接工作树但 Nova 未登记（如外部手动 `git worktree add`）时，
+/// 静默登记该工作目录并复用；检出目录是主工作区或已不存在时返回 None，由调用方报错。
+/// 返回 (worktree, 是否为本次新登记)。
 fn reuse_worktree(
     state: &AppState,
     repo: &str,
     branch: &str,
     thread_id: Option<String>,
     roaming: bool,
-) -> Option<Worktree> {
+) -> Option<(Worktree, bool)> {
     if branch.is_empty() {
         return None;
     }
@@ -1384,16 +1387,38 @@ fn reuse_worktree(
             && record.branch == branch
             && Path::new(&record.path).is_dir()
             && Path::new(&record.path) == Path::new(&checked_out)
-    })?;
-    record.thread_id = thread_id;
-    record.roaming = roaming;
+    });
+    if let Some(record) = record {
+        record.thread_id = thread_id;
+        record.roaming = roaming;
+        let worktree = Worktree {
+            repo: record.repo.clone(),
+            path: record.path.clone(),
+            branch: record.branch.clone(),
+        };
+        store.save();
+        return Some((worktree, false));
+    }
+    // 未登记：静默接管已存在的链接工作树（主工作区不接管）
+    if Path::new(&checked_out) == Path::new(repo) || !Path::new(&checked_out).is_dir() {
+        return None;
+    }
     let worktree = Worktree {
-        repo: record.repo.clone(),
-        path: record.path.clone(),
-        branch: record.branch.clone(),
+        repo: repo.to_string(),
+        path: checked_out.clone(),
+        branch: branch.to_string(),
     };
-    store.save();
-    Some(worktree)
+    store.add(WorktreeRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        repo: repo.to_string(),
+        path: checked_out,
+        branch: branch.to_string(),
+        thread_id,
+        roaming,
+        owned_branch: false,
+        created_at: now_ms(),
+    });
+    Some((worktree, true))
 }
 
 /// 为 dir 所在 git 仓库创建一个 worktree 并登记到 WorktreeStore：
@@ -1419,7 +1444,7 @@ pub fn create_worktree_for(
     } else {
         &branch
     };
-    if let Some(worktree) =
+    if let Some((worktree, _adopted)) =
         reuse_worktree(state, &repo, requested_branch, thread_id.clone(), roaming)
     {
         return Ok(worktree);
@@ -1518,7 +1543,7 @@ async fn create_thread(
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let requested_branch = if branch.is_empty() { &base } else { &branch };
-        if let Some(worktree) = reuse_worktree(
+        if let Some((worktree, adopted)) = reuse_worktree(
             state.inner(),
             &repo,
             requested_branch,
@@ -1527,7 +1552,14 @@ async fn create_thread(
         ) {
             thread.cwd = worktree.path.clone();
             thread.worktree = Some(worktree);
-            thread.push_system("已复用现有 git worktree，开始执行".into(), "info");
+            thread.push_system(
+                if adopted {
+                    format!("已静默添加现有工作目录并切换：{}，开始执行", thread.cwd)
+                } else {
+                    "已复用现有 git worktree，开始执行".to_string()
+                },
+                "info",
+            );
             {
                 let mut store = state.store.lock().unwrap();
                 store.threads.push(thread.clone());
