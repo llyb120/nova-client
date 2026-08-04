@@ -89,10 +89,13 @@ export function Composer() {
     resizeInput();
   });
 
-  const insertShortcutText = (snippet: string): boolean => {
-    if (!textareaRef || document.activeElement !== textareaRef) return false;
-    const start = textareaRef.selectionStart ?? text().length;
-    const end = textareaRef.selectionEnd ?? start;
+  const insertShortcutText = (snippet: string, mayFocus: boolean): boolean => {
+    if (!textareaRef) return false;
+    const focused = document.activeElement === textareaRef;
+    // 焦点不在输入框：允许全局触发时先聚焦并追加到末尾；否则忽略（如其它输入框里的无修饰键输入）。
+    if (!focused && !mayFocus) return false;
+    const start = focused ? (textareaRef.selectionStart ?? text().length) : text().length;
+    const end = focused ? (textareaRef.selectionEnd ?? start) : text().length;
     const next = `${text().slice(0, start)}${snippet}${text().slice(end)}`;
     const nextCursor = start + snippet.length;
     setText(next);

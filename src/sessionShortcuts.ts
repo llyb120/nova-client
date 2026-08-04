@@ -154,8 +154,12 @@ export function mountSessionShortcuts(options: {
     quotaPeer?: { token: string; name: string } | null,
   ) => void;
   onNewSession?: () => void;
-  /** 返回 true 表示已插入到当前会话输入框。 */
-  onInsertText?: (text: string) => boolean;
+  /**
+   * 返回 true 表示已插入到当前会话输入框。
+   * mayFocus=true 表示允许先聚焦输入框再插入（焦点在别处时的全局触发）；
+   * false 表示仅在输入框已聚焦时处理（避免抢走其它可编辑区的无修饰键输入）。
+   */
+  onInsertText?: (text: string, mayFocus: boolean) => boolean;
   /** 返回 true 表示已终止当前回合（例如正在运行且未被其它 Esc 用途占用）。 */
   onStopSession?: () => boolean;
 }): void {
@@ -181,8 +185,10 @@ export function mountSessionShortcuts(options: {
     }
 
     if (hit.action === "insertText") {
-      if (!isEditableTarget(event.target)) return;
-      const handled = options.onInsertText?.(hit.target) ?? false;
+      // 任意位置可触发：焦点不在会话输入框时先聚焦再插入。
+      // 无修饰键的快捷键只作用于已聚焦的输入框，避免抢走其它可编辑区的正常输入。
+      const mayFocus = !(isEditableTarget(event.target) && !shortcutHasModifier(hit.keys));
+      const handled = options.onInsertText?.(hit.target, mayFocus) ?? false;
       if (!handled) return;
       event.preventDefault();
       event.stopPropagation();
