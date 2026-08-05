@@ -652,13 +652,13 @@ export function buildAlkaidSystemPrompt(options = {}) {
         ? "你拥有批量增强 edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。"
         : "你拥有 PI coding agent 的原生 read、bash、edit、write 工具。"}以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 fast_context/find_symbols。`
         + (fastContext
-          ? "计划修改两个及以上本会话未读过的文件、或修改点分布不明时，先调用一次 fast_context（只要定义/引用行号时用 find_symbols）；一次调用通常替代 5–10 轮 rg+read 往返。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
+          ? "任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（只要定义/引用行号时用 find_symbols）；一次调用通常替代 5–10 轮 rg+read 往返。拿不准是否涉及多个文件、或只是先分析要改哪里而不写代码时，同样按涉及处理，先调用 fast_context。find_symbols 只用于拿行号；定位后仍需阅读两个及以上文件正文时，把文件清单传给 fast_context 的 files 一次打包，不要逐个 read。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
           : "未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；")
         + `大文件禁止无目的全量读取。${editFiles
           ? "修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。"
           : "修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。"}已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。`,
       (fastContext
-        ? "搜索与遍历必须成本有界。路径和行段已明确时直接 read；修改点分布不明、或计划修改两个及以上未读文件时，先调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返），只要定义/引用位置时用 find_symbols。fast_context 已展示范围视为已读；SIG/IMPACT 仅在确需函数体时精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
+        ? "搜索与遍历必须成本有界。路径和行段已明确且只需少量行段时直接 read；任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返），只要定义/引用位置时用 find_symbols。fast_context 已展示范围视为已读；SIG/IMPACT 仅在确需函数体时精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调；返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
         : "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。")
         + "除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
