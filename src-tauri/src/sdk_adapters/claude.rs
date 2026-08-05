@@ -21,6 +21,15 @@ impl SdkAdapter for ClaudeAdapter {
         )
     }
 
+    /// nova-tools MCP（fast_context / find_symbols / edit_files）随 bridge 释放到 runtime 目录，
+    /// 由 bridge 在 query 时通过 mcpServers 挂载。
+    fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
+        &[(
+            "nova-tools-mcp.mjs",
+            include_bytes!("../../resources/nova-tools-mcp.mjs"),
+        )]
+    }
+
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
             program: settings.claudecode_path.clone(),
@@ -28,7 +37,15 @@ impl SdkAdapter for ClaudeAdapter {
             path_env: "NOVA_CLAUDE_PATH",
             api_key: (!settings.claudecode_sdk_api_key.is_empty())
                 .then(|| ("ANTHROPIC_API_KEY", settings.claudecode_sdk_api_key.clone())),
-            extra_env: Vec::new(),
+            extra_env: vec![(
+                "NOVA_FAST_CONTEXT",
+                if settings.fast_context_enabled {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            )],
         }
     }
 

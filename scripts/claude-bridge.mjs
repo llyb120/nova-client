@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
@@ -19,6 +20,23 @@ function claudePathOverride() {
   return [...roots]
     .map((root) => join(root, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"))
     .find(existsSync);
+}
+
+/** 为 Claude 会话挂载 nova-tools MCP（fast_context / find_symbols / edit_files）；runtime 脚本缺失时不挂载。 */
+function novaToolsMcpServers(request, env = process.env) {
+  const script = join(env.NOVA_DATA_DIR || join(homedir(), ".nova"), "runtime", "nova-tools-mcp.mjs");
+  if (!existsSync(script)) return undefined;
+  const serverEnv = {
+    NOVA_TOOLS_CWD: request.cwd,
+    NOVA_FAST_CONTEXT: env.NOVA_FAST_CONTEXT ?? "1",
+  };
+  if (request.mode === "plan") serverEnv.NOVA_TOOLS_READ_ONLY = "1";
+  for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN"]) {
+    if (env[key]) serverEnv[key] = env[key];
+  }
+  return {
+    "nova-tools": { type: "stdio", command: process.execPath, args: [script], env: serverEnv },
+  };
 }
 
 function claudeModelOptions(models) {
@@ -161,6 +179,7 @@ async function main() {
     prompt,
     options: {
       cwd: request.cwd,
+      mcpServers: novaToolsMcpServers(request),
       resume: request.sessionId || undefined,
       resumeSessionAt: request.restoreAt || undefined,
       forkSession: Boolean(request.restoreAt),
@@ -198,4 +217,4 @@ async function main() {
 
 if (process.env.NOVA_CLAUDE_BRIDGE_TEST !== "1") main().catch((error) => { send({ ok: false, error: error instanceof Error ? error.message : String(error) }); process.exitCode = 1; });
 
-export { assistantItems, claudeModelOptions, claudeModelSelection, promptText, streamEventItem };
+export { assistantItems, claudeModelOptions, claudeModelSelection, novaToolsMcpServers, promptText, streamEventItem };

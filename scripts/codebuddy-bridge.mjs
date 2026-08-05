@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
-import { win32 } from "node:path";
+import { homedir } from "node:os";
+import { join, win32 } from "node:path";
 import { createInterface } from "node:readline";
 import { query, unstable_v2_createSession } from "@tencent-ai/agent-sdk";
 
@@ -22,6 +23,23 @@ function resolveCodeBuddyCliPath(cliPath, fileExists = existsSync) {
 
 function permissionModeFor(mode) {
   return mode === "plan" ? "plan" : "bypassPermissions";
+}
+
+/** 为 CodeBuddy 会话挂载 nova-tools MCP（fast_context / find_symbols / edit_files）；runtime 脚本缺失时不挂载。 */
+function novaToolsMcpServers(request, env = process.env) {
+  const script = join(env.NOVA_DATA_DIR || join(homedir(), ".nova"), "runtime", "nova-tools-mcp.mjs");
+  if (!existsSync(script)) return undefined;
+  const serverEnv = {
+    NOVA_TOOLS_CWD: request.cwd,
+    NOVA_FAST_CONTEXT: env.NOVA_FAST_CONTEXT ?? "1",
+  };
+  if (request.mode === "plan") serverEnv.NOVA_TOOLS_READ_ONLY = "1";
+  for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN"]) {
+    if (env[key]) serverEnv[key] = env[key];
+  }
+  return {
+    "nova-tools": { type: "stdio", command: process.execPath, args: [script], env: serverEnv },
+  };
 }
 
 async function readRequest(lines) {
@@ -122,6 +140,7 @@ async function runPrompt(lines, request) {
     prompt: promptMessages(request),
     options: {
       cwd: request.cwd,
+      mcpServers: novaToolsMcpServers(request),
       resume: request.sessionId || undefined,
       resumeSessionAt: request.restoreAt || undefined,
       forkSession: Boolean(request.restoreAt),
@@ -239,4 +258,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { assistantItems, assistantText, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem };
+export { assistantItems, assistantText, novaToolsMcpServers, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem };

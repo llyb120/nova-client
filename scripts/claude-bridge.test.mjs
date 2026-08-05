@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 process.env.NOVA_CLAUDE_BRIDGE_TEST = "1";
-const { assistantItems, claudeModelOptions, claudeModelSelection, promptText, streamEventItem } = await import("./claude-bridge.mjs");
+const { assistantItems, claudeModelOptions, claudeModelSelection, novaToolsMcpServers, promptText, streamEventItem } = await import("./claude-bridge.mjs");
 
 assert.deepEqual(claudeModelOptions([
   {
@@ -58,3 +58,30 @@ assert.deepEqual(assistantItems({
   arguments: { path: "a" },
   status: "in_progress",
 }]);
+
+const { mkdir, mkdtemp, writeFile } = await import("node:fs/promises");
+const { tmpdir } = await import("node:os");
+const { join } = await import("node:path");
+
+const novaHome = await mkdtemp(join(tmpdir(), "nova-claude-mcp-"));
+assert.equal(novaToolsMcpServers({ cwd: "D:/repo", mode: "build" }, { NOVA_DATA_DIR: join(novaHome, "missing") }), undefined);
+await mkdir(join(novaHome, "runtime"), { recursive: true });
+await writeFile(join(novaHome, "runtime", "nova-tools-mcp.mjs"), "// stub\n");
+const planServers = novaToolsMcpServers({ cwd: "D:/repo", mode: "plan" }, {
+  NOVA_DATA_DIR: novaHome,
+  NOVA_FAST_CONTEXT: "0",
+  NOVA_CONTEXT_SERVICE_ENDPOINT: "http://127.0.0.1:9",
+  NOVA_CONTEXT_SERVICE_TOKEN: "token",
+});
+assert.equal(planServers["nova-tools"].command, process.execPath);
+assert.deepEqual(planServers["nova-tools"].args, [join(novaHome, "runtime", "nova-tools-mcp.mjs")]);
+assert.deepEqual(planServers["nova-tools"].env, {
+  NOVA_TOOLS_CWD: "D:/repo",
+  NOVA_FAST_CONTEXT: "0",
+  NOVA_TOOLS_READ_ONLY: "1",
+  NOVA_CONTEXT_SERVICE_ENDPOINT: "http://127.0.0.1:9",
+  NOVA_CONTEXT_SERVICE_TOKEN: "token",
+});
+const buildServers = novaToolsMcpServers({ cwd: "/repo", mode: "build" }, { NOVA_DATA_DIR: novaHome });
+assert.equal(buildServers["nova-tools"].env.NOVA_TOOLS_READ_ONLY, undefined);
+assert.equal(buildServers["nova-tools"].env.NOVA_FAST_CONTEXT, "1");
