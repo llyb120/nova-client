@@ -3,11 +3,14 @@
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
-const COMPLETION_MAX_TOKENS: u32 = 64;
+const COMPLETION_MAX_TOKENS: u32 = 48;
+/// 流式收到足够续写后立刻返回并断开连接，缩短体感等待。
+const COMPLETION_EARLY_MIN_CHARS: usize = 24;
+const COMPLETION_EARLY_HARD_CHARS: usize = 64;
 
 #[derive(Debug, Clone)]
 struct ResolvedCompletionTarget {
@@ -20,6 +23,18 @@ struct ResolvedCompletionTarget {
     thinking_format: Option<String>,
     max_tokens_field: &'static str,
     reasoning: bool,
+}
+
+struct CachedConfig {
+    path: PathBuf,
+    mtime: Option<SystemTime>,
+    server_fingerprint: u64,
+    config: Value,
+}
+
+fn config_cache() -> &'static Mutex<Option<CachedConfig>> {
+    static CACHE: OnceLock<Mutex<Option<CachedConfig>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
 }
 
 /// 用已有 reqwest 连接池直调补全；仅支持 openai-completions / openai-responses。
@@ -49,22 +64,12 @@ async fn complete_openai_completions(
     let mut body = json!({
         "model": target.model_id,
         "messages": [{ "role": "user", "content": prompt }],
-        "stream": false,
+        "stream": true,
     });
     body[target.max_tokens_field] = json!(COMPLETION_MAX_TOKENS);
-    if target.reasoning {
-        match target.thinking_format.as_deref() {
-            Some("deepseek") | Some("zai") => {
-                body["thinking"] = json!({ "type": "disabled" });
-            }
-            Some("qwen") => {
-                body["enable_thinking"] = json!(false);
-            }
-            _ => {}
-        }
-    }
-    let response = post_json(http, &url, &target.api_key, &target.headers, body).await?;
-    extract_completions_text(&response)
+    apply_thinking_disabled_completions(&mut body, target);
+    let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
+    read_completions_sse(&mut response).await
 }
 
 async fn complete_openai_responses(
@@ -76,27 +81,43 @@ async fn complete_openai_responses(
     let mut body = json!({
         "model": target.model_id,
         "input": [{ "role": "user", "content": prompt }],
-        "stream": false,
+        "stream": true,
         "store": false,
         "max_output_tokens": COMPLETION_MAX_TOKENS.max(16),
     });
     if target.reasoning {
         body["reasoning"] = json!({ "effort": "none" });
     }
-    let response = post_json(http, &url, &target.api_key, &target.headers, body).await?;
-    extract_responses_text(&response)
+    let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
+    read_responses_sse(&mut response).await
 }
 
-async fn post_json(
+fn apply_thinking_disabled_completions(body: &mut Value, target: &ResolvedCompletionTarget) {
+    if !target.reasoning {
+        return;
+    }
+    match target.thinking_format.as_deref() {
+        Some("deepseek") | Some("zai") => {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        Some("qwen") => {
+            body["enable_thinking"] = json!(false);
+        }
+        _ => {}
+    }
+}
+
+async fn post_stream(
     http: &reqwest::Client,
     url: &str,
     api_key: &str,
     headers: &Map<String, Value>,
     body: Value,
-) -> Result<Value, String> {
+) -> Result<reqwest::Response, String> {
     let mut req = http
         .post(url)
         .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
         .json(&body)
         .timeout(Duration::from_secs(12));
     if !api_key.is_empty() {
@@ -109,11 +130,11 @@ async fn post_json(
     }
     let response = req.send().await.map_err(|e| format!("补全请求失败：{e}"))?;
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("读取补全响应失败：{e}"))?;
     if !status.is_success() {
+        let text = response
+            .text()
+            .await
+            .unwrap_or_default();
         let message = text.trim();
         return Err(if message.is_empty() {
             format!("补全 HTTP {status}")
@@ -121,7 +142,130 @@ async fn post_json(
             format!("补全 HTTP {status}：{message}")
         });
     }
-    serde_json::from_str(&text).map_err(|e| format!("解析补全响应失败：{e}"))
+    Ok(response)
+}
+
+async fn read_completions_sse(response: &mut reqwest::Response) -> Result<String, String> {
+    let mut buffer = String::new();
+    let mut out = String::new();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|e| format!("读取补全流失败：{e}"))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(idx) = buffer.find('\n') {
+            let mut line = buffer[..idx].to_string();
+            buffer.drain(..=idx);
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            let Some(data) = sse_data_payload(&line) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                return Ok(out.trim().to_string());
+            }
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            // 非流式回退：偶发代理把 stream 请求仍按整包 JSON 返回
+            if value.get("choices").is_some() && value.pointer("/choices/0/delta").is_none() {
+                return extract_completions_text(&value);
+            }
+            if let Some(delta) = value
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+            {
+                out.push_str(delta);
+                if should_early_stop(&out) {
+                    return Ok(out.trim().to_string());
+                }
+            }
+        }
+    }
+    Ok(out.trim().to_string())
+}
+
+async fn read_responses_sse(response: &mut reqwest::Response) -> Result<String, String> {
+    let mut buffer = String::new();
+    let mut out = String::new();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|e| format!("读取补全流失败：{e}"))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(idx) = buffer.find('\n') {
+            let mut line = buffer[..idx].to_string();
+            buffer.drain(..=idx);
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            let Some(data) = sse_data_payload(&line) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                return Ok(out.trim().to_string());
+            }
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            // 非流式整包
+            if value.get("output").is_some() || value.get("output_text").is_some() {
+                return extract_responses_text(&value);
+            }
+            let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+            let delta = match kind {
+                "response.output_text.delta" | "response.text.delta" => value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                _ => value
+                    .pointer("/delta/text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            };
+            if let Some(delta) = delta {
+                out.push_str(&delta);
+                if should_early_stop(&out) {
+                    return Ok(out.trim().to_string());
+                }
+            }
+        }
+    }
+    Ok(out.trim().to_string())
+}
+
+fn sse_data_payload(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("data:") {
+        return None;
+    }
+    Some(trimmed[5..].trim_start())
+}
+
+fn should_early_stop(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    if len >= COMPLETION_EARLY_HARD_CHARS {
+        return true;
+    }
+    if len < COMPLETION_EARLY_MIN_CHARS {
+        return false;
+    }
+    matches!(
+        chars.last(),
+        Some(
+            '。' | '！' | '？' | '；' | '，' | '、' | '!' | '?' | ';' | ',' | '\n' | '…'
+        )
+    )
 }
 
 fn extract_completions_text(response: &Value) -> Result<String, String> {
@@ -178,8 +322,33 @@ fn content_to_text(content: &Value) -> String {
         .join("")
 }
 
+fn fingerprint_server_config(server_config: &Option<Value>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    match server_config {
+        Some(value) => value.to_string().hash(&mut hasher),
+        None => 0u8.hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
 fn load_merged_config(data_dir: &Path, server_config: Option<Value>) -> Result<Value, String> {
     let path = data_dir.join("alkaid").join("config.jsonc");
+    let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+    let server_fingerprint = fingerprint_server_config(&server_config);
+    {
+        let cache = config_cache().lock().unwrap();
+        if let Some(cached) = cache.as_ref() {
+            if cached.path == path
+                && cached.mtime == mtime
+                && cached.server_fingerprint == server_fingerprint
+            {
+                return Ok(cached.config.clone());
+            }
+        }
+    }
+
     let local = match std::fs::read_to_string(&path) {
         Ok(text) => parse_jsonc(&text)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -190,10 +359,19 @@ fn load_merged_config(data_dir: &Path, server_config: Option<Value>) -> Result<V
         }
         Err(error) => return Err(format!("读取 Vega 配置失败：{error}")),
     };
-    let merged = merge_objects(server_config.unwrap_or_else(|| Value::Object(Map::new())), local);
+    let merged = merge_objects(
+        server_config.unwrap_or_else(|| Value::Object(Map::new())),
+        local,
+    );
     if !merged.get("provider").map(Value::is_object).unwrap_or(false) {
         return Err("Vega 配置缺少 provider".into());
     }
+    *config_cache().lock().unwrap() = Some(CachedConfig {
+        path,
+        mtime,
+        server_fingerprint,
+        config: merged.clone(),
+    });
     Ok(merged)
 }
 
@@ -534,5 +712,19 @@ mod tests {
             "choices": [{ "message": { "content": "  world  " } }]
         });
         assert_eq!(extract_completions_text(&response).unwrap(), "world");
+    }
+
+    #[test]
+    fn early_stop_on_sentence_or_hard_cap() {
+        assert!(!should_early_stop("短"));
+        assert!(!should_early_stop("还不够长的句子。"));
+        assert!(should_early_stop(
+            "这是一句已经超过最小字数阈值、可以在顿号处早停、"
+        ));
+        assert!(should_early_stop(
+            "这是一句已经超过最小字数阈值，可以在逗号处早停，"
+        ));
+        let hard: String = "字".repeat(COMPLETION_EARLY_HARD_CHARS);
+        assert!(should_early_stop(&hard));
     }
 }

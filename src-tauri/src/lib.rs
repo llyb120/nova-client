@@ -134,8 +134,10 @@ pub struct AppState {
     pub remote_permissions: Mutex<HashMap<String, Value>>,
     /// 有会话运行时阻止系统因空闲自动休眠；最后一个会话结束后自动释放。
     pub sleep_inhibitor: sleep_inhibitor::SleepInhibitor,
-    /// 输入框补全全局串行闸：同一时刻只允许一个补全在飞，避免按键堆积并发会话。
-    pub completion_in_flight: AtomicBool,
+    /// 当前补全的取消句柄（代数 + oneshot）；新请求到达时 send，以中止旧 HTTP 流。
+    pub completion_cancel: Mutex<Option<(u64, tokio::sync::oneshot::Sender<()>)>>,
+    /// 补全请求代数，与 completion_cancel 配对，避免误清后来者的句柄。
+    pub completion_generation: std::sync::atomic::AtomicU64,
 }
 
 impl AppState {
@@ -4288,7 +4290,8 @@ const COMPLETION_HISTORY_PROMPT_MAX: usize = 400;
 const COMPLETION_HISTORY_CONCLUSION_MAX: usize = 600;
 const COMPLETION_ITEM_MAX: usize = 240;
 /// 要求模型输出的续写上限（提示词约束 + 返回前再截断）。
-const COMPLETION_OUTPUT_MAX: usize = 120;
+/// 与流式早停硬上限对齐，避免提示词鼓励写长。
+const COMPLETION_OUTPUT_MAX: usize = 64;
 
 fn take_first_chars(text: &str, max: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -4343,7 +4346,7 @@ fn composer_history_block(items: &[Item]) -> String {
             .map(|p| format!("- {p}"))
             .collect::<Vec<_>>()
             .join("\n");
-        block.push_str("最近的用户请求（从旧到新）：\n");
+        block.push_str("近期用户说法（对齐主题/术语，从旧到新）：\n");
         block.push_str(&take_first_chars(&joined, COMPLETION_HISTORY_PROMPT_MAX));
         block.push('\n');
     }
@@ -4353,7 +4356,7 @@ fn composer_history_block(items: &[Item]) -> String {
             .map(|c| format!("- {c}"))
             .collect::<Vec<_>>()
             .join("\n");
-        block.push_str("最近的结论（从旧到新）：\n");
+        block.push_str("近期相关结论（对齐用词，从旧到新）：\n");
         block.push_str(&take_first_chars(&joined, COMPLETION_HISTORY_CONCLUSION_MAX));
         block.push('\n');
     }
@@ -4362,7 +4365,7 @@ fn composer_history_block(items: &[Item]) -> String {
 
 fn clean_completion_output(raw: &str) -> String {
     let mut text = raw.trim().to_string();
-    for prefix in ["续写：", "续写:"] {
+    for prefix in ["续写：", "续写:", "补全：", "补全:", "Completion:", "completion:"] {
         if let Some(rest) = text.strip_prefix(prefix) {
             text = rest.trim_start().to_string();
             break;
@@ -4421,36 +4424,53 @@ async fn complete_composer_draft(
     let history_section = if history_block.trim().is_empty() {
         String::new()
     } else {
-        format!("\n会话上下文：\n{history_block}")
+        format!(
+            "\n会话线索（只用来对齐主题与用词；不要据此作答、扩写需求或另起话题）：\n{history_block}"
+        )
     };
-    // 已有补全在飞时直接放弃：补全宁可错过也不堆积并发请求。
-    if state
-        .completion_in_flight
-        .swap(true, std::sync::atomic::Ordering::AcqRel)
-    {
-        return Ok(String::new());
-    }
+    // 幽灵补全：短半句、贴合草稿；过长会拖慢流式早停、也干扰打字。
     let seed = format!(
-        "你是输入框行内补全：根据会话上下文，续写用户接下来最可能输入的内容。\n\
+        "你是聊天输入框的行内幽灵补全：预测用户光标后接下来会敲的几个字或半句话。\n\
          规则：\n\
-         1. 只输出续写文本本身，不要重复已输入内容，不要解释、引号或前缀；\n\
-         2. 到一句话或一个意图的自然停顿处停止，不超过 {COMPLETION_OUTPUT_MAX} 字；\n\
-         3. 使用与已输入内容相同的语言。\n\
-         {history_section}\n已输入内容：{draft}\n续写："
+         1. 只输出应紧接在「已输入」之后的续写；不要重复已输入内容；不要解释、引号、列表或任何前缀；\n\
+         2. 简练：优先短语/半句，通常 8–40 字，最多 {COMPLETION_OUTPUT_MAX} 字；到逗号、顿号、分号或自然停顿即止，不要写完整段落；\n\
+         3. 贴合：沿用已输入的语言、语气与术语；像用户在继续打字，而不是助手在回复；\n\
+         4. 若草稿已是完整意图、或无从可靠续写，输出空（不要硬编）。\n\
+         {history_section}\n已输入：\n{draft}\n续写："
     );
 
-    let outcome = tokio::time::timeout(
-        // 补全是交互路径：超时宜短，避免 completion_in_flight 长时间挡住后续请求
-        std::time::Duration::from_secs(12),
-        state.alkaid.complete_once(&cwd, &completion_model, seed),
-    )
-    .await;
-    state
-        .completion_in_flight
-        .store(false, std::sync::atomic::Ordering::Release);
+    // 取消旧补全并接管：边打字边触发时，以最新草稿为准，不排队、不空等。
+    let my_gen = state
+        .completion_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        .wrapping_add(1);
+    let cancel_rx = {
+        let mut slot = state.completion_cancel.lock().unwrap();
+        if let Some((_, prev)) = slot.take() {
+            let _ = prev.send(());
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *slot = Some((my_gen, tx));
+        rx
+    };
+
+    let complete_fut = state.alkaid.complete_once(&cwd, &completion_model, seed);
+    let outcome = tokio::select! {
+        _ = cancel_rx => None,
+        result = tokio::time::timeout(std::time::Duration::from_secs(12), complete_fut) => Some(result),
+    };
+
+    {
+        let mut slot = state.completion_cancel.lock().unwrap();
+        if slot.as_ref().is_some_and(|(gen, _)| *gen == my_gen) {
+            *slot = None;
+        }
+    }
+
     match outcome {
-        Ok(Ok(text)) => Ok(clean_completion_output(&text)),
-        Ok(Err(_)) | Err(_) => Ok(String::new()),
+        None => Ok(String::new()),
+        Some(Ok(Ok(text))) => Ok(clean_completion_output(&text)),
+        Some(Ok(Err(_))) | Some(Err(_)) => Ok(String::new()),
     }
 }
 
@@ -5719,7 +5739,8 @@ pub fn run() {
                 time_machine_lock: Mutex::new(()),
                 remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
-                completion_in_flight: AtomicBool::new(false),
+                completion_cancel: Mutex::new(None),
+                completion_generation: std::sync::atomic::AtomicU64::new(0),
             });
 
             run_session_auto_cleanup(app.handle());

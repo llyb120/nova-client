@@ -1,8 +1,8 @@
 import { createSignal, onCleanup } from "solid-js";
 import { api } from "./ipc";
 
-const GHOST_IDLE_MS = 200;
-const GHOST_MIN_INTERVAL_MS = 500;
+const GHOST_IDLE_MS = 120;
+const GHOST_MIN_INTERVAL_MS = 280;
 
 export type ComposerGhostOptions = {
   getText: () => string;
