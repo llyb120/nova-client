@@ -133,6 +133,8 @@ pub struct AppState {
     pub remote_permissions: Mutex<HashMap<String, Value>>,
     /// 有会话运行时阻止系统因空闲自动休眠；最后一个会话结束后自动释放。
     pub sleep_inhibitor: sleep_inhibitor::SleepInhibitor,
+    /// 输入框补全全局串行闸：同一时刻只允许一个补全在飞，避免按键堆积并发会话。
+    pub completion_in_flight: AtomicBool,
 }
 
 impl AppState {
@@ -4379,96 +4381,12 @@ fn clean_completion_output(raw: &str) -> String {
     take_first_chars(text.trim(), COMPLETION_OUTPUT_MAX)
 }
 
-/// bridge 不支持一次性 title action 的后端（Devin / Claude / Cursor / OpenCode）：
-/// 走隐藏会话（mind_thread + ephemeral，不进列表、不发 EV_THREADS），跑完即删。
-async fn complete_via_hidden_thread(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    agent_kind: AgentKind,
-    model: String,
-    cwd: String,
-    seed: String,
-) -> Result<String, String> {
-    let model_opt = (!model.trim().is_empty()).then(|| model.trim().to_string());
-    let mut thread = Thread::new(cwd, agent_kind.clone(), model_opt, None, None, true);
-    thread.title = "输入框补全".into();
-    thread.mind_thread = true;
-    let run_id = thread.id.clone();
-    {
-        let mut store = state.store.lock().unwrap();
-        store.threads.push(thread);
-        store.save();
-    }
-    employees::run_employee_prompt(&agent_kind, app, run_id.clone(), seed).await;
-    let output =
-        employees::last_employee_assistant(app, &run_id).filter(|t| !t.trim().is_empty());
-    {
-        let mut store = state.store.lock().unwrap();
-        store.threads.retain(|t| t.id != run_id);
-        store.save();
-    }
-    state.acp.forget_session_of_thread(&run_id);
-    state.codex.forget_session_of_thread(&run_id);
-    state.alkaid.forget_session_of_thread(&run_id);
-    state.codexplus.forget_session_of_thread(&run_id);
-    state.codebuddyplus.forget_session_of_thread(&run_id);
-    state.claudeplus.forget_session_of_thread(&run_id);
-    state.cursorplus.forget_session_of_thread(&run_id);
-    state.opencodeplus.forget_session_of_thread(&run_id);
-    output.ok_or_else(|| "补全模型未返回内容".into())
-}
-
-async fn complete_with_agent(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    agent_kind: AgentKind,
-    model: String,
-    cwd: String,
-    seed: String,
-) -> Result<String, String> {
-    match agent_kind {
-        AgentKind::Alkaid => state.alkaid.complete_once(&cwd, &model, seed).await,
-        AgentKind::Codex | AgentKind::CodexPlus => {
-            state.codexplus.complete_once(&cwd, &model, seed).await
-        }
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-            state.codebuddyplus.complete_once(&cwd, &model, seed).await
-        }
-        _ => complete_via_hidden_thread(app, state, agent_kind, model, cwd, seed).await,
-    }
-}
-
-/// 非 Vega 后端补全后维持预热，下次补全/首轮不冷启动。
-fn keep_agent_prewarmed(state: &AppState, agent_kind: &AgentKind, cwd: String, model: String) {
-    let model_opt = (!model.trim().is_empty()).then(|| model.trim().to_string());
-    match agent_kind {
-        AgentKind::Devin => {
-            let mgr = state.acp.clone();
-            tauri::async_runtime::spawn(async move {
-                mgr.prewarm(cwd).await;
-            });
-        }
-        AgentKind::Codex | AgentKind::CodexPlus => {
-            let mgr = state.codex.clone();
-            tauri::async_runtime::spawn(async move {
-                mgr.prewarm(cwd, model_opt, None).await;
-            });
-        }
-        AgentKind::Cursor => {
-            state
-                .cursorplus
-                .prewarm_idle(cwd, model_opt.unwrap_or_default(), String::new());
-        }
-        _ => {}
-    }
-}
-
-/// 输入框行内补全：用设置的轻量模型续写用户草稿。
+/// 输入框行内补全：用配置的补全模型（仅 Vega）续写用户草稿。
+/// 不运行 agent：bridge 的 complete action 直接对模型 API 发一次 completion。
 /// 上下文 = 当前草稿 + 最近提示词 + 最近结论，各部分均限字数。
-/// 失败/超时静默返回空串，不打断输入。
+/// 未配置补全模型、或失败/超时时静默返回空串，不打断输入。
 #[tauri::command]
 async fn complete_composer_draft(
-    app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: Option<String>,
     draft: String,
@@ -4477,13 +4395,10 @@ async fn complete_composer_draft(
     if draft.trim().is_empty() {
         return Ok(String::new());
     }
-    let (agent_kind, lightweight_model) = {
-        let s = state.settings.lock().unwrap();
-        (
-            AgentKind::from_str(&s.lightweight_model_agent).unwrap_or(AgentKind::Alkaid),
-            s.lightweight_model.trim().to_string(),
-        )
-    };
+    let completion_model = state.settings.lock().unwrap().completion_model.trim().to_string();
+    if completion_model.is_empty() {
+        return Ok(String::new());
+    }
     let (thread_cwd, history_block) = {
         let store = state.store.lock().unwrap();
         match thread_id
@@ -4507,6 +4422,13 @@ async fn complete_composer_draft(
     } else {
         format!("\n会话上下文：\n{history_block}")
     };
+    // 已有补全在飞时直接放弃：补全宁可错过也不堆积并发请求。
+    if state
+        .completion_in_flight
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return Ok(String::new());
+    }
     let seed = format!(
         "你是输入框行内补全：根据会话上下文，续写用户接下来最可能输入的内容。\n\
          规则：\n\
@@ -4518,20 +4440,12 @@ async fn complete_composer_draft(
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        complete_with_agent(
-            &app,
-            state.inner(),
-            agent_kind.clone(),
-            lightweight_model.clone(),
-            cwd.clone(),
-            seed,
-        ),
+        state.alkaid.complete_once(&cwd, &completion_model, seed),
     )
     .await;
-    // 非 Vega：无论成败都维持后端预热，保证下次补全低延迟。
-    if agent_kind != AgentKind::Alkaid {
-        keep_agent_prewarmed(state.inner(), &agent_kind, cwd, lightweight_model);
-    }
+    state
+        .completion_in_flight
+        .store(false, std::sync::atomic::Ordering::Release);
     match outcome {
         Ok(Ok(text)) => Ok(clean_completion_output(&text)),
         Ok(Err(_)) | Err(_) => Ok(String::new()),
@@ -5803,6 +5717,7 @@ pub fn run() {
                 time_machine_lock: Mutex::new(()),
                 remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
+                completion_in_flight: AtomicBool::new(false),
             });
 
             run_session_auto_cleanup(app.handle());

@@ -433,6 +433,8 @@ export interface Settings {
   lightweightModelAgent: string;
   /** 辅助任务所用轻量级模型；失败时回退到任务原模型 */
   lightweightModel: string;
+  /** 输入框补全所用 Vega 模型（provider/model 格式）；空 = 关闭补全 */
+  completionModel: string;
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */
   editor: string;
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */

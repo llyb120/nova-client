@@ -74,6 +74,7 @@ export function Composer() {
   let ghostTimer: number | undefined;
   let ghostReqSeq = 0;
   let ghostLastFired = 0;
+  let ghostBusy = false;
   let ghostCache: { draft: string; completion: string } | undefined;
   let composing = false;
 
@@ -122,9 +123,12 @@ export function Composer() {
       setGhost(ghostCache.completion);
       return;
     }
+    // 已有补全在飞时不叠加新请求，避免堆积
+    if (ghostBusy) return;
     const now = Date.now();
     if (now - ghostLastFired < 1200) return;
     ghostLastFired = now;
+    ghostBusy = true;
     const reqId = ++ghostReqSeq;
     try {
       const completion = await api.completeComposerDraft(state.currentId ?? null, draft);
@@ -135,6 +139,8 @@ export function Composer() {
       setGhost(value);
     } catch {
       if (reqId === ghostReqSeq) ghostCache = undefined;
+    } finally {
+      ghostBusy = false;
     }
   };
 
