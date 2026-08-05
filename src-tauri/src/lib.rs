@@ -4277,6 +4277,267 @@ fn parse_clue_ai_summary(raw: &str, fallback_title: &str) -> ClueAiSummary {
     ClueAiSummary { title, content }
 }
 
+/* ===== 输入框行内补全（轻量模型） ===== */
+
+/// 补全上下文各部分字数预算（字符数）。
+const COMPLETION_DRAFT_MAX: usize = 500;
+const COMPLETION_HISTORY_PROMPT_MAX: usize = 400;
+const COMPLETION_HISTORY_CONCLUSION_MAX: usize = 600;
+const COMPLETION_ITEM_MAX: usize = 240;
+/// 要求模型输出的续写上限（提示词约束 + 返回前再截断）。
+const COMPLETION_OUTPUT_MAX: usize = 120;
+
+fn take_first_chars(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let mut out: String = chars[..max].iter().collect();
+    out.push('…');
+    out
+}
+
+fn take_last_chars(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let mut out = String::from("…");
+    out.extend(&chars[chars.len() - max..]);
+    out
+}
+
+/// 从会话历史拼「最近提示词 + 最近结论」，各部分限字数；结论取末尾（结论通常在后面）。
+fn composer_history_block(items: &[Item]) -> String {
+    let mut prompts: Vec<String> = Vec::new();
+    let mut conclusions: Vec<String> = Vec::new();
+    for item in items.iter().rev() {
+        match item {
+            Item::User { text, .. } if prompts.len() < 3 => {
+                let t = take_last_chars(text.trim(), COMPLETION_ITEM_MAX);
+                if !t.trim().is_empty() {
+                    prompts.push(t.trim().to_string());
+                }
+            }
+            Item::Assistant { text, .. } if conclusions.len() < 2 => {
+                let t = take_last_chars(text.trim(), COMPLETION_ITEM_MAX);
+                if !t.trim().is_empty() {
+                    conclusions.push(t.trim().to_string());
+                }
+            }
+            _ => {}
+        }
+        if prompts.len() >= 3 && conclusions.len() >= 2 {
+            break;
+        }
+    }
+    prompts.reverse();
+    conclusions.reverse();
+    let mut block = String::new();
+    if !prompts.is_empty() {
+        let joined = prompts
+            .iter()
+            .map(|p| format!("- {p}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        block.push_str("最近的用户请求（从旧到新）：\n");
+        block.push_str(&take_first_chars(&joined, COMPLETION_HISTORY_PROMPT_MAX));
+        block.push('\n');
+    }
+    if !conclusions.is_empty() {
+        let joined = conclusions
+            .iter()
+            .map(|c| format!("- {c}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        block.push_str("最近的结论（从旧到新）：\n");
+        block.push_str(&take_first_chars(&joined, COMPLETION_HISTORY_CONCLUSION_MAX));
+        block.push('\n');
+    }
+    block
+}
+
+fn clean_completion_output(raw: &str) -> String {
+    let mut text = raw.trim().to_string();
+    for prefix in ["续写：", "续写:"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.trim_start().to_string();
+            break;
+        }
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() >= 2 {
+        let (first, last) = (chars[0], chars[chars.len() - 1]);
+        if (first == '"' && last == '"')
+            || (first == '“' && last == '”')
+            || (first == '\'' && last == '\'')
+            || (first == '「' && last == '」')
+        {
+            text = chars[1..chars.len() - 1].iter().collect();
+        }
+    }
+    take_first_chars(text.trim(), COMPLETION_OUTPUT_MAX)
+}
+
+/// bridge 不支持一次性 title action 的后端（Devin / Claude / Cursor / OpenCode）：
+/// 走隐藏会话（mind_thread + ephemeral，不进列表、不发 EV_THREADS），跑完即删。
+async fn complete_via_hidden_thread(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    agent_kind: AgentKind,
+    model: String,
+    cwd: String,
+    seed: String,
+) -> Result<String, String> {
+    let model_opt = (!model.trim().is_empty()).then(|| model.trim().to_string());
+    let mut thread = Thread::new(cwd, agent_kind.clone(), model_opt, None, None, true);
+    thread.title = "输入框补全".into();
+    thread.mind_thread = true;
+    let run_id = thread.id.clone();
+    {
+        let mut store = state.store.lock().unwrap();
+        store.threads.push(thread);
+        store.save();
+    }
+    employees::run_employee_prompt(&agent_kind, app, run_id.clone(), seed).await;
+    let output =
+        employees::last_employee_assistant(app, &run_id).filter(|t| !t.trim().is_empty());
+    {
+        let mut store = state.store.lock().unwrap();
+        store.threads.retain(|t| t.id != run_id);
+        store.save();
+    }
+    state.acp.forget_session_of_thread(&run_id);
+    state.codex.forget_session_of_thread(&run_id);
+    state.alkaid.forget_session_of_thread(&run_id);
+    state.codexplus.forget_session_of_thread(&run_id);
+    state.codebuddyplus.forget_session_of_thread(&run_id);
+    state.claudeplus.forget_session_of_thread(&run_id);
+    state.cursorplus.forget_session_of_thread(&run_id);
+    state.opencodeplus.forget_session_of_thread(&run_id);
+    output.ok_or_else(|| "补全模型未返回内容".into())
+}
+
+async fn complete_with_agent(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    agent_kind: AgentKind,
+    model: String,
+    cwd: String,
+    seed: String,
+) -> Result<String, String> {
+    match agent_kind {
+        AgentKind::Alkaid => state.alkaid.complete_once(&cwd, &model, seed).await,
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            state.codexplus.complete_once(&cwd, &model, seed).await
+        }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            state.codebuddyplus.complete_once(&cwd, &model, seed).await
+        }
+        _ => complete_via_hidden_thread(app, state, agent_kind, model, cwd, seed).await,
+    }
+}
+
+/// 非 Vega 后端补全后维持预热，下次补全/首轮不冷启动。
+fn keep_agent_prewarmed(state: &AppState, agent_kind: &AgentKind, cwd: String, model: String) {
+    let model_opt = (!model.trim().is_empty()).then(|| model.trim().to_string());
+    match agent_kind {
+        AgentKind::Devin => {
+            let mgr = state.acp.clone();
+            tauri::async_runtime::spawn(async move {
+                mgr.prewarm(cwd).await;
+            });
+        }
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            let mgr = state.codex.clone();
+            tauri::async_runtime::spawn(async move {
+                mgr.prewarm(cwd, model_opt, None).await;
+            });
+        }
+        AgentKind::Cursor => {
+            state
+                .cursorplus
+                .prewarm_idle(cwd, model_opt.unwrap_or_default(), String::new());
+        }
+        _ => {}
+    }
+}
+
+/// 输入框行内补全：用设置的轻量模型续写用户草稿。
+/// 上下文 = 当前草稿 + 最近提示词 + 最近结论，各部分均限字数。
+/// 失败/超时静默返回空串，不打断输入。
+#[tauri::command]
+async fn complete_composer_draft(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: Option<String>,
+    draft: String,
+) -> Result<String, String> {
+    let draft = take_first_chars(draft.trim_end(), COMPLETION_DRAFT_MAX);
+    if draft.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let (agent_kind, lightweight_model) = {
+        let s = state.settings.lock().unwrap();
+        (
+            AgentKind::from_str(&s.lightweight_model_agent).unwrap_or(AgentKind::Alkaid),
+            s.lightweight_model.trim().to_string(),
+        )
+    };
+    let (thread_cwd, history_block) = {
+        let store = state.store.lock().unwrap();
+        match thread_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| store.get(id))
+        {
+            Some(thread) => (thread.cwd.clone(), composer_history_block(&thread.items)),
+            None => (String::new(), String::new()),
+        }
+    };
+    let cwd = if !thread_cwd.trim().is_empty() && std::path::Path::new(&thread_cwd).is_dir() {
+        thread_cwd
+    } else {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let history_section = if history_block.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n会话上下文：\n{history_block}")
+    };
+    let seed = format!(
+        "你是输入框行内补全：根据会话上下文，续写用户接下来最可能输入的内容。\n\
+         规则：\n\
+         1. 只输出续写文本本身，不要重复已输入内容，不要解释、引号或前缀；\n\
+         2. 到一句话或一个意图的自然停顿处停止，不超过 {COMPLETION_OUTPUT_MAX} 字；\n\
+         3. 使用与已输入内容相同的语言。\n\
+         {history_section}\n已输入内容：{draft}\n续写："
+    );
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        complete_with_agent(
+            &app,
+            state.inner(),
+            agent_kind.clone(),
+            lightweight_model.clone(),
+            cwd.clone(),
+            seed,
+        ),
+    )
+    .await;
+    // 非 Vega：无论成败都维持后端预热，保证下次补全低延迟。
+    if agent_kind != AgentKind::Alkaid {
+        keep_agent_prewarmed(state.inner(), &agent_kind, cwd, lightweight_model);
+    }
+    match outcome {
+        Ok(Ok(text)) => Ok(clean_completion_output(&text)),
+        Ok(Err(_)) | Err(_) => Ok(String::new()),
+    }
+}
+
 /// 接收一条分享，在指定目录新建本地会话，返回新会话 id
 #[tauri::command]
 fn accept_share(
@@ -5862,6 +6123,7 @@ pub fn run() {
             share_thread,
             advanced_share,
             summarize_clue,
+            complete_composer_draft,
             accept_share,
             decline_share,
             share_workflow,

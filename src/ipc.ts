@@ -80,6 +80,9 @@ export const api = {
   removeProject: (cwd: string) => invoke<void>("remove_project", { cwd }),
   prewarm: (cwd: string, agentKind: AgentKind, model?: string | null, mode?: string | null) =>
     invoke<void>("prewarm", { cwd, agentKind, model, mode }),
+  /** 输入框行内补全（轻量模型）；失败时后端静默返回空串 */
+  completeComposerDraft: (threadId: string | null, draft: string) =>
+    invoke<string>("complete_composer_draft", { threadId, draft }),
   scratchDir: () => invoke<string>("scratch_dir"),
   directoryExists: (path: string) => invoke<boolean>("directory_exists", { path }),
   getQuota: () => invoke<Quota>("get_quota"),
