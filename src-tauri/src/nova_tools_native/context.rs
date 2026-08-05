@@ -1365,14 +1365,11 @@ fn reverse_from_files(files: &HashMap<String, FileEntry>, all_set: &HashSet<Stri
     for (file, entry) in files {
         for import in &entry.imports {
             if let Some(target) = resolve_specifier(&import.from, file, all_set) {
-                reverse
-                    .entry(target)
-                    .or_default()
-                    .push(ReverseImport {
-                        importer: file.clone(),
-                        local: import.name.clone(),
-                        orig: import.orig.clone(),
-                    });
+                reverse.entry(target).or_default().push(ReverseImport {
+                    importer: file.clone(),
+                    local: import.name.clone(),
+                    orig: import.orig.clone(),
+                });
             }
         }
     }
@@ -1492,11 +1489,15 @@ fn build_index(
             if let Some(entry) = cache.files.get(file) {
                 for import in &entry.imports {
                     if let Some(target) = resolve_specifier(&import.from, file, &all_set) {
-                        cache.reverse.entry(target).or_default().push(ReverseImport {
-                            importer: file.clone(),
-                            local: import.name.clone(),
-                            orig: import.orig.clone(),
-                        });
+                        cache
+                            .reverse
+                            .entry(target)
+                            .or_default()
+                            .push(ReverseImport {
+                                importer: file.clone(),
+                                local: import.name.clone(),
+                                orig: import.orig.clone(),
+                            });
                     }
                 }
             }
@@ -2178,9 +2179,9 @@ fn suggest_symbols(root: &Path, anchors: &[String]) -> Vec<String> {
     let normalized_anchors = anchors.iter().map(|a| normalize(a)).collect::<Vec<_>>();
     let score_of = |name: &str, item: &Scored| {
         let base = item.words.len() * 10 + item.hits.min(5) + usize::from(item.def) * 4;
-        let close = normalized_anchors.iter().any(|anchor| {
-            !anchor.is_empty() && levenshtein(anchor, &normalize(name), 3) <= 2
-        });
+        let close = normalized_anchors
+            .iter()
+            .any(|anchor| !anchor.is_empty() && levenshtein(anchor, &normalize(name), 3) <= 2);
         base + usize::from(close) * 100
     };
     let mut list = scored.into_iter().collect::<Vec<_>>();
@@ -2205,7 +2206,11 @@ fn file_segments(file: &str) -> Vec<String> {
         let chars: Vec<char> = part.chars().collect();
         let mut piece = String::new();
         for (index, ch) in chars.iter().enumerate() {
-            let prev = if index > 0 { Some(chars[index - 1]) } else { None };
+            let prev = if index > 0 {
+                Some(chars[index - 1])
+            } else {
+                None
+            };
             if ch.is_ascii_uppercase()
                 && prev.map_or(false, |p| p.is_ascii_lowercase() || p.is_ascii_digit())
             {
@@ -2237,11 +2242,7 @@ fn term_freq_map(counts: &HashMap<String, usize>) -> HashMap<String, usize> {
 
 /// 主题加分按词稀有度衰减：build/mode 这类命中数百上千行的泛词，仅凭文件名
 /// 不能把 build.rs / build.bat 顶进 EDIT 槽位；低频符号名仍拿满分。
-fn subject_match(
-    file: &str,
-    subject_terms: &[String],
-    term_freq: &HashMap<String, usize>,
-) -> f64 {
+fn subject_match(file: &str, subject_terms: &[String], term_freq: &HashMap<String, usize>) -> f64 {
     if subject_terms.is_empty() {
         return 0.0;
     }
@@ -2514,11 +2515,13 @@ fn collect_dependencies(
 
 /// git 共改耦合：种子文件近 120 次触及提交里的高频共改文件（可选开关），抓文本
 /// 零耦合的关联文件（DI 注册表、路由表、配套样式）。只给提示，不占 EDIT 预算。
+/// tests_only=true 时只统计测试文件（noise_path），供伴生测试默认打包用。
 fn co_changed_files(
     root: &Path,
     seed_files: &[String],
     exclude: &HashSet<String>,
     limit: usize,
+    tests_only: bool,
 ) -> Vec<(String, usize)> {
     if seed_files.is_empty() {
         return Vec::new();
@@ -2546,11 +2549,17 @@ fn co_changed_files(
     if shas.is_empty() {
         return Vec::new();
     }
+    // 注意：git show --format= 对连续提交不输出任何分隔（无空行无头），
+    // 用显式标记切块（格式串必须含 %H 占位符否则 git 报 invalid format）；
+    // -m --first-parent 保证 merge 提交也产出完整文件清单。
+    const COMMIT_MARK: &str = "@@NOVA_COMMIT@@";
     let mut show_args = vec![
         "show".to_string(),
-        "--format=".to_string(),
+        format!("--format={COMMIT_MARK}%H"),
         "--name-only".to_string(),
         "--no-renames".to_string(),
+        "-m".to_string(),
+        "--first-parent".to_string(),
     ];
     show_args.extend(shas);
     let Some(bytes) = run_command(root, "git", &show_args) else {
@@ -2559,7 +2568,7 @@ fn co_changed_files(
     let text = String::from_utf8_lossy(&bytes);
     let seeds = seed_files.iter().take(4).collect::<HashSet<_>>();
     let mut counts = HashMap::<String, usize>::new();
-    for commit in text.split("\n\n") {
+    for commit in text.split(COMMIT_MARK) {
         let files = commit
             .lines()
             .map(str::trim)
@@ -2574,6 +2583,7 @@ fn co_changed_files(
                 || exclude.contains(&file)
                 || !is_code_file(&file)
                 || !root.join(&file).is_file()
+                || (tests_only && !noise_path(&file))
             {
                 continue;
             }
@@ -2584,6 +2594,69 @@ fn co_changed_files(
     list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     list.truncate(limit);
     list
+}
+
+/// 伴生测试文件：改实现通常要同步改断言了该实现的测试，但测试文件与任务文本
+/// 零重叠且是反向 import 图的叶子，常规检索必然漏召。git 共改 ≥2 次的测试文件
+/// 优先，同目录 `*.test.*` / `*.spec.*` / `*_test.*` 命名约定兜底。
+fn companion_test_files(
+    root: &Path,
+    seed_files: &[String],
+    exclude: &HashSet<String>,
+    limit: usize,
+) -> Vec<String> {
+    if seed_files.is_empty() {
+        return Vec::new();
+    }
+    let mut companions = Vec::new();
+    // git 共改：按种子逐个取其 top-3 测试伴生，避免其它种子的高频伴生抢占槽位。
+    for seed in seed_files.iter().take(3) {
+        let got = co_changed_files(root, std::slice::from_ref(seed), exclude, 3, true);
+        for (file, count) in got {
+            if count >= 2 && !companions.contains(&file) {
+                companions.push(file);
+            }
+        }
+    }
+    for seed in seed_files.iter().take(4) {
+        let path = Path::new(seed);
+        let (Some(stem), Some(ext)) = (
+            path.file_stem().and_then(|s| s.to_str()),
+            path.extension().and_then(|s| s.to_str()),
+        ) else {
+            continue;
+        };
+        let dir = path
+            .parent()
+            .map(|d| d.to_string_lossy())
+            .unwrap_or_default();
+        let base = if dir.is_empty() || dir == "." {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        for candidate in [
+            format!("{base}{stem}.test.{ext}"),
+            format!("{base}{stem}.spec.{ext}"),
+            format!("{base}{stem}_test.{ext}"),
+        ] {
+            if !companions.contains(&candidate)
+                && is_code_file(&candidate)
+                && root.join(&candidate).is_file()
+            {
+                companions.push(candidate);
+            }
+        }
+    }
+    companions.truncate(limit);
+    companions
+}
+
+/// 行数 ≤ FULL_FILE_MAX 才值得无命中 FULL 打包；大文件必须有关键词命中才保留。
+fn file_is_small(root: &Path, file: &str) -> bool {
+    std::fs::read_to_string(root.join(file))
+        .map(|text| text.lines().count() <= FULL_FILE_MAX)
+        .unwrap_or(false)
 }
 
 pub fn find_symbols(root: &Path, params: Value) -> Result<String, String> {
@@ -2770,9 +2843,7 @@ fn backfill_block(
         blocks: vec![block.clone()],
         rank,
     });
-    sigs.retain(|(sig_file, ln, _)| {
-        !(sig_file == file && *ln >= block.start && *ln <= block.end)
-    });
+    sigs.retain(|(sig_file, ln, _)| !(sig_file == file && *ln >= block.start && *ln <= block.end));
     Some(true)
 }
 
@@ -2816,7 +2887,9 @@ fn anchor_correction(out: &str, params: &Value) -> Option<(String, String)> {
     if !out.starts_with("# CTX MISS") {
         return None;
     }
-    let line = out.lines().find(|line| line.starts_with("did-you-mean: "))?;
+    let line = out
+        .lines()
+        .find(|line| line.starts_with("did-you-mean: "))?;
     let suggestions = line["did-you-mean: ".len()..]
         .split(", ")
         .filter_map(|item| item.split_whitespace().next())
@@ -3216,9 +3289,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     }
     // 高频泛词（如 build/mode 命中数百行）不作为种子：其"定义"多半是无关同名函数，
     // 会经由 plannedTerms 二次检索把 build 脚本等噪声反馈回排名。
-    seed_terms.retain(|term| {
-        term_freq.get(&term.to_lowercase()).copied().unwrap_or(0) <= SEED_FREQ_CAP
-    });
+    seed_terms
+        .retain(|term| term_freq.get(&term.to_lowercase()).copied().unwrap_or(0) <= SEED_FREQ_CAP);
     for keyword in &seed_terms {
         let lower = keyword.to_lowercase();
         for name in &def_names {
@@ -3269,7 +3341,11 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             if !seen_targets.insert(definition.file.clone()) {
                 continue;
             }
-            let base = definition.file.rsplit('/').next().unwrap_or(&definition.file);
+            let base = definition
+                .file
+                .rsplit('/')
+                .next()
+                .unwrap_or(&definition.file);
             let stem = base
                 .rsplit_once('.')
                 .map(|(stem, _)| stem)
@@ -3457,7 +3533,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             if importer == via || !graph_seen.insert((importer.clone(), local.clone())) {
                 continue;
             }
-            if !exact_callers.contains_key(&importer) && exact_callers.len() >= MAX_GRAPH_IMPORTERS {
+            if !exact_callers.contains_key(&importer) && exact_callers.len() >= MAX_GRAPH_IMPORTERS
+            {
                 continue;
             }
             if !is_code_file(&importer) || !root.join(&importer).is_file() {
@@ -3512,8 +3589,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                     hit_order.push(importer.clone());
                 }
                 let file_rows = hit_files.entry(importer.clone()).or_default();
-                if file_rows.iter().any(|row| row.ln == ln)
-                    || file_rows.len() >= MAX_HITS_PER_FILE
+                if file_rows.iter().any(|row| row.ln == ln) || file_rows.len() >= MAX_HITS_PER_FILE
                 {
                     continue;
                 }
@@ -3619,6 +3695,32 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             ranked.push((file.clone(), 550.0));
         }
     }
+    // 伴生测试：默认把与种子共改（或同目录 *.test.* 命名）的测试文件并入闭包。
+    // 改实现通常要同步改测试，而测试文件被 noise_path 过滤且任务文本零重叠。
+    let companion_tests = if ordered_seed_files.is_empty() {
+        Vec::new()
+    } else {
+        // 只排除非测试文件：已进 ranked 的测试文件仍会被 noise 过滤丢弃，
+        // 必须允许它们经由伴生通道重新进入闭包；重复 push 由下方去重拦截。
+        let exclude = ranked
+            .iter()
+            .filter(|(file, _)| !noise_path(file))
+            .map(|(file, _)| file.clone())
+            .collect::<HashSet<_>>();
+        // 零命中且超过 FULL 上限的伴生无法产出任何块，只会挤占候选槽位。
+        companion_test_files(root, &ordered_seed_files, &exclude, 4)
+            .into_iter()
+            .filter(|file| hit_files.contains_key(file) || file_is_small(root, file))
+            .take(3)
+            .collect::<Vec<_>>()
+    };
+    for file in &companion_tests {
+        if let Some(existing) = ranked.iter_mut().find(|(existing, _)| existing == file) {
+            existing.1 = existing.1.max(520.0);
+        } else {
+            ranked.push((file.clone(), 520.0));
+        }
+    }
     ranked.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -3636,7 +3738,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             .iter()
             .map(|(file, _)| file.clone())
             .collect::<HashSet<_>>();
-        co_changed_files(root, &ordered_seed_files, &exclude, 3)
+        co_changed_files(root, &ordered_seed_files, &exclude, 3, false)
     } else {
         Vec::new()
     };
@@ -3653,7 +3755,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 && (plan_intent.tests
                     || !noise_path(file)
                     || files.contains(file)
-                    || seed_files.contains(file))
+                    || seed_files.contains(file)
+                    || companion_tests.contains(file))
         })
         .take(candidate_limit)
         .cloned()
@@ -3811,6 +3914,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 "target"
             } else if plan_intent.tests && noise_path(file) && references_seed {
                 "test"
+            } else if noise_path(file) && companion_tests.contains(file) {
+                // 伴生测试：实现改动通常要同步改断言，按 test 类别参与打包。
+                "test"
             } else if plan_intent.errors && planned_relation {
                 "handler"
             } else if plan_intent.callers && calls_seed {
@@ -3946,7 +4052,13 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 .into_iter()
                 .find_map(|(feature, _)| feature.starts_with("caller:").then_some(feature))
         } else if picked.role == "test" {
-            Some("test".into())
+            if companion_tests.contains(&picked.file) {
+                // 伴生测试按文件保底：每个伴生文件至少打包一个块，
+                // 而不是整个 test 类别只留一个代表。
+                Some(format!("test:{}", picked.file))
+            } else {
+                Some("test".into())
+            }
         } else {
             None
         };
@@ -3975,6 +4087,30 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             continue;
         };
         if source.lines.len() > EXPLICIT_FULL_MAX {
+            continue;
+        }
+        let cost = range_cost(&source, 1, source.lines.len());
+        if used + source.lines.len() <= budget && used_bytes + cost <= soft_bytes {
+            used += source.lines.len();
+            used_bytes += cost;
+            plans.push(PlannedFile {
+                file: file.clone(),
+                source,
+                section: "edit",
+                full: true,
+                blocks: Vec::new(),
+                rank: *file_rank.get(file).unwrap_or(&99),
+            });
+        }
+    }
+    // 伴生测试：小文件直接 FULL（断言分散，按块易漏）；大文件依赖命中的 unit 管线。
+    for file in &companion_tests {
+        let Some(source) = sources.get(file).cloned() else {
+            continue;
+        };
+        if source.lines.len() > FULL_FILE_MAX
+            || plans.iter().any(|plan| plan.file == *file && plan.full)
+        {
             continue;
         }
         let cost = range_cost(&source, 1, source.lines.len());
@@ -4154,7 +4290,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
         let required_representative = unit.obligation.is_some()
             && ((unit.role == "caller" && plan_intent.callers)
-                || (unit.role == "test" && plan_intent.tests));
+                || (unit.role == "test"
+                    && (plan_intent.tests || companion_tests.contains(&unit.file))));
         let effective_required = unit.required || required_representative;
         if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
             eprintln!(
@@ -4882,14 +5019,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 }
                 Dropped::Block(file, block) => {
                     let created = backfill_block(
-                        root,
-                        &index,
-                        &sources,
-                        &mut plans,
-                        &mut sigs,
-                        &file,
-                        &block,
-                        99,
+                        root, &index, &sources, &mut plans, &mut sigs, &file, &block, 99,
                     );
                     let Some(created) = created else {
                         continue;
@@ -4901,11 +5031,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                         .iter()
                         .position(|plan| plan.file == file && !plan.full)
                     {
-                        plans[position]
-                            .blocks
-                            .retain(|existing| {
-                                !(existing.start == block.start && existing.end == block.end)
-                            });
+                        plans[position].blocks.retain(|existing| {
+                            !(existing.start == block.start && existing.end == block.end)
+                        });
                         if created && plans[position].blocks.is_empty() {
                             plans.remove(position);
                         }
@@ -5049,7 +5177,10 @@ mod tests {
             .lines()
             .find(|line| line.contains("未命中关键词"))
             .unwrap_or_default();
-        assert!(note.contains(&invented_p) && note.contains(&invented_a), "{out}");
+        assert!(
+            note.contains(&invented_p) && note.contains(&invented_a),
+            "{out}"
+        );
         assert!(!note.contains("plan mode"), "{out}");
     }
 
@@ -5694,11 +5825,62 @@ mod tests {
         assert!(out.contains("共改耦合(git)"), "{out}");
         assert!(out.contains("registry.ts"), "{out}");
         // 默认关闭：无提示行
-        let plain = fast_context(
+        let plain =
+            fast_context(d.path(), serde_json::json!({"keywords":["coupledTarget"]})).unwrap();
+        assert!(!plain.contains("共改耦合(git)"), "{plain}");
+    }
+
+    #[test]
+    fn companion_test_files_are_packed_by_default() {
+        // 伴生测试：改实现默认带上共改的测试文件，即使任务文本未提测试、
+        // 测试文件与关键词零重叠（noise_path 不再拦截伴生测试）。
+        let d = tempdir().unwrap();
+        git(d.path(), &["init", "-q"]);
+        git(
             d.path(),
-            serde_json::json!({"keywords":["coupledTarget"]}),
+            &["config", "user.email", "native-test@nova.local"],
+        );
+        git(d.path(), &["config", "user.name", "Nova Native Test"]);
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        for round in 0..3 {
+            fs::write(
+                d.path().join("src/core.ts"),
+                format!("export function companionTarget() {{\n  return {round};\n}}\n"),
+            )
+            .unwrap();
+            // core.test.ts 与 core.ts 高频共改，但正文与关键词零重叠
+            fs::write(
+                d.path().join("src/core.test.ts"),
+                format!("assert.equal(coreResult, {round});\n"),
+            )
+            .unwrap();
+            git(d.path(), &["add", "-A"]);
+            git(d.path(), &["commit", "-qm", "change"]);
+        }
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":["companionTarget"],"task":"修改实现逻辑"}),
         )
         .unwrap();
-        assert!(!plain.contains("共改耦合(git)"), "{plain}");
+        assert!(out.contains("### src/core.test.ts"), "{out}");
+        // 命名约定兜底：无 git 历史时同目录 *.test.* 也要进闭包
+        let d2 = tempdir().unwrap();
+        fs::create_dir_all(d2.path().join("lib")).unwrap();
+        fs::write(
+            d2.path().join("lib/widget.ts"),
+            "export function widgetTarget() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            d2.path().join("lib/widget.test.ts"),
+            "expect(widgetResult).toBe(1);\n",
+        )
+        .unwrap();
+        let out2 = fast_context(
+            d2.path(),
+            serde_json::json!({"keywords":["widgetTarget"],"task":"修改实现逻辑"}),
+        )
+        .unwrap();
+        assert!(out2.contains("### lib/widget.test.ts"), "{out2}");
     }
 }
