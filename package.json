@@ -30,6 +30,7 @@
     "test:nova-context-service": "node --test scripts/nova-context-service.test.mjs",
     "test:context-parity": "node scripts/audit-context-parity.mjs && node scripts/alkaid-context-super.test.mjs && node scripts/cursor-context-super.test.mjs",
     "eval:context-recall": "node scripts/ctx-recall.eval.mjs",
+    "eval:context-invoke": "node scripts/ctx-invoke.eval.mjs",
     "test:native-context-differential": "node scripts/audit-native-context-random.mjs",
     "audit:native-context": "node scripts/audit-native-context.mjs && npm run test:native-context-differential"
   },

@@ -208,6 +208,43 @@ const CASES = [
     expect: ["共改耦合(" + "git)"],
     min: 1,
   },
+  // ---- 真实会话回放回归用例（来自 ctx-invoke.eval.mjs 的低召回任务，符号已适配当前仓库） ----
+  {
+    // 真实任务“为工作流节点增加人工审核”，原录制 11 目标文件只召回 0。
+    // 期望跨 runtime/types/UI 三个层面同时召回。
+    name: "真实回放：工作流人工审核（跨层多文件）",
+    args: {
+      keywords: ["manualWorkflowReview", "WorkflowSettingsPanel", "handleTurnEnd", "workflow"],
+      task: "为工作流节点增加人工审核：节点开启后 turn 由人确认",
+      budget: 800,
+    },
+    expect: ["src/workflow/runtime.ts", "src/workflow/types.ts", "src/components/WorkflowSettingsPanel.tsx"],
+    min: 1,
+  },
+  {
+    // 真实任务“简化工作流配置”，CJK+英文泛词混合，无强锚点符号。
+    name: "真实回放：工作流配置简化（泛词混合）",
+    args: {
+      keywords: ["workflow", "工作流", "transition", "handoff"],
+      task: "简化工作流配置：节点和连线提示词 + 引擎隐式接力会话结论",
+      budget: 800,
+    },
+    expect: ["src/workflow/types.ts", "src/workflow/runtime.ts", "src/components/WorkflowCanvas.tsx", "src/components/WorkflowSettingsPanel.tsx"],
+    min: 0.75,
+  },
+  {
+    // 真实任务“那就加一句保底”，原录制 3 目标只召回 1：测试文件不进闭包。
+    // 期望实现文件与其测试文件一并召回。
+    name: "真实回放：提示词保底（测试文件召回）",
+    args: {
+      files: ["scripts/alkaid-core.mjs", "scripts/cursor-filesystem-tools.mjs", "docs/alkaid.md"],
+      keywords: ["buildAlkaidSystemPrompt", "cursorPromptPrefix", "同轮并行"],
+      task: "在并行工具规则里加一句保底说明",
+      budget: 800,
+    },
+    expect: ["scripts/alkaid-core.mjs", "scripts/alkaid" + ".test.mjs", "scripts/alkaid-context-super" + ".test.mjs"],
+    min: 1,
+  },
 ];
 
 async function main() {
