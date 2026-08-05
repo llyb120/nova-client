@@ -405,6 +405,7 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const quotaShareKinds = createMemo<AgentKind[]>(() => {
     const kinds: AgentKind[] = [];
+    if (alkaidEnabled()) kinds.push("alkaid");
     if (devinEnabled()) kinds.push("devin");
     if (codexEnabled()) kinds.push("codex");
     if (codebuddyEnabled()) kinds.push("codebuddy");

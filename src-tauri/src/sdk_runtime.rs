@@ -612,6 +612,24 @@ impl SdkManager {
         request
     }
 
+    /// 出借 Vega 额度：跑一次 bridge 导出当前生效的合并配置（服务端下发配置为基线、
+    /// 本地 config.jsonc 递归覆盖），并把 {env:NAME} 密钥占位符解析成字面量，
+    /// 借用方无需出借方的环境变量即可直接使用该配置。
+    pub async fn export_quota_credentials(&self) -> Result<String, String> {
+        if self.adapter.agent_kind() != AgentKind::Alkaid {
+            return Err("仅 Vega 支持导出共享凭证".into());
+        }
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let value = self.run_bridge(&cwd, json!({ "action": "export" })).await?;
+        value
+            .as_str()
+            .filter(|config| !config.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "Vega 凭证导出结果无效".into())
+    }
+
     /// 返回当前缓存的模型列表，供同步的远程快照构建逻辑使用。
     pub fn get_model_options(&self) -> Option<Value> {
         self.model_options.lock().unwrap().clone()

@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { createAlkaidAgent } from "./alkaid-core.mjs";
-import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidModel } from "./alkaid-config.mjs";
+import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidConfigEnv, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 export function send(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -134,6 +134,12 @@ export async function runAlkaidBridge(handlePrompt) {
     else if (request.action === "models") {
       const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
       send({ ok: true, data: { configOptions: [{ id: "model", name: "Model", currentValue: defaultAlkaidModel(config), options: alkaidModelOptions(config) }], modes: null } });
+    } else if (request.action === "export") {
+      // 额度共享导出：服务端配置基线 + 本地 config.jsonc 覆盖后的生效配置，
+      // 密钥占位符解析为字面量，借用方无需出借方的环境变量
+      const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
+      const { root: _root, env: _env, ...shared } = config;
+      send({ ok: true, data: JSON.stringify(resolveAlkaidConfigEnv(shared)) });
     } else if (request.action === "title") await title(request);
     else if (request.action === "complete") await complete(request);
     else throw new Error(`Vega bridge 不支持 action: ${request.action}`);

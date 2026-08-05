@@ -9,7 +9,7 @@ import test from "node:test";
 import { createCodingTools, createReadOnlyTools } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js";
 import { getShellConfig } from "../node_modules/@earendil-works/pi-coding-agent/dist/utils/shell.js";
 import { startedToolItem } from "./alkaid-bridge-common.mjs";
-import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
+import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidConfigEnv, resolveAlkaidModel } from "./alkaid-config.mjs";
 import { ALKAID_PROVIDER_DIAGNOSTIC_LOG, alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
 import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, rebaseNativeContextForSlimMemory, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import {
@@ -137,6 +137,95 @@ test("server Alkaid config is merged in memory with local values winning", () =>
   assert.equal(merged.provider.shared.models.same.name, "Local Same");
   assert.equal(merged.provider.shared.models.local.name, "Local");
   assert.equal(merged.provider.server.models["server-model"].name, "Server");
+});
+
+test("quota sharing export resolves env placeholders recursively", () => {
+  const env = { NOVA_TEST_KEY: "secret-value" };
+  const resolved = resolveAlkaidConfigEnv({
+    provider: {
+      shared: {
+        options: { apiKey: "{env:NOVA_TEST_KEY}", baseURL: "https://static.example/v1" },
+        models: { model: { tags: ["{env:NOVA_TEST_KEY}", "plain"] } },
+      },
+    },
+    flag: true,
+    limit: 4096,
+  }, env);
+  assert.equal(resolved.provider.shared.options.apiKey, "secret-value");
+  assert.equal(resolved.provider.shared.options.baseURL, "https://static.example/v1");
+  assert.deepEqual(resolved.provider.shared.models.model.tags, ["secret-value", "plain"]);
+  assert.equal(resolved.flag, true);
+  assert.equal(resolved.limit, 4096);
+  assert.throws(() => resolveAlkaidConfigEnv({ apiKey: "{env:NOVA_MISSING_KEY}" }, env));
+});
+
+test("bridge export merges server config and resolves env secrets for quota sharing", async () => {
+  const home = await mkdtemp(join(tmpdir(), "alkaid-export-"));
+  const dataRoot = join(home, ".nova", "alkaid");
+  await mkdir(dataRoot, { recursive: true });
+  await writeFile(join(dataRoot, "config.jsonc"), JSON.stringify({
+    model: "shared/local-model",
+    provider: {
+      shared: {
+        npm: "@ai-sdk/openai-compatible",
+        options: { apiKey: "{env:ALKAID_EXPORT_TEST_KEY}" },
+        models: { "local-model": { name: "Local" } },
+      },
+    },
+  }));
+  const child = spawn(process.execPath, [join(process.cwd(), "scripts/alkaid-bridge.mjs")], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      NOVA_DATA_DIR: join(home, ".nova"),
+      ALKAID_EXPORT_TEST_KEY: "resolved-key",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.write(`${JSON.stringify({
+    action: "export",
+    alkaidServerConfig: {
+      provider: {
+        shared: {
+          npm: "@ai-sdk/openai-compatible",
+          options: { baseURL: "https://server.example/v1" },
+          models: { "server-model": { name: "Server" } },
+        },
+      },
+    },
+  })}\n`);
+  child.stdin.end();
+  let timeout;
+  const exitCode = await Promise.race([
+    new Promise((resolve) => child.once("exit", resolve)),
+    new Promise((_, reject) => {
+      timeout = setTimeout(() => {
+        child.kill();
+        reject(new Error("Alkaid export timed out"));
+      }, 15000);
+    }),
+  ]).finally(() => clearTimeout(timeout));
+  assert.equal(exitCode, 0, `stdout: ${stdout}\nstderr: ${stderr}`);
+  const response = stdout
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+    .find((event) => "ok" in event);
+  assert.equal(response?.ok, true, `stdout: ${stdout}\nstderr: ${stderr}`);
+  const shared = JSON.parse(response.data);
+  // 服务端基线 + 本地覆盖；密钥占位符解析为字面量
+  assert.equal(shared.provider.shared.options.baseURL, "https://server.example/v1");
+  assert.equal(shared.provider.shared.options.apiKey, "resolved-key");
+  assert(shared.provider.shared.models["local-model"]);
+  assert(shared.provider.shared.models["server-model"]);
+  assert.equal(shared.root, undefined);
+  assert.equal(shared.env, undefined);
 });
 
 test("PI coding tools provide read, bash, edit and write", async () => {

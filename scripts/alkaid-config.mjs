@@ -232,6 +232,20 @@ function variantLabel(variant) {
   return labels[variant] ?? variant;
 }
 
+/** 递归把配置中的 {env:NAME} 占位符解析为环境变量实际值，用于额度共享导出。 */
+export function resolveAlkaidConfigEnv(value, env = process.env) {
+  if (typeof value === "string") return resolveEnv(value, env);
+  if (Array.isArray(value)) return value.map((item) => resolveAlkaidConfigEnv(item, env));
+  if (isPlainObject(value)) {
+    const resolved = {};
+    for (const [key, item] of Object.entries(value)) {
+      resolved[key] = resolveAlkaidConfigEnv(item, env);
+    }
+    return resolved;
+  }
+  return value;
+}
+
 export function alkaidModelOptions(config) {
   return Object.entries(config.provider).flatMap(([providerId, provider]) =>
     Object.entries(provider.models ?? {}).flatMap(([modelId, model]) => {

@@ -328,6 +328,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
         let mut settings = Settings::default();
         settings.quota_shared_models = vec![
+            "alkaid:provider/model".into(),
             "devin:swe-1.6".into(),
             "codex:gpt-5.6".into(),
             "codebuddy:claude-sonnet".into(),

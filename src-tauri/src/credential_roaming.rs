@@ -5,7 +5,9 @@
 
 use crate::acp::AcpManager;
 use crate::opencode_sdk::OpenCodeSdkManager;
-use crate::sdk_adapters::{ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter};
+use crate::sdk_adapters::{
+    AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter,
+};
 use crate::sdk_runtime::SdkManager;
 use crate::threads::AgentKind;
 use crate::AppState;
@@ -211,11 +213,22 @@ pub fn collect_credentials(
     app: &AppHandle,
     agent_kind: AgentKind,
     model: &str,
+    alkaid_config: Option<&str>,
 ) -> Result<CredentialBundle, String> {
     let mut files = Vec::new();
     let mut env = HashMap::new();
     match &agent_kind {
-        AgentKind::Alkaid => return Err("Vega 暂不支持额度凭据共享".into()),
+        AgentKind::Alkaid => {
+            // 出借方已通过 bridge 导出合并后的生效配置（含解析后的密钥），直接打包
+            let config = alkaid_config
+                .map(str::trim)
+                .filter(|config| !config.is_empty())
+                .ok_or("Vega 凭证导出结果缺失")?;
+            files.push(CredentialFile {
+                path: "alkaid/config.jsonc".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(config.as_bytes()),
+            });
+        }
         AgentKind::Devin => collect_file(
             &devin_credentials_path()?,
             "appdata/devin/credentials.toml",
@@ -369,7 +382,9 @@ pub fn materialize_runtime(
     )?;
     stage_local_skills(&app, expected_kind, &launch_env)?;
     let manager = match expected_kind {
-        AgentKind::Alkaid => return Err("Vega 暂不支持额度凭据共享".into()),
+        AgentKind::Alkaid => {
+            BorrowedManager::Sdk(SdkManager::new_with_env(app, AlkaidAdapter, launch_env))
+        }
         AgentKind::Devin => BorrowedManager::Acp(AcpManager::new_with_env(
             app,
             AgentKind::Devin,
@@ -399,7 +414,10 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
     let mut env = HashMap::new();
     let as_string = |path: PathBuf| path.to_string_lossy().to_string();
     match kind {
-        AgentKind::Alkaid => {}
+        AgentKind::Alkaid => {
+            // bridge 从 NOVA_DATA_DIR/alkaid/config.jsonc 读配置，指向隔离根目录即可
+            env.insert("NOVA_DATA_DIR".into(), as_string(root.to_path_buf()));
+        }
         AgentKind::Devin => {
             #[cfg(windows)]
             {
@@ -475,7 +493,10 @@ fn stage_local_skills(
     env: &HashMap<String, String>,
 ) -> Result<(), String> {
     let root = match kind {
-        AgentKind::Alkaid => return Ok(()),
+        AgentKind::Alkaid => env
+            .get("NOVA_DATA_DIR")
+            .map(PathBuf::from)
+            .map(|path| path.join("alkaid").join("skills")),
         AgentKind::Devin => return Ok(()),
         AgentKind::Codex | AgentKind::CodexPlus => env
             .get("CODEX_HOME")
@@ -531,7 +552,7 @@ pub fn isolate_borrowed_command(command: &mut Command) {
 fn credential_path_allowed(kind: &AgentKind, raw: &str) -> bool {
     let path = raw.replace('\\', "/");
     match kind {
-        AgentKind::Alkaid => false,
+        AgentKind::Alkaid => path == "alkaid/config.jsonc",
         AgentKind::Devin => path == "appdata/devin/credentials.toml",
         AgentKind::Codex | AgentKind::CodexPlus => path == "codex-home/auth.json",
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
@@ -772,6 +793,27 @@ mod tests {
         assert!(!credential_env_allowed(
             &AgentKind::ClaudeCode,
             "NODE_OPTIONS"
+        ));
+    }
+
+    #[test]
+    fn alkaid_launch_env_points_nova_data_dir_to_isolated_root() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-alkaid-launch-env-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let env = launch_env(&AgentKind::Alkaid, &root).unwrap();
+        assert_eq!(
+            env.get("NOVA_DATA_DIR"),
+            Some(&root.to_string_lossy().to_string())
+        );
+        assert!(credential_path_allowed(
+            &AgentKind::Alkaid,
+            "alkaid/config.jsonc"
+        ));
+        assert!(!credential_path_allowed(
+            &AgentKind::Alkaid,
+            "alkaid/sessions/a.json"
         ));
     }
 

@@ -199,8 +199,8 @@ fn quota_model_key(kind: &AgentKind, model: &str) -> String {
 
 fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
     match kind {
-        AgentKind::Alkaid => Err("Vega 暂不支持额度共享".into()),
-        AgentKind::Devin
+        AgentKind::Alkaid
+        | AgentKind::Devin
         | AgentKind::Codex
         | AgentKind::CodexPlus
         | AgentKind::CodeBuddy
@@ -240,7 +240,7 @@ fn shared_quota_model_keys(shared_options: &Value) -> HashSet<String> {
 
 fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> bool {
     let enabled = match kind {
-        AgentKind::Alkaid => false,
+        AgentKind::Alkaid => settings.alkaid_enabled,
         AgentKind::Devin => settings.devin_enabled,
         AgentKind::Codex => settings.codex_enabled,
         AgentKind::CodexPlus => settings.codex_enabled,
@@ -2211,24 +2211,57 @@ impl RelayManager {
 
         let app = self.app.clone();
         let to = env.from.clone();
-        std::thread::spawn(move || {
-            let result = crate::credential_roaming::collect_credentials(&app, agent_kind, &model)
+        tauri::async_runtime::spawn(async move {
+            // Vega 没有独立登录凭证文件：先在出借方把生效配置（含密钥解析）导出，
+            // 再走统一的凭证打包加密链路
+            let alkaid_config = if matches!(agent_kind, AgentKind::Alkaid) {
+                match app
+                    .state::<AppState>()
+                    .alkaid
+                    .export_quota_credentials()
+                    .await
+                {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        let relay = app.state::<AppState>().relay.clone();
+                        relay.spawn_quota_send(
+                            to,
+                            "quota.rejected",
+                            json!({
+                                "reqId": req_id,
+                                "error": format!("Vega 额度共享失败：{error}"),
+                            }),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            std::thread::spawn(move || {
+                let result = crate::credential_roaming::collect_credentials(
+                    &app,
+                    agent_kind,
+                    &model,
+                    alkaid_config.as_deref(),
+                )
                 .and_then(|bundle| {
                     crate::credential_roaming::encrypt_bundle(&public_key, &req_id, &bundle)
                 });
-            let relay = app.state::<AppState>().relay.clone();
-            match result {
-                Ok(grant) => relay.spawn_quota_send(
-                    to,
-                    "quota.granted",
-                    json!({ "reqId": req_id, "grant": grant }),
-                ),
-                Err(error) => relay.spawn_quota_send(
-                    to,
-                    "quota.rejected",
-                    json!({ "reqId": req_id, "error": error }),
-                ),
-            }
+                let relay = app.state::<AppState>().relay.clone();
+                match result {
+                    Ok(grant) => relay.spawn_quota_send(
+                        to,
+                        "quota.granted",
+                        json!({ "reqId": req_id, "grant": grant }),
+                    ),
+                    Err(error) => relay.spawn_quota_send(
+                        to,
+                        "quota.rejected",
+                        json!({ "reqId": req_id, "error": error }),
+                    ),
+                }
+            });
         });
     }
 
@@ -4666,6 +4699,21 @@ mod tests {
             &AgentKind::Codex,
             "cursor-small"
         ));
+
+        let mut vega_settings = Settings::default();
+        vega_settings.alkaid_enabled = true;
+        vega_settings.quota_shared_models = vec!["alkaid:provider/model".into()];
+        assert!(quota_model_is_shared(
+            &vega_settings,
+            &AgentKind::Alkaid,
+            "provider/model"
+        ));
+        vega_settings.alkaid_enabled = false;
+        assert!(!quota_model_is_shared(
+            &vega_settings,
+            &AgentKind::Alkaid,
+            "provider/model"
+        ));
     }
 
     #[test]
@@ -4696,6 +4744,7 @@ mod tests {
     #[test]
     fn quota_runtime_supports_every_frontend_backend() {
         for kind in [
+            AgentKind::Alkaid,
             AgentKind::Devin,
             AgentKind::Codex,
             AgentKind::CodeBuddy,
