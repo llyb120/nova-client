@@ -748,21 +748,46 @@ export function ChatView() {
     const currentEnd = insertPath(currentPrompts, null, true);
     currentEnd.current = true;
 
-    // 当前时间线固定占最左一列；每条旁支只在分叉时申请新列，之后沿该列向下。
+    // 当前时间线固定占最左一列；旁支在分叉时申请列，行区间不重叠的旁支复用同一列。
     const nodes: GraphNode[] = [];
     const edgeIds: Array<{ from: string; to: string }> = [];
-    let nextLane = 1;
     let maxPromptCount = currentPrompts.length;
+    const sortedChildren = (node: PromptTreeNode) =>
+      [...node.children].sort(
+        (left, right) => Number(right.onCurrentPath) - Number(left.onCurrentPath),
+      );
+    // 旁支的“主脊”：沿首个子节点一路向下的链；该列被占用的行区间即 [起点行, 主脊末端行]。
+    const spineEndRow = (node: PromptTreeNode): number => {
+      let end = node.promptCount;
+      let cursor = node;
+      for (;;) {
+        const next = sortedChildren(cursor).find((child) => !child.onCurrentPath);
+        if (!next) return end;
+        end = next.promptCount;
+        cursor = next;
+      }
+    };
+    // laneIntervals[lane] = 该列已占用的行区间；相邻区间至少空一行，避免上下分支首尾相接看似相连。
+    const laneIntervals: Array<Array<[number, number]>> = [[]];
+    const forkLane = (node: PromptTreeNode): number => {
+      const start = node.promptCount;
+      const end = spineEndRow(node);
+      for (let lane = 1; lane < laneIntervals.length; lane++) {
+        if (laneIntervals[lane].every(([s, e]) => start > e + 1 || end < s - 1)) {
+          laneIntervals[lane].push([start, end]);
+          return lane;
+        }
+      }
+      laneIntervals.push([[start, end]]);
+      return laneIntervals.length - 1;
+    };
     const place = (node: PromptTreeNode, lane: number) => {
       const nodeLane = node.onCurrentPath ? 0 : lane;
       maxPromptCount = Math.max(maxPromptCount, node.promptCount);
       nodes.push({ ...node, x: 18 + nodeLane * 26, y: 20 + (node.promptCount - 1) * 32 });
 
-      const children = [...node.children].sort(
-        (left, right) => Number(right.onCurrentPath) - Number(left.onCurrentPath),
-      );
       let continuedBranch = false;
-      for (const child of children) {
+      for (const child of sortedChildren(node)) {
         edgeIds.push({ from: node.id, to: child.id });
         if (child.onCurrentPath) {
           place(child, 0);
@@ -770,18 +795,15 @@ export function ChatView() {
           continuedBranch = true;
           place(child, nodeLane);
         } else {
-          place(child, nextLane++);
+          place(child, forkLane(child));
         }
       }
     };
-    const roots = [...root.children].sort(
-      (left, right) => Number(right.onCurrentPath) - Number(left.onCurrentPath),
-    );
-    for (const node of roots) place(node, node.onCurrentPath ? 0 : nextLane++);
+    for (const node of sortedChildren(root)) place(node, node.onCurrentPath ? 0 : forkLane(node));
 
     const positions = new Map(nodes.map((node) => [node.id, node]));
     const nowY = 20 + Math.max(1, maxPromptCount) * 32;
-    const laneCount = Math.max(1, nextLane);
+    const laneCount = Math.max(1, laneIntervals.length);
     return {
       nodes,
       edges: edgeIds.flatMap((edge) => {
