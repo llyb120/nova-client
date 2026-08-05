@@ -16,6 +16,7 @@
 //                   对比"录制时召回"与"当前实现召回"，检测检索回归/改进。
 
 import { readdirSync, readFileSync, existsSync, statSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { join, relative, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { callNapiTool } from "./nova-napi-tools.mjs";
@@ -224,5 +225,5 @@ async function main() {
 
 export { analyzeThread as analyzeThreadForDbg };
 
-const isMain = process.argv[1] && realpathSync(process.argv[1]) === realpathSync(new URL(import.meta.url).pathname);
+const isMain = process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
 if (isMain) await main();

@@ -13,3 +13,9 @@ index = "https://rsproxy.cn/crates.io-index"
 
 [net]
 git-fetch-with-cli = true
+
+# napi-build (Windows GNU) 需要 libnode.dll 用于链接 napi_* 符号。
+# 本机 node.exe 导出全部 NAPI 符号，已用 mingw gendef/dlltool 生成导入库 libnode.dll.a
+# 置于 .libnode/ 下；占位 libnode.dll（空文件）用于满足 napi-build 的存在性检查。
+[env]
+LIBNODE_PATH = { value = "D:/code/nova-client/.libnode", force = true }

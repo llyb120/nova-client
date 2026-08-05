@@ -61,3 +61,5 @@ release/
 
 # 界面走查截图等临时产物
 tmp/
+
+.libnode/
