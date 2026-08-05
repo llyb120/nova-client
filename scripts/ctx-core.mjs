@@ -239,4 +239,4 @@ export async function findSymbols({ names } = {}, root = repoRoot()) {
 // ---------------------------------------------------------------- 工具描述
 
 export const FAST_CONTEXT_DESCRIPTION =
-  '未知修改分布时调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单。输出无 partial；已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读。路径和行段已知时直接 read，不要调用本工具。';
+  '计划修改两个及以上本会话未读过的文件、或修改点分布不明时，先调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单，一次调用通常替代 5–10 轮 rg+read 往返，比自行 rg/grep 往返更省 token。路径和行段已明确时直接 read；只需符号的定义/引用行号时用 find_symbols。默认只传 keywords/task/files；调用后不要再用 rg/git grep 重复检索同一批关键词，已展示范围视为已读。';

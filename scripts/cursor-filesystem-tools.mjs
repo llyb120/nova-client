@@ -67,14 +67,14 @@ export function cursorBatchToolPolicy(options = {}) {
       + ". The following tool-selection rules are hard constraints.",
     "Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. "
       + (fastContext
-        ? "When edit distribution is unknown and you need complete cross-file context, call fast_context once (or find_symbols for definitions/references only). Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
+        ? "When edit distribution is unknown — or when you plan to modify two or more files not yet read this session — call fast_context first; one call typically replaces 5–10 grep+read round-trips (use find_symbols for definitions/references only). Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
         : "When location is unknown, search first (see below), then read near hits. ")
       + "Do not dump large files blindly."
       + (readOnly
         ? ""
         : " For edits, use Cursor built-in Write/Edit/StrReplace; do not expect a Nova edit_files tool."),
     (fastContext
-      ? "Search and traversal must be cost-bounded. If path and range are known, use Read directly. When edit distribution is unknown, call fast_context once: it returns complete EDIT/DEPS units plus IMPACT/SIG indexes using batched rg and an incremental symbol index; use find_symbols for locations only. Never re-read shown ranges. Read SIG/IMPACT bodies by exact path:line only when truly needed. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
+      ? "Search and traversal must be cost-bounded. If path and range are known, use Read directly. When edit distribution is unknown, or you plan to modify 2+ unread files, call fast_context once — one call typically replaces 5–10 grep+read round-trips. It returns complete EDIT/DEPS units plus IMPACT/SIG indexes using batched rg and an incremental symbol index; use find_symbols for locations only. Never re-read shown ranges. Read SIG/IMPACT bodies by exact path:line only when truly needed. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
       : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
       + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];

@@ -3146,7 +3146,7 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
         format!(
             "Prefer minimal reads via Devin native read: when line ranges are known, read only those segments; expand nearby context only as needed. {}Do not dump large files blindly.{}",
             if fast_context {
-                "When location is unknown, you must call only fast_context (or find_symbols if you only need line numbers); then read only coverage gaps / next_reads with native read. "
+                "When location is unknown — or when you plan to modify two or more files not yet read in this session — you must call fast_context first (or find_symbols if you only need line numbers); one call typically replaces 5–10 grep+read round-trips. Then read only coverage gaps / next_reads with native read. "
             } else {
                 "When location is unknown, search first (see below), then read near hits. "
             },
