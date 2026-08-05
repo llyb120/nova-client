@@ -84,20 +84,35 @@ async function complete(request) {
   const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
   // 空 model = 未配置补全模型，回退到 Vega 默认模型
   const resolved = resolveAlkaidModel(config, request.model || undefined);
+  // 行内补全只要短续写：压低 maxTokens，避免模型按 32k 上限慢慢吐完
+  const maxChars = 120;
+  const controller = new AbortController();
   const stream = streamSimple(
     resolved.model,
     { messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }] },
+    // 补全要关思考：Responses → reasoning.effort=none；Completions(deepseek) → thinking.type=disabled
     // 直调没有 agent 的 getApiKey 兜底，必须显式带上解析出的 key，否则请求无鉴权
-    { reasoning: "minimal", apiKey: resolved.apiKey },
+    { reasoning: "off", apiKey: resolved.apiKey, maxTokens: 64, signal: controller.signal },
   );
   let text = "";
-  for await (const event of stream) {
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      text += event.assistantMessageEvent.delta;
+  // streamSimple 事件是扁平的 text_delta；Agent.subscribe 才是 message_update 嵌套形状
+  try {
+    for await (const event of stream) {
+      if (event.type === "text_delta") {
+        text += event.delta ?? "";
+        if ([...text].length >= maxChars) {
+          controller.abort();
+          break;
+        }
+      }
     }
+  } catch (error) {
+    if (!text.trim() && !controller.signal.aborted) throw error;
   }
-  const result = await stream.result();
-  if (result.stopReason === "error") throw new Error(result.errorMessage ?? "Vega 补全调用失败");
+  if (!controller.signal.aborted) {
+    const result = await stream.result();
+    if (result.stopReason === "error") throw new Error(result.errorMessage ?? "Vega 补全调用失败");
+  }
   send({ ok: true, data: text.trim() });
 }
 

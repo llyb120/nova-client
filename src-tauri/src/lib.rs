@@ -1,5 +1,6 @@
 mod acp;
 mod agent_config;
+mod alkaid_complete;
 mod cli;
 mod cli_manager;
 mod clues;
@@ -4439,7 +4440,8 @@ async fn complete_composer_draft(
     );
 
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        // 补全是交互路径：超时宜短，避免 completion_in_flight 长时间挡住后续请求
+        std::time::Duration::from_secs(12),
         state.alkaid.complete_once(&cwd, &completion_model, seed),
     )
     .await;

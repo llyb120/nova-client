@@ -61,6 +61,8 @@ pub struct SdkManager {
     app: AppHandle,
     adapter: Arc<dyn SdkAdapter>,
     launch_env: HashMap<String, String>,
+    /// 补全直连 HTTP 复用连接池，避免每次冷建 TLS。
+    http: reqwest::Client,
     running_children: Mutex<HashMap<String, RunningBridge>>,
     idle_children: Mutex<HashMap<String, IdleBridge>>,
     /// 最新一次预热请求（后到覆盖先到）；持有 prewarm_gate 的循环负责逐个消化。
@@ -89,10 +91,17 @@ impl SdkManager {
         adapter: A,
         launch_env: HashMap<String, String>,
     ) -> Arc<Self> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .pool_max_idle_per_host(4)
+            .tcp_keepalive(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_default();
         Arc::new(Self {
             app,
             adapter: Arc::new(adapter),
             launch_env,
+            http,
             running_children: Mutex::new(HashMap::new()),
             idle_children: Mutex::new(HashMap::new()),
             prewarm_pending: Mutex::new(None),
@@ -758,9 +767,30 @@ impl SdkManager {
         });
     }
 
-    /// 一次性行内补全：bridge 的 `complete` action 不建 agent/会话，
-    /// 直接对模型 API 发一次 completion 并返回全文。
+    /// 一次性行内补全：Rust 直连 provider HTTP（不冷启 Node）。
+    /// 仅 openai-completions / openai-responses；其它协议再回退 bridge。
     pub async fn complete_once(&self, cwd: &str, model: &str, prompt: String) -> Result<String, String> {
+        let server_config = self.alkaid_server_config.lock().unwrap().clone();
+        let data_dir = nova_data_dir(&self.app);
+        match crate::alkaid_complete::complete_direct(
+            &self.http,
+            &data_dir,
+            server_config,
+            &self.launch_env,
+            model,
+            &prompt,
+        )
+        .await
+        {
+            Ok(text) => return Ok(text),
+            Err(error)
+                if error.contains("补全暂不支持直连协议")
+                    || error.contains("Vega provider 缺少 api") =>
+            {
+                // anthropic / google 等仍走 bridge
+            }
+            Err(error) => return Err(error),
+        }
         let request = json!({
             "action": "complete",
             "cwd": cwd,

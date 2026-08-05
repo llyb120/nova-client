@@ -1,5 +1,6 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createComposerGhost } from "../composerGhost";
 import { api } from "../ipc";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
@@ -131,6 +132,23 @@ export function HomeView() {
     textareaRef.style.height = "auto";
     textareaRef.style.height = Math.min(textareaRef.scrollHeight, 220) + "px";
   };
+
+  // 新会话页没有 ChatView/Composer，需单独挂行内补全
+  const ghostCtl = createComposerGhost({
+    getText: () => text(),
+    setText: (value) => {
+      setText(value);
+      setCursor(value.length);
+    },
+    getTextarea: () => textareaRef,
+    isBlocked: () => slashStart() !== null,
+    getThreadId: () => null,
+    onAfterAccept: () => {
+      if (textareaRef) updateSlashState(textareaRef, true);
+      resizeInput();
+    },
+  });
+  const { ghost, dismissGhostIfCaretMoved, syncGhostScroll, noteInput } = ghostCtl;
 
   const pickEmployee = (employeeId: string | null) => {
     setSelectedEmployeeId(employeeId);
@@ -560,6 +578,7 @@ export function HomeView() {
     noteFlow.bump();
     if (typedSlash) void refreshSlashCommands(agentKind());
     updateSlashState(el, typedSlash || trackingSlash);
+    noteInput();
     if (el.value.trim()) prewarmCurrent();
   };
 
@@ -828,6 +847,7 @@ export function HomeView() {
       setSlashStart(null);
       return;
     }
+    if (ghostCtl.handleKeyDown(e)) return;
     if (
       e.key === "ArrowDown" &&
       !text().trim() &&
@@ -931,18 +951,38 @@ export function HomeView() {
               </Show>
             </div>
           </Show>
-          <textarea
-            ref={textareaRef}
-            class="composer-input"
-            placeholder={composerPlaceholder()}
-            rows={3}
-            value={text()}
-            onInput={onInput}
-            onKeyDown={onKeyDown}
-            onClick={(e) => updateSlashState(e.currentTarget)}
-            onKeyUp={(e) => updateSlashState(e.currentTarget)}
-            onPaste={attach.onPaste}
-          />
+          <div class="composer-input-wrap">
+            <Show when={ghost()}>
+              <div
+                ref={ghostCtl.setGhostRef}
+                class="composer-ghost"
+                aria-hidden="true"
+                textContent={`${text()}${ghost()}`}
+              />
+            </Show>
+            <textarea
+              ref={textareaRef}
+              class="composer-input"
+              placeholder={composerPlaceholder()}
+              rows={3}
+              value={text()}
+              onInput={onInput}
+              onKeyDown={onKeyDown}
+              onClick={(e) => {
+                updateSlashState(e.currentTarget);
+                dismissGhostIfCaretMoved(e.currentTarget);
+              }}
+              onKeyUp={(e) => {
+                updateSlashState(e.currentTarget);
+                dismissGhostIfCaretMoved(e.currentTarget);
+              }}
+              onScroll={syncGhostScroll}
+              onBlur={ghostCtl.onBlur}
+              onCompositionStart={ghostCtl.onCompositionStart}
+              onCompositionEnd={ghostCtl.onCompositionEnd}
+              onPaste={attach.onPaste}
+            />
+          </div>
           <div class="composer-bar">
             <ProjectPicker
               value={cwd()}
