@@ -73,7 +73,10 @@ export function WorkflowSettingsPanel() {
   const reload = () => setList(listWorkflows());
 
   // 启用状态独立于定义持久化（内置工作流也可切换），保存后立即生效。
+  // enabledRev：开关写在 localStorage 而非信号里，切换后手动推动 memo 重算。
+  const [enabledRev, setEnabledRev] = createSignal(0);
   const wfEnabled = createMemo(() => {
+    enabledRev();
     const d = draft();
     return d ? isWorkflowEnabled(d) : true;
   });
@@ -82,6 +85,7 @@ export function WorkflowSettingsPanel() {
     if (!d) return;
     const next = !isWorkflowEnabled(d);
     setWorkflowEnabled(d.id, next);
+    setEnabledRev((v) => v + 1);
     reload();
     setMsg(next ? "已启用" : "已停用：新会话选择、/run 与触发条件均不再出现");
   }
@@ -596,11 +600,35 @@ export function WorkflowSettingsPanel() {
                         class="field-input wf-edge-label-input"
                         value={tv().transition.prompt ?? tv().transition.label ?? ""}
                         disabled={draft()!.builtin}
-                        placeholder="什么时候走这条连线"
+                        placeholder="连线名称（显示在线上）"
                         onInput={(e) => patchTransition(tv().stage.id, tv().transition.id, { prompt: e.currentTarget.value })}
                       />
                     </div>
-                    <div class="field-hint">存在多个出口时，引擎会隐式要求当前节点判断并输出路由标识。</div>
+                    <div class="wf-inspector-row wf-edge-mode-row">
+                      <button
+                        class="wf-chip"
+                        classList={{ active: tv().transition.judge !== "llm" }}
+                        disabled={draft()!.builtin}
+                        onClick={() => patchTransition(tv().stage.id, tv().transition.id, { judge: "marker" })}
+                        title="前一节点结论出现对应标识时才走这条连线"
+                      >
+                        正常模式
+                      </button>
+                      <button
+                        class="wf-chip"
+                        classList={{ active: tv().transition.judge === "llm" }}
+                        disabled={draft()!.builtin}
+                        onClick={() => patchTransition(tv().stage.id, tv().transition.id, { judge: "llm" })}
+                        title="由轻量模型根据前一节点结论自动判断是否走这条连线"
+                      >
+                        提示词判断
+                      </button>
+                    </div>
+                    <div class="field-hint">
+                      {tv().transition.judge === "llm"
+                        ? "提示词判断：由轻量模型根据前一节点结论与连线名称自动选择去向；引擎会自动生成判断提示词，并隐式要求前一节点给出清晰结论。"
+                        : "正常模式：前一节点结论末尾出现对应路由标识时才走这条连线；引擎会把「要输出什么标识」隐式插进前一节点的提示词。"}
+                    </div>
                   </div>
 
                   <div class="wf-modal-foot">

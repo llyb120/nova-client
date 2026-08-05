@@ -4474,6 +4474,90 @@ async fn complete_composer_draft(
     }
 }
 
+/* ===== 工作流连线判断（轻量模型） ===== */
+
+/// 提示词模式连线的候选分支。
+#[derive(serde::Deserialize)]
+struct RouteJudgeOption {
+    id: String,
+    label: String,
+}
+
+/// 传给判断模型的节点结论字数上限（结论通常在后面，取末尾）。
+const ROUTE_JUDGE_CONCLUSION_MAX: usize = 2000;
+
+/// 提示词模式连线判断：用轻量级模型（未配置时回退补全模型）根据节点结论选择下一条连线。
+/// 返回选中的连线 id；无法判断返回空串，由前端按「待补充」暂停处理。
+#[tauri::command]
+async fn judge_workflow_route(
+    state: State<'_, AppState>,
+    conclusion: String,
+    options: Vec<RouteJudgeOption>,
+) -> Result<String, String> {
+    if options.is_empty() {
+        return Ok(String::new());
+    }
+    let model = {
+        let s = state.settings.lock().unwrap();
+        let lightweight = s.lightweight_model.trim().to_string();
+        let lightweight_agent = s.lightweight_model_agent.trim().to_string();
+        let completion = s.completion_model.trim().to_string();
+        // complete_once 走 Vega(alkaid) 直连/bridge，只有 alkaid 系模型 id 可用。
+        if (lightweight_agent.is_empty() || lightweight_agent == "alkaid") && !lightweight.is_empty()
+        {
+            lightweight
+        } else {
+            completion
+        }
+    };
+    if model.is_empty() {
+        return Err("未配置轻量级模型或补全模型，无法使用提示词判断连线".into());
+    }
+    let list = options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| format!("{}. {}", i + 1, o.label.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let seed = format!(
+        "你是工作流路由器：根据「节点结论」判断流程接下来应该走哪一条分支。\n\
+         规则：只输出所选分支的编号（一个数字），不要输出任何其它内容；没有明显合适的分支时输出 0。\n\n\
+         分支：\n{list}\n\n节点结论：\n{}\n\n编号：",
+        take_last_chars(conclusion.trim(), ROUTE_JUDGE_CONCLUSION_MAX)
+    );
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let fut = state.alkaid.complete_once(&cwd, &model, seed);
+    let raw = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+        .await
+        .map_err(|_| "连线判断超时".to_string())??;
+    let text = raw.trim();
+    // 1) 编号解析：只看输出中的第一个数字。
+    for token in text.split(|c: char| !c.is_ascii_digit()) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Ok(n) = token.parse::<usize>() {
+            if n >= 1 && n <= options.len() {
+                return Ok(options[n - 1].id.clone());
+            }
+            if n == 0 {
+                return Ok(String::new());
+            }
+        }
+        break;
+    }
+    // 2) 名称兜底：输出里直接包含某分支名。
+    for opt in &options {
+        let label = opt.label.trim();
+        if !label.is_empty() && text.contains(label) {
+            return Ok(opt.id.clone());
+        }
+    }
+    Ok(String::new())
+}
+
 /// 接收一条分享，在指定目录新建本地会话，返回新会话 id
 #[tauri::command]
 fn accept_share(
@@ -6062,6 +6146,7 @@ pub fn run() {
             advanced_share,
             summarize_clue,
             complete_composer_draft,
+            judge_workflow_route,
             accept_share,
             decline_share,
             share_workflow,

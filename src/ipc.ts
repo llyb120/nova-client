@@ -83,6 +83,9 @@ export const api = {
   /** 输入框行内补全（轻量模型）；失败时后端静默返回空串 */
   completeComposerDraft: (threadId: string | null, draft: string) =>
     invoke<string>("complete_composer_draft", { threadId, draft }),
+  /** 工作流提示词模式连线判断（轻量模型）；返回选中的连线 id，无法判断返回空串 */
+  judgeWorkflowRoute: (conclusion: string, options: { id: string; label: string }[]) =>
+    invoke<string>("judge_workflow_route", { conclusion, options }),
   scratchDir: () => invoke<string>("scratch_dir"),
   directoryExists: (path: string) => invoke<boolean>("directory_exists", { path }),
   getQuota: () => invoke<Quota>("get_quota"),

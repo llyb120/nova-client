@@ -19,7 +19,7 @@ import type {
   WorkHours,
 } from "../types";
 import { agentLabel } from "../utils";
-import { listWorkflows, employeeWorkflowName } from "../workflow/storage";
+import { isWorkflowEnabled, listWorkflows, employeeWorkflowName } from "../workflow/storage";
 import { WORKFLOW_WAKE_DO_ID } from "../workflow/builtin";
 import { ConfigSelects, ModelPicker } from "./ConfigSelects";
 import {
@@ -1120,7 +1120,7 @@ export function EmployeesView() {
                   onChange={(e) => setFWorkflowId(e.currentTarget.value)}
                 >
                   <For each={workflowChoices()}>
-                    {(wf) => <option value={wf.id}>{wf.name}</option>}
+                    {(wf) => <option value={wf.id}>{isWorkflowEnabled(wf) ? wf.name : `${wf.name}（已停用）`}</option>}
                   </For>
                 </select>
                 <span class="emp-field-hint">

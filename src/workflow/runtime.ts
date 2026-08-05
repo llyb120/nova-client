@@ -135,11 +135,30 @@ function resolvePrompt(
     ctx.prev.trim() ? `上一节点结论：\n${ctx.prev.trim()}` : "",
   ].filter(Boolean);
   const routes = stage.transitions;
-  const routing = routes.length > 1 && !stage.manualReview
-    ? `完成当前节点任务后，必须根据实际结论选择且只选择一个下一跳。将对应标识单独放在回复最后一行，标识后不要再输出内容：\n${routes
-        .map((transition) => `- ${workflowTransitionPrompt(transition)}\n  ${workflowRouteMarker(transition.id)}`)
-        .join("\n")}`
-    : "";
+  // 引擎自动补全两种连线模式所需的提示词：
+  // - 正常模式：隐式要求本节点在结尾输出所选分支的路由标识；
+  // - 提示词模式：隐式要求本节点给出清晰结论，去向由轻量模型按连线名称判断。
+  let routing = "";
+  if (routes.length > 1 && !stage.manualReview) {
+    const markerRoutes = routes.filter((transition) => transition.judge !== "llm");
+    const llmRoutes = routes.filter((transition) => transition.judge === "llm");
+    const sections: string[] = [];
+    if (markerRoutes.length > 0) {
+      sections.push(
+        `完成当前节点任务后，必须根据实际结论选择且只选择一个下一跳。将对应标识单独放在回复最后一行，标识后不要再输出内容：\n${markerRoutes
+          .map((transition) => `- ${workflowTransitionPrompt(transition)}\n  ${workflowRouteMarker(transition.id)}`)
+          .join("\n")}`,
+      );
+    }
+    if (llmRoutes.length > 0) {
+      sections.push(
+        `以下候选去向由系统根据你的结论自动判断（无需输出任何标识）。请在结尾清楚总结本轮的实际结果与结论，供系统判断走向：\n${llmRoutes
+          .map((transition) => `- ${workflowTransitionPrompt(transition)}`)
+          .join("\n")}`,
+      );
+    }
+    routing = sections.join("\n\n");
+  }
   return [base, ...handoff, routing].filter(Boolean).join("\n\n");
 }
 
@@ -296,10 +315,18 @@ async function advanceWorkflow(threadId: string): Promise<void> {
     return;
   }
 
-  // 单出口直接接力；多出口由引擎注入的标识选择。旧工作流仍兼容 marker/regex。
-  const transition = stage.transitions.length === 1
+  // 单出口直接接力；多出口先按标识（正常模式）匹配，未命中再由轻量模型判断提示词模式连线。
+  // 旧工作流仍兼容 marker/regex。
+  let transition = stage.transitions.length === 1
     ? stage.transitions[0]
     : evalTransition(stage, conclusion);
+
+  if (!transition && stage.transitions.length > 1) {
+    const llmRoutes = stage.transitions.filter((candidate) => candidate.judge === "llm");
+    if (llmRoutes.length > 0) {
+      transition = await judgeLlmTransition(run, llmRoutes, conclusion);
+    }
+  }
 
   if (!transition) {
     // 没有任何转移命中：停在当前阶段等用户补充。
@@ -311,6 +338,33 @@ async function advanceWorkflow(threadId: string): Promise<void> {
   }
 
   await followTransition(threadId, run, def, stage, conclusion, transition);
+}
+
+/**
+ * 提示词模式连线判断：把候选连线交给轻量模型，按当前节点结论选择下一跳。
+ * 模型不可用 / 超时 / 无法判断时返回 null，由调用方按「待补充」暂停处理。
+ */
+async function judgeLlmTransition(
+  run: WorkflowRunStep,
+  routes: WorkflowTransition[],
+  conclusion: string,
+): Promise<WorkflowTransition | null> {
+  try {
+    const context = [
+      run.vars.goal?.trim() ? `工作流目标：\n${run.vars.goal.trim()}` : "",
+      conclusion.slice(-1500),
+    ].filter(Boolean).join("\n\n");
+    const chosenId = await api.judgeWorkflowRoute(
+      context,
+      routes.map((transition) => ({
+        id: transition.id,
+        label: workflowTransitionPrompt(transition) || transition.id,
+      })),
+    );
+    return routes.find((transition) => transition.id === chosenId) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function suspendWorkflow(threadId: string, manual: boolean): void {
