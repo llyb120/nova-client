@@ -17,6 +17,9 @@ target-check/
 target_msvc/
 Cargo.lock
 
+# Agent local config（Devin 本地 MCP 配置，不提交）
+.devin/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
