@@ -13,7 +13,6 @@ import {
   removeQueuedPrompt,
 } from "../promptQueue";
 import { mountSessionShortcuts } from "../sessionShortcuts";
-import { api } from "../ipc";
 import {
   cancelTurn,
   clueCardById,
@@ -69,13 +68,6 @@ export function Composer() {
   let employeePickerRef: HTMLDivElement | undefined;
   let resizeFrame: number | undefined;
   let maxInputHeight: number | undefined;
-  const [ghost, setGhost] = createSignal("");
-  let ghostRef: HTMLDivElement | undefined;
-  let ghostTimer: number | undefined;
-  let ghostReqSeq = 0;
-  let ghostLastFired = 0;
-  let ghostCache: { draft: string; completion: string } | undefined;
-  let composing = false;
 
   const flushInputResize = () => {
     resizeFrame = undefined;
@@ -91,72 +83,6 @@ export function Composer() {
 
   const resizeInput = () => {
     if (resizeFrame === undefined) resizeFrame = requestAnimationFrame(flushInputResize);
-  };
-
-  /* ===== 轻量模型行内补全（幽灵文字） ===== */
-  const clearGhost = () => {
-    if (ghost()) setGhost("");
-  };
-
-  const syncGhostScroll = () => {
-    if (ghostRef && textareaRef) ghostRef.scrollTop = textareaRef.scrollTop;
-  };
-
-  const scheduleGhost = () => {
-    if (ghostTimer !== undefined) window.clearTimeout(ghostTimer);
-    ghostTimer = window.setTimeout(() => {
-      ghostTimer = undefined;
-      void requestGhost();
-    }, 400);
-  };
-
-  const requestGhost = async () => {
-    const el = textareaRef;
-    if (!el || composing) return;
-    if (historyOpen() || slashStart() !== null) return;
-    if (document.activeElement !== el) return;
-    const draft = text();
-    if (!draft.trim()) return;
-    if ((el.selectionEnd ?? draft.length) !== draft.length) return;
-    if (ghostCache && ghostCache.draft === draft) {
-      setGhost(ghostCache.completion);
-      return;
-    }
-    const now = Date.now();
-    if (now - ghostLastFired < 1200) return;
-    ghostLastFired = now;
-    const reqId = ++ghostReqSeq;
-    try {
-      const completion = await api.completeComposerDraft(state.currentId ?? null, draft);
-      // 上下文已变化（继续输入 / 失焦）时丢弃过期结果
-      if (reqId !== ghostReqSeq || text() !== draft || document.activeElement !== el) return;
-      const value = (completion ?? "").trim();
-      ghostCache = { draft, completion: value };
-      setGhost(value);
-    } catch {
-      if (reqId === ghostReqSeq) ghostCache = undefined;
-    }
-  };
-
-  const acceptGhost = () => {
-    const completion = ghost();
-    if (!completion) return;
-    const next = text() + completion;
-    setGhost("");
-    ghostCache = { draft: next, completion: "" };
-    setText(next);
-    setCursor(next.length);
-    queueMicrotask(() => {
-      if (!textareaRef) return;
-      textareaRef.focus();
-      textareaRef.setSelectionRange(next.length, next.length);
-      updateSlashState(textareaRef, true);
-      resizeInput();
-    });
-  };
-
-  const dismissGhostIfCaretMoved = (el: HTMLTextAreaElement) => {
-    if (ghost() && (el.selectionEnd ?? 0) !== text().length) clearGhost();
   };
 
   createEffect(() => {
@@ -188,7 +114,6 @@ export function Composer() {
 
   onCleanup(() => {
     if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
-    if (ghostTimer !== undefined) window.clearTimeout(ghostTimer);
   });
 
   const attach = createImageAttachments({ enableFileDrop: true });
@@ -461,7 +386,6 @@ export function Composer() {
   const clearInput = () => {
     setText("");
     setHistoryOpen(false);
-    clearGhost();
     attach.clear();
     if (textareaRef) textareaRef.style.height = "auto";
   };
@@ -601,26 +525,6 @@ export function Composer() {
       setSlashStart(null);
       return;
     }
-    if (ghost()) {
-      if (e.key === "Tab") {
-        e.preventDefault();
-        acceptGhost();
-        return;
-      }
-      if (
-        e.key === "ArrowRight" &&
-        (textareaRef?.selectionEnd ?? 0) >= text().length
-      ) {
-        e.preventDefault();
-        acceptGhost();
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        clearGhost();
-        return;
-      }
-    }
     if (e.key === "ArrowDown" && empty() && restoreDraft()) {
       e.preventDefault();
       return;
@@ -670,8 +574,6 @@ export function Composer() {
     if (historyOpen()) setHistoryOpen(false);
     if (typedSlash) void refreshSlashCommands(state.agentKind);
     updateSlashState(el, typedSlash || trackingSlash);
-    clearGhost();
-    if (el.value.trim()) scheduleGhost();
   };
 
   return (
@@ -816,50 +718,24 @@ export function Composer() {
           </For>
         </div>
       </Show>
-      <div class="composer-input-wrap">
-        <Show when={ghost()}>
-          <div
-            ref={ghostRef}
-            class="composer-ghost"
-            aria-hidden="true"
-            textContent={`${text()}${ghost()}`}
-          />
-        </Show>
-        <textarea
-          ref={textareaRef}
-          class="composer-input"
-          placeholder={
-            running()
-              ? supportsSteer()
-                ? `${providerName()} 正在工作…输入并回车加入队列；输入为空时回车可立即引导`
-                : `${providerName()} 正在工作…输入并回车加入队列，任务结束后自动发送`
-              : `给 ${providerName()} 下达任务，Enter 发送，Shift+Enter 换行，可粘贴或拖入文件`
-          }
-          value={text()}
-          onInput={onInput}
-          onKeyDown={onKeyDown}
-          onClick={(e) => {
-            updateSlashState(e.currentTarget);
-            dismissGhostIfCaretMoved(e.currentTarget);
-          }}
-          onKeyUp={(e) => {
-            updateSlashState(e.currentTarget);
-            dismissGhostIfCaretMoved(e.currentTarget);
-          }}
-          onScroll={syncGhostScroll}
-          onBlur={clearGhost}
-          onCompositionStart={() => {
-            composing = true;
-            clearGhost();
-          }}
-          onCompositionEnd={() => {
-            composing = false;
-            if (text().trim()) scheduleGhost();
-          }}
-          onPaste={attach.onPaste}
-          rows={3}
-        />
-      </div>
+      <textarea
+        ref={textareaRef}
+        class="composer-input"
+        placeholder={
+          running()
+            ? supportsSteer()
+              ? `${providerName()} 正在工作…输入并回车加入队列；输入为空时回车可立即引导`
+              : `${providerName()} 正在工作…输入并回车加入队列，任务结束后自动发送`
+            : `给 ${providerName()} 下达任务，Enter 发送，Shift+Enter 换行，可粘贴或拖入文件`
+        }
+        value={text()}
+        onInput={onInput}
+        onKeyDown={onKeyDown}
+        onClick={(e) => updateSlashState(e.currentTarget)}
+        onKeyUp={(e) => updateSlashState(e.currentTarget)}
+        onPaste={attach.onPaste}
+        rows={3}
+      />
       <div class="composer-bar">
         <Show
           when={!isQuotaBorrowed()}

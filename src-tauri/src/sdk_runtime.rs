@@ -740,26 +740,6 @@ impl SdkManager {
         });
     }
 
-    /// 一次性行内补全：复用 bridge 的 `title` action，不建会话/线程，直接返回全文。
-    /// 供输入框补全使用；bridge 不支持 title action 时返回错误，由调用方降级。
-    pub async fn complete_once(&self, cwd: &str, model: &str, prompt: String) -> Result<String, String> {
-        let model = if self.adapter.uses_codex_model_routing() {
-            split_codex_effort(model)
-                .map(|(model, _)| model.to_string())
-                .unwrap_or_else(|| model.to_string())
-        } else {
-            model.to_string()
-        };
-        let request = json!({
-            "action": "title",
-            "cwd": cwd,
-            "model": model,
-            "prompt": prompt,
-        });
-        let output = self.run_bridge(cwd, request).await?;
-        Ok(output.as_str().unwrap_or_default().trim().to_string())
-    }
-
     async fn run_bridge(&self, cwd: &str, request: Value) -> Result<Value, String> {
         let request = self.with_alkaid_server_config(request);
         let mut child = self.spawn_bridge(cwd)?;

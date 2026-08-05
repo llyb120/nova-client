@@ -80,8 +80,7 @@ export function startedToolItem(event) {
 
 async function title(request) {
   const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
-  // 空 model = 未配置轻量模型，回退到 Vega 默认模型
-  const resolved = resolveAlkaidModel(config, request.model || undefined);
+  const resolved = resolveAlkaidModel(config, request.model);
   const runtime = await createAlkaidAgent({
     cwd: request.cwd,
     model: resolved.model,
