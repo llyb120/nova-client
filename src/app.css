@@ -6259,6 +6259,332 @@ button.head-badge:hover {
 .clue-edge-menu button:hover:not(:disabled) {
   background: color-mix(in srgb, var(--red) 12%, transparent);
 }
+
+/* --- 视图切换（列表 / 关系图） --- */
+.clue-view-switch {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg-float) 72%, transparent);
+}
+.clue-view-switch button {
+  padding: 5px 14px;
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+}
+.clue-view-switch button:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+.clue-view-switch button.active {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+/* --- 证据链列表（大纲）视图 --- */
+.clue-list-wrap {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 16% 12%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 34%),
+    linear-gradient(145deg, color-mix(in srgb, var(--bg-panel) 95%, var(--bg)), var(--bg));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
+}
+.clue-list-banner {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 12px;
+}
+.clue-list-banner strong {
+  font-weight: 700;
+}
+.clue-list-banner-hint {
+  margin-left: 8px;
+  color: color-mix(in srgb, var(--accent) 72%, var(--text));
+}
+.clue-list-banner button {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 6px;
+  color: var(--accent);
+  font-size: 11px;
+}
+.clue-list-banner button:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.clue-list {
+  flex: 1;
+  min-height: 0;
+  padding: 10px 14px 22px;
+  overflow-y: auto;
+}
+.clue-list-stage {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 14px 0 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.clue-list-stage:first-child {
+  margin-top: 4px;
+}
+.clue-list-stage.isolated {
+  margin-top: 22px;
+  padding-top: 14px;
+  border-top: 1px dashed color-mix(in srgb, var(--text-faint) 30%, transparent);
+}
+.clue-list-stage-count {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.clue-list-group {
+  display: flex;
+  flex-direction: column;
+}
+.clue-list-parallel {
+  display: flex;
+  align-items: center;
+  margin: 4px 0 2px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 650;
+}
+.clue-list-parallel span {
+  padding: 2px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
+}
+.clue-list-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 3px 0;
+}
+.clue-list-chips-label {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.clue-list-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 280px;
+  padding: 2px 3px 2px 9px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-float) 86%, transparent);
+}
+.clue-list-chip-title {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.clue-list-chip-title:hover {
+  color: var(--accent);
+}
+.clue-list-chip-remove {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1;
+}
+.clue-list-chip-remove:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+  color: var(--red);
+}
+.clue-list-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 1px 0;
+  padding-top: 6px;
+  padding-right: 10px;
+  padding-bottom: 6px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.clue-list-row:hover {
+  background: var(--bg-hover);
+}
+.clue-list-row.active {
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+  background: var(--accent-dim);
+}
+.clue-list-row.selected:not(.active) {
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.clue-list-row.mentioned:not(.active) {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.clue-list-row.is-source {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.clue-list-wrap.connecting .clue-list-row {
+  cursor: crosshair;
+}
+.clue-list-wrap.connecting .clue-list-row:hover {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  background: var(--accent-dim);
+}
+.clue-list-guide {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--text-faint) 24%, transparent);
+}
+.clue-list-role {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+.clue-list-row.role-start .clue-list-role {
+  background: #34b37f;
+}
+.clue-list-row.role-middle .clue-list-role {
+  background: #4a94e9;
+}
+.clue-list-row.role-end .clue-list-role {
+  background: #e56577;
+}
+.clue-list-row.role-isolated .clue-list-role {
+  background: #e0b34f;
+}
+.clue-list-avatar {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid var(--border-light);
+  border-radius: 50%;
+  color: var(--text-dim);
+  background: var(--bg-float);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.04em;
+}
+.clue-list-main {
+  flex: 1;
+  min-width: 0;
+}
+.clue-list-titleline {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.clue-list-titleline strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.clue-list-mention {
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.clue-list-comments {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.clue-list-excerpt {
+  margin: 1px 0 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.clue-list-meta {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.clue-list-connect {
+  flex-shrink: 0;
+  padding: 3px 9px;
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-float) 90%, transparent);
+  color: var(--text-dim);
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.clue-list-row:hover .clue-list-connect,
+.clue-list-row.is-source .clue-list-connect {
+  opacity: 1;
+}
+.clue-list-connect:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
+}
+.clue-list-wrap.connecting .clue-list-connect {
+  opacity: 1;
+}
+.clue-list-hint {
+  position: absolute;
+  right: 14px;
+  bottom: 10px;
+  z-index: 5;
+  padding: 4px 8px;
+  border-radius: 6px;
+  color: var(--text-faint);
+  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  font-size: 10px;
+  pointer-events: none;
+}
 .clue-detail {
   min-width: 0;
   min-height: 0;
