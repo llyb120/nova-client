@@ -34,6 +34,7 @@ import {
   loadAlkaidSkills,
   mergeAlkaidUsage,
   messagesWithPendingAlkaidPrompt,
+  novaEditFilesEnabled,
   OPENAI_TOOL_OUTPUT_MAX_CHARS,
   OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
   resolveAlkaidShellConfig,
@@ -937,7 +938,13 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.equal(runtime.agent.steeringMode, "all");
     const toolNames = runtime.agent.state.tools.map((tool) => tool.name);
     assert.equal(toolNames.includes("read_files"), false);
-    assert(toolNames.includes("edit_files"));
+    assert.equal(toolNames.includes("edit_files"), novaEditFilesEnabled());
+    if (novaEditFilesEnabled()) {
+      assert.match(runtime.agent.state.systemPrompt, /必须使用 edit_files/);
+    } else {
+      assert.match(runtime.agent.state.systemPrompt, /修改已有文件时使用原生 edit/);
+      assert.doesNotMatch(runtime.agent.state.systemPrompt, /必须使用 edit_files/);
+    }
     if (process.env.NOVA_FAST_CONTEXT !== "0") assert(toolNames.includes("fast_context"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "load_skill"));

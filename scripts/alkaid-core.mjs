@@ -450,6 +450,11 @@ export function decodeTextBuffer(buffer) {
     : content.toString(encoding);
 }
 
+/** 暂时禁用 Vega 的批量 edit_files，回退 PI 原生 edit；设 NOVA_EDIT_FILES=1 恢复。只影响 Vega，不影响其它 agent 的 nova-tools 注入。 */
+export function novaEditFilesEnabled(env = process.env) {
+  return env.NOVA_EDIT_FILES === "1";
+}
+
 export function createFilesystemTools(cwd, editTool = null, opts = {}) {
   const fastContext = opts.fastContext !== false && process.env.NOVA_FAST_CONTEXT !== "0";
   const root = resolve(cwd);
@@ -626,8 +631,9 @@ export function buildAlkaidSystemPrompt(options = {}) {
   const cwd = (options.cwd ?? process.cwd()).replace(/\\/g, "/");
   const skills = options.skills ?? [];
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
+  const editFiles = options.editFiles ?? novaEditFilesEnabled();
   const toolLines = [
-    options.readOnly ? null : "- edit_files: 并行智能编辑多个互不依赖的已有文件（精确优先、锚点定位、歧义拒绝）",
+    options.readOnly || !editFiles ? null : "- edit_files: 并行智能编辑多个互不依赖的已有文件（精确优先、锚点定位、歧义拒绝）",
     "- read: 读取单个文件",
     options.readOnly
       ? "- grep / find / ls: 只读搜索与列举"
@@ -642,11 +648,15 @@ export function buildAlkaidSystemPrompt(options = {}) {
   const stableParts = [
     "你是 Vega：高效、简单、面向软件工程结果。",
     `Available tools:\n${toolLines.join("\n")}`,
-      "你拥有批量增强 edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 fast_context/find_symbols。"
+      `${editFiles
+        ? "你拥有批量增强 edit_files，以及 PI coding agent 的原生 read、bash、edit、write 工具。"
+        : "你拥有 PI coding agent 的原生 read、bash、edit、write 工具。"}以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 fast_context/find_symbols。`
         + (fastContext
           ? "计划修改两个及以上本会话未读过的文件、或修改点分布不明时，先调用一次 fast_context（只要定义/引用行号时用 find_symbols）；一次调用通常替代 5–10 轮 rg+read 往返。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
           : "未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；")
-        + "大文件禁止无目的全量读取。修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。",
+        + `大文件禁止无目的全量读取。${editFiles
+          ? "修改两个及以上互不依赖的已有文件时必须使用 edit_files；同一文件的多处修改合并到该文件的一组 edits。"
+          : "修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。"}已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。`,
       (fastContext
         ? "搜索与遍历必须成本有界。路径和行段已明确时直接 read；修改点分布不明、或计划修改两个及以上未读文件时，先调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返），只要定义/引用位置时用 find_symbols。fast_context 已展示范围视为已读；SIG/IMPACT 仅在确需函数体时精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
         : "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。")
@@ -789,7 +799,9 @@ export async function createAlkaidAgent(options = {}) {
     ? createReadOnlyTools(cwd, { read: { operations: readOperations } })
     : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell }, read: { operations: readOperations } });
   const editTool = codingTools.find((tool) => tool.name === "edit");
-  const batchTools = createFilesystemTools(cwd, editTool);
+  // 批量 edit_files 暂时默认禁用，Vega 回退 PI 原生 edit；NOVA_EDIT_FILES=1 恢复。
+  const editFiles = options.editFiles ?? novaEditFilesEnabled();
+  const batchTools = createFilesystemTools(cwd, editFiles ? editTool : null);
   const rawTools = [...batchTools, ...codingTools, ...mcp.tools];
   const archiveDir = options.sessionId
     ? join(alkaidDataRoot(), "tool-results", safeArchiveSegment(options.sessionId))
@@ -815,6 +827,7 @@ export async function createAlkaidAgent(options = {}) {
     skills,
     readOnly: options.readOnly,
     shellConfig,
+    editFiles,
     systemPrompt: customInstructions,
   });
   const sessionId = options.sessionId;
