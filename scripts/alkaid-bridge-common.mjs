@@ -87,7 +87,8 @@ async function complete(request) {
   const stream = streamSimple(
     resolved.model,
     { messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }] },
-    { reasoning: "minimal" },
+    // 直调没有 agent 的 getApiKey 兜底，必须显式带上解析出的 key，否则请求无鉴权
+    { reasoning: "minimal", apiKey: resolved.apiKey },
   );
   let text = "";
   for await (const event of stream) {
