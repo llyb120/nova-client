@@ -248,12 +248,19 @@ export function ModelPicker(props: {
   const modelValue = createMemo(() => {
     const peerToken = props.quotaPeerToken;
     if (peerToken) return encodeQuotaModelValue(peerToken, props.agentKind, effectiveModel());
+    // allowDefault 时空值代表「默认/关闭」，保持 ""，避免触发器显示编码残片（如 "alkaid:"）
+    if (props.allowDefault && !effectiveModel()) return "";
     return merged() ? encodeModelValue(props.agentKind, effectiveModel()) : effectiveModel();
   });
 
   const onModelChange = (v: string) => {
     if (!merged()) {
       props.onPickModel(props.agentKind, v, null);
+      return;
+    }
+    if (!v && props.allowDefault) {
+      // 「默认/关闭」入口：merged 模式下空值无需解码，直接提交空模型
+      props.onPickModel(props.agentKind, "", null);
       return;
     }
     const decoded = decodeModelValue(v);

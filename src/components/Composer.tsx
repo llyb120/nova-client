@@ -95,7 +95,8 @@ export function Composer() {
       setCursor(value.length);
     },
     getTextarea: () => textareaRef,
-    isBlocked: () => historyOpen() || slashStart() !== null,
+    isBlocked: () =>
+      historyOpen() || slashStart() !== null || !state.settings?.completionModel?.trim(),
     getThreadId: () => state.currentId ?? null,
     onAfterAccept: () => {
       if (textareaRef) updateSlashState(textareaRef, true);

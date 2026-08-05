@@ -141,7 +141,7 @@ export function HomeView() {
       setCursor(value.length);
     },
     getTextarea: () => textareaRef,
-    isBlocked: () => slashStart() !== null,
+    isBlocked: () => slashStart() !== null || !state.settings?.completionModel?.trim(),
     getThreadId: () => null,
     onAfterAccept: () => {
       if (textareaRef) updateSlashState(textareaRef, true);

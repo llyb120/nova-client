@@ -191,10 +191,6 @@ export function SearchSelect(props: {
     setActiveBackend(id);
     setActiveGroup(null);
   };
-  /** 当前后端下的「默认」入口（跟随 agent 默认模型） */
-  const defaultOfBackend = createMemo(() =>
-    props.options.find((o) => o.backend === shownBackend() && o.isDefault),
-  );
   /** 当前后端下、按厂商分组的模型 */
   const providersOfBackend = createMemo(() => {
     const b = shownBackend();
@@ -433,18 +429,16 @@ export function SearchSelect(props: {
               </div>
               <Show when={!showingFavorites()}>
                 <div class="sel-groups sel-providers">
-                  <Show when={props.allowDefault && defaultOfBackend()}>
-                    {(d) => (
-                      <div
-                        class={`sel-item ${props.value === d().value ? "active" : ""}`}
-                        onClick={() => pick(d().value)}
-                      >
-                        <span class="sel-label">{defaultLabel()}</span>
-                        <Show when={props.value === d().value}>
-                          <IconCheck size={13} />
-                        </Show>
-                      </div>
-                    )}
+                  <Show when={props.allowDefault}>
+                    <div
+                      class={`sel-item ${props.value === "" ? "active" : ""}`}
+                      onClick={() => pick("")}
+                    >
+                      <span class="sel-label">{defaultLabel()}</span>
+                      <Show when={props.value === ""}>
+                        <IconCheck size={13} />
+                      </Show>
+                    </div>
                   </Show>
                   <For each={providersOfBackend()}>
                     {(g) => (
