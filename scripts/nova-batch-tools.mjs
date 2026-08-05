@@ -56,7 +56,8 @@ export function normalizeFindSymbolsArgs(params = {}) {
 export function createNovaBatchTools(cwd, options = {}) {
   const fastContext = fastContextEnabled(options);
   const readOnly = readOnlyEnabled(options);
-  const includeEditFiles = options.includeEditFiles !== false && !readOnly;
+  // edit_files 全链路默认禁用（不注入）；设 NOVA_EDIT_FILES=1 或显式传 includeEditFiles: true 恢复。
+  const includeEditFiles = options.includeEditFiles === true && !readOnly;
   const root = resolve(cwd);
 
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
@@ -207,10 +208,15 @@ export function createNovaBatchTools(cwd, options = {}) {
 export function novaDevinBatchToolPolicy(options = {}) {
   const readOnly = readOnlyEnabled(options);
   const fastContext = fastContextEnabled(options);
-  const includeEditFiles = options.includeEditFiles !== false && !readOnly;
+  const includeEditFiles = options.includeEditFiles === true && !readOnly;
   const toolNames = [];
   if (fastContext) toolNames.push("fast_context", "find_symbols");
   if (includeEditFiles) toolNames.push("edit_files");
+  if (toolNames.length === 0) {
+    const lines = ["Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."];
+    if (readOnly) lines.push("Current mode is plan/read-only: analyze only; do not modify files.");
+    return lines.join("\n");
+  }
   const example = fastContext
     ? '{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}'
     : includeEditFiles
@@ -229,7 +235,7 @@ export function novaDevinBatchToolPolicy(options = {}) {
       + "Do not dump large files blindly."
       + (includeEditFiles
         ? " When modifying two or more independent existing files, you must use edit_files; merge multiple edits for the same file into that file's edits array. Single-file edits may use Devin native edit tools."
-        : " For edits, use Devin native edit tools; do not expect a Nova edit_files tool in this mode."),
+        : " For edits, use Devin native edit tools; do not expect a Nova edit_files tool. Multiple edits for the same file must be merged into one native edit call."),
     (fastContext
       ? "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only fast_context (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`) or find_symbols (locations only). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with Devin native read. After fast_context/find_symbols, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside fast_context. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that fast_context did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
       : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")

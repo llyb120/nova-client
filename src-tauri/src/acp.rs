@@ -3070,7 +3070,10 @@ mod nova_tools_config_tests {
         let guidance = super::nova_tools_prompt_guidance(true, false);
         assert!(guidance.contains("ROUTING RULE — before choosing any tool"));
         assert!(guidance.contains("must NEVER be selected as direct tool calls"));
-        assert!(guidance.contains("fast_context, find_symbols, edit_files"));
+        assert!(guidance.contains("fast_context, find_symbols"));
+        assert!(!guidance.contains("fast_context, find_symbols, edit_files"));
+        assert!(!guidance.contains("you must use edit_files"));
+        assert!(guidance.contains("do not expect a Nova edit_files tool"));
         assert!(!guidance.contains("read_files"));
         assert!(guidance.contains("only valid execution path"));
         assert!(guidance.contains("generic mcp_call_tool wrapper"));
@@ -3090,7 +3093,8 @@ mod nova_tools_config_tests {
         assert!(!guidance.contains("fast_context"));
         assert!(!guidance.contains("find_symbols"));
         assert!(!guidance.contains("read_files"));
-        assert!(guidance.contains("edit_files"));
+        assert!(!guidance.contains("you must use edit_files"));
+        assert!(guidance.contains("Devin built-in tools"));
     }
 
     #[cfg(windows)]
@@ -3108,37 +3112,28 @@ mod nova_tools_config_tests {
 
 /// First-prompt guidance for Nova MCP tools attached to Devin ACP sessions.
 /// Aligned with scripts/nova-batch-tools.mjs `novaDevinBatchToolPolicy`:
-/// read_files is intentionally omitted; multi-file reads use Devin native read.
+/// read_files / edit_files are intentionally omitted (edit_files 全链路默认禁用，
+/// NOVA_EDIT_FILES=1 才在 MCP 工具层恢复，此处提示词同步恢复前仍按原生 edit 引导)。
 fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
     let mut tool_names: Vec<&str> = Vec::new();
     if fast_context {
         tool_names.extend(["fast_context", "find_symbols"]);
     }
-    if !read_only {
-        tool_names.push("edit_files");
+    if tool_names.is_empty() {
+        let mut lines = vec![
+            "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools.".to_string(),
+        ];
+        if read_only {
+            lines.push("Current mode is plan/read-only: analyze only; do not modify files.".into());
+        }
+        return lines.join("\n");
     }
     let tools = tool_names.join(", ");
-    let example = if fast_context {
-        r#"{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}"#
-    } else if !read_only {
-        r#"{"server_name":"nova-tools","tool_name":"edit_files","arguments":{"files":[{"path":"src/example.ts","edits":[{"oldText":"a","newText":"b"}]}]}}"#
-    } else {
-        r#"{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}"#
-    };
-    let call_example_name = if fast_context {
-        "fast_context"
-    } else if !read_only {
-        "edit_files"
-    } else {
-        "fast_context"
-    };
-    let nova_tools_phrase = if tool_names.is_empty() {
-        "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools.".into()
-    } else {
-        format!(
-            "You have Nova MCP endpoints from server nova-tools ({tools}) plus Devin built-in tools. In this Devin version, {tools} are remote MCP tool names, NOT top-level callable Devin tools."
-        )
-    };
+    let example = r#"{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}"#;
+    let call_example_name = "fast_context";
+    let nova_tools_phrase = format!(
+        "You have Nova MCP endpoints from server nova-tools ({tools}) plus Devin built-in tools. In this Devin version, {tools} are remote MCP tool names, NOT top-level callable Devin tools."
+    );
     let mut lines = vec![
         format!(
             "ROUTING RULE — before choosing any tool: Nova endpoints must NEVER be selected as direct tool calls. Select Devin's top-level mcp_call_tool first, then pass server_name=\"nova-tools\" and the endpoint name in tool_name. {nova_tools_phrase} Never select or invoke any of those names directly, even after mcp_list_tools lists them; a direct invocation produces `Unknown tool ... This tool is not available.` Your only valid execution path for a Nova tool is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string \"nova-tools\" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: {example}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as `use/call {call_example_name}` means `call mcp_call_tool with server_name nova-tools and tool_name {call_example_name}`; it never authorizes a direct tool call. If a direct call reports `Unknown tool`, retry once through mcp_call_tool. If parsing reports missing field `server_name`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints."
@@ -3153,7 +3148,7 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
             if read_only {
                 " For edits, use Devin native edit tools; do not expect a Nova edit_files tool in this mode."
             } else {
-                " When modifying two or more independent existing files, you must use edit_files; merge multiple edits for the same file into that file's edits array. Single-file edits may use Devin native edit tools."
+                " For edits, use Devin native edit tools; do not expect a Nova edit_files tool. Multiple edits for the same file must be merged into one native edit call."
             }
         ),
         if fast_context {

@@ -29,6 +29,21 @@ test("createNovaBatchTools exposes context/edit by default", () => {
   }
 });
 
+test("edit_files is omitted for all agents by default", () => {
+  const prev = process.env.NOVA_EDIT_FILES;
+  delete process.env.NOVA_EDIT_FILES;
+  try {
+    const tools = createNovaBatchTools(process.cwd(), { readOnly: false });
+    assert.equal(tools.edit_files, undefined);
+    const policy = novaDevinBatchToolPolicy({ fastContext: true });
+    assert.doesNotMatch(policy, /you must use edit_files/);
+    assert.match(policy, /use Devin native edit tools/);
+  } finally {
+    if (prev === undefined) delete process.env.NOVA_EDIT_FILES;
+    else process.env.NOVA_EDIT_FILES = prev;
+  }
+});
+
 test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
   const prev = process.env.NOVA_FAST_CONTEXT;
   process.env.NOVA_FAST_CONTEXT = "0";
@@ -104,6 +119,10 @@ test("devin policy only mentions enabled tools", () => {
     assert.doesNotMatch(disabledPolicy, /fast_context/);
     assert.doesNotMatch(disabledPolicy, /find_symbols/);
     assert.doesNotMatch(disabledPolicy, /Do not use read_files even if a stale Devin MCP listing still shows it/);
+
+    const defaultPolicy = novaDevinBatchToolPolicy({ fastContext: true });
+    assert.doesNotMatch(defaultPolicy, /you must use edit_files/);
+    assert.match(defaultPolicy, /use Devin native edit tools; do not expect a Nova edit_files tool/);
   } finally {
     if (prev === undefined) delete process.env.NOVA_FAST_CONTEXT;
     else process.env.NOVA_FAST_CONTEXT = prev;
