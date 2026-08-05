@@ -80,6 +80,33 @@ export function saveWorkflow(def: WorkflowDef): void {
 
 export function deleteUserWorkflow(id: string): void {
   writeUserWorkflows(readUserWorkflows().filter((w) => w.id !== id));
+  const shared = readSharedIds();
+  if (shared.delete(id)) localStorage.setItem(SHARED_KEY, JSON.stringify([...shared]));
+}
+
+// ---------------------------------------------------------------------------
+// 共享标记：本地记录哪些工作流已共享给团队（UI 展示「已共享」，重复共享 = 更新）。
+// ---------------------------------------------------------------------------
+
+const SHARED_KEY = "fd:workflowShared:v1";
+
+function readSharedIds(): Set<string> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SHARED_KEY) ?? "[]");
+    return Array.isArray(raw) ? new Set(raw as string[]) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+export function isWorkflowShared(id: string): boolean {
+  return readSharedIds().has(id);
+}
+
+export function markWorkflowShared(id: string): void {
+  const shared = readSharedIds();
+  shared.add(id);
+  localStorage.setItem(SHARED_KEY, JSON.stringify([...shared]));
 }
 
 /**

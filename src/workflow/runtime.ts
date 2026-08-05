@@ -129,51 +129,31 @@ function resolvePrompt(
     prev: ctx.prev,
     attempt: ctx.attempt,
   }).trim();
-  const handoff = [
-    ctx.vars.context?.trim() ? ctx.vars.context.trim() : "",
-    ctx.vars.goal?.trim() ? `工作流目标：\n${ctx.vars.goal.trim()}` : "",
-    ctx.prev.trim() ? `上一节点结论：\n${ctx.prev.trim()}` : "",
-  ].filter(Boolean);
+  // 上下文（目标 / 上一节点结论 / 自定义变量）不再隐式注入：需要哪些上下文，
+  // 由用户在节点提示词里用 {{goal}} {{prev}} 等占位符显式引用。
   const routes = stage.transitions;
-  // 引擎自动补全两种连线模式所需的提示词：
-  // - 正常模式：隐式要求本节点在结尾输出所选分支的路由标识；
-  // - 提示词模式：隐式要求本节点给出清晰结论，去向由轻量模型按连线名称判断。
+  // 路由规则是唯一隐式注入的内容：要求节点在给出结论的同时，把所选去向的路由标识放在最后一行；
+  // 节点未明确选择时，运行时会再用轻量模型按结论判断去向。
   let routing = "";
   if (routes.length > 1 && !stage.manualReview) {
-    const markerRoutes = routes.filter((transition) => transition.judge !== "llm");
-    const llmRoutes = routes.filter((transition) => transition.judge === "llm");
-    const sections: string[] = [];
-    if (markerRoutes.length > 0) {
-      sections.push(
-        `完成当前节点任务后，必须根据实际结论选择且只选择一个下一跳。将对应标识单独放在回复最后一行，标识后不要再输出内容：\n${markerRoutes
-          .map((transition) => `- ${workflowTransitionPrompt(transition)}\n  ${workflowRouteMarker(transition.id)}`)
-          .join("\n")}`,
-      );
-    }
-    if (llmRoutes.length > 0) {
-      sections.push(
-        `以下候选去向由系统根据你的结论自动判断（无需输出任何标识）。请在结尾清楚总结本轮的实际结果与结论，供系统判断走向：\n${llmRoutes
-          .map((transition) => `- ${workflowTransitionPrompt(transition)}`)
-          .join("\n")}`,
-      );
-    }
-    routing = sections.join("\n\n");
+    routing = `完成当前节点任务后，必须根据实际结论选择且只选择一个下一跳。将对应标识单独放在回复最后一行，标识后不要再输出内容：\n${routes
+      .map((transition) => `- ${workflowTransitionPrompt(transition)}\n  ${workflowRouteMarker(transition.id)}`)
+      .join("\n")}`;
   }
-  return [base, ...handoff, routing].filter(Boolean).join("\n\n");
+  return [base, routing].filter(Boolean).join("\n\n");
 }
 
 function resolveTitle(
   _def: WorkflowDef,
   stage: WorkflowStageDef,
   ctx: WorkflowStageContext,
-  status = "",
 ): string {
-  const base = renderTemplate(stage.titleTemplate ?? `[WF] ${stage.name} · 第{{attempt}}次`, {
+  // 仅作为会话创建时的兜底标题：随提示词发出的同时会让模型生成正式标题替换它。
+  return renderTemplate(stage.titleTemplate ?? `[WF] ${stage.name} · 第{{attempt}}次`, {
     ...ctx.vars,
     prev: ctx.prev,
     attempt: ctx.attempt,
   });
-  return status ? `${base} · ${status}` : base;
 }
 
 function runContext(run: WorkflowRunStep, prev: string): WorkflowStageContext {
@@ -198,10 +178,17 @@ async function createStageThread(
 ): Promise<void> {
   const h = requireHost();
   const root = await api.getThread(run.rootId);
+  // 节点可覆盖后端/模型：未配置时跟随启动会话；配置了后端但未配模型时用该后端默认模型。
+  const stageAgentKind = stage.agentKind ?? root.agentKind;
+  const stageModel = stage.model?.trim()
+    ? stage.model
+    : stage.agentKind
+      ? null
+      : (root.model ?? null);
   const thread = await api.createThread(
     root.cwd,
-    root.agentKind,
-    root.model ?? null,
+    stageAgentKind,
+    stageModel,
     stage.mode ?? "build",
     null,
     false,
@@ -212,6 +199,10 @@ async function createStageThread(
     run.rootId,
   );
   await api.renameThread(thread.id, title);
+  // 会话标题交给模型按节点任务生成（异步，[WF] 前缀由后端保留）；失败则保持上面的兜底标题。
+  void api
+    .generateThreadTitle(thread.id, prompt.replace(/\[\[NOVA_WORKFLOW_ROUTE:[^\]]+\]\]/g, "").slice(0, 1200))
+    .catch(() => {});
   activeRuns.set(thread.id, run);
   runHistory.set(thread.id, run);
   latestThreadByRoot.set(run.rootId, thread.id);
@@ -247,8 +238,6 @@ async function followTransition(
     pendingManualReviews.delete(threadId);
     persistRuns();
     setWorkflowReviewRevision((value) => value + 1);
-    await api.renameThread(threadId, resolveTitle(def, stage, runContext(run, conclusion), "完成"));
-    await h.refreshThreads();
     void api.notifyWorkflowDone(threadId, true).catch(() => {});
     return;
   }
@@ -260,8 +249,6 @@ async function followTransition(
     pendingManualReviews.delete(threadId);
     persistRuns();
     setWorkflowReviewRevision((value) => value + 1);
-    await api.renameThread(threadId, resolveTitle(def, stage, runContext(run, conclusion), "已停止"));
-    await h.refreshThreads();
     void api.notifyWorkflowDone(threadId, false).catch(() => {});
     return;
   }
@@ -310,30 +297,24 @@ async function advanceWorkflow(threadId: string): Promise<void> {
     pendingManualReviews.add(threadId);
     persistRuns();
     setWorkflowReviewRevision((value) => value + 1);
-    await api.renameThread(threadId, resolveTitle(def, stage, runContext(run, conclusion), "待人工审核"));
-    await h.refreshThreads();
     return;
   }
 
-  // 单出口直接接力；多出口先按标识（正常模式）匹配，未命中再由轻量模型判断提示词模式连线。
+  // 单出口直接接力；多出口先按节点输出的路由标识匹配，
+  // 节点未明确选择（无标识）时由轻量模型按结论与「跳转依据」快速判断。
   // 旧工作流仍兼容 marker/regex。
   let transition = stage.transitions.length === 1
     ? stage.transitions[0]
     : evalTransition(stage, conclusion);
 
   if (!transition && stage.transitions.length > 1) {
-    const llmRoutes = stage.transitions.filter((candidate) => candidate.judge === "llm");
-    if (llmRoutes.length > 0) {
-      transition = await judgeLlmTransition(run, llmRoutes, conclusion);
-    }
+    transition = await judgeLlmTransition(run, stage.transitions, conclusion);
   }
 
   if (!transition) {
     // 没有任何转移命中：停在当前阶段等用户补充。
     suspendedRuns.set(threadId, run);
     persistRuns();
-    await api.renameThread(threadId, resolveTitle(def, stage, runContext(run, conclusion), "待补充"));
-    await h.refreshThreads();
     return;
   }
 
@@ -341,7 +322,7 @@ async function advanceWorkflow(threadId: string): Promise<void> {
 }
 
 /**
- * 提示词模式连线判断：把候选连线交给轻量模型，按当前节点结论选择下一跳。
+ * 节点未明确输出路由标识时，把全部候选连线交给轻量模型，按当前节点结论快速判断下一跳。
  * 模型不可用 / 超时 / 无法判断时返回 null，由调用方按「待补充」暂停处理。
  */
 async function judgeLlmTransition(
@@ -367,20 +348,12 @@ async function judgeLlmTransition(
   }
 }
 
-function suspendWorkflow(threadId: string, manual: boolean): void {
+function suspendWorkflow(threadId: string, _manual: boolean): void {
   const run = activeRuns.get(threadId);
   if (!run) return;
   activeRuns.delete(threadId);
   suspendedRuns.set(threadId, run);
   persistRuns();
-  const def = getWorkflow(run.workflowId);
-  const stage = def?.stages.find((s) => s.id === run.stageId);
-  if (def && stage) {
-    void api
-      .renameThread(threadId, resolveTitle(def, stage, runContext(run, ""), manual ? "已暂停" : "异常暂停"))
-      .then(() => requireHost().refreshThreads())
-      .catch(() => {});
-  }
 }
 
 /** turn 开始或用户补充消息时重新挂回流程；返回该 thread 的运行态（非工作流会话返回 null）。 */
@@ -399,18 +372,8 @@ function reattach(threadId: string): WorkflowRunStep | null {
   const wasSuspended = suspendedRuns.delete(threadId);
   const wasManualReview = pendingManualReviews.delete(threadId);
   activeRuns.set(threadId, run);
-  if (wasSuspended || wasCompleted || wasManualReview) {
-    const def = getWorkflow(run.workflowId);
-    const stage = def?.stages.find((s) => s.id === run.stageId);
-    if (def && stage) {
-      void api
-        .renameThread(threadId, resolveTitle(def, stage, runContext(run, "")))
-        .then(() => requireHost().refreshThreads())
-        .catch(() => {});
-    }
-  }
   persistRuns();
-  if (wasManualReview) setWorkflowReviewRevision((value) => value + 1);
+  if (wasSuspended || wasCompleted || wasManualReview) setWorkflowReviewRevision((value) => value + 1);
   return run;
 }
 
@@ -475,7 +438,6 @@ export function startWorkflow(
     persistRuns();
 
     const ctx = runContext(run, "");
-    await api.renameThread(rootId, resolveTitle(def, entry, ctx));
     await h.refreshThreads();
     if (h.currentId() === rootId) h.bumpScrollToBottom();
     h.clearProposedPlan();

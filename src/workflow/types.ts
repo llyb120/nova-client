@@ -6,6 +6,7 @@
  * 路由标识才走该连线）与提示词模式（轻量模型按前一节点结论判断）；两种模式运行所需
  * 的提示词均由引擎自动补全，用户只需配置节点提示词与连线名称。
  */
+import type { AgentKind } from "../types";
 
 /** 终止伪节点：只表示流程到达结束状态。 */
 export const WF_DONE = "$done";
@@ -36,15 +37,9 @@ export interface WorkflowTransition {
   when: WorkflowTransitionWhen;
   /** 目标节点 id，或 $done。旧数据中的 $fail 视为同一个结束状态。 */
   to: string;
-  /** 连线名称（显示在线上），同时作为判断依据：引擎据此生成路由标识要求或轻量模型判断提示词。 */
+  /** 跳转依据：告诉引擎/模型什么情况下走这条连线。正常模式用于生成路由标识要求，提示词模式作为轻量模型判断的候选描述；留空时回退用连线名称。 */
   prompt?: string;
-  /**
-   * 判断模式：
-   * - marker（默认，正常模式）：前一节点结论末尾出现引擎注入的路由标识时才走该连线；
-   * - llm（提示词模式）：由轻量模型根据前一节点结论与连线名称自动判断是否走该连线。
-   */
-  judge?: "marker" | "llm";
-  /** 旧版画布标签，继续兼容已有工作流。 */
+  /** 连线名称（显示在线上）。 */
   label?: string;
 }
 
@@ -61,6 +56,9 @@ export interface WorkflowStageDef {
   titleTemplate?: string;
   /** 可选：覆盖该阶段会话模式（如 build / plan）。 */
   mode?: string;
+  /** 可选：覆盖该阶段的后端；缺省跟随启动会话。仅换模型不换后端时无需设置。 */
+  agentKind?: AgentKind;
+  /** 可选：覆盖该阶段的模型；缺省跟随启动会话（设置了 agentKind 而未设模型时用该后端默认模型）。 */
   model?: string | null;
   /** 节点完成后暂停，由用户人工选择下一条连线；引擎不自动判断。 */
   manualReview?: boolean;

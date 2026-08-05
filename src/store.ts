@@ -1557,7 +1557,7 @@ async function tryBuiltinPrompt(
   }
   if (/^\/run(?:\s|$)/i.test(builtInInput)) {
     const parsed = parseRunInput(builtInInput);
-    await startWorkflow(parsed.workflowId, { goal: parsed.goal }, threadId, images);
+    await startWorkflow(parsed.workflowId, parsed.vars, threadId, images);
     return true;
   }
   if (/^\/setup(?:\s|$)/i.test(builtInInput)) {
@@ -1578,16 +1578,36 @@ async function tryBuiltinPrompt(
   return false;
 }
 
-/** 解析 /run <工作流名> <目标>。工作流名取第一个空白分隔的词，其余为目标。 */
-function parseRunInput(input: string): { workflowId: string; goal: string } {
+/**
+ * 解析 /run <工作流名> <目标> [-- key=value ...]。
+ * 工作流名取第一个空白分隔的词；「--」之前（工作流名之后）为目标 goal；
+ * 「--」之后为 key=value 形式的流程变量（值可含空格，最后一个 key 吞掉剩余文本），
+ * 可在节点提示词模板里用 {{key}} 引用，例如 -- criteria=不能有类型错误。
+ */
+function parseRunInput(input: string): { workflowId: string; vars: Record<string, string> } {
   const body = input.replace(/^\/run(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
   if (!body) throw new Error("请在 /run 后输入工作流名称和目标");
-  const [nameToken, ...rest] = body.split(/\s+/);
-  const goal = rest.join(" ").trim();
+  const [nameToken, ...restTokens] = body.split(/\s+/);
   const workflow = findWorkflowByName(nameToken);
   if (!workflow) throw new Error(`找不到名为「${nameToken}」的工作流，可在设置·工作流中查看`);
+  const rest = restTokens.join(" ");
+  const sepMatch = /(?:^|\s)--(?:\s|$)/.exec(rest);
+  const goal = (sepMatch ? rest.slice(0, sepMatch.index) : rest).trim();
   if (!goal) throw new Error("请在 /run <工作流名> 后输入目标");
-  return { workflowId: workflow.id, goal };
+  const vars: Record<string, string> = { goal };
+  const varsText = sepMatch ? rest.slice(sepMatch.index + sepMatch[0].length).trim() : "";
+  if (varsText) {
+    // 按「空白后跟 key=」切分，允许值里包含空格。
+    const parts = varsText.split(/\s+(?=[\w一-龥-]+=)/);
+    for (const part of parts) {
+      const eq = part.indexOf("=");
+      if (eq <= 0) continue;
+      const key = part.slice(0, eq).trim();
+      const value = part.slice(eq + 1).trim();
+      if (key && value) vars[key] = value;
+    }
+  }
+  return { workflowId: workflow.id, vars };
 }
 
 /** 创建会话 / 暂存前提前校验内置命令，避免 worktree 建完才发现 /fire 非法。 */

@@ -313,9 +313,9 @@ export function WorkflowCanvas(props: Props) {
               >
                 <path class="wf-edge-hit" d={edge.d} />
                 <path class="wf-edge-line" d={edge.d} marker-end="url(#wf-arrow)" />
-                <Show when={edge.transition.prompt || edge.transition.label}>
+                <Show when={edge.transition.label || edge.transition.prompt}>
                   <text class="wf-edge-label" x={edge.label.x} y={edge.label.y}>
-                    {`${edge.transition.judge === "llm" ? "✦ " : ""}${(edge.transition.prompt || edge.transition.label || "").slice(0, 18)}`}
+                    {`${(edge.transition.label || edge.transition.prompt || "").slice(0, 18)}`}
                   </text>
                 </Show>
               </g>

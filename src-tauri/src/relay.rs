@@ -1557,7 +1557,7 @@ impl RelayManager {
     // ===== 工作流分享：把工作流定义定向发给队友，对方接收后进入其工作流库 =====
 
     /// 把工作流定义分享给指定队友。def 为前端完整的 WorkflowDef JSON。
-    pub fn share_workflow(&self, def: &Value, to: &str) -> Result<(), String> {
+    pub fn share_workflow(&self, def: &Value, to: &str) -> Result<usize, String> {
         if self.cfg().is_none() {
             return Err("未配置团队中转站".into());
         }
@@ -1577,8 +1577,29 @@ impl RelayManager {
         if stage_count == 0 {
             return Err("工作流没有阶段，无法分享".into());
         }
-        self.enqueue(to.to_string(), "workflow", def.clone());
-        Ok(())
+        // to 为空 = 共享给全组在线队友（各自收件箱出现，按需导入；重复共享 = 覆盖更新）
+        let targets: Vec<String> = if to.trim().is_empty() {
+            self.peers
+                .lock()
+                .unwrap()
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|peer| peer["token"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![to.to_string()]
+        };
+        if targets.is_empty() {
+            return Err("当前没有在线队友，对方上线后请重新共享".into());
+        }
+        let count = targets.len();
+        for target in targets {
+            self.enqueue(target, "workflow", def.clone());
+        }
+        Ok(count)
     }
 
     fn on_workflow(&self, env: &InEnvelope) {

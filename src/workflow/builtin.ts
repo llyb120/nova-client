@@ -48,7 +48,7 @@ export const WORKFLOW_WAKE_DO: WorkflowDef = {
       name: "开发执行",
       titleTemplate: "[Do] 开发执行 · 第{{attempt}}次",
       promptTemplate:
-        "你是数字员工的开发执行（Do）阶段。请基于开工预检的结论动手完成工作：遵循仓库现有规范，控制改动范围，完成后自查并给出可核实的结论（改了什么、如何验证）。\n\n{{context}}",
+        "你是数字员工的开发执行（Do）阶段。请基于开工预检的结论动手完成工作：遵循仓库现有规范，控制改动范围，完成后自查并给出可核实的结论（改了什么、如何验证）。\n\n工作目标：\n{{goal}}\n\n开工预检结论：\n{{prev}}\n\n{{context}}",
       mode: "build",
       x: 360,
       y: 160,
@@ -75,7 +75,7 @@ export const WORKFLOW_DEMO: WorkflowDef = {
     {
       id: "execute",
       name: "执行",
-      promptTemplate: "完成工作流目标。检查现状后直接实施，并在结尾给出可核实的完成结论。",
+      promptTemplate: "完成工作流目标。检查现状后直接实施，并在结尾给出可核实的完成结论。\n\n工作目标：\n{{goal}}\n\n上一节点结论：\n{{prev}}",
       mode: "build",
       x: 80,
       y: 160,
@@ -91,7 +91,7 @@ export const WORKFLOW_DEMO: WorkflowDef = {
     {
       id: "review",
       name: "检查",
-      promptTemplate: "根据工作流目标和上一节点结论检查实际结果，只做判断并指出未满足项。",
+      promptTemplate: "根据工作流目标和上一节点结论检查实际结果，只做判断并指出未满足项。\n\n工作目标：\n{{goal}}\n\n上一节点结论：\n{{prev}}",
       mode: "build",
       x: 360,
       y: 160,

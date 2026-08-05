@@ -8717,6 +8717,7 @@ button.head-badge:hover {
 .wf-badge { font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--bg-hover); color: var(--text-muted); flex: 0 0 auto; }
 .wf-badge-off { color: var(--text-faint); border: 1px solid var(--border); background: transparent; }
 .wf-badge-team { color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); background: transparent; }
+.wf-shared-btn { border-color: color-mix(in srgb, var(--green) 55%, var(--border)); color: var(--green); }
 /* 团队分享收件箱（抽屉内） */
 .wf-inbox { display: flex; flex-direction: column; gap: 6px; padding-bottom: 8px; margin-bottom: 4px; border-bottom: 1px solid var(--border); }
 .wf-inbox-title { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--accent); }

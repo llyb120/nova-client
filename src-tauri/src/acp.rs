@@ -1984,6 +1984,12 @@ impl AcpManager {
             let mut store = state.store.lock().unwrap();
             if let Some(thread) = store.get_mut(&job.thread_id) {
                 if thread.title == "新会话" || thread.title == job.fallback_title {
+                    // 工作流会话：剥掉模型可能重复生成的前缀，统一保证单个 [WF] 前缀。
+                    let title = if job.fallback_title.starts_with("[WF]") {
+                        format!("[WF] {}", title.trim_start_matches("[WF]").trim_start())
+                    } else {
+                        title
+                    };
                     thread.title = title;
                     true
                 } else {

@@ -190,6 +190,16 @@ impl AppState {
         prompt: String,
         fallback: String,
     ) {
+        // 工作流会话保留 [WF] 前缀（阶段导航依赖它识别链）；超长的阶段名兜底标题截短。
+        let fallback = if fallback.starts_with("[WF]") {
+            if fallback.chars().count() > 28 {
+                format!("[WF] {}", fallback[4..].chars().take(24).collect::<String>())
+            } else {
+                fallback
+            }
+        } else {
+            fallback
+        };
         let (agent_raw, model) = {
             let s = self.settings.lock().unwrap();
             (
@@ -2933,6 +2943,23 @@ fn rename_thread(
     Ok(())
 }
 
+/// 工作流阶段会话：让模型按节点任务生成标题。会话先以「[WF] 节点名」兜底创建，
+/// 生成成功后替换（[WF] 前缀由后端统一保留）；生成失败则保持兜底标题。
+#[tauri::command]
+fn generate_thread_title(state: State<'_, AppState>, thread_id: String, prompt: String) {
+    let (agent_kind, fallback) = {
+        let store = state.store.lock().unwrap();
+        let Some(thread) = store.get(&thread_id) else {
+            return;
+        };
+        (thread.agent_kind.clone(), thread.title.clone())
+    };
+    if fallback.trim().is_empty() || prompt.trim().is_empty() {
+        return;
+    }
+    state.generate_title(&agent_kind, thread_id, prompt, fallback);
+}
+
 #[tauri::command]
 fn set_thread_model(
     state: State<'_, AppState>,
@@ -4578,7 +4605,7 @@ fn decline_share(state: State<'_, AppState>, id: String) {
 
 /// 把工作流定义分享给指定队友（对方接收后进入其工作流库）
 #[tauri::command]
-fn share_workflow(state: State<'_, AppState>, workflow: Value, to: String) -> Result<(), String> {
+fn share_workflow(state: State<'_, AppState>, workflow: Value, to: String) -> Result<usize, String> {
     state.relay.share_workflow(&workflow, &to)
 }
 
@@ -6145,6 +6172,7 @@ pub fn run() {
             share_thread,
             advanced_share,
             summarize_clue,
+            generate_thread_title,
             complete_composer_draft,
             judge_workflow_route,
             accept_share,

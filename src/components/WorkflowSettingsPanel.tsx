@@ -6,13 +6,16 @@ import {
   acceptSharedWorkflow,
   deleteUserWorkflow,
   isWorkflowEnabled,
+  isWorkflowShared,
   listWorkflows,
+  markWorkflowShared,
   saveWorkflow,
   setWorkflowEnabled,
 } from "../workflow/storage";
 import { api } from "../ipc";
-import { refreshWorkflowInbox, state } from "../store";
-import type { IncomingWorkflowShare, Peer } from "../types";
+import { enabledAgentKinds, refreshWorkflowInbox, state } from "../store";
+import { ModelPicker } from "./ConfigSelects";
+import type { AgentKind, IncomingWorkflowShare } from "../types";
 import {
   newWorkflowId,
   validateWorkflow,
@@ -63,12 +66,16 @@ export function WorkflowSettingsPanel() {
   const [stageModalOpen, setStageModalOpen] = createSignal(false);
   const [edgeModalOpen, setEdgeModalOpen] = createSignal(false);
 
-  // 团队分享：把当前工作流定向发给队友；队友分享来的工作流在抽屉收件箱里接收。
-  const [shareOpen, setShareOpen] = createSignal(false);
-  const [shareTarget, setShareTarget] = createSignal("");
+  // 团队共享：点「共享」把工作流发布给全组在线队友（出现在对方「导入」列表），重复共享 = 更新；
+  // sharedRev：共享记录写在 localStorage，点击后手动推动 memo 重算。
   const [shareBusy, setShareBusy] = createSignal(false);
-  const myToken = () => state.settings?.relayToken ?? "";
-  const peers = createMemo<Peer[]>(() => state.peers.filter((p) => p.token !== myToken()));
+  const [sharedRev, setSharedRev] = createSignal(0);
+  const wfShared = createMemo(() => {
+    sharedRev();
+    const d = draft();
+    return d ? isWorkflowShared(d.id) : false;
+  });
+  const [importOpen, setImportOpen] = createSignal(false);
 
   const reload = () => setList(listWorkflows());
 
@@ -231,23 +238,21 @@ export function WorkflowSettingsPanel() {
     select(null);
   }
 
-  /** 把当前工作流分享给选中的队友（分享的是当前画布内容，含未保存改动）。 */
+  /** 把当前工作流共享给全组在线队友（分享的是当前画布内容，含未保存改动）。 */
   async function submitShare() {
     const d = draft();
-    const to = shareTarget();
-    if (!d || !to) return;
+    if (!d) return;
     const errs = validateWorkflow(d);
     if (errs.length > 0) {
       setMsg(errs.join("；"));
-      setShareOpen(false);
       return;
     }
     setShareBusy(true);
     try {
-      await api.shareWorkflow(d, to);
-      const name = state.peers.find((p) => p.token === to)?.name ?? to;
-      setShareOpen(false);
-      setMsg(`已把「${d.name}」分享给 ${name}，对方在工作流页接收`);
+      const count = await api.shareWorkflow(d, "");
+      markWorkflowShared(d.id);
+      setSharedRev((v) => v + 1);
+      setMsg(`已共享「${d.name}」：${count} 位在线队友可在工作流页点「导入」获取；之后修改可再次共享以更新`);
     } catch (e) {
       setMsg(e instanceof Error ? e.message : String(e));
     } finally {
@@ -263,7 +268,8 @@ export function WorkflowSettingsPanel() {
       reload();
       await refreshWorkflowInbox();
       select(saved.id);
-      setMsg(`已接收「${saved.name}」，新会话的工作流选择里可直接使用`);
+      setImportOpen(false);
+      setMsg(`已导入「${saved.name}」，新会话的工作流选择里可直接使用`);
     } catch (e) {
       setMsg(e instanceof Error ? e.message : String(e));
       void refreshWorkflowInbox();
@@ -289,16 +295,20 @@ export function WorkflowSettingsPanel() {
     setStageModalOpen(false);
   }
 
-  const targetOptions = createMemo(() => {
-    const d = draft();
-    if (!d) return [];
-    return [
-      ...d.stages.map((s) => ({ value: s.id, label: `→ ${s.name || s.id}` })),
-      { value: WF_DONE, label: "→ 结束" },
-    ];
-  });
-
   const currentName = createMemo(() => draft()?.name ?? "未选择");
+
+  /** 遮罩点击关闭：要求按下与抬起都在遮罩本身，避免弹窗内拖选文字滑出窗口误关。 */
+  let backdropDownOnSelf = false;
+  function onBackdropMouseDown(e: MouseEvent) {
+    backdropDownOnSelf = e.target === e.currentTarget;
+  }
+  function backdropClose(close: () => void) {
+    return (e: MouseEvent) => {
+      const ok = backdropDownOnSelf && e.target === e.currentTarget;
+      backdropDownOnSelf = false;
+      if (ok) close();
+    };
+  }
 
   return (
     <div class="wf-panel">
@@ -330,31 +340,18 @@ export function WorkflowSettingsPanel() {
             <button class="btn primary small" onClick={createNew}>
               <IconPlus size={14} /> 新建
             </button>
+            <button
+              class="btn secondary small"
+              disabled={!state.relay.connected}
+              onClick={() => { setDrawerOpen(false); setImportOpen(true); void refreshWorkflowInbox(); }}
+              title={state.relay.connected ? "导入队友共享的工作流" : "未连接中转站"}
+            >
+              <IconShare size={14} /> 导入{state.workflowInbox.length > 0 ? `（${state.workflowInbox.length}）` : ""}
+            </button>
             <button class="btn secondary small" disabled={!draft() || draft()!.builtin} onClick={removeSelected}>
               删除
             </button>
           </div>
-          <Show when={state.workflowInbox.length > 0}>
-            <div class="wf-inbox">
-              <div class="wf-inbox-title">
-                <IconBroadcast size={13} /> 团队分享的工作流（{state.workflowInbox.length}）
-              </div>
-              <For each={state.workflowInbox}>
-                {(s) => (
-                  <div class="wf-inbox-item">
-                    <div class="wf-inbox-info">
-                      <span class="wf-list-name">{s.def.name}</span>
-                      <span class="field-hint">来自 {s.fromName} · {s.def.stages.length} 个阶段</span>
-                    </div>
-                    <div class="wf-inbox-actions">
-                      <button class="btn small primary" onClick={() => void acceptShared(s)}>接收</button>
-                      <button class="btn danger small" onClick={() => void declineShared(s.id)}>忽略</button>
-                    </div>
-                  </div>
-                )}
-              </For>
-            </div>
-          </Show>
           <div class="wf-list">
             <For each={list()}>
               {(wf) => (
@@ -475,11 +472,18 @@ export function WorkflowSettingsPanel() {
                 <button class="btn primary small" disabled={d().builtin} onClick={save}>保存</button>
                 <button
                   class="btn secondary small"
-                  disabled={d().builtin}
-                  onClick={() => { setShareTarget(""); setShareOpen(true); }}
-                  title="把这个工作流分享给队友（内置工作流人人都有，无需分享）"
+                  classList={{ "wf-shared-btn": wfShared() }}
+                  disabled={d().builtin || shareBusy() || !state.relay.connected}
+                  onClick={() => void submitShare()}
+                  title={
+                    !state.relay.connected
+                      ? "未连接中转站：在设置里填写 token 后才能共享"
+                      : wfShared()
+                        ? "已共享给团队；修改后再次点击可更新"
+                        : "共享给全组在线队友，对方在工作流页点「导入」获取（内置工作流人人都有，无需共享）"
+                  }
                 >
-                  <IconShare size={13} /> 分享
+                  <IconShare size={13} /> {shareBusy() ? "共享中…" : wfShared() ? "已共享" : "共享"}
                 </button>
                 <button class="wf-bar-toggle" onClick={() => setBarCollapsed(true)} title="收起工具条">
                   <IconChevron size={14} />
@@ -506,7 +510,7 @@ export function WorkflowSettingsPanel() {
 
       {/* 阶段编辑弹窗（与连线弹窗相互独立） */}
       <Show when={stageModalOpen() && draft()}>
-        <div class="modal-backdrop wf-modal-backdrop" onClick={() => setStageModalOpen(false)}>
+        <div class="modal-backdrop wf-modal-backdrop" onMouseDown={onBackdropMouseDown} onClick={backdropClose(() => setStageModalOpen(false))}>
           <div class="modal wf-modal wf-inspector-modal" onClick={(e) => e.stopPropagation()}>
             <div class="modal-head">
               <span>编辑阶段</span>
@@ -549,6 +553,24 @@ export function WorkflowSettingsPanel() {
                       </label>
                       <span class="field-hint">开启后，节点完成时暂停，不由模型判断；用户在会话底部手动选择下一条连线。</span>
 
+                      <label class="field">
+                        <span class="field-label">模型</span>
+                        <ModelPicker
+                          agentKind={stage().agentKind ?? enabledAgentKinds()[0] ?? "devin"}
+                          agentKinds={enabledAgentKinds()}
+                          model={stage().model ?? ""}
+                          onPickModel={(kind: AgentKind, model: string) =>
+                            patchStage(stage().id, model
+                              ? { agentKind: kind, model }
+                              : { agentKind: undefined, model: null })}
+                          title="节点模型"
+                          allowDefault
+                          defaultLabel="跟随会话"
+                          portal
+                        />
+                        <span class="field-hint">默认跟随启动会话的后端与模型；选择后该节点用指定的后端/模型运行。</span>
+                      </label>
+
                       <label class="wf-field">
                         <span>提示词模板</span>
                         <textarea
@@ -558,7 +580,13 @@ export function WorkflowSettingsPanel() {
                           value={stage().promptTemplate}
                           onInput={(e) => patchStage(stage().id, { promptTemplate: e.currentTarget.value })}
                         />
-                        <span class="field-hint">引擎会自动补充工作流目标、上一节点结论和跳转要求。模板变量仍兼容：{"{{goal}} {{criteria}} {{prev}} {{attempt}}"}</span>
+                        <span class="field-hint">
+                          节点只隐式注入路由规则；目标、上一节点结论等上下文需用以下占位符显式引用：<br />
+                          {"{{goal}}"}：启动工作流时填写的目标（/run 的工作流名之后、「--」之前的文本）；<br />
+                          {"{{criteria}}"} 等自定义变量：用 /run 的「--」参数附带，例如 /run 评审 修复登录页 -- criteria=不能有类型错误，值里可含空格；<br />
+                          {"{{prev}}"}：上一节点的结论（首节点为空）；<br />
+                          {"{{attempt}}"}：当前节点是第几次进入（走回环重进时递增）。
+                        </span>
                       </label>
                     </div>
 
@@ -578,7 +606,7 @@ export function WorkflowSettingsPanel() {
       {/* 连线编辑弹窗（与阶段弹窗相互独立） */}
       <Show when={edgeModalOpen() && selectedTransitionView()}>
         {(tv) => (
-          <div class="modal-backdrop wf-modal-backdrop" onClick={() => setEdgeModalOpen(false)}>
+          <div class="modal-backdrop wf-modal-backdrop" onMouseDown={onBackdropMouseDown} onClick={backdropClose(() => setEdgeModalOpen(false))}>
             <div class="modal wf-modal wf-inspector-modal" onClick={(e) => e.stopPropagation()}>
               <div class="modal-head">
                 <span>编辑连线 · 来自「{tv().stage.name}」</span>
@@ -587,47 +615,29 @@ export function WorkflowSettingsPanel() {
               <div class="modal-body">
                 <div class="wf-stage-editor">
                   <div class="wf-modal-section">
-                    <div class="wf-transition focused">
-                      <select
-                        class="field-input wf-select"
-                        value={tv().transition.to}
-                        disabled={draft()!.builtin}
-                        onChange={(e) => patchTransition(tv().stage.id, tv().transition.id, { to: e.currentTarget.value })}
-                      >
-                        <For each={targetOptions()}>{(opt) => <option value={opt.value}>{opt.label}</option>}</For>
-                      </select>
+                    <label class="field">
+                      <span class="field-label">连线名称（显示在线上）</span>
                       <input
-                        class="field-input wf-edge-label-input"
-                        value={tv().transition.prompt ?? tv().transition.label ?? ""}
+                        class="field-input"
+                        value={tv().transition.label ?? ""}
                         disabled={draft()!.builtin}
-                        placeholder="连线名称（显示在线上）"
+                        placeholder="例如：通过 / 打回重做"
+                        onInput={(e) => patchTransition(tv().stage.id, tv().transition.id, { label: e.currentTarget.value })}
+                      />
+                    </label>
+                    <label class="field">
+                      <span class="field-label">跳转依据（告诉引擎/模型什么情况下走这条线）</span>
+                      <textarea
+                        class="field-input"
+                        rows={2}
+                        value={tv().transition.prompt ?? ""}
+                        disabled={draft()!.builtin}
+                        placeholder="留空则使用连线名称作为跳转依据"
                         onInput={(e) => patchTransition(tv().stage.id, tv().transition.id, { prompt: e.currentTarget.value })}
                       />
-                    </div>
-                    <div class="wf-inspector-row wf-edge-mode-row">
-                      <button
-                        class="wf-chip"
-                        classList={{ active: tv().transition.judge !== "llm" }}
-                        disabled={draft()!.builtin}
-                        onClick={() => patchTransition(tv().stage.id, tv().transition.id, { judge: "marker" })}
-                        title="前一节点结论出现对应标识时才走这条连线"
-                      >
-                        正常模式
-                      </button>
-                      <button
-                        class="wf-chip"
-                        classList={{ active: tv().transition.judge === "llm" }}
-                        disabled={draft()!.builtin}
-                        onClick={() => patchTransition(tv().stage.id, tv().transition.id, { judge: "llm" })}
-                        title="由轻量模型根据前一节点结论自动判断是否走这条连线"
-                      >
-                        提示词判断
-                      </button>
-                    </div>
+                    </label>
                     <div class="field-hint">
-                      {tv().transition.judge === "llm"
-                        ? "提示词判断：由轻量模型根据前一节点结论与连线名称自动选择去向；引擎会自动生成判断提示词，并隐式要求前一节点给出清晰结论。"
-                        : "正常模式：前一节点结论末尾出现对应路由标识时才走这条连线；引擎会把「要输出什么标识」隐式插进前一节点的提示词。"}
+                      去向由提示词判断：引擎会把「跳转依据」隐式插进前一节点的提示词，要求它在给出结论的同时标明所选去向；若未明确选择，再由轻量模型按其结论快速判断。
                     </div>
                   </div>
 
@@ -643,13 +653,13 @@ export function WorkflowSettingsPanel() {
         )}
       </Show>
 
-      {/* 工作流分享：选择队友 */}
-      <Show when={shareOpen() && draft()}>
-        <div class="modal-backdrop wf-modal-backdrop" onClick={() => setShareOpen(false)}>
+      {/* 导入：列出团队共享来的工作流，选择导入 */}
+      <Show when={importOpen()}>
+        <div class="modal-backdrop wf-modal-backdrop" onMouseDown={onBackdropMouseDown} onClick={backdropClose(() => setImportOpen(false))}>
           <div class="modal wf-modal" onClick={(e) => e.stopPropagation()}>
             <div class="modal-head">
-              <span>分享工作流「{draft()?.name}」</span>
-              <button class="icon-btn" onClick={() => setShareOpen(false)}><IconX size={16} /></button>
+              <span>导入团队共享的工作流</span>
+              <button class="icon-btn" onClick={() => setImportOpen(false)}><IconX size={16} /></button>
             </div>
             <div class="modal-body">
               <Show
@@ -658,23 +668,27 @@ export function WorkflowSettingsPanel() {
                   <div class="inbox-empty">
                     <IconBroadcast size={26} />
                     <p>未连接到团队中转站</p>
-                    <p class="field-hint">先在设置里填写 token，再分享给队友。</p>
+                    <p class="field-hint">先在设置里填写 token，连接后队友共享的工作流会出现在这里。</p>
                   </div>
                 }
               >
-                <p class="field-hint">分享当前画布上的工作流内容（含未保存改动）；对方接收后进入其工作流库，可直接选择运行。</p>
-                <Show when={peers().length > 0} fallback={<p class="field-hint">暂时没有其他成员。</p>}>
-                  <div class="share-peers">
-                    <For each={peers()}>
-                      {(p) => (
-                        <button
-                          class={`peer-row ${shareTarget() === p.token ? "active" : ""}`}
-                          onClick={() => setShareTarget(p.token)}
-                        >
-                          <span class={`peer-dot ${p.online ? "on" : "off"}`} />
-                          <span class="peer-name">{p.name}</span>
-                          <span class="peer-action">{p.online ? "在线" : "离线"}</span>
-                        </button>
+                <Show
+                  when={state.workflowInbox.length > 0}
+                  fallback={<p class="field-hint">暂时没有可导入的工作流。让队友在其工作流页点「共享」后会出现在这里。</p>}
+                >
+                  <div class="wf-inbox">
+                    <For each={state.workflowInbox}>
+                      {(s) => (
+                        <div class="wf-inbox-item">
+                          <div class="wf-inbox-info">
+                            <span class="wf-list-name">{s.def.name}</span>
+                            <span class="field-hint">来自 {s.fromName} · {s.def.stages.length} 个阶段</span>
+                          </div>
+                          <div class="wf-inbox-actions">
+                            <button class="btn small primary" onClick={() => void acceptShared(s)}>导入</button>
+                            <button class="btn danger small" onClick={() => void declineShared(s.id)}>忽略</button>
+                          </div>
+                        </div>
                       )}
                     </For>
                   </div>
@@ -682,14 +696,7 @@ export function WorkflowSettingsPanel() {
               </Show>
             </div>
             <div class="modal-foot">
-              <button class="btn secondary" disabled={shareBusy()} onClick={() => setShareOpen(false)}>取消</button>
-              <button
-                class="btn primary"
-                disabled={shareBusy() || !state.relay.connected || !shareTarget()}
-                onClick={() => void submitShare()}
-              >
-                {shareBusy() ? "发送中…" : "分享"}
-              </button>
+              <button class="btn secondary" onClick={() => setImportOpen(false)}>关闭</button>
             </div>
           </div>
         </div>

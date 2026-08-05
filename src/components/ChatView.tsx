@@ -625,8 +625,20 @@ export function ChatView() {
     const chain = state.threads.filter((thread) => rootOf(thread).id === root.id);
     return chain.sort((a, b) => a.createdAt - b.createdAt);
   });
-  const showStageRail = () => stageThreads().length > 1;
+  /** 是否工作流/Fire/员工事件链的会话标题（决定导航栏是否从第一个节点起就显示）。 */
+  const isStageTitle = (title: string) =>
+    /^\[WF\]/.test(title) ||
+    /^\[Fire\]/.test(title) ||
+    /\]\s*(Wake|Do|Dream|巡查)/.test(title);
+  const showStageRail = () => {
+    const threads = stageThreads();
+    // 链上有多个会话，或链本身就是工作流/Fire/员工事件链（从第一个节点起就显示）。
+    return threads.length > 1 || threads.some((thread) => isStageTitle(thread.title));
+  };
   const stageName = (thread: (typeof state.threads)[number]) => {
+    // 工作流节点：[WF] 节点名 · 第N次（· 待补充等状态后缀），显示节点名。
+    const wfStage = thread.title.match(/^\[WF\]\s*(.+?)(?:\s+·\s+.*)?$/);
+    if (wfStage) return wfStage[1].trim() || "节点";
     if (/\]\s*Wake/.test(thread.title)) return "Wake";
     if (/\]\s*Do/.test(thread.title)) return "Do";
     if (/\]\s*Dream/.test(thread.title)) return "Dream";
@@ -636,6 +648,8 @@ export function ChatView() {
     const fireStage = thread.title.match(/^\[Fire\]\s*阶段\s+(\d+)/);
     if (fireStage) return `阶段 ${fireStage[1]}`;
     if (/^\[Fire\]/.test(thread.title)) return "目标";
+    // 工作流链的起点会话（用户输入目标的会话）显示为「目标」。
+    if (!thread.parentThreadId && stageThreads().some((t) => isStageTitle(t.title))) return "目标";
     return "事件";
   };
   const jumpToStage = async (threadId: string) => {
@@ -1365,7 +1379,7 @@ export function ChatView() {
       </Portal>
       <Show when={showStageRail()}>
         <aside class="stage-rail" aria-label="会话阶段导航">
-          <div class="stage-rail-count">{stageThreads().length} 个事件</div>
+          <div class="stage-rail-count">{stageThreads().length} {stageThreads().some((t) => isStageTitle(t.title)) ? "个节点" : "个事件"}</div>
           <For each={stageThreads()}>
             {(thread, index) => (
               <button

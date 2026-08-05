@@ -216,6 +216,9 @@ export const api = {
     invoke<SlashCommand[]>("get_slash_commands", { agentKind }),
   renameThread: (threadId: string, title: string) =>
     invoke<void>("rename_thread", { threadId, title }),
+  /** 让模型按节点任务生成会话标题（仅用于工作流阶段会话，前缀由后端保留）。 */
+  generateThreadTitle: (threadId: string, prompt: string) =>
+    invoke<void>("generate_thread_title", { threadId, prompt }),
   notifyFireDone: (threadId: string, success: boolean) =>
     invoke<void>("notify_fire_done", { threadId, success }),
   notifyWorkflowDone: (threadId: string, success: boolean) =>
@@ -276,8 +279,9 @@ export const api = {
     invoke<string>("accept_share", { id, cwd, ephemeral }),
   declineShare: (id: string) => invoke<void>("decline_share", { id }),
   // 工作流分享：把工作流定义定向发给队友 / 接收队友分享的工作流
+  /** 共享/分享工作流：to 为空串 = 共享给全组在线队友；返回送达的队友数。 */
   shareWorkflow: (workflow: WorkflowDef, to: string) =>
-    invoke<void>("share_workflow", { workflow, to }),
+    invoke<number>("share_workflow", { workflow, to }),
   getRelayWorkflowInbox: () => invoke<IncomingWorkflowShare[]>("get_relay_workflow_inbox"),
   acceptRelayWorkflowShare: (id: string) =>
     invoke<WorkflowDef>("accept_relay_workflow_share", { id }),
