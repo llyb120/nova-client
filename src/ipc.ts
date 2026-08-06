@@ -212,6 +212,8 @@ export const api = {
     invoke<void>("set_thread_agent", { threadId, agentKind, model, mode, reasoningEffort }),
   getModelOptions: (agentKind: AgentKind) =>
     invoke<ModelOptions | null>("get_model_options", { agentKind }),
+  /** 设置页手动刷新 Vega 本地配置：重读 config.jsonc 并后台重拉模型列表。 */
+  refreshAlkaidConfig: () => invoke<void>("refresh_alkaid_config"),
   getSlashCommands: (agentKind: AgentKind) =>
     invoke<SlashCommand[]>("get_slash_commands", { agentKind }),
   renameThread: (threadId: string, title: string) =>

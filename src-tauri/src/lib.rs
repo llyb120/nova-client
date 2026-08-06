@@ -3301,6 +3301,14 @@ async fn get_model_options(
     }
 }
 
+/// 手动刷新 Vega 本地配置（`~/.nova/alkaid/config.jsonc`）：清空模型列表缓存、
+/// 杀掉预热实例，并由后台重拉模型列表推给前端。用于设置页「刷新配置」按钮；
+/// 不打断正在运行的会话（bridge 每轮请求本就会重读配置）。
+#[tauri::command]
+fn refresh_alkaid_config(state: State<'_, AppState>) {
+    state.alkaid.notify_alkaid_config_changed();
+}
+
 #[tauri::command]
 async fn get_slash_commands(
     state: State<'_, AppState>,
@@ -6235,6 +6243,7 @@ pub fn run() {
             set_thread_starred,
             set_thread_agent,
             get_model_options,
+            refresh_alkaid_config,
             get_slash_commands,
             send_prompt,
             truncate_thread,

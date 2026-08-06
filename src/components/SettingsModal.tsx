@@ -362,6 +362,23 @@ export function SettingsModal(props: { onClose: () => void }) {
     }
   };
 
+  const [vegaRefreshing, setVegaRefreshing] = createSignal(false);
+  const [vegaRefreshMsg, setVegaRefreshMsg] = createSignal("");
+
+  const refreshVegaConfig = async () => {
+    setVegaRefreshing(true);
+    setVegaRefreshMsg("");
+    try {
+      await api.refreshAlkaidConfig();
+      setVegaRefreshMsg("已重载配置，模型列表刷新中…");
+      setTimeout(() => setVegaRefreshMsg(""), 4000);
+    } catch (e) {
+      setVegaRefreshMsg(`刷新失败：${String(e)}`);
+    } finally {
+      setVegaRefreshing(false);
+    }
+  };
+
   const restartAgents = async () => {
     setRestarting(true);
     setRestartMsg("");
@@ -1529,6 +1546,21 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <span class="field-hint">复用本机 Codex provider 凭据，支持并行文件工具、MCP 与 Skills。</span>
               </div>
               <ProxyField value={vegaProxy()} onInput={setVegaProxy} />
+              <div class="backend-quota-row">
+                <span class="field-label">本地配置</span>
+                <span class="field-hint">修改 ~/.nova/alkaid/config.jsonc 后点此按钮，立即重载模型列表、补全与预热配置。</span>
+                <Show when={vegaRefreshMsg()}>
+                  <span class="field-hint">{vegaRefreshMsg()}</span>
+                </Show>
+                <button
+                  type="button"
+                  class="link-btn backend-quota-refresh"
+                  disabled={vegaRefreshing()}
+                  onClick={() => void refreshVegaConfig()}
+                >
+                  {vegaRefreshing() ? "刷新中…" : "刷新配置"}
+                </button>
+              </div>
             </div>
 
             <div class="backend-card">

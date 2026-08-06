@@ -38,6 +38,11 @@ fn config_cache() -> &'static Mutex<Option<CachedConfig>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
+/// 配置文件发生变化后由外部文件监听器调用，避免直连补全继续使用旧配置。
+pub fn invalidate_config_cache() {
+    *config_cache().lock().unwrap() = None;
+}
+
 /// 用已有 reqwest 连接池直调补全；仅支持 openai-completions / openai-responses。
 pub async fn complete_direct(
     http: &reqwest::Client,

@@ -596,8 +596,22 @@ impl SdkManager {
             }
             *current = config;
         }
-        self.alkaid_config_generation.fetch_add(1, Ordering::SeqCst);
         // 换了服务端配置，旧模型列表可能整批失效，先清空再重拉。
+        self.invalidate_alkaid_config();
+    }
+
+    /// 本地 `config.jsonc` 发生变化时调用。当前正在执行的 bridge 不打断，
+    /// 但会让下一轮请求、模型列表和预热实例使用新配置。
+    pub fn notify_alkaid_config_changed(self: &Arc<Self>) {
+        if self.adapter.agent_kind() != AgentKind::Alkaid {
+            return;
+        }
+        self.invalidate_alkaid_config();
+    }
+
+    fn invalidate_alkaid_config(self: &Arc<Self>) {
+        crate::alkaid_complete::invalidate_config_cache();
+        self.alkaid_config_generation.fetch_add(1, Ordering::SeqCst);
         *self.model_options.lock().unwrap() = None;
         let _ = self.app.emit(
             EV_OPTIONS,

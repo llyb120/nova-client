@@ -439,6 +439,8 @@ export function reasoningEffortChoices(
 }
 
 const modelOptionsLoading = new Set<AgentKind>();
+/** Vega 配置文件当前声明的默认模型；用于配置热更新时同步新会话页。 */
+export const [alkaidConfigDefaultModel, setAlkaidConfigDefaultModel] = createSignal("");
 
 /** store 的对象赋值是浅合并，占位里的 pending 不会被后来的真实列表冲掉，必须显式复位。 */
 function setModelOptions(agentKind: AgentKind, opts: ModelOptions | null) {
@@ -454,6 +456,7 @@ export async function ensureModelOptions(agentKind: AgentKind) {
   try {
     const opts = await api.getModelOptions(agentKind);
     setModelOptions(agentKind, opts);
+    syncAlkaidConfigDefaultModel(agentKind, opts);
     // 选项就绪后回填友好名，供下次冷启动触发器使用
     const model = lastUsed.model(agentKind);
     const name = modelChoices(agentKind).find((c) => c.value === model)?.name;
@@ -1362,6 +1365,24 @@ export const lastUsed = {
   setReasoningEffort: (agentKind: AgentKind, v: string) =>
     localStorage.setItem(`fd:${agentKind}:lastReasoningEffort`, v),
 };
+
+function syncAlkaidConfigDefaultModel(agentKind: AgentKind, options: ModelOptions | null) {
+  if (agentKind !== "alkaid" || !options || options.pending) return;
+  const configured = options.configOptions
+    ?.find((option) => option.id === "model")
+    ?.currentValue?.trim();
+  if (!configured) return;
+
+  const previous = alkaidConfigDefaultModel();
+  if (previous && previous !== configured && lastUsed.agentKind() === "alkaid") {
+    const remembered = lastUsed.model("alkaid");
+    if (!remembered || remembered === previous) {
+      const choice = modelChoices("alkaid").find((item) => item.value === configured);
+      lastUsed.setModel("alkaid", configured, choice?.name);
+    }
+  }
+  setAlkaidConfigDefaultModel(configured);
+}
 
 export async function setThreadModel(model: string) {
   const id = state.currentId;
@@ -2514,11 +2535,13 @@ export async function initStore() {
     const payload = e.payload;
     if ("options" in payload && "agentKind" in payload) {
       setModelOptions(payload.agentKind, payload.options);
+      syncAlkaidConfigDefaultModel(payload.agentKind, payload.options);
       const model = lastUsed.model(payload.agentKind);
       const name = modelChoices(payload.agentKind).find((c) => c.value === model)?.name;
       if (model && name) lastUsed.setModelName(payload.agentKind, name);
     } else {
       setModelOptions("devin", payload as ModelOptions);
+      syncAlkaidConfigDefaultModel("devin", payload as ModelOptions);
     }
   });
 
