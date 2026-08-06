@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
-import { createAlkaidAgent } from "./alkaid-core.mjs";
+import { createAlkaidAgent, injectOpenAIServiceTier } from "./alkaid-core.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidConfigEnv, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 export function send(value) {
@@ -92,7 +92,13 @@ async function complete(request) {
     { messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }] },
     // 补全要关思考：Responses → reasoning.effort=none；Completions(deepseek) → thinking.type=disabled
     // 直调没有 agent 的 getApiKey 兜底，必须显式带上解析出的 key，否则请求无鉴权
-    { reasoning: "off", apiKey: resolved.apiKey, maxTokens: 64, signal: controller.signal },
+    {
+      reasoning: "off",
+      apiKey: resolved.apiKey,
+      maxTokens: 64,
+      signal: controller.signal,
+      onPayload: (payload) => injectOpenAIServiceTier(payload, resolved.model.serviceTier),
+    },
   );
   let text = "";
   // streamSimple 事件是扁平的 text_delta；Agent.subscribe 才是 message_update 嵌套形状

@@ -10,9 +10,52 @@ Vega 是一个基于 pi agent core 的轻量 coding agent，目标是少往返�
 - Skills 使用 pi 的 `loadSkillsFromDir` + Agent Skills 标准目录格式；根目录为 `~/.nova/alkaid/skills`。输入 `/skill:<name>` 可补全并显式调用 skill；普通任务中模型也可按需用 `read` 加载完整 `SKILL.md`（不再提供自定义 `load_skill` 工具）。
 - 系统提示词：Vega 策略（批量编辑、最小读取、改后验证、shell 语法约束）为稳态前缀；`cwd` / skills 目录为动态后缀，便于 provider prompt/KV cache 命中。skills ≥ 4 时压缩目录体积。
 - 命令终端：Windows 直接使用 PowerShell（`System32` 自带或 PATH 上的 `powershell.exe`，桌面端启用 shell shim 时按 kind 经 `NOVA_SHELL_SHIM_POWERSHELL` / `NOVA_SHELL_SHIM_BASH` 无窗口启动），找不到 PowerShell 时兜底回退 bash 探测；macOS / Linux 维持 bash。
-- Provider 缓存：默认 `cacheRetention: "long"`，为 OpenAI 兼容请求补齐 `prompt_cache_key`（session id）；第三方 OpenAI/Anthropic 兼容代理默认开启 `sendSessionAffinityHeaders`（不覆盖用户显式配置）。
+- Provider 缓存：默认 `cacheRetention: "long"`，为 OpenAI 兼容请求补齐 `prompt_cache_key`（session id）；第三方 OpenAI/Anthropic 兼容代理默认开启 `sendSessionAffinityHeaders`（不覆盖用户显式配置）。OpenAI Responses/Chat Completions 支持在 provider 或 model 的 `options.serviceTier` 配置 `priority`、`default`、`flex` 等值，并转发为请求体的 `service_tier`。
 - 支持并行连接多个 MCP stdio server，并把工具映射为 `mcp__<server>__<tool>`。
 - 本机配置读取 `~/.nova/alkaid/config.jsonc`（OpenCode 风格），可与服务端下发配置合并；密钥仅从进程环境 / `{env:NAME}` 解析。
+
+### OpenAI Priority Service Tier
+
+对支持 OpenAI `service_tier` 的 provider，在 `options` 中加入：
+
+```jsonc
+{
+  "options": {
+    "baseURL": "https://api.openai.com/v1",
+    "apiKey": "{env:OPENAI_API_KEY}",
+    "serviceTier": "priority"
+  }
+}
+```
+
+也可以把 `serviceTier` 放在单个 model 的 `options` 中，以覆盖 provider 默认值。若希望同时保留普通枚举和 Fast 枚举，可以直接把它放在 `variants` 中：
+
+```jsonc
+{
+  "model": "codex/gpt-5.6-sol/variant/medium",
+  "provider": {
+    "codex": {
+      "options": { "baseURL": "https://api.openai.com/v1", "apiKey": "{env:OPENAI_API_KEY}" },
+      "models": {
+        "gpt-5.6-sol": {
+          "options": { "reasoningEffort": "medium" },
+          "variants": {
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "fast": {
+              "name": "Fast",
+              "reasoningEffort": "medium",
+              "serviceTier": "priority"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+这样模型列表会保留 `medium`、`high` 和 `fast` 三个枚举；只有选择 `.../variant/fast` 时才发送 `"service_tier": "priority"`。Vega 会对正常对话、标题/补全请求以及 Rust 直连的行内补全转发该字段；未配置时不发送。代理必须自行支持并转发此参数。
 - 已作为独立的 `alkaid` 后端接入桌面端；后端选择顺序为“收藏 → Vega → 其他后端”。
 - 会话消息持久化到 `~/.nova/alkaid/sessions`，支持跨 bridge 进程续接多轮上下文。开启“超级上下文”时，OpenAI/GPT 已完成轮次不再回传 reasoning；当前轮次及中断后续做所需的原生工具轨迹仍完整保留。重组后的提示词/结论上下文按实际用量或保守估算计数，达到模型窗口 60% 时压缩，且压缩阈值最低为 150k tokens；优先使用设置中的轻量级模型，失败后回退当前会话模型。
 - Plan 模式不暴露写文件工具；Build 模式开放并行读写。

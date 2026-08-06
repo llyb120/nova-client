@@ -204,6 +204,17 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
     value?.reasoningEffort ?? null,
   ]));
   const api = providerApi(provider);
+  const variantOptions = variant && isPlainObject(model.variants?.[variant])
+    ? model.variants[variant]
+    : {};
+  const modelOptions = model.options ?? {};
+  // variant 可以覆盖 model/provider 默认值，例如单独增加一个 fast 枚举。
+  const serviceTier = variantOptions.serviceTier
+    ?? variantOptions.service_tier
+    ?? modelOptions.serviceTier
+    ?? modelOptions.service_tier
+    ?? options.serviceTier
+    ?? options.service_tier;
   return {
     apiKey: resolveEnv(options.apiKey, config.env),
     thinkingLevel: variant
@@ -222,6 +233,7 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
       contextWindow: model.limit?.context ?? 128000,
       maxTokens: model.limit?.output ?? 32000,
       headers: options.headers,
+      serviceTier,
       compat: mergeAlkaidCompatDefaults(api, modelId, baseUrl, model.compat ?? provider.compat),
     },
   };
@@ -252,11 +264,11 @@ export function alkaidModelOptions(config) {
       const value = `${providerId}/${modelId}`;
       const name = `${provider.name ?? providerId} / ${model.name ?? modelId}`;
       const meta = { "codex.ai/supportsImages": model.modalities?.input?.includes("image") ?? false };
-      const variants = Object.keys(model.variants ?? {});
+      const variants = Object.entries(model.variants ?? {});
       if (variants.length === 0) return [{ value, name, _meta: meta }];
-      return variants.map((variant) => ({
+      return variants.map(([variant, variantConfig]) => ({
         value: `${value}/variant/${variant}`,
-        name: `${name} · ${variantLabel(variant)}`,
+        name: `${name} · ${variantConfig?.name ?? variantLabel(variant)}`,
         _meta: meta,
       }));
     }),

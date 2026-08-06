@@ -698,6 +698,14 @@ export function injectOpenAIPromptCacheKey(payload, sessionId) {
   return { ...record, prompt_cache_key: key };
 }
 
+/** Add the configured OpenAI service tier without overriding an explicit payload value. */
+export function injectOpenAIServiceTier(payload, serviceTier) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  if (Object.hasOwn(payload, "service_tier")) return undefined;
+  if (typeof serviceTier !== "string" || !serviceTier.trim()) return undefined;
+  return { ...payload, service_tier: serviceTier.trim() };
+}
+
 function createAlkaidStreamFn() {
   return (model, context, options = {}) => streamSimple(model, context, {
     ...options,
@@ -857,6 +865,11 @@ export async function createAlkaidAgent(options = {}) {
       if (modelApi !== "openai-completions" && modelApi !== "openai-responses") return undefined;
       let next = payload;
       let changed = false;
+      const withServiceTier = injectOpenAIServiceTier(next, options.model.serviceTier);
+      if (withServiceTier) {
+        next = withServiceTier;
+        changed = true;
+      }
       const withCache = injectOpenAIPromptCacheKey(next, sessionId);
       if (withCache) {
         next = withCache;

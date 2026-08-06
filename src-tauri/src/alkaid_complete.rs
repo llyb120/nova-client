@@ -23,6 +23,7 @@ struct ResolvedCompletionTarget {
     thinking_format: Option<String>,
     max_tokens_field: &'static str,
     reasoning: bool,
+    service_tier: Option<String>,
 }
 
 struct CachedConfig {
@@ -67,6 +68,9 @@ async fn complete_openai_completions(
         "stream": true,
     });
     body[target.max_tokens_field] = json!(COMPLETION_MAX_TOKENS);
+    if let Some(service_tier) = &target.service_tier {
+        body["service_tier"] = json!(service_tier);
+    }
     apply_thinking_disabled_completions(&mut body, target);
     let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
     read_completions_sse(&mut response).await
@@ -85,6 +89,9 @@ async fn complete_openai_responses(
         "store": false,
         "max_output_tokens": COMPLETION_MAX_TOKENS.max(16),
     });
+    if let Some(service_tier) = &target.service_tier {
+        body["service_tier"] = json!(service_tier);
+    }
     if target.reasoning {
         body["reasoning"] = json!({ "effort": "none" });
     }
@@ -414,6 +421,20 @@ fn resolve_target(
         env,
     )?;
     let api = provider_api(provider)?;
+    let variant = selection
+        .rsplit_once(marker)
+        .map(|(_, value)| value);
+    let variant_options = variant
+        .and_then(|name| model.pointer(&format!("/variants/{name}")))
+        .and_then(Value::as_object);
+    let service_tier = variant_options
+        .and_then(|value| value.get("serviceTier").or_else(|| value.get("service_tier")))
+        .or_else(|| model.pointer("/options/serviceTier"))
+        .or_else(|| model.pointer("/options/service_tier"))
+        .or_else(|| provider.pointer("/options/serviceTier"))
+        .or_else(|| provider.pointer("/options/service_tier"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let reasoning = model
         .get("reasoning")
         .and_then(Value::as_bool)
@@ -443,6 +464,7 @@ fn resolve_target(
         thinking_format,
         max_tokens_field,
         reasoning,
+        service_tier,
     })
 }
 
