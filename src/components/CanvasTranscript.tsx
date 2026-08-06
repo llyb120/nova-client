@@ -77,9 +77,38 @@ function measure(text: string, fs: number, ff: string, fw = "400"): number {
   const ctx = mCtx();
   ctx.font = `${fw} ${fs}px ${ff}`;
   w = ctx.measureText(text).width;
-  if (_mCache.size > 8192) _mCache.clear();
+  // 大会话唯一字符串远超旧上限 8192，整表清空会让热点全部重测；提高上限并只淘汰最旧的一半
+  if (_mCache.size > 32768) {
+    let n = 0;
+    for (const k of _mCache.keys()) {
+      _mCache.delete(k);
+      if (++n > 16384) break;
+    }
+  }
   _mCache.set(key, w);
   return w;
+}
+
+/** 省略号截断缓存：key = 字体+宽度+原文。工具标题普遍是超长命令，此前每帧逐字收缩
+ *  （每行每帧上百次 measure），展开大量工具行后成为滚动卡顿主因。 */
+const _ellipsisCache = new Map<string, string>();
+function ellipsize(text: string, maxW: number, fs: number, ff: string): string {
+  if (measure(text, fs, ff) <= maxW) return text;
+  const key = `${fs}|${ff}|${Math.round(maxW)}|${text}`;
+  let out = _ellipsisCache.get(key);
+  if (out !== undefined) return out;
+  // 二分定位最长可显示前缀，把逐字收缩从 O(n) 次 measure 降到 O(log n)
+  let lo = 1;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (measure(text.slice(0, mid) + "…", fs, ff) <= maxW) lo = mid;
+    else hi = mid - 1;
+  }
+  out = text.slice(0, lo) + "…";
+  if (_ellipsisCache.size > 4096) _ellipsisCache.clear();
+  _ellipsisCache.set(key, out);
+  return out;
 }
 
 /** Soft-wrapped line plus per-UTF16-unit offsets into the original (normalized) string. */
@@ -732,10 +761,9 @@ interface Block {
   _charStyles?: Array<{ bold?: boolean; italic?: boolean; code?: boolean; link?: string }>;
   _charXs?: number[][];
   _lineWidths?: number[];
-  /** textLines 构建缓存：内容不变时跨帧复用，避免每帧全量 measure+分配 */
+  /** textLines 构建缓存：内容不变时跨帧复用，避免每帧全量 measure+分配。
+   *  行 y 不含 clipped 内滚偏移，内滚时无需重建，命中/选区处再减去 bScroll。 */
   _textLines?: TextLine[];
-  /** 缓存对应的内滚偏移（clipped 块内滚会使行 y 位移，需重建） */
-  _textLinesKey?: number;
 }
 
 // ─── Selection ───────────────────────────────────────────────────────────────
@@ -817,7 +845,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   const blockScrolls = new Map<string, number>();
   let rebuildRaf = 0;
   interface PrefixLayoutCache {
-    sig: string;
+    /** 宽度+配色签名：任一变化则整份缓存作废 */
+    meta: string;
+    /** 每个已闭合分组的签名（同 closedGroupSig），用于求最长可复用前缀 */
+    sigs: string[];
     blocks: Block[];
     height: number;
     groupYs: number[];
@@ -1031,18 +1062,27 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       closedSigs.push(closedGroupSig(groups[i]));
       closedUntil = i + 1;
     }
-    const prefixSig = `${Math.round(W)}|${p.bg}|${p.text}|${closedSigs.join("||")}`;
+    // 逐组比对签名，取最长连续匹配前缀复用：展开/收起中间某个工具不再整份作废，
+    // 只从该分组起重排（此前签名是全量拼接、一处变化全部重排，展开后长时间卡顿）
+    const metaSig = `${Math.round(W)}|${p.bg}|${p.text}`;
     const cacheKey = threadId ?? "";
     const prefixCache = prefixLayoutCaches.get(cacheKey);
-    const reusePrefix = closedUntil > 0
-      && prefixCache?.sig === prefixSig
-      && prefixCache.until === closedUntil;
+    let reuseUntil = 0;
+    if (prefixCache && prefixCache.meta === metaSig) {
+      const n = Math.min(closedUntil, prefixCache.sigs.length);
+      while (reuseUntil < n && prefixCache.sigs[reuseUntil] === closedSigs[reuseUntil]) {
+        reuseUntil++;
+      }
+    }
     let gi = 0;
-    if (reusePrefix && prefixCache) {
-      for (const b of prefixCache.blocks) result.push(b);
-      nextGroupYs.push(...prefixCache.groupYs);
-      y = prefixCache.height;
-      gi = closedUntil;
+    if (reuseUntil > 0 && prefixCache) {
+      for (const b of prefixCache.blocks) {
+        if (b.groupIdx >= reuseUntil) break;
+        result.push(b);
+      }
+      nextGroupYs.push(...prefixCache.groupYs.slice(0, reuseUntil));
+      y = prefixCache.groupYs[reuseUntil] ?? prefixCache.height;
+      gi = reuseUntil;
     }
 
     for (; gi < groups.length; gi++) {
@@ -1206,10 +1246,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     blocks = result;
     totalHeight = y + 16;
 
-    if (closedUntil > 0 && !reusePrefix && cacheKey) {
+    if (closedUntil > 0 && reuseUntil < closedUntil && cacheKey) {
       prefixLayoutCaches.delete(cacheKey);
       prefixLayoutCaches.set(cacheKey, {
-        sig: prefixSig,
+        meta: metaSig,
+        sigs: closedSigs,
         until: closedUntil,
         blocks: result.filter((b) => b.groupIdx < closedUntil),
         groupYs: nextGroupYs.slice(0, closedUntil),
@@ -1263,12 +1304,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       clickAction: () => {
         void navigator.clipboard.writeText(codeText);
         copiedCodeUntil.set(copyKey, performance.now() + 1200);
-        paintAll();
+        requestPaint();
         window.setTimeout(() => {
           const until = copiedCodeUntil.get(copyKey);
           if (until != null && until <= performance.now()) {
             copiedCodeUntil.delete(copyKey);
-            paintAll();
+            requestPaint();
           }
         }, 1220);
       },
@@ -1853,11 +1894,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const maxTextW = Math.max(20, b.w - (textX - bx) - trailReserve);
     // 有 detail 时标题只占部分宽度，给详情文本留空间（对齐 DOM .tool-headline-detail）
     const labelMaxW = detail ? Math.max(60, Math.floor(maxTextW * 0.45)) : maxTextW;
-    let label = b.text!;
-    if (measure(label, b.fontSize!, b.font!) > labelMaxW) {
-      while (label.length > 1 && measure(label + "…", b.fontSize!, b.font!) > labelMaxW) label = label.slice(0, -1);
-      label += "…";
-    }
+    const label = ellipsize(b.text!, labelMaxW, b.fontSize!, b.font!);
     fillTextCrisp(ctx, label, textX, midY);
 
     const labelW = measure(label, b.fontSize!, b.font!);
@@ -1867,11 +1904,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const detailX = sepX + 1 + 8;
       const detailMaxW = bx + b.w - trailReserve - detailX;
       if (detailMaxW > 24) {
-        let text = detail;
-        if (measure(text, b.fontSize!, b.font!) > detailMaxW) {
-          while (text.length > 1 && measure(text + "…", b.fontSize!, b.font!) > detailMaxW) text = text.slice(0, -1);
-          text += "…";
-        }
+        const text = ellipsize(detail, detailMaxW, b.fontSize!, b.font!);
         ctx.save();
         ctx.strokeStyle = p.border;
         ctx.lineWidth = 1;
@@ -1942,7 +1975,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     if (clipped) {
       ctx.save();
-      roundRect(ctx, bx, by, b.w, b.h, b.borderRadius || 0);
+      // 圆角 clip 在 Skia 里是抗锯齿蒙版，每个展开的工具块每帧都要付一次；
+      // 内容只需硬边界（padding 大于圆角，文本不会渗进圆角区），改用廉价矩形 clip
+      ctx.beginPath();
+      ctx.rect(bx, by, b.w, b.h);
       ctx.clip();
     }
 
@@ -1962,15 +1998,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         b._lines = lines;
         b._lineSeps = seps;
       }
-      // textLines 跨帧缓存：clipped 块的内滚会平移行 y，用 bScroll 作缓存键；
+      // textLines 跨帧缓存：行 y 不含内滚偏移（内滚只改 bScroll，不再触发重建）；
       // 大输出几千行时避免每帧全量 measure + 数组分配（滚动卡顿主因之一）
-      const tlKey = clipped ? bScroll : 0;
-      if (!b._textLines || b._textLinesKey !== tlKey) {
-        b._textLinesKey = tlKey;
+      if (!b._textLines) {
         b._textLines = [];
         let offset = 0;
         for (let i = 0; i < lines.length; i++) {
-          const ty = b.y + padY + i * lh - bScroll; // 绝对坐标（= 屏幕 ty + scrollY）
+          const ty = b.y + padY + i * lh; // 绝对坐标（= 屏幕 ty + scrollY + bScroll）
           b._textLines.push({ text: lines[i], x: innerX, y: ty, w: measure(lines[i], fs, ff, fw), offset, fs, lh, sepAfter: seps[i] });
           offset += lines[i].length;
         }
@@ -2173,7 +2207,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const innerW = Math.max(1, b.w - padX * 2);
 
     ctx.save();
-    roundRect(ctx, bx, by, b.w, b.h, b.borderRadius || 8);
+    // 同 paintTextBlock：矩形 clip 足够（padding 大于圆角），避免每帧抗锯齿蒙版
+    ctx.beginPath();
+    ctx.rect(bx, by, b.w, b.h);
     ctx.clip();
 
     ctx.font = `${fs}px ${ff}`;
@@ -2387,16 +2423,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const sOff = i === from ? fromOff : 0;
       const eOff = i === to ? toOff : Number.POSITIVE_INFINITY;
       const clipped = !!b.data?.clipped;
+      const bScr = clipped ? (blockScrolls.get(blockScrollKey(b)) || 0) : 0;
       if (clipped) {
         ctx.save();
         roundRect(ctx, b.x, b.y - scrollY, b.w, b.h, b.borderRadius || 0);
         ctx.clip();
       }
       for (const ln of b.textLines) {
+        const ly = ln.y - bScr;
         const lineEnd = ln.offset + ln.text.length;
         if (eOff <= ln.offset || sOff >= lineEnd) continue;
         // 工具详情内部滚动后，裁切区外的行不再画高亮，避免漂到卡片上方
-        if (clipped && (ln.y + ln.lh <= b.y || ln.y >= b.y + b.h)) continue;
+        if (clipped && (ly + ln.lh <= b.y || ly >= b.y + b.h)) continue;
         const a = Math.max(0, sOff - ln.offset);
         const bEnd = Math.min(ln.text.length, eOff - ln.offset);
         let x0: number, x1: number;
@@ -2408,7 +2446,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           x1 = ln.x + measure(ln.text.slice(0, bEnd), ln.fs, b.font || pal.sans, b.fontWeight);
         }
         const halfLead = (ln.lh - ln.fs) / 2;
-        ctx.fillRect(x0, ln.y - scrollY + halfLead, x1 - x0, ln.fs);
+        ctx.fillRect(x0, ly - scrollY + halfLead, x1 - x0, ln.fs);
       }
       if (clipped) ctx.restore();
     }
@@ -2454,7 +2492,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     keepBottom = maxScroll - scrollY <= 2;
     applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, user);
-    paintAll();
+    requestPaint();
   }
 
   function scrollFromPointerY(clientY: number) {
@@ -2489,9 +2527,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const b = blocks[i];
       if (!b.textLines || !b.selectable) continue;
       if (b.data?.clipped && (my < b.y || my >= b.y + b.h)) continue;
+      // textLines 的 y 不含内滚偏移，命中判定时换算
+      const bScr = b.data?.clipped ? (blockScrolls.get(blockScrollKey(b)) || 0) : 0;
       for (const ln of b.textLines) {
-        if (b.data?.clipped && (ln.y + ln.lh <= b.y || ln.y >= b.y + b.h)) continue;
-        if (my < ln.y || my >= ln.y + ln.lh) continue;
+        const ly = ln.y - bScr;
+        if (b.data?.clipped && (ly + ln.lh <= b.y || ly >= b.y + b.h)) continue;
+        if (my < ly || my >= ly + ln.lh) continue;
         // 表格同行多列共享同一 y：按水平距离选最近行，避免永远命中左侧单元格
         const lineRight = ln.x + Math.max(ln.w, 1);
         const xDist = mx < ln.x ? ln.x - mx : mx > lineRight ? mx - lineRight : 0;
@@ -2526,14 +2567,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (pos && selStart) {
         selection = { startBlock: selStart.block, startOffset: selStart.offset,
           endBlock: pos.block, endOffset: pos.offset };
-        paintAll();
+        requestPaint();
       }
       return;
     }
     if (hitScrollbar(e.clientX, e.clientY)) {
       if (hoverBlockIdx !== -1) {
         hoverBlockIdx = -1;
-        paintAll();
+        requestPaint();
       }
       canvasEl.style.cursor = "default";
       if (canvasEl.title) canvasEl.title = "";
@@ -2545,7 +2586,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const b = idx >= 0 ? blocks[idx] : null;
       canvasEl.style.cursor = b?.cursor || (b?.selectable ? "text" : "default");
       canvasEl.title = b?.title ?? "";
-      paintAll();
+      requestPaint();
     }
   }
 
@@ -2587,7 +2628,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       canvasEl.style.cursor = "default";
       document.addEventListener("mousemove", onScrollDragMove);
       document.addEventListener("mouseup", onScrollDragUp);
-      paintAll();
+      requestPaint();
       return;
     }
 
@@ -2602,13 +2643,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         selStart = pos;
         selection = { startBlock: pos.block, startOffset: pos.offset, endBlock: pos.block, endOffset: pos.offset };
         canvasEl.focus();
-        paintAll();
+        requestPaint();
         return;
       }
     }
     selection = null;
     clearCanvasChatSelection();
-    paintAll();
+    requestPaint();
   }
 
   function onMouseUp(_e: MouseEvent) {
@@ -2623,7 +2664,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
       if (selection) setCanvasChatSelection(selectionText(blocks, selection));
       else clearCanvasChatSelection();
-      paintAll();
+      requestPaint();
       return;
     }
   }
@@ -2661,7 +2702,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const newScroll = Math.max(0, Math.min(maxBlockScroll, curScroll + dy));
           if (newScroll !== curScroll) {
             blockScrolls.set(key, newScroll);
-            paintAll();
+            requestPaint();
             return;
           }
         }
@@ -2672,7 +2713,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     keepBottom = maxScroll - scrollY <= 2;
     applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, true);
-    paintAll();
+    requestPaint();
   }
 
   function onCopy(e: ClipboardEvent) {
@@ -2688,6 +2729,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   function requestRender() {
     if (rafId) return;
     rafId = requestAnimationFrame(tick);
+  }
+
+  let paintQueued = false;
+  /**
+   * 合并高频输入事件（wheel/mousemove/拖拽）的重绘：每帧最多一次全量绘制。
+   * 此前每个 wheel 事件都同步 paintAll，一次滚动手势内多次光栅化整帧画布，
+   * 展开工具后单帧绘制变贵，叠加放大成滚动卡顿（qwen canvas 走 rAF 合并所以不卡）。
+   */
+  function requestPaint() {
+    if (paintQueued) return;
+    paintQueued = true;
+    requestAnimationFrame(() => {
+      paintQueued = false;
+      paintAll();
+    });
   }
 
   function tick() {
@@ -2792,7 +2848,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (scrollDragging || selecting) return;
       if (hoverBlockIdx !== -1) {
         hoverBlockIdx = -1;
-        paintAll();
+        requestPaint();
       }
       canvasEl.style.cursor = "default";
       if (canvasEl.title) canvasEl.title = "";
