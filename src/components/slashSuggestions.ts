@@ -34,6 +34,12 @@ export function getSlashSuggestions(
       input: "/plan ",
     },
     {
+      name: "easy",
+      description: "显而易见的小修改：不运行或编写测试，仅做基本编译校验",
+      kind: "Nova",
+      input: "/easy ",
+    },
+    {
       name: "fire",
       description: "分阶段执行，并用独立会话反复验收直到目标达成",
       kind: "Nova",

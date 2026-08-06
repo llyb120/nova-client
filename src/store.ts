@@ -56,7 +56,7 @@ import {
 } from "./workflow/runtime";
 import { findTriggeredWorkflow, findWorkflowByName, getWorkflow, isWorkflowEnabled } from "./workflow/storage";
 import { WORKFLOW_WAKE_DO_ID } from "./workflow/builtin";
-import { buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
+import { buildEasyPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
@@ -1575,6 +1575,12 @@ async function tryBuiltinPrompt(
     await deliverPrompt(threadId, buildPlanPrompt(goal), images);
     return true;
   }
+  if (/^\/easy(?:\s|$)/i.test(builtInInput)) {
+    const goal = builtInInput.replace(/^\/easy(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+    if (!goal) throw new Error("请在 /easy 后输入明确的小修改目标，例如 /easy 修复这个类型错误");
+    await deliverPrompt(threadId, buildEasyPrompt(goal), images);
+    return true;
+  }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
     if (images.length > 0) throw new Error("/fire 暂不支持附件");
     const parsed = parseFireInput(builtInInput);
@@ -1642,6 +1648,11 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   if (/^\/plan(?:\s|$)/i.test(builtInInput)) {
     const goal = builtInInput.replace(/^\/plan(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /plan 后输入规划目标，例如 /plan 设计登录流程");
+    return;
+  }
+  if (/^\/easy(?:\s|$)/i.test(builtInInput)) {
+    const goal = builtInInput.replace(/^\/easy(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+    if (!goal) throw new Error("请在 /easy 后输入明确的小修改目标，例如 /easy 修复这个类型错误");
     return;
   }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
