@@ -242,12 +242,17 @@ export function WorkflowSettingsPanel() {
   async function submitShare() {
     const d = draft();
     if (!d) return;
+    if (!state.relay.connected) {
+      setMsg("未连接到团队中转站：请先在设置里填写 token 并等待连接成功");
+      return;
+    }
     const errs = validateWorkflow(d);
     if (errs.length > 0) {
       setMsg(errs.join("；"));
       return;
     }
     setShareBusy(true);
+    setMsg("正在共享…");
     try {
       const count = await api.shareWorkflow(d, "");
       markWorkflowShared(d.id);
@@ -340,14 +345,15 @@ export function WorkflowSettingsPanel() {
             <button class="btn primary small" onClick={createNew}>
               <IconPlus size={14} /> 新建
             </button>
-            <button
-              class="btn secondary small"
-              disabled={!state.relay.connected}
-              onClick={() => { setDrawerOpen(false); setImportOpen(true); void refreshWorkflowInbox(); }}
-              title={state.relay.connected ? "导入队友共享的工作流" : "未连接中转站"}
-            >
-              <IconShare size={14} /> 导入{state.workflowInbox.length > 0 ? `（${state.workflowInbox.length}）` : ""}
-            </button>
+            <Show when={state.relay.connected}>
+              <button
+                class="btn secondary small"
+                onClick={() => { setDrawerOpen(false); setImportOpen(true); void refreshWorkflowInbox(); }}
+                title="导入队友共享的工作流"
+              >
+                <IconShare size={14} /> 导入{state.workflowInbox.length > 0 ? `（${state.workflowInbox.length}）` : ""}
+              </button>
+            </Show>
             <button class="btn secondary small" disabled={!draft() || draft()!.builtin} onClick={removeSelected}>
               删除
             </button>
@@ -470,21 +476,21 @@ export function WorkflowSettingsPanel() {
                 <Show when={d().builtin}><span class="wf-badge">内置只读</span></Show>
                 <button class="btn secondary small" onClick={() => select(d().id)} title="放弃未保存改动">撤销</button>
                 <button class="btn primary small" disabled={d().builtin} onClick={save}>保存</button>
-                <button
-                  class="btn secondary small"
-                  classList={{ "wf-shared-btn": wfShared() }}
-                  disabled={d().builtin || shareBusy() || !state.relay.connected}
-                  onClick={() => void submitShare()}
-                  title={
-                    !state.relay.connected
-                      ? "未连接中转站：在设置里填写 token 后才能共享"
-                      : wfShared()
+                <Show when={state.relay.connected}>
+                  <button
+                    class="btn secondary small"
+                    classList={{ "wf-shared-btn": wfShared() }}
+                    disabled={d().builtin || shareBusy()}
+                    onClick={() => void submitShare()}
+                    title={
+                      wfShared()
                         ? "已共享给团队；修改后再次点击可更新"
                         : "共享给全组在线队友，对方在工作流页点「导入」获取（内置工作流人人都有，无需共享）"
-                  }
-                >
-                  <IconShare size={13} /> {shareBusy() ? "共享中…" : wfShared() ? "已共享" : "共享"}
-                </button>
+                    }
+                  >
+                    <IconShare size={13} /> {shareBusy() ? "共享中…" : wfShared() ? "已共享" : "共享"}
+                  </button>
+                </Show>
                 <button class="wf-bar-toggle" onClick={() => setBarCollapsed(true)} title="收起工具条">
                   <IconChevron size={14} />
                 </button>

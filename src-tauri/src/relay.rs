@@ -1558,9 +1558,9 @@ impl RelayManager {
 
     /// 把工作流定义分享给指定队友。def 为前端完整的 WorkflowDef JSON。
     pub fn share_workflow(&self, def: &Value, to: &str) -> Result<usize, String> {
-        if self.cfg().is_none() {
-            return Err("未配置团队中转站".into());
-        }
+        let (_, own_token, _) = self
+            .cfg()
+            .ok_or_else(|| "未配置团队中转站".to_string())?;
         let name = def
             .get("name")
             .and_then(|v| v.as_str())
@@ -1577,7 +1577,9 @@ impl RelayManager {
         if stage_count == 0 {
             return Err("工作流没有阶段，无法分享".into());
         }
-        // to 为空 = 共享给全组在线队友（各自收件箱出现，按需导入；重复共享 = 覆盖更新）
+        // to 为空 = 共享给全组在线队友（排除自己；各自收件箱出现，按需导入；
+        // 同一发送方再次共享同一工作流 = 更新原来的收件箱条目）。presence 名单包含自己，
+        // 不能直接把所有 token 当作目标，否则“共享”可能只发回自己，且离线成员也会被计数。
         let targets: Vec<String> = if to.trim().is_empty() {
             self.peers
                 .lock()
@@ -1585,7 +1587,10 @@ impl RelayManager {
                 .as_array()
                 .map(|list| {
                     list.iter()
-                        .filter_map(|peer| peer["token"].as_str().map(str::to_string))
+                        .filter(|peer| peer["online"].as_bool().unwrap_or(false))
+                        .filter_map(|peer| peer["token"].as_str())
+                        .filter(|token| !token.is_empty() && *token != own_token)
+                        .map(str::to_string)
                         .collect()
                 })
                 .unwrap_or_default()
@@ -1617,7 +1622,25 @@ impl RelayManager {
         };
         {
             let mut inbox = self.workflow_inbox.lock().unwrap();
-            inbox.push(share);
+            // 工作流 id 在编辑/再次共享时保持不变，因此按发送方 + 工作流 id 原地更新，
+            // 避免对方每次修改后都看到一张过期的重复卡片。
+            let workflow_id = share
+                .def
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+            let existing = workflow_id.as_deref().and_then(|id| {
+                inbox.iter().position(|item| {
+                    item.from == share.from
+                        && item.def.get("id").and_then(Value::as_str) == Some(id)
+                })
+            });
+            if let Some(index) = existing {
+                inbox[index] = share;
+            } else {
+                inbox.push(share);
+            }
             persist_workflow_inbox(&self.config_dir, &inbox);
         }
         self.emit_workflow_inbox();
