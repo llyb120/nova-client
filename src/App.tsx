@@ -1,4 +1,5 @@
-import { createEffect, createSignal, onMount, Show } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { listen } from "@tauri-apps/api/event";
 import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
 import { CliOperationModal } from "./components/CliOperationModal";
@@ -15,7 +16,6 @@ import { UpdateModal } from "./components/UpdateModal";
 import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
 import { selectedChatText } from "./chatSelection";
-import { mountSessionShortcuts } from "./sessionShortcuts";
 import { initStore, openNewSession, state } from "./store";
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
@@ -42,14 +42,22 @@ export default function App() {
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
 
-  // 快速新会话快捷键在任意页面生效（与侧栏「新对话」一致，会话中继承目录/模型）。
-  mountSessionShortcuts({
-    allowedActions: ["newSession"],
-    onNewSession: () => openNewSession(selectedChatText()),
-  });
-
   onMount(() => {
     void initStore();
+
+    // Native global shortcut events also arrive while the WebView is unfocused/minimized.
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen("session-shortcut:new-session", () => {
+      openNewSession(selectedChatText());
+    }).then((remove) => {
+      if (disposed) remove();
+      else unlisten = remove;
+    });
+    onCleanup(() => {
+      disposed = true;
+      unlisten?.();
+    });
   });
 
   // 空闲时后端请求更新（update:prompt）→ 自动弹出更新对话框，由用户选择是否现在更新。

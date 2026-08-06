@@ -38,6 +38,8 @@ mod windows_shell_shim;
 
 /// 临时会话目录的统一父目录名（前端据此识别并显示「临时会话」）
 pub const SCRATCH_MARK: &str = "Nova-scratch";
+/// Native global shortcut event for creating a new session.
+const EV_NEW_SESSION_SHORTCUT: &str = "session-shortcut:new-session";
 
 pub use path_env::init_process_path;
 pub use server::configure_from_args as configure_server_mode;
@@ -579,6 +581,87 @@ fn spawn_single_instance_focus_listener(app: &tauri::AppHandle) {
             CloseHandle(event);
         }
     });
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+    if server::is_headless() {
+        return;
+    }
+    if let Err(error) = app.global_shortcut().unregister_all() {
+        eprintln!("[shortcut] 清理全局快捷键失败：{error}");
+    }
+
+    let mut seen = HashSet::new();
+    let state = app.state::<AppState>();
+    let shortcuts = {
+        let settings = state.settings.lock().unwrap();
+        settings
+            .session_shortcuts
+            .iter()
+            .filter(|shortcut| shortcut.action == "newSession")
+            .filter_map(|shortcut| {
+                let keys = normalize_global_shortcut(&shortcut.keys);
+                if keys.is_empty() || !seen.insert(keys.to_ascii_lowercase()) {
+                    return None;
+                }
+                let parsed = match keys.parse::<tauri_plugin_global_shortcut::Shortcut>() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        eprintln!("[shortcut] 忽略无法注册的快捷键：{}", shortcut.keys);
+                        return None;
+                    }
+                };
+                Some(parsed)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if shortcuts.is_empty() {
+        return;
+    }
+    for shortcut in shortcuts {
+        let label = shortcut.to_string();
+        if let Err(error) = app.global_shortcut().on_shortcut(
+            shortcut,
+            |app, _shortcut, event| {
+                if event.state == ShortcutState::Pressed {
+                    // A global shortcut is often used while Nova is behind another window or
+                    // minimized. Bring it back before delivering the event so the user can see
+                    // the newly opened session page.
+                    if let Some(window) = app
+                        .get_webview_window("main")
+                        .or_else(|| app.webview_windows().into_values().next())
+                    {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                    let _ = app.emit(EV_NEW_SESSION_SHORTCUT, ());
+                }
+            },
+        ) {
+            eprintln!("[shortcut] 注册新建会话全局快捷键失败（{label}）：{error}");
+        } else {
+            eprintln!("[shortcut] 已注册新建会话全局快捷键：{label}");
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn normalize_global_shortcut(keys: &str) -> String {
+    keys.split('+')
+        .map(|part| {
+            if part.trim().eq_ignore_ascii_case("meta") {
+                "Super".to_string()
+            } else {
+                part.trim().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 /// 后端可用性检测完成事件：payload = { availability: { devin: bool, codex: bool, ... } }
@@ -4055,6 +4138,8 @@ async fn apply_runtime_settings(
     if recheck_availability {
         spawn_backend_availability_check(app.clone());
     }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    sync_global_session_shortcuts(app);
     run_session_auto_cleanup(app);
     Ok(())
 }
@@ -5710,9 +5795,11 @@ pub fn maybe_run_update_helper() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+
+    builder.setup(|app| {
             #[cfg(windows)]
             {
                 spawn_single_instance_focus_listener(app.handle());
@@ -5854,6 +5941,8 @@ pub fn run() {
                 completion_generation: std::sync::atomic::AtomicU64::new(0),
             });
 
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            sync_global_session_shortcuts(app.handle());
             run_session_auto_cleanup(app.handle());
             let cleanup_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
