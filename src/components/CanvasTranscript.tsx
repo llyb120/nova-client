@@ -83,7 +83,13 @@ function measure(text: string, fs: number, ff: string, fw = "400"): number {
 }
 
 /** Soft-wrapped line plus per-UTF16-unit offsets into the original (normalized) string. */
-interface WrappedLine { text: string; offsets: number[] }
+interface WrappedLine {
+  text: string; offsets: number[];
+  /** 行尾是源文本中的真实换行（段落边界），复制时应保留 "\n" */
+  hardBreak?: boolean;
+  /** 软换行发生在空白处（折行时该空白被丢弃），复制时应补一个空格 */
+  spaceBreak?: boolean;
+}
 interface CharStyle { bold?: boolean; italic?: boolean; code?: boolean; link?: string }
 type LineMeasurer = (text: string, offsets: number[]) => number;
 
@@ -118,7 +124,7 @@ function wrapTextIndexed(
     const paraLineStart = lines.length;
     // Keep intentional empty paragraphs as a single blank line.
     if (para === "") {
-      lines.push({ text: "", offsets: [] });
+      lines.push({ text: "", offsets: [], hardBreak: true });
       if (pi < paras.length - 1) base += 1; // consume the separating `\n`
       continue;
     }
@@ -151,7 +157,12 @@ function wrapTextIndexed(
       // Word won't fit: fill remaining space on this line char-by-char first
       // (CJK soft-wrap), instead of flushing `cur` and starting the word on the next line.
       if (/^\s+$/.test(token.text)) {
-        if (cur) { pushTrimmedLine(lines, cur, curOffs); cur = ""; curOffs = []; curW = 0; }
+        if (cur) {
+          pushTrimmedLine(lines, cur, curOffs);
+          // 折行发生在空白处：复制时应还原为一个空格，而不是换行或直接拼接
+          lines[lines.length - 1].spaceBreak = true;
+          cur = ""; curOffs = []; curW = 0;
+        }
         continue;
       }
       let ci = 0;
@@ -177,6 +188,8 @@ function wrapTextIndexed(
     // A trailing whitespace token can overflow after the paragraph's content was
     // already flushed. Do not turn that discarded whitespace into a blank line.
     if (cur || lines.length === paraLineStart) pushTrimmedLine(lines, cur, curOffs);
+    // 段落最后一行以源文本中的真实 \n 结尾
+    if (lines.length > paraLineStart) lines[lines.length - 1].hardBreak = true;
     base += para.length;
     if (pi < paras.length - 1) base += 1; // skip `\n` — not present in any line
   }
@@ -187,6 +200,16 @@ function wrapTextIndexed(
 
 function wrapText(text: string, maxW: number, fs: number, ff: string, fw = "400"): string[] {
   return wrapTextIndexed(text, maxW, fs, ff, fw).map((l) => l.text);
+}
+
+/** 复制时的行尾连接符：硬换行 → "\n"；空白处软换行 → " "；词内软换行 → ""（直接拼接，不截断）。 */
+function wrappedLineSeps(wrapped: WrappedLine[]): string[] {
+  return wrapped.map((l) => (l.hardBreak ? "\n" : l.spaceBreak ? " " : ""));
+}
+
+function wrapTextFull(text: string, maxW: number, fs: number, ff: string, fw = "400"): { lines: string[]; seps: string[] } {
+  const wrapped = wrapTextIndexed(text, maxW, fs, ff, fw);
+  return { lines: wrapped.map((l) => l.text), seps: wrappedLineSeps(wrapped) };
 }
 
 const CODE_TAB_SIZE = 4;
@@ -213,13 +236,15 @@ function expandCodeTabs(text: string): string {
 }
 
 /** Code needs to retain leading whitespace; the prose wrapper intentionally drops it. */
-function wrapCodeText(text: string, maxW: number, fs: number, ff: string): string[] {
+function wrapCodeTextFull(text: string, maxW: number, fs: number, ff: string): { lines: string[]; seps: string[] } {
   const lines: string[] = [];
+  const seps: string[] = [];
   const safeMax = Math.max(1, maxW);
   const expanded = expandCodeTabs(text);
   for (const sourceLine of expanded.split("\n")) {
     if (!sourceLine) {
       lines.push("");
+      seps.push("\n");
       continue;
     }
     let line = "";
@@ -228,6 +253,7 @@ function wrapCodeText(text: string, maxW: number, fs: number, ff: string): strin
       const charW = measure(ch, fs, ff);
       if (line && lineW + charW > safeMax) {
         lines.push(line);
+        seps.push(""); // 代码行内软换行：复制时直接拼接
         line = "";
         lineW = 0;
       }
@@ -235,9 +261,15 @@ function wrapCodeText(text: string, maxW: number, fs: number, ff: string): strin
       lineW += charW;
     }
     lines.push(line);
+    seps.push("\n");
   }
-  while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-  return lines.length ? lines : [""];
+  while (lines.length > 1 && lines[lines.length - 1] === "") { lines.pop(); seps.pop(); }
+  if (!lines.length) { lines.push(""); seps.push("\n"); }
+  return { lines, seps };
+}
+
+function wrapCodeText(text: string, maxW: number, fs: number, ff: string): string[] {
+  return wrapCodeTextFull(text, maxW, fs, ff).lines;
 }
 
 function segmentCharStyles(segments: TextSegment[]): CharStyle[] {
@@ -555,19 +587,23 @@ function layoutMdTable(
     totalW = colWidths.reduce((a, b) => a + b, 0);
   }
   const cellLines: string[][][] = [];
+  const cellSeps: string[][][] = [];
   const rowHeights: number[] = [];
   for (let r = 0; r < rows.length; r++) {
     const fw = r === 0 ? "600" : "400";
     const linesPerCell: string[][] = [];
+    const sepsPerCell: string[][] = [];
     let maxLines = 1;
     for (let c = 0; c < colCount; c++) {
       const plain = segmentsPlainText(rows[r][c]?.segments || []);
       const maxW = Math.max(1, colWidths[c] - TABLE_PAD_X * 2);
-      const lines = wrapText(plain, maxW, fs, p.sans, fw);
-      linesPerCell.push(lines.length ? lines : [""]);
-      maxLines = Math.max(maxLines, linesPerCell[c].length);
+      const { lines, seps } = wrapTextFull(plain, maxW, fs, p.sans, fw);
+      linesPerCell.push(lines);
+      sepsPerCell.push(seps);
+      maxLines = Math.max(maxLines, lines.length);
     }
     cellLines.push(linesPerCell);
+    cellSeps.push(sepsPerCell);
     rowHeights.push(maxLines * fs * TABLE_LH + TABLE_PAD_Y * 2);
   }
   const tableH = rowHeights.reduce((a, b) => a + b, 0);
@@ -577,7 +613,7 @@ function layoutMdTable(
     kind: "md-table", id: itemId, groupIdx: gi,
     x, y, w: tableW, h: tableH,
     text: plain, color, fontSize: fs, font: p.sans, selectable: true,
-    data: { rows, aligns, colWidths, cellLines, rowHeights, border: p.border },
+    data: { rows, aligns, colWidths, cellLines, cellSeps, rowHeights, border: p.border },
   });
   return y + tableH + 10;
 }
@@ -674,7 +710,7 @@ function drawToolIcon(ctx: CanvasRenderingContext2D, kind: string, x: number, y:
 
 // ─── Block types ─────────────────────────────────────────────────────────────
 
-interface TextLine { text: string; x: number; y: number; w: number; offset: number; fs: number; lh: number; bold?: boolean; italic?: boolean; code?: boolean; link?: string; charX?: number[]; }
+interface TextLine { text: string; x: number; y: number; w: number; offset: number; fs: number; lh: number; bold?: boolean; italic?: boolean; code?: boolean; link?: string; charX?: number[]; sepAfter?: string; }
 interface Block {
   kind: string; id: number; groupIdx: number;
   x: number; y: number; w: number; h: number;
@@ -690,6 +726,8 @@ interface Block {
   title?: string;
   data?: Record<string, unknown>;
   _lines?: string[];
+  /** 与 _lines 一一对应的行尾连接符（复制用）："\n" / " " / "" */
+  _lineSeps?: string[];
   _wrapped?: WrappedLine[];
   _charStyles?: Array<{ bold?: boolean; italic?: boolean; code?: boolean; link?: string }>;
   _charXs?: number[][];
@@ -723,15 +761,23 @@ function selectionText(blocks: Block[], sel: Selection): string {
     const eOff = i === to ? toOff : Number.POSITIVE_INFINITY;
     // 选区 offset 来自 textLines（含 wrap/trim），不能直接 slice 原始 b.text
     if (b.textLines?.length) {
-      const lineParts: string[] = [];
+      const picked: { text: string; sep: string }[] = [];
       for (const ln of b.textLines) {
         const lineEnd = ln.offset + ln.text.length;
         if (eOff <= ln.offset || sOff >= lineEnd) continue;
         const a = Math.max(0, sOff - ln.offset);
         const c = Math.min(ln.text.length, eOff - ln.offset);
-        lineParts.push(ln.text.slice(a, c));
+        picked.push({ text: ln.text.slice(a, c), sep: ln.sepAfter ?? "\n" });
       }
-      if (lineParts.length) parts.push(lineParts.join("\n"));
+      if (picked.length) {
+        // 软换行只是视觉折行：按行尾连接符拼接，词内折行直接相连，不插入换行
+        let joined = "";
+        for (let pi = 0; pi < picked.length; pi++) {
+          joined += picked[pi].text;
+          if (pi < picked.length - 1) joined += picked[pi].sep;
+        }
+        parts.push(joined);
+      }
     } else if (b.text) {
       parts.push(b.text.slice(sOff, Math.min(eOff, b.text.length)));
     }
@@ -1725,14 +1771,22 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ctx.font = `${fs}px ${ff}`;
       ctx.fillStyle = b.color || p.text;
       ctx.textBaseline = "top";
-      const lines = b._lines || (b._lines = wrapText(b.text, b.w - 34, fs, ff));
+      let lines = b._lines;
+      let seps = b._lineSeps;
+      if (!lines || !seps) {
+        const full = wrapTextFull(b.text || "", b.w - 34, fs, ff);
+        lines = full.lines;
+        seps = full.seps;
+        b._lines = lines;
+        b._lineSeps = seps;
+      }
       const halfLead = (lh - fs) / 2;
       if (!b._textLines) {
         b._textLines = [];
         let offset = 0;
         for (let i = 0; i < lines.length; i++) {
           const ty = b.y + 10 + imgOffset + i * lh; // 绝对坐标（= 屏幕 ty + scrollY）
-          b._textLines.push({ text: lines[i], x: b.x + 16, y: ty, w: measure(lines[i], fs, ff), offset, fs, lh });
+          b._textLines.push({ text: lines[i], x: b.x + 16, y: ty, w: measure(lines[i], fs, ff), offset, fs, lh, sepAfter: seps[i] });
           offset += lines[i].length;
         }
       }
@@ -1899,7 +1953,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ctx.textBaseline = "top";
       const innerX = b.data?.borderLeft ? bx + (padX || 14) : bx + padX;
       const innerW = b.data?.borderLeft ? b.w - (padX || 14) : b.w - padX * 2;
-      const lines = b._lines || (b._lines = wrapText(b.text, Math.max(1, innerW), fs, ff, fw));
+      let lines = b._lines;
+      let seps = b._lineSeps;
+      if (!lines || !seps) {
+        const full = wrapTextFull(b.text || "", Math.max(1, innerW), fs, ff, fw);
+        lines = full.lines;
+        seps = full.seps;
+        b._lines = lines;
+        b._lineSeps = seps;
+      }
       // textLines 跨帧缓存：clipped 块的内滚会平移行 y，用 bScroll 作缓存键；
       // 大输出几千行时避免每帧全量 measure + 数组分配（滚动卡顿主因之一）
       const tlKey = clipped ? bScroll : 0;
@@ -1909,7 +1971,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         let offset = 0;
         for (let i = 0; i < lines.length; i++) {
           const ty = b.y + padY + i * lh - bScroll; // 绝对坐标（= 屏幕 ty + scrollY）
-          b._textLines.push({ text: lines[i], x: innerX, y: ty, w: measure(lines[i], fs, ff, fw), offset, fs, lh });
+          b._textLines.push({ text: lines[i], x: innerX, y: ty, w: measure(lines[i], fs, ff, fw), offset, fs, lh, sepAfter: seps[i] });
           offset += lines[i].length;
         }
       }
@@ -1977,12 +2039,20 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (b.text) {
         ctx.font = `${baseFw} ${fs}px ${ff}`;
         ctx.fillStyle = b.color || pal.text;
-        const lines = wrapText(b.text, maxW, fs, ff, baseFw);
+        let lines = b._lines;
+        let seps = b._lineSeps;
+        if (!lines || !seps) {
+          const full = wrapTextFull(b.text, maxW, fs, ff, baseFw);
+          lines = full.lines;
+          seps = full.seps;
+          b._lines = lines;
+          b._lineSeps = seps;
+        }
         let offset = 0;
         for (let i = 0; i < lines.length; i++) {
           const ty = by + i * lh;
           fillTextCrisp(ctx, lines[i], startX, ty + halfLead);
-          b.textLines.push({ text: lines[i], x: startX, y: ty + scrollY, w: measure(lines[i], fs, ff, baseFw), offset, fs, lh });
+          b.textLines.push({ text: lines[i], x: startX, y: ty + scrollY, w: measure(lines[i], fs, ff, baseFw), offset, fs, lh, sepAfter: seps[i] });
           offset += lines[i].length;
         }
       }
@@ -2048,7 +2118,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const tySnap = snap(ty + halfLead);
       const charX = cachedCharXs[li];
       const lineW = cachedLineWidths![li];
-      const lineEntry: TextLine = { text: line, x: startX, y: ty + scrollY, w: lineW, offset: globalOffset, fs, lh, charX };
+      const lineEntry: TextLine = { text: line, x: startX, y: ty + scrollY, w: lineW, offset: globalOffset, fs, lh, charX,
+        sepAfter: wrapped[li].hardBreak ? "\n" : wrapped[li].spaceBreak ? " " : "" };
       b.textLines.push(lineEntry);
 
       // Render styled runs — look up styles via original offsets (not packed line index)
@@ -2109,12 +2180,20 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.fillStyle = b.color || p.text;
     ctx.textBaseline = "top";
     // Soft-wrap long lines (layout already sizes height via wrapText); do not rely on hard \n only.
-    const lines = b._lines || (b._lines = wrapCodeText(b.text || "", innerW, fs, ff));
+    let lines = b._lines;
+    let seps = b._lineSeps;
+    if (!lines || !seps) {
+      const full = wrapCodeTextFull(b.text || "", innerW, fs, ff);
+      lines = full.lines;
+      seps = full.seps;
+      b._lines = lines;
+      b._lineSeps = seps;
+    }
     if (!b._textLines) {
       b._textLines = [];
       let offset = 0;
       for (let i = 0; i < lines.length; i++) {
-        b._textLines.push({ text: lines[i], x: bx + padX, y: b.y + padY + i * lh, w: measure(lines[i], fs, ff), offset, fs, lh });
+        b._textLines.push({ text: lines[i], x: bx + padX, y: b.y + padY + i * lh, w: measure(lines[i], fs, ff), offset, fs, lh, sepAfter: seps[i] });
         offset += lines[i].length;
       }
     }
@@ -2134,6 +2213,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const ff = b.font || p.sans;
     const colWidths = (b.data?.colWidths as number[]) || [];
     const cellLines = (b.data?.cellLines as string[][][]) || [];
+    const cellSeps = (b.data?.cellSeps as string[][][]) || [];
     const rowHeights = (b.data?.rowHeights as number[]) || [];
     const aligns = (b.data?.aligns as Array<"left" | "center" | "right">) || [];
     const border = (b.data?.border as string) || p.border;
@@ -2174,6 +2254,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               fs,
               lh: lineH,
               charX,
+              sepAfter: cellSeps[r]?.[c]?.[li] ?? "\n",
             });
             charOff += line.length + 1;
           }
