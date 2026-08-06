@@ -694,6 +694,10 @@ interface Block {
   _charStyles?: Array<{ bold?: boolean; italic?: boolean; code?: boolean; link?: string }>;
   _charXs?: number[][];
   _lineWidths?: number[];
+  /** textLines 构建缓存：内容不变时跨帧复用，避免每帧全量 measure+分配 */
+  _textLines?: TextLine[];
+  /** 缓存对应的内滚偏移（clipped 块内滚会使行 y 位移，需重建） */
+  _textLinesKey?: number;
 }
 
 // ─── Selection ───────────────────────────────────────────────────────────────
@@ -784,6 +788,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // render loop (busy spinners)
   let rafId = 0;
+  // busy 重绘节流定时器：spinner 动画不需要 60fps 全量重绘
+  let busyTimer: number | undefined;
 
   // custom scrollbar drag (drawn on canvas; not a DOM control)
   let scrollDragging = false;
@@ -1682,7 +1688,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     // scrollbar
     if (maxScroll > 0) paintScrollbar(ctx);
 
-    if (hasBusy) requestRender();
+    // busy spinner 节流到 ~20fps：此前每帧全量重绘，滚动时与 wheel 绘制叠加放大卡顿
+    if (hasBusy && busyTimer === undefined) {
+      busyTimer = window.setTimeout(() => {
+        busyTimer = undefined;
+        requestRender();
+      }, 50);
+    }
   }
 
   function paintUserBubble(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette, hover: boolean) {
@@ -1715,14 +1727,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ctx.textBaseline = "top";
       const lines = b._lines || (b._lines = wrapText(b.text, b.w - 34, fs, ff));
       const halfLead = (lh - fs) / 2;
-      b.textLines = [];
-      let offset = 0;
+      if (!b._textLines) {
+        b._textLines = [];
+        let offset = 0;
+        for (let i = 0; i < lines.length; i++) {
+          const ty = b.y + 10 + imgOffset + i * lh; // 绝对坐标（= 屏幕 ty + scrollY）
+          b._textLines.push({ text: lines[i], x: b.x + 16, y: ty, w: measure(lines[i], fs, ff), offset, fs, lh });
+          offset += lines[i].length;
+        }
+      }
+      b.textLines = b._textLines;
       for (let i = 0; i < lines.length; i++) {
-        const tx = bx + 16;
-        const ty = by + 10 + imgOffset + i * lh;
-        fillTextCrisp(ctx, lines[i], tx, ty + halfLead);
-        b.textLines.push({ text: lines[i], x: tx, y: ty + scrollY, w: measure(lines[i], fs, ff), offset, fs, lh });
-        offset += lines[i].length;
+        fillTextCrisp(ctx, lines[i], bx + 16, by + 10 + imgOffset + i * lh + halfLead);
       }
     }
   }
@@ -1884,20 +1900,30 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const innerX = b.data?.borderLeft ? bx + (padX || 14) : bx + padX;
       const innerW = b.data?.borderLeft ? b.w - (padX || 14) : b.w - padX * 2;
       const lines = b._lines || (b._lines = wrapText(b.text, Math.max(1, innerW), fs, ff, fw));
-      b.textLines = [];
-      let offset = 0;
+      // textLines 跨帧缓存：clipped 块的内滚会平移行 y，用 bScroll 作缓存键；
+      // 大输出几千行时避免每帧全量 measure + 数组分配（滚动卡顿主因之一）
+      const tlKey = clipped ? bScroll : 0;
+      if (!b._textLines || b._textLinesKey !== tlKey) {
+        b._textLinesKey = tlKey;
+        b._textLines = [];
+        let offset = 0;
+        for (let i = 0; i < lines.length; i++) {
+          const ty = b.y + padY + i * lh - bScroll; // 绝对坐标（= 屏幕 ty + scrollY）
+          b._textLines.push({ text: lines[i], x: innerX, y: ty, w: measure(lines[i], fs, ff, fw), offset, fs, lh });
+          offset += lines[i].length;
+        }
+      }
+      b.textLines = b._textLines;
       for (let i = 0; i < lines.length; i++) {
-        const tx = innerX;
         const ty = by + padY + i * lh - bScroll;
-        if (ty + lh > by - 10 && ty < by + b.h + 10) {
-          fillTextCrisp(ctx, lines[i], tx, ty + halfLead);
+        // 块窗口 + 视口双重裁剪，视口外只算坐标不绘制
+        if (ty + lh > by - 10 && ty < by + b.h + 10 && ty + lh > -10 && ty < viewH + 10) {
+          fillTextCrisp(ctx, lines[i], innerX, ty + halfLead);
           if (hover && b.data?.underlineOnHover) {
             const tw = measure(lines[i], fs, ff, fw);
-            ctx.fillRect(tx, snap(ty + halfLead) + fs, tw, 1);
+            ctx.fillRect(innerX, snap(ty + halfLead) + fs, tw, 1);
           }
         }
-        b.textLines.push({ text: lines[i], x: tx, y: ty + scrollY, w: measure(lines[i], fs, ff, fw), offset, fs, lh });
-        offset += lines[i].length;
       }
     }
 
@@ -2084,16 +2110,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.textBaseline = "top";
     // Soft-wrap long lines (layout already sizes height via wrapText); do not rely on hard \n only.
     const lines = b._lines || (b._lines = wrapCodeText(b.text || "", innerW, fs, ff));
-    b.textLines = [];
-    let offset = 0;
-    for (let i = 0; i < lines.length; i++) {
-      const tx = bx + padX;
-      const ty = by + padY + i * lh;
-      if (ty + lh >= by - 10 && ty <= by + b.h + 10) {
-        fillTextCrisp(ctx, lines[i], tx, ty + halfLead);
+    if (!b._textLines) {
+      b._textLines = [];
+      let offset = 0;
+      for (let i = 0; i < lines.length; i++) {
+        b._textLines.push({ text: lines[i], x: bx + padX, y: b.y + padY + i * lh, w: measure(lines[i], fs, ff), offset, fs, lh });
+        offset += lines[i].length;
       }
-      b.textLines.push({ text: lines[i], x: tx, y: ty + scrollY, w: measure(lines[i], fs, ff), offset, fs, lh });
-      offset += lines[i].length;
+    }
+    b.textLines = b._textLines;
+    // 只绘制视口内的行：高代码块部分可见时，原先会对全部行 fillText（每帧文本整形开销极大）
+    for (let i = 0; i < lines.length; i++) {
+      const ty = by + padY + i * lh;
+      if (ty + lh >= -10 && ty <= viewH + 10) {
+        fillTextCrisp(ctx, lines[i], bx + padX, ty + halfLead);
+      }
     }
     ctx.restore();
   }
@@ -2106,15 +2137,61 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const rowHeights = (b.data?.rowHeights as number[]) || [];
     const aligns = (b.data?.aligns as Array<"left" | "center" | "right">) || [];
     const border = (b.data?.border as string) || p.border;
-    const textLines: TextLine[] = [];
-    let charOff = 0;
-    let rowY = by;
-    let absRowY = b.y;
+    // textLines（含逐字 charX 测量）一次构建跨帧复用：
+    // 原先每帧对每个单元格 O(n²) slice+measure，滚动经过表格时必然掉帧
+    if (!b._textLines) {
+      const textLines: TextLine[] = [];
+      let charOff = 0;
+      let absRowY = b.y;
+      for (let r = 0; r < cellLines.length; r++) {
+        const rh = rowHeights[r] || fs * TABLE_LH + TABLE_PAD_Y * 2;
+        let cellX = b.x;
+        for (let c = 0; c < colWidths.length; c++) {
+          const cw = colWidths[c];
+          const lines = cellLines[r]?.[c] || [""];
+          const fw = r === 0 ? "600" : "400";
+          const align = aligns[c] || "left";
+          const lineH = fs * TABLE_LH;
+          const contentH = lines.length * lineH;
+          const absTextTop = absRowY + Math.max(TABLE_PAD_Y, (rh - contentH) / 2);
+          for (let li = 0; li < lines.length; li++) {
+            const line = lines[li];
+            const tw = measure(line, fs, ff, fw);
+            let tx = cellX + TABLE_PAD_X;
+            if (align === "center") tx = cellX + (cw - tw) / 2;
+            else if (align === "right") tx = cellX + cw - TABLE_PAD_X - tw;
+            // Per cell visual line: selection hit/paint follows column x, not row-joined text
+            const charX: number[] = new Array(line.length + 1);
+            for (let ci = 0; ci <= line.length; ci++) {
+              charX[ci] = measure(line.slice(0, ci), fs, ff, fw);
+            }
+            textLines.push({
+              text: line,
+              x: tx,
+              y: absTextTop + li * lineH,
+              w: tw,
+              offset: charOff,
+              fs,
+              lh: lineH,
+              charX,
+            });
+            charOff += line.length + 1;
+          }
+          cellX += cw;
+        }
+        absRowY += rh;
+      }
+      b._textLines = textLines;
+    }
+    b.textLines = b._textLines;
 
+    // 绘制按行做视口裁剪，跳过不可见行的描边/填充/文本
+    let rowY = by;
     for (let r = 0; r < cellLines.length; r++) {
       const rh = rowHeights[r] || fs * TABLE_LH + TABLE_PAD_Y * 2;
+      const rowVisible = rowY + rh >= -10 && rowY <= viewH + 10;
       let cellX = bx;
-      if (r === 0) {
+      if (rowVisible && r === 0) {
         ctx.fillStyle = p.panel;
         ctx.globalAlpha = 0.55;
         ctx.fillRect(bx, rowY, b.w, rh);
@@ -2122,49 +2199,32 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
       for (let c = 0; c < colWidths.length; c++) {
         const cw = colWidths[c];
-        const lines = cellLines[r]?.[c] || [""];
-        const fw = r === 0 ? "600" : "400";
-        const align = aligns[c] || "left";
-        ctx.strokeStyle = border;
-        ctx.lineWidth = 1;
-        ctx.strokeRect(cellX + 0.5, rowY + 0.5, cw - 1, rh - 1);
-        ctx.fillStyle = b.color || p.text;
-        ctx.font = `${fw} ${fs}px ${ff}`;
-        ctx.textBaseline = "top";
-        const lineH = fs * TABLE_LH;
-        const contentH = lines.length * lineH;
-        const textTop = rowY + Math.max(TABLE_PAD_Y, (rh - contentH) / 2);
-        const absTextTop = absRowY + Math.max(TABLE_PAD_Y, (rh - contentH) / 2);
-        for (let li = 0; li < lines.length; li++) {
-          const line = lines[li];
-          const tw = measure(line, fs, ff, fw);
-          let tx = cellX + TABLE_PAD_X;
-          if (align === "center") tx = cellX + (cw - tw) / 2;
-          else if (align === "right") tx = cellX + cw - TABLE_PAD_X - tw;
-          fillTextCrisp(ctx, line, tx, textTop + li * lineH);
-          // Per cell visual line: selection hit/paint follows column x, not row-joined text
-          const charX: number[] = new Array(line.length + 1);
-          for (let ci = 0; ci <= line.length; ci++) {
-            charX[ci] = measure(line.slice(0, ci), fs, ff, fw);
+        if (rowVisible && cellX + cw >= -10 && cellX <= viewW + 10) {
+          const lines = cellLines[r]?.[c] || [""];
+          const fw = r === 0 ? "600" : "400";
+          const align = aligns[c] || "left";
+          ctx.strokeStyle = border;
+          ctx.lineWidth = 1;
+          ctx.strokeRect(cellX + 0.5, rowY + 0.5, cw - 1, rh - 1);
+          ctx.fillStyle = b.color || p.text;
+          ctx.font = `${fw} ${fs}px ${ff}`;
+          ctx.textBaseline = "top";
+          const lineH = fs * TABLE_LH;
+          const contentH = lines.length * lineH;
+          const textTop = rowY + Math.max(TABLE_PAD_Y, (rh - contentH) / 2);
+          for (let li = 0; li < lines.length; li++) {
+            const line = lines[li];
+            const tw = measure(line, fs, ff, fw); // 对齐需要宽度；measure 有缓存
+            let tx = cellX + TABLE_PAD_X;
+            if (align === "center") tx = cellX + (cw - tw) / 2;
+            else if (align === "right") tx = cellX + cw - TABLE_PAD_X - tw;
+            fillTextCrisp(ctx, line, tx, textTop + li * lineH);
           }
-          textLines.push({
-            text: line,
-            x: tx,
-            y: absTextTop + li * lineH,
-            w: tw,
-            offset: charOff,
-            fs,
-            lh: lineH,
-            charX,
-          });
-          charOff += line.length + 1;
         }
         cellX += cw;
       }
       rowY += rh;
-      absRowY += rh;
     }
-    b.textLines = textLines;
   }
 
   function paintEditIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, color: string) {
