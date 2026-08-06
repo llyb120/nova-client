@@ -39,9 +39,35 @@ fn is_codex_model_resume_warning(value: &Value) -> bool {
         })
 }
 
+/// 回合控制通道：进程桥写 stdin，进程内桥写 mpsc（同样的 JSONL 控制行）。
+#[derive(Clone)]
+enum BridgeControl {
+    Process(Arc<tokio::sync::Mutex<ChildStdin>>),
+    InProcess(tokio::sync::mpsc::UnboundedSender<String>),
+}
+
 struct RunningBridge {
-    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    control: BridgeControl,
     pid: Option<u32>,
+    /// 进程内桥的注册代数（run_epoch），用于区分同一 session 的新旧回合；进程桥为 0。
+    registration: u64,
+    /// 进程内任务的 abort 句柄，等价于进程桥的 kill。
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+impl RunningBridge {
+    fn identity(&self) -> (Option<u32>, u64) {
+        (self.pid, self.registration)
+    }
+}
+
+fn kill_running(bridge: &RunningBridge) {
+    if let Some(pid) = bridge.pid {
+        crate::acp::kill_process_tree(pid);
+    }
+    if let Some(abort) = &bridge.abort {
+        abort.abort();
+    }
 }
 
 struct IdleBridge {
@@ -55,6 +81,23 @@ struct IdleBridge {
 enum ReadEventsOutcome {
     Completed,
     Superseded,
+}
+
+/// 回合事件行来源：进程桥 stdout 或进程内 mpsc 通道，均为 JSONL。
+enum EventSource<'a> {
+    Process(&'a mut BufReader<tokio::process::ChildStdout>),
+    Channel(tokio::sync::mpsc::UnboundedReceiver<String>),
+}
+
+impl EventSource<'_> {
+    async fn next_line(&mut self) -> Result<Option<String>, String> {
+        match self {
+            EventSource::Process(reader) => {
+                reader.lines().next_line().await.map_err(|e| e.to_string())
+            }
+            EventSource::Channel(rx) => Ok(rx.recv().await),
+        }
+    }
 }
 
 pub struct SdkManager {
@@ -77,6 +120,8 @@ pub struct SdkManager {
     /// 仅 Alkaid 使用：nova-server 下发的配置保存在内存，请求 bridge 时随首包传入。
     alkaid_server_config: Mutex<Option<Value>>,
     alkaid_config_generation: AtomicU64,
+    /// 进程内原生 agent（Lyra）的 HTTP 连接池：按 vega_proxy 设置构建一次并复用。
+    native_http: Mutex<Option<reqwest::Client>>,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
 }
@@ -114,9 +159,52 @@ impl SdkManager {
             model_options_revalidated: AtomicBool::new(false),
             alkaid_server_config: Mutex::new(None),
             alkaid_config_generation: AtomicU64::new(0),
+            native_http: Mutex::new(None),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// 主运行时用进程内原生 agent：adapter 声明支持且非借用额度隔离运行时。
+    /// 进程内原生 agent（Lyra）：主运行时与借用额度运行时都在本进程 tokio 任务中运行。
+    /// 借用额度只换数据根（不同凭证），无需进程隔离。
+    fn use_inprocess(&self) -> bool {
+        self.adapter.runs_inprocess()
+    }
+
+    /// 借用额度运行时的隔离数据根（launch_env 中的 NOVA_DATA_DIR）；主运行时为 None。
+    fn borrowed_root(&self) -> Option<PathBuf> {
+        self.launch_env.get("NOVA_DATA_DIR").map(PathBuf::from)
+    }
+
+    /// 进程内原生 agent 的 HTTP 连接池：按 vega_proxy 设置构建一次复用，避免每轮冷建 TLS。
+    fn native_http(&self) -> reqwest::Client {
+        if let Some(client) = self.native_http.lock().unwrap().as_ref() {
+            return client.clone();
+        }
+        let proxy = {
+            let state = self.app.state::<AppState>();
+            let proxy = state.settings.lock().unwrap().vega_proxy.clone();
+            proxy
+        };
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(4)
+            .tcp_keepalive(std::time::Duration::from_secs(20));
+        let proxy = proxy.trim();
+        if !proxy.is_empty() {
+            let url = if proxy.contains("://") {
+                proxy.to_string()
+            } else {
+                format!("http://{proxy}")
+            };
+            if let Ok(proxy) = reqwest::Proxy::all(&url) {
+                builder = builder.proxy(proxy);
+            }
+        }
+        let client = builder.build().unwrap_or_default();
+        *self.native_http.lock().unwrap() = Some(client.clone());
+        client
     }
 
     pub fn is_running(&self, thread_id: &str) -> bool {
@@ -293,7 +381,10 @@ impl SdkManager {
             }
         }
         parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
-        let lightweight_model = if self.adapter.agent_kind() == AgentKind::Alkaid {
+        let lightweight_model = if matches!(
+            self.adapter.agent_kind(),
+            AgentKind::Alkaid | AgentKind::Lyra
+        ) {
             let app_state = self.app.state::<AppState>();
             let settings = app_state.settings.lock().unwrap();
             (AgentKind::from_str(&settings.lightweight_model_agent) == Some(AgentKind::Alkaid))
@@ -376,10 +467,10 @@ impl SdkManager {
             .lock()
             .unwrap()
             .get(thread_id)
-            .map(|bridge| (bridge.stdin.clone(), bridge.pid));
-        let target_pid = bridge.as_ref().and_then(|(_, pid)| *pid);
-        if let Some((stdin, _)) = bridge {
-            let _ = write_line(&stdin, &json!({ "action": "cancel" })).await;
+            .map(|bridge| (bridge.control.clone(), bridge.identity()));
+        let target = bridge.as_ref().map(|(_, identity)| *identity);
+        if let Some((control, _)) = bridge {
+            let _ = write_control(&control, &json!({ "action": "cancel" })).await;
             for _ in 0..self.adapter.cancel_grace_attempts() {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let target_is_running = self
@@ -387,7 +478,7 @@ impl SdkManager {
                     .lock()
                     .unwrap()
                     .get(thread_id)
-                    .is_some_and(|bridge| bridge.pid == target_pid);
+                    .is_some_and(|bridge| Some(bridge.identity()) == target);
                 if !target_is_running {
                     break;
                 }
@@ -397,14 +488,12 @@ impl SdkManager {
             let mut running = self.running_children.lock().unwrap();
             running
                 .get(thread_id)
-                .is_some_and(|bridge| bridge.pid == target_pid)
+                .is_some_and(|bridge| Some(bridge.identity()) == target)
                 .then(|| running.remove(thread_id))
                 .flatten()
         };
         if let Some(bridge) = bridge {
-            if let Some(pid) = bridge.pid {
-                crate::acp::kill_process_tree(pid);
-            }
+            kill_running(&bridge);
         }
         self.finish_turn(thread_id, "cancelled", None);
     }
@@ -434,20 +523,20 @@ impl SdkManager {
         images: Vec<PromptImage>,
     ) {
         // set_running 早于 bridge 注册，极快的补充提示可能命中这个短窗口；稍候 bridge 就绪。
-        let mut stdin = None;
+        let mut control = None;
         for _ in 0..20 {
-            stdin = self
+            control = self
                 .running_children
                 .lock()
                 .unwrap()
                 .get(thread_id)
-                .map(|bridge| bridge.stdin.clone());
-            if stdin.is_some() || !self.is_running(thread_id) {
+                .map(|bridge| bridge.control.clone());
+            if control.is_some() || !self.is_running(thread_id) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        let Some(stdin) = stdin else {
+        let Some(control) = control else {
             if !self.is_running(thread_id) {
                 self.clone()
                     .run_prompt(thread_id.to_string(), text, images)
@@ -475,7 +564,8 @@ impl SdkManager {
         }
 
         let parts = prompt_parts(self.adapter.as_ref(), &text, &images);
-        if let Err(error) = write_line(&stdin, &json!({ "action": "steer", "parts": parts })).await
+        if let Err(error) =
+            write_control(&control, &json!({ "action": "steer", "parts": parts })).await
         {
             self.push_system(thread_id, format!("Vega 引导发送失败：{error}"), "error");
         }
@@ -489,14 +579,22 @@ impl SdkManager {
             .lock()
             .unwrap()
             .get(thread_id)
-            .map(|bridge| (bridge.stdin.clone(), bridge.pid));
-        if let Some((stdin, pid)) = bridge {
+            .map(|bridge| {
+                (
+                    bridge.control.clone(),
+                    bridge.pid,
+                    bridge.abort.clone(),
+                )
+            });
+        if let Some((control, pid, abort)) = bridge {
             // Bridge cancellation and persistence are best-effort only. The replacement prompt
             // receives the already-streamed transcript from Thread, so do not wait for SDK cleanup.
             if let Some(pid) = pid {
                 crate::acp::kill_process_tree(pid);
+            } else if let Some(abort) = abort {
+                abort.abort();
             } else {
-                let _ = write_line(&stdin, &json!({ "action": "cancel" })).await;
+                let _ = write_control(&control, &json!({ "action": "cancel" })).await;
             }
             self.running_children.lock().unwrap().remove(thread_id);
         }
@@ -519,9 +617,7 @@ impl SdkManager {
 
     pub fn forget_session_of_thread(&self, thread_id: &str) {
         if let Some(bridge) = self.running_children.lock().unwrap().remove(thread_id) {
-            if let Some(pid) = bridge.pid {
-                crate::acp::kill_process_tree(pid);
-            }
+            kill_running(&bridge);
         }
         if let Some(mut bridge) = self.idle_children.lock().unwrap().remove(thread_id) {
             kill_child(&mut bridge.child);
@@ -553,9 +649,7 @@ impl SdkManager {
 
     pub fn shutdown(&self) {
         for bridge in std::mem::take(&mut *self.running_children.lock().unwrap()).into_values() {
-            if let Some(pid) = bridge.pid {
-                crate::acp::kill_process_tree(pid);
-            }
+            kill_running(&bridge);
         }
         for mut bridge in std::mem::take(&mut *self.idle_children.lock().unwrap()).into_values() {
             kill_child(&mut bridge.child);
@@ -584,9 +678,13 @@ impl SdkManager {
     }
 
     /// 应用 nova-server 定向下发的 Alkaid 配置。配置只驻留内存；当前运行轮次不打断，
-    /// 后续 bridge 首包携带它并由 JS 侧以本地 config.jsonc 覆盖合并。
+    /// 后续 bridge 首包携带它并由 agent 侧以本地 config.jsonc 覆盖合并。
+    /// Lyra 与 Vega 共用配置文件，同样接收下发配置。
     pub fn set_alkaid_server_config(self: &Arc<Self>, config: Option<Value>) {
-        if self.adapter.agent_kind() != AgentKind::Alkaid {
+        if !matches!(
+            self.adapter.agent_kind(),
+            AgentKind::Alkaid | AgentKind::Lyra
+        ) {
             return;
         }
         {
@@ -603,7 +701,10 @@ impl SdkManager {
     /// 本地 `config.jsonc` 发生变化时调用。当前正在执行的 bridge 不打断，
     /// 但会让下一轮请求、模型列表和预热实例使用新配置。
     pub fn notify_alkaid_config_changed(self: &Arc<Self>) {
-        if self.adapter.agent_kind() != AgentKind::Alkaid {
+        if !matches!(
+            self.adapter.agent_kind(),
+            AgentKind::Alkaid | AgentKind::Lyra
+        ) {
             return;
         }
         self.invalidate_alkaid_config();
@@ -616,7 +717,7 @@ impl SdkManager {
         let _ = self.app.emit(
             EV_OPTIONS,
             json!({
-                "agentKind": AgentKind::Alkaid.as_str(),
+                "agentKind": self.adapter.agent_kind().as_str(),
                 "options": self.pending_model_options(),
             }),
         );
@@ -627,7 +728,10 @@ impl SdkManager {
     }
 
     fn with_alkaid_server_config(&self, mut request: Value) -> Value {
-        if self.adapter.agent_kind() == AgentKind::Alkaid {
+        if matches!(
+            self.adapter.agent_kind(),
+            AgentKind::Alkaid | AgentKind::Lyra
+        ) {
             if let Some(config) = self.alkaid_server_config.lock().unwrap().clone() {
                 request["alkaidServerConfig"] = config;
             }
@@ -817,6 +921,9 @@ impl SdkManager {
 
     async fn run_bridge(&self, cwd: &str, request: Value) -> Result<Value, String> {
         let request = self.with_alkaid_server_config(request);
+        if self.use_inprocess() {
+            return crate::lyra::run_oneshot(&self.native_http(), &request, self.borrowed_root()).await;
+        }
         let mut child = self.spawn_bridge(cwd)?;
         let mut stdin = child
             .stdin
@@ -843,6 +950,11 @@ impl SdkManager {
         run_epoch: u64,
     ) -> Result<(), String> {
         let request = self.with_alkaid_server_config(request);
+        if self.use_inprocess() {
+            return self
+                .run_prompt_inprocess(thread_id, request, user_item_id, run_epoch)
+                .await;
+        }
         let cached_bridge = self
             .adapter
             .keeps_bridge_alive()
@@ -862,8 +974,10 @@ impl SdkManager {
         self.running_children.lock().unwrap().insert(
             thread_id.to_string(),
             RunningBridge {
-                stdin: bridge.stdin.clone(),
+                control: BridgeControl::Process(bridge.stdin.clone()),
                 pid,
+                registration: 0,
+                abort: None,
             },
         );
         if let Err(first_error) = write_line(&bridge.stdin, &request).await {
@@ -887,8 +1001,10 @@ impl SdkManager {
             self.running_children.lock().unwrap().insert(
                 thread_id.to_string(),
                 RunningBridge {
-                    stdin: bridge.stdin.clone(),
+                    control: BridgeControl::Process(bridge.stdin.clone()),
                     pid,
+                    registration: 0,
+                    abort: None,
                 },
             );
             if let Err(error) = write_line(&bridge.stdin, &request).await {
@@ -904,8 +1020,9 @@ impl SdkManager {
                 return Err(error);
             }
         }
+        let mut source = EventSource::Process(&mut bridge.stdout);
         let event_result = self
-            .read_events(thread_id, user_item_id, run_epoch, &mut bridge.stdout)
+            .read_events(thread_id, user_item_id, run_epoch, &mut source)
             .await;
         let completed = matches!(&event_result, Ok(ReadEventsOutcome::Completed));
         let still_owned = {
@@ -964,6 +1081,68 @@ impl SdkManager {
             kill_child(&mut bridge.child);
         }
         result
+    }
+
+    /// 进程内运行 Lyra：不起子进程，会话在同进程 tokio 任务中执行，
+    /// 事件/控制行走 mpsc 通道，事件处理与进程桥完全同一路径。
+    async fn run_prompt_inprocess(
+        &self,
+        thread_id: &str,
+        request: Value,
+        user_item_id: u64,
+        run_epoch: u64,
+    ) -> Result<(), String> {
+        let fast_context = {
+            let state = self.app.state::<AppState>();
+            let enabled = state.settings.lock().unwrap().fast_context_enabled;
+            enabled
+        };
+        let session = crate::lyra::spawn_prompt(
+            self.native_http(),
+            request,
+            fast_context,
+            self.borrowed_root(),
+        );
+        let abort = session.task.abort_handle();
+        self.running_children.lock().unwrap().insert(
+            thread_id.to_string(),
+            RunningBridge {
+                control: BridgeControl::InProcess(session.control.clone()),
+                pid: None,
+                registration: run_epoch,
+                abort: Some(abort.clone()),
+            },
+        );
+        let crate::lyra::InProcessSession { events, task, .. } = session;
+        let mut source = EventSource::Channel(events);
+        let event_result = self
+            .read_events(thread_id, user_item_id, run_epoch, &mut source)
+            .await;
+        // 仅当注册项仍属于本回合时才移除（新回合可能已重新注册）。
+        {
+            let mut running = self.running_children.lock().unwrap();
+            if running
+                .get(thread_id)
+                .is_some_and(|bridge| bridge.identity() == (None, run_epoch))
+            {
+                running.remove(thread_id);
+            }
+        }
+        let result = event_result.map(|_| ());
+        // 错误均已作为 {ok:false} 事件流出；这里只打捞 panic 信息，interrupt 的 abort 属正常。
+        match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
+            Ok(Err(join_error)) if join_error.is_panic() => Err(format!(
+                "{}；Lyra 任务 panic：{join_error}",
+                result
+                    .err()
+                    .unwrap_or_else(|| "Lyra 任务异常结束".to_string())
+            )),
+            Err(_) => {
+                abort.abort();
+                result
+            }
+            _ => result,
+        }
     }
 
     fn spawn_idle_bridge(&self, cwd: &str) -> Result<IdleBridge, String> {
@@ -1106,11 +1285,10 @@ impl SdkManager {
         thread_id: &str,
         user_item_id: u64,
         run_epoch: u64,
-        stdout: &mut BufReader<tokio::process::ChildStdout>,
+        source: &mut EventSource<'_>,
     ) -> Result<ReadEventsOutcome, String> {
-        let mut lines = stdout.lines();
         let mut item_ids = HashMap::new();
-        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+        while let Some(line) = source.next_line().await? {
             let event: Value = serde_json::from_str(&line).map_err(|e| {
                 format!("解析 {} 事件失败：{e}；输出：{line}", self.adapter.label())
             })?;
@@ -1180,16 +1358,27 @@ impl SdkManager {
         let program = resolve_program_on_path(&launch.program)
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or(launch.program);
-        let node = resolve_program_on_path("node").ok_or_else(|| {
-            format!(
-                "未找到 Node.js，{} 需要 Node.js 运行官方 SDK",
-                self.adapter.label()
-            )
-        })?;
-        let bridge = bridge_path(&self.app, self.adapter.as_ref())?;
-        let mut command = Command::new(node);
+        // Rust 原生 agent（如 Lyra）：直接以应用自身子命令启动，不经 Node bridge。
+        let native_subcommand = self.adapter.native_subcommand();
+        let mut command = if let Some(subcommand) = native_subcommand {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("定位应用可执行文件失败：{e}"))?;
+            let mut command = Command::new(exe);
+            command.arg(subcommand);
+            command
+        } else {
+            let node = resolve_program_on_path("node").ok_or_else(|| {
+                format!(
+                    "未找到 Node.js，{} 需要 Node.js 运行官方 SDK",
+                    self.adapter.label()
+                )
+            })?;
+            let bridge = bridge_path(&self.app, self.adapter.as_ref())?;
+            let mut command = Command::new(node);
+            command.arg(bridge);
+            command
+        };
         command
-            .arg(bridge)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1227,9 +1416,13 @@ impl SdkManager {
         }
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
-        command
-            .spawn()
-            .map_err(|e| format!("启动 {} Node bridge 失败：{e}", self.adapter.label()))
+        command.spawn().map_err(|e| {
+            if native_subcommand.is_some() {
+                format!("启动 {} 原生进程失败：{e}", self.adapter.label())
+            } else {
+                format!("启动 {} Node bridge 失败：{e}", self.adapter.label())
+            }
+        })
     }
 
     fn save_session_id(&self, thread_id: &str, session_id: &str) {
@@ -1451,14 +1644,14 @@ impl SdkManager {
             .unwrap()
             .remove(request_key)
             .ok_or("该权限请求已失效")?;
-        let stdin = self
+        let control = self
             .running_children
             .lock()
             .unwrap()
             .get(&thread_id)
-            .map(|bridge| bridge.stdin.clone())
+            .map(|bridge| bridge.control.clone())
             .ok_or_else(|| format!("{} 会话已结束", self.adapter.label()))?;
-        write_line(&stdin, &json!({ "action": "permission", "requestId": request_id, "reply": if option_id == "reject" { "reject" } else { "once" } })).await?;
+        write_control(&control, &json!({ "action": "permission", "requestId": request_id, "reply": if option_id == "reject" { "reject" } else { "once" } })).await?;
         let _ = self.app.emit(
             crate::acp::EV_PERMISSION_RESOLVED,
             json!({ "requestKey": request_key }),
@@ -1613,6 +1806,15 @@ fn prompt_parts(adapter: &dyn SdkAdapter, text: &str, images: &[PromptImage]) ->
         }
     }
     parts
+}
+
+async fn write_control(control: &BridgeControl, line: &Value) -> Result<(), String> {
+    match control {
+        BridgeControl::Process(stdin) => write_line(stdin, line).await,
+        BridgeControl::InProcess(tx) => tx
+            .send(line.to_string())
+            .map_err(|_| "Lyra 会话控制通道已关闭".to_string()),
+    }
 }
 
 async fn write_line(

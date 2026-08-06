@@ -5,6 +5,8 @@ export function agentLabel(kind: AgentKind): string {
   switch (kind) {
     case "alkaid":
       return "Vega";
+    case "lyra":
+      return "Lyra";
     case "codex":
       return "Codex";
     case "codebuddy":
@@ -26,6 +28,8 @@ export function agentShort(kind: AgentKind): string {
   switch (kind) {
     case "alkaid":
       return "V";
+    case "lyra":
+      return "L";
     case "codex":
       return "C";
     case "codebuddy":

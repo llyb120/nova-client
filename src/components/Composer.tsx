@@ -139,9 +139,10 @@ export function Composer() {
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
-  // 原生注入当前轮：Alkaid / Codex / Devin。
+  // 原生注入当前轮：Alkaid / Lyra / Codex / Devin。
   const supportsLiveSteer = () =>
     state.agentKind === "alkaid" ||
+    state.agentKind === "lyra" ||
     state.agentKind === "codex" ||
     state.agentKind === "devin";
   // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）、OpenCode。

@@ -107,7 +107,7 @@ impl SdkAdapter for AlkaidAdapter {
     }
 }
 
-fn alkaid_tool_call(value: &Value) -> ToolCall {
+pub(crate) fn alkaid_tool_call(value: &Value) -> ToolCall {
     let item_type = value.get("type").and_then(Value::as_str).unwrap_or("tool");
     let status = value
         .get("status")

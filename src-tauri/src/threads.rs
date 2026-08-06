@@ -61,6 +61,7 @@ pub enum AgentKind {
     Cursor,
     OpenCode,
     OpenCodePlus,
+    Lyra,
 }
 
 impl Default for AgentKind {
@@ -82,6 +83,7 @@ impl AgentKind {
             AgentKind::Cursor => "cursor",
             AgentKind::OpenCode => "opencode",
             AgentKind::OpenCodePlus => "opencodeplus",
+            AgentKind::Lyra => "lyra",
         }
     }
 
@@ -98,6 +100,7 @@ impl AgentKind {
             "cursor" => Some(AgentKind::Cursor),
             "opencode" => Some(AgentKind::OpenCode),
             "opencodeplus" => Some(AgentKind::OpenCodePlus),
+            "lyra" => Some(AgentKind::Lyra),
             _ => None,
         }
     }
@@ -115,6 +118,7 @@ impl AgentKind {
             AgentKind::Cursor => "Cursor",
             AgentKind::OpenCode => "OpenCode",
             AgentKind::OpenCodePlus => "OpenCode",
+            AgentKind::Lyra => "Lyra",
         }
     }
 }

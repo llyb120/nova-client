@@ -632,6 +632,13 @@ button {
   background: color-mix(in srgb, var(--cyan) 14%, transparent);
 }
 
+.thread-agent.lyra,
+.agent-badge.lyra {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 40%, transparent);
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+}
+
 .thread-agent.devin,
 .agent-badge.devin {
   color: var(--accent);

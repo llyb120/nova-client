@@ -200,6 +200,7 @@ fn quota_model_key(kind: &AgentKind, model: &str) -> String {
 fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
     match kind {
         AgentKind::Alkaid
+        | AgentKind::Lyra
         | AgentKind::Devin
         | AgentKind::Codex
         | AgentKind::CodexPlus
@@ -241,6 +242,7 @@ fn shared_quota_model_keys(shared_options: &Value) -> HashSet<String> {
 fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> bool {
     let enabled = match kind {
         AgentKind::Alkaid => settings.alkaid_enabled,
+        AgentKind::Lyra => settings.lyra_enabled,
         AgentKind::Devin => settings.devin_enabled,
         AgentKind::Codex => settings.codex_enabled,
         AgentKind::CodexPlus => settings.codex_enabled,
@@ -1761,6 +1763,12 @@ impl RelayManager {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
             }
+            AgentKind::Lyra => {
+                let mgr = state.lyra.clone();
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(run_id, seed, vec![]).await;
+                });
+            }
             AgentKind::Devin => {
                 let mgr = state.acp.clone();
                 tauri::async_runtime::spawn(async move {
@@ -2704,6 +2712,9 @@ impl RelayManager {
                     AgentKind::Alkaid => {
                         app.state::<AppState>().alkaid.ensure_model_options().await
                     }
+                    AgentKind::Lyra => {
+                        app.state::<AppState>().lyra.ensure_model_options().await
+                    }
                     AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                         app.state::<AppState>()
                             .opencodeplus
@@ -3338,6 +3349,14 @@ impl RelayManager {
                     }
                 });
             }
+            AgentKind::Lyra => {
+                let mgr = state.lyra.clone();
+                tauri::async_runtime::spawn(async move {
+                    if host_prompt_is_current(&prompt_epoch) {
+                        mgr.run_prompt(host_thread_id, text, images).await;
+                    }
+                });
+            }
             AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                 let mgr = state.opencodeplus.clone();
                 tauri::async_runtime::spawn(async move {
@@ -3440,6 +3459,10 @@ impl RelayManager {
         match agent_kind {
             AgentKind::Alkaid => {
                 let mgr = state.alkaid.clone();
+                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
+            }
+            AgentKind::Lyra => {
+                let mgr = state.lyra.clone();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
             AgentKind::Devin => {

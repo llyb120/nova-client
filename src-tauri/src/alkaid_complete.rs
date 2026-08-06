@@ -255,7 +255,7 @@ async fn read_responses_sse(response: &mut reqwest::Response) -> Result<String, 
     Ok(out.trim().to_string())
 }
 
-fn sse_data_payload(line: &str) -> Option<&str> {
+pub(crate) fn sse_data_payload(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
     if !trimmed.starts_with("data:") {
         return None;
@@ -345,7 +345,7 @@ fn fingerprint_server_config(server_config: &Option<Value>) -> u64 {
     hasher.finish()
 }
 
-fn load_merged_config(data_dir: &Path, server_config: Option<Value>) -> Result<Value, String> {
+pub(crate) fn load_merged_config(data_dir: &Path, server_config: Option<Value>) -> Result<Value, String> {
     let path = data_dir.join("alkaid").join("config.jsonc");
     let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
     let server_fingerprint = fingerprint_server_config(&server_config);
@@ -473,7 +473,7 @@ fn resolve_target(
     })
 }
 
-fn provider_api(provider: &Value) -> Result<String, String> {
+pub(crate) fn provider_api(provider: &Value) -> Result<String, String> {
     if let Some(api) = provider.get("api").and_then(Value::as_str) {
         return Ok(api.to_string());
     }
@@ -493,7 +493,7 @@ fn provider_api(provider: &Value) -> Result<String, String> {
     Err("Vega provider 缺少 api，且无法从 npm 推导协议".into())
 }
 
-fn detect_thinking_format(
+pub(crate) fn detect_thinking_format(
     provider_id: &str,
     base_url: &str,
     model: &Value,
@@ -516,7 +516,7 @@ fn detect_thinking_format(
     }
 }
 
-fn detect_max_tokens_field(base_url: &str, provider: &Value) -> &'static str {
+pub(crate) fn detect_max_tokens_field(base_url: &str, provider: &Value) -> &'static str {
     if let Some(field) = provider
         .pointer("/compat/maxTokensField")
         .and_then(Value::as_str)
@@ -544,7 +544,7 @@ fn detect_max_tokens_field(base_url: &str, provider: &Value) -> &'static str {
     }
 }
 
-fn resolve_env_string(value: &str, env: &HashMap<String, String>) -> Result<String, String> {
+pub(crate) fn resolve_env_string(value: &str, env: &HashMap<String, String>) -> Result<String, String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}").unwrap());
     let mut out = value.to_string();
@@ -561,7 +561,7 @@ fn resolve_env_string(value: &str, env: &HashMap<String, String>) -> Result<Stri
     Ok(out)
 }
 
-fn join_url(base: &str, path: &str) -> String {
+pub(crate) fn join_url(base: &str, path: &str) -> String {
     format!(
         "{}/{}",
         base.trim_end_matches('/'),
@@ -569,7 +569,7 @@ fn join_url(base: &str, path: &str) -> String {
     )
 }
 
-fn merge_objects(base: Value, overlay: Value) -> Value {
+pub(crate) fn merge_objects(base: Value, overlay: Value) -> Value {
     match (base, overlay) {
         (Value::Object(mut base_map), Value::Object(overlay_map)) => {
             for (key, value) in overlay_map {
@@ -585,7 +585,7 @@ fn merge_objects(base: Value, overlay: Value) -> Value {
     }
 }
 
-fn parse_jsonc(text: &str) -> Result<Value, String> {
+pub(crate) fn parse_jsonc(text: &str) -> Result<Value, String> {
     let stripped = strip_trailing_commas(&strip_json_comments(text));
     serde_json::from_str(&stripped).map_err(|e| format!("解析 Vega 配置失败：{e}"))
 }

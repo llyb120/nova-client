@@ -246,6 +246,9 @@ fn main() {
     if nova_lib::maybe_run_cli() {
         return;
     }
+    if nova_lib::maybe_run_lyra() {
+        return;
+    }
 
     #[cfg(any(windows, target_os = "macos"))]
     let _single_instance = if should_enforce_single_instance() {
