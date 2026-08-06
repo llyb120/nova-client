@@ -189,6 +189,57 @@ function wrapText(text: string, maxW: number, fs: number, ff: string, fw = "400"
   return wrapTextIndexed(text, maxW, fs, ff, fw).map((l) => l.text);
 }
 
+const CODE_TAB_SIZE = 4;
+
+/** CanvasRenderingContext2D does not lay out tab characters like a <pre> does. */
+function expandCodeTabs(text: string): string {
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  let column = 0;
+  let result = "";
+  for (const ch of normalized) {
+    if (ch === "\n") {
+      result += ch;
+      column = 0;
+    } else if (ch === "\t") {
+      const spaces = CODE_TAB_SIZE - (column % CODE_TAB_SIZE);
+      result += " ".repeat(spaces);
+      column += spaces;
+    } else {
+      result += ch;
+      column++;
+    }
+  }
+  return result;
+}
+
+/** Code needs to retain leading whitespace; the prose wrapper intentionally drops it. */
+function wrapCodeText(text: string, maxW: number, fs: number, ff: string): string[] {
+  const lines: string[] = [];
+  const safeMax = Math.max(1, maxW);
+  const expanded = expandCodeTabs(text);
+  for (const sourceLine of expanded.split("\n")) {
+    if (!sourceLine) {
+      lines.push("");
+      continue;
+    }
+    let line = "";
+    let lineW = 0;
+    for (const ch of Array.from(sourceLine)) {
+      const charW = measure(ch, fs, ff);
+      if (line && lineW + charW > safeMax) {
+        lines.push(line);
+        line = "";
+        lineW = 0;
+      }
+      line += ch;
+      lineW += charW;
+    }
+    lines.push(line);
+  }
+  while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines.length ? lines : [""];
+}
+
 function segmentCharStyles(segments: TextSegment[]): CharStyle[] {
   const styles: CharStyle[] = [];
   for (const seg of segments) {
@@ -1128,7 +1179,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       x: number; y: number; w: number; h: number;
       text: string; color: string; bg: string; border: string;
       borderRadius: number; fontSize: number; lineHeight: number; font: string;
-      padX: number; padY: number; lang?: string; hoverKey: string;
+      padX: number; padY: number; lang?: string; hoverKey: string; copyText?: string;
     },
   ) {
     const p = pal;
@@ -1145,7 +1196,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const btn = 24;
     const inset = 7;
     const copyKey = opts.hoverKey;
-    const codeText = opts.text;
+    const codeText = opts.copyText ?? opts.text;
     result.push({
       kind: "code-copy-btn",
       id: opts.id, groupIdx: opts.groupIdx,
@@ -1204,7 +1255,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           if (mb.type === "code") {
             const codeText = mb.raw || segmentsPlainText(mb.segments);
             // Match paintCodeBlock: innerW = (proseW - 14) - padX*2
-            const codeLines = wrapText(codeText, proseW - 38, 12, p.mono);
+            const codeLines = wrapCodeText(codeText, proseW - 38, 12, p.mono);
             const codeLh = 12 * 1.55;
             const codeH = codeLines.length * codeLh + 20; // padY 10*2
             pushMdCodeBlock(result, {
@@ -1212,7 +1263,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               x: x + 14, y: thY, w: proseW - 14, h: codeH,
               text: codeText, color: p.dim, bg: p.sidebar, border: p.border,
               borderRadius: 6, fontSize: 12, lineHeight: 1.55, font: p.mono,
-              padX: 12, padY: 10, hoverKey: `md-code-${item.id}-t${codeIdx++}`,
+              padX: 12, padY: 10, copyText: codeText, hoverKey: `md-code-${item.id}-t${codeIdx++}`,
             });
             thY += codeH + 8;
           } else if (mb.type === "table") {
@@ -1259,7 +1310,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           y += 25;
         } else if (mb.type === "code") {
           const codeText = mb.raw || segmentsPlainText(mb.segments);
-          const codeLines = wrapText(codeText, proseW - 28, 12.5, p.mono);
+          const codeLines = wrapCodeText(codeText, proseW - 28, 12.5, p.mono);
           const codeLh = 12.5 * 1.55;
           const codeH = codeLines.length * codeLh + 24; // padding 12*2
           pushMdCodeBlock(result, {
@@ -1267,7 +1318,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             x, y, w: proseW, h: codeH,
             text: codeText, color: p.text, bg: p.panel, border: p.border,
             borderRadius: 8, fontSize: 12.5, lineHeight: 1.55, font: p.mono,
-            padX: 14, padY: 12, lang: mb.lang,
+            padX: 14, padY: 12, lang: mb.lang, copyText: codeText,
             hoverKey: `md-code-${item.id}-${mi}`,
           });
           y += codeH + 10;
@@ -2032,7 +2083,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.fillStyle = b.color || p.text;
     ctx.textBaseline = "top";
     // Soft-wrap long lines (layout already sizes height via wrapText); do not rely on hard \n only.
-    const lines = b._lines || (b._lines = wrapText(b.text || "", innerW, fs, ff));
+    const lines = b._lines || (b._lines = wrapCodeText(b.text || "", innerW, fs, ff));
     b.textLines = [];
     let offset = 0;
     for (let i = 0; i < lines.length; i++) {

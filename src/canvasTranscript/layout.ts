@@ -23,6 +23,7 @@ import {
   drawIcon,
   drawSpinner,
   ellipsis,
+  expandTabs,
   font,
   measure,
   metrics,
@@ -519,7 +520,10 @@ function mdHeading(flow: Flow, tok: MkToken, opts: MdOpts, first: boolean): void
 
 function mdCode(flow: Flow, tok: MkToken, opts: MdOpts, id: number): void {
   const theme = flow.theme;
-  const text = String(tok.text ?? "").replace(/\n$/, "");
+  const rawText = String(tok.text ?? "").replace(/\n$/, "");
+  // Canvas fillText does not expand tabs; render with tab stops while keeping the
+  // original text for the copy action.
+  const text = expandTabs(rawText);
   const f = font(12.5, { mono: true });
   const lineH = 12.5 * 1.35;
   const padX = 14;
@@ -536,7 +540,7 @@ function mdCode(flow: Flow, tok: MkToken, opts: MdOpts, id: number): void {
     y: flow.y + 7,
     w: 23,
     h: 23,
-    action: { kind: "copy", id: groupId, text },
+    action: { kind: "copy", id: groupId, text: rawText },
     cursor: "pointer",
     title: "复制",
     groupId,

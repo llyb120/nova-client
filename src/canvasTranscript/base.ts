@@ -17,6 +17,27 @@ export function font(size: number, opts: FontOpts = {}): string {
   return `${opts.italic ? "italic " : ""}${opts.bold ? "600 " : ""}${size}px ${opts.mono ? MONO : SANS}`;
 }
 
+/** CanvasRenderingContext2D does not lay out tab characters like a <pre> does. */
+export function expandTabs(text: string, tabSize = 4): string {
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  let column = 0;
+  let result = "";
+  for (const ch of normalized) {
+    if (ch === "\n") {
+      result += ch;
+      column = 0;
+    } else if (ch === "\t") {
+      const spaces = tabSize - (column % tabSize);
+      result += " ".repeat(spaces);
+      column += spaces;
+    } else {
+      result += ch;
+      column++;
+    }
+  }
+  return result;
+}
+
 /* ===== 文本测量（带缓存） ===== */
 
 let measureCtx: CanvasRenderingContext2D | null = null;
