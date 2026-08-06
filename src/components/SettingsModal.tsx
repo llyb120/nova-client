@@ -1531,6 +1531,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge alkaid`}>{agentLabel("alkaid")}</span>
+                <span class="fixed-integration">PI</span>
                 <label class="backend-switch">
                   <input
                     type="checkbox"
@@ -1541,10 +1542,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <div class="backend-config-row">
-                <span class="fixed-integration">PI</span>
-                <span class="field-hint">复用本机 Codex provider 凭据，支持并行文件工具、MCP 与 Skills。</span>
-              </div>
+              <span class="field-hint">复用本机 Codex provider 凭据，支持并行文件工具、MCP 与 Skills。</span>
               <ProxyField value={vegaProxy()} onInput={setVegaProxy} />
               <div class="backend-quota-row">
                 <span class="field-label">本地配置</span>
@@ -1566,6 +1564,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge devin`}>{agentLabel("devin")}</span>
+                <span class="fixed-integration">ACP</span>
                 <Show when={backendMissing("devin")}>
                   <span class="backend-missing">未检测到 CLI</span>
                 </Show>
@@ -1587,18 +1586,15 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().devin}
                 onUpgrade={() => void upgradeCli("devin")}
               />
-              <div class="backend-config-row">
-                <span class="fixed-integration">ACP</span>
-                <div class="backend-fields">
-                  <label class="backend-field">
-                    <span class="field-label">可执行文件</span>
-                    <input class="field-input" value={devinPath()} onInput={(e) => setDevinPath(e.currentTarget.value)} placeholder="devin" />
-                  </label>
-                  <label class="backend-field">
-                    <span class="field-label">启动参数</span>
-                    <input class="field-input" value={acpArgs()} onInput={(e) => setAcpArgs(e.currentTarget.value)} placeholder="acp" />
-                  </label>
-                </div>
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">可执行文件</span>
+                  <input class="field-input" value={devinPath()} onInput={(e) => setDevinPath(e.currentTarget.value)} placeholder="devin" />
+                </label>
+                <label class="backend-field">
+                  <span class="field-label">启动参数</span>
+                  <input class="field-input" value={acpArgs()} onInput={(e) => setAcpArgs(e.currentTarget.value)} placeholder="acp" />
+                </label>
               </div>
               <ProxyField value={devinProxy()} onInput={setDevinProxy} />
               <div class="backend-quota-row">
@@ -1631,6 +1627,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge codebuddy`}>{agentLabel("codebuddy")}</span>
+                <span class="fixed-integration">SDK</span>
                 <Show when={backendMissing("codebuddy")}>
                   <span class="backend-missing">未检测到 CLI</span>
                 </Show>
@@ -1652,14 +1649,11 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().codebuddy}
                 onUpgrade={() => void upgradeCli("codebuddy")}
               />
-              <div class="backend-config-row">
-                <span class="fixed-integration">SDK</span>
-                <div class="backend-fields">
-                  <label class="backend-field">
-                    <span class="field-label">可执行文件</span>
-                    <input class="field-input" value={codebuddyPath()} onInput={(e) => setCodebuddyPath(e.currentTarget.value)} placeholder="codebuddy" />
-                  </label>
-                </div>
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">可执行文件</span>
+                  <input class="field-input" value={codebuddyPath()} onInput={(e) => setCodebuddyPath(e.currentTarget.value)} placeholder="codebuddy" />
+                </label>
               </div>
               <ProxyField value={codebuddyProxy()} onInput={setCodebuddyProxy} />
             </div>
@@ -1667,6 +1661,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge claudecode`}>{agentLabel("claudecode")}</span>
+                <span class="fixed-integration">SDK</span>
                 <Show when={backendMissing("claudecode")}>
                   <span class="backend-missing">未检测到 CLI</span>
                 </Show>
@@ -1688,18 +1683,15 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().claudecode}
                 onUpgrade={() => void upgradeCli("claudecode")}
               />
-              <div class="backend-config-row">
-                <span class="fixed-integration">SDK</span>
-                <div class="backend-fields">
-                  <label class="backend-field">
-                    <span class="field-label">可执行文件</span>
-                    <input class="field-input" value={claudecodePath()} onInput={(e) => setClaudecodePath(e.currentTarget.value)} placeholder="claude" />
-                  </label>
-                  <label class="backend-field backend-field-wide">
-                    <span class="field-label">Anthropic API Key</span>
-                    <input class="field-input" value={claudecodeSdkApiKey()} onInput={(e) => setClaudecodeSdkApiKey(e.currentTarget.value)} placeholder="留空使用环境/provider 凭据" />
-                  </label>
-                </div>
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">可执行文件</span>
+                  <input class="field-input" value={claudecodePath()} onInput={(e) => setClaudecodePath(e.currentTarget.value)} placeholder="claude" />
+                </label>
+                <label class="backend-field backend-field-wide">
+                  <span class="field-label">Anthropic API Key</span>
+                  <input class="field-input" value={claudecodeSdkApiKey()} onInput={(e) => setClaudecodeSdkApiKey(e.currentTarget.value)} placeholder="留空使用环境/provider 凭据" />
+                </label>
               </div>
               <ProxyField value={claudecodeProxy()} onInput={setClaudecodeProxy} />
             </div>
@@ -1707,6 +1699,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge codex`}>{agentLabel("codex")}</span>
+                <span class="fixed-integration">SDK</span>
                 <Show when={backendMissing("codex")}>
                   <span class="backend-missing">未检测到 CLI</span>
                 </Show>
@@ -1728,14 +1721,11 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().codex}
                 onUpgrade={() => void upgradeCli("codex")}
               />
-              <div class="backend-config-row">
-                <span class="fixed-integration">SDK</span>
-                <div class="backend-fields">
-                  <label class="backend-field">
-                    <span class="field-label">可执行文件</span>
-                    <input class="field-input" value={codexPath()} onInput={(e) => setCodexPath(e.currentTarget.value)} placeholder="codex" />
-                  </label>
-                </div>
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">可执行文件</span>
+                  <input class="field-input" value={codexPath()} onInput={(e) => setCodexPath(e.currentTarget.value)} placeholder="codex" />
+                </label>
               </div>
               <ProxyField value={codexProxy()} onInput={setCodexProxy} />
             </div>
@@ -1743,6 +1733,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge cursor`}>{agentLabel("cursor")}</span>
+                <span class="fixed-integration">SDK</span>
                 <label class="backend-switch">
                   <input
                     type="checkbox"
@@ -1753,14 +1744,11 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <div class="backend-config-row">
-                <span class="fixed-integration">SDK</span>
-                <div class="backend-fields">
-                  <label class="backend-field backend-field-wide">
-                    <span class="field-label">Cursor API Key</span>
-                    <input class="field-input" value={cursorSdkApiKey()} onInput={(e) => setCursorSdkApiKey(e.currentTarget.value)} placeholder="留空使用 CURSOR_API_KEY" />
-                  </label>
-                </div>
+              <div class="backend-fields">
+                <label class="backend-field backend-field-wide">
+                  <span class="field-label">Cursor API Key</span>
+                  <input class="field-input" value={cursorSdkApiKey()} onInput={(e) => setCursorSdkApiKey(e.currentTarget.value)} placeholder="留空使用 CURSOR_API_KEY" />
+                </label>
               </div>
               <ProxyField value={cursorProxy()} onInput={setCursorProxy} />
               <div class="cursor-context-config">
@@ -1819,6 +1807,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge opencode`}>{agentLabel("opencode")}</span>
+                <span class="fixed-integration">SDK</span>
                 <Show when={backendMissing("opencode")}>
                   <span class="backend-missing">未检测到 CLI</span>
                 </Show>
@@ -1840,14 +1829,11 @@ export function SettingsModal(props: { onClose: () => void }) {
                 message={cliMessages().opencode}
                 onUpgrade={() => void upgradeCli("opencode")}
               />
-              <div class="backend-config-row">
-                <span class="fixed-integration">SDK</span>
-                <div class="backend-fields">
-                  <label class="backend-field">
-                    <span class="field-label">可执行文件</span>
-                    <input class="field-input" value={opencodePath()} onInput={(e) => setOpencodePath(e.currentTarget.value)} placeholder="opencode" />
-                  </label>
-                </div>
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">可执行文件</span>
+                  <input class="field-input" value={opencodePath()} onInput={(e) => setOpencodePath(e.currentTarget.value)} placeholder="opencode" />
+                </label>
               </div>
               <ProxyField value={opencodeProxy()} onInput={setOpencodeProxy} />
             </div>

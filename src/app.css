@@ -4285,15 +4285,27 @@ button {
 }
 .backend-quota-refresh {
   margin-left: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
   font-size: 11.5px;
+}
+
+.backend-quota-row .field-label {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.backend-quota-row .field-hint {
+  flex: 1;
+  min-width: 0;
 }
 
 /* 模型后端配置卡片 */
 .backend-card {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 12px;
+  gap: 10px;
+  padding: 12px 14px 14px;
   border: 1px solid var(--card-border);
   border-radius: 10px;
   background: var(--bg-panel);
@@ -4302,27 +4314,28 @@ button {
 .backend-card-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
 }
 
-.backend-config-row {
-  display: flex;
-  align-items: end;
-  gap: 12px;
+.backend-card-head .backend-switch {
+  margin-left: auto;
 }
 
+/* 集成方式（PI / ACP / SDK）紧凑胶囊，位于卡片头部与 agent-badge 并列 */
 .fixed-integration {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 164px;
-  min-height: 34px;
-  border: 1px solid color-mix(in srgb, var(--accent) 84%, var(--border-strong));
-  border-radius: 8px;
-  color: var(--on-accent);
-  background: var(--accent);
-  font-size: 12px;
+  flex-shrink: 0;
+  height: 20px;
+  padding: 0 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+  border-radius: 6px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 11%, transparent);
+  font-size: 10.5px;
   font-weight: 600;
+  letter-spacing: 0.5px;
 }
 
 .backend-fields {
@@ -4350,13 +4363,9 @@ button {
 
 .backend-proxy-field {
   display: grid;
-  grid-template-columns: 164px minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  gap: 12px;
-}
-
-.backend-proxy-field .field-label {
-  text-align: right;
+  gap: 10px;
 }
 
 .backend-proxy-field .field-input {
@@ -4567,19 +4576,6 @@ button {
 }
 
 @media (max-width: 680px) {
-  .backend-config-row {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .fixed-integration {
-    width: 100%;
-  }
-
-  .fixed-integration {
-    flex-basis: auto;
-  }
-
   .backend-field-wide {
     grid-column: auto;
   }
@@ -4587,10 +4583,6 @@ button {
   .backend-proxy-field {
     grid-template-columns: 1fr;
     gap: 4px;
-  }
-
-  .backend-proxy-field .field-label {
-    text-align: left;
   }
 
   .cursor-context-row {
@@ -4621,8 +4613,6 @@ button {
 
 /* 后端可用性检测未通过的提示（设置→模型后端卡片头部） */
 .backend-missing {
-  margin-right: auto;
-  margin-left: 8px;
   font-size: 11px;
   color: var(--red);
   border: 1px solid color-mix(in srgb, var(--red) 36%, transparent);
