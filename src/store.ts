@@ -512,13 +512,37 @@ export function resolveEnabledAgentKind(kind: AgentKind): AgentKind {
   return list.includes(kind) ? kind : (list[0] ?? kind);
 }
 
+let refreshThreadsRequest = 0;
+// 事件版本比单纯比较 running 值可靠：同一状态的重复事件也不能被旧快照覆盖。
+const runningEventVersions = new Map<string, number>();
+// send_prompt 先乐观置忙，后端随后才会登记 manager.running；在这段窗口内刷新
+// list_threads 只能看到 false，额度租借创建线程时尤其容易撞上这个竞态。
+const optimisticRunningThreads = new Set<string>();
+
 export async function refreshThreads() {
+  const request = ++refreshThreadsRequest;
+  // list_threads 可能与 send_prompt 并发：额度会话创建后会立即触发一次刷新，
+  // 但后端此时还没来得及把异步 agent 任务登记为 running。记录请求开始时的
+  // 事件版本，若期间已经收到 acp:turn，就不能再用这份旧快照覆盖事件结果。
+  const runningVersionsBeforeRequest = new Map(runningEventVersions);
   const threads = await api.listThreads();
+  // 多次刷新并发时，较早的响应不能覆盖较新的响应。
+  if (request !== refreshThreadsRequest) return;
   // 按 id reconcile 而非整体替换：保留未变线程的对象身份，
   // 避免 <For> 重建整个列表 DOM 导致侧边栏滚动位置被重置
   setState("threads", reconcile(threads, { key: "id" }));
   const running: Record<string, boolean> = {};
-  for (const t of threads) running[t.id] = t.running;
+  for (const t of threads) {
+    // 运行事件在本次请求期间到达时，以事件为准；否则使用后端快照。
+    // 这样不会因额度租借的「创建线程刷新」竞态把实际运行态冲回 false。
+    const before = runningVersionsBeforeRequest.get(t.id) ?? 0;
+    const current = runningEventVersions.get(t.id) ?? 0;
+    running[t.id] = optimisticRunningThreads.has(t.id)
+      ? true
+      : current !== before
+        ? !!state.running[t.id]
+        : t.running;
+  }
   setState("running", running);
   for (const thread of threads.filter((thread) => thread.running).slice(0, THREAD_SNAPSHOT_LIMIT)) {
     preloadThreadSnapshot(thread.id);
@@ -1086,7 +1110,9 @@ export async function createQuotaThread(
     roamingPeer: peer.token,
     loadingThread: false,
   });
-  setState("running", t.id, false);
+  // 新线程通常紧接着就会由首页 sendPrompt 投递；不要在这里把后端尚未登记
+  // running 的瞬间覆盖掉事件/发送方的乐观忙碌态。
+  if (!optimisticRunningThreads.has(t.id)) setState("running", t.id, false);
   reportActivity(true);
   void refreshThreads();
   ensurePeerModels(peer.token);
@@ -1652,6 +1678,7 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
   }
   if (state.currentId === threadId) bumpChatScrollToBottom();
   setState("proposedPlan", null);
+  optimisticRunningThreads.add(threadId);
   setState("running", threadId, true);
   try {
     // 判断阶段被重新唤起时仍然只是验收者：补充内容要并入本轮核验，实现工作交给
@@ -1661,6 +1688,7 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
       : workflowOutbound ?? text;
     await api.sendPrompt(threadId, outbound, images);
   } catch (e) {
+    optimisticRunningThreads.delete(threadId);
     if (resumedFireStep && fireRelaySteps.get(threadId) === resumedFireStep) {
       fireRelaySteps.delete(threadId);
       suspendedFireRelaySteps.set(threadId, resumedFireStep);
@@ -2124,6 +2152,7 @@ export async function editUserMessage(itemId: number, text: string, images: Prom
 export async function cancelTurn(stopReason?: string, deleteWork = false) {
   const id = state.currentId;
   if (!id) return;
+  optimisticRunningThreads.delete(id);
   await api.cancelTurn(id, stopReason, deleteWork);
   // 部分后端的取消调用会先返回，结束事件稍后才到；主动释放前端忙碌态，
   // 避免停止成功后历史消息仍被 running 门控，必须切换会话才能编辑。
@@ -2416,7 +2445,10 @@ export async function initStore() {
   });
 
   await listen<TurnEvent>("acp:turn", (e) => {
-    setState("running", e.payload.threadId, e.payload.running);
+    const threadId = e.payload.threadId;
+    runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
+    optimisticRunningThreads.delete(threadId);
+    setState("running", threadId, e.payload.running);
     if (e.payload.running) {
       preloadThreadSnapshot(e.payload.threadId);
       // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
