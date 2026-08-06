@@ -65,7 +65,11 @@ export function ShareModal(props: {
   };
 
   return (
-    <div class="modal-backdrop" onClick={(e) => e.target === e.currentTarget && props.onClose()}>
+    <div
+      class="modal-backdrop"
+      // 用 mousedown 判断遮罩关闭，避免在弹窗内选中文字后拖到遮罩上松开时触发 click 关闭。
+      onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}
+    >
       <div
         class="modal"
         classList={{ "clue-capture-modal": mode() === "clue" }}
