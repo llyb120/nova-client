@@ -1,6 +1,11 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
+  promptHistory as globalPromptHistory,
+  rememberPromptHistory,
+  type PromptHistoryItem,
+} from "../promptHistory";
+import {
   dispatchQueuedPrompt,
   dispatchingQueueIds,
   enqueuePrompt,
@@ -46,13 +51,6 @@ import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 
-type PromptHistoryItem = {
-  id: string;
-  text: string;
-  ts: number;
-  images: PromptImage[];
-};
-
 const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
 
 export function Composer() {
@@ -60,7 +58,6 @@ export function Composer() {
   const [cursor, setCursor] = createSignal(0);
   const [slashStart, setSlashStart] = createSignal<number | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
-  const [sentHistory, setSentHistory] = createSignal<PromptHistoryItem[]>([]);
   const [historyOpen, setHistoryOpen] = createSignal(false);
   const [activeHistoryIndex, setActiveHistoryIndex] = createSignal(0);
   const [choosingWorkflowRoute, setChoosingWorkflowRoute] = createSignal(false);
@@ -265,8 +262,6 @@ export function Composer() {
   createEffect(() => {
     if (usesPeerModels() && state.roamingPeer) ensurePeerModels(state.roamingPeer);
   });
-  const currentHistoryPrefix = () => `${state.currentId ?? ""}:`;
-
   const updateSlashState = (el = textareaRef, allowOpen = false) => {
     if (!el) return;
     const value = el.value;
@@ -294,40 +289,26 @@ export function Composer() {
     return getSlashSuggestions(state.agentKind, state.slashCommands[state.agentKind], query);
   });
 
-  const promptHistory = createMemo(() => {
-    const currentId = state.currentId;
-    if (!currentId) return [];
-    const transcriptItems = state.items
-      .filter((item): item is Extract<(typeof state.items)[number], { type: "user" }> => item.type === "user")
-      .map((item) => ({
-        id: `${currentId}:item:${item.id}`,
-        text: item.text.trim(),
-        ts: item.ts,
-        images: item.images ?? [],
-      }));
-    const all = [
-      ...sentHistory().filter((item) => item.id.startsWith(currentHistoryPrefix())),
-      ...transcriptItems,
-    ]
-      .filter((item) => item.text)
-      .sort((a, b) => b.ts - a.ts);
-    const seen = new Set<string>();
-    return all.filter((item) => {
-      if (seen.has(item.text)) return false;
-      seen.add(item.text);
-      return true;
-    }).slice(0, 20);
-  });
-
   createEffect(() => {
     const count = slashSuggestions().length;
     if (activeSlashIndex() >= count) setActiveSlashIndex(Math.max(0, count - 1));
   });
 
   createEffect(() => {
-    const count = promptHistory().length;
+    const count = globalPromptHistory().length;
     if (activeHistoryIndex() >= count) setActiveHistoryIndex(Math.max(0, count - 1));
     if (count === 0 && historyOpen()) setHistoryOpen(false);
+  });
+
+  // 打开已有会话时，把后端保存的用户输入并入全局历史，供新会话页使用。
+  createEffect(() => {
+    const currentId = state.currentId;
+    if (!currentId) return;
+    for (const item of state.items) {
+      if (item.type === "user") {
+        rememberPromptHistory(item.text, item.images ?? [], item.ts, `${currentId}:item:${item.id}`);
+      }
+    }
   });
 
   createEffect(() => {
@@ -350,7 +331,7 @@ export function Composer() {
     const historyIsOpen = historyOpen();
     if (!slashOpen && !historyIsOpen) return;
     void slashSuggestions().length;
-    void promptHistory().length;
+    void globalPromptHistory().length;
     const sync = () => {
       if (slashOpen) fitSlashMenuHeight(slashMenuRef);
       if (historyIsOpen) fitSlashMenuHeight(historyMenuRef, { maxHeight: 300 });
@@ -393,16 +374,6 @@ export function Composer() {
     return !!(currentId && queueHeldThreadIds().has(currentId));
   });
 
-  const rememberSentPrompt = (currentId: string, value: string, images: PromptImage[]) => {
-    if (!value) return;
-    const now = Date.now();
-    const snapshot = images.map((image) => ({ ...image }));
-    setSentHistory((items) => [
-      { id: `${currentId}:sent:${now}`, text: value, ts: now, images: snapshot },
-      ...items.filter((item) => item.text !== value || !item.id.startsWith(`${currentId}:`)),
-    ].slice(0, 80));
-  };
-
   const clearInput = () => {
     setText("");
     setHistoryOpen(false);
@@ -439,7 +410,7 @@ export function Composer() {
     const images = attach.images().map((image) => ({ ...image }));
     const currentId = state.currentId;
     if (!currentId) return;
-    rememberSentPrompt(currentId, value, images);
+    rememberPromptHistory(value, images);
     clearInput();
     setEmployeeMenuOpen(false);
     if (running()) {
@@ -501,7 +472,7 @@ export function Composer() {
 
   const onKeyDown = (e: KeyboardEvent) => {
     const suggestions = slashSuggestions();
-    const history = promptHistory();
+    const history = globalPromptHistory();
     if (historyOpen() && history.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -718,7 +689,7 @@ export function Composer() {
       <Show when={historyOpen()}>
         <div ref={historyMenuRef} class="slash-menu prompt-history-menu">
           <div class="slash-menu-head">历史输入</div>
-          <For each={promptHistory()}>
+          <For each={globalPromptHistory()}>
             {(item, index) => (
               <button
                 type="button"

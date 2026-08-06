@@ -4,6 +4,11 @@ import { createComposerGhost } from "../composerGhost";
 import { api } from "../ipc";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
+  promptHistory,
+  rememberPromptHistory,
+  type PromptHistoryItem,
+} from "../promptHistory";
+import {
   createRoamingThread,
   createQuotaThread,
   createThread,
@@ -36,7 +41,7 @@ import { enabledWorkflows, employeeWorkflowName } from "../workflow/storage";
 import type { WorkflowDef } from "../workflow/types";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
-import { IconClue, IconFolder, IconLogo, IconMerge, IconSend, IconUsers, IconX } from "./icons";
+import { IconClue, IconFile, IconFolder, IconLogo, IconMerge, IconSend, IconUsers, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
@@ -118,6 +123,7 @@ export function HomeView() {
   let submittingPrompt = false;
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
+  let historyMenuRef: HTMLDivElement | undefined;
   let employeePickerRef: HTMLDivElement | undefined;
   let workflowPickerRef: HTMLDivElement | undefined;
   type PrewarmTarget = {
@@ -227,6 +233,38 @@ export function HomeView() {
     const query = slashQuery();
     if (query === null) return [];
     return getSlashSuggestions(agentKind(), state.slashCommands[agentKind()], query);
+  });
+  const [historyOpen, setHistoryOpen] = createSignal(false);
+  const [activeHistoryIndex, setActiveHistoryIndex] = createSignal(0);
+
+  createEffect(() => {
+    const count = promptHistory().length;
+    if (activeHistoryIndex() >= count) setActiveHistoryIndex(Math.max(0, count - 1));
+    if (count === 0 && historyOpen()) setHistoryOpen(false);
+  });
+
+  createEffect(() => {
+    activeHistoryIndex();
+    historyMenuRef
+      ?.querySelector(".prompt-history-item.active")
+      ?.scrollIntoView({ block: "nearest" });
+  });
+
+  // 首页历史菜单与 slash 菜单一样向上展开，并限制在输入框上方的空间内。
+  createEffect(() => {
+    if (!historyOpen()) return;
+    void promptHistory().length;
+    const sync = () => fitSlashMenuHeight(historyMenuRef, { maxHeight: 300 });
+    const frame = requestAnimationFrame(sync);
+    const host = textareaRef?.closest(".composer, .home-composer");
+    const ro = host instanceof HTMLElement ? new ResizeObserver(sync) : undefined;
+    if (host instanceof HTMLElement) ro?.observe(host);
+    window.addEventListener("resize", sync);
+    onCleanup(() => {
+      cancelAnimationFrame(frame);
+      ro?.disconnect();
+      window.removeEventListener("resize", sync);
+    });
   });
 
   createEffect(() => {
@@ -575,6 +613,7 @@ export function HomeView() {
     const typedSlash = e.inputType === "insertText" && e.data === "/";
     const trackingSlash = slashStart() !== null;
     setText(el.value);
+    if (historyOpen()) setHistoryOpen(false);
     noteFlow.bump();
     if (typedSlash) void refreshSlashCommands(agentKind());
     updateSlashState(el, typedSlash || trackingSlash);
@@ -618,6 +657,7 @@ export function HomeView() {
     const base = wtOn ? opts.base?.trim() ?? "" : "";
     if (wtOn && !branch && !base) return; // 新分支名与基于分支至少填一个（留空分支名 = 直接用所选分支）
     submittingPrompt = true;
+    rememberPromptHistory(t, images);
     setQuotaCancelling(false);
     setBusy(true);
     try {
@@ -804,6 +844,20 @@ export function HomeView() {
     });
   };
 
+  const insertHistoryItem = (item: PromptHistoryItem) => {
+    const nextCursor = item.text.length;
+    setText(item.text);
+    attach.set(item.images ?? []);
+    setHistoryOpen(false);
+    setSlashStart(null);
+    setCursor(nextCursor);
+    queueMicrotask(() => {
+      textareaRef?.focus();
+      textareaRef?.setSelectionRange(nextCursor, nextCursor);
+      resizeInput();
+    });
+  };
+
   const restoreDraft = () => {
     const draft = takePromptDraft();
     if (!draft) return false;
@@ -822,6 +876,32 @@ export function HomeView() {
 
   const onKeyDown = (e: KeyboardEvent) => {
     const suggestions = slashSuggestions();
+    const history = promptHistory();
+    if (historyOpen() && history.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setActiveHistoryIndex((i) => (i + 1) % history.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setActiveHistoryIndex((i) => (i - 1 + history.length) % history.length);
+        return;
+      }
+      if (
+        e.key === "Tab" ||
+        (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.isComposing)
+      ) {
+        e.preventDefault();
+        insertHistoryItem(history[activeHistoryIndex()] ?? history[0]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setHistoryOpen(false);
+        return;
+      }
+    }
     if (slashQuery() !== null && suggestions.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -848,6 +928,13 @@ export function HomeView() {
       return;
     }
     if (ghostCtl.handleKeyDown(e)) return;
+    if (e.key === "ArrowUp" && !text().trim() && attach.images().length === 0 && history.length > 0) {
+      e.preventDefault();
+      setSlashStart(null);
+      setActiveHistoryIndex(0);
+      setHistoryOpen(true);
+      return;
+    }
     if (
       e.key === "ArrowDown" &&
       !text().trim() &&
@@ -949,6 +1036,32 @@ export function HomeView() {
                   )}
                 </For>
               </Show>
+            </div>
+          </Show>
+          <Show when={historyOpen()}>
+            <div ref={historyMenuRef} class="slash-menu prompt-history-menu">
+              <div class="slash-menu-head">历史输入</div>
+              <For each={promptHistory()}>
+                {(item, index) => (
+                  <button
+                    type="button"
+                    classList={{ "prompt-history-item": true, active: index() === activeHistoryIndex() }}
+                    onMouseEnter={() => setActiveHistoryIndex(index())}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      insertHistoryItem(item);
+                    }}
+                  >
+                    <span class="prompt-history-text">{item.text}</span>
+                    <Show when={item.images.length > 0}>
+                      <span class="prompt-history-attach" title={`${item.images.length} 个附件`}>
+                        <IconFile size={12} />
+                        {item.images.length}
+                      </span>
+                    </Show>
+                  </button>
+                )}
+              </For>
             </div>
           </Show>
           <div class="composer-input-wrap">
