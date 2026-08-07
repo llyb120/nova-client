@@ -739,7 +739,9 @@ function drawToolIcon(ctx: CanvasRenderingContext2D, kind: string, x: number, y:
 
 // ─── Block types ─────────────────────────────────────────────────────────────
 
-interface TextLine { text: string; x: number; y: number; w: number; offset: number; fs: number; lh: number; bold?: boolean; italic?: boolean; code?: boolean; link?: string; charX?: number[]; sepAfter?: string; }
+interface TextLine { text: string; x: number; y: number; w: number; offset: number; fs: number; lh: number; bold?: boolean; italic?: boolean; code?: boolean; link?: string; charX?: number[]; sepAfter?: string;
+  /** markdown 表格单元格坐标（行/列）：复制时按可视行重组成表格结构 */
+  tRow?: number; tCol?: number; }
 interface Block {
   kind: string; id: number; groupIdx: number;
   x: number; y: number; w: number; h: number;
@@ -787,6 +789,12 @@ function selectionText(blocks: Block[], sel: Selection): string {
     if (!b?.selectable) continue;
     const sOff = i === from ? fromOff : 0;
     const eOff = i === to ? toOff : Number.POSITIVE_INFINITY;
+    // 表格：按可视行重组单元格，输出行内 " | "、行间 "\n" 的表格结构
+    if (b.kind === "md-table" && b.textLines?.length) {
+      const t = tableSelectionText(b, sOff, eOff);
+      if (t) parts.push(t);
+      continue;
+    }
     // 选区 offset 来自 textLines（含 wrap/trim），不能直接 slice 原始 b.text
     if (b.textLines?.length) {
       const picked: { text: string; sep: string }[] = [];
@@ -813,8 +821,72 @@ function selectionText(blocks: Block[], sel: Selection): string {
   return parts.join("\n");
 }
 
+/** 表格选区复制：按可视行重组单元格。同一行单元格用 " | " 连接、行间换行；
+ *  选区包含表头且跨行时输出 GitHub 风格 markdown 表格（含 | --- | 分隔行）。 */
+function tableSelectionText(b: Block, sOff: number, eOff: number): string {
+  const cells: { row: number; col: number; pieces: { text: string; sep: string }[] }[] = [];
+  for (const ln of b.textLines!) {
+    const lineEnd = ln.offset + ln.text.length;
+    if (eOff <= ln.offset || sOff >= lineEnd) continue;
+    const a = Math.max(0, sOff - ln.offset);
+    const c = Math.min(ln.text.length, eOff - ln.offset);
+    const row = ln.tRow ?? 0;
+    const col = ln.tCol ?? 0;
+    // textLines 按 行→列→折行 顺序生成，同一单元格的折行必然相邻
+    let cell = cells[cells.length - 1];
+    if (!cell || cell.row !== row || cell.col !== col) {
+      cell = { row, col, pieces: [] };
+      cells.push(cell);
+    }
+    cell.pieces.push({ text: ln.text.slice(a, c), sep: ln.sepAfter ?? " " });
+  }
+  const rowMap = new Map<number, string[]>();
+  for (const cell of cells) {
+    let txt = "";
+    for (let pi = 0; pi < cell.pieces.length; pi++) {
+      txt += cell.pieces[pi].text;
+      // 单元格内折行按行尾连接符拼接（词内折行直接相连，空白折行补空格）
+      if (pi < cell.pieces.length - 1) txt += cell.pieces[pi].sep;
+    }
+    if (!txt) continue;
+    const arr = rowMap.get(cell.row) ?? [];
+    arr.push(txt);
+    rowMap.set(cell.row, arr);
+  }
+  const rowIdxs = [...rowMap.keys()].sort((x, y) => x - y);
+  if (!rowIdxs.length) return "";
+  const withHeader = rowIdxs[0] === 0 && rowIdxs.length > 1;
+  const lines = rowIdxs.map((r) => {
+    const joined = rowMap.get(r)!.join(" | ");
+    return withHeader ? `| ${joined} |` : joined;
+  });
+  if (withHeader) {
+    const cols = rowMap.get(0)!.length;
+    lines.splice(1, 0, `| ${new Array(cols).fill("---").join(" | ")} |`);
+  }
+  return lines.join("\n");
+}
+
 function blockScrollKey(b: Block): string {
   return `${b.kind}:${b.id}:${b.text?.length ?? 0}:${(b.data?.fullH as number) ?? b.h}`;
+}
+
+/** 双击选词的字符分类：空白 / 词字符（字母数字下划线及 CJK）/ 标点。
+ *  与浏览器一致，双击选中光标周围同类字符的连续串。 */
+function wordClass(ch: string): number {
+  if (/\s/.test(ch)) return 0;
+  if (/[\w\u3400-\u9fff\uf900-\ufaff]/.test(ch)) return 1;
+  return 2;
+}
+
+/** 定位 offset 所在的视觉行（offset 落在行尾与下一行行首之间时归前一行）。 */
+function lineAtOffset(b: Block, offset: number): TextLine | null {
+  const lines = b.textLines;
+  if (!lines?.length) return null;
+  for (const ln of lines) {
+    if (offset >= ln.offset && offset <= ln.offset + ln.text.length) return ln;
+  }
+  return offset < lines[0].offset ? lines[0] : lines[lines.length - 1];
 }
 
 // ─── Main component ──────────────────────────────────────────────────────────
@@ -862,6 +934,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let selection: Selection | null = null;
   let selecting = false;
   let selStart: { block: number; offset: number } | null = null;
+  /** 本次按压是否拖出了非空选区：用于 click 时区分点选与拖选 */
+  let selMoved = false;
+  /** 连击计数（双击选词 / 三击选行）：按时间间隔与位置抖动判定 */
+  let lastClick = { t: 0, count: 0, x: 0, y: 0 };
 
   // render loop (busy spinners)
   let rafId = 0;
@@ -2293,6 +2369,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               lh: lineH,
               charX,
               sepAfter: cellSeps[r]?.[c]?.[li] ?? "\n",
+              tRow: r,
+              tCol: c,
             });
             charOff += line.length + 1;
           }
@@ -2304,40 +2382,65 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
     b.textLines = b._textLines;
 
-    // 绘制按行做视口裁剪，跳过不可见行的描边/填充/文本
+    // 表头背景（DOM 版表头底色）
+    const headerH = rowHeights[0] || fs * TABLE_LH + TABLE_PAD_Y * 2;
+    if (cellLines.length && by + headerH >= -10 && by <= viewH + 10) {
+      ctx.fillStyle = p.panel;
+      ctx.globalAlpha = 0.55;
+      ctx.fillRect(bx, by, b.w, headerH);
+      ctx.globalAlpha = 1;
+    }
+    // 折叠边框：对齐 DOM border-collapse: collapse，整表网格一次描边，
+    // 避免此前每个单元格各描一条边导致相邻边重叠成双线
+    const gridW = colWidths.reduce((sum, cw) => sum + cw, 0);
+    const gridH = rowHeights.reduce((sum, rh) => sum + rh, 0);
+    ctx.strokeStyle = border;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    let gridY = by;
+    for (let r = 0; r <= cellLines.length; r++) {
+      const yy = Math.round(gridY) + 0.5;
+      ctx.moveTo(bx, yy);
+      ctx.lineTo(bx + gridW, yy);
+      gridY += rowHeights[r] ?? 0;
+    }
+    let gridX = bx;
+    for (let c = 0; c <= colWidths.length; c++) {
+      const xx = Math.round(gridX) + 0.5;
+      ctx.moveTo(xx, by);
+      ctx.lineTo(xx, by + gridH);
+      gridX += colWidths[c] ?? 0;
+    }
+    ctx.stroke();
+
+    // 文本绘制按行做视口裁剪，跳过不可见行
     let rowY = by;
     for (let r = 0; r < cellLines.length; r++) {
       const rh = rowHeights[r] || fs * TABLE_LH + TABLE_PAD_Y * 2;
       const rowVisible = rowY + rh >= -10 && rowY <= viewH + 10;
       let cellX = bx;
-      if (rowVisible && r === 0) {
-        ctx.fillStyle = p.panel;
-        ctx.globalAlpha = 0.55;
-        ctx.fillRect(bx, rowY, b.w, rh);
-        ctx.globalAlpha = 1;
-      }
       for (let c = 0; c < colWidths.length; c++) {
         const cw = colWidths[c];
         if (rowVisible && cellX + cw >= -10 && cellX <= viewW + 10) {
           const lines = cellLines[r]?.[c] || [""];
           const fw = r === 0 ? "600" : "400";
           const align = aligns[c] || "left";
-          ctx.strokeStyle = border;
-          ctx.lineWidth = 1;
-          ctx.strokeRect(cellX + 0.5, rowY + 0.5, cw - 1, rh - 1);
           ctx.fillStyle = b.color || p.text;
           ctx.font = `${fw} ${fs}px ${ff}`;
           ctx.textBaseline = "top";
           const lineH = fs * TABLE_LH;
           const contentH = lines.length * lineH;
           const textTop = rowY + Math.max(TABLE_PAD_Y, (rh - contentH) / 2);
+          // 文字在行高内垂直居中（与代码块 halfLead、DOM line-height 一致），
+          // 此前从行槽顶直接画，视觉上每行文字偏上、行间距下坠
+          const halfLead = (lineH - fs) / 2;
           for (let li = 0; li < lines.length; li++) {
             const line = lines[li];
             const tw = measure(line, fs, ff, fw); // 对齐需要宽度；measure 有缓存
             let tx = cellX + TABLE_PAD_X;
             if (align === "center") tx = cellX + (cw - tw) / 2;
             else if (align === "right") tx = cellX + cw - TABLE_PAD_X - tw;
-            fillTextCrisp(ctx, line, tx, textTop + li * lineH);
+            fillTextCrisp(ctx, line, tx, textTop + li * lineH + halfLead);
           }
         }
         cellX += cw;
@@ -2410,7 +2513,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   function paintSelection(ctx: CanvasRenderingContext2D) {
     if (!selection) return;
     ctx.save();
-    ctx.fillStyle = "rgba(74, 144, 217, 0.35)";
+    // 对齐 DOM ::selection（app.css: color-mix(in srgb, var(--accent) 30%, transparent)）
+    ctx.fillStyle = pal.accent;
+    ctx.globalAlpha = 0.3;
     // 同 block 内从下往上也要按 offset 判向，否则 fromOff>toOff 导致高亮宽度为负
     const forward =
       selection.startBlock < selection.endBlock ||
@@ -2447,8 +2552,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           x0 = ln.x + measure(ln.text.slice(0, a), ln.fs, b.font || pal.sans, b.fontWeight);
           x1 = ln.x + measure(ln.text.slice(0, bEnd), ln.fs, b.font || pal.sans, b.fontWeight);
         }
-        const halfLead = (ln.lh - ln.fs) / 2;
-        ctx.fillRect(x0, ly - scrollY + halfLead, x1 - x0, ln.fs);
+        // 选区越过行尾换行符时，DOM 会在行尾多画一小段（换行符宽度），补一个空格宽
+        if (eOff > lineEnd) x1 += measure(" ", ln.fs, b.font || pal.sans, b.fontWeight);
+        // DOM 选区高亮覆盖整行 line-height，而不是字号高度
+        ctx.fillRect(x0, ly - scrollY, x1 - x0, ln.lh);
       }
       if (clipped) ctx.restore();
     }
@@ -2520,25 +2627,29 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     return -1;
   }
 
+  /**
+   * 命中最近的文本位置（对齐 DOM 选区行为）：不要求指针精确落在行内，
+   * 垂直方向取最近行、水平方向越界时收敛到行首/行尾，
+   * 因此空白区域、行距、块间距都能发起/延续选区，拖动经过空隙也不会卡住。
+   */
   function hitTextPosition(clientX: number, clientY: number): { block: number; offset: number } | null {
     const rect = canvasEl.getBoundingClientRect();
     const mx = clientX - rect.left;
     const my = clientY - rect.top + scrollY;
-    let best: { block: number; offset: number; xDist: number } | null = null;
+    let best: { block: number; offset: number; dy: number; dx: number } | null = null;
     for (let i = 0; i < blocks.length; i++) {
       const b = blocks[i];
       if (!b.textLines || !b.selectable) continue;
-      if (b.data?.clipped && (my < b.y || my >= b.y + b.h)) continue;
       // textLines 的 y 不含内滚偏移，命中判定时换算
       const bScr = b.data?.clipped ? (blockScrolls.get(blockScrollKey(b)) || 0) : 0;
       for (const ln of b.textLines) {
         const ly = ln.y - bScr;
         if (b.data?.clipped && (ly + ln.lh <= b.y || ly >= b.y + b.h)) continue;
-        if (my < ly || my >= ly + ln.lh) continue;
+        const dy = my < ly ? ly - my : my >= ly + ln.lh ? my - (ly + ln.lh) : 0;
         // 表格同行多列共享同一 y：按水平距离选最近行，避免永远命中左侧单元格
         const lineRight = ln.x + Math.max(ln.w, 1);
-        const xDist = mx < ln.x ? ln.x - mx : mx > lineRight ? mx - lineRight : 0;
-        if (best && xDist >= best.xDist) continue;
+        const dx = mx < ln.x ? ln.x - mx : mx > lineRight ? mx - lineRight : 0;
+        if (best && (dy > best.dy || (dy === best.dy && dx >= best.dx))) continue;
         let off = ln.offset + ln.text.length;
         if (ln.charX) {
           for (let c = 0; c < ln.text.length; c++) {
@@ -2553,7 +2664,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             if (mx < (left + right) / 2) { off = ln.offset + c; break; }
           }
         }
-        best = { block: i, offset: off, xDist };
+        best = { block: i, offset: off, dy, dx };
       }
     }
     return best ? { block: best.block, offset: best.offset } : null;
@@ -2565,10 +2676,17 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       return;
     }
     if (selecting) {
+      // 拖出视口上下边缘时跟随滚动（对齐 DOM 拖拽选区的自动滚动）
+      const rect = canvasEl.getBoundingClientRect();
+      if (e.clientY < rect.top) applyScrollY(scrollY - Math.min(48, rect.top - e.clientY), true);
+      else if (e.clientY > rect.bottom) applyScrollY(scrollY + Math.min(48, e.clientY - rect.bottom), true);
       const pos = hitTextPosition(e.clientX, e.clientY);
       if (pos && selStart) {
         selection = { startBlock: selStart.block, startOffset: selStart.offset,
           endBlock: pos.block, endOffset: pos.offset };
+        if (selection.startBlock !== selection.endBlock || selection.startOffset !== selection.endOffset) {
+          selMoved = true;
+        }
         requestPaint();
       }
       return;
@@ -2586,7 +2704,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (idx !== hoverBlockIdx) {
       hoverBlockIdx = idx;
       const b = idx >= 0 ? blocks[idx] : null;
-      canvasEl.style.cursor = b?.cursor || (b?.selectable ? "text" : "default");
+      // 空白区域也能发起选区（对齐 DOM），无专属光标时一律显示文本光标；
+      // 只有纯点击块（不可选的折叠头/按钮等）保持默认光标
+      canvasEl.style.cursor = b?.cursor || (b?.selectable || !b?.clickAction ? "text" : "default");
       canvasEl.title = b?.title ?? "";
       requestPaint();
     }
@@ -2606,6 +2726,44 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function onScrollDragUp(_e: MouseEvent) {
     endScrollDrag();
+  }
+
+  /** 双击：选中光标所在词（同类字符连续串），对齐 DOM 双击选词。 */
+  function selectWordAt(blockIdx: number, offset: number): boolean {
+    const b = blocks[blockIdx];
+    if (!b) return false;
+    const ln = lineAtOffset(b, offset);
+    if (!ln || !ln.text.length) return false;
+    let i = Math.min(Math.max(0, offset - ln.offset), ln.text.length - 1);
+    // 点在两个字符边界上且右侧是空白时，选左侧的词
+    if (i > 0 && wordClass(ln.text[i]) === 0 && wordClass(ln.text[i - 1]) !== 0) i--;
+    const cls = wordClass(ln.text[i]);
+    let s = i;
+    let e = i + 1;
+    while (s > 0 && wordClass(ln.text[s - 1]) === cls) s--;
+    while (e < ln.text.length && wordClass(ln.text[e]) === cls) e++;
+    selection = { startBlock: blockIdx, startOffset: ln.offset + s, endBlock: blockIdx, endOffset: ln.offset + e };
+    return true;
+  }
+
+  /** 三击：选中逻辑行（段落）。软折行（sepAfter 为 ""/" "）向前后合并成一段，
+   *  与 DOM 三击选段落一致；代码/逐行内容每行都是硬换行，即选单行。 */
+  function selectLineAt(blockIdx: number, offset: number): boolean {
+    const b = blocks[blockIdx];
+    if (!b?.textLines?.length) return false;
+    const ln = lineAtOffset(b, offset);
+    if (!ln) return false;
+    const lines = b.textLines;
+    const idx = lines.indexOf(ln);
+    let s = idx;
+    while (s > 0 && (lines[s - 1].sepAfter ?? "\n") !== "\n") s--;
+    let e = idx;
+    while (e < lines.length - 1 && (lines[e].sepAfter ?? "\n") !== "\n") e++;
+    selection = {
+      startBlock: blockIdx, startOffset: lines[s].offset,
+      endBlock: blockIdx, endOffset: lines[e].offset + lines[e].text.length,
+    };
+    return true;
   }
 
   function onMouseDown(e: MouseEvent) {
@@ -2634,24 +2792,46 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       return;
     }
 
-    const idx = hitTest(e.clientX, e.clientY);
-    const b = idx >= 0 ? blocks[idx] : null;
-
-    if (b?.selectable) {
-      clearCanvasChatSelection();
-      const pos = hitTextPosition(e.clientX, e.clientY);
-      if (pos) {
-        selecting = true;
-        selStart = pos;
-        selection = { startBlock: pos.block, startOffset: pos.offset, endBlock: pos.block, endOffset: pos.offset };
-        canvasEl.focus();
+    // 与 DOM 一致：任意位置（含空白、行距、块间距）按下都允许发起文本选区；
+    // 不拖动的点击仍由 click 事件触发 clickAction（靠 selMoved 区分点选与拖选）
+    clearCanvasChatSelection();
+    // 连击判定：500ms 内且位置基本不动
+    const nowT = performance.now();
+    const nearLast = (e.clientX - lastClick.x) ** 2 + (e.clientY - lastClick.y) ** 2 < 36;
+    const clickCount = nowT - lastClick.t < 500 && nearLast ? lastClick.count + 1 : 1;
+    lastClick = { t: nowT, count: clickCount, x: e.clientX, y: e.clientY };
+    const pos = hitTextPosition(e.clientX, e.clientY);
+    if (pos && clickCount >= 2) {
+      // 双击选词 / 三击选行（对齐 DOM），选中后不进入拖选
+      const ok = clickCount === 2 ? selectWordAt(pos.block, pos.offset) : selectLineAt(pos.block, pos.offset);
+      if (ok) {
+        selecting = false;
+        selMoved = true;
+        if (selection) setCanvasChatSelection(selectionText(blocks, selection));
         requestPaint();
         return;
       }
     }
+    if (pos) {
+      selecting = true;
+      selMoved = false;
+      selStart = pos;
+      selection = { startBlock: pos.block, startOffset: pos.offset, endBlock: pos.block, endOffset: pos.offset };
+      canvasEl.focus();
+      // 拖出 canvas 后仍能延续选区/自动滚动，松开时收尾（对齐 DOM 拖拽选区）
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onSelectDocUp);
+      requestPaint();
+      return;
+    }
     selection = null;
-    clearCanvasChatSelection();
     requestPaint();
+  }
+
+  function onSelectDocUp(e: MouseEvent) {
+    document.removeEventListener("mousemove", onMouseMove);
+    document.removeEventListener("mouseup", onSelectDocUp);
+    onMouseUp(e);
   }
 
   function onMouseUp(_e: MouseEvent) {
@@ -2673,6 +2853,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function onClick(e: MouseEvent) {
     if (hitScrollbar(e.clientX, e.clientY)) return;
+    // 拖选结束的 click 不触发折叠/按钮动作（DOM 中拖选也不会触发点击）
+    if (selMoved) {
+      selMoved = false;
+      return;
+    }
     const idx = hitTest(e.clientX, e.clientY);
     const b = idx >= 0 ? blocks[idx] : null;
     if (b?.clickAction && !selecting) {
