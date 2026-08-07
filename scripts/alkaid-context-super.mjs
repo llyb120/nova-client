@@ -52,7 +52,7 @@ function messageWithSlimMemory(text, memory) {
 
 async function prompt(request, commands) {
   const input = await alkaidPromptInput(request.parts);
-  const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
+  const config = await loadAlkaidConfig({ root: dataRoot });
   const resolved = resolveAlkaidModel(config, request.model);
   const sessionId = request.sessionId || randomUUID();
   // The previous super-context build forced slim memory on at bundle time.

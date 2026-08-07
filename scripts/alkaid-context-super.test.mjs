@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js";
 import { getShellConfig } from "../node_modules/@earendil-works/pi-coding-agent/dist/utils/shell.js";
-import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
+import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, parseJsonc, resolveAlkaidModel } from "./alkaid-config.mjs";
 import { ALKAID_PROVIDER_DIAGNOSTIC_LOG, alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
 import { appendSlimTurn, compactSlimMemory, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-context-super-memory.mjs";
 import {
@@ -109,31 +109,6 @@ test("OpenCode-style JSONC config resolves providers and models", () => {
   assert.throws(() => resolveAlkaidModel(config, "custom/gpt-test/variant/max"), /不支持思考强度/);
   delete config.model;
   assert.equal(resolveAlkaidModel(config).thinkingLevel, "medium");
-});
-
-test("server Alkaid config is merged in memory with local values winning", () => {
-  const merged = mergeAlkaidConfig(
-    {
-      model: "server/server-model",
-      provider: {
-        server: { options: { baseURL: "https://server.example/v1", apiKey: "server-key" }, models: { "server-model": { name: "Server" } } },
-        shared: { options: { baseURL: "https://server-shared/v1", apiKey: "server-key" }, models: { remote: { name: "Remote" }, same: { name: "Server Same" } } },
-      },
-    },
-    {
-      model: "shared/same",
-      provider: {
-        shared: { options: { apiKey: "local-key" }, models: { same: { name: "Local Same" }, local: { name: "Local" } } },
-      },
-    },
-  );
-  assert.equal(merged.model, "shared/same");
-  assert.equal(merged.provider.shared.options.baseURL, "https://server-shared/v1");
-  assert.equal(merged.provider.shared.options.apiKey, "local-key");
-  assert.equal(merged.provider.shared.models.remote.name, "Remote");
-  assert.equal(merged.provider.shared.models.same.name, "Local Same");
-  assert.equal(merged.provider.shared.models.local.name, "Local");
-  assert.equal(merged.provider.server.models["server-model"].name, "Server");
 });
 
 test("PI coding tools provide read, bash, edit and write", async () => {

@@ -9,7 +9,7 @@ import test from "node:test";
 import { createCodingTools, createReadOnlyTools } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js";
 import { getShellConfig } from "../node_modules/@earendil-works/pi-coding-agent/dist/utils/shell.js";
 import { startedToolItem } from "./alkaid-bridge-common.mjs";
-import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, mergeAlkaidConfig, parseJsonc, resolveAlkaidConfigEnv, resolveAlkaidModel } from "./alkaid-config.mjs";
+import { alkaidDataRoot, alkaidModelOptions, mergeAlkaidCompatDefaults, parseJsonc, resolveAlkaidConfigEnv, resolveAlkaidModel } from "./alkaid-config.mjs";
 import { ALKAID_PROVIDER_DIAGNOSTIC_LOG, alkaidDiagnosticEndpoint, createAlkaidDiagnosticLog } from "./alkaid-diagnostics.mjs";
 import { appendSlimTurn, compactNativeToolResults, compactSlimMemory, contextPressureTier, contextTokensFromMessages, createSlimMemory, estimateContextTokens, formatSlimMemory, memoryWithoutCurrent, rebaseNativeContextForSlimMemory, setLatestConclusion, shouldUseFullContext, stripCompletedOpenAIReasoning } from "./alkaid-slim-memory.mjs";
 import {
@@ -125,31 +125,6 @@ test("OpenCode-style JSONC config resolves providers and models", () => {
   assert.equal(resolveAlkaidModel(config).thinkingLevel, "medium");
 });
 
-test("server Alkaid config is merged in memory with local values winning", () => {
-  const merged = mergeAlkaidConfig(
-    {
-      model: "server/server-model",
-      provider: {
-        server: { options: { baseURL: "https://server.example/v1", apiKey: "server-key" }, models: { "server-model": { name: "Server" } } },
-        shared: { options: { baseURL: "https://server-shared/v1", apiKey: "server-key" }, models: { remote: { name: "Remote" }, same: { name: "Server Same" } } },
-      },
-    },
-    {
-      model: "shared/same",
-      provider: {
-        shared: { options: { apiKey: "local-key" }, models: { same: { name: "Local Same" }, local: { name: "Local" } } },
-      },
-    },
-  );
-  assert.equal(merged.model, "shared/same");
-  assert.equal(merged.provider.shared.options.baseURL, "https://server-shared/v1");
-  assert.equal(merged.provider.shared.options.apiKey, "local-key");
-  assert.equal(merged.provider.shared.models.remote.name, "Remote");
-  assert.equal(merged.provider.shared.models.same.name, "Local Same");
-  assert.equal(merged.provider.shared.models.local.name, "Local");
-  assert.equal(merged.provider.server.models["server-model"].name, "Server");
-});
-
 test("quota sharing export resolves env placeholders recursively", () => {
   const env = { NOVA_TEST_KEY: "secret-value" };
   const resolved = resolveAlkaidConfigEnv({
@@ -170,7 +145,7 @@ test("quota sharing export resolves env placeholders recursively", () => {
   assert.throws(() => resolveAlkaidConfigEnv({ apiKey: "{env:NOVA_MISSING_KEY}" }, env));
 });
 
-test("bridge export merges server config and resolves env secrets for quota sharing", async () => {
+test("bridge export uses local config and resolves env secrets for quota sharing", async () => {
   const home = await mkdtemp(join(tmpdir(), "alkaid-export-"));
   const dataRoot = join(home, ".nova", "alkaid");
   await mkdir(dataRoot, { recursive: true });
@@ -201,10 +176,10 @@ test("bridge export merges server config and resolves env secrets for quota shar
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   child.stdin.write(`${JSON.stringify({
     action: "export",
+    // 兼容旧请求字段，但服务端/Relay 配置不得再影响额度导出。
     alkaidServerConfig: {
       provider: {
         shared: {
-          npm: "@ai-sdk/openai-compatible",
           options: { baseURL: "https://server.example/v1" },
           models: { "server-model": { name: "Server" } },
         },
@@ -230,11 +205,11 @@ test("bridge export merges server config and resolves env secrets for quota shar
     .find((event) => "ok" in event);
   assert.equal(response?.ok, true, `stdout: ${stdout}\nstderr: ${stderr}`);
   const shared = JSON.parse(response.data);
-  // 服务端基线 + 本地覆盖；密钥占位符解析为字面量
-  assert.equal(shared.provider.shared.options.baseURL, "https://server.example/v1");
+  // 仅导出本地配置；密钥占位符解析为字面量
+  assert.equal(shared.provider.shared.options.baseURL, undefined);
   assert.equal(shared.provider.shared.options.apiKey, "resolved-key");
   assert(shared.provider.shared.models["local-model"]);
-  assert(shared.provider.shared.models["server-model"]);
+  assert.equal(shared.provider.shared.models["server-model"], undefined);
   assert.equal(shared.root, undefined);
   assert.equal(shared.env, undefined);
 });

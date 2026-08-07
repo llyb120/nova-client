@@ -29,7 +29,6 @@ struct ResolvedCompletionTarget {
 struct CachedConfig {
     path: PathBuf,
     mtime: Option<SystemTime>,
-    server_fingerprint: u64,
     config: Value,
 }
 
@@ -47,12 +46,11 @@ pub fn invalidate_config_cache() {
 pub async fn complete_direct(
     http: &reqwest::Client,
     data_dir: &Path,
-    server_config: Option<Value>,
     env: &HashMap<String, String>,
     model_selection: &str,
     prompt: &str,
 ) -> Result<String, String> {
-    let config = load_merged_config(data_dir, server_config)?;
+    let config = load_config(data_dir)?;
     let target = resolve_target(&config, model_selection, env)?;
     match target.api.as_str() {
         "openai-completions" => complete_openai_completions(http, &target, prompt).await,
@@ -334,57 +332,34 @@ fn content_to_text(content: &Value) -> String {
         .join("")
 }
 
-fn fingerprint_server_config(server_config: &Option<Value>) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    match server_config {
-        Some(value) => value.to_string().hash(&mut hasher),
-        None => 0u8.hash(&mut hasher),
-    }
-    hasher.finish()
-}
-
-fn load_merged_config(data_dir: &Path, server_config: Option<Value>) -> Result<Value, String> {
+fn load_config(data_dir: &Path) -> Result<Value, String> {
     let path = data_dir.join("alkaid").join("config.jsonc");
     let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-    let server_fingerprint = fingerprint_server_config(&server_config);
     {
         let cache = config_cache().lock().unwrap();
         if let Some(cached) = cache.as_ref() {
-            if cached.path == path
-                && cached.mtime == mtime
-                && cached.server_fingerprint == server_fingerprint
-            {
+            if cached.path == path && cached.mtime == mtime {
                 return Ok(cached.config.clone());
             }
         }
     }
 
-    let local = match std::fs::read_to_string(&path) {
+    let config = match std::fs::read_to_string(&path) {
         Ok(text) => parse_jsonc(&text)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if server_config.is_none() {
-                return Err(format!("未找到 Vega 配置：{}", path.display()));
-            }
-            Value::Object(Map::new())
+            return Err(format!("未找到 Vega 配置：{}", path.display()));
         }
         Err(error) => return Err(format!("读取 Vega 配置失败：{error}")),
     };
-    let merged = merge_objects(
-        server_config.unwrap_or_else(|| Value::Object(Map::new())),
-        local,
-    );
-    if !merged.get("provider").map(Value::is_object).unwrap_or(false) {
+    if !config.get("provider").map(Value::is_object).unwrap_or(false) {
         return Err("Vega 配置缺少 provider".into());
     }
     *config_cache().lock().unwrap() = Some(CachedConfig {
         path,
         mtime,
-        server_fingerprint,
-        config: merged.clone(),
+        config: config.clone(),
     });
-    Ok(merged)
+    Ok(config)
 }
 
 fn resolve_target(
@@ -567,22 +542,6 @@ fn join_url(base: &str, path: &str) -> String {
         base.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
-}
-
-fn merge_objects(base: Value, overlay: Value) -> Value {
-    match (base, overlay) {
-        (Value::Object(mut base_map), Value::Object(overlay_map)) => {
-            for (key, value) in overlay_map {
-                let next = match base_map.remove(&key) {
-                    Some(existing) => merge_objects(existing, value),
-                    None => value,
-                };
-                base_map.insert(key, next);
-            }
-            Value::Object(base_map)
-        }
-        (_base, overlay) => overlay,
-    }
 }
 
 fn parse_jsonc(text: &str) -> Result<Value, String> {

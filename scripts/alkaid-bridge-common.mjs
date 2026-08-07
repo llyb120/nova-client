@@ -81,7 +81,7 @@ export function startedToolItem(event) {
 
 /// 输入框补全：不建 agent，只对模型 API 直接发一次 completion。
 async function complete(request) {
-  const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
+  const config = await loadAlkaidConfig({ root: dataRoot });
   // 空 model = 未配置补全模型，回退到 Vega 默认模型
   const resolved = resolveAlkaidModel(config, request.model || undefined);
   // 行内补全只要短续写：压低 maxTokens，避免模型按 32k 上限慢慢吐完
@@ -123,7 +123,7 @@ async function complete(request) {
 }
 
 async function title(request) {
-  const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
+  const config = await loadAlkaidConfig({ root: dataRoot });
   // 空 model = 未配置轻量模型，回退到 Vega 默认模型
   const resolved = resolveAlkaidModel(config, request.model || undefined);
   const runtime = await createAlkaidAgent({
@@ -153,12 +153,12 @@ export async function runAlkaidBridge(handlePrompt) {
     const request = JSON.parse(first.value);
     if (request.action === "prompt") await handlePrompt(request, commands);
     else if (request.action === "models") {
-      const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
+      const config = await loadAlkaidConfig({ root: dataRoot });
       send({ ok: true, data: { configOptions: [{ id: "model", name: "Model", currentValue: defaultAlkaidModel(config), options: alkaidModelOptions(config) }], modes: null } });
     } else if (request.action === "export") {
-      // 额度共享导出：服务端配置基线 + 本地 config.jsonc 覆盖后的生效配置，
+      // 额度共享导出：读取出借方本地 config.jsonc 的生效配置，
       // 密钥占位符解析为字面量，借用方无需出借方的环境变量
-      const config = await loadAlkaidConfig({ root: dataRoot, serverConfig: request.alkaidServerConfig });
+      const config = await loadAlkaidConfig({ root: dataRoot });
       const { root: _root, env: _env, ...shared } = config;
       send({ ok: true, data: JSON.stringify(resolveAlkaidConfigEnv(shared)) });
     } else if (request.action === "title") await title(request);
