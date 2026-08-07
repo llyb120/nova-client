@@ -60,11 +60,11 @@ Vega 是一个基于 pi agent core 的轻量 coding agent，目标是少往返�
 - 会话消息持久化到 `~/.nova/alkaid/sessions`，支持跨 bridge 进程续接多轮上下文。开启“超级上下文”时，OpenAI/GPT 已完成轮次不再回传 reasoning；当前轮次及中断后续做所需的原生工具轨迹仍完整保留。重组后的提示词/结论上下文按实际用量或保守估算计数，达到模型窗口 60% 时压缩，且压缩阈值最低为 150k tokens；优先使用设置中的轻量级模型，失败后回退当前会话模型。
 - Plan 模式不暴露写文件工具；Build 模式开放并行读写。
 
-## 服务端配置同步
+## 团队 / Relay 与额度共享
 
-`nova-server` 可按团队 token 前缀通过 v2 SSE 定向下发 Vega 配置。客户端收到后只保存在运行内存，并按“服务端配置为基线、本地 `~/.nova/alkaid/config.jsonc` 递归覆盖”的规则合并；不会把服务端配置或合并结果写回磁盘。服务端配置变化会清空并重新探测 Vega 模型列表，当前正在执行的轮次不被打断，后续 bridge 使用新配置。
+Relay 不再向客户端下发或合并 Vega provider/model 配置。Vega 始终只读取本机 `~/.nova/alkaid/config.jsonc`（开发版为 `~/.novadev/alkaid/config.jsonc`）。
 
-服务端配置中的密钥建议继续写成 `{env:NAME}`；对应环境变量必须注入客户端 Nova 进程，服务端不会代替客户端保存运行凭据。
+额度共享仍然可用：出借方通过本机配置导出当前 Vega 配置，并经端到端加密凭证链路提供给借用方；借用方只在隔离的临时运行目录中使用，不会覆盖本机 Vega 配置或登录状态。
 
 ## 本机运行
 

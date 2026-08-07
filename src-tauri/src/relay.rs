@@ -817,7 +817,6 @@ impl RelayManager {
                     self.persist_seq(true);
                 }
             }
-            "alkaid.config" => self.apply_alkaid_config(&frame["data"]),
             "event" => {
                 let Ok(mut env) = serde_json::from_value::<InEnvelope>(frame["event"].clone())
                 else {
@@ -855,7 +854,6 @@ impl RelayManager {
                 let _ = self.app.emit(EV_CLUES, env.data);
             }
             "clue.mentioned" => self.on_clue_mentioned(&env),
-            "alkaid.config" => self.apply_alkaid_config(&env.data),
             "remote.device" => crate::remote::publish_main_sse(env.data),
             "share" => self.on_share(&env),
             "workflow" => self.on_workflow(&env),
@@ -894,21 +892,6 @@ impl RelayManager {
             }
             _ => {}
         }
-    }
-
-    fn apply_alkaid_config(&self, data: &Value) {
-        let config = data.get("config").filter(|value| !value.is_null()).cloned();
-        let revision = data
-            .get("revision")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        self.app
-            .state::<AppState>()
-            .alkaid
-            .set_alkaid_server_config(config);
-        self.log(format!(
-            "[relay] 已应用 Vega 服务端配置 revision={revision}"
-        ));
     }
 
     fn on_clue_mentioned(&self, env: &InEnvelope) {

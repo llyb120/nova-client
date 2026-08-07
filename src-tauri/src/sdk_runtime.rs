@@ -74,8 +74,7 @@ pub struct SdkManager {
     model_options: Mutex<Option<Value>>,
     model_options_refreshing: AtomicBool,
     model_options_revalidated: AtomicBool,
-    /// 仅 Alkaid 使用：nova-server 下发的配置保存在内存，请求 bridge 时随首包传入。
-    alkaid_server_config: Mutex<Option<Value>>,
+    /// 本地 Vega 配置变化代数，避免旧模型列表覆盖新配置结果。
     alkaid_config_generation: AtomicU64,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
@@ -112,7 +111,6 @@ impl SdkManager {
             model_options: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
             model_options_revalidated: AtomicBool::new(false),
-            alkaid_server_config: Mutex::new(None),
             alkaid_config_generation: AtomicU64::new(0),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
@@ -583,23 +581,6 @@ impl SdkManager {
         });
     }
 
-    /// 应用 nova-server 定向下发的 Alkaid 配置。配置只驻留内存；当前运行轮次不打断，
-    /// 后续 bridge 首包携带它并由 JS 侧以本地 config.jsonc 覆盖合并。
-    pub fn set_alkaid_server_config(self: &Arc<Self>, config: Option<Value>) {
-        if self.adapter.agent_kind() != AgentKind::Alkaid {
-            return;
-        }
-        {
-            let mut current = self.alkaid_server_config.lock().unwrap();
-            if *current == config {
-                return;
-            }
-            *current = config;
-        }
-        // 换了服务端配置，旧模型列表可能整批失效，先清空再重拉。
-        self.invalidate_alkaid_config();
-    }
-
     /// 本地 `config.jsonc` 发生变化时调用。当前正在执行的 bridge 不打断，
     /// 但会让下一轮请求、模型列表和预热实例使用新配置。
     pub fn notify_alkaid_config_changed(self: &Arc<Self>) {
@@ -626,17 +607,8 @@ impl SdkManager {
         self.refresh_model_options_soon();
     }
 
-    fn with_alkaid_server_config(&self, mut request: Value) -> Value {
-        if self.adapter.agent_kind() == AgentKind::Alkaid {
-            if let Some(config) = self.alkaid_server_config.lock().unwrap().clone() {
-                request["alkaidServerConfig"] = config;
-            }
-        }
-        request
-    }
-
-    /// 出借 Vega 额度：跑一次 bridge 导出当前生效的合并配置（服务端下发配置为基线、
-    /// 本地 config.jsonc 递归覆盖），并把 {env:NAME} 密钥占位符解析成字面量，
+    /// 出借 Vega 额度：跑一次 bridge 导出本地 config.jsonc 的生效配置，
+    /// 并把 {env:NAME} 密钥占位符解析成字面量，
     /// 借用方无需出借方的环境变量即可直接使用该配置。
     pub async fn export_quota_credentials(&self) -> Result<String, String> {
         if self.adapter.agent_kind() != AgentKind::Alkaid {
@@ -718,10 +690,7 @@ impl SdkManager {
         }
         *self.model_options.lock().unwrap() = Some(value.clone());
         let kind = self.adapter.agent_kind();
-        // 服务端配置只允许驻留内存；启用时不把合并后的模型列表写入本地缓存。
-        if kind != AgentKind::Alkaid || self.alkaid_server_config.lock().unwrap().is_none() {
-            model_cache::save(&crate::nova_data_dir(&self.app), kind.as_str(), &value);
-        }
+        model_cache::save(&crate::nova_data_dir(&self.app), kind.as_str(), &value);
         self.model_options_revalidated.store(true, Ordering::SeqCst);
         let _ = self.app.emit(
             EV_OPTIONS,
@@ -784,12 +753,10 @@ impl SdkManager {
     /// 一次性行内补全：Rust 直连 provider HTTP（不冷启 Node）。
     /// 仅 openai-completions / openai-responses；其它协议再回退 bridge。
     pub async fn complete_once(&self, cwd: &str, model: &str, prompt: String) -> Result<String, String> {
-        let server_config = self.alkaid_server_config.lock().unwrap().clone();
         let data_dir = nova_data_dir(&self.app);
         match crate::alkaid_complete::complete_direct(
             &self.http,
             &data_dir,
-            server_config,
             &self.launch_env,
             model,
             &prompt,
@@ -816,7 +783,6 @@ impl SdkManager {
     }
 
     async fn run_bridge(&self, cwd: &str, request: Value) -> Result<Value, String> {
-        let request = self.with_alkaid_server_config(request);
         let mut child = self.spawn_bridge(cwd)?;
         let mut stdin = child
             .stdin
@@ -842,7 +808,6 @@ impl SdkManager {
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
-        let request = self.with_alkaid_server_config(request);
         let cached_bridge = self
             .adapter
             .keeps_bridge_alive()
