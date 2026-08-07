@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,7 @@ test("N-API addon serves read_files and edit_files", { skip: !napiToolsAvailable
 
 test("fast_context online learning consumes edit feedback automatically", { skip: !napiToolsAvailable() }, async () => {
   const root = await mkdtemp(join(tmpdir(), "nova-context-learning-root-"));
+  const worktree = `${root}-linked`;
   const learningDir = await mkdtemp(join(tmpdir(), "nova-context-learning-model-"));
   const previousDir = process.env.NOVA_CONTEXT_LEARNING_DIR;
   const previousEnabled = process.env.NOVA_CONTEXT_LEARNING;
@@ -31,6 +33,12 @@ test("fast_context online learning consumes edit feedback automatically", { skip
   process.env.NOVA_CONTEXT_LEARNING = "1";
   try {
     await writeFile(join(root, "target.ts"), "export function target() {\n  return 1;\n}\n");
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    execFileSync("git", ["config", "user.email", "nova-test@example.invalid"], { cwd: root });
+    execFileSync("git", ["config", "user.name", "Nova Test"], { cwd: root });
+    execFileSync("git", ["add", "target.ts"], { cwd: root });
+    execFileSync("git", ["commit", "-qm", "seed"], { cwd: root });
+    execFileSync("git", ["worktree", "add", "-q", "-b", "linked", worktree], { cwd: root });
     const context = await callNapiTool("fast_context", root, {
       keywords: ["target"],
       files: ["target.ts"],
@@ -43,7 +51,20 @@ test("fast_context online learning consumes edit feedback automatically", { skip
     });
     assert.equal(feedback.updated, 1);
     const settled = await callNapiTool("observe_context_feedback", root, { action: "settle" });
-    assert.ok(settled.observations >= 1);
+    assert.equal(settled.settled, 1);
+
+    // linked worktree 必须复用同一内存状态和同一个持久化模型文件。
+    await callNapiTool("fast_context", worktree, {
+      keywords: ["target"],
+      files: ["target.ts"],
+      task: "change target from linked worktree",
+    });
+    const linkedFeedback = await callNapiTool("observe_context_feedback", worktree, {
+      action: "edit",
+      path: "target.ts",
+    });
+    assert.equal(linkedFeedback.updated, 1);
+    await callNapiTool("observe_context_feedback", worktree, { action: "settle" });
     const files = await import("node:fs/promises").then(({ readdir }) => readdir(learningDir));
     assert.equal(files.filter((file) => file.endsWith(".json")).length, 1);
   } finally {
@@ -51,6 +72,7 @@ test("fast_context online learning consumes edit feedback automatically", { skip
     else process.env.NOVA_CONTEXT_LEARNING_DIR = previousDir;
     if (previousEnabled === undefined) delete process.env.NOVA_CONTEXT_LEARNING;
     else process.env.NOVA_CONTEXT_LEARNING = previousEnabled;
+    await rm(worktree, { recursive: true, force: true });
     await rm(root, { recursive: true, force: true });
     await rm(learningDir, { recursive: true, force: true });
   }

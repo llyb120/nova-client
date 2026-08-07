@@ -93,6 +93,7 @@ struct RepoLearningState {
 }
 
 static LEARNING_STATE: OnceLock<Mutex<HashMap<String, RepoLearningState>>> = OnceLock::new();
+static LEARNING_REPO_IDENTITIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 fn learning_enabled() -> bool {
     std::env::var("NOVA_CONTEXT_LEARNING")
@@ -103,10 +104,51 @@ fn learning_enabled() -> bool {
 }
 
 fn learning_root_key(root: &Path) -> String {
-    root.canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root_key = canonical_root.to_string_lossy().into_owned();
+    let identities = LEARNING_REPO_IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(identity) = identities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&root_key)
+        .cloned()
+    {
+        return identity;
+    }
+
+    // `--git-common-dir` 对主工作区返回 `.git`，对 linked worktree 返回主仓库的
+    // 绝对 `.git` 路径，因此同一仓库的全部 worktree 会得到同一个模型身份。
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(&canonical_root)
+        .args(["rev-parse", "--git-common-dir"]);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let identity = command
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|output| output.trim().to_string())
+        .filter(|output| !output.is_empty())
+        .map(PathBuf::from)
+        .map(|common_dir| {
+            if common_dir.is_absolute() {
+                common_dir
+            } else {
+                canonical_root.join(common_dir)
+            }
+        })
+        .map(|common_dir| common_dir.canonicalize().unwrap_or(common_dir))
+        .map(|common_dir| format!("git:{}", common_dir.to_string_lossy()))
+        .unwrap_or_else(|| format!("path:{root_key}"));
+
+    identities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(root_key, identity.clone());
+    identity
 }
 
 fn learning_model_path(root: &Path) -> PathBuf {
@@ -190,15 +232,38 @@ fn learning_update(
     }
 }
 
-fn settle_pending(root: &Path, state: &mut RepoLearningState) {
+fn settle_pending(root: &Path, state: &mut RepoLearningState) -> usize {
     let pending = std::mem::take(&mut state.pending);
+    let settled = pending.len();
     for sample in pending {
         if !sample.edit_applied {
             // 未编辑不等于无用，只作为很弱的负反馈。
             learning_update(&mut state.model, &sample.features, 0.0, 0.08);
         }
     }
-    save_learning_model(root, &state.model);
+    if settled > 0 {
+        save_learning_model(root, &state.model);
+    }
+    settled
+}
+
+/// 会话生命周期收尾使用：只有当前进程确实存在待结算 trace 时才做更新与 I/O。
+/// 这样未使用 fast_context 的 Lyra/Vega 会话不会加载或写入学习模型。
+pub fn settle_context_learning(root: &Path) -> usize {
+    if !learning_enabled() {
+        return 0;
+    }
+    let Some(states) = LEARNING_STATE.get() else {
+        return 0;
+    };
+    let key = learning_root_key(root);
+    let mut states = states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(state) = states.get_mut(&key) else {
+        return 0;
+    };
+    settle_pending(root, state)
 }
 
 fn with_learning_state<T>(root: &Path, callback: impl FnOnce(&mut RepoLearningState) -> T) -> T {
@@ -235,11 +300,8 @@ pub fn observe_context_feedback(root: &Path, params: Value) -> Result<Value, Str
         .and_then(Value::as_str)
         .unwrap_or_default();
     if action == "settle" {
-        let observations = with_learning_state(root, |state| {
-            settle_pending(root, state);
-            state.model.observations
-        });
-        return Ok(serde_json::json!({"enabled": true, "action": "settle", "observations": observations}));
+        let settled = settle_context_learning(root);
+        return Ok(serde_json::json!({"enabled": true, "action": "settle", "settled": settled}));
     }
     let raw_path = params
         .get("path")

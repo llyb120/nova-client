@@ -211,6 +211,15 @@ struct PromptContext {
     mode: String,
 }
 
+struct ContextLearningSettleGuard(PathBuf);
+
+impl Drop for ContextLearningSettleGuard {
+    fn drop(&mut self) {
+        // 覆盖正常完成、provider 错误、用户取消以及 task abort；无待结算 trace 时为零 I/O。
+        crate::nova_tools_native::context::settle_context_learning(&self.0);
+    }
+}
+
 async fn handle_prompt(
     http: &reqwest::Client,
     request: &Value,
@@ -243,6 +252,7 @@ async fn handle_prompt(
     let cwd_path = cwd_path
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(&ctx.cwd));
+    let _learning_settle = ContextLearningSettleGuard(cwd_path.clone());
     let env = config::process_env();
     let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
     let resolved = config::resolve_model(
