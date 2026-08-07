@@ -93,6 +93,9 @@ pub struct ResolvedModel {
     pub session_affinity_format: String,
     /// 官方 OpenAI 或显式开启时支持 24h 长缓存保持。
     pub supports_long_cache_retention: bool,
+    /// 是否在 thinking.enabled 之外同时发送 reasoning_effort；zai 默认不发送，
+    /// 可用 compat.supportsReasoningEffort 显式覆盖（与 Vega/PI 对齐）。
+    pub supports_reasoning_effort: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -320,12 +323,16 @@ pub fn resolve_model(
             .unwrap_or(id_lower.contains("deepseek"));
     let supports_long_cache_retention = compat_flag(model, provider, "supportsLongCacheRetention")
         .unwrap_or(official_openai);
+    let thinking_format = detect_thinking_format(provider_id, &base_url, model, provider);
+    // 与 Vega(PI) 对齐：zai 默认不发 reasoning_effort，其余（含 deepseek）默认发送。
+    let supports_reasoning_effort = compat_flag(model, provider, "supportsReasoningEffort")
+        .unwrap_or(!matches!(thinking_format.as_deref(), Some("zai")));
     Ok(Resolved {
         model: ResolvedModel {
             provider: provider_id.to_string(),
             id: model_id.to_string(),
             api,
-            thinking_format: detect_thinking_format(provider_id, &base_url, model, provider),
+            thinking_format,
             max_tokens_field: detect_max_tokens_field(&base_url, provider),
             base_url,
             headers,
@@ -347,6 +354,7 @@ pub fn resolve_model(
                 "openai".into()
             },
             supports_long_cache_retention,
+            supports_reasoning_effort,
         },
         api_key,
         thinking_level,
