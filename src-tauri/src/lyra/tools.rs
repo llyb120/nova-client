@@ -11,11 +11,32 @@ use std::path::{Path, PathBuf};
 
 const FAST_CONTEXT_DESCRIPTION: &str = "任务涉及跨文件查找或修改（含分析要改哪里）、或需要阅读多个文件正文来理解/规划改动时，先调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单，一次调用通常替代 5–10 轮 rg+read 往返，比自行 rg/grep 往返更省 token。目标路径和行段都已明确且只需少量行段时直接 read；只需符号的定义/引用行号时用 find_symbols；已定位但仍需阅读正文的多个文件，通过 files 传入一次打包，不要逐个 read。默认只传 keywords/task/files；任务里点名了某个工具/符号（如要改某个函数）时也不要用 find_symbols 代替本工具——find_symbols 只给行号不给正文；调用后不要再用 rg/git grep 重复检索同一批关键词，已展示范围视为已读。返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要直接退回 rg/grep 逐个搜索。";
 
-const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回带行号的文本与 hasMore/nextOffset 等分段信息。";
+const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。行号可直接用于 edit 的 startLine/endLine 行区间替换。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。禁止无排除的递归搜索（grep -r 等）。";
-const EDIT_DESCRIPTION: &str = "对单个文件做精确文本替换。edits 数组中的每个 oldText 必须在文件当前内容中唯一且不重叠匹配；多处修改合并到同一次调用。写入前全量校验，任一 edit 无法唯一定位则整体拒绝。";
+const EDIT_DESCRIPTION: &str = "对单个文件做精确文本替换。两种定位方式二选一：(a) oldText：文件当前内容中唯一匹配的原文（支持轻微差异的模糊定位；失败时错误信息自带最相似候选的真实内容，可直接修正重试）；(b) startLine+endLine（1 起始、闭区间）：直接替换行区间，无需复述原文，建议附 firstLine/lastLine（边界行当前原文，来自 read/fast_context 输出）做防漂移校验，坐标过期时会返回实际行内容。多处修改合并到同一次调用；写入前全量校验，任一 edit 无法定位则整体拒绝；成功后返回改动处带行号的回显，无需再 read 验证。";
 const WRITE_DESCRIPTION: &str = "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
 const FIND_SYMBOLS_DESCRIPTION: &str = "并行定位多个符号在仓库中的所有出现位置（文件:行号）。只要行号不要正文时用；需要上下文用 fast_context。";
+
+/// 基准对照：原版（HEAD / PI 语义）工具描述。
+const READ_DESCRIPTION_LEGACY: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回带行号的文本与 hasMore/nextOffset 等分段信息。";
+const EDIT_DESCRIPTION_LEGACY: &str = "对单个文件做精确文本替换。edits 数组中的每个 oldText 必须在文件当前内容中唯一且不重叠匹配；多处修改合并到同一次调用。写入前全量校验，任一 edit 无法唯一定位则整体拒绝。";
+
+/// 编辑工具行为模式：enhanced（默认，H 行区间 / A 失败回读 / E 成功回显）或
+/// legacy（原版基线：read 无行号、edit 仅 oldText、紧凑错误、无回显）。
+/// 仅用于基准对照与紧急回退：LYRA_EDIT_MODE=legacy。
+fn legacy_edit_mode() -> bool {
+    std::env::var("LYRA_EDIT_MODE").ok().as_deref() == Some("legacy")
+}
+
+/// read 输出的行号前缀：`行号|内容`，坐标可直接用于 edit 的 startLine/endLine。
+fn add_line_numbers(content: &str, start_line: usize) -> String {
+    content
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| format!("{}|{}", start_line + i, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 pub struct Tool {
     pub name: &'static str,
@@ -59,7 +80,12 @@ pub fn tool_set(read_only: bool, fast_context: bool) -> Vec<Tool> {
     }
     tools.push(Tool {
         name: "read",
-        description: READ_DESCRIPTION.into(),
+        description: if legacy_edit_mode() {
+            READ_DESCRIPTION_LEGACY
+        } else {
+            READ_DESCRIPTION
+        }
+        .into(),
         parameters: schema(json!({
             "type": "object",
             "properties": {
@@ -85,8 +111,34 @@ pub fn tool_set(read_only: bool, fast_context: bool) -> Vec<Tool> {
         });
         tools.push(Tool {
             name: "edit",
-            description: EDIT_DESCRIPTION.into(),
-            parameters: schema(json!({
+            description: if legacy_edit_mode() {
+                EDIT_DESCRIPTION_LEGACY
+            } else {
+                EDIT_DESCRIPTION
+            }
+            .into(),
+            parameters: if legacy_edit_mode() {
+                schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "edits": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "oldText": { "type": "string" },
+                                    "newText": { "type": "string" }
+                                },
+                                "required": ["oldText", "newText"]
+                            }
+                        }
+                    },
+                    "required": ["path", "edits"]
+                }))
+            } else {
+                schema(json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
@@ -96,15 +148,20 @@ pub fn tool_set(read_only: bool, fast_context: bool) -> Vec<Tool> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "oldText": { "type": "string" },
-                                "newText": { "type": "string" }
+                                "oldText": { "type": "string", "description": "要替换的原文（与 startLine/endLine 二选一）" },
+                                "newText": { "type": "string" },
+                                "startLine": { "type": "integer", "minimum": 1, "description": "替换起始行（1 起始，与 oldText 二选一）" },
+                                "endLine": { "type": "integer", "minimum": 1, "description": "替换结束行（闭区间）" },
+                                "firstLine": { "type": "string", "description": "防漂移护栏：startLine 行的当前原文（可选，建议提供）" },
+                                "lastLine": { "type": "string", "description": "防漂移护栏：endLine 行的当前原文（可选）" }
                             },
-                            "required": ["oldText", "newText"]
+                            "required": ["newText"]
                         }
                     }
                 },
                 "required": ["path", "edits"]
-            })),
+            }))
+            },
         });
         tools.push(Tool {
             name: "write",
@@ -408,6 +465,15 @@ async fn execute_inner(
                         return ToolOutcome::error(error.to_string());
                     }
                     let content = item.get("content").and_then(Value::as_str).unwrap_or_default();
+                    let start_line = item.get("startLine").and_then(Value::as_u64).unwrap_or(1) as usize;
+                    let lines_read = item.get("linesRead").and_then(Value::as_u64).unwrap_or(0);
+                    // H 的前置：`行号|内容` 前缀，让模型拿到可直接用于 startLine/endLine 的坐标。
+                    // legacy 模式（基准对照）保持原版裸正文输出。
+                    let numbered = if legacy_edit_mode() || lines_read == 0 || content.is_empty() {
+                        content.to_string()
+                    } else {
+                        add_line_numbers(content, start_line)
+                    };
                     let mut meta = Vec::new();
                     if item.get("hasMore").and_then(Value::as_bool) == Some(true) {
                         let next = item.get("nextOffset").and_then(Value::as_u64).unwrap_or(0);
@@ -419,9 +485,9 @@ async fn execute_inner(
                         }
                     }
                     let text = if meta.is_empty() {
-                        content.to_string()
+                        numbered
                     } else {
-                        format!("{content}\n\n[{}]", meta.join(", "))
+                        format!("{numbered}\n\n[{}]", meta.join(", "))
                     };
                     ToolOutcome::text(text)
                 }
@@ -450,17 +516,38 @@ async fn execute_inner(
             let Some(edits) = args.get("edits").and_then(Value::as_array) else {
                 return ToolOutcome::error("edit 缺少 edits");
             };
+            let legacy = legacy_edit_mode();
             for edit in edits {
-                if edit.get("oldText").and_then(Value::as_str).is_none()
-                    || edit.get("newText").and_then(Value::as_str).is_none()
+                if legacy {
+                    if edit.get("oldText").and_then(Value::as_str).is_none()
+                        || edit.get("newText").and_then(Value::as_str).is_none()
+                    {
+                        return ToolOutcome::error("edit 的每项都需要 oldText 与 newText");
+                    }
+                    continue;
+                }
+                let has_old = edit
+                    .get("oldText")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty());
+                let has_range = edit.get("startLine").and_then(Value::as_u64).is_some()
+                    && edit.get("endLine").and_then(Value::as_u64).is_some();
+                if edit.get("newText").and_then(Value::as_str).is_none() || (!has_old && !has_range)
                 {
-                    return ToolOutcome::error("edit 的每项都需要 oldText 与 newText");
+                    return ToolOutcome::error(
+                        "edit 的每项都需要 newText，以及 oldText 或 startLine+endLine 之一",
+                    );
                 }
             }
             let root_buf = root.to_path_buf();
             let params = json!({ "files": [{ "path": path, "edits": edits }] });
             let result = tokio::task::spawn_blocking(move || {
-                native_edit::edit_files(&root_buf, params)
+                // 增强模式：H 行区间定位 / A 失败回读 / E 成功回显；legacy 走原版入口（基准对照）
+                if legacy {
+                    native_edit::edit_files(&root_buf, params)
+                } else {
+                    native_edit::edit_files_enhanced(&root_buf, params)
+                }
             })
             .await;
             match result {
@@ -469,7 +556,23 @@ async fn execute_inner(
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("编辑完成");
-                    let mut outcome = ToolOutcome::text(message.to_string());
+                    // E：把改动处带行号的回显拼进模型可见文本，免验证性 read。
+                    let mut text = message.to_string();
+                    if let Some(files) = value.get("previews").and_then(Value::as_array) {
+                        for file in files {
+                            let path = file.get("path").and_then(Value::as_str).unwrap_or_default();
+                            if let Some(list) = file.get("edits").and_then(Value::as_array) {
+                                for preview in list {
+                                    let line =
+                                        preview.get("line").and_then(Value::as_u64).unwrap_or(0);
+                                    let body =
+                                        preview.get("text").and_then(Value::as_str).unwrap_or_default();
+                                    text.push_str(&format!("\n\n{path} @@ {line}:\n{body}"));
+                                }
+                            }
+                        }
+                    }
+                    let mut outcome = ToolOutcome::text(text);
                     outcome.details = Some(value);
                     outcome
                 }
@@ -585,5 +688,16 @@ mod tests {
             "取消后孙进程 {grandchild} 未被清理"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod hea_tests {
+    use super::add_line_numbers;
+
+    #[test]
+    fn read_lines_are_prefixed_with_line_numbers() {
+        assert_eq!(add_line_numbers("alpha\nbeta", 41), "41|alpha\n42|beta");
+        assert_eq!(add_line_numbers("only", 1), "1|only");
     }
 }

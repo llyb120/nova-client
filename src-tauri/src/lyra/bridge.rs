@@ -128,7 +128,7 @@ fn aggregate_tool_text(message: &Value) -> String {
 fn started_tool_item(id: &str, name: &str, args: &Value) -> Value {
     match name {
         "bash" => json!({
-            "id": id, "type": "command_execution", "status": "in_progress",
+            "id": id, "type": "command_execution", "status": "in_progress", "tool": name,
             "command": args.get("command").and_then(Value::as_str).unwrap_or_default(),
             "aggregatedOutput": "",
         }),
@@ -138,7 +138,7 @@ fn started_tool_item(id: &str, name: &str, args: &Value) -> Value {
                 .and_then(Value::as_str)
                 .or_else(|| args.pointer("/files/0/path").and_then(Value::as_str))
                 .unwrap_or_default();
-            json!({ "id": id, "type": "file_change", "status": "in_progress", "changes": [{ "path": path, "kind": "update" }] })
+            json!({ "id": id, "type": "file_change", "status": "in_progress", "tool": name, "arguments": args, "changes": [{ "path": path, "kind": "update" }] })
         }
         _ => json!({
             "id": id, "type": "mcp_tool_call", "status": "in_progress",
@@ -157,10 +157,20 @@ fn completed_tool_item(started: &Value, outcome: &Value) -> Value {
         Some("mcp_tool_call") => {
             item["result"] = json!({ "content": outcome.get("content").cloned().unwrap_or(Value::Array(vec![])) });
         }
+        // file_change 失败时附上错误内容：edit 定位失败等原因对 UI/调用方可见。
+        Some("file_change") => {
+            if outcome.get("isError").and_then(Value::as_bool) == Some(true) {
+                item["result"] = json!({ "content": outcome.get("content").cloned().unwrap_or(Value::Array(vec![])) });
+            }
+        }
         _ => {}
     }
     if let Some(details) = outcome.get("details").filter(|d| !d.is_null()) {
         item["details"] = details.clone();
+    }
+    // 工具失败（edit 定位失败等）对 UI/调用方可见；缺省视为成功。
+    if outcome.get("isError").and_then(Value::as_bool) == Some(true) {
+        item["isError"] = json!(true);
     }
     item
 }
