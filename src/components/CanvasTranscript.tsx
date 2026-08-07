@@ -879,6 +879,30 @@ function wordClass(ch: string): number {
   return 2;
 }
 
+/** 中文分词：Intl.Segmenter（Chromium/WebKit 均支持），不可用时回退 null。 */
+let _wordSegmenter: Intl.Segmenter | null | undefined;
+function wordSegmenter(): Intl.Segmenter | null {
+  if (_wordSegmenter === undefined) {
+    try { _wordSegmenter = new Intl.Segmenter("zh", { granularity: "word" }); }
+    catch { _wordSegmenter = null; }
+  }
+  return _wordSegmenter;
+}
+
+/** 用 Intl.Segmenter 求 text 中 idx 所在的词区间；idx 不在词段内（空白/标点）或分词器
+ *  不可用时返回 null，调用方回退到字符类扩展。 */
+function segmentWordRange(text: string, idx: number): { s: number; e: number } | null {
+  const seg = wordSegmenter();
+  if (!seg) return null;
+  for (const part of seg.segment(text)) {
+    const st = part.index;
+    const en = st + part.segment.length;
+    if (idx < st) break;
+    if (idx < en) return part.isWordLike ? { s: st, e: en } : null;
+  }
+  return null;
+}
+
 /** 定位 offset 所在的视觉行（offset 落在行尾与下一行行首之间时归前一行）。 */
 function lineAtOffset(b: Block, offset: number): TextLine | null {
   const lines = b.textLines;
@@ -2728,7 +2752,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     endScrollDrag();
   }
 
-  /** 双击：选中光标所在词（同类字符连续串），对齐 DOM 双击选词。 */
+  /** 双击：选中光标所在词，对齐 DOM 双击选词。中文等 CJK 用 Intl.Segmenter 分词，
+   *  只选当前词语而非整串同类字符；分词器不可用时回退同类字符连续串。 */
   function selectWordAt(blockIdx: number, offset: number): boolean {
     const b = blocks[blockIdx];
     if (!b) return false;
@@ -2742,6 +2767,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     let e = i + 1;
     while (s > 0 && wordClass(ln.text[s - 1]) === cls) s--;
     while (e < ln.text.length && wordClass(ln.text[e]) === cls) e++;
+    if (cls === 1) {
+      // 只对光标周围的最小词字符候选串分词（不对整行分词），精确到词（如“渲染”）；
+      // 分词结果不是词段（如纯下划线串）时保留整个候选串
+      const range = segmentWordRange(ln.text.slice(s, e), i - s);
+      if (range) { s += range.s; e = s - range.s + range.e; }
+    }
     selection = { startBlock: blockIdx, startOffset: ln.offset + s, endBlock: blockIdx, endOffset: ln.offset + e };
     return true;
   }
