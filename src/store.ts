@@ -228,6 +228,7 @@ export const [state, setState] = createStore<AppStore>({
   settings: null,
   modelOptions: {
     alkaid: null,
+    lyra: null,
     devin: null,
     codex: null,
     codebuddy: null,
@@ -245,6 +246,7 @@ export const [state, setState] = createStore<AppStore>({
   updatePromptAt: 0,
   slashCommands: {
     alkaid: [],
+    lyra: [],
     devin: [],
     codex: [],
     codebuddy: [],
@@ -475,6 +477,7 @@ export async function ensureModelOptions(agentKind: AgentKind) {
 /** 模型后端固定展示顺序 */
 export const ALL_AGENT_KINDS: AgentKind[] = [
   "alkaid",
+  "lyra",
   "devin",
   "codex",
   "codebuddy",
@@ -488,6 +491,8 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
   switch (k) {
     case "alkaid":
       return s.alkaidEnabled !== false;
+    case "lyra":
+      return s.lyraEnabled !== false;
     case "devin":
       return s.devinEnabled !== false;
     case "codex":

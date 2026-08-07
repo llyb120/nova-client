@@ -1,0 +1,7 @@
+{
+  "name": "lyra-bench-sandbox",
+  "private": true,
+  "scripts": {
+    "test": "node test/run.js"
+  }
+}

@@ -121,6 +121,8 @@ pub struct Settings {
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
     pub alkaid_enabled: bool,
+    /// Lyra 原生 agent（与 Vega 共用配置）。
+    pub lyra_enabled: bool,
     pub codex_enabled: bool,
     /// 旧版独立 SDK 后端开关，仅用于兼容反序列化。
     pub codexplus_enabled: bool,
@@ -203,6 +205,7 @@ impl Default for Settings {
             session_shortcuts: Vec::new(),
             devin_enabled: false,
             alkaid_enabled: true,
+            lyra_enabled: true,
             codex_enabled: false,
             codexplus_enabled: false,
             codebuddy_enabled: false,

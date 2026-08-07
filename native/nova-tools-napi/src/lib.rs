@@ -5,11 +5,6 @@ use std::path::Path;
 
 #[path = "../../../src-tauri/src/nova_tools_native/context.rs"]
 mod context;
-#[path = "../../../src-tauri/src/nova_tools_native/edit.rs"]
-mod edit;
-#[path = "../../../src-tauri/src/nova_tools_native/read.rs"]
-mod read;
-
 fn workspace_root(root: &str) -> Result<&Path> {
     let path = Path::new(root);
     if path.is_dir() {
@@ -20,18 +15,6 @@ fn workspace_root(root: &str) -> Result<&Path> {
             format!("workspace root is not a directory: {root}"),
         ))
     }
-}
-
-#[napi(js_name = "readFiles")]
-pub fn read_files(root: String, params: Value) -> Result<Value> {
-    read::read_files(workspace_root(&root)?, params)
-        .map_err(|message| Error::new(Status::GenericFailure, message))
-}
-
-#[napi(js_name = "editFiles")]
-pub fn edit_files(root: String, params: Value) -> Result<Value> {
-    edit::edit_files(workspace_root(&root)?, params)
-        .map_err(|message| Error::new(Status::GenericFailure, message))
 }
 
 #[napi(js_name = "fastContext")]

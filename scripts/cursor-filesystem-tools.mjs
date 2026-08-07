@@ -4,12 +4,8 @@ import { callNapiTool } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
 
 /**
- * Vega-style batch FS tools for Cursor SDK `local.customTools`.
- * Exposes code-context tools (fast_context, find_symbols).
- * read_files is intentionally omitted; use Cursor built-in Read.
- * edit_files is intentionally omitted because Cursor
- * CallMcpTool truncates/mangles large or heavily-escaped arguments.
- * Use Cursor built-in Write / StrReplace / Edit for mutations.
+ * Nova context tools for Cursor SDK `local.customTools`.
+ * Exposes fast_context and find_symbols; filesystem operations use Cursor built-ins.
  */
 export function createCursorFilesystemTools(cwd, options = {}) {
   void options;
@@ -72,7 +68,7 @@ export function cursorBatchToolPolicy(options = {}) {
       + "Do not dump large files blindly."
       + (readOnly
         ? ""
-        : " For edits, use Cursor built-in Write/Edit/StrReplace; do not expect a Nova edit_files tool."),
+        : " For edits, use Cursor built-in Write/Edit/StrReplace."),
     (fastContext
       ? "Search and traversal must be cost-bounded. If path and range are known, use Read directly. When edit distribution is unknown, or you plan to modify 2+ unread files, call fast_context once — one call typically replaces 5–10 grep+read round-trips. It returns complete EDIT/DEPS units plus IMPACT/SIG indexes using batched rg and an incremental symbol index; use find_symbols for locations only. Never re-read shown ranges. Read SIG/IMPACT bodies by exact path:line only when truly needed. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
       : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")

@@ -2929,6 +2929,13 @@ async fn run_prompt_for_images(
                 .run_prompt(thread_id, prompt, images)
                 .await
         }
+        AgentKind::Lyra => {
+            app.state::<AppState>()
+                .lyra
+                .clone()
+                .run_prompt(thread_id, prompt, images)
+                .await
+        }
         AgentKind::Devin => {
             app.state::<AppState>()
                 .acp
@@ -3193,6 +3200,7 @@ pub(crate) async fn cancel_employee_thread(app: &AppHandle, thread_id: &str) {
         .insert(thread_id.to_string());
     match kind {
         AgentKind::Alkaid => state.alkaid.cancel(thread_id).await,
+        AgentKind::Lyra => state.lyra.cancel(thread_id).await,
         AgentKind::Devin => state.acp.cancel(thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
@@ -3468,6 +3476,7 @@ fn employee_has_running_thread(app: &AppHandle, employee_id: &str) -> bool {
     };
     ids.iter().any(|(id, kind)| match kind {
         AgentKind::Alkaid => state.alkaid.is_running(id),
+        AgentKind::Lyra => state.lyra.is_running(id),
         AgentKind::Devin => state.acp.is_running(id),
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.is_running(id),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddyplus.is_running(id),

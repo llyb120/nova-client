@@ -11,10 +11,12 @@ mod credential_roaming;
 mod employees;
 mod gitwt;
 mod http_stream;
+mod lyra;
 mod marks;
 mod mind;
 mod model_cache;
 mod notice;
+mod nova_tools_native;
 mod nova_tools_napi_asset;
 mod opencode_sdk;
 mod path_env;
@@ -50,7 +52,9 @@ use codex::CodexManager;
 use credential_roaming::{BorrowedManager, BorrowedRuntime};
 use opencode_sdk::OpenCodeSdkManager;
 use relay::{RelayManager, Share, WorkflowShare};
-use sdk_adapters::{AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter};
+use sdk_adapters::{
+    AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter, LyraAdapter,
+};
 use sdk_runtime::SdkManager;
 use serde_json::{json, Value};
 use settings::Settings;
@@ -99,6 +103,8 @@ pub struct AppState {
     pub codex: Arc<CodexManager>,
     /// Alkaid 自研 pi agent 后端。
     pub alkaid: Arc<SdkManager>,
+    /// Lyra Rust 原生 agent 后端（与 Vega 共用配置，不经 Node bridge）。
+    pub lyra: Arc<SdkManager>,
     /// Codex 官方 TypeScript SDK 后端，不经过 app-server 集成层。
     pub codexplus: Arc<SdkManager>,
     /// CodeBuddy 官方 Agent SDK 后端。
@@ -164,6 +170,7 @@ impl AppState {
         let s = self.settings.lock().unwrap();
         match kind {
             AgentKind::Alkaid => s.alkaid_enabled,
+            AgentKind::Lyra => s.lyra_enabled,
             AgentKind::Devin => s.devin_enabled,
             AgentKind::Codex => s.codex_enabled,
             AgentKind::CodexPlus => s.codexplus_enabled,
@@ -246,11 +253,26 @@ impl AppState {
                 .generate_title_async(thread_id, prompt, fallback, model);
             return;
         }
+        if AgentKind::from_str(&agent_raw) == Some(AgentKind::Lyra)
+            && self.agent_enabled(&AgentKind::Lyra)
+        {
+            self.lyra
+                .generate_title_async(thread_id, prompt, fallback, model);
+            return;
+        }
         if agent_raw.is_empty()
             && origin == &AgentKind::Alkaid
             && self.agent_enabled(&AgentKind::Alkaid)
         {
             self.alkaid
+                .generate_title_async(thread_id, prompt, fallback, String::new());
+            return;
+        }
+        if agent_raw.is_empty()
+            && origin == &AgentKind::Lyra
+            && self.agent_enabled(&AgentKind::Lyra)
+        {
+            self.lyra
                 .generate_title_async(thread_id, prompt, fallback, String::new());
             return;
         }
@@ -320,6 +342,7 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     }
     match thread.agent_kind {
         AgentKind::Alkaid => state.alkaid.is_running(&thread.id),
+        AgentKind::Lyra => state.lyra.is_running(&thread.id),
         AgentKind::Devin => state.acp.is_running(&thread.id),
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.is_running(&thread.id),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
@@ -673,7 +696,11 @@ pub const EV_BACKENDS: &str = "backends:availability";
 fn backend_is_available(kind: &AgentKind, program: &str) -> bool {
     matches!(
         kind,
-        AgentKind::Alkaid | AgentKind::CodeBuddy | AgentKind::ClaudeCode | AgentKind::Cursor
+        AgentKind::Alkaid
+            | AgentKind::Lyra
+            | AgentKind::CodeBuddy
+            | AgentKind::ClaudeCode
+            | AgentKind::Cursor
     ) || acp::resolve_program_on_path(program).is_some()
 }
 
@@ -2038,6 +2065,12 @@ async fn merge_worktree_thread(
                         mgr.run_prompt(thread_id, prompt, vec![]).await;
                     });
                 }
+                AgentKind::Lyra => {
+                    let mgr = state.lyra.clone();
+                    tauri::async_runtime::spawn(async move {
+                        mgr.run_prompt(thread_id, prompt, vec![]).await;
+                    });
+                }
                 AgentKind::Devin => {
                     let mgr = state.acp.clone();
                     tauri::async_runtime::spawn(async move {
@@ -2978,6 +3011,7 @@ fn delete_time_machine_context(
     // 作废原生 session，并通过一次无感接力在新 session 中继续。旧压缩摘要也随之失效。
     match agent_kind {
         AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&thread_id),
+        AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
         AgentKind::Devin => state.acp.forget_session_of_thread(&thread_id),
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codexplus.forget_session_of_thread(&thread_id)
@@ -3087,6 +3121,7 @@ fn set_thread_model(
     } else {
         match agent_kind {
             AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&thread_id),
+            AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
             AgentKind::Codex | AgentKind::CodexPlus => {
                 state.codexplus.forget_session_of_thread(&thread_id)
             }
@@ -3286,6 +3321,7 @@ async fn get_model_options(
     }
     match agent_kind {
         AgentKind::Alkaid => state.alkaid.ensure_model_options().await.map(Some),
+        AgentKind::Lyra => state.lyra.ensure_model_options().await.map(Some),
         AgentKind::Devin => state.acp.ensure_model_options().await.map(Some),
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codex.ensure_model_options().await.map(Some)
@@ -3307,6 +3343,8 @@ async fn get_model_options(
 #[tauri::command]
 fn refresh_alkaid_config(state: State<'_, AppState>) {
     state.alkaid.notify_alkaid_config_changed();
+    // Lyra 与 Vega 共用配置文件，同步失效其模型列表缓存。
+    state.lyra.notify_alkaid_config_changed();
 }
 
 #[tauri::command]
@@ -3319,7 +3357,9 @@ async fn get_slash_commands(
         return Ok(Vec::new());
     }
     match agent_kind {
-        AgentKind::Alkaid => Ok(list_alkaid_skill_commands(&state.config_dir)),
+        AgentKind::Alkaid | AgentKind::Lyra => {
+            Ok(list_alkaid_skill_commands(&state.config_dir))
+        }
         AgentKind::Devin => {
             let commands = state.acp.fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
@@ -3494,6 +3534,18 @@ pub(crate) fn dispatch_prompt(
     match agent_kind {
         AgentKind::Alkaid => {
             let mgr = state.alkaid.clone();
+            if mgr.is_running(&thread_id) {
+                tauri::async_runtime::spawn(async move {
+                    mgr.steer_prompt(thread_id, text, images).await;
+                });
+            } else {
+                tauri::async_runtime::spawn(async move {
+                    mgr.run_prompt(thread_id, text, images).await;
+                });
+            }
+        }
+        AgentKind::Lyra => {
+            let mgr = state.lyra.clone();
             if mgr.is_running(&thread_id) {
                 tauri::async_runtime::spawn(async move {
                     mgr.steer_prompt(thread_id, text, images).await;
@@ -3884,6 +3936,7 @@ async fn cancel_turn(
     let kind = agent_kind_for_thread(&state, &thread_id)?;
     match kind {
         AgentKind::Alkaid => state.alkaid.cancel(&thread_id).await,
+        AgentKind::Lyra => state.lyra.cancel(&thread_id).await,
         AgentKind::Devin => state.acp.cancel(&thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(&thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
@@ -5796,6 +5849,11 @@ pub fn maybe_run_cli() -> bool {
     cli::maybe_run()
 }
 
+/// Lyra agent 原生入口（`nova lyra`）：命中则执行 stdio bridge 协议并退出，不启动 GUI。
+pub fn maybe_run_lyra() -> bool {
+    lyra::maybe_run()
+}
+
 /// 自更新内部 helper 入口：命中则替换旧 exe 并退出，不启动 GUI。
 pub fn maybe_run_update_helper() -> bool {
     updater::maybe_run_apply_helper()
@@ -5896,6 +5954,10 @@ pub fn run() {
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
             let alkaid = SdkManager::new(app.handle().clone(), AlkaidAdapter);
+            let lyra = SdkManager::new(app.handle().clone(), LyraAdapter);
+            // Lyra 进程内运行时：会话/技能/配置目录锚定到当前 profile 的数据根
+            // （debug 构建不回退到 release 的 ~/.nova）。
+            lyra::set_nova_root(dir.clone());
             let codexplus = SdkManager::new(app.handle().clone(), CodexAdapter);
             let codebuddyplus = SdkManager::new(app.handle().clone(), CodeBuddyAdapter);
             let claudeplus = SdkManager::new(app.handle().clone(), ClaudeAdapter);
@@ -5925,6 +5987,7 @@ pub fn run() {
                 opencodeplus,
                 codex,
                 alkaid,
+                lyra,
                 codexplus,
                 codebuddyplus,
                 claudeplus,
@@ -5984,6 +6047,11 @@ pub fn run() {
                 state.opencodeplus.spawn_revalidate_model_options();
                 if let Some(v) = model_cache::load(&dir, AgentKind::Alkaid.as_str()) {
                     state.alkaid.seed_model_options(v);
+                }
+                // Lyra 与 Vega 共用配置，刷新成功后同样按 "lyra" 写了磁盘缓存；
+                // 启动时一并灌入内存，避免首次打开选择器只能看到 pending 空占位。
+                if let Some(v) = model_cache::load(&dir, AgentKind::Lyra.as_str()) {
+                    state.lyra.seed_model_options(v);
                 }
                 if let Some(v) = model_cache::load(&dir, "codex") {
                     state.codex.seed_model_options(v);

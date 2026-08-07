@@ -1017,6 +1017,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         }
         let value = match kind {
             AgentKind::Alkaid => state.alkaid.get_model_options(),
+            AgentKind::Lyra => state.lyra.get_model_options(),
             AgentKind::Devin => state.acp.get_model_options(),
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
@@ -1865,6 +1866,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
     };
     match kind {
         AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&cmd.thread_id),
+        AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
         AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codexplus.forget_session_of_thread(&cmd.thread_id)
@@ -2471,6 +2473,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
     };
     match kind {
         AgentKind::Alkaid => state.alkaid.cancel(thread_id).await,
+        AgentKind::Lyra => state.lyra.cancel(thread_id).await,
         AgentKind::Devin => state.acp.cancel(thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {

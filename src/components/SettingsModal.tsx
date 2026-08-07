@@ -290,6 +290,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
   const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
   const [alkaidEnabled, setAlkaidEnabled] = createSignal(s?.alkaidEnabled !== false);
+  const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
   const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
   const [claudecodeEnabled, setClaudecodeEnabled] = createSignal(s?.claudecodeEnabled !== false);
@@ -416,6 +417,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     [
       devinEnabled(),
       alkaidEnabled(),
+      lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
       claudecodeEnabled(),
@@ -426,6 +428,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const quotaShareKinds = createMemo<AgentKind[]>(() => {
     const kinds: AgentKind[] = [];
     if (alkaidEnabled()) kinds.push("alkaid");
+    if (lyraEnabled()) kinds.push("lyra");
     if (devinEnabled()) kinds.push("devin");
     if (codexEnabled()) kinds.push("codex");
     if (codebuddyEnabled()) kinds.push("codebuddy");
@@ -697,6 +700,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     sessionShortcuts: draftSessionShortcuts(),
     devinEnabled: devinEnabled(),
     alkaidEnabled: alkaidEnabled(),
+    lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
     claudecodeEnabled: claudecodeEnabled(),
@@ -1562,6 +1566,23 @@ export function SettingsModal(props: { onClose: () => void }) {
                   {vegaRefreshing() ? "刷新中…" : "刷新配置"}
                 </button>
               </div>
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class={`agent-badge lyra`}>{agentLabel("lyra")}</span>
+                <span class="fixed-integration">原生</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={lyraEnabled()}
+                    disabled={lyraEnabled() && enabledCount() === 1}
+                    onChange={(e) => setLyraEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <span class="field-hint">Rust 原生 agent，不经 Node bridge；与 Vega 共用模型配置与 Skills。</span>
             </div>
 
             <div class="backend-card">

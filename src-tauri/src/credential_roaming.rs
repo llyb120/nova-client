@@ -6,7 +6,7 @@
 use crate::acp::AcpManager;
 use crate::opencode_sdk::OpenCodeSdkManager;
 use crate::sdk_adapters::{
-    AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter,
+    AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter, LyraAdapter,
 };
 use crate::sdk_runtime::SdkManager;
 use crate::threads::AgentKind;
@@ -218,8 +218,9 @@ pub fn collect_credentials(
     let mut files = Vec::new();
     let mut env = HashMap::new();
     match &agent_kind {
-        AgentKind::Alkaid => {
-            // 出借方已通过 bridge 导出合并后的生效配置（含解析后的密钥），直接打包
+        AgentKind::Alkaid | AgentKind::Lyra => {
+            // 出借方已通过 bridge 导出合并后的生效配置（含解析后的密钥），直接打包。
+            // Lyra 与 Vega 共用同一份配置文件。
             let config = alkaid_config
                 .map(str::trim)
                 .filter(|config| !config.is_empty())
@@ -385,6 +386,9 @@ pub fn materialize_runtime(
         AgentKind::Alkaid => {
             BorrowedManager::Sdk(SdkManager::new_with_env(app, AlkaidAdapter, launch_env))
         }
+        AgentKind::Lyra => {
+            BorrowedManager::Sdk(SdkManager::new_with_env(app, LyraAdapter, launch_env))
+        }
         AgentKind::Devin => BorrowedManager::Acp(AcpManager::new_with_env(
             app,
             AgentKind::Devin,
@@ -414,7 +418,7 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
     let mut env = HashMap::new();
     let as_string = |path: PathBuf| path.to_string_lossy().to_string();
     match kind {
-        AgentKind::Alkaid => {
+        AgentKind::Alkaid | AgentKind::Lyra => {
             // bridge 从 NOVA_DATA_DIR/alkaid/config.jsonc 读配置，指向隔离根目录即可
             env.insert("NOVA_DATA_DIR".into(), as_string(root.to_path_buf()));
         }
@@ -493,7 +497,7 @@ fn stage_local_skills(
     env: &HashMap<String, String>,
 ) -> Result<(), String> {
     let root = match kind {
-        AgentKind::Alkaid => env
+        AgentKind::Alkaid | AgentKind::Lyra => env
             .get("NOVA_DATA_DIR")
             .map(PathBuf::from)
             .map(|path| path.join("alkaid").join("skills")),
@@ -552,7 +556,7 @@ pub fn isolate_borrowed_command(command: &mut Command) {
 fn credential_path_allowed(kind: &AgentKind, raw: &str) -> bool {
     let path = raw.replace('\\', "/");
     match kind {
-        AgentKind::Alkaid => path == "alkaid/config.jsonc",
+        AgentKind::Alkaid | AgentKind::Lyra => path == "alkaid/config.jsonc",
         AgentKind::Devin => path == "appdata/devin/credentials.toml",
         AgentKind::Codex | AgentKind::CodexPlus => path == "codex-home/auth.json",
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {

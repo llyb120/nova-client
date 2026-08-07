@@ -116,7 +116,7 @@ impl SdkAdapter for AlkaidAdapter {
     }
 }
 
-fn alkaid_tool_call(value: &Value) -> ToolCall {
+pub(crate) fn alkaid_tool_call(value: &Value) -> ToolCall {
     let item_type = value.get("type").and_then(Value::as_str).unwrap_or("tool");
     let status = value
         .get("status")
@@ -194,8 +194,8 @@ fn alkaid_tool_call(value: &Value) -> ToolCall {
         ),
         kind: match tool {
             "bash" | "shell" => "execute",
-            "read" | "read_files" | "load_skill" => "read",
-            "edit" | "write" | "edit_files" => "edit",
+            "read" | "load_skill" => "read",
+            "edit" | "write" => "edit",
             "grep" | "find" | "ls" | "glob" => "search",
             _ => "other",
         }
@@ -216,7 +216,6 @@ fn tool_detail(tool: &str, arguments: Option<&Value>) -> Option<String> {
         "read" | "edit" | "write" | "ls" => arguments.get("path")?.as_str()?.to_string(),
         "grep" | "find" => arguments.get("pattern")?.as_str()?.to_string(),
         "load_skill" => arguments.get("name")?.as_str()?.to_string(),
-        "read_files" => format!("{} files", arguments.get("paths")?.as_array()?.len()),
         _ => return None,
     };
     Some(value.chars().take(160).collect())

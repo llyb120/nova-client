@@ -114,6 +114,18 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
             upgrade_args: Vec::new(),
             proxy: String::new(),
         },
+        AgentKind::Lyra => CliSpec {
+            // Rust 原生 agent，无外部 CLI。
+            kind: kind.clone(),
+            cli_name: "lyra",
+            program: "lyra".into(),
+            version_args: vec!["--version".into()],
+            install_program: String::new(),
+            install_args: Vec::new(),
+            upgrade_program: String::new(),
+            upgrade_args: Vec::new(),
+            proxy: String::new(),
+        },
         AgentKind::Devin => {
             let program = configured_cli_program(&settings.devin_path, &["devin"], "devin");
             #[cfg(windows)]
@@ -566,6 +578,7 @@ pub async fn statuses(settings: &Settings) -> Vec<CliStatus> {
 async fn stop_backend(state: &AppState, kind: &AgentKind) {
     match kind {
         AgentKind::Alkaid => state.alkaid.shutdown(),
+        AgentKind::Lyra => state.lyra.shutdown(),
         AgentKind::Devin => state.acp.restart().await,
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codexplus.shutdown();
@@ -633,7 +646,10 @@ pub async fn upgrade(
     settings: &Settings,
     operation_id: &str,
 ) -> Result<CliStatus, String> {
-    if matches!(kind, AgentKind::Cursor | AgentKind::Alkaid) {
+    if matches!(
+        kind,
+        AgentKind::Cursor | AgentKind::Alkaid | AgentKind::Lyra
+    ) {
         return Err(format!(
             "{} 后端仅使用官方 SDK，无需安装或升级 CLI",
             kind.label()
@@ -761,8 +777,11 @@ pub fn cancel(state: &AppState, operation_id: &str) -> bool {
 }
 
 pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
-    // Cursor / Alkaid 由内置 Node bridge + SDK 驱动，不依赖本机 agent CLI。
-    if matches!(kind, AgentKind::Cursor | AgentKind::Alkaid) {
+    // Cursor / Alkaid 由内置 Node bridge + SDK 驱动，Lyra 为 Rust 原生，均不依赖本机 agent CLI。
+    if matches!(
+        kind,
+        AgentKind::Cursor | AgentKind::Alkaid | AgentKind::Lyra
+    ) {
         return true;
     }
     let spec = spec_for(kind, settings);
