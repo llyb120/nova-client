@@ -132,11 +132,10 @@ fn started_tool_item(id: &str, name: &str, args: &Value) -> Value {
             "command": args.get("command").and_then(Value::as_str).unwrap_or_default(),
             "aggregatedOutput": "",
         }),
-        "edit" | "write" | "edit_files" => {
+        "edit" | "write" => {
             let path = args
                 .get("path")
                 .and_then(Value::as_str)
-                .or_else(|| args.pointer("/files/0/path").and_then(Value::as_str))
                 .unwrap_or_default();
             json!({ "id": id, "type": "file_change", "status": "in_progress", "tool": name, "arguments": args, "changes": [{ "path": path, "kind": "update" }] })
         }

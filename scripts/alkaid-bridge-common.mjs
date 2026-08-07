@@ -46,7 +46,7 @@ export function saveMessages(sessionId, messages) {
 }
 
 export function startedToolItem(event) {
-  const fileChange = event.toolName === "edit" || event.toolName === "write" || event.toolName === "edit_files";
+  const fileChange = event.toolName === "edit" || event.toolName === "write";
   const args = event.args && typeof event.args === "object" ? event.args : {};
   let type = "mcp_tool_call";
   let command;
@@ -60,10 +60,7 @@ export function startedToolItem(event) {
     [, server, tool] = event.toolName.split("__");
   } else if (fileChange) {
     type = "file_change";
-    const files = event.toolName === "edit_files"
-      ? (Array.isArray(args.files) ? args.files : [])
-      : [args];
-    changes = files
+    changes = [args]
       .filter((file) => file && typeof file.path === "string")
       .map((file) => ({ path: file.path, kind: "update" }));
   }

@@ -202,11 +202,6 @@ export function appendText(state, runId, type, text) {
   return { id, type: type === "assistant" ? "agent_message" : "reasoning", text: combined };
 }
 
-export function isEditFilesTool(name) {
-  const tool = String(name ?? "");
-  return tool === "edit_files" || tool.endsWith("__edit_files") || tool.endsWith("/edit_files");
-}
-
 export function isMcpEnvelope(value) {
   return value && typeof value === "object" && !Array.isArray(value)
     && typeof value.toolName === "string";
@@ -229,19 +224,13 @@ export function mapTool(state, callId, name, status, args, result) {
     : resultEnvelope;
   const item = {
     id: callId,
-    type: isEditFilesTool(tool) ? "file_change" : "mcp_tool_call",
+    type: "mcp_tool_call",
     server: "Cursor",
     tool,
     arguments: arguments_,
     result: normalizedResult,
     status: status === "error" ? "failed" : status === "running" ? "in_progress" : "completed",
   };
-  if (item.type === "file_change") {
-    const files = Array.isArray(arguments_?.files) ? arguments_.files : [];
-    item.changes = files
-      .map((file) => ({ path: typeof file?.path === "string" ? file.path : "", kind: "update" }))
-      .filter((change) => change.path);
-  }
   state.tools.set(callId, item);
   let trace = state.trace.find((entry) => entry.id === callId);
   if (!trace) {

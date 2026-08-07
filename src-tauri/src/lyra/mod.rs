@@ -13,8 +13,10 @@
 mod agent;
 mod bridge;
 mod config;
+mod edit;
 mod prompt;
 mod provider;
+mod read;
 mod reasonix;
 mod tools;
 

@@ -34,14 +34,12 @@ import {
   loadAlkaidSkills,
   mergeAlkaidUsage,
   messagesWithPendingAlkaidPrompt,
-  novaEditFilesEnabled,
   OPENAI_TOOL_OUTPUT_MAX_CHARS,
   OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
   resolveAlkaidShellConfig,
   restoreAlkaidSteeringForRetry,
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
-import { applySmartEdits } from "./alkaid-smart-edit.mjs";
 
 const configuredModel = {
   id: "gpt-test",
@@ -588,110 +586,6 @@ test("text decoding handles PowerShell UTF-16 output", () => {
   assert.equal(decodeTextBuffer(Buffer.from(text, "utf16le")), text);
 });
 
-test("batch edit_files remains available as Alkaid enhancement", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "alkaid-batch-"));
-  await Promise.all([writeFile(join(cwd, "a.txt"), "A"), writeFile(join(cwd, "b.txt"), "B")]);
-  const editTool = createCodingTools(cwd).find((tool) => tool.name === "edit");
-  const tools = createFilesystemTools(cwd, editTool);
-  assert.equal(tools.some((tool) => tool.name === "read_files"), false);
-  const editFiles = tools.find((tool) => tool.name === "edit_files");
-  await editFiles.execute("2", { files: [
-    { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] },
-    { path: "b.txt", edits: [{ oldText: "B", newText: "BB" }] },
-  ] });
-  assert.deepEqual(await Promise.all([readFile(join(cwd, "a.txt"), "utf8"), readFile(join(cwd, "b.txt"), "utf8")]), ["AA", "BB"]);
-});
-
-test("smart edits use normalized anchors and preserve the matched indentation", () => {
-  const source = [
-    "function outer() {",
-    "    if (ready) {   ",
-    "        log(“old”);",
-    "    }",
-    "}",
-  ].join("\n");
-  const result = applySmartEdits(source, [{
-    oldText: "if (ready) {\n    log(\"old\");\n}",
-    newText: "if (ready) {\n    log(\"new\");\n}",
-  }], "sample.js");
-  assert.equal(result.matches[0].mode, "relative-indent");
-  assert.match(result.content, /    if \(ready\) \{\n        log\(\"new\"\);\n    \}/);
-});
-
-test("smart edits require the complete relative indentation shape", () => {
-  const source = [
-    "function outer() {",
-    "      if (ready) {",
-    "          work();",
-    "      }",
-    "}",
-  ].join("\n");
-  const result = applySmartEdits(source, [{
-    oldText: "if (ready) {\n    work();\n}",
-    newText: "if (ready) {\n    done();\n}",
-  }], "relative.js");
-  assert.equal(result.matches[0].mode, "relative-indent");
-  assert.match(result.content, /      if \(ready\) \{\n          done\(\);\n      \}/);
-});
-
-test("smart edits reject fuzzy ambiguity", () => {
-  const source = [
-    "function first() {", "  calculate(invoiceSubtotal, regionalTax, shippingFee, discountCode, currencyA);", "}",
-    "function second() {", "  calculate(invoiceSubtotal, regionalTax, shippingFee, discountCode, currencyB);", "}",
-  ].join("\n");
-  assert.throws(() => applySmartEdits(source, [{
-    oldText: "calculate(invoiceSubtotal, regionalTax, shippingFee, discountCode, currencyC);",
-    newText: "return total;",
-  }], "ambiguous.js"), /Ambiguous fuzzy match/);
-});
-
-test("batch smart edits validate every file before writing", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "alkaid-smart-transaction-"));
-  await Promise.all([writeFile(join(cwd, "a.txt"), "alpha"), writeFile(join(cwd, "b.txt"), "beta")]);
-  const editTool = createCodingTools(cwd).find((tool) => tool.name === "edit");
-  const editFiles = createFilesystemTools(cwd, editTool).find((tool) => tool.name === "edit_files");
-  await assert.rejects(() => editFiles.execute("1", { files: [
-    { path: "a.txt", edits: [{ oldText: "alpha", newText: "changed" }] },
-    { path: "b.txt", edits: [{ oldText: "missing", newText: "changed" }] },
-  ] }), /Could not find/);
-  assert.deepEqual(await Promise.all([readFile(join(cwd, "a.txt"), "utf8"), readFile(join(cwd, "b.txt"), "utf8")]), ["alpha", "beta"]);
-});
-
-test("batch edit_files allow absolute paths outside the workspace", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "alkaid-paths-"));
-  const cwd = join(parent, "workspace");
-  await mkdir(cwd);
-  const outside = join(parent, "outside.txt");
-  await writeFile(outside, "outside");
-  await writeFile(join(cwd, "x.txt"), "x");
-
-  const codingTools = createCodingTools(cwd);
-  const nativeRead = codingTools.find((tool) => tool.name === "read");
-  const editTool = codingTools.find((tool) => tool.name === "edit");
-  const editFiles = createFilesystemTools(cwd, editTool).find((tool) => tool.name === "edit_files");
-  assert.match((await nativeRead.execute("1", { path: outside })).content[0].text, /outside/);
-  const absoluteInside = join(cwd, "x.txt");
-  await editFiles.execute("3", { files: [
-    { path: absoluteInside, edits: [{ oldText: "x", newText: "inside" }] },
-  ] });
-  assert.equal(await readFile(absoluteInside, "utf8"), "inside");
-  await editFiles.execute("4", { files: [
-    { path: outside, edits: [{ oldText: "outside", newText: "changed" }] },
-  ] });
-  assert.equal(await readFile(outside, "utf8"), "changed");
-  await writeFile(absoluteInside, "alpha\nbeta\ngamma");
-  await editFiles.execute("5", { files: [
-    { path: "x.txt", edits: [{ oldText: "alpha", newText: "ALPHA" }] },
-    { path: absoluteInside, edits: [{ oldText: "gamma", newText: "GAMMA" }] },
-  ] });
-  assert.equal(await readFile(absoluteInside, "utf8"), "ALPHA\nbeta\nGAMMA");
-  await assert.rejects(() => editFiles.execute("6", { files: [
-    { path: "x.txt", edits: [{ oldText: "ALPHA\nbeta", newText: "first" }] },
-    { path: absoluteInside, edits: [{ oldText: "beta\nGAMMA", newText: "second" }] },
-  ] }), /overlap/);
-});
-
-
 test("skills are discovered via pi loadSkillsFromDir", async () => {
   const root = await mkdtemp(join(tmpdir(), "nova-skills-test-"));
   const skillDir = join(root, "demo");
@@ -938,13 +832,8 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.equal(runtime.agent.steeringMode, "all");
     const toolNames = runtime.agent.state.tools.map((tool) => tool.name);
     assert.equal(toolNames.includes("read_files"), false);
-    assert.equal(toolNames.includes("edit_files"), novaEditFilesEnabled());
-    if (novaEditFilesEnabled()) {
-      assert.match(runtime.agent.state.systemPrompt, /必须使用 edit_files/);
-    } else {
-      assert.match(runtime.agent.state.systemPrompt, /修改已有文件时使用原生 edit/);
-      assert.doesNotMatch(runtime.agent.state.systemPrompt, /必须使用 edit_files/);
-    }
+    assert.equal(toolNames.includes("edit_files"), false);
+    assert.match(runtime.agent.state.systemPrompt, /修改已有文件时使用原生 edit/);
     if (process.env.NOVA_FAST_CONTEXT !== "0") assert(toolNames.includes("fast_context"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "load_skill"));

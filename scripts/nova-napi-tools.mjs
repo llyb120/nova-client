@@ -55,8 +55,6 @@ export function napiToolsAvailable() {
 
 export async function callNapiTool(method, root, params) {
   const native = loadBinding();
-  if (method === "read_files") return native.readFiles(resolve(root), params ?? {});
-  if (method === "edit_files") return native.editFiles(resolve(root), params ?? {});
   if (method === "fast_context") return native.fastContext(resolve(root), params ?? {});
   if (method === "find_symbols") return native.findSymbols(resolve(root), params ?? {});
   if (method === "code_map") return native.codeMap(resolve(root), params ?? {});
@@ -72,7 +70,6 @@ export async function callNapiToolOrFallback(method, root, params, fallback) {
     if (mode === "native" || mode === "napi") throw error;
     return fallback();
   }
-  // Once native execution starts, propagate errors. edit_files may already have touched disk;
-  // retrying through JS could apply the same mutation twice.
+  // Once native execution starts, propagate errors instead of silently changing backends.
   return callNapiTool(method, root, params);
 }

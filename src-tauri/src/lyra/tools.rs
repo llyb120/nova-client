@@ -5,7 +5,8 @@ use crate::lyra::prompt::{
     clamp_tool_output_text, govern_tool_text, FAST_CONTEXT_OUTPUT_MAX_BYTES,
     TOOL_OUTPUT_CONTEXT_MAX_BYTES,
 };
-use crate::nova_tools_native::{context, edit as native_edit, read as native_read};
+use crate::lyra::{edit as native_edit, read as native_read};
+use crate::nova_tools_native::context;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,8 @@ const FAST_CONTEXT_DESCRIPTION: &str = "任务涉及跨文件查找或修改（�
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。行号可直接用于 edit 的 startLine/endLine 行区间替换。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。禁止无排除的递归搜索（grep -r 等）。";
 const EDIT_DESCRIPTION: &str = "对单个文件做精确文本替换。两种定位方式二选一：(a) oldText：文件当前内容中唯一匹配的原文（支持轻微差异的模糊定位；失败时错误信息自带最相似候选的真实内容，可直接修正重试）；(b) startLine+endLine（1 起始、闭区间）：直接替换行区间，无需复述原文，建议附 firstLine/lastLine（边界行当前原文，来自 read/fast_context 输出）做防漂移校验，坐标过期时会返回实际行内容。多处修改合并到同一次调用；写入前全量校验，任一 edit 无法定位则整体拒绝；成功后返回改动处带行号的回显，无需再 read 验证。";
-const WRITE_DESCRIPTION: &str = "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
+const WRITE_DESCRIPTION: &str =
+    "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
 const FIND_SYMBOLS_DESCRIPTION: &str = "并行定位多个符号在仓库中的所有出现位置（文件:行号）。只要行号不要正文时用；需要上下文用 fast_context。";
 
 /// 基准对照：原版（HEAD / PI 语义）工具描述。
@@ -34,17 +36,6 @@ fn final_note_enabled() -> bool {
 }
 
 const FINAL_NOTE_DESCRIPTION: &str = "确信这是本任务最后一次工具调用时，把给用户的最终总结写在这里：工具结果返回后本轮立即结束，省去一个纯总结回合（不影响工具本身执行）。之后还需调用任何工具时禁止填写。";
-
-
-/// read 输出的行号前缀：`行号|内容`，坐标可直接用于 edit 的 startLine/endLine。
-fn add_line_numbers(content: &str, start_line: usize) -> String {
-    content
-        .split('\n')
-        .enumerate()
-        .map(|(i, line)| format!("{}|{}", start_line + i, line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 pub struct Tool {
     pub name: &'static str,
@@ -257,7 +248,12 @@ fn text_of(value: &Value) -> String {
 }
 
 /// 应用 Reasonix 工具结果治理：超限归档 + 首尾截断 + OpenAI 硬上限。
-fn govern(outcome: ToolOutcome, name: &str, call_id: &str, archive_dir: Option<&Path>) -> ToolOutcome {
+fn govern(
+    outcome: ToolOutcome,
+    name: &str,
+    call_id: &str,
+    archive_dir: Option<&Path>,
+) -> ToolOutcome {
     let text = text_of(&json!({ "content": outcome.content }));
     let max_bytes = if name == "fast_context" {
         FAST_CONTEXT_OUTPUT_MAX_BYTES
@@ -344,7 +340,9 @@ async fn run_bash(
         use std::os::windows::process::CommandExt;
         process.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let mut child = process.spawn().map_err(|e| format!("启动 shell 失败：{e}"))?;
+    let mut child = process
+        .spawn()
+        .map_err(|e| format!("启动 shell 失败：{e}"))?;
     let mut guard = PidGuard(child.id());
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
@@ -469,52 +467,27 @@ async fn execute_inner(
             let Some(path) = args.get("path").and_then(Value::as_str) else {
                 return ToolOutcome::error("read 缺少 path");
             };
-            let mut request = json!({ "path": path });
-            if let Some(offset) = args.get("offset").and_then(Value::as_u64) {
-                request["offset"] = json!(offset);
-            }
-            if let Some(limit) = args.get("limit").and_then(Value::as_u64) {
-                request["limit"] = json!(limit);
-            }
-            let root_buf = root.to_path_buf();
-            let result = tokio::task::spawn_blocking(move || {
-                native_read::read_files(&root_buf, json!({ "paths": [request] }))
+            let offset = args
+                .get("offset")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            let root = root.to_path_buf();
+            let path = path.to_string();
+            let numbered = !legacy_edit_mode();
+            match tokio::task::spawn_blocking(move || {
+                native_read::read(&root, &path, offset, limit, numbered)
             })
-            .await;
-            match result {
-                Ok(Ok(Value::Array(items))) => {
-                    let item = items.into_iter().next().unwrap_or(Value::Null);
-                    if let Some(error) = item.get("error").and_then(Value::as_str) {
-                        return ToolOutcome::error(error.to_string());
-                    }
-                    let content = item.get("content").and_then(Value::as_str).unwrap_or_default();
-                    let start_line = item.get("startLine").and_then(Value::as_u64).unwrap_or(1) as usize;
-                    let lines_read = item.get("linesRead").and_then(Value::as_u64).unwrap_or(0);
-                    // H 的前置：`行号|内容` 前缀，让模型拿到可直接用于 startLine/endLine 的坐标。
-                    // legacy 模式（基准对照）保持原版裸正文输出。
-                    let numbered = if legacy_edit_mode() || lines_read == 0 || content.is_empty() {
-                        content.to_string()
-                    } else {
-                        add_line_numbers(content, start_line)
-                    };
-                    let mut meta = Vec::new();
-                    if item.get("hasMore").and_then(Value::as_bool) == Some(true) {
-                        let next = item.get("nextOffset").and_then(Value::as_u64).unwrap_or(0);
-                        meta.push(format!("hasMore: true, nextOffset: {next}"));
-                    }
-                    if let Some(stop) = item.get("stopReason").and_then(Value::as_str) {
-                        if stop != "eof" {
-                            meta.push(format!("stopReason: {stop}"));
-                        }
-                    }
-                    let text = if meta.is_empty() {
-                        numbered
-                    } else {
-                        format!("{numbered}\n\n[{}]", meta.join(", "))
-                    };
-                    ToolOutcome::text(text)
-                }
-                Ok(Ok(_)) => ToolOutcome::error("read 返回格式异常"),
+            .await
+            {
+                Ok(Ok(content)) => ToolOutcome {
+                    content,
+                    details: None,
+                    is_error: false,
+                },
                 Ok(Err(error)) => ToolOutcome::error(error),
                 Err(e) => ToolOutcome::error(format!("read 执行失败：{e}")),
             }
@@ -563,14 +536,10 @@ async fn execute_inner(
                 }
             }
             let root_buf = root.to_path_buf();
-            let params = json!({ "files": [{ "path": path, "edits": edits }] });
+            let path = path.to_string();
+            let edits = Value::Array(edits.clone());
             let result = tokio::task::spawn_blocking(move || {
-                // 增强模式：H 行区间定位 / A 失败回读 / E 成功回显；legacy 走原版入口（基准对照）
-                if legacy {
-                    native_edit::edit_files(&root_buf, params)
-                } else {
-                    native_edit::edit_files_enhanced(&root_buf, params)
-                }
+                native_edit::edit(&root_buf, &path, edits, !legacy)
             })
             .await;
             match result {
@@ -581,18 +550,18 @@ async fn execute_inner(
                         .unwrap_or("编辑完成");
                     // E：把改动处带行号的回显拼进模型可见文本，免验证性 read。
                     let mut text = message.to_string();
-                    if let Some(files) = value.get("previews").and_then(Value::as_array) {
-                        for file in files {
-                            let path = file.get("path").and_then(Value::as_str).unwrap_or_default();
-                            if let Some(list) = file.get("edits").and_then(Value::as_array) {
-                                for preview in list {
-                                    let line =
-                                        preview.get("line").and_then(Value::as_u64).unwrap_or(0);
-                                    let body =
-                                        preview.get("text").and_then(Value::as_str).unwrap_or_default();
-                                    text.push_str(&format!("\n\n{path} @@ {line}:\n{body}"));
-                                }
-                            }
+                    let path = value
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if let Some(previews) = value.get("previews").and_then(Value::as_array) {
+                        for preview in previews {
+                            let line = preview.get("line").and_then(Value::as_u64).unwrap_or(0);
+                            let body = preview
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            text.push_str(&format!("\n\n{path} @@ {line}:\n{body}"));
                         }
                     }
                     let mut outcome = ToolOutcome::text(text);
@@ -607,7 +576,10 @@ async fn execute_inner(
             let Some(path) = args.get("path").and_then(Value::as_str) else {
                 return ToolOutcome::error("write 缺少 path");
             };
-            let content = args.get("content").and_then(Value::as_str).unwrap_or_default();
+            let content = args
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let target = resolve_path(root, path);
             if let Some(parent) = target.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
@@ -640,7 +612,8 @@ mod tests {
     }
 
     fn temp_case_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nova-lyra-bash-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("nova-lyra-bash-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -711,16 +684,5 @@ mod tests {
             "取消后孙进程 {grandchild} 未被清理"
         );
         let _ = std::fs::remove_dir_all(dir);
-    }
-}
-
-#[cfg(test)]
-mod hea_tests {
-    use super::add_line_numbers;
-
-    #[test]
-    fn read_lines_are_prefixed_with_line_numbers() {
-        assert_eq!(add_line_numbers("alpha\nbeta", 41), "41|alpha\n42|beta");
-        assert_eq!(add_line_numbers("only", 1), "1|only");
     }
 }

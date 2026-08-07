@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { Agent } from "@cursor/sdk";
-import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isCursorStallAbortError, isEditFilesTool, isRetryableCursorError, mapDelta, mapMessage, modelOptions, modelSelection } from "./cursor-bridge-common.mjs";
+import { completePendingTools, createMessageState, cursorModelOptions, cursorShellProgram, cursorTodoPlan, isCursorStallAbortError, isRetryableCursorError, mapDelta, mapMessage, modelOptions, modelSelection } from "./cursor-bridge-common.mjs";
 import { createCursorFilesystemTools, cursorPromptPrefix } from "./cursor-filesystem-tools.mjs";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -1233,7 +1233,6 @@ export {
   formatSlimMemory,
   pendingTurnContext,
   ingestCompactHistory,
-  isEditFilesTool,
   isNovaDenyTaskHook,
   isRetryableCursorError,
   shouldSilentRetryCursorTurn,
