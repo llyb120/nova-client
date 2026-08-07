@@ -44,6 +44,8 @@
   --yellow: #d4b26e;
   --violet: #b19ddd;
   --green: #8ec489;
+  /* 灰原哀发色：薄茶偏红的红茶色，亮底主题用加深版保对比 */
+  --tea: #e09b78;
   --amber: #d9a05f;
   --purple: var(--violet);
   --ok: var(--green);
@@ -100,6 +102,7 @@
   --yellow: #96721f;
   --violet: #6a55a8;
   --green: #3f7d3a;
+  --tea: #b0603c;
   --amber: #a6742a;
   --purple: var(--violet);
   --ok: var(--green);
@@ -634,9 +637,9 @@ button {
 
 .thread-agent.lyra,
 .agent-badge.lyra {
-  color: var(--green);
-  border-color: color-mix(in srgb, var(--green) 40%, transparent);
-  background: color-mix(in srgb, var(--green) 14%, transparent);
+  color: var(--tea);
+  border-color: color-mix(in srgb, var(--tea) 40%, transparent);
+  background: color-mix(in srgb, var(--tea) 14%, transparent);
 }
 
 .thread-agent.devin,
