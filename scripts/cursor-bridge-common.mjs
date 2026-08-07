@@ -371,7 +371,7 @@ export function encodeModelVariant(model, variant) {
 }
 
 export function cursorModelOptions(models) {
-  const options = [{ value: "", name: "Auto（Cursor 默认）" }];
+  const options = [{ value: "", name: "Auto（自动选具体模型）" }];
   for (const model of models) {
     if (!model.id || ["auto", "default"].includes(model.id.toLowerCase())) continue;
     if (model.variants?.length) {
