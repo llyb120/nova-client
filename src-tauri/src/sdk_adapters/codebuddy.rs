@@ -36,15 +36,26 @@ impl SdkAdapter for CodeBuddyAdapter {
             proxy: settings.codebuddy_proxy.clone(),
             path_env: "NOVA_CODEBUDDY_PATH",
             api_key: None,
-            extra_env: vec![(
-                "NOVA_FAST_CONTEXT",
-                if settings.fast_context_enabled {
-                    "1"
-                } else {
-                    "0"
-                }
-                .into(),
-            )],
+            extra_env: vec![
+                (
+                    "NOVA_FAST_CONTEXT",
+                    if settings.fast_context_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
+                (
+                    "NOVA_ENHANCED_FAST_CONTEXT",
+                    if settings.enhanced_fast_context_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
+            ],
         }
     }
 

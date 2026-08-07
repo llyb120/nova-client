@@ -147,6 +147,8 @@ pub struct Settings {
     pub semantic_enabled: bool,
     /// 启用 Fast Context：为 Vega / Cursor / Devin 注入 fast_context / find_symbols 上下文检索工具；关闭则不附带。
     pub fast_context_enabled: bool,
+    /// 增强 Fast Context：输出完整 span、边界来源、完整性和预算省略清单；关闭时保持旧版输出契约。
+    pub enhanced_fast_context_enabled: bool,
     /// embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434）
     pub embed_endpoint: String,
     /// embedding 模型名（如 bge-m3 / nomic-embed-text / text-embedding-3-small）
@@ -219,6 +221,7 @@ impl Default for Settings {
             session_auto_cleanup_hours: 24 * 30,
             semantic_enabled: false,
             fast_context_enabled: true,
+            enhanced_fast_context_enabled: true,
             embed_endpoint: "http://localhost:11434".into(),
             embed_model: "bge-m3".into(),
             embed_api_key: String::new(),
@@ -252,7 +255,15 @@ mod tests {
 
     #[test]
     fn fast_context_is_enabled_by_default() {
-        assert!(Settings::default().fast_context_enabled);
+        let settings = Settings::default();
+        assert!(settings.fast_context_enabled);
+        assert!(settings.enhanced_fast_context_enabled);
+    }
+
+    #[test]
+    fn enhanced_fast_context_defaults_on_for_legacy_settings() {
+        let settings: Settings = serde_json::from_str(r#"{"fastContextEnabled":true}"#).unwrap();
+        assert!(settings.enhanced_fast_context_enabled);
     }
 
     #[test]

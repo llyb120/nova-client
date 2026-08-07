@@ -45,6 +45,15 @@ impl SdkAdapter for AlkaidAdapter {
                     }
                     .into(),
                 ),
+                (
+                    "NOVA_ENHANCED_FAST_CONTEXT",
+                    if settings.enhanced_fast_context_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
             ],
         }
     }

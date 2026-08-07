@@ -2958,6 +2958,11 @@ fn levenshtein(a: &str, b: &str, cap: usize) -> usize {
 }
 
 fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
+    // 默认开启增强输出；显式 false 时保持优化前文本契约。
+    let enhanced = params
+        .get("enhanced")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let mut keyword_seen = HashSet::new();
     let keywords: Vec<String> = params
         .get("keywords")
@@ -4592,11 +4597,20 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                     ""
                 };
                 if plan.full {
-                    body.push(format!(
-                        "### {} ({}L) FULL{exact_mark}",
-                        plan.file,
-                        plan.source.lines.len()
-                    ));
+                    body.push(if enhanced {
+                        format!(
+                            "### {} ({}L) FULL span=1-{} complete=true boundary=file{exact_mark}",
+                            plan.file,
+                            plan.source.lines.len(),
+                            plan.source.lines.len()
+                        )
+                    } else {
+                        format!(
+                            "### {} ({}L) FULL{exact_mark}",
+                            plan.file,
+                            plan.source.lines.len()
+                        )
+                    });
                     body.extend(plan.source.lines.iter().map(|line| clip(line)));
                     block_count += 1;
                 } else {
@@ -4622,17 +4636,29 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                     blocks.sort_by_key(|block| block.start);
                     for block in blocks {
                         block_count += 1;
-                        body.push(format!(
-                            "@@ {}-{} {}{}",
-                            block.start,
-                            block.end,
-                            block.label,
-                            if block.tag == "hit" {
-                                "".into()
-                            } else {
-                                format!(" [{}]", block.tag)
-                            }
-                        ));
+                        let symbol = plan
+                            .source
+                            .syms
+                            .iter()
+                            .find(|symbol| symbol.ln == block.start && symbol.end == block.end);
+                        let boundary = if symbol.is_some() { "ast" } else { "heuristic" };
+                        let symbol_span = symbol
+                            .map(|value| format!(" symbolSpan={}-{}", value.ln, value.end))
+                            .unwrap_or_default();
+                        let tag = if block.tag == "hit" {
+                            String::new()
+                        } else {
+                            format!(" [{}]", block.tag)
+                        };
+                        body.push(if enhanced {
+                            format!(
+                                "@@ {}-{} {}{} editUnitSpan={}-{}{} complete=true boundary={boundary}",
+                                block.start, block.end, block.label, tag,
+                                block.start, block.end, symbol_span
+                            )
+                        } else {
+                            format!("@@ {}-{} {}{}", block.start, block.end, block.label, tag)
+                        });
                         body.extend(
                             plan.source.lines[block.start - 1..block.end]
                                 .iter()
@@ -4704,23 +4730,47 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                     seed_names.iter().any(|name| row.text.contains(name)) || graph_hit
                 };
                 if seed_ref {
-                    impacts.push(format!(
-                        "{}:{} {}{}",
-                        file,
-                        row.ln,
-                        js_utf16_slice(row.text.trim(), 120),
-                        if graph_hit { " [import图]" } else { "" }
-                    ));
+                    let span = sources
+                        .get(file)
+                        .and_then(|source| unit_for_hit(&source.syms, row.ln).0)
+                        .map(|symbol| (symbol.ln, symbol.end, "ast"))
+                        .unwrap_or((row.ln, row.ln, "heuristic"));
+                    impacts.push(if enhanced {
+                        format!(
+                            "{}:{}-{} hitLine={} complete=true boundary={} {}{}",
+                            file,
+                            span.0,
+                            span.1,
+                            row.ln,
+                            span.2,
+                            js_utf16_slice(row.text.trim(), 120),
+                            if graph_hit { " [import图]" } else { "" }
+                        )
+                    } else {
+                        format!(
+                            "{}:{} {}{}",
+                            file,
+                            row.ln,
+                            js_utf16_slice(row.text.trim(), 120),
+                            if graph_hit { " [import图]" } else { "" }
+                        )
+                    });
                 }
             }
         }
         impacts.sort();
         if !impacts.is_empty() {
-            body.push(format!(
-                "## IMPACT (调用方/引用清单 {}/{}, 仅行; 确需函数体按 path:ln 补读)",
-                impacts.len().min(impact_limit),
-                impacts.len()
-            ));
+            body.push(if enhanced {
+                format!(
+                    "## IMPACT (调用方/引用清单 {}/{}, 完整调用单元 span; 确需正文按 path:start-end 精确补读)",
+                    impacts.len().min(impact_limit), impacts.len()
+                )
+            } else {
+                format!(
+                    "## IMPACT (调用方/引用清单 {}/{}, 仅行; 确需函数体按 path:ln 补读)",
+                    impacts.len().min(impact_limit), impacts.len()
+                )
+            });
             body.extend(impacts.into_iter().take(impact_limit));
             body.push(String::new());
         }
@@ -4810,11 +4860,40 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
         body.push(String::new());
         if !sigs.is_empty() {
-            body.push("## SIG (预算内放不下或最终回退的定义, 仅签名)".into());
+            body.push(if enhanced {
+                "## SIG (预算内放不下或最终回退的定义, 仅签名但含完整 span)".into()
+            } else {
+                "## SIG (预算内放不下或最终回退的定义, 仅签名)".into()
+            });
             for (file, line, sig) in sigs {
-                body.push(format!("{file}:{line} {sig}"));
+                let (end, boundary) = sources
+                    .get(file)
+                    .and_then(|source| source.syms.iter().find(|symbol| symbol.ln == *line))
+                    .map(|symbol| (symbol.end, "ast"))
+                    .unwrap_or((*line, "heuristic"));
+                body.push(if enhanced {
+                    format!("{file}:{line}-{end} complete=false boundary={boundary} {sig}")
+                } else {
+                    format!("{file}:{line} {sig}")
+                });
             }
             body.push(String::new());
+            if enhanced {
+                body.push("## OMITTED (完整单元未展开)".into());
+                for (file, line, sig) in sigs {
+                    let (end, boundary) = sources
+                        .get(file)
+                        .and_then(|source| source.syms.iter().find(|symbol| symbol.ln == *line))
+                        .map(|symbol| (symbol.end, "ast"))
+                        .unwrap_or((*line, "heuristic"));
+                    body.push(format!(
+                    "{file}:{line}-{end} reason=budget complete=false boundary={boundary} symbol={}",
+                    js_utf16_slice(sig, 80)
+                ));
+                }
+                body.push("continuation: 以 OMITTED 的 path:start-end 精确 read，或将对应 path 加入 files 重调 fast_context。".into());
+                body.push(String::new());
+            }
         }
         let mut notes = Vec::new();
         if !compact_index {
@@ -4868,11 +4947,20 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                     .sum::<usize>()
             })
             .sum::<usize>();
-        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 契约: 已按修改计划构建符号关系、计算任务闭包并做缺口证明；正文均为完整单元/完整文件。已展示行段禁止重读。",
-            if keywords.is_empty() { String::new() } else { format!("q={}", keywords.join(",")) },
-            if task.is_empty() { String::new() } else { format!(" task=\"{}\"", js_utf16_slice(&task, 80)) },
-            if files.is_empty() { String::new() } else { format!(" files={}", files.join(",")) },
-            revision, order.len(), block_count, shown_lines, content.len() as f64 / 1024.0);
+        let complete = sigs.is_empty();
+        let mut head = if enhanced {
+            format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB complete={}\n# 契约: 已按修改计划构建符号关系、计算任务闭包并做缺口证明；正文均为完整单元/完整文件，每段含 inclusive endLine 与边界来源。已展示行段禁止重读。",
+                if keywords.is_empty() { String::new() } else { format!("q={}", keywords.join(",")) },
+                if task.is_empty() { String::new() } else { format!(" task=\"{}\"", js_utf16_slice(&task, 80)) },
+                if files.is_empty() { String::new() } else { format!(" files={}", files.join(",")) },
+                revision, order.len(), block_count, shown_lines, content.len() as f64 / 1024.0, complete)
+        } else {
+            format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 契约: 已按修改计划构建符号关系、计算任务闭包并做缺口证明；正文均为完整单元/完整文件。已展示行段禁止重读。",
+                if keywords.is_empty() { String::new() } else { format!("q={}", keywords.join(",")) },
+                if task.is_empty() { String::new() } else { format!(" task=\"{}\"", js_utf16_slice(&task, 80)) },
+                if files.is_empty() { String::new() } else { format!(" files={}", files.join(",")) },
+                revision, order.len(), block_count, shown_lines, content.len() as f64 / 1024.0)
+        };
         for note in notes {
             head.push_str(&format!("\n# {note}"));
         }
@@ -5115,7 +5203,61 @@ mod tests {
         let out = fast_context(d.path(), serde_json::json!({"keywords":["target"]})).unwrap();
         assert!(out.contains("export function target"));
         assert!(out.contains("\n}"));
+        assert!(out.contains("complete=true"), "{out}");
+        assert!(out.contains("boundary="), "{out}");
+        assert!(
+            out.contains("span=1-3") || out.contains("editUnitSpan=1-3"),
+            "{out}"
+        );
         assert!(!out.contains("partial"));
+    }
+
+    #[test]
+    fn impact_and_omitted_entries_include_complete_spans() {
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("target.ts"),
+            "export function targetApi() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("caller.ts"),
+            "import { targetApi } from './target';\nexport function caller() {\n  return targetApi();\n}\n",
+        )
+        .unwrap();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":["targetApi"], "task":"inspect callers", "maxBytes":8192}),
+        )
+        .unwrap();
+        for line in out.lines().filter(|line| line.starts_with("caller.ts:")) {
+            assert!(line.contains('-'), "{line}");
+            assert!(line.contains("boundary="), "{line}");
+        }
+        for line in out.lines().filter(|line| line.contains("reason=budget")) {
+            assert!(line.contains('-'), "{line}");
+            assert!(line.contains("complete=false"), "{line}");
+        }
+    }
+
+    #[test]
+    fn enhanced_output_can_be_disabled_for_legacy_contract() {
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("a.ts"),
+            "export function target() {\n return 1;\n}\n",
+        )
+        .unwrap();
+        let out = fast_context(
+            d.path(),
+            serde_json::json!({"keywords":["target"], "enhanced":false}),
+        )
+        .unwrap();
+        assert!(out.contains("export function target"), "{out}");
+        assert!(!out.contains("editUnitSpan="), "{out}");
+        assert!(!out.contains("boundary="), "{out}");
+        assert!(!out.contains("complete="), "{out}");
+        assert!(!out.contains("## OMITTED"), "{out}");
     }
 
     #[test]
