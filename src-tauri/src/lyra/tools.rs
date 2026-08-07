@@ -564,6 +564,12 @@ async fn execute_inner(
                             text.push_str(&format!("\n\n{path} @@ {line}:\n{body}"));
                         }
                     }
+                    if !path.is_empty() {
+                        let _ = context::observe_context_feedback(
+                            root,
+                            serde_json::json!({ "action": "edit", "path": path }),
+                        );
+                    }
                     let mut outcome = ToolOutcome::text(text);
                     outcome.details = Some(value);
                     outcome

@@ -1,0 +1,208 @@
+{
+  "model": "opencode/deepseek-v4-flash",
+  "ranAt": "2026-08-07T16:10:13.781Z",
+  "branch": "feat/fast-context-online-learning-ab",
+  "parallel": true,
+  "parallelElapsedMs": 45006,
+  "cases": [
+    {
+      "id": "R1",
+      "sourceSession": "6097d0a6-916d-48ad-ac16-b68c320116d6.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 fast_context_run、co_changed_files，分析还能如何提高 fast_context 效率并减少后续 read。只基于工具输出回答，不再调用其它检索工具，不改代码。",
+      "A": {
+        "wallMs": 44994,
+        "reportedWallMs": 38307,
+        "inputTokens": 2776,
+        "outputTokens": 4012,
+        "cacheReadTokens": 4992,
+        "totalTokens": 11780,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 346,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 36818,
+        "reportedWallMs": 29997,
+        "inputTokens": 2745,
+        "outputTokens": 2962,
+        "cacheReadTokens": 4992,
+        "totalTokens": 10699,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 603,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": "话任务描述（本输出中 eval prompt 文件正是因任务文本字面命中而被包含）。在返回里补充\"建议的真实符号名\"提示，能减少一次因 CTX MISS 引发的重调。\n\n**对\"减少后续 read\"的结论**：现有机制已通过\"块级裁剪 + 评分降噪 + PROOF 闭包证明 + 禁重读契约\"实现低读取；剩余 read 只应发生在两类场景——(a) 闭包内被刻意省略的函数体（按 `path:line` 精确补读），(b) 默认关闭的耦合清单按需开启。改进重点是消除输出内的无关块与无关索引尾巴，让预算全部留给闭包内正文，从而把\"后续 read\"压缩到接近零。未做任何代码修改，也未调用其它检索工具。",
+        "B": "CASE），就是在为未来的打包质量做数据积累。\n\n## 小结（可操作清单）\n1. keywords 用精确符号名，不用散文短语（避免 eval 文案这类噪声命中）；\n2. 多文件任务显式传 `files` 与 `coupling: true`；\n3. 需要某函数体时把符号列入目标 keywords，利用\"目标定义闭合\"一次拿到正文；\n4. 遵守\"已展示=已读、不重复 rg\"的契约，后续 read 只取精确行段；\n5. 长期靠 eval.mjs 与在线学习样本持续校准打分，压缩 Dropped 块。\n\n注：本次为计划模式，未做任何修改；以上全部结论仅基于这一次 fast_context 的输出。"
+      }
+    },
+    {
+      "id": "R2",
+      "sourceSession": "6097d0a6-916d-48ad-ac16-b68c320116d6.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 native_edit、edit、fast_context，分析原生 edit 使用独立工具实现时如何消费 fast_context 编辑锚点。只基于工具输出回答，不再检索，不改代码。",
+      "A": {
+        "wallMs": 33897,
+        "reportedWallMs": 27424,
+        "inputTokens": 5721,
+        "outputTokens": 2208,
+        "cacheReadTokens": 4992,
+        "totalTokens": 12921,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 383,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 35029,
+        "reportedWallMs": 28614,
+        "inputTokens": 4149,
+        "outputTokens": 3162,
+        "cacheReadTokens": 5120,
+        "totalTokens": 12431,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 172,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": "xt 的锚点是否被原生 edit 采纳（编辑了哪个 path）就是训练信号本身。\n\n## 结论\n\n原生 edit 消费 fast_context 编辑锚点的完整链路为：fast_context 以 `path:line` 完整单元形式展示定义/依赖/影响面并标记\"已读\" → 原生 edit 直接以这些锚点为 oldText 来源合并构造编辑（同文件多修改并入一次调用）→ 编辑路径经 `observe_context_feedback` 回灌模型，形成\"锚点是否被使用\"的正负反馈。fast_context 是只读定位器，edit 是唯一写入工具，二者通过锚点（path + 已展示行段）解耦衔接。",
+        "B": "率就是锚点质量的观测值。\n\n## 结论\n\n原生 edit 作为独立工具，通过 Devin 内置 `{path, edits:[{oldText,newText}]}` 文本锚接口消费 fast_context 的编辑锚点：fast_context（远程 MCP）负责把目标代码以完整单元+精确行段的形式\"视为已读\"地展示出来，代理直接从其输出复制 oldText 构造 edit 调用（同文件合并一次），无需 read 往返；二者按路由规则严格分离（MCP 端点 vs 内置工具），并由 `observe_context_feedback` 把每次 edit 的消费结果回灌成锚点质量模型的训练信号。"
+      }
+    },
+    {
+      "id": "R3",
+      "sourceSession": "09774430-c287-4f78-bfc0-bfc9116cd4e7.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 buildAlkaidSystemPrompt、fast_context，分析为什么 Agent 开始会用 fast_context、后续却可能不再使用。只基于工具输出回答，不再检索，不改代码。",
+      "A": {
+        "wallMs": 34531,
+        "reportedWallMs": 28063,
+        "inputTokens": 8590,
+        "outputTokens": 3201,
+        "cacheReadTokens": 5120,
+        "totalTokens": 16911,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 263,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 37029,
+        "reportedWallMs": 30541,
+        "inputTokens": 8370,
+        "outputTokens": 3159,
+        "cacheReadTokens": 4992,
+        "totalTokens": 16521,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 379,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": "下文后，后续走 read/slim 而非重复 fast_context。评测报告按案例对比 `fast_context` 调用次数，正是在验证这一行为差异。\n\n## 结论\n\"开头用、后续不用\"首先是**提示词设计使然**：fast_context 被定位为任务前置的一次性打包工具，用完即\"视为已读\"，后续只允许精确补读（read/find_symbols）。其次，`NOVA_FAST_CONTEXT=0` 开关会同时移除工具与指令、batch 形态禁止顶层调用、以及上下文学习会学出\"少用全量上下文\"的策略，三者在特定运行环境下都会进一步导致 Agent 后续不再使用 fast_context。",
+        "B": "。评分还含「fast_context 之后零 rg/grep 重复检索」但**允许之后的 read**（单独统计 `readsAfterFc`）——即设计意图就是：fast_context 只在任务开端做跨文件闭包，后续信息获取一律收敛到 read/find_symbols。\n\n**结论**：Agent 开始必用 fast_context，是因为系统提示把它设为跨文件任务的强制第一步；后续停用，是因为该工具被设计为\"开局一次性引导\"——任务闭包证明后触发条件不再成立，且重调被禁止、预算封顶、read 对已知行段更便宜，三条规则合力把后续所有信息获取推向精确 read/find_symbols。"
+      }
+    }
+  ],
+  "pretraining": {
+    "contexts": 19,
+    "positiveUpdates": 19,
+    "sessions": [
+      "e18c0006-7868-4c74-b9dc-6cc0c6f7f233.slim.json",
+      "c50e2312-3ba9-4696-a91c-b06ba69bc9b5.slim.json",
+      "216481cf-adbc-4392-adc5-d2f5b656b68a.slim.json",
+      "6097d0a6-916d-48ad-ac16-b68c320116d6.slim.json",
+      "8b9b52f3-14ff-4432-8eaa-de4ab6e1520e.slim.json",
+      "84cfea80-586d-499f-802b-6d2bd8623476.slim.json",
+      "60123777-76d9-4124-a601-773d9b618065.slim.json",
+      "f7f40d93-4d98-43d7-9aab-8624d4315753.slim.json",
+      "1018c694-3574-4259-8f83-0bd7f0d579a8.slim.json",
+      "c55ee47e-1b5b-45b7-8cd4-38c098ab0e71.slim.json",
+      "f21f66e8-601c-4e13-8faf-2d61a229d67a.slim.json",
+      "bf15e349-390e-4184-a014-dec30badb709.slim.json",
+      "d4696145-78c9-4721-9581-9372c34608ee.slim.json",
+      "efa78b83-4faa-4cba-a541-c16ded9f398e.slim.json",
+      "ab9540e6-41a8-48e6-87ca-1b7c22b096bf.slim.json",
+      "08034749-bb73-4b7a-b849-e512fa05f3f2.slim.json",
+      "b8acde2c-0cd9-4211-b137-2a4bbe2a6a29.slim.json",
+      "1e9f81dd-238d-4c30-af9b-9efef4e0a2a5.slim.json",
+      "9c1666fa-2fd6-4105-87e4-3520b5efdb1d.slim.json",
+      "a01eb6a2-7000-4656-b294-454fd555de3a.slim.json",
+      "89c4070e-ddee-4ec1-8654-decc7e9af07d.slim.json",
+      "da76f639-644d-471c-85dc-a0b2f55ae929.slim.json",
+      "3a8c0711-2a81-409e-9d43-f849fd11b2de.slim.json"
+    ],
+    "model": {
+      "version": 1,
+      "weights": [
+        1.2165545015882593,
+        1.1495081052251002,
+        1.1667257632901722,
+        0.6900409427984194,
+        0.7499350892231842,
+        0.3473436165239609,
+        0.2296421155797528
+      ],
+      "bias": -1.795116340462069,
+      "observations": 369,
+      "positives": 19
+    }
+  },
+  "totals": {
+    "A": {
+      "wallMs": 113422,
+      "inputTokens": 17087,
+      "outputTokens": 9421,
+      "cacheReadTokens": 15104,
+      "totalTokens": 41612,
+      "toolCalls": 3,
+      "fastContextCalls": 3,
+      "readCalls": 0,
+      "bashCalls": 0,
+      "toolTimeMs": 992
+    },
+    "B": {
+      "wallMs": 108876,
+      "inputTokens": 15264,
+      "outputTokens": 9283,
+      "cacheReadTokens": 15104,
+      "totalTokens": 39651,
+      "toolCalls": 3,
+      "fastContextCalls": 3,
+      "readCalls": 0,
+      "bashCalls": 0,
+      "toolTimeMs": 1154
+    }
+  },
+  "deltas": {
+    "wallMs": -4546,
+    "inputTokens": -1823,
+    "outputTokens": -138,
+    "cacheReadTokens": 0,
+    "totalTokens": -1961,
+    "toolCalls": 0,
+    "fastContextCalls": 0,
+    "readCalls": 0,
+    "bashCalls": 0,
+    "toolTimeMs": 162
+  }
+}

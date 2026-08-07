@@ -53,6 +53,231 @@ const REVERSE_FULL_REBUILD_CHANGES: usize = 64;
 const PERSIST_MIN_CHANGED: usize = 16;
 /// 目录 scope 检索时限定代码文件扩展名的 rg glob（与 is_code_file 的扩展名集合一致）。
 const CODE_FILES_GLOB: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,rs,py,pyi,go,java,kt,kts,cs,c,h,cc,cpp,hpp,swift,php,scala,dart,m,mm,zig}";
+const LEARNING_FEATURES: usize = 7;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OnlineEditModel {
+    version: u32,
+    weights: [f64; LEARNING_FEATURES],
+    bias: f64,
+    observations: u64,
+    positives: u64,
+}
+
+impl Default for OnlineEditModel {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            // heuristic, seed, explicit, exact caller, companion test, test path, small file
+            weights: [1.2, 1.0, 1.2, 0.7, 0.8, 0.4, 0.2],
+            bias: -2.0,
+            observations: 0,
+            positives: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingLearningSample {
+    file: String,
+    features: [f64; LEARNING_FEATURES],
+    included: bool,
+    edit_applied: bool,
+}
+
+#[derive(Default)]
+struct RepoLearningState {
+    loaded: bool,
+    model: OnlineEditModel,
+    pending: Vec<PendingLearningSample>,
+}
+
+static LEARNING_STATE: OnceLock<Mutex<HashMap<String, RepoLearningState>>> = OnceLock::new();
+
+fn learning_enabled() -> bool {
+    std::env::var("NOVA_CONTEXT_LEARNING")
+        .ok()
+        .as_deref()
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
+fn learning_root_key(root: &Path) -> String {
+    root.canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn learning_model_path(root: &Path) -> PathBuf {
+    let base = std::env::var_os("NOVA_CONTEXT_LEARNING_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("NOVA_DATA_DIR")
+                .map(|value| PathBuf::from(value).join("alkaid/context-learning"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|value| PathBuf::from(value).join(".nova/alkaid/context-learning"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("nova-context-learning"));
+    let mut hasher = Sha256::new();
+    hasher.update(learning_root_key(root).as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    base.join(format!("{}.json", &digest[..20]))
+}
+
+fn load_learning_model(root: &Path) -> OnlineEditModel {
+    fs::read(learning_model_path(root))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<OnlineEditModel>(&bytes).ok())
+        .filter(|model| model.version == 1)
+        .unwrap_or_default()
+}
+
+fn save_learning_model(root: &Path, model: &OnlineEditModel) {
+    let path = learning_model_path(root);
+    let Some(parent) = path.parent() else { return };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec_pretty(model) else {
+        return;
+    };
+    let staged = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    if fs::write(&staged, bytes).is_ok() {
+        let _ = fs::rename(&staged, &path);
+    }
+}
+
+fn sigmoid(value: f64) -> f64 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exp = value.exp();
+        exp / (1.0 + exp)
+    }
+}
+
+fn learning_predict(model: &OnlineEditModel, features: &[f64; LEARNING_FEATURES]) -> f64 {
+    sigmoid(
+        model.bias
+            + model
+                .weights
+                .iter()
+                .zip(features)
+                .map(|(weight, feature)| weight * feature)
+                .sum::<f64>(),
+    )
+}
+
+fn learning_update(
+    model: &mut OnlineEditModel,
+    features: &[f64; LEARNING_FEATURES],
+    label: f64,
+    sample_weight: f64,
+) {
+    let prediction = learning_predict(model, features);
+    let error = (label - prediction) * sample_weight;
+    let rate = 0.035 / (1.0 + model.observations as f64 / 500.0).sqrt();
+    for (weight, feature) in model.weights.iter_mut().zip(features) {
+        *weight = (*weight + rate * error * feature - rate * 0.0005 * *weight).clamp(-6.0, 6.0);
+    }
+    model.bias = (model.bias + rate * error).clamp(-6.0, 6.0);
+    model.observations += 1;
+    if label >= 0.5 {
+        model.positives += 1;
+    }
+}
+
+fn settle_pending(root: &Path, state: &mut RepoLearningState) {
+    let pending = std::mem::take(&mut state.pending);
+    for sample in pending {
+        if !sample.edit_applied {
+            // 未编辑不等于无用，只作为很弱的负反馈。
+            learning_update(&mut state.model, &sample.features, 0.0, 0.08);
+        }
+    }
+    save_learning_model(root, &state.model);
+}
+
+fn with_learning_state<T>(root: &Path, callback: impl FnOnce(&mut RepoLearningState) -> T) -> T {
+    let key = learning_root_key(root);
+    let states = LEARNING_STATE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut states = states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = states.entry(key).or_default();
+    if !state.loaded {
+        state.model = load_learning_model(root);
+        state.loaded = true;
+    }
+    callback(state)
+}
+
+fn learning_blend(observations: u64) -> f64 {
+    match observations {
+        0..=19 => 0.0,
+        20..=99 => 0.12,
+        100..=499 => 0.28,
+        _ => 0.45,
+    }
+}
+
+/// 工具执行层在成功 read/edit 后调用。edit 是强正样本；read 目前只记事件，
+/// 避免把“需要理解”错误混入“将被编辑”模型。下一次 fast_context 自动结算弱负样本。
+pub fn observe_context_feedback(root: &Path, params: Value) -> Result<Value, String> {
+    if !learning_enabled() {
+        return Ok(serde_json::json!({"enabled": false, "updated": 0}));
+    }
+    let action = params
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if action == "settle" {
+        let observations = with_learning_state(root, |state| {
+            settle_pending(root, state);
+            state.model.observations
+        });
+        return Ok(serde_json::json!({"enabled": true, "action": "settle", "observations": observations}));
+    }
+    let raw_path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if raw_path.trim().is_empty() {
+        return Err("context feedback requires path".into());
+    }
+    let path = if Path::new(raw_path).is_absolute() {
+        Path::new(raw_path)
+            .strip_prefix(root)
+            .unwrap_or(Path::new(raw_path))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        raw_path.to_string()
+    };
+    let path = normalize_rel(&path);
+    let updated = with_learning_state(root, |state| {
+        if action != "edit" {
+            return 0usize;
+        }
+        let mut count = 0usize;
+        for sample in &mut state.pending {
+            if sample.file == path && !sample.edit_applied {
+                let weight = if sample.included { 1.0 } else { 1.5 };
+                learning_update(&mut state.model, &sample.features, 1.0, weight);
+                sample.edit_applied = true;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            save_learning_model(root, &state.model);
+        }
+        count
+    });
+    Ok(serde_json::json!({"enabled": true, "action": action, "path": path, "updated": updated}))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Symbol {
@@ -3721,6 +3946,50 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             ranked.push((file.clone(), 520.0));
         }
     }
+    let learning_snapshot = if learning_enabled() {
+        Some(with_learning_state(root, |state| {
+            settle_pending(root, state);
+            state.model.clone()
+        }))
+    } else {
+        None
+    };
+    let learning_features = |file: &str, heuristic: f64| -> [f64; LEARNING_FEATURES] {
+        let small = fs::metadata(root.join(file))
+            .ok()
+            .map(|meta| meta.len() <= 24 * 1024)
+            .unwrap_or(false);
+        [
+            (heuristic / 1000.0).clamp(0.0, 1.5),
+            if seed_files.contains(file) { 1.0 } else { 0.0 },
+            if files.iter().any(|explicit| explicit == file) {
+                1.0
+            } else {
+                0.0
+            },
+            if exact_callers.contains_key(file) {
+                1.0
+            } else {
+                0.0
+            },
+            if companion_tests.contains(&file.to_string()) {
+                1.0
+            } else {
+                0.0
+            },
+            if noise_path(file) { 1.0 } else { 0.0 },
+            if small { 1.0 } else { 0.0 },
+        ]
+    };
+    if let Some(model) = &learning_snapshot {
+        let blend = learning_blend(model.observations);
+        if blend > 0.0 {
+            for (file, score) in &mut ranked {
+                let probability = learning_predict(model, &learning_features(file, *score));
+                *score += blend * (probability - 0.5) * 420.0;
+            }
+        }
+    }
     ranked.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -3763,6 +4032,23 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         .collect::<Vec<_>>();
     if final_candidates.is_empty() {
         final_candidates = ranked.iter().take(3).cloned().collect();
+    }
+    if learning_snapshot.is_some() {
+        let included = final_candidates
+            .iter()
+            .map(|(file, _)| file)
+            .collect::<HashSet<_>>();
+        let pending = ranked
+            .iter()
+            .take(20)
+            .map(|(file, score)| PendingLearningSample {
+                file: file.clone(),
+                features: learning_features(file, *score),
+                included: included.contains(file),
+                edit_applied: false,
+            })
+            .collect::<Vec<_>>();
+        with_learning_state(root, |state| state.pending = pending);
     }
     let mut sources = HashMap::<String, Source>::new();
     for (file, _) in &final_candidates {
