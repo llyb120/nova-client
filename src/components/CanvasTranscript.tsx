@@ -1225,7 +1225,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             data: { images: item.images, editItem: item, imageLayouts } });
 
           // .user-edit-btn: padding 5px, margin 0 2px 4px 0, align-self flex-end
-          if (state.currentId && !state.running[state.currentId]) {
+          // 世界线预览是静态快照，即使当前主线仍在运行，也应允许从历史消息编辑并分叉。
+          // 使用父组件传入的有效 running 状态，避免直接读取主线状态把预览中的编辑入口隐藏。
+          if (!props.running) {
             result.push({ kind: "edit-btn", id: item.id, groupIdx: gi,
               x: bx - 28, y: y + bubbleH - 26 - 4, w: 24, h: 24,
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
