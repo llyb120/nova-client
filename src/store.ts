@@ -1616,7 +1616,15 @@ async function tryBuiltinPrompt(
   if (/^\/setup(?:\s|$)/i.test(builtInInput)) {
     const goal = builtInInput.replace(/^\/setup(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /setup 后输入要接入的模型，例如 /setup qwen3.8");
-    await deliverPrompt(threadId, buildIntegrateModelPrompt(goal), images);
+    // /setup 由 agent 修改本地 config.jsonc；本轮结束后复用设置页的刷新机制，
+    // 让 Vega 立刻重读配置并刷新模型列表，而不要求用户手动点「刷新配置」。
+    pendingSetupConfigRefresh.add(threadId);
+    try {
+      await deliverPrompt(threadId, buildIntegrateModelPrompt(goal), images);
+    } catch (error) {
+      pendingSetupConfigRefresh.delete(threadId);
+      throw error;
+    }
     return true;
   }
   // 触发条件：提示词命中某工作流的 slash/contains/regex 触发器时自动启动。
@@ -1742,6 +1750,8 @@ type FireRelayStep = {
 };
 
 const fireRelaySteps = new Map<string, FireRelayStep>();
+// 已发送 /setup、等待该轮结束后重载 Vega 本地配置的会话。
+const pendingSetupConfigRefresh = new Set<string>();
 // 中断不丢弃 Fire 上下文。用户在阶段再次发言时可重新挂回自动验收流程，
 // 同时避免网络错误把一次尚未完成的响应误当成最终结论送去判断。
 const suspendedFireRelaySteps = new Map<string, FireRelayStep>();
@@ -2487,6 +2497,11 @@ export async function initStore() {
       resumeFireRelay(e.payload.threadId);
       handleWorkflowTurnStart(e.payload.threadId);
     } else {
+      if (pendingSetupConfigRefresh.delete(threadId)) {
+        void api.refreshAlkaidConfig().catch((error) =>
+          console.error("Refresh Vega config after /setup failed", error),
+        );
+      }
       if (fireRelaySteps.has(e.payload.threadId)) {
         const reason = e.payload.stopReason;
         const manuallyInterrupted = reason === "cancelled" || reason === "force_cancelled";

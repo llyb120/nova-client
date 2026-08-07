@@ -70,10 +70,10 @@ export function buildIntegrateModelPrompt(goal: string): string {
    - 常见示例：DashScope（通义千问，OpenAI 兼容）baseURL 为 https://dashscope.aliyuncs.com/compatible-mode/v1。
 3. 在 provider 下新增或更新一个 provider 块；如需设为默认，把顶层 model 更新为 \`<providerId>/<modelId>\`。
 4. apiKey 直接明文写入配置文件即可。
-5. 完成后告诉我：在桌面端重启 Vega 以重新探测模型列表。
+5. 完成后告诉我：本次 /setup 轮次结束后 Nova 会自动重载 Vega 配置并刷新模型列表，无需手动重启；如果没有看到新模型，再提示我在设置·模型后端中点击「刷新配置」。
 
 ## 验证
-改动后若当前工作区就是 Nova 仓库，可冒烟测试：\`npm run alkaid -- --prompt "请只回复 Vega OK"\`；否则提示我在桌面端重启 Vega 后确认新模型出现在模型列表。`;
+改动后若当前工作区就是 Nova 仓库，可冒烟测试：\`npm run alkaid -- --prompt "请只回复 Vega OK"\`；否则提示我等待本次 setup 完成后确认新模型出现在模型列表中。`;
 }
 
 /**
