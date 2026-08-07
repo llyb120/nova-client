@@ -264,9 +264,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [fastContextEnabled, setFastContextEnabled] = createSignal(
     s?.fastContextEnabled ?? true,
   );
-  const [enhancedFastContextEnabled, setEnhancedFastContextEnabled] = createSignal(
-    s?.enhancedFastContextEnabled ?? true,
-  );
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
   const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
@@ -672,7 +669,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     windowsShellShimEnabled: windowsShellShimEnabled(),
     checkpointEnabled: checkpointEnabled(),
     fastContextEnabled: fastContextEnabled(),
-    enhancedFastContextEnabled: enhancedFastContextEnabled(),
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
     claudecodeProxy: claudecodeProxy().trim(),
@@ -1449,21 +1445,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </label>
                 <span class="field-hint">
                   启用后为 Vega / Cursor / Devin 注入 fast_context / find_symbols 工具，用于一次性打包相关代码上下文；关闭则不附带这两个工具。Devin 另始终挂载 read_files / edit_files（Plan 模式不含 edit_files）。默认启用。
-                </span>
-              </div>
-              <div class="field">
-                <span class="field-label">增强的 Fast Context</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={enhancedFastContextEnabled()}
-                    disabled={!fastContextEnabled()}
-                    onChange={(e) => setEnhancedFastContextEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-                <span class="field-hint">
-                  输出完整起止行、边界来源、完整性和预算省略清单，减少额外 read。关闭后 fast_context 工具仍可用，但输出与旧版一致。默认启用，新会话生效。
                 </span>
               </div>
             </section>
