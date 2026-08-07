@@ -707,13 +707,23 @@ export interface Quota {
   flexCredits: number | null;
 }
 
+/** 轮次进行中的实时累计用量（未落库；Turn 落定后由 TurnItem 接管展示） */
+export interface LiveUsage {
+  totalTokens?: number | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
+}
+
 export type UpdateOp =
   | { t: "upsert"; item: Item }
   | { t: "remove"; itemId: number }
   | { t: "delta"; itemId: number; text: string }
   | { t: "plan"; plan: PlanEntry[] }
   | { t: "proposed_plan"; text: string | null }
-  | { t: "mode"; mode: string };
+  | { t: "mode"; mode: string }
+  | { t: "usage"; usage: LiveUsage };
 
 export interface TurnEvent {
   threadId: string;

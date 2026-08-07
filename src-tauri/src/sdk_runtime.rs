@@ -1155,6 +1155,17 @@ impl SdkManager {
                 Some("plan") => self.apply_plan(thread_id, &event["plan"]),
                 Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
                 Some("permission") => self.emit_permission(thread_id, &event["permission"]),
+                Some("usage") => {
+                    // 本轮进行中的累计用量（bridge 可选上报）：只推给前端实时展示，不落库；
+                    // Turn 落库时前端清零该值，避免与轮次用量重复计。
+                    if let Some(raw) = event.get("usage") {
+                        let (usage, _) = self.adapter.normalize_usage(Some(raw), None, None);
+                        if let Some(usage) = usage {
+                            let _ = self
+                                .emit_op(thread_id, json!({ "t": "usage", "usage": usage }));
+                        }
+                    }
+                }
                 Some("done") => {
                     let usage = event.get("usage").cloned();
                     let stop_reason = if self.adapter.done_is_cancelled(&event) {

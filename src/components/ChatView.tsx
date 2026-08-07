@@ -1,5 +1,5 @@
 import { message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
 import { api } from "../ipc";
 import { buildTimeNotesPrompt } from "../builtinPrompts";
@@ -483,13 +483,84 @@ export function ChatView() {
     if (stickToBottom()) scheduleBottomPin();
   };
 
-  // 会话累计 token 用量
-  const totalTokens = createMemo(() =>
-    state.items.reduce(
-      (sum, it) => (it.type === "turn" && it.totalTokens ? sum + it.totalTokens : sum),
-      0,
-    ),
-  );
+  // 会话累计 token 用量：直接对当前展示的 turn 项求和。turn 项经 upsert 按 id
+  // 覆盖落位，求和天然不会重复累计；世界线预览（previewItems）或恢复切换后
+  // items 被整体替换，总量随之指向所预览/所在的那条分支。
+  const tokenStats = createMemo(() => {
+    let total = 0;
+    let read = 0;
+    let output = 0;
+    let cacheRead = 0;
+    let cacheWrite = 0;
+    for (const it of displayedItems()) {
+      if (it.type !== "turn") continue;
+      total += it.totalTokens ?? 0;
+      // inputTokens 是总输入量（含缓存命中/写入），拆出互斥的「读取」避免重复计。
+      const cr = it.cacheReadTokens ?? 0;
+      const cw = it.cacheWriteTokens ?? 0;
+      read += Math.max(0, (it.inputTokens ?? 0) - cr - cw);
+      output += it.outputTokens ?? 0;
+      cacheRead += cr;
+      cacheWrite += cw;
+    }
+    return { total, read, output, cacheRead, cacheWrite };
+  });
+  // 本轮进行中的实时用量（Vega 流式上报；预览世界线时不混入当前轮）。
+  const liveUsage = () => (previewItems() ? null : state.liveUsage);
+  const totalTokens = () => tokenStats().total + (liveUsage()?.totalTokens ?? 0);
+  const totalTokensTitle = () => {
+    const s = tokenStats();
+    const parts = [`读取 ${fmtTokens(s.read)}`, `写入 ${fmtTokens(s.output)}`];
+    if (s.cacheRead > 0) parts.push(`缓存读取 ${fmtTokens(s.cacheRead)}`);
+    if (s.cacheWrite > 0) parts.push(`缓存写入 ${fmtTokens(s.cacheWrite)}`);
+    const live = liveUsage();
+    if (live?.totalTokens) parts.push(`本轮进行中 ${fmtTokens(live.totalTokens)}`);
+    const scope = previewItems() ? "当前预览的世界线节点" : "本会话";
+    return `${scope}累计 token 用量\n${parts.join(" / ")} tokens`;
+  };
+
+  // 数字滚动效果：总量变化时从旧值平滑跳到新值（类似金额跳动），
+  // 方向不限（世界线切换可能变少），动画期间加高亮。
+  const [shownTokens, setShownTokens] = createSignal(0);
+  const [tokensRolling, setTokensRolling] = createSignal(false);
+  let tokenRollFrame = 0;
+  let tokenRollDoneTimer: number | undefined;
+  const stopTokenRoll = () => {
+    if (tokenRollFrame) cancelAnimationFrame(tokenRollFrame);
+    tokenRollFrame = 0;
+    if (tokenRollDoneTimer !== undefined) window.clearTimeout(tokenRollDoneTimer);
+    tokenRollDoneTimer = undefined;
+    setTokensRolling(false);
+  };
+  createEffect(() => {
+    const target = totalTokens();
+    const from = untrack(shownTokens);
+    if (from === target) return;
+    stopTokenRoll();
+    setTokensRolling(true);
+    // 变化越大滚动越久，设上限避免世界线大跨度切换时数字跑太久。
+    const duration = Math.min(1200, 350 + Math.abs(target - from) / 20);
+    const start = performance.now();
+    const step = (now: number) => {
+      const progress = Math.min(1, (now - start) / duration);
+      // easeOutCubic：前快后慢，像计数器缓缓停到最终值。
+      const eased = 1 - Math.pow(1 - progress, 3);
+      setShownTokens(Math.round(from + (target - from) * eased));
+      if (progress < 1) {
+        tokenRollFrame = requestAnimationFrame(step);
+      } else {
+        setShownTokens(target);
+        tokenRollFrame = 0;
+        // 数值到位后高亮稍留一拍再消退。
+        tokenRollDoneTimer = window.setTimeout(() => {
+          tokenRollDoneTimer = undefined;
+          setTokensRolling(false);
+        }, 250);
+      }
+    };
+    tokenRollFrame = requestAnimationFrame(step);
+  });
+  onCleanup(stopTokenRoll);
 
   // 流式内容变化后请求一次绘制前钉底；自由浏览时 pinBottom 会直接退出。
   createEffect(() => {
@@ -1098,11 +1169,16 @@ export function ChatView() {
             <span class="chat-cwd-wt">⎇ {currentMeta()!.worktree!.branch}</span>
           </Show>
         </div>
-        <Show when={totalTokens() > 0}>
-          <span class="chat-tokens" title="本会话累计 token 用量">
-            {fmtTokens(totalTokens())} tokens
-          </span>
-        </Show>
+        <span
+          class="chat-tokens"
+          classList={{
+            "chat-tokens-empty": totalTokens() === 0,
+            "chat-tokens-rolling": tokensRolling(),
+          }}
+          title={totalTokensTitle()}
+        >
+          {fmtTokens(shownTokens())} tokens
+        </span>
         <Show
           when={
             state.agentKind === "codex" &&
