@@ -974,9 +974,11 @@ impl SdkManager {
     /// 把首轮关键路径上的进程启动与 Agent 创建开销提前到用户还在选项目/模型时。
     /// 最新请求生效：模型/cwd/模式连续变化时，飞行中的循环会接着处理最新一条。
     pub fn prewarm_idle(self: &Arc<Self>, cwd: String, model: String, mode: String) {
-        if !self.adapter.supports_idle_prewarm() || model.trim().is_empty() {
+        if !self.adapter.supports_idle_prewarm() {
             return;
         }
+        // Cursor 用空字符串表示 Auto；bridge 会把它转换为 { id: "auto" }。这里不能把空值
+        // 当成“未选模型”跳过，否则最常用的 Auto 首轮永远无法预热，Agent.create 会阻塞首字。
         let request = json!({
             "action": "prewarm",
             "cwd": cwd,

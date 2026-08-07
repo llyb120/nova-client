@@ -86,9 +86,12 @@ export function createNovaBatchTools(cwd, options = {}) {
         additionalProperties: false,
       },
       async execute(params) {
-        const args = normalizeFastContextArgs(params);
+        const args = normalizeFastContextArgs({
+          ...params,
+          enhanced: process.env.NOVA_ENHANCED_FAST_CONTEXT !== "0",
+        });
         // fast_context 只有 Rust native 实现（JS 镜像已移除）；无全局 service 时直走 native。
-    return await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
+        return await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
       },
     };
     tools.find_symbols = {

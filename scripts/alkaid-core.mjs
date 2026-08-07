@@ -457,6 +457,9 @@ export function novaEditFilesEnabled(env = process.env) {
 
 export function createFilesystemTools(cwd, editTool = null, opts = {}) {
   const fastContext = opts.fastContext !== false && process.env.NOVA_FAST_CONTEXT !== "0";
+  const fastContextTransform = typeof opts.fastContextTransform === "function"
+    ? opts.fastContextTransform
+    : (value) => value;
   const root = resolve(cwd);
   const tools = [];
   if (fastContext) tools.push(
@@ -472,9 +475,13 @@ export function createFilesystemTools(cwd, editTool = null, opts = {}) {
         coupling: Type.Optional(Type.Boolean({ description: "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" })),
       }),
       async execute(_id, params) {
-        const args = params ?? {};
+        const args = {
+          ...(params ?? {}),
+          enhanced: process.env.NOVA_ENHANCED_FAST_CONTEXT !== "0",
+        };
         // fast_context 只有 Rust native 实现（JS 镜像已移除）；无全局 service 时直走 native。
-        return textResult(await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args)));
+        const value = await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
+        return textResult(await fastContextTransform(value, args));
       },
     },
     {
@@ -809,7 +816,9 @@ export async function createAlkaidAgent(options = {}) {
   const editTool = codingTools.find((tool) => tool.name === "edit");
   // 批量 edit_files 暂时默认禁用，Vega 回退 PI 原生 edit；NOVA_EDIT_FILES=1 恢复。
   const editFiles = options.editFiles ?? novaEditFilesEnabled();
-  const batchTools = createFilesystemTools(cwd, editFiles ? editTool : null);
+  const batchTools = createFilesystemTools(cwd, editFiles ? editTool : null, {
+    fastContextTransform: options.fastContextTransform,
+  });
   const rawTools = [...batchTools, ...codingTools, ...mcp.tools];
   const archiveDir = options.sessionId
     ? join(alkaidDataRoot(), "tool-results", safeArchiveSegment(options.sessionId))

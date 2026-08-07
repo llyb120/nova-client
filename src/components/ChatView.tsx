@@ -1295,7 +1295,7 @@ export function ChatView() {
                 threadId={state.currentId}
                 groups={groups()}
                 permissions={permissions()}
-                running={isRunning()}
+                running={isRunning() && !previewItems()}
                 loading={state.loadingThread}
                 preview={!!previewCheckpointId()}
                 onReturnToCurrent={returnToCurrentTimeline}
@@ -1313,7 +1313,7 @@ export function ChatView() {
             <TranscriptCanvas
               groups={groups()}
               permissions={permissions()}
-              running={isRunning()}
+              running={isRunning() && !previewItems()}
               showHint={displayedItems().length === 0 && !state.loadingThread}
               hintCwd={cwdDisplay()}
               threadId={state.currentId ?? ""}
