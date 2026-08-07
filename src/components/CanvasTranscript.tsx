@@ -1506,8 +1506,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const hasBody = contentBlocks.length > 0 || item.locations.length > 0
       || item.rawInput !== undefined || item.rawOutput !== undefined;
 
-    const label = displayToolTitle(stripAnsi(item.title || item.kind));
-    const detail = isDevin ? toolHeadlineDetail(item) : "";
+    // Canvas 的 fillText 不会按制表位展开；工具标题（以及 Devin 的独立详情）
+    // 可能直接带有命令参数中的真实 tab，先展开后再测量和绘制，避免详情错位。
+    const label = expandCodeTabs(displayToolTitle(stripAnsi(item.title || item.kind)));
+    const detail = isDevin ? expandCodeTabs(toolHeadlineDetail(item)) : "";
     // .tool-row margin 1px 0; .tool-line padding 3px 8px; min-height 26; gap 8
     const toolH = 26;
 
