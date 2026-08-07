@@ -6048,6 +6048,11 @@ pub fn run() {
                 if let Some(v) = model_cache::load(&dir, AgentKind::Alkaid.as_str()) {
                     state.alkaid.seed_model_options(v);
                 }
+                // Lyra 与 Vega 共用配置，刷新成功后同样按 "lyra" 写了磁盘缓存；
+                // 启动时一并灌入内存，避免首次打开选择器只能看到 pending 空占位。
+                if let Some(v) = model_cache::load(&dir, AgentKind::Lyra.as_str()) {
+                    state.lyra.seed_model_options(v);
+                }
                 if let Some(v) = model_cache::load(&dir, "codex") {
                     state.codex.seed_model_options(v);
                 }

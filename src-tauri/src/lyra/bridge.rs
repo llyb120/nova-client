@@ -624,9 +624,16 @@ async fn handle_prompt(
 
 fn models_data(request: &Value, roots: &Roots) -> Result<Value, String> {
     let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
-    let _ = config::default_model(&config_value)?; // 与 JS 一样先校验存在可用模型
+    // 与 Vega bridge 相同的 configOptions 形状：前端与漫游/雷达都只认 id=="model" 的包裹结构，
+    // 直接返回扁平选项列表会导致选择器永远为空。
+    let current = config::default_model(&config_value)?; // 与 JS 一样先校验存在可用模型
     Ok(json!({
-        "configOptions": config::model_options(&config_value),
+        "configOptions": [{
+            "id": "model",
+            "name": "Model",
+            "currentValue": current,
+            "options": config::model_options(&config_value),
+        }],
         "modes": Value::Null,
     }))
 }
@@ -877,7 +884,7 @@ mod tests {
         .await
         .expect("models");
         let options = data
-            .get("configOptions")
+            .pointer("/configOptions/0/options")
             .and_then(|v| v.as_array())
             .unwrap();
         assert!(
