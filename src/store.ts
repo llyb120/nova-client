@@ -19,6 +19,7 @@ import type {
   IncomingShare,
   IncomingWorkflowShare,
   Item,
+  LiveUsage,
   Mark,
   ModelChoice,
   ModelCost,
@@ -130,6 +131,8 @@ interface AppStore {
   modelOptions: Record<AgentKind, ModelOptions | null>;
   logs: string[];
   loadingThread: boolean;
+  /** 当前会话本轮进行中的实时 token 用量（后端流式上报，不落库；Turn 落库后清零避免重复计） */
+  liveUsage: LiveUsage | null;
   quota: Quota | null;
   /** 模型费用信息（modelUid -> 倍率/厂商/视觉），拉取失败时为 null */
   modelCosts: Record<string, ModelCost> | null;
@@ -234,6 +237,7 @@ export const [state, setState] = createStore<AppStore>({
   },
   logs: [],
   loadingThread: false,
+  liveUsage: null,
   quota: null,
   modelCosts: null,
   update: null,
@@ -1179,6 +1183,9 @@ function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileIte
         ? thread.roamingPeer ?? null
         : thread.quotaPeer ?? null,
     loadingThread,
+    // 快照替换 items 后，进行中的实时用量一律作废：若该会话正在跑，下一条流式
+    // usage 事件会重新填上；若已结束，Turn 项本身就是最终值。
+    liveUsage: null,
   });
 }
 
@@ -1214,6 +1221,7 @@ export async function openThread(id: string) {
       reasoningEffort: "",
       roamingPeer: null,
       loadingThread: true,
+      liveUsage: null,
     });
   }
   try {
@@ -1258,6 +1266,7 @@ export function closeThread() {
     mode: lastUsed.mode(agentKind),
     reasoningEffort: lastUsed.reasoningEffort(agentKind),
     roamingPeer: null,
+    liveUsage: null,
   });
   reportActivity(true);
 }
@@ -2293,6 +2302,8 @@ function queueDelta(op: Extract<UpdateOp, { t: "delta" }>) {
 }
 
 function applyUpsert(item: Item) {
+  // Turn 落库意味着本轮用量已有终值，清掉进行中的实时值，防止短暂双计。
+  if (item.type === "turn" && state.liveUsage) setState("liveUsage", null);
   if (item.type === "user") {
     const optimistic = state.items.findIndex(
       (current) => current.type === "user" && current.id < 0,
@@ -2331,6 +2342,11 @@ function flushPendingStreamUpdates() {
 }
 
 function applyOp(op: UpdateOp) {
+  if (op.t === "usage") {
+    // 本轮进行中的实时累计用量；Turn 落库（applyUpsert）时清零，避免双计。
+    setState("liveUsage", op.usage);
+    return;
+  }
   if (op.t === "plan") {
     flushPendingStreamUpdates();
     setState("plan", op.plan);
@@ -2497,6 +2513,8 @@ export async function initStore() {
       resumeFireRelay(e.payload.threadId);
       handleWorkflowTurnStart(e.payload.threadId);
     } else {
+      // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
+      if (threadId === state.currentId) setState("liveUsage", null);
       if (pendingSetupConfigRefresh.delete(threadId)) {
         void api.refreshAlkaidConfig().catch((error) =>
           console.error("Refresh Vega config after /setup failed", error),

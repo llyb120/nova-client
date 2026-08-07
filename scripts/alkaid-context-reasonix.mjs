@@ -362,6 +362,8 @@ async function prompt(request, commands) {
       providerActivity.lastEvent = "message_end";
       providerActivity.messageEnds += 1;
       usage = mergeAlkaidUsage(usage, event.message.usage);
+      // 本轮进行中的累计用量实时上报，前端据此做 token 跳变效果；Turn 落库后由前端清零。
+      send({ type: "usage", usage });
     }
     if (event.type === "message_start" && event.message.role === "assistant") {
       attemptActivityBaseline = { ...providerActivity };
