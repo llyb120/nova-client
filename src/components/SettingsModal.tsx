@@ -278,7 +278,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       .filter((item) => item.action !== "stopSession")
       .map((item) => ({ ...item })),
   );
-  const [vegaContextMode, setVegaContextMode] = createSignal<"default" | "super">(
+  const [vegaContextMode] = createSignal<"default" | "super">(
     s?.vegaContextMode === "super" ? "super" : "default",
   );
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
@@ -1413,22 +1413,6 @@ export function SettingsModal(props: { onClose: () => void }) {
           <Show when={tab() === "advanced"}>
             <section class="settings-group">
               <h3 class="settings-group-title">上下文机制</h3>
-              <label class="field">
-                <span class="field-label">Vega 上下文</span>
-                <select
-                  class="field-input"
-                  value={vegaContextMode()}
-                  onChange={(e) =>
-                    setVegaContextMode(e.currentTarget.value === "super" ? "super" : "default")
-                  }
-                >
-                  <option value="default">默认</option>
-                  <option value="super">超级（旧版超级上下文）</option>
-                </select>
-                <span class="field-hint">
-                  默认使用当前的 append-only 会话、分级压缩和 frozen digest；超级切换到改造前备份的 Vega 超级上下文实现。
-                </span>
-              </label>
               <label class="field">
                 <span class="field-label">Cursor 上下文</span>
                 <select
