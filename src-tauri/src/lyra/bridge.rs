@@ -377,6 +377,7 @@ async fn handle_prompt(
         shell: (!read_only).then(prompt::detect_shell),
         cancelled: cancelled.clone(),
         steering: steering.clone(),
+        spec_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     emit(&json!({ "type": "ready", "sessionId": ctx.session_id }));
@@ -452,6 +453,7 @@ async fn handle_prompt(
     let mut on_event = |event: AgentEvent| match event {
         AgentEvent::MessageStart => {
             agent_message_index += 1;
+            emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
             current_text.clear();
             current_thinking.clear();
         }
@@ -469,6 +471,16 @@ async fn handle_prompt(
                 "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
             }));
         }
+        AgentEvent::FinalNote(note) => {
+            agent_message_index += 1;
+            current_text.clear();
+            current_text.push_str(&note);
+            emit(&json!({ "type": "timing", "phase": "final_note", "elapsedMs": 0 }));
+            emit(&json!({
+                "type": "item",
+                "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
+            }));
+        }
         AgentEvent::ToolStart { id, name, args } => {
             let item = started_tool_item(&id, &name, &args);
             started_tools.insert(id, item.clone());
@@ -481,6 +493,9 @@ async fn handle_prompt(
                 .unwrap_or_else(|| json!({ "id": id, "type": "mcp_tool_call", "server": "Lyra" }));
             let item = completed_tool_item(&started, &outcome);
             emit(&json!({ "type": "item", "item": item }));
+            if outcome.get("specHit").and_then(Value::as_bool) == Some(true) {
+                emit(&json!({ "type": "timing", "phase": "spec_hit", "elapsedMs": 0 }));
+            }
         }
         AgentEvent::MessageEnd { usage } => {
             merge_usage(&mut total_usage, &usage);

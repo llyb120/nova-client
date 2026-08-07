@@ -13,6 +13,9 @@ use std::sync::Arc;
 pub enum StreamEvent {
     TextDelta(String),
     ThinkingDelta(String),
+    /// 工具调用参数的流式增量：index 为本条消息内工具调用序号，
+    /// args 为该调用迄今累积的参数 JSON 片段（供投机执行预解析）。
+    ToolArgsDelta { index: usize, name: String, args: String },
 }
 
 #[derive(Debug, Default)]
@@ -153,6 +156,12 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     match model.thinking_format.as_deref() {
         Some("deepseek") | Some("zai") => {
             body["thinking"] = json!({ "type": if enabled { "enabled" } else { "disabled" } });
+            // 与 Vega 对齐：deepseek 等在 thinking.enabled 之外同时发送 reasoning_effort（如 max）。
+            if enabled && model.supports_reasoning_effort {
+                if let Some(level) = level {
+                    body["reasoning_effort"] = json!(level);
+                }
+            }
         }
         Some("qwen") => {
             body["enable_thinking"] = json!(enabled);
@@ -358,12 +367,18 @@ async fn post_stream(
     }
     if model.session_affinity_headers {
         if let Some(session) = session_id {
-            let header = if model.session_affinity_format == "openrouter" {
-                "x-session-id"
+            // 与 Vega(PI) 对齐：openrouter 只发 x-session-id；其余发 session_id（openai 格式）
+            // + x-client-request-id + x-session-affinity，提高代理层会话亲和/前缀缓存命中。
+            if model.session_affinity_format == "openrouter" {
+                request = request.header("x-session-id", session);
             } else {
-                "x-session-affinity"
-            };
-            request = request.header(header, session);
+                if model.session_affinity_format == "openai" {
+                    request = request.header("session_id", session);
+                }
+                request = request
+                    .header("x-client-request-id", session)
+                    .header("x-session-affinity", session);
+            }
         }
     }
     let response = request
@@ -617,6 +632,11 @@ async fn stream_completions(
                         .and_then(Value::as_str)
                     {
                         accum.arguments.push_str(args);
+                        on_event(StreamEvent::ToolArgsDelta {
+                            index,
+                            name: accum.name.clone(),
+                            args: accum.arguments.clone(),
+                        });
                     }
                 }
             }
@@ -714,6 +734,11 @@ async fn stream_responses(
                 if let Some(index) = open_call {
                     if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                         calls[index].arguments.push_str(delta);
+                        on_event(StreamEvent::ToolArgsDelta {
+                            index,
+                            name: calls[index].name.clone(),
+                            args: calls[index].arguments.clone(),
+                        });
                     }
                 }
             }
@@ -1096,6 +1121,9 @@ async fn stream_anthropic(
     // 按 content block 索引聚合 tool_use 入参
     let mut blocks: std::collections::HashMap<u64, (String, String, String)> =
         std::collections::HashMap::new();
+    // block 索引 → 本条消息内工具调用序号（与最终 content 中 toolCall 顺序一致）
+    let mut block_ordinals: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::new();
     let mut stop_reason: Option<String> = None;
     let cancelled = read_sse(&mut response, cancel, |data| {
         let Ok(value) = serde_json::from_str::<Value>(data) else {
@@ -1111,6 +1139,7 @@ async fn stream_anthropic(
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let block = &value["content_block"];
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    block_ordinals.insert(index, block_ordinals.len());
                     blocks.insert(
                         index,
                         (
@@ -1147,6 +1176,13 @@ async fn stream_anthropic(
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             if let Some(entry) = blocks.get_mut(&index) {
                                 entry.2.push_str(partial);
+                                if let Some(ordinal) = block_ordinals.get(&index) {
+                                    on_event(StreamEvent::ToolArgsDelta {
+                                        index: *ordinal,
+                                        name: entry.1.clone(),
+                                        args: entry.2.clone(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -1240,6 +1276,7 @@ mod tests {
             session_affinity_headers: false,
             session_affinity_format: "openai".into(),
             supports_long_cache_retention: true,
+            supports_reasoning_effort: true,
         }
     }
 

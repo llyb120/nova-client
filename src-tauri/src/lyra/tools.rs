@@ -28,6 +28,14 @@ fn legacy_edit_mode() -> bool {
     std::env::var("LYRA_EDIT_MODE").ok().as_deref() == Some("legacy")
 }
 
+/// final_note：最终总结寄生在最后一次工具调用上。LYRA_FINAL_NOTE=off 关闭（基准对照）。
+fn final_note_enabled() -> bool {
+    std::env::var("LYRA_FINAL_NOTE").ok().as_deref() != Some("off")
+}
+
+const FINAL_NOTE_DESCRIPTION: &str = "确信这是本任务最后一次工具调用时，把给用户的最终总结写在这里：工具结果返回后本轮立即结束，省去一个纯总结回合（不影响工具本身执行）。之后还需调用任何工具时禁止填写。";
+
+
 /// read 输出的行号前缀：`行号|内容`，坐标可直接用于 edit 的 startLine/endLine。
 fn add_line_numbers(content: &str, start_line: usize) -> String {
     content
@@ -175,6 +183,21 @@ pub fn tool_set(read_only: bool, fast_context: bool) -> Vec<Tool> {
                 "required": ["path", "content"]
             })),
         });
+    }
+    // final_note：所有工具可寄生最终总结，省一个纯总结回合。
+    if final_note_enabled() {
+        for tool in &mut tools {
+            if let Some(props) = tool
+                .parameters
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+            {
+                props.insert(
+                    "final_note".into(),
+                    json!({ "type": "string", "description": FINAL_NOTE_DESCRIPTION }),
+                );
+            }
+        }
     }
     tools
 }

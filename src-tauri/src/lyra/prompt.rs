@@ -349,8 +349,31 @@ pub fn load_agent_instructions(roots: &crate::lyra::config::Roots) -> String {
 pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     let fast_context = options.fast_context;
     let read_only = options.read_only;
+    // 与 Vega 提示词对齐：显式列出可用工具（按 Lyra 实际注册的工具集，只读模式无 bash/edit/write）。
+    let tool_lines: Vec<&str> = [
+        Some("- read: 读取单个文件"),
+        if read_only {
+            None
+        } else {
+            Some(match &options.shell {
+                Some(shell) if shell.kind == ShellKind::PowerShell => "- bash: 执行 PowerShell 命令",
+                _ => "- bash: 执行 Bash 命令",
+            })
+        },
+        fast_context.then_some("- fast_context: 一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG（内部批量 rg + 增量符号索引）"),
+        fast_context.then_some("- find_symbols: 并行定位多个符号出现位置（只要行号时用）"),
+        if read_only {
+            None
+        } else {
+            Some("- edit / write: 单文件编辑或写入")
+        },
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let mut stable: Vec<String> = vec![
         "你是 Lyra：高效、简单、面向软件工程结果。".into(),
+        format!("Available tools:\n{}", tool_lines.join("\n")),
         if fast_context {
             "你拥有 Lyra 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 fast_context/find_symbols。任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（只要定义/引用行号时用 find_symbols）；一次调用通常替代 5–10 轮 rg+read 往返。拿不准是否涉及多个文件、或只是先分析要改哪里而不写代码时，同样按涉及处理，先调用 fast_context。find_symbols 只用于拿行号；定位后仍需阅读两个及以上文件正文时，把文件清单传给 fast_context 的 files 一次打包，不要逐个 read。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；大文件禁止无目的全量读取。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。"
         } else {
@@ -365,6 +388,11 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         .into(),
         "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。".into(),
         "完成修改后，优先根据版本控制 diff 按需确定受影响单元及直接使用方，并执行成本最低且有效的验证；禁止遍历或列出完整仓库、无依据扩大范围，纯文档类改动可说明依据后跳过测试，无法验证时须报告原因、建议命令及剩余风险。".into(),
+        if std::env::var("LYRA_FINAL_NOTE").ok().as_deref() != Some("off") {
+            "final_note 是硬性收尾协议：当你判断这次工具调用已经是本任务最后一次调用时，必须把给用户的最终总结写进该工具的 final_note 参数；工具结果返回后本轮直接结束，不要再发一轮纯文本总结。若还需要任何工具，final_note 留空。".into()
+        } else {
+            String::new()
+        },
         match &options.shell {
             Some(shell) if shell.kind == ShellKind::PowerShell => format!(
                 "命令终端已确认使用 PowerShell（{}）；bash 工具在 Windows 下通过 PowerShell 执行命令，必须从第一次调用起使用 PowerShell 语法（cmdlet、`;` 串联多条命令、`$env:NAME` 访问环境变量），不要使用 Bash 语法（`export`、`&&` 串联在 Windows PowerShell 5.1 中不可用、POSIX 风格的 sed/awk/grep 调用）。",
@@ -383,7 +411,9 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     if read_only {
         dynamic.push("当前为计划模式：只读分析，不得修改文件。".into());
     }
-    dynamic.push(format!("Current working directory: {}", options.cwd));
+    // 与 Vega 对齐：统一为正斜杠并去掉 Windows 的 \\?\ 前缀。
+    let cwd = options.cwd.trim_start_matches(r"\\?\").replace('\\', "/");
+    dynamic.push(format!("Current working directory: {cwd}"));
     if !options.skills_text.is_empty() {
         dynamic.push(options.skills_text.clone());
     }
