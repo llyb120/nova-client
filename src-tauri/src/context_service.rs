@@ -1,8 +1,18 @@
 use crate::acp::resolve_program_on_path;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+#[derive(Clone)]
+struct GlobalServiceConfig {
+    endpoint: String,
+    token: String,
+}
+
+static GLOBAL_SERVICE: OnceLock<GlobalServiceConfig> = OnceLock::new();
 
 const SERVICE_JS: &[u8] = include_bytes!("../resources/nova-context-service.mjs");
 
@@ -49,6 +59,7 @@ impl ContextService {
             .env("NOVA_CONTEXT_SERVICE_TOKEN", &token)
             .env("NOVA_CONTEXT_READY_FILE", &ready_file)
             .env("NOVA_CONTEXT_PARENT_PID", pid.to_string())
+            .env("NOVA_CONTEXT_LEARNING_OWNER", "1")
             .env("NOVA_DATA_DIR", data_dir);
         #[cfg(windows)]
         {
@@ -78,6 +89,11 @@ impl ContextService {
             std::thread::sleep(Duration::from_millis(25));
         }
 
+        let _ = GLOBAL_SERVICE.set(GlobalServiceConfig {
+            endpoint: endpoint.clone(),
+            token: token.clone(),
+        });
+
         Ok(Self {
             endpoint,
             token,
@@ -93,6 +109,76 @@ impl ContextService {
     pub(crate) fn token(&self) -> &str {
         &self.token
     }
+}
+
+async fn exchange<S>(mut stream: S, request: &[u8]) -> Result<Value, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(request)
+        .await
+        .map_err(|e| format!("写入全局 context service 失败：{e}"))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|e| format!("结束 context service 请求失败：{e}"))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .map_err(|e| format!("读取全局 context service 失败：{e}"))?;
+    let envelope: Value = serde_json::from_slice(&response)
+        .map_err(|e| format!("解析全局 context service 响应失败：{e}"))?;
+    if envelope.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(envelope
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("全局 context service 调用失败")
+            .to_string());
+    }
+    Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Lyra 与 Vega 共用同一个服务进程；本地 native fallback 不参与学习，避免双模型和丢更新。
+pub(crate) async fn call_global(method: &str, root: &Path, params: Value) -> Result<Value, String> {
+    let config = GLOBAL_SERVICE
+        .get()
+        .ok_or_else(|| "全局 context service 尚未启动".to_string())?;
+    let request = serde_json::to_vec(&serde_json::json!({
+        "token": config.token,
+        "method": method,
+        "root": root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+        "params": params,
+    }))
+    .map_err(|e| format!("编码全局 context service 请求失败：{e}"))?;
+    let mut request = request;
+    request.push(b'\n');
+
+    let call = async {
+        #[cfg(unix)]
+        {
+            let stream = tokio::net::UnixStream::connect(&config.endpoint)
+                .await
+                .map_err(|e| format!("连接全局 context service 失败：{e}"))?;
+            exchange(stream, &request).await
+        }
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::ClientOptions;
+            let stream = ClientOptions::new()
+                .open(&config.endpoint)
+                .map_err(|e| format!("连接全局 context service 失败：{e}"))?;
+            exchange(stream, &request).await
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err("当前平台不支持全局 context service IPC".to_string())
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(120), call)
+        .await
+        .map_err(|_| format!("全局 context service 调用超时：{method}"))?
 }
 
 impl Drop for ContextService {

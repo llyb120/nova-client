@@ -96,11 +96,21 @@ static LEARNING_STATE: OnceLock<Mutex<HashMap<String, RepoLearningState>>> = Onc
 static LEARNING_REPO_IDENTITIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 fn learning_enabled() -> bool {
-    std::env::var("NOVA_CONTEXT_LEARNING")
+    let enabled = std::env::var("NOVA_CONTEXT_LEARNING")
         .ok()
         .as_deref()
         .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+        .unwrap_or(true);
+    if !enabled {
+        return false;
+    }
+    // 训练（feedback/settle/样本收集）只允许全局 context service 进程执行，
+    // 避免多进程并发覆盖同一模型文件；检索侧模型快照（预测用）不受此限。
+    learning_owner()
+}
+
+fn learning_owner() -> bool {
+    std::env::var("NOVA_CONTEXT_LEARNING_OWNER").ok().as_deref() == Some("1")
 }
 
 fn learning_root_key(root: &Path) -> String {
@@ -192,6 +202,52 @@ fn save_learning_model(root: &Path, model: &OnlineEditModel) {
     }
 }
 
+/// 序列化后的模型快照（可跨进程传递）；非法/不兼容快照返回 None。
+#[allow(dead_code)] // 预留给需要传输快照字节的调用方；当前经 JSON 值传递。
+pub fn parse_learning_model_snapshot(bytes: &[u8]) -> Option<Value> {
+    let model: OnlineEditModel = serde_json::from_slice(bytes).ok()?;
+    if model.version != 1 {
+        return None;
+    }
+    serde_json::to_value(&model).ok()
+}
+
+/// Lyra 等纯 Rust 调用方的学习增强入口：把全局 service 下发的模型快照注入
+/// 本进程（只读使用），使本地 fast_context 的 blend 排序与全局模型一致。
+/// 注入方不持有训练能力（learning_enabled 仍要求 owner），快照不持久化。
+#[allow(dead_code)] // Tauri lib 侧由 Lyra 使用；napi 独立编译时仅 N-API 入口可达。
+pub fn inject_learning_model_snapshot(root: &Path, snapshot: &Value) -> bool {
+    if !learning_owner() {
+        // owner 进程自己就是模型来源，注入无意义。
+        let Ok(model) = serde_json::from_value::<OnlineEditModel>(snapshot.clone()) else {
+            return false;
+        };
+        if model.version != 1 {
+            return false;
+        }
+        let key = learning_root_key(root);
+        let states = LEARNING_STATE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut states = states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = states.entry(key).or_default();
+        state.model = model;
+        state.loaded = true; // 阻断 load_learning_model 从磁盘覆盖注入的快照
+        return true;
+    }
+    false
+}
+
+/// 当前进程的模型快照（JSON）。owner 进程（全局 service）用它向检索调用方
+/// 下发模型；非 owner 进程返回 None。
+#[allow(dead_code)] // 在 napi crate 内经 observe_context_feedback 使用。
+pub fn learning_model_snapshot(root: &Path) -> Option<Value> {
+    if !learning_owner() || !learning_enabled() {
+        return None;
+    }
+    with_learning_state(root, |state| serde_json::to_value(&state.model).ok())
+}
+
 fn sigmoid(value: f64) -> f64 {
     if value >= 0.0 {
         1.0 / (1.0 + (-value).exp())
@@ -249,6 +305,7 @@ fn settle_pending(root: &Path, state: &mut RepoLearningState) -> usize {
 
 /// 会话生命周期收尾使用：只有当前进程确实存在待结算 trace 时才做更新与 I/O。
 /// 这样未使用 fast_context 的 Lyra/Vega 会话不会加载或写入学习模型。
+#[allow(dead_code)] // 在 napi crate 内经 observe_context_feedback 使用。
 pub fn settle_context_learning(root: &Path) -> usize {
     if !learning_enabled() {
         return 0;
@@ -274,6 +331,15 @@ fn with_learning_state<T>(root: &Path, callback: impl FnOnce(&mut RepoLearningSt
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let state = states.entry(key).or_default();
     if !state.loaded {
+        if !learning_owner() {
+            // 非 owner：只读加载磁盘模型作为兜底快照；不入内存缓存、不标记 loaded，
+            // 防止后续 inject 的全局快照被旧磁盘模型阻塞，也避免本地进程间的缓存漂移。
+            let model = load_learning_model(root);
+            return callback(&mut RepoLearningState {
+                model,
+                ..Default::default()
+            });
+        }
         state.model = load_learning_model(root);
         state.loaded = true;
     }
@@ -291,6 +357,7 @@ fn learning_blend(observations: u64) -> f64 {
 
 /// 工具执行层在成功 read/edit 后调用。edit 是强正样本；read 目前只记事件，
 /// 避免把“需要理解”错误混入“将被编辑”模型。下一次 fast_context 自动结算弱负样本。
+#[allow(dead_code)] // 在 napi crate 内经 N-API 入口使用；Tauri lib 侧走 service IPC。
 pub fn observe_context_feedback(root: &Path, params: Value) -> Result<Value, String> {
     if !learning_enabled() {
         return Ok(serde_json::json!({"enabled": false, "updated": 0}));
@@ -301,7 +368,10 @@ pub fn observe_context_feedback(root: &Path, params: Value) -> Result<Value, Str
         .unwrap_or_default();
     if action == "settle" {
         let settled = settle_context_learning(root);
-        return Ok(serde_json::json!({"enabled": true, "action": "settle", "settled": settled}));
+        let snapshot = learning_model_snapshot(root);
+        return Ok(
+            serde_json::json!({"enabled": true, "action": "settle", "settled": settled, "modelSnapshot": snapshot}),
+        );
     }
     let raw_path = params
         .get("path")
@@ -338,7 +408,7 @@ pub fn observe_context_feedback(root: &Path, params: Value) -> Result<Value, Str
         }
         count
     });
-    Ok(serde_json::json!({"enabled": true, "action": action, "path": path, "updated": updated}))
+    Ok(serde_json::json!({"enabled": true, "action": action, "path": path, "updated": updated, "modelSnapshot": learning_model_snapshot(root)}))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4008,9 +4078,14 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             ranked.push((file.clone(), 520.0));
         }
     }
-    let learning_snapshot = if learning_enabled() {
+    let learning_snapshot = if learning_enabled() || !learning_owner() {
+        // owner：训练进程，模型在本进程内（先结算 pending 再取快照）；
+        // 非 owner（如 Lyra 本地检索）：只读使用 inject 注入的快照，
+        // 无快照时 with_learning_state 惰性加载磁盘模型作为兜底（只读，不写回）。
         Some(with_learning_state(root, |state| {
-            settle_pending(root, state);
+            if learning_owner() {
+                settle_pending(root, state);
+            }
             state.model.clone()
         }))
     } else {

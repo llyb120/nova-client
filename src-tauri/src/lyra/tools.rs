@@ -1,12 +1,13 @@
 //! 基础工具：read / bash / edit / write + fast_context / find_symbols。
-//! fast_context 与 find_symbols 直连 nova_tools_native（无 napi、无 bridge）。
+//! fast_context / find_symbols 始终进程内 Rust 直连，无 Node 依赖；学习增强
+//! 是锦上添花：edit 反馈/settle 发往全局 context service（不在则静默丢弃），
+//! 反馈响应顺带回全局模型快照注入本地，使本地检索的 blend 排序与全局模型一致。
 
 use crate::lyra::prompt::{
     clamp_tool_output_text, govern_tool_text, FAST_CONTEXT_OUTPUT_MAX_BYTES,
     TOOL_OUTPUT_CONTEXT_MAX_BYTES,
 };
 use crate::lyra::{edit as native_edit, read as native_read};
-use crate::nova_tools_native::context;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -446,9 +447,14 @@ async fn execute_inner(
 ) -> ToolOutcome {
     match name {
         "fast_context" => {
+            // 进程内 Rust 直连：Lyra 不依赖 Node/service 也能完整检索。
             let root = root.to_path_buf();
             let args = args.clone();
-            match tokio::task::spawn_blocking(move || context::fast_context(&root, args)).await {
+            match tokio::task::spawn_blocking(move || {
+                crate::nova_tools_native::context::fast_context(&root, args)
+            })
+            .await
+            {
                 Ok(Ok(text)) => ToolOutcome::text(clamp_tool_output_text(&text)),
                 Ok(Err(error)) => ToolOutcome::error(error),
                 Err(e) => ToolOutcome::error(format!("fast_context 执行失败：{e}")),
@@ -457,7 +463,11 @@ async fn execute_inner(
         "find_symbols" => {
             let root = root.to_path_buf();
             let args = args.clone();
-            match tokio::task::spawn_blocking(move || context::find_symbols(&root, args)).await {
+            match tokio::task::spawn_blocking(move || {
+                crate::nova_tools_native::context::find_symbols(&root, args)
+            })
+            .await
+            {
                 Ok(Ok(text)) => ToolOutcome::text(text),
                 Ok(Err(error)) => ToolOutcome::error(error),
                 Err(e) => ToolOutcome::error(format!("find_symbols 执行失败：{e}")),
@@ -565,10 +575,27 @@ async fn execute_inner(
                         }
                     }
                     if !path.is_empty() {
-                        let _ = context::observe_context_feedback(
+                        // 学习是锦上添花：反馈发往全局 service，服务不在则静默丢弃；
+                        // 响应顺带回全局模型快照，注入本地进程供后续检索 blend 使用。
+                        if let Ok(value) = crate::context_service::call_global(
+                            "observe_context_feedback",
                             root,
                             serde_json::json!({ "action": "edit", "path": path }),
-                        );
+                        )
+                        .await
+                        {
+                            if let Some(snapshot) = value.get("modelSnapshot") {
+                                let root_buf = root.to_path_buf();
+                                let snapshot = snapshot.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    crate::nova_tools_native::context::inject_learning_model_snapshot(
+                                        &root_buf,
+                                        &snapshot,
+                                    )
+                                })
+                                .await;
+                            }
+                        }
                     }
                     let mut outcome = ToolOutcome::text(text);
                     outcome.details = Some(value);

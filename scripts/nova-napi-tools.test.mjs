@@ -29,8 +29,10 @@ test("fast_context online learning consumes edit feedback automatically", { skip
   const learningDir = await mkdtemp(join(tmpdir(), "nova-context-learning-model-"));
   const previousDir = process.env.NOVA_CONTEXT_LEARNING_DIR;
   const previousEnabled = process.env.NOVA_CONTEXT_LEARNING;
+  const previousOwner = process.env.NOVA_CONTEXT_LEARNING_OWNER;
   process.env.NOVA_CONTEXT_LEARNING_DIR = learningDir;
   process.env.NOVA_CONTEXT_LEARNING = "1";
+  process.env.NOVA_CONTEXT_LEARNING_OWNER = "1";
   try {
     await writeFile(join(root, "target.ts"), "export function target() {\n  return 1;\n}\n");
     execFileSync("git", ["init", "-q"], { cwd: root });
@@ -72,6 +74,8 @@ test("fast_context online learning consumes edit feedback automatically", { skip
     else process.env.NOVA_CONTEXT_LEARNING_DIR = previousDir;
     if (previousEnabled === undefined) delete process.env.NOVA_CONTEXT_LEARNING;
     else process.env.NOVA_CONTEXT_LEARNING = previousEnabled;
+    if (previousOwner === undefined) delete process.env.NOVA_CONTEXT_LEARNING_OWNER;
+    else process.env.NOVA_CONTEXT_LEARNING_OWNER = previousOwner;
     await rm(worktree, { recursive: true, force: true });
     await rm(root, { recursive: true, force: true });
     await rm(learningDir, { recursive: true, force: true });

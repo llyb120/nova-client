@@ -56,6 +56,7 @@ function relativeFeedbackPath(raw) {
 
 async function pretrainFromRecentSessions() {
   process.env.NOVA_CONTEXT_LEARNING = "1";
+  process.env.NOVA_CONTEXT_LEARNING_OWNER = "1";
   process.env.NOVA_CONTEXT_LEARNING_DIR = LEARNING_DIR;
   process.env.NOVA_TOOLS_NAPI_PATH = NAPI_PATH;
   let contexts = 0;
@@ -101,6 +102,7 @@ function runCase(testCase, arm) {
       ...process.env,
       NOVA_TOOLS_NAPI_PATH: NAPI_PATH,
       NOVA_CONTEXT_LEARNING: arm === "B" ? "1" : "0",
+      NOVA_CONTEXT_LEARNING_OWNER: "1", // standalone evaluator acts as the sole owner
       NOVA_CONTEXT_LEARNING_DIR: arm === "B" ? LEARNING_DIR : join(RUN_DIR, "baseline-unused"),
     };
     const child = spawn(process.execPath, [join(REPO, "scripts", "alkaid.mjs")], { cwd: REPO, env, stdio: ["pipe", "pipe", "pipe"] });
