@@ -156,6 +156,8 @@ struct RemoteCommand {
     /// 网页侧生成的排队条目 id，用于撤回 / 立刻发送与桌面队列对齐。
     #[serde(default)]
     queue_id: String,
+    #[serde(default)]
+    reasoning_effort: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -1846,14 +1848,58 @@ fn rename_remote_thread(app: &AppHandle, thread_id: &str, title: &str) -> Result
 
 fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let kind = {
+    let old_kind;
+    let new_kind;
+    let agent_changed;
+    let switched_item;
+    {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&cmd.thread_id).ok_or("会话不存在")?;
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
+        if thread.is_quota_borrowed() && !cmd.agent_kind.trim().is_empty() {
+            return Err("额度租借会话的后端已绑定；请重新发起租借以切换后端".into());
+        }
         if is_running(&state, thread) {
             return Err("请先停止当前轮次再切换模型或模式".into());
+        }
+        // 解析目标 agent；为空时保持当前 agent（仅切模型/模式）。
+        new_kind = if cmd.agent_kind.trim().is_empty() {
+            thread.agent_kind.clone()
+        } else {
+            AgentKind::from_str(&cmd.agent_kind)
+                .ok_or_else(|| format!("未知后端: {}", cmd.agent_kind))?
+        };
+        old_kind = thread.agent_kind.clone();
+        agent_changed = old_kind != new_kind;
+        if agent_changed || (!cmd.model.trim().is_empty() && thread.model.as_deref() != Some(cmd.model.trim())) {
+            thread.clear_auto_route();
+        }
+        if agent_changed {
+            // 旧 remote session 属于旧 agent，作废；下次发消息时新 agent 重新建会话
+            thread.acp_session_id = None;
+            thread.pending_native_restore = None;
+            thread.provider_checkpoints.clear();
+            thread.codex_usage_snapshot = None;
+            thread.agent_kind = new_kind.clone();
+            // 标记上下文接力：仅当已有历史时才有意义
+            thread.handoff_from = if thread.items.is_empty() {
+                None
+            } else {
+                Some(old_kind.clone())
+            };
+            let label = new_kind.label();
+            let note = if thread.handoff_from.is_some() {
+                format!(
+                    "已切换到 {label}。下一条消息会把此前的对话上下文一并交给 {label}，便于无缝接续。"
+                )
+            } else {
+                format!("已切换到 {label}，后续消息将由 {label} 处理。")
+            };
+            switched_item = Some(thread.push_system(note, "info"));
+        } else {
+            switched_item = None;
         }
         if !cmd.model.trim().is_empty() {
             thread.model = Some(cmd.model.trim().to_string());
@@ -1861,24 +1907,56 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         if !cmd.mode.trim().is_empty() {
             thread.mode = Some(cmd.mode.trim().to_string());
         }
-        let kind = thread.agent_kind.clone();
+        if !cmd.reasoning_effort.trim().is_empty() {
+            thread.reasoning_effort = Some(cmd.reasoning_effort.trim().to_string());
+        }
+        thread.updated_at = crate::threads::now_ms();
         store.save();
-        kind
-    };
-    match kind {
-        AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&cmd.thread_id),
-        AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
-        AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
-        AgentKind::Codex | AgentKind::CodexPlus => {
-            state.codexplus.forget_session_of_thread(&cmd.thread_id)
+    }
+    if agent_changed {
+        // 旧 remote session 只属于切换前的后端，清理旧 agent 的 session 缓存。
+        // 不能清理目标后端：独占连接的 manager 会异步杀连接，可能误杀新连接。
+        match old_kind {
+            AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Codex | AgentKind::CodexPlus => {
+                state.codexplus.forget_session_of_thread(&cmd.thread_id)
+            }
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+                state.codebuddyplus.forget_session_of_thread(&cmd.thread_id)
+            }
+            AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+                state.opencodeplus.forget_session_of_thread(&cmd.thread_id)
+            }
+            AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
         }
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-            state.codebuddyplus.forget_session_of_thread(&cmd.thread_id)
+        if let Some(item) = switched_item {
+            let _ = app.emit(
+                crate::acp::EV_UPDATE,
+                json!({ "threadId": cmd.thread_id, "op": { "t": "upsert", "item": item } }),
+            );
         }
-        AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&cmd.thread_id),
-        AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-            state.opencodeplus.forget_session_of_thread(&cmd.thread_id)
+        let _ = app.emit(crate::acp::EV_THREADS, json!({}));
+    } else if !cmd.model.trim().is_empty() {
+        // 同 agent 仅切模型：作废旧 session 让新模型生效。
+        // 仅切 mode 不需要作废 session（mode 每轮下发，不绑定 session）。
+        match new_kind {
+            AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Codex | AgentKind::CodexPlus => {
+                state.codexplus.forget_session_of_thread(&cmd.thread_id)
+            }
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+                state.codebuddyplus.forget_session_of_thread(&cmd.thread_id)
+            }
+            AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+                state.opencodeplus.forget_session_of_thread(&cmd.thread_id)
+            }
         }
     }
     Ok(())
