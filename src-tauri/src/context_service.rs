@@ -24,7 +24,7 @@ pub(crate) struct ContextService {
 }
 
 impl ContextService {
-    pub(crate) fn start(data_dir: &Path) -> Result<Self, String> {
+    pub(crate) fn start(data_dir: &Path, learning_enabled: bool) -> Result<Self, String> {
         let runtime_dir = data_dir.join("runtime");
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|e| format!("创建 context service 运行目录失败：{e}"))?;
@@ -60,6 +60,11 @@ impl ContextService {
             .env("NOVA_CONTEXT_READY_FILE", &ready_file)
             .env("NOVA_CONTEXT_PARENT_PID", pid.to_string())
             .env("NOVA_CONTEXT_LEARNING_OWNER", "1")
+            // 设置项控制学习开关（默认开）；service 是唯一学习 owner。
+            .env(
+                "NOVA_CONTEXT_LEARNING",
+                if learning_enabled { "1" } else { "0" },
+            )
             .env("NOVA_DATA_DIR", data_dir);
         #[cfg(windows)]
         {

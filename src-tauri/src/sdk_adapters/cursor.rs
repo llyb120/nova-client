@@ -45,6 +45,15 @@ impl SdkAdapter for CursorAdapter {
                     }
                     .into(),
                 ),
+                (
+                    "NOVA_CONTEXT_LEARNING",
+                    if settings.context_learning_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
             ],
         }
     }

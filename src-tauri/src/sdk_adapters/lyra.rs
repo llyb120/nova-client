@@ -39,15 +39,26 @@ impl SdkAdapter for LyraAdapter {
             proxy: settings.vega_proxy.clone(),
             path_env: "LYRA_RUNTIME",
             api_key: None,
-            extra_env: vec![(
-                "NOVA_FAST_CONTEXT",
-                if settings.fast_context_enabled {
-                    "1"
-                } else {
-                    "0"
-                }
-                .into(),
-            )],
+            extra_env: vec![
+                (
+                    "NOVA_FAST_CONTEXT",
+                    if settings.fast_context_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
+                (
+                    "NOVA_CONTEXT_LEARNING",
+                    if settings.context_learning_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
+            ],
         }
     }
 
