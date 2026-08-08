@@ -52,6 +52,7 @@ lerna-debug.log*
 
 # Tauri specific
 src-tauri/target/
+src-tauri/gen/
 src-tauri/resources/*.mjs
 src-tauri/resources/*.cjs
 src-tauri/resources/*.wasm
