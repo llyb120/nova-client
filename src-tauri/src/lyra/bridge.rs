@@ -498,6 +498,8 @@ async fn handle_prompt(
         }
         AgentEvent::MessageEnd { usage } => {
             merge_usage(&mut total_usage, &usage);
+            // 流式上报本轮累计用量，让前端实时显示 token（与 Vega bridge 一致）。
+            emit(&json!({ "type": "usage", "usage": total_usage }));
         }
     };
 
