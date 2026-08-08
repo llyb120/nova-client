@@ -1,0 +1,692 @@
+{
+  "ranAt": "2026-08-08T23:41:10.674Z",
+  "armA": "all features OFF (NOVA_CTX_*=0)",
+  "armB": "all features ON (default)",
+  "callCount": 28,
+  "summaryA": {
+    "total": 28,
+    "ok": 28,
+    "miss": 0,
+    "errors": 0,
+    "totalWallMs": 44583,
+    "avgWallMs": 1592,
+    "avgFiles": 8.3,
+    "avgBlocks": 24.8,
+    "avgBytes": 28695,
+    "avgSpeculative": 0,
+    "avgSig": 2.8,
+    "avgImpact": 5
+  },
+  "summaryB": {
+    "total": 28,
+    "ok": 28,
+    "miss": 0,
+    "errors": 0,
+    "totalWallMs": 15042,
+    "avgWallMs": 537,
+    "avgFiles": 8.3,
+    "avgBlocks": 24.4,
+    "avgBytes": 26787,
+    "avgSpeculative": 1.1,
+    "avgSig": 1.6,
+    "avgImpact": 4.8
+  },
+  "cases": [
+    {
+      "keywords": [
+        "card",
+        "comments",
+        "评论",
+        "帖子"
+      ],
+      "session": "lyra-18c9dd1d97f673c4-175416.slim.json",
+      "A": {
+        "wallMs": 558,
+        "files": 5,
+        "blocks": 25,
+        "bytes": 20078,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 242,
+        "files": 4,
+        "blocks": 27,
+        "bytes": 18392,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "setup",
+        "Kimi",
+        "GPT"
+      ],
+      "session": "lyra-18c9e043f96ce6b1-175416.slim.json",
+      "A": {
+        "wallMs": 215,
+        "files": 9,
+        "blocks": 20,
+        "bytes": 15424,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 207,
+        "files": 9,
+        "blocks": 22,
+        "bytes": 14607,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "kimi",
+        "moonshot",
+        "defaultConfig",
+        "providers"
+      ],
+      "session": "lyra-18c9e043f96ce6b1-175416.slim.json",
+      "A": {
+        "wallMs": 63,
+        "files": 6,
+        "blocks": 11,
+        "bytes": 10670,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 73,
+        "files": 6,
+        "blocks": 11,
+        "bytes": 10670,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "kimi",
+        "moonshot",
+        "gpt",
+        "default",
+        "provider"
+      ],
+      "session": "lyra-18c9e043f96ce6b1-175416.slim.json",
+      "A": {
+        "wallMs": 260,
+        "files": 4,
+        "blocks": 6,
+        "bytes": 24505,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 236,
+        "files": 4,
+        "blocks": 6,
+        "bytes": 24505,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "lyra.json",
+        "lyra"
+      ],
+      "session": "8782b561-a24c-48c3-9d6f-bf9d2f76caef.slim.json",
+      "A": {
+        "wallMs": 231,
+        "files": 7,
+        "blocks": 21,
+        "bytes": 28660,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 221,
+        "files": 7,
+        "blocks": 22,
+        "bytes": 29345,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "remote",
+        "model",
+        "switch",
+        "session"
+      ],
+      "session": "bd12ca61-0c21-46f3-ad2d-cf85194a7a05.slim.json",
+      "A": {
+        "wallMs": 1126,
+        "files": 7,
+        "blocks": 27,
+        "bytes": 19592,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 936,
+        "files": 7,
+        "blocks": 27,
+        "bytes": 18987,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "remote",
+        "send",
+        "command",
+        "model",
+        "switch"
+      ],
+      "session": "bd12ca61-0c21-46f3-ad2d-cf85194a7a05.slim.json",
+      "A": {
+        "wallMs": 1072,
+        "files": 7,
+        "blocks": 23,
+        "bytes": 21604,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 1073,
+        "files": 7,
+        "blocks": 23,
+        "bytes": 21583,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "fast_context",
+        "oldText",
+        "edit",
+        "virtual",
+        "anchor"
+      ],
+      "session": "38c5862a-1059-4c26-a544-9276641deef4.slim.json",
+      "A": {
+        "wallMs": 747,
+        "files": 10,
+        "blocks": 34,
+        "bytes": 43424,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 796,
+        "files": 12,
+        "blocks": 38,
+        "bytes": 41933,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "EditInput",
+        "fast_context",
+        "edit_tool",
+        "oldText",
+        "ToolDefinition"
+      ],
+      "session": "38c5862a-1059-4c26-a544-9276641deef4.slim.json",
+      "A": {
+        "wallMs": 649,
+        "files": 10,
+        "blocks": 37,
+        "bytes": 35689,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 450,
+        "files": 10,
+        "blocks": 38,
+        "bytes": 34552,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "EditInput",
+        "fast_context",
+        "oldText",
+        "ToolDefinition"
+      ],
+      "session": "38c5862a-1059-4c26-a544-9276641deef4.slim.json",
+      "A": {
+        "wallMs": 462,
+        "files": 6,
+        "blocks": 30,
+        "bytes": 29430,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 471,
+        "files": 6,
+        "blocks": 29,
+        "bytes": 27367,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "fast_context",
+        "coupling",
+        "co-change",
+        "共改"
+      ],
+      "session": "c50e2312-3ba9-4696-a91c-b06ba69bc9b5.slim.json",
+      "A": {
+        "wallMs": 397,
+        "files": 10,
+        "blocks": 28,
+        "bytes": 30853,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 403,
+        "files": 10,
+        "blocks": 27,
+        "bytes": 29279,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "deepseek",
+        "Vega",
+        "session",
+        "token",
+        "tool_calls"
+      ],
+      "session": "c50e2312-3ba9-4696-a91c-b06ba69bc9b5.slim.json",
+      "A": {
+        "wallMs": 633,
+        "files": 8,
+        "blocks": 36,
+        "bytes": 46515,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 455,
+        "files": 8,
+        "blocks": 36,
+        "bytes": 42629,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "tool_start",
+        "usage",
+        "session_end",
+        "createAlkaidAgent",
+        "saveSession"
+      ],
+      "session": "c50e2312-3ba9-4696-a91c-b06ba69bc9b5.slim.json",
+      "A": {
+        "wallMs": 600,
+        "files": 12,
+        "blocks": 30,
+        "bytes": 33516,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 615,
+        "files": 12,
+        "blocks": 29,
+        "bytes": 30941,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "fast_context",
+        "fastContext",
+        "napi",
+        "context_service"
+      ],
+      "session": "c50e2312-3ba9-4696-a91c-b06ba69bc9b5.slim.json",
+      "A": {
+        "wallMs": 479,
+        "files": 7,
+        "blocks": 2,
+        "bytes": 19835,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 476,
+        "files": 7,
+        "blocks": 2,
+        "bytes": 19835,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "Lyra",
+        "close",
+        "settle",
+        "learning_root_key",
+        "workspace_root"
+      ],
+      "session": "c50e2312-3ba9-4696-a91c-b06ba69bc9b5.slim.json",
+      "A": {
+        "wallMs": 26927,
+        "files": 9,
+        "blocks": 31,
+        "bytes": 40474,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 664,
+        "files": 9,
+        "blocks": 28,
+        "bytes": 40410,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "run_oneshot",
+        "spawn_prompt",
+        "InProcessSession",
+        "run_loop",
+        "done"
+      ],
+      "session": "c50e2312-3ba9-4696-a91c-b06ba69bc9b5.slim.json",
+      "A": {
+        "wallMs": 2010,
+        "files": 8,
+        "blocks": 28,
+        "bytes": 32143,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 461,
+        "files": 7,
+        "blocks": 21,
+        "bytes": 17385,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "model sync",
+        "sync models",
+        "lyra",
+        "models"
+      ],
+      "session": "8b9b52f3-14ff-4432-8eaa-de4ab6e1520e.slim.json",
+      "A": {
+        "wallMs": 620,
+        "files": 5,
+        "blocks": 15,
+        "bytes": 23351,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 639,
+        "files": 5,
+        "blocks": 14,
+        "bytes": 22832,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "AgentKind",
+        "labelAgent",
+        "req.Model",
+        "models",
+        "agentKind"
+      ],
+      "session": "8b9b52f3-14ff-4432-8eaa-de4ab6e1520e.slim.json",
+      "A": {
+        "wallMs": 681,
+        "files": 9,
+        "blocks": 25,
+        "bytes": 41498,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 575,
+        "files": 9,
+        "blocks": 26,
+        "bytes": 41365,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "FastContext",
+        "SIG",
+        "IMPACT",
+        "NEXT_READS",
+        "REQUIRED COVERAGE COMPLETE"
+      ],
+      "session": "216481cf-adbc-4392-adc5-d2f5b656b68a.slim.json",
+      "A": {
+        "wallMs": 818,
+        "files": 11,
+        "blocks": 34,
+        "bytes": 36569,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 641,
+        "files": 11,
+        "blocks": 34,
+        "bytes": 34865,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "enhanced",
+        "fastContextTransform",
+        "ctx-session-ab",
+        "fast-context-span-ab",
+        "RetrievalPlan"
+      ],
+      "session": "216481cf-adbc-4392-adc5-d2f5b656b68a.slim.json",
+      "A": {
+        "wallMs": 631,
+        "files": 7,
+        "blocks": 30,
+        "bytes": 42643,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 520,
+        "files": 9,
+        "blocks": 30,
+        "bytes": 40408,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "fast_context",
+        "SIG",
+        "IMPACT",
+        "NEXT_READS",
+        "REQUIRED COVERAGE COMPLETE"
+      ],
+      "session": "e18c0006-7868-4c74-b9dc-6cc0c6f7f233.slim.json",
+      "A": {
+        "wallMs": 757,
+        "files": 11,
+        "blocks": 37,
+        "bytes": 35529,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 669,
+        "files": 11,
+        "blocks": 37,
+        "bytes": 35483,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "fastContextTransform",
+        "createAlkaidAgent",
+        "callNapiTool",
+        "fast_context"
+      ],
+      "session": "e18c0006-7868-4c74-b9dc-6cc0c6f7f233.slim.json",
+      "A": {
+        "wallMs": 734,
+        "files": 10,
+        "blocks": 19,
+        "bytes": 23942,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 680,
+        "files": 10,
+        "blocks": 19,
+        "bytes": 23750,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "fast_context",
+        "FastContext",
+        "context.rs",
+        "max_bytes",
+        "budget"
+      ],
+      "session": "6097d0a6-916d-48ad-ac16-b68c320116d6.slim.json",
+      "A": {
+        "wallMs": 672,
+        "files": 14,
+        "blocks": 32,
+        "bytes": 33898,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 600,
+        "files": 14,
+        "blocks": 32,
+        "bytes": 33701,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "证据链",
+        "画布",
+        "canvas",
+        "evidence"
+      ],
+      "session": "84cfea80-586d-499f-802b-6d2bd8623476.slim.json",
+      "A": {
+        "wallMs": 887,
+        "files": 6,
+        "blocks": 24,
+        "bytes": 28645,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 812,
+        "files": 8,
+        "blocks": 20,
+        "bytes": 11428,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "edit_files",
+        "executeTools",
+        "parallel tool",
+        "applyEdit"
+      ],
+      "session": "60123777-76d9-4124-a601-773d9b618065.slim.json",
+      "A": {
+        "wallMs": 563,
+        "files": 6,
+        "blocks": 19,
+        "bytes": 16676,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 519,
+        "files": 5,
+        "blocks": 18,
+        "bytes": 15601,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "novaDevinBatchToolPolicy",
+        "includeEditFiles",
+        "mcpServers",
+        "customTools",
+        "nova-tools"
+      ],
+      "session": "60123777-76d9-4124-a601-773d9b618065.slim.json",
+      "A": {
+        "wallMs": 623,
+        "files": 10,
+        "blocks": 27,
+        "bytes": 20365,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 618,
+        "files": 10,
+        "blocks": 28,
+        "bytes": 20078,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "远程控制",
+        "会话排序",
+        "remote control",
+        "session"
+      ],
+      "session": "bf15e349-390e-4184-a014-dec30badb709.slim.json",
+      "A": {
+        "wallMs": 690,
+        "files": 10,
+        "blocks": 33,
+        "bytes": 25995,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 504,
+        "files": 9,
+        "blocks": 29,
+        "bytes": 26197,
+        "miss": false
+      }
+    },
+    {
+      "keywords": [
+        "cursor",
+        "claude",
+        "claude-code",
+        "adapter",
+        "provider"
+      ],
+      "session": "ab9540e6-41a8-48e6-87ca-1b7c22b096bf.slim.json",
+      "A": {
+        "wallMs": 478,
+        "files": 7,
+        "blocks": 10,
+        "bytes": 21924,
+        "miss": false
+      },
+      "B": {
+        "wallMs": 486,
+        "files": 7,
+        "blocks": 10,
+        "bytes": 21900,
+        "miss": false
+      }
+    }
+  ]
+}

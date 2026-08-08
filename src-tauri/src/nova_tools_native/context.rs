@@ -2549,7 +2549,11 @@ fn compact_evidence_miss(
 /// 硬 MISS 时的"你是不是想找"：把未命中锚点拆成词，一次批量检索后从命中行提取
 /// 包含这些词的真实标识符，按覆盖词数/频次/是否定义行打分。只给生产代码里的
 /// 符号；测试/文档命中不算。找不到相近符号时返回空，MISS 保持原样。
-fn suggest_symbols(root: &Path, anchors: &[String]) -> Vec<String> {
+/// 方案3 倒排索引加速：defs 表（索引期预建的 name → 定义映射）直接查表得候选，
+/// 只有 defs 查不到任何候选时才退回全仓 rg 扫描。倒排键按 camelCase/snake_case 拆词，
+/// 锚点拆出的 words 在 defs 的拆词键上 O(1) 查表，命中即跳过 O(defs × terms) 子串扫描。
+/// NOVA_CTX_DEFS_SUGGEST=0 可回退到纯 rg 扫描（A/B 对照）。
+fn suggest_symbols(root: &Path, anchors: &[String], defs: Option<&HashMap<String, Vec<Definition>>>) -> Vec<String> {
     let mut words = Vec::<String>::new();
     for anchor in anchors {
         for variant in naming_variants(anchor) {
@@ -2570,6 +2574,61 @@ fn suggest_symbols(root: &Path, anchors: &[String]) -> Vec<String> {
     words.truncate(8);
     if words.is_empty() {
         return Vec::new();
+    }
+    let defs_suggest = std::env::var_os("NOVA_CTX_DEFS_SUGGEST")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    // 倒排查表路径：defs 键按标识符原样存储，候选 = 键中包含任一 word 的定义符号。
+    if defs_suggest {
+        if let Some(defs) = defs {
+            let mut scored = Vec::<(String, String, usize)>::new(); // (name, location, matched_words)
+            for (name, definitions) in defs.iter() {
+                let low = name.to_lowercase();
+                if low.len() < 5 || words.contains(&low) || stop_word(&low) {
+                    continue;
+                }
+                let matched = words.iter().filter(|word| low.contains(word.as_str())).count();
+                if matched == 0 {
+                    continue;
+                }
+                let Some(definition) = definitions.first() else { continue };
+                if !is_code_file(&definition.file) || anchor_noise_path(&definition.file) {
+                    continue;
+                }
+                scored.push((
+                    name.clone(),
+                    format!("{}:{}", definition.file, definition.symbol.ln),
+                    matched,
+                ));
+            }
+            if !scored.is_empty() {
+                let normalize = |value: &str| {
+                    value
+                        .chars()
+                        .filter(|ch| ch.is_ascii_alphanumeric())
+                        .map(|ch| ch.to_ascii_lowercase())
+                        .collect::<String>()
+                };
+                let normalized_anchors = anchors.iter().map(|a| normalize(a)).collect::<Vec<_>>();
+                scored.sort_by(|(a_name, _, a_matched), (b_name, _, b_matched)| {
+                    let a_close = normalized_anchors.iter().any(|anchor| {
+                        !anchor.is_empty() && levenshtein(anchor, &normalize(a_name), 3) <= 2
+                    });
+                    let b_close = normalized_anchors.iter().any(|anchor| {
+                        !anchor.is_empty() && levenshtein(anchor, &normalize(b_name), 3) <= 2
+                    });
+                    (b_close, b_matched)
+                        .cmp(&(a_close, a_matched))
+                        .then_with(|| a_name.cmp(b_name))
+                });
+                scored.truncate(DID_YOU_MEAN_MAX);
+                return scored
+                    .into_iter()
+                    .map(|(name, location, _)| format!("{name} ({location})"))
+                    .collect();
+            }
+            // defs 表为空或无候选：继续走 rg 扫描兜底（冷缓存或未扫描文件）。
+        }
     }
     let rows = search_text(root, &words, true, false, &[]);
     static IDENT: OnceLock<Regex> = OnceLock::new();
@@ -3533,7 +3592,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             &revision,
             &explicit_anchors,
             &task,
-            &suggest_symbols(root, &explicit_anchors),
+            // 方案3：MISS 路径尚无全量 index，用 None 走 rg 扫描兜底；defs 查表路径
+            // 服务于未来在 index 可用处的 did-you-mean 加速（如软降级的锚点补充）。
+            &suggest_symbols(root, &explicit_anchors, None),
         ));
     }
     let loose_kw = keywords
@@ -3813,28 +3874,72 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         .map(|(file, _)| file.clone())
         .collect::<Vec<_>>();
     let planned_scope = scope_dirs(&seed_body_files);
-    // 计划驱动的二次检索与反向图词根检索互相独立，并行执行。
+    // 方案2 单进程多 pattern 扫描：planned_terms 和 discover_stems 合并进一次 rg 调用
+    //（原先两个并行 rg 进程各自全仓 walk 一次）。统一 ignore_case=true——planned 的归因
+    // 逻辑（下方 `row.text.contains(term) || lower.contains(...)`）本就大小写双路兼容，
+    // 统一后不改变归因语义；scope 目录限制对合并后的单进程不可行（planned 限 scope、
+    // stems 全仓），取并集即全仓。客户端按行归因到两组 term，IO 减半、省一次进程 spawn。
+    // NOVA_CTX_MERGED_SEARCH=0 可回退到旧的双进程并行模式（A/B 对照）。
+    let merged_search = std::env::var_os("NOVA_CTX_MERGED_SEARCH")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     let search_stage = Instant::now();
-    let (planned_rows, discover_rows) = std::thread::scope(|scope| {
-        let planned = scope.spawn(|| {
-            if planned_terms.is_empty() {
-                Vec::<SearchRow>::new()
-            } else {
-                search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())
+    let (planned_rows, discover_rows) = if merged_search {
+        // 合并：单进程多 pattern，行级归因到 planned / stem 两组。
+        let mut all_terms = planned_terms.clone();
+        for stem in &discover_stems {
+            if !all_terms.iter().any(|t| t.eq_ignore_ascii_case(stem)) {
+                all_terms.push(stem.clone());
             }
-        });
-        let stems = scope.spawn(|| {
-            if discover_stems.is_empty() {
-                Vec::<SearchRow>::new()
-            } else {
-                search_text(root, &discover_stems, true, false, &[])
+        }
+        let rows = if all_terms.is_empty() {
+            Vec::new()
+        } else {
+            search_text(root, &all_terms, true, false, &[])
+        };
+        let planned_lowers = planned_terms
+            .iter()
+            .map(|t| t.to_lowercase())
+            .collect::<Vec<_>>();
+        let stem_lowers = discover_stems
+            .iter()
+            .map(|t| t.to_lowercase())
+            .collect::<Vec<_>>();
+        let mut planned_rows = Vec::new();
+        let mut discover_rows = Vec::new();
+        for row in rows {
+            let lower = row.text.to_lowercase();
+            if planned_lowers.iter().any(|t| lower.contains(t)) {
+                planned_rows.push(row.clone());
             }
-        });
-        (
-            planned.join().unwrap_or_default(),
-            stems.join().unwrap_or_default(),
-        )
-    });
+            if stem_lowers.iter().any(|t| lower.contains(t)) {
+                discover_rows.push(row);
+            }
+        }
+        (planned_rows, discover_rows)
+    } else {
+        // 旧版：两个并行 rg 进程，各自独立 walk。
+        std::thread::scope(|scope| {
+            let planned = scope.spawn(|| {
+                if planned_terms.is_empty() {
+                    Vec::<SearchRow>::new()
+                } else {
+                    search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())
+                }
+            });
+            let stems = scope.spawn(|| {
+                if discover_stems.is_empty() {
+                    Vec::<SearchRow>::new()
+                } else {
+                    search_text(root, &discover_stems, true, false, &[])
+                }
+            });
+            (
+                planned.join().unwrap_or_default(),
+                stems.join().unwrap_or_default(),
+            )
+        })
+    };
     trace("fast_context.plan_search", search_stage);
     if !planned_terms.is_empty() {
         terms.extend(planned_terms.iter().cloned());
@@ -4560,32 +4665,64 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
         features
     };
+    // 子模贪心打包。NOVA_CTX_SUBMODULAR=0 时退回旧版（粗粒度特征 + O(n²) 朴素贪心），
+    // 便于 A/B 对照；默认走细化特征 + Lazy Greedy。
+    //
+    // 细化点：覆盖元素从 `term:kw` 细化到 `term:kw:file`——同一 term 在同一文件内的
+    // 重复命中零增量（冗余覆盖），跨文件命中给 0.4× 衰减分。这让“信息增量”成为真正的
+    // 单调次模函数：两个文件命中同一批关键词时，第二个文件的增益按衰减后的边际计算，
+    // 不再被误判为零（旧实现）或满分（纯加性）。
+    let submodular_enabled = std::env::var_os("NOVA_CTX_SUBMODULAR")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     let mut remaining = units;
     let mut units = Vec::<UnitCandidate>::new();
+    // (term) -> 已覆盖该 term 的文件集合；用于跨文件衰减。
     let mut covered_features = HashSet::<String>::new();
-    while !remaining.is_empty() {
-        let mut best_index = 0usize;
-        let mut best_value = f64::NEG_INFINITY;
-        for (index, unit) in remaining.iter().enumerate() {
-            let mut gain = if unit.required { 1000.0 } else { 0.0 };
-            for (feature, weight) in unit_features(unit) {
-                if !covered_features.contains(&feature) {
-                    gain += weight;
+    let mut term_files = HashMap::<String, HashSet<String>>::new();
+
+    // 每个候选的覆盖增益（不考虑 score 平局项），随 covered_features / term_files 变化。
+    let marginal_gain = |unit: &UnitCandidate,
+                         covered: &HashSet<String>,
+                         term_files: &HashMap<String, HashSet<String>>,
+                         submodular: bool|
+     -> f64 {
+        let mut gain = if unit.required { 1000.0 } else { 0.0 };
+        for (feature, weight) in unit_features(unit) {
+            if submodular {
+                if let Some(term) = feature.strip_prefix("term:") {
+                    let term_key = term.to_string();
+                    match term_files.get(&term_key) {
+                        None => gain += weight, // 该 term 首次被覆盖：满分
+                        Some(files) if !files.contains(&unit.file) => {
+                            // 跨文件命中：衰减 0.4×
+                            gain += weight * 0.4;
+                        }
+                        _ => { /* 同文件重复命中：零增量 */ }
+                    }
+                    continue;
                 }
             }
-            if noise_path(&unit.file) && unit.role != "test" {
-                gain -= 50.0;
-            }
-            let value =
-                gain / (unit.estimated_bytes as f64 / 1024.0).max(1.0) + unit.score / 1000.0;
-            if value > best_value {
-                best_value = value;
-                best_index = index;
+            if !covered.contains(&feature) {
+                gain += weight;
             }
         }
-        let mut picked = remaining.remove(best_index);
+        if noise_path(&unit.file) && unit.role != "test" {
+            gain -= 50.0;
+        }
+        gain
+    };
+
+    let pack_value = |unit: &UnitCandidate, gain: f64| -> f64 {
+        gain / (unit.estimated_bytes as f64 / 1024.0).max(1.0) + unit.score / 1000.0
+    };
+
+    // 提交一个块：更新 covered_features / term_files / obligation。
+    let commit = |picked: &mut UnitCandidate,
+                  covered: &mut HashSet<String>,
+                  term_files: &mut HashMap<String, HashSet<String>>| {
         picked.obligation = if picked.role == "caller" {
-            unit_features(&picked)
+            unit_features(picked)
                 .into_iter()
                 .find_map(|(feature, _)| feature.starts_with("caller:").then_some(feature))
         } else if picked.role == "test" {
@@ -4599,10 +4736,91 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         } else {
             None
         };
-        for (feature, _) in unit_features(&picked) {
-            covered_features.insert(feature);
+        for (feature, _) in unit_features(picked) {
+            if let Some(term) = feature.strip_prefix("term:") {
+                term_files
+                    .entry(term.to_string())
+                    .or_default()
+                    .insert(picked.file.clone());
+            }
+            covered.insert(feature);
         }
-        units.push(picked);
+    };
+
+    if submodular_enabled {
+        // Lazy Greedy（Minoux 加速）：用最大堆维护各候选的增益上界，每次弹出堆顶重算；
+        // 若重算后仍是堆顶则直接选中。单调次模性保证上界只减不增，正确性不变。
+        use std::collections::BinaryHeap;
+        #[derive(Clone)]
+        struct QueueEntry {
+            bound: f64,
+            index: usize,
+        }
+        impl PartialEq for QueueEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.bound == other.bound
+            }
+        }
+        impl Eq for QueueEntry {}
+        impl PartialOrd for QueueEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for QueueEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.bound
+                    .partial_cmp(&other.bound)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+        let mut heap = BinaryHeap::<QueueEntry>::new();
+        for (index, unit) in remaining.iter().enumerate() {
+            let gain = marginal_gain(unit, &covered_features, &term_files, true);
+            heap.push(QueueEntry {
+                bound: pack_value(unit, gain),
+                index,
+            });
+        }
+        let mut alive = vec![true; remaining.len()];
+        while let Some(QueueEntry { bound, index }) = heap.pop() {
+            if !alive[index] {
+                continue;
+            }
+            let unit = &remaining[index];
+            let gain = marginal_gain(unit, &covered_features, &term_files, true);
+            let value = pack_value(unit, gain);
+            // 重算后仍不劣于当前堆顶（或堆已空）：选中。
+            let next_bound = heap.peek().map(|entry| entry.bound).unwrap_or(f64::NEG_INFINITY);
+            if value >= next_bound {
+                alive[index] = false;
+                let mut picked = remaining[index].clone();
+                commit(&mut picked, &mut covered_features, &mut term_files);
+                units.push(picked);
+            } else if value > bound {
+                // 上界失效（不该发生于单调次模，防御）：以新值重新入堆。
+                heap.push(QueueEntry { bound: value, index });
+            } else {
+                heap.push(QueueEntry { bound: value, index });
+            }
+        }
+    } else {
+        // 旧版：粗粒度特征 + O(n²) 朴素贪心（A/B 对照臂）。
+        while !remaining.is_empty() {
+            let mut best_index = 0usize;
+            let mut best_value = f64::NEG_INFINITY;
+            for (index, unit) in remaining.iter().enumerate() {
+                let gain = marginal_gain(unit, &covered_features, &term_files, false);
+                let value = pack_value(unit, gain);
+                if value > best_value {
+                    best_value = value;
+                    best_index = index;
+                }
+            }
+            let mut picked = remaining.remove(best_index);
+            commit(&mut picked, &mut covered_features, &mut term_files);
+            units.push(picked);
+        }
     }
     let mut plans = Vec::<PlannedFile>::new();
     let mut sigs = Vec::<(String, usize, String)>::new();
@@ -5353,6 +5571,49 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             }
             body.push(String::new());
         }
+        // 方案5 超取经济学：字节便宜、调用昂贵。把 deferred 中未回填的非必需块
+        // 以签名形式暴露为"投机块"——模型若判断相关可直接按 path:ln 补读，
+        // 省掉一次完整工具调用的 RTT。按 score 降序取前 8 个。
+        // NOVA_CTX_SPECULATIVE=0 关闭（A/B 对照）。
+        let speculative_enabled = std::env::var_os("NOVA_CTX_SPECULATIVE")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        if speculative_enabled {
+            let mut speculative = deferred
+                .iter()
+                .filter(|item| !item.block.required)
+                .filter(|item| {
+                    // 已被回填进 plans 的块不再重复列出。
+                    !plans.iter().any(|plan| {
+                        plan.file == item.file
+                            && plan.blocks.iter().any(|block| {
+                                block.start == item.block.start && block.end == item.block.end
+                            })
+                    })
+                })
+                .collect::<Vec<_>>();
+            speculative.sort_by(|a, b| {
+                b.block
+                    .score
+                    .partial_cmp(&a.block.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            speculative.truncate(8);
+            if !speculative.is_empty() {
+                body.push("## SPECULATIVE (可能相关但预算内未打包; 确需按 path:ln 补读)".into());
+                for item in speculative {
+                    body.push(format!(
+                        "{}:{}-{} {} [{}]",
+                        item.file,
+                        item.block.start,
+                        item.block.end,
+                        item.block.label,
+                        item.block.tag
+                    ));
+                }
+                body.push(String::new());
+            }
+        }
         let mut notes = Vec::new();
         if !compact_index {
             if !missed_all.is_empty() {
@@ -5613,6 +5874,57 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     }
     let _ = original_count;
     trace("fast_context.render", render_start);
+    // 方案4（重设计）预测性读取——CPU 分支预测的类比：
+    //   分支预测器 = OnlineEditModel（RankNet 9 特征成对逻辑回归，随 edit feedback 在线更新）
+    //   预测目标   = ranked 中未进入 final_candidates 的文件里 P(edit) 最高的前 N 个
+    //   预取动作   = 预读这些文件的 source 进内存缓存，不改变本次输出
+    //   预测正确   = 下次 fast_context 若命中同文件，source() 直接复用，省磁盘 IO
+    //   预测错误   = 一次无害的 fs::read_to_string，无副作用
+    // 与自动学习完全兼容：用的就是同一个模型的预测分数；被预取的文件若后续被编辑，
+    // 在下次 settle 时作为正样本进一步强化模型（正反馈回路）。
+    // NOVA_CTX_PREFETCH=0 关闭（A/B 对照）。
+    let prefetch_enabled = std::env::var_os("NOVA_CTX_PREFETCH")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    if prefetch_enabled {
+        if let Some(model) = &learning_snapshot {
+            let prefetch_start = Instant::now();
+            let packed_files = sources.keys().cloned().collect::<HashSet<_>>();
+            // 对 ranked 中未打包的文件按模型 P(edit) 打分，取 top-3。
+            let mut prefetch_candidates = ranked
+                .iter()
+                .filter(|(file, _)| !packed_files.contains(file))
+                .filter(|(file, _)| is_code_file(file))
+                .filter(|(file, _)| !noise_path(file))
+                .map(|(file, heuristic)| {
+                    let probability =
+                        learning_predict(model, &learning_features(file, *heuristic));
+                    (file.clone(), probability)
+                })
+                .collect::<Vec<_>>();
+            prefetch_candidates.sort_by(|(_, a), (_, b)| {
+                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            prefetch_candidates.truncate(3);
+            let mut prefetched = 0usize;
+            for (file, probability) in &prefetch_candidates {
+                // 只预取模型有正向信心的文件（P > 0.5），避免冷启动时乱读。
+                if *probability < 0.5 {
+                    continue;
+                }
+                if let Some(src) = source(root, file, index.files.get(file)) {
+                    sources.insert(file.clone(), src);
+                    prefetched += 1;
+                    if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
+                        eprintln!("[ctx] prefetch {file} P(edit)={probability:.3}");
+                    }
+                }
+            }
+            if prefetched > 0 {
+                trace("fast_context.prefetch", prefetch_start);
+            }
+        }
+    }
     trace("fast_context.total", total_start);
     Ok(text)
 }
