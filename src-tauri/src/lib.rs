@@ -6121,6 +6121,11 @@ pub fn run() {
                         _ => {}
                     }
                 }
+                // Lyra 与 Vega 共用配置且进程内拉取零成本，启动时静默刷新，
+                // 避免首次打开模型选择器才生成 ~/.nova/model-options/lyra.json。
+                if state.agent_enabled(&AgentKind::Lyra) {
+                    state.lyra.spawn_revalidate_model_options();
+                }
             }
 
             // 会话后台落盘器：store.save() 只置脏标记，这里以 600ms 防抖合并，
