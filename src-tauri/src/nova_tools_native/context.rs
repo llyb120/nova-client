@@ -53,7 +53,7 @@ const REVERSE_FULL_REBUILD_CHANGES: usize = 64;
 const PERSIST_MIN_CHANGED: usize = 16;
 /// 目录 scope 检索时限定代码文件扩展名的 rg glob（与 is_code_file 的扩展名集合一致）。
 const CODE_FILES_GLOB: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,rs,py,pyi,go,java,kt,kts,cs,c,h,cc,cpp,hpp,swift,php,scala,dart,m,mm,zig}";
-const LEARNING_FEATURES: usize = 7;
+const LEARNING_FEATURES: usize = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OnlineEditModel {
@@ -67,9 +67,10 @@ struct OnlineEditModel {
 impl Default for OnlineEditModel {
     fn default() -> Self {
         Self {
-            version: 1,
-            // heuristic, seed, explicit, exact caller, companion test, test path, small file
-            weights: [1.2, 1.0, 1.2, 0.7, 0.8, 0.4, 0.2],
+            version: 3,
+            // heuristic, seed, explicit, exact caller, companion test, test path, small file,
+            // path depth, query-path overlap
+            weights: [1.2, 1.0, 1.2, 0.7, 0.8, 0.4, 0.2, 0.5, 0.6],
             bias: -2.0,
             observations: 0,
             positives: 0,
@@ -90,6 +91,8 @@ struct RepoLearningState {
     loaded: bool,
     model: OnlineEditModel,
     pending: Vec<PendingLearningSample>,
+    /// AdaGrad per-coordinate gradient accumulators (in-memory only, not persisted).
+    grad_acc: [f64; LEARNING_FEATURES],
 }
 
 static LEARNING_STATE: OnceLock<Mutex<HashMap<String, RepoLearningState>>> = OnceLock::new();
@@ -183,7 +186,7 @@ fn load_learning_model(root: &Path) -> OnlineEditModel {
     fs::read(learning_model_path(root))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<OnlineEditModel>(&bytes).ok())
-        .filter(|model| model.version == 1)
+        .filter(|model| model.version == 3)
         .unwrap_or_default()
 }
 
@@ -206,7 +209,7 @@ fn save_learning_model(root: &Path, model: &OnlineEditModel) {
 #[allow(dead_code)] // 预留给需要传输快照字节的调用方；当前经 JSON 值传递。
 pub fn parse_learning_model_snapshot(bytes: &[u8]) -> Option<Value> {
     let model: OnlineEditModel = serde_json::from_slice(bytes).ok()?;
-    if model.version != 1 {
+    if model.version != 3 {
         return None;
     }
     serde_json::to_value(&model).ok()
@@ -222,7 +225,7 @@ pub fn inject_learning_model_snapshot(root: &Path, snapshot: &Value) -> bool {
         let Ok(model) = serde_json::from_value::<OnlineEditModel>(snapshot.clone()) else {
             return false;
         };
-        if model.version != 1 {
+        if model.version != 3 {
             return false;
         }
         let key = learning_root_key(root);
@@ -257,49 +260,104 @@ fn sigmoid(value: f64) -> f64 {
     }
 }
 
-fn learning_predict(model: &OnlineEditModel, features: &[f64; LEARNING_FEATURES]) -> f64 {
-    sigmoid(
-        model.bias
-            + model
-                .weights
-                .iter()
-                .zip(features)
-                .map(|(weight, feature)| weight * feature)
-                .sum::<f64>(),
-    )
+fn learning_score(model: &OnlineEditModel, features: &[f64; LEARNING_FEATURES]) -> f64 {
+    model.bias
+        + model
+            .weights
+            .iter()
+            .zip(features)
+            .map(|(weight, feature)| weight * feature)
+            .sum::<f64>()
 }
 
-fn learning_update(
+fn learning_predict(model: &OnlineEditModel, features: &[f64; LEARNING_FEATURES]) -> f64 {
+    sigmoid(learning_score(model, features))
+}
+
+/// RankNet pairwise logistic loss with AdaGrad per-coordinate learning rates.
+///
+/// Instead of predicting absolute P(edit) for each file independently (pointwise),
+/// we learn that the positive (edited) file should score higher than the negative
+/// (not edited) file. The gradient is:
+///   ∂L/∂w_i = sigmoid(-(s_pos - s_neg)) * (pos_f_i - neg_f_i)
+/// which only depends on the *relative* score difference, not absolute probabilities.
+/// This naturally eliminates class imbalance: every pair is 1:1.
+///
+/// AdaGrad gives each feature its own learning rate: lr_i = base / sqrt(G_i + ε),
+/// where G_i accumulates squared gradients. Frequently-active features (e.g. "small
+/// file") converge and their lr decays; rare features (e.g. "exact caller") keep
+/// a high lr to learn faster from scarce signal.
+fn learning_update_pair(
     model: &mut OnlineEditModel,
-    features: &[f64; LEARNING_FEATURES],
-    label: f64,
-    sample_weight: f64,
+    grad_acc: &mut [f64; LEARNING_FEATURES],
+    pos_features: &[f64; LEARNING_FEATURES],
+    neg_features: &[f64; LEARNING_FEATURES],
+    weight: f64,
 ) {
-    let prediction = learning_predict(model, features);
-    let error = (label - prediction) * sample_weight;
-    let rate = 0.035 / (1.0 + model.observations as f64 / 500.0).sqrt();
-    for (weight, feature) in model.weights.iter_mut().zip(features) {
-        *weight = (*weight + rate * error * feature - rate * 0.0005 * *weight).clamp(-6.0, 6.0);
+    let score_pos = learning_score(model, pos_features);
+    let score_neg = learning_score(model, neg_features);
+    let delta = score_pos - score_neg;
+    // sigmoid(-delta) = P(neg should rank above pos) = the model's ranking error.
+    let grad_base = sigmoid(-delta) * weight;
+
+    for i in 0..LEARNING_FEATURES {
+        let feature_diff = pos_features[i] - neg_features[i];
+        let gradient = grad_base * feature_diff;
+        grad_acc[i] += gradient * gradient;
+        let lr_i = 0.08 / (grad_acc[i].sqrt() + 0.1);
+        model.weights[i] =
+            (model.weights[i] - lr_i * gradient - lr_i * 0.0005 * model.weights[i]).clamp(-6.0, 6.0);
     }
-    model.bias = (model.bias + rate * error).clamp(-6.0, 6.0);
+    // Bias uses a fixed learning rate (single parameter, AdaGrad unnecessary).
+    model.bias = (model.bias - 0.03 * grad_base - 0.03 * 0.0005 * model.bias).clamp(-6.0, 6.0);
+
     model.observations += 1;
-    if label >= 0.5 {
-        model.positives += 1;
-    }
+    model.positives += 1;
 }
 
 fn settle_pending(root: &Path, state: &mut RepoLearningState) -> usize {
     let pending = std::mem::take(&mut state.pending);
     let settled = pending.len();
-    for sample in pending {
-        if !sample.edit_applied {
-            // 未编辑不等于无用，只作为很弱的负反馈。
-            learning_update(&mut state.model, &sample.features, 0.0, 0.08);
+
+    // Pairwise learning: split into positives (edited) and negatives (not edited).
+    // No training signal without both — read-only sessions produce no updates.
+    let positives: Vec<&PendingLearningSample> = pending.iter().filter(|s| s.edit_applied).collect();
+    let negatives: Vec<&PendingLearningSample> = pending.iter().filter(|s| !s.edit_applied).collect();
+    if positives.is_empty() || negatives.is_empty() {
+        return settled;
+    }
+
+    // Pre-compute model scores for all negatives to find hardest examples.
+    let neg_scores: Vec<f64> = negatives
+        .iter()
+        .map(|n| learning_score(&state.model, &n.features))
+        .collect();
+
+    for pos in &positives {
+        // Hard negative mining: pick the negative with the highest model score.
+        // This is the model's most confident "mistake" — the most informative
+        // training example. One hard negative ≈ many random negatives.
+        let hardest_idx = neg_scores
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i);
+        if let Some(idx) = hardest_idx {
+            let neg = negatives[idx];
+            // Included positives (surfaced to user) get weight 1.0;
+            // excluded positives (model missed them) get weight 1.5 — penalize misses harder.
+            let weight = if pos.included { 1.0 } else { 1.5 };
+            learning_update_pair(
+                &mut state.model,
+                &mut state.grad_acc,
+                &pos.features,
+                &neg.features,
+                weight,
+            );
         }
     }
-    if settled > 0 {
-        save_learning_model(root, &state.model);
-    }
+
+    save_learning_model(root, &state.model);
     settled
 }
 
@@ -347,11 +405,14 @@ fn with_learning_state<T>(root: &Path, callback: impl FnOnce(&mut RepoLearningSt
 }
 
 fn learning_blend(observations: u64) -> f64 {
-    match observations {
-        0..=19 => 0.0,
-        20..=99 => 0.12,
-        100..=499 => 0.28,
-        _ => 0.45,
+    // Smooth ramp: minimal influence until 5 observations, then asymptotic approach to 0.4.
+    // Time constant 120 balances fast ramp-up with stability: at 42 obs blend≈0.13
+    // (max adjustment ±39pts), enough to reorder similar-scored files without
+    // disrupting the heuristic ranking for broad queries.
+    if observations < 5 {
+        0.0
+    } else {
+        0.4 * (1.0 - (-((observations - 5) as f64) / 120.0).exp())
     }
 }
 
@@ -394,18 +455,48 @@ pub fn observe_context_feedback(root: &Path, params: Value) -> Result<Value, Str
         if action != "edit" {
             return 0usize;
         }
+        // Find the edited sample's features (Copy out to avoid borrow conflict).
+        let pos_data = state
+            .pending
+            .iter()
+            .find(|s| s.file == path && !s.edit_applied)
+            .map(|s| (s.features, s.included));
+        let Some((pos_features, pos_included)) = pos_data else {
+            return 0usize;
+        };
+        // Compute scores for all non-edited pending samples to find hardest negative.
+        let neg_candidates: Vec<([f64; LEARNING_FEATURES], f64)> = state
+            .pending
+            .iter()
+            .filter(|s| !s.edit_applied && s.file != path)
+            .map(|s| (s.features, learning_score(&state.model, &s.features)))
+            .collect();
+        let hardest_neg = neg_candidates
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(f, _)| *f);
+        // Mark all matching samples as edited first (count reflects edits recorded).
         let mut count = 0usize;
         for sample in &mut state.pending {
             if sample.file == path && !sample.edit_applied {
-                let weight = if sample.included { 1.0 } else { 1.5 };
-                learning_update(&mut state.model, &sample.features, 1.0, weight);
                 sample.edit_applied = true;
                 count += 1;
             }
         }
-        if count > 0 {
-            save_learning_model(root, &state.model);
-        }
+        // Pairwise update: use hardest negative if available, otherwise a zero-vector
+        // baseline (represents "an undistinguished file with no signal"). This ensures
+        // training signal even when the pending list has only one file — the model
+        // learns that the edited file should score higher than a random baseline.
+        let neg_feat = hardest_neg.unwrap_or([0.0; LEARNING_FEATURES]);
+        let weight = if pos_included { 1.0 } else { 1.5 };
+        learning_update_pair(
+            &mut state.model,
+            &mut state.grad_acc,
+            &pos_features,
+            &neg_feat,
+            weight,
+        );
+        save_learning_model(root, &state.model);
         count
     });
     Ok(serde_json::json!({"enabled": true, "action": action, "path": path, "updated": updated, "modelSnapshot": learning_model_snapshot(root)}))
@@ -4096,6 +4187,22 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             .ok()
             .map(|meta| meta.len() <= 24 * 1024)
             .unwrap_or(false);
+        // Path depth: shallow files (e.g. src/lib.rs) tend to be more central.
+        // Normalized as 1/(depth+1) so root-level files = 1.0, 2-deep = 0.33, etc.
+        let depth = file.matches('/').count() as f64;
+        let path_depth = 1.0 / (depth + 1.0);
+        // Query-path overlap: fraction of keywords found in the file path string.
+        // Files whose path contains query terms are more likely to be relevant.
+        let path_lower = file.to_lowercase();
+        let overlap = if keywords.is_empty() {
+            0.0
+        } else {
+            keywords
+                .iter()
+                .filter(|kw| path_lower.contains(&kw.to_lowercase()))
+                .count() as f64
+                / keywords.len() as f64
+        };
         [
             (heuristic / 1000.0).clamp(0.0, 1.5),
             if seed_files.contains(file) { 1.0 } else { 0.0 },
@@ -4116,6 +4223,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             },
             if noise_path(file) { 1.0 } else { 0.0 },
             if small { 1.0 } else { 0.0 },
+            path_depth,
+            overlap,
         ]
     };
     if let Some(model) = &learning_snapshot {
@@ -4123,7 +4232,12 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         if blend > 0.0 {
             for (file, score) in &mut ranked {
                 let probability = learning_predict(model, &learning_features(file, *score));
-                *score += blend * (probability - 0.5) * 420.0;
+                // Clamp: model can adjust score by at most ±(blend * 300) points.
+                // This prevents a low-heuristic file from being pushed into candidate
+                // range by an overconfident model prediction (the R4 problem).
+                let adjustment = (blend * (probability - 0.5) * 420.0)
+                    .clamp(-blend * 300.0, blend * 300.0);
+                *score += adjustment;
             }
         }
     }

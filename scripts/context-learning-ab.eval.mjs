@@ -31,6 +31,31 @@ const CASES = [
     sourceSession: "09774430-c287-4f78-bfc0-bfc9116cd4e7.slim.json",
     prompt: "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 buildAlkaidSystemPrompt、fast_context，分析为什么 Agent 开始会用 fast_context、后续却可能不再使用。只基于工具输出回答，不再检索，不改代码。"
   },
+  {
+    id: "R4",
+    sourceSession: "bd12ca61-0c21-46f3-ad2d-cf85194a7a05.slim.json",
+    prompt: "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 remote、model、switch、session，task 描述理解远程控制会话与模型切换功能，分析在远程控制会话内支持切换模型需要改哪些地方。只基于工具输出回答，不再调用其它检索工具，不改代码。"
+  },
+  {
+    id: "R5",
+    sourceSession: "84cfea80-586d-499f-802b-6d2bd8623476.slim.json",
+    prompt: "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 证据链、画布、canvas、evidence，task 描述证据链画布组件的布局与渲染优化占屏空间，分析该怎么优化。只基于工具输出回答，不再调用其它检索工具，不改代码。"
+  },
+  {
+    id: "R6",
+    sourceSession: "60123777-76d9-4124-a601-773d9b618065.slim.json",
+    prompt: "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 edit_files、executeTools、parallel tool、applyEdit，task 描述查找 pi 工具执行代码判断 edit 是否并发执行，分析 pi 的 edit 是否也会并发执行。只基于工具输出回答，不再调用其它检索工具，不改代码。"
+  },
+  {
+    id: "R7",
+    sourceSession: "bf15e349-390e-4184-a014-dec30badb709.slim.json",
+    prompt: "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 远程控制、会话排序、remote control、session，task 描述远程控制的会话列表排序改为按用户最后输入提示词时间倒序，分析当前排序逻辑和需要改的地方。只基于工具输出回答，不再调用其它检索工具，不改代码。"
+  },
+  {
+    id: "R8",
+    sourceSession: "da76f639-644d-471c-85dc-a0b2f55ae929.slim.json",
+    prompt: "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 workflow、工作流、edge、transition、handoff，task 描述简化工作流配置让引擎隐式补充会话结论接力，分析当前工作流配置和运行引擎的结构。只基于工具输出回答，不再调用其它检索工具，不改代码。"
+  },
 ];
 
 function recentSessionFiles(limit = 80) {
