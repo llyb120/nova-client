@@ -1001,6 +1001,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         AgentKind::Cursor,
         AgentKind::OpenCode,
         AgentKind::OpenCodePlus,
+        AgentKind::Lyra,
     ] {
         if !state.agent_enabled(&kind) {
             continue;
