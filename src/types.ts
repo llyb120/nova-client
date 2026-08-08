@@ -481,6 +481,8 @@ export interface Settings {
   semanticEnabled: boolean;
   /** 启用 Fast Context 上下文检索工具（fast_context / find_symbols）。 */
   fastContextEnabled: boolean;
+  /** 启用 Fast Context 在线学习（全局 context service 汇总编辑反馈调整排序）。 */
+  contextLearningEnabled: boolean;
   /** embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434） */
   embedEndpoint: string;
   /** embedding 模型名（如 bge-m3 / nomic-embed-text / text-embedding-3-small） */

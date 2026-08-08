@@ -17,14 +17,20 @@ async function run(request) {
     thinkingLevel: resolved.thinkingLevel ?? request.thinkingLevel ?? request.reasoningEffort,
   });
   let finalText = "";
+  const toolStartedAt = new Map();
+  const toolMetrics = [];
+  const runStartedAt = Date.now();
   runtime.agent.subscribe((event) => {
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       finalText += event.assistantMessageEvent.delta;
       send({ type: "text_delta", delta: event.assistantMessageEvent.delta });
     } else if (event.type === "tool_execution_start") {
+      toolStartedAt.set(event.toolCallId, Date.now());
       send({ type: "tool_start", id: event.toolCallId, name: event.toolName, arguments: event.args });
     } else if (event.type === "tool_execution_end") {
-      send({ type: "tool_end", id: event.toolCallId, name: event.toolName, isError: event.isError });
+      const durationMs = Date.now() - (toolStartedAt.get(event.toolCallId) ?? Date.now());
+      toolMetrics.push({ id: event.toolCallId, name: event.toolName, durationMs, isError: event.isError });
+      send({ type: "tool_end", id: event.toolCallId, name: event.toolName, isError: event.isError, durationMs });
     }
   });
   try {
@@ -34,7 +40,16 @@ async function run(request) {
     if (last?.role === "assistant" && last.stopReason === "error") {
       throw new Error(last.errorMessage || "Vega provider 请求失败");
     }
-    send({ type: "done", text: finalText });
+    const usage = runtime.agent.state.messages
+      .filter((message) => message.role === "assistant" && message.usage)
+      .reduce((total, message) => {
+        for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"]) {
+          total[key] += Number.isFinite(message.usage[key]) ? message.usage[key] : 0;
+        }
+        return total;
+      }, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 });
+    if (!usage.totalTokens) usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+    send({ type: "done", text: finalText, usage, wallMs: Date.now() - runStartedAt, tools: toolMetrics });
   } finally {
     await runtime.close();
   }

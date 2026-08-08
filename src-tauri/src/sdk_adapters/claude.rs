@@ -37,15 +37,26 @@ impl SdkAdapter for ClaudeAdapter {
             path_env: "NOVA_CLAUDE_PATH",
             api_key: (!settings.claudecode_sdk_api_key.is_empty())
                 .then(|| ("ANTHROPIC_API_KEY", settings.claudecode_sdk_api_key.clone())),
-            extra_env: vec![(
-                "NOVA_FAST_CONTEXT",
-                if settings.fast_context_enabled {
-                    "1"
-                } else {
-                    "0"
-                }
-                .into(),
-            )],
+            extra_env: vec![
+                (
+                    "NOVA_FAST_CONTEXT",
+                    if settings.fast_context_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
+                (
+                    "NOVA_CONTEXT_LEARNING",
+                    if settings.context_learning_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
+            ],
         }
     }
 

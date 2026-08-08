@@ -1,0 +1,397 @@
+{
+  "model": "opencode/deepseek-v4-flash",
+  "ranAt": "2026-08-08T15:42:42.581Z",
+  "branch": "feat/fast-context-online-learning-ab",
+  "parallel": true,
+  "parallelElapsedMs": 58228,
+  "cases": [
+    {
+      "id": "R1",
+      "sourceSession": "6097d0a6-916d-48ad-ac16-b68c320116d6.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 fast_context_run、co_changed_files，分析还能如何提高 fast_context 效率并减少后续 read。只基于工具输出回答，不再调用其它检索工具，不改代码。",
+      "A": {
+        "wallMs": 58221,
+        "reportedWallMs": 45159,
+        "inputTokens": 3435,
+        "outputTokens": 3939,
+        "cacheReadTokens": 4992,
+        "totalTokens": 12366,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1065,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 46625,
+        "reportedWallMs": 33535,
+        "inputTokens": 3299,
+        "outputTokens": 2869,
+        "cacheReadTokens": 5120,
+        "totalTokens": 11288,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1192,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": "，一次把 `files` 传满（最多 6 个）合并打包，避免多次调用；keywords 也一次给足（最多 5 个）。\n- 涉及编辑/计划分析时显式开 `coupling: true`，把共改提示提前拿到。\n- 大文件只展示少量块时，先看是否有未展示块清单再决定是否放大预算，避免盲目重调。\n\n风险提示：以上改进集中在 `src-tauri/src/nova_tools_native/context.rs`（6423 行，改动面大），建议按\"未展开文件附证据行 → coupling 默认策略 → source() 缓存\"的优先级小步落地，并用现有测试（含 coupling 默认关闭断言）守住行为。",
+        "B": "要不要 read 的文件上**。\n\n6. **让在线学习替你记住耦合**。edit/settle 反馈会沉淀进跨 worktree 共享的单一 JSON 模型，使后续 fast_context 调用对高频共改文件排序更高——这是把「这次的发现」转成「下次少 read」的机制，且单模型文件不碎片化，linked worktree 也能复用。\n\n一句话总结：**把「决定权」交给参数（`files` 必选、`coupling: true` 提前带出共改文件、按需调预算），把「已验证闭包」当免读证明（PROOF + shown 行段），把「历史共改」沉淀进学习模型**，即可减少绝大多数后续 read。"
+      }
+    },
+    {
+      "id": "R2",
+      "sourceSession": "6097d0a6-916d-48ad-ac16-b68c320116d6.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 native_edit、edit、fast_context，分析原生 edit 使用独立工具实现时如何消费 fast_context 编辑锚点。只基于工具输出回答，不再检索，不改代码。",
+      "A": {
+        "wallMs": 39037,
+        "reportedWallMs": 25979,
+        "inputTokens": 5760,
+        "outputTokens": 2220,
+        "cacheReadTokens": 4992,
+        "totalTokens": 12972,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1085,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 39434,
+        "reportedWallMs": 26366,
+        "inputTokens": 6066,
+        "outputTokens": 2410,
+        "cacheReadTokens": 4992,
+        "totalTokens": 13468,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 977,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": " 时启用，=0 时为对照臂）。\n- 本任务正是该回放的一次聚焦样例（prompt 一字不差出现在用例里，keywords 即 native_edit/edit/fast_context）。\n\n**一句话总结**：Devin 变体中 edit 是独立原生工具而非 MCP 端点，它直接消费 fast_context 输出里 `@@ path shown=行段` + `[def]/[dep]` 锚点（已展示即已读、禁止重读），通过\"先 fast_context 拿锚点 → 只补缺口 read → 原生 edit 合并改动\"的路径完成编辑；每次 edit 以相对路径为键回报给上下文学习模型作为正反馈。",
+        "B": "ontext 锚点\"在 learning 侧的可观测信号。\n\n**小结**：原生 edit 不直接调用 fast_context；它通过模型层消费其输出锚点——path 定目标文件、`@@ 起-止`/FULL 定 startLine/endLine、已展示原文充当 oldText 与 firstLine/lastLine 护栏，同文件多锚点合并进一次 edit 调用（Devin 模式经 mcp_call_tool 拿锚点 + Devin 原生 edit 落地），且每次 edit 通过 observe_context_feedback 向 context service 回传正反馈形成学习闭环。"
+      }
+    },
+    {
+      "id": "R3",
+      "sourceSession": "09774430-c287-4f78-bfc0-bfc9116cd4e7.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 buildAlkaidSystemPrompt、fast_context，分析为什么 Agent 开始会用 fast_context、后续却可能不再使用。只基于工具输出回答，不再检索，不改代码。",
+      "A": {
+        "wallMs": 51851,
+        "reportedWallMs": 38753,
+        "inputTokens": 8837,
+        "outputTokens": 3890,
+        "cacheReadTokens": 4992,
+        "totalTokens": 17719,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1101,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 42788,
+        "reportedWallMs": 29820,
+        "inputTokens": 8877,
+        "outputTokens": 2793,
+        "cacheReadTokens": 4992,
+        "totalTokens": 16662,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1089,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": "ing-ab.eval.mjs:82-122 的 pretrainFromRecentSessions 会回放真实会话的 `fast_context → edit` 顺序并对每次 edit 做增量 Logistic 更新（observe_context_feedback），模型对 fast_context 的倾向会随沉淀的会话数据漂移——存在\"越学越少调用\"的自我强化可能，但这属于推断，输出中无直接证据。\n\n未改动任何文件；如需验证\"开关分支切换后的行为差异\"，可运行 `NOVA_FAST_CONTEXT=0 node scripts/alkaid.test.mjs` 对照（未执行，属建议）。",
+        "B": "873–889 行）的断言也印证了这一点：`NOVA_FAST_CONTEXT !== \"0\"` 时才断言工具存在、提示词含「先调用一次 fast_context」。\n\n### 一句话总结\n\n「开头用、后来不用」是系统提示词中的自洽设计：fast_context 被定义为**前置一次性**的跨文件分析工具——开头那次调用负责把改动面完整装进上下文（一次替代多轮检索），随后「已展示范围视为已读」+「禁止为看更多重调」+「后续走已知路径直接 read / diff 验证」三条规则共同确保后续不再调用；此外 `NOVA_FAST_CONTEXT=0` 环境开关可从工具列表和提示词两个层面整体移除它。"
+      }
+    },
+    {
+      "id": "R4",
+      "sourceSession": "bd12ca61-0c21-46f3-ad2d-cf85194a7a05.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 remote、model、switch、session，task 描述理解远程控制会话与模型切换功能，分析在远程控制会话内支持切换模型需要改哪些地方。只基于工具输出回答，不再调用其它检索工具，不改代码。",
+      "A": {
+        "wallMs": 43780,
+        "reportedWallMs": 30749,
+        "inputTokens": 7953,
+        "outputTokens": 2743,
+        "cacheReadTokens": 4992,
+        "totalTokens": 15688,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 2096,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 40607,
+        "reportedWallMs": 27637,
+        "inputTokens": 5960,
+        "outputTokens": 2414,
+        "cacheReadTokens": 4992,
+        "totalTokens": 13366,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 2100,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": " 是否已含 model 字段**：输出中仅展示类型名未展示字段体，需补读确认是否有已预留的模型切换命令。\n- **权限捕获的覆盖范围**：`remote_permissions` 目前只挂 `EV_PERMISSION`（工具权限类），模型切换是否需要另走一套确认机制需结合命令类型判断。\n\n验证建议（实施阶段）：在 host 侧切换模型后，比对 `RemoteSnapshot` 中 thread 的 model 字段与 `SdkManager.model_options` 是否同步刷新；并通过 `ServerResponse.commands` 回放一次切换命令，确认会话重建与上下文接力不丢。",
+        "B": "moteThreadMeta` 字段（当前模型是否已在元数据中）。\n- `sync()` 与 `RemoteTransport.incoming` 的处理循环（决定切换结果如何回流）。\n- UI/前端侧（输出仅命中 Rust 端，docs/*.md 等 121 个其它文件未展开，可能存在前端入口与文档约定）。\n\n建议下一步以 `remote.rs` 的 `RemoteCommand`/`RemoteThreadMeta`/`sync` 为入口补读（可再传 `files` 指向 `src-tauri/src/remote.rs` 一次 fast_context），确认协议细节后再定具体改动清单。"
+      }
+    },
+    {
+      "id": "R5",
+      "sourceSession": "84cfea80-586d-499f-802b-6d2bd8623476.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 证据链、画布、canvas、evidence，task 描述证据链画布组件的布局与渲染优化占屏空间，分析该怎么优化。只基于工具输出回答，不再调用其它检索工具，不改代码。",
+      "A": {
+        "wallMs": 37071,
+        "reportedWallMs": 24171,
+        "inputTokens": 3047,
+        "outputTokens": 1726,
+        "cacheReadTokens": 4992,
+        "totalTokens": 9765,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1628,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 42905,
+        "reportedWallMs": 29976,
+        "inputTokens": 2971,
+        "outputTokens": 2431,
+        "cacheReadTokens": 5120,
+        "totalTokens": 10522,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1464,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": "名与类型的推断，尚未看到实现细节**：\n- `GraphLayout`/`Placement` 的实际间距算法与是否已自适应；\n- `Camera` 是否已支持 auto-fit、是否用 transform 重绘；\n- 画布尺寸/容器是否随侧栏折叠、窗口缩放响应（占屏空间常受容器而非画布限制）。\n\n建议下一步：用 `fast_context`（`files: [\"src/components/EvidenceChainView.tsx\"]`）展开 `Placement/Camera/GraphLayout` 三个块的实现，即可把上面的假设确认成具体改点。本轮按要求未改代码、未调用其它检索工具。",
+        "B": "stroke，降低绘制开销。\n\n## 优先级建议\n\n1. **折叠分组 + fit-to-view 相机**（直接减少占屏，改动集中在 `stackCards` 展开策略与 `Camera` 初始化）；\n2. **视口裁剪 + RAF 按需重绘**（大画布下占屏体验与性能同时改善）；\n3. **分层压缩与 LOD 分档**（细节打磨）。\n\n## 局限说明\n\n本输出未展开 `EvidenceChainView` 函数体（SIG 仅给签名），因此渲染循环、展开/折叠状态、相机变换的具体实现细节尚不可见；以上建议基于暴露的类型与辅助函数推断，落地前需先读 189 行起的组件体确认当前重绘与展开逻辑。"
+      }
+    },
+    {
+      "id": "R6",
+      "sourceSession": "60123777-76d9-4124-a601-773d9b618065.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 edit_files、executeTools、parallel tool、applyEdit，task 描述查找 pi 工具执行代码判断 edit 是否并发执行，分析 pi 的 edit 是否也会并发执行。只基于工具输出回答，不再调用其它检索工具，不改代码。",
+      "A": {
+        "wallMs": 32804,
+        "reportedWallMs": 19907,
+        "inputTokens": 5603,
+        "outputTokens": 1477,
+        "cacheReadTokens": 5120,
+        "totalTokens": 12200,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 797,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 37104,
+        "reportedWallMs": 24209,
+        "inputTokens": 5329,
+        "outputTokens": 2023,
+        "cacheReadTokens": 4992,
+        "totalTokens": 12344,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1214,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": "rallel\" 关键词的全部命中都属于无关语义（clues.rs 的平行线索、文档中的 A/B 并发评测说明），不能作为\"edit 并发执行\"的依据。\n\n## 结论\n\n仅依据本次工具输出，**没有证据表明 pi 的 edit 会并发执行**，也找不到 `executeTools` 这类并行调度代码；edit 的实际执行在 N-API 原生层，其实现未在本次展示范围内，因此无法进一步证实。若要确认，需单独检索原生 addon 层（`native/nova-tools-napi/src/lib.rs`）中 `edit_files` 的分发逻辑——但按约束，本次不再调用其它工具。\n\n未修改任何代码。",
+        "B": "es` 调用 + `files`/`edits` 批量数组\"形态执行；学习系统按原始调用顺序串行回放并逐个产生反馈；评测脚本里的 `parallel` 是会话级并行，与 edit 工具并发无关。\n- 因此可合理判断：**pi 的 edit 与既有设计一致，是\"同一调用内批量 edits 数组、多文件合批\"的串行批量执行，而非并发执行多个 edit 工具调用**。若要给出铁证，需要补读未被展开的 `alkaid-bridge-common.mjs` / `alkaid-context-reasonix.mjs` 中的派发代码——这超出了\"只基于本次输出\"的约束，故在此明确标注为未验证的剩余风险。"
+      }
+    },
+    {
+      "id": "R7",
+      "sourceSession": "bf15e349-390e-4184-a014-dec30badb709.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 远程控制、会话排序、remote control、session，task 描述远程控制的会话列表排序改为按用户最后输入提示词时间倒序，分析当前排序逻辑和需要改的地方。只基于工具输出回答，不再调用其它检索工具，不改代码。",
+      "A": {
+        "wallMs": 39229,
+        "reportedWallMs": 26230,
+        "inputTokens": 6727,
+        "outputTokens": 2234,
+        "cacheReadTokens": 4992,
+        "totalTokens": 13953,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1741,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 36610,
+        "reportedWallMs": 23806,
+        "inputTokens": 6664,
+        "outputTokens": 1874,
+        "cacheReadTokens": 5120,
+        "totalTokens": 13658,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1568,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": "量。\n3. **验证边界**：`threads` 之外的 `thread_snapshots: HashMap` 是键值存储、无顺序概念，不受影响；需确认前端是否还有二次排序（本次输出未含前端代码）。\n\n### 剩余风险\n\n- 当前排序逻辑与 `RemoteThreadMeta` 字段定义未在本次输出中展开（SIG 只给了 `run` 签名），改前必须补读 remote.rs 的 `run`（约 409 行起）与 `RemoteThreadMeta` 定义。\n- 若\"最后输入提示词时间\"与现有排序字段（如最后任何消息/会话创建时间）不是同一字段，还需一并确认消息写入路径上该时间戳是否已持久化。",
+        "B": "te_control_enabled` 均为协议或开关逻辑，无需改动。\n\n## 剩余风险\n\n当前输出不足以确认 `run()` 体内 `threads` 的真实组装方式与 `RemoteThreadMeta` 是否已含\"最后输入提示词时间\"字段——这两处被 SIG 截断或未命中。若继续推进，下一步应补读 `remote.rs:409` 起的 `run` 函数体及 `RemoteThreadMeta` 定义（可再次用 fast_context 指定 `files: [\"src-tauri/src/remote.rs\"]` 或按行精确 read），但按你的约束，本轮不再调用其它检索工具、不改代码。"
+      }
+    },
+    {
+      "id": "R8",
+      "sourceSession": "da76f639-644d-471c-85dc-a0b2f55ae929.slim.json",
+      "prompt": "这是此前真实任务的聚焦回放：先用且只用一次 fast_context，keywords 取 workflow、工作流、edge、transition、handoff，task 描述简化工作流配置让引擎隐式补充会话结论接力，分析当前工作流配置和运行引擎的结构。只基于工具输出回答，不再调用其它检索工具，不改代码。",
+      "A": {
+        "wallMs": 41372,
+        "reportedWallMs": 28534,
+        "inputTokens": 3348,
+        "outputTokens": 2655,
+        "cacheReadTokens": 4992,
+        "totalTokens": 10995,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1695,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "B": {
+        "wallMs": 41732,
+        "reportedWallMs": 28876,
+        "inputTokens": 3776,
+        "outputTokens": 2565,
+        "cacheReadTokens": 5120,
+        "totalTokens": 11461,
+        "toolCalls": 1,
+        "fastContextCalls": 1,
+        "readCalls": 0,
+        "bashCalls": 0,
+        "toolTimeMs": 1602,
+        "sequence": "fast_context",
+        "timeout": false
+      },
+      "finalTextTail": {
+        "A": "划 + 进行中工具轨迹\"的隐式接力；唯一空洞是 `always` 连线在 prompt/label 双空时 `workflowTransitionPrompt` 返回空串，`to_label` 会为空。简化方案应保证连线始终有可回退的 label（或由引擎对空 label 生成默认值）。\n\n3. **改动面收敛**：运行时语义全部在 threads.rs（已存在，无需新增），配置简化只需动 `types.ts` 的注释/类型约束与 SettingsPanel 的连线编辑 UI；Canvas 的 `edges()` 纯渲染、不受影响。\n\n未修改任何代码（计划模式），以上仅为结构与简化可行性分析。",
+        "B": "路由标识要求，提示词模式由轻量模型对候选描述做判断（字段注释已写明此意图），替代显式 `when`。\n3. **接力无需显式 transfer**：`{{prev}}`（配置侧注入）+ `take_handoff_context`（引擎侧按标签渲染会话结论）已构成完整的隐式接力闭环；`manualReview` 仍保留为唯一需要人工选边的场景，其余阶段引擎可自行补足到下一阶段。\n\n**净效果**：配置里只需声明“节点模板 + 目标节点”，`when` 规则与显式转移声明从“必需”降级为“兼容遗留数据”，引擎按会话结论隐式完成路由与结论接力。\n\n未修改任何文件（计划模式），未再调用其它检索工具。"
+      }
+    }
+  ],
+  "pretraining": {
+    "contexts": 24,
+    "positiveUpdates": 20,
+    "sessions": [
+      "lyra-18c9d96a146c61de-175416.slim.json",
+      "8782b561-a24c-48c3-9d6f-bf9d2f76caef.slim.json",
+      "bd12ca61-0c21-46f3-ad2d-cf85194a7a05.slim.json",
+      "38c5862a-1059-4c26-a544-9276641deef4.slim.json",
+      "c50e2312-3ba9-4696-a91c-b06ba69bc9b5.slim.json",
+      "8b9b52f3-14ff-4432-8eaa-de4ab6e1520e.slim.json",
+      "216481cf-adbc-4392-adc5-d2f5b656b68a.slim.json",
+      "e18c0006-7868-4c74-b9dc-6cc0c6f7f233.slim.json",
+      "6097d0a6-916d-48ad-ac16-b68c320116d6.slim.json",
+      "84cfea80-586d-499f-802b-6d2bd8623476.slim.json",
+      "60123777-76d9-4124-a601-773d9b618065.slim.json",
+      "f7f40d93-4d98-43d7-9aab-8624d4315753.slim.json",
+      "1018c694-3574-4259-8f83-0bd7f0d579a8.slim.json",
+      "c55ee47e-1b5b-45b7-8cd4-38c098ab0e71.slim.json",
+      "f21f66e8-601c-4e13-8faf-2d61a229d67a.slim.json"
+    ],
+    "model": {
+      "version": 3,
+      "weights": [
+        1.8060738358343882,
+        1.408820256401227,
+        1.513868338948571,
+        0.5803209155176705,
+        1.2014285635210138,
+        0.531179963158247,
+        0.781597328757299,
+        0.8931078364364688,
+        0.7061665886600905
+      ],
+      "bias": -3.077053027099682,
+      "observations": 40,
+      "positives": 40
+    }
+  },
+  "totals": {
+    "A": {
+      "wallMs": 343365,
+      "inputTokens": 44710,
+      "outputTokens": 20884,
+      "cacheReadTokens": 40064,
+      "totalTokens": 105658,
+      "toolCalls": 8,
+      "fastContextCalls": 8,
+      "readCalls": 0,
+      "bashCalls": 0,
+      "toolTimeMs": 11208
+    },
+    "B": {
+      "wallMs": 327805,
+      "inputTokens": 42942,
+      "outputTokens": 19379,
+      "cacheReadTokens": 40448,
+      "totalTokens": 102769,
+      "toolCalls": 8,
+      "fastContextCalls": 8,
+      "readCalls": 0,
+      "bashCalls": 0,
+      "toolTimeMs": 11206
+    }
+  },
+  "deltas": {
+    "wallMs": -15560,
+    "inputTokens": -1768,
+    "outputTokens": -1505,
+    "cacheReadTokens": 384,
+    "totalTokens": -2889,
+    "toolCalls": 0,
+    "fastContextCalls": 0,
+    "readCalls": 0,
+    "bashCalls": 0,
+    "toolTimeMs": -2
+  }
+}
