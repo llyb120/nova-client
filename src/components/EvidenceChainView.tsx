@@ -20,56 +20,22 @@ import {
 import type { ClueAttachment, ClueCard, ClueComment, ClueNodeGroup } from "../types";
 import { ClueCaptureModal } from "./ClueCaptureModal";
 import { attachmentPreviewSrc } from "./ImageAttachmentStrip";
-import { IconClue, IconDownload, IconFile, IconMove, IconPlus } from "./icons";
+import { IconClue, IconDownload, IconFile, IconPlus } from "./icons";
 import { MentionPicker } from "./MentionPicker";
 
 type Placement = "update" | "parallel" | "new";
-type Point = { x: number; y: number };
-type Camera = { x: number; y: number; zoom: number };
+type GroupRole = "start" | "middle" | "end" | "isolated";
 
-type GroupNode = {
+type StageEntry = {
   group: ClueNodeGroup;
   cards: ClueCard[];
-  role: "start" | "middle" | "end" | "isolated";
+  role: GroupRole;
+};
+
+type StageColumn = {
   depth: number;
-  x: number;
-  y: number;
+  entries: StageEntry[];
 };
-
-type GraphEdge = {
-  fromCardId: string;
-  toCardIds: string[];
-  points: Point[];
-};
-
-type GraphLayout = {
-  nodes: GroupNode[];
-  stages: Array<{ depth: number; x: number }>;
-  edges: GraphEdge[];
-  cardAnchors: Map<string, Point>;
-  maxX: number;
-  maxY: number;
-};
-
-type GraphStructure = {
-  nodes: Array<Omit<GroupNode, "cards">>;
-  stages: Array<{ depth: number; x: number }>;
-  layoutTop: number;
-};
-
-const CARD_WIDTH = 236;
-const CARD_HEIGHT = 296;
-const STACK_TITLE_PEEK = 48;
-const COLUMN_GAP = 150;
-const ROW_GAP = 105;
-const WORLD_LEFT = 110;
-const WORLD_TOP = 104;
-const EDGE_LANE_GAP = 14;
-const PORT_CENTER_Y = 66.5;
-const OUTPUT_ANCHOR_X = CARD_WIDTH + 4.5;
-const INPUT_ANCHOR_X = -4.5;
-const MIN_ZOOM = 0.42;
-const MAX_ZOOM = 1.65;
 
 function fmtTime(ts: number) {
   return new Date(ts).toLocaleString("zh-CN", {
@@ -98,20 +64,20 @@ function authorBadge(name?: string) {
   return characters.slice(0, 2).join("");
 }
 
-function roleLabel(role: GroupNode["role"]) {
+function roleLabel(role: GroupRole) {
   switch (role) {
     case "start":
-      return "START · 起始";
+      return "起始";
     case "end":
-      return "END · 末尾";
+      return "末端";
     case "isolated":
-      return "ISOLATED · 孤立";
+      return "孤立";
     default:
-      return "CLUE · 证据";
+      return "衔接";
   }
 }
 
-function groupRole(group: ClueNodeGroup, parentCardIds: Set<string>): GroupNode["role"] {
+function groupRole(group: ClueNodeGroup, parentCardIds: Set<string>): GroupRole {
   const hasIncoming = group.parentCardIds.length > 0;
   const hasOutgoing = group.cards.some((card) => parentCardIds.has(card.id));
   if (!hasIncoming) return hasOutgoing ? "start" : "isolated";
@@ -125,67 +91,6 @@ function stackCards(group: ClueNodeGroup, selectedCardId: string | null) {
     : [...group.cards];
 }
 
-function traceRoundedRoute(context: CanvasRenderingContext2D, points: Point[], radius: number) {
-  if (points.length < 2) return;
-  context.beginPath();
-  context.moveTo(points[0].x, points[0].y);
-  for (let index = 1; index < points.length - 1; index += 1) {
-    const previous = points[index - 1];
-    const current = points[index];
-    const next = points[index + 1];
-    const incoming = Math.min(radius, Math.hypot(current.x - previous.x, current.y - previous.y) / 2);
-    const outgoing = Math.min(radius, Math.hypot(next.x - current.x, next.y - current.y) / 2);
-    const before = {
-      x: current.x - Math.sign(current.x - previous.x) * incoming,
-      y: current.y - Math.sign(current.y - previous.y) * incoming,
-    };
-    const after = {
-      x: current.x + Math.sign(next.x - current.x) * outgoing,
-      y: current.y + Math.sign(next.y - current.y) * outgoing,
-    };
-    context.lineTo(before.x, before.y);
-    context.quadraticCurveTo(current.x, current.y, after.x, after.y);
-  }
-  const last = points[points.length - 1];
-  context.lineTo(last.x, last.y);
-}
-
-function drawArrow(context: CanvasRenderingContext2D, from: Point, to: Point, size: number, color: string) {
-  const angle = Math.atan2(to.y - from.y, to.x - from.x);
-  context.beginPath();
-  context.moveTo(to.x, to.y);
-  context.lineTo(
-    to.x - size * Math.cos(angle - Math.PI / 6),
-    to.y - size * Math.sin(angle - Math.PI / 6),
-  );
-  context.lineTo(
-    to.x - size * Math.cos(angle + Math.PI / 6),
-    to.y - size * Math.sin(angle + Math.PI / 6),
-  );
-  context.closePath();
-  context.fillStyle = color;
-  context.fill();
-}
-
-function distanceToSegment(point: Point, start: Point, end: Point) {
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
-  if (dx === 0 && dy === 0) return Math.hypot(point.x - start.x, point.y - start.y);
-  const progress = Math.max(
-    0,
-    Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / (dx * dx + dy * dy)),
-  );
-  return Math.hypot(point.x - (start.x + progress * dx), point.y - (start.y + progress * dy));
-}
-
-function distanceToEdge(point: Point, edge: GraphEdge) {
-  let distance = Number.POSITIVE_INFINITY;
-  for (let index = 1; index < edge.points.length; index += 1) {
-    distance = Math.min(distance, distanceToSegment(point, edge.points[index - 1], edge.points[index]));
-  }
-  return distance;
-}
-
 export function EvidenceChainView() {
   const [selectedCardId, setSelectedCardId] = createSignal<string | null>(null);
   const [capture, setCapture] = createSignal<{
@@ -193,54 +98,19 @@ export function EvidenceChainView() {
     targetCardId: string | null;
   } | null>(null);
   const [selectedCardIds, setSelectedCardIds] = createSignal<Set<string>>(new Set());
+  const [previewCardId, setPreviewCardId] = createSignal<string | null>(null);
   const [deletingCardId, setDeletingCardId] = createSignal<string | null>(null);
   const [splittingCardId, setSplittingCardId] = createSignal<string | null>(null);
   const [stacking, setStacking] = createSignal(false);
-  const [camera, setCamera] = createSignal<Camera>({ x: 40, y: 40, zoom: 1 });
-  const [nodePositions, setNodePositions] = createSignal<Map<string, Point>>(new Map());
-  const [draggingGroupId, setDraggingGroupId] = createSignal<string | null>(null);
-  const [connecting, setConnecting] = createSignal<{
-    fromCardId: string;
-    pointerId: number;
-    pointer: Point;
-  } | null>(null);
-  const [connectionTargetId, setConnectionTargetId] = createSignal<string | null>(null);
+  const [connectFromId, setConnectFromId] = createSignal<string | null>(null);
   const [connectionBusy, setConnectionBusy] = createSignal(false);
-  const [edgeMenu, setEdgeMenu] = createSignal<{
-    x: number;
-    y: number;
-    beforeCardId: string;
-    afterCardId: string;
-  } | null>(null);
-  const [edgeBusy, setEdgeBusy] = createSignal(false);
+  const [removingEdgeKey, setRemovingEdgeKey] = createSignal<string | null>(null);
   const [commentText, setCommentText] = createSignal("");
   const [commentMentions, setCommentMentions] = createSignal<string[]>([]);
   const [replyToCommentId, setReplyToCommentId] = createSignal<string | null>(null);
   const [commentBusy, setCommentBusy] = createSignal(false);
-  let viewportElement: HTMLDivElement | undefined;
-  let canvasElement: HTMLCanvasElement | undefined;
   let commentInputElement: HTMLTextAreaElement | undefined;
   let composingCardId: string | null | undefined;
-  let resizeObserver: ResizeObserver | undefined;
-  let drawFrame: number | undefined;
-  let dragFrame: number | undefined;
-  let pendingDragPosition: { groupId: string; point: Point } | undefined;
-  let fitted = false;
-  let panGesture: {
-    pointerId: number;
-    startX: number;
-    startY: number;
-    cameraX: number;
-    cameraY: number;
-  } | null = null;
-  let nodeDrag: {
-    pointerId: number;
-    groupId: string;
-    startX: number;
-    startY: number;
-    nodeX: number;
-    nodeY: number;
-  } | null = null;
 
   const cardToGroup = createMemo(() => {
     const map = new Map<string, ClueNodeGroup>();
@@ -252,8 +122,8 @@ export function EvidenceChainView() {
 
   const cards = createMemo(() => state.clueGroups.flatMap((group) => group.cards));
 
-  // 拓扑排序和自动布局只依赖线索结构。选中卡片、节点拖动不再触发这部分昂贵计算。
-  const graphStructure = createMemo<GraphStructure>(() => {
+  // 只保留拓扑分层：同一深度的组排成一列，列内按创建时间排序。
+  const stageColumns = createMemo<StageColumn[]>(() => {
     const byCard = cardToGroup();
     const depthMemo = new Map<string, number>();
     const depthOf = (group: ClueNodeGroup, visiting = new Set<string>()): number => {
@@ -275,240 +145,26 @@ export function EvidenceChainView() {
       return depth;
     };
 
-    const stageGroups = new Map<number, ClueNodeGroup[]>();
     const parentCardIds = new Set(state.clueGroups.flatMap((group) => group.parentCardIds));
-    const parentsByGroup = new Map<string, Set<string>>();
-    const childrenByGroup = new Map<string, Set<string>>();
+    const stageGroups = new Map<number, ClueNodeGroup[]>();
     for (const group of state.clueGroups) {
       const depth = depthOf(group);
       stageGroups.set(depth, [...(stageGroups.get(depth) ?? []), group]);
-      for (const parentCardId of group.parentCardIds) {
-        const parent = byCard.get(parentCardId);
-        if (!parent || parent.id === group.id) continue;
-        parentsByGroup.set(group.id, new Set([...(parentsByGroup.get(group.id) ?? []), parent.id]));
-        childrenByGroup.set(parent.id, new Set([...(childrenByGroup.get(parent.id) ?? []), group.id]));
-      }
     }
 
-    const orderedStages = [...stageGroups.entries()].sort(([left], [right]) => left - right);
-    for (const [, groups] of orderedStages) {
-      groups.sort((left, right) => left.createdAt - right.createdAt);
-    }
-    const reorderByNeighbors = (groups: ClueNodeGroup[], neighbors: Map<string, Set<string>>) => {
-      const positions = new Map<string, number>();
-      for (const [, stage] of orderedStages) {
-        stage.forEach((group, index) => positions.set(group.id, (index + 0.5) / stage.length));
-      }
-      const previousOrder = new Map(groups.map((group, index) => [group.id, index]));
-      const score = (group: ClueNodeGroup) => {
-        const values = [...(neighbors.get(group.id) ?? [])]
-          .map((id) => positions.get(id))
-          .filter((value): value is number => value !== undefined);
-        return values.length
-          ? values.reduce((sum, value) => sum + value, 0) / values.length
-          : Number.MAX_SAFE_INTEGER;
-      };
-      groups.sort((left, right) => {
-        const difference = score(left) - score(right);
-        return difference || (previousOrder.get(left.id) ?? 0) - (previousOrder.get(right.id) ?? 0);
-      });
-    };
-    for (let iteration = 0; iteration < 4; iteration += 1) {
-      for (let index = 1; index < orderedStages.length; index += 1) {
-        reorderByNeighbors(orderedStages[index][1], parentsByGroup);
-      }
-      for (let index = orderedStages.length - 2; index >= 0; index -= 1) {
-        reorderByNeighbors(orderedStages[index][1], childrenByGroup);
-      }
-    }
-
-    const longEdgeCount = state.clueGroups.reduce((count, group) => {
-      const targetDepth = depthMemo.get(group.id) ?? 0;
-      return count + group.parentCardIds.filter((parentCardId) => {
-        const parent = byCard.get(parentCardId);
-        return parent && targetDepth - (depthMemo.get(parent.id) ?? 0) > 1;
-      }).length;
-    }, 0);
-    const layoutTop = WORLD_TOP + longEdgeCount * EDGE_LANE_GAP;
-    const groupHeight = (group: ClueNodeGroup) =>
-      CARD_HEIGHT + Math.max(0, group.cards.length - 1) * STACK_TITLE_PEEK;
-    const stageHeight = (groups: ClueNodeGroup[]) =>
-      groups.reduce((sum, group) => sum + groupHeight(group), 0)
-      + Math.max(0, groups.length - 1) * ROW_GAP;
-    const groupsById = new Map(state.clueGroups.map((group) => [group.id, group]));
-    const unassignedGroupIds = new Set(groupsById.keys());
-    const components: ClueNodeGroup[][] = [];
-    for (const seed of [...state.clueGroups].sort((left, right) => left.createdAt - right.createdAt)) {
-      if (!unassignedGroupIds.delete(seed.id)) continue;
-      const component: ClueNodeGroup[] = [];
-      const queue = [seed.id];
-      for (let index = 0; index < queue.length; index += 1) {
-        const groupId = queue[index];
-        const group = groupsById.get(groupId);
-        if (group) component.push(group);
-        const neighbors = new Set([
-          ...(parentsByGroup.get(groupId) ?? []),
-          ...(childrenByGroup.get(groupId) ?? []),
-        ]);
-        for (const neighborId of neighbors) {
-          if (unassignedGroupIds.delete(neighborId)) queue.push(neighborId);
-        }
-      }
-      components.push(component);
-    }
-
-    const groupY = new Map<string, number>();
-    let componentTop = layoutTop;
-    for (const component of components) {
-      const componentIds = new Set(component.map((group) => group.id));
-      const componentStages = orderedStages
-        .map(([, groups]) => groups.filter((group) => componentIds.has(group.id)))
-        .filter((groups) => groups.length > 0);
-      const componentHeight = Math.max(...componentStages.map(stageHeight));
-      for (const groups of componentStages) {
-        let y = componentTop + (componentHeight - stageHeight(groups)) / 2;
-        for (const group of groups) {
-          groupY.set(group.id, y);
-          y += groupHeight(group) + ROW_GAP;
-        }
-      }
-      componentTop += componentHeight + ROW_GAP;
-    }
-
-    const nodes: GraphStructure["nodes"] = [];
-    const stages: Array<{ depth: number; x: number }> = [];
-    for (const [depth, groups] of orderedStages) {
-      const x = WORLD_LEFT + depth * (CARD_WIDTH + COLUMN_GAP);
-      stages.push({ depth, x });
-      groups.forEach((group) => {
-        nodes.push({
-          group,
-          role: groupRole(group, parentCardIds),
-          depth,
-          x,
-          y: groupY.get(group.id) ?? layoutTop,
-        });
-      });
-    }
-
-    return { nodes, stages, layoutTop };
-  });
-
-  // 交互层只套用卡片前后顺序和手动坐标，再更新锚点/连线；拖动时不重跑拓扑布局。
-  const graphLayout = createMemo<GraphLayout>(() => {
-    const structure = graphStructure();
-    const positions = nodePositions();
     const selected = selectedCardId();
-    const nodes: GroupNode[] = structure.nodes.map((node) => {
-      const manualPosition = positions.get(node.group.id);
-      return {
-        ...node,
-        cards: stackCards(node.group, selected),
-        x: manualPosition?.x ?? node.x,
-        y: manualPosition?.y ?? node.y,
-      };
-    });
-    const { stages, layoutTop } = structure;
-
-    const nodeByCard = new Map<string, GroupNode>();
-    const cardAnchors = new Map<string, Point>();
-    for (const node of nodes) {
-      const frontOffset = Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK;
-      const commonOutput = {
-        x: node.x + OUTPUT_ANCHOR_X,
-        y: node.y + PORT_CENTER_Y + frontOffset,
-      };
-      node.cards.forEach((card) => {
-        nodeByCard.set(card.id, node);
-        cardAnchors.set(card.id, commonOutput);
-      });
-    }
-
-    const rawEdges: Array<{
-      key: string;
-      fromCardId: string;
-      toCardIds: string[];
-      start: Point;
-      end: Point;
-    }> = [];
-    // 同一组 → 同一组只画一条线：堆叠后多张前置卡共享锚点，按卡去重前会画出重合的多条边
-    const seenGroupEdges = new Set<string>();
-    for (const node of nodes) {
-      for (const parentCardId of node.group.parentCardIds) {
-        const sourceNode = nodeByCard.get(parentCardId);
-        const start = cardAnchors.get(parentCardId);
-        if (!sourceNode || !start) continue;
-        const groupEdgeKey = `${sourceNode.group.id}->${node.group.id}`;
-        if (seenGroupEdges.has(groupEdgeKey)) continue;
-        seenGroupEdges.add(groupEdgeKey);
-        rawEdges.push({
-          key: `${sourceNode.depth}:${node.depth}`,
-          fromCardId: parentCardId,
-          toCardIds: node.group.cards.map((card) => card.id),
-          start,
-          end: {
-            x: node.x + INPUT_ANCHOR_X,
-            y: node.y + PORT_CENTER_Y + Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK,
-          },
-        });
-      }
-    }
-
-    const edges: GraphEdge[] = [];
-    const edgeGroups = new Map<string, typeof rawEdges>();
-    const longEdges = rawEdges
-      .filter((edge) => {
-        const [sourceDepth, targetDepth] = edge.key.split(":").map(Number);
-        return targetDepth - sourceDepth > 1;
-      })
-      .sort((left, right) => left.start.y - right.start.y || left.end.y - right.end.y);
-    const longEdgeSet = new Set(longEdges);
-    for (const edge of rawEdges) {
-      if (longEdgeSet.has(edge)) continue;
-      edgeGroups.set(edge.key, [...(edgeGroups.get(edge.key) ?? []), edge]);
-    }
-    for (const groupedEdges of edgeGroups.values()) {
-      groupedEdges.sort((left, right) => left.start.y - right.start.y || left.end.y - right.end.y);
-      groupedEdges.forEach((edge, index) => {
-        const laneOffset = (index - (groupedEdges.length - 1) / 2) * 15;
-        const desiredLane = edge.start.x + (edge.end.x - edge.start.x) * 0.5 + laneOffset;
-        const laneX = Math.max(edge.start.x + 28, Math.min(edge.end.x - 28, desiredLane));
-        edges.push({
-          fromCardId: edge.fromCardId,
-          toCardIds: edge.toCardIds,
-          points: [edge.start, { x: laneX, y: edge.start.y }, { x: laneX, y: edge.end.y }, edge.end],
-        });
-      });
-    }
-    longEdges.forEach((edge, index) => {
-      const railY = layoutTop - 28 - index * EDGE_LANE_GAP;
-      const sourceLaneX = edge.start.x + COLUMN_GAP / 2;
-      const targetLaneX = edge.end.x - COLUMN_GAP / 2;
-      edges.push({
-        fromCardId: edge.fromCardId,
-        toCardIds: edge.toCardIds,
-        points: [
-          edge.start,
-          { x: sourceLaneX, y: edge.start.y },
-          { x: sourceLaneX, y: railY },
-          { x: targetLaneX, y: railY },
-          { x: targetLaneX, y: edge.end.y },
-          edge.end,
-        ],
-      });
-    });
-
-    const maxX = Math.max(
-      520,
-      ...nodes.map((node) => node.x + CARD_WIDTH + 80),
-    );
-    const maxY = Math.max(
-      420,
-      ...nodes.map(
-        (node) => node.y + CARD_HEIGHT + Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK + 80,
-      ),
-    );
-    return { nodes, stages, edges, cardAnchors, maxX, maxY };
+    return [...stageGroups.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([depth, groups]) => ({
+        depth,
+        entries: groups
+          .sort((left, right) => left.createdAt - right.createdAt)
+          .map((group) => ({
+            group,
+            cards: stackCards(group, selected),
+            role: groupRole(group, parentCardIds),
+          })),
+      }));
   });
 
   const selectedCard = createMemo(() => clueCardById(selectedCardId()));
@@ -536,204 +192,32 @@ export function EvidenceChainView() {
       : undefined;
   });
 
-  const scheduleDraw = () => {
-    if (drawFrame !== undefined) cancelAnimationFrame(drawFrame);
-    drawFrame = requestAnimationFrame(() => {
-      drawFrame = undefined;
-      drawCanvas();
-    });
-  };
-
-  const drawCanvas = () => {
-    const viewport = viewportElement;
-    const canvas = canvasElement;
-    if (!viewport || !canvas) return;
-    const width = viewport.clientWidth;
-    const height = viewport.clientHeight;
-    const pixelRatio = window.devicePixelRatio || 1;
-    const targetWidth = Math.round(width * pixelRatio);
-    const targetHeight = Math.round(height * pixelRatio);
-    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
-      canvas.width = targetWidth;
-      canvas.height = targetHeight;
-    }
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    const style = getComputedStyle(viewport);
-    const muted = style.getPropertyValue("--text-faint").trim() || "#7d8799";
-    const accent = style.getPropertyValue("--accent").trim() || "#3465c8";
-    const surface = style.getPropertyValue("--bg-panel").trim() || "#ffffff";
-    const currentCamera = camera();
-
-    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-    context.clearRect(0, 0, width, height);
-    const grid = Math.max(16, 30 * currentCamera.zoom);
-    const gridX = ((currentCamera.x % grid) + grid) % grid;
-    const gridY = ((currentCamera.y % grid) + grid) % grid;
-    context.fillStyle = muted;
-    context.globalAlpha = 0.34;
-    for (let x = gridX; x < width; x += grid) {
-      for (let y = gridY; y < height; y += grid) {
-        context.beginPath();
-        context.arc(x, y, 1, 0, Math.PI * 2);
-        context.fill();
-      }
-    }
-    context.globalAlpha = 1;
-    context.translate(currentCamera.x, currentCamera.y);
-    context.scale(currentCamera.zoom, currentCamera.zoom);
-
-    const selected = selectedCardId();
-    const activeCardIds = new Set(
-      selected ? (cardToGroup().get(selected)?.cards.map((card) => card.id) ?? [selected]) : [],
-    );
-    const edgeIsActive = (edge: GraphEdge) =>
-      activeCardIds.has(edge.fromCardId) || edge.toCardIds.some((cardId) => activeCardIds.has(cardId));
-    const orderedEdges = [...graphLayout().edges].sort((left, right) => {
-      return Number(edgeIsActive(left)) - Number(edgeIsActive(right));
-    });
-    for (const edge of orderedEdges) {
-      const active = edgeIsActive(edge);
-      traceRoundedRoute(context, edge.points, 14 / currentCamera.zoom);
-      context.strokeStyle = surface;
-      context.lineWidth = (active ? 8 : 6) / currentCamera.zoom;
-      context.stroke();
-      traceRoundedRoute(context, edge.points, 14 / currentCamera.zoom);
-      context.strokeStyle = active ? accent : muted;
-      context.globalAlpha = active ? 0.95 : 0.56;
-      context.lineWidth = (active ? 2.6 : 1.45) / currentCamera.zoom;
-      context.stroke();
-      context.globalAlpha = 1;
-      drawArrow(
-        context,
-        edge.points[edge.points.length - 2],
-        edge.points[edge.points.length - 1],
-        (active ? 11 : 9) / currentCamera.zoom,
-        active ? accent : muted,
-      );
-    }
-
-    const pendingConnection = connecting();
-    if (pendingConnection) {
-      const start = graphLayout().cardAnchors.get(pendingConnection.fromCardId);
-      if (start) {
-        const end = pendingConnection.pointer;
-        const laneX = start.x + Math.max(34, (end.x - start.x) * 0.5);
-        const points = [start, { x: laneX, y: start.y }, { x: laneX, y: end.y }, end];
-        context.setLineDash([8 / currentCamera.zoom, 6 / currentCamera.zoom]);
-        traceRoundedRoute(context, points, 12 / currentCamera.zoom);
-        context.strokeStyle = accent;
-        context.lineWidth = 2 / currentCamera.zoom;
-        context.stroke();
-        context.setLineDash([]);
-      }
-    }
-  };
-
-  const fitGraph = () => {
-    const viewport = viewportElement;
-    const layout = graphLayout();
-    if (!viewport || layout.nodes.length === 0 || viewport.clientWidth <= 0 || viewport.clientHeight <= 0) {
-      return false;
-    }
-    const padding = 54;
-    const zoom = Math.max(
-      MIN_ZOOM,
-      Math.min(
-        1,
-        (viewport.clientWidth - padding * 2) / layout.maxX,
-        (viewport.clientHeight - padding * 2) / layout.maxY,
-      ),
-    );
-    setCamera({
-      x: Math.max(padding, (viewport.clientWidth - layout.maxX * zoom) / 2),
-      y: Math.max(padding, (viewport.clientHeight - layout.maxY * zoom) / 2),
-      zoom,
-    });
-    return true;
-  };
-
-  const zoomAt = (nextZoom: number, screenX?: number, screenY?: number) => {
-    const viewport = viewportElement;
-    if (!viewport) return;
-    const current = camera();
-    const zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, nextZoom));
-    const x = screenX ?? viewport.clientWidth / 2;
-    const y = screenY ?? viewport.clientHeight / 2;
-    const worldX = (x - current.x) / current.zoom;
-    const worldY = (y - current.y) / current.zoom;
-    setCamera({ x: x - worldX * zoom, y: y - worldY * zoom, zoom });
-  };
-
-  const screenToWorld = (clientX: number, clientY: number): Point => {
-    const viewport = viewportElement;
-    const current = camera();
-    if (!viewport) return { x: 0, y: 0 };
-    const rect = viewport.getBoundingClientRect();
-    return {
-      x: (clientX - rect.left - current.x) / current.zoom,
-      y: (clientY - rect.top - current.y) / current.zoom,
-    };
-  };
-
   const selectOnly = (cardId: string) => {
     markClueMentionRead(cardId);
     setSelectedCardId(cardId);
     setSelectedCardIds(new Set([cardId]));
   };
 
-  const beginConnection = (cardId: string, event: PointerEvent) => {
-    if (connectionBusy()) return;
-    event.preventDefault();
-    event.stopPropagation();
-    selectOnly(cardId);
-    setConnecting({
-      fromCardId: cardId,
-      pointerId: event.pointerId,
-      pointer: screenToWorld(event.clientX, event.clientY),
-    });
-    viewportElement?.setPointerCapture(event.pointerId);
-  };
-
-  const beginNodeDrag = (groupId: string, cardId: string, event: PointerEvent) => {
-    if (event.button !== 0 || (event.target as HTMLElement).closest(".clue-port")) return;
-    if (event.ctrlKey || event.metaKey) return;
-    const pendingConnection = connecting();
-    if (pendingConnection) {
-      event.preventDefault();
-      event.stopPropagation();
-      if (pendingConnection.fromCardId === cardId) cancelPointerAction();
-      else void finishConnection(cardId);
+  const selectCard = (cardId: string, event: MouseEvent) => {
+    if (!event.ctrlKey && !event.metaKey) {
+      selectOnly(cardId);
       return;
     }
-    const node = graphLayout().nodes.find((item) => item.group.id === groupId);
-    if (!node) return;
-    event.stopPropagation();
-    selectOnly(cardId);
-    setDraggingGroupId(groupId);
-    nodeDrag = {
-      pointerId: event.pointerId,
-      groupId,
-      startX: event.clientX,
-      startY: event.clientY,
-      nodeX: node.x,
-      nodeY: node.y,
-    };
-    viewportElement?.setPointerCapture(event.pointerId);
+    const next = new Set(selectedCardIds());
+    if (next.has(cardId)) next.delete(cardId);
+    else next.add(cardId);
+    if (next.size === 0) next.add(cardId);
+    setSelectedCardIds(next);
+    setSelectedCardId(cardId);
   };
 
-  const finishConnection = async (targetCardId?: string) => {
-    const pending = connecting();
-    const target = targetCardId ?? connectionTargetId();
-    setConnecting(null);
-    setConnectionTargetId(null);
-    if (!pending || !target || target === pending.fromCardId) return;
+  const completeConnect = async (fromCardId: string, targetCardId: string) => {
+    if (connectionBusy()) return;
+    setConnectFromId(null);
     setConnectionBusy(true);
     try {
-      await associateClues(pending.fromCardId, target);
-      selectOnly(target);
+      await associateClues(fromCardId, targetCardId);
+      selectOnly(targetCardId);
     } catch (error) {
       await message(String(error), { title: "连接失败", kind: "error" });
     } finally {
@@ -741,138 +225,27 @@ export function EvidenceChainView() {
     }
   };
 
-  const onPointerDown = (event: PointerEvent) => {
-    const target = event.target as HTMLElement;
-    if (!target.closest(".clue-edge-menu")) setEdgeMenu(null);
-    if (target.closest(".clue-group-node, .clue-canvas-toolbar, .clue-edge-menu")) return;
-    if (event.button !== 0 && event.button !== 1) return;
-    if (connecting()) {
-      cancelPointerAction();
+  const onCardClick = (cardId: string, event: MouseEvent) => {
+    const from = connectFromId();
+    if (from) {
+      if (from === cardId) setConnectFromId(null);
+      else void completeConnect(from, cardId);
       return;
     }
-    const current = camera();
-    panGesture = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      cameraX: current.x,
-      cameraY: current.y,
-    };
-    viewportElement?.setPointerCapture(event.pointerId);
+    selectCard(cardId, event);
   };
 
-  const flushDragPosition = () => {
-    dragFrame = undefined;
-    const pending = pendingDragPosition;
-    pendingDragPosition = undefined;
-    if (!pending) return;
-    const next = new Map(nodePositions());
-    next.set(pending.groupId, pending.point);
-    setNodePositions(next);
-  };
-
-  const scheduleDragPosition = (groupId: string, point: Point) => {
-    pendingDragPosition = { groupId, point };
-    if (dragFrame === undefined) dragFrame = requestAnimationFrame(flushDragPosition);
-  };
-
-  const onPointerMove = (event: PointerEvent) => {
-    const pending = connecting();
-    if (pending) {
-      setConnecting({ ...pending, pointer: screenToWorld(event.clientX, event.clientY) });
-      const target = (document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null)
-        ?.closest(".clue-group-node")
-        ?.getAttribute("data-clue-target-id");
-      setConnectionTargetId(target && target !== pending.fromCardId ? target : null);
-      return;
-    }
-    if (nodeDrag?.pointerId === event.pointerId) {
-      const zoom = camera().zoom;
-      scheduleDragPosition(nodeDrag.groupId, {
-        x: nodeDrag.nodeX + (event.clientX - nodeDrag.startX) / zoom,
-        y: nodeDrag.nodeY + (event.clientY - nodeDrag.startY) / zoom,
-      });
-      return;
-    }
-    if (!panGesture || panGesture.pointerId !== event.pointerId) return;
-    setCamera((current) => ({
-      ...current,
-      x: panGesture!.cameraX + event.clientX - panGesture!.startX,
-      y: panGesture!.cameraY + event.clientY - panGesture!.startY,
-    }));
-  };
-
-  const onPointerUp = (event: PointerEvent) => {
-    if (viewportElement?.hasPointerCapture(event.pointerId)) {
-      viewportElement.releasePointerCapture(event.pointerId);
-    }
-    if (connecting()?.pointerId === event.pointerId && connectionTargetId()) void finishConnection();
-    if (nodeDrag?.pointerId === event.pointerId) {
-      if (dragFrame !== undefined) cancelAnimationFrame(dragFrame);
-      flushDragPosition();
-      nodeDrag = null;
-      setDraggingGroupId(null);
-    }
-    if (panGesture?.pointerId === event.pointerId) panGesture = null;
-  };
-
-  const cancelPointerAction = () => {
-    if (dragFrame !== undefined) cancelAnimationFrame(dragFrame);
-    dragFrame = undefined;
-    pendingDragPosition = undefined;
-    panGesture = null;
-    nodeDrag = null;
-    setDraggingGroupId(null);
-    setConnecting(null);
-    setConnectionTargetId(null);
-  };
-
-  const onWheel = (event: WheelEvent) => {
-    event.preventDefault();
-    const viewport = viewportElement;
-    if (!viewport) return;
-    const rect = viewport.getBoundingClientRect();
-    zoomAt(
-      camera().zoom * Math.exp(-event.deltaY * 0.0015),
-      event.clientX - rect.left,
-      event.clientY - rect.top,
-    );
-  };
-
-  const onEdgeContextMenu = (event: MouseEvent) => {
-    if ((event.target as HTMLElement).closest(".clue-group-node, .clue-canvas-toolbar")) return;
-    const point = screenToWorld(event.clientX, event.clientY);
-    const edge = graphLayout().edges
-      .map((item) => ({ item, distance: distanceToEdge(point, item) }))
-      .sort((left, right) => left.distance - right.distance)[0];
-    if (!edge || edge.distance > 24 / camera().zoom || edge.item.toCardIds.length === 0) return;
-    event.preventDefault();
-    const rect = viewportElement?.getBoundingClientRect();
-    if (!rect) return;
-    setEdgeMenu({
-      x: event.clientX - rect.left,
-      y: event.clientY - rect.top,
-      beforeCardId: edge.item.fromCardId,
-      afterCardId: edge.item.toCardIds[0],
-    });
-  };
-
-  const arrangeGraph = () => {
-    setNodePositions(new Map());
-    requestAnimationFrame(fitGraph);
-  };
-
-  const removeConnection = async () => {
-    const edge = edgeMenu();
-    if (!edge || edgeBusy()) return;
-    setEdgeBusy(true);
+  const removeConnection = async (fromCardId: string, toCardId: string, event: MouseEvent) => {
+    event.stopPropagation();
+    const key = `${fromCardId}->${toCardId}`;
+    if (removingEdgeKey() === key) return;
+    setRemovingEdgeKey(key);
     try {
-      await disassociateClues(edge.beforeCardId, edge.afterCardId);
-      setEdgeMenu(null);
+      await disassociateClues(fromCardId, toCardId);
     } catch (error) {
       await message(String(error), { title: "删除连接失败", kind: "error" });
     } finally {
-      setEdgeBusy(false);
+      setRemovingEdgeKey(null);
     }
   };
 
@@ -906,26 +279,12 @@ export function EvidenceChainView() {
     }
   };
 
-  const selectCard = (cardId: string, event: MouseEvent) => {
-    if (!event.ctrlKey && !event.metaKey) {
-      selectOnly(cardId);
-      return;
-    }
-    const next = new Set(selectedCardIds());
-    if (next.has(cardId)) next.delete(cardId);
-    else next.add(cardId);
-    if (next.size === 0) next.add(cardId);
-    setSelectedCardIds(next);
-    setSelectedCardId(cardId);
-  };
-
   const splitSelectedCard = async (card: ClueCard) => {
     if (splittingCardId()) return;
     setSplittingCardId(card.id);
     try {
       await splitClue(card.id);
       setSelectedCardIds(new Set([card.id]));
-      requestAnimationFrame(fitGraph);
     } catch (error) {
       await message(String(error), { title: "拆分失败", kind: "error" });
     } finally {
@@ -941,8 +300,6 @@ export function EvidenceChainView() {
       await stackClues(cardIds);
       const selected = selectedCardId() ?? cardIds[0];
       setSelectedCardIds(new Set([selected]));
-      setNodePositions(new Map());
-      requestAnimationFrame(fitGraph);
     } catch (error) {
       await message(String(error), { title: "堆叠失败", kind: "error" });
     } finally {
@@ -1013,39 +370,17 @@ export function EvidenceChainView() {
     setSelectedCardIds(new Set(next ? [next] : []));
   });
 
-  createEffect(() => {
-    const layout = graphLayout();
-    camera();
-    connecting();
-    selectedCardId();
-    scheduleDraw();
-    if (!fitted && layout.nodes.length > 0 && viewportElement) {
-      requestAnimationFrame(() => {
-        if (!fitted && fitGraph()) fitted = true;
-      });
-    }
-  });
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Escape") setConnectFromId(null);
+  };
 
   onMount(() => {
-    void refreshClueGroups().then(() => {
-      requestAnimationFrame(() => {
-        if (fitGraph()) fitted = true;
-      });
-    });
-    resizeObserver = new ResizeObserver(() => {
-      scheduleDraw();
-      if (!fitted && graphLayout().nodes.length > 0) {
-        fitted = fitGraph();
-      }
-    });
-    if (viewportElement) resizeObserver.observe(viewportElement);
-    scheduleDraw();
+    void refreshClueGroups();
+    window.addEventListener("keydown", onKeyDown);
   });
 
   onCleanup(() => {
-    if (drawFrame !== undefined) cancelAnimationFrame(drawFrame);
-    if (dragFrame !== undefined) cancelAnimationFrame(dragFrame);
-    resizeObserver?.disconnect();
+    window.removeEventListener("keydown", onKeyDown);
   });
 
   return (
@@ -1053,9 +388,16 @@ export function EvidenceChainView() {
       <header class="clue-head">
         <div>
           <h1 class="clue-title">证据链</h1>
-          <p class="clue-sub">拖动空白处平移，滚轮缩放；拖动卡牌调整位置，从右侧连接点建立顺序。</p>
+          <p class="clue-sub">
+            点击卡片查看详情；点「连接」再点目标卡即可建立前置关系；Ctrl + 点击可多选堆叠。
+          </p>
         </div>
         <div class="clue-head-actions">
+          <Show when={connectFromId()}>
+            <button class="btn secondary" onClick={() => setConnectFromId(null)}>
+              取消连接
+            </button>
+          </Show>
           <button class="btn primary" onClick={() => setCapture({ placement: "new", targetCardId: null })}>
             <IconPlus size={14} />
             新建线索
@@ -1074,157 +416,155 @@ export function EvidenceChainView() {
         }
       >
         <div class="clue-layout">
-          <div
-            classList={{ "clue-canvas": true, connecting: !!connecting() }}
-            ref={(element) => (viewportElement = element)}
-            onPointerDown={onPointerDown}
-            onPointerMove={onPointerMove}
-            onPointerUp={onPointerUp}
-            onPointerCancel={cancelPointerAction}
-            onWheel={onWheel}
-            onContextMenu={onEdgeContextMenu}
-          >
-            <canvas class="clue-canvas-lines" ref={(element) => (canvasElement = element)} />
-            <div
-              class="clue-canvas-world"
-              style={{ transform: `translate(${camera().x}px, ${camera().y}px) scale(${camera().zoom})` }}
-            >
-              <For each={graphLayout().stages}>
+          <div class="clue-board" classList={{ connecting: !!connectFromId() }}>
+            <div class="clue-board-columns">
+              <For each={stageColumns()}>
                 {(stage) => (
-                  <div class="clue-canvas-stage" style={{ left: `${stage.x}px`, top: "48px" }}>
-                    {stage.depth === 0 ? "起点" : `第 ${stage.depth + 1} 步`}
+                  <div class="clue-stage">
+                    <div class="clue-stage-head">
+                      {stage.depth === 0 ? "起点" : `第 ${stage.depth + 1} 步`}
+                      <span>{stage.entries.reduce((count, entry) => count + entry.cards.length, 0)} 条</span>
+                    </div>
+                    <div class="clue-stage-cards">
+                      <For each={stage.entries}>
+                        {(entry) => (
+                          <div class="clue-group-block" classList={{ stacked: entry.cards.length > 1 }}>
+                            <Show when={entry.cards.length > 1}>
+                              <div class="clue-group-stack-label">{entry.cards.length} 张平行线索</div>
+                            </Show>
+                            <For each={entry.cards}>
+                              {(card, index) => {
+                                const version = () => clueCurrentVersion(card);
+                                const groupPreds = () =>
+                                  entry.group.parentCardIds
+                                    .map((id) => clueCardById(id))
+                                    .filter((item): item is ClueCard => !!item);
+                                const commentCount = () => (card.comments ?? []).length;
+                                const attachmentCount = () => (version()?.attachments ?? []).length;
+                                const mentionCount = () => (version()?.mentions ?? []).length;
+                                const front = () => index() === entry.cards.length - 1;
+                                return (
+                                  <article
+                                    class={`clue-card-item role-${entry.role}`}
+                                    classList={{
+                                      active: selectedCardId() === card.id,
+                                      selected: selectedCardIds().has(card.id),
+                                      "connect-source": connectFromId() === card.id,
+                                    }}
+                                    role="button"
+                                    tabIndex={0}
+                                    onClick={(event) => onCardClick(card.id, event)}
+                                    onKeyDown={(event) => {
+                                      if (event.key === "Enter" || event.key === " ") {
+                                        event.preventDefault();
+                                        if (!connectFromId()) selectOnly(card.id);
+                                      }
+                                    }}
+                                  >
+                                    <div class="clue-card-top">
+                                      <span
+                                        class="clue-author-avatar"
+                                        title={`作者：${authorName(version()?.authorName)}`}
+                                        aria-label={`作者：${authorName(version()?.authorName)}`}
+                                      >
+                                        {authorBadge(version()?.authorName)}
+                                      </span>
+                                      <strong>{version()?.title || "未命名线索"}</strong>
+                                      <span class="clue-version-tag">v{card.versions.length}</span>
+                                    </div>
+                                    <p class="clue-card-excerpt">{excerpt(version()?.content ?? "", 140)}</p>
+                                    <div class="clue-card-meta">
+                                      <span>{authorName(version()?.authorName)}</span>
+                                      <time>{fmtTime(card.updatedAt)}</time>
+                                    </div>
+                                    <div class="clue-card-stats">
+                                      <span class="role">{roleLabel(entry.role)}</span>
+                                      <Show when={commentCount() > 0}>
+                                        <span>评论 {commentCount()}</span>
+                                      </Show>
+                                      <Show when={attachmentCount() > 0}>
+                                        <span>附件 {attachmentCount()}</span>
+                                      </Show>
+                                      <Show when={mentionCount() > 0}>
+                                        <span>提醒 {mentionCount()}</span>
+                                      </Show>
+                                      <Show when={state.unreadClueMentions.includes(card.id)}>
+                                        <span class="mention">新提醒</span>
+                                      </Show>
+                                    </div>
+                                    <Show when={previewCardId() === card.id}>
+                                      <div class="clue-card-preview">{version()?.content}</div>
+                                    </Show>
+                                    <Show when={front() && groupPreds().length > 0}>
+                                      <div class="clue-card-preds">
+                                        <span class="clue-card-preds-label">前置线索</span>
+                                        <div class="clue-card-preds-list">
+                                          <For each={groupPreds()}>
+                                            {(pred) => (
+                                              <span class="clue-pred-chip">
+                                                <button
+                                                  type="button"
+                                                  class="clue-pred-jump"
+                                                  title="查看前置线索"
+                                                  onClick={(event) => {
+                                                    event.stopPropagation();
+                                                    selectOnly(pred.id);
+                                                  }}
+                                                >
+                                                  {clueCurrentVersion(pred)?.title || "未命名线索"}
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  class="clue-pred-remove"
+                                                  title="删除此前置连接"
+                                                  disabled={removingEdgeKey() === `${pred.id}->${card.id}`}
+                                                  onClick={(event) => void removeConnection(pred.id, card.id, event)}
+                                                >
+                                                  ×
+                                                </button>
+                                              </span>
+                                            )}
+                                          </For>
+                                        </div>
+                                      </div>
+                                    </Show>
+                                    <div class="clue-card-actions-row">
+                                      <button
+                                        type="button"
+                                        class="btn secondary small"
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          setPreviewCardId(previewCardId() === card.id ? null : card.id);
+                                        }}
+                                      >
+                                        {previewCardId() === card.id ? "收起" : "预览"}
+                                      </button>
+                                      <Show when={!connectFromId()}>
+                                        <button
+                                          type="button"
+                                          class="btn secondary small"
+                                          disabled={connectionBusy()}
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            setConnectFromId(card.id);
+                                          }}
+                                        >
+                                          连接
+                                        </button>
+                                      </Show>
+                                    </div>
+                                  </article>
+                                );
+                              }}
+                            </For>
+                          </div>
+                        )}
+                      </For>
+                    </div>
                   </div>
                 )}
               </For>
-              <For each={graphLayout().nodes}>
-                {(node) => (
-                  <section
-                    class="clue-group-node"
-                    classList={{
-                      stacked: node.cards.length > 1,
-                      dragging: draggingGroupId() === node.group.id,
-                      "connection-source": node.group.cards.some(
-                        (card) => connecting()?.fromCardId === card.id,
-                      ),
-                      "connection-target": node.group.cards.some(
-                        (card) => connectionTargetId() === card.id,
-                      ),
-                    }}
-                    data-clue-target-id={node.cards[node.cards.length - 1]?.id}
-                    style={{
-                      left: `${node.x}px`,
-                      top: `${node.y}px`,
-                      width: `${CARD_WIDTH}px`,
-                      height: `${CARD_HEIGHT + Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK}px`,
-                    }}
-                  >
-                    <Show when={node.cards.length > 1}>
-                      <div class="clue-stack-count">{node.cards.length} 张平行线索</div>
-                    </Show>
-                    <span
-                      class="clue-port input"
-                      style={{ top: `${Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK + 58}px` }}
-                      aria-hidden="true"
-                      onPointerDown={(event) => {
-                        const frontCard = node.cards[node.cards.length - 1];
-                        if (!connecting() || !frontCard) return;
-                        event.preventDefault();
-                        event.stopPropagation();
-                        void finishConnection(frontCard.id);
-                      }}
-                    />
-                    <button
-                      type="button"
-                      class="clue-port output"
-                      style={{ top: `${Math.max(0, node.cards.length - 1) * STACK_TITLE_PEEK + 58}px` }}
-                      title="拖到另一组线索，建立前置 → 后续"
-                      disabled={connectionBusy()}
-                      onPointerDown={(event) => {
-                        const frontCard = node.cards[node.cards.length - 1];
-                        if (frontCard) beginConnection(frontCard.id, event);
-                      }}
-                    />
-                    <For each={node.cards}>
-                      {(card, index) => {
-                        const version = () => clueCurrentVersion(card);
-                        const front = () => index() === node.cards.length - 1;
-                        return (
-                          <article
-                            class={`clue-trading-card role-${node.role}`}
-                             classList={{
-                               active: selectedCardId() === card.id,
-                               selected: selectedCardIds().has(card.id),
-                               front: front(),
-                               mentioned: state.unreadClueMentions.includes(card.id),
-                             }}
-                            role="button"
-                            tabIndex={0}
-                            style={{
-                              left: "0",
-                              top: `${index() * STACK_TITLE_PEEK}px`,
-                              "z-index": index() + 1,
-                            }}
-                            onPointerDown={(event) => beginNodeDrag(node.group.id, card.id, event)}
-                            onClick={(event) => selectCard(card.id, event)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === " ") {
-                                selectOnly(card.id);
-                              }
-                            }}
-                          >
-                            <div class="clue-card-nameplate">
-                              <span
-                                class="clue-author-avatar"
-                                title={`作者：${authorName(version()?.authorName)}`}
-                                aria-label={`作者：${authorName(version()?.authorName)}`}
-                              >
-                                {authorBadge(version()?.authorName)}
-                              </span>
-                              <strong>{version()?.title || "未命名线索"}</strong>
-                              <span class="clue-version-gem">v{card.versions.length}</span>
-                            </div>
-                            <div class="clue-card-textbox">
-                              <div class="clue-card-kind">{roleLabel(node.role)}</div>
-                              <p>{excerpt(version()?.content ?? "")}</p>
-                              <div class="clue-card-rule" />
-                              <footer>
-                                <span>{authorName(version()?.authorName)}</span>
-                                <time>{fmtTime(card.updatedAt)}</time>
-                              </footer>
-                            </div>
-                          </article>
-                        );
-                      }}
-                    </For>
-                  </section>
-                )}
-              </For>
             </div>
-            <div class="clue-canvas-toolbar" onPointerDown={(event) => event.stopPropagation()}>
-              <button title="缩小" onClick={() => zoomAt(camera().zoom / 1.16)}>−</button>
-              <button class="zoom-value" title="恢复 100%" onClick={() => zoomAt(1)}>
-                {Math.round(camera().zoom * 100)}%
-              </button>
-              <button title="放大" onClick={() => zoomAt(camera().zoom * 1.16)}>＋</button>
-              <button title="适应全部线索" onClick={fitGraph}><IconMove size={14} /></button>
-              <button class="arrange" title="清除手动位置并自动整理结构" onClick={arrangeGraph}>
-                一键整理
-              </button>
-            </div>
-            <div class="clue-canvas-hint">Ctrl + 点击多选 · 滚轮缩放 · 拖动卡牌移动 · 右侧圆点连接</div>
-            <Show when={edgeMenu()}>
-              {(menu) => (
-                <div
-                  class="clue-edge-menu"
-                  style={{ left: `${menu().x}px`, top: `${menu().y}px` }}
-                  onPointerDown={(event) => event.stopPropagation()}
-                >
-                  <button disabled={edgeBusy()} onClick={() => void removeConnection()}>
-                    {edgeBusy() ? "删除中…" : "删除连接"}
-                  </button>
-                </div>
-              )}
-            </Show>
           </div>
 
           <Show when={selectedCard()}>
@@ -1233,19 +573,44 @@ export function EvidenceChainView() {
               const comments = () => card().comments ?? [];
               const commentById = (id?: string | null) =>
                 id ? comments().find((comment) => comment.id === id) : undefined;
+              type TimelineEntry =
+                | { kind: "comment"; at: number; floor: number; comment: ClueComment }
+                | { kind: "version"; at: number; floor: number; versionIndex: number };
+              // 论坛式时间线：评论与历史版本更新按时间混排成楼层。
+              const timeline = createMemo<TimelineEntry[]>(() => {
+                const entries: TimelineEntry[] = comments().map((comment) => ({
+                  kind: "comment",
+                  at: comment.createdAt,
+                  floor: 0,
+                  comment,
+                }));
+                card().versions.forEach((item, index) => {
+                  if (index === 0 || item.id === card().currentVersionId) return;
+                  entries.push({ kind: "version", at: item.createdAt, floor: 0, versionIndex: index });
+                });
+                entries.sort((left, right) => left.at - right.at);
+                entries.forEach((entry, index) => {
+                  entry.floor = index + 2;
+                });
+                return entries;
+              });
               return (
                 <aside class="clue-detail">
-                  <div class="clue-detail-head">
-                    <span class="clue-detail-kicker">ClueCard</span>
-                    <h2>{version()?.title || "未命名线索"}</h2>
-                    <div class="clue-detail-author">
-                      <span class="clue-author-avatar" title={`作者：${authorName(version()?.authorName)}`}>
-                        {authorBadge(version()?.authorName)}
-                      </span>
-                      <span>{authorName(version()?.authorName)}</span>
+                  <header class="clue-post-head">
+                    <span class="clue-author-avatar" title={`作者：${authorName(version()?.authorName)}`}>
+                      {authorBadge(version()?.authorName)}
+                    </span>
+                    <div class="clue-post-byline">
+                      <strong>{authorName(version()?.authorName)}</strong>
+                      <span class="clue-post-tag">楼主</span>
                     </div>
-                    <span class="clue-detail-meta">{fmtTime(card().updatedAt)} · {card().versions.length} 个版本</span>
-                  </div>
+                    <div class="clue-post-head-main">
+                      <h2>{version()?.title || "未命名线索"}</h2>
+                      <span class="clue-detail-meta">
+                        1 楼 · {fmtTime(card().updatedAt)} · v{card().versions.length} · {comments().length} 条评论
+                      </span>
+                    </div>
+                  </header>
                   <pre class="clue-detail-content">{version()?.content}</pre>
                   <Show when={(version()?.attachments ?? []).length > 0}>
                     <div class="clue-attachments">
@@ -1351,58 +716,101 @@ export function EvidenceChainView() {
 
                   <div class="clue-comments">
                     <div class="clue-comments-head">
-                      <div class="clue-section-title">评论与回复</div>
-                      <span>{comments().length}</span>
+                      <div class="clue-section-title">回帖</div>
+                      <span>{timeline().length}</span>
                     </div>
                     <Show
-                      when={comments().length > 0}
-                      fallback={<div class="clue-comments-empty">还没有评论</div>}
+                      when={timeline().length > 0}
+                      fallback={<div class="clue-comments-empty">还没有回帖，来抢沙发</div>}
                     >
-                      <div class="clue-comment-list">
-                        <For each={comments()}>
-                          {(item) => {
-                            const parent = () => commentById(item.parentCommentId);
-                            return (
-                              <article
-                                class="clue-comment"
-                                classList={{ reply: !!item.parentCommentId }}
-                              >
-                                <div class="clue-comment-head">
-                                  <span
-                                    class="clue-author-avatar"
-                                    title={`作者：${authorName(item.authorName)}`}
+                      <div class="clue-timeline">
+                        <For each={timeline()}>
+                          {(entry) => (
+                            <Show
+                              when={entry.kind === "comment" ? entry : undefined}
+                              fallback={
+                                <Show when={entry.kind === "version" ? entry : undefined}>
+                                  {(item) => {
+                                    const itemVersion = () => card().versions[item().versionIndex];
+                                    const isCurrent = () => itemVersion()?.id === card().currentVersionId;
+                                    return (
+                                      <article class="clue-floor version">
+                                        <span class="clue-floor-no">{item().floor} 楼</span>
+                                        <div class="clue-floor-body">
+                                          <div class="clue-comment-head">
+                                            <span
+                                              class="clue-author-avatar"
+                                              title={`作者：${authorName(itemVersion()?.authorName)}`}
+                                            >
+                                              {authorBadge(itemVersion()?.authorName)}
+                                            </span>
+                                            <strong>{authorName(itemVersion()?.authorName)}</strong>
+                                            <span class="clue-post-tag">更新</span>
+                                            <time>{fmtTime(item().at)}</time>
+                                          </div>
+                                          <div class="clue-floor-version">
+                                            <strong>
+                                              更新到 v{item().versionIndex + 1}
+                                              {isCurrent() ? "（当前）" : ""}：{itemVersion()?.title || "未命名线索"}
+                                            </strong>
+                                            <span>{excerpt(itemVersion()?.content ?? "", 120)}</span>
+                                          </div>
+                                        </div>
+                                      </article>
+                                    );
+                                  }}
+                                </Show>
+                              }
+                            >
+                              {(item) => {
+                                const comment = () => item().comment;
+                                const parent = () => commentById(comment().parentCommentId);
+                                return (
+                                  <article
+                                    class="clue-floor"
+                                    classList={{ reply: !!comment().parentCommentId }}
                                   >
-                                    {authorBadge(item.authorName)}
-                                  </span>
-                                  <strong>{authorName(item.authorName)}</strong>
-                                  <time>{fmtTime(item.createdAt)}</time>
-                                </div>
-                                <Show when={parent()}>
-                                  {(target) => (
-                                    <blockquote class="clue-comment-quote">
-                                      <strong>@{authorName(target().authorName)}</strong>
-                                      <span>{target().content}</span>
-                                    </blockquote>
-                                  )}
-                                </Show>
-                                <Show when={(item.mentions ?? []).length > 0}>
-                                  <div class="clue-comment-mentions">
-                                    <For each={item.mentions ?? []}>
-                                      {(mention) => <span>@{mention.name}</span>}
-                                    </For>
-                                  </div>
-                                </Show>
-                                <p>{item.content}</p>
-                                <button
-                                  type="button"
-                                  class="clue-comment-reply"
-                                  onClick={() => beginReply(item)}
-                                >
-                                  回复
-                                </button>
-                              </article>
-                            );
-                          }}
+                                    <span class="clue-floor-no">{item().floor} 楼</span>
+                                    <div class="clue-floor-body">
+                                      <div class="clue-comment-head">
+                                        <span
+                                          class="clue-author-avatar"
+                                          title={`作者：${authorName(comment().authorName)}`}
+                                        >
+                                          {authorBadge(comment().authorName)}
+                                        </span>
+                                        <strong>{authorName(comment().authorName)}</strong>
+                                        <time>{fmtTime(comment().createdAt)}</time>
+                                      </div>
+                                      <Show when={parent()}>
+                                        {(target) => (
+                                          <blockquote class="clue-comment-quote">
+                                            <strong>@{authorName(target().authorName)}</strong>
+                                            <span>{target().content}</span>
+                                          </blockquote>
+                                        )}
+                                      </Show>
+                                      <Show when={(comment().mentions ?? []).length > 0}>
+                                        <div class="clue-comment-mentions">
+                                          <For each={comment().mentions ?? []}>
+                                            {(mention) => <span>@{mention.name}</span>}
+                                          </For>
+                                        </div>
+                                      </Show>
+                                      <p>{comment().content}</p>
+                                      <button
+                                        type="button"
+                                        class="clue-comment-reply"
+                                        onClick={() => beginReply(comment())}
+                                      >
+                                        回复
+                                      </button>
+                                    </div>
+                                  </article>
+                                );
+                              }}
+                            </Show>
+                          )}
                         </For>
                       </div>
                     </Show>
@@ -1424,7 +832,7 @@ export function EvidenceChainView() {
                         rows={3}
                         value={commentText()}
                         disabled={commentBusy()}
-                        placeholder={replyTarget() ? "写下回复…" : "写下评论…"}
+                        placeholder={replyTarget() ? "写下回复…" : "写下回帖…"}
                         onInput={(event) => setCommentText(event.currentTarget.value)}
                       />
                       <MentionPicker
@@ -1442,7 +850,7 @@ export function EvidenceChainView() {
                           disabled={commentBusy() || !commentText().trim()}
                           onClick={() => void submitComment()}
                         >
-                          {commentBusy() ? "发送中…" : replyTarget() ? "发送回复" : "发表评论"}
+                          {commentBusy() ? "发送中…" : replyTarget() ? "发送回复" : "发表回帖"}
                         </button>
                       </div>
                     </div>
@@ -1473,20 +881,6 @@ export function EvidenceChainView() {
                     </div>
                   </Show>
 
-                  <Show when={card().versions.length > 1}>
-                    <div class="clue-history">
-                      <div class="clue-section-title">版本记录</div>
-                      <For each={[...card().versions].reverse()}>
-                        {(item, index) => (
-                          <div class="clue-history-item">
-                            <span>v{card().versions.length - index()}</span>
-                            <strong>{item.title}</strong>
-                            <time>{fmtTime(item.createdAt)}</time>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
                 </aside>
               );
             }}
