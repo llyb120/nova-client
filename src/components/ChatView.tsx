@@ -955,16 +955,20 @@ export function ChatView() {
       const stop = timeStops()[promptIndex];
       if (stop) travelTo(stop.index);
     };
-    // 已经位于当前时间线时只滚动，不触发会话内容重绘。
+    // 选择当前时间线时必须立即取消尚未完成的旁支预览。此前只有 previewItems 已经
+    // 落地后才清理 target；若用户在 90ms 预览延迟内点回主线，旧请求仍会完成，
+    // 下一次发送便会误从旁支 restore，表现为世界线有时分裂、有时不分裂。
+    previewRequest++;
+    if (previewTimer) clearTimeout(previewTimer);
+    setTimeMachineEditTarget(null);
     if (!previewItems()) {
+      setPreviewCheckpointId(null);
+      setPreviewFading(false);
       scroll();
       return;
     }
 
     // 从旁支预览切回主线时，先恢复当前会话，再在新 DOM 中定位提示词。
-    previewRequest++;
-    if (previewTimer) clearTimeout(previewTimer);
-    setTimeMachineEditTarget(null);
     setPreviewFading(true);
     previewTimer = setTimeout(() => {
       setPreviewItems(null);
@@ -1422,7 +1426,7 @@ export function ChatView() {
                 class="repo-time-now"
                 classList={{ active: stickToBottom() && !previewItems() }}
                 title="回到当前时间线的最新消息"
-                onClick={() => previewItems() ? returnToCurrentTimeline() : returnToNow()}
+                onClick={returnToCurrentTimeline}
               >
                 <span class="repo-time-now-pulse" />
                 现在
