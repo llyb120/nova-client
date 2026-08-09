@@ -151,6 +151,8 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "premature close",
     "other side closed",
     "network connection lost",
+    "upstream stream ended prematurely",
+    "safe to retry",
     "stream ended before a terminal response event",
     "stream ended without finish_reason",
     "idle timeout",
@@ -500,6 +502,9 @@ mod tests {
     fn classifies_retryable() {
         assert!(is_retryable_provider_error("HTTP 429 too many requests"));
         assert!(is_retryable_provider_error("connection error: ECONNRESET"));
+        assert!(is_retryable_provider_error(
+            "provider error: Upstream stream ended prematurely; safe to retry"
+        ));
         assert!(!is_retryable_provider_error("invalid api key"));
     }
 
