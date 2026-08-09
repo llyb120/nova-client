@@ -37,7 +37,6 @@ const {
   formatInterruptedTurn,
   formatSlimMemory,
   ingestCompactHistory,
-  isEditFilesTool,
   isNovaDenyTaskHook,
   isRetryableCursorError,
   shouldSilentRetryCursorTurn,
@@ -71,7 +70,6 @@ for (const name of [
   "cursorModelOptions",
   "cursorShellProgram",
   "cursorTodoPlan",
-  "isEditFilesTool",
   "isRetryableCursorError",
   "mapDelta",
   "mapMessage",
@@ -859,9 +857,6 @@ assert.doesNotMatch(slimWithPolicy, /Do not use read_files even if it appears/);
 assert.doesNotMatch(slimWithPolicy, /smart caveman/);
 assert.match(slimWithPolicy, /Changed the lighting/);
 assert.match(slimWithPolicy, /User:\nContinue$/);
-assert.equal(isEditFilesTool("edit_files"), true);
-assert.equal(isEditFilesTool("mcp__custom-user-tools__edit_files"), true);
-assert.equal(isEditFilesTool("read_files"), false);
 const editFilesState = createMessageState();
 const editFilesItem = mapMessage({
   type: "tool_call",
@@ -870,8 +865,9 @@ const editFilesItem = mapMessage({
   status: "running",
   args: { files: [{ path: "a.ts", edits: [{ oldText: "a", newText: "b" }] }] },
 }, editFilesState)[0];
-assert.equal(editFilesItem.type, "file_change");
-assert.deepEqual(editFilesItem.changes, [{ path: "a.ts", kind: "update" }]);
+assert.equal(editFilesItem.type, "mcp_tool_call");
+assert.equal(editFilesItem.tool, "edit_files");
+assert.deepEqual(editFilesItem.arguments, { files: [{ path: "a.ts", edits: [{ oldText: "a", newText: "b" }] }] });
 
 const batchCwd = await mkdtemp(join(tmpdir(), "nova-cursor-batch-"));
 try {
