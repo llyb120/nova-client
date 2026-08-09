@@ -1,7 +1,7 @@
 //! stdio JSONL 协议（与 alkaid-bridge 兼容）：首行为请求，prompt 期间后续行为
 //! cancel/steer；事件 ready/item/timing/done/{ok:false}。Reasonix 会话生命周期在此串联。
 
-use crate::lyra::agent::{user_message, Agent, AgentEvent};
+use crate::lyra::agent::{estimate_text_tokens, user_message, Agent, AgentEvent};
 use crate::lyra::config::{self, Resolved, Roots};
 use crate::lyra::prompt::{
     self, build_system_prompt, expand_skill_command, format_skills_prompt, image_media_type,
@@ -9,9 +9,7 @@ use crate::lyra::prompt::{
     SystemPromptOptions, PROVIDER_RETRY_DELAYS_MS,
 };
 use crate::lyra::provider::{stream_chat, StreamEvent};
-use crate::lyra::reasonix::{
-    self, context_tokens_from_messages, load_legacy_messages, SlimMemory,
-};
+use crate::lyra::reasonix::{self, context_tokens_from_messages, load_legacy_messages, SlimMemory};
 use crate::lyra::tools::tool_set;
 use serde_json::{json, Value};
 use std::io::Write as _;
@@ -19,6 +17,30 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+const LIVE_USAGE_OUTPUT_STEP: u64 = 8;
+
+fn estimated_live_usage(total: &Value, input: u64, output: u64) -> Value {
+    let mut usage = total.clone();
+    usage["input"] = json!(usage
+        .get("input")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(input));
+    usage["output"] = json!(usage
+        .get("output")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(output));
+    usage["cacheRead"] = json!(usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0));
+    usage["cacheWrite"] = json!(usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0));
+    usage
+}
+
+fn should_emit_live_output(last_emitted: u64, output: u64) -> bool {
+    output > 0
+        && (last_emitted == 0 || output.saturating_sub(last_emitted) >= LIVE_USAGE_OUTPUT_STEP)
+}
 
 fn send(value: &Value) {
     let stdout = std::io::stdout();
@@ -133,10 +155,7 @@ fn started_tool_item(id: &str, name: &str, args: &Value) -> Value {
             "aggregatedOutput": "",
         }),
         "edit" | "write" => {
-            let path = args
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             json!({ "id": id, "type": "file_change", "status": "in_progress", "tool": name, "arguments": args, "changes": [{ "path": path, "kind": "update" }] })
         }
         _ => json!({
@@ -200,7 +219,9 @@ async fn summarize_with_model(
     )
     .await?;
     if result.stop_reason == "error" {
-        return Err(result.error_message.unwrap_or_else(|| "summarize failed".into()));
+        return Err(result
+            .error_message
+            .unwrap_or_else(|| "summarize failed".into()));
     }
     Ok(result_text)
 }
@@ -233,8 +254,7 @@ impl Drop for ContextLearningSettleGuard {
                         let snapshot = snapshot.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             crate::nova_tools_native::context::inject_learning_model_snapshot(
-                                &root_buf,
-                                &snapshot,
+                                &root_buf, &snapshot,
                             )
                         })
                         .await;
@@ -285,15 +305,12 @@ async fn handle_prompt(
         request.get("model").and_then(Value::as_str),
         &env,
     )?;
-    let thinking_level = resolved
-        .thinking_level
-        .clone()
-        .or_else(|| {
-            request
-                .get("reasoningEffort")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
+    let thinking_level = resolved.thinking_level.clone().or_else(|| {
+        request
+            .get("reasoningEffort")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     let resolved = Resolved {
         thinking_level,
         ..resolved
@@ -378,7 +395,11 @@ async fn handle_prompt(
         reasonix::strip_completed_openai_reasoning(&memory.full_messages)
     };
 
-    let active_turn_start = if native_messages.is_empty() { -1 } else { native_messages.len() as i64 };
+    let active_turn_start = if native_messages.is_empty() {
+        -1
+    } else {
+        native_messages.len() as i64
+    };
     memory.pending_messages = native_messages.clone();
 
     // ---- Agent 构建 ----
@@ -435,7 +456,10 @@ async fn handle_prompt(
                                 .unwrap_or_default()
                                 .as_slice(),
                         );
-                        steering.lock().unwrap().push_back(user_message(&text, &images));
+                        steering
+                            .lock()
+                            .unwrap()
+                            .push_back(user_message(&text, &images));
                     }
                     _ => {}
                 }
@@ -484,12 +508,21 @@ async fn handle_prompt(
     let mut current_thinking = String::new();
     let mut started_tools: std::collections::HashMap<String, Value> =
         std::collections::HashMap::new();
+    let mut current_input_estimate = 0_u64;
+    let mut last_live_output = 0_u64;
     let mut on_event = |event: AgentEvent| match event {
-        AgentEvent::MessageStart => {
+        AgentEvent::MessageStart { input_estimate } => {
             agent_message_index += 1;
             emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
             current_text.clear();
             current_thinking.clear();
+            current_input_estimate = input_estimate;
+            last_live_output = 0;
+            emit(&json!({
+                "type": "usage",
+                "usage": estimated_live_usage(&total_usage, current_input_estimate, 0),
+                "estimated": true,
+            }));
         }
         AgentEvent::TextDelta(delta) => {
             current_text.push_str(&delta);
@@ -497,6 +530,16 @@ async fn handle_prompt(
                 "type": "item",
                 "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
             }));
+            let output = estimate_text_tokens(&current_text)
+                .saturating_add(estimate_text_tokens(&current_thinking));
+            if should_emit_live_output(last_live_output, output) {
+                last_live_output = output;
+                emit(&json!({
+                    "type": "usage",
+                    "usage": estimated_live_usage(&total_usage, current_input_estimate, output),
+                    "estimated": true,
+                }));
+            }
         }
         AgentEvent::ThinkingDelta(delta) => {
             current_thinking.push_str(&delta);
@@ -504,6 +547,16 @@ async fn handle_prompt(
                 "type": "item",
                 "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
             }));
+            let output = estimate_text_tokens(&current_text)
+                .saturating_add(estimate_text_tokens(&current_thinking));
+            if should_emit_live_output(last_live_output, output) {
+                last_live_output = output;
+                emit(&json!({
+                    "type": "usage",
+                    "usage": estimated_live_usage(&total_usage, current_input_estimate, output),
+                    "estimated": true,
+                }));
+            }
         }
         AgentEvent::FinalNote(note) => {
             agent_message_index += 1;
@@ -533,8 +586,9 @@ async fn handle_prompt(
         }
         AgentEvent::MessageEnd { usage } => {
             merge_usage(&mut total_usage, &usage);
-            // 流式上报本轮累计用量，让前端实时显示 token（与 Vega bridge 一致）。
-            emit(&json!({ "type": "usage", "usage": total_usage }));
+            current_input_estimate = 0;
+            last_live_output = 0;
+            emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
         }
     };
 
@@ -633,20 +687,16 @@ async fn handle_prompt(
         let prefix_len = active_turn_start.max(0) as usize;
         let mut new_messages = agent.messages[prefix_len.min(agent.messages.len())..].to_vec();
         full.append(&mut new_messages);
-        let (compacted, _) =
-            reasonix::compact_native_tool_results(&full, &memory.context_tier);
+        let (compacted, _) = reasonix::compact_native_tool_results(&full, &memory.context_tier);
         memory.full_messages = compacted;
         memory.context_tokens = context_tokens_from_messages(&memory.full_messages);
-        memory.context_stage = if reasonix::should_use_full_context(
-            &memory,
-            max_context_tokens,
-            max_context_chars,
-        ) {
-            "full"
-        } else {
-            "slim"
-        }
-        .into();
+        memory.context_stage =
+            if reasonix::should_use_full_context(&memory, max_context_tokens, max_context_chars) {
+                "full"
+            } else {
+                "slim"
+            }
+            .into();
     } else {
         // 取消或失败：中断轨迹作为 pendingMessages 保留，等待下一条提示恢复。
         memory.pending_messages = agent.messages.clone();
@@ -689,7 +739,11 @@ fn models_data(request: &Value, roots: &Roots) -> Result<Value, String> {
     }))
 }
 
-async fn title_data(http: &reqwest::Client, request: &Value, roots: &Roots) -> Result<Value, String> {
+async fn title_data(
+    http: &reqwest::Client,
+    request: &Value,
+    roots: &Roots,
+) -> Result<Value, String> {
     let env = config::process_env();
     let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
     let resolved = config::resolve_model(
@@ -728,7 +782,11 @@ async fn title_data(http: &reqwest::Client, request: &Value, roots: &Roots) -> R
     Ok(Value::String(text.trim().to_string()))
 }
 
-async fn complete_data(http: &reqwest::Client, request: &Value, roots: &Roots) -> Result<Value, String> {
+async fn complete_data(
+    http: &reqwest::Client,
+    request: &Value,
+    roots: &Roots,
+) -> Result<Value, String> {
     let prompt = request
         .get("prompt")
         .and_then(Value::as_str)
@@ -812,7 +870,9 @@ pub fn spawn_prompt(
                 }
             }
         });
-        if let Err(error) = handle_prompt(&http, &request, &emit, fast_context, &roots, line_rx).await {
+        if let Err(error) =
+            handle_prompt(&http, &request, &emit, fast_context, &roots, line_rx).await
+        {
             emit(&json!({ "ok": false, "error": error }));
         }
         pump.abort();
@@ -902,13 +962,30 @@ pub async fn run() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use super::{estimated_live_usage, should_emit_live_output};
+    use serde_json::json;
+
+    #[test]
+    fn live_usage_estimate_is_throttled_and_preserves_completed_usage() {
+        assert!(!should_emit_live_output(0, 0));
+        assert!(should_emit_live_output(0, 1));
+        assert!(!should_emit_live_output(1, 8));
+        assert!(should_emit_live_output(1, 9));
+
+        let usage = estimated_live_usage(
+            &json!({ "input": 100, "output": 20, "cacheRead": 80, "cacheWrite": 0 }),
+            40,
+            7,
+        );
+        assert_eq!(usage["input"], 140);
+        assert_eq!(usage["output"], 27);
+        assert_eq!(usage["cacheRead"], 80);
+    }
     /// 借用额度运行时：进程内按隔离数据根加载凭证配置（不起子进程、不读全局配置）。
     #[tokio::test]
     async fn borrowed_root_loads_isolated_config() {
-        let root = std::env::temp_dir().join(format!(
-            "nova-lyra-borrowed-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("nova-lyra-borrowed-test-{}", uuid::Uuid::new_v4()));
         let config_dir = root.join("alkaid");
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
@@ -978,6 +1055,9 @@ mod tests {
         assert!(joined.contains("\"ready\""), "缺少 ready：{joined}");
         assert!(joined.contains("\"done\""), "缺少 done：{joined}");
         assert!(!joined.contains("\"ok\":false"), "出现错误事件：{joined}");
-        assert!(joined.contains("lyra-inprocess"), "未执行 bash 工具：{joined}");
+        assert!(
+            joined.contains("lyra-inprocess"),
+            "未执行 bash 工具：{joined}"
+        );
     }
 }

@@ -12,16 +12,55 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// provider 尚未返回 usage 时的保守估算：ASCII 约 4 字符/token，非 ASCII 约 1 字符/token。
+pub(crate) fn estimate_text_tokens(text: &str) -> u64 {
+    let (ascii, non_ascii) = text.chars().fold((0_u64, 0_u64), |(ascii, non_ascii), ch| {
+        if ch.is_ascii() {
+            (ascii + 1, non_ascii)
+        } else {
+            (ascii, non_ascii + 1)
+        }
+    });
+    ascii.div_ceil(4).saturating_add(non_ascii)
+}
+
+fn estimate_request_tokens(system_prompt: &str, messages: &[Value], tools: &[Tool]) -> u64 {
+    let mut tokens = estimate_text_tokens(system_prompt);
+    tokens = tokens.saturating_add(estimate_text_tokens(
+        &serde_json::to_string(messages).unwrap_or_default(),
+    ));
+    for tool in tools {
+        tokens = tokens
+            .saturating_add(estimate_text_tokens(tool.name))
+            .saturating_add(estimate_text_tokens(&tool.description))
+            .saturating_add(estimate_text_tokens(
+                &serde_json::to_string(&tool.parameters).unwrap_or_default(),
+            ));
+    }
+    tokens
+}
+
 #[derive(Debug)]
 pub enum AgentEvent {
-    MessageStart,
+    MessageStart {
+        input_estimate: u64,
+    },
     TextDelta(String),
     ThinkingDelta(String),
     /// final_note 寄生的最终回复（不参与流式拼接，独立成一条消息项）。
     FinalNote(String),
-    ToolStart { id: String, name: String, args: Value },
-    ToolEnd { id: String, outcome: Value },
-    MessageEnd { usage: Value },
+    ToolStart {
+        id: String,
+        name: String,
+        args: Value,
+    },
+    ToolEnd {
+        id: String,
+        outcome: Value,
+    },
+    MessageEnd {
+        usage: Value,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -230,7 +269,9 @@ impl Agent {
                 outcome.stop_reason = "aborted".into();
                 return Ok(outcome);
             }
-            on_event(AgentEvent::MessageStart);
+            let input_estimate =
+                estimate_request_tokens(&self.system_prompt, &self.messages, &self.tools);
+            on_event(AgentEvent::MessageStart { input_estimate });
             // 投机缓存按消息重置：序号是消息内的，上一轮未命中的句柄中止。
             {
                 let mut cache = self.spec_cache.lock().unwrap();
@@ -349,7 +390,11 @@ impl Agent {
             // steeringMode=all：工具结果后、最终回复后都把排队提示注入下一轮。
             self.drain_steering();
             let has_more_work = !self.messages.is_empty()
-                && self.messages.last().and_then(|m| m.get("role")).and_then(Value::as_str)
+                && self
+                    .messages
+                    .last()
+                    .and_then(|m| m.get("role"))
+                    .and_then(Value::as_str)
                     != Some("assistant");
             if !has_more_work {
                 return Ok(outcome);
@@ -506,5 +551,4 @@ mod tests {
         let array = salvage_json(r#"{"names":["Agent""#).unwrap();
         assert_eq!(array["names"][0], "Agent");
     }
-
 }
