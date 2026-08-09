@@ -256,7 +256,7 @@ assert.deepEqual(cursorModelOptions([
     { displayName: "Cursor Grok 4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }] },
   ] },
 ]), [
-  { value: "", name: "Auto（Cursor 默认）" },
+  { value: "__cursor_auto__", name: "Auto（自动选具体模型）" },
   { value: "grok-4.5::effort=high&fast=false", name: "Cursor Grok 4.5 High", description: undefined },
   { value: "grok-4.5::effort=high&fast=true", name: "Cursor Grok 4.5 High Fast", description: undefined },
 ]);

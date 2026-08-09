@@ -80,7 +80,7 @@ impl SdkAdapter for CursorAdapter {
                 "id": "model",
                 "name": "Model",
                 "currentValue": "",
-                "options": [{ "value": "", "name": "Auto（Cursor 默认）" }],
+                "options": [{ "value": "__cursor_auto__", "name": "Auto（Cursor 默认）" }],
             }],
             "modes": null,
         })

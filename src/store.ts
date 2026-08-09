@@ -375,7 +375,13 @@ export function resolveAvailableModel(
   if (preferred) return preferred;
   const previous = lastUsed.model(agentKind);
   if (previous && choices.some((c) => c.value === previous)) return previous;
-  return choices.find((c) => c.value)?.value ?? choices[0]?.value ?? "";
+  // 跳过 Cursor「Auto」哨兵入口（非空但不选具体模型），保持默认落到第一个具体模型；
+  // 显式选中过 Auto 的走上面 previous 分支保留。
+  return (
+    choices.find((c) => c.value && c.value !== "__cursor_auto__")?.value ??
+    choices[0]?.value ??
+    ""
+  );
 }
 
 /** 界面可选会话模式：仅 Build。Plan 不进选择器，只由 /plan 隐式启动；

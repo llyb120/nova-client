@@ -318,7 +318,7 @@ export function cursorTodoPlan(toolCall) {
 }
 
 export function modelSelection(selected) {
-  if (!selected) return undefined;
+  if (!selected || selected === "__cursor_auto__") return undefined;
   const separator = selected.indexOf("::");
   if (separator >= 0) {
     const id = selected.slice(0, separator);
@@ -360,7 +360,9 @@ export function encodeModelVariant(model, variant) {
 }
 
 export function cursorModelOptions(models) {
-  const options = [{ value: "", name: "Auto（自动选具体模型）" }];
+  // 非空哨兵值：与「未选择」区分开，前端显式选中后不会被 resolveAvailableModel 弹回；
+  // 发送时由 modelSelection 翻译回 undefined，即 Cursor 官方默认模型。
+  const options = [{ value: "__cursor_auto__", name: "Auto（自动选具体模型）" }];
   for (const model of models) {
     if (!model.id || ["auto", "default"].includes(model.id.toLowerCase())) continue;
     if (model.variants?.length) {
