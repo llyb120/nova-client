@@ -360,18 +360,19 @@ export function EvidenceChainView() {
                           <For each={preds()}>
                             {(pred) => (
                               <span class="clue-reply-line">
-                                回帖给
+                                回复
                                 <button
                                   type="button"
                                   class="clue-reply-link"
+                                  title={clueCurrentVersion(pred)?.title || "未命名线索"}
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     selectOnly(pred.id);
                                   }}
                                 >
                                   @{authorName(clueCurrentVersion(pred)?.authorName)}
-                                  《{clueCurrentVersion(pred)?.title || "未命名线索"}》
                                 </button>
+                                ：{clueCurrentVersion(pred)?.title || "未命名线索"}
                                 <button
                                   type="button"
                                   class="clue-reply-unlink"
@@ -454,33 +455,39 @@ export function EvidenceChainView() {
                       </div>
                     </Show>
 
-                    <div class="clue-feed-stats">
+                    {/* 微博式操作行：转发(接力) | 回帖 | 更多操作，灰字横排 */}
+                    <div class="clue-feed-bar">
                       <button
                         type="button"
-                        class="clue-stat"
+                        class="clue-bar-item"
                         classList={{ active: expanded() }}
+                        title="回帖"
                         onClick={(event) => {
                           event.stopPropagation();
                           if (!connectFromId()) selectOnly(expanded() ? null : card.id);
                         }}
                       >
-                        {commentCount() + timeline().filter((entry) => entry.kind === "version").length} 回帖
+                        {commentCount() + timeline().filter((entry) => entry.kind === "version").length || "回帖"}
                       </button>
-                      <span class="clue-stat">{attachmentCount()} 附件</span>
-                      <span class="clue-stat">{successors().length} 条接力</span>
+                      <Show when={successors().length > 0}>
+                        <span class="clue-bar-item static" title="接力这条线索的回帖">
+                          {successors().length} 接力
+                        </span>
+                      </Show>
+                      <Show when={attachmentCount() > 0}>
+                        <span class="clue-bar-item static">{attachmentCount()} 附件</span>
+                      </Show>
                       <Show when={mentionCount() > 0}>
-                        <span class="clue-stat">{mentionCount()} 提醒</span>
+                        <span class="clue-bar-item static">{mentionCount()} 提醒</span>
                       </Show>
                       <Show when={state.unreadClueMentions.includes(card.id)}>
-                        <span class="clue-stat mention">新提醒</span>
+                        <span class="clue-bar-item mention">新提醒</span>
                       </Show>
-                    </div>
-
-                    <div class="clue-feed-actions">
+                      <span class="clue-bar-spacer" />
                       <Show when={!connectFromId()}>
                         <button
                           type="button"
-                          class="btn secondary small"
+                          class="clue-bar-item"
                           disabled={connectionBusy()}
                           onClick={(event) => {
                             event.stopPropagation();
@@ -492,27 +499,7 @@ export function EvidenceChainView() {
                       </Show>
                       <button
                         type="button"
-                        class="btn secondary small"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          startSessionFromClue(card);
-                        }}
-                      >
-                        沿此线索发起会话
-                      </button>
-                      <button
-                        type="button"
-                        class="btn secondary small"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setCapture({ placement: "update", targetCardId: card.id });
-                        }}
-                      >
-                        更新
-                      </button>
-                      <button
-                        type="button"
-                        class="btn secondary small"
+                        class="clue-bar-item"
                         onClick={(event) => {
                           event.stopPropagation();
                           setCapture({ placement: "new", targetCardId: card.id });
@@ -522,7 +509,27 @@ export function EvidenceChainView() {
                       </button>
                       <button
                         type="button"
-                        class="btn danger small"
+                        class="clue-bar-item"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          startSessionFromClue(card);
+                        }}
+                      >
+                        发起会话
+                      </button>
+                      <button
+                        type="button"
+                        class="clue-bar-item"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setCapture({ placement: "update", targetCardId: card.id });
+                        }}
+                      >
+                        更新
+                      </button>
+                      <button
+                        type="button"
+                        class="clue-bar-item danger"
                         disabled={deletingCardId() === card.id}
                         onClick={(event) => {
                           event.stopPropagation();
