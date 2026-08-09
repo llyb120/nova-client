@@ -24,18 +24,6 @@ import { IconClue, IconDownload, IconFile, IconPlus } from "./icons";
 import { MentionPicker } from "./MentionPicker";
 
 type Placement = "update" | "parallel" | "new";
-type GroupRole = "start" | "middle" | "end" | "isolated";
-
-type StageEntry = {
-  group: ClueNodeGroup;
-  cards: ClueCard[];
-  role: GroupRole;
-};
-
-type StageColumn = {
-  depth: number;
-  entries: StageEntry[];
-};
 
 function fmtTime(ts: number) {
   return new Date(ts).toLocaleString("zh-CN", {
@@ -62,33 +50,6 @@ function authorBadge(name?: string) {
   const words = value.split(/\s+/).filter(Boolean);
   if (words.length > 1) return words.slice(0, 2).map((word) => word[0]).join("").toUpperCase();
   return characters.slice(0, 2).join("");
-}
-
-function roleLabel(role: GroupRole) {
-  switch (role) {
-    case "start":
-      return "起始";
-    case "end":
-      return "末端";
-    case "isolated":
-      return "孤立";
-    default:
-      return "衔接";
-  }
-}
-
-function groupRole(group: ClueNodeGroup, parentCardIds: Set<string>): GroupRole {
-  const hasIncoming = group.parentCardIds.length > 0;
-  const hasOutgoing = group.cards.some((card) => parentCardIds.has(card.id));
-  if (!hasIncoming) return hasOutgoing ? "start" : "isolated";
-  return hasOutgoing ? "middle" : "end";
-}
-
-function stackCards(group: ClueNodeGroup, selectedCardId: string | null) {
-  const selected = group.cards.find((card) => card.id === selectedCardId);
-  return selected
-    ? [...group.cards.filter((card) => card.id !== selected.id), selected]
-    : [...group.cards];
 }
 
 export function EvidenceChainView() {
@@ -120,52 +81,11 @@ export function EvidenceChainView() {
     return map;
   });
 
-  const cards = createMemo(() => state.clueGroups.flatMap((group) => group.cards));
-
-  // 只保留拓扑分层：同一深度的组排成一列，列内按创建时间排序。
-  const stageColumns = createMemo<StageColumn[]>(() => {
-    const byCard = cardToGroup();
-    const depthMemo = new Map<string, number>();
-    const depthOf = (group: ClueNodeGroup, visiting = new Set<string>()): number => {
-      const cached = depthMemo.get(group.id);
-      if (cached !== undefined) return cached;
-      if (visiting.has(group.id)) return 0;
-      const nextVisiting = new Set(visiting);
-      nextVisiting.add(group.id);
-      const depth = group.parentCardIds.length
-        ? Math.max(
-            0,
-            ...group.parentCardIds.map((parentId) => {
-              const parentGroup = byCard.get(parentId);
-              return parentGroup ? depthOf(parentGroup, nextVisiting) + 1 : 0;
-            }),
-          )
-        : 0;
-      depthMemo.set(group.id, depth);
-      return depth;
-    };
-
-    const parentCardIds = new Set(state.clueGroups.flatMap((group) => group.parentCardIds));
-    const stageGroups = new Map<number, ClueNodeGroup[]>();
-    for (const group of state.clueGroups) {
-      const depth = depthOf(group);
-      stageGroups.set(depth, [...(stageGroups.get(depth) ?? []), group]);
-    }
-
-    const selected = selectedCardId();
-    return [...stageGroups.entries()]
-      .sort(([left], [right]) => left - right)
-      .map(([depth, groups]) => ({
-        depth,
-        entries: groups
-          .sort((left, right) => left.createdAt - right.createdAt)
-          .map((group) => ({
-            group,
-            cards: stackCards(group, selected),
-            role: groupRole(group, parentCardIds),
-          })),
-      }));
-  });
+  const cards = createMemo(() =>
+    state.clueGroups
+      .flatMap((group) => group.cards)
+      .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt),
+  );
 
   const selectedCard = createMemo(() => clueCardById(selectedCardId()));
   const selectedGroup = createMemo(() => {
@@ -389,7 +309,7 @@ export function EvidenceChainView() {
         <div>
           <h1 class="clue-title">证据链</h1>
           <p class="clue-sub">
-            点击卡片查看详情；点「连接」再点目标卡即可建立前置关系；Ctrl + 点击可多选堆叠。
+            像刷微博一样浏览线索：新线索在最上面，点卡片查看回帖、版本更新和上下文。
           </p>
         </div>
         <div class="clue-head-actions">
@@ -415,157 +335,124 @@ export function EvidenceChainView() {
           </div>
         }
       >
-        <div class="clue-layout">
-          <div class="clue-board" classList={{ connecting: !!connectFromId() }}>
-            <div class="clue-board-columns">
-              <For each={stageColumns()}>
-                {(stage) => (
-                  <div class="clue-stage">
-                    <div class="clue-stage-head">
-                      {stage.depth === 0 ? "起点" : `第 ${stage.depth + 1} 步`}
-                      <span>{stage.entries.reduce((count, entry) => count + entry.cards.length, 0)} 条</span>
+        <div class="clue-feed-layout">
+          <section class="clue-feed" classList={{ connecting: !!connectFromId() }}>
+            <For each={cards()}>
+              {(card) => {
+                const version = () => clueCurrentVersion(card);
+                const group = () => cardToGroup().get(card.id);
+                const groupPreds = () =>
+                  (group()?.parentCardIds ?? [])
+                    .map((id) => clueCardById(id))
+                    .filter((item): item is ClueCard => !!item);
+                const commentCount = () => (card.comments ?? []).length;
+                const attachmentCount = () => (version()?.attachments ?? []).length;
+                const mentionCount = () => (version()?.mentions ?? []).length;
+                const isActive = () => selectedCardId() === card.id;
+                return (
+                  <article
+                    class="clue-feed-card"
+                    classList={{
+                      active: isActive(),
+                      selected: selectedCardIds().has(card.id),
+                      "connect-source": connectFromId() === card.id,
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    onClick={(event) => onCardClick(card.id, event)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        if (!connectFromId()) selectOnly(card.id);
+                      }
+                    }}
+                  >
+                    <div class="clue-feed-side">
+                      <span
+                        class="clue-author-avatar"
+                        title={`作者：${authorName(version()?.authorName)}`}
+                        aria-label={`作者：${authorName(version()?.authorName)}`}
+                      >
+                        {authorBadge(version()?.authorName)}
+                      </span>
                     </div>
-                    <div class="clue-stage-cards">
-                      <For each={stage.entries}>
-                        {(entry) => (
-                          <div class="clue-group-block" classList={{ stacked: entry.cards.length > 1 }}>
-                            <Show when={entry.cards.length > 1}>
-                              <div class="clue-group-stack-label">{entry.cards.length} 张平行线索</div>
-                            </Show>
-                            <For each={entry.cards}>
-                              {(card, index) => {
-                                const version = () => clueCurrentVersion(card);
-                                const groupPreds = () =>
-                                  entry.group.parentCardIds
-                                    .map((id) => clueCardById(id))
-                                    .filter((item): item is ClueCard => !!item);
-                                const commentCount = () => (card.comments ?? []).length;
-                                const attachmentCount = () => (version()?.attachments ?? []).length;
-                                const mentionCount = () => (version()?.mentions ?? []).length;
-                                const front = () => index() === entry.cards.length - 1;
-                                return (
-                                  <article
-                                    class={`clue-card-item role-${entry.role}`}
-                                    classList={{
-                                      active: selectedCardId() === card.id,
-                                      selected: selectedCardIds().has(card.id),
-                                      "connect-source": connectFromId() === card.id,
-                                    }}
-                                    role="button"
-                                    tabIndex={0}
-                                    onClick={(event) => onCardClick(card.id, event)}
-                                    onKeyDown={(event) => {
-                                      if (event.key === "Enter" || event.key === " ") {
-                                        event.preventDefault();
-                                        if (!connectFromId()) selectOnly(card.id);
-                                      }
-                                    }}
-                                  >
-                                    <div class="clue-card-top">
-                                      <span
-                                        class="clue-author-avatar"
-                                        title={`作者：${authorName(version()?.authorName)}`}
-                                        aria-label={`作者：${authorName(version()?.authorName)}`}
-                                      >
-                                        {authorBadge(version()?.authorName)}
-                                      </span>
-                                      <strong>{version()?.title || "未命名线索"}</strong>
-                                      <span class="clue-version-tag">v{card.versions.length}</span>
-                                    </div>
-                                    <p class="clue-card-excerpt">{excerpt(version()?.content ?? "", 140)}</p>
-                                    <div class="clue-card-meta">
-                                      <span>{authorName(version()?.authorName)}</span>
-                                      <time>{fmtTime(card.updatedAt)}</time>
-                                    </div>
-                                    <div class="clue-card-stats">
-                                      <span class="role">{roleLabel(entry.role)}</span>
-                                      <Show when={commentCount() > 0}>
-                                        <span>评论 {commentCount()}</span>
-                                      </Show>
-                                      <Show when={attachmentCount() > 0}>
-                                        <span>附件 {attachmentCount()}</span>
-                                      </Show>
-                                      <Show when={mentionCount() > 0}>
-                                        <span>提醒 {mentionCount()}</span>
-                                      </Show>
-                                      <Show when={state.unreadClueMentions.includes(card.id)}>
-                                        <span class="mention">新提醒</span>
-                                      </Show>
-                                    </div>
-                                    <Show when={previewCardId() === card.id}>
-                                      <div class="clue-card-preview">{version()?.content}</div>
-                                    </Show>
-                                    <Show when={front() && groupPreds().length > 0}>
-                                      <div class="clue-card-preds">
-                                        <span class="clue-card-preds-label">前置线索</span>
-                                        <div class="clue-card-preds-list">
-                                          <For each={groupPreds()}>
-                                            {(pred) => (
-                                              <span class="clue-pred-chip">
-                                                <button
-                                                  type="button"
-                                                  class="clue-pred-jump"
-                                                  title="查看前置线索"
-                                                  onClick={(event) => {
-                                                    event.stopPropagation();
-                                                    selectOnly(pred.id);
-                                                  }}
-                                                >
-                                                  {clueCurrentVersion(pred)?.title || "未命名线索"}
-                                                </button>
-                                                <button
-                                                  type="button"
-                                                  class="clue-pred-remove"
-                                                  title="删除此前置连接"
-                                                  disabled={removingEdgeKey() === `${pred.id}->${card.id}`}
-                                                  onClick={(event) => void removeConnection(pred.id, card.id, event)}
-                                                >
-                                                  ×
-                                                </button>
-                                              </span>
-                                            )}
-                                          </For>
-                                        </div>
-                                      </div>
-                                    </Show>
-                                    <div class="clue-card-actions-row">
-                                      <button
-                                        type="button"
-                                        class="btn secondary small"
-                                        onClick={(event) => {
-                                          event.stopPropagation();
-                                          setPreviewCardId(previewCardId() === card.id ? null : card.id);
-                                        }}
-                                      >
-                                        {previewCardId() === card.id ? "收起" : "预览"}
-                                      </button>
-                                      <Show when={!connectFromId()}>
-                                        <button
-                                          type="button"
-                                          class="btn secondary small"
-                                          disabled={connectionBusy()}
-                                          onClick={(event) => {
-                                            event.stopPropagation();
-                                            setConnectFromId(card.id);
-                                          }}
-                                        >
-                                          连接
-                                        </button>
-                                      </Show>
-                                    </div>
-                                  </article>
-                                );
-                              }}
-                            </For>
-                          </div>
-                        )}
-                      </For>
+                    <div class="clue-feed-main">
+                      <div class="clue-feed-head">
+                        <div class="clue-feed-author">
+                          <strong>{authorName(version()?.authorName)}</strong>
+                          <span class="clue-feed-time">{fmtTime(card.updatedAt)}</span>
+                        </div>
+                        <span class="clue-version-tag">v{card.versions.length}</span>
+                      </div>
+
+                      <h2 class="clue-feed-title">{version()?.title || "未命名线索"}</h2>
+                      <p class="clue-feed-content">{excerpt(version()?.content ?? "", 220)}</p>
+
+                      <Show when={groupPreds().length > 0}>
+                        <div class="clue-quote">
+                          <div class="clue-quote-title">前置线索</div>
+                          <For each={groupPreds()}>
+                            {(pred) => (
+                              <button
+                                type="button"
+                                class="clue-quote-item"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  selectOnly(pred.id);
+                                }}
+                              >
+                                <span>{clueCurrentVersion(pred)?.title || "未命名线索"}</span>
+                                <small>{authorName(clueCurrentVersion(pred)?.authorName)}</small>
+                              </button>
+                            )}
+                          </For>
+                        </div>
+                      </Show>
+
+                      <Show when={previewCardId() === card.id}>
+                        <div class="clue-feed-preview">{version()?.content}</div>
+                      </Show>
+
+                      <div class="clue-feed-stats">
+                        <span>{commentCount()} 评论</span>
+                        <span>{attachmentCount()} 附件</span>
+                        <span>{mentionCount()} 提醒</span>
+                        <Show when={state.unreadClueMentions.includes(card.id)}>
+                          <span class="mention">新提醒</span>
+                        </Show>
+                      </div>
+
+                      <div class="clue-feed-actions">
+                        <button
+                          type="button"
+                          class="btn secondary small"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setPreviewCardId(previewCardId() === card.id ? null : card.id);
+                          }}
+                        >
+                          {previewCardId() === card.id ? "收起" : "预览"}
+                        </button>
+                        <Show when={!connectFromId()}>
+                          <button
+                            type="button"
+                            class="btn secondary small"
+                            disabled={connectionBusy()}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setConnectFromId(card.id);
+                            }}
+                          >
+                            连接
+                          </button>
+                        </Show>
+                      </div>
                     </div>
-                  </div>
-                )}
-              </For>
-            </div>
-          </div>
+                  </article>
+                );
+              }}
+            </For>
+          </section>
 
           <Show when={selectedCard()}>
             {(card) => {
@@ -576,7 +463,6 @@ export function EvidenceChainView() {
               type TimelineEntry =
                 | { kind: "comment"; at: number; floor: number; comment: ClueComment }
                 | { kind: "version"; at: number; floor: number; versionIndex: number };
-              // 论坛式时间线：评论与历史版本更新按时间混排成楼层。
               const timeline = createMemo<TimelineEntry[]>(() => {
                 const entries: TimelineEntry[] = comments().map((comment) => ({
                   kind: "comment",
@@ -716,12 +602,12 @@ export function EvidenceChainView() {
 
                   <div class="clue-comments">
                     <div class="clue-comments-head">
-                      <div class="clue-section-title">回帖</div>
+                      <div class="clue-section-title">评论</div>
                       <span>{timeline().length}</span>
                     </div>
                     <Show
                       when={timeline().length > 0}
-                      fallback={<div class="clue-comments-empty">还没有回帖，来抢沙发</div>}
+                      fallback={<div class="clue-comments-empty">还没有评论，来抢沙发</div>}
                     >
                       <div class="clue-timeline">
                         <For each={timeline()}>
@@ -832,7 +718,7 @@ export function EvidenceChainView() {
                         rows={3}
                         value={commentText()}
                         disabled={commentBusy()}
-                        placeholder={replyTarget() ? "写下回复…" : "写下回帖…"}
+                        placeholder={replyTarget() ? "写下回复…" : "写下评论…"}
                         onInput={(event) => setCommentText(event.currentTarget.value)}
                       />
                       <MentionPicker
@@ -850,7 +736,7 @@ export function EvidenceChainView() {
                           disabled={commentBusy() || !commentText().trim()}
                           onClick={() => void submitComment()}
                         >
-                          {commentBusy() ? "发送中…" : replyTarget() ? "发送回复" : "发表回帖"}
+                          {commentBusy() ? "发送中…" : replyTarget() ? "发送��复" : "发表评论"}
                         </button>
                       </div>
                     </div>
@@ -880,7 +766,6 @@ export function EvidenceChainView() {
                       </For>
                     </div>
                   </Show>
-
                 </aside>
               );
             }}
