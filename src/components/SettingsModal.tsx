@@ -1383,7 +1383,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <div class="share-list">
                   <Index each={stageModels()}>
                     {(target, index) => (
-                      <div class="share-row" title={`/stage${index + 1}`}>
+                      <div class="share-row stage-model-row" title={`/stage${index + 1}`}>
                         <span style={{ width: "64px", "flex-shrink": 0 }}>
                           {index === 0 ? "/stage" : `/stage${index + 1}`}
                         </span>
@@ -1413,7 +1413,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                     <div class="share-empty">尚未配置 Stage 模型，/stage 将提示先完成配置。</div>
                   </Show>
                   <Show when={enabledAgentKinds().length > 0}>
-                    <div class="share-row share-row-add">
+                    <div class="share-row share-row-add stage-model-row">
                       <span style={{ width: "64px", "flex-shrink": 0 }}>
                         /stage{stageModels().length + 1}
                       </span>

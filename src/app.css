@@ -4718,6 +4718,9 @@ button {
   align-items: center;
   gap: 6px;
 }
+.stage-model-row {
+  grid-template-columns: 64px minmax(0, 1fr) 28px;
+}
 .share-row .proj-picker,
 .share-row .search-select,
 .share-row .pill {
