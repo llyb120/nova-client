@@ -584,6 +584,28 @@ struct Source {
 }
 
 #[derive(Clone)]
+struct CachedSource {
+    source: Source,
+    len: u64,
+    modified_nanos: u128,
+    touched: u64,
+}
+
+#[derive(Default)]
+struct SourceCache {
+    entries: HashMap<String, CachedSource>,
+    clock: u64,
+}
+
+const SOURCE_CACHE_MAX_ENTRIES: usize = 96;
+static SOURCE_CACHE: OnceLock<Mutex<SourceCache>> = OnceLock::new();
+
+static SOURCE_DISK_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SOURCE_CACHE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PREFETCH_DISK_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PREFETCH_CACHE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Clone)]
 struct Block {
     start: usize,
     end: usize,
@@ -2009,7 +2031,35 @@ fn build_index(
 }
 
 fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> {
-    let text = fs::read_to_string(root.join(file)).ok()?;
+    let path = root.join(file);
+    let metadata = fs::metadata(&path).ok()?;
+    let len = metadata.len();
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let key = format!("{}\0{file}", learning_root_key(root));
+    let cache = SOURCE_CACHE.get_or_init(|| Mutex::new(SourceCache::default()));
+    {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.clock = cache.clock.wrapping_add(1);
+        let touched = cache.clock;
+        if let Some(cached) = cache.entries.get_mut(&key) {
+            if cached.len == len && cached.modified_nanos == modified_nanos {
+                cached.touched = touched;
+                SOURCE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(cached.source.clone());
+            }
+            cache.entries.remove(&key);
+        }
+    }
+
+    SOURCE_DISK_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let text = fs::read_to_string(&path).ok()?;
     let mut lines: Vec<_> = text.split('\n').map(str::to_string).collect();
     if lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
         lines.pop();
@@ -2019,7 +2069,33 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
     } else {
         scan_source(&text, file).syms
     };
-    Some(Source { lines, syms })
+    let source = Source { lines, syms };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.clock = cache.clock.wrapping_add(1);
+    let touched = cache.clock;
+    cache.entries.insert(
+        key,
+        CachedSource {
+            source: source.clone(),
+            len,
+            modified_nanos,
+            touched,
+        },
+    );
+    while cache.entries.len() > SOURCE_CACHE_MAX_ENTRIES {
+        let Some(oldest) = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, cached)| cached.touched)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.entries.remove(&oldest);
+    }
+    Some(source)
 }
 
 fn js_utf16_len(value: &str) -> usize {
@@ -5898,54 +5974,85 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     trace("fast_context.render", render_start);
     // 方案4（重设计）预测性读取——CPU 分支预测的类比：
     //   分支预测器 = OnlineEditModel（RankNet 9 特征成对逻辑回归，随 edit feedback 在线更新）
-    //   预测目标   = ranked 中未进入 final_candidates 的文件里 P(edit) 最高的前 N 个
-    //   预取动作   = 预读这些文件的 source 进内存缓存，不改变本次输出
-    //   预测正确   = 下次 fast_context 若命中同文件，source() 直接复用，省磁盘 IO
-    //   预测错误   = 一次无害的 fs::read_to_string，无副作用
-    // 与自动学习完全兼容：用的就是同一个模型的预测分数；被预取的文件若后续被编辑，
-    // 在下次 settle 时作为正样本进一步强化模型（正反馈回路）。
+    //   预测目标   = ranked 中未进入 final_candidates 的文件里 P(edit) 最高的前 3 个
+    //   预取条件   = P(edit) > 0.5；模型不足 5 个 observation 时冷启动休眠
+    //   预取动作   = 预读 source 进入有界进程内 LRU；不改变本次输出
+    //   预测正确   = 下次 fast_context 若命中同文件，经 mtime+len 校验后直接复用
+    //   预测错误   = 一次无害的 fs::read_to_string；LRU 会自然淘汰
     // NOVA_CTX_PREFETCH=0 关闭（A/B 对照）。
     let prefetch_enabled = std::env::var_os("NOVA_CTX_PREFETCH")
         .map(|value| value != "0")
         .unwrap_or(true);
     if prefetch_enabled {
         if let Some(model) = &learning_snapshot {
-            let prefetch_start = Instant::now();
-            let packed_files = sources.keys().cloned().collect::<HashSet<_>>();
-            // 对 ranked 中未打包的文件按模型 P(edit) 打分，取 top-3。
-            let mut prefetch_candidates = ranked
-                .iter()
-                .filter(|(file, _)| !packed_files.contains(file))
-                .filter(|(file, _)| is_code_file(file))
-                .filter(|(file, _)| !noise_path(file))
-                .map(|(file, heuristic)| {
-                    let probability = learning_predict(model, &learning_features(file, *heuristic));
-                    (file.clone(), probability)
-                })
-                .collect::<Vec<_>>();
-            prefetch_candidates
-                .sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-            prefetch_candidates.truncate(3);
-            let mut prefetched = 0usize;
-            for (file, probability) in &prefetch_candidates {
-                // 只预取模型有正向信心的文件（P > 0.5），避免冷启动时乱读。
-                if *probability < 0.5 {
-                    continue;
-                }
-                if let Some(src) = source(root, file, index.files.get(file)) {
-                    sources.insert(file.clone(), src);
-                    prefetched += 1;
-                    if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
-                        eprintln!("[ctx] prefetch {file} P(edit)={probability:.3}");
+            // 与排序 blend 同一冷启动门槛；默认权重不应在零反馈时触发预取。
+            if learning_blend(model.observations) > 0.0 {
+                let prefetch_start = Instant::now();
+                let packed_files = final_candidates
+                    .iter()
+                    .map(|(file, _)| file)
+                    .collect::<HashSet<_>>();
+                let mut prefetch_candidates = ranked
+                    .iter()
+                    .filter(|(file, _)| !packed_files.contains(file))
+                    .filter(|(file, _)| is_code_file(file))
+                    .filter(|(file, _)| !noise_path(file))
+                    .map(|(file, heuristic)| {
+                        let probability =
+                            learning_predict(model, &learning_features(file, *heuristic));
+                        (file.clone(), probability)
+                    })
+                    .collect::<Vec<_>>();
+                prefetch_candidates.sort_by(|(_, a), (_, b)| {
+                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                prefetch_candidates.truncate(3);
+                let mut prefetched = 0usize;
+                for (file, probability) in &prefetch_candidates {
+                    if *probability <= 0.5 {
+                        continue;
+                    }
+                    // source() 自身写入进程级有界缓存；这里故意不写本次 sources，
+                    // 保证预测性读取不改变当前 fast_context 的打包与输出。
+                    let disk_before = SOURCE_DISK_READS.load(std::sync::atomic::Ordering::Relaxed);
+                    let hits_before = SOURCE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+                    if source(root, file, index.files.get(file)).is_some() {
+                        let disk_after =
+                            SOURCE_DISK_READS.load(std::sync::atomic::Ordering::Relaxed);
+                        let hits_after =
+                            SOURCE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+                        PREFETCH_DISK_READS.fetch_add(
+                            disk_after.saturating_sub(disk_before),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        PREFETCH_CACHE_HITS.fetch_add(
+                            hits_after.saturating_sub(hits_before),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        prefetched += 1;
+                        if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
+                            eprintln!("[ctx] prefetch {file} P(edit)={probability:.3}");
+                        }
                     }
                 }
-            }
-            if prefetched > 0 {
-                trace("fast_context.prefetch", prefetch_start);
+                if prefetched > 0 {
+                    trace("fast_context.prefetch", prefetch_start);
+                }
             }
         }
     }
     trace("fast_context.total", total_start);
+    if std::env::var_os("NOVA_CTX_DEBUG_STATS").is_some() {
+        let disk = SOURCE_DISK_READS.load(std::sync::atomic::Ordering::Relaxed);
+        let hits = SOURCE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let prefetch_disk = PREFETCH_DISK_READS.load(std::sync::atomic::Ordering::Relaxed);
+        let prefetch_hits = PREFETCH_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[ctx-stats] source_disk_reads={disk} source_cache_hits={hits} prefetch_disk_reads={prefetch_disk} prefetch_cache_hits={prefetch_hits} demand_disk_reads={} demand_cache_hits={}",
+            disk.saturating_sub(prefetch_disk),
+            hits.saturating_sub(prefetch_hits),
+        );
+    }
     Ok(text)
 }
 

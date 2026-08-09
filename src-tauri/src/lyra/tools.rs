@@ -496,7 +496,16 @@ async fn execute_inner(
 ) -> ToolOutcome {
     match name {
         "fast_context" => {
-            // 进程内 Rust 直连：Lyra 不依赖 Node/service 也能完整检索。
+            // 优先走常驻全局 context service：索引、学习模型与预测预取 source cache
+            // 都驻留在同一个 owner 进程内。服务不可用时才回退本地 Rust，保证工具可用。
+            if let Ok(value) =
+                crate::context_service::call_global("fast_context", root, args.clone()).await
+            {
+                if let Some(text) = value.as_str() {
+                    return ToolOutcome::text(clamp_tool_output_text(text));
+                }
+                return ToolOutcome::error("全局 fast_context 返回了非文本结果");
+            }
             let root = root.to_path_buf();
             let args = args.clone();
             match tokio::task::spawn_blocking(move || {
@@ -510,6 +519,14 @@ async fn execute_inner(
             }
         }
         "find_symbols" => {
+            if let Ok(value) =
+                crate::context_service::call_global("find_symbols", root, args.clone()).await
+            {
+                if let Some(text) = value.as_str() {
+                    return ToolOutcome::text(text);
+                }
+                return ToolOutcome::error("全局 find_symbols 返回了非文本结果");
+            }
             let root = root.to_path_buf();
             let args = args.clone();
             match tokio::task::spawn_blocking(move || {
@@ -716,9 +733,15 @@ mod tests {
     #[tokio::test]
     async fn bash_timeout_kills_process_tree() {
         let dir = temp_case_dir("timeout");
-        let err = run_bash(&dir, &shell(), "sleep 300 & echo $! > child.pid; wait", 1, None)
-            .await
-            .expect_err("必须超时");
+        let err = run_bash(
+            &dir,
+            &shell(),
+            "sleep 300 & echo $! > child.pid; wait",
+            1,
+            None,
+        )
+        .await
+        .expect_err("必须超时");
         assert!(err.contains("已终止"), "err={err}");
         let grandchild: u32 = std::fs::read_to_string(dir.join("child.pid"))
             .unwrap()
