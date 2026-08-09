@@ -12,8 +12,6 @@ import {
   disassociateClues,
   markClueMentionRead,
   refreshClueGroups,
-  splitClue,
-  stackClues,
   startSessionFromClue,
   state,
 } from "../store";
@@ -62,10 +60,7 @@ export function EvidenceChainView() {
     placement: Placement;
     targetCardId: string | null;
   } | null>(null);
-  const [selectedCardIds, setSelectedCardIds] = createSignal<Set<string>>(new Set());
   const [deletingCardId, setDeletingCardId] = createSignal<string | null>(null);
-  const [splittingCardId, setSplittingCardId] = createSignal<string | null>(null);
-  const [stacking, setStacking] = createSignal(false);
   const [connectFromId, setConnectFromId] = createSignal<string | null>(null);
   const [connectionBusy, setConnectionBusy] = createSignal(false);
   const [removingEdgeKey, setRemovingEdgeKey] = createSignal<string | null>(null);
@@ -106,21 +101,11 @@ export function EvidenceChainView() {
   const selectOnly = (cardId: string | null) => {
     if (cardId) markClueMentionRead(cardId);
     setSelectedCardId(cardId);
-    setSelectedCardIds(new Set(cardId ? [cardId] : []));
   };
 
-  const selectCard = (cardId: string, event: MouseEvent) => {
-    if (!event.ctrlKey && !event.metaKey) {
-      // 微博式：再次点击已展开的卡片则收起。
-      selectOnly(selectedCardId() === cardId ? null : cardId);
-      return;
-    }
-    const next = new Set(selectedCardIds());
-    if (next.has(cardId)) next.delete(cardId);
-    else next.add(cardId);
-    if (next.size === 0) next.add(cardId);
-    setSelectedCardIds(next);
-    setSelectedCardId(cardId);
+  // 微博式：点卡片展开/收起；不存在多选——线索关系本来就是一棵回复树。
+  const selectCard = (cardId: string, _event: MouseEvent) => {
+    selectOnly(selectedCardId() === cardId ? null : cardId);
   };
 
   const completeConnect = async (fromCardId: string, targetCardId: string) => {
@@ -192,34 +177,6 @@ export function EvidenceChainView() {
     }
   };
 
-  const splitSelectedCard = async (card: ClueCard) => {
-    if (splittingCardId()) return;
-    setSplittingCardId(card.id);
-    try {
-      await splitClue(card.id);
-      setSelectedCardIds(new Set([card.id]));
-    } catch (error) {
-      await message(String(error), { title: "拆分失败", kind: "error" });
-    } finally {
-      setSplittingCardId(null);
-    }
-  };
-
-  const stackSelectedCards = async () => {
-    const cardIds = [...selectedCardIds()];
-    if (cardIds.length < 2 || stacking()) return;
-    setStacking(true);
-    try {
-      await stackClues(cardIds);
-      const selected = selectedCardId() ?? cardIds[0];
-      setSelectedCardIds(new Set([selected]));
-    } catch (error) {
-      await message(String(error), { title: "堆叠失败", kind: "error" });
-    } finally {
-      setStacking(false);
-    }
-  };
-
   const beginReply = (comment: ClueComment) => {
     setReplyToCommentId(comment.id);
     const myToken = state.settings?.relayToken ?? "";
@@ -265,22 +222,19 @@ export function EvidenceChainView() {
     const request = state.clueOpenRequest;
     if (request && available.some((card) => card.id === request)) {
       setSelectedCardId(request);
-      setSelectedCardIds(new Set([request]));
       clearClueOpenRequest(request);
       return;
     }
     const selected = selectedCardId();
-    if (selected && available.some((card) => card.id === selected)) {
-      const availableIds = new Set(available.map((card) => card.id));
-      const next = new Set([...selectedCardIds()].filter((cardId) => availableIds.has(cardId)));
-      if (next.size !== selectedCardIds().size) setSelectedCardIds(next);
+    if (selected && available.some((card) => card.id === selected)) return;
+    if (selected && !available.some((card) => card.id === selected)) {
+      setSelectedCardId(null);
       return;
     }
     if (!selected) {
       const preferred = state.pendingClueCard?.id;
       if (preferred && available.some((card) => card.id === preferred)) {
         setSelectedCardId(preferred);
-        setSelectedCardIds(new Set([preferred]));
       }
     }
   });
@@ -308,11 +262,6 @@ export function EvidenceChainView() {
           </p>
         </div>
         <div class="clue-head-actions">
-          <Show when={selectedCardIds().size > 1}>
-            <button class="btn secondary" disabled={stacking()} onClick={() => void stackSelectedCards()}>
-              {stacking() ? "堆叠中…" : `堆叠所选（${selectedCardIds().size}）`}
-            </button>
-          </Show>
           <Show when={connectFromId()}>
             <button class="btn secondary" onClick={() => setConnectFromId(null)}>
               取消连接
@@ -372,7 +321,6 @@ export function EvidenceChainView() {
                   class="clue-feed-card"
                   classList={{
                     expanded: expanded(),
-                    selected: selectedCardIds().has(card.id),
                     "connect-source": connectFromId() === card.id,
                   }}
                 >
@@ -567,34 +515,11 @@ export function EvidenceChainView() {
                         class="btn secondary small"
                         onClick={(event) => {
                           event.stopPropagation();
-                          setCapture({ placement: "parallel", targetCardId: card.id });
-                        }}
-                      >
-                        堆叠
-                      </button>
-                      <button
-                        type="button"
-                        class="btn secondary small"
-                        onClick={(event) => {
-                          event.stopPropagation();
                           setCapture({ placement: "new", targetCardId: card.id });
                         }}
                       >
-                        接一条
+                        回复线索
                       </button>
-                      <Show when={(group()?.cards.length ?? 0) > 1}>
-                        <button
-                          type="button"
-                          class="btn secondary small"
-                          disabled={splittingCardId() === card.id}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void splitSelectedCard(card);
-                          }}
-                        >
-                          {splittingCardId() === card.id ? "拆分中…" : "拆分"}
-                        </button>
-                      </Show>
                       <button
                         type="button"
                         class="btn danger small"
