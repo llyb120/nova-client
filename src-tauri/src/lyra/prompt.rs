@@ -192,9 +192,12 @@ pub struct ShellConfig {
 
 pub fn detect_shell() -> ShellConfig {
     if cfg!(windows) {
-        for root in [std::env::var("SystemRoot").ok(), std::env::var("windir").ok()]
-            .into_iter()
-            .flatten()
+        for root in [
+            std::env::var("SystemRoot").ok(),
+            std::env::var("windir").ok(),
+        ]
+        .into_iter()
+        .flatten()
         {
             let candidate = PathBuf::from(root)
                 .join("System32")
@@ -245,10 +248,21 @@ fn parse_skill(path: &Path) -> Option<Skill> {
         for line in rest[..end].lines() {
             let line = line.trim();
             if let Some(value) = line.strip_prefix("name:") {
-                name = Some(value.trim().trim_matches('"').trim_matches('\'').to_string());
+                name = Some(
+                    value
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string(),
+                );
             } else if let Some(value) = line.strip_prefix("description:") {
-                description =
-                    Some(value.trim().trim_matches('"').trim_matches('\'').to_string());
+                description = Some(
+                    value
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string(),
+                );
             }
         }
     }
@@ -441,8 +455,7 @@ mod tests {
     #[test]
     fn governs_oversized_text_with_head_tail() {
         let text = "a".repeat(100_000);
-        let (governed, archive, original) =
-            govern_tool_text(&text, 1_024, None, "call-1", "bash");
+        let (governed, archive, original) = govern_tool_text(&text, 1_024, None, "call-1", "bash");
         assert!(governed.len() <= 1_024 + 128);
         assert!(governed.contains("[elided tool result — 100000 bytes]"));
         assert!(archive.is_none());

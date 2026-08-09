@@ -3756,7 +3756,8 @@ fn run_cycle(app: AppHandle, mut emp: Employee, manual: bool) {
         {
             images = m.images.clone();
             // 认领后账本不再重复派给心跳轮次；工作流本身不维护账本状态，该单保持 claimed。
-            let (outcome, _) = ledger_claim_one(&app, use_shared, &scope, &m.key, &m.title, &emp).await;
+            let (outcome, _) =
+                ledger_claim_one(&app, use_shared, &scope, &m.key, &m.title, &emp).await;
             if outcome == ClaimOutcome::Acquired {
                 let _ = app.emit(EV_MARKS, json!({}));
                 goal = if m.note.trim().is_empty() {

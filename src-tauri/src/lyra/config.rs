@@ -178,13 +178,18 @@ pub fn default_model(config: &Value) -> Result<String, String> {
             .iter()
             .any(|option| option.get("value").and_then(Value::as_str) == Some(value))
     };
-    let mut selection = config.get("model").and_then(Value::as_str).map(str::to_string);
+    let mut selection = config
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if let Some(current) = selection.clone() {
         if !has(&current) {
             // 兼容旧配置：model 无 variant 后缀时按 options.reasoningEffort 补全。
             let (provider_id, model_id) = current.split_once('/').unwrap_or((&current, ""));
             let effort = config
-                .pointer(&format!("/provider/{provider_id}/models/{model_id}/options/reasoningEffort"))
+                .pointer(&format!(
+                    "/provider/{provider_id}/models/{model_id}/options/reasoningEffort"
+                ))
                 .and_then(Value::as_str);
             selection = effort
                 .map(|effort| format!("{current}/variant/{effort}"))
@@ -246,7 +251,10 @@ pub fn resolve_model(
             return Err(format!("Vega model 不支持思考强度：{selection}"));
         }
     }
-    let options = provider.get("options").cloned().unwrap_or_else(|| json!({}));
+    let options = provider
+        .get("options")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let base_url = resolve_env_string(
         options
             .get("baseURL")
@@ -317,11 +325,14 @@ pub fn resolve_model(
     let session_affinity_headers = compat_flag(model, provider, "sendSessionAffinityHeaders")
         .unwrap_or(api == "openai-completions" && !official_openai);
     let id_lower = model_id.to_lowercase();
-    let requires_reasoning_content =
-        compat_flag(model, provider, "requiresReasoningContentOnAssistantMessages")
-            .unwrap_or(id_lower.contains("deepseek"));
-    let supports_long_cache_retention = compat_flag(model, provider, "supportsLongCacheRetention")
-        .unwrap_or(official_openai);
+    let requires_reasoning_content = compat_flag(
+        model,
+        provider,
+        "requiresReasoningContentOnAssistantMessages",
+    )
+    .unwrap_or(id_lower.contains("deepseek"));
+    let supports_long_cache_retention =
+        compat_flag(model, provider, "supportsLongCacheRetention").unwrap_or(official_openai);
     let thinking_format = detect_thinking_format(provider_id, &base_url, model, provider);
     // 与 Vega(PI) 对齐：zai 默认不发 reasoning_effort，其余（含 deepseek）默认发送。
     let supports_reasoning_effort = compat_flag(model, provider, "supportsReasoningEffort")

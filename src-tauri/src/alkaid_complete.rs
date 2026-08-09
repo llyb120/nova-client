@@ -141,10 +141,7 @@ async fn post_stream(
     let response = req.send().await.map_err(|e| format!("补全请求失败：{e}"))?;
     let status = response.status();
     if !status.is_success() {
-        let text = response
-            .text()
-            .await
-            .unwrap_or_default();
+        let text = response.text().await.unwrap_or_default();
         let message = text.trim();
         return Err(if message.is_empty() {
             format!("补全 HTTP {status}")
@@ -231,7 +228,10 @@ async fn read_responses_sse(response: &mut reqwest::Response) -> Result<String, 
             if value.get("output").is_some() || value.get("output_text").is_some() {
                 return extract_responses_text(&value);
             }
-            let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let delta = match kind {
                 "response.output_text.delta" | "response.text.delta" => value
                     .get("delta")
@@ -272,9 +272,7 @@ fn should_early_stop(text: &str) -> bool {
     }
     matches!(
         chars.last(),
-        Some(
-            '。' | '！' | '？' | '；' | '，' | '、' | '!' | '?' | ';' | ',' | '\n' | '…'
-        )
+        Some('。' | '！' | '？' | '；' | '，' | '、' | '!' | '?' | ';' | ',' | '\n' | '…')
     )
 }
 
@@ -334,7 +332,9 @@ fn content_to_text(content: &Value) -> String {
 
 pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
     let path = data_dir.join("alkaid").join("config.jsonc");
-    let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+    let mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok());
     {
         let cache = config_cache().lock().unwrap();
         if let Some(cached) = cache.as_ref() {
@@ -351,7 +351,11 @@ pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
         }
         Err(error) => return Err(format!("读取 Vega 配置失败：{error}")),
     };
-    if !config.get("provider").map(Value::is_object).unwrap_or(false) {
+    if !config
+        .get("provider")
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
         return Err("Vega 配置缺少 provider".into());
     }
     *config_cache().lock().unwrap() = Some(CachedConfig {
@@ -384,7 +388,10 @@ fn resolve_target(
     let model = provider
         .pointer(&format!("/models/{model_id}"))
         .ok_or_else(|| format!("Vega model 不存在：{base_selection}"))?;
-    let options = provider.get("options").cloned().unwrap_or_else(|| json!({}));
+    let options = provider
+        .get("options")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let base_url = resolve_env_string(
         options
             .get("baseURL")
@@ -397,18 +404,23 @@ fn resolve_target(
         return Err(format!("Vega provider 缺少 options.baseURL：{provider_id}"));
     }
     let api_key = resolve_env_string(
-        options.get("apiKey").and_then(Value::as_str).unwrap_or_default(),
+        options
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
         env,
     )?;
     let api = provider_api(provider)?;
-    let variant = selection
-        .rsplit_once(marker)
-        .map(|(_, value)| value);
+    let variant = selection.rsplit_once(marker).map(|(_, value)| value);
     let variant_options = variant
         .and_then(|name| model.pointer(&format!("/variants/{name}")))
         .and_then(Value::as_object);
     let service_tier = variant_options
-        .and_then(|value| value.get("serviceTier").or_else(|| value.get("service_tier")))
+        .and_then(|value| {
+            value
+                .get("serviceTier")
+                .or_else(|| value.get("service_tier"))
+        })
         .or_else(|| model.pointer("/options/serviceTier"))
         .or_else(|| model.pointer("/options/service_tier"))
         .or_else(|| provider.pointer("/options/serviceTier"))
@@ -452,7 +464,10 @@ pub(crate) fn provider_api(provider: &Value) -> Result<String, String> {
     if let Some(api) = provider.get("api").and_then(Value::as_str) {
         return Ok(api.to_string());
     }
-    let npm = provider.get("npm").and_then(Value::as_str).unwrap_or_default();
+    let npm = provider
+        .get("npm")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if npm.contains("anthropic") {
         return Ok("anthropic-messages".into());
     }
@@ -519,7 +534,10 @@ pub(crate) fn detect_max_tokens_field(base_url: &str, provider: &Value) -> &'sta
     }
 }
 
-pub(crate) fn resolve_env_string(value: &str, env: &HashMap<String, String>) -> Result<String, String> {
+pub(crate) fn resolve_env_string(
+    value: &str,
+    env: &HashMap<String, String>,
+) -> Result<String, String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}").unwrap());
     let mut out = value.to_string();
@@ -655,7 +673,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            value.pointer("/provider/deepseek/npm").and_then(Value::as_str),
+            value
+                .pointer("/provider/deepseek/npm")
+                .and_then(Value::as_str),
             Some("@ai-sdk/openai-compatible")
         );
     }

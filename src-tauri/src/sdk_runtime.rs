@@ -577,13 +577,7 @@ impl SdkManager {
             .lock()
             .unwrap()
             .get(thread_id)
-            .map(|bridge| {
-                (
-                    bridge.control.clone(),
-                    bridge.pid,
-                    bridge.abort.clone(),
-                )
-            });
+            .map(|bridge| (bridge.control.clone(), bridge.pid, bridge.abort.clone()));
         if let Some((control, pid, abort)) = bridge {
             // Bridge cancellation and persistence are best-effort only. The replacement prompt
             // receives the already-streamed transcript from Thread, so do not wait for SDK cleanup.
@@ -674,7 +668,6 @@ impl SdkManager {
             manager.spawn_revalidate_model_options();
         });
     }
-
 
     /// 本地 `config.jsonc` 发生变化时调用。当前正在执行的 bridge 不打断，
     /// 但会让下一轮请求、模型列表和预热实例使用新配置。
@@ -850,7 +843,12 @@ impl SdkManager {
 
     /// 一次性行内补全：Rust 直连 provider HTTP（不冷启 Node）。
     /// 仅 openai-completions / openai-responses；其它协议再回退 bridge。
-    pub async fn complete_once(&self, cwd: &str, model: &str, prompt: String) -> Result<String, String> {
+    pub async fn complete_once(
+        &self,
+        cwd: &str,
+        model: &str,
+        prompt: String,
+    ) -> Result<String, String> {
         let data_dir = nova_data_dir(&self.app);
         match crate::alkaid_complete::complete_direct(
             &self.http,
@@ -882,7 +880,8 @@ impl SdkManager {
 
     async fn run_bridge(&self, cwd: &str, request: Value) -> Result<Value, String> {
         if self.use_inprocess() {
-            return crate::lyra::run_oneshot(&self.native_http(), &request, self.borrowed_root()).await;
+            return crate::lyra::run_oneshot(&self.native_http(), &request, self.borrowed_root())
+                .await;
         }
         let mut child = self.spawn_bridge(cwd)?;
         let mut stdin = child
@@ -1300,8 +1299,8 @@ impl SdkManager {
                     if let Some(raw) = event.get("usage") {
                         let (usage, _) = self.adapter.normalize_usage(Some(raw), None, None);
                         if let Some(usage) = usage {
-                            let _ = self
-                                .emit_op(thread_id, json!({ "t": "usage", "usage": usage }));
+                            let _ =
+                                self.emit_op(thread_id, json!({ "t": "usage", "usage": usage }));
                         }
                     }
                 }
@@ -1333,8 +1332,8 @@ impl SdkManager {
         // Rust 原生 agent（如 Lyra）：直接以应用自身子命令启动，不经 Node bridge。
         let native_subcommand = self.adapter.native_subcommand();
         let mut command = if let Some(subcommand) = native_subcommand {
-            let exe = std::env::current_exe()
-                .map_err(|e| format!("定位应用可执行文件失败：{e}"))?;
+            let exe =
+                std::env::current_exe().map_err(|e| format!("定位应用可执行文件失败：{e}"))?;
             let mut command = Command::new(exe);
             command.arg(subcommand);
             command

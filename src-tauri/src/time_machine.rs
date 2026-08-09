@@ -1049,7 +1049,10 @@ pub fn timeline_training_digest(
             .as_deref()
             .filter(|parent_id| ids.contains(parent_id))
         {
-            Some(parent_id) => children.entry(parent_id).or_default().push(checkpoint_index),
+            Some(parent_id) => children
+                .entry(parent_id)
+                .or_default()
+                .push(checkpoint_index),
             None => roots.push(checkpoint_index),
         }
     }
@@ -1091,7 +1094,8 @@ pub fn timeline_training_digest(
                 )
             })
             .unwrap_or(0);
-        let edge = &checkpoint.thread_snapshot.items[edge_start.min(checkpoint.thread_snapshot.items.len())..];
+        let edge = &checkpoint.thread_snapshot.items
+            [edge_start.min(checkpoint.thread_snapshot.items.len())..];
         out.push_str(&format!(
             "\n### #{} 「{}」{}\n",
             short_id(&checkpoint.id),

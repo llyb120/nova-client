@@ -71,8 +71,11 @@ impl SlimMemory {
         value["version"] = json!(3);
         let path = slim_path(root, session_id);
         let temp = path.with_extension("slim.tmp");
-        std::fs::write(&temp, serde_json::to_string(&value).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            &temp,
+            serde_json::to_string(&value).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         std::fs::rename(&temp, &path).map_err(|e| e.to_string())
     }
 
@@ -195,7 +198,12 @@ impl SlimMemory {
     }
 
     /// 超出容量时把最旧的完成轮次折叠为一条冻结摘要；最新完成轮（含其后的中断提示）受保护。
-    pub async fn compact<F, Fut>(&mut self, current_tokens: u64, max_tokens: u64, summarize: F) -> bool
+    pub async fn compact<F, Fut>(
+        &mut self,
+        current_tokens: u64,
+        max_tokens: u64,
+        summarize: F,
+    ) -> bool
     where
         F: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
@@ -266,9 +274,7 @@ impl SlimMemory {
                 Some("assistant")
                     if message.get("stopReason").and_then(Value::as_str) != Some("error") =>
                 {
-                    self.set_latest_conclusion(
-                        message.get("content").unwrap_or(&Value::Null),
-                    );
+                    self.set_latest_conclusion(message.get("content").unwrap_or(&Value::Null));
                 }
                 _ => {}
             }

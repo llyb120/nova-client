@@ -811,21 +811,42 @@ mod tests {
     fn line_range_guard_rejects_drift() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "inserted\na\nb\nc\n").unwrap();
-        let error = edit(dir.path(), "a.txt", json!([{
-            "startLine": 2, "endLine": 3, "firstLine": "b", "lastLine": "c", "newText": "x"
-        }]), true).unwrap_err();
+        let error = edit(
+            dir.path(),
+            "a.txt",
+            json!([{
+                "startLine": 2, "endLine": 3, "firstLine": "b", "lastLine": "c", "newText": "x"
+            }]),
+            true,
+        )
+        .unwrap_err();
         assert!(error.contains("likely changed"), "{error}");
-        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "inserted\na\nb\nc\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "inserted\na\nb\nc\n"
+        );
     }
 
     #[test]
     fn enhanced_edit_preserves_crlf_and_returns_numbered_preview() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), b"a\r\nb\r\nc\r\n").unwrap();
-        let result = edit(dir.path(), "a.txt", json!([{
-            "startLine": 2, "endLine": 2, "firstLine": "b", "newText": "B"
-        }]), true).unwrap();
-        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"a\r\nB\r\nc\r\n");
-        assert!(result["previews"][0]["text"].as_str().unwrap().contains("2|B"));
+        let result = edit(
+            dir.path(),
+            "a.txt",
+            json!([{
+                "startLine": 2, "endLine": 2, "firstLine": "b", "newText": "B"
+            }]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("a.txt")).unwrap(),
+            b"a\r\nB\r\nc\r\n"
+        );
+        assert!(result["previews"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("2|B"));
     }
 }

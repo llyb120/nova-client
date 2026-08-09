@@ -1873,7 +1873,9 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         };
         old_kind = thread.agent_kind.clone();
         agent_changed = old_kind != new_kind;
-        if agent_changed || (!cmd.model.trim().is_empty() && thread.model.as_deref() != Some(cmd.model.trim())) {
+        if agent_changed
+            || (!cmd.model.trim().is_empty() && thread.model.as_deref() != Some(cmd.model.trim()))
+        {
             thread.clear_auto_route();
         }
         if agent_changed {

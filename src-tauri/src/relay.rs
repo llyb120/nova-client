@@ -1543,9 +1543,7 @@ impl RelayManager {
 
     /// 把工作流定义分享给指定队友。def 为前端完整的 WorkflowDef JSON。
     pub fn share_workflow(&self, def: &Value, to: &str) -> Result<usize, String> {
-        let (_, own_token, _) = self
-            .cfg()
-            .ok_or_else(|| "未配置团队中转站".to_string())?;
+        let (_, own_token, _) = self.cfg().ok_or_else(|| "未配置团队中转站".to_string())?;
         let name = def
             .get("name")
             .and_then(|v| v.as_str())
@@ -2695,9 +2693,7 @@ impl RelayManager {
                     AgentKind::Alkaid => {
                         app.state::<AppState>().alkaid.ensure_model_options().await
                     }
-                    AgentKind::Lyra => {
-                        app.state::<AppState>().lyra.ensure_model_options().await
-                    }
+                    AgentKind::Lyra => app.state::<AppState>().lyra.ensure_model_options().await,
                     AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                         app.state::<AppState>()
                             .opencodeplus

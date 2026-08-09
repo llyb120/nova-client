@@ -16,8 +16,8 @@ mod marks;
 mod mind;
 mod model_cache;
 mod notice;
-mod nova_tools_native;
 mod nova_tools_napi_asset;
+mod nova_tools_native;
 mod opencode_sdk;
 mod path_env;
 mod quota;
@@ -202,7 +202,10 @@ impl AppState {
         // 工作流会话保留 [WF] 前缀（阶段导航依赖它识别链）；超长的阶段名兜底标题截短。
         let fallback = if fallback.starts_with("[WF]") {
             if fallback.chars().count() > 28 {
-                format!("[WF] {}", fallback[4..].chars().take(24).collect::<String>())
+                format!(
+                    "[WF] {}",
+                    fallback[4..].chars().take(24).collect::<String>()
+                )
             } else {
                 fallback
             }
@@ -647,9 +650,9 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
     }
     for shortcut in shortcuts {
         let label = shortcut.to_string();
-        if let Err(error) = app.global_shortcut().on_shortcut(
-            shortcut,
-            |app, _shortcut, event| {
+        if let Err(error) = app
+            .global_shortcut()
+            .on_shortcut(shortcut, |app, _shortcut, event| {
                 if event.state == ShortcutState::Pressed {
                     // A global shortcut is often used while Nova is behind another window or
                     // minimized. Bring it back before delivering the event so the user can see
@@ -664,8 +667,8 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
                     }
                     let _ = app.emit(EV_NEW_SESSION_SHORTCUT, ());
                 }
-            },
-        ) {
+            })
+        {
             eprintln!("[shortcut] 注册新建会话全局快捷键失败（{label}）：{error}");
         } else {
             eprintln!("[shortcut] 已注册新建会话全局快捷键：{label}");
@@ -3357,9 +3360,7 @@ async fn get_slash_commands(
         return Ok(Vec::new());
     }
     match agent_kind {
-        AgentKind::Alkaid | AgentKind::Lyra => {
-            Ok(list_alkaid_skill_commands(&state.config_dir))
-        }
+        AgentKind::Alkaid | AgentKind::Lyra => Ok(list_alkaid_skill_commands(&state.config_dir)),
         AgentKind::Devin => {
             let commands = state.acp.fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
@@ -4530,7 +4531,10 @@ fn composer_history_block(items: &[Item]) -> String {
             .collect::<Vec<_>>()
             .join("\n");
         block.push_str("近期相关结论（对齐用词，从旧到新）：\n");
-        block.push_str(&take_first_chars(&joined, COMPLETION_HISTORY_CONCLUSION_MAX));
+        block.push_str(&take_first_chars(
+            &joined,
+            COMPLETION_HISTORY_CONCLUSION_MAX,
+        ));
         block.push('\n');
     }
     block
@@ -4538,7 +4542,14 @@ fn composer_history_block(items: &[Item]) -> String {
 
 fn clean_completion_output(raw: &str) -> String {
     let mut text = raw.trim().to_string();
-    for prefix in ["续写：", "续写:", "补全：", "补全:", "Completion:", "completion:"] {
+    for prefix in [
+        "续写：",
+        "续写:",
+        "补全：",
+        "补全:",
+        "Completion:",
+        "completion:",
+    ] {
         if let Some(rest) = text.strip_prefix(prefix) {
             text = rest.trim_start().to_string();
             break;
@@ -4572,7 +4583,13 @@ async fn complete_composer_draft(
     if draft.trim().is_empty() {
         return Ok(String::new());
     }
-    let completion_model = state.settings.lock().unwrap().completion_model.trim().to_string();
+    let completion_model = state
+        .settings
+        .lock()
+        .unwrap()
+        .completion_model
+        .trim()
+        .to_string();
     if completion_model.is_empty() {
         return Ok(String::new());
     }
@@ -4676,7 +4693,8 @@ async fn judge_workflow_route(
         let lightweight_agent = s.lightweight_model_agent.trim().to_string();
         let completion = s.completion_model.trim().to_string();
         // complete_once 走 Vega(alkaid) 直连/bridge，只有 alkaid 系模型 id 可用。
-        if (lightweight_agent.is_empty() || lightweight_agent == "alkaid") && !lightweight.is_empty()
+        if (lightweight_agent.is_empty() || lightweight_agent == "alkaid")
+            && !lightweight.is_empty()
         {
             lightweight
         } else {
@@ -4751,7 +4769,11 @@ fn decline_share(state: State<'_, AppState>, id: String) {
 
 /// 把工作流定义分享给指定队友（对方接收后进入其工作流库）
 #[tauri::command]
-fn share_workflow(state: State<'_, AppState>, workflow: Value, to: String) -> Result<usize, String> {
+fn share_workflow(
+    state: State<'_, AppState>,
+    workflow: Value,
+    to: String,
+) -> Result<usize, String> {
     state.relay.share_workflow(&workflow, &to)
 }
 
@@ -5865,7 +5887,8 @@ pub fn run() {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
-    builder.setup(|app| {
+    builder
+        .setup(|app| {
             #[cfg(windows)]
             {
                 spawn_single_instance_focus_listener(app.handle());

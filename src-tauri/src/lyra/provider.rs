@@ -15,7 +15,11 @@ pub enum StreamEvent {
     ThinkingDelta(String),
     /// 工具调用参数的流式增量：index 为本条消息内工具调用序号，
     /// args 为该调用迄今累积的参数 JSON 片段（供投机执行预解析）。
-    ToolArgsDelta { index: usize, name: String, args: String },
+    ToolArgsDelta {
+        index: usize,
+        name: String,
+        args: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -57,7 +61,11 @@ fn tool_result_text(message: &Value) -> String {
 
 // ---------- chat/completions ----------
 
-fn completions_messages(system_prompt: &str, messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
+fn completions_messages(
+    system_prompt: &str,
+    messages: &[Value],
+    model: &ResolvedModel,
+) -> Vec<Value> {
     let mut out = vec![json!({ "role": "system", "content": system_prompt })];
     for message in messages {
         match message.get("role").and_then(Value::as_str) {
@@ -381,10 +389,7 @@ async fn post_stream(
             }
         }
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("请求失败：{e}"))?;
+    let response = request.send().await.map_err(|e| format!("请求失败：{e}"))?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -392,7 +397,10 @@ async fn post_stream(
         return Err(if message.is_empty() {
             format!("HTTP {status}")
         } else {
-            format!("HTTP {status}：{}", message.chars().take(500).collect::<String>())
+            format!(
+                "HTTP {status}：{}",
+                message.chars().take(500).collect::<String>()
+            )
         });
     }
     Ok(response)
@@ -434,7 +442,12 @@ async fn read_sse(
     }
 }
 
-fn push_delta(result: &mut StreamResult, kind: &str, delta: &str, on_event: &mut (dyn FnMut(StreamEvent) + Send)) {
+fn push_delta(
+    result: &mut StreamResult,
+    kind: &str,
+    delta: &str,
+    on_event: &mut (dyn FnMut(StreamEvent) + Send),
+) {
     if delta.is_empty() {
         return;
     }
@@ -443,7 +456,9 @@ fn push_delta(result: &mut StreamResult, kind: &str, delta: &str, on_event: &mut
             // 合并到当前 thinking 块
             if !matches!(result.content.last(), Some(b) if b.get("type").and_then(Value::as_str) == Some("thinking"))
             {
-                result.content.push(json!({ "type": "thinking", "thinking": "" }));
+                result
+                    .content
+                    .push(json!({ "type": "thinking", "thinking": "" }));
             }
             if let Some(block) = result.content.last_mut() {
                 let current = block
@@ -480,7 +495,10 @@ struct ToolCallAccum {
 }
 
 fn completions_usage(usage: &Value) -> Value {
-    let prompt = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let prompt = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let completion = usage
         .get("completion_tokens")
         .and_then(Value::as_u64)
@@ -499,8 +517,14 @@ fn completions_usage(usage: &Value) -> Value {
 }
 
 fn responses_usage(usage: &Value) -> Value {
-    let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let cached = usage
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
@@ -573,7 +597,11 @@ async fn stream_completions(
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
                     calls.push(ToolCallAccum {
-                        id: call.get("id").and_then(Value::as_str).unwrap_or_default().into(),
+                        id: call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .into(),
                         name: call
                             .pointer("/function/name")
                             .and_then(Value::as_str)
@@ -627,9 +655,7 @@ async fn stream_completions(
                     if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
                         accum.name.push_str(name);
                     }
-                    if let Some(args) = call
-                        .pointer("/function/arguments")
-                        .and_then(Value::as_str)
+                    if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str)
                     {
                         accum.arguments.push_str(args);
                         on_event(StreamEvent::ToolArgsDelta {
@@ -688,7 +714,10 @@ async fn stream_responses(
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
-        let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match kind {
             "response.output_text.delta" | "response.text.delta" => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
@@ -799,7 +828,11 @@ async fn stream_responses(
     Ok(result)
 }
 
-fn parse_responses_object(value: &Value, result: &mut StreamResult, calls: &mut Vec<ToolCallAccum>) {
+fn parse_responses_object(
+    value: &Value,
+    result: &mut StreamResult,
+    calls: &mut Vec<ToolCallAccum>,
+) {
     let items: Vec<Value> = if let Some(output) = value.get("output").and_then(Value::as_array) {
         output.clone()
     } else {
@@ -864,11 +897,25 @@ pub async fn stream_chat(
 ) -> Result<StreamResult, String> {
     match model.api.as_str() {
         "openai-completions" => {
-            let body = completions_body(model, system_prompt, messages, tools, thinking_level, session_id);
+            let body = completions_body(
+                model,
+                system_prompt,
+                messages,
+                tools,
+                thinking_level,
+                session_id,
+            );
             stream_completions(http, model, api_key, body, session_id, cancel, on_event).await
         }
         "openai-responses" => {
-            let body = responses_body(model, system_prompt, messages, tools, thinking_level, session_id);
+            let body = responses_body(
+                model,
+                system_prompt,
+                messages,
+                tools,
+                thinking_level,
+                session_id,
+            );
             stream_responses(http, model, api_key, body, session_id, cancel, on_event).await
         }
         "anthropic-messages" => {
@@ -939,7 +986,10 @@ fn anthropic_messages(messages: &[Value]) -> Vec<Value> {
                 for block in &content {
                     match block.get("type").and_then(Value::as_str) {
                         Some("text") => {
-                            let text = block.get("text").and_then(Value::as_str).unwrap_or_default();
+                            let text = block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
                             if !text.is_empty() {
                                 parts.push(json!({ "type": "text", "text": text }));
                             }
@@ -1102,10 +1152,7 @@ async fn stream_anthropic(
             request = request.header(key.as_str(), text);
         }
     }
-    let mut response = request
-        .send()
-        .await
-        .map_err(|e| format!("请求失败：{e}"))?;
+    let mut response = request.send().await.map_err(|e| format!("请求失败：{e}"))?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -1113,7 +1160,10 @@ async fn stream_anthropic(
         return Err(if message.is_empty() {
             format!("HTTP {status}")
         } else {
-            format!("HTTP {status}：{}", message.chars().take(500).collect::<String>())
+            format!(
+                "HTTP {status}：{}",
+                message.chars().take(500).collect::<String>()
+            )
         });
     }
 
@@ -1373,7 +1423,13 @@ mod tests {
             json!({ "role": "toolResult", "toolCallId": "toolu-1", "toolName": "read",
                     "isError": false, "content": [{ "type": "text", "text": "内容" }] }),
         ];
-        let body = anthropic_body(&model, "系统提示", &messages, std::slice::from_ref(&tool), Some("high"));
+        let body = anthropic_body(
+            &model,
+            "系统提示",
+            &messages,
+            std::slice::from_ref(&tool),
+            Some("high"),
+        );
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
@@ -1391,7 +1447,10 @@ mod tests {
     #[test]
     fn anthropic_thinking_budget_caps_below_max_tokens() {
         assert_eq!(anthropic_thinking_budget(Some("off"), 32_000), None);
-        assert_eq!(anthropic_thinking_budget(Some("medium"), 32_000), Some(16384));
+        assert_eq!(
+            anthropic_thinking_budget(Some("medium"), 32_000),
+            Some(16384)
+        );
         assert_eq!(anthropic_thinking_budget(Some("xhigh"), 8_000), Some(6_976));
         assert_eq!(anthropic_thinking_budget(None, 32_000), Some(16384));
     }

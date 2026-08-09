@@ -305,8 +305,8 @@ fn learning_update_pair(
         let gradient = grad_base * feature_diff;
         grad_acc[i] += gradient * gradient;
         let lr_i = 0.08 / (grad_acc[i].sqrt() + 0.1);
-        model.weights[i] =
-            (model.weights[i] - lr_i * gradient - lr_i * 0.0005 * model.weights[i]).clamp(-6.0, 6.0);
+        model.weights[i] = (model.weights[i] - lr_i * gradient - lr_i * 0.0005 * model.weights[i])
+            .clamp(-6.0, 6.0);
     }
     // Bias uses a fixed learning rate (single parameter, AdaGrad unnecessary).
     model.bias = (model.bias - 0.03 * grad_base - 0.03 * 0.0005 * model.bias).clamp(-6.0, 6.0);
@@ -321,8 +321,10 @@ fn settle_pending(root: &Path, state: &mut RepoLearningState) -> usize {
 
     // Pairwise learning: split into positives (edited) and negatives (not edited).
     // No training signal without both — read-only sessions produce no updates.
-    let positives: Vec<&PendingLearningSample> = pending.iter().filter(|s| s.edit_applied).collect();
-    let negatives: Vec<&PendingLearningSample> = pending.iter().filter(|s| !s.edit_applied).collect();
+    let positives: Vec<&PendingLearningSample> =
+        pending.iter().filter(|s| s.edit_applied).collect();
+    let negatives: Vec<&PendingLearningSample> =
+        pending.iter().filter(|s| !s.edit_applied).collect();
     if positives.is_empty() || negatives.is_empty() {
         return settled;
     }
@@ -499,7 +501,9 @@ pub fn observe_context_feedback(root: &Path, params: Value) -> Result<Value, Str
         save_learning_model(root, &state.model);
         count
     });
-    Ok(serde_json::json!({"enabled": true, "action": action, "path": path, "updated": updated, "modelSnapshot": learning_model_snapshot(root)}))
+    Ok(
+        serde_json::json!({"enabled": true, "action": action, "path": path, "updated": updated, "modelSnapshot": learning_model_snapshot(root)}),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2553,7 +2557,11 @@ fn compact_evidence_miss(
 /// 只有 defs 查不到任何候选时才退回全仓 rg 扫描。倒排键按 camelCase/snake_case 拆词，
 /// 锚点拆出的 words 在 defs 的拆词键上 O(1) 查表，命中即跳过 O(defs × terms) 子串扫描。
 /// NOVA_CTX_DEFS_SUGGEST=0 可回退到纯 rg 扫描（A/B 对照）。
-fn suggest_symbols(root: &Path, anchors: &[String], defs: Option<&HashMap<String, Vec<Definition>>>) -> Vec<String> {
+fn suggest_symbols(
+    root: &Path,
+    anchors: &[String],
+    defs: Option<&HashMap<String, Vec<Definition>>>,
+) -> Vec<String> {
     let mut words = Vec::<String>::new();
     for anchor in anchors {
         for variant in naming_variants(anchor) {
@@ -2587,11 +2595,16 @@ fn suggest_symbols(root: &Path, anchors: &[String], defs: Option<&HashMap<String
                 if low.len() < 5 || words.contains(&low) || stop_word(&low) {
                     continue;
                 }
-                let matched = words.iter().filter(|word| low.contains(word.as_str())).count();
+                let matched = words
+                    .iter()
+                    .filter(|word| low.contains(word.as_str()))
+                    .count();
                 if matched == 0 {
                     continue;
                 }
-                let Some(definition) = definitions.first() else { continue };
+                let Some(definition) = definitions.first() else {
+                    continue;
+                };
                 if !is_code_file(&definition.file) || anchor_noise_path(&definition.file) {
                     continue;
                 }
@@ -4340,8 +4353,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 // Clamp: model can adjust score by at most ±(blend * 300) points.
                 // This prevents a low-heuristic file from being pushed into candidate
                 // range by an overconfident model prediction (the R4 problem).
-                let adjustment = (blend * (probability - 0.5) * 420.0)
-                    .clamp(-blend * 300.0, blend * 300.0);
+                let adjustment =
+                    (blend * (probability - 0.5) * 420.0).clamp(-blend * 300.0, blend * 300.0);
                 *score += adjustment;
             }
         }
@@ -4791,7 +4804,10 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             let gain = marginal_gain(unit, &covered_features, &term_files, true);
             let value = pack_value(unit, gain);
             // 重算后仍不劣于当前堆顶（或堆已空）：选中。
-            let next_bound = heap.peek().map(|entry| entry.bound).unwrap_or(f64::NEG_INFINITY);
+            let next_bound = heap
+                .peek()
+                .map(|entry| entry.bound)
+                .unwrap_or(f64::NEG_INFINITY);
             if value >= next_bound {
                 alive[index] = false;
                 let mut picked = remaining[index].clone();
@@ -4799,9 +4815,15 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 units.push(picked);
             } else if value > bound {
                 // 上界失效（不该发生于单调次模，防御）：以新值重新入堆。
-                heap.push(QueueEntry { bound: value, index });
+                heap.push(QueueEntry {
+                    bound: value,
+                    index,
+                });
             } else {
-                heap.push(QueueEntry { bound: value, index });
+                heap.push(QueueEntry {
+                    bound: value,
+                    index,
+                });
             }
         }
     } else {
@@ -5897,14 +5919,12 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 .filter(|(file, _)| is_code_file(file))
                 .filter(|(file, _)| !noise_path(file))
                 .map(|(file, heuristic)| {
-                    let probability =
-                        learning_predict(model, &learning_features(file, *heuristic));
+                    let probability = learning_predict(model, &learning_features(file, *heuristic));
                     (file.clone(), probability)
                 })
                 .collect::<Vec<_>>();
-            prefetch_candidates.sort_by(|(_, a), (_, b)| {
-                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            prefetch_candidates
+                .sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             prefetch_candidates.truncate(3);
             let mut prefetched = 0usize;
             for (file, probability) in &prefetch_candidates {

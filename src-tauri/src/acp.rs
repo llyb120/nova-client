@@ -3081,7 +3081,8 @@ mod nova_tools_config_tests {
     use std::path::Path;
 
     fn merge_test_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nova-devin-mcp-merge-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nova-devin-mcp-merge-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -3093,7 +3094,11 @@ mod nova_tools_config_tests {
         let config_dir = dir.join(".devin");
         std::fs::create_dir_all(&config_dir).unwrap();
         let path = config_dir.join("mcp_config.local.json");
-        std::fs::write(&path, r#"{"mcpServers":{"mine":{"command":"foo"}},"other":1}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"mine":{"command":"foo"}},"other":1}"#,
+        )
+        .unwrap();
         let server = json!({"command":"node","args":["nova-tools-mcp.mjs"],"transport":"stdio"});
 
         merge_devin_session_mcp_config(dir.to_str().unwrap(), &server).unwrap();
@@ -3204,7 +3209,8 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
     }
     if tool_names.is_empty() {
         let mut lines = vec![
-            "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools.".to_string(),
+            "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."
+                .to_string(),
         ];
         if read_only {
             lines.push("Current mode is plan/read-only: analyze only; do not modify files.".into());
@@ -3212,7 +3218,8 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
         return lines.join("\n");
     }
     let tools = tool_names.join(", ");
-    let example = r#"{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}"#;
+    let example =
+        r#"{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}"#;
     let call_example_name = "fast_context";
     let nova_tools_phrase = format!(
         "You have Nova MCP endpoints from server nova-tools ({tools}) plus Devin built-in tools. In this Devin version, {tools} are remote MCP tool names, NOT top-level callable Devin tools."
