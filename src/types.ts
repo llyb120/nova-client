@@ -9,6 +9,11 @@ export interface SlashCommand {
   input?: string;
 }
 
+export interface StageModelTarget {
+  agentKind: AgentKind;
+  model: string;
+}
+
 /** worktree 执行信息：会话在为某 git 仓库创建的独立 worktree（分支 + 工作目录）中运行 */
 export interface Worktree {
   repo: string;
@@ -437,6 +442,8 @@ export interface Settings {
   lightweightModelAgent: string;
   /** 辅助任务所用轻量级模型；失败时回退到任务原模型 */
   lightweightModel: string;
+  /** /stage、/stage2 等命令依次使用的模型；/stage 默认取第一项 */
+  stageModels: StageModelTarget[];
   /** 输入框补全所用 Vega 模型（provider/model 格式）；空 = 关闭补全 */
   completionModel: string;
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */

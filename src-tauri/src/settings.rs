@@ -28,6 +28,13 @@ pub struct SessionShortcut {
     pub target: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StageModelTarget {
+    pub agent_kind: String,
+    pub model: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -91,6 +98,8 @@ pub struct Settings {
     /// 轻量级模型 id；失败时辅助任务回退到发起任务的原模型。
     #[serde(alias = "titleModel")]
     pub lightweight_model: String,
+    /// /stage、/stage2 等命令依次使用的模型；/stage 默认取第一项。
+    pub stage_models: Vec<StageModelTarget>,
     /// 输入框补全所用 Vega 模型（provider/model 格式）；空 = 关闭补全。
     /// 补全不走 agent，只对该模型 API 直接发一次 completion 请求。
     pub completion_model: String,
@@ -192,6 +201,7 @@ impl Default for Settings {
             default_mode: String::new(),
             lightweight_model_agent: "alkaid".into(),
             lightweight_model: String::new(),
+            stage_models: Vec::new(),
             completion_model: String::new(),
             editor: "code".into(),
             theme: String::new(),

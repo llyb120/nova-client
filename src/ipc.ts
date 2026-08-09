@@ -125,8 +125,8 @@ export const api = {
       clueCardId,
       parentThreadId,
     }),
-  createStageThread: (sourceThreadId: string) =>
-    invoke<Thread>("create_stage_thread", { sourceThreadId }),
+  createStageThread: (sourceThreadId: string, stageIndex = 0) =>
+    invoke<Thread>("create_stage_thread", { sourceThreadId, stageIndex }),
   listClueGroups: () => invoke<ClueNodeGroup[]>("list_clue_groups"),
   getClueContext: (cardId: string) =>
     invoke<ClueContextSnapshot>("get_clue_context", { cardId }),

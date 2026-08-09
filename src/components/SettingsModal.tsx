@@ -301,6 +301,11 @@ export function SettingsModal(props: { onClose: () => void }) {
     (s?.lightweightModelAgent as AgentKind) || "alkaid",
   );
   const [lightweightModel, setLightweightModel] = createSignal(s?.lightweightModel ?? "");
+  const [stageModels, setStageModels] = createSignal<Settings["stageModels"]>(
+    (s?.stageModels ?? []).map((target) => ({ ...target })),
+  );
+  const [draftStageKind, setDraftStageKind] = createSignal<AgentKind | null>(null);
+  const [draftStageModel, setDraftStageModel] = createSignal("");
   const [completionModel, setCompletionModel] = createSignal(s?.completionModel ?? "");
   const [editor, setEditor] = createSignal(s?.editor ?? "code");
   const [sessionAutoCleanupEnabled, setSessionAutoCleanupEnabled] = createSignal(
@@ -465,6 +470,26 @@ export function SettingsModal(props: { onClose: () => void }) {
   /** 行选择器的后端列表：已启用后端 + 该行自身的后端（后端被停用后旧行仍可展示/移除） */
   const quotaRowKinds = (kind: AgentKind): AgentKind[] =>
     quotaShareKinds().includes(kind) ? quotaShareKinds() : [...quotaShareKinds(), kind];
+  const stageRowKinds = (kind: AgentKind): AgentKind[] => {
+    const enabled = enabledAgentKinds();
+    return enabled.includes(kind) ? enabled : [...enabled, kind];
+  };
+  const addStageModel = (agentKind: AgentKind, model: string) => {
+    if (!model) return;
+    setStageModels((current) => [...current, { agentKind, model }]);
+    setDraftStageKind(agentKind);
+    setDraftStageModel("");
+  };
+  const replaceStageModel = (index: number, agentKind: AgentKind, model: string) => {
+    setStageModels((current) =>
+      current.map((target, targetIndex) =>
+        targetIndex === index ? { agentKind, model } : target,
+      ),
+    );
+  };
+  const removeStageModelAt = (index: number) => {
+    setStageModels((current) => current.filter((_, targetIndex) => targetIndex !== index));
+  };
   const updateCursorModelContext = (index: number, patch: { prefix?: string; contextWindow?: number }) => {
     setCursorModelContexts((current) => current.map((rule, ruleIndex) =>
       ruleIndex === index ? { ...rule, ...patch } : rule));
@@ -688,6 +713,9 @@ export function SettingsModal(props: { onClose: () => void }) {
     defaultMode: "build",
     lightweightModelAgent: lightweightAgent(),
     lightweightModel: lightweightModel().trim(),
+    stageModels: stageModels()
+      .map((target) => ({ agentKind: target.agentKind, model: target.model.trim() }))
+      .filter((target) => target.model.length > 0),
     completionModel: completionModel().trim(),
     editor: editor().trim() || "code",
     theme: state.theme,
@@ -1347,6 +1375,65 @@ export function SettingsModal(props: { onClose: () => void }) {
               <p class="settings-group-desc">
                 用于标题生成、快速总结、摘要和上下文压缩等辅助任务；调用失败时自动回退到任务原模型。
               </p>
+              <div class="field">
+                <span class="field-label">Stage 模型</span>
+                <span class="field-hint">
+                  按顺序配置 /stage、/stage2、/stage3… 使用的模型；/stage 等同于 /stage1。命令会引用当前会话并直接开启对应模型的新会话。
+                </span>
+                <div class="share-list">
+                  <Index each={stageModels()}>
+                    {(target, index) => (
+                      <div class="share-row" title={`/stage${index + 1}`}>
+                        <span style={{ width: "64px", "flex-shrink": 0 }}>
+                          {index === 0 ? "/stage" : `/stage${index + 1}`}
+                        </span>
+                        <ModelPicker
+                          agentKind={target().agentKind}
+                          agentKinds={stageRowKinds(target().agentKind)}
+                          model={target().model}
+                          onPickModel={(agentKind, model) =>
+                            replaceStageModel(index, agentKind, model)
+                          }
+                          title={`Stage ${index + 1} 模型`}
+                          portal
+                        />
+                        <button
+                          type="button"
+                          class="icon-btn share-row-remove"
+                          title="移除该模型"
+                          aria-label="移除该 Stage 模型"
+                          onClick={() => removeStageModelAt(index)}
+                        >
+                          <IconX size={14} />
+                        </button>
+                      </div>
+                    )}
+                  </Index>
+                  <Show when={stageModels().length === 0}>
+                    <div class="share-empty">尚未配置 Stage 模型，/stage 将提示先完成配置。</div>
+                  </Show>
+                  <Show when={enabledAgentKinds().length > 0}>
+                    <div class="share-row share-row-add">
+                      <span style={{ width: "64px", "flex-shrink": 0 }}>
+                        /stage{stageModels().length + 1}
+                      </span>
+                      <ModelPicker
+                        agentKind={draftStageKind() ?? (enabledAgentKinds()[0] ?? "alkaid")}
+                        agentKinds={enabledAgentKinds()}
+                        model={draftStageModel()}
+                        allowDefault
+                        defaultLabel="选择并添加模型"
+                        onPickModel={(agentKind, model) => addStageModel(agentKind, model)}
+                        title="添加 Stage 模型"
+                        portal
+                      />
+                      <span class="share-row-plus" title="选择模型后自动加入列表">
+                        <IconPlus size={13} />
+                      </span>
+                    </div>
+                  </Show>
+                </div>
+              </div>
               <div class="field">
                 <span class="field-label">轻量级模型</span>
                 <ModelPicker

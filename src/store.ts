@@ -1602,19 +1602,27 @@ async function handleEmployeeWorkflowRequest(payload: {
   }
 }
 
-type StageInput = { currentPrompt: string; stagePrompt: string };
+type StageInput = { currentPrompt: string; stagePrompt: string; stageIndex: number };
 
 function parseStageInput(input: string): StageInput | null {
-  const match = /(^|\s)\/stage(?:[ \t]+|(?=\r?\n)|$)/i.exec(input);
+  const match = /(^|\s)\/stage(\d*)(?:[ \t]+|(?=\r?\n)|$)/i.exec(input);
   if (!match) return null;
   const commandStart = match.index + match[1].length;
+  const stageNumber = match[2] ? Number(match[2]) : 1;
+  if (!Number.isSafeInteger(stageNumber) || stageNumber < 1) {
+    throw new Error("Stage 编号必须从 1 开始，例如 /stage2 复核当前方案");
+  }
   const stagePrompt = input.slice(commandStart + match[0].length - match[1].length).trim();
   if (!stagePrompt) throw new Error("请在 /stage 后输入新会话提示词，例如 /stage 复核当前方案");
-  return { currentPrompt: input.slice(0, commandStart).trim(), stagePrompt };
+  return { currentPrompt: input.slice(0, commandStart).trim(), stagePrompt, stageIndex: stageNumber - 1 };
 }
 
-async function startStageThread(sourceThreadId: string, prompt: string): Promise<void> {
-  const thread = await api.createStageThread(sourceThreadId);
+async function startStageThread(
+  sourceThreadId: string,
+  prompt: string,
+  stageIndex: number,
+): Promise<void> {
+  const thread = await api.createStageThread(sourceThreadId, stageIndex);
   const ownTitle = prompt.split(/\r?\n/, 1)[0].trim().slice(0, 40) || "Stage";
   await api.renameThread(thread.id, ownTitle);
   thread.title = ownTitle;
@@ -1632,7 +1640,7 @@ async function startStageThread(sourceThreadId: string, prompt: string): Promise
   }
 }
 
-/** 处理 /stage、/fire、/plan 等内置命令。返回 true 表示已消费。 */
+/** 处理 /stage、/stage2、/fire、/plan 等内置命令。返回 true 表示已消费。 */
 async function tryBuiltinPrompt(
   threadId: string,
   text: string,
@@ -1644,7 +1652,7 @@ async function tryBuiltinPrompt(
     if (images.length > 0) throw new Error("/stage 暂不支持附件");
     // 命令前有实质内容时，先作为普通提示追加到当前会话；Stage 随后独立启动。
     if (stage.currentPrompt) await deliverPrompt(threadId, stage.currentPrompt, []);
-    await startStageThread(threadId, stage.stagePrompt);
+    await startStageThread(threadId, stage.stagePrompt, stage.stageIndex);
     return true;
   }
   if (/^\/plan(?:\s|$)/i.test(builtInInput)) {

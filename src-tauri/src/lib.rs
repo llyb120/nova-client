@@ -1832,6 +1832,7 @@ fn create_stage_thread(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     source_thread_id: String,
+    stage_index: usize,
 ) -> Result<Thread, String> {
     let (cwd, source_id) = {
         let store = state.store.lock().unwrap();
@@ -1840,14 +1841,24 @@ fn create_stage_thread(
     };
     let (agent_kind, model) = {
         let settings = state.settings.lock().unwrap();
-        let kind = AgentKind::from_str(settings.lightweight_model_agent.trim())
-            .unwrap_or(AgentKind::Alkaid);
-        let model = (!settings.lightweight_model.trim().is_empty())
-            .then(|| settings.lightweight_model.trim().to_string());
+        let target = settings.stage_models.get(stage_index).ok_or_else(|| {
+            if settings.stage_models.is_empty() {
+                "尚未配置 Stage 模型，请先在设置中添加".to_string()
+            } else {
+                format!(
+                    "未配置 /stage{} 对应的模型，当前共有 {} 个 Stage 模型",
+                    stage_index + 1,
+                    settings.stage_models.len()
+                )
+            }
+        })?;
+        let kind = AgentKind::from_str(target.agent_kind.trim())
+            .ok_or_else(|| format!("Stage 模型后端无效：{}", target.agent_kind))?;
+        let model = (!target.model.trim().is_empty()).then(|| target.model.trim().to_string());
         (kind, model)
     };
     if !state.agent_enabled(&agent_kind) {
-        return Err(format!("轻量模型后端 {} 已关闭", agent_kind.label()));
+        return Err(format!("Stage 模型后端 {} 已关闭", agent_kind.label()));
     }
     let mut thread = Thread::new(cwd, agent_kind, model, Some("build".into()), None, false);
     thread.parent_thread_id = Some(source_id.clone());
