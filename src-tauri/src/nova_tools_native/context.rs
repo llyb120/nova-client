@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -54,6 +54,10 @@ const PERSIST_MIN_CHANGED: usize = 16;
 /// 目录 scope 检索时限定代码文件扩展名的 rg glob（与 is_code_file 的扩展名集合一致）。
 const CODE_FILES_GLOB: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,rs,py,pyi,go,java,kt,kts,cs,c,h,cc,cpp,hpp,swift,php,scala,dart,m,mm,zig}";
 const LEARNING_FEATURES: usize = 9;
+const PREFETCH_FEATURES: usize = 14;
+const PREFETCH_WINDOW: u8 = 3;
+const PREFETCH_MAX_FILES: usize = 3;
+const PREFETCH_MAX_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OnlineEditModel {
@@ -68,14 +72,49 @@ impl Default for OnlineEditModel {
     fn default() -> Self {
         Self {
             version: 3,
-            // heuristic, seed, explicit, exact caller, companion test, test path, small file,
-            // path depth, query-path overlap
             weights: [1.2, 1.0, 1.2, 0.7, 0.8, 0.4, 0.2, 0.5, 0.6],
             bias: -2.0,
             observations: 0,
             positives: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OnlinePrefetchModel {
+    version: u32,
+    weights: [f64; PREFETCH_FEATURES],
+    bias: f64,
+    observations: u64,
+    positives: u64,
+    opportunities: u64,
+    useful: u64,
+}
+
+impl Default for OnlinePrefetchModel {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            // heuristic, seed, explicit, caller, companion, noise, small, depth, overlap,
+            // graph-near, recent-demand, query-continuity, read-cost, co-change
+            weights: [
+                0.8, 0.5, 0.7, 0.8, 0.5, -1.0, 0.1, 0.2, 0.7, 1.0, 1.1, 0.8, 0.4, 0.5,
+            ],
+            bias: -1.5,
+            observations: 0,
+            positives: 0,
+            opportunities: 0,
+            useful: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct LearningModels {
+    #[serde(default)]
+    edit: OnlineEditModel,
+    #[serde(default)]
+    prefetch: OnlinePrefetchModel,
 }
 
 #[derive(Debug, Clone)]
@@ -86,13 +125,44 @@ struct PendingLearningSample {
     edit_applied: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PrefetchSample {
+    file: String,
+    features: [f64; PREFETCH_FEATURES],
+    probability: f64,
+    bytes: u64,
+    prefetched: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPrefetchTrace {
+    samples: Vec<PrefetchSample>,
+    remaining: u8,
+}
+
+#[derive(Default)]
+struct PrefetchMetrics {
+    predicted: u64,
+    useful: u64,
+    avoided_disk_reads: u64,
+    wasted_bytes: u64,
+    blocking_ms: u64,
+    latencies_ms: Vec<u64>,
+}
+
 #[derive(Default)]
 struct RepoLearningState {
     loaded: bool,
     model: OnlineEditModel,
+    prefetch_model: OnlinePrefetchModel,
     pending: Vec<PendingLearningSample>,
-    /// AdaGrad per-coordinate gradient accumulators (in-memory only, not persisted).
+    prefetch_traces: Vec<PendingPrefetchTrace>,
+    recent_demand: HashMap<String, u64>,
+    last_query_terms: Vec<String>,
+    call_generation: u64,
     grad_acc: [f64; LEARNING_FEATURES],
+    prefetch_grad_acc: [f64; PREFETCH_FEATURES],
+    metrics: PrefetchMetrics,
 }
 
 static LEARNING_STATE: OnceLock<Mutex<HashMap<String, RepoLearningState>>> = OnceLock::new();
@@ -182,21 +252,36 @@ fn learning_model_path(root: &Path) -> PathBuf {
     base.join(format!("{}.json", &digest[..20]))
 }
 
-fn load_learning_model(root: &Path) -> OnlineEditModel {
-    fs::read(learning_model_path(root))
+fn load_learning_models(root: &Path) -> LearningModels {
+    let Ok(bytes) = fs::read(learning_model_path(root)) else {
+        return LearningModels::default();
+    };
+    if let Ok(models) = serde_json::from_slice::<LearningModels>(&bytes) {
+        if models.edit.version == 3 && models.prefetch.version == 1 {
+            return models;
+        }
+    }
+    serde_json::from_slice::<OnlineEditModel>(&bytes)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<OnlineEditModel>(&bytes).ok())
         .filter(|model| model.version == 3)
+        .map(|edit| LearningModels {
+            edit,
+            prefetch: OnlinePrefetchModel::default(),
+        })
         .unwrap_or_default()
 }
 
-fn save_learning_model(root: &Path, model: &OnlineEditModel) {
+fn save_learning_models(root: &Path, edit: &OnlineEditModel, prefetch: &OnlinePrefetchModel) {
     let path = learning_model_path(root);
     let Some(parent) = path.parent() else { return };
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let Ok(bytes) = serde_json::to_vec_pretty(model) else {
+    let models = LearningModels {
+        edit: edit.clone(),
+        prefetch: prefetch.clone(),
+    };
+    let Ok(bytes) = serde_json::to_vec_pretty(&models) else {
         return;
     };
     let staged = path.with_extension(format!("json.tmp-{}", std::process::id()));
@@ -208,11 +293,11 @@ fn save_learning_model(root: &Path, model: &OnlineEditModel) {
 /// 序列化后的模型快照（可跨进程传递）；非法/不兼容快照返回 None。
 #[allow(dead_code)] // 预留给需要传输快照字节的调用方；当前经 JSON 值传递。
 pub fn parse_learning_model_snapshot(bytes: &[u8]) -> Option<Value> {
-    let model: OnlineEditModel = serde_json::from_slice(bytes).ok()?;
-    if model.version != 3 {
+    let models = serde_json::from_slice::<LearningModels>(bytes).ok()?;
+    if models.edit.version != 3 || models.prefetch.version != 1 {
         return None;
     }
-    serde_json::to_value(&model).ok()
+    serde_json::to_value(&models).ok()
 }
 
 /// Lyra 等纯 Rust 调用方的学习增强入口：把全局 service 下发的模型快照注入
@@ -221,11 +306,14 @@ pub fn parse_learning_model_snapshot(bytes: &[u8]) -> Option<Value> {
 #[allow(dead_code)] // Tauri lib 侧由 Lyra 使用；napi 独立编译时仅 N-API 入口可达。
 pub fn inject_learning_model_snapshot(root: &Path, snapshot: &Value) -> bool {
     if !learning_owner() {
-        // owner 进程自己就是模型来源，注入无意义。
-        let Ok(model) = serde_json::from_value::<OnlineEditModel>(snapshot.clone()) else {
-            return false;
-        };
-        if model.version != 3 {
+        let models = serde_json::from_value::<LearningModels>(snapshot.clone()).or_else(|_| {
+            serde_json::from_value::<OnlineEditModel>(snapshot.clone()).map(|edit| LearningModels {
+                edit,
+                prefetch: OnlinePrefetchModel::default(),
+            })
+        });
+        let Ok(models) = models else { return false };
+        if models.edit.version != 3 || models.prefetch.version != 1 {
             return false;
         }
         let key = learning_root_key(root);
@@ -234,8 +322,9 @@ pub fn inject_learning_model_snapshot(root: &Path, snapshot: &Value) -> bool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = states.entry(key).or_default();
-        state.model = model;
-        state.loaded = true; // 阻断 load_learning_model 从磁盘覆盖注入的快照
+        state.model = models.edit;
+        state.prefetch_model = models.prefetch;
+        state.loaded = true;
         return true;
     }
     false
@@ -248,7 +337,13 @@ pub fn learning_model_snapshot(root: &Path) -> Option<Value> {
     if !learning_owner() || !learning_enabled() {
         return None;
     }
-    with_learning_state(root, |state| serde_json::to_value(&state.model).ok())
+    with_learning_state(root, |state| {
+        serde_json::to_value(LearningModels {
+            edit: state.model.clone(),
+            prefetch: state.prefetch_model.clone(),
+        })
+        .ok()
+    })
 }
 
 fn sigmoid(value: f64) -> f64 {
@@ -287,6 +382,12 @@ fn learning_predict(model: &OnlineEditModel, features: &[f64; LEARNING_FEATURES]
 /// where G_i accumulates squared gradients. Frequently-active features (e.g. "small
 /// file") converge and their lr decays; rare features (e.g. "exact caller") keep
 /// a high lr to learn faster from scarce signal.
+fn legacy_edit_ranknet_direction() -> bool {
+    std::env::var("NOVA_CONTEXT_EDIT_RANKNET_DIRECTION")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("legacy") || value == "subtract")
+}
+
 fn learning_update_pair(
     model: &mut OnlineEditModel,
     grad_acc: &mut [f64; LEARNING_FEATURES],
@@ -294,23 +395,53 @@ fn learning_update_pair(
     neg_features: &[f64; LEARNING_FEATURES],
     weight: f64,
 ) {
-    let score_pos = learning_score(model, pos_features);
-    let score_neg = learning_score(model, neg_features);
-    let delta = score_pos - score_neg;
-    // sigmoid(-delta) = P(neg should rank above pos) = the model's ranking error.
-    let grad_base = sigmoid(-delta) * weight;
-
+    let grad_base =
+        sigmoid(-(learning_score(model, pos_features) - learning_score(model, neg_features)))
+            * weight;
     for i in 0..LEARNING_FEATURES {
-        let feature_diff = pos_features[i] - neg_features[i];
-        let gradient = grad_base * feature_diff;
+        let diff = pos_features[i] - neg_features[i];
+        let gradient = grad_base * diff;
         grad_acc[i] += gradient * gradient;
-        let lr_i = 0.08 / (grad_acc[i].sqrt() + 0.1);
-        model.weights[i] = (model.weights[i] - lr_i * gradient - lr_i * 0.0005 * model.weights[i])
-            .clamp(-6.0, 6.0);
+        let lr = 0.08 / (grad_acc[i].sqrt() + 0.1);
+        model.weights[i] = if legacy_edit_ranknet_direction() {
+            (model.weights[i] - lr * gradient - lr * 0.0005 * model.weights[i]).clamp(-6.0, 6.0)
+        } else {
+            (model.weights[i] + lr * gradient - lr * 0.0005 * model.weights[i]).clamp(-6.0, 6.0)
+        };
     }
-    // Bias uses a fixed learning rate (single parameter, AdaGrad unnecessary).
-    model.bias = (model.bias - 0.03 * grad_base - 0.03 * 0.0005 * model.bias).clamp(-6.0, 6.0);
+    model.observations += 1;
+    model.positives += 1;
+}
 
+fn prefetch_score(model: &OnlinePrefetchModel, features: &[f64; PREFETCH_FEATURES]) -> f64 {
+    model.bias
+        + model
+            .weights
+            .iter()
+            .zip(features)
+            .map(|(w, f)| w * f)
+            .sum::<f64>()
+}
+
+fn prefetch_predict(model: &OnlinePrefetchModel, features: &[f64; PREFETCH_FEATURES]) -> f64 {
+    sigmoid(prefetch_score(model, features))
+}
+
+fn prefetch_update_pair(
+    model: &mut OnlinePrefetchModel,
+    grad_acc: &mut [f64; PREFETCH_FEATURES],
+    pos: &[f64; PREFETCH_FEATURES],
+    neg: &[f64; PREFETCH_FEATURES],
+) {
+    let grad_base = sigmoid(-(prefetch_score(model, pos) - prefetch_score(model, neg)));
+    for i in 0..PREFETCH_FEATURES {
+        let diff = pos[i] - neg[i];
+        let gradient = grad_base * diff;
+        grad_acc[i] += gradient * gradient;
+        let lr = 0.06 / (grad_acc[i].sqrt() + 0.1);
+        model.weights[i] =
+            (model.weights[i] + lr * gradient - lr * 0.0005 * model.weights[i]).clamp(-6.0, 6.0);
+    }
     model.observations += 1;
     model.positives += 1;
 }
@@ -318,48 +449,31 @@ fn learning_update_pair(
 fn settle_pending(root: &Path, state: &mut RepoLearningState) -> usize {
     let pending = std::mem::take(&mut state.pending);
     let settled = pending.len();
-
-    // Pairwise learning: split into positives (edited) and negatives (not edited).
-    // No training signal without both — read-only sessions produce no updates.
-    let positives: Vec<&PendingLearningSample> =
-        pending.iter().filter(|s| s.edit_applied).collect();
-    let negatives: Vec<&PendingLearningSample> =
-        pending.iter().filter(|s| !s.edit_applied).collect();
-    if positives.is_empty() || negatives.is_empty() {
-        return settled;
-    }
-
-    // Pre-compute model scores for all negatives to find hardest examples.
-    let neg_scores: Vec<f64> = negatives
-        .iter()
-        .map(|n| learning_score(&state.model, &n.features))
-        .collect();
-
-    for pos in &positives {
-        // Hard negative mining: pick the negative with the highest model score.
-        // This is the model's most confident "mistake" — the most informative
-        // training example. One hard negative ≈ many random negatives.
-        let hardest_idx = neg_scores
+    let positives: Vec<_> = pending.iter().filter(|s| s.edit_applied).collect();
+    let negatives: Vec<_> = pending.iter().filter(|s| !s.edit_applied).collect();
+    if !positives.is_empty() && !negatives.is_empty() {
+        let neg_scores = negatives
             .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i);
-        if let Some(idx) = hardest_idx {
-            let neg = negatives[idx];
-            // Included positives (surfaced to user) get weight 1.0;
-            // excluded positives (model missed them) get weight 1.5 — penalize misses harder.
-            let weight = if pos.included { 1.0 } else { 1.5 };
-            learning_update_pair(
-                &mut state.model,
-                &mut state.grad_acc,
-                &pos.features,
-                &neg.features,
-                weight,
-            );
+            .map(|n| learning_score(&state.model, &n.features))
+            .collect::<Vec<_>>();
+        for pos in positives {
+            if let Some(idx) = neg_scores
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+            {
+                learning_update_pair(
+                    &mut state.model,
+                    &mut state.grad_acc,
+                    &pos.features,
+                    &negatives[idx].features,
+                    if pos.included { 1.0 } else { 1.5 },
+                );
+            }
         }
     }
-
-    save_learning_model(root, &state.model);
+    save_learning_models(root, &state.model, &state.prefetch_model);
     settled
 }
 
@@ -391,16 +505,16 @@ fn with_learning_state<T>(root: &Path, callback: impl FnOnce(&mut RepoLearningSt
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let state = states.entry(key).or_default();
     if !state.loaded {
+        let models = load_learning_models(root);
         if !learning_owner() {
-            // 非 owner：只读加载磁盘模型作为兜底快照；不入内存缓存、不标记 loaded，
-            // 防止后续 inject 的全局快照被旧磁盘模型阻塞，也避免本地进程间的缓存漂移。
-            let model = load_learning_model(root);
             return callback(&mut RepoLearningState {
-                model,
+                model: models.edit,
+                prefetch_model: models.prefetch,
                 ..Default::default()
             });
         }
-        state.model = load_learning_model(root);
+        state.model = models.edit;
+        state.prefetch_model = models.prefetch;
         state.loaded = true;
     }
     callback(state)
@@ -498,12 +612,38 @@ pub fn observe_context_feedback(root: &Path, params: Value) -> Result<Value, Str
             &neg_feat,
             weight,
         );
-        save_learning_model(root, &state.model);
+        save_learning_models(root, &state.model, &state.prefetch_model);
         count
     });
     Ok(
         serde_json::json!({"enabled": true, "action": action, "path": path, "updated": updated, "modelSnapshot": learning_model_snapshot(root)}),
     )
+}
+
+#[allow(dead_code)]
+pub fn prefetch_metrics(root: &Path) -> Value {
+    with_learning_state(root, |state| {
+        let mut latencies = state.metrics.latencies_ms.clone();
+        latencies.sort_unstable();
+        let percentile = |p: f64| -> u64 {
+            if latencies.is_empty() {
+                return 0;
+            }
+            latencies[((latencies.len() - 1) as f64 * p).round() as usize]
+        };
+        serde_json::json!({
+            "predicted": state.metrics.predicted,
+            "useful": state.metrics.useful,
+            "usefulRate": state.metrics.useful as f64 / state.metrics.predicted.max(1) as f64,
+            "precisionAt3": state.prefetch_model.useful as f64 / state.prefetch_model.opportunities.max(1) as f64,
+            "avoidedDiskReads": state.metrics.avoided_disk_reads,
+            "wastedBytes": state.metrics.wasted_bytes,
+            "prefetchWorkMs": state.metrics.blocking_ms,
+            "prefetchP50Ms": percentile(0.50),
+            "prefetchP95Ms": percentile(0.95),
+            "model": state.prefetch_model,
+        })
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,6 +739,7 @@ struct SourceCache {
 
 const SOURCE_CACHE_MAX_ENTRIES: usize = 96;
 static SOURCE_CACHE: OnceLock<Mutex<SourceCache>> = OnceLock::new();
+static SOURCE_LOADING: OnceLock<(Mutex<HashSet<String>>, Condvar)> = OnceLock::new();
 
 static SOURCE_DISK_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static SOURCE_CACHE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2030,6 +2171,88 @@ fn build_index(
     (view, all, reverse)
 }
 
+fn source_cache_contains(root: &Path, file: &str) -> bool {
+    let path = root.join(file);
+    let Ok(metadata) = fs::metadata(&path) else {
+        return false;
+    };
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let key = format!("{}\0{file}", learning_root_key(root));
+    SOURCE_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok())
+        .and_then(|cache| cache.entries.get(&key).cloned())
+        .is_some_and(|cached| {
+            cached.len == metadata.len() && cached.modified_nanos == modified_nanos
+        })
+}
+
+fn record_prefetch_demand(root: &Path, demanded: &HashSet<String>, disk_misses: &HashSet<String>) {
+    if !learning_enabled() {
+        return;
+    }
+    with_learning_state(root, |state| {
+        state.call_generation += 1;
+        for file in demanded {
+            *state.recent_demand.entry(file.clone()).or_default() += 1;
+        }
+        let traces = std::mem::take(&mut state.prefetch_traces);
+        let mut retained = Vec::new();
+        for mut trace in traces {
+            let positives = trace
+                .samples
+                .iter()
+                .filter(|s| demanded.contains(&s.file))
+                .cloned()
+                .collect::<Vec<_>>();
+            let negatives = trace
+                .samples
+                .iter()
+                .filter(|s| !demanded.contains(&s.file))
+                .cloned()
+                .collect::<Vec<_>>();
+            state.prefetch_model.opportunities += trace.samples.len() as u64;
+            for pos in &positives {
+                if pos.prefetched && !disk_misses.contains(&pos.file) {
+                    state.prefetch_model.useful += 1;
+                    state.metrics.useful += 1;
+                    state.metrics.avoided_disk_reads += 1;
+                }
+                if let Some(neg) = negatives.iter().max_by(|a, b| {
+                    a.probability
+                        .partial_cmp(&b.probability)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }) {
+                    prefetch_update_pair(
+                        &mut state.prefetch_model,
+                        &mut state.prefetch_grad_acc,
+                        &pos.features,
+                        &neg.features,
+                    );
+                }
+            }
+            trace.remaining = trace.remaining.saturating_sub(1);
+            if trace.remaining > 0 {
+                retained.push(trace);
+            } else {
+                state.metrics.wasted_bytes += trace
+                    .samples
+                    .iter()
+                    .filter(|s| s.prefetched && !positives.iter().any(|p| p.file == s.file))
+                    .map(|s| s.bytes)
+                    .sum::<u64>();
+            }
+        }
+        state.prefetch_traces = retained;
+        save_learning_models(root, &state.model, &state.prefetch_model);
+    });
+}
+
 fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> {
     let path = root.join(file);
     let metadata = fs::metadata(&path).ok()?;
@@ -2058,8 +2281,42 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
         }
     }
 
+    let loading = SOURCE_LOADING.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()));
+    {
+        let mut active = loading
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while active.contains(&key) {
+            active = loading
+                .1
+                .wait(active)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if source_cache_contains(root, file) {
+                SOURCE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let cache = SOURCE_CACHE
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                return cache.entries.get(&key).map(|cached| cached.source.clone());
+            }
+        }
+        active.insert(key.clone());
+    }
     SOURCE_DISK_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let text = fs::read_to_string(&path).ok()?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => {
+            let mut active = loading
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active.remove(&key);
+            loading.1.notify_all();
+            return None;
+        }
+    };
     let mut lines: Vec<_> = text.split('\n').map(str::to_string).collect();
     if lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
         lines.pop();
@@ -2076,7 +2333,7 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
     cache.clock = cache.clock.wrapping_add(1);
     let touched = cache.clock;
     cache.entries.insert(
-        key,
+        key.clone(),
         CachedSource {
             source: source.clone(),
             len,
@@ -2095,6 +2352,13 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
         };
         cache.entries.remove(&oldest);
     }
+    drop(cache);
+    let mut active = loading
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    active.remove(&key);
+    loading.1.notify_all();
     Some(source)
 }
 
@@ -4495,6 +4759,16 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             .collect::<Vec<_>>();
         with_learning_state(root, |state| state.pending = pending);
     }
+    let demanded_files = final_candidates
+        .iter()
+        .map(|(file, _)| file.clone())
+        .collect::<HashSet<_>>();
+    let demand_disk_misses = demanded_files
+        .iter()
+        .filter(|file| !source_cache_contains(root, file))
+        .cloned()
+        .collect::<HashSet<_>>();
+    record_prefetch_demand(root, &demanded_files, &demand_disk_misses);
     let mut sources = HashMap::<String, Source>::new();
     for (file, _) in &final_candidates {
         if let Some(source) = source(root, file, index.files.get(file)) {
@@ -5972,72 +6246,153 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     }
     let _ = original_count;
     trace("fast_context.render", render_start);
-    // 方案4（重设计）预测性读取——CPU 分支预测的类比：
-    //   分支预测器 = OnlineEditModel（RankNet 9 特征成对逻辑回归，随 edit feedback 在线更新）
-    //   预测目标   = ranked 中未进入 final_candidates 的文件里 P(edit) 最高的前 3 个
-    //   预取条件   = P(edit) > 0.5；模型不足 5 个 observation 时冷启动休眠
-    //   预取动作   = 预读 source 进入有界进程内 LRU；不改变本次输出
-    //   预测正确   = 下次 fast_context 若命中同文件，经 mtime+len 校验后直接复用
-    //   预测错误   = 一次无害的 fs::read_to_string；LRU 会自然淘汰
-    // NOVA_CTX_PREFETCH=0 关闭（A/B 对照）。
+    // 独立预取模型：预测未来 1–3 次 fast_context 的 demand source miss。
+    // 硬排除已缓存文件，按 expected gain 与 256KB 总预算取 top-3。
     let prefetch_enabled = std::env::var_os("NOVA_CTX_PREFETCH")
         .map(|value| value != "0")
         .unwrap_or(true);
-    if prefetch_enabled {
-        if let Some(model) = &learning_snapshot {
-            // 与排序 blend 同一冷启动门槛；默认权重不应在零反馈时触发预取。
-            if learning_blend(model.observations) > 0.0 {
-                let prefetch_start = Instant::now();
-                let packed_files = final_candidates
-                    .iter()
-                    .map(|(file, _)| file)
-                    .collect::<HashSet<_>>();
-                let mut prefetch_candidates = ranked
-                    .iter()
-                    .filter(|(file, _)| !packed_files.contains(file))
-                    .filter(|(file, _)| is_code_file(file))
-                    .filter(|(file, _)| !noise_path(file))
-                    .map(|(file, heuristic)| {
-                        let probability =
-                            learning_predict(model, &learning_features(file, *heuristic));
-                        (file.clone(), probability)
+    if prefetch_enabled && learning_owner() {
+        let packed_files = final_candidates
+            .iter()
+            .map(|(file, _)| file)
+            .collect::<HashSet<_>>();
+        let current_terms = keywords
+            .iter()
+            .chain(task_terms.iter())
+            .map(|term| term.to_lowercase())
+            .collect::<Vec<_>>();
+        let use_edit_model = std::env::var("NOVA_CTX_PREFETCH_MODEL")
+            .ok()
+            .as_deref()
+            == Some("edit");
+        let (model, edit_model, recent, previous_terms) = with_learning_state(root, |state| {
+            (
+                state.prefetch_model.clone(),
+                state.model.clone(),
+                state.recent_demand.clone(),
+                state.last_query_terms.clone(),
+            )
+        });
+        let query_continuity = if previous_terms.is_empty() || current_terms.is_empty() {
+            0.0
+        } else {
+            let previous = previous_terms.iter().collect::<HashSet<_>>();
+            current_terms
+                .iter()
+                .filter(|term| previous.contains(term))
+                .count() as f64
+                / current_terms.len().max(1) as f64
+        };
+        let precision = model.useful as f64 / model.opportunities.max(1) as f64;
+        let predictor_ready = if use_edit_model {
+            edit_model.observations >= 5
+        } else {
+            model.opportunities < 20 || precision >= 0.2
+        };
+        if predictor_ready {
+            let mut candidates = ranked
+                .iter()
+                .filter(|(file, _)| !packed_files.contains(file))
+                .filter(|(file, _)| is_code_file(file) && !noise_path(file))
+                .filter(|(file, _)| !source_cache_contains(root, file))
+                .filter_map(|(file, heuristic)| {
+                    let bytes = fs::metadata(root.join(file)).ok()?.len();
+                    if bytes == 0 || bytes > PREFETCH_MAX_BYTES {
+                        return None;
+                    }
+                    let base = learning_features(file, *heuristic);
+                    let graph_near = if exact_callers.contains_key(file)
+                        || companion_tests.contains(file)
+                        || coupling_files
+                            .iter()
+                            .any(|(candidate, _)| candidate == file)
+                    {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    let recent_demand =
+                        (recent.get(file).copied().unwrap_or(0) as f64 / 5.0).min(1.0);
+                    let read_cost =
+                        ((bytes as f64).ln_1p() / (PREFETCH_MAX_BYTES as f64).ln_1p()).min(1.0);
+                    let features = [
+                        base[0],
+                        base[1],
+                        base[2],
+                        base[3],
+                        base[4],
+                        base[5],
+                        base[6],
+                        base[7],
+                        base[8],
+                        graph_near,
+                        recent_demand,
+                        query_continuity,
+                        read_cost,
+                        if coupling_files
+                            .iter()
+                            .any(|(candidate, _)| candidate == file)
+                        {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                    ];
+                    let probability = if use_edit_model {
+                        learning_predict(&edit_model, &base)
+                    } else {
+                        prefetch_predict(&model, &features)
+                    };
+                    let expected_gain =
+                        probability * read_cost - (1.0 - probability) * read_cost * 0.35;
+                    (expected_gain > 0.0).then_some(PrefetchSample {
+                        file: file.clone(),
+                        features,
+                        probability,
+                        bytes,
+                        prefetched: false,
                     })
-                    .collect::<Vec<_>>();
-                prefetch_candidates.sort_by(|(_, a), (_, b)| {
-                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|a, b| {
+                (b.probability * b.bytes as f64)
+                    .partial_cmp(&(a.probability * a.bytes as f64))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut selected = Vec::new();
+            let mut selected_bytes = 0u64;
+            for mut sample in candidates {
+                if selected.len() >= PREFETCH_MAX_FILES
+                    || selected_bytes.saturating_add(sample.bytes) > PREFETCH_MAX_BYTES
+                {
+                    continue;
+                }
+                selected_bytes += sample.bytes;
+                sample.prefetched = true;
+                selected.push(sample);
+            }
+            if !selected.is_empty() {
+                with_learning_state(root, |state| {
+                    state.last_query_terms = current_terms;
+                    state.metrics.predicted += selected.len() as u64;
+                    state.prefetch_traces.push(PendingPrefetchTrace {
+                        samples: selected.clone(),
+                        remaining: PREFETCH_WINDOW,
+                    });
                 });
-                prefetch_candidates.truncate(3);
-                let mut prefetched = 0usize;
-                for (file, probability) in &prefetch_candidates {
-                    if *probability <= 0.5 {
-                        continue;
+                let root = root.to_path_buf();
+                let entries = index.files.clone();
+                std::thread::spawn(move || {
+                    let started = Instant::now();
+                    for sample in selected {
+                        let _ = source(&root, &sample.file, entries.get(&sample.file));
                     }
-                    // source() 自身写入进程级有界缓存；这里故意不写本次 sources，
-                    // 保证预测性读取不改变当前 fast_context 的打包与输出。
-                    let disk_before = SOURCE_DISK_READS.load(std::sync::atomic::Ordering::Relaxed);
-                    let hits_before = SOURCE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
-                    if source(root, file, index.files.get(file)).is_some() {
-                        let disk_after =
-                            SOURCE_DISK_READS.load(std::sync::atomic::Ordering::Relaxed);
-                        let hits_after =
-                            SOURCE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
-                        PREFETCH_DISK_READS.fetch_add(
-                            disk_after.saturating_sub(disk_before),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        PREFETCH_CACHE_HITS.fetch_add(
-                            hits_after.saturating_sub(hits_before),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        prefetched += 1;
-                        if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
-                            eprintln!("[ctx] prefetch {file} P(edit)={probability:.3}");
-                        }
-                    }
-                }
-                if prefetched > 0 {
-                    trace("fast_context.prefetch", prefetch_start);
-                }
+                    let elapsed = started.elapsed().as_millis() as u64;
+                    with_learning_state(&root, |state| {
+                        state.metrics.blocking_ms += elapsed;
+                        state.metrics.latencies_ms.push(elapsed);
+                    });
+                });
             }
         }
     }

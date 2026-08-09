@@ -21,7 +21,9 @@ const runner=`
 import { callNapiTool } from ${JSON.stringify(join(REPO,'scripts/nova-napi-tools.mjs'))};
 const calls=JSON.parse(process.env.CALLS);let elapsed=[];
 for(const args of calls){const s=Date.now();await callNapiTool('fast_context',${JSON.stringify(REPO)},args).catch(()=>{});elapsed.push(Date.now()-s)}
-console.log(JSON.stringify({elapsed,total:elapsed.reduce((a,b)=>a+b,0)}));
+await new Promise(resolve=>setTimeout(resolve,100));
+const metrics=await callNapiTool('prefetch_metrics',${JSON.stringify(REPO)}).catch(()=>null);
+console.log(JSON.stringify({elapsed,total:elapsed.reduce((a,b)=>a+b,0),metrics}));
 `;
 function arm(name,prefetch){return new Promise((resolveArm)=>{const dir=join(tmpdir(),`ctx-prefetch-ab-${process.pid}-${name}`);mkdirSync(dir,{recursive:true});
  // Copy trained model files so both arms use identical OnlineEditModel.

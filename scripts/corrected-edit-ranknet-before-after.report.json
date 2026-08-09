@@ -1,0 +1,151 @@
+{
+  "ranAt": "2026-08-09T11:24:14.338Z",
+  "direction": "corrected-add",
+  "trainPairs": 16,
+  "holdoutCalls": 24,
+  "trainSessions": [
+    "3a8c0711-2a81-409e-9d43-f849fd11b2de.slim.json",
+    "da76f639-644d-471c-85dc-a0b2f55ae929.slim.json",
+    "89c4070e-ddee-4ec1-8654-decc7e9af07d.slim.json",
+    "60123777-76d9-4124-a601-773d9b618065.slim.json",
+    "8782b561-a24c-48c3-9d6f-bf9d2f76caef.slim.json",
+    "lyra-18c9dd1d97f673c4-175416.slim.json",
+    "lyra-18c9f730b17de1dd-18c669.slim.json",
+    "4f25d8fa-5037-4cad-a02e-7e0b31b20f25.slim.json",
+    "lyra-18c9fe0be06c1f41-1a9672.slim.json",
+    "lyra-18ca0c1d97983461-1b101b.slim.json",
+    "lyra-18ca0c46c864a313-1b101b.slim.json",
+    "lyra-18ca13c4bfe50bbd-1b101b.slim.json",
+    "lyra-18ca1a2c786512fc-1da98c.slim.json"
+  ],
+  "holdoutSessions": [
+    "lyra-18c9fe0be06c1f41-1a9672.slim.json",
+    "lyra-18ca0c1d97983461-1b101b.slim.json",
+    "lyra-18ca0c46c864a313-1b101b.slim.json",
+    "lyra-18ca13c4bfe50bbd-1b101b.slim.json",
+    "lyra-18ca1a2c786512fc-1da98c.slim.json",
+    "lyra-18ca0847e1e9133a-1b101b.slim.json",
+    "lyra-18ca103e882f3cd8-1b101b.slim.json"
+  ],
+  "beforeModel": {
+    "version": 3,
+    "weights": [
+      1.2,
+      1,
+      1.2,
+      0.7,
+      0.8,
+      0.4,
+      0.2,
+      0.5,
+      0.6
+    ],
+    "bias": -2,
+    "observations": 0,
+    "positives": 0
+  },
+  "afterModel": {
+    "version": 3,
+    "weights": [
+      0.8756220469959615,
+      1.1049960986727083,
+      1.2355597198076502,
+      0.5875451491927257,
+      0.615949981543872,
+      0.2170809993566045,
+      0.002731156962505853,
+      0.23458591343044063,
+      0.4111733168687982
+    ],
+    "bias": -2,
+    "observations": 28,
+    "positives": 28
+  },
+  "training": {
+    "name": "corrected-train",
+    "code": 0,
+    "elapsed": [],
+    "totalMs": 0,
+    "stderr": ""
+  },
+  "before": {
+    "name": "before-training",
+    "code": 0,
+    "elapsed": [
+      1295,
+      672,
+      1360,
+      739,
+      494,
+      699,
+      561,
+      859,
+      731,
+      1003,
+      305,
+      513,
+      536,
+      544,
+      487,
+      516,
+      543,
+      52,
+      826,
+      641,
+      255,
+      369,
+      883,
+      1497
+    ],
+    "totalMs": 16380,
+    "stderr": ""
+  },
+  "after": {
+    "name": "after-corrected-training",
+    "code": 0,
+    "elapsed": [
+      1374,
+      622,
+      1349,
+      907,
+      478,
+      575,
+      652,
+      758,
+      691,
+      1034,
+      273,
+      534,
+      473,
+      492,
+      484,
+      470,
+      535,
+      44,
+      900,
+      653,
+      288,
+      292,
+      917,
+      1383
+    ],
+    "totalMs": 16178,
+    "stderr": ""
+  },
+  "delta": {
+    "totalMs": -202,
+    "totalPct": -1.2332112332112333,
+    "weightDelta": [
+      -0.3243779530040385,
+      0.10499609867270832,
+      0.03555971980765027,
+      -0.11245485080727424,
+      -0.184050018456128,
+      -0.18291900064339553,
+      -0.19726884303749415,
+      -0.26541408656955934,
+      -0.18882668313120177
+    ],
+    "biasDelta": 0
+  }
+}

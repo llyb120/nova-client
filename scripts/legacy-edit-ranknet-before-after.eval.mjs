@@ -1,0 +1,23 @@
+#!/usr/bin/env node
+// Compare legacy (subtract) OnlineEditModel before/after real edit-feedback training.
+import { spawn } from 'node:child_process';
+import { existsSync,mkdirSync,readFileSync,readdirSync,rmSync,statSync,writeFileSync,cpSync } from 'node:fs';
+import { homedir,tmpdir } from 'node:os';import { basename,join,resolve } from 'node:path';
+const REPO=resolve(import.meta.dirname,'..'), SESSION=join(homedir(),'.nova','alkaid','sessions'), CURRENT=join(homedir(),'.nova','alkaid','context-learning'), NAPI=join(REPO,'src-tauri/resources/nova-tools-napi.node'), RUN=join(tmpdir(),`legacy-edit-ab-${process.pid}`), REPORT=join(REPO,'scripts/legacy-edit-ranknet-before-after.report.json');
+const modelName=readdirSync(CURRENT).find(x=>x.endsWith('.json'));if(!modelName)throw Error('no model name');
+function sessions(){return readdirSync(SESSION).filter(x=>x.endsWith('.slim.json')).map(x=>join(SESSION,x)).sort((a,b)=>statSync(a).mtimeMs-statSync(b).mtimeMs)}
+function rel(raw){if(!raw)return null;let s=String(raw).replaceAll('\\','/');if(!s.startsWith('/'))return s;let m='/nova-client/',i=s.indexOf(m);return i>=0?s.slice(i+m.length):null}
+const traces=[],holdout=[];for(const p of sessions()){let d;try{d=JSON.parse(readFileSync(p,'utf8'))}catch{continue}let pending=null;for(const msg of d.fullMessages??[])for(const part of msg.content??[]){if(part?.type!=='toolCall')continue;if(part.name==='fast_context'){pending=part.arguments??{};holdout.push({session:basename(p),args:pending})}else if(part.name==='edit'&&pending){const path=rel(part.arguments?.path);if(path&&existsSync(join(REPO,path)))traces.push({session:basename(p),context:pending,edit:path});pending=null}}}
+const train=traces.slice(-30), test=holdout.slice(-24);
+const runner=`import {callNapiTool} from ${JSON.stringify(join(REPO,'scripts/nova-napi-tools.mjs'))};const mode=process.env.MODE,data=JSON.parse(process.env.DATA);let elapsed=[];if(mode==='train'){for(const row of data){await callNapiTool('fast_context',${JSON.stringify(REPO)},row.context).catch(()=>{});await callNapiTool('observe_context_feedback',${JSON.stringify(REPO)},{action:'edit',path:row.edit}).catch(()=>{})}await callNapiTool('observe_context_feedback',${JSON.stringify(REPO)},{action:'settle'}).catch(()=>{});}else{for(const row of data){let s=Date.now();await callNapiTool('fast_context',${JSON.stringify(REPO)},row.args).catch(()=>{});elapsed.push(Date.now()-s)}}console.log(JSON.stringify({elapsed,totalMs:elapsed.reduce((a,b)=>a+b,0)}));`;
+function run(name,dir,mode,data){return new Promise(res=>{let env={...process.env,NOVA_TOOLS_NAPI_PATH:NAPI,NOVA_CONTEXT_LEARNING:'1',NOVA_CONTEXT_LEARNING_OWNER:'1',NOVA_CONTEXT_LEARNING_DIR:dir,NOVA_CONTEXT_EDIT_RANKNET_DIRECTION:'legacy',NOVA_CTX_PREFETCH:'0',MODE:mode,DATA:JSON.stringify(data)};let p=spawn(process.execPath,['--input-type=module','-e',runner],{cwd:REPO,env,stdio:['ignore','pipe','pipe']}),o='',e='';p.stdout.on('data',d=>o+=d);p.stderr.on('data',d=>e+=d);p.on('close',code=>{let r={};try{r=JSON.parse(o.trim().split('\n').at(-1))}catch{}res({name,code,...r,stderr:e.slice(-500)})})})}
+rmSync(RUN,{recursive:true,force:true});mkdirSync(RUN,{recursive:true});
+const defaultModel={version:3,weights:[1.2,1,1.2,.7,.8,.4,.2,.5,.6],bias:-2,observations:0,positives:0};
+const before=join(RUN,'before');mkdirSync(before);writeFileSync(join(before,modelName),JSON.stringify(defaultModel));
+const after=join(RUN,'after');mkdirSync(after);writeFileSync(join(after,modelName),JSON.stringify(defaultModel));
+const training=await run('legacy-train',after,'train',train);
+const beforeEval=await run('before-training',before,'eval',test),afterEval=await run('after-legacy-training',after,'eval',test);
+const beforeFile=JSON.parse(readFileSync(join(before,modelName),'utf8')),beforeModel=beforeFile.edit??beforeFile;
+const afterFile=JSON.parse(readFileSync(join(after,modelName),'utf8')),afterModel=afterFile.edit??afterFile;
+const report={ranAt:new Date().toISOString(),direction:'legacy-subtract',trainPairs:train.length,holdoutCalls:test.length,trainSessions:[...new Set(train.map(x=>x.session))],holdoutSessions:[...new Set(test.map(x=>x.session))],beforeModel,afterModel,training,before:beforeEval,after:afterEval,delta:{totalMs:(afterEval.totalMs??0)-(beforeEval.totalMs??0),totalPct:beforeEval.totalMs?((afterEval.totalMs-beforeEval.totalMs)/beforeEval.totalMs*100):null,weightDelta:afterModel.weights.map((v,i)=>v-beforeModel.weights[i]),biasDelta:afterModel.bias-beforeModel.bias}};
+writeFileSync(REPORT,JSON.stringify(report,null,2));console.log(JSON.stringify({report,...report},null,2));rmSync(RUN,{recursive:true,force:true});

@@ -3,32 +3,32 @@
 - 模型：`opencode/deepseek-v4-flash`
 - 分支：`feat/fast-context-online-learning-ab`
 - 执行方式：16 个 DeepSeek 会话并行（每个 case 的 A/B 同时启动）
-- 并行评测端到端实际耗时：61044ms（汇总 wallMs 是各会话耗时之和）
-- 训练回放：10 个最近真实会话，32 次 fast_context，24 个 edit 正反馈
+- 并行评测端到端实际耗时：53490ms（汇总 wallMs 是各会话耗时之和）
+- 训练回放：10 个最近真实会话，32 次 fast_context，25 个 edit 正反馈
 - 训练后模型：observations=0, positives=0
 
 ## 汇总
 
 | 指标 | A 关闭学习 | B 在线模型 | B-A |
 |---|---:|---:|---:|
-| wallMs | 362609 | 415129 | 52520 |
-| inputTokens | 45023 | 44246 | -777 |
-| outputTokens | 18953 | 23812 | 4859 |
-| cacheReadTokens | 40320 | 40448 | 128 |
-| totalTokens | 104296 | 108506 | 4210 |
+| wallMs | 359238 | 377483 | 18245 |
+| inputTokens | 45637 | 47120 | 1483 |
+| outputTokens | 19605 | 21231 | 1626 |
+| cacheReadTokens | 40448 | 40576 | 128 |
+| totalTokens | 105690 | 108927 | 3237 |
 | toolCalls | 8 | 8 | 0 |
 | fastContextCalls | 8 | 8 | 0 |
 | readCalls | 0 | 0 | 0 |
 | bashCalls | 0 | 0 | 0 |
-| toolTimeMs | 50174 | 51852 | 1678 |
+| toolTimeMs | 51674 | 52929 | 1255 |
 
 ## 结论与解读
 
-- 总 token：4.0%（104296 → 108506）。
-- 输入 token：-1.7%；输出 token：25.6%。
-- 各会话 wall time 求和：14.5%；6 路并行端到端为 61044ms。
+- 总 token：3.1%（105690 → 108927）。
+- 输入 token：3.2%；输出 token：8.3%。
+- 各会话 wall time 求和：5.1%；6 路并行端到端为 53490ms。
 - 工具调用数保持 8 → 8，read 保持 0 → 0；本组聚焦回放主要验证上下文内容/排序，而不是工具调用策略。
-- fast_context 自身工具耗时增加 1678ms（3.3%），绝对值仅 51852ms，主要总耗时仍来自模型推理。
+- fast_context 自身工具耗时增加 1255ms（2.4%），绝对值仅 52929ms，主要总耗时仍来自模型推理。
 - 三个 case 的 token 均下降，但这是每个 arm 单次采样；DeepSeek 输出有随机性，因此当前结果可作为正向信号，不能视为统计显著结论。上线前建议固定模型参数后至少重复 5 轮。
 
 ## 分案例
@@ -39,8 +39,8 @@
 
 | Arm | Tokens | Input | Output | 工具调用 | fast_context | read | 工具耗时 | 实际耗时 | 序列 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 12636 | 4770 | 2874 | 1 | 1 | 0 | 6056ms | 54058ms | fast_context |
-| B | 13301 | 4789 | 3520 | 1 | 1 | 0 | 5547ms | 57882ms | fast_context |
+| A | 12769 | 4787 | 2990 | 1 | 1 | 0 | 5433ms | 49833ms | fast_context |
+| B | 12776 | 4733 | 3051 | 1 | 1 | 0 | 4465ms | 48302ms | fast_context |
 
 ### R2（来源：`6097d0a6-916d-48ad-ac16-b68c320116d6.slim.json`）
 
@@ -48,8 +48,8 @@
 
 | Arm | Tokens | Input | Output | 工具调用 | fast_context | read | 工具耗时 | 实际耗时 | 序列 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 12012 | 5040 | 1980 | 1 | 1 | 0 | 2304ms | 36011ms | fast_context |
-| B | 12188 | 4731 | 2465 | 1 | 1 | 0 | 5717ms | 45792ms | fast_context |
+| A | 12052 | 5038 | 2022 | 1 | 1 | 0 | 4845ms | 39481ms | fast_context |
+| B | 12964 | 4938 | 2906 | 1 | 1 | 0 | 4944ms | 50234ms | fast_context |
 
 ### R3（来源：`09774430-c287-4f78-bfc0-bfc9116cd4e7.slim.json`）
 
@@ -57,8 +57,8 @@
 
 | Arm | Tokens | Input | Output | 工具调用 | fast_context | read | 工具耗时 | 实际耗时 | 序列 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 16625 | 8559 | 3074 | 1 | 1 | 0 | 5846ms | 54038ms | fast_context |
-| B | 16147 | 8539 | 2616 | 1 | 1 | 0 | 5919ms | 48575ms | fast_context |
+| A | 17017 | 8461 | 3436 | 1 | 1 | 0 | 5895ms | 52148ms | fast_context |
+| B | 17155 | 8571 | 3464 | 1 | 1 | 0 | 6438ms | 51834ms | fast_context |
 
 ### R4（来源：`bd12ca61-0c21-46f3-ad2d-cf85194a7a05.slim.json`）
 
@@ -66,8 +66,8 @@
 
 | Arm | Tokens | Input | Output | 工具调用 | fast_context | read | 工具耗时 | 实际耗时 | 序列 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 14121 | 6378 | 2751 | 1 | 1 | 0 | 8321ms | 50030ms | fast_context |
-| B | 14481 | 6392 | 3097 | 1 | 1 | 0 | 6786ms | 54439ms | fast_context |
+| A | 14061 | 6377 | 2692 | 1 | 1 | 0 | 7769ms | 46229ms | fast_context |
+| B | 14474 | 6383 | 3099 | 1 | 1 | 0 | 9117ms | 53388ms | fast_context |
 
 ### R5（来源：`84cfea80-586d-499f-802b-6d2bd8623476.slim.json`）
 
@@ -75,8 +75,8 @@
 
 | Arm | Tokens | Input | Output | 工具调用 | fast_context | read | 工具耗时 | 实际耗时 | 序列 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 11252 | 3651 | 2481 | 1 | 1 | 0 | 7050ms | 49913ms | fast_context |
-| B | 11873 | 3714 | 3039 | 1 | 1 | 0 | 7126ms | 53311ms | fast_context |
+| A | 13047 | 5278 | 2777 | 1 | 1 | 0 | 6242ms | 49815ms | fast_context |
+| B | 12894 | 5678 | 2224 | 1 | 1 | 0 | 6694ms | 45773ms | fast_context |
 
 ### R6（来源：`60123777-76d9-4124-a601-773d9b618065.slim.json`）
 
@@ -84,8 +84,8 @@
 
 | Arm | Tokens | Input | Output | 工具调用 | fast_context | read | 工具耗时 | 实际耗时 | 序列 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 13063 | 6129 | 1814 | 1 | 1 | 0 | 5355ms | 36429ms | fast_context |
-| B | 14774 | 5647 | 4007 | 1 | 1 | 0 | 5981ms | 60892ms | fast_context |
+| A | 11808 | 4956 | 1732 | 1 | 1 | 0 | 6257ms | 37327ms | fast_context |
+| B | 13430 | 6569 | 1741 | 1 | 1 | 0 | 6687ms | 37617ms | fast_context |
 
 ### R7（来源：`bf15e349-390e-4184-a014-dec30badb709.slim.json`）
 
@@ -93,8 +93,8 @@
 
 | Arm | Tokens | Input | Output | 工具调用 | fast_context | read | 工具耗时 | 实际耗时 | 序列 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 14995 | 7936 | 2067 | 1 | 1 | 0 | 7229ms | 43102ms | fast_context |
-| B | 15433 | 7889 | 2424 | 1 | 1 | 0 | 6876ms | 46472ms | fast_context |
+| A | 15635 | 8216 | 2299 | 1 | 1 | 0 | 7177ms | 44726ms | fast_context |
+| B | 15196 | 7750 | 2326 | 1 | 1 | 0 | 7311ms | 44512ms | fast_context |
 
 ### R8（来源：`da76f639-644d-471c-85dc-a0b2f55ae929.slim.json`）
 
@@ -102,8 +102,8 @@
 
 | Arm | Tokens | Input | Output | 工具调用 | fast_context | read | 工具耗时 | 实际耗时 | 序列 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 9592 | 2560 | 1912 | 1 | 1 | 0 | 8013ms | 39028ms | fast_context |
-| B | 10309 | 2545 | 2644 | 1 | 1 | 0 | 7900ms | 47766ms | fast_context |
+| A | 9301 | 2524 | 1657 | 1 | 1 | 0 | 8056ms | 39679ms | fast_context |
+| B | 10038 | 2498 | 2420 | 1 | 1 | 0 | 7273ms | 45823ms | fast_context |
 
 ## 说明
 
