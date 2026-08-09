@@ -24,20 +24,47 @@ pub(crate) fn estimate_text_tokens(text: &str) -> u64 {
     ascii.div_ceil(4).saturating_add(non_ascii)
 }
 
-fn estimate_request_tokens(system_prompt: &str, messages: &[Value], tools: &[Tool]) -> u64 {
+const ESTIMATED_IMAGE_TOKENS: u64 = 1_024;
+
+fn estimate_value_tokens(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => estimate_text_tokens(text),
+        Value::Array(values) => values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(estimate_value_tokens(value))
+        }),
+        Value::Object(map) => {
+            // 图片 data 是 base64 传输编码，不是 provider 按文本 tokenizer 计费的提示词。
+            if map.get("type").and_then(Value::as_str) == Some("image") {
+                return ESTIMATED_IMAGE_TOKENS;
+            }
+            map.iter().fold(0_u64, |total, (key, value)| {
+                if key == "timestamp" || key == "usage" {
+                    total
+                } else {
+                    total.saturating_add(estimate_value_tokens(value))
+                }
+            })
+        }
+        _ => 0,
+    }
+}
+
+fn estimate_request_tokens(
+    system_prompt: &str,
+    messages: &[Value],
+    tools: &[Tool],
+    context_window: u64,
+) -> u64 {
     let mut tokens = estimate_text_tokens(system_prompt);
-    tokens = tokens.saturating_add(estimate_text_tokens(
-        &serde_json::to_string(messages).unwrap_or_default(),
-    ));
+    tokens = tokens.saturating_add(estimate_value_tokens(&Value::Array(messages.to_vec())));
     for tool in tools {
         tokens = tokens
             .saturating_add(estimate_text_tokens(tool.name))
             .saturating_add(estimate_text_tokens(&tool.description))
-            .saturating_add(estimate_text_tokens(
-                &serde_json::to_string(&tool.parameters).unwrap_or_default(),
-            ));
+            .saturating_add(estimate_value_tokens(&tool.parameters));
     }
-    tokens
+    // 即时值只是 UI 估算，不允许超过模型上下文上限；最终仍由 provider usage 校正。
+    tokens.min(context_window.max(1))
 }
 
 #[derive(Debug)]
@@ -283,8 +310,12 @@ impl Agent {
                 outcome.stop_reason = "aborted".into();
                 return Ok(outcome);
             }
-            let input_estimate =
-                estimate_request_tokens(&self.system_prompt, &self.messages, &self.tools);
+            let input_estimate = estimate_request_tokens(
+                &self.system_prompt,
+                &self.messages,
+                &self.tools,
+                self.model.model.context_window,
+            );
             on_event(AgentEvent::MessageStart { input_estimate });
             // 投机缓存按消息重置：序号是消息内的，上一轮未命中的句柄中止。
             {
@@ -602,5 +633,31 @@ mod tests {
         assert_eq!(object["path"], "src/lib.rs");
         let array = salvage_json(r#"{"names":["Agent""#).unwrap();
         assert_eq!(array["names"][0], "Agent");
+    }
+
+    #[test]
+    fn request_estimate_does_not_tokenize_image_base64() {
+        let small = vec![user_message(
+            "看图",
+            &[json!({
+                "type": "image", "mimeType": "image/png", "data": "AAAA"
+            })],
+        )];
+        let huge = vec![user_message(
+            "看图",
+            &[json!({
+                "type": "image", "mimeType": "image/png", "data": "A".repeat(8_000_000)
+            })],
+        )];
+        let small_tokens = estimate_request_tokens("system", &small, &[], 128_000);
+        let huge_tokens = estimate_request_tokens("system", &huge, &[], 128_000);
+        assert_eq!(small_tokens, huge_tokens);
+        assert!(huge_tokens < 2_000, "unexpected estimate: {huge_tokens}");
+    }
+
+    #[test]
+    fn request_estimate_is_capped_to_context_window() {
+        let messages = vec![user_message(&"内容".repeat(10_000), &[])];
+        assert_eq!(estimate_request_tokens("", &messages, &[], 4_096), 4_096);
     }
 }

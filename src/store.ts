@@ -1615,10 +1615,15 @@ function parseStageInput(input: string): StageInput | null {
 
 async function startStageThread(sourceThreadId: string, prompt: string): Promise<void> {
   const thread = await api.createStageThread(sourceThreadId);
+  const ownTitle = prompt.split(/\r?\n/, 1)[0].trim().slice(0, 40) || "Stage";
+  await api.renameThread(thread.id, ownTitle);
+  thread.title = ownTitle;
   rememberThreadSnapshot(thread);
   await refreshThreads();
   await openThread(thread.id);
   setState("running", thread.id, true);
+  // Stage 使用自己的任务生成标题，不沿用来源会话名；失败时保留上面的提示词兜底标题。
+  void api.generateThreadTitle(thread.id, prompt.slice(0, 1200)).catch(() => {});
   try {
     await api.sendPrompt(thread.id, prompt);
   } catch (error) {

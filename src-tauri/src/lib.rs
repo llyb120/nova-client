@@ -844,6 +844,7 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
             employee_id: t.employee_id.clone(),
             mind_thread: t.mind_thread,
             parent_thread_id: t.parent_thread_id.clone(),
+            stage_source_thread_id: t.stage_source_thread_id.clone(),
             active_clue_card_id: t.active_clue_card_id.clone(),
         })
         .collect();

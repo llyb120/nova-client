@@ -128,6 +128,8 @@ export interface ThreadMeta {
   mindThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
+  /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
+  stageSourceThreadId?: string | null;
   /** 当前会话在证据链中的线索位置 */
   activeClueCardId?: string | null;
 }

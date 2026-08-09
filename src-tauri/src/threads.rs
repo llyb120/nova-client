@@ -887,6 +887,9 @@ pub struct ThreadMeta {
     /// 会话树父节点：用于把预检会话与后续开发会话关联展示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
+    /// 普通 /stage 引用的源会话；前端据此区别工作流事件链。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_source_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_clue_card_id: Option<String>,
 }

@@ -533,19 +533,26 @@ export function ChatView() {
     setTokensRolling(false);
   };
   createEffect(() => {
-    const target = totalTokens();
-    const from = untrack(shownTokens);
+    // 用量来自多个异步来源（实时估算、provider 校正、Turn 落库接替）。
+    // 任一来源切换都不应让计数器进入负区间；同时防御异常的非有限值。
+    const rawTarget = totalTokens();
+    const target = Number.isFinite(rawTarget) ? Math.max(0, Math.round(rawTarget)) : 0;
+    const current = untrack(shownTokens);
+    const from = Number.isFinite(current) ? Math.max(0, current) : 0;
     if (from === target) return;
     stopTokenRoll();
     setTokensRolling(true);
     // 变化越大滚动越久，设上限避免世界线大跨度切换时数字跑太久。
     const duration = Math.min(1200, 350 + Math.abs(target - from) / 20);
     const start = performance.now();
+    const lower = Math.max(0, Math.min(from, target));
+    const upper = Math.max(from, target);
     const step = (now: number) => {
-      const progress = Math.min(1, (now - start) / duration);
-      // easeOutCubic：前快后慢，像计数器缓缓停到最终值。
+      const progress = Math.min(1, Math.max(0, (now - start) / duration));
+      // easeOutCubic：前快后慢；钳制到起止区间，避免异步目标切换时出现负数或过冲。
       const eased = 1 - Math.pow(1 - progress, 3);
-      setShownTokens(Math.round(from + (target - from) * eased));
+      const next = Math.round(from + (target - from) * eased);
+      setShownTokens(Math.max(lower, Math.min(upper, next)));
       if (progress < 1) {
         tokenRollFrame = requestAnimationFrame(step);
       } else {
@@ -719,9 +726,11 @@ export function ChatView() {
     const fireStage = thread.title.match(/^\[Fire\]\s*阶段\s+(\d+)/);
     if (fireStage) return `阶段 ${fireStage[1]}`;
     if (/^\[Fire\]/.test(thread.title)) return "目标";
+    // 普通 /stage 会话显示自己的会话名，不再显示泛化的「事件」。
+    if (thread.stageSourceThreadId) return thread.title.replace(/^\[Stage\]\s*/, "").trim() || "Stage";
     // 工作流链的起点会话（用户输入目标的会话）显示为「目标」。
     if (!thread.parentThreadId && stageThreads().some((t) => isStageTitle(t.title))) return "目标";
-    return "事件";
+    return thread.title || "会话";
   };
   const jumpToStage = async (threadId: string) => {
     // 每个 stage 都是独立会话；切换 stage 只切换会话，不再拼接 transcript。
