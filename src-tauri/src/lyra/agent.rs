@@ -90,6 +90,9 @@ pub struct Agent {
     pub steering: Arc<Mutex<VecDeque<Value>>>,
     /// 投机缓存：本条消息内工具调用序号 → 预执行句柄（每条消息流开始前清空）。
     pub spec_cache: Arc<Mutex<HashMap<usize, Speculative>>>,
+    /// 中断轨迹增量落盘钩子：每条消息入列后以完整消息数组回调（对齐 PI 的
+    /// message_end 增量持久化），任务被强杀/崩溃时磁盘上仍有截至中断点的轨迹。
+    pub checkpoint: Option<Box<dyn FnMut(&[Value]) + Send>>,
 }
 
 fn now_ms() -> u64 {
@@ -180,6 +183,9 @@ fn maybe_speculate(spec: &SpecContext, index: usize, name: &str, fragment: &str)
             shell.as_ref(),
             archive_dir.as_deref(),
             &call_id,
+            // 投机句柄随缓存失效显式中止，不随会话取消标志提前退出：
+            // 无副作用只读工具，跑完即可供命中。
+            None,
         )
         .await
     });
@@ -216,6 +222,13 @@ pub fn user_message(text: &str, images: &[Value]) -> Value {
 }
 
 impl Agent {
+    /// 每条消息入列后回调中断轨迹钩子（字段级拆分借用，避免与回调冲突）。
+    fn checkpoint_now(&mut self) {
+        if let Some(checkpoint) = self.checkpoint.as_mut() {
+            checkpoint(&self.messages);
+        }
+    }
+
     fn drain_steering(&mut self) {
         let queued: Vec<Value> = self.steering.lock().unwrap().drain(..).collect();
         self.messages.extend(queued);
@@ -235,6 +248,7 @@ impl Agent {
         M: FnMut(&mut Vec<Value>, &Value) + Send,
     {
         self.messages.push(user_message(text, &images));
+        self.checkpoint_now();
         self.run_loop(http, on_event, mid_turn).await
     }
 
@@ -329,6 +343,7 @@ impl Agent {
                         "errorMessage": error,
                         "timestamp": now_ms(),
                     }));
+                    self.checkpoint_now();
                     return Ok(outcome);
                 }
             };
@@ -344,6 +359,7 @@ impl Agent {
                 "timestamp": now_ms(),
             });
             self.messages.push(assistant);
+            self.checkpoint_now();
             on_event(AgentEvent::MessageEnd {
                 usage: result.usage.clone(),
             });
@@ -383,12 +399,16 @@ impl Agent {
                         "stopReason": "stop",
                         "timestamp": now_ms(),
                     }));
+                    self.checkpoint_now();
                 }
                 // Reasonix：每个模型/工具回合后、下一次 provider 请求前维护上下文。
                 mid_turn(&mut self.messages, &message);
+                // 中途压缩/rebase 改写了消息，同步一次中断轨迹。
+                self.checkpoint_now();
             }
             // steeringMode=all：工具结果后、最终回复后都把排队提示注入下一轮。
             self.drain_steering();
+            self.checkpoint_now();
             let has_more_work = !self.messages.is_empty()
                 && self
                     .messages
@@ -458,6 +478,35 @@ impl Agent {
                 args,
             });
         }
+        // 取消在准备阶段到达（模型回合顶检查之后、执行之前）：不启动任何执行，
+        // 给每个 toolCall 补取消占位 toolResult，保持 assistant toolCall ↔ toolResult
+        // 配对完整（provider 校验要求；中断轨迹随后由轮末 pendingMessages 保存）。
+        if self.cancelled.load(Ordering::SeqCst) {
+            {
+                let mut cache = self.spec_cache.lock().unwrap();
+                for (_, entry) in cache.drain() {
+                    entry.handle.abort();
+                }
+            }
+            for call in prepared {
+                let result_message = json!({
+                    "role": "toolResult",
+                    "toolCallId": call.id,
+                    "toolName": call.name,
+                    "content": [{ "type": "text", "text": "已取消" }],
+                    "details": Value::Null,
+                    "isError": true,
+                    "timestamp": now_ms(),
+                });
+                on_event(AgentEvent::ToolEnd {
+                    id: call.id.clone(),
+                    outcome: result_message.clone(),
+                });
+                self.messages.push(result_message);
+                self.checkpoint_now();
+            }
+            return Vec::new();
+        }
         // 收取本轮投机缓存：参数严格相等才命中，未命中与残留句柄一律中止。
         let mut speculated: Vec<Option<Speculative>> = Vec::new();
         {
@@ -498,6 +547,7 @@ impl Agent {
                             self.shell.as_ref(),
                             self.archive_dir.as_deref(),
                             &call.id,
+                            Some(&self.cancelled),
                         ))
                     }
                     None => Box::pin(execute(
@@ -507,6 +557,7 @@ impl Agent {
                         self.shell.as_ref(),
                         self.archive_dir.as_deref(),
                         &call.id,
+                        Some(&self.cancelled),
                     )),
                 }
             })
@@ -535,6 +586,7 @@ impl Agent {
                 outcome: result_message.clone(),
             });
             self.messages.push(result_message);
+            self.checkpoint_now();
         }
         notes
     }

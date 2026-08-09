@@ -290,6 +290,37 @@ fn slim_path(root: &Path, session_id: &str) -> PathBuf {
     root.join(format!("{session_id}.slim.json"))
 }
 
+fn pending_checkpoint_path(root: &Path, session_id: &str) -> PathBuf {
+    root.join(format!("{session_id}.pending.json"))
+}
+
+/// 中断轨迹增量落盘：每条消息后全量原子重写（temp+rename），任务被强杀也不留半截文件。
+/// 对齐 PI 的 message_end 增量持久化；轮末正式保存 slim 后由 clear_pending_checkpoint 清除。
+pub fn write_pending_checkpoint(
+    root: &Path,
+    session_id: &str,
+    messages: &[Value],
+) -> Result<(), String> {
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let path = pending_checkpoint_path(root, session_id);
+    let temp = path.with_extension("pending.tmp");
+    std::fs::write(&temp, serde_json::to_string(messages).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(&temp, &path).map_err(|e| e.to_string())
+}
+
+/// 轮末写盘没机会执行（强杀/panic/退出）时，checkpoint 保留了截至中断点的完整轨迹。
+pub fn load_pending_checkpoint(root: &Path, session_id: &str) -> Option<Vec<Value>> {
+    std::fs::read_to_string(pending_checkpoint_path(root, session_id))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<Value>>(&text).ok())
+        .filter(|messages| !messages.is_empty())
+}
+
+pub fn clear_pending_checkpoint(root: &Path, session_id: &str) {
+    let _ = std::fs::remove_file(pending_checkpoint_path(root, session_id));
+}
+
 pub fn messages_path(root: &Path, session_id: &str) -> PathBuf {
     root.join(format!("{session_id}.json"))
 }

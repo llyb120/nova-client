@@ -10,6 +10,8 @@ use crate::lyra::prompt::{
 use crate::lyra::{edit as native_edit, read as native_read};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const FAST_CONTEXT_DESCRIPTION: &str = "任务涉及跨文件查找或修改（含分析要改哪里）、或需要阅读多个文件正文来理解/规划改动时，先调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单，一次调用通常替代 5–10 轮 rg+read 往返，比自行 rg/grep 往返更省 token。目标路径和行段都已明确且只需少量行段时直接 read；只需符号的定义/引用行号时用 find_symbols；已定位但仍需阅读正文的多个文件，通过 files 传入一次打包，不要逐个 read。默认只传 keywords/task/files；任务里点名了某个工具/符号（如要改某个函数）时也不要用 find_symbols 代替本工具——find_symbols 只给行号不给正文；调用后不要再用 rg/git grep 重复检索同一批关键词，已展示范围视为已读。返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要直接退回 rg/grep 逐个搜索。";
 
@@ -308,6 +310,7 @@ async fn run_bash(
     shell: &crate::lyra::prompt::ShellConfig,
     command: &str,
     timeout_secs: u64,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
     use crate::lyra::prompt::ShellKind;
     let timeout_secs = timeout_secs.clamp(1, 600);
@@ -363,15 +366,42 @@ async fn run_bash(
         }
         buf
     });
-    let timed_out = match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        child.wait(),
-    )
-    .await
-    {
-        Ok(result) => {
+    enum Wait {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Cancelled,
+    }
+    // PI 语义：取消信号穿透到工具，bash 轮询取消标志，命中即强杀整棵进程树。
+    let wait = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        loop {
+            tokio::select! {
+                result = child.wait() => break Wait::Exited(result),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    if cancelled
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                    {
+                        break Wait::Cancelled;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    let status = match wait {
+        Ok(Wait::Exited(result)) => {
             guard.disarm();
             result.map_err(|e| format!("执行命令失败：{e}"))?
+        }
+        Ok(Wait::Cancelled) => {
+            // 与超时一致的清理：显式强杀整棵进程树（含孙进程）并回收，管道随之 EOF。
+            if let Some(pid) = guard.0.take() {
+                crate::acp::kill_process_tree(pid);
+            }
+            let _ = child.wait().await;
+            return Err(cancel_message(
+                &read_out.await.unwrap_or_default(),
+                &read_err.await.unwrap_or_default(),
+            ));
         }
         Err(_) => {
             // 显式强杀整棵进程树（含孙进程）并回收，管道随之 EOF。
@@ -396,7 +426,7 @@ async fn run_bash(
         }
         text.push_str(&String::from_utf8_lossy(&output_stderr));
     }
-    let code = timed_out.code().unwrap_or(-1);
+    let code = status.code().unwrap_or(-1);
     if code != 0 {
         if !text.is_empty() {
             text.push('\n');
@@ -427,6 +457,23 @@ fn timeout_message(timeout_secs: u64, stdout: &[u8], stderr: &[u8]) -> String {
     text
 }
 
+/// 取消错误：附带已产生的部分输出，便于模型判断现场（与超时一致）。
+fn cancel_message(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(stdout));
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(stderr));
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("命令已被取消，已终止");
+    text
+}
+
 pub async fn execute(
     root: &Path,
     name: &str,
@@ -434,8 +481,9 @@ pub async fn execute(
     shell: Option<&crate::lyra::prompt::ShellConfig>,
     archive_dir: Option<&Path>,
     call_id: &str,
+    cancelled: Option<&Arc<AtomicBool>>,
 ) -> ToolOutcome {
-    let outcome = execute_inner(root, name, args, shell).await;
+    let outcome = execute_inner(root, name, args, shell, cancelled).await;
     govern(outcome, name, call_id, archive_dir)
 }
 
@@ -444,6 +492,7 @@ async fn execute_inner(
     name: &str,
     args: &Value,
     shell: Option<&crate::lyra::prompt::ShellConfig>,
+    cancelled: Option<&Arc<AtomicBool>>,
 ) -> ToolOutcome {
     match name {
         "fast_context" => {
@@ -510,7 +559,7 @@ async fn execute_inner(
                 return ToolOutcome::error("当前为只读模式，bash 不可用");
             };
             let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(120);
-            match run_bash(root, shell, command, timeout).await {
+            match run_bash(root, shell, command, timeout, cancelled.cloned()).await {
                 Ok(text) => ToolOutcome::text(clamp_tool_output_text(&text)),
                 Err(error) => ToolOutcome::error(error),
             }
@@ -632,6 +681,8 @@ async fn execute_inner(
 mod tests {
     use super::run_bash;
     use crate::lyra::prompt::{ShellConfig, ShellKind};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn shell() -> ShellConfig {
         ShellConfig {
@@ -665,7 +716,7 @@ mod tests {
     #[tokio::test]
     async fn bash_timeout_kills_process_tree() {
         let dir = temp_case_dir("timeout");
-        let err = run_bash(&dir, &shell(), "sleep 300 & echo $! > child.pid; wait", 1)
+        let err = run_bash(&dir, &shell(), "sleep 300 & echo $! > child.pid; wait", 1, None)
             .await
             .expect_err("必须超时");
         assert!(err.contains("已终止"), "err={err}");
@@ -692,6 +743,7 @@ mod tests {
                 &shell(),
                 "sleep 300 & echo $! > child.pid; wait",
                 600,
+                None,
             )
             .await
         });
@@ -712,6 +764,50 @@ mod tests {
         task.abort();
         let _ = task.await;
 
+        assert!(
+            wait_pid_exit(grandchild),
+            "取消后孙进程 {grandchild} 未被清理"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 取消标志：运行中置位后 bash 必须尽快退出并清理整棵进程树（PI 的 signal 语义）。
+    #[tokio::test]
+    async fn bash_cancel_flag_kills_process_tree() {
+        let dir = temp_case_dir("cancel");
+        let flag = Arc::new(AtomicBool::new(false));
+        let work_dir = dir.clone();
+        let cancel = flag.clone();
+        let task = tokio::spawn(async move {
+            run_bash(
+                &work_dir,
+                &shell(),
+                "sleep 300 & echo $! > child.pid; wait",
+                600,
+                Some(cancel),
+            )
+            .await
+        });
+        // 等孙进程起来
+        let mut grandchild = None;
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(dir.join("child.pid")) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    grandchild = Some(pid);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let grandchild = grandchild.expect("孙进程未启动");
+        assert!(pid_alive(grandchild));
+
+        flag.store(true, Ordering::SeqCst);
+        let err = task
+            .await
+            .expect("任务 panic")
+            .expect_err("取消后必须返回错误");
+        assert!(err.contains("已被取消"), "err={err}");
         assert!(
             wait_pid_exit(grandchild),
             "取消后孙进程 {grandchild} 未被清理"

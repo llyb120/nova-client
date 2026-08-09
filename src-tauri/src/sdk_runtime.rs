@@ -491,7 +491,20 @@ impl SdkManager {
                 .flatten()
         };
         if let Some(bridge) = bridge {
+            let in_process = matches!(bridge.control, BridgeControl::InProcess(_));
             kill_running(&bridge);
+            // 进程内（Lyra）bridge 的中断轨迹（pendingMessages）只在轮次收尾时写盘；
+            // 宽限期内没能自行结束（典型：卡在长时间工具执行里，工具不响应取消），
+            // 被强制 abort 意味着这次中断内容没来得及持久化。回退到 Nova 侧接力上下文，
+            // 把已流出的中断轮注入下一条提示，避免续聊时上下文退回上次结论。
+            if in_process {
+                let state = self.app.state::<AppState>();
+                let mut store = state.store.lock().unwrap();
+                if let Some(thread) = store.get_mut(thread_id) {
+                    thread.handoff_from = Some(self.adapter.agent_kind());
+                }
+                store.save();
+            }
         }
         self.finish_turn(thread_id, "cancelled", None);
     }

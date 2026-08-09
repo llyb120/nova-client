@@ -335,6 +335,13 @@ async fn handle_prompt(
 
     // ---- Reasonix：加载精简记忆 / 旧会话播种 / restoreAt 截断 ----
     let mut memory = SlimMemory::load(&sessions_root, &ctx.session_id);
+    // 上一轮被强杀/panic/退出时轮末写盘没机会执行：增量 checkpoint 保留了中断轨迹。
+    // slim 已有 pendingMessages（优雅取消/失败已保存）时以 slim 为准，不覆盖。
+    if memory.pending_messages.is_empty() {
+        if let Some(pending) = reasonix::load_pending_checkpoint(&sessions_root, &ctx.session_id) {
+            memory.pending_messages = pending;
+        }
+    }
     if memory.turns.is_empty()
         && memory.digests.is_empty()
         && memory.pending_messages.is_empty()
@@ -433,7 +440,21 @@ async fn handle_prompt(
         cancelled: cancelled.clone(),
         steering: steering.clone(),
         spec_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        checkpoint: None,
     };
+    // 中断轨迹增量落盘：每条消息入列即原子重写 sidecar（对齐 PI 的 message_end 持久化），
+    // 任务被强杀/崩溃时下次续聊仍能恢复未完成内容；轮末正式保存后清除。
+    {
+        let checkpoint_root = sessions_root.clone();
+        let checkpoint_session = ctx.session_id.clone();
+        agent.checkpoint = Some(Box::new(move |messages: &[Value]| {
+            if let Err(error) =
+                reasonix::write_pending_checkpoint(&checkpoint_root, &checkpoint_session, messages)
+            {
+                eprintln!("lyra: 中断轨迹 checkpoint 写盘失败：{error}");
+            }
+        }));
+    }
 
     emit(&json!({ "type": "ready", "sessionId": ctx.session_id }));
 
@@ -709,6 +730,8 @@ async fn handle_prompt(
     if let Err(error) = memory.save(&sessions_root, &ctx.session_id) {
         eprintln!("lyra: 保存会话失败：{error}");
     }
+    // 轮末正式保存完成后清除增量 checkpoint（先存后删：中间崩溃也不会两边都丢）。
+    reasonix::clear_pending_checkpoint(&sessions_root, &ctx.session_id);
     send_timing(emit, "cache_shape", turn_started);
 
     if let Some(error) = failed {
