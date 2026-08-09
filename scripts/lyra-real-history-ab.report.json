@@ -1,0 +1,280 @@
+{
+  "model": "opencode/deepseek-v4-flash/variant/high",
+  "ranAt": "2026-08-09T05:31:43Z",
+  "cases": [
+    {
+      "session": "lyra-18ca098303c2d3bc-1b101b",
+      "prompt": "继续当前审查：只读复核本轮改动是否真正让 Lyra 的 Reasonix、provider cache 和 fast_context 常驻预取按设计工作。使用必要的最少工具，给出代码证据和剩余风险，不修改文件。",
+      "A-old": {
+        "arm": "A-old",
+        "exitCode": 0,
+        "wallMs": 4184,
+        "usage": null,
+        "cancelled": null,
+        "tools": [],
+        "providerRounds": 1,
+        "specHits": 0,
+        "contextShape": null,
+        "cacheShape": {
+          "elapsedMs": 3662,
+          "phase": "cache_shape",
+          "type": "timing"
+        },
+        "finalTail": "",
+        "stderrTail": ""
+      },
+      "B-new": {
+        "arm": "B-new",
+        "exitCode": 0,
+        "wallMs": 3797,
+        "usage": null,
+        "cancelled": null,
+        "tools": [],
+        "providerRounds": 1,
+        "specHits": 0,
+        "contextShape": {
+          "cacheMissReasons": [],
+          "contextTier": "normal",
+          "elapsedMs": 0,
+          "historyHash": "a202061313914476",
+          "phase": "context_shape",
+          "rewriteVersion": 0,
+          "systemPromptHash": "9a4c60a6d93bc02e",
+          "toolSchemaHash": "6afe503c4cf1ea2d",
+          "type": "timing"
+        },
+        "cacheShape": {
+          "cacheHitRate": 0.0,
+          "cacheReadTokens": 0,
+          "cacheWriteTokens": 0,
+          "elapsedMs": 3708,
+          "inputTokens": 0,
+          "phase": "cache_shape",
+          "rewriteVersion": 0,
+          "type": "timing"
+        },
+        "finalTail": "",
+        "stderrTail": ""
+      }
+    },
+    {
+      "session": "lyra-18c9f730b17de1dd-18c669",
+      "prompt": "继续此前 fast_context 优化任务：只读检查当前实现的预测性读取、在线学习和候选打包是否互相独立且正确衔接，给出代码证据，不修改文件。",
+      "A-old": {
+        "arm": "A-old",
+        "exitCode": 0,
+        "wallMs": 101213,
+        "usage": {
+          "cacheRead": 653184,
+          "cacheWrite": 0,
+          "input": 135473,
+          "output": 7053
+        },
+        "cancelled": false,
+        "tools": [
+          "bash",
+          "find_symbols",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "providerRounds": 6,
+        "specHits": 0,
+        "contextShape": null,
+        "cacheShape": {
+          "elapsedMs": 101055,
+          "phase": "cache_shape",
+          "type": "timing"
+        },
+        "finalTail": "efetch 从整个 `ranked` 未打包部分选（5993）。若某文件排名 >20、被 prefetch 预读、随后被编辑，`observe_context_feedback` 的 `find`（464）找不到它 → `pos_data` 为 None → 返回 0，**该次编辑不进模型**。影响面小（排名 >20 且被编辑的场景），但确实存在：预取\"预测对了\"却学不到。\n\n## 5. 验证状态\n\n- `cargo check --lib` 通过（此前编译验证）。\n- 三者共享状态无数据竞争：`with_learning_state` 和 `SOURCE_CACHE` 都是 `Mutex` 保护（386/2042），prefetch 只读 `learning_snapshot`（clone 出来的模型），不持有学习锁。\n\n**总结**：设计上三者通过\"同一模型快照 + 同一份 ranked\"正确衔接，prefetch 通过 `SOURCE_CACHE` 隔离不污染输出，mtime 校验防止过期缓存，冷启动门槛三处一致。缝隙 A/B 属于优化空间而非正确性缺陷，建议后续在报告中记录。",
+        "stderrTail": ""
+      },
+      "B-new": {
+        "arm": "B-new",
+        "exitCode": 0,
+        "wallMs": 120405,
+        "usage": {
+          "cacheRead": 1806208,
+          "cacheWrite": 0,
+          "input": 144194,
+          "output": 6769
+        },
+        "cancelled": false,
+        "tools": [
+          "bash",
+          "fast_context",
+          "read",
+          "read",
+          "bash",
+          "find_symbols",
+          "read",
+          "find_symbols",
+          "read",
+          "read",
+          "find_symbols",
+          "read",
+          "find_symbols",
+          "read"
+        ],
+        "providerRounds": 14,
+        "specHits": 0,
+        "contextShape": {
+          "cacheMissReasons": [],
+          "contextTier": "normal",
+          "elapsedMs": 0,
+          "historyHash": "973fb173775e2e91",
+          "phase": "context_shape",
+          "rewriteVersion": 0,
+          "systemPromptHash": "9a4c60a6d93bc02e",
+          "toolSchemaHash": "6afe503c4cf1ea2d",
+          "type": "timing"
+        },
+        "cacheShape": {
+          "cacheHitRate": 0.9260696000106645,
+          "cacheReadTokens": 1806208,
+          "cacheWriteTokens": 0,
+          "elapsedMs": 120246,
+          "inputTokens": 144194,
+          "phase": "cache_shape",
+          "rewriteVersion": 0,
+          "type": "timing"
+        },
+        "finalTail": "ristic；而 `6000` 预取打分用的是**调整后**的 heuristic（ranked 的 score 已被 4433 原地修改）。由于调整幅度被 clamp 在 ±blend×300（blend 上限 0.4 → ±120 分），对特征 0 `(heuristic/1000).clamp(0,1.5)` 的影响至多 ±0.12，且两个调用都经过同一 sigmoid，实际排序与预取的选择一致性几乎不受影响。若追求严格一致，可让预取改用原始 heuristic——但按当前 clamp 约束这属于可忽略的精度项，不构成衔接错误。\n\n### 五、结论\n\n三个机制：**候选打包**（确定性、基于检索+启发式+学习微调）、**在线学习**（RankNet + hardest-negative，经 pending/settle 闭环）、**预测性读取**（读模型预测 → 写进程级 LRU → 只影响下一次）——职责单一、数据流单向、共享的仅是可复用的 `learning_features` 与 `learning_snapshot`（都只读）。衔接正确、独立成立，无循环依赖、无输出污染。",
+        "stderrTail": ""
+      }
+    },
+    {
+      "session": "lyra-18c9d96a146c61de-175416",
+      "prompt": "继续此前在线学习任务：只读检查 fast_context 学习开关、常驻学习 owner、edit feedback 与推理侧模型消费的完整链路，指出仍可能影响实际收益的地方，不修改文件。",
+      "A-old": {
+        "arm": "A-old",
+        "exitCode": 0,
+        "wallMs": 251964,
+        "usage": {
+          "cacheRead": 2449664,
+          "cacheWrite": 0,
+          "input": 121041,
+          "output": 17263
+        },
+        "cancelled": false,
+        "tools": [
+          "bash",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "bash",
+          "read",
+          "read",
+          "read",
+          "bash",
+          "read",
+          "find_symbols",
+          "read",
+          "read",
+          "read",
+          "read",
+          "find_symbols",
+          "read",
+          "read"
+        ],
+        "providerRounds": 21,
+        "specHits": 0,
+        "contextShape": null,
+        "cacheShape": {
+          "elapsedMs": 251290,
+          "phase": "cache_shape",
+          "type": "timing"
+        },
+        "finalTail": "0`：`ContextLearningSettleGuard` 在 `handle_prompt`（每次请求）创建，drop 时 settle。读多写少的会话每轮都触发一次 service 结算，且会提前清空该 root 的 Vega 待结算样本（多为空操作）。建议提升为会话级 guard。\n\n### 7. 小项\n\n- Lyra 本地 `state.pending` 每次检索记录、永不消费（浪费，可随问题 1 一并处理）；\n- 快照只在 edit/settle 时注入，长会话无编辑时 blend 用注入时的旧模型（可接受，注明即可）；\n- `parse_learning_model_snapshot` 无人调用（死代码）。\n\n---\n\n**一句话结论**：Vega 的\"训练→持久化→推理消费\"闭环是通且测过的；真正影响收益的是 **(1) Lyra 只消费不贡献** 和 **(2) RankNet 更新方向疑反**——前者让一类 agent 的全部编辑反馈白费，后者让模型在 blend 放大时可能反噬；建议优先修这两项，再补一条模型路径一致性（3）和双算（5），随后重跑 A/B 验证。",
+        "stderrTail": ""
+      },
+      "B-new": {
+        "arm": "B-new",
+        "exitCode": 0,
+        "wallMs": 112696,
+        "usage": {
+          "cacheRead": 857344,
+          "cacheWrite": 0,
+          "input": 111363,
+          "output": 8138
+        },
+        "cancelled": false,
+        "tools": [
+          "bash",
+          "fast_context",
+          "find_symbols",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "providerRounds": 9,
+        "specHits": 0,
+        "contextShape": {
+          "cacheMissReasons": [],
+          "contextTier": "normal",
+          "elapsedMs": 0,
+          "historyHash": "0d375478a43d649e",
+          "phase": "context_shape",
+          "rewriteVersion": 0,
+          "systemPromptHash": "9a4c60a6d93bc02e",
+          "toolSchemaHash": "6afe503c4cf1ea2d",
+          "type": "timing"
+        },
+        "cacheShape": {
+          "cacheHitRate": 0.8850395424003337,
+          "cacheReadTokens": 857344,
+          "cacheWriteTokens": 0,
+          "elapsedMs": 112017,
+          "inputTokens": 111363,
+          "phase": "cache_shape",
+          "rewriteVersion": 0,
+          "type": "timing"
+        },
+        "finalTail": "_context 都多一次文件 I/O。\n\n**6. 无写竞态，但 service 是单点**\n唯一写者（owner）设计消除了并发覆盖 ✓；代价是 service 挂掉后：训练停摆（上述 2）、`call_global` 120s 超时后才走 Lyra 本地（Lyra 检索本来就不依赖 service，无此问题；Vega 检索会卡到连接失败降级）。\n\n## 结论\n\n链路本身**闭环且无写竞态**：开关→owner→feedback→训练→落盘→快照下发→推理消费全部打通，A/B 也验证了有效（−2.7% token）。当前实际收益的主要制约是**第 1 点：Lyra 本地检索的模型新鲜度**——它占了 agent 使用的大头（Lyra 是默认后端之一），却只能吃到 edit 时点快照。其余为静默降级（2）与收益上限（4）等次要问题。若要让学习收益最大化，最值得改的方向是给 Lyra 本地检索增加**低成本的快照拉取/过期刷新**（如 fast_context 前异步 ping 一次 service 拿最新快照，失败即用现有模型——保持锦上添花语义），或让磁盘兜底走缓存 + 定期刷新。",
+        "stderrTail": ""
+      }
+    }
+  ],
+  "A-old": {
+    "input": 256514,
+    "output": 24316,
+    "cacheRead": 3102848,
+    "cacheWrite": 0,
+    "wallMs": 357361,
+    "tools": 31,
+    "rounds": 28
+  },
+  "B-new": {
+    "input": 255557,
+    "output": 14907,
+    "cacheRead": 2663552,
+    "cacheWrite": 0,
+    "wallMs": 236898,
+    "tools": 27,
+    "rounds": 24
+  },
+  "delta": {
+    "input": -957,
+    "output": -9409,
+    "cacheRead": -439296,
+    "cacheWrite": 0,
+    "wallMs": -120463,
+    "tools": -4,
+    "rounds": -4
+  }
+}

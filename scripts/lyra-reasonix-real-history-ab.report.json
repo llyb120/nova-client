@@ -1,0 +1,151 @@
+{
+  "model": "opencode/deepseek-v4-flash/variant/high",
+  "forcedContextWindow": 128000,
+  "cases": [
+    {
+      "session": "1018c694-3574-4259-8f83-0bd7f0d579a8",
+      "prompt": "基于此前会话继续，只读总结当前任务的核心结论、涉及模块和仍需核查的风险。需要时使用最少工具，不修改文件。",
+      "A-old": {
+        "wallMs": 31569,
+        "usage": {
+          "cacheRead": 2048,
+          "cacheWrite": 0,
+          "input": 125220,
+          "output": 2775
+        },
+        "tools": [],
+        "rounds": 1,
+        "contextShape": null,
+        "cacheShape": {
+          "elapsedMs": 31372,
+          "phase": "cache_shape",
+          "type": "timing"
+        },
+        "error": null,
+        "stderr": ""
+      },
+      "B-new": {
+        "wallMs": 33047,
+        "usage": {
+          "cacheRead": 13824,
+          "cacheWrite": 0,
+          "input": 8963,
+          "output": 3433
+        },
+        "tools": [
+          "find_symbols"
+        ],
+        "rounds": 2,
+        "contextShape": {
+          "cacheMissReasons": [
+            "tools_changed",
+            "history_rewritten"
+          ],
+          "contextTier": "force",
+          "elapsedMs": 0,
+          "historyHash": "0244bd8dc785cb70",
+          "phase": "context_shape",
+          "rewriteVersion": 1,
+          "systemPromptHash": "9a4c60a6d93bc02e",
+          "toolSchemaHash": "6afe503c4cf1ea2d",
+          "type": "timing"
+        },
+        "cacheShape": {
+          "cacheHitRate": 0.6066616930706105,
+          "cacheReadTokens": 13824,
+          "cacheWriteTokens": 0,
+          "elapsedMs": 32879,
+          "inputTokens": 8963,
+          "phase": "cache_shape",
+          "rewriteVersion": 1,
+          "type": "timing"
+        },
+        "error": null,
+        "stderr": ""
+      }
+    },
+    {
+      "session": "89c4070e-ddee-4ec1-8654-decc7e9af07d",
+      "prompt": "基于此前会话继续，只读复核已有分析的关键代码链路，指出一个最重要的正确性风险和一个性能风险。使用最少工具，不修改文件。",
+      "A-old": {
+        "wallMs": 27679,
+        "usage": null,
+        "tools": [],
+        "rounds": 1,
+        "contextShape": null,
+        "cacheShape": {
+          "elapsedMs": 27575,
+          "phase": "cache_shape",
+          "type": "timing"
+        },
+        "error": {
+          "error": "Lyra provider 请求失败：HTTP 400 Bad Request：{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id', The following tool_call_ids did not have response messages: call_vijEoQ3WJiJpzDedTwxN0jYb|fc_04badf96ea75aa2a016a6feacc68f481919b8da7401f88fbd8\"}}",
+          "ok": false
+        },
+        "stderr": ""
+      },
+      "B-new": {
+        "wallMs": 3372,
+        "usage": null,
+        "tools": [],
+        "rounds": 1,
+        "contextShape": {
+          "cacheMissReasons": [
+            "tools_changed",
+            "history_rewritten"
+          ],
+          "contextTier": "elide",
+          "elapsedMs": 0,
+          "historyHash": "4d29741f4c95b125",
+          "phase": "context_shape",
+          "rewriteVersion": 18,
+          "systemPromptHash": "9a4c60a6d93bc02e",
+          "toolSchemaHash": "6afe503c4cf1ea2d",
+          "type": "timing"
+        },
+        "cacheShape": {
+          "cacheHitRate": 0.0,
+          "cacheReadTokens": 0,
+          "cacheWriteTokens": 0,
+          "elapsedMs": 3263,
+          "inputTokens": 0,
+          "phase": "cache_shape",
+          "rewriteVersion": 18,
+          "type": "timing"
+        },
+        "error": {
+          "error": "Lyra provider 请求失败：HTTP 400 Bad Request：{\"error\":{\"param\":null,\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\",\"message\":\"Error from provider (Console Go): Upstream request failed: [invalid_request_error] An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id', The following tool_call_ids did not have response messages: call_vijEoQ3WJiJpzDedTwxN0jYb|fc_04badf96ea75aa2a016a6feacc68f481919b8da7401f88fbd8\"}}",
+          "ok": false
+        },
+        "stderr": ""
+      }
+    }
+  ],
+  "A-old": {
+    "input": 125220,
+    "output": 2775,
+    "cacheRead": 2048,
+    "cacheWrite": 0,
+    "wallMs": 59248,
+    "tools": 0,
+    "rounds": 2
+  },
+  "B-new": {
+    "input": 8963,
+    "output": 3433,
+    "cacheRead": 13824,
+    "cacheWrite": 0,
+    "wallMs": 36419,
+    "tools": 1,
+    "rounds": 3
+  },
+  "delta": {
+    "input": -116257,
+    "output": 658,
+    "cacheRead": 11776,
+    "cacheWrite": 0,
+    "wallMs": -22829,
+    "tools": 1,
+    "rounds": 1
+  }
+}

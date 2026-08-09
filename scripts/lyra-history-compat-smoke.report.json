@@ -1,0 +1,102 @@
+{
+  "model": "opencode/deepseek-v4-flash/variant/high",
+  "forcedContextWindow": 128000,
+  "cases": [
+    {
+      "session": "38c5862a-1059-4c26-a544-9276641deef4",
+      "prompt": "基于此前会话继续，只读总结当前任务的核心结论、涉及模块和仍需核查的风险。需要时使用最少工具，不修改文件。",
+      "A-fixed": {
+        "wallMs": 40893,
+        "usage": {
+          "cacheRead": 4096,
+          "cacheWrite": 0,
+          "input": 94237,
+          "output": 2865
+        },
+        "tools": [
+          "bash"
+        ],
+        "rounds": 2,
+        "contextShape": {
+          "cacheMissReasons": [
+            "tools_changed",
+            "history_rewritten"
+          ],
+          "contextTier": "elide",
+          "elapsedMs": 0,
+          "historyHash": "f16b5aa903f482a9",
+          "phase": "context_shape",
+          "rewriteVersion": 14,
+          "systemPromptHash": "9a4c60a6d93bc02e",
+          "toolSchemaHash": "6afe503c4cf1ea2d",
+          "type": "timing"
+        },
+        "cacheShape": {
+          "cacheHitRate": 0.04346488109765803,
+          "cacheReadTokens": 4096,
+          "cacheWriteTokens": 0,
+          "elapsedMs": 40396,
+          "inputTokens": 94237,
+          "phase": "cache_shape",
+          "rewriteVersion": 15,
+          "type": "timing"
+        },
+        "error": null,
+        "stderr": ""
+      }
+    },
+    {
+      "session": "89c4070e-ddee-4ec1-8654-decc7e9af07d",
+      "prompt": "基于此前会话继续，只读复核已有分析的关键代码链路，指出一个最重要的正确性风险和一个性能风险。使用最少工具，不修改文件。",
+      "A-fixed": {
+        "wallMs": 145762,
+        "usage": {
+          "cacheRead": 890624,
+          "cacheWrite": 0,
+          "input": 64469,
+          "output": 8950
+        },
+        "tools": [
+          "read",
+          "read",
+          "read",
+          "find_symbols",
+          "read",
+          "read",
+          "read",
+          "read",
+          "find_symbols",
+          "read",
+          "read"
+        ],
+        "rounds": 10,
+        "contextShape": {
+          "cacheMissReasons": [
+            "tools_changed",
+            "history_rewritten"
+          ],
+          "contextTier": "elide",
+          "elapsedMs": 0,
+          "historyHash": "4d29741f4c95b125",
+          "phase": "context_shape",
+          "rewriteVersion": 18,
+          "systemPromptHash": "9a4c60a6d93bc02e",
+          "toolSchemaHash": "6afe503c4cf1ea2d",
+          "type": "timing"
+        },
+        "cacheShape": {
+          "cacheHitRate": 0.9324997670383931,
+          "cacheReadTokens": 890624,
+          "cacheWriteTokens": 0,
+          "elapsedMs": 145428,
+          "inputTokens": 64469,
+          "phase": "cache_shape",
+          "rewriteVersion": 26,
+          "type": "timing"
+        },
+        "error": null,
+        "stderr": ""
+      }
+    }
+  ]
+}
