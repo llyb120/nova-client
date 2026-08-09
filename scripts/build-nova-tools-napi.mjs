@@ -1,6 +1,6 @@
-import { copyFileSync, mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -28,8 +28,16 @@ const library = platform === "win32"
   : platform === "darwin"
     ? "libnova_tools_napi.dylib"
     : "libnova_tools_napi.so";
-const source = join(root, "native", "nova-tools-napi", "target", ...(target ? [target] : []), profile, library);
+const cargoTargetDir = process.env.CARGO_TARGET_DIR;
+const nativeTargetRoot = cargoTargetDir
+  ? (isAbsolute(cargoTargetDir) ? cargoTargetDir : join(root, cargoTargetDir))
+  : join(root, "native", "nova-tools-napi", "target");
+const source = join(nativeTargetRoot, ...(target ? [target] : []), profile, library);
 const output = join(root, "src-tauri", "resources", "nova-tools-napi.node");
 mkdirSync(dirname(output), { recursive: true });
+if (!existsSync(source)) {
+  console.error(`expected native addon at ${source} (CARGO_TARGET_DIR=${process.env.CARGO_TARGET_DIR ?? "(unset)"})`);
+  process.exit(1);
+}
 copyFileSync(source, output);
 console.log(`built ${pathToFileURL(output).href}`);
