@@ -5,8 +5,8 @@ use crate::lyra::agent::{estimate_text_tokens, user_message, Agent, AgentEvent};
 use crate::lyra::config::{self, Resolved, Roots};
 use crate::lyra::prompt::{
     self, build_system_prompt, expand_skill_command, format_skills_prompt, image_media_type,
-    is_retryable_provider_error, load_agent_instructions, load_skills, merge_usage,
-    system_prompt_fingerprint, SystemPromptOptions, PROVIDER_RETRY_DELAYS_MS,
+    is_context_window_error, is_retryable_provider_error, load_agent_instructions, load_skills,
+    merge_usage, system_prompt_fingerprint, SystemPromptOptions, PROVIDER_RETRY_DELAYS_MS,
 };
 use crate::lyra::provider::{stream_chat, StreamEvent};
 use crate::lyra::reasonix::{self, context_tokens_from_messages, load_legacy_messages, SlimMemory};
@@ -567,9 +567,11 @@ async fn handle_prompt(
 
     // ---- Reasonix 中途维护闭包 ----
     let context_window_u = context_window;
+    let rebase_memory = memory.clone();
+    let mid_turn_state = Arc::new(Mutex::new((0_u64, 0_u64, String::new())));
     let mut mid_turn = {
-        let memory_ref = &mut memory;
         let mut last_rewrite_turn: usize = usize::MAX;
+        let mid_turn_state = mid_turn_state.clone();
         move |messages: &mut Vec<Value>, assistant: &Value| {
             let measured = reasonix::context_tokens_from_messages(std::slice::from_ref(assistant));
             let measured = measured.max(reasonix::context_tokens_from_messages(messages));
@@ -584,8 +586,11 @@ async fn handle_prompt(
                 }
                 let turn_count = messages.len();
                 if tier == "force" && turn_count > 0 && last_rewrite_turn != turn_count {
-                    let (next, rebased) =
-                        reasonix::rebase_native_context(messages, active_turn_start, memory_ref);
+                    let (next, rebased) = reasonix::rebase_native_context(
+                        messages,
+                        active_turn_start,
+                        &rebase_memory,
+                    );
                     if rebased {
                         *messages = next;
                         rewritten = true;
@@ -593,9 +598,10 @@ async fn handle_prompt(
                     }
                 }
                 if rewritten {
-                    memory_ref.rewrite_version += 1;
-                    memory_ref.context_tokens = measured;
-                    memory_ref.context_tier = tier.into();
+                    let mut state = mid_turn_state.lock().unwrap();
+                    state.0 += 1;
+                    state.1 = measured;
+                    state.2 = tier.into();
                     send_timing(emit, "mid_turn_context_rewrite", started);
                 }
             }
@@ -696,6 +702,7 @@ async fn handle_prompt(
     // ---- 带重试的执行 ----
     let mut retries = 0usize;
     let mut pending = Some((prompt_text, images));
+    let mut context_recovery_attempted = false;
     let outcome = loop {
         let attempt = if let Some((text, images)) = pending.take() {
             agent
@@ -717,6 +724,47 @@ async fn handle_prompt(
             break outcome;
         }
         let error = provider_error.unwrap();
+        let context_overflow = is_context_window_error(&error);
+        if context_overflow && !context_recovery_attempted && !cancelled.load(Ordering::SeqCst) {
+            // 失败 assistant 只是 provider 占位，不能带入下一次请求。
+            while agent
+                .messages
+                .last()
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant")
+            {
+                agent.messages.pop();
+            }
+            let (compacted, tools_changed) =
+                reasonix::compact_all_native_tool_results(&agent.messages);
+            agent.messages = compacted;
+            let (rebased, history_changed) =
+                reasonix::rebase_native_context(&agent.messages, active_turn_start, &memory);
+            if history_changed {
+                agent.messages = rebased;
+            }
+            // 中断恢复时 active_turn_start=0，若工具结果也无法再压，重试不会改变请求形状。
+            if !tools_changed && !history_changed {
+                break outcome;
+            }
+            context_recovery_attempted = true;
+            memory.context_stage = "slim".into();
+            memory.context_tier = "force".into();
+            memory.context_tokens = 0;
+            memory.full_messages.clear();
+            memory.pending_messages = agent.messages.clone();
+            memory.rewrite_version += 1;
+            let _ = memory.save(&sessions_root, &ctx.session_id);
+            send_timing(emit, "context_overflow_recovery", turn_started);
+            emit(&json!({
+                "type": "ready",
+                "sessionId": ctx.session_id,
+                "retry": retries + 1,
+                "contextRecovery": true,
+            }));
+            continue;
+        }
         if retries >= PROVIDER_RETRY_DELAYS_MS.len()
             || !is_retryable_provider_error(&error)
             || cancelled.load(Ordering::SeqCst)
@@ -754,6 +802,17 @@ async fn handle_prompt(
     };
     drop(on_event);
     drop(mid_turn);
+    let (mid_turn_rewrite_count, mid_turn_context_tokens, mid_turn_context_tier) = {
+        let state = mid_turn_state.lock().unwrap();
+        (state.0, state.1, state.2.clone())
+    };
+    if mid_turn_rewrite_count > 0 {
+        memory.rewrite_version = memory
+            .rewrite_version
+            .saturating_add(mid_turn_rewrite_count);
+        memory.context_tokens = mid_turn_context_tokens;
+        memory.context_tier = mid_turn_context_tier;
+    }
     line_consumer.abort();
 
     let failed = outcome

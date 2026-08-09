@@ -632,11 +632,15 @@ fn compact_tool_text(text: &str, tier: &str, tool_call_id: Option<&str>) -> Stri
 }
 
 /// 摘要之前先对较旧的原生工具结果做单向、稳定的压缩；最近 6 条保持完整。
-pub fn compact_native_tool_results(messages: &[Value], tier: &str) -> (Vec<Value>, bool) {
+fn compact_native_tool_results_with_preserve(
+    messages: &[Value],
+    tier: &str,
+    preserve_recent: usize,
+) -> (Vec<Value>, bool) {
     if !matches!(tier, "snip" | "elide" | "force") {
         return (messages.to_vec(), false);
     }
-    let cutoff = messages.len().saturating_sub(6);
+    let cutoff = messages.len().saturating_sub(preserve_recent);
     let mut changed = false;
     let next: Vec<Value> = messages
         .iter()
@@ -682,6 +686,16 @@ pub fn compact_native_tool_results(messages: &[Value], tier: &str) -> (Vec<Value
     } else {
         (messages.to_vec(), false)
     }
+}
+
+/// 摘要之前先对较旧的原生工具结果做单向、稳定的压缩；最近 6 条保持完整。
+pub fn compact_native_tool_results(messages: &[Value], tier: &str) -> (Vec<Value>, bool) {
+    compact_native_tool_results_with_preserve(messages, tier, 6)
+}
+
+/// Provider 已明确拒绝上下文时不再保留最近工具结果，优先确保当前任务能继续。
+pub fn compact_all_native_tool_results(messages: &[Value]) -> (Vec<Value>, bool) {
+    compact_native_tool_results_with_preserve(messages, "force", 0)
 }
 
 pub fn should_use_full_context(memory: &SlimMemory, max_tokens: u64, max_chars: usize) -> bool {
@@ -862,5 +876,24 @@ mod tests {
         assert_eq!(memory.turns.len(), 1);
         assert_eq!(memory.turns[0].conclusion, "完成");
         assert_eq!(memory.context_stage, "full");
+    }
+
+    #[test]
+    fn overflow_compaction_elides_even_recent_tool_results() {
+        let messages = vec![json!({
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "content": [{ "type": "text", "text": "x".repeat(10_000) }]
+        })];
+        let (normal, normal_changed) = compact_native_tool_results(&messages, "force");
+        assert!(!normal_changed);
+        assert_eq!(normal, messages);
+
+        let (recovered, changed) = compact_all_native_tool_results(&messages);
+        assert!(changed);
+        assert!(recovered[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[elided tool result call-1"));
     }
 }

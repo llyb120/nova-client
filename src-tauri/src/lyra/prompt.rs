@@ -170,6 +170,24 @@ pub fn is_retryable_provider_error(error: &str) -> bool {
         .any(|fragment| message.contains(fragment))
 }
 
+/// Provider 对上下文超限的文案并不统一；单独识别后由 Reasonix 强制收缩轨迹并重试一次。
+pub fn is_context_window_error(error: &str) -> bool {
+    let message = error.to_lowercase();
+    [
+        "exceeds the context window",
+        "context window exceeded",
+        "context length exceeded",
+        "maximum context length",
+        "context_length_exceeded",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "request too large for model",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+}
+
 pub const PROVIDER_RETRY_DELAYS_MS: &[u64] = &[1_000, 3_000];
 
 /// 按 PI 约定累加一次 agent 轮内多次模型请求的用量。
@@ -519,5 +537,22 @@ mod tests {
         assert!(expanded.contains("deploy"));
         assert!(expanded.contains("生产环境"));
         assert_eq!(expand_skill_command("普通输入", &skills), "普通输入");
+    }
+}
+
+#[cfg(test)]
+mod context_error_tests {
+    use super::is_context_window_error;
+
+    #[test]
+    fn recognizes_provider_context_limit_errors() {
+        assert!(is_context_window_error(
+            "Your input exceeds the context window of this model."
+        ));
+        assert!(is_context_window_error(
+            "invalid_request_error: context_length_exceeded"
+        ));
+        assert!(is_context_window_error("Prompt is too long"));
+        assert!(!is_context_window_error("connection reset by peer"));
     }
 }
