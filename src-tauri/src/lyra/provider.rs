@@ -339,12 +339,15 @@ fn responses_body(
     if !tool_defs.is_empty() {
         body["tools"] = Value::Array(tool_defs);
     }
-    if model.reasoning {
+    if model.reasoning && level != Some("off") {
+        // 与 Vega/PI 对齐：OpenAI Responses 只有显式请求 summary 才会流式返回
+        // response.reasoning_summary_text.delta；仅发送 effort 会有推理开销但前端无内容可展示。
+        let mut reasoning = Map::new();
+        reasoning.insert("summary".into(), json!("auto"));
         if let Some(level) = level {
-            if level != "off" {
-                body["reasoning"] = json!({ "effort": level });
-            }
+            reasoning.insert("effort".into(), json!(level));
         }
+        body["reasoning"] = Value::Object(reasoning);
     }
     if let Some(key) = session_id.and_then(clamp_prompt_cache_key) {
         body["prompt_cache_key"] = json!(key);
@@ -1356,6 +1359,36 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"][0]["text"], "你好");
+    }
+
+    #[test]
+    fn responses_payload_requests_reasoning_summary_like_vega() {
+        let model = test_model("openai-responses");
+        let body = responses_body(
+            &model,
+            "系统",
+            &[json!({ "role": "user", "content": [{ "type": "text", "text": "你好" }] })],
+            &[],
+            Some("high"),
+            None,
+        );
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn responses_payload_still_requests_summary_without_effort() {
+        let model = test_model("openai-responses");
+        let body = responses_body(&model, "系统", &[], &[], None, None);
+        assert!(body["reasoning"].get("effort").is_none());
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn responses_payload_keeps_reasoning_off() {
+        let model = test_model("openai-responses");
+        let body = responses_body(&model, "系统", &[], &[], Some("off"), None);
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]
