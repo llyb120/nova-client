@@ -34,6 +34,8 @@ const REMOTE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// `/fire` 由前端编排（阶段会话 / 验收循环）；Rust 只负责拦截并投递。
 /// 任意会进入 `dispatch_prompt` 的来源（IPC、远程、后台重发等）共用此事件。
 pub const EV_FIRE_START: &str = "fire:start";
+/// 有界面时，远程提示词交给前端统一输入入口处理内置/自定义指令。
+pub const EV_REMOTE_PROMPT_DISPATCH: &str = "remote-prompt:dispatch";
 
 /// 远程 send 在会话忙碌时交给前端 `promptQueue` 展示并 FIFO 投递。
 pub const EV_PROMPT_QUEUE_ENQUEUE: &str = "prompt-queue:enqueue";
@@ -81,6 +83,7 @@ struct RemoteThreadMeta {
     parent_thread_id: Option<String>,
     created_at: i64,
     updated_at: i64,
+    starred: bool,
     running: bool,
 }
 
@@ -110,6 +113,7 @@ struct RemoteThreadDelta {
     parent_thread_id: Option<String>,
     created_at: i64,
     updated_at: i64,
+    starred: bool,
     running: bool,
     plan: Value,
     base: ThreadCheckpoint,
@@ -158,6 +162,8 @@ struct RemoteCommand {
     queue_id: String,
     #[serde(default)]
     reasoning_effort: String,
+    #[serde(default)]
+    starred: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -959,6 +965,7 @@ fn thread_metas(app: &AppHandle) -> Vec<RemoteThreadMeta> {
             parent_thread_id: t.parent_thread_id.clone(),
             created_at: t.created_at,
             updated_at: t.updated_at,
+            starred: t.starred,
             running: is_running(&state, t),
         })
         .collect();
@@ -1123,6 +1130,7 @@ fn catalog_signature_for(metas: &[RemoteThreadMeta]) -> String {
                 &m.mode,
                 &m.parent_thread_id,
                 m.created_at,
+                m.starred,
             )
         })
         .collect();
@@ -1136,6 +1144,7 @@ fn thread_changed(old: &Thread, old_running: bool, current: &Thread, running: bo
         || old.agent_kind != current.agent_kind
         || old.model != current.model
         || old.mode != current.mode
+        || old.starred != current.starred
         || old.plan != current.plan
         || old.items.len() != current.items.len()
         || old
@@ -1280,6 +1289,7 @@ fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<Re
         // 流式输出期间 updated_at 会高频变化。若每拍都同步，手机端按更新时间排序的
         // 会话会反复跳到列表顶部，并可能打断正在查看的历史会话；结束时再提交最终时间。
         updated_at: remote_delta_updated_at(previous, current, running),
+        starred: current.starred,
         running,
         plan: current.plan.clone().unwrap_or(Value::Null),
         base: thread_checkpoint(previous),
@@ -1484,6 +1494,36 @@ mod tests {
         assert_eq!(command.images[0].name, "screen.png");
         assert_eq!(command.images[0].mime_type, "image/png");
         assert_eq!(command.images[0].data.as_deref(), Some("aW1hZ2U="));
+    }
+
+    #[test]
+    fn remote_star_command_and_catalog_signature_include_starred() {
+        let command: RemoteCommand = serde_json::from_value(json!({
+            "id": 8,
+            "type": "star",
+            "threadId": "thread-1",
+            "starred": true
+        }))
+        .unwrap();
+        assert!(command.starred);
+
+        let meta = RemoteThreadMeta {
+            id: "thread-1".into(),
+            title: "thread".into(),
+            cwd: "C:/work".into(),
+            agent_kind: "codex".into(),
+            model: String::new(),
+            mode: String::new(),
+            parent_thread_id: None,
+            created_at: 1,
+            updated_at: 2,
+            starred: false,
+            running: false,
+        };
+        let before = catalog_signature_for(std::slice::from_ref(&meta));
+        let mut starred = meta;
+        starred.starred = true;
+        assert_ne!(before, catalog_signature_for(&[starred]));
     }
 
     #[test]
@@ -1775,6 +1815,10 @@ async fn execute_command(
                 Err(e) => fail(e),
             }
         }
+        "star" => match star_remote_thread(app, &cmd.thread_id, cmd.starred) {
+            Ok(()) => ok_thread(cmd.thread_id.clone()),
+            Err(e) => fail(e),
+        },
         "rename" => match rename_remote_thread(app, &cmd.thread_id, &cmd.title) {
             Ok(()) => ok_thread(cmd.thread_id.clone()),
             Err(e) => fail(e),
@@ -1827,6 +1871,19 @@ async fn execute_command(
         },
         _ => fail("不支持的远程操作".into()),
     }
+}
+
+fn star_remote_thread(app: &AppHandle, thread_id: &str, starred: bool) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut store = state.store.lock().unwrap();
+    let thread = store.get_mut(thread_id).ok_or("会话不存在")?;
+    if !eligible(thread) {
+        return Err("该会话不支持远程操作".into());
+    }
+    thread.starred = starred;
+    store.save();
+    let _ = app.emit(crate::acp::EV_THREADS, json!({}));
+    Ok(())
 }
 
 fn rename_remote_thread(app: &AppHandle, thread_id: &str, title: &str) -> Result<(), String> {
@@ -2419,9 +2476,21 @@ fn send_prompt(
             return Err("该会话不支持远程操作".into());
         }
     }
-    // 复用本地聊天的唯一分发入口：运行中的 Alkaid/Codex/Devin 走原生引导，
-    // Cursor 走打断后新 turn并继续复用 live Agent session，与桌面输入框保持一致。
-    // `/fire` 在 dispatch_prompt 内统一拦截，远程与其它入口行为一致。
+    // 有界面时先交给前端统一输入入口，让远程文本与桌面 Composer 一样处理
+    // `/easy`、`/plan`、工作流触发器等客户端指令；前端展开后再经 IPC 投递。
+    // headless 没有前端事件消费者，继续直接发送普通提示词。
+    if !crate::server::is_headless() {
+        app.emit(
+            EV_REMOTE_PROMPT_DISPATCH,
+            json!({
+                "threadId": thread_id,
+                "text": text,
+                "images": images,
+            }),
+        )
+        .map_err(|error| format!("转交远程提示词失败: {error}"))?;
+        return Ok(());
+    }
     crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), images)
 }
 

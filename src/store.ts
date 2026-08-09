@@ -2598,6 +2598,15 @@ export async function initStore() {
     );
   });
 
+  await listen<{ threadId: string; text: string; images?: PromptImage[] }>(
+    "remote-prompt:dispatch",
+    (e) => {
+      void sendPromptTo(e.payload.threadId, e.payload.text, e.payload.images ?? []).catch((error) =>
+        console.error("Remote prompt dispatch failed", error),
+      );
+    },
+  );
+
   await listen<PermissionRequest>("acp:permission", (e) => {
     setState("permissions", state.permissions.length, e.payload);
   });
