@@ -6,12 +6,13 @@ use crate::lyra::config::{self, Resolved, Roots};
 use crate::lyra::prompt::{
     self, build_system_prompt, expand_skill_command, format_skills_prompt, image_media_type,
     is_retryable_provider_error, load_agent_instructions, load_skills, merge_usage,
-    SystemPromptOptions, PROVIDER_RETRY_DELAYS_MS,
+    system_prompt_fingerprint, SystemPromptOptions, PROVIDER_RETRY_DELAYS_MS,
 };
 use crate::lyra::provider::{stream_chat, StreamEvent};
 use crate::lyra::reasonix::{self, context_tokens_from_messages, load_legacy_messages, SlimMemory};
 use crate::lyra::tools::tool_set;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +67,11 @@ fn send_timing(emit: &Emit, phase: &str, start: Instant) {
         "phase": phase,
         "elapsedMs": start.elapsed().as_millis() as u64,
     }));
+}
+
+fn stable_hash(value: impl AsRef<[u8]>) -> String {
+    let digest = Sha256::digest(value.as_ref());
+    format!("{digest:x}")[..16].to_string()
 }
 
 fn new_session_id() -> String {
@@ -356,7 +362,18 @@ async fn handle_prompt(
         }
     }
 
-    let fingerprint = format!("cwd={} mode={}", cwd_path.display(), ctx.mode);
+    let agent_instructions = load_agent_instructions(roots);
+    let shell = (!read_only).then(prompt::detect_shell);
+    let skills_text = format_skills_prompt(&skills);
+    let prompt_options = SystemPromptOptions {
+        cwd: cwd_path.display().to_string(),
+        read_only,
+        fast_context,
+        shell: shell.clone(),
+        skills_text,
+        custom_instructions: agent_instructions,
+    };
+    let fingerprint = system_prompt_fingerprint(&prompt_options);
     let system_changed = memory.system_fingerprint != fingerprint;
     if system_changed {
         memory.system_fingerprint = fingerprint;
@@ -374,35 +391,53 @@ async fn handle_prompt(
         .max(memory.context_tokens);
     let current_tier = reasonix::pressure_tier(measured_tokens, context_window);
     memory.context_tier = current_tier.into();
-    let max_context_tokens = ((context_window as f64) * 0.85) as u64;
-    let max_context_chars = ((context_window as f64) * 1.5) as usize;
-    let use_full_context =
-        reasonix::should_use_full_context(&memory, max_context_tokens, max_context_chars);
+    let max_context_tokens = ((context_window as f64) * 0.75) as u64;
+    let force_context_tokens = ((context_window as f64) * 0.9) as u64;
+    let max_context_chars = force_context_tokens.saturating_mul(4) as usize;
+    let mut use_full_context =
+        reasonix::should_use_full_context(&memory, force_context_tokens, max_context_chars);
     memory.append_turn(&text);
-    let summarize_target = ((context_window as f64) * 0.6) as u64;
+    // 与 Vega 一致：摘要容量判断基于重建后的 slim memory，而不是即将丢弃的
+    // 原生 reasoning/tool trajectory usage。
+    let rebuilt_context_tokens = estimate_text_tokens(&memory.format());
     let summarize_model = lightweight.clone().unwrap_or_else(|| resolved.clone());
-    if use_full_context
-        && measured_tokens > summarize_target
-        && memory
-            .compact(measured_tokens, summarize_target, |earlier| {
-                let http = http.clone();
-                let model = summarize_model.clone();
-                async move { summarize_with_model(&http, &model, &earlier).await }
-            })
-            .await
+    if memory
+        .compact(rebuilt_context_tokens, max_context_tokens, |earlier| {
+            let http = http.clone();
+            let model = summarize_model.clone();
+            async move { summarize_with_model(&http, &model, &earlier).await }
+        })
+        .await
     {
         memory.context_stage = "slim".into();
+        memory.context_tokens = 0;
+        memory.full_messages.clear();
+        use_full_context = false;
+    }
+    if !use_full_context && memory.context_stage == "full" {
+        memory.context_stage = "slim".into();
+        memory.context_tokens = 0;
+        memory.full_messages.clear();
+        memory.rewrite_version += 1;
     }
 
-    let native_messages: Vec<Value> = if !memory.pending_messages.is_empty() {
-        std::mem::take(&mut memory.pending_messages)
-    } else if use_full_context && !memory.full_messages.is_empty() {
+    let resumed_pending_turn = !memory.pending_messages.is_empty();
+    let mut native_messages: Vec<Value> = if resumed_pending_turn {
+        reasonix::repair_interrupted_tool_pairs(&std::mem::take(&mut memory.pending_messages))
+    } else if use_full_context {
         memory.full_messages.clone()
     } else {
-        reasonix::strip_completed_openai_reasoning(&memory.full_messages)
+        Vec::new()
     };
+    let strips_completed_reasoning =
+        resolved.model.api.starts_with("openai") || resolved.model.api == "azure-openai-responses";
+    if !resumed_pending_turn && strips_completed_reasoning {
+        native_messages = reasonix::strip_completed_openai_reasoning(&native_messages);
+    }
 
-    let active_turn_start = if native_messages.is_empty() {
+    let active_turn_start = if resumed_pending_turn {
+        0
+    } else if native_messages.is_empty() {
         -1
     } else {
         native_messages.len() as i64
@@ -410,21 +445,57 @@ async fn handle_prompt(
     memory.pending_messages = native_messages.clone();
 
     // ---- Agent 构建 ----
-    let agent_instructions = load_agent_instructions(roots);
     let system_prompt = if !memory.system_prompt_snapshot.is_empty() && !system_changed {
         memory.system_prompt_snapshot.clone()
     } else {
-        let shell = (!read_only).then(prompt::detect_shell);
-        build_system_prompt(&SystemPromptOptions {
-            cwd: cwd_path.display().to_string(),
-            read_only,
-            fast_context,
-            shell,
-            skills_text: format_skills_prompt(&skills),
-            custom_instructions: agent_instructions,
-        })
+        build_system_prompt(&prompt_options)
     };
     let agent_tools = tool_set(read_only, fast_context);
+    let system_prompt_hash = stable_hash(system_prompt.as_bytes());
+    let tool_shape = serde_json::to_string(
+        &agent_tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
+    let tool_schema_hash = stable_hash(tool_shape.as_bytes());
+    let mut cache_miss_reasons = Vec::new();
+    if !memory.system_prompt_hash.is_empty() && memory.system_prompt_hash != system_prompt_hash {
+        cache_miss_reasons.push("system_changed");
+    }
+    if !memory.tool_schema_hash.is_empty() && memory.tool_schema_hash != tool_schema_hash {
+        cache_miss_reasons.push("tools_changed");
+    }
+    if memory.last_shape_rewrite_version != memory.rewrite_version {
+        cache_miss_reasons.push("history_rewritten");
+    }
+    memory.system_prompt_hash = system_prompt_hash.clone();
+    memory.tool_schema_hash = tool_schema_hash.clone();
+    memory.last_shape_rewrite_version = memory.rewrite_version;
+    let history_hash = stable_hash(
+        memory
+            .without_current(!memory.pending_messages.is_empty())
+            .format()
+            .as_bytes(),
+    );
+    emit(&json!({
+        "type": "timing",
+        "phase": "context_shape",
+        "elapsedMs": 0,
+        "contextTier": memory.context_tier,
+        "rewriteVersion": memory.rewrite_version,
+        "cacheMissReasons": cache_miss_reasons,
+        "systemPromptHash": system_prompt_hash,
+        "toolSchemaHash": tool_schema_hash,
+        "historyHash": history_hash,
+    }));
     let archive_dir = Some(roots.data().join("tool-results").join(&ctx.session_id));
     let cancelled = Arc::new(AtomicBool::new(false));
     let steering = Arc::new(Mutex::new(std::collections::VecDeque::new()));
@@ -436,7 +507,7 @@ async fn handle_prompt(
         cwd: cwd_path.clone(),
         session_id: ctx.session_id.clone(),
         archive_dir,
-        shell: (!read_only).then(prompt::detect_shell),
+        shell,
         cancelled: cancelled.clone(),
         steering: steering.clone(),
         spec_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -488,6 +559,12 @@ async fn handle_prompt(
         })
     };
 
+    let prompt_text = if !resumed_pending_turn && !use_full_context {
+        reasonix::message_with_slim_memory(&text, &memory)
+    } else {
+        text
+    };
+
     // ---- Reasonix 中途维护闭包 ----
     let context_window_u = context_window;
     let mut mid_turn = {
@@ -516,6 +593,9 @@ async fn handle_prompt(
                     }
                 }
                 if rewritten {
+                    memory_ref.rewrite_version += 1;
+                    memory_ref.context_tokens = measured;
+                    memory_ref.context_tier = tier.into();
                     send_timing(emit, "mid_turn_context_rewrite", started);
                 }
             }
@@ -615,7 +695,7 @@ async fn handle_prompt(
 
     // ---- 带重试的执行 ----
     let mut retries = 0usize;
-    let mut pending = Some((text, images));
+    let mut pending = Some((prompt_text, images));
     let outcome = loop {
         let attempt = if let Some((text, images)) = pending.take() {
             agent
@@ -694,30 +774,44 @@ async fn handle_prompt(
             memory.set_latest_conclusion(last.get("content").unwrap_or(&Value::Null));
         }
         memory.pending_messages.clear();
-        let base: Vec<Value> = native_messages
-            .iter()
-            .take(if active_turn_start >= 0 {
-                active_turn_start as usize
-            } else {
-                0
-            })
-            .cloned()
-            .collect();
-        let mut full: Vec<Value> = base;
-        // 合并本会话产生的新消息（用户提示及之后）
-        let prefix_len = active_turn_start.max(0) as usize;
-        let mut new_messages = agent.messages[prefix_len.min(agent.messages.len())..].to_vec();
-        full.append(&mut new_messages);
-        let (compacted, _) = reasonix::compact_native_tool_results(&full, &memory.context_tier);
-        memory.full_messages = compacted;
-        memory.context_tokens = context_tokens_from_messages(&memory.full_messages);
-        memory.context_stage =
-            if reasonix::should_use_full_context(&memory, max_context_tokens, max_context_chars) {
-                "full"
-            } else {
-                "slim"
+        let measured = context_tokens_from_messages(&agent.messages);
+        if memory.context_stage == "full" {
+            let base: Vec<Value> = native_messages
+                .iter()
+                .take(if active_turn_start >= 0 {
+                    active_turn_start as usize
+                } else {
+                    0
+                })
+                .cloned()
+                .collect();
+            let mut full: Vec<Value> = base;
+            // 合并本会话产生的新消息（用户提示及之后）
+            let prefix_len = active_turn_start.max(0) as usize;
+            let mut new_messages = agent.messages[prefix_len.min(agent.messages.len())..].to_vec();
+            full.append(&mut new_messages);
+            let pressure = reasonix::pressure_tier(measured, context_window);
+            let (compacted, changed) = reasonix::compact_native_tool_results(&full, pressure);
+            memory.full_messages = compacted;
+            memory.context_tokens = measured;
+            memory.context_tier = pressure.into();
+            if changed {
+                memory.rewrite_version += 1;
             }
-            .into();
+            if !reasonix::should_use_full_context(&memory, force_context_tokens, max_context_chars)
+            {
+                memory.context_stage = "slim".into();
+                memory.context_tier = "force".into();
+                memory.context_tokens = 0;
+                memory.full_messages.clear();
+                memory.rewrite_version += 1;
+            }
+        } else {
+            // slim epoch 只保留用户原文、冻结摘要和结论；不能把已嵌入 slim memory 的
+            // prompt 再保存为 fullMessages，否则下一轮会重复重放压缩历史。
+            memory.context_tokens = measured;
+            memory.full_messages.clear();
+        }
     } else {
         // 取消或失败：中断轨迹作为 pendingMessages 保留，等待下一条提示恢复。
         memory.pending_messages = agent.messages.clone();
@@ -732,7 +826,33 @@ async fn handle_prompt(
     }
     // 轮末正式保存完成后清除增量 checkpoint（先存后删：中间崩溃也不会两边都丢）。
     reasonix::clear_pending_checkpoint(&sessions_root, &ctx.session_id);
-    send_timing(emit, "cache_shape", turn_started);
+    let input_tokens = total_usage
+        .get("input")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_tokens = total_usage
+        .get("cacheRead")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_write_tokens = total_usage
+        .get("cacheWrite")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_denominator = if input_tokens >= cache_read_tokens + cache_write_tokens {
+        input_tokens
+    } else {
+        input_tokens + cache_read_tokens + cache_write_tokens
+    };
+    emit(&json!({
+        "type": "timing",
+        "phase": "cache_shape",
+        "elapsedMs": turn_started.elapsed().as_millis() as u64,
+        "inputTokens": input_tokens,
+        "cacheReadTokens": cache_read_tokens,
+        "cacheWriteTokens": cache_write_tokens,
+        "cacheHitRate": if cache_denominator > 0 { cache_read_tokens as f64 / cache_denominator as f64 } else { 0.0 },
+        "rewriteVersion": memory.rewrite_version,
+    }));
 
     if let Some(error) = failed {
         emit(&json!({ "ok": false, "error": format!("Lyra provider 请求失败：{error}") }));

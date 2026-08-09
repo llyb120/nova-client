@@ -81,11 +81,15 @@ fn completions_messages(
                                     "type": "text",
                                     "text": block.get("text").and_then(Value::as_str).unwrap_or_default()
                                 })),
-                                Some("image") => parts.push(json!({
+                                Some("image") if model.supports_images => parts.push(json!({
                                     "type": "image_url",
                                     "image_url": { "url": format!("data:{};base64,{}",
                                         block.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                                         block.get("data").and_then(Value::as_str).unwrap_or_default()) }
+                                })),
+                                Some("image") | Some("image_url") => parts.push(json!({
+                                    "type": "text",
+                                    "text": "[历史图片已省略：当前模型不支持图片输入]"
                                 })),
                                 _ => {}
                             }
@@ -230,7 +234,7 @@ fn completions_body(
 
 // ---------- responses ----------
 
-fn responses_input(messages: &[Value]) -> Vec<Value> {
+fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
     let mut out = Vec::new();
     for message in messages {
         match message.get("role").and_then(Value::as_str) {
@@ -246,11 +250,15 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
                                     "type": "input_text",
                                     "text": block.get("text").and_then(Value::as_str).unwrap_or_default()
                                 })),
-                                Some("image") => parts.push(json!({
+                                Some("image") if model.supports_images => parts.push(json!({
                                     "type": "input_image",
                                     "image_url": format!("data:{};base64,{}",
                                         block.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                                         block.get("data").and_then(Value::as_str).unwrap_or_default())
+                                })),
+                                Some("image") | Some("image_url") => parts.push(json!({
+                                    "type": "input_text",
+                                    "text": "[历史图片已省略：当前模型不支持图片输入]"
                                 })),
                                 _ => {}
                             }
@@ -323,7 +331,7 @@ fn responses_body(
     let mut body = json!({
         "model": model.id,
         "instructions": system_prompt,
-        "input": responses_input(messages),
+        "input": responses_input(messages, model),
         "store": false,
         "stream": true,
         "max_output_tokens": model.max_output_tokens,
@@ -1322,6 +1330,7 @@ mod tests {
             context_window: 128_000,
             max_output_tokens: 32_000,
             service_tier: Some("flex".into()),
+            supports_images: true,
             requires_reasoning_content: false,
             session_affinity_headers: false,
             session_affinity_format: "openai".into(),
@@ -1347,6 +1356,20 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"][0]["text"], "你好");
+    }
+
+    #[test]
+    fn text_only_model_downgrades_legacy_images() {
+        let mut model = test_model("openai-completions");
+        model.supports_images = false;
+        let messages = vec![json!({ "role": "user", "content": [
+            { "type": "text", "text": "看图" },
+            { "type": "image", "mimeType": "image/png", "data": "QUJD" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,QUJD" } }
+        ]})];
+        let out = completions_messages("sys", &messages, &model);
+        assert_eq!(out[1]["content"][1]["type"], "text");
+        assert_eq!(out[1]["content"][2]["type"], "text");
     }
 
     #[test]
@@ -1383,7 +1406,8 @@ mod tests {
             json!({ "role": "toolResult", "toolCallId": "call-9", "toolName": "bash",
                     "content": [{ "type": "text", "text": "ok" }] }),
         ];
-        let out = responses_input(&messages);
+        let model = test_model("openai-responses");
+        let out = responses_input(&messages, &model);
         assert_eq!(out[0]["type"], "message");
         assert_eq!(out[0]["content"][0]["type"], "output_text");
         assert_eq!(out[1]["type"], "function_call");

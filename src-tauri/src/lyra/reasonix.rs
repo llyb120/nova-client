@@ -286,6 +286,16 @@ impl SlimMemory {
     }
 }
 
+/// fresh turn 已进入 slim stage 时，用只追加记忆替换已完成的原生轨迹。
+/// 当前用户提示已由 append_turn 记入 memory，因此格式化时先去掉当前提示再显式追加一次。
+pub fn message_with_slim_memory(text: &str, memory: &SlimMemory) -> String {
+    format!(
+        "{}\n\nUser:\n{}",
+        memory.without_current(false).format(),
+        text
+    )
+}
+
 fn slim_path(root: &Path, session_id: &str) -> PathBuf {
     root.join(format!("{session_id}.slim.json"))
 }
@@ -304,8 +314,11 @@ pub fn write_pending_checkpoint(
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let path = pending_checkpoint_path(root, session_id);
     let temp = path.with_extension("pending.tmp");
-    std::fs::write(&temp, serde_json::to_string(messages).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &temp,
+        serde_json::to_string(messages).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     std::fs::rename(&temp, &path).map_err(|e| e.to_string())
 }
 
@@ -352,7 +365,7 @@ pub fn text_content(content: &Value) -> String {
 /// 已完成的 OpenAI 轮次不需要重放 reasoning；Responses 工具调用去掉 item-id 后缀，
 /// 保留与工具结果配对的 call id。只用于完成的轮次，中断轨迹保持原样。
 pub fn strip_completed_openai_reasoning(messages: &[Value]) -> Vec<Value> {
-    messages
+    let normalized: Vec<Value> = messages
         .iter()
         .map(|message| {
             if message.get("role").and_then(Value::as_str) != Some("assistant") {
@@ -387,7 +400,150 @@ pub fn strip_completed_openai_reasoning(messages: &[Value]) -> Vec<Value> {
             message["content"] = Value::Array(next);
             message
         })
+        .collect();
+    sanitize_completed_tool_pairs(&normalized)
+}
+
+/// Provider 要求 completed assistant toolCall 与 toolResult 完整配对。旧会话可能因强杀、
+/// 早期 bridge bug 或 call-id 后缀迁移留下孤儿。这里只清理已完成历史；pending 活动轨迹
+/// 不调用本函数，仍逐字保留供恢复。
+pub fn sanitize_completed_tool_pairs(messages: &[Value]) -> Vec<Value> {
+    let result_ids = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("toolResult"))
+        .filter_map(|message| message.get("toolCallId").and_then(Value::as_str))
+        .map(|id| id.split('|').next().unwrap_or(id).to_string())
+        .collect::<std::collections::HashSet<_>>();
+    let call_ids = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .flat_map(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
+        .filter_map(|part| part.get("id").and_then(Value::as_str))
+        .map(|id| id.split('|').next().unwrap_or(id).to_string())
+        .collect::<std::collections::HashSet<_>>();
+
+    messages
+        .iter()
+        .filter_map(
+            |message| match message.get("role").and_then(Value::as_str) {
+                Some("assistant") => {
+                    let Some(content) = message.get("content").and_then(Value::as_array) else {
+                        return Some(message.clone());
+                    };
+                    let next = content
+                        .iter()
+                        .filter_map(|part| {
+                            if part.get("type").and_then(Value::as_str) != Some("toolCall") {
+                                return Some(part.clone());
+                            }
+                            let id = part
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(|id| id.split('|').next().unwrap_or(id))?;
+                            if !result_ids.contains(id) {
+                                return None;
+                            }
+                            let mut part = part.clone();
+                            part["id"] = json!(id);
+                            Some(part)
+                        })
+                        .collect::<Vec<_>>();
+                    if next.is_empty() {
+                        None
+                    } else {
+                        let mut message = message.clone();
+                        message["content"] = Value::Array(next);
+                        Some(message)
+                    }
+                }
+                Some("toolResult") => message
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .map(|id| id.split('|').next().unwrap_or(id))
+                    .filter(|id| call_ids.contains(*id))
+                    .map(|id| {
+                        let mut message = message.clone();
+                        message["toolCallId"] = json!(id);
+                        message
+                    }),
+                _ => Some(message.clone()),
+            },
+        )
         .collect()
+}
+
+/// 中断轨迹不能删除活动 toolCall；为旧 checkpoint 中缺失的结果补一个明确的中断占位，
+/// 使 provider 校验通过并让模型决定是否重跑。孤儿 toolResult 和空 assistant 安全丢弃。
+pub fn repair_interrupted_tool_pairs(messages: &[Value]) -> Vec<Value> {
+    let call_ids = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .flat_map(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
+        .filter_map(|part| part.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
+    let result_ids = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("toolResult"))
+        .filter_map(|message| message.get("toolCallId").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
+    let mut out = Vec::new();
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) == Some("toolResult") {
+            if message
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| call_ids.contains(id))
+            {
+                out.push(message.clone());
+            }
+            continue;
+        }
+        let content = message.get("content").and_then(Value::as_array);
+        if message.get("role").and_then(Value::as_str) == Some("assistant")
+            && content.is_some_and(|parts| parts.is_empty())
+        {
+            continue;
+        }
+        out.push(message.clone());
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        for part in content.into_iter().flatten() {
+            if part.get("type").and_then(Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            let Some(id) = part.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if result_ids.contains(id) {
+                continue;
+            }
+            out.push(json!({
+                "role": "toolResult",
+                "toolCallId": id,
+                "toolName": part.get("name").and_then(Value::as_str).unwrap_or_default(),
+                "content": [{ "type": "text", "text": "[interrupted tool call — no result was persisted; re-run if needed]" }],
+                "isError": true,
+            }));
+        }
+    }
+    out
 }
 
 /// 每个 assistant 请求都上报当时的上下文大小；取最大（最近一次），跨工具调用不求和。
@@ -607,12 +763,54 @@ mod tests {
     }
 
     #[test]
+    fn slim_prompt_replaces_completed_native_history() {
+        let mut memory = SlimMemory::new();
+        memory.append_turn("旧要求");
+        memory.set_latest_conclusion(&json!([{ "type": "text", "text": "旧结论" }]));
+        memory.append_turn("当前要求");
+        let text = message_with_slim_memory("当前要求", &memory);
+        assert!(text.contains("旧要求"));
+        assert!(text.contains("旧结论"));
+        assert_eq!(text.matches("当前要求").count(), 1);
+        assert!(text.ends_with("User:\n当前要求"));
+    }
+
+    #[test]
     fn pressure_tiers() {
         assert_eq!(pressure_tier(0, 100), "normal");
         assert_eq!(pressure_tier(50, 100), "warn");
         assert_eq!(pressure_tier(60, 100), "snip");
         assert_eq!(pressure_tier(80, 100), "elide");
         assert_eq!(pressure_tier(90, 100), "force");
+    }
+
+    #[test]
+    fn removes_orphaned_completed_tool_pairs() {
+        let messages = vec![
+            json!({ "role": "assistant", "content": [
+                { "type": "text", "text": "keep" },
+                { "type": "toolCall", "id": "paired|fc_1", "name": "read", "arguments": {} },
+                { "type": "toolCall", "id": "orphan|fc_2", "name": "read", "arguments": {} }
+            ]}),
+            json!({ "role": "toolResult", "toolCallId": "paired|fc_1", "content": [{ "type": "text", "text": "ok" }] }),
+            json!({ "role": "toolResult", "toolCallId": "result-only", "content": [{ "type": "text", "text": "bad" }] }),
+        ];
+        let out = strip_completed_openai_reasoning(&messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(out[0]["content"][1]["id"], "paired");
+        assert_eq!(out[1]["toolCallId"], "paired");
+    }
+
+    #[test]
+    fn repairs_interrupted_missing_tool_result() {
+        let messages = vec![json!({ "role": "assistant", "content": [
+            { "type": "toolCall", "id": "call|fc", "name": "read", "arguments": {} }
+        ]})];
+        let out = repair_interrupted_tool_pairs(&messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["toolCallId"], "call|fc");
+        assert_eq!(out[1]["isError"], true);
     }
 
     #[test]

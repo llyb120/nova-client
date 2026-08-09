@@ -2,6 +2,7 @@
 //! 工具结果治理（超限归档 + 首尾截断）、provider 重试判定与用量合并。
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Reasonix 风格的单工具上下文预算；超限文本先归档再截断。
@@ -357,6 +358,26 @@ pub fn load_agent_instructions(roots: &crate::lyra::config::Roots) -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
+    let shell = options
+        .shell
+        .as_ref()
+        .map(|shell| format!("{:?}:{}", shell.kind, shell.program))
+        .unwrap_or_default();
+    let shape = json!({
+        "cwd": options.cwd.trim_start_matches(r"\\?\").replace('\\', "/"),
+        "readOnly": options.read_only,
+        "fastContext": options.fast_context,
+        "shell": shell,
+        "skills": options.skills_text,
+        "customInstructions": options.custom_instructions,
+        "finalNote": std::env::var("LYRA_FINAL_NOTE").ok().as_deref() != Some("off"),
+        "editMode": std::env::var("LYRA_EDIT_MODE").unwrap_or_default(),
+    });
+    let digest = Sha256::digest(serde_json::to_vec(&shape).unwrap_or_default());
+    format!("{digest:x}")[..16].to_string()
 }
 
 /// 稳定段在前、动态段在后，配合 session 级 prompt_cache_key 最大化前缀缓存命中。

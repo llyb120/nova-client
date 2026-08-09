@@ -85,6 +85,8 @@ pub struct ResolvedModel {
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub service_tier: Option<String>,
+    /// 当前模型是否声明支持图片输入；旧会话中的图片对 text-only 模型应降级为占位文本。
+    pub supports_images: bool,
     /// deepseek 等要求 assistant 消息回传 reasoning_content。
     pub requires_reasoning_content: bool,
     /// 非官方 OpenAI 兼容代理默认发送会话亲和头，提高前缀缓存命中。
@@ -356,6 +358,10 @@ pub fn resolve_model(
                 .and_then(Value::as_u64)
                 .unwrap_or(32_000),
             service_tier,
+            supports_images: model
+                .pointer("/modalities/input")
+                .and_then(Value::as_array)
+                .is_some_and(|input| input.iter().any(|value| value.as_str() == Some("image"))),
             requires_reasoning_content,
             session_affinity_headers,
             session_affinity_format: if url_lower.contains("openrouter") {
