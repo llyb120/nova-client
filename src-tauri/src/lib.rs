@@ -64,8 +64,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use threads::{
-    now_ms, session_cleanup_is_expired, AgentKind, Item, ProjectStore, PromptImage, RoamingStore,
-    Thread, ThreadMeta, ThreadStore, ThreadTrashStore, Worktree, WorktreeRecord, WorktreeStore,
+    now_ms, render_stage_context, session_cleanup_is_expired, AgentKind, Item, ProjectStore,
+    PromptImage, RoamingStore, Thread, ThreadMeta, ThreadStore, ThreadTrashStore, Worktree,
+    WorktreeRecord, WorktreeStore,
 };
 
 pub struct AppState {
@@ -1825,6 +1826,41 @@ async fn create_thread(
     Ok(thread)
 }
 
+#[tauri::command]
+fn create_stage_thread(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    source_thread_id: String,
+) -> Result<Thread, String> {
+    let (cwd, source_id) = {
+        let store = state.store.lock().unwrap();
+        let source = store.get(&source_thread_id).ok_or("源会话不存在")?;
+        (source.cwd.clone(), source.id.clone())
+    };
+    let (agent_kind, model) = {
+        let settings = state.settings.lock().unwrap();
+        let kind = AgentKind::from_str(settings.lightweight_model_agent.trim())
+            .unwrap_or(AgentKind::Alkaid);
+        let model = (!settings.lightweight_model.trim().is_empty())
+            .then(|| settings.lightweight_model.trim().to_string());
+        (kind, model)
+    };
+    if !state.agent_enabled(&agent_kind) {
+        return Err(format!("轻量模型后端 {} 已关闭", agent_kind.label()));
+    }
+    let mut thread = Thread::new(cwd, agent_kind, model, Some("build".into()), None, false);
+    thread.parent_thread_id = Some(source_id.clone());
+    thread.stage_source_thread_id = Some(source_id);
+    thread.title = "[Stage] 新会话".into();
+    {
+        let mut store = state.store.lock().unwrap();
+        store.threads.push(thread.clone());
+        store.save();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    Ok(thread)
+}
+
 /// 为「不使用项目」的会话新建一个空的临时目录
 #[tauri::command]
 fn scratch_dir() -> Result<String, String> {
@@ -3451,6 +3487,23 @@ pub(crate) fn dispatch_prompt(
             t.mind_thread,
         )
     };
+    // Stage 引用不是一次性快照：每次投递都从源会话最新 items 重建，并通过各后端
+    // 已有的隐藏 prompt-context 通道注入，不污染 Stage 自己展示的用户消息。
+    {
+        let mut store = state.store.lock().unwrap();
+        let source_id = store
+            .get(&thread_id)
+            .and_then(|thread| thread.stage_source_thread_id.clone());
+        if let Some(source_id) = source_id {
+            let context = store
+                .get(&source_id)
+                .map(render_stage_context)
+                .ok_or("Stage 引用的源会话不存在")?;
+            if let Some(stage) = store.get_mut(&thread_id) {
+                stage.pending_stage_context = Some(context);
+            }
+        }
+    }
     if employee_id.is_some() && !mind_thread {
         return Err(
             "数字员工会话不能直接发送 prompt；请通过员工交办/账本流程，让 Dream 先做开工预检。"
@@ -6312,6 +6365,7 @@ pub fn run() {
             take_restore_thread,
             signature_pending,
             create_thread,
+            create_stage_thread,
             delete_thread,
             delete_threads,
             delete_project_threads,

@@ -40,6 +40,12 @@ export function getSlashSuggestions(
       input: "/easy ",
     },
     {
+      name: "stage",
+      description: "用轻量模型开启引用当前会话的 Stage：前置内容先续跑当前会话",
+      kind: "Nova",
+      input: "/stage ",
+    },
+    {
       name: "fire",
       description: "分阶段执行，并用独立会话反复验收直到目标达成",
       kind: "Nova",

@@ -1602,13 +1602,46 @@ async function handleEmployeeWorkflowRequest(payload: {
   }
 }
 
-/** 处理 /fire、/plan 等内置命令。返回 true 表示已消费，调用方不应再发给模型。 */
+type StageInput = { currentPrompt: string; stagePrompt: string };
+
+function parseStageInput(input: string): StageInput | null {
+  const match = /(^|\s)\/stage(?:[ \t]+|(?=\r?\n)|$)/i.exec(input);
+  if (!match) return null;
+  const commandStart = match.index + match[1].length;
+  const stagePrompt = input.slice(commandStart + match[0].length - match[1].length).trim();
+  if (!stagePrompt) throw new Error("请在 /stage 后输入新会话提示词，例如 /stage 复核当前方案");
+  return { currentPrompt: input.slice(0, commandStart).trim(), stagePrompt };
+}
+
+async function startStageThread(sourceThreadId: string, prompt: string): Promise<void> {
+  const thread = await api.createStageThread(sourceThreadId);
+  rememberThreadSnapshot(thread);
+  await refreshThreads();
+  await openThread(thread.id);
+  setState("running", thread.id, true);
+  try {
+    await api.sendPrompt(thread.id, prompt);
+  } catch (error) {
+    setState("running", thread.id, false);
+    throw error;
+  }
+}
+
+/** 处理 /stage、/fire、/plan 等内置命令。返回 true 表示已消费。 */
 async function tryBuiltinPrompt(
   threadId: string,
   text: string,
   images: PromptImage[],
 ): Promise<boolean> {
   const builtInInput = text.trim();
+  const stage = parseStageInput(builtInInput);
+  if (stage) {
+    if (images.length > 0) throw new Error("/stage 暂不支持附件");
+    // 命令前有实质内容时，先作为普通提示追加到当前会话；Stage 随后独立启动。
+    if (stage.currentPrompt) await deliverPrompt(threadId, stage.currentPrompt, []);
+    await startStageThread(threadId, stage.stagePrompt);
+    return true;
+  }
   if (/^\/plan(?:\s|$)/i.test(builtInInput)) {
     const goal = builtInInput.replace(/^\/plan(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /plan 后输入规划目标，例如 /plan 设计登录流程");
@@ -1694,6 +1727,11 @@ function parseRunInput(input: string): { workflowId: string; vars: Record<string
 /** 创建会话 / 暂存前提前校验内置命令，避免 worktree 建完才发现 /fire 非法。 */
 export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   const builtInInput = text.trim();
+  const stage = parseStageInput(builtInInput);
+  if (stage) {
+    if (images.length > 0) throw new Error("/stage 暂不支持附件");
+    return;
+  }
   if (/^\/plan(?:\s|$)/i.test(builtInInput)) {
     const goal = builtInInput.replace(/^\/plan(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /plan 后输入规划目标，例如 /plan 设计登录流程");

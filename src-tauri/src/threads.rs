@@ -551,6 +551,12 @@ pub struct Thread {
     /// 会话树父节点：用于把数字员工“开工预检”与后续开发会话关联展示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
+    /// Stage 会话引用的源会话。每次发送前都会从源会话最新时间线重建上下文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_source_thread_id: Option<String>,
+    /// 仅供下一次 prompt 隐式注入，不持久化到会话文件或前端快照。
+    #[serde(skip)]
+    pub pending_stage_context: Option<String>,
     /// 本会话从哪张线索卡发起；后续生成线索时默认以它为当前位置。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_clue_card_id: Option<String>,
@@ -615,6 +621,8 @@ impl Thread {
             employee_id: None,
             mind_thread: false,
             parent_thread_id: None,
+            stage_source_thread_id: None,
+            pending_stage_context: None,
             active_clue_card_id: None,
             clue_context: None,
             created_at: now,
@@ -791,13 +799,59 @@ impl Thread {
             None
         };
         let handoff = self.take_handoff_context(to_label);
-        match (clue, handoff) {
-            (Some(clue), Some(handoff)) => Some(format!("{clue}\n\n{handoff}")),
-            (Some(clue), None) => Some(clue),
-            (None, Some(handoff)) => Some(handoff),
-            (None, None) => None,
+        let stage = self.pending_stage_context.take();
+        [clue, handoff, stage]
+            .into_iter()
+            .flatten()
+            .reduce(|left, right| format!("{left}\n\n{right}"))
+    }
+}
+
+/// 给 Stage 会话提供源会话的轻量引用：只保留每轮用户提示词和该轮最后一段助手结论。
+pub fn render_stage_context(source: &Thread) -> String {
+    let mut turns: Vec<(String, String)> = Vec::new();
+    let mut prompt: Option<String> = None;
+    let mut conclusion = String::new();
+    for item in &source.items {
+        match item {
+            Item::User { text, .. } => {
+                if let Some(previous) = prompt.take() {
+                    turns.push((previous, conclusion.trim().to_string()));
+                }
+                prompt = Some(text.trim().to_string());
+                conclusion.clear();
+            }
+            Item::Assistant { text, .. } if prompt.is_some() && !text.trim().is_empty() => {
+                conclusion = text.trim().to_string();
+            }
+            _ => {}
         }
     }
+    if let Some(previous) = prompt {
+        turns.push((previous, conclusion.trim().to_string()));
+    }
+    let body = turns
+        .into_iter()
+        .enumerate()
+        .map(|(index, (prompt, conclusion))| {
+            let conclusion = if conclusion.is_empty() {
+                "（本轮尚无结论）"
+            } else {
+                &conclusion
+            };
+            format!(
+                "第 {} 轮\n提示词：{}\n结论：{}",
+                index + 1,
+                prompt,
+                conclusion
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "[Stage 引用上下文]\n你正在一个引用会话中工作。以下内容来自源会话的最新时间线；每次发送消息时都会重新注入，请以最新版本为准。\n\n{}",
+        if body.is_empty() { "（源会话暂无对话）" } else { &body }
+    )
 }
 
 #[derive(Serialize, Clone, Debug)]

@@ -282,6 +282,8 @@ export interface Thread {
   mindThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
+  /** Stage 会话动态引用的源会话。 */
+  stageSourceThreadId?: string | null;
   activeClueCardId?: string | null;
   clueContext?: ClueContextSnapshot | null;
   createdAt: number;
