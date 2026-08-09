@@ -163,6 +163,7 @@ assert.deepEqual(modelSelection("grok-4.5-high-false"), { id: "grok-4.5", params
 assert.deepEqual(modelSelection("composer-2.5-fast"), { id: "composer-2.5", params: [{ id: "fast", value: "true" }] });
 assert.deepEqual(modelSelection("gpt-5.6-sol"), { id: "gpt-5.6-sol" });
 assert.deepEqual(modelSelection("grok-4.5::effort=high&fast=false"), { id: "grok-4.5", params: [{ id: "effort", value: "high" }, { id: "fast", value: "false" }] });
+assert.deepEqual(modelSelection("__cursor_auto__"), { id: "auto" });
 assert.equal(
   agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a", mode: "agent" }),
   agentFingerprint({ model: "grok-4.5-high-fast", cwd: "/tmp/a" }),
@@ -259,6 +260,9 @@ assert.deepEqual(cursorModelOptions([
   { value: "grok-4.5::effort=high&fast=false", name: "Cursor Grok 4.5 High", description: undefined },
   { value: "grok-4.5::effort=high&fast=true", name: "Cursor Grok 4.5 High Fast", description: undefined },
 ]);
+assert.deepEqual(modelSelection("__cursor_auto__"), { id: "auto" });
+cursorModelOptions([{ id: "default", displayName: "Default" }]);
+assert.deepEqual(modelSelection("__cursor_auto__"), { id: "default" });
 assert.deepEqual(await promptMessage([{ type: "text", text: "look" }, { type: "image_data", mime: "image/png", data: "base64" }]), { text: "look", images: [{ data: "base64", mimeType: "image/png" }] });
 assert.equal(await promptMessage([{ type: "text", text: "inspect" }, { type: "local_image", path: "C:/Users/1/Desktop/1.xlsx" }]), "inspect\n\nAttached file: C:/Users/1/Desktop/1.xlsx");
 assert.equal(threadMemoryKey("thread-a"), "nova-thread-thread-a");

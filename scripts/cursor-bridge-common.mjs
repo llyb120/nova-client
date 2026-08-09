@@ -317,8 +317,13 @@ export function cursorTodoPlan(toolCall) {
     .filter((todo) => todo.content);
 }
 
+let cursorAutoModelId = "auto";
+
 export function modelSelection(selected) {
-  if (!selected || selected === "__cursor_auto__") return undefined;
+  if (!selected) return undefined;
+  // Cursor SDK local agents require a concrete model selection. The UI sentinel must therefore
+  // resolve to the Auto/default model id returned by models.list(), not to an omitted model.
+  if (selected === "__cursor_auto__") return { id: cursorAutoModelId };
   const separator = selected.indexOf("::");
   if (separator >= 0) {
     const id = selected.slice(0, separator);
@@ -360,8 +365,11 @@ export function encodeModelVariant(model, variant) {
 }
 
 export function cursorModelOptions(models) {
+  const autoModel = models.find((model) => model?.id?.toLowerCase() === "auto")
+    ?? models.find((model) => model?.id?.toLowerCase() === "default");
+  cursorAutoModelId = autoModel?.id || "auto";
   // 非空哨兵值：与「未选择」区分开，前端显式选中后不会被 resolveAvailableModel 弹回；
-  // 发送时由 modelSelection 翻译回 undefined，即 Cursor 官方默认模型。
+  // 发送时由 modelSelection 翻译为 Cursor models.list() 返回的 Auto/default 模型 id。
   const options = [{ value: "__cursor_auto__", name: "Auto（自动选具体模型）" }];
   for (const model of models) {
     if (!model.id || ["auto", "default"].includes(model.id.toLowerCase())) continue;
