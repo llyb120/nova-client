@@ -88,6 +88,7 @@ assert.equal(finalItems[0].id, "message-1-2", "the final snapshot must replace t
 const trailingDeltaStream = {
   messageId: "message-2",
   blocks: new Map([[0, { type: "text", text: "完整回答？" }]]),
+  finalizedBlocks: [],
 };
 assert.deepEqual(assistantItems({
   message: {
@@ -95,6 +96,22 @@ assert.deepEqual(assistantItems({
     content: [{ id: "trailing-punctuation", type: "text", text: "？" }],
   },
 }, trailingDeltaStream), [], "a final snapshot containing only the last delta must not duplicate punctuation");
+
+const splitSnapshotStream = {
+  messageId: "message-3",
+  blocks: new Map([[0, { type: "text", text: "完整回答。" }]]),
+  finalizedBlocks: [],
+};
+assert.deepEqual(assistantItems({
+  message: { id: "main-snapshot", content: [{ type: "text", text: "完整回答。" }] },
+}, splitSnapshotStream), [{ id: "message-3-0", type: "agent_message", text: "完整回答。" }]);
+streamEventItem({ event: { type: "message_start", message: { id: "message-4" } } }, splitSnapshotStream);
+assert.deepEqual(assistantItems({
+  message: { id: "punctuation-snapshot", content: [{ id: "punctuation", type: "text", text: "。" }] },
+}, splitSnapshotStream), [], "a later punctuation-only assistant snapshot must not create a standalone item");
+assert.deepEqual(assistantItems({
+  message: { id: "real-short-reply", content: [{ type: "text", text: "好" }] },
+}, splitSnapshotStream), [{ id: "real-short-reply-0", type: "agent_message", text: "好" }], "non-punctuation replies must remain visible");
 
 const toolStream = { messageId: "message", blocks: new Map(), tools: new Map() };
 const [pendingTool] = assistantItems({

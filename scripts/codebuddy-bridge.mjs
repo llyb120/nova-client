@@ -120,17 +120,32 @@ async function* promptMessages(request, env = process.env) {
   yield { type: "user", session_id: request.sessionId || "", message: { role: "user", content }, parent_tool_use_id: null };
 }
 
+const TRAILING_PUNCTUATION_RE = /^[\p{P}\p{S}]+$/u;
+
 function assistantItems(message, stream) {
   const matchedStreamIndexes = new Set();
-  return (message.message?.content ?? []).flatMap((block, index) => {
+  const finalizedBlocks = stream?.finalizedBlocks ?? [];
+  const items = (message.message?.content ?? []).flatMap((block, index) => {
     let streamedIndex;
     let alreadyStreamedSuffix = false;
     if (block.type === "text" || block.type === "thinking") {
       const finalText = block.type === "text" ? block.text : block.thinking;
+      // CodeBuddy may emit the main answer and its final punctuation as two
+      // assistant snapshots. The second snapshot has no matching block because
+      // message_start cleared the current stream, so also compare with earlier
+      // finalized snapshots from this turn.
+      if (
+        finalText &&
+        TRAILING_PUNCTUATION_RE.test(finalText) &&
+        finalizedBlocks.some((candidate) => candidate.type === block.type && candidate.text?.endsWith(finalText))
+      ) {
+        alreadyStreamedSuffix = true;
+      }
       // The final snapshot may omit or reorder thinking blocks, so its array
       // indexes do not necessarily match content_block event indexes. Match the
       // accumulated stream by type/content and retain its ID.
       for (const [candidateIndex, candidate] of stream?.blocks ?? []) {
+        if (alreadyStreamedSuffix) break;
         if (matchedStreamIndexes.has(candidateIndex) || candidate.type !== block.type) continue;
         if (finalText === candidate.text || finalText?.startsWith(candidate.text)) {
           streamedIndex = candidateIndex;
@@ -141,12 +156,15 @@ function assistantItems(message, stream) {
         // only the last delta (often a trailing punctuation mark). It was already
         // included in the accumulated stream, so emitting it with the snapshot ID
         // would create a standalone duplicate message.
-        if (finalText && candidate.text?.endsWith(finalText)) {
+        if (finalText && TRAILING_PUNCTUATION_RE.test(finalText) && candidate.text?.endsWith(finalText)) {
           streamedIndex = candidateIndex;
           alreadyStreamedSuffix = true;
           matchedStreamIndexes.add(candidateIndex);
           break;
         }
+      }
+      if (!alreadyStreamedSuffix) {
+        stream?.finalizedBlocks?.push({ type: block.type, text: finalText });
       }
     }
     if (alreadyStreamedSuffix) return [];
@@ -162,6 +180,7 @@ function assistantItems(message, stream) {
     }
     return [];
   });
+  return items;
 }
 
 /** CodeBuddy SDK reports completed tools as user/tool_result messages. Re-emit the same item ID
@@ -223,7 +242,7 @@ function streamEventItem(message, stream) {
 
 async function runPrompt(lines, request) {
   const pending = new Map();
-  const stream = { messageId: "message", blocks: new Map(), tools: new Map() };
+  const stream = { messageId: "message", blocks: new Map(), tools: new Map(), finalizedBlocks: [] };
   let sessionId = request.sessionId;
   let checkpoint;
   let activeQuery;
