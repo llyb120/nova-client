@@ -1014,6 +1014,9 @@ export function TranscriptCanvas(props: {
   };
 
   const finishPointer = () => {
+    // executeAction(toggle) 与 pointerup 同步发生，父级 stickToBottom 要到下一轮
+    // 响应式更新才会变为 false；不能按旧值钉底，否则会先跳到底部再折叠。
+    const preserveToggleAnchor = toggleScrollAnchor !== null;
     if (selecting) {
       selecting = false;
       if (selA === selB) {
@@ -1024,7 +1027,7 @@ export function TranscriptCanvas(props: {
     pointerActive = false;
     scrollDrag = null;
     downPos = null;
-    if (props.stickToBottom) pinBottom();
+    if (props.stickToBottom && !preserveToggleAnchor) pinBottom();
   };
 
   const onPointerUp = (e: PointerEvent) => {
