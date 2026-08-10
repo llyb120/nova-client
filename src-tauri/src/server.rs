@@ -295,7 +295,7 @@ fn show_config(show_token: bool) -> Result<(), String> {
         "environment": environment,
         "defaultMode": settings.default_mode,
         "agents": {
-            "vega": { "enabled": settings.alkaid_enabled, "proxy": settings.vega_proxy },
+            "vega": { "enabled": settings.vega_enabled, "proxy": settings.vega_proxy },
             "devin": { "enabled": settings.devin_enabled, "path": settings.devin_path, "proxy": settings.devin_proxy },
             "codex": { "enabled": settings.codex_enabled, "path": settings.codex_path, "args": settings.codex_args, "proxy": settings.codex_proxy },
             "codebuddy": { "enabled": settings.codebuddy_enabled, "path": settings.codebuddy_path, "proxy": settings.codebuddy_proxy },
@@ -355,7 +355,7 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
             "claude-proxy" => settings.claudecode_proxy = value.into(),
             "cursor-proxy" => settings.cursor_proxy = value.into(),
             "opencode-proxy" => settings.opencode_proxy = value.into(),
-            "vega-enabled" => settings.alkaid_enabled = parse_bool(value)?,
+            "vega-enabled" => settings.vega_enabled = parse_bool(value)?,
             "devin-enabled" => settings.devin_enabled = parse_bool(value)?,
             "codex-enabled" => settings.codex_enabled = parse_bool(value)?,
             "codebuddy-enabled" => settings.codebuddy_enabled = parse_bool(value)?,

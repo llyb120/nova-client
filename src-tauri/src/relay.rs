@@ -241,7 +241,7 @@ fn shared_quota_model_keys(shared_options: &Value) -> HashSet<String> {
 
 fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> bool {
     let enabled = match kind {
-        AgentKind::Alkaid => settings.alkaid_enabled,
+        AgentKind::Alkaid => settings.vega_enabled,
         AgentKind::Lyra => settings.lyra_enabled,
         AgentKind::Devin => settings.devin_enabled,
         AgentKind::Codex => settings.codex_enabled,
@@ -2668,7 +2668,7 @@ impl RelayManager {
                 let s = state.settings.lock().unwrap();
                 let avail = state.backend_availability.lock().unwrap();
                 let kinds = [
-                    (AgentKind::Alkaid, s.alkaid_enabled),
+                    (AgentKind::Alkaid, s.vega_enabled),
                     (AgentKind::Devin, s.devin_enabled),
                     (AgentKind::Codex, s.codex_enabled),
                     (AgentKind::CodeBuddy, s.codebuddy_enabled),
@@ -4747,14 +4747,14 @@ mod tests {
         ));
 
         let mut vega_settings = Settings::default();
-        vega_settings.alkaid_enabled = true;
+        vega_settings.vega_enabled = true;
         vega_settings.quota_shared_models = vec!["alkaid:provider/model".into()];
         assert!(quota_model_is_shared(
             &vega_settings,
             &AgentKind::Alkaid,
             "provider/model"
         ));
-        vega_settings.alkaid_enabled = false;
+        vega_settings.vega_enabled = false;
         assert!(!quota_model_is_shared(
             &vega_settings,
             &AgentKind::Alkaid,

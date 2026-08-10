@@ -129,7 +129,7 @@ pub struct Settings {
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
-    pub alkaid_enabled: bool,
+    pub vega_enabled: bool,
     /// Lyra 原生 agent（与 Vega 共用配置）。
     pub lyra_enabled: bool,
     pub codex_enabled: bool,
@@ -215,7 +215,7 @@ impl Default for Settings {
             model_favorites: Vec::new(),
             session_shortcuts: Vec::new(),
             devin_enabled: false,
-            alkaid_enabled: true,
+            vega_enabled: false,
             lyra_enabled: true,
             codex_enabled: false,
             codexplus_enabled: false,
@@ -309,15 +309,21 @@ mod tests {
     }
 
     #[test]
-    fn only_alkaid_is_enabled_by_default() {
+    fn vega_and_external_backends_are_disabled_by_default() {
         let settings = Settings::default();
-        assert!(settings.alkaid_enabled);
+        assert!(!settings.vega_enabled);
         assert!(!settings.devin_enabled);
         assert!(!settings.codex_enabled);
         assert!(!settings.codebuddy_enabled);
         assert!(!settings.claudecode_enabled);
         assert!(!settings.cursor_enabled);
         assert!(!settings.opencode_enabled);
+    }
+
+    #[test]
+    fn legacy_alkaid_enabled_does_not_enable_vega() {
+        let settings: Settings = serde_json::from_str(r#"{"alkaidEnabled":true}"#).unwrap();
+        assert!(!settings.vega_enabled);
     }
 
     #[test]

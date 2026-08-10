@@ -496,7 +496,7 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
 function agentEnabled(s: Settings, k: AgentKind): boolean {
   switch (k) {
     case "alkaid":
-      return s.alkaidEnabled !== false;
+      return s.vegaEnabled === true;
     case "lyra":
       return s.lyraEnabled !== false;
     case "devin":

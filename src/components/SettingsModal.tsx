@@ -314,7 +314,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   );
   const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
   const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
-  const [alkaidEnabled, setAlkaidEnabled] = createSignal(s?.alkaidEnabled !== false);
+  const [vegaEnabled, setVegaEnabled] = createSignal(s?.vegaEnabled === true);
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
   const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
@@ -470,7 +470,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const enabledCount = () =>
     [
       devinEnabled(),
-      alkaidEnabled(),
+      vegaEnabled(),
       lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
@@ -481,7 +481,7 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const quotaShareKinds = createMemo<AgentKind[]>(() => {
     const kinds: AgentKind[] = [];
-    if (alkaidEnabled()) kinds.push("alkaid");
+    if (vegaEnabled()) kinds.push("alkaid");
     if (lyraEnabled()) kinds.push("lyra");
     if (devinEnabled()) kinds.push("devin");
     if (codexEnabled()) kinds.push("codex");
@@ -776,7 +776,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     modelFavorites: state.settings?.modelFavorites ?? [],
     sessionShortcuts: draftSessionShortcuts(),
     devinEnabled: devinEnabled(),
-    alkaidEnabled: alkaidEnabled(),
+    vegaEnabled: vegaEnabled(),
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
@@ -1681,9 +1681,9 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <label class="backend-switch">
                   <input
                     type="checkbox"
-                    checked={alkaidEnabled()}
-                    disabled={alkaidEnabled() && enabledCount() === 1}
-                    onChange={(e) => setAlkaidEnabled(e.currentTarget.checked)}
+                    checked={vegaEnabled()}
+                    disabled={vegaEnabled() && enabledCount() === 1}
+                    onChange={(e) => setVegaEnabled(e.currentTarget.checked)}
                   />
                   <span>启用</span>
                 </label>

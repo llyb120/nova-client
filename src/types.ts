@@ -470,7 +470,7 @@ export interface Settings {
   sessionShortcuts: SessionShortcut[];
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
-  alkaidEnabled: boolean;
+  vegaEnabled: boolean;
   lyraEnabled: boolean;
   codexEnabled: boolean;
   codebuddyEnabled: boolean;

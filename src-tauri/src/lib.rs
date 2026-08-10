@@ -170,7 +170,7 @@ impl AppState {
     pub fn agent_enabled(&self, kind: &AgentKind) -> bool {
         let s = self.settings.lock().unwrap();
         match kind {
-            AgentKind::Alkaid => s.alkaid_enabled,
+            AgentKind::Alkaid => s.vega_enabled,
             AgentKind::Lyra => s.lyra_enabled,
             AgentKind::Devin => s.devin_enabled,
             AgentKind::Codex => s.codex_enabled,
@@ -4169,7 +4169,7 @@ async fn apply_runtime_settings(
         let restart_vega = restart_all_agents
             || s.vega_proxy != settings.vega_proxy
             || s.vega_context_mode != settings.vega_context_mode
-            || s.alkaid_enabled != settings.alkaid_enabled;
+            || s.vega_enabled != settings.vega_enabled;
         let restart_devin = restart_all_agents
             || s.devin_path != settings.devin_path
             || s.acp_args != settings.acp_args
