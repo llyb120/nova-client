@@ -2626,7 +2626,12 @@ export function groupCacheSig(group: Group): string {
     keys.push(`tool-${it.id}`, `tool-raw-${it.id}`, `thought-${it.id}`, String(it.id));
   }
   let sig = "";
-  for (const k of keys) sig += state.expanded[k] ? "1" : "0";
+  // undefined 会走 active/bodyExpanded 默认值，必须与用户显式收起的 false 区分；
+  // 否则首次点击 true-default 项时签名仍是 0，缓存继续复用展开布局。
+  for (const k of keys) {
+    const value = state.expanded[k];
+    sig += value === undefined ? "-" : value ? "1" : "0";
+  }
   // 内容指纹：最后一条 assistant/thought 的 text 长度 + user text 长度
   // 流式期间 text 增长 → sig 变 → 缓存失效 → 重布局
   // 非流式期间 text 不变 → sig 不变 → 缓存命中 → 跳过布局

@@ -99,6 +99,8 @@ export function TranscriptCanvas(props: {
   let hover: Region | null = null;
   let hoverAction: Action | null = null;
   let scrollbarHover = false;
+  // 展开/折叠时锁住触发行在视口中的位置，避免吸底重排把滚动条和按钮一起推走。
+  let toggleScrollAnchor: { key: string; viewportY: number } | null = null;
   let selA = -1;
   let selB = -1;
   let selAnchor = -1;
@@ -327,7 +329,16 @@ export function TranscriptCanvas(props: {
     }
 
     const max = Math.max(0, (doc?.height ?? 0) - h);
-    if (props.stickToBottom && !pointerActive) scrollTop = max;
+    const anchor = toggleScrollAnchor;
+    toggleScrollAnchor = null;
+    if (anchor && doc) {
+      const entry = doc.regions.find(({ region }) =>
+        region.action.kind === "toggle" && String(region.action.key) === anchor.key,
+      );
+      scrollTop = entry
+        ? Math.max(0, Math.min(max, entry.top + entry.region.y - anchor.viewportY))
+        : Math.min(scrollTop, max);
+    } else if (props.stickToBottom && !pointerActive) scrollTop = max;
     else scrollTop = Math.min(scrollTop, max);
     setViewTop(scrollTop);
     requestRender();
@@ -775,9 +786,17 @@ export function TranscriptCanvas(props: {
 
   const executeAction = (action: Action, e: { clientX: number; clientY: number }) => {
     switch (action.kind) {
-      case "toggle":
-        toggleExpanded(String(action.key), action.value as boolean | undefined);
+      case "toggle": {
+        const key = String(action.key);
+        const entry = doc?.regions.find(({ region }) => region.action === action);
+        if (entry) {
+          toggleScrollAnchor = { key, viewportY: entry.top + entry.region.y - scrollTop };
+        }
+        // 详情开合属于主动浏览；先退出吸底，下一次布局按上面的锚点稳定视口。
+        if (props.stickToBottom) props.onStickChange(false);
+        toggleExpanded(key, action.value as boolean | undefined);
         break;
+      }
       case "copy": {
         void navigator.clipboard.writeText(String(action.text ?? ""));
         copied.add(String(action.id));
