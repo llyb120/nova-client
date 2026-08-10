@@ -6037,9 +6037,7 @@ pub fn run() {
             let notices = notice::NoticeStore::load(&dir);
             let marks = marks::MarkStore::load(&dir);
             let vectors = semantic::VectorStore::load(&dir);
-            let context_learning_enabled = settings.context_learning_enabled;
-            let context_service =
-                context_service::ContextService::start(&dir, context_learning_enabled)?;
+            let context_service = context_service::ContextService::start(&dir)?;
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());

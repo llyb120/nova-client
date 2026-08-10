@@ -745,15 +745,7 @@ export async function createAlkaidAgent(options = {}) {
     ...tool,
     async execute(toolCallId, params, signal, onUpdate) {
       const result = await tool.execute(toolCallId, params, signal, onUpdate);
-      if (tool.name === "edit" && result?.isError !== true && typeof params?.path === "string") {
-        // 可靠的 edit 结果自动成为在线学习正反馈；反馈失败不能影响用户工具调用。
-        await callContextToolOrLocal(
-          "observe_context_feedback",
-          cwd,
-          { action: "edit", path: params.path },
-          () => callNapiTool("observe_context_feedback", cwd, { action: "edit", path: params.path }),
-        ).catch(() => {});
-      }
+
       return governToolResult(result, {
         archiveDir,
         toolCallId,
@@ -820,15 +812,7 @@ export async function createAlkaidAgent(options = {}) {
   });
   return {
     agent,
-    close: async () => {
-      await callContextToolOrLocal(
-        "observe_context_feedback",
-        cwd,
-        { action: "settle" },
-        () => callNapiTool("observe_context_feedback", cwd, { action: "settle" }),
-      ).catch(() => {});
-      return mcp.close();
-    },
+    close: () => mcp.close(),
     skills,
     toolCount: tools.length,
     systemPrompt,

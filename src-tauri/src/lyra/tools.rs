@@ -496,16 +496,6 @@ async fn execute_inner(
 ) -> ToolOutcome {
     match name {
         "fast_context" => {
-            // 优先走常驻全局 context service：索引、学习模型与预测预取 source cache
-            // 都驻留在同一个 owner 进程内。服务不可用时才回退本地 Rust，保证工具可用。
-            if let Ok(value) =
-                crate::context_service::call_global("fast_context", root, args.clone()).await
-            {
-                if let Some(text) = value.as_str() {
-                    return ToolOutcome::text(clamp_tool_output_text(text));
-                }
-                return ToolOutcome::error("全局 fast_context 返回了非文本结果");
-            }
             let root = root.to_path_buf();
             let args = args.clone();
             match tokio::task::spawn_blocking(move || {
@@ -519,14 +509,6 @@ async fn execute_inner(
             }
         }
         "find_symbols" => {
-            if let Ok(value) =
-                crate::context_service::call_global("find_symbols", root, args.clone()).await
-            {
-                if let Some(text) = value.as_str() {
-                    return ToolOutcome::text(text);
-                }
-                return ToolOutcome::error("全局 find_symbols 返回了非文本结果");
-            }
             let root = root.to_path_buf();
             let args = args.clone();
             match tokio::task::spawn_blocking(move || {
@@ -640,29 +622,7 @@ async fn execute_inner(
                             text.push_str(&format!("\n\n{path} @@ {line}:\n{body}"));
                         }
                     }
-                    if !path.is_empty() {
-                        // 学习是锦上添花：反馈发往全局 service，服务不在则静默丢弃；
-                        // 响应顺带回全局模型快照，注入本地进程供后续检索 blend 使用。
-                        if let Ok(value) = crate::context_service::call_global(
-                            "observe_context_feedback",
-                            root,
-                            serde_json::json!({ "action": "edit", "path": path }),
-                        )
-                        .await
-                        {
-                            if let Some(snapshot) = value.get("modelSnapshot") {
-                                let root_buf = root.to_path_buf();
-                                let snapshot = snapshot.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    crate::nova_tools_native::context::inject_learning_model_snapshot(
-                                        &root_buf,
-                                        &snapshot,
-                                    )
-                                })
-                                .await;
-                            }
-                        }
-                    }
+
                     let mut outcome = ToolOutcome::text(text);
                     outcome.details = Some(value);
                     outcome

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -53,598 +53,6 @@ const REVERSE_FULL_REBUILD_CHANGES: usize = 64;
 const PERSIST_MIN_CHANGED: usize = 16;
 /// 目录 scope 检索时限定代码文件扩展名的 rg glob（与 is_code_file 的扩展名集合一致）。
 const CODE_FILES_GLOB: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,rs,py,pyi,go,java,kt,kts,cs,c,h,cc,cpp,hpp,swift,php,scala,dart,m,mm,zig}";
-const LEARNING_FEATURES: usize = 9;
-const PREFETCH_FEATURES: usize = 14;
-const PREFETCH_WINDOW: u8 = 3;
-const PREFETCH_MAX_FILES: usize = 3;
-const PREFETCH_MAX_BYTES: u64 = 256 * 1024;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OnlineEditModel {
-    version: u32,
-    weights: [f64; LEARNING_FEATURES],
-    bias: f64,
-    observations: u64,
-    positives: u64,
-}
-
-impl Default for OnlineEditModel {
-    fn default() -> Self {
-        Self {
-            version: 3,
-            weights: [1.2, 1.0, 1.2, 0.7, 0.8, 0.4, 0.2, 0.5, 0.6],
-            bias: -2.0,
-            observations: 0,
-            positives: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OnlinePrefetchModel {
-    version: u32,
-    weights: [f64; PREFETCH_FEATURES],
-    bias: f64,
-    observations: u64,
-    positives: u64,
-    opportunities: u64,
-    useful: u64,
-}
-
-impl Default for OnlinePrefetchModel {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            // heuristic, seed, explicit, caller, companion, noise, small, depth, overlap,
-            // graph-near, recent-demand, query-continuity, read-cost, co-change
-            weights: [
-                0.8, 0.5, 0.7, 0.8, 0.5, -1.0, 0.1, 0.2, 0.7, 1.0, 1.1, 0.8, 0.4, 0.5,
-            ],
-            bias: -1.5,
-            observations: 0,
-            positives: 0,
-            opportunities: 0,
-            useful: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct LearningModels {
-    #[serde(default)]
-    edit: OnlineEditModel,
-    #[serde(default)]
-    prefetch: OnlinePrefetchModel,
-}
-
-#[derive(Debug, Clone)]
-struct PendingLearningSample {
-    file: String,
-    features: [f64; LEARNING_FEATURES],
-    included: bool,
-    edit_applied: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PrefetchSample {
-    file: String,
-    features: [f64; PREFETCH_FEATURES],
-    probability: f64,
-    bytes: u64,
-    prefetched: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PendingPrefetchTrace {
-    samples: Vec<PrefetchSample>,
-    remaining: u8,
-}
-
-#[derive(Default)]
-struct PrefetchMetrics {
-    predicted: u64,
-    useful: u64,
-    avoided_disk_reads: u64,
-    wasted_bytes: u64,
-    blocking_ms: u64,
-    latencies_ms: Vec<u64>,
-}
-
-#[derive(Default)]
-struct RepoLearningState {
-    loaded: bool,
-    model: OnlineEditModel,
-    prefetch_model: OnlinePrefetchModel,
-    pending: Vec<PendingLearningSample>,
-    prefetch_traces: Vec<PendingPrefetchTrace>,
-    recent_demand: HashMap<String, u64>,
-    last_query_terms: Vec<String>,
-    call_generation: u64,
-    grad_acc: [f64; LEARNING_FEATURES],
-    prefetch_grad_acc: [f64; PREFETCH_FEATURES],
-    metrics: PrefetchMetrics,
-}
-
-static LEARNING_STATE: OnceLock<Mutex<HashMap<String, RepoLearningState>>> = OnceLock::new();
-static LEARNING_REPO_IDENTITIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-
-fn learning_enabled() -> bool {
-    let enabled = std::env::var("NOVA_CONTEXT_LEARNING")
-        .ok()
-        .as_deref()
-        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    if !enabled {
-        return false;
-    }
-    // 训练（feedback/settle/样本收集）只允许全局 context service 进程执行，
-    // 避免多进程并发覆盖同一模型文件；检索侧模型快照（预测用）不受此限。
-    learning_owner()
-}
-
-fn learning_owner() -> bool {
-    std::env::var("NOVA_CONTEXT_LEARNING_OWNER").ok().as_deref() == Some("1")
-}
-
-fn learning_root_key(root: &Path) -> String {
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let root_key = canonical_root.to_string_lossy().into_owned();
-    let identities = LEARNING_REPO_IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(identity) = identities
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&root_key)
-        .cloned()
-    {
-        return identity;
-    }
-
-    // `--git-common-dir` 对主工作区返回 `.git`，对 linked worktree 返回主仓库的
-    // 绝对 `.git` 路径，因此同一仓库的全部 worktree 会得到同一个模型身份。
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(&canonical_root)
-        .args(["rev-parse", "--git-common-dir"]);
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-    let identity = command
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|output| output.trim().to_string())
-        .filter(|output| !output.is_empty())
-        .map(PathBuf::from)
-        .map(|common_dir| {
-            if common_dir.is_absolute() {
-                common_dir
-            } else {
-                canonical_root.join(common_dir)
-            }
-        })
-        .map(|common_dir| common_dir.canonicalize().unwrap_or(common_dir))
-        .map(|common_dir| format!("git:{}", common_dir.to_string_lossy()))
-        .unwrap_or_else(|| format!("path:{root_key}"));
-
-    identities
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(root_key, identity.clone());
-    identity
-}
-
-fn learning_model_path(root: &Path) -> PathBuf {
-    let base = std::env::var_os("NOVA_CONTEXT_LEARNING_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("NOVA_DATA_DIR")
-                .map(|value| PathBuf::from(value).join("alkaid/context-learning"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|value| PathBuf::from(value).join(".nova/alkaid/context-learning"))
-        })
-        .unwrap_or_else(|| std::env::temp_dir().join("nova-context-learning"));
-    let mut hasher = Sha256::new();
-    hasher.update(learning_root_key(root).as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    base.join(format!("{}.json", &digest[..20]))
-}
-
-fn load_learning_models(root: &Path) -> LearningModels {
-    let Ok(bytes) = fs::read(learning_model_path(root)) else {
-        return LearningModels::default();
-    };
-    if let Ok(models) = serde_json::from_slice::<LearningModels>(&bytes) {
-        if models.edit.version == 3 && models.prefetch.version == 1 {
-            return models;
-        }
-    }
-    serde_json::from_slice::<OnlineEditModel>(&bytes)
-        .ok()
-        .filter(|model| model.version == 3)
-        .map(|edit| LearningModels {
-            edit,
-            prefetch: OnlinePrefetchModel::default(),
-        })
-        .unwrap_or_default()
-}
-
-fn save_learning_models(root: &Path, edit: &OnlineEditModel, prefetch: &OnlinePrefetchModel) {
-    let path = learning_model_path(root);
-    let Some(parent) = path.parent() else { return };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let models = LearningModels {
-        edit: edit.clone(),
-        prefetch: prefetch.clone(),
-    };
-    let Ok(bytes) = serde_json::to_vec_pretty(&models) else {
-        return;
-    };
-    let staged = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    if fs::write(&staged, bytes).is_ok() {
-        let _ = fs::rename(&staged, &path);
-    }
-}
-
-/// 序列化后的模型快照（可跨进程传递）；非法/不兼容快照返回 None。
-#[allow(dead_code)] // 预留给需要传输快照字节的调用方；当前经 JSON 值传递。
-pub fn parse_learning_model_snapshot(bytes: &[u8]) -> Option<Value> {
-    let models = serde_json::from_slice::<LearningModels>(bytes).ok()?;
-    if models.edit.version != 3 || models.prefetch.version != 1 {
-        return None;
-    }
-    serde_json::to_value(&models).ok()
-}
-
-/// Lyra 等纯 Rust 调用方的学习增强入口：把全局 service 下发的模型快照注入
-/// 本进程（只读使用），使本地 fast_context 的 blend 排序与全局模型一致。
-/// 注入方不持有训练能力（learning_enabled 仍要求 owner），快照不持久化。
-#[allow(dead_code)] // Tauri lib 侧由 Lyra 使用；napi 独立编译时仅 N-API 入口可达。
-pub fn inject_learning_model_snapshot(root: &Path, snapshot: &Value) -> bool {
-    if !learning_owner() {
-        let models = serde_json::from_value::<LearningModels>(snapshot.clone()).or_else(|_| {
-            serde_json::from_value::<OnlineEditModel>(snapshot.clone()).map(|edit| LearningModels {
-                edit,
-                prefetch: OnlinePrefetchModel::default(),
-            })
-        });
-        let Ok(models) = models else { return false };
-        if models.edit.version != 3 || models.prefetch.version != 1 {
-            return false;
-        }
-        let key = learning_root_key(root);
-        let states = LEARNING_STATE.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut states = states
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = states.entry(key).or_default();
-        state.model = models.edit;
-        state.prefetch_model = models.prefetch;
-        state.loaded = true;
-        return true;
-    }
-    false
-}
-
-/// 当前进程的模型快照（JSON）。owner 进程（全局 service）用它向检索调用方
-/// 下发模型；非 owner 进程返回 None。
-#[allow(dead_code)] // 在 napi crate 内经 observe_context_feedback 使用。
-pub fn learning_model_snapshot(root: &Path) -> Option<Value> {
-    if !learning_owner() || !learning_enabled() {
-        return None;
-    }
-    with_learning_state(root, |state| {
-        serde_json::to_value(LearningModels {
-            edit: state.model.clone(),
-            prefetch: state.prefetch_model.clone(),
-        })
-        .ok()
-    })
-}
-
-fn sigmoid(value: f64) -> f64 {
-    if value >= 0.0 {
-        1.0 / (1.0 + (-value).exp())
-    } else {
-        let exp = value.exp();
-        exp / (1.0 + exp)
-    }
-}
-
-fn learning_score(model: &OnlineEditModel, features: &[f64; LEARNING_FEATURES]) -> f64 {
-    model.bias
-        + model
-            .weights
-            .iter()
-            .zip(features)
-            .map(|(weight, feature)| weight * feature)
-            .sum::<f64>()
-}
-
-fn learning_predict(model: &OnlineEditModel, features: &[f64; LEARNING_FEATURES]) -> f64 {
-    sigmoid(learning_score(model, features))
-}
-
-/// RankNet pairwise logistic loss with AdaGrad per-coordinate learning rates.
-///
-/// Instead of predicting absolute P(edit) for each file independently (pointwise),
-/// we learn that the positive (edited) file should score higher than the negative
-/// (not edited) file. The gradient is:
-///   ∂L/∂w_i = sigmoid(-(s_pos - s_neg)) * (pos_f_i - neg_f_i)
-/// which only depends on the *relative* score difference, not absolute probabilities.
-/// This naturally eliminates class imbalance: every pair is 1:1.
-///
-/// AdaGrad gives each feature its own learning rate: lr_i = base / sqrt(G_i + ε),
-/// where G_i accumulates squared gradients. Frequently-active features (e.g. "small
-/// file") converge and their lr decays; rare features (e.g. "exact caller") keep
-/// a high lr to learn faster from scarce signal.
-fn legacy_edit_ranknet_direction() -> bool {
-    std::env::var("NOVA_CONTEXT_EDIT_RANKNET_DIRECTION")
-        .ok()
-        .is_some_and(|value| value.eq_ignore_ascii_case("legacy") || value == "subtract")
-}
-
-fn learning_update_pair(
-    model: &mut OnlineEditModel,
-    grad_acc: &mut [f64; LEARNING_FEATURES],
-    pos_features: &[f64; LEARNING_FEATURES],
-    neg_features: &[f64; LEARNING_FEATURES],
-    weight: f64,
-) {
-    let grad_base =
-        sigmoid(-(learning_score(model, pos_features) - learning_score(model, neg_features)))
-            * weight;
-    for i in 0..LEARNING_FEATURES {
-        let diff = pos_features[i] - neg_features[i];
-        let gradient = grad_base * diff;
-        grad_acc[i] += gradient * gradient;
-        let lr = 0.08 / (grad_acc[i].sqrt() + 0.1);
-        model.weights[i] = if legacy_edit_ranknet_direction() {
-            (model.weights[i] - lr * gradient - lr * 0.0005 * model.weights[i]).clamp(-6.0, 6.0)
-        } else {
-            (model.weights[i] + lr * gradient - lr * 0.0005 * model.weights[i]).clamp(-6.0, 6.0)
-        };
-    }
-    model.observations += 1;
-    model.positives += 1;
-}
-
-fn prefetch_score(model: &OnlinePrefetchModel, features: &[f64; PREFETCH_FEATURES]) -> f64 {
-    model.bias
-        + model
-            .weights
-            .iter()
-            .zip(features)
-            .map(|(w, f)| w * f)
-            .sum::<f64>()
-}
-
-fn prefetch_predict(model: &OnlinePrefetchModel, features: &[f64; PREFETCH_FEATURES]) -> f64 {
-    sigmoid(prefetch_score(model, features))
-}
-
-fn prefetch_update_pair(
-    model: &mut OnlinePrefetchModel,
-    grad_acc: &mut [f64; PREFETCH_FEATURES],
-    pos: &[f64; PREFETCH_FEATURES],
-    neg: &[f64; PREFETCH_FEATURES],
-) {
-    let grad_base = sigmoid(-(prefetch_score(model, pos) - prefetch_score(model, neg)));
-    for i in 0..PREFETCH_FEATURES {
-        let diff = pos[i] - neg[i];
-        let gradient = grad_base * diff;
-        grad_acc[i] += gradient * gradient;
-        let lr = 0.06 / (grad_acc[i].sqrt() + 0.1);
-        model.weights[i] =
-            (model.weights[i] + lr * gradient - lr * 0.0005 * model.weights[i]).clamp(-6.0, 6.0);
-    }
-    model.observations += 1;
-    model.positives += 1;
-}
-
-fn settle_pending(root: &Path, state: &mut RepoLearningState) -> usize {
-    let pending = std::mem::take(&mut state.pending);
-    let settled = pending.len();
-    let positives: Vec<_> = pending.iter().filter(|s| s.edit_applied).collect();
-    let negatives: Vec<_> = pending.iter().filter(|s| !s.edit_applied).collect();
-    if !positives.is_empty() && !negatives.is_empty() {
-        let neg_scores = negatives
-            .iter()
-            .map(|n| learning_score(&state.model, &n.features))
-            .collect::<Vec<_>>();
-        for pos in positives {
-            if let Some(idx) = neg_scores
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i)
-            {
-                learning_update_pair(
-                    &mut state.model,
-                    &mut state.grad_acc,
-                    &pos.features,
-                    &negatives[idx].features,
-                    if pos.included { 1.0 } else { 1.5 },
-                );
-            }
-        }
-    }
-    save_learning_models(root, &state.model, &state.prefetch_model);
-    settled
-}
-
-/// 会话生命周期收尾使用：只有当前进程确实存在待结算 trace 时才做更新与 I/O。
-/// 这样未使用 fast_context 的 Lyra/Vega 会话不会加载或写入学习模型。
-#[allow(dead_code)] // 在 napi crate 内经 observe_context_feedback 使用。
-pub fn settle_context_learning(root: &Path) -> usize {
-    if !learning_enabled() {
-        return 0;
-    }
-    let Some(states) = LEARNING_STATE.get() else {
-        return 0;
-    };
-    let key = learning_root_key(root);
-    let mut states = states
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(state) = states.get_mut(&key) else {
-        return 0;
-    };
-    settle_pending(root, state)
-}
-
-fn with_learning_state<T>(root: &Path, callback: impl FnOnce(&mut RepoLearningState) -> T) -> T {
-    let key = learning_root_key(root);
-    let states = LEARNING_STATE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut states = states
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let state = states.entry(key).or_default();
-    if !state.loaded {
-        let models = load_learning_models(root);
-        if !learning_owner() {
-            return callback(&mut RepoLearningState {
-                model: models.edit,
-                prefetch_model: models.prefetch,
-                ..Default::default()
-            });
-        }
-        state.model = models.edit;
-        state.prefetch_model = models.prefetch;
-        state.loaded = true;
-    }
-    callback(state)
-}
-
-fn learning_blend(observations: u64) -> f64 {
-    // Smooth ramp: minimal influence until 5 observations, then asymptotic approach to 0.4.
-    // Time constant 120 balances fast ramp-up with stability: at 42 obs blend≈0.13
-    // (max adjustment ±39pts), enough to reorder similar-scored files without
-    // disrupting the heuristic ranking for broad queries.
-    if observations < 5 {
-        0.0
-    } else {
-        0.4 * (1.0 - (-((observations - 5) as f64) / 120.0).exp())
-    }
-}
-
-/// 工具执行层在成功 read/edit 后调用。edit 是强正样本；read 目前只记事件，
-/// 避免把“需要理解”错误混入“将被编辑”模型。下一次 fast_context 自动结算弱负样本。
-#[allow(dead_code)] // 在 napi crate 内经 N-API 入口使用；Tauri lib 侧走 service IPC。
-pub fn observe_context_feedback(root: &Path, params: Value) -> Result<Value, String> {
-    if !learning_enabled() {
-        return Ok(serde_json::json!({"enabled": false, "updated": 0}));
-    }
-    let action = params
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if action == "settle" {
-        let settled = settle_context_learning(root);
-        let snapshot = learning_model_snapshot(root);
-        return Ok(
-            serde_json::json!({"enabled": true, "action": "settle", "settled": settled, "modelSnapshot": snapshot}),
-        );
-    }
-    let raw_path = params
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if raw_path.trim().is_empty() {
-        return Err("context feedback requires path".into());
-    }
-    let path = if Path::new(raw_path).is_absolute() {
-        Path::new(raw_path)
-            .strip_prefix(root)
-            .unwrap_or(Path::new(raw_path))
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        raw_path.to_string()
-    };
-    let path = normalize_rel(&path);
-    let updated = with_learning_state(root, |state| {
-        if action != "edit" {
-            return 0usize;
-        }
-        // Find the edited sample's features (Copy out to avoid borrow conflict).
-        let pos_data = state
-            .pending
-            .iter()
-            .find(|s| s.file == path && !s.edit_applied)
-            .map(|s| (s.features, s.included));
-        let Some((pos_features, pos_included)) = pos_data else {
-            return 0usize;
-        };
-        // Compute scores for all non-edited pending samples to find hardest negative.
-        let neg_candidates: Vec<([f64; LEARNING_FEATURES], f64)> = state
-            .pending
-            .iter()
-            .filter(|s| !s.edit_applied && s.file != path)
-            .map(|s| (s.features, learning_score(&state.model, &s.features)))
-            .collect();
-        let hardest_neg = neg_candidates
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(f, _)| *f);
-        // Mark all matching samples as edited first (count reflects edits recorded).
-        let mut count = 0usize;
-        for sample in &mut state.pending {
-            if sample.file == path && !sample.edit_applied {
-                sample.edit_applied = true;
-                count += 1;
-            }
-        }
-        // Pairwise update: use hardest negative if available, otherwise a zero-vector
-        // baseline (represents "an undistinguished file with no signal"). This ensures
-        // training signal even when the pending list has only one file — the model
-        // learns that the edited file should score higher than a random baseline.
-        let neg_feat = hardest_neg.unwrap_or([0.0; LEARNING_FEATURES]);
-        let weight = if pos_included { 1.0 } else { 1.5 };
-        learning_update_pair(
-            &mut state.model,
-            &mut state.grad_acc,
-            &pos_features,
-            &neg_feat,
-            weight,
-        );
-        save_learning_models(root, &state.model, &state.prefetch_model);
-        count
-    });
-    Ok(
-        serde_json::json!({"enabled": true, "action": action, "path": path, "updated": updated, "modelSnapshot": learning_model_snapshot(root)}),
-    )
-}
-
-#[allow(dead_code)]
-pub fn prefetch_metrics(root: &Path) -> Value {
-    with_learning_state(root, |state| {
-        let mut latencies = state.metrics.latencies_ms.clone();
-        latencies.sort_unstable();
-        let percentile = |p: f64| -> u64 {
-            if latencies.is_empty() {
-                return 0;
-            }
-            latencies[((latencies.len() - 1) as f64 * p).round() as usize]
-        };
-        serde_json::json!({
-            "predicted": state.metrics.predicted,
-            "useful": state.metrics.useful,
-            "usefulRate": state.metrics.useful as f64 / state.metrics.predicted.max(1) as f64,
-            "precisionAt3": state.prefetch_model.useful as f64 / state.prefetch_model.opportunities.max(1) as f64,
-            "avoidedDiskReads": state.metrics.avoided_disk_reads,
-            "wastedBytes": state.metrics.wasted_bytes,
-            "prefetchWorkMs": state.metrics.blocking_ms,
-            "prefetchP50Ms": percentile(0.50),
-            "prefetchP95Ms": percentile(0.95),
-            "model": state.prefetch_model,
-        })
-    })
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Symbol {
@@ -722,29 +130,6 @@ struct Source {
     lines: Vec<String>,
     syms: Vec<Symbol>,
 }
-
-#[derive(Clone)]
-struct CachedSource {
-    source: Source,
-    len: u64,
-    modified_nanos: u128,
-    touched: u64,
-}
-
-#[derive(Default)]
-struct SourceCache {
-    entries: HashMap<String, CachedSource>,
-    clock: u64,
-}
-
-const SOURCE_CACHE_MAX_ENTRIES: usize = 96;
-static SOURCE_CACHE: OnceLock<Mutex<SourceCache>> = OnceLock::new();
-static SOURCE_LOADING: OnceLock<(Mutex<HashSet<String>>, Condvar)> = OnceLock::new();
-
-static SOURCE_DISK_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static SOURCE_CACHE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static PREFETCH_DISK_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static PREFETCH_CACHE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Clone)]
 struct Block {
@@ -2171,152 +1556,8 @@ fn build_index(
     (view, all, reverse)
 }
 
-fn source_cache_contains(root: &Path, file: &str) -> bool {
-    let path = root.join(file);
-    let Ok(metadata) = fs::metadata(&path) else {
-        return false;
-    };
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let key = format!("{}\0{file}", learning_root_key(root));
-    SOURCE_CACHE
-        .get()
-        .and_then(|cache| cache.lock().ok())
-        .and_then(|cache| cache.entries.get(&key).cloned())
-        .is_some_and(|cached| {
-            cached.len == metadata.len() && cached.modified_nanos == modified_nanos
-        })
-}
-
-fn record_prefetch_demand(root: &Path, demanded: &HashSet<String>, disk_misses: &HashSet<String>) {
-    if !learning_enabled() {
-        return;
-    }
-    with_learning_state(root, |state| {
-        state.call_generation += 1;
-        for file in demanded {
-            *state.recent_demand.entry(file.clone()).or_default() += 1;
-        }
-        let traces = std::mem::take(&mut state.prefetch_traces);
-        let mut retained = Vec::new();
-        for mut trace in traces {
-            let positives = trace
-                .samples
-                .iter()
-                .filter(|s| demanded.contains(&s.file))
-                .cloned()
-                .collect::<Vec<_>>();
-            let negatives = trace
-                .samples
-                .iter()
-                .filter(|s| !demanded.contains(&s.file))
-                .cloned()
-                .collect::<Vec<_>>();
-            state.prefetch_model.opportunities += trace.samples.len() as u64;
-            for pos in &positives {
-                if pos.prefetched && !disk_misses.contains(&pos.file) {
-                    state.prefetch_model.useful += 1;
-                    state.metrics.useful += 1;
-                    state.metrics.avoided_disk_reads += 1;
-                }
-                if let Some(neg) = negatives.iter().max_by(|a, b| {
-                    a.probability
-                        .partial_cmp(&b.probability)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                }) {
-                    prefetch_update_pair(
-                        &mut state.prefetch_model,
-                        &mut state.prefetch_grad_acc,
-                        &pos.features,
-                        &neg.features,
-                    );
-                }
-            }
-            trace.remaining = trace.remaining.saturating_sub(1);
-            if trace.remaining > 0 {
-                retained.push(trace);
-            } else {
-                state.metrics.wasted_bytes += trace
-                    .samples
-                    .iter()
-                    .filter(|s| s.prefetched && !positives.iter().any(|p| p.file == s.file))
-                    .map(|s| s.bytes)
-                    .sum::<u64>();
-            }
-        }
-        state.prefetch_traces = retained;
-        save_learning_models(root, &state.model, &state.prefetch_model);
-    });
-}
-
 fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> {
-    let path = root.join(file);
-    let metadata = fs::metadata(&path).ok()?;
-    let len = metadata.len();
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let key = format!("{}\0{file}", learning_root_key(root));
-    let cache = SOURCE_CACHE.get_or_init(|| Mutex::new(SourceCache::default()));
-    {
-        let mut cache = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.clock = cache.clock.wrapping_add(1);
-        let touched = cache.clock;
-        if let Some(cached) = cache.entries.get_mut(&key) {
-            if cached.len == len && cached.modified_nanos == modified_nanos {
-                cached.touched = touched;
-                SOURCE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(cached.source.clone());
-            }
-            cache.entries.remove(&key);
-        }
-    }
-
-    let loading = SOURCE_LOADING.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()));
-    {
-        let mut active = loading
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while active.contains(&key) {
-            active = loading
-                .1
-                .wait(active)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if source_cache_contains(root, file) {
-                SOURCE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let cache = SOURCE_CACHE
-                    .get()
-                    .unwrap()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                return cache.entries.get(&key).map(|cached| cached.source.clone());
-            }
-        }
-        active.insert(key.clone());
-    }
-    SOURCE_DISK_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => {
-            let mut active = loading
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            active.remove(&key);
-            loading.1.notify_all();
-            return None;
-        }
-    };
+    let text = fs::read_to_string(root.join(file)).ok()?;
     let mut lines: Vec<_> = text.split('\n').map(str::to_string).collect();
     if lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
         lines.pop();
@@ -2326,40 +1567,7 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
     } else {
         scan_source(&text, file).syms
     };
-    let source = Source { lines, syms };
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.clock = cache.clock.wrapping_add(1);
-    let touched = cache.clock;
-    cache.entries.insert(
-        key.clone(),
-        CachedSource {
-            source: source.clone(),
-            len,
-            modified_nanos,
-            touched,
-        },
-    );
-    while cache.entries.len() > SOURCE_CACHE_MAX_ENTRIES {
-        let Some(oldest) = cache
-            .entries
-            .iter()
-            .min_by_key(|(_, cached)| cached.touched)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        cache.entries.remove(&oldest);
-    }
-    drop(cache);
-    let mut active = loading
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    active.remove(&key);
-    loading.1.notify_all();
-    Some(source)
+    Some(Source { lines, syms })
 }
 
 fn js_utf16_len(value: &str) -> usize {
@@ -2893,15 +2101,7 @@ fn compact_evidence_miss(
 /// 硬 MISS 时的"你是不是想找"：把未命中锚点拆成词，一次批量检索后从命中行提取
 /// 包含这些词的真实标识符，按覆盖词数/频次/是否定义行打分。只给生产代码里的
 /// 符号；测试/文档命中不算。找不到相近符号时返回空，MISS 保持原样。
-/// 方案3 倒排索引加速：defs 表（索引期预建的 name → 定义映射）直接查表得候选，
-/// 只有 defs 查不到任何候选时才退回全仓 rg 扫描。倒排键按 camelCase/snake_case 拆词，
-/// 锚点拆出的 words 在 defs 的拆词键上 O(1) 查表，命中即跳过 O(defs × terms) 子串扫描。
-/// NOVA_CTX_DEFS_SUGGEST=0 可回退到纯 rg 扫描（A/B 对照）。
-fn suggest_symbols(
-    root: &Path,
-    anchors: &[String],
-    defs: Option<&HashMap<String, Vec<Definition>>>,
-) -> Vec<String> {
+fn suggest_symbols(root: &Path, anchors: &[String]) -> Vec<String> {
     let mut words = Vec::<String>::new();
     for anchor in anchors {
         for variant in naming_variants(anchor) {
@@ -2922,66 +2122,6 @@ fn suggest_symbols(
     words.truncate(8);
     if words.is_empty() {
         return Vec::new();
-    }
-    let defs_suggest = std::env::var_os("NOVA_CTX_DEFS_SUGGEST")
-        .map(|value| value != "0")
-        .unwrap_or(true);
-    // 倒排查表路径：defs 键按标识符原样存储，候选 = 键中包含任一 word 的定义符号。
-    if defs_suggest {
-        if let Some(defs) = defs {
-            let mut scored = Vec::<(String, String, usize)>::new(); // (name, location, matched_words)
-            for (name, definitions) in defs.iter() {
-                let low = name.to_lowercase();
-                if low.len() < 5 || words.contains(&low) || stop_word(&low) {
-                    continue;
-                }
-                let matched = words
-                    .iter()
-                    .filter(|word| low.contains(word.as_str()))
-                    .count();
-                if matched == 0 {
-                    continue;
-                }
-                let Some(definition) = definitions.first() else {
-                    continue;
-                };
-                if !is_code_file(&definition.file) || anchor_noise_path(&definition.file) {
-                    continue;
-                }
-                scored.push((
-                    name.clone(),
-                    format!("{}:{}", definition.file, definition.symbol.ln),
-                    matched,
-                ));
-            }
-            if !scored.is_empty() {
-                let normalize = |value: &str| {
-                    value
-                        .chars()
-                        .filter(|ch| ch.is_ascii_alphanumeric())
-                        .map(|ch| ch.to_ascii_lowercase())
-                        .collect::<String>()
-                };
-                let normalized_anchors = anchors.iter().map(|a| normalize(a)).collect::<Vec<_>>();
-                scored.sort_by(|(a_name, _, a_matched), (b_name, _, b_matched)| {
-                    let a_close = normalized_anchors.iter().any(|anchor| {
-                        !anchor.is_empty() && levenshtein(anchor, &normalize(a_name), 3) <= 2
-                    });
-                    let b_close = normalized_anchors.iter().any(|anchor| {
-                        !anchor.is_empty() && levenshtein(anchor, &normalize(b_name), 3) <= 2
-                    });
-                    (b_close, b_matched)
-                        .cmp(&(a_close, a_matched))
-                        .then_with(|| a_name.cmp(b_name))
-                });
-                scored.truncate(DID_YOU_MEAN_MAX);
-                return scored
-                    .into_iter()
-                    .map(|(name, location, _)| format!("{name} ({location})"))
-                    .collect();
-            }
-            // defs 表为空或无候选：继续走 rg 扫描兜底（冷缓存或未扫描文件）。
-        }
     }
     let rows = search_text(root, &words, true, false, &[]);
     static IDENT: OnceLock<Regex> = OnceLock::new();
@@ -3945,9 +3085,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             &revision,
             &explicit_anchors,
             &task,
-            // 方案3：MISS 路径尚无全量 index，用 None 走 rg 扫描兜底；defs 查表路径
-            // 服务于未来在 index 可用处的 did-you-mean 加速（如软降级的锚点补充）。
-            &suggest_symbols(root, &explicit_anchors, None),
+            &suggest_symbols(root, &explicit_anchors),
         ));
     }
     let loose_kw = keywords
@@ -4227,72 +3365,28 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         .map(|(file, _)| file.clone())
         .collect::<Vec<_>>();
     let planned_scope = scope_dirs(&seed_body_files);
-    // 方案2 单进程多 pattern 扫描：planned_terms 和 discover_stems 合并进一次 rg 调用
-    //（原先两个并行 rg 进程各自全仓 walk 一次）。统一 ignore_case=true——planned 的归因
-    // 逻辑（下方 `row.text.contains(term) || lower.contains(...)`）本就大小写双路兼容，
-    // 统一后不改变归因语义；scope 目录限制对合并后的单进程不可行（planned 限 scope、
-    // stems 全仓），取并集即全仓。客户端按行归因到两组 term，IO 减半、省一次进程 spawn。
-    // NOVA_CTX_MERGED_SEARCH=0 可回退到旧的双进程并行模式（A/B 对照）。
-    let merged_search = std::env::var_os("NOVA_CTX_MERGED_SEARCH")
-        .map(|value| value != "0")
-        .unwrap_or(true);
+    // 计划驱动的二次检索与反向图词根检索互相独立，并行执行。
     let search_stage = Instant::now();
-    let (planned_rows, discover_rows) = if merged_search {
-        // 合并：单进程多 pattern，行级归因到 planned / stem 两组。
-        let mut all_terms = planned_terms.clone();
-        for stem in &discover_stems {
-            if !all_terms.iter().any(|t| t.eq_ignore_ascii_case(stem)) {
-                all_terms.push(stem.clone());
+    let (planned_rows, discover_rows) = std::thread::scope(|scope| {
+        let planned = scope.spawn(|| {
+            if planned_terms.is_empty() {
+                Vec::<SearchRow>::new()
+            } else {
+                search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())
             }
-        }
-        let rows = if all_terms.is_empty() {
-            Vec::new()
-        } else {
-            search_text(root, &all_terms, true, false, &[])
-        };
-        let planned_lowers = planned_terms
-            .iter()
-            .map(|t| t.to_lowercase())
-            .collect::<Vec<_>>();
-        let stem_lowers = discover_stems
-            .iter()
-            .map(|t| t.to_lowercase())
-            .collect::<Vec<_>>();
-        let mut planned_rows = Vec::new();
-        let mut discover_rows = Vec::new();
-        for row in rows {
-            let lower = row.text.to_lowercase();
-            if planned_lowers.iter().any(|t| lower.contains(t)) {
-                planned_rows.push(row.clone());
+        });
+        let stems = scope.spawn(|| {
+            if discover_stems.is_empty() {
+                Vec::<SearchRow>::new()
+            } else {
+                search_text(root, &discover_stems, true, false, &[])
             }
-            if stem_lowers.iter().any(|t| lower.contains(t)) {
-                discover_rows.push(row);
-            }
-        }
-        (planned_rows, discover_rows)
-    } else {
-        // 旧版：两个并行 rg 进程，各自独立 walk。
-        std::thread::scope(|scope| {
-            let planned = scope.spawn(|| {
-                if planned_terms.is_empty() {
-                    Vec::<SearchRow>::new()
-                } else {
-                    search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())
-                }
-            });
-            let stems = scope.spawn(|| {
-                if discover_stems.is_empty() {
-                    Vec::<SearchRow>::new()
-                } else {
-                    search_text(root, &discover_stems, true, false, &[])
-                }
-            });
-            (
-                planned.join().unwrap_or_default(),
-                stems.join().unwrap_or_default(),
-            )
-        })
-    };
+        });
+        (
+            planned.join().unwrap_or_default(),
+            stems.join().unwrap_or_default(),
+        )
+    });
     trace("fast_context.plan_search", search_stage);
     if !planned_terms.is_empty() {
         terms.extend(planned_terms.iter().cloned());
@@ -4627,78 +3721,6 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             ranked.push((file.clone(), 520.0));
         }
     }
-    let learning_snapshot = if learning_enabled() || !learning_owner() {
-        // owner：训练进程，模型在本进程内（先结算 pending 再取快照）；
-        // 非 owner（如 Lyra 本地检索）：只读使用 inject 注入的快照，
-        // 无快照时 with_learning_state 惰性加载磁盘模型作为兜底（只读，不写回）。
-        Some(with_learning_state(root, |state| {
-            if learning_owner() {
-                settle_pending(root, state);
-            }
-            state.model.clone()
-        }))
-    } else {
-        None
-    };
-    let learning_features = |file: &str, heuristic: f64| -> [f64; LEARNING_FEATURES] {
-        let small = fs::metadata(root.join(file))
-            .ok()
-            .map(|meta| meta.len() <= 24 * 1024)
-            .unwrap_or(false);
-        // Path depth: shallow files (e.g. src/lib.rs) tend to be more central.
-        // Normalized as 1/(depth+1) so root-level files = 1.0, 2-deep = 0.33, etc.
-        let depth = file.matches('/').count() as f64;
-        let path_depth = 1.0 / (depth + 1.0);
-        // Query-path overlap: fraction of keywords found in the file path string.
-        // Files whose path contains query terms are more likely to be relevant.
-        let path_lower = file.to_lowercase();
-        let overlap = if keywords.is_empty() {
-            0.0
-        } else {
-            keywords
-                .iter()
-                .filter(|kw| path_lower.contains(&kw.to_lowercase()))
-                .count() as f64
-                / keywords.len() as f64
-        };
-        [
-            (heuristic / 1000.0).clamp(0.0, 1.5),
-            if seed_files.contains(file) { 1.0 } else { 0.0 },
-            if files.iter().any(|explicit| explicit == file) {
-                1.0
-            } else {
-                0.0
-            },
-            if exact_callers.contains_key(file) {
-                1.0
-            } else {
-                0.0
-            },
-            if companion_tests.contains(&file.to_string()) {
-                1.0
-            } else {
-                0.0
-            },
-            if noise_path(file) { 1.0 } else { 0.0 },
-            if small { 1.0 } else { 0.0 },
-            path_depth,
-            overlap,
-        ]
-    };
-    if let Some(model) = &learning_snapshot {
-        let blend = learning_blend(model.observations);
-        if blend > 0.0 {
-            for (file, score) in &mut ranked {
-                let probability = learning_predict(model, &learning_features(file, *score));
-                // Clamp: model can adjust score by at most ±(blend * 300) points.
-                // This prevents a low-heuristic file from being pushed into candidate
-                // range by an overconfident model prediction (the R4 problem).
-                let adjustment =
-                    (blend * (probability - 0.5) * 420.0).clamp(-blend * 300.0, blend * 300.0);
-                *score += adjustment;
-            }
-        }
-    }
     ranked.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -4742,33 +3764,6 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     if final_candidates.is_empty() {
         final_candidates = ranked.iter().take(3).cloned().collect();
     }
-    if learning_snapshot.is_some() {
-        let included = final_candidates
-            .iter()
-            .map(|(file, _)| file)
-            .collect::<HashSet<_>>();
-        let pending = ranked
-            .iter()
-            .take(20)
-            .map(|(file, score)| PendingLearningSample {
-                file: file.clone(),
-                features: learning_features(file, *score),
-                included: included.contains(file),
-                edit_applied: false,
-            })
-            .collect::<Vec<_>>();
-        with_learning_state(root, |state| state.pending = pending);
-    }
-    let demanded_files = final_candidates
-        .iter()
-        .map(|(file, _)| file.clone())
-        .collect::<HashSet<_>>();
-    let demand_disk_misses = demanded_files
-        .iter()
-        .filter(|file| !source_cache_contains(root, file))
-        .cloned()
-        .collect::<HashSet<_>>();
-    record_prefetch_demand(root, &demanded_files, &demand_disk_misses);
     let mut sources = HashMap::<String, Source>::new();
     for (file, _) in &final_candidates {
         if let Some(source) = source(root, file, index.files.get(file)) {
@@ -5028,64 +4023,32 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
         features
     };
-    // 子模贪心打包。NOVA_CTX_SUBMODULAR=0 时退回旧版（粗粒度特征 + O(n²) 朴素贪心），
-    // 便于 A/B 对照；默认走细化特征 + Lazy Greedy。
-    //
-    // 细化点：覆盖元素从 `term:kw` 细化到 `term:kw:file`——同一 term 在同一文件内的
-    // 重复命中零增量（冗余覆盖），跨文件命中给 0.4× 衰减分。这让“信息增量”成为真正的
-    // 单调次模函数：两个文件命中同一批关键词时，第二个文件的增益按衰减后的边际计算，
-    // 不再被误判为零（旧实现）或满分（纯加性）。
-    let submodular_enabled = std::env::var_os("NOVA_CTX_SUBMODULAR")
-        .map(|value| value != "0")
-        .unwrap_or(true);
     let mut remaining = units;
     let mut units = Vec::<UnitCandidate>::new();
-    // (term) -> 已覆盖该 term 的文件集合；用于跨文件衰减。
     let mut covered_features = HashSet::<String>::new();
-    let mut term_files = HashMap::<String, HashSet<String>>::new();
-
-    // 每个候选的覆盖增益（不考虑 score 平局项），随 covered_features / term_files 变化。
-    let marginal_gain = |unit: &UnitCandidate,
-                         covered: &HashSet<String>,
-                         term_files: &HashMap<String, HashSet<String>>,
-                         submodular: bool|
-     -> f64 {
-        let mut gain = if unit.required { 1000.0 } else { 0.0 };
-        for (feature, weight) in unit_features(unit) {
-            if submodular {
-                if let Some(term) = feature.strip_prefix("term:") {
-                    let term_key = term.to_string();
-                    match term_files.get(&term_key) {
-                        None => gain += weight, // 该 term 首次被覆盖：满分
-                        Some(files) if !files.contains(&unit.file) => {
-                            // 跨文件命中：衰减 0.4×
-                            gain += weight * 0.4;
-                        }
-                        _ => { /* 同文件重复命中：零增量 */ }
-                    }
-                    continue;
+    while !remaining.is_empty() {
+        let mut best_index = 0usize;
+        let mut best_value = f64::NEG_INFINITY;
+        for (index, unit) in remaining.iter().enumerate() {
+            let mut gain = if unit.required { 1000.0 } else { 0.0 };
+            for (feature, weight) in unit_features(unit) {
+                if !covered_features.contains(&feature) {
+                    gain += weight;
                 }
             }
-            if !covered.contains(&feature) {
-                gain += weight;
+            if noise_path(&unit.file) && unit.role != "test" {
+                gain -= 50.0;
+            }
+            let value =
+                gain / (unit.estimated_bytes as f64 / 1024.0).max(1.0) + unit.score / 1000.0;
+            if value > best_value {
+                best_value = value;
+                best_index = index;
             }
         }
-        if noise_path(&unit.file) && unit.role != "test" {
-            gain -= 50.0;
-        }
-        gain
-    };
-
-    let pack_value = |unit: &UnitCandidate, gain: f64| -> f64 {
-        gain / (unit.estimated_bytes as f64 / 1024.0).max(1.0) + unit.score / 1000.0
-    };
-
-    // 提交一个块：更新 covered_features / term_files / obligation。
-    let commit = |picked: &mut UnitCandidate,
-                  covered: &mut HashSet<String>,
-                  term_files: &mut HashMap<String, HashSet<String>>| {
+        let mut picked = remaining.remove(best_index);
         picked.obligation = if picked.role == "caller" {
-            unit_features(picked)
+            unit_features(&picked)
                 .into_iter()
                 .find_map(|(feature, _)| feature.starts_with("caller:").then_some(feature))
         } else if picked.role == "test" {
@@ -5099,100 +4062,10 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         } else {
             None
         };
-        for (feature, _) in unit_features(picked) {
-            if let Some(term) = feature.strip_prefix("term:") {
-                term_files
-                    .entry(term.to_string())
-                    .or_default()
-                    .insert(picked.file.clone());
-            }
-            covered.insert(feature);
+        for (feature, _) in unit_features(&picked) {
+            covered_features.insert(feature);
         }
-    };
-
-    if submodular_enabled {
-        // Lazy Greedy（Minoux 加速）：用最大堆维护各候选的增益上界，每次弹出堆顶重算；
-        // 若重算后仍是堆顶则直接选中。单调次模性保证上界只减不增，正确性不变。
-        use std::collections::BinaryHeap;
-        #[derive(Clone)]
-        struct QueueEntry {
-            bound: f64,
-            index: usize,
-        }
-        impl PartialEq for QueueEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.bound == other.bound
-            }
-        }
-        impl Eq for QueueEntry {}
-        impl PartialOrd for QueueEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for QueueEntry {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.bound
-                    .partial_cmp(&other.bound)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
-        }
-        let mut heap = BinaryHeap::<QueueEntry>::new();
-        for (index, unit) in remaining.iter().enumerate() {
-            let gain = marginal_gain(unit, &covered_features, &term_files, true);
-            heap.push(QueueEntry {
-                bound: pack_value(unit, gain),
-                index,
-            });
-        }
-        let mut alive = vec![true; remaining.len()];
-        while let Some(QueueEntry { bound, index }) = heap.pop() {
-            if !alive[index] {
-                continue;
-            }
-            let unit = &remaining[index];
-            let gain = marginal_gain(unit, &covered_features, &term_files, true);
-            let value = pack_value(unit, gain);
-            // 重算后仍不劣于当前堆顶（或堆已空）：选中。
-            let next_bound = heap
-                .peek()
-                .map(|entry| entry.bound)
-                .unwrap_or(f64::NEG_INFINITY);
-            if value >= next_bound {
-                alive[index] = false;
-                let mut picked = remaining[index].clone();
-                commit(&mut picked, &mut covered_features, &mut term_files);
-                units.push(picked);
-            } else if value > bound {
-                // 上界失效（不该发生于单调次模，防御）：以新值重新入堆。
-                heap.push(QueueEntry {
-                    bound: value,
-                    index,
-                });
-            } else {
-                heap.push(QueueEntry {
-                    bound: value,
-                    index,
-                });
-            }
-        }
-    } else {
-        // 旧版：粗粒度特征 + O(n²) 朴素贪心（A/B 对照臂）。
-        while !remaining.is_empty() {
-            let mut best_index = 0usize;
-            let mut best_value = f64::NEG_INFINITY;
-            for (index, unit) in remaining.iter().enumerate() {
-                let gain = marginal_gain(unit, &covered_features, &term_files, false);
-                let value = pack_value(unit, gain);
-                if value > best_value {
-                    best_value = value;
-                    best_index = index;
-                }
-            }
-            let mut picked = remaining.remove(best_index);
-            commit(&mut picked, &mut covered_features, &mut term_files);
-            units.push(picked);
-        }
+        units.push(picked);
     }
     let mut plans = Vec::<PlannedFile>::new();
     let mut sigs = Vec::<(String, usize, String)>::new();
@@ -5943,49 +4816,6 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             }
             body.push(String::new());
         }
-        // 方案5 超取经济学：字节便宜、调用昂贵。把 deferred 中未回填的非必需块
-        // 以签名形式暴露为"投机块"——模型若判断相关可直接按 path:ln 补读，
-        // 省掉一次完整工具调用的 RTT。按 score 降序取前 8 个。
-        // NOVA_CTX_SPECULATIVE=0 关闭（A/B 对照）。
-        let speculative_enabled = std::env::var_os("NOVA_CTX_SPECULATIVE")
-            .map(|value| value != "0")
-            .unwrap_or(true);
-        if speculative_enabled {
-            let mut speculative = deferred
-                .iter()
-                .filter(|item| !item.block.required)
-                .filter(|item| {
-                    // 已被回填进 plans 的块不再重复列出。
-                    !plans.iter().any(|plan| {
-                        plan.file == item.file
-                            && plan.blocks.iter().any(|block| {
-                                block.start == item.block.start && block.end == item.block.end
-                            })
-                    })
-                })
-                .collect::<Vec<_>>();
-            speculative.sort_by(|a, b| {
-                b.block
-                    .score
-                    .partial_cmp(&a.block.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            speculative.truncate(8);
-            if !speculative.is_empty() {
-                body.push("## SPECULATIVE (可能相关但预算内未打包; 确需按 path:ln 补读)".into());
-                for item in speculative {
-                    body.push(format!(
-                        "{}:{}-{} {} [{}]",
-                        item.file,
-                        item.block.start,
-                        item.block.end,
-                        item.block.label,
-                        item.block.tag
-                    ));
-                }
-                body.push(String::new());
-            }
-        }
         let mut notes = Vec::new();
         if !compact_index {
             if !missed_all.is_empty() {
@@ -6246,166 +5076,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     }
     let _ = original_count;
     trace("fast_context.render", render_start);
-    // 独立预取模型：预测未来 1–3 次 fast_context 的 demand source miss。
-    // 硬排除已缓存文件，按 expected gain 与 256KB 总预算取 top-3。
-    let prefetch_enabled = std::env::var_os("NOVA_CTX_PREFETCH")
-        .map(|value| value != "0")
-        .unwrap_or(true);
-    if prefetch_enabled && learning_owner() {
-        let packed_files = final_candidates
-            .iter()
-            .map(|(file, _)| file)
-            .collect::<HashSet<_>>();
-        let current_terms = keywords
-            .iter()
-            .chain(task_terms.iter())
-            .map(|term| term.to_lowercase())
-            .collect::<Vec<_>>();
-        let use_edit_model =
-            std::env::var("NOVA_CTX_PREFETCH_MODEL").ok().as_deref() == Some("edit");
-        let (model, edit_model, recent, previous_terms) = with_learning_state(root, |state| {
-            (
-                state.prefetch_model.clone(),
-                state.model.clone(),
-                state.recent_demand.clone(),
-                state.last_query_terms.clone(),
-            )
-        });
-        let query_continuity = if previous_terms.is_empty() || current_terms.is_empty() {
-            0.0
-        } else {
-            let previous = previous_terms.iter().collect::<HashSet<_>>();
-            current_terms
-                .iter()
-                .filter(|term| previous.contains(term))
-                .count() as f64
-                / current_terms.len().max(1) as f64
-        };
-        let precision = model.useful as f64 / model.opportunities.max(1) as f64;
-        let predictor_ready = if use_edit_model {
-            edit_model.observations >= 5
-        } else {
-            model.opportunities < 20 || precision >= 0.2
-        };
-        if predictor_ready {
-            let mut candidates = ranked
-                .iter()
-                .filter(|(file, _)| !packed_files.contains(file))
-                .filter(|(file, _)| is_code_file(file) && !noise_path(file))
-                .filter(|(file, _)| !source_cache_contains(root, file))
-                .filter_map(|(file, heuristic)| {
-                    let bytes = fs::metadata(root.join(file)).ok()?.len();
-                    if bytes == 0 || bytes > PREFETCH_MAX_BYTES {
-                        return None;
-                    }
-                    let base = learning_features(file, *heuristic);
-                    let graph_near = if exact_callers.contains_key(file)
-                        || companion_tests.contains(file)
-                        || coupling_files
-                            .iter()
-                            .any(|(candidate, _)| candidate == file)
-                    {
-                        1.0
-                    } else {
-                        0.0
-                    };
-                    let recent_demand =
-                        (recent.get(file).copied().unwrap_or(0) as f64 / 5.0).min(1.0);
-                    let read_cost =
-                        ((bytes as f64).ln_1p() / (PREFETCH_MAX_BYTES as f64).ln_1p()).min(1.0);
-                    let features = [
-                        base[0],
-                        base[1],
-                        base[2],
-                        base[3],
-                        base[4],
-                        base[5],
-                        base[6],
-                        base[7],
-                        base[8],
-                        graph_near,
-                        recent_demand,
-                        query_continuity,
-                        read_cost,
-                        if coupling_files
-                            .iter()
-                            .any(|(candidate, _)| candidate == file)
-                        {
-                            1.0
-                        } else {
-                            0.0
-                        },
-                    ];
-                    let probability = if use_edit_model {
-                        learning_predict(&edit_model, &base)
-                    } else {
-                        prefetch_predict(&model, &features)
-                    };
-                    let expected_gain =
-                        probability * read_cost - (1.0 - probability) * read_cost * 0.35;
-                    (expected_gain > 0.0).then_some(PrefetchSample {
-                        file: file.clone(),
-                        features,
-                        probability,
-                        bytes,
-                        prefetched: false,
-                    })
-                })
-                .collect::<Vec<_>>();
-            candidates.sort_by(|a, b| {
-                (b.probability * b.bytes as f64)
-                    .partial_cmp(&(a.probability * a.bytes as f64))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut selected = Vec::new();
-            let mut selected_bytes = 0u64;
-            for mut sample in candidates {
-                if selected.len() >= PREFETCH_MAX_FILES
-                    || selected_bytes.saturating_add(sample.bytes) > PREFETCH_MAX_BYTES
-                {
-                    continue;
-                }
-                selected_bytes += sample.bytes;
-                sample.prefetched = true;
-                selected.push(sample);
-            }
-            if !selected.is_empty() {
-                with_learning_state(root, |state| {
-                    state.last_query_terms = current_terms;
-                    state.metrics.predicted += selected.len() as u64;
-                    state.prefetch_traces.push(PendingPrefetchTrace {
-                        samples: selected.clone(),
-                        remaining: PREFETCH_WINDOW,
-                    });
-                });
-                let root = root.to_path_buf();
-                let entries = index.files.clone();
-                std::thread::spawn(move || {
-                    let started = Instant::now();
-                    for sample in selected {
-                        let _ = source(&root, &sample.file, entries.get(&sample.file));
-                    }
-                    let elapsed = started.elapsed().as_millis() as u64;
-                    with_learning_state(&root, |state| {
-                        state.metrics.blocking_ms += elapsed;
-                        state.metrics.latencies_ms.push(elapsed);
-                    });
-                });
-            }
-        }
-    }
     trace("fast_context.total", total_start);
-    if std::env::var_os("NOVA_CTX_DEBUG_STATS").is_some() {
-        let disk = SOURCE_DISK_READS.load(std::sync::atomic::Ordering::Relaxed);
-        let hits = SOURCE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        let prefetch_disk = PREFETCH_DISK_READS.load(std::sync::atomic::Ordering::Relaxed);
-        let prefetch_hits = PREFETCH_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
-            "[ctx-stats] source_disk_reads={disk} source_cache_hits={hits} prefetch_disk_reads={prefetch_disk} prefetch_cache_hits={prefetch_hits} demand_disk_reads={} demand_cache_hits={}",
-            disk.saturating_sub(prefetch_disk),
-            hits.saturating_sub(prefetch_hits),
-        );
-    }
     Ok(text)
 }
 

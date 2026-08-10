@@ -34,14 +34,3 @@ pub fn code_map(root: String, params: Value) -> Result<String> {
     context::code_map(workspace_root(&root)?, params)
         .map_err(|message| Error::new(Status::GenericFailure, message))
 }
-
-#[napi(js_name = "observeContextFeedback")]
-pub fn observe_context_feedback(root: String, params: Value) -> Result<Value> {
-    context::observe_context_feedback(workspace_root(&root)?, params)
-        .map_err(|message| Error::new(Status::GenericFailure, message))
-}
-
-#[napi(js_name = "prefetchMetrics")]
-pub fn prefetch_metrics(root: String) -> Result<Value> {
-    Ok(context::prefetch_metrics(workspace_root(&root)?))
-}

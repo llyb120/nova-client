@@ -61,8 +61,7 @@ export async function callNapiTool(method, root, params) {
   if (method === "fast_context") return native.fastContext(resolve(root), params ?? {});
   if (method === "find_symbols") return native.findSymbols(resolve(root), params ?? {});
   if (method === "code_map") return native.codeMap(resolve(root), params ?? {});
-  if (method === "observe_context_feedback") return native.observeContextFeedback(resolve(root), params ?? {});
-  if (method === "prefetch_metrics") return native.prefetchMetrics(resolve(root));
+
   throw new Error(`unknown N-API tool: ${method}`);
 }
 

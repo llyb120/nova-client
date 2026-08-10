@@ -28,7 +28,6 @@ async function dispatch(request) {
     case "fast_context":
     case "find_symbols":
     case "code_map":
-    case "observe_context_feedback":
       return callNapiTool(request.method, root, params);
     default:
       throw new Error(`unknown context service method: ${request.method}`);

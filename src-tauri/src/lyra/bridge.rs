@@ -214,38 +214,7 @@ struct PromptContext {
     mode: String,
 }
 
-struct ContextLearningSettleGuard(PathBuf);
 
-impl Drop for ContextLearningSettleGuard {
-    fn drop(&mut self) {
-        // 覆盖正常完成、provider 错误、用户取消以及 task abort。settle 是锦上添花：
-        // 学习状态只在全局 service 内更新持久化，服务不在则静默丢弃，Lyra 进程
-        // 本身不持有训练能力。响应带回全局模型快照，注入本地供后续检索 blend 使用。
-        let root = self.0.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Ok(value) = crate::context_service::call_global(
-                    "observe_context_feedback",
-                    &root,
-                    serde_json::json!({ "action": "settle" }),
-                )
-                .await
-                {
-                    if let Some(snapshot) = value.get("modelSnapshot") {
-                        let root_buf = root.clone();
-                        let snapshot = snapshot.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            crate::nova_tools_native::context::inject_learning_model_snapshot(
-                                &root_buf, &snapshot,
-                            )
-                        })
-                        .await;
-                    }
-                }
-            });
-        }
-    }
-}
 
 async fn handle_prompt(
     http: &reqwest::Client,
@@ -279,7 +248,7 @@ async fn handle_prompt(
     let cwd_path = cwd_path
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(&ctx.cwd));
-    let _learning_settle = ContextLearningSettleGuard(cwd_path.clone());
+
     let env = config::process_env();
     let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
     let resolved = config::resolve_model(

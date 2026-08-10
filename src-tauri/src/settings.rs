@@ -158,9 +158,7 @@ pub struct Settings {
     pub semantic_enabled: bool,
     /// 启用 Fast Context：为 Vega / Cursor / Devin 注入 fast_context / find_symbols 上下文检索工具；关闭则不附带。
     pub fast_context_enabled: bool,
-    /// 启用 Fast Context 在线学习：由全局 context service 汇总各 agent 的编辑反馈，
-    /// 增量调整 fast_context 候选文件排序。检索本身不依赖学习，关闭后只做检索。
-    pub context_learning_enabled: bool,
+
     /// embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434）
     pub embed_endpoint: String,
     /// embedding 模型名（如 bge-m3 / nomic-embed-text / text-embedding-3-small）
@@ -235,7 +233,7 @@ impl Default for Settings {
             session_auto_cleanup_hours: 24 * 30,
             semantic_enabled: false,
             fast_context_enabled: true,
-            context_learning_enabled: true,
+
             embed_endpoint: "http://localhost:11434".into(),
             embed_model: "bge-m3".into(),
             embed_api_key: String::new(),
@@ -270,7 +268,7 @@ mod tests {
     #[test]
     fn fast_context_is_enabled_by_default() {
         assert!(Settings::default().fast_context_enabled);
-        assert!(Settings::default().context_learning_enabled);
+
     }
 
     #[test]

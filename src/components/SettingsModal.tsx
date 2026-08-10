@@ -289,9 +289,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [fastContextEnabled, setFastContextEnabled] = createSignal(
     s?.fastContextEnabled ?? true,
   );
-  const [contextLearningEnabled, setContextLearningEnabled] = createSignal(
-    s?.contextLearningEnabled ?? true,
-  );
+
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
   const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
@@ -746,7 +744,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     windowsShellShimEnabled: windowsShellShimEnabled(),
     checkpointEnabled: checkpointEnabled(),
     fastContextEnabled: fastContextEnabled(),
-    contextLearningEnabled: contextLearningEnabled(),
+
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
     claudecodeProxy: claudecodeProxy().trim(),
@@ -1591,20 +1589,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   启用后为 Vega / Cursor / Devin 注入 fast_context / find_symbols 工具，用于一次性打包相关代码上下文；关闭则不附带这两个工具。Devin 另始终挂载 read_files / edit_files（Plan 模式不含 edit_files）。默认启用。
                 </span>
               </div>
-              <div class="field">
-                <span class="field-label">Fast Context 在线学习</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={contextLearningEnabled()}
-                    onChange={(e) => setContextLearningEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-                <span class="field-hint">
-                  由全局 context service 汇总各 agent 会话的编辑反馈，增量调整 fast_context 候选文件排序（RankNet 成对学习）。检索本身不依赖学习，关闭后仍正常检索只是不再学习。默认启用；保存后重启 Nova 生效。
-                </span>
-              </div>
+
             </section>
 
             <section class="settings-group">
