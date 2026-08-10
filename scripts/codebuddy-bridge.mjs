@@ -1,8 +1,9 @@
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, win32 } from "node:path";
+import { win32 } from "node:path";
 import { createInterface } from "node:readline";
-import { query, unstable_v2_createSession } from "@tencent-ai/agent-sdk";
+import { createSdkMcpServer, query, tool, unstable_v2_createSession } from "@tencent-ai/agent-sdk";
+import { z } from "zod";
+import { createNovaBatchTools } from "./nova-batch-tools.mjs";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -47,20 +48,42 @@ function codeBuddyBatchToolPolicy(request, env = process.env) {
   return lines.join("\n");
 }
 
-/** 为 CodeBuddy 会话挂载 nova-tools MCP（fast_context / find_symbols）；runtime 脚本缺失时不挂载。 */
-function novaToolsMcpServers(request, env = process.env) {
-  const script = join(env.NOVA_DATA_DIR || join(homedir(), ".nova"), "runtime", "nova-tools-mcp.mjs");
-  if (!existsSync(script)) return undefined;
-  const serverEnv = {
-    NOVA_TOOLS_CWD: request.cwd,
-    NOVA_FAST_CONTEXT: env.NOVA_FAST_CONTEXT ?? "1",
-  };
-  if (request.mode === "plan") serverEnv.NOVA_TOOLS_READ_ONLY = "1";
-  for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN"]) {
-    if (env[key]) serverEnv[key] = env[key];
-  }
+/**
+ * Register Nova tools as an in-process SDK MCP server. CodeBuddy's CLI can fail to discover a
+ * spawned stdio sidecar even when that sidecar itself is healthy; SDK MCP uses the agent-sdk
+ * control channel and therefore appears in the CLI tool registry before the first model turn.
+ */
+function novaToolsMcpServers(request, env = process.env, createServer = createSdkMcpServer) {
+  if (env.NOVA_FAST_CONTEXT === "0") return undefined;
+  const batchTools = createNovaBatchTools(request.cwd, {
+    fastContext: true,
+    readOnly: request.mode === "plan",
+  });
+  const fastContext = batchTools.fast_context;
+  const findSymbols = batchTools.find_symbols;
   return {
-    "nova-tools": { type: "stdio", command: process.execPath, args: [script], env: serverEnv },
+    "nova-tools": createServer({
+      name: "nova-tools",
+      version: "1.0.0",
+      tools: [
+        tool("fast_context", fastContext.description, {
+          keywords: z.array(z.string().min(1)).min(1).max(5).optional(),
+          query: z.string().min(1).optional(),
+          task: z.string().min(1).optional(),
+          files: z.array(z.string().min(1)).min(1).max(6).optional(),
+          budget: z.number().int().min(100).max(4000).optional(),
+          maxChars: z.number().int().min(4000).max(80000).optional(),
+          coupling: z.boolean().optional(),
+        }, async (args) => ({ content: [{ type: "text", text: await fastContext.execute(args) }] })),
+        tool("find_symbols", findSymbols.description, {
+          names: z.array(z.string().min(1)).min(1).optional(),
+          name: z.string().min(1).optional(),
+          query: z.string().min(1).optional(),
+          keywords: z.array(z.string().min(1)).min(1).optional(),
+          symbols: z.array(z.string().min(1)).min(1).optional(),
+        }, async (args) => ({ content: [{ type: "text", text: await findSymbols.execute(args) }] })),
+      ],
+    }),
   };
 }
 
@@ -70,8 +93,18 @@ async function readRequest(lines) {
   return JSON.parse(value);
 }
 
-async function* promptMessages(request) {
+async function* promptMessages(request, env = process.env) {
   const content = [];
+  const policy = codeBuddyBatchToolPolicy(request, env);
+  // CodeBuddy may retain the original system prompt when resuming a CLI session. Cursor avoids
+  // that problem by attaching its policy to every user message; do the same here so the current
+  // turn always sees the MCP routing rule immediately before the user's request.
+  if (policy) content.push({
+    type: "text",
+    text: `${policy}${env.NOVA_FAST_CONTEXT !== "0"
+      ? "\n\nCURRENT TURN ROUTING: If repository discovery/search is needed, your first repository tool call MUST be mcp__nova-tools__fast_context (the fast_context tool from MCP server nova-tools). Do not call Grep, Glob, Search, or Bash search first. Only use built-in search after fast_context when its output explicitly leaves a coverage gap."
+      : ""}\n\nUser request follows:`,
+  });
   for (const part of request.parts ?? []) {
     if (part.type === "text") content.push({ type: "text", text: part.text });
     if (part.type === "image_data") content.push({ type: "image", source: { type: "base64", media_type: part.mime, data: part.data } });
@@ -88,17 +121,56 @@ async function* promptMessages(request) {
 }
 
 function assistantItems(message, stream) {
+  const matchedStreamIndexes = new Set();
   return (message.message?.content ?? []).flatMap((block, index) => {
-    // Text/thinking blocks already seen in stream events must keep the streaming
-    // ID. CodeBuddy may use a different message/block ID in the final assistant
-    // snapshot; switching IDs would leave both snapshots visible in Nova.
-    const streamed = stream?.blocks.has(index) && (block.type === "text" || block.type === "thinking");
-    const id = streamed ? `${stream.messageId}-${index}` : block.id ?? `${message.message.id}-${index}`;
+    let streamedIndex;
+    if (block.type === "text" || block.type === "thinking") {
+      const finalText = block.type === "text" ? block.text : block.thinking;
+      // The final snapshot may omit or reorder thinking blocks, so its array
+      // indexes do not necessarily match content_block event indexes. Match the
+      // accumulated stream by type/content and retain its ID.
+      for (const [candidateIndex, candidate] of stream?.blocks ?? []) {
+        if (matchedStreamIndexes.has(candidateIndex) || candidate.type !== block.type) continue;
+        if (finalText === candidate.text || finalText?.startsWith(candidate.text)) {
+          streamedIndex = candidateIndex;
+          matchedStreamIndexes.add(candidateIndex);
+          break;
+        }
+      }
+    }
+    const id = streamedIndex !== undefined
+      ? `${stream.messageId}-${streamedIndex}`
+      : block.id ?? `${message.message.id}-${index}`;
     if (block.type === "text") return [{ id, type: "agent_message", text: block.text }];
     if (block.type === "thinking") return [{ id, type: "reasoning", text: block.thinking }];
-    if (block.type === "tool_use") return [{ id, type: "mcp_tool_call", server: "CodeBuddy", tool: block.name, arguments: block.input, status: "in_progress" }];
+    if (block.type === "tool_use") {
+      const item = { id, type: "mcp_tool_call", server: "CodeBuddy", tool: block.name, arguments: block.input, status: "in_progress" };
+      stream?.tools?.set(id, item);
+      return [item];
+    }
     return [];
   });
+}
+
+/** CodeBuddy SDK reports completed tools as user/tool_result messages. Re-emit the same item ID
+ * so the Rust runtime upserts the loading card instead of adding a second tool card. */
+function toolResultItems(message, stream) {
+  return (message.message?.content ?? []).flatMap((block) => {
+    if (block.type !== "tool_result" || !block.tool_use_id) return [];
+    const pending = stream.tools.get(block.tool_use_id);
+    if (!pending) return [];
+    stream.tools.delete(block.tool_use_id);
+    const content = Array.isArray(block.content)
+      ? block.content
+      : [{ type: "text", text: String(block.content ?? "") }];
+    return [{ ...pending, status: block.is_error ? "failed" : "completed", result: { content } }];
+  });
+}
+
+function completePendingTools(stream) {
+  const items = [...stream.tools.values()].map((item) => ({ ...item, status: "completed" }));
+  stream.tools.clear();
+  return items;
 }
 
 function emitContent(message, stream) {
@@ -139,7 +211,7 @@ function streamEventItem(message, stream) {
 
 async function runPrompt(lines, request) {
   const pending = new Map();
-  const stream = { messageId: "message", blocks: new Map() };
+  const stream = { messageId: "message", blocks: new Map(), tools: new Map() };
   let sessionId = request.sessionId;
   let checkpoint;
   let activeQuery;
@@ -194,9 +266,14 @@ async function runPrompt(lines, request) {
       checkpoint = message.uuid;
       emitContent(message, stream);
     }
+    else if (message.type === "user") {
+      for (const item of toolResultItems(message, stream)) send({ type: "item", item });
+    }
     else if (message.type === "error") throw new Error(message.error);
     else if (message.type === "result") {
       if (message.is_error) throw new Error(message.errors?.join("\n") || "CodeBuddy turn failed");
+      // Some SDK versions consume tool_result internally without yielding the user message.
+      for (const item of completePendingTools(stream)) send({ type: "item", item });
       if (sessionId && checkpoint) send({ type: "checkpoint", sessionId, position: checkpoint });
       send({ type: "done", usage: message.usage });
     }
@@ -283,4 +360,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { assistantItems, assistantText, codeBuddyBatchToolPolicy, novaToolsMcpServers, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem };
+export { assistantItems, assistantText, codeBuddyBatchToolPolicy, completePendingTools, novaToolsMcpServers, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem, toolResultItems };

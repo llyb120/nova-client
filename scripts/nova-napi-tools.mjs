@@ -3,10 +3,13 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const require = createRequire(import.meta.url);
+// This module is also bundled into CodeBuddy's CommonJS bridge. In that output esbuild
+// replaces import.meta with an empty shim, so use Node's real CJS globals when available.
+const moduleLocation = typeof __filename === "string" ? __filename : import.meta.url;
+const require = createRequire(moduleLocation);
 const moduleDir = typeof __dirname === "string"
   ? __dirname
-  : dirname(fileURLToPath(import.meta.url));
+  : dirname(fileURLToPath(moduleLocation));
 let binding;
 let loadError;
 

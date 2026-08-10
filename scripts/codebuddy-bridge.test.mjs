@@ -10,6 +10,8 @@ const {
   promptMessages,
   resolveCodeBuddyCliPath,
   streamEventItem,
+  toolResultItems,
+  completePendingTools,
 } = await import("./codebuddy-bridge.mjs");
 
 const npmShim = "C:\\Users\\test\\AppData\\Roaming\\npm\\codebuddy.cmd";
@@ -17,6 +19,7 @@ const npmCli = "C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\@tencent-a
 assert.equal(resolveCodeBuddyCliPath(npmShim, (path) => path === npmCli), npmCli);
 assert.equal(resolveCodeBuddyCliPath(npmShim, () => false), npmShim);
 assert.equal(resolveCodeBuddyCliPath("C:\\codebuddy\\codebuddy.exe", () => true), "C:\\codebuddy\\codebuddy.exe");
+assert.doesNotThrow(() => resolveCodeBuddyCliPath(npmShim), "default filesystem check must be defined");
 
 assert.equal(permissionModeFor("build"), "bypassPermissions");
 assert.equal(permissionModeFor("bypass"), "bypassPermissions");
@@ -38,27 +41,35 @@ for await (const message of promptMessages({
     { type: "text", text: "inspect" },
     { type: "local_image", path: "C:/Users/1/Desktop/report.xlsx" },
   ],
-})) messages.push(message);
+}, { NOVA_FAST_CONTEXT: "1" })) messages.push(message);
 
-assert.deepEqual(messages[0].message.content, [
+assert.match(messages[0].message.content[0].text, /first repository tool call MUST be mcp__nova-tools__fast_context/);
+assert.deepEqual(messages[0].message.content.slice(1), [
   { type: "text", text: "inspect" },
   { type: "text", text: "Attached file: C:/Users/1/Desktop/report.xlsx" },
 ]);
+
+const noFastContextMessages = [];
+for await (const message of promptMessages({ parts: [{ type: "text", text: "inspect" }] }, { NOVA_FAST_CONTEXT: "0" })) {
+  noFastContextMessages.push(message);
+}
+assert.doesNotMatch(noFastContextMessages[0].message.content[0].text, /first repository tool call MUST/);
+assert.deepEqual(noFastContextMessages[0].message.content[1], { type: "text", text: "inspect" });
 
 const stream = { messageId: "message", blocks: new Map() };
 assert.equal(streamEventItem({
   event: { type: "message_start", message: { id: "message-1" } },
 }, stream), null);
 assert.equal(streamEventItem({
-  event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+  event: { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
 }, stream), null);
 assert.deepEqual(streamEventItem({
-  event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "残" } },
-}, stream), { id: "message-1-0", type: "agent_message", text: "残" });
+  event: { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "完整回答" } },
+}, stream), { id: "message-1-2", type: "agent_message", text: "完整回答" });
 
 const finalItems = assistantItems({
   message: {
-    // The SDK may use IDs in the final snapshot that differ from message_start.
+    // Final snapshot IDs and indexes may all differ from the stream events.
     id: "final-message-id",
     content: [
       { id: "final-text-block", type: "text", text: "完整回答" },
@@ -68,38 +79,43 @@ const finalItems = assistantItems({
   },
 }, stream);
 assert.deepEqual(finalItems, [
-  { id: "message-1-0", type: "agent_message", text: "完整回答" },
+  { id: "message-1-2", type: "agent_message", text: "完整回答" },
   { id: "final-thinking-block", type: "reasoning", text: "完整思考" },
   { id: "tool-1", type: "mcp_tool_call", server: "CodeBuddy", tool: "Grep", arguments: { pattern: "榜单" }, status: "in_progress" },
 ]);
-assert.equal(finalItems[0].id, "message-1-0", "the final snapshot must replace the partial item");
+assert.equal(finalItems[0].id, "message-1-2", "the final snapshot must replace the partial item even when its index changed");
+const toolStream = { messageId: "message", blocks: new Map(), tools: new Map() };
+const [pendingTool] = assistantItems({
+  message: { id: "assistant", content: [{ type: "tool_use", id: "tool-result-id", name: "fast_context", input: { query: "roblox" } }] },
+}, toolStream);
+assert.equal(pendingTool.status, "in_progress");
+assert.deepEqual(toolResultItems({
+  message: { content: [{ type: "tool_result", tool_use_id: "tool-result-id", content: "found", is_error: false }] },
+}, toolStream), [{
+  ...pendingTool,
+  status: "completed",
+  result: { content: [{ type: "text", text: "found" }] },
+}]);
+assert.equal(toolStream.tools.size, 0);
+assistantItems({
+  message: { id: "assistant-2", content: [{ type: "tool_use", id: "tool-without-result", name: "Grep", input: {} }] },
+}, toolStream);
+assert.equal(completePendingTools(toolStream)[0].status, "completed");
 assert.equal(assistantText({
   message: { content: [{ type: "thinking", thinking: "ignore" }, { type: "text", text: "修复标题" }] },
 }), "修复标题");
 
-const { mkdir, mkdtemp, writeFile } = await import("node:fs/promises");
-const { tmpdir } = await import("node:os");
-const { join } = await import("node:path");
-
-const novaHome = await mkdtemp(join(tmpdir(), "nova-codebuddy-mcp-"));
-assert.equal(novaToolsMcpServers({ cwd: "D:/repo", mode: "build" }, { NOVA_DATA_DIR: join(novaHome, "missing") }), undefined);
-await mkdir(join(novaHome, "runtime"), { recursive: true });
-await writeFile(join(novaHome, "runtime", "nova-tools-mcp.mjs"), "// stub\n");
-const planServers = novaToolsMcpServers({ cwd: "D:/repo", mode: "plan" }, {
-  NOVA_DATA_DIR: novaHome,
-  NOVA_FAST_CONTEXT: "0",
-  NOVA_CONTEXT_SERVICE_ENDPOINT: "http://127.0.0.1:9",
-  NOVA_CONTEXT_SERVICE_TOKEN: "token",
-});
-assert.equal(planServers["nova-tools"].command, process.execPath);
-assert.deepEqual(planServers["nova-tools"].args, [join(novaHome, "runtime", "nova-tools-mcp.mjs")]);
-assert.deepEqual(planServers["nova-tools"].env, {
-  NOVA_TOOLS_CWD: "D:/repo",
-  NOVA_FAST_CONTEXT: "0",
-  NOVA_TOOLS_READ_ONLY: "1",
-  NOVA_CONTEXT_SERVICE_ENDPOINT: "http://127.0.0.1:9",
-  NOVA_CONTEXT_SERVICE_TOKEN: "token",
-});
-const buildServers = novaToolsMcpServers({ cwd: "/repo", mode: "build" }, { NOVA_DATA_DIR: novaHome });
-assert.equal(buildServers["nova-tools"].env.NOVA_TOOLS_READ_ONLY, undefined);
-assert.equal(buildServers["nova-tools"].env.NOVA_FAST_CONTEXT, "1");
+const disabledServers = novaToolsMcpServers({ cwd: "D:/repo", mode: "build" }, { NOVA_FAST_CONTEXT: "0" });
+assert.equal(disabledServers, undefined);
+let sdkServerOptions;
+const sdkServers = novaToolsMcpServers(
+  { cwd: "D:/repo", mode: "plan" },
+  { NOVA_FAST_CONTEXT: "1" },
+  (options) => {
+    sdkServerOptions = options;
+    return { type: "sdk", name: options.name, instance: {} };
+  },
+);
+assert.deepEqual(sdkServers["nova-tools"], { type: "sdk", name: "nova-tools", instance: {} });
+assert.equal(sdkServerOptions.name, "nova-tools");
+assert.deepEqual(sdkServerOptions.tools.map((item) => item.name), ["fast_context", "find_symbols"]);

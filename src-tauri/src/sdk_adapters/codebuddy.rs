@@ -21,14 +21,7 @@ impl SdkAdapter for CodeBuddyAdapter {
         )
     }
 
-    /// nova-tools MCP（fast_context / find_symbols）随 bridge 释放到 runtime 目录，
-    /// 由 bridge 在 query 时通过 mcpServers 挂载。
-    fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
-        &[(
-            "nova-tools-mcp.mjs",
-            include_bytes!("../../resources/nova-tools-mcp.mjs"),
-        )]
-    }
+
 
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
         LaunchConfig {
