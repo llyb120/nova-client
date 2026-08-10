@@ -159,6 +159,8 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "429",
     "too many requests",
     "rate limit",
+    "503",
+    "service unavailable",
     "timed out",
     "error sending request",
 ];
@@ -519,6 +521,9 @@ mod tests {
     #[test]
     fn classifies_retryable() {
         assert!(is_retryable_provider_error("HTTP 429 too many requests"));
+        assert!(is_retryable_provider_error(
+            "Lyra provider 请求失败：HTTP 503 Service Unavailable"
+        ));
         assert!(is_retryable_provider_error("connection error: ECONNRESET"));
         assert!(is_retryable_provider_error(
             "provider error: Upstream stream ended prematurely; safe to retry"
