@@ -25,7 +25,29 @@ function permissionModeFor(mode) {
   return mode === "plan" ? "plan" : "bypassPermissions";
 }
 
-/** 为 CodeBuddy 会话挂载 nova-tools MCP（fast_context / find_symbols / edit_files）；runtime 脚本缺失时不挂载。 */
+/** Append Cursor-equivalent batch context policy without replacing CodeBuddy's built-in prompt. */
+function codeBuddyBatchToolPolicy(request, env = process.env) {
+  const readOnly = request.mode === "plan";
+  const fastContext = env.NOVA_FAST_CONTEXT !== "0";
+  const tools = fastContext
+    ? " plus Nova MCP tools fast_context and find_symbols from server nova-tools"
+    : "";
+  const lines = [
+    `You have CodeBuddy built-in filesystem/search tools${tools}. The following tool-selection rules are hard constraints.`,
+    "Prefer minimal reads: when a path and line range are known, read only that segment and expand nearby context only as needed. Do not dump large files blindly.",
+    fastContext
+      ? "When edit distribution is unknown, or when a task requires understanding two or more unread files, call nova-tools fast_context first; use find_symbols only when definition/reference line numbers are sufficient. One fast_context call typically replaces 5–10 grep+read round-trips. Treat its displayed ranges as already read, and read only coverage gaps or explicitly suggested next locations."
+      : "When location is unknown, use a cost-bounded search first and then read only near relevant hits.",
+    fastContext
+      ? "Do not re-discover the same keywords with Grep, rg, or git grep after fast_context. If fast_context reports CTX MISS, retry once using its next hint or explicit files instead of falling back to repeated searches."
+      : "Do not use unscoped recursive grep over a repository or source root.",
+    "Do not scan build artifacts, dependencies, caches, generated files, or large binary directories unless the task requires them. Keep edits focused and run the lowest-cost effective validation.",
+  ];
+  if (readOnly) lines.push("Current mode is plan/read-only: analyze only; do not modify files.");
+  return lines.join("\n");
+}
+
+/** 为 CodeBuddy 会话挂载 nova-tools MCP（fast_context / find_symbols）；runtime 脚本缺失时不挂载。 */
 function novaToolsMcpServers(request, env = process.env) {
   const script = join(env.NOVA_DATA_DIR || join(homedir(), ".nova"), "runtime", "nova-tools-mcp.mjs");
   if (!existsSync(script)) return undefined;
@@ -143,6 +165,7 @@ async function runPrompt(lines, request) {
     options: {
       cwd: request.cwd,
       mcpServers: novaToolsMcpServers(request),
+      systemPrompt: { append: codeBuddyBatchToolPolicy(request) },
       resume: request.sessionId || undefined,
       resumeSessionAt: request.restoreAt || undefined,
       forkSession: Boolean(request.restoreAt),
@@ -260,4 +283,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { assistantItems, assistantText, novaToolsMcpServers, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem };
+export { assistantItems, assistantText, codeBuddyBatchToolPolicy, novaToolsMcpServers, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem };

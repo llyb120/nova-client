@@ -4,6 +4,7 @@ process.env.NOVA_CODEBUDDY_BRIDGE_TEST = "1";
 const {
   assistantItems,
   assistantText,
+  codeBuddyBatchToolPolicy,
   novaToolsMcpServers,
   permissionModeFor,
   promptMessages,
@@ -20,6 +21,16 @@ assert.equal(resolveCodeBuddyCliPath("C:\\codebuddy\\codebuddy.exe", () => true)
 assert.equal(permissionModeFor("build"), "bypassPermissions");
 assert.equal(permissionModeFor("bypass"), "bypassPermissions");
 assert.equal(permissionModeFor("plan"), "plan");
+
+const batchPolicy = codeBuddyBatchToolPolicy({ mode: "build" }, { NOVA_FAST_CONTEXT: "1" });
+assert.match(batchPolicy, /Nova MCP tools fast_context and find_symbols/);
+assert.match(batchPolicy, /call nova-tools fast_context first/);
+assert.match(batchPolicy, /Do not re-discover the same keywords/);
+assert.doesNotMatch(batchPolicy, /plan\/read-only/);
+assert.match(codeBuddyBatchToolPolicy({ mode: "plan" }, { NOVA_FAST_CONTEXT: "1" }), /plan\/read-only/);
+const noFastContextPolicy = codeBuddyBatchToolPolicy({ mode: "build" }, { NOVA_FAST_CONTEXT: "0" });
+assert.doesNotMatch(noFastContextPolicy, /Nova MCP tools/);
+assert.match(noFastContextPolicy, /cost-bounded search/);
 
 const messages = [];
 for await (const message of promptMessages({
