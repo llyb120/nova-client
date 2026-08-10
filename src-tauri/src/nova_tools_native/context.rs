@@ -6261,10 +6261,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             .chain(task_terms.iter())
             .map(|term| term.to_lowercase())
             .collect::<Vec<_>>();
-        let use_edit_model = std::env::var("NOVA_CTX_PREFETCH_MODEL")
-            .ok()
-            .as_deref()
-            == Some("edit");
+        let use_edit_model =
+            std::env::var("NOVA_CTX_PREFETCH_MODEL").ok().as_deref() == Some("edit");
         let (model, edit_model, recent, previous_terms) = with_learning_state(root, |state| {
             (
                 state.prefetch_model.clone(),

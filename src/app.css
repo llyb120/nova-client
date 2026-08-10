@@ -5863,27 +5863,37 @@ button.head-badge:hover {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  max-width: 600px;
-  width: 100%;
+  width: min(100%, 1400px);
   margin: 0 auto;
-  border-left: 1px solid var(--border);
-  border-right: 1px solid var(--border);
-  background: var(--bg-panel);
+  padding: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(520px, 100%), 1fr));
+  align-content: start;
+  gap: 12px;
+  background: var(--bg);
 }
 .clue-feed-card {
+  min-width: 0;
   display: grid;
   grid-template-columns: 46px minmax(0, 1fr);
   gap: 10px;
   padding: 14px 16px 10px;
-  border-bottom: 1px solid var(--border);
-  transition: background 0.12s;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  transition: background 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.clue-feed-card.expanded {
+  grid-column: 1 / -1;
 }
 .clue-feed-card:hover {
   background: color-mix(in srgb, var(--bg-hover) 50%, var(--bg-panel));
 }
 .clue-feed-card.expanded,
 .clue-feed-card.expanded:hover {
+  border-color: var(--border-strong);
   background: var(--bg-panel);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--text) 7%, transparent);
 }
 .clue-feed-card.connect-source {
   background: var(--weibo-dim);
@@ -6097,7 +6107,7 @@ button.clue-bar-item:hover,
   grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
   gap: 6px;
   margin-top: 8px;
-  max-width: 380px;
+  max-width: 760px;
 }
 .clue-attachment {
   position: relative;
