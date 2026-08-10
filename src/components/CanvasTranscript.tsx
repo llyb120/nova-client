@@ -1439,7 +1439,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         text: "思考过程", color: p.faint, fontSize: 12, font: p.sans,
         hoverBg: p.hover, hoverColor: p.dim, borderRadius: 6, cursor: "pointer",
         data: { open, key },
-        clickAction: () => { toggleExpanded(key, !isExpanded(key, false)); } });
+        // 未显式设置时，进行中的思考默认展开；点击必须基于同一个默认值取反，
+        // 否则首次点击会把 undefined 写成 true，看起来无法收起。
+        clickAction: () => { toggleExpanded(key, !isExpanded(key, active)); } });
       y += 6 + 24;
       if (open) {
         // .thought-body: margin-top 6px; padding 8px 14px; border-left 2px border-light

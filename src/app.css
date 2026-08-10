@@ -1129,7 +1129,7 @@ button {
   50% { opacity: .35; transform: scale(.72); }
 }
 
-/* 右侧世界线沿用紧凑单线样式；分支按列展开，当前时间线始终固定在最左侧。 */
+/* 右侧世界线：仅保留轻量宽度过渡与钟表指针动画。 */
 .repo-time-machine {
   position: relative;
   z-index: 8;
@@ -1139,25 +1139,122 @@ button {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: visible;
   border-left: 1px solid var(--border-light);
   color: var(--text-muted);
   background: color-mix(in srgb, var(--bg) 94%, transparent);
-  transition: width .16s ease, flex-basis .16s ease;
+  transition: width .18s ease-out, flex-basis .18s ease-out;
+}
+.repo-time-machine.collapsed {
+  flex-basis: 18px;
+  width: 18px;
+  border-left-color: transparent;
+  background: transparent;
+}
+.repo-time-toggle {
+  position: absolute;
+  z-index: 5;
+  top: 22px;
+  left: -38px;
+  width: 38px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 62%, transparent);
+  border-right: 0;
+  border-radius: 999px 0 0 999px;
+  color: var(--text-faint);
+  background: color-mix(in srgb, var(--bg-panel) 94%, transparent);
+  box-shadow: -5px 7px 18px rgba(0, 0, 0, .1);
+  cursor: pointer;
+  transition: color .16s ease, border-color .16s ease, background .16s ease;
+}
+.repo-time-machine.collapsed .repo-time-toggle { left: -20px; }
+.repo-time-machine.expanded .repo-time-toggle {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.repo-time-toggle:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 44%, var(--border-light));
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-panel));
+}
+.repo-time-toggle:active { transform: scale(.96); }
+.repo-time-toggle:focus-visible,
+.repo-time-magic-clock:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
+  outline-offset: 2px;
+}
+.repo-time-toggle-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 .repo-time-machine-label {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: 3px;
   flex: 0 0 auto;
-  min-height: 52px;
-  padding: 8px;
+  min-height: 76px;
+  padding: 7px 6px 6px;
+  overflow: hidden;
   border-bottom: 1px solid var(--border-light);
   color: var(--text-faint);
   font-size: 9px;
   letter-spacing: .08em;
   white-space: nowrap;
+}
+.repo-time-machine.collapsed .repo-time-machine-label,
+.repo-time-machine.collapsed .repo-time-machine-track {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.repo-time-magic-clock {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 31px;
+  height: 31px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: var(--accent);
+  cursor: pointer;
+  background: transparent;
+}
+.repo-time-clock-face {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 31px;
+  height: 31px;
+}
+.repo-time-clock-face > svg {
+  position: relative;
+  z-index: 1;
+}
+.repo-time-clock-hand {
+  position: absolute;
+  z-index: 2;
+  left: calc(50% - .5px);
+  top: 5px;
+  width: 1px;
+  height: 7px;
+  border-radius: 2px;
+  background: currentColor;
+  transform-origin: 50% 7px;
+  will-change: transform;
+}
+.repo-time-machine.expanded .repo-time-clock-hand {
+  animation: repo-time-hand-turn .72s linear both;
 }
 .repo-time-machine-track {
   min-width: 0;
@@ -1165,7 +1262,6 @@ button {
   flex: 1;
   display: flex;
   flex-direction: column;
-  /* 单线/多线整图横向居中，避免贴左导致右侧大块留白；溢出时回退到起点以便滚动 */
   align-items: center;
   align-items: safe center;
   overflow-x: auto;
@@ -1173,6 +1269,17 @@ button {
   padding: 6px 5px;
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
+}
+@keyframes repo-time-hand-turn {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .repo-time-machine,
+  .repo-time-clock-hand {
+    animation: none !important;
+    transition-duration: .01ms !important;
+  }
 }
 .repo-time-graph {
   position: relative;

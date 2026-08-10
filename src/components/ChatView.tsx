@@ -664,7 +664,9 @@ export function ChatView() {
   const [draft, setDraft] = createSignal("");
   const [showShare, setShowShare] = createSignal(false);
   const [timeline, setTimeline] = createSignal<TimeMachineTimeline | null>(null);
+  const [timeMachineExpanded, setTimeMachineExpanded] = createSignal(false);
   const [restoringCheckpoint, setRestoringCheckpoint] = createSignal<string | null>(null);
+
 
   createEffect(() => {
     const threadId = state.currentId;
@@ -1351,19 +1353,42 @@ export function ChatView() {
       <Show when={showTimeMachine()}>
         <aside
           class="repo-time-machine"
+          classList={{ collapsed: !timeMachineExpanded(), expanded: timeMachineExpanded() }}
           aria-label="会话与工作目录分支时间线"
         >
-          <div class="repo-time-machine-label">
+          <button
+            type="button"
+            class="repo-time-toggle"
+            aria-expanded={timeMachineExpanded()}
+            title="展开世界线"
+            onClick={() => setTimeMachineExpanded(true)}
+          >
+            <IconStopwatch size={17} />
+            <span class="repo-time-toggle-label">世界线</span>
+          </button>
+          <div class="repo-time-machine-label" aria-hidden={!timeMachineExpanded()}>
             <button
               type="button"
               class="repo-time-notes"
               title="把这条世界线的经验沉淀为一个 skill：新开一个训练会话自行阅读并逐级分析"
-              disabled={!!restoringCheckpoint()}
+              disabled={!!restoringCheckpoint() || !timeMachineExpanded()}
               onClick={() => setShowTimeNotes(true)}
             >
               时光笔记
             </button>
-            <IconStopwatch size={17} />
+            <button
+              type="button"
+              class="repo-time-magic-clock"
+              title="收起世界线"
+              aria-label="收起世界线"
+              tabindex={timeMachineExpanded() ? 0 : -1}
+              onClick={() => setTimeMachineExpanded(false)}
+            >
+              <span class="repo-time-clock-face" aria-hidden="true">
+                <IconStopwatch size={19} />
+                <span class="repo-time-clock-hand" />
+              </span>
+            </button>
             <span>{restoringCheckpoint() ? "跳转中…" : "世界线"}</span>
           </div>
           <div class="repo-time-machine-track">
