@@ -1772,26 +1772,39 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
 
 /** 向指定会话投递普通提示词（含 Fire 阶段续跑）。不处理内置命令。一律 Build。 */
 async function deliverPrompt(threadId: string, text: string, images: PromptImage[]) {
+  // 后端 user 事件到达前先把用户刚发送的内容上屏，避免首轮仍显示“请在下方输入”。
+  // applyUpsert 收到真实 user item 后会移除这个负 id 临时项。
+  const optimisticId = state.currentId === threadId ? -Date.now() : null;
+  if (optimisticId !== null) {
+    setState("items", state.items.length, {
+      type: "user",
+      id: optimisticId,
+      text,
+      images,
+      ts: Date.now(),
+    } as Item);
+    bumpChatScrollToBottom();
+  }
+
   // Fire 阶段在暂停后，或已经产出过判断后，仍允许用户从该会话补充提示继续流程。
   // 本轮正常结束时会重新进入自动验收，而不是退化成不受跟踪的普通会话。
   const resumedFireStep = resumeFireRelay(threadId);
   // 非 Fire 会话再尝试挂回通用工作流；只读阶段会改写为续跑提示。
   const workflowOutbound = resumedFireStep ? null : prepareWorkflowPrompt(threadId, text);
-  // ThreadMeta 不持久化 mode：非当前会话按未知处理，无条件在后端置为 build。
   const currentMode = state.currentId === threadId ? state.mode : "";
-  // 一律 Build：含历史 Plan 会话、以及后端原生 bypass/agent 等。
-  if ((currentMode || "").toLowerCase() !== "build") {
-    await api.setThreadMode(threadId, "build");
-    if (state.currentId === threadId) {
-      setState("mode", "build");
-      lastUsed.setMode(state.agentKind, "build");
-    }
-  }
-  if (state.currentId === threadId) bumpChatScrollToBottom();
   setState("proposedPlan", null);
   optimisticRunningThreads.add(threadId);
   setState("running", threadId, true);
   try {
+    // ThreadMeta 不持久化 mode：非当前会话按未知处理，无条件在后端置为 build。
+    // 一律 Build：含历史 Plan 会话、以及后端原生 bypass/agent 等。
+    if ((currentMode || "").toLowerCase() !== "build") {
+      await api.setThreadMode(threadId, "build");
+      if (state.currentId === threadId) {
+        setState("mode", "build");
+        lastUsed.setMode(state.agentKind, "build");
+      }
+    }
     // 判断阶段被重新唤起时仍然只是验收者：补充内容要并入本轮核验，实现工作交给
     // 下一个执行阶段，否则判断会话会自己动手改项目。
     const outbound = resumedFireStep?.role === "judge"
@@ -1800,6 +1813,9 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
     await api.sendPrompt(threadId, outbound, images);
   } catch (e) {
     optimisticRunningThreads.delete(threadId);
+    if (optimisticId !== null && state.currentId === threadId) {
+      setState("items", (items) => items.filter((item) => item.id !== optimisticId));
+    }
     if (resumedFireStep && fireRelaySteps.get(threadId) === resumedFireStep) {
       fireRelaySteps.delete(threadId);
       suspendedFireRelaySteps.set(threadId, resumedFireStep);
