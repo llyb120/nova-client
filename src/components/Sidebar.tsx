@@ -121,7 +121,8 @@ export function Sidebar(props: {
   const isEmployeeView = () => state.view === "employees" || state.view === "workbench";
 
   const openHistoryThread = async (id: string) => {
-    if (state.view === "clues") setView("home");
+    // 历史会话属于普通模式；从工作流、证据链等页进入时同步复位顶部 tab。
+    setView("home");
     await openThread(id);
   };
 
