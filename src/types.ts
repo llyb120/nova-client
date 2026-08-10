@@ -437,6 +437,8 @@ export interface Settings {
   windowsShellShimEnabled: boolean;
   /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
   checkpointEnabled: boolean;
+  /** Super FastContext 大仓库优化；默认关闭，关闭时保持 master baseline。 */
+  superFastContextEnabled: boolean;
   defaultMode: string;
   /** 标题、快速总结、摘要和压缩等辅助任务所用后端 */
   lightweightModelAgent: string;

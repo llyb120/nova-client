@@ -54,10 +54,13 @@ export function globalContextServiceConfigured() {
 export async function callGlobalContextTool(method, root, params) {
   const config = serviceConfig();
   if (!config) throw new Error("global context service is not configured");
+  const requestParams = method === "fast_context"
+    ? { ...(params ?? {}), _superFastContext: process.env.NOVA_SUPER_FAST_CONTEXT === "1" }
+    : params;
   const deadline = Date.now() + CONNECT_TIMEOUT_MS;
   for (;;) {
     try {
-      return await requestOnce(config, method, root, params);
+      return await requestOnce(config, method, root, requestParams);
     } catch (error) {
       const code = error?.code;
       if (Date.now() >= deadline || !["ENOENT", "ECONNREFUSED", "EPIPE"].includes(code)) throw error;

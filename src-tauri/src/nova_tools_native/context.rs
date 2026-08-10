@@ -198,16 +198,10 @@ struct SourceCache {
 
 static SOURCE_CACHE: OnceLock<Mutex<SourceCache>> = OnceLock::new();
 
-fn scale_optimizations_enabled() -> bool {
-    std::env::var_os("NOVA_CTX_SCALE_OPT")
-        .map(|value| value != "0")
-        .unwrap_or(true)
-}
-
-fn scale_v2_enabled() -> bool {
-    std::env::var_os("NOVA_CTX_SCALE_V2")
-        .map(|value| value != "0")
-        .unwrap_or(true)
+fn super_fast_context_enabled() -> bool {
+    std::env::var_os("NOVA_SUPER_FAST_CONTEXT")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn trace(label: &str, start: Instant) {
@@ -382,13 +376,15 @@ fn hidden_command(program: &str) -> Command {
 }
 
 fn run_command(root: &Path, program: &str, args: &[String]) -> Option<Vec<u8>> {
-    hidden_command(program)
+    let output = hidden_command(program)
         .args(args)
         .current_dir(root)
         .output()
-        .ok()
-        .filter(|output| output.status.success() || !output.stdout.is_empty())
-        .map(|output| output.stdout)
+        .ok()?;
+    if super_fast_context_enabled() && !output.status.success() && output.stdout.is_empty() {
+        return None;
+    }
+    Some(output.stdout)
 }
 
 fn git_index_path(root: &Path) -> Option<PathBuf> {
@@ -409,8 +405,7 @@ fn git_index_path(root: &Path) -> Option<PathBuf> {
 
 fn prefer_git_grep_for_large_repo(root: &Path) -> bool {
     const LARGE_GIT_INDEX_BYTES: u64 = 256 * 1024;
-    scale_optimizations_enabled()
-        && scale_v2_enabled()
+    super_fast_context_enabled()
         && git_index_path(root)
             .and_then(|path| fs::metadata(path).ok())
             .is_some_and(|metadata| metadata.len() >= LARGE_GIT_INDEX_BYTES)
@@ -551,13 +546,15 @@ fn parse_search_rows(bytes: Vec<u8>) -> Vec<SearchRow> {
             .then(a.ln.cmp(&b.ln))
             .then(a.text.cmp(&b.text))
     });
-    // rg enforces this while scanning; align git-grep/fallback semantics explicitly.
-    let mut per_file = HashMap::<String, usize>::new();
-    rows.retain(|row| {
-        let count = per_file.entry(row.file.clone()).or_default();
-        *count += 1;
-        *count <= MAX_HITS_PER_FILE
-    });
+    if super_fast_context_enabled() {
+        // rg enforces this while scanning; align Super's git-grep path with rg semantics.
+        let mut per_file = HashMap::<String, usize>::new();
+        rows.retain(|row| {
+            let count = per_file.entry(row.file.clone()).or_default();
+            *count += 1;
+            *count <= MAX_HITS_PER_FILE
+        });
+    }
     rows.truncate(MAX_HIT_LINES);
     rows
 }
@@ -1544,8 +1541,8 @@ fn build_index(
     // 反向图随缓存持久化：无文件变更的调用直接复用，不再每次
     // O(全部 import × resolve_specifier) 全量重建；有变更时增量补丁（删旧边、
     // 加新边），变更数超阈值才整图重建。
-    if !scale_optimizations_enabled() {
-        // A/B baseline: rebuild the complete reverse graph on every request.
+    if !super_fast_context_enabled() {
+        // Default path must remain behaviorally identical to the current master baseline.
         cache.reverse = reverse_from_files(&cache.files, &all_set);
     } else if changed == 0 && cache.reverse.is_empty() && !cache.files.is_empty() {
         cache.reverse = reverse_from_files(&cache.files, &all_set);
@@ -1633,7 +1630,7 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
     let path = root.join(file);
     let stamp = metadata_stamp(&path)?;
     let cache_key = format!("{}\0{file}", normalize_root(root));
-    if scale_optimizations_enabled() {
+    if super_fast_context_enabled() {
         let cache = SOURCE_CACHE.get_or_init(|| Mutex::new(SourceCache::default()));
         let mut cache = cache
             .lock()
@@ -1662,7 +1659,7 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
         scan_source(&text, file).syms
     };
     let loaded = Source { lines, syms };
-    if scale_optimizations_enabled() {
+    if super_fast_context_enabled() {
         let bytes = text.len();
         if bytes <= SOURCE_CACHE_MAX_BYTES / 4 {
             let cache = SOURCE_CACHE.get_or_init(|| Mutex::new(SourceCache::default()));
@@ -2173,7 +2170,7 @@ fn search_text_scopes(
     word: bool,
     dirs: Option<&[String]>,
 ) -> Vec<SearchRow> {
-    if scale_optimizations_enabled() && rg_available(root) {
+    if super_fast_context_enabled() && rg_available(root) {
         let rows = match dirs {
             Some(dirs) if !dirs.is_empty() => rg_search(root, terms, ignore_case, word, dirs, true),
             _ => rg_search(root, terms, ignore_case, word, &[], true),
@@ -4182,7 +4179,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
     };
 
-    if scale_optimizations_enabled() {
+    if super_fast_context_enabled() {
         // Minoux lazy greedy: marginal coverage can only decrease. Re-evaluate the heap top
         // until it still outranks every remaining upper bound. This preserves the baseline
         // objective while avoiding its O(n²) full rescans on large candidate sets.
