@@ -15,7 +15,7 @@ const CASES = [
 
 function run(test, arm, repeat) {
   return new Promise((resolve) => {
-    const child = spawn(EXE, ["lyra"], { cwd: REPO, env: { ...process.env, NOVA_CTX_SCALE_OPT: arm === "B" ? "1" : "0", LYRA_SPECULATE: "0" }, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(EXE, ["lyra"], { cwd: REPO, env: { ...process.env, NOVA_CTX_SCALE_OPT: "1", NOVA_CTX_SCALE_V2: arm === "B" ? "1" : "0", LYRA_SPECULATE: "0" }, stdio: ["pipe", "pipe", "pipe"] });
     const started = Date.now(); let buf = "", stderr = "", text = "", usage = null; const tools = []; let done = false;
     const finish = (extra={}) => { if (done) return; done = true; clearTimeout(timer); try { child.kill(); } catch {} resolve({ id:test.id, arm, repeat, wallMs:Date.now()-started, text, usage, tools, recall:test.expect.filter(x=>text.includes(x)).length/test.expect.length, stderr:stderr.slice(-1000), ...extra }); };
     const timer = setTimeout(() => finish({ timeout:true }), 8*60_000);

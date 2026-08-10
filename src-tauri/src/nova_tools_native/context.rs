@@ -204,6 +204,12 @@ fn scale_optimizations_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn scale_v2_enabled() -> bool {
+    std::env::var_os("NOVA_CTX_SCALE_V2")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
 fn trace(label: &str, start: Instant) {
     if std::env::var_os("NOVA_TOOLS_NATIVE_PROFILE").is_some() {
         eprintln!(
@@ -381,7 +387,33 @@ fn run_command(root: &Path, program: &str, args: &[String]) -> Option<Vec<u8>> {
         .current_dir(root)
         .output()
         .ok()
+        .filter(|output| output.status.success() || !output.stdout.is_empty())
         .map(|output| output.stdout)
+}
+
+fn git_index_path(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git.join("index"));
+    }
+    let marker = fs::read_to_string(dot_git).ok()?;
+    let value = marker.trim().strip_prefix("gitdir:")?.trim();
+    let path = PathBuf::from(value);
+    let git_dir = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    Some(git_dir.join("index"))
+}
+
+fn prefer_git_grep_for_large_repo(root: &Path) -> bool {
+    const LARGE_GIT_INDEX_BYTES: u64 = 256 * 1024;
+    scale_optimizations_enabled()
+        && scale_v2_enabled()
+        && git_index_path(root)
+            .and_then(|path| fs::metadata(path).ok())
+            .is_some_and(|metadata| metadata.len() >= LARGE_GIT_INDEX_BYTES)
 }
 
 fn walk_code_files(root: &Path) -> Vec<String> {
@@ -518,6 +550,13 @@ fn parse_search_rows(bytes: Vec<u8>) -> Vec<SearchRow> {
             .cmp(&b.file)
             .then(a.ln.cmp(&b.ln))
             .then(a.text.cmp(&b.text))
+    });
+    // rg enforces this while scanning; align git-grep/fallback semantics explicitly.
+    let mut per_file = HashMap::<String, usize>::new();
+    rows.retain(|row| {
+        let count = per_file.entry(row.file.clone()).or_default();
+        *count += 1;
+        *count <= MAX_HITS_PER_FILE
     });
     rows.truncate(MAX_HIT_LINES);
     rows
@@ -707,11 +746,14 @@ fn search_text(
         rows.truncate(MAX_HIT_LINES);
         return rows;
     }
-    if let Some(rows) = rg_search(root, &terms, ignore_case, word, files, false) {
-        return rows;
-    }
     let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
-    if inside == "true" {
+    // On very large tracked repositories git-grep can walk the index substantially faster than
+    // rg walks the filesystem. Keep rg first for normal repos and every explicitly scoped query.
+    let git_first = files.is_empty() && inside == "true" && prefer_git_grep_for_large_repo(root);
+    let run_git = || {
+        if inside != "true" {
+            return None;
+        }
         let mut args = vec!["grep".into(), "-nI".into(), "--untracked".into()];
         if ignore_case {
             args.push("-i".into());
@@ -726,8 +768,19 @@ fn search_text(
         }
         args.push("--".into());
         args.extend(files.iter().cloned());
-        if let Some(stdout) = run_command(root, "git", &args) {
-            return parse_search_rows(stdout);
+        run_command(root, "git", &args).map(parse_search_rows)
+    };
+    if git_first {
+        if let Some(rows) = run_git() {
+            return rows;
+        }
+    }
+    if let Some(rows) = rg_search(root, &terms, ignore_case, word, files, false) {
+        return rows;
+    }
+    if !git_first {
+        if let Some(rows) = run_git() {
+            return rows;
         }
     }
     search_in_process(root, &terms, ignore_case, word, files)
