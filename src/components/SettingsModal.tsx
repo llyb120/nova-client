@@ -1,4 +1,5 @@
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
 import * as QRCode from "qrcode";
@@ -35,6 +36,7 @@ import {
 import type {
   AgentInstructionTarget,
   AgentKind,
+  CliOperationProgress,
   CliStatus,
   Peer,
   SessionShortcut,
@@ -178,42 +180,65 @@ function CliManager(props: {
   busy: boolean;
   upgrading: boolean;
   message?: string;
+  progress?: CliOperationProgress;
+  output?: string;
   onUpgrade: () => void;
 }) {
+  const failed = () => props.message?.includes("失败") || props.progress?.stage === "failed";
   return (
     <div class="cli-manager">
-      <div class="cli-manager-info">
-        <span class="field-label">对应 CLI</span>
-        <span class="cli-manager-name">{props.status?.cliName ?? "检测中…"}</span>
-        <span
-          classList={{
-            "cli-manager-version": true,
-            missing: props.status?.installed === false,
-          }}
-          title={props.status?.detail || ""}
+      <div class="cli-manager-main">
+        <div class="cli-manager-info">
+          <span class="field-label">对应 CLI</span>
+          <span class="cli-manager-name">{props.status?.cliName ?? "检测中…"}</span>
+          <span
+            classList={{
+              "cli-manager-version": true,
+              missing: props.status?.installed === false,
+            }}
+            title={props.status?.detail || ""}
+          >
+            {props.loading ? "正在读取版本…" : (props.status?.version ?? "尚未检测")}
+          </span>
+        </div>
+        <button
+          type="button"
+          class="btn secondary cli-upgrade-btn"
+          disabled={props.loading || props.busy || props.status?.upgradeSupported !== true}
+          onClick={props.onUpgrade}
         >
-          {props.loading ? "正在读取版本…" : (props.status?.version ?? "尚未检测")}
-        </span>
+          {props.upgrading
+            ? (props.status?.installed === false ? "安装中…" : "升级中…")
+            : (props.status?.installed === false ? "一键安装" : "一键升级")}
+        </button>
+        <Show when={props.message}>
+          <span class={`cli-manager-message ${failed() ? "bad" : "ok"}`} title={props.message}>
+            {props.message}
+          </span>
+        </Show>
+        <Show when={!props.message && !props.loading && props.status?.upgradeSupported === false}>
+          <span class="cli-manager-message bad" title={props.status?.detail}>
+            {props.status?.detail}
+          </span>
+        </Show>
       </div>
-      <button
-        type="button"
-        class="btn secondary cli-upgrade-btn"
-        disabled={props.loading || props.busy || props.status?.upgradeSupported !== true}
-        onClick={props.onUpgrade}
-      >
-        {props.upgrading
-          ? (props.status?.installed === false ? "安装中…" : "升级中…")
-          : (props.status?.installed === false ? "一键安装" : "一键升级")}
-      </button>
-      <Show when={props.message}>
-        <span class={`cli-manager-message ${props.message?.includes("失败") ? "bad" : "ok"}`}>
-          {props.message}
-        </span>
+      <Show when={props.progress}>
+        {(progress) => (
+          <div class="cli-operation-progress">
+            <div class="cli-progress-track" aria-label={`${progress().action}进度 ${progress().percent}%`}>
+              <span style={{ width: `${progress().percent}%` }} />
+            </div>
+            <span classList={{ "cli-progress-label": true, bad: failed() }}>
+              {progress().percent}% · {progress().message}
+            </span>
+          </div>
+        )}
       </Show>
-      <Show when={!props.message && !props.loading && props.status?.upgradeSupported === false}>
-        <span class="cli-manager-message bad" title={props.status?.detail}>
-          {props.status?.detail}
-        </span>
+      <Show when={props.output}>
+        <details class="cli-shell-output" open={props.upgrading || failed()}>
+          <summary>Shell 输出</summary>
+          <pre>{props.output}</pre>
+        </details>
       </Show>
     </div>
   );
@@ -360,6 +385,30 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [cliLoading, setCliLoading] = createSignal(false);
   const [upgradingCli, setUpgradingCli] = createSignal<AgentKind | null>(null);
   const [cliMessages, setCliMessages] = createSignal<Partial<Record<AgentKind, string>>>({});
+  const [cliProgress, setCliProgress] = createSignal<Partial<Record<AgentKind, CliOperationProgress>>>({});
+  const [cliOutputs, setCliOutputs] = createSignal<Partial<Record<AgentKind, string>>>({});
+  const activeCliOperations: Partial<Record<AgentKind, string>> = {};
+  let disposedCliProgressListener = false;
+  let stopCliProgressListener: (() => void) | undefined;
+  void listen<CliOperationProgress>("cli:operation-progress", (event) => {
+    const progress = event.payload;
+    if (activeCliOperations[progress.agentKind] !== progress.operationId) return;
+    setCliProgress((prev) => ({ ...prev, [progress.agentKind]: progress }));
+    const isTicker = progress.stage === "running" && /^正在(安装|升级) .+…$/.test(progress.message);
+    if (isTicker) return;
+    setCliOutputs((prev) => {
+      const current = prev[progress.agentKind] ?? "";
+      const next = current ? `${current}\n${progress.message}` : progress.message;
+      return { ...prev, [progress.agentKind]: next.slice(-12000) };
+    });
+  }).then((unlisten) => {
+    if (disposedCliProgressListener) unlisten();
+    else stopCliProgressListener = unlisten;
+  });
+  onCleanup(() => {
+    disposedCliProgressListener = true;
+    stopCliProgressListener?.();
+  });
   const [quotaRefreshing, setQuotaRefreshing] = createSignal(false);
 
   const reloadQuota = async () => {
@@ -764,17 +813,20 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const upgradeCli = async (kind: AgentKind) => {
     const wasInstalled = cliStatuses()[kind]?.installed !== false;
+    const operationId = typeof globalThis.crypto?.randomUUID === "function"
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    activeCliOperations[kind] = operationId;
     setUpgradingCli(kind);
     setCliMessages((prev) => ({ ...prev, [kind]: "" }));
+    setCliProgress((prev) => ({ ...prev, [kind]: undefined }));
+    setCliOutputs((prev) => ({ ...prev, [kind]: "" }));
     try {
-      const operationId = typeof globalThis.crypto?.randomUUID === "function"
-        ? globalThis.crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const status = await api.upgradeCli(kind, draftSettings(), operationId);
       setCliStatuses((prev) => ({ ...prev, [kind]: status }));
       setCliMessages((prev) => ({
         ...prev,
-        [kind]: `${wasInstalled ? "已更新" : "已安装"}到 ${status.version}`,
+        [kind]: `${wasInstalled ? "更新" : "安装"}成功：${status.version}`,
       }));
     } catch (e) {
       const cancelled = String(e).includes("CLI 操作已取消");
@@ -783,6 +835,7 @@ export function SettingsModal(props: { onClose: () => void }) {
         [kind]: cancelled ? "操作已取消" : `${wasInstalled ? "升级" : "安装"}失败：${String(e)}`,
       }));
     } finally {
+      delete activeCliOperations[kind];
       setUpgradingCli(null);
     }
   };
@@ -1694,6 +1747,8 @@ export function SettingsModal(props: { onClose: () => void }) {
                 busy={upgradingCli() !== null}
                 upgrading={upgradingCli() === "devin"}
                 message={cliMessages().devin}
+                progress={cliProgress().devin}
+                output={cliOutputs().devin}
                 onUpgrade={() => void upgradeCli("devin")}
               />
               <div class="backend-fields">
@@ -1757,6 +1812,8 @@ export function SettingsModal(props: { onClose: () => void }) {
                 busy={upgradingCli() !== null}
                 upgrading={upgradingCli() === "codebuddy"}
                 message={cliMessages().codebuddy}
+                progress={cliProgress().codebuddy}
+                output={cliOutputs().codebuddy}
                 onUpgrade={() => void upgradeCli("codebuddy")}
               />
               <div class="backend-fields">
@@ -1791,6 +1848,8 @@ export function SettingsModal(props: { onClose: () => void }) {
                 busy={upgradingCli() !== null}
                 upgrading={upgradingCli() === "claudecode"}
                 message={cliMessages().claudecode}
+                progress={cliProgress().claudecode}
+                output={cliOutputs().claudecode}
                 onUpgrade={() => void upgradeCli("claudecode")}
               />
               <div class="backend-fields">
@@ -1829,6 +1888,8 @@ export function SettingsModal(props: { onClose: () => void }) {
                 busy={upgradingCli() !== null}
                 upgrading={upgradingCli() === "codex"}
                 message={cliMessages().codex}
+                progress={cliProgress().codex}
+                output={cliOutputs().codex}
                 onUpgrade={() => void upgradeCli("codex")}
               />
               <div class="backend-fields">
@@ -1937,6 +1998,8 @@ export function SettingsModal(props: { onClose: () => void }) {
                 busy={upgradingCli() !== null}
                 upgrading={upgradingCli() === "opencode"}
                 message={cliMessages().opencode}
+                progress={cliProgress().opencode}
+                output={cliOutputs().opencode}
                 onUpgrade={() => void upgradeCli("opencode")}
               />
               <div class="backend-fields">
