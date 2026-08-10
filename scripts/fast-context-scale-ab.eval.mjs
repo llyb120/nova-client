@@ -7,7 +7,10 @@ import { createRequire } from "node:module";
 
 const ROOT = join(tmpdir(), "nova-fast-context-scale-ab");
 const ADDON = join(import.meta.dirname, "..", "src-tauri", "resources", "nova-tools-napi.node");
-const SIZES = [1000, 4000, 8000];
+const SIZES = String(process.env.SCALE_AB_SIZES ?? "1000,4000,8000")
+  .split(",")
+  .map(Number)
+  .filter((value) => Number.isInteger(value) && value > 0);
 const REPEATS = Number(process.env.SCALE_AB_REPEATS ?? 9);
 
 function fixture(size) {
