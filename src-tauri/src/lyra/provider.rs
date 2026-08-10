@@ -893,8 +893,39 @@ fn parse_responses_object(
     }
 }
 
-/// 一次流式模型调用。取消时返回 stop_reason = aborted。
-pub async fn stream_chat(
+const STREAM_RETRY_DELAYS_MS: [u64; 2] = [250, 750];
+
+fn is_retryable_stream_error(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    [
+        "error decoding response body",
+        "读取响应流失败",
+        "unexpected eof",
+        "connection reset",
+        "connection closed",
+        "connection error",
+        "broken pipe",
+        "incomplete message",
+        "stream error",
+        "request failed",
+        "请求失败",
+        "timeout",
+        "timed out",
+        "http 429",
+        "too many requests",
+        "rate limit",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "http2",
+        "http/2",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+}
+
+async fn stream_chat_once(
     http: &reqwest::Client,
     model: &ResolvedModel,
     api_key: &str,
@@ -934,6 +965,61 @@ pub async fn stream_chat(
             stream_anthropic(http, model, api_key, body, cancel, on_event).await
         }
         other => Err(format!("Lyra 暂不支持协议 {other}")),
+    }
+}
+
+/// 一次流式模型调用。网络/响应体解码错误会在尚未向调用方发送任何增量时静默重试；
+/// 已经发送增量后不重试，避免 UI、工具参数或会话内容重复。取消时返回 stop_reason = aborted。
+pub async fn stream_chat(
+    http: &reqwest::Client,
+    model: &ResolvedModel,
+    api_key: &str,
+    thinking_level: Option<&str>,
+    system_prompt: &str,
+    messages: &[Value],
+    tools: &[Tool],
+    session_id: Option<&str>,
+    cancel: &Arc<AtomicBool>,
+    on_event: &mut (dyn FnMut(StreamEvent) + Send),
+) -> Result<StreamResult, String> {
+    let mut retry = 0;
+    loop {
+        let mut emitted = false;
+        let result = stream_chat_once(
+            http,
+            model,
+            api_key,
+            thinking_level,
+            system_prompt,
+            messages,
+            tools,
+            session_id,
+            cancel,
+            &mut |event| {
+                emitted = true;
+                on_event(event);
+            },
+        )
+        .await;
+
+        match result {
+            Err(error)
+                if !emitted
+                    && retry < STREAM_RETRY_DELAYS_MS.len()
+                    && is_retryable_stream_error(&error)
+                    && !cancel.load(Ordering::SeqCst) =>
+            {
+                let delay = STREAM_RETRY_DELAYS_MS[retry];
+                retry += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                if cancel.load(Ordering::SeqCst) {
+                    let mut result = StreamResult::empty();
+                    result.stop_reason = "aborted".into();
+                    return Ok(result);
+                }
+            }
+            outcome => return outcome,
+        }
     }
 }
 
@@ -1340,6 +1426,17 @@ mod tests {
             supports_long_cache_retention: true,
             supports_reasoning_effort: true,
         }
+    }
+
+    #[test]
+    fn transient_stream_decode_errors_are_retryable() {
+        assert!(is_retryable_stream_error(
+            "读取响应流失败：error decoding response body"
+        ));
+        assert!(is_retryable_stream_error("HTTP 503 Service Unavailable"));
+        assert!(is_retryable_stream_error("connection reset by peer"));
+        assert!(!is_retryable_stream_error("HTTP 401 Unauthorized"));
+        assert!(!is_retryable_stream_error("provider 错误：invalid request"));
     }
 
     #[test]
