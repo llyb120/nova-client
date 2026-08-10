@@ -124,6 +124,7 @@ function assistantItems(message, stream) {
   const matchedStreamIndexes = new Set();
   return (message.message?.content ?? []).flatMap((block, index) => {
     let streamedIndex;
+    let alreadyStreamedSuffix = false;
     if (block.type === "text" || block.type === "thinking") {
       const finalText = block.type === "text" ? block.text : block.thinking;
       // The final snapshot may omit or reorder thinking blocks, so its array
@@ -136,8 +137,19 @@ function assistantItems(message, stream) {
           matchedStreamIndexes.add(candidateIndex);
           break;
         }
+        // Some CodeBuddy SDK versions yield a final assistant snapshot containing
+        // only the last delta (often a trailing punctuation mark). It was already
+        // included in the accumulated stream, so emitting it with the snapshot ID
+        // would create a standalone duplicate message.
+        if (finalText && candidate.text?.endsWith(finalText)) {
+          streamedIndex = candidateIndex;
+          alreadyStreamedSuffix = true;
+          matchedStreamIndexes.add(candidateIndex);
+          break;
+        }
       }
     }
+    if (alreadyStreamedSuffix) return [];
     const id = streamedIndex !== undefined
       ? `${stream.messageId}-${streamedIndex}`
       : block.id ?? `${message.message.id}-${index}`;

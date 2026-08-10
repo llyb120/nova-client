@@ -84,6 +84,18 @@ assert.deepEqual(finalItems, [
   { id: "tool-1", type: "mcp_tool_call", server: "CodeBuddy", tool: "Grep", arguments: { pattern: "榜单" }, status: "in_progress" },
 ]);
 assert.equal(finalItems[0].id, "message-1-2", "the final snapshot must replace the partial item even when its index changed");
+
+const trailingDeltaStream = {
+  messageId: "message-2",
+  blocks: new Map([[0, { type: "text", text: "完整回答？" }]]),
+};
+assert.deepEqual(assistantItems({
+  message: {
+    id: "final-trailing-delta",
+    content: [{ id: "trailing-punctuation", type: "text", text: "？" }],
+  },
+}, trailingDeltaStream), [], "a final snapshot containing only the last delta must not duplicate punctuation");
+
 const toolStream = { messageId: "message", blocks: new Map(), tools: new Map() };
 const [pendingTool] = assistantItems({
   message: { id: "assistant", content: [{ type: "tool_use", id: "tool-result-id", name: "fast_context", input: { query: "roblox" } }] },
