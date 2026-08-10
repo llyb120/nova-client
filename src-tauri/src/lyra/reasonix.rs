@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -304,9 +305,109 @@ fn pending_checkpoint_path(root: &Path, session_id: &str) -> PathBuf {
     root.join(format!("{session_id}.pending.json"))
 }
 
-/// 中断轨迹增量落盘：每条消息后全量原子重写（temp+rename），任务被强杀也不留半截文件。
-/// 对齐 PI 的 message_end 增量持久化；轮末正式保存 slim 后由 clear_pending_checkpoint 清除。
-pub fn write_pending_checkpoint(
+/// 后台 checkpoint 单写者。调用线程只克隆并发送最新 snapshot；序列化、写盘和
+/// rename 全部在 spawn_blocking 中完成。worker 合并 300ms 内的连续更新，避免工具批次
+/// 对同一份不断增长的历史反复全量写盘。
+pub struct PendingCheckpointWriter {
+    tx: mpsc::UnboundedSender<CheckpointCommand>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+enum CheckpointCommand {
+    Snapshot(Vec<Value>),
+    Close {
+        flush: bool,
+        done: oneshot::Sender<()>,
+    },
+}
+
+impl PendingCheckpointWriter {
+    pub fn spawn(root: PathBuf, session_id: String) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut latest: Option<Vec<Value>> = None;
+            loop {
+                let command = if latest.is_some() {
+                    tokio::select! {
+                        command = rx.recv() => command,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
+                            if let Some(messages) = latest.take() {
+                                write_pending_checkpoint_blocking(root.clone(), session_id.clone(), messages).await;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    rx.recv().await
+                };
+                match command {
+                    Some(CheckpointCommand::Snapshot(messages)) => latest = Some(messages),
+                    Some(CheckpointCommand::Close { flush, done }) => {
+                        if flush {
+                            if let Some(messages) = latest.take() {
+                                write_pending_checkpoint_blocking(
+                                    root.clone(),
+                                    session_id.clone(),
+                                    messages,
+                                )
+                                .await;
+                            }
+                        }
+                        let _ = done.send(());
+                        break;
+                    }
+                    None => {
+                        if let Some(messages) = latest.take() {
+                            write_pending_checkpoint_blocking(
+                                root.clone(),
+                                session_id.clone(),
+                                messages,
+                            )
+                            .await;
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        Self { tx, task }
+    }
+
+    pub fn checkpoint(&self, messages: &[Value]) {
+        let _ = self.tx.send(CheckpointCommand::Snapshot(messages.to_vec()));
+    }
+
+    /// flush=true 用于取消/失败：先确保最新活动轨迹已落盘，再保存 slim memory。
+    /// 正常完成时 slim memory 即将完整保存，可丢弃尚未写出的冗余 snapshot。
+    pub async fn close(self, flush: bool) {
+        let (done_tx, done_rx) = oneshot::channel();
+        let _ = self.tx.send(CheckpointCommand::Close {
+            flush,
+            done: done_tx,
+        });
+        let _ = done_rx.await;
+        let _ = self.task.await;
+    }
+}
+
+async fn write_pending_checkpoint_blocking(
+    root: PathBuf,
+    session_id: String,
+    messages: Vec<Value>,
+) {
+    let result = tokio::task::spawn_blocking(move || {
+        write_pending_checkpoint(&root, &session_id, &messages)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("lyra: 中断轨迹 checkpoint 写盘失败：{error}"),
+        Err(error) => eprintln!("lyra: 中断轨迹 checkpoint worker 失败：{error}"),
+    }
+}
+
+/// 原子 checkpoint 写入。只允许从后台 blocking worker 调用，避免阻塞 async executor。
+fn write_pending_checkpoint(
     root: &Path,
     session_id: &str,
     messages: &[Value],
@@ -895,5 +996,23 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("[elided tool result call-1"));
+    }
+    #[tokio::test]
+    async fn checkpoint_writer_flushes_latest_interrupted_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("nova-checkpoint-writer-{}", uuid::Uuid::new_v4()));
+        let session = "cancelled";
+        let writer = PendingCheckpointWriter::spawn(root.clone(), session.into());
+        writer.checkpoint(&[json!({ "role": "user", "content": "first" })]);
+        writer.checkpoint(&[
+            json!({ "role": "user", "content": "first" }),
+            json!({ "role": "assistant", "content": [{ "type": "toolCall", "id": "call-1", "name": "read" }] }),
+        ]);
+        // 模拟取消/失败收尾：debounce 尚未到期也必须等待最新轨迹落盘。
+        writer.close(true).await;
+        let loaded = load_pending_checkpoint(&root, session).expect("checkpoint 应存在");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[1]["content"][0]["id"], "call-1");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

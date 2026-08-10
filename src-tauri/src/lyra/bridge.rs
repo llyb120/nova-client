@@ -19,30 +19,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-const LIVE_USAGE_OUTPUT_STEP: u64 = 8;
-
-fn estimated_live_usage(total: &Value, input: u64, output: u64) -> Value {
-    let mut usage = total.clone();
-    usage["input"] = json!(usage
-        .get("input")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .saturating_add(input));
-    usage["output"] = json!(usage
-        .get("output")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .saturating_add(output));
-    usage["cacheRead"] = json!(usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0));
-    usage["cacheWrite"] = json!(usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0));
-    usage
-}
-
-fn should_emit_live_output(last_emitted: u64, output: u64) -> bool {
-    output > 0
-        && (last_emitted == 0 || output.saturating_sub(last_emitted) >= LIVE_USAGE_OUTPUT_STEP)
-}
-
 fn send(value: &Value) {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -513,16 +489,17 @@ async fn handle_prompt(
         spec_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         checkpoint: None,
     };
-    // 中断轨迹增量落盘：每条消息入列即原子重写 sidecar（对齐 PI 的 message_end 持久化），
-    // 任务被强杀/崩溃时下次续聊仍能恢复未完成内容；轮末正式保存后清除。
+    // 后台单写者：Agent 热路径只更新最新 snapshot；300ms debounce 后由
+    // spawn_blocking 完成序列化与原子写盘，不阻塞 provider/tool 执行。
+    let checkpoint_writer = Arc::new(Mutex::new(Some(reasonix::PendingCheckpointWriter::spawn(
+        sessions_root.clone(),
+        ctx.session_id.clone(),
+    ))));
     {
-        let checkpoint_root = sessions_root.clone();
-        let checkpoint_session = ctx.session_id.clone();
+        let writer = checkpoint_writer.clone();
         agent.checkpoint = Some(Box::new(move |messages: &[Value]| {
-            if let Err(error) =
-                reasonix::write_pending_checkpoint(&checkpoint_root, &checkpoint_session, messages)
-            {
-                eprintln!("lyra: 中断轨迹 checkpoint 写盘失败：{error}");
+            if let Some(writer) = writer.lock().unwrap().as_ref() {
+                writer.checkpoint(messages);
             }
         }));
     }
@@ -615,21 +592,13 @@ async fn handle_prompt(
     let mut current_thinking = String::new();
     let mut started_tools: std::collections::HashMap<String, Value> =
         std::collections::HashMap::new();
-    let mut current_input_estimate = 0_u64;
-    let mut last_live_output = 0_u64;
+
     let mut on_event = |event: AgentEvent| match event {
-        AgentEvent::MessageStart { input_estimate } => {
+        AgentEvent::MessageStart => {
             agent_message_index += 1;
             emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
             current_text.clear();
             current_thinking.clear();
-            current_input_estimate = input_estimate;
-            last_live_output = 0;
-            emit(&json!({
-                "type": "usage",
-                "usage": estimated_live_usage(&total_usage, current_input_estimate, 0),
-                "estimated": true,
-            }));
         }
         AgentEvent::TextDelta(delta) => {
             current_text.push_str(&delta);
@@ -637,16 +606,6 @@ async fn handle_prompt(
                 "type": "item",
                 "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
             }));
-            let output = estimate_text_tokens(&current_text)
-                .saturating_add(estimate_text_tokens(&current_thinking));
-            if should_emit_live_output(last_live_output, output) {
-                last_live_output = output;
-                emit(&json!({
-                    "type": "usage",
-                    "usage": estimated_live_usage(&total_usage, current_input_estimate, output),
-                    "estimated": true,
-                }));
-            }
         }
         AgentEvent::ThinkingDelta(delta) => {
             current_thinking.push_str(&delta);
@@ -654,16 +613,6 @@ async fn handle_prompt(
                 "type": "item",
                 "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
             }));
-            let output = estimate_text_tokens(&current_text)
-                .saturating_add(estimate_text_tokens(&current_thinking));
-            if should_emit_live_output(last_live_output, output) {
-                last_live_output = output;
-                emit(&json!({
-                    "type": "usage",
-                    "usage": estimated_live_usage(&total_usage, current_input_estimate, output),
-                    "estimated": true,
-                }));
-            }
         }
         AgentEvent::FinalNote(note) => {
             agent_message_index += 1;
@@ -692,9 +641,8 @@ async fn handle_prompt(
             }
         }
         AgentEvent::MessageEnd { usage } => {
+            // 每个 provider 请求结束都会返回真实 usage；逐轮累加并立即上报。
             merge_usage(&mut total_usage, &usage);
-            current_input_estimate = 0;
-            last_live_output = 0;
             emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
         }
     };
@@ -876,15 +824,28 @@ async fn handle_prompt(
         memory.pending_messages = agent.messages.clone();
     }
 
+    // 取消/失败先 flush 最新活动轨迹，保证恢复语义；正常完成可丢弃尚未写出的
+    // 冗余 checkpoint，正式 slim memory 保存后再清理 sidecar。
+    agent.checkpoint = None;
+    let checkpoint_writer = checkpoint_writer.lock().unwrap().take();
+    if let Some(writer) = checkpoint_writer {
+        writer.close(outcome.cancelled || failed.is_some()).await;
+    }
     if memory.system_prompt_snapshot.is_empty() && failed.is_none() {
         memory.system_prompt_snapshot = agent.system_prompt.clone();
     }
     memory.normalize();
-    if let Err(error) = memory.save(&sessions_root, &ctx.session_id) {
-        eprintln!("lyra: 保存会话失败：{error}");
+    let memory_saved = match memory.save(&sessions_root, &ctx.session_id) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("lyra: 保存会话失败：{error}");
+            false
+        }
+    };
+    // 只有正式会话已可靠落盘才删除 checkpoint；保存失败时保留 sidecar，避免取消轨迹丢失。
+    if memory_saved {
+        reasonix::clear_pending_checkpoint(&sessions_root, &ctx.session_id);
     }
-    // 轮末正式保存完成后清除增量 checkpoint（先存后删：中间崩溃也不会两边都丢）。
-    reasonix::clear_pending_checkpoint(&sessions_root, &ctx.session_id);
     let input_tokens = total_usage
         .get("input")
         .and_then(Value::as_u64)
@@ -1164,25 +1125,7 @@ pub async fn run() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{estimated_live_usage, should_emit_live_output};
-    use serde_json::json;
 
-    #[test]
-    fn live_usage_estimate_is_throttled_and_preserves_completed_usage() {
-        assert!(!should_emit_live_output(0, 0));
-        assert!(should_emit_live_output(0, 1));
-        assert!(!should_emit_live_output(1, 8));
-        assert!(should_emit_live_output(1, 9));
-
-        let usage = estimated_live_usage(
-            &json!({ "input": 100, "output": 20, "cacheRead": 80, "cacheWrite": 0 }),
-            40,
-            7,
-        );
-        assert_eq!(usage["input"], 140);
-        assert_eq!(usage["output"], 27);
-        assert_eq!(usage["cacheRead"], 80);
-    }
     /// 借用额度运行时：进程内按隔离数据根加载凭证配置（不起子进程、不读全局配置）。
     #[tokio::test]
     async fn borrowed_root_loads_isolated_config() {
