@@ -47,16 +47,19 @@ assert.deepEqual(streamEventItem({
 
 const finalItems = assistantItems({
   message: {
-    id: "message-1",
+    // The SDK may use IDs in the final snapshot that differ from message_start.
+    id: "final-message-id",
     content: [
-      { type: "text", text: "完整回答" },
-      { type: "thinking", thinking: "完整思考" },
+      { id: "final-text-block", type: "text", text: "完整回答" },
+      { id: "final-thinking-block", type: "thinking", thinking: "完整思考" },
+      { id: "tool-1", type: "tool_use", name: "Grep", input: { pattern: "榜单" } },
     ],
   },
-});
+}, stream);
 assert.deepEqual(finalItems, [
   { id: "message-1-0", type: "agent_message", text: "完整回答" },
-  { id: "message-1-1", type: "reasoning", text: "完整思考" },
+  { id: "final-thinking-block", type: "reasoning", text: "完整思考" },
+  { id: "tool-1", type: "mcp_tool_call", server: "CodeBuddy", tool: "Grep", arguments: { pattern: "榜单" }, status: "in_progress" },
 ]);
 assert.equal(finalItems[0].id, "message-1-0", "the final snapshot must replace the partial item");
 assert.equal(assistantText({

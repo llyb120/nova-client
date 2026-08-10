@@ -65,11 +65,13 @@ async function* promptMessages(request) {
   yield { type: "user", session_id: request.sessionId || "", message: { role: "user", content }, parent_tool_use_id: null };
 }
 
-function assistantItems(message) {
+function assistantItems(message, stream) {
   return (message.message?.content ?? []).flatMap((block, index) => {
-    // Match the streaming item ID so the complete assistant message is the
-    // authoritative final snapshot, even when partial events were dropped.
-    const id = block.id ?? `${message.message.id}-${index}`;
+    // Text/thinking blocks already seen in stream events must keep the streaming
+    // ID. CodeBuddy may use a different message/block ID in the final assistant
+    // snapshot; switching IDs would leave both snapshots visible in Nova.
+    const streamed = stream?.blocks.has(index) && (block.type === "text" || block.type === "thinking");
+    const id = streamed ? `${stream.messageId}-${index}` : block.id ?? `${message.message.id}-${index}`;
     if (block.type === "text") return [{ id, type: "agent_message", text: block.text }];
     if (block.type === "thinking") return [{ id, type: "reasoning", text: block.thinking }];
     if (block.type === "tool_use") return [{ id, type: "mcp_tool_call", server: "CodeBuddy", tool: block.name, arguments: block.input, status: "in_progress" }];
@@ -77,8 +79,8 @@ function assistantItems(message) {
   });
 }
 
-function emitContent(message) {
-  for (const item of assistantItems(message)) send({ type: "item", item });
+function emitContent(message, stream) {
+  for (const item of assistantItems(message, stream)) send({ type: "item", item });
 }
 
 function streamEventItem(message, stream) {
@@ -167,7 +169,7 @@ async function runPrompt(lines, request) {
     }
     else if (message.type === "assistant") {
       checkpoint = message.uuid;
-      emitContent(message);
+      emitContent(message, stream);
     }
     else if (message.type === "error") throw new Error(message.error);
     else if (message.type === "result") {
