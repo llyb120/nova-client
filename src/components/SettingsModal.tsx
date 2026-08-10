@@ -289,6 +289,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [fastContextEnabled, setFastContextEnabled] = createSignal(
     s?.fastContextEnabled ?? true,
   );
+  const [superFastContextEnabled, setSuperFastContextEnabled] = createSignal(
+    s?.superFastContextEnabled ?? false,
+  );
 
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
@@ -744,6 +747,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     windowsShellShimEnabled: windowsShellShimEnabled(),
     checkpointEnabled: checkpointEnabled(),
     fastContextEnabled: fastContextEnabled(),
+    superFastContextEnabled: superFastContextEnabled(),
 
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
@@ -1586,7 +1590,22 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  启用后为 Vega / Cursor / Devin 注入 fast_context / find_symbols 工具，用于一次性打包相关代码上下文；关闭则不附带这两个工具。Devin 另始终挂载 read_files / edit_files（Plan 模式不含 edit_files）。默认启用。
+                  启用后为 Vega / Cursor / Devin 注入 fast_context / find_symbols 工具，用于一次性打包相关代码上下文；关闭则不附带这两个工具。默认启用。
+                </span>
+              </div>
+              <div class="field">
+                <span class="field-label">Super FastContext</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={superFastContextEnabled()}
+                    disabled={!fastContextEnabled()}
+                    onChange={(e) => setSuperFastContextEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  大仓库实验优化：启用 scoped/index 搜索、增量反向依赖图、有界源码缓存和 Lazy Greedy。默认关闭；关闭时严格使用当前 master 的 Fast Context baseline。保存后重启相关 Agent 生效。
                 </span>
               </div>
 

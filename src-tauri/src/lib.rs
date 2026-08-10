@@ -4166,27 +4166,41 @@ async fn apply_runtime_settings(
         recheck_availability,
     ) = {
         let mut s = state.settings.lock().unwrap();
+        let context_runtime_changed = s.fast_context_enabled != settings.fast_context_enabled
+            || s.super_fast_context_enabled != settings.super_fast_context_enabled;
+        if s.super_fast_context_enabled != settings.super_fast_context_enabled {
+            if settings.super_fast_context_enabled {
+                std::env::set_var("NOVA_SUPER_FAST_CONTEXT", "1");
+            } else {
+                std::env::remove_var("NOVA_SUPER_FAST_CONTEXT");
+            }
+        }
         let restart_vega = restart_all_agents
+            || context_runtime_changed
             || s.vega_proxy != settings.vega_proxy
             || s.vega_context_mode != settings.vega_context_mode
             || s.vega_enabled != settings.vega_enabled;
         let restart_devin = restart_all_agents
+            || context_runtime_changed
             || s.devin_path != settings.devin_path
             || s.acp_args != settings.acp_args
             || s.devin_proxy != settings.devin_proxy
             || s.devin_enabled != settings.devin_enabled;
         let restart_codebuddy = restart_all_agents
+            || context_runtime_changed
             || s.codebuddy_path != settings.codebuddy_path
             || s.codebuddy_proxy != settings.codebuddy_proxy
             || s.codebuddy_enabled != settings.codebuddy_enabled;
         // API Key 也是 bridge 的启动环境：改了必须重启后端并重拉模型列表，
         // 否则新 Key 要等下次开应用才生效。
         let restart_claudecode = restart_all_agents
+            || context_runtime_changed
             || s.claudecode_path != settings.claudecode_path
             || s.claudecode_proxy != settings.claudecode_proxy
             || s.claudecode_sdk_api_key != settings.claudecode_sdk_api_key
             || s.claudecode_enabled != settings.claudecode_enabled;
         let restart_cursor = restart_all_agents
+            || context_runtime_changed
             || s.cursor_path != settings.cursor_path
             || s.cursor_proxy != settings.cursor_proxy
             || s.cursor_sdk_api_key != settings.cursor_sdk_api_key
@@ -6037,6 +6051,11 @@ pub fn run() {
             let notices = notice::NoticeStore::load(&dir);
             let marks = marks::MarkStore::load(&dir);
             let vectors = semantic::VectorStore::load(&dir);
+            if settings.super_fast_context_enabled {
+                std::env::set_var("NOVA_SUPER_FAST_CONTEXT", "1");
+            } else {
+                std::env::remove_var("NOVA_SUPER_FAST_CONTEXT");
+            }
             let context_service = context_service::ContextService::start(&dir)?;
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());

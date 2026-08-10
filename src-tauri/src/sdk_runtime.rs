@@ -1373,12 +1373,21 @@ impl SdkManager {
             .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
         {
             let state = self.app.state::<AppState>();
+            let settings = state.settings.lock().unwrap();
             command
                 .env(
                     "NOVA_CONTEXT_SERVICE_ENDPOINT",
                     state.context_service.endpoint(),
                 )
-                .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token());
+                .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token())
+                .env(
+                    "NOVA_SUPER_FAST_CONTEXT",
+                    if settings.super_fast_context_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    },
+                );
         }
         if !self.launch_env.is_empty() {
             crate::credential_roaming::isolate_borrowed_command(&mut command);

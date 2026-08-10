@@ -752,6 +752,7 @@ impl AcpManager {
                 conn_key,
                 cwd,
                 settings.fast_context_enabled,
+                settings.super_fast_context_enabled,
                 self.thread_is_read_only(conn_key),
             )?;
             cmd.current_dir(&launch_dir);
@@ -781,7 +782,15 @@ impl AcpManager {
                 "NOVA_CONTEXT_SERVICE_ENDPOINT",
                 state.context_service.endpoint(),
             )
-            .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token());
+            .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token())
+            .env(
+                "NOVA_SUPER_FAST_CONTEXT",
+                if settings.super_fast_context_enabled {
+                    "1"
+                } else {
+                    "0"
+                },
+            );
         }
         // 微型 GUI helper 统一覆盖各后端绕过父进程 flags 的 cmd/powershell/pwsh 孙进程。
         #[cfg(windows)]
@@ -2961,6 +2970,7 @@ fn devin_nova_tools_config(
     script: &std::path::Path,
     cwd: &str,
     fast_context: bool,
+    super_fast_context: bool,
     read_only: bool,
     context_endpoint: &str,
     context_token: &str,
@@ -2969,6 +2979,10 @@ fn devin_nova_tools_config(
     env.insert(
         "NOVA_FAST_CONTEXT".into(),
         Value::String(if fast_context { "1" } else { "0" }.into()),
+    );
+    env.insert(
+        "NOVA_SUPER_FAST_CONTEXT".into(),
+        Value::String(if super_fast_context { "1" } else { "0" }.into()),
     );
     env.insert("NOVA_TOOLS_CWD".into(), Value::String(cwd.into()));
     env.insert(
@@ -3007,6 +3021,7 @@ fn prepare_devin_nova_tools_config(
     conn_key: &str,
     cwd: &str,
     fast_context: bool,
+    super_fast_context: bool,
     read_only: bool,
 ) -> Result<PathBuf, String> {
     let script = materialize_nova_tools_mcp(app)?;
@@ -3035,6 +3050,7 @@ fn prepare_devin_nova_tools_config(
         &script,
         cwd,
         fast_context,
+        super_fast_context,
         read_only,
         state.context_service.endpoint(),
         state.context_service.token(),
@@ -3138,6 +3154,7 @@ mod nova_tools_config_tests {
             "D:/repo",
             true,
             true,
+            true,
             "test-endpoint",
             "test-token",
         );
@@ -3145,6 +3162,7 @@ mod nova_tools_config_tests {
         assert_eq!(server["transport"], "stdio");
         assert_eq!(server["env"]["NOVA_TOOLS_CWD"], "D:/repo");
         assert_eq!(server["env"]["NOVA_FAST_CONTEXT"], "1");
+        assert_eq!(server["env"]["NOVA_SUPER_FAST_CONTEXT"], "1");
         assert_eq!(server["env"]["NOVA_TOOLS_READ_ONLY"], "1");
         assert_eq!(
             server["env"]["NOVA_CONTEXT_SERVICE_ENDPOINT"],

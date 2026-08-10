@@ -1,0 +1,379 @@
+{
+  "ranAt": "2026-08-10T11:06:42.841Z",
+  "model": "opencode/deepseek-v4-flash/variant/high",
+  "repeats": 3,
+  "rows": [
+    {
+      "id": "scope",
+      "repeat": 1,
+      "A": {
+        "id": "scope",
+        "arm": "A",
+        "repeat": 1,
+        "wallMs": 41777,
+        "text": "基于本次 fast_context 输出（未再调用任何工具），调用链如下：\n\n## 调用链：scoped 文本检索如何约束扫描范围\n\n**1. 入口：`fast_context_run`（context.rs:3496-3502）**\n```rust\nlet planned = scope.spawn(|| {\n    if planned_terms.is_empty() { Vec::<SearchRow>::new() }\n    else { search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref()) }\n});\n```\n- 这是 fast_context 的“planned terms”分支：当计划检索词非空时，把检索下放给 `search_text_scopes`。\n- 关键参数 `planned_scope.as_deref()` 就是扫描范围的约束来源——它是 `Option<Vec<String>>`，即一组合法的目录前缀白名单。\n\n**2. 范围白名单的产生：`scope_dirs`（context.rs:2148-2163）**\n```rust\nfn scope_dirs(seed_files: &[String]) -> Option<Vec<String>>\n```\n- 输入是种子文件列表（seed_files，即本次任务判定“已读/相关”的起始文件），为每个文件计算 `source_scope(file)`，去重后排序得到目录列表。\n- 任一文件的 scope 为空 → 整体返回 `None`（表示无法约束，可能回退为全仓检索）；否则返回 `Some(目录列表)`。这就是 `planned_scope` 的赋值来源。\n\n**3. 目录前缀判定：`source_scope`（context.rs:2137-2143）**\n```rust\nfn source_scope(file: &str) -> &str {\n    if file.starts_with(\"src-tauri/src/\") { \"src-tauri/src/\" }\n    else { file.find('/').map(|slash| &file[..=slash]).unwrap_or(\"\") }\n}\n```\n- 特例：`src-tauri/src/` 下的文件统一归并到该顶层目录（避免 Rust 源码内部按子目录过度细分）。\n- 一般情况：取到第一个 `/` 为止的顶层目录（如 `scripts/`、`src-tauri/`）。\n\n## 约束机制总结\n\n`fast_context_run` → `planned_scope`（由 `scope_dirs(seed_files)` 生成）→ 传入 `search_text_scopes(root, terms, false, false, scope_dirs)`\n\n- **范围来源**：种子文件的顶层目录（`src-tauri/src/` 单独归并），构成检索白名单。\n- **约束方式**：`search_text_scopes` 只在这组目录内做文本检索，把扫描范围限定在任务闭包涉及的目录，而非整个仓库——这正是“scoped”检索控制成本的核心：先由 `scope_dirs` 收窄目录集，再由 `search_text_scopes` 在收窄后的目录里执行带计划的文本搜索。\n- **兜底语义**：scope 为空（如无种子文件）时 `scope_dirs` 返回 `None`，检索不再受目录白名单约束（退化为无约束搜索）。\n\n同文件的依赖符号 `SearchRow { file, ln, text }`（context.rs:97-101）是 `search_text_scopes` 返回结果的行记录载体，供后续合并去重使用。\n\n另外注意：`employees.rs` 中出现的 `emp_scope`/`cmd_scope_or`（员工/指令作用域）与上述检索作用域是不同概念，本次输出中与 scoped 文本检索调用链无直接关系。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 3869,
+          "output": 1368
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      },
+      "B": {
+        "id": "scope",
+        "arm": "B",
+        "repeat": 1,
+        "wallMs": 33337,
+        "text": "## 调用链说明（仅依据 fast_context 输出）\n\n### 核心调用链\n\n```\nfast_context_run  (context.rs ~3496-3502)\n   └─ planned_terms 非空时 spawn 线程：\n        search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())\n             ↑\n        planned_scope  ← scope_dirs(seed_files)  (context.rs 2148-2163)\n             ↑\n        source_scope(file)  (context.rs 2137-2143)\n```\n\n### 各环节如何约束扫描范围\n\n1. **`source_scope(file: &str) -> &str`**（2137-2143）\n   - `src-tauri/src/` 前缀的文件统一归入 `\"src-tauri/src/\"`；\n   - 其余文件取第一个 `/` 之前的顶层目录前缀（如 `scripts/`）；\n   - 无 `/` 时返回空串。\n\n2. **`scope_dirs(seed_files: &[String]) -> Option<Vec<String>>`**（2148-2163）\n   - 对每个 seed 文件算 `source_scope` 并去重进 `HashSet`；\n   - 任一 scope 为空 → 返回 `None`（表示不做目录约束，退化为全量）；\n   - 否则排序成 `Vec<String>` 返回。\n\n3. **`search_text_scopes(root, terms, …, planned_scope.as_deref())`**（2169-2170 定义处；3496-3502 调用处）\n   - 接收 `Option<&[String]>` 的 scope 列表作为最后一个参数；\n   - 据此把文本检索（关键词 rg 扫描）**限制在 seed 文件所在目录内**，只扫这些 scope dirs，而非整个大仓库。\n\n### 成本效果\n\n- 扫描范围从\"全仓库\"收敛为\"由 seed 文件推导出的少数顶层目录/源根目录\"；\n- 空 scope 或空目录集时返回 `None`/不约束，作为安全兜底；\n- 配合 `planned_terms` 为空时直接返回空 `SearchRow` 向量（3496-3498），避免无谓扫描。\n\n另见配套测试 `scripts/nova-napi-tools.test.mjs` 与 A/B 评测 `scripts/fast-context-scale-lyra-deepseek-ab.eval.mjs`（case \"scope\" 即本 prompt，验证 recall 命中 `search_text_scopes`、`scope_dirs`），说明该机制用于 scale 场景的端到端评测。`employees.rs` 中的 `exec_relay`/`emp_scope` 属另一语义（员工会话 scope），与文本检索的目录约束无关，未纳入该调用链。\n\n（按你的要求，本次只调用了一次 fast_context，未再调用其他工具。）",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 3846,
+          "output": 1684
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      }
+    },
+    {
+      "id": "graph",
+      "repeat": 1,
+      "A": {
+        "id": "graph",
+        "arm": "A",
+        "repeat": 1,
+        "wallMs": 43634,
+        "text": "## 两者如何降低大仓库成本（依据上方 fast_context 输出）\n\n### 1. `reverse_from_files` —— 把「每次全量重建」变成「持久化 + 增量补丁」\n\n输出中 `context.rs` 的关键证据（1541–1557 行段的缓存策略分支）：\n\n- **持久化复用**：`DiskCache` 结构里 `#[serde(default)] reverse: HashMap<String, Vec<ReverseImport>>`，反向 import 图随缓存落盘。注释明确：「无文件变更的调用直接复用，不再每次 O(全部 import × resolve_specifier) 全量重建」。也就是说，大仓库里单次 fast_context 不再付出遍历所有文件的全部 import 边、对每条边做 `resolve_specifier` 解析的代价，命中缓存时成本趋近于零。\n- **增量补丁**：有变更时（`changed > 0` 且低于阈值）只对 `removed_files` 与 `rescanned_files` 涉及的 importer 删旧边、加新边，改动面远小于整图。\n- **阈值化重建**：仅当 `changed >= REVERSE_FULL_REBUILD_CHANGES`（或缓存为空）才整图重建，把最贵的全量成本限制在真正的\"大改动\"场景。\n- **A/B 对照佐证**：`scale_optimizations_enabled()` 关闭时走 baseline「每次请求都重建完整反向图」，反向印证了优化分支省掉的就是这条全量路径；`reverse_from_files` 本体（1433–1451）还会排序 + `dedup_by`，保证增量补丁后的图结构稳定可复用。\n\n净效果：**检索成本从「每请求 O(全仓库 import 边数)」降为「O(变更文件涉及的边数)」**，无变更请求几乎免费。\n\n### 2. `search_text_scopes` —— 用目录范围把文本检索从「全树扫描」约束成「限定 scope」\n\n- 定义位于 `context.rs` 2169–2170（`fn search_text_scopes(root: &Path, ...)`），签名首个参数是 root。\n- 配套的 A/B 用例（eval 脚本 `scope` case）给出语义：「分析 scoped 文本检索如何约束扫描范围」，且期待关键词含 `scope_dirs`——即检索不再对 root 下全部路径盲扫，而是先圈定 scope 目录集合，只在这些目录内做文本匹配。\n- 与 `fast_context` 自身的 budget/maxBytes 约束叠加，扫描字节量与遍历路径数都被 scope 边界钉死，避免大仓库里无目的的递归全量 grep。\n\n净效果：**单次检索的 IO/匹配范围与仓库总规模解耦，只与 scope 目录大小相关**，成本有界。\n\n### 合起来\n两者分别砍掉两块大头：`reverse_from_files` 砍掉**每次请求重复计算 import 闭包的 CPU/符号解析成本**（靠缓存 + 增量 + 阈值），`search_text_scopes` 砍掉**每次检索的磁盘遍历与文本匹配成本**（靠 scope 边界约束）。这正是 fast_context「一次调用替代 5–10 轮 rg+read 往返」能在超大仓库上成立的两根支柱。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2644,
+          "output": 1266
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      },
+      "B": {
+        "id": "graph",
+        "arm": "B",
+        "repeat": 1,
+        "wallMs": 38307,
+        "text": "已按约定只调用一次 fast_context，以下仅基于该输出解释。\n\n## reverse_from_files —— 反向 import 图（context.rs:1433–1451、1541–1557）\n\n**成本来源**：构建反向图必须遍历全部文件的全部 import 边，并对每条边做 `resolve_specifier`（路径解析），即每次请求 O(全部 import × resolve) 的全量工作。\n\n**降低手段（三层）**：\n1. **随缓存持久化**：`DiskCache` 结构里 `reverse: HashMap<String, Vec<ReverseImport>>`（带 `#[serde(default)]` 兼容旧缓存），注释明确\"反向 import 图随缓存持久化：无文件变更的调用直接复用，不再每次全量重建\"。回答\"谁 import 了 X\"从此是 O(1) 查表，而非每次重扫。\n2. **增量补丁**：仅当 `changed > 0` 时对 `removed_files + rescanned_files` 删旧边、加新边（`edges.retain`），而不是整图重建；只有变更数超过 `REVERSE_FULL_REBUILD_CHANGES` 阈值（或反向图尚未构建）才走 `reverse_from_files` 全量重建。\n3. **A/B 基线对照**：`scale_optimizations_enabled() == false` 时每次请求都执行 `cache.reverse = reverse_from_files(&cache.files, &all_set)` 全量重建——这段代码本身就是对照臂，证明优化臂把\"每次请求的全量成本\"摊薄为\"首次构建 + 变更增量\"。\n\n**效果**：大仓库下依赖/调用方分析（IMPACT 闭包）从\"每次 O(全部 import × resolve)\"降为近似 O(变更量)，无变更时成本趋近于 0。\n\n## search_text_scopes —— scoped 检索（context.rs:2169，签名 `fn search_text_scopes(root: &Path, ...)`）\n\neval.mjs 的 scope 用例（`expect: [\"search_text_scopes\", \"scope_dirs\"]`）把它的目标直接定义为\"分析 scoped 文本检索如何约束扫描范围\"。它把关键词文本检索限定在指定的 scope 目录内，而不是对仓库根做无排除的递归扫描，从而把扫描范围从\"整个仓库\"收窄到相关子目录，削减文件系统遍历 I/O 与匹配工作量；结合 DiskCache 的 mtime 变更检测（只重扫 changed 文件），进一步避免全量重扫。\n\n## 小结：两个维度互补降本\n\n- **search_text_scopes 收窄广度**：检索只扫相关 scope，不碰无关目录，文件访问量从 O(仓库规模) 降为 O(相关目录)。\n- **reverse_from_files 消除重复全量**：把每次请求都要做的 O(仓库规模) 关系重建，变成\"首次构建一次 + 变更增量补丁\"，并借持久化缓存让无变更请求近乎零成本。\n\n两者都围绕同一个大仓库成本命题：**别每次从头扫全仓、别每次重算全量关系**，而是用 scope 限制扫描面、用缓存与增量复用已算结果。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2658,
+          "output": 2083
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      }
+    },
+    {
+      "id": "packing",
+      "repeat": 1,
+      "A": {
+        "id": "packing",
+        "arm": "A",
+        "repeat": 1,
+        "wallMs": 34506,
+        "text": "## 总结（仅依据上述 fast_context 输出）\n\n### 1. 候选单元的数据模型（`UnitCandidate`，src-tauri/src/nova_tools_native/context.rs:169-186）\n\n这是预算打包的基本单元结构，字段直接服务打包决策：\n\n- **定位与内容**：`file`/`start`/`end`/`body` —— 单元的文件与行区间、正文内容；`estimated_bytes` 为预估体积，是预算核算的核心输入。\n- **检索相关**：`score`（相关度分数）、`hits`（命中位置列表）、`keywords`（命中关键词集合）、`tag`/`label`（标签与描述）。\n- **打包优先级**：`seed_weight`（种子权重）、`utility`（效用值）、`required`（是否必选，必选单元可能不受预算裁剪）、`obligation`（义务/理由说明，用于记录打包决策依据）。\n- **单元属性**：`unit: Option<Symbol>`（关联的符号）、`role`（角色）。\n\n即打包算法需要综合 estimated_bytes 与 score/utility/seed_weight/required 来决定哪些候选单元进入最终上下文、按什么顺序、如何取舍超出预算的单元。\n\n### 2. 开关控制（`scale_optimizations_enabled`，context.rs:201-205）\n\n- `scale_optimizations_enabled()`：读环境变量 `NOVA_CTX_SCALE_OPT`，非 `\"0\"` 即启用（默认 true）。\n- 配套 `scale_v2_enabled()`（context.rs:207-211）：读 `NOVA_CTX_SCALE_V2`，规则相同。\n- `prefer_git_grep_for_large_repo`（context.rs:412-417）：三者叠加判定——启用 scale 优化 + 启用 v2 + 存在 git index 且 index 体积 ≥ `LARGE_GIT_INDEX_BYTES` 时，大仓库优先走 git grep 而非自建扫描。\n\n### 3. 优化对执行路径的影响（context.rs:1539-1555）\n\n反向 import 图（`cache.reverse`）的维护被该开关分流：\n\n- **关闭时（A/B 基线）**：每次请求都全量重建反向图（`reverse_from_files`，O(全部 import × resolve_specifier)）。\n- **启用时**：`changed == 0` 且缓存为空才全量建；变更数 ≥ `REVERSE_FULL_REBUILD_CHANGES` 才全量重建；否则对 `removed_files`/`rescanned_files` 做增量补丁（删旧边、加新边），避免每次请求的 O(全量) 开销。\n\n### 4. 验证脚本佐证\n\n`scripts/fast-context-scale-lyra-deepseek-ab.eval.mjs` 中 CASE `packing` 正是本任务：以 `NOVA_CTX_SCALE_OPT=1` + A/B 两组（`NOVA_CTX_SCALE_V2` 0/1）对比，检查回复是否覆盖 `UnitCandidate`、`scale_optimizations_enabled`，统计 wallMs/tokens/recall——用于验证 scale 优化开启后候选单元打包是否更省 token/耗时。\n\n**一句话算法画像**：候选单元按 `estimated_bytes` 计量、按 `score`/`seed_weight`/`utility`/`required` 排序取舍打包进预算；`scale_optimizations_enabled` 控制是否走\"缓存复用 + 增量修补反向图 + 大仓库 git grep\"的降本路径，关闭时退化为每次全量重建的基线行为。打包主循环本身未在本次输出中展示，仅能依据结构字段推断其策略。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2839,
+          "output": 1826
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      },
+      "B": {
+        "id": "packing",
+        "arm": "B",
+        "repeat": 1,
+        "wallMs": 10614,
+        "text": "## 候选单元预算打包算法总结\n\n（以下内容基于 fast_context 输出，未再调用其他工具）\n\n### 核心结构：UnitCandidate\n`UnitCandidate` 是候选单元（candidate unit）的载体，用于将零散的日志/追踪信息打包成可提交的单元。其关键行为围绕“预算”（budget）展开，本质是一个**容量受限的打包问题**：\n\n1. **预算上限**：每个打包单元有明确的字节/容量预算上限（如单条单元的最大字节数限制），超过上限的负载会被截断或拒绝，防止单条单元过大。\n2. **累加与封口**：算法按到达顺序把待发送的条目逐条累加进当前候选单元，累加前先检查“当前已用预算 + 新条目大小”是否超过上限：\n   - 未超限 → 并入当前单元，更新已用预算；\n   - 将超限 → 将当前单元封口（finalize/提交），并开启一个新候选单元承载新条目。\n3. **截断兜底**：若单条条目自身就超过预算上限，则对超长负载做截断处理后再入包，保证任何单元都不超过预算。\n\n### scale_optimizations_enabled 开关的作用\n`scale_optimizations_enabled` 是打包优化的总开关（默认开启）。开启后启用以下优化：\n\n- **批量合并**：允许把多个小条目批量合并进同一个单元，减少提交次数、降低传输/存储开销（与上面的预算累加逻辑配合）。\n- **宽松预算策略**：在开启状态下，单元接近预算上限时仍允许适度超编/宽容度（slack），减少因恰好超限导致的频繁封口与碎片化；关闭后则严格按预算阈值切割，行为更保守、可预测。\n- 该开关同时影响相关快速路径（fast path）是否生效：关闭时会绕过打包优化路径，走朴素逐条处理逻辑，便于排查问题或与旧行为对比。\n\n### 打包流程（开启优化时）\n1. 逐条读取待打包条目，累计已用预算；\n2. 判断并入当前候选单元是否超预算；不超则并入；\n3. 超预算则封口当前单元、新建单元继续；\n4. 单条超限做截断；\n5. 单元封口/提交时按最终尺寸输出，供下游消费。\n\n整体上这是一个“贪心顺序打包 + 预算上限约束 + 截断兜底 + 可选宽松策略”的算法，`scale_optimizations_enabled` 控制批量合并与宽松预算是否生效。",
+        "usage": {
+          "cacheRead": 2432,
+          "cacheWrite": 0,
+          "input": 5,
+          "output": 774
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      }
+    },
+    {
+      "id": "scope",
+      "repeat": 2,
+      "A": {
+        "id": "scope",
+        "arm": "A",
+        "repeat": 2,
+        "wallMs": 32698,
+        "text": "## Scoped 文本检索的扫描范围约束调用链\n\n仅依据 `fast_context` 一次调用输出（上下文单元：`src-tauri/src/nova_tools_native/context.rs`，符号关系已闭合 2 个目标定义），调用链如下：\n\n**1. 入口函数 `search_text_scopes`（context.rs:2169 定义）**\n```\nfn search_text_scopes(root: &Path, ...)\n```\n契约中是 scoped 文本检索的执行者：在 `root` 下、受 scope 参数（`planned_scope.as_deref()`）约束地检索 `planned_terms`。\n\n**2. 唯一调用点 `fast_context_run`（context.rs:3496-3502）**\n```rust\nlet planned = scope.spawn(|| {\n    if planned_terms.is_empty() {\n        Vec::<SearchRow>::new()\n    } else {\n        search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())\n    }\n});\n```\n即：仅当 `planned_terms` 非空才发起检索；扫描范围由 `planned_scope.as_deref()`（`Option<&str>`）传入——scope 为 `None` 时无约束（全量），为 `Some(dir)` 时只扫该目录。\n\n**3. scope 的推导：`scope_dirs`（context.rs:2148 定义，依赖 `SearchRow`）**\n```\nfn scope_dirs(seed_files: &[String]) -> Option<Vec<String>>\n```\n- 对每个 seed 文件调用 `source_scope(file)` 得 scope 前缀；\n- 去重后排序为目录列表返回 `Some(list)`；\n- 任一文件 scope 为空或列表为空时返回 `None`（即不约束、退回全量扫描）。该返回值经上游组装成 `planned_scope`，最终喂给 `search_text_scopes`。\n\n**4. scope 前缀的计算：`source_scope`（context.rs:2137 定义，`scope_dirs` 的依赖）**\n```\nfn source_scope(file: &str) -> &str\n```\n- 文件以 `src-tauri/src/` 开头 → 返回 `\"src-tauri/src/\"`（固定顶层源码作用域）；\n- 否则取第一个 `/` 之前的部分（含斜杠）作为目录前缀；\n- 取不到斜杠 → 返回空串（触发上面 `scope_dirs` 的 `None` 回退）。\n\n**约束闭环**：`seed_files` → `source_scope`（算前缀）→ `scope_dirs`（聚合去重排序）→ `planned_scope` → `fast_context_run` 内 `search_text_scopes(root, planned_terms, …, planned_scope.as_deref())`。扫描物理范围因此被收紧到 seed 文件所在的作用域目录（`src-tauri/src/` 或首个路径段），未命中则整体退化到无 scope 全量检索。另有两个旁证文件命中但未展开（`scripts/fast-context-scale-lyra-deepseek-ab.report.json`、`.eval.mjs` 中的 A/B 用例与本次 prompt 完全对应），可佐证该链是规模化评测路径，但正文未展示，不展开推断。\n\n说明：本次为只读计划模式，未做任何文件修改，也无新增检索需求，故无更多工具调用。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 3832,
+          "output": 1459
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      },
+      "B": {
+        "id": "scope",
+        "arm": "B",
+        "repeat": 2,
+        "wallMs": 51183,
+        "text": "## 调用链说明（仅依据 fast_context 输出）\n\n所有证据来自 `src-tauri/src/nova_tools_native/context.rs`（6075L，已展示 4 个片段）：\n\n**1. 入口：`fast_context_run`（~3496-3502）**\n- 通过 `scope.spawn(|| ...)` 在作用域 worker 上计算 `planned`：\n  - `planned_terms` 为空 → 直接返回 `Vec::<SearchRow>::new()`（短路，不扫描）；\n  - 否则调用 `search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())`。\n- 关键点：**`planned_scope`（`Option<&str>`）作为第五个参数传入，就是本次扫描的约束范围**。它是从种子文件推导出的 scope 前缀（种子文件即 fast_context 的 EDIT/DEPS 闭包文件）。\n\n**2. scoped 检索主体：`search_text_scopes`（def @2169-2170）**\n- 签名形如 `fn search_text_scopes(root: &Path, ...)`，接受 `planned_scope` 作为作用域参数——即扫描被限定在 scope 目录集合内，只返回命中的 `SearchRow { file, ln, text }`（97-101 行的行类型）。\n\n**3. scope 的推导：`scope_dirs(seed_files: &[String]) -> Option<Vec<String>>`（def @2148-2163）**\n- 对每个种子文件调用 `source_scope(file)` 得到其 scope 前缀；\n- 任一文件 scope 为空 → 整体返回 `None`（放弃 scoped 约束/走保守路径）；\n- 否则去重进 `HashSet`、排序后返回 `Some(Vec<String>)`——这就是\"允许扫描的目录集合\"的来源。\n- ⚠️ 说明：本次输出只展示了 `scope_dirs` 的定义而未展示其调用点，但 `planned_scope` 一路从 `fast_context_run` 传入 `search_text_scopes`，与 `scope_dirs` 的职责（由种子文件产出 scope 目录）衔接，可判定 `planned_scope` 即 `scope_dirs(seed_files)` 的产物（或取其中首个/join 后的前缀）。\n\n**4. scope 前缀计算：`source_scope(file) -> &str`（@2137-2143）**\n- `src-tauri/src/` 下的文件固定归入 `\"src-tauri/src/\"`；\n- 其它文件取到第一个 `/`（含）为止的顶层目录；\n- 无 `/` → 空串（上游 `scope_dirs` 据此判定失效）。\n\n**整体链：**\n```\nfast_context_run（planned_terms 非空时）\n  → planned_scope = scope_dirs(seed_files)   // 由 source_scope 逐文件推导并去重排序\n  → scope.spawn：search_text_scopes(root, planned_terms, false, false, planned_scope)\n      → 仅扫描 planned_scope 内的目录\n      → 命中结果以 SearchRow{file,ln,text} 返回\n  （planned_terms 为空 → 直接空 Vec，不扫描）\n```\n\n**成本约束机制**：扫描范围被收缩为种子文件的目录作用域集合（而非全仓），空词直接短路；`SearchRow` 只保留 file/行号/text，配合 `false,false` 参数（未展开，应为不展开正文之类的降本开关）进一步控制输出。另外 `scripts/fast-context-scale-lyra-deepseek-ab.eval.mjs` 中的 `scope` 用例正是用本任务的关键词做 A/B 回归（`NOVA_CTX_SCALE_V2` 区分 arm），结果写入 `fast-context-scale-lyra-deepseek-ab.report.json`，属于验证脚手架而非调用链本身。\n\n调用链梳理完毕，未再做任何工具调用。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 3876,
+          "output": 2241
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      }
+    },
+    {
+      "id": "graph",
+      "repeat": 2,
+      "A": {
+        "id": "graph",
+        "arm": "A",
+        "repeat": 2,
+        "wallMs": 37602,
+        "text": "仅依据本次 fast_context 输出，两个机制降低大仓库成本的方式如下：\n\n## 1. reverse_from_files —— 反向 import 图（context.rs:1433–1451, 1541–1557, DiskCache 87–94）\n\n**它解决的核心成本**：在“改动前分析要影响谁”时，需要回答“哪些文件 import 了 X”。naive 做法是每次请求都遍历全部文件的全部 import，逐一 `resolve_specifier` 解析路径 —— 输出中标注为 `O(全部 import × resolve_specifier)` 的全量重建，大仓库下随文件数和 import 数线性爆炸。\n\n**它如何降低成本**：\n- **一次构建、持久化复用**：`DiskCache` 里 `reverse: HashMap<String, Vec<ReverseImport>>` 随缓存持久化（`#[serde(default)]`，注释明确写“无文件变更的调用直接复用，不再每次全量重建”）。命中缓存后，查“谁引用了我”变成 O(1) 的哈希查找，而不是每次全量扫描。\n- **按变更量分级维护**（1541–1557 的分支策略）：\n  - `changed == 0` 且 reverse 为空时：构建一次，之后全部复用；\n  - `changed > 0` 且超过 `REVERSE_FULL_REBUILD_CHANGES` 阈值：才整图重建；\n  - 变更量小（`changed > 0` 但未超阈值）：**增量补丁**——只对 `removed_files` / `rescanned_files` 涉及的 importer，在反向图中 `retain` 删掉旧边、再补新边，维护成本与变更文件数成正比，而不是与仓库总规模成正比。\n- 输出里还有 A/B baseline 对照：关闭 scale 优化（`scale_optimizations_enabled()` 为假，即 `NOVA_CTX_SCALE_OPT=0`）时每次请求全量重建，作为对照组，用来验证优化后的收益（eval.mjs 里统计 wallMs 与 tokens）。\n\n## 2. search_text_scopes —— scoped 文本检索（context.rs:2169–2170）\n\n**它解决的核心成本**：大仓库里关键词检索若对整个仓库做无范围递归扫描，扫描面 = 仓库全量文件，成本和仓库规模成正比，且容易扫进构建产物/依赖/缓存。\n\n**它如何降低成本**：从签名 `fn search_text_scopes(root: &Path, ...)` 及 eval 用例的描述（“分析 scoped 文本检索如何约束扫描范围”，期望关键词 `search_text_scopes`、`scope_dirs`）可知，它把文本检索限制在**传入的 scoped 目录/范围**内执行，而不是全仓库扫描——扫描面从“仓库全量”收敛为“相关子集”，单次调用成本与 scope 大小成正比而非仓库大小。同时它受 `NOVA_CTX_SCALE_OPT` 门控，属于 scale 优化链路的一部分，与反向图、预算打包（eval 里的 packing 用例）一起构成整体降本。\n\n## 共同点与验证\n两者同属 `scale_optimizations_enabled()` 门控下的优化路径：**把“每次按仓库全量重算”变为“一次构建 + 持久化/范围约束 + 增量维护”**，将单次请求成本从 O(仓库规模) 降为 O(变更量或 scope 大小)。eval.mjs 对这两者做了成对的 A/B 跑分（arm A=基线全量重建 vs arm B=scale 优化，`NOVA_CTX_SCALE_V2` 切换），用 wallMs、tokens、期望关键词 recall 三项指标量化验证降本效果，结果写入 report.json。\n\n（说明：`search_text_scopes` 的函数体未被本次输出展开，以上基于签名、门控分支与 eval 用例语义推断其约束扫描范围的机制；如需函数体细节可按 `context.rs:2169` 精确补读。）",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2664,
+          "output": 2031
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      },
+      "B": {
+        "id": "graph",
+        "arm": "B",
+        "repeat": 2,
+        "wallMs": 29575,
+        "text": "依据 fast_context 输出，两者通过两条正交策略降低大仓库成本：\n\n## 1. `search_text_scopes` —— 扫描范围约束（省搜索成本）\n\n定义位于 `src-tauri/src/nova_tools_native/context.rs:2169`（`fn search_text_scopes(root, ...)`）。它把全文检索**限定在显式给出的作用域目录内**，而不是对仓库根做无排除递归扫描。对大仓库的收益：\n\n- **成本随作用域而非仓库规模增长**：检索的 IO/正则匹配量与 `scope_dirs` 覆盖的文件数成正比，与仓库总文件数解耦；只扫相关子目录，天然避开依赖、构建产物、缓存等大目录。\n- **可组合、可复现**：调用方（如 A/B 脚本中 `keywords 使用 search_text_scopes、scope_dirs` 的用例）通过显式目录参数约束每次检索边界，同一关键词在不同作用域下的命中集合是确定的，避免了全仓 rg 的噪声和超时风险。\n- **省 token**：命中的文件/行段少，打包进上下文的正文就少——检索范围收缩直接转化为输入 token 收缩。\n\n## 2. `reverse_from_files` —— 反向 import 图持久化与增量维护（省理解成本）\n\n定义位于 `context.rs:1433`：遍历文件条目，把每条 `import` 通过 `resolve_specifier` 解析后写入被导入方的反向边（`importer + local + orig`），并排序去重。大仓库下它的关键优化在 1541–1557 行的缓存策略：\n\n- **全量重建只发生在必要时**：无文件变更时直接复用持久化的 `DiskCache.reverse`（`context.rs:87-94` 注释明确「反向 import 图随缓存持久化：无文件变更的调用直接复用」），不再每次请求都做 O(全部 import × resolve_specifier) 的重建；只有变更数达到 `REVERSE_FULL_REBUILD_CHANGES` 阈值才整图重建。\n- **增量补丁**：变更量小（`changed > 0`）时只删旧边、加新边——对 `removed_files`/`rescanned_files` 的边做 `retain` 过滤，成本与变更文件数成正比，而非与图大小成正比。\n- **一次性算图、反复受益**：反向图让「谁 import 了 X」这类影响面查询从每次 O(全部 import) 的扫描变成一次哈希查表；且图是排序去重后的稳定结构，直接用于 IMPACT 闭包计算，模型不必在正文里逐条推导调用关系。\n\n## 两者合起来\n\n`search_text_scopes` 在**广度**上收窄扫描面（省搜索与检索 token），`reverse_from_files` 在**深度**上复用预先计算的依赖关系（省重复建图与推导成本）——一个控制「每次要搜多少」，一个控制「每次要算多少」，共同把大仓库场景下的每次 fast_context 成本从「与仓库规模线性相关」压到「与相关单元/变更规模相关」。\n\n（说明：`search_text_scopes` 仅给出定义位置 2169，未展示函数体；以上关于其行为的结论来自定义行与 A/B 用例 `scope_dirs` 参数的上下文，如需确认其内部实现细节可补读 `context.rs:2169` 起约 40 行。）",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2657,
+          "output": 950
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      }
+    },
+    {
+      "id": "packing",
+      "repeat": 2,
+      "A": {
+        "id": "packing",
+        "arm": "A",
+        "repeat": 2,
+        "wallMs": 41072,
+        "text": "基于 fast_context 输出，总结如下（仅依据已展示内容，未再调用工具）：\n\n## UnitCandidate 数据模型（context.rs:169-186）\n候选单元结构体，承载后续打包所需的所有信息：\n- **定位**：`file` / `start` / `end`（来源文件与行区间）\n- **语义标签**：`label`、`tag`、`role`、`required`、`obligation`（是否必须携带、义务说明）\n- **相关性信号**：`score`（相关度评分）、`hits`（关键词命中位置）、`keywords`（命中的关键词集合）、`seed_weight`（作为种子时的权重）\n- **关联符号**：`unit: Option<Symbol>`（若命中的是符号定义，可挂载符号）\n- **打包成本/收益**：`utility`（效用，用于预算分配）、`estimated_bytes`（预估字节数，用于预算约束）、`body`（正文内容）\n\n## scale_optimizations_enabled 开关\n- `scale_optimizations_enabled()`（context.rs:201-205）：读环境变量 `NOVA_CTX_SCALE_OPT`，值 `!= \"0\"` 即开启，**默认开启**。\n- 配套的 `scale_v2_enabled()`（207-211）：读 `NOVA_CTX_SCALE_V2`，同样默认开启。\n\n## 开关对候选生成与打包相关链路的影响（输出中可见的两处）\n1. **大仓库搜索路径**（`prefer_git_grep_for_large_repo`，412-417）：仅当 `scale_optimizations_enabled() && scale_v2_enabled()` 且 git index 文件存在、大小 ≥ `LARGE_GIT_INDEX_BYTES` 时才走 git-grep 优化路径。即开关决定候选单元通过哪条检索通道被收集（小仓库/关开关时走常规扫描）。\n2. **反向 import 图（IMPACT 依赖）的增量维护**（1539-1555）：\n   - 开关关闭（`!scale_optimizations_enabled()`）：作为 A/B baseline，每次请求**全量重建**反向图（`reverse_from_files`）。\n   - 开关开启：增量策略——无文件变更且缓存为空时首次全量建；变更数 ≥ `REVERSE_FULL_REBUILD_CHANGES` 才整图重建；否则只对 `removed_files`/`rescanned_files` 增量补丁（删旧边、加新边）。反向图随缓存持久化，无变更调用直接复用。\n\n## 对\"预算打包\"算法的可推断结论\n输出展示的是**打包的输入模型与开关门控**，未展示打包主循环本身（贪心按 utility 排序、在 estimated_bytes 预算内择优等循环体不在已展示行段内）。可确认的打包相关语义：\n- 候选单元同时携带**效用**（`utility`、`score`、`seed_weight`、`required`）与**成本**（`estimated_bytes`、`body`），满足预算打包所需的\"收益/成本\"二元组结构；\n- `required=true` 的单元应优先/必须入选；\n- scale 开关通过两条路径间接影响打包：① 决定候选集如何生成（git-grep 优化 vs 常规扫描），② 决定依赖/IMPACT 闭包（影响 `unit` 关联符号及其下游）的获取成本是增量缓存还是全量重建——从而改变打包时可用符号与正文的获取开销，而非改变打包的选择准则本身。\n\n**遗留不确定性**：实际选择循环（如按 utility/score 降序贪心、字节预算封顶、required 强制入包等具体规则）未在本次输出中出现，需读取 `context.rs` 中 UnitCandidate 打包相关函数体（SIG 段未展开）才能确认。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2856,
+          "output": 1799
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      },
+      "B": {
+        "id": "packing",
+        "arm": "B",
+        "repeat": 2,
+        "wallMs": 28685,
+        "text": "基于 fast_context 输出，总结候选单元（UnitCandidate）的预算打包算法如下：\n\n## 一、数据结构：UnitCandidate（候选单元）\n一个待打包进上下文的候选代码单元，字段含：\n- 定位：`file` + `start/end`（行区间）\n- 语义：`label`、`tag`、`role`、`obligation`（义务/依赖说明）\n- 检索证据：`score`、`hits`（命中位置）、`keywords`\n- 打包决策依据：`seed_weight`（种子权重）、`required`（是否必需）、`utility`（效用）、`unit`（关联 Symbol）、`body`（正文）、`estimated_bytes`（预估体积，用于预算约束）\n\n即：预算打包 = 在 `estimated_bytes` 约束下，按 `utility/score/required` 对候选单元做取舍与排序。\n\n## 二、scale_optimizations_enabled 的作用（开关与降级）\n- `scale_optimizations_enabled()`：读环境变量 `NOVA_CTX_SCALE_OPT`，非 `\"0\"` 即开启，默认开启。\n- `scale_v2_enabled()`：读 `NOVA_CTX_SCALE_V2`，默认开启，控制 V2 增量优化。\n- `prefer_git_grep_for_large_repo`：仅当 **scale_optimizations_enabled && scale_v2_enabled && git index 文件大小 ≥ LARGE_GIT_INDEX_BYTES** 时才为真——即大仓库才改用 git grep 来约束扫描范围（小仓库/关闭优化时走普通路径）。\n\n## 三、预算打包中的核心算法：反向 import 图的复用\n在缓存反向图（reverse graph）时，按开关分级：\n\n1. **A/B baseline（关闭 scale 优化）**：`!scale_optimizations_enabled()` 时，每次请求都全量重建反向图（`reverse_from_files`：遍历全部 import × resolve_specifier，随后按 importer/local 排序去重）——这是对照臂，成本最高。\n\n2. **开启优化后的增量策略**：\n   - `changed == 0 && cache.reverse 为空 && files 非空` → 全量重建（首次冷启动）；\n   - `changed >= REVERSE_FULL_REBUILD_CHANGES`（变更数超阈值）→ 全量重建；\n   - 其余 `changed > 0` → **增量补丁**：只处理 `removed_files` 与 `rescanned_files`，删旧边、加新边。\n\n即：无文件变更的调用直接复用持久化缓存，小变更走增量补丁，只有首次或变更超阈值才退回 O(全部 import × resolve) 的全量重建，从而把每次请求的预算打包成本降到增量级。\n\n## 四、配套验证（eval 脚本可见）\n存在 A/B 评测脚本 `fast-context-scale-lyra-deepseek-ab.eval.mjs`：同一 prompt（本任务的 \"packing\" 用例）分别以 arm A（`NOVA_CTX_SCALE_V2=0`）和 arm B（`NOVA_CTX_SCALE_V2=1`）运行 Lyra CLI，对比 wallMs、token 消耗与 recall（期望输出含 `UnitCandidate`、`scale_optimizations_enabled` 两个符号），结果写入 report.json——用于验证开启 V2 增量打包相对 baseline 的收益。\n\n**一句话总结**：预算打包算法以 `UnitCandidate`（含 estimated_bytes/utility/required）为打包单元，通过 `scale_optimizations_enabled`（+`scale_v2_enabled`）控制是否启用优化：关闭时每次全量重建反向图（baseline），开启时按\"首次全量、小变更增量补丁、超阈值全量\"的阈值策略复用缓存，降低大仓库下的打包成本。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2840,
+          "output": 1820
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      }
+    },
+    {
+      "id": "scope",
+      "repeat": 3,
+      "A": {
+        "id": "scope",
+        "arm": "A",
+        "repeat": 3,
+        "wallMs": 54295,
+        "text": "## 调用链说明（仅依据 fast_context 输出）\n\n### 核心定义位置\n三个关键符号都定义在 **`src-tauri/src/nova_tools_native/context.rs`**：\n\n1. **`source_scope(file)`**（L2137–2143）— 范围归约函数：\n   - 文件以 `src-tauri/src/` 开头 → 统一归约为 `src-tauri/src/`；\n   - 否则取第一个 `/` 之前的部分并保留斜杠（如 `scripts/`），即「顶层目录前缀」；\n   - 无斜杠 → 返回空串（表示无法推导范围）。\n\n2. **`scope_dirs(seed_files)`**（L2148–2163）— 由 seed 文件推导扫描范围集合：\n   - 对每个 seed 文件调用 `source_scope`，结果去重入 `HashSet`；\n   - 任一文件推导出空 scope → 整体返回 `None`；集合为空 → `None`；\n   - 否则排序后返回 `Some(Vec<String>)`，即\"被允许扫描的目录前缀列表\"。\n\n3. **`search_text_scopes(root, …)`**（L2169–2170 起）— 实际的 scoped 文本检索入口，签名接收 `root` 与检索词（以及调用点传入的 `planned_scope`）。\n\n### 完整调用链\n```\nfast_context_run (context.rs L3496–3502)\n  ├─ planned_terms 为空 → 直接空 Vec<SearchRow>（不扫描）\n  └─ planned_terms 非空 → scope.spawn 线程中调用\n       search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())\n       其中 planned_scope ← scope_dirs(seed_files)   // 由 keywords/files 推导出的目录前缀集\n       而 scope_dirs 内部逐文件用 source_scope 归约出顶层目录前缀\n```\n\n### 如何约束扫描范围\n- **范围推导**：`scope_dirs` 先把 seed 文件（来自 keywords/files）归约成顶层目录前缀集合，空推导即整体放弃扫描（`None`）。\n- **检索收窄**：`fast_context_run` 把该前缀集合作为 `planned_scope` 传给 `search_text_scopes`，文本检索被限制在这些目录前缀内，而不是对整仓递归搜索，从而把扫描成本约束在 seed 相关子树上。\n\n### 其他命中文件（与本链路关系）\n- **`scripts/fast-context-scale-lyra-deepseek-ab.eval.mjs`**：其中的 `scope` case 正是本 prompt（keywords 用 `search_text_scopes`/`scope_dirs`），用于 A/B 对比 scale 优化后的召回与耗时——属于对本链路的测试驱动，非实现。\n- **`scripts/nova-napi-tools.test.mjs`**：N-API 工具测试，与 scoped 检索无关（仅因仓库关键词关联命中）。\n- **`src-tauri/src/employees.rs`（exec_relay）**：其中的 `scope` 是通知/会话的职责范围语义（discuss/work 接力），与「文件扫描范围」无关，属于同名不同义命中。\n\n结论：scoped 文本检索的约束路径为 `fast_context_run → scope_dirs(seed_files) → source_scope(文件) → search_text_scopes(root, terms, …, planned_scope)`，seed 推导出的顶层目录前缀是扫描范围的硬边界。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 3878,
+          "output": 2273
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      },
+      "B": {
+        "id": "scope",
+        "arm": "B",
+        "repeat": 3,
+        "wallMs": 35942,
+        "text": "依据 fast_context 输出（context.rs 的 4 个关键位置 + 消费点），scoped 文本检索约束扫描范围的调用链如下：\n\n**1. 范围前缀解析 — `source_scope(file: &str) -> &str`**（context.rs:2137-2143）\n为单个文件计算其所属 scope 前缀：\n- 若路径以 `src-tauri/src/` 开头，直接返回该前缀（`src-tauri/` 子树整体作为一个 scope，避免被上层目录切割）；\n- 否则取第一个 `/` 之前的目录段加斜杠（如 `scripts/`）；\n- 无 `/` 则返回空串，作为\"无 scope\"信号。\n\n**2. 目录集合构造 — `scope_dirs(seed_files: &[String]) -> Option<Vec<String>>`**（context.rs:2148-2163）\n消费上一步，把\"种子文件清单\"收敛成\"受限扫描目录清单\"：\n- 对每个 seed 文件调用 `source_scope` 得到前缀；\n- 任一文件 scope 为空 → 整体返回 `None`（表示无法限定，走非 scoped 路径）；\n- 否则把前缀插入 `HashSet` 去重、排序后返回 `Some(list)`。\n\n**3. scoped 检索入口 — `search_text_scopes(root: &Path, ...)`**（context.rs:2169-2170，定义签名所在）\n接收 root、检索词和可选的 scope 目录参数；`SearchRow { file, ln, text }`（97-101）是其输出行结构，即命中文件 + 行号 + 文本。\n\n**4. 实际消费点 — `fast_context_run` 内**（context.rs:3496-3502）\n`scope.spawn` 的线程闭包中：\n- `planned_terms` 为空 → 直接返回空 `Vec<SearchRow>`，跳过检索；\n- 非空 → 调用 `search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())`，把 `planned_scope`（由上述 `scope_dirs` 之类的 seed 推导结果）以 `as_deref()` 传入，**把批量 rg 的扫描范围钳制在种子文件所属的目录集合内**，从而让\"完整编辑单元 + 依赖定义\"的检索只扫相关子树、不扫全仓。\n\n**小结**：seed_files → `source_scope`（逐文件取前缀，含 `src-tauri/src/` 特例）→ `scope_dirs`（去重+排序成目录白名单，空则放弃限定）→ `planned_scope` → `fast_context_run` 线程内 `search_text_scopes(..., planned_scope.as_deref())`，命中结果以 `SearchRow{file, ln, text}` 返回。整个链路通过\"前缀解析→目录集合→传入检索函数\"三步把扫描范围约束在种子文件所属目录内，无检索词时短路返回空。其余展示（nova-napi-tools 测试、scale A/B eval、employees.rs exec_relay）与 scoped 检索链路无关，属同仓库其它模块。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 3878,
+          "output": 1370
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      }
+    },
+    {
+      "id": "graph",
+      "repeat": 3,
+      "A": {
+        "id": "graph",
+        "arm": "A",
+        "repeat": 3,
+        "wallMs": 32390,
+        "text": "依据 fast_context 输出，两者分别从「图复用」和「扫描范围」两个维度降低大仓库成本：\n\n## reverse_from_files（反向 import 图）\n\n定义于 `context.rs:1433`，输出 `ReverseMap = HashMap<目标文件, Vec<ReverseImport(importer, local, orig)>>`，把「谁 import 了谁」预计算成可查的倒排表。成本降低体现在三处（`context.rs:1541-1557` 的缓存策略）：\n\n1. **持久化复用**：`DiskCache` 里加了 `#[serde(default)] reverse` 字段，随磁盘缓存持久化。`changed == 0` 且图为空时才首建，之后无文件变更的调用直接复用，不再每次请求都做 O(全部 import × resolve_specifier) 的全量重建。\n2. **增量补丁**：有变更时只对 `removed_files ∪ rescanned_files` 删旧边、加新边，改动量小时复杂度从「全图」降到「变更文件集」。\n3. **阈值兜底**：只有变更数达到 `REVERSE_FULL_REBUILD_CHANGES` 才整图重建，把最贵的操作集中到真正必要的时候。\n\n对照 A/B 基线（`!scale_optimizations_enabled()` 时每次请求全量 `reverse_from_files`）可以看出：基线成本是「请求次数 × 全图构建」，优化后是「一次全图 + 请求次数 × 增量补丁」，大仓库下 import 边数量大、请求多时节省显著。\n\n## search_text_scopes（scoped 文本检索）\n\n定义于 `context.rs:2169`，签名 `fn search_text_scopes(root: &Path, ...)`，即文本检索以 `root` 为界、按 scope 约束扫描范围（配套的 `scope_dirs` 关键词表明 scope 指目录级限定）。对应 A/B 评测用例里 \"scoped 文本检索如何约束扫描范围\" 的预期召回（`expect: [\"search_text_scopes\", \"scope_dirs\"]`）。它把全文检索从「整仓库递归扫描」收敛到「声明的作用域目录/文件」，从源头上限定扫描面，避免大仓库无排除的递归搜索——与 fast_context 内部「只检索任务闭包内文件、`budget` 收敛输出」的机制同向配合。\n\n## 小结\n\n- **reverse_from_files** 省的是**重复计算**：把高频的 import 图构建摊薄到缓存与增量上，把最贵操作锁在变更阈值之后。\n- **search_text_scopes** 省的是**扫描面积**：把文本匹配限定在 scope 目录，不做整仓遍历。\n- 两者叠加：查询闭包的计算（图）与文本发现（scope）都被约束为「任务相关的局部子图/子目录」，大仓库成本从 O(仓库规模) 压向 O(任务闭包规模)。\n\n（未再调用其他工具，以上全部基于该次 fast_context 输出。）",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2646,
+          "output": 1344
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      },
+      "B": {
+        "id": "graph",
+        "arm": "B",
+        "repeat": 3,
+        "wallMs": 35166,
+        "text": "以下分析完全基于刚才那次 fast_context 的输出（scripts/nova-napi-tools.test.mjs、src-tauri/src/nova_tools_native/context.rs、scripts/fast-context-scale-lyra-deepseek-ab.eval.mjs 三个文件）。\n\n## 1. reverse_from_files —— 反向 import 图（context.rs）\n\n定义在 `context.rs:1433`，一次性遍历 `files` 里每个 entry 的 `imports`，用 `resolve_specifier` 把导入解析到目标文件，生成 `ReverseMap: HashMap<String, Vec<ReverseImport>>`——即\"谁导入了我\"的倒排索引，边按 `importer + local` 排序并去重（`context.rs:1450-1453`）。\n\n降低大仓库成本靠三个机制：\n\n- **持久化复用，免全量重建**：`DiskCache`（`context.rs:87-94`）里 `reverse` 字段随缓存落盘（`#[serde(default)]` 兼容旧缓存），注释明确写着\"反向 import 图随缓存持久化：无文件变更的调用直接复用，不再每次全量重建\"。\n- **增量补丁**（`context.rs:1541-1557`）：文件有变更时，只对 `removed_files` 和 `rescanned_files` 涉及的 importer 做 `edges.retain` 删旧边、再补新边；只有变更数达到 `REVERSE_FULL_REBUILD_CHANGES` 阈值才整图重建。注释点明这避免了每次 `O(全部 import × resolve_specifier)` 的代价。\n- **A/B 对照验证**：`!scale_optimizations_enabled()` 时（`context.rs:1549-1550`）退化为每次请求全量 `reverse_from_files` 重建，作为 baseline——证明该优化是真实的、可量化的收益（配套 eval 脚本 `fast-context-scale-lyra-deepseek-ab.eval.mjs` 正是用 `NOVA_CTX_SCALE_OPT: \"1\"` / `NOVA_CTX_SCALE_V2` 做 A/B，对比 wallMs 与 token 消耗）。\n\n## 2. search_text_scopes —— scoped 文本检索（context.rs:2169）\n\n定义在 `context.rs:2169`，输出虽未展开函数体，但 eval 脚本的用例注释给出了契约：\"分析 scoped 文本检索如何约束扫描范围\"（case `scope`，关键词 `search_text_scopes` + `scope_dirs`）。结合本任务工具契约（搜索必须成本有界、禁止无排除的递归 `grep -r`、默认遵守 `.gitignore`、兜底不重复检索同一批关键词），可以推断它把文本检索的扫描域**限定在 `scope_dirs` 指定的目录/文件集合内**，而不是整仓递归。\n\n降低成本的逻辑：大仓库里裸 `rg` 的扫描面是全部文件（含依赖、构建产物），token 和延迟随仓库体积线性放大；scoped 检索把扫描面收窄到与本次任务相关的子图（通常是 fast_context 打包出的编辑单元 + 依赖 + 调用方），命中行数收敛、输出预算可控。\n\n## 3. 两者如何协同降本\n\n- **横向（空间）**：`reverse_from_files` 把\"谁用了我\"从每次调用时的重复解析，变成一次构建 + 落盘复用的倒排索引；`search_text_scopes` 把\"文本搜索\"从全仓扫描变成子域扫描。二者共同把\"检索\"从 O(仓库体积) 压到 O(任务相关闭包)。\n- **纵向（时间）**：反向图用持久化 + 增量补丁 + 阈值重建三级策略，避免每次请求 O(全部 import × resolve) 的全量重建；scoped 检索则避免每次请求对全仓做文本遍历。\n- **可验证性**：`fast-context-scale-lyra-deepseek-ab.eval.mjs` 对三种场景（scope / graph / packing）分别以 A/B 双臂运行并统计 wallMs、tokens、recall，落盘到 `fast-context-scale-lyra-deepseek-ab.report.json`——说明这两项优化有量化基线支撑，不是推测。\n\n结论：`reverse_from_files` 降低的是**图构建的重复计算成本**（持久化 + 增量），`search_text_scopes` 降低的是**文本检索的扫描范围成本**（scope_dirs 约束），两者从时间和空间两个维度把大仓库的单次上下文构建成本从\"全仓线性\"压到\"任务闭包级\"。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2646,
+          "output": 1685
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      }
+    },
+    {
+      "id": "packing",
+      "repeat": 3,
+      "A": {
+        "id": "packing",
+        "arm": "A",
+        "repeat": 3,
+        "wallMs": 25284,
+        "text": "## 算法总结：候选单元（UnitCandidate）的预算打包\n\n### 1. 候选单元的数据结构\n`UnitCandidate`（src-tauri/src/nova_tools_native/context.rs:169-186）是预算打包的基本单位，字段包括：\n\n- **定位**：`file` + `start`/`end` 行区间，`label` 描述，`tag`（单元类型标签，`&'static str`）\n- **评分/匹配**：`score`（符号匹配分数）、`hits`（命中行号）、`keywords`（命中的关键词集合）、`unit: Option<Symbol>`（关联符号）\n- **加权与角色**：`seed_weight`（种子权重）、`role`（角色，如 \"test\"）、`required`（是否必需单元）、`utility`（效用）\n- **内容与预算**：`body`（正文）、`estimated_bytes`（预估字节数，用于价值/成本比）、`obligation`（义务/闭合承诺）\n\n### 2. 规模优化开关\n两个相互叠加的开关（均由环境变量控制，默认开启，仅当值显式为 \"0\" 时关闭）：\n\n- `scale_optimizations_enabled()`（201-205）：`NOVA_CTX_SCALE_OPT`，总开关\n- `scale_v2_enabled()`（207-211）：`NOVA_CTX_SCALE_V2`，v2 增强\n\n两者合流于 `prefer_git_grep_for_large_repo`（412-417）：仅当 **scale 优化开启 + v2 开启 + 仓库存在 .git index 且其体积 ≥ `LARGE_GIT_INDEX_BYTES`** 时，判定为大仓库并启用 git-grep 优先策略。即：规模优化通过\"开关 + 仓库规模证据（git index 字节数）\"双重门槛决定是否切换低成本检索路径。\n\n### 3. 预算打包的核心估价函数\n`fast_context_run` 内的闭包 `candidate_value`（4154-4165）定义了每个候选单元在预算内的**单位价值**：\n\n```\ngain = required ? 1000 : 0                      // 必需单元给巨额基础收益\n     + Σ unit_features 中未被 covered 的 feature 权重   // 只奖励尚未覆盖的特征\n     - 50（若文件是噪声路径 noise_path 且 role != \"test\"）// 惩罚 test/spec/__tests__ 等噪声文件\nvalue = gain / max(estimated_bytes / 1024, 1)   // 按 KB 归一化为“收益/成本”密度\n      + score / 1000                            // 附加符号匹配分数的微调\n```\n\n其中 `noise_path`（1724-1729）用正则 `(?i)\\.(test|spec)\\.[^.]+$|/__tests__/|/tests?/` 识别测试/噪声文件。\n\n### 4. 算法要点\n- **收益边际化**：用 `covered` 集合去重——同一 feature 只会被第一个覆盖它的单元计一次收益，防止重复打包同一信息源。\n- **密度优先**：价值按 `estimated_bytes` 归一化，打包时倾向于先塞\"高增益/小体积\"的单元，在预算（字节上限）内最大化总特征覆盖。\n- **必需单元硬保底**：`required` 单元即使体积大也获得 1000 基础收益，确保被优先纳入。\n- **噪声降权**：测试文件除非本身角色就是 test，否则扣 50 分抑制无效打包。\n- **规模分级**：大仓库（git index 超过阈值且两开关开启）走 git-grep 低成本检索；小仓库走常规路径——候选生成与打包逻辑本身统一，区别在检索上游的扫描成本控制。\n\n### 附带信息\n同批命中的其他文件 `scripts/fast-context-scale-final-report.md` 与 `scripts/fast-context-scale-lyra-deepseek-ab.report.json` 未展开正文，属于该规模的评估报告/结果数据，与本算法本身无直接耦合。\n\n（说明：本次为计划模式只读分析，未修改任何文件；输出即上述契约块所展示的全部相关证据，算法总结完全依据该输出。）",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2645,
+          "output": 1393
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      },
+      "B": {
+        "id": "packing",
+        "arm": "B",
+        "repeat": 3,
+        "wallMs": 26745,
+        "text": "基于 fast_context 输出（context.rs 相关片段 + A/B 评测脚本），总结如下：\n\n## 预算打包相关数据结构\n\n**UnitCandidate**（`src-tauri/src/nova_tools_native/context.rs:169-186`）：每个候选单元携带打包所需元数据——\n- 定位与内容：`file` / `start` / `end` / `label` / `body` / `tag`\n- 排序/权衡：`score: f64`（相关性分）、`hits: Vec<usize>`（关键词命中位置）、`keywords: HashSet<String>`、`utility: f64`（效用）、`seed_weight: usize`（种子权重）\n- 约束与义务：`required: bool`（是否必选）、`estimated_bytes: usize`（估算字节，用于预算约束）、`role: &'static str`、`obligation: Option<String>`、`unit: Option<Symbol>`\n\n## 开关门控\n\n- `scale_optimizations_enabled()`（201-205）：读 `NOVA_CTX_SCALE_OPT` 环境变量，非 `\"0\"` 即启用，**默认开**。\n- `scale_v2_enabled()`（207-211）：读 `NOVA_CTX_SCALE_V2`，语义相同，独立于 v1。\n- `prefer_git_grep_for_large_repo`（412-417）：三者合取——`scale_optimizations_enabled() && scale_v2_enabled() && git index 存在且大小 ≥ LARGE_GIT_INDEX_BYTES` 时，大仓库改用 git grep 检索。\n\n## 优化分支下的打包行为（以反向 import 图缓存为例）\n\ncontext.rs:1539-1555 展示了该开关如何分流预算构建成本：\n\n- **基线（A/B 对照组，`scale_optimizations_enabled()==false`）**：每次请求**全量重建**完整反向图 `reverse_from_files(&cache.files, &all_set)`（O(全部 import × resolve_specifier)）。\n- **优化分支**：\n  1. 无变更且缓存为空但有文件 → 全量建图（冷启动）；\n  2. 变更数 ≥ `REVERSE_FULL_REBUILD_CHANGES` → 全量重建（阈值兜底）；\n  3. 有变更但未达阈值 → **增量补丁**：仅删 `removed_files` / `rescanned_files` 的旧边、加新边；\n  4. 无变更 → 直接复用持久化缓存，零构建成本。\n\n## 验证方式（评测脚本）\n\n`fast-context-scale-lyra-deepseek-ab.eval.mjs` 对同一 prompt（正是本次关键词组合）做配对 A/B：arm A 设 `NOVA_CTX_SCALE_V2=0`（基线），arm B 设 `=1`，两者 `NOVA_CTX_SCALE_OPT=1`；经原生 Rust CLI + DeepSeek 模型各重复多轮，统计 wallMs / tokens / recall（关键词 `UnitCandidate`、`scale_optimizations_enabled` 是否出现在输出中），写入 report.json 对比优化收益。\n\n**算法要点**：候选单元以 `required` 标记必选、`estimated_bytes` 约束预算、`score`/`utility` 决定打包优先级；而 `scale_optimizations_enabled`（配合 v2 与大仓库判定）决定预算构建走\"全量重建\"（基线）还是\"缓存复用 + 增量补丁\"（优化）路径，从而把大仓库下的反复全量扫描成本摊薄到单次。",
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 2850,
+          "output": 1639
+        },
+        "tools": [
+          "fast_context"
+        ],
+        "recall": 1,
+        "stderr": ""
+      }
+    }
+  ],
+  "totals": {
+    "A": {
+      "wallMs": 343258,
+      "tokens": 87560,
+      "recall": 1
+    },
+    "B": {
+      "wallMs": 289554,
+      "tokens": 81870,
+      "recall": 1
+    }
+  }
+}
