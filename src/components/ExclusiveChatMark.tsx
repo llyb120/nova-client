@@ -10,6 +10,7 @@ const EXCLUSIVE_MARK_BY_TOKEN_PREFIX: ReadonlyArray<readonly [string, string]> =
   ["chen.lv", "002"],
   ["zheng.hanliang", "003"],
   ["nie.youlin", "004"],
+  ["ma.chunyu", "005"],
 ];
 
 export interface ExclusiveChatIdentity {

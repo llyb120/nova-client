@@ -17,6 +17,7 @@ const EXCLUSIVE_MARK_BY_TOKEN_PREFIX: &[(&str, &str)] = &[
     ("chen.lv", "002"),
     ("zheng.hanliang", "003"),
     ("nie.youlin", "004"),
+    ("ma.chunyu", "005"),
 ];
 
 /// token 对应的专属身份；无身份则始终 None（不签）。
@@ -42,5 +43,12 @@ mod tests {
         let identity = identity_for_token("  Nie.YouLin/device-token  ").unwrap();
         assert_eq!(identity.username, "Nie.YouLin");
         assert_eq!(identity.number, "004");
+    }
+
+    #[test]
+    fn matches_ma_chunyu_as_number_005() {
+        let identity = identity_for_token("ma.chunyu/device-token").unwrap();
+        assert_eq!(identity.username, "ma.chunyu");
+        assert_eq!(identity.number, "005");
     }
 }
