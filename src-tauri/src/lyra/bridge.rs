@@ -599,7 +599,7 @@ async fn handle_prompt(
             }
         }
         AgentEvent::MessageEnd { usage } => {
-            // 每个 provider 请求结束都会返回真实 usage；逐轮累加并立即上报。
+            // 每个 provider request 完成后累计其真实 usage，并立即更新运行中统计。
             merge_usage(&mut total_usage, &usage);
             emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
         }
