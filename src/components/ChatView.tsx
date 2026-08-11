@@ -665,7 +665,23 @@ export function ChatView() {
   const [showShare, setShowShare] = createSignal(false);
   const [timeline, setTimeline] = createSignal<TimeMachineTimeline | null>(null);
   const [timeMachineExpanded, setTimeMachineExpanded] = createSignal(false);
+  const [timeMachineHintTurn, setTimeMachineHintTurn] = createSignal(0);
   const [restoringCheckpoint, setRestoringCheckpoint] = createSignal<string | null>(null);
+  let observedTimeMachineThread: string | null = null;
+  let observedTimeMachineChange = timeMachineChangedSignal();
+
+  createEffect(() => {
+    const threadId = state.currentId;
+    const change = timeMachineChangedSignal();
+    const changedCurrentTimeline =
+      threadId !== null && threadId === observedTimeMachineThread && change !== observedTimeMachineChange;
+    observedTimeMachineThread = threadId;
+    observedTimeMachineChange = change;
+    if (changedCurrentTimeline && !timeMachineExpanded()) {
+      // 收起时世界线不可见，用卡扣里的表针转动提示历史编辑已生成新分支。
+      setTimeMachineHintTurn((turn) => turn + 1);
+    }
+  });
 
 
   createEffect(() => {
@@ -1364,7 +1380,12 @@ export function ChatView() {
             title="展开世界线"
             onClick={() => setTimeMachineExpanded(true)}
           >
-            <IconStopwatch size={17} />
+            <span class="repo-time-toggle-clock" aria-hidden="true">
+              <IconStopwatch size={17} />
+              <Show keyed when={!timeMachineExpanded() && timeMachineHintTurn()}>
+                {() => <span class="repo-time-toggle-hand" />}
+              </Show>
+            </span>
             <span class="repo-time-toggle-label">世界线</span>
           </button>
           <div class="repo-time-machine-label" aria-hidden={!timeMachineExpanded()}>

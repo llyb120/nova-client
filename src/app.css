@@ -1182,6 +1182,30 @@ button {
   background: color-mix(in srgb, var(--accent) 6%, var(--bg-panel));
 }
 .repo-time-toggle:active { transform: scale(.96); }
+.repo-time-toggle-clock {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+}
+.repo-time-toggle-clock > svg {
+  position: relative;
+  z-index: 1;
+}
+.repo-time-toggle-hand {
+  position: absolute;
+  z-index: 2;
+  left: calc(50% - .5px);
+  top: 5px;
+  width: 1px;
+  height: 6px;
+  border-radius: 2px;
+  background: currentColor;
+  transform-origin: 50% 6px;
+  animation: repo-time-hand-turn .72s linear both;
+  will-change: transform;
+}
 .repo-time-toggle:focus-visible,
 .repo-time-magic-clock:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
@@ -1276,7 +1300,8 @@ button {
 }
 @media (prefers-reduced-motion: reduce) {
   .repo-time-machine,
-  .repo-time-clock-hand {
+  .repo-time-clock-hand,
+  .repo-time-toggle-hand {
     animation: none !important;
     transition-duration: .01ms !important;
   }
