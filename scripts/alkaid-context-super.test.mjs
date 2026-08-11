@@ -365,6 +365,7 @@ test("incomplete OpenAI response streams retry silently and preserve context", a
   assert.equal(isRetryableAlkaidProviderError("HTTP 429 Too Many Requests"), true);
   assert.equal(isRetryableAlkaidProviderError("rate limit exceeded"), true);
   assert.equal(isRetryableAlkaidProviderError("Upstream stream ended prematurely; safe to retry"), true);
+  assert.equal(isRetryableAlkaidProviderError("读取响应流失败：error decoding response body"), true);
   assert.equal(isRetryableAlkaidProviderError("HTTP 401 unauthorized"), false);
 });
 

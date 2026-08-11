@@ -155,6 +155,7 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "safe to retry",
     "stream ended before a terminal response event",
     "stream ended without finish_reason",
+    "error decoding response body",
     "idle timeout",
     "429",
     "too many requests",
@@ -523,6 +524,9 @@ mod tests {
         assert!(is_retryable_provider_error("connection error: ECONNRESET"));
         assert!(is_retryable_provider_error(
             "provider error: Upstream stream ended prematurely; safe to retry"
+        ));
+        assert!(is_retryable_provider_error(
+            "读取响应流失败：error decoding response body"
         ));
         assert!(!is_retryable_provider_error("invalid api key"));
     }

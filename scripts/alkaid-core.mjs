@@ -262,6 +262,7 @@ export function isRetryableAlkaidProviderError(error) {
     "safe to retry",
     "stream ended before a terminal response event",
     "stream ended without finish_reason",
+    "error decoding response body",
     "idle timeout",
     "429",
     "too many requests",
