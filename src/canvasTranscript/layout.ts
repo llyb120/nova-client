@@ -1378,6 +1378,26 @@ function toolBlock(flow: Flow, item: ToolItem, env: LayoutEnv, active: boolean):
     dotCx = rightX + 3.5;
     rightX -= 8;
   }
+  const durationValue = isRecord(item.rawOutput)
+    ? item.rawOutput.durationMs ?? item.rawOutput.duration_ms
+    : undefined;
+  const durationMs = typeof durationValue === "number" && Number.isFinite(durationValue) && durationValue >= 0
+    ? durationValue
+    : undefined;
+  const durationText = durationMs === undefined
+    ? ""
+    : durationMs < 1000
+      ? `${Math.round(durationMs)}ms`
+      : durationMs < 60_000
+        ? `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 2 : 1)}s`
+        : `${Math.floor(Math.round(durationMs / 1000) / 60)}m ${Math.round(durationMs / 1000) % 60}s`;
+  const durationF = font(11.5, { mono: true });
+  let durationX = 0;
+  if (durationText) {
+    rightX -= measure(durationText, durationF);
+    durationX = rightX;
+    rightX -= 8;
+  }
   const addText = `+${add}`;
   const delText = `-${del}`;
   const statsF = font(11.5, { mono: true });
@@ -1413,6 +1433,11 @@ function toolBlock(flow: Flow, item: ToolItem, env: LayoutEnv, active: boolean):
         ctx.fillText(addText, statsX, y0 + baselineOf(rowH, statsF));
         ctx.fillStyle = view.theme.red;
         ctx.fillText(delText, statsX + measure(addText, statsF) + 6, y0 + baselineOf(rowH, statsF));
+      }
+      if (durationX) {
+        ctx.font = durationF;
+        ctx.fillStyle = view.theme.textFaint;
+        ctx.fillText(durationText, durationX, y0 + baselineOf(rowH, durationF));
       }
       if (busy) drawSpinner(ctx, spinnerCx, y0 + rowH / 2, 12, view.now, view.theme.blue, view.theme.accent26);
       if (dotCx) {

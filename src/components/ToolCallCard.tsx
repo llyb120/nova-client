@@ -134,6 +134,19 @@ function toolSummary(item: ToolItem): string {
   return rawPreview(item.rawInput) || rawPreview(item.rawOutput);
 }
 
+function toolDurationMs(item: ToolItem): number | undefined {
+  if (!isRecord(item.rawOutput)) return undefined;
+  const value = item.rawOutput.durationMs ?? item.rawOutput.duration_ms;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function formatToolDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`;
+  const seconds = Math.round(ms / 1000);
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
 function DiffView(props: {
   path: string;
   oldText?: string | null;
@@ -302,6 +315,11 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
           <span class="tool-stats">
             <span class="stat-add">+{stats().add}</span>
             <span class="stat-del">-{stats().del}</span>
+          </span>
+        </Show>
+        <Show when={toolDurationMs(props.item) !== undefined}>
+          <span class="tool-duration" title="工具调用耗时">
+            {formatToolDuration(toolDurationMs(props.item)!)}
           </span>
         </Show>
         <Switch>

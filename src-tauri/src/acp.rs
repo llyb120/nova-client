@@ -1302,10 +1302,13 @@ impl AcpManager {
                     let mut completed = false;
                     let mut snapshot: Option<Item> = None;
                     for item in thread.items.iter_mut().rev() {
-                        if let Item::Tool { call, .. } = item {
+                        if let Item::Tool { ts, call, .. } = item {
                             if call.tool_call_id == tc_id {
                                 merge_tool_call(call, update);
                                 completed = call.status == "completed" || call.status == "failed";
+                                if completed {
+                                    set_tool_duration(call, now_ms().saturating_sub(*ts) as u64);
+                                }
                                 snapshot = Some(item.clone());
                                 found = true;
                                 break;
@@ -3490,10 +3493,18 @@ fn normalize_generated_title(raw: &str, fallback: &str) -> String {
     title
 }
 
+fn set_tool_duration(call: &mut ToolCall, duration_ms: u64) {
+    let output = call.raw_output.get_or_insert_with(|| json!({}));
+    if let Some(object) = output.as_object_mut() {
+        object.insert("durationMs".into(), json!(duration_ms));
+    }
+}
+
 fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>) -> Vec<Item> {
     let mut changed = Vec::new();
+    let finished_at = now_ms();
     for item in &mut thread.items {
-        let Item::Tool { call, .. } = item else {
+        let Item::Tool { ts, call, .. } = item else {
             continue;
         };
         if except_tool_call_id == Some(call.tool_call_id.as_str()) {
@@ -3501,6 +3512,7 @@ fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>
         }
         if call.status == "pending" || call.status == "in_progress" {
             call.status = "completed".to_string();
+            set_tool_duration(call, finished_at.saturating_sub(*ts) as u64);
             changed.push(item.clone());
         }
     }

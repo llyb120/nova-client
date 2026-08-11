@@ -1103,7 +1103,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (const item of g.body) {
       if (item.type === "tool") {
         parts.push(
-          `tool:${item.id}:${item.status}:${item.title}:${item.content.length}:${item.locations.length}:${item.rawInput !== undefined}:${!!state.expanded[`tool-${item.id}`]}`,
+          `tool:${item.id}:${item.status}:${item.title}:${item.content.length}:${item.locations.length}:${item.rawInput !== undefined}:${JSON.stringify(item.rawOutput)}:${!!state.expanded[`tool-${item.id}`]}`,
         );
       } else if ("text" in item) {
         parts.push(
