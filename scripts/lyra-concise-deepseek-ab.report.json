@@ -1,0 +1,662 @@
+{
+  "ranAt": "2026-08-11T03:20:49.732Z",
+  "model": "opencode/deepseek-v4-flash/variant/high",
+  "runs": 2,
+  "cases": [
+    {
+      "id": "simple-success",
+      "must": [
+        "完成",
+        "通过"
+      ],
+      "exception": []
+    },
+    {
+      "id": "multi-file-success",
+      "must": [
+        "完成",
+        "通过"
+      ],
+      "exception": []
+    },
+    {
+      "id": "unverified",
+      "must": [
+        "完成",
+        "无法",
+        "CI"
+      ],
+      "exception": [
+        "数据库"
+      ]
+    },
+    {
+      "id": "action-required",
+      "must": [
+        "完成",
+        "重启"
+      ],
+      "exception": [
+        "新会话"
+      ]
+    },
+    {
+      "id": "failed",
+      "must": [
+        "未完成",
+        "401",
+        "令牌"
+      ],
+      "exception": []
+    }
+  ],
+  "binaries": {
+    "A": "D:\\code\\nova-client-master\\src-tauri\\target\\debug\\nova.exe",
+    "B": "D:\\code\\nova-client-lyra-concise-output\\src-tauri\\target\\debug\\nova.exe"
+  },
+  "totals": {
+    "A": {
+      "samples": 10,
+      "avgChars": 286.2,
+      "avgLines": 10.5,
+      "avgMustRecallRate": 1,
+      "avgExceptionRecallRate": 1,
+      "lowValueHits": 6,
+      "failures": 0,
+      "usage": {
+        "cacheRead": 18560,
+        "cacheWrite": 0,
+        "input": 3146,
+        "output": 2939
+      }
+    },
+    "B": {
+      "samples": 10,
+      "avgChars": 58.9,
+      "avgLines": 1,
+      "avgMustRecallRate": 1,
+      "avgExceptionRecallRate": 1,
+      "lowValueHits": 4,
+      "failures": 0,
+      "usage": {
+        "cacheRead": 19584,
+        "cacheWrite": 0,
+        "input": 3632,
+        "output": 1540
+      }
+    },
+    "delta": {
+      "avgCharsPct": -79.4199860237596,
+      "avgLinesPct": -90.47619047619048,
+      "mustRecallPoints": 0,
+      "exceptionRecallPoints": 0,
+      "lowValueHits": -2
+    }
+  },
+  "rows": [
+    {
+      "id": "simple-success",
+      "run": 1,
+      "A": {
+        "arm": "A",
+        "run": 1,
+        "id": "simple-success",
+        "wallMs": 14910,
+        "text": "修复已完成，测试通过。改动仅涉及单个文件，无需其他处理。",
+        "chars": 28,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "通过"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 1,
+        "usage": {
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "input": 2163,
+          "output": 216
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 1,
+        "id": "simple-success",
+        "wallMs": 12595,
+        "text": "修复已完成，单文件改动，测试通过。",
+        "chars": 17,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "通过"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 1,
+        "usage": {
+          "cacheRead": 768,
+          "cacheWrite": 0,
+          "input": 1546,
+          "output": 66
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    },
+    {
+      "id": "multi-file-success",
+      "run": 1,
+      "A": {
+        "arm": "A",
+        "run": 1,
+        "id": "multi-file-success",
+        "wallMs": 5990,
+        "text": "开发已完成，结论如下：\n\n## ✅ 功能开发完成，可正常交付\n\n**交付摘要**\n- 功能改动跨 4 个文件，整体开发已完成并合入当前代码库。\n- 改动范围清晰、聚焦，未涉及额外模块或外部依赖。\n\n**验证结果**\n- ✅ 单元测试：全部通过\n- ✅ 类型检查：通过，无类型错误\n- ✅ 兼容性：无破坏性变化，对既有调用方和使用方式零影响\n\n**对使用方的影响**\n- 无用户操作要求：功能上线后即可生效，无需配置、迁移或人工干预。\n- 接口与行为向后兼容，现有功能不受影响。\n\n**风险与后续**\n- 无已知剩余风险，无需追加跟进事项。\n- 如需在正式环境验证，可结合实际场景做一次冒烟确认（可选，非必须）。\n\n如需要，我可以进一步提供改动文件的变更明细或对应的提交记录摘要。",
+        "chars": 339,
+        "lines": 16,
+        "mustRecall": [
+          "完成",
+          "通过"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 2,
+        "usage": {
+          "cacheRead": 2048,
+          "cacheWrite": 0,
+          "input": 130,
+          "output": 422
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 1,
+        "id": "multi-file-success",
+        "wallMs": 10359,
+        "text": "功能开发已完成：跨 4 个文件的改动全部落地，单元测试与类型检查均通过，无兼容性变化，也无需用户任何操作。功能即可正常使用。",
+        "chars": 62,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "通过"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 1,
+        "usage": {
+          "cacheRead": 768,
+          "cacheWrite": 0,
+          "input": 1561,
+          "output": 166
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    },
+    {
+      "id": "unverified",
+      "run": 1,
+      "A": {
+        "arm": "A",
+        "run": 1,
+        "id": "unverified",
+        "wallMs": 13626,
+        "text": "## 最终结论\n\n**代码修改已完成**，但当前交付状态为 **未完全验证，暂不具备上线条件**。\n\n### 现状\n- 修改已完成（代码层面改动落盘）。\n- 本机缺少数据库服务，**集成测试无法在本地运行**，因此依赖数据库的测试路径当前处于“未执行”状态。\n\n### 上线前必须完成\n1. **在 CI 中执行完整集成测试**：CI 环境需提供数据库服务（或使用容器化数据库/测试专用实例），跑通全部集成测试用例，确保改动在真实依赖环境下行为正确。\n2. **确认测试结果全部通过**：重点关注与本次改动相关的测试套件，确认无回归、无新增失败。\n3. **如 CI 出现失败，需修复后重新提交并再次通过 CI**，方可进入上线流程。\n\n### 剩余风险\n- 改动仅通过本地静态/单测层面的验证，**数据库相关行为（连接、事务、SQL、数据迁移等）未经真实环境确认**。\n- 若改动涉及数据库结构或数据读写逻辑，风险更高，CI 验证不可跳过。\n\n### 建议命令 / 操作\n- 在 CI 配置中启用带数据库的集成测试阶段（如 `docker compose up -d db` 后运行测试）；\n- 或本地临时启动数据库服务后运行：`<项目对应的集成测试命令>`，验证通过后再上线。\n\n**一句话结论：代码改完，但需先在 CI 上完成集成测试验证且全部通过后，才可上线；当前不应直接发布。**",
+        "chars": 595,
+        "lines": 16,
+        "mustRecall": [
+          "完成",
+          "无法",
+          "CI"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [
+          "数据库"
+        ],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 1,
+        "usage": {
+          "cacheRead": 2048,
+          "cacheWrite": 0,
+          "input": 124,
+          "output": 526
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 1,
+        "id": "unverified",
+        "wallMs": 11368,
+        "text": "代码修改已完成，但本地因缺少数据库服务无法运行集成测试，属于**未验证**状态；上线前必须在 CI 上跑通集成测试（含数据库相关用例），确认通过后才能发布。若有任何用例在 CI 失败，请回来把失败信息给我，我会跟进修复。",
+        "chars": 110,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "无法",
+          "CI"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [
+          "数据库"
+        ],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2176,
+          "cacheWrite": 0,
+          "input": 147,
+          "output": 303
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    },
+    {
+      "id": "action-required",
+      "run": 1,
+      "A": {
+        "arm": "A",
+        "run": 1,
+        "id": "action-required",
+        "wallMs": 10715,
+        "text": "配置修改已完成并通过验证，以下是最终结论：\n\n---\n\n## 最终结论\n\n**配置修改已完成并验证通过 ✅**\n\n但需要你注意一个重要事项：\n\n> ⚠️ **本次修改仅对新会话生效，请重启 Nova 以加载新配置。**\n\n### 你需要做的事\n\n1. **保存当前工作**（如有未保存内容）\n2. **退出并重启 Nova**\n3. 重启后，新配置将自动生效\n\n### 说明\n\n- 配置验证已通过，重启后无需再次修改\n- 重启后若发现任何异常，可随时回来继续排查\n- 本次改动不影响已保存的历史会话数据\n\n---\n\n有其它问题随时找我，祝使用愉快！",
+        "chars": 274,
+        "lines": 16,
+        "mustRecall": [
+          "完成",
+          "重启"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [
+          "新会话"
+        ],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2048,
+          "cacheWrite": 0,
+          "input": 120,
+          "output": 217
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 1,
+        "id": "action-required",
+        "wallMs": 4066,
+        "text": "配置修改已完成并验证通过，但新配置只对新会话生效，请重启 Nova 后再使用。",
+        "chars": 39,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "重启"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [
+          "新会话"
+        ],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2176,
+          "cacheWrite": 0,
+          "input": 143,
+          "output": 156
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    },
+    {
+      "id": "failed",
+      "run": 1,
+      "A": {
+        "arm": "A",
+        "run": 1,
+        "id": "failed",
+        "wallMs": 4989,
+        "text": "## 任务结论：未完成（构建失败）\n\n**状态**：❌ 失败，需要用户介入。\n\n**失败原因**：构建过程中，依赖服务返回 **HTTP 401 未授权**，说明当前使用的访问令牌已失效或被拒绝。\n\n**用户需执行的操作**：\n\n1. **更新访问令牌**：获取/刷新新的访问令牌（如 TAPD、腾讯云或其他依赖服务的 token），更新到对应的环境变量或配置中。\n2. **重新触发构建**：令牌更新后，重新发起构建任务。\n\n**剩余风险**：\n- 若刷新后仍返回 401，请确认令牌的权限范围（scope）是否覆盖该依赖服务所需的最小权限。\n- 请确认令牌未过期、环境变量确实已生效（必要时重启相关进程/重新加载配置）。\n\n**本次未产出任何代码或配置变更**，构建停留在失败状态，待令牌更新后重试即可。",
+        "chars": 354,
+        "lines": 10,
+        "mustRecall": [
+          "未完成",
+          "401",
+          "令牌"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2048,
+          "cacheWrite": 0,
+          "input": 124,
+          "output": 277
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 1,
+        "id": "failed",
+        "wallMs": 4081,
+        "text": "任务未完成：构建失败，原因是依赖服务返回 401（鉴权失败）。请更新访问令牌（access token）后重新触发构建；若更新后仍报 401，请检查令牌所属账号是否有对应服务的访问权限。",
+        "chars": 93,
+        "lines": 1,
+        "mustRecall": [
+          "未完成",
+          "401",
+          "令牌"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2176,
+          "cacheWrite": 0,
+          "input": 147,
+          "output": 163
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    },
+    {
+      "id": "simple-success",
+      "run": 2,
+      "A": {
+        "arm": "A",
+        "run": 2,
+        "id": "simple-success",
+        "wallMs": 3868,
+        "text": "修复已完成，测试通过。",
+        "chars": 11,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "通过"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2048,
+          "cacheWrite": 0,
+          "input": 115,
+          "output": 48
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 2,
+        "id": "simple-success",
+        "wallMs": 3263,
+        "text": "普通单文件修复已完成，测试通过。无需进一步操作。",
+        "chars": 24,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "通过"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 1,
+        "usage": {
+          "cacheRead": 2304,
+          "cacheWrite": 0,
+          "input": 10,
+          "output": 55
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    },
+    {
+      "id": "multi-file-success",
+      "run": 2,
+      "A": {
+        "arm": "A",
+        "run": 2,
+        "id": "multi-file-success",
+        "wallMs": 9477,
+        "text": "功能开发已完成，最终结论如下：\n\n## 开发完成\n\n**改动范围**：跨 4 个文件，属一个完整功能单元，改动聚焦、无附带牵连修改。\n\n**验证情况**：\n- ✅ 单元测试全部通过\n- ✅ 类型检查通过\n\n**兼容性**：\n- ✅ 无兼容性变化（接口/数据结构对外契约不变，现有调用方不受影响）\n\n**用户影响**：\n- ✅ 无需任何用户操作，功能上线后自动生效\n\n## 结论\n\n本次功能开发已完成并验收通过，可以直接交付/合入。未发现遗留风险，无需额外跟进事项。",
+        "chars": 232,
+        "lines": 12,
+        "mustRecall": [
+          "完成",
+          "通过"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 1,
+        "usage": {
+          "cacheRead": 2176,
+          "cacheWrite": 0,
+          "input": 2,
+          "output": 257
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 2,
+        "id": "multi-file-success",
+        "wallMs": 4652,
+        "text": "功能开发已完成，跨 4 个文件的改动已通过单元测试和类型检查，无兼容性变化，无需用户任何操作，可以正常合入使用。",
+        "chars": 56,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "通过"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 1,
+        "usage": {
+          "cacheRead": 2304,
+          "cacheWrite": 0,
+          "input": 25,
+          "output": 141
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    },
+    {
+      "id": "unverified",
+      "run": 2,
+      "A": {
+        "arm": "A",
+        "run": 2,
+        "id": "unverified",
+        "wallMs": 5553,
+        "text": "## 最终结论\n\n**状态：代码修改已完成，但尚未通过集成测试验证，当前不具备上线条件。**\n\n具体说明：\n\n1. **已完成**：代码修改本身已完成。\n2. **阻塞项**：本机缺少数据库服务，无法本地运行集成测试，因此修改正确性（尤其涉及数据读写、事务、表结构变更的部分）尚未得到验证。\n3. **前置要求**：上线前必须在 CI 中完成集成测试验证。\n\n### 建议的放行条件\n\n- [ ] CI 上运行集成测试（含数据库相关用例）全部通过\n- [ ] CI 构建、静态检查通过\n- [ ] 确认 CI 集成测试环境已配置数据库服务（否则 CI 也会失败，需先补齐 CI 的 DB 依赖）\n\n**结论：暂不能发布/合并上线，需待 CI 集成测试验证通过后再放行。** 若 CI 环境也未配置数据库服务，请先补充 CI 的数据库依赖与初始化步骤，避免验证空转。",
+        "chars": 382,
+        "lines": 11,
+        "mustRecall": [
+          "完成",
+          "无法",
+          "CI"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [
+          "数据库"
+        ],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2048,
+          "cacheWrite": 0,
+          "input": 124,
+          "output": 402
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 2,
+        "id": "unverified",
+        "wallMs": 7945,
+        "text": "代码修改已完成。由于本机缺少数据库服务，集成测试无法在本地执行，这部分验证未通过——必须在 CI 环境跑通集成测试后才能上线。请在上线前确认 CI 中集成测试通过。",
+        "chars": 82,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "无法",
+          "CI"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [
+          "数据库"
+        ],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2304,
+          "cacheWrite": 0,
+          "input": 19,
+          "output": 182
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    },
+    {
+      "id": "action-required",
+      "run": 2,
+      "A": {
+        "arm": "A",
+        "run": 2,
+        "id": "action-required",
+        "wallMs": 5783,
+        "text": "## 最终结论\n\n配置修改已完成并通过验证。但由于本次改动只在**新会话**中生效，请执行以下操作：\n\n**1. 重启 Nova**\n\n关闭当前 Nova 窗口/进程后重新启动，或通过 Nova 的退出入口退出后再启动。\n\n**2. 重启后验证**\n\n- 新启动的 Nova 会话会自动加载新配置；\n- 若重启后仍出现异常，请重新发起会话并在提问时附上现象描述，便于进一步排查。\n\n**补充说明**\n\n- 当前会话中的旧配置不会受到影响，重启前请勿将当前会话中的临时改动作为判断依据；\n- 重启后如需确认配置是否已加载，可在新会话中询问或检查相关配置项的实际表现。\n\n---\n\n如重启后仍有问题，请描述具体现象（如报错信息、预期行为 vs 实际行为），我会继续协助定位。",
+        "chars": 335,
+        "lines": 12,
+        "mustRecall": [
+          "完成",
+          "重启"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [
+          "新会话"
+        ],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2048,
+          "cacheWrite": 0,
+          "input": 120,
+          "output": 285
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 2,
+        "id": "action-required",
+        "wallMs": 4061,
+        "text": "配置修改已完成并验证通过，但仅对新会话生效——请重启 Nova 后重新发起会话，改动即可生效。",
+        "chars": 47,
+        "lines": 1,
+        "mustRecall": [
+          "完成",
+          "重启"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [
+          "新会话"
+        ],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2304,
+          "cacheWrite": 0,
+          "input": 15,
+          "output": 167
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    },
+    {
+      "id": "failed",
+      "run": 2,
+      "A": {
+        "arm": "A",
+        "run": 2,
+        "id": "failed",
+        "wallMs": 6223,
+        "text": "任务未完成，结论如下：\n\n**构建失败原因**：依赖服务返回 401（未授权）。说明当前使用的访问令牌（access token）已失效或权限不足，服务端拒绝认证。\n\n**处理方式**：请更新访问令牌后重试构建。\n\n具体步骤：\n1. 在依赖服务的控制台 / 认证平台重新生成或刷新访问令牌；\n2. 将新令牌更新到对应配置（环境变量 / 配置文件 / 凭据存储）；\n3. 确认令牌具备本次构建所需的作用域（scope）和权限；\n4. 重新执行构建命令。\n\n**当前状态**：构建未成功，代码改动尚未通过构建验证，请勿将本次改动标记为完成。\n\n如果你希望我继续协助，可以在你更新令牌并重跑构建后告诉我结果，我再帮你定位后续问题。",
+        "chars": 312,
+        "lines": 10,
+        "mustRecall": [
+          "未完成",
+          "401",
+          "令牌"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 1,
+        "usage": {
+          "cacheRead": 2048,
+          "cacheWrite": 0,
+          "input": 124,
+          "output": 289
+        },
+        "stderr": "",
+        "cancelled": false
+      },
+      "B": {
+        "arm": "B",
+        "run": 2,
+        "id": "failed",
+        "wallMs": 4751,
+        "text": "任务未完成：构建失败，原因是依赖服务返回 401（访问令牌无效或已过期）。请你更新访问令牌后重新构建/重试，即可继续。",
+        "chars": 59,
+        "lines": 1,
+        "mustRecall": [
+          "未完成",
+          "401",
+          "令牌"
+        ],
+        "mustRecallRate": 1,
+        "exceptionRecall": [],
+        "exceptionRecallRate": 1,
+        "lowValueHits": 0,
+        "usage": {
+          "cacheRead": 2304,
+          "cacheWrite": 0,
+          "input": 19,
+          "output": 141
+        },
+        "stderr": "",
+        "cancelled": false
+      }
+    }
+  ]
+}

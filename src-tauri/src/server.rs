@@ -60,6 +60,7 @@ const HELP: &str = r#"Nova Headless Server
 
 可配置键：
   relay-server, token, groups, name, proxy, default-mode
+  context（none / fast / super，默认 super）
   devin-path, codex-path, codex-args, codebuddy-path, claude-path,
   cursor-path, opencode-path
   vega-proxy, devin-proxy, codex-proxy, codebuddy-proxy, claude-proxy,
@@ -294,6 +295,7 @@ fn show_config(show_token: bool) -> Result<(), String> {
         "proxy": server.proxy,
         "environment": environment,
         "defaultMode": settings.default_mode,
+        "contextRetrievalMode": settings.context_retrieval_mode.as_str(),
         "agents": {
             "vega": { "enabled": settings.vega_enabled, "proxy": settings.vega_proxy },
             "devin": { "enabled": settings.devin_enabled, "path": settings.devin_path, "proxy": settings.devin_proxy },
@@ -341,6 +343,14 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
             "name" => server.name = value.into(),
             "proxy" => server.proxy = value.into(),
             "default-mode" => settings.default_mode = value.into(),
+            "context" | "context-retrieval-mode" => {
+                settings.context_retrieval_mode = match value.trim().to_ascii_lowercase().as_str() {
+                    "none" => crate::settings::ContextRetrievalMode::None,
+                    "fast" => crate::settings::ContextRetrievalMode::Fast,
+                    "super" => crate::settings::ContextRetrievalMode::Super,
+                    _ => return Err("无效上下文模式：应为 none/fast/super".into()),
+                }
+            }
             "devin-path" => settings.devin_path = value.into(),
             "codex-path" => settings.codex_path = value.into(),
             "codex-args" => settings.codex_args = value.into(),

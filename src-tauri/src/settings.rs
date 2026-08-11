@@ -35,6 +35,27 @@ pub struct StageModelTarget {
     pub model: String,
 }
 
+/// 上下文检索模式：none = 不注入工具，fast = 旧 FastContext，super = 无索引单遍 SuperContext。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextRetrievalMode {
+    None,
+    Fast,
+    #[default]
+    #[serde(other)]
+    Super,
+}
+
+impl ContextRetrievalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Fast => "fast",
+            Self::Super => "super",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -156,10 +177,8 @@ pub struct Settings {
     pub session_auto_cleanup_hours: u32,
     /// 语义检索开关（关 = 用内置 BM25 关键词检索；开需配置下面的 embedding 服务）
     pub semantic_enabled: bool,
-    /// 启用 Fast Context：为 Vega / Cursor / Devin 注入 fast_context / find_symbols 上下文检索工具；关闭则不附带。
-    pub fast_context_enabled: bool,
-    /// Super FastContext：启用大仓库 scoped/index/cache/Lazy Greedy 优化；默认关闭时保持 master baseline。
-    pub super_fast_context_enabled: bool,
+    /// 上下文检索：none / fast / super。SuperContext 使用无持久化索引的单遍程序切片，默认启用。
+    pub context_retrieval_mode: ContextRetrievalMode,
 
     /// embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434）
     pub embed_endpoint: String,
@@ -234,8 +253,7 @@ impl Default for Settings {
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
             semantic_enabled: false,
-            fast_context_enabled: true,
-            super_fast_context_enabled: false,
+            context_retrieval_mode: ContextRetrievalMode::Super,
 
             embed_endpoint: "http://localhost:11434".into(),
             embed_model: "bge-m3".into(),
@@ -269,13 +287,41 @@ mod tests {
     }
 
     #[test]
-    fn fast_context_is_enabled_by_default() {
-        assert!(Settings::default().fast_context_enabled);
+    fn super_context_is_enabled_by_default() {
+        let settings = Settings::default();
+        assert_eq!(
+            settings.context_retrieval_mode,
+            super::ContextRetrievalMode::Super
+        );
+        assert!(settings.context_tools_enabled());
+        assert!(settings.super_context_enabled());
     }
 
     #[test]
-    fn super_fast_context_is_disabled_by_default() {
-        assert!(!Settings::default().super_fast_context_enabled);
+    fn legacy_disabled_fast_context_migrates_to_none() {
+        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), r#"{"fastContextEnabled":false}"#).unwrap();
+        let settings = Settings::load(&dir);
+        assert_eq!(
+            settings.context_retrieval_mode,
+            super::ContextRetrievalMode::None
+        );
+        assert!(!settings.context_tools_enabled());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn context_retrieval_modes_round_trip() {
+        for mode in [
+            super::ContextRetrievalMode::None,
+            super::ContextRetrievalMode::Fast,
+            super::ContextRetrievalMode::Super,
+        ] {
+            let text = serde_json::to_string(&mode).unwrap();
+            let decoded: super::ContextRetrievalMode = serde_json::from_str(&text).unwrap();
+            assert_eq!(decoded, mode);
+        }
     }
 
     #[test]
@@ -426,16 +472,30 @@ mod tests {
 impl Settings {
     pub fn load(dir: &PathBuf) -> Self {
         let raw = fs::read_to_string(dir.join("settings.json")).ok();
-        let legacy_days = raw.as_deref().and_then(|json| {
-            serde_json::from_str::<serde_json::Value>(json)
-                .ok()
-                .and_then(|value| value["sessionAutoCleanupDays"].as_u64())
-                .and_then(|days| u32::try_from(days).ok())
-        });
+        let raw_value = raw
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+        let legacy_days = raw_value
+            .as_ref()
+            .and_then(|value| value["sessionAutoCleanupDays"].as_u64())
+            .and_then(|days| u32::try_from(days).ok());
         let mut settings: Self = raw
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_default();
+        // 三态设置上线前只有 fastContextEnabled 布尔值。显式关闭继续迁移为 none；
+        // 其它旧配置采用新的默认 SuperContext。
+        if raw_value
+            .as_ref()
+            .is_some_and(|value| value.get("contextRetrievalMode").is_none())
+            && raw_value
+                .as_ref()
+                .and_then(|value| value.get("fastContextEnabled"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+        {
+            settings.context_retrieval_mode = ContextRetrievalMode::None;
+        }
         if settings.claudecode_path.trim() == "npx" {
             settings.claudecode_path = "claude".into();
         }
@@ -469,6 +529,31 @@ impl Settings {
             settings.cursor_context_mode = "default".into();
         }
         settings
+    }
+
+    pub fn context_tools_enabled(&self) -> bool {
+        self.context_retrieval_mode != ContextRetrievalMode::None
+    }
+
+    pub fn super_context_enabled(&self) -> bool {
+        self.context_retrieval_mode == ContextRetrievalMode::Super
+    }
+
+    pub fn apply_context_retrieval_environment(&self) {
+        std::env::set_var(
+            "NOVA_CONTEXT_RETRIEVAL_MODE",
+            self.context_retrieval_mode.as_str(),
+        );
+        std::env::set_var(
+            "NOVA_CONTEXT_NO_INDEX",
+            if self.super_context_enabled() {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        // NOVA_SUPER_FAST_CONTEXT 是已废弃的旧实验优化，不属于新的 SuperContext。
+        std::env::remove_var("NOVA_SUPER_FAST_CONTEXT");
     }
 
     pub fn save(&self, dir: &PathBuf) {

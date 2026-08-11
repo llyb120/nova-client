@@ -751,8 +751,7 @@ impl AcpManager {
                 &self.app,
                 conn_key,
                 cwd,
-                settings.fast_context_enabled,
-                settings.super_fast_context_enabled,
+                settings.context_retrieval_mode.as_str(),
                 self.thread_is_read_only(conn_key),
             )?;
             cmd.current_dir(&launch_dir);
@@ -784,8 +783,12 @@ impl AcpManager {
             )
             .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token())
             .env(
-                "NOVA_SUPER_FAST_CONTEXT",
-                if settings.super_fast_context_enabled {
+                "NOVA_CONTEXT_RETRIEVAL_MODE",
+                settings.context_retrieval_mode.as_str(),
+            )
+            .env(
+                "NOVA_CONTEXT_NO_INDEX",
+                if settings.super_context_enabled() {
                     "1"
                 } else {
                     "0"
@@ -2332,9 +2335,9 @@ impl AcpManager {
         let mut prompt = Self::build_prompt_blocks(text, images);
         let mut guidance = Vec::new();
         if include_runtime_guidance {
-            let (fast_context, read_only) = {
+            let (context_tools, read_only) = {
                 let state = self.app.state::<AppState>();
-                let fast_context = state.settings.lock().unwrap().fast_context_enabled;
+                let context_tools = state.settings.lock().unwrap().context_tools_enabled();
                 let read_only = {
                     let store = state.store.lock().unwrap();
                     store
@@ -2344,20 +2347,20 @@ impl AcpManager {
                         .as_deref()
                         == Some("plan")
                 };
-                (fast_context, read_only)
+                (context_tools, read_only)
             };
-            guidance.push(nova_tools_prompt_guidance(fast_context, read_only));
+            guidance.push(nova_tools_prompt_guidance(context_tools, read_only));
         }
         // Shell 解释器由 Devin 的执行层选择，且可能在同一 Windows 会话中切换。
         // 每轮带上短契约，旧 session 也能立即纠正 Bash / PowerShell 混用。
-        let fast_context = self
+        let context_tools = self
             .app
             .state::<AppState>()
             .settings
             .lock()
             .unwrap()
-            .fast_context_enabled;
-        if let Some(runtime) = devin_runtime_guidance(fast_context) {
+            .context_tools_enabled();
+        if let Some(runtime) = devin_runtime_guidance(context_tools) {
             guidance.push(runtime);
         }
         if !guidance.is_empty() {
@@ -2969,20 +2972,24 @@ fn devin_nova_tools_config(
     node: &std::path::Path,
     script: &std::path::Path,
     cwd: &str,
-    fast_context: bool,
-    super_fast_context: bool,
+    context_mode: &str,
     read_only: bool,
     context_endpoint: &str,
     context_token: &str,
 ) -> Value {
+    let enabled = context_mode != "none";
     let mut env = serde_json::Map::new();
     env.insert(
         "NOVA_FAST_CONTEXT".into(),
-        Value::String(if fast_context { "1" } else { "0" }.into()),
+        Value::String(if enabled { "1" } else { "0" }.into()),
     );
     env.insert(
-        "NOVA_SUPER_FAST_CONTEXT".into(),
-        Value::String(if super_fast_context { "1" } else { "0" }.into()),
+        "NOVA_CONTEXT_RETRIEVAL_MODE".into(),
+        Value::String(context_mode.into()),
+    );
+    env.insert(
+        "NOVA_CONTEXT_NO_INDEX".into(),
+        Value::String(if context_mode == "super" { "1" } else { "0" }.into()),
     );
     env.insert("NOVA_TOOLS_CWD".into(), Value::String(cwd.into()));
     env.insert(
@@ -3020,8 +3027,7 @@ fn prepare_devin_nova_tools_config(
     app: &AppHandle,
     conn_key: &str,
     cwd: &str,
-    fast_context: bool,
-    super_fast_context: bool,
+    context_mode: &str,
     read_only: bool,
 ) -> Result<PathBuf, String> {
     let script = materialize_nova_tools_mcp(app)?;
@@ -3049,8 +3055,7 @@ fn prepare_devin_nova_tools_config(
         &node,
         &script,
         cwd,
-        fast_context,
-        super_fast_context,
+        context_mode,
         read_only,
         state.context_service.endpoint(),
         state.context_service.token(),
@@ -3152,8 +3157,7 @@ mod nova_tools_config_tests {
             Path::new("C:/node.exe"),
             Path::new("C:/nova-tools.mjs"),
             "D:/repo",
-            true,
-            true,
+            "super",
             true,
             "test-endpoint",
             "test-token",
@@ -3162,7 +3166,8 @@ mod nova_tools_config_tests {
         assert_eq!(server["transport"], "stdio");
         assert_eq!(server["env"]["NOVA_TOOLS_CWD"], "D:/repo");
         assert_eq!(server["env"]["NOVA_FAST_CONTEXT"], "1");
-        assert_eq!(server["env"]["NOVA_SUPER_FAST_CONTEXT"], "1");
+        assert_eq!(server["env"]["NOVA_CONTEXT_RETRIEVAL_MODE"], "super");
+        assert_eq!(server["env"]["NOVA_CONTEXT_NO_INDEX"], "1");
         assert_eq!(server["env"]["NOVA_TOOLS_READ_ONLY"], "1");
         assert_eq!(
             server["env"]["NOVA_CONTEXT_SERVICE_ENDPOINT"],

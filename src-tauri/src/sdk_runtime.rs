@@ -1063,15 +1063,15 @@ impl SdkManager {
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
-        let fast_context = {
+        let context_tools = {
             let state = self.app.state::<AppState>();
-            let enabled = state.settings.lock().unwrap().fast_context_enabled;
+            let enabled = state.settings.lock().unwrap().context_tools_enabled();
             enabled
         };
         let session = crate::lyra::spawn_prompt(
             self.native_http(),
             request,
-            fast_context,
+            context_tools,
             self.borrowed_root(),
         );
         let abort = session.task.abort_handle();
@@ -1381,8 +1381,12 @@ impl SdkManager {
                 )
                 .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token())
                 .env(
-                    "NOVA_SUPER_FAST_CONTEXT",
-                    if settings.super_fast_context_enabled {
+                    "NOVA_CONTEXT_RETRIEVAL_MODE",
+                    settings.context_retrieval_mode.as_str(),
+                )
+                .env(
+                    "NOVA_CONTEXT_NO_INDEX",
+                    if settings.super_context_enabled() {
                         "1"
                     } else {
                         "0"

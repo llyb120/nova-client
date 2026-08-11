@@ -4166,14 +4166,9 @@ async fn apply_runtime_settings(
         recheck_availability,
     ) = {
         let mut s = state.settings.lock().unwrap();
-        let context_runtime_changed = s.fast_context_enabled != settings.fast_context_enabled
-            || s.super_fast_context_enabled != settings.super_fast_context_enabled;
-        if s.super_fast_context_enabled != settings.super_fast_context_enabled {
-            if settings.super_fast_context_enabled {
-                std::env::set_var("NOVA_SUPER_FAST_CONTEXT", "1");
-            } else {
-                std::env::remove_var("NOVA_SUPER_FAST_CONTEXT");
-            }
+        let context_runtime_changed = s.context_retrieval_mode != settings.context_retrieval_mode;
+        if context_runtime_changed {
+            settings.apply_context_retrieval_environment();
         }
         let restart_vega = restart_all_agents
             || context_runtime_changed
@@ -6051,11 +6046,7 @@ pub fn run() {
             let notices = notice::NoticeStore::load(&dir);
             let marks = marks::MarkStore::load(&dir);
             let vectors = semantic::VectorStore::load(&dir);
-            if settings.super_fast_context_enabled {
-                std::env::set_var("NOVA_SUPER_FAST_CONTEXT", "1");
-            } else {
-                std::env::remove_var("NOVA_SUPER_FAST_CONTEXT");
-            }
+            settings.apply_context_retrieval_environment();
             let context_service = context_service::ContextService::start(&dir)?;
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
