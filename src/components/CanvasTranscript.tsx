@@ -940,6 +940,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   // per-block scroll for clipped tool-content（按内容身份记，避免 rebuild 丢位置）
   const blockScrolls = new Map<string, number>();
   let rebuildRaf = 0;
+  let rebuildTimer: number | undefined;
+  let rebuildAfterPaint = false;
+  let lastRebuildAt = 0;
+  // 流式事件可能高于屏幕刷新率；Markdown 解析/换行无需跟着每个 token 同步执行。
+  const STREAM_LAYOUT_INTERVAL_MS = 80;
   interface PrefixLayoutCache {
     /** 宽度+配色签名：任一变化则整份缓存作废 */
     meta: string;
@@ -951,6 +956,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     until: number;
   }
   const prefixLayoutCaches = new Map<string, PrefixLayoutCache>();
+  // groupItems 会保留已闭合分组的对象身份；缓存其内容签名，避免每个流式 token
+  // 都重新遍历整段历史文本。展开状态变化时会整体换新此 WeakMap。
+  let closedGroupSigCache = new WeakMap<Group, string>();
   let layoutGeneration = 0;
   let renderedThreadId = props.threadId;
 
@@ -963,10 +971,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   /** 连击计数（双击选词 / 三击选行）：按时间间隔与位置抖动判定 */
   let lastClick = { t: 0, count: 0, x: 0, y: 0 };
 
-  // render loop (busy spinners)
-  let rafId = 0;
-  // busy 重绘节流定时器：spinner 动画不需要 60fps 全量重绘
+  // busy spinner 只重绘自身所在的工具头，不再以 20fps 光栅化整个视口。
   let busyTimer: number | undefined;
+  const busyBlockIndices: number[] = [];
 
   // custom scrollbar drag (drawn on canvas; not a DOM control)
   let scrollDragging = false;
@@ -974,7 +981,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // spinner
   let spinPhase = 0;
-  let hasBusy = false;
 
   // editing
   const [editing, setEditing] = createSignal<UserItem | null>(null);
@@ -1108,6 +1114,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     return parts.join("|");
   }
 
+  function cachedClosedGroupSig(g: Group): string {
+    const cached = closedGroupSigCache.get(g);
+    if (cached !== undefined) return cached;
+    const sig = closedGroupSig(g);
+    closedGroupSigCache.set(g, sig);
+    return sig;
+  }
+
   async function computeLayout(generation: number): Promise<boolean> {
     const p = pal;
     const W = viewW;
@@ -1159,7 +1173,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (let i = 0; i < groups.length; i++) {
       if (!groups[i].turn) break;
       if (editingId != null && groups[i].user?.id === editingId) break;
-      closedSigs.push(closedGroupSig(groups[i]));
+      closedSigs.push(cachedClosedGroupSig(groups[i]));
       closedUntil = i + 1;
     }
     // 逐组比对签名，取最长连续匹配前缀复用：展开/收起中间某个工具不再整份作废，
@@ -1751,7 +1765,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const visTop = scrollY - 50;
     const visBot = scrollY + viewH + 50;
     spinPhase = (performance.now() / 800) % 1;
-    hasBusy = false;
+    busyBlockIndices.length = 0;
 
     for (let i = 0; i < blocks.length; i++) {
       const b = blocks[i];
@@ -1833,6 +1847,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           paintFoldToggle(ctx, b, bx, by, p, !!isHover);
           break;
         case "tool-header":
+          if (b.data?.busy) busyBlockIndices.push(i);
           paintToolHeader(ctx, b, bx, by, p);
           break;
         case "md-paragraph":
@@ -1881,13 +1896,48 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     // scrollbar
     if (maxScroll > 0) paintScrollbar(ctx);
 
-    // busy spinner 节流到 ~20fps：此前每帧全量重绘，滚动时与 wheel 绘制叠加放大卡顿
-    if (hasBusy && busyTimer === undefined) {
-      busyTimer = window.setTimeout(() => {
-        busyTimer = undefined;
-        requestRender();
-      }, 50);
+    scheduleBusyPaint();
+  }
+
+  function scheduleBusyPaint() {
+    if (busyBlockIndices.length === 0 || busyTimer !== undefined) return;
+    busyTimer = window.setTimeout(paintBusyIndicators, 50);
+  }
+
+  /** 动画帧仅擦除并重画可见的 busy 工具头，正文、图片和选区均不重复光栅化。 */
+  function paintBusyIndicators() {
+    busyTimer = undefined;
+    const canvas = canvasEl;
+    if (!canvas || busyBlockIndices.length === 0) return;
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.textRendering = "optimizeLegibility";
+    ctx.fontKerning = "normal";
+    spinPhase = (performance.now() / 800) % 1;
+    let anyBusy = false;
+
+    for (const index of busyBlockIndices) {
+      const b = blocks[index];
+      if (!b || b.kind !== "tool-header" || !b.data?.busy) continue;
+      const by = b.y - scrollY;
+      if (by + b.h < -1 || by > viewH + 1) continue;
+      anyBusy = true;
+      const isHover = index === hoverBlockIdx
+        || !!(b.hoverKey && blocks[hoverBlockIdx]?.hoverKey === b.hoverKey);
+      ctx.save();
+      ctx.fillStyle = pal.bg;
+      ctx.fillRect(b.x, by, b.w, b.h);
+      if (isHover && b.hoverBg) {
+        ctx.fillStyle = b.hoverBg;
+        roundRect(ctx, b.x, by, b.w, b.h, b.borderRadius || 0);
+        ctx.fill();
+      }
+      paintToolHeader(ctx, b, b.x, by, pal);
+      ctx.restore();
     }
+
+    if (anyBusy) scheduleBusyPaint();
   }
 
   function paintUserBubble(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette, hover: boolean) {
@@ -2028,7 +2078,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     // trailing status / chevron sit after the label (not flush-right)
     let nextX = textX + labelW + gap;
     if (busy) {
-      hasBusy = true;
       const cx = nextX + 6;
       const angle = spinPhase * Math.PI * 2;
       ctx.save();
@@ -2946,13 +2995,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     e.clipboardData?.setData("text/plain", text);
   }
 
-  // ─── Render loop ──────────────────────────────────────────────────────────
-
-  function requestRender() {
-    if (rafId) return;
-    rafId = requestAnimationFrame(tick);
-  }
-
+  // ─── Render scheduling ────────────────────────────────────────────────────
   let paintQueued = false;
   /**
    * 合并高频输入事件（wheel/mousemove/拖拽）的重绘：每帧最多一次全量绘制。
@@ -2966,11 +3009,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       paintQueued = false;
       paintAll();
     });
-  }
-
-  function tick() {
-    rafId = 0;
-    if (hasBusy) paintAll();
   }
 
   // ─── Image loading ─────────────────────────────────────────────────────────
@@ -3018,20 +3056,46 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     paintAll();
   }
 
-  function scheduleRebuild(afterPaint = false) {
+  const queueRebuildFrame = () => {
     if (rebuildRaf) return;
     rebuildRaf = requestAnimationFrame(() => {
-      if (afterPaint) {
+      const deferForPaint = rebuildAfterPaint;
+      rebuildAfterPaint = false;
+      if (deferForPaint) {
         // Let the loading state reach the screen before starting an uncached layout.
         rebuildRaf = requestAnimationFrame(() => {
           rebuildRaf = 0;
+          lastRebuildAt = performance.now();
           void rebuild();
         });
         return;
       }
       rebuildRaf = 0;
+      lastRebuildAt = performance.now();
       void rebuild();
     });
+  };
+
+  function scheduleRebuild(afterPaint = false) {
+    rebuildAfterPaint ||= afterPaint;
+    // 停止、切会话等状态要立即落屏，不受流式节流影响。
+    if ((afterPaint || !props.running) && rebuildTimer !== undefined) {
+      window.clearTimeout(rebuildTimer);
+      rebuildTimer = undefined;
+    }
+    if (rebuildRaf || rebuildTimer !== undefined) return;
+    const elapsed = performance.now() - lastRebuildAt;
+    const delay = props.running && !rebuildAfterPaint
+      ? Math.max(0, STREAM_LAYOUT_INTERVAL_MS - elapsed)
+      : 0;
+    if (delay > 1) {
+      rebuildTimer = window.setTimeout(() => {
+        rebuildTimer = undefined;
+        queueRebuildFrame();
+      }, delay);
+      return;
+    }
+    queueRebuildFrame();
   }
 
   function resizeCanvas() {
@@ -3102,7 +3166,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       editResizeObserver = undefined;
       editHostEl = undefined;
       if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
-      if (rafId) cancelAnimationFrame(rafId);
+      if (rebuildTimer !== undefined) window.clearTimeout(rebuildTimer);
+      if (busyTimer !== undefined) window.clearTimeout(busyTimer);
       canvasEl.removeEventListener("mousemove", onMouseMove);
       canvasEl.removeEventListener("mouseleave", onMouseLeave);
       canvasEl.removeEventListener("mousedown", onMouseDown);
@@ -3116,9 +3181,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   });
 
   createEffect(() => {
-    // Read reactive fields without concatenating full message text into temporary strings.
     const threadId = props.threadId;
-    for (const g of props.groups) {
+    const groups = props.groups;
+    // 已闭合分组不会再流式变化；只深度订阅仍未闭合的尾部，避免每个 token
+    // 都遍历整段历史。新增/替换分组仍由 props.groups 的引用变化触发。
+    for (const g of groups) {
+      if (g.turn) continue;
       if (g.user) {
         void g.user.text;
         void g.user.images?.length;
@@ -3132,15 +3200,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           void item.locations.length;
         }
       }
-      if (g.turn) {
-        void g.turn.durationMs;
-        void g.turn.totalTokens;
-      }
     }
+    void props.permissions;
     void props.running;
     void props.loading;
     void props.preview;
-    JSON.stringify(state.expanded);
+    void props.emptyHint;
     void editing()?.id;
     const switchedThread = threadId !== renderedThreadId;
     if (switchedThread) {
@@ -3161,6 +3226,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (canvasEl) paintAll();
     }
     scheduleRebuild(switchedThread);
+  });
+
+  createEffect(() => {
+    // 展开态参与闭合分组签名；仅在它变化时废弃签名缓存，而不是流式时反复哈希历史。
+    JSON.stringify(state.expanded);
+    closedGroupSigCache = new WeakMap<Group, string>();
+    scheduleRebuild();
   });
 
   const saveEdit = () => {
