@@ -37,6 +37,7 @@ test("fast_context prioritizes resolved targets and lets required units exceed l
       task: "inspect requiredTarget implementation",
       budget: 100,
       maxBytes: 32768,
+      _contextMode: "fast",
     }, root);
     assert.match(output, /@@ 1-143 fn requiredTarget \[def\]/);
     assert.match(output, /return value_139;\n}/);
@@ -66,6 +67,7 @@ test("fast_context closes third-level dependencies and samples caller behaviors"
       task: "修改 targetApi 签名并保持调用方兼容",
       budget: 180,
       maxBytes: 12288,
+      _contextMode: "fast",
     }, root);
     assert.match(output, /DEPTH_THREE/);
     assert.match(output, /export function returnCaller/);
@@ -145,7 +147,8 @@ test("different Node processes share one global context service", async (t) => {
     const params = { keywords: ["sharedTarget"] };
     const context = await callGlobalContextTool("fast_context", root, params);
     assert.match(context, /sharedTarget/);
-    assert.equal(context, await fastContextNative(params, root));
+    assert.match(context, /algorithm=no-index-one-pass/);
+    assert.match(await fastContextNative({ ...params, _contextMode: "fast" }, root), /sharedTarget/);
   } finally {
     // 先挂 exit 监听再 kill：进程可能已退出（如构建产物缺失），事后挂监听会永等。
     const exited = service.exitCode !== null || service.signalCode !== null

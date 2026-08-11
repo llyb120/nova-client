@@ -70,6 +70,7 @@ await writeFile(join(novaHome, "runtime", "nova-tools-mcp.mjs"), "// stub\n");
 const planServers = novaToolsMcpServers({ cwd: "D:/repo", mode: "plan" }, {
   NOVA_DATA_DIR: novaHome,
   NOVA_FAST_CONTEXT: "0",
+  NOVA_CONTEXT_RETRIEVAL_MODE: "none",
   NOVA_CONTEXT_SERVICE_ENDPOINT: "http://127.0.0.1:9",
   NOVA_CONTEXT_SERVICE_TOKEN: "token",
 });
@@ -78,6 +79,7 @@ assert.deepEqual(planServers["nova-tools"].args, [join(novaHome, "runtime", "nov
 assert.deepEqual(planServers["nova-tools"].env, {
   NOVA_TOOLS_CWD: "D:/repo",
   NOVA_FAST_CONTEXT: "0",
+  NOVA_CONTEXT_RETRIEVAL_MODE: "none",
   NOVA_TOOLS_READ_ONLY: "1",
   NOVA_CONTEXT_SERVICE_ENDPOINT: "http://127.0.0.1:9",
   NOVA_CONTEXT_SERVICE_TOKEN: "token",
@@ -85,3 +87,4 @@ assert.deepEqual(planServers["nova-tools"].env, {
 const buildServers = novaToolsMcpServers({ cwd: "/repo", mode: "build" }, { NOVA_DATA_DIR: novaHome });
 assert.equal(buildServers["nova-tools"].env.NOVA_TOOLS_READ_ONLY, undefined);
 assert.equal(buildServers["nova-tools"].env.NOVA_FAST_CONTEXT, "1");
+assert.equal(buildServers["nova-tools"].env.NOVA_CONTEXT_RETRIEVAL_MODE, "super");

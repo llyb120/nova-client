@@ -437,8 +437,8 @@ export interface Settings {
   windowsShellShimEnabled: boolean;
   /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
   checkpointEnabled: boolean;
-  /** Super FastContext 大仓库优化；默认关闭，关闭时保持 master baseline。 */
-  superFastContextEnabled: boolean;
+  /** 代码上下文检索模式：无 / 旧 FastContext / 无索引单遍 SuperContext。 */
+  contextRetrievalMode: "none" | "fast" | "super";
   defaultMode: string;
   /** 标题、快速总结、摘要和压缩等辅助任务所用后端 */
   lightweightModelAgent: string;
@@ -492,8 +492,7 @@ export interface Settings {
   sessionAutoCleanupHours: number;
   /** 语义检索开关（关 = 内置 BM25 关键词检索） */
   semanticEnabled: boolean;
-  /** 启用 Fast Context 上下文检索工具（fast_context / find_symbols）。 */
-  fastContextEnabled: boolean;
+
 
   /** embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434） */
   embedEndpoint: string;

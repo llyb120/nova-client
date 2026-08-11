@@ -29,6 +29,7 @@ function novaToolsMcpServers(request, env = process.env) {
   const serverEnv = {
     NOVA_TOOLS_CWD: request.cwd,
     NOVA_FAST_CONTEXT: env.NOVA_FAST_CONTEXT ?? "1",
+    NOVA_CONTEXT_RETRIEVAL_MODE: env.NOVA_CONTEXT_RETRIEVAL_MODE ?? "super",
   };
   if (request.mode === "plan") serverEnv.NOVA_TOOLS_READ_ONLY = "1";
   for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN"]) {

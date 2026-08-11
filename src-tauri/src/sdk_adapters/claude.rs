@@ -40,14 +40,17 @@ impl SdkAdapter for ClaudeAdapter {
             extra_env: vec![
                 (
                     "NOVA_FAST_CONTEXT",
-                    if settings.fast_context_enabled {
+                    if settings.context_tools_enabled() {
                         "1"
                     } else {
                         "0"
                     }
                     .into(),
                 ),
-
+                (
+                    "NOVA_CONTEXT_RETRIEVAL_MODE",
+                    settings.context_retrieval_mode.as_str().into(),
+                ),
             ],
         }
     }
