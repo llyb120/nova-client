@@ -6357,8 +6357,14 @@ pub fn run() {
                                 }
                             } else if prompted.as_deref() != Some(ver.as_str()) {
                                 if let Ok(info) = updater::check(&prompt_app).await {
-                                    let _ = prompt_app.emit(updater::EV_PROMPT, info);
-                                    prompted = Some(ver);
+                                    // 在线检查可能刚发现比暂存包更高的版本。只有暂存包仍是
+                                    // 当前最新版时才提示，绝不把中间版本伪装成最新版应用。
+                                    let is_same_staged = info["staged"].as_bool().unwrap_or(false)
+                                        && info["latest"].as_str() == Some(ver.as_str());
+                                    if is_same_staged {
+                                        let _ = prompt_app.emit(updater::EV_PROMPT, info);
+                                        prompted = Some(ver);
+                                    }
                                 }
                             }
                         }

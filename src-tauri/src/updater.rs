@@ -22,6 +22,8 @@ const APPLY_UPDATE_ARG: &str = "--nova-apply-update";
 const RESTART_PARENT_PID: &str = "NOVA_RESTART_PARENT_PID";
 /// 后台定时下载与手动检查共用同一套临时文件，必须串行，避免进度交叉和暂存包互相覆盖。
 static UPDATE_OPERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// 最近一次在线检查发现的最新版。用于阻止已下载的中间版本在最新版下载完成前被应用。
+static LATEST_DISCOVERED_VERSION: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// GitHub 仓库 owner/repo。编译时可设 NOVA_GH_REPO 覆盖。
 fn github_repo() -> &'static str {
@@ -273,6 +275,23 @@ fn parse_ver(s: &str) -> Option<(u64, u64, u64)> {
     let b = it.next().unwrap_or("0").parse().ok()?;
     let c = it.next().unwrap_or("0").parse().ok()?;
     Some((a, b, c))
+}
+
+fn remember_latest_discovered(version: &str) {
+    if let Ok(mut latest) = LATEST_DISCOVERED_VERSION.write() {
+        *latest = Some(version.to_string());
+    }
+}
+
+fn latest_discovered_version() -> Option<String> {
+    LATEST_DISCOVERED_VERSION
+        .read()
+        .ok()
+        .and_then(|latest| latest.clone())
+}
+
+fn staged_is_latest_discovered(staged: &str, latest: Option<&str>) -> bool {
+    latest.map(|version| version == staged).unwrap_or(true)
 }
 
 fn marker_path(app: &AppHandle) -> Option<PathBuf> {
@@ -701,8 +720,13 @@ fn valid_staged(app: &AppHandle) -> Option<StagedMarker> {
 pub fn staged_upgrade_version(app: &AppHandle) -> Option<String> {
     let marker = valid_staged(app)?;
     let current = app.package_info().version.to_string();
+    let latest = latest_discovered_version();
     match (parse_ver(&marker.version), parse_ver(&current)) {
-        (Some(staged), Some(cur)) if staged > cur => Some(marker.version),
+        (Some(staged), Some(cur))
+            if staged > cur && staged_is_latest_discovered(&marker.version, latest.as_deref()) =>
+        {
+            Some(marker.version)
+        }
         _ => None,
     }
 }
@@ -768,6 +792,9 @@ pub async fn check(app: &AppHandle) -> Result<Value, String> {
     if latest.is_empty() {
         return Ok(json!({ "current": current, "hasUpdate": false }));
     }
+    // 必须在检查结果返回、以及最新版开始下载前立即记录。这样一旦发现更高版本，
+    // 已暂存的中间版本便不再能被提示或应用。
+    remember_latest_discovered(&latest);
 
     let want = asset_name_for(&latest);
     let mut download_url = String::new();
@@ -1224,6 +1251,14 @@ fn install_headless_in_place(
 pub async fn apply_staged(app: AppHandle) -> Result<(), String> {
     let _operation = UPDATE_OPERATION_LOCK.lock().await;
     let marker = valid_staged(&app).ok_or("没有已下载好的更新")?;
+    if let Some(latest) = latest_discovered_version() {
+        if !staged_is_latest_discovered(&marker.version, Some(&latest)) {
+            return Err(format!(
+                "已发现更新版本 {latest}，将跳过已下载的中间版本 {}，请等待最新版下载完成",
+                marker.version
+            ));
+        }
+    }
     let extract_dir = PathBuf::from(&marker.dir);
     let marker_file = marker_path(&app).ok_or("更新标记路径不可用")?;
     let error_log = crate::nova_data_dir(&app).join("update-error.log");
@@ -1319,5 +1354,17 @@ pub fn cleanup_old() {
         if name.ends_with(".old") {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::staged_is_latest_discovered;
+
+    #[test]
+    fn downloaded_intermediate_version_is_ignored_after_latest_is_discovered() {
+        assert!(staged_is_latest_discovered("1.2.0", None));
+        assert!(staged_is_latest_discovered("1.3.0", Some("1.3.0")));
+        assert!(!staged_is_latest_discovered("1.2.0", Some("1.3.0")));
     }
 }
