@@ -38,7 +38,7 @@ fn final_note_enabled() -> bool {
     std::env::var("LYRA_FINAL_NOTE").ok().as_deref() != Some("off")
 }
 
-const FINAL_NOTE_DESCRIPTION: &str = "确信这是本任务最后一次工具调用时，把给用户的最终总结写在这里：工具结果返回后本轮立即结束，省去一个纯总结回合（不影响工具本身执行）。之后还需调用任何工具时禁止填写。";
+const FINAL_NOTE_DESCRIPTION: &str = "确信这是本任务最后一次工具调用时，填写给用户的最终回复；工具结果返回后本轮立即结束，之后还需调用任何工具时禁止填写。采用例外汇报：正常成功只写 1～3 句话的用户可感知结果，不列文件、过程、命令、常规细节或泛化建议；仅在失败、未验证、风险或用户需要行动时展开。";
 
 pub struct Tool {
     pub name: &'static str,
