@@ -1,0 +1,365 @@
+{
+  "ranAt": "2026-08-11T06:54:24.734Z",
+  "model": "opencode/deepseek-v4-flash/variant/high",
+  "source": "C:\\Users\\油彬\\.nova\\threads",
+  "arms": {
+    "A": "indexed legacy",
+    "B": "optimized no-index query-driven slice"
+  },
+  "rows": [
+    {
+      "test": {
+        "id": "18be7005-4",
+        "threadId": "18be7005-8eea-445f-9938-9eb3f17562cd",
+        "title": "fastcontext git训练",
+        "user": "帮我优化，然后使用deepseek用真实会话做一个AB测试，给我最终的回测报告",
+        "history": "用户: fastcontext可否通过git历史进行神经网络训练更准？\n\n助手: 可以，而且 **Git 历史非常适合提升 fast_context 的召回与排序准确率**。但不建议一开始就训练重型神经网络；通常先做“共改统计 + 学习排序”，性价比更高。\n\n### Git 历史可以提供的信号\n\n- **共改关系**：文件 A 修改时，文件 B 是否经常一起修改\n- **时间衰减**：近期提交比多年前提交权重更高\n- **提交语义**：commit message、需求号、缺陷号与代码符号的关联\n- **调用演化**：接口变更时，哪些调用方通常需要同步修改\n- **开发者行为**：同一任务中常访问或修改的模块\n- **变更类型**：修 Bug、重构、加功能对应不同的上下文扩展模式\n- **提交顺序**：先改定义、再改调用方、最后补测试等路径规律\n\n你当前描述中的“近 120 次提交高频共改文件”已经属于最基础的 Git 历史利用，只是它更像统计模型，而非神经网络。\n\n### 推荐的演进路线\n\n#### 1. 共改图，不需要神经网络\n\n构造文件或符号关系图：\n\n```text\n节点：文件、类、函数、测试\n边权：共改次数 × 时间衰减 × 提交可信度\n```\n\n例如：\n\n```text\nscore(A, B) =\n    co_change_count\n    × exp(-age / decay)\n    × inverse_commit_size\n```\n\n其中应降低“大规模格式化提交、批量重命名、合并提交”的权重，否则容易产生伪关联。\n\n这一阶段通常已经能显著改善 `IMPACT` 和候选文件召回。\n\n#### 2. Learning-to-Rank，最实用\n\n先由文本搜索、符号索引、调用图和共改图生成候选，再训练轻量排序模型。特征可以包括：\n\n- BM25/关键词相似度\n- embedding 相似度\n- import/use 距离\n- 调用图距离\n- Git 共改分数\n- 最近一次共改时间\n- 同目录、同模块、同测试单元\n- 提交信息与任务描述相似度\n- 文件大小和生成文件标记\n\n标签可从历史提交自动生成：\n\n```text\n输入：某次提交中的任务描述 + 首个修改文件\n正样本：该提交中其他实际修改文件\n负样本：候选中未修改的文件\n```\n\n模型不必是神经网络，LightGBM/XGBoost 往往就很好，而且：\n\n- 训练快\n- 可解释\n- 小仓库也能用\n- 容易发现错误特征\n- 可控制延迟\n\n#### 3. 图神经网络或神经排序模型\n\n数据量足够后，可以尝试：\n\n- GNN：融合调用图、依赖图、共改图\n- Cross-encoder：判断“任务描述—文件/符号”相关性\n- Two-tower：快速检索任务对应的代码单元\n- Transformer：学习历史变更序列\n\n不过，单个仓库通常数据不够。一个仓库可能只有几千到几万次有效提交，经过过滤后更少，容易过拟合。更合理的是：\n\n1. 在多个仓库上预训练通用模型；\n2. 对当前仓库做轻量适配；\n3. 将仓库实时共改统计作为额外特征。\n\n### 对 fast_context 最合适的架构\n\n建议采用混合检索，而不是让神经网络直接决定上下文：\n\n```text\n关键词/任务\n  ↓\n候选召回\n  ├─ 文本与符号索引\n  ├─ import/call graph\n  ├─ Git co-change graph\n  └─ embedding retrieval\n  ↓\n学习排序\n  ↓\n预算约束下选择完整代码单元\n  ↓\n输出 EDIT / DEPS / IMPACT / SIG\n```\n\n这样神经模型即使判断失误，仍有静态依赖和符号索引兜底。\n\n### 关键难点\n\n1. **Git 共改不等于代码依赖**  \n   两个文件可能只是因为一次大提交同时变化。\n\n2. **历史会固化错误习惯**  \n   如果过去经常漏改测试，模型也可能认为测试不重要，需要人为规则兜底。\n\n3. **数据泄漏**  \n   评估必须按时间切分，不能随机拆分提交，否则模型会“看到未来”。\n\n4. **冷启动**  \n   新仓库、新模块没有历史，要回退到静态分析和语义检索。\n\n5. **隐私与安全**  \n   commit message 可能含需求信息、账号或内部地址，训练前应脱",
+        "keywords": [
+          "fast_context",
+          "coupling",
+          "co-change",
+          "DeepSeek",
+          "session"
+        ],
+        "expectedPaths": [
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/nova-tools-mcp.test.mjs",
+          "scripts/nova-batch-tools.mjs",
+          "src-tauri/src/alkaid_complete.rs",
+          "src-tauri/src/nova_tools_native/context.rs",
+          "src/core.test.ts",
+          "lib/widget.test.ts"
+        ]
+      },
+      "A": {
+        "arm": "A",
+        "wallMs": 96318,
+        "finalText": "# 回测报告：fast_context 优化 + DeepSeek 真实会话 A/B（单次检索 dry-run）\n\n## 0. 执行边界\n\n按约束仅执行了 1 次 `fast_context`（`keywords=[\"fast_context\",\"coupling\",\"co-change\",\"DeepSeek\",\"session\"]`，`task=\"帮我优化…AB测试…回测报告\"`，`coupling=true`，budget=800），未调用 read/find_symbols/bash/edit/write，未修改任何文件。因此本报告 = **一次真实检索样本的 dry-run 回测 + 可落地的优化清单 + A/B 实验协议**；真实 DeepSeek 回放是后续可执行步骤，不在本次只读范围内。\n\n## 1. 结论先行\n\n1. **A 基线已具备且本样本表现良好**：返回 9 文件/23 块/492 行/24.5KB，预算内命中核心实现（`nova-batch-tools.mjs` 工具注册、`ctx-core/ctx-index` 检索索引、`context.rs` 原生实现与 coupling 测试）、DeepSeek 兼容配置（`alkaid` 的 `mergeAlkaidCompatDefaults`）、并检索出 2 处**存量回测报告 JSON**（IMPACT 38/67 行）——历史会话产物可复用，说明回测数据通道已经存在。\n2. **最大结构性缺口**：coupling 是\"事后备注\"，不参与排序与预算分配。`fast_context_run`（context.rs:4788-4801）先完成 `ranked` 再算 `co_changed_files`，且 `exclude=ranked`、top-3 硬编码——耦合文件永远只能出现在提示行，进不了 EDIT/IMPACT 正文。\n3. **DeepSeek 接入点已就绪**：alkaid 兼容层已支持 `sendSessionAffinityHeaders=true` + `thinkingFormat=\"deepseek\"`（真实会话亲和），做 A/B 裁判/标注无需新建链路。\n\n## 2. 检索证据解读\n\n- **EDIT**：`nova-batch-tools.mjs`（`normalizeFastContextArgs`/工具 schema，含 coupling 参数描述）、`nova-tools-mcp.test.mjs`（FULL）、两个 alkaid 测试（DeepSeek 会话亲和默认值断言）。\n- **DEPS**：`nova-context-client.mjs`（super/fast 模式路由）、`nova-napi-tools.mjs`（native 调用）、`ctx-core.mjs`（`searchText` 对 >128 文件分块并发、默认遵守 gitignore）、`ctx-index.mjs`（focused 模式仅扩一跳 import 的 `dependencyDepth` 边界）。\n- **IMPACT**：`co_changed_files` 两处调用——context.rs:2637（单 seed + header 标志，疑似独立查询工具）与 3872（多 target，fast_context_run 路径）；`settings.rs` 的 `fastContextEnabled` 开关；2 处存量 AB 报告 JSON。\n- **coupling 备注**：`nova-napi-tools.test.mjs`(5x)、`nova_tools_native/mod.rs`(4x)、`main.rs`(3x)。\n- **已知未展开缺口**：`co_changed_files` 打分体（2542 之后）未进入正文，**时间衰减/大提交过滤是否已实现无法在本样本内审计**——B 变体落地前需一次 SIG 补读。\n\n## 3. 优化建议（按性价比排序，均基于已见代码）\n\n- **P0｜coupling 提升为排序特征 + 预算感知扩展**：在 rank 阶段并入 co-change 分数，预算分配时给共改文件预留块；把硬编码 top-3 改为按剩余预算比例；保持 `exclude=已入选` 防自我重复（已有测试语义覆盖）。这是当前备注化设计唯一的结构性短板。\n- **P1｜共改统计加权**（承接上次对话）：`recency × exp(-age/decay)`、`inverse_commit_size`、过滤 merge/format/rename 大提交；窗口与 coupling 一致（近 120 次提交）。\n- **P2｜focused 索引边界用耦合扩展**：`getIndex` 当前只扩一跳 import；把 co-changed 文件并入 frontier，覆盖\"文本零耦合但同提交变更\"场景（`coupling_note_lists_co_changed_files` 测试已证明该场景真实存在）。\n- **P3｜会话级特征**：复用 alkaid session affinity 思路，把\"同任务内已访问文件\"作为正权重——真实会话回测可直接产出该标签。\n\n## 4. A/B 实验协议（DeepSeek + 真实会话）\n\n- **数据**：近 120 次提交（与 coupling 窗口对齐），过滤 merge/format/rename；单样本 = `task: commit subject+diffstat`、`seed: 首个修改文件`、`gold: 该提交实际修改文件集`。\n- **时间切分**：t<T 训练 coupling 权重，t≥T 评估（防泄漏）；排除与建立耦合同轮的提交。\n- **变体**：A=当前行为（coupling 仅备注）；B=P0+P1（coupling 入排序 + 时间衰减）。\n- **DeepSeek 角色**：走既有 openai-compatible 代理（session affinity 已配置）做 A/B 输出 pairwise 相关性判定 + 理由；或由 DeepSeek 从 diff 生成任务描述替代人工标注。\n- **指标**：Recall@K(3/5/10)、MRR、Precision、必要文件命中率、token 成本差；按 bugfix/refactor/feature 分层（commit message 启发式）。\n- **判定规则**：B 在 multi-file 提交上 Recall@5 提升 ≥5pt 且 Precision 下降 ≤3pt 即胜出；格式化/重命名类单独统计（预期 B 略降，由 P1 过滤抵消）。\n\n## 5. 本样本 dry-run 结果\n\n- A 基线：预算命中良好、核心文件全数召回、意外命中存量回测报告（高 precision）；**短板是 coupling 仅 3 行备注，`nova-napi-tools.test.mjs` 等共改文件正文未进入上下文**——本任务关键词本身与共改强相关，B 在此样本上的预期增益即把这些共改文件从备注提升为 EDIT/IMPACT 正文。\n- 未验证项：context.rs 打分体未展开，P1 是否已实现无法确认 → **A/B 的最终真实性以补读后为准**。\n\n## 6. 风险与下一步\n\n- 只读约束下未实际运行 DeepSeek 回放，指标为设计值 + 单样本 dry-run；存量 `fast-context-real-history-deepseek-ab.report.json`（2 处命中）若保留会与本次并存，最终报告需选定最新一份或合并去重。\n- Git 历史会固化历史坏习惯（如漏改测试），需规则兜底。\n\n**建议落地顺序**：SIG 补读 `co_changed_files` 打分体 → 落地 P0 → 按第 4 节协议跑 120 提交 A/B（DeepSeek 裁判）→ 输出全量回测报告替换本 dry-run。",
+        "contextChars": 26019,
+        "keywordRecall": 1,
+        "pathRecall": 0.625,
+        "keywordHits": [
+          "fast_context",
+          "coupling",
+          "co-change",
+          "DeepSeek",
+          "session"
+        ],
+        "pathHits": [
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/nova-tools-mcp.test.mjs",
+          "scripts/nova-batch-tools.mjs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "cacheRead": 6656,
+          "cacheWrite": 0,
+          "input": 8164,
+          "output": 7492
+        },
+        "stderr": ""
+      },
+      "B": {
+        "arm": "B",
+        "wallMs": 70127,
+        "finalText": "基于单次 fast_context 探针（原会话检索意图，`keywords=[\"fast_context\",\"coupling\",\"co-change\",\"DeepSeek\",\"session\"]`）的返回内容，给出诊断与回测报告。\n\n## 一、单次探针观测（本次约束下真实执行结果）\n\n本次调用即是一个数据点，实际走了 `algorithm=no-index-query-slice` 路径，观测到：\n\n| 指标 | 观测值 | 判定 |\n|---|---|---|\n| 覆盖级别 | `deadline-partial`，16468.4ms 撞线，12 候选文件 / 485KB | 扫描未完成 |\n| EDIT 目标集 | alkaid-core.mjs、codebuddy-bridge.mjs、nova-batch-tools.mjs、context.rs | 目标解析尚可（4/4 命中核心文件） |\n| DEPS | 0 files，无 DEPS 段 | 依赖闭包未建立 |\n| IMPACT | 2/2 条，且明显为噪声：`mkdir(sessionRoot)` 行 + 一条 DeepSeek 注释行 | 精度差 |\n| 共改耦合 | 未触发（本调用未开 `coupling`） | 信号缺失 |\n\n结论：检索意图命中方向正确，但输出质量被 deadline 主导——目标解析成功后就撞线，导致依赖闭包归零、IMPACT 退化为一对一图邻居的噪声行。\n\n## 二、代码层可证优化点（取自返回的 `fast_context_no_index` 函数体）\n\n1. **时间预算无分级**：`no_index_expand_forward`、`no_index_query_discover`（sweep）、2 轮 alias 反向切片、`no_index_backward_slice(2,20)` 互相抢占同一 deadline，撞线后 `dependencies` 为空、callers 截断。应改为分级预算：目标解析 → 正向依赖闭包 → 反向调用方 → 共改耦合，保证低级别工作被截断时高级别结果完整。\n2. **co-change 是末端 afterthought**：`co_changed_files(root, &targets, &exclude, 3, false)` 仅在 targets 非空且 `coupling=true` 时、输出末尾才计算，窗口硬编码为 3，且完全未参与候选排序。应把共改分数前移到候选排序与依赖闭包排序（配合上一轮讨论的时间衰减、剔除大提交）。\n3. **IMPACT 精度缺陷**：当前只按\"行不在已展示区间 && 非 import/use\"过滤，导致 mkdir 调用行与注释行混入。应要求 caller 行与目标符号的 locals 有真实交集，否则丢弃。\n4. **硬编码常量**（alias 2 轮、backward 切片 2/40、2/20、耦合窗口 3）应随 budget 自适应。\n\n## 三、DeepSeek 真实会话 A/B 协议（可直接执行规格）\n\n- **数据源**：真实会话即 `sessionRoot/sessions/{sessionId}.json`（`alkaid-bridge-common.mjs:15 sessionPath` / `:27 loadMessages`），抽取最近 N 个含 edit/write 工具调用的会话；ground truth = 会话中实际修改/读取的文件集合。\n- **变体**：A = 现状基线（no-index 路径）；B = 优化版（分级预算 + co-change 参与排序 + IMPACT 符号交集过滤）。\n- **裁判**：DeepSeek 作为 LLM-as-judge，对每个会话的两份输出打分：目标文件召回、依赖闭包完备度、IMPACT 有用性、字节效率（maxBytes 达标）、延迟/deadline 命中率。\n- **指标**：Hit@k、MAP、DEPS 覆盖率、IMPACT 精度、deadline-hit 率、DeepSeek 平均分。\n- **防泄漏**：按时间切分样本，B 的共改特征只用该会话之前的历史提交（与前述\"数据泄漏\"难点一致）。\n\n## 四、最终回测结论\n\n- **本次探针实测**：检索召回方向正确（EDIT 4 个目标文件均为真实核心实现），但 `deadline-partial` 直接导致 DEPS=0、IMPACT 噪声率 100%（2/2 条无效），co-change 信号完全未参与——即\"撞线降级\"与\"耦合未前移\"是当前两个最确定的质量瓶颈。\n- **预期 B 相对 A**：deadline 命中率下降、DEPS 覆盖率从 0 提升、IMPACT 精度显著上升、字节效率持平或更优。\n- **诚实声明**：本次为只读约束下的单次探针诊断，未实际运行 DeepSeek 裁判回测；以上即诊断结果 + 可直接执行的 A/B 协议，放开工具权限后按第三部分规格运行即可产出带 DeepSeek 打分的完整回测表。",
+        "contextChars": 21487,
+        "keywordRecall": 1,
+        "pathRecall": 0.625,
+        "keywordHits": [
+          "fast_context",
+          "coupling",
+          "co-change",
+          "DeepSeek",
+          "session"
+        ],
+        "pathHits": [
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/nova-tools-mcp.test.mjs",
+          "scripts/nova-batch-tools.mjs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "cacheRead": 6784,
+          "cacheWrite": 0,
+          "input": 5649,
+          "output": 4136
+        },
+        "stderr": ""
+      }
+    },
+    {
+      "test": {
+        "id": "3989321a-0",
+        "threadId": "3989321a-b5be-4474-a52c-b2fb658ced23",
+        "title": "lyra性能下降分析",
+        "user": "看下8号和9号的commit，为何加上后，lyra本身的执行速度慢了这么多？",
+        "history": "",
+        "keywords": [
+          "predictive prefetch",
+          "speculative",
+          "token estimate",
+          "retry",
+          "reasoning summary"
+        ],
+        "expectedPaths": [
+          "src-tauri/src/lyra/bridge.rs",
+          "src-tauri/src/lyra/agent.rs",
+          "bench/fixture/test/run.js",
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/nova-napi-tools.test.mjs",
+          "src-tauri/src/lyra/tools.rs",
+          "src-tauri/src/lyra/prompt.rs",
+          "a/src-tauri/src/context_service.rs"
+        ]
+      },
+      "A": {
+        "arm": "A",
+        "wallMs": 69717,
+        "finalText": "基于 fast_context 返回的代码（`src-tauri/src/lyra/agent.rs` 的 Speculative/spec_cache/estimate_text_tokens、`remote.rs` 的 PREFETCH_RECENT、以及 alkaid-slim-memory.mjs 的 token 估算），8号/9号 commit 引入的\"预测性预取 + 投机执行 + token 估算\"是拖慢 Lyra 自身执行的主因，按影响排序：\n\n**1. 工具调用投机预执行（speculative / predictive prefetch）——最可能的主因**\n`agent.rs` 里新增 `Speculative { args, handle: tokio::task::JoinHandle<ToolOutcome> }` 和 `spec_cache`（消息流内按工具调用序号缓存预执行句柄）。模型还在流式生成工具调用时，Lyra 就\"挽救式\"解析出参数并提前 spawn tokio 任务执行工具。但命中条件是**最终参数严格相等**——模型中途微调参数（很常见）时预执行结果作废，真实工具还要再跑一遍。后果：\n- 工具执行成本被翻倍（bash/read 等重工具尤其明显），预执行与模型流式生成抢占 CPU/IO，拖慢生成与每轮总耗时；\n- 严格相等命中率低，多数预执行是纯浪费。\n\n**2. 每次消息都重扫全历史的 token 估算——长会话呈平方级恶化**\n`estimate_text_tokens`/`count_text_chars` 是 O(字符数) 的逐字符扫描（ASCII/4 + 非ASCII）。若每条消息/每个工具结果后都对完整消息数组重算上下文 token，会话变长后累计开销是 O(消息数 × 累计字符数)，叠加在模型推理之前，每轮都增加可见延迟。JS 侧 `alkaid-slim-memory.mjs` 的 `estimateContextTokens`/`contextTokensFromMessages` 是同一模式。\n\n**3. checkpoint 全量回调落盘（次要但也在 agent.rs）**\n`Agent.checkpoint` 注释明确\"每条消息入列后以完整消息数组回调\"——每来一条消息就把整个历史克隆一遍并写盘，同样是 O(n²) 拷贝 + 磁盘 IO，消息一多每步都有明显开销。\n\n**可排除项**：`isRetryableCursorError` 重试逻辑只在错误路径生效，正常流程不消耗时间；`compactSlimMemory`/reasoning summary 属于 alkaid 侧，与 Lyra 自身执行无关。\n\n验证方向建议（未实际改动）：把预执行改为\"参数严格相等才复用、否则不预执行\"，或限制预执行只针对只读工具；token 估算改为增量累加/缓存上次结果而非每次全量重扫；checkpoint 改为增量增量块或节流。",
+        "contextChars": 24744,
+        "keywordRecall": 1,
+        "pathRecall": 0.375,
+        "keywordHits": [
+          "predictive prefetch",
+          "speculative",
+          "token estimate",
+          "retry",
+          "reasoning summary"
+        ],
+        "pathHits": [
+          "src-tauri/src/lyra/agent.rs",
+          "src-tauri/src/lyra/tools.rs",
+          "src-tauri/src/lyra/prompt.rs"
+        ],
+        "usage": {
+          "cacheRead": 4736,
+          "cacheWrite": 0,
+          "input": 7971,
+          "output": 3678
+        },
+        "stderr": ""
+      },
+      "B": {
+        "arm": "B",
+        "wallMs": 59115,
+        "finalText": "根据本次检索到的实现，8、9 号 commit 引入的“投机预执行 + token 估算”（agent.rs）和“retry + 上下文压缩摘要”（alkaid-context-reasonix.mjs）给 Lyra 每次执行叠加了几层热路径开销，慢主要来自以下几点：\n\n**1. 投机预执行（大概率 8 号 commit，agent.rs 的 `Speculative`/`spec_cache`）**\n- 每条消息里每个工具调用都会在“挽救式解析出参数”时立即 `tokio::spawn` 预执行真正的工具（shell/read/rg 这类重操作），并行占 CPU/磁盘。\n- 命中条件是“最终参数严格相等”，而实际调用几乎总会带上下文差异，命中率低 → 预执行大多白跑，但资源已经被消耗；多工具轮次还会叠加多次空跑。\n- 每条消息流开始前清空 `spec_cache`、每次工具调用都要进 `Arc<Mutex<HashMap>>` 登记/比对/join，增加每轮协调开销。\n\n**2. 中断轨迹 checkpoint 增量落盘（agent.rs 的 `checkpoint` 钩子）**\n- “每条消息入列后以完整消息数组回调”持久化：每入列一条消息就序列化一遍全部历史消息并写盘，一轮任务 N 条消息就是 O(N²) 的 JSON 序列化 + 磁盘写，长任务里非常可观。\n\n**3. 每轮模型/工具循环后都做上下文维护并同步落盘（reasonix.mjs 的 `prepareNextTurnWithContext`）**\n- 每个 tool round 后测量 token、算压力档、可能 `compactNativeToolResults`，然后 **await `saveSlimMemory` 同步写盘**；再加上 stableHash(system prompt/tool schema/history)、`contextTokensFromMessages` 全量扫描，都是串行插在热路径上的。\n\n**4. 上下文压缩时插入额外 LLM 摘要调用（`compactSlimMemory`）**\n- 压力档到 snip/elide/force 时，会 `createAlkaidAgent` 起一个**全新 agent 运行时**跑一次摘要 LLM，并在当前轮内 await 完成——这是硬性多一次模型往返，本身就要多花几十秒到几分钟。\n\n**5. 辅助开销**\n- `runAlkaidPromptWithRetry` 的 retry 状态机、`settlePendingInput` 每轮结束时至少 25ms 的静默轮询、以及 idle-timeout 对每个事件的 touch 记账。\n\n其中**白跑的投机预执行（1）**和**每消息全量落盘（2）**是“执行速度变慢”最直接的原因，而**摘要 LLM 往返（4）**是单轮内最不可控的放大项。若想恢复速度，优先考虑：投机预执行只在确定性工具上启用并加参数相似度兜底、checkpoint 改为阈值/定时批量落盘、把每轮同步持久化改异步。\n\n注：以上为基于检索到的当前实现的反推（commit 边界与改动点未能逐条核对到 git log），如需精确定位可后续用 git 对比 8/9 号提交的具体 diff。",
+        "contextChars": 30012,
+        "keywordRecall": 1,
+        "pathRecall": 0.375,
+        "keywordHits": [
+          "predictive prefetch",
+          "speculative",
+          "token estimate",
+          "retry",
+          "reasoning summary"
+        ],
+        "pathHits": [
+          "src-tauri/src/lyra/bridge.rs",
+          "src-tauri/src/lyra/agent.rs",
+          "scripts/alkaid-context-super.test.mjs"
+        ],
+        "usage": {
+          "cacheRead": 4736,
+          "cacheWrite": 0,
+          "input": 8220,
+          "output": 2983
+        },
+        "stderr": ""
+      }
+    },
+    {
+      "test": {
+        "id": "719d5639-17",
+        "threadId": "719d5639-3e22-4d03-83eb-193e5fa5fd33",
+        "title": "fastcontext工具耗时分析",
+        "user": "基于这个和fastcontext的8-9号变动，看看有无优化的方法",
+        "history": "用户: 看下这两个fastcontext工具浪费了多少时间\n\n助手: 我把两个压缩包对过了：它们不是两次独立运行，而是**同一个 Lyra 会话的两种日志格式**：\n\n- `2ce2...zip`：会话记录\n- `lyra-...slim.zip`：模型上下文记录，包含更准确的工具调用起止时间\n\n## 时间统计\n\n这个会话共调用了 **6 次 `fast_context`**：\n\n| 次数 | 耗时 | 输出量 | 评价 |\n|---|---:|---:|---|\n| 1 | 2分56.5秒 | 10.1K 字符 | 搜索偏题，未命中 `data-datasource` |\n| 2 | 1分04.2秒 | 12.7K 字符 | 仍未定位正确页面，随后继续搜索 |\n| 3 | 4分07.5秒 | 27.6K 字符 | 最终找到 SourcesMetrics 页面 |\n| 4 | 2分55.3秒 | 56.3K 字符 | 实施前的大范围上下文 |\n| 5 | 44.1秒 | 40.9K 字符 | 与第4次高度连续，可合并/精准读取 |\n| 6 | 2分32.2秒 | 29.4K 字符 | 为十几行修复读取了较大上下文 |\n\n### 合计\n\n- **Fast Context 等待时间：14分19.7秒**\n- 整个会话三轮总耗时：**23分00.5秒**\n- Fast Context 占总耗时：**62.3%**\n- Fast Context 总输出：约 **17.7万字符**\n\n分轮来看：\n\n- 第一轮澄清：Fast Context **8分08秒**，占该轮 **87.2%**\n- 第二轮实施：Fast Context **3分39秒**，占该轮 **35.0%**\n- 第三轮修复：Fast Context **2分32秒**，占该轮 **78.5%**\n\n## 明确浪费了多少\n\n保守计算，明确可以避免的重复/低效调用：\n\n1. 前两次搜索方向不准，最终还得第三次重新搜：**4分00.7秒**\n2. 第4次已经返回 56K 上下文，紧接着又调用第5次补 41K：至少 **44.1秒**\n3. 第6次针对很小的修复返回 29K 内容，明显过重；预计至少可节省 **1～2分钟**\n\n因此：\n\n- **可明确认定的浪费：至少 4分45秒**\n- 加上明显过度读取，合理估计浪费约：**6～8分钟**\n- 极限上，全部 Fast Context 本身占用了：**14分20秒**\n\n核心问题不是单次慢，而是：\n\n- 搜索词连续试错；\n- 首轮连续调用 3 次；\n- 已拿到大上下文后又补调；\n- 小修复仍使用大范围上下文；\n- 输出过大，进一步推高后续模型处理时间。",
+        "keywords": [
+          "fast_context",
+          "CTX",
+          "IMPACT",
+          "maxBytes",
+          "budget"
+        ],
+        "expectedPaths": [
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/cursor-bridge.test.mjs",
+          "src-tauri/src/lyra/provider.rs",
+          "src-tauri/src/threads.rs",
+          "scripts/alkaid-core.mjs",
+          "src-tauri/src/nova_tools_native/context.rs",
+          "src-tauri/src/lyra/prompt.rs"
+        ]
+      },
+      "A": {
+        "arm": "A",
+        "wallMs": 52149,
+        "finalText": "基于 fast_context 当前实现（`ctx-core.mjs`/`ctx-index.mjs`/`alkaid-core.mjs`/`nova-batch-tools.mjs`）与该会话实测的 14分20秒 / 17.7万字符数据，优化空间分三类，按 ROI 排序：\n\n## 一、直接命中\"浪费最大项\"：首轮连续 3 次试错搜索（8分08秒）\n\n根因在工具侧：`searchText` 用 `-F` 精确匹配（ctx-core.mjs:140），`data-datasource` 这类关键词一旦拼写/命名不一致就零命中，agent 只能重试。\n\n- **零命中自动降级**：`searchText` 命中数为 0 时，自动用 `-i`（忽略大小写）和子串模式重试一次，并在输出里标注\"原词无精确命中，以下为近似结果\"。可把前两次偏题搜索压缩成一次。\n- **文件名相似度兜底**：`getIndex` 已有 `subjectTerms` 匹配 base filename（ctx-index.mjs:881），但只在 `matchTerms.length>=4` 才生效。把阈值降到 2，并在 CTX MISS 时附 top-N 候选文件（按文件名相似度 + 最近修改时间排序），替代现在\"空手等 agent 重搜\"。\n\n## 二、命中\"连续冗余大调用\"：第 4→5 次（56K+41K 高度重叠）\n\n工具是无状态远程端点（`callContextToolOrLocal` → `callGlobalContextTool`，nova-context-client.mjs:54），每次调用全量重建，无法感知\"上次已给过什么\"。\n\n- **降低默认 maxBytes**：当前默认 32768（alkaid-core.mjs:26 附近 `FAST_CONTEXT_OUTPUT_MAX_BYTES=64K`，agent 侧默认 32768）。实测第 4 次给了 56K——agent 手动调大了。把默认压到 16–20K，让\"连续补调\"的成本自然变高，倒逼 agent 用 `files` 精读而非重搜。\n- **输出尾部附\"已覆盖清单\"**：返回里已有 `# 契约`/`## DEPS` 头。再在末尾加一行\"本次已包含 X/Y/Z 完整单元，后续如需同一区域请用 files 精读，勿重调 fast_context\"，把规则从 system prompt 下沉到工具输出本身。\n\n## 三、命中\"小修复大上下文\"：第 6 次（十几行修复读了 29K）\n\n- **按任务规模自动定档**：native 侧可根据 `keywords/task` 长度 + 是否带 `files` 推断改动粒度；只有 `files` 无 `keywords` 且文件数 ≤2 时，自动用小 budget（如 maxBytes 12K / budget 300），不必等 agent 手动调参。\n- **闭包扩展按预算收敛**：PROOF 机制会算任务闭包（本次解析 9 个定义）。对\"小修复\"场景，限制依赖展开深度（`dependencyDepth` 目前 focused 模式默认 1），并优先直接依赖、命中预算即停——避免为十几行改动把整个调用链拉进来。\n\n## 成本面（次要）\n\n- `getIndex` 每次调用都 `listCodeFiles` + `cacheEntryFresh` stat 全仓再扫描 stale 文件（ctx-index.mjs:893-911）。同一进程内 `memo` 有缓存，但跨调用/跨进程会重扫。若 native 是每调用新进程，加一个进程内 LRU（keyword→rows、文件→符号）可显著降低第 4→5 次这类近重复调用的耗时。\n\n## 结论\n\n**收益最大且改动最小的是第一类**：零命中自动降级 + CTX MISS 候选文件，直接消灭\"搜索试错\"这一占总耗时 87%（首轮）的浪费。第二类靠降低默认输出预算即可，第三类属于锦上添花。真正的杠杆其实在 agent 侧——工具描述里已有\"已展示视为已读、勿重调\"等约束，但实测仍出现连续大调用，把约束从 prompt 下沉到输出内容里（第二类第 2 条）比改检索逻辑更可靠。\n\n以上均为分析建议，未修改任何文件。",
+        "contextChars": 29183,
+        "keywordRecall": 1,
+        "pathRecall": 0.75,
+        "keywordHits": [
+          "fast_context",
+          "CTX",
+          "IMPACT",
+          "maxBytes",
+          "budget"
+        ],
+        "pathHits": [
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/cursor-bridge.test.mjs",
+          "src-tauri/src/lyra/provider.rs",
+          "src-tauri/src/threads.rs",
+          "scripts/alkaid-core.mjs"
+        ],
+        "usage": {
+          "cacheRead": 6144,
+          "cacheWrite": 0,
+          "input": 9239,
+          "output": 3349
+        },
+        "stderr": ""
+      },
+      "B": {
+        "arm": "B",
+        "wallMs": 65974,
+        "finalText": "基于这次 fast_context 返回的内容（当前实现 + 算法标注），结合你前面测出的 14分20秒等待 / 62.3% 占比，可以给出几个直接对症的优化点。\n\n## 返回内容里直接坐实的三个事实\n\n1. **算法是「无持久化索引 / 查询驱动候选」**，且本次扫描 `10 candidate files / 1005003 bytes / 6272.8ms deadline reached / coverage=deadline-partial`——每次调用都要现扫约 1MB 候选文件，到 6.3 秒截止线就放弃、声明「未覆盖全仓」。这正是单次调用慢的根因，也解释了前两次搜索方向不准时为何要花 4 分钟重试。\n2. **`fast_context` 有隐藏的二次全量重跑**：`anchor_correction` 命中 typo 时会用 `_anchorRetry` 再跑一次完整的 `fast_context_run`。也就是说一次调用最坏 = **2 次全量扫描 + 2 次截止线**，输出还会在前面加 `# 锚点更正` 头、与重试输出叠加——和你测到的「搜索重试浪费 4 分」完全对得上，且输出可能翻倍。\n3. **字节预算只在「完整文件/单元边界」收敛**：工具自身上限是 `FAST_CONTEXT_OUTPUT_MAX_BYTES = 64KB`，默认 maxBytes 才 32KB，但一个单元就能顶到 56KB 直接溢出预算。这解释了你看到的 56K/41K/29K 大输出——「为十几行修复读 29K」不是模型贪，是工具给得出。\n\n## 优化方法（按收益排序）\n\n1. **把锚点更正从「全量重跑」降级为「轻量探测」**：重试前先用单条符号定位（或索引查证）确认建议锚点确有生产命中且置信度足够，再决定是否走第二次全量扫描；重试输出和原输出合计不得超过 maxBytes（现在等价于 2× 预算）。这条直接吃掉「搜索重试 4 分钟」里的大部分。\n2. **建增量符号索引，替换查询驱动全扫**：工具描述里写着「增量符号索引」，实际算法却标注「无持久化索引」。哪怕只做每仓一个轻量 symbol→file:line 增量索引，也能把 6.3 秒级扫描压到毫秒级，顺带消除 `deadline-partial` 的覆盖不确定性和每次调用 `coverage` 头部。这是对「14 分 20 秒总量」的系统性修复。\n3. **输出加硬截断收尾**：单元边界收敛之外，再对总输出做一次字节级截断并附 `…(截断, 还剩N单元)` 标记，保证 maxBytes 是硬上限而不是软建议。直接消灭 29K/56K 这类超预算输出，也降低后续模型处理开销。\n4. **候选排序优化「60 hits」截断**：候选枚举按命中数截断但未体现搜索词特异度，导致首两次调用「偏题、未命中目标页面」被迫重试。改为按符号特异性 + 文件热度/体积排序后再截断，减少「搜错再搜」。\n5. **加 `resume/续读` 增量模式**：第 4→5 次连续调用（44 秒）本质是模型拿到大输出后发现缺一块又全量补调。支持传上次 CTX 标识 + 需要的单元，只返回增量部分，而非重新扫描。\n6. **透出耗时与覆盖度**：返回头里已有 `scan ms` 和 `coverage`，可让模型在 `deadline-partial` 时主动判断是否需要补调或换检索词，而不是盲目再搜一次。\n\n一句话总结：**最贵的不是单次慢，而是「无索引全扫 + 隐藏重跑 + 软预算」三者叠加**；改动 1、2、3 就能覆盖你实测浪费的绝大部分。若要落地，建议先做 1（改动最小、收益最直接），再做 2（架构级）。\n\n（本次按评测约束只做分析、未改任何文件。）",
+        "contextChars": 12471,
+        "keywordRecall": 1,
+        "pathRecall": 1,
+        "keywordHits": [
+          "fast_context",
+          "CTX",
+          "IMPACT",
+          "maxBytes",
+          "budget"
+        ],
+        "pathHits": [
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/cursor-bridge.test.mjs",
+          "src-tauri/src/lyra/provider.rs",
+          "src-tauri/src/threads.rs",
+          "scripts/alkaid-core.mjs",
+          "src-tauri/src/nova_tools_native/context.rs",
+          "src-tauri/src/lyra/prompt.rs"
+        ],
+        "usage": {
+          "cacheRead": 6144,
+          "cacheWrite": 0,
+          "input": 3642,
+          "output": 3371
+        },
+        "stderr": ""
+      }
+    },
+    {
+      "test": {
+        "id": "e09fd327-8",
+        "threadId": "e09fd327-9a4a-4a2d-bf80-965570bfedfa",
+        "title": "fastcontext性能问题",
+        "user": "可否研究下别的算法改进？",
+        "history": "用户: 在一个1万文件的仓库里，fastcontext为何这么慢，已经指明了files只有一个文件，结果还是运行了几十分钟\n\n助手: `fast_context.files` 通常只是“**指定必须读取的入口文件**”，并不是“**只允许访问这个文件**”。即使只传一个文件，它仍可能执行仓库级工作：\n\n1. **首次构建或更新符号索引**  \n   扫描仓库内可索引文件，建立定义、引用、import/use 关系。1 万文件在 Windows 上遇到大量小文件、杀毒软件实时扫描时会很慢。\n\n2. **计算跨文件依赖和 IMPACT 调用方**  \n   为找出入口文件引用了谁、又被谁引用，必须查询甚至扫描其他文件。\n\n3. **处理 `keywords` 和 `task` 的全仓检索**  \n   `files` 不一定会限制关键词搜索范围。关键词过于常见时，候选结果可能非常多。\n\n4. **开启 `coupling: true` 时分析 Git 共改历史**  \n   这会额外读取最近提交及文件变更关系，大仓库或 Git 状态较差时开销明显。\n\n5. **`budget` / `maxBytes` 只限制返回内容，不限制扫描量**  \n   把它们调小，通常不能解决前置索引和检索耗时。\n\n不过，**几十分钟仍然不正常**，更像是以下问题之一：\n\n- 冷启动索引每次都在重建，增量索引缓存未命中或无法写入；\n- `.gitignore` 没排除生成目录、依赖目录、缓存目录；\n- 仓库位于机械盘、网络盘，或被 Defender/杀毒软件逐文件扫描；\n- 某些超大文件、Git 历史或符号解析器卡住；\n- `files` 没有被实现为检索边界，导致仍进行了完整仓库分析；\n- 工具缺少阶段超时，某一步异常后一直等待。\n\n### 建议用法\n\n如果路径已经明确，只需要读这个文件，**不要使用 `fast_context`**，直接：\n\n```text\nread(path=..., offset=..., limit=...)\n```\n\n只有确实需要依赖、调用方或跨文件影响分析时才用：\n\n```json\n{\n  \"files\": [\"明确路径\"],\n  \"keywords\": [\"精确符号名\"],\n  \"task\": \"查找该符号的直接定义、依赖和调用方\",\n  \"coupling\": false,\n  \"budget\": 300,\n  \"maxBytes\": 16384\n}\n```\n\n如果只想知道定义或引用的行号，使用 `find_symbols`，通常比 `fast_context` 更合适。\n\n### 如何判断具体卡在哪里\n\n用同样参数连续执行两次：\n\n- **第一次慢、第二次快**：主要是冷索引问题；\n- **每次都慢**：缓存失效、全仓重复扫描或某阶段卡住；\n- **关闭 `coupling` 后明显变快**：Git 历史分析是瓶颈；\n- **直接 `read` 秒开而 `fast_context` 很慢**：不是目标文件读取慢，而是索引、依赖或 IMPACT 分析慢。\n\n归根结底：传一个 `files` 并不等价于单文件模式。对“已知单文件”的场景，`read` 才是有严格成本边界的工具；`fast_context` 应增加真正的 `scope/filesOnly` 选项以及索引、检索、依赖分析各阶段的耗时日志和超时，否则这种行为很难定位。\n\n用户: 那有什么办法能让fastcontext秒出结果，太慢了就没有意义了\n\n助手: 有办法，但要先明确：**按当前接口，`files` 不是硬性的扫描范围，`budget/maxBytes` 也只限制输出，无法保证秒出。**  \n如果单文件还跑几十分钟，这不是“仓库有 1 万文件”的正常成本，而是索引、全仓依赖分析或缓存机制出了问题。\n\n## 立即可用的做法\n\n### 1. 已知文件，只读内容：直接用 `read`\n\n这是唯一能严格保证工作量只和该文件相关的方式：\n\n```text\nread(path=\"src/xxx.ts\", offset=1, limit=300)\n```\n\n不要为了读取单个文件调用 `fast_context`。\n\n### 2. 必须使用 `fast_context` 时，尽量压缩工作\n\n```json\n{\n  \"files\": [\"src/xxx.ts\"],\n  \"keywords\": [\"精确的函数名或类名\"],\n  \"task\": \"仅提取该文件中目标符号的完整实现和直接 import，不做调用方、Git 共改或全仓扩展\",\n  \"coupling\": false,\n  \"budget\": 200,\n  \"maxBytes\": 12000\n}\n```\n\n关键点：\n\n- `coupling: false`\n- 使用唯一、精确的符号名，不要使用 `service`、`config` 之类高频词\n- `files` 使用仓库内精确相对路径\n- 明确要求不做调用方和全仓扩展\n\n但要注意：最后一项只是任务提示，**如果工具内部始终构建 IMPACT/索引，它仍然可能慢**。\n\n### 3. 只需要位置：使用 `find_symbols`\n\n如果只是寻找定义或引用行号：\n\n```json\n{\n  \"names\": [\"ExactClassName\", \"exactFunctionName\"]\n}\n```\n\n它比打包正文、依赖和 IMPACT 的 `fast_context` 更合适。\n\n---\n\n## 真正让 `fast_context` 秒出的方案\n\n如果你能修改工具实现，最重要的不是调 `budget`，而是增加以下机制。\n\n### 1. 增加真正的 `filesOnly` 模式\n\n例如：\n\n```json\n{\n  \"files\": [\"src/xxx.ts\"],\n  \"scope\": \"files-only\",\n  \"includeDependencies\": false,\n  \"includeImpact\": false,\n  \"coupling\": false\n}\n```\n\n这个模式必须在代码层面保证：\n\n- 不遍历仓库；\n- 不初始化全仓符号索引；\n- 不搜索调用方；\n- 不读取 Git 历史；\n- 只解析传入文件；\n- 最多解析该文件的直接 import。\n\n这是单文件场景最有效的优化。仅靠在 `task` 中写“只读这个文件”不够，必须做成硬参数。\n\n### 2. 索引必须移出请求链路\n\n错误模式：\n\n```text\n收到请求\n→ 扫描 1 万文件\n→ 检查或重建索引\n→ 做查询\n→ 返回\n```\n\n正确模式：\n\n```text\n后台常驻索引服务\n→ 文件变化时增量更新\n→ 请求只查询已存在索引\n→ 数百毫秒返回\n```\n\n要求包括：\n\n- 索引持久化，进程重启后继续使用；\n- 按文件 `mtime + size` 或内容哈希增量更新；\n- 不要因为 Git `HEAD` 变化就重建全仓索引；\n- 删除、重命名文件单独增量处理；\n- 请求到来时不得同步全量重建。\n\n如果索引无效，可以先降级返回文件内容，后台重建，而不是阻塞几十分钟。\n\n### 3. 增加硬性时间预算和降级策略\n\n例如给请求设置：\n\n```text\n总预算：2 秒\n文件读取：200 ms\n索引查询：500 ms\n依赖扩展：500 ms\nIMPACT：500 ms\n```\n\n超过预算后：\n\n1. 先返回指定文件；\n2. 跳过间接依赖；\n3. 跳过 IMPACT；\n4. 跳过 Git coupling；\n5. 在结果里注明哪些阶段因超时被省略。\n\n上下文不够完整，通常也比几十分钟后才返回有价值。\n\n### 4. `files` 应当先走快速路径\n\n工具收到非空 `files` 后，应先判断：\n\n```text\n只需要文件内",
+        "keywords": [
+          "fast_context",
+          "find_symbols",
+          "symbol index",
+          "IMPACT"
+        ],
+        "expectedPaths": [
+          "scripts/nova-batch-tools.mjs",
+          "scripts/audit-native-context-random.mjs",
+          ".test.ts",
+          "scripts/ctx-core.mjs",
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/ctx-core.test.mjs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ]
+      },
+      "A": {
+        "arm": "A",
+        "wallMs": 40111,
+        "finalText": "",
+        "contextChars": 22355,
+        "keywordRecall": 1,
+        "pathRecall": 0.75,
+        "keywordHits": [
+          "fast_context",
+          "find_symbols",
+          "symbol index",
+          "IMPACT"
+        ],
+        "pathHits": [
+          "scripts/nova-batch-tools.mjs",
+          "scripts/ctx-core.mjs",
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/ctx-core.test.mjs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "cacheRead": 3968,
+          "cacheWrite": 0,
+          "input": 47,
+          "output": 177
+        },
+        "stderr": ""
+      },
+      "B": {
+        "arm": "B",
+        "wallMs": 58671,
+        "finalText": "基于本次 fast_context 返回的内容（`algorithm=no-index-query-slice coverage=deadline-partial`，命中 `src-tauri/src/nova_tools_native/context.rs`、`scripts/alkaid-core.mjs`、`scripts/nova-batch-tools.mjs` 等），可以做算法改进，而且有几个关键线索比\"上一轮建议\"更具体：\n\n## 从返回内容看到的真实瓶颈\n\n1. **瓶颈不在全仓扫描，而在候选文件的解析/索引**：本次运行只扫了 12 个候选文件（728KB），却花了 6348ms 直接打满 deadline。也就是说即使候选集已经很小，单次查询仍然慢——问题出在\"拿到候选后怎么处理\"，而不是\"扫了多少文件\"。\n2. **find_symbols 存在过度建设**：`context.rs:2685` 的 `find_symbols` 在拿到 wanted（有命中的文件集合）后，仍调用 `build_index(root, Some(&wanted), ...)` 构建符号索引，但它最终只输出 defs 前 6 条 + hits 前 24 条。为这么低精度需求构建完整索引，属于过度建设。\n3. **重复的不变量查询**：`find_symbols` 每次请求都在线程里重跑 `list_code_files` + `search_text` + `short_rev`；这些在 root/HEAD/文件 mtime 未变时结果完全一样，没有跨查询缓存。\n4. **no-index 路径已存在**：`fast_context`（context.rs:3899）已分流到 `fast_context_no_index`，且已有 `anchor_correction` 锚点自动更正重试——说明\"锚点定位\"基础设施已经在了，可以往这个方向加深。\n\n## 值得研究的算法改进（按 ROI 排序）\n\n1. **轻量倒排/指纹层，替代每次查询的全文搜索**：不建完整符号索引，只做一次全仓 token 级倒排（term → files）或每文件词位图（bloom filter），按 `(path, mtime, size)` 增量维护并持久化。查询 = posting 交集 → 候选文件数从全仓降到真正含关键词的文件。成本比符号索引低一个量级（只需词法切分，不要语法解析）。\n2. **find_symbols 减配**：wanted 确定后只做\"定义行提取\"（轻量 sig/def 正则），删掉 `build_index` 这一段；defs/hits 都只取前几十条，精度要求低，不需要完整索引。\n3. **先 slice 后 parse**：既然 12 个候选文件就 6.3s，说明深度解析是主成本。应把 `search_text` 的结果按 (文件, 命中数) 排序，只深度解析命中数最高的少数文件，每文件设独立超时，超时降级为行级输出——而不是把所有候选都解析一遍。\n4. **复用不变数据**：`list_code_files` / `short_rev` / 无变更文件的命中行按 `root+HEAD+mtime` 做秒级 TTL 缓存，跨查询共享；当前每个请求都重算。\n5. **锚点优先**：已有 `anchor_correction`，可把\"精确标识符关键词\"优先走 token 级锚点定位（只查倒排定位定义文件），定位失败才回退全文搜索。这比 `files` 更可靠地解决上一轮\"files 不是硬边界\"的问题。\n\n## 需要先确认再定稿的点\n\n本次返回是 `deadline-partial`，`fast_context_no_index` 函数体、`build_index` 内部、以及索引缓存层都没有展开——第 1/4 条是否已有部分实现，必须补读 `context.rs` 里 `fast_context_no_index`、`build_index` 两个函数体才能确定，否则可能重复建设。建议下一步用 `files:[\"src-tauri/src/nova_tools_native/context.rs\"]` + 这两个符号名再跑一次 fast_context 确认现状后，再选定 1–2 条实施。",
+        "contextChars": 13244,
+        "keywordRecall": 1,
+        "pathRecall": 0.875,
+        "keywordHits": [
+          "fast_context",
+          "find_symbols",
+          "symbol index",
+          "IMPACT"
+        ],
+        "pathHits": [
+          "scripts/nova-batch-tools.mjs",
+          "scripts/audit-native-context-random.mjs",
+          "scripts/ctx-core.mjs",
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/ctx-core.test.mjs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "cacheRead": 8192,
+          "cacheWrite": 0,
+          "input": 3678,
+          "output": 4171
+        },
+        "stderr": ""
+      }
+    }
+  ],
+  "totals": {
+    "A": {
+      "cases": 4,
+      "success": 4,
+      "avgWallMs": 64573.75,
+      "avgKeywordRecall": 1,
+      "avgPathRecall": 0.625,
+      "totalTokens": 61621
+    },
+    "B": {
+      "cases": 4,
+      "success": 4,
+      "avgWallMs": 63471.75,
+      "avgKeywordRecall": 1,
+      "avgPathRecall": 0.71875,
+      "totalTokens": 61706
+    }
+  }
+}
