@@ -49,13 +49,10 @@ function loadCases() {
         ...(item.locations ?? []).map((location) => location.path).filter(Boolean),
         ...extractPaths(JSON.stringify(item.content ?? "")),
       ]);
-      const historicalPaths = [...new Set([...extractPaths(originalOutput), ...laterPaths].map((p) => p.replaceAll("\\", "/")))].slice(0, 12);
-      // Deleted fixtures and old-worktree paths are impossible to retrieve from this checkout.
-      const expectedPaths = historicalPaths.filter((p) => existsSync(join(REPO, p)));
-      const unavailablePaths = historicalPaths.filter((p) => !existsSync(join(REPO, p)));
+      const expectedPaths = [...new Set([...extractPaths(originalOutput), ...laterPaths].map((p) => p.replaceAll("\\", "/")))].slice(0, 8);
       const history = items.slice(0, i).filter((item) => ["user", "assistant"].includes(item.type) && asText(item)).slice(-6)
         .map((item) => `${item.type === "user" ? "用户" : "助手"}: ${asText(item).slice(0, 1800)}`).join("\n\n");
-      cases.push({ id: `${thread.id.slice(0, 8)}-${i}`, threadId: thread.id, title: thread.title, user: asText(items[i]), history, keywords, historicalPaths, expectedPaths, unavailablePaths });
+      cases.push({ id: `${thread.id.slice(0, 8)}-${i}`, threadId: thread.id, title: thread.title, user: asText(items[i]), history, keywords, expectedPaths });
       break;
     }
   }
@@ -76,8 +73,7 @@ function runOne(test, arm) {
       const evidence = `${contextText}\n${finalText}`;
       const keywordHits = test.keywords.filter((term) => evidence.toLowerCase().includes(term.toLowerCase()));
       const pathHits = test.expectedPaths.filter((term) => evidence.toLowerCase().includes(term.toLowerCase()));
-      const retrievalMs = Number(contextText.match(/# scan:[\s\S]*?\/ ([\d.]+)ms/)?.[1] ?? NaN);
-      resolveRun({ arm, wallMs: Date.now() - started, retrievalMs: Number.isFinite(retrievalMs) ? retrievalMs : null, finalText, contextChars: contextText.length, keywordRecall: keywordHits.length / test.keywords.length, pathRecall: test.expectedPaths.length ? pathHits.length / test.expectedPaths.length : null, keywordHits, pathHits, usage, stderr: stderr.slice(-800), ...extra });
+      resolveRun({ arm, wallMs: Date.now() - started, finalText, contextChars: contextText.length, keywordRecall: keywordHits.length / test.keywords.length, pathRecall: test.expectedPaths.length ? pathHits.length / test.expectedPaths.length : null, keywordHits, pathHits, usage, stderr: stderr.slice(-800), ...extra });
     };
     const timer = setTimeout(() => finish({ timeout: true }), TIMEOUT_MS);
     child.stdout.on("data", (chunk) => {
@@ -88,14 +84,7 @@ function runOne(test, arm) {
         if (event.type === "item" && event.item?.type === "agent_message") finalText = event.item.text ?? finalText;
         if (event.type === "item" && event.item?.type === "mcp_tool_call") {
           const serialized = JSON.stringify(event.item);
-          if (serialized.includes("fast_context")) {
-            contextText = serialized;
-            const result = event.item.result?.content;
-            if (Array.isArray(result)) {
-              const direct = result.map((entry) => entry?.text ?? entry?.content?.text ?? "").join("\n");
-              if (direct) contextText = direct;
-            }
-          }
+          if (serialized.includes("fast_context")) contextText += serialized;
         }
         if (event.type === "done") { usage = event.usage ?? null; finish(); }
         if (event.ok === false) finish({ error: event.error ?? event });
@@ -119,18 +108,9 @@ for (const test of cases) {
 }
 const tokenCount = (run) => Object.values(run.usage ?? {}).filter(Number.isFinite).reduce((a, b) => a + b, 0);
 const aggregate = (arm) => {
-  const values = rows.map((row) => row[arm]);
-  const validRetrieval = values.map((run) => run.retrievalMs).filter(Number.isFinite);
-  const average = (items) => items.length ? items.reduce((sum, value) => sum + value, 0) / items.length : null;
-  return {
-    cases: values.length,
-    success: values.filter((run) => !run.timeout && !run.error && !run.exitCode).length,
-    avgWallMs: average(values.map((run) => Number(run.wallMs ?? 0))),
-    avgRetrievalMs: average(validRetrieval),
-    avgKeywordRecall: average(values.map((run) => Number(run.keywordRecall ?? 0))),
-    avgPathRecall: average(values.map((run) => Number(run.pathRecall ?? 0))),
-    totalTokens: values.reduce((sum, run) => sum + tokenCount(run), 0),
-  };
+  const runs = rows.map((row) => row[arm]);
+  const avg = (key) => runs.reduce((sum, run) => sum + Number(run[key] ?? 0), 0) / runs.length;
+  return { cases: runs.length, success: runs.filter((run) => !run.timeout && !run.error && !run.exitCode).length, avgWallMs: avg("wallMs"), avgKeywordRecall: avg("keywordRecall"), avgPathRecall: avg("pathRecall"), totalTokens: runs.reduce((sum, run) => sum + tokenCount(run), 0) };
 };
 const report = { ranAt: new Date().toISOString(), model: MODEL, source: THREAD_DIR, arms: { A: "indexed legacy", B: "optimized no-index query-driven slice" }, rows, totals: { A: aggregate("A"), B: aggregate("B") } };
 writeFileSync(OUT, JSON.stringify(report, null, 2));

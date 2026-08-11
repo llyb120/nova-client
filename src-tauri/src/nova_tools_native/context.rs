@@ -209,9 +209,6 @@ const NO_INDEX_MAX_DEADLINE_MS: u64 = 15_000;
 const NO_INDEX_MAX_FORWARD_FILES: usize = 24;
 
 const NO_INDEX_MAX_SUMMARIES: usize = 256;
-/// Parse only a bounded high-confidence head; line-level evidence for the remaining matches is
-/// retained in CANDIDATES. A larger head materially improves import/alias graph coverage.
-const NO_INDEX_PARSE_HEAD: usize = 16;
 
 fn trace(label: &str, start: Instant) {
     if std::env::var_os("NOVA_TOOLS_NATIVE_PROFILE").is_some() {
@@ -635,9 +632,6 @@ fn rg_search(
         "-F".into(),
         "--max-count".into(),
         MAX_HITS_PER_FILE.to_string(),
-        "--max-filesize".into(),
-        MAX_INDEX_FILE_BYTES.to_string(),
-        "--no-messages".into(),
     ];
     if ignore_case {
         args.push("-i".into());
@@ -3227,17 +3221,8 @@ fn no_index_query_discover(
                     }
                 }
                 let declaration = [
-                    "fn ",
-                    "function ",
-                    "struct ",
-                    "enum ",
-                    "class ",
-                    "interface ",
-                    "type ",
-                    "const ",
-                    "static ",
-                    "def ",
-                    "impl ",
+                    "fn ", "function ", "struct ", "enum ", "class ", "interface ",
+                    "type ", "const ", "static ", "def ", "impl ",
                 ]
                 .iter()
                 .any(|prefix| {
@@ -3256,13 +3241,22 @@ fn no_index_query_discover(
     // Keep cheap line-level evidence for every result. Only the high-confidence head is parsed;
     // the tail remains available as a compact candidate map.
     for (file, hit_rows) in &ranked {
-        rows.entry(file.clone())
-            .or_insert_with(|| hit_rows.iter().take(MAX_HITS_PER_FILE).cloned().collect());
+        rows.entry(file.clone()).or_insert_with(|| {
+            hit_rows
+                .iter()
+                .take(MAX_HITS_PER_FILE)
+                .cloned()
+                .collect()
+        });
     }
-    for (rank, (file, _hit_rows)) in ranked.into_iter().take(NO_INDEX_MAX_SUMMARIES).enumerate() {
+    for (rank, (file, _hit_rows)) in ranked
+        .into_iter()
+        .take(NO_INDEX_MAX_SUMMARIES)
+        .enumerate()
+    {
         // Native search may consume most of a cold deadline. Always parse a high-confidence head;
         // only optional tail candidates obey the deadline.
-        if rank >= NO_INDEX_PARSE_HEAD && Instant::now() >= deadline {
+        if rank >= 12 && Instant::now() >= deadline {
             stats.deadline_hit = true;
             break;
         }
@@ -3279,6 +3273,8 @@ fn no_index_query_discover(
         sources.insert(file, source);
     }
 }
+
+
 
 fn no_index_target_files(
     roots: &[String],
@@ -3308,13 +3304,7 @@ fn no_index_target_files(
                     .iter()
                     .any(|term| term.len() >= 4 && name.contains(term))
             });
-            let tier = if exact_def {
-                2
-            } else if loose_def {
-                1
-            } else {
-                0
-            };
+            let tier = if exact_def { 2 } else if loose_def { 1 } else { 0 };
             let score = usize::from(exact_def) * 1_000
                 + usize::from(loose_def) * 300
                 + rows.get(file).map(Vec::len).unwrap_or(0).min(20) * 5
@@ -3733,65 +3723,14 @@ fn fast_context_no_index(root: &Path, params: &Value) -> Result<String, String> 
             .then_with(|| b.3.cmp(&a.3))
             .then_with(|| a.0.cmp(&b.0))
     });
-    // Greedy diversification: every query term gets representation before high-frequency generic
-    // files can consume the path budget. Production and test surfaces have independent quotas.
-    let lowered_terms = terms
-        .iter()
-        .map(|term| term.to_ascii_lowercase())
-        .collect::<Vec<_>>();
     let mut picked = Vec::new();
     for want_test in [false, true] {
-        let cap = if want_test { 16 } else { 48 };
-        let mut pool = candidate_paths
-            .iter()
-            .filter(|row| row.2 == want_test)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut covered = HashSet::<usize>::new();
-        while picked
-            .iter()
-            .filter(|(_, picked_test, _)| *picked_test == want_test)
-            .count()
-            < cap
-            && !pool.is_empty()
-        {
-            pool.sort_by(|a, b| {
-                let rank = |row: &(String, usize, bool, i64)| {
-                    let matched = rows
-                        .get(&row.0)
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|hit| {
-                            let line = hit.text.to_ascii_lowercase();
-                            lowered_terms
-                                .iter()
-                                .enumerate()
-                                .filter_map(move |(index, term)| {
-                                    line.contains(term).then_some(index)
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<HashSet<_>>();
-                    let novel = matched
-                        .iter()
-                        .filter(|index| !covered.contains(index))
-                        .count();
-                    (novel, matched.len(), row.1.min(20), row.3)
-                };
-                rank(b).cmp(&rank(a)).then_with(|| a.0.cmp(&b.0))
-            });
-            let (file, hits, is_test, _) = pool.remove(0);
-            if let Some(file_rows) = rows.get(&file) {
-                for (index, term) in lowered_terms.iter().enumerate() {
-                    if file_rows
-                        .iter()
-                        .any(|hit| hit.text.to_ascii_lowercase().contains(term))
-                    {
-                        covered.insert(index);
-                    }
-                }
+        let cap = if want_test { 8 } else { 24 };
+        for (file, hits, is_test, _) in candidate_paths.iter().filter(|row| row.2 == want_test) {
+            if picked.iter().filter(|(_, picked_test, _)| *picked_test == want_test).count() >= cap {
+                break;
             }
-            picked.push((file, is_test, hits));
+            picked.push((file.clone(), *is_test, *hits));
         }
     }
     if !picked.is_empty() {
