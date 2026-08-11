@@ -3087,16 +3087,19 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     });
   };
 
-  function scheduleRebuild(afterPaint = false) {
+  function scheduleRebuild(afterPaint = false, immediate = false) {
     rebuildAfterPaint ||= afterPaint;
-    // 停止、切会话等状态要立即落屏，不受流式节流影响。
-    if ((afterPaint || !props.running) && rebuildTimer !== undefined) {
+    // 停止、切会话、展开/折叠等状态要立即落屏，不受流式节流影响。
+    // immediate 时也必须清掉已排队的流式 timer：否则展开/收起触发的 rebuild
+    // 会被吞并到那次流式 rebuild 里，而流式 rebuild 可能发生在 click 设置
+    // scrollLock 之前，导致开合看似失效（先滚到底、要再点一次）。
+    if ((afterPaint || immediate || !props.running) && rebuildTimer !== undefined) {
       window.clearTimeout(rebuildTimer);
       rebuildTimer = undefined;
     }
     if (rebuildRaf || rebuildTimer !== undefined) return;
     const elapsed = performance.now() - lastRebuildAt;
-    const delay = props.running && !rebuildAfterPaint
+    const delay = props.running && !rebuildAfterPaint && !immediate
       ? Math.max(0, STREAM_LAYOUT_INTERVAL_MS - elapsed)
       : 0;
     if (delay > 1) {
@@ -3241,9 +3244,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   createEffect(() => {
     // 展开态参与闭合分组签名；仅在它变化时废弃签名缓存，而不是流式时反复哈希历史。
+    // 用户主动开合必须立即重排（immediate）：不能被套在流式 80ms 节流里，
+    // 否则 click 设置的 scrollLock 来不及生效、开合看似失效。
     JSON.stringify(state.expanded);
     closedGroupSigCache = new WeakMap<Group, string>();
-    scheduleRebuild();
+    scheduleRebuild(false, true);
   });
 
   const saveEdit = () => {

@@ -412,6 +412,16 @@ export function ChatView() {
     if (useAnyCanvas()) return;
     if (isToolDetailScroll(event.target)) return;
     pointerActive = true;
+    // 折叠/思考/工具头开合会改变文档高度：若仍在吸底，pointerup 的钉底微任务和
+    // 运行中新内容触发的钉底会在 click 前移动滚动位置，吞掉首次点击（表现为
+    // 先滚到最底、要再点一次）；展开后又会被新内容拉回最底。按下即退出吸底，
+    // 对齐 Canvas 版 onBrowseDetail 的行为。
+    if (
+      event.target instanceof Element &&
+      event.target.closest(".tool-line, .thought-toggle, .turn-fold")
+    ) {
+      cancelBottomFollow();
+    }
   };
 
   const processTranscriptScroll = () => {
