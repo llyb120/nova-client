@@ -435,7 +435,7 @@ export interface Settings {
   vegaProxy: string;
   /** Windows shell 启动 shim（保存后重启应用生效） */
   windowsShellShimEnabled: boolean;
-  /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
+  /** Git 仓库中穿越世界线时是否保存/还原 checkpoint 工作区；非 Git 目录不启用 */
   checkpointEnabled: boolean;
   /** 代码上下文检索模式：无 / 旧 FastContext / 无索引单遍 SuperContext。 */
   contextRetrievalMode: "none" | "fast" | "super";

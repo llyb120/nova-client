@@ -1637,7 +1637,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  开启后，从其他时间线继续对话时会把工作目录文件还原到对应时间点。默认关闭；关闭时只切换会话历史，不修改当前文件。
+                  开启后，仅在当前会话目录属于 Git 仓库时保存并还原工作区文件；非 Git 目录自动跳过文件 Checkpoint，只保留会话世界线。默认关闭。
                 </span>
               </div>
             </section>

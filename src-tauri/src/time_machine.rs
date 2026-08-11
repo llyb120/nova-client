@@ -222,7 +222,17 @@ fn get_blob(data_dir: &Path, hash: &str) -> Result<Vec<u8>, String> {
     fs::read(object_path(data_dir, hash)).map_err(|e| format!("读取世界线对象 {hash} 失败：{e}"))
 }
 
+fn checkpoint_available(thread: &Thread) -> bool {
+    !thread.is_roaming_guest() && crate::gitwt::is_repo(&thread.cwd)
+}
+
 fn workspace_root(cwd: &Path) -> Result<PathBuf, String> {
+    let cwd_text = cwd
+        .to_str()
+        .ok_or_else(|| format!("工作目录不是有效 UTF-8 路径：{}", cwd.display()))?;
+    if !crate::gitwt::is_repo(cwd_text) {
+        return Err("Checkpoint 仅支持 Git 仓库".into());
+    }
     let root =
         fs::canonicalize(cwd).map_err(|e| format!("无法访问工作目录 {}：{e}", cwd.display()))?;
     if !root.is_dir() {
@@ -255,56 +265,55 @@ fn executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn directory_files(root: &Path) -> Result<Vec<String>, String> {
-    fn visit(root: &Path, directory: &Path, paths: &mut Vec<String>) -> Result<(), String> {
-        let children = fs::read_dir(directory)
-            .map_err(|e| format!("读取目录失败 {}：{e}", directory.display()))?;
-        for child in children {
-            let child =
-                child.map_err(|e| format!("读取目录项失败 {}：{e}", directory.display()))?;
-            let path = child.path();
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|e| format!("读取文件属性失败 {}：{e}", path.display()))?;
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            if metadata.is_dir() {
-                let name = child.file_name();
-                if IGNORED_DIRECTORIES
-                    .iter()
-                    .any(|ignored| name == std::ffi::OsStr::new(ignored))
-                {
-                    continue;
-                }
-                visit(root, &path, paths)?;
-            } else if metadata.is_file() {
-                let relative = path
-                    .strip_prefix(root)
-                    .map_err(|_| format!("文件不在工作目录中：{}", path.display()))?;
-                let relative = relative
-                    .to_str()
-                    .ok_or_else(|| format!("目录包含非 UTF-8 路径：{}", path.display()))?
-                    .replace('\\', "/");
-                safe_relative(&relative)?;
-                paths.push(relative);
-            }
-        }
-        Ok(())
+fn ignored_snapshot_path(path: &str) -> bool {
+    path.split('/')
+        .any(|part| IGNORED_DIRECTORIES.contains(&part))
+}
+
+fn git_files(root: &Path) -> Result<Vec<String>, String> {
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| format!("工作目录不是有效 UTF-8 路径：{}", root.display()))?;
+    let output = crate::gitwt::run_raw(
+        root_text,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ],
+    )
+    .map_err(|e| format!("读取 Git 文件列表失败：{e}"))?;
+    if output.contains('\u{fffd}') {
+        return Err("Git 仓库包含非 UTF-8 路径，暂不支持创建 Checkpoint".into());
     }
 
-    let mut paths = Vec::new();
-    visit(root, root, &mut paths)?;
-    paths.sort();
-    Ok(paths)
+    let mut paths = BTreeSet::new();
+    for raw in output.split('\0').filter(|path| !path.is_empty()) {
+        let path = raw.replace('\\', "/");
+        safe_relative(&path)?;
+        if !ignored_snapshot_path(&path) {
+            paths.insert(path);
+        }
+    }
+    Ok(paths.into_iter().collect())
 }
 
 fn capture_manifest(data_dir: &Path, root: &Path) -> Result<Vec<PatchEntry>, String> {
     let mut entries = Vec::new();
-    for path in directory_files(root)? {
+    for path in git_files(root)? {
         let absolute = root.join(safe_relative(&path)?);
-        let metadata = fs::symlink_metadata(&absolute)
-            .map_err(|e| format!("读取文件属性失败 {}：{e}", absolute.display()))?;
-        if metadata.len() > MAX_SNAPSHOT_FILE_BYTES {
+        let metadata = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("读取文件属性失败 {}：{error}", absolute.display())),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_SNAPSHOT_FILE_BYTES
+        {
             continue;
         }
         let bytes = fs::read(&absolute)
@@ -385,8 +394,8 @@ fn checkpoint_workspace(
     thread: &Thread,
     capture_workspace: bool,
 ) -> Result<(PathBuf, Vec<PatchEntry>, bool), String> {
-    // 漫游 guest 的工作目录位于对端；关闭 Checkpoint 时也只保存会话快照。
-    let workspace_captured = capture_workspace && !thread.is_roaming_guest();
+    // 文件 Checkpoint 仅对本地 Git 工作树生效；非 Git 目录和漫游 guest 只保存会话世界线。
+    let workspace_captured = capture_workspace && checkpoint_available(thread);
     let root = if workspace_captured {
         workspace_root(Path::new(&thread.cwd))?
     } else {
@@ -807,6 +816,8 @@ pub fn restore_checkpoint(
     current_thread: &Thread,
     restore_files: bool,
 ) -> Result<(Thread, RestoreResult), String> {
+    // 设置虽为全局开关，但非 Git 目录不执行文件 Checkpoint；仍可恢复会话历史。
+    let restore_files = restore_files && checkpoint_available(current_thread);
     let mut store = load_store(data_dir)?;
     let timeline_index = store
         .timelines
@@ -1135,6 +1146,11 @@ pub fn timeline_training_digest(
 mod tests {
     use super::*;
 
+    fn init_git_repo(root: &Path) {
+        fs::create_dir_all(root).unwrap();
+        crate::gitwt::run(root.to_str().unwrap(), &["init", "-q"]).unwrap();
+    }
+
     #[test]
     fn rejects_paths_that_escape_repository() {
         assert!(safe_relative("../secret").is_err());
@@ -1199,19 +1215,23 @@ mod tests {
     }
 
     #[test]
-    fn managed_snapshot_ignores_generated_directories() {
+    fn managed_snapshot_uses_git_scope_and_ignores_generated_directories() {
         let root = std::env::temp_dir().join(format!(
             "nova-time-machine-ignore-test-{}",
             uuid::Uuid::new_v4()
         ));
+        init_git_repo(&root);
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
-        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::write(root.join(".gitignore"), b"ignored.log\n").unwrap();
         fs::write(root.join("src/main.ts"), b"source").unwrap();
         fs::write(root.join("node_modules/pkg/index.js"), b"dependency").unwrap();
-        fs::write(root.join(".git/objects/object"), b"git").unwrap();
+        fs::write(root.join("ignored.log"), b"ignored").unwrap();
 
-        assert_eq!(directory_files(&root).unwrap(), vec!["src/main.ts"]);
+        assert_eq!(
+            git_files(&root).unwrap(),
+            vec![".gitignore".to_string(), "src/main.ts".to_string()]
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1223,7 +1243,7 @@ mod tests {
         ));
         let project = root.join("project");
         let data = root.join("data");
-        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
         fs::write(project.join("source.txt"), b"checkpoint").unwrap();
         let large = project.join("debug-bin.exe");
         let file = fs::File::create(&large).unwrap();
@@ -1266,16 +1286,15 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_and_restores_a_directory_without_git() {
+    fn checkpoint_is_skipped_for_directory_without_git() {
         let root = std::env::temp_dir().join(format!(
             "nova-time-machine-dir-test-{}",
             uuid::Uuid::new_v4()
         ));
         let project = root.join("project");
         let data = root.join("data");
-        fs::create_dir_all(project.join("nested")).unwrap();
-        fs::write(project.join("kept.txt"), b"first\n").unwrap();
-        fs::write(project.join("nested/removed-later.txt"), b"present\n").unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("file.txt"), b"before\n").unwrap();
 
         let thread = Thread::new(
             project.to_string_lossy().to_string(),
@@ -1285,21 +1304,15 @@ mod tests {
             None,
             false,
         );
-        let first = create_checkpoint(&data, &thread, true).unwrap();
-        let first_id = first.current_checkpoint_id.unwrap();
+        let checkpoint = create_checkpoint(&data, &thread, true).unwrap();
+        let checkpoint_id = checkpoint.current_checkpoint_id.unwrap();
+        let store = load_store(&data).unwrap();
+        assert!(!store.timelines[0].checkpoints[0].workspace_captured);
+        assert!(store.timelines[0].checkpoints[0].entries.is_empty());
 
-        fs::write(project.join("kept.txt"), b"second\n").unwrap();
-        fs::remove_file(project.join("nested/removed-later.txt")).unwrap();
-        fs::write(project.join("added-later.txt"), b"new\n").unwrap();
-        create_checkpoint(&data, &thread, true).unwrap();
-
-        restore_checkpoint(&data, &first_id, &thread, true).unwrap();
-        assert_eq!(fs::read(project.join("kept.txt")).unwrap(), b"first\n");
-        assert_eq!(
-            fs::read(project.join("nested/removed-later.txt")).unwrap(),
-            b"present\n"
-        );
-        assert!(!project.join("added-later.txt").exists());
+        fs::write(project.join("file.txt"), b"after\n").unwrap();
+        restore_checkpoint(&data, &checkpoint_id, &thread, true).unwrap();
+        assert_eq!(fs::read(project.join("file.txt")).unwrap(), b"after\n");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1377,7 +1390,7 @@ mod tests {
         ));
         let project = root.join("project");
         let data = root.join("data");
-        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
         fs::write(project.join("file.txt"), b"checkpoint\n").unwrap();
 
         let thread = Thread::new(
@@ -1408,7 +1421,7 @@ mod tests {
         ));
         let project = root.join("project");
         let data = root.join("data");
-        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
         fs::write(project.join("file.txt"), b"working\n").unwrap();
         let mut thread = Thread::new(
             project.to_string_lossy().to_string(),
@@ -1448,7 +1461,7 @@ mod tests {
         ));
         let project = root.join("project");
         let data = root.join("data");
-        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
         fs::write(project.join("file.txt"), b"branch point\n").unwrap();
         let thread = Thread::new(
             project.to_string_lossy().to_string(),
@@ -1486,7 +1499,7 @@ mod tests {
             std::env::temp_dir().join(format!("nova-time-machine-test-{}", uuid::Uuid::new_v4()));
         let repo = root.join("repo");
         let data = root.join("data");
-        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
         fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
 
         let thread = Thread::new(

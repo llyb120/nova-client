@@ -109,7 +109,7 @@ pub struct Settings {
     pub vega_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
-    /// 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件。
+    /// Git 仓库中穿越世界线时是否保存/还原 checkpoint 工作区；非 Git 目录自动跳过。
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,
