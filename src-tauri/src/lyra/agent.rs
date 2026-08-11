@@ -34,8 +34,7 @@ pub enum AgentEvent {
     MessageStart,
     TextDelta(String),
     ThinkingDelta(String),
-    /// final_note 寄生的最终回复（不参与流式拼接，独立成一条消息项）。
-    FinalNote(String),
+
     ToolStart {
         id: String,
         name: String,
@@ -94,11 +93,6 @@ fn speculate_enabled() -> bool {
     std::env::var("LYRA_SPECULATE").ok().as_deref() != Some("off")
 }
 
-/// final_note：最终总结寄生在最后一次工具调用上，省一个纯总结回合。LYRA_FINAL_NOTE=off 关闭。
-fn final_note_enabled() -> bool {
-    std::env::var("LYRA_FINAL_NOTE").ok().as_deref() != Some("off")
-}
-
 /// 流式参数片段的挽救式解析：原样解析失败后尝试补全未闭合的字符串/数组/对象括号。
 /// 仅用于投机预执行——最终参数严格相等才命中缓存，误判的代价至多是一次预读。
 fn salvage_json(fragment: &str) -> Option<Value> {
@@ -142,13 +136,10 @@ fn maybe_speculate(spec: &SpecContext, index: usize, name: &str, fragment: &str)
     if !speculate_enabled() {
         return;
     }
-    let Some(mut args) = salvage_json(fragment) else {
+    let Some(args) = salvage_json(fragment) else {
         return;
     };
-    // final_note 只属于 agent 收尾协议，不应让它造成投机参数与最终执行参数不一致。
-    if let Some(map) = args.as_object_mut() {
-        map.remove("final_note");
-    }
+
     if !speculatable(name, &args) {
         return;
     }
@@ -367,25 +358,7 @@ impl Agent {
                 .cloned()
                 .collect();
             if !tool_calls.is_empty() {
-                let notes = self.execute_tools(tool_calls, on_event).await;
-                // final_note：模型声明这是最后一次工具调用，总结直接落为最终回复，
-                // 跳过"收结果 → 再生成一轮纯总结"的回合。
-                if final_note_enabled() && !notes.is_empty() {
-                    outcome.stop_reason = "stop".into();
-                    let note = notes.join("\n\n");
-                    on_event(AgentEvent::FinalNote(note.clone()));
-                    self.messages.push(json!({
-                        "role": "assistant",
-                        "content": [{ "type": "text", "text": note }],
-                        "api": self.model.model.api,
-                        "provider": self.model.model.provider,
-                        "model": self.model.model.id,
-                        "usage": Value::Null,
-                        "stopReason": "stop",
-                        "timestamp": now_ms(),
-                    }));
-                    self.checkpoint_now();
-                }
+                self.execute_tools(tool_calls, on_event).await;
                 // Reasonix：每个模型/工具回合后、下一次 provider 请求前维护上下文。
                 mid_turn(&mut self.messages, &message);
                 // 中途压缩/rebase 改写了消息，同步一次中断轨迹。
@@ -407,9 +380,8 @@ impl Agent {
         }
     }
 
-    /// 执行一轮工具调用：剥离 final_note →（投机缓存命中则复用）并行执行。
-    /// 返回本轮收集到的 final_note。
-    async fn execute_tools<F>(&mut self, tool_calls: Vec<Value>, on_event: &mut F) -> Vec<String>
+    /// 执行一轮工具调用：（投机缓存命中则复用）并行执行。
+    async fn execute_tools<F>(&mut self, tool_calls: Vec<Value>, on_event: &mut F)
     where
         F: FnMut(AgentEvent) + Send,
     {
@@ -417,12 +389,10 @@ impl Agent {
             index: usize,
             id: String,
             name: String,
-            /// 剥离 final_note 后的参数（投机缓存按它匹配）。
             raw_args: Value,
             args: Value,
         }
         let mut prepared = Vec::new();
-        let mut notes = Vec::new();
         for (index, call) in tool_calls.into_iter().enumerate() {
             let id = call
                 .get("id")
@@ -435,20 +405,7 @@ impl Agent {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let mut args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            if final_note_enabled() {
-                if let Some(note) = args
-                    .get("final_note")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|note| !note.is_empty())
-                {
-                    notes.push(note.to_string());
-                }
-                if let Some(map) = args.as_object_mut() {
-                    map.remove("final_note");
-                }
-            }
+            let args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
             let raw_args = args.clone();
             on_event(AgentEvent::ToolStart {
                 id: id.clone(),
@@ -490,7 +447,7 @@ impl Agent {
                 self.messages.push(result_message);
                 self.checkpoint_now();
             }
-            return Vec::new();
+            return;
         }
         // 收取本轮投机缓存：参数严格相等才命中，未命中与残留句柄一律中止。
         let mut speculated: Vec<Option<Speculative>> = Vec::new();
@@ -573,7 +530,6 @@ impl Agent {
             self.messages.push(result_message);
             self.checkpoint_now();
         }
-        notes
     }
 }
 

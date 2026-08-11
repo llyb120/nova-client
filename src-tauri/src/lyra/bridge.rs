@@ -214,8 +214,6 @@ struct PromptContext {
     mode: String,
 }
 
-
-
 async fn handle_prompt(
     http: &reqwest::Client,
     request: &Value,
@@ -583,16 +581,7 @@ async fn handle_prompt(
                 "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
             }));
         }
-        AgentEvent::FinalNote(note) => {
-            agent_message_index += 1;
-            current_text.clear();
-            current_text.push_str(&note);
-            emit(&json!({ "type": "timing", "phase": "final_note", "elapsedMs": 0 }));
-            emit(&json!({
-                "type": "item",
-                "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
-            }));
-        }
+
         AgentEvent::ToolStart { id, name, args } => {
             let item = started_tool_item(&id, &name, &args);
             started_tools.insert(id, item.clone());

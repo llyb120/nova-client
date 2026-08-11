@@ -1,6 +1,6 @@
-// Lyra 特性基准：流式投机执行 / final_note。
-// 用法: node bench/lyra-bench.mjs [--cells t1,t2,t3,t4] [--runs 2]
-// 每个 cell 跑 baseline（两项优化全关）与 treatment（两项优化全开），输出 bench/results-<ts>.json。
+// Lyra 流式投机执行特性基准。
+// 用法: node bench/lyra-bench.mjs [--cells t1,t2,t3] [--runs 2]
+// 每个 cell 跑 baseline（关闭投机）与 treatment（开启投机），输出 bench/results-<ts>.json。
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
@@ -24,7 +24,7 @@ const TASKS = {
     cwd: () => REPO,
     text: "调查这个仓库里 lyra 的 read 工具实现：输出格式（含行号前缀规则）、分段读取的 offset/limit/hasMore 语义、超限治理（govern）的触发条件与归档行为、以及 legacy 模式分别由哪些环境变量控制。给出每一项对应的文件与行号依据。",
   },
-  // 小编辑任务：edit + bash 验证 + final_note 收尾。
+  // 小编辑任务：edit + bash 验证。
   t2: {
     cwd: () => freshSandbox("t2"),
     text: "这是一个 Node 项目。把 src/greet.js 的问候语从 hello 改成 hi，同步更新使用它和测试它的文件，然后运行 npm test 确认全部通过。",
@@ -34,11 +34,7 @@ const TASKS = {
     cwd: () => freshSandbox("t3"),
     text: "这是一个 Node 项目。给 src/cart.js 的购物车加打折功能：addItem 支持第三个可选参数 discountRate（0-1 的折扣率，如 0.8 表示八折，缺省为 1），total() 应用各自折扣，list() 用 src/format.js 的 money() 格式化并标注折扣。同步更新 test/run.js 覆盖新行为，更新 src/index.js 演示，然后运行 npm test 确认全部通过。",
   },
-  // 显式要求使用 final_note，验证协议可用性而不是只看模型自发采用率。
-  t4: {
-    cwd: () => freshSandbox("t4"),
-    text: "这是一个 Node 项目。运行 npm test 确认当前测试结果。严格要求：最后一次工具调用必须在该工具参数的 final_note 字段写一段中文最终总结；写入 final_note 后不要再调用任何工具，也不要另起一轮纯文本总结。",
-  },
+
   // 真实历史任务：来自本机 thread 6a0bc774... 的第一个用户请求。
   r1: {
     cwd: () => "D:\\code\\nova-client",
@@ -106,7 +102,6 @@ function runOnce({ cell, variant, task }) {
     if (task.dataRoot) env.NOVA_DATA_DIR = task.dataRoot;
     if (variant === "baseline") {
       env.LYRA_SPECULATE = "off";
-      env.LYRA_FINAL_NOTE = "off";
     }
     const started = Date.now();
     const child = spawn(EXE, ["lyra"], { env, stdio: ["pipe", "pipe", "pipe"] });
@@ -125,7 +120,7 @@ function runOnce({ cell, variant, task }) {
       const toolById = new Map();
       for (const i of items) if (i && i.tool) toolById.set(i.id, i);
       const agentIds = items.filter((i) => i && i.type === "agent_message").map((i) => i.id);
-      // 模型 API 回合数：agent_message-N / reasoning-N 的 N 以 MessageStart 递增（FinalNote 也 +1）。
+      // 模型 API 回合数：agent_message-N / reasoning-N 的 N 以 MessageStart 递增。
       let maxIndex = 0;
       for (const i of items) {
         const m = i && typeof i.id === "string" && i.id.match(/^(?:agent_message|reasoning)-(\d+)$/);
@@ -145,7 +140,7 @@ function runOnce({ cell, variant, task }) {
         toolCalls: toolById.size,
         toolSequence: [...toolById.values()].map((i) => i.tool).join(","),
         specHits: timings.filter((p) => p === "spec_hit").length,
-        finalNotes: timings.filter((p) => p === "final_note").length,
+
         usage: (doneEvent && doneEvent.usage) || null,
         cancelled: doneEvent ? doneEvent.cancelled : null,
         finalText: finalText.slice(-600),

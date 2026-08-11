@@ -395,7 +395,7 @@ pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
         "shell": shell,
         "skills": options.skills_text,
         "customInstructions": options.custom_instructions,
-        "finalNote": std::env::var("LYRA_FINAL_NOTE").ok().as_deref() != Some("off"),
+
         "editMode": std::env::var("LYRA_EDIT_MODE").unwrap_or_default(),
     });
     let digest = Sha256::digest(serde_json::to_vec(&shape).unwrap_or_default());
@@ -445,11 +445,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         .into(),
         "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。".into(),
         "完成修改后，优先根据版本控制 diff 按需确定受影响单元及直接使用方，并执行成本最低且有效的验证；禁止遍历或列出完整仓库、无依据扩大范围，纯文档类改动可说明依据后跳过测试，无法验证时须报告原因、建议命令及剩余风险。".into(),
-        if std::env::var("LYRA_FINAL_NOTE").ok().as_deref() != Some("off") {
-            "final_note 是硬性收尾协议：当你判断这次工具调用已经是本任务最后一次调用时，必须把给用户的最终总结写进该工具的 final_note 参数；工具结果返回后本轮直接结束，不要再发一轮纯文本总结。若还需要任何工具，final_note 留空。".into()
-        } else {
-            String::new()
-        },
+
         match &options.shell {
             Some(shell) if shell.kind == ShellKind::PowerShell => format!(
                 "命令终端已确认使用 PowerShell（{}）；bash 工具在 Windows 下通过 PowerShell 执行命令，必须从第一次调用起使用 PowerShell 语法（cmdlet、`;` 串联多条命令、`$env:NAME` 访问环境变量），不要使用 Bash 语法（`export`、`&&` 串联在 Windows PowerShell 5.1 中不可用、POSIX 风格的 sed/awk/grep 调用）。",
