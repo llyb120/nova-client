@@ -1321,6 +1321,7 @@ export function ChatView() {
                   }
                   syncTimeCursor();
                 }}
+                onBrowseDetail={cancelBottomFollow}
                 emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
               />
             }

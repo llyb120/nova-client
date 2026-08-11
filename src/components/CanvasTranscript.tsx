@@ -31,6 +31,8 @@ interface CanvasTranscriptProps {
   preview: boolean;
   onReturnToCurrent: () => void;
   onScroll?: (top: number, max: number, user: boolean) => void;
+  /** 详情开合从 pointerup 吸底流程中退出，避免 click 前滚动导致命中项变化。 */
+  onBrowseDetail?: () => void;
   ref?: (handle: CanvasTranscriptHandle) => void;
 }
 
@@ -2874,6 +2876,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       document.addEventListener("mouseup", onScrollDragUp);
       requestPaint();
       return;
+    }
+
+    // 必须在 mousedown 阶段退出吸底。ChatView 在 window pointerup 上排队钉底；若等到
+    // click 才处理，钉底微任务可能先改变 scrollY，使同一坐标命中另一个块而吞掉首次点击。
+    const pressedIdx = hitTest(e.clientX, e.clientY);
+    const pressed = pressedIdx >= 0 ? blocks[pressedIdx] : null;
+    if (pressed && (pressed.kind === "fold" || pressed.kind === "thought-toggle" || pressed.kind === "tool-header")) {
+      keepBottom = false;
+      props.onBrowseDetail?.();
     }
 
     // 与 DOM 一致：任意位置（含空白、行距、块间距）按下都允许发起文本选区；
