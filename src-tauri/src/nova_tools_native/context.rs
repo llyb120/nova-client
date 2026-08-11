@@ -187,23 +187,6 @@ struct UnitCandidate {
 
 static MEMO: OnceLock<Mutex<HashMap<String, DiskCache>>> = OnceLock::new();
 
-const SOURCE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
-
-#[derive(Default)]
-struct SourceCache {
-    entries: HashMap<String, (u64, u128, Source, usize, u64)>,
-    bytes: usize,
-    tick: u64,
-}
-
-static SOURCE_CACHE: OnceLock<Mutex<SourceCache>> = OnceLock::new();
-
-fn super_fast_context_enabled() -> bool {
-    std::env::var_os("NOVA_SUPER_FAST_CONTEXT")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 fn trace(label: &str, start: Instant) {
     if std::env::var_os("NOVA_TOOLS_NATIVE_PROFILE").is_some() {
         eprintln!(
@@ -376,39 +359,12 @@ fn hidden_command(program: &str) -> Command {
 }
 
 fn run_command(root: &Path, program: &str, args: &[String]) -> Option<Vec<u8>> {
-    let output = hidden_command(program)
+    hidden_command(program)
         .args(args)
         .current_dir(root)
         .output()
-        .ok()?;
-    if super_fast_context_enabled() && !output.status.success() && output.stdout.is_empty() {
-        return None;
-    }
-    Some(output.stdout)
-}
-
-fn git_index_path(root: &Path) -> Option<PathBuf> {
-    let dot_git = root.join(".git");
-    if dot_git.is_dir() {
-        return Some(dot_git.join("index"));
-    }
-    let marker = fs::read_to_string(dot_git).ok()?;
-    let value = marker.trim().strip_prefix("gitdir:")?.trim();
-    let path = PathBuf::from(value);
-    let git_dir = if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
-    };
-    Some(git_dir.join("index"))
-}
-
-fn prefer_git_grep_for_large_repo(root: &Path) -> bool {
-    const LARGE_GIT_INDEX_BYTES: u64 = 256 * 1024;
-    super_fast_context_enabled()
-        && git_index_path(root)
-            .and_then(|path| fs::metadata(path).ok())
-            .is_some_and(|metadata| metadata.len() >= LARGE_GIT_INDEX_BYTES)
+        .ok()
+        .map(|output| output.stdout)
 }
 
 fn walk_code_files(root: &Path) -> Vec<String> {
@@ -546,15 +502,6 @@ fn parse_search_rows(bytes: Vec<u8>) -> Vec<SearchRow> {
             .then(a.ln.cmp(&b.ln))
             .then(a.text.cmp(&b.text))
     });
-    if super_fast_context_enabled() {
-        // rg enforces this while scanning; align Super's git-grep path with rg semantics.
-        let mut per_file = HashMap::<String, usize>::new();
-        rows.retain(|row| {
-            let count = per_file.entry(row.file.clone()).or_default();
-            *count += 1;
-            *count <= MAX_HITS_PER_FILE
-        });
-    }
     rows.truncate(MAX_HIT_LINES);
     rows
 }
@@ -743,14 +690,11 @@ fn search_text(
         rows.truncate(MAX_HIT_LINES);
         return rows;
     }
+    if let Some(rows) = rg_search(root, &terms, ignore_case, word, files, false) {
+        return rows;
+    }
     let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
-    // On very large tracked repositories git-grep can walk the index substantially faster than
-    // rg walks the filesystem. Keep rg first for normal repos and every explicitly scoped query.
-    let git_first = files.is_empty() && inside == "true" && prefer_git_grep_for_large_repo(root);
-    let run_git = || {
-        if inside != "true" {
-            return None;
-        }
+    if inside == "true" {
         let mut args = vec!["grep".into(), "-nI".into(), "--untracked".into()];
         if ignore_case {
             args.push("-i".into());
@@ -765,19 +709,8 @@ fn search_text(
         }
         args.push("--".into());
         args.extend(files.iter().cloned());
-        run_command(root, "git", &args).map(parse_search_rows)
-    };
-    if git_first {
-        if let Some(rows) = run_git() {
-            return rows;
-        }
-    }
-    if let Some(rows) = rg_search(root, &terms, ignore_case, word, files, false) {
-        return rows;
-    }
-    if !git_first {
-        if let Some(rows) = run_git() {
-            return rows;
+        if let Some(stdout) = run_command(root, "git", &args) {
+            return parse_search_rows(stdout);
         }
     }
     search_in_process(root, &terms, ignore_case, word, files)
@@ -1541,10 +1474,7 @@ fn build_index(
     // 反向图随缓存持久化：无文件变更的调用直接复用，不再每次
     // O(全部 import × resolve_specifier) 全量重建；有变更时增量补丁（删旧边、
     // 加新边），变更数超阈值才整图重建。
-    if !super_fast_context_enabled() {
-        // Default path must remain behaviorally identical to the current master baseline.
-        cache.reverse = reverse_from_files(&cache.files, &all_set);
-    } else if changed == 0 && cache.reverse.is_empty() && !cache.files.is_empty() {
+    if changed == 0 && cache.reverse.is_empty() && !cache.files.is_empty() {
         cache.reverse = reverse_from_files(&cache.files, &all_set);
     } else if changed >= REVERSE_FULL_REBUILD_CHANGES {
         cache.reverse = reverse_from_files(&cache.files, &all_set);
@@ -1627,28 +1557,7 @@ fn build_index(
 }
 
 fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> {
-    let path = root.join(file);
-    let stamp = metadata_stamp(&path)?;
-    let cache_key = format!("{}\0{file}", normalize_root(root));
-    if super_fast_context_enabled() {
-        let cache = SOURCE_CACHE.get_or_init(|| Mutex::new(SourceCache::default()));
-        let mut cache = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.tick = cache.tick.wrapping_add(1);
-        let tick = cache.tick;
-        if let Some((size, modified_ns, cached, _, last_used)) = cache.entries.get_mut(&cache_key) {
-            if (*size, *modified_ns) == stamp {
-                *last_used = tick;
-                return Some(cached.clone());
-            }
-        }
-        if let Some((_, _, _, bytes, _)) = cache.entries.remove(&cache_key) {
-            cache.bytes = cache.bytes.saturating_sub(bytes);
-        }
-    }
-
-    let text = fs::read_to_string(&path).ok()?;
+    let text = fs::read_to_string(root.join(file)).ok()?;
     let mut lines: Vec<_> = text.split('\n').map(str::to_string).collect();
     if lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
         lines.pop();
@@ -1658,36 +1567,7 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
     } else {
         scan_source(&text, file).syms
     };
-    let loaded = Source { lines, syms };
-    if super_fast_context_enabled() {
-        let bytes = text.len();
-        if bytes <= SOURCE_CACHE_MAX_BYTES / 4 {
-            let cache = SOURCE_CACHE.get_or_init(|| Mutex::new(SourceCache::default()));
-            let mut cache = cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.tick = cache.tick.wrapping_add(1);
-            let tick = cache.tick;
-            while cache.bytes.saturating_add(bytes) > SOURCE_CACHE_MAX_BYTES {
-                let Some(oldest) = cache
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, (_, _, _, _, last_used))| *last_used)
-                    .map(|(key, _)| key.clone())
-                else {
-                    break;
-                };
-                if let Some((_, _, _, removed, _)) = cache.entries.remove(&oldest) {
-                    cache.bytes = cache.bytes.saturating_sub(removed);
-                }
-            }
-            cache.bytes = cache.bytes.saturating_add(bytes);
-            cache
-                .entries
-                .insert(cache_key, (stamp.0, stamp.1, loaded.clone(), bytes, tick));
-        }
-    }
-    Some(loaded)
+    Some(Source { lines, syms })
 }
 
 fn js_utf16_len(value: &str) -> usize {
@@ -2170,7 +2050,7 @@ fn search_text_scopes(
     word: bool,
     dirs: Option<&[String]>,
 ) -> Vec<SearchRow> {
-    if super_fast_context_enabled() && rg_available(root) {
+    if rg_available(root) {
         let rows = match dirs {
             Some(dirs) if !dirs.is_empty() => rg_search(root, terms, ignore_case, word, dirs, true),
             _ => rg_search(root, terms, ignore_case, word, &[], true),
@@ -2179,8 +2059,6 @@ fn search_text_scopes(
             return rows;
         }
     }
-    // A/B baseline expands scoped directories into paths; search_text starts one rg per 128 files.
-    // The optimized arm passes directories directly to a single bounded rg process.
     let files = match dirs {
         Some(dirs) if !dirs.is_empty() => list_code_files(root)
             .into_iter()
@@ -4145,28 +4023,38 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
         features
     };
-    let remaining = units;
+    let mut remaining = units;
     let mut units = Vec::<UnitCandidate>::new();
     let mut covered_features = HashSet::<String>::new();
-    let candidate_value = |unit: &UnitCandidate, covered: &HashSet<String>| {
-        let mut gain = if unit.required { 1000.0 } else { 0.0 };
-        for (feature, weight) in unit_features(unit) {
-            if !covered.contains(&feature) {
-                gain += weight;
+    while !remaining.is_empty() {
+        let mut best_index = 0usize;
+        let mut best_value = f64::NEG_INFINITY;
+        for (index, unit) in remaining.iter().enumerate() {
+            let mut gain = if unit.required { 1000.0 } else { 0.0 };
+            for (feature, weight) in unit_features(unit) {
+                if !covered_features.contains(&feature) {
+                    gain += weight;
+                }
+            }
+            if noise_path(&unit.file) && unit.role != "test" {
+                gain -= 50.0;
+            }
+            let value =
+                gain / (unit.estimated_bytes as f64 / 1024.0).max(1.0) + unit.score / 1000.0;
+            if value > best_value {
+                best_value = value;
+                best_index = index;
             }
         }
-        if noise_path(&unit.file) && unit.role != "test" {
-            gain -= 50.0;
-        }
-        gain / (unit.estimated_bytes as f64 / 1024.0).max(1.0) + unit.score / 1000.0
-    };
-    let commit_unit = |picked: &mut UnitCandidate, covered: &mut HashSet<String>| {
+        let mut picked = remaining.remove(best_index);
         picked.obligation = if picked.role == "caller" {
-            unit_features(picked)
+            unit_features(&picked)
                 .into_iter()
                 .find_map(|(feature, _)| feature.starts_with("caller:").then_some(feature))
         } else if picked.role == "test" {
             if companion_tests.contains(&picked.file) {
+                // 伴生测试按文件保底：每个伴生文件至少打包一个块，
+                // 而不是整个 test 类别只留一个代表。
                 Some(format!("test:{}", picked.file))
             } else {
                 Some("test".into())
@@ -4174,84 +4062,10 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         } else {
             None
         };
-        for (feature, _) in unit_features(picked) {
-            covered.insert(feature);
+        for (feature, _) in unit_features(&picked) {
+            covered_features.insert(feature);
         }
-    };
-
-    if super_fast_context_enabled() {
-        // Minoux lazy greedy: marginal coverage can only decrease. Re-evaluate the heap top
-        // until it still outranks every remaining upper bound. This preserves the baseline
-        // objective while avoiding its O(n²) full rescans on large candidate sets.
-        use std::collections::BinaryHeap;
-        #[derive(Clone)]
-        struct QueueEntry {
-            bound: f64,
-            index: usize,
-        }
-        impl PartialEq for QueueEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.bound.to_bits() == other.bound.to_bits() && self.index == other.index
-            }
-        }
-        impl Eq for QueueEntry {}
-        impl PartialOrd for QueueEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for QueueEntry {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.bound
-                    .total_cmp(&other.bound)
-                    .then_with(|| other.index.cmp(&self.index))
-            }
-        }
-        let mut heap = BinaryHeap::new();
-        for (index, unit) in remaining.iter().enumerate() {
-            heap.push(QueueEntry {
-                bound: candidate_value(unit, &covered_features),
-                index,
-            });
-        }
-        let mut selected = vec![false; remaining.len()];
-        while let Some(entry) = heap.pop() {
-            if selected[entry.index] {
-                continue;
-            }
-            let value = candidate_value(&remaining[entry.index], &covered_features);
-            let next_bound = heap
-                .peek()
-                .map(|next| next.bound)
-                .unwrap_or(f64::NEG_INFINITY);
-            if value >= next_bound {
-                selected[entry.index] = true;
-                let mut picked = remaining[entry.index].clone();
-                commit_unit(&mut picked, &mut covered_features);
-                units.push(picked);
-            } else {
-                heap.push(QueueEntry {
-                    bound: value,
-                    index: entry.index,
-                });
-            }
-        }
-    } else {
-        let mut remaining = remaining;
-        while !remaining.is_empty() {
-            let mut best_index = 0usize;
-            let mut best_value = f64::NEG_INFINITY;
-            for (index, unit) in remaining.iter().enumerate() {
-                let value = candidate_value(unit, &covered_features);
-                if value > best_value {
-                    best_value = value;
-                    best_index = index;
-                }
-            }
-            let mut picked = remaining.remove(best_index);
-            commit_unit(&mut picked, &mut covered_features);
-            units.push(picked);
-        }
+        units.push(picked);
     }
     let mut plans = Vec::<PlannedFile>::new();
     let mut sigs = Vec::<(String, usize, String)>::new();
