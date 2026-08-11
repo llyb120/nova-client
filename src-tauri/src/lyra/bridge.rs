@@ -566,6 +566,14 @@ async fn handle_prompt(
             emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
             current_text.clear();
             current_thinking.clear();
+            // 快照刷新可能清掉前端的临时 liveUsage；下一次 request 开始时用此前
+            // request 已返回的真实累计 usage 重发一次，不做任何 token 估算。
+            if total_usage
+                .as_object()
+                .is_some_and(|usage| !usage.is_empty())
+            {
+                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+            }
         }
         AgentEvent::TextDelta(delta) => {
             current_text.push_str(&delta);
@@ -596,6 +604,14 @@ async fn handle_prompt(
             emit(&json!({ "type": "item", "item": item }));
             if outcome.get("specHit").and_then(Value::as_bool) == Some(true) {
                 emit(&json!({ "type": "timing", "phase": "spec_hit", "elapsedMs": 0 }));
+            }
+            // 工具执行期间前端可能因运行态快照刷新而清空 liveUsage。在工具结束、
+            // 下一次 provider request 之前重发上一 request 的真实累计值。
+            if total_usage
+                .as_object()
+                .is_some_and(|usage| !usage.is_empty())
+            {
+                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
             }
         }
         AgentEvent::MessageEnd { usage } => {
@@ -1161,6 +1177,17 @@ mod tests {
         assert!(
             joined.contains("lyra-inprocess"),
             "未执行 bash 工具：{joined}"
+        );
+        // request 级 usage 必须在工具结束前到达；否则 UI 只能在整个 turn 完成后变化。
+        let first_usage = joined
+            .find("\"type\":\"usage\"")
+            .expect("缺少 request usage");
+        let tool_completed = joined
+            .find("\"status\":\"completed\"")
+            .expect("缺少工具完成事件");
+        assert!(
+            first_usage < tool_completed,
+            "request usage 未在工具执行前上报：{joined}"
         );
     }
 }

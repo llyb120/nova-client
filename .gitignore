@@ -62,6 +62,7 @@ src-tauri/resources/*.node
 release/
 
 .codegraph/*
+.cargo-target/*
 
 # 界面走查截图等临时产物
 tmp/
