@@ -1381,21 +1381,26 @@ function toolBlock(flow: Flow, item: ToolItem, env: LayoutEnv, active: boolean):
   const durationValue = isRecord(item.rawOutput)
     ? item.rawOutput.durationMs ?? item.rawOutput.duration_ms
     : undefined;
-  const durationMs = typeof durationValue === "number" && Number.isFinite(durationValue) && durationValue >= 0
+  const finishedDuration = typeof durationValue === "number" && Number.isFinite(durationValue) && durationValue >= 0
     ? durationValue
     : undefined;
-  const durationText = durationMs === undefined
-    ? ""
-    : durationMs < 1000
-      ? `${Math.round(durationMs)}ms`
-      : durationMs < 60_000
-        ? `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 2 : 1)}s`
-        : `${Math.floor(Math.round(durationMs / 1000) / 60)}m ${Math.round(durationMs / 1000) % 60}s`;
+  const formatDuration = (ms: number) => ms < 1000
+    ? `${Math.round(ms)}ms`
+    : ms < 60_000
+      ? `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`
+      : `${Math.floor(Math.round(ms / 1000) / 60)}m ${Math.round(ms / 1000) % 60}s`;
+  const liveDuration = () => Math.max(0, Date.now() - item.ts);
+  const durationText = () => finishedDuration !== undefined
+    ? formatDuration(finishedDuration)
+    : busy && liveDuration() >= 1000
+      ? formatDuration(liveDuration())
+      : "";
   const durationF = font(11.5, { mono: true });
-  let durationX = 0;
-  if (durationText) {
-    rightX -= measure(durationText, durationF);
-    durationX = rightX;
+  let durationRight = 0;
+  if (finishedDuration !== undefined || busy) {
+    const reservedText = busy ? "99m 59s" : durationText();
+    rightX -= measure(reservedText, durationF);
+    durationRight = rightX + measure(reservedText, durationF);
     rightX -= 8;
   }
   const addText = `+${add}`;
@@ -1434,10 +1439,13 @@ function toolBlock(flow: Flow, item: ToolItem, env: LayoutEnv, active: boolean):
         ctx.fillStyle = view.theme.red;
         ctx.fillText(delText, statsX + measure(addText, statsF) + 6, y0 + baselineOf(rowH, statsF));
       }
-      if (durationX) {
-        ctx.font = durationF;
-        ctx.fillStyle = view.theme.textFaint;
-        ctx.fillText(durationText, durationX, y0 + baselineOf(rowH, durationF));
+      if (durationRight) {
+        const text = durationText();
+        if (text) {
+          ctx.font = durationF;
+          ctx.fillStyle = view.theme.textFaint;
+          ctx.fillText(text, durationRight - measure(text, durationF), y0 + baselineOf(rowH, durationF));
+        }
       }
       if (busy) drawSpinner(ctx, spinnerCx, y0 + rowH / 2, 12, view.now, view.theme.blue, view.theme.accent26);
       if (dotCx) {

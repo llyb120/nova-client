@@ -1,6 +1,6 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { diffLines } from "diff";
-import { createEffect, createMemo, createSignal, For, Index, Match, Show, Switch } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Index, Match, onCleanup, Show, Switch } from "solid-js";
 import { api } from "../ipc";
 import { isExpanded, state, toggleExpanded } from "../store";
 import type { ToolContent, ToolItem } from "../types";
@@ -140,6 +140,10 @@ function toolDurationMs(item: ToolItem): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+function isRunningTool(item: ToolItem): boolean {
+  return item.status === "pending" || item.status === "in_progress";
+}
+
 function formatToolDuration(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`;
@@ -274,6 +278,20 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
   const summary = createMemo(() => toolSummary(props.item));
   const devinOnly = () => state.agentKind === "devin";
   const detail = createMemo(() => (devinOnly() ? toolHeadlineDetail(props.item) : ""));
+  const [clock, setClock] = createSignal(Date.now());
+  createEffect(() => {
+    if (!isRunningTool(props.item)) return;
+    setClock(Date.now());
+    const timer = window.setInterval(() => setClock(Date.now()), 100);
+    onCleanup(() => window.clearInterval(timer));
+  });
+  const displayedDuration = () => {
+    const finished = toolDurationMs(props.item);
+    if (finished !== undefined) return finished;
+    if (!isRunningTool(props.item)) return undefined;
+    const elapsed = Math.max(0, clock() - props.item.ts);
+    return elapsed >= 1000 ? elapsed : undefined;
+  };
 
   // 文件编辑统计 +N -N（codex 风格）
   const stats = createMemo(() => {
@@ -317,9 +335,9 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
             <span class="stat-del">-{stats().del}</span>
           </span>
         </Show>
-        <Show when={toolDurationMs(props.item) !== undefined}>
-          <span class="tool-duration" title="工具调用耗时">
-            {formatToolDuration(toolDurationMs(props.item)!)}
+        <Show when={displayedDuration() !== undefined}>
+          <span class="tool-duration live" title="工具调用耗时">
+            {formatToolDuration(displayedDuration()!)}
           </span>
         </Show>
         <Switch>
