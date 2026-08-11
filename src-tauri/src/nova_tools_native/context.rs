@@ -53,8 +53,8 @@ const REVERSE_FULL_REBUILD_CHANGES: usize = 64;
 /// 缓存变更数低于该值时跳过磁盘写回，只更新内存 MEMO：整仓缓存的全量序列化
 /// 成本随仓库线性增长，下次冷启动重扫这几个文件更划算。首次建缓存不受此限制。
 const PERSIST_MIN_CHANGED: usize = 16;
-/// 目录 scope 检索时限定代码文件扩展名的 rg glob（与 is_code_file 的扩展名集合一致）。
-const CODE_FILES_GLOB: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,rs,py,pyi,go,java,kt,kts,cs,c,h,cc,cpp,hpp,swift,php,scala,dart,m,mm,zig}";
+/// 查询发现覆盖代码及承载实现细节的文本资源；资源文件不进入符号索引。
+const CODE_FILES_GLOB: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,rs,py,pyi,go,java,kt,kts,cs,c,h,cc,cpp,hpp,swift,php,scala,dart,m,mm,zig,sql,md}";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Symbol {
@@ -371,6 +371,11 @@ fn is_code_file(file: &str) -> bool {
         && !lower.ends_with(".min.js")
         && !lower.ends_with(".lock")
         && !lower.contains(".generated.")
+}
+
+fn is_searchable_implementation_file(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    is_code_file(file) || lower.ends_with(".sql") || lower.ends_with(".md")
 }
 
 fn hidden_command(program: &str) -> Command {
@@ -3196,12 +3201,14 @@ fn no_index_query_discover(
     if terms.is_empty() || Instant::now() >= deadline {
         return;
     }
-    // Restrict the hot discovery pass to source extensions. This avoids reports/docs/generated
-    // artifacts both improving precision and reducing bytes read by the native search engine.
+    // Markdown/SQL contribute lexical implementation evidence without entering the symbol/import graph.
     let found = rg_search(root, terms, true, false, &[], true)
         .unwrap_or_else(|| search_text(root, terms, true, false, &[]));
     let mut by_file = HashMap::<String, Vec<SearchRow>>::new();
-    for row in found.into_iter().filter(|row| is_code_file(&row.file)) {
+    for row in found
+        .into_iter()
+        .filter(|row| is_searchable_implementation_file(&row.file))
+    {
         by_file.entry(row.file.clone()).or_default().push(row);
     }
     let exact_terms = terms
@@ -3304,8 +3311,19 @@ fn no_index_target_files(
                     .iter()
                     .any(|term| term.len() >= 4 && name.contains(term))
             });
-            let tier = if exact_def { 2 } else if loose_def { 1 } else { 0 };
+            // A direct SQL hit is an implementation root; do not let a same-named code
+            // definition suppress it during best-tier filtering.
+            let resource_hit = !is_code_file(file)
+                && rows.get(file).is_some_and(|hits| !hits.is_empty());
+            let tier = if exact_def || resource_hit {
+                2
+            } else if loose_def {
+                1
+            } else {
+                0
+            };
             let score = usize::from(exact_def) * 1_000
+                + usize::from(resource_hit) * 900
                 + usize::from(loose_def) * 300
                 + rows.get(file).map(Vec::len).unwrap_or(0).min(20) * 5
                 + score_path(file).max(0) as usize;
@@ -6998,6 +7016,32 @@ mod tests {
         assert!(out.contains("useIt"), "{out}");
         assert!(out.contains("run(v)"), "{out}");
         assert!(out.contains("调用方: 1 files"), "{out}");
+    }
+
+    #[test]
+    fn no_index_keyword_discovery_includes_markdown_implementation() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("services/game")).unwrap();
+        fs::create_dir_all(d.path().join("docs/queries")).unwrap();
+        fs::write(
+            d.path().join("services/game/minigame.go"),
+            "package game\ntype MinigameDataQuery struct{}\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("docs/queries/minigame.md"),
+            "# MinigameDataQuery\n```sql\nSELECT game_id, genre FROM minigame_data;\n```\n",
+        )
+        .unwrap();
+
+        let out = fast_context_no_index(
+            d.path(),
+            &serde_json::json!({"keywords":["MinigameDataQuery"],"deadlineMs":3000}),
+        )
+        .unwrap();
+        assert!(out.contains("services/game/minigame.go"), "{out}");
+        assert!(out.contains("docs/queries/minigame.md"), "{out}");
+        assert!(out.contains("SELECT game_id, genre FROM minigame_data"), "{out}");
     }
 
     #[test]
