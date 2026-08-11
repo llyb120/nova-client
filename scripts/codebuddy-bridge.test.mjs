@@ -12,6 +12,7 @@ const {
   streamEventItem,
   toolResultItems,
   completePendingTools,
+  mergeCodeBuddyUsage,
 } = await import("./codebuddy-bridge.mjs");
 
 const npmShim = "C:\\Users\\test\\AppData\\Roaming\\npm\\codebuddy.cmd";
@@ -20,6 +21,30 @@ assert.equal(resolveCodeBuddyCliPath(npmShim, (path) => path === npmCli), npmCli
 assert.equal(resolveCodeBuddyCliPath(npmShim, () => false), npmShim);
 assert.equal(resolveCodeBuddyCliPath("C:\\codebuddy\\codebuddy.exe", () => true), "C:\\codebuddy\\codebuddy.exe");
 assert.doesNotThrow(() => resolveCodeBuddyCliPath(npmShim), "default filesystem check must be defined");
+
+const firstUsage = mergeCodeBuddyUsage(undefined, {
+  input_tokens: 100,
+  output_tokens: 20,
+  cache_read_input_tokens: 300,
+  cache_creation_input_tokens: 40,
+});
+assert.deepEqual(firstUsage, {
+  input_tokens: 100,
+  output_tokens: 20,
+  cache_read_input_tokens: 300,
+  cache_creation_input_tokens: 40,
+});
+assert.deepEqual(mergeCodeBuddyUsage(firstUsage, {
+  input_tokens: 500,
+  output_tokens: 30,
+  cache_read_input_tokens: 200,
+}), {
+  input_tokens: 600,
+  output_tokens: 50,
+  cache_read_input_tokens: 500,
+  cache_creation_input_tokens: 40,
+});
+assert.equal(mergeCodeBuddyUsage(undefined, undefined), undefined);
 
 assert.equal(permissionModeFor("build"), "bypassPermissions");
 assert.equal(permissionModeFor("bypass"), "bypassPermissions");

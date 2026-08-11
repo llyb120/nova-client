@@ -22,6 +22,26 @@ function resolveCodeBuddyCliPath(cliPath, fileExists = existsSync) {
   return fileExists(npmCliPath) ? npmCliPath : cliPath;
 }
 
+const CODEBUDDY_USAGE_KEYS = [
+  "input_tokens",
+  "output_tokens",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+];
+
+function mergeCodeBuddyUsage(total, usage) {
+  if (!usage || typeof usage !== "object") return total;
+  const next = { ...(total ?? {}) };
+  let found = false;
+  for (const key of CODEBUDDY_USAGE_KEYS) {
+    const value = Number(usage[key]);
+    if (!Number.isFinite(value) || value < 0) continue;
+    next[key] = (Number(next[key]) || 0) + value;
+    found = true;
+  }
+  return found ? next : total;
+}
+
 function permissionModeFor(mode) {
   return mode === "plan" ? "plan" : "bypassPermissions";
 }
@@ -246,6 +266,7 @@ async function runPrompt(lines, request) {
   let sessionId = request.sessionId;
   let checkpoint;
   let activeQuery;
+  let liveUsage;
   const cliPath = resolveCodeBuddyCliPath(process.env.NOVA_CODEBUDDY_PATH || undefined);
   const input = (async () => {
     for await (const line of lines) {
@@ -296,6 +317,10 @@ async function runPrompt(lines, request) {
     else if (message.type === "assistant") {
       checkpoint = message.uuid;
       emitContent(message, stream);
+      // CodeBuddy 在每次模型请求结束时把真实 usage 放在 assistant.message 上。
+      // 逐次累计并立即上报，让工具调用期间标题栏也能更新，而不是等整个 agent turn 结束。
+      liveUsage = mergeCodeBuddyUsage(liveUsage, message.message?.usage);
+      if (liveUsage) send({ type: "usage", usage: liveUsage });
     }
     else if (message.type === "user") {
       for (const item of toolResultItems(message, stream)) send({ type: "item", item });
@@ -306,7 +331,8 @@ async function runPrompt(lines, request) {
       // Some SDK versions consume tool_result internally without yielding the user message.
       for (const item of completePendingTools(stream)) send({ type: "item", item });
       if (sessionId && checkpoint) send({ type: "checkpoint", sessionId, position: checkpoint });
-      send({ type: "done", usage: message.usage });
+      // result.usage 是 SDK 汇总终值；缺失时回退到 assistant 事件累计值。
+      send({ type: "done", usage: message.usage ?? liveUsage });
     }
   }
   void input;
@@ -391,4 +417,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { assistantItems, assistantText, codeBuddyBatchToolPolicy, completePendingTools, novaToolsMcpServers, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem, toolResultItems };
+export { assistantItems, assistantText, codeBuddyBatchToolPolicy, completePendingTools, mergeCodeBuddyUsage, novaToolsMcpServers, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem, toolResultItems };
