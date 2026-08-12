@@ -1204,9 +1204,10 @@ impl RelayManager {
             .timeout(Duration::from_secs(60)))
     }
 
-    pub async fn clue_list(&self) -> Result<Vec<ClueNodeGroup>, String> {
+    pub async fn clue_list(&self, space: &str) -> Result<Vec<ClueNodeGroup>, String> {
         let response = self
             .clue_request(reqwest::Method::GET, "/v2/clues")?
+            .query(&[("space", space)])
             .send()
             .await
             .map_err(|error| error.to_string())?;
@@ -1222,10 +1223,12 @@ impl RelayManager {
         target_card_id: Option<&str>,
         mention_tokens: &[String],
         attachments: &[crate::clues::ClueAttachment],
+        space: &str,
     ) -> Result<CaptureClueResult, String> {
         let author_name = self.cfg().map(|(_, _, name)| name).unwrap_or_default();
         let response = self
             .clue_request(reqwest::Method::POST, "/v2/clues/capture")?
+            .query(&[("space", space)])
             .json(&json!({
                 "threadId": thread_id.unwrap_or_default(),
                 "title": title,
@@ -1235,6 +1238,7 @@ impl RelayManager {
                 "authorName": author_name,
                 "mentionTokens": mention_tokens,
                 "attachments": attachments,
+                "space": space,
             }))
             .send()
             .await
@@ -1248,14 +1252,17 @@ impl RelayManager {
         content: &str,
         parent_comment_id: Option<&str>,
         mention_tokens: &[String],
+        space: &str,
     ) -> Result<(), String> {
         let response = self
             .clue_request(reqwest::Method::POST, "/v2/clues/comment")?
+            .query(&[("space", space)])
             .json(&json!({
                 "cardId": card_id,
                 "content": content,
                 "parentCommentId": parent_comment_id.unwrap_or_default(),
                 "mentionTokens": mention_tokens,
+                "space": space,
             }))
             .send()
             .await
@@ -1268,68 +1275,69 @@ impl RelayManager {
         &self,
         before_card_id: &str,
         after_card_id: &str,
+        space: &str,
     ) -> Result<ClueNodeGroup, String> {
         let response = self
             .clue_request(reqwest::Method::POST, "/v2/clues/associate")?
+            .query(&[("space", space)])
             .json(&json!({
                 "beforeCardId": before_card_id,
                 "afterCardId": after_card_id,
+                "space": space,
             }))
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response)
-            .await?
-            .group)
+        Ok(decode_relay_json::<RelayClueAssociate>(response).await?.group)
     }
 
     pub async fn clue_disassociate(
         &self,
         before_card_id: &str,
         after_card_id: &str,
+        space: &str,
     ) -> Result<ClueNodeGroup, String> {
         let response = self
             .clue_request(reqwest::Method::POST, "/v2/clues/disassociate")?
+            .query(&[("space", space)])
             .json(&json!({
                 "beforeCardId": before_card_id,
                 "afterCardId": after_card_id,
+                "space": space,
             }))
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response)
-            .await?
-            .group)
+        Ok(decode_relay_json::<RelayClueAssociate>(response).await?.group)
     }
 
-    pub async fn clue_split(&self, card_id: &str) -> Result<ClueNodeGroup, String> {
+    pub async fn clue_split(&self, card_id: &str, space: &str) -> Result<ClueNodeGroup, String> {
         let response = self
             .clue_request(reqwest::Method::POST, "/v2/clues/split")?
-            .json(&json!({ "cardId": card_id }))
+            .query(&[("space", space)])
+            .json(&json!({ "cardId": card_id, "space": space }))
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response)
-            .await?
-            .group)
+        Ok(decode_relay_json::<RelayClueAssociate>(response).await?.group)
     }
 
-    pub async fn clue_stack(&self, card_ids: &[String]) -> Result<ClueNodeGroup, String> {
+    pub async fn clue_stack(&self, card_ids: &[String], space: &str) -> Result<ClueNodeGroup, String> {
         let response = self
             .clue_request(reqwest::Method::POST, "/v2/clues/stack")?
-            .json(&json!({ "cardIds": card_ids }))
+            .query(&[("space", space)])
+            .json(&json!({ "cardIds": card_ids, "space": space }))
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response)
-            .await?
-            .group)
+        Ok(decode_relay_json::<RelayClueAssociate>(response).await?.group)
     }
 
-    pub async fn clue_delete(&self, card_id: &str) -> Result<(), String> {
+    pub async fn clue_delete(&self, card_id: &str, space: &str) -> Result<(), String> {
         let response = self
             .clue_request(reqwest::Method::POST, "/v2/clues/delete")?
-            .json(&json!({ "cardId": card_id }))
+            .query(&[("space", space)])
+            .json(&json!({ "cardId": card_id, "space": space }))
             .send()
             .await
             .map_err(|error| error.to_string())?;

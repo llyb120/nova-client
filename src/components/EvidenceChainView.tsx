@@ -12,6 +12,7 @@ import {
   disassociateClues,
   markClueMentionRead,
   refreshClueGroups,
+  setClueSpace,
   startSessionFromClue,
   state,
 } from "../store";
@@ -262,6 +263,23 @@ export function EvidenceChainView() {
           </p>
         </div>
         <div class="clue-head-actions">
+          <div class="clue-space-switch" role="tablist" aria-label="证据链空间">
+            <button
+              classList={{ active: state.clueSpace === "personal" }}
+              disabled={state.clueSpace === "personal"}
+              onClick={() => void setClueSpace("personal")}
+            >
+              个人空间
+            </button>
+            <button
+              classList={{ active: state.clueSpace === "team" }}
+              disabled={state.clueSpace === "team" || !state.relay.enabled}
+              title={state.relay.enabled ? "团队共享的证据链" : "请先配置团队中转站"}
+              onClick={() => void setClueSpace("team")}
+            >
+              团队空间
+            </button>
+          </div>
           <Show when={connectFromId()}>
             <button class="btn secondary" onClick={() => setConnectFromId(null)}>
               取消连接

@@ -6066,7 +6066,32 @@ button.head-badge:hover {
 }
 .clue-head-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
+}
+.clue-space-switch {
+  display: inline-flex;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-soft);
+}
+.clue-space-switch button {
+  padding: 5px 10px;
+  border-radius: var(--r-sm);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.clue-space-switch button.active {
+  background: var(--bg-float);
+  color: var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+.clue-space-switch button:disabled {
+  opacity: 1;
+}
+.clue-space-switch button:disabled:not(.active) {
+  opacity: 0.45;
 }
 .clue-title {
   margin: 0;

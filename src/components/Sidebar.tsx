@@ -571,7 +571,7 @@ export function Sidebar(props: {
           <div class="mode-seg">
             <button
               class="mode-seg-btn"
-              classList={{ active: state.view === "home" || state.view === "clues" }}
+              classList={{ active: state.view === "home" }}
               onClick={openHome}
               title="普通模式：查看你自己的会话"
             >
@@ -595,9 +595,9 @@ export function Sidebar(props: {
             </button>
             <button
               class="mode-seg-btn"
-              classList={{ open: state.view === "clues" }}
+              classList={{ active: state.view === "clues" }}
               onClick={openClues}
-              title="打开证据链页面；左侧仍保持普通会话"
+              title="打开证据链页面"
             >
               <IconClue size={14} />
               证据链

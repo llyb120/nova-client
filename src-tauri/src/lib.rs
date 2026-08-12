@@ -853,14 +853,14 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
 }
 
 #[tauri::command]
-async fn list_clue_groups(state: State<'_, AppState>) -> Result<Vec<clues::ClueNodeGroup>, String> {
-    if state.relay.is_configured() {
-        let groups = state.relay.clue_list().await?;
-        let _ = state.clues.lock().unwrap().replace(groups.clone());
-        Ok(groups)
-    } else {
-        Ok(state.clues.lock().unwrap().list())
+async fn list_clue_groups(
+    state: State<'_, AppState>,
+    space: Option<String>,
+) -> Result<Vec<clues::ClueNodeGroup>, String> {
+    if !state.relay.is_configured() {
+        return Err("云端证据链需要先配置团队中转站".into());
     }
+    state.relay.clue_list(space.as_deref().unwrap_or("personal")).await
 }
 
 #[tauri::command]
@@ -875,12 +875,7 @@ async fn get_clue_context(
     }
 }
 
-fn local_clue_author_name() -> String {
-    std::env::var("USERNAME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "我".into())
-}
+
 
 #[tauri::command]
 async fn capture_clue(
@@ -893,6 +888,7 @@ async fn capture_clue(
     target_card_id: Option<String>,
     mention_tokens: Vec<String>,
     attachments: Vec<clues::ClueAttachment>,
+    space: Option<String>,
 ) -> Result<clues::CaptureClueResult, String> {
     if let Some(thread_id) = thread_id.as_deref() {
         let store = state.store.lock().unwrap();
@@ -900,36 +896,23 @@ async fn capture_clue(
             return Err("线程不存在".into());
         }
     }
-    let result = if state.relay.is_configured() {
-        let result = state
-            .relay
-            .clue_capture(
-                thread_id.as_deref(),
-                &title,
-                &content,
-                &placement,
-                target_card_id.as_deref(),
-                &mention_tokens,
-                &attachments,
-            )
-            .await?;
-        if let Ok(groups) = state.relay.clue_list().await {
-            let _ = state.clues.lock().unwrap().replace(groups);
-        }
-        result
-    } else {
-        let author_name = local_clue_author_name();
-        state.clues.lock().unwrap().capture_with_attachments(
+    if !state.relay.is_configured() {
+        return Err("云端证据链需要先配置团队中转站".into());
+    }
+    let clue_space = space.as_deref().unwrap_or("personal");
+    let result = state
+        .relay
+        .clue_capture(
+            thread_id.as_deref(),
+            &title,
+            &content,
             &placement,
             target_card_id.as_deref(),
-            title,
-            content,
-            thread_id.clone(),
-            author_name,
-            Vec::new(),
-            attachments,
-        )?
-    };
+            &mention_tokens,
+            &attachments,
+            clue_space,
+        )
+        .await?;
     if let Some(thread_id) = thread_id {
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(&thread_id) {
@@ -951,31 +934,21 @@ async fn add_clue_comment(
     content: String,
     parent_comment_id: Option<String>,
     mention_tokens: Vec<String>,
+    space: Option<String>,
 ) -> Result<(), String> {
-    if state.relay.is_configured() {
-        state
-            .relay
-            .clue_comment(
-                &card_id,
-                &content,
-                parent_comment_id.as_deref(),
-                &mention_tokens,
-            )
-            .await?;
-        if let Ok(groups) = state.relay.clue_list().await {
-            let _ = state.clues.lock().unwrap().replace(groups);
-        }
-    } else {
-        let author_name = local_clue_author_name();
-        state.clues.lock().unwrap().add_comment(
-            &card_id,
-            content,
-            parent_comment_id,
-            None,
-            author_name,
-            Vec::new(),
-        )?;
+    if !state.relay.is_configured() {
+        return Err("云端证据链需要先配置团队中转站".into());
     }
+    state
+        .relay
+        .clue_comment(
+            &card_id,
+            &content,
+            parent_comment_id.as_deref(),
+            &mention_tokens,
+            space.as_deref().unwrap_or("personal"),
+        )
+        .await?;
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(())
 }
@@ -986,23 +959,12 @@ async fn associate_clues(
     state: State<'_, AppState>,
     before_card_id: String,
     after_card_id: String,
+    space: Option<String>,
 ) -> Result<clues::ClueNodeGroup, String> {
-    let group = if state.relay.is_configured() {
-        let group = state
-            .relay
-            .clue_associate(&before_card_id, &after_card_id)
-            .await?;
-        if let Ok(groups) = state.relay.clue_list().await {
-            let _ = state.clues.lock().unwrap().replace(groups);
-        }
-        group
-    } else {
-        state
-            .clues
-            .lock()
-            .unwrap()
-            .associate(&before_card_id, &after_card_id)?
-    };
+    let group = state
+        .relay
+        .clue_associate(&before_card_id, &after_card_id, space.as_deref().unwrap_or("personal"))
+        .await?;
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(group)
 }
@@ -1013,23 +975,12 @@ async fn disassociate_clues(
     state: State<'_, AppState>,
     before_card_id: String,
     after_card_id: String,
+    space: Option<String>,
 ) -> Result<clues::ClueNodeGroup, String> {
-    let group = if state.relay.is_configured() {
-        let group = state
-            .relay
-            .clue_disassociate(&before_card_id, &after_card_id)
-            .await?;
-        if let Ok(groups) = state.relay.clue_list().await {
-            let _ = state.clues.lock().unwrap().replace(groups);
-        }
-        group
-    } else {
-        state
-            .clues
-            .lock()
-            .unwrap()
-            .disassociate(&before_card_id, &after_card_id)?
-    };
+    let group = state
+        .relay
+        .clue_disassociate(&before_card_id, &after_card_id, space.as_deref().unwrap_or("personal"))
+        .await?;
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(group)
 }
@@ -1039,16 +990,12 @@ async fn split_clue(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     card_id: String,
+    space: Option<String>,
 ) -> Result<clues::ClueNodeGroup, String> {
-    let group = if state.relay.is_configured() {
-        let group = state.relay.clue_split(&card_id).await?;
-        if let Ok(groups) = state.relay.clue_list().await {
-            let _ = state.clues.lock().unwrap().replace(groups);
-        }
-        group
-    } else {
-        state.clues.lock().unwrap().split_card(&card_id)?
-    };
+    let group = state
+        .relay
+        .clue_split(&card_id, space.as_deref().unwrap_or("personal"))
+        .await?;
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(group)
 }
@@ -1058,16 +1005,12 @@ async fn stack_clues(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     card_ids: Vec<String>,
+    space: Option<String>,
 ) -> Result<clues::ClueNodeGroup, String> {
-    let group = if state.relay.is_configured() {
-        let group = state.relay.clue_stack(&card_ids).await?;
-        if let Ok(groups) = state.relay.clue_list().await {
-            let _ = state.clues.lock().unwrap().replace(groups);
-        }
-        group
-    } else {
-        state.clues.lock().unwrap().stack_cards(&card_ids)?
-    };
+    let group = state
+        .relay
+        .clue_stack(&card_ids, space.as_deref().unwrap_or("personal"))
+        .await?;
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(group)
 }
@@ -1077,15 +1020,12 @@ async fn delete_clue(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     card_id: String,
+    space: Option<String>,
 ) -> Result<(), String> {
-    if state.relay.is_configured() {
-        state.relay.clue_delete(&card_id).await?;
-        if let Ok(groups) = state.relay.clue_list().await {
-            let _ = state.clues.lock().unwrap().replace(groups);
-        }
-    } else {
-        state.clues.lock().unwrap().delete(&card_id)?;
-    }
+    state
+        .relay
+        .clue_delete(&card_id, space.as_deref().unwrap_or("personal"))
+        .await?;
     let mut store = state.store.lock().unwrap();
     if store.clear_active_clue_card(&card_id) {
         store.save();

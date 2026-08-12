@@ -127,7 +127,8 @@ export const api = {
     }),
   createStageThread: (sourceThreadId: string, stageIndex = 0) =>
     invoke<Thread>("create_stage_thread", { sourceThreadId, stageIndex }),
-  listClueGroups: () => invoke<ClueNodeGroup[]>("list_clue_groups"),
+  listClueGroups: (space: "personal" | "team" = "personal") =>
+    invoke<ClueNodeGroup[]>("list_clue_groups", { space }),
   getClueContext: (cardId: string) =>
     invoke<ClueContextSnapshot>("get_clue_context", { cardId }),
   captureClue: (
@@ -138,6 +139,7 @@ export const api = {
     targetCardId: string | null,
     mentionTokens: string[],
     attachments: ClueAttachment[],
+    space: "personal" | "team" = "personal",
   ) =>
     invoke<CaptureClueResult>("capture_clue", {
       threadId,
@@ -147,26 +149,32 @@ export const api = {
       targetCardId,
       mentionTokens,
       attachments,
+      space,
     }),
   addClueComment: (
     cardId: string,
     content: string,
     parentCommentId: string | null,
     mentionTokens: string[],
+    space: "personal" | "team" = "personal",
   ) =>
     invoke<void>("add_clue_comment", {
       cardId,
       content,
       parentCommentId,
       mentionTokens,
+      space,
     }),
-  associateClues: (beforeCardId: string, afterCardId: string) =>
-    invoke<ClueNodeGroup>("associate_clues", { beforeCardId, afterCardId }),
-  disassociateClues: (beforeCardId: string, afterCardId: string) =>
-    invoke<ClueNodeGroup>("disassociate_clues", { beforeCardId, afterCardId }),
-  splitClue: (cardId: string) => invoke<ClueNodeGroup>("split_clue", { cardId }),
-  stackClues: (cardIds: string[]) => invoke<ClueNodeGroup>("stack_clues", { cardIds }),
-  deleteClue: (cardId: string) => invoke<void>("delete_clue", { cardId }),
+  associateClues: (beforeCardId: string, afterCardId: string, space: "personal" | "team") =>
+    invoke<ClueNodeGroup>("associate_clues", { beforeCardId, afterCardId, space }),
+  disassociateClues: (beforeCardId: string, afterCardId: string, space: "personal" | "team") =>
+    invoke<ClueNodeGroup>("disassociate_clues", { beforeCardId, afterCardId, space }),
+  splitClue: (cardId: string, space: "personal" | "team") =>
+    invoke<ClueNodeGroup>("split_clue", { cardId, space }),
+  stackClues: (cardIds: string[], space: "personal" | "team") =>
+    invoke<ClueNodeGroup>("stack_clues", { cardIds, space }),
+  deleteClue: (cardId: string, space: "personal" | "team") =>
+    invoke<void>("delete_clue", { cardId, space }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),
   deleteProjectThreads: (threadIds: string[]) =>

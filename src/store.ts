@@ -131,79 +131,45 @@ interface AppStore {
   modelOptions: Record<AgentKind, ModelOptions | null>;
   logs: string[];
   loadingThread: boolean;
-  /** 当前会话本轮进行中的实时 token 用量（后端流式上报，不落库；Turn 落库后清零避免重复计） */
   liveUsage: LiveUsage | null;
   quota: Quota | null;
-  /** 模型费用信息（modelUid -> 倍率/厂商/视觉），拉取失败时为 null */
   modelCosts: Record<string, ModelCost> | null;
-  /** 已静默下载好、可重启更新的版本信息（无则为 null） */
   update: UpdateInfo | null;
-  /** 正在后台静默下载更新 */
   updateStaging: boolean;
-  /** 空闲时后端请求弹出更新对话框的时间戳（0 = 未请求）；变化即触发弹窗 */
   updatePromptAt: number;
-  /** 当前 agent 暴露的斜杠命令。Devin 来自 ACP，Codex 来自本机 Codex skills。 */
   slashCommands: Record<AgentKind, SlashCommand[]>;
-  /** 更新下载/安装进度 */
   updateProgress: UpdateProgress | null;
-  /** CLI 安装/升级进度；设置页与额度租借前置安装共用。 */
   cliOperationProgress: CliOperationProgress | null;
-  /** 团队/漫游中转站状态 */
   relay: RelayStatus;
-  /** 在线名单（团队/漫游） */
   peers: Peer[];
-  /** 漫游：各对端（host）回传的可选模型/模式，按对端 token 缓存 */
   peerModels: Record<string, PeerModels>;
-  /** worktree：各来源的本地分支列表，key 为 `${peer}:${folder}`（本地会话不走这里） */
   peerBranches: Record<string, BranchList>;
-  /** 收到的待接收分享 */
   inbox: IncomingShare[];
-  /** 收到的待接收工作流分享（团队分享的工作流，接收后进入本地工作流库） */
   workflowInbox: IncomingWorkflowShare[];
-  /** 我的成就（中转站按身份授予）；未配置团队 token 时为空 */
   achievements: Achievement[];
-  /** 成就列表是否已完成首次拉取（区分「加载中」与「暂无成就」） */
   achievementsLoaded: boolean;
-  /** 成就拉取失败原因（空 = 正常） */
   achievementsError: string;
-  /** 尚未在成就页看过的成就 id（侧栏角标） */
   unseenAchievementIds: string[];
-  /** 请求自动弹出收件箱的时间戳（漫游召回快照到达时置位；0 = 无请求） */
   inboxPromptAt: number;
-  /** host 侧：待本机确认的漫游请求队列 */
   incomingRoams: IncomingRoamRequest[];
-  /** 借用方：等待授权、安装 CLI、准备隔离凭证的进度。 */
   quotaRoamingProgress: QuotaRoamingProgress | null;
-  /** 本机允许漫游的目录 */
   roamingFolders: string[];
-  /** 手动展开的详情（工具调用/轮次折叠/思考过程），key 为 item id；切换线程时清空 */
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
-  /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
   view: "home" | "clues" | "employees" | "workbench" | "workflows";
-  /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
+  /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
+  clueSpace: "personal" | "team";
   clueGroups: ClueNodeGroup[];
-  /** 从证据链跳到新会话时暂存的根线索。 */
   pendingClueCard: { id: string; title: string } | null;
-  /** 从当前会话点「新会话」时暂存的目录/模型，供 HomeView 继承。 */
   pendingNewSessionSeed: PendingNewSessionSeed | null;
-  /** 打开新会话页后递增，HomeView 据此聚焦输入框。 */
   homeComposerFocusAt: number;
-  /** 系统提醒点击后，请证据链定位到指定卡片。 */
   clueOpenRequest: string | null;
-  /** 收到的线索 @ 提醒；打开对应卡片后清除。 */
   unreadClueMentions: string[];
-  /** 数字员工列表 */
   employees: Employee[];
-  /** 全部员工的任务活动记录（历史/进行中） */
   employeeTasks: EmployeeTask[];
-  /** 协作标记账本（全部 scope） */
   marks: Mark[];
-  /** 奏折（御书房）：候旨/已批阅 */
   decisions: Decision[];
-  /** 当前界面皮肤 */
   theme: ThemePref;
-  /** 后端可用性检测结果（agentKind → 是否可用）。空 = 尚未检测完成（按全部可用处理） */
   backendAvailability: Record<string, boolean>;
 }
 
@@ -273,6 +239,7 @@ export const [state, setState] = createStore<AppStore>({
   expanded: {},
   titleTyping: {},
   view: "home",
+  clueSpace: "personal",
   clueGroups: [],
   pendingClueCard: null,
   pendingNewSessionSeed: null,
@@ -760,8 +727,15 @@ export function clueCardById(cardId: string | null | undefined): ClueCard | unde
 }
 
 export async function refreshClueGroups() {
-  const groups = await api.listClueGroups();
-  setState("clueGroups", reconcile(groups));
+  const space = state.clueSpace;
+  const groups = await api.listClueGroups(space);
+  if (state.clueSpace === space) setState("clueGroups", reconcile(groups));
+}
+
+export async function setClueSpace(space: "personal" | "team") {
+  if (space === state.clueSpace) return;
+  setState({ clueSpace: space, clueGroups: [] });
+  await refreshClueGroups();
 }
 
 export async function captureClue(
@@ -773,6 +747,7 @@ export async function captureClue(
   mentionTokens: string[] = [],
   attachments: ClueAttachment[] = [],
 ): Promise<CaptureClueResult> {
+  const space = state.clueSpace;
   const result = await api.captureClue(
     threadId,
     title,
@@ -781,8 +756,14 @@ export async function captureClue(
     targetCardId,
     mentionTokens,
     attachments,
+    space,
   );
-  await Promise.all([refreshClueGroups(), refreshThreads()]);
+  // 保存接口已经返回完整受影响分组，直接合并，避免保存后重复拉取整条证据链。
+  if (state.clueSpace === space) {
+    const index = state.clueGroups.findIndex((group) => group.id === result.group.id);
+    if (index >= 0) setState("clueGroups", index, reconcile(result.group));
+    else setState("clueGroups", (groups) => [result.group, ...groups]);
+  }
   return result;
 }
 
@@ -792,7 +773,7 @@ export async function addClueComment(
   parentCommentId: string | null,
   mentionTokens: string[] = [],
 ) {
-  await api.addClueComment(cardId, content, parentCommentId, mentionTokens);
+  await api.addClueComment(cardId, content, parentCommentId, mentionTokens, state.clueSpace);
   await refreshClueGroups();
 }
 
@@ -802,27 +783,27 @@ export async function summarizeClue(threadId: string) {
 }
 
 export async function associateClues(beforeCardId: string, afterCardId: string) {
-  await api.associateClues(beforeCardId, afterCardId);
+  await api.associateClues(beforeCardId, afterCardId, state.clueSpace);
   await refreshClueGroups();
 }
 
 export async function disassociateClues(beforeCardId: string, afterCardId: string) {
-  await api.disassociateClues(beforeCardId, afterCardId);
+  await api.disassociateClues(beforeCardId, afterCardId, state.clueSpace);
   await refreshClueGroups();
 }
 
 export async function splitClue(cardId: string) {
-  await api.splitClue(cardId);
+  await api.splitClue(cardId, state.clueSpace);
   await refreshClueGroups();
 }
 
 export async function stackClues(cardIds: string[]) {
-  await api.stackClues(cardIds);
+  await api.stackClues(cardIds, state.clueSpace);
   await refreshClueGroups();
 }
 
 export async function deleteClue(cardId: string) {
-  await api.deleteClue(cardId);
+  await api.deleteClue(cardId, state.clueSpace);
   await Promise.all([refreshClueGroups(), refreshThreads()]);
 }
 
