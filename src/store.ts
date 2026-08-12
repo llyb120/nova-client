@@ -1206,58 +1206,49 @@ function recoverProposedPlan(_thread: Thread): string | null {
   return null;
 }
 
+let openThreadRequest = 0;
+
 export async function openThread(id: string) {
   const switching = state.currentId !== id;
-  if (switching) {
+  const request = switching ? ++openThreadRequest : openThreadRequest;
+  if (!switching) flushPendingStreamUpdates();
+
+  const cached = getThreadSnapshot(id);
+  const commitSnapshot = (thread: Thread, loadingThread: boolean, reconcileItems = false) => {
     discardPendingStreamUpdates();
     setState("expanded", reconcile({}));
-  } else {
-    flushPendingStreamUpdates();
-  }
-  const cached = getThreadSnapshot(id);
+    showThreadSnapshot(thread, loadingThread, reconcileItems);
+  };
+
+  // 缓存命中时立即展示；未命中则保留旧会话，等完整快照到达后一次性切换，
+  // 避免中途空白，同时不使用页面截图、滤镜或动画阻塞主线程。
   if (cached) {
-    showThreadSnapshot(cached, true);
-  } else {
-    const meta = state.threads.find((thread) => thread.id === id);
-    setState({
-      currentId: id,
-      items: [],
-      plan: null,
-      proposedPlan: null,
-      cwd: meta?.cwd ?? "",
-      title: meta?.title ?? "",
-      agentKind: meta?.agentKind ?? state.agentKind,
-      model: "",
-      mode: "",
-      reasoningEffort: "",
-      roamingPeer: null,
-      loadingThread: true,
-      liveUsage: null,
-    });
+    commitSnapshot(cached, true);
+    if (request !== openThreadRequest || state.currentId !== id) return;
   }
+
   try {
-    // 先把「当前查看会话」上报后端，再拉快照。后端 emit_update 按 active_thread 门控，
-    // 只有该会话被标记为前台后才会向本 WebView 推增量——放在 getThread 之前，能保证
-    // 快照之后产生的流式增量都会被推来，不漏。加载期间 acp:update 监听按 loadingThread
-    // 忽略增量（见 initStore），避免它们打到尚未替换的旧 items 上。
+    // 先切换后端 active_thread，再获取快照，保证加载期间产生的增量包含在快照中。
     await api.reportActivity(id);
     lastActivityReport = Date.now();
-    if (state.currentId !== id) return;
+    if (request !== openThreadRequest) return;
     const t = await api.getThread(id);
-    // 防止异步竞态：用户可能已切走
-    if (state.currentId !== id) return;
+    if (request !== openThreadRequest) return;
     rememberThreadSnapshot(t);
     const agentKind = t.agentKind ?? "devin";
-    // 只有本地 createThread 成功后才更新模型偏好；打开、恢复、会话内切换和漫游只同步 UI。
-    showThreadSnapshot(t, false, !!cached);
-    // 漫游 / 额度租借：拉取对端模型列表；普通本地会话才探测本机后端。
+    if (cached) {
+      if (state.currentId !== id) return;
+      showThreadSnapshot(t, false, true);
+    } else {
+      commitSnapshot(t, false);
+      if (request !== openThreadRequest || state.currentId !== id) return;
+    }
     const roamingPeer =
       t.roamingRole === "guest" ? t.roamingPeer ?? null : t.quotaPeer ?? null;
     if (roamingPeer) ensurePeerModels(roamingPeer);
     else void ensureModelOptions(agentKind);
-    // 活动已在 getThread 之前上报（见开头），此处无需重复
   } catch {
-    setState({ loadingThread: false });
+    if (state.currentId === id) setState({ loadingThread: false });
   }
 }
 
