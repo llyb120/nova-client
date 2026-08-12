@@ -15,6 +15,7 @@ import {
   type Action,
   getTheme,
   measure,
+  paintCanvasBackdrop,
   roundRectPath,
 } from "./base";
 import {
@@ -410,12 +411,16 @@ export function TranscriptCanvas(props: {
       canvas.width = Math.round(w * dpr);
       canvas.height = Math.round(h * dpr);
     }
-    const ctx = canvas.getContext("2d");
+    // Opaque backing avoids the extra alpha-compositing pass that makes small light-on-dark
+    // glyphs look soft in Chromium/WebView. Canvas-specific theme colors control contrast.
+    const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-    ctx.textBaseline = "alphabetic";
+    ctx.textRendering = "optimizeLegibility";
+    ctx.fontKerning = "normal";
     const theme = getTheme();
+    paintCanvasBackdrop(ctx, w, h, theme);
+    ctx.textBaseline = "alphabetic";
     let a = Math.min(selA, selB);
     let b = Math.max(selA, selB);
     if (a === b) {

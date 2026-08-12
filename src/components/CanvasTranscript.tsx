@@ -1,4 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { paintCanvasBackdrop } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
@@ -44,7 +45,9 @@ interface Palette {
   text: string; dim: string; muted: string; faint: string;
   accent: string; accentDim: string;
   red: string; yellow: string; green: string; blue: string;
-  scroll: string; mono: string; sans: string;
+  scroll: string; wash1: string; wash2: string; gridDot: string;
+  glowAccent: string; glowCyan: string; glowCorner: string;
+  mono: string; sans: string;
 }
 
 function readPalette(): Palette {
@@ -54,13 +57,21 @@ function readPalette(): Palette {
     bg: v("--bg", "#0e1014"), panel: v("--bg-panel", "#171b23"),
     sidebar: v("--bg-sidebar", "#0a0c10"), hover: v("--bg-hover", "#1e232d"),
     border: v("--border", "#252a33"), borderLight: v("--border-light", "#313844"),
-    text: v("--text", "#e4e7ec"), dim: v("--text-dim", "#a9b0bd"),
-    muted: v("--text-muted", "#7d8593"), faint: v("--text-faint", "#5d6470"),
+    text: v("--canvas-text", v("--text", "#e4e7ec")),
+    dim: v("--canvas-text-dim", v("--text-dim", "#a9b0bd")),
+    muted: v("--canvas-text-muted", v("--text-muted", "#7d8593")),
+    faint: v("--canvas-text-faint", v("--text-faint", "#5d6470")),
     accent: v("--accent", "#6e93f8"), accentDim: v("--accent-dim", "rgba(110,147,248,.14)"),
     red: v("--red", "#e07d76"), yellow: v("--yellow", "#d4b26e"),
     green: v("--green", "#8ec489"), blue: v("--blue", "#7aa2f2"),
-    scroll: v("--scroll", "#2e333d"), mono: v("--mono", "monospace"),
-    sans: v("--sans", "sans-serif"),
+    scroll: v("--scroll", "#2e333d"),
+    wash1: v("--wash-1", "rgba(111,151,240,.05)"),
+    wash2: v("--wash-2", "rgba(209,154,102,.04)"),
+    gridDot: v("--grid-dot", "rgba(228,231,236,.045)"),
+    glowAccent: v("--canvas-glow-accent", "rgba(110,147,248,.11)"),
+    glowCyan: v("--canvas-glow-cyan", "rgba(63,212,228,.06)"),
+    glowCorner: v("--canvas-glow-corner", "rgba(110,147,248,.05)"),
+    mono: v("--mono", "monospace"), sans: v("--sans", "sans-serif"),
   };
 }
 
@@ -1772,8 +1783,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.textRendering = "optimizeLegibility";
     ctx.fontKerning = "normal";
-    ctx.fillStyle = p.bg;
-    ctx.fillRect(0, 0, viewW, viewH);
+    paintCanvasBackdrop(ctx, viewW, viewH, p);
 
     const visTop = scrollY - 50;
     const visBot = scrollY + viewH + 50;

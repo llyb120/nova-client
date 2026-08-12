@@ -127,6 +127,12 @@ export interface ThemeColors {
   violet: string;
   scroll: string;
   scrollHover: string;
+  wash1: string;
+  wash2: string;
+  gridDot: string;
+  glowAccent: string;
+  glowCyan: string;
+  glowCorner: string;
   accent7: string;
   accent8: string;
   accent12: string;
@@ -164,10 +170,10 @@ const VAR_KEYS: Array<[keyof ThemeColors, string]> = [
   ["border", "--border"],
   ["borderLight", "--border-light"],
   ["borderStrong", "--border-strong"],
-  ["text", "--text"],
-  ["textDim", "--text-dim"],
-  ["textMuted", "--text-muted"],
-  ["textFaint", "--text-faint"],
+  ["text", "--canvas-text"],
+  ["textDim", "--canvas-text-dim"],
+  ["textMuted", "--canvas-text-muted"],
+  ["textFaint", "--canvas-text-faint"],
   ["accent", "--accent"],
   ["accentDim", "--accent-dim"],
   ["onAccent", "--on-accent"],
@@ -178,6 +184,12 @@ const VAR_KEYS: Array<[keyof ThemeColors, string]> = [
   ["violet", "--violet"],
   ["scroll", "--scroll"],
   ["scrollHover", "--scroll-hover"],
+  ["wash1", "--wash-1"],
+  ["wash2", "--wash-2"],
+  ["gridDot", "--grid-dot"],
+  ["glowAccent", "--canvas-glow-accent"],
+  ["glowCyan", "--canvas-glow-cyan"],
+  ["glowCorner", "--canvas-glow-corner"],
 ];
 
 const MIX_KEYS: Array<[keyof ThemeColors, string]> = [
@@ -245,6 +257,70 @@ export function getTheme(): ThemeColors {
 /** 主题切换时强制失效缓存 */
 export function invalidateTheme(): void {
   themeCache = null;
+}
+
+/**
+ * 背景缓存在独立的离屏 Canvas：主题或尺寸变化时才重绘柔光与点阵；正文每帧只做一次位图拷贝。
+ * 比两个可见 Canvas 更稳：前景仍可使用 alpha:false，避免透明合成让暗色小字重新发虚。
+ */
+const backdropCache = new Map<string, HTMLCanvasElement>();
+
+export function paintCanvasBackdrop(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  theme: Pick<ThemeColors, "bg" | "glowAccent" | "glowCyan" | "glowCorner" | "gridDot">,
+): void {
+  const dpr = window.devicePixelRatio || 1;
+  const pixelW = Math.max(1, Math.round(width * dpr));
+  const pixelH = Math.max(1, Math.round(height * dpr));
+  const key = [pixelW, pixelH, theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
+  let surface = backdropCache.get(key);
+
+  if (!surface) {
+    surface = document.createElement("canvas");
+    surface.width = pixelW;
+    surface.height = pixelH;
+    const bg = surface.getContext("2d", { alpha: false })!;
+    bg.setTransform(dpr, 0, 0, dpr, 0, 0);
+    bg.fillStyle = theme.bg;
+    bg.fillRect(0, 0, width, height);
+
+    const radialEllipse = (
+      x: number,
+      y: number,
+      radiusX: number,
+      radiusY: number,
+      color: string,
+      fadeAt: number,
+    ) => {
+      bg.save();
+      bg.translate(x, y);
+      bg.scale(radiusX, radiusY);
+      const gradient = bg.createRadialGradient(0, 0, 0, 0, 0, 1);
+      gradient.addColorStop(0, color);
+      gradient.addColorStop(fadeAt, "transparent");
+      gradient.addColorStop(1, "transparent");
+      bg.fillStyle = gradient;
+      bg.fillRect(-2, -2, 4, 4);
+      bg.restore();
+    };
+    // Canvas 是不透明表面，不能直接裁切位于其下方的 body::before；按相同比例在会话区复现。
+    radialEllipse(width * 0.28, height * -0.14, 1000, 520, theme.glowAccent, 0.7);
+    radialEllipse(width * 0.86, height * -0.1, 780, 460, theme.glowCyan, 0.7);
+    radialEllipse(width * 1.04, height * 1.12, 820, 560, theme.glowCorner, 0.72);
+
+    bg.fillStyle = theme.gridDot;
+    const dot = 1 / dpr;
+    for (let y = 0; y < height; y += 26) {
+      for (let x = 0; x < width; x += 26) bg.fillRect(x, y, dot, dot);
+    }
+
+    if (backdropCache.size >= 4) backdropCache.delete(backdropCache.keys().next().value!);
+    backdropCache.set(key, surface);
+  }
+
+  ctx.drawImage(surface, 0, 0, pixelW, pixelH, 0, 0, width, height);
 }
 
 /* ===== 矢量图标（与 icons.tsx 的 feather 风格 path 一致，Path2D 直绘） ===== */

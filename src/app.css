@@ -23,11 +23,18 @@
   /* 表单输入底色：比面板略亮（浮起可交互） */
   --bg-input: #1e232d;
   --card-border: #313844;
-  /* 暗底文字压到 ~89% 亮度，避免高亮小字在深底上产生光晕 */
+  /* DOM 文字维持原层级；Canvas 对低对比小字单独提亮，抵消深底栅格化后的发虚。 */
   --text: #e4e7ec;
   --text-dim: #a9b0bd;
   --text-muted: #7d8593;
   --text-faint: #5d6470;
+  --canvas-text: #e4e7ec;
+  --canvas-text-dim: #b3bac6;
+  --canvas-text-muted: #8992a1;
+  --canvas-text-faint: #707987;
+  --canvas-glow-accent: rgba(110, 147, 248, 0.11);
+  --canvas-glow-cyan: rgba(63, 212, 228, 0.06);
+  --canvas-glow-corner: rgba(110, 147, 248, 0.05);
   --accent: #6e93f8;
   --accent-dim: rgba(110, 147, 248, 0.14);
   --on-accent: #0c1220;
@@ -84,11 +91,19 @@
   --border-strong: #aab1be;
   --bg-input: #f2f4f7;
   --card-border: #e5e7ec;
-  /* 亮底深字笔画显细，四档整体加深一档补回分量 */
+  /* Canvas 使用略柔和的独立文字阶，降低亮底高对比笔画的锐利感，不影响 DOM。 */
   --text: #181c24;
   --text-dim: #454d5c;
   --text-muted: #68707f;
   --text-faint: #969daa;
+  --canvas-text: #252a33;
+  --canvas-text-dim: #505866;
+  --canvas-text-muted: #707887;
+  --canvas-text-faint: #9299a5;
+  /* 亮底对光色更敏感，压低到 DOM 背景叠加后的实际观感。 */
+  --canvas-glow-accent: rgba(59, 94, 224, 0.055);
+  --canvas-glow-cyan: rgba(13, 157, 180, 0.028);
+  --canvas-glow-corner: rgba(59, 94, 224, 0.025);
   --accent: #3b5ee0;
   --accent-dim: rgba(59, 94, 224, 0.09);
   --on-accent: #ffffff;
