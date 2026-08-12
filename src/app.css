@@ -2118,6 +2118,13 @@ button {
   color: var(--text-dim);
 }
 
+/* 流式输出时避免出现突兀的矩形底板，完成后仍保留输出卡片。 */
+.tool-row.status-pending .tool-output,
+.tool-row.status-in_progress .tool-output {
+  background: transparent;
+  border-color: transparent;
+}
+
 .tool-summary {
   width: fit-content;
   max-width: 100%;

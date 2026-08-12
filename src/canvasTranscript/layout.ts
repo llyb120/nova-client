@@ -977,6 +977,7 @@ function makeScrollBox(opts: {
   env: LayoutEnv;
   radius?: number;
   copyId?: string;
+  chrome?: boolean;
 }): ScrollBox {
   const { x, y, w, maxH, padX, padY, text, f, color, lineH, key, env } = opts;
   // Canvas fillText does not implement <pre>-style tab stops. Expand only the
@@ -1018,12 +1019,14 @@ function makeScrollBox(opts: {
     regions: [],
     fixedRegions,
     paint: (ctx, view) => {
-      roundRectPath(ctx, x + 0.5, y + 0.5, w - 1, box.h - 1, radius);
-      ctx.fillStyle = view.theme.bgSidebar;
-      ctx.fill();
-      ctx.strokeStyle = view.theme.border;
-      ctx.lineWidth = 1;
-      ctx.stroke();
+      if (opts.chrome !== false) {
+        roundRectPath(ctx, x + 0.5, y + 0.5, w - 1, box.h - 1, radius);
+        ctx.fillStyle = view.theme.bgSidebar;
+        ctx.fill();
+        ctx.strokeStyle = view.theme.border;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
       ctx.save();
       roundRectPath(ctx, x, y, w, box.h, radius);
       ctx.clip();
@@ -1660,6 +1663,7 @@ function toolBlock(flow: Flow, item: ToolItem, env: LayoutEnv, active: boolean):
           key: scrollKey(`output-${index}`),
           env,
           copyId,
+          chrome: !busy,
         });
         bodyBlocks.push({ y: by, h: box.h, regions: [], lines: [], boxes: [box], paint: (ctx, view) => box.paint(ctx, view) });
         by += box.h + 8;
