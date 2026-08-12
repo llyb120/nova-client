@@ -1211,34 +1211,23 @@ button {
 .repo-time-toggle-hand {
   position: absolute;
   z-index: 2;
-  left: calc(50% - .5px);
-  top: 5px;
-  width: 1px;
-  height: 6px;
-  border-radius: 2px;
-  background: currentColor;
-  transform-origin: 50% 6px;
-  animation: repo-time-hand-turn 1s cubic-bezier(.4, 0, .2, 1) both;
-  will-change: transform;
+  inset: 1px;
+  border-radius: 50%;
+  opacity: 0;
+  transform-origin: center;
+  animation: repo-time-history-glow 1s ease-out both;
+  will-change: transform, opacity;
+  pointer-events: none;
 }
-/* 新世界线生成时，卡扣沿外圈扫过一整圈高亮，而不只转动细小表针。 */
+/* 只在历史变化时挂载一次：一小段高光沿卡扣边缘扫过，结束后完全消失。 */
 .repo-time-toggle-hand::before {
   content: "";
   position: absolute;
-  left: -12px;
-  top: -5px;
-  width: 21px;
-  height: 21px;
-  border: 2px solid transparent;
-  border-top-color: color-mix(in srgb, var(--accent) 96%, white);
-  border-right-color: color-mix(in srgb, var(--accent) 42%, transparent);
+  inset: 0;
+  border: 1.5px solid transparent;
+  border-top-color: var(--accent);
   border-radius: 50%;
-  box-shadow:
-    0 0 6px color-mix(in srgb, var(--accent) 90%, transparent),
-    0 0 14px color-mix(in srgb, var(--accent) 66%, transparent),
-    inset 0 0 5px color-mix(in srgb, var(--accent) 34%, transparent);
-  filter: drop-shadow(0 0 3px var(--accent));
-  pointer-events: none;
+  filter: drop-shadow(0 0 2px color-mix(in srgb, var(--accent) 72%, transparent));
 }
 .repo-time-toggle:focus-visible,
 .repo-time-magic-clock:focus-visible {
@@ -1331,6 +1320,12 @@ button {
 @keyframes repo-time-hand-turn {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+@keyframes repo-time-history-glow {
+  0% { opacity: 0; transform: rotate(0deg); }
+  12% { opacity: 1; }
+  72% { opacity: .85; }
+  100% { opacity: 0; transform: rotate(360deg); }
 }
 @media (prefers-reduced-motion: reduce) {
   .repo-time-machine,
