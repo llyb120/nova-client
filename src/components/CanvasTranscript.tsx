@@ -1633,12 +1633,23 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     // .tool-row margin 1px 0; .tool-line padding 3px 8px; min-height 26; gap 8
     const toolH = 26;
 
+    const rawOutput = item.rawOutput;
+    const durationValue = typeof rawOutput === "object" && rawOutput !== null
+      ? (rawOutput as Record<string, unknown>).durationMs
+        ?? (rawOutput as Record<string, unknown>).duration_ms
+      : undefined;
+    const durationMs = typeof durationValue === "number" && Number.isFinite(durationValue) && durationValue >= 0
+      ? durationValue
+      : undefined;
     result.push({ kind: "tool-header", id: item.id, groupIdx: gi,
       x, y: y + 1, w: proseW, h: toolH,
       text: label, color: item.status === "failed" ? p.red : p.dim,
       fontSize: 12, font: p.mono, hoverBg: p.hover, borderRadius: 7,
       cursor: hasBody ? "pointer" : "default",
-      data: { open, busy, hasBody, kind: item.kind, status: item.status, detail },
+      data: {
+        open, busy, hasBody, kind: item.kind, status: item.status, detail,
+        durationMs, startedAt: item.ts,
+      },
       clickAction: hasBody ? () => {
         const liveBusy = item.status === "pending" || item.status === "in_progress";
         toggleExpanded(key, !isExpanded(key, liveBusy));
@@ -2032,20 +2043,36 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function paintToolHeader(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette) {
-    const { open, busy, hasBody, kind, status, detail } = b.data as { open: boolean; busy: boolean; hasBody: boolean; kind: string; status: string; detail?: string };
-    // padding 3px 8px; gap 8 — match DOM .tool-line: icon → title → busy → chevron
+    const { open, busy, hasBody, kind, status, detail, durationMs, startedAt } = b.data as {
+      open: boolean; busy: boolean; hasBody: boolean; kind: string; status: string;
+      detail?: string; durationMs?: number; startedAt?: number;
+    };
+    // padding 3px 8px; gap 8 — match DOM .tool-line: icon → title/detail → duration → status → chevron
     const padX = 8;
     const gap = 8;
     const midY = snap(by + b.h / 2);
+    const elapsed = durationMs ?? (busy && startedAt != null ? Math.max(0, Date.now() - startedAt) : undefined);
+    const durationText = elapsed !== undefined && (durationMs !== undefined || elapsed >= 1000)
+      ? elapsed < 1000
+        ? `${Math.round(elapsed)}ms`
+        : elapsed < 60_000
+          ? `${(elapsed / 1000).toFixed(elapsed < 10_000 ? 2 : 1)}s`
+          : `${Math.floor(Math.round(elapsed / 1000) / 60)}m ${Math.round(elapsed / 1000) % 60}s`
+      : "";
+    const durationFontSize = 11.5;
+    const durationW = durationText ? measure(durationText, durationFontSize, p.mono) : 0;
+    // 运行中预留稳定宽度，避免秒数增长时标题和尾部图标左右跳动。
+    const durationReserve = busy ? measure("99m 59s", durationFontSize, p.mono) : durationW;
 
     // icon (14px) at left
     drawToolIcon(ctx, kind, bx + padX, by + (b.h - 14) / 2, 14, p.faint);
 
-    // label after icon + gap 8; reserve trailing icons so long titles ellipsize
+    // label after icon + gap 8; reserve trailing duration/icons so long titles ellipsize
     const textX = bx + padX + 14 + gap;
     let trailReserve = padX;
     if (busy || status === "failed") trailReserve += gap + 12;
     if (hasBody) trailReserve += gap + 12;
+    if (durationMs !== undefined || busy) trailReserve += gap + durationReserve;
     ctx.font = `${b.fontSize}px ${b.font}`;
     ctx.fillStyle = b.color || p.dim;
     ctx.textBaseline = "middle";
@@ -2056,6 +2083,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     fillTextCrisp(ctx, label, textX, midY);
 
     const labelW = measure(label, b.fontSize!, b.font!);
+    let detailEndX = textX + labelW;
     // detail：标题后 gap 8 + 1px 分隔线 + padding 8（对齐 DOM .tool-title + .tool-headline-detail）
     if (detail) {
       const sepX = textX + labelW + gap;
@@ -2074,11 +2102,19 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         ctx.restore();
         ctx.fillStyle = p.faint;
         fillTextCrisp(ctx, text, detailX, midY);
+        detailEndX = detailX + measure(text, b.fontSize!, b.font!);
       }
     }
 
-    // trailing status / chevron sit after the label (not flush-right)
-    let nextX = textX + labelW + gap;
+    // trailing duration / status / chevron sit after the visible headline (not flush-right)
+    let nextX = detailEndX + gap;
+    if (durationText) {
+      ctx.font = `${durationFontSize}px ${p.mono}`;
+      ctx.fillStyle = p.faint;
+      fillTextCrisp(ctx, durationText, nextX, midY);
+    }
+    if (durationMs !== undefined || busy) nextX += durationReserve + gap;
+
     if (busy) {
       const cx = nextX + 6;
       const angle = spinPhase * Math.PI * 2;
