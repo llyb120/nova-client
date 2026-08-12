@@ -2669,6 +2669,7 @@ impl RelayManager {
                 let avail = state.backend_availability.lock().unwrap();
                 let kinds = [
                     (AgentKind::Alkaid, s.vega_enabled),
+                    (AgentKind::Lyra, s.lyra_enabled),
                     (AgentKind::Devin, s.devin_enabled),
                     (AgentKind::Codex, s.codex_enabled),
                     (AgentKind::CodeBuddy, s.codebuddy_enabled),
