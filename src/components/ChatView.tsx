@@ -1393,7 +1393,7 @@ export function ChatView() {
             <span class="repo-time-toggle-clock" aria-hidden="true">
               <IconStopwatch size={17} />
               <Show keyed when={!timeMachineExpanded() && timeMachineHintTurn()}>
-                {() => <span class="repo-time-toggle-hand" />}
+                <span class="repo-time-toggle-hand" />
               </Show>
             </span>
             <span class="repo-time-toggle-label">世界线</span>
