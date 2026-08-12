@@ -18,7 +18,13 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       inputSchema: {
         type: "object",
         properties: {
-          keywords: { type: "array", minItems: 1, maxItems: 5, items: { type: "string" }, description: "1–5 个符号或关键词" },
+          keywords: {
+            anyOf: [
+              { type: "array", minItems: 1, items: { type: "string" } },
+              { type: "string", minLength: 1 },
+            ],
+            description: "关键词或符号名；字符串自动转单项数组，超过 5 项默认取前 5 项",
+          },
           task: { type: "string", description: "一句话任务描述，用于补充检索词和排序" },
           files: { type: "array", maxItems: 6, items: { type: "string" }, description: "已知必看文件，可与 keywords/task 同用" },
           budget: { type: "integer", minimum: 100, maximum: 1200, description: "完整代码单元行预算，默认 600" },
@@ -28,7 +34,10 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         additionalProperties: false,
       },
       async execute(params) {
-        const args = params ?? {};
+        const rawKeywords = params?.keywords;
+        const keywords = [...new Set((Array.isArray(rawKeywords) ? rawKeywords : typeof rawKeywords === "string" ? [rawKeywords] : [])
+          .map((value) => String(value ?? "").trim()).filter(Boolean))].slice(0, 5);
+        const args = { ...(params ?? {}), keywords };
         // fast_context 只有 Rust native 实现（JS 镜像已移除）；无全局 service 时直走 native。
         return await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
       },

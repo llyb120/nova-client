@@ -27,6 +27,17 @@ test("context argument aliases normalize", () => {
   assert.deepEqual(normalizeFastContextArgs({ query: "Widget" }).keywords, ["Widget"]);
 });
 
+test("fast_context keywords normalize to top five", () => {
+  assert.deepEqual(normalizeFastContextArgs({ keywords: "Widget" }).keywords, ["Widget"]);
+  assert.deepEqual(
+    normalizeFastContextArgs({ keywords: ["a", "b", "a", "c", "d", "e", "f"] }).keywords,
+    ["a", "b", "c", "d", "e"],
+  );
+  const schema = createNovaBatchTools(process.cwd(), { fastContext: true }).fast_context.inputSchema.properties.keywords;
+  assert.equal(schema.maxItems, undefined);
+  assert(schema.anyOf.some((option) => option.type === "string"));
+});
+
 test("devin policy routes context through MCP", () => {
   const policy = novaDevinBatchToolPolicy({ fastContext: true });
   assert.match(policy, /mcp_call_tool/);

@@ -1558,10 +1558,8 @@ impl SdkManager {
                 .find(|candidate| candidate.id() == id)
             {
                 let mut item = item;
-                if let (
-                    Item::Tool { ts: started_at, .. },
-                    Item::Tool { ts, call, .. },
-                ) = (&*slot, &mut item)
+                if let (Item::Tool { ts: started_at, .. }, Item::Tool { ts, call, .. }) =
+                    (&*slot, &mut item)
                 {
                     *ts = *started_at;
                     if matches!(call.status.as_str(), "completed" | "failed") {

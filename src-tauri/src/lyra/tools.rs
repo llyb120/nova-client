@@ -52,7 +52,13 @@ pub fn tool_set(read_only: bool, fast_context: bool) -> Vec<Tool> {
             parameters: schema(json!({
                 "type": "object",
                 "properties": {
-                    "keywords": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 5, "description": "1–5 个符号或关键词" },
+                    "keywords": {
+                        "anyOf": [
+                            { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                            { "type": "string", "minLength": 1 }
+                        ],
+                        "description": "关键词或符号名；字符串自动转单项数组，超过 5 项默认取前 5 项"
+                    },
                     "task": { "type": "string", "description": "一句话任务描述，用于补充检索词和排序" },
                     "files": { "type": "array", "items": { "type": "string" }, "maxItems": 6, "description": "已知必看文件，可与 keywords/task 同用" },
                     "budget": { "type": "integer", "minimum": 100, "maximum": 1200, "description": "完整代码单元行预算，默认 600" },
@@ -476,7 +482,24 @@ async fn execute_inner(
     match name {
         "fast_context" => {
             let root = root.to_path_buf();
-            let args = args.clone();
+            let mut args = args.clone();
+            if let Some(object) = args.as_object_mut() {
+                let raw = object.get("keywords").cloned().unwrap_or(Value::Null);
+                let values = match raw {
+                    Value::Array(values) => values,
+                    Value::String(value) => vec![Value::String(value)],
+                    _ => Vec::new(),
+                };
+                let mut seen = std::collections::HashSet::new();
+                let keywords = values
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
+                    .filter(|value| !value.is_empty() && seen.insert(value.to_lowercase()))
+                    .take(5)
+                    .map(Value::String)
+                    .collect();
+                object.insert("keywords".into(), Value::Array(keywords));
+            }
             match tokio::task::spawn_blocking(move || {
                 crate::nova_tools_native::context::fast_context(&root, args)
             })

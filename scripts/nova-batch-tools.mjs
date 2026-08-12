@@ -20,10 +20,10 @@ function stringList(value) {
 
 export function normalizeFastContextArgs(params = {}) {
   const query = String(params.query ?? "").trim();
-  const keywords = stringList(params.keywords);
+  const keywords = stringList(params.keywords).slice(0, 5);
   const task = String(params.task ?? "").trim() || (query.includes(" ") ? query : "");
   if (!keywords.length && query && !task) keywords.push(query);
-  const files = stringList(params.files);
+  const files = stringList(params.files).slice(0, 6);
   return {
     ...params,
     keywords,
@@ -60,7 +60,13 @@ export function createNovaBatchTools(cwd, options = {}) {
       inputSchema: {
         type: "object",
         properties: {
-          keywords: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "首选参数：关键词或符号名，建议 2–6 个" },
+          keywords: {
+            anyOf: [
+              { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+              { type: "string", minLength: 1 },
+            ],
+            description: "关键词或符号名；字符串自动转单项数组，超过 5 项默认取前 5 项",
+          },
           query: { type: "string", minLength: 1, description: "简短检索词；兼容单字符串调用，如 cursor" },
           task: { type: "string", minLength: 1, description: "自然语言任务描述，将自动提取检索词" },
           files: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "明确要纳入上下文的仓库相对文件路径" },
