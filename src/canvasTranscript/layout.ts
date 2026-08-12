@@ -979,7 +979,10 @@ function makeScrollBox(opts: {
   copyId?: string;
 }): ScrollBox {
   const { x, y, w, maxH, padX, padY, text, f, color, lineH, key, env } = opts;
-  const lines = wrapSegs([{ t: text, f, color }], w - padX * 2, lineH, f, { mode: "all", preWrap: true });
+  // Canvas fillText does not implement <pre>-style tab stops. Expand only the
+  // painted text; copy actions keep the original text (including real tabs).
+  const displayText = expandTabs(text);
+  const lines = wrapSegs([{ t: displayText, f, color }], w - padX * 2, lineH, f, { mode: "all", preWrap: true });
   const placed: TLine[] = [];
   let cy = padY;
   for (const line of lines) {
@@ -1335,11 +1338,11 @@ function toolBlock(flow: Flow, item: ToolItem, env: LayoutEnv, active: boolean):
       else if (part.removed) del += part.count ?? 0;
     }
   }
-  const label = (() => {
+  const label = expandTabs((() => {
     const t = (item.title || "").trim();
     if (t) return displayToolTitle(stripAnsi(t));
     return KIND_LABEL[item.kind] ?? item.kind;
-  })();
+  })());
 
   const titleF = font(12, { mono: true });
   const titleColor = item.status === "failed" ? theme.red : theme.textDim;
@@ -1560,7 +1563,7 @@ function toolBlock(flow: Flow, item: ToolItem, env: LayoutEnv, active: boolean):
         let ry = 0;
         for (const row of rows) {
           const wrapped = wrapSegs(
-            [{ t: row.text, f: font(12, { mono: true }), color: "" }],
+            [{ t: expandTabs(row.text), f: font(12, { mono: true }), color: "" }],
             bodyW - 26,
             lineH,
             font(12, { mono: true }),
@@ -1666,7 +1669,7 @@ function toolBlock(flow: Flow, item: ToolItem, env: LayoutEnv, active: boolean):
     if (!visibleContent && summary) {
       const f = font(12, { mono: true });
       const lineH = 12 * 1.55;
-      const lines = wrapSegs([{ t: summary, f, color: theme.textDim }], bodyW - 20, lineH, f, { preWrap: true });
+      const lines = wrapSegs([{ t: expandTabs(summary), f, color: theme.textDim }], bodyW - 20, lineH, f, { preWrap: true });
       const w = Math.min(bodyW, Math.max(...lines.map((l) => l.w), 0) + 20);
       const { tlines, height } = placeLines(flow, lines, bodyX + 10, by + 7);
       const y = by;
