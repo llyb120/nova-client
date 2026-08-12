@@ -57,6 +57,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Use crates.io (skip China mirror on GitHub runners)
         shell: bash
