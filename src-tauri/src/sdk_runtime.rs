@@ -1371,6 +1371,11 @@ impl SdkManager {
             // Node bridges also persist app-owned state. Pin them to the same profile-specific
             // root as Rust so debug builds never fall back to the release ~/.nova directory.
             .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
+        if self.adapter.agent_kind() == AgentKind::Alkaid {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("定位 Vega 内嵌 RTK 可执行文件失败：{e}"))?;
+            command.env("NOVA_RTK_EXE", exe);
+        }
         {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap();

@@ -290,6 +290,25 @@ impl Drop for PidGuard {
     }
 }
 
+fn rewrite_with_embedded_rtk(
+    command: &str,
+    shell: &crate::lyra::prompt::ShellConfig,
+) -> String {
+    use crate::lyra::prompt::ShellKind;
+    let Some(rewritten) = rtk::rewrite_command(command) else {
+        return command.to_string();
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return command.to_string();
+    };
+    let path = exe.to_string_lossy();
+    let prefix = match shell.kind {
+        ShellKind::PowerShell => format!("& '{}' __rtk ", path.replace('\'', "''")),
+        ShellKind::Bash => format!("'{}' __rtk ", path.replace('\'', "'\\''")),
+    };
+    rewritten.replace("rtk ", &prefix)
+}
+
 async fn run_bash(
     root: &Path,
     shell: &crate::lyra::prompt::ShellConfig,
@@ -299,15 +318,16 @@ async fn run_bash(
 ) -> Result<String, String> {
     use crate::lyra::prompt::ShellKind;
     let timeout_secs = timeout_secs.clamp(1, 600);
+    let command = rewrite_with_embedded_rtk(command, shell);
     let mut process = match shell.kind {
         ShellKind::PowerShell => {
             let mut p = tokio::process::Command::new(&shell.program);
-            p.arg("-c").arg(command);
+            p.arg("-c").arg(&command);
             p
         }
         ShellKind::Bash => {
             let mut p = tokio::process::Command::new(&shell.program);
-            p.arg("-c").arg(command);
+            p.arg("-c").arg(&command);
             p
         }
     };
@@ -656,6 +676,26 @@ async fn execute_inner(
     }
 }
 
+#[cfg(test)]
+mod embedded_rtk_tests {
+    use super::rewrite_with_embedded_rtk;
+    use crate::lyra::prompt::{ShellConfig, ShellKind};
+
+    #[test]
+    fn rewrites_supported_commands_without_external_rtk_binary() {
+        let shell = ShellConfig {
+            program: if cfg!(windows) { "powershell.exe" } else { "bash" }.into(),
+            kind: if cfg!(windows) { ShellKind::PowerShell } else { ShellKind::Bash },
+        };
+        let rewritten = rewrite_with_embedded_rtk("git status", &shell);
+        assert!(rewritten.contains("__rtk git status"), "{rewritten}");
+        assert!(!rewritten.starts_with("rtk "), "{rewritten}");
+        for unsupported in ["echo hello", "git rev-parse HEAD", "go version", "npm install"] {
+            assert_eq!(rewrite_with_embedded_rtk(unsupported, &shell), unsupported);
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::run_bash;
@@ -669,6 +709,7 @@ mod tests {
             kind: ShellKind::Bash,
         }
     }
+
 
     fn pid_alive(pid: u32) -> bool {
         unsafe { libc::kill(pid as i32, 0) == 0 }

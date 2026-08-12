@@ -199,6 +199,12 @@ fn should_enforce_single_instance() -> bool {
 }
 
 fn main() {
+    let mut args = std::env::args_os();
+    let program = args.next().unwrap_or_else(|| "nova".into());
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("__rtk")) {
+        std::process::exit(rtk::run_embedded(std::iter::once(program).chain(args)));
+    }
+
     // Finder / Dock 启动的 macOS .app 不继承终端 PATH。必须在任何 CLI 探测或
     // 后端线程启动前恢复，否则已安装的 codex、npx 等都会被误判为不可用。
     nova_lib::init_process_path();

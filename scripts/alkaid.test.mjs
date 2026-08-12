@@ -40,6 +40,8 @@ import {
   OPENAI_TOOL_OUTPUT_MAX_CHARS,
   OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS,
   TOOL_OUTPUT_CONTEXT_MAX_BYTES,
+  proxyAlkaidBashTool,
+  rewriteAlkaidBashCommand,
   resolveAlkaidShellConfig,
   restoreAlkaidSteeringForRetry,
   runAlkaidPromptWithRetry,
@@ -222,6 +224,36 @@ test("PI coding tools provide read, bash, edit and write", async () => {
   await edit.execute("3", { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] });
   assert.match((await bash.execute("4", { command: "ls -1" })).content[0].text, /a\.txt/);
   assert.equal(await readFile(join(cwd, "a.txt"), "utf8"), "AA");
+});
+
+test("Vega transparently routes supported bash commands through embedded RTK", async () => {
+  const novaExe = join(tmpdir(), "nova-rtk-test.exe");
+  await writeFile(novaExe, "stub");
+  const spawn = (_path, args) => ({ status: 3, stdout: `rtk ${args[2]}\n` });
+  const rewritten = rewriteAlkaidBashCommand("git status", "powershell", { novaExe, spawn });
+  assert.match(rewritten, /__rtk git status$/);
+
+  let executed;
+  const proxied = proxyAlkaidBashTool({
+    name: "bash",
+    async execute(_id, params) {
+      executed = params.command;
+      return { content: [{ type: "text", text: "ok" }] };
+    },
+  }, "powershell", { novaExe, spawn });
+  await proxied.execute("call", { command: "git status" });
+  assert.equal(executed, rewritten);
+});
+
+test("Vega embedded RTK proxy preserves unsupported commands", async () => {
+  const novaExe = join(tmpdir(), "nova-rtk-fallback-test.exe");
+  await writeFile(novaExe, "stub");
+  for (const unsupported of ["Get-Date", "git rev-parse HEAD", "go version", "npm install"]) {
+    assert.equal(rewriteAlkaidBashCommand(unsupported, "powershell", {
+      novaExe,
+      spawn: () => ({ status: 1, stdout: "" }),
+    }), unsupported);
+  }
 });
 
 test("prompt input preserves embedded and local images", async () => {

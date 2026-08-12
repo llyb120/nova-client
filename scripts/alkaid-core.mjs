@@ -12,6 +12,7 @@ import { getShellConfig } from "../node_modules/@earendil-works/pi-coding-agent/
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -675,6 +676,43 @@ export function resolveAlkaidShellConfig(shellConfig, env = process.env, platfor
   return shim ? { ...shellConfig, shell: shim } : shellConfig;
 }
 
+function quoteAlkaidShellArg(value, shellKind) {
+  return shellKind === "powershell"
+    ? `'${String(value).replaceAll("'", "''")}'`
+    : `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+export function rewriteAlkaidBashCommand(command, shellKind, options = {}) {
+  const raw = String(command ?? "");
+  const novaExe = options.novaExe ?? process.env.NOVA_RTK_EXE;
+  const spawn = options.spawn ?? spawnSync;
+  if (!raw.trim() || !novaExe || !existsSync(novaExe)) return raw;
+  const result = spawn(novaExe, ["__rtk", "rewrite", raw], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 2000,
+  });
+  const rewritten = String(result.stdout ?? "").trim();
+  if (!rewritten || ![0, 3].includes(result.status)) return raw;
+  const prefix = shellKind === "powershell"
+    ? `& ${quoteAlkaidShellArg(novaExe, shellKind)} __rtk `
+    : `${quoteAlkaidShellArg(novaExe, shellKind)} __rtk `;
+  return rewritten.replaceAll("rtk ", prefix);
+}
+
+export function proxyAlkaidBashTool(tool, shellKind, options = {}) {
+  if (tool?.name !== "bash") return tool;
+  return {
+    ...tool,
+    async execute(toolCallId, params, signal, onUpdate) {
+      // `rtk rewrite` is the source-of-truth allowlist: unsupported commands return
+      // no rewrite and execute byte-for-byte unchanged in the original shell.
+      const command = rewriteAlkaidBashCommand(params?.command, shellKind, options);
+      return tool.execute(toolCallId, { ...params, command }, signal, onUpdate);
+    },
+  };
+}
+
 function mcpResult(result) {
   const content = (result.content ?? []).flatMap((part) => {
     if (part.type === "text") return [{ type: "text", text: clampToolOutputText(part.text) }];
@@ -736,7 +774,8 @@ export async function createAlkaidAgent(options = {}) {
   };
   const codingTools = options.readOnly
     ? createReadOnlyTools(cwd, { read: { operations: readOperations } })
-    : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell }, read: { operations: readOperations } });
+    : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell }, read: { operations: readOperations } })
+      .map((tool) => proxyAlkaidBashTool(tool, shellConfig.kind, options.rtkOptions));
   const batchTools = createFilesystemTools(cwd);
   const rawTools = [...batchTools, ...codingTools, ...mcp.tools];
   const archiveDir = options.sessionId
