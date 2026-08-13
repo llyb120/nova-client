@@ -6,10 +6,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+use wait_timeout::ChildExt;
 use walkdir::WalkDir;
 
 #[cfg(windows)]
@@ -399,6 +402,39 @@ fn run_command(root: &Path, program: &str, args: &[String]) -> Option<Vec<u8>> {
         .map(|output| output.stdout)
 }
 
+fn run_command_until(
+    root: &Path,
+    program: &str,
+    args: &[String],
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    let mut child = hidden_command(program)
+        .args(args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Drain concurrently so a large rg result cannot fill the OS pipe and block the child.
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes).ok()
+    });
+    let completed = child.wait_timeout(remaining).ok()?.is_some();
+    if !completed {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let bytes = reader.join().ok().flatten();
+    if completed {
+        bytes
+    } else {
+        None
+    }
+}
+
 fn walk_code_files(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
     let walker = WalkDir::new(root)
@@ -631,6 +667,7 @@ fn rg_search(
     word: bool,
     paths: &[String],
     code_glob: bool,
+    deadline: Option<Instant>,
 ) -> Option<Vec<SearchRow>> {
     let mut args = vec![
         "-n".into(),
@@ -687,7 +724,11 @@ fn rg_search(
     } else {
         args.extend(paths.iter().cloned());
     }
-    let stdout = run_command(root, "rg", &args)?;
+    let stdout = if let Some(deadline) = deadline {
+        run_command_until(root, "rg", &args, deadline)?
+    } else {
+        run_command(root, "rg", &args)?
+    };
     Some(parse_search_rows(stdout))
 }
 
@@ -728,7 +769,7 @@ fn search_text(
         rows.truncate(MAX_HIT_LINES);
         return rows;
     }
-    if let Some(rows) = rg_search(root, &terms, ignore_case, word, files, false) {
+    if let Some(rows) = rg_search(root, &terms, ignore_case, word, files, false, None) {
         return rows;
     }
     let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
@@ -2090,8 +2131,10 @@ fn search_text_scopes(
 ) -> Vec<SearchRow> {
     if rg_available(root) {
         let rows = match dirs {
-            Some(dirs) if !dirs.is_empty() => rg_search(root, terms, ignore_case, word, dirs, true),
-            _ => rg_search(root, terms, ignore_case, word, &[], true),
+            Some(dirs) if !dirs.is_empty() => {
+                rg_search(root, terms, ignore_case, word, dirs, true, None)
+            }
+            _ => rg_search(root, terms, ignore_case, word, &[], true, None),
         };
         if let Some(rows) = rows {
             return rows;
@@ -3212,8 +3255,14 @@ fn no_index_query_discover(
         return;
     }
     // Markdown/SQL contribute lexical implementation evidence without entering the symbol/import graph.
-    let found = rg_search(root, terms, true, false, &[], true)
-        .unwrap_or_else(|| search_text(root, terms, true, false, &[]));
+    let found = match rg_search(root, terms, true, false, &[], true, Some(deadline)) {
+        Some(found) => found,
+        None if Instant::now() >= deadline => {
+            stats.deadline_hit = true;
+            return;
+        }
+        None => search_text(root, terms, true, false, &[]),
+    };
     let mut by_file = HashMap::<String, Vec<SearchRow>>::new();
     for row in found
         .into_iter()
@@ -6727,6 +6776,7 @@ mod tests {
             false,
             &[],
             true,
+            None,
         )
         .unwrap();
         assert!(
@@ -6737,6 +6787,25 @@ mod tests {
             rows.iter().all(|row| row.file != "generated/bundle.mjs"),
             "{rows:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_deadline_terminates_child() {
+        let start = Instant::now();
+        let args = vec![
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Start-Sleep -Seconds 5; Write-Output late".to_string(),
+        ];
+        let output = run_command_until(
+            Path::new("."),
+            "powershell.exe",
+            &args,
+            start + Duration::from_millis(150),
+        );
+        assert!(output.is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
