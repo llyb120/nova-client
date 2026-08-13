@@ -511,6 +511,15 @@ impl Agent {
                 details,
                 is_error,
             } = outcome;
+            if !is_error && call.name == "change_working_directory" {
+                if let Some(path) = details
+                    .as_ref()
+                    .and_then(|value| value.get("workingDirectory"))
+                    .and_then(Value::as_str)
+                {
+                    self.cwd = PathBuf::from(path);
+                }
+            }
             let mut result_message = json!({
                 "role": "toolResult",
                 "toolCallId": call.id,

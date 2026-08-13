@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -224,6 +224,23 @@ test("PI coding tools provide read, bash, edit and write", async () => {
   await edit.execute("3", { path: "a.txt", edits: [{ oldText: "A", newText: "AA" }] });
   assert.match((await bash.execute("4", { command: "ls -1" })).content[0].text, /a\.txt/);
   assert.equal(await readFile(join(cwd, "a.txt"), "utf8"), "AA");
+});
+
+test("Vega change_working_directory redirects subsequent coding tools", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "alkaid-cwd-"));
+  const child = join(cwd, "child");
+  await mkdir(child);
+  const runtime = await createAlkaidAgent({ cwd, model: configuredModel });
+  try {
+    const tools = new Map(runtime.agent.state.tools.map((tool) => [tool.name, tool]));
+    const changed = await tools.get("change_working_directory").execute("cwd", { path: "child" });
+    assert.match(changed.content[0].text, /child/);
+    await tools.get("write").execute("write", { path: "a.txt", content: "moved" });
+    assert.equal(await readFile(join(child, "a.txt"), "utf8"), "moved");
+  } finally {
+    await runtime.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("Vega transparently routes supported bash commands through embedded RTK", async () => {

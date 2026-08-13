@@ -416,6 +416,10 @@ async function prompt(request, commands) {
         result: event.isError ? undefined : event.result,
         error: event.isError ? { message: output } : undefined,
       } });
+      const workingDirectory = event.result?.details?.workingDirectory;
+      if (!event.isError && event.toolName === "change_working_directory" && workingDirectory) {
+        send({ type: "working_directory_changed", cwd: workingDirectory });
+      }
     }
   });
   void (async () => {

@@ -44,7 +44,17 @@ fn schema(value: Value) -> Value {
 }
 
 pub fn tool_set(read_only: bool, fast_context: bool) -> Vec<Tool> {
-    let mut tools = Vec::new();
+    let mut tools = vec![Tool {
+        name: "change_working_directory",
+        description: "改变本会话后续工具调用的工作目录，并通知 Nova 切换到已有项目或自动创建项目。相对路径基于当前工作目录解析；目录必须已存在。请单独调用，不要与依赖新目录的工具并行调用。".into(),
+        parameters: schema(json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "新的工作目录（相对当前工作目录或绝对路径）" }
+            },
+            "required": ["path"]
+        })),
+    }];
     if fast_context {
         tools.push(Tool {
             name: "fast_context",
@@ -290,10 +300,7 @@ impl Drop for PidGuard {
     }
 }
 
-fn rewrite_with_embedded_rtk(
-    command: &str,
-    shell: &crate::lyra::prompt::ShellConfig,
-) -> String {
+fn rewrite_with_embedded_rtk(command: &str, shell: &crate::lyra::prompt::ShellConfig) -> String {
     use crate::lyra::prompt::ShellKind;
     let Some(rewritten) = rtk::rewrite_command(command) else {
         return command.to_string();
@@ -672,6 +679,25 @@ async fn execute_inner(
                 Err(e) => ToolOutcome::error(format!("写入 {path} 失败：{e}")),
             }
         }
+        "change_working_directory" => {
+            let Some(path) = args.get("path").and_then(Value::as_str).map(str::trim) else {
+                return ToolOutcome::error("change_working_directory 缺少 path");
+            };
+            if path.is_empty() {
+                return ToolOutcome::error("change_working_directory 缺少 path");
+            }
+            let next = resolve_path(root, path);
+            match std::fs::metadata(&next) {
+                Ok(metadata) if metadata.is_dir() => ToolOutcome {
+                    content: vec![
+                        json!({ "type": "text", "text": format!("Current working directory: {}", next.display()) }),
+                    ],
+                    details: Some(json!({ "workingDirectory": next })),
+                    is_error: false,
+                },
+                _ => ToolOutcome::error(format!("工作目录不存在或不是目录：{}", next.display())),
+            }
+        }
         other => ToolOutcome::error(format!("未知工具：{other}")),
     }
 }
@@ -684,13 +710,27 @@ mod embedded_rtk_tests {
     #[test]
     fn rewrites_supported_commands_without_external_rtk_binary() {
         let shell = ShellConfig {
-            program: if cfg!(windows) { "powershell.exe" } else { "bash" }.into(),
-            kind: if cfg!(windows) { ShellKind::PowerShell } else { ShellKind::Bash },
+            program: if cfg!(windows) {
+                "powershell.exe"
+            } else {
+                "bash"
+            }
+            .into(),
+            kind: if cfg!(windows) {
+                ShellKind::PowerShell
+            } else {
+                ShellKind::Bash
+            },
         };
         let rewritten = rewrite_with_embedded_rtk("git status", &shell);
         assert!(rewritten.contains("__rtk git status"), "{rewritten}");
         assert!(!rewritten.starts_with("rtk "), "{rewritten}");
-        for unsupported in ["echo hello", "git rev-parse HEAD", "go version", "npm install"] {
+        for unsupported in [
+            "echo hello",
+            "git rev-parse HEAD",
+            "go version",
+            "npm install",
+        ] {
             assert_eq!(rewrite_with_embedded_rtk(unsupported, &shell), unsupported);
         }
     }
@@ -709,7 +749,6 @@ mod tests {
             kind: ShellKind::Bash,
         }
     }
-
 
     fn pid_alive(pid: u32) -> bool {
         unsafe { libc::kill(pid as i32, 0) == 0 }

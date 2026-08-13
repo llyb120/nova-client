@@ -1303,6 +1303,11 @@ impl SdkManager {
                     );
                 }
                 Some("item") => self.apply_item(thread_id, &event["item"], &mut item_ids),
+                Some("working_directory_changed") => {
+                    if let Some(cwd) = event.get("cwd").and_then(Value::as_str) {
+                        self.change_working_directory(thread_id, cwd);
+                    }
+                }
                 Some("plan") => self.apply_plan(thread_id, &event["plan"]),
                 Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
                 Some("permission") => self.emit_permission(thread_id, &event["permission"]),
@@ -1425,6 +1430,27 @@ impl SdkManager {
                 format!("启动 {} Node bridge 失败：{e}", self.adapter.label())
             }
         })
+    }
+
+    fn change_working_directory(&self, thread_id: &str, cwd: &str) {
+        let path = std::path::PathBuf::from(cwd);
+        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+        if !canonical.is_dir() {
+            return;
+        }
+        let cwd = canonical.to_string_lossy().into_owned();
+        let state = self.app.state::<AppState>();
+        {
+            let mut store = state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(thread_id) {
+                thread.cwd = cwd.clone();
+            }
+            store.save();
+        }
+        // touch 同时覆盖“已有则切换到最前、没有则创建”，并持久化 projects.json。
+        state.projects.lock().unwrap().touch(&cwd);
+        let _ = self.app.emit("projects:changed", json!({}));
+        let _ = self.app.emit(EV_THREADS, json!({}));
     }
 
     fn save_session_id(&self, thread_id: &str, session_id: &str) {

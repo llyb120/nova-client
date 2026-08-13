@@ -605,6 +605,13 @@ async fn handle_prompt(
             if outcome.get("specHit").and_then(Value::as_bool) == Some(true) {
                 emit(&json!({ "type": "timing", "phase": "spec_hit", "elapsedMs": 0 }));
             }
+            if let Some(cwd) = outcome
+                .get("details")
+                .and_then(|details| details.get("workingDirectory"))
+                .and_then(Value::as_str)
+            {
+                emit(&json!({ "type": "working_directory_changed", "cwd": cwd }));
+            }
             // 工具执行期间前端可能因运行态快照刷新而清空 liveUsage。在工具结束、
             // 下一次 provider request 之前重发上一 request 的真实累计值。
             if total_usage

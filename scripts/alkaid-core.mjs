@@ -14,7 +14,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
@@ -455,8 +455,22 @@ export function decodeTextBuffer(buffer) {
 
 export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
   const fastContext = opts.fastContext !== false && process.env.NOVA_FAST_CONTEXT !== "0";
-  const root = resolve(cwd);
-  const tools = [];
+  const workingDirectory = opts.workingDirectory ?? { cwd: resolve(cwd) };
+  const currentRoot = () => resolve(workingDirectory.cwd);
+  const tools = [{
+    name: "change_working_directory",
+    description: "改变本会话后续工具调用的工作目录，并通知 Nova 切换到已有项目或自动创建项目。相对路径基于当前工作目录解析；目录必须已存在。请单独调用，不要与依赖新目录的工具并行调用。",
+    parameters: Type.Object({ path: Type.String({ description: "新的工作目录（相对当前工作目录或绝对路径）" }) }),
+    async execute(_id, params) {
+      const rawPath = String(params?.path ?? "").trim();
+      if (!rawPath) throw new Error("change_working_directory 缺少 path");
+      const next = resolve(currentRoot(), rawPath);
+      const info = await stat(next).catch(() => null);
+      if (!info?.isDirectory()) throw new Error(`工作目录不存在或不是目录：${next}`);
+      workingDirectory.cwd = next;
+      return textResult(`Current working directory: ${next}`, { workingDirectory: next });
+    },
+  }];
   if (fastContext) tools.push(
     {
       name: "fast_context",
@@ -471,18 +485,17 @@ export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
       }),
       async execute(_id, params) {
         const args = params ?? {};
-        // fast_context 只有 Rust native 实现（JS 镜像已移除）；无全局 service 时直走 native。
+        const root = currentRoot();
         return textResult(await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args)));
       },
     },
     {
       name: "find_symbols",
       description: "并行定位多个符号在仓库中的所有出现位置（文件:行号）。只要行号不要正文时用；需要上下文用 fast_context。",
-      parameters: Type.Object({
-        names: Type.Array(Type.String(), { minItems: 1, description: "符号名列表" }),
-      }),
+      parameters: Type.Object({ names: Type.Array(Type.String(), { minItems: 1, description: "符号名列表" }) }),
       async execute(_id, params) {
         const args = params ?? {};
+        const root = currentRoot();
         return textResult(await callContextToolOrLocal("find_symbols", root, args, () => findSymbols(args, root)));
       },
     },
@@ -570,6 +583,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
   const skills = options.skills ?? [];
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
   const toolLines = [
+    "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
     "- read: 读取单个文件",
     options.readOnly
       ? "- grep / find / ls: 只读搜索与列举"
@@ -588,7 +602,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
         + (fastContext
           ? "任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（只要定义/引用行号时用 find_symbols）；一次调用通常替代 5–10 轮 rg+read 往返。拿不准是否涉及多个文件、或只是先分析要改哪里而不写代码时，同样按涉及处理，先调用 fast_context。find_symbols 只用于拿行号；定位后仍需阅读两个及以上文件正文时，把文件清单传给 fast_context 的 files 一次打包，不要逐个 read。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
           : "未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；")
-        + `大文件禁止无目的全量读取。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。`,
+        + `大文件禁止无目的全量读取。需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。`,
       (fastContext
         ? "搜索与遍历必须成本有界。路径和行段已明确且只需少量行段时直接 read；任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返），只要定义/引用位置时用 find_symbols。fast_context 已展示范围视为已读；SIG/IMPACT 仅在确需函数体时精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调；返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
         : "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。")
@@ -772,11 +786,20 @@ export async function createAlkaidAgent(options = {}) {
       return IMAGE_MEDIA_TYPES[extname(path).toLowerCase()];
     },
   };
-  const codingTools = options.readOnly
-    ? createReadOnlyTools(cwd, { read: { operations: readOperations } })
-    : createCodingTools(cwd, { bash: { shellPath: shellConfig.shell }, read: { operations: readOperations } })
-      .map((tool) => proxyAlkaidBashTool(tool, shellConfig.kind, options.rtkOptions));
-  const batchTools = createFilesystemTools(cwd);
+  const workingDirectory = { cwd };
+  const makeCodingTools = (root) => (options.readOnly
+    ? createReadOnlyTools(root, { read: { operations: readOperations } })
+    : createCodingTools(root, { bash: { shellPath: shellConfig.shell }, read: { operations: readOperations } })
+      .map((tool) => proxyAlkaidBashTool(tool, shellConfig.kind, options.rtkOptions)));
+  const codingTools = makeCodingTools(cwd).map((definition) => ({
+    ...definition,
+    async execute(toolCallId, params, signal, onUpdate) {
+      const tool = makeCodingTools(workingDirectory.cwd).find((candidate) => candidate.name === definition.name);
+      if (!tool) throw new Error(`工具不可用：${definition.name}`);
+      return tool.execute(toolCallId, params, signal, onUpdate);
+    },
+  }));
+  const batchTools = createFilesystemTools(cwd, null, { workingDirectory });
   const rawTools = [...batchTools, ...codingTools, ...mcp.tools];
   const archiveDir = options.sessionId
     ? join(alkaidDataRoot(), "tool-results", safeArchiveSegment(options.sessionId))
