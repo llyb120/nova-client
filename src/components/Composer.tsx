@@ -18,7 +18,6 @@ import {
   removeQueuedPrompt,
 } from "../promptQueue";
 import { mountSessionShortcuts } from "../sessionShortcuts";
-import { createComposerGhost } from "../composerGhost";
 import { api } from "../ipc";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import {
@@ -87,24 +86,6 @@ export function Composer() {
     if (resizeFrame === undefined) resizeFrame = requestAnimationFrame(flushInputResize);
   };
 
-  /* ===== 轻量模型行内补全（幽灵文字） ===== */
-  const ghostCtl = createComposerGhost({
-    getText: () => text(),
-    setText: (value) => {
-      setText(value);
-      setCursor(value.length);
-    },
-    getTextarea: () => textareaRef,
-    isBlocked: () =>
-      historyOpen() || slashStart() !== null || !state.settings?.completionModel?.trim(),
-    getThreadId: () => state.currentId ?? null,
-    onAfterAccept: () => {
-      if (textareaRef) updateSlashState(textareaRef, true);
-      resizeInput();
-    },
-  });
-  const { ghost, clearGhost, dismissGhostIfCaretMoved, syncGhostScroll, noteInput } = ghostCtl;
-
   createEffect(() => {
     text();
     resizeInput();
@@ -134,7 +115,6 @@ export function Composer() {
 
   onCleanup(() => {
     if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
-    if (pasteShortcutTimer !== undefined) clearTimeout(pasteShortcutTimer);
   });
 
   const attach = createImageAttachments({ enableFileDrop: true });
@@ -382,7 +362,6 @@ export function Composer() {
   const clearInput = () => {
     setText("");
     setHistoryOpen(false);
-    clearGhost();
     attach.clear();
     if (textareaRef) textareaRef.style.height = "auto";
   };
@@ -479,7 +458,6 @@ export function Composer() {
     const seq = ++pastePathsSeq;
     void resolveClipboardFilePaths(data).then((paths) => {
       if (seq !== pastePathsSeq || paths.length === 0) return;
-      clearGhost();
       insertShortcutText(paths.join("\n"), true);
     });
   };
@@ -543,7 +521,7 @@ export function Composer() {
       setSlashStart(null);
       return;
     }
-    if (ghostCtl.handleKeyDown(e)) return;
+
     if (e.key === "ArrowDown" && empty() && restoreDraft()) {
       e.preventDefault();
       return;
@@ -606,7 +584,6 @@ export function Composer() {
     if (historyOpen()) setHistoryOpen(false);
     if (typedSlash) void refreshSlashCommands(state.agentKind);
     updateSlashState(el, typedSlash || trackingSlash);
-    noteInput();
   };
 
   return (
@@ -752,14 +729,6 @@ export function Composer() {
         </div>
       </Show>
       <div class="composer-input-wrap">
-        <Show when={ghost()}>
-          <div
-            ref={ghostCtl.setGhostRef}
-            class="composer-ghost"
-            aria-hidden="true"
-            textContent={`${text()}${ghost()}`}
-          />
-        </Show>
         <textarea
           ref={textareaRef}
           class="composer-input"
@@ -773,18 +742,8 @@ export function Composer() {
           value={text()}
           onInput={onInput}
           onKeyDown={onKeyDown}
-          onClick={(e) => {
-            updateSlashState(e.currentTarget);
-            dismissGhostIfCaretMoved(e.currentTarget);
-          }}
-          onKeyUp={(e) => {
-            updateSlashState(e.currentTarget);
-            dismissGhostIfCaretMoved(e.currentTarget);
-          }}
-          onScroll={syncGhostScroll}
-          onBlur={ghostCtl.onBlur}
-          onCompositionStart={ghostCtl.onCompositionStart}
-          onCompositionEnd={ghostCtl.onCompositionEnd}
+          onClick={(e) => updateSlashState(e.currentTarget)}
+          onKeyUp={(e) => updateSlashState(e.currentTarget)}
           onPaste={onPaste}
           rows={3}
         />

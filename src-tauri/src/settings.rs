@@ -121,9 +121,6 @@ pub struct Settings {
     pub lightweight_model: String,
     /// /stage、/stage2 等命令依次使用的模型；/stage 默认取第一项。
     pub stage_models: Vec<StageModelTarget>,
-    /// 输入框补全所用 Vega 模型（provider/model 格式）；空 = 关闭补全。
-    /// 补全不走 agent，只对该模型 API 直接发一次 completion 请求。
-    pub completion_model: String,
     /// 打开文件用的编辑器命令（cursor / code / zed / windsurf 等，依赖 PATH）
     pub editor: String,
     /// 界面皮肤（ink-dark / ink-light，空 = 未设置，由前端 localStorage 迁移）
@@ -221,7 +218,6 @@ impl Default for Settings {
             lightweight_model_agent: "alkaid".into(),
             lightweight_model: String::new(),
             stage_models: Vec::new(),
-            completion_model: String::new(),
             editor: "code".into(),
             theme: String::new(),
             history_display_mode: "project".into(),

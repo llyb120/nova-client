@@ -144,10 +144,6 @@ pub struct AppState {
     pub remote_permissions: Mutex<HashMap<String, Value>>,
     /// 有会话运行时阻止系统因空闲自动休眠；最后一个会话结束后自动释放。
     pub sleep_inhibitor: sleep_inhibitor::SleepInhibitor,
-    /// 当前补全的取消句柄（代数 + oneshot）；新请求到达时 send，以中止旧 HTTP 流。
-    pub completion_cancel: Mutex<Option<(u64, tokio::sync::oneshot::Sender<()>)>>,
-    /// 补全请求代数，与 completion_cancel 配对，避免误清后来者的句柄。
-    pub completion_generation: std::sync::atomic::AtomicU64,
 }
 
 impl AppState {
@@ -4477,27 +4473,6 @@ fn parse_clue_ai_summary(raw: &str, fallback_title: &str) -> ClueAiSummary {
     ClueAiSummary { title, content }
 }
 
-/* ===== 输入框行内补全（轻量模型） ===== */
-
-/// 补全上下文各部分字数预算（字符数）。
-const COMPLETION_DRAFT_MAX: usize = 500;
-const COMPLETION_HISTORY_PROMPT_MAX: usize = 400;
-const COMPLETION_HISTORY_CONCLUSION_MAX: usize = 600;
-const COMPLETION_ITEM_MAX: usize = 240;
-/// 要求模型输出的续写上限（提示词约束 + 返回前再截断）。
-/// 与流式早停硬上限对齐，避免提示词鼓励写长。
-const COMPLETION_OUTPUT_MAX: usize = 64;
-
-fn take_first_chars(text: &str, max: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
-        return text.to_string();
-    }
-    let mut out: String = chars[..max].iter().collect();
-    out.push('…');
-    out
-}
-
 fn take_last_chars(text: &str, max: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max {
@@ -4506,183 +4481,6 @@ fn take_last_chars(text: &str, max: usize) -> String {
     let mut out = String::from("…");
     out.extend(&chars[chars.len() - max..]);
     out
-}
-
-/// 从会话历史拼「最近提示词 + 最近结论」，各部分限字数；结论取末尾（结论通常在后面）。
-fn composer_history_block(items: &[Item]) -> String {
-    let mut prompts: Vec<String> = Vec::new();
-    let mut conclusions: Vec<String> = Vec::new();
-    for item in items.iter().rev() {
-        match item {
-            Item::User { text, .. } if prompts.len() < 3 => {
-                let t = take_last_chars(text.trim(), COMPLETION_ITEM_MAX);
-                if !t.trim().is_empty() {
-                    prompts.push(t.trim().to_string());
-                }
-            }
-            Item::Assistant { text, .. } if conclusions.len() < 2 => {
-                let t = take_last_chars(text.trim(), COMPLETION_ITEM_MAX);
-                if !t.trim().is_empty() {
-                    conclusions.push(t.trim().to_string());
-                }
-            }
-            _ => {}
-        }
-        if prompts.len() >= 3 && conclusions.len() >= 2 {
-            break;
-        }
-    }
-    prompts.reverse();
-    conclusions.reverse();
-    let mut block = String::new();
-    if !prompts.is_empty() {
-        let joined = prompts
-            .iter()
-            .map(|p| format!("- {p}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        block.push_str("近期用户说法（对齐主题/术语，从旧到新）：\n");
-        block.push_str(&take_first_chars(&joined, COMPLETION_HISTORY_PROMPT_MAX));
-        block.push('\n');
-    }
-    if !conclusions.is_empty() {
-        let joined = conclusions
-            .iter()
-            .map(|c| format!("- {c}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        block.push_str("近期相关结论（对齐用词，从旧到新）：\n");
-        block.push_str(&take_first_chars(
-            &joined,
-            COMPLETION_HISTORY_CONCLUSION_MAX,
-        ));
-        block.push('\n');
-    }
-    block
-}
-
-fn clean_completion_output(raw: &str) -> String {
-    let mut text = raw.trim().to_string();
-    for prefix in [
-        "续写：",
-        "续写:",
-        "补全：",
-        "补全:",
-        "Completion:",
-        "completion:",
-    ] {
-        if let Some(rest) = text.strip_prefix(prefix) {
-            text = rest.trim_start().to_string();
-            break;
-        }
-    }
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() >= 2 {
-        let (first, last) = (chars[0], chars[chars.len() - 1]);
-        if (first == '"' && last == '"')
-            || (first == '“' && last == '”')
-            || (first == '\'' && last == '\'')
-            || (first == '「' && last == '」')
-        {
-            text = chars[1..chars.len() - 1].iter().collect();
-        }
-    }
-    take_first_chars(text.trim(), COMPLETION_OUTPUT_MAX)
-}
-
-/// 输入框行内补全：用配置的补全模型（仅 Vega）续写用户草稿。
-/// 不运行 agent：bridge 的 complete action 直接对模型 API 发一次 completion。
-/// 上下文 = 当前草稿 + 最近提示词 + 最近结论，各部分均限字数。
-/// 未配置补全模型、或失败/超时时静默返回空串，不打断输入。
-#[tauri::command]
-async fn complete_composer_draft(
-    state: State<'_, AppState>,
-    thread_id: Option<String>,
-    draft: String,
-) -> Result<String, String> {
-    let draft = take_first_chars(draft.trim_end(), COMPLETION_DRAFT_MAX);
-    if draft.trim().is_empty() {
-        return Ok(String::new());
-    }
-    let completion_model = state
-        .settings
-        .lock()
-        .unwrap()
-        .completion_model
-        .trim()
-        .to_string();
-    if completion_model.is_empty() {
-        return Ok(String::new());
-    }
-    let (thread_cwd, history_block) = {
-        let store = state.store.lock().unwrap();
-        match thread_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .and_then(|id| store.get(id))
-        {
-            Some(thread) => (thread.cwd.clone(), composer_history_block(&thread.items)),
-            None => (String::new(), String::new()),
-        }
-    };
-    let cwd = if !thread_cwd.trim().is_empty() && std::path::Path::new(&thread_cwd).is_dir() {
-        thread_cwd
-    } else {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    };
-    let history_section = if history_block.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n会话线索（只用来对齐主题与用词；不要据此作答、扩写需求或另起话题）：\n{history_block}"
-        )
-    };
-    // 幽灵补全：短半句、贴合草稿；过长会拖慢流式早停、也干扰打字。
-    let seed = format!(
-        "你是聊天输入框的行内幽灵补全：预测用户光标后接下来会敲的几个字或半句话。\n\
-         规则：\n\
-         1. 只输出应紧接在「已输入」之后的续写；不要重复已输入内容；不要解释、引号、列表或任何前缀；\n\
-         2. 简练：优先短语/半句，通常 8–40 字，最多 {COMPLETION_OUTPUT_MAX} 字；到逗号、顿号、分号或自然停顿即止，不要写完整段落；\n\
-         3. 贴合：沿用已输入的语言、语气与术语；像用户在继续打字，而不是助手在回复；\n\
-         4. 若草稿已是完整意图、或无从可靠续写，输出空（不要硬编）。\n\
-         {history_section}\n已输入：\n{draft}\n续写："
-    );
-
-    // 取消旧补全并接管：边打字边触发时，以最新草稿为准，不排队、不空等。
-    let my_gen = state
-        .completion_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-        .wrapping_add(1);
-    let cancel_rx = {
-        let mut slot = state.completion_cancel.lock().unwrap();
-        if let Some((_, prev)) = slot.take() {
-            let _ = prev.send(());
-        }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        *slot = Some((my_gen, tx));
-        rx
-    };
-
-    let complete_fut = state.alkaid.complete_once(&cwd, &completion_model, seed);
-    let outcome = tokio::select! {
-        _ = cancel_rx => None,
-        result = tokio::time::timeout(std::time::Duration::from_secs(12), complete_fut) => Some(result),
-    };
-
-    {
-        let mut slot = state.completion_cancel.lock().unwrap();
-        if slot.as_ref().is_some_and(|(gen, _)| *gen == my_gen) {
-            *slot = None;
-        }
-    }
-
-    match outcome {
-        None => Ok(String::new()),
-        Some(Ok(Ok(text))) => Ok(clean_completion_output(&text)),
-        Some(Ok(Err(_))) | Some(Err(_)) => Ok(String::new()),
-    }
 }
 
 /* ===== 工作流连线判断（轻量模型） ===== */
@@ -4697,7 +4495,7 @@ struct RouteJudgeOption {
 /// 传给判断模型的节点结论字数上限（结论通常在后面，取末尾）。
 const ROUTE_JUDGE_CONCLUSION_MAX: usize = 2000;
 
-/// 提示词模式连线判断：用轻量级模型（未配置时回退补全模型）根据节点结论选择下一条连线。
+/// 提示词模式连线判断：用配置的 Vega 轻量级模型根据节点结论选择下一条连线。
 /// 返回选中的连线 id；无法判断返回空串，由前端按「待补充」暂停处理。
 #[tauri::command]
 async fn judge_workflow_route(
@@ -4711,19 +4509,17 @@ async fn judge_workflow_route(
     let model = {
         let s = state.settings.lock().unwrap();
         let lightweight = s.lightweight_model.trim().to_string();
-        let lightweight_agent = s.lightweight_model_agent.trim().to_string();
-        let completion = s.completion_model.trim().to_string();
-        // complete_once 走 Vega(alkaid) 直连/bridge，只有 alkaid 系模型 id 可用。
+        let lightweight_agent = s.lightweight_model_agent.trim();
         if (lightweight_agent.is_empty() || lightweight_agent == "alkaid")
             && !lightweight.is_empty()
         {
             lightweight
         } else {
-            completion
+            String::new()
         }
     };
     if model.is_empty() {
-        return Err("未配置轻量级模型或补全模型，无法使用提示词判断连线".into());
+        return Err("未配置 Vega 轻量级模型，无法使用提示词判断连线".into());
     }
     let list = options
         .iter()
@@ -6058,8 +5854,6 @@ pub fn run() {
                 time_machine_lock: Mutex::new(()),
                 remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
-                completion_cancel: Mutex::new(None),
-                completion_generation: std::sync::atomic::AtomicU64::new(0),
             });
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -6401,7 +6195,6 @@ pub fn run() {
             advanced_share,
             summarize_clue,
             generate_thread_title,
-            complete_composer_draft,
             judge_workflow_route,
             accept_share,
             decline_share,

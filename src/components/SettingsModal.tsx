@@ -331,7 +331,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   );
   const [draftStageKind, setDraftStageKind] = createSignal<AgentKind | null>(null);
   const [draftStageModel, setDraftStageModel] = createSignal("");
-  const [completionModel, setCompletionModel] = createSignal(s?.completionModel ?? "");
   const [editor, setEditor] = createSignal(s?.editor ?? "code");
   const [sessionAutoCleanupEnabled, setSessionAutoCleanupEnabled] = createSignal(
     s?.sessionAutoCleanupEnabled ?? false,
@@ -765,7 +764,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     stageModels: stageModels()
       .map((target) => ({ agentKind: target.agentKind, model: target.model.trim() }))
       .filter((target) => target.model.length > 0),
-    completionModel: completionModel().trim(),
     editor: editor().trim() || "code",
     theme: state.theme,
     relayServer: relayServer().trim(),
@@ -1502,23 +1500,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                   portal
                 />
               </div>
-              <div class="field">
-                <span class="field-label">输入框补全模型</span>
-                <ModelPicker
-                  agentKind="alkaid"
-                  agentKinds={["alkaid"]}
-                  model={completionModel()}
-                  onPickModel={(_, m) => setCompletionModel(m)}
-                  prefix="补全模型"
-                  title="输入框补全模型"
-                  allowDefault
-                  defaultLabel="关闭补全"
-                  portal
-                />
-              </div>
-              <p class="settings-group-desc">
-                输入框补全仅支持 Vega 模型：不运行 agent，只对模型 API 直接发一次补全请求；未配置时关闭补全。
-              </p>
             </section>
 
             <section class="settings-group">

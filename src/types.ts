@@ -446,8 +446,6 @@ export interface Settings {
   lightweightModel: string;
   /** /stage、/stage2 等命令依次使用的模型；/stage 默认取第一项 */
   stageModels: StageModelTarget[];
-  /** 输入框补全所用 Vega 模型（provider/model 格式）；空 = 关闭补全 */
-  completionModel: string;
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */
   editor: string;
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */
