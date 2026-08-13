@@ -107,7 +107,7 @@ export function Sidebar(props: {
     return decisions + active;
   });
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "employees" | "workbench" | "workflows") => {
+  const switchView = (view: "home" | "clues" | "employees" | "workbench" | "workflows" | "training") => {
     setView(view);
     closeThread();
   };
@@ -115,14 +115,17 @@ export function Sidebar(props: {
   const openClues = () => switchView("clues");
   const openEmployees = () => switchView("employees");
   const openWorkbench = () => switchView("workbench");
+  const openTraining = () => switchView("training");
   const openWorkflows = () => switchView("workflows");
 
   // 数字员工（配置）/ 御书房（日常）视图下，左侧切换为「员工会话」这一卷。
   const isEmployeeView = () => state.view === "employees" || state.view === "workbench";
+  const isTrainingView = () => state.view === "training";
 
   const openHistoryThread = async (id: string) => {
-    // 历史会话属于普通模式；从工作流、证据链等页进入时同步复位顶部 tab。
-    setView("home");
+    const thread = state.threads.find((item) => item.id === id);
+    // 猎户座会话保持猎户座 tab；其它历史会话回到普通模式。
+    setView(thread?.experienceThread ? "training" : "home");
     await openThread(id);
   };
 
@@ -153,8 +156,10 @@ export function Sidebar(props: {
   // 当前这一卷：员工视图看员工产生的会话，否则看用户自己的会话。结构完全一致。
   const currentGroups = createMemo(() =>
     isEmployeeView()
-      ? groupByCwd(state.threads.filter((t) => t.employeeId && !isMindThread(t)))
-      : groupByCwd(state.threads.filter((t) => !t.employeeId)),
+      ? groupByCwd(state.threads.filter((t) => t.employeeId && !isMindThread(t) && !t.experienceThread))
+      : isTrainingView()
+        ? groupByCwd(state.threads.filter((t) => t.experienceThread))
+        : groupByCwd(state.threads.filter((t) => !t.employeeId && !t.experienceThread)),
   );
 
   type ThreadTreeRow = {
@@ -609,6 +614,14 @@ export function Sidebar(props: {
           <div class="mode-seg secondary">
             <button
               class="mode-seg-btn"
+              classList={{ active: state.view === "training" }}
+              onClick={openTraining}
+              title="大熊座：查看隔离的训练记录、北斗七星专家经验，并进行点赞点踩"
+            >
+              大熊座
+            </button>
+            <button
+              class="mode-seg-btn"
               classList={{ active: state.view === "workbench" }}
               onClick={openWorkbench}
               title="御书房：下旨交办、查看进行中事件、批阅奏折与汇报"
@@ -639,7 +652,7 @@ export function Sidebar(props: {
             <div class="thread-empty">
               <Show
                 when={isEmployeeView()}
-                fallback="还没有会话。在右侧输入任务开始。"
+                fallback={isTrainingView() ? "还没有训练会话。点击右侧“立即训练”开始。" : "还没有会话。在右侧输入任务开始。"}
               >
                 数字员工还没有留下会话。
                 <br />

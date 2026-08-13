@@ -10,6 +10,7 @@ mod codex_radar;
 mod context_service;
 mod credential_roaming;
 mod employees;
+mod experience;
 mod gitwt;
 mod http_stream;
 mod lyra;
@@ -841,6 +842,7 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
                 .or_else(|| wt_by_path.get(&t.cwd).cloned()),
             employee_id: t.employee_id.clone(),
             mind_thread: t.mind_thread,
+            experience_thread: t.experience_thread,
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             active_clue_card_id: t.active_clue_card_id.clone(),
@@ -3401,6 +3403,39 @@ async fn get_slash_commands(
 }
 
 #[tauri::command]
+fn list_experiences(state: State<'_, AppState>) -> Result<Value, String> {
+    let configs = state
+        .settings
+        .lock()
+        .unwrap()
+        .experience_experts
+        .clone();
+    experience::list_memory(&configs)
+}
+
+#[tauri::command]
+fn feedback_experience(state: State<'_, AppState>, experience_id: String, reward: f64) -> Result<Value, String> {
+    let settings = state.settings.lock().unwrap().clone();
+    let requested = if reward > 0.0 { 1 } else { -1 };
+    experience::set_user_feedback(&experience_id, requested, &settings.experience_experts)
+}
+
+#[tauri::command]
+fn delete_experience(experience_id: String) -> Result<Value, String> {
+    experience::delete_memory(&experience_id)
+}
+
+#[tauri::command]
+async fn evolve_experiences(app: tauri::AppHandle) -> Result<Value, String> {
+    experience::evolve_memory(&app).await
+}
+
+#[tauri::command]
+async fn train_experience(app: tauri::AppHandle) -> Result<Value, String> {
+    experience::train(&app, true).await
+}
+
+#[tauri::command]
 fn list_skills(state: State<'_, AppState>) -> Vec<skills::SkillInfo> {
     skills::list_skills(&state.config_dir)
 }
@@ -3477,21 +3512,16 @@ pub(crate) fn dispatch_prompt(
             t.mind_thread,
         )
     };
-    // Stage 引用不是一次性快照：每次投递都从源会话最新 items 重建，并通过各后端
-    // 已有的隐藏 prompt-context 通道注入，不污染 Stage 自己展示的用户消息。
+    // Stage 引用不是一次性快照：每次投递都从源会话最新 items 重建。
+    // 猎户座知识不在这里自动注入；只有 Lyra 可通过 load_trained_memory 显式调用。
     {
         let mut store = state.store.lock().unwrap();
-        let source_id = store
-            .get(&thread_id)
-            .and_then(|thread| thread.stage_source_thread_id.clone());
-        if let Some(source_id) = source_id {
-            let context = store
-                .get(&source_id)
-                .map(render_stage_context)
-                .ok_or("Stage 引用的源会话不存在")?;
-            if let Some(stage) = store.get_mut(&thread_id) {
-                stage.pending_stage_context = Some(context);
-            }
+        let source_id = store.get(&thread_id).and_then(|thread| thread.stage_source_thread_id.clone());
+        let stage_context = if let Some(source_id) = source_id {
+            Some(store.get(&source_id).map(render_stage_context).ok_or("Stage 引用的源会话不存在")?)
+        } else { None };
+        if let Some(thread) = store.get_mut(&thread_id) {
+            thread.pending_stage_context = stage_context;
         }
     }
     if employee_id.is_some() && !mind_thread {
@@ -4145,11 +4175,14 @@ async fn apply_runtime_settings(
     ) = {
         let mut s = state.settings.lock().unwrap();
         let context_runtime_changed = s.context_retrieval_mode != settings.context_retrieval_mode;
-        if context_runtime_changed {
+
+        let experience_tools_changed = s.experience_training_enabled != settings.experience_training_enabled;
+        if context_runtime_changed || experience_tools_changed {
             settings.apply_context_retrieval_environment();
         }
         let restart_vega = restart_all_agents
             || context_runtime_changed
+            || experience_tools_changed
             || s.vega_proxy != settings.vega_proxy
             || s.vega_context_mode != settings.vega_context_mode
             || s.vega_enabled != settings.vega_enabled;
@@ -5824,6 +5857,7 @@ pub fn run() {
             let tasks = employees::TaskStore::load(&dir);
             let workflows = employees::WorkflowStore::load(&dir);
             let memory = employees::MemoryStore::load(&dir);
+            experience::init(&dir);
             let mind = mind::MindStore::load(&dir);
             let decisions = employees::DecisionStore::load(&dir);
             let notices = notice::NoticeStore::load(&dir);
@@ -6093,6 +6127,18 @@ pub fn run() {
                 }
             });
 
+            // 经验训练调度无需跟随 5 秒员工心跳；每分钟检查一次是否达到用户配置的训练间隔。
+            // 手动 /train 不受该检查频率限制。
+            let experience_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tokio::time::{sleep, Duration};
+                sleep(Duration::from_secs(60)).await;
+                loop {
+                    experience::tick(&experience_app);
+                    sleep(Duration::from_secs(60)).await;
+                }
+            });
+
             // 自动更新：桌面端和无头模式都由后端 tokio 定时检测并静默下载暂存（每 10 分钟）。
             // 放后端而非前端 setInterval：WebView 计时器在窗口最小化/隐藏时会被严重节流甚至暂停；
             // 无头模式则根本没有前端。桌面端下载就绪后额外发事件显示可更新角标。
@@ -6221,6 +6267,11 @@ pub fn run() {
             get_model_options,
             refresh_alkaid_config,
             get_slash_commands,
+            list_experiences,
+            feedback_experience,
+            delete_experience,
+            evolve_experiences,
+            train_experience,
             send_prompt,
             truncate_thread,
             cancel_turn,

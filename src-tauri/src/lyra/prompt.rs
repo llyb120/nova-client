@@ -393,6 +393,7 @@ pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
         "cwd": options.cwd.trim_start_matches(r"\\?\").replace('\\', "/"),
         "readOnly": options.read_only,
         "fastContext": options.fast_context,
+        "memoryEnabled": options.memory_enabled,
         "shell": shell,
         "skills": options.skills_text,
         "customInstructions": options.custom_instructions,
@@ -426,6 +427,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         } else {
             Some("- edit / write: 单文件编辑或写入")
         },
+        options.memory_enabled.then_some("- feedback_memory: 对 fast_context 返回且本轮实际使用的训练知识闭环反馈"),
     ]
     .into_iter()
     .flatten()
@@ -433,6 +435,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     let mut stable: Vec<String> = vec![
         "你是 Lyra：高效、简单、面向软件工程结果。".into(),
         format!("Available tools:\n{}", tool_lines.join("\n")),
+
         if fast_context {
             "你拥有 Lyra 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 fast_context/find_symbols。任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（只要定义/引用行号时用 find_symbols）；一次调用通常替代 5–10 轮 rg+read 往返。拿不准是否涉及多个文件、或只是先分析要改哪里而不写代码时，同样按涉及处理，先调用 fast_context。find_symbols 只用于拿行号；定位后仍需阅读两个及以上文件正文时，把文件清单传给 fast_context 的 files 一次打包，不要逐个 read。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；大文件禁止无目的全量读取。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。"
         } else {
@@ -446,6 +449,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         }
         .into(),
         "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。".into(),
+        if options.memory_enabled { "fast_context 会用 task 自动附带相关训练知识（task 为空时回退 keywords）。若结果含 TRAINED KNOWLEDGE，当前会话新事实优先；rule 是强约束，memory 是可核验事实，experience 仅在条件匹配时适用，并在最终回复前调用 feedback_memory。" } else { "" }.into(),
         "先理解再修改，保持改动聚焦。".into(),
         "最终回复采用例外汇报，而不是完整工作报告。先直接给出用户可感知的结果；只有信息会影响结果判断、下一步行动、风险认知或可信度时，才写入最终回复。默认省略文件/函数/行号清单、搜索和工具调用过程、常规实现细节、具体测试命令、成功步骤清单、无实际影响的注意事项、泛化建议、‘无风险’声明，以及对同一结果的重复总结。正常成功时用 1～3 句话，不强制使用标题或列表；存在失败、未验证、行为变化、兼容性风险或用户必须操作的事项时，只围绕这些例外按需展开。用户明确询问实现细节时才提供详细报告。".into(),
         "完成修改后，优先根据版本控制 diff 按需确定受影响单元及直接使用方，并执行成本最低且有效的验证；禁止遍历或列出完整仓库、无依据扩大范围。最终回复只需说明验证是否通过，不列具体命令和逐项过程；仅当验证失败、无法验证或结果存在关键限制时补充原因与影响。".into(),
@@ -485,6 +489,7 @@ pub struct SystemPromptOptions {
     pub cwd: String,
     pub read_only: bool,
     pub fast_context: bool,
+    pub memory_enabled: bool,
     pub shell: Option<ShellConfig>,
     pub skills_text: String,
     pub custom_instructions: String,

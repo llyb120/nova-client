@@ -138,7 +138,9 @@ fn completions_messages(
                         .filter_map(|part| part.get("thinking").and_then(Value::as_str))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    if !thinking.is_empty() {
+                    // DeepSeek/Console Go 的 thinking 模式要求每条带 tool_calls 的 assistant
+                    // 历史都显式回传 reasoning_content；运行时合成工具调用可能只有决策轨迹。
+                    if !thinking.is_empty() || !tool_calls.is_empty() {
                         item.insert("reasoning_content".into(), json!(thinking));
                     }
                 }

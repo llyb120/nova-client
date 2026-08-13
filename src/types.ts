@@ -131,6 +131,8 @@ export interface ThreadMeta {
   employeeId?: string | null;
   /** Mind 自整理会话：默认不进入数字员工左侧会话列表 */
   mindThread?: boolean;
+  /** 猎户座训练会话：仅在猎户座历史展示 */
+  experienceThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
@@ -287,6 +289,8 @@ export interface Thread {
   employeeId?: string | null;
   /** Mind 自整理会话：默认不进入数字员工左侧会话列表 */
   mindThread?: boolean;
+  /** 猎户座训练会话：仅在猎户座历史展示 */
+  experienceThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** Stage 会话动态引用的源会话。 */
@@ -498,6 +502,74 @@ export interface Settings {
   embedModel: string;
   /** embedding 服务 API key（本地服务通常留空） */
   embedApiKey: string;
+  /** 独立经验库训练；经验不同于客观记忆和必须遵守的守则。开启后 Lyra fast_context 也会并行召回训练知识。 */
+  experienceTrainingEnabled: boolean;
+  experienceTrainingAgent: AgentKind;
+  experienceTrainingModel: string;
+  experienceTrainingIntervalMinutes: number;
+  experienceEvolutionIntervalMinutes: number;
+  experienceExperts: ExperienceExpertConfig[];
+}
+
+export interface ExperienceEntry {
+  id: string;
+  expertId: string;
+  kind: "experience" | "memory" | "rule";
+  trigger: string;
+  action: string;
+  avoid: string;
+  scope: string[];
+  sourceThreadIds: string[];
+  confidence: number;
+  utility: number;
+  positiveCount: number;
+  negativeCount: number;
+  /** 当前用户单票评价；模型反馈仍可累计到计数。 */
+  userFeedback: -1 | 0 | 1;
+  hitCount: number;
+  updatedAt: number;
+  status: string;
+}
+
+export interface ExperienceTrainingSession {
+  id: string;
+  createdAt: number;
+  agentKind: string;
+  model: string;
+  expertId: string;
+  sourceThreadIds: string[];
+  conversation: string;
+  output: string;
+  status: string;
+  error: string;
+}
+
+export interface ExperienceExpertRef {
+  id: string;
+  name: string;
+}
+
+export interface ExperienceOverview {
+  experiences: ExperienceEntry[];
+  /** 全部已配置专家；即使尚未产出知识也会返回。 */
+  experts: ExperienceExpertRef[];
+  lastTrainAt: number;
+  trainingCycles: number;
+  evolutionGeneration: number;
+  training: boolean;
+}
+
+export interface ExperienceExpertConfig {
+  id: string;
+  name: string;
+  writeRate: number;
+  valueLearningRate: number;
+  forgetRate: number;
+  mutationRate: number;
+  migrationRate: number;
+  abstractionLevel: number;
+  noveltyPreference: number;
+  negativeSensitivity: number;
 }
 
 export interface AgentInstructionTarget {

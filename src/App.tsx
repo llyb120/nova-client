@@ -13,8 +13,10 @@ import { ShareInboxModal } from "./components/ShareInboxModal";
 import { Sidebar } from "./components/Sidebar";
 import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
+import { TrainingGroundView } from "./components/TrainingGroundView";
 import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
+import "./training-ground.css";
 import { selectedChatText } from "./chatSelection";
 import { initStore, openNewSession, state } from "./store";
 
@@ -83,12 +85,16 @@ export default function App() {
         fallback={
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
+            <Show when={state.view === "training"} fallback={
             <Show when={state.view === "employees"} fallback={
               <Show when={state.view === "workbench"} fallback={<HomeView />}>
                 <DecisionWorkbench />
               </Show>
             }>
               <EmployeesView />
+            </Show>
+            }>
+              <TrainingGroundView />
             </Show>
           }>
             <EvidenceChainView />

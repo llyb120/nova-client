@@ -20,6 +20,7 @@ import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
 import { callNapiTool } from "./nova-napi-tools.mjs";
 import { callContextToolOrLocal } from "./nova-context-client.mjs";
+import { appendTrainedKnowledge, createExperienceTools } from "./alkaid-experience-tools.mjs";
 
 /** Reasonix-style per-tool context budget. Full oversized text is archived before truncation. */
 export const TOOL_OUTPUT_CONTEXT_MAX_BYTES = 32 * 1024;
@@ -486,7 +487,9 @@ export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
       async execute(_id, params) {
         const args = params ?? {};
         const root = currentRoot();
-        return textResult(await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args)));
+        // 代码上下文与训练知识同轮返回；模型不需要再调用独立的 load 工具。
+        const codeText = await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
+        return textResult(await appendTrainedKnowledge(codeText, args));
       },
     },
     {
@@ -593,6 +596,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
     fastContext ? "- fast_context: 一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG（内部批量 rg + 增量符号索引）" : null,
     fastContext ? "- find_symbols: 并行定位多个符号出现位置（只要行号时用）" : null,
     options.readOnly ? null : "- edit / write: 单文件编辑或写入",
+    process.env.NOVA_EXPERIENCE_TOOLS === "1" ? "- feedback_memory: 对 fast_context 返回且实际使用的训练知识闭环反馈" : null,
   ].filter(Boolean);
 
   const stableParts = [
@@ -607,6 +611,9 @@ export function buildAlkaidSystemPrompt(options = {}) {
         ? "搜索与遍历必须成本有界。路径和行段已明确且只需少量行段时直接 read；任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返），只要定义/引用位置时用 find_symbols。fast_context 已展示范围视为已读；SIG/IMPACT 仅在确需函数体时精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调；返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
         : "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。")
         + "除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。",
+    process.env.NOVA_EXPERIENCE_TOOLS === "1"
+      ? "fast_context 会自动附带相关训练知识。当前会话事实优先；rule 是强约束，memory 是可核验事实，experience 只在条件匹配时适用。若结果含 TRAINED KNOWLEDGE，最终回复前调用 feedback_memory，只反馈实际采用的条目；用户沉默不算成功，未采用或无法验证时用 reward=0。"
+      : "",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
     "完成修改后，优先根据版本控制 diff 按需确定受影响单元及直接使用方，并执行成本最低且有效的验证；禁止遍历或列出完整仓库、无依据扩大范围，纯文档类改动可说明依据后跳过测试，无法验证时须报告原因、建议命令及剩余风险。",
     options.shellConfig
@@ -800,7 +807,7 @@ export async function createAlkaidAgent(options = {}) {
     },
   }));
   const batchTools = createFilesystemTools(cwd, null, { workingDirectory });
-  const rawTools = [...batchTools, ...codingTools, ...mcp.tools];
+  const rawTools = [...batchTools, ...codingTools, ...createExperienceTools(), ...mcp.tools];
   const archiveDir = options.sessionId
     ? join(alkaidDataRoot(), "tool-results", safeArchiveSegment(options.sessionId))
     : undefined;
