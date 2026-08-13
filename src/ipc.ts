@@ -295,6 +295,8 @@ export const api = {
   /** 共享/分享工作流：to 为空串 = 共享给全组在线队友；返回送达的队友数。 */
   shareWorkflow: (workflow: WorkflowDef, to: string) =>
     invoke<number>("share_workflow", { workflow, to }),
+  revokeWorkflow: (workflowId: string) =>
+    invoke<number>("revoke_workflow", { workflowId }),
   getRelayWorkflowInbox: () => invoke<IncomingWorkflowShare[]>("get_relay_workflow_inbox"),
   acceptRelayWorkflowShare: (id: string) =>
     invoke<WorkflowDef>("accept_relay_workflow_share", { id }),

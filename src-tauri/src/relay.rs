@@ -859,6 +859,7 @@ impl RelayManager {
             "remote.device" => crate::remote::publish_main_sse(env.data),
             "share" => self.on_share(&env),
             "workflow" => self.on_workflow(&env),
+            "workflow.revoke" => self.on_workflow_revoke(&env),
             // guest -> host
             "roaming.create" => self.on_roaming_create(&env),
             "roaming.prompt" => self.on_roaming_prompt(&env),
@@ -1186,6 +1187,8 @@ impl RelayManager {
             .cloned()
             .unwrap_or_default())
     }
+
+
 
     fn clue_request(
         &self,
@@ -1598,40 +1601,34 @@ impl RelayManager {
         Ok(count)
     }
 
+    pub async fn revoke_workflow(&self, workflow_id: &str) -> Result<usize, String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v2/workflows/revoke")?
+            .json(&json!({ "workflowId": workflow_id }))
+            .send().await.map_err(|error| error.to_string())?;
+        let value: Value = decode_relay_json(response).await?;
+        Ok(value.get("count").and_then(Value::as_u64).unwrap_or(0) as usize)
+    }
+
     fn on_workflow(&self, env: &InEnvelope) {
-        // 轻量校验，避免无效消息污染收件箱
         let stages = env.data.get("stages").and_then(|v| v.as_array());
-        if stages.map(|a| a.is_empty()).unwrap_or(true) {
-            return;
-        }
-        let share = WorkflowShare {
-            id: uuid::Uuid::new_v4().to_string(),
-            from: env.from.clone(),
-            from_name: env.from_name.clone(),
-            def: env.data.clone(),
-            ts: now_ms(),
-        };
+        if stages.map(|a| a.is_empty()).unwrap_or(true) { return; }
+        let share = WorkflowShare { id: uuid::Uuid::new_v4().to_string(), from: env.from.clone(), from_name: env.from_name.clone(), def: env.data.clone(), ts: now_ms() };
         {
             let mut inbox = self.workflow_inbox.lock().unwrap();
-            // 工作流 id 在编辑/再次共享时保持不变，因此按发送方 + 工作流 id 原地更新，
-            // 避免对方每次修改后都看到一张过期的重复卡片。
-            let workflow_id = share
-                .def
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string);
-            let existing = workflow_id.as_deref().and_then(|id| {
-                inbox.iter().position(|item| {
-                    item.from == share.from
-                        && item.def.get("id").and_then(Value::as_str) == Some(id)
-                })
-            });
-            if let Some(index) = existing {
-                inbox[index] = share;
-            } else {
-                inbox.push(share);
-            }
+            let workflow_id = share.def.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string);
+            let existing = workflow_id.as_deref().and_then(|id| inbox.iter().position(|item| item.from == share.from && item.def.get("id").and_then(Value::as_str) == Some(id)));
+            if let Some(index) = existing { inbox[index] = share; } else { inbox.push(share); }
+            persist_workflow_inbox(&self.config_dir, &inbox);
+        }
+        self.emit_workflow_inbox();
+    }
+
+    fn on_workflow_revoke(&self, env: &InEnvelope) {
+        let Some(workflow_id) = env.data.get("workflowId").and_then(Value::as_str) else { return; };
+        {
+            let mut inbox = self.workflow_inbox.lock().unwrap();
+            inbox.retain(|item| !(item.from == env.from && item.def.get("id").and_then(Value::as_str) == Some(workflow_id)));
             persist_workflow_inbox(&self.config_dir, &inbox);
         }
         self.emit_workflow_inbox();

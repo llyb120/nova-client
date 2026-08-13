@@ -4799,6 +4799,11 @@ fn share_workflow(
 }
 
 #[tauri::command]
+async fn revoke_workflow(state: State<'_, AppState>, workflow_id: String) -> Result<usize, String> {
+    state.relay.revoke_workflow(&workflow_id).await
+}
+
+#[tauri::command]
 fn get_relay_workflow_inbox(state: State<'_, AppState>) -> Vec<WorkflowShare> {
     state.relay.workflow_inbox_list()
 }
@@ -6401,6 +6406,7 @@ pub fn run() {
             accept_share,
             decline_share,
             share_workflow,
+            revoke_workflow,
             get_relay_workflow_inbox,
             accept_relay_workflow_share,
             decline_relay_workflow_share,

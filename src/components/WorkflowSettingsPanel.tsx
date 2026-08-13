@@ -11,6 +11,7 @@ import {
   markWorkflowShared,
   saveWorkflow,
   setWorkflowEnabled,
+  unmarkWorkflowShared,
 } from "../workflow/storage";
 import { api } from "../ipc";
 import { enabledAgentKinds, refreshWorkflowInbox, state } from "../store";
@@ -242,27 +243,24 @@ export function WorkflowSettingsPanel() {
   async function submitShare() {
     const d = draft();
     if (!d) return;
-    if (!state.relay.connected) {
-      setMsg("未连接到团队中转站：请先在设置里填写 token 并等待连接成功");
-      return;
-    }
-    const errs = validateWorkflow(d);
-    if (errs.length > 0) {
-      setMsg(errs.join("；"));
-      return;
-    }
+    if (!state.relay.connected) { setMsg("未连接到团队中转站"); return; }
     setShareBusy(true);
-    setMsg("正在共享…");
     try {
+      if (wfShared()) {
+        const count = await api.revokeWorkflow(d.id);
+        unmarkWorkflowShared(d.id);
+        setSharedRev((v) => v + 1);
+        setMsg(`已撤回「${d.name}」的团队共享${count > 0 ? `（通知 ${count} 位成员）` : ""}`);
+        return;
+      }
+      const errs = validateWorkflow(d);
+      if (errs.length > 0) { setMsg(errs.join("；")); return; }
       const count = await api.shareWorkflow(d, "");
       markWorkflowShared(d.id);
       setSharedRev((v) => v + 1);
-      setMsg(`已共享「${d.name}」：${count} 位在线队友可在工作流页点「导入」获取；之后修改可再次共享以更新`);
-    } catch (e) {
-      setMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      setShareBusy(false);
-    }
+      setMsg(`已共享「${d.name}」：${count} 位在线队友可导入；再次点击可撤回共享`);
+    } catch (e) { setMsg(e instanceof Error ? e.message : String(e)); }
+    finally { setShareBusy(false); }
   }
 
   /** 接收队友分享的工作流：入库后新会话即可选择，重复分享会原地更新。 */
@@ -482,13 +480,9 @@ export function WorkflowSettingsPanel() {
                     classList={{ "wf-shared-btn": wfShared() }}
                     disabled={d().builtin || shareBusy()}
                     onClick={() => void submitShare()}
-                    title={
-                      wfShared()
-                        ? "已共享给团队；修改后再次点击可更新"
-                        : "共享给全组在线队友，对方在工作流页点「导入」获取（内置工作流人人都有，无需共享）"
-                    }
+                    title={wfShared() ? "撤回团队共享，移除队友尚未导入的条目" : "共享到团队空间，队友可在工作流页导入"}
                   >
-                    <IconShare size={13} /> {shareBusy() ? "共享中…" : wfShared() ? "已共享" : "共享"}
+                    <IconShare size={13} /> {shareBusy() ? "处理中…" : wfShared() ? "撤回共享" : "共享到团队"}
                   </button>
                 </Show>
                 <button class="wf-bar-toggle" onClick={() => setBarCollapsed(true)} title="收起工具条">

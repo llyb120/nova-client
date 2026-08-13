@@ -109,6 +109,11 @@ export function markWorkflowShared(id: string): void {
   localStorage.setItem(SHARED_KEY, JSON.stringify([...shared]));
 }
 
+export function unmarkWorkflowShared(id: string): void {
+  const shared = readSharedIds();
+  if (shared.delete(id)) localStorage.setItem(SHARED_KEY, JSON.stringify([...shared]));
+}
+
 /**
  * 接收队友分享的工作流：去掉内置标记、记录团队来源后入库。
  * 保持原 id，同一工作流再次分享 = 原地更新；接收后默认启用，新会话可直接选择。
