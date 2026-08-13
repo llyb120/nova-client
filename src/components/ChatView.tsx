@@ -1,4 +1,4 @@
-import { message } from "@tauri-apps/plugin-dialog";
+import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
 import { api } from "../ipc";
@@ -7,6 +7,7 @@ import {
   compactThread,
   chatScrollToBottomSignal,
   createThread,
+  deleteThread,
   openThread,
   pickThreadModel,
   refreshThreads,
@@ -17,7 +18,7 @@ import {
   timeMachineChangedSignal,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
-import type { AgentKind, Item, Thread, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
+import type { AgentKind, Item, Thread, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { TranscriptCanvas, type TranscriptCanvasApi } from "../canvasTranscript/TranscriptCanvas";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
@@ -763,6 +764,36 @@ export function ChatView() {
   const jumpToStage = async (threadId: string) => {
     // 每个 stage 都是独立会话；切换 stage 只切换会话，不再拼接 transcript。
     await openThread(threadId);
+  };
+  const [stageContextMenu, setStageContextMenu] = createSignal<{
+    x: number;
+    y: number;
+    thread: ThreadMeta;
+  } | null>(null);
+  const deleteStageEvent = async (thread: ThreadMeta) => {
+    setStageContextMenu(null);
+    const descendants = new Set([thread.id]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const candidate of stageThreads()) {
+        if (candidate.parentThreadId && descendants.has(candidate.parentThreadId) && !descendants.has(candidate.id)) {
+          descendants.add(candidate.id);
+          changed = true;
+        }
+      }
+    }
+    const followingCount = descendants.size - 1;
+    const ok = await confirm(
+      `删除事件「${stageName(thread)}」？聊天记录将一并删除。${followingCount > 0 ? `\n\n其后的 ${followingCount} 个事件也会一起删除。` : ""}`,
+      { title: "删除事件", kind: "warning" },
+    );
+    if (!ok) return;
+    try {
+      await deleteThread(thread.id);
+    } catch (error) {
+      await message(String(error), { kind: "error" });
+    }
   };
   const [starUpdating, setStarUpdating] = createSignal(false);
   const roamingRole = () => currentMeta()?.roamingRole ?? null;
@@ -1533,7 +1564,15 @@ export function ChatView() {
                 class="stage-rail-item"
                 classList={{ active: thread.id === state.currentId }}
                 title={thread.title}
-                onClick={() => void jumpToStage(thread.id)}
+                onClick={() => {
+                  setStageContextMenu(null);
+                  void jumpToStage(thread.id);
+                }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setStageContextMenu({ x: event.clientX, y: event.clientY, thread });
+                }}
               >
                 <span>{stageName(thread)}</span>
                 <small>{index() + 1}</small>
@@ -1542,6 +1581,24 @@ export function ChatView() {
           </For>
         </aside>
       </Show>
+      <Portal>
+        <Show when={stageContextMenu()} keyed>
+          {(menu) => (
+            <div class="repo-time-context-backdrop" onMouseDown={() => setStageContextMenu(null)}>
+              <div
+                class="repo-time-context-menu"
+                style={{
+                  left: `${Math.max(8, Math.min(menu.x, window.innerWidth - 210))}px`,
+                  top: `${Math.max(8, Math.min(menu.y, window.innerHeight - 80))}px`,
+                }}
+                onMouseDown={(event) => event.stopPropagation()}
+              >
+                <button onClick={() => void deleteStageEvent(menu.thread)}>删除事件</button>
+              </div>
+            </div>
+          )}
+        </Show>
+      </Portal>
       </div>
     </main>
   );
