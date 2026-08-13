@@ -9,11 +9,16 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use wait_timeout::ChildExt;
 use walkdir::WalkDir;
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -62,6 +67,9 @@ const CODE_FILE_EXTENSIONS: &[&str] = &[
     "java", "kt", "kts", "cs", "c", "h", "cc", "cpp", "hpp", "swift", "php", "scala", "dart", "m",
     "mm", "zig", "sql", "md",
 ];
+const CODE_FILES_GLOB: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,rs,py,pyi,go,java,kt,kts,cs,c,h,cc,cpp,hpp,swift,php,scala,dart,m,mm,zig,sql,md}";
+const SEARCH_SNAPSHOT_VERSION: u32 = 2;
+const SEARCH_INDEX_MIN_TOKEN: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Symbol {
@@ -107,6 +115,31 @@ struct SearchRow {
     file: String,
     ln: usize,
     text: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchSnapshot {
+    version: u32,
+    root: String,
+    fingerprint: String,
+    postings: HashMap<String, Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchDelta {
+    fingerprint: String,
+    files: HashMap<String, Option<Vec<String>>>,
+}
+
+#[derive(Clone)]
+struct SearchIndex {
+    fingerprint: String,
+    postings: Arc<HashMap<String, Vec<String>>>,
+}
+
+enum SearchIndexState {
+    Building,
+    Ready(SearchIndex),
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +228,8 @@ struct UnitCandidate {
 }
 
 static MEMO: OnceLock<Mutex<HashMap<String, DiskCache>>> = OnceLock::new();
+static SEARCH_INDEXES: OnceLock<Mutex<HashMap<String, SearchIndexState>>> = OnceLock::new();
+static SEARCH_WATCHERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// No-index request execution is intentionally independent from the persistent codemap cache.
 /// It is an A/B switch while the new one-pass algorithm is proven against the legacy pipeline.
@@ -506,6 +541,384 @@ fn list_code_files(root: &Path) -> Vec<String> {
         }
     }
     walk_code_files(root)
+}
+
+fn search_snapshot_path(root: &Path) -> PathBuf {
+    cache_path(root).with_file_name("search-snapshot-v2.bin")
+}
+
+fn search_wal_path(root: &Path) -> PathBuf {
+    cache_path(root).with_file_name("search-delta-v2.wal")
+}
+
+#[cfg(windows)]
+fn with_mapped_file<T>(path: &Path, consume: impl FnOnce(&[u8]) -> Option<T>) -> Option<T> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, PAGE_READONLY,
+    };
+    let file = fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len() as usize;
+    if size == 0 {
+        return None;
+    }
+    unsafe {
+        let mapping = CreateFileMappingW(
+            file.as_raw_handle() as _,
+            std::ptr::null(),
+            PAGE_READONLY,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        if mapping.is_null() {
+            return None;
+        }
+        let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size);
+        if view.Value.is_null() {
+            CloseHandle(mapping);
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(view.Value.cast::<u8>(), size);
+        let result = consume(bytes);
+        UnmapViewOfFile(view);
+        CloseHandle(mapping);
+        result
+    }
+}
+
+#[cfg(unix)]
+fn with_mapped_file<T>(path: &Path, consume: impl FnOnce(&[u8]) -> Option<T>) -> Option<T> {
+    let file = fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len() as usize;
+    if size == 0 {
+        return None;
+    }
+    unsafe {
+        let view = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        );
+        if view == libc::MAP_FAILED {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(view.cast::<u8>(), size);
+        let result = consume(bytes);
+        libc::munmap(view, size);
+        result
+    }
+}
+
+fn search_fingerprint(root: &Path, _files: &[String]) -> String {
+    git_value(root, &["rev-parse", "HEAD"])
+}
+
+fn search_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-' && ch != '.')
+        .filter(|token| token.len() >= SEARCH_INDEX_MIN_TOKEN)
+        .map(str::to_ascii_lowercase)
+}
+
+fn build_search_snapshot(root: &Path) -> Option<SearchSnapshot> {
+    let files = list_code_files(root);
+    if files.is_empty() {
+        return None;
+    }
+    let fingerprint = search_fingerprint(root, &files);
+    let mut postings = HashMap::<String, Vec<String>>::new();
+    for file in &files {
+        let Ok(text) = fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        let mut seen = HashSet::new();
+        for token in search_tokens(&text) {
+            if seen.insert(token.clone()) {
+                postings.entry(token).or_default().push(file.clone());
+            }
+        }
+    }
+    for files in postings.values_mut() {
+        files.sort();
+        files.dedup();
+    }
+    Some(SearchSnapshot {
+        version: SEARCH_SNAPSHOT_VERSION,
+        root: normalize_root(root),
+        fingerprint,
+        postings,
+    })
+}
+
+fn publish_search_snapshot(root: &Path, snapshot: SearchSnapshot) {
+    let key = snapshot.root.clone();
+    let index = SearchIndex {
+        fingerprint: snapshot.fingerprint.clone(),
+        postings: Arc::new(snapshot.postings.clone()),
+    };
+    let path = search_snapshot_path(root);
+    if let Ok(bytes) = bincode::serialize(&snapshot) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if fs::write(&temp, bytes).is_ok() {
+            if path.exists() {
+                let _ = fs::remove_file(&path);
+            }
+            let _ = fs::rename(temp, path);
+        }
+    }
+    let _ = fs::remove_file(search_wal_path(root));
+    SEARCH_INDEXES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(key, SearchIndexState::Ready(index));
+}
+
+fn load_search_snapshot(root: &Path) -> Option<SearchIndex> {
+    let mut snapshot = with_mapped_file(&search_snapshot_path(root), |bytes| {
+        bincode::deserialize::<SearchSnapshot>(bytes).ok()
+    })?;
+    if snapshot.version != SEARCH_SNAPSHOT_VERSION
+        || snapshot.root != normalize_root(root)
+        || snapshot.fingerprint != search_fingerprint(root, &[])
+    {
+        return None;
+    }
+    if let Some(delta) = with_mapped_file(&search_wal_path(root), |bytes| {
+        bincode::deserialize::<SearchDelta>(bytes).ok()
+    }) {
+        for (file, tokens) in delta.files {
+            for files in snapshot.postings.values_mut() {
+                files.retain(|candidate| candidate != &file);
+            }
+            if let Some(tokens) = tokens {
+                for token in tokens {
+                    snapshot
+                        .postings
+                        .entry(token)
+                        .or_default()
+                        .push(file.clone());
+                }
+            }
+        }
+        snapshot.fingerprint = delta.fingerprint;
+    }
+    Some(SearchIndex {
+        fingerprint: snapshot.fingerprint,
+        postings: Arc::new(snapshot.postings),
+    })
+}
+
+/// Return the current immutable index snapshot without ever waiting for construction. A cold or
+/// invalid snapshot starts a background build and immediately falls back to repository search.
+fn ensure_search_watcher(root: &Path) {
+    let key = normalize_root(root);
+    let watchers = SEARCH_WATCHERS.get_or_init(|| Mutex::new(HashSet::new()));
+    if !watchers.lock().unwrap().insert(key.clone()) {
+        return;
+    }
+    let root = root.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("nova-context-watcher".into())
+        .spawn(move || {
+            let mut last = String::new();
+            loop {
+                std::thread::sleep(Duration::from_millis(750));
+                let Some(status) = run_command(
+                    &root,
+                    "git",
+                    &[
+                        "status".into(),
+                        "--porcelain".into(),
+                        "-z".into(),
+                        "--untracked-files=all".into(),
+                    ],
+                ) else {
+                    continue;
+                };
+                let digest = format!("{:x}", Sha256::digest(&status));
+                if digest == last {
+                    continue;
+                }
+                last = digest;
+                let ready = SEARCH_INDEXES
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .and_then(|state| match state {
+                        SearchIndexState::Ready(index) => Some(index.clone()),
+                        _ => None,
+                    });
+                if let Some(index) = ready {
+                    let _ = refresh_search_delta(&root, index);
+                }
+            }
+        });
+}
+
+fn search_index_now(root: &Path) -> Option<SearchIndex> {
+    ensure_search_watcher(root);
+    let key = normalize_root(root);
+    let indexes = SEARCH_INDEXES.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = indexes.lock().unwrap();
+        if let Some(SearchIndexState::Ready(index)) = guard.get(&key) {
+            if index.fingerprint == search_fingerprint(root, &[]) {
+                return Some(index.clone());
+            }
+        }
+        if matches!(guard.get(&key), Some(SearchIndexState::Building)) {
+            return None;
+        }
+    }
+    if let Some(index) = load_search_snapshot(root) {
+        indexes
+            .lock()
+            .unwrap()
+            .insert(key, SearchIndexState::Ready(index.clone()));
+        return Some(index);
+    }
+    indexes
+        .lock()
+        .unwrap()
+        .insert(key.clone(), SearchIndexState::Building);
+    let owned_root = root.to_path_buf();
+    std::thread::Builder::new()
+        .name("nova-context-index".into())
+        .spawn(move || {
+            if let Some(snapshot) = build_search_snapshot(&owned_root) {
+                publish_search_snapshot(&owned_root, snapshot);
+            } else {
+                SEARCH_INDEXES
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap()
+                    .remove(&key);
+            }
+        })
+        .ok();
+    None
+}
+
+fn refresh_search_delta(root: &Path, index: SearchIndex) -> SearchIndex {
+    let Some(status) = run_command(
+        root,
+        "git",
+        &[
+            "status".into(),
+            "--porcelain".into(),
+            "-z".into(),
+            "--untracked-files=all".into(),
+        ],
+    ) else {
+        return index;
+    };
+    let mut changed = HashMap::<String, Option<Vec<String>>>::new();
+    for record in status.split(|byte| *byte == 0) {
+        let Ok(record) = std::str::from_utf8(record) else {
+            continue;
+        };
+        let file = normalize_rel(record.get(3..).unwrap_or(record));
+        if !is_searchable_implementation_file(&file) {
+            continue;
+        }
+        let tokens = fs::read_to_string(root.join(&file)).ok().map(|text| {
+            let mut values = search_tokens(&text).collect::<Vec<_>>();
+            values.sort();
+            values.dedup();
+            values
+        });
+        changed.insert(file, tokens);
+    }
+    if changed.is_empty() {
+        return index;
+    }
+    let mut postings = (*index.postings).clone();
+    for (file, tokens) in &changed {
+        for files in postings.values_mut() {
+            files.retain(|candidate| candidate != file);
+        }
+        if let Some(tokens) = tokens {
+            for token in tokens {
+                postings
+                    .entry(token.clone())
+                    .or_default()
+                    .push(file.clone());
+            }
+        }
+    }
+    let delta = SearchDelta {
+        fingerprint: index.fingerprint.clone(),
+        files: changed,
+    };
+    if let Ok(bytes) = bincode::serialize(&delta) {
+        let path = search_wal_path(root);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if fs::write(&temp, bytes).is_ok() {
+            let _ = fs::remove_file(&path);
+            let _ = fs::rename(temp, path);
+        }
+    }
+    let updated = SearchIndex {
+        fingerprint: index.fingerprint,
+        postings: Arc::new(postings),
+    };
+    SEARCH_INDEXES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            normalize_root(root),
+            SearchIndexState::Ready(updated.clone()),
+        );
+    updated
+}
+
+fn indexed_candidate_files(root: &Path, terms: &[String]) -> Option<Vec<String>> {
+    // Never run git/status or update work on the query path; the watcher publishes deltas.
+    let index = search_index_now(root)?;
+    let mut candidates = HashSet::<String>::new();
+    let mut usable = false;
+    for term in terms {
+        let tokens = search_tokens(term).collect::<Vec<_>>();
+        if tokens.is_empty() {
+            continue;
+        }
+        usable = true;
+        let mut per_term: Option<HashSet<String>> = None;
+        for token in tokens {
+            let Some(files) = index.postings.get(&token) else {
+                per_term = Some(HashSet::new());
+                break;
+            };
+            let set = files.iter().cloned().collect::<HashSet<_>>();
+            per_term = Some(match per_term {
+                Some(current) => current.intersection(&set).cloned().collect(),
+                None => set,
+            });
+        }
+        candidates.extend(per_term.unwrap_or_default());
+    }
+    // An index miss is not proof of absence (the watcher may not have published a fresh delta yet),
+    // so preserve recall by invoking the existing full repository fallback.
+    if !usable || candidates.is_empty() {
+        return None;
+    }
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+
+    candidates.sort();
+    candidates.dedup();
+    Some(candidates)
 }
 
 fn git_value(root: &Path, args: &[&str]) -> String {
@@ -2938,6 +3351,7 @@ struct NoIndexStats {
     scanned_files: usize,
     scanned_bytes: u64,
     deadline_hit: bool,
+    index_hit: bool,
 }
 
 fn no_index_safe_file(root: &Path, value: &str) -> Option<String> {
@@ -3255,14 +3669,33 @@ fn no_index_query_discover(
         return;
     }
     // Markdown/SQL contribute lexical implementation evidence without entering the symbol/import graph.
-    let found = match rg_search(root, terms, true, false, &[], true, Some(deadline)) {
-        Some(found) => found,
-        None if Instant::now() >= deadline => {
+    // A ready immutable snapshot narrows native search to matching files. Cold, corrupt or
+    // zero-hit snapshots preserve the existing deadline-bounded repository-wide fallback.
+    let indexed_files = indexed_candidate_files(root, terms);
+    stats.index_hit |= indexed_files.is_some();
+    let found = if let Some(files) = indexed_files.as_ref() {
+        if Instant::now() >= deadline {
             stats.deadline_hit = true;
             return;
         }
-        None => search_text(root, terms, true, false, &[]),
+        if files.is_empty() {
+            Vec::new()
+        } else {
+            // The snapshot already performed repository-wide candidate discovery. Reading the
+            // narrowed set in-process avoids another process and directory walk.
+            search_in_process(root, terms, true, false, files)
+        }
+    } else {
+        match rg_search(root, terms, true, false, &[], true, Some(deadline)) {
+            Some(found) => found,
+            None if Instant::now() >= deadline => {
+                stats.deadline_hit = true;
+                return;
+            }
+            None => search_text(root, terms, true, false, &[]),
+        }
     };
+
     let mut by_file = HashMap::<String, Vec<SearchRow>>::new();
     for row in found
         .into_iter()
@@ -3775,11 +4208,12 @@ fn fast_context_no_index(root: &Path, params: &Value) -> Result<String, String> 
         "forward-closure"
     };
     let mut out = format!(
-        "# CTX q={} task=\"{}\" @{}  algorithm=no-index-query-slice coverage={}\n# scan: {} candidate files / {} bytes / {:.1}ms{}\n",
+        "# CTX q={} task=\"{}\" @{}  algorithm=no-index-query-slice coverage={} source={}\n# scan: {} candidate files / {} bytes / {:.1}ms{}\n",
         if keywords.is_empty() { terms.join(",") } else { keywords.join(",") },
         task,
         revision,
         coverage,
+        if stats.index_hit { "memory-index" } else { "repository-search" },
         stats.scanned_files,
         stats.scanned_bytes,
         total_start.elapsed().as_secs_f64() * 1000.0,
@@ -7085,6 +7519,78 @@ mod tests {
         assert!(!no_index_context_enabled(&serde_json::json!({
             "_contextMode":"fast"
         })));
+    }
+
+    #[test]
+    fn search_snapshot_cold_fallback_then_hot_index() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/hot.ts"),
+            "export function uniqueHotAnchor() { return 1; }\n",
+        )
+        .unwrap();
+        let params = serde_json::json!({
+            "keywords":["uniqueHotAnchor"],
+            "deadlineMs":1000
+        });
+        let cold = fast_context_no_index(d.path(), &params).unwrap();
+        assert!(cold.contains("source=repository-search"), "{cold}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let hot = loop {
+            let out = fast_context_no_index(d.path(), &params).unwrap();
+            if out.contains("source=memory-index") {
+                break out;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "index did not become ready: {out}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(hot.contains("uniqueHotAnchor"), "{hot}");
+        assert!(search_snapshot_path(d.path()).is_file());
+        let scan_ms = |text: &str| {
+            let marker = text.split("# scan:").nth(1).unwrap_or_default();
+            marker
+                .split("ms")
+                .next()
+                .and_then(|prefix| prefix.rsplit('/').next())
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .unwrap_or(f64::MAX)
+        };
+        let cold_ms = scan_ms(&cold);
+        let hot_ms = scan_ms(&hot);
+        assert!(
+            hot_ms < 100.0,
+            "hot query too slow: cold={cold_ms:.1}ms hot={hot_ms:.1}ms"
+        );
+        fs::write(
+            d.path().join("bench.txt"),
+            format!("cold_ms={cold_ms:.1} hot_ms={hot_ms:.1}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn corrupt_snapshot_falls_back_without_failure() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/a.ts"),
+            "export const corruptAnchor = 1;\n",
+        )
+        .unwrap();
+        let path = search_snapshot_path(d.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"not-a-snapshot").unwrap();
+        let out = fast_context_no_index(
+            d.path(),
+            &serde_json::json!({"keywords":["corruptAnchor"],"deadlineMs":1000}),
+        )
+        .unwrap();
+        assert!(out.contains("source=repository-search"), "{out}");
+        assert!(out.contains("corruptAnchor"), "{out}");
     }
 
     #[test]

@@ -7,6 +7,8 @@ import { join, resolve } from "node:path";
 
 const REPO = resolve(import.meta.dirname, "..");
 const EXE = process.env.LYRA_AB_EXE ?? join(REPO, ".cargo-target", "debug", "nova.exe");
+const EXE_A = process.env.LYRA_AB_EXE_A ?? EXE;
+const EXE_B = process.env.LYRA_AB_EXE_B ?? EXE;
 const MODEL = process.env.LYRA_AB_MODEL ?? "opencode/deepseek-v4-flash/variant/high";
 const THREAD_DIR = process.env.LYRA_AB_THREAD_DIR ?? join(homedir(), ".nova", "threads");
 const OUT = process.env.LYRA_AB_OUT ?? join(import.meta.dirname, "fast-context-real-history-deepseek-ab.report.json");
@@ -62,9 +64,9 @@ function loadCases() {
 function runOne(test, arm) {
   return new Promise((resolveRun) => {
     const started = Date.now();
-    const child = spawn(EXE, ["lyra"], {
+    const child = spawn(arm === "A" ? EXE_A : EXE_B, ["lyra"], {
       cwd: REPO,
-      env: { ...process.env, NOVA_DATA_DIR: join(homedir(), ".nova"), NOVA_CONTEXT_RETRIEVAL_MODE: arm === "A" ? "fast" : "super", LYRA_SPECULATE: "0" },
+      env: { ...process.env, NOVA_DATA_DIR: join(homedir(), ".nova"), NOVA_CONTEXT_RETRIEVAL_MODE: process.env.LYRA_AB_CONTEXT_MODE ?? "super", LYRA_SPECULATE: "0" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let buffer = "", stderr = "", finalText = "", contextText = "", usage = null, done = false;
@@ -112,6 +114,6 @@ const aggregate = (arm) => {
   const avg = (key) => runs.reduce((sum, run) => sum + Number(run[key] ?? 0), 0) / runs.length;
   return { cases: runs.length, success: runs.filter((run) => !run.timeout && !run.error && !run.exitCode).length, avgWallMs: avg("wallMs"), avgKeywordRecall: avg("keywordRecall"), avgPathRecall: avg("pathRecall"), totalTokens: runs.reduce((sum, run) => sum + tokenCount(run), 0) };
 };
-const report = { ranAt: new Date().toISOString(), model: MODEL, source: THREAD_DIR, arms: { A: "indexed legacy", B: "optimized no-index query-driven slice" }, rows, totals: { A: aggregate("A"), B: aggregate("B") } };
+const report = { ranAt: new Date().toISOString(), model: MODEL, source: THREAD_DIR, arms: { A: EXE_A, B: EXE_B }, contextMode: process.env.LYRA_AB_CONTEXT_MODE ?? "super", rows, totals: { A: aggregate("A"), B: aggregate("B") } };
 writeFileSync(OUT, JSON.stringify(report, null, 2));
 console.log(JSON.stringify({ out: OUT, totals: report.totals }, null, 2));
