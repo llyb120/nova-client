@@ -1438,7 +1438,7 @@ impl SdkManager {
         if !canonical.is_dir() {
             return;
         }
-        let cwd = canonical.to_string_lossy().into_owned();
+        let cwd = display_working_directory(&canonical);
         let state = self.app.state::<AppState>();
         {
             let mut store = state.store.lock().unwrap();
@@ -1896,6 +1896,17 @@ fn parse_bridge_output(output: &str, label: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("{label} bridge 响应缺少 data"))
 }
 
+fn display_working_directory(path: &std::path::Path) -> String {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        value.into_owned()
+    }
+}
+
 fn normalize_title(output: &str, fallback: &str) -> String {
     let title = output
         .trim()
@@ -2056,9 +2067,9 @@ fn codex_todo_plan(value: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_todo_plan, complete_pending_tools, derive_title, is_codex_model_resume_warning,
-        normalize_title, parse_bridge_output, resolve_codex_model, text_snapshot_change, tool_call,
-        TextSnapshotChange,
+        codex_todo_plan, complete_pending_tools, derive_title, display_working_directory,
+        is_codex_model_resume_warning, normalize_title, parse_bridge_output, resolve_codex_model,
+        text_snapshot_change, tool_call, TextSnapshotChange,
     };
     use crate::sdk_adapters::{
         AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter, SdkAdapter,
@@ -2243,6 +2254,18 @@ mod tests {
         let partial = json!({ "input_tokens": 100 });
         let (usage, _) = ClaudeAdapter.normalize_usage(Some(&partial), None, None);
         assert!(usage.is_none());
+    }
+
+    #[test]
+    fn working_directory_hides_windows_verbatim_prefix() {
+        assert_eq!(
+            display_working_directory(std::path::Path::new(r"\\?\D:\code\nova-client")),
+            r"D:\code\nova-client"
+        );
+        assert_eq!(
+            display_working_directory(std::path::Path::new(r"\\?\UNC\server\share\repo")),
+            r"\\server\share\repo"
+        );
     }
 
     #[test]
