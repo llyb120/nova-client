@@ -54,7 +54,11 @@ const REVERSE_FULL_REBUILD_CHANGES: usize = 64;
 /// 成本随仓库线性增长，下次冷启动重扫这几个文件更划算。首次建缓存不受此限制。
 const PERSIST_MIN_CHANGED: usize = 16;
 /// 查询发现覆盖代码及承载实现细节的文本资源；资源文件不进入符号索引。
-const CODE_FILES_GLOB: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,rs,py,pyi,go,java,kt,kts,cs,c,h,cc,cpp,hpp,swift,php,scala,dart,m,mm,zig,sql,md}";
+const CODE_FILE_EXTENSIONS: &[&str] = &[
+    "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "vue", "svelte", "rs", "py", "pyi", "go",
+    "java", "kt", "kts", "cs", "c", "h", "cc", "cpp", "hpp", "swift", "php", "scala", "dart", "m",
+    "mm", "zig", "sql", "md",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Symbol {
@@ -669,8 +673,14 @@ fn rg_search(
         args.push(glob.into());
     }
     if code_glob {
-        args.push("--glob".into());
-        args.push(CODE_FILES_GLOB.into());
+        // Positive --glob patterns whitelist matching files and therefore override .gitignore.
+        // A custom rg type limits extensions while preserving normal ignore semantics.
+        for extension in CODE_FILE_EXTENSIONS {
+            args.push("--type-add".into());
+            args.push(format!("novacode:*.{extension}"));
+        }
+        args.push("--type".into());
+        args.push("novacode".into());
     }
     if paths.is_empty() {
         args.push(".".into());
@@ -3228,8 +3238,17 @@ fn no_index_query_discover(
                     }
                 }
                 let declaration = [
-                    "fn ", "function ", "struct ", "enum ", "class ", "interface ",
-                    "type ", "const ", "static ", "def ", "impl ",
+                    "fn ",
+                    "function ",
+                    "struct ",
+                    "enum ",
+                    "class ",
+                    "interface ",
+                    "type ",
+                    "const ",
+                    "static ",
+                    "def ",
+                    "impl ",
                 ]
                 .iter()
                 .any(|prefix| {
@@ -3248,19 +3267,10 @@ fn no_index_query_discover(
     // Keep cheap line-level evidence for every result. Only the high-confidence head is parsed;
     // the tail remains available as a compact candidate map.
     for (file, hit_rows) in &ranked {
-        rows.entry(file.clone()).or_insert_with(|| {
-            hit_rows
-                .iter()
-                .take(MAX_HITS_PER_FILE)
-                .cloned()
-                .collect()
-        });
+        rows.entry(file.clone())
+            .or_insert_with(|| hit_rows.iter().take(MAX_HITS_PER_FILE).cloned().collect());
     }
-    for (rank, (file, _hit_rows)) in ranked
-        .into_iter()
-        .take(NO_INDEX_MAX_SUMMARIES)
-        .enumerate()
-    {
+    for (rank, (file, _hit_rows)) in ranked.into_iter().take(NO_INDEX_MAX_SUMMARIES).enumerate() {
         // Native search may consume most of a cold deadline. Always parse a high-confidence head;
         // only optional tail candidates obey the deadline.
         if rank >= 12 && Instant::now() >= deadline {
@@ -3280,8 +3290,6 @@ fn no_index_query_discover(
         sources.insert(file, source);
     }
 }
-
-
 
 fn no_index_target_files(
     roots: &[String],
@@ -3313,8 +3321,8 @@ fn no_index_target_files(
             });
             // A direct SQL hit is an implementation root; do not let a same-named code
             // definition suppress it during best-tier filtering.
-            let resource_hit = !is_code_file(file)
-                && rows.get(file).is_some_and(|hits| !hits.is_empty());
+            let resource_hit =
+                !is_code_file(file) && rows.get(file).is_some_and(|hits| !hits.is_empty());
             let tier = if exact_def || resource_hit {
                 2
             } else if loose_def {
@@ -3745,7 +3753,12 @@ fn fast_context_no_index(root: &Path, params: &Value) -> Result<String, String> 
     for want_test in [false, true] {
         let cap = if want_test { 8 } else { 24 };
         for (file, hits, is_test, _) in candidate_paths.iter().filter(|row| row.2 == want_test) {
-            if picked.iter().filter(|(_, picked_test, _)| *picked_test == want_test).count() >= cap {
+            if picked
+                .iter()
+                .filter(|(_, picked_test, _)| *picked_test == want_test)
+                .count()
+                >= cap
+            {
                 break;
             }
             picked.push((file.clone(), *is_test, *hits));
@@ -6690,6 +6703,43 @@ mod tests {
     }
 
     #[test]
+    fn code_filtered_search_preserves_gitignore() {
+        let d = tempdir().unwrap();
+        git(d.path(), &["init", "-q"]);
+        fs::create_dir(d.path().join("src")).unwrap();
+        fs::create_dir(d.path().join("generated")).unwrap();
+        fs::write(d.path().join(".gitignore"), "generated/\n").unwrap();
+        fs::write(
+            d.path().join("src/visible.ts"),
+            "const context_anchor = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("generated/bundle.mjs"),
+            "const context_anchor = 2;\n",
+        )
+        .unwrap();
+
+        let rows = rg_search(
+            d.path(),
+            &["context_anchor".to_string()],
+            false,
+            false,
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(
+            rows.iter().any(|row| row.file == "src/visible.ts"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| row.file != "generated/bundle.mjs"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
     fn symbol_locations_and_code_map_distinguish_defs() {
         let d = tempdir().unwrap();
         fs::create_dir(d.path().join("src")).unwrap();
@@ -7041,7 +7091,10 @@ mod tests {
         .unwrap();
         assert!(out.contains("services/game/minigame.go"), "{out}");
         assert!(out.contains("docs/queries/minigame.md"), "{out}");
-        assert!(out.contains("SELECT game_id, genre FROM minigame_data"), "{out}");
+        assert!(
+            out.contains("SELECT game_id, genre FROM minigame_data"),
+            "{out}"
+        );
     }
 
     #[test]
