@@ -518,19 +518,17 @@ pub(crate) fn detect_max_tokens_field(base_url: &str, provider: &Value) -> &'sta
         };
     }
     let url = base_url.to_lowercase();
-    if url.contains("deepseek.com")
-        || url.contains("moonshot")
+    if url.contains("moonshot")
         || url.contains("together")
         || url.contains("chutes.ai")
+        || url.contains("nvidia")
+        || url.contains("ant-ling")
     {
         "max_tokens"
     } else {
-        // openai-compatible 代理多数认 max_tokens；官方 OpenAI 更偏 max_completion_tokens
-        if url.contains("api.openai.com") {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        }
+        // 与 Vega/PI 对齐：标准及未知 OpenAI-compatible 默认 max_completion_tokens；
+        // 只有 PI 明确识别的兼容服务默认使用旧 max_tokens，配置仍可显式覆盖。
+        "max_completion_tokens"
     }
 }
 
@@ -708,7 +706,7 @@ mod tests {
         assert_eq!(target.api, "openai-completions");
         assert_eq!(target.model_id, "deepseek-v4-flash");
         assert_eq!(target.thinking_format.as_deref(), Some("deepseek"));
-        assert_eq!(target.max_tokens_field, "max_tokens");
+        assert_eq!(target.max_tokens_field, "max_completion_tokens");
         assert!(target.reasoning);
     }
 

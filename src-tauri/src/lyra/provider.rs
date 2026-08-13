@@ -363,6 +363,36 @@ fn responses_body(
 
 // ---------- HTTP + SSE ----------
 
+// PI/OpenAI SDK 的请求可由 AbortSignal 打断；Lyra 使用 reqwest 时必须显式把取消和
+// deadline 并入网络 future，否则代理接受连接后不发响应头/SSE 时会永久挂起。
+const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+async fn wait_cancelled(cancel: &Arc<AtomicBool>) {
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+    }
+}
+
+async fn send_request(
+    request: reqwest::RequestBuilder,
+    cancel: &Arc<AtomicBool>,
+) -> Result<reqwest::Response, String> {
+    tokio::select! {
+        result = tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, request.send()) => {
+            match result {
+                Ok(result) => result.map_err(|e| format!("请求失败：{e}")),
+                Err(_) => Err(format!(
+                    "provider 响应头等待超过 {}s",
+                    RESPONSE_HEADERS_TIMEOUT.as_secs()
+                )),
+            }
+        }
+        _ = wait_cancelled(cancel) => Err("provider 请求已取消".into()),
+    }
+}
+
 async fn post_stream(
     http: &reqwest::Client,
     url: &str,
@@ -370,6 +400,7 @@ async fn post_stream(
     api_key: &str,
     session_id: Option<&str>,
     body: Value,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<reqwest::Response, String> {
     let mut request = http
         .post(url)
@@ -400,7 +431,7 @@ async fn post_stream(
             }
         }
     }
-    let response = request.send().await.map_err(|e| format!("请求失败：{e}"))?;
+    let response = send_request(request, cancel).await?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -425,13 +456,18 @@ async fn read_sse(
 ) -> Result<bool, String> {
     let mut buffer = String::new();
     loop {
-        if cancel.load(Ordering::SeqCst) {
-            return Ok(true);
-        }
-        let chunk = response
-            .chunk()
-            .await
-            .map_err(|e| format!("读取响应流失败：{e}"))?;
+        let chunk = tokio::select! {
+            result = tokio::time::timeout(SSE_IDLE_TIMEOUT, response.chunk()) => {
+                match result {
+                    Ok(result) => result.map_err(|e| format!("读取响应流失败：{e}"))?,
+                    Err(_) => return Err(format!(
+                        "provider SSE 连续 {}s 无数据",
+                        SSE_IDLE_TIMEOUT.as_secs()
+                    )),
+                }
+            }
+            _ = wait_cancelled(cancel) => return Ok(true),
+        };
         let Some(chunk) = chunk else {
             return Ok(false);
         };
@@ -588,7 +624,7 @@ async fn stream_completions(
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
     let url = crate::alkaid_complete::join_url(&model.base_url, "chat/completions");
-    let mut response = post_stream(http, &url, model, api_key, session_id, body).await?;
+    let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await?;
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
     let mut finish_reason: Option<String> = None;
@@ -717,7 +753,7 @@ async fn stream_responses(
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
     let url = crate::alkaid_complete::join_url(&model.base_url, "responses");
-    let mut response = post_stream(http, &url, model, api_key, session_id, body).await?;
+    let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await?;
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
     let mut open_call: Option<usize> = None;
@@ -911,6 +947,8 @@ fn is_retryable_stream_error(error: &str) -> bool {
         "请求失败",
         "timeout",
         "timed out",
+        "响应头等待超过",
+        "sse 连续",
         "http 429",
         "too many requests",
         "rate limit",
@@ -1003,11 +1041,15 @@ pub async fn stream_chat(
         .await;
 
         match result {
+            Err(_) if cancel.load(Ordering::SeqCst) => {
+                let mut result = StreamResult::empty();
+                result.stop_reason = "aborted".into();
+                return Ok(result);
+            }
             Err(error)
                 if !emitted
                     && retry < STREAM_RETRY_DELAYS_MS.len()
-                    && is_retryable_stream_error(&error)
-                    && !cancel.load(Ordering::SeqCst) =>
+                    && is_retryable_stream_error(&error) =>
             {
                 let delay = STREAM_RETRY_DELAYS_MS[retry];
                 retry += 1;
@@ -1249,7 +1291,7 @@ async fn stream_anthropic(
             request = request.header(key.as_str(), text);
         }
     }
-    let mut response = request.send().await.map_err(|e| format!("请求失败：{e}"))?;
+    let mut response = send_request(request, cancel).await?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();

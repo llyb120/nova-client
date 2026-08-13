@@ -69,6 +69,10 @@ impl SdkAdapter for LyraAdapter {
         true
     }
 
+    fn uses_text_deltas(&self) -> bool {
+        true
+    }
+
     fn cancel_grace_attempts(&self) -> usize {
         20
     }

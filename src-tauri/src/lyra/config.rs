@@ -324,8 +324,10 @@ pub fn resolve_model(
     }
     let url_lower = base_url.to_lowercase();
     let official_openai = url_lower.contains("api.openai.com");
-    let session_affinity_headers = compat_flag(model, provider, "sendSessionAffinityHeaders")
-        .unwrap_or(api == "openai-completions" && !official_openai);
+    // 与 Vega/PI 对齐：默认不注入会话亲和 header；仅 provider/model 显式声明时发送。
+    // 自建 OpenAI 兼容代理可能错误地把这些 header 固定到失效上游，形成半开 SSE。
+    let session_affinity_headers =
+        compat_flag(model, provider, "sendSessionAffinityHeaders").unwrap_or(false);
     let id_lower = model_id.to_lowercase();
     let requires_reasoning_content = compat_flag(
         model,
@@ -395,5 +397,56 @@ pub fn resolve_config_env(value: &Value, env: &HashMap<String, String>) -> Resul
             Ok(Value::Object(out))
         }
         other => Ok(other.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_openai_proxy_defaults_match_vega_pi() {
+        let config = json!({
+            "provider": {
+                "custom": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": { "baseURL": "http://127.0.0.1:8317/v1", "apiKey": "key" },
+                    "models": {
+                        "gpt": {
+                            "reasoning": true,
+                            "variants": { "medium": { "reasoningEffort": "medium" } }
+                        }
+                    }
+                }
+            }
+        });
+        let resolved = resolve_model(
+            &config,
+            Some("custom/gpt/variant/medium"),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(resolved.model.max_tokens_field, "max_completion_tokens");
+        assert!(!resolved.model.session_affinity_headers);
+    }
+
+    #[test]
+    fn explicit_proxy_compat_overrides_pi_defaults() {
+        let config = json!({
+            "provider": {
+                "custom": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "compat": {
+                        "maxTokensField": "max_tokens",
+                        "sendSessionAffinityHeaders": true
+                    },
+                    "options": { "baseURL": "http://127.0.0.1:8317/v1", "apiKey": "key" },
+                    "models": { "gpt": {} }
+                }
+            }
+        });
+        let resolved = resolve_model(&config, Some("custom/gpt"), &HashMap::new()).unwrap();
+        assert_eq!(resolved.model.max_tokens_field, "max_tokens");
+        assert!(resolved.model.session_affinity_headers);
     }
 }
