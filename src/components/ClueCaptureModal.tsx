@@ -45,6 +45,7 @@ export function ClueCaptureModal(props: {
   const [placement, setPlacement] = createSignal<Placement>(defaultPlacement());
   const [targetCardId, setTargetCardId] = createSignal(activeCardId() ?? "");
   const [stackSameSession, setStackSameSession] = createSignal(false);
+  const [space, setSpace] = createSignal<"personal" | "team">(state.clueSpace);
   const [title, setTitle] = createSignal(initialVersion()?.title ?? (props.threadId ? state.title : ""));
   const [content, setContent] = createSignal(
     initialVersion()?.content ?? (props.threadId ? lastAssistant() : ""),
@@ -154,6 +155,7 @@ export function ClueCaptureModal(props: {
         nextTarget,
         mentionTokens(),
         attachments.images(),
+        space(),
       );
       props.onClose();
     } catch (error) {
@@ -170,7 +172,7 @@ export function ClueCaptureModal(props: {
         classList={{ "is-dragging": attachments.dragging() }}
         onPaste={attachments.onPaste}
       >
-        <Show when={!props.sessionMode}>
+        <Show when={!props.sessionMode && props.initialPlacement !== "new"}>
           <div class="clue-placement">
             <button
               type="button"
@@ -221,23 +223,20 @@ export function ClueCaptureModal(props: {
         </Show>
 
         <Show when={props.sessionMode}>
-          <p class="field-hint">把本次会话结论保存到证据链。默认新增一条线索；勾选后会与本会话已产生的线索堆叠（可溯源时）。</p>
-          <label class="setting-check clue-stack-check">
-            <input
-              type="checkbox"
-              checked={stackSameSession()}
-              disabled={busy() || summarizing()}
-              onChange={(event) => setStackSameSession(event.currentTarget.checked)}
-            />
-            <span>
-              <span class="field-label">与同会话线索堆叠</span>
-              <span class="field-hint">
-                {sameSessionCardId()
-                  ? "已找到本会话产生的线索，勾选后将堆叠到同一组。"
-                  : "当前还没有可溯源的同会话线索；勾选后将先创建新线索，后续同会话线索可继续堆叠。"}
-              </span>
-            </span>
-          </label>
+          <div class="field clue-space-field">
+            <span class="field-label">保存空间</span>
+            <div class="clue-space-switch" role="radiogroup" aria-label="线索保存空间">
+              <button type="button" classList={{ active: space() === "personal" }} onClick={() => { setSpace("personal"); setStackSameSession(false); }}>个人空间</button>
+              <button type="button" classList={{ active: space() === "team" }} disabled={!state.relay.connected} title={state.relay.connected ? "团队成员共享" : "请先连接团队中转站"} onClick={() => { setSpace("team"); setStackSameSession(false); }}>团队空间</button>
+            </div>
+          </div>
+          <p class="field-hint">把本次会话结论保存到所选空间。默认新增一条线索。</p>
+          <Show when={space() === state.clueSpace}>
+            <label class="setting-check clue-stack-check">
+              <input type="checkbox" checked={stackSameSession()} disabled={busy() || summarizing()} onChange={(event) => setStackSameSession(event.currentTarget.checked)} />
+              <span><span class="field-label">与同会话线索堆叠</span><span class="field-hint">{sameSessionCardId() ? "已找到本会话产生的线索，勾选后将堆叠到同一组。" : "当前还没有可溯源的同会话线索。"}</span></span>
+            </label>
+          </Show>
         </Show>
 
         <label class="field">

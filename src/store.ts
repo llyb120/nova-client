@@ -746,19 +746,13 @@ export async function captureClue(
   targetCardId: string | null,
   mentionTokens: string[] = [],
   attachments: ClueAttachment[] = [],
+  spaceOverride?: "personal" | "team",
 ): Promise<CaptureClueResult> {
-  const space = state.clueSpace;
+  const space = spaceOverride ?? state.clueSpace;
   const result = await api.captureClue(
-    threadId,
-    title,
-    content,
-    placement,
-    targetCardId,
-    mentionTokens,
-    attachments,
-    space,
+    threadId, title, content, placement, targetCardId, mentionTokens, attachments, space,
   );
-  // 保存接口已经返回完整受影响分组，直接合并，避免保存后重复拉取整条证据链。
+  // 只把结果合并进当前正在查看的空间；Flow 弹窗可保存到另一个空间。
   if (state.clueSpace === space) {
     const index = state.clueGroups.findIndex((group) => group.id === result.group.id);
     if (index >= 0) setState("clueGroups", index, reconcile(result.group));
