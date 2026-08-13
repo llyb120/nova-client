@@ -3,6 +3,7 @@ mod agent_config;
 mod alkaid_complete;
 mod cli;
 mod cli_manager;
+mod clipboard;
 mod clues;
 mod codex;
 mod codex_radar;
@@ -1829,6 +1830,12 @@ fn scratch_dir() -> Result<String, String> {
 #[tauri::command]
 fn directory_exists(path: String) -> bool {
     Path::new(path.trim()).is_dir()
+}
+
+/// 资源管理器复制的文件绝对路径。Ctrl+Shift+V 粘贴路径用；WebView2 的 JS 剪贴板通常拿不到。
+#[tauri::command]
+fn clipboard_file_paths() -> Vec<String> {
+    clipboard::file_paths()
 }
 
 /// 判断目录是否 git 仓库：前端据此决定「在 worktree 中执行」开关是否可用。
@@ -6409,6 +6416,7 @@ pub fn run() {
             request_peer_models,
             respond_roam_request,
             directory_exists,
+            clipboard_file_paths,
             is_git_repo,
             list_branches,
             request_peer_branches,

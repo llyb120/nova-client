@@ -20,6 +20,7 @@ import {
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import { createComposerGhost } from "../composerGhost";
 import { api } from "../ipc";
+import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import {
   cancelTurn,
   clueCardById,
@@ -46,38 +47,12 @@ import { employeeWorkflowName } from "../workflow/storage";
 import { ConfigSelects } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconClue, IconFile, IconSend, IconStop, IconUndo, IconUsers } from "./icons";
-import { createImageAttachments, fileUriPath, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 
 const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
-
-function pastedAbsoluteFilePaths(data: DataTransfer): string[] {
-  const paths: string[] = [];
-  const add = (value: string | undefined) => {
-    const path = value?.trim().replace(/^"|"$/g, "");
-    if (path && /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(path) && !paths.includes(path)) paths.push(path);
-  };
-
-  for (const file of Array.from(data.files)) add((file as File & { path?: string }).path);
-  for (const item of Array.from(data.items)) {
-    if (item.kind === "file") add((item.getAsFile() as (File & { path?: string }) | null)?.path);
-  }
-  for (const uri of data.getData("text/uri-list").split(/\r?\n/)) {
-    if (!uri || uri.startsWith("#") || !uri.startsWith("file://")) continue;
-    try {
-      add(fileUriPath(uri));
-    } catch {
-      // Ignore malformed clipboard URI entries.
-    }
-  }
-  // WebView2 may expose copied Explorer files as absolute plain-text paths instead of File.path.
-  if (data.files.length > 0 || Array.from(data.items).some((item) => item.kind === "file")) {
-    for (const line of data.getData("text/plain").split(/\r?\n/)) add(line);
-  }
-  return paths;
-}
 
 export function Composer() {
   const [text, setText] = createSignal("");
@@ -93,8 +68,8 @@ export function Composer() {
   let employeePickerRef: HTMLDivElement | undefined;
   let resizeFrame: number | undefined;
   let maxInputHeight: number | undefined;
-  let pasteFilesAsPaths = false;
-  let pasteShortcutTimer: ReturnType<typeof setTimeout> | undefined;
+  let pasteAsPaths = false;
+  let pastePathsSeq = 0;
 
   const flushInputResize = () => {
     resizeFrame = undefined;
@@ -500,14 +475,27 @@ export function Composer() {
     return true;
   };
 
+  const insertClipboardFilePaths = (data?: DataTransfer | null) => {
+    const seq = ++pastePathsSeq;
+    void resolveClipboardFilePaths(data).then((paths) => {
+      if (seq !== pastePathsSeq || paths.length === 0) return;
+      clearGhost();
+      insertShortcutText(paths.join("\n"), true);
+    });
+  };
+
   const onKeyDown = (e: KeyboardEvent) => {
-    if (e.key.toLowerCase() === "v" && e.shiftKey && (e.ctrlKey || e.metaKey)) {
-      pasteFilesAsPaths = true;
-      if (pasteShortcutTimer !== undefined) clearTimeout(pasteShortcutTimer);
-      pasteShortcutTimer = setTimeout(() => {
-        pasteFilesAsPaths = false;
-        pasteShortcutTimer = undefined;
-      }, 1000);
+    if (isPasteFilePathsShortcut(e)) {
+      // WebView2 maps Ctrl+Shift+V to "paste as plain text" and strips file items;
+      // preventDefault and read CF_HDROP natively instead of waiting for paste.
+      e.preventDefault();
+      e.stopPropagation();
+      pasteAsPaths = true;
+      insertClipboardFilePaths();
+      queueMicrotask(() => {
+        pasteAsPaths = false;
+      });
+      return;
     }
     const suggestions = slashSuggestions();
     const history = globalPromptHistory();
@@ -597,27 +585,16 @@ export function Composer() {
   };
 
   const onPaste = (e: ClipboardEvent) => {
-    const pasteAsPaths = pasteFilesAsPaths;
-    pasteFilesAsPaths = false;
-    if (pasteShortcutTimer !== undefined) {
-      clearTimeout(pasteShortcutTimer);
-      pasteShortcutTimer = undefined;
-    }
-
-    const hasFiles = Array.from(e.clipboardData?.items ?? []).some((item) => item.kind === "file")
-      || (e.clipboardData?.files.length ?? 0) > 0;
-    if (!pasteAsPaths || !hasFiles || !e.clipboardData) {
-      attach.onPaste(e);
+    const asPaths = pasteAsPaths;
+    pasteAsPaths = false;
+    if (asPaths) {
+      // Ctrl+Shift+V is the explicit "paste file paths" gesture; never add attachments.
+      e.preventDefault();
+      insertClipboardFilePaths(e.clipboardData);
       return;
     }
 
-    // Ctrl+Shift+V is the explicit "paste file paths" gesture; never let this branch add attachments.
-    e.preventDefault();
-    const paths = pastedAbsoluteFilePaths(e.clipboardData);
-    if (paths.length > 0) {
-      clearGhost();
-      insertShortcutText(paths.join("\n"), false);
-    }
+    attach.onPaste(e);
   };
 
   const onInput = (e: InputEvent) => {

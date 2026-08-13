@@ -35,6 +35,7 @@ import {
   assertBuiltinPrompt,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
+import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import type { AgentKind, Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
 import { enabledWorkflows, employeeWorkflowName } from "../workflow/storage";
@@ -154,7 +155,7 @@ export function HomeView() {
       resizeInput();
     },
   });
-  const { ghost, dismissGhostIfCaretMoved, syncGhostScroll, noteInput } = ghostCtl;
+  const { ghost, clearGhost, dismissGhostIfCaretMoved, syncGhostScroll, noteInput } = ghostCtl;
 
   const pickEmployee = (employeeId: string | null) => {
     setSelectedEmployeeId(employeeId);
@@ -874,7 +875,25 @@ export function HomeView() {
     return true;
   };
 
+  let pasteAsPaths = false;
+  let pastePathsSeq = 0;
+  const insertClipboardFilePaths = (data?: DataTransfer | null) => {
+    const seq = ++pastePathsSeq;
+    void resolveClipboardFilePaths(data).then((paths) => {
+      if (seq !== pastePathsSeq || paths.length === 0) return;
+      clearGhost();
+      insertShortcutText(paths.join("\n"), true);
+    });
+  };
+
   const onKeyDown = (e: KeyboardEvent) => {
+    if (isPasteFilePathsShortcut(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      pasteAsPaths = true;
+      insertClipboardFilePaths();
+      return;
+    }
     const suggestions = slashSuggestions();
     const history = promptHistory();
     if (historyOpen() && history.length > 0) {
@@ -1093,7 +1112,16 @@ export function HomeView() {
               onBlur={ghostCtl.onBlur}
               onCompositionStart={ghostCtl.onCompositionStart}
               onCompositionEnd={ghostCtl.onCompositionEnd}
-              onPaste={attach.onPaste}
+              onPaste={(event) => {
+                const asPaths = pasteAsPaths;
+                pasteAsPaths = false;
+                if (asPaths) {
+                  event.preventDefault();
+                  insertClipboardFilePaths(event.clipboardData);
+                  return;
+                }
+                attach.onPaste(event);
+              }}
             />
           </div>
           <div class="composer-bar">

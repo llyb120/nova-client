@@ -88,6 +88,7 @@ export const api = {
     invoke<string>("judge_workflow_route", { conclusion, options }),
   scratchDir: () => invoke<string>("scratch_dir"),
   directoryExists: (path: string) => invoke<boolean>("directory_exists", { path }),
+  clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
   getQuota: () => invoke<Quota>("get_quota"),
   getModelCosts: () => invoke<Record<string, ModelCost>>("get_model_costs"),
   checkUpdate: () => invoke<UpdateInfo>("check_update"),
