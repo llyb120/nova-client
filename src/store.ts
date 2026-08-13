@@ -2546,6 +2546,14 @@ export async function initStore() {
     }
   });
 
+  await listen<{ threadId: string; cwd: string }>("thread:cwd-changed", (e) => {
+    const { threadId, cwd } = e.payload;
+    const cached = threadSnapshots.get(threadId);
+    if (cached) rememberThreadSnapshot({ ...cached, cwd });
+    setState("threads", (thread) => thread.id === threadId, "cwd", cwd);
+    if (state.currentId === threadId) setState("cwd", cwd);
+  });
+
   await listen<TurnEvent>("acp:turn", (e) => {
     const threadId = e.payload.threadId;
     runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);

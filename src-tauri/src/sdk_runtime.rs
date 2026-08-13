@@ -1450,6 +1450,10 @@ impl SdkManager {
         // touch 同时覆盖“已有则切换到最前、没有则创建”，并持久化 projects.json。
         state.projects.lock().unwrap().touch(&cwd);
         let _ = self.app.emit("projects:changed", json!({}));
+        let _ = self.app.emit(
+            "thread:cwd-changed",
+            json!({ "threadId": thread_id, "cwd": cwd }),
+        );
         let _ = self.app.emit(EV_THREADS, json!({}));
     }
 
