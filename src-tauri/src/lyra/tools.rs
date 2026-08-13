@@ -481,6 +481,11 @@ async fn execute_inner(
                     .collect();
                 object.insert("keywords".into(), Value::Array(keywords));
             }
+            if let Ok(text) =
+                crate::context_service::call_configured("fast_context", &root, &args).await
+            {
+                return ToolOutcome::text(clamp_tool_output_text(&text));
+            }
             match tokio::task::spawn_blocking(move || {
                 crate::nova_tools_native::context::fast_context(&root, args)
             })
@@ -494,6 +499,11 @@ async fn execute_inner(
         "find_symbols" => {
             let root = root.to_path_buf();
             let args = args.clone();
+            if let Ok(text) =
+                crate::context_service::call_configured("find_symbols", &root, &args).await
+            {
+                return ToolOutcome::text(text);
+            }
             match tokio::task::spawn_blocking(move || {
                 crate::nova_tools_native::context::find_symbols(&root, args)
             })

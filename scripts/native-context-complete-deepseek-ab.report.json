@@ -1,0 +1,115 @@
+{
+  "ranAt": "2026-08-13T03:03:53.746Z",
+  "model": "opencode/deepseek-v4-flash/variant/high",
+  "source": "C:\\Users\\油彬\\.nova\\threads",
+  "arms": {
+    "A": "D:/code/nova-client-master/src-tauri/target/debug/nova.exe",
+    "B": "D:/code/nova-client-native-context-mmap/src-tauri/target/debug/nova.exe"
+  },
+  "contextMode": "super",
+  "rows": [
+    {
+      "test": {
+        "id": "e09fd327-8",
+        "threadId": "e09fd327-9a4a-4a2d-bf80-965570bfedfa",
+        "title": "fastcontext性能问题",
+        "user": "可否研究下别的算法改进？",
+        "history": "用户: 在一个1万文件的仓库里，fastcontext为何这么慢，已经指明了files只有一个文件，结果还是运行了几十分钟\n\n助手: `fast_context.files` 通常只是“**指定必须读取的入口文件**”，并不是“**只允许访问这个文件**”。即使只传一个文件，它仍可能执行仓库级工作：\n\n1. **首次构建或更新符号索引**  \n   扫描仓库内可索引文件，建立定义、引用、import/use 关系。1 万文件在 Windows 上遇到大量小文件、杀毒软件实时扫描时会很慢。\n\n2. **计算跨文件依赖和 IMPACT 调用方**  \n   为找出入口文件引用了谁、又被谁引用，必须查询甚至扫描其他文件。\n\n3. **处理 `keywords` 和 `task` 的全仓检索**  \n   `files` 不一定会限制关键词搜索范围。关键词过于常见时，候选结果可能非常多。\n\n4. **开启 `coupling: true` 时分析 Git 共改历史**  \n   这会额外读取最近提交及文件变更关系，大仓库或 Git 状态较差时开销明显。\n\n5. **`budget` / `maxBytes` 只限制返回内容，不限制扫描量**  \n   把它们调小，通常不能解决前置索引和检索耗时。\n\n不过，**几十分钟仍然不正常**，更像是以下问题之一：\n\n- 冷启动索引每次都在重建，增量索引缓存未命中或无法写入；\n- `.gitignore` 没排除生成目录、依赖目录、缓存目录；\n- 仓库位于机械盘、网络盘，或被 Defender/杀毒软件逐文件扫描；\n- 某些超大文件、Git 历史或符号解析器卡住；\n- `files` 没有被实现为检索边界，导致仍进行了完整仓库分析；\n- 工具缺少阶段超时，某一步异常后一直等待。\n\n### 建议用法\n\n如果路径已经明确，只需要读这个文件，**不要使用 `fast_context`**，直接：\n\n```text\nread(path=..., offset=..., limit=...)\n```\n\n只有确实需要依赖、调用方或跨文件影响分析时才用：\n\n```json\n{\n  \"files\": [\"明确路径\"],\n  \"keywords\": [\"精确符号名\"],\n  \"task\": \"查找该符号的直接定义、依赖和调用方\",\n  \"coupling\": false,\n  \"budget\": 300,\n  \"maxBytes\": 16384\n}\n```\n\n如果只想知道定义或引用的行号，使用 `find_symbols`，通常比 `fast_context` 更合适。\n\n### 如何判断具体卡在哪里\n\n用同样参数连续执行两次：\n\n- **第一次慢、第二次快**：主要是冷索引问题；\n- **每次都慢**：缓存失效、全仓重复扫描或某阶段卡住；\n- **关闭 `coupling` 后明显变快**：Git 历史分析是瓶颈；\n- **直接 `read` 秒开而 `fast_context` 很慢**：不是目标文件读取慢，而是索引、依赖或 IMPACT 分析慢。\n\n归根结底：传一个 `files` 并不等价于单文件模式。对“已知单文件”的场景，`read` 才是有严格成本边界的工具；`fast_context` 应增加真正的 `scope/filesOnly` 选项以及索引、检索、依赖分析各阶段的耗时日志和超时，否则这种行为很难定位。\n\n用户: 那有什么办法能让fastcontext秒出结果，太慢了就没有意义了\n\n助手: 有办法，但要先明确：**按当前接口，`files` 不是硬性的扫描范围，`budget/maxBytes` 也只限制输出，无法保证秒出。**  \n如果单文件还跑几十分钟，这不是“仓库有 1 万文件”的正常成本，而是索引、全仓依赖分析或缓存机制出了问题。\n\n## 立即可用的做法\n\n### 1. 已知文件，只读内容：直接用 `read`\n\n这是唯一能严格保证工作量只和该文件相关的方式：\n\n```text\nread(path=\"src/xxx.ts\", offset=1, limit=300)\n```\n\n不要为了读取单个文件调用 `fast_context`。\n\n### 2. 必须使用 `fast_context` 时，尽量压缩工作\n\n```json\n{\n  \"files\": [\"src/xxx.ts\"],\n  \"keywords\": [\"精确的函数名或类名\"],\n  \"task\": \"仅提取该文件中目标符号的完整实现和直接 import，不做调用方、Git 共改或全仓扩展\",\n  \"coupling\": false,\n  \"budget\": 200,\n  \"maxBytes\": 12000\n}\n```\n\n关键点：\n\n- `coupling: false`\n- 使用唯一、精确的符号名，不要使用 `service`、`config` 之类高频词\n- `files` 使用仓库内精确相对路径\n- 明确要求不做调用方和全仓扩展\n\n但要注意：最后一项只是任务提示，**如果工具内部始终构建 IMPACT/索引，它仍然可能慢**。\n\n### 3. 只需要位置：使用 `find_symbols`\n\n如果只是寻找定义或引用行号：\n\n```json\n{\n  \"names\": [\"ExactClassName\", \"exactFunctionName\"]\n}\n```\n\n它比打包正文、依赖和 IMPACT 的 `fast_context` 更合适。\n\n---\n\n## 真正让 `fast_context` 秒出的方案\n\n如果你能修改工具实现，最重要的不是调 `budget`，而是增加以下机制。\n\n### 1. 增加真正的 `filesOnly` 模式\n\n例如：\n\n```json\n{\n  \"files\": [\"src/xxx.ts\"],\n  \"scope\": \"files-only\",\n  \"includeDependencies\": false,\n  \"includeImpact\": false,\n  \"coupling\": false\n}\n```\n\n这个模式必须在代码层面保证：\n\n- 不遍历仓库；\n- 不初始化全仓符号索引；\n- 不搜索调用方；\n- 不读取 Git 历史；\n- 只解析传入文件；\n- 最多解析该文件的直接 import。\n\n这是单文件场景最有效的优化。仅靠在 `task` 中写“只读这个文件”不够，必须做成硬参数。\n\n### 2. 索引必须移出请求链路\n\n错误模式：\n\n```text\n收到请求\n→ 扫描 1 万文件\n→ 检查或重建索引\n→ 做查询\n→ 返回\n```\n\n正确模式：\n\n```text\n后台常驻索引服务\n→ 文件变化时增量更新\n→ 请求只查询已存在索引\n→ 数百毫秒返回\n```\n\n要求包括：\n\n- 索引持久化，进程重启后继续使用；\n- 按文件 `mtime + size` 或内容哈希增量更新；\n- 不要因为 Git `HEAD` 变化就重建全仓索引；\n- 删除、重命名文件单独增量处理；\n- 请求到来时不得同步全量重建。\n\n如果索引无效，可以先降级返回文件内容，后台重建，而不是阻塞几十分钟。\n\n### 3. 增加硬性时间预算和降级策略\n\n例如给请求设置：\n\n```text\n总预算：2 秒\n文件读取：200 ms\n索引查询：500 ms\n依赖扩展：500 ms\nIMPACT：500 ms\n```\n\n超过预算后：\n\n1. 先返回指定文件；\n2. 跳过间接依赖；\n3. 跳过 IMPACT；\n4. 跳过 Git coupling；\n5. 在结果里注明哪些阶段因超时被省略。\n\n上下文不够完整，通常也比几十分钟后才返回有价值。\n\n### 4. `files` 应当先走快速路径\n\n工具收到非空 `files` 后，应先判断：\n\n```text\n只需要文件内",
+        "keywords": [
+          "fast_context",
+          "find_symbols",
+          "symbol index",
+          "IMPACT"
+        ],
+        "expectedPaths": [
+          "scripts/nova-batch-tools.mjs",
+          "scripts/audit-native-context-random.mjs",
+          ".test.ts",
+          "scripts/ctx-core.mjs",
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/ctx-core.test.mjs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ]
+      },
+      "A": {
+        "arm": "A",
+        "wallMs": 65426,
+        "finalText": "基于 `fast_context` 单次返回的内容（`algorithm=no-index-query-slice coverage=deadline-partial`、Rust 侧 `context.rs` 与 JS 侧 `ctx-index.mjs` 的实现），先盘点现状，再给可研究的算法改进。\n\n## 现状：很多\"显然的优化\"其实已经落地\n\n返回证据显示本仓库已经实现了此前讨论的大部分机制，剩余问题更细：\n\n- Rust `fast_context` 已有 `fast_context_no_index`（no-index 快速路径，按 `no_index_context_enabled` 门控），还有 typo 自动更正（`anchor_correction` + `_anchorRetry` 重跑一次）；\n- `find_symbols` 已用 `std::thread::scope` 并行跑 `list_code_files` / `search_text` / `short_rev`，且 `build_index` 只对命中文件建索引（`Some(&wanted)`）；\n- JS `getIndex` 已有 per-workspace memo、磁盘 JSON 缓存、`cacheEntryFresh` 按 mtime+size 判脏、`mode='focused'`（只扩一跳依赖）、`MAX_SCAN_PER_CALL` 扫描上限、`resolveRef` 的\"仅当 `complete` 才开放全局唯一回退\"；\n- 本次运行本身命中 deadline（`deadline-partial`），说明**阶段超时已存在**。\n\n但注意本次返回：**12 个候选文件 / 583KB 就扫了 8649ms** 才到 deadline——瓶颈不在仓库规模，而在\"每个请求都要重新做全仓 walk + 全量文本检索 + 候选展开\"这条链路上。\n\n## 剩余瓶颈（基于证据）\n\n1. **全仓文件清单每次都重算**：`find_symbols` 每次调用 `list_code_files(root)` 全量 walk；JS `getIndex` 在 `only` 为空时也 `listCodeFiles(root)`。Windows + Defender 下 10k 文件的 stat 是最大单项成本。\n2. **no-index 路径仍是\"查询驱动切片\"而非\"files-only\"**：即使传了 `files`，仍扫出 12 个候选文件逐个解析，没有真正跳过全仓 walk/search。\n3. **typo 更正会重跑整个 `fast_context_run`**：`_anchorRetry` 对同一次请求做二次全量检索，命中 typo 时成本翻倍。\n4. **IMPACT 只是输出截断**：`MAX_IMPACT=20` 只限返回条数，不限\"找调用方\"的扫描量。\n5. **次要成本挂在请求链路上**：`short_rev` 每次 spawn git 子进程；`cleanupNovaCodemap` 在 memo 未命中时全量 readdir 缓存目录并解析其他工作区的 JSON。\n\n## 可研究的算法改进（按收益/成本排序）\n\n**A. 文件清单也缓存（目录级 mtime 快照）——最高 ROI**\n把 `list_code_files` 的结果按 (root, 目录树 mtime 哈希) 缓存，请求时只重 walk mtime 变化的目录。文件清单从 O(全仓) 降到 O(变更目录)。可与 `cacheEntryFresh` 的逐文件 stat 合并成\"按目录批量 stat\"。\n\n**B. `files` 非空时走硬 files-only 路径**\n新增 `fast_context_files_only`：解析 `files` → 只读这些文件 + 一跳 import → 返回，不调 `list_code_files` / `search_text` / `build_index` / git rev。这直接消灭\"传一个文件却跑全仓\"的根因，是本次讨论的核心诉求。\n\n**C. 符号检索从\"逐文件正则全文扫描\"改为持久化倒排 + mmap**\n仓库本身是 mmap 主题（native-context-mmap）。把 JSON 磁盘缓存换成二进制倒排（bincode 或 SQLite FTS5），按 mtime+size 增量更新；查询变 O(1) 字典查。兜底子串扫描用 `memchr` 而非逐行正则（正则对象按进程缓存，不按调用编译）。10k 文件时 JSON 序列化/解析本身就是显著开销。\n\n**D. IMPACT 改为视图内惰性 + 预算采样**\n只对已加载视图内的文件算调用方；视图外的调用方做有界采样（扫描 N 个文件、命中 20 条即早停），并给独立阶段预算（如 500ms），超时在输出里标注\"impact 已省略\"。让 `MAX_IMPACT` 从\"截断输出\"变成\"截断扫描\"。\n\n**E. typo 更正复用首次检索结果**\n`_anchorRetry` 不重跑整个 `fast_context_run`，而是复用第一次的 file-list 与 search rows，只在已加载视图内替换关键词重排。避免 typo 场景成本翻倍。\n\n**F. 后台常驻索引线程（中期）**\nTauri 侧起常驻线程 + notify 文件监听增量更新索引，请求查 arc-swap 原子快照。这与 A/B/C 叠加后请求进入毫秒级；冷索引阶段先降级返回文件内容，后台重建。\n\n**G. 快速清除（quick wins）**\n`short_rev` 加 TTL 缓存并按需异步；`cleanupNovaCodemap` 从\"每次 memo 未命中\"改为\"每进程一次或 5 分钟 TTL\"；`search_text` 用 rayon 有界线程池并行。\n\n## 推荐组合\n\n- **立即落地**：A + B + G（改动小、直接解决\"传 files 仍跑全仓\"与\"每次全量 walk\"两个根因）；\n- **短中期**：D + E（把 typo 与 IMPACT 的成本真正降下来）；\n- **长期**：C + F（彻底把索引移出请求链路）。\n\n如果只能选一个先做：**B（files-only 硬路径）**，因为它正面回答了你最初的问题——\"指明了一个文件，为什么还要跑全仓\"。",
+        "contextChars": 21997,
+        "keywordRecall": 1,
+        "pathRecall": 0.875,
+        "keywordHits": [
+          "fast_context",
+          "find_symbols",
+          "symbol index",
+          "IMPACT"
+        ],
+        "pathHits": [
+          "scripts/nova-batch-tools.mjs",
+          "scripts/audit-native-context-random.mjs",
+          "scripts/ctx-core.mjs",
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/ctx-core.test.mjs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "input": 6562,
+          "output": 5584,
+          "cacheRead": 8064,
+          "cacheWrite": 0
+        },
+        "stderr": ""
+      },
+      "B": {
+        "arm": "B",
+        "wallMs": 63135,
+        "finalText": "基于本次 `fast_context` 返回的内容（含 Rust 端 `context.rs` 的 `fast_context`/`find_symbols` 实现、JS 端 `ctx-index.mjs` 的 `getIndex` 增量索引、以及工具参数定义），分析如下。\n\n## 先说现状（这次调用本身就是证据）\n\n返回头：`algorithm=no-index-query-slice`，`scan: 12 candidate files / 583519 bytes / 4948.9ms deadline reached`。\n\n要点：**当前算法已经不是\"全仓建索引\"而是\"无持久化索引、按查询切片候选、逐文件正则扫描\"**。但即使只有 12 个候选文件 / 583KB，本次也花了约 5 秒并触发 deadline。这说明瓶颈已从\"冷索引重建\"转移到了**查询链路里的全仓目录遍历 + 逐文件逐词正则扫描**。改进方向应针对这两点，而不是再谈索引冷启动。\n\n## 算法改进（按 ROI 排序）\n\n**1. 每查询的 N 趟正则 → 一趟 RegexSet + 持久化倒排**\n证据：`find_symbols` 在 `for name in names` 循环内逐个 `Regex::new(\\b{name}\\b)` 并对同一批 `rows` 做 N 趟过滤（`rows.iter().filter(...)`）。改进：\n- 立即能做：用 `regex::RegexSet` 一趟扫描全部 names，按位掩码归组，O(N) 趟降为 1 趟；\n- 更进一步：把 `(term → file)` 轻量倒排持久化（只索引符号名级别的 token，不是全文），按文件 `mtime+size` 增量更新。查询变成索引探针，而不是每次扫 583KB。\n\n**2. 把全仓 `list_code_files` / `build_index(.., Some(&all))` 移出查询链路**\n证据：`find_symbols` 并行段里同时跑了 `list_code_files(root)`、`search_text`，且 `build_index(root, Some(&wanted), 0, Some(&all))` 传入了全仓清单 `all`。10k 文件下光这个 walk + stat（Windows + Defender）就是大头。改进：用 `git ls-files`（天然遵守 .gitignore、快）或**目录级 mtime 快照**代替递归 walk；正则已命中时跳过 `build_index`。\n\n**3. 锚点更正从\"整管线跑多趟\"改为\"一趟多锚点\"**\n证据：`fast_context` 硬 MISS 后对每个 did-you-mean 候选**重新执行整个 `fast_context_run`**（`_anchorRetry` 重试路径）。改进：原词 + 候选词合并进同一趟候选切片和扫描，只共享结果层做选择，避免整管线重复 2 趟以上。\n\n**4. 阶段化时间预算 + 逐阶段降级**\n证据：返回头有 `coverage=deadline-partial`，说明已有 deadline，但粒度不明。改进：把 list / scan / IMPACT / coupling 拆成独立预算，超时跳过并标注，避免 Git coupling 或大文件正则吃光总预算后文件正文反而没返回。\n\n**5. `files` 非空走\"文件直读 + 一跳 import\"硬路径**\n证据：工具参数里 `files ≤ 6` 但**没有 `scope/filesOnly` 硬开关**；而 JS 端 `getIndex` 的 `focused` 模式已是这个思路（只扫 `requested` + 一跳依赖，`viewCache` 只暴露 requested）。Rust 主路径应对齐：files 非空时不再参与候选切片，直接解析传入文件及其直接 import。\n\n**6. 索引/缓存增量写，移出请求同步路径**\n证据：JS 端已有 `saveCache`/`cacheEntryFresh`/`memo`/`cleanupNovaCodemap`，但仍是 `JSON.stringify` 全量写 + 全仓 stat 校验。改进：按文件增量写（单文件记录或 SQLite），请求到来时若索引无效则后台重建、前台降级直接返回文件内容。\n\n**7. 进程内共享扫描/索引结果**\n`find_symbols` 的 `build_index` 与 `fast_context` 的扫描存在重复工作；Rust 端补一个类似 JS `memo` 的进程内缓存（keyed by workspace + mtime），同一会话内避免重复全仓扫描。\n\n## 结论\n\n最高 ROI 是 **1（RegexSet + 轻量倒排）** 和 **2（去掉查询链路的全仓 walk）**——它们直接命中本次实测的 5s/12 文件瓶颈；其次是 **3/5** 这种\"减少整管线重复执行\"的改动，零风险、见效快。索引冷启动问题（原会话的痛点）建议用 **6** 解决：前台降级 + 后台增量重建，而不是让请求阻塞。\n\n（本次仅基于 `fast_context` 返回内容分析，未读取任何文件正文、未做修改。）",
+        "contextChars": 21997,
+        "keywordRecall": 1,
+        "pathRecall": 0.875,
+        "keywordHits": [
+          "fast_context",
+          "find_symbols",
+          "symbol index",
+          "IMPACT"
+        ],
+        "pathHits": [
+          "scripts/nova-batch-tools.mjs",
+          "scripts/audit-native-context-random.mjs",
+          "scripts/ctx-core.mjs",
+          "scripts/alkaid-context-super.test.mjs",
+          "scripts/alkaid.test.mjs",
+          "scripts/ctx-core.test.mjs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "input": 6546,
+          "output": 4958,
+          "cacheRead": 8064,
+          "cacheWrite": 0
+        },
+        "stderr": ""
+      }
+    }
+  ],
+  "totals": {
+    "A": {
+      "cases": 1,
+      "success": 1,
+      "avgWallMs": 65426,
+      "avgKeywordRecall": 1,
+      "avgPathRecall": 0.875,
+      "totalTokens": 20210
+    },
+    "B": {
+      "cases": 1,
+      "success": 1,
+      "avgWallMs": 63135,
+      "avgKeywordRecall": 1,
+      "avgPathRecall": 0.875,
+      "totalTokens": 19568
+    }
+  }
+}
