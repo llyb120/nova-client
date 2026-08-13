@@ -106,7 +106,19 @@ jobs:
 
       - name: Build (Linux DEB + AppImage)
         if: runner.os == 'Linux'
-        run: npx tauri build --bundles deb,appimage
+        shell: bash
+        run: |
+          set -o pipefail
+          for attempt in 1 2 3; do
+            if npx tauri build --bundles deb,appimage; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "Linux bundle failed (attempt $attempt/3); retrying in $((attempt * 15))s..."
+            sleep $((attempt * 15))
+          done
 
       - name: Package update zip
         shell: bash
