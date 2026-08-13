@@ -44,6 +44,7 @@ import type {
   Settings,
   SkillInfo,
   WorktreeRecord,
+  ExperienceExpertConfig,
 } from "../types";
 
 function threadGroupName(cwd: string): string {
@@ -797,6 +798,12 @@ export function SettingsModal(props: { onClose: () => void }) {
     embedEndpoint: embedEndpoint().trim(),
     embedModel: embedModel().trim(),
     embedApiKey: embedApiKey().trim(),
+    experienceTrainingEnabled: experienceTrainingEnabled(),
+    experienceTrainingAgent: experienceTrainingAgent(),
+    experienceTrainingModel: experienceTrainingModel().trim(),
+    experienceTrainingIntervalMinutes: Math.max(5, Math.floor(experienceTrainingIntervalMinutes() || 30)),
+    experienceEvolutionIntervalMinutes: Math.max(10, Math.floor(experienceEvolutionIntervalMinutes() || 720)),
+    experienceExperts: experienceExperts(),
   });
 
   const refreshCliStatuses = async () => {
@@ -907,6 +914,25 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [embedEndpoint, setEmbedEndpoint] = createSignal(s?.embedEndpoint ?? "http://localhost:11434");
   const [embedModel, setEmbedModel] = createSignal(s?.embedModel ?? "bge-m3");
   const [embedApiKey, setEmbedApiKey] = createSignal(s?.embedApiKey ?? "");
+  const [experienceTrainingEnabled, setExperienceTrainingEnabled] = createSignal(s?.experienceTrainingEnabled ?? false);
+  const trainingAgentKinds = () => enabledAgentKinds().filter((kind) => kind !== "devin" && kind !== "opencode");
+  const [experienceTrainingAgent, setExperienceTrainingAgent] = createSignal<AgentKind>(s?.experienceTrainingAgent ?? "lyra");
+  const [experienceTrainingModel, setExperienceTrainingModel] = createSignal(s?.experienceTrainingModel ?? "");
+  const [experienceTrainingIntervalMinutes, setExperienceTrainingIntervalMinutes] = createSignal(s?.experienceTrainingIntervalMinutes ?? 30);
+  const [experienceEvolutionIntervalMinutes, setExperienceEvolutionIntervalMinutes] = createSignal(s?.experienceEvolutionIntervalMinutes ?? 720);
+  const [experienceExperts, setExperienceExperts] = createSignal(s?.experienceExperts ?? []);
+  const updateExperienceExpert = (index: number, key: string, value: number) => {
+    setExperienceExperts((current) => current.map((expert, i) => i === index ? { ...expert, [key]: Math.max(0, Math.min(key === "negativeSensitivity" ? 3 : 1, value || 0)) } : expert));
+  };
+  const BASE_EXPERIENCE_EXPERTS: ExperienceExpertConfig[] = [
+    { id: "fast", name: "参宿一", writeRate: 0.90, valueLearningRate: 0.50, forgetRate: 0.08, mutationRate: 0.25, migrationRate: 0.05, abstractionLevel: 0.35, noveltyPreference: 0.40, negativeSensitivity: 1.0 },
+    { id: "slow", name: "参宿七", writeRate: 0.30, valueLearningRate: 0.10, forgetRate: 0.005, mutationRate: 0.03, migrationRate: 0.05, abstractionLevel: 0.55, noveltyPreference: 0.20, negativeSensitivity: 0.7 },
+    { id: "concrete", name: "参宿二", writeRate: 0.70, valueLearningRate: 0.30, forgetRate: 0.03, mutationRate: 0.10, migrationRate: 0.10, abstractionLevel: 0.20, noveltyPreference: 0.30, negativeSensitivity: 1.0 },
+    { id: "abstract", name: "参宿四", writeRate: 0.50, valueLearningRate: 0.20, forgetRate: 0.015, mutationRate: 0.12, migrationRate: 0.10, abstractionLevel: 0.85, noveltyPreference: 0.45, negativeSensitivity: 0.8 },
+    { id: "negative", name: "参宿五", writeRate: 0.60, valueLearningRate: 0.45, forgetRate: 0.04, mutationRate: 0.15, migrationRate: 0.08, abstractionLevel: 0.45, noveltyPreference: 0.35, negativeSensitivity: 1.5 },
+    { id: "novel", name: "参宿六", writeRate: 0.80, valueLearningRate: 0.35, forgetRate: 0.06, mutationRate: 0.40, migrationRate: 0.05, abstractionLevel: 0.60, noveltyPreference: 0.85, negativeSensitivity: 1.0 },
+  ];
+  const resetExperienceExperts = () => setExperienceExperts(BASE_EXPERIENCE_EXPERTS.map((expert) => ({ ...expert })));
   const [embedBusy, setEmbedBusy] = createSignal(false);
   const [embedMsg, setEmbedMsg] = createSignal("");
   const persistEmbed = async () => {
@@ -917,6 +943,12 @@ export function SettingsModal(props: { onClose: () => void }) {
       embedEndpoint: embedEndpoint().trim(),
       embedModel: embedModel().trim(),
       embedApiKey: embedApiKey().trim(),
+      experienceTrainingEnabled: experienceTrainingEnabled(),
+      experienceTrainingAgent: experienceTrainingAgent(),
+      experienceTrainingModel: experienceTrainingModel().trim(),
+      experienceTrainingIntervalMinutes: Math.max(5, Math.floor(experienceTrainingIntervalMinutes() || 30)),
+      experienceEvolutionIntervalMinutes: Math.max(10, Math.floor(experienceEvolutionIntervalMinutes() || 720)),
+      experienceExperts: experienceExperts(),
     };
     await api.setSettings(next);
     setState("settings", next);
@@ -2418,6 +2450,69 @@ export function SettingsModal(props: { onClose: () => void }) {
             <Show when={embedMsg()}>
               <div class="field-hint">{embedMsg()}</div>
             </Show>
+
+            <div class="field" style={{ "margin-top": "20px", "padding-top": "16px", "border-top": "1px solid var(--border)" }}>
+              <span class="field-label">经验训练</span>
+              <span class="field-hint">
+                经验是从会话结果中学习出的条件性结论；它与“客观做过什么”的记忆、以及“必须遵守”的守则严格分库存储。Lyra 只会按需加载经验，并用反馈调整经验，不会改写记忆或守则。
+              </span>
+            </div>
+            <label class="field" style={{ display: "flex", "flex-direction": "row", "align-items": "center", gap: "8px" }}>
+              <input type="checkbox" checked={experienceTrainingEnabled()} onChange={(e) => setExperienceTrainingEnabled(e.currentTarget.checked)} />
+              <span>定期从新会话训练多个独立知识库</span>
+            </label>
+            <span class="field-hint">开启后 Lyra fast_context 会并行召回大熊座训练知识，Lyra 提示词和工具列表也会出现训练知识与反馈能力。</span>
+            <div class="field">
+              <span class="field-label">训练模型</span>
+              <ModelPicker
+                agentKind={experienceTrainingAgent()}
+                agentKinds={trainingAgentKinds()}
+                model={experienceTrainingModel()}
+                onPickModel={(agentKind, model) => {
+                  setExperienceTrainingAgent(agentKind);
+                  setExperienceTrainingModel(model);
+                }}
+                portal
+                favorites
+              />
+              <span class="field-hint">复用新会话同款后端 / 模型选择器；选择会保存到经验训练配置。</span>
+            </div>
+            <label class="field">
+              <span class="field-label">训练间隔（分钟）</span>
+              <input class="field-input" type="number" min="5" value={experienceTrainingIntervalMinutes()} onInput={(e) => setExperienceTrainingIntervalMinutes(Number(e.currentTarget.value))} />
+            </label>
+            <label class="field">
+              <span class="field-label">世代演进间隔（分钟）</span>
+              <input class="field-input" type="number" min="10" value={experienceEvolutionIntervalMinutes()} onInput={(e) => setExperienceEvolutionIntervalMinutes(Number(e.currentTarget.value))} />
+              <span class="field-hint">到达间隔后自动执行一次群岛遗传世代演进（选择、交叉、变异、迁移、淘汰）。手动演进不受此限制。</span>
+            </label>
+            <div class="field">
+              <span class="field-label" style={{ display: "flex", "align-items": "center", "justify-content": "space-between", gap: "8px" }}>
+                <span>经验专家配置</span>
+                <button type="button" class="btn secondary" onClick={resetExperienceExperts}>重置为基础权重</button>
+              </span>
+              <span class="field-hint">每个专家只提供独立经验库；学习率、遗忘率和迁移率不同，以维持学习多样性。重置只恢复专家名称和参数，不会删除已经训练出的内容。</span>
+              <div class="expert-grid">
+                <For each={experienceExperts()}>
+                  {(expert, index) => (
+                    <div class="expert-row">
+                      <strong title={expert.id}>{expert.name || expert.id}</strong>
+                      {([
+                        ["writeRate", "写入率"],
+                        ["valueLearningRate", "更新率"],
+                        ["forgetRate", "遗忘率"],
+                        ["migrationRate", "迁移率"],
+                      ] as const).map(([key, label]) => (
+                        <label>
+                          <span>{label}</span>
+                          <input class="field-input" type="number" min="0" max="1" step="0.01" value={expert[key]} onInput={(e) => updateExperienceExpert(index(), key, Number(e.currentTarget.value))} />
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </For>
+              </div>
+            </div>
           </Show>
 
           {/* ===== Worktree ===== */}

@@ -180,7 +180,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "clues" | "employees" | "workbench" | "workflows";
+  view: "home" | "clues" | "employees" | "workbench" | "workflows" | "training";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
   clueGroups: ClueNodeGroup[];
   /** 从证据链跳到新会话时暂存的根线索。 */
@@ -742,7 +742,7 @@ export async function refreshRoamingFolders() {
 // ===== 数字员工 =====
 
 /** 切换主区域视图。不影响已打开的会话（currentId 优先）。 */
-export function setView(view: "home" | "clues" | "employees" | "workbench" | "workflows") {
+export function setView(view: "home" | "clues" | "employees" | "workbench" | "workflows" | "training") {
   setState("view", view);
 }
 
@@ -1487,6 +1487,11 @@ export async function sendPrompt(
 ) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
+  // /train 是 Nova 内置命令：不写入当前会话，也不发送给模型。
+  if (text.trim() === "/train" && images.length === 0) {
+    await api.trainExperience();
+    return;
+  }
   // 新会话页选择了工作流：会话输入就是首节点输入，文本作为 goal、图片作为首节点附件。
   if (workflowId) {
     await startWorkflow(workflowId, { goal: text.trim() }, id, images);

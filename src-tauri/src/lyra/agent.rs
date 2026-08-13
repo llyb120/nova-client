@@ -180,16 +180,6 @@ fn error_outcome(message: String) -> ToolOutcome {
     }
 }
 
-impl Drop for Agent {
-    fn drop(&mut self) {
-        if let Ok(mut cache) = self.spec_cache.lock() {
-            for (_, entry) in cache.drain() {
-                entry.handle.abort();
-            }
-        }
-    }
-}
-
 pub fn user_message(text: &str, images: &[Value]) -> Value {
     let mut parts = Vec::new();
     if !text.is_empty() {
@@ -198,7 +188,6 @@ pub fn user_message(text: &str, images: &[Value]) -> Value {
     parts.extend(images.iter().cloned());
     json!({ "role": "user", "content": parts, "timestamp": now_ms() })
 }
-
 impl Agent {
     /// 每条消息入列后回调中断轨迹钩子（字段级拆分借用，避免与回调冲突）。
     fn checkpoint_now(&mut self) {
@@ -227,7 +216,7 @@ impl Agent {
     {
         self.messages.push(user_message(text, &images));
         self.checkpoint_now();
-        self.run_loop(http, on_event, mid_turn).await
+        self.run_loop(http, on_event, mid_turn, false).await
     }
 
     /// 重试时不重复追加提示，直接从当前消息尾部继续。
@@ -241,7 +230,7 @@ impl Agent {
         F: FnMut(AgentEvent) + Send,
         M: FnMut(&mut Vec<Value>, &Value) + Send,
     {
-        self.run_loop(http, on_event, mid_turn).await
+        self.run_loop(http, on_event, mid_turn, false).await
     }
 
     async fn run_loop<F, M>(
@@ -249,6 +238,7 @@ impl Agent {
         http: &reqwest::Client,
         on_event: &mut F,
         mid_turn: &mut M,
+        mut memory_feedback_pending: bool,
     ) -> Result<TurnOutcome, String>
     where
         F: FnMut(AgentEvent) + Send,
@@ -358,7 +348,16 @@ impl Agent {
                 .cloned()
                 .collect();
             if !tool_calls.is_empty() {
+                let fed_back_memory = tool_calls.iter().any(|call| call.get("name").and_then(Value::as_str) == Some("feedback_memory"));
                 self.execute_tools(tool_calls, on_event).await;
+                let fast_context_loaded_memory = self.messages.last().is_some_and(|message| {
+                    message.get("toolName").and_then(Value::as_str) == Some("fast_context")
+                        && message.get("content").and_then(Value::as_array).is_some_and(|parts| parts.iter().filter_map(|part| part.get("text").and_then(Value::as_str)).any(|text| text.contains("# TRAINED KNOWLEDGE")))
+                });
+                if fast_context_loaded_memory { memory_feedback_pending = true; }
+                // fast_context 在结果正文中标记 TRAINED KNOWLEDGE，并明确要求反馈；
+                // feedback_memory 调用后清除旧会话可能遗留的闭环状态。
+                if fed_back_memory { memory_feedback_pending = false; }
                 // Reasonix：每个模型/工具回合后、下一次 provider 请求前维护上下文。
                 mid_turn(&mut self.messages, &message);
                 // 中途压缩/rebase 改写了消息，同步一次中断轨迹。
@@ -367,16 +366,17 @@ impl Agent {
             // steeringMode=all：工具结果后、最终回复后都把排队提示注入下一轮。
             self.drain_steering();
             self.checkpoint_now();
-            let has_more_work = !self.messages.is_empty()
-                && self
-                    .messages
-                    .last()
-                    .and_then(|m| m.get("role"))
-                    .and_then(Value::as_str)
-                    != Some("assistant");
-            if !has_more_work {
-                return Ok(outcome);
+            let mut has_more_work = !self.messages.is_empty()
+                && self.messages.last().and_then(|m| m.get("role")).and_then(Value::as_str) != Some("assistant");
+            if !has_more_work && memory_feedback_pending {
+                self.messages.push(user_message(
+                    "[系统闭环提醒] 本轮 fast_context 返回了训练知识。请在最终回复前调用 feedback_memory：采用且结果明确的条目用 ±1；未采用、无法验证或本轮无可观察结果的条目用 0，并说明原因。",
+                    &[],
+                ));
+                self.checkpoint_now();
+                has_more_work = true;
             }
+            if !has_more_work { return Ok(outcome); }
         }
     }
 

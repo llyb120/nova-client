@@ -548,6 +548,9 @@ pub struct Thread {
     /// Mind 自整理会话：默认不进入数字员工左侧会话列表，仅从关联入口查看。
     #[serde(default)]
     pub mind_thread: bool,
+    /// 猎户座训练会话：仅在猎户座左侧历史展示，与普通/员工会话隔离。
+    #[serde(default)]
+    pub experience_thread: bool,
     /// 会话树父节点：用于把数字员工“开工预检”与后续开发会话关联展示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -620,6 +623,7 @@ impl Thread {
             worktree: None,
             employee_id: None,
             mind_thread: false,
+            experience_thread: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
             pending_stage_context: None,
@@ -884,6 +888,9 @@ pub struct ThreadMeta {
     /// Mind 自整理会话：默认不进入数字员工左侧会话列表。
     #[serde(default)]
     pub mind_thread: bool,
+    /// 猎户座训练会话：只在猎户座左侧历史展示。
+    #[serde(default)]
+    pub experience_thread: bool,
     /// 会话树父节点：用于把预检会话与后续开发会话关联展示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,

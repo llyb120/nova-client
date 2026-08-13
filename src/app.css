@@ -5204,6 +5204,54 @@ select.field-input {
   line-height: 1.6;
 }
 
+.expert-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+.expert-row {
+  display: grid;
+  grid-template-columns: 72px repeat(4, minmax(72px, 1fr));
+  gap: 10px;
+  align-items: stretch;
+  min-height: 57px;
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--panel) 45%, transparent);
+}
+.expert-row > strong {
+  display: flex;
+  align-items: center;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 650;
+}
+.expert-row label {
+  display: grid;
+  grid-template-rows: 18px 32px;
+  gap: 3px;
+  min-width: 0;
+}
+.expert-row label > span {
+  align-self: start;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.expert-row .field-input {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 9px;
+}
+@media (max-width: 760px) {
+  .expert-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .expert-row > strong { grid-column: 1 / -1; }
+}
+
 .log-view {
   font-family: var(--mono);
   font-size: 11px;

@@ -64,6 +64,12 @@ export function getSlashSuggestions(
       input: "/run ",
     },
     {
+      name: "train",
+      description: "立即用大熊座配置的模型训练一次经验库",
+      kind: "Nova",
+      input: "/train",
+    },
+    {
       name: "setup",
       description: "把一个模型 / provider 接入 Vega：/setup 模型名",
       kind: "Nova",

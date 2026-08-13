@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const FAST_CONTEXT_DESCRIPTION: &str = "任务涉及跨文件查找或修改（含分析要改哪里）、或需要阅读多个文件正文来理解/规划改动时，先调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单，一次调用通常替代 5–10 轮 rg+read 往返，比自行 rg/grep 往返更省 token。目标路径和行段都已明确且只需少量行段时直接 read；只需符号的定义/引用行号时用 find_symbols；已定位但仍需阅读正文的多个文件，通过 files 传入一次打包，不要逐个 read。默认只传 keywords/task/files；任务里点名了某个工具/符号（如要改某个函数）时也不要用 find_symbols 代替本工具——find_symbols 只给行号不给正文；调用后不要再用 rg/git grep 重复检索同一批关键词，已展示范围视为已读。返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要直接退回 rg/grep 逐个搜索。";
+const FAST_CONTEXT_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文时先调用：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，并自动使用 task（缺省时回退 keywords）检索相关的猎户座经验、记忆与守则，一并返回。若返回训练知识，本轮结束前调用 feedback_memory。目标行段已明确时直接 read；只需符号位置时用 find_symbols。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。行号可直接用于 edit 的 startLine/endLine 行区间替换。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。禁止无排除的递归搜索（grep -r 等）。";
@@ -43,7 +43,7 @@ fn schema(value: Value) -> Value {
     value
 }
 
-pub fn tool_set(read_only: bool, fast_context: bool) -> Vec<Tool> {
+pub fn tool_set(read_only: bool, fast_context: bool, memory_enabled: bool) -> Vec<Tool> {
     let mut tools = Vec::new();
     if fast_context {
         tools.push(Tool {
@@ -174,6 +174,23 @@ pub fn tool_set(read_only: bool, fast_context: bool) -> Vec<Tool> {
                     "content": { "type": "string" }
                 },
                 "required": ["path", "content"]
+            })),
+        });
+    }
+
+
+    if memory_enabled {
+        tools.push(Tool {
+            name: "feedback_memory",
+            description: "闭环反馈 fast_context 本轮返回的训练知识。用户卡片评价只保留当前一票；本工具属于模型反馈，可跨会话多次累计。".into(),
+            parameters: schema(json!({
+                "type": "object",
+                "properties": {
+                    "experienceIds": { "type": "array", "items": { "type": "string" } },
+                    "reward": { "type": "number", "minimum": -1, "maximum": 1 },
+                    "note": { "type": "string", "description": "成功、失败、不采用或无法验证的依据" }
+                },
+                "required": ["experienceIds", "reward", "note"]
             })),
         });
     }
@@ -520,12 +537,33 @@ async fn execute_inner(
                     .collect();
                 object.insert("keywords".into(), Value::Array(keywords));
             }
-            match tokio::task::spawn_blocking(move || {
-                crate::nova_tools_native::context::fast_context(&root, args)
-            })
-            .await
-            {
-                Ok(Ok(text)) => ToolOutcome::text(clamp_tool_output_text(&text)),
+            let memory_query = args.get("task").and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
+                .or_else(|| args.get("keywords").and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")))
+                .unwrap_or_default();
+            // 代码上下文与训练知识是独立数据源，同轮并行，附加召回不会串行拖慢 fast_context。
+            let code_job = tokio::task::spawn_blocking(move || crate::nova_tools_native::context::fast_context(&root, args));
+            let memory_job = tokio::task::spawn_blocking(move || {
+                let enabled = crate::settings::Settings::load(&crate::lyra::config::nova_root()).experience_training_enabled;
+                if !enabled || memory_query.is_empty() { None } else { crate::experience::load_trained_memory(&memory_query, 8).ok() }
+            });
+            let (code_result, memory_result) = tokio::join!(code_job, memory_job);
+            match code_result {
+                Ok(Ok(text)) => {
+                    let mut text = clamp_tool_output_text(&text);
+                    let memory = memory_result.ok().flatten();
+                    if let Some(rows) = memory.as_ref().and_then(|value| value.get("experiences")).and_then(Value::as_array).filter(|rows| !rows.is_empty()) {
+                        let rendered = rows.iter().map(|item| {
+                            let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                            let kind = item.get("kind").and_then(Value::as_str).unwrap_or("experience");
+                            let trigger = item.get("trigger").and_then(Value::as_str).unwrap_or("");
+                            let action = item.get("action").and_then(Value::as_str).unwrap_or("");
+                            format!("- [{kind}] id={id} 条件/上下文：{trigger}\n  内容：{action}")
+                        }).collect::<Vec<_>>().join("\n");
+                        let activated = memory.as_ref().and_then(|value| value.get("activatedExperts")).cloned().unwrap_or_else(|| json!([]));
+                        text.push_str(&format!("\n\n# TRAINED KNOWLEDGE\nactivatedExperts={activated}\n{rendered}\n# FEEDBACK REQUIRED\n最终回复前调用 feedback_memory；采用并验证用 ±1，未采用或无法验证用 0。"));
+                    }
+                    ToolOutcome::text(text)
+                }
                 Ok(Err(error)) => ToolOutcome::error(error),
                 Err(e) => ToolOutcome::error(format!("fast_context 执行失败：{e}")),
             }
@@ -670,6 +708,28 @@ async fn execute_inner(
             match std::fs::write(&target, content) {
                 Ok(()) => ToolOutcome::text(format!("已写入 {}（{} 字节）", path, content.len())),
                 Err(e) => ToolOutcome::error(format!("写入 {path} 失败：{e}")),
+            }
+        }
+        "load_trained_memory" => {
+            let Some(query) = args.get("query").and_then(Value::as_str) else {
+                return ToolOutcome::error("load_trained_memory 缺少 query");
+            };
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
+            match crate::experience::load_trained_memory(query, limit) {
+                Ok(value) => ToolOutcome::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
+        "feedback_memory" => {
+            let ids = args.get("experienceIds").and_then(Value::as_array).map(|items| {
+                items.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            let reward = args.get("reward").and_then(Value::as_f64).unwrap_or(0.0);
+            let note = args.get("note").and_then(Value::as_str).unwrap_or_default();
+            let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
+            match crate::experience::feedback_memory(&ids, reward, note, &settings.experience_experts) {
+                Ok(value) => ToolOutcome::text(value.to_string()),
+                Err(error) => ToolOutcome::error(error),
             }
         }
         other => ToolOutcome::error(format!("未知工具：{other}")),
