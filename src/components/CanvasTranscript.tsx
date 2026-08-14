@@ -1,5 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { attachStarMapBackdrop } from "../canvasTranscript/base";
+import { paintCanvasBackdrop } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
@@ -930,9 +930,6 @@ function lineAtOffset(b: Block, offset: number): TextLine | null {
 
 export function CanvasTranscript(props: CanvasTranscriptProps) {
   let canvasEl!: HTMLCanvasElement;
-  /** 星图背景层（独立 canvas，自带动画循环） */
-  let bgCanvasEl!: HTMLCanvasElement;
-  let detachSky: (() => void) | undefined;
   let hostEl!: HTMLDivElement;
 
   // state
@@ -1781,14 +1778,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   function paintAll() {
     const canvas = canvasEl;
     if (!canvas) return;
-    // 前景文字层为透明表面，星图由下层独立 canvas 绘制；每帧先清空再画正文
-    const ctx = canvas.getContext("2d")!;
+    // The transcript is opaque; avoiding an alpha surface improves Chromium's text compositing.
+    const ctx = canvas.getContext("2d", { alpha: false })!;
     const p = pal;
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.textRendering = "optimizeLegibility";
     ctx.fontKerning = "normal";
-    ctx.clearRect(0, 0, viewW, viewH);
+    paintCanvasBackdrop(ctx, viewW, viewH, p);
 
     const visTop = scrollY - 50;
     const visBot = scrollY + viewH + 50;
@@ -3282,8 +3279,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     canvasEl.addEventListener("click", onClick);
     canvasEl.addEventListener("wheel", onWheel, { passive: false });
     canvasEl.addEventListener("copy", onCopy);
-    // 星图背景层：独立 canvas + 自驱动动画，主题随 pal 逐帧读取自动切换
-    if (bgCanvasEl) detachSky = attachStarMapBackdrop(bgCanvasEl, () => pal);
 
     props.ref?.({
       scrollToBottom() { keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
@@ -3305,7 +3300,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
       if (rebuildTimer !== undefined) window.clearTimeout(rebuildTimer);
       if (busyTimer !== undefined) window.clearTimeout(busyTimer);
-      detachSky?.();
       canvasEl.removeEventListener("mousemove", onMouseMove);
       canvasEl.removeEventListener("mouseleave", onMouseLeave);
       canvasEl.removeEventListener("mousedown", onMouseDown);
@@ -3386,7 +3380,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   return (
     <div class="canvas-transcript-host" ref={hostEl}>
-<canvas ref={bgCanvasEl} class="starmap-canvas" aria-hidden="true" />
       <canvas ref={canvasEl} class="transcript-canvas-only" tabindex="0" aria-label="会话记录" />
       {editing() && (
         <div class="canvas-prompt-editor" style={editStyle()} ref={bindEditHost}>

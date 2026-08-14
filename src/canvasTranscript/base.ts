@@ -262,10 +262,10 @@ export function invalidateTheme(): void {
 }
 
 /**
- * 静态背景（底色/柔光/点阵，不含星图）缓存在离屏 Canvas：主题或尺寸变化时才重建，
- * 之后每帧只做一次位图拷贝。星图由独立的背景 canvas 绘制（见 attachStarMapBackdrop）。
+ * 背景缓存在独立的离屏 Canvas：主题或尺寸变化时才重绘柔光与点阵；正文每帧只做一次位图拷贝。
+ * 比两个可见 Canvas 更稳：前景仍可使用 alpha:false，避免透明合成让暗色小字重新发虚。
  */
-const staticBackdropCache = new Map<string, HTMLCanvasElement>();
+const backdropCache = new Map<string, HTMLCanvasElement>();
 
 export function paintCanvasBackdrop(
   ctx: CanvasRenderingContext2D,
@@ -276,8 +276,10 @@ export function paintCanvasBackdrop(
   const dpr = window.devicePixelRatio || 1;
   const pixelW = Math.max(1, Math.round(width * dpr));
   const pixelH = Math.max(1, Math.round(height * dpr));
-  const key = [pixelW, pixelH, theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
-  let surface = staticBackdropCache.get(key);
+  // 星图随恒星时旋转：缓存按分钟分桶，每分钟重建一次背景位图，旧桶自然被淘汰
+  const skyBucket = Math.floor(Date.now() / 60000);
+  const key = [pixelW, pixelH, skyBucket, theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
+  let surface = backdropCache.get(key);
 
   if (!surface) {
     surface = document.createElement("canvas");
@@ -318,54 +320,14 @@ export function paintCanvasBackdrop(
       for (let x = 0; x < width; x += 26) bg.fillRect(x, y, dot, dot);
     }
 
-    if (staticBackdropCache.size >= 4) staticBackdropCache.delete(staticBackdropCache.keys().next().value!);
-    staticBackdropCache.set(key, surface);
+    // 星图层：低透明度星座，画在文字之下的背景缓存里
+    paintStarMap(bg, width, height, theme, skyBucket * 60000);
+
+    if (backdropCache.size >= 4) backdropCache.delete(backdropCache.keys().next().value!);
+    backdropCache.set(key, surface);
   }
+
   ctx.drawImage(surface, 0, 0, pixelW, pixelH, 0, 0, width, height);
-}
-
-/**
- * 把一块独立 canvas 变成“星图背景层”：1.5s 一次的定时器驱动，与前景文本层完全解耦。
- *
- * 每次重绘 = 一次静态层位图拷贝 + 一次星野直绘（银河/星座/连线/名称标注）。
- * 星野以连续恒星时计算，每步漂移不足 1px，人眼读作平滑移动，无需淡入淡出。
- * 页面隐藏（document.hidden）时跳过绘制。返回清理函数。
- */
-export function attachStarMapBackdrop(
-  canvas: HTMLCanvasElement,
-  themeOf: () => Pick<ThemeColors, "bg" | "glowAccent" | "glowCyan" | "glowCorner" | "gridDot">,
-): () => void {
-  const SKY_REBUILD_MS = 1500;
-  let timer: number | undefined;
-
-  const draw = () => {
-    if (document.hidden) return;
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
-    if (!w || !h) return;
-    const dpr = window.devicePixelRatio || 1;
-    const pw = Math.round(w * dpr);
-    const ph = Math.round(h * dpr);
-    if (canvas.width !== pw || canvas.height !== ph) {
-      canvas.width = pw;
-      canvas.height = ph;
-    }
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const theme = themeOf();
-    paintCanvasBackdrop(ctx, w, h, theme);
-    paintStarMap(ctx, w, h, theme, Date.now());
-  };
-
-  const ro = new ResizeObserver(() => draw());
-  ro.observe(canvas);
-  draw();
-  timer = window.setInterval(draw, SKY_REBUILD_MS);
-  return () => {
-    window.clearInterval(timer);
-    ro.disconnect();
-  };
 }
 
 /* ===== 矢量图标（与 icons.tsx 的 feather 风格 path 一致，Path2D 直绘） ===== */

@@ -13,9 +13,9 @@ import { editUserMessage, isExpanded, respondPermission, toggleExpanded } from "
 import type { PermissionRequest, PromptImage, RevertChange, UserItem } from "../types";
 import {
   type Action,
-  attachStarMapBackdrop,
   getTheme,
   measure,
+  paintCanvasBackdrop,
   roundRectPath,
 } from "./base";
 import {
@@ -70,8 +70,6 @@ export function TranscriptCanvas(props: {
 }) {
   let hostRef: HTMLDivElement | undefined;
   let canvasRef: HTMLCanvasElement | undefined;
-  /** 星图背景层（独立 canvas，自带动画循环） */
-  let bgCanvasRef: HTMLCanvasElement | undefined;
 
   const [viewW, setViewW] = createSignal(0);
   const [viewH, setViewH] = createSignal(0);
@@ -413,14 +411,15 @@ export function TranscriptCanvas(props: {
       canvas.width = Math.round(w * dpr);
       canvas.height = Math.round(h * dpr);
     }
-    // 前景文字层为透明表面，星图背景由下层独立 canvas 绘制；每帧先清空再画正文
-    const ctx = canvas.getContext("2d");
+    // Opaque backing avoids the extra alpha-compositing pass that makes small light-on-dark
+    // glyphs look soft in Chromium/WebView. Canvas-specific theme colors control contrast.
+    const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.textRendering = "optimizeLegibility";
     ctx.fontKerning = "normal";
     const theme = getTheme();
-    ctx.clearRect(0, 0, w, h);
+    paintCanvasBackdrop(ctx, w, h, theme);
     ctx.textBaseline = "alphabetic";
     let a = Math.min(selA, selB);
     let b = Math.max(selA, selB);
@@ -1202,13 +1201,10 @@ export function TranscriptCanvas(props: {
     window.addEventListener("pointercancel", finishPointer, true);
     const mo = new MutationObserver(() => bump());
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    // 星图背景层：独立 canvas + 自驱动动画，主题随 getTheme 逐帧读取自动切换
-    const detachSky = bgCanvasRef ? attachStarMapBackdrop(bgCanvasRef, getTheme) : () => {};
 
     props.onApi(canvasApi);
 
     onCleanup(() => {
-      detachSky();
       ro.disconnect();
       mo.disconnect();
       canvas.removeEventListener("wheel", onWheel);
@@ -1226,7 +1222,6 @@ export function TranscriptCanvas(props: {
       classList={{ "checkpoint-preview-fading": props.fading }}
       ref={hostRef}
     >
-      <canvas ref={bgCanvasRef} class="starmap-canvas" aria-hidden="true" />
       <canvas
         ref={canvasRef}
         onPointerDown={onPointerDown}
