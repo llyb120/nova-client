@@ -25,6 +25,10 @@ interface Star {
 }
 
 interface Constellation {
+  /** 中文名 */
+  name: string;
+  /** 名称标注锚点（放在星群附近的空白处） */
+  label: { ra: number; dec: number };
   stars: Star[];
   lines: Array<[number, number]>;
 }
@@ -33,6 +37,8 @@ interface Constellation {
 const CONSTELLATIONS: Constellation[] = [
   {
     // 北斗七星（大熊座）
+    name: "北斗七星",
+    label: { ra: 12.2, dec: 51.5 },
     stars: [
       { ra: 11.06, dec: 61.75, mag: 1.8 }, // 天枢 Dubhe
       { ra: 11.03, dec: 56.38, mag: 2.4 }, // 天璇 Merak
@@ -48,6 +54,8 @@ const CONSTELLATIONS: Constellation[] = [
   },
   {
     // 仙后座（W 形）
+    name: "仙后座",
+    label: { ra: 1.05, dec: 64.5 },
     stars: [
       { ra: 0.15, dec: 59.15, mag: 2.3 }, // 王良一 Caph
       { ra: 0.68, dec: 56.54, mag: 2.2 }, // 王良四 Schedar
@@ -61,6 +69,8 @@ const CONSTELLATIONS: Constellation[] = [
   },
   {
     // 猎户座
+    name: "猎户座",
+    label: { ra: 5.55, dec: 3.6 },
     stars: [
       { ra: 5.92, dec: 7.41, mag: 0.4 }, // 参宿四 Betelgeuse（红超巨星）
       { ra: 5.42, dec: 6.35, mag: 1.6 }, // 参宿五 Bellatrix
@@ -76,6 +86,8 @@ const CONSTELLATIONS: Constellation[] = [
   },
   {
     // 天鹅座（北十字）
+    name: "天鹅座",
+    label: { ra: 20.25, dec: 47.6 },
     stars: [
       { ra: 20.69, dec: 45.28, mag: 1.3 }, // 天津四 Deneb
       { ra: 20.62, dec: 40.26, mag: 2.2 }, // 天津一 Sadr
@@ -89,6 +101,8 @@ const CONSTELLATIONS: Constellation[] = [
   },
   {
     // 天蝎座
+    name: "天蝎座",
+    label: { ra: 16.35, dec: -21.3 },
     stars: [
       { ra: 16.09, dec: -19.81, mag: 2.6 }, // 房宿三 β Sco
       { ra: 16.0, dec: -22.62, mag: 2.3 }, // 房宿四 Dschubba
@@ -106,6 +120,8 @@ const CONSTELLATIONS: Constellation[] = [
   },
   {
     // 狮子座（镰刀 + 三角）
+    name: "狮子座",
+    label: { ra: 10.55, dec: 27.8 },
     stars: [
       { ra: 9.76, dec: 23.77, mag: 3.0 }, // 轩辕九 ε Leo
       { ra: 9.88, dec: 26.01, mag: 3.9 }, // 轩辕十 μ Leo
@@ -122,6 +138,8 @@ const CONSTELLATIONS: Constellation[] = [
   },
   {
     // 天琴座
+    name: "天琴座",
+    label: { ra: 18.55, dec: 41.5 },
     stars: [
       { ra: 18.62, dec: 38.78, mag: 0.0 }, // 织女星 Vega
       { ra: 18.74, dec: 33.67, mag: 4.0 }, // 织女二 ε Lyr
@@ -135,6 +153,8 @@ const CONSTELLATIONS: Constellation[] = [
   },
   {
     // 天鹰座
+    name: "天鹰座",
+    label: { ra: 19.9, dec: 12.8 },
     stars: [
       { ra: 19.85, dec: 8.87, mag: 0.8 }, // 牛郎星 Altair
       { ra: 19.77, dec: 10.61, mag: 2.7 }, // 河鼓三 Tarazed
@@ -146,6 +166,8 @@ const CONSTELLATIONS: Constellation[] = [
   },
   {
     // 南十字座
+    name: "南十字座",
+    label: { ra: 12.45, dec: -55 },
     stars: [
       { ra: 12.44, dec: -63.1, mag: 0.8 }, // 十字架二 α Cru
       { ra: 12.79, dec: -59.69, mag: 1.3 }, // 十字架三 β Cru
@@ -430,8 +452,8 @@ export function paintStarMap(
 ): void {
   if (width < 80 || height < 80) return;
   const lum = luminanceOf(theme.bg);
-  const dark = lum == null || lum < 0.5;
-  const alphaScale = dark ? 1 : 0.6; // 浅色主题整体压暗
+  // 仅暗色主题绘制星图：浅色主题直接跳过，零开销也避免任何视觉噪声
+  if (lum != null && lum >= 0.5) return;
 
   const proj = makeProjection(width, height, now);
   const margin = 48;
@@ -441,14 +463,14 @@ export function paintStarMap(
   // ── 银河（最底层）：星团云气叠加 ────────────────────────────────────────
   {
     // 颜色混合：暖白 ↔ 冷蓝
-    const warm: Rgb = dark ? [224, 216, 235] : [150, 138, 170];
-    const cool: Rgb = dark ? [186, 206, 250] : [108, 122, 175];
+    const warm: Rgb = [224, 216, 235];
+    const cool: Rgb = [186, 206, 250];
     const mix = (t: number): Rgb => [
       Math.round(warm[0] + (cool[0] - warm[0]) * t),
       Math.round(warm[1] + (cool[1] - warm[1]) * t),
       Math.round(warm[2] + (cool[2] - warm[2]) * t),
     ];
-    const baseA = (dark ? 0.055 : 0.045) * alphaScale;
+    const baseA = 0.055;
     for (const c of MILKY_CLUMPS) {
       const { x, y } = project(proj, c);
       const r = proj.s * c.size * D2R * 1.5;
@@ -486,7 +508,7 @@ export function paintStarMap(
     // 星等 → 亮度/尺寸：非线性，亮星差异拉开
     const t = Math.max(0, Math.min(1, (5.6 - star.mag) / 5.6));
     const size = 3 + 17 * t * t; // 3-20px 的精灵
-    const alpha = Math.min(1, (0.22 + 0.78 * t * t + boost) * alphaScale);
+    const alpha = Math.min(1, 0.22 + 0.78 * t * t + boost);
     const bright = star.mag <= 2.3;
     // 已知红超巨星固定暖色，其余按随机色温
     const isWarmGiant =
@@ -503,7 +525,7 @@ export function paintStarMap(
   for (const s of MILKY_STARS) drawStar(s);
 
   // ── 星座连线：极暗的结构暗示 ────────────────────────────────────────────
-  ctx.strokeStyle = dark ? "rgba(200,212,240,0.09)" : "rgba(52,64,110,0.12)";
+  ctx.strokeStyle = "rgba(200,212,240,0.09)";
   ctx.lineWidth = 1;
   for (const con of CONSTELLATIONS) {
     const pts = con.stars.map((s) => project(proj, s));
@@ -516,6 +538,23 @@ export function paintStarMap(
       ctx.lineTo(q.x, q.y);
     }
     ctx.stroke();
+  }
+
+  // ── 星座名称：低透明度小字，跟随投影位置 ──────────────────────────────
+  {
+    ctx.fillStyle = "rgba(198,210,238,0.30)";
+    ctx.font =
+      '500 10.5px "Inter Variable","Noto Sans SC Variable","Segoe UI","Microsoft YaHei UI","PingFang SC",system-ui,sans-serif';
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const spaced = ctx as CanvasRenderingContext2D & { letterSpacing?: string };
+    if (spaced.letterSpacing !== undefined) spaced.letterSpacing = "2px";
+    for (const con of CONSTELLATIONS) {
+      const { x, y } = project(proj, con.label);
+      if (!inView(x, y)) continue;
+      ctx.fillText(con.name, x, y);
+    }
+    if (spaced.letterSpacing !== undefined) spaced.letterSpacing = "0px";
   }
 
   // ── 星座主星（压在线之上）───────────────────────────────────────────────
