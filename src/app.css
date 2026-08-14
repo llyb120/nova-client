@@ -954,8 +954,20 @@ button {
   overflow: hidden;
   background: var(--bg);
 }
+/* 星图背景层：独立 canvas，铺在文字层之下 */
+.starmap-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  z-index: 0;
+  pointer-events: none;
+}
 .transcript-canvas-only {
   display: block;
+  position: relative;
+  z-index: 1;
   width: 100%;
   height: 100%;
   outline: none;
@@ -8946,6 +8958,9 @@ button.clue-bar-item:hover,
   width: 100%;
   height: 100%;
   display: block;
+}
+.transcript-canvas-host > canvas:not(.starmap-canvas) {
+  z-index: 1;
 }
 .canvas-float {
   position: absolute;

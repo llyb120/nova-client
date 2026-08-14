@@ -10,8 +10,10 @@ import type { ThemeColors } from "./base";
  *    叠加出云气般的银河，银心方向（人马座）最亮最宽。
  * 3. 星座连线降到几乎不可见的暗线，只起结构暗示作用，避免"示意图"感。
  *
- * 绘制在会话背景缓存层（文字之下），投影为以当前子午线为中心的球面立体投影
- * （约 160° 广角视场），星空随真实时间自东向西漂移。
+ * 绘制在会话背景缓存层（文字之下），投影为球面立体投影（广角视场，横向随屏幕宽高比
+ * 展开）。中心赤经跟随恒星时、中心赤纬在 -24°…+60° 间随恒星时缓慢摆动：
+ * 不要求一屏装下全天，但一天之内高纬（北斗/仙后/北极星）与低纬（天蝎尾/南十字）
+ * 的星座都会轮流进入视野中心，星空随真实时间自东向西漂移。
  */
 
 const D2R = Math.PI / 180;
@@ -259,12 +261,12 @@ const MILKY_CLUMPS: MilkyClump[] = (() => {
     const u = Math.max(rand(), 1e-9);
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
   };
-  for (let i = 0; i < 520; i++) {
+  for (let i = 0; i < 720; i++) {
     const l = rand() * 360;
     const dl = dlFromCore(l);
     const dlCyg = Math.min(Math.abs(l - 80), 360 - Math.abs(l - 80));
     const bright =
-      0.15 + 0.85 * Math.exp(-((dl / 62) ** 2)) + 0.28 * Math.exp(-((dlCyg / 32) ** 2));
+      0.2 + 0.9 * Math.exp(-((dl / 62) ** 2)) + 0.34 * Math.exp(-((dlCyg / 32) ** 2));
     const width = 6.5 + 6.5 * Math.exp(-((dl / 50) ** 2)); // 银心鼓胀
     const b = gauss() * width;
     if (Math.abs(b) > width * 2.2) continue; // 远尾巴裁掉，省得画飞点
@@ -280,34 +282,32 @@ const MILKY_CLUMPS: MilkyClump[] = (() => {
   return clumps;
 })();
 
-/** 银河带里的星场增强：沿银道多撒暗星，让"银河由无数恒星组成"的感觉出来 */
-const MILKY_STARS: Star[] = (() => {
+interface MilkyStar extends Star {
+  /** 亮度权重 0.5-1.3，模拟星点明暗起伏 */
+  w: number;
+}
+
+/** 银河带里的星场增强：沿银道撒大量暗星，让"银河由无数恒星组成"的颗粒感出来 */
+const MILKY_STARS: MilkyStar[] = (() => {
   const rand = mulberry32(778899);
-  const stars: Star[] = [];
+  const stars: MilkyStar[] = [];
   const gauss = () => {
     const u = Math.max(rand(), 1e-9);
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
   };
-  for (let i = 0; i < 420; i++) {
+  for (let i = 0; i < 1300; i++) {
     const l = rand() * 360;
-    const width = 7 + 6 * Math.exp(-((dlFromCore(l) / 55) ** 2));
+    const dl = dlFromCore(l);
+    const width = 7 + 6 * Math.exp(-((dl / 55) ** 2));
     const b = gauss() * width * 0.8;
     if (Math.abs(b) > width * 2) continue;
     const eq = galacticToEquatorial(l, b);
-    stars.push({ ra: eq.ra, dec: eq.dec, mag: 3.4 + rand() * 2.4 });
-  }
-  return stars;
-})();
-
-/** 全天背景暗星 */
-const FIELD_STARS: Star[] = (() => {
-  const rand = mulberry32(20240521);
-  const stars: Star[] = [];
-  for (let i = 0; i < 360; i++) {
     stars.push({
-      ra: rand() * 24,
-      dec: rand() * 160 - 80,
-      mag: 3.0 + rand() * 2.6,
+      ra: eq.ra,
+      dec: eq.dec,
+      // 星等分布向暗端倾斜，偶有几颗较亮的打破均匀感
+      mag: 3.2 + rand() * 2.6 - (rand() < 0.12 ? 0.9 : 0),
+      w: 0.5 + rand() * 0.8,
     });
   }
   return stars;
@@ -325,35 +325,43 @@ function siderealDeg(now: number): number {
 interface Projection {
   cx: number;
   cy: number;
-  s: number;
+  /** 横向/纵向分离缩放：宽屏时横向视野展开，避免全屏最大化后两侧大片空白 */
+  sx: number;
+  sy: number;
   raC: number;
   sinC: number;
   cosC: number;
 }
 
 function makeProjection(width: number, height: number, now: number): Projection {
-  const decC = 18 * D2R; // 中心赤纬固定在中北纬天空
+  const raC = siderealDeg(now) * D2R;
+  // 中心赤纬随恒星时在 -24°…+60° 间摆动：北极星(89°)最近时距中心 29°，
+  // 南十字(-60°)最近时距中心 36°，全天星座一天内都会轮流进入视野
+  const decC = (18 + 42 * Math.sin(raC)) * D2R;
+  const sy = Math.min(width, height) * 0.34;
+  const sx = sy * Math.min(Math.max(width / height, 1), 1.75); // 限制倍率防止过度拉伸
   return {
     cx: width * 0.5,
     cy: height * 0.5,
-    s: Math.min(width, height) * 0.3,
-    raC: siderealDeg(now) * D2R,
+    sx,
+    sy,
+    raC,
     sinC: Math.sin(decC),
     cosC: Math.cos(decC),
   };
 }
 
-/** 球面立体投影（约 160° 广角） */
+/** 球面立体投影（广角，横向按屏幕宽高比展开） */
 function project(p: Projection, star: { ra: number; dec: number }): { x: number; y: number } {
   const dec = star.dec * D2R;
   const dRa = star.ra * 15 * D2R - p.raC;
   const sinD = Math.sin(dec);
   const cosD = Math.cos(dec);
   const denom = 1 + p.sinC * sinD + p.cosC * cosD * Math.cos(dRa);
-  const k = (2 * p.s) / Math.max(denom, 0.02);
+  const k = 2 / Math.max(denom, 0.02);
   return {
-    x: p.cx + k * cosD * Math.sin(dRa),
-    y: p.cy - k * (p.cosC * sinD - p.sinC * cosD * Math.cos(dRa)),
+    x: p.cx + k * p.sx * cosD * Math.sin(dRa),
+    y: p.cy - k * p.sy * (p.cosC * sinD - p.sinC * cosD * Math.cos(dRa)),
   };
 }
 
@@ -406,6 +414,20 @@ function makeStarSprite(color: Rgb, spiky: boolean): HTMLCanvasElement {
     spike(Math.PI / 2);
   }
   return c;
+}
+
+/* ===== 星光精灵（模块级缓存：两个组件共用，跨帧复用） ===== */
+
+const spriteCache = new Map<string, HTMLCanvasElement>();
+
+function spriteFor(color: Rgb, spiky: boolean): HTMLCanvasElement {
+  const key = `${color.join(",")}|${spiky ? 1 : 0}`;
+  let s = spriteCache.get(key);
+  if (!s) {
+    s = makeStarSprite(color, spiky);
+    spriteCache.set(key, s);
+  }
+  return s;
 }
 
 /* ===== 主题适配 ===== */
@@ -470,10 +492,11 @@ export function paintStarMap(
       Math.round(warm[1] + (cool[1] - warm[1]) * t),
       Math.round(warm[2] + (cool[2] - warm[2]) * t),
     ];
+    // 银河基础亮度：低于文字可读阈值，不够明显再微调这个数
     const baseA = 0.055;
     for (const c of MILKY_CLUMPS) {
       const { x, y } = project(proj, c);
-      const r = proj.s * c.size * D2R * 1.5;
+      const r = ((proj.sx + proj.sy) / 2) * c.size * D2R * 1.8;
       if (!inView(x - r, y - r) && !inView(x + r, y + r)) continue;
       const [cr, cg, cb] = mix(c.cool);
       const a = baseA * c.b;
@@ -488,27 +511,17 @@ export function paintStarMap(
     }
   }
 
-  // ── 星光精灵缓存（按颜色分）────────────────────────────────────────────
-  // 亮星带衍射芒、暗星不带；两种各三套色温
+  // ── 星光精灵：模块级缓存，亮星带衍射芒、暗星不带 ─────────────────
   const tintRand = mulberry32(4451);
-  const spriteCache = new Map<string, HTMLCanvasElement>();
-  const spriteFor = (color: Rgb, spiky: boolean): HTMLCanvasElement => {
-    const key = `${color.join(",")}|${spiky ? 1 : 0}`;
-    let s = spriteCache.get(key);
-    if (!s) {
-      s = makeStarSprite(color, spiky);
-      spriteCache.set(key, s);
-    }
-    return s;
-  };
 
-  const drawStar = (star: Star, boost = 0) => {
+  const drawStar = (star: Star, boost = 0, sizeBoost = 0) => {
     const { x, y } = project(proj, star);
     if (!inView(x, y)) return;
     // 星等 → 亮度/尺寸：非线性，亮星差异拉开
     const t = Math.max(0, Math.min(1, (5.6 - star.mag) / 5.6));
-    const size = 3 + 17 * t * t; // 3-20px 的精灵
-    const alpha = Math.min(1, 0.22 + 0.78 * t * t + boost);
+    const size = 3 + 17 * t * t + sizeBoost; // 3-20px 的精灵
+    const alpha = Math.max(0, Math.min(1, 0.22 + 0.78 * t * t + boost));
+    if (alpha <= 0.01) return;
     const bright = star.mag <= 2.3;
     // 已知红超巨星固定暖色，其余按随机色温
     const isWarmGiant =
@@ -520,9 +533,8 @@ export function paintStarMap(
     ctx.globalAlpha = 1;
   };
 
-  // 全天暗星 + 银河带星场增强
-  for (const s of FIELD_STARS) drawStar(s, -0.04);
-  for (const s of MILKY_STARS) drawStar(s);
+  // 银河带星场增强：星点细密但极暗，只在银河区域内
+  for (const s of MILKY_STARS) drawStar(s, -0.16);
 
   // ── 星座连线：极暗的结构暗示 ────────────────────────────────────────────
   ctx.strokeStyle = "rgba(200,212,240,0.09)";
@@ -563,3 +575,4 @@ export function paintStarMap(
   }
   drawStar(POLARIS, 0.15);
 }
+
