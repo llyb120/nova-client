@@ -310,6 +310,11 @@ pub(crate) fn assign_to_agent_job(child: &tokio::process::Child) {
 #[cfg(not(windows))]
 pub(crate) fn assign_to_agent_job(_child: &tokio::process::Child) {}
 
+struct SteerTurnState {
+    pending: u32,
+    deferred_finish: Option<(String, Option<Value>)>,
+}
+
 pub struct AcpManager {
     pub app: AppHandle,
     /// 保留 agent 类型供现有路由和事件载荷使用；ACP 实现仅支持 Devin。
@@ -326,6 +331,9 @@ pub struct AcpManager {
     /// 正在 session/load 回放、需要抑制 update 的会话
     loading_sessions: StdMutex<HashSet<String>>,
     running_threads: StdMutex<HashSet<String>>,
+    /// Devin 会把运行中引导作为并发 session/prompt 合入当前轮次。主请求可能先返回，
+    /// 此时必须把轮次收尾延后到最后一个引导请求结束，避免 UI 提前显示“已停止”。
+    steer_turns: StdMutex<HashMap<String, SteerTurnState>>,
     /// 轮次开始时间，用于结束时计算耗时
     turn_started: StdMutex<HashMap<String, std::time::Instant>>,
     /// 诊断：session/prompt 发出时刻 → 用于测量「首响应延迟」(session_id)
@@ -366,6 +374,7 @@ impl AcpManager {
             routes: StdMutex::new(HashMap::new()),
             loading_sessions: StdMutex::new(HashSet::new()),
             running_threads: StdMutex::new(HashSet::new()),
+            steer_turns: StdMutex::new(HashMap::new()),
             turn_started: StdMutex::new(HashMap::new()),
             prompt_sent_at: StdMutex::new(HashMap::new()),
             pending_permissions: StdMutex::new(HashMap::new()),
@@ -1458,6 +1467,7 @@ impl AcpManager {
 
     /// 轮次收尾：写入 turn item（耗时 + token 用量）并结束 running 状态
     fn finish_turn(&self, thread_id: &str, stop_reason: String, usage: Option<Value>) {
+        self.steer_turns.lock().unwrap().remove(thread_id);
         let duration_ms = self
             .turn_started
             .lock()
@@ -1480,6 +1490,55 @@ impl AcpManager {
         self.maybe_emit_plan_action(thread_id, &stop_reason);
         self.set_running(thread_id, false, Some(stop_reason.clone()));
         self.notify_done(thread_id, &stop_reason);
+    }
+
+    /// 若还有已经受理的 Devin 引导请求，则由最后一个引导请求负责收尾。
+    fn finish_turn_after_steers(&self, thread_id: &str, stop_reason: String, usage: Option<Value>) {
+        {
+            let mut turns = self.steer_turns.lock().unwrap();
+            if let Some(state) = turns.get_mut(thread_id) {
+                if state.pending > 0 {
+                    state.deferred_finish = Some((stop_reason, usage));
+                    return;
+                }
+            }
+        }
+        self.finish_turn(thread_id, stop_reason, usage);
+    }
+
+    fn reserve_steer(&self, thread_id: &str) {
+        let mut turns = self.steer_turns.lock().unwrap();
+        let state = turns
+            .entry(thread_id.to_string())
+            .or_insert(SteerTurnState {
+                pending: 0,
+                deferred_finish: None,
+            });
+        state.pending = state.pending.saturating_add(1);
+    }
+
+    fn complete_steer(&self, thread_id: &str) {
+        let deferred = {
+            let mut turns = self.steer_turns.lock().unwrap();
+            let Some(state) = turns.get_mut(thread_id) else {
+                return;
+            };
+            state.pending = state.pending.saturating_sub(1);
+            if state.pending == 0 {
+                turns
+                    .remove(thread_id)
+                    .and_then(|state| state.deferred_finish)
+            } else {
+                None
+            }
+        };
+        if let Some((stop_reason, usage)) = deferred {
+            // cancel/force-finish 可能已在引导 RPC 返回前结束轮次。
+            if self.is_running(thread_id) {
+                self.finish_turn(thread_id, stop_reason, usage);
+                let _ = self.app.emit(EV_THREADS, json!({}));
+            }
+        }
     }
 
     fn maybe_emit_plan_action(&self, thread_id: &str, stop_reason: &str) {
@@ -2260,7 +2319,7 @@ impl AcpManager {
                 ("error".to_string(), None)
             }
         };
-        self.finish_turn(&thread_id, stop_reason, usage);
+        self.finish_turn_after_steers(&thread_id, stop_reason, usage);
         let _ = self.app.emit(EV_THREADS, json!({}));
     }
 
@@ -2381,6 +2440,15 @@ impl AcpManager {
         text: String,
         images: Vec<PromptImage>,
     ) {
+        // 先登记引导，再做 session/连接准备；否则主 prompt 可能正好在结论阶段返回，
+        // 抢先发出 running:false，而引导 RPC 实际仍在继续。
+        if self.is_running(&thread_id) {
+            self.reserve_steer(&thread_id);
+        } else {
+            self.clone().run_prompt(thread_id, text, images).await;
+            return;
+        }
+
         // 首条消息的 session 可能还在建立中，短暂等待
         let mut session_id: Option<String> = None;
         for _ in 0..20 {
@@ -2398,6 +2466,7 @@ impl AcpManager {
         // 再注入只会随被取消的轮次一起丢弃（消息上屏却永远没有回应，表现为发送失败），
         // 改走正常新轮次。
         if !self.is_running(&thread_id) {
+            self.complete_steer(&thread_id);
             self.clone().run_prompt(thread_id, text, images).await;
             return;
         }
@@ -2411,6 +2480,7 @@ impl AcpManager {
             }
         };
         let Some(session_id) = session_id else {
+            self.complete_steer(&thread_id);
             err("引导消息发送失败：会话尚未建立".into());
             return;
         };
@@ -2418,6 +2488,7 @@ impl AcpManager {
             .conn_for_key(&self.conn_key_for_thread(&thread_id))
             .await
         else {
+            self.complete_steer(&thread_id);
             err(format!("引导消息发送失败：{} 未连接", self.kind.label()));
             return;
         };
@@ -2440,14 +2511,16 @@ impl AcpManager {
         let tid = thread_id.clone();
         // 该请求要到轮次结束才返回（与主 prompt 一同返回），结果由主 drive 收尾，这里只记录失败
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = conn
+            let result = conn
                 .request(
                     "session/prompt",
                     json!({ "sessionId": session_id, "prompt": prompt }),
                     None,
                 )
-                .await
-            {
+                .await;
+            // 必须先释放引导占位；若主请求已经返回，这一步会完成被延后的轮次收尾。
+            mgr.complete_steer(&tid);
+            if let Err(e) = result {
                 mgr.push_log(format!("[nova] 引导消息发送失败 {tid}: {e}"));
                 // 注入随轮次一起夭折（如注入后用户立刻停止/连接被杀）：轮次已结束的话，
                 // 这条消息不会再有任何回应，明确提示用户重发，避免看起来「发出去但没反应」。
