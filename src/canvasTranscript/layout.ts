@@ -1429,7 +1429,9 @@ function toolBlock(flow: Flow, item: ToolItem, env: LayoutEnv, active: boolean):
     lines: [],
     boxes: [],
     paint: (ctx, view) => {
-      if (view.hoverGroup === `tl-${item.id}`) {
+      // 运行中的工具由 spinner 持续重绘；此时不画 hover 底板，避免首个工具
+      // 在鼠标恰好停留于该位置时出现突兀的矩形背景。
+      if (!busy && view.hoverGroup === `tl-${item.id}`) {
         roundRectPath(ctx, flow.x0, y0, flow.width, rowH, 7);
         ctx.fillStyle = view.theme.bgHover;
         ctx.fill();

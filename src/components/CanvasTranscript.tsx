@@ -1657,7 +1657,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     result.push({ kind: "tool-header", id: item.id, groupIdx: gi,
       x, y: y + 1, w: proseW, h: toolH,
       text: label, color: item.status === "failed" ? p.red : p.dim,
-      fontSize: 12, font: p.mono, hoverBg: p.hover, borderRadius: 7,
+      fontSize: 12, font: p.mono, hoverBg: busy ? undefined : p.hover, borderRadius: 7,
       cursor: hasBody ? "pointer" : "default",
       data: {
         open, busy, hasBody, kind: item.kind, status: item.status, detail,
@@ -1775,6 +1775,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.fillText(text, snap(x), snap(y));
   }
 
+  let paintedBackdropAt = Date.now();
+
   function paintAll() {
     const canvas = canvasEl;
     if (!canvas) return;
@@ -1785,7 +1787,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.textRendering = "optimizeLegibility";
     ctx.fontKerning = "normal";
-    paintCanvasBackdrop(ctx, viewW, viewH, p);
+    paintedBackdropAt = Date.now();
+    paintCanvasBackdrop(ctx, viewW, viewH, p, paintedBackdropAt);
 
     const visTop = scrollY - 50;
     const visBot = scrollY + viewH + 50;
@@ -1948,16 +1951,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const by = b.y - scrollY;
       if (by + b.h < -1 || by > viewH + 1) continue;
       anyBusy = true;
-      const isHover = index === hoverBlockIdx
-        || !!(b.hoverKey && blocks[hoverBlockIdx]?.hoverKey === b.hoverKey);
       ctx.save();
-      ctx.fillStyle = pal.bg;
-      ctx.fillRect(b.x, by, b.w, b.h);
-      if (isHover && b.hoverBg) {
-        ctx.fillStyle = b.hoverBg;
-        roundRect(ctx, b.x, by, b.w, b.h, b.borderRadius || 0);
-        ctx.fill();
-      }
+      // 背景包含柔光、点阵和星图，不能用纯色 pal.bg 擦除 spinner 旧帧；
+      // 否则第一个运行中工具会每 50ms 把整行刷成一块矩形（浅色主题下就是白块）。
+      // 恢复整帧绘制时使用的同一背景桶，再重画工具头。
+      paintCanvasBackdrop(ctx, viewW, viewH, pal, paintedBackdropAt, {
+        x: b.x,
+        y: by,
+        w: b.w,
+        h: b.h,
+      });
+      ctx.restore();
+      ctx.save();
       paintToolHeader(ctx, b, b.x, by, pal);
       ctx.restore();
     }

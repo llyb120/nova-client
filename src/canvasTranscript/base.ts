@@ -272,12 +272,14 @@ export function paintCanvasBackdrop(
   width: number,
   height: number,
   theme: Pick<ThemeColors, "bg" | "glowAccent" | "glowCyan" | "glowCorner" | "gridDot">,
+  now = Date.now(),
+  region?: { x: number; y: number; w: number; h: number },
 ): void {
   const dpr = window.devicePixelRatio || 1;
   const pixelW = Math.max(1, Math.round(width * dpr));
   const pixelH = Math.max(1, Math.round(height * dpr));
   // 星图随恒星时旋转：缓存按分钟分桶，每分钟重建一次背景位图，旧桶自然被淘汰
-  const skyBucket = Math.floor(Date.now() / 60000);
+  const skyBucket = Math.floor(now / 60000);
   const key = [pixelW, pixelH, skyBucket, theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
   let surface = backdropCache.get(key);
 
@@ -327,7 +329,28 @@ export function paintCanvasBackdrop(
     backdropCache.set(key, surface);
   }
 
-  ctx.drawImage(surface, 0, 0, pixelW, pixelH, 0, 0, width, height);
+  if (region) {
+    // spinner 等局部动画只恢复自身覆盖的背景区域，避免每帧重拷整张背景。
+    const x0 = Math.max(0, region.x);
+    const y0 = Math.max(0, region.y);
+    const x1 = Math.min(width, region.x + region.w);
+    const y1 = Math.min(height, region.y + region.h);
+    if (x1 > x0 && y1 > y0) {
+      ctx.drawImage(
+        surface,
+        x0 * dpr,
+        y0 * dpr,
+        (x1 - x0) * dpr,
+        (y1 - y0) * dpr,
+        x0,
+        y0,
+        x1 - x0,
+        y1 - y0,
+      );
+    }
+  } else {
+    ctx.drawImage(surface, 0, 0, pixelW, pixelH, 0, 0, width, height);
+  }
 }
 
 /* ===== 矢量图标（与 icons.tsx 的 feather 风格 path 一致，Path2D 直绘） ===== */
