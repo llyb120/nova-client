@@ -3157,6 +3157,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     scrollLock = null;
     const wasBottom = !lock && (keepBottom || maxScroll - scrollY <= 2);
     if (!await computeLayout(generation)) return;
+    // blocks are replaced during layout; an index from the previous block array may now
+    // identify an unrelated block (often the first tool), producing a phantom hover card.
+    hoverBlockIdx = -1;
+    if (canvasEl) {
+      canvasEl.style.cursor = "default";
+      canvasEl.title = "";
+    }
     const liveKeys = new Set(
       blocks.filter((b) => b.data?.clipped).map((b) => blockScrollKey(b)),
     );
