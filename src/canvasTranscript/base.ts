@@ -7,6 +7,8 @@ export const SANS =
   '"Inter Variable","Noto Sans SC Variable","Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif';
 export const MONO = '"JetBrains Mono Variable","Cascadia Mono",Consolas,monospace';
 
+import { paintStarMap } from "./starMap";
+
 export interface FontOpts {
   bold?: boolean;
   italic?: boolean;
@@ -274,7 +276,9 @@ export function paintCanvasBackdrop(
   const dpr = window.devicePixelRatio || 1;
   const pixelW = Math.max(1, Math.round(width * dpr));
   const pixelH = Math.max(1, Math.round(height * dpr));
-  const key = [pixelW, pixelH, theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
+  // 星图随恒星时旋转：缓存按分钟分桶，每分钟重建一次背景位图，旧桶自然被淘汰
+  const skyBucket = Math.floor(Date.now() / 60000);
+  const key = [pixelW, pixelH, skyBucket, theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
   let surface = backdropCache.get(key);
 
   if (!surface) {
@@ -315,6 +319,9 @@ export function paintCanvasBackdrop(
     for (let y = 0; y < height; y += 26) {
       for (let x = 0; x < width; x += 26) bg.fillRect(x, y, dot, dot);
     }
+
+    // 星图层：低透明度星座，画在文字之下的背景缓存里
+    paintStarMap(bg, width, height, theme, skyBucket * 60000);
 
     if (backdropCache.size >= 4) backdropCache.delete(backdropCache.keys().next().value!);
     backdropCache.set(key, surface);
