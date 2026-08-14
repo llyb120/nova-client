@@ -1,720 +1,279 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-const FUZZY_THRESHOLD: f64 = 0.90;
-const AMBIGUITY_MARGIN: f64 = 0.08;
-const MAX_FALLBACK_CANDIDATES: usize = 20_000;
-/// E 成功回显的上下文行数（改动区上下各 N 行）；真实会话基准（DeepSeek V4 Flash，30 轮）
-/// 显示 ±3 与 ±1 差异在噪声内，取 ±3 保留更多上下文。
-/// 改动区本身的完整新内容始终在回显内。
-const PREVIEW_CONTEXT_LINES: usize = 3;
-/// E 回显的最大行数（超过截断中段）。
-const PREVIEW_CAP_LINES: usize = 30;
-/// A 失败回读中单个候选区域的最大行数（超过截断中段）。
-const CANDIDATE_READBACK_CAP: usize = 20;
-
-/// 基准对照/调优旋钮，仅增强路径（Lyra）生效，legacy 入口（Vega/napi）不读；
-/// 生产不设置即默认值。LYRA_EDIT_PREVIEW_CTX / LYRA_EDIT_READBACK_CAP。
-fn tune_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v <= 64)
-        .unwrap_or(default)
-}
-
-fn preview_context_lines() -> usize {
-    tune_usize("LYRA_EDIT_PREVIEW_CTX", PREVIEW_CONTEXT_LINES)
-}
-
-fn candidate_readback_cap() -> usize {
-    tune_usize("LYRA_EDIT_READBACK_CAP", CANDIDATE_READBACK_CAP)
-}
+use std::sync::{Arc, Mutex, OnceLock};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EditInput {
-    /// 文本定位模式：要替换的原文（与 startLine/endLine 二选一）。
-    #[serde(default)]
-    old_text: Option<String>,
+    old_text: String,
     new_text: String,
-    /// 行区间定位模式（H，仅 edit_files_enhanced / Lyra 生效；legacy 入口忽略这些字段）：
-    /// 1 起始闭区间，直接替换这些行，无需复述原文。
-    #[serde(default)]
-    start_line: Option<usize>,
-    #[serde(default)]
-    end_line: Option<usize>,
-    /// 防漂移护栏（F-lite，仅增强模式生效）：startLine/endLine 行应有的当前原文，不匹配则拒绝并回显实际内容（A）。
-    #[serde(default)]
-    first_line: Option<String>,
-    #[serde(default)]
-    last_line: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MatchInfo {
-    edit_index: usize,
-    mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    line: Option<usize>,
-}
-
-/// E：改动后回显——最终内容中该 edit 的起始行号与带行号上下文，免验证性 read。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PreviewInfo {
-    edit_index: usize,
-    line: usize,
-    text: String,
 }
 
 #[derive(Debug, Clone)]
-struct Located {
-    index: usize,
-    length: usize,
-    line: Option<usize>,
-    mode: &'static str,
-    new_text: String,
-    old_text: String,
-    matched_text: String,
+struct Replacement {
     edit_index: usize,
+    match_index: usize,
+    match_length: usize,
+    new_text: String,
 }
 
-fn normalize_unicode(value: &str) -> String {
-    value
+static FILE_MUTATION_QUEUES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn normalize_to_lf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn detect_line_ending(text: &str) -> &'static str {
+    match (text.find("\r\n"), text.find('\n')) {
+        (Some(crlf), Some(lf)) if crlf <= lf => "\r\n",
+        _ => "\n",
+    }
+}
+
+fn restore_line_endings(text: &str, ending: &str) -> String {
+    if ending == "\r\n" {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Match PI's fuzzy normalization: NFKC, trim line endings, then normalize
+/// typographic quotes/dashes and Unicode spaces.
+fn normalize_for_fuzzy_match(text: &str) -> String {
+    let nfkc: String = text.nfkc().collect();
+    nfkc.split('\n')
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
         .chars()
         .map(|c| match c {
-            '‐' | '‑' | '‒' | '–' | '—' | '―' | '−' => '-',
             '‘' | '’' | '‚' | '‛' => '\'',
             '“' | '”' | '„' | '‟' => '"',
-            '\u{00a0}' | ' ' | ' ' | ' ' | ' ' | ' ' | ' ' | ' ' | ' ' | ' ' | ' ' | ' ' | '　' => {
-                ' '
-            }
+            '‐' | '‑' | '‒' | '–' | '—' | '―' | '−' => '-',
+            '\u{00a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => ' ',
             other => other,
         })
         .collect()
 }
 
-fn line_indent(line: &str) -> &str {
-    let end = line
-        .char_indices()
-        .find(|(_, c)| !matches!(c, ' ' | '\t'))
-        .map(|(i, _)| i)
-        .unwrap_or(line.len());
-    &line[..end]
-}
-
-fn find_occurrences(content: &str, needle: &str) -> Vec<usize> {
+fn count_occurrences(content: &str, needle: &str) -> usize {
+    let content = normalize_for_fuzzy_match(content);
+    let needle = normalize_for_fuzzy_match(needle);
     if needle.is_empty() {
-        return Vec::new();
+        return 0;
     }
-    content.match_indices(needle).map(|(i, _)| i).collect()
+    content.match_indices(&needle).count()
 }
 
-fn line_starts(content: &str) -> (Vec<&str>, Vec<usize>) {
-    let lines: Vec<_> = content.split('\n').collect();
-    let mut starts = Vec::with_capacity(lines.len());
-    let mut offset = 0;
-    for (i, line) in lines.iter().enumerate() {
-        starts.push(offset);
-        offset += line.len() + usize::from(i + 1 < lines.len());
-    }
-    (lines, starts)
-}
-
-/// 带行号的区域快照（`  行号|内容`），用于错误回读（A）与成功回显（E），超过 cap 行时截断中段。
-fn numbered_region(lines: &[&str], start: usize, len: usize, cap: usize) -> String {
-    let end = (start + len).min(lines.len());
-    if start >= end {
-        return String::new();
-    }
-    let mut out = Vec::new();
-    if end - start <= cap {
-        for (i, line) in lines[start..end].iter().enumerate() {
-            out.push(format!("  {}|{}", start + i + 1, line));
-        }
+fn not_found_error(path: &str, edit_index: usize, total: usize) -> String {
+    if total == 1 {
+        format!("Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines.")
     } else {
-        let head = cap * 2 / 3;
-        let tail = cap - head;
-        for (i, line) in lines[start..start + head].iter().enumerate() {
-            out.push(format!("  {}|{}", start + i + 1, line));
-        }
-        out.push(format!("  ... ({} more lines)", end - start - head - tail));
-        for (i, line) in lines[end - tail..end].iter().enumerate() {
-            out.push(format!("  {}|{}", end - tail + i + 1, line));
-        }
+        format!("Could not find edits[{edit_index}] in {path}. The oldText must match exactly including all whitespace and newlines.")
     }
-    out.join("\n")
 }
 
-fn token_set(value: &str) -> HashSet<String> {
-    let normalized = normalize_unicode(value);
-    let mut out = HashSet::new();
-    let mut current = String::new();
-    for c in normalized.chars() {
-        if c.is_alphanumeric() || matches!(c, '_' | '$') {
-            current.push(c);
-        } else {
-            if !current.is_empty() {
-                out.insert(std::mem::take(&mut current));
-            }
-            if !c.is_whitespace() {
-                out.insert(c.to_string());
-            }
-        }
-    }
-    if !current.is_empty() {
-        out.insert(current);
-    }
-    out
-}
-
-fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    let common = a.intersection(b).count() as f64;
-    common / (a.len() + b.len() - common as usize) as f64
-}
-
-fn line_similarity(left: &str, right: &str) -> f64 {
-    let a = normalize_unicode(left).trim().to_string();
-    let b = normalize_unicode(right).trim().to_string();
-    if a == b {
-        return 1.0;
-    }
-    let aa = a.as_bytes();
-    let bb = b.as_bytes();
-    let length = aa.len().max(bb.len());
-    if length == 0 {
-        return 1.0;
-    }
-    let mut prefix = 0;
-    while prefix < aa.len().min(bb.len()) && aa[prefix] == bb[prefix] {
-        prefix += 1;
-    }
-    let mut suffix = 0;
-    while suffix < aa.len().min(bb.len()).saturating_sub(prefix)
-        && aa[aa.len() - 1 - suffix] == bb[bb.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-    0.55 * ((prefix + suffix) as f64 / length as f64)
-        + 0.45 * jaccard(&token_set(&a), &token_set(&b))
-}
-
-fn span_for_lines(
-    lines: &[&str],
-    starts: &[usize],
-    start: usize,
-    pattern_len: usize,
-    pattern_ends_empty: bool,
-) -> (usize, usize) {
-    let last = start + pattern_len - 1;
-    let end = if pattern_ends_empty {
-        starts[last]
+fn duplicate_error(path: &str, edit_index: usize, total: usize, occurrences: usize) -> String {
+    if total == 1 {
+        format!("Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique.")
     } else {
-        starts[last] + lines[last].len()
-    };
-    (starts[start], end - starts[start])
-}
-
-fn mapped_line(line: &str, mode: &str) -> String {
-    match mode {
-        "rstrip" => line.trim_end().to_string(),
-        "unicode" => normalize_unicode(line).trim_end().to_string(),
-        _ => normalize_unicode(line).trim().to_string(),
+        format!("Found {occurrences} occurrences of edits[{edit_index}] in {path}. Each oldText must be unique. Please provide more context to make it unique.")
     }
 }
 
-fn candidate_starts(target: &[&str], pattern: &[&str], mode: &str) -> Vec<usize> {
-    let mapped_target: Vec<_> = target.iter().map(|l| mapped_line(l, mode)).collect();
-    let mapped_pattern: Vec<_> = pattern.iter().map(|l| mapped_line(l, mode)).collect();
-    let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, line) in mapped_target.iter().enumerate() {
-        if !line.trim().is_empty() {
-            index.entry(line).or_default().push(i);
-        }
+fn empty_old_text_error(path: &str, edit_index: usize, total: usize) -> String {
+    if total == 1 {
+        format!("oldText must not be empty in {path}.")
+    } else {
+        format!("edits[{edit_index}].oldText must not be empty in {path}.")
     }
-    let mut anchors: Vec<_> = mapped_pattern
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, line)| {
-            let positions = index.get(line.as_str())?;
-            (!line.trim().is_empty() && positions.len() <= MAX_FALLBACK_CANDIDATES).then_some((
-                offset,
-                line.len(),
-                positions,
-            ))
-        })
-        .collect();
-    anchors.sort_by_key(|(_, len, positions)| (positions.len(), usize::MAX - *len));
-    anchors.truncate(4);
-    let mut votes = HashMap::<usize, usize>::new();
-    for (offset, _, positions) in anchors {
-        for &position in positions {
-            if position >= offset {
-                let start = position - offset;
-                if start + pattern.len() <= target.len() {
-                    *votes.entry(start).or_default() += 1;
-                }
-            }
-        }
-    }
-    let mut rows: Vec<_> = votes.into_iter().collect();
-    rows.sort_by_key(|(start, votes)| (usize::MAX - *votes, *start));
-    rows.truncate(MAX_FALLBACK_CANDIDATES);
-    rows.into_iter().map(|(start, _)| start).collect()
 }
 
-fn locate_edit(
-    content: &str,
-    old_text: &str,
-    path: &str,
-    edit_index: usize,
-    enhanced: bool,
-) -> Result<Located, String> {
-    if old_text.is_empty() {
-        return Err(format!("edits[{edit_index}].oldText is empty in {path}."));
+fn no_change_error(path: &str, total: usize) -> String {
+    if total == 1 {
+        format!("No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.")
+    } else {
+        format!("No changes made to {path}. The replacements produced identical content.")
     }
-    let exact = find_occurrences(content, old_text);
-    if exact.len() == 1 {
-        return Ok(Located {
-            index: exact[0],
-            length: old_text.len(),
-            line: Some(content[..exact[0]].bytes().filter(|b| *b == b'\n').count() + 1),
-            mode: "exact",
-            new_text: String::new(),
-            old_text: old_text.into(),
-            matched_text: old_text.into(),
-            edit_index,
-        });
-    }
-    if exact.len() > 1 {
-        if !enhanced {
-            return Err(format!("Ambiguous exact match for edits[{edit_index}] in {path}: {} occurrences; add more context.", exact.len()));
-        }
-        // A（增强模式）：歧义错误自带各发生的行号与内容，模型无需再 read 即可纠错。
-        let (target_lines, _) = line_starts(content);
-        let mut detail = String::new();
-        for &pos in exact.iter().take(6) {
-            let line_no = content[..pos].bytes().filter(|b| *b == b'\n').count() + 1;
-            detail.push_str(&format!(
-                "\n  {}|{}",
-                line_no,
-                target_lines
-                    .get(line_no.saturating_sub(1))
-                    .copied()
-                    .unwrap_or("")
-            ));
-        }
-        return Err(format!("Ambiguous exact match for edits[{edit_index}] in {path}: {} occurrences; add more context. Matching lines:{detail}", exact.len()));
-    }
+}
 
-    let (target_lines, starts) = line_starts(content);
-    let pattern_lines: Vec<_> = old_text.split('\n').collect();
-    for mode in ["rstrip", "unicode"] {
-        let candidates = candidate_starts(&target_lines, &pattern_lines, mode);
-        let matches: Vec<_> = candidates
-            .into_iter()
-            .filter(|&start| {
-                (0..pattern_lines.len()).all(|off| {
-                    mapped_line(target_lines[start + off], mode)
-                        == mapped_line(pattern_lines[off], mode)
-                })
-            })
-            .collect();
-        if matches.len() == 1 {
-            let start = matches[0];
-            let (index, length) = span_for_lines(
-                &target_lines,
-                &starts,
-                start,
-                pattern_lines.len(),
-                pattern_lines.last() == Some(&""),
-            );
-            let matched = content[index..index + length].to_string();
-            return Ok(Located {
-                index,
-                length,
-                line: Some(start + 1),
-                mode,
-                new_text: String::new(),
-                old_text: old_text.into(),
-                matched_text: matched,
-                edit_index,
-            });
-        }
-        if matches.len() > 1 {
-            if !enhanced {
-                return Err(format!("Ambiguous {mode} match for edits[{edit_index}] in {path}: {} occurrences; add more context.", matches.len()));
-            }
-            let lines_list = matches
-                .iter()
-                .take(6)
-                .map(|s| (s + 1).to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let first_lines: String = matches
-                .iter()
-                .take(6)
-                .map(|&s| format!("\n  {}|{}", s + 1, target_lines[s]))
-                .collect();
-            return Err(format!("Ambiguous {mode} match for edits[{edit_index}] in {path}: {} occurrences at lines {lines_list}; add more context. Matching lines:{first_lines}", matches.len()));
-        }
-    }
-
-    let relative_candidates = candidate_starts(&target_lines, &pattern_lines, "relative-anchor");
-    let relative_pattern = relative_indent_lines(&pattern_lines);
-    let relative_matches: Vec<_> = relative_candidates
-        .iter()
-        .copied()
-        .filter(|start| {
-            relative_indent_lines(&target_lines[*start..*start + pattern_lines.len()])
-                == relative_pattern
-        })
-        .collect();
-    if relative_matches.len() > 1 {
-        if !enhanced {
-            return Err(format!(
-                "Ambiguous relative-indent match for edits[{edit_index}] in {path}; add more context."
-            ));
-        }
-        let lines_list = relative_matches
-            .iter()
-            .take(6)
-            .map(|s| (s + 1).to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let first_lines: String = relative_matches
-            .iter()
-            .take(6)
-            .map(|&s| format!("\n  {}|{}", s + 1, target_lines[s]))
-            .collect();
-        return Err(format!(
-            "Ambiguous relative-indent match for edits[{edit_index}] in {path} at lines {lines_list}; add more context. Matching lines:{first_lines}"
-        ));
-    }
-    if let Some(start) = relative_matches.first().copied() {
-        let (index, length) = span_for_lines(
-            &target_lines,
-            &starts,
-            start,
-            pattern_lines.len(),
-            pattern_lines.last() == Some(&""),
+fn apply_replacements(content: &str, replacements: &[Replacement], offset: usize) -> String {
+    let mut result = content.to_string();
+    for replacement in replacements.iter().rev() {
+        let start = replacement.match_index - offset;
+        result.replace_range(
+            start..start + replacement.match_length,
+            &replacement.new_text,
         );
-        let matched = content[index..index + length].to_string();
-        return Ok(Located {
-            index,
-            length,
-            line: Some(start + 1),
-            mode: "relative-indent",
-            new_text: String::new(),
-            old_text: old_text.into(),
-            matched_text: matched,
-            edit_index,
-        });
     }
-
-    let mut starts_candidates = candidate_starts(&target_lines, &pattern_lines, "rstrip");
-    for start in candidate_starts(&target_lines, &pattern_lines, "unicode") {
-        if !starts_candidates.contains(&start) {
-            starts_candidates.push(start);
-        }
-    }
-    if starts_candidates.is_empty()
-        && target_lines.len() >= pattern_lines.len()
-        && target_lines.len() <= MAX_FALLBACK_CANDIDATES
-    {
-        starts_candidates = (0..=target_lines.len() - pattern_lines.len()).collect();
-    }
-    let mut ranked: Vec<_> = starts_candidates
-        .into_iter()
-        .map(|start| {
-            let mut line_score = 0.0;
-            for off in 0..pattern_lines.len() {
-                line_score += line_similarity(target_lines[start + off], pattern_lines[off]);
-            }
-            let boundary = (line_similarity(target_lines[start], pattern_lines[0])
-                + line_similarity(
-                    target_lines[start + pattern_lines.len() - 1],
-                    pattern_lines[pattern_lines.len() - 1],
-                ))
-                / 2.0;
-            (
-                start,
-                0.9 * line_score / pattern_lines.len() as f64 + 0.1 * boundary,
-            )
-        })
-        .collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    let best = ranked.first().copied();
-    let second = ranked.get(1).copied();
-    if let (Some((sa, a)), Some((sb, b))) = (best, second) {
-        if a >= FUZZY_THRESHOLD - AMBIGUITY_MARGIN && a - b < AMBIGUITY_MARGIN {
-            if !enhanced {
-                return Err(format!("Ambiguous fuzzy match for edits[{edit_index}] in {path} ({}% vs {}%); add more context.", (a * 100.0).round(), (b * 100.0).round()));
-            }
-            return Err(format!(
-                "Ambiguous fuzzy match for edits[{edit_index}] in {path} ({}% vs {}%); add more context. Candidates:\n  @@ {}-{}\n{}\n  @@ {}-{}\n{}",
-                (a * 100.0).round(),
-                (b * 100.0).round(),
-                sa + 1,
-                sa + pattern_lines.len(),
-                numbered_region(&target_lines, sa, pattern_lines.len(), 8),
-                sb + 1,
-                sb + pattern_lines.len(),
-                numbered_region(&target_lines, sb, pattern_lines.len(), 8),
-            ));
-        }
-    }
-    let Some((start, score)) = best else {
-        if !enhanced {
-            return Err(format!(
-                "Could not find a sufficiently similar match for edits[{edit_index}] in {path}."
-            ));
-        }
-        return Err(format!(
-            "Could not find a sufficiently similar match for edits[{edit_index}] in {path} (oldText spans {} lines, file has {} lines). Make sure you are editing the right file; read it or use fast_context to get the actual content.",
-            pattern_lines.len(),
-            target_lines.len()
-        ));
-    };
-    if score < FUZZY_THRESHOLD {
-        if !enhanced {
-            return Err(format!("Could not find a sufficiently similar match for edits[{edit_index}] in {path} (best {}%).", (score * 100.0).round()));
-        }
-        return Err(format!(
-            "Could not find a sufficiently similar match for edits[{edit_index}] in {path} (best {}%). Best candidate @@ {}-{}:\n{}\nCopy oldText from the candidate above and retry, or replace the lines directly with startLine/endLine (add firstLine/lastLine as a drift guard).",
-            (score * 100.0).round(),
-            start + 1,
-            start + pattern_lines.len(),
-            numbered_region(&target_lines, start, pattern_lines.len(), candidate_readback_cap()),
-        ));
-    }
-    let (index, length) = span_for_lines(
-        &target_lines,
-        &starts,
-        start,
-        pattern_lines.len(),
-        pattern_lines.last() == Some(&""),
-    );
-    let matched = content[index..index + length].to_string();
-    Ok(Located {
-        index,
-        length,
-        line: Some(start + 1),
-        mode: "fuzzy",
-        new_text: String::new(),
-        old_text: old_text.into(),
-        matched_text: matched,
-        edit_index,
-    })
+    result
 }
 
-fn relative_indent_lines(lines: &[&str]) -> Vec<String> {
-    let mut previous = 0isize;
+fn split_lines_with_endings(content: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            lines.push(&content[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < content.len() {
+        lines.push(&content[start..]);
+    }
     lines
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let indent = line_indent(line).len() as isize;
-            let delta = if index == 0 { 0 } else { indent - previous };
-            previous = indent;
-            format!("{delta}:{}", normalize_unicode(line).trim())
+}
+
+fn line_spans(content: &str) -> Vec<(usize, usize)> {
+    let mut offset = 0;
+    split_lines_with_endings(content)
+        .into_iter()
+        .map(|line| {
+            let span = (offset, offset + line.len());
+            offset = span.1;
+            span
         })
         .collect()
 }
 
-fn rebase_indent(new_text: &str, old_text: &str, matched_text: &str) -> String {
-    let old_first = old_text.lines().find(|l| !l.trim().is_empty());
-    let matched_first = matched_text.lines().find(|l| !l.trim().is_empty());
-    let (Some(old_first), Some(matched_first)) = (old_first, matched_first) else {
-        return new_text.into();
-    };
-    let old_indent = line_indent(old_first);
-    let matched_indent = line_indent(matched_first);
-    if old_indent == matched_indent {
-        return new_text.into();
-    }
-    new_text
-        .split('\n')
-        .map(|line| {
-            if line.trim().is_empty() {
-                line.to_string()
-            } else if let Some(rest) = line.strip_prefix(old_indent) {
-                format!("{matched_indent}{rest}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// H：行区间定位。firstLine/lastLine 作为防漂移护栏，不匹配时回显实际行内容（A）供模型自纠正。
-fn locate_line_range(
-    content: &str,
-    edit: &EditInput,
-    path: &str,
-    edit_index: usize,
-) -> Result<Located, String> {
-    let (Some(start_line), Some(end_line)) = (edit.start_line, edit.end_line) else {
-        return Err(format!(
-            "edits[{edit_index}] in {path}: provide either oldText or startLine+endLine."
-        ));
-    };
-    let (target_lines, starts) = line_starts(content);
-    if start_line == 0 || end_line < start_line || end_line > target_lines.len() {
-        return Err(format!(
-            "edits[{edit_index}] in {path}: line range {start_line}-{end_line} is out of bounds (file has {} lines).",
-            target_lines.len()
-        ));
-    }
-    let guard = |line_no: usize, expected: &Option<String>, tag: &str| -> Result<(), String> {
-        let Some(expected) = expected else {
-            return Ok(());
-        };
-        let actual = target_lines[line_no - 1];
-        if normalize_unicode(actual).trim_end() == normalize_unicode(expected).trim_end() {
-            return Ok(());
-        }
-        let lo = line_no.saturating_sub(2).max(1);
-        let hi = (line_no + 2).min(target_lines.len());
-        let context = numbered_region(&target_lines, lo - 1, hi - lo + 1, 8);
-        Err(format!(
-            "Line-range guard failed for edits[{edit_index}] in {path}: line {line_no} is '{actual}' but {tag} claims '{expected}'. The file likely changed since it was read. Actual context:\n{context}\nFix the coordinates from the actual lines above, or switch to oldText."
-        ))
-    };
-    guard(start_line, &edit.first_line, "firstLine")?;
-    guard(end_line, &edit.last_line, "lastLine")?;
-    let first = start_line - 1;
-    let last = end_line - 1;
-    let index = starts[first];
-    let length = starts[last] + target_lines[last].len() - index;
-    let matched = content[index..index + length].to_string();
-    Ok(Located {
-        index,
-        length,
-        line: Some(start_line),
-        mode: "lines",
-        new_text: String::new(),
-        // old_text 置为实际命中内容，rebase_indent 因此成为恒等变换。
-        old_text: matched.clone(),
-        matched_text: matched,
-        edit_index,
-    })
-}
-
-/// E：按最终内容计算每个 edit 的回显（行号 + 带行号上下文），多 edit 时行号已反映前序位移。
-fn build_previews(output: &str, applied: &[(usize, usize, usize)]) -> Vec<PreviewInfo> {
-    let (lines, starts) = line_starts(output);
-    let mut items: Vec<_> = applied
+fn replacement_line_range(
+    spans: &[(usize, usize)],
+    replacement: &Replacement,
+) -> Result<(usize, usize), String> {
+    let start = replacement.match_index;
+    let end = start + replacement.match_length;
+    let start_line = spans
         .iter()
-        .map(|&(edit_index, index, len)| {
-            let start_idx = starts.partition_point(|s| *s <= index).saturating_sub(1);
-            let end_char = index + len;
-            let mut end_idx = starts.partition_point(|s| *s < end_char).saturating_sub(1);
-            if end_idx < start_idx {
-                end_idx = start_idx;
+        .position(|(lo, hi)| start >= *lo && start < *hi)
+        .ok_or_else(|| "Replacement range is outside the base content.".to_string())?;
+    let mut end_line = start_line;
+    while end_line < spans.len() && spans[end_line].1 < end {
+        end_line += 1;
+    }
+    if end_line >= spans.len() {
+        return Err("Replacement range is outside the base content.".into());
+    }
+    Ok((start_line, end_line + 1))
+}
+
+/// PI performs fuzzy replacements in normalized space, but copies every
+/// untouched line back from the original so fuzzy matching cannot rewrite
+/// unrelated trailing whitespace or Unicode characters.
+fn apply_replacements_preserving_unchanged_lines(
+    original: &str,
+    base: &str,
+    replacements: &[Replacement],
+) -> Result<String, String> {
+    let original_lines = split_lines_with_endings(original);
+    let spans = line_spans(base);
+    if original_lines.len() != spans.len() {
+        return Err(
+            "Cannot preserve unchanged lines because the base content has a different line count."
+                .into(),
+        );
+    }
+
+    let mut groups: Vec<(usize, usize, Vec<Replacement>)> = Vec::new();
+    for replacement in replacements {
+        let (start_line, end_line) = replacement_line_range(&spans, replacement)?;
+        if let Some(last) = groups.last_mut() {
+            if start_line < last.1 {
+                last.1 = last.1.max(end_line);
+                last.2.push(replacement.clone());
+                continue;
             }
-            let preview_ctx = preview_context_lines();
-            let lo = start_idx.saturating_sub(preview_ctx);
-            let hi = (end_idx + preview_ctx).min(lines.len().saturating_sub(1));
-            PreviewInfo {
-                edit_index,
-                line: start_idx + 1,
-                text: numbered_region(&lines, lo, hi - lo + 1, PREVIEW_CAP_LINES),
-            }
+        }
+        groups.push((start_line, end_line, vec![replacement.clone()]));
+    }
+
+    let mut original_line_index = 0;
+    let mut result = String::new();
+    for (start_line, end_line, group_replacements) in groups {
+        result.push_str(&original_lines[original_line_index..start_line].concat());
+        let start_offset = spans[start_line].0;
+        let end_offset = spans[end_line - 1].1;
+        result.push_str(&apply_replacements(
+            &base[start_offset..end_offset],
+            &group_replacements,
+            start_offset,
+        ));
+        original_line_index = end_line;
+    }
+    result.push_str(&original_lines[original_line_index..].concat());
+    Ok(result)
+}
+
+fn apply_edits(content: &str, edits: &[EditInput], path: &str) -> Result<String, String> {
+    let edits: Vec<EditInput> = edits
+        .iter()
+        .map(|edit| EditInput {
+            old_text: normalize_to_lf(&edit.old_text),
+            new_text: normalize_to_lf(&edit.new_text),
         })
         .collect();
-    items.sort_by_key(|p| p.edit_index);
-    items
-}
-
-fn apply_smart_edits(
-    content: &str,
-    edits: &[EditInput],
-    path: &str,
-    enhanced: bool,
-) -> Result<(String, Vec<MatchInfo>, Vec<PreviewInfo>), String> {
-    let mut located = Vec::with_capacity(edits.len());
-    for (i, edit) in edits.iter().enumerate() {
-        let new_text = edit.new_text.replace("\r\n", "\n");
-        let old_text = edit
-            .old_text
-            .as_deref()
-            .map(|s| s.replace("\r\n", "\n"))
-            .filter(|s| !s.is_empty());
-        let mut found = match old_text {
-            Some(old) => {
-                // legacy（Vega/napi）：忽略行区间字段，行为与增强前完全一致。
-                if enhanced && (edit.start_line.is_some() || edit.end_line.is_some()) {
-                    return Err(format!(
-                        "edits[{i}] in {path}: pass either oldText or startLine/endLine, not both."
-                    ));
-                }
-                locate_edit(content, &old, path, i, enhanced)?
-            }
-            // H：行区间定位仅增强模式可用；legacy 下缺 oldText 直接报错。
-            None if enhanced => locate_line_range(content, edit, path, i)?,
-            None => {
-                return Err(format!("edits[{i}].oldText is empty in {path}."));
-            }
-        };
-        found.new_text = new_text;
-        located.push(found);
+    for (index, edit) in edits.iter().enumerate() {
+        if edit.old_text.is_empty() {
+            return Err(empty_old_text_error(path, index, edits.len()));
+        }
     }
-    located.sort_by_key(|m| m.index);
-    for pair in located.windows(2) {
-        if pair[0].index + pair[0].length > pair[1].index {
+
+    let used_fuzzy_match = edits.iter().any(|edit| {
+        !content.contains(&edit.old_text)
+            && normalize_for_fuzzy_match(content)
+                .contains(&normalize_for_fuzzy_match(&edit.old_text))
+    });
+    let replacement_base = if used_fuzzy_match {
+        normalize_for_fuzzy_match(content)
+    } else {
+        content.to_string()
+    };
+
+    let mut replacements = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let needle = if used_fuzzy_match {
+            normalize_for_fuzzy_match(&edit.old_text)
+        } else {
+            edit.old_text.clone()
+        };
+        let Some(match_index) = replacement_base.find(&needle) else {
+            return Err(not_found_error(path, index, edits.len()));
+        };
+        let occurrences = count_occurrences(&replacement_base, &needle);
+        if occurrences > 1 {
+            return Err(duplicate_error(path, index, edits.len(), occurrences));
+        }
+        replacements.push(Replacement {
+            edit_index: index,
+            match_index,
+            match_length: needle.len(),
+            new_text: edit.new_text.clone(),
+        });
+    }
+
+    replacements.sort_by_key(|replacement| replacement.match_index);
+    for pair in replacements.windows(2) {
+        if pair[0].match_index + pair[0].match_length > pair[1].match_index {
             return Err(format!(
-                "edits[{}] and edits[{}] overlap in {path}.",
+                "edits[{}] and edits[{}] overlap in {path}. Merge them into one edit or target disjoint regions.",
                 pair[0].edit_index, pair[1].edit_index
             ));
         }
     }
-    let matches = located
-        .iter()
-        .map(|m| MatchInfo {
-            edit_index: m.edit_index,
-            mode: m.mode.into(),
-            line: m.line,
-        })
-        .collect();
-    let mut output = content.to_string();
-    // 正序推算每个替换在最终内容中的位置（非重叠、已按 index 排序），倒序执行替换。
-    let replacements: Vec<String> = located
-        .iter()
-        .map(|m| rebase_indent(&m.new_text, &m.old_text, &m.matched_text))
-        .collect();
-    let mut applied: Vec<(usize, usize, usize)> = Vec::with_capacity(located.len());
-    let mut delta: isize = 0;
-    for (k, m) in located.iter().enumerate() {
-        applied.push((
-            m.edit_index,
-            (m.index as isize + delta) as usize,
-            replacements[k].len(),
-        ));
-        delta += replacements[k].len() as isize - m.length as isize;
-    }
-    for (k, m) in located.iter().enumerate().rev() {
-        output.replace_range(m.index..m.index + m.length, &replacements[k]);
-    }
-    if output == content {
-        return Err(format!("No changes made to {path}."));
-    }
-    // E：成功回显仅增强模式产出，legacy 结果 JSON 不携带 previews。
-    let previews = if enhanced {
-        build_previews(&output, &applied)
+
+    let output = if used_fuzzy_match {
+        apply_replacements_preserving_unchanged_lines(content, &replacement_base, &replacements)?
     } else {
-        Vec::new()
+        apply_replacements(&replacement_base, &replacements, 0)
     };
-    Ok((output, matches, previews))
+    if output == content {
+        return Err(no_change_error(path, edits.len()));
+    }
+    Ok(output)
 }
 
 fn resolve_target(root: &Path, input: &str) -> Result<PathBuf, String> {
@@ -729,77 +288,121 @@ fn resolve_target(root: &Path, input: &str) -> Result<PathBuf, String> {
     Ok(target.canonicalize().unwrap_or(target))
 }
 
-#[cfg(windows)]
-fn replace_staged(target: &Path, staged: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    let staged: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
-    let ok = unsafe {
-        ReplaceFileW(
-            target.as_ptr(),
-            staged.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+fn mutation_lock(target: &Path) -> Arc<Mutex<()>> {
+    let queues = FILE_MUTATION_QUEUES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut queues = queues
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    queues
+        .entry(target.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn generate_display_diff(old: &str, new: &str, context_lines: usize) -> (String, usize) {
+    use similar::ChangeTag;
+
+    let diff = similar::TextDiff::from_lines(old, new);
+    let changes: Vec<_> = diff.iter_all_changes().collect();
+    let changed: Vec<usize> = changes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, change)| (change.tag() != ChangeTag::Equal).then_some(index))
+        .collect();
+    let first_changed_line = changes
+        .iter()
+        .find(|change| change.tag() != ChangeTag::Equal)
+        .and_then(|change| change.new_index())
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    let max_line = old.split('\n').count().max(new.split('\n').count());
+    let width = max_line.to_string().len();
+    let mut output = Vec::new();
+    let mut skipped = false;
+
+    for (index, change) in changes.iter().enumerate() {
+        let visible = change.tag() != ChangeTag::Equal
+            || changed
+                .iter()
+                .any(|changed_index| index.abs_diff(*changed_index) <= context_lines);
+        if !visible {
+            skipped = true;
+            continue;
+        }
+        if skipped {
+            output.push(format!(" {} ...", " ".repeat(width)));
+            skipped = false;
+        }
+        let text = change.value().strip_suffix('\n').unwrap_or(change.value());
+        match change.tag() {
+            ChangeTag::Delete => output.push(format!(
+                "-{:>width$} {text}",
+                change.old_index().map(|line| line + 1).unwrap_or(0)
+            )),
+            ChangeTag::Insert => output.push(format!(
+                "+{:>width$} {text}",
+                change.new_index().map(|line| line + 1).unwrap_or(0)
+            )),
+            ChangeTag::Equal => output.push(format!(
+                " {:>width$} {text}",
+                change.old_index().map(|line| line + 1).unwrap_or(0)
+            )),
+        }
     }
+    if skipped {
+        output.push(format!(" {} ...", " ".repeat(width)));
+    }
+    (output.join("\n"), first_changed_line)
 }
 
-#[cfg(not(windows))]
-fn replace_staged(target: &Path, staged: &Path) -> std::io::Result<()> {
-    fs::rename(staged, target)
+fn generate_diff(path: &str, old: &str, new: &str) -> (String, String, usize) {
+    let diff = similar::TextDiff::from_lines(old, new);
+    let patch = diff
+        .unified_diff()
+        .context_radius(4)
+        .header(path, path)
+        .to_string();
+    let (display, first_changed_line) = generate_display_diff(old, new, 4);
+    (display, patch, first_changed_line)
 }
 
-/// 单文件 edit。保留智能 oldText 定位，并在增强模式下提供 H/A/E：
-/// 行区间替换、失败候选回读、成功带行号回显。
-pub fn edit(root: &Path, path: &str, edits: Value, enhanced: bool) -> Result<Value, String> {
+/// Lyra edit intentionally mirrors Vega's PI edit contract and behavior:
+/// path + edits[{oldText,newText}], all matches against one original snapshot.
+pub fn edit(root: &Path, path: &str, edits: Value) -> Result<Value, String> {
     let edits: Vec<EditInput> =
         serde_json::from_value(edits).map_err(|e| format!("invalid edit arguments: {e}"))?;
     if edits.is_empty() {
-        return Err("edits must not be empty".into());
+        return Err(
+            "Edit tool input is invalid. edits must contain at least one replacement.".into(),
+        );
     }
+
     let target = resolve_target(root, path)?;
-    let original = fs::read(&target).map_err(|e| format!("{path}: {e}"))?;
+    let lock = mutation_lock(&target);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let original = fs::read(&target).map_err(|e| format!("Could not edit file: {path}. {e}."))?;
     let raw = std::str::from_utf8(&original).map_err(|e| format!("{path} is not UTF-8: {e}"))?;
     let (bom, body) = raw
         .strip_prefix('\u{feff}')
-        .map(|s| ("\u{feff}", s))
+        .map(|text| ("\u{feff}", text))
         .unwrap_or(("", raw));
-    let crlf = body.contains("\r\n");
-    let normalized = body.replace("\r\n", "\n");
-    let (edited, matches, previews) = apply_smart_edits(&normalized, &edits, path, enhanced)?;
-    let restored = if crlf {
-        edited.replace('\n', "\r\n")
-    } else {
-        edited
-    };
-    let output = format!("{bom}{restored}").into_bytes();
+    let line_ending = detect_line_ending(body);
+    let normalized = normalize_to_lf(body);
+    let edited = apply_edits(&normalized, &edits, path)?;
+    let final_content = format!("{bom}{}", restore_line_endings(&edited, line_ending));
+    fs::write(&target, final_content.as_bytes())
+        .map_err(|e| format!("Could not edit file: {path}. {e}."))?;
 
-    let transaction = format!(
-        "{}.{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let staged = target.with_extension(format!("nova-tmp-{transaction}"));
-    fs::write(&staged, output).map_err(|e| format!("failed to stage {path}: {e}"))?;
-    if let Err(error) = replace_staged(&target, &staged) {
-        let _ = fs::remove_file(&staged);
-        return Err(format!("failed to replace {path}: {error}"));
-    }
-
-    let mut result =
-        json!({ "message": format!("已编辑 {path}"), "path": path, "matches": matches });
-    if enhanced {
-        result["previews"] = json!(previews);
-    }
-    Ok(result)
+    let (diff, patch, first_changed_line) = generate_diff(path, &normalized, &edited);
+    Ok(json!({
+        "message": format!("Successfully replaced {} block(s) in {path}.", edits.len()),
+        "details": {
+            "diff": diff,
+            "patch": patch,
+            "firstChangedLine": first_changed_line
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -808,45 +411,79 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn line_range_guard_rejects_drift() {
+    fn exact_edit_preserves_bom_and_crlf() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "inserted\na\nb\nc\n").unwrap();
-        let error = edit(
-            dir.path(),
-            "a.txt",
-            json!([{
-                "startLine": 2, "endLine": 3, "firstLine": "b", "lastLine": "c", "newText": "x"
-            }]),
-            true,
-        )
-        .unwrap_err();
-        assert!(error.contains("likely changed"), "{error}");
-        assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "inserted\na\nb\nc\n"
-        );
-    }
-
-    #[test]
-    fn enhanced_edit_preserves_crlf_and_returns_numbered_preview() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), b"a\r\nb\r\nc\r\n").unwrap();
+        fs::write(dir.path().join("a.txt"), b"\xef\xbb\xbfhello\r\nworld\r\n").unwrap();
         let result = edit(
             dir.path(),
             "a.txt",
-            json!([{
-                "startLine": 2, "endLine": 2, "firstLine": "b", "newText": "B"
-            }]),
-            true,
+            json!([{"oldText":"hello","newText":"hola"}]),
         )
         .unwrap();
         assert_eq!(
             fs::read(dir.path().join("a.txt")).unwrap(),
-            b"a\r\nB\r\nc\r\n"
+            b"\xef\xbb\xbfhola\r\nworld\r\n"
         );
-        assert!(result["previews"][0]["text"]
+        assert_eq!(
+            result["message"],
+            "Successfully replaced 1 block(s) in a.txt."
+        );
+        assert!(result["details"]["patch"]
             .as_str()
             .unwrap()
-            .contains("2|B"));
+            .contains("-hello"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_text_without_writing() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "same\nsame\n").unwrap();
+        let error = edit(
+            dir.path(),
+            "a.txt",
+            json!([{"oldText":"same","newText":"x"}]),
+        )
+        .unwrap_err();
+        assert!(error.contains("Found 2 occurrences"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "same\nsame\n"
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_preserves_untouched_lines() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.txt"),
+            "keep   \nquote(“old”);   \ntail\n",
+        )
+        .unwrap();
+        edit(
+            dir.path(),
+            "a.txt",
+            json!([{"oldText":"quote(\"old\");","newText":"quote(\"new\");"}]),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "keep   \nquote(\"new\");\ntail\n"
+        );
+    }
+
+    #[test]
+    fn all_edits_match_the_original_and_must_not_overlap() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma").unwrap();
+        let error = edit(
+            dir.path(),
+            "a.txt",
+            json!([
+                {"oldText":"alpha\nbeta","newText":"first"},
+                {"oldText":"beta\ngamma","newText":"second"}
+            ]),
+        )
+        .unwrap_err();
+        assert!(error.contains("overlap"));
     }
 }
