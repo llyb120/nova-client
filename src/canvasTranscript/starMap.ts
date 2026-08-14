@@ -408,6 +408,55 @@ function makeStarSprite(color: Rgb, spiky: boolean): HTMLCanvasElement {
   return c;
 }
 
+/* ===== 精灵缓存（模块级，跨分钟重建复用） ===== */
+
+/** 星光精灵按「色温|是否带衍射芒」缓存：星图每分钟重建时不再重复生成渐变精灵 */
+const STAR_SPRITE_CACHE = new Map<string, HTMLCanvasElement>();
+
+function starSpriteFor(color: Rgb, spiky: boolean): HTMLCanvasElement {
+  const key = `${color.join(",")}|${spiky ? 1 : 0}`;
+  let s = STAR_SPRITE_CACHE.get(key);
+  if (!s) {
+    s = makeStarSprite(color, spiky);
+    STAR_SPRITE_CACHE.set(key, s);
+  }
+  return s;
+}
+
+/**
+ * 银河星团精灵：色温量化成若干档，每档只生成一次径向渐变精灵。
+ * 绘制时按角半径缩放 drawImage、按亮度调 globalAlpha，
+ * 把每次重建的数百次 createRadialGradient 降为一次性的精灵生成。
+ */
+const CLUMP_COOL_LEVELS = 8;
+const CLUMP_SPRITE_SIZE = 128;
+const CLUMP_SPRITES: HTMLCanvasElement[] = [];
+
+function clumpSpriteFor(level: number): HTMLCanvasElement {
+  let s = CLUMP_SPRITES[level];
+  if (s) return s;
+  // 颜色混合：暖白 ↔ 冷蓝
+  const warm: Rgb = [224, 216, 235];
+  const cool: Rgb = [186, 206, 250];
+  const t = level / (CLUMP_COOL_LEVELS - 1);
+  const r = Math.round(warm[0] + (cool[0] - warm[0]) * t);
+  const g = Math.round(warm[1] + (cool[1] - warm[1]) * t);
+  const b = Math.round(warm[2] + (cool[2] - warm[2]) * t);
+  const half = CLUMP_SPRITE_SIZE / 2;
+  const c = document.createElement("canvas");
+  c.width = CLUMP_SPRITE_SIZE;
+  c.height = CLUMP_SPRITE_SIZE;
+  const ctx = c.getContext("2d")!;
+  const grad = ctx.createRadialGradient(half, half, 0, half, half, half);
+  grad.addColorStop(0, `rgba(${r},${g},${b},1)`);
+  grad.addColorStop(0.45, `rgba(${r},${g},${b},0.55)`);
+  grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, CLUMP_SPRITE_SIZE, CLUMP_SPRITE_SIZE);
+  CLUMP_SPRITES[level] = c;
+  return c;
+}
+
 /* ===== 主题适配 ===== */
 
 function luminanceOf(color: string): number | null {
@@ -460,47 +509,25 @@ export function paintStarMap(
   const inView = (x: number, y: number) =>
     x >= -margin && x <= width + margin && y >= -margin && y <= height + margin;
 
-  // ── 银河（最底层）：星团云气叠加 ────────────────────────────────────────
+  // ── 银河（最底层）：星团云气叠加（预生成精灵 + globalAlpha，避免逐团创建渐变）──
   {
-    // 颜色混合：暖白 ↔ 冷蓝
-    const warm: Rgb = [224, 216, 235];
-    const cool: Rgb = [186, 206, 250];
-    const mix = (t: number): Rgb => [
-      Math.round(warm[0] + (cool[0] - warm[0]) * t),
-      Math.round(warm[1] + (cool[1] - warm[1]) * t),
-      Math.round(warm[2] + (cool[2] - warm[2]) * t),
-    ];
     const baseA = 0.055;
     for (const c of MILKY_CLUMPS) {
       const { x, y } = project(proj, c);
       const r = proj.s * c.size * D2R * 1.5;
       if (!inView(x - r, y - r) && !inView(x + r, y + r)) continue;
-      const [cr, cg, cb] = mix(c.cool);
-      const a = baseA * c.b;
-      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
-      g.addColorStop(0, `rgba(${cr},${cg},${cb},${a.toFixed(3)})`);
-      g.addColorStop(0.45, `rgba(${cr},${cg},${cb},${(a * 0.55).toFixed(3)})`);
-      g.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fill();
+      const level = Math.min(
+        CLUMP_COOL_LEVELS - 1,
+        Math.round(c.cool * (CLUMP_COOL_LEVELS - 1)),
+      );
+      ctx.globalAlpha = baseA * c.b;
+      ctx.drawImage(clumpSpriteFor(level), x - r, y - r, r * 2, r * 2);
     }
+    ctx.globalAlpha = 1;
   }
 
-  // ── 星光精灵缓存（按颜色分）────────────────────────────────────────────
-  // 亮星带衍射芒、暗星不带；两种各三套色温
+  // 亮星带衍射芒、暗星不带；两种各三套色温（精灵缓存见模块级 starSpriteFor）
   const tintRand = mulberry32(4451);
-  const spriteCache = new Map<string, HTMLCanvasElement>();
-  const spriteFor = (color: Rgb, spiky: boolean): HTMLCanvasElement => {
-    const key = `${color.join(",")}|${spiky ? 1 : 0}`;
-    let s = spriteCache.get(key);
-    if (!s) {
-      s = makeStarSprite(color, spiky);
-      spriteCache.set(key, s);
-    }
-    return s;
-  };
 
   const drawStar = (star: Star, boost = 0) => {
     const { x, y } = project(proj, star);
@@ -514,7 +541,7 @@ export function paintStarMap(
     const isWarmGiant =
       Math.abs(star.ra - 5.92) < 0.05 || Math.abs(star.ra - 16.49) < 0.05; // 参宿四 / 心宿二
     const color: Rgb = isWarmGiant ? [255, 206, 160] : starTint(tintRand());
-    const sprite = spriteFor(color, bright);
+    const sprite = starSpriteFor(color, bright);
     ctx.globalAlpha = alpha;
     ctx.drawImage(sprite, x - size / 2, y - size / 2, size, size);
     ctx.globalAlpha = 1;

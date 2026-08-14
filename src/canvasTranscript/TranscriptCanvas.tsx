@@ -13,6 +13,7 @@ import { editUserMessage, isExpanded, respondPermission, toggleExpanded } from "
 import type { PermissionRequest, PromptImage, RevertChange, UserItem } from "../types";
 import {
   type Action,
+  CANVAS_BACKDROP_READY_EVENT,
   getTheme,
   measure,
   paintCanvasBackdrop,
@@ -1201,12 +1202,15 @@ export function TranscriptCanvas(props: {
     window.addEventListener("pointercancel", finishPointer, true);
     const mo = new MutationObserver(() => bump());
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    const onBackdropReady = () => requestRender();
+    window.addEventListener(CANVAS_BACKDROP_READY_EVENT, onBackdropReady);
 
     props.onApi(canvasApi);
 
     onCleanup(() => {
       ro.disconnect();
       mo.disconnect();
+      window.removeEventListener(CANVAS_BACKDROP_READY_EVENT, onBackdropReady);
       canvas.removeEventListener("wheel", onWheel);
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("pointerup", finishPointer, true);

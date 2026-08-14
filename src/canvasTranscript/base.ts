@@ -264,71 +264,156 @@ export function invalidateTheme(): void {
 /**
  * 背景缓存在独立的离屏 Canvas：主题或尺寸变化时才重绘柔光与点阵；正文每帧只做一次位图拷贝。
  * 比两个可见 Canvas 更稳：前景仍可使用 alpha:false，避免透明合成让暗色小字重新发虚。
+ * 星图成本明显高于底色，缓存未命中时先同步提供无星图背景，等首帧落屏后再补全星图。
  */
-const backdropCache = new Map<string, HTMLCanvasElement>();
+export const CANVAS_BACKDROP_READY_EVENT = "nova:canvas-backdrop-ready";
+
+type BackdropTheme = Pick<
+  ThemeColors,
+  "bg" | "glowAccent" | "glowCyan" | "glowCorner" | "gridDot"
+>;
+
+interface BackdropEntry {
+  surface: HTMLCanvasElement;
+  complete: boolean;
+}
+
+const backdropCache = new Map<string, BackdropEntry>();
+const pendingBackdropBuilds = new Set<string>();
+
+function cacheBackdrop(key: string, entry: BackdropEntry): void {
+  // 替换基础背景时也把条目移到末尾，避免刚补好的当前主题最先被淘汰。
+  if (backdropCache.has(key)) backdropCache.delete(key);
+  while (backdropCache.size >= 4) backdropCache.delete(backdropCache.keys().next().value!);
+  backdropCache.set(key, entry);
+}
+
+/** 创建背景位图（纯色底 + 柔光 + 点阵，可选星图） */
+function createBackdrop(
+  width: number,
+  height: number,
+  pixelW: number,
+  pixelH: number,
+  dpr: number,
+  theme: BackdropTheme,
+  skyBucket: number,
+  withStarMap: boolean,
+): HTMLCanvasElement {
+  const surface = document.createElement("canvas");
+  surface.width = pixelW;
+  surface.height = pixelH;
+  const bg = surface.getContext("2d", { alpha: false })!;
+  bg.setTransform(dpr, 0, 0, dpr, 0, 0);
+  bg.fillStyle = theme.bg;
+  bg.fillRect(0, 0, width, height);
+
+  const radialEllipse = (
+    x: number,
+    y: number,
+    radiusX: number,
+    radiusY: number,
+    color: string,
+    fadeAt: number,
+  ) => {
+    bg.save();
+    bg.translate(x, y);
+    bg.scale(radiusX, radiusY);
+    const gradient = bg.createRadialGradient(0, 0, 0, 0, 0, 1);
+    gradient.addColorStop(0, color);
+    gradient.addColorStop(fadeAt, "transparent");
+    gradient.addColorStop(1, "transparent");
+    bg.fillStyle = gradient;
+    bg.fillRect(-2, -2, 4, 4);
+    bg.restore();
+  };
+  // Canvas 是不透明表面，不能直接裁切位于其下方的 body::before；按相同比例在会话区复现。
+  radialEllipse(width * 0.28, height * -0.14, 1000, 520, theme.glowAccent, 0.7);
+  radialEllipse(width * 0.86, height * -0.1, 780, 460, theme.glowCyan, 0.7);
+  radialEllipse(width * 1.04, height * 1.12, 820, 560, theme.glowCorner, 0.72);
+
+  bg.fillStyle = theme.gridDot;
+  const dot = 1 / dpr;
+  for (let y = 0; y < height; y += 26) {
+    for (let x = 0; x < width; x += 26) bg.fillRect(x, y, dot, dot);
+  }
+
+  if (withStarMap) {
+    // 星图层：低透明度星座，画在文字之下的背景缓存里。
+    paintStarMap(bg, width, height, theme, skyBucket * 60000);
+  }
+  return surface;
+}
+
+function completeBackdropAfterPaint(
+  key: string,
+  width: number,
+  height: number,
+  pixelW: number,
+  pixelH: number,
+  dpr: number,
+  theme: BackdropTheme,
+  skyBucket: number,
+): void {
+  if (pendingBackdropBuilds.has(key)) return;
+  pendingBackdropBuilds.add(key);
+
+  const build = () => {
+    pendingBackdropBuilds.delete(key);
+    const cached = backdropCache.get(key);
+    // 尺寸或主题快速变化时，已淘汰的旧背景不再浪费时间补建。
+    if (!cached || cached.complete) return;
+    const surface = createBackdrop(
+      width,
+      height,
+      pixelW,
+      pixelH,
+      dpr,
+      theme,
+      skyBucket,
+      true,
+    );
+    cacheBackdrop(key, { surface, complete: true });
+    window.dispatchEvent(new Event(CANVAS_BACKDROP_READY_EVENT));
+  };
+
+  // 先让主题底色和控件完成一帧绘制，再利用空闲时间生成星图；星图不能再阻塞设置点击。
+  window.requestAnimationFrame(() => {
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(build, { timeout: 1500 });
+    } else {
+      window.setTimeout(build, 0);
+    }
+  });
+}
 
 export function paintCanvasBackdrop(
   ctx: CanvasRenderingContext2D,
   width: number,
   height: number,
-  theme: Pick<ThemeColors, "bg" | "glowAccent" | "glowCyan" | "glowCorner" | "gridDot">,
+  theme: BackdropTheme,
   now = Date.now(),
   region?: { x: number; y: number; w: number; h: number },
 ): void {
   const dpr = window.devicePixelRatio || 1;
   const pixelW = Math.max(1, Math.round(width * dpr));
   const pixelH = Math.max(1, Math.round(height * dpr));
-  // 星图随恒星时旋转：缓存按分钟分桶，每分钟重建一次背景位图，旧桶自然被淘汰
+  // 星图随恒星时旋转：缓存按分钟分桶；未命中时先展示轻量背景，再异步补全星图。
   const skyBucket = Math.floor(now / 60000);
-  const key = [pixelW, pixelH, skyBucket, theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
-  let surface = backdropCache.get(key);
-
-  if (!surface) {
-    surface = document.createElement("canvas");
-    surface.width = pixelW;
-    surface.height = pixelH;
-    const bg = surface.getContext("2d", { alpha: false })!;
-    bg.setTransform(dpr, 0, 0, dpr, 0, 0);
-    bg.fillStyle = theme.bg;
-    bg.fillRect(0, 0, width, height);
-
-    const radialEllipse = (
-      x: number,
-      y: number,
-      radiusX: number,
-      radiusY: number,
-      color: string,
-      fadeAt: number,
-    ) => {
-      bg.save();
-      bg.translate(x, y);
-      bg.scale(radiusX, radiusY);
-      const gradient = bg.createRadialGradient(0, 0, 0, 0, 0, 1);
-      gradient.addColorStop(0, color);
-      gradient.addColorStop(fadeAt, "transparent");
-      gradient.addColorStop(1, "transparent");
-      bg.fillStyle = gradient;
-      bg.fillRect(-2, -2, 4, 4);
-      bg.restore();
+  const themeKey = [theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
+  const key = [pixelW, pixelH, skyBucket, themeKey].join("|");
+  let entry = backdropCache.get(key);
+  if (!entry) {
+    entry = {
+      surface: createBackdrop(width, height, pixelW, pixelH, dpr, theme, skyBucket, false),
+      complete: false,
     };
-    // Canvas 是不透明表面，不能直接裁切位于其下方的 body::before；按相同比例在会话区复现。
-    radialEllipse(width * 0.28, height * -0.14, 1000, 520, theme.glowAccent, 0.7);
-    radialEllipse(width * 0.86, height * -0.1, 780, 460, theme.glowCyan, 0.7);
-    radialEllipse(width * 1.04, height * 1.12, 820, 560, theme.glowCorner, 0.72);
-
-    bg.fillStyle = theme.gridDot;
-    const dot = 1 / dpr;
-    for (let y = 0; y < height; y += 26) {
-      for (let x = 0; x < width; x += 26) bg.fillRect(x, y, dot, dot);
-    }
-
-    // 星图层：低透明度星座，画在文字之下的背景缓存里
-    paintStarMap(bg, width, height, theme, skyBucket * 60000);
-
-    if (backdropCache.size >= 4) backdropCache.delete(backdropCache.keys().next().value!);
-    backdropCache.set(key, surface);
+    cacheBackdrop(key, entry);
+  }
+  if (!entry.complete) {
+    completeBackdropAfterPaint(key, width, height, pixelW, pixelH, dpr, theme, skyBucket);
   }
 
+  const surface = entry.surface;
   if (region) {
     // spinner 等局部动画只恢复自身覆盖的背景区域，避免每帧重拷整张背景。
     const x0 = Math.max(0, region.x);

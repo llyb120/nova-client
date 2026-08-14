@@ -1,5 +1,8 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { paintCanvasBackdrop } from "../canvasTranscript/base";
+import {
+  CANVAS_BACKDROP_READY_EVENT,
+  paintCanvasBackdrop,
+} from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
@@ -3266,6 +3269,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     const mo = new MutationObserver(() => { void rebuild(); });
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    const onBackdropReady = () => requestPaint();
+    window.addEventListener(CANVAS_BACKDROP_READY_EVENT, onBackdropReady);
 
     function onMouseLeave() {
       if (scrollDragging || selecting) return;
@@ -3299,6 +3304,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     onCleanup(() => {
       ro.disconnect();
       mo.disconnect();
+      window.removeEventListener(CANVAS_BACKDROP_READY_EVENT, onBackdropReady);
       editResizeObserver?.disconnect();
       editResizeObserver = undefined;
       editHostEl = undefined;
