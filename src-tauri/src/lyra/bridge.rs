@@ -15,9 +15,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn send(value: &Value) {
     let stdout = std::io::stdout();
@@ -71,6 +71,20 @@ fn truncate_at_restore(messages: Vec<Value>, restore_at: Option<&str>) -> Vec<Va
     {
         Some(index) => messages[..=index].to_vec(),
         None => messages,
+    }
+}
+
+/// 与 Vega/PI 的 settlePendingInput 对齐：provider 最后一轮结束与控制通道收取
+/// steer 之间存在竞争，必须等到控制通道经历一个安静窗口后才能判定任务结束。
+async fn settle_pending_input(command_busy: &AtomicBool, command_revision: &AtomicU64) {
+    loop {
+        let observed = command_revision.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if !command_busy.load(Ordering::SeqCst)
+            && command_revision.load(Ordering::SeqCst) == observed
+        {
+            return;
+        }
     }
 }
 
@@ -474,9 +488,13 @@ async fn handle_prompt(
     emit(&json!({ "type": "ready", "sessionId": ctx.session_id }));
 
     // ---- steer / cancel 控制行消费（行源由调用方提供：stdin 或进程内通道） ----
+    let command_busy = Arc::new(AtomicBool::new(false));
+    let command_revision = Arc::new(AtomicU64::new(0));
     let line_consumer = {
         let steering = steering.clone();
         let cancelled = cancelled.clone();
+        let command_busy = command_busy.clone();
+        let command_revision = command_revision.clone();
         tokio::spawn(async move {
             while let Some(value) = line_rx.recv().await {
                 match value.get("action").and_then(Value::as_str) {
@@ -484,6 +502,7 @@ async fn handle_prompt(
                         cancelled.store(true, Ordering::SeqCst);
                     }
                     Some("steer") => {
+                        command_busy.store(true, Ordering::SeqCst);
                         let (text, images) = prompt_input(
                             value
                                 .get("parts")
@@ -496,6 +515,8 @@ async fn handle_prompt(
                             .lock()
                             .unwrap()
                             .push_back(user_message(&text, &images));
+                        command_revision.fetch_add(1, Ordering::SeqCst);
+                        command_busy.store(false, Ordering::SeqCst);
                     }
                     _ => {}
                 }
@@ -650,6 +671,14 @@ async fn handle_prompt(
         };
         let provider_error = outcome.error.clone().filter(|e| !e.is_empty());
         if provider_error.is_none() || outcome.cancelled {
+            if !outcome.cancelled && !cancelled.load(Ordering::SeqCst) {
+                settle_pending_input(&command_busy, &command_revision).await;
+                if !steering.lock().unwrap().is_empty() {
+                    // steer 可能在 Agent 最后一次 drain 后才进入队列；保持同一 turn，
+                    // 从现有轨迹继续，不能静默结束并遗留用户的新指令。
+                    continue;
+                }
+            }
             break outcome;
         }
         let error = provider_error.unwrap();
@@ -1147,6 +1176,29 @@ mod tests {
             "未从借用数据根加载模型：{data}"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pending_input_settlement_waits_for_late_command() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let busy = Arc::new(AtomicBool::new(false));
+        let revision = Arc::new(AtomicU64::new(0));
+        let writer_busy = busy.clone();
+        let writer_revision = revision.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            writer_busy.store(true, Ordering::SeqCst);
+            writer_revision.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            writer_busy.store(false, Ordering::SeqCst);
+        });
+
+        super::settle_pending_input(&busy, &revision).await;
+        writer.await.unwrap();
+        assert_eq!(revision.load(Ordering::SeqCst), 1);
+        assert!(!busy.load(Ordering::SeqCst));
     }
     /// 手动端到端验证（需真实 provider 配置）：进程内 spawn_prompt 全事件流 + run_oneshot。
     #[tokio::test]
