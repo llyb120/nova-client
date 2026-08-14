@@ -3080,9 +3080,13 @@ fn set_thread_model(
     let agent_kind;
     let is_guest;
     let is_quota;
+    let was_running;
     {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
+        // 运行中的 provider/bridge 仍在使用旧模型。此时只保存新选择，让它从
+        // 下一轮请求生效；不能 forget 当前 session，否则会杀掉正在输出的进程。
+        was_running = is_running(&state, thread);
         let model = model.filter(|s| !s.is_empty());
         if thread.model != model {
             thread.clear_auto_route();
@@ -3102,8 +3106,16 @@ fn set_thread_model(
                     manager.sync_thread_config(&thread_id).await;
                 });
             }
-            BorrowedManager::Sdk(manager) => manager.forget_session_of_thread(&thread_id),
-            BorrowedManager::OpenCode(manager) => manager.forget_session_of_thread(&thread_id),
+            BorrowedManager::Sdk(manager) => {
+                if !was_running {
+                    manager.forget_session_of_thread(&thread_id);
+                }
+            }
+            BorrowedManager::OpenCode(manager) => {
+                if !was_running {
+                    manager.forget_session_of_thread(&thread_id);
+                }
+            }
         }
     } else if is_quota {
         return Err("额度凭证已过期，请重新发起租借".into());
@@ -3112,7 +3124,7 @@ fn set_thread_model(
         tauri::async_runtime::spawn(async move {
             mgr.sync_thread_config(&thread_id).await;
         });
-    } else {
+    } else if !was_running {
         match agent_kind {
             AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&thread_id),
             AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
@@ -3220,8 +3232,21 @@ fn set_thread_agent(
     mode: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<(), String> {
+    // 同后端切模型允许在运行中进行：set_thread_model 会保留当前运行，
+    // 新模型从下一轮生效。跨后端切换涉及运行路由迁移，仍需等待当前轮结束。
     if running_by_id(&state, &thread_id) {
-        return Err("会话正在运行，请先停止再切换模型".into());
+        let current_kind = {
+            let store = state.store.lock().unwrap();
+            store
+                .get(&thread_id)
+                .ok_or("线程不存在")?
+                .agent_kind
+                .clone()
+        };
+        if current_kind != agent_kind {
+            return Err("会话正在运行，请等待当前轮结束后再切换后端".into());
+        }
+        return set_thread_model(state, thread_id, model);
     }
     let changed;
     let old_kind: AgentKind;
