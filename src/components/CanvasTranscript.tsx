@@ -991,6 +991,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   // custom scrollbar drag (drawn on canvas; not a DOM control)
   let scrollDragging = false;
   let scrollDragGrab = 0;
+  let blockScrollDrag: { key: string; grab: number } | null = null;
+
 
   // spinner
   let spinPhase = 0;
@@ -2228,19 +2230,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     if (clipped) {
       ctx.restore();
-      // scrollbar
-      const fullH = (b.data?.fullH as number) || b.h;
-      const maxBScroll = fullH - b.h;
-      const ratio = b.h / fullH;
-      const thumbH = Math.max(20, b.h * ratio);
-      const scrollRatio = maxBScroll > 0 ? bScroll / maxBScroll : 0;
-      const thumbY = by + scrollRatio * (b.h - thumbH);
-      const trackX = bx + b.w - 7;
-      ctx.fillStyle = pal.scroll;
-      ctx.globalAlpha = 0.6;
-      roundRect(ctx, trackX, thumbY, 4, thumbH, 2);
-      ctx.fill();
-      ctx.globalAlpha = 1;
+      const g = blockScrollbarGeom(b);
+      if (g) {
+        ctx.fillStyle = pal.scroll;
+        ctx.globalAlpha = 0.65;
+        roundRect(ctx, g.trackX, g.thumbY, g.trackW, g.thumbH, g.trackW / 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
     }
   }
 
@@ -2687,11 +2684,54 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.restore();
   }
 
+  function blockScrollbarGeom(b: Block) {
+    if (!b.data?.clipped || b.kind !== "tool-content") return null;
+    const fullH = (b.data.fullH as number) || b.h;
+    const maxBlockScroll = Math.max(0, fullH - b.h);
+    if (maxBlockScroll <= 0) return null;
+    const trackW = 5;
+    const trackX = b.x + b.w - trackW - 3;
+    const thumbH = Math.max(20, b.h * (b.h / fullH));
+    const travel = Math.max(0, b.h - thumbH);
+    const key = blockScrollKey(b);
+    const blockScroll = Math.max(0, Math.min(maxBlockScroll, blockScrolls.get(key) || 0));
+    const thumbY = b.y - scrollY + (blockScroll / maxBlockScroll) * travel;
+    const hitPad = 6;
+    return { key, trackW, trackX, hitX: trackX - hitPad, hitW: trackW + hitPad * 2,
+      thumbH, thumbY, travel, maxBlockScroll, blockTop: b.y - scrollY };
+  }
+
+  function hitBlockScrollbar(clientX: number, clientY: number) {
+    const rect = canvasEl.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const g = blockScrollbarGeom(blocks[i]);
+      if (!g) continue;
+      if (x < g.hitX || x > g.hitX + g.hitW || y < g.blockTop || y > g.blockTop + blocks[i].h) continue;
+      return { ...g, part: y >= g.thumbY && y <= g.thumbY + g.thumbH ? "thumb" as const : "track" as const };
+    }
+    return null;
+  }
+
+  function scrollBlockFromPointerY(clientY: number) {
+    if (!blockScrollDrag) return;
+    const block = blocks.find((b) => blockScrollKey(b) === blockScrollDrag!.key);
+    if (!block) return;
+    const g = blockScrollbarGeom(block);
+    if (!g || g.travel <= 0) return;
+    const rect = canvasEl.getBoundingClientRect();
+    const y = clientY - rect.top;
+    const thumbY = Math.max(0, Math.min(g.travel, y - g.blockTop - blockScrollDrag.grab));
+    blockScrolls.set(g.key, (thumbY / g.travel) * g.maxBlockScroll);
+    requestPaint();
+  }
+
   function scrollbarGeom() {
     if (maxScroll <= 0 || viewH <= 0 || totalHeight <= 0) return null;
-    const trackW = 4;
+    const trackW = 5;
     const trackX = viewW - trackW - 3;
-    // Wider hit target than the 4px visual thumb.
+    // Wider hit target than the visual thumb.
     const hitPad = 6;
     const hitX = trackX - hitPad;
     const hitW = trackW + hitPad * 2;
@@ -2796,6 +2836,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function onMouseMove(e: MouseEvent) {
+    if (blockScrollDrag) {
+      scrollBlockFromPointerY(e.clientY);
+      return;
+    }
     if (scrollDragging) {
       scrollFromPointerY(e.clientY);
       return;
@@ -2816,7 +2860,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
       return;
     }
-    if (hitScrollbar(e.clientX, e.clientY)) {
+    if (hitBlockScrollbar(e.clientX, e.clientY) || hitScrollbar(e.clientX, e.clientY)) {
       if (hoverBlockIdx !== -1) {
         hoverBlockIdx = -1;
         requestPaint();
@@ -2838,15 +2882,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function endScrollDrag() {
-    if (!scrollDragging) return;
+    if (!scrollDragging && !blockScrollDrag) return;
     scrollDragging = false;
+    blockScrollDrag = null;
     document.removeEventListener("mousemove", onScrollDragMove);
     document.removeEventListener("mouseup", onScrollDragUp);
   }
 
   function onScrollDragMove(e: MouseEvent) {
-    if (!scrollDragging) return;
-    scrollFromPointerY(e.clientY);
+    if (blockScrollDrag) scrollBlockFromPointerY(e.clientY);
+    else if (scrollDragging) scrollFromPointerY(e.clientY);
   }
 
   function onScrollDragUp(_e: MouseEvent) {
@@ -2900,6 +2945,26 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function onMouseDown(e: MouseEvent) {
     if (e.button !== 0) return;
+
+    const blockSb = hitBlockScrollbar(e.clientX, e.clientY);
+    if (blockSb) {
+      e.preventDefault();
+      const rect = canvasEl.getBoundingClientRect();
+      const y = e.clientY - rect.top;
+      const grab = blockSb.part === "track"
+        ? blockSb.thumbH / 2
+        : Math.max(0, Math.min(blockSb.thumbH, y - blockSb.thumbY));
+      blockScrollDrag = { key: blockSb.key, grab };
+      scrollDragging = false;
+      selecting = false;
+      selection = null;
+      if (blockSb.part === "track") scrollBlockFromPointerY(e.clientY);
+      canvasEl.style.cursor = "default";
+      document.addEventListener("mousemove", onScrollDragMove);
+      document.addEventListener("mouseup", onScrollDragUp);
+      requestPaint();
+      return;
+    }
 
     const sb = hitScrollbar(e.clientX, e.clientY);
     if (sb) {
@@ -2976,7 +3041,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function onMouseUp(_e: MouseEvent) {
-    if (scrollDragging) {
+    if (scrollDragging || blockScrollDrag) {
       endScrollDrag();
       return;
     }
@@ -2993,7 +3058,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function onClick(e: MouseEvent) {
-    if (hitScrollbar(e.clientX, e.clientY)) return;
+    if (hitBlockScrollbar(e.clientX, e.clientY) || hitScrollbar(e.clientX, e.clientY)) return;
     // 拖选结束的 click 不触发折叠/按钮动作（DOM 中拖选也不会触发点击）
     if (selMoved) {
       selMoved = false;
