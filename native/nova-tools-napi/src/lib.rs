@@ -18,7 +18,10 @@ fn workspace_root(root: &str) -> Result<&Path> {
 }
 
 #[napi(js_name = "fastContext")]
-pub fn fast_context(root: String, params: Value) -> Result<String> {
+pub fn fast_context(root: String, mut params: Value) -> Result<String> {
+    if let Some(object) = params.as_object_mut() {
+        object.insert("_contextMode".into(), Value::String("fast".into()));
+    }
     context::fast_context(workspace_root(&root)?, params)
         .map_err(|message| Error::new(Status::GenericFailure, message))
 }

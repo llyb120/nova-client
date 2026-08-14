@@ -54,9 +54,9 @@ export function globalContextServiceConfigured() {
 export async function callGlobalContextTool(method, root, params) {
   const config = serviceConfig();
   if (!config) throw new Error("global context service is not configured");
-  const mode = String(process.env.NOVA_CONTEXT_RETRIEVAL_MODE ?? "super").trim().toLowerCase();
+  const mode = "fast";
   const requestParams = method === "fast_context"
-    ? { ...(params ?? {}), _contextMode: mode === "fast" ? "fast" : "super" }
+    ? { ...(params ?? {}), _contextMode: mode }
     : params;
   const deadline = Date.now() + CONNECT_TIMEOUT_MS;
   for (;;) {

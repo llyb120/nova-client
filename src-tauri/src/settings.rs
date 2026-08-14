@@ -47,11 +47,12 @@ pub enum ContextRetrievalMode {
 }
 
 impl ContextRetrievalMode {
+    // SuperContext is temporarily hidden. Preserve the serialized variant so old settings still
+    // deserialize, but every enabled mode resolves to FastContext at runtime.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Fast => "fast",
-            Self::Super => "super",
+            Self::Fast | Self::Super => "fast",
         }
     }
 }
@@ -174,7 +175,7 @@ pub struct Settings {
     pub session_auto_cleanup_hours: u32,
     /// 语义检索开关（关 = 用内置 BM25 关键词检索；开需配置下面的 embedding 服务）
     pub semantic_enabled: bool,
-    /// 上下文检索：none / fast / super。SuperContext 使用无持久化索引的单遍程序切片，默认启用。
+    /// 上下文检索：none / fast。旧配置中的 super 会在加载时迁移为 fast。
     pub context_retrieval_mode: ContextRetrievalMode,
 
     /// embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434）
@@ -249,7 +250,7 @@ impl Default for Settings {
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
             semantic_enabled: false,
-            context_retrieval_mode: ContextRetrievalMode::Super,
+            context_retrieval_mode: ContextRetrievalMode::Fast,
 
             embed_endpoint: "http://localhost:11434".into(),
             embed_model: "bge-m3".into(),
@@ -283,14 +284,33 @@ mod tests {
     }
 
     #[test]
-    fn super_context_is_enabled_by_default() {
+    fn fast_context_is_enabled_by_default() {
         let settings = Settings::default();
         assert_eq!(
             settings.context_retrieval_mode,
-            super::ContextRetrievalMode::Super
+            super::ContextRetrievalMode::Fast
         );
         assert!(settings.context_tools_enabled());
-        assert!(settings.super_context_enabled());
+        assert!(!settings.super_context_enabled());
+    }
+
+    #[test]
+    fn persisted_super_context_migrates_to_fast() {
+        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            r#"{"contextRetrievalMode":"super"}"#,
+        )
+        .unwrap();
+        let settings = Settings::load(&dir);
+        assert_eq!(
+            settings.context_retrieval_mode,
+            super::ContextRetrievalMode::Fast
+        );
+        let persisted = fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(persisted.contains(r#""contextRetrievalMode": "fast""#));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -492,6 +512,14 @@ impl Settings {
         {
             settings.context_retrieval_mode = ContextRetrievalMode::None;
         }
+        // SuperContext is temporarily unavailable. Migrate persisted `super` immediately so all
+        // bridge environments and the settings UI consistently expose FastContext.
+        if settings.context_retrieval_mode == ContextRetrievalMode::Super {
+            settings.context_retrieval_mode = ContextRetrievalMode::Fast;
+            if raw_value.is_some() {
+                settings.save(dir);
+            }
+        }
         if settings.claudecode_path.trim() == "npx" {
             settings.claudecode_path = "claude".into();
         }
@@ -532,7 +560,7 @@ impl Settings {
     }
 
     pub fn super_context_enabled(&self) -> bool {
-        self.context_retrieval_mode == ContextRetrievalMode::Super
+        false
     }
 
     pub fn apply_context_retrieval_environment(&self) {
@@ -540,14 +568,7 @@ impl Settings {
             "NOVA_CONTEXT_RETRIEVAL_MODE",
             self.context_retrieval_mode.as_str(),
         );
-        std::env::set_var(
-            "NOVA_CONTEXT_NO_INDEX",
-            if self.super_context_enabled() {
-                "1"
-            } else {
-                "0"
-            },
-        );
+        std::env::set_var("NOVA_CONTEXT_NO_INDEX", "0");
         // NOVA_SUPER_FAST_CONTEXT 是已废弃的旧实验优化，不属于新的 SuperContext。
         std::env::remove_var("NOVA_SUPER_FAST_CONTEXT");
     }

@@ -481,29 +481,21 @@ async fn execute_inner(
                     .collect();
                 object.insert("keywords".into(), Value::Array(keywords));
             }
-            if let Ok(text) =
-                crate::context_service::call_configured("fast_context", &root, &args).await
-            {
-                return ToolOutcome::text(clamp_tool_output_text(&text));
-            }
-            match tokio::task::spawn_blocking(move || {
+            if let Ok(text) = tokio::task::spawn_blocking(move || {
                 crate::nova_tools_native::context::fast_context(&root, args)
             })
             .await
             {
-                Ok(Ok(text)) => ToolOutcome::text(clamp_tool_output_text(&text)),
-                Ok(Err(error)) => ToolOutcome::error(error),
-                Err(e) => ToolOutcome::error(format!("fast_context 执行失败：{e}")),
+                return match text {
+                    Ok(text) => ToolOutcome::text(clamp_tool_output_text(&text)),
+                    Err(error) => ToolOutcome::error(error),
+                };
             }
+            ToolOutcome::error("fast_context 原生常驻任务执行失败")
         }
         "find_symbols" => {
             let root = root.to_path_buf();
             let args = args.clone();
-            if let Ok(text) =
-                crate::context_service::call_configured("find_symbols", &root, &args).await
-            {
-                return ToolOutcome::text(text);
-            }
             match tokio::task::spawn_blocking(move || {
                 crate::nova_tools_native::context::find_symbols(&root, args)
             })

@@ -1,0 +1,294 @@
+{
+  "ranAt": "2026-08-14T08:45:15.280Z",
+  "model": "opencode/deepseek-v4-flash/variant/high",
+  "source": "C:\\Users\\油彬\\.nova\\threads",
+  "arms": {
+    "A": "D:\\code\\nova-client-master\\.cargo-target\\debug\\nova-fastcontext-ab-a.exe",
+    "B": "D:\\code\\nova-client-master\\src-tauri\\target\\debug\\nova.exe"
+  },
+  "contextMode": "fast",
+  "rows": [
+    {
+      "test": {
+        "id": "resident-service-routing",
+        "threadId": "builtin",
+        "title": "原生常驻服务路由",
+        "user": "分析 FastContext 原生常驻进程如何让 Lyra 直连、其它后端通过 bridge 接入，并指出关键调用链。",
+        "history": "",
+        "keywords": [
+          "ContextService",
+          "preload_indexes",
+          "callGlobalContextTool",
+          "fast_context"
+        ],
+        "expectedPaths": [
+          "src-tauri/src/context_service.rs",
+          "src-tauri/src/lyra/tools.rs",
+          "scripts/nova-context-client.mjs"
+        ]
+      },
+      "A": {
+        "arm": "A",
+        "wallMs": 266294,
+        "finalText": "分析完成。核心结论：**同一份 mmap 预热的内存索引（Rust 常驻进程），Lyra 走进程内 N-API 直连，其它后端走 TCP JSON 桥接，两路共用 `callContextToolOrLocal` 单引擎决策点**。\n\n## 架构：单引擎、双路由\n\n- 常驻进程侧（`src-tauri/src/nova_tools_native/context.rs`）：`MEMO: OnceLock<Mutex<HashMap<String, DiskCache>>>` 是全局内存索引。Nova 启动时 `preload_indexes(roots)` 对每个已知 root 用 `with_mapped_file`（Windows `CreateFileMappingW`+`MapViewOfFile` 只读 mmap）读 `~/.nova/codemap-v3-native/<key>/index.bin`，bincode 反序列化后塞入 `MEMO`；测试 `preload_indexes_uses_mmap_and_queries_do_not_reload_disk` 明确验证\"预热走 mmap、运行期查询不落盘\"，首见项目冷启动为空、内存中增量加热。\n- 决策点（`scripts/nova-context-client.mjs`）：`callContextToolOrLocal(method, root, params, local)` —— 未配置全局 service 时执行 `local()`（直连），配置了则走 `callGlobalContextTool`（bridge），并注释 \"Never create a second in-process context engine when Nova configured its global service\"（保证全局只有一个索引引擎）。\n\n## 关键调用链\n\n**Lyra 直连（进程内 N-API）**\n```\nfast_context.execute (nova-batch-tools.mjs, createNovaBatchTools)\n  → callContextToolOrLocal(无 NOVA_CONTEXT_SERVICE_ENDPOINT/TOKEN)\n  → local() = callNapiTool(\"fast_context\", root, args)   // nova-napi-tools.mjs\n  → native.fastContext(resolve(root), params)            // N-API binding\n  → context.rs: 直接查 MEMO 预热索引返回\n```\n\n**其它后端 bridge（TCP JSON）**\n```\nDevin: mcp_call_tool(server_name=\"nova-tools\", tool_name=\"fast_context\")\n  → 同一 fast_context.execute\n  → callContextToolOrLocal(已配置 NOVA_CONTEXT_SERVICE_ENDPOINT + TOKEN)\n  → callGlobalContextTool(\"fast_context\", root, {...params, _contextMode:\"fast\"})\n  → node:net socket 发送 {token, method:\"fast_context\", root:resolve(root), params}\n  → 常驻 service 处理（命中同一 MEMO 索引）→ JSON 结果回传\n```\n- 鉴权/健壮性：每次请求携带 `NOVA_CONTEXT_SERVICE_TOKEN`；`ENOENT/ECONNREFUSED/EPIPE` 以 50ms 间隔重试直到 3s 连接截止，单次调用 120s 超时。\n- `_contextMode:\"fast\"` 仅对 `fast_context` 方法附加，作为线协议上的模式标签。\n- 仓库中还有 `scripts/claude-bridge.mjs`、`scripts/codebuddy-bridge.mjs` 同族桥接、`bench/lyra-bench.mjs` 基准，应复用同一路由模式。\n\n## 其余要点\n\n- 开关：`NOVA_FAST_CONTEXT=0` 整组隐藏 `fast_context`/`find_symbols`；`NOVA_TOOLS_READ_ONLY=1` 只读。`normalizeFastContextArgs` 负责关键词去重、截前 5、files 截前 6 等归一化。\n- `find_symbols` 走完全相同双路由（`callContextToolOrLocal(\"find_symbols\", …)`），本地回退是 JS 的 `findSymbols`（ctx-core/ctx-index 的 rg/git grep/focused 索引），而 `fast_context` 注释明确\"只有 Rust native 实现，JS 镜像已移除\"。\n\n一句话：**常驻进程 = `preload_indexes` mmap 预热 + `MEMO` 内存索引；`callContextToolOrLocal` 依据环境变量决定直连还是桥接，是两路共用的唯一路由决策点。**",
+        "contextChars": 29193,
+        "keywordRecall": 1,
+        "pathRecall": 0.3333333333333333,
+        "keywordHits": [
+          "ContextService",
+          "preload_indexes",
+          "callGlobalContextTool",
+          "fast_context"
+        ],
+        "pathHits": [
+          "scripts/nova-context-client.mjs"
+        ],
+        "usage": {
+          "cacheRead": 13696,
+          "cacheWrite": 0,
+          "input": 117,
+          "output": 3810
+        },
+        "stderr": ""
+      },
+      "B": {
+        "arm": "B",
+        "wallMs": 45534,
+        "finalText": "基于 `fast_context` 返回的契约内容（context.rs / nova-context-client.mjs / nova-batch-tools.mjs / nova-napi-tools.mjs 等完整单元），架构可归纳如下：\n\n## 原生常驻进程：Rust 内存索引\n`src-tauri/src/nova_tools_native/context.rs` 持有进程级常驻缓存 `MEMO: OnceLock<Mutex<HashMap<String, DiskCache>>>`（按 normalize_root 的 key 索引）。启动时调用 `preload_indexes(roots)` 对已知项目执行 `with_mapped_file`（Windows `CreateFileMappingW/MapViewOfFile` 只读映射）把 `NOVA_DATA_DIR/codemap-v3-native/<key>/index.bin` 反序列化进 MEMO；运行期 `load_cache` 只读 MEMO，\"Runtime queries never read index files\"，后见项目以空缓存起步、内存内增量预热。测试 `preload_indexes_uses_mmap_and_queries_do_not_reload_disk` 验证了删除磁盘文件后查询仍命中。\n\n## Lyra 直连：同进程 N-API，零 IPC\nLyra 运行在 Nova（Tauri）进程内，直接命中该常驻内存：\n\n```\nfast_context.execute → normalizeFastContextArgs\n  → callContextToolOrLocal(\"fast_context\", root, args, local)\n      → serviceConfig() 为空 → local()\n      → callNapiTool → native.fastContext(root, params)\n      → Rust context.rs → MEMO 常驻索引 → 结果\n```\n`callNapiTool` 是唯一 native 入口（fast_context/find_symbols/code_map 三分支），同进程直调，无需序列化与网络。\n\n## 其它后端：bridge 走 TCP 全局上下文服务\nCursor/Claude/Devin 等不在 Tauri 进程内，无法触达原生内存。Nova 把原生常驻进程暴露为 TCP 服务，客户端在 `nova-context-client.mjs`：\n\n```\n后端 policy（如 novaDevinBatchToolPolicy 强制 mcp_call_tool，server=\"nova-tools\"）\n  → createNovaBatchTools fast_context.execute（同上 normalize）\n  → callContextToolOrLocal：检测到 NOVA_CONTEXT_SERVICE_ENDPOINT + TOKEN\n      → callGlobalContextTool → 不落本地，改走全局服务\n      → 对 endpoint 建立 node:net socket，发换行分隔 JSON {token, method, root, params}\n      → fast_context 额外注入 _contextMode:\"fast\"\n      → 原生服务端（常驻进程）响应 → JSON.parse → 返回\n```\n关键约束注释即机制：\"Never create a second in-process context engine when Nova configured its global service\"——只要配了全局服务，所有调用统一路由到 Nova 侧唯一引擎，避免多进程各建索引；`callContextToolOrLocal` 的 serviceConfig 探测（endpoint+token 双非空）就是直连/bridge 的开关。对 ENOENT/ECONNREFUSED/EPIPE 在 3s 窗口内 50ms 重试、单次 120s 超时。\n\n## 关键调用链结论\n- **直连（Lyra）**：`execute → callContextToolOrLocal → callNapiTool → native.fastContext → MEMO/preload_indexes`，同进程、零拷贝。\n- **bridge（其它后端）**：`mcp_call_tool(nova-tools) → execute → callContextToolOrLocal → callGlobalContextTool → TCP({token,method,root,_contextMode:\"fast\"}) → 原生常驻服务 → JSON 回包`，远程复用同一份常驻索引。\n- 两个出口由 `NOVA_CONTEXT_SERVICE_ENDPOINT/TOKEN` 环境变量单一开关分流；`find_symbols` 走完全相同的双路径；`NOVA_FAST_CONTEXT=0` 可整体关闭。\n\n未发现缺口：任务闭包检查 12 个符号关系、6 个目标定义、8 个依赖定义均闭合，调用链可完整追溯。",
+        "contextChars": 29101,
+        "keywordRecall": 1,
+        "pathRecall": 0.3333333333333333,
+        "keywordHits": [
+          "ContextService",
+          "preload_indexes",
+          "callGlobalContextTool",
+          "fast_context"
+        ],
+        "pathHits": [
+          "scripts/nova-context-client.mjs"
+        ],
+        "usage": {
+          "input": 8811,
+          "output": 2820,
+          "cacheRead": 5248,
+          "cacheWrite": 0
+        },
+        "stderr": ""
+      }
+    },
+    {
+      "test": {
+        "id": "mmap-incremental-index",
+        "threadId": "builtin",
+        "title": "mmap 增量索引",
+        "user": "分析 FastContext 索引如何在启动时 mmap 加载、运行时只使用内存并增量更新。",
+        "history": "",
+        "keywords": [
+          "preload_indexes",
+          "with_mapped_file",
+          "load_cache",
+          "store_cache"
+        ],
+        "expectedPaths": [
+          "src-tauri/src/nova_tools_native/context.rs"
+        ]
+      },
+      "A": {
+        "arm": "A",
+        "wallMs": 27536,
+        "finalText": "基于 `src-tauri/src/nova_tools_native/context.rs`（FastContext 索引的 Rust 原生实现）给出的完整代码单元，可以还原完整链路。核心是：**mmap 只作为启动期读取磁盘文件的窗口，反序列化出的 `DiskCache` 是自有内存结构，运行期查询完全不碰磁盘；更新则围绕进程级静态 `MEMO` 做\"取走—增量改—放回（并可选落盘）\"**。\n\n## 1. 启动时 mmap 加载：`preload_indexes` + `with_mapped_file`\n\n- 启动时对已知工作区根调用 `preload_indexes(roots)`：逐 root 跳过非目录、跳过 `MEMO` 中已有的 key，然后 `with_mapped_file(&cache_path(root), |bytes| bincode::deserialize::<DiskCache>(bytes).ok())`。\n- `cache_path` 按规范化后的 root 生成 `NOVA_DATA_DIR/.nova/codemap-v3-native/<key>/index.bin`。\n- `with_mapped_file` 用 `libc::mmap(PROT_READ, MAP_PRIVATE)` 把整个文件映射成字节切片，`bincode::deserialize` 一次反序列化出**拥有的** `DiskCache`（`HashMap<String, FileEntry>` 等），随后立即 `munmap`。mmap 的角色是零拷贝读取窗口，不驻留。\n- 反序列化结果再经 `cache.version == CACHE_VERSION && cache.root == key` 校验后才插入 `MEMO`（`Mutex<HashMap<String, DiskCache>>`），`loaded` 计数返回。\n\n## 2. 运行期只使用内存：`load_cache` 的 MEMO 语义\n\n- `load_cache(root)` 先从 `MEMO` 里 `remove(&key)` **取走**缓存并返回（\"take\" 语义，调用方独占所有权，避免扫描期间持有全局锁）；取不到才返回一个空 `DiskCache`（仅带 version/root）。\n- 代码注释明确：`Runtime queries never read index files. Known projects are mmap-loaded once during Nova startup; projects first seen later start empty and are warmed incrementally in memory.`——即运行期查询路径只有内存，磁盘索引文件只在启动时读一次；启动后才首次出现的项目从空缓存起步，在内存里增量加热。\n\n## 3. 增量更新：扫描改内存 + `store_cache` 放回/落盘\n\n- 扫描过程直接在取出的内存 `DiskCache` 上增量更新（新增/刷新 `FileEntry`，`reverse` 反向 import 图随缓存持久化，无文件变更的调用直接复用，不再全量重建）。\n- 更新后 `store_cache(root, cache, persist)`：`persist` 为真时 `bincode::serialize` → 写 `<pid>.tmp` 临时文件 → 原子 `rename` 覆盖 `index.bin`（避免半写损坏）；无论是否落盘，都重新 `insert` 回 `MEMO`，供后续查询命中。\n- `reverse` 字段带 `#[serde(default)]`，保证旧版本缓存无该字段时也能反序列化兼容。\n\n## 4. 旁证：JS 侧实现与之一致\n\n`scripts/ctx-index.mjs` 的 `getIndex` 是同样的模式：`memo`（按 workspace root）优先，未命中才 `loadCache` 读磁盘 JSON（version + root 校验）；`cacheEntryFresh` 用 `stat`（size + mtimeMs）判断条目是否过期，`scanIntoCache` 只扫描过期/缺失文件做增量，最后 `saveCache` 写回；另有 `cleanupNovaCodemap` 负责缓存 GC 与超量 eviction。Rust 原生版用 bincode+mmap 取代了 JSON 全量读，但\"内存常驻 + 增量 + 校验后复用\"的设计一致。\n\n**小结**：启动期一次 mmap→反序列化→unmap 把索引装进静态内存；运行期查询/更新全部在内存 `DiskCache` 上完成，扫描后通过 `store_cache` 回写内存并以原子替换方式持久化；版本号 + 规范化 root（Windows 小写化）双重校验保证磁盘缓存可安全复用或自动失效。",
+        "contextChars": 17468,
+        "keywordRecall": 1,
+        "pathRecall": 1,
+        "keywordHits": [
+          "preload_indexes",
+          "with_mapped_file",
+          "load_cache",
+          "store_cache"
+        ],
+        "pathHits": [
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "cacheRead": 4992,
+          "cacheWrite": 0,
+          "input": 5191,
+          "output": 2132
+        },
+        "stderr": ""
+      },
+      "B": {
+        "arm": "B",
+        "wallMs": 26096,
+        "finalText": "基于 `fast_context` 返回的 `src-tauri/src/nova_tools_native/context.rs` 完整闭包，FastContext 索引的生命周期分三段：\n\n**启动 mmap 加载（`preload_indexes`，341–363）**\n- 对每个已知 root：`normalize_root` 规范化 → 查全局内存表 `MEMO`（`Mutex<HashMap<String, DiskCache>>`）跳过已加载项 → 用 `with_mapped_file(&cache_path(root), ...)` 打开 `index.bin`。\n- `with_mapped_file`（644–667）是纯加载通道：`libc::mmap(PROT_READ | MAP_PRIVATE)` 映射文件 → 构造 `&[u8]` 切片 → 在闭包内 `bincode::deserialize::<DiskCache>` → 闭包返回后立即 `munmap`。**mmap 只服务于启动这一次读取**，反序列化出的 `DiskCache` 是普通堆内存对象，校验 `version == CACHE_VERSION && root == key` 通过后整体 `insert` 进 `MEMO`。映射本身不保留到运行时。\n\n**运行时只使用内存（`load_cache`，322–336）**\n- 运行期查询走 `load_cache`：命中 `MEMO` 则 `remove` 取出返回；未命中（启动后才首次见到的项目）直接返回空 `DiskCache`，注释明确：*\"Runtime queries never read index files. Known projects are mmap-loaded once during Nova startup; projects first seen later start empty and are warmed incrementally in memory.\"* —— 即运行时零磁盘读取，新项目在内存中从空缓存增量构建。`take`-后-`insert` 的用法避免扫描期间长期持锁。\n\n**增量更新（`store_cache`，365–385）**\n- 更新路径把修改后的 `DiskCache`（含随缓存持久化的反向 import 图 `reverse`，见 110–117，无文件变更的调用直接复用）写回 `MEMO`。\n- `persist=true` 时才落盘：bincode 序列化 → 写 `{pid}.tmp` 临时文件 → 删旧 → `rename` 原子替换，崩溃安全。\n\n**对照**：`scripts/ctx-index.mjs` 的 JS 后端走的是另一套（`loadCache` 用 `readFileSync` 读 JSON + `memo` Map，`getIndex` 通过 `cacheEntryFresh` 按 size/mtime 判 stale、`scanIntoCache` 增量扫描、`saveCache` 仅在 `scanned` 非零时写回），而 Rust native 版本才是上面这条 mmap→内存→增量更新的主线。",
+        "contextChars": 17468,
+        "keywordRecall": 1,
+        "pathRecall": 1,
+        "keywordHits": [
+          "preload_indexes",
+          "with_mapped_file",
+          "load_cache",
+          "store_cache"
+        ],
+        "pathHits": [
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "input": 5255,
+          "output": 1550,
+          "cacheRead": 5248,
+          "cacheWrite": 0
+        },
+        "stderr": ""
+      }
+    },
+    {
+      "test": {
+        "id": "super-fallback",
+        "threadId": "builtin",
+        "title": "SuperContext 回退",
+        "user": "确认 SuperContext 隐藏后，旧 super 配置如何迁移并回退到 FastContext。",
+        "history": "",
+        "keywords": [
+          "ContextRetrievalMode",
+          "super_context_enabled",
+          "no_index_context_enabled"
+        ],
+        "expectedPaths": [
+          "src-tauri/src/settings.rs",
+          "src/components/SettingsModal.tsx",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ]
+      },
+      "A": {
+        "arm": "A",
+        "wallMs": 20538,
+        "finalText": "已确认：SuperContext 隐藏后，旧 super 配置**无需数据迁移即可回退到 FastContext**，隐藏点全部在运行时 shim，序列化格式完整保留。\n\n**迁移/回退机制（三处 shim + 一层配置归一化）**\n\n1. **反序列化层（settings.rs）**：`ContextRetrievalMode` 的 `Super` 变体保留并标记 `#[default] + #[serde(other)]`，旧配置里的 \"super\" 值仍能正常反序列化（`context_retrieval_modes_round_trip` 测试覆盖），不会因读取旧配置报错或丢失。\n2. **运行时解析（settings.rs）**：`as_str()` 将 `Super | Fast` 统一映射为 `\"fast\"`；`super_context_enabled()` 恒返回 `false`。\n3. **管线路由（nova_tools_native/context.rs）**：`no_index_context_enabled()` 恒返回 `false`，因此所有公共 `fast_context` 请求（含持久化的 \"super\" 配置、`_contextMode: super`）一律走索引版 `fast_context_run` 管线，不再进入 no-index 分支；测试 `request_context_mode_always_selects_fast_while_super_is_hidden` 明确断言两种模式均落到 fast。\n4. **配置下发层（acp.rs）**：`devin_nova_tools_config` 在传入 mode \"super\" 时，生成的环境变量为 `NOVA_CONTEXT_RETRIEVAL_MODE=fast` + `NOVA_CONTEXT_NO_INDEX=0`——即旧 super 在写入环境变量前就归一化为 fast。\n\n**回滚路径**：因为 `Super` 变体与序列化格式均未删除，将来恢复 SuperContext 只需改回上述三处 shim（`as_str` 映射、`super_context_enabled`、`no_index_context_enabled`），旧配置数据无需任何迁移即可复用。",
+        "contextChars": 30898,
+        "keywordRecall": 1,
+        "pathRecall": 0.6666666666666666,
+        "keywordHits": [
+          "ContextRetrievalMode",
+          "super_context_enabled",
+          "no_index_context_enabled"
+        ],
+        "pathHits": [
+          "src-tauri/src/settings.rs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "cacheRead": 4864,
+          "cacheWrite": 0,
+          "input": 7791,
+          "output": 1609
+        },
+        "stderr": ""
+      },
+      "B": {
+        "arm": "B",
+        "wallMs": 24764,
+        "finalText": "基于检索结果确认：SuperContext 隐藏后无需任何数据迁移，旧 super 配置在每一层都被透明归一化到 FastContext，回退是自动且无感的。\n\n**序列化兼容（不丢配置）**：`ContextRetrievalMode` 枚举保留 `Super` 变体（`#[default]` + `#[serde(other)]`），旧配置里持久化的 `\"super\"` 仍能正常反序列化，不会因未知值报错；round-trip 测试覆盖了三种模式。\n\n**运行时归一（Super ≡ Fast）**：\n- `as_str()` 把 `Fast | Super` 都映射为 `\"fast\"`，运行路径上两者等价；\n- `super_context_enabled()` 硬编码返回 `false`（SuperContext 被临时隐藏）；\n- `no_index_context_enabled()` 对所有公开请求固定返回 `false`（实现保留仅供内部测试），因此任何携带旧 \"super\" 配置的 fast_context 请求都走索引化管线 `fast_context_run`，不会落入旧 no-index 路径。\n\n**MCP/环境配置归一**：`devin_nova_tools_config` 传入旧 mode `\"super\"` 时，生成的 env 仍为 `NOVA_CONTEXT_RETRIEVAL_MODE=fast`、`NOVA_CONTEXT_NO_INDEX=0`、`NOVA_FAST_CONTEXT=1`，有测试断言覆盖。\n\n**唯一保留的后门**：`fast_context` 入口里的 `_legacyFastContext` 标记可在 `no_index_context_enabled` 为真时切回 `fast_context_no_index`；但该开关当前硬编码关闭，故公开流量恒定走 FastContext 索引管线，旧 no-index 实现仅作为可测试的内部回退保留，处于惰性状态。\n\n结论：迁移=零操作（配置原样读入、运行期折叠为 fast）；回退=由 `no_index_context_enabled=false` 统一保证，无需用户介入，风险点为将来若重开 no-index 开关需注意 `_legacyFastContext` 的逃逸语义。",
+        "contextChars": 21167,
+        "keywordRecall": 1,
+        "pathRecall": 0.6666666666666666,
+        "keywordHits": [
+          "ContextRetrievalMode",
+          "super_context_enabled",
+          "no_index_context_enabled"
+        ],
+        "pathHits": [
+          "src-tauri/src/settings.rs",
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "input": 6052,
+          "output": 1680,
+          "cacheRead": 5248,
+          "cacheWrite": 0
+        },
+        "stderr": ""
+      }
+    },
+    {
+      "test": {
+        "id": "reverse-import-graph",
+        "threadId": "builtin",
+        "title": "反向 import 图兼容性",
+        "user": "分析 FastContext 的反向 import 图缓存和别名、barrel 调用方发现链路。",
+        "history": "",
+        "keywords": [
+          "reverse_from_files",
+          "ReverseMap",
+          "discover"
+        ],
+        "expectedPaths": [
+          "src-tauri/src/nova_tools_native/context.rs"
+        ]
+      },
+      "A": {
+        "arm": "A",
+        "wallMs": 23633,
+        "finalText": "基于本次 fast_context 输出（核心证据集中在 `src-tauri/src/nova_tools_native/context.rs`），链路分析如下：\n\n**1. 数据模型（反向图的节点与边）**\n- `ReverseMap = HashMap<String, Vec<ReverseImport>>`（L174）：key 是**解析后的目标文件路径**，value 是反向边列表。\n- `ReverseImport`（L166-170）携带三字段：`importer`（谁 import 的）、`local`（导入后的本地名）、`orig: Option<String>`（原始导出名）。`orig` 的存在正是为别名场景保留的——`import { X as Y }` 时 `local=Y`、`orig=Some(X)`。\n\n**2. 别名处理**\n`reverse_from_files`（L1926-1944）遍历每个 `FileEntry.imports`，用 `resolve_specifier` 把 `import.from` 解析成目标文件后写入 `reverse[target]`，再按 `(importer, local)` 排序 + `dedup_by`。去重键是本地名而非原始名，意味着**同一文件以不同别名引入同一符号会被保留为多条边**，调用方发现按 local 匹配即可命中别名场景（测试 `no_index_keyword_discovery_includes_callers_without_task_hints` 中 `import { discoveredTarget as run }` 被检索到，输出含 `run(v)` 调用体）。\n\n**3. barrel 解析**\n`resolve_specifier`（L1834-1921）的 `try_base` 依次尝试：裸路径 → 追加 11 种扩展名（ts/tsx/mts/cts/js/jsx/mjs/cjs/vue/svelte/rs/py）→ 追加 `{base}/index.{ext}` 与 `{base}/mod.{ext}`。第三段即 barrel 目录解析：`./core` → `core/index.ts`。Rust 侧另有 `::` 路径（crate/self/super/Rust2018 裸路径）分支；非相对且非 Rust 的 spec（外部包）返回 `None`，不进入反向图。\n\n**4. 缓存与增量链路（L2046-2062）**\n- 无变更 + 反向图为空 + files 非空 → 全量构建 `reverse_from_files`（惰性首建）。\n- 变更数 ≥ `REVERSE_FULL_REBUILD_CHANGES` 阈值 → 全量重建。\n- 0 < 变更 < 阈值 → 增量补丁：仅对 `removed_files ∪ rescanned_files` 从各 `reverse` 边表 `retain` 删除旧边（注释声明\"删旧边、加新边\"，展示段在删除循环处截断，新增边重建部分未在输出中展开）。未变更文件的边直接复用，避免每次 O(全部 import × resolve_specifier) 全量重建。\n\n**5. 调用方发现闭环（测试佐证，L7789-7810）**\n`fast_context_no_index` 用 `keywords=[\"discoveredTarget\"]` 时：core.ts 导出目标 → caller.ts 经扩展名解析 + 别名导入 → 反向图命中 caller → 输出包含调用方函数 `useIt`、别名调用体 `run(v)` 及\"调用方: 1 files\"计数。证明无需 task 提示词即可通过反向图 + 别名边完成调用方发现。\n\n**备注**：输出中另两个文件（`updater.rs`、`vendor/rtk/src/discover/report.rs`）的 \"discover\" 是 RTK 会话节省扫描，与本次调用方发现链路无关；`REVERSE_FULL_REBUILD_CHANGES` 常量值未在展示段中给出。",
+        "contextChars": 22066,
+        "keywordRecall": 1,
+        "pathRecall": 1,
+        "keywordHits": [
+          "reverse_from_files",
+          "ReverseMap",
+          "discover"
+        ],
+        "pathHits": [
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "cacheRead": 4864,
+          "cacheWrite": 0,
+          "input": 6535,
+          "output": 2093
+        },
+        "stderr": ""
+      },
+      "B": {
+        "arm": "B",
+        "wallMs": 34444,
+        "finalText": "基于单次 fast_context 返回内容（核心单元均在 `src-tauri/src/nova_tools_native/context.rs`），链路分析如下：\n\n## 1. 反向 import 图构建（reverse_from_files, L1926-1944）\n- 数据模型：`ReverseMap = HashMap<target文件, Vec<ReverseImport>>`，`ReverseImport { importer, local, orig }`（L166-174）。`local` 是 importer 内绑定的名字（可被 `as` 改写），`orig` 是原始导出名。\n- 对每个 `FileEntry.imports` 调用 `resolve_specifier`（L1834-1921）把 specifier 解析为具体文件：相对路径经 Path components 归一化；扩展名探测（ts/tsx/mts/cts/js/jsx/mjs/cjs/vue/svelte/rs/py）+ `index`/`mod` 叶子回退；Rust `crate::`/裸 2018 路径按 `src` 标记定位 crate 根，`self`/`super` 逐层上跳；外部 crate 解析落空 → 不产生边。\n- 收尾：每个 target 的边按 `(importer, local)` 排序并去重，保证确定性输出。\n\n## 2. 缓存持久化与增量策略（L2046-2062）\n- 反向图随 `DiskCache` 持久化（`cache.reverse`），避免每次 O(全部 import × resolve) 全量重建。\n- 三分支：`changed==0` 且 reverse 为空 → 全量构建；`changed >= REVERSE_FULL_REBUILD_CHANGES` → 全量重建；`0 < changed < 阈值` → 增量补丁，shown 部分执行 `edges.retain(|e| e.importer != file)` 清除 removed ∪ rescanned 文件的旧边（\"删旧边\"；\"加新边\" 的补边路径不在展示段内，可推断对 rescanned 文件重跑 reverse_from_files）。\n- 消费方：索引构建返回 `(IndexView, Vec<String>, ReverseMap)`（L1951），调用方发现（IMPACT）在 L5137 以 `&ReverseMap` 参数做符号→调用方匹配。\n\n## 3. 别名（alias）调用方发现\n测试 `no_index_keyword_discovery_includes_callers_without_task_hints`（L7789-7810）直接验证：`import { discoveredTarget as run }` → 反向边 target=src/core.ts，`local=\"run\"`, `orig=\"discoveredTarget\"`；关键词 `discoveredTarget` 命中后，调用方 `useIt` 及其函数体 `run(v)` 均被带出，断言 `\"调用方: 1 files\"`。即别名场景靠 `orig`/`local` 双字段匹配符号名完成发现。\n\n## 4. barrel 发现链路（关键观察/限制）\n- `resolve_specifier` 的 `base/index.{ext}`、`base/mod.{ext}` 回退会把\"目录导入\"解析到 barrel 文件本身 → 反向边以 **barrel 文件路径** 为 key，而非符号起源文件。\n- 展示代码中 **没有** re-export 链展开（`orig` 仅覆盖单跳 `as` 别名）：`a.ts → index.ts → b.ts` 这类多跳场景，边的 key 停在 index.ts；若发现面只匹配 b.ts 的符号，barrel 后的调用方不会被折叠到起源文件。这是当前链路的边界——barrel 上的直接导入者可被发现，跨 barrel 的符号起源追踪不在本单元内。\n\n## 5. 相关但无实质关联的命中\n`updater.rs` 的 `remember_latest_discovered`/`latest_discovered_version` 与 `vendor/rtk discover.md` 均为同名干扰命中（更新器版本记忆、RTK 命令历史分析），非本链路组成部分。`nova-napi-tools.test.mjs` 验证 N-API addon 的 read/edit，与反向图无关。",
+        "contextChars": 15799,
+        "keywordRecall": 1,
+        "pathRecall": 1,
+        "keywordHits": [
+          "reverse_from_files",
+          "ReverseMap",
+          "discover"
+        ],
+        "pathHits": [
+          "src-tauri/src/nova_tools_native/context.rs"
+        ],
+        "usage": {
+          "input": 4403,
+          "output": 3188,
+          "cacheRead": 5248,
+          "cacheWrite": 0
+        },
+        "stderr": ""
+      }
+    }
+  ],
+  "totals": {
+    "A": {
+      "cases": 4,
+      "success": 4,
+      "avgWallMs": 84500.25,
+      "avgKeywordRecall": 1,
+      "avgPathRecall": 0.75,
+      "totalTokens": 57694
+    },
+    "B": {
+      "cases": 4,
+      "success": 4,
+      "avgWallMs": 32709.5,
+      "avgKeywordRecall": 1,
+      "avgPathRecall": 0.75,
+      "totalTokens": 54751
+    }
+  }
+}

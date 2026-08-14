@@ -1,5 +1,5 @@
 // DeepSeek model-level A/B using real local Nova conversation history.
-// A = indexed legacy fast_context; B = optimized index-free one-pass fast_context.
+// A = baseline executable; B = current native resident FastContext executable.
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -28,6 +28,47 @@ const parseRawInput = (item) => {
   try { return JSON.parse(item?.rawInput ?? "{}"); } catch { return {}; }
 };
 const extractPaths = (text) => [...String(text).matchAll(/(?:### |DEF |EDIT |dependency[^\n]*?)([\w./\\-]+\.(?:rs|ts|tsx|js|mjs|json|md))(?::\d+)?/g)].map((m) => m[1].replaceAll("\\", "/"));
+
+function builtInCases() {
+  return [
+    {
+      id: "resident-service-routing",
+      threadId: "builtin",
+      title: "原生常驻服务路由",
+      user: "分析 FastContext 原生常驻进程如何让 Lyra 直连、其它后端通过 bridge 接入，并指出关键调用链。",
+      history: "",
+      keywords: ["ContextService", "preload_indexes", "callGlobalContextTool", "fast_context"],
+      expectedPaths: ["src-tauri/src/context_service.rs", "src-tauri/src/lyra/tools.rs", "scripts/nova-context-client.mjs"],
+    },
+    {
+      id: "mmap-incremental-index",
+      threadId: "builtin",
+      title: "mmap 增量索引",
+      user: "分析 FastContext 索引如何在启动时 mmap 加载、运行时只使用内存并增量更新。",
+      history: "",
+      keywords: ["preload_indexes", "with_mapped_file", "load_cache", "store_cache"],
+      expectedPaths: ["src-tauri/src/nova_tools_native/context.rs"],
+    },
+    {
+      id: "super-fallback",
+      threadId: "builtin",
+      title: "SuperContext 回退",
+      user: "确认 SuperContext 隐藏后，旧 super 配置如何迁移并回退到 FastContext。",
+      history: "",
+      keywords: ["ContextRetrievalMode", "super_context_enabled", "no_index_context_enabled"],
+      expectedPaths: ["src-tauri/src/settings.rs", "src/components/SettingsModal.tsx", "src-tauri/src/nova_tools_native/context.rs"],
+    },
+    {
+      id: "reverse-import-graph",
+      threadId: "builtin",
+      title: "反向 import 图兼容性",
+      user: "分析 FastContext 的反向 import 图缓存和别名、barrel 调用方发现链路。",
+      history: "",
+      keywords: ["reverse_from_files", "ReverseMap", "discover"],
+      expectedPaths: ["src-tauri/src/nova_tools_native/context.rs"],
+    },
+  ];
+}
 
 function loadCases() {
   const cases = [];
@@ -58,7 +99,8 @@ function loadCases() {
       break;
     }
   }
-  return cases.sort((a, b) => Number(preferred.has(b.threadId)) - Number(preferred.has(a.threadId))).slice(0, LIMIT);
+  const selected = cases.sort((a, b) => Number(preferred.has(b.threadId)) - Number(preferred.has(a.threadId))).slice(0, LIMIT);
+  return selected.length ? selected : builtInCases().slice(0, LIMIT);
 }
 
 function runOne(test, arm) {
@@ -66,7 +108,7 @@ function runOne(test, arm) {
     const started = Date.now();
     const child = spawn(arm === "A" ? EXE_A : EXE_B, ["lyra"], {
       cwd: REPO,
-      env: { ...process.env, NOVA_DATA_DIR: join(homedir(), ".nova"), NOVA_CONTEXT_RETRIEVAL_MODE: process.env.LYRA_AB_CONTEXT_MODE ?? "super", LYRA_SPECULATE: "0" },
+      env: { ...process.env, NOVA_DATA_DIR: join(homedir(), ".nova"), NOVA_CONTEXT_RETRIEVAL_MODE: "fast", NOVA_CONTEXT_NO_INDEX: "0", LYRA_SPECULATE: "0" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let buffer = "", stderr = "", finalText = "", contextText = "", usage = null, done = false;
@@ -114,6 +156,6 @@ const aggregate = (arm) => {
   const avg = (key) => runs.reduce((sum, run) => sum + Number(run[key] ?? 0), 0) / runs.length;
   return { cases: runs.length, success: runs.filter((run) => !run.timeout && !run.error && !run.exitCode).length, avgWallMs: avg("wallMs"), avgKeywordRecall: avg("keywordRecall"), avgPathRecall: avg("pathRecall"), totalTokens: runs.reduce((sum, run) => sum + tokenCount(run), 0) };
 };
-const report = { ranAt: new Date().toISOString(), model: MODEL, source: THREAD_DIR, arms: { A: EXE_A, B: EXE_B }, contextMode: process.env.LYRA_AB_CONTEXT_MODE ?? "super", rows, totals: { A: aggregate("A"), B: aggregate("B") } };
+const report = { ranAt: new Date().toISOString(), model: MODEL, source: THREAD_DIR, arms: { A: EXE_A, B: EXE_B }, contextMode: "fast", rows, totals: { A: aggregate("A"), B: aggregate("B") } };
 writeFileSync(OUT, JSON.stringify(report, null, 2));
 console.log(JSON.stringify({ out: OUT, totals: report.totals }, null, 2));

@@ -97,7 +97,8 @@ pub struct AppState {
     /// 共享标记账本：员工协作时对外部实体（需求单等）做去重/互斥/接力
     pub marks: Mutex<marks::MarkStore>,
     pub vectors: Mutex<semantic::VectorStore>,
-    /// 全部 Node bridge 共用的唯一 fast_context/find_symbols JS 进程。
+    /// Native resident fast_context service shared by every external bridge. Lyra bypasses the
+    /// socket and calls the same in-process engine directly.
     pub(crate) context_service: context_service::ContextService,
     pub acp: Arc<AcpManager>,
     /// OpenCode 官方 SDK 对应的 HTTP API 后端，不经过 ACP。
@@ -857,7 +858,10 @@ async fn list_clue_groups(
     if !state.relay.is_configured() {
         return Err("云端证据链需要先配置团队中转站".into());
     }
-    state.relay.clue_list(space.as_deref().unwrap_or("personal")).await
+    state
+        .relay
+        .clue_list(space.as_deref().unwrap_or("personal"))
+        .await
 }
 
 #[tauri::command]
@@ -871,8 +875,6 @@ async fn get_clue_context(
         state.clues.lock().unwrap().snapshot(&card_id)
     }
 }
-
-
 
 #[tauri::command]
 async fn capture_clue(
@@ -960,7 +962,11 @@ async fn associate_clues(
 ) -> Result<clues::ClueNodeGroup, String> {
     let group = state
         .relay
-        .clue_associate(&before_card_id, &after_card_id, space.as_deref().unwrap_or("personal"))
+        .clue_associate(
+            &before_card_id,
+            &after_card_id,
+            space.as_deref().unwrap_or("personal"),
+        )
         .await?;
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(group)
@@ -976,7 +982,11 @@ async fn disassociate_clues(
 ) -> Result<clues::ClueNodeGroup, String> {
     let group = state
         .relay
-        .clue_disassociate(&before_card_id, &after_card_id, space.as_deref().unwrap_or("personal"))
+        .clue_disassociate(
+            &before_card_id,
+            &after_card_id,
+            space.as_deref().unwrap_or("personal"),
+        )
         .await?;
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(group)
@@ -5820,6 +5830,23 @@ pub fn run() {
             let marks = marks::MarkStore::load(&dir);
             let vectors = semantic::VectorStore::load(&dir);
             settings.apply_context_retrieval_environment();
+            // Load known roots once into the process-wide cache shared by Lyra and every bridge.
+            // Include active thread/worktree roots so alternate checkouts do not cold-rebuild.
+            let mut preload_roots = projects.projects.clone();
+            preload_roots.extend(store.threads.iter().map(|thread| thread.cwd.clone()));
+            preload_roots.extend(
+                worktrees
+                    .worktrees
+                    .iter()
+                    .flat_map(|worktree| [worktree.repo.clone(), worktree.path.clone()]),
+            );
+            preload_roots.sort();
+            preload_roots.dedup();
+            let loaded_indexes = nova_tools_native::context::preload_indexes(&preload_roots);
+            eprintln!(
+                "[fast-context] shared mmap-loaded {loaded_indexes}/{} workspace indexes",
+                preload_roots.len()
+            );
             let context_service = context_service::ContextService::start(&dir)?;
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());

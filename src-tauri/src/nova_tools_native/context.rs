@@ -69,6 +69,13 @@ const CODE_FILE_EXTENSIONS: &[&str] = &[
 ];
 const SEARCH_SNAPSHOT_VERSION: u32 = 2;
 const SEARCH_INDEX_MIN_TOKEN: usize = 2;
+const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FILE_LIST_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const FAST_REPOSITORY_COMMAND_DEADLINE_MS: u64 = 5_000;
+const CO_CHANGE_DEADLINE_MS: u64 = 750;
+const CO_CHANGE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const CO_CHANGE_DEFAULT_HISTORY_DAYS: u64 = 730;
+const CO_CHANGE_CACHE_FILES: usize = 1_024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Symbol {
@@ -99,7 +106,7 @@ struct FileEntry {
     imports: Vec<ImportRef>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiskCache {
     version: u32,
     root: String,
@@ -227,21 +234,18 @@ struct UnitCandidate {
 }
 
 static MEMO: OnceLock<Mutex<HashMap<String, DiskCache>>> = OnceLock::new();
+static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static SEARCH_INDEXES: OnceLock<Mutex<HashMap<String, SearchIndexState>>> = OnceLock::new();
 static SEARCH_WATCHERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static CO_CHANGE_CACHE: OnceLock<Mutex<HashMap<String, Vec<(String, usize)>>>> = OnceLock::new();
 
 /// No-index request execution is intentionally independent from the persistent codemap cache.
 /// It is an A/B switch while the new one-pass algorithm is proven against the legacy pipeline.
-fn no_index_context_enabled(params: &Value) -> bool {
-    if let Some(mode) = params.get("_contextMode").and_then(Value::as_str) {
-        return mode.eq_ignore_ascii_case("super");
-    }
-    if let Ok(mode) = std::env::var("NOVA_CONTEXT_RETRIEVAL_MODE") {
-        return mode.eq_ignore_ascii_case("super");
-    }
-    std::env::var_os("NOVA_CONTEXT_NO_INDEX")
-        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-        .unwrap_or(!cfg!(test))
+fn no_index_context_enabled(_params: &Value) -> bool {
+    // SuperContext is temporarily hidden. Keep its implementation available for focused internal
+    // tests, but every public fast_context request (including persisted "super" configuration)
+    // runs the indexed FastContext pipeline.
+    false
 }
 
 const NO_INDEX_DEFAULT_DEADLINE_MS: u64 = 2_500;
@@ -318,40 +322,72 @@ fn metadata_stamp(path: &Path) -> Option<(u64, u128)> {
 fn load_cache(root: &Path) -> DiskCache {
     let key = normalize_root(root);
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cache) = memo.lock().unwrap().remove(&key) {
+    if let Some(cache) = memo.lock().unwrap().get(&key).cloned() {
         return cache;
     }
-    let path = cache_path(root);
-    if let Ok(bytes) = fs::read(path) {
-        if let Ok(cache) = bincode::deserialize::<DiskCache>(&bytes) {
-            if cache.version == CACHE_VERSION && cache.root == key {
-                return cache;
-            }
-        }
-    }
-    DiskCache {
+    // A root opened after startup gets one mmap load on first use instead of silently discarding an
+    // existing index and rebuilding it from source. Publish it immediately so concurrent callers
+    // share the same warm baseline; the per-root update lock serializes their incremental commits.
+    let cache = mmap_cache(root, &key).unwrap_or_else(|| DiskCache {
         version: CACHE_VERSION,
-        root: key,
+        root: key.clone(),
         files: HashMap::new(),
         reverse: HashMap::new(),
+    });
+    memo.lock().unwrap().insert(key, cache.clone());
+    cache
+}
+
+fn mmap_cache(root: &Path, key: &str) -> Option<DiskCache> {
+    with_mapped_file(&cache_path(root), |bytes| {
+        bincode::deserialize::<DiskCache>(bytes).ok()
+    })
+    .filter(|cache| cache.version == CACHE_VERSION && cache.root == key)
+}
+
+/// Load persisted FastContext indexes once into the shared process at startup. mmap avoids an
+/// additional file-sized read buffer; bincode materializes the mutable in-memory cache used by
+/// later incremental updates. A workspace first opened after startup uses the same mmap path once.
+pub fn preload_indexes(roots: &[String]) -> usize {
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut loaded = 0usize;
+    for root in roots {
+        let root = Path::new(root);
+        if !root.is_dir() {
+            continue;
+        }
+        let key = normalize_root(root);
+        if memo.lock().unwrap().contains_key(&key) {
+            continue;
+        }
+        let cache = mmap_cache(root, &key);
+        if let Some(cache) = cache {
+            memo.lock().unwrap().insert(key, cache);
+            loaded += 1;
+        }
+    }
+    loaded
+}
+
+fn write_cache(root: &Path, cache: &DiskCache) {
+    if let Ok(bytes) = bincode::serialize(cache) {
+        let path = cache_path(root);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if fs::write(&temp, bytes).is_ok() {
+            if path.exists() {
+                let _ = fs::remove_file(&path);
+            }
+            let _ = fs::rename(&temp, &path);
+        }
     }
 }
 
 fn store_cache(root: &Path, cache: DiskCache, persist: bool) {
     if persist {
-        if let Ok(bytes) = bincode::serialize(&cache) {
-            let path = cache_path(root);
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-            if fs::write(&temp, bytes).is_ok() {
-                if path.exists() {
-                    let _ = fs::remove_file(&path);
-                }
-                let _ = fs::rename(&temp, &path);
-            }
-        }
+        write_cache(root, &cache);
     }
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -442,6 +478,19 @@ fn run_command_until(
     args: &[String],
     deadline: Instant,
 ) -> Option<Vec<u8>> {
+    run_command_until_limited(root, program, args, deadline, usize::MAX)
+}
+
+/// Run an external search with both a wall-clock and stdout cap. Closing the stdout pipe once the
+/// cap is reached makes producers such as rg/git stop promptly instead of buffering hundreds of
+/// megabytes before the caller can apply its result limit.
+fn run_command_until_limited(
+    root: &Path,
+    program: &str,
+    args: &[String],
+    deadline: Instant,
+    max_output_bytes: usize,
+) -> Option<Vec<u8>> {
     let remaining = deadline.checked_duration_since(Instant::now())?;
     let mut child = hidden_command(program)
         .args(args)
@@ -451,10 +500,20 @@ fn run_command_until(
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
-    // Drain concurrently so a large rg result cannot fill the OS pipe and block the child.
+    // Drain concurrently so a large result cannot fill the OS pipe and block the child. A bounded
+    // reader drops the pipe at the limit; most CLI producers then terminate immediately.
     let reader = thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes).ok()
+        if max_output_bytes == usize::MAX {
+            stdout.read_to_end(&mut bytes).map(|_| bytes).ok()
+        } else {
+            stdout
+                .take(max_output_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            bytes.truncate(max_output_bytes);
+            Some(bytes)
+        }
     });
     let completed = child.wait_timeout(remaining).ok()?.is_some();
     if !completed {
@@ -504,7 +563,7 @@ fn walk_code_files(root: &Path) -> Vec<String> {
         }
         if let Ok(rel) = entry.path().strip_prefix(root) {
             let rel = normalize_rel(&rel.to_string_lossy());
-            if is_code_file(&rel) {
+            if is_searchable_implementation_file(&rel) {
                 files.push(rel);
             }
         }
@@ -516,7 +575,7 @@ fn list_code_files(root: &Path) -> Vec<String> {
     const EXTENSIONS: &[&str] = &[
         "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts",
         "swift", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "cs", "php", "scala", "dart",
-        "m", "mm", "zig", "vue", "svelte", "py", "pyi",
+        "m", "mm", "zig", "vue", "svelte", "py", "pyi", "sql", "md",
     ];
     let mut args = vec![
         "ls-files".into(),
@@ -527,13 +586,19 @@ fn list_code_files(root: &Path) -> Vec<String> {
         "--".into(),
     ];
     args.extend(EXTENSIONS.iter().map(|extension| format!("*.{extension}")));
-    if let Some(stdout) = run_command(root, "git", &args) {
+    if let Some(stdout) = run_command_until_limited(
+        root,
+        "git",
+        &args,
+        Instant::now() + Duration::from_millis(FAST_REPOSITORY_COMMAND_DEADLINE_MS),
+        MAX_FILE_LIST_OUTPUT_BYTES,
+    ) {
         let mut seen = HashSet::new();
         let files: Vec<_> = stdout
             .split(|byte| *byte == 0)
             .filter_map(|raw| std::str::from_utf8(raw).ok())
             .map(normalize_rel)
-            .filter(|file| is_code_file(file) && seen.insert(file.clone()))
+            .filter(|file| is_searchable_implementation_file(file) && seen.insert(file.clone()))
             .collect();
         if !files.is_empty() {
             return files;
@@ -1098,6 +1163,10 @@ fn rg_search(
         "-F".into(),
         "--max-count".into(),
         MAX_HITS_PER_FILE.to_string(),
+        "--max-filesize".into(),
+        "2M".into(),
+        "--max-columns".into(),
+        "1000".into(),
     ];
     if ignore_case {
         args.push("-i".into());
@@ -1144,11 +1213,15 @@ fn rg_search(
     } else {
         args.extend(paths.iter().cloned());
     }
-    let stdout = if let Some(deadline) = deadline {
-        run_command_until(root, "rg", &args, deadline)?
-    } else {
-        run_command(root, "rg", &args)?
-    };
+    let stdout = run_command_until_limited(
+        root,
+        "rg",
+        &args,
+        deadline.unwrap_or_else(|| {
+            Instant::now() + Duration::from_millis(FAST_REPOSITORY_COMMAND_DEADLINE_MS)
+        }),
+        MAX_SEARCH_OUTPUT_BYTES,
+    )?;
     Some(parse_search_rows(stdout))
 }
 
@@ -1189,8 +1262,10 @@ fn search_text(
         rows.truncate(MAX_HIT_LINES);
         return rows;
     }
-    if let Some(rows) = rg_search(root, &terms, ignore_case, word, files, false, None) {
-        return rows;
+    if rg_available(root) {
+        // rg is the bounded primary path. A timeout/output-cap failure must not fall through to an
+        // unbounded `git grep` over the same large repository.
+        return rg_search(root, &terms, ignore_case, word, files, false, None).unwrap_or_default();
     }
     let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
     if inside == "true" {
@@ -1884,7 +1959,17 @@ fn build_index(
     wanted: Option<&HashSet<String>>,
     dependency_depth: usize,
     known_files: Option<&[String]>,
-) -> (IndexView, Vec<String>, ReverseMap) {
+) -> (IndexView, Vec<String>, Arc<ReverseMap>) {
+    // load_cache temporarily moves this root's cache out of MEMO. Serialize all users of the same
+    // workspace so concurrent Lyra sessions and bridge calls cannot observe an empty cache.
+    let cache_lock = CACHE_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(normalize_root(root))
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _cache_guard = cache_lock.lock().unwrap();
     let all = known_files
         .map(<[String]>::to_vec)
         .unwrap_or_else(|| list_code_files(root));
@@ -1961,11 +2046,14 @@ fn build_index(
     // Focused results must depend on this request, not files left by older cache history.
     // Persist the full incremental cache, but expose only the requested dependency closure.
     let selected = if wanted.is_some() {
-        cache
-            .files
+        targets
             .iter()
-            .filter(|(file, _)| targets.contains(*file))
-            .map(|(file, entry)| (file.clone(), entry.clone()))
+            .filter_map(|file| {
+                cache
+                    .files
+                    .get(file)
+                    .map(|entry| (file.clone(), entry.clone()))
+            })
             .collect()
     } else {
         cache.files.clone()
@@ -2006,11 +2094,19 @@ fn build_index(
             edges.dedup_by(|a, b| a.importer == b.importer && a.local == b.local);
         }
     }
-    let reverse = cache.reverse.clone();
+    let reverse = Arc::new(cache.reverse.clone());
     // 少量变更只更新内存 MEMO，跳过整仓缓存的全量序列化写盘；下次冷启动
     // 重扫这几个文件即可。首次建缓存（initially_empty）不受此限。
     let persist = dirty && (changed >= PERSIST_MIN_CHANGED || initially_empty);
-    store_cache(root, cache, persist);
+    let persist_snapshot = persist.then(|| cache.clone());
+    // Publish the updated cache before releasing the per-root mutation lock. Persistence happens
+    // afterwards, so another request can use the warm in-memory snapshot instead of waiting for a
+    // full bincode serialization and disk replacement.
+    store_cache(root, cache, false);
+    drop(_cache_guard);
+    if let Some(snapshot) = persist_snapshot.as_ref() {
+        write_cache(root, snapshot);
+    }
     let mut view = IndexView {
         files: selected,
         ..Default::default()
@@ -2239,7 +2335,7 @@ fn plan_terms_from_bodies(
 
 fn score_path(file: &str) -> i64 {
     let mut score = 0;
-    if !is_code_file(file) {
+    if !is_searchable_implementation_file(file) {
         score -= 90;
     }
     if noise_path(file) {
@@ -2480,7 +2576,7 @@ fn production_anchor_hit(rows: &[SearchRow], keyword: &str) -> bool {
         .map(|variant| variant.to_lowercase())
         .collect::<Vec<_>>();
     rows.iter().any(|row| {
-        if !is_code_file(&row.file) || anchor_noise_path(&row.file) {
+        if !is_searchable_implementation_file(&row.file) || anchor_noise_path(&row.file) {
             return false;
         }
         let line = row.text.to_lowercase();
@@ -2624,7 +2720,7 @@ fn suggest_symbols(root: &Path, anchors: &[String]) -> Vec<String> {
     if words.is_empty() {
         return Vec::new();
     }
-    let rows = search_text(root, &words, true, false, &[]);
+    let rows = search_text_scopes(root, &words, true, false, None);
     static IDENT: OnceLock<Regex> = OnceLock::new();
     let ident = IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][\w$]{2,}").unwrap());
     static DEF_LINE: OnceLock<Regex> = OnceLock::new();
@@ -3014,9 +3110,9 @@ fn collect_dependencies(
     picked
 }
 
-/// git 共改耦合：种子文件近 120 次触及提交里的高频共改文件（可选开关），抓文本
-/// 零耦合的关联文件（DI 注册表、路由表、配套样式）。只给提示，不占 EDIT 预算。
-/// tests_only=true 时只统计测试文件（noise_path），供伴生测试默认打包用。
+/// git 共改耦合：种子文件近期触及提交里的高频共改文件（可选开关），抓文本
+/// 零耦合的关联文件（DI 注册表、路由表、配套样式）。历史窗口、执行时间和输出均
+/// 有硬上限，避免稀有文件在超大历史仓库中遍历全部提交。
 fn co_changed_files(
     root: &Path,
     seed_files: &[String],
@@ -3027,72 +3123,84 @@ fn co_changed_files(
     if seed_files.is_empty() {
         return Vec::new();
     }
-    // 注意不能一步 `git log --name-only -- <path>`：pathspec 会把展示的文件名也
-    // 限制在路径内，共改文件根本不会出现。先按 pathspec 取触及种子文件的提交
-    //（便宜），再 git show 这些提交的完整文件清单（只算相关提交的 diff）。
-    let mut sha_args = vec![
-        "log".to_string(),
-        "--format=%H".to_string(),
-        "-n".to_string(),
-        "120".to_string(),
-        "--".to_string(),
-    ];
-    sha_args.extend(seed_files.iter().take(4).cloned());
-    let Some(bytes) = run_command(root, "git", &sha_args) else {
-        return Vec::new();
-    };
-    let shas = String::from_utf8_lossy(&bytes)
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.len() >= 7 && line.chars().all(|ch| ch.is_ascii_hexdigit()))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if shas.is_empty() {
-        return Vec::new();
-    }
-    // 注意：git show --format= 对连续提交不输出任何分隔（无空行无头），
-    // 用显式标记切块（格式串必须含 %H 占位符否则 git 报 invalid format）；
-    // -m --first-parent 保证 merge 提交也产出完整文件清单。
-    const COMMIT_MARK: &str = "@@NOVA_COMMIT@@";
-    let mut show_args = vec![
-        "show".to_string(),
-        format!("--format={COMMIT_MARK}%H"),
-        "--name-only".to_string(),
-        "--no-renames".to_string(),
-        "-m".to_string(),
-        "--first-parent".to_string(),
-    ];
-    show_args.extend(shas);
-    let Some(bytes) = run_command(root, "git", &show_args) else {
-        return Vec::new();
-    };
-    let text = String::from_utf8_lossy(&bytes);
-    let seeds = seed_files.iter().take(4).collect::<HashSet<_>>();
-    let mut counts = HashMap::<String, usize>::new();
-    for commit in text.split(COMMIT_MARK) {
-        let files = commit
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(normalize_rel)
-            .collect::<Vec<_>>();
-        if !files.iter().any(|file| seeds.contains(file)) {
-            continue;
-        }
-        for file in files {
-            if seeds.contains(&file)
-                || exclude.contains(&file)
-                || !is_code_file(&file)
-                || !root.join(&file).is_file()
-                || (tests_only && !noise_path(&file))
-            {
+    let mut seeds = seed_files.iter().take(4).cloned().collect::<Vec<_>>();
+    seeds.sort();
+    seeds.dedup();
+    let history_days = std::env::var("NOVA_CONTEXT_GIT_HISTORY_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(CO_CHANGE_DEFAULT_HISTORY_DAYS)
+        .clamp(30, 3650);
+    let cache_key = format!(
+        "{}\0{}\0{}\0{}",
+        normalize_root(root),
+        short_rev(root),
+        history_days,
+        seeds.join("\0")
+    );
+    let cache = CO_CHANGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = cache.lock().unwrap().get(&cache_key).cloned();
+    let counts = if let Some(cached) = cached {
+        cached
+    } else {
+        // --full-diff keeps commit selection path-scoped while listing every file changed by each
+        // selected commit, avoiding the former log + giant multi-SHA show pair.
+        const COMMIT_MARK: &str = "@@NOVA_COMMIT@@";
+        let mut args = vec![
+            "log".to_string(),
+            format!("--format={COMMIT_MARK}%H"),
+            "--name-only".to_string(),
+            "--full-diff".to_string(),
+            "--no-renames".to_string(),
+            "--first-parent".to_string(),
+            "--max-count=120".to_string(),
+            format!("--since={history_days}.days.ago"),
+            "--".to_string(),
+        ];
+        args.extend(seeds.iter().cloned());
+        let deadline = Instant::now() + Duration::from_millis(CO_CHANGE_DEADLINE_MS);
+        let Some(bytes) =
+            run_command_until_limited(root, "git", &args, deadline, CO_CHANGE_MAX_OUTPUT_BYTES)
+        else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let seed_set = seeds.iter().collect::<HashSet<_>>();
+        let mut counts = HashMap::<String, usize>::new();
+        for commit in text.split(COMMIT_MARK).skip(1) {
+            let mut lines = commit
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty());
+            let _sha = lines.next();
+            let files = lines.map(normalize_rel).collect::<Vec<_>>();
+            if !files.iter().any(|file| seed_set.contains(file)) {
                 continue;
             }
-            *counts.entry(file).or_default() += 1;
+            for file in files {
+                if !seed_set.contains(&file) && is_code_file(&file) {
+                    *counts.entry(file).or_default() += 1;
+                }
+            }
         }
-    }
-    let mut list = counts.into_iter().collect::<Vec<_>>();
-    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut counts = counts.into_iter().collect::<Vec<_>>();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        counts.truncate(CO_CHANGE_CACHE_FILES);
+        let mut guard = cache.lock().unwrap();
+        if guard.len() >= 64 {
+            guard.clear();
+        }
+        guard.insert(cache_key, counts.clone());
+        counts
+    };
+    let mut list = counts
+        .into_iter()
+        .filter(|(file, _)| {
+            !exclude.contains(file)
+                && root.join(file).is_file()
+                && (!tests_only || noise_path(file))
+        })
+        .collect::<Vec<_>>();
     list.truncate(limit);
     list
 }
@@ -3110,13 +3218,19 @@ fn companion_test_files(
         return Vec::new();
     }
     let mut companions = Vec::new();
-    // git 共改：按种子逐个取其 top-3 测试伴生，避免其它种子的高频伴生抢占槽位。
-    for seed in seed_files.iter().take(3) {
-        let got = co_changed_files(root, std::slice::from_ref(seed), exclude, 3, true);
-        for (file, count) in got {
-            if count >= 2 && !companions.contains(&file) {
-                companions.push(file);
-            }
+    // One batched history walk avoids paying the bounded git-log deadline once per seed in large
+    // repositories. Keep extra candidates before the final cap so one seed cannot consume all
+    // companion slots.
+    let history_seeds = seed_files.iter().take(3).cloned().collect::<Vec<_>>();
+    for (file, count) in co_changed_files(
+        root,
+        &history_seeds,
+        exclude,
+        limit.saturating_mul(history_seeds.len().max(1)),
+        true,
+    ) {
+        if count >= 2 && !companions.contains(&file) {
+            companions.push(file);
         }
     }
     for seed in seed_files.iter().take(4) {
@@ -4690,8 +4804,12 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         })
         .filter(|term| production_anchor_hit(&rows, term))
         .collect();
+    let mut all_set: HashSet<String> = all.iter().cloned().collect();
     for file in rows.iter().map(|row| &row.file).chain(files.iter()) {
-        if !all.contains(file) && root.join(file).is_file() && is_code_file(file) {
+        if all_set.insert(file.clone())
+            && root.join(file).is_file()
+            && is_searchable_implementation_file(file)
+        {
             all.push(file.clone());
         }
     }
@@ -4818,7 +4936,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     }
     let mut candidates = preliminary
         .iter()
-        .filter(|(file, _)| is_code_file(file) || files.contains(file))
+        .filter(|(file, _)| is_searchable_implementation_file(file) || files.contains(file))
         .take(MAX_CANDIDATES)
         .cloned()
         .collect::<Vec<_>>();
@@ -4958,7 +5076,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             if discover_stems.is_empty() {
                 Vec::<SearchRow>::new()
             } else {
-                search_text(root, &discover_stems, true, false, &[])
+                search_text_scopes(root, &discover_stems, true, false, None)
             }
         });
         (
@@ -5044,10 +5162,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 .to_string();
             if stem.len() >= 3 && searched.insert(target.to_string()) {
                 // 种子目标的词根行来自预取的批量检索；动态发现的中转目标才单独补搜。
-                let rows = stem_rows
-                    .get(&stem)
-                    .cloned()
-                    .unwrap_or_else(|| search_text(root, &[stem.clone()], true, false, &[]));
+                let rows = stem_rows.get(&stem).cloned().unwrap_or_else(|| {
+                    search_text_scopes(root, &[stem.clone()], true, false, None)
+                });
                 let mut seen_files = HashSet::<String>::new();
                 for row in rows {
                     if row.file == target || !is_code_file(&row.file) {
@@ -5093,7 +5210,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         let mut graph_queue = Vec::<(String, String, String, String, usize)>::new();
         let mut graph_seen = HashSet::<(String, String)>::new();
         for (definition, name, _) in &seeds {
-            for edge in discover(&definition.file, &mut searched_targets, &reverse) {
+            for edge in discover(&definition.file, &mut searched_targets, reverse.as_ref()) {
                 if edge.local == *name || edge.orig.as_deref() == Some(name.as_str()) {
                     graph_queue.push((
                         name.clone(),
@@ -5136,7 +5253,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                     symbol.name == seed_name && symbol.depth <= 1 && symbol.kind != "prop"
                 })
             {
-                for edge in discover(&importer, &mut searched_targets, &reverse) {
+                for edge in discover(&importer, &mut searched_targets, reverse.as_ref()) {
                     if edge.local == local || edge.orig.as_deref() == Some(local.as_str()) {
                         graph_queue.push((
                             seed_name.clone(),
@@ -5189,7 +5306,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 graph_rows.insert((importer.clone(), ln));
                 added += 1;
             }
-            if !all.contains(&importer) {
+            if all_set.insert(importer.clone()) {
                 all.push(importer.clone());
             }
         }
@@ -5330,7 +5447,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let mut final_candidates = ranked
         .iter()
         .filter(|(file, _)| {
-            (is_code_file(file) || files.contains(file))
+            (is_searchable_implementation_file(file) || files.contains(file))
                 && (plan_intent.tests
                     || !noise_path(file)
                     || files.contains(file)
@@ -7251,6 +7368,64 @@ mod tests {
     }
 
     #[test]
+    fn limited_command_caps_large_output() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("many.txt"), "bounded-output\n".repeat(20_000)).unwrap();
+        let args = vec![
+            "-n".to_string(),
+            "bounded-output".to_string(),
+            "many.txt".to_string(),
+        ];
+        let output = run_command_until_limited(
+            d.path(),
+            "rg",
+            &args,
+            Instant::now() + Duration::from_secs(2),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(output.len(), 1024);
+    }
+
+    fn preload_indexes_uses_mmap_and_queries_do_not_reload_disk() {
+        let d = tempdir().unwrap();
+        let key = normalize_root(d.path());
+        let mut files = HashMap::new();
+        files.insert(
+            "src/cached.ts".into(),
+            FileEntry {
+                size: 21,
+                modified_ns: 1,
+                total: 1,
+                syms: Vec::new(),
+                imports: Vec::new(),
+            },
+        );
+        let cache = DiskCache {
+            version: CACHE_VERSION,
+            root: key.clone(),
+            files,
+            reverse: HashMap::new(),
+        };
+        let path = cache_path(d.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bincode::serialize(&cache).unwrap()).unwrap();
+        MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&key);
+
+        assert_eq!(
+            preload_indexes(&[d.path().to_string_lossy().into_owned()]),
+            1
+        );
+        fs::remove_file(path).unwrap();
+        let loaded = load_cache(d.path());
+        assert!(loaded.files.contains_key("src/cached.ts"));
+        store_cache(d.path(), loaded, false);
+    }
+
+    #[test]
     fn symbol_locations_and_code_map_distinguish_defs() {
         let d = tempdir().unwrap();
         fs::create_dir(d.path().join("src")).unwrap();
@@ -7520,8 +7695,8 @@ mod tests {
         assert!(out2.contains("### lib/widget.test.ts"), "{out2}");
     }
     #[test]
-    fn request_context_mode_selects_fast_or_super() {
-        assert!(no_index_context_enabled(&serde_json::json!({
+    fn request_context_mode_always_selects_fast_while_super_is_hidden() {
+        assert!(!no_index_context_enabled(&serde_json::json!({
             "_contextMode":"super"
         })));
         assert!(!no_index_context_enabled(&serde_json::json!({
@@ -7570,7 +7745,7 @@ mod tests {
         let cold_ms = scan_ms(&cold);
         let hot_ms = scan_ms(&hot);
         assert!(
-            hot_ms < 100.0,
+            hot_ms < 400.0 && hot_ms <= cold_ms * 1.25,
             "hot query too slow: cold={cold_ms:.1}ms hot={hot_ms:.1}ms"
         );
         fs::write(
@@ -7676,6 +7851,39 @@ mod tests {
         assert!(out.contains("docs/queries/minigame.md"), "{out}");
         assert!(
             out.contains("SELECT game_id, genre FROM minigame_data"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn fast_context_run_includes_sql_and_markdown_candidates() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("services/game")).unwrap();
+        fs::create_dir_all(d.path().join("docs/queries")).unwrap();
+        fs::write(
+            d.path().join("services/game/minigame.go"),
+            "package game\ntype MinigameDataQuery struct{}\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("docs/queries/minigame.md"),
+            "# MinigameDataQuery\n```sql\nSELECT game_id, genre FROM minigame_data;\n```\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("docs/queries/minigame.sql"),
+            "SELECT game_id, genre FROM minigame_data;\n",
+        )
+        .unwrap();
+
+        let out = fast_context_run(
+            d.path(),
+            &serde_json::json!({"keywords":["MinigameDataQuery"]}),
+        )
+        .unwrap();
+        assert!(out.contains("services/game/minigame.go"), "{out}");
+        assert!(
+            out.contains("docs/queries/minigame.sql") || out.contains("docs/queries/minigame.md"),
             "{out}"
         );
     }

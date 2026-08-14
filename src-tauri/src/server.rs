@@ -346,9 +346,8 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
             "context" | "context-retrieval-mode" => {
                 settings.context_retrieval_mode = match value.trim().to_ascii_lowercase().as_str() {
                     "none" => crate::settings::ContextRetrievalMode::None,
-                    "fast" => crate::settings::ContextRetrievalMode::Fast,
-                    "super" => crate::settings::ContextRetrievalMode::Super,
-                    _ => return Err("无效上下文模式：应为 none/fast/super".into()),
+                    "fast" | "super" => crate::settings::ContextRetrievalMode::Fast,
+                    _ => return Err("无效上下文模式：应为 none/fast（super 暂时回退 fast）".into()),
                 }
             }
             "devin-path" => settings.devin_path = value.into(),

@@ -438,7 +438,7 @@ export interface Settings {
   /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
   checkpointEnabled: boolean;
   /** 代码上下文检索模式：无 / 旧 FastContext / 无索引单遍 SuperContext。 */
-  contextRetrievalMode: "none" | "fast" | "super";
+  contextRetrievalMode: "none" | "fast";
   defaultMode: string;
   /** 标题、快速总结、摘要和压缩等辅助任务所用后端 */
   lightweightModelAgent: string;

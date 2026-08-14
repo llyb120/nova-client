@@ -286,10 +286,8 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [checkpointEnabled, setCheckpointEnabled] = createSignal(
     s?.checkpointEnabled ?? false,
   );
-  const [contextRetrievalMode, setContextRetrievalMode] = createSignal<"none" | "fast" | "super">(
-    s?.contextRetrievalMode === "none" || s?.contextRetrievalMode === "fast"
-      ? s.contextRetrievalMode
-      : "super",
+  const [contextRetrievalMode, setContextRetrievalMode] = createSignal<"none" | "fast">(
+    s?.contextRetrievalMode === "none" ? "none" : "fast",
   );
 
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
@@ -1563,19 +1561,15 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <select
                   class="field-input"
                   value={contextRetrievalMode()}
-                  onChange={(e) => {
-                    const value = e.currentTarget.value;
-                    setContextRetrievalMode(
-                      value === "none" || value === "fast" ? value : "super",
-                    );
-                  }}
+                  onChange={(e) =>
+                    setContextRetrievalMode(e.currentTarget.value === "none" ? "none" : "fast")
+                  }
                 >
                   <option value="none">无</option>
-                  <option value="fast">FastContext</option>
-                  <option value="super">SuperContext（默认）</option>
+                  <option value="fast">FastContext（默认）</option>
                 </select>
                 <span class="field-hint">
-                  无：不注入上下文工具；FastContext：使用旧版索引检索；SuperContext：使用无持久化索引的单遍程序切片，明确文件时只读取局部闭包。保存后重启相关 Agent 生效。
+                  FastContext 使用原生常驻服务和增量索引；旧配置中的 SuperContext 会自动回退到 FastContext。保存后重启相关 Agent 生效。
                 </span>
               </label>
 

@@ -3053,6 +3053,11 @@ fn devin_nova_tools_config(
     context_endpoint: &str,
     context_token: &str,
 ) -> Value {
+    let context_mode = if context_mode == "none" {
+        "none"
+    } else {
+        "fast"
+    };
     let enabled = context_mode != "none";
     let mut env = serde_json::Map::new();
     env.insert(
@@ -3242,8 +3247,8 @@ mod nova_tools_config_tests {
         assert_eq!(server["transport"], "stdio");
         assert_eq!(server["env"]["NOVA_TOOLS_CWD"], "D:/repo");
         assert_eq!(server["env"]["NOVA_FAST_CONTEXT"], "1");
-        assert_eq!(server["env"]["NOVA_CONTEXT_RETRIEVAL_MODE"], "super");
-        assert_eq!(server["env"]["NOVA_CONTEXT_NO_INDEX"], "1");
+        assert_eq!(server["env"]["NOVA_CONTEXT_RETRIEVAL_MODE"], "fast");
+        assert_eq!(server["env"]["NOVA_CONTEXT_NO_INDEX"], "0");
         assert_eq!(server["env"]["NOVA_TOOLS_READ_ONLY"], "1");
         assert_eq!(
             server["env"]["NOVA_CONTEXT_SERVICE_ENDPOINT"],

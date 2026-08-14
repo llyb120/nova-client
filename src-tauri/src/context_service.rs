@@ -6,7 +6,6 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
-use tokio::time::timeout;
 
 pub(crate) struct ContextService {
     endpoint: String,
@@ -70,10 +69,16 @@ fn dispatch(request: ContextRequest, token: &str) -> Result<Value, String> {
             request.root
         ));
     }
+    let mut params = request.params;
+    if request.method == "fast_context" {
+        if let Some(object) = params.as_object_mut() {
+            object.insert("_contextMode".into(), Value::String("fast".into()));
+        }
+    }
     let output = match request.method.as_str() {
-        "fast_context" => crate::nova_tools_native::context::fast_context(root, request.params),
-        "find_symbols" => crate::nova_tools_native::context::find_symbols(root, request.params),
-        "code_map" => crate::nova_tools_native::context::code_map(root, request.params),
+        "fast_context" => crate::nova_tools_native::context::fast_context(root, params),
+        "find_symbols" => crate::nova_tools_native::context::find_symbols(root, params),
+        "code_map" => crate::nova_tools_native::context::code_map(root, params),
         _ => Err(format!(
             "unknown context service method: {}",
             request.method
@@ -100,7 +105,15 @@ where
     let mut line = String::new();
     let response = match stream.read_line(&mut line).await {
         Ok(0) => return,
-        Ok(_) if line.len() <= 2 * 1024 * 1024 => response_for_line(line.trim_end(), token),
+        Ok(_) if line.len() <= 2 * 1024 * 1024 => {
+            let line = line.trim_end().to_string();
+            let token = token.to_string();
+            tokio::task::spawn_blocking(move || response_for_line(&line, &token))
+                .await
+                .unwrap_or_else(|error| {
+                    ContextResponse::failure(format!("context worker failed: {error}"))
+                })
+        }
         Ok(_) => ContextResponse::failure("context request too large"),
         Err(error) => ContextResponse::failure(error.to_string()),
     };
@@ -144,8 +157,8 @@ async fn run_server(
             _ = &mut shutdown => return,
             connected = server.connect() => {
                 if connected.is_err() { continue; }
-                // Keep the same serialized execution contract as the former Node service.
-                serve_stream(server, &token).await;
+                let token = token.clone();
+                tokio::spawn(async move { serve_stream(server, &token).await });
             }
         }
     }
@@ -173,7 +186,10 @@ async fn run_server(
         tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => serve_stream(stream, &token).await,
+                Ok((stream, _)) => {
+                    let token = token.clone();
+                    tokio::spawn(async move { serve_stream(stream, &token).await });
+                }
                 Err(_) => break,
             }
         }
@@ -204,8 +220,9 @@ impl ContextService {
         let worker = std::thread::Builder::new()
             .name("nova-context-service".into())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
+                    .worker_threads(2)
                     .build()
                 {
                     Ok(runtime) => runtime,
@@ -226,12 +243,16 @@ impl ContextService {
             .map_err(|e| format!("启动原生 context service 失败：{e}"))?;
 
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(Self {
-                endpoint,
-                token,
-                shutdown: Mutex::new(Some(shutdown_tx)),
-                worker: Mutex::new(Some(worker)),
-            }),
+            Ok(Ok(())) => {
+                std::env::set_var("NOVA_CONTEXT_SERVICE_ENDPOINT", &endpoint);
+                std::env::set_var("NOVA_CONTEXT_SERVICE_TOKEN", &token);
+                Ok(Self {
+                    endpoint,
+                    token,
+                    shutdown: Mutex::new(Some(shutdown_tx)),
+                    worker: Mutex::new(Some(worker)),
+                })
+            }
             Ok(Err(error)) => {
                 let _ = worker.join();
                 Err(error)
@@ -253,86 +274,6 @@ impl ContextService {
     }
 }
 
-#[derive(Deserialize)]
-struct ClientResponse {
-    ok: bool,
-    result: Option<Value>,
-    error: Option<String>,
-}
-
-async fn exchange<S>(stream: S, request: &[u8]) -> Result<String, String>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let mut stream = BufReader::new(stream);
-    stream
-        .get_mut()
-        .write_all(request)
-        .await
-        .map_err(|e| e.to_string())?;
-    stream
-        .get_mut()
-        .write_all(b"\n")
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut line = String::new();
-    stream
-        .read_line(&mut line)
-        .await
-        .map_err(|e| e.to_string())?;
-    let response: ClientResponse =
-        serde_json::from_str(line.trim_end()).map_err(|e| e.to_string())?;
-    if !response.ok {
-        return Err(response
-            .error
-            .unwrap_or_else(|| "context service failed".into()));
-    }
-    response
-        .result
-        .and_then(|value| value.as_str().map(str::to_string))
-        .ok_or_else(|| "context service returned invalid result".into())
-}
-
-/// Native client used by Lyra. Absence, connection failure and timeout are deliberately errors so
-/// the caller can immediately execute the unchanged in-process implementation as its fallback.
-pub(crate) async fn call_configured(
-    method: &str,
-    root: &Path,
-    params: &Value,
-) -> Result<String, String> {
-    let endpoint = std::env::var("NOVA_CONTEXT_SERVICE_ENDPOINT")
-        .map_err(|_| "context service is not configured".to_string())?;
-    let token = std::env::var("NOVA_CONTEXT_SERVICE_TOKEN")
-        .map_err(|_| "context service is not configured".to_string())?;
-    let request = serde_json::to_vec(&serde_json::json!({
-        "token": token,
-        "method": method,
-        "root": root,
-        "params": params,
-    }))
-    .map_err(|e| e.to_string())?;
-
-    let operation = async {
-        #[cfg(windows)]
-        {
-            let stream = tokio::net::windows::named_pipe::ClientOptions::new()
-                .open(&endpoint)
-                .map_err(|e| e.to_string())?;
-            exchange(stream, &request).await
-        }
-        #[cfg(unix)]
-        {
-            let stream = tokio::net::UnixStream::connect(&endpoint)
-                .await
-                .map_err(|e| e.to_string())?;
-            exchange(stream, &request).await
-        }
-    };
-    timeout(Duration::from_secs(120), operation)
-        .await
-        .map_err(|_| format!("context service timed out: {method}"))?
-}
-
 impl Drop for ContextService {
     fn drop(&mut self) {
         if let Ok(shutdown) = self.shutdown.get_mut() {
@@ -348,6 +289,8 @@ impl Drop for ContextService {
         if !cfg!(windows) {
             let _ = std::fs::remove_file(&self.endpoint);
         }
+        std::env::remove_var("NOVA_CONTEXT_SERVICE_ENDPOINT");
+        std::env::remove_var("NOVA_CONTEXT_SERVICE_TOKEN");
     }
 }
 
