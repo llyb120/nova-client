@@ -142,7 +142,6 @@ pub fn tool_set(read_only: bool, fast_context: bool, memory_enabled: bool) -> Ve
         });
     }
 
-
     if memory_enabled {
         tools.push(Tool {
             name: "feedback_memory",
@@ -479,7 +478,8 @@ async fn execute_inner(
 ) -> ToolOutcome {
     match name {
         "fast_context" => {
-            let root = root.to_path_buf();
+            let code_root = root.to_path_buf();
+            let memory_root = root.to_path_buf();
             let mut args = args.clone();
             if let Some(object) = args.as_object_mut() {
                 let raw = object.get("keywords").cloned().unwrap_or(Value::Null);
@@ -498,30 +498,91 @@ async fn execute_inner(
                     .collect();
                 object.insert("keywords".into(), Value::Array(keywords));
             }
-            let memory_query = args.get("task").and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
-                .or_else(|| args.get("keywords").and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")))
+            let memory_query = args
+                .get("task")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    args.get("keywords")
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                })
                 .unwrap_or_default();
             // 代码上下文与训练知识是独立数据源，同轮并行，附加召回不会串行拖慢 fast_context。
-            let code_job = tokio::task::spawn_blocking(move || crate::nova_tools_native::context::fast_context(&root, args));
+            let code_job = tokio::task::spawn_blocking(move || {
+                crate::nova_tools_native::context::fast_context(&code_root, args)
+            });
             let memory_job = tokio::task::spawn_blocking(move || {
-                let enabled = crate::settings::Settings::load(&crate::lyra::config::nova_root()).experience_training_enabled;
-                if !enabled || memory_query.is_empty() { None } else { crate::experience::load_trained_memory(&memory_query, 8).ok() }
+                let enabled = crate::settings::Settings::load(&crate::lyra::config::nova_root())
+                    .experience_training_enabled;
+                if !enabled || memory_query.is_empty() {
+                    None
+                } else {
+                    crate::experience::load_trained_memory(
+                        &memory_root.to_string_lossy(),
+                        &memory_query,
+                        8,
+                    )
+                    .ok()
+                }
             });
             let (code_result, memory_result) = tokio::join!(code_job, memory_job);
             match code_result {
                 Ok(Ok(text)) => {
                     let mut text = clamp_tool_output_text(&text);
                     let memory = memory_result.ok().flatten();
-                    if let Some(rows) = memory.as_ref().and_then(|value| value.get("experiences")).and_then(Value::as_array).filter(|rows| !rows.is_empty()) {
-                        let rendered = rows.iter().map(|item| {
-                            let id = item.get("id").and_then(Value::as_str).unwrap_or("");
-                            let kind = item.get("kind").and_then(Value::as_str).unwrap_or("experience");
-                            let trigger = item.get("trigger").and_then(Value::as_str).unwrap_or("");
-                            let action = item.get("action").and_then(Value::as_str).unwrap_or("");
-                            format!("- [{kind}] id={id} 条件/上下文：{trigger}\n  内容：{action}")
-                        }).collect::<Vec<_>>().join("\n");
-                        let activated = memory.as_ref().and_then(|value| value.get("activatedExperts")).cloned().unwrap_or_else(|| json!([]));
-                        text.push_str(&format!("\n\n# TRAINED KNOWLEDGE\nactivatedExperts={activated}\n{rendered}\n# FEEDBACK REQUIRED\n最终回复前调用 feedback_memory；采用并验证用 ±1，未采用或无法验证用 0。"));
+                    if let Some(rows) = memory
+                        .as_ref()
+                        .and_then(|value| value.get("experiences"))
+                        .and_then(Value::as_array)
+                        .filter(|rows| !rows.is_empty())
+                    {
+                        let rendered = rows
+                            .iter()
+                            .map(|item| {
+                                let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                                let kind = item
+                                    .get("kind")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("experience");
+                                let knowledge_scope = item
+                                    .get("knowledgeScope")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("project");
+                                let scope_label = if knowledge_scope == "universal" {
+                                    "泛用"
+                                } else {
+                                    "项目独有"
+                                };
+                                let trigger =
+                                    item.get("trigger").and_then(Value::as_str).unwrap_or("");
+                                let action =
+                                    item.get("action").and_then(Value::as_str).unwrap_or("");
+                                format!(
+                                    "- [{scope_label}/{kind}] id={id} 条件/上下文：{trigger}\n  内容：{action}"
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let activated = memory
+                            .as_ref()
+                            .and_then(|value| value.get("activatedExperts"))
+                            .cloned()
+                            .unwrap_or_else(|| json!([]));
+                        let project_root = memory
+                            .as_ref()
+                            .and_then(|value| value.get("projectRoot"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        text.push_str(&format!("\n\n# TRAINED KNOWLEDGE\nprojectRoot={project_root}\nactivatedExperts={activated}\n{rendered}\n# FEEDBACK REQUIRED\n最终回复前调用 feedback_memory；采用并验证用 ±1，未采用或无法验证用 0。"));
                     }
                     ToolOutcome::text(text)
                 }
@@ -657,13 +718,27 @@ async fn execute_inner(
             }
         }
         "feedback_memory" => {
-            let ids = args.get("experienceIds").and_then(Value::as_array).map(|items| {
-                items.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()
-            }).unwrap_or_default();
+            let ids = args
+                .get("experienceIds")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let reward = args.get("reward").and_then(Value::as_f64).unwrap_or(0.0);
             let note = args.get("note").and_then(Value::as_str).unwrap_or_default();
             let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
-            match crate::experience::feedback_memory(&ids, reward, note, &settings.experience_experts) {
+            match crate::experience::feedback_memory(
+                &root.to_string_lossy(),
+                &ids,
+                reward,
+                note,
+                &settings.experience_experts,
+            ) {
                 Ok(value) => ToolOutcome::text(value.to_string()),
                 Err(error) => ToolOutcome::error(error),
             }

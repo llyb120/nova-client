@@ -1,8 +1,26 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
+
+const execFileAsync = promisify(execFile);
+
+async function projectIdentity(cwd) {
+  let root = resolve(String(cwd || process.cwd()));
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir"], { windowsHide: true });
+    const common = resolve(root, stdout.trim());
+    if (basename(common) === ".git") root = dirname(common);
+  } catch {
+    root = await realpath(root).catch(() => root);
+  }
+  let key = root.replaceAll("\\", "/").replace(/\/$/, "");
+  if (process.platform === "win32") key = key.toLowerCase();
+  return { key, root };
+}
 
 function novaRoot(env = process.env) {
   return env.NOVA_DATA_DIR || join(homedir(), ".nova");
@@ -35,9 +53,15 @@ function textResult(value) {
 
 async function loadTrainedMemory(params) {
   const query = terms(params?.query);
+  const cwd = String(params?.cwd ?? process.cwd());
   const limit = Math.max(1, Math.min(12, Number(params?.limit) || 8));
   const store = await loadStore();
-  const rows = (store.experiences ?? [])
+  const { key, root } = await projectIdentity(cwd);
+  const universal = (store.universalExperiences ?? store.universal_experiences ?? [])
+    .filter((entry) => (entry.knowledgeScope ?? entry.knowledge_scope) === "universal");
+  const project = (store.projects?.[key]?.experiences ?? [])
+    .filter((entry) => (entry.knowledgeScope ?? entry.knowledge_scope ?? "project") !== "universal");
+  const rows = [...universal, ...project]
     .filter((entry) => entry.status !== "quarantined")
     .map((entry) => ({ entry, relevance: relevance(query, entry) }))
     .filter((row) => row.relevance > 0)
@@ -55,7 +79,8 @@ async function loadTrainedMemory(params) {
     if (!selectedExperts.includes(expertId) || (counts.get(expertId) ?? 0) >= 3) continue;
     counts.set(expertId, (counts.get(expertId) ?? 0) + 1);
     experiences.push({
-      id: entry.id, expertId, kind: entry.kind ?? "experience", trigger: entry.trigger,
+      id: entry.id, expertId, kind: entry.kind ?? "experience",
+      knowledgeScope: entry.knowledgeScope ?? entry.knowledge_scope ?? "project", trigger: entry.trigger,
       action: entry.action, avoid: entry.avoid ?? "", scope: entry.scope ?? [],
       confidence: entry.confidence ?? 0, utility: entry.utility ?? 0,
     });
@@ -63,37 +88,38 @@ async function loadTrainedMemory(params) {
   }
   return textResult({
     activatedExperts: selectedExperts,
+    projectRoot: root,
     experiences,
-    instruction: "memory 是可参考事实，rule 是强约束，experience 仅在触发条件匹配时参考；当前会话事实始终优先。",
+    instruction: "knowledgeScope=universal 的知识可跨项目使用；knowledgeScope=project 的知识只适用于当前 projectRoot。memory 是可参考事实，rule 是强约束，experience 仅在触发条件匹配时参考；当前会话事实始终优先。",
   });
 }
 
-export async function appendTrainedKnowledge(codeText, params) {
+export async function appendTrainedKnowledge(codeText, params, cwd = process.cwd()) {
   if (process.env.NOVA_EXPERIENCE_TOOLS !== "1") return String(codeText ?? "");
   const query = String(params?.task ?? "").trim()
     || (Array.isArray(params?.keywords) ? params.keywords.join(" ") : String(params?.keywords ?? "")).trim();
   if (!query) return String(codeText ?? "");
-  const result = await loadTrainedMemory({ query, limit: 8 });
+  const result = await loadTrainedMemory({ query, limit: 8, cwd });
   const memory = JSON.parse(result.content[0].text);
   if (!memory.experiences?.length) return String(codeText ?? "");
   const rendered = memory.experiences.map((item) =>
-    `- [${item.kind}] id=${item.id} 条件/上下文：${item.trigger}\n  内容：${item.action}`).join("\n");
-  return `${String(codeText ?? "")}\n\n# TRAINED KNOWLEDGE\nactivatedExperts=${JSON.stringify(memory.activatedExperts)}\n${rendered}\n# FEEDBACK REQUIRED\n最终回复前调用 feedback_memory；采用并验证用 ±1，未采用或无法验证用 0。`;
+    `- [${item.knowledgeScope === "universal" ? "泛用" : "项目独有"}/${item.kind}] id=${item.id} 条件/上下文：${item.trigger}\n  内容：${item.action}`).join("\n");
+  return `${String(codeText ?? "")}\n\n# TRAINED KNOWLEDGE\nprojectRoot=${memory.projectRoot}\nactivatedExperts=${JSON.stringify(memory.activatedExperts)}\n${rendered}\n# FEEDBACK REQUIRED\n最终回复前调用 feedback_memory；采用并验证用 ±1，未采用或无法验证用 0。`;
 }
 
 
-async function feedbackMemory(params) {
+async function feedbackMemory(params, cwd = process.cwd()) {
   const experienceIds = Array.isArray(params?.experienceIds) ? params.experienceIds.map(String).filter(Boolean) : [];
   const reward = Math.max(-1, Math.min(1, Number(params?.reward) || 0));
   if (!experienceIds.length && reward !== 0) throw new Error("feedback_memory 非零反馈必须提供 experienceIds");
   const inbox = join(novaRoot(), "experience-feedback-inbox");
   await mkdir(inbox, { recursive: true });
-  const payload = { experienceIds, reward, note: String(params?.note ?? ""), createdAt: Date.now(), source: "vega" };
+  const payload = { cwd, experienceIds, reward, note: String(params?.note ?? ""), createdAt: Date.now(), source: "vega" };
   await writeFile(join(inbox, `${Date.now()}-${randomUUID()}.json`), JSON.stringify(payload), "utf8");
   return textResult({ queued: true, updated: experienceIds.length, reward });
 }
 
-export function createExperienceTools() {
+export function createExperienceTools(currentRoot = () => process.cwd()) {
   if (process.env.NOVA_EXPERIENCE_TOOLS !== "1") return [];
   return [{
     name: "feedback_memory",
@@ -103,6 +129,6 @@ export function createExperienceTools() {
       reward: Type.Number({ minimum: -1, maximum: 1, description: "-1 明确有害，0 无法判断或未采用，1 明确有效" }),
       note: Type.String({ description: "成功、失败、不采用或无法验证的依据" }),
     }),
-    async execute(_id, params) { return feedbackMemory(params); },
+    async execute(_id, params) { return feedbackMemory(params, currentRoot()); },
   }];
 }

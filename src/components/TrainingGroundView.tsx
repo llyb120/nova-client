@@ -1,7 +1,9 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
+import { setTrainingProject, state } from "../store";
 import type { ExperienceEntry } from "../types";
+import { ProjectPicker } from "./ProjectPicker";
 
 function fmtTime(ts: number) {
   return ts ? new Date(ts).toLocaleString("zh-CN") : "尚未训练";
@@ -45,7 +47,8 @@ const starLooks: Record<string, { scale: number; tint: string; glow: string }> =
 };
 
 export function TrainingGroundView() {
-  const [overview, { refetch }] = createResource(api.listExperiences);
+  const projectCwd = () => state.trainingCwd;
+  const [overview, { refetch }] = createResource(projectCwd, api.listExperiences);
   const [busy, setBusy] = createSignal(false);
   const [evolutionStatus, setEvolutionStatus] = createSignal("");
   const experts = createMemo(() => {
@@ -190,7 +193,7 @@ export function TrainingGroundView() {
     if (busy()) return;
     setBusy(true);
     try {
-      await api.trainExperience();
+      await api.trainExperience(projectCwd());
       await refetch();
     } catch (error) {
       await message(String(error), { kind: "error" });
@@ -204,7 +207,7 @@ export function TrainingGroundView() {
     setBusy(true);
     setEvolutionStatus("正在生成并审核本代经验…");
     try {
-      const result = await api.evolveExperiences();
+      const result = await api.evolveExperiences(projectCwd());
       await refetch();
       setEvolutionStatus(`第 ${result.generation} 代：审核 ${result.reviewed} 条，形成 ${result.created} 条新经验，去重 ${result.rejected} 条`);
     } catch (error) {
@@ -216,7 +219,7 @@ export function TrainingGroundView() {
 
   const vote = async (id: string, reward: number) => {
     try {
-      await api.feedbackExperience(id, reward);
+      await api.feedbackExperience(projectCwd(), id, reward);
       await refetch();
     } catch (error) {
       await message(String(error), { kind: "error" });
@@ -225,7 +228,7 @@ export function TrainingGroundView() {
 
   const remove = async (id: string) => {
     try {
-      await api.deleteExperience(id);
+      await api.deleteExperience(projectCwd(), id);
       await refetch();
     } catch (error) {
       await message(String(error), { kind: "error" });
@@ -240,7 +243,8 @@ export function TrainingGroundView() {
           <div class="training-intro">
             <span class="training-eyebrow">EXPERIENCE CONSTELLATION</span>
             <h1>大熊座</h1>
-            <p>从真实会话中提炼可复用经验。训练数据独立保存，不会改写客观记忆或员工守则。</p>
+            <p>当前项目：{overview()?.projectRoot ?? projectCwd()}。训练经验、记忆和守则按项目独立保存；同一仓库的 worktree 共享同一份。</p>
+            <ProjectPicker value={projectCwd()} onChange={setTrainingProject} ownOnly />
           </div>
           <div class="training-actions">
             <Show when={evolutionStatus()}><span class="evolution-status" role="status">{evolutionStatus()}</span></Show>
@@ -334,7 +338,7 @@ export function TrainingGroundView() {
                         <For each={selected()[2]} fallback={<div class="expert-empty">该专家尚未产出经验</div>}>
                           {(entry) => (
                             <article classList={{ "experience-card": true, quarantined: entry.status === "quarantined", [`kind-${entry.kind}`]: true }}>
-                              <div class="experience-topline"><span class={`experience-condition kind-${entry.kind}`}>{kindLabel(entry.kind)}</span><span class="experience-date">更新于 {fmtDate(entry.updatedAt)}</span></div>
+                              <div class="experience-topline"><span class={`experience-condition kind-${entry.kind}`}>{kindLabel(entry.kind)}</span><span class="experience-condition">{entry.knowledgeScope === "universal" ? "泛用" : "项目独有"}</span><span class="experience-date">更新于 {fmtDate(entry.updatedAt)}</span></div>
                               <Show when={entry.trigger}><div class="experience-trigger">{entry.trigger}</div></Show>
                               <div class="experience-action">{entry.action}</div>
                               <Show when={entry.avoid}><div class="experience-avoid"><span>避免</span>{entry.avoid}</div></Show>

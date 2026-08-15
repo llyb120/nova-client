@@ -28,6 +28,7 @@ import {
   resolveEnabledAgentKind,
   roamingPeers,
   sendPrompt,
+  setTrainingProject,
   setView,
   state,
   stashWorktreePrompt,
@@ -631,7 +632,8 @@ export function HomeView() {
       if (busy()) return;
       setBusy(true);
       try {
-        const result = await api.trainExperience();
+        setTrainingProject(cwd());
+        const result = await api.trainExperience(cwd());
         setText("");
         setSlashStart(null);
         setView("training");

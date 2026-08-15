@@ -515,6 +515,8 @@ export interface ExperienceEntry {
   id: string;
   expertId: string;
   kind: "experience" | "memory" | "rule";
+  /** universal = 泛用；project = 仅当前项目。 */
+  knowledgeScope: "universal" | "project";
   trigger: string;
   action: string;
   avoid: string;
@@ -550,6 +552,8 @@ export interface ExperienceExpertRef {
 }
 
 export interface ExperienceOverview {
+  /** 当前项目根；同一 Git 仓库的 worktree 会归一到主工作树。 */
+  projectRoot: string;
   experiences: ExperienceEntry[];
   /** 全部已配置专家；即使尚未产出知识也会返回。 */
   experts: ExperienceExpertRef[];

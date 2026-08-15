@@ -489,7 +489,7 @@ export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
         const root = currentRoot();
         // 代码上下文与训练知识同轮返回；模型不需要再调用独立的 load 工具。
         const codeText = await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
-        return textResult(await appendTrainedKnowledge(codeText, args));
+        return textResult(await appendTrainedKnowledge(codeText, args, root));
       },
     },
     {
@@ -807,7 +807,7 @@ export async function createAlkaidAgent(options = {}) {
     },
   }));
   const batchTools = createFilesystemTools(cwd, null, { workingDirectory });
-  const rawTools = [...batchTools, ...codingTools, ...createExperienceTools(), ...mcp.tools];
+  const rawTools = [...batchTools, ...codingTools, ...createExperienceTools(() => workingDirectory.cwd), ...mcp.tools];
   const archiveDir = options.sessionId
     ? join(alkaidDataRoot(), "tool-results", safeArchiveSegment(options.sessionId))
     : undefined;

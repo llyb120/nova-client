@@ -3403,36 +3403,36 @@ async fn get_slash_commands(
 }
 
 #[tauri::command]
-fn list_experiences(state: State<'_, AppState>) -> Result<Value, String> {
+fn list_experiences(state: State<'_, AppState>, cwd: String) -> Result<Value, String> {
     let configs = state
         .settings
         .lock()
         .unwrap()
         .experience_experts
         .clone();
-    experience::list_memory(&configs)
+    experience::list_memory(&cwd, &configs)
 }
 
 #[tauri::command]
-fn feedback_experience(state: State<'_, AppState>, experience_id: String, reward: f64) -> Result<Value, String> {
+fn feedback_experience(state: State<'_, AppState>, cwd: String, experience_id: String, reward: f64) -> Result<Value, String> {
     let settings = state.settings.lock().unwrap().clone();
     let requested = if reward > 0.0 { 1 } else { -1 };
-    experience::set_user_feedback(&experience_id, requested, &settings.experience_experts)
+    experience::set_user_feedback(&cwd, &experience_id, requested, &settings.experience_experts)
 }
 
 #[tauri::command]
-fn delete_experience(experience_id: String) -> Result<Value, String> {
-    experience::delete_memory(&experience_id)
+fn delete_experience(cwd: String, experience_id: String) -> Result<Value, String> {
+    experience::delete_memory(&cwd, &experience_id)
 }
 
 #[tauri::command]
-async fn evolve_experiences(app: tauri::AppHandle) -> Result<Value, String> {
-    experience::evolve_memory(&app).await
+async fn evolve_experiences(app: tauri::AppHandle, cwd: String) -> Result<Value, String> {
+    experience::evolve_memory(&app, &cwd).await
 }
 
 #[tauri::command]
-async fn train_experience(app: tauri::AppHandle) -> Result<Value, String> {
-    experience::train(&app, true).await
+async fn train_experience(app: tauri::AppHandle, cwd: String) -> Result<Value, String> {
+    experience::train(&app, &cwd, true).await
 }
 
 #[tauri::command]

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { appendTrainedKnowledge } from "./alkaid-experience-tools.mjs";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { createCodingTools, createReadOnlyTools } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js";
@@ -46,6 +48,8 @@ import {
   restoreAlkaidSteeringForRetry,
   runAlkaidPromptWithRetry,
 } from "./alkaid-core.mjs";
+
+const execFileAsync = promisify(execFile);
 
 const configuredModel = {
   id: "gpt-test",
@@ -212,6 +216,49 @@ test("bridge export uses local config and resolves env secrets for quota sharing
   assert.equal(shared.provider.shared.models["server-model"], undefined);
   assert.equal(shared.root, undefined);
   assert.equal(shared.env, undefined);
+});
+
+test("Vega trained knowledge includes universal plus current project only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "nova-experience-scope-"));
+  const projectA = join(root, "a");
+  const projectB = join(root, "b");
+  const data = join(root, "data");
+  const previousData = process.env.NOVA_DATA_DIR;
+  const previousEnabled = process.env.NOVA_EXPERIENCE_TOOLS;
+  try {
+    for (const project of [projectA, projectB]) {
+      await mkdir(project, { recursive: true });
+      await execFileAsync("git", ["-C", project, "init", "-q"]);
+    }
+    await mkdir(data, { recursive: true });
+    const key = (path) => path.replaceAll("\\", "/").replace(/\/$/, "").toLowerCase();
+    await writeFile(join(data, "experience_memory.json"), JSON.stringify({
+      universalExperiences: [{ id: "universal", expertId: "fast", knowledgeScope: "universal", kind: "memory", trigger: "shared", action: "universal-token", scope: [], status: "candidate" }],
+      projects: {
+        [key(projectA)]: { experiences: [{ id: "project-a", expertId: "fast", knowledgeScope: "project", kind: "memory", trigger: "local", action: "project-a-token", scope: [], status: "candidate" }] },
+        [key(projectB)]: { experiences: [{ id: "project-b", expertId: "fast", knowledgeScope: "project", kind: "memory", trigger: "local", action: "project-b-token", scope: [], status: "candidate" }] },
+      },
+    }), "utf8");
+    process.env.NOVA_DATA_DIR = data;
+    process.env.NOVA_EXPERIENCE_TOOLS = "1";
+    const query = { task: "universal-token project-a-token project-b-token" };
+    const a = await appendTrainedKnowledge("CTX", query, projectA);
+    const b = await appendTrainedKnowledge("CTX", query, projectB);
+    assert.match(a, /id=universal/);
+    assert.match(a, /id=project-a/);
+    assert.doesNotMatch(a, /id=project-b/);
+    assert.match(b, /id=universal/);
+    assert.match(b, /id=project-b/);
+    assert.doesNotMatch(b, /id=project-a/);
+    assert.match(a, /泛用\/memory/);
+    assert.match(a, /项目独有\/memory/);
+  } finally {
+    if (previousData === undefined) delete process.env.NOVA_DATA_DIR;
+    else process.env.NOVA_DATA_DIR = previousData;
+    if (previousEnabled === undefined) delete process.env.NOVA_EXPERIENCE_TOOLS;
+    else process.env.NOVA_EXPERIENCE_TOOLS = previousEnabled;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("PI coding tools provide read, bash, edit and write", async () => {

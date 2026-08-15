@@ -1,7 +1,7 @@
 //! Git worktree 操作：为会话创建/移除独立工作目录 + 分支，隔离执行不干扰主工作区。
 //! 全部通过命令行 git 实现（依赖用户已安装 git 且在 PATH 中）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Windows 下不弹出控制台窗口
@@ -48,21 +48,54 @@ pub fn is_repo(dir: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 返回 dir 所属仓库的根目录（顶层工作树）
+/// 返回 dir 所属仓库的根目录（当前工作树顶层）。
 pub fn repo_root(dir: &str) -> Result<String, String> {
     let root = run(dir, &["rev-parse", "--show-toplevel"])?;
     if root.is_empty() {
         return Err("不是 git 仓库".into());
     }
-    // git 统一返回正斜杠，Windows 下规范化为反斜杠，避免与本地路径比较不一致
+    Ok(normalize_git_path(root))
+}
+
+fn normalize_git_path(path: String) -> String {
     #[cfg(windows)]
     {
-        Ok(root.replace('/', "\\"))
+        path.replace('/', "\\")
     }
     #[cfg(not(windows))]
     {
-        Ok(root)
+        path
     }
+}
+
+/// 返回用于项目级数据隔离的稳定根目录。
+/// 普通仓库返回自身根；linked worktree 通过 commondir 归一到主工作树，
+/// 因而同一仓库的所有 worktree 共用同一个项目身份。
+pub fn project_root(dir: &str) -> Result<String, String> {
+    let worktree_root = repo_root(dir)?;
+    let common_dir = run(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .or_else(|_| run(dir, &["rev-parse", "--git-common-dir"]))?;
+    if common_dir.is_empty() {
+        return Ok(worktree_root);
+    }
+    let common_dir = PathBuf::from(normalize_git_path(common_dir));
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        Path::new(dir).join(common_dir)
+    };
+    let common_dir = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
+    if common_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
+        return Ok(worktree_root);
+    }
+    let Some(root) = common_dir.parent() else {
+        return Ok(worktree_root);
+    };
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 /// 校验分支名是否合法（交给 git check-ref-format 判定）
@@ -219,4 +252,52 @@ pub fn remove(repo: &str, path: &str) -> Result<(), String> {
 pub fn delete_branch(repo: &str, branch: &str) -> Result<(), String> {
     run(repo, &["branch", "-D", branch])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_root;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn linked_worktree_uses_the_main_worktree_as_project_root() {
+        let temp = std::env::temp_dir().join(format!("nova-project-root-{}", uuid::Uuid::new_v4()));
+        let main = temp.join("main");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "test@example.com"]);
+        git(&main, &["config", "user.name", "test"]);
+        fs::write(main.join("a.txt"), "a").unwrap();
+        git(&main, &["add", "a.txt"]);
+        git(&main, &["commit", "-qm", "init"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                &worktree.to_string_lossy(),
+            ],
+        );
+
+        let main_root = project_root(&main.to_string_lossy()).unwrap();
+        let worktree_root = project_root(&worktree.to_string_lossy()).unwrap();
+        assert_eq!(main_root, worktree_root);
+        let _ = fs::remove_dir_all(temp);
+    }
 }

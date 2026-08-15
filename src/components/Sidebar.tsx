@@ -12,6 +12,7 @@ import {
   openNewSession,
   openThread,
   pendingDecisionCount,
+  setTrainingProject,
   setView,
   state,
 } from "../store";
@@ -115,7 +116,16 @@ export function Sidebar(props: {
   const openClues = () => switchView("clues");
   const openEmployees = () => switchView("employees");
   const openWorkbench = () => switchView("workbench");
-  const openTraining = () => switchView("training");
+  const openTraining = () => {
+    const recent = state.threads.find((thread) => !thread.experienceThread && !thread.employeeId);
+    const cwd = recent?.worktree?.repo || recent?.cwd || state.projects[0]?.worktree?.repo || state.projects[0]?.path || "";
+    if (!cwd) {
+      void message("请先创建或选择一个项目，再打开大熊座。", { kind: "info" });
+      return;
+    }
+    setTrainingProject(cwd);
+    switchView("training");
+  };
   const openWorkflows = () => switchView("workflows");
 
   // 数字员工（配置）/ 御书房（日常）视图下，左侧切换为「员工会话」这一卷。
@@ -125,6 +135,7 @@ export function Sidebar(props: {
   const openHistoryThread = async (id: string) => {
     const thread = state.threads.find((item) => item.id === id);
     // 猎户座会话保持猎户座 tab；其它历史会话回到普通模式。
+    if (thread?.experienceThread) setTrainingProject(thread.worktree?.repo || thread.cwd);
     setView(thread?.experienceThread ? "training" : "home");
     await openThread(id);
   };

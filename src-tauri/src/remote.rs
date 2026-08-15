@@ -945,6 +945,9 @@ fn eligible(t: &Thread) -> bool {
     t.roaming_role.is_none()
         && t.employee_id.is_none()
         && !t.mind_thread
+        // 猎户座的经验训练与世代演进会话只在本地训练视图展示，
+        // 不进入网页端最近会话，也不上传目录、元数据或会话内容。
+        && !t.experience_thread
         && crate::server::path_allowed(&t.cwd)
 }
 
@@ -1524,6 +1527,24 @@ mod tests {
         let mut starred = meta;
         starred.starred = true;
         assert_ne!(before, catalog_signature_for(&[starred]));
+    }
+
+    #[test]
+    fn experience_threads_are_never_eligible_for_remote_sync() {
+        let mut thread = Thread::new(
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            AgentKind::Lyra,
+            None,
+            None,
+            None,
+            false,
+        );
+        thread.experience_thread = true;
+
+        assert!(!eligible(&thread));
     }
 
     #[test]

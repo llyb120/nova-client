@@ -115,6 +115,8 @@ interface AppStore {
   /** Plan 模式产出的 proposed plan：非空时展示「实施此计划」选项 */
   proposedPlan: string | null;
   cwd: string;
+  /** 大熊座当前项目；切换视图时保留，worktree 由后端归一到主仓库。 */
+  trainingCwd: string;
   title: string;
   /** 当前线程的模型/模式（"" = 默认） */
   agentKind: AgentKind;
@@ -183,6 +185,7 @@ export const [state, setState] = createStore<AppStore>({
   plan: null,
   proposedPlan: null,
   cwd: "",
+  trainingCwd: "",
   title: "",
   agentKind: "devin",
   model: "",
@@ -715,6 +718,10 @@ export function setView(view: "home" | "clues" | "employees" | "workbench" | "wo
   setState("view", view);
 }
 
+export function setTrainingProject(cwd: string) {
+  setState("trainingCwd", cwd);
+}
+
 export function clueCurrentVersion(card: ClueCard) {
   return card.versions.find((version) => version.id === card.currentVersionId) ?? card.versions.at(-1);
 }
@@ -1171,9 +1178,8 @@ function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileIte
         ? thread.roamingPeer ?? null
         : thread.quotaPeer ?? null,
     loadingThread,
-    // 快照替换 items 后，进行中的实时用量一律作废：若该会话正在跑，下一条流式
-    // usage 事件会重新填上；若已结束，Turn 项本身就是最终值。
-    liveUsage: null,
+    // 运行中切回会话时恢复此前收到的 usage；结束会话仍以 Turn 项的最终值为准。
+    liveUsage: state.running[thread.id] ? (liveUsageByThread.get(thread.id) ?? null) : null,
   });
 }
 
