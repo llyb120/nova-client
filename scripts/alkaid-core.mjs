@@ -456,9 +456,12 @@ export function decodeTextBuffer(buffer) {
 
 export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
   const fastContext = opts.fastContext !== false && process.env.NOVA_FAST_CONTEXT !== "0";
+  const autoChangeProject = opts.autoChangeProject !== false
+    && process.env.NOVA_AUTO_CHANGE_PROJECT !== "0";
   const workingDirectory = opts.workingDirectory ?? { cwd: resolve(cwd) };
   const currentRoot = () => resolve(workingDirectory.cwd);
-  const tools = [{
+  const tools = [];
+  if (autoChangeProject) tools.push({
     name: "change_working_directory",
     description: "改变本会话后续工具调用的工作目录，并通知 Nova 切换到已有项目或自动创建项目。相对路径基于当前工作目录解析；目录必须已存在。请单独调用，不要与依赖新目录的工具并行调用。",
     parameters: Type.Object({ path: Type.String({ description: "新的工作目录（相对当前工作目录或绝对路径）" }) }),
@@ -471,7 +474,7 @@ export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
       workingDirectory.cwd = next;
       return textResult(`Current working directory: ${next}`, { workingDirectory: next });
     },
-  }];
+  });
   if (fastContext) tools.push(
     {
       name: "fast_context",
@@ -585,8 +588,10 @@ export function buildAlkaidSystemPrompt(options = {}) {
   const cwd = (options.cwd ?? process.cwd()).replace(/\\/g, "/");
   const skills = options.skills ?? [];
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
+  const autoChangeProject = options.autoChangeProject !== false
+    && process.env.NOVA_AUTO_CHANGE_PROJECT !== "0";
   const toolLines = [
-    "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
+    autoChangeProject ? "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目" : null,
     "- read: 读取单个文件",
     options.readOnly
       ? "- grep / find / ls: 只读搜索与列举"
@@ -606,7 +611,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
         + (fastContext
           ? "任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（只要定义/引用行号时用 find_symbols）；一次调用通常替代 5–10 轮 rg+read 往返。拿不准是否涉及多个文件、或只是先分析要改哪里而不写代码时，同样按涉及处理，先调用 fast_context。find_symbols 只用于拿行号；定位后仍需阅读两个及以上文件正文时，把文件清单传给 fast_context 的 files 一次打包，不要逐个 read。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
           : "未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；")
-        + `大文件禁止无目的全量读取。需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。`,
+        + `大文件禁止无目的全量读取。${autoChangeProject ? "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" : ""}修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。`,
       (fastContext
         ? "搜索与遍历必须成本有界。路径和行段已明确且只需少量行段时直接 read；任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返），只要定义/引用位置时用 find_symbols。fast_context 已展示范围视为已读；SIG/IMPACT 仅在确需函数体时精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调；返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
         : "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。")
@@ -806,7 +811,10 @@ export async function createAlkaidAgent(options = {}) {
       return tool.execute(toolCallId, params, signal, onUpdate);
     },
   }));
-  const batchTools = createFilesystemTools(cwd, null, { workingDirectory });
+  const batchTools = createFilesystemTools(cwd, null, {
+    workingDirectory,
+    autoChangeProject: options.autoChangeProject,
+  });
   const rawTools = [...batchTools, ...codingTools, ...createExperienceTools(() => workingDirectory.cwd), ...mcp.tools];
   const archiveDir = options.sessionId
     ? join(alkaidDataRoot(), "tool-results", safeArchiveSegment(options.sessionId))
@@ -833,6 +841,7 @@ export async function createAlkaidAgent(options = {}) {
     skills,
     readOnly: options.readOnly,
     shellConfig,
+    autoChangeProject: options.autoChangeProject,
     systemPrompt: customInstructions,
   });
   const sessionId = options.sessionId;

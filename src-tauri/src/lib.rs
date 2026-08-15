@@ -4163,6 +4163,7 @@ async fn apply_runtime_settings(
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
     let (
         restart_vega,
+        restart_lyra,
         restart_devin,
         restart_codebuddy,
         restart_claudecode,
@@ -4176,6 +4177,8 @@ async fn apply_runtime_settings(
         let mut s = state.settings.lock().unwrap();
         let context_runtime_changed = s.context_retrieval_mode != settings.context_retrieval_mode;
 
+        let auto_change_project_changed =
+            s.auto_change_project_enabled != settings.auto_change_project_enabled;
         let experience_tools_changed = s.experience_training_enabled != settings.experience_training_enabled;
         if context_runtime_changed || experience_tools_changed {
             settings.apply_context_retrieval_environment();
@@ -4183,9 +4186,16 @@ async fn apply_runtime_settings(
         let restart_vega = restart_all_agents
             || context_runtime_changed
             || experience_tools_changed
+            || auto_change_project_changed
             || s.vega_proxy != settings.vega_proxy
             || s.vega_context_mode != settings.vega_context_mode
             || s.vega_enabled != settings.vega_enabled;
+        let restart_lyra = restart_all_agents
+            || context_runtime_changed
+            || experience_tools_changed
+            || auto_change_project_changed
+            || s.vega_proxy != settings.vega_proxy
+            || s.lyra_enabled != settings.lyra_enabled;
         let restart_devin = restart_all_agents
             || context_runtime_changed
             || s.devin_path != settings.devin_path
@@ -4210,6 +4220,7 @@ async fn apply_runtime_settings(
             || s.cursor_path != settings.cursor_path
             || s.cursor_proxy != settings.cursor_proxy
             || s.cursor_sdk_api_key != settings.cursor_sdk_api_key
+            || s.cursor_disable_subagents != settings.cursor_disable_subagents
             || s.cursor_model_contexts != settings.cursor_model_contexts
             || s.cursor_context_mode != settings.cursor_context_mode
             || s.cursor_enabled != settings.cursor_enabled;
@@ -4239,6 +4250,7 @@ async fn apply_runtime_settings(
         }
         (
             restart_vega,
+            restart_lyra,
             restart_devin,
             restart_codebuddy,
             restart_claudecode,
@@ -4253,6 +4265,10 @@ async fn apply_runtime_settings(
     if restart_vega {
         state.alkaid.shutdown();
         state.alkaid.refresh_model_options_soon();
+    }
+    if restart_lyra {
+        state.lyra.shutdown();
+        state.lyra.refresh_model_options_soon();
     }
     if restart_devin {
         // 杀掉当前进程，下次发消息时用新配置重启（历史会话靠 session/load 恢复）

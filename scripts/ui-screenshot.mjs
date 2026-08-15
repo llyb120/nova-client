@@ -51,7 +51,8 @@ const threadMeta = {
 const mockSettings = {
   devinPath: "", acpArgs: "", devinProxy: "", codebuddyPath: "", codebuddyProxy: "",
   claudecodePath: "", claudecodeProxy: "", claudecodeSdkApiKey: "", cursorProxy: "",
-  cursorPath: "", cursorSdkApiKey: "", opencodePath: "", opencodeProxy: "",
+  cursorPath: "", cursorSdkApiKey: "", cursorDisableSubagents: false, opencodePath: "", opencodeProxy: "",
+    autoChangeProjectEnabled: true,
   codexPath: "", codexProxy: "", vegaProxy: "", windowsShellShimEnabled: false,
   defaultMode: "build", lightweightModelAgent: "alkaid", lightweightModel: "",
   editor: "cursor", theme: "", historyDisplayMode: "project", chatViewRender: "canvas",

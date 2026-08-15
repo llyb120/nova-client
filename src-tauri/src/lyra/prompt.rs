@@ -394,6 +394,7 @@ pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
         "readOnly": options.read_only,
         "fastContext": options.fast_context,
         "memoryEnabled": options.memory_enabled,
+        "autoChangeProject": options.auto_change_project,
         "shell": shell,
         "skills": options.skills_text,
         "customInstructions": options.custom_instructions,
@@ -410,7 +411,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     let read_only = options.read_only;
     // 与 Vega 提示词对齐：显式列出可用工具（按 Lyra 实际注册的工具集，只读模式无 bash/edit/write）。
     let tool_lines: Vec<&str> = [
-        Some("- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目"),
+        options.auto_change_project.then_some("- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目"),
         Some("- read: 读取单个文件"),
         if read_only {
             None
@@ -448,7 +449,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。"
         }
         .into(),
-        "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。".into(),
+        if options.auto_change_project { "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" } else { "" }.into(),
         if options.memory_enabled { "fast_context 会用 task 自动附带相关训练知识（task 为空时回退 keywords）。若结果含 TRAINED KNOWLEDGE，当前会话新事实优先；rule 是强约束，memory 是可核验事实，experience 仅在条件匹配时适用，并在最终回复前调用 feedback_memory。" } else { "" }.into(),
         "先理解再修改，保持改动聚焦。".into(),
         "最终回复采用例外汇报，而不是完整工作报告。先直接给出用户可感知的结果；只有信息会影响结果判断、下一步行动、风险认知或可信度时，才写入最终回复。默认省略文件/函数/行号清单、搜索和工具调用过程、常规实现细节、具体测试命令、成功步骤清单、无实际影响的注意事项、泛化建议、‘无风险’声明，以及对同一结果的重复总结。正常成功时用 1～3 句话，不强制使用标题或列表；存在失败、未验证、行为变化、兼容性风险或用户必须操作的事项时，只围绕这些例外按需展开。用户明确询问实现细节时才提供详细报告。".into(),
@@ -490,6 +491,7 @@ pub struct SystemPromptOptions {
     pub read_only: bool,
     pub fast_context: bool,
     pub memory_enabled: bool,
+    pub auto_change_project: bool,
     pub shell: Option<ShellConfig>,
     pub skills_text: String,
     pub custom_instructions: String,
@@ -498,6 +500,22 @@ pub struct SystemPromptOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_change_project_controls_tool_prompt() {
+        let options = SystemPromptOptions {
+            cwd: "/tmp/project".into(),
+            read_only: false,
+            fast_context: false,
+            memory_enabled: false,
+            auto_change_project: false,
+            shell: None,
+            skills_text: String::new(),
+            custom_instructions: String::new(),
+        };
+        let prompt = build_system_prompt(&options);
+        assert!(!prompt.contains("change_working_directory"));
+    }
 
     #[test]
     fn governs_oversized_text_with_head_tail() {

@@ -129,6 +129,8 @@ pub struct Settings {
     pub cursor_proxy: String,
     /// Cursor SDK API Key；空 = 使用 CURSOR_API_KEY 环境变量。
     pub cursor_sdk_api_key: String,
+    /// 是否写入 Cursor 全局 hook 以阻止 Task/subagent；默认关闭。
+    pub cursor_disable_subagents: bool,
     /// Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。
     pub cursor_model_contexts: Vec<CursorModelContextRule>,
     /// Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。
@@ -151,6 +153,8 @@ pub struct Settings {
     pub vega_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
+    /// 是否允许 Lyra/Vega 自动切换当前项目和工具工作目录；默认开启。
+    pub auto_change_project_enabled: bool,
     /// 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件。
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
@@ -255,6 +259,7 @@ impl Default for Settings {
             cursor_args: "acp".into(),
             cursor_proxy: String::new(),
             cursor_sdk_api_key: String::new(),
+            cursor_disable_subagents: false,
             cursor_model_contexts: Vec::new(),
             vega_context_mode: "default".into(),
             cursor_context_mode: "default".into(),
@@ -266,6 +271,7 @@ impl Default for Settings {
             codex_proxy: String::new(),
             vega_proxy: String::new(),
             windows_shell_shim_enabled: false,
+            auto_change_project_enabled: true,
             checkpoint_enabled: false,
             default_mode: String::new(),
             lightweight_model_agent: "alkaid".into(),
@@ -422,6 +428,15 @@ mod tests {
     }
 
     #[test]
+    fn cursor_subagent_hook_is_disabled_by_default_and_round_trips() {
+        let defaults = Settings::default();
+        assert!(!defaults.cursor_disable_subagents);
+        let settings: Settings =
+            serde_json::from_str(r#"{"cursorDisableSubagents":true}"#).unwrap();
+        assert!(settings.cursor_disable_subagents);
+    }
+
+    #[test]
     fn context_modes_default_and_round_trip() {
         let defaults = Settings::default();
         assert_eq!(defaults.vega_context_mode, "default");
@@ -492,6 +507,15 @@ mod tests {
             settings.quota_shared_models
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn auto_change_project_is_enabled_by_default_and_round_trips() {
+        let defaults = Settings::default();
+        assert!(defaults.auto_change_project_enabled);
+        let settings: Settings =
+            serde_json::from_str(r#"{"autoChangeProjectEnabled":false}"#).unwrap();
+        assert!(!settings.auto_change_project_enabled);
     }
 
     #[test]

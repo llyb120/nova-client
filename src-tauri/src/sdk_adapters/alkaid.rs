@@ -35,6 +35,15 @@ impl SdkAdapter for AlkaidAdapter {
             path_env: "ALKAID_RUNTIME",
             api_key: None,
             extra_env: vec![
+                (
+                    "NOVA_AUTO_CHANGE_PROJECT",
+                    if settings.auto_change_project_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
                 ("NOVA_CONTEXT_MODE", settings.vega_context_mode.clone()),
                 (
                     "NOVA_FAST_CONTEXT",

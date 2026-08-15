@@ -273,6 +273,18 @@ test("PI coding tools provide read, bash, edit and write", async () => {
   assert.equal(await readFile(join(cwd, "a.txt"), "utf8"), "AA");
 });
 
+test("Vega can disable automatic project changes and related prompts", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "alkaid-no-cwd-"));
+  const runtime = await createAlkaidAgent({ cwd, model: configuredModel, autoChangeProject: false });
+  try {
+    assert.equal(runtime.agent.state.tools.some((tool) => tool.name === "change_working_directory"), false);
+    assert.doesNotMatch(runtime.systemPrompt, /change_working_directory/);
+  } finally {
+    await runtime.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("Vega change_working_directory redirects subsequent coding tools", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "alkaid-cwd-"));
   const child = join(cwd, "child");

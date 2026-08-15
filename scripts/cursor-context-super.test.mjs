@@ -23,6 +23,7 @@ const {
   cursorShellProgram,
   cursorTodoPlan,
   ensureGlobalTaskDenyHooks,
+  syncGlobalTaskDenyHooks,
   extractTurnConclusion,
   formatCompletedTurn,
   formatInterruptedTurn,
@@ -626,6 +627,13 @@ assert.deepEqual(mergedHooks.hooks.subagentStart, [{
 
 const cursorDir = await mkdtemp(join(tmpdir(), "nova-cursor-hooks-"));
 try {
+  await writeFile(join(cursorDir, "hooks.json"), `${JSON.stringify({
+    version: 1,
+    hooks: {
+      afterFileEdit: [{ command: "./hooks/format.sh" }],
+      preToolUse: [{ command: "echo keep-me", matcher: "Shell" }],
+    },
+  }, null, 2)}\n`);
   const ensured = await ensureGlobalTaskDenyHooks(cursorDir);
   const written = JSON.parse(await readFile(ensured.hooksPath, "utf8"));
   const script = await readFile(ensured.scriptPath, "utf8");
@@ -634,6 +642,12 @@ try {
   assert.equal(written.hooks.subagentStart[0].command, novaDenyTaskHookCommand());
   const again = await ensureGlobalTaskDenyHooks(cursorDir);
   assert.deepEqual(again.config.hooks.preToolUse, written.hooks.preToolUse);
+  const disabled = await syncGlobalTaskDenyHooks(false, cursorDir);
+  const cleaned = JSON.parse(await readFile(disabled.hooksPath, "utf8"));
+  assert.deepEqual(cleaned.hooks.afterFileEdit, [{ command: "./hooks/format.sh" }]);
+  assert.deepEqual(cleaned.hooks.preToolUse, [{ command: "echo keep-me", matcher: "Shell" }]);
+  assert.equal(cleaned.hooks.subagentStart, undefined);
+  await assert.rejects(readFile(disabled.scriptPath, "utf8"), (error) => error?.code === "ENOENT");
 } finally {
   await rm(cursorDir, { recursive: true, force: true });
 }

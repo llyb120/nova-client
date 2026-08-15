@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -124,25 +124,51 @@ function mergeNovaTaskDenyHooks(config = {}) {
   };
 }
 
-async function ensureGlobalTaskDenyHooks(cursorDir = CURSOR_USER_DIR) {
+function removeNovaTaskDenyHooks(config = {}) {
+  const hooks = { ...(config.hooks && typeof config.hooks === "object" ? config.hooks : {}) };
+  for (const key of ["preToolUse", "subagentStart"]) {
+    if (!Array.isArray(hooks[key])) continue;
+    const entries = hooks[key].filter((entry) => !isNovaDenyTaskHook(entry));
+    if (entries.length) hooks[key] = entries;
+    else delete hooks[key];
+  }
+  const next = { ...config };
+  if (Object.keys(hooks).length) next.hooks = hooks;
+  else delete next.hooks;
+  return next;
+}
+
+async function syncGlobalTaskDenyHooks(enabled, cursorDir = CURSOR_USER_DIR) {
   const hooksDir = join(cursorDir, "hooks");
   const scriptPath = join(hooksDir, NOVA_DENY_TASK_SCRIPT);
   const hooksPath = join(cursorDir, "hooks.json");
-  await mkdir(hooksDir, { recursive: true });
-  await writeFile(scriptPath, NOVA_DENY_TASK_SCRIPT_SOURCE, "utf8");
   let existing = {};
   try {
     existing = JSON.parse(await readFile(hooksPath, "utf8"));
     if (!existing || typeof existing !== "object" || Array.isArray(existing)) existing = {};
   } catch (error) {
     if (error?.code !== "ENOENT") {
-      process.stderr.write(`Cursor hooks.json unreadable; rewriting Nova Task deny: ${error instanceof Error ? error.message : String(error)}\n`);
-      existing = {};
+      process.stderr.write(`Cursor hooks.json unreadable; cannot sync Nova Task deny: ${error instanceof Error ? error.message : String(error)}\n`);
+      await rm(scriptPath, { force: true });
+      return { hooksPath, scriptPath, config: null };
     }
   }
-  const next = mergeNovaTaskDenyHooks(existing);
-  await writeFile(hooksPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  if (enabled) {
+    await mkdir(hooksDir, { recursive: true });
+    await writeFile(scriptPath, NOVA_DENY_TASK_SCRIPT_SOURCE, "utf8");
+  } else {
+    await rm(scriptPath, { force: true });
+  }
+  const next = enabled ? mergeNovaTaskDenyHooks(existing) : removeNovaTaskDenyHooks(existing);
+  if (enabled || JSON.stringify(next) !== JSON.stringify(existing)) {
+    await mkdir(cursorDir, { recursive: true });
+    await writeFile(hooksPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  }
   return { hooksPath, scriptPath, config: next };
+}
+
+async function ensureGlobalTaskDenyHooks(cursorDir = CURSOR_USER_DIR) {
+  return syncGlobalTaskDenyHooks(true, cursorDir);
 }
 
 class CursorStartupTimeout extends Error {
@@ -923,9 +949,10 @@ async function promptMessage(parts) {
 }
 
 async function main() {
-  // Cursor has no built-in Task toggle; install user-global deny hooks before any Agent.create.
-  await ensureGlobalTaskDenyHooks().catch((error) => {
-    process.stderr.write(`Cursor global Task-deny hooks failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  // Keep Nova's global Task/subagent hook in sync before any Agent.create.
+  const disableSubagents = process.env.NOVA_CURSOR_DISABLE_SUBAGENTS === "1";
+  await syncGlobalTaskDenyHooks(disableSubagents).catch((error) => {
+    process.stderr.write(`Cursor global Task-deny hook sync failed: ${error instanceof Error ? error.message : String(error)}\n`);
   });
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   const requests = [];
@@ -1366,6 +1393,8 @@ export {
   normalizeCursorUsageForNova,
   createCursorAgent,
   ensureGlobalTaskDenyHooks,
+  syncGlobalTaskDenyHooks,
+  removeNovaTaskDenyHooks,
   extractTurnConclusion,
   formatCompletedTurn,
   formatInterruptedTurn,

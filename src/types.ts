@@ -424,6 +424,8 @@ export interface Settings {
   /** 兼容旧配置；Cursor 后端仅使用官方 SDK，不再依赖本机 CLI */
   cursorPath: string;
   cursorSdkApiKey: string;
+  /** 是否通过 Cursor 全局 hook 阻止 Task/subagent；默认关闭。 */
+  cursorDisableSubagents: boolean;
   /** Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。 */
   cursorModelContexts: CursorModelContextRule[];
   /** Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
@@ -439,6 +441,8 @@ export interface Settings {
   vegaProxy: string;
   /** Windows shell 启动 shim（保存后重启应用生效） */
   windowsShellShimEnabled: boolean;
+  /** 是否允许 Lyra/Vega 自动切换当前项目和工具工作目录；默认开启。 */
+  autoChangeProjectEnabled: boolean;
   /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
   checkpointEnabled: boolean;
   /** 代码上下文检索模式：无 / 旧 FastContext / 无索引单遍 SuperContext。 */

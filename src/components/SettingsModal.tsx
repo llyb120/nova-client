@@ -284,6 +284,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
+  const [autoChangeProjectEnabled, setAutoChangeProjectEnabled] = createSignal(
+    s?.autoChangeProjectEnabled !== false,
+  );
   const [checkpointEnabled, setCheckpointEnabled] = createSignal(
     s?.checkpointEnabled ?? false,
   );
@@ -297,6 +300,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [claudecodeSdkApiKey, setClaudecodeSdkApiKey] = createSignal(s?.claudecodeSdkApiKey ?? "");
   const [cursorProxy, setCursorProxy] = createSignal(s?.cursorProxy ?? "");
   const [cursorSdkApiKey, setCursorSdkApiKey] = createSignal(s?.cursorSdkApiKey ?? "");
+  const [cursorDisableSubagents, setCursorDisableSubagents] = createSignal(
+    s?.cursorDisableSubagents ?? false,
+  );
   const [cursorModelContexts, setCursorModelContexts] = createSignal(
     (s?.cursorModelContexts ?? []).map((rule) => ({ ...rule })),
   );
@@ -742,6 +748,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     codexProxy: codexProxy().trim(),
     vegaProxy: vegaProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
+    autoChangeProjectEnabled: autoChangeProjectEnabled(),
     checkpointEnabled: checkpointEnabled(),
     contextRetrievalMode: contextRetrievalMode(),
 
@@ -751,6 +758,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     claudecodeSdkApiKey: claudecodeSdkApiKey().trim(),
     cursorProxy: cursorProxy().trim(),
     cursorSdkApiKey: cursorSdkApiKey().trim(),
+    cursorDisableSubagents: cursorDisableSubagents(),
     cursorModelContexts: cursorModelContexts()
       .map((rule) => ({ prefix: rule.prefix.trim(), contextWindow: rule.contextWindow }))
       .filter((rule) => rule.prefix.length > 0),
@@ -1608,6 +1616,24 @@ export function SettingsModal(props: { onClose: () => void }) {
             </section>
 
             <section class="settings-group">
+              <h3 class="settings-group-title">Agent 行为</h3>
+              <div class="field">
+                <span class="field-label">自动更换项目</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={autoChangeProjectEnabled()}
+                    onChange={(e) => setAutoChangeProjectEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  默认开启。关闭后 Lyra 和 Vega 不再提供切换工作目录/项目的工具，也不会注入对应提示词。
+                </span>
+              </div>
+            </section>
+
+            <section class="settings-group">
               <h3 class="settings-group-title">聊天视图</h3>
               <label class="field">
                 <span class="field-label">渲染方式</span>
@@ -1922,6 +1948,17 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </label>
               </div>
               <ProxyField value={cursorProxy()} onInput={setCursorProxy} />
+              <label class="backend-switch" style={{ "align-self": "flex-start" }}>
+                <input
+                  type="checkbox"
+                  checked={cursorDisableSubagents()}
+                  onChange={(e) => setCursorDisableSubagents(e.currentTarget.checked)}
+                />
+                <span>阻止 Task / subagent</span>
+              </label>
+              <div class="field-hint">
+                默认关闭。开启后写入 Cursor 全局 hook；关闭会清除 Nova 写入的 hook 和脚本，并保留其他 hook。
+              </div>
               <div class="cursor-context-config">
                 <div class="cursor-context-head">
                   <div>

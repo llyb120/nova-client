@@ -31,6 +31,15 @@ impl SdkAdapter for CursorAdapter {
                 .then(|| ("CURSOR_API_KEY", settings.cursor_sdk_api_key.clone())),
             extra_env: vec![
                 (
+                    "NOVA_CURSOR_DISABLE_SUBAGENTS",
+                    if settings.cursor_disable_subagents {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
+                (
                     "NOVA_CURSOR_MODEL_CONTEXTS",
                     serde_json::to_string(&settings.cursor_model_contexts)
                         .unwrap_or_else(|_| "[]".into()),

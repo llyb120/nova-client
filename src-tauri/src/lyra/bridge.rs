@@ -320,7 +320,9 @@ async fn handle_prompt(
     }
 
     let agent_instructions = load_agent_instructions(roots);
-    let memory_enabled = crate::settings::Settings::load(&crate::lyra::config::nova_root()).experience_training_enabled;
+    let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
+    let memory_enabled = settings.experience_training_enabled;
+    let auto_change_project = settings.auto_change_project_enabled;
     let shell = (!read_only).then(prompt::detect_shell);
     let skills_text = format_skills_prompt(&skills);
     let prompt_options = SystemPromptOptions {
@@ -328,6 +330,7 @@ async fn handle_prompt(
         read_only,
         fast_context,
         memory_enabled,
+        auto_change_project,
         shell: shell.clone(),
         skills_text,
         custom_instructions: agent_instructions,
@@ -409,7 +412,7 @@ async fn handle_prompt(
     } else {
         build_system_prompt(&prompt_options)
     };
-    let agent_tools = tool_set(read_only, fast_context, memory_enabled);
+    let agent_tools = tool_set(read_only, fast_context, memory_enabled, auto_change_project);
     let system_prompt_hash = stable_hash(system_prompt.as_bytes());
     let tool_shape = serde_json::to_string(
         &agent_tools

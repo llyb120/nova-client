@@ -32,18 +32,26 @@ fn schema(value: Value) -> Value {
     value
 }
 
-pub fn tool_set(read_only: bool, fast_context: bool, memory_enabled: bool) -> Vec<Tool> {
-    let mut tools = vec![Tool {
-        name: "change_working_directory",
-        description: "改变本会话后续工具调用的工作目录，并通知 Nova 切换到已有项目或自动创建项目。相对路径基于当前工作目录解析；目录必须已存在。请单独调用，不要与依赖新目录的工具并行调用。".into(),
-        parameters: schema(json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "新的工作目录（相对当前工作目录或绝对路径）" }
-            },
-            "required": ["path"]
-        })),
-    }];
+pub fn tool_set(
+    read_only: bool,
+    fast_context: bool,
+    memory_enabled: bool,
+    auto_change_project: bool,
+) -> Vec<Tool> {
+    let mut tools = Vec::new();
+    if auto_change_project {
+        tools.push(Tool {
+            name: "change_working_directory",
+            description: "改变本会话后续工具调用的工作目录，并通知 Nova 切换到已有项目或自动创建项目。相对路径基于当前工作目录解析；目录必须已存在。请单独调用，不要与依赖新目录的工具并行调用。".into(),
+            parameters: schema(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "新的工作目录（相对当前工作目录或绝对路径）" }
+                },
+                "required": ["path"]
+            })),
+        });
+    }
     if fast_context {
         tools.push(Tool {
             name: "fast_context",

@@ -41,6 +41,15 @@ impl SdkAdapter for LyraAdapter {
             api_key: None,
             extra_env: vec![
                 (
+                    "NOVA_AUTO_CHANGE_PROJECT",
+                    if settings.auto_change_project_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
+                (
                     "NOVA_FAST_CONTEXT",
                     if settings.context_tools_enabled() {
                         "1"
