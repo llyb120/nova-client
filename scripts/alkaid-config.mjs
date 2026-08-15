@@ -249,7 +249,10 @@ export function alkaidModelOptions(config) {
     Object.entries(provider.models ?? {}).flatMap(([modelId, model]) => {
       const value = `${providerId}/${modelId}`;
       const name = `${provider.name ?? providerId} / ${model.name ?? modelId}`;
-      const meta = { "codex.ai/supportsImages": model.modalities?.input?.includes("image") ?? false };
+      const meta = {
+        "codex.ai/supportsImages": model.modalities?.input?.includes("image") ?? false,
+        contextWindow: model.limit?.context ?? 128000,
+      };
       const variants = Object.entries(model.variants ?? {});
       if (variants.length === 0) return [{ value, name, _meta: meta }];
       return variants.map(([variant, variantConfig]) => ({

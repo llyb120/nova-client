@@ -107,17 +107,17 @@ test("OpenCode-style JSONC config resolves providers and models", () => {
     {
       value: "custom/gpt-test/variant/medium",
       name: "Custom / GPT Test · Medium",
-      _meta: { "codex.ai/supportsImages": true },
+      _meta: { "codex.ai/supportsImages": true, contextWindow: 200000 },
     },
     {
       value: "custom/gpt-test/variant/high",
       name: "Custom / GPT Test · High",
-      _meta: { "codex.ai/supportsImages": true },
+      _meta: { "codex.ai/supportsImages": true, contextWindow: 200000 },
     },
     {
       value: "custom/gpt-test/variant/fast",
       name: "Custom / GPT Test · Fast",
-      _meta: { "codex.ai/supportsImages": true },
+      _meta: { "codex.ai/supportsImages": true, contextWindow: 200000 },
     },
   ]);
   assert.equal(resolveAlkaidModel(config, "custom/gpt-test/variant/high").thinkingLevel, "high");

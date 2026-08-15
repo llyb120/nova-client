@@ -387,7 +387,17 @@ async function modelOptions(request) {
           value: model.id,
           name: model.name ?? model.id,
           description: model.credits ?? model.description,
-          _meta: { "codex.ai/supportsImages": model.supportsImages ?? false },
+          _meta: {
+            "codex.ai/supportsImages": model.supportsImages ?? false,
+            ...(() => {
+              const contextWindow = Number(
+                model.contextWindow ?? model.context_window ?? model.maxContextTokens ?? model.max_context_tokens,
+              );
+              return Number.isFinite(contextWindow) && contextWindow >= 2_000
+                ? { contextWindow }
+                : {};
+            })(),
+          },
         })),
       }],
       modes: null,

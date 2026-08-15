@@ -365,18 +365,50 @@ export function encodeModelVariant(model, variant) {
 }
 
 export function cursorModelOptions(models) {
+  const contextRules = (() => {
+    try {
+      const parsed = JSON.parse(process.env.NOVA_CURSOR_MODEL_CONTEXTS || "[]");
+      return Array.isArray(parsed)
+        ? parsed
+          .map((rule) => ({
+            prefix: String(rule?.prefix ?? "").trim().toLowerCase(),
+            contextWindow: Number.parseInt(rule?.contextWindow ?? "", 10),
+          }))
+          .filter((rule) => rule.prefix && rule.contextWindow >= 2_000)
+          .sort((left, right) => right.prefix.length - left.prefix.length)
+        : [];
+    } catch {
+      return [];
+    }
+  })();
+  const defaultContextWindow = Number.parseInt(process.env.NOVA_CURSOR_CONTEXT_WINDOW || "", 10) || 128_000;
+  const contextWindowOf = (model) => {
+    const id = String(model?.id ?? "").toLowerCase();
+    return contextRules.find((rule) => id.includes(rule.prefix))?.contextWindow ?? defaultContextWindow;
+  };
+  const withContextWindow = (option, model) => ({
+    ...option,
+    _meta: { ...(option._meta ?? {}), contextWindow: contextWindowOf(model) },
+  });
   const autoModel = models.find((model) => model?.id?.toLowerCase() === "auto")
     ?? models.find((model) => model?.id?.toLowerCase() === "default");
   cursorAutoModelId = autoModel?.id || "auto";
   // 非空哨兵值：与「未选择」区分开，前端显式选中后不会被 resolveAvailableModel 弹回；
   // 发送时由 modelSelection 翻译为 Cursor models.list() 返回的 Auto/default 模型 id。
-  const options = [{ value: "__cursor_auto__", name: "Auto（自动选具体模型）" }];
+  const options = [withContextWindow(
+    { value: "__cursor_auto__", name: "Auto（自动选具体模型）" },
+    autoModel,
+  )];
   for (const model of models) {
     if (!model.id || ["auto", "default"].includes(model.id.toLowerCase())) continue;
     if (model.variants?.length) {
-      options.push(...model.variants.map((variant) => encodeModelVariant(model, variant)));
+      options.push(...model.variants.map((variant) =>
+        withContextWindow(encodeModelVariant(model, variant), model)));
     } else {
-      options.push({ value: model.id, name: model.displayName, description: model.description });
+      options.push(withContextWindow(
+        { value: model.id, name: model.displayName, description: model.description },
+        model,
+      ));
     }
   }
   return options.filter((option, index) =>

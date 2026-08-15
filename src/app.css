@@ -3325,6 +3325,32 @@ button {
   max-width: 100%;
   min-width: 0;
 }
+.composer-run-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.composer-run-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+  animation: composer-run-pulse 1.5s ease-in-out infinite;
+}
+.composer-run-sep {
+  color: color-mix(in srgb, var(--text-faint) 65%, transparent);
+}
+@keyframes composer-run-pulse {
+  0%, 100% { opacity: .45; }
+  50% { opacity: 1; }
+}
 /* 模型选择保持紧凑，长模型名在 pill 内省略 */
 .composer-bar .sel.wide {
   flex: 0 1 280px;

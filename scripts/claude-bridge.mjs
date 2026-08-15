@@ -43,13 +43,20 @@ function novaToolsMcpServers(request, env = process.env) {
 function claudeModelOptions(models) {
   return models.flatMap((model) => {
     const efforts = model.supportedEffortLevels ?? [];
+    const contextWindow = Number(
+      model.contextWindow ?? model.context_window ?? model.maxContextTokens ?? model.max_context_tokens,
+    );
+    const meta = Number.isFinite(contextWindow) && contextWindow >= 2_000
+      ? { contextWindow }
+      : undefined;
     if (!model.supportsEffort || efforts.length === 0) {
-      return [{ value: model.value, name: model.displayName, description: model.description }];
+      return [{ value: model.value, name: model.displayName, description: model.description, _meta: meta }];
     }
     return efforts.map((effort) => ({
       value: `${model.value}:${effort}`,
       name: `${model.displayName} ${effort[0].toUpperCase()}${effort.slice(1)}`,
       description: model.description,
+      _meta: meta,
     }));
   });
 }

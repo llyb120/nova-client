@@ -1081,10 +1081,17 @@ fn provider_options(value: Value) -> Result<Value, String> {
                     .and_then(Value::as_str)
                     .unwrap_or(model_id);
                 let base_name = format!("{provider_name} / {name}");
+                let context_window = model
+                    .get("contextWindow")
+                    .or_else(|| model.get("context_window"))
+                    .and_then(Value::as_u64);
                 options.push(json!({
                     "value": format!("{provider_id}/{model_id}"),
                     "name": format!("{base_name} · Default"),
-                    "_meta": { "codex.ai/supportsImages": supports_images(model) }
+                    "_meta": {
+                        "codex.ai/supportsImages": supports_images(model),
+                        "contextWindow": context_window,
+                    }
                 }));
                 for variant in model
                     .get("variants")
@@ -1096,7 +1103,10 @@ fn provider_options(value: Value) -> Result<Value, String> {
                     options.push(json!({
                         "value": format!("{provider_id}/{model_id}/variant/{variant}"),
                         "name": format!("{base_name} · {}", variant_label(variant)),
-                        "_meta": { "codex.ai/supportsImages": supports_images(model) }
+                        "_meta": {
+                            "codex.ai/supportsImages": supports_images(model),
+                            "contextWindow": context_window,
+                        }
                     }));
                 }
             }

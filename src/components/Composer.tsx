@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, untrack } from "solid-js";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
   promptHistory as globalPromptHistory,
@@ -50,6 +50,7 @@ import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentS
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
+import { fmtTokens } from "./TurnGroup";
 
 const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
 
@@ -120,6 +121,56 @@ export function Composer() {
   const attach = createImageAttachments({ enableFileDrop: true });
 
   const running = () => !!(state.currentId && state.running[state.currentId]);
+  const contextUsedTokens = () => {
+    if (state.liveUsage?.inputTokens) return state.liveUsage.inputTokens;
+    for (let index = state.items.length - 1; index >= 0; index--) {
+      const item = state.items[index];
+      if (item.type === "turn" && item.inputTokens) return item.inputTokens;
+    }
+    return 0;
+  };
+  const contextWindow = () => {
+    const model = state.modelOptions[state.agentKind]?.configOptions
+      ?.find((option) => option.id === "model")
+      ?.options?.find((option) => option.value === state.model);
+    const value = Number(
+      model?._meta?.contextWindow ??
+      model?._meta?.context_window ??
+      model?._meta?.["codex.ai/contextWindow"],
+    );
+    return Number.isFinite(value) && value >= 2_000 ? value : null;
+  };
+  const [runClock, setRunClock] = createSignal(Date.now());
+  const [runStartedAt, setRunStartedAt] = createSignal<number | null>(null);
+  createEffect(() => {
+    const threadId = state.currentId;
+    if (!threadId || !state.running[threadId]) {
+      setRunStartedAt(null);
+      return;
+    }
+    const startedAt = untrack(() => {
+      for (let index = state.items.length - 1; index >= 0; index--) {
+        if (state.items[index].type === "turn") break;
+        if (state.items[index].type === "user") return state.items[index].ts;
+      }
+      return Date.now();
+    });
+    setRunStartedAt(startedAt);
+    setRunClock(Date.now());
+    const timer = window.setInterval(() => setRunClock(Date.now()), 1_000);
+    onCleanup(() => window.clearInterval(timer));
+  });
+  const runElapsed = () => {
+    const startedAt = runStartedAt();
+    if (startedAt === null) return "0:00";
+    const seconds = Math.max(0, Math.floor((runClock() - startedAt) / 1_000));
+    const hours = Math.floor(seconds / 3_600);
+    const minutes = Math.floor((seconds % 3_600) / 60);
+    const remainder = seconds % 60;
+    return hours > 0
+      ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+      : `${minutes}:${String(remainder).padStart(2, "0")}`;
+  };
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
@@ -762,6 +813,21 @@ export function Composer() {
             anchorTo=".composer"
             favorites
           />
+        </Show>
+        <Show when={running()}>
+          <span
+            class="composer-run-stats"
+            title={contextWindow()
+              ? `本轮已运行 ${runElapsed()}\n上下文 ${fmtTokens(contextUsedTokens())} / ${fmtTokens(contextWindow()!)} tokens`
+              : `本轮已运行 ${runElapsed()}\n当前模型未提供上下文窗口`}
+          >
+            <span class="composer-run-dot" aria-hidden="true" />
+            <span>{runElapsed()}</span>
+            <span class="composer-run-sep">·</span>
+            <span>
+              上下文 {fmtTokens(contextUsedTokens())} / {contextWindow() ? fmtTokens(contextWindow()!) : "--"}
+            </span>
+          </span>
         </Show>
         <span class="bar-spacer" />
         <button

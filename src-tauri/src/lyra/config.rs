@@ -146,7 +146,14 @@ pub fn model_options(config: &Value) -> Vec<Value> {
                 .and_then(Value::as_array)
                 .map(|input| input.iter().any(|v| v.as_str() == Some("image")))
                 .unwrap_or(false);
-            let meta = json!({ "codex.ai/supportsImages": supports_images });
+            let context_window = model
+                .pointer("/limit/context")
+                .and_then(Value::as_u64)
+                .unwrap_or(128_000);
+            let meta = json!({
+                "codex.ai/supportsImages": supports_images,
+                "contextWindow": context_window,
+            });
             let variants: Vec<(&String, &Value)> = model
                 .get("variants")
                 .and_then(Value::as_object)

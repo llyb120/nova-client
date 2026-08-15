@@ -1128,6 +1128,8 @@ export function clearQuotaRoamingProgress() {
 const THREAD_SNAPSHOT_LIMIT = 2;
 const threadSnapshots = new Map<string, Thread>();
 const loadingThreadSnapshots = new Set<string>();
+/** 运行中各会话最近一次实时用量；切换会话时恢复，避免等待下一次 usage 事件。 */
+const liveUsageByThread = new Map<string, LiveUsage>();
 
 function rememberThreadSnapshot(thread: Thread) {
   threadSnapshots.delete(thread.id);
@@ -1472,7 +1474,10 @@ export async function sendPrompt(
   if (!id || (!text.trim() && images.length === 0)) return;
   // /train 是 Nova 内置命令：不写入当前会话，也不发送给模型。
   if (text.trim() === "/train" && images.length === 0) {
-    await api.trainExperience();
+    const cwd = state.threads.find((thread) => thread.id === id)?.worktree?.repo || state.cwd;
+    if (!cwd) throw new Error("请先选择一个项目再训练");
+    setTrainingProject(cwd);
+    await api.trainExperience(cwd);
     return;
   }
   // 新会话页选择了工作流：会话输入就是首节点输入，文本作为 goal、图片作为首节点附件。
@@ -2360,7 +2365,10 @@ function queueDelta(op: Extract<UpdateOp, { t: "delta" }>) {
 
 function applyUpsert(item: Item) {
   // Turn 落库意味着本轮用量已有终值，清掉进行中的实时值，防止短暂双计。
-  if (item.type === "turn" && state.liveUsage) setState("liveUsage", null);
+  if (item.type === "turn") {
+    if (state.currentId) liveUsageByThread.delete(state.currentId);
+    if (state.liveUsage) setState("liveUsage", null);
+  }
   if (item.type === "user") {
     const optimistic = state.items.findIndex(
       (current) => current.type === "user" && current.id < 0,
@@ -2400,7 +2408,8 @@ function flushPendingStreamUpdates() {
 
 function applyOp(op: UpdateOp) {
   if (op.t === "usage") {
-    // 本轮进行中的实时累计用量；Turn 落库（applyUpsert）时清零，避免双计。
+    // 本轮进行中的实时累计用量；按会话缓存，切换回来无需等待下一次工具/usage 事件。
+    if (state.currentId) liveUsageByThread.set(state.currentId, op.usage);
     setState("liveUsage", op.usage);
     return;
   }
@@ -2533,8 +2542,12 @@ export async function initStore() {
   });
 
   await listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
-    if (e.payload.threadId !== state.currentId) return;
     const ops = e.payload.ops ?? (e.payload.op ? [e.payload.op] : []);
+    // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
+    for (const op of ops) {
+      if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
+    }
+    if (e.payload.threadId !== state.currentId) return;
     // 切换会话加载快照期间忽略增量：此刻 items 还是旧会话的，getThread 快照会包含
     // 已落库的全部内容，加载完成（loadingThread=false）后再应用后续实时增量。
     // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
@@ -2569,16 +2582,23 @@ export async function initStore() {
 
   await listen<TurnEvent>("acp:turn", (e) => {
     const threadId = e.payload.threadId;
+    const wasRunning = !!state.running[threadId];
     runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
     optimisticRunningThreads.delete(threadId);
     setState("running", threadId, e.payload.running);
     if (e.payload.running) {
+      // 只在新一轮开始时丢弃上一轮残留；重复 running 事件不能覆盖本轮已收到的 usage。
+      if (!wasRunning) {
+        liveUsageByThread.delete(threadId);
+        if (threadId === state.currentId) setState("liveUsage", null);
+      }
       preloadThreadSnapshot(e.payload.threadId);
       // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
       resumeFireRelay(e.payload.threadId);
       handleWorkflowTurnStart(e.payload.threadId);
     } else {
       // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
+      liveUsageByThread.delete(threadId);
       if (threadId === state.currentId) setState("liveUsage", null);
       if (pendingSetupConfigRefresh.delete(threadId)) {
         void api.refreshAlkaidConfig().catch((error) =>

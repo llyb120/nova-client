@@ -1515,6 +1515,11 @@ impl CodexManager {
                 .unwrap_or(false);
             let is_default_model = m["isDefault"].as_bool().unwrap_or(false);
             let default_effort = m["defaultReasoningEffort"].as_str().unwrap_or("");
+            let context_window = m["contextWindow"]
+                .as_u64()
+                .or_else(|| m["context_window"].as_u64())
+                .or_else(|| m["maxContextTokens"].as_u64())
+                .or_else(|| m["max_context_tokens"].as_u64());
             let description = m["description"].as_str().unwrap_or("");
             let efforts: Vec<(String, String)> = m["supportedReasoningEfforts"]
                 .as_array()
@@ -1537,7 +1542,8 @@ impl CodexManager {
                     "_meta": {
                         "codex.ai/supportsImages": supports_images,
                         "codex.ai/default": is_default_model,
-                        "codex.ai/description": description
+                        "codex.ai/description": description,
+                        "contextWindow": context_window
                     }
                 }));
             } else {
@@ -1554,7 +1560,8 @@ impl CodexManager {
                             "codex.ai/supportsImages": supports_images,
                             "codex.ai/default": is_default_model && effort == default_effort,
                             "codex.ai/effort": effort,
-                            "codex.ai/description": desc
+                            "codex.ai/description": desc,
+                            "contextWindow": context_window
                         }
                     }));
                 }

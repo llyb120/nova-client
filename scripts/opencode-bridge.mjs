@@ -35,6 +35,12 @@ async function oneShot(client, request) {
                       pdf: model.capabilities.input.pdf,
                     },
                   },
+                  contextWindow:
+                    model.limit?.context ??
+                    model.contextWindow ??
+                    model.context_window ??
+                    model.maxContextTokens ??
+                    model.max_context_tokens,
                 },
               ]),
             ),
