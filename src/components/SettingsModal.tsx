@@ -723,7 +723,20 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [version, setVersion] = createSignal("");
   const [checking, setChecking] = createSignal(false);
   const [checkResult, setCheckResult] = createSignal("");
+  const [updateChannel, setUpdateChannel] = createSignal<"release" | "pre-release">(
+    s?.updateChannel === "pre-release" ? "pre-release" : "release",
+  );
   onMount(() => void getVersion().then(setVersion));
+  const changeUpdateChannel = async (channel: "release" | "pre-release") => {
+    if (channel === updateChannel() || checking()) return;
+    const cur = await api.getSettings();
+    const next = { ...cur, updateChannel: channel };
+    await api.setSettings(next);
+    setState("settings", next);
+    setUpdateChannel(channel);
+    setCheckResult("");
+    await checkNow();
+  };
   const checkNow = async () => {
     setChecking(true);
     setCheckResult("");
@@ -794,6 +807,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     cursorIntegration: "sdk",
     opencodeIntegration: "sdk",
     worktreeDir: worktreeDir().trim(),
+    updateChannel: updateChannel(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
     historyDisplayMode: historyDisplayMode(),
@@ -2728,6 +2742,29 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span class="field-hint">{checkResult()}</span>
                 </Show>
               </div>
+            </div>
+
+            <div class="field">
+              <span class="field-label">更新通道</span>
+              <div class="seg-control" role="radiogroup" aria-label="更新通道">
+                <button
+                  type="button"
+                  classList={{ active: updateChannel() === "release" }}
+                  disabled={checking()}
+                  onClick={() => void changeUpdateChannel("release")}
+                >
+                  正式版
+                </button>
+                <button
+                  type="button"
+                  classList={{ active: updateChannel() === "pre-release" }}
+                  disabled={checking()}
+                  onClick={() => void changeUpdateChannel("pre-release")}
+                >
+                  预发布版
+                </button>
+              </div>
+              <span class="field-hint">切换后会立即检查并下载目标通道的最新版，版本号较低时也会切换。</span>
             </div>
 
             <div class="field">
