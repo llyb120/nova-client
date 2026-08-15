@@ -13,11 +13,11 @@ import { editUserMessage, isExpanded, respondPermission, toggleExpanded } from "
 import type { PermissionRequest, PromptImage, RevertChange, UserItem } from "../types";
 import {
   type Action,
-  CANVAS_BACKDROP_READY_EVENT,
   getTheme,
   measure,
   paintCanvasBackdrop,
   roundRectPath,
+  STAR_MAP_UPDATE_MS,
 } from "./base";
 import {
   type Doc,
@@ -70,6 +70,7 @@ export function TranscriptCanvas(props: {
   onApi: (api: TranscriptCanvasApi) => void;
 }) {
   let hostRef: HTMLDivElement | undefined;
+  let backdropCanvasRef: HTMLCanvasElement | undefined;
   let canvasRef: HTMLCanvasElement | undefined;
 
   const [viewW, setViewW] = createSignal(0);
@@ -378,6 +379,36 @@ export function TranscriptCanvas(props: {
   createEffect(scheduleRebuild);
 
   /* ===== 绘制 ===== */
+  let backdropQueued = false;
+
+  const paintBackdrop = (now = Date.now()) => {
+    const canvas = backdropCanvasRef;
+    if (!canvas) return;
+    const w = viewW();
+    const h = viewH();
+    if (w <= 0 || h <= 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    const pixelW = Math.max(1, Math.round(w * dpr));
+    const pixelH = Math.max(1, Math.round(h * dpr));
+    if (canvas.width !== pixelW || canvas.height !== pixelH) {
+      canvas.width = pixelW;
+      canvas.height = pixelH;
+    }
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    paintCanvasBackdrop(ctx, w, h, getTheme(), now);
+  };
+
+  const requestBackdrop = () => {
+    if (backdropQueued) return;
+    backdropQueued = true;
+    requestAnimationFrame(() => {
+      backdropQueued = false;
+      paintBackdrop();
+    });
+  };
+
   const requestRender = () => {
     if (renderQueued) return;
     renderQueued = true;
@@ -412,15 +443,14 @@ export function TranscriptCanvas(props: {
       canvas.width = Math.round(w * dpr);
       canvas.height = Math.round(h * dpr);
     }
-    // Opaque backing avoids the extra alpha-compositing pass that makes small light-on-dark
-    // glyphs look soft in Chromium/WebView. Canvas-specific theme colors control contrast.
-    const ctx = canvas.getContext("2d", { alpha: false });
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.textRendering = "optimizeLegibility";
     ctx.fontKerning = "normal";
     const theme = getTheme();
-    paintCanvasBackdrop(ctx, w, h, theme);
     ctx.textBaseline = "alphabetic";
     let a = Math.min(selA, selB);
     let b = Math.max(selA, selB);
@@ -1191,26 +1221,32 @@ export function TranscriptCanvas(props: {
     const ro = new ResizeObserver(() => {
       setViewW(host.clientWidth);
       setViewH(host.clientHeight);
+      requestBackdrop();
     });
     ro.observe(host);
     setViewW(host.clientWidth);
     setViewH(host.clientHeight);
+    paintBackdrop();
 
     canvas.addEventListener("wheel", onWheel, { passive: false });
     window.addEventListener("keydown", onKey, true);
     window.addEventListener("pointerup", finishPointer, true);
     window.addEventListener("pointercancel", finishPointer, true);
-    const mo = new MutationObserver(() => bump());
+    const mo = new MutationObserver(() => {
+      bump();
+      requestBackdrop();
+    });
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    const onBackdropReady = () => requestRender();
-    window.addEventListener(CANVAS_BACKDROP_READY_EVENT, onBackdropReady);
+    const starMapTimer = window.setInterval(() => {
+      if (!document.hidden) paintBackdrop();
+    }, STAR_MAP_UPDATE_MS);
 
     props.onApi(canvasApi);
 
     onCleanup(() => {
       ro.disconnect();
       mo.disconnect();
-      window.removeEventListener(CANVAS_BACKDROP_READY_EVENT, onBackdropReady);
+      window.clearInterval(starMapTimer);
       canvas.removeEventListener("wheel", onWheel);
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("pointerup", finishPointer, true);
@@ -1226,8 +1262,10 @@ export function TranscriptCanvas(props: {
       classList={{ "checkpoint-preview-fading": props.fading }}
       ref={hostRef}
     >
+      <canvas ref={backdropCanvasRef} class="transcript-canvas-backdrop" aria-hidden="true" />
       <canvas
         ref={canvasRef}
+        class="transcript-canvas-foreground"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}

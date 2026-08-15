@@ -1,7 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
-  CANVAS_BACKDROP_READY_EVENT,
   paintCanvasBackdrop,
+  STAR_MAP_UPDATE_MS,
 } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
@@ -933,6 +933,7 @@ function lineAtOffset(b: Block, offset: number): TextLine | null {
 
 export function CanvasTranscript(props: CanvasTranscriptProps) {
   let canvasEl!: HTMLCanvasElement;
+  let backdropCanvasEl!: HTMLCanvasElement;
   let hostEl!: HTMLDivElement;
 
   // state
@@ -1778,20 +1779,33 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.fillText(text, snap(x), snap(y));
   }
 
-  let paintedBackdropAt = Date.now();
+  function paintBackdrop(timestamp = Date.now()) {
+    const canvas = backdropCanvasEl;
+    if (!canvas || viewW <= 0 || viewH <= 0) return;
+    const pixelW = Math.max(1, Math.round(viewW * dpr));
+    const pixelH = Math.max(1, Math.round(viewH * dpr));
+    if (canvas.width !== pixelW || canvas.height !== pixelH) {
+      canvas.width = pixelW;
+      canvas.height = pixelH;
+    }
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    paintCanvasBackdrop(ctx, viewW, viewH, pal, timestamp);
+  }
 
   function paintAll() {
     const canvas = canvasEl;
     if (!canvas) return;
-    // The transcript is opaque; avoiding an alpha surface improves Chromium's text compositing.
-    const ctx = canvas.getContext("2d", { alpha: false })!;
+    // 前景保持透明，只清空并重绘正文；星图背景由下层 canvas 保留，不再随滚动反复拷贝。
+    const ctx = canvas.getContext("2d")!;
     const p = pal;
 
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.textRendering = "optimizeLegibility";
     ctx.fontKerning = "normal";
-    paintedBackdropAt = Date.now();
-    paintCanvasBackdrop(ctx, viewW, viewH, p, paintedBackdropAt);
 
     const visTop = scrollY - 50;
     const visBot = scrollY + viewH + 50;
@@ -1940,7 +1954,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     busyTimer = undefined;
     const canvas = canvasEl;
     if (!canvas || busyBlockIndices.length === 0) return;
-    const ctx = canvas.getContext("2d", { alpha: false });
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.textRendering = "optimizeLegibility";
@@ -1955,15 +1969,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (by + b.h < -1 || by > viewH + 1) continue;
       anyBusy = true;
       ctx.save();
-      // 背景包含柔光、点阵和星图，不能用纯色 pal.bg 擦除 spinner 旧帧；
-      // 否则第一个运行中工具会每 50ms 把整行刷成一块矩形（浅色主题下就是白块）。
-      // 恢复整帧绘制时使用的同一背景桶，再重画工具头。
-      paintCanvasBackdrop(ctx, viewW, viewH, pal, paintedBackdropAt, {
-        x: b.x,
-        y: by,
-        w: b.w,
-        h: b.h,
-      });
+      ctx.clearRect(b.x, by, b.w, b.h);
       ctx.restore();
       ctx.save();
       paintToolHeader(ctx, b, b.x, by, pal);
@@ -3239,16 +3245,20 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function resizeCanvas() {
-    const w = canvasEl.clientWidth;
-    const h = canvasEl.clientHeight;
+    const w = hostEl.clientWidth;
+    const h = hostEl.clientHeight;
     if (w === viewW && h === viewH && dpr === devicePixelRatio) return;
     dpr = devicePixelRatio || 1;
     viewW = w; viewH = h;
-    // alpha:false 缓冲在改尺寸后会被清空成不透明黑；立刻重绘，避免布局异步完成前的黑闪。
-    canvasEl.width = Math.round(w * dpr);
-    canvasEl.height = Math.round(h * dpr);
+    const pixelW = Math.max(1, Math.round(w * dpr));
+    const pixelH = Math.max(1, Math.round(h * dpr));
+    backdropCanvasEl.width = pixelW;
+    backdropCanvasEl.height = pixelH;
+    canvasEl.width = pixelW;
+    canvasEl.height = pixelH;
     maxScroll = Math.max(0, totalHeight - viewH);
     if (keepBottom) scrollY = maxScroll;
+    paintBackdrop();
     paintAll();
   }
 
@@ -3259,7 +3269,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     void rebuild();
 
     const ro = new ResizeObserver(() => { resizeCanvas(); void rebuild(); });
-    ro.observe(canvasEl);
+    ro.observe(hostEl);
 
     // Rebuild fallback-font measurements after bundled web fonts become available.
     void document.fonts.ready.then(() => {
@@ -3269,8 +3279,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     const mo = new MutationObserver(() => { void rebuild(); });
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    const onBackdropReady = () => requestPaint();
-    window.addEventListener(CANVAS_BACKDROP_READY_EVENT, onBackdropReady);
+    const starMapTimer = window.setInterval(() => {
+      if (!document.hidden) paintBackdrop();
+    }, STAR_MAP_UPDATE_MS);
 
     function onMouseLeave() {
       if (scrollDragging || selecting) return;
@@ -3304,7 +3315,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     onCleanup(() => {
       ro.disconnect();
       mo.disconnect();
-      window.removeEventListener(CANVAS_BACKDROP_READY_EVENT, onBackdropReady);
+      window.clearInterval(starMapTimer);
       editResizeObserver?.disconnect();
       editResizeObserver = undefined;
       editHostEl = undefined;
@@ -3391,6 +3402,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   return (
     <div class="canvas-transcript-host" ref={hostEl}>
+      <canvas ref={backdropCanvasEl} class="transcript-canvas-backdrop" aria-hidden="true" />
       <canvas ref={canvasEl} class="transcript-canvas-only" tabindex="0" aria-label="会话记录" />
       {editing() && (
         <div class="canvas-prompt-editor" style={editStyle()} ref={bindEditHost}>

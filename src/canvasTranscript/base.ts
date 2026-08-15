@@ -261,34 +261,23 @@ export function invalidateTheme(): void {
   themeCache = null;
 }
 
-/**
- * 背景缓存在独立的离屏 Canvas：主题或尺寸变化时才重绘柔光与点阵；正文每帧只做一次位图拷贝。
- * 比两个可见 Canvas 更稳：前景仍可使用 alpha:false，避免透明合成让暗色小字重新发虚。
- * 星图成本明显高于底色，缓存未命中时先同步提供无星图背景，等首帧落屏后再补全星图。
- */
-export const CANVAS_BACKDROP_READY_EVENT = "nova:canvas-backdrop-ready";
+/** 星图背景低频更新间隔；恒星位移很小，1.5 秒步进不会产生可见跳动。 */
+export const STAR_MAP_UPDATE_MS = 1500;
 
 type BackdropTheme = Pick<
   ThemeColors,
   "bg" | "glowAccent" | "glowCyan" | "glowCorner" | "gridDot"
 >;
 
-interface BackdropEntry {
-  surface: HTMLCanvasElement;
-  complete: boolean;
-}
+const backdropCache = new Map<string, HTMLCanvasElement>();
 
-const backdropCache = new Map<string, BackdropEntry>();
-const pendingBackdropBuilds = new Set<string>();
-
-function cacheBackdrop(key: string, entry: BackdropEntry): void {
-  // 替换基础背景时也把条目移到末尾，避免刚补好的当前主题最先被淘汰。
+function cacheBackdrop(key: string, surface: HTMLCanvasElement): void {
   if (backdropCache.has(key)) backdropCache.delete(key);
   while (backdropCache.size >= 4) backdropCache.delete(backdropCache.keys().next().value!);
-  backdropCache.set(key, entry);
+  backdropCache.set(key, surface);
 }
 
-/** 创建背景位图（纯色底 + 柔光 + 点阵，可选星图） */
+/** 创建不含星图的静态底图（纯色底 + 柔光 + 点阵）。 */
 function createBackdrop(
   width: number,
   height: number,
@@ -296,8 +285,6 @@ function createBackdrop(
   pixelH: number,
   dpr: number,
   theme: BackdropTheme,
-  skyBucket: number,
-  withStarMap: boolean,
 ): HTMLCanvasElement {
   const surface = document.createElement("canvas");
   surface.width = pixelW;
@@ -336,106 +323,32 @@ function createBackdrop(
   for (let y = 0; y < height; y += 26) {
     for (let x = 0; x < width; x += 26) bg.fillRect(x, y, dot, dot);
   }
-
-  if (withStarMap) {
-    // 星图层：低透明度星座，画在文字之下的背景缓存里。
-    paintStarMap(bg, width, height, theme, skyBucket * 60000);
-  }
   return surface;
 }
 
-function completeBackdropAfterPaint(
-  key: string,
-  width: number,
-  height: number,
-  pixelW: number,
-  pixelH: number,
-  dpr: number,
-  theme: BackdropTheme,
-  skyBucket: number,
-): void {
-  if (pendingBackdropBuilds.has(key)) return;
-  pendingBackdropBuilds.add(key);
-
-  const build = () => {
-    pendingBackdropBuilds.delete(key);
-    const cached = backdropCache.get(key);
-    // 尺寸或主题快速变化时，已淘汰的旧背景不再浪费时间补建。
-    if (!cached || cached.complete) return;
-    const surface = createBackdrop(
-      width,
-      height,
-      pixelW,
-      pixelH,
-      dpr,
-      theme,
-      skyBucket,
-      true,
-    );
-    cacheBackdrop(key, { surface, complete: true });
-    window.dispatchEvent(new Event(CANVAS_BACKDROP_READY_EVENT));
-  };
-
-  // 先让主题底色和控件完成一帧绘制，再利用空闲时间生成星图；星图不能再阻塞设置点击。
-  window.requestAnimationFrame(() => {
-    if (typeof window.requestIdleCallback === "function") {
-      window.requestIdleCallback(build, { timeout: 1500 });
-    } else {
-      window.setTimeout(build, 0);
-    }
-  });
-}
-
+/**
+ * 绘制独立背景 Canvas 的一帧：静态底图从缓存拷贝，星图按当前恒星时直接叠加。
+ * 调用方以 1.5 秒低频更新；前景 Canvas 的滚动、悬停和流式绘制不会触发这里。
+ */
 export function paintCanvasBackdrop(
   ctx: CanvasRenderingContext2D,
   width: number,
   height: number,
   theme: BackdropTheme,
   now = Date.now(),
-  region?: { x: number; y: number; w: number; h: number },
 ): void {
   const dpr = window.devicePixelRatio || 1;
   const pixelW = Math.max(1, Math.round(width * dpr));
   const pixelH = Math.max(1, Math.round(height * dpr));
-  // 星图随恒星时旋转：缓存按分钟分桶；未命中时先展示轻量背景，再异步补全星图。
-  const skyBucket = Math.floor(now / 60000);
   const themeKey = [theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
-  const key = [pixelW, pixelH, skyBucket, themeKey].join("|");
-  let entry = backdropCache.get(key);
-  if (!entry) {
-    entry = {
-      surface: createBackdrop(width, height, pixelW, pixelH, dpr, theme, skyBucket, false),
-      complete: false,
-    };
-    cacheBackdrop(key, entry);
+  const key = [pixelW, pixelH, themeKey].join("|");
+  let surface = backdropCache.get(key);
+  if (!surface) {
+    surface = createBackdrop(width, height, pixelW, pixelH, dpr, theme);
+    cacheBackdrop(key, surface);
   }
-  if (!entry.complete) {
-    completeBackdropAfterPaint(key, width, height, pixelW, pixelH, dpr, theme, skyBucket);
-  }
-
-  const surface = entry.surface;
-  if (region) {
-    // spinner 等局部动画只恢复自身覆盖的背景区域，避免每帧重拷整张背景。
-    const x0 = Math.max(0, region.x);
-    const y0 = Math.max(0, region.y);
-    const x1 = Math.min(width, region.x + region.w);
-    const y1 = Math.min(height, region.y + region.h);
-    if (x1 > x0 && y1 > y0) {
-      ctx.drawImage(
-        surface,
-        x0 * dpr,
-        y0 * dpr,
-        (x1 - x0) * dpr,
-        (y1 - y0) * dpr,
-        x0,
-        y0,
-        x1 - x0,
-        y1 - y0,
-      );
-    }
-  } else {
-    ctx.drawImage(surface, 0, 0, pixelW, pixelH, 0, 0, width, height);
-  }
+  ctx.drawImage(surface, 0, 0, pixelW, pixelH, 0, 0, width, height);
+  paintStarMap(ctx, width, height, theme, now);
 }
 
 /* ===== 矢量图标（与 icons.tsx 的 feather 风格 path 一致，Path2D 直绘） ===== */
