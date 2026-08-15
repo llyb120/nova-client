@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nova 使用文档</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e6e8eb;
+    --text-dim: #9aa3b2;
+    --accent: #6ea8fe;
+    --accent-2: #8b9bff;
+    --green: #5fcf80;
+    --orange: #f0a04b;
+    --red: #f06b6b;
+    --code-bg: #11141a;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    font-size: 15px;
+    line-height: 1.8;
+  }
+  .layout { display: flex; min-height: 100vh; }
+
+  nav {
+    width: 260px;
+    flex-shrink: 0;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    padding: 24px 16px;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+  }
+  nav .logo {
+    font-size: 20px;
+    font-weight: 700;
+    margin-bottom: 4px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  nav .sub { font-size: 12px; color: var(--text-dim); margin-bottom: 24px; }
+  nav a {
+    display: block;
+    color: var(--text-dim);
+    text-decoration: none;
+    padding: 7px 12px;
+    border-radius: 6px;
+    font-size: 14px;
+    margin-bottom: 2px;
+    transition: all .15s;
+  }
+  nav a:hover { background: var(--panel-2); color: var(--text); }
+  nav a.section-title {
+    color: var(--text);
+    font-weight: 600;
+    margin-top: 20px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    cursor: default;
+  }
+  nav a.section-title:hover { background: transparent; }
+
+  main {
+    flex: 1;
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 48px 40px 120px;
+  }
+  h1 {
+    font-size: 38px;
+    margin: 0 0 8px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  h2 {
+    font-size: 24px;
+    margin: 52px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 18px; margin: 32px 0 12px; color: var(--accent); }
+  h4 { font-size: 15px; margin: 22px 0 10px; color: var(--text); }
+  p { margin: 12px 0; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 6px 0; }
+  .lead { font-size: 17px; color: var(--text-dim); margin-bottom: 32px; }
+  code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "Consolas", "SF Mono", monospace;
+    font-size: 13px;
+    color: var(--accent);
+  }
+  .callout {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    padding: 14px 18px;
+    border-radius: 6px;
+    margin: 18px 0;
+  }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout.tip { border-left-color: var(--green); }
+  .callout strong { color: var(--text); }
+
+  .steps { display: grid; gap: 14px; margin: 20px 0; }
+  .step {
+    display: flex;
+    gap: 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+  }
+  .step .num {
+    flex-shrink: 0;
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #0f1115;
+    font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+  }
+  .step .body { flex: 1; }
+  .step .body p { margin: 0; }
+  .step .body p + p { margin-top: 8px; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 18px 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  th, td {
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { background: var(--panel-2); color: var(--text-dim); font-weight: 600; font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+
+  kbd {
+    display: inline-block;
+    padding: 2px 8px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    font-family: "Consolas", monospace;
+    font-size: 12px;
+    color: var(--text);
+  }
+
+  .footer {
+    margin-top: 80px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 13px;
+    text-align: center;
+  }
+  .hotkey-list { background: var(--panel); border:1px solid var(--border); border-radius:8px; padding: 8px 18px; margin: 14px 0; }
+  .hotkey-list dl { display:grid; grid-template-columns: 180px 1fr; gap: 6px 16px; margin:0; }
+  .hotkey-list dt { color: var(--text-dim); }
+  .hotkey-list dd { margin:0; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav>
+    <div class="logo">Nova</div>
+    <div class="sub">使用文档</div>
+    <a href="#overview">Nova 是什么</a>
+    <a href="#start">5 分钟上手</a>
+    <a href="#home">下达第一个任务</a>
+    <a href="#input">输入框的全部技巧</a>
+    <a href="#slash">斜杠命令速查</a>
+    <a href="#session">管理你的会话</a>
+    <a href="#watch">看懂 AI 的工作过程</a>
+    <a href="#permission">审批 AI 的敏感操作</a>
+    <a href="#plan">让 AI 先出计划再动手</a>
+    <a href="#chat-head">会话顶栏按钮一览</a>
+    <a href="#worldline">世界线：回到任何一个时间点</a>
+    <a href="#worktree">在独立分支里干活</a>
+    <a href="#views" class="section-title">六大视图</a>
+    <a href="#v-normal">普通模式</a>
+    <a href="#v-workflow">工作流</a>
+    <a href="#v-clue">证据链</a>
+    <a href="#v-employee">数字员工</a>
+    <a href="#v-workbench">御书房</a>
+    <a href="#v-training">大熊座</a>
+    <a href="#team" class="section-title">团队协作</a>
+    <a href="#team-relay">连接团队中转站</a>
+    <a href="#roam">漫游到队友的机器</a>
+    <a href="#share">把会话 Flow 给队友</a>
+    <a href="#quota">共享你的模型额度</a>
+    <a href="#settings" class="section-title">设置详解</a>
+    <a href="#s-general">通用</a>
+    <a href="#s-backends">模型后端</a>
+    <a href="#s-instructions">Agent 配置</a>
+    <a href="#s-team">团队</a>
+    <a href="#s-memory">记忆检索</a>
+    <a href="#s-worktree">Worktree</a>
+    <a href="#s-skills">Skills</a>
+    <a href="#s-appearance">外观</a>
+    <a href="#s-advanced">高级</a>
+    <a href="#s-about">关于</a>
+    <a href="#misc" class="section-title">附录</a>
+    <a href="#notify">通知与防休眠</a>
+    <a href="#update">自动更新</a>
+    <a href="#trouble">排障</a>
+  </nav>
+
+  <main>
+    <h1>Nova</h1>
+    <p class="lead">一个本地桌面客户端。你选项目、下任务，AI 就在你电脑上替你干活，所有过程实时显示在界面里。</p>
+
+    <h2 id="overview">Nova 是什么</h2>
+    <p>你像老板：选项目、下任务、审过程与结果。AI 在本地 shell 里干活——思考、工具调用、文件改动、终端输出都实时显示在界面上。除了「你戳一下它动一下」的用法，Nova 还能配置一批<strong>常驻数字员工</strong>替你持续推进工作。</p>
+    <p>主界面分三块：左侧<strong>侧边栏</strong>（会话列表 + 视图切换），中间<strong>主区域</strong>（首页或会话视图），按需弹出各种弹窗（设置、成就、收件箱、更新等）。</p>
+
+    <h2 id="start">5 分钟上手</h2>
+    <div class="steps">
+      <div class="step"><div class="num">1</div><div class="body">
+        <p><strong>装好至少一个 AI 后端的命令行工具</strong>，并在终端登录一次。例如 <code>devin</code>、<code>codex</code>、<code>claude</code> 等。Nova 启动时会自动检测哪些后端可用。</p>
+      </div></div>
+      <div class="step"><div class="num">2</div><div class="body">
+        <p><strong>启动 Nova</strong>。默认进入首页，正中是大字标题「我们该做什么？」，下面是一个任务输入框。</p>
+      </div></div>
+      <div class="step"><div class="num">3</div><div class="body">
+        <p><strong>选项目</strong>：点输入框下方工具条左侧的「项目」胶囊按钮，弹出列表里挑一个最近项目；也可以点列表底部的「使用现有文件夹…」浏览任意目录；或选最上方的「临时会话（不使用项目）」在系统临时目录建一个空工作区。</p>
+      </div></div>
+      <div class="step"><div class="num">4</div><div class="body">
+        <p><strong>选后端和模型</strong>：点项目胶囊右边的「模型」胶囊。如果只启用了一个后端，弹出二级面板：左栏列厂商（如 OpenAI、Anthropic），右栏列该厂商的模型，鼠标移到左栏某项右栏跟着切换。如果启用了多个后端，弹出三级面板：最左栏列后端（Devin、Codex、Claude Code 等），中栏列厂商，最右栏列模型。顶部有搜索框可直接搜模型名。模型右侧会显示单价（如 <code>$5/$25</code>）和支持图片的眼睛图标。点模型即选中。</p>
+      </div></div>
+      <div class="step"><div class="num">5</div><div class="body">
+        <p><strong>输入任务，回车发送</strong>。界面立即切到会话视图，AI 开始干活，过程实时滚动显示。任务跑完会弹系统通知（如果窗口不在前台）。</p>
+      </div></div>
+    </div>
+    <div class="callout tip">
+      <strong>提示：</strong>如果侧边栏某个后端显示「未检测到 CLI」，说明对应命令行工具没装或不在 PATH 里。可去「设置 → 模型后端」对应卡片的「可执行文件」里填完整路径，保存后会自动重新检测。
+    </div>
+
+    <h2 id="home">下达第一个任务</h2>
+    <p>首页从上到下依次是：</p>
+    <ul>
+      <li><strong>Logo + 标题「我们该做什么？」</strong></li>
+      <li><strong>任务输入框</strong>（多行文本域，自动增高，最高 220px）</li>
+      <li><strong>工具条</strong>（输入框下方一行按钮，从左到右）：
+        <ul>
+          <li><strong>项目</strong>胶囊：显示当前项目名，点开选项目。</li>
+          <li><strong>模型</strong>胶囊：显示当前后端/模型，点开切换。</li>
+          <li><strong>工作流</strong>图标按钮（分支图标）：点开选一个已启用的工作流来运行本次任务，不选就是普通会话。菜单里每项标注「内置 / 自定义 / 团队 · 队友名」和节点数。</li>
+          <li><strong>证据链</strong>图标按钮（线索图标）：跳到证据链页面，从线索发起会话或查看当前引用的线索。</li>
+          <li><strong>数字员工</strong>图标按钮（人头图标，配了员工才出现）：点开选本次工作交给哪个员工，菜单里每项标注「工作流名 · Dream 生效」。</li>
+          <li><strong>发送</strong>按钮（纸飞机图标）。</li>
+        </ul>
+      </li>
+      <li><strong>最近会话</strong>列表（工具条下方）：最多 6 条，点一下直接打开。</li>
+    </ul>
+    <p>三个发送快捷键：</p>
+    <div class="hotkey-list">
+      <dl>
+        <dt><kbd>Enter</kbd></dt><dd>发送，开始新会话。</dd>
+        <dt><kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Enter</kbd></dt><dd>创建临时会话（标「临时」徽章，程序关闭时自动删除）。</dd>
+        <dt><kbd>Alt</kbd>+<kbd>Enter</kbd></dt><dd>在 git worktree 中执行（弹窗填分支名，详见<a href="#worktree">下文</a>）。仅当前目录是 git 仓库时可用。</dd>
+      </dl>
+    </div>
+    <p>输入框为空时，占位符会提示当前模式：<code>描述任务，Enter 发送 · Ctrl+Enter 临时会话 · Alt+Enter 在 worktree 执行</code>。</p>
+
+    <h2 id="input">输入框的全部技巧</h2>
+    <div class="hotkey-list">
+      <dl>
+        <dt>输入 <code>/</code></dt><dd>弹出斜杠命令菜单。<kbd>↑</kbd><kbd>↓</kbd>选择、<kbd>Tab</kbd> 或 <kbd>Enter</kbd> 插入，<kbd>Esc</kbd> 关闭。</dd>
+        <dt>空框按 <kbd>↑</kbd></dt><dd>弹出历史输入菜单（你之前发过的提示词，含图片附件数量）。<kbd>↑</kbd><kbd>↓</kbd>选择、<kbd>Tab</kbd>/<kbd>Enter</kbd> 插入。</dd>
+        <dt>空框按 <kbd>↓</kbd></dt><dd>恢复上次未发送的草稿（含图片附件）。</dd>
+        <dt><kbd>Shift</kbd>+<kbd>Enter</kbd></dt><dd>换行。</dd>
+        <dt>直接粘贴 / 拖入文件</dt><dd>图片作为附件显示在输入框上方的附件条；可多张，点 × 删除。</dd>
+        <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd></dt><dd>把剪贴板里的文件作为<strong>路径文本</strong>插入（不作为附件）。适合把文件路径告诉 AI。</dd>
+      </dl>
+    </div>
+    <h4>任务运行中再输入会怎样</h4>
+    <p>回车会把新提示词加入「待发送队列」，输入框上方出现队列条目（带序号、文本预览、附件数）。每条右边两个按钮：</p>
+    <ul>
+      <li><strong>撤回</strong>（撤销图标）：把这条拿回输入框，可改后再发。</li>
+      <li><strong>发送</strong>（纸飞机图标）：立即作为引导发送。支持引导的后端（Vega、Lyra、Codex、Devin、Cursor、OpenCode）可在运行中直接插入；不支持的按钮会置灰。</li>
+    </ul>
+    <p>队列头部提示「当前任务结束后自动发送」或「已停止，可手动发送或撤回」。空输入框按 <kbd>Enter</kbd> 也会立即发送队列第一条作为引导。</p>
+
+    <h2 id="slash">斜杠命令速查</h2>
+    <p>输入 <code>/</code> 弹出菜单，列出 Nova 内置命令和当前后端自带的命令。内置命令：</p>
+    <table>
+      <thead><tr><th>命令</th><th>怎么用</th></tr></thead>
+      <tbody>
+        <tr><td><code>/plan</code></td><td>让 AI 先出一份待办清单（计划卡片），不直接编码。计划结束后会弹「实施此计划？」卡片，点「是，实施此计划」即按计划开始编码，点「否」放弃。</td></tr>
+        <tr><td><code>/easy</code></td><td>显而易见的小修改：不运行或编写测试，仅做基本编译校验。</td></tr>
+        <tr><td><code>/stage</code></td><td>用配置的 Stage 模型开启一个新会话，引用当前会话作为前置内容。<code>/stage</code> 等同 <code>/stage1</code>，可在「设置 → 通用 → Stage 模型」配置 <code>/stage2</code>、<code>/stage3</code>… 用的模型。</td></tr>
+        <tr><td><code>/fire</code></td><td>分阶段执行，并用独立会话反复验收直到目标达成。配合 <code>/target</code> 明确验收规则。</td></tr>
+        <tr><td><code>/target</code></td><td>为 <code>/fire</code> 明确指定验收规则，需与 <code>/fire</code> 一起发送。</td></tr>
+        <tr><td><code>/run 工作流名 目标</code></td><td>运行一个已配置的工作流。例如 <code>/run 评审 修复登录页</code>。可用 <code>--</code> 附带自定义变量：<code>/run 评审 修复登录页 -- criteria=不能有类型错误</code>。</td></tr>
+        <tr><td><code>/train</code></td><td>立即用大熊座配置的模型训练一次经验库。训练完弹窗告诉你新学了几条经验，并自动跳到大熊座视图。</td></tr>
+        <tr><td><code>/setup 模型名</code></td><td>把一个模型 / provider 接入 Vega。</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="session">管理你的会话</h2>
+    <p>侧边栏从上到下：</p>
+    <ul>
+      <li><strong>顶部品牌区</strong>：Nova logo + 版本号（点一下静默检查更新）。右边一排小徽章：
+        <ul>
+          <li><strong>中转站徽章</strong>（广播图标 + 在线人数）：配了团队中转站才出现。鼠标悬停弹出本群组在线名单，自己置顶标「我」。</li>
+          <li><strong>收件箱徽章</strong>（铃铛图标 + 数字）：有人 Flow 给你时出现，点一下打开收件箱。</li>
+          <li><strong>更新徽章</strong>（下载图标 / 转圈）：新版本下载中转圈，下载完变下载图标，点一下打开更新弹窗。</li>
+        </ul>
+      </li>
+      <li><strong>新对话</strong>按钮：回到首页开新会话。</li>
+      <li><strong>视图切换</strong>（两行标签）：上行「普通模式 / 工作流 / 证据链」，下行「大熊座 / 御书房 / 数字员工」。带未读角标（如御书房显示候旨+进行中数，证据链显示新提醒数，工作流显示待接收分享数）。</li>
+      <li><strong>会话列表</strong>：默认按项目目录分组（可在「设置 → 通用」改成按时间排列）。每组顶部是目录名（右键菜单：在终端/资源管理器打开），右侧有垃圾桶批量删除该目录下会话。组内超过 5 个会话会折叠，点底部箭头展开。</li>
+      <li><strong>底部</strong>：设置（齿轮）、成就（奖杯，有新成就显示数字角标）。</li>
+    </ul>
+    <h4>会话条上的标记</h4>
+    <ul>
+      <li><strong>后端徽章</strong>（如 D、Cx）：显示 Wake 用的后端。预检 → 开发子会话会显示成对徽章和箭头 <code>D → Cx</code>。</li>
+      <li><strong>worktree 分支</strong>：<code>⎇ feature/login</code>，表示在独立 worktree 执行。</li>
+      <li><strong>预检 · N</strong>：该预检会话下有 N 个开发子会话。</li>
+      <li><strong>临时</strong>：临时会话，程序关闭时自动删除。</li>
+      <li><strong>时间</strong>：今天显示时分，其他显示月日。</li>
+      <li><strong>垃圾桶</strong>：删除该会话（运行中的会话不能删）。</li>
+    </ul>
+    <h4>会话右键菜单</h4>
+    <ul>
+      <li>worktree 会话：「合并到分支…」「在终端中打开 worktree」「在资源管理器中打开 worktree」。</li>
+      <li>普通会话：「在终端中打开」「在资源管理器中打开」。</li>
+      <li>漫游会话（队友目录）：显示「队友的目录，无法在本机操作」。</li>
+    </ul>
+    <div class="callout tip">
+      <strong>记忆延续：</strong>应用重启后，之前的会话会自动恢复上下文，可以接着聊。会话历史保存在本地 <code>~/.nova/</code> 目录下。
+    </div>
+
+    <h2 id="watch">看懂 AI 的工作过程</h2>
+    <p>会话视图从上到下：顶栏（标题+按钮）→ 中间对话区（滚动）→ 底部输入框。对话区里每条内容：</p>
+    <ul>
+      <li><strong>你的消息</strong>：右对齐圆角块。鼠标悬停右上角出现铅笔图标，点一下可<strong>编辑这条消息并从这里重新开始</strong>（后续内容全部作废，相当于 git reset）。编辑时可改文本、管理附件，<kbd>Enter</kbd> 发送。</li>
+      <li><strong>AI 的回复</strong>：左对齐正文，Markdown 渲染。代码块右上角有复制按钮（点一下变 ✓）。正文里出现的文件路径会变成可点击的按钮：单击在配置的编辑器里打开（带行号），右键「打开所在目录」。图片文件单击用系统默认程序打开。</li>
+      <li><strong>思考过程</strong>：可折叠块，默认折叠。点「思考过程」展开看 AI 的推理。</li>
+      <li><strong>工具调用</strong>：紧凑一行——图标 + 标题 + diff 统计（<code>+N -N</code>）+ 耗时 + 状态点（转圈=进行中，红点=失败）。点整行展开详情：
+        <ul>
+          <li><strong>命令执行</strong>：显示输出（带复制按钮）。</li>
+          <li><strong>文件编辑</strong>：显示 diff 视图，左绿右红。文件路径可点击在编辑器打开，右键「打开所在目录」。</li>
+          <li><strong>位置芯片</strong>：涉及的文件位置（<code>文件名:行号</code>），点击跳转编辑器。</li>
+          <li><strong>原始数据</strong>：点「原始数据」可看工具的原始输入/输出 JSON。</li>
+        </ul>
+      </li>
+      <li><strong>已编辑文件卡片</strong>：每个回合结束如果改了文件，底部出现「已编辑 N 个文件 +X -Y」卡片，列出每个文件路径和增删行数。点文件在编辑器打开。右上角「撤销」按钮：把这些文件恢复到本轮编辑前的内容（被后续修改过的文件会跳过），撤销后按钮变「已撤销」。</li>
+      <li><strong>回合折叠</strong>：长回合中间过程会折叠成一行（如「12 个工具调用 · 1.2k tokens」），点展开。</li>
+    </ul>
+
+    <h2 id="permission">审批 AI 的敏感操作</h2>
+    <p>当后端要执行敏感操作时，对话区底部弹出一张审批卡片。两种形态：</p>
+    <h4>按钮审批</h4>
+    <p>卡片标题形如「Devin 请求权限：执行工具」，下方 <code>pre</code> 块显示操作预览（命令、路径等）。底部一排按钮是<strong>后端动态返回的选项</strong>（例如「允许一次」「总是允许」「拒绝」等，具体文案以后端为准）。点哪个就按哪个响应。</p>
+    <h4>问答审批</h4>
+    <p>卡片标题形如「Devin 需要确认：…」，下面列出若干问题。每题有候选选项按钮（单选点一个即选中，多选可点多个），每个选项下可能有小说明。如果该题允许自定义答案，下方有「输入其他答案」输入框。全部回答后点「提交回答」；也可「拒绝回答」。</p>
+
+    <h2 id="plan">让 AI 先出计划再动手</h2>
+    <p>发送 <code>/plan 你的任务</code>。AI 会先产出一份待办清单，对话区显示「计划」卡片：标题旁有进度「已完成 / 总数」，每条带状态点（完成/未完成）。点标题可折叠/展开清单。</p>
+    <p>计划结束后（任务停止运行时），输入框上方弹出「实施此计划？」卡片：「按计划开始编码，或继续用 /plan 补充规划。」两个按钮：</p>
+    <ul>
+      <li><strong>是，实施此计划</strong>：AI 按计划开始编码。</li>
+      <li><strong>否</strong>：放弃，可继续用 <code>/plan</code> 补充规划。</li>
+    </ul>
+
+    <h2 id="chat-head">会话顶栏按钮一览</h2>
+    <p>打开会话后，顶栏从左到右依次是：</p>
+    <ul>
+      <li><strong>标题</strong>：双击进入重命名模式，<kbd>Enter</kbd> 保存，<kbd>Esc</kbd> 取消。</li>
+      <li><strong>星标</strong>（星形按钮）：加星后在该项目内置顶。</li>
+      <li><strong>后端徽章</strong>：如 Devin、Codex。</li>
+      <li><strong>漫游徽章</strong>（仅漫游会话）：guest 显示「漫游 @ 队友」（在对方机器执行），host 显示「代执行 · 队友」（替对方在本机执行）。</li>
+      <li><strong>额度徽章</strong>（仅额度会话）：「额度 · 队友」（临时借用对方加密授权额度）。</li>
+      <li><strong>工作目录</strong>：普通会话显示路径；worktree 会话显示「仓库名 ⎇ 分支」。</li>
+      <li><strong>累计 tokens</strong>：鼠标悬停看明细（按输入/输出/缓存拆分）。</li>
+      <li><strong>压缩</strong>按钮（仅 Codex 后端）：把当前长历史浓缩为摘要，后续仅基于摘要继续，加快响应。</li>
+      <li><strong>Flow</strong>按钮：把当前会话分享给队友（详见<a href="#share">下文</a>）。</li>
+      <li><strong>召回</strong>按钮（仅 guest 漫游会话）：把这段漫游会话拿回本机，对方自动回传完整快照。</li>
+      <li><strong>世界线</strong>入口（右侧时钟图标，展开后显示）。</li>
+    </ul>
+    <p>底部输入框上方还有：</p>
+    <ul>
+      <li><strong>运行状态条</strong>（运行中显示）：圆点 + 已运行时长 + 「上下文 X / Y tokens」。鼠标悬停看明细。</li>
+      <li><strong>证据链</strong>按钮（线索图标）：本会话引用了线索时高亮，点一下跳到证据链。</li>
+      <li><strong>数字员工</strong>选择器（人头图标，仅新普通会话且配了员工才出现）。</li>
+      <li><strong>停止</strong>按钮（方块图标，运行中才显示）：点一下停止。普通会话直接停；员工会话弹「停止数字员工」对话框，可填停止原因告诉 Dream，点「直接停止」或「提交原因并停止」。</li>
+      <li><strong>发送</strong>按钮（纸飞机图标）。</li>
+    </ul>
+    <p>工作流运行到「人工审核」节点时，输入框上方还会出现「等待人工审核 · 选择下一步」横条，列出可选的下一步连线按钮，点哪个走哪条线。</p>
+
+    <h2 id="worldline">世界线：回到任何一个时间点</h2>
+    <p>每个会话有一条时间线，记录你每次发送提示词后产生的工作目录快照（Checkpoint）。点顶栏右侧的时钟图标展开「世界线」侧栏：</p>
+    <ul>
+      <li><strong>节点图</strong>：每个圆点是一个时间点，上面的数字是该时间点的提示词数量。当前时间线上的节点高亮，分叉的节点用不同颜色。成功/失败结果用不同颜色区分。</li>
+      <li><strong>点节点</strong>：跳转到那个时间点——预览该时间点的会话历史。如果开了 Checkpoint（见下），还会把工作目录文件还原到对应时间点。顶部出现「回到当前时间线」横条，点一下回到最新。</li>
+      <li><strong>右键节点</strong>：菜单可「标记成功/失败/清除结局标记」（结局标记会作为时光笔记的提示），以及各种删除上下文操作（删除到开始/向上 N 个/自身/向下 N 个/删除到结尾）。</li>
+      <li><strong>时光笔记</strong>按钮：弹窗填 skill 名称、选训练后端和模型，确认后新开一个训练会话，自行阅读这条世界线的成败历史并逐级分析，沉淀为可复用的 skill。</li>
+    </ul>
+    <div class="callout warn">
+      <strong>Checkpoint 还原</strong>需在「设置 → 高级 → 世界线 → 启用 Checkpoint」开启。开启后从其他时间线继续对话会把工作目录文件还原到对应时间点，请谨慎使用。默认关闭时只切换会话历史，不修改当前文件。
+    </div>
+
+    <h2 id="worktree">在独立分支里干活</h2>
+    <p>想让 AI 在独立分支目录里干活、不污染主工作区？在首页输入框写好任务后按 <kbd>Alt</kbd>+<kbd>Enter</kbd>，弹出「在 worktree 中执行」对话框：</p>
+    <ol>
+      <li><strong>新分支名（可留空）</strong>：填新分支名（如 <code>feature/login</code>）= 基于所选分支切新分支；留空 = 直接使用下面所选分支（不能是已检出的分支）。</li>
+      <li><strong>基于分支</strong>：可搜索/手填的下拉，默认当前分支。点开列出所有分支，当前分支标「当前」。</li>
+      <li>点「创建并执行」（填了新分支名）或「在所选分支执行」（留空）。</li>
+    </ol>
+    <p>会话在独立 worktree 目录执行，侧边栏会话条显示 <code>⎇ 分支名</code>。</p>
+    <h4>合并回主分支</h4>
+    <p>右键 worktree 会话 →「合并到分支…」→ 弹窗列出可选目标分支，点选一个 → 点「合并」。若产生冲突，会自动交给该会话的 AI 解决并完成合并提交。合并前请确认 worktree 里的改动都已提交。</p>
+    <h4>集中管理</h4>
+    <p>所有 worktree 在「设置 → Worktree」里集中管理：查看分支、关联会话、移除（可选「同时删分支」；直接检出已有分支的 worktree 移除时不删分支）。这些工作目录不随会话删除而自动清理。</p>
+
+    <h2 id="views">六大视图</h2>
+    <p>侧边栏两行标签切换六个视图：</p>
+
+    <h3 id="v-normal">普通模式</h3>
+    <p>默认视图，列出你自己的会话，按项目分组。日常下达任务、看过程、审结果都在这里。</p>
+
+    <h3 id="v-workflow">工作流</h3>
+    <p>可视化的工作流编排器。左上角悬浮「工作流列表」按钮（显示当前工作流名），点一下展开左侧抽屉：</p>
+    <ul>
+      <li><strong>新建</strong>按钮：创建一个空工作流。</li>
+      <li><strong>导入</strong>按钮（连了中转站才出现）：导入队友共享的工作流，有待接收会显示数字角标。</li>
+      <li><strong>删除</strong>按钮：删除选中工作流（内置的不能删）。</li>
+      <li><strong>工作流列表</strong>：内置标「内置」徽章，队友分享标「团队」徽章，停用的标「已停用」。点一下选中并关闭抽屉。</li>
+      <li>底部「从内置复制：」可克隆内置工作流作为起点。</li>
+    </ul>
+    <p>选中工作流后，右侧画布显示节点图。画布上方浮动工具条：</p>
+    <ul>
+      <li><strong>名称输入框</strong>：改工作流名（内置的禁用）。</li>
+      <li><strong>已启用/已停用</strong>芯片：点击切换。停用后不出现在新会话选择和 <code>/run</code> 中。</li>
+      <li><strong>编辑</strong>按钮：编辑选中的阶段或连线（也可双击节点/连线）。</li>
+      <li><strong>阶段</strong>按钮：添加一个新阶段节点。</li>
+      <li><strong>撤销</strong>：放弃未保存改动。</li>
+      <li><strong>保存</strong>：保存改动。</li>
+      <li><strong>共享到团队 / 撤回共享</strong>（连了中转站才出现）。</li>
+    </ul>
+    <p>画布操作提示（右下角浮动）：双击节点/连线编辑 · 拖右侧手柄连线 · 右键删除 · 滚轮缩放。</p>
+    <h4>编辑阶段</h4>
+    <p>双击节点或选中后点工具条「编辑」，弹出阶段编辑窗：</p>
+    <ul>
+      <li><strong>阶段名称</strong>输入框 + 「设为首节点」按钮。</li>
+      <li><strong>人工审核</strong>勾选框：开启后节点完成时暂停，不由模型判断去向；用户在会话底部手动选下一步连线。</li>
+      <li><strong>模型</strong>选择器：默认「跟随会话」，可选指定后端/模型。</li>
+      <li><strong>提示词模板</strong>：支持占位符 <code>{{goal}}</code>（启动时填的目标）、<code>{{prev}}</code>（上一节点结论）、<code>{{attempt}}</code>（第几次进入）、<code>{{criteria}}</code> 等自定义变量。</li>
+      <li>底部「删除该阶段」按钮。</li>
+    </ul>
+    <h4>编辑连线</h4>
+    <p>双击连线弹出：连线名称（显示在线上）+ 跳转依据（告诉引擎什么情况下走这条线，留空则用连线名称）。去向由提示词判断：引擎把跳转依据隐式插进前一节点的提示词，要求它标明所选去向；未明确则由轻量模型按结论判断。</p>
+    <h4>运行工作流</h4>
+    <p>两种方式：在首页输入框点工作流图标按钮选一个，或在会话里输入 <code>/run 工作流名 目标</code>。</p>
+
+    <h3 id="v-clue">证据链</h3>
+    <p>像刷微博一样浏览「线索」：点卡片原地展开全文与回帖，线索之间的连接以回帖形式呈现。右上角：</p>
+    <ul>
+      <li><strong>个人空间 / 团队空间</strong>切换：个人空间始终本地保存；团队空间通过中转站共享（需先连接）。团队空间按钮未连接时置灰。</li>
+      <li><strong>新建线索</strong>按钮：弹出线索捕获窗（见下）。</li>
+    </ul>
+    <h4>线索卡片</h4>
+    <p>每张卡片：作者头像 + 时间 + 版本号 <code>vN</code> + 标题 + 摘要。点卡片展开全文。底部操作行（灰字横排）：</p>
+    <ul>
+      <li><strong>回帖数</strong>（或「回帖」）：点一下展开回帖楼层。</li>
+      <li><strong>N 接力</strong>：回复本条的下一条线索，点一下跳过去。</li>
+      <li><strong>N 附件 / N 提醒 / 新提醒</strong>：附件可点击打开/下载；@ 提醒的成员高亮。</li>
+      <li><strong>连接</strong>：点一下进入连接模式，再点另一张卡片即建立连接（回帖关系）。</li>
+      <li><strong>回复线索</strong>：弹出线索捕获窗，默认「堆叠线索」。</li>
+      <li><strong>发起会话</strong>：以这条线索作为上下文开一个新会话。</li>
+      <li><strong>更新</strong>：弹出线索捕获窗，默认「更新旧线索」。</li>
+      <li><strong>删除</strong>：删除该线索。</li>
+    </ul>
+    <h4>展开后的回帖区</h4>
+    <p>「接力这条线索的回帖」列出后续线索（点一下跳过去）。「全部回帖」按时间排列每条回帖，点回帖右下「回复」即回复该回帖（自动 @ 原作者）。底部有回帖输入框 + @ 提醒选择器 + 「发表回帖」按钮。</p>
+    <h4>线索捕获窗</h4>
+    <p>三种去向按钮：</p>
+    <ul>
+      <li><strong>更新旧线索</strong>：选一条已有线索，给它加新版本。</li>
+      <li><strong>堆叠线索</strong>：在同一组里加平行线索。</li>
+      <li><strong>开启新线索</strong>：新建一条独立线索（可选前置线索，下拉里选「不接前置线索」则无前置）。</li>
+    </ul>
+    <p>下方：线索标题输入框 + 线索内容文本域（可直接粘贴图片或文件，也可「添加附件」按钮选本地文件）+ @ 提醒选择器 + 「保存线索」按钮。从会话里打开时还有「AI 总结」按钮（用轻量模型总结会话核心内容）和「保存空间」选择（个人/团队）+「与同会话线索堆叠」勾选框。</p>
+
+    <h3 id="v-employee">数字员工</h3>
+    <p>配置你的常驻 AI 员工。左侧员工列表（绿点=在岗，灰点=休息；显示后端徽章、心跳周期或「手动」或「休眠中」），右侧详情。右上角「去御书房」和「新建员工」按钮。</p>
+    <h4>新建/编辑员工弹窗</h4>
+    <ul>
+      <li><strong>名字</strong>：如「后端小助手」。</li>
+      <li><strong>工作模型</strong>：和新会话一样的后端/模型选择器。运行权限固定 Build（全自动）；需规划时在会话里用 <code>/plan</code>。</li>
+      <li><strong>允许员工使用独立 git worktree</strong>勾选：只控制能力边界，员工自己决定用不用。</li>
+      <li><strong>工作流</strong>下拉：选已配置的工作流。默认内置「开工预检 → 开发（Wake → Do）」。</li>
+      <li><strong>岗位说明书（启动提示词）</strong>：定义它是谁、负责什么、工作规范与偏好。</li>
+      <li><strong>自动心跳</strong>勾选：开启后定时巡查、自动领活；关闭则只在御书房交办或朱批时行动。</li>
+      <li><strong>Dream 模型</strong>：独立于 Wake，只在员工没工作且有新事件时反思学习、合并经验、降级低价值记忆。</li>
+      <li>开了心跳才显示：<strong>心跳周期</strong>（秒，有预设按钮）+ <strong>巡查/心跳模型</strong>（建议选便宜的）+ <strong>上班时间</strong>勾选（开启后设时段和星期，时段外自动休眠；跨夜班可设 22:00 至 06:00；不选任何星期=每天都上班）。</li>
+      <li><strong>创建后立即上岗</strong>勾选：到点自动干活。</li>
+      <li><strong>常驻职责</strong>：去哪里找、找什么样的单子、怎么算完成。留空则只处理你登记到账本的单子。</li>
+      <li><strong>协作账本 scope</strong>：多个员工填相同 scope 即可对同一批单子去重、互斥认领、失败接力。</li>
+      <li><strong>共享到中转站</strong>勾选：同组队友填相同 scope 时共用一个账本，跨机器去重/互斥/接力。</li>
+      <li><strong>讨论伙伴</strong>：本机其他员工（勾选）+ 跨机队友伙伴（填队友展示名 + 对方员工名，可添加多个）。</li>
+    </ul>
+    <h4>员工详情页</h4>
+    <ul>
+      <li>顶部：名字 + 后端徽章 + 「动态工作目录」+ 心跳周期/「手动指派」+ 上班时间 + 工作流名 + 「休眠中」徽章（非上班时段）。右侧按钮：停用/启用、编辑（齿轮）、解雇（垃圾桶）。</li>
+      <li><strong>常驻职责</strong>区块：显示职责正文 + 账本 scope + 讨论伙伴。</li>
+      <li><strong>Dream</strong>区块：状态（运行中/暂停/冷却/空闲）+ 待处理事件数 + 记忆数/上限 + 保护数。按钮：暂停/启用/恢复。</li>
+      <li><strong>记忆 / 知识库</strong>区块：
+        <ul>
+          <li>「添加知识」按钮：弹出文本域，写清适用条件和结论，保存为人工知识。</li>
+          <li>分类标签：<strong>全部 / 人工 / Dream / 长期</strong>（带数量）。</li>
+          <li>每条记忆：徽章（人工/Dream/长期）+ 任务标题 + 时间。右侧按钮：点赞（Dream 优先保留强化）、点踩（Dream 优先复核修正降级）、设为长期知识（图钉）、编辑、删除。人工分类不显示点赞点踩。</li>
+        </ul>
+      </li>
+    </ul>
+
+    <h3 id="v-workbench">御书房</h3>
+    <p>日常交办与批阅的入口。顶部标题 + 统计（候旨数、待阅汇报数、进行中数）+「下旨」按钮。三个区块：</p>
+    <h4>进行中事件</h4>
+    <p>交办后正在进行的单子。每条：状态标签 + 标题 + 承办员工 + scope + 更新时间。右侧按钮：打开关联会话（眼睛）、删除事件（垃圾桶）。</p>
+    <h4>候旨</h4>
+    <p>员工遇到拿不准的大事时上奏到这里。每张奏折卡片：</p>
+    <ul>
+      <li>头部：分类标签 + 员工名（+ Wake/Mind 来源）+ 任务标题 + 时间 + 「留中不发」×按钮。</li>
+      <li>元信息：单号 + scope + 「查看关联对话」按钮（打开员工上奏时的会话看上下文）。</li>
+      <li>岗位说明 + 背景 + 建议动作（如有）。</li>
+      <li><strong>所奏何事</strong>：员工的问题。</li>
+      <li><strong>可选批示</strong>：员工给的候选选项按钮，点一下填入下方文本框（可改后再准奏）。</li>
+      <li>底部：朱批文本框 + 三个按钮：<strong>准奏</strong>（或 <kbd>Ctrl</kbd>+<kbd>Enter</kbd>）、<strong>留中不发</strong>（不作批示，员工自行斟酌推进）、<strong>驳回</strong>。</li>
+    </ul>
+    <h4>完工汇报</h4>
+    <p>员工干完一单活后汇报。每条：员工名 + 任务标题 + 时间 + 「查看对话」按钮 + 「已读」按钮。下方有评价文本框 + 「批阅」按钮（批示会供 Dream 反思学习）。</p>
+    <h4>已批阅</h4>
+    <p>已处理的奏折，带结局标签（准奏/驳回/留中）和「朱批」徽章。</p>
+    <h4>下旨</h4>
+    <p>点右上角「下旨」按钮弹窗：选交办给的员工（下拉，显示是否启用、是否手动）+ 写旨内容文本框（可粘贴或拖入图片）。<kbd>Enter</kbd> 下旨，<kbd>Shift</kbd>+<kbd>Enter</kbd> 换行。点「下旨」按钮提交，员工即开始干活。</p>
+
+    <h3 id="v-training">大熊座</h3>
+    <p>经验训练与查看。顶部显示当前项目（可用 ProjectPicker 切换；训练数据按项目独立保存，同一仓库的 worktree 共享一份），统计：训练轮次、演进世代、知识总数、上次训练时间。右上角：</p>
+    <ul>
+      <li><strong>世代演进</strong>按钮：手动触发一次群岛遗传世代演进（选择、交叉、变异、迁移、淘汰）。完成后显示「第 N 代：审核 X 条，形成 Y 条新经验，去重 Z 条」。</li>
+      <li><strong>立即训练</strong>按钮（或 <code>/train</code>）：用配置的训练模型跑一次经验库训练。</li>
+    </ul>
+    <p>下方三张卡片说明三类知识：<strong>经验</strong>（从结果归纳的条件性结论，可反馈和淘汰）、<strong>记忆</strong>（从会话提炼的长期事实）、<strong>守则</strong>（强约束）。</p>
+    <h4>北斗七星专家</h4>
+    <p>画面上七颗星代表七个独立经验专家（参宿一~七，对应 fast/concrete/balanced/abstract/negative/novel/slow 七种认知视角）。每颗星按真实恒星参数渲染（大小、色温、闪烁）。星上有未评分经验数会显示红色数字角标。点一颗星选中，下方显示该专家产出的经验条目：</p>
+    <ul>
+      <li>每张经验卡：类型标签（经验/记忆/守则）+ 泛用/项目独有 + 更新日期 + 触发条件 + 动作 + 避免（如有）+ scope + 置信度。</li>
+      <li>底部反馈按钮：<strong>↑ 有用</strong>（再点取消）、<strong>↓ 有问题</strong>（再点取消）、<strong>删除</strong>。反馈会调整经验权重。</li>
+    </ul>
+
+    <h2 id="team">团队协作</h2>
+
+    <h3 id="team-relay">连接团队中转站</h3>
+    <p>「设置 → 团队」里配置：</p>
+    <ul>
+      <li><strong>中转服务地址</strong>：一般用默认（留空回退默认）。</li>
+      <li><strong>身份 token</strong>：填服务端为你配置的 token。旁边「验证」按钮可测试连接。<strong>填了 token 即开启团队/漫游，清空 token 即关闭。</strong></li>
+      <li><strong>群组</strong>：逗号或空格分隔，可多个。只有<strong>相同群组</strong>的人才能在在线名单里看到彼此、互相分享/漫游。留空 = 默认群组。</li>
+    </ul>
+    <p>连接后侧边栏顶部出现中转站徽章，鼠标悬停看本群组在线名单（自己置顶标「我」）。</p>
+
+    <h3 id="roam">漫游到队友的机器</h3>
+    <p>先在「设置 → 团队 → 允许漫游的项目」里添加你想对外开放的本地项目（每行一个，用 ProjectPicker 选；未列入的目录不会展示给队友）。队友就能在他的首页项目选择器里选你的目录发起漫游会话——<strong>每次请求仍需你在本机确认</strong>。</p>
+    <p>两种漫游方向：</p>
+    <ul>
+      <li><strong>guest 漫游</strong>：你在队友的机器上执行，本机只接收过程展示，只读。会话顶栏显示「漫游 @ 队友」。可点「召回」把完整快照拿回本机（对方自动回传，到你的收件箱选项目接收）。</li>
+      <li><strong>host 代执行</strong>：队友的活儿在你本机执行，你替对方跑。会话顶栏显示「代执行 · 队友」。</li>
+    </ul>
+    <p>「允许 server 端远程控制」默认关闭。手动开启并保存后，server 端才可查看会话、读取项目文件或发送远程操作。可点「远控二维码」生成二维码用手机扫码打开远控页面。</p>
+
+    <h3 id="share">把会话 Flow 给队友</h3>
+    <p>会话顶栏点「Flow」按钮弹出分享窗，顶部三个标签：</p>
+    <ul>
+      <li><strong>线索</strong>（默认）：嵌入线索捕获窗，把会话结论保存为一条线索分享。可选个人/团队空间、与同会话线索堆叠、AI 总结。</li>
+      <li><strong>快速分享</strong>：直接把当前对话原样分享给队友。下方选队友（列出在线/离线状态），点「分享」。</li>
+      <li><strong>高级分享</strong>：先用模型按你的提示词处理会话（如总结要点），把结果分享给队友。需填处理提示词、选处理模型、选队友，点「处理并分享」。处理过程会在本机新开一个会话，跑完自动发送。</li>
+    </ul>
+    <h4>接收 Flow</h4>
+    <p>队友分享给你时，侧边栏顶部出现收件箱徽章。点开收件箱弹窗，每条显示：后端徽章 + 标题 + 来自谁 + 时间 + 消息数。点「接收到…」展开项目选择列表（可搜索、可选临时目录、可浏览其它文件夹），选一个即变成你的本地会话。召回的漫游会话会标「召回」徽章。也可「忽略」。</p>
+
+    <h3 id="quota">共享你的模型额度</h3>
+    <p>「设置 → 团队 → 共享模型额度」里添加你想共享的模型（每行一个，用 ModelPicker 选）。共享的模型会以「我的 Cursor」这类一级分类出现在队友的新会话模型选择器中。队友选用时，临时借用你的加密授权额度在本机目录执行。首次添加会安全同步并预热额度租约。队友发起额度会话时会弹「正在准备额度会话」加载窗，可「取消本次漫游」。</p>
+
+    <h2 id="settings">设置详解</h2>
+    <p>侧边栏左下角「设置」按钮打开，顶部十个标签页：通用、高级、模型后端、Agent 配置、外观、团队、记忆检索、Worktree、Skills、关于。底部「取消」和「保存」按钮。</p>
+
+    <h3 id="s-general">通用</h3>
+    <h4>会话</h4>
+    <ul>
+      <li><strong>会话历史展示方式</strong>下拉：按项目（默认）/ 按时间。按时间会将普通会话按最近更新时间排列，并标出项目和模型。</li>
+      <li><strong>编辑器命令</strong>：点击文件路径时用它打开，如 <code>code</code> / <code>cursor</code> / <code>zed</code> / <code>windsurf</code>（需在 PATH 中）。</li>
+      <li><strong>自动清理过期会话</strong>勾选 + <strong>会话保留时间（小时）</strong>：启用后启动时及每小时检查，超时先移入回收站，保留同样时长才彻底删除。周六周日不计入保留时长。仅清理普通会话。</li>
+      <li><strong>会话快捷键</strong>：点「添加」录制。每行：按键（点一下按钮进入录制，按组合键即录下，<kbd>Esc</kbd> 取消）+ 动作下拉（选择模型/选择项目/快速新会话/快捷输入）+ 目标（按动作不同显示模型选择器/项目选择器/文本框）。可删除。默认 <kbd>Esc</kbd> 终止当前回合。</li>
+    </ul>
+    <h4>轻量级模型</h4>
+    <ul>
+      <li><strong>Stage 模型</strong>：按顺序配置 <code>/stage</code>、<code>/stage2</code>、<code>/stage3</code>… 用的模型。每行一个 ModelPicker，可移除。下方可添加新行。</li>
+      <li><strong>轻量级模型</strong>：用于标题生成、快速总结、摘要和上下文压缩等辅助任务；调用失败自动回退到任务原模型。</li>
+    </ul>
+    <h4>环境变量</h4>
+    <ul>
+      <li><strong>刷新 Windows 环境变量</strong>按钮：从注册表重新读取系统和当前用户环境变量，覆盖 Nova 启动时继承的同名变量。之后新启动的 agent 进程会用新值。</li>
+    </ul>
+    <h4>更新</h4>
+    <p>说明文字：新版本后台自动下载，空闲时间弹窗提示，不会强制静默重启。</p>
+
+    <h3 id="s-backends">模型后端</h3>
+    <p>每个后端一张卡片，可单独启用/关闭（至少保留一个启用）。关闭的后端不出现在新建/切换会话的后端列表里（历史会话仍可打开）。</p>
+    <table>
+      <thead><tr><th>后端</th><th>卡片上的配置项</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Vega (alkaid)</strong></td><td>启用勾选 · 代理 · 「刷新配置」按钮（修改 <code>~/.nova/alkaid/config.jsonc</code> 后点此重载模型列表）</td></tr>
+        <tr><td><strong>Lyra</strong></td><td>启用勾选（Rust 原生 agent，与 Vega 共用模型配置与 Skills）</td></tr>
+        <tr><td><strong>Devin</strong></td><td>启用勾选 · CLI 管理器（查看状态/升级）· 可执行文件 · 启动参数 · 代理 · 额度（日/周百分比 + 积分，可刷新）</td></tr>
+        <tr><td><strong>CodeBuddy</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · 代理</td></tr>
+        <tr><td><strong>Claude Code</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · Anthropic API Key · 代理</td></tr>
+        <tr><td><strong>Codex</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · 代理</td></tr>
+        <tr><td><strong>Cursor</strong></td><td>启用勾选 · CLI 管理器 · Cursor API Key · 代理 · 按模型 ID 自定义上下文窗口</td></tr>
+        <tr><td><strong>OpenCode</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · 代理</td></tr>
+      </tbody>
+    </table>
+    <p>每个 SDK 后端的 CLI 管理器显示：CLI 名称、版本（未安装标红）、状态消息、升级按钮（升级时显示进度和输出）。</p>
+    <p>底部「重启所有 agent 进程」按钮：任务卡死（如后端网络重试不止）时使用，所有运行中的轮次立即结束，会话上下文下次发消息时自动恢复。</p>
+    <div class="callout warn">
+      <strong>注意：</strong>修改后端配置会重启对应 agent 进程，进行中的会话将被打断（上下文下次发消息时自动恢复）。未检测到 CLI 的后端保存后会自动重新检测。
+    </div>
+
+    <h3 id="s-instructions">Agent 配置</h3>
+    <p>集中维护一份<strong>全局指令</strong>（如「始终使用中文；修改代码后执行聚焦测试；不要覆盖用户已有改动」）。Nova 会按已启用后端的原生规则入口分别适配。顶部显示集中配置文件路径（<code>~/.nova/global-agent-instructions.md</code>）。下方：</p>
+    <ul>
+      <li><strong>全局指令</strong>文本域：编辑内容。「保存并同步」按钮。</li>
+      <li><strong>后端适配状态</strong>列表：每个已启用后端一行，可单独开关适配。显示状态（已同步/待同步/已取消适配）和文件路径。</li>
+    </ul>
+    <p>清空后同步会移除 Nova 创建的托管文件/区块，不删各后端原有配置。正在运行的 Agent 需重启后读取新内容。</p>
+
+    <h3 id="s-team">团队</h3>
+    <p>配置团队中转站（地址、token、群组）、远控、允许漫游的项目、共享模型额度。详见上文<a href="#team">团队协作</a>章节。</p>
+
+    <h3 id="s-memory">记忆检索</h3>
+    <h4>语义检索</h4>
+    <ul>
+      <li><strong>启用语义检索</strong>勾选：关闭则用内置 BM25 关键词检索（零依赖）。</li>
+      <li><strong>服务地址</strong>：OpenAI 兼容的 base 地址。可填本地 Ollama（<code>http://localhost:11434</code>）、服务器地址、或任意 OpenAI 兼容的 <code>/v1/embeddings</code> 服务。</li>
+      <li><strong>模型名</strong>：中文/多语言推荐 <code>bge-m3</code>；轻量可用 <code>nomic-embed-text</code>。</li>
+      <li><strong>API Key</strong>：本地服务留空；云端填对应 key。</li>
+      <li><strong>测试连接</strong> / <strong>下载模型（Ollama）</strong>按钮。</li>
+    </ul>
+    <p>连不上时自动回退 BM25，员工记忆检索始终可用。</p>
+    <h4>经验训练</h4>
+    <ul>
+      <li><strong>定期从新会话训练多个独立知识库</strong>勾选。</li>
+      <li><strong>训练模型</strong>选择器。</li>
+      <li><strong>训练间隔（分钟）</strong> / <strong>世代演进间隔（分钟）</strong>：到间隔自动执行。</li>
+      <li><strong>经验专家配置</strong>：七个专家各可调写入率、更新率、遗忘率、迁移率。「重置为基础权重」按钮只恢复参数不删已有内容。</li>
+    </ul>
+
+    <h3 id="s-worktree">Worktree</h3>
+    <ul>
+      <li><strong>worktree 根目录</strong>：留空 = 应用数据目录下的 <code>worktrees/</code>。可「浏览…」选择。改动仅对之后新建的 worktree 生效。</li>
+      <li><strong>已创建的 worktree 列表</strong>：每行显示分支 + 仓库名 + 漫游标签 + 路径 + 关联会话标题（或「无关联会话」）。右侧：「同时删分支」勾选框（直接检出已有分支的显示「已有分支」不可勾）+ 「移除」按钮。可「刷新」。</li>
+    </ul>
+
+    <h3 id="s-skills">Skills</h3>
+    <p>Skill 统一放在 <code>~/.nova/skills</code>，启动各后端时会以软链接/目录联接同步到 Codex / Claude Code / Cursor / OpenCode / agents 的全局 skills 目录，不拷贝文件。</p>
+    <ul>
+      <li>顶部：集中目录路径（只读）+「打开」按钮（在文件管理器打开）+「同步」按钮（重新同步到各后端）。</li>
+      <li>拖放区：拖入 zip 或 skill 文件夹安装（每个 skill 需含 <code>SKILL.md</code>）。也可「上传 zip…」「选择文件夹…」「刷新」。</li>
+      <li>已安装列表：每行显示 skill 名 + 描述/路径 + 「删除」按钮。</li>
+    </ul>
+
+    <h3 id="s-appearance">外观</h3>
+    <p>浅色 / 深色两套主题，点一下即换，选择自动记住。</p>
+
+    <h3 id="s-advanced">高级</h3>
+    <h4>上下文机制</h4>
+    <ul>
+      <li><strong>Cursor 上下文</strong>下拉：默认 / 超级（旧版超级上下文）。</li>
+      <li><strong>代码上下文检索</strong>下拉：无 / FastContext（默认，原生常驻服务 + 增量索引）。保存后重启相关 Agent 生效。</li>
+    </ul>
+    <h4>聊天视图</h4>
+    <ul>
+      <li><strong>渲染方式</strong>下拉：Canvas（默认，超长会话更省 DOM、滚动更轻）/ canvas(qwen)（GLM canvas 实验实现）/ DOM（选区复制更可靠）。可随时切换，保存后立即生效。</li>
+    </ul>
+    <h4>世界线</h4>
+    <ul>
+      <li><strong>启用 Checkpoint</strong>勾选：开启后从其他时间线继续对话会还原工作目录文件到对应时间点，默认关闭。</li>
+    </ul>
+    <h4>Windows 启动</h4>
+    <ul>
+      <li><strong>Windows shell 启动 shim</strong>勾选：为 agent 子进程的 cmd/PowerShell/pwsh 使用无窗口 shim，减少控制台闪现。默认关闭，保存后重启 Nova 生效。</li>
+    </ul>
+
+    <h3 id="s-about">关于</h3>
+    <ul>
+      <li><strong>版本</strong> + 「检查更新」按钮。</li>
+      <li><strong>会话管理</strong>：「批量管理会话」按钮展开列表，每行勾选框 + 标题 + 后端 + 项目。运行中的会话禁用勾选并标「运行中」。顶部「全选」+ 「已选 N 个」+「删除选中」按钮。</li>
+      <li><strong>agent 日志</strong>：「查看 agent 日志（N）」链接展开最近 200 行日志，排障用。</li>
+    </ul>
+
+    <h2 id="misc">附录</h2>
+
+    <h3 id="notify">通知与防休眠</h3>
+    <ul>
+      <li><strong>任务完成通知</strong>：窗口不在前台时，任务结束（完成/出错/停止）会弹系统通知。Windows 点通知可唤起窗口并跳到对应会话；macOS 可通过 Dock 唤起应用。</li>
+      <li><strong>运行时防休眠</strong>：只要有会话在运行，系统不会因空闲自动休眠；所有会话结束后自动恢复。手动让电脑睡眠不受影响。</li>
+    </ul>
+
+    <h3 id="update">自动更新</h3>
+    <p>新版本会在后台自动下载（侧边栏版本号可点击静默检查；下载中顶部徽章转圈，下载完变下载图标）。下载完成后在空闲时间（没有任何会话或任务在运行）弹更新弹窗，显示 <code>v当前 → v最新</code> 和大小。两个按钮：<strong>稍后</strong> / <strong>立即更新</strong>。点「立即更新」会替换并重启应用（进行中的任务会被打断）。不会强制静默重启。</p>
+
+    <h3 id="trouble">排障</h3>
+    <h4>任务卡住一直转圈</h4>
+    <p>通常是后端网络不通导致反复重试。按顺序尝试：</p>
+    <ol>
+      <li>点输入框旁的<strong>停止</strong>按钮（或按 <kbd>Esc</kbd>）。若后端 10 秒内不响应取消，应用会强制结束本轮。</li>
+      <li>仍不行，去「设置 → 模型后端」底部「重启所有 agent 进程」，所有卡住的轮次立即结束，会话上下文下次发消息时自动恢复。</li>
+      <li>根治需保证网络能访问对应后端服务，必要时在「设置 → 模型后端」对应卡片的「代理」里填代理地址。</li>
+    </ol>
+    <h4>看到「Get-ChildItem: 找不到参数 la」之类的报错</h4>
+    <p>这是 AI 在 Windows 上尝试了 Unix 风格命令（如 <code>ls -la</code>）后自行重试纠正，属于 AI 自身行为，不是 Nova 的问题，可忽略。</p>
+    <h4>某个后端显示「未检测到 CLI」</h4>
+    <p>对应命令行工具没装或不在 PATH 里。在「设置 → 模型后端」对应卡片的「可执行文件」里填完整路径，保存后会自动重新检测。</p>
+    <h4>数据存在哪里</h4>
+    <p>会话与设置统一保存在本地 <code>~/.nova/</code> 目录下，Windows 与 macOS 一致。</p>
+
+    <div class="footer">
+      Nova 使用文档 · 以代码实际功能为准
+    </div>
+  </main>
+</div>
+</body>
+</html>
