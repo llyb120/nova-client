@@ -261,11 +261,17 @@ fn project_snapshot(cwd: &str) -> Result<(String, String, ProjectExperienceStore
     Ok((key.clone(), root, guard.project(&key)))
 }
 
+fn is_training_source_thread(thread: &Thread) -> bool {
+    // 训练与世代演进自身产生的会话都标记为 experience_thread。
+    // 这些会话只用于审计训练过程，禁止再次作为训练语料，避免自我回灌。
+    !thread.mind_thread && !thread.experience_thread
+}
+
 fn project_threads(state: &AppState, project_key: &str) -> Vec<Thread> {
     let threads = state.store.lock().unwrap().threads.clone();
     threads
         .into_iter()
-        .filter(|thread| !thread.mind_thread && !thread.experience_thread)
+        .filter(is_training_source_thread)
         .filter(|thread| project_identity(&thread.cwd).is_ok_and(|(key, _)| key == project_key))
         .collect()
 }
@@ -1184,7 +1190,7 @@ pub fn tick(app: &AppHandle) {
                 .unwrap()
                 .threads
                 .iter()
-                .filter(|thread| !thread.mind_thread && !thread.experience_thread)
+                .filter(|thread| is_training_source_thread(thread))
                 .filter_map(|thread| project_identity(&thread.cwd).ok())
                 .collect::<Vec<_>>();
             projects.sort();
@@ -1578,4 +1584,29 @@ fn evolve_generation(
     let created = offspring.len();
     store.experiences.extend(offspring);
     json!({ "generation": generation, "created": created, "crossed": crossed, "mutated": mutated, "migrated": migrated, "quarantined": quarantined })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn training_and_evolution_sessions_are_not_training_sources() {
+        let mut ordinary = Thread::new(
+            String::new(),
+            AgentKind::Lyra,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(is_training_source_thread(&ordinary));
+
+        ordinary.experience_thread = true;
+        ordinary.title = "经验训练 · 1 个来源会话 · fast".into();
+        assert!(!is_training_source_thread(&ordinary));
+
+        ordinary.title = "世代演进审核 · 第 2 代".into();
+        assert!(!is_training_source_thread(&ordinary));
+    }
 }
