@@ -16,6 +16,8 @@ const LOOP_OFFSET = 58;
 
 interface Props {
   def: WorkflowDef;
+  /** 显式只读：允许平移、缩放、选择和查看详情，但禁止拖动节点、连线与删除。 */
+  readonly?: boolean;
   onChange: (def: WorkflowDef) => void;
   selectedStageId: string | null;
   selectedTransitionId: string | null;
@@ -51,7 +53,7 @@ export function WorkflowCanvas(props: Props) {
   const [connectPos, setConnectPos] = createSignal<Point | null>(null);
   const [menu, setMenu] = createSignal<ContextMenu>(null);
 
-  const readonly = () => props.def.builtin === true;
+  const readonly = () => props.readonly === true || props.def.builtin === true;
   const stages = () => props.def.stages;
   const stageById = (id: string) => stages().find((s) => s.id === id);
 
@@ -193,6 +195,11 @@ export function WorkflowCanvas(props: Props) {
   function onNodePointerDown(e: PointerEvent, stage: WorkflowStageDef) {
     e.stopPropagation();
     setMenu(null);
+    if (readonly()) {
+      props.onSelectStage(stage.id);
+      props.onSelectTransition(null);
+      return;
+    }
     (e.target as Element).setPointerCapture?.(e.pointerId);
     if (connectFrom()) { finishConnect(stage.id); return; }
     const world = toWorld(e.clientX, e.clientY);
@@ -249,8 +256,12 @@ export function WorkflowCanvas(props: Props) {
   }
 
   // --- 连线 ---
-  function startConnect(stageId: string) { setConnectFrom(stageId); setConnectPos(null); props.onSelectStage(null); props.onSelectTransition(null); }
+  function startConnect(stageId: string) {
+    if (readonly()) return;
+    setConnectFrom(stageId); setConnectPos(null); props.onSelectStage(null); props.onSelectTransition(null);
+  }
   function finishConnect(to: string) {
+    if (readonly()) return;
     const from = connectFrom();
     setConnectFrom(null); setConnectPos(null);
     if (!from || from === to) return;
@@ -289,7 +300,7 @@ export function WorkflowCanvas(props: Props) {
       <svg
         ref={svgRef}
         class="wf-canvas"
-        classList={{ connecting: !!connectFrom() }}
+        classList={{ connecting: !!connectFrom(), readonly: readonly() }}
         onPointerMove={onPointerMove}
         onPointerUp={() => { onBackgroundPointerUp(); dragStage = null; }}
         onWheel={onWheel}
@@ -342,7 +353,7 @@ export function WorkflowCanvas(props: Props) {
             {(stage) => (
               <g
                 class="wf-node"
-                classList={{ selected: props.selectedStageId === stage.id, entry: props.def.entry === stage.id, "connect-source": connectFrom() === stage.id }}
+                classList={{ selected: props.selectedStageId === stage.id, entry: props.def.entry === stage.id, "connect-source": connectFrom() === stage.id, readonly: readonly() }}
                 transform={`translate(${stage.x},${stage.y})`}
                 onPointerDown={(e) => onNodePointerDown(e, stage)}
                 onPointerUp={(e) => onNodePointerUp(e, stage)}
@@ -355,9 +366,11 @@ export function WorkflowCanvas(props: Props) {
                   {stage.manualReview ? `人工审核 · ${stage.transitions.length} 条连线` : `${stage.transitions.length} 条连线`}
                 </text>
                 <Show when={props.def.entry === stage.id}><text class="wf-node-entry" x={10} y={-6}>起点</text></Show>
-                <circle class="wf-node-handle" cx={NODE_W} cy={NODE_H / 2} r={8} onPointerDown={(e) => { e.stopPropagation(); startConnect(stage.id); }}>
-                  <title>拖出连线</title>
-                </circle>
+                <Show when={!readonly()}>
+                  <circle class="wf-node-handle" cx={NODE_W} cy={NODE_H / 2} r={8} onPointerDown={(e) => { e.stopPropagation(); startConnect(stage.id); }}>
+                    <title>拖出连线</title>
+                  </circle>
+                </Show>
               </g>
             )}
           </For>
@@ -381,7 +394,7 @@ export function WorkflowCanvas(props: Props) {
                   else props.onDeleteTransition(cur.stageId, cur.transitionId);
                 }}
               >
-                {readonly() ? "内置只读，无法删除" : "删除"}
+                {readonly() ? "只读画布，无法删除" : "删除"}
               </button>
             </div>
           </>

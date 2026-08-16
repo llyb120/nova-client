@@ -1742,13 +1742,21 @@ fn create_stage_thread(
     state: State<'_, AppState>,
     source_thread_id: String,
     stage_index: usize,
+    inherit_source_model: bool,
 ) -> Result<Thread, String> {
-    let (cwd, source_id) = {
+    let (cwd, source_id, source_agent_kind, source_model) = {
         let store = state.store.lock().unwrap();
         let source = store.get(&source_thread_id).ok_or("源会话不存在")?;
-        (source.cwd.clone(), source.id.clone())
+        (
+            source.cwd.clone(),
+            source.id.clone(),
+            source.agent_kind.clone(),
+            source.model.clone(),
+        )
     };
-    let (agent_kind, model) = {
+    let (agent_kind, model) = if inherit_source_model {
+        (source_agent_kind, source_model)
+    } else {
         let settings = state.settings.lock().unwrap();
         let target = settings.stage_models.get(stage_index).ok_or_else(|| {
             if settings.stage_models.is_empty() {
@@ -2807,6 +2815,29 @@ fn notify_workflow_done(
         "工作流已结束，但未通过最终阶段"
     };
     sys_notify::notify_thread_done_unfiltered(&app, &thread_id, &title, body, acp::EV_NOTIFY_OPEN);
+    Ok(())
+}
+
+/// 向会话追加一条系统提示（工作流预览、错误提示等由前端渲染的结构化内容）。
+#[tauri::command]
+fn push_system_item(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    text: String,
+    level: String,
+) -> Result<(), String> {
+    let item = {
+        let mut store = state.store.lock().unwrap();
+        let thread = store.get_mut(&thread_id).ok_or("会话不存在")?;
+        let item = thread.push_system(text, &level);
+        store.save();
+        item
+    };
+    let _ = app.emit(
+        acp::EV_UPDATE,
+        json!({ "threadId": thread_id, "op": { "t": "upsert", "item": item } }),
+    );
     Ok(())
 }
 
@@ -4484,140 +4515,6 @@ fn take_last_chars(text: &str, max: usize) -> String {
     out
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DesignedWorkflow {
-    name: String,
-    entry: String,
-    #[serde(default = "default_hard_stage_limit")]
-    max_total_stages: u64,
-    stages: Vec<DesignedStage>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DesignedStage {
-    id: String,
-    name: String,
-    prompt_template: String,
-    #[serde(default)]
-    manual_review: bool,
-    #[serde(default)]
-    transitions: Vec<DesignedTransition>,
-}
-
-#[derive(serde::Deserialize)]
-struct DesignedTransition {
-    to: String,
-    prompt: String,
-    #[serde(default)]
-    label: String,
-}
-
-fn default_hard_stage_limit() -> u64 {
-    12
-}
-
-fn extract_json_object(raw: &str) -> Result<&str, String> {
-    let start = raw.find('{').ok_or("Agent 未返回 JSON 工作流")?;
-    let end = raw.rfind('}').ok_or("Agent 返回的 JSON 不完整")?;
-    if end < start {
-        return Err("Agent 返回的 JSON 不完整".into());
-    }
-    Ok(&raw[start..=end])
-}
-
-/// /hard：使用当前会话的 Agent/模型设计一个小型声明式工作流，前端校验后立即执行。
-#[tauri::command]
-async fn design_workflow(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    thread_id: String,
-    goal: String,
-) -> Result<Value, String> {
-    let goal = goal.trim();
-    if goal.is_empty() {
-        return Err("工作流目标不能为空".into());
-    }
-    let (cwd, agent_kind, model) = {
-        let store = state.store.lock().unwrap();
-        let thread = store.get(&thread_id).ok_or("会话不存在")?;
-        (
-            thread.cwd.clone(),
-            thread.agent_kind.clone(),
-            thread.model.clone(),
-        )
-    };
-    let seed = format!(
-        "你是 Nova 工作流设计器。为下面目标设计一个简单、高效、可立即执行的工作流。\n\
-         只输出一个 JSON 对象，不要 Markdown、代码围栏或解释。\n\
-         约束：2 到 6 个阶段；最多 12 次阶段运行；每阶段职责单一；结构必须服从任务实际复杂度。简单且确定的任务可以是直线流程；存在不确定判断、验证失败、返工或风险决策时，应设计分支或可收敛回环；不要为了复杂而复杂；至少一条路径到 $done。\n\
-         典型结构：调查后可判定无需修改或进入实施；验证成功则结束，失败则回到实施；高风险动作可进入人工审核。只有实际需要时才使用这些结构，每个回环必须同时存在明确的退出路径，禁止无出口死循环。\n\
-         JSON 字段：name、entry、maxTotalStages、stages。每个 stage 包含 id、name、promptTemplate、manualReview、transitions；每条 transition 包含 to、prompt、label。\n\
-         promptTemplate 必须显式包含模板变量 {{{{goal}}}}，需要上一阶段结论时使用 {{{{prev}}}}。\n\
-         不要指定模型、触发器、权限或画布坐标。执行阶段使用 Build。\n\n目标：{goal}"
-    );
-    let mut design_thread = Thread::new(
-        cwd,
-        agent_kind.clone(),
-        model,
-        Some("build".into()),
-        None,
-        true,
-    );
-    design_thread.title = "Hard 工作流设计".into();
-    let design_thread_id = design_thread.id.clone();
-    {
-        let mut store = state.store.lock().unwrap();
-        store.threads.push(design_thread);
-        store.save();
-    }
-    run_auxiliary_prompt(
-        &agent_kind,
-        &app,
-        design_thread_id.clone(),
-        seed,
-    )
-    .await;
-    let raw = last_assistant_text(&app, &design_thread_id);
-    {
-        let mut store = state.store.lock().unwrap();
-        store.threads.retain(|thread| thread.id != design_thread_id);
-        store.save();
-    }
-    state.acp.forget_session_of_thread(&design_thread_id);
-    state.codex.forget_session_of_thread(&design_thread_id);
-    state.alkaid.forget_session_of_thread(&design_thread_id);
-    state.lyra.forget_session_of_thread(&design_thread_id);
-    state.codexplus.forget_session_of_thread(&design_thread_id);
-    state.codebuddyplus.forget_session_of_thread(&design_thread_id);
-    state.claudeplus.forget_session_of_thread(&design_thread_id);
-    state.cursorplus.forget_session_of_thread(&design_thread_id);
-    state.opencodeplus.forget_session_of_thread(&design_thread_id);
-    let _ = app.emit(acp::EV_THREADS, json!({}));
-    let raw = raw.ok_or("Agent 没有返回工作流设计")?;
-    let parsed: DesignedWorkflow = serde_json::from_str(extract_json_object(&raw)?)
-        .map_err(|error| format!("Agent 返回的工作流 JSON 无法解析：{error}"))?;
-    if parsed.stages.len() < 2 || parsed.stages.len() > 6 {
-        return Err("Agent 生成的工作流必须包含 2 到 6 个阶段".into());
-    }
-    Ok(json!({
-        "name": parsed.name,
-        "entry": parsed.entry,
-        "maxTotalStages": parsed.max_total_stages.min(12),
-        "stages": parsed.stages.into_iter().map(|stage| json!({
-            "id": stage.id,
-            "name": stage.name,
-            "promptTemplate": stage.prompt_template,
-            "manualReview": stage.manual_review,
-            "transitions": stage.transitions.into_iter().map(|transition| json!({
-                "to": transition.to,
-                "prompt": transition.prompt,
-                "label": transition.label,
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-    }))
-}
 
 /* ===== 工作流连线判断（轻量模型） ===== */
 
@@ -5645,6 +5542,7 @@ pub fn run() {
             rename_thread,
             notify_fire_done,
             notify_workflow_done,
+            push_system_item,
             set_prompt_queue_pending,
             set_thread_model,
             set_thread_mode,
@@ -5685,7 +5583,6 @@ pub fn run() {
             advanced_share,
             summarize_clue,
             generate_thread_title,
-            design_workflow,
             judge_workflow_route,
             accept_share,
             decline_share,

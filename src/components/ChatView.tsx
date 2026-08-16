@@ -228,11 +228,15 @@ export function ChatView() {
   let transcriptRef: CanvasTranscriptHandle | undefined;
   let qwenApi: TranscriptCanvasApi | null = null;
   const renderMode = () => state.settings?.chatViewRender ?? "canvas";
-  /** master 默认 canvas 渲染 */
-  const useCanvas = () => renderMode() === "canvas";
+  const hasWorkflowPreview = () => displayedItems().some(
+    (item) => item.type === "system" && item.level === "workflow",
+  );
+  /** 工作流设计图需要 SVG/DOM 渲染；包含预览时自动回退 DOM transcript。 */
+  const forceDomTranscript = () => hasWorkflowPreview();
+  const useCanvas = () => renderMode() === "canvas" && !forceDomTranscript();
   /** canvas(qwen)：feat/glm_canvas 分支的独立 canvas 渲染，与默认 canvas 互不影响 */
-  const useQwenCanvas = () => renderMode() === "canvas_qwen";
-  const useAnyCanvas = () => renderMode() !== "dom";
+  const useQwenCanvas = () => renderMode() === "canvas_qwen" && !forceDomTranscript();
+  const useAnyCanvas = () => !forceDomTranscript() && renderMode() !== "dom";
   const [stickToBottom, setStickToBottom] = createSignal(true);
 
   mountSessionShortcuts({
@@ -735,6 +739,7 @@ export function ChatView() {
   /** 是否工作流/Fire/员工事件链的会话标题（决定导航栏是否从第一个节点起就显示）。 */
   const isStageTitle = (title: string) =>
     /^\[WF\]/.test(title) ||
+    /^\[Hard\]/.test(title) ||
     /^\[Fire\]/.test(title) ||
     /\]\s*(Wake|Do|Dream|巡查)/.test(title);
   const showStageRail = () => {
@@ -744,6 +749,8 @@ export function ChatView() {
   };
   const stageName = (thread: (typeof state.threads)[number]) => {
     // 工作流节点：[WF] 节点名 · 第N次（· 待补充等状态后缀），显示节点名。
+    const hardStage = thread.title.match(/^\[Hard\]\s*(.+?)\s*$/);
+    if (hardStage) return hardStage[1].trim() || "Hard";
     const wfStage = thread.title.match(/^\[WF\]\s*(.+?)(?:\s+·\s+.*)?$/);
     if (wfStage) return wfStage[1].trim() || "节点";
     if (/\]\s*Wake/.test(thread.title)) return "Wake";
@@ -1313,7 +1320,7 @@ export function ChatView() {
         <div class="chat-primary">
       <div class="chat-body">
         <Show
-          when={renderMode() !== "dom"}
+          when={useAnyCanvas()}
           fallback={
             <div
               class="transcript"

@@ -8,7 +8,7 @@
 import { createSignal } from "solid-js";
 import { api } from "../ipc";
 import type { PromptImage, Thread, Item } from "../types";
-import { getWorkflow, isWorkflowEnabled } from "./storage";
+import { getWorkflow, isWorkflowEnabled, unregisterTransientWorkflow } from "./storage";
 import {
   evalTransition,
   isTerminal,
@@ -235,6 +235,7 @@ async function followTransition(
   const h = requireHost();
   if (isTerminal(transition.to)) {
     completedRoots.add(run.rootId);
+    unregisterTransientWorkflow(run.workflowId);
     pendingManualReviews.delete(threadId);
     persistRuns();
     setWorkflowReviewRevision((value) => value + 1);
@@ -246,6 +247,7 @@ async function followTransition(
   if (!next) return;
   if (run.stageCount + 1 > def.maxTotalStages) {
     completedRoots.add(run.rootId);
+    unregisterTransientWorkflow(run.workflowId);
     pendingManualReviews.delete(threadId);
     persistRuns();
     setWorkflowReviewRevision((value) => value + 1);

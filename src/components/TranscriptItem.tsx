@@ -7,6 +7,8 @@ import { IconChevron, IconFile, IconPencil } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { Markdown } from "./Markdown";
 import { ToolCallCard } from "./ToolCallCard";
+import { WorkflowPreview } from "./WorkflowPreview";
+import type { WorkflowDef } from "../workflow/types";
 
 function attachmentPath(img: PromptImage): string | undefined {
   if (img.data || !img.uri) return undefined;
@@ -200,6 +202,19 @@ export function TranscriptItem(props: { item: Item; active?: boolean }) {
       <Match when={props.item.type === "system" && !isCodexModelResumeWarning(props.item)}>
         {(() => {
           const item = props.item as Extract<Item, { type: "system" }>;
+          if (item.level === "workflow") {
+            let workflow: WorkflowDef | null = null;
+            try {
+              workflow = JSON.parse(item.text) as WorkflowDef;
+            } catch {
+              workflow = null;
+            }
+            return workflow ? (
+              <WorkflowPreview workflow={workflow} />
+            ) : (
+              <div class="msg msg-system level-info">工作流数据无法解析</div>
+            );
+          }
           const isCompaction = item.level === "compacting" || item.level === "compacted";
           return (
             <Show

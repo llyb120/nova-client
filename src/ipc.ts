@@ -72,9 +72,6 @@ export const api = {
   removeProject: (cwd: string) => invoke<void>("remove_project", { cwd }),
   prewarm: (cwd: string, agentKind: AgentKind, model?: string | null, mode?: string | null) =>
     invoke<void>("prewarm", { cwd, agentKind, model, mode }),
-  /** 让当前 Agent 设计简洁工作流；返回 WorkflowDef 草案。 */
-  designWorkflow: (threadId: string, goal: string) =>
-    invoke<WorkflowDef>("design_workflow", { threadId, goal }),
   /** 工作流提示词模式连线判断（轻量模型）；返回选中的连线 id，无法判断返回空串 */
   judgeWorkflowRoute: (conclusion: string, options: { id: string; label: string }[]) =>
     invoke<string>("judge_workflow_route", { conclusion, options }),
@@ -118,8 +115,8 @@ export const api = {
       clueCardId,
       parentThreadId,
     }),
-  createStageThread: (sourceThreadId: string, stageIndex = 0) =>
-    invoke<Thread>("create_stage_thread", { sourceThreadId, stageIndex }),
+  createStageThread: (sourceThreadId: string, stageIndex = 0, inheritSourceModel = false) =>
+    invoke<Thread>("create_stage_thread", { sourceThreadId, stageIndex, inheritSourceModel }),
   listClueGroups: (space: "personal" | "team" = "personal") =>
     invoke<ClueNodeGroup[]>("list_clue_groups", { space }),
   getClueContext: (cardId: string) =>
@@ -228,6 +225,9 @@ export const api = {
     invoke<void>("notify_fire_done", { threadId, success }),
   notifyWorkflowDone: (threadId: string, success: boolean) =>
     invoke<void>("notify_workflow_done", { threadId, success }),
+  /** 向后端追加一条系统提示（工作流预览等由前端渲染的结构化内容）。 */
+  pushSystemItem: (threadId: string, text: string, level = "info") =>
+    invoke<void>("push_system_item", { threadId, text, level }),
   setPromptQueuePending: (threadId: string, pending: boolean) =>
     invoke<void>("set_prompt_queue_pending", { threadId, pending }),
   sendPrompt: (threadId: string, text: string, images: PromptImage[] = []) =>

@@ -50,9 +50,14 @@ import {
   startWorkflow,
   suspendActive as suspendWorkflowActive,
 } from "./workflow/runtime";
-import { findTriggeredWorkflow, findWorkflowByName, saveWorkflow } from "./workflow/storage";
+import {
+  findTriggeredWorkflow,
+  findWorkflowByName,
+  registerTransientWorkflow,
+  unregisterTransientWorkflow,
+} from "./workflow/storage";
 import { normalizeGeneratedWorkflow } from "./workflow/types";
-import { buildEasyPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
+import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
@@ -1484,6 +1489,90 @@ async function startStageThread(
   }
 }
 
+// ---- /hard：从第一个 Stage 设计并展示工作流，再直接执行工作流入口 ----
+
+interface PendingHardDesign {
+  goal: string;
+}
+
+/** 设计轮次 id → 待执行信息。设计正常结束后由 turn 事件驱动解析并启动工作流。 */
+const pendingHardDesign = new Map<string, PendingHardDesign>();
+
+function extractWorkflowJson(raw: string): string {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end < start) throw new Error("Agent 未返回 JSON 工作流");
+  return raw.slice(start, end + 1);
+}
+
+function lastAssistantText(thread: Thread): string {
+  for (let i = thread.items.length - 1; i >= 0; i--) {
+    const item = thread.items[i];
+    if (item.type === "assistant" && item.text.trim()) return item.text.trim();
+  }
+  return "";
+}
+
+/** 第一个阶段：当前会话本身立即成为工作流设计 Stage，不再派生一个空父/设计会话。 */
+async function startHardWorkflow(threadId: string, goal: string): Promise<void> {
+  const designTitle = "[Hard] 工作流设计";
+  await api.renameThread(threadId, designTitle);
+  setState("title", designTitle);
+  setState("threads", (thread) => thread.id === threadId, "title", designTitle);
+  pendingHardDesign.set(threadId, { goal });
+  try {
+    await deliverPrompt(threadId, buildHardDesignPrompt(goal), []);
+  } catch (error) {
+    pendingHardDesign.delete(threadId);
+    throw error;
+  }
+}
+
+/** 设计 Stage 正常结束后：在结尾展示工作流图；入口节点从下一个 Stage 会话开始执行。 */
+async function finalizeHardDesign(threadId: string): Promise<void> {
+  const pending = pendingHardDesign.get(threadId);
+  if (!pending) return;
+  pendingHardDesign.delete(threadId);
+  let transientWorkflowId: string | null = null;
+
+  try {
+    const thread = await api.getThread(threadId);
+    const raw = lastAssistantText(thread);
+    if (!raw) throw new Error("Agent 没有返回工作流设计");
+    const workflow = normalizeGeneratedWorkflow(JSON.parse(extractWorkflowJson(raw)));
+    registerTransientWorkflow(workflow);
+    transientWorkflowId = workflow.id;
+
+    // 单独插入一个只读流程图 Stage：设计会话保留设计原文，下一 Stage 复用
+    // 工作流配置画布展示结构，再由后续 Stage 开始执行入口节点。
+    const workflowJson = JSON.stringify(workflow);
+    const previewThread = await api.createStageThread(threadId, 1, true);
+    const previewTitle = "[Hard] 工作流图";
+    await api.renameThread(previewThread.id, previewTitle);
+    previewThread.title = previewTitle;
+    rememberThreadSnapshot(previewThread);
+    await api.pushSystemItem(previewThread.id, workflowJson, "workflow");
+    await refreshThreads();
+    await openThread(previewThread.id);
+
+    const entry = workflow.stages.find((stage) => stage.id === workflow.entry)!;
+    const execThread = await api.createStageThread(previewThread.id, 2, true);
+    const execTitle = `[WF] ${entry.name}`;
+    await api.renameThread(execThread.id, execTitle);
+    execThread.title = execTitle;
+    rememberThreadSnapshot(execThread);
+    await refreshThreads();
+    // 执行节点在后台立即开始；界面停留在流程图 Stage，用户可先查看完整画布，
+    // 再从 Stage 导航进入已经启动的入口节点。
+    await startWorkflow(workflow.id, { goal: pending.goal }, execThread.id, []);
+  } catch (error) {
+    if (transientWorkflowId) unregisterTransientWorkflow(transientWorkflowId);
+    const message = error instanceof Error ? error.message : String(error);
+    await api.pushSystemItem(threadId, `Hard 工作流设计失败：${message}`, "error");
+    throw error;
+  }
+}
+
 /** 处理 /stage、/stage2、/fire、/plan 等内置命令。返回 true 表示已消费。 */
 async function tryBuiltinPrompt(
   threadId: string,
@@ -1516,10 +1605,7 @@ async function tryBuiltinPrompt(
     if (images.length > 0) throw new Error("/hard 暂不支持附件");
     const goal = builtInInput.replace(/^\/hard(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /hard 后输入目标，例如 /hard 修复登录问题并完成测试");
-    const raw = await api.designWorkflow(threadId, goal);
-    const workflow = normalizeGeneratedWorkflow(raw);
-    saveWorkflow(workflow);
-    await startWorkflow(workflow.id, { goal }, threadId, images);
+    await startHardWorkflow(threadId, goal);
     return true;
   }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
@@ -2494,6 +2580,15 @@ export async function initStore() {
       }
       // 通用工作流（/run）与 Fire 互斥：非 Fire 会话才会被其接管。
       handleWorkflowTurnEnd(e.payload.threadId, e.payload.stopReason);
+      if (pendingHardDesign.has(threadId)) {
+        const reason = e.payload.stopReason;
+        const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
+        if (completedNormally) {
+          void finalizeHardDesign(threadId).catch((error) =>
+            console.error("Hard workflow design failed", error),
+          );
+        }
+      }
       if (
         e.payload.threadId === state.currentId &&
         state.items.some((item) => item.id < 0)

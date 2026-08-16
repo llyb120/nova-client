@@ -7,6 +7,9 @@ import type { WorkflowDef, WorkflowTrigger } from "./types";
 
 const WORKFLOWS_KEY = "fd:workflows:v1";
 
+/** Hard 等一次性工作流：仅当前前端进程可见，不进入工作流列表或 localStorage。 */
+const transientWorkflows = new Map<string, WorkflowDef>();
+
 function readUserWorkflows(): WorkflowDef[] {
   try {
     const raw = JSON.parse(localStorage.getItem(WORKFLOWS_KEY) ?? "[]");
@@ -60,7 +63,15 @@ export function enabledWorkflows(): WorkflowDef[] {
 }
 
 export function getWorkflow(id: string): WorkflowDef | undefined {
-  return getBuiltinWorkflow(id) ?? readUserWorkflows().find((w) => w.id === id);
+  return transientWorkflows.get(id) ?? getBuiltinWorkflow(id) ?? readUserWorkflows().find((w) => w.id === id);
+}
+
+export function registerTransientWorkflow(def: WorkflowDef): void {
+  transientWorkflows.set(def.id, def);
+}
+
+export function unregisterTransientWorkflow(id: string): void {
+  transientWorkflows.delete(id);
 }
 
 /** 按名称查找（/run 命令用），大小写不敏感。 */
