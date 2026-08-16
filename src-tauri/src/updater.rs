@@ -30,11 +30,59 @@ fn github_repo() -> &'static str {
     option_env!("NOVA_GH_REPO").unwrap_or("llyb120/nova-client")
 }
 
-fn github_api_latest() -> String {
-    format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        github_repo()
-    )
+fn github_api_latest(channel: &str) -> String {
+    if channel == "pre-release" {
+        format!(
+            "https://api.github.com/repos/{}/releases?per_page=20",
+            github_repo()
+        )
+    } else {
+        format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            github_repo()
+        )
+    }
+}
+
+fn selected_update_channel(app: &AppHandle) -> String {
+    let settings = crate::settings::Settings::load(&crate::nova_data_dir(app));
+    if settings.update_channel == "pre-release" {
+        "pre-release".into()
+    } else {
+        "release".into()
+    }
+}
+
+fn compiled_update_channel() -> &'static str {
+    option_env!("NOVA_BUILD_CHANNEL").unwrap_or("release")
+}
+
+fn select_release(value: Value, channel: &str) -> Option<Value> {
+    if channel == "pre-release" {
+        value
+            .as_array()?
+            .iter()
+            .find(|release| {
+                release["prerelease"].as_bool() == Some(true)
+                    && release["draft"].as_bool() != Some(true)
+                    && release["tag_name"]
+                        .as_str()
+                        .is_some_and(|tag| tag.starts_with("pre-v"))
+            })
+            .cloned()
+    } else {
+        Some(value)
+    }
+}
+
+fn release_version(release: &Value) -> String {
+    release["tag_name"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("pre-")
+        .trim_start_matches('v')
+        .to_string()
 }
 
 fn asset_name_for(version: &str) -> String {
@@ -94,7 +142,7 @@ async fn run_server_update_async(check_only: bool) -> Result<(), String> {
         Some(Duration::from_secs(30)),
     )?;
     let response = client
-        .get(github_api_latest())
+        .get(github_api_latest("release"))
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -106,12 +154,7 @@ async fn run_server_update_async(check_only: bool) -> Result<(), String> {
         .json()
         .await
         .map_err(|error| format!("更新信息解析失败：{error}"))?;
-    let latest = release["tag_name"]
-        .as_str()
-        .unwrap_or_default()
-        .trim()
-        .trim_start_matches('v')
-        .to_string();
+    let latest = release_version(&release);
     if latest.is_empty() {
         return Err("最新 Release 没有有效版本号".into());
     }
@@ -226,7 +269,13 @@ pub const EV_PROMPT: &str = "update:prompt";
 #[derive(Serialize, Deserialize, Clone)]
 struct StagedMarker {
     version: String,
+    #[serde(default = "default_release_channel")]
+    channel: String,
     dir: String,
+}
+
+fn default_release_channel() -> String {
+    "release".into()
 }
 
 /// 升级重启前窗口的完整状态：位置（含多屏的全局坐标）、大小、最大化/最小化、
@@ -721,9 +770,13 @@ pub fn staged_upgrade_version(app: &AppHandle) -> Option<String> {
     let marker = valid_staged(app)?;
     let current = app.package_info().version.to_string();
     let latest = latest_discovered_version();
+    let target_channel = selected_update_channel(app);
+    let channel_switch = target_channel != compiled_update_channel();
     match (parse_ver(&marker.version), parse_ver(&current)) {
         (Some(staged), Some(cur))
-            if staged > cur && staged_is_latest_discovered(&marker.version, latest.as_deref()) =>
+            if (staged > cur || channel_switch)
+                && marker.channel == target_channel
+                && staged_is_latest_discovered(&marker.version, latest.as_deref()) =>
         {
             Some(marker.version)
         }
@@ -766,12 +819,13 @@ fn update_http_client(
 /// 查询最新版本并与当前版本比较（GitHub Releases）
 pub async fn check(app: &AppHandle) -> Result<Value, String> {
     let current = app.package_info().version.to_string();
+    let channel = selected_update_channel(app);
     let client = update_http_client(
         Some(&format!("Nova/{current}")),
         Some(Duration::from_secs(15)),
     )?;
     let resp = client
-        .get(github_api_latest())
+        .get(github_api_latest(&channel))
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -782,13 +836,15 @@ pub async fn check(app: &AppHandle) -> Result<Value, String> {
     if !resp.status().is_success() {
         return Err(format!("检查更新失败:HTTP {}", resp.status()));
     }
-    let v: Value = resp
+    let raw: Value = resp
         .json()
         .await
         .map_err(|e| format!("更新信息解析失败:{e}"))?;
+    let Some(v) = select_release(raw, &channel) else {
+        return Ok(json!({ "current": current, "channel": channel, "hasUpdate": false }));
+    };
 
-    let tag = v["tag_name"].as_str().unwrap_or_default();
-    let latest = tag.trim().trim_start_matches('v').to_string();
+    let latest = release_version(&v);
     if latest.is_empty() {
         return Ok(json!({ "current": current, "hasUpdate": false }));
     }
@@ -816,14 +872,12 @@ pub async fn check(app: &AppHandle) -> Result<Value, String> {
         return Ok(json!({ "current": current, "latest": latest, "hasUpdate": false }));
     }
 
-    let has_update = matches!(
-        (parse_ver(&latest), parse_ver(&current)),
-        (Some(l), Some(c)) if l > c
-    );
+    let has_update = latest != current || channel != compiled_update_channel();
     let staged = valid_staged(app)
-        .map(|m| m.version == latest)
+        .map(|m| m.version == latest && m.channel == channel)
         .unwrap_or(false);
     Ok(json!({
+        "channel": channel,
         "current": current,
         "latest": latest,
         "hasUpdate": has_update,
@@ -1093,10 +1147,11 @@ pub async fn download_and_stage(app: AppHandle) -> Result<Value, String> {
         return Ok(json!({ "ready": false, "hasUpdate": false }));
     }
     let latest = info["latest"].as_str().unwrap_or_default().to_string();
+    let selected_channel = info["channel"].as_str().unwrap_or("release").to_string();
 
-    // 已暂存好同版本：跳过下载，直接就绪。
+    // 已暂存好同通道同版本：跳过下载，直接就绪。
     if let Some(marker) = valid_staged(&app) {
-        if marker.version == latest {
+        if marker.version == latest && marker.channel == selected_channel {
             return Ok(json!({ "ready": true, "version": latest }));
         }
     }
@@ -1189,6 +1244,7 @@ pub async fn download_and_stage(app: AppHandle) -> Result<Value, String> {
         &app,
         &StagedMarker {
             version: latest.clone(),
+            channel: selected_channel,
             dir: extract_dir.to_string_lossy().to_string(),
         },
     );

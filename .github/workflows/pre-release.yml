@@ -1,0 +1,141 @@
+name: Pre-release
+
+on:
+  push:
+    branches: [pre-release]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pre-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          CUR=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          IFS=. read -r A B C <<< "$CUR"
+          NEW="${A:-0}.${B:-0}.$((${C:-0}+1))"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows, os: windows-latest, target: "" }
+          - { name: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
+          - { name: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin }
+          - { name: linux, os: ubuntu-22.04, target: "" }
+    runs-on: ${{ matrix.os }}
+    env:
+      NOVA_BUILD_CHANNEL: pre-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - shell: bash
+        run: |
+          mkdir -p .cargo
+          printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'macOS'
+        run: rustup target add "${{ matrix.target }}"
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      - run: npm run check
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb
+      - shell: bash
+        run: python3 scripts/package.py --version "${{ needs.prepare.outputs.version }}" --bump-only
+      - if: runner.os == 'Windows'
+        run: npx tauri build --no-bundle
+      - if: runner.os == 'macOS'
+        run: npx tauri build --target "${{ matrix.target }}" --bundles dmg
+      - if: runner.os == 'Linux'
+        run: npx tauri build --bundles deb,appimage
+      - shell: bash
+        run: |
+          TARGET="${{ matrix.target }}"
+          if [ -n "$TARGET" ]; then
+            python3 scripts/package.py --version "${{ needs.prepare.outputs.version }}" --no-build --target "$TARGET"
+          else
+            python3 scripts/package.py --version "${{ needs.prepare.outputs.version }}" --no-build
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pre-update-${{ matrix.name }}
+          path: release/*.zip
+          if-no-files-found: error
+      - if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nova-pre-${{ matrix.name }}-dmg
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+      - if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nova-pre-linux
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ needs.prepare.outputs.version }}"
+          python3 scripts/package.py --version "$VER" --bump-only
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/tauri.conf.json package.json
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: pre-release v${VER} [skip ci]"
+            git push origin "HEAD:pre-release"
+          fi
+          git tag -f "pre-v${VER}"
+          git push origin "pre-v${VER}" -f
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pre-v${{ needs.prepare.outputs.version }}
+          name: Nova pre-release v${{ needs.prepare.outputs.version }}
+          target_commitish: pre-release
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/**/*.zip
+            dist/**/*.dmg
+            dist/**/*.deb
+            dist/**/*.AppImage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

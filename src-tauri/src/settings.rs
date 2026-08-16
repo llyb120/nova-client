@@ -214,6 +214,8 @@ pub struct Settings {
     /// worktree 工作目录的根（空 = 应用数据目录下的 worktrees/）。
     /// 会话开启「在 worktree 中执行」时，在此目录下为其创建独立工作目录。
     pub worktree_dir: String,
+    /// 更新通道：release / pre-release。
+    pub update_channel: String,
     /// 是否自动清理长期未更新的会话。
     pub session_auto_cleanup_enabled: bool,
     /// 自动清理会话的保留时长（小时）。
@@ -305,6 +307,7 @@ impl Default for Settings {
             cursor_integration: "sdk".into(),
             opencode_integration: "sdk".into(),
             worktree_dir: String::new(),
+            update_channel: "release".into(),
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
             semantic_enabled: false,
@@ -604,6 +607,9 @@ impl Settings {
         }
         if settings.claudecode_path.trim() == "npx" {
             settings.claudecode_path = "claude".into();
+        }
+        if settings.update_channel != "pre-release" {
+            settings.update_channel = "release".into();
         }
         if settings.session_auto_cleanup_hours == 0 {
             settings.session_auto_cleanup_hours = legacy_days
