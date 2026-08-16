@@ -50,7 +50,8 @@ import {
   startWorkflow,
   suspendActive as suspendWorkflowActive,
 } from "./workflow/runtime";
-import { findTriggeredWorkflow, findWorkflowByName } from "./workflow/storage";
+import { findTriggeredWorkflow, findWorkflowByName, saveWorkflow } from "./workflow/storage";
+import { normalizeGeneratedWorkflow } from "./workflow/types";
 import { buildEasyPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
@@ -1430,7 +1431,7 @@ export async function sendPrompt(
     await startWorkflow(workflowId, { goal: text.trim() }, id, images);
     return;
   }
-  // 内置命令优先于员工交办/账本，避免 /fire 被当成普通交办内容。
+  // 内置命令优先于工作流触发器，避免 /fire、/hard 等被当成普通内容。
   if (await tryBuiltinPrompt(id, text, images)) return;
   // 在历史分支预览中追加提示词时才发生时间跳跃：先恢复该分支，再把新提示词
   // 发送到恢复出的会话。仅浏览或点击当前时间线不会恢复会话。
@@ -1509,6 +1510,16 @@ async function tryBuiltinPrompt(
     const goal = builtInInput.replace(/^\/easy(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /easy 后输入明确的小修改目标，例如 /easy 修复这个类型错误");
     await deliverPrompt(threadId, buildEasyPrompt(goal), images);
+    return true;
+  }
+  if (/^\/hard(?:\s|$)/i.test(builtInInput)) {
+    if (images.length > 0) throw new Error("/hard 暂不支持附件");
+    const goal = builtInInput.replace(/^\/hard(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+    if (!goal) throw new Error("请在 /hard 后输入目标，例如 /hard 修复登录问题并完成测试");
+    const raw = await api.designWorkflow(threadId, goal);
+    const workflow = normalizeGeneratedWorkflow(raw);
+    saveWorkflow(workflow);
+    await startWorkflow(workflow.id, { goal }, threadId, images);
     return true;
   }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
@@ -1596,6 +1607,12 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   if (/^\/easy(?:\s|$)/i.test(builtInInput)) {
     const goal = builtInInput.replace(/^\/easy(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /easy 后输入明确的小修改目标，例如 /easy 修复这个类型错误");
+    return;
+  }
+  if (/^\/hard(?:\s|$)/i.test(builtInInput)) {
+    if (images.length > 0) throw new Error("/hard 暂不支持附件");
+    const goal = builtInInput.replace(/^\/hard(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+    if (!goal) throw new Error("请在 /hard 后输入目标，例如 /hard 修复登录问题并完成测试");
     return;
   }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {

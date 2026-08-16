@@ -207,6 +207,97 @@ export function validateWorkflow(def: WorkflowDef): string[] {
   return errors;
 }
 
+export function normalizeGeneratedWorkflow(raw: unknown): WorkflowDef {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Agent 未返回有效工作流");
+  }
+  const source = raw as Partial<WorkflowDef>;
+  const inputStages = Array.isArray(source.stages) ? source.stages.slice(0, 6) : [];
+  if (inputStages.length === 0) throw new Error("Agent 生成的工作流没有阶段");
+
+  const stageIds = inputStages.map((stage, index) => {
+    const candidate = stage && typeof stage === "object" ? String((stage as WorkflowStageDef).id ?? "").trim() : "";
+    return candidate || `stage_${index + 1}`;
+  });
+  const uniqueIds = stageIds.map((id, index) =>
+    stageIds.indexOf(id) === index ? id : `${id}_${index + 1}`,
+  );
+  const idMap = new Map(stageIds.map((id, index) => [id, uniqueIds[index]]));
+
+  const stages: WorkflowStageDef[] = inputStages.map((value, index) => {
+    const stage = (value && typeof value === "object" ? value : {}) as Partial<WorkflowStageDef>;
+    const transitions = Array.isArray(stage.transitions) ? stage.transitions.slice(0, 4) : [];
+    return {
+      id: uniqueIds[index],
+      name: String(stage.name ?? `阶段 ${index + 1}`).trim() || `阶段 ${index + 1}`,
+      promptTemplate: String(stage.promptTemplate ?? "").trim(),
+      mode: "build",
+      manualReview: !!stage.manualReview,
+      transitions: transitions.map((value, transitionIndex) => {
+        const transition = (value && typeof value === "object" ? value : {}) as Partial<WorkflowTransition>;
+        const target = String(transition.to ?? "").trim();
+        return {
+          id: `route_${index + 1}_${transitionIndex + 1}`,
+          when: { kind: "always" },
+          to: isTerminal(target) ? WF_DONE : (idMap.get(target) ?? target),
+          prompt: String(transition.prompt ?? transition.label ?? "").trim(),
+          label: String(transition.label ?? "").trim() || undefined,
+        };
+      }),
+      x: 80 + (index % 3) * 280,
+      y: 140 + Math.floor(index / 3) * 180,
+    };
+  });
+
+  const entryRaw = String(source.entry ?? stageIds[0]).trim();
+  const workflow: WorkflowDef = {
+    id: newWorkflowId("hard"),
+    name: String(source.name ?? "Hard 工作流").trim() || "Hard 工作流",
+    version: 1,
+    enabled: true,
+    entry: idMap.get(entryRaw) ?? stages[0].id,
+    maxTotalStages: Math.min(12, Math.max(stages.length, Number(source.maxTotalStages) || 12)),
+    stages,
+  };
+  const errors = validateWorkflow(workflow);
+  const reachable = new Set<string>();
+  const pending = [workflow.entry];
+  while (pending.length > 0) {
+    const id = pending.shift()!;
+    if (reachable.has(id)) continue;
+    reachable.add(id);
+    const stage = stages.find((candidate) => candidate.id === id);
+    if (!stage) continue;
+    for (const transition of stage.transitions) {
+      if (!isTerminal(transition.to)) pending.push(transition.to);
+    }
+  }
+  const canFinish = new Set<string>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const stage of stages) {
+      if (canFinish.has(stage.id)) continue;
+      if (stage.transitions.some((transition) =>
+        isTerminal(transition.to) || canFinish.has(transition.to))) {
+        canFinish.add(stage.id);
+        changed = true;
+      }
+    }
+  }
+  for (const stage of stages) {
+    if (!reachable.has(stage.id)) errors.push(`阶段「${stage.name}」无法从入口到达`);
+    if (!stage.manualReview && stage.transitions.length === 0) {
+      errors.push(`阶段「${stage.name}」没有出口`);
+    }
+    if (reachable.has(stage.id) && !canFinish.has(stage.id)) {
+      errors.push(`阶段「${stage.name}」无法到达结束，可能形成无出口死循环`);
+    }
+  }
+  if (errors.length > 0) throw new Error(`Agent 生成的工作流不可运行：${errors.join("；")}`);
+  return workflow;
+}
+
 let idCounter = 0;
 /** 生成短 id（画布新建节点/转移用）。 */
 export function newWorkflowId(prefix: string): string {

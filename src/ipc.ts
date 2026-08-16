@@ -72,6 +72,9 @@ export const api = {
   removeProject: (cwd: string) => invoke<void>("remove_project", { cwd }),
   prewarm: (cwd: string, agentKind: AgentKind, model?: string | null, mode?: string | null) =>
     invoke<void>("prewarm", { cwd, agentKind, model, mode }),
+  /** 让当前 Agent 设计简洁工作流；返回 WorkflowDef 草案。 */
+  designWorkflow: (threadId: string, goal: string) =>
+    invoke<WorkflowDef>("design_workflow", { threadId, goal }),
   /** 工作流提示词模式连线判断（轻量模型）；返回选中的连线 id，无法判断返回空串 */
   judgeWorkflowRoute: (conclusion: string, options: { id: string; label: string }[]) =>
     invoke<string>("judge_workflow_route", { conclusion, options }),

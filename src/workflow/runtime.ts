@@ -413,7 +413,7 @@ export function startWorkflow(
 
   return (async () => {
     const root = await api.getThread(rootId);
-    // 漫游/额度会话的执行位置不在本机，无法由本地工作流驱动；员工会话允许作为工作流根。
+    // 漫游/额度会话的执行位置不在本机，无法由本地工作流驱动。
     if (root.roamingRole || root.quotaPeerName) {
       throw new Error("工作流仅支持本地会话");
     }
