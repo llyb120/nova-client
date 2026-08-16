@@ -248,10 +248,6 @@ fn main() {
     #[cfg(windows)]
     wait_for_restart_parent();
 
-    // 命令行子工具（如 `nova mem-search ...`，供数字员工 agent 调用）：命中即执行并退出，不启动 GUI。
-    if nova_lib::maybe_run_cli() {
-        return;
-    }
     if nova_lib::maybe_run_lyra() {
         return;
     }

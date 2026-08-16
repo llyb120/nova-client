@@ -39,11 +39,11 @@ import { mountSessionShortcuts } from "../sessionShortcuts";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import type { AgentKind, Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
-import { enabledWorkflows, employeeWorkflowName } from "../workflow/storage";
+import { enabledWorkflows } from "../workflow/storage";
 import type { WorkflowDef } from "../workflow/types";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
-import { IconClue, IconFile, IconFolder, IconLogo, IconMerge, IconSend, IconUsers, IconX } from "./icons";
+import { IconClue, IconFile, IconFolder, IconLogo, IconMerge, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
@@ -51,7 +51,6 @@ import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 import { TypewriterText } from "./TypewriterText";
 
-const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
 const LAST_NEW_THREAD_PROJECT_KEY = "fd:lastNewThreadProject";
 
 /** codex 风格草稿首页：输入任务 + 选择项目/模型/模式，回车即开干 */
@@ -74,17 +73,8 @@ export function HomeView() {
   const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(agentKind()));
   const [mode, setMode] = createSignal("build");
   const [busy, setBusy] = createSignal(false);
-  const [employeeMenuOpen, setEmployeeMenuOpen] = createSignal(false);
-  const [selectedEmployeeId, setSelectedEmployeeId] = createSignal<string | null>(
-    localStorage.getItem(LAST_EMPLOYEE_KEY) || null,
-  );
-  const selectedEmployee = createMemo(() =>
-    state.employees.find(
-      (employee) => employee.id === selectedEmployeeId() && employee.enabled,
-    ) ?? null,
-  );
   // 工作流：新会话页选定后，发送时以输入内容为 goal、本会话为根启动流程（等效 /run）。
-  // 与数字员工、漫游/额度互斥，仅对本地普通会话生效。
+  // 只对本地普通会话生效，与漫游/额度互斥。
   const [workflowMenuOpen, setWorkflowMenuOpen] = createSignal(false);
   const [selectedWorkflowId, setSelectedWorkflowId] = createSignal<string | null>(null);
   const selectedWorkflow = createMemo<WorkflowDef | null>(() => {
@@ -126,7 +116,6 @@ export function HomeView() {
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
-  let employeePickerRef: HTMLDivElement | undefined;
   let workflowPickerRef: HTMLDivElement | undefined;
   type PrewarmTarget = {
     cwd?: string;
@@ -141,49 +130,22 @@ export function HomeView() {
     textareaRef.style.height = Math.min(textareaRef.scrollHeight, 220) + "px";
   };
 
-  const pickEmployee = (employeeId: string | null) => {
-    setSelectedEmployeeId(employeeId);
-    if (employeeId) localStorage.setItem(LAST_EMPLOYEE_KEY, employeeId);
-    else localStorage.removeItem(LAST_EMPLOYEE_KEY);
-    if (employeeId) setSelectedWorkflowId(null);
-    setEmployeeMenuOpen(false);
-  };
-
   const pickWorkflow = (workflowId: string | null) => {
     setSelectedWorkflowId(workflowId);
-    // 与数字员工互斥：工作流只能在本地普通会话中运行。
-    if (workflowId) pickEmployee(null);
     setWorkflowMenuOpen(false);
   };
 
   createEffect(() => {
-    const selectedId = selectedEmployeeId();
-    if (
-      selectedId &&
-      state.employees.length > 0 &&
-      !state.employees.some((employee) => employee.id === selectedId && employee.enabled)
-    ) {
-      pickEmployee(null);
-    }
-    if (roam() || quotaPeer()) {
-      setEmployeeMenuOpen(false);
-      setWorkflowMenuOpen(false);
-    }
+    if (roam() || quotaPeer()) setWorkflowMenuOpen(false);
   });
 
   onMount(() => {
-    const closeEmployeeMenu = (event: PointerEvent) => {
-      if (!employeeMenuOpen() || employeePickerRef?.contains(event.target as Node)) return;
-      setEmployeeMenuOpen(false);
-    };
     const closeWorkflowMenu = (event: PointerEvent) => {
       if (!workflowMenuOpen() || workflowPickerRef?.contains(event.target as Node)) return;
       setWorkflowMenuOpen(false);
     };
-    document.addEventListener("pointerdown", closeEmployeeMenu);
     document.addEventListener("pointerdown", closeWorkflowMenu);
     onCleanup(() => {
-      document.removeEventListener("pointerdown", closeEmployeeMenu);
       document.removeEventListener("pointerdown", closeWorkflowMenu);
     });
   });
@@ -624,9 +586,7 @@ export function HomeView() {
     const images = attach.images();
     const target = roam();
     const quota = quotaPeer();
-    const employeeId = !target && !quota ? selectedEmployee()?.id ?? null : null;
-    // 新会话页选定的工作流：只对本地普通会话生效，与漫游/额度/员工互斥。
-    const workflow = !target && !quota && !employeeId ? selectedWorkflow() : null;
+    const workflow = !target && !quota ? selectedWorkflow() : null;
     const clue = state.pendingClueCard;
     if (t === "/train" && images.length === 0) {
       if (busy()) return;
@@ -661,8 +621,7 @@ export function HomeView() {
       !peerReady() ||
       (usesPeerModels() && configAgentKinds().length === 0)
     ) return;
-    // 员工会由 Wake 自己决定 current/branch/worktree；不要再叠加首页手动 worktree。
-    const wtOn = !employeeId && opts.worktree === true && worktreeAvailable();
+    const wtOn = opts.worktree === true && worktreeAvailable();
     const branch = opts.branch?.trim() ?? "";
     const base = wtOn ? opts.base?.trim() ?? "" : "";
     if (wtOn && !branch && !base) return; // 新分支名与基于分支至少填一个（留空分支名 = 直接用所选分支）
@@ -725,7 +684,7 @@ export function HomeView() {
         );
         if (!ephemeral) lastUsed.setModel(agentKind(), model());
         if (clue) clearPendingClueCard();
-        await sendPrompt(prompt, images, employeeId, workflow?.id ?? null);
+        await sendPrompt(prompt, images, workflow?.id ?? null);
       }
       setText("");
       setQuote("");
@@ -983,7 +942,7 @@ export function HomeView() {
     }
   };
 
-  const recent = () => state.threads.filter((t) => !t.employeeId).slice(0, 6);
+  const recent = () => state.threads.slice(0, 6);
 
   return (
     <main class="home">
@@ -1206,54 +1165,6 @@ export function HomeView() {
             >
               <IconClue size={16} />
             </button>
-            <Show when={!roam() && !quotaPeer() && state.employees.length > 0}>
-              <div ref={employeePickerRef} class="composer-employee-picker">
-                <Show when={employeeMenuOpen()}>
-                  <div class="composer-employee-menu">
-                    <div class="composer-employee-head">本次工作交给</div>
-                    <button
-                      type="button"
-                      classList={{
-                        "composer-employee-item": true,
-                        active: !selectedEmployeeId(),
-                      }}
-                      onClick={() => pickEmployee(null)}
-                    >
-                      <span>普通会话</span>
-                      <small>直接由当前模型执行</small>
-                    </button>
-                    <For each={state.employees.filter((employee) => employee.enabled)}>
-                      {(employee) => (
-                        <button
-                          type="button"
-                          classList={{
-                            "composer-employee-item": true,
-                            active: selectedEmployeeId() === employee.id,
-                          }}
-                          onClick={() => pickEmployee(employee.id)}
-                        >
-                          <span>{employee.name}</span>
-                          <small>{employeeWorkflowName(employee.workflowId)} · Dream 生效</small>
-                        </button>
-                      )}
-                    </For>
-                  </div>
-                </Show>
-                <button
-                  type="button"
-                  class="composer-btn employee"
-                  classList={{ active: !!selectedEmployee() }}
-                  onClick={() => setEmployeeMenuOpen((open) => !open)}
-                  title={
-                    selectedEmployee()
-                      ? `本次工作：${selectedEmployee()!.name}`
-                      : "选择本次工作的数字员工"
-                  }
-                >
-                  <IconUsers size={16} />
-                </button>
-              </div>
-            </Show>
             <button
               class="composer-btn send"
               disabled={

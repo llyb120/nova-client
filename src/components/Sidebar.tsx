@@ -2,7 +2,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
-import { firstWakeDoChild, latestFireStage } from "../threadDisplay";
+import { latestFireStage } from "../threadDisplay";
 import type { ThreadMeta, Worktree } from "../types";
 import {
   checkAndStageUpdate,
@@ -11,7 +11,6 @@ import {
   deleteThread,
   openNewSession,
   openThread,
-  pendingDecisionCount,
   setTrainingProject,
   setView,
   state,
@@ -32,7 +31,6 @@ import {
   IconTerminal,
   IconTrash,
   IconTrophy,
-  IconUsers,
   IconX,
 } from "./icons";
 import { TypewriterText } from "./TypewriterText";
@@ -55,10 +53,6 @@ function fmtTime(ts: number): string {
     return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
   }
   return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
-}
-
-function isMindThread(t: ThreadMeta): boolean {
-  return !!t.mindThread || /\]\s*Mind(?:\s|$|·)/.test(t.title);
 }
 
 export function Sidebar(props: {
@@ -98,26 +92,15 @@ export function Sidebar(props: {
     );
   });
   const onlineCount = createMemo(() => onlinePeers().length);
-  // 数字员工：配置入口，无日常操作角标
-  // 御书房：候旨 + 进行中任务，作为日常操作入口角标
-  const workbenchBadge = createMemo(() => {
-    const decisions = pendingDecisionCount();
-    const active = state.employeeTasks.filter(
-      (t) => t.status === "queued" || t.status === "working",
-    ).length;
-    return decisions + active;
-  });
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "employees" | "workbench" | "workflows" | "training") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "training") => {
     setView(view);
     closeThread();
   };
   const openHome = () => openNewSession();
   const openClues = () => switchView("clues");
-  const openEmployees = () => switchView("employees");
-  const openWorkbench = () => switchView("workbench");
   const openTraining = () => {
-    const recent = state.threads.find((thread) => !thread.experienceThread && !thread.employeeId);
+    const recent = state.threads.find((thread) => !thread.experienceThread);
     const cwd = recent?.worktree?.repo || recent?.cwd || state.projects[0]?.worktree?.repo || state.projects[0]?.path || "";
     if (!cwd) {
       void message("请先创建或选择一个项目，再打开大熊座。", { kind: "info" });
@@ -128,8 +111,6 @@ export function Sidebar(props: {
   };
   const openWorkflows = () => switchView("workflows");
 
-  // 数字员工（配置）/ 御书房（日常）视图下，左侧切换为「员工会话」这一卷。
-  const isEmployeeView = () => state.view === "employees" || state.view === "workbench";
   const isTrainingView = () => state.view === "training";
 
   const openHistoryThread = async (id: string) => {
@@ -140,9 +121,8 @@ export function Sidebar(props: {
     await openThread(id);
   };
 
-  // 按目录分组（普通会话与员工会话共用同一套分组/结构，只是各看各的、不混在一起）。
-  // worktree 会话的 cwd 是 uuid 工作目录，不适合展示/分组：归到源仓库组，用分支 badge 区分。
-  // （guest 漫游会话 worktree.path 为空，真实目录在对端，仍按对方目录分组。）
+  // 按目录分组。worktree 会话的 cwd 是 uuid 工作目录，不适合展示/分组：
+  // 归到源仓库组，用分支 badge 区分。（guest 漫游会话仍按对方目录分组。）
   const groupByCwd = (threads: typeof state.threads) => {
     const map = new Map<string, typeof state.threads>();
     const byId = new Map(threads.map((t) => [t.id, t]));
@@ -154,8 +134,7 @@ export function Sidebar(props: {
           : t.cwd;
     for (const t of threads) {
       const parent = t.parentThreadId ? byId.get(t.parentThreadId) : null;
-      // 子会话无论是否在 worktree/新 cwd 中执行，都归到预检父会话所在分组，
-      // 这样左侧能稳定显示为一棵“预检 → 开发”树。
+      // 子会话无论是否在 worktree/新 cwd 中执行，都归到父会话所在分组。
       const key = parent ? rawKey(parent) : rawKey(t);
       const list = map.get(key) ?? [];
       if (list.length === 0) map.set(key, list);
@@ -164,13 +143,10 @@ export function Sidebar(props: {
     return [...map.entries()];
   };
 
-  // 当前这一卷：员工视图看员工产生的会话，否则看用户自己的会话。结构完全一致。
   const currentGroups = createMemo(() =>
-    isEmployeeView()
-      ? groupByCwd(state.threads.filter((t) => t.employeeId && !isMindThread(t) && !t.experienceThread))
-      : isTrainingView()
-        ? groupByCwd(state.threads.filter((t) => t.experienceThread))
-        : groupByCwd(state.threads.filter((t) => !t.employeeId && !t.experienceThread)),
+    isTrainingView()
+      ? groupByCwd(state.threads.filter((t) => t.experienceThread))
+      : groupByCwd(state.threads.filter((t) => !t.experienceThread)),
   );
 
   type ThreadTreeRow = {
@@ -200,14 +176,12 @@ export function Sidebar(props: {
       return result;
     };
     // 左侧每条任务链只显示根会话；各阶段由会话右侧的 Stage 导航切换。
-    // Wake/Do 仍沿用原来的合并展示，避免改变数字员工列表语义。
     const rows = threads
       .filter((thread) => !thread.parentThreadId || !byId.has(thread.parentThreadId))
       .map((thread) => ({
         thread,
         child: false,
         childCount: 0,
-        mergedChild: firstWakeDoChild(threads, thread),
         chainUpdatedAt: Math.max(
           thread.updatedAt,
           ...descendants(thread.id).map((item) => item.updatedAt),
@@ -216,8 +190,7 @@ export function Sidebar(props: {
     rows.sort((a, b) => b.chainUpdatedAt - a.chainUpdatedAt);
     return rows;
   };
-  const showHistoryByTime = () =>
-    !isEmployeeView() && state.settings?.historyDisplayMode === "time";
+  const showHistoryByTime = () => state.settings?.historyDisplayMode === "time";
   const timeRows = createMemo(() => {
     const effectiveUpdatedAt = (row: ThreadTreeRow) =>
       row.chainUpdatedAt ?? Math.max(row.thread.updatedAt, row.mergedChild?.updatedAt ?? 0);
@@ -631,28 +604,8 @@ export function Sidebar(props: {
             >
               大熊座
             </button>
-            <button
-              class="mode-seg-btn"
-              classList={{ active: state.view === "workbench" }}
-              onClick={openWorkbench}
-              title="御书房：下旨交办、查看进行中事件、批阅奏折与汇报"
-            >
-              <IconBell size={14} />
-              御书房
-              <Show when={workbenchBadge() > 0}>
-                <span class="mode-seg-badge alert">{workbenchBadge()}</span>
-              </Show>
-            </button>
-            <button
-              class="mode-seg-btn"
-              classList={{ active: state.view === "employees" }}
-              onClick={openEmployees}
-              title="数字员工配置：岗位、心跳、模型与知识库"
-            >
-              <IconUsers size={14} />
-              数字员工
-            </button>
           </div>
+
         </div>
       </div>
 
@@ -661,14 +614,7 @@ export function Sidebar(props: {
           when={currentGroups().length > 0}
           fallback={
             <div class="thread-empty">
-              <Show
-                when={isEmployeeView()}
-                fallback={isTrainingView() ? "还没有训练会话。点击右侧“立即训练”开始。" : "还没有会话。在右侧输入任务开始。"}
-              >
-                数字员工还没有留下会话。
-                <br />
-                在御书房下旨后，员工巡查与工作的足迹会在此处留痕。
-              </Show>
+              {isTrainingView() ? "还没有训练会话。点击右侧“立即训练”开始。" : "还没有会话。在右侧输入任务开始。"}
             </div>
           }
         >
@@ -685,8 +631,7 @@ export function Sidebar(props: {
                 const peerName = guestThread?.roamingPeerName ?? "";
                 const rows = createMemo(() => threadTreeRows(threads));
                 const expanded = () => expandedGroups().has(cwd);
-                const collapsible = () =>
-                  !isEmployeeView() && rows().length > COLLAPSED_THREAD_LIMIT;
+                const collapsible = () => rows().length > COLLAPSED_THREAD_LIMIT;
                 const visibleRows = () =>
                   collapsible() && !expanded()
                     ? rows().slice(0, COLLAPSED_THREAD_LIMIT)

@@ -264,7 +264,7 @@ fn project_snapshot(cwd: &str) -> Result<(String, String, ProjectExperienceStore
 fn is_training_source_thread(thread: &Thread) -> bool {
     // 训练与世代演进自身产生的会话都标记为 experience_thread。
     // 这些会话只用于审计训练过程，禁止再次作为训练语料，避免自我回灌。
-    !thread.mind_thread && !thread.experience_thread
+    !thread.experience_thread
 }
 
 fn project_threads(state: &AppState, project_key: &str) -> Vec<Thread> {

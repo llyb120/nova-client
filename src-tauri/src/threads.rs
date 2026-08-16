@@ -541,17 +541,10 @@ pub struct Thread {
     /// 非 None：本会话在独立 git worktree 中执行（cwd 已指向该 worktree 工作目录）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
-    /// 非 None：本会话由数字员工后台产生（记录员工 id）。此类会话不常驻左侧历史，
-    /// 仅在「数字员工 / 御书房」里点开时查看。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub employee_id: Option<String>,
-    /// Mind 自整理会话：默认不进入数字员工左侧会话列表，仅从关联入口查看。
-    #[serde(default)]
-    pub mind_thread: bool,
-    /// 猎户座训练会话：仅在猎户座左侧历史展示，与普通/员工会话隔离。
+    /// 猎户座训练会话：仅在猎户座左侧历史展示，与普通会话隔离。
     #[serde(default)]
     pub experience_thread: bool,
-    /// 会话树父节点：用于把数字员工“开工预检”与后续开发会话关联展示。
+    /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
     /// Stage 会话引用的源会话。每次发送前都会从源会话最新时间线重建上下文。
@@ -621,8 +614,6 @@ impl Thread {
             quota_peer: None,
             quota_peer_name: None,
             worktree: None,
-            employee_id: None,
-            mind_thread: false,
             experience_thread: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
@@ -882,16 +873,10 @@ pub struct ThreadMeta {
     /// 非 None：该会话在独立 git worktree 中执行（前端据此显示分支标记）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
-    /// 非 None：该会话由数字员工后台产生（前端据此不在左侧历史列表展示）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub employee_id: Option<String>,
-    /// Mind 自整理会话：默认不进入数字员工左侧会话列表。
-    #[serde(default)]
-    pub mind_thread: bool,
     /// 猎户座训练会话：只在猎户座左侧历史展示。
     #[serde(default)]
     pub experience_thread: bool,
-    /// 会话树父节点：用于把预检会话与后续开发会话关联展示。
+    /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
     /// 普通 /stage 引用的源会话；前端据此区别工作流事件链。

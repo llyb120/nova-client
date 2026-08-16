@@ -10,20 +10,12 @@ import type {
   ClueAttachment,
   ClueContextSnapshot,
   ClueNodeGroup,
-  Decision,
-  Employee,
-  EmployeeJournalEntry,
-  EmployeeTask,
   ExperienceOverview,
   GlobalAgentInstructions,
   IncomingShare,
   IncomingWorkflowShare,
-  Mark,
-  MindSnapshot,
   ModelCost,
   ModelOptions,
-  Notice,
-  Partner,
   Peer,
   ProjectEntry,
   PromptImage,
@@ -42,7 +34,6 @@ import type {
   TimeMachineTimeline,
   TimeMachineTrainingDigest,
   UpdateInfo,
-  WorkHours,
   WorktreeRecord,
 } from "./types";
 import type { WorkflowDef } from "./workflow/types";
@@ -403,99 +394,4 @@ export const api = {
   removeSkill: (name: string) => invoke<void>("remove_skill", { name }),
   syncSkills: () => invoke<void>("sync_skills"),
 
-  // 数字员工
-  listEmployees: () => invoke<Employee[]>("list_employees"),
-  createEmployee: (p: {
-    name: string;
-    agentKind: AgentKind;
-    model: string | null;
-    heartbeatAgentKind: AgentKind;
-    heartbeatModel: string | null;
-    mindAgentKind: AgentKind;
-    mindModel: string | null;
-    mode: string | null;
-    charter: string;
-    cwd: string;
-    heartbeatEnabled: boolean;
-    heartbeatSecs: number;
-    workHours: WorkHours | null;
-    enabled: boolean;
-    allowWorktree: boolean;
-    directive: string;
-    markScope: string;
-    sharedLedger: boolean;
-    partners: Partner[];
-    workflowId?: string;
-  }) => invoke<Employee>("create_employee", p),
-  updateEmployee: (employee: Employee) => invoke<void>("update_employee", { employee }),
-  deleteEmployee: (id: string) => invoke<void>("delete_employee", { id }),
-  setEmployeeEnabled: (id: string, enabled: boolean) =>
-    invoke<void>("set_employee_enabled", { id, enabled }),
-  getEmployeeMind: (id: string) => invoke<MindSnapshot>("get_employee_mind", { id }),
-  setEmployeeMindEnabled: (id: string, enabled: boolean) =>
-    invoke<void>("set_employee_mind_enabled", { id, enabled }),
-  resumeEmployeeMind: (id: string) => invoke<void>("resume_employee_mind", { id }),
-  runEmployeeNow: (id: string) => invoke<void>("run_employee_now", { id }),
-  listEmployeeTasks: () => invoke<EmployeeTask[]>("list_employee_tasks"),
-  deleteTask: (id: string) => invoke<void>("delete_task", { id }),
-  /** 交办：把一个具体单子登记到该员工账本的「待处理」（无需标题，直接填内容），员工唤起后自行侦察认领 */
-  registerLedgerItem: (employeeId: string, content: string, images: PromptImage[] = []) =>
-    invoke<void>("register_ledger_item", { employeeId, title: "", brief: content, images }),
-  /** 普通会话临时交给数字员工：界面只记录用户原文，内部以员工配置的工作流推进（默认内置 Wake → Do）。 */
-  delegateEmployeeWork: (
-    threadId: string,
-    employeeId: string,
-    content: string,
-    images: PromptImage[] = [],
-  ) => invoke<void>("delegate_employee_work", { threadId, employeeId, content, images }),
-
-  // 御书房（员工上奏、主管朱批准奏；dismiss = 留中不发）—— 底层 Notice 广播
-  listDecisions: () => invoke<Decision[]>("list_decisions"),
-  listNotices: () => invoke<Notice[]>("list_notices"),
-  resolveDecision: (id: string, answer: string) =>
-    invoke<void>("resolve_decision", { id, answer }),
-  rejectDecision: (id: string, answer: string) =>
-    invoke<void>("reject_decision", { id, answer }),
-  dismissDecision: (id: string) => invoke<void>("dismiss_decision", { id }),
-  /** 物理删除奏折/汇报记录（含已批阅） */
-  deleteDecision: (id: string) => invoke<void>("delete_decision", { id }),
-  /** 完工汇报点已读归档（不批示、不唤醒员工） */
-  readReport: (id: string) => invoke<void>("read_report", { id }),
-  /** 完工汇报批阅归档；批示只供 Dream 学习，不重新唤醒员工 */
-  reviewReport: (id: string, answer: string) =>
-    invoke<void>("review_report", { id, answer }),
-  getEmployeeMemory: (id: string) =>
-    invoke<EmployeeJournalEntry[]>("get_employee_memory", { id }),
-  addEmployeeMemory: (id: string, title: string, summary: string, pinned: boolean) =>
-    invoke<EmployeeJournalEntry>("add_employee_memory", { id, title, summary, pinned }),
-  updateEmployeeMemory: (id: string, ts: number, summary: string) =>
-    invoke<void>("update_employee_memory", { id, ts, summary }),
-  deleteEmployeeMemory: (id: string, ts: number) =>
-    invoke<void>("delete_employee_memory", { id, ts }),
-  setEmployeeMemoryPinned: (id: string, ts: number, pinned: boolean) =>
-    invoke<void>("set_employee_memory_pinned", { id, ts, pinned }),
-  setEmployeeMemoryFeedback: (id: string, ts: number, feedback: number) =>
-    invoke<void>("set_employee_memory_feedback", { id, ts, feedback }),
-
-  // 协作标记账本
-  listMarks: (scope?: string | null) => invoke<Mark[]>("list_marks", { scope: scope ?? null }),
-  releaseMark: (scope: string, key: string) => invoke<void>("release_mark", { scope, key }),
-  resetMark: (scope: string, key: string) => invoke<void>("reset_mark", { scope, key }),
-  setMark: (scope: string, key: string, status: string, note?: string | null) =>
-    invoke<void>("set_mark", { scope, key, status, note: note ?? null }),
-
-  // 共享账本（跨机器，经中转站中心仲裁）
-  listSharedMarks: (scope: string) => invoke<Mark[]>("list_shared_marks", { scope }),
-  releaseSharedMark: (scope: string, key: string) =>
-    invoke<void>("release_shared_mark", { scope, key }),
-  resetSharedMark: (scope: string, key: string, threadId?: string | null) =>
-    invoke<void>("reset_shared_mark", { scope, key, threadId: threadId ?? null }),
-  setSharedMark: (scope: string, key: string, status: string, note?: string | null) =>
-    invoke<void>("set_shared_mark", { scope, key, status, note: note ?? null }),
-
-  // 语义检索（外置 embedding 引擎）
-  semanticStatus: () => invoke<{ ok: boolean; dim: number }>("semantic_status"),
-  semanticPull: (model?: string | null) => invoke<void>("semantic_pull", { model: model ?? null }),
-  semanticRebuild: (employeeId?: string | null) =>
-    invoke<void>("semantic_rebuild", { employeeId: employeeId ?? null }),
 };

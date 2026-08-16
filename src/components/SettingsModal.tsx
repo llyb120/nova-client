@@ -812,10 +812,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
     historyDisplayMode: historyDisplayMode(),
     chatViewRender: chatViewRender(),
-    semanticEnabled: semanticEnabled(),
-    embedEndpoint: embedEndpoint().trim(),
-    embedModel: embedModel().trim(),
-    embedApiKey: embedApiKey().trim(),
     experienceTrainingEnabled: experienceTrainingEnabled(),
     experienceTrainingAgent: experienceTrainingAgent(),
     experienceTrainingModel: experienceTrainingModel().trim(),
@@ -928,10 +924,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [skillsBusy, setSkillsBusy] = createSignal(false);
   const [skillsDragging, setSkillsDragging] = createSignal(false);
   const [skillsMsg, setSkillsMsg] = createSignal("");
-  const [semanticEnabled, setSemanticEnabled] = createSignal(s?.semanticEnabled ?? false);
-  const [embedEndpoint, setEmbedEndpoint] = createSignal(s?.embedEndpoint ?? "http://localhost:11434");
-  const [embedModel, setEmbedModel] = createSignal(s?.embedModel ?? "bge-m3");
-  const [embedApiKey, setEmbedApiKey] = createSignal(s?.embedApiKey ?? "");
   const [experienceTrainingEnabled, setExperienceTrainingEnabled] = createSignal(s?.experienceTrainingEnabled ?? false);
   const trainingAgentKinds = () => enabledAgentKinds().filter((kind) => kind !== "devin" && kind !== "opencode");
   const [experienceTrainingAgent, setExperienceTrainingAgent] = createSignal<AgentKind>(s?.experienceTrainingAgent ?? "lyra");
@@ -951,16 +943,10 @@ export function SettingsModal(props: { onClose: () => void }) {
     { id: "novel", name: "参宿六", writeRate: 0.80, valueLearningRate: 0.35, forgetRate: 0.06, mutationRate: 0.40, migrationRate: 0.05, abstractionLevel: 0.60, noveltyPreference: 0.85, negativeSensitivity: 1.0 },
   ];
   const resetExperienceExperts = () => setExperienceExperts(BASE_EXPERIENCE_EXPERTS.map((expert) => ({ ...expert })));
-  const [embedBusy, setEmbedBusy] = createSignal(false);
-  const [embedMsg, setEmbedMsg] = createSignal("");
-  const persistEmbed = async () => {
+  const persistExperience = async () => {
     const cur = await api.getSettings();
     const next: Settings = {
       ...cur,
-      semanticEnabled: semanticEnabled(),
-      embedEndpoint: embedEndpoint().trim(),
-      embedModel: embedModel().trim(),
-      embedApiKey: embedApiKey().trim(),
       experienceTrainingEnabled: experienceTrainingEnabled(),
       experienceTrainingAgent: experienceTrainingAgent(),
       experienceTrainingModel: experienceTrainingModel().trim(),
@@ -970,37 +956,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     };
     await api.setSettings(next);
     setState("settings", next);
-  };
-  const testEmbed = async () => {
-    setEmbedBusy(true);
-    setEmbedMsg("正在连接…");
-    try {
-      await persistEmbed();
-      const r = await api.semanticStatus();
-      setEmbedMsg(`连接成功，向量维度 ${r.dim}。`);
-    } catch (e) {
-      setEmbedMsg(`连接失败：${String(e)}`);
-    } finally {
-      setEmbedBusy(false);
-    }
-  };
-  const pullModel = async () => {
-    const m = embedModel().trim();
-    if (!m) {
-      setEmbedMsg("请先填写模型名。");
-      return;
-    }
-    setEmbedBusy(true);
-    setEmbedMsg(`正在下载模型 ${m}…（体积较大，请耐心等待，勿关闭）`);
-    try {
-      await persistEmbed();
-      await api.semanticPull(m);
-      setEmbedMsg("模型下载完成，可点「测试连接」验证。");
-    } catch (e) {
-      setEmbedMsg(`下载失败：${String(e)}`);
-    } finally {
-      setEmbedBusy(false);
-    }
   };
   const [worktrees, setWorktrees] = createSignal<WorktreeRecord[]>([]);
   const [wtLoading, setWtLoading] = createSignal(false);
@@ -2417,67 +2372,9 @@ export function SettingsModal(props: { onClose: () => void }) {
             </div>
           </Show>
 
-          {/* ===== 记忆检索 ===== */}
+          {/* ===== 经验训练 ===== */}
           <Show when={tab() === "memory"}>
-            <label
-              class="field"
-              style={{ display: "flex", "flex-direction": "row", "align-items": "center", gap: "8px" }}
-            >
-              <input
-                type="checkbox"
-                checked={semanticEnabled()}
-                onChange={(e) => setSemanticEnabled(e.currentTarget.checked)}
-              />
-              <span>启用语义检索（关闭 = 用内置 BM25 关键词检索，零依赖）</span>
-            </label>
             <div class="field">
-              <span class="field-hint">
-                语义检索由「外置 embedding 服务」提供：主程序不内置模型、不增加体积。可本地安装 Ollama 后填模型名并点「下载模型」；也可把服务部署在服务器上（Ollama / TEI / vLLM 等，见 docs/embedding-server.md），本地只在下方填服务器地址即可，无需本地部署；还可填任意 OpenAI 兼容的 /v1/embeddings 服务（含云端）。不配置或连不上时自动回退 BM25，员工记忆检索始终可用。
-              </span>
-            </div>
-            <label class="field">
-              <span class="field-label">服务地址</span>
-              <input
-                class="field-input"
-                value={embedEndpoint()}
-                onInput={(e) => setEmbedEndpoint(e.currentTarget.value)}
-                placeholder="http://localhost:11434"
-              />
-              <span class="field-hint">OpenAI 兼容服务的 base 地址（无需带 /v1）。可填本地（Ollama 默认 http://localhost:11434），也可填部署在服务器上的地址（如 http://your-server:11434），本地无需装模型。服务器部署见 docs/embedding-server.md。</span>
-            </label>
-            <label class="field">
-              <span class="field-label">模型名</span>
-              <input
-                class="field-input"
-                value={embedModel()}
-                onInput={(e) => setEmbedModel(e.currentTarget.value)}
-                placeholder="bge-m3 / nomic-embed-text / text-embedding-3-small"
-              />
-              <span class="field-hint">中文/多语言推荐 bge-m3；轻量可用 nomic-embed-text。换模型后向量会自动重建。</span>
-            </label>
-            <label class="field">
-              <span class="field-label">API Key</span>
-              <input
-                class="field-input"
-                type="password"
-                value={embedApiKey()}
-                onInput={(e) => setEmbedApiKey(e.currentTarget.value)}
-                placeholder="本地服务留空；云端填对应 key"
-              />
-            </label>
-            <div class="wt-dir-row">
-              <button class="btn secondary" disabled={embedBusy()} onClick={() => void testEmbed()}>
-                测试连接
-              </button>
-              <button class="btn secondary" disabled={embedBusy()} onClick={() => void pullModel()}>
-                下载模型（Ollama）
-              </button>
-            </div>
-            <Show when={embedMsg()}>
-              <div class="field-hint">{embedMsg()}</div>
-            </Show>
-
-            <div class="field" style={{ "margin-top": "20px", "padding-top": "16px", "border-top": "1px solid var(--border)" }}>
               <span class="field-label">经验训练</span>
               <span class="field-hint">
                 经验是从会话结果中学习出的条件性结论；它与“客观做过什么”的记忆、以及“必须遵守”的守则严格分库存储。Lyra 只会按需加载经验，并用反馈调整经验，不会改写记忆或守则。

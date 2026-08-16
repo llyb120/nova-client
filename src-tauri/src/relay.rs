@@ -886,13 +886,6 @@ impl RelayManager {
             "roaming.error" => self.on_roaming_error(&env),
             "quota.granted" => self.on_quota_granted(&env),
             "quota.rejected" => self.on_quota_rejected(&env),
-            // 数字员工跨机讨论：队友员工来咨询 / 对我方咨询的回复
-            "employee.discuss" => {
-                crate::employees::on_remote_discuss(&self.app, &env.from, &env.from_name, env.data)
-            }
-            "employee.discuss.reply" => {
-                crate::employees::on_remote_discuss_reply(&self.app, env.data)
-            }
             _ => {}
         }
     }

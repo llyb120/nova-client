@@ -943,8 +943,6 @@ async fn sync(transport: &RemoteTransport, value: &Value) -> Result<ServerRespon
 
 fn eligible(t: &Thread) -> bool {
     t.roaming_role.is_none()
-        && t.employee_id.is_none()
-        && !t.mind_thread
         // 猎户座的经验训练与世代演进会话只在本地训练视图展示，
         // 不进入网页端最近会话，也不上传目录、元数据或会话内容。
         && !t.experience_thread
@@ -2542,11 +2540,7 @@ pub(crate) fn route_fire_command(
         let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
         let thread = store.get(thread_id).ok_or("会话不存在")?;
-        if thread.employee_id.is_some()
-            || thread.mind_thread
-            || thread.roaming_role.is_some()
-            || thread.quota_peer_name.is_some()
-        {
+        if thread.roaming_role.is_some() || thread.quota_peer_name.is_some() {
             return Err("/fire 仅支持本地普通会话".into());
         }
         if is_running(&state, thread) {

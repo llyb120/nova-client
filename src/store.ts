@@ -11,16 +11,12 @@ import type {
   ClueAttachment,
   ClueCard,
   ClueNodeGroup,
-  Decision,
   EffortChoice,
-  Employee,
-  EmployeeTask,
   IncomingRoamRequest,
   IncomingShare,
   IncomingWorkflowShare,
   Item,
   LiveUsage,
-  Mark,
   ModelChoice,
   ModelCost,
   ModelOptions,
@@ -51,12 +47,10 @@ import {
   handleTurnStart as handleWorkflowTurnStart,
   initWorkflowRuntime,
   preparePrompt as prepareWorkflowPrompt,
-  runRootIds as workflowRunRootIds,
   startWorkflow,
   suspendActive as suspendWorkflowActive,
 } from "./workflow/runtime";
-import { findTriggeredWorkflow, findWorkflowByName, getWorkflow, isWorkflowEnabled } from "./workflow/storage";
-import { WORKFLOW_WAKE_DO_ID } from "./workflow/builtin";
+import { findTriggeredWorkflow, findWorkflowByName } from "./workflow/storage";
 import { buildEasyPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
@@ -159,7 +153,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "clues" | "employees" | "workbench" | "workflows" | "training";
+  view: "home" | "clues" | "workflows" | "training";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -169,10 +163,6 @@ interface AppStore {
   homeComposerFocusAt: number;
   clueOpenRequest: string | null;
   unreadClueMentions: string[];
-  employees: Employee[];
-  employeeTasks: EmployeeTask[];
-  marks: Mark[];
-  decisions: Decision[];
   theme: ThemePref;
   backendAvailability: Record<string, boolean>;
 }
@@ -251,10 +241,6 @@ export const [state, setState] = createStore<AppStore>({
   homeComposerFocusAt: 0,
   clueOpenRequest: null,
   unreadClueMentions: [],
-  employees: [],
-  employeeTasks: [],
-  marks: [],
-  decisions: [],
   theme: readThemePref(),
   backendAvailability: {},
 });
@@ -711,10 +697,7 @@ export async function refreshRoamingFolders() {
   }
 }
 
-// ===== 数字员工 =====
-
-/** 切换主区域视图。不影响已打开的会话（currentId 优先）。 */
-export function setView(view: "home" | "clues" | "employees" | "workbench" | "workflows" | "training") {
+export function setView(view: "home" | "clues" | "workflows" | "training") {
   setState("view", view);
 }
 
@@ -874,43 +857,6 @@ export function clearClueOpenRequest(cardId: string) {
 
 export function markClueMentionRead(cardId: string) {
   setState("unreadClueMentions", (ids) => ids.filter((id) => id !== cardId));
-}
-
-export async function refreshEmployees() {
-  try {
-    setState("employees", await api.listEmployees());
-  } catch {
-    // 忽略（保留上次数据）
-  }
-}
-
-export async function refreshEmployeeTasks() {
-  try {
-    setState("employeeTasks", await api.listEmployeeTasks());
-  } catch {
-    // 忽略
-  }
-}
-
-export async function refreshMarks() {
-  try {
-    setState("marks", await api.listMarks());
-  } catch {
-    // 忽略
-  }
-}
-
-export async function refreshDecisions() {
-  try {
-    setState("decisions", await api.listDecisions());
-  } catch {
-    // 忽略
-  }
-}
-
-/** 候旨（待主管朱批）+ 未读完工汇报的数量（御书房入口的未决 badge） */
-export function pendingDecisionCount(): number {
-  return state.decisions.filter((d) => d.status === "pending" || d.status === "report").length;
 }
 
 /** 在线的其他人（排除自己）。漫游只能选择对方已共享（上报）的目录，不再支持手输路径；
@@ -1467,7 +1413,6 @@ export async function deleteProjectThreads(ids: string[]): Promise<number> {
 export async function sendPrompt(
   text: string,
   images: PromptImage[] = [],
-  employeeId?: string | null,
   workflowId?: string | null,
 ) {
   let id = state.currentId;
@@ -1497,93 +1442,7 @@ export async function sendPrompt(
     await openThread(restored.threadId);
     id = restored.threadId;
   }
-  const thread = state.threads.find((t) => t.id === id);
-  if (thread?.employeeId && !thread.mindThread) {
-    // 员工会话里的补充输入：先尝试挂回进行中的工作流（含附件），否则开启新一轮工作流。
-    if (prepareWorkflowPrompt(id, text) !== null) {
-      await deliverPrompt(id, text, images);
-      return;
-    }
-    const employee = state.employees.find((e) => e.id === thread.employeeId);
-    if (employee) {
-      await startEmployeeWorkflow(employee, id, text.trim(), images);
-      return;
-    }
-    await api.registerLedgerItem(thread.employeeId, text, images);
-    return;
-  }
-  if (employeeId) {
-    // 普通会话只保存用户输入；岗位说明、记忆与工作流内部提示留在后台员工会话。
-    bumpChatScrollToBottom();
-    await api.delegateEmployeeWork(id, employeeId, text, images);
-    return;
-  }
   await deliverPrompt(id, text, images);
-}
-
-/** 解析员工配置的工作流（空 = 默认内置「Wake → Do」），在指定员工会话上开启一轮工作。 */
-export async function startEmployeeWorkflow(
-  employee: Employee,
-  threadId: string,
-  goal: string,
-  images: PromptImage[] = [],
-): Promise<void> {
-  const configured = (employee.workflowId ?? "").trim();
-  let workflowId = configured || WORKFLOW_WAKE_DO_ID;
-  // 自定义工作流已删除或被停用 → 回落默认内置工作流，保证员工总能开工。
-  const resolved = getWorkflow(workflowId);
-  if (!resolved || !isWorkflowEnabled(resolved)) workflowId = WORKFLOW_WAKE_DO_ID;
-  const context = [
-    employee.charter.trim() ? `岗位说明书：\n${employee.charter.trim()}` : "",
-    employee.directive.trim() ? `常驻职责：\n${employee.directive.trim()}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-  await startWorkflow(workflowId, { goal, context }, threadId, images);
-}
-
-/** 后端移交的员工工作轮次（心跳 / 立即执行 / 交办）：在新建的工作流根会话上启动配置的工作流。 */
-async function handleEmployeeWorkflowRequest(payload: {
-  employeeId: string;
-  threadId: string;
-  goal: string;
-  images?: PromptImage[];
-}): Promise<void> {
-  await refreshThreads(); // 后端刚建的根会话可能还没进列表
-  const employee = state.employees.find((e) => e.id === payload.employeeId);
-  if (!employee || !employee.enabled) return;
-  // 去重：该员工已有进行中/暂停的工作流链时不再开新轮，避免重复开工；
-  // 顺手丢弃后端为本轮新建的空根会话，避免侧栏堆积空壳。
-  const roots = new Set(workflowRunRootIds());
-  if (state.threads.some((t) => t.employeeId === employee.id && roots.has(t.id))) {
-    try {
-      const spawned = await api.getThread(payload.threadId);
-      if (spawned.items.length === 0) await api.deleteThread(payload.threadId);
-    } catch {
-      // 会话已被其他路径清理
-    }
-    await refreshThreads();
-    return;
-  }
-  if (state.running[payload.threadId]) return;
-  const goal =
-    payload.goal.trim() ||
-    (employee.directive.trim()
-      ? `按常驻职责自主推进一轮工作。\n常驻职责：${employee.directive.trim()}`
-      : "自主巡查一轮：看看有没有需要处理的工作并推进。");
-  try {
-    await startEmployeeWorkflow(employee, payload.threadId, goal, payload.images ?? []);
-  } catch (error) {
-    // 启动失败（如工作流被删且默认流被停用）：丢弃本轮新建的空根会话，避免侧栏留空壳。
-    try {
-      const spawned = await api.getThread(payload.threadId);
-      if (spawned.items.length === 0) await api.deleteThread(payload.threadId);
-      await refreshThreads();
-    } catch {
-      // 会话已被其他路径清理
-    }
-    throw error;
-  }
 }
 
 type StageInput = { currentPrompt: string; stagePrompt: string; stageIndex: number };
@@ -2097,7 +1956,7 @@ export async function startFireRelay(
   // 首页刚创建会话后会立即发送首条提示，此时异步 refreshThreads 可能尚未完成；
   // 直接读取后端快照，不能依赖列表中已经出现该会话。
   const root = await api.getThread(rootId);
-  if (root.employeeId || root.roamingRole || root.quotaPeerName) {
+  if (root.roamingRole || root.quotaPeerName) {
     throw new Error("/fire 仅支持本地普通会话");
   }
   if (state.running[rootId]) throw new Error("请等待当前会话结束后再启动 /fire");
@@ -2748,28 +2607,6 @@ export async function initStore() {
     void refreshProjects();
   });
 
-  // 数字员工：后端在配置/收件箱变化、心跳执行前后都会 emit，前端据此刷新列表与状态
-  await listen("employees:changed", () => {
-    void refreshEmployees();
-  });
-  // 员工工作轮次移交：后端不再自动跑 Wake→Do，改为建会话后由前端工作流运行时推进
-  await listen<{ employeeId: string; threadId: string; goal: string; images?: PromptImage[] }>(
-    "employees:workflow-request",
-    (e) => {
-      void handleEmployeeWorkflowRequest(e.payload).catch((error) =>
-        console.error("Employee workflow request failed", error),
-      );
-    },
-  );
-  await listen("tasks:changed", () => {
-    void refreshEmployeeTasks();
-  });
-  await listen("marks:changed", () => {
-    void refreshMarks();
-  });
-  await listen("decisions:changed", () => {
-    void refreshDecisions();
-  });
   await listen("clues:changed", () => {
     void refreshClueGroups();
   });
@@ -2787,12 +2624,6 @@ export async function initStore() {
   // 系统通知点击：跳转到对应会话
   await listen<{ threadId: string }>("acp:notify-open", (e) => {
     void openThread(e.payload.threadId);
-  });
-
-  // 「员工上奏」系统通知点击：直达御书房批阅
-  await listen("decisions:open", () => {
-    setState("view", "workbench");
-    closeThread();
   });
 
   // 漫游快照重同步（重连/轮次结束自愈）：用 reconcile 按 id 合并，保留未变条目的
@@ -2932,12 +2763,6 @@ export async function initStore() {
   // 成就后台预拉：有新成就时侧栏入口直接亮角标，不必等用户打开成就页
   void refreshAchievements();
   void refreshRoamingFolders();
-
-  // 数字员工：列表 + 任务活动 + 协作账本 + 御书房（纯本地读取，很快）
-  void refreshEmployees();
-  void refreshEmployeeTasks();
-  void refreshMarks();
-  void refreshDecisions();
   void refreshClueGroups();
 
   // 会话/项目列表也是快的本地读取；升级重启后的会话恢复依赖 threads 已就绪，故这里 await 等它俩。

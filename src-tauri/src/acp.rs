@@ -1062,23 +1062,18 @@ impl AcpManager {
                     return;
                 };
                 let tool_call = params.get("toolCall").cloned().unwrap_or(Value::Null);
-                // 自动放行（挑一个 allow 选项作答）的两种情形：
-                // - 数字员工：无人值守，授权请求没人应答会让本轮永久挂起（is_running 卡死、
-                //   员工「永远在忙」、无法再次「立即执行」）；
-                // - 统一 Build 模式：语义就是放开全部权限。若后端仍上报授权请求，
-                //   这里代答 allow；Plan 等其他模式照旧弹给用户审批。
-                let (is_employee, is_build) = {
+                // 统一 Build 模式会放开全部权限。若后端仍上报授权请求，
+                // 这里代答 allow；Plan 等其他模式照旧弹给用户审批。
+                let is_build = {
                     let state = self.app.state::<AppState>();
                     let store = state.store.lock().unwrap();
-                    let t = store.get(&thread_id);
-                    (
-                        t.and_then(|t| t.employee_id.clone()).is_some(),
-                        t.and_then(|t| t.mode.clone())
-                            .map(|m| is_full_permission_mode(&m))
-                            .unwrap_or(false),
-                    )
+                    store
+                        .get(&thread_id)
+                        .and_then(|t| t.mode.clone())
+                        .map(|m| is_full_permission_mode(&m))
+                        .unwrap_or(false)
                 };
-                if is_employee || is_build {
+                if is_build {
                     let allow = params
                         .get("options")
                         .and_then(|o| o.as_array())
@@ -1097,7 +1092,7 @@ impl AcpManager {
                         Some(oid) => json!({ "outcome": "selected", "optionId": oid }),
                         None => json!({ "outcome": "cancelled" }),
                     };
-                    if is_build && !is_employee {
+                    if is_build {
                         let title = tool_call
                             .get("title")
                             .and_then(|v| v.as_str())
@@ -1579,8 +1574,6 @@ impl AcpManager {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             match store.get(thread_id) {
-                // 数字员工的后台会话完成不弹系统提醒（巡查/开发都算），避免打扰。
-                Some(t) if t.employee_id.is_some() => return,
                 Some(t) => t.title.clone(),
                 None => return,
             }

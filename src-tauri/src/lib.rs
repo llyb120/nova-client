@@ -1,7 +1,6 @@
 mod acp;
 mod agent_config;
 mod alkaid_complete;
-mod cli;
 mod cli_manager;
 mod clipboard;
 mod clues;
@@ -9,15 +8,11 @@ mod codex;
 mod codex_radar;
 mod context_service;
 mod credential_roaming;
-mod employees;
 mod experience;
 mod gitwt;
 mod http_stream;
 mod lyra;
-mod marks;
-mod mind;
 mod model_cache;
-mod notice;
 mod nova_tools_napi_asset;
 mod nova_tools_native;
 mod opencode_sdk;
@@ -27,7 +22,6 @@ mod relay;
 mod remote;
 mod sdk_adapters;
 mod sdk_runtime;
-mod semantic;
 mod server;
 mod settings;
 mod signature;
@@ -84,20 +78,6 @@ pub struct AppState {
     pub roaming: Mutex<RoamingStore>,
     /// 已创建的 git worktree 记录（独立持久化，供设置面板手动清理）
     pub worktrees: Mutex<WorktreeStore>,
-    /// 数字员工：配置 / 任务收件箱 / 工作记忆
-    pub employees: Mutex<employees::EmployeeStore>,
-    pub tasks: Mutex<employees::TaskStore>,
-    pub workflows: Mutex<employees::WorkflowStore>,
-    pub memory: Mutex<employees::MemoryStore>,
-    /// 数字员工 Mind：事件、注意力、运行租约与自愈状态
-    pub mind: Mutex<mind::MindStore>,
-    /// 奏折（御书房）：兼容旧存档；新协作走 notices
-    pub decisions: Mutex<employees::DecisionStore>,
-    /// 统一协作 Notice（发送方声明 PendingIntent）
-    pub notices: Mutex<notice::NoticeStore>,
-    /// 共享标记账本：员工协作时对外部实体（需求单等）做去重/互斥/接力
-    pub marks: Mutex<marks::MarkStore>,
-    pub vectors: Mutex<semantic::VectorStore>,
     /// Native resident fast_context service shared by every external bridge. Lyra bypasses the
     /// socket and calls the same in-process engine directly.
     pub(crate) context_service: context_service::ContextService,
@@ -126,11 +106,6 @@ pub struct AppState {
     pub last_activity_ms: Mutex<i64>,
     /// 前端当前打开的会话 id（None = 停在主页）。升级重启前写入恢复标记，重启后据此恢复显示。
     pub active_thread: Mutex<Option<String>>,
-    /// 被用户手动停止的数字员工会话 id 集合：`cancel_turn` 命中员工会话时置入。
-    /// 必须按会话隔离，否则新交办唤起下一轮时会误清旧会话的停止信号。
-    pub cancelled_employee_threads: Mutex<HashSet<String>>,
-    /// 用户停止普通数字员工工作会话时填写的原因。空字符串表示仅仅不想继续运行。
-    pub employee_stop_reasons: Mutex<HashMap<String, String>>,
     /// 后端可用性检测结果（agent_kind → 是否可用）。启动后并发按需检测（解析 PATH，
     /// 不拉起进程），前端据此只显示真正可用的后端。空 map 表示尚未检测完成。
     pub backend_availability: Mutex<HashMap<String, bool>>,
@@ -366,14 +341,11 @@ fn running_by_id(state: &AppState, thread_id: &str) -> bool {
 }
 
 fn is_ordinary_thread(thread: &Thread) -> bool {
-    thread.employee_id.is_none()
-        && !thread.mind_thread
-        && thread.roaming_role.is_none()
-        && thread.quota_peer.is_none()
+    thread.roaming_role.is_none() && thread.quota_peer.is_none()
 }
 
 fn is_starrable_thread(thread: &Thread) -> bool {
-    thread.employee_id.is_none() && !thread.mind_thread && thread.roaming_role.is_none()
+    thread.roaming_role.is_none()
 }
 
 fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
@@ -442,13 +414,6 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
 fn any_session_running(state: &AppState) -> bool {
     let store = state.store.lock().unwrap();
     store.threads.iter().any(|t| is_running(state, t))
-}
-
-/// 是否有任何员工任务正在执行（working）。用于判断「空闲（没有任务）」：
-/// 空闲弹窗更新要求既没有会话在跑，也没有员工任务在做。
-fn any_employee_working(state: &AppState) -> bool {
-    let tasks = state.tasks.lock().unwrap();
-    tasks.tasks.iter().any(|t| t.status == "working")
 }
 
 pub(crate) async fn shutdown_agent_processes(state: &AppState) {
@@ -543,9 +508,6 @@ mod session_auto_cleanup_tests {
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
         thread.starred = false;
         thread.ephemeral = false;
-        thread.employee_id = Some("employee".into());
-        assert!(!is_normal_thread_for_auto_cleanup(&thread));
-        thread.employee_id = None;
         thread.roaming_role = Some("host".into());
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
     }
@@ -840,8 +802,6 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
                 .worktree
                 .clone()
                 .or_else(|| wt_by_path.get(&t.cwd).cloned()),
-            employee_id: t.employee_id.clone(),
-            mind_thread: t.mind_thread,
             experience_thread: t.experience_thread,
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
@@ -1924,11 +1884,6 @@ fn remove_worktree(
     if delete_branch && rec.owned_branch {
         let _ = gitwt::delete_branch(&rec.repo, &rec.branch);
     }
-    state
-        .workflows
-        .lock()
-        .unwrap()
-        .close_by_worktree(&rec.repo, &rec.path, &rec.branch);
     state.worktrees.lock().unwrap().remove(&id);
     if !doomed.is_empty() {
         {
@@ -2041,11 +1996,6 @@ async fn merge_worktree_thread(
                     json!({ "threadId": thread_id, "op": { "t": "upsert", "item": item } }),
                 );
             }
-            state
-                .workflows
-                .lock()
-                .unwrap()
-                .close_by_thread_id(&thread_id);
             Ok("merged".into())
         }
         Err(e) => {
@@ -2213,8 +2163,6 @@ fn delete_thread(
         store.threads.retain(|t| !delete_ids.contains(&t.id));
         store.save();
     }
-    employees::delete_tasks_for_threads(&app, &delete_ids);
-    state.workflows.lock().unwrap().detach_threads(&delete_ids);
     for id in &delete_ids {
         state.acp.forget_session_of_thread(id);
         state.codex.forget_session_of_thread(id);
@@ -2285,8 +2233,6 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
         store.save();
         removed
     };
-    employees::delete_tasks_for_threads(app, &deletable);
-    state.workflows.lock().unwrap().detach_threads(&deletable);
     for id in &deletable {
         state.acp.forget_session_of_thread(id);
         state.codex.forget_session_of_thread(id);
@@ -3501,15 +3447,13 @@ pub(crate) fn dispatch_prompt(
     if remote::route_fire_command(app, &thread_id, &text, &images)? {
         return Ok(());
     }
-    let (agent_kind, is_guest, is_quota, employee_id, mind_thread) = {
+    let (agent_kind, is_guest, is_quota) = {
         let store = state.store.lock().unwrap();
         let t = store.get(&thread_id).ok_or("线程不存在")?;
         (
             t.agent_kind.clone(),
             t.is_roaming_guest(),
             t.is_quota_borrowed(),
-            t.employee_id.clone(),
-            t.mind_thread,
         )
     };
     // Stage 引用不是一次性快照：每次投递都从源会话最新 items 重建。
@@ -3523,12 +3467,6 @@ pub(crate) fn dispatch_prompt(
         if let Some(thread) = store.get_mut(&thread_id) {
             thread.pending_stage_context = stage_context;
         }
-    }
-    if employee_id.is_some() && !mind_thread {
-        return Err(
-            "数字员工会话不能直接发送 prompt；请通过员工交办/账本流程，让 Dream 先做开工预检。"
-                .into(),
-        );
     }
     // 漫游 guest：本机不执行，转发到对端 host
     if is_guest {
@@ -3915,8 +3853,8 @@ async fn cancel_turn(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
-    stop_reason: Option<String>,
-    delete_work: Option<bool>,
+    _stop_reason: Option<String>,
+    _delete_work: Option<bool>,
 ) -> Result<(), String> {
     if state
         .pending_prompt_restores
@@ -3952,61 +3890,6 @@ async fn cancel_turn(
     if is_quota {
         return Err("额度凭证已过期，请重新发起租借".into());
     }
-    // 数字员工后台会话：用户手动停止 = 中止整轮自主编排（不只停当前一轮 turn），
-    // 并把心跳计时重置，避免下一次 tick 立刻又把它唤起。
-    let (employee_id, mind_thread, thread_title) = {
-        let store = state.store.lock().unwrap();
-        store
-            .get(&thread_id)
-            .map(|t| (t.employee_id.clone(), t.mind_thread, t.title.clone()))
-            .unwrap_or((None, false, String::new()))
-    };
-    if let Some(eid) = employee_id {
-        let is_mind = mind::is_active_thread(&app, &thread_id);
-        state
-            .cancelled_employee_threads
-            .lock()
-            .unwrap()
-            .insert(thread_id.clone());
-        if is_mind {
-            mind::manual_stop(&app, &eid, &thread_id);
-        } else {
-            if !mind_thread {
-                let reason = stop_reason.unwrap_or_default().trim().to_string();
-                state
-                    .employee_stop_reasons
-                    .lock()
-                    .unwrap()
-                    .insert(thread_id.clone(), reason.clone());
-                let scope = employees::find_employee(&app, &eid)
-                    .map(|employee| employees::employee_scope(&employee))
-                    .unwrap_or_else(|| format!("emp:{eid}"));
-                let summary = if reason.is_empty() {
-                    "【用户】手动停止了这轮工作，没有填写具体原因，只是不想继续运行了。Dream 应结合会话过程判断是否需要沉淀。".to_string()
-                } else {
-                    format!(
-                        "【用户】手动停止了这轮工作，原因：{reason}。Dream 应结合会话过程复盘任务方向、执行范围和上奏时机。"
-                    )
-                };
-                mind::record_journal_event(
-                    &app,
-                    &eid,
-                    &scope,
-                    &thread_id,
-                    &thread_title,
-                    &summary,
-                    "outcome:stopped",
-                    now_ms(),
-                );
-            }
-            let mut emps = state.employees.lock().unwrap();
-            if let Some(e) = emps.get_mut(&eid) {
-                e.last_heartbeat_ms = now_ms();
-                e.updated_at = now_ms();
-            }
-            emps.save();
-        }
-    }
     let kind = agent_kind_for_thread(&state, &thread_id)?;
     match kind {
         AgentKind::Alkaid => state.alkaid.cancel(&thread_id).await,
@@ -4021,9 +3904,6 @@ async fn cancel_turn(
         AgentKind::OpenCode | AgentKind::OpenCodePlus => {
             state.opencodeplus.cancel(&thread_id).await
         }
-    }
-    if delete_work.unwrap_or(false) {
-        employees::delete_work_by_thread(&app, &thread_id).await;
     }
     Ok(())
 }
@@ -4422,6 +4302,44 @@ struct ClueAiSummary {
     content: String,
 }
 
+async fn run_auxiliary_prompt(
+    kind: &AgentKind,
+    app: &tauri::AppHandle,
+    thread_id: String,
+    prompt: String,
+) {
+    let state = app.state::<AppState>();
+    match kind {
+        AgentKind::Alkaid => state.alkaid.clone().run_prompt(thread_id, prompt, Vec::new()).await,
+        AgentKind::Lyra => state.lyra.clone().run_prompt(thread_id, prompt, Vec::new()).await,
+        AgentKind::Devin => state.acp.clone().run_prompt(thread_id, prompt, Vec::new()).await,
+        AgentKind::Codex | AgentKind::CodexPlus => {
+            state.codexplus.clone().run_prompt(thread_id, prompt, Vec::new()).await
+        }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
+            state.codebuddyplus.clone().run_prompt(thread_id, prompt, Vec::new()).await
+        }
+        AgentKind::ClaudeCode => {
+            state.claudeplus.clone().run_prompt(thread_id, prompt, Vec::new()).await
+        }
+        AgentKind::Cursor => {
+            state.cursorplus.clone().run_prompt(thread_id, prompt, Vec::new()).await
+        }
+        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            state.opencodeplus.clone().run_prompt(thread_id, prompt, Vec::new()).await
+        }
+    }
+}
+
+fn last_assistant_text(app: &tauri::AppHandle, thread_id: &str) -> Option<String> {
+    let state = app.state::<AppState>();
+    let store = state.store.lock().unwrap();
+    store.get(thread_id)?.items.iter().rev().find_map(|item| match item {
+        Item::Assistant { text, .. } if !text.trim().is_empty() => Some(text.trim().to_string()),
+        _ => None,
+    })
+}
+
 /// 优先用轻量级模型总结会话核心内容，失败时回退到原会话模型。
 #[tauri::command]
 async fn summarize_clue(
@@ -4485,9 +4403,8 @@ async fn summarize_clue(
             store.save();
         }
         let _ = app.emit(acp::EV_THREADS, json!({}));
-        employees::run_employee_prompt(&agent_kind, &app, run_id.clone(), seed.clone()).await;
-        let output = employees::last_employee_assistant(&app, &run_id)
-            .filter(|text| !text.trim().is_empty());
+        run_auxiliary_prompt(&agent_kind, &app, run_id.clone(), seed.clone()).await;
+        let output = last_assistant_text(&app, &run_id).filter(|text| !text.trim().is_empty());
 
         // 每次尝试后都清理辅助会话；轻量模型失败时再用原会话模型重试。
         {
@@ -4931,640 +4848,6 @@ fn get_logs(state: State<'_, AppState>) -> Vec<String> {
     logs
 }
 
-// ===== 数字员工 =====
-
-#[tauri::command]
-fn list_employees(app: tauri::AppHandle) -> Vec<employees::Employee> {
-    employees::list_employees(&app)
-}
-
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-fn create_employee(
-    app: tauri::AppHandle,
-    name: String,
-    agent_kind: Option<AgentKind>,
-    model: Option<String>,
-    heartbeat_agent_kind: Option<AgentKind>,
-    heartbeat_model: Option<String>,
-    mind_agent_kind: Option<AgentKind>,
-    mind_model: Option<String>,
-    mode: Option<String>,
-    charter: String,
-    cwd: String,
-    heartbeat_enabled: Option<bool>,
-    heartbeat_secs: Option<u64>,
-    work_hours: Option<employees::WorkHours>,
-    enabled: Option<bool>,
-    self_directed: Option<bool>,
-    allow_worktree: Option<bool>,
-    directive: Option<String>,
-    mark_scope: Option<String>,
-    shared_ledger: Option<bool>,
-    partners: Option<Vec<employees::Partner>>,
-    workflow_id: Option<String>,
-) -> Result<employees::Employee, String> {
-    employees::create_employee(
-        &app,
-        name,
-        agent_kind,
-        model,
-        heartbeat_agent_kind,
-        heartbeat_model,
-        mind_agent_kind,
-        mind_model,
-        mode,
-        charter,
-        cwd,
-        heartbeat_enabled,
-        heartbeat_secs,
-        work_hours,
-        enabled,
-        self_directed,
-        allow_worktree,
-        directive,
-        mark_scope,
-        shared_ledger,
-        partners,
-        workflow_id,
-    )
-}
-
-#[tauri::command]
-fn update_employee(app: tauri::AppHandle, employee: employees::Employee) -> Result<(), String> {
-    employees::update_employee(&app, employee)
-}
-
-#[tauri::command]
-fn delete_employee(app: tauri::AppHandle, id: String) {
-    employees::delete_employee(&app, &id);
-}
-
-#[tauri::command]
-fn set_employee_enabled(app: tauri::AppHandle, id: String, enabled: bool) {
-    employees::set_employee_enabled(&app, &id, enabled);
-}
-
-#[tauri::command]
-fn get_employee_mind(app: tauri::AppHandle, id: String) -> mind::MindSnapshot {
-    mind::snapshot(&app, &id)
-}
-
-#[tauri::command]
-fn set_employee_mind_enabled(app: tauri::AppHandle, id: String, enabled: bool) {
-    mind::set_enabled(&app, &id, enabled);
-}
-
-#[tauri::command]
-fn resume_employee_mind(app: tauri::AppHandle, id: String) {
-    mind::resume(&app, &id);
-}
-
-/// 立即让某员工干一轮（忽略心跳节奏，方便手动触发）
-#[tauri::command]
-fn run_employee_now(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    employees::run_now(&app, &id)
-}
-
-#[tauri::command]
-fn list_employee_tasks(app: tauri::AppHandle) -> Vec<employees::Task> {
-    employees::list_tasks(&app)
-}
-
-#[tauri::command]
-fn assign_task(
-    app: tauri::AppHandle,
-    employee_id: String,
-    title: String,
-    brief: String,
-) -> Result<employees::Task, String> {
-    employees::assign_task(&app, employee_id, title, brief)
-}
-
-#[tauri::command]
-fn delete_task(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    employees::delete_task(&app, &id)
-}
-
-/// 交办：把一个具体单子登记到该员工账本的「待处理」，员工唤起后自行侦察认领。
-#[tauri::command]
-async fn register_ledger_item(
-    app: tauri::AppHandle,
-    employee_id: String,
-    title: String,
-    brief: String,
-    images: Option<Vec<PromptImage>>,
-) -> Result<(), String> {
-    employees::register_ledger_item(
-        &app,
-        employee_id,
-        title,
-        brief,
-        images.unwrap_or_default(),
-        None,
-        None,
-        None,
-    )
-    .await
-}
-
-#[tauri::command]
-async fn delegate_employee_work(
-    app: tauri::AppHandle,
-    thread_id: String,
-    employee_id: String,
-    content: String,
-    images: Option<Vec<PromptImage>>,
-) -> Result<(), String> {
-    employees::delegate_employee_work(
-        &app,
-        thread_id,
-        employee_id,
-        content,
-        images.unwrap_or_default(),
-    )
-    .await
-}
-
-#[tauri::command]
-fn get_employee_memory(app: tauri::AppHandle, id: String) -> Vec<employees::JournalEntry> {
-    employees::employee_memory(&app, &id)
-}
-
-/// 手动新增一条记忆/知识（pinned=true 为长期知识，不会被自动截断）
-#[tauri::command]
-fn add_employee_memory(
-    app: tauri::AppHandle,
-    id: String,
-    title: String,
-    summary: String,
-    pinned: bool,
-) -> Result<employees::JournalEntry, String> {
-    employees::add_memory(&app, &id, title, summary, pinned)
-}
-
-#[tauri::command]
-fn update_employee_memory(app: tauri::AppHandle, id: String, ts: i64, summary: String) {
-    employees::update_memory_entry(&app, &id, ts, summary)
-}
-
-#[tauri::command]
-fn delete_employee_memory(app: tauri::AppHandle, id: String, ts: i64) {
-    employees::delete_memory_entry(&app, &id, ts)
-}
-
-#[tauri::command]
-fn set_employee_memory_pinned(app: tauri::AppHandle, id: String, ts: i64, pinned: bool) {
-    employees::set_memory_pinned(&app, &id, ts, pinned)
-}
-
-#[tauri::command]
-fn set_employee_memory_feedback(
-    app: tauri::AppHandle,
-    id: String,
-    ts: i64,
-    feedback: i8,
-) -> Result<(), String> {
-    employees::set_memory_feedback(&app, &id, ts, feedback)
-}
-
-// ===== 协作标记账本 =====
-
-#[tauri::command]
-fn list_marks(state: State<'_, AppState>, scope: Option<String>) -> Vec<marks::Mark> {
-    state.marks.lock().unwrap().list(scope.as_deref())
-}
-
-/// 释放认领：状态回到 open，供他人接手（不删除历史与备注）
-#[tauri::command]
-fn release_mark(app: tauri::AppHandle, state: State<'_, AppState>, scope: String, key: String) {
-    state.marks.lock().unwrap().release(&scope, &key);
-    let _ = app.emit(marks::EV_MARKS, json!({}));
-}
-
-/// 删除标记：该单子可被重新发现处理（用于「重做」）
-#[tauri::command]
-async fn reset_mark(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    scope: String,
-    key: String,
-) -> Result<(), String> {
-    let thread_id = state
-        .marks
-        .lock()
-        .unwrap()
-        .get(&scope, &key)
-        .and_then(|mark| mark.thread_id.clone());
-    if let Some(thread_id) = thread_id.as_deref() {
-        employees::cancel_deleted_ledger_thread(&app, thread_id).await;
-    }
-    state.marks.lock().unwrap().remove(&scope, &key);
-    employees::cooloff_clear(&scope, &key); // 主管手动复位 = 明确要求可以再做
-    let _ = app.emit(marks::EV_MARKS, json!({}));
-    Ok(())
-}
-
-/// 手动改标记状态（open / claimed / done / failed）；置 open 时一并释放认领。
-#[tauri::command]
-fn set_mark(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    scope: String,
-    key: String,
-    status: String,
-    note: Option<String>,
-) {
-    let release = status == "open";
-    state
-        .marks
-        .lock()
-        .unwrap()
-        .set_status(&scope, &key, &status, note, release);
-    if release {
-        employees::cooloff_clear(&scope, &key); // 主管手动放回待处理 = 允许任何人（含原认领者）再领
-    }
-    let _ = app.emit(marks::EV_MARKS, json!({}));
-}
-
-// ===== 御书房（员工上奏、主管朱批）—— 统一走 Notice 广播 =====
-
-/// 列出全部奏折（从 Notice 投影，兼容旧存档）。
-#[tauri::command]
-fn list_decisions(app: tauri::AppHandle) -> Vec<employees::Decision> {
-    notice::list_as_decisions(&app)
-}
-
-#[tauri::command]
-fn list_notices(app: tauri::AppHandle) -> Vec<notice::Notice> {
-    app.state::<AppState>().notices.lock().unwrap().list()
-}
-
-/// 朱批准奏：respond Notice（choice=approve）并执行发送方预声明的 ActionPlan。
-#[tauri::command]
-fn resolve_decision(app: tauri::AppHandle, id: String, answer: String) -> Result<(), String> {
-    // 优先 Notice；旧 Decision 存档兜底
-    if app
-        .state::<AppState>()
-        .notices
-        .lock()
-        .unwrap()
-        .get(&id)
-        .is_some()
-    {
-        notice::respond_notice(
-            &app,
-            &id,
-            notice::ActorRef::user(),
-            notice::RespondParams {
-                choice_id: Some("approve".into()),
-                text: Some(answer),
-                reject: false,
-            },
-        )?;
-        return Ok(());
-    }
-    legacy_resolve_decision(&app, &id, &answer)
-}
-
-fn legacy_resolve_decision(app: &tauri::AppHandle, id: &str, answer: &str) -> Result<(), String> {
-    let decision = {
-        let state = app.state::<AppState>();
-        let mut d = state.decisions.lock().unwrap();
-        if !d.resolve(id, answer) {
-            return Err("奏折不存在或已批阅".into());
-        }
-        d.decisions.iter().find(|x| x.id == id).cloned()
-    };
-    if let Some(decision) = decision {
-        if decision.source == "mind" {
-            mind::on_decision(app, &decision);
-        } else {
-            employees::finalize_wake_thread_decision(app, &decision);
-            if decision.source != "wake" {
-                mind::preempt_for_work(app, &decision.employee_id);
-            }
-            employees::summon_employee(app, &decision.employee_id);
-        }
-    }
-    let _ = app.emit(employees::EV_DECISIONS, json!({}));
-    let _ = app.emit(employees::EV_EMPLOYEES, json!({}));
-    Ok(())
-}
-
-#[tauri::command]
-fn reject_decision(app: tauri::AppHandle, id: String, answer: String) -> Result<(), String> {
-    if app
-        .state::<AppState>()
-        .notices
-        .lock()
-        .unwrap()
-        .get(&id)
-        .is_some()
-    {
-        notice::respond_notice(
-            &app,
-            &id,
-            notice::ActorRef::user(),
-            notice::RespondParams {
-                choice_id: Some("reject".into()),
-                text: Some(answer),
-                reject: true,
-            },
-        )?;
-        return Ok(());
-    }
-    legacy_reject_decision(&app, &id, &answer)
-}
-
-fn legacy_reject_decision(app: &tauri::AppHandle, id: &str, answer: &str) -> Result<(), String> {
-    let decision = {
-        let state = app.state::<AppState>();
-        let mut d = state.decisions.lock().unwrap();
-        if !d.reject(id, answer) {
-            return Err("奏折不存在或已批阅".into());
-        }
-        d.decisions.iter().find(|x| x.id == id).cloned()
-    };
-    if let Some(decision) = decision {
-        if decision.source == "mind" {
-            mind::on_decision(app, &decision);
-        } else {
-            employees::finalize_wake_thread_decision(app, &decision);
-            if decision.source != "wake" {
-                mind::preempt_for_work(app, &decision.employee_id);
-            }
-            employees::summon_employee(app, &decision.employee_id);
-        }
-    }
-    let _ = app.emit(employees::EV_DECISIONS, json!({}));
-    let _ = app.emit(employees::EV_EMPLOYEES, json!({}));
-    Ok(())
-}
-
-#[tauri::command]
-fn read_report(app: tauri::AppHandle, id: String) {
-    if app
-        .state::<AppState>()
-        .notices
-        .lock()
-        .unwrap()
-        .get(&id)
-        .is_some()
-    {
-        let _ = notice::respond_notice(
-            &app,
-            &id,
-            notice::ActorRef::user(),
-            notice::RespondParams {
-                choice_id: Some("ack".into()),
-                text: Some("ack".into()),
-                reject: false,
-            },
-        );
-        return;
-    }
-    let changed = {
-        let state = app.state::<AppState>();
-        let mut d = state.decisions.lock().unwrap();
-        d.mark_read(&id)
-    };
-    if changed {
-        let _ = app.emit(employees::EV_DECISIONS, json!({}));
-    }
-}
-
-#[tauri::command]
-fn review_report(app: tauri::AppHandle, id: String, answer: String) -> Result<(), String> {
-    let answer = answer.trim();
-    if answer.is_empty() {
-        return Err("批阅内容不能为空".into());
-    }
-    if app
-        .state::<AppState>()
-        .notices
-        .lock()
-        .unwrap()
-        .get(&id)
-        .is_some()
-    {
-        notice::respond_notice(
-            &app,
-            &id,
-            notice::ActorRef::user(),
-            notice::RespondParams {
-                choice_id: Some("review".into()),
-                text: Some(answer.to_string()),
-                reject: false,
-            },
-        )?;
-        return Ok(());
-    }
-    let decision = {
-        let state = app.state::<AppState>();
-        let mut decisions = state.decisions.lock().unwrap();
-        if !decisions.review_report(&id, answer) {
-            return Err("完工汇报不存在或已归档".into());
-        }
-        decisions.decisions.iter().find(|d| d.id == id).cloned()
-    };
-    if let Some(decision) = decision {
-        mind::record_journal_event(
-            &app,
-            &decision.employee_id,
-            &decision.scope,
-            &decision.mark_key,
-            &decision.task_title,
-            &format!("完工汇报：{}\n【用户】批阅：{}", decision.question, answer),
-            "supervision",
-            now_ms(),
-        );
-    }
-    let _ = app.emit(employees::EV_DECISIONS, json!({}));
-    Ok(())
-}
-
-#[tauri::command]
-fn dismiss_decision(app: tauri::AppHandle, id: String) {
-    if app
-        .state::<AppState>()
-        .notices
-        .lock()
-        .unwrap()
-        .get(&id)
-        .is_some()
-    {
-        let _ = notice::respond_notice(
-            &app,
-            &id,
-            notice::ActorRef::user(),
-            notice::RespondParams {
-                choice_id: Some("shelve".into()),
-                text: Some("留中不发".into()),
-                reject: false,
-            },
-        );
-        return;
-    }
-    let decision = {
-        let state = app.state::<AppState>();
-        let mut d = state.decisions.lock().unwrap();
-        if !d.shelve(&id) {
-            return;
-        }
-        d.decisions.iter().find(|x| x.id == id).cloned()
-    };
-    if let Some(decision) = decision {
-        if decision.source == "mind" {
-            mind::on_decision(&app, &decision);
-        } else {
-            employees::finalize_wake_thread_decision(&app, &decision);
-            if decision.source != "wake" {
-                mind::preempt_for_work(&app, &decision.employee_id);
-            }
-            employees::summon_employee(&app, &decision.employee_id);
-        }
-    }
-    let _ = app.emit(employees::EV_DECISIONS, json!({}));
-    let _ = app.emit(employees::EV_EMPLOYEES, json!({}));
-}
-
-/// 从御书房物理删除一条奏折/汇报记录（含已批阅归档）。
-#[tauri::command]
-fn delete_decision(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let notice_removed = {
-        let mut notices = state.notices.lock().unwrap();
-        notices.remove(&id)
-    };
-    let legacy_removed = {
-        let mut decisions = state.decisions.lock().unwrap();
-        let existed = decisions.decisions.iter().any(|d| d.id == id);
-        if existed {
-            decisions.remove(&id);
-        }
-        existed
-    };
-    if !notice_removed && !legacy_removed {
-        return Err("奏折不存在".into());
-    }
-    let _ = app.emit(employees::EV_DECISIONS, json!({}));
-    Ok(())
-}
-
-// ===== 共享协作账本（跨机器，经中转站中心仲裁）=====
-
-fn relay_of(app: &tauri::AppHandle) -> Arc<RelayManager> {
-    app.state::<AppState>().relay.clone()
-}
-
-/// 列出共享账本某 scope 下的全部单子（从中转站拉取）。
-#[tauri::command]
-async fn list_shared_marks(
-    app: tauri::AppHandle,
-    scope: String,
-) -> Result<Vec<marks::Mark>, String> {
-    let vals = relay_of(&app).ledger_list(&scope).await?;
-    Ok(vals
-        .into_iter()
-        .filter_map(|v| serde_json::from_value(v).ok())
-        .collect())
-}
-
-/// 释放共享账本里的认领（状态回到 open，供同组队友接手）。
-#[tauri::command]
-async fn release_shared_mark(
-    app: tauri::AppHandle,
-    scope: String,
-    key: String,
-) -> Result<(), String> {
-    relay_of(&app)
-        .ledger_set(&scope, &key, "open", None, true)
-        .await?;
-    let _ = app.emit(marks::EV_MARKS, json!({}));
-    Ok(())
-}
-
-/// 从共享账本删除一个单子（可被重新发现处理）。
-#[tauri::command]
-async fn reset_shared_mark(
-    app: tauri::AppHandle,
-    scope: String,
-    key: String,
-    thread_id: Option<String>,
-) -> Result<(), String> {
-    if let Some(thread_id) = thread_id.as_deref() {
-        employees::cancel_deleted_ledger_thread(&app, thread_id).await;
-    }
-    relay_of(&app).ledger_remove(&scope, &key).await?;
-    let _ = app.emit(marks::EV_MARKS, json!({}));
-    Ok(())
-}
-
-/// 手动改共享账本里某单子的状态（open / claimed / done / failed）。
-#[tauri::command]
-async fn set_shared_mark(
-    app: tauri::AppHandle,
-    scope: String,
-    key: String,
-    status: String,
-    note: Option<String>,
-) -> Result<(), String> {
-    let release = status == "open";
-    relay_of(&app)
-        .ledger_set(&scope, &key, &status, note.as_deref(), release)
-        .await?;
-    let _ = app.emit(marks::EV_MARKS, json!({}));
-    Ok(())
-}
-
-// ===== 语义检索（外置 embedding 引擎）=====
-
-fn embed_cfg(app: &tauri::AppHandle) -> (String, String, String) {
-    let state = app.state::<AppState>();
-    let s = state.settings.lock().unwrap();
-    (
-        s.embed_endpoint.clone(),
-        s.embed_model.clone(),
-        s.embed_api_key.clone(),
-    )
-}
-
-/// 探测 embedding 服务是否可用，返回向量维度。
-#[tauri::command]
-async fn semantic_status(app: tauri::AppHandle) -> Result<Value, String> {
-    let (endpoint, model, key) = embed_cfg(&app);
-    if endpoint.trim().is_empty() || model.trim().is_empty() {
-        return Err("未配置 embedding 服务地址或模型".into());
-    }
-    let client = reqwest::Client::new();
-    let dim = semantic::probe(&client, &endpoint, &model, &key).await?;
-    Ok(json!({ "ok": true, "dim": dim }))
-}
-
-/// 触发本地 Ollama 拉取模型（"点按钮手动下载"）。
-#[tauri::command]
-async fn semantic_pull(app: tauri::AppHandle, model: Option<String>) -> Result<(), String> {
-    let (endpoint, cfg_model, _key) = embed_cfg(&app);
-    let model = model.filter(|s| !s.trim().is_empty()).unwrap_or(cfg_model);
-    if model.trim().is_empty() {
-        return Err("未指定要下载的模型".into());
-    }
-    let client = reqwest::Client::new();
-    semantic::ollama_pull(&client, &endpoint, &model).await
-}
-
-/// 重建向量索引：清空后下次检索惰性补算（employeeId 为空则清全部）。
-#[tauri::command]
-fn semantic_rebuild(state: State<'_, AppState>, employee_id: Option<String>) {
-    let mut vs = state.vectors.lock().unwrap();
-    match employee_id {
-        Some(id) if !id.is_empty() => vs.clear_employee(&id),
-        _ => vs.set_model(""),
-    }
-    vs.save();
-}
-
 /// 注册 Tauri 事件监听：本机 agent 产生的 update/turn/permission 事件，
 /// 若属于「被别人漫游」的会话，则原样转发给对应 guest。
 fn register_roaming_forwarders(app: &tauri::AppHandle, relay: Arc<RelayManager>) {
@@ -5771,12 +5054,6 @@ fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 命令行子工具入口（如 `nova mem-search ...`）：命中则执行并返回 true，调用方随后退出、不启动 GUI。
-/// 供数字员工的 agent 用自带 shell 调用记忆检索工具。
-pub fn maybe_run_cli() -> bool {
-    cli::maybe_run()
-}
-
 /// Lyra agent 原生入口（`nova lyra`）：命中则执行 stdio bridge 协议并退出，不启动 GUI。
 pub fn maybe_run_lyra() -> bool {
     lyra::maybe_run()
@@ -5869,16 +5146,7 @@ pub fn run() {
             let _ = skills::sync_skills_to_backends(&dir);
             let roaming = RoamingStore::load(&dir);
             let worktrees = WorktreeStore::load(&dir);
-            let employees = employees::EmployeeStore::load(&dir);
-            let tasks = employees::TaskStore::load(&dir);
-            let workflows = employees::WorkflowStore::load(&dir);
-            let memory = employees::MemoryStore::load(&dir);
             experience::init(&dir);
-            let mind = mind::MindStore::load(&dir);
-            let decisions = employees::DecisionStore::load(&dir);
-            let notices = notice::NoticeStore::load(&dir);
-            let marks = marks::MarkStore::load(&dir);
-            let vectors = semantic::VectorStore::load(&dir);
             settings.apply_context_retrieval_environment();
             // Load known roots once into the process-wide cache shared by Lyra and every bridge.
             // Include active thread/worktree roots so alternate checkouts do not cold-rebuild.
@@ -5921,15 +5189,6 @@ pub fn run() {
                 windows_shell_shim_enabled,
                 roaming: Mutex::new(roaming),
                 worktrees: Mutex::new(worktrees),
-                employees: Mutex::new(employees),
-                tasks: Mutex::new(tasks),
-                workflows: Mutex::new(workflows),
-                memory: Mutex::new(memory),
-                mind: Mutex::new(mind),
-                decisions: Mutex::new(decisions),
-                notices: Mutex::new(notices),
-                marks: Mutex::new(marks),
-                vectors: Mutex::new(vectors),
                 context_service,
                 acp,
                 opencodeplus,
@@ -5947,8 +5206,6 @@ pub fn run() {
                 // 启动即视为一次活动，避免刚开机就触发静默升级
                 last_activity_ms: Mutex::new(now_ms()),
                 active_thread: Mutex::new(None),
-                cancelled_employee_threads: Mutex::new(HashSet::new()),
-                employee_stop_reasons: Mutex::new(HashMap::new()),
                 backend_availability: Mutex::new(HashMap::new()),
                 cli_upgrade_lock: tokio::sync::Mutex::new(()),
                 cli_operations: Mutex::new(HashMap::new()),
@@ -5970,8 +5227,6 @@ pub fn run() {
                 }
             });
 
-            // 旧奏折 → Notice（一次性迁移 pending/待领旨）
-            notice::migrate_from_decisions(app.handle());
             // Tool API 已移除，清理旧版本遗留的失效连接信息。
             let _ = std::fs::remove_file(dir.join("tool-api.json"));
 
@@ -6113,9 +5368,6 @@ pub fn run() {
                 });
             }
 
-            // 迁移旧收件箱：历史 queued/working 任务转成员工账本的待处理单子（新模型下自主认领）
-            employees::migrate_tasks_to_ledger(app.handle());
-
             // 漫游 host：把本机被漫游会话的更新/轮次/权限事件转发给 guest
             register_roaming_forwarders(app.handle(), relay.clone());
             register_remote_permission_capture(app.handle());
@@ -6126,22 +5378,6 @@ pub fn run() {
             // `Nova server config/project ...` 由独立管理进程写盘；运行实例监听提交标记，
             // 无需重启即可同步设置、环境变量与项目白名单。
             start_headless_config_watcher(app.handle().clone());
-
-            // 数字员工心跳：每 5 秒 tick 一次，到点的在岗员工自动唤起干一轮（续做在手单子或找新单子）。
-            // 放后端 tokio 定时器（同更新检测）：窗口最小化/隐藏也不受 WebView 节流影响。
-            let hb_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use tokio::time::{sleep, Duration};
-                sleep(Duration::from_secs(5)).await;
-                loop {
-                    // 先处理 agent 工具写入的收件箱（接力/记忆/收尾等），再心跳。
-                    // 顺序很重要：让「done/接力」在本轮心跳前生效，避免重复开发/漏接力。
-                    employees::process_command_inbox(&hb_app).await;
-                    employees::heartbeat_tick(&hb_app);
-                    mind::tick(&hb_app);
-                    sleep(Duration::from_secs(5)).await;
-                }
-            });
 
             // 经验训练调度无需跟随 5 秒员工心跳；每分钟检查一次是否达到用户配置的训练间隔。
             // 手动 /train 不受该检查频率限制。
@@ -6197,7 +5433,7 @@ pub fn run() {
                     if let Some(ver) = updater::staged_upgrade_version(&prompt_app) {
                         let idle = {
                             let state = prompt_app.state::<AppState>();
-                            !any_session_running(&state) && !any_employee_working(&state)
+                            !any_session_running(&state)
                         };
                         if idle {
                             if server::is_headless() {
@@ -6345,46 +5581,7 @@ pub fn run() {
             get_skills_dir,
             install_skill,
             remove_skill,
-            sync_skills,
-            list_employees,
-            create_employee,
-            update_employee,
-            delete_employee,
-            set_employee_enabled,
-            get_employee_mind,
-            set_employee_mind_enabled,
-            resume_employee_mind,
-            run_employee_now,
-            list_employee_tasks,
-            assign_task,
-            delete_task,
-            register_ledger_item,
-            delegate_employee_work,
-            list_decisions,
-            list_notices,
-            resolve_decision,
-            reject_decision,
-            read_report,
-            review_report,
-            dismiss_decision,
-            delete_decision,
-            get_employee_memory,
-            add_employee_memory,
-            update_employee_memory,
-            delete_employee_memory,
-            set_employee_memory_pinned,
-            set_employee_memory_feedback,
-            list_marks,
-            release_mark,
-            reset_mark,
-            set_mark,
-            list_shared_marks,
-            release_shared_mark,
-            reset_shared_mark,
-            set_shared_mark,
-            semantic_status,
-            semantic_pull,
-            semantic_rebuild
+            sync_skills
         ])
         .build(tauri::generate_context!())
         .expect("Nova 启动失败")

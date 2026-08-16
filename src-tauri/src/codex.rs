@@ -788,25 +788,6 @@ impl CodexManager {
             conn.respond_err(id, -32603, "无法定位 Codex 会话".into());
             return;
         };
-        // 数字员工是无人值守的：授权请求没人应答会让本轮永久挂起（is_running 卡死、员工「永远在忙」、
-        // 无法再次「立即执行」）。对员工会话直接自动放行（等价 bypass），让自主编排顺畅跑完并正常收尾。
-        let is_employee = {
-            let state = self.app.state::<AppState>();
-            let store = state.store.lock().unwrap();
-            store
-                .get(&thread_id)
-                .and_then(|t| t.employee_id.clone())
-                .is_some()
-        };
-        if is_employee {
-            let decision = if method == "execCommandApproval" || method == "applyPatchApproval" {
-                "approved"
-            } else {
-                "accept"
-            };
-            conn.respond_ok(id, json!({ "decision": decision }));
-            return;
-        }
         let key = format!("{}codex-perm-{}", self.permission_scope, id);
         self.pending_permissions.lock().unwrap().insert(
             key.clone(),
@@ -2229,8 +2210,6 @@ impl CodexManager {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             match store.get(thread_id) {
-                // 数字员工的后台会话完成不弹系统提醒（巡查/开发都算），避免打扰。
-                Some(t) if t.employee_id.is_some() => return,
                 Some(t) => t.title.clone(),
                 None => return,
             }

@@ -514,14 +514,6 @@ export function isActive(threadId: string): boolean {
   return activeRuns.has(threadId);
 }
 
-/** 所有进行中/暂停运行的链根会话 id（数字员工按员工会话去重轮次用）。 */
-export function runRootIds(): string[] {
-  const roots = new Set<string>();
-  for (const run of activeRuns.values()) roots.add(run.rootId);
-  for (const run of suspendedRuns.values()) roots.add(run.rootId);
-  return [...roots];
-}
-
 /** sendPrompt 失败时由 store 调用，把当前阶段挂起。 */
 export function suspendActive(threadId: string): void {
   suspendWorkflow(threadId, false);

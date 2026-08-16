@@ -1,7 +1,7 @@
 /**
  * 用户自定义工作流的持久化（localStorage）。内置工作流来自代码，不存这里。
  */
-import { BUILTIN_WORKFLOWS, getBuiltinWorkflow, WORKFLOW_WAKE_DO_ID } from "./builtin";
+import { BUILTIN_WORKFLOWS, getBuiltinWorkflow } from "./builtin";
 import { validateWorkflow } from "./types";
 import type { WorkflowDef, WorkflowTrigger } from "./types";
 
@@ -130,14 +130,6 @@ export function acceptSharedWorkflow(def: WorkflowDef, fromName: string): Workfl
   copy.enabled = true;
   saveWorkflow(copy);
   return copy;
-}
-
-/** 数字员工配置的工作流名称（空/已删除回落默认内置「Wake → Do」）。 */
-export function employeeWorkflowName(workflowId: string | null | undefined): string {
-  const id = (workflowId ?? "").trim() || WORKFLOW_WAKE_DO_ID;
-  return (
-    getWorkflow(id)?.name ?? getBuiltinWorkflow(WORKFLOW_WAKE_DO_ID)?.name ?? "Wake → Do"
-  );
 }
 
 // ---------------------------------------------------------------------------
