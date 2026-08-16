@@ -727,15 +727,11 @@ export function SettingsModal(props: { onClose: () => void }) {
     s?.updateChannel === "pre-release" ? "pre-release" : "release",
   );
   onMount(() => void getVersion().then(setVersion));
-  const changeUpdateChannel = async (channel: "release" | "pre-release") => {
-    if (channel === updateChannel() || checking()) return;
-    const cur = await api.getSettings();
-    const next = { ...cur, updateChannel: channel };
-    await api.setSettings(next);
-    setState("settings", next);
+  const changeUpdateChannel = (channel: "release" | "pre-release") => {
+    if (channel === updateChannel()) return;
+    // 这里只修改设置草稿；取消弹窗不会切换通道，也不会触发下载。
     setUpdateChannel(channel);
     setCheckResult("");
-    await checkNow();
   };
   const checkNow = async () => {
     setChecking(true);
@@ -1145,11 +1141,19 @@ export function SettingsModal(props: { onClose: () => void }) {
     setSaving(true);
     const settings = draftSettings();
     settings.relayToken = relayToken().trim();
+    const updateChannelChanged =
+      settings.updateChannel !== (state.settings?.updateChannel ?? "release");
     const shellShimChanged =
       settings.windowsShellShimEnabled !== (state.settings?.windowsShellShimEnabled ?? false);
     try {
       await api.setSettings(settings);
       setState("settings", settings);
+      // 只有设置成功持久化后才确认通道切换；检查与下载在后台进行，不阻塞保存或关闭弹窗。
+      if (updateChannelChanged) {
+        void checkAndStageUpdate().catch((error) =>
+          console.error("Background update after channel switch failed", error),
+        );
+      }
       if (roamingFoldersLoaded) {
         const folders = await api.setRoamingFolders(roamingFolders());
         setRoamingFolders(folders);
@@ -2641,25 +2645,40 @@ export function SettingsModal(props: { onClose: () => void }) {
               </div>
             </div>
 
-            <div class="field">
+            <div class="field update-channel-field">
               <span class="field-label">更新通道</span>
-              <div class="seg-control" role="radiogroup" aria-label="更新通道">
-                <button
-                  type="button"
-                  classList={{ active: updateChannel() === "release" }}
-                  disabled={checking()}
-                  onClick={() => void changeUpdateChannel("release")}
-                >
-                  正式版
-                </button>
-                <button
-                  type="button"
-                  classList={{ active: updateChannel() === "pre-release" }}
-                  disabled={checking()}
-                  onClick={() => void changeUpdateChannel("pre-release")}
-                >
-                  预发布版
-                </button>
+              <div class="update-channel-card">
+                <div class="update-channel-status">
+                  <span class={`update-channel-dot ${updateChannel()}`} aria-hidden="true" />
+                  <div>
+                    <strong>{updateChannel() === "release" ? "正式版通道" : "预发布版通道"}</strong>
+                    <span>{updateChannel() === "release" ? "稳定更新，适合日常使用" : "优先体验新功能，可能包含未完全验证的改动"}</span>
+                  </div>
+                </div>
+                <div class="seg-control update-channel-control" role="radiogroup" aria-label="更新通道">
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={updateChannel() === "release"}
+                    classList={{ active: updateChannel() === "release" }}
+                    disabled={checking()}
+                    onClick={() => void changeUpdateChannel("release")}
+                  >
+                    <span>Release</span>
+                    <small>正式版</small>
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={updateChannel() === "pre-release"}
+                    classList={{ active: updateChannel() === "pre-release" }}
+                    disabled={checking()}
+                    onClick={() => void changeUpdateChannel("pre-release")}
+                  >
+                    <span>Pre-release</span>
+                    <small>预发布版</small>
+                  </button>
+                </div>
               </div>
               <span class="field-hint">切换后会立即检查并下载目标通道的最新版，版本号较低时也会切换。</span>
             </div>

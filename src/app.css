@@ -7396,6 +7396,59 @@ button.clue-bar-item:hover,
 .wf-edge:hover .wf-edge-line { stroke: var(--accent); stroke-width: 2.6; }
 .wf-edge-label { paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; }
 
+/* 聊天记录中的只读工作流画布（/hard 独立流程图 Stage） */
+.wf-preview {
+  position: relative;
+  width: min(1400px, calc(100vw - 390px));
+  max-width: none;
+  height: min(680px, calc(100vh - 250px));
+  min-height: 460px;
+  margin: 10px 0 10px 50%;
+  transform: translateX(-50%);
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 4%, var(--panel));
+}
+.wf-preview-title {
+  position: absolute;
+  top: 12px;
+  left: 14px;
+  right: 186px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  pointer-events: none;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.wf-preview-title > div { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-preview-meta { margin-left: 8px; color: var(--text-muted); font-size: 11px; font-weight: 400; }
+.wf-preview-readonly {
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-float) 82%, transparent);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+.wf-preview-canvas { position: absolute; inset: 0; }
+.wf-preview .wf-canvas-wrap { border-radius: 12px; overflow: hidden; }
+.wf-preview .wf-canvas-toolbar { top: 10px; right: 10px; }
+.wf-preview .wf-canvas.readonly .wf-node { cursor: pointer; }
+.wf-preview-detail-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--text-muted); font-size: 12px; }
+.wf-preview-detail-row span { padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-hover); }
+@media (max-width: 900px) {
+  .wf-preview { width: calc(100vw - 120px); }
+  .wf-preview-title { right: 14px; top: 54px; }
+  .wf-preview-readonly { display: none; }
+}
+
 /* ===== canvas transcript (qwen)：feat/glm_canvas 分支的独立 canvas 渲染，样式与默认 canvas 互不影响 ===== */
 .transcript-canvas-host {
   position: relative;
@@ -7415,3 +7468,21 @@ button.clue-bar-item:hover,
   position: absolute;
   z-index: 6;
 }
+
+/* About / update channel: make channel identity and the selected side unmistakable. */
+.update-channel-field { gap: 9px; }
+.update-channel-card { display: flex; align-items: stretch; justify-content: space-between; gap: 18px; padding: 14px; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border)); border-radius: 12px; background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 7%, var(--panel)), var(--panel)); }
+.update-channel-status { display: flex; align-items: center; min-width: 0; gap: 10px; }
+.update-channel-status > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.update-channel-status strong { color: var(--text); font-size: 13px; }
+.update-channel-status span:not(.update-channel-dot) { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.update-channel-dot { width: 10px; height: 10px; flex: 0 0 auto; border: 2px solid color-mix(in srgb, var(--accent) 28%, var(--panel)); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent), 0 0 14px color-mix(in srgb, var(--accent) 45%, transparent); }
+.update-channel-dot.pre-release { background: #c58cff; box-shadow: 0 0 0 4px rgba(197,140,255,.12), 0 0 14px rgba(197,140,255,.45); }
+.update-channel-control { display: grid; width: 270px; flex: 0 0 auto; grid-template-columns: 1fr 1fr; gap: 5px; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--bg) 65%, transparent); }
+.update-channel-control button { display: flex; min-height: 48px; flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px; padding: 7px 11px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font: inherit; text-align: left; transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease; }
+.update-channel-control button span { font-size: 12px; font-weight: 700; }
+.update-channel-control button small { font-size: 10px; opacity: .75; }
+.update-channel-control button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.update-channel-control button.active { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: color-mix(in srgb, var(--accent) 18%, var(--panel)); color: var(--accent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 14%, transparent), 0 3px 10px color-mix(in srgb, var(--accent) 10%, transparent); }
+.update-channel-control button:disabled { cursor: wait; opacity: .6; }
+@media (max-width: 760px) { .update-channel-card { flex-direction: column; } .update-channel-control { width: 100%; } }
