@@ -1,4 +1,4 @@
-import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -7,19 +7,35 @@ import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 
 const execFileAsync = promisify(execFile);
+const projectIdentityCache = new Map();
+let storeCache;
+const entryTermsCache = new WeakMap();
 
 async function projectIdentity(cwd) {
-  let root = resolve(String(cwd || process.cwd()));
-  try {
-    const { stdout } = await execFileAsync("git", ["-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir"], { windowsHide: true });
-    const common = resolve(root, stdout.trim());
-    if (basename(common) === ".git") root = dirname(common);
-  } catch {
-    root = await realpath(root).catch(() => root);
+  const requested = resolve(String(cwd || process.cwd()));
+  let pending = projectIdentityCache.get(requested);
+  if (!pending) {
+    pending = (async () => {
+      let root = requested;
+      try {
+        const { stdout } = await execFileAsync("git", ["-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir"], { windowsHide: true });
+        const common = resolve(root, stdout.trim());
+        if (basename(common) === ".git") root = dirname(common);
+      } catch {
+        root = await realpath(root).catch(() => root);
+      }
+      let key = root.replaceAll("\\", "/").replace(/\/$/, "");
+      if (process.platform === "win32") key = key.toLowerCase();
+      return { key, root };
+    })();
+    projectIdentityCache.set(requested, pending);
   }
-  let key = root.replaceAll("\\", "/").replace(/\/$/, "");
-  if (process.platform === "win32") key = key.toLowerCase();
-  return { key, root };
+  try {
+    return await pending;
+  } catch (error) {
+    projectIdentityCache.delete(requested);
+    throw error;
+  }
 }
 
 function novaRoot(env = process.env) {
@@ -36,15 +52,31 @@ function terms(text) {
 
 function relevance(query, entry) {
   if (!query.size) return 0;
-  const haystack = terms([entry.trigger, entry.action, entry.avoid, ...(entry.scope ?? [])].join(" "));
+  let haystack = entryTermsCache.get(entry);
+  if (!haystack) {
+    haystack = terms([entry.trigger, entry.action, entry.avoid, ...(entry.scope ?? [])].join(" "));
+    entryTermsCache.set(entry, haystack);
+  }
   let hits = 0;
   for (const term of query) if (haystack.has(term)) hits += 1;
   return hits / query.size;
 }
 
 async function loadStore() {
-  const text = await readFile(join(novaRoot(), "experience_memory.json"), "utf8").catch(() => "{}");
-  try { return JSON.parse(text); } catch { return {}; }
+  const path = join(novaRoot(), "experience_memory.json");
+  const metadata = await stat(path).catch(() => null);
+  if (!metadata) {
+    storeCache = { path, mtimeMs: 0, size: 0, store: {} };
+    return storeCache.store;
+  }
+  if (storeCache?.path === path && storeCache.mtimeMs === metadata.mtimeMs && storeCache.size === metadata.size) {
+    return storeCache.store;
+  }
+  const text = await readFile(path, "utf8").catch(() => "{}");
+  let store;
+  try { store = JSON.parse(text); } catch { store = {}; }
+  storeCache = { path, mtimeMs: metadata.mtimeMs, size: metadata.size, store };
+  return store;
 }
 
 function textResult(value) {

@@ -33,6 +33,9 @@
 }
 .training-head h1 { margin: 0 0 7px; font-size: 30px; line-height: 1.15; letter-spacing: -.035em; }
 .training-head p { margin: 0; max-width: 650px; color: var(--muted); font-size: 13px; line-height: 1.65; }
+.training-project-identity { display: flex; align-items: center; gap: 9px; width: fit-content; max-width: 650px; margin-top: 12px; padding: 7px 10px; border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--accent) 7%, var(--panel)); }
+.training-project-identity span { flex: 0 0 auto; color: var(--accent); font-size: 10px; font-weight: 750; letter-spacing: .06em; }
+.training-project-identity strong { min-width: 0; overflow: hidden; color: var(--text); font: 11px/1.4 var(--font-mono, monospace); text-overflow: ellipsis; white-space: nowrap; }
 .training-actions { display: flex; flex: 0 0 auto; gap: 9px; }
 .training-action { min-height: 40px; padding: 0 14px; gap: 8px; border-radius: 9px; box-shadow: 0 5px 15px color-mix(in srgb, var(--accent) 18%, transparent); }
 .evolution-action { min-height: 40px; padding-inline: 15px; }
@@ -109,6 +112,7 @@
 .experience-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: auto; padding: 16px 0 12px; }
 .experience-scopes { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px; }
 .experience-scopes span { max-width: 140px; padding: 3px 7px; overflow: hidden; border-radius: 5px; background: var(--hover); color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.experience-project { min-width: 0; max-width: 180px; overflow: hidden; color: color-mix(in srgb, var(--accent) 72%, var(--muted)); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .experience-confidence { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
 .experience-confidence b { color: var(--text); }
 .experience-votes { display: flex; align-items: center; gap: 6px; margin: 0 -17px; padding: 9px 17px; border-top: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 45%, transparent); }

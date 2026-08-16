@@ -503,6 +503,10 @@ export interface ExperienceEntry {
   id: string;
   expertId: string;
   kind: "experience" | "memory" | "rule";
+  /** 产生该知识的项目标识；按 Git 仓库根归一，同仓库目录和 worktree 相同。 */
+  projectId: string;
+  /** 产生该知识的 Git 仓库根路径，用于展示和审计。 */
+  projectRoot: string;
   /** universal = 泛用；project = 仅当前项目。 */
   knowledgeScope: "universal" | "project";
   trigger: string;

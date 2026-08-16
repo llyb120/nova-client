@@ -1,9 +1,8 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
-import { setTrainingProject, state } from "../store";
+import { state } from "../store";
 import type { ExperienceEntry } from "../types";
-import { ProjectPicker } from "./ProjectPicker";
 
 function fmtTime(ts: number) {
   return ts ? new Date(ts).toLocaleString("zh-CN") : "尚未训练";
@@ -243,8 +242,11 @@ export function TrainingGroundView() {
           <div class="training-intro">
             <span class="training-eyebrow">EXPERIENCE CONSTELLATION</span>
             <h1>大熊座</h1>
-            <p>当前项目：{overview()?.projectRoot ?? projectCwd()}。训练经验、记忆和守则按项目独立保存；同一仓库的 worktree 共享同一份。</p>
-            <ProjectPicker value={projectCwd()} onChange={setTrainingProject} ownOnly />
+            <p>知识、记忆和经验会自动标记来源项目；项目按 Git 仓库识别，同一仓库下的目录与 worktree 属于同一个项目。</p>
+            <div class="training-project-identity" title={overview()?.projectRoot ?? projectCwd()}>
+              <span>当前仓库</span>
+              <strong>{overview()?.projectRoot ?? projectCwd()}</strong>
+            </div>
           </div>
           <div class="training-actions">
             <Show when={evolutionStatus()}><span class="evolution-status" role="status">{evolutionStatus()}</span></Show>
@@ -338,7 +340,7 @@ export function TrainingGroundView() {
                         <For each={selected()[2]} fallback={<div class="expert-empty">该专家尚未产出经验</div>}>
                           {(entry) => (
                             <article classList={{ "experience-card": true, quarantined: entry.status === "quarantined", [`kind-${entry.kind}`]: true }}>
-                              <div class="experience-topline"><span class={`experience-condition kind-${entry.kind}`}>{kindLabel(entry.kind)}</span><span class="experience-condition">{entry.knowledgeScope === "universal" ? "泛用" : "项目独有"}</span><span class="experience-date">更新于 {fmtDate(entry.updatedAt)}</span></div>
+                              <div class="experience-topline"><span class={`experience-condition kind-${entry.kind}`}>{kindLabel(entry.kind)}</span><span class="experience-condition">{entry.knowledgeScope === "universal" ? "泛用" : "项目独有"}</span><span class="experience-project" title={entry.projectRoot || "历史知识未记录来源仓库"}>{entry.projectRoot ? `仓库 · ${entry.projectRoot.replace(/[\\/]+$/, "").split(/[\\/]/).pop()}` : "来源仓库未知"}</span><span class="experience-date">更新于 {fmtDate(entry.updatedAt)}</span></div>
                               <Show when={entry.trigger}><div class="experience-trigger">{entry.trigger}</div></Show>
                               <div class="experience-action">{entry.action}</div>
                               <Show when={entry.avoid}><div class="experience-avoid"><span>避免</span>{entry.avoid}</div></Show>
