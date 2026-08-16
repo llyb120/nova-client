@@ -125,11 +125,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-      - uses: softprops/action-gh-release@v2
+      - name: Create draft prerelease and upload assets
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: pre-v${{ needs.prepare.outputs.version }}
           name: Nova pre-release v${{ needs.prepare.outputs.version }}
           target_commitish: pre-release
+          draft: true
           prerelease: true
           generate_release_notes: true
           files: |
@@ -139,3 +141,9 @@ jobs:
             dist/**/*.AppImage
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish prerelease after assets are uploaded
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "pre-v${{ needs.prepare.outputs.version }}" --draft=false --prerelease
