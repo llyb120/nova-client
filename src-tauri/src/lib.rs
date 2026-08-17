@@ -349,19 +349,49 @@ fn is_starrable_thread(thread: &Thread) -> bool {
 }
 
 fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
-    is_ordinary_thread(thread) && !thread.starred
+    is_ordinary_thread(thread) && !thread.experience_thread && !thread.starred
 }
 
 fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
     session_cleanup_is_expired(updated_at, now, hours)
 }
 
+const EXPERIENCE_THREAD_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn experience_thread_is_expired(thread: &Thread, now: i64) -> bool {
+    thread.experience_thread
+        && thread.updated_at < now.saturating_sub(EXPERIENCE_THREAD_RETENTION_MS)
+}
+
+fn run_experience_thread_cleanup(app: &tauri::AppHandle) -> usize {
+    let state = app.state::<AppState>();
+    let now = now_ms();
+    let candidates: Vec<String> = {
+        let store = state.store.lock().unwrap();
+        store
+            .threads
+            .iter()
+            .filter(|thread| experience_thread_is_expired(thread, now))
+            .map(|thread| thread.id.clone())
+            .collect()
+    };
+    let deletable = candidates
+        .into_iter()
+        .filter(|id| !running_by_id(&state, id))
+        .collect::<Vec<_>>();
+    if deletable.is_empty() {
+        return 0;
+    }
+    remove_threads(app, &state, deletable).len()
+}
+
 fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
+    let experience_removed = run_experience_thread_cleanup(app);
     let state = app.state::<AppState>();
     let hours = {
         let settings = state.settings.lock().unwrap();
         if !settings.session_auto_cleanup_enabled {
-            return 0;
+            return experience_removed;
         }
         settings.session_auto_cleanup_hours
     };
@@ -395,7 +425,7 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
             .collect()
     };
     if threads.is_empty() {
-        return 0;
+        return experience_removed;
     }
     if let Err(error) = state
         .thread_trash
@@ -404,9 +434,9 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
         .move_to_trash(threads, now)
     {
         eprintln!("[session-cleanup] 移入回收站失败：{error}");
-        return 0;
+        return experience_removed;
     }
-    remove_threads(app, &state, deletable).len()
+    experience_removed + remove_threads(app, &state, deletable).len()
 }
 
 /// 是否有任意会话正在运行（本地 Devin/Codex、漫游 guest、被别人漫游的 host 均算）。
@@ -457,10 +487,25 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
 #[cfg(test)]
 mod session_auto_cleanup_tests {
     use super::{
-        is_normal_thread_for_auto_cleanup, is_starrable_thread, thread_is_expired,
-        tree_contains_starred_thread, AgentKind, Thread,
+        experience_thread_is_expired, is_normal_thread_for_auto_cleanup, is_starrable_thread,
+        thread_is_expired, tree_contains_starred_thread, AgentKind, Thread,
+        EXPERIENCE_THREAD_RETENTION_MS,
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn experience_threads_expire_after_24_continuous_hours_only() {
+        let now = 100 * 60 * 60 * 1000;
+        let mut training = Thread::new(String::new(), AgentKind::Devin, None, None, None, false);
+        training.experience_thread = true;
+        training.updated_at = now - EXPERIENCE_THREAD_RETENTION_MS;
+        assert!(!experience_thread_is_expired(&training, now));
+
+        training.updated_at -= 1;
+        assert!(experience_thread_is_expired(&training, now));
+        training.experience_thread = false;
+        assert!(!experience_thread_is_expired(&training, now));
+    }
 
     #[test]
     fn thread_is_expired_only_after_the_configured_retention() {
@@ -508,6 +553,9 @@ mod session_auto_cleanup_tests {
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
         thread.starred = false;
         thread.ephemeral = false;
+        thread.experience_thread = true;
+        assert!(!is_normal_thread_for_auto_cleanup(&thread));
+        thread.experience_thread = false;
         thread.roaming_role = Some("host".into());
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
     }
