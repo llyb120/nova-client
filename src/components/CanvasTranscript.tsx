@@ -5,7 +5,7 @@ import {
 } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
-import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
+import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded } from "../store";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
@@ -3406,12 +3406,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     scheduleRebuild(switchedThread);
   });
 
+  let expandedEffectThreadId = props.threadId;
+  let expandedEffectReady = false;
   createEffect(() => {
     // 展开态参与闭合分组签名；仅在它变化时废弃签名缓存，而不是流式时反复哈希历史。
     // 用户主动开合必须立即重排（immediate）：不能被套在流式 80ms 节流里，
     // 否则 click 设置的 scrollLock 来不及生效、开合看似失效。
-    JSON.stringify(state.expanded);
+    expandedRevision();
+    const threadId = props.threadId;
     closedGroupSigCache = new WeakMap<Group, string>();
+    // openThread 重置 expanded 与 thread 切换属于同一批更新，主 effect 已负责 rebuild。
+    if (!expandedEffectReady || threadId !== expandedEffectThreadId) {
+      expandedEffectReady = true;
+      expandedEffectThreadId = threadId;
+      return;
+    }
     scheduleRebuild(false, true);
   });
 

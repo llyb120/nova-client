@@ -290,9 +290,18 @@ export function isExpanded(key: number | string, fallback = false): boolean {
   return v === undefined ? fallback : !!v;
 }
 
+const [expandedRevisionValue, setExpandedRevision] = createSignal(0);
+export const expandedRevision = expandedRevisionValue;
+
 export function toggleExpanded(key: number | string, value?: boolean) {
   const k = String(key);
   setState("expanded", k, value ?? !state.expanded[k]);
+  setExpandedRevision((revision) => revision + 1);
+}
+
+function resetExpanded(): void {
+  setState("expanded", reconcile({}));
+  setExpandedRevision((revision) => revision + 1);
 }
 
 /** 可选模型列表（来自 devin）。
@@ -1153,7 +1162,7 @@ export async function openThread(id: string) {
   const cached = getThreadSnapshot(id);
   const commitSnapshot = (thread: Thread, loadingThread: boolean, reconcileItems = false) => {
     discardPendingStreamUpdates();
-    setState("expanded", reconcile({}));
+    resetExpanded();
     showThreadSnapshot(thread, loadingThread, reconcileItems);
   };
 
@@ -1191,7 +1200,7 @@ export async function openThread(id: string) {
 
 export function closeThread() {
   discardPendingStreamUpdates();
-  setState("expanded", reconcile({}));
+  resetExpanded();
   const agentKind = lastUsed.agentKind();
   setState({
     currentId: null,
