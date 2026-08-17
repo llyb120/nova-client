@@ -1252,15 +1252,27 @@ pub fn tick(app: &AppHandle) {
                     settings.experience_evolution_interval_minutes.max(10) as i64 * 60_000;
                 let training_interval =
                     settings.experience_training_interval_minutes.max(5) as i64 * 60_000;
+                let global_last_schedule_at = projects
+                    .iter()
+                    .map(|(key, _)| {
+                        let project = guard.project(key);
+                        project.last_train_at.max(project.last_attempt_at)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let global_training_due = now - global_last_schedule_at >= training_interval;
                 projects.into_iter().find_map(|(key, root)| {
                     let project = guard.project(&key);
                     if !project.experiences.is_empty()
                         && now - project.last_evolution_at >= evolution_interval
                     {
                         Some((true, root))
-                    } else if now - project.last_train_at.max(project.last_attempt_at)
-                        >= training_interval
+                    } else if global_training_due
+                        && now - project.last_train_at.max(project.last_attempt_at)
+                            >= training_interval
                     {
+                        // 训练间隔是全局批次间隔，不是每个项目各自的间隔。项目知识仍独立，
+                        // 到期时每轮只选择一个项目，避免多个项目按各自时钟相隔数分钟连跑。
                         Some((false, root))
                     } else {
                         None
