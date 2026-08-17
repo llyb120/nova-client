@@ -1582,7 +1582,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <option value="fast">FastContext（默认）</option>
                 </select>
                 <span class="field-hint">
-                  FastContext 使用原生常驻服务和增量索引；旧配置中的 SuperContext 会自动回退到 FastContext。保存后重启相关 Agent 生效。
+                  FastContext 使用原生常驻服务和增量索引。保存后重启相关 Agent 生效。
                 </span>
               </label>
 

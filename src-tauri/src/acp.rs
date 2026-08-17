@@ -794,14 +794,6 @@ impl AcpManager {
             .env(
                 "NOVA_CONTEXT_RETRIEVAL_MODE",
                 settings.context_retrieval_mode.as_str(),
-            )
-            .env(
-                "NOVA_CONTEXT_NO_INDEX",
-                if settings.super_context_enabled() {
-                    "1"
-                } else {
-                    "0"
-                },
             );
         }
         // 微型 GUI helper 统一覆盖各后端绕过父进程 flags 的 cmd/powershell/pwsh 孙进程。
@@ -3061,10 +3053,6 @@ fn devin_nova_tools_config(
         "NOVA_CONTEXT_RETRIEVAL_MODE".into(),
         Value::String(context_mode.into()),
     );
-    env.insert(
-        "NOVA_CONTEXT_NO_INDEX".into(),
-        Value::String(if context_mode == "super" { "1" } else { "0" }.into()),
-    );
     env.insert("NOVA_TOOLS_CWD".into(), Value::String(cwd.into()));
     env.insert(
         "NOVA_CONTEXT_SERVICE_ENDPOINT".into(),
@@ -3241,7 +3229,7 @@ mod nova_tools_config_tests {
         assert_eq!(server["env"]["NOVA_TOOLS_CWD"], "D:/repo");
         assert_eq!(server["env"]["NOVA_FAST_CONTEXT"], "1");
         assert_eq!(server["env"]["NOVA_CONTEXT_RETRIEVAL_MODE"], "fast");
-        assert_eq!(server["env"]["NOVA_CONTEXT_NO_INDEX"], "0");
+        assert!(server["env"].get("NOVA_CONTEXT_NO_INDEX").is_none());
         assert_eq!(server["env"]["NOVA_TOOLS_READ_ONLY"], "1");
         assert_eq!(
             server["env"]["NOVA_CONTEXT_SERVICE_ENDPOINT"],

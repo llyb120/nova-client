@@ -1393,14 +1393,6 @@ impl SdkManager {
                 .env(
                     "NOVA_CONTEXT_RETRIEVAL_MODE",
                     settings.context_retrieval_mode.as_str(),
-                )
-                .env(
-                    "NOVA_CONTEXT_NO_INDEX",
-                    if settings.super_context_enabled() {
-                        "1"
-                    } else {
-                        "0"
-                    },
                 );
         }
         if !self.launch_env.is_empty() {
