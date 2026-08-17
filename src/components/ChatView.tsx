@@ -228,9 +228,9 @@ export function ChatView() {
   let transcriptRef: CanvasTranscriptHandle | undefined;
   let qwenApi: TranscriptCanvasApi | null = null;
   const renderMode = () => state.settings?.chatViewRender ?? "canvas";
-  const hasWorkflowPreview = createMemo(() => displayedItems().some(
+  const hasWorkflowPreview = () => displayedItems().some(
     (item) => item.type === "system" && item.level === "workflow",
-  ));
+  );
   /** 工作流设计图需要 SVG/DOM 渲染；包含预览时自动回退 DOM transcript。 */
   const forceDomTranscript = () => hasWorkflowPreview();
   const useCanvas = () => renderMode() === "canvas" && !forceDomTranscript();
