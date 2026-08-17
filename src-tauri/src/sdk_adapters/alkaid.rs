@@ -108,15 +108,16 @@ impl SdkAdapter for AlkaidAdapter {
         let cached_input = cache_read
             .unwrap_or(0)
             .saturating_add(cache_write.unwrap_or(0));
-        (
-            Some(canonical_usage(
-                input.saturating_add(cached_input),
-                output,
-                cache_read,
-                cache_write,
-            )),
-            None,
-        )
+        let mut normalized = canonical_usage(
+            input.saturating_add(cached_input),
+            output,
+            cache_read,
+            cache_write,
+        );
+        if let Some(context_tokens) = usage.get("contextTokens").and_then(Value::as_u64) {
+            normalized["contextTokens"] = context_tokens.into();
+        }
+        (Some(normalized), None)
     }
 }
 

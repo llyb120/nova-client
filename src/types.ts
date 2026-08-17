@@ -234,6 +234,8 @@ export interface TurnItem {
   durationMs: number;
   totalTokens?: number | null;
   inputTokens?: number | null;
+  /** 最后一次模型请求实际携带的上下文；不同于本轮多次请求的累计输入。 */
+  contextTokens?: number | null;
   outputTokens?: number | null;
   /** 后端支持时提供缓存读取/写入 token 明细 */
   cacheReadTokens?: number | null;
@@ -791,6 +793,8 @@ export interface Quota {
 export interface LiveUsage {
   totalTokens?: number | null;
   inputTokens?: number | null;
+  /** 最后一次模型请求实际携带的上下文；不同于当前轮次累计输入。 */
+  contextTokens?: number | null;
   outputTokens?: number | null;
   cacheReadTokens?: number | null;
   cacheWriteTokens?: number | null;

@@ -118,9 +118,11 @@ export function Composer() {
 
   const running = () => !!(state.currentId && state.running[state.currentId]);
   const contextUsedTokens = () => {
+    if (state.liveUsage?.contextTokens) return state.liveUsage.contextTokens;
     if (state.liveUsage?.inputTokens) return state.liveUsage.inputTokens;
     for (let index = state.items.length - 1; index >= 0; index--) {
       const item = state.items[index];
+      if (item.type === "turn" && item.contextTokens) return item.contextTokens;
       if (item.type === "turn" && item.inputTokens) return item.inputTokens;
     }
     return 0;
