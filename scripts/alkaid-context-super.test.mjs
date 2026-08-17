@@ -811,16 +811,16 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.equal(toolNames.includes("read_files"), false);
     assert.equal(toolNames.includes("edit_files"), false);
     assert.match(runtime.agent.state.systemPrompt, /修改已有文件时使用原生 edit/);
-    if (process.env.NOVA_FAST_CONTEXT !== "0") assert(toolNames.includes("fast_context"));
+    if (process.env.NOVA_FAST_CONTEXT !== "0") assert(toolNames.includes("polaris"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "write_files"));
     assert(!runtime.agent.state.tools.some((tool) => tool.name === "load_skill"));
     assert.match(runtime.agent.state.systemPrompt, /读取内容遵循最小必要原则.*已知目标行范围时，只读取相关行段/);
     assert.doesNotMatch(runtime.agent.state.systemPrompt, /不要使用 read_files/);
     assert.match(runtime.agent.state.systemPrompt, /已知多个独立路径时，同轮并行发多个 read/);
     if (process.env.NOVA_FAST_CONTEXT !== "0") {
-      assert.match(runtime.agent.state.systemPrompt, /先调用一次 fast_context/);
+      assert.match(runtime.agent.state.systemPrompt, /先调用一次 polaris/);
     } else {
-      assert.doesNotMatch(runtime.agent.state.systemPrompt, /fast_context/);
+      assert.doesNotMatch(runtime.agent.state.systemPrompt, /polaris/);
     }
     assert.doesNotMatch(runtime.agent.state.systemPrompt, /必须在一次 read_files 调用中合并读取/);
     assert.match(runtime.agent.state.systemPrompt, /禁止使用 `grep -r` 或 `grep -R`.*无排除的递归搜索/);

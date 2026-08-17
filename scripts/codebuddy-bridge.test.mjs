@@ -51,8 +51,8 @@ assert.equal(permissionModeFor("bypass"), "bypassPermissions");
 assert.equal(permissionModeFor("plan"), "plan");
 
 const batchPolicy = codeBuddyBatchToolPolicy({ mode: "build" }, { NOVA_FAST_CONTEXT: "1" });
-assert.match(batchPolicy, /Nova MCP tools fast_context and find_symbols/);
-assert.match(batchPolicy, /call nova-tools fast_context first/);
+assert.match(batchPolicy, /Nova MCP tool polaris/);
+assert.match(batchPolicy, /call nova-tools polaris first/);
 assert.match(batchPolicy, /Do not re-discover the same keywords/);
 assert.doesNotMatch(batchPolicy, /plan\/read-only/);
 assert.match(codeBuddyBatchToolPolicy({ mode: "plan" }, { NOVA_FAST_CONTEXT: "1" }), /plan\/read-only/);
@@ -68,7 +68,7 @@ for await (const message of promptMessages({
   ],
 }, { NOVA_FAST_CONTEXT: "1" })) messages.push(message);
 
-assert.match(messages[0].message.content[0].text, /first repository tool call MUST be mcp__nova-tools__fast_context/);
+assert.match(messages[0].message.content[0].text, /first repository tool call MUST be mcp__nova-tools__polaris/);
 assert.deepEqual(messages[0].message.content.slice(1), [
   { type: "text", text: "inspect" },
   { type: "text", text: "Attached file: C:/Users/1/Desktop/report.xlsx" },
@@ -140,7 +140,7 @@ assert.deepEqual(assistantItems({
 
 const toolStream = { messageId: "message", blocks: new Map(), tools: new Map() };
 const [pendingTool] = assistantItems({
-  message: { id: "assistant", content: [{ type: "tool_use", id: "tool-result-id", name: "fast_context", input: { query: "roblox" } }] },
+  message: { id: "assistant", content: [{ type: "tool_use", id: "tool-result-id", name: "polaris", input: { query: "roblox" } }] },
 }, toolStream);
 assert.equal(pendingTool.status, "in_progress");
 assert.deepEqual(toolResultItems({
@@ -172,4 +172,4 @@ const sdkServers = novaToolsMcpServers(
 );
 assert.deepEqual(sdkServers["nova-tools"], { type: "sdk", name: "nova-tools", instance: {} });
 assert.equal(sdkServerOptions.name, "nova-tools");
-assert.deepEqual(sdkServerOptions.tools.map((item) => item.name), ["fast_context", "find_symbols"]);
+assert.deepEqual(sdkServerOptions.tools.map((item) => item.name), ["polaris"]);

@@ -1,10 +1,10 @@
-//! 基础工具：read / bash / edit / write + fast_context / find_symbols。
-//! fast_context / find_symbols 始终进程内 Rust 直连，无 Node 依赖；学习增强
+//! 基础工具：read / bash / edit / write + polaris。
+//! polaris 始终进程内 Rust 直连，无 Node 依赖；学习增强
 //! 是锦上添花：edit 反馈/settle 发往全局 context service（不在则静默丢弃），
 //! 反馈响应顺带回全局模型快照注入本地，使本地检索的 blend 排序与全局模型一致。
 
 use crate::lyra::prompt::{
-    clamp_tool_output_text, govern_tool_text, FAST_CONTEXT_OUTPUT_MAX_BYTES,
+    clamp_tool_output_text, govern_tool_text, POLARIS_OUTPUT_MAX_BYTES,
     TOOL_OUTPUT_CONTEXT_MAX_BYTES,
 };
 use crate::lyra::{edit as native_edit, read as native_read};
@@ -13,14 +13,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const FAST_CONTEXT_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文时先调用：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，并自动使用 task（缺省时回退 keywords）检索相关的猎户座经验、记忆与守则，一并返回。若返回训练知识，本轮结束前调用 feedback_memory。目标行段已明确时直接 read；只需符号位置时用 find_symbols。";
+const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文时先调用：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，并自动使用 task（缺省时回退 keywords）检索相关的猎户座经验、记忆与守则，一并返回。若返回训练知识，本轮结束前调用 feedback_memory。目标行段已明确时直接 read。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。禁止无排除的递归搜索（grep -r 等）。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
     "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
-const FIND_SYMBOLS_DESCRIPTION: &str = "并行定位多个符号在仓库中的所有出现位置（文件:行号）。只要行号不要正文时用；需要上下文用 fast_context。";
 
 pub struct Tool {
     pub name: &'static str,
@@ -34,7 +33,7 @@ fn schema(value: Value) -> Value {
 
 pub fn tool_set(
     read_only: bool,
-    fast_context: bool,
+    polaris: bool,
     memory_enabled: bool,
     auto_change_project: bool,
 ) -> Vec<Tool> {
@@ -52,10 +51,10 @@ pub fn tool_set(
             })),
         });
     }
-    if fast_context {
+    if polaris {
         tools.push(Tool {
-            name: "fast_context",
-            description: FAST_CONTEXT_DESCRIPTION.into(),
+            name: "polaris",
+            description: POLARIS_DESCRIPTION.into(),
             parameters: schema(json!({
                 "type": "object",
                 "properties": {
@@ -72,17 +71,6 @@ pub fn tool_set(
                     "maxBytes": { "type": "integer", "minimum": 8192, "maximum": 65536, "description": "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" },
                     "coupling": { "type": "boolean", "description": "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" }
                 }
-            })),
-        });
-        tools.push(Tool {
-            name: "find_symbols",
-            description: FIND_SYMBOLS_DESCRIPTION.into(),
-            parameters: schema(json!({
-                "type": "object",
-                "properties": {
-                    "names": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "符号名列表" }
-                },
-                "required": ["names"]
             })),
         });
     }
@@ -153,7 +141,7 @@ pub fn tool_set(
     if memory_enabled {
         tools.push(Tool {
             name: "feedback_memory",
-            description: "闭环反馈 fast_context 本轮返回的训练知识。用户卡片评价只保留当前一票；本工具属于模型反馈，可跨会话多次累计。".into(),
+            description: "闭环反馈 polaris 本轮返回的训练知识。用户卡片评价只保留当前一票；本工具属于模型反馈，可跨会话多次累计。".into(),
             parameters: schema(json!({
                 "type": "object",
                 "properties": {
@@ -231,8 +219,8 @@ fn govern(
     archive_dir: Option<&Path>,
 ) -> ToolOutcome {
     let text = text_of(&json!({ "content": outcome.content }));
-    let max_bytes = if name == "fast_context" {
-        FAST_CONTEXT_OUTPUT_MAX_BYTES
+    let max_bytes = if name == "polaris" {
+        POLARIS_OUTPUT_MAX_BYTES
     } else {
         TOOL_OUTPUT_CONTEXT_MAX_BYTES
     };
@@ -485,7 +473,7 @@ async fn execute_inner(
     cancelled: Option<&Arc<AtomicBool>>,
 ) -> ToolOutcome {
     match name {
-        "fast_context" => {
+        "polaris" => {
             let code_root = root.to_path_buf();
             let memory_root = root.to_path_buf();
             let mut args = args.clone();
@@ -524,9 +512,9 @@ async fn execute_inner(
                         })
                 })
                 .unwrap_or_default();
-            // 代码上下文与训练知识是独立数据源，同轮并行，附加召回不会串行拖慢 fast_context。
+            // 代码上下文与训练知识是独立数据源，同轮并行，附加召回不会串行拖慢 polaris。
             let code_job = tokio::task::spawn_blocking(move || {
-                crate::nova_tools_native::context::fast_context(&code_root, args)
+                crate::nova_tools_native::context::polaris(&code_root, args)
             });
             let memory_job = tokio::task::spawn_blocking(move || {
                 let enabled = crate::settings::Settings::load(&crate::lyra::config::nova_root())
@@ -595,20 +583,7 @@ async fn execute_inner(
                     ToolOutcome::text(text)
                 }
                 Ok(Err(error)) => ToolOutcome::error(error),
-                Err(e) => ToolOutcome::error(format!("fast_context 执行失败：{e}")),
-            }
-        }
-        "find_symbols" => {
-            let root = root.to_path_buf();
-            let args = args.clone();
-            match tokio::task::spawn_blocking(move || {
-                crate::nova_tools_native::context::find_symbols(&root, args)
-            })
-            .await
-            {
-                Ok(Ok(text)) => ToolOutcome::text(text),
-                Ok(Err(error)) => ToolOutcome::error(error),
-                Err(e) => ToolOutcome::error(format!("find_symbols 执行失败：{e}")),
+                Err(e) => ToolOutcome::error(format!("polaris 执行失败：{e}")),
             }
         }
         "read" => {

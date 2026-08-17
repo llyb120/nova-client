@@ -1,10 +1,10 @@
 import { resolve } from "node:path";
-import { FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
 import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
 
 /**
  * Nova context tools for Cursor SDK `local.customTools`.
- * Exposes fast_context and find_symbols; filesystem operations use Cursor built-ins.
+ * Exposes polaris; filesystem operations use Cursor built-ins.
  */
 export function createCursorFilesystemTools(cwd, options = {}) {
   void options;
@@ -12,8 +12,8 @@ export function createCursorFilesystemTools(cwd, options = {}) {
   const root = resolve(cwd);
   if (!fastContext) return {};
   return {
-    fast_context: {
-      description: FAST_CONTEXT_DESCRIPTION,
+    polaris: {
+      description: POLARIS_DESCRIPTION,
       inputSchema: {
         type: "object",
         properties: {
@@ -37,20 +37,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         const keywords = [...new Set((Array.isArray(rawKeywords) ? rawKeywords : typeof rawKeywords === "string" ? [rawKeywords] : [])
           .map((value) => String(value ?? "").trim()).filter(Boolean))].slice(0, 5);
         const args = { ...(params ?? {}), keywords };
-        return await callGlobalContextTool("fast_context", root, args);
-      },
-    },
-    find_symbols: {
-      description: "并行定位多个符号在仓库中的所有出现位置（文件:行号）。只要行号不要正文时用；需要上下文用 fast_context。",
-      inputSchema: {
-        type: "object",
-        properties: { names: { type: "array", minItems: 1, items: { type: "string" }, description: "符号名列表" } },
-        required: ["names"],
-        additionalProperties: false,
-      },
-      async execute(params) {
-        const args = params ?? {};
-        return await callGlobalContextTool("find_symbols", root, args);
+        return await callGlobalContextTool("polaris", root, args);
       },
     },
   };
@@ -65,19 +52,19 @@ export function cursorBatchToolPolicy(options = {}) {
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0" && globalContextServiceConfigured();
   const lines = [
     "You have Cursor built-in Read, Shell, Grep"
-      + (fastContext ? " plus Nova tools fast_context and find_symbols" : "")
+      + (fastContext ? " plus Nova tools polaris" : "")
       + (readOnly ? "" : ", Write/Edit")
       + ". The following tool-selection rules are hard constraints.",
     "Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. "
       + (fastContext
-        ? "When edit distribution is unknown — or when you plan to modify two or more files not yet read this session — call fast_context first; one call typically replaces 5–10 grep+read round-trips (use find_symbols for definitions/references only). Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
+        ? "When edit distribution is unknown — or when you plan to modify two or more files not yet read this session — call polaris first; one call typically replaces 5–10 grep+read round-trips. Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
         : "When location is unknown, search first (see below), then read near hits. ")
       + "Do not dump large files blindly."
       + (readOnly
         ? ""
         : " For edits, use Cursor built-in Write/Edit/StrReplace."),
     (fastContext
-      ? "Search and traversal must be cost-bounded. If path and range are known, use Read directly. When edit distribution is unknown, or you plan to modify 2+ unread files, call fast_context once — one call typically replaces 5–10 grep+read round-trips. It returns complete EDIT/DEPS units plus IMPACT/SIG indexes using batched rg and an incremental symbol index; use find_symbols for locations only. Never re-read shown ranges. Read SIG/IMPACT bodies by exact path:line only when truly needed. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
+      ? "Search and traversal must be cost-bounded. If path and range are known, use Read directly. When edit distribution is unknown, or you plan to modify 2+ unread files, call polaris once — one call typically replaces 5–10 grep+read round-trips. It returns complete EDIT/DEPS units plus IMPACT/SIG indexes using batched rg and an incremental symbol index. Never re-read shown ranges. Read SIG/IMPACT bodies by exact path:line only when truly needed. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
       : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
       + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];

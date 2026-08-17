@@ -492,7 +492,7 @@ export interface Settings {
   sessionAutoCleanupEnabled: boolean;
   /** 自动清理会话的保留时长（小时） */
   sessionAutoCleanupHours: number;
-  /** 独立经验库训练；经验不同于客观记忆和必须遵守的守则。开启后 Lyra fast_context 也会并行召回训练知识。 */
+  /** 独立经验库训练；经验不同于客观记忆和必须遵守的守则。开启后 Lyra polaris 也会并行召回训练知识。 */
   experienceTrainingEnabled: boolean;
   experienceTrainingAgent: AgentKind;
   experienceTrainingModel: string;

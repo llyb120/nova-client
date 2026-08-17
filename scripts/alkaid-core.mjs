@@ -17,14 +17,14 @@ import { existsSync } from "node:fs";
 import { access, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
-import { FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
 import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
 import { appendTrainedKnowledge, createExperienceTools } from "./alkaid-experience-tools.mjs";
 
 /** Reasonix-style per-tool context budget. Full oversized text is archived before truncation. */
 export const TOOL_OUTPUT_CONTEXT_MAX_BYTES = 32 * 1024;
-/** fast_context has its own complete-unit budget (default 32KB, explicit max 64KB). */
-export const FAST_CONTEXT_OUTPUT_MAX_BYTES = 64 * 1024;
+/** polaris has its own complete-unit budget (default 32KB, explicit max 64KB). */
+export const POLARIS_OUTPUT_MAX_BYTES = 64 * 1024;
 /** OpenAI Responses API hard limit for function_call_output.output string length. */
 export const OPENAI_TOOL_OUTPUT_MAX_CHARS = 10_485_760;
 /** Leave room for a truncation notice before the API rejects the request. */
@@ -478,8 +478,8 @@ export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
   });
   if (fastContext) tools.push(
     {
-      name: "fast_context",
-      description: FAST_CONTEXT_DESCRIPTION,
+      name: "polaris",
+      description: POLARIS_DESCRIPTION,
       parameters: Type.Object({
         keywords: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 5, description: "1–5 个符号或关键词" })),
         task: Type.Optional(Type.String({ description: "一句话任务描述，用于补充检索词和排序" })),
@@ -492,18 +492,8 @@ export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
         const args = params ?? {};
         const root = currentRoot();
         // 代码上下文与训练知识同轮返回；模型不需要再调用独立的 load 工具。
-        const codeText = await callGlobalContextTool("fast_context", root, args);
+        const codeText = await callGlobalContextTool("polaris", root, args);
         return textResult(await appendTrainedKnowledge(codeText, args, root));
-      },
-    },
-    {
-      name: "find_symbols",
-      description: "并行定位多个符号在仓库中的所有出现位置（文件:行号）。只要行号不要正文时用；需要上下文用 fast_context。",
-      parameters: Type.Object({ names: Type.Array(Type.String(), { minItems: 1, description: "符号名列表" }) }),
-      async execute(_id, params) {
-        const args = params ?? {};
-        const root = currentRoot();
-        return textResult(await callGlobalContextTool("find_symbols", root, args));
       },
     },
   );
@@ -599,26 +589,25 @@ export function buildAlkaidSystemPrompt(options = {}) {
       : options.shellConfig?.kind === "powershell"
         ? "- bash: 执行 PowerShell 命令"
         : "- bash: 执行 Bash 命令",
-    fastContext ? "- fast_context: 一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG（内部批量 rg + 增量符号索引）" : null,
-    fastContext ? "- find_symbols: 并行定位多个符号出现位置（只要行号时用）" : null,
+    fastContext ? "- polaris: 一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG（内部批量 rg + 增量符号索引）" : null,
     options.readOnly ? null : "- edit / write: 单文件编辑或写入",
-    process.env.NOVA_EXPERIENCE_TOOLS === "1" ? "- feedback_memory: 对 fast_context 返回且实际使用的训练知识闭环反馈" : null,
+    process.env.NOVA_EXPERIENCE_TOOLS === "1" ? "- feedback_memory: 对 polaris 返回且实际使用的训练知识闭环反馈" : null,
   ].filter(Boolean);
 
   const stableParts = [
     "你是 Vega：高效、简单、面向软件工程结果。",
     `Available tools:\n${toolLines.join("\n")}`,
-      `你拥有 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 fast_context/find_symbols。`
+      `你拥有 PI coding agent 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 polaris。`
         + (fastContext
-          ? "任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（只要定义/引用行号时用 find_symbols）；一次调用通常替代 5–10 轮 rg+read 往返。拿不准是否涉及多个文件、或只是先分析要改哪里而不写代码时，同样按涉及处理，先调用 fast_context。find_symbols 只用于拿行号；定位后仍需阅读两个及以上文件正文时，把文件清单传给 fast_context 的 files 一次打包，不要逐个 read。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
+          ? "任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 polaris；一次调用通常替代 5–10 轮 rg+read 往返。拿不准是否涉及多个文件、或只是先分析要改哪里而不写代码时，同样按涉及处理，先调用 polaris。定位后仍需阅读两个及以上文件正文时，把文件清单传给 polaris 的 files 一次打包，不要逐个 read。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；"
           : "未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；")
         + `大文件禁止无目的全量读取。${autoChangeProject ? "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" : ""}修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。`,
       (fastContext
-        ? "搜索与遍历必须成本有界。路径和行段已明确且只需少量行段时直接 read；任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 fast_context（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返），只要定义/引用位置时用 find_symbols。fast_context 已展示范围视为已读；SIG/IMPACT 仅在确需函数体时精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调；返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
+        ? "搜索与遍历必须成本有界。路径和行段已明确且只需少量行段时直接 read；任务涉及跨文件查找或修改（含分析要改哪里）时，先调用一次 polaris（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返）。polaris 已展示范围视为已读；SIG/IMPACT 仅在确需函数体时精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调；返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。"
         : "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。")
         + "除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。",
     process.env.NOVA_EXPERIENCE_TOOLS === "1"
-      ? "fast_context 会自动附带相关训练知识。当前会话事实优先；rule 是强约束，memory 是可核验事实，experience 只在条件匹配时适用。若结果含 TRAINED KNOWLEDGE，最终回复前调用 feedback_memory，只反馈实际采用的条目；用户沉默不算成功，未采用或无法验证时用 reward=0。"
+      ? "polaris 会自动附带相关训练知识。当前会话事实优先；rule 是强约束，memory 是可核验事实，experience 只在条件匹配时适用。若结果含 TRAINED KNOWLEDGE，最终回复前调用 feedback_memory，只反馈实际采用的条目；用户沉默不算成功，未采用或无法验证时用 reward=0。"
       : "",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
     "完成修改后，优先根据版本控制 diff 按需确定受影响单元及直接使用方，并执行成本最低且有效的验证；禁止遍历或列出完整仓库、无依据扩大范围，纯文档类改动可说明依据后跳过测试，无法验证时须报告原因、建议命令及剩余风险。",
@@ -829,7 +818,7 @@ export async function createAlkaidAgent(options = {}) {
         archiveDir,
         toolCallId,
         toolName: tool.name,
-        maxBytes: tool.name === "fast_context" ? FAST_CONTEXT_OUTPUT_MAX_BYTES : undefined,
+        maxBytes: tool.name === "polaris" ? POLARIS_OUTPUT_MAX_BYTES : undefined,
       });
     },
   }));

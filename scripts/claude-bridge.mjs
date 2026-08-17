@@ -22,7 +22,7 @@ function claudePathOverride() {
     .find(existsSync);
 }
 
-/** 为 Claude 会话挂载 nova-tools MCP（fast_context / find_symbols / edit_files）；runtime 脚本缺失时不挂载。 */
+/** 为 Claude 会话挂载 nova-tools MCP（polaris）；runtime 脚本缺失时不挂载。 */
 function novaToolsMcpServers(request, env = process.env) {
   const script = join(env.NOVA_DATA_DIR || join(homedir(), ".nova"), "runtime", "nova-tools-mcp.mjs");
   if (!existsSync(script)) return undefined;

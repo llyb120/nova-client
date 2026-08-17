@@ -77,7 +77,7 @@ pub struct AppState {
     pub roaming: Mutex<RoamingStore>,
     /// 已创建的 git worktree 记录（独立持久化，供设置面板手动清理）
     pub worktrees: Mutex<WorktreeStore>,
-    /// Native resident fast_context service shared by every external bridge. Lyra bypasses the
+    /// Native resident polaris service shared by every external bridge. Lyra bypasses the
     /// socket and calls the same in-process engine directly.
     pub(crate) context_service: context_service::ContextService,
     pub acp: Arc<AcpManager>,

@@ -1,4 +1,4 @@
-// ctx-recall.eval.mjs — fast_context 召回率评测（native Rust 实现，真实仓库 + 夹具）
+// ctx-recall.eval.mjs — polaris 召回率评测（native Rust 实现，真实仓库 + 夹具）
 //
 // 用法: node scripts/ctx-recall.eval.mjs [--json] [--save <file>]
 //
@@ -257,7 +257,7 @@ async function main() {
   for (const item of CASES) {
     const caseRoot = item.fixture ? item.fixture() : root;
     const started = performance.now();
-    const out = await callGlobalContextTool("fast_context", caseRoot, item.args);
+    const out = await callGlobalContextTool("polaris", caseRoot, item.args);
     const ms = Math.round(performance.now() - started);
     const kb = Math.round(out.length / 102.4) / 10;
 

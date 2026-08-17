@@ -1,6 +1,6 @@
 // ctx-keyword-discipline.experiment.mjs — 验证"关键词纪律"能提升多少真实召回
 //
-// 用录制的真实 fast_context 调用（真实 rawInput + 真实编辑目标）在当前 native
+// 用录制的真实 polaris 调用（真实 rawInput + 真实编辑目标）在当前 native
 // 实现上做三组对照回放：
 //   A 原始查询        ：完全按录制参数回放（baseline）
 //   B 纪律查询(机械版)：删掉仓库中零命中的臆造关键词，保留真实关键词
@@ -50,7 +50,7 @@ for (const f of readdirSync(dir).filter((x) => x.endsWith(".json"))) {
     for (const c of t.fcCalls) {
       if (!c.targets.length || !t.cwd || !existsSync(t.cwd)) continue;
       if (!c.rawInput || (!c.rawInput.keywords && !c.rawInput.task)) continue;
-      // 只回放真正的 fast_context 查询（带 keywords/task），跳过被误录的 shell
+      // 只回放真正的 polaris 查询（带 keywords/task），跳过被误录的 shell
       if (!Array.isArray(c.rawInput.keywords) && !c.rawInput.task) continue;
       calls.push({ t, c });
     }
@@ -70,17 +70,17 @@ for (const { t, c } of picked) {
   };
   const baseArgs = { ...c.rawInput };
   delete baseArgs.command;
-  const rA = recall(await callGlobalContextTool("fast_context", root, baseArgs));
+  const rA = recall(await callGlobalContextTool("polaris", root, baseArgs));
 
   const kws = Array.isArray(baseArgs.keywords) ? baseArgs.keywords : [];
   const kept = kws.filter((k) => keywordExists(root, k));
   const dropped = kws.length - kept.length;
   const argsB = { ...baseArgs, keywords: kept.length ? kept : kws.slice(0, 1) };
-  const rB = recall(await callGlobalContextTool("fast_context", root, argsB));
+  const rB = recall(await callGlobalContextTool("polaris", root, argsB));
 
   const oracle = oracleSymbols(root, c.targets);
   const argsC = { ...baseArgs, keywords: oracle.length ? oracle : kept, files: undefined };
-  const rC = oracle.length ? recall(await callGlobalContextTool("fast_context", root, argsC)) : rB;
+  const rC = oracle.length ? recall(await callGlobalContextTool("polaris", root, argsC)) : rB;
 
   rows.push({ task: t.task, root: root.split("/").pop(), n: c.targets.length, dropped, total: kws.length, rA, rB, rC });
   console.log(`${(rA * 100).toFixed(0).padStart(3)}% → ${(rB * 100).toFixed(0).padStart(3)}% → ${(rC * 100).toFixed(0).padStart(3)}%  删${dropped}/${kws.length}个  ${t.task.slice(0, 44)}`);

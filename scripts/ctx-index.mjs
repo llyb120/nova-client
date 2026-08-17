@@ -1,6 +1,6 @@
 // ctx-index.mjs — 仓库符号索引 (纯 JS 扫描, 无 rg 子进程) + 增量缓存
 //
-// 设计目标: fast_context / code_map / find_symbols 共用一份索引。
+// 设计目标: polaris / code_map 共用一份索引。
 //   - 符号边界用括号配对算真实 end 行 (而非"下一个符号起始 -1")，并保留嵌套层级，
 //     使命中可落到最内层单元 (方法/闭包) 而不是整个 impl/class。
 //   - 全程无子进程 (仅列文件用一次 git ls-files)，扫描在进程内完成。

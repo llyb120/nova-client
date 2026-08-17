@@ -449,7 +449,7 @@ pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value
     let mut guard = store()?.lock().map_err(|_| "经验库锁已损坏".to_string())?;
     guard.universal_experiences = universal_entries;
     guard.projects.insert(project_key, project);
-    // 命中次数与专家激活是召回遥测，不应让每次 fast_context 都同步重写完整经验库。
+    // 命中次数与专家激活是召回遥测，不应让每次 polaris 都同步重写完整经验库。
     // 保留内存态，后续训练、反馈或删除等真实写操作会一并持久化。
     Ok(
         json!({ "activatedExperts": selected, "experiences": result, "projectRoot": project_root,

@@ -82,7 +82,7 @@ function loadCases() {
       if (items[i]?.type !== "user" || !asText(items[i])) continue;
       const nextUser = items.findIndex((item, j) => j > i && item?.type === "user");
       const end = nextUser < 0 ? items.length : nextUser;
-      const fc = items.slice(i + 1, end).find((item) => item?.type === "tool" && toolName(item).includes("fast_context"));
+      const fc = items.slice(i + 1, end).find((item) => item?.type === "tool" && toolName(item).includes("polaris") || toolName(item).includes("fast_context"));
       if (!fc) continue;
       const input = parseRawInput(fc);
       const keywords = Array.isArray(input.keywords) ? input.keywords.filter((v) => typeof v === "string") : [];
@@ -137,7 +137,7 @@ function runOne(test, arm) {
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => finish({ error: String(error) }));
     child.on("close", (code) => { if (!done) finish({ exitCode: code }); });
-    const prompt = `以下来自一个真实 Nova 软件工程会话。请延续上下文处理最后的真实用户请求。\n\n${test.history ? `历史：\n${test.history}\n\n` : ""}当前用户：${test.user}\n\n评测约束：只调用一次 fast_context，不调用 read/find_symbols/bash/edit/write；基于返回内容给出分析，不实际修改文件。fast_context 使用原会话检索意图：keywords=${JSON.stringify(test.keywords)}，task=${JSON.stringify(test.user.slice(0, 300))}。`;
+    const prompt = `以下来自一个真实 Nova 软件工程会话。请延续上下文处理最后的真实用户请求。\n\n${test.history ? `历史：\n${test.history}\n\n` : ""}当前用户：${test.user}\n\n评测约束：只调用一次 polaris，不调用 read/bash/edit/write；基于返回内容给出分析，不实际修改文件。polaris 使用原会话检索意图：keywords=${JSON.stringify(test.keywords)}，task=${JSON.stringify(test.user.slice(0, 300))}。`;
     child.stdin.end(`${JSON.stringify({ action: "prompt", cwd: REPO, mode: "plan", model: MODEL, sessionId: `real-history-fc-${test.id}-${arm}-${Date.now()}`, parts: [{ type: "text", text: prompt }] })}\n`);
   });
 }

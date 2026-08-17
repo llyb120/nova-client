@@ -2388,7 +2388,7 @@ export function SettingsModal(props: { onClose: () => void }) {
               <input type="checkbox" checked={experienceTrainingEnabled()} onChange={(e) => setExperienceTrainingEnabled(e.currentTarget.checked)} />
               <span>定期从新会话训练多个独立知识库</span>
             </label>
-            <span class="field-hint">开启后 Lyra fast_context 会并行召回大熊座训练知识，Lyra 提示词和工具列表也会出现训练知识与反馈能力。</span>
+            <span class="field-hint">开启后 Lyra polaris 会并行召回大熊座训练知识，Lyra 提示词和工具列表也会出现训练知识与反馈能力。</span>
             <div class="field">
               <span class="field-label">训练模型</span>
               <ModelPicker

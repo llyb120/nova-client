@@ -1,5 +1,5 @@
 //! Lyra — Rust 原生自研 agent，实现 Vega（pi）用到的核心机制：
-//! 基础工具（read/bash/edit/write + fast_context/find_symbols 直连 nova_tools_native）、
+//! 基础工具（read/bash/edit/write + polaris 直连 nova_tools_native）、
 //! Reasonix 精简上下文（slim memory 冻结摘要 + 压力分层 + 中途重写）、
 //! 缓存优化（稳定/动态系统提示分段、prompt_cache_key、service_tier、长缓存保持）、
 //! provider 兼容 OpenAI Completions 与 Responses。

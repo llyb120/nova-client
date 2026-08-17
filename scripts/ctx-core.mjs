@@ -1,11 +1,11 @@
 // ctx-core.mjs — 上下文检索共享基础设施（纯模块，无协议）
 //
-// fast_context 的唯一实现是线上的 Rust native（nova-tools-napi, src-tauri/src/
+// polaris 的唯一实现是线上的 Rust native（nova-tools-napi, src-tauri/src/
 // nova_tools_native/context.rs），不再维护 JS 镜像。本文件只保留：
 //   1. 检索基础设施 searchText（batched rg → git grep → 有界进程内扫描），供
-//      find_symbols 与评测脚本复用；
-//   2. find_symbols / code_map 的 JS 实现（native 不可用时的降级路径）；
-//   3. FAST_CONTEXT_DESCRIPTION 工具描述与 repoRoot 等公共导出。
+//      评测脚本复用；
+//   2. code_map 的 JS 实现（native 不可用时的降级路径）；
+//   3. POLARIS_DESCRIPTION 工具描述与 repoRoot 等公共导出。
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
@@ -203,43 +203,7 @@ export async function codeMap(args = {}, root = repoRoot()) {
   return out.join('\n');
 }
 
-// ---------------------------------------------------------------- find_symbols
-
-export async function findSymbols({ names } = {}, root = repoRoot()) {
-  const list = [...new Set((Array.isArray(names) ? names : []).map((n) => String(n ?? '').trim()).filter(Boolean))].slice(0, 12);
-  if (!list.length) return '错误: names 不能为空';
-  const rows = await searchText(root, list, { word: true });
-  const index = await getIndex(root, {
-    priorityFiles: [...new Set(rows.map((r) => r.file))],
-    matchTerms: list,
-    mode: 'focused',
-    dependencyDepth: 0,
-  });
-  /** @type {Map<string, { file: string, ln: number, text: string }[]>} */
-  const refs = new Map();
-  for (const p of rows) {
-    for (const n of list) {
-      if (!new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(p.text)) continue;
-      const arr = refs.get(n) ?? [];
-      if (arr.length < 400) arr.push({ file: p.file, ln: p.ln, text: p.text });
-      refs.set(n, arr);
-    }
-  }
-  const out = [`# 符号定位 @${(await run(root, 'git', ['rev-parse', '--short', 'HEAD'])).trim()}`];
-  for (const n of list) {
-    const defs = index.defs.get(n) ?? [];
-    const hits = refs.get(n) ?? [];
-    out.push('', `## ${n}  defs=${defs.length} refs=${hits.length}`);
-    for (const d of defs.slice(0, 6)) out.push(`DEF ${d.file}:${d.ln}-${d.end} ${d.sig}`);
-    const rest = hits.filter((h) => !defs.some((d) => d.file === h.file && d.ln === h.ln));
-    for (const h of rest.slice(0, 24)) out.push(`    ${h.file}:${h.ln} ${h.text.trim().slice(0, 110)}`);
-    if (rest.length > 24) out.push(`    … +${rest.length - 24}`);
-    if (!defs.length && !hits.length) out.push('(无命中)');
-  }
-  return out.join('\n');
-}
-
 // ---------------------------------------------------------------- 工具描述
 
-export const FAST_CONTEXT_DESCRIPTION =
-  '任务涉及跨文件查找或修改（含分析要改哪里）、或需要阅读多个文件正文来理解/规划改动时，先调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单，一次调用通常替代 5–10 轮 rg+read 往返，比自行 rg/grep 往返更省 token。目标路径和行段都已明确且只需少量行段时直接 read；只需符号的定义/引用行号时用 find_symbols；已定位但仍需阅读正文的多个文件，通过 files 传入一次打包，不要逐个 read。默认只传 keywords/task/files；任务里点名了某个工具/符号（如要改某个函数）时也不要用 find_symbols 代替本工具——find_symbols 只给行号不给正文；调用后不要再用 rg/git grep 重复检索同一批关键词，已展示范围视为已读。返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要直接退回 rg/grep 逐个搜索。';
+export const POLARIS_DESCRIPTION =
+  '任务涉及跨文件查找或修改（含分析要改哪里）、或需要阅读多个文件正文来理解/规划改动时，先调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单，一次调用通常替代 5–10 轮 rg+read 往返，比自行 rg/grep 往返更省 token。目标路径和行段都已明确且只需少量行段时直接 read；已定位但仍需阅读正文的多个文件，通过 files 传入一次打包，不要逐个 read。默认只传 keywords/task/files；调用后不要再用 rg/git grep 重复检索同一批关键词，已展示范围视为已读。返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要直接退回 rg/grep 逐个搜索。';

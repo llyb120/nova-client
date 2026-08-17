@@ -3066,73 +3066,6 @@ fn file_is_small(root: &Path, file: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn find_symbols(root: &Path, params: Value) -> Result<String, String> {
-    let mut seen_names = HashSet::new();
-    let names: Vec<String> = params
-        .get("names")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && seen_names.insert((*value).to_string()))
-        .take(12)
-        .map(str::to_string)
-        .collect();
-    if names.is_empty() {
-        return Ok("错误: names 不能为空".into());
-    }
-    let (all, rows, revision) = std::thread::scope(|scope| {
-        let files = scope.spawn(|| list_code_files(root));
-        let search = scope.spawn(|| search_text(root, &names, false, true, &[]));
-        let revision = scope.spawn(|| short_rev(root));
-        (
-            files.join().unwrap_or_default(),
-            search.join().unwrap_or_default(),
-            revision.join().unwrap_or_else(|_| "unknown".into()),
-        )
-    });
-    let wanted: HashSet<_> = rows.iter().map(|r| r.file.clone()).collect();
-    let (index, _, _) = build_index(root, Some(&wanted), 0, Some(all.as_slice()));
-    let mut out = vec![format!("# 符号定位 @{revision}")];
-    for name in names {
-        let defs = index.defs.get(&name).cloned().unwrap_or_default();
-        let word_re = Regex::new(&format!(r"\b{}\b", regex::escape(&name))).unwrap();
-        let hits: Vec<_> = rows.iter().filter(|r| word_re.is_match(&r.text)).collect();
-        out.push(String::new());
-        out.push(format!(
-            "## {name}  defs={} refs={}",
-            defs.len(),
-            hits.len()
-        ));
-        for d in defs.iter().take(6) {
-            out.push(format!(
-                "DEF {}:{}-{} {}",
-                d.file, d.symbol.ln, d.symbol.end, d.symbol.sig
-            ));
-        }
-        let rest = hits
-            .iter()
-            .filter(|h| !defs.iter().any(|d| d.file == h.file && d.symbol.ln == h.ln))
-            .collect::<Vec<_>>();
-        for h in rest.iter().take(24) {
-            out.push(format!(
-                "    {}:{} {}",
-                h.file,
-                h.ln,
-                js_utf16_slice(h.text.trim(), 110)
-            ));
-        }
-        if rest.len() > 24 {
-            out.push(format!("    … +{}", rest.len() - 24));
-        }
-        if defs.is_empty() && hits.is_empty() {
-            out.push("(无命中)".into());
-        }
-    }
-    Ok(out.join("\n"))
-}
-
 pub fn code_map(root: &Path, params: Value) -> Result<String, String> {
     let scope = normalize_rel(
         params
@@ -3256,6 +3189,10 @@ fn backfill_block(
 
 
 pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
+    polaris(root, params)
+}
+
+pub fn polaris(root: &Path, params: Value) -> Result<String, String> {
     let out = fast_context_run(root, &params)?;
     if params
         .get("_anchorRetry")
@@ -3648,7 +3585,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     preliminary.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     preliminary.dedup_by(|a, b| a.0 == b.0);
     if preliminary.is_empty() {
-        return Ok(format!("# CTX @{}\n无命中: {}\n提示: 换更短的符号名/字符串片段，或改用 find_symbols / grep 定位后用 read。",short_rev(root),terms.join(" ")));
+        return Ok(format!("# CTX @{}\n无命中: {}\n提示: 换更短的符号名/字符串片段，或用 grep 定位后用 read。",short_rev(root),terms.join(" ")));
     }
     let mut candidates = preliminary
         .iter()
@@ -6149,7 +6086,7 @@ mod tests {
     }
 
     #[test]
-    fn symbol_locations_and_code_map_distinguish_defs() {
+    fn code_map_distinguishes_defs() {
         let d = tempdir().unwrap();
         fs::create_dir(d.path().join("src")).unwrap();
         fs::write(
@@ -6162,9 +6099,6 @@ mod tests {
             "import { pick } from './a';\nexport const value = pick();\n",
         )
         .unwrap();
-        let symbols = find_symbols(d.path(), serde_json::json!({"names":["pick"]})).unwrap();
-        assert!(symbols.contains("defs=1 refs=3"), "{symbols}");
-        assert!(symbols.contains("DEF src/a.ts:1-3"), "{symbols}");
         let map = code_map(d.path(), serde_json::json!({"scope":"src/"})).unwrap();
         assert!(map.contains("## src/a.ts (3L)"), "{map}");
         assert!(map.contains("1 pick"), "{map}");

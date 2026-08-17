@@ -1,4 +1,4 @@
-// ctx-invoke.eval.mjs — fast_context 调用率 + 真实任务召回评测（真实会话回放）
+// ctx-invoke.eval.mjs — polaris 调用率 + 真实任务召回评测（真实会话回放）
 //
 // 用法: node scripts/ctx-invoke.eval.mjs [--json] [--dir ~/.nova/threads] [--limit N] [--replay [N]]
 //
@@ -6,12 +6,12 @@
 //
 // 指标定义：
 // - coding turn   : 有编辑(edit/write)或检索(read/rg/grep/find)动作的用户回合
-// - shouldCall    : 该回合编辑了 >=2 个不同文件（跨文件任务 = fast_context 的目标场景）
-// - invoke rate   : 调用了 fast_context 的回合 / 全部 coding turn
+// - shouldCall    : 该回合编辑了 >=2 个不同文件（跨文件任务 = polaris 的目标场景）
+// - invoke rate   : 调用了 polaris 的回合 / 全部 coding turn
 // - sc invoke rate: shouldCall 回合里实际调用的比例（核心指标：该调时调了没有）
 // - waste         : shouldCall 但没调的回合，平均白跑的检索动作数（rg/grep/find/read）
 // - recall        : 调用点之后、同回合内新编辑的文件（调用前已编辑的视为已知路径，剔除），
-//                   有多少出现在 fast_context 输出的 ### 文件块里。
+//                   有多少出现在 polaris 输出的 ### 文件块里。
 // --replay [N]    : 用录制的真实 rawInput 对当前 native 实现重跑（cwd 需仍存在），
 //                   对比"录制时召回"与"当前实现召回"，检测检索回归/改进。
 
@@ -25,11 +25,10 @@ const SEARCH_CMD = /^\s*(rg|grep|git\s+grep|find|ag|ls|fd)\b/;
 
 function classify(item) {
   const title = item.title || "";
-  // 工具名只在 "·" 前缀段匹配；shell 命令正文里提到 fast_context 不算调用
+  // 工具名只在 "·" 前缀段匹配；shell 命令正文里提到 polaris 不算调用
   const head = title.split("·")[0];
   const cmd = title.includes("·") ? title.split("·").slice(1).join("·").trim() : "";
-  if (/\bfast_context\b/.test(head)) return { tool: "fast_context" };
-  if (/\bfind_symbols\b/.test(head)) return { tool: "find_symbols" };
+  if (/\bpolaris\b/.test(head)) return { tool: "polaris" };
   if (/\b(edit|write)\b/.test(head) || /^修改 /.test(title)) {
     // 单文件 edit：rawInput.path；批量：rawInput.files[].path
     const filesArr = Array.isArray(item.rawInput?.files) ? item.rawInput.files : null;
@@ -66,7 +65,7 @@ function rel(p, cwd) {
   return r.startsWith("..") ? p : r;
 }
 
-// 解析 fast_context 输出里的 "### <path> (...)" 文件块标题
+// 解析 polaris 输出里的 "### <path> (...)" 文件块标题
 function filesInOutput(out) {
   const set = new Set();
   for (const m of String(out).matchAll(/^###\s+(\S+)\s+\(/gm)) set.add(m[1]);
@@ -91,19 +90,18 @@ function analyzeThread(d) {
   const turnStats = [];
   for (const turn of turns) {
     const edited = new Set();
-    let search = 0, fc = 0, fs = 0;
+    let search = 0, fc = 0;
     const fcCalls = [];
     for (const ev of turn.events) {
       const c = classify(ev);
       if (c.tool === "edit") (c.paths || []).forEach((p) => edited.add(rel(p, cwd) || p));
       else if (c.tool === "read") search += c.n || 1;
       else if (c.tool === "search_cmd") search += 1;
-      else if (c.tool === "find_symbols") fs += 1;
-      else if (c.tool === "fast_context") { fc += 1; fcCalls.push(ev); }
+      else if (c.tool === "polaris") { fc += 1; fcCalls.push(ev); }
     }
     if (edited.size === 0 && search === 0) continue; // 非 coding 回合
 
-    // 每次 fast_context 调用的召回口径：调用之后新编辑的文件（调用前已编辑 = 已知路径）
+    // 每次 polaris 调用的召回口径：调用之后新编辑的文件（调用前已编辑 = 已知路径）
     for (const call of fcCalls) {
       const before = new Set(), after = new Set();
       for (const ev of turn.events) {
@@ -123,7 +121,7 @@ function analyzeThread(d) {
     }
     turnStats.push({
       agent: d.agentKind || "?", cwd, task: turn.task,
-      edited: edited.size, search, fc, fs,
+      edited: edited.size, search, fc,
       shouldCall: edited.size >= 2,
       invoked: fc > 0,
       fcCalls,
@@ -179,7 +177,7 @@ async function main() {
       if (!c.rawInput || !t.cwd || !existsSync(t.cwd)) continue;
       budget -= 1;
       try {
-        const out = await callGlobalContextTool("fast_context", t.cwd, c.rawInput);
+        const out = await callGlobalContextTool("polaris", t.cwd, c.rawInput);
         const outFiles = filesInOutput(out);
         const hit = c.targets.filter((f) => outFiles.has(f)).length;
         rows.push({ task: t.task, cwd: t.cwd, targets: c.targets.length, recorded: c.outLen > 0 ? c.recalled.length : null, current: hit });
@@ -206,7 +204,7 @@ async function main() {
   };
 
   if (json) { console.log(JSON.stringify(result, null, 2)); return; }
-  console.log(`线程: ${all.length}  coding 回合: ${turns.length}  fast_context 调用: ${result.fcCallsTotal}`);
+  console.log(`线程: ${all.length}  coding 回合: ${turns.length}  polaris 调用: ${result.fcCallsTotal}`);
   console.log(`调用率(全部 coding 回合): ${pct(result.invokeRate)}`);
   console.log(`调用率(shouldCall 回合, 核心): ${pct(result.scInvokeRate)}  (${scInvoked.length}/${sc.length})`);
   console.log(`shouldCall 未调用回合白跑检索均值: ${Number.isNaN(result.avgWastedSearch) ? "n/a" : result.avgWastedSearch.toFixed(1)} 次/回合`);

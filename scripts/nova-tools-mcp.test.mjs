@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   createNovaBatchTools,
-  normalizeFastContextArgs,
-  normalizeFindSymbolsArgs,
+  normalizePolarisArgs,
   novaDevinBatchToolPolicy,
 } from "./nova-batch-tools.mjs";
 
@@ -32,7 +31,7 @@ test("createNovaBatchTools exposes context tools only with the native service", 
     if (previousToken !== undefined) process.env.NOVA_CONTEXT_SERVICE_TOKEN = previousToken;
   }
   const tools = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }));
-  assert.deepEqual(Object.keys(tools).sort(), ["fast_context", "find_symbols"]);
+  assert.deepEqual(Object.keys(tools).sort(), ["polaris"]);
 });
 
 test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
@@ -46,17 +45,16 @@ test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
 });
 
 test("context argument aliases normalize", () => {
-  assert.deepEqual(normalizeFindSymbolsArgs({ query: "Widget" }), { names: ["Widget"] });
-  assert.deepEqual(normalizeFastContextArgs({ query: "Widget" }).keywords, ["Widget"]);
+  assert.deepEqual(normalizePolarisArgs({ query: "Widget" }).keywords, ["Widget"]);
 });
 
-test("fast_context keywords normalize to top five", () => {
-  assert.deepEqual(normalizeFastContextArgs({ keywords: "Widget" }).keywords, ["Widget"]);
+test("polaris keywords normalize to top five", () => {
+  assert.deepEqual(normalizePolarisArgs({ keywords: "Widget" }).keywords, ["Widget"]);
   assert.deepEqual(
-    normalizeFastContextArgs({ keywords: ["a", "b", "a", "c", "d", "e", "f"] }).keywords,
+    normalizePolarisArgs({ keywords: ["a", "b", "a", "c", "d", "e", "f"] }).keywords,
     ["a", "b", "c", "d", "e"],
   );
-  const schema = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true })).fast_context.inputSchema.properties.keywords;
+  const schema = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true })).polaris.inputSchema.properties.keywords;
   assert.equal(schema.maxItems, undefined);
   assert(schema.anyOf.some((option) => option.type === "string"));
 });
@@ -64,6 +62,6 @@ test("fast_context keywords normalize to top five", () => {
 test("devin policy routes context through MCP when the native service exists", () => {
   const policy = withContextService(() => novaDevinBatchToolPolicy({ fastContext: true }));
   assert.match(policy, /mcp_call_tool/);
-  assert.match(policy, /fast_context/);
+  assert.match(policy, /polaris/);
   assert.match(policy, /Devin native edit tools/);
 });

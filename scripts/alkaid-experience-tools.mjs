@@ -155,7 +155,7 @@ export function createExperienceTools(currentRoot = () => process.cwd()) {
   if (process.env.NOVA_EXPERIENCE_TOOLS !== "1") return [];
   return [{
     name: "feedback_memory",
-    description: "闭环反馈 fast_context 本轮返回且实际使用的训练知识；非零反馈必须提供采用的条目 id。",
+    description: "闭环反馈 polaris 本轮返回且实际使用的训练知识；非零反馈必须提供采用的条目 id。",
     parameters: Type.Object({
       experienceIds: Type.Array(Type.String(), { description: "实际影响本轮决策的知识 id" }),
       reward: Type.Number({ minimum: -1, maximum: 1, description: "-1 明确有害，0 无法判断或未采用，1 明确有效" }),
