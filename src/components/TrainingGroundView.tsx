@@ -243,10 +243,6 @@ export function TrainingGroundView() {
             <span class="training-eyebrow">EXPERIENCE CONSTELLATION</span>
             <h1>大熊座</h1>
             <p>知识、记忆和经验会自动标记来源项目；项目按 Git 仓库识别，同一仓库下的目录与 worktree 属于同一个项目。</p>
-            <div class="training-project-identity" title={overview()?.projectRoot ?? projectCwd()}>
-              <span>当前仓库</span>
-              <strong>{overview()?.projectRoot ?? projectCwd()}</strong>
-            </div>
           </div>
           <div class="training-actions">
             <Show when={evolutionStatus()}><span class="evolution-status" role="status">{evolutionStatus()}</span></Show>
