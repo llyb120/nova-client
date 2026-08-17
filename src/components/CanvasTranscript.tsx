@@ -973,6 +973,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     until: number;
   }
   const prefixLayoutCaches = new Map<string, PrefixLayoutCache>();
+  const PREFIX_CACHE_LIMIT = 10;
   // groupItems 会保留已闭合分组的对象身份；缓存其内容签名，避免每个流式 token
   // 都重新遍历整段历史文本。展开状态变化时会整体换新此 WeakMap。
   let closedGroupSigCache = new WeakMap<Group, string>();
@@ -1391,7 +1392,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         groupYs: nextGroupYs.slice(0, closedUntil),
         height: closedUntil < groups.length ? nextGroupYs[closedUntil] : y,
       });
-      while (prefixLayoutCaches.size > 3) {
+      while (prefixLayoutCaches.size > PREFIX_CACHE_LIMIT) {
         const oldest = prefixLayoutCaches.keys().next().value;
         if (oldest == null) break;
         prefixLayoutCaches.delete(oldest);
