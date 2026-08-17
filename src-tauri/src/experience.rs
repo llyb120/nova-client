@@ -778,6 +778,15 @@ fn deterministic_roll(key: &str) -> f64 {
     h.finish() as f64 / u64::MAX as f64
 }
 
+fn training_expert_count(seed: i64, available: usize) -> usize {
+    let requested = if deterministic_roll(&format!("expert-count:{seed}")) < 0.5 {
+        2
+    } else {
+        3
+    };
+    requested.min(available)
+}
+
 fn render_thread(thread: &crate::threads::Thread) -> String {
     let mut out = format!("会话 {}：{}\n", thread.id, thread.title);
     for item in thread.items.iter().rev().take(16).rev() {
@@ -1081,7 +1090,8 @@ async fn train_source_thread(
                 project.last_trained_experts.contains(&a.id).cmp(&project.last_trained_experts.contains(&b.id))
                     .then_with(|| deterministic_roll(&format!("activate:{seed}:{}", a.id)).total_cmp(&deterministic_roll(&format!("activate:{seed}:{}", b.id))))
             });
-            configs.truncate(configs.len().min(2));
+            let active_count = training_expert_count(seed, configs.len());
+            configs.truncate(active_count);
             let mut threads = project_threads(&state, &project_key);
             if let Some(source_thread_id) = source_thread_id {
                 // 自动训练直接选择会话；项目只由会话 cwd 决定并作为知识标签，
@@ -1693,6 +1703,15 @@ fn evolve_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn training_randomly_activates_two_or_three_experts() {
+        let counts = (0..100)
+            .map(|seed| training_expert_count(seed, 7))
+            .collect::<HashSet<_>>();
+        assert_eq!(counts, HashSet::from([2, 3]));
+        assert_eq!(training_expert_count(0, 1), 1);
+    }
 
     #[test]
     fn training_agent_accepts_devin_and_rejects_opencode() {
