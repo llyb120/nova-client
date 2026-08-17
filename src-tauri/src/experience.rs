@@ -937,8 +937,12 @@ fn training_prompt(config: &ExperienceExpertConfig, existing: &str, conversation
 }
 
 fn training_agent(settings: &Settings) -> Result<AgentKind, String> {
-    serde_json::from_value(json!(settings.experience_training_agent.trim()))
-        .map_err(|_| format!("不支持的训练后端：{}", settings.experience_training_agent))
+    let agent: AgentKind = serde_json::from_value(json!(settings.experience_training_agent.trim()))
+        .map_err(|_| format!("不支持的训练后端：{}", settings.experience_training_agent))?;
+    if matches!(agent, AgentKind::OpenCode | AgentKind::OpenCodePlus) {
+        return Err(format!("{} 暂不支持经验训练", agent.label()));
+    }
+    Ok(agent)
 }
 
 /// 在猎户座 Thread 上运行一个真实 agent turn，而不是旁路 complete_once。
@@ -1005,9 +1009,16 @@ async fn run_training_turn(
                     .run_prompt(thread_id.into(), prompt, Vec::new())
                     .await
             }
-            AgentKind::Devin | AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            AgentKind::Devin => {
+                state
+                    .acp
+                    .clone()
+                    .run_prompt(thread_id.into(), prompt, Vec::new())
+                    .await
+            }
+            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                 return Err(format!(
-                    "{} 暂不支持经验训练，请选择 Vega、Lyra、Codex、CodeBuddy、Claude 或 Cursor",
+                    "{} 暂不支持经验训练，请选择 Vega、Lyra、Devin、Codex、CodeBuddy、Claude 或 Cursor",
                     agent.label()
                 ))
             }
@@ -1682,6 +1693,18 @@ fn evolve_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn training_agent_accepts_devin_and_rejects_opencode() {
+        let mut settings = Settings::default();
+        settings.experience_training_agent = "devin".into();
+        assert_eq!(training_agent(&settings).unwrap(), AgentKind::Devin);
+
+        settings.experience_training_agent = "opencode".into();
+        assert!(training_agent(&settings)
+            .unwrap_err()
+            .contains("暂不支持经验训练"));
+    }
 
     #[test]
     fn training_and_evolution_sessions_are_not_training_sources() {

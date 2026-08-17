@@ -921,7 +921,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [skillsDragging, setSkillsDragging] = createSignal(false);
   const [skillsMsg, setSkillsMsg] = createSignal("");
   const [experienceTrainingEnabled, setExperienceTrainingEnabled] = createSignal(s?.experienceTrainingEnabled ?? false);
-  const trainingAgentKinds = () => enabledAgentKinds().filter((kind) => kind !== "devin" && kind !== "opencode");
+  const trainingAgentKinds = () => enabledAgentKinds().filter((kind) => kind !== "opencode");
   const [experienceTrainingAgent, setExperienceTrainingAgent] = createSignal<AgentKind>(s?.experienceTrainingAgent ?? "lyra");
   const [experienceTrainingModel, setExperienceTrainingModel] = createSignal(s?.experienceTrainingModel ?? "");
   const [experienceTrainingIntervalMinutes, setExperienceTrainingIntervalMinutes] = createSignal(s?.experienceTrainingIntervalMinutes ?? 30);
