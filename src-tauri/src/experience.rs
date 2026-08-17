@@ -1038,6 +1038,15 @@ async fn run_training_turn(
 }
 
 pub async fn train(app: &AppHandle, cwd: &str, force: bool) -> Result<Value, String> {
+    train_source_thread(app, cwd, force, None).await
+}
+
+async fn train_source_thread(
+    app: &AppHandle,
+    cwd: &str,
+    force: bool,
+    source_thread_id: Option<&str>,
+) -> Result<Value, String> {
     let (project_key, project_root) = project_identity(cwd)?;
     if TRAINING.swap(true, Ordering::SeqCst) {
         return Err("已有一次经验训练正在进行".into());
@@ -1063,6 +1072,11 @@ pub async fn train(app: &AppHandle, cwd: &str, force: bool) -> Result<Value, Str
             });
             configs.truncate(configs.len().min(2));
             let mut threads = project_threads(&state, &project_key);
+            if let Some(source_thread_id) = source_thread_id {
+                // 自动训练直接选择会话；项目只由会话 cwd 决定并作为知识标签，
+                // 不再把同项目的其他会话捆成一个调度单元。
+                threads.retain(|thread| thread.id == source_thread_id);
+            }
             threads.retain(|thread| thread.items.iter().any(|item| matches!(item, Item::User { .. }))
                 && configs.iter().any(|config| project.expert_processed_threads.get(&config.id)
                     .and_then(|seen| seen.get(&thread.id)).copied().unwrap_or(0) < thread.updated_at));
@@ -1232,17 +1246,21 @@ pub fn tick(app: &AppHandle) {
         if !settings.experience_training_enabled {
             None
         } else {
-            let mut projects = state
+            let source_threads = state
                 .store
                 .lock()
                 .unwrap()
                 .threads
                 .iter()
                 .filter(|thread| is_training_source_thread(thread))
-                .filter_map(|thread| project_identity(&thread.cwd).ok())
+                .filter(|thread| {
+                    thread
+                        .items
+                        .iter()
+                        .any(|item| matches!(item, Item::User { .. }))
+                })
+                .cloned()
                 .collect::<Vec<_>>();
-            projects.sort();
-            projects.dedup_by(|left, right| left.0 == right.0);
             let guard = store()
                 .and_then(|value| value.lock().map_err(|_| "lock".into()))
                 .ok();
@@ -1252,36 +1270,49 @@ pub fn tick(app: &AppHandle) {
                     settings.experience_evolution_interval_minutes.max(10) as i64 * 60_000;
                 let training_interval =
                     settings.experience_training_interval_minutes.max(5) as i64 * 60_000;
-                let global_last_schedule_at = projects
-                    .iter()
-                    .map(|(key, _)| {
-                        let project = guard.project(key);
-                        project.last_train_at.max(project.last_attempt_at)
-                    })
+                let global_last_schedule_at = guard
+                    .projects
+                    .values()
+                    .map(|project| project.last_train_at.max(project.last_attempt_at))
                     .max()
                     .unwrap_or(0);
-                let global_training_due = now - global_last_schedule_at >= training_interval;
-                projects.into_iter().find_map(|(key, root)| {
-                    let project = guard.project(&key);
-                    if !project.experiences.is_empty()
-                        && now - project.last_evolution_at >= evolution_interval
-                    {
-                        Some((true, root))
-                    } else if global_training_due
-                        && now - project.last_train_at.max(project.last_attempt_at)
-                            >= training_interval
-                    {
-                        // 训练间隔是全局批次间隔，不是每个项目各自的间隔。项目知识仍独立，
-                        // 到期时每轮只选择一个项目，避免多个项目按各自时钟相隔数分钟连跑。
-                        Some((false, root))
-                    } else {
-                        None
-                    }
-                })
+
+                // 世代演进仍作用于知识所属项目；训练调度则不按项目轮转，而是直接从
+                // 全部来源会话里选最新的未消费会话，再由该会话自然带出项目标签。
+                let evolution = guard.projects.iter().find_map(|(_, project)| {
+                    (!project.experiences.is_empty()
+                        && now - project.last_evolution_at >= evolution_interval)
+                        .then(|| project.project_root.clone())
+                });
+                if evolution.is_some() {
+                    return evolution.map(|root| (true, root, None));
+                }
+                if now - global_last_schedule_at < training_interval {
+                    return None;
+                }
+
+                source_threads
+                    .into_iter()
+                    .filter_map(|thread| {
+                        let (project_key, project_root) = project_identity(&thread.cwd).ok()?;
+                        let project = guard.project(&project_key);
+                        let pending = settings.experience_experts.iter().any(|config| {
+                            project
+                                .expert_processed_threads
+                                .get(&config.id)
+                                .and_then(|seen| seen.get(&thread.id))
+                                .copied()
+                                .unwrap_or(0)
+                                < thread.updated_at
+                        });
+                        pending.then_some((thread.updated_at, project_root, thread.id))
+                    })
+                    .max_by_key(|(updated_at, _, _)| *updated_at)
+                    .map(|(_, root, thread_id)| (false, root, Some(thread_id)))
             })
         }
     };
-    let Some((evolve_due, cwd)) = action else {
+    let Some((evolve_due, cwd, source_thread_id)) = action else {
         return;
     };
     let app = app.clone();
@@ -1289,7 +1320,7 @@ pub fn tick(app: &AppHandle) {
         if evolve_due {
             let _ = evolve_memory(&app, &cwd).await;
         } else {
-            let _ = train(&app, &cwd, false).await;
+            let _ = train_source_thread(&app, &cwd, false, source_thread_id.as_deref()).await;
         }
     });
 }
