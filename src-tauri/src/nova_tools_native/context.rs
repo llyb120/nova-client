@@ -55,11 +55,17 @@ const MAX_DEPS: usize = 8;
 const MAX_DEP_FILES: usize = 4;
 const MAX_IMPACT: usize = 20;
 const MAX_GRAPH_TERMS: usize = 12;
-/// 反向图增量补丁的变更数上限：超过则整图重建（补丁是 O(变更数 × 边数)）。
-const REVERSE_FULL_REBUILD_CHANGES: usize = 64;
-/// 缓存变更数低于该值时跳过磁盘写回，只更新内存 MEMO：整仓缓存的全量序列化
-/// 成本随仓库线性增长，下次冷启动重扫这几个文件更划算。首次建缓存不受此限制。
-const PERSIST_MIN_CHANGED: usize = 16;
+/// 反向 import 图无论变更规模都做增量补丁：大仓库一次 rebase/批量改动不应触发
+/// O(全部 import × resolve_specifier) 的整图重建；补丁只动受影响边（先按 importer
+/// 删旧边，再按新 import 表加边），复杂度与变更文件数成正比。
+///
+/// 磁盘持久化最少间隔：整仓缓存的 bincode 序列化成本随仓库线性增长，异步写盘
+/// 按该间隔合并；间隔内的中间态只保留在内存 MEMO 中，冷启动时按 size+mtime 重扫
+/// 补差即可，不阻塞查询。
+const PERSIST_INTERVAL_MS: u64 = 30_000;
+/// 文件清单（git ls-files）缓存的有效期。大仓库列全仓文件是百毫秒到秒级的固定
+/// 开销，与本次查询的关键词无关；TTL 内复用，过期后台刷新，查询路径不再每次列仓。
+const FILE_LIST_TTL_MS: u64 = 30_000;
 /// 查询发现覆盖代码及承载实现细节的文本资源；资源文件不进入符号索引。
 const CODE_FILE_EXTENSIONS: &[&str] = &[
     "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "vue", "svelte", "rs", "py", "pyi", "go",
@@ -208,6 +214,19 @@ struct UnitCandidate {
 static MEMO: OnceLock<Mutex<HashMap<String, Arc<DiskCache>>>> = OnceLock::new();
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static CO_CHANGE_CACHE: OnceLock<Mutex<HashMap<String, Vec<(String, usize)>>>> = OnceLock::new();
+/// 文件清单按规范化根路径缓存：(清单, 入库时刻, HEAD 指纹)。指纹用 rev-parse HEAD
+/// （非 git 仓库回退 .git 目录 mtime），提交/切换分支会使旧清单失效。
+struct FileListCacheEntry {
+    files: Arc<Vec<String>>,
+    at: Instant,
+    fingerprint: String,
+}
+static FILE_LIST_CACHE: OnceLock<Mutex<HashMap<String, FileListCacheEntry>>> = OnceLock::new();
+/// 防止同一根路径的过期清单被多个并发查询重复后台刷新。
+static FILE_LIST_REFRESHING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// 异步持久化节流：root → 最近一次写盘发起时刻；按 PERSIST_INTERVAL_MS 合并写盘，
+/// 间隔内的中间态只保留在内存 MEMO 中，冷启动按 size+mtime 重扫补差。
+static PERSIST_LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 /// Per-stage wall-clock logging for fast_context. Always on: a slow lookup must be diagnosable
 /// from stderr without rerunning under a special env. Output is a single line per stage.
@@ -324,30 +343,51 @@ pub fn preload_indexes(roots: &[String]) -> usize {
     loaded
 }
 
-fn write_cache(root: &Path, cache: &DiskCache) {
+fn store_cache(root: &Path, cache: Arc<DiskCache>, persist: bool) {
+    if persist {
+        write_cache_async(root, cache.clone());
+    }
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(cache.root.clone(), cache);
+}
+
+/// 异步、按根路径节流与去重的整仓缓存写盘：同一根在写盘进行中只保留一个后台任务，
+/// 期间再次请求写盘直接跳过（新版本已由 MEMO 发布，下次节流窗口过后再收敛）；
+/// 大仓库下查询线程只付出一次 Arc 克隆，序列化与磁盘替换都在后台进行。
+fn write_cache_async(root: &Path, cache: Arc<DiskCache>) {
+    let key = cache.root.clone();
+    {
+        let last = PERSIST_LAST.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = last.lock().unwrap();
+        if let Some(previous) = guard.get(&key) {
+            if previous.elapsed() < Duration::from_millis(PERSIST_INTERVAL_MS) {
+                // 距上次写盘不久：更新 MEMO 即可（store_cache 已做），跳过本次写盘。
+                return;
+            }
+        }
+        guard.insert(key.clone(), Instant::now());
+    }
+    let path = cache_path(root);
+    thread::spawn(move || {
+        write_cache_at(&path, &cache);
+    });
+}
+
+fn write_cache_at(path: &Path, cache: &DiskCache) {
     if let Ok(bytes) = bincode::serialize(cache) {
-        let path = cache_path(root);
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         let temp = path.with_extension(format!("{}.tmp", std::process::id()));
         if fs::write(&temp, bytes).is_ok() {
             if path.exists() {
-                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(path);
             }
-            let _ = fs::rename(&temp, &path);
+            let _ = fs::rename(&temp, path);
         }
     }
-}
-
-fn store_cache(root: &Path, cache: Arc<DiskCache>, persist: bool) {
-    if persist {
-        write_cache(root, &cache);
-    }
-    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .insert(cache.root.clone(), cache);
 }
 
 fn normalize_rel(value: &str) -> String {
@@ -538,7 +578,33 @@ fn walk_code_files(root: &Path) -> Vec<String> {
     files
 }
 
-fn list_code_files(root: &Path) -> Vec<String> {
+/// 仓库 HEAD 指纹：git 仓库用 rev-parse HEAD（提交/切分支即变），非 git 仓库
+/// 回退为根目录元数据 mtime（不可靠但不影响正确性，只是让缓存提前失效）。
+fn repo_head_fingerprint(root: &Path) -> String {
+    let head = {
+        let args = vec!["rev-parse".to_string(), "HEAD".to_string()];
+        run_command(root, "git", &args)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".into())
+    };
+    if head != "unknown" {
+        return head;
+    }
+    fs::metadata(root)
+        .and_then(|meta| meta.modified())
+        .map(|time| {
+            let since = time
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            format!("mtime:{since}")
+        })
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+fn list_code_files_uncached(root: &Path) -> Vec<String> {
     const EXTENSIONS: &[&str] = &[
         "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts",
         "swift", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "cs", "php", "scala", "dart",
@@ -572,6 +638,66 @@ fn list_code_files(root: &Path) -> Vec<String> {
         }
     }
     walk_code_files(root)
+}
+
+/// 带缓存的文件清单：TTL + HEAD 指纹双闸。TTL 内直接复用；过期但 HEAD 未变时先返回
+/// 旧清单并后台刷新，查询路径不再每次为列全仓文件付出百毫秒到秒级的固定开销。
+/// HEAD 变化（提交/切分支）时同步重列，保证索引与检出内容一致。
+fn list_code_files(root: &Path) -> Arc<Vec<String>> {
+    let key = normalize_root(root);
+    let cache = FILE_LIST_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let entry = cache.lock().unwrap().get(&key).map(|entry| FileListCacheEntry {
+        files: entry.files.clone(),
+        at: entry.at,
+        fingerprint: entry.fingerprint.clone(),
+    });
+    if let Some(entry) = entry {
+        if entry.at.elapsed() < Duration::from_millis(FILE_LIST_TTL_MS) {
+            return entry.files;
+        }
+        let current = repo_head_fingerprint(root);
+        if current == entry.fingerprint {
+            // 内容未变但 TTL 已过：后台刷新以发现未提交改动，本次先用旧清单。
+            let refreshing = FILE_LIST_REFRESHING.get_or_init(|| Mutex::new(HashSet::new()));
+            if refreshing.lock().unwrap().insert(key.clone()) {
+                let root = root.to_path_buf();
+                let cache_key = key.clone();
+                thread::spawn(move || {
+                    let files = Arc::new(list_code_files_uncached(&root));
+                    let fingerprint = repo_head_fingerprint(&root);
+                    FILE_LIST_CACHE
+                        .get_or_init(|| Mutex::new(HashMap::new()))
+                        .lock()
+                        .unwrap()
+                        .insert(
+                            cache_key.clone(),
+                            FileListCacheEntry {
+                                files,
+                                at: Instant::now(),
+                                fingerprint,
+                            },
+                        );
+                    FILE_LIST_REFRESHING
+                        .get_or_init(|| Mutex::new(HashSet::new()))
+                        .lock()
+                        .unwrap()
+                        .remove(&cache_key);
+                });
+            }
+            return entry.files;
+        }
+    }
+    let files = Arc::new(list_code_files_uncached(root));
+    let fingerprint = repo_head_fingerprint(root);
+    cache.lock().unwrap().insert(
+        key,
+        FileListCacheEntry {
+            files: files.clone(),
+            at: Instant::now(),
+            fingerprint,
+        },
+    );
+    files
 }
 
 #[cfg(windows)]
@@ -712,7 +838,7 @@ fn search_in_process(
     deadline: Option<Instant>,
 ) -> Vec<SearchRow> {
     let files = if scoped_files.is_empty() {
-        list_code_files(root)
+        (*list_code_files(root)).clone()
     } else {
         scoped_files.to_vec()
     };
@@ -1603,7 +1729,7 @@ fn build_index(
     wanted: Option<&HashSet<String>>,
     dependency_depth: usize,
     known_files: Option<&[String]>,
-) -> (IndexView, Vec<String>, Arc<ReverseMap>) {
+) -> (IndexView, Arc<Vec<String>>, Arc<ReverseMap>) {
     // load_cache temporarily moves this root's cache out of MEMO. Serialize all users of the same
     // workspace so concurrent Lyra sessions and bridge calls cannot observe an empty cache.
     let cache_lock = CACHE_LOCKS
@@ -1615,7 +1741,7 @@ fn build_index(
         .clone();
     let _cache_guard = cache_lock.lock().unwrap();
     let all = known_files
-        .map(<[String]>::to_vec)
+        .map(|files| Arc::new(files.to_vec()))
         .unwrap_or_else(|| list_code_files(root));
     let all_set: HashSet<_> = all.iter().cloned().collect();
     // Shared snapshot. Mutations go into a local `fresh` copy and are published back atomically,
@@ -1710,12 +1836,10 @@ fn build_index(
     } else {
         fresh.files.clone()
     };
-    // 反向图随缓存持久化：无文件变更的调用直接复用，不再每次
-    // O(全部 import × resolve_specifier) 全量重建；有变更时增量补丁（删旧边、
-    // 加新边），变更数超阈值才整图重建。
+    // 反向图随缓存持久化：无文件变更的调用直接复用。有变更时始终增量补丁
+    //（先按 importer 删旧边，再按新 import 表加边），复杂度与变更文件数成正比，
+    // 与仓库规模无关；大仓库一次 rebase/批量改动不再触发整图重建。
     if changed == 0 && fresh.reverse.is_empty() && !fresh.files.is_empty() {
-        fresh.reverse = reverse_from_files(&fresh.files, &all_set);
-    } else if changed >= REVERSE_FULL_REBUILD_CHANGES {
         fresh.reverse = reverse_from_files(&fresh.files, &all_set);
     } else if changed > 0 {
         for file in removed_files.iter().chain(rescanned_files.iter()) {
@@ -1747,18 +1871,16 @@ fn build_index(
         }
     }
     let reverse = Arc::new(fresh.reverse.clone());
-    // 少量变更只更新内存 MEMO，跳过整仓缓存的全量序列化写盘；下次冷启动
-    // 重扫这几个文件即可。首次建缓存（initially_empty）不受此限。
-    let persist = dirty && (changed >= PERSIST_MIN_CHANGED || initially_empty);
-    // Publish the updated cache before releasing the per-root mutation lock. Persistence happens
-    // afterwards, so another request can use the warm in-memory snapshot instead of waiting for a
-    // full bincode serialization and disk replacement.
+    // 少量变更只更新内存 MEMO；整仓缓存的 bincode 全量序列化写盘按
+    // PERSIST_INTERVAL_MS 节流并异步执行，查询线程不再阻塞在磁盘上。首次建缓存
+    // （initially_empty）立即持久化，保证冷启动有基线可用。
+    let persist = dirty && (initially_empty || changed > 0);
+    // Publish the updated cache before releasing the per-root mutation lock. Persistence is
+    // queued to a background thread, so another request can use the warm in-memory snapshot
+    // instead of waiting for a full bincode serialization and disk replacement.
     let updated = Arc::new(fresh);
-    store_cache(root, updated.clone(), false);
+    store_cache(root, updated.clone(), persist);
     drop(_cache_guard);
-    if persist {
-        write_cache(root, &updated);
-    }
     let mut view = IndexView {
         files: selected,
         ..Default::default()
@@ -2310,8 +2432,9 @@ fn search_text_scopes(
     }
     let files = match dirs {
         Some(dirs) if !dirs.is_empty() => list_code_files(root)
-            .into_iter()
+            .iter()
             .filter(|file| dirs.iter().any(|dir| file.starts_with(dir)))
+            .cloned()
             .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
@@ -2792,56 +2915,13 @@ fn co_changed_files(
     );
     let cache = CO_CHANGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let cached = cache.lock().unwrap().get(&cache_key).cloned();
+    // 共改耦合是显式开启的附加信息（coupling: true），调用方期待即时返回；git log
+    // 本身有 CO_CHANGE_DEADLINE_MS 硬上限，未命中缓存时同步计算一次并入库，后续
+    // 相同 HEAD+种子的查询零等待复用。
     let counts = if let Some(cached) = cached {
         cached
     } else {
-        // --full-diff keeps commit selection path-scoped while listing every file changed by each
-        // selected commit, avoiding the former log + giant multi-SHA show pair.
-        const COMMIT_MARK: &str = "@@NOVA_COMMIT@@";
-        let mut args = vec![
-            "log".to_string(),
-            format!("--format={COMMIT_MARK}%H"),
-            "--name-only".to_string(),
-            "--full-diff".to_string(),
-            "--no-renames".to_string(),
-            "--first-parent".to_string(),
-            "--max-count=120".to_string(),
-            format!("--since={history_days}.days.ago"),
-            "--".to_string(),
-        ];
-        args.extend(seeds.iter().cloned());
-        let deadline = Instant::now() + Duration::from_millis(CO_CHANGE_DEADLINE_MS);
-        let Some(bytes) = run_command_until_limited(
-            root,
-            "git",
-            &args,
-            Some(deadline),
-            CO_CHANGE_MAX_OUTPUT_BYTES,
-        ) else {
-            return Vec::new();
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        let seed_set = seeds.iter().collect::<HashSet<_>>();
-        let mut counts = HashMap::<String, usize>::new();
-        for commit in text.split(COMMIT_MARK).skip(1) {
-            let mut lines = commit
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty());
-            let _sha = lines.next();
-            let files = lines.map(normalize_rel).collect::<Vec<_>>();
-            if !files.iter().any(|file| seed_set.contains(file)) {
-                continue;
-            }
-            for file in files {
-                if !seed_set.contains(&file) && is_code_file(&file) {
-                    *counts.entry(file).or_default() += 1;
-                }
-            }
-        }
-        let mut counts = counts.into_iter().collect::<Vec<_>>();
-        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        counts.truncate(CO_CHANGE_CACHE_FILES);
+        let counts = compute_co_changed_counts(root, &seeds, history_days);
         let mut guard = cache.lock().unwrap();
         if guard.len() >= 64 {
             guard.clear();
@@ -2859,6 +2939,62 @@ fn co_changed_files(
         .collect::<Vec<_>>();
     list.truncate(limit);
     list
+}
+
+/// 共改历史统计：--full-diff 保持提交选择按路径限定，同时列出每个入选提交改动的
+/// 全部文件，避免旧的 log + 巨型多 SHA show 配对。带 CO_CHANGE_DEADLINE_MS 硬上限，
+/// 结果写入 CO_CHANGE_CACHE 供相同 HEAD+种子的后续查询零等待复用。
+fn compute_co_changed_counts(
+    root: &Path,
+    seeds: &[String],
+    history_days: u64,
+) -> Vec<(String, usize)> {
+    const COMMIT_MARK: &str = "@@NOVA_COMMIT@@";
+    let mut args = vec![
+        "log".to_string(),
+        format!("--format={COMMIT_MARK}%H"),
+        "--name-only".to_string(),
+        "--full-diff".to_string(),
+        "--no-renames".to_string(),
+        "--first-parent".to_string(),
+        "--max-count=120".to_string(),
+        format!("--since={history_days}.days.ago"),
+        "--".to_string(),
+    ];
+    args.extend(seeds.iter().cloned());
+    let deadline = Instant::now() + Duration::from_millis(CO_CHANGE_DEADLINE_MS);
+    let Some(bytes) = run_command_until_limited(
+        root,
+        "git",
+        &args,
+        Some(deadline),
+        CO_CHANGE_MAX_OUTPUT_BYTES,
+    ) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let seed_set = seeds.iter().collect::<HashSet<_>>();
+    let mut counts = HashMap::<String, usize>::new();
+    for commit in text.split(COMMIT_MARK).skip(1) {
+        let mut lines = commit
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        let _sha = lines.next();
+        let files = lines.map(normalize_rel).collect::<Vec<_>>();
+        if !files.iter().any(|file| seed_set.contains(file)) {
+            continue;
+        }
+        for file in files {
+            if !seed_set.contains(&file) && is_code_file(&file) {
+                *counts.entry(file).or_default() += 1;
+            }
+        }
+    }
+    let mut counts = counts.into_iter().collect::<Vec<_>>();
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts.truncate(CO_CHANGE_CACHE_FILES);
+    counts
 }
 
 /// 伴生测试文件：改实现通常要同步改断言了该实现的测试，但测试文件与任务文本
@@ -2957,7 +3093,7 @@ pub fn find_symbols(root: &Path, params: Value) -> Result<String, String> {
         )
     });
     let wanted: HashSet<_> = rows.iter().map(|r| r.file.clone()).collect();
-    let (index, _, _) = build_index(root, Some(&wanted), 0, Some(&all));
+    let (index, _, _) = build_index(root, Some(&wanted), 0, Some(all.as_slice()));
     let mut out = vec![format!("# 符号定位 @{revision}")];
     for name in names {
         let defs = index.defs.get(&name).cloned().unwrap_or_default();
@@ -3325,7 +3461,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let soft_bytes = hard * 64 / 100;
     let total_start = Instant::now();
     let stage = Instant::now();
-    let (mut all, rows, revision) = std::thread::scope(|scope| {
+    let (all, rows, revision) = std::thread::scope(|scope| {
         let files = scope.spawn(|| list_code_files(root));
         let search = scope.spawn(|| {
             if initial_terms.is_empty() {
@@ -3341,6 +3477,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             revision.join().unwrap_or_else(|_| "unknown".into()),
         )
     });
+    let mut all = (*all).clone();
     trace("fast_context.search_and_files", stage);
     let resolved_anchors = explicit_anchors
         .iter()
@@ -3531,7 +3668,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
     }
     let stage = Instant::now();
-    let (index, _, reverse) = build_index(root, Some(&wanted), 3, Some(&all));
+    let (index, _, reverse) = build_index(root, Some(&wanted), 3, Some(all.as_slice()));
     trace("fast_context.index", stage);
     let stage = Instant::now();
     let mut def_names = index.defs.keys().cloned().collect::<Vec<_>>();
@@ -5886,6 +6023,13 @@ mod tests {
         assert!(first.contains(&"src/a.ts".to_string()));
         assert!(!first.contains(&"ignored.ts".to_string()));
         fs::write(d.path().join("src/new.ts"), "export const fresh = 1;\n").unwrap();
+        // 清单按 TTL 缓存：过期路径会先后台刷新，需触发刷新后再断言新文件可见。
+        let key = normalize_root(d.path());
+        FILE_LIST_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&key);
         assert!(list_code_files(d.path()).contains(&"src/new.ts".to_string()));
     }
 
