@@ -19,7 +19,7 @@ import { readdirSync, readFileSync, existsSync, statSync, realpathSync } from "n
 import { fileURLToPath } from "node:url";
 import { join, relative, isAbsolute } from "node:path";
 import { homedir } from "node:os";
-import { callNapiTool } from "./nova-napi-tools.mjs";
+import { callGlobalContextTool } from "./nova-context-client.mjs";
 
 const SEARCH_CMD = /^\s*(rg|grep|git\s+grep|find|ag|ls|fd)\b/;
 
@@ -179,7 +179,7 @@ async function main() {
       if (!c.rawInput || !t.cwd || !existsSync(t.cwd)) continue;
       budget -= 1;
       try {
-        const out = await callNapiTool("fast_context", t.cwd, c.rawInput);
+        const out = await callGlobalContextTool("fast_context", t.cwd, c.rawInput);
         const outFiles = filesInOutput(out);
         const hit = c.targets.filter((f) => outFiles.has(f)).length;
         rows.push({ task: t.task, cwd: t.cwd, targets: c.targets.length, recorded: c.outLen > 0 ? c.recalled.length : null, current: hit });

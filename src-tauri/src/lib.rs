@@ -13,7 +13,6 @@ mod gitwt;
 mod http_stream;
 mod lyra;
 mod model_cache;
-mod nova_tools_napi_asset;
 mod nova_tools_native;
 mod opencode_sdk;
 mod path_env;
@@ -5245,7 +5244,10 @@ pub fn run() {
                 "[fast-context] shared mmap-loaded {loaded_indexes}/{} workspace indexes",
                 preload_roots.len()
             );
-            let context_service = context_service::ContextService::start(&dir)?;
+            let context_service = context_service::ContextService::start(&dir).unwrap_or_else(|error| {
+                eprintln!("[fast-context] native context service disabled: {error}");
+                context_service::ContextService::disabled()
+            });
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
