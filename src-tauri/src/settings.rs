@@ -55,7 +55,7 @@ impl ContextRetrievalMode {
     }
 }
 
-fn default_experience_training_interval_minutes() -> u32 { 30 }
+fn default_experience_training_interval_minutes() -> u32 { 60 }
 fn default_experience_evolution_interval_minutes() -> u32 { 720 }
 fn default_experience_training_agent() -> String { "lyra".into() }
 fn default_experience_experts() -> Vec<ExperienceExpertConfig> {
