@@ -1042,6 +1042,7 @@ pub async fn train(app: &AppHandle, cwd: &str, force: bool) -> Result<Value, Str
     if TRAINING.swap(true, Ordering::SeqCst) {
         return Err("已有一次经验训练正在进行".into());
     }
+    let mut attempted = false;
     let result = async {
         let (settings, active_configs, threads) = {
             let state = app.state::<AppState>();
@@ -1074,6 +1075,7 @@ pub async fn train(app: &AppHandle, cwd: &str, force: bool) -> Result<Value, Str
             guard.save();
             return Ok(json!({ "trained": false, "reason": "noNewSessions" }));
         }
+        attempted = true;
         {
             let mut guard = store()?.lock().map_err(|_| "经验库锁已损坏".to_string())?;
             guard.project_mut(&project_key, &project_root).last_attempt_at = now_ms();
@@ -1203,7 +1205,18 @@ pub async fn train(app: &AppHandle, cwd: &str, force: bool) -> Result<Value, Str
             "activatedExperts": activated_experts,
             "failedExperts": failures
         }))
-    }.await;
+    }
+    .await;
+    if attempted {
+        // 自动调度的间隔从本轮结束时开始计算。失败或耗时较长的训练也必须进入冷却，
+        // 否则若运行时间已接近间隔，下一次每分钟 tick 会在结束后立即再开一轮。
+        if let Ok(mut guard) = store().and_then(|value| value.lock().map_err(|_| "lock".into())) {
+            guard
+                .project_mut(&project_key, &project_root)
+                .last_attempt_at = now_ms();
+            guard.save();
+        }
+    }
     TRAINING.store(false, Ordering::SeqCst);
     result
 }
