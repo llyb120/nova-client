@@ -1,10 +1,9 @@
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -67,11 +66,8 @@ const CODE_FILE_EXTENSIONS: &[&str] = &[
     "java", "kt", "kts", "cs", "c", "h", "cc", "cpp", "hpp", "swift", "php", "scala", "dart", "m",
     "mm", "zig", "sql", "md",
 ];
-const SEARCH_SNAPSHOT_VERSION: u32 = 2;
-const SEARCH_INDEX_MIN_TOKEN: usize = 2;
 const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILE_LIST_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
-const FAST_REPOSITORY_COMMAND_DEADLINE_MS: u64 = 5_000;
 const CO_CHANGE_DEADLINE_MS: u64 = 750;
 const CO_CHANGE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const CO_CHANGE_DEFAULT_HISTORY_DAYS: u64 = 730;
@@ -123,30 +119,6 @@ struct SearchRow {
     text: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SearchSnapshot {
-    version: u32,
-    root: String,
-    fingerprint: String,
-    postings: HashMap<String, Vec<String>>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SearchDelta {
-    fingerprint: String,
-    files: HashMap<String, Option<Vec<String>>>,
-}
-
-#[derive(Clone)]
-struct SearchIndex {
-    fingerprint: String,
-    postings: Arc<HashMap<String, Vec<String>>>,
-}
-
-enum SearchIndexState {
-    Building,
-    Ready(SearchIndex),
-}
 
 #[derive(Debug, Clone)]
 struct Definition {
@@ -233,35 +205,17 @@ struct UnitCandidate {
     obligation: Option<String>,
 }
 
-static MEMO: OnceLock<Mutex<HashMap<String, DiskCache>>> = OnceLock::new();
+static MEMO: OnceLock<Mutex<HashMap<String, Arc<DiskCache>>>> = OnceLock::new();
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-static SEARCH_INDEXES: OnceLock<Mutex<HashMap<String, SearchIndexState>>> = OnceLock::new();
-static SEARCH_WATCHERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static CO_CHANGE_CACHE: OnceLock<Mutex<HashMap<String, Vec<(String, usize)>>>> = OnceLock::new();
 
-/// No-index request execution is intentionally independent from the persistent codemap cache.
-/// It is an A/B switch while the new one-pass algorithm is proven against the legacy pipeline.
-fn no_index_context_enabled(_params: &Value) -> bool {
-    // SuperContext is temporarily hidden. Keep its implementation available for focused internal
-    // tests, but every public fast_context request (including persisted "super" configuration)
-    // runs the indexed FastContext pipeline.
-    false
-}
-
-const NO_INDEX_DEFAULT_DEADLINE_MS: u64 = 2_500;
-const NO_INDEX_MIN_DEADLINE_MS: u64 = 250;
-const NO_INDEX_MAX_DEADLINE_MS: u64 = 15_000;
-const NO_INDEX_MAX_FORWARD_FILES: usize = 24;
-
-const NO_INDEX_MAX_SUMMARIES: usize = 256;
-
+/// Per-stage wall-clock logging for fast_context. Always on: a slow lookup must be diagnosable
+/// from stderr without rerunning under a special env. Output is a single line per stage.
 fn trace(label: &str, start: Instant) {
-    if std::env::var_os("NOVA_TOOLS_NATIVE_PROFILE").is_some() {
-        eprintln!(
-            "[nova-tools-profile] {label}: {:.2}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-    }
+    eprintln!(
+        "[nova-tools-profile] {label}: {:.2}ms",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
 }
 
 fn normalize_root(root: &Path) -> String {
@@ -319,7 +273,9 @@ fn metadata_stamp(path: &Path) -> Option<(u64, u128)> {
     Some((meta.len(), ns))
 }
 
-fn load_cache(root: &Path) -> DiskCache {
+/// Load the shared cache for `root` without copying it. Mutation happens on a local copy under
+/// the per-root lock and is published back atomically, so readers never deep-copy the large map.
+fn load_cache(root: &Path) -> Arc<DiskCache> {
     let key = normalize_root(root);
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cache) = memo.lock().unwrap().get(&key).cloned() {
@@ -328,12 +284,12 @@ fn load_cache(root: &Path) -> DiskCache {
     // A root opened after startup gets one mmap load on first use instead of silently discarding an
     // existing index and rebuilding it from source. Publish it immediately so concurrent callers
     // share the same warm baseline; the per-root update lock serializes their incremental commits.
-    let cache = mmap_cache(root, &key).unwrap_or_else(|| DiskCache {
+    let cache = Arc::new(mmap_cache(root, &key).unwrap_or_else(|| DiskCache {
         version: CACHE_VERSION,
         root: key.clone(),
         files: HashMap::new(),
         reverse: HashMap::new(),
-    });
+    }));
     memo.lock().unwrap().insert(key, cache.clone());
     cache
 }
@@ -360,9 +316,8 @@ pub fn preload_indexes(roots: &[String]) -> usize {
         if memo.lock().unwrap().contains_key(&key) {
             continue;
         }
-        let cache = mmap_cache(root, &key);
-        if let Some(cache) = cache {
-            memo.lock().unwrap().insert(key, cache);
+        if let Some(cache) = mmap_cache(root, &key) {
+            memo.lock().unwrap().insert(key, Arc::new(cache));
             loaded += 1;
         }
     }
@@ -385,7 +340,7 @@ fn write_cache(root: &Path, cache: &DiskCache) {
     }
 }
 
-fn store_cache(root: &Path, cache: DiskCache, persist: bool) {
+fn store_cache(root: &Path, cache: Arc<DiskCache>, persist: bool) {
     if persist {
         write_cache(root, &cache);
     }
@@ -478,20 +433,24 @@ fn run_command_until(
     args: &[String],
     deadline: Instant,
 ) -> Option<Vec<u8>> {
-    run_command_until_limited(root, program, args, deadline, usize::MAX)
+    run_command_until_limited(root, program, args, Some(deadline), usize::MAX)
 }
 
-/// Run an external search with both a wall-clock and stdout cap. Closing the stdout pipe once the
-/// cap is reached makes producers such as rg/git stop promptly instead of buffering hundreds of
-/// megabytes before the caller can apply its result limit.
+/// Run an external search with an optional wall-clock deadline and a stdout cap. Closing the
+/// stdout pipe once the cap is reached makes producers such as rg/git stop promptly instead of
+/// buffering hundreds of megabytes before the caller can apply its result limit. A `None`
+/// deadline waits for the process to finish (bounded only by the stdout cap).
 fn run_command_until_limited(
     root: &Path,
     program: &str,
     args: &[String],
-    deadline: Instant,
+    deadline: Option<Instant>,
     max_output_bytes: usize,
 ) -> Option<Vec<u8>> {
-    let remaining = deadline.checked_duration_since(Instant::now())?;
+    let remaining = deadline.and_then(|limit| limit.checked_duration_since(Instant::now()));
+    if deadline.is_some() && remaining.is_none() {
+        return None;
+    }
     let mut child = hidden_command(program)
         .args(args)
         .current_dir(root)
@@ -515,7 +474,15 @@ fn run_command_until_limited(
             Some(bytes)
         }
     });
-    let completed = child.wait_timeout(remaining).ok()?.is_some();
+    let completed = match remaining {
+        Some(limit) => child.wait_timeout(limit).ok()?.is_some(),
+        None => {
+            // No deadline: wait for the reader to finish (stdout cap bounds the work) then reap.
+            let bytes = reader.join().ok().flatten();
+            let _ = child.wait();
+            return bytes;
+        }
+    };
     if !completed {
         let _ = child.kill();
         let _ = child.wait();
@@ -590,7 +557,7 @@ fn list_code_files(root: &Path) -> Vec<String> {
         root,
         "git",
         &args,
-        Instant::now() + Duration::from_millis(FAST_REPOSITORY_COMMAND_DEADLINE_MS),
+        None,
         MAX_FILE_LIST_OUTPUT_BYTES,
     ) {
         let mut seen = HashSet::new();
@@ -605,14 +572,6 @@ fn list_code_files(root: &Path) -> Vec<String> {
         }
     }
     walk_code_files(root)
-}
-
-fn search_snapshot_path(root: &Path) -> PathBuf {
-    cache_path(root).with_file_name("search-snapshot-v2.bin")
-}
-
-fn search_wal_path(root: &Path) -> PathBuf {
-    cache_path(root).with_file_name("search-delta-v2.wal")
 }
 
 #[cfg(windows)]
@@ -677,313 +636,6 @@ fn with_mapped_file<T>(path: &Path, consume: impl FnOnce(&[u8]) -> Option<T>) ->
     }
 }
 
-fn search_fingerprint(root: &Path, _files: &[String]) -> String {
-    git_value(root, &["rev-parse", "HEAD"])
-}
-
-fn search_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-' && ch != '.')
-        .filter(|token| token.len() >= SEARCH_INDEX_MIN_TOKEN)
-        .map(str::to_ascii_lowercase)
-}
-
-fn build_search_snapshot(root: &Path) -> Option<SearchSnapshot> {
-    let files = list_code_files(root);
-    if files.is_empty() {
-        return None;
-    }
-    let fingerprint = search_fingerprint(root, &files);
-    let mut postings = HashMap::<String, Vec<String>>::new();
-    for file in &files {
-        let Ok(text) = fs::read_to_string(root.join(file)) else {
-            continue;
-        };
-        let mut seen = HashSet::new();
-        for token in search_tokens(&text) {
-            if seen.insert(token.clone()) {
-                postings.entry(token).or_default().push(file.clone());
-            }
-        }
-    }
-    for files in postings.values_mut() {
-        files.sort();
-        files.dedup();
-    }
-    Some(SearchSnapshot {
-        version: SEARCH_SNAPSHOT_VERSION,
-        root: normalize_root(root),
-        fingerprint,
-        postings,
-    })
-}
-
-fn publish_search_snapshot(root: &Path, snapshot: SearchSnapshot) {
-    let key = snapshot.root.clone();
-    let index = SearchIndex {
-        fingerprint: snapshot.fingerprint.clone(),
-        postings: Arc::new(snapshot.postings.clone()),
-    };
-    let path = search_snapshot_path(root);
-    if let Ok(bytes) = bincode::serialize(&snapshot) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-        if fs::write(&temp, bytes).is_ok() {
-            if path.exists() {
-                let _ = fs::remove_file(&path);
-            }
-            let _ = fs::rename(temp, path);
-        }
-    }
-    let _ = fs::remove_file(search_wal_path(root));
-    SEARCH_INDEXES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .insert(key, SearchIndexState::Ready(index));
-}
-
-fn load_search_snapshot(root: &Path) -> Option<SearchIndex> {
-    let mut snapshot = with_mapped_file(&search_snapshot_path(root), |bytes| {
-        bincode::deserialize::<SearchSnapshot>(bytes).ok()
-    })?;
-    if snapshot.version != SEARCH_SNAPSHOT_VERSION
-        || snapshot.root != normalize_root(root)
-        || snapshot.fingerprint != search_fingerprint(root, &[])
-    {
-        return None;
-    }
-    if let Some(delta) = with_mapped_file(&search_wal_path(root), |bytes| {
-        bincode::deserialize::<SearchDelta>(bytes).ok()
-    }) {
-        for (file, tokens) in delta.files {
-            for files in snapshot.postings.values_mut() {
-                files.retain(|candidate| candidate != &file);
-            }
-            if let Some(tokens) = tokens {
-                for token in tokens {
-                    snapshot
-                        .postings
-                        .entry(token)
-                        .or_default()
-                        .push(file.clone());
-                }
-            }
-        }
-        snapshot.fingerprint = delta.fingerprint;
-    }
-    Some(SearchIndex {
-        fingerprint: snapshot.fingerprint,
-        postings: Arc::new(snapshot.postings),
-    })
-}
-
-/// Return the current immutable index snapshot without ever waiting for construction. A cold or
-/// invalid snapshot starts a background build and immediately falls back to repository search.
-fn ensure_search_watcher(root: &Path) {
-    let key = normalize_root(root);
-    let watchers = SEARCH_WATCHERS.get_or_init(|| Mutex::new(HashSet::new()));
-    if !watchers.lock().unwrap().insert(key.clone()) {
-        return;
-    }
-    let root = root.to_path_buf();
-    let _ = std::thread::Builder::new()
-        .name("nova-context-watcher".into())
-        .spawn(move || {
-            let mut last = String::new();
-            loop {
-                std::thread::sleep(Duration::from_millis(750));
-                let Some(status) = run_command(
-                    &root,
-                    "git",
-                    &[
-                        "status".into(),
-                        "--porcelain".into(),
-                        "-z".into(),
-                        "--untracked-files=all".into(),
-                    ],
-                ) else {
-                    continue;
-                };
-                let digest = format!("{:x}", Sha256::digest(&status));
-                if digest == last {
-                    continue;
-                }
-                last = digest;
-                let ready = SEARCH_INDEXES
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .unwrap()
-                    .get(&key)
-                    .and_then(|state| match state {
-                        SearchIndexState::Ready(index) => Some(index.clone()),
-                        _ => None,
-                    });
-                if let Some(index) = ready {
-                    let _ = refresh_search_delta(&root, index);
-                }
-            }
-        });
-}
-
-fn search_index_now(root: &Path) -> Option<SearchIndex> {
-    ensure_search_watcher(root);
-    let key = normalize_root(root);
-    let indexes = SEARCH_INDEXES.get_or_init(|| Mutex::new(HashMap::new()));
-    {
-        let guard = indexes.lock().unwrap();
-        if let Some(SearchIndexState::Ready(index)) = guard.get(&key) {
-            if index.fingerprint == search_fingerprint(root, &[]) {
-                return Some(index.clone());
-            }
-        }
-        if matches!(guard.get(&key), Some(SearchIndexState::Building)) {
-            return None;
-        }
-    }
-    if let Some(index) = load_search_snapshot(root) {
-        indexes
-            .lock()
-            .unwrap()
-            .insert(key, SearchIndexState::Ready(index.clone()));
-        return Some(index);
-    }
-    indexes
-        .lock()
-        .unwrap()
-        .insert(key.clone(), SearchIndexState::Building);
-    let owned_root = root.to_path_buf();
-    std::thread::Builder::new()
-        .name("nova-context-index".into())
-        .spawn(move || {
-            if let Some(snapshot) = build_search_snapshot(&owned_root) {
-                publish_search_snapshot(&owned_root, snapshot);
-            } else {
-                SEARCH_INDEXES
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .unwrap()
-                    .remove(&key);
-            }
-        })
-        .ok();
-    None
-}
-
-fn refresh_search_delta(root: &Path, index: SearchIndex) -> SearchIndex {
-    let Some(status) = run_command(
-        root,
-        "git",
-        &[
-            "status".into(),
-            "--porcelain".into(),
-            "-z".into(),
-            "--untracked-files=all".into(),
-        ],
-    ) else {
-        return index;
-    };
-    let mut changed = HashMap::<String, Option<Vec<String>>>::new();
-    for record in status.split(|byte| *byte == 0) {
-        let Ok(record) = std::str::from_utf8(record) else {
-            continue;
-        };
-        let file = normalize_rel(record.get(3..).unwrap_or(record));
-        if !is_searchable_implementation_file(&file) {
-            continue;
-        }
-        let tokens = fs::read_to_string(root.join(&file)).ok().map(|text| {
-            let mut values = search_tokens(&text).collect::<Vec<_>>();
-            values.sort();
-            values.dedup();
-            values
-        });
-        changed.insert(file, tokens);
-    }
-    if changed.is_empty() {
-        return index;
-    }
-    let mut postings = (*index.postings).clone();
-    for (file, tokens) in &changed {
-        for files in postings.values_mut() {
-            files.retain(|candidate| candidate != file);
-        }
-        if let Some(tokens) = tokens {
-            for token in tokens {
-                postings
-                    .entry(token.clone())
-                    .or_default()
-                    .push(file.clone());
-            }
-        }
-    }
-    let delta = SearchDelta {
-        fingerprint: index.fingerprint.clone(),
-        files: changed,
-    };
-    if let Ok(bytes) = bincode::serialize(&delta) {
-        let path = search_wal_path(root);
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-        if fs::write(&temp, bytes).is_ok() {
-            let _ = fs::remove_file(&path);
-            let _ = fs::rename(temp, path);
-        }
-    }
-    let updated = SearchIndex {
-        fingerprint: index.fingerprint,
-        postings: Arc::new(postings),
-    };
-    SEARCH_INDEXES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .insert(
-            normalize_root(root),
-            SearchIndexState::Ready(updated.clone()),
-        );
-    updated
-}
-
-fn indexed_candidate_files(root: &Path, terms: &[String]) -> Option<Vec<String>> {
-    // Never run git/status or update work on the query path; the watcher publishes deltas.
-    let index = search_index_now(root)?;
-    let mut candidates = HashSet::<String>::new();
-    let mut usable = false;
-    for term in terms {
-        let tokens = search_tokens(term).collect::<Vec<_>>();
-        if tokens.is_empty() {
-            continue;
-        }
-        usable = true;
-        let mut per_term: Option<HashSet<String>> = None;
-        for token in tokens {
-            let Some(files) = index.postings.get(&token) else {
-                per_term = Some(HashSet::new());
-                break;
-            };
-            let set = files.iter().cloned().collect::<HashSet<_>>();
-            per_term = Some(match per_term {
-                Some(current) => current.intersection(&set).cloned().collect(),
-                None => set,
-            });
-        }
-        candidates.extend(per_term.unwrap_or_default());
-    }
-    // An index miss is not proof of absence (the watcher may not have published a fresh delta yet),
-    // so preserve recall by invoking the existing full repository fallback.
-    if !usable || candidates.is_empty() {
-        return None;
-    }
-    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
-
-    candidates.sort();
-    candidates.dedup();
-    Some(candidates)
-}
 
 fn git_value(root: &Path, args: &[&str]) -> String {
     let args = args
@@ -1213,15 +865,7 @@ fn rg_search(
     } else {
         args.extend(paths.iter().cloned());
     }
-    let stdout = run_command_until_limited(
-        root,
-        "rg",
-        &args,
-        deadline.unwrap_or_else(|| {
-            Instant::now() + Duration::from_millis(FAST_REPOSITORY_COMMAND_DEADLINE_MS)
-        }),
-        MAX_SEARCH_OUTPUT_BYTES,
-    )?;
+    let stdout = run_command_until_limited(root, "rg", &args, deadline, MAX_SEARCH_OUTPUT_BYTES)?;
     Some(parse_search_rows(stdout))
 }
 
@@ -1974,8 +1618,16 @@ fn build_index(
         .map(<[String]>::to_vec)
         .unwrap_or_else(|| list_code_files(root));
     let all_set: HashSet<_> = all.iter().cloned().collect();
-    let mut cache = load_cache(root);
+    // Shared snapshot. Mutations go into a local `fresh` copy and are published back atomically,
+    // so holding the per-root lock never requires deep-copying the shared cache.
+    let cache = load_cache(root);
     let initially_empty = cache.files.is_empty();
+    let mut fresh = DiskCache {
+        version: cache.version,
+        root: cache.root.clone(),
+        files: cache.files.clone(),
+        reverse: cache.reverse.clone(),
+    };
     let mut targets: HashSet<String> = wanted.cloned().unwrap_or_else(|| all_set.clone());
     let mut frontier: Vec<String> = targets.iter().cloned().collect();
     let mut dirty = false;
@@ -1988,14 +1640,14 @@ fn build_index(
         for file in current {
             let path = root.join(&file);
             let Some((size, modified_ns)) = metadata_stamp(&path) else {
-                if cache.files.remove(&file).is_some() {
+                if fresh.files.remove(&file).is_some() {
                     dirty = true;
                     changed += 1;
                     removed_files.push(file.clone());
                 }
                 continue;
             };
-            let stale = cache
+            let stale = fresh
                 .files
                 .get(&file)
                 .map(|e| e.size != size || e.modified_ns != modified_ns)
@@ -2005,14 +1657,14 @@ fn build_index(
                     let mut entry = scan_source(&text, &file);
                     entry.size = size;
                     entry.modified_ns = modified_ns;
-                    cache.files.insert(file.clone(), entry);
+                    fresh.files.insert(file.clone(), entry);
                     dirty = true;
                     changed += 1;
                     rescanned_files.push(file.clone());
                 }
             }
             if depth < dependency_depth {
-                for import in cache
+                for import in fresh
                     .files
                     .get(&file)
                     .map(|e| e.imports.as_slice())
@@ -2028,14 +1680,14 @@ fn build_index(
         }
     }
     if wanted.is_none() {
-        let pruned: Vec<String> = cache
+        let pruned: Vec<String> = fresh
             .files
             .keys()
             .filter(|file| !all_set.contains(*file))
             .cloned()
             .collect();
         for file in &pruned {
-            cache.files.remove(file);
+            fresh.files.remove(file);
         }
         if !pruned.is_empty() {
             dirty = true;
@@ -2049,34 +1701,34 @@ fn build_index(
         targets
             .iter()
             .filter_map(|file| {
-                cache
+                fresh
                     .files
                     .get(file)
                     .map(|entry| (file.clone(), entry.clone()))
             })
             .collect()
     } else {
-        cache.files.clone()
+        fresh.files.clone()
     };
     // 反向图随缓存持久化：无文件变更的调用直接复用，不再每次
     // O(全部 import × resolve_specifier) 全量重建；有变更时增量补丁（删旧边、
     // 加新边），变更数超阈值才整图重建。
-    if changed == 0 && cache.reverse.is_empty() && !cache.files.is_empty() {
-        cache.reverse = reverse_from_files(&cache.files, &all_set);
+    if changed == 0 && fresh.reverse.is_empty() && !fresh.files.is_empty() {
+        fresh.reverse = reverse_from_files(&fresh.files, &all_set);
     } else if changed >= REVERSE_FULL_REBUILD_CHANGES {
-        cache.reverse = reverse_from_files(&cache.files, &all_set);
+        fresh.reverse = reverse_from_files(&fresh.files, &all_set);
     } else if changed > 0 {
         for file in removed_files.iter().chain(rescanned_files.iter()) {
-            for edges in cache.reverse.values_mut() {
+            for edges in fresh.reverse.values_mut() {
                 edges.retain(|edge| edge.importer != *file);
             }
         }
-        cache.reverse.retain(|_, edges| !edges.is_empty());
+        fresh.reverse.retain(|_, edges| !edges.is_empty());
         for file in &rescanned_files {
-            if let Some(entry) = cache.files.get(file) {
+            if let Some(entry) = fresh.files.get(file) {
                 for import in &entry.imports {
                     if let Some(target) = resolve_specifier(&import.from, file, &all_set) {
-                        cache
+                        fresh
                             .reverse
                             .entry(target)
                             .or_default()
@@ -2089,23 +1741,23 @@ fn build_index(
                 }
             }
         }
-        for edges in cache.reverse.values_mut() {
+        for edges in fresh.reverse.values_mut() {
             edges.sort_by(|a, b| a.importer.cmp(&b.importer).then(a.local.cmp(&b.local)));
             edges.dedup_by(|a, b| a.importer == b.importer && a.local == b.local);
         }
     }
-    let reverse = Arc::new(cache.reverse.clone());
+    let reverse = Arc::new(fresh.reverse.clone());
     // 少量变更只更新内存 MEMO，跳过整仓缓存的全量序列化写盘；下次冷启动
     // 重扫这几个文件即可。首次建缓存（initially_empty）不受此限。
     let persist = dirty && (changed >= PERSIST_MIN_CHANGED || initially_empty);
-    let persist_snapshot = persist.then(|| cache.clone());
     // Publish the updated cache before releasing the per-root mutation lock. Persistence happens
     // afterwards, so another request can use the warm in-memory snapshot instead of waiting for a
     // full bincode serialization and disk replacement.
-    store_cache(root, cache, false);
+    let updated = Arc::new(fresh);
+    store_cache(root, updated.clone(), false);
     drop(_cache_guard);
-    if let Some(snapshot) = persist_snapshot.as_ref() {
-        write_cache(root, snapshot);
+    if persist {
+        write_cache(root, &updated);
     }
     let mut view = IndexView {
         files: selected,
@@ -3159,9 +2811,13 @@ fn co_changed_files(
         ];
         args.extend(seeds.iter().cloned());
         let deadline = Instant::now() + Duration::from_millis(CO_CHANGE_DEADLINE_MS);
-        let Some(bytes) =
-            run_command_until_limited(root, "git", &args, deadline, CO_CHANGE_MAX_OUTPUT_BYTES)
-        else {
+        let Some(bytes) = run_command_until_limited(
+            root,
+            "git",
+            &args,
+            Some(deadline),
+            CO_CHANGE_MAX_OUTPUT_BYTES,
+        ) else {
             return Vec::new();
         };
         let text = String::from_utf8_lossy(&bytes);
@@ -3462,1085 +3118,8 @@ fn backfill_block(
     Some(true)
 }
 
-#[derive(Default)]
-struct NoIndexGraph {
-    reverse: HashMap<String, Vec<ReverseImport>>,
-}
-
-#[derive(Default)]
-struct NoIndexStats {
-    scanned_files: usize,
-    scanned_bytes: u64,
-    deadline_hit: bool,
-    index_hit: bool,
-}
-
-fn no_index_safe_file(root: &Path, value: &str) -> Option<String> {
-    let rel = normalize_rel(value.trim());
-    if rel.is_empty()
-        || Path::new(&rel).is_absolute()
-        || Path::new(&rel).components().any(|part| {
-            matches!(
-                part,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-        || !root.join(&rel).is_file()
-    {
-        return None;
-    }
-    Some(rel)
-}
-
-fn no_index_normalize_join(parent: &Path, spec: &str) -> Option<String> {
-    let mut parts = Vec::<String>::new();
-    let joined = parent.join(spec);
-    for part in joined.components() {
-        match part {
-            Component::Normal(value) => parts.push(value.to_string_lossy().to_string()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop()?;
-            }
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    (!parts.is_empty()).then(|| parts.join("/"))
-}
-
-/// Resolve local modules by bounded filesystem probes. Unlike the legacy resolver this never
-/// needs an all-repository path set, so a file-rooted request can stay proportional to its closure.
-fn no_index_resolve_specifier(root: &Path, spec: &str, from: &str) -> Option<String> {
-    const EXTENSIONS: &[&str] = &[
-        "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "vue", "svelte", "rs", "py", "pyi",
-        "go", "java", "kt", "cs", "c", "h", "cc", "cpp", "hpp",
-    ];
-    let probe = |base: String| -> Option<String> {
-        let mut candidates = Vec::with_capacity(1 + EXTENSIONS.len() * 3);
-        candidates.push(base.clone());
-        for ext in EXTENSIONS {
-            candidates.push(format!("{base}.{ext}"));
-        }
-        for leaf in ["index", "mod", "__init__"] {
-            for ext in EXTENSIONS {
-                candidates.push(format!("{base}/{leaf}.{ext}"));
-            }
-        }
-        candidates
-            .into_iter()
-            .find(|candidate| root.join(candidate).is_file())
-    };
-
-    let clean = spec.split(['?', '#']).next().unwrap_or(spec).trim();
-    if clean.starts_with('.') {
-        let parent = Path::new(from).parent().unwrap_or_else(|| Path::new(""));
-        return no_index_normalize_join(parent, clean).and_then(probe);
-    }
-    if !clean.contains("::") {
-        return None;
-    }
-
-    let mut segments = clean
-        .split("::")
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    let from_parts = from.split('/').collect::<Vec<_>>();
-    let src_pos = from_parts.iter().rposition(|part| *part == "src")?;
-    let mut base = if segments.first() == Some(&"crate") {
-        segments.remove(0);
-        from_parts[..=src_pos]
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect::<Vec<_>>()
-    } else if matches!(segments.first(), Some(&"self") | Some(&"super")) {
-        let mut local = from_parts[..from_parts.len().saturating_sub(1)]
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect::<Vec<_>>();
-        while segments.first() == Some(&"super") {
-            segments.remove(0);
-            local.pop();
-        }
-        if segments.first() == Some(&"self") {
-            segments.remove(0);
-        }
-        local
-    } else {
-        from_parts[..=src_pos]
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect::<Vec<_>>()
-    };
-    if segments.is_empty() {
-        return None;
-    }
-    base.extend(
-        segments
-            .iter()
-            .take(segments.len().saturating_sub(1))
-            .map(|value| (*value).to_string()),
-    );
-    probe(base.join("/")).or_else(|| {
-        let mut full = from_parts[..=src_pos]
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect::<Vec<_>>();
-        full.extend(segments.iter().map(|value| (*value).to_string()));
-        probe(full.join("/"))
-    })
-}
-
-fn no_index_add_imports(
-    root: &Path,
-    graph: &mut NoIndexGraph,
-    importer: &str,
-    imports: &[ImportRef],
-) -> Vec<String> {
-    let mut targets = Vec::new();
-    for import in imports {
-        let Some(target) = no_index_resolve_specifier(root, &import.from, importer) else {
-            continue;
-        };
-        if !targets.contains(&target) {
-            targets.push(target.clone());
-        }
-        graph
-            .reverse
-            .entry(target)
-            .or_default()
-            .push(ReverseImport {
-                importer: importer.to_string(),
-                local: import.name.clone(),
-                orig: import.orig.clone(),
-            });
-    }
-    targets
-}
-
-fn no_index_read_source(root: &Path, file: &str) -> Option<(Source, Vec<ImportRef>, u64)> {
-    let path = root.join(file);
-    let metadata = fs::metadata(&path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_INDEX_FILE_BYTES {
-        return None;
-    }
-    let text = fs::read_to_string(path).ok()?;
-    let entry = scan_source(&text, file);
-    let mut lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
-    if lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-    Some((
-        Source {
-            lines,
-            syms: entry.syms,
-        },
-        entry.imports,
-        metadata.len(),
-    ))
-}
-
-fn no_index_rows(file: &str, lines: &[String], matcher: Option<&AhoCorasick>) -> Vec<SearchRow> {
-    let Some(matcher) = matcher else {
-        return Vec::new();
-    };
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| matcher.is_match(line.as_bytes()))
-        .take(MAX_HITS_PER_FILE)
-        .map(|(index, line)| SearchRow {
-            file: file.to_string(),
-            ln: index + 1,
-            text: line.clone(),
-        })
-        .collect()
-}
-
-fn no_index_matcher(terms: &[String]) -> Option<AhoCorasick> {
-    if terms.is_empty() {
-        return None;
-    }
-    AhoCorasickBuilder::new()
-        .ascii_case_insensitive(true)
-        .match_kind(MatchKind::LeftmostFirst)
-        .build(terms)
-        .ok()
-}
-
-fn no_index_request_terms(params: &Value) -> (Vec<String>, Vec<String>, String) {
-    let mut keyword_seen = HashSet::new();
-    let keywords = params
-        .get("keywords")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && keyword_seen.insert(value.to_lowercase()))
-        .take(5)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let task = params
-        .get("task")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(300)
-        .collect::<String>();
-    let mut terms = Vec::new();
-    for keyword in &keywords {
-        let words = phrase_words(keyword);
-        let variants = if words.is_empty() {
-            naming_variants(keyword)
-        } else {
-            words
-                .into_iter()
-                .flat_map(|word| naming_variants(&word))
-                .collect()
-        };
-        for variant in variants {
-            if variant.len() >= 2
-                && !terms
-                    .iter()
-                    .any(|existing: &String| existing.eq_ignore_ascii_case(&variant))
-            {
-                terms.push(variant);
-            }
-        }
-    }
-    if terms.is_empty() {
-        for term in task_tokens(&task).into_iter().take(8) {
-            if term.len() >= 3 && !stop_word(&term.to_lowercase()) {
-                terms.push(term);
-            }
-        }
-    }
-    terms.truncate(24);
-    (keywords, terms, task)
-}
-
-fn no_index_expand_forward(
-    root: &Path,
-    roots: &[String],
-    matcher: Option<&AhoCorasick>,
-    deadline: Instant,
-    sources: &mut HashMap<String, Source>,
-    rows: &mut HashMap<String, Vec<SearchRow>>,
-    graph: &mut NoIndexGraph,
-    dependencies: &mut HashSet<String>,
-    stats: &mut NoIndexStats,
-) {
-    let mut queue = roots
-        .iter()
-        .cloned()
-        .map(|file| (file, 0usize))
-        .collect::<VecDeque<_>>();
-    let mut visited = HashSet::new();
-    while let Some((file, depth)) = queue.pop_front() {
-        if Instant::now() >= deadline || visited.len() >= NO_INDEX_MAX_FORWARD_FILES {
-            stats.deadline_hit |= Instant::now() >= deadline;
-            break;
-        }
-        if !visited.insert(file.clone()) {
-            continue;
-        }
-        let (source, imports, bytes) = if let Some(source) = sources.get(&file).cloned() {
-            let text = source.lines.join("\n");
-            (source, extract_imports(&text, &file), text.len() as u64)
-        } else {
-            let Some(loaded) = no_index_read_source(root, &file) else {
-                continue;
-            };
-            loaded
-        };
-        stats.scanned_files += 1;
-        stats.scanned_bytes += bytes;
-        rows.entry(file.clone())
-            .or_insert_with(|| no_index_rows(&file, &source.lines, matcher));
-        let targets = no_index_add_imports(root, graph, &file, &imports);
-        sources.insert(file.clone(), source);
-        if depth >= 2 {
-            continue;
-        }
-        for target in targets {
-            if !roots.contains(&target) {
-                dependencies.insert(target.clone());
-            }
-            if !visited.contains(&target) {
-                queue.push_back((target, depth + 1));
-            }
-        }
-    }
-}
-
-/// Query-driven discovery: use native repository search to find the small set of files that
-/// contain an anchor, then parse only those files. Nothing is persisted and cost follows the
-/// result set rather than repository size.
-fn no_index_query_discover(
-    root: &Path,
-    terms: &[String],
-    deadline: Instant,
-    sources: &mut HashMap<String, Source>,
-    rows: &mut HashMap<String, Vec<SearchRow>>,
-    graph: &mut NoIndexGraph,
-    stats: &mut NoIndexStats,
-) {
-    if terms.is_empty() || Instant::now() >= deadline {
-        return;
-    }
-    // Markdown/SQL contribute lexical implementation evidence without entering the symbol/import graph.
-    // A ready immutable snapshot narrows native search to matching files. Cold, corrupt or
-    // zero-hit snapshots preserve the existing repository-wide fallback exactly.
-    let indexed_files = indexed_candidate_files(root, terms);
-    stats.index_hit |= indexed_files.is_some();
-    let found = if let Some(files) = indexed_files.as_ref() {
-        if Instant::now() >= deadline {
-            stats.deadline_hit = true;
-            return;
-        }
-        // The snapshot already performed repository-wide candidate discovery. Reading the
-        // narrowed set in-process avoids another process and directory walk while honoring the
-        // query deadline inherited from the current branch.
-        let found = search_in_process(root, terms, true, false, files, Some(deadline));
-        if Instant::now() >= deadline {
-            stats.deadline_hit = true;
-            return;
-        }
-        found
-    } else {
-        match rg_search(root, terms, true, false, &[], true, Some(deadline)) {
-            Some(found) => found,
-            None if Instant::now() >= deadline => {
-                stats.deadline_hit = true;
-                return;
-            }
-            None => search_text(root, terms, true, false, &[]),
-        }
-    };
-    let mut by_file = HashMap::<String, Vec<SearchRow>>::new();
-    for row in found
-        .into_iter()
-        .filter(|row| is_searchable_implementation_file(&row.file))
-    {
-        by_file.entry(row.file.clone()).or_default().push(row);
-    }
-    let exact_terms = terms
-        .iter()
-        .map(|term| term.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    let mut ranked = by_file.into_iter().collect::<Vec<_>>();
-    ranked.sort_by(|a, b| {
-        let score = |file: &str, hits: &[SearchRow]| {
-            let mut covered = HashSet::new();
-            let mut value = score_path(file) - i64::from(noise_path(file)) * 80;
-            for hit in hits.iter().take(30) {
-                let line = hit.text.to_ascii_lowercase();
-                for term in &exact_terms {
-                    if line.contains(term) {
-                        covered.insert(term);
-                    }
-                }
-                let declaration = [
-                    "fn ",
-                    "function ",
-                    "struct ",
-                    "enum ",
-                    "class ",
-                    "interface ",
-                    "type ",
-                    "const ",
-                    "static ",
-                    "def ",
-                    "impl ",
-                ]
-                .iter()
-                .any(|prefix| {
-                    exact_terms
-                        .iter()
-                        .any(|term| line.contains(&format!("{prefix}{term}")))
-                });
-                value += if declaration { 10_000 } else { 8 };
-            }
-            value + covered.len() as i64 * 120
-        };
-        score(&b.0, &b.1)
-            .cmp(&score(&a.0, &a.1))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    // Keep cheap line-level evidence for every result. Only the high-confidence head is parsed;
-    // the tail remains available as a compact candidate map.
-    for (file, hit_rows) in &ranked {
-        rows.entry(file.clone())
-            .or_insert_with(|| hit_rows.iter().take(MAX_HITS_PER_FILE).cloned().collect());
-    }
-    for (rank, (file, _hit_rows)) in ranked.into_iter().take(NO_INDEX_MAX_SUMMARIES).enumerate() {
-        // Native search may consume most of a cold deadline. Always parse a high-confidence head;
-        // only optional tail candidates obey the deadline.
-        if rank >= 12 && Instant::now() >= deadline {
-            stats.deadline_hit = true;
-            break;
-        }
-        if sources.contains_key(&file) {
-            continue;
-        }
-        let Some((source, imports, bytes)) = no_index_read_source(root, &file) else {
-            continue;
-        };
-        stats.scanned_files += 1;
-        stats.scanned_bytes += bytes;
-        // rows already contains this file's bounded search evidence.
-        no_index_add_imports(root, graph, &file, &imports);
-        sources.insert(file, source);
-    }
-}
-
-fn no_index_target_files(
-    roots: &[String],
-    keywords: &[String],
-    sources: &HashMap<String, Source>,
-    rows: &HashMap<String, Vec<SearchRow>>,
-) -> Vec<String> {
-    if !roots.is_empty() {
-        return roots.to_vec();
-    }
-    let lowered = keywords
-        .iter()
-        .flat_map(|keyword| naming_variants(keyword))
-        .map(|value| value.to_lowercase())
-        .collect::<HashSet<_>>();
-    let mut scored = sources
-        .iter()
-        .filter(|(file, _)| !anchor_noise_path(file))
-        .map(|(file, source)| {
-            let exact_def = source.syms.iter().any(|symbol| {
-                let name = symbol.name.to_lowercase();
-                lowered.contains(&name)
-            });
-            let loose_def = source.syms.iter().any(|symbol| {
-                let name = symbol.name.to_lowercase();
-                lowered
-                    .iter()
-                    .any(|term| term.len() >= 4 && name.contains(term))
-            });
-            // A direct SQL hit is an implementation root; do not let a same-named code
-            // definition suppress it during best-tier filtering.
-            let resource_hit =
-                !is_code_file(file) && rows.get(file).is_some_and(|hits| !hits.is_empty());
-            let tier = if exact_def || resource_hit {
-                2
-            } else if loose_def {
-                1
-            } else {
-                0
-            };
-            let score = usize::from(exact_def) * 1_000
-                + usize::from(resource_hit) * 900
-                + usize::from(loose_def) * 300
-                + rows.get(file).map(Vec::len).unwrap_or(0).min(20) * 5
-                + score_path(file).max(0) as usize;
-            (file.clone(), tier, score)
-        })
-        .filter(|(_, _, score)| *score > 0)
-        .collect::<Vec<_>>();
-    // Once a real definition exists, textual references/imports must not become co-equal roots:
-    // doing so removes them from the backward slice and hides their IMPACT relationship.
-    let best_tier = scored.iter().map(|(_, tier, _)| *tier).max().unwrap_or(0);
-    if best_tier > 0 {
-        scored.retain(|(_, tier, _)| *tier == best_tier);
-    }
-    scored.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-    scored
-        .into_iter()
-        .take(4)
-        .map(|(file, _, _)| file)
-        .collect()
-}
-
-fn no_index_backward_slice(
-    graph: &NoIndexGraph,
-    targets: &[String],
-    max_depth: usize,
-    max_files: usize,
-) -> (Vec<String>, HashMap<String, HashSet<String>>) {
-    let mut queue = targets
-        .iter()
-        .cloned()
-        .map(|file| (file, 0usize))
-        .collect::<VecDeque<_>>();
-    let target_set = targets.iter().cloned().collect::<HashSet<_>>();
-    let mut seen = target_set.clone();
-    let mut callers = Vec::new();
-    let mut locals = HashMap::<String, HashSet<String>>::new();
-    while let Some((target, depth)) = queue.pop_front() {
-        if depth >= max_depth || callers.len() >= max_files {
-            continue;
-        }
-        for edge in graph.reverse.get(&target).into_iter().flatten() {
-            locals
-                .entry(edge.importer.clone())
-                .or_default()
-                .insert(edge.local.clone());
-            if seen.insert(edge.importer.clone()) {
-                if !target_set.contains(&edge.importer) {
-                    callers.push(edge.importer.clone());
-                }
-                queue.push_back((edge.importer.clone(), depth + 1));
-            }
-        }
-    }
-    callers.truncate(max_files);
-    (callers, locals)
-}
-
-fn no_index_symbol_matches(symbol: &Symbol, keywords: &[String]) -> bool {
-    let name = symbol.name.to_lowercase();
-    keywords.iter().any(|keyword| {
-        naming_variants(keyword)
-            .into_iter()
-            .map(|variant| variant.to_lowercase())
-            .any(|variant| name == variant || (variant.len() >= 4 && name.contains(&variant)))
-    })
-}
-
-fn no_index_file_chunk(
-    file: &str,
-    source: &Source,
-    hit_rows: &[SearchRow],
-    keywords: &[String],
-    role: &str,
-    explicit: bool,
-    line_budget: usize,
-) -> (String, Vec<(usize, usize)>, usize) {
-    if source.lines.is_empty() || line_budget == 0 {
-        return (String::new(), Vec::new(), 0);
-    }
-    if source.lines.len() <= FULL_FILE_MAX || (explicit && source.lines.len() <= EXPLICIT_FULL_MAX)
-    {
-        let body = source
-            .lines
-            .iter()
-            .map(|line| clip(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return (
-            format!(
-                "### {file} ({}L) FULL [{role}]\n{body}\n",
-                source.lines.len()
-            ),
-            vec![(1, source.lines.len())],
-            source.lines.len(),
-        );
-    }
-    let mut symbols = source
-        .syms
-        .iter()
-        .filter(|symbol| {
-            no_index_symbol_matches(symbol, keywords)
-                || hit_rows
-                    .iter()
-                    .any(|row| row.ln >= symbol.ln && row.ln <= symbol.end)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if symbols.is_empty() && explicit {
-        symbols.extend(
-            source
-                .syms
-                .iter()
-                .filter(|symbol| {
-                    symbol.depth == 0 && !(symbol.kind == "const" && symbol.end == symbol.ln)
-                })
-                .take(3)
-                .cloned(),
-        );
-    }
-    // Large files often contain many textual matches. Source order made the first four units
-    // crowd out the requested definition, especially for generic names such as context/index.
-    symbols.sort_by(|a, b| {
-        let rank = |symbol: &Symbol| {
-            let exact_anchor = keywords.iter().any(|keyword| {
-                naming_variants(keyword)
-                    .into_iter()
-                    .any(|variant| symbol.name.eq_ignore_ascii_case(&variant))
-            });
-            let loose_anchor = no_index_symbol_matches(symbol, keywords);
-            let hits = hit_rows
-                .iter()
-                .filter(|row| row.ln >= symbol.ln && row.ln <= symbol.end)
-                .count()
-                .min(20);
-            usize::from(exact_anchor) * 10_000
-                + usize::from(loose_anchor) * 1_000
-                + hits * 20
-                + usize::from(symbol.depth == 0) * 5
-        };
-        rank(b)
-            .cmp(&rank(a))
-            .then_with(|| a.ln.cmp(&b.ln))
-            .then_with(|| a.end.cmp(&b.end))
-    });
-    symbols.dedup_by(|a, b| a.ln == b.ln && a.end == b.end);
-    let mut out = vec![format!("### {file} ({}L) [{role}]", source.lines.len())];
-    let mut ranges = Vec::new();
-    let mut used = 0usize;
-    for symbol in symbols.into_iter().take(MAX_UNITS_PER_FILE) {
-        let cost = symbol.end.saturating_sub(symbol.ln) + 1;
-        if used + cost > line_budget && !ranges.is_empty() {
-            continue;
-        }
-        out.push(format!(
-            "@@ {}-{} {} {} [{}]",
-            symbol.ln, symbol.end, symbol.kind, symbol.name, role
-        ));
-        out.extend(
-            source.lines[symbol.ln - 1..symbol.end]
-                .iter()
-                .map(|line| clip(line)),
-        );
-        ranges.push((symbol.ln, symbol.end));
-        used += cost;
-    }
-    if ranges.is_empty() {
-        if let Some(hit) = hit_rows.first() {
-            let start = hit.ln.saturating_sub(6).max(1);
-            let end = (hit.ln + 6).min(source.lines.len());
-            if end - start + 1 <= line_budget {
-                out.push(format!("@@ {start}-{end} match [{role}]"));
-                out.extend(source.lines[start - 1..end].iter().map(|line| clip(line)));
-                ranges.push((start, end));
-                used += end - start + 1;
-            }
-        }
-    }
-    if ranges.is_empty() {
-        return (String::new(), Vec::new(), 0);
-    }
-    (format!("{}\n", out.join("\n")), ranges, used)
-}
-
-fn no_index_append(out: &mut String, value: &str, hard: usize) -> bool {
-    if value.is_empty() || out.len().saturating_add(value.len()) > hard {
-        return false;
-    }
-    out.push_str(value);
-    true
-}
-
-/// Index-free target-driven program slicing. File-rooted requests only read their forward closure;
-/// repository impact requests perform one cancellable sweep and build a request-local reverse graph.
-fn fast_context_no_index(root: &Path, params: &Value) -> Result<String, String> {
-    let total_start = Instant::now();
-    let (keywords, terms, task) = no_index_request_terms(params);
-    let plan = retrieval_plan(&task);
-    let matcher = no_index_matcher(&terms);
-    let mut file_seen = HashSet::new();
-    let roots = params
-        .get("files")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter_map(|value| no_index_safe_file(root, value))
-        .filter(|value| file_seen.insert(value.clone()))
-        .take(6)
-        .collect::<Vec<_>>();
-    if roots.is_empty() && terms.is_empty() {
-        return Ok("错误: 需要 keywords / task / files 至少其一".into());
-    }
-    let budget = params
-        .get("budget")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_BUDGET as u64) as usize;
-    let budget = budget.clamp(MIN_BUDGET, MAX_BUDGET);
-    let hard = params
-        .get("maxBytes")
-        .or_else(|| params.get("maxChars"))
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_HARD_BYTES as u64) as usize;
-    let hard = hard.clamp(MIN_HARD_BYTES, MAX_HARD_BYTES);
-    let deadline_ms = params
-        .get("deadlineMs")
-        .and_then(Value::as_u64)
-        .unwrap_or(NO_INDEX_DEFAULT_DEADLINE_MS)
-        .clamp(NO_INDEX_MIN_DEADLINE_MS, NO_INDEX_MAX_DEADLINE_MS);
-    let deadline = total_start + Duration::from_millis(deadline_ms);
-
-    let mut sources = HashMap::<String, Source>::new();
-    let mut rows = HashMap::<String, Vec<SearchRow>>::new();
-    let mut graph = NoIndexGraph::default();
-    let mut dependencies = HashSet::new();
-    let mut stats = NoIndexStats::default();
-    no_index_expand_forward(
-        root,
-        &roots,
-        matcher.as_ref(),
-        deadline,
-        &mut sources,
-        &mut rows,
-        &mut graph,
-        &mut dependencies,
-        &mut stats,
-    );
-
-    let local_has_hits = rows.values().any(|hits| !hits.is_empty());
-    let need_sweep = roots.is_empty()
-        || plan.callers
-        || plan.tests
-        || plan.errors
-        || plan.config
-        || plan.state
-        || (!terms.is_empty() && !local_has_hits);
-    if need_sweep && Instant::now() < deadline {
-        no_index_query_discover(
-            root,
-            &terms,
-            deadline,
-            &mut sources,
-            &mut rows,
-            &mut graph,
-            &mut stats,
-        );
-    }
-
-    let mut targets = no_index_target_files(&roots, &keywords, &sources, &rows);
-    if targets.is_empty() && roots.is_empty() {
-        return Ok(format!(
-            "# CTX MISS @{}\nquery: {}\nstatus: no production definition or reference\nevidence: index-free one-pass scan checked {} source files / {} bytes{}\nnext: provide a known entry file via files or a more exact symbol",
-            short_rev(root),
-            if keywords.is_empty() { terms.join(",") } else { keywords.join(",") },
-            stats.scanned_files,
-            stats.scanned_bytes,
-            if stats.deadline_hit { " before deadline" } else { "" }
-        ));
-    }
-
-    // Keyword discovery learns its roots during the sweep; now resolve their forward closure by
-    // direct probes. Files already seen by the sweep are only reread if selected into the slice.
-    if roots.is_empty() && !targets.is_empty() && Instant::now() < deadline {
-        no_index_expand_forward(
-            root,
-            &targets,
-            matcher.as_ref(),
-            deadline,
-            &mut sources,
-            &mut rows,
-            &mut graph,
-            &mut dependencies,
-            &mut stats,
-        );
-    }
-    targets.sort();
-    targets.dedup();
-
-    // Follow renamed exports/imports on demand. Each round searches only aliases observed on the
-    // current backward frontier, recovering barrel chains without parsing unrelated files.
-    let mut searched_terms = terms
-        .iter()
-        .map(|term| term.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    for _ in 0..2 {
-        if !need_sweep || Instant::now() >= deadline {
-            break;
-        }
-        let (_, locals) = no_index_backward_slice(&graph, &targets, 2, 40);
-        let aliases = locals
-            .values()
-            .flatten()
-            .filter(|name| name.len() >= 2 && searched_terms.insert(name.to_ascii_lowercase()))
-            .take(24)
-            .cloned()
-            .collect::<Vec<_>>();
-        if aliases.is_empty() {
-            break;
-        }
-        let before = sources.len();
-        no_index_query_discover(
-            root,
-            &aliases,
-            deadline,
-            &mut sources,
-            &mut rows,
-            &mut graph,
-            &mut stats,
-        );
-        if sources.len() == before {
-            break;
-        }
-    }
-
-    let (mut callers, caller_locals) = if need_sweep {
-        no_index_backward_slice(&graph, &targets, 2, 20)
-    } else {
-        (Vec::new(), HashMap::new())
-    };
-    callers.sort_by(|a, b| {
-        let a_test = noise_path(a);
-        let b_test = noise_path(b);
-        if plan.tests {
-            b_test.cmp(&a_test).then_with(|| a.cmp(b))
-        } else {
-            a_test.cmp(&b_test).then_with(|| a.cmp(b))
-        }
-    });
-    callers.truncate(12);
-    for caller in &callers {
-        if Instant::now() >= deadline {
-            break;
-        }
-        if !sources.contains_key(caller) {
-            if let Some((source, _, bytes)) = no_index_read_source(root, caller) {
-                stats.scanned_bytes += bytes;
-                sources.insert(caller.clone(), source);
-            }
-        }
-        let Some(source) = sources.get(caller) else {
-            continue;
-        };
-        let locals = caller_locals.get(caller).cloned().unwrap_or_default();
-        let caller_rows = source
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| locals.iter().any(|local| contains_ascii_word(line, local)))
-            .take(MAX_HITS_PER_FILE)
-            .map(|(index, line)| SearchRow {
-                file: caller.clone(),
-                ln: index + 1,
-                text: line.clone(),
-            })
-            .collect::<Vec<_>>();
-        // Merge graph-derived aliases with lexical rows so renamed and barrel call sites can
-        // select their containing complete unit even when the caller was retained by the sweep.
-        let entry = rows.entry(caller.clone()).or_default();
-        entry.extend(caller_rows);
-        entry.sort_by_key(|row| row.ln);
-        entry.dedup_by(|a, b| a.ln == b.ln);
-        entry.truncate(MAX_HITS_PER_FILE);
-    }
-
-    let revision = short_rev(root);
-    let coverage = if stats.deadline_hit {
-        "deadline-partial"
-    } else if need_sweep {
-        "query-driven"
-    } else if dependencies.is_empty() {
-        "entry"
-    } else {
-        "forward-closure"
-    };
-    let mut out = format!(
-        "# CTX q={} task=\"{}\" @{}  algorithm=no-index-query-slice coverage={} source={}\n# scan: {} candidate files / {} bytes / {:.1}ms{}\n",
-        if keywords.is_empty() { terms.join(",") } else { keywords.join(",") },
-        task,
-        revision,
-        coverage,
-        if stats.index_hit { "memory-index" } else { "repository-search" },
-        stats.scanned_files,
-        stats.scanned_bytes,
-        total_start.elapsed().as_secs_f64() * 1000.0,
-        if stats.deadline_hit { " deadline reached" } else { "" }
-    );
-    // Preserve broad recall without parsing broad results: emit a bounded, stratified path map.
-    // This costs only search-result bytes and exposes secondary implementation/test surfaces even
-    // when the source-expansion deadline has expired.
-    let mut candidate_paths = rows
-        .iter()
-        .filter(|(file, hits)| !hits.is_empty() && !targets.contains(file))
-        .map(|(file, hits)| (file.clone(), hits.len(), noise_path(file), score_path(file)))
-        .collect::<Vec<_>>();
-    candidate_paths.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| b.3.cmp(&a.3))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    let mut picked = Vec::new();
-    for want_test in [false, true] {
-        let cap = if want_test { 8 } else { 24 };
-        for (file, hits, is_test, _) in candidate_paths.iter().filter(|row| row.2 == want_test) {
-            if picked
-                .iter()
-                .filter(|(_, picked_test, _)| *picked_test == want_test)
-                .count()
-                >= cap
-            {
-                break;
-            }
-            picked.push((file.clone(), *is_test, *hits));
-        }
-    }
-    if !picked.is_empty() {
-        let candidate_note = format!(
-            "# CANDIDATES (检索命中，未必展开)\n{}\n",
-            picked
-                .into_iter()
-                .map(|(file, is_test, hits)| format!(
-                    "{file} ({hits} hits{})",
-                    if is_test { ", test" } else { "" }
-                ))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        no_index_append(&mut out, &candidate_note, hard);
-    }
-    out.push_str("# EDIT\n");
-    let target_set = targets.iter().cloned().collect::<HashSet<_>>();
-    let caller_set = callers.iter().cloned().collect::<HashSet<_>>();
-    let mut ordered = Vec::<String>::new();
-    for file in roots.iter().chain(targets.iter()) {
-        if !ordered.contains(file) {
-            ordered.push(file.clone());
-        }
-    }
-    let mut dep_order = dependencies.iter().cloned().collect::<Vec<_>>();
-    dep_order.sort();
-    for file in dep_order.iter().chain(callers.iter()) {
-        if !ordered.contains(file) {
-            ordered.push(file.clone());
-        }
-    }
-    // No explicit root: retain a few high-confidence text candidates after targets/callers.
-    if roots.is_empty() {
-        let mut related = rows
-            .iter()
-            .filter(|(file, hits)| !hits.is_empty() && !ordered.contains(file))
-            .map(|(file, hits)| (file.clone(), hits.len()))
-            .collect::<Vec<_>>();
-        related.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        for (file, _) in related.into_iter().take(4) {
-            ordered.push(file);
-        }
-    }
-
-    let mut used_lines = 0usize;
-    let mut displayed = HashMap::<String, Vec<(usize, usize)>>::new();
-    let mut section = "edit";
-    for file in ordered {
-        let Some(source) = sources.get(&file) else {
-            continue;
-        };
-        let next_section = if dependencies.contains(&file) && !target_set.contains(&file) {
-            "dep"
-        } else {
-            "edit"
-        };
-        if next_section != section {
-            if next_section == "dep" {
-                no_index_append(&mut out, "\n# DEPS\n", hard);
-            } else {
-                no_index_append(&mut out, "\n# EDIT (continued)\n", hard);
-            }
-            section = next_section;
-        }
-        let role = if target_set.contains(&file) {
-            "target"
-        } else if dependencies.contains(&file) {
-            "dependency"
-        } else if noise_path(&file) {
-            "test"
-        } else if caller_set.contains(&file) {
-            "caller"
-        } else {
-            "related"
-        };
-        let remaining = budget.saturating_sub(used_lines);
-        let (chunk, ranges, lines) = no_index_file_chunk(
-            &file,
-            source,
-            rows.get(&file).map(Vec::as_slice).unwrap_or(&[]),
-            &keywords,
-            role,
-            roots.contains(&file),
-            remaining,
-        );
-        if no_index_append(&mut out, &chunk, hard) {
-            used_lines += lines;
-            displayed.insert(file, ranges);
-        }
-    }
-
-    let mut impact = Vec::new();
-    for caller in &callers {
-        let shown = displayed.get(caller);
-        for row in rows.get(caller).into_iter().flatten() {
-            if shown.is_some_and(|ranges| {
-                ranges
-                    .iter()
-                    .any(|(start, end)| row.ln >= *start && row.ln <= *end)
-            }) || (row.text.contains("import") || row.text.contains("use "))
-            {
-                continue;
-            }
-            impact.push(format!(
-                "{}:{} {} [one-pass graph]",
-                caller,
-                row.ln,
-                js_utf16_slice(row.text.trim(), 120)
-            ));
-        }
-    }
-    impact.sort();
-    impact.dedup();
-    if !impact.is_empty() {
-        let mut chunk = format!(
-            "\n## IMPACT (调用方/引用清单 {}/{})\n",
-            impact.len().min(MAX_IMPACT),
-            impact.len()
-        );
-        chunk.push_str(
-            &impact
-                .into_iter()
-                .take(MAX_IMPACT)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        chunk.push('\n');
-        no_index_append(&mut out, &chunk, hard);
-    }
-
-    if params
-        .get("coupling")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && !targets.is_empty()
-    {
-        let exclude = displayed.keys().cloned().collect::<HashSet<_>>();
-        let coupling = co_changed_files(root, &targets, &exclude, 3, false);
-        if !coupling.is_empty() {
-            let note = format!(
-                "\n## 共改耦合(git)\n{}\n",
-                coupling
-                    .into_iter()
-                    .map(|(file, count)| format!("{file} ({count} commits)"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-            no_index_append(&mut out, &note, hard);
-        }
-    }
-
-    let proof = format!(
-        "\n## PROOF (任务闭包检查)\n算法: 无持久化索引 / 查询驱动候选 / 按需 alias 反向切片\n目标定义: {}\n正向依赖: {} files\n调用方: {} files\n覆盖级别: {}{}\n",
-        if targets.is_empty() { "未解析" } else { "已闭合" },
-        dependencies.len(),
-        callers.len(),
-        coverage,
-        if stats.deadline_hit { "（达到时限，未声明全仓完备）" } else { "" }
-    );
-    no_index_append(&mut out, &proof, hard);
-    trace("fast_context.no_index.total", total_start);
-    Ok(out)
-}
 
 pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
-    if no_index_context_enabled(&params)
-        && !params
-            .get("_legacyFastContext")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
-        return fast_context_no_index(root, &params);
-    }
     let out = fast_context_run(root, &params)?;
     if params
         .get("_anchorRetry")
@@ -7380,7 +5959,7 @@ mod tests {
             d.path(),
             "rg",
             &args,
-            Instant::now() + Duration::from_secs(2),
+            Some(Instant::now() + Duration::from_secs(2)),
             1024,
         )
         .unwrap();
@@ -7695,167 +6274,6 @@ mod tests {
         assert!(out2.contains("### lib/widget.test.ts"), "{out2}");
     }
     #[test]
-    fn request_context_mode_always_selects_fast_while_super_is_hidden() {
-        assert!(!no_index_context_enabled(&serde_json::json!({
-            "_contextMode":"super"
-        })));
-        assert!(!no_index_context_enabled(&serde_json::json!({
-            "_contextMode":"fast"
-        })));
-    }
-
-    #[test]
-    fn search_snapshot_cold_fallback_then_hot_index() {
-        let d = tempdir().unwrap();
-        fs::create_dir_all(d.path().join("src")).unwrap();
-        fs::write(
-            d.path().join("src/hot.ts"),
-            "export function uniqueHotAnchor() { return 1; }\n",
-        )
-        .unwrap();
-        let params = serde_json::json!({
-            "keywords":["uniqueHotAnchor"],
-            "deadlineMs":1000
-        });
-        let cold = fast_context_no_index(d.path(), &params).unwrap();
-        assert!(cold.contains("source=repository-search"), "{cold}");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let hot = loop {
-            let out = fast_context_no_index(d.path(), &params).unwrap();
-            if out.contains("source=memory-index") {
-                break out;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "index did not become ready: {out}"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        };
-        assert!(hot.contains("uniqueHotAnchor"), "{hot}");
-        assert!(search_snapshot_path(d.path()).is_file());
-        let scan_ms = |text: &str| {
-            let marker = text.split("# scan:").nth(1).unwrap_or_default();
-            marker
-                .split("ms")
-                .next()
-                .and_then(|prefix| prefix.rsplit('/').next())
-                .and_then(|value| value.trim().parse::<f64>().ok())
-                .unwrap_or(f64::MAX)
-        };
-        let cold_ms = scan_ms(&cold);
-        let hot_ms = scan_ms(&hot);
-        assert!(
-            hot_ms < 400.0 && hot_ms <= cold_ms * 1.25,
-            "hot query too slow: cold={cold_ms:.1}ms hot={hot_ms:.1}ms"
-        );
-        fs::write(
-            d.path().join("bench.txt"),
-            format!("cold_ms={cold_ms:.1} hot_ms={hot_ms:.1}"),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn corrupt_snapshot_falls_back_without_failure() {
-        let d = tempdir().unwrap();
-        fs::create_dir_all(d.path().join("src")).unwrap();
-        fs::write(
-            d.path().join("src/a.ts"),
-            "export const corruptAnchor = 1;\n",
-        )
-        .unwrap();
-        let path = search_snapshot_path(d.path());
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"not-a-snapshot").unwrap();
-        let out = fast_context_no_index(
-            d.path(),
-            &serde_json::json!({"keywords":["corruptAnchor"],"deadlineMs":1000}),
-        )
-        .unwrap();
-        assert!(out.contains("source=repository-search"), "{out}");
-        assert!(out.contains("corruptAnchor"), "{out}");
-    }
-
-    #[test]
-    fn no_index_file_root_stays_on_forward_closure() {
-        let d = tempdir().unwrap();
-        fs::create_dir_all(d.path().join("src")).unwrap();
-        fs::write(d.path().join("src/entry.ts"), "import { helper } from './helper';\nexport function entryTarget(v) { return helper(v); }\n").unwrap();
-        fs::write(
-            d.path().join("src/helper.ts"),
-            "export function helper(v) { return v + 1; }\n",
-        )
-        .unwrap();
-        for i in 0..300 {
-            fs::write(
-                d.path().join(format!("src/noise{i}.ts")),
-                format!("export const unrelated{i} = {i};\n"),
-            )
-            .unwrap();
-        }
-        let out = fast_context_no_index(d.path(), &serde_json::json!({"files":["src/entry.ts"],"keywords":["entryTarget"],"deadlineMs":1000})).unwrap();
-        assert!(out.contains("algorithm=no-index-query-slice"), "{out}");
-        assert!(out.contains("coverage=forward-closure"), "{out}");
-        assert!(out.contains("entryTarget"), "{out}");
-        assert!(out.contains("helper(v)"), "{out}");
-        assert!(out.contains("# scan: 2 candidate files /"), "{out}");
-        assert!(!out.contains("unrelated299"), "{out}");
-    }
-
-    #[test]
-    fn no_index_keyword_discovery_includes_callers_without_task_hints() {
-        let d = tempdir().unwrap();
-        fs::create_dir_all(d.path().join("src")).unwrap();
-        fs::write(
-            d.path().join("src/core.ts"),
-            "export function discoveredTarget(v) { return v; }\n",
-        )
-        .unwrap();
-        fs::write(
-            d.path().join("src/caller.ts"),
-            "import { discoveredTarget as run } from './core';\nexport function useIt(v) { return run(v); }\n",
-        )
-        .unwrap();
-        let out = fast_context_no_index(
-            d.path(),
-            &serde_json::json!({"keywords":["discoveredTarget"],"deadlineMs":3000}),
-        )
-        .unwrap();
-        assert!(out.contains("useIt"), "{out}");
-        assert!(out.contains("run(v)"), "{out}");
-        assert!(out.contains("调用方: 1 files"), "{out}");
-    }
-
-    #[test]
-    fn no_index_keyword_discovery_includes_markdown_implementation() {
-        let d = tempdir().unwrap();
-        fs::create_dir_all(d.path().join("services/game")).unwrap();
-        fs::create_dir_all(d.path().join("docs/queries")).unwrap();
-        fs::write(
-            d.path().join("services/game/minigame.go"),
-            "package game\ntype MinigameDataQuery struct{}\n",
-        )
-        .unwrap();
-        fs::write(
-            d.path().join("docs/queries/minigame.md"),
-            "# MinigameDataQuery\n```sql\nSELECT game_id, genre FROM minigame_data;\n```\n",
-        )
-        .unwrap();
-
-        let out = fast_context_no_index(
-            d.path(),
-            &serde_json::json!({"keywords":["MinigameDataQuery"],"deadlineMs":3000}),
-        )
-        .unwrap();
-        assert!(out.contains("services/game/minigame.go"), "{out}");
-        assert!(out.contains("docs/queries/minigame.md"), "{out}");
-        assert!(
-            out.contains("SELECT game_id, genre FROM minigame_data"),
-            "{out}"
-        );
-    }
-
-    #[test]
     fn fast_context_run_includes_sql_and_markdown_candidates() {
         let d = tempdir().unwrap();
         fs::create_dir_all(d.path().join("services/game")).unwrap();
@@ -7888,25 +6306,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_index_one_pass_graph_finds_alias_and_barrel_callers() {
-        let d = tempdir().unwrap();
-        fs::create_dir_all(d.path().join("src")).unwrap();
-        fs::write(
-            d.path().join("src/core.ts"),
-            "export function targetApi(v) { return v; }\n",
-        )
-        .unwrap();
-        fs::write(
-            d.path().join("src/index.ts"),
-            "export { targetApi as publicApi } from './core';\n",
-        )
-        .unwrap();
-        fs::write(d.path().join("src/caller.ts"), "import { publicApi as invoke } from './index';\nexport function caller(v) { return invoke(v); }\n").unwrap();
-        let out = fast_context_no_index(d.path(), &serde_json::json!({"files":["src/core.ts"],"keywords":["targetApi"],"task":"修改签名并检查调用方","deadlineMs":3000})).unwrap();
-        assert!(out.contains("coverage=query-driven"), "{out}");
-        assert!(out.contains("src/caller.ts"), "{out}");
-        assert!(out.contains("invoke(v)"), "{out}");
-        assert!(out.contains("调用方: 2 files"), "{out}");
-    }
 }

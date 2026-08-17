@@ -778,6 +778,15 @@ fn deterministic_roll(key: &str) -> f64 {
     h.finish() as f64 / u64::MAX as f64
 }
 
+fn training_expert_count(seed: i64, available: usize) -> usize {
+    let requested = if deterministic_roll(&format!("expert-count:{seed}")) < 0.5 {
+        2
+    } else {
+        3
+    };
+    requested.min(available)
+}
+
 fn render_thread(thread: &crate::threads::Thread) -> String {
     let mut out = format!("会话 {}：{}\n", thread.id, thread.title);
     for item in thread.items.iter().rev().take(16).rev() {
@@ -937,8 +946,12 @@ fn training_prompt(config: &ExperienceExpertConfig, existing: &str, conversation
 }
 
 fn training_agent(settings: &Settings) -> Result<AgentKind, String> {
-    serde_json::from_value(json!(settings.experience_training_agent.trim()))
-        .map_err(|_| format!("不支持的训练后端：{}", settings.experience_training_agent))
+    let agent: AgentKind = serde_json::from_value(json!(settings.experience_training_agent.trim()))
+        .map_err(|_| format!("不支持的训练后端：{}", settings.experience_training_agent))?;
+    if matches!(agent, AgentKind::OpenCode | AgentKind::OpenCodePlus) {
+        return Err(format!("{} 暂不支持经验训练", agent.label()));
+    }
+    Ok(agent)
 }
 
 /// 在猎户座 Thread 上运行一个真实 agent turn，而不是旁路 complete_once。
@@ -1005,9 +1018,16 @@ async fn run_training_turn(
                     .run_prompt(thread_id.into(), prompt, Vec::new())
                     .await
             }
-            AgentKind::Devin | AgentKind::OpenCode | AgentKind::OpenCodePlus => {
+            AgentKind::Devin => {
+                state
+                    .acp
+                    .clone()
+                    .run_prompt(thread_id.into(), prompt, Vec::new())
+                    .await
+            }
+            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                 return Err(format!(
-                    "{} 暂不支持经验训练，请选择 Vega、Lyra、Codex、CodeBuddy、Claude 或 Cursor",
+                    "{} 暂不支持经验训练，请选择 Vega、Lyra、Devin、Codex、CodeBuddy、Claude 或 Cursor",
                     agent.label()
                 ))
             }
@@ -1038,10 +1058,20 @@ async fn run_training_turn(
 }
 
 pub async fn train(app: &AppHandle, cwd: &str, force: bool) -> Result<Value, String> {
+    train_source_thread(app, cwd, force, None).await
+}
+
+async fn train_source_thread(
+    app: &AppHandle,
+    cwd: &str,
+    force: bool,
+    source_thread_id: Option<&str>,
+) -> Result<Value, String> {
     let (project_key, project_root) = project_identity(cwd)?;
     if TRAINING.swap(true, Ordering::SeqCst) {
         return Err("已有一次经验训练正在进行".into());
     }
+    let mut attempted = false;
     let result = async {
         let (settings, active_configs, threads) = {
             let state = app.state::<AppState>();
@@ -1060,8 +1090,14 @@ pub async fn train(app: &AppHandle, cwd: &str, force: bool) -> Result<Value, Str
                 project.last_trained_experts.contains(&a.id).cmp(&project.last_trained_experts.contains(&b.id))
                     .then_with(|| deterministic_roll(&format!("activate:{seed}:{}", a.id)).total_cmp(&deterministic_roll(&format!("activate:{seed}:{}", b.id))))
             });
-            configs.truncate(configs.len().min(2));
+            let active_count = training_expert_count(seed, configs.len());
+            configs.truncate(active_count);
             let mut threads = project_threads(&state, &project_key);
+            if let Some(source_thread_id) = source_thread_id {
+                // 自动训练直接选择会话；项目只由会话 cwd 决定并作为知识标签，
+                // 不再把同项目的其他会话捆成一个调度单元。
+                threads.retain(|thread| thread.id == source_thread_id);
+            }
             threads.retain(|thread| thread.items.iter().any(|item| matches!(item, Item::User { .. }))
                 && configs.iter().any(|config| project.expert_processed_threads.get(&config.id)
                     .and_then(|seen| seen.get(&thread.id)).copied().unwrap_or(0) < thread.updated_at));
@@ -1074,6 +1110,7 @@ pub async fn train(app: &AppHandle, cwd: &str, force: bool) -> Result<Value, Str
             guard.save();
             return Ok(json!({ "trained": false, "reason": "noNewSessions" }));
         }
+        attempted = true;
         {
             let mut guard = store()?.lock().map_err(|_| "经验库锁已损坏".to_string())?;
             guard.project_mut(&project_key, &project_root).last_attempt_at = now_ms();
@@ -1203,7 +1240,18 @@ pub async fn train(app: &AppHandle, cwd: &str, force: bool) -> Result<Value, Str
             "activatedExperts": activated_experts,
             "failedExperts": failures
         }))
-    }.await;
+    }
+    .await;
+    if attempted {
+        // 自动调度的间隔从本轮结束时开始计算。失败或耗时较长的训练也必须进入冷却，
+        // 否则若运行时间已接近间隔，下一次每分钟 tick 会在结束后立即再开一轮。
+        if let Ok(mut guard) = store().and_then(|value| value.lock().map_err(|_| "lock".into())) {
+            guard
+                .project_mut(&project_key, &project_root)
+                .last_attempt_at = now_ms();
+            guard.save();
+        }
+    }
     TRAINING.store(false, Ordering::SeqCst);
     result
 }
@@ -1219,17 +1267,21 @@ pub fn tick(app: &AppHandle) {
         if !settings.experience_training_enabled {
             None
         } else {
-            let mut projects = state
+            let source_threads = state
                 .store
                 .lock()
                 .unwrap()
                 .threads
                 .iter()
                 .filter(|thread| is_training_source_thread(thread))
-                .filter_map(|thread| project_identity(&thread.cwd).ok())
+                .filter(|thread| {
+                    thread
+                        .items
+                        .iter()
+                        .any(|item| matches!(item, Item::User { .. }))
+                })
+                .cloned()
                 .collect::<Vec<_>>();
-            projects.sort();
-            projects.dedup_by(|left, right| left.0 == right.0);
             let guard = store()
                 .and_then(|value| value.lock().map_err(|_| "lock".into()))
                 .ok();
@@ -1239,24 +1291,49 @@ pub fn tick(app: &AppHandle) {
                     settings.experience_evolution_interval_minutes.max(10) as i64 * 60_000;
                 let training_interval =
                     settings.experience_training_interval_minutes.max(5) as i64 * 60_000;
-                projects.into_iter().find_map(|(key, root)| {
-                    let project = guard.project(&key);
-                    if !project.experiences.is_empty()
-                        && now - project.last_evolution_at >= evolution_interval
-                    {
-                        Some((true, root))
-                    } else if now - project.last_train_at.max(project.last_attempt_at)
-                        >= training_interval
-                    {
-                        Some((false, root))
-                    } else {
-                        None
-                    }
-                })
+                let global_last_schedule_at = guard
+                    .projects
+                    .values()
+                    .map(|project| project.last_train_at.max(project.last_attempt_at))
+                    .max()
+                    .unwrap_or(0);
+
+                // 世代演进仍作用于知识所属项目；训练调度则不按项目轮转，而是直接从
+                // 全部来源会话里选最新的未消费会话，再由该会话自然带出项目标签。
+                let evolution = guard.projects.iter().find_map(|(_, project)| {
+                    (!project.experiences.is_empty()
+                        && now - project.last_evolution_at >= evolution_interval)
+                        .then(|| project.project_root.clone())
+                });
+                if evolution.is_some() {
+                    return evolution.map(|root| (true, root, None));
+                }
+                if now - global_last_schedule_at < training_interval {
+                    return None;
+                }
+
+                source_threads
+                    .into_iter()
+                    .filter_map(|thread| {
+                        let (project_key, project_root) = project_identity(&thread.cwd).ok()?;
+                        let project = guard.project(&project_key);
+                        let pending = settings.experience_experts.iter().any(|config| {
+                            project
+                                .expert_processed_threads
+                                .get(&config.id)
+                                .and_then(|seen| seen.get(&thread.id))
+                                .copied()
+                                .unwrap_or(0)
+                                < thread.updated_at
+                        });
+                        pending.then_some((thread.updated_at, project_root, thread.id))
+                    })
+                    .max_by_key(|(updated_at, _, _)| *updated_at)
+                    .map(|(_, root, thread_id)| (false, root, Some(thread_id)))
             })
         }
     };
-    let Some((evolve_due, cwd)) = action else {
+    let Some((evolve_due, cwd, source_thread_id)) = action else {
         return;
     };
     let app = app.clone();
@@ -1264,7 +1341,7 @@ pub fn tick(app: &AppHandle) {
         if evolve_due {
             let _ = evolve_memory(&app, &cwd).await;
         } else {
-            let _ = train(&app, &cwd, false).await;
+            let _ = train_source_thread(&app, &cwd, false, source_thread_id.as_deref()).await;
         }
     });
 }
@@ -1626,6 +1703,27 @@ fn evolve_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn training_randomly_activates_two_or_three_experts() {
+        let counts = (0..100)
+            .map(|seed| training_expert_count(seed, 7))
+            .collect::<HashSet<_>>();
+        assert_eq!(counts, HashSet::from([2, 3]));
+        assert_eq!(training_expert_count(0, 1), 1);
+    }
+
+    #[test]
+    fn training_agent_accepts_devin_and_rejects_opencode() {
+        let mut settings = Settings::default();
+        settings.experience_training_agent = "devin".into();
+        assert_eq!(training_agent(&settings).unwrap(), AgentKind::Devin);
+
+        settings.experience_training_agent = "opencode".into();
+        assert!(training_agent(&settings)
+            .unwrap_err()
+            .contains("暂不支持经验训练"));
+    }
 
     #[test]
     fn training_and_evolution_sessions_are_not_training_sources() {

@@ -401,6 +401,9 @@ pub enum Item {
         total_tokens: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
+        /// 最后一次模型请求实际携带的上下文；input_tokens 是整轮多次请求的累计输入。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_tokens: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_tokens: Option<u64>,
         /// 缓存 token 仅在后端提供明细时出现；不支持的后端保持 None。
@@ -749,6 +752,7 @@ impl Thread {
             duration_ms,
             total_tokens: g(&["totalTokens", "total_tokens"]),
             input_tokens: g(&["inputTokens", "input_tokens"]),
+            context_tokens: g(&["contextTokens", "context_tokens"]),
             output_tokens: g(&["outputTokens", "output_tokens"]),
             cache_read_tokens: g(&[
                 "cacheReadTokens",
@@ -1859,6 +1863,7 @@ mod tests {
                 duration_ms: 1,
                 total_tokens: None,
                 input_tokens: None,
+                context_tokens: None,
                 output_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,

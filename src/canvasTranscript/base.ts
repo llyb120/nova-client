@@ -261,8 +261,10 @@ export function invalidateTheme(): void {
   themeCache = null;
 }
 
-/** 星图背景低频更新间隔；恒星位移很小，1.5 秒步进不会产生可见跳动。 */
-export const STAR_MAP_UPDATE_MS = 1500;
+/** 星图背景低频更新间隔；恒星位移很小，30 秒步进不会产生可见跳动。 */
+export const STAR_MAP_UPDATE_MS = 30_000;
+
+const SKY_BUCKET_MS = 30_000;
 
 type BackdropTheme = Pick<
   ThemeColors,
@@ -270,10 +272,19 @@ type BackdropTheme = Pick<
 >;
 
 const backdropCache = new Map<string, HTMLCanvasElement>();
+const pendingBackdrops = new Set<string>();
 
-function cacheBackdrop(key: string, surface: HTMLCanvasElement): void {
+type IdleWindow = Window & {
+  requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+};
+
+function cacheBackdrop(groupKey: string, key: string, surface: HTMLCanvasElement): void {
+  // 每个尺寸/主题只保留最新恒星时桶，避免旧桶占满小缓存后规律性 miss。
+  for (const cachedKey of backdropCache.keys()) {
+    if (cachedKey.startsWith(`${groupKey}|`) && cachedKey !== key) backdropCache.delete(cachedKey);
+  }
   if (backdropCache.has(key)) backdropCache.delete(key);
-  while (backdropCache.size >= 4) backdropCache.delete(backdropCache.keys().next().value!);
+  while (backdropCache.size >= 8) backdropCache.delete(backdropCache.keys().next().value!);
   backdropCache.set(key, surface);
 }
 
@@ -326,9 +337,26 @@ function createBackdrop(
   return surface;
 }
 
+/** 创建已合成静态层和星图的背景位图。 */
+function createCompleteBackdrop(
+  width: number,
+  height: number,
+  pixelW: number,
+  pixelH: number,
+  dpr: number,
+  theme: BackdropTheme,
+  now: number,
+): HTMLCanvasElement {
+  const surface = createBackdrop(width, height, pixelW, pixelH, dpr, theme);
+  const surfaceCtx = surface.getContext("2d", { alpha: false })!;
+  surfaceCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  paintStarMap(surfaceCtx, width, height, theme, now);
+  return surface;
+}
+
 /**
- * 绘制独立背景 Canvas 的一帧：静态底图从缓存拷贝，星图按当前恒星时直接叠加。
- * 调用方以 1.5 秒低频更新；前景 Canvas 的滚动、悬停和流式绘制不会触发这里。
+ * 绘制独立背景 Canvas：星图与静态层共用缓存位图，热路径只做一次 drawImage。
+ * 分桶失效时先沿用旧位图，并在 idle 时生成新桶；首次绘制同步生成以避免空白。
  */
 export function paintCanvasBackdrop(
   ctx: CanvasRenderingContext2D,
@@ -336,19 +364,43 @@ export function paintCanvasBackdrop(
   height: number,
   theme: BackdropTheme,
   now = Date.now(),
+  onReady?: () => void,
+  canBuild: () => boolean = () => true,
 ): void {
   const dpr = window.devicePixelRatio || 1;
   const pixelW = Math.max(1, Math.round(width * dpr));
   const pixelH = Math.max(1, Math.round(height * dpr));
   const themeKey = [theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
-  const key = [pixelW, pixelH, themeKey].join("|");
+  const groupKey = [pixelW, pixelH, themeKey].join("|");
+  const bucket = Math.floor(now / SKY_BUCKET_MS);
+  const key = `${groupKey}|${bucket}`;
   let surface = backdropCache.get(key);
   if (!surface) {
-    surface = createBackdrop(width, height, pixelW, pixelH, dpr, theme);
-    cacheBackdrop(key, surface);
+    const previous = [...backdropCache.entries()].find(([cachedKey]) => cachedKey.startsWith(`${groupKey}|`))?.[1];
+    if (!previous) {
+      surface = createCompleteBackdrop(width, height, pixelW, pixelH, dpr, theme, now);
+      cacheBackdrop(groupKey, key, surface);
+    } else {
+      surface = previous;
+      if (!pendingBackdrops.has(key)) {
+        pendingBackdrops.add(key);
+        const build = () => {
+          if (!canBuild()) {
+            pendingBackdrops.delete(key);
+            return;
+          }
+          const next = createCompleteBackdrop(width, height, pixelW, pixelH, dpr, theme, now);
+          pendingBackdrops.delete(key);
+          cacheBackdrop(groupKey, key, next);
+          onReady?.();
+        };
+        const idleWindow = window as IdleWindow;
+        if (idleWindow.requestIdleCallback) idleWindow.requestIdleCallback(build, { timeout: 2_000 });
+        else window.setTimeout(build, 50);
+      }
+    }
   }
   ctx.drawImage(surface, 0, 0, pixelW, pixelH, 0, 0, width, height);
-  paintStarMap(ctx, width, height, theme, now);
 }
 
 /* ===== 矢量图标（与 icons.tsx 的 feather 风格 path 一致，Path2D 直绘） ===== */

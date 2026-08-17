@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { analyzeThreadForDbg } from "./ctx-invoke.eval.mjs";
-import { callNapiTool } from "./nova-napi-tools.mjs";
+import { callGlobalContextTool } from "./nova-context-client.mjs";
 
 const dir = process.argv[2]?.replace(/^~(?=\/|$)/, homedir()) || join(homedir(), ".nova", "threads");
 
@@ -70,17 +70,17 @@ for (const { t, c } of picked) {
   };
   const baseArgs = { ...c.rawInput };
   delete baseArgs.command;
-  const rA = recall(await callNapiTool("fast_context", root, baseArgs));
+  const rA = recall(await callGlobalContextTool("fast_context", root, baseArgs));
 
   const kws = Array.isArray(baseArgs.keywords) ? baseArgs.keywords : [];
   const kept = kws.filter((k) => keywordExists(root, k));
   const dropped = kws.length - kept.length;
   const argsB = { ...baseArgs, keywords: kept.length ? kept : kws.slice(0, 1) };
-  const rB = recall(await callNapiTool("fast_context", root, argsB));
+  const rB = recall(await callGlobalContextTool("fast_context", root, argsB));
 
   const oracle = oracleSymbols(root, c.targets);
   const argsC = { ...baseArgs, keywords: oracle.length ? oracle : kept, files: undefined };
-  const rC = oracle.length ? recall(await callNapiTool("fast_context", root, argsC)) : rB;
+  const rC = oracle.length ? recall(await callGlobalContextTool("fast_context", root, argsC)) : rB;
 
   rows.push({ task: t.task, root: root.split("/").pop(), n: c.targets.length, dropped, total: kws.length, rA, rB, rC });
   console.log(`${(rA * 100).toFixed(0).padStart(3)}% → ${(rB * 100).toFixed(0).padStart(3)}% → ${(rC * 100).toFixed(0).padStart(3)}%  删${dropped}/${kws.length}个  ${t.task.slice(0, 44)}`);

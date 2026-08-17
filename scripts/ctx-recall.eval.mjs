@@ -13,7 +13,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { repoRoot } from "./ctx-core.mjs";
-import { callNapiTool } from "./nova-napi-tools.mjs";
+import { callGlobalContextTool } from "./nova-context-client.mjs";
 
 function makeFixture(files) {
   const dir = mkdtempSync(join(tmpdir(), "ctx-recall-"));
@@ -257,7 +257,7 @@ async function main() {
   for (const item of CASES) {
     const caseRoot = item.fixture ? item.fixture() : root;
     const started = performance.now();
-    const out = await callNapiTool("fast_context", caseRoot, item.args);
+    const out = await callGlobalContextTool("fast_context", caseRoot, item.args);
     const ms = Math.round(performance.now() - started);
     const kb = Math.round(out.length / 102.4) / 10;
 

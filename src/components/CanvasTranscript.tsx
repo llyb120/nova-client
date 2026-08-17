@@ -5,7 +5,7 @@ import {
 } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
-import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
+import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded } from "../store";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
@@ -973,6 +973,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     until: number;
   }
   const prefixLayoutCaches = new Map<string, PrefixLayoutCache>();
+  const PREFIX_CACHE_LIMIT = 10;
   // groupItems 会保留已闭合分组的对象身份；缓存其内容签名，避免每个流式 token
   // 都重新遍历整段历史文本。展开状态变化时会整体换新此 WeakMap。
   let closedGroupSigCache = new WeakMap<Group, string>();
@@ -1391,7 +1392,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         groupYs: nextGroupYs.slice(0, closedUntil),
         height: closedUntil < groups.length ? nextGroupYs[closedUntil] : y,
       });
-      while (prefixLayoutCaches.size > 3) {
+      while (prefixLayoutCaches.size > PREFIX_CACHE_LIMIT) {
         const oldest = prefixLayoutCaches.keys().next().value;
         if (oldest == null) break;
         prefixLayoutCaches.delete(oldest);
@@ -1791,7 +1792,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    paintCanvasBackdrop(ctx, viewW, viewH, pal, timestamp);
+    paintCanvasBackdrop(ctx, viewW, viewH, pal, timestamp, paintBackdrop, () => !props.running);
   }
 
   function paintAll() {
@@ -3268,8 +3269,23 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     resizeCanvas();
     void rebuild();
 
-    const ro = new ResizeObserver(() => { resizeCanvas(); void rebuild(); });
+    let resizeTimer: number | undefined;
+    let canvasVisible = false;
+    const ro = new ResizeObserver(() => {
+      // 保留旧位图供 CSS 拉伸；停止 resize 200ms 后再分配 canvas 并重排。
+      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = undefined;
+        resizeCanvas();
+        void rebuild();
+      }, 200);
+    });
+    const visibilityObserver = new IntersectionObserver(([entry]) => {
+      canvasVisible = !!entry?.isIntersecting;
+      if (canvasVisible && !props.running) paintBackdrop();
+    });
     ro.observe(hostEl);
+    visibilityObserver.observe(hostEl);
 
     // Rebuild fallback-font measurements after bundled web fonts become available.
     void document.fonts.ready.then(() => {
@@ -3277,10 +3293,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       scheduleRebuild();
     });
 
-    const mo = new MutationObserver(() => { void rebuild(); });
+    const mo = new MutationObserver(() => {
+      // 背景 Canvas 不参与正文 rebuild，主题切换时必须立即重绘；否则会一直保留
+      // 旧主题，直到低频星图定时器的下一帧。
+      pal = readPalette();
+      paintBackdrop();
+      void rebuild();
+    });
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     const starMapTimer = window.setInterval(() => {
-      if (!document.hidden) paintBackdrop();
+      if (!document.hidden && canvasVisible && !props.running) paintBackdrop();
     }, STAR_MAP_UPDATE_MS);
 
     function onMouseLeave() {
@@ -3314,8 +3336,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     onCleanup(() => {
       ro.disconnect();
+      visibilityObserver.disconnect();
       mo.disconnect();
       window.clearInterval(starMapTimer);
+      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
       editResizeObserver?.disconnect();
       editResizeObserver = undefined;
       editHostEl = undefined;
@@ -3382,12 +3406,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     scheduleRebuild(switchedThread);
   });
 
+  let expandedEffectThreadId = props.threadId;
+  let expandedEffectReady = false;
   createEffect(() => {
     // 展开态参与闭合分组签名；仅在它变化时废弃签名缓存，而不是流式时反复哈希历史。
     // 用户主动开合必须立即重排（immediate）：不能被套在流式 80ms 节流里，
     // 否则 click 设置的 scrollLock 来不及生效、开合看似失效。
-    JSON.stringify(state.expanded);
+    expandedRevision();
+    const threadId = props.threadId;
     closedGroupSigCache = new WeakMap<Group, string>();
+    // openThread 重置 expanded 与 thread 切换属于同一批更新，主 effect 已负责 rebuild。
+    if (!expandedEffectReady || threadId !== expandedEffectThreadId) {
+      expandedEffectReady = true;
+      expandedEffectThreadId = threadId;
+      return;
+    }
     scheduleRebuild(false, true);
   });
 

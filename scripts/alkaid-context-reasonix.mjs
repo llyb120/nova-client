@@ -362,7 +362,9 @@ async function prompt(request, commands) {
       providerActivity.lastEvent = "message_end";
       providerActivity.messageEnds += 1;
       usage = mergeAlkaidUsage(usage, event.message.usage);
-      // 本轮进行中的累计用量实时上报，前端据此做 token 跳变效果；Turn 落库后由前端清零。
+      const contextTokens = contextTokensFromMessages([event.message]);
+      if (contextTokens > 0) usage.contextTokens = contextTokens;
+      // 累计费用字段与最后一次请求的真实上下文同时上报；Turn 落库后由前端清零。
       send({ type: "usage", usage });
     }
     if (event.type === "message_start" && event.message.role === "assistant") {

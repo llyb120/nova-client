@@ -1,7 +1,6 @@
 import { resolve } from "node:path";
-import { findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
-import { callNapiTool } from "./nova-napi-tools.mjs";
-import { callContextToolOrLocal } from "./nova-context-client.mjs";
+import { FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
 
 /**
  * Nova context tools for Cursor SDK `local.customTools`.
@@ -9,7 +8,7 @@ import { callContextToolOrLocal } from "./nova-context-client.mjs";
  */
 export function createCursorFilesystemTools(cwd, options = {}) {
   void options;
-  const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
+  const fastContext = process.env.NOVA_FAST_CONTEXT !== "0" && globalContextServiceConfigured();
   const root = resolve(cwd);
   if (!fastContext) return {};
   return {
@@ -38,8 +37,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
         const keywords = [...new Set((Array.isArray(rawKeywords) ? rawKeywords : typeof rawKeywords === "string" ? [rawKeywords] : [])
           .map((value) => String(value ?? "").trim()).filter(Boolean))].slice(0, 5);
         const args = { ...(params ?? {}), keywords };
-        // fast_context 只有 Rust native 实现（JS 镜像已移除）；无全局 service 时直走 native。
-        return await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
+        return await callGlobalContextTool("fast_context", root, args);
       },
     },
     find_symbols: {
@@ -52,7 +50,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = params ?? {};
-        return await callContextToolOrLocal("find_symbols", root, args, () => findSymbols(args, root));
+        return await callGlobalContextTool("find_symbols", root, args);
       },
     },
   };
@@ -64,7 +62,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
  */
 export function cursorBatchToolPolicy(options = {}) {
   const readOnly = options.readOnly === true;
-  const fastContext = process.env.NOVA_FAST_CONTEXT !== "0";
+  const fastContext = process.env.NOVA_FAST_CONTEXT !== "0" && globalContextServiceConfigured();
   const lines = [
     "You have Cursor built-in Read, Shell, Grep"
       + (fastContext ? " plus Nova tools fast_context and find_symbols" : "")

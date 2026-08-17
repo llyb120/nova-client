@@ -557,6 +557,9 @@ test("Vega context measures the largest input request without generated output",
     { role: "assistant", usage: { input: 100, output: 20, cacheRead: 300, cacheWrite: 40 } },
     { role: "assistant", usage: { totalTokens: 900, input: 500, output: 30 } },
   ]), 870);
+  assert.equal(contextTokensFromMessages([
+    { role: "assistant", usage: { input: 120, output: 20, cacheRead: 300, cacheWrite: 40 } },
+  ]), 460);
 });
 
 test("Vega estimates tokens from the rebuilt compact context", () => {

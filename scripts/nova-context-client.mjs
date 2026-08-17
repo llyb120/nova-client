@@ -69,9 +69,3 @@ export async function callGlobalContextTool(method, root, params) {
     }
   }
 }
-
-export async function callContextToolOrLocal(method, root, params, local) {
-  if (!serviceConfig()) return local();
-  // Never create a second in-process context engine when Nova configured its global service.
-  return callGlobalContextTool(method, root, params);
-}

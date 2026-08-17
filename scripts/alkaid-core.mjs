@@ -17,9 +17,8 @@ import { existsSync } from "node:fs";
 import { access, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
-import { findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
-import { callNapiTool } from "./nova-napi-tools.mjs";
-import { callContextToolOrLocal } from "./nova-context-client.mjs";
+import { FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
 import { appendTrainedKnowledge, createExperienceTools } from "./alkaid-experience-tools.mjs";
 
 /** Reasonix-style per-tool context budget. Full oversized text is archived before truncation. */
@@ -455,7 +454,9 @@ export function decodeTextBuffer(buffer) {
 }
 
 export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
-  const fastContext = opts.fastContext !== false && process.env.NOVA_FAST_CONTEXT !== "0";
+  const fastContext = opts.fastContext !== false
+    && process.env.NOVA_FAST_CONTEXT !== "0"
+    && globalContextServiceConfigured();
   const autoChangeProject = opts.autoChangeProject !== false
     && process.env.NOVA_AUTO_CHANGE_PROJECT !== "0";
   const workingDirectory = opts.workingDirectory ?? { cwd: resolve(cwd) };
@@ -491,7 +492,7 @@ export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
         const args = params ?? {};
         const root = currentRoot();
         // 代码上下文与训练知识同轮返回；模型不需要再调用独立的 load 工具。
-        const codeText = await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
+        const codeText = await callGlobalContextTool("fast_context", root, args);
         return textResult(await appendTrainedKnowledge(codeText, args, root));
       },
     },
@@ -502,7 +503,7 @@ export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
       async execute(_id, params) {
         const args = params ?? {};
         const root = currentRoot();
-        return textResult(await callContextToolOrLocal("find_symbols", root, args, () => findSymbols(args, root)));
+        return textResult(await callGlobalContextTool("find_symbols", root, args));
       },
     },
   );

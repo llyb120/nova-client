@@ -921,10 +921,10 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [skillsDragging, setSkillsDragging] = createSignal(false);
   const [skillsMsg, setSkillsMsg] = createSignal("");
   const [experienceTrainingEnabled, setExperienceTrainingEnabled] = createSignal(s?.experienceTrainingEnabled ?? false);
-  const trainingAgentKinds = () => enabledAgentKinds().filter((kind) => kind !== "devin" && kind !== "opencode");
+  const trainingAgentKinds = () => enabledAgentKinds().filter((kind) => kind !== "opencode");
   const [experienceTrainingAgent, setExperienceTrainingAgent] = createSignal<AgentKind>(s?.experienceTrainingAgent ?? "lyra");
   const [experienceTrainingModel, setExperienceTrainingModel] = createSignal(s?.experienceTrainingModel ?? "");
-  const [experienceTrainingIntervalMinutes, setExperienceTrainingIntervalMinutes] = createSignal(s?.experienceTrainingIntervalMinutes ?? 30);
+  const [experienceTrainingIntervalMinutes, setExperienceTrainingIntervalMinutes] = createSignal(s?.experienceTrainingIntervalMinutes ?? 60);
   const [experienceEvolutionIntervalMinutes, setExperienceEvolutionIntervalMinutes] = createSignal(s?.experienceEvolutionIntervalMinutes ?? 720);
   const [experienceExperts, setExperienceExperts] = createSignal(s?.experienceExperts ?? []);
   const updateExperienceExpert = (index: number, key: string, value: number) => {
@@ -946,7 +946,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       experienceTrainingEnabled: experienceTrainingEnabled(),
       experienceTrainingAgent: experienceTrainingAgent(),
       experienceTrainingModel: experienceTrainingModel().trim(),
-      experienceTrainingIntervalMinutes: Math.max(5, Math.floor(experienceTrainingIntervalMinutes() || 30)),
+      experienceTrainingIntervalMinutes: Math.max(5, Math.floor(experienceTrainingIntervalMinutes() || 60)),
       experienceEvolutionIntervalMinutes: Math.max(10, Math.floor(experienceEvolutionIntervalMinutes() || 720)),
       experienceExperts: experienceExperts(),
     };
@@ -1582,7 +1582,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <option value="fast">FastContext（默认）</option>
                 </select>
                 <span class="field-hint">
-                  FastContext 使用原生常驻服务和增量索引；旧配置中的 SuperContext 会自动回退到 FastContext。保存后重启相关 Agent 生效。
+                  FastContext 使用原生常驻服务和增量索引。保存后重启相关 Agent 生效。
                 </span>
               </label>
 

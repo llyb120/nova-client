@@ -1,11 +1,12 @@
 import { resolve } from "node:path";
-import { findSymbols, FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
-import { callNapiTool } from "./nova-napi-tools.mjs";
-import { callContextToolOrLocal } from "./nova-context-client.mjs";
+import { FAST_CONTEXT_DESCRIPTION } from "./ctx-core.mjs";
+import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
 
 function fastContextEnabled(options = {}) {
-  if (typeof options.fastContext === "boolean") return options.fastContext;
-  return process.env.NOVA_FAST_CONTEXT !== "0";
+  const enabled = typeof options.fastContext === "boolean"
+    ? options.fastContext
+    : process.env.NOVA_FAST_CONTEXT !== "0";
+  return enabled && globalContextServiceConfigured();
 }
 
 function readOnlyEnabled(options = {}) {
@@ -84,8 +85,7 @@ export function createNovaBatchTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = normalizeFastContextArgs(params);
-        // fast_context 只有 Rust native 实现（JS 镜像已移除）；无全局 service 时直走 native。
-    return await callContextToolOrLocal("fast_context", root, args, () => callNapiTool("fast_context", root, args));
+        return await callGlobalContextTool("fast_context", root, args);
       },
     };
     tools.find_symbols = {
@@ -110,7 +110,7 @@ export function createNovaBatchTools(cwd, options = {}) {
       },
       async execute(params) {
         const args = normalizeFindSymbolsArgs(params);
-        return await callContextToolOrLocal("find_symbols", root, args, () => findSymbols(args, root));
+        return await callGlobalContextTool("find_symbols", root, args);
       },
     };
   }

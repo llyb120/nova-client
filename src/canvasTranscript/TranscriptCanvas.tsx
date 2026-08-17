@@ -14,6 +14,7 @@ import type { PermissionRequest, PromptImage, RevertChange, UserItem } from "../
 import {
   type Action,
   getTheme,
+  invalidateTheme,
   measure,
   paintCanvasBackdrop,
   roundRectPath,
@@ -397,7 +398,7 @@ export function TranscriptCanvas(props: {
     const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    paintCanvasBackdrop(ctx, w, h, getTheme(), now);
+    paintCanvasBackdrop(ctx, w, h, getTheme(), now, requestBackdrop, () => !props.running);
   };
 
   const requestBackdrop = () => {
@@ -408,6 +409,10 @@ export function TranscriptCanvas(props: {
       paintBackdrop();
     });
   };
+  createEffect(() => {
+    // 流式期间沿用当前星图；结束后补齐当前恒星时桶。
+    if (!props.running) requestBackdrop();
+  });
 
   const requestRender = () => {
     if (renderQueued) return;
@@ -1218,12 +1223,24 @@ export function TranscriptCanvas(props: {
     const host = hostRef;
     const canvas = canvasRef;
     if (!host || !canvas) return;
+    let resizeBackdropTimer: number | undefined;
+    let canvasVisible = false;
     const ro = new ResizeObserver(() => {
       setViewW(host.clientWidth);
       setViewH(host.clientHeight);
-      requestBackdrop();
+      // 拖拽期间让浏览器拉伸旧位图；停手后再重建昂贵的背景 surface。
+      if (resizeBackdropTimer !== undefined) window.clearTimeout(resizeBackdropTimer);
+      resizeBackdropTimer = window.setTimeout(() => {
+        resizeBackdropTimer = undefined;
+        requestBackdrop();
+      }, 200);
+    });
+    const visibilityObserver = new IntersectionObserver(([entry]) => {
+      canvasVisible = !!entry?.isIntersecting;
+      if (canvasVisible && !props.running) requestBackdrop();
     });
     ro.observe(host);
+    visibilityObserver.observe(host);
     setViewW(host.clientWidth);
     setViewH(host.clientHeight);
     paintBackdrop();
@@ -1233,20 +1250,25 @@ export function TranscriptCanvas(props: {
     window.addEventListener("pointerup", finishPointer, true);
     window.addEventListener("pointercancel", finishPointer, true);
     const mo = new MutationObserver(() => {
+      // data-theme 已变更时同步清掉主题缓存并刷新两层 Canvas，避免背景继续显示
+      // 旧配色直到 1.5 秒星图定时器触发。
+      invalidateTheme();
       bump();
       requestBackdrop();
     });
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     const starMapTimer = window.setInterval(() => {
-      if (!document.hidden) paintBackdrop();
+      if (!document.hidden && canvasVisible && !props.running) requestBackdrop();
     }, STAR_MAP_UPDATE_MS);
 
     props.onApi(canvasApi);
 
     onCleanup(() => {
       ro.disconnect();
+      visibilityObserver.disconnect();
       mo.disconnect();
       window.clearInterval(starMapTimer);
+      if (resizeBackdropTimer !== undefined) window.clearTimeout(resizeBackdropTimer);
       canvas.removeEventListener("wheel", onWheel);
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("pointerup", finishPointer, true);

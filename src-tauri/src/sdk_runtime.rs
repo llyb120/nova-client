@@ -1393,14 +1393,6 @@ impl SdkManager {
                 .env(
                     "NOVA_CONTEXT_RETRIEVAL_MODE",
                     settings.context_retrieval_mode.as_str(),
-                )
-                .env(
-                    "NOVA_CONTEXT_NO_INDEX",
-                    if settings.super_context_enabled() {
-                        "1"
-                    } else {
-                        "0"
-                    },
                 );
         }
         if !self.launch_env.is_empty() {
@@ -1807,7 +1799,6 @@ fn bridge_path(app: &AppHandle, adapter: &dyn SdkAdapter) -> Result<PathBuf, Str
     let dir = crate::nova_data_dir(app).join("runtime");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("创建 {} 运行目录失败：{e}", adapter.label()))?;
-    crate::nova_tools_napi_asset::materialize(&dir)?;
     let path = dir.join(name);
     if std::fs::read(&path).ok().as_deref() != Some(bridge) {
         std::fs::write(&path, bridge)

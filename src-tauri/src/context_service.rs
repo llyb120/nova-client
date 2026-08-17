@@ -198,6 +198,17 @@ async fn run_server(
 }
 
 impl ContextService {
+    pub(crate) fn disabled() -> Self {
+        std::env::remove_var("NOVA_CONTEXT_SERVICE_ENDPOINT");
+        std::env::remove_var("NOVA_CONTEXT_SERVICE_TOKEN");
+        Self {
+            endpoint: String::new(),
+            token: String::new(),
+            shutdown: Mutex::new(None),
+            worker: Mutex::new(None),
+        }
+    }
+
     pub(crate) fn start(data_dir: &Path) -> Result<Self, String> {
         let runtime_dir = data_dir.join("runtime");
         std::fs::create_dir_all(&runtime_dir)
@@ -286,7 +297,7 @@ impl Drop for ContextService {
                 let _ = worker.join();
             }
         }
-        if !cfg!(windows) {
+        if !cfg!(windows) && !self.endpoint.is_empty() {
             let _ = std::fs::remove_file(&self.endpoint);
         }
         std::env::remove_var("NOVA_CONTEXT_SERVICE_ENDPOINT");

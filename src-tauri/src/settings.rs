@@ -40,24 +40,22 @@ pub struct StageModelTarget {
 #[serde(rename_all = "lowercase")]
 pub enum ContextRetrievalMode {
     None,
-    Fast,
     #[default]
     #[serde(other)]
-    Super,
+    Fast,
 }
 
 impl ContextRetrievalMode {
-    // SuperContext is temporarily hidden. Preserve the serialized variant so old settings still
-    // deserialize, but every enabled mode resolves to FastContext at runtime.
+    // 兼容持久化的旧值（如 super）：#[serde(other)] 会把无法识别的变体反序列化为 Fast。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Fast | Self::Super => "fast",
+            Self::Fast => "fast",
         }
     }
 }
 
-fn default_experience_training_interval_minutes() -> u32 { 30 }
+fn default_experience_training_interval_minutes() -> u32 { 60 }
 fn default_experience_evolution_interval_minutes() -> u32 { 720 }
 fn default_experience_training_agent() -> String { "lyra".into() }
 fn default_experience_experts() -> Vec<ExperienceExpertConfig> {
@@ -345,7 +343,6 @@ mod tests {
             super::ContextRetrievalMode::Fast
         );
         assert!(settings.context_tools_enabled());
-        assert!(!settings.super_context_enabled());
     }
 
     #[test]
@@ -362,8 +359,6 @@ mod tests {
             settings.context_retrieval_mode,
             super::ContextRetrievalMode::Fast
         );
-        let persisted = fs::read_to_string(dir.join("settings.json")).unwrap();
-        assert!(persisted.contains(r#""contextRetrievalMode": "fast""#));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -386,7 +381,6 @@ mod tests {
         for mode in [
             super::ContextRetrievalMode::None,
             super::ContextRetrievalMode::Fast,
-            super::ContextRetrievalMode::Super,
         ] {
             let text = serde_json::to_string(&mode).unwrap();
             let decoded: super::ContextRetrievalMode = serde_json::from_str(&text).unwrap();
@@ -584,14 +578,6 @@ impl Settings {
         {
             settings.context_retrieval_mode = ContextRetrievalMode::None;
         }
-        // SuperContext is temporarily unavailable. Migrate persisted `super` immediately so all
-        // bridge environments and the settings UI consistently expose FastContext.
-        if settings.context_retrieval_mode == ContextRetrievalMode::Super {
-            settings.context_retrieval_mode = ContextRetrievalMode::Fast;
-            if raw_value.is_some() {
-                settings.save(dir);
-            }
-        }
         if settings.claudecode_path.trim() == "npx" {
             settings.claudecode_path = "claude".into();
         }
@@ -657,22 +643,15 @@ impl Settings {
         self.context_retrieval_mode != ContextRetrievalMode::None
     }
 
-    pub fn super_context_enabled(&self) -> bool {
-        false
-    }
-
     pub fn apply_context_retrieval_environment(&self) {
         std::env::set_var(
             "NOVA_CONTEXT_RETRIEVAL_MODE",
             self.context_retrieval_mode.as_str(),
         );
-        std::env::set_var("NOVA_CONTEXT_NO_INDEX", "0");
         std::env::set_var(
             "NOVA_EXPERIENCE_TOOLS",
             if self.experience_training_enabled { "1" } else { "0" },
         );
-        // NOVA_SUPER_FAST_CONTEXT 是已废弃的旧实验优化，不属于新的 SuperContext。
-        std::env::remove_var("NOVA_SUPER_FAST_CONTEXT");
     }
 
     pub fn save(&self, dir: &PathBuf) {
