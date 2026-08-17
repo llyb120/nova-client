@@ -859,6 +859,9 @@ export function HomeView() {
       e.stopPropagation();
       pasteAsPaths = true;
       insertClipboardFilePaths();
+      queueMicrotask(() => {
+        pasteAsPaths = false;
+      });
       return;
     }
     const suggestions = slashSuggestions();
