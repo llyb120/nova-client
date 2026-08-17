@@ -1791,7 +1791,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    paintCanvasBackdrop(ctx, viewW, viewH, pal, timestamp);
+    paintCanvasBackdrop(ctx, viewW, viewH, pal, timestamp, paintBackdrop, () => !props.running);
   }
 
   function paintAll() {
@@ -3268,8 +3268,23 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     resizeCanvas();
     void rebuild();
 
-    const ro = new ResizeObserver(() => { resizeCanvas(); void rebuild(); });
+    let resizeTimer: number | undefined;
+    let canvasVisible = false;
+    const ro = new ResizeObserver(() => {
+      // 保留旧位图供 CSS 拉伸；停止 resize 200ms 后再分配 canvas 并重排。
+      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = undefined;
+        resizeCanvas();
+        void rebuild();
+      }, 200);
+    });
+    const visibilityObserver = new IntersectionObserver(([entry]) => {
+      canvasVisible = !!entry?.isIntersecting;
+      if (canvasVisible && !props.running) paintBackdrop();
+    });
     ro.observe(hostEl);
+    visibilityObserver.observe(hostEl);
 
     // Rebuild fallback-font measurements after bundled web fonts become available.
     void document.fonts.ready.then(() => {
@@ -3277,10 +3292,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       scheduleRebuild();
     });
 
-    const mo = new MutationObserver(() => { void rebuild(); });
+    const mo = new MutationObserver(() => {
+      // 背景 Canvas 不参与正文 rebuild，主题切换时必须立即重绘；否则会一直保留
+      // 旧主题，直到低频星图定时器的下一帧。
+      pal = readPalette();
+      paintBackdrop();
+      void rebuild();
+    });
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     const starMapTimer = window.setInterval(() => {
-      if (!document.hidden) paintBackdrop();
+      if (!document.hidden && canvasVisible && !props.running) paintBackdrop();
     }, STAR_MAP_UPDATE_MS);
 
     function onMouseLeave() {
@@ -3314,8 +3335,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     onCleanup(() => {
       ro.disconnect();
+      visibilityObserver.disconnect();
       mo.disconnect();
       window.clearInterval(starMapTimer);
+      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
       editResizeObserver?.disconnect();
       editResizeObserver = undefined;
       editHostEl = undefined;
