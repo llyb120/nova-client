@@ -1,11 +1,14 @@
 /**
  * 用户自定义工作流的持久化（localStorage）。内置工作流来自代码，不存这里。
  */
-import { BUILTIN_WORKFLOWS, getBuiltinWorkflow, WORKFLOW_WAKE_DO_ID } from "./builtin";
+import { BUILTIN_WORKFLOWS, getBuiltinWorkflow } from "./builtin";
 import { validateWorkflow } from "./types";
 import type { WorkflowDef, WorkflowTrigger } from "./types";
 
 const WORKFLOWS_KEY = "fd:workflows:v1";
+
+/** Hard 等一次性工作流：仅当前前端进程可见，不进入工作流列表或 localStorage。 */
+const transientWorkflows = new Map<string, WorkflowDef>();
 
 function readUserWorkflows(): WorkflowDef[] {
   try {
@@ -60,7 +63,15 @@ export function enabledWorkflows(): WorkflowDef[] {
 }
 
 export function getWorkflow(id: string): WorkflowDef | undefined {
-  return getBuiltinWorkflow(id) ?? readUserWorkflows().find((w) => w.id === id);
+  return transientWorkflows.get(id) ?? getBuiltinWorkflow(id) ?? readUserWorkflows().find((w) => w.id === id);
+}
+
+export function registerTransientWorkflow(def: WorkflowDef): void {
+  transientWorkflows.set(def.id, def);
+}
+
+export function unregisterTransientWorkflow(id: string): void {
+  transientWorkflows.delete(id);
 }
 
 /** 按名称查找（/run 命令用），大小写不敏感。 */
@@ -130,14 +141,6 @@ export function acceptSharedWorkflow(def: WorkflowDef, fromName: string): Workfl
   copy.enabled = true;
   saveWorkflow(copy);
   return copy;
-}
-
-/** 数字员工配置的工作流名称（空/已删除回落默认内置「Wake → Do」）。 */
-export function employeeWorkflowName(workflowId: string | null | undefined): string {
-  const id = (workflowId ?? "").trim() || WORKFLOW_WAKE_DO_ID;
-  return (
-    getWorkflow(id)?.name ?? getBuiltinWorkflow(WORKFLOW_WAKE_DO_ID)?.name ?? "Wake → Do"
-  );
 }
 
 // ---------------------------------------------------------------------------

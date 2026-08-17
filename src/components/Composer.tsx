@@ -42,17 +42,14 @@ import {
   manualWorkflowReview,
   workflowReviewRevision,
 } from "../workflow/runtime";
-import { employeeWorkflowName } from "../workflow/storage";
 import { ConfigSelects } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
-import { IconClue, IconFile, IconSend, IconStop, IconUndo, IconUsers } from "./icons";
+import { IconClue, IconFile, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 import { fmtTokens } from "./TurnGroup";
-
-const LAST_EMPLOYEE_KEY = "fd:lastEmployeeId";
 
 export function Composer() {
   const [text, setText] = createSignal("");
@@ -65,7 +62,6 @@ export function Composer() {
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
-  let employeePickerRef: HTMLDivElement | undefined;
   let resizeFrame: number | undefined;
   let maxInputHeight: number | undefined;
   let pasteAsPaths = false;
@@ -186,24 +182,6 @@ export function Composer() {
     state.agentKind === "opencode";
   const supportsSteer = () => supportsLiveSteer() || supportsInterruptSteer();
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
-  const [stopReason, setStopReason] = createSignal("");
-  const [employeeMenuOpen, setEmployeeMenuOpen] = createSignal(false);
-  const [selectedEmployeeId, setSelectedEmployeeId] = createSignal<string | null>(
-    localStorage.getItem(LAST_EMPLOYEE_KEY) || null,
-  );
-  const selectedEmployee = createMemo(() =>
-    state.employees.find((employee) => employee.id === selectedEmployeeId() && employee.enabled) ?? null,
-  );
-  const isNewOrdinaryThread = () => {
-    const thread = state.threads.find((item) => item.id === state.currentId);
-    return !!thread &&
-      !thread.employeeId &&
-      !thread.roamingRole &&
-      !thread.quotaPeerName &&
-      !state.loadingThread &&
-      !running() &&
-      !state.items.some((item) => item.type === "user");
-  };
   const activeClue = createMemo(() => {
     const cardId = state.threads.find((item) => item.id === state.currentId)?.activeClueCardId;
     if (!cardId) return null;
@@ -221,46 +199,9 @@ export function Composer() {
     closeThread();
     setView("clues");
   };
-  const pickEmployee = (employeeId: string | null) => {
-    setSelectedEmployeeId(employeeId);
-    if (employeeId) localStorage.setItem(LAST_EMPLOYEE_KEY, employeeId);
-    else localStorage.removeItem(LAST_EMPLOYEE_KEY);
-    setEmployeeMenuOpen(false);
-  };
-  createEffect(() => {
-    const selectedId = selectedEmployeeId();
-    if (
-      selectedId &&
-      state.employees.length > 0 &&
-      !state.employees.some((employee) => employee.id === selectedId && employee.enabled)
-    ) {
-      pickEmployee(null);
-    }
-    if (!isNewOrdinaryThread()) setEmployeeMenuOpen(false);
-  });
-  onMount(() => {
-    const closeEmployeeMenu = (event: PointerEvent) => {
-      if (!employeeMenuOpen() || employeePickerRef?.contains(event.target as Node)) return;
-      setEmployeeMenuOpen(false);
-    };
-    document.addEventListener("pointerdown", closeEmployeeMenu);
-    onCleanup(() => document.removeEventListener("pointerdown", closeEmployeeMenu));
-  });
   const requestStop = () => {
-    const thread = state.threads.find((item) => item.id === state.currentId);
-    if (thread?.employeeId && !thread.mindThread) {
-      setStopReason("");
-      setStopDialogOpen(true);
-      return;
-    }
     holdPromptQueue(state.currentId);
     void cancelTurn();
-  };
-  const confirmEmployeeStop = () => {
-    const reason = stopReason().trim();
-    setStopDialogOpen(false);
-    holdPromptQueue(state.currentId);
-    void cancelTurn(reason);
   };
 
   mountSessionShortcuts({
@@ -447,14 +388,12 @@ export function Composer() {
     if (!currentId) return;
     rememberPromptHistory(value, images);
     clearInput();
-    setEmployeeMenuOpen(false);
     if (running()) {
       enqueuePrompt(currentId, value, images);
       return;
     }
     releasePromptQueue(currentId);
-    const employeeId = isNewOrdinaryThread() ? selectedEmployee()?.id ?? null : null;
-    void sendPrompt(value, images, employeeId);
+    void sendPrompt(value, images);
   };
 
   const insertSlashSuggestion = (item: SlashSuggestion) => {
@@ -839,47 +778,6 @@ export function Composer() {
         >
           <IconClue size={16} />
         </button>
-        <Show when={isNewOrdinaryThread() && state.employees.length > 0}>
-          <div ref={employeePickerRef} class="composer-employee-picker">
-            <Show when={employeeMenuOpen()}>
-              <div class="composer-employee-menu">
-                <div class="composer-employee-head">本次工作交给</div>
-                <button
-                  type="button"
-                  classList={{ "composer-employee-item": true, active: !selectedEmployeeId() }}
-                  onClick={() => pickEmployee(null)}
-                >
-                  <span>普通会话</span>
-                  <small>直接由当前模型执行</small>
-                </button>
-                <For each={state.employees.filter((employee) => employee.enabled)}>
-                  {(employee) => (
-                    <button
-                      type="button"
-                      classList={{
-                        "composer-employee-item": true,
-                        active: selectedEmployeeId() === employee.id,
-                      }}
-                      onClick={() => pickEmployee(employee.id)}
-                    >
-                      <span>{employee.name}</span>
-                      <small>{employeeWorkflowName(employee.workflowId)} · Dream 生效</small>
-                    </button>
-                  )}
-                </For>
-              </div>
-            </Show>
-            <button
-              type="button"
-              class="composer-btn employee"
-              classList={{ active: !!selectedEmployee() }}
-              onClick={() => setEmployeeMenuOpen((open) => !open)}
-              title={selectedEmployee() ? `本次工作：${selectedEmployee()!.name}` : "选择本次工作的数字员工"}
-            >
-              <IconUsers size={16} />
-            </button>
-          </div>
-        </Show>
         <span class="composer-stop-slot" classList={{ hidden: !running() }}>
           <button
             class="composer-btn stop"
@@ -899,34 +797,6 @@ export function Composer() {
           <IconSend size={16} />
         </button>
       </div>
-      <Show when={stopDialogOpen()}>
-        <div class="modal-backdrop" onClick={() => setStopDialogOpen(false)}>
-          <div class="modal stop-reason-dialog" onClick={(event) => event.stopPropagation()}>
-            <div class="modal-head">停止数字员工</div>
-            <div class="modal-body">
-              <p class="stop-reason-hint">
-                可以告诉 Dream 为什么停止；停止后会话保留，账本项会保留为失败记录。
-              </p>
-              <textarea
-                class="field-input"
-                rows={4}
-                autofocus
-                placeholder="可选：方向做偏了、范围太大、应该先请示……"
-                value={stopReason()}
-                onInput={(event) => setStopReason(event.currentTarget.value)}
-              />
-              <div class="stop-reason-actions">
-                <button class="btn secondary" onClick={() => setStopDialogOpen(false)}>
-                  取消
-                </button>
-                <button class="btn danger" onClick={confirmEmployeeStop}>
-                  {stopReason().trim() ? "提交原因并停止" : "直接停止"}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </Show>
     </div>
   );
 }

@@ -8,7 +8,7 @@
 import { createSignal } from "solid-js";
 import { api } from "../ipc";
 import type { PromptImage, Thread, Item } from "../types";
-import { getWorkflow, isWorkflowEnabled } from "./storage";
+import { getWorkflow, isWorkflowEnabled, unregisterTransientWorkflow } from "./storage";
 import {
   evalTransition,
   isTerminal,
@@ -235,6 +235,7 @@ async function followTransition(
   const h = requireHost();
   if (isTerminal(transition.to)) {
     completedRoots.add(run.rootId);
+    unregisterTransientWorkflow(run.workflowId);
     pendingManualReviews.delete(threadId);
     persistRuns();
     setWorkflowReviewRevision((value) => value + 1);
@@ -246,6 +247,7 @@ async function followTransition(
   if (!next) return;
   if (run.stageCount + 1 > def.maxTotalStages) {
     completedRoots.add(run.rootId);
+    unregisterTransientWorkflow(run.workflowId);
     pendingManualReviews.delete(threadId);
     persistRuns();
     setWorkflowReviewRevision((value) => value + 1);
@@ -413,7 +415,7 @@ export function startWorkflow(
 
   return (async () => {
     const root = await api.getThread(rootId);
-    // 漫游/额度会话的执行位置不在本机，无法由本地工作流驱动；员工会话允许作为工作流根。
+    // 漫游/额度会话的执行位置不在本机，无法由本地工作流驱动。
     if (root.roamingRole || root.quotaPeerName) {
       throw new Error("工作流仅支持本地会话");
     }
@@ -512,14 +514,6 @@ export async function chooseManualWorkflowTransition(
 
 export function isActive(threadId: string): boolean {
   return activeRuns.has(threadId);
-}
-
-/** 所有进行中/暂停运行的链根会话 id（数字员工按员工会话去重轮次用）。 */
-export function runRootIds(): string[] {
-  const roots = new Set<string>();
-  for (const run of activeRuns.values()) roots.add(run.rootId);
-  for (const run of suspendedRuns.values()) roots.add(run.rootId);
-  return [...roots];
 }
 
 /** sendPrompt 失败时由 store 调用，把当前阶段挂起。 */

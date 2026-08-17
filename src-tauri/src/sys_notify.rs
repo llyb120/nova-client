@@ -1,6 +1,5 @@
 //! 跨平台系统通知：Windows 用 WinRT Toast（可点击回调），macOS 用 osascript。
 
-use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, UserAttentionType};
@@ -120,22 +119,6 @@ pub fn notify_thread_done_unfiltered(
         Some(Box::new(move || {
             focus_main_window(&app2);
             let _ = app2.emit(&event, serde_json::json!({ "threadId": tid }));
-        })),
-    );
-}
-
-/// 员工上奏通知：点击打开御书房批阅。
-pub fn notify_decision(app: &AppHandle, emp_name: &str, question: &str, event: &str) {
-    let app2 = app.clone();
-    let event = event.to_string();
-    show(
-        app,
-        &format!("「{emp_name}」有本上奏"),
-        question,
-        true,
-        Some(Box::new(move || {
-            focus_main_window(&app2);
-            let _ = app2.emit(&event, Value::Object(Default::default()));
         })),
     );
 }

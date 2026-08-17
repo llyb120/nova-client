@@ -77,6 +77,22 @@ export function buildIntegrateModelPrompt(goal: string): string {
 }
 
 /**
+ * 展开 `/hard <目标>` 的设计阶段提示词：让当前会话的主模型设计一个可立即执行的声明式工作流。
+ * 该提示词只要求输出 JSON，工作流解析、渲染与执行都由客户端在本轮结束后接管。
+ */
+export function buildHardDesignPrompt(goal: string): string {
+  return `你是 Nova 工作流设计器。为下面目标设计一个简单、高效、可立即执行的工作流。
+只输出一个 JSON 对象，不要 Markdown、代码围栏或解释。
+约束：2 到 6 个阶段；最多 12 次阶段运行；每阶段职责单一；结构必须服从任务实际复杂度。简单且确定的任务可以是直线流程；存在不确定判断、验证失败、返工或风险决策时，应设计分支或可收敛回环；不要为了复杂而复杂；至少一条路径必须明确指向 $done。
+典型结构：调查后可判定无需修改或进入实施；验证成功则结束，失败则回到实施；高风险动作可进入人工审核。只有实际需要时才使用这些结构，每个回环必须同时存在明确的退出路径，禁止无出口死循环。终点必须写成 transition.to = "$done"，不要创建名为 done、完成或结束的普通阶段。
+JSON 字段：name、entry、maxTotalStages、stages。每个 stage 包含 id、name、promptTemplate、manualReview、transitions；每条 transition 包含 to、prompt、label。
+promptTemplate 必须显式包含模板变量 {{goal}}，需要上一阶段结论时使用 {{prev}}。
+不要指定模型、触发器、权限或画布坐标。执行阶段使用 Build。
+
+目标：${goal}`;
+}
+
+/**
  * 展开「时光笔记」：新建一个训练会话，让它自己读取世界线材料文件逐级分析、
  * 必要时反问用户，最后沉淀为一个可复用的 skill。提示词只描述规则，
  * 不内嵌任何世界线内容；具体学什么由用户在会话中自行补充。

@@ -220,17 +220,9 @@ pub struct Settings {
     pub session_auto_cleanup_enabled: bool,
     /// 自动清理会话的保留时长（小时）。
     pub session_auto_cleanup_hours: u32,
-    /// 语义检索开关（关 = 用内置 BM25 关键词检索；开需配置下面的 embedding 服务）
-    pub semantic_enabled: bool,
     /// 上下文检索：none / fast。旧配置中的 super 会在加载时迁移为 fast。
     pub context_retrieval_mode: ContextRetrievalMode,
 
-    /// embedding 服务地址（OpenAI 兼容 /v1/embeddings；本地 Ollama 默认 http://localhost:11434）
-    pub embed_endpoint: String,
-    /// embedding 模型名（如 bge-m3 / nomic-embed-text / text-embedding-3-small）
-    pub embed_model: String,
-    /// embedding 服务 API key（本地服务通常留空）
-    pub embed_api_key: String,
     /// 是否周期性从会话中训练独立知识库。开启后 Lyra fast_context 也会并行召回训练知识。
     pub experience_training_enabled: bool,
     #[serde(default = "default_experience_training_agent")]
@@ -310,12 +302,7 @@ impl Default for Settings {
             update_channel: "release".into(),
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
-            semantic_enabled: false,
             context_retrieval_mode: ContextRetrievalMode::Fast,
-
-            embed_endpoint: "http://localhost:11434".into(),
-            embed_model: "bge-m3".into(),
-            embed_api_key: String::new(),
             experience_training_enabled: false,
             experience_training_agent: default_experience_training_agent(),
             experience_training_model: String::new(),

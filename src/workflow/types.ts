@@ -207,6 +207,187 @@ export function validateWorkflow(def: WorkflowDef): string[] {
   return errors;
 }
 
+function layoutGeneratedStages(stages: WorkflowStageDef[], entry: string): void {
+  const byId = new Map(stages.map((stage) => [stage.id, stage]));
+  const depth = new Map<string, number>([[entry, 0]]);
+  const visitOrder = new Map<string, number>([[entry, 0]]);
+  const queue = [entry];
+  let nextOrder = 1;
+
+  // 用从入口首次到达的层级排布主流程；回环不会把节点反复推远。
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    const stage = byId.get(id);
+    if (!stage) continue;
+    const nextDepth = (depth.get(id) ?? 0) + 1;
+    for (const transition of stage.transitions) {
+      if (isTerminal(transition.to) || !byId.has(transition.to) || depth.has(transition.to)) continue;
+      depth.set(transition.to, nextDepth);
+      visitOrder.set(transition.to, nextOrder++);
+      queue.push(transition.to);
+    }
+  }
+
+  let fallbackDepth = Math.max(0, ...depth.values()) + 1;
+  for (const stage of stages) {
+    if (depth.has(stage.id)) continue;
+    depth.set(stage.id, fallbackDepth++);
+    visitOrder.set(stage.id, nextOrder++);
+  }
+
+  const columns = new Map<number, WorkflowStageDef[]>();
+  for (const stage of stages) {
+    const d = depth.get(stage.id) ?? 0;
+    const column = columns.get(d) ?? [];
+    column.push(stage);
+    columns.set(d, column);
+  }
+
+  const maxRows = Math.max(1, ...[...columns.values()].map((column) => column.length));
+  const rowGap = 150;
+  const centerY = Math.max(180, 80 + ((maxRows - 1) * rowGap) / 2);
+  for (const [d, column] of [...columns.entries()].sort((a, b) => a[0] - b[0])) {
+    column.sort((a, b) => (visitOrder.get(a.id) ?? 0) - (visitOrder.get(b.id) ?? 0));
+    const startY = centerY - ((column.length - 1) * rowGap) / 2;
+    column.forEach((stage, row) => {
+      stage.x = 80 + d * 270;
+      stage.y = Math.round(startY + row * rowGap);
+    });
+  }
+}
+
+export function normalizeGeneratedWorkflow(raw: unknown): WorkflowDef {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Agent 未返回有效工作流");
+  }
+  const source = raw as Partial<WorkflowDef>;
+  const inputStages = Array.isArray(source.stages) ? source.stages.slice(0, 6) : [];
+  if (inputStages.length === 0) throw new Error("Agent 生成的工作流没有阶段");
+
+  const stageIds = inputStages.map((stage, index) => {
+    const candidate = stage && typeof stage === "object" ? String((stage as WorkflowStageDef).id ?? "").trim() : "";
+    return candidate || `stage_${index + 1}`;
+  });
+  const uniqueIds = stageIds.map((id, index) =>
+    stageIds.indexOf(id) === index ? id : `${id}_${index + 1}`,
+  );
+  const idMap = new Map(stageIds.map((id, index) => [id, uniqueIds[index]]));
+
+  const terminalAliases = new Set(["done", "end", "finish", "finished", "complete", "completed", "结束", "完成"]);
+  const stages: WorkflowStageDef[] = inputStages.map((value, index) => {
+    const stage = (value && typeof value === "object" ? value : {}) as Partial<WorkflowStageDef>;
+    const transitions = Array.isArray(stage.transitions) ? stage.transitions.slice(0, 4) : [];
+    return {
+      id: uniqueIds[index],
+      name: String(stage.name ?? `阶段 ${index + 1}`).trim() || `阶段 ${index + 1}`,
+      promptTemplate: String(stage.promptTemplate ?? "").trim() || `完成当前阶段负责的任务。目标：{{goal}}\n上一阶段结论：{{prev}}`,
+      mode: "build",
+      manualReview: !!stage.manualReview,
+      transitions: transitions.map((value, transitionIndex) => {
+        const transition = (value && typeof value === "object" ? value : {}) as Partial<WorkflowTransition>;
+        const target = String(transition.to ?? "").trim();
+        const normalizedTarget = target === WF_FAIL
+          ? WF_FAIL
+          : target === WF_DONE || (!idMap.has(target) && terminalAliases.has(target.toLowerCase()))
+            ? WF_DONE
+            : (idMap.get(target) ?? target);
+        return {
+          id: `route_${index + 1}_${transitionIndex + 1}`,
+          when: { kind: "always" },
+          to: normalizedTarget,
+          prompt: String(transition.prompt ?? transition.label ?? "").trim(),
+          label: String(transition.label ?? "").trim() || undefined,
+        };
+      }),
+      x: 80 + (index % 3) * 280,
+      y: 140 + Math.floor(index / 3) * 180,
+    };
+  });
+
+  const entryRaw = String(source.entry ?? stageIds[0]).trim();
+  const workflow: WorkflowDef = {
+    id: newWorkflowId("hard"),
+    name: String(source.name ?? "Hard 工作流").trim() || "Hard 工作流",
+    version: 1,
+    enabled: true,
+    entry: idMap.get(entryRaw) ?? stages[0].id,
+    maxTotalStages: Math.min(12, Math.max(stages.length, Number(source.maxTotalStages) || 12)),
+    stages,
+  };
+  // 生成模型常把终点写成普通节点、漏写出口，或产出只有回环没有退出路径的图。
+  // Hard 模式应自动补成可收敛工作流，而不是把原始 JSON 和校验错误直接暴露给用户。
+  const stageIdSet = new Set(stages.map((stage) => stage.id));
+  for (const stage of stages) {
+    for (const transition of stage.transitions) {
+      if (!isTerminal(transition.to) && !stageIdSet.has(transition.to)) transition.to = WF_DONE;
+    }
+    if (stage.transitions.length === 0) {
+      stage.transitions.push({
+        id: `route_auto_done_${stage.id}`,
+        when: { kind: "always" },
+        to: WF_DONE,
+        prompt: "当前阶段完成后结束工作流",
+        label: "完成",
+      });
+    }
+  }
+
+  const canFinish = new Set<string>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const stage of stages) {
+      if (canFinish.has(stage.id)) continue;
+      if (stage.transitions.some((transition) =>
+        isTerminal(transition.to) || canFinish.has(transition.to))) {
+        canFinish.add(stage.id);
+        changed = true;
+      }
+    }
+  }
+  for (const stage of stages) {
+    if (canFinish.has(stage.id)) continue;
+    stage.transitions.push({
+      id: `route_auto_exit_${stage.id}`,
+      when: { kind: "always" },
+      to: WF_DONE,
+      prompt: "当前回环已完成目标或继续迭代不再产生收益时结束工作流",
+      label: "完成并退出",
+    });
+  }
+  for (const stage of stages) {
+    if (stage.transitions.length <= 1) continue;
+    for (const transition of stage.transitions) {
+      if (!workflowTransitionPrompt(transition)) {
+        transition.prompt = isTerminal(transition.to) ? "目标已完成时结束" : `需要进入下一阶段 ${transition.to}`;
+      }
+    }
+  }
+
+  const reachable = new Set<string>();
+  const pending = [workflow.entry];
+  while (pending.length > 0) {
+    const id = pending.shift()!;
+    if (reachable.has(id)) continue;
+    reachable.add(id);
+    const stage = stages.find((candidate) => candidate.id === id);
+    if (!stage) continue;
+    for (const transition of stage.transitions) {
+      if (!isTerminal(transition.to)) pending.push(transition.to);
+    }
+  }
+  // 与入口断开的孤立节点不参与执行，自动移除，避免一块无关子图阻塞整个 Hard 流程。
+  for (let index = stages.length - 1; index >= 0; index--) {
+    if (!reachable.has(stages[index].id)) stages.splice(index, 1);
+  }
+  // Hard 设计只采用生成内容，不采用模型坐标：保持配置画布原有视觉，
+  // 仅按入口层级重新放置节点，让主流程从左到右、分支上下展开、回环走画布绕线。
+  layoutGeneratedStages(stages, workflow.entry);
+  const errors = validateWorkflow(workflow);
+  if (errors.length > 0) throw new Error(`Agent 生成的工作流不可运行：${errors.join("；")}`);
+  return workflow;
+}
+
 let idCounter = 0;
 /** 生成短 id（画布新建节点/转移用）。 */
 export function newWorkflowId(prefix: string): string {

@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager};
 const MAX_TRAIN_THREADS: usize = 12;
 const MAX_EXPERIENCES_PER_EXPERT: usize = 800;
 static STORE: OnceLock<Mutex<ExperienceStore>> = OnceLock::new();
+static PROJECT_IDENTITIES: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
 static TRAINING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -22,6 +23,12 @@ static TRAINING: AtomicBool = AtomicBool::new(false);
 pub struct ExperienceEntry {
     pub id: String,
     pub expert_id: String,
+    /// 产生该知识的项目标识。Git 项目按主仓库根归一，因此子目录和 worktree 共享同一标识。
+    #[serde(default)]
+    pub project_id: String,
+    /// 产生该知识的 Git 仓库根路径，用于展示与审计。
+    #[serde(default)]
+    pub project_root: String,
     /// universal = 可跨项目使用；project = 仅当前项目使用。旧数据默认 project，避免意外外泄。
     #[serde(default = "default_knowledge_scope")]
     pub knowledge_scope: String,
@@ -203,6 +210,18 @@ impl ExperienceStore {
             .unwrap_or_default();
         // 旧版是全局混合库，无法可靠判断每条知识属于哪个项目；解析不到新结构时
         // 保持 projects 为空，防止升级后继续跨项目召回。新训练会按项目重新沉淀。
+        // 项目属性属于每一条知识，而不是 UI 筛选状态。旧的项目分区数据在加载时补齐属性；
+        // key 已由 Git 主仓库根归一，同一仓库的子目录与 worktree 因而得到相同 project_id。
+        for (project_id, project) in &mut store.projects {
+            for entry in &mut project.experiences {
+                if entry.project_id.is_empty() {
+                    entry.project_id = project_id.clone();
+                }
+                if entry.project_root.is_empty() {
+                    entry.project_root = project.project_root.clone();
+                }
+            }
+        }
         store.path = path;
         store
     }
@@ -238,6 +257,15 @@ fn project_identity(cwd: &str) -> Result<(String, String), String> {
     if !path.is_dir() {
         return Err("项目目录不存在".into());
     }
+    let cache = PROJECT_IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(identity) = cache
+        .lock()
+        .map_err(|_| "项目身份缓存已损坏".to_string())?
+        .get(cwd)
+        .cloned()
+    {
+        return Ok(identity);
+    }
     let root = crate::gitwt::project_root(cwd).unwrap_or_else(|_| {
         std::fs::canonicalize(&path)
             .unwrap_or(path)
@@ -252,7 +280,12 @@ fn project_identity(cwd: &str) -> Result<(String, String), String> {
     {
         normalized = normalized.to_lowercase();
     }
-    Ok((normalized, root))
+    let identity = (normalized, root);
+    cache
+        .lock()
+        .map_err(|_| "项目身份缓存已损坏".to_string())?
+        .insert(cwd.to_string(), identity.clone());
+    Ok(identity)
 }
 
 fn project_snapshot(cwd: &str) -> Result<(String, String, ProjectExperienceStore), String> {
@@ -264,7 +297,7 @@ fn project_snapshot(cwd: &str) -> Result<(String, String, ProjectExperienceStore
 fn is_training_source_thread(thread: &Thread) -> bool {
     // 训练与世代演进自身产生的会话都标记为 experience_thread。
     // 这些会话只用于审计训练过程，禁止再次作为训练语料，避免自我回灌。
-    !thread.mind_thread && !thread.experience_thread
+    !thread.experience_thread
 }
 
 fn project_threads(state: &AppState, project_key: &str) -> Vec<Thread> {
@@ -404,6 +437,7 @@ pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value
         entry.last_used_at = now;
         json!({
             "id": entry.id, "expertId": entry.expert_id, "kind": entry.kind,
+            "projectId": entry.project_id, "projectRoot": entry.project_root,
             "knowledgeScope": entry.knowledge_scope,
             "trigger": entry.trigger, "action": entry.action, "avoid": entry.avoid, "scope": entry.scope,
             "confidence": entry.confidence, "utility": entry.utility
@@ -415,7 +449,8 @@ pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value
     let mut guard = store()?.lock().map_err(|_| "经验库锁已损坏".to_string())?;
     guard.universal_experiences = universal_entries;
     guard.projects.insert(project_key, project);
-    guard.save();
+    // 命中次数与专家激活是召回遥测，不应让每次 fast_context 都同步重写完整经验库。
+    // 保留内存态，后续训练、反馈或删除等真实写操作会一并持久化。
     Ok(
         json!({ "activatedExperts": selected, "experiences": result, "projectRoot": project_root,
         "instruction": "knowledgeScope=universal 的知识可跨项目使用；knowledgeScope=project 的知识只适用于当前 projectRoot。memory 是可参考事实，rule 是强约束，experience 仅在触发条件匹配时参考；当前会话事实始终优先。" }),
@@ -1346,6 +1381,8 @@ fn apply_training_output(
             let mut entry = ExperienceEntry {
                 id: uuid::Uuid::new_v4().to_string(),
                 expert_id: expert.expert_id.clone(),
+                project_id: project_key.to_string(),
+                project_root: project_root.to_string(),
                 knowledge_scope: knowledge_scope.clone(),
                 kind,
                 trigger: candidate.trigger,
@@ -1592,14 +1629,7 @@ mod tests {
 
     #[test]
     fn training_and_evolution_sessions_are_not_training_sources() {
-        let mut ordinary = Thread::new(
-            String::new(),
-            AgentKind::Lyra,
-            None,
-            None,
-            None,
-            false,
-        );
+        let mut ordinary = Thread::new(String::new(), AgentKind::Lyra, None, None, None, false);
         assert!(is_training_source_thread(&ordinary));
 
         ordinary.experience_thread = true;

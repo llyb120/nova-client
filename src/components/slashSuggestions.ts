@@ -46,6 +46,12 @@ export function getSlashSuggestions(
       input: "/stage ",
     },
     {
+      name: "hard",
+      description: "让当前 Agent 设计简洁工作流并立即执行",
+      kind: "Nova",
+      input: "/hard ",
+    },
+    {
       name: "fire",
       description: "分阶段执行，并用独立会话反复验收直到目标达成",
       kind: "Nova",

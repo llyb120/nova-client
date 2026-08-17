@@ -3,8 +3,6 @@ import { listen } from "@tauri-apps/api/event";
 import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
 import { CliOperationModal } from "./components/CliOperationModal";
-import { DecisionWorkbench } from "./components/DecisionWorkbench";
-import { EmployeesView } from "./components/EmployeesView";
 import { EvidenceChainView } from "./components/EvidenceChainView";
 import { HomeView } from "./components/HomeView";
 import { RoamRequestModal } from "./components/RoamRequestModal";
@@ -85,15 +83,7 @@ export default function App() {
         fallback={
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
-            <Show when={state.view === "training"} fallback={
-            <Show when={state.view === "employees"} fallback={
-              <Show when={state.view === "workbench"} fallback={<HomeView />}>
-                <DecisionWorkbench />
-              </Show>
-            }>
-              <EmployeesView />
-            </Show>
-            }>
+            <Show when={state.view === "training"} fallback={<HomeView />}>
               <TrainingGroundView />
             </Show>
           }>
