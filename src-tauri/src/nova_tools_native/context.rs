@@ -55,11 +55,6 @@ const MAX_DEPS: usize = 8;
 const MAX_DEP_FILES: usize = 4;
 const MAX_IMPACT: usize = 20;
 const MAX_GRAPH_TERMS: usize = 12;
-/// 泛词护栏：无显式锚点且命中文件数超过仓库代码文件数的 1/6（封顶/保底）时，
-/// 跳过种子分析、反向图遍历等重型精确符号分析，走轻量降级路径直接输出候选清单。
-const WIDE_QUERY_RATIO: usize = 6;
-const WIDE_QUERY_MIN_CAP: usize = 20;
-const WIDE_QUERY_MAX_CAP: usize = 200;
 /// 反向 import 图无论变更规模都做增量补丁：大仓库一次 rebase/批量改动不应触发
 /// O(全部 import × resolve_specifier) 的整图重建；补丁只动受影响边（先按 importer
 /// 删旧边，再按新 import 表加边），复杂度与变更文件数成正比。
@@ -2475,92 +2470,6 @@ fn compact_evidence_miss(
     lines.join("\n")
 }
 
-/// 泛词降级路径：无显式锚点且命中文件爆炸时，跳过种子/反向图等精确符号分析，
-/// 直接对命中文件做轻量排序 + 紧凑输出。每个文件只出路径和命中行摘要，
-/// 末尾提示用户用精确符号名深查。目标延迟 <200ms（一次 rg + 排序，无磁盘重读）。
-fn wide_context_fallback(
-    _root: &Path,
-    revision: &str,
-    task: &str,
-    keywords: &[String],
-    _terms: &[String],
-    hit_files: &HashMap<String, Vec<SearchRow>>,
-    file_keywords: &HashMap<String, HashSet<String>>,
-    keyword_counts: &HashMap<String, usize>,
-    hit_order: &[String],
-    all: &[String],
-    budget: usize,
-    hard: usize,
-) -> Result<String, String> {
-    // 轻量排序：路径分 + 命中密度 + 关键词覆盖数，不做 subject_match / seed 分析
-    let mut scored: Vec<(String, i64)> = hit_order
-        .iter()
-        .filter_map(|file| {
-            let rows = hit_files.get(file)?;
-            let mut score = score_path(file) + rows.len().min(8) as i64 * 4;
-            // 关键词覆盖度：命中的不同关键词越多越相关
-            if let Some(matched) = file_keywords.get(file) {
-                score += matched.len() as i64 * 25;
-                // 稀有词加权：低频关键词比高频泛词更有区分度
-                for term in matched {
-                    let count = *keyword_counts.get(term).unwrap_or(&1);
-                    let weight = if count <= 40 {
-                        15
-                    } else if count <= 200 {
-                        8
-                    } else {
-                        2
-                    };
-                    score += weight;
-                }
-            }
-            Some((file.clone(), score))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-    // 预算内输出候选文件清单
-    let max_show = (budget / 40).max(8).min(30);
-    let mut out = vec![format!(
-        "# CTX WIDE @{revision}  命中 {} 文件 / 共 {} 代码文件",
-        hit_files.len(),
-        all.len(),
-    )];
-    if !task.is_empty() {
-        out.push(format!("task: {task}"));
-    }
-    if !keywords.is_empty() {
-        out.push(format!("keywords: {}", keywords.join(", ")));
-    }
-    out.push(format!(
-        "hint: 泛词查询命中过多，已降级为文件清单。用 polaris + 精确符号名深查具体文件。"
-    ));
-    out.push(String::new());
-
-    let hard_limit = hard * 64 / 100;
-    let mut shown = 0usize;
-    for (file, score) in scored.iter().take(max_show) {
-        let rows = &hit_files[file];
-        // 每文件最多 3 个命中行摘要
-        let samples: Vec<String> = rows
-            .iter()
-            .take(3)
-            .map(|row| format!("  :{} {}", row.ln, clip(&row.text)))
-            .collect();
-        let entry = format!("## {file}  (score {score})\n{}", samples.join("\n"));
-        let entry_bytes = entry.len() + out.iter().map(|line: &String| line.len() + 1).sum::<usize>();
-        if entry_bytes > hard_limit && shown > 0 {
-            break;
-        }
-        out.push(entry);
-        shown += 1;
-    }
-    if scored.len() > shown {
-        out.push(format!("… +{} more files", scored.len() - shown));
-    }
-    Ok(out.join("\n"))
-}
-
 /// 硬 MISS 时的"你是不是想找"：把未命中锚点拆成词，一次批量检索后从命中行提取
 /// 包含这些词的真实标识符，按覆盖词数/频次/是否定义行打分。只给生产代码里的
 /// 符号；测试/文档命中不算。找不到相近符号时返回空，MISS 保持原样。
@@ -3507,54 +3416,6 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     });
     let mut all = (*all).clone();
     trace("fast_context.search_and_files", stage);
-
-    // 构建命中文件索引（轻量：内存操作，无磁盘 IO）
-    let mut hit_files: HashMap<String, Vec<SearchRow>> = HashMap::new();
-    let mut file_keywords = HashMap::<String, HashSet<String>>::new();
-    let mut line_keywords = HashMap::<(String, usize), HashSet<String>>::new();
-    let mut keyword_counts = HashMap::<String, usize>::new();
-    let mut hit_order = Vec::new();
-    for row in &rows {
-        if !hit_files.contains_key(&row.file) {
-            hit_order.push(row.file.clone());
-        }
-        let lower = row.text.to_lowercase();
-        for term in &terms {
-            if row.text.contains(term) || lower.contains(&term.to_lowercase()) {
-                file_keywords
-                    .entry(row.file.clone())
-                    .or_default()
-                    .insert(term.clone());
-                line_keywords
-                    .entry((row.file.clone(), row.ln))
-                    .or_default()
-                    .insert(term.clone());
-                *keyword_counts.entry(term.clone()).or_default() += 1;
-            }
-        }
-        let file_rows = hit_files.entry(row.file.clone()).or_default();
-        if file_rows.iter().any(|existing| existing.ln == row.ln)
-            || file_rows.len() >= MAX_HITS_PER_FILE
-        {
-            continue;
-        }
-        file_rows.push(row.clone());
-    }
-
-    // 泛词护栏：无显式锚点且命中文件爆炸时，走轻量降级路径。
-    // 精确符号分析（seed/planned_terms/反向图）在泛词场景产出的全是噪声，
-    // 且逐文件 source() 读磁盘 + 链式 import 展开是延迟的主要放大器。
-    let wide_cap = (all.len() / WIDE_QUERY_RATIO).clamp(WIDE_QUERY_MIN_CAP, WIDE_QUERY_MAX_CAP);
-    if explicit_anchors.is_empty() && files.is_empty() && hit_files.len() > wide_cap {
-        let wide_start = Instant::now();
-        let result = wide_context_fallback(
-            root, &revision, &task, &keywords, &terms, &hit_files, &file_keywords, &keyword_counts, &hit_order, &all, budget, hard,
-        );
-        trace("fast_context.wide_fallback", wide_start);
-        trace("fast_context.total", total_start);
-        return result;
-    }
-
     let resolved_anchors = explicit_anchors
         .iter()
         .filter(|keyword| production_anchor_hit(&rows, keyword))
@@ -3604,6 +3465,37 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         {
             all.push(file.clone());
         }
+    }
+    let mut hit_files: HashMap<String, Vec<SearchRow>> = HashMap::new();
+    let mut file_keywords = HashMap::<String, HashSet<String>>::new();
+    let mut line_keywords = HashMap::<(String, usize), HashSet<String>>::new();
+    let mut keyword_counts = HashMap::<String, usize>::new();
+    let mut hit_order = Vec::new();
+    for row in rows {
+        if !hit_files.contains_key(&row.file) {
+            hit_order.push(row.file.clone());
+        }
+        let lower = row.text.to_lowercase();
+        for term in &terms {
+            if row.text.contains(term) || lower.contains(&term.to_lowercase()) {
+                file_keywords
+                    .entry(row.file.clone())
+                    .or_default()
+                    .insert(term.clone());
+                line_keywords
+                    .entry((row.file.clone(), row.ln))
+                    .or_default()
+                    .insert(term.clone());
+                *keyword_counts.entry(term.clone()).or_default() += 1;
+            }
+        }
+        let file_rows = hit_files.entry(row.file.clone()).or_default();
+        if file_rows.iter().any(|existing| existing.ln == row.ln)
+            || file_rows.len() >= MAX_HITS_PER_FILE
+        {
+            continue;
+        }
+        file_rows.push(row);
     }
     // 短语关键词按拆出的单词判定命中；非锚点关键词看是否出现在命中行。
     let missed_all = keywords
@@ -6490,59 +6382,6 @@ mod tests {
             out.contains("docs/queries/minigame.sql") || out.contains("docs/queries/minigame.md"),
             "{out}"
         );
-    }
-
-    #[test]
-    fn wide_query_falls_back_to_file_listing() {
-        let d = tempdir().unwrap();
-        // 构造一个小仓库，用泛词 "state" 写入足够多的文件使 hit_files 超过 wide_cap。
-        // wide_cap = max(all.len()/6, 20)，6 个文件 → cap=20，需要 >20 个命中文件。
-        // 用 25 个文件各含 "state" 确保触发。
-        for i in 0..25 {
-            fs::write(
-                d.path().join(format!("module_{i:02}.ts")),
-                format!("export const render{i} = 'render';
-export function process{i}() {{ return render{i}; }}\n"),
-            )
-            .unwrap();
-        }
-        let out = fast_context(
-            d.path(),
-            serde_json::json!({"task":"render 渲染逻辑"}),
-        )
-        .unwrap();
-        assert!(out.starts_with("# CTX WIDE"), "{out}");
-        assert!(out.contains("泛词查询命中过多"), "{out}");
-        // 应包含文件清单
-        assert!(out.contains("module_00.ts"), "{out}");
-        // 不应包含精确分析的输出段
-        assert!(!out.contains("## EDIT"), "{out}");
-    }
-
-    #[test]
-    fn anchored_query_never_triggers_wide_fallback() {
-        let d = tempdir().unwrap();
-        // 即使命中文件多，有显式锚点也不降级
-        for i in 0..25 {
-            fs::write(
-                d.path().join(format!("module_{i:02}.ts")),
-                format!("export const render{i} = 'render';\n"),
-            )
-            .unwrap();
-        }
-        fs::write(
-            d.path().join("core.ts"),
-            "export function renderEngine() { return 'render'; }\n",
-        )
-        .unwrap();
-        let out = fast_context(
-            d.path(),
-            serde_json::json!({"keywords":["renderEngine"]}),
-        )
-        .unwrap();
-        // 有锚点 → 走正常路径（不输出 CTX WIDE 头）
-        assert!(!out.starts_with("# CTX WIDE"), "{out}");
-        assert!(out.contains("renderEngine"), "{out}");
     }
 
 }
