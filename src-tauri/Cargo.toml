@@ -38,6 +38,7 @@ walkdir = "2"
 similar = "2"
 unicode-normalization = "0.1"
 aho-corasick = "1"
+big-dipper = { path = "../tools/big-dipper" }
 ignore = "0.4"
 wait-timeout = "0.2"
 rtk = { path = "../vendor/rtk" }

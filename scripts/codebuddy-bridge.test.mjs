@@ -51,7 +51,7 @@ assert.equal(permissionModeFor("bypass"), "bypassPermissions");
 assert.equal(permissionModeFor("plan"), "plan");
 
 const batchPolicy = codeBuddyBatchToolPolicy({ mode: "build" }, { NOVA_FAST_CONTEXT: "1" });
-assert.match(batchPolicy, /Nova MCP tool polaris/);
+assert.match(batchPolicy, /Nova MCP tools? polaris/);
 assert.match(batchPolicy, /call nova-tools polaris first/);
 assert.match(batchPolicy, /Do not re-discover the same keywords/);
 assert.doesNotMatch(batchPolicy, /plan\/read-only/);

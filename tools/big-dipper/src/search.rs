@@ -193,7 +193,7 @@ pub fn parse_query(q: &str, alias: &[(&str, &[&str])]) -> Parsed {
     // 标识符 token
     let mut raw_idents = Vec::new();
     let mut cur = String::new();
-    let mut flush = |cur: &mut String, out: &mut Vec<String>| {
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
         if cur.chars().count() >= 2 {
             out.push(std::mem::take(cur));
         } else {
@@ -272,32 +272,68 @@ pub struct Prepared {
     pub bm25: Bm25f,
 }
 
-/// 由符号表构建检索文档 + BM25F 统计（一次性，常驻内存复用）。
-pub fn prepare(files: &HashMap<String, Vec<Sym>>) -> Prepared {
+/// 检索文档构建的最小符号输入。big_dipper 自带 scanner::Sym 与 polaris 的 Symbol 都可映射到它，
+/// 使两侧共享同一份符号索引时不必各自扫描。
+pub struct SymInput<'a> {
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub ln: u32,
+    pub end: u32,
+    pub sig: &'a str,
+}
+
+fn push_doc(docs: &mut Vec<Doc>, file: &str, name: &str, kind: &str, ln: u32, end: u32, sig: &str) {
+    let name_subs = split_ident(name);
+    let mut name_field = name_subs.clone();
+    name_field.push(name.to_lowercase());
+    docs.push(Doc {
+        id: docs.len(),
+        file: file.to_string(),
+        name: name.to_string(),
+        kind: kind.to_string(),
+        ln,
+        end,
+        sig: sig.to_string(),
+        noise: is_noise_path(file),
+        acr: acronym(name),
+        tri: trigrams(name),
+        name_subs,
+        fields: [name_field, path_tokens(file), sig_tokens(sig)],
+    });
+}
+
+/// 从任意符号源构建检索文档 + BM25F 统计（一次性，常驻内存复用）。
+/// `files` 为 (仓库相对路径, 该文件符号清单) 的迭代器。
+pub fn prepare_from<'a, I>(files: I) -> Prepared
+where
+    I: IntoIterator<Item = (&'a str, Vec<SymInput<'a>>)>,
+{
     let mut docs = Vec::new();
     for (file, syms) in files {
         for s in syms {
-            let name_subs = split_ident(&s.name);
-            let mut name_field = name_subs.clone();
-            name_field.push(s.name.to_lowercase());
-            docs.push(Doc {
-                id: docs.len(),
-                file: file.clone(),
-                name: s.name.clone(),
-                kind: s.kind.to_string(),
-                ln: s.ln,
-                end: s.end,
-                sig: s.sig.clone(),
-                noise: is_noise_path(file),
-                acr: acronym(&s.name),
-                tri: trigrams(&s.name),
-                name_subs,
-                fields: [name_field, path_tokens(file), sig_tokens(&s.sig)],
-            });
+            push_doc(&mut docs, file, s.name, s.kind, s.ln, s.end, s.sig);
         }
     }
     let bm25 = Bm25f::new(&docs);
     Prepared { docs, bm25 }
+}
+
+/// 由符号表构建检索文档 + BM25F 统计（big_dipper 自带扫描器路径）。
+pub fn prepare(files: &HashMap<String, Vec<Sym>>) -> Prepared {
+    prepare_from(files.iter().map(|(file, syms)| {
+        (
+            file.as_str(),
+            syms.iter()
+                .map(|s| SymInput {
+                    name: &s.name,
+                    kind: s.kind,
+                    ln: s.ln,
+                    end: s.end,
+                    sig: &s.sig,
+                })
+                .collect::<Vec<_>>(),
+        )
+    }))
 }
 
 // ---------------------------------------------------------------- 通道一：BM25F
@@ -442,7 +478,7 @@ pub struct SearchResult {
 }
 
 /// 模糊检索主入口：只召回排序，不做精确解析。
-pub fn fuzzy_search(p: &Prepared, query: &str, limit: usize, alias: &[(&str, &[&str])]) -> SearchResult {
+pub fn big_dipper_search(p: &Prepared, query: &str, limit: usize, alias: &[(&str, &[&str])]) -> SearchResult {
     let t0 = Instant::now();
     let parsed = parse_query(query, alias);
 
@@ -555,7 +591,8 @@ pub fn fuzzy_search(p: &Prepared, query: &str, limit: usize, alias: &[(&str, &[&
     raw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     raw.truncate(limit);
 
-    // 置信度门控：Top1 绝对证据 + Top1/Top2 margin（阈值待真实查询集校准）
+    // 置信度门控：Top1 绝对证据 + Top1/Top2 margin（阈值待真实查询集校准）。
+    // 无精确证据时要求更大 margin 才自动展开，避免错别字查询误进 polaris。
     let mut verdict = "none";
     if let Some(top1) = raw.first() {
         let margin = raw
@@ -563,9 +600,9 @@ pub fn fuzzy_search(p: &Prepared, query: &str, limit: usize, alias: &[(&str, &[&
             .map(|t2| top1.1 / t2.1.max(1e-9))
             .unwrap_or(f64::INFINITY);
         let strong = top1.2 || top1.3.iter().any(|e| e.starts_with("ident:exact"));
-        verdict = if strong || margin >= 1.5 {
+        verdict = if strong || margin >= 2.0 {
             "high"
-        } else if margin >= 1.15 || top1.3.len() >= 2 {
+        } else if margin >= 1.2 || top1.3.len() >= 2 {
             "medium"
         } else {
             "low"
@@ -644,14 +681,14 @@ mod tests {
     #[test]
     fn typo_recall_via_ngram() {
         let p = prep_one("getIndex");
-        let res = fuzzy_search(&p, "getindx", 5, DEFAULT_ALIAS);
+        let res = big_dipper_search(&p, "getindx", 5, DEFAULT_ALIAS);
         assert_eq!(res.candidates[0].symbol, "getIndex", "{:?}", res.candidates.iter().map(|c| &c.symbol).collect::<Vec<_>>());
     }
 
     #[test]
     fn exact_ident_is_high_confidence() {
         let p = prep_one("retryAuth");
-        let res = fuzzy_search(&p, "retryAuth", 5, DEFAULT_ALIAS);
+        let res = big_dipper_search(&p, "retryAuth", 5, DEFAULT_ALIAS);
         assert_eq!(res.verdict, "high");
         assert_eq!(res.candidates[0].symbol, "retryAuth");
     }
@@ -659,14 +696,14 @@ mod tests {
     #[test]
     fn chinese_alias_recall() {
         let p = prep_one("retryAuth");
-        let res = fuzzy_search(&p, "鉴权重试", 5, DEFAULT_ALIAS);
+        let res = big_dipper_search(&p, "鉴权重试", 5, DEFAULT_ALIAS);
         assert_eq!(res.candidates[0].symbol, "retryAuth");
     }
 
     #[test]
     fn acronym_channel_recall() {
         let p = prep_one("AuthHttpRetry");
-        let res = fuzzy_search(&p, "ahr", 5, DEFAULT_ALIAS);
+        let res = big_dipper_search(&p, "ahr", 5, DEFAULT_ALIAS);
         assert_eq!(res.candidates[0].symbol, "AuthHttpRetry");
         assert!(res.candidates[0].evidence.iter().any(|e| e == "ident:acronym"));
     }

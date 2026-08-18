@@ -1,0 +1,16 @@
+[package]
+name = "big-dipper"
+version = "0.1.0"
+edition = "2021"
+description = "模糊符号检索：BM25F + 标识符 + n-gram 三通道，RRF 融合，输出候选句柄交给 polaris 精确展开"
+
+[lib]
+name = "big_dipper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "big-dipper"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

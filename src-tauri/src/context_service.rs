@@ -78,6 +78,27 @@ fn dispatch(request: ContextRequest, token: &str) -> Result<Value, String> {
     let output = match request.method.as_str() {
         "polaris" => crate::nova_tools_native::context::fast_context(root, params),
         "code_map" => crate::nova_tools_native::context::code_map(root, params),
+        "big_dipper" => {
+            let query = params
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(10);
+            if query.trim().is_empty() {
+                Err("big_dipper 缺少 query".into())
+            } else {
+                // 复用 polaris 共享的符号索引（同一 build_index），不单独扫描
+                let prepared =
+                    crate::nova_tools_native::context::big_dipper_shared_prepared(root)?;
+                let res = big_dipper::big_dipper_search_with(&prepared, &query, limit);
+                Ok(big_dipper::index::handoff_json(&res, root))
+            }
+        }
         _ => Err(format!(
             "unknown context service method: {}",
             request.method
@@ -325,5 +346,53 @@ mod tests {
             "secret",
         );
         assert!(!response.ok);
+    }
+
+    #[test]
+    fn big_dipper_uses_shared_polaris_index() {
+        // 真实临时仓库：big_dipper 方法应命中 polaris 同一份索引里的符号
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(
+            d.path().join("src/auth.ts"),
+            "export function retryAuthToken(t: string) { return t; }\n",
+        )
+        .unwrap();
+        let req = serde_json::json!({
+            "token": "secret",
+            "method": "big_dipper",
+            "root": d.path().to_string_lossy(),
+            "params": { "query": "retryAuthToken", "limit": 3 },
+        });
+        let response = response_for_line(&req.to_string(), "secret");
+        assert!(response.ok, "{:?}", response.error);
+        let result = response.result.unwrap();
+        let text = result.as_str().unwrap_or("").to_string();
+        assert!(text.contains("retryAuthToken"), "{text}");
+        assert!(text.contains("expand"), "{text}");
+    }
+
+    #[test]
+    fn big_dipper_rejects_missing_root() {
+        let response = response_for_line(
+            r#"{"token":"secret","method":"big_dipper","root":"/nonexistent-nova-root","params":{"query":"getIndex"}}"#,
+            "secret",
+        );
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("not a directory"));
+    }
+
+    #[test]
+    fn big_dipper_rejects_empty_query() {
+        let root = std::env::temp_dir();
+        let req = serde_json::json!({
+            "token": "secret",
+            "method": "big_dipper",
+            "root": root.to_string_lossy(),
+            "params": { "query": "   " },
+        });
+        let response = response_for_line(&req.to_string(), "secret");
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("缺少 query"));
     }
 }

@@ -11,7 +11,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0" && globalContextServiceConfigured();
   const root = resolve(cwd);
   if (!fastContext) return {};
-  return {
+  const tools = {
     polaris: {
       description: POLARIS_DESCRIPTION,
       inputSchema: {
@@ -41,6 +41,7 @@ export function createCursorFilesystemTools(cwd, options = {}) {
       },
     },
   };
+  return tools;
 }
 
 /**

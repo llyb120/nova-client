@@ -3192,7 +3192,211 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     polaris(root, params)
 }
 
+// ---------------------------------------------------------------- big_dipper 并入
+//
+// 模糊召回内聚进 polaris：模型只需记住一个工具。polaris 按输入信号自动分流——
+//   - 模糊信号（含 CJK / 带空格短语 / 非标识符关键词）→ 先跑 big_dipper 召回；
+//       high 置信 → 用召回的 symbol/path 重写 keywords/files 继续精确展开（输出带召回回声）；
+//       medium/low/none → 直接返回候选句柄让模型消歧或补充信息，不做精确展开；
+//   - 精确输入（合法标识符/路径）→ 零开销直通 fast_context_run。
+// 每个 workspace 的检索预备（符号索引 + BM25F）跨调用缓存，命中索引不失效时不重建。
+
+/// big_dipper 检索预备：与 polaris 共享同一份符号索引（build_index 全量 + MEMO + 磁盘缓存）。
+/// context_service 的 big_dipper 方法与 polaris 内部模糊分流都从这里取，进程内只扫一次。
+pub(crate) fn big_dipper_shared_prepared(
+    root: &Path,
+) -> Result<Arc<big_dipper::search::Prepared>, String> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (usize, Arc<big_dipper::search::Prepared>)>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = normalize_root(root);
+    // 与 polaris 共享同一份符号索引：build_index 全量（None 目标、depth 0）走 MEMO + 磁盘缓存，
+    // 按 size+mtime 逐文件失效，与 polaris 自身的索引维护完全一致，不重复扫描。
+    let (index, all_files, _reverse) = build_index(root, None, 0, None);
+    // 失效戳：文件清单规模 + 已入符号的文件数 + 符号总数。任何文件增删或重扫都会改变它。
+    let sym_files = index.files.len();
+    let sym_total: usize = index.files.values().map(|e| e.syms.len()).sum();
+    let stamp = all_files
+        .len()
+        .saturating_mul(1_000_000)
+        .saturating_add(sym_files.saturating_mul(1_000))
+        .saturating_add(sym_total);
+    let mut guard = cache.lock().map_err(|e| e.to_string())?;
+    if let Some((s, prep)) = guard.get(&key) {
+        if *s == stamp {
+            return Ok(Arc::clone(prep));
+        }
+    }
+    // 从 polaris 的 IndexView 直接构建检索文档，复用同一份符号边界
+    let prep = Arc::new(big_dipper::search::prepare_from(index.files.iter().map(
+        |(file, entry)| {
+            (
+                file.as_str(),
+                entry
+                    .syms
+                    .iter()
+                    .map(|s| big_dipper::search::SymInput {
+                        name: &s.name,
+                        kind: &s.kind,
+                        ln: s.ln as u32,
+                        end: s.end as u32,
+                        sig: &s.sig,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        },
+    )));
+    guard.insert(key, (stamp, Arc::clone(&prep)));
+    Ok(prep)
+}
+
+/// 判断是否为模糊信号：合法标识符或路径视为精确，否则（含 CJK、带空格短语、过短/非法字符）模糊。
+fn polaris_is_fuzzy_token(token: &str) -> bool {
+    let t = token.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains('/') || t.contains('\\') {
+        return false; // 路径视为精确
+    }
+    if t.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return true; // CJK 业务词
+    }
+    if t.chars().any(|c| c.is_whitespace()) {
+        return true; // 带空格短语
+    }
+    let mut chars = t.chars();
+    let first_ok = chars
+        .next()
+        .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        .unwrap_or(false);
+    let rest_ok = t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    !(first_ok && rest_ok && t.len() >= 2)
+}
+
+/// 收集模糊输入文本。触发条件刻意收窄——
+///   - 存在任一精确 keywords（合法标识符/路径）→ 不分流，避免自然语言 task 或混入的
+///     短语把原本的精确锚点流程劫持进模糊召回；
+///   - 仅当 keywords 全为模糊（或没有 keywords）且 task 含模糊信号 → 分流。
+/// task 在有精确 keywords 时只是排序提示，不参与触发。
+fn polaris_fuzzy_query(params: &Value) -> Option<String> {
+    let keywords: Vec<String> = params
+        .get("keywords")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let task = params
+        .get("task")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let has_precise_kw = keywords.iter().any(|k| !polaris_is_fuzzy_token(k));
+    if has_precise_kw {
+        return None; // 有精确锚点就走原 polaris 流程
+    }
+    let fuzzy_kw: Vec<&str> = keywords
+        .iter()
+        .map(String::as_str)
+        .filter(|k| polaris_is_fuzzy_token(k))
+        .collect();
+    let task_fuzzy = !task.is_empty() && polaris_is_fuzzy_token(task);
+    if fuzzy_kw.is_empty() && !task_fuzzy {
+        return None;
+    }
+    // 拼装召回查询：模糊关键词 + task（task 往往是自然语言，召回信息量最大）
+    let mut parts: Vec<&str> = fuzzy_kw;
+    if !task.is_empty() {
+        parts.push(task);
+    }
+    let q = parts.join(" ");
+    if q.trim().is_empty() { None } else { Some(q) }
+}
+
+/// polaris 前置模糊分流。返回 Some(output) 表示已由 big_dipper 处理（直通候选或自动展开），
+/// None 表示精确输入，继续走原 polaris 流程。
+fn polaris_big_dipper_route(root: &Path, params: &Value) -> Option<Result<String, String>> {
+    // 显式重试/内部递归不再重复分流
+    if params
+        .get("_anchorRetry")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || params
+            .get("_bigDipperRouted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let query = polaris_fuzzy_query(params)?;
+    let prepared = match big_dipper_shared_prepared(root) {
+        Ok(p) => p,
+        Err(e) => return Some(Err(e)),
+    };
+    let res = big_dipper::big_dipper_search_with(&prepared, &query, 5);
+    match res.verdict.as_str() {
+        "high" => {
+            let Some(top) = res.candidates.first() else {
+                return Some(Ok("# CTX MISS\nbig_dipper 高置信但无候选".into()));
+            };
+            // 用召回句柄重写 keywords/files，继续精确展开
+            let mut routed = params.clone();
+            if let Some(obj) = routed.as_object_mut() {
+                obj.insert("keywords".into(), serde_json::json!([top.symbol]));
+                obj.insert("files".into(), serde_json::json!([top.path]));
+                obj.insert("_bigDipperRouted".into(), Value::Bool(true));
+            }
+            match fast_context_run(root, &routed) {
+                Ok(out) if !out.starts_with("# CTX MISS") => Some(Ok(format!(
+                    "# big_dipper 召回: {query} → {} ({}:{}，置信 high，已自动精确展开)\n{out}",
+                    top.symbol, top.path, top.lines.0
+                ))),
+                // 召回句柄展开失败：退回候选列表让模型自行判断
+                _ => Some(Ok(big_dipper_candidates_text(&query, &res))),
+            }
+        }
+        // medium/low/none：不自动展开，返回候选让模型消歧或补充
+        _ => Some(Ok(big_dipper_candidates_text(&query, &res))),
+    }
+}
+
+fn big_dipper_candidates_text(query: &str, res: &big_dipper::search::SearchResult) -> String {
+    if res.candidates.is_empty() {
+        return format!(
+            "# CTX MISS\nbig_dipper 未找到 ` {query} ` 的可靠候选。请补充目录/模块/符号类型后重试，或改用 files 精确指定。"
+        );
+    }
+    let mut out = format!(
+        "# big_dipper 模糊召回（{query}，置信 {}，未自动展开）\n按证据选择其一，用其 symbol 作 keywords、path 作 files 重新调用 polaris 精确展开：\n",
+        res.verdict
+    );
+    for (i, c) in res.candidates.iter().enumerate() {
+        out.push_str(&format!(
+            "#{} {} `{}` ({}:{}..{})  证据: {}\n    {}\n",
+            i + 1,
+            c.kind,
+            c.symbol,
+            c.path,
+            c.lines.0,
+            c.lines.1,
+            c.evidence.join(", "),
+            c.snippet
+        ));
+    }
+    out
+}
+
 pub fn polaris(root: &Path, params: Value) -> Result<String, String> {
+    // 模糊信号前置分流：big_dipper 召回，高置信自动精确展开，否则返回候选
+    if let Some(routed) = polaris_big_dipper_route(root, &params) {
+        return routed;
+    }
     let out = fast_context_run(root, &params)?;
     if params
         .get("_anchorRetry")
@@ -5433,6 +5637,71 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn big_dipper_route_detects_fuzzy_and_precise() {
+        // 纯精确标识符 → 不分流
+        assert!(polaris_fuzzy_query(&serde_json::json!({"keywords":["getIndex"]})).is_none());
+        assert!(polaris_fuzzy_query(&serde_json::json!({"files":["src/a.ts"]})).is_none());
+        // 混合精确锚点 + 自然语言 task → 不分流（精确锚点优先，task 只是排序提示）
+        assert!(polaris_fuzzy_query(&serde_json::json!({
+            "keywords":["modeChoics"],"task":"switch mode handling"
+        })).is_none());
+        assert!(polaris_fuzzy_query(&serde_json::json!({
+            "keywords":["plan mode","PlanMode"],"task":"Remove plan mode UI"
+        })).is_none());
+        // keywords 全模糊 / 仅 task 模糊 → 分流
+        assert!(polaris_fuzzy_query(&serde_json::json!({"keywords":["鉴权重试"]})).is_some());
+        assert!(polaris_fuzzy_query(&serde_json::json!({"keywords":["retry logic"]})).is_some());
+        assert!(polaris_fuzzy_query(&serde_json::json!({"task":"检查鉴权失败后的重试"})).is_some());
+        // 标识符判定
+        assert!(!polaris_is_fuzzy_token("getIndex"));
+        assert!(!polaris_is_fuzzy_token("src/a.ts"));
+        assert!(polaris_is_fuzzy_token("鉴权"));
+        assert!(polaris_is_fuzzy_token("retry logic"));
+    }
+
+    #[test]
+    fn big_dipper_route_auto_expands_on_high_confidence() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/auth.ts"),
+            "export function retryAuth(token: string) {\n  return token;\n}\n",
+        )
+        .unwrap();
+        // 模糊中文输入 → big_dipper 召回 → 高置信自动精确展开
+        let out = polaris(
+            d.path(),
+            serde_json::json!({"keywords":["鉴权重试"],"task":"鉴权失败后的重试"}),
+        )
+        .unwrap();
+        assert!(out.contains("big_dipper 召回"), "{out}");
+        assert!(out.contains("retryAuth"), "{out}");
+    }
+
+    #[test]
+    fn big_dipper_route_returns_candidates_when_not_high() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        // 多个相似符号，使召回落在非 high 档
+        fs::write(
+            d.path().join("src/a.ts"),
+            "export function retryConnect() {}\nexport function retrySend() {}\nexport function retryRead() {}\n",
+        )
+        .unwrap();
+        let out = polaris(
+            d.path(),
+            serde_json::json!({"keywords":["重试连接"]}),
+        )
+        .unwrap();
+        // 非高置信：返回候选列表而非自动展开
+        assert!(
+            out.contains("big_dipper") && (out.contains("未自动展开") || out.contains("召回")),
+            "{out}"
+        );
+    }
+
     #[test]
     fn chinese_task_extracts_generic_ngrams_without_stop_words() {
         let tokens = task_tokens("检查支持中心的问题反馈处理器");
