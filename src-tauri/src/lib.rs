@@ -367,12 +367,16 @@ fn run_experience_thread_cleanup(app: &tauri::AppHandle) -> usize {
     let now = now_ms();
     let candidates: Vec<String> = {
         let store = state.store.lock().unwrap();
-        store
+        let mut ids: Vec<String> = store
             .threads
             .iter()
             .filter(|thread| experience_thread_is_expired(thread, now))
             .map(|thread| thread.id.clone())
-            .collect()
+            .collect();
+        // 训练与世代演进为同一批内容在多个时点各开一条会话；只保留每个时点组
+        // 里最新的一条，其余无论是否到 24h 都清掉，避免列表被同批次会话刷屏。
+        ids.extend(stale_experience_run_thread_ids(&store));
+        ids
     };
     let deletable = candidates
         .into_iter()
@@ -382,6 +386,61 @@ fn run_experience_thread_cleanup(app: &tauri::AppHandle) -> usize {
         return 0;
     }
     remove_threads(app, &state, deletable).len()
+}
+
+/// 一次训练/演进批次 = 首个会话（无 parent）+ 其后代（parent 指向它）。
+/// 返回除每批最新一条外的所有会话 id，保持训练视图只剩最近时点。
+fn stale_experience_run_thread_ids(store: &crate::threads::ThreadStore) -> Vec<String> {
+    let experience: Vec<&Thread> = store
+        .threads
+        .iter()
+        .filter(|thread| thread.experience_thread)
+        .collect();
+    let mut child_parent: HashMap<&str, &str> = HashMap::new();
+    for thread in &experience {
+        if let Some(parent) = thread
+            .parent_thread_id
+            .as_deref()
+            .filter(|parent| experience.iter().any(|t| t.id == *parent))
+        {
+            child_parent.insert(thread.id.as_str(), parent);
+        }
+    }
+    let root_of = |thread: &Thread| -> String {
+        child_parent
+            .get(thread.id.as_str())
+            .map(|parent| (*parent).to_string())
+            .unwrap_or_else(|| thread.id.clone())
+    };
+    // 演进审核会话没有 parent，但按「同项目同标题前缀」聚成一组，同样只留最新。
+    let mut groups: HashMap<String, Vec<&Thread>> = HashMap::new();
+    for thread in &experience {
+        let parent = child_parent.get(thread.id.as_str());
+        let key = if parent.is_some() {
+            format!("run:{}", root_of(thread))
+        } else if thread.title.starts_with("世代演进审核") {
+            format!("evolve:{}:{}", thread.cwd, thread.title)
+        } else {
+            format!("run:{}", root_of(thread))
+        };
+        groups.entry(key).or_default().push(*thread);
+    }
+    let mut stale = Vec::new();
+    for (_, members) in groups {
+        if members.len() <= 1 {
+            continue;
+        }
+        let newest = members
+            .iter()
+            .max_by_key(|thread| thread.updated_at)
+            .map(|thread| thread.id.as_str());
+        for member in members {
+            if Some(member.id.as_str()) != newest {
+                stale.push(member.id.clone());
+            }
+        }
+    }
+    stale
 }
 
 fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {

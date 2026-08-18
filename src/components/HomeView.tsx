@@ -945,7 +945,8 @@ export function HomeView() {
     }
   };
 
-  const recent = () => state.threads.slice(0, 6);
+  // 训练与世代演进会话只在训练视图展示，不进入首页最近会话。
+  const recent = () => state.threads.filter((t) => !t.experienceThread).slice(0, 6);
 
   return (
     <main class="home">
