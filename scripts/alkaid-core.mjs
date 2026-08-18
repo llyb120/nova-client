@@ -589,7 +589,7 @@ export function buildAlkaidSystemPrompt(options = {}) {
       : options.shellConfig?.kind === "powershell"
         ? "- bash: 执行 PowerShell 命令"
         : "- bash: 执行 Bash 命令",
-    fastContext ? "- polaris: 代码检索（模糊召回 + 精确展开一体），一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG" : null,
+    fastContext ? "- polaris: 一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG（内部批量 rg + 增量符号索引）" : null,
     options.readOnly ? null : "- edit / write: 单文件编辑或写入",
     process.env.NOVA_EXPERIENCE_TOOLS === "1" ? "- feedback_memory: 对 polaris 返回且实际使用的训练知识闭环反馈" : null,
   ].filter(Boolean);

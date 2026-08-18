@@ -80,22 +80,21 @@ function novaToolsMcpServers(request, env = process.env, createServer = createSd
     readOnly: request.mode === "plan",
   });
   const polaris = batchTools.polaris;
-  const toolDefs = [
-    tool("polaris", polaris.description, {
-      keywords: z.array(z.string().min(1)).min(1).max(5).optional(),
-      query: z.string().min(1).optional(),
-      task: z.string().min(1).optional(),
-      files: z.array(z.string().min(1)).min(1).max(6).optional(),
-      budget: z.number().int().min(100).max(4000).optional(),
-      maxChars: z.number().int().min(4000).max(80000).optional(),
-      coupling: z.boolean().optional(),
-    }, async (args) => ({ content: [{ type: "text", text: await polaris.execute(args) }] })),
-  ];
   return {
     "nova-tools": createServer({
       name: "nova-tools",
       version: "1.0.0",
-      tools: toolDefs,
+      tools: [
+        tool("polaris", polaris.description, {
+          keywords: z.array(z.string().min(1)).min(1).max(5).optional(),
+          query: z.string().min(1).optional(),
+          task: z.string().min(1).optional(),
+          files: z.array(z.string().min(1)).min(1).max(6).optional(),
+          budget: z.number().int().min(100).max(4000).optional(),
+          maxChars: z.number().int().min(4000).max(80000).optional(),
+          coupling: z.boolean().optional(),
+        }, async (args) => ({ content: [{ type: "text", text: await polaris.execute(args) }] })),
+      ],
     }),
   };
 }

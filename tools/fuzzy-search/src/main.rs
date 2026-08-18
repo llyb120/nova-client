@@ -1,8 +1,20 @@
-//! 索引构建：文件遍历（遵守 .gitignore）、符号磁盘缓存（size+mtime 逐文件失效）、检索文档与 JSON 输出。
+//! fuzzy-search — 独立模糊符号检索原型（零外部依赖）
+//!
+//! 用法：
+//!   fuzzy-search "鉴权失败后的重试" [--limit 10] [--json] [--bench] [--root DIR]
+//!   fuzzy-search "getIndx"     # 拼写纠错走 n-gram 通道
+//!   fuzzy-search "AHR"         # 缩写走标识符通道
+//!
+//! 职责边界：只做模糊召回与排序，输出候选句柄 + 证据 + 置信度；
+//! 高置信句柄交给 polaris 做精确解析（path + symbol + lines 即精确定位输入）。
 
-use crate::gitignore::GitignoreStack;
-use crate::scanner::{is_code_file, scan_source, Sym};
-use crate::search::{prepare, Prepared, SearchResult};
+mod gitignore;
+mod scanner;
+mod search;
+
+use gitignore::GitignoreStack;
+use scanner::{is_code_file, scan_source, Sym};
+use search::{fuzzy_search, prepare, SearchResult, DEFAULT_ALIAS};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -71,7 +83,7 @@ fn walk(dir: &Path, rel: &str, out: &mut Vec<String>, stack: &mut GitignoreStack
     stack.pop(rel);
 }
 
-pub fn list_code_files(root: &Path) -> Vec<String> {
+fn list_code_files(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = GitignoreStack::new();
     walk(root, "", &mut out, &mut stack);
@@ -86,7 +98,7 @@ type CacheEntry = (u64, u64, u32, Vec<Sym>); // size, mtime_secs, mtime_nanos, s
 fn cache_path(root: &Path) -> PathBuf {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     root.to_string_lossy().to_lowercase().hash(&mut h);
-    let dir = env::temp_dir().join("big-dipper-cache");
+    let dir = env::temp_dir().join("fuzzy-search-cache");
     let _ = fs::create_dir_all(&dir);
     dir.join(format!("symbols-{:x}-v{}.txt", h.finish(), CACHE_VERSION))
 }
@@ -188,12 +200,11 @@ pub struct IndexStats {
 }
 
 /// 构建/更新符号缓存：只重扫过期文件。
-pub fn build_symbol_cache(root: &Path, use_disk: bool) -> (HashMap<String, Vec<Sym>>, IndexStats) {
+fn build_symbol_cache(root: &Path, use_disk: bool) -> (HashMap<String, Vec<Sym>>, IndexStats) {
     let t0 = Instant::now();
     let list = list_code_files(root);
     let file_set: HashSet<&String> = list.iter().collect();
-    let mut cache: HashMap<String, CacheEntry> =
-        if use_disk { load_cache(root) } else { HashMap::new() };
+    let mut cache: HashMap<String, CacheEntry> = if use_disk { load_cache(root) } else { HashMap::new() };
     cache.retain(|f, _| file_set.contains(f));
     let mut scanned = 0;
     let mut result: HashMap<String, Vec<Sym>> = HashMap::new();
@@ -230,12 +241,6 @@ pub fn build_symbol_cache(root: &Path, use_disk: bool) -> (HashMap<String, Vec<S
     )
 }
 
-/// 一次性准备：建/更新符号缓存 + 构建检索文档与 BM25F 统计。
-pub fn prepare_root(root: &Path, use_disk: bool) -> Prepared {
-    let (files, _stats) = build_symbol_cache(root, use_disk);
-    prepare(&files)
-}
-
 // ---------------------------------------------------------------- 输出
 
 fn json_escape(s: &str) -> String {
@@ -254,7 +259,7 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-pub fn to_json(res: &SearchResult) -> String {
+fn to_json(res: &SearchResult) -> String {
     let mut s = String::from("{\n");
     s.push_str(&format!(
         "  \"verdict\": \"{}\",\n  \"elapsedMs\": {:.1},\n  \"docCount\": {},\n  \"candidates\": [\n",
@@ -281,64 +286,7 @@ pub fn to_json(res: &SearchResult) -> String {
     s
 }
 
-// ---------------------------------------------------------------- 交接协议（handoff）
-//
-// big_dipper_search 与 polaris（北极星）的交接契约：
-//   high   → decision=expand，targets 取 candidates[0].handle，可直接调 polaris
-//   medium → decision=disambiguate，targets 取前 3 个，由调用方选定后再调 polaris
-//   low/none → decision=clarify/none，targets 为空，调用方应补充信息或报未找到
-// 行号仅在同一次进程交接内有效；跨会话传递必须退回 path+symbol 重新定位。
-
-pub fn handoff_json(res: &SearchResult, root: &Path) -> String {
-    // snapshot：git 仓库取 HEAD commit，否则取内容戳（文件数:符号数）
-    let snapshot = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("content:{}", res.doc_count));
-    let (decision, take) = match res.verdict.as_str() {
-        "high" => ("expand", 1),
-        "medium" => ("disambiguate", 3),
-        "low" => ("clarify", 0),
-        _ => ("none", 0),
-    };
-    let mut s = String::from("{\n");
-    s.push_str(&format!("  \"snapshot\": \"{}\",\n", json_escape(&snapshot)));
-    s.push_str(&format!("  \"verdict\": \"{}\",\n", res.verdict));
-    s.push_str(&format!("  \"decision\": \"{}\",\n", decision));
-    s.push_str("  \"targets\": [\n");
-    let picks: Vec<_> = res.candidates.iter().take(take).collect();
-    for (i, c) in picks.iter().enumerate() {
-        s.push_str(&format!(
-            "    {{ \"path\": \"{}\", \"symbol\": \"{}\", \"kind\": \"{}\", \"lines\": [{}, {}], \"score\": {}, \"evidence\": [{}] }}{}\n",
-            json_escape(&c.path),
-            json_escape(&c.symbol),
-            c.kind,
-            c.lines.0,
-            c.lines.1,
-            c.score,
-            c.evidence.iter().map(|e| format!("\"{}\"", json_escape(e))).collect::<Vec<_>>().join(", "),
-            if i + 1 < picks.len() { "," } else { "" }
-        ));
-    }
-    s.push_str("  ],\n");
-    // 给调用方的下一步建议
-    let hint = match decision {
-        "expand" => "polaris_exact(targets, expand={definitions:true,directCallers:true}, budget=600)",
-        "disambiguate" => "present targets to caller; on selection call polaris_exact with the chosen handle",
-        "clarify" => "ask for module/path/kind hint and retry big_dipper_search",
-        _ => "report not found; do NOT guess",
-    };
-    s.push_str(&format!("  \"next\": \"{}\"\n", hint));
-    s.push_str("}\n");
-    s
-}
-
-pub fn print_human(res: &SearchResult) {
+fn print_human(res: &SearchResult) {
     println!(
         "verdict: {}  query: {:.1}ms  docs: {}",
         res.verdict, res.elapsed_ms, res.doc_count
@@ -354,5 +302,87 @@ pub fn print_human(res: &SearchResult) {
         );
         println!("    evidence: {}", c.evidence.join(", "));
         println!("    sig: {}", c.snippet);
+    }
+}
+
+// ---------------------------------------------------------------- CLI
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut limit = 10usize;
+    let mut json = false;
+    let mut bench = false;
+    let mut query: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" => {
+                i += 1;
+                if i < args.len() {
+                    root = PathBuf::from(&args[i]);
+                }
+            }
+            "--limit" => {
+                i += 1;
+                if i < args.len() {
+                    limit = args[i].parse().unwrap_or(10);
+                }
+            }
+            "--json" => json = true,
+            "--bench" => bench = true,
+            a if !a.starts_with("--") && query.is_none() => query = Some(a.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    if query.is_none() && !bench {
+        eprintln!("usage: fuzzy-search \"query\" [--limit N] [--json] [--bench] [--root DIR]");
+        std::process::exit(2);
+    }
+
+    let t_idx = Instant::now();
+    let (files, stats) = build_symbol_cache(&root, true);
+    let t_prep = Instant::now();
+    let prep = prepare(&files);
+    eprintln!(
+        "index: {} files (+{} scanned, {:.0}ms), {} symbols, prepare {:.0}ms",
+        stats.total,
+        stats.scanned,
+        stats.elapsed_ms,
+        prep.docs.len(),
+        t_prep.elapsed().as_secs_f64() * 1000.0
+    );
+    let _ = t_idx;
+
+    if bench {
+        let queries = [
+            "getIndex",
+            "getIndx",
+            "scanSource",
+            "鉴权重试",
+            "context recall eval",
+            "render message list",
+            "STRIP",
+        ];
+        let _ = fuzzy_search(&prep, "warmup", 1, DEFAULT_ALIAS); // 预热
+        for q in queries {
+            let r = fuzzy_search(&prep, q, 5, DEFAULT_ALIAS);
+            println!(
+                "{:>8.1}ms  {:<6}  {:<24}  ->  {}",
+                r.elapsed_ms,
+                r.verdict,
+                q,
+                r.candidates.first().map(|c| c.symbol.as_str()).unwrap_or("(none)")
+            );
+        }
+        return;
+    }
+
+    let res = fuzzy_search(&prep, query.as_deref().unwrap(), limit, DEFAULT_ALIAS);
+    if json {
+        print!("{}", to_json(&res));
+    } else {
+        print_human(&res);
     }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "fuzzy-search"
+version = "0.1.0"
+edition = "2021"
+description = "模糊符号检索原型：BM25F + 标识符 + n-gram 三通道，RRF 融合，输出候选句柄交给 polaris 精确展开"
+
+[[bin]]
+name = "fuzzy-search"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
