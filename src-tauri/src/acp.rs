@@ -1570,6 +1570,10 @@ impl AcpManager {
                 None => return,
             }
         };
+        // 大熊座训练/演进会话静默完成，不弹系统通知。
+        if title.starts_with("经验训练") || title.starts_with("世代演进") {
+            return;
+        }
         let body = match stop_reason {
             "end_turn" | "max_turn_requests" => "任务已完成，点击查看结果",
             "cancelled" | "force_cancelled" => "任务已停止",

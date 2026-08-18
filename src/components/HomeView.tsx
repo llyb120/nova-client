@@ -1,4 +1,4 @@
-import { message } from "@tauri-apps/plugin-dialog";
+﻿import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 
 import { api } from "../ipc";
@@ -596,17 +596,10 @@ export function HomeView() {
         const result = await api.trainExperience(cwd());
         setText("");
         setSlashStart(null);
+        // 大熊座训练静默进行：成功/无新会话均不弹窗，错误仍提示；
+        // 训练完成会切换到训练视图，用户可在那里看到最新结果。
+        if (!result.trained && result.reason === "noNewSessions") return;
         setView("training");
-        await message(
-          result.trained
-            ? (result.learned ?? 0) > 0
-              ? `经验训练已完成，新学习 ${result.learned} 条经验。`
-              : "训练完成，但模型判断这些会话中没有可复用经验。"
-            : result.reason === "noNewSessions"
-              ? "没有尚未训练的新会话。"
-              : "本次无需训练。",
-          { kind: "info" },
-        );
       } catch (error) {
         await message(String(error), { kind: "error" });
       } finally {

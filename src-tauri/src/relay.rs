@@ -2243,9 +2243,9 @@ impl RelayManager {
         let app = self.app.clone();
         let to = env.from.clone();
         tauri::async_runtime::spawn(async move {
-            // Vega 没有独立登录凭证文件：先在出借方把生效配置（含密钥解析）导出，
-            // 再走统一的凭证打包加密链路
-            let alkaid_config = if matches!(agent_kind, AgentKind::Alkaid) {
+            // Vega/Lyra 没有独立登录凭证文件（两者共用同一份配置）：先在出借方把
+            // 生效配置（含密钥解析）导出，再走统一的凭证打包加密链路
+            let alkaid_config = if matches!(agent_kind, AgentKind::Alkaid | AgentKind::Lyra) {
                 match app
                     .state::<AppState>()
                     .alkaid
@@ -2260,7 +2260,7 @@ impl RelayManager {
                             "quota.rejected",
                             json!({
                                 "reqId": req_id,
-                                "error": format!("Vega 额度共享失败：{error}"),
+                                "error": format!("{} 额度共享失败：{error}", agent_kind.label()),
                             }),
                         );
                         return;
