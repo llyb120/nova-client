@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 const { scanSource, innermostUnit, getIndex } = await import("./ctx-index.mjs");
-const { codeMap, findSymbols, searchText } = await import("./ctx-core.mjs");
+const { codeMap, searchText } = await import("./ctx-core.mjs");
 
 /** 建一个一次性 git 仓库当夹具，避免依赖本仓库内容。 */
 async function fixture(files) {
@@ -171,7 +171,7 @@ test("code_map: 默认给文件清单, scope 给符号大纲", async () => {
   }
 });
 
-test("searchText: fast_context 与 find_symbols 共用批量搜索抽象", async () => {
+test("searchText: polaris 使用批量搜索抽象", async () => {
   const dir = await fixture({
     "src/a.ts": "export function sharedSearch() { return 1; }\n",
     "src/b.ts": "export const use = sharedSearch();\n",
@@ -198,21 +198,6 @@ test("searchText: files 可把后续图扩张限定到候选文件", async () =>
   }
 });
 
-test("find_symbols: 区分定义与引用", async () => {
-  const dir = await fixture({
-    "src/a.ts": "export function pick() {\n  return 1;\n}\n",
-    "src/b.ts": "import { pick } from './a';\nexport const v = pick();\n",
-  });
-  try {
-    const out = await findSymbols({ names: ["pick", "missingSymbol"] }, dir);
-    assert.match(out, /## pick\s+defs=1 refs=3/);
-    assert.match(out, /DEF src\/a\.ts:1-3/);
-    assert.match(out, /src\/b\.ts:2/);
-    assert.match(out, /## missingSymbol\s+defs=0 refs=0/);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
 test("focused index: 冷启动只扫描命中文件和直接依赖，不全扫仓库", async () => {
   const files = {
     "src/target.ts": "import { helper } from './helper';\nexport function target() { return helper(); }\n",

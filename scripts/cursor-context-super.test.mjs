@@ -657,11 +657,11 @@ assert.doesNotMatch(cursorBatchToolPolicy(), /Do not use read_files even if it a
 assert.doesNotMatch(cursorBatchToolPolicy(), /must use edit_files/);
 assert.match(cursorBatchToolPolicy(), /Write\/Edit\/StrReplace/);
 if (process.env.NOVA_FAST_CONTEXT !== "0") {
-  assert.match(cursorBatchToolPolicy(), /call fast_context once/);
+  assert.match(cursorBatchToolPolicy(), /call polaris once/);
   assert.match(cursorBatchToolPolicy(), /Do not re-discover the same keywords/);
   assert.match(cursorBatchToolPolicy(), /batched rg and an incremental symbol index/);
 } else {
-  assert.doesNotMatch(cursorBatchToolPolicy(), /fast_context/);
+  assert.doesNotMatch(cursorBatchToolPolicy(), /polaris/);
 }
 assert.doesNotMatch(cursorBatchToolPolicy(), /Cursor Grep is also allowed/);
 assert.doesNotMatch(cursorBatchToolPolicy(), /you must search untracked files/);
@@ -699,8 +699,7 @@ try {
   assert.equal(agentTools.read_files, undefined);
   assert.equal(agentTools.edit_files, undefined);
   if (process.env.NOVA_FAST_CONTEXT !== "0") {
-    assert.equal(typeof agentTools.fast_context.execute, "function");
-    assert.equal(typeof agentTools.find_symbols.execute, "function");
+    assert.equal(typeof agentTools.polaris.execute, "function");
   }
   const readOnlyTools = createCursorFilesystemTools(batchCwd, { readOnly: true });
   assert.equal(readOnlyTools.edit_files, undefined);

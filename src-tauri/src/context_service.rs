@@ -70,14 +70,13 @@ fn dispatch(request: ContextRequest, token: &str) -> Result<Value, String> {
         ));
     }
     let mut params = request.params;
-    if request.method == "fast_context" {
+    if request.method == "polaris" {
         if let Some(object) = params.as_object_mut() {
             object.insert("_contextMode".into(), Value::String("fast".into()));
         }
     }
     let output = match request.method.as_str() {
-        "fast_context" => crate::nova_tools_native::context::fast_context(root, params),
-        "find_symbols" => crate::nova_tools_native::context::find_symbols(root, params),
+        "polaris" => crate::nova_tools_native::context::fast_context(root, params),
         "code_map" => crate::nova_tools_native::context::code_map(root, params),
         _ => Err(format!(
             "unknown context service method: {}",

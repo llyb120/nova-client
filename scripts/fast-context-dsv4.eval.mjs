@@ -1,14 +1,14 @@
-// fast-context-dsv4.eval.mjs — 真实模型（默认 deepseek/deepseek-v4-flash）对 fast_context 的使用行为评测
+// fast-context-dsv4.eval.mjs — 真实模型（默认 deepseek/deepseek-v4-flash）对 polaris 的使用行为评测
 //
 // 用法: node scripts/fast-context-dsv4.eval.mjs [model] [--case C1,C3] [--json]
 //
 // 每个用例起一个真实 alkaid 会话（readOnly，cwd=仓库根），记录全部 tool_start/tool_end 事件，
 // 按用例期望打分：
-//   - trigger      : 该调 fast_context 时是否调了（且在第一次检索动作之前/之中）
+//   - trigger      : 该调 polaris 时是否调了（且在第一次检索动作之前/之中）
 //   - no-over      : 不该调时是否保持克制（已知路径直接 read）
 //   - params       : 参数是否合法（keywords 1–5、files ≤6、budget 100–1200、无工具报错）
-//   - no-research  : fast_context 之后是否又用 rg/grep/git grep 重复检索（违反硬性约束）
-//   - no-reread    : fast_context 之后是否立即重读输出中已完整展示的文件段（宽松：仅统计）
+//   - no-research  : polaris 之后是否又用 rg/grep/git grep 重复检索（违反硬性约束）
+//   - no-reread    : polaris 之后是否立即重读输出中已完整展示的文件段（宽松：仅统计）
 // 结果写 scripts/fast-context-dsv4.report.json，stdout 打表。
 
 import { spawn } from "node:child_process";
@@ -24,9 +24,9 @@ const CASES = [
   {
     id: "C1",
     kind: "trigger",
-    prompt: "我要给 fast_context 工具增加一个按目录过滤的新参数 includeGlobs。请分析从 JS 工具定义到 Rust native 实现需要改哪些地方，给出修改清单，不要改代码。",
+    prompt: "我要给 polaris 工具增加一个按目录过滤的新参数 includeGlobs。请分析从 JS 工具定义到 Rust native 实现需要改哪些地方，给出修改清单，不要改代码。",
     expect: { fastContext: true, maxRgAfterFc: 0 },
-    keywordHint: /fast_context|includeGlobs/i,
+    keywordHint: /polaris|includeGlobs/i,
   },
   {
     id: "C2",
@@ -45,12 +45,12 @@ const CASES = [
     id: "C4",
     kind: "find-symbols-ok",
     prompt: "createAlkaidAgent 在哪些地方被调用？只要文件和行号，不要正文。",
-    expect: { fastContextOrFindSymbols: true },
+    expect: { fastContext: true },
   },
   {
     id: "C5",
     kind: "no-research",
-    prompt: "先用 fast_context 查 clampToolOutputText 相关的完整单元，然后仅基于它的输出总结这个函数的职责与调用方，之后不许再用 rg/grep 检索。",
+    prompt: "先用 polaris 查 clampToolOutputText 相关的完整单元，然后仅基于它的输出总结这个函数的职责与调用方，之后不许再用 rg/grep 检索。",
     expect: { fastContext: true, maxRgAfterFc: 0 },
     keywordHint: /clampToolOutputText/i,
   },
@@ -122,15 +122,14 @@ function isSearchCall(tool) {
 
 function score(testCase, result) {
   const checks = [];
-  const fcIndex = result.tools.findIndex((t) => t.name === "fast_context");
-  const fcCalls = result.tools.filter((t) => t.name === "fast_context");
-  const fsCalls = result.tools.filter((t) => t.name === "find_symbols");
-  const firstSearchIndex = result.tools.findIndex((t) => t.name !== "fast_context" && (t.name === "read" || t.name === "find_symbols" || isSearchCall(t)));
+  const fcIndex = result.tools.findIndex((t) => t.name === "polaris");
+  const fcCalls = result.tools.filter((t) => t.name === "polaris");
+  const firstSearchIndex = result.tools.findIndex((t) => t.name !== "polaris" && (t.name === "read" || isSearchCall(t)));
 
   if (testCase.expect.fastContext) {
-    checks.push({ name: "调用了 fast_context", pass: fcIndex >= 0 });
+    checks.push({ name: "调用了 polaris", pass: fcIndex >= 0 });
     if (fcIndex >= 0) {
-      checks.push({ name: "fast_context 不晚于首个 read/检索动作", pass: firstSearchIndex < 0 || fcIndex <= firstSearchIndex });
+      checks.push({ name: "polaris 不晚于首个 read/检索动作", pass: firstSearchIndex < 0 || fcIndex <= firstSearchIndex });
       if (testCase.keywordHint) {
         const kw = fcCalls[0]?.args?.keywords;
         checks.push({ name: `keywords 命中主题 (${testCase.keywordHint})`, pass: Array.isArray(kw) && kw.some((k) => testCase.keywordHint.test(k)) });
@@ -138,11 +137,8 @@ function score(testCase, result) {
     }
   }
   if (testCase.expect.fastContext === false) {
-    checks.push({ name: "未误触发 fast_context（直接 read）", pass: fcIndex < 0 });
+    checks.push({ name: "未误触发 polaris（直接 read）", pass: fcIndex < 0 });
     checks.push({ name: "确实用了 read", pass: result.tools.some((t) => t.name === "read") });
-  }
-  if (testCase.expect.fastContextOrFindSymbols) {
-    checks.push({ name: "用了 fast_context 或 find_symbols", pass: fcCalls.length + fsCalls.length > 0 });
   }
 
   for (const [i, call] of fcCalls.entries()) {
@@ -153,12 +149,12 @@ function score(testCase, result) {
     if (a.budget !== undefined && (!Number.isInteger(a.budget) || a.budget < 100 || a.budget > 1200)) problems.push(`budget=${a.budget}`);
     if (a.maxBytes !== undefined && (!Number.isInteger(a.maxBytes) || a.maxBytes < 8192 || a.maxBytes > 65536)) problems.push(`maxBytes=${a.maxBytes}`);
     if (call.isError) problems.push("工具返回错误");
-    checks.push({ name: `fast_context#${i + 1} 参数合法且无错误`, pass: problems.length === 0, detail: problems.join("; ") });
+    checks.push({ name: `polaris#${i + 1} 参数合法且无错误`, pass: problems.length === 0, detail: problems.join("; ") });
   }
 
   if (testCase.expect.maxRgAfterFc !== undefined && fcIndex >= 0) {
     const searchesAfter = result.tools.slice(fcIndex + 1).filter(isSearchCall);
-    checks.push({ name: "fast_context 之后零 rg/grep 重复检索", pass: searchesAfter.length <= testCase.expect.maxRgAfterFc, detail: searchesAfter.map((s) => String(s.args?.command ?? s.name).slice(0, 80)).join(" | ") });
+    checks.push({ name: "polaris 之后零 rg/grep 重复检索", pass: searchesAfter.length <= testCase.expect.maxRgAfterFc, detail: searchesAfter.map((s) => String(s.args?.command ?? s.name).slice(0, 80)).join(" | ") });
   }
 
   const readsAfter = fcIndex >= 0 ? result.tools.slice(fcIndex + 1).filter((t) => t.name === "read").length : 0;
@@ -168,7 +164,6 @@ function score(testCase, result) {
     summary: {
       toolCalls: result.tools.length,
       fastContextCalls: fcCalls.length,
-      findSymbolsCalls: fsCalls.length,
       readsAfterFc: readsAfter,
       toolErrors: errored.map((t) => t.name),
       sequence: result.tools.map((t) => t.name + (t.isError ? "✗" : "")).join(" → "),

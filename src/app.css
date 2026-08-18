@@ -3008,15 +3008,63 @@ button {
 .composer-btn.stop:hover {
   background: color-mix(in srgb, var(--red) 20%, transparent);
 }
+.composer-btn.workflow {
+  color: var(--text-muted);
+  background: var(--bg-active);
+  border: 1px solid var(--border);
+}
 .composer-btn.workflow:hover,
 .composer-btn.workflow.active {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-active));
 }
+.composer-workflow-picker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.composer-workflow-menu {
+  position: absolute;
+  z-index: 40;
+  right: 0;
+  bottom: calc(100% + 9px);
+  width: 240px;
+  max-height: 300px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-float);
+  box-shadow: var(--shadow-lg);
+}
+.composer-workflow-head {
+  padding: 6px 8px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.composer-workflow-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px;
+  border-radius: var(--r-sm);
+  color: var(--text);
+  text-align: left;
+}
 .composer-workflow-item:hover,
 .composer-workflow-item.active {
   background: var(--bg-active);
+}
+.composer-workflow-item.active > span {
+  color: var(--accent);
+}
+.composer-workflow-item small {
+  color: var(--text-faint);
+  font-size: 11px;
 }
 
 .composer-stop-slot {

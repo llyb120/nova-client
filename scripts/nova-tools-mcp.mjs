@@ -1,9 +1,9 @@
 /**
  * Nova context tools MCP stdio server for Devin ACP (session/new mcpServers).
- * Tools: optional fast_context/find_symbols.
+ * Tools: optional polaris.
  *
  * Env:
- *   NOVA_FAST_CONTEXT=0     — omit fast_context / find_symbols
+ *   NOVA_FAST_CONTEXT=0     — omit polaris
  *   NOVA_TOOLS_CWD          — override tool root (default: process.cwd())
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";

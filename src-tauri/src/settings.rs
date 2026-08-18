@@ -221,7 +221,7 @@ pub struct Settings {
     /// 上下文检索：none / fast。旧配置中的 super 会在加载时迁移为 fast。
     pub context_retrieval_mode: ContextRetrievalMode,
 
-    /// 是否周期性从会话中训练独立知识库。开启后 Lyra fast_context 也会并行召回训练知识。
+    /// 是否周期性从会话中训练独立知识库。开启后 Lyra polaris 也会并行召回训练知识。
     pub experience_training_enabled: bool,
     #[serde(default = "default_experience_training_agent")]
     pub experience_training_agent: String,
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_context_is_enabled_by_default() {
+    fn polaris_is_enabled_by_default() {
         let settings = Settings::default();
         assert_eq!(
             settings.context_retrieval_mode,
@@ -363,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_disabled_fast_context_migrates_to_none() {
+    fn legacy_disabled_polaris_migrates_to_none() {
         let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("settings.json"), r#"{"fastContextEnabled":false}"#).unwrap();

@@ -3271,9 +3271,28 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     let resizeTimer: number | undefined;
     let canvasVisible = false;
+    // 窗口尺寸：区分“用户拖动窗口”与“应用内部布局变化”（发送消息、切会话、
+    // 侧边栏/阶段栏开合都会改变宿主尺寸）。内部变化时旧位图会被 CSS 拉伸，
+    // 文字位图跟着缩放，表现为“字体大小闪变”，必须立即重分配并重排；
+    // 只有窗口尺寸本身连续变化（拖动）才保留 200ms 去抖，避免反复分配位图。
+    let lastWindowW = window.innerWidth;
+    let lastWindowH = window.innerHeight;
     const ro = new ResizeObserver(() => {
-      // 保留旧位图供 CSS 拉伸；停止 resize 200ms 后再分配 canvas 并重排。
+      const w = hostEl.clientWidth;
+      const h = hostEl.clientHeight;
+      const winW = window.innerWidth;
+      const winH = window.innerHeight;
+      const windowResizing = winW !== lastWindowW || winH !== lastWindowH;
+      lastWindowW = winW;
+      lastWindowH = winH;
       if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
+      if (!windowResizing && (w !== viewW || h !== viewH)) {
+        resizeTimer = undefined;
+        resizeCanvas();
+        void rebuild();
+        return;
+      }
+      // 拖动窗口：保留旧位图供 CSS 拉伸；停止 resize 200ms 后再分配 canvas 并重排。
       resizeTimer = window.setTimeout(() => {
         resizeTimer = undefined;
         resizeCanvas();

@@ -1570,6 +1570,10 @@ impl AcpManager {
                 None => return,
             }
         };
+        // 大熊座训练/演进会话静默完成，不弹系统通知。
+        if title.starts_with("经验训练") || title.starts_with("世代演进") {
+            return;
+        }
         let body = match stop_reason {
             "end_turn" | "max_turn_requests" => "任务已完成，点击查看结果",
             "cancelled" | "force_cancelled" => "任务已停止",
@@ -3242,8 +3246,8 @@ mod nova_tools_config_tests {
         let guidance = super::nova_tools_prompt_guidance(true, false);
         assert!(guidance.contains("ROUTING RULE — before choosing any tool"));
         assert!(guidance.contains("must NEVER be selected as direct tool calls"));
-        assert!(guidance.contains("fast_context, find_symbols"));
-        assert!(!guidance.contains("fast_context, find_symbols, edit_files"));
+        assert!(guidance.contains("polaris"));
+        assert!(!guidance.contains("find_symbols"));
         assert!(!guidance.contains("you must use edit_files"));
         assert!(guidance.contains("do not expect a Nova edit_files tool"));
         assert!(!guidance.contains("read_files"));
@@ -3251,7 +3255,7 @@ mod nova_tools_config_tests {
         assert!(guidance.contains("generic mcp_call_tool wrapper"));
         assert!(guidance.contains("Set server_name to the top-level string \"nova-tools\""));
         assert!(guidance.contains("\"server_name\":\"nova-tools\""));
-        assert!(guidance.contains("wording such as `use/call fast_context`"));
+        assert!(guidance.contains("wording such as `use/call polaris`"));
         assert!(guidance.contains("do not call mcp_list_tools merely to discover them"));
         assert!(guidance.contains("Never repeat a malformed call unchanged"));
         assert!(guidance.contains("Prefer minimal reads via Devin native read"));
@@ -3260,9 +3264,9 @@ mod nova_tools_config_tests {
     }
 
     #[test]
-    fn disabled_fast_context_is_absent_from_devin_guidance() {
+    fn disabled_polaris_is_absent_from_devin_guidance() {
         let guidance = super::nova_tools_prompt_guidance(false, false);
-        assert!(!guidance.contains("fast_context"));
+        assert!(!guidance.contains("polaris"));
         assert!(!guidance.contains("find_symbols"));
         assert!(!guidance.contains("read_files"));
         assert!(!guidance.contains("you must use edit_files"));
@@ -3278,7 +3282,7 @@ mod nova_tools_config_tests {
         assert!(guidance.contains("Do not mix Bash pipelines/operators with PowerShell cmdlets"));
         assert!(!super::devin_runtime_guidance(false)
             .unwrap()
-            .contains("fast_context"));
+            .contains("polaris"));
     }
 }
 
@@ -3286,10 +3290,10 @@ mod nova_tools_config_tests {
 /// Aligned with scripts/nova-batch-tools.mjs `novaDevinBatchToolPolicy`:
 /// read_files / edit_files are intentionally omitted (edit_files 全链路默认禁用，
 /// NOVA_EDIT_FILES=1 才在 MCP 工具层恢复，此处提示词同步恢复前仍按原生 edit 引导)。
-fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
+fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
     let mut tool_names: Vec<&str> = Vec::new();
-    if fast_context {
-        tool_names.extend(["fast_context", "find_symbols"]);
+    if polaris {
+        tool_names.extend(["polaris"]);
     }
     if tool_names.is_empty() {
         let mut lines = vec![
@@ -3303,8 +3307,8 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
     }
     let tools = tool_names.join(", ");
     let example =
-        r#"{"server_name":"nova-tools","tool_name":"fast_context","arguments":{"query":"cursor"}}"#;
-    let call_example_name = "fast_context";
+        r#"{"server_name":"nova-tools","tool_name":"polaris","arguments":{"query":"cursor"}}"#;
+    let call_example_name = "polaris";
     let nova_tools_phrase = format!(
         "You have Nova MCP endpoints from server nova-tools ({tools}) plus Devin built-in tools. In this Devin version, {tools} are remote MCP tool names, NOT top-level callable Devin tools."
     );
@@ -3314,8 +3318,8 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
         ),
         format!(
             "Prefer minimal reads via Devin native read: when line ranges are known, read only those segments; expand nearby context only as needed. {}Do not dump large files blindly.{}",
-            if fast_context {
-                "When location is unknown — or when you plan to modify two or more files not yet read in this session — you must call fast_context first (or find_symbols if you only need line numbers); one call typically replaces 5–10 grep+read round-trips. Then read only coverage gaps / next_reads with native read. "
+            if polaris {
+                "When location is unknown — or when you plan to modify two or more files not yet read in this session — you must call polaris first; one call typically replaces 5–10 grep+read round-trips. Then read only coverage gaps / next_reads with native read. "
             } else {
                 "When location is unknown, search first (see below), then read near hits. "
             },
@@ -3325,8 +3329,8 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
                 " For edits, use Devin native edit tools; do not expect a Nova edit_files tool. Multiple edits for the same file must be merged into one native edit call."
             }
         ),
-        if fast_context {
-            "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only fast_context (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`) or find_symbols (locations only). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with Devin native read. After fast_context/find_symbols, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside fast_context. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that fast_context did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
+        if polaris {
+            "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only polaris (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with Devin native read. After polaris, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside polaris. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that polaris did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
         } else {
             "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
         },
@@ -3338,9 +3342,9 @@ fn nova_tools_prompt_guidance(fast_context: bool, read_only: bool) -> String {
 }
 
 #[cfg(windows)]
-fn devin_runtime_guidance(fast_context: bool) -> Option<String> {
-    let search_guidance = if fast_context {
-        " Do not use Bash to recursively search when Nova fast_context/find_symbols already covers the task."
+fn devin_runtime_guidance(polaris: bool) -> Option<String> {
+    let search_guidance = if polaris {
+        " Do not use Bash to recursively search when Nova polaris already covers the task."
     } else {
         ""
     };
@@ -3350,7 +3354,7 @@ fn devin_runtime_guidance(fast_context: bool) -> Option<String> {
 }
 
 #[cfg(not(windows))]
-fn devin_runtime_guidance(_fast_context: bool) -> Option<String> {
+fn devin_runtime_guidance(_polaris: bool) -> Option<String> {
     None
 }
 

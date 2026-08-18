@@ -7,7 +7,7 @@
  */
 import { createSignal } from "solid-js";
 import { api } from "../ipc";
-import type { PromptImage, Thread, Item } from "../types";
+import type { AgentKind, PromptImage, Thread, Item } from "../types";
 import { getWorkflow, isWorkflowEnabled, unregisterTransientWorkflow } from "./storage";
 import {
   evalTransition,
@@ -421,9 +421,7 @@ export function startWorkflow(
     }
     if (h.isRunning(rootId)) throw new Error("请等待当前会话结束后再启动工作流");
 
-    if (entry.mode) {
-      await api.setThreadMode(rootId, entry.mode);
-    }
+    await applyStageConfig(rootId, entry);
     const run: WorkflowRunStep = {
       rootId,
       workflowId,
@@ -456,6 +454,29 @@ export function startWorkflow(
       throw e;
     }
   })();
+}
+
+type WorkflowStageConfig = {
+  agentKind?: AgentKind;
+  model?: string | null;
+  mode?: string;
+};
+
+/**
+ * 起点节点可配置专属后端/模型/模式；应用到 root 会话，避免创建时选错后端后
+ * 工作流仍按旧配置运行。模型只在工作流启动时覆盖一次，之后的模型切换仍是用户选择。
+ */
+async function applyStageConfig(rootId: string, config: WorkflowStageConfig): Promise<void> {
+  if (config.mode) await api.setThreadMode(rootId, config.mode);
+  const agentKind = config.agentKind?.trim();
+  const model = config.model?.trim();
+  if (!agentKind && !model) return;
+  const root = await api.getThread(rootId);
+  if (agentKind && agentKind !== root.agentKind) {
+    await api.setThreadAgent(rootId, agentKind as AgentKind, model || null, null, null);
+  } else if (model && model !== (root.model ?? "")) {
+    await api.setThreadModel(rootId, model);
+  }
 }
 
 /** acp:turn running=true：重新挂回流程。 */

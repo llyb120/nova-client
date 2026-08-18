@@ -51,16 +51,16 @@ function codeBuddyBatchToolPolicy(request, env = process.env) {
   const readOnly = request.mode === "plan";
   const fastContext = env.NOVA_FAST_CONTEXT !== "0";
   const tools = fastContext
-    ? " plus Nova MCP tools fast_context and find_symbols from server nova-tools"
+    ? " plus Nova MCP tool polaris from server nova-tools"
     : "";
   const lines = [
     `You have CodeBuddy built-in filesystem/search tools${tools}. The following tool-selection rules are hard constraints.`,
     "Prefer minimal reads: when a path and line range are known, read only that segment and expand nearby context only as needed. Do not dump large files blindly.",
     fastContext
-      ? "When edit distribution is unknown, or when a task requires understanding two or more unread files, call nova-tools fast_context first; use find_symbols only when definition/reference line numbers are sufficient. One fast_context call typically replaces 5–10 grep+read round-trips. Treat its displayed ranges as already read, and read only coverage gaps or explicitly suggested next locations."
+      ? "When edit distribution is unknown, or when a task requires understanding two or more unread files, call nova-tools polaris first. One polaris call typically replaces 5–10 grep+read round-trips. Treat its displayed ranges as already read, and read only coverage gaps or explicitly suggested next locations."
       : "When location is unknown, use a cost-bounded search first and then read only near relevant hits.",
     fastContext
-      ? "Do not re-discover the same keywords with Grep, rg, or git grep after fast_context. If fast_context reports CTX MISS, retry once using its next hint or explicit files instead of falling back to repeated searches."
+      ? "Do not re-discover the same keywords with Grep, rg, or git grep after polaris. If polaris reports CTX MISS, retry once using its next hint or explicit files instead of falling back to repeated searches."
       : "Do not use unscoped recursive grep over a repository or source root.",
     "Do not scan build artifacts, dependencies, caches, generated files, or large binary directories unless the task requires them. Keep edits focused and run the lowest-cost effective validation.",
   ];
@@ -79,14 +79,13 @@ function novaToolsMcpServers(request, env = process.env, createServer = createSd
     fastContext: true,
     readOnly: request.mode === "plan",
   });
-  const fastContext = batchTools.fast_context;
-  const findSymbols = batchTools.find_symbols;
+  const polaris = batchTools.polaris;
   return {
     "nova-tools": createServer({
       name: "nova-tools",
       version: "1.0.0",
       tools: [
-        tool("fast_context", fastContext.description, {
+        tool("polaris", polaris.description, {
           keywords: z.array(z.string().min(1)).min(1).max(5).optional(),
           query: z.string().min(1).optional(),
           task: z.string().min(1).optional(),
@@ -94,14 +93,7 @@ function novaToolsMcpServers(request, env = process.env, createServer = createSd
           budget: z.number().int().min(100).max(4000).optional(),
           maxChars: z.number().int().min(4000).max(80000).optional(),
           coupling: z.boolean().optional(),
-        }, async (args) => ({ content: [{ type: "text", text: await fastContext.execute(args) }] })),
-        tool("find_symbols", findSymbols.description, {
-          names: z.array(z.string().min(1)).min(1).optional(),
-          name: z.string().min(1).optional(),
-          query: z.string().min(1).optional(),
-          keywords: z.array(z.string().min(1)).min(1).optional(),
-          symbols: z.array(z.string().min(1)).min(1).optional(),
-        }, async (args) => ({ content: [{ type: "text", text: await findSymbols.execute(args) }] })),
+        }, async (args) => ({ content: [{ type: "text", text: await polaris.execute(args) }] })),
       ],
     }),
   };
@@ -122,7 +114,7 @@ async function* promptMessages(request, env = process.env) {
   if (policy) content.push({
     type: "text",
     text: `${policy}${env.NOVA_FAST_CONTEXT !== "0"
-      ? "\n\nCURRENT TURN ROUTING: If repository discovery/search is needed, your first repository tool call MUST be mcp__nova-tools__fast_context (the fast_context tool from MCP server nova-tools). Do not call Grep, Glob, Search, or Bash search first. Only use built-in search after fast_context when its output explicitly leaves a coverage gap."
+      ? "\n\nCURRENT TURN ROUTING: If repository discovery/search is needed, your first repository tool call MUST be mcp__nova-tools__polaris (the polaris tool from MCP server nova-tools). Do not call Grep, Glob, Search, or Bash search first. Only use built-in search after polaris when its output explicitly leaves a coverage gap."
       : ""}\n\nUser request follows:`,
   });
   for (const part of request.parts ?? []) {

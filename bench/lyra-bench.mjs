@@ -19,7 +19,7 @@ const BENCH_OPENCODE_API_KEY = process.env.BENCH_OPENCODE_API_KEY || "";
 const BENCH_CONFIG_MODEL = "opencode/deepseek-v4-flash";
 
 const TASKS = {
-  // 探索型任务（只读意图）：多轮 read/fast_context，大结果触发转存，参数流长触发投机。
+  // 探索型任务（只读意图）：多轮 read/polaris，大结果触发转存，参数流长触发投机。
   t1: {
     cwd: () => REPO,
     text: "调查这个仓库里 lyra 的 read 工具实现：输出格式（含行号前缀规则）、分段读取的 offset/limit/hasMore 语义、超限治理（govern）的触发条件与归档行为、以及 legacy 模式分别由哪些环境变量控制。给出每一项对应的文件与行号依据。",

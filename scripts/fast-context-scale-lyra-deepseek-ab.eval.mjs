@@ -8,9 +8,9 @@ const EXE = join(REPO, ".cargo-target", "debug", "nova.exe");
 const MODEL = process.env.LYRA_AB_MODEL ?? "deepseek/deepseek-v4-flash";
 const REPEATS = Number(process.env.LYRA_AB_REPEATS ?? 2);
 const CASES = [
-  { id: "scope", prompt: "先且只调用一次 fast_context，keywords 使用 search_text_scopes、scope_dirs，task 说明分析 scoped 文本检索如何约束扫描范围。然后仅依据工具输出说明调用链，不要再调用任何工具。", expect: ["search_text_scopes", "scope_dirs"] },
-  { id: "graph", prompt: "先且只调用一次 fast_context，keywords 使用 search_text_scopes、reverse_from_files，task 说明分析 scoped 检索与反向 import 图。然后仅依据输出解释两者如何降低大仓库成本，不要再调用工具。", expect: ["search_text_scopes", "reverse_from_files"] },
-  { id: "packing", prompt: "先且只调用一次 fast_context，keywords 使用 UnitCandidate、scale_optimizations_enabled，task 说明分析候选单元的预算打包。然后仅依据输出总结算法，不要再调用工具。", expect: ["UnitCandidate", "scale_optimizations_enabled"] },
+  { id: "scope", prompt: "先且只调用一次 polaris，keywords 使用 search_text_scopes、scope_dirs，task 说明分析 scoped 文本检索如何约束扫描范围。然后仅依据工具输出说明调用链，不要再调用任何工具。", expect: ["search_text_scopes", "scope_dirs"] },
+  { id: "graph", prompt: "先且只调用一次 polaris，keywords 使用 search_text_scopes、reverse_from_files，task 说明分析 scoped 检索与反向 import 图。然后仅依据输出解释两者如何降低大仓库成本，不要再调用工具。", expect: ["search_text_scopes", "reverse_from_files"] },
+  { id: "packing", prompt: "先且只调用一次 polaris，keywords 使用 UnitCandidate、scale_optimizations_enabled，task 说明分析候选单元的预算打包。然后仅依据输出总结算法，不要再调用工具。", expect: ["UnitCandidate", "scale_optimizations_enabled"] },
 ];
 
 function run(test, arm, repeat) {
