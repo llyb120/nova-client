@@ -3541,13 +3541,11 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         file_rows.push(row.clone());
     }
 
-    // 泛词护栏：命中文件爆炸时，走轻量降级路径。
+    // 泛词护栏：无显式锚点且命中文件爆炸时，走轻量降级路径。
     // 精确符号分析（seed/planned_terms/反向图）在泛词场景产出的全是噪声，
     // 且逐文件 source() 读磁盘 + 链式 import 展开是延迟的主要放大器。
-    // 短锚点（<8 字符）如 config/error/mode 本身就是泛词，命中爆炸时不受保护。
     let wide_cap = (all.len() / WIDE_QUERY_RATIO).clamp(WIDE_QUERY_MIN_CAP, WIDE_QUERY_MAX_CAP);
-    let has_strong_anchor = explicit_anchors.iter().any(|a| a.len() >= 8);
-    if !has_strong_anchor && files.is_empty() && hit_files.len() > wide_cap {
+    if explicit_anchors.is_empty() && files.is_empty() && hit_files.len() > wide_cap {
         let wide_start = Instant::now();
         let result = wide_context_fallback(
             root, &revision, &task, &keywords, &terms, &hit_files, &file_keywords, &keyword_counts, &hit_order, &all, budget, hard,
@@ -3561,11 +3559,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         .iter()
         .filter(|keyword| production_anchor_hit(&rows, keyword))
         .count();
-    // 软降级：强锚点（>8 字符）全灭但其它关键词命中生产代码时继续检索，
+    // 软降级：显式锚点全灭但其它关键词（如短语拆出的泛词）命中生产代码时继续检索，
     // 未命中锚点由头部"未命中关键词"标注；只有全部关键词零命中才硬 MISS（附 did-you-mean）。
-    // 短锚点（<8 字符）零命中不硬 MISS——它们本质是泛词，交给后续排序或降级处理。
-    let strong_anchors: Vec<&String> = explicit_anchors.iter().filter(|a| a.len() >= 8).collect();
-    if !strong_anchors.is_empty()
+    if !explicit_anchors.is_empty()
         && resolved_anchors == 0
         && files.is_empty()
         && !keywords.iter().any(|keyword| keyword_hit(&rows, keyword))
