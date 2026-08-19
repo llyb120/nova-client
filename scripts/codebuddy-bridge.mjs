@@ -291,10 +291,17 @@ async function runPrompt(lines, request) {
       pathToCodebuddyCode: cliPath,
       stderr: (data) => process.stderr.write(data),
       permissionMode: permissionModeFor(request.mode),
-      canUseTool: (tool, toolInput, options) => new Promise((resolve) => {
-        pending.set(options.toolUseID, resolve);
-        send({ type: "permission", permission: { id: options.toolUseID, permission: tool, metadata: toolInput } });
-      }),
+      canUseTool: (toolName, toolInput, options) => {
+        // 非 plan 模式下 Bash 自动放行：CLI 内置执行模型相同，逐条审批只是多一轮
+        // bridge↔Nova IPC 与用户点击，不改变实际权限边界（permissionMode 已是 bypassPermissions）。
+        if (request.mode !== "plan" && toolName === "Bash") {
+          return Promise.resolve({ behavior: "allow" });
+        }
+        return new Promise((resolve) => {
+          pending.set(options.toolUseID, resolve);
+          send({ type: "permission", permission: { id: options.toolUseID, permission: toolName, metadata: toolInput } });
+        });
+      },
     },
   });
   for await (const message of activeQuery) {
