@@ -291,10 +291,17 @@ async function runPrompt(lines, request) {
       pathToCodebuddyCode: cliPath,
       stderr: (data) => process.stderr.write(data),
       permissionMode: permissionModeFor(request.mode),
-      canUseTool: (tool, toolInput, options) => new Promise((resolve) => {
-        pending.set(options.toolUseID, resolve);
-        send({ type: "permission", permission: { id: options.toolUseID, permission: tool, metadata: toolInput } });
-      }),
+      canUseTool: (toolName, toolInput, options) => {
+        // 非 plan 模式下 Bash 自动放行：CLI 内置执行模型相同，逐条审批只是多一轮
+        // bridge↔Nova IPC 与用户点击，不改变实际权限边界（permissionMode 已是 bypassPermissions）。
+        if (request.mode !== "plan" && toolName === "Bash") {
+          return Promise.resolve({ behavior: "allow" });
+        }
+        return new Promise((resolve) => {
+          pending.set(options.toolUseID, resolve);
+          send({ type: "permission", permission: { id: options.toolUseID, permission: toolName, metadata: toolInput } });
+        });
+      },
     },
   });
   for await (const message of activeQuery) {
@@ -399,21 +406,31 @@ async function modelOptions(request) {
   }
 }
 
+async function runModels(lines, request) {
+  send({ ok: true, data: await modelOptions(request) });
+  void lines;
+}
+
+async function runTitle(lines, request) {
+  send({ ok: true, data: await generateTitle(request) });
+  void lines;
+}
+
 async function main() {
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  let request;
   try {
-    request = await readRequest(lines);
-    if (request.action === "prompt") await runPrompt(lines, request);
-    else if (request.action === "models") send({ ok: true, data: await modelOptions(request) });
-    else if (request.action === "title") send({ ok: true, data: await generateTitle(request) });
-    else throw new Error(`Unknown action: ${request.action}`);
+    while (true) {
+      const request = await readRequest(lines);
+      // bridge 常驻：一个进程串行处理多条命令；prompt 仍在每轮新建 query()，
+      // resume/sessionId 照常随请求下发，仅省去进程与 SDK 加载的冷启动。
+      if (request.action === "prompt") await runPrompt(lines, request);
+      else if (request.action === "models") await runModels(lines, request);
+      else if (request.action === "title") await runTitle(lines, request);
+      else throw new Error(`Unknown action: ${request.action}`);
+    }
   } catch (error) {
     send({ ok: false, error: error instanceof Error ? error.message : String(error) });
     process.exitCode = 1;
-  } finally {
-    lines.close();
-    if (request?.action === "models") process.exit(0);
   }
 }
 

@@ -3510,7 +3510,7 @@ fn delete_experience(cwd: String, experience_id: String) -> Result<Value, String
 
 #[tauri::command]
 async fn evolve_experiences(app: tauri::AppHandle, cwd: String) -> Result<Value, String> {
-    experience::evolve_memory(&app, &cwd).await
+    experience::evolve_memory(&app, None, &cwd).await
 }
 
 #[tauri::command]

@@ -41,12 +41,20 @@ impl SdkAdapter for CodeBuddyAdapter {
                     "NOVA_CONTEXT_RETRIEVAL_MODE",
                     settings.context_retrieval_mode.as_str().into(),
                 ),
+                // Windows 上 CodeBuddy 的 Bash 工具默认走 Git Bash；显式指定 PowerShell，
+                // 避免依赖 Git Bash 安装，同时与 Nova 自身的 PowerShell 工具约定一致。
+                #[cfg(windows)]
+                ("CODEBUDDY_CODE_SHELL", "powershell".into()),
             ],
         }
     }
 
     fn permission_prefix(&self) -> &'static str {
         "cbp"
+    }
+
+    fn keeps_bridge_alive(&self) -> bool {
+        true
     }
 
     fn generates_title(&self) -> bool {

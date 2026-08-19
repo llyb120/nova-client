@@ -1,5 +1,5 @@
 import { message } from "@tauri-apps/plugin-dialog";
-import { createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import { state } from "../store";
 import type { ExperienceEntry } from "../types";
@@ -45,11 +45,17 @@ const starLooks: Record<string, { scale: number; tint: string; glow: string }> =
   slow: { scale: 1.2, tint: "#d2e2ff", glow: "148, 186, 255" },
 };
 
+const PAGE_SIZE = 20;
+
 export function TrainingGroundView() {
   const projectCwd = () => state.trainingCwd;
   const [overview, { refetch }] = createResource(projectCwd, api.listExperiences);
   const [busy, setBusy] = createSignal(false);
   const [evolutionStatus, setEvolutionStatus] = createSignal("");
+  // 每个专家独立的分页状态；切换专家时保留各自的页码。
+  const [pages, setPages] = createSignal<Record<string, number>>({});
+  const setPage = (expertId: string, page: number) =>
+    setPages((previous) => ({ ...previous, [expertId]: Math.max(1, page) }));
   const experts = createMemo(() => {
     const nameMap = new Map<string, string>();
     for (const expert of overview()?.experts ?? []) nameMap.set(expert.id, expert.name);
@@ -67,6 +73,22 @@ export function TrainingGroundView() {
   const selectedExpert = createMemo(() => experts().find(([id]) => id === activeExpert()) ?? experts()[0]);
   const unscored = (entries: ExperienceEntry[]) =>
     entries.filter((entry) => entry.userFeedback === 0).length;
+
+  const currentPage = () => pages()[selectedExpert()?.[0] ?? ""] ?? 1;
+  const pageCount = () => Math.max(1, Math.ceil((selectedExpert()?.[2].length ?? 0) / PAGE_SIZE));
+  const pagedEntries = () => {
+    const entries = selectedExpert()?.[2] ?? [];
+    const start = (currentPage() - 1) * PAGE_SIZE;
+    return entries.slice(start, start + PAGE_SIZE);
+  };
+
+  // 数据刷新后如果当前页超出范围（比如删除了条目），自动回落到最后一页。
+  createEffect(() => {
+    const expert = selectedExpert();
+    if (!expert) return;
+    const maxPage = Math.max(1, Math.ceil(expert[2].length / PAGE_SIZE));
+    if (currentPage() > maxPage) setPage(expert[0], maxPage);
+  });
 
   // Canvas 星野：三层景深的恒星按各自频率闪烁，色温按真实恒星分布，
   // 约三分之一星点聚集在一条斜贯的银河带中，亮星带辉光与衍射星芒。
@@ -311,7 +333,7 @@ export function TrainingGroundView() {
                             "--star-glow": look().glow,
                             "--twinkle-delay": `${(index() * 0.53).toFixed(2)}s`,
                           }}
-                          onClick={() => setActiveExpert(expertId)}
+                          onClick={() => { setActiveExpert(expertId); }}
                         >
                           <span class="star-halo" aria-hidden="true" />
                           <span class="star-orbit" aria-hidden="true" />
@@ -333,7 +355,7 @@ export function TrainingGroundView() {
                         <Show when={unscored(selected()[2]) > 0}><span class="expert-pending">{unscored(selected()[2])} 条待评分</span></Show>
                       </header>
                       <div class="experience-grid">
-                        <For each={selected()[2]} fallback={<div class="expert-empty">该专家尚未产出经验</div>}>
+                        <For each={pagedEntries()} fallback={<div class="expert-empty">该专家尚未产出经验</div>}>
                           {(entry) => (
                             <article classList={{ "experience-card": true, quarantined: entry.status === "quarantined", [`kind-${entry.kind}`]: true }}>
                               <div class="experience-topline"><span class={`experience-condition kind-${entry.kind}`}>{kindLabel(entry.kind)}</span><span class="experience-condition">{entry.knowledgeScope === "universal" ? "泛用" : "项目独有"}</span><span class="experience-project" title={entry.projectRoot || "历史知识未记录来源仓库"}>{entry.projectRoot ? `仓库 · ${entry.projectRoot.replace(/[\\/]+$/, "").split(/[\\/]/).pop()}` : "来源仓库未知"}</span><span class="experience-date">更新于 {fmtDate(entry.updatedAt)}</span></div>
@@ -354,6 +376,13 @@ export function TrainingGroundView() {
                           )}
                         </For>
                       </div>
+                      <Show when={pageCount() > 1}>
+                        <div class="pagination">
+                          <button class="pagination-btn" disabled={currentPage() <= 1} onClick={() => setPage(selectedExpert()![0], currentPage() - 1)}>上一页</button>
+                          <span class="pagination-info">{currentPage()} / {pageCount()} 页 · 共 {selectedExpert()![2].length} 条</span>
+                          <button class="pagination-btn" disabled={currentPage() >= pageCount()} onClick={() => setPage(selectedExpert()![0], currentPage() + 1)}>下一页</button>
+                        </div>
+                      </Show>
                     </section>
                   )}
                 </Show>
