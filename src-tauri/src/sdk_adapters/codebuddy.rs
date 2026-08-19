@@ -53,6 +53,10 @@ impl SdkAdapter for CodeBuddyAdapter {
         "cbp"
     }
 
+    fn keeps_bridge_alive(&self) -> bool {
+        true
+    }
+
     fn generates_title(&self) -> bool {
         true
     }

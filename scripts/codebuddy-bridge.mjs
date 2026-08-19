@@ -406,21 +406,31 @@ async function modelOptions(request) {
   }
 }
 
+async function runModels(lines, request) {
+  send({ ok: true, data: await modelOptions(request) });
+  void lines;
+}
+
+async function runTitle(lines, request) {
+  send({ ok: true, data: await generateTitle(request) });
+  void lines;
+}
+
 async function main() {
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  let request;
   try {
-    request = await readRequest(lines);
-    if (request.action === "prompt") await runPrompt(lines, request);
-    else if (request.action === "models") send({ ok: true, data: await modelOptions(request) });
-    else if (request.action === "title") send({ ok: true, data: await generateTitle(request) });
-    else throw new Error(`Unknown action: ${request.action}`);
+    while (true) {
+      const request = await readRequest(lines);
+      // bridge 常驻：一个进程串行处理多条命令；prompt 仍在每轮新建 query()，
+      // resume/sessionId 照常随请求下发，仅省去进程与 SDK 加载的冷启动。
+      if (request.action === "prompt") await runPrompt(lines, request);
+      else if (request.action === "models") await runModels(lines, request);
+      else if (request.action === "title") await runTitle(lines, request);
+      else throw new Error(`Unknown action: ${request.action}`);
+    }
   } catch (error) {
     send({ ok: false, error: error instanceof Error ? error.message : String(error) });
     process.exitCode = 1;
-  } finally {
-    lines.close();
-    if (request?.action === "models") process.exit(0);
   }
 }
 
