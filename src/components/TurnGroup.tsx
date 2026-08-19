@@ -47,7 +47,10 @@ function groupMatchesAt(g: Group, items: Item[], start: number): boolean {
  * 单次开销从 O(全会话 item 数) 降到 O(尾部)，消除长会话流式时反复全量分配分组对象带来的 GC 抖动。
  * prev 的最后一组可能仍在增长，一律排除、从它的起点重算。
  */
-export function groupItems(items: Item[], prev: Group[] = []): Group[] {
+export function groupItems(rawItems: Item[], prev: Group[] = []): Group[] {
+  // feedback_memory 等内部记账工具对用户不可见：先滤掉再分组，否则它横在
+  // 「正文 → 收尾」之间会把前面的 assistant 正文一起折叠进「已处理」。
+  const items = rawItems.filter((item) => !isSilentTool(item));
   let itemIdx = 0;
   let reuse = 0;
   // 排除 prev 末组（可能仍在增长）：只复用「后面还有别的分组、因而必定已闭合」的前缀
@@ -122,6 +125,13 @@ export function turnTokenTitle(t: TurnItem | undefined | null): string | undefin
   if (t.cacheReadTokens != null) parts.push(`缓存读取 ${fmtTokens(cacheRead)}`);
   if (t.cacheWriteTokens != null) parts.push(`缓存写入 ${fmtTokens(cacheWrite)}`);
   return `${parts.join(" / ")} tokens`;
+}
+
+/** 无用户可感知输出的内部工具（训练知识闭环反馈），不进入转录。 */
+function isSilentTool(item: Item): boolean {
+  if (item.type !== "tool") return false;
+  const title = item.title;
+  return title === "feedback_memory" || title.endsWith("/ feedback_memory");
 }
 
 function isBusyItem(item: Item): boolean {
