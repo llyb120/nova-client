@@ -125,6 +125,11 @@
 .experience-delete { margin-left: 2px; }
 .experience-votes .experience-delete:hover { border-color: color-mix(in srgb, var(--danger, #c66) 40%, var(--border)); color: var(--danger, #c66); }
 .expert-empty { grid-column: 1 / -1; padding: 48px; border: 1px dashed var(--border); border-radius: 10px; color: var(--muted); text-align: center; font-size: 11px; }
+.pagination { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 18px; }
+.pagination-btn { padding: 5px 14px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel); color: var(--text); cursor: pointer; font: inherit; font-size: 11px; transition: border-color .15s ease, background .15s ease; }
+.pagination-btn:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: color-mix(in srgb, var(--accent) 6%, var(--panel)); }
+.pagination-btn:disabled { opacity: .38; cursor: default; }
+.pagination-info { color: var(--muted); font-size: 10px; letter-spacing: .02em; }
 
 
 .training-empty, .training-loading { display: flex; min-height: 220px; align-items: center; justify-content: center; flex-direction: column; color: var(--muted); text-align: center; }
