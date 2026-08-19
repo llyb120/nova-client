@@ -119,6 +119,10 @@ struct ProjectExperienceStore {
     last_evolution_at: i64,
     #[serde(default)]
     expert_activations: HashMap<String, u64>,
+    /// 是否已有演进审核待处理（演进线程已发起但尚未更新 last_evolution_at）。
+    /// 防止每分钟 tick 在审核运行期间再次触发演进。
+    #[serde(default)]
+    pending_evolution: bool,
 }
 
 impl ExperienceStore {
@@ -648,10 +652,25 @@ pub fn set_user_feedback(
     Ok(json!({ "feedback": next }))
 }
 
-pub async fn evolve_memory(app: &AppHandle, cwd: &str) -> Result<Value, String> {
-    let (project_key, project_root) = project_identity(cwd)?;
+/// 自动调度路径传入已知 project_key；手动触发传 None，由 cwd 推导。
+pub async fn evolve_memory(app: &AppHandle, project_key_hint: Option<&str>, cwd: &str) -> Result<Value, String> {
+    let (project_key, project_root) = match project_key_hint {
+        Some(key) => {
+            let (_, root) = project_identity(cwd)?;
+            (key.to_string(), root)
+        }
+        None => project_identity(cwd)?,
+    };
     if TRAINING.swap(true, Ordering::SeqCst) {
         return Err("已有一次经验训练或演进正在进行".into());
+    }
+    // 标记本项目的演进已进入流程，防止下一次 tick 在审核完成前再次触发同一项目。
+    if let Ok(store) = store() {
+        if let Ok(mut guard) = store.lock() {
+            let project = guard.project_mut(&project_key, &project_root);
+            project.pending_evolution = true;
+            guard.save();
+        }
     }
     let result = async {
         let mut settings = {
@@ -695,6 +714,7 @@ pub async fn evolve_memory(app: &AppHandle, cwd: &str) -> Result<Value, String> 
             }
             project.evolution_generation = evolved.evolution_generation;
             project.last_evolution_at = now_ms();
+            project.pending_evolution = false;
             if project.project_root.is_empty() { project.project_root = project_root.clone(); }
             guard.projects.insert(project_key.clone(), project);
             guard.save();
@@ -786,6 +806,7 @@ pub async fn evolve_memory(app: &AppHandle, cwd: &str) -> Result<Value, String> 
         }
         project.evolution_generation = evolved.evolution_generation;
         project.last_evolution_at = now_ms();
+        project.pending_evolution = false;
         project.experiences.extend(accepted_project);
         guard.universal_experiences.extend(accepted_universal);
         if project.project_root.is_empty() { project.project_root = project_root.clone(); }
@@ -798,6 +819,14 @@ pub async fn evolve_memory(app: &AppHandle, cwd: &str) -> Result<Value, String> 
         Ok(result)
     }.await;
     TRAINING.store(false, Ordering::SeqCst);
+    // 无论成功或失败都清除 pending 标记，避免永久卡死。
+    if let Ok(store) = store() {
+        if let Ok(mut guard) = store.lock() {
+            let project = guard.project_mut(&project_key, &project_root);
+            project.pending_evolution = false;
+            guard.save();
+        }
+    }
     result
 }
 
@@ -1329,13 +1358,14 @@ pub fn tick(app: &AppHandle) {
 
                 // 世代演进仍作用于知识所属项目；训练调度则不按项目轮转，而是直接从
                 // 全部来源会话里选最新的未消费会话，再由该会话自然带出项目标签。
-                let evolution = guard.projects.iter().find_map(|(_, project)| {
+                let evolution = guard.projects.iter().find_map(|(key, project)| {
                     (!project.experiences.is_empty()
-                        && now - project.last_evolution_at >= evolution_interval)
-                        .then(|| project.project_root.clone())
+                        && now - project.last_evolution_at >= evolution_interval
+                        && !project.pending_evolution)
+                        .then(|| (key.clone(), project.project_root.clone()))
                 });
                 if evolution.is_some() {
-                    return evolution.map(|root| (true, root, None));
+                    return evolution.map(|(key, root)| (true, key, root, None));
                 }
                 if now - global_last_schedule_at < training_interval {
                     return None;
@@ -1355,20 +1385,20 @@ pub fn tick(app: &AppHandle) {
                                 .unwrap_or(0)
                                 < thread.updated_at
                         });
-                        pending.then_some((thread.updated_at, project_root, thread.id))
+                        pending.then_some((thread.updated_at, project_key, project_root, thread.id))
                     })
-                    .max_by_key(|(updated_at, _, _)| *updated_at)
-                    .map(|(_, root, thread_id)| (false, root, Some(thread_id)))
+                    .max_by_key(|(updated_at, _, _, _)| *updated_at)
+                    .map(|(_, key, root, thread_id)| (false, key, root, Some(thread_id)))
             })
         }
     };
-    let Some((evolve_due, cwd, source_thread_id)) = action else {
+    let Some((evolve_due, project_key, cwd, source_thread_id)) = action else {
         return;
     };
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if evolve_due {
-            let _ = evolve_memory(&app, &cwd).await;
+            let _ = evolve_memory(&app, Some(&project_key), &cwd).await;
         } else {
             let _ = train_source_thread(&app, &cwd, false, source_thread_id.as_deref()).await;
         }
