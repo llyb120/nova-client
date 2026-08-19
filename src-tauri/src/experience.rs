@@ -341,6 +341,33 @@ fn relevance(query: &HashSet<String>, entry: &ExperienceEntry) -> f64 {
     query.intersection(&hay).count() as f64 / query.len().max(1) as f64
 }
 
+/// 词面相似度（Jaccard），用于捕获演进产生的近似重复条目。
+/// 中英文都走 terms() 的双字片段，阈值 0.65 视为语义重复。
+fn text_similarity(a: &str, b: &str) -> f64 {
+    if a.trim().is_empty() || b.trim().is_empty() {
+        return 0.0;
+    }
+    let ta = terms(a);
+    let tb = terms(b);
+    let intersection = ta.intersection(&tb).count();
+    let union = ta.union(&tb).count();
+    if union == 0 {
+        return 0.0;
+    }
+    intersection as f64 / union as f64
+}
+
+/// 两条经验是否语义重复（kind + action 近似相同）。
+fn entries_duplicate(a: &ExperienceEntry, b: &ExperienceEntry) -> bool {
+    if a.id == b.id || a.kind != b.kind || a.knowledge_scope != b.knowledge_scope {
+        return false;
+    }
+    text_similarity(&a.action, &b.action) >= 0.65
+        && (a.trigger.is_empty()
+            || b.trigger.is_empty()
+            || text_similarity(&a.trigger, &b.trigger) >= 0.45)
+}
+
 pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value, String> {
     let (project_key, project_root) = project_identity(cwd)?;
     let (mut universal, mut project) = {
@@ -732,8 +759,10 @@ pub async fn evolve_memory(app: &AppHandle, cwd: &str) -> Result<Value, String> 
             entry.avoid = candidate.avoid.trim().to_string();
             entry.scope = candidate.scope.into_iter().map(|scope| scope.trim().to_string()).filter(|scope| !scope.is_empty()).collect();
             entry.confidence = candidate.confidence.clamp(0.1, 0.95);
+            // 用相似度去重替换精确 terms 相等：演进出的新条目往往只是换了说法，
+            // 仅靠词集合完全相同根本拦不住，导致知识库越来越臃肿。
             let duplicate = evolved.experiences.iter().any(|old| original_ids.contains(&old.id) && old.status != "quarantined"
-                && old.knowledge_scope == entry.knowledge_scope && old.kind == entry.kind && terms(&old.action) == terms(&entry.action));
+                && entries_duplicate(old, &entry));
             if !duplicate { accepted_entries.push(entry); }
         }
         let created = accepted_entries.len();
@@ -1548,6 +1577,53 @@ fn evolve(store: &mut ProjectExperienceStore, configs: &[ExperienceExpertConfig]
             store.experiences[index].status = "quarantined".into();
         }
     }
+    dedupe_entries(&mut store.experiences);
+    purge_quarantined(&mut store.experiences);
+}
+
+/// 隔离超过 7 天的条目直接删除，防止经验库文件无限膨胀。
+/// 7 天足够发现误隔离并手动回滚；正常演进路径不会把近期条目长时间留在 quarantined。
+fn purge_quarantined(experiences: &mut Vec<ExperienceEntry>) {
+    let cutoff = now_ms() - 7 * 86_400_000;
+    experiences.retain(|entry| {
+        !(entry.status == "quarantined" && entry.updated_at < cutoff)
+    });
+}
+
+/// 用词面相似度把同一 expert 内的近似重复条目隔离，保留适应度最高的一条。
+fn dedupe_entries(experiences: &mut Vec<ExperienceEntry>) {
+    // 按 (expert, kind, scope) 分组，在组内做 O(n²) 查重；每组实际几十条，开销可控。
+    let mut groups: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
+    for (index, entry) in experiences.iter().enumerate() {
+        if entry.status == "quarantined" || entry.status == "candidate" {
+            continue;
+        }
+        groups
+            .entry((
+                entry.expert_id.clone(),
+                entry.kind.clone(),
+                entry.knowledge_scope.clone(),
+            ))
+            .or_default()
+            .push(index);
+    }
+    for (_, indices) in groups {
+        // 按适应度降序，保留排在前面的“最优代表”。
+        let mut sorted = indices.clone();
+        sorted.sort_by(|&a, &b| fitness(&experiences[b]).total_cmp(&fitness(&experiences[a])));
+        let mut kept: Vec<usize> = Vec::new();
+        for &index in &sorted {
+            let entry = &experiences[index];
+            if kept
+                .iter()
+                .any(|&k| entries_duplicate(&experiences[k], entry))
+            {
+                experiences[index].status = "quarantined".into();
+            } else {
+                kept.push(index);
+            }
+        }
+    }
 }
 
 fn evolve_universal(store: &mut Vec<ExperienceEntry>, configs: &[ExperienceExpertConfig]) {
@@ -1572,6 +1648,8 @@ fn evolve_universal(store: &mut Vec<ExperienceEntry>, configs: &[ExperienceExper
             store[index].status = "quarantined".into();
         }
     }
+    dedupe_entries(store);
+    purge_quarantined(store);
 }
 
 /// 完整群岛遗传世代：岛内选择、双亲继承、参数化变异、环形迁移。
@@ -1618,6 +1696,10 @@ fn evolve_generation(
             continue;
         }
         let (parent_a, parent_b) = (&island[0], &island[1]);
+        // 双亲内容高度相似时不再生成候选：子代大概率只是换说法，审核成本高且入库价值低。
+        if text_similarity(&parent_a.action, &parent_b.action) >= 0.55 {
+            continue;
+        }
         let mut child = parent_a.clone();
         child.id = uuid::Uuid::new_v4().to_string();
         child.parent_ids = vec![parent_a.id.clone(), parent_b.id.clone()];
@@ -1669,10 +1751,12 @@ fn evolve_generation(
                 .max_by(|a, b| fitness(a).total_cmp(&fitness(b)))
                 .cloned()
             {
+                // 目标岛已有高度相似的条目时跳过，避免同一条知识在不同专家之间复制。
                 if store.experiences.iter().any(|e| {
                     e.expert_id == target.id
+                        && e.status != "quarantined"
                         && e.kind == parent.kind
-                        && terms(&e.action) == terms(&parent.action)
+                        && text_similarity(&e.action, &parent.action) >= 0.65
                 }) {
                     continue;
                 }
