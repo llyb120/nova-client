@@ -129,6 +129,8 @@ export interface ThreadMeta {
   worktree?: Worktree | null;
   /** 猎户座训练会话：仅在猎户座历史展示 */
   experienceThread?: boolean;
+  /** 双子座浏览器执行会话：仅在双子座历史展示 */
+  browserThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
@@ -285,6 +287,8 @@ export interface Thread {
   worktree?: Worktree | null;
   /** 猎户座训练会话：仅在猎户座历史展示 */
   experienceThread?: boolean;
+  /** 双子座浏览器执行会话：仅在双子座历史展示 */
+  browserThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** Stage 会话动态引用的源会话。 */

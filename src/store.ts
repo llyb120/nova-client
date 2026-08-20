@@ -159,7 +159,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "clues" | "workflows" | "training";
+  view: "home" | "clues" | "workflows" | "training" | "browser";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -712,7 +712,7 @@ export async function refreshRoamingFolders() {
   }
 }
 
-export function setView(view: "home" | "clues" | "workflows" | "training") {
+export function setView(view: "home" | "clues" | "workflows" | "training" | "browser") {
   setState("view", view);
 }
 
