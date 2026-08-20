@@ -114,10 +114,8 @@ export default function BrowserView() {
       kind: action,
       target: { selector: "" },
       data: action === "record"
-        ? { recordContent: "", imagePaths: [] }
-        : action === "sessionStorage"
-          ? { storageKey: "", storageValue: "" }
-          : {},
+        ? { recordContent: "", outputName: `记录${clip.events.filter((item) => item.kind === "record").length + 1}`, imagePaths: [] }
+        : {},
     };
     updateClip(clip.id, (value) => ({ ...value, events: [...value.events, event] }));
   }
@@ -225,6 +223,20 @@ export default function BrowserView() {
   function setAnalysisPrompt(text: string) {
     const clip = activeClip();
     if (clip) updateClip(clip.id, (value) => ({ ...value, analysisPrompt: text }));
+  }
+
+  function setAnalysisRecordRef(name: string, checked: boolean) {
+    const clip = activeClip();
+    if (!clip) return;
+    updateClip(clip.id, (value) => {
+      const current = value.analysisRecordRefs || [];
+      return {
+        ...value,
+        analysisRecordRefs: checked
+          ? [...new Set([...current, name])]
+          : current.filter((item) => item !== name),
+      };
+    });
   }
 
   async function pasteTargetImages(eventId: number, event: ClipboardEvent) {
@@ -415,6 +427,7 @@ export default function BrowserView() {
     try {
       const plan: PlayPlan = await compilePlan(clip.events);
       plan.analysisPrompt = clip.analysisPrompt || "";
+      plan.analysisRecordRefs = clip.analysisRecordRefs || [];
       plan.headless = clip.headless ?? true;
       const runAgentKind = clip.runAgentKind || lastUsed.agentKind();
       const raw = await runPlanWithAgent(state.cwd || ".", plan, runAgentKind, clip.runModel || lastUsed.model(runAgentKind));
@@ -500,7 +513,6 @@ export default function BrowserView() {
                       <option value="navigate">访问网址</option>
                       <option value="key">按键</option>
                       <option value="record">记录</option>
-                      <option value="sessionStorage">设置 sessionStorage</option>
                     </select>
                     <button class="bt-btn primary" onClick={addManualStep}><IconPlus size={13} /> 新建步骤</button>
                   </div>
@@ -535,7 +547,6 @@ export default function BrowserView() {
                               <option value="key">按键</option>
                               <option value="navigate">访问网址</option>
                               <option value="record">记录</option>
-                              <option value="sessionStorage">设置 sessionStorage</option>
                             </select>
                             <div class="be-step-actions">
                               <button class="bt-icon-btn" title="上移" onClick={() => moveStep(event.id, -1)}>↑</button>
@@ -545,31 +556,25 @@ export default function BrowserView() {
                           </div>
 
                           <Show when={event.kind === "navigate"} fallback={
-                            <Show when={event.kind === "sessionStorage"} fallback={
-                              <Show when={event.kind === "record"} fallback={
-                                <>
-                                  <label class="be-field be-target-field"><span>目标元素</span><div class="be-target-input"><input value={event.target?.selector || ""} onChange={(e) => updateStep(event.id, { target: { ...event.target, selector: e.currentTarget.value } })} onPaste={(e) => void pasteTargetImages(event.id, e)} placeholder="输入 selector，或直接粘贴图片辅助定位" /><Show when={(event.target?.imagePaths || []).length > 0}><div class="be-target-images"><For each={event.target?.imagePaths || []}>{(path) => <div class="be-record-image"><span>{path}</span><button class="bt-icon-btn danger" onClick={() => removeTargetImage(event.id, path)}><IconTrash size={11} /></button></div>}</For></div></Show></div></label>
-                                  <Show when={event.kind === "input" || event.kind === "change"}>
-                                    <label class="be-field"><span>输入值</span><input value={event.data?.value || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, value: e.currentTarget.value } })} /></label>
-                                  </Show>
-                                  <Show when={event.kind === "key"}>
-                                    <label class="be-field"><span>按键</span><input value={event.data?.key || "Enter"} onChange={(e) => updateStep(event.id, { data: { ...event.data, key: e.currentTarget.value } })} /></label>
-                                  </Show>
-                                </>
-                              }>
-                                <div class="be-record-simple">
-                                  <label class="be-field be-record-content"><span>定位参考</span><textarea value={event.data?.recordContent || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, recordContent: e.currentTarget.value } })} onPaste={(e) => void pasteRecordImages(event.id, e)} placeholder="描述要定位并保存截图的页面块；也可粘贴参考图片，Agent 会结合视觉与 DOM 判断位置" /></label>
-                                  <Show when={(event.data?.imagePaths || []).length > 0}>
-                                    <div class="be-record-images">
-                                      <For each={event.data?.imagePaths || []}>{(path) => <div class="be-record-image"><span>{path}</span><button class="bt-icon-btn danger" onClick={() => removeRecordImage(event.id, path)}><IconTrash size={11} /></button></div>}</For>
-                                    </div>
-                                  </Show>
-                                </div>
-                              </Show>
+                            <Show when={event.kind === "record"} fallback={
+                              <>
+                                <label class="be-field be-target-field"><span>目标元素</span><div class="be-target-input"><input value={event.target?.selector || ""} onChange={(e) => updateStep(event.id, { target: { ...event.target, selector: e.currentTarget.value } })} onPaste={(e) => void pasteTargetImages(event.id, e)} placeholder="输入 selector，或直接粘贴图片辅助定位" /><Show when={(event.target?.imagePaths || []).length > 0}><div class="be-target-images"><For each={event.target?.imagePaths || []}>{(path) => <div class="be-record-image"><span>{path}</span><button class="bt-icon-btn danger" onClick={() => removeTargetImage(event.id, path)}><IconTrash size={11} /></button></div>}</For></div></Show></div></label>
+                                <Show when={event.kind === "input" || event.kind === "change"}>
+                                  <label class="be-field"><span>输入值</span><input value={event.data?.value || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, value: e.currentTarget.value } })} /></label>
+                                </Show>
+                                <Show when={event.kind === "key"}>
+                                  <label class="be-field"><span>按键</span><input value={event.data?.key || "Enter"} onChange={(e) => updateStep(event.id, { data: { ...event.data, key: e.currentTarget.value } })} /></label>
+                                </Show>
+                              </>
                             }>
                               <div class="be-record-simple">
-                                <label class="be-field"><span>键</span><input value={event.data?.storageKey || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, storageKey: e.currentTarget.value } })} placeholder="sessionStorage key" /></label>
-                                <label class="be-field"><span>值</span><textarea value={event.data?.storageValue || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, storageValue: e.currentTarget.value } })} placeholder="sessionStorage value" /></label>
+                                <label class="be-field"><span>记录名</span><input value={event.data?.outputName || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, outputName: e.currentTarget.value } })} placeholder="用于最终分析引用此记录结果" /></label>
+                                <label class="be-field be-record-content"><span>补充要求</span><textarea value={event.data?.recordContent || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, recordContent: e.currentTarget.value } })} onPaste={(e) => void pasteRecordImages(event.id, e)} placeholder="补充说明这条记录的定位线索、截图范围或其它要求；也可粘贴参考图片" /></label>
+                                <Show when={(event.data?.imagePaths || []).length > 0}>
+                                  <div class="be-record-images">
+                                    <For each={event.data?.imagePaths || []}>{(path) => <div class="be-record-image"><span>{path}</span><button class="bt-icon-btn danger" onClick={() => removeRecordImage(event.id, path)}><IconTrash size={11} /></button></div>}</For>
+                                  </div>
+                                </Show>
                               </div>
                             </Show>
                           }>
@@ -600,6 +605,25 @@ export default function BrowserView() {
 
                 <div class="be-analysis">
                   <div class="bt-title">最终分析</div>
+                  <Show when={currentClip().events.some((event) => event.kind === "record" && event.data?.outputName?.trim())}>
+                    <div class="be-record-simple">
+                      <span class="bt-hint">引用记录结果</span>
+                      <div class="bt-row">
+                        <For each={currentClip().events.filter((event) => event.kind === "record" && event.data?.outputName?.trim())}>
+                          {(event) => (
+                            <label class="be-inline-check">
+                              <input
+                                type="checkbox"
+                                checked={(currentClip().analysisRecordRefs || []).includes(event.data!.outputName!.trim())}
+                                onChange={(e) => setAnalysisRecordRef(event.data!.outputName!.trim(), e.currentTarget.checked)}
+                              />
+                              {event.data!.outputName!.trim()}
+                            </label>
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                  </Show>
                   <textarea
                     value={currentClip().analysisPrompt || ""}
                     onInput={(e) => setAnalysisPrompt(e.currentTarget.value)}
