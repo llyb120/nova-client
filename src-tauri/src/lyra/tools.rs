@@ -138,21 +138,8 @@ pub fn tool_set(
         });
     }
 
-    if memory_enabled {
-        tools.push(Tool {
-            name: "feedback_memory",
-            description: "闭环反馈 polaris 本轮返回的训练知识。用户卡片评价只保留当前一票；本工具属于模型反馈，可跨会话多次累计。".into(),
-            parameters: schema(json!({
-                "type": "object",
-                "properties": {
-                    "experienceIds": { "type": "array", "items": { "type": "string" } },
-                    "reward": { "type": "number", "minimum": -1, "maximum": 1 },
-                    "note": { "type": "string", "description": "成功、失败、不采用或无法验证的依据" }
-                },
-                "required": ["experienceIds", "reward", "note"]
-            })),
-        });
-    }
+    // feedback_memory 暂时禁用：内部记账调用会打断转录的结论切分，且闭环提醒会多跑一次模型。
+    let _ = memory_enabled;
 
     tools
 }
@@ -700,32 +687,7 @@ async fn execute_inner(
                 _ => ToolOutcome::error(format!("工作目录不存在或不是目录：{}", next.display())),
             }
         }
-        "feedback_memory" => {
-            let ids = args
-                .get("experienceIds")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let reward = args.get("reward").and_then(Value::as_f64).unwrap_or(0.0);
-            let note = args.get("note").and_then(Value::as_str).unwrap_or_default();
-            let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
-            match crate::experience::feedback_memory(
-                &root.to_string_lossy(),
-                &ids,
-                reward,
-                note,
-                &settings.experience_experts,
-            ) {
-                Ok(value) => ToolOutcome::text(value.to_string()),
-                Err(error) => ToolOutcome::error(error),
-            }
-        }
+        "feedback_memory" => ToolOutcome::error("feedback_memory 已暂时禁用"),
         other => ToolOutcome::error(format!("未知工具：{other}")),
     }
 }

@@ -45,6 +45,8 @@ export const IconFile = (p: P) =>
 export const IconPencil = (p: P) =>
   svg(<><path d="M21.17 6.83a2.83 2.83 0 0 0-4-4L3 17v4h4Z" /><path d="m15 5 4 4" /></>, p);
 export const IconSearch = (p: P) => svg(<><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></>, p);
+export const IconBrowser = (p: P) =>
+  svg(<><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 9h18M6 6.5h.01M9 6.5h.01" /></>, p);
 export const IconGlobe = (p: P) =>
   svg(<><circle cx="12" cy="12" r="10" /><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20M2 12h20" /></>, p);
 export const IconBrain = (p: P) =>

@@ -22,6 +22,7 @@ import {
   IconCheck,
   IconChevron,
   IconClue,
+  IconBrowser,
   IconDownload,
   IconFolder,
   IconGear,
@@ -93,7 +94,7 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "training") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "training" | "browser") => {
     setView(view);
     closeThread();
   };
@@ -110,14 +111,16 @@ export function Sidebar(props: {
     switchView("training");
   };
   const openWorkflows = () => switchView("workflows");
+  const openBrowser = () => switchView("browser");
 
   const isTrainingView = () => state.view === "training";
+  const isBrowserView = () => state.view === "browser";
 
   const openHistoryThread = async (id: string) => {
     const thread = state.threads.find((item) => item.id === id);
-    // 猎户座会话保持猎户座 tab；其它历史会话回到普通模式。
+    // 大熊座、双子座会话各自保持对应 tab；普通会话回到普通模式。
     if (thread?.experienceThread) setTrainingProject(thread.worktree?.repo || thread.cwd);
-    setView(thread?.experienceThread ? "training" : "home");
+    setView(thread?.experienceThread ? "training" : thread?.browserThread ? "browser" : "home");
     await openThread(id);
   };
 
@@ -143,11 +146,14 @@ export function Sidebar(props: {
     return [...map.entries()];
   };
 
-  const currentGroups = createMemo(() =>
-    isTrainingView()
-      ? groupByCwd(state.threads.filter((t) => t.experienceThread))
-      : groupByCwd(state.threads.filter((t) => !t.experienceThread)),
-  );
+  const currentGroups = createMemo(() => {
+    const threads = isTrainingView()
+      ? state.threads.filter((t) => t.experienceThread)
+      : isBrowserView()
+        ? state.threads.filter((t) => t.browserThread)
+        : state.threads.filter((t) => !t.experienceThread && !t.browserThread);
+    return groupByCwd(threads);
+  });
 
   type ThreadTreeRow = {
     thread: ThreadMeta;
@@ -604,6 +610,15 @@ export function Sidebar(props: {
             >
               大熊座
             </button>
+            <button
+              class="mode-seg-btn"
+              classList={{ active: state.view === "browser" }}
+              onClick={openBrowser}
+              title="内嵌浏览器：录制操作、框选标记并编排为 Playwright 计划"
+            >
+              <IconBrowser size={14} />
+              双子座
+            </button>
           </div>
 
         </div>
@@ -614,7 +629,11 @@ export function Sidebar(props: {
           when={currentGroups().length > 0}
           fallback={
             <div class="thread-empty">
-              {isTrainingView() ? "还没有训练会话。点击右侧“立即训练”开始。" : "还没有会话。在右侧输入任务开始。"}
+              {isTrainingView()
+                ? "还没有训练会话。点击右侧“立即训练”开始。"
+                : isBrowserView()
+                  ? "还没有双子座执行会话。运行一个片段后会显示在这里。"
+                  : "还没有会话。在右侧输入任务开始。"}
             </div>
           }
         >

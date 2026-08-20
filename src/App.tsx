@@ -5,6 +5,7 @@ import { ChatView } from "./components/ChatView";
 import { CliOperationModal } from "./components/CliOperationModal";
 import { EvidenceChainView } from "./components/EvidenceChainView";
 import { HomeView } from "./components/HomeView";
+import BrowserView from "./components/BrowserView";
 import { RoamRequestModal } from "./components/RoamRequestModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { ShareInboxModal } from "./components/ShareInboxModal";
@@ -83,9 +84,13 @@ export default function App() {
         fallback={
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
+          <Show when={state.view === "browser"} fallback={
             <Show when={state.view === "training"} fallback={<HomeView />}>
               <TrainingGroundView />
             </Show>
+          }>
+            <BrowserView />
+          </Show>
           }>
             <EvidenceChainView />
           </Show>

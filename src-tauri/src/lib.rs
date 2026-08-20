@@ -1,6 +1,8 @@
 mod acp;
 mod agent_config;
 mod alkaid_complete;
+mod browser;
+mod browser_agent;
 mod cli_manager;
 mod clipboard;
 mod clues;
@@ -120,6 +122,10 @@ pub struct AppState {
     pub remote_permissions: Mutex<HashMap<String, Value>>,
     /// 有会话运行时阻止系统因空闲自动休眠；最后一个会话结束后自动释放。
     pub sleep_inhibitor: sleep_inhibitor::SleepInhibitor,
+    /// 内嵌浏览器（Playwright 录制进程）状态。
+    pub browser: browser::BrowserManager,
+    /// 截图分析临时会话与计划运行管理。
+    pub browser_agent: browser_agent::BrowserAgentState,
 }
 
 impl AppState {
@@ -909,6 +915,7 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
                 .clone()
                 .or_else(|| wt_by_path.get(&t.cwd).cloned()),
             experience_thread: t.experience_thread,
+            browser_thread: t.browser_thread,
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             active_clue_card_id: t.active_clue_card_id.clone(),
@@ -5354,6 +5361,8 @@ pub fn run() {
                 time_machine_lock: Mutex::new(()),
                 remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
+                browser: browser::BrowserManager::new(),
+                browser_agent: browser_agent::BrowserAgentState::new(),
             });
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -5723,7 +5732,22 @@ pub fn run() {
             get_skills_dir,
             install_skill,
             remove_skill,
-            sync_skills
+            sync_skills,
+            browser::browser_open,
+            browser::browser_close,
+            browser::browser_navigate,
+            browser::browser_info,
+            browser::browser_record_start,
+            browser::browser_record_stop,
+            browser::browser_record_pause,
+            browser::browser_record_resume,
+            browser::browser_events,
+            browser::browser_capture_screenshot,
+            browser::browser_capture_region,
+            browser::browser_save_shot,
+            browser::browser_compile_plan,
+            browser_agent::analyze_screenshot,
+            browser_agent::run_plan_with_agent
         ])
         .build(tauri::generate_context!())
         .expect("Nova 启动失败")

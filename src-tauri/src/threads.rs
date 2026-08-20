@@ -547,6 +547,9 @@ pub struct Thread {
     /// 猎户座训练会话：仅在猎户座左侧历史展示，与普通会话隔离。
     #[serde(default)]
     pub experience_thread: bool,
+    /// 双子座浏览器计划执行会话：仅在双子座左侧历史展示。
+    #[serde(default)]
+    pub browser_thread: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -618,6 +621,7 @@ impl Thread {
             quota_peer_name: None,
             worktree: None,
             experience_thread: false,
+            browser_thread: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
             pending_stage_context: None,
@@ -880,6 +884,9 @@ pub struct ThreadMeta {
     /// 猎户座训练会话：只在猎户座左侧历史展示。
     #[serde(default)]
     pub experience_thread: bool,
+    /// 双子座浏览器执行会话：只在双子座左侧历史展示。
+    #[serde(default)]
+    pub browser_thread: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
