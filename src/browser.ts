@@ -11,7 +11,7 @@ export interface BrowserInfo {
   eventCount: number;
 }
 
-export type BrowserAction = "click" | "input" | "change" | "key" | "submit" | "navigate" | "record" | "sessionStorage";
+export type BrowserAction = "click" | "input" | "change" | "key" | "submit" | "navigate" | "record";
 
 export interface RecordEvent {
   id: number;
@@ -34,6 +34,7 @@ export interface RecordEvent {
     inputType?: "paste";
     trigger?: { kind?: string; selector?: string } | null;
     recordContent?: string;
+    outputName?: string;
     imagePaths?: string[];
     storageKey?: string;
     storageValue?: string;
@@ -49,6 +50,7 @@ export interface RecordedClip {
   events: RecordEvent[];
   marks: ClipMark[];
   analysisPrompt?: string;
+  analysisRecordRefs?: string[];
   runAgentKind?: AgentKind;
   runModel?: string;
   headless?: boolean;
@@ -65,7 +67,7 @@ export interface ClipMark {
 }
 
 export interface PlayStep {
-  action: "goto" | "click" | "fill" | "selectOption" | "press" | "waitForSelector" | "assertVisible" | "assertText" | "record" | "setSessionStorage";
+  action: "goto" | "click" | "fill" | "selectOption" | "press" | "waitForSelector" | "assertVisible" | "assertText" | "record";
   selector?: string;
   targetImagePaths?: string[];
   value?: string;
@@ -74,12 +76,14 @@ export interface PlayStep {
   sessionStorage?: { key: string; value: string };
   timeoutMs?: number;
   recordContent?: string;
+  outputName?: string;
 }
 
 export interface PlayPlan {
   version?: number;
   steps: PlayStep[];
   analysisPrompt?: string;
+  analysisRecordRefs?: string[];
   headless?: boolean;
 }
 

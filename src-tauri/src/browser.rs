@@ -458,23 +458,13 @@ pub fn browser_compile_plan(_state: State<'_, AppState>, events: Vec<Value>) -> 
         let target = ev.get("target").cloned().unwrap_or(Value::Null);
         let sel = target.get("selector").and_then(Value::as_str).unwrap_or("").to_string();
         match kind {
-            "sessionStorage" => {
-                flush_input(&mut steps, &mut pending_input);
-                let data = ev.get("data").cloned().unwrap_or(Value::Null);
-                let key = data.get("storageKey").and_then(Value::as_str).unwrap_or("");
-                if !key.is_empty() {
-                    steps.push(json!({
-                        "action": "setSessionStorage",
-                        "key": key,
-                        "value": data.get("storageValue").and_then(Value::as_str).unwrap_or(""),
-                    }));
-                }
-            }
             "record" => {
                 flush_input(&mut steps, &mut pending_input);
                 let data = ev.get("data").cloned().unwrap_or(Value::Null);
                 steps.push(json!({
                     "action": "record",
+                    "selector": sel,
+                    "outputName": data.get("outputName").and_then(Value::as_str).unwrap_or(""),
                     "recordContent": data.get("recordContent").and_then(Value::as_str).unwrap_or(""),
                     "targetImagePaths": data.get("targetImagePaths").or_else(|| data.get("imagePaths")).cloned().unwrap_or_else(|| json!([])),
                 }));

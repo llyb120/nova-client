@@ -228,13 +228,16 @@ pub async fn run_plan_with_agent(
          执行环境：\n\
          - 使用 Nova 共享 playwright-core：{node_modules}，禁止安装、升级或下载任何依赖或浏览器；\n\
          - 每次新建 browser/context/page，不复用历史标签页或历史 URL；\n\
-         - 可加载登录态文件 {storage_state} 保留 Cookie/localStorage；Plan 中遇到 goto 时按所在顺序执行，没有 goto 时不补充导航。\n\
+         - 可加载登录态文件 {storage_state} 保留 Cookie/localStorage；Plan 中遇到 goto 时按所在顺序执行，没有 goto 时不补充导航。goto 携带 sessionStorage 时，必须通过 context.addInitScript 在目标文档创建时按目标 origin 注入，再发起首次 page.goto，确保鉴权脚本和请求读取前已经存在。\n\
          - Plan 顶层 headless={headless}；false 时必须使用系统 Chrome/Edge 显示真实窗口，true 时使用无头模式。\n\
          定位规则：\n\
-         - 普通操作步骤优先使用 selector；若 selector 为空、失效或不唯一，必须参考 targetImagePaths 中的截图识别目标元素后再执行；\n\
-         - targetImagePaths 只用于视觉定位，不是待分析数据；不得因为图片存在而跳过对应操作；\n\
-         - 所有 record 步骤都只能产出截图，不采集或返回文本、HTML、JSON 等其它形式的数据。record 步骤没有名称或引用语义；忽略历史 Plan 中可能残留的 outputName。使用 recordContent 的文字说明和 targetImagePaths 的视觉参考定位当前网页上的目标块：必须同时观察截图视觉特征与当前 DOM（文字、结构、role、尺寸和相邻内容）判断真实位置，但 DOM 只用于辅助定位，不能作为记录结果；定位后使用目标元素 locator.screenshot 截取该块并保存到 {record_output_dir}，不要截整页代替。每个 record 步骤至少产出一张按步骤序号命名的 PNG；若目标跨多个必要元素，可保存多张并在最终结论中列出路径；\n\
-         - setSessionStorage 步骤必须在当前页面执行 page.evaluate，将 step.key/step.value 原样写入 window.sessionStorage；禁止调用 alert、confirm、prompt 或注入任何可见弹窗；它作用于当前页面 origin，不得改写为 localStorage、Cookie 或启动参数；写入后应在页面上下文读取同一 key 静默校验，若当前页没有可用的 http(s) origin，应停止并说明需要先执行 goto；\n\
+         - 普通操作步骤优先使用 selector；若 selector 为空、失效或不唯一，必须先逐张读取并识别 targetImagePaths，再在当前页面寻找视觉结构相似的模块后执行；\n\
+         - targetImagePaths 只用于视觉定位，不是待分析数据；不得因为图片存在而跳过对应操作，也不得未经图片识别就仅凭页面文字或第一个匹配元素定位；\n\
+         - record 步骤必须根据该步骤上已有的信息自行定位，包括 selector、targetImagePaths 参考图和 recordContent 补充要求；不得让用户在运行时补充信息。selector 存在时先用它快速验证候选模块；selector 为空或失效时，根据参考图和提示词在 DOM 中生成并验证唯一、稳定的 locator。确定元素后必须调用 locator.screenshot，而不是按参考图坐标裁切页面；locator 的唯一性不能只凭首个匹配判断，必须先在整页统计匹配数量，若大于 1 则结合参考图和 recordContent 再筛选，禁止直接取 first()；\n\
+         - record 步骤必须遵循“等待页面就绪、识别步骤信息、匹配当前页面、生成并验证 locator、截图 DOM、检查结果”的顺序。所有 record 结果截图必须保存到目录 {record_output_dir}（不存在时先创建），禁止保存到其它位置。第一步不是立即定位：先等待 domcontentloaded，再对 networkidle 做有限等待（超时不能直接视为就绪）；持续检查页面中的 loading/spinner/skeleton/progress、全屏或模块级 mask/overlay、空数据占位和禁用态，等待它们消失。随后对候选模块每隔 800ms 读取一次关键特征（可见行数、文本长度、容器尺寸、表头及首末行），至少连续 3 次一致且存在实质数据后才算稳定；仅有表头、骨架、空白或“加载中”时禁止截图。若有 Cookie 提示、引导层等可关闭遮挡，应先正常关闭；不可关闭的遮挡必须等待或报告阻断，不得透过遮挡强行截图；\n\
+         - 页面稳定后，实际读取每张 targetImagePaths 图片，提取模块类型、标题/表头、布局、边界、相邻元素、行列数量和大致尺寸等视觉特征；再枚举当前页面全部候选 DOM 区块（不要只查第一个），将候选的文字、结构、位置、尺寸及必要的候选截图与参考图逐项比对，只有确认是同类模块后才能确定 locator。禁止把参考图本身复制为结果，禁止看到相似文字后直接截取最小文字节点，也禁止未读取参考图就猜 selector；\n\
+         - 所有 record 步骤都只能产出截图，不采集或返回文本、HTML、JSON 等其它形式的数据。outputName 是记录结果名称，必须保留并用于 analysisRecordRefs 的结果引用；recordContent 是该条记录的补充要求，可能同时包含定位线索、截图范围和其它约束，必须完整遵守；targetImagePaths 是视觉参考。确定模块后，应从命中的表头或子元素逐级向上检查父级，选择同时覆盖表头和真实数据区的最小合理容器；必须用数据行数量、容器 boundingBox 高度和截图预览验证，不能仅凭 class 名或 locator 首次命中。要求“完整表格数据”时，至少要看到表头和一行真实数据；若表格使用固定表头、内部滚动或虚拟列表，单次 locator.screenshot 只包含表头或当前视口就不算完成，必须滚动表格数据区并按顺序保存多张无遗漏、可衔接的截图，直到末行，所有截图归入同一 outputName；禁止截单元格、标题、局部行或整页代替；禁止把只含表头、没有数据行的截图当作完成，也不得在 record 残缺时仍进入后续分析步骤；\n\
+         - 每张结果截图保存后必须立即重新读取刚保存的图片文件进行自检：确认不存在 spinner/skeleton/mask，并逐项对照 recordContent 核对截图包含的表头、数据行数量和内容范围。若只看到表头、数据行缺失、遮挡、裁剪或仍在加载，应删除/覆盖该无效结果，重新等待并改选容器或采用分段滚动截图，最多修正 3 次；不得把已知不完整的截图当作成功继续执行。截图文件名应包含步骤序号、安全化后的 outputName 和分段序号；\n\
          - 选择器失效时允许根据当前页面、文字参考和截图推断等价 selector，但必须执行原步骤 action。\n\
          自适应执行规则（像人操作，不要先生成一份固定脚本后一次性运行）：\n\
          - 逐步读取 Plan：每次只处理当前步骤，先观察当前 URL、页面结构和可见状态，再决定具体 Playwright 调用；当前步骤成功后才进入下一步；\n\
@@ -244,9 +247,9 @@ pub async fn run_plan_with_agent(
          - 可以修正定位方式和等待策略，但不得改变步骤业务意图、跳过步骤或打乱顺序；goto 的目标 URL 不允许替换；\n\
          - 如果被登录、验证码、权限或不可恢复错误阻断，应停止后续步骤并在结论中明确说明阻断位置和原因。\n\
          执行与验证：\n\
-         - goto 步骤出现时必须访问 step.url；若该 goto 带 sessionStorage，则必须在首次请求发出前完成注入，禁止先 page.goto 再写入。推荐先为目标 origin 打开一个不会触发业务鉴权的空白响应，写入 sessionStorage 后再 page.goto(step.url)，或使用 context.addInitScript 按目标 origin 在文档最早期写入；必须确保目标站点首个鉴权脚本和请求读取到该值。不得用当前地址或历史页面代替；Plan 没有 goto 时直接执行其它步骤，不得自行补充 goto；\n\
+         - goto 步骤出现时必须访问 step.url；若该 goto 带 sessionStorage，必须先注册 context.addInitScript，并在脚本中仅当 location.origin 等于 step.url 的 origin 时写入对应 key/value，然后再首次 page.goto(step.url)。禁止先访问目标站点、临时页面或业务地址再写入，必须确保目标站点首个鉴权脚本和请求读取到该值；不得用当前地址或历史页面代替；Plan 没有 goto 时直接执行其它步骤，不得自行补充 goto；\n\
          - 每步失败时保留错误和当前页面截图，经过允许的修正重试后仍失败才停止；\n\
-         - 所有步骤完成后再按照 analysisPrompt 分析 record 步骤实际保存的页面块截图；不得直接使用 DOM 文本、HTML、参考文字或参考图片作为分析数据。\n\
+         - 所有步骤完成后再按照 analysisPrompt 分析 analysisRecordRefs 指定名称对应的 record 页面块截图；analysisRecordRefs 为空时可使用全部 record 结果。不得直接使用 DOM 文本、HTML、参考文字或参考图片作为分析数据。\n\
          最终只返回自然语言结论，不要 JSON、代码块或逐步原始日志。结论应简洁说明：是否完成、关键结果、发生过的必要定位修正，以及失败时的阻断步骤和原因。",
         path = path.to_string_lossy(),
         node_modules = runtime_node_modules.to_string_lossy(),
