@@ -629,18 +629,10 @@ impl RelayManager {
             .retain(|key, _| key.peer != peer);
     }
 
-    fn retain_online_quota_leases(&self, peers: &Value) {
-        let online: HashSet<&str> = peers
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|peer| peer["online"].as_bool().unwrap_or(false))
-            .filter_map(|peer| peer["token"].as_str())
-            .collect();
-        self.quota_leases
-            .lock()
-            .unwrap()
-            .retain(|key, _| online.contains(key.peer.as_str()));
+    fn retain_online_quota_leases(&self, _peers: &Value) {
+        // 额度共享租约不应因提供方离线而失效：只要对方未撤销共享（sharedOptions 仍包含该模型），
+        // 借用方应可持续使用已获取的凭证，直到收到明确的撤销通知（retain_shared_quota_leases）。
+        // 此前按 online 过滤会在对方关机后立即清除租约，导致新会话创建失败。
     }
 
     fn retain_shared_quota_leases(&self, peer: &str, shared_options: &Value) {
@@ -663,9 +655,8 @@ impl RelayManager {
 
     fn set_connected(&self, on: bool) {
         let prev = self.connected.swap(on, Ordering::SeqCst);
-        if prev && !on {
-            self.clear_quota_leases();
-        }
+        // 断线不应清空已获取的额度租约；租约仅在对方撤销共享时由 retain_shared_quota_leases 清理。
+        // 此前 clear_quota_leases 会导致重连后所有已预热租约丢失，对方若已关机则无法重新获取。
         if prev != on {
             self.emit_status();
         }

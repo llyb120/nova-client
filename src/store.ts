@@ -881,6 +881,13 @@ export function roamingPeers(): Peer[] {
   return state.peers.filter((p) => p.online && p.token !== me);
 }
 
+/** 额度共享可选的队友（排除自己，离线也保留）：只要对方未撤销共享，
+ *  借用方应可持续使用已获取的凭证/模型列表，不应因对方关机/离线而消失。 */
+export function quotaPeers(): Peer[] {
+  const me = state.settings?.relayToken ?? "";
+  return state.peers.filter((p) => p.token !== me && !!p.token);
+}
+
 /** 漫游：确保已拉取某对端（host）的模型/模式列表。已缓存则跳过，force 时强制刷新。
  *  对端异步回传，经 relay:peer-models 事件写入 state.peerModels[token]。 */
 export function ensurePeerModels(token: string, force = false) {

@@ -26,6 +26,7 @@ import {
   refreshSlashCommands,
   resolveAvailableModel,
   resolveEnabledAgentKind,
+  quotaPeers,
   roamingPeers,
   sendPrompt,
   setTrainingProject,
@@ -285,7 +286,7 @@ export function HomeView() {
   // 三级菜单一次性提交「后端 + 模型」：跨后端时切后端，同后端时仅换模型
   const pickModelCombined = (next: AgentKind, m: string, borrowed?: QuotaModelPeer | null) => {
     if (borrowed) {
-      const peer = roamingPeers().find((item) => item.token === borrowed.token);
+      const peer = quotaPeers().find((item) => item.token === borrowed.token);
       if (!peer) return;
       setRoam(null);
       setQuotaPeer(peer);
@@ -329,7 +330,7 @@ export function HomeView() {
   // 模型选项来源：漫游取对端列表（缺失返回 null → 空列表），否则用本机全局
   const peerModelSource = (k: AgentKind) => peerModels()?.options[k] ?? null;
   const quotaSharedModelSources = createMemo<SharedModelSource[]>(() =>
-    roamingPeers()
+    quotaPeers()
       .map((peer) => ({
         peer: { token: peer.token, name: peer.name },
         options: state.peerModels[peer.token]?.sharedOptions ?? {},
@@ -479,7 +480,7 @@ export function HomeView() {
       })();
     },
     onSelectModel: (next, modelId, quotaPeer) => {
-      if (quotaPeer && !roamingPeers().some((peer) => peer.token === quotaPeer.token)) {
+      if (quotaPeer && !quotaPeers().some((peer) => peer.token === quotaPeer.token)) {
         void message(`队友不在线，无法使用共享模型：${quotaPeer.name}`, { kind: "error" });
         return;
       }
@@ -535,7 +536,7 @@ export function HomeView() {
     if (sessionSeed.cwd) selectProject(sessionSeed.cwd);
     else void restoreLastProject();
     if (sessionSeed.quotaPeerToken) {
-      const peer = roamingPeers().find((item) => item.token === sessionSeed.quotaPeerToken);
+      const peer = quotaPeers().find((item) => item.token === sessionSeed.quotaPeerToken);
       if (peer) {
         pickModelCombined(sessionSeed.agentKind, sessionSeed.model, {
           token: peer.token,
