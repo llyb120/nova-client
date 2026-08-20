@@ -7535,7 +7535,7 @@ button.clue-bar-item:hover,
 .update-channel-control button:disabled { cursor: wait; opacity: .6; }
 @media (max-width: 760px) { .update-channel-card { flex-direction: column; } .update-channel-control { width: 100%; } }
 
-/* ============ ÄÚÇ¶ä¯ÀÀÆ÷ tab ============ */
+/* ============ å†…åµŒæµè§ˆå™¨ tab ============ */
 .browser-view { display: flex; flex: 1; min-width: 0; min-height: 0; }
 .browser-main { display: flex; flex-direction: column; flex: 1; min-width: 0; }
 .browser-bar { display: flex; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border); align-items: center; background: var(--panel); }
@@ -7589,7 +7589,7 @@ button.clue-bar-item:hover,
 .bt-shot-img { max-width: 100%; border: 1px solid var(--border); border-radius: 6px; }
 .bt-note { width: 100%; min-height: 60px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 12px; font-family: inherit; resize: vertical; }
 
-/* ä¯ÀÀÆ÷ tab - Ö÷ÇøÕ¼Î» / ²½Öè±à¼­ */
+/* æµè§ˆå™¨ tab - ä¸»åŒºå ä½ / æ­¥éª¤ç¼–è¾‘ */
 .browser-placeholder-main { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; gap: 10px; color: var(--muted); padding: 24px; text-align: center; }
 .bp-title { font-size: 16px; font-weight: 600; color: var(--text); margin: 0; }
 .bp-sub { font-size: 13px; margin: 0; max-width: 420px; }
