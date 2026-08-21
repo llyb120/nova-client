@@ -77,6 +77,7 @@ fn dispatch(request: ContextRequest, token: &str) -> Result<Value, String> {
     }
     let output = match request.method.as_str() {
         "polaris" => crate::nova_tools_native::context::fast_context(root, params),
+        "polaris_deep" => crate::nova_tools_native::context::polaris_deep(root, params),
         "code_map" => crate::nova_tools_native::context::code_map(root, params),
         _ => Err(format!(
             "unknown context service method: {}",

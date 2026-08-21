@@ -206,4 +206,4 @@ export async function codeMap(args = {}, root = repoRoot()) {
 // ---------------------------------------------------------------- 工具描述
 
 export const POLARIS_DESCRIPTION =
-  '任务涉及跨文件查找或修改（含分析要改哪里）、或需要阅读多个文件正文来理解/规划改动时，先调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单，一次调用通常替代 5–10 轮 rg+read 往返，比自行 rg/grep 往返更省 token。目标路径和行段都已明确且只需少量行段时直接 read；已定位但仍需阅读正文的多个文件，通过 files 传入一次打包，不要逐个 read。默认只传 keywords/task/files；调用后不要再用 rg/git grep 重复检索同一批关键词，已展示范围视为已读。返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要直接退回 rg/grep 逐个搜索。';
+  '代码位置或跨文件分布不明确时先调用一次：在 3 秒硬时限内按 keywords+task+files 返回排序后的代码命中片段与精确 path:start-end。它只负责快速候选搜集，不构建完整依赖/调用图闭包；拿到结果后，用原生 read 按相关范围补读，多个独立范围应并行。目标路径和行段已明确时直接 read；候选不足时再缩小目录/文件类型做有界搜索。';
