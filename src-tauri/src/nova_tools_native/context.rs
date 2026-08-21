@@ -1,3 +1,4 @@
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,14 +74,6 @@ const CODE_FILE_EXTENSIONS: &[&str] = &[
 ];
 const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILE_LIST_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
-const FAST_CONTEXT_DEADLINE_MS: u64 = 2_700;
-const FAST_CONTEXT_SEARCH_SLICE_MS: u64 = 1_500;
-const FAST_CONTEXT_CANDIDATE_FILES: usize = 256;
-const FAST_CONTEXT_SNIPPET_FILES: usize = 10;
-const FAST_CONTEXT_SNIPPETS_PER_FILE: usize = 2;
-const FAST_CONTEXT_SNIPPET_RADIUS: usize = 4;
-const FAST_CONTEXT_MAX_SNIPPET_LINES: usize = 160;
-const FAST_CONTEXT_MAX_SNIPPET_BYTES: usize = 24 * 1024;
 const CO_CHANGE_DEADLINE_MS: u64 = 750;
 const CO_CHANGE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const CO_CHANGE_DEFAULT_HISTORY_DAYS: u64 = 730;
@@ -131,6 +124,7 @@ struct SearchRow {
     ln: usize,
     text: String,
 }
+
 
 #[derive(Debug, Clone)]
 struct Definition {
@@ -541,7 +535,7 @@ fn run_command_until_limited(
     }
 }
 
-fn walk_code_files_until(root: &Path, deadline: Option<Instant>) -> Vec<String> {
+fn walk_code_files(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
     let walker = WalkDir::new(root)
         .follow_links(false)
@@ -571,9 +565,6 @@ fn walk_code_files_until(root: &Path, deadline: Option<Instant>) -> Vec<String> 
                 )
         });
     for entry in walker.filter_map(Result::ok).take(MAX_WALK_FILES) {
-        if deadline.is_some_and(|limit| Instant::now() >= limit) {
-            break;
-        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -585,10 +576,6 @@ fn walk_code_files_until(root: &Path, deadline: Option<Instant>) -> Vec<String> 
         }
     }
     files
-}
-
-fn walk_code_files(root: &Path) -> Vec<String> {
-    walk_code_files_until(root, None)
 }
 
 /// 仓库 HEAD 指纹：git 仓库用 rev-parse HEAD（提交/切分支即变），非 git 仓库
@@ -632,9 +619,13 @@ fn list_code_files_uncached(root: &Path) -> Vec<String> {
         "--".into(),
     ];
     args.extend(EXTENSIONS.iter().map(|extension| format!("*.{extension}")));
-    if let Some(stdout) =
-        run_command_until_limited(root, "git", &args, None, MAX_FILE_LIST_OUTPUT_BYTES)
-    {
+    if let Some(stdout) = run_command_until_limited(
+        root,
+        "git",
+        &args,
+        None,
+        MAX_FILE_LIST_OUTPUT_BYTES,
+    ) {
         let mut seen = HashSet::new();
         let files: Vec<_> = stdout
             .split(|byte| *byte == 0)
@@ -655,15 +646,11 @@ fn list_code_files_uncached(root: &Path) -> Vec<String> {
 fn list_code_files(root: &Path) -> Arc<Vec<String>> {
     let key = normalize_root(root);
     let cache = FILE_LIST_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let entry = cache
-        .lock()
-        .unwrap()
-        .get(&key)
-        .map(|entry| FileListCacheEntry {
-            files: entry.files.clone(),
-            at: entry.at,
-            fingerprint: entry.fingerprint.clone(),
-        });
+    let entry = cache.lock().unwrap().get(&key).map(|entry| FileListCacheEntry {
+        files: entry.files.clone(),
+        at: entry.at,
+        fingerprint: entry.fingerprint.clone(),
+    });
     if let Some(entry) = entry {
         if entry.at.elapsed() < Duration::from_millis(FILE_LIST_TTL_MS) {
             return entry.files;
@@ -775,6 +762,7 @@ fn with_mapped_file<T>(path: &Path, consume: impl FnOnce(&[u8]) -> Option<T>) ->
     }
 }
 
+
 fn git_value(root: &Path, args: &[&str]) -> String {
     let args = args
         .iter()
@@ -850,10 +838,7 @@ fn search_in_process(
     deadline: Option<Instant>,
 ) -> Vec<SearchRow> {
     let files = if scoped_files.is_empty() {
-        match deadline {
-            Some(limit) => walk_code_files_until(root, Some(limit)),
-            None => (*list_code_files(root)).clone(),
-        }
+        (*list_code_files(root)).clone()
     } else {
         scoped_files.to_vec()
     };
@@ -933,16 +918,7 @@ fn search_in_process(
 
 fn rg_available(root: &Path) -> bool {
     static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *RG_AVAILABLE.get_or_init(|| {
-        run_command_until_limited(
-            root,
-            "rg",
-            &["--version".into()],
-            Some(Instant::now() + Duration::from_millis(200)),
-            16 * 1024,
-        )
-        .is_some()
-    })
+    *RG_AVAILABLE.get_or_init(|| run_command(root, "rg", &["--version".into()]).is_some())
 }
 
 /// 单次 rg 检索。paths 为空时搜整个仓库；code_glob 为 true 时用扩展名 glob
@@ -1019,13 +995,12 @@ fn rg_search(
     Some(parse_search_rows(stdout))
 }
 
-fn search_text_until(
+fn search_text(
     root: &Path,
     terms: &[String],
     ignore_case: bool,
     word: bool,
     files: &[String],
-    deadline: Option<Instant>,
 ) -> Vec<SearchRow> {
     let mut seen = HashSet::new();
     let terms = terms
@@ -1044,23 +1019,10 @@ fn search_text_until(
         return Vec::new();
     }
     if files.len() > 128 {
-        let mut rows = Vec::new();
-        for chunk in files.chunks(128) {
-            if deadline.is_some_and(|limit| Instant::now() >= limit) {
-                break;
-            }
-            rows.extend(search_text_until(
-                root,
-                &terms,
-                ignore_case,
-                word,
-                chunk,
-                deadline,
-            ));
-            if rows.len() >= MAX_HIT_LINES {
-                break;
-            }
-        }
+        let mut rows = files
+            .chunks(128)
+            .flat_map(|chunk| search_text(root, &terms, ignore_case, word, chunk))
+            .collect::<Vec<_>>();
         rows.sort_by(|a, b| {
             a.file
                 .cmp(&b.file)
@@ -1071,46 +1033,31 @@ fn search_text_until(
         return rows;
     }
     if rg_available(root) {
-        // rg is the bounded primary path. If it times out, fall through to the deadline-aware
-        // in-process scan; never fall through to an unbounded git grep.
-        if let Some(rows) = rg_search(root, &terms, ignore_case, word, files, false, deadline) {
-            return rows;
+        // rg is the bounded primary path. A timeout/output-cap failure must not fall through to an
+        // unbounded `git grep` over the same large repository.
+        return rg_search(root, &terms, ignore_case, word, files, false, None).unwrap_or_default();
+    }
+    let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
+    if inside == "true" {
+        let mut args = vec!["grep".into(), "-nI".into(), "--untracked".into()];
+        if ignore_case {
+            args.push("-i".into());
+        }
+        if word {
+            args.push("-w".into());
+        }
+        args.push("-F".into());
+        for term in &terms {
+            args.push("-e".into());
+            args.push(term.clone());
+        }
+        args.push("--".into());
+        args.extend(files.iter().cloned());
+        if let Some(stdout) = run_command(root, "git", &args) {
+            return parse_search_rows(stdout);
         }
     }
-    // Deadline-aware calls deliberately avoid git grep: the legacy helper has no child timeout.
-    if deadline.is_none() {
-        let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
-        if inside == "true" {
-            let mut args = vec!["grep".into(), "-nI".into(), "--untracked".into()];
-            if ignore_case {
-                args.push("-i".into());
-            }
-            if word {
-                args.push("-w".into());
-            }
-            args.push("-F".into());
-            for term in &terms {
-                args.push("-e".into());
-                args.push(term.clone());
-            }
-            args.push("--".into());
-            args.extend(files.iter().cloned());
-            if let Some(stdout) = run_command(root, "git", &args) {
-                return parse_search_rows(stdout);
-            }
-        }
-    }
-    search_in_process(root, &terms, ignore_case, word, files, deadline)
-}
-
-fn search_text(
-    root: &Path,
-    terms: &[String],
-    ignore_case: bool,
-    word: bool,
-    files: &[String],
-) -> Vec<SearchRow> {
-    search_text_until(root, terms, ignore_case, word, files, None)
+    search_in_process(root, &terms, ignore_case, word, files, None)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -3240,272 +3187,12 @@ fn backfill_block(
     Some(true)
 }
 
+
 pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
-    snippet_context_run(root, &params)
+    polaris(root, params)
 }
 
 pub fn polaris(root: &Path, params: Value) -> Result<String, String> {
-    fast_context(root, params)
-}
-
-fn snippet_query(params: &Value) -> (Vec<String>, Vec<String>, String) {
-    let mut keyword_seen = HashSet::new();
-    let keywords = params
-        .get("keywords")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && keyword_seen.insert(value.to_lowercase()))
-        .take(5)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let task = params
-        .get("task")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(300)
-        .collect::<String>();
-    let mut terms = Vec::<String>::new();
-    for keyword in &keywords {
-        let words = phrase_words(keyword);
-        let variants = if words.is_empty() {
-            naming_variants(keyword)
-        } else {
-            words
-                .iter()
-                .flat_map(|word| naming_variants(word))
-                .collect::<Vec<_>>()
-        };
-        for variant in variants {
-            if !terms
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(&variant))
-            {
-                terms.push(variant);
-            }
-        }
-    }
-    for token in task_tokens(&task) {
-        if !terms
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&token))
-        {
-            terms.push(token);
-        }
-    }
-    terms.truncate(24);
-    (keywords, terms, task)
-}
-
-fn snippet_context_run(root: &Path, params: &Value) -> Result<String, String> {
-    let total_start = Instant::now();
-    let deadline = total_start + Duration::from_millis(FAST_CONTEXT_DEADLINE_MS);
-    let (keywords, terms, task) = snippet_query(params);
-    let mut file_seen = HashSet::new();
-    let files = params
-        .get("files")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(|value| normalize_rel(value.trim()))
-        .filter(|value| !value.is_empty() && file_seen.insert(value.clone()))
-        .take(6)
-        .collect::<Vec<_>>();
-    if terms.is_empty() && files.is_empty() {
-        return Ok("错误: 需要 keywords / task / files 至少其一".into());
-    }
-    let search_deadline =
-        deadline.min(Instant::now() + Duration::from_millis(FAST_CONTEXT_SEARCH_SLICE_MS));
-    let search_files = if files.is_empty() {
-        walk_code_files_until(root, Some(search_deadline))
-    } else {
-        files.clone()
-    };
-    let rows = if terms.is_empty() {
-        Vec::new()
-    } else if files.is_empty() {
-        // Direct scan has a real in-process deadline. This is intentionally simpler than the old
-        // closure builder and avoids waiting on an external process during repository contention.
-        search_in_process(
-            root,
-            &terms,
-            true,
-            false,
-            search_files.as_slice(),
-            Some(search_deadline),
-        )
-    } else {
-        search_in_process(
-            root,
-            &terms,
-            true,
-            false,
-            search_files.as_slice(),
-            Some(search_deadline),
-        )
-    };
-
-    let mut grouped = HashMap::<String, Vec<SearchRow>>::new();
-    let mut order = Vec::<String>::new();
-    for row in rows {
-        if Instant::now() >= deadline {
-            break;
-        }
-        if !grouped.contains_key(&row.file) {
-            if order.len() >= FAST_CONTEXT_CANDIDATE_FILES {
-                continue;
-            }
-            order.push(row.file.clone());
-        }
-        let values = grouped.entry(row.file.clone()).or_default();
-        if values.len() < 12 && !values.iter().any(|existing| existing.ln == row.ln) {
-            values.push(row);
-        }
-    }
-    for file in files.iter().rev() {
-        if !order.iter().any(|existing| existing == file) {
-            order.insert(0, file.clone());
-        }
-    }
-    let term_lowers = terms
-        .iter()
-        .map(|term| term.to_lowercase())
-        .collect::<Vec<_>>();
-    order.sort_by(|left, right| {
-        let score = |file: &str| {
-            let matches = grouped.get(file).map(Vec::as_slice).unwrap_or(&[]);
-            let distinct = term_lowers
-                .iter()
-                .filter(|term| {
-                    matches
-                        .iter()
-                        .any(|row| row.text.to_lowercase().contains(term.as_str()))
-                })
-                .count() as i64;
-            let definition = matches.iter().any(|row| {
-                let text = row.text.trim_start();
-                [
-                    "fn ",
-                    "pub fn ",
-                    "function ",
-                    "export function ",
-                    "class ",
-                    "struct ",
-                    "interface ",
-                    "def ",
-                ]
-                .iter()
-                .any(|prefix| text.starts_with(prefix))
-            });
-            distinct * 100
-                + matches.len().min(8) as i64 * 5
-                + if definition { 80 } else { 0 }
-                + score_path(file)
-                + if files.iter().any(|known| known == file) {
-                    1000
-                } else {
-                    0
-                }
-        };
-        score(right).cmp(&score(left)).then_with(|| left.cmp(right))
-    });
-    order.dedup();
-    order.truncate(FAST_CONTEXT_SNIPPET_FILES);
-
-    let mut out = vec![format!(
-        "# CTX HINTS{}{}  {} files",
-        if keywords.is_empty() {
-            String::new()
-        } else {
-            format!(" q={}", keywords.join(","))
-        },
-        if task.is_empty() {
-            String::new()
-        } else {
-            format!(" task=\"{}\"", js_utf16_slice(&task, 80))
-        },
-        order.len()
-    )];
-    out.push("# 快速候选，不做依赖/调用图闭包；请按 path:start-end 用 read 并行补读。".into());
-    let mut shown_lines = 0usize;
-    let mut shown_bytes = out.iter().map(String::len).sum::<usize>();
-    for file in order {
-        if Instant::now() >= deadline
-            || shown_lines >= FAST_CONTEXT_MAX_SNIPPET_LINES
-            || shown_bytes >= FAST_CONTEXT_MAX_SNIPPET_BYTES
-        {
-            break;
-        }
-        let Ok(text) = fs::read_to_string(root.join(&file)) else {
-            continue;
-        };
-        let lines = text.split('\n').collect::<Vec<_>>();
-        if lines.is_empty() {
-            continue;
-        }
-        let mut ranges = grouped
-            .get(&file)
-            .into_iter()
-            .flatten()
-            .map(|row| {
-                (
-                    row.ln.saturating_sub(FAST_CONTEXT_SNIPPET_RADIUS).max(1),
-                    (row.ln + FAST_CONTEXT_SNIPPET_RADIUS).min(lines.len()),
-                )
-            })
-            .collect::<Vec<_>>();
-        if ranges.is_empty() && files.iter().any(|known| known == &file) {
-            ranges.push((1, lines.len().min(20)));
-        }
-        ranges.sort_unstable();
-        let mut merged = Vec::<(usize, usize)>::new();
-        for (start, end) in ranges {
-            if let Some(last) = merged.last_mut() {
-                if start <= last.1 + 2 {
-                    last.1 = last.1.max(end);
-                    continue;
-                }
-            }
-            if merged.len() >= FAST_CONTEXT_SNIPPETS_PER_FILE {
-                break;
-            }
-            merged.push((start, end));
-        }
-        for (start, end) in merged {
-            if Instant::now() >= deadline || shown_lines >= FAST_CONTEXT_MAX_SNIPPET_LINES {
-                break;
-            }
-            let remaining = FAST_CONTEXT_MAX_SNIPPET_LINES - shown_lines;
-            let end = end.min(start + remaining.saturating_sub(1));
-            let mut block = format!("\n## {file}:{start}-{end}");
-            for (index, line) in lines[start - 1..end].iter().enumerate() {
-                block.push_str(&format!("\n{}|{}", start + index, clip(line)));
-            }
-            if shown_bytes + block.len() > FAST_CONTEXT_MAX_SNIPPET_BYTES {
-                break;
-            }
-            shown_lines += end - start + 1;
-            shown_bytes += block.len();
-            out.push(block);
-        }
-    }
-    if out.len() == 2 {
-        out.push("\n无文本命中。请缩短关键词，或通过 files 提供已知入口文件。".into());
-    }
-    out.push(format!(
-        "\n# elapsed={}ms; next=read relevant ranges in parallel",
-        total_start.elapsed().as_millis()
-    ));
-    trace("fast_context.snippets", total_start);
-    Ok(out.join("\n"))
-}
-
-pub fn polaris_deep(root: &Path, params: Value) -> Result<String, String> {
     let out = fast_context_run(root, &params)?;
     if params
         .get("_anchorRetry")
@@ -3898,11 +3585,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     preliminary.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     preliminary.dedup_by(|a, b| a.0 == b.0);
     if preliminary.is_empty() {
-        return Ok(format!(
-            "# CTX @{}\n无命中: {}\n提示: 换更短的符号名/字符串片段，或用 grep 定位后用 read。",
-            short_rev(root),
-            terms.join(" ")
-        ));
+        return Ok(format!("# CTX @{}\n无命中: {}\n提示: 换更短的符号名/字符串片段，或用 grep 定位后用 read。",short_rev(root),terms.join(" ")));
     }
     let mut candidates = preliminary
         .iter()
@@ -5750,69 +5433,6 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    #[test]
-    fn fast_context_returns_ranked_snippets_for_agent_followup() {
-        let d = tempdir().unwrap();
-        fs::create_dir_all(d.path().join("src")).unwrap();
-        fs::write(
-            d.path().join("src/context.ts"),
-            "export function unrelated() { return 0; }\n\nexport function targetContext() {\n  const fast = true;\n  return fast;\n}\n",
-        )
-        .unwrap();
-        let started = Instant::now();
-        let out = fast_context(
-            d.path(),
-            serde_json::json!({"keywords":["targetContext"], "task":"find the implementation"}),
-        )
-        .unwrap();
-        assert!(out.starts_with("# CTX HINTS"), "{out}");
-        assert!(out.contains("## src/context.ts:"), "{out}");
-        assert!(out.contains("targetContext"), "{out}");
-        assert!(
-            out.contains("next=read relevant ranges in parallel"),
-            "{out}"
-        );
-        assert!(
-            out.len() <= FAST_CONTEXT_MAX_SNIPPET_BYTES + 1024,
-            "{}",
-            out.len()
-        );
-        assert!(started.elapsed() < Duration::from_secs(3));
-    }
-
-    #[test]
-    fn fast_context_current_workspace_stays_under_three_seconds() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root");
-        let started = Instant::now();
-        let out = fast_context(
-            root,
-            serde_json::json!({"keywords":["snippet_context_run"], "task":"locate fast context snippets"}),
-        )
-        .unwrap();
-        assert!(out.contains("snippet_context_run"), "{out}");
-        assert!(started.elapsed() < Duration::from_secs(3), "{out}");
-    }
-
-    #[test]
-    fn fast_context_known_file_returns_its_opening_lines_without_a_match() {
-        let d = tempdir().unwrap();
-        fs::write(
-            d.path().join("known.ts"),
-            "const entry = 1;\nconst next = 2;\n",
-        )
-        .unwrap();
-        let out = fast_context(
-            d.path(),
-            serde_json::json!({"files":["known.ts"], "keywords":["missingSymbol"]}),
-        )
-        .unwrap();
-        assert!(out.contains("## known.ts:1-3"), "{out}");
-        assert!(out.contains("1|const entry = 1;"), "{out}");
-    }
-
     #[test]
     fn chinese_task_extracts_generic_ngrams_without_stop_words() {
         let tokens = task_tokens("检查支持中心的问题反馈处理器");
@@ -5841,7 +5461,7 @@ mod tests {
             "export function target() {\n return 1;\n}\n",
         )
         .unwrap();
-        let out = polaris_deep(d.path(), serde_json::json!({"keywords":["target"]})).unwrap();
+        let out = fast_context(d.path(), serde_json::json!({"keywords":["target"]})).unwrap();
         assert!(out.contains("export function target"));
         assert!(out.contains("\n}"));
         assert!(!out.contains("partial"));
@@ -5861,7 +5481,7 @@ mod tests {
             format!("export const requestedName = '{anchor}';\n"),
         )
         .unwrap();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({
                 "keywords":[anchor],
@@ -5890,7 +5510,7 @@ mod tests {
         // 锚点拼接构造：字面量写进本文件会污染真实仓库的召回评测（production_anchor_hit 命中）
         let invented_p = ["Plan", "Mode"].concat();
         let invented_a = ["agent", "Mode"].concat();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({
                 "keywords":["plan mode", invented_p, invented_a],
@@ -5928,7 +5548,7 @@ mod tests {
         )
         .unwrap();
         let invented_p = ["Plan", "Mode"].concat();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"keywords":[invented_p], "task":"switch to plan mode"}),
         )
@@ -5986,7 +5606,7 @@ mod tests {
             "import { listen } from '@tauri-apps/api/event';\nexport function subscribeRefresh(handler) { return listen('workspace-refresh', handler); }\n",
         )
         .unwrap();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({
                 "keywords":["workspace-refresh"],
@@ -6041,7 +5661,7 @@ mod tests {
             "export function helperFn(value) {\n  return `${value}!`;\n}\n",
         )
         .unwrap();
-        let out = polaris_deep(d.path(), serde_json::json!({"keywords":["targetFn"]})).unwrap();
+        let out = fast_context(d.path(), serde_json::json!({"keywords":["targetFn"]})).unwrap();
         assert!(out.contains("@@ 3-5 fn targetFn [def]"), "{out}");
         assert!(out.contains("## DEPS"), "{out}");
         assert!(out.contains("export function helperFn"), "{out}");
@@ -6071,12 +5691,12 @@ mod tests {
         ).unwrap();
 
         let plain =
-            polaris_deep(d.path(), serde_json::json!({"keywords":["refreshSession"]})).unwrap();
+            fast_context(d.path(), serde_json::json!({"keywords":["refreshSession"]})).unwrap();
         assert!(
             !plain.contains("export function handleSessionFailure"),
             "{plain}"
         );
-        let planned = polaris_deep(
+        let planned = fast_context(
             d.path(),
             serde_json::json!({
                 "keywords":["refreshSession"],
@@ -6115,7 +5735,7 @@ mod tests {
             d.path().join("src/ui/authBoundary.ts"),
             "import { AuthFault } from '../auth/faults';\nexport function routeFault(reason) {\n  if (reason instanceof AuthFault) return 'login';\n  return 'unknown';\n}\n",
         ).unwrap();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"keywords":["authorize"],"task":"修改 authorize 的失败处理"}),
         )
@@ -6146,7 +5766,7 @@ mod tests {
             "export class ResultEnvelope {\n  constructor(value) { this.value = value; }\n}\n",
         )
         .unwrap();
-        let out = polaris_deep(d.path(), serde_json::json!({"keywords":["targetFlow"]})).unwrap();
+        let out = fast_context(d.path(), serde_json::json!({"keywords":["targetFlow"]})).unwrap();
         assert!(out.contains("buildEnvelope"), "{out}");
         assert!(out.contains("ResultEnvelope"), "{out}");
         assert!(out.contains("[dep2]"), "{out}");
@@ -6170,7 +5790,7 @@ mod tests {
             "import { zebraMarker } from './zebra_engine';\nexport const sees = zebraMarker();\n",
         )
         .unwrap();
-        let out = polaris_deep(d.path(), serde_json::json!({"keywords":["zebra"]})).unwrap();
+        let out = fast_context(d.path(), serde_json::json!({"keywords":["zebra"]})).unwrap();
         assert!(out.contains("### src/zebra_engine.ts"), "{out}");
         assert!(out.contains("export function zebraMarker"), "{out}");
         assert!(!out.contains("export function laterFlow"), "{out}");
@@ -6193,7 +5813,7 @@ mod tests {
             format!("export function requiredTarget() {{\n{body}\n  return value_139;\n}}"),
         )
         .unwrap();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"keywords":["requiredTarget"],"budget":100,"maxBytes":32768}),
         )
@@ -6229,7 +5849,7 @@ mod tests {
             "import { targetApi } from './target';\nexport function targetContract() { return targetApi('x') === 'x'; }\n",
         )
         .unwrap();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({
                 "keywords":["targetApi"],
@@ -6252,7 +5872,7 @@ mod tests {
             "export function taskOnlyTarget() {\n  return 7;\n}\n",
         )
         .unwrap();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"task":"inspect taskOnlyTarget implementation"}),
         )
@@ -6276,7 +5896,7 @@ mod tests {
             )
             .unwrap();
         }
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"keywords":["bounded"],"maxBytes":8192}),
         )
@@ -6510,7 +6130,7 @@ mod tests {
             "import { widget } from './barrel';\n\nexport function mountB(config) {\n  return widget(config);\n}\n",
         )
         .unwrap();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"keywords":["renderWidget"],"task":"找出所有调用方 caller 兼容"}),
         )
@@ -6533,7 +6153,7 @@ mod tests {
         .unwrap();
         // 锚点拼接构造：字面量写进本文件会污染真实仓库的召回评测（production_anchor_hit 命中）
         let typo = ["mode", "Choics"].concat();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"keywords":[typo],"task":"switch mode handling"}),
         )
@@ -6543,7 +6163,7 @@ mod tests {
         assert!(out.contains("modeChoices"), "{out}");
         // 距离远的锚点不重试，保持 MISS
         let far = ["agent", "Mode"].concat();
-        let miss = polaris_deep(
+        let miss = fast_context(
             d.path(),
             serde_json::json!({"keywords":[far],"task":"switch agent mode"}),
         )
@@ -6591,7 +6211,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"keywords":["mountWidget"],"task":"修改挂载入口签名"}),
         )
@@ -6624,7 +6244,7 @@ mod tests {
             }
             fs::write(d.path().join(format!("src/mod{m}.ts")), units.join("\n")).unwrap();
         }
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({
                 "keywords":["alphaTarget"],
@@ -6665,7 +6285,7 @@ mod tests {
             git(d.path(), &["add", "-A"]);
             git(d.path(), &["commit", "-qm", "change"]);
         }
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"keywords":["coupledTarget"],"coupling":true}),
         )
@@ -6674,7 +6294,7 @@ mod tests {
         assert!(out.contains("registry.ts"), "{out}");
         // 默认关闭：无提示行
         let plain =
-            polaris_deep(d.path(), serde_json::json!({"keywords":["coupledTarget"]})).unwrap();
+            fast_context(d.path(), serde_json::json!({"keywords":["coupledTarget"]})).unwrap();
         assert!(!plain.contains("共改耦合(git)"), "{plain}");
     }
 
@@ -6705,7 +6325,7 @@ mod tests {
             git(d.path(), &["add", "-A"]);
             git(d.path(), &["commit", "-qm", "change"]);
         }
-        let out = polaris_deep(
+        let out = fast_context(
             d.path(),
             serde_json::json!({"keywords":["companionTarget"],"task":"修改实现逻辑"}),
         )
@@ -6724,7 +6344,7 @@ mod tests {
             "expect(widgetResult).toBe(1);\n",
         )
         .unwrap();
-        let out2 = polaris_deep(
+        let out2 = fast_context(
             d2.path(),
             serde_json::json!({"keywords":["widgetTarget"],"task":"修改实现逻辑"}),
         )
@@ -6763,4 +6383,5 @@ mod tests {
             "{out}"
         );
     }
+
 }

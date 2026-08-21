@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 
 const CONNECT_RETRY_MS = 50;
 const CONNECT_TIMEOUT_MS = 3000;
-const CALL_TIMEOUT_MS = 3_000;
+const CALL_TIMEOUT_MS = 120_000;
 
 function serviceConfig() {
   const endpoint = String(process.env.NOVA_CONTEXT_SERVICE_ENDPOINT ?? "").trim();
@@ -15,12 +15,11 @@ function wait(ms) {
   return new Promise((done) => setTimeout(done, ms));
 }
 
-async function requestOnce(config, method, root, params, timeoutMs) {
+async function requestOnce(config, method, root, params) {
   return new Promise((resolveResult, reject) => {
     const socket = connect(config.endpoint);
     let response = "";
     let settled = false;
-    const effectiveTimeoutMs = timeoutMs ?? (method === "polaris" ? CALL_TIMEOUT_MS : 120_000);
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
@@ -29,7 +28,7 @@ async function requestOnce(config, method, root, params, timeoutMs) {
       if (error) reject(error);
       else resolveResult(value);
     };
-    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), effectiveTimeoutMs);
+    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), CALL_TIMEOUT_MS);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), params: params ?? {} })}\n`);
@@ -62,15 +61,11 @@ export async function callGlobalContextTool(method, root, params) {
   const deadline = Date.now() + CONNECT_TIMEOUT_MS;
   for (;;) {
     try {
-      const remaining = method === "polaris" ? Math.max(1, deadline - Date.now()) : undefined;
-      return await requestOnce(config, method, root, requestParams, remaining);
+      return await requestOnce(config, method, root, requestParams);
     } catch (error) {
       const code = error?.code;
-      if (method === "polaris" && (Date.now() >= deadline || /timed out/i.test(String(error?.message ?? error)))) {
-        return "# CTX HINTS\n# 已达到 3 秒检索时限；请缩短关键词或通过 files 指定入口文件。";
-      }
       if (Date.now() >= deadline || !["ENOENT", "ECONNREFUSED", "EPIPE"].includes(code)) throw error;
-      await wait(Math.min(CONNECT_RETRY_MS, Math.max(1, deadline - Date.now())));
+      await wait(CONNECT_RETRY_MS);
     }
   }
 }

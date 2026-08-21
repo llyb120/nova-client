@@ -825,8 +825,8 @@ test("build mode confirms and uses the detected Bash shell", async () => {
     assert.doesNotMatch(runtime.agent.state.systemPrompt, /必须在一次 read_files 调用中合并读取/);
     assert.match(runtime.agent.state.systemPrompt, /禁止使用 `grep -r` 或 `grep -R`.*无排除的递归搜索/);
     if (process.env.NOVA_FAST_CONTEXT !== "0") {
-      assert.match(runtime.agent.state.systemPrompt, /3 秒硬时限/);
-      assert.match(runtime.agent.state.systemPrompt, /path:start-end.*read 补读/);
+      assert.match(runtime.agent.state.systemPrompt, /一次调用通常替代 5–10 轮 rg\+read 往返/);
+      assert.match(runtime.agent.state.systemPrompt, /内部批量 rg 与增量符号索引/);
       assert.match(runtime.agent.state.systemPrompt, /兜底搜索默认遵守 `\.gitignore`/);
     } else {
       assert.match(runtime.agent.state.systemPrompt, /优先使用 `rg`（遵守 `\.gitignore`）/);
