@@ -3,8 +3,8 @@
 //! JSON 行协议收发。录制事件缓冲在 Rust，前端轮询/事件推送获取。
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,9 @@ pub(crate) fn playwright_runtime_dir(config_dir: &std::path::Path) -> std::path:
 
 /// Nova 共享 Playwright 运行时。首次缺失时安装一次，后续所有项目和临时会话复用；
 /// 只安装 playwright-core，不下载 Chromium，浏览器使用系统 Chrome/Edge。
-pub(crate) fn ensure_playwright_runtime(config_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+pub(crate) fn ensure_playwright_runtime(
+    config_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     let runtime = playwright_runtime_dir(config_dir);
     let module = runtime.join("node_modules").join("playwright-core");
     let marker = runtime.join(".nova-playwright-version");
@@ -64,7 +66,10 @@ pub(crate) fn ensure_playwright_runtime(config_dir: &std::path::Path) -> Result<
         .map_err(|e| format!("启动 npm 安装 Playwright 共享运行时失败: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("首次安装 Playwright 共享运行时失败: {}", stderr.trim()));
+        return Err(format!(
+            "首次安装 Playwright 共享运行时失败: {}",
+            stderr.trim()
+        ));
     }
     std::fs::write(&marker, PLAYWRIGHT_VERSION)
         .map_err(|e| format!("写入 Playwright 版本标记失败: {e}"))?;
@@ -180,7 +185,10 @@ fn ensure_proc(app: &AppHandle) -> Result<(), String> {
     std::fs::write(dir.join("browser_collector.js"), COLLECTOR_JS).map_err(|e| e.to_string())?;
 
     let node_path = node_modules_root(&state)?;
-    let storage_state = state.config_dir.join("browser-runtime").join("storage-state.json");
+    let storage_state = state
+        .config_dir
+        .join("browser-runtime")
+        .join("storage-state.json");
     let mut child = std::process::Command::new("node")
         .arg(&script)
         .env("NODE_PATH", &node_path)
@@ -218,10 +226,10 @@ fn ensure_proc(app: &AppHandle) -> Result<(), String> {
         // 旧录制进程可能在新进程启动后才结束；只允许清理自己，不能误关新浏览器。
         let st = app2.state::<AppState>();
         if clear_proc_if_current(&st, &proc_id) {
-        st.browser.recording.store(false, Ordering::SeqCst);
+            st.browser.recording.store(false, Ordering::SeqCst);
             st.browser.paused.store(false, Ordering::SeqCst);
-        let _ = app2.emit("browser://info", info_of(&st));
-        let _ = app2.emit("browser://closed", ());
+            let _ = app2.emit("browser://info", info_of(&st));
+            let _ = app2.emit("browser://closed", ());
         }
     });
 
@@ -304,8 +312,16 @@ fn handle_node_msg(app: &AppHandle, proc_id: &str, msg: NodeMsg) {
             state.browser.recording.store(on, Ordering::SeqCst);
             let _ = app.emit("browser://info", info_of(&state));
         }
-        NodeMsg::Event { ts, url, kind, target, data } => {
-            if state.browser.recording.load(Ordering::SeqCst) && !state.browser.paused.load(Ordering::SeqCst) {
+        NodeMsg::Event {
+            ts,
+            url,
+            kind,
+            target,
+            data,
+        } => {
+            if state.browser.recording.load(Ordering::SeqCst)
+                && !state.browser.paused.load(Ordering::SeqCst)
+            {
                 let mut events = state.browser.events.lock().unwrap();
                 // input 每次按键都会上报；同一输入框在没有其它步骤插入时原地更新，
                 // 最终只保留用户完成输入后的最后值。
@@ -321,7 +337,9 @@ fn handle_node_msg(app: &AppHandle, proc_id: &str, msg: NodeMsg) {
                             .and_then(|value| value.get("selector"))
                             .and_then(Value::as_str)
                             == selector.as_deref();
-                        if last.get("kind").and_then(Value::as_str) == Some("input") && same_selector {
+                        if last.get("kind").and_then(Value::as_str) == Some("input")
+                            && same_selector
+                        {
                             if let Some(object) = last.as_object_mut() {
                                 object.insert("ts".into(), json!(ts));
                                 object.insert("url".into(), json!(url));
@@ -360,11 +378,11 @@ fn handle_node_msg(app: &AppHandle, proc_id: &str, msg: NodeMsg) {
         }
         NodeMsg::Closed => {
             if clear_proc_if_current(&state, proc_id) {
-            state.browser.recording.store(false, Ordering::SeqCst);
+                state.browser.recording.store(false, Ordering::SeqCst);
                 state.browser.paused.store(false, Ordering::SeqCst);
-            let _ = app.emit("browser://closed", ());
-            let _ = app.emit("browser://info", info_of(&state));
-        }
+                let _ = app.emit("browser://closed", ());
+                let _ = app.emit("browser://info", info_of(&state));
+            }
         }
         NodeMsg::Error { error } => {
             eprintln!("[browser] recorder error: {error}");
@@ -444,9 +462,11 @@ pub fn browser_info(app: AppHandle) -> BrowserInfo {
 
 #[tauri::command]
 pub async fn browser_open(app: AppHandle, url: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || send_cmd(&app, json!({ "cmd": "navigate", "url": url })))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        send_cmd(&app, json!({ "cmd": "navigate", "url": url }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -474,9 +494,9 @@ pub async fn browser_record_start(app: AppHandle) -> Result<(), String> {
 pub async fn browser_record_stop(app: AppHandle) -> Result<Vec<Value>, String> {
     // Node 确认停止前保持接收，避免地址栏跳转后立刻停止时丢掉尾部事件。
     let result = send_cmd_wait(app.clone(), json!({ "cmd": "stopRecord" })).await;
-        let state = app.state::<AppState>();
-        state.browser.recording.store(false, Ordering::SeqCst);
-        state.browser.paused.store(false, Ordering::SeqCst);
+    let state = app.state::<AppState>();
+    state.browser.recording.store(false, Ordering::SeqCst);
+    state.browser.paused.store(false, Ordering::SeqCst);
     result?;
     let events = std::mem::take(&mut *state.browser.events.lock().unwrap());
     Ok(events)
@@ -515,7 +535,12 @@ pub fn browser_events(app: AppHandle) -> Vec<Value> {
 pub async fn browser_capture_screenshot(app: AppHandle) -> Result<String, String> {
     let req_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.state::<AppState>().browser.pending_shots.lock().unwrap().insert(req_id.clone(), tx);
+    app.state::<AppState>()
+        .browser
+        .pending_shots
+        .lock()
+        .unwrap()
+        .insert(req_id.clone(), tx);
     send_cmd(&app, json!({ "cmd": "screenshot", "reqId": req_id }))?;
     match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
         Ok(Ok(Ok(Some(data)))) => Ok(data),
@@ -531,7 +556,12 @@ pub async fn browser_capture_screenshot(app: AppHandle) -> Result<String, String
 pub async fn browser_capture_region(app: AppHandle) -> Result<Value, String> {
     let req_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.state::<AppState>().browser.pending_shots.lock().unwrap().insert(req_id.clone(), tx);
+    app.state::<AppState>()
+        .browser
+        .pending_shots
+        .lock()
+        .unwrap()
+        .insert(req_id.clone(), tx);
     send_cmd(&app, json!({ "cmd": "regionScreenshot", "reqId": req_id }))?;
     match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
         Ok(Ok(Ok(Some(data)))) => Ok(json!({ "image": data })),
@@ -551,11 +581,17 @@ pub fn browser_close(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-pub fn save_shot_to_disk(config_dir: &std::path::Path, data_url: &str, name: Option<&str>) -> Result<String, String> {
+pub fn save_shot_to_disk(
+    config_dir: &std::path::Path,
+    data_url: &str,
+    name: Option<&str>,
+) -> Result<String, String> {
     let Some(b64) = data_url.strip_prefix("data:image/png;base64,") else {
         return Err("只支持 PNG data URL".into());
     };
-    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| e.to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| e.to_string())?;
     let dir = config_dir.join("browser-shots");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let file = name
@@ -568,13 +604,23 @@ pub fn save_shot_to_disk(config_dir: &std::path::Path, data_url: &str, name: Opt
 }
 
 #[tauri::command]
-pub fn browser_save_shot(state: State<'_, AppState>, data_url: String, name: Option<String>) -> Result<String, String> {
+pub fn browser_save_shot(
+    state: State<'_, AppState>,
+    data_url: String,
+    name: Option<String>,
+) -> Result<String, String> {
     save_shot_to_disk(&state.config_dir, &data_url, name.as_deref())
 }
 
 fn sanitize_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .chars()
@@ -588,18 +634,27 @@ pub fn browser_compile_plan(_state: State<'_, AppState>, events: Vec<Value>) -> 
     let mut steps: Vec<Value> = Vec::new();
     let mut pending_input: Option<(String, String, String, Value)> = None;
 
-    let flush_input = |steps: &mut Vec<Value>, pending: &mut Option<(String, String, String, Value)>| {
-        if let Some((sel, val, tag, images)) = pending.take() {
-            let method = if tag == "select" { "selectOption" } else { "fill" };
-            steps.push(json!({ "action": method, "selector": sel, "value": val, "targetImagePaths": images }));
-        }
-    };
+    let flush_input =
+        |steps: &mut Vec<Value>, pending: &mut Option<(String, String, String, Value)>| {
+            if let Some((sel, val, tag, images)) = pending.take() {
+                let method = if tag == "select" {
+                    "selectOption"
+                } else {
+                    "fill"
+                };
+                steps.push(json!({ "action": method, "selector": sel, "value": val, "targetImagePaths": images }));
+            }
+        };
 
     // 严格保留片段编辑器中的步骤顺序，不做导航折叠或额外补步。
     for ev in &events {
         let kind = ev.get("kind").and_then(Value::as_str).unwrap_or("");
         let target = ev.get("target").cloned().unwrap_or(Value::Null);
-        let sel = target.get("selector").and_then(Value::as_str).unwrap_or("").to_string();
+        let sel = target
+            .get("selector")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         match kind {
             "record" => {
                 flush_input(&mut steps, &mut pending_input);
@@ -614,19 +669,48 @@ pub fn browser_compile_plan(_state: State<'_, AppState>, events: Vec<Value>) -> 
             }
             "click" | "submit" => {
                 flush_input(&mut steps, &mut pending_input);
-                if !sel.is_empty() || !target.get("imagePaths").map_or(true, |value| value.as_array().is_none_or(Vec::is_empty)) {
+                if !sel.is_empty()
+                    || !target
+                        .get("imagePaths")
+                        .map_or(true, |value| value.as_array().is_none_or(Vec::is_empty))
+                {
                     steps.push(json!({ "action": "click", "selector": sel, "targetImagePaths": target.get("imagePaths").cloned().unwrap_or_else(|| json!([])) }));
                 }
             }
             "input" | "change" => {
-                let val = ev.get("data").and_then(|d| d.get("value")).and_then(Value::as_str).unwrap_or("").to_string();
-                let tag = target.get("tag").and_then(Value::as_str).unwrap_or("").to_string();
-                if !sel.is_empty() || !target.get("imagePaths").map_or(true, |value| value.as_array().is_none_or(Vec::is_empty)) {
-                    pending_input = Some((sel, val, tag, target.get("imagePaths").cloned().unwrap_or_else(|| json!([]))));
+                let val = ev
+                    .get("data")
+                    .and_then(|d| d.get("value"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let tag = target
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !sel.is_empty()
+                    || !target
+                        .get("imagePaths")
+                        .map_or(true, |value| value.as_array().is_none_or(Vec::is_empty))
+                {
+                    pending_input = Some((
+                        sel,
+                        val,
+                        tag,
+                        target
+                            .get("imagePaths")
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                    ));
                 }
             }
             "key" => {
-                let key = ev.get("data").and_then(|d| d.get("key")).and_then(Value::as_str).unwrap_or("");
+                let key = ev
+                    .get("data")
+                    .and_then(|d| d.get("key"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 if key == "Enter" || key == "Tab" {
                     flush_input(&mut steps, &mut pending_input);
                     steps.push(json!({ "action": "press", "key": key }));
@@ -635,10 +719,17 @@ pub fn browser_compile_plan(_state: State<'_, AppState>, events: Vec<Value>) -> 
             "navigate" => {
                 flush_input(&mut steps, &mut pending_input);
                 // 当前片段中的每一条 navigate 都原样编排为 goto，不再根据来源过滤。
-                let url = ev.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                let url = ev
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 if !url.is_empty() {
                     let data = ev.get("data").cloned().unwrap_or(Value::Null);
-                    let storage_enabled = data.get("navigateStorageEnabled").and_then(Value::as_bool).unwrap_or(false);
+                    let storage_enabled = data
+                        .get("navigateStorageEnabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     let storage_key = data.get("storageKey").and_then(Value::as_str).unwrap_or("");
                     if storage_enabled && !storage_key.is_empty() {
                         steps.push(json!({
