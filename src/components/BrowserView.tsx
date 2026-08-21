@@ -288,6 +288,23 @@ export default function BrowserView() {
   }
 
   // ---------- 录制 ----------
+  function createEmptyClip() {
+    const name = `片段 ${clips().length + 1}`;
+    const clip: RecordedClip = {
+      id: crypto.randomUUID(),
+      name,
+      createdAt: Date.now(),
+      startUrl: url(),
+      events: [],
+      marks: [],
+    };
+    const next = [...clips(), clip];
+    setClips(next);
+    saveClips(next);
+    setActiveClipId(clip.id);
+    notify(`已新建 ${name}，可在左侧编辑步骤`);
+  }
+
   async function newClip() {
     if (recording()) {
       const events = await stopRecording();
@@ -676,19 +693,18 @@ export default function BrowserView() {
         </div>
 
         <div class="bt-section">
-          <div class="bt-title">片段 ({clips().length})</div>
+          <div class="bt-title-row">
+            <div class="bt-title">片段 ({clips().length})</div>
+            <button class="bt-btn ghost small" onClick={createEmptyClip} title="新建空白片段，无需录制即可手动添加步骤">
+              <IconPlus size={12} /> 新建片段
+            </button>
+          </div>
           <div class="bt-clips">
-            <For each={clips()} fallback={<div class="bt-empty">还没有片段。打开浏览器后开始录制。</div>}>
+            <For each={clips()} fallback={<div class="bt-empty">还没有片段。点击“新建片段”或开始录制来创建。</div>}>
               {(clip) => (
-                <div class="bt-clip" classList={{ active: activeClipId() === clip.id }} onClick={() => setActiveClipId(clip.id)}>
+                <div class="bt-clip" classList={{ active: activeClipId() === clip.id }} onClick={() => setActiveClipId(clip.id)} title="点击在左侧编辑；重命名请在左侧标题处修改">
                   <div class="bt-clip-head">
-                    <input
-                      class="bt-clip-name-input"
-                      value={clip.name}
-                      onClick={(e) => e.stopPropagation()}
-                      onInput={(e) => updateClip(clip.id, (value) => ({ ...value, name: e.currentTarget.value }))}
-                      aria-label="片段名称"
-                    />
+                    <span class="bt-clip-name">{clip.name}</span>
                     <span class="bt-clip-count">{clip.events.length} 步</span>
                   </div>
                 </div>

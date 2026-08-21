@@ -7556,6 +7556,9 @@ button.clue-bar-item:hover,
 .browser-toolbar { display: flex; flex-direction: column; gap: 0; border-left: 1px solid var(--border); background: var(--panel); overflow-y: auto; flex-shrink: 0; }
 .bt-section { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
 .bt-title { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+.bt-title-row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.bt-btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.bt-btn.ghost:hover { background: var(--hover); color: var(--text); border-color: var(--border); }
 .bt-sub { font-size: 11px; font-weight: 600; color: var(--muted); margin-top: 4px; }
 .bt-row { display: flex; align-items: center; gap: 6px; }
 .bt-btn { display: inline-flex; align-items: center; gap: 4px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 12px; cursor: pointer; }
