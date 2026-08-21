@@ -74,6 +74,16 @@ const CODE_FILE_EXTENSIONS: &[&str] = &[
 ];
 const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILE_LIST_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+/// 全仓 rg 的单阶段硬上限。正常热查询应远低于此值；磁盘/杀软异常或并发争用时
+/// 宁可返回当前有界结果，也不能无限占住 blocking worker 并放大后续查询。
+const SEARCH_DEADLINE_MS: u64 = 3_000;
+const SEARCH_SNAPSHOT_VERSION: u32 = 4;
+const SEARCH_INDEX_MIN_TOKEN: usize = 2;
+const SEARCH_GIT_POLL_MS: u64 = 2_000;
+const SEARCH_COMPACT_INTERVAL_MS: u64 = 15 * 60 * 1_000;
+const SEARCH_COMPACT_CHANGED_FILES: usize = 256;
+const SEARCH_MAX_INCREMENTAL_FILES: usize = 2_000;
+const SEARCH_INDEX_MAX_CANDIDATES: usize = 512;
 const CO_CHANGE_DEADLINE_MS: u64 = 750;
 const CO_CHANGE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const CO_CHANGE_DEFAULT_HISTORY_DAYS: u64 = 730;
@@ -123,6 +133,50 @@ struct SearchRow {
     file: String,
     ln: usize,
     text: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SearchSnapshot {
+    version: u32,
+    root: String,
+    head: String,
+    git_signature: String,
+    dirty_files: Vec<String>,
+    postings: HashMap<String, Vec<String>>,
+    /// 索引构建时的源码快照。查询在内存中验证具体行，避免候选阶段再次逐文件 IO。
+    contents: HashMap<String, String>,
+    file_tokens: HashMap<String, Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchDelta {
+    version: u32,
+    root: String,
+    base_head: String,
+    base_signature: String,
+    head: String,
+    git_signature: String,
+    dirty_files: Vec<String>,
+    files: HashMap<String, Option<String>>,
+}
+
+#[derive(Clone)]
+struct SearchIndex {
+    base_head: String,
+    base_signature: String,
+    head: String,
+    git_signature: String,
+    dirty_files: Arc<HashSet<String>>,
+    postings: Arc<HashMap<String, Vec<String>>>,
+    contents: Arc<HashMap<String, String>>,
+    file_tokens: Arc<HashMap<String, Vec<String>>>,
+    delta_files: Arc<HashMap<String, Option<String>>>,
+}
+
+struct SearchGitState {
+    head: String,
+    signature: String,
+    dirty_files: HashSet<String>,
 }
 
 
@@ -212,6 +266,7 @@ struct UnitCandidate {
 }
 
 static MEMO: OnceLock<Mutex<HashMap<String, Arc<DiskCache>>>> = OnceLock::new();
+static CONTEXT_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static CO_CHANGE_CACHE: OnceLock<Mutex<HashMap<String, Vec<(String, usize)>>>> = OnceLock::new();
 /// 文件清单按规范化根路径缓存：(清单, 入库时刻, HEAD 指纹)。指纹用 rev-parse HEAD
@@ -227,6 +282,17 @@ static FILE_LIST_REFRESHING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 /// 异步持久化节流：root → 最近一次写盘发起时刻；按 PERSIST_INTERVAL_MS 合并写盘，
 /// 间隔内的中间态只保留在内存 MEMO 中，冷启动按 size+mtime 重扫补差。
 static PERSIST_LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+/// 全文倒排索引：符号 index.bin 只覆盖定义/import；这里负责字符串和自然语言候选发现。
+static SEARCH_INDEXES: OnceLock<Mutex<HashMap<String, SearchIndex>>> = OnceLock::new();
+static SEARCH_INDEX_BUILDING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static SEARCH_INDEX_BUILD_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+static SEARCH_INDEX_UPDATERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static SEARCH_INDEX_COMPACTED: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn search_deadline() -> Option<Instant> {
+    (!cfg!(test))
+        .then(|| Instant::now() + Duration::from_millis(SEARCH_DEADLINE_MS))
+}
 
 /// Per-stage wall-clock logging for fast_context. Always on: a slow lookup must be diagnosable
 /// from stderr without rerunning under a special env. Output is a single line per stage.
@@ -265,10 +331,16 @@ fn cache_location_label(root: &Path) -> String {
     )
 }
 
+pub fn set_data_root(root: PathBuf) {
+    let _ = CONTEXT_DATA_ROOT.set(root);
+}
+
 fn cache_path(root: &Path) -> PathBuf {
     let key = workspace_cache_key(root);
-    let data = std::env::var_os("NOVA_DATA_DIR")
-        .map(PathBuf::from)
+    let data = CONTEXT_DATA_ROOT
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os("NOVA_DATA_DIR").map(PathBuf::from))
         .unwrap_or_else(|| {
             std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
                 .map(PathBuf::from)
@@ -276,6 +348,14 @@ fn cache_path(root: &Path) -> PathBuf {
                 .join(".nova")
         });
     data.join("codemap-v3-native").join(key).join("index.bin")
+}
+
+fn search_snapshot_path(root: &Path) -> PathBuf {
+    cache_path(root).with_file_name("search-snapshot-v4.bin")
+}
+
+fn search_delta_path(root: &Path) -> PathBuf {
+    cache_path(root).with_file_name("search-delta-v4.wal")
 }
 
 fn metadata_stamp(path: &Path) -> Option<(u64, u128)> {
@@ -339,6 +419,9 @@ pub fn preload_indexes(roots: &[String]) -> usize {
             memo.lock().unwrap().insert(key, Arc::new(cache));
             loaded += 1;
         }
+        // 符号索引只解决定义/import；同时预载或后台构建全文倒排索引，避免首次
+        // Polaris 查询仍退回全仓 rg。构建门保证多个项目不会同时扫盘。
+        let _ = search_index_now(root);
     }
     loaded
 }
@@ -638,6 +721,564 @@ fn list_code_files_uncached(root: &Path) -> Vec<String> {
         }
     }
     walk_code_files(root)
+}
+
+fn search_index_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-' && ch != '.')
+        .filter(|token| token.len() >= SEARCH_INDEX_MIN_TOKEN)
+        .map(str::to_ascii_lowercase)
+}
+
+fn search_head(root: &Path) -> String {
+    git_value(root, &["rev-parse", "HEAD"])
+}
+
+fn parse_git_paths(bytes: &[u8], rename_pairs: bool) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    let fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < fields.len() {
+        let raw = fields[index];
+        index += 1;
+        if raw.is_empty() {
+            continue;
+        }
+        let text = std::str::from_utf8(raw).unwrap_or("");
+        let path = if text.len() >= 3 && text.as_bytes().get(2) == Some(&b' ') {
+            normalize_rel(&text[3..])
+        } else {
+            normalize_rel(text)
+        };
+        if !path.is_empty() && is_searchable_implementation_file(&path) {
+            paths.insert(path);
+        }
+        if rename_pairs && text.as_bytes().first().is_some_and(|ch| matches!(ch, b'R' | b'C')) {
+            if let Some(next) = fields.get(index) {
+                index += 1;
+                let old = normalize_rel(std::str::from_utf8(next).unwrap_or(""));
+                if !old.is_empty() && is_searchable_implementation_file(&old) {
+                    paths.insert(old);
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn search_git_state(root: &Path) -> Option<SearchGitState> {
+    let head = search_head(root);
+    if head == "unknown" {
+        return None;
+    }
+    let args = vec![
+        "status".into(),
+        "--porcelain=v1".into(),
+        "-z".into(),
+        "--untracked-files=all".into(),
+        "--ignore-submodules=all".into(),
+    ];
+    let status = run_command_until_limited(
+        root,
+        "git",
+        &args,
+        Some(Instant::now() + Duration::from_millis(1_500)),
+        MAX_FILE_LIST_OUTPUT_BYTES,
+    )?;
+    Some(SearchGitState {
+        head,
+        signature: format!("{:x}", Sha256::digest(&status)),
+        dirty_files: parse_git_paths(&status, true),
+    })
+}
+
+fn search_changed_between(root: &Path, old_head: &str, new_head: &str) -> Option<HashSet<String>> {
+    if old_head == new_head {
+        return Some(HashSet::new());
+    }
+    let args = vec![
+        "diff".into(),
+        "--name-only".into(),
+        "-z".into(),
+        "--no-renames".into(),
+        format!("{old_head}..{new_head}"),
+        "--".into(),
+    ];
+    let bytes = run_command_until_limited(
+        root,
+        "git",
+        &args,
+        Some(Instant::now() + Duration::from_millis(2_000)),
+        MAX_FILE_LIST_OUTPUT_BYTES,
+    )?;
+    Some(parse_git_paths(&bytes, false))
+}
+
+fn tokens_for_search_text(text: &str) -> Vec<String> {
+    let mut tokens = search_index_tokens(text).collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn index_from_snapshot(snapshot: SearchSnapshot) -> SearchIndex {
+    SearchIndex {
+        base_head: snapshot.head.clone(),
+        base_signature: snapshot.git_signature.clone(),
+        head: snapshot.head,
+        git_signature: snapshot.git_signature,
+        dirty_files: Arc::new(snapshot.dirty_files.into_iter().collect()),
+        postings: Arc::new(snapshot.postings),
+        contents: Arc::new(snapshot.contents),
+        file_tokens: Arc::new(snapshot.file_tokens),
+        delta_files: Arc::new(HashMap::new()),
+    }
+}
+
+fn build_search_snapshot(root: &Path) -> Option<SearchSnapshot> {
+    let git = search_git_state(root)?;
+    let files = list_code_files(root);
+    if files.is_empty() {
+        return None;
+    }
+    let mut postings = HashMap::<String, Vec<String>>::new();
+    let mut contents = HashMap::<String, String>::new();
+    let mut file_tokens = HashMap::<String, Vec<String>>::new();
+    for file in files.iter() {
+        let Ok(text) = fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        let tokens = tokens_for_search_text(&text);
+        for token in &tokens {
+            postings.entry(token.clone()).or_default().push(file.clone());
+        }
+        file_tokens.insert(file.clone(), tokens);
+        contents.insert(file.clone(), text);
+    }
+    for files in postings.values_mut() {
+        files.sort();
+        files.dedup();
+    }
+    Some(SearchSnapshot {
+        version: SEARCH_SNAPSHOT_VERSION,
+        root: normalize_root(root),
+        head: git.head,
+        git_signature: git.signature,
+        dirty_files: git.dirty_files.into_iter().collect(),
+        postings,
+        contents,
+        file_tokens,
+    })
+}
+
+fn write_search_snapshot(root: &Path, snapshot: &SearchSnapshot) -> bool {
+    let Ok(bytes) = bincode::serialize(snapshot) else {
+        return false;
+    };
+    let path = search_snapshot_path(root);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if fs::write(&temp, bytes).is_err() {
+        return false;
+    }
+    let _ = fs::remove_file(&path);
+    fs::rename(temp, path).is_ok()
+}
+
+fn publish_search_snapshot(root: &Path, snapshot: SearchSnapshot) {
+    let key = snapshot.root.clone();
+    let index = index_from_snapshot(snapshot.clone());
+    if write_search_snapshot(root, &snapshot) {
+        let _ = fs::remove_file(search_delta_path(root));
+    }
+    SEARCH_INDEXES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(key.clone(), index);
+    SEARCH_INDEX_COMPACTED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(key.clone(), Instant::now());
+    SEARCH_INDEX_BUILDING
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .remove(&key);
+}
+
+fn apply_search_delta(mut index: SearchIndex, delta: &SearchDelta) -> Option<SearchIndex> {
+    if delta.version != SEARCH_SNAPSHOT_VERSION
+        || delta.base_head != index.base_head
+        || delta.base_signature != index.base_signature
+    {
+        return None;
+    }
+    let mut postings = (*index.postings).clone();
+    let mut contents = (*index.contents).clone();
+    let mut file_tokens = (*index.file_tokens).clone();
+    for (file, content) in &delta.files {
+        if let Some(tokens) = file_tokens.remove(file) {
+            for token in tokens {
+                if let Some(files) = postings.get_mut(&token) {
+                    files.retain(|candidate| candidate != file);
+                    if files.is_empty() {
+                        postings.remove(&token);
+                    }
+                }
+            }
+        }
+        contents.remove(file);
+        if let Some(content) = content {
+            let tokens = tokens_for_search_text(content);
+            for token in &tokens {
+                let files = postings.entry(token.clone()).or_default();
+                if !files.iter().any(|candidate| candidate == file) {
+                    files.push(file.clone());
+                }
+            }
+            file_tokens.insert(file.clone(), tokens);
+            contents.insert(file.clone(), content.clone());
+        }
+    }
+    index.head = delta.head.clone();
+    index.git_signature = delta.git_signature.clone();
+    index.dirty_files = Arc::new(delta.dirty_files.iter().cloned().collect());
+    index.postings = Arc::new(postings);
+    index.contents = Arc::new(contents);
+    index.file_tokens = Arc::new(file_tokens);
+    index.delta_files = Arc::new(delta.files.clone());
+    Some(index)
+}
+
+fn load_search_snapshot(root: &Path) -> Option<SearchIndex> {
+    let snapshot = with_mapped_file(&search_snapshot_path(root), |bytes| {
+        bincode::deserialize::<SearchSnapshot>(bytes).ok()
+    })?;
+    if snapshot.version != SEARCH_SNAPSHOT_VERSION || snapshot.root != normalize_root(root) {
+        return None;
+    }
+    let mut index = index_from_snapshot(snapshot);
+    if let Some(delta) = with_mapped_file(&search_delta_path(root), |bytes| {
+        bincode::deserialize::<SearchDelta>(bytes).ok()
+    }) {
+        if let Some(updated) = apply_search_delta(index.clone(), &delta) {
+            index = updated;
+        }
+    }
+    Some(index)
+}
+
+fn write_search_delta(root: &Path, delta: &SearchDelta) {
+    let Ok(bytes) = bincode::serialize(delta) else {
+        return;
+    };
+    let path = search_delta_path(root);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if fs::write(&temp, bytes).is_ok() {
+        let _ = fs::remove_file(&path);
+        let _ = fs::rename(temp, path);
+    }
+}
+
+fn compact_search_index(root: &Path, key: &str, index: &SearchIndex) {
+    let snapshot = SearchSnapshot {
+        version: SEARCH_SNAPSHOT_VERSION,
+        root: key.to_string(),
+        head: index.head.clone(),
+        git_signature: index.git_signature.clone(),
+        dirty_files: index.dirty_files.iter().cloned().collect(),
+        postings: (*index.postings).clone(),
+        contents: (*index.contents).clone(),
+        file_tokens: (*index.file_tokens).clone(),
+    };
+    if write_search_snapshot(root, &snapshot) {
+        let _ = fs::remove_file(search_delta_path(root));
+        if let Some(current) = SEARCH_INDEXES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .get_mut(key)
+        {
+            current.base_head = current.head.clone();
+            current.base_signature = current.git_signature.clone();
+            current.delta_files = Arc::new(HashMap::new());
+        }
+        SEARCH_INDEX_COMPACTED
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), Instant::now());
+    }
+}
+
+fn refresh_search_index(root: &Path, key: &str, current: SearchIndex) -> Option<SearchIndex> {
+    let git = search_git_state(root)?;
+    if current.head == git.head && current.git_signature == git.signature {
+        return Some(current);
+    }
+    let mut changed = search_changed_between(root, &current.head, &git.head)?;
+    changed.extend(current.dirty_files.iter().cloned());
+    changed.extend(git.dirty_files.iter().cloned());
+    if changed.len() > SEARCH_MAX_INCREMENTAL_FILES {
+        return None;
+    }
+    let mut files = current.delta_files.as_ref().clone();
+    for file in changed {
+        files.insert(file.clone(), fs::read_to_string(root.join(&file)).ok());
+    }
+    let delta = SearchDelta {
+        version: SEARCH_SNAPSHOT_VERSION,
+        root: key.to_string(),
+        base_head: current.base_head.clone(),
+        base_signature: current.base_signature.clone(),
+        head: git.head,
+        git_signature: git.signature,
+        dirty_files: git.dirty_files.into_iter().collect(),
+        files,
+    };
+    let updated = apply_search_delta(current, &delta)?;
+    write_search_delta(root, &delta);
+    Some(updated)
+}
+
+fn search_compaction_due(key: &str, index: &SearchIndex) -> bool {
+    if index.delta_files.len() >= SEARCH_COMPACT_CHANGED_FILES {
+        return true;
+    }
+    SEARCH_INDEX_COMPACTED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(key)
+        .is_some_and(|at| {
+            !index.delta_files.is_empty()
+                && at.elapsed() >= Duration::from_millis(SEARCH_COMPACT_INTERVAL_MS)
+        })
+}
+
+fn search_updater_loop(root: PathBuf, key: String) {
+    loop {
+        thread::sleep(Duration::from_millis(SEARCH_GIT_POLL_MS));
+        let current = SEARCH_INDEXES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned();
+        let Some(current) = current else {
+            continue;
+        };
+        if let Some(updated) = refresh_search_index(&root, &key, current) {
+            SEARCH_INDEXES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap()
+                .insert(key.clone(), updated.clone());
+            if search_compaction_due(&key, &updated) {
+                compact_search_index(&root, &key, &updated);
+            }
+        } else {
+            let _gate = SEARCH_INDEX_BUILD_GATE
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap();
+            if let Some(snapshot) = build_search_snapshot(&root) {
+                publish_search_snapshot(&root, snapshot);
+            }
+        }
+    }
+}
+
+fn ensure_search_updater(root: &Path, key: &str) {
+    let updaters = SEARCH_INDEX_UPDATERS.get_or_init(|| Mutex::new(HashSet::new()));
+    if !updaters.lock().unwrap().insert(key.to_string()) {
+        return;
+    }
+    let root = root.to_path_buf();
+    let key = key.to_string();
+    let _ = thread::Builder::new()
+        .name("nova-context-git-index".into())
+        .spawn(move || search_updater_loop(root, key));
+}
+
+fn spawn_search_index_build(root: &Path, key: String) {
+    let building = SEARCH_INDEX_BUILDING.get_or_init(|| Mutex::new(HashSet::new()));
+    if !building.lock().unwrap().insert(key.clone()) {
+        return;
+    }
+    let root = root.to_path_buf();
+    let _ = thread::Builder::new()
+        .name("nova-context-text-index".into())
+        .spawn(move || {
+            let _gate = SEARCH_INDEX_BUILD_GATE
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap();
+            if let Some(snapshot) = build_search_snapshot(&root) {
+                publish_search_snapshot(&root, snapshot);
+                ensure_search_updater(&root, &key);
+            } else {
+                SEARCH_INDEX_BUILDING
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap()
+                    .remove(&key);
+            }
+        });
+}
+
+fn search_index_now(root: &Path) -> Option<SearchIndex> {
+    let key = normalize_root(root);
+    let indexes = SEARCH_INDEXES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(index) = indexes.lock().unwrap().get(&key).cloned() {
+        ensure_search_updater(root, &key);
+        return Some(index);
+    }
+    if cfg!(test) {
+        return None;
+    }
+    if let Some(index) = load_search_snapshot(root) {
+        indexes.lock().unwrap().insert(key.clone(), index.clone());
+        SEARCH_INDEX_COMPACTED
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Instant::now());
+        ensure_search_updater(root, &key);
+        return Some(index);
+    }
+    spawn_search_index_build(root, key);
+    None
+}
+
+fn search_index_rows(
+    root: &Path,
+    terms: &[String],
+    ignore_case: bool,
+    word: bool,
+    dirs: Option<&[String]>,
+    deadline: Option<Instant>,
+) -> Option<Vec<SearchRow>> {
+    let index = search_index_now(root)?;
+    let candidates = indexed_candidate_files_from(&index, terms)?;
+    let needles = terms
+        .iter()
+        .map(|term| if ignore_case { term.to_lowercase() } else { term.clone() })
+        .collect::<Vec<_>>();
+    let word_res = if word {
+        terms
+            .iter()
+            .filter_map(|term| {
+                Regex::new(&format!(
+                    r"(?{}:\b{}\b)",
+                    if ignore_case { "i" } else { "" },
+                    regex::escape(term)
+                ))
+                .ok()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut rows = Vec::new();
+    'files: for file in candidates {
+        if dirs.is_some_and(|dirs| !dirs.is_empty() && !dirs.iter().any(|dir| file.starts_with(dir))) {
+            continue;
+        }
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            break;
+        }
+        let Some(text) = index.contents.get(&file) else {
+            return None;
+        };
+        let mut file_hits = 0usize;
+        for (line_index, line) in text.split('\n').enumerate() {
+            let matched = if word {
+                word_res.iter().any(|regex| regex.is_match(line))
+            } else if ignore_case {
+                let hay = line.to_lowercase();
+                needles.iter().any(|needle| hay.contains(needle))
+            } else {
+                needles.iter().any(|needle| line.contains(needle))
+            };
+            if matched {
+                rows.push(SearchRow {
+                    file: file.clone(),
+                    ln: line_index + 1,
+                    text: line.trim_end_matches('\r').to_string(),
+                });
+                file_hits += 1;
+                if file_hits >= MAX_HITS_PER_FILE || rows.len() >= MAX_HIT_LINES {
+                    if rows.len() >= MAX_HIT_LINES {
+                        break 'files;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    rows.sort_by(|a, b| a.file.cmp(&b.file).then(a.ln.cmp(&b.ln)));
+    Some(rows)
+}
+
+fn indexed_candidate_files_from(index: &SearchIndex, terms: &[String]) -> Option<Vec<String>> {
+    let mut scores = HashMap::<String, usize>::new();
+    let mut wide_candidates = HashSet::<String>::new();
+    let mut usable = false;
+    for term in terms {
+        let tokens = search_index_tokens(term).collect::<Vec<_>>();
+        if tokens.is_empty() {
+            continue;
+        }
+        let mut per_term: Option<HashSet<String>> = None;
+        for token in tokens {
+            let Some(files) = index.postings.get(&token) else {
+                per_term = Some(HashSet::new());
+                break;
+            };
+            let set = files.iter().cloned().collect::<HashSet<_>>();
+            per_term = Some(match per_term {
+                Some(current) => current.intersection(&set).cloned().collect(),
+                None => set,
+            });
+        }
+        let per_term = per_term.unwrap_or_default();
+        // SQL/build/config 等超高频词不具备候选收敛能力。查询同时有 roblox 这类
+        // 稀有锚点时跳过泛词，避免一个泛词把候选重新膨胀到全仓。
+        if per_term.len() > SEARCH_INDEX_MAX_CANDIDATES {
+            wide_candidates.extend(per_term);
+            continue;
+        }
+        usable = true;
+        for file in per_term {
+            *scores.entry(file).or_default() += 1;
+        }
+    }
+    if !usable && !wide_candidates.is_empty() {
+        for file in wide_candidates {
+            scores.insert(file, 1);
+        }
+        usable = true;
+    }
+    if !usable || scores.is_empty() {
+        return None;
+    }
+    let mut candidates = scores.into_iter().collect::<Vec<_>>();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    candidates.truncate(SEARCH_INDEX_MAX_CANDIDATES);
+    Some(candidates.into_iter().map(|(file, _)| file).collect())
+}
+
+#[cfg(test)]
+fn indexed_candidate_files(root: &Path, terms: &[String]) -> Option<Vec<String>> {
+    let index = search_index_now(root)?;
+    indexed_candidate_files_from(&index, terms)
 }
 
 /// 带缓存的文件清单：TTL + HEAD 指纹双闸。TTL 内直接复用；过期但 HEAD 未变时先返回
@@ -995,13 +1636,19 @@ fn rg_search(
     Some(parse_search_rows(stdout))
 }
 
-fn search_text(
+fn search_text_until(
     root: &Path,
     terms: &[String],
     ignore_case: bool,
     word: bool,
     files: &[String],
+    deadline: Option<Instant>,
 ) -> Vec<SearchRow> {
+    if files.is_empty() {
+        if let Some(rows) = search_index_rows(root, terms, ignore_case, word, None, deadline) {
+            return rows;
+        }
+    }
     let mut seen = HashSet::new();
     let terms = terms
         .iter()
@@ -1021,7 +1668,9 @@ fn search_text(
     if files.len() > 128 {
         let mut rows = files
             .chunks(128)
-            .flat_map(|chunk| search_text(root, &terms, ignore_case, word, chunk))
+            .flat_map(|chunk| {
+                search_text_until(root, &terms, ignore_case, word, chunk, deadline)
+            })
             .collect::<Vec<_>>();
         rows.sort_by(|a, b| {
             a.file
@@ -1035,7 +1684,8 @@ fn search_text(
     if rg_available(root) {
         // rg is the bounded primary path. A timeout/output-cap failure must not fall through to an
         // unbounded `git grep` over the same large repository.
-        return rg_search(root, &terms, ignore_case, word, files, false, None).unwrap_or_default();
+        return rg_search(root, &terms, ignore_case, word, files, false, deadline)
+            .unwrap_or_default();
     }
     let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
     if inside == "true" {
@@ -1057,7 +1707,7 @@ fn search_text(
             return parse_search_rows(stdout);
         }
     }
-    search_in_process(root, &terms, ignore_case, word, files, None)
+    search_in_process(root, &terms, ignore_case, word, files, deadline)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2412,19 +3062,23 @@ fn scope_dirs(seed_files: &[String]) -> Option<Vec<String>> {
 /// 展开后的整份文件列表按 128 个切片、逐片起 rg 的做法）。None = 全仓。
 /// 两种情形都用扩展名 glob 限定代码文件，与旧的按 all 展开过滤语义一致。
 /// rg 不可用时把目录展开成代码文件列表退回 search_text。
-fn search_text_scopes(
+fn search_text_scopes_until(
     root: &Path,
     terms: &[String],
     ignore_case: bool,
     word: bool,
     dirs: Option<&[String]>,
+    deadline: Option<Instant>,
 ) -> Vec<SearchRow> {
+    if let Some(rows) = search_index_rows(root, terms, ignore_case, word, dirs, deadline) {
+        return rows;
+    }
     if rg_available(root) {
         let rows = match dirs {
             Some(dirs) if !dirs.is_empty() => {
-                rg_search(root, terms, ignore_case, word, dirs, true, None)
+                rg_search(root, terms, ignore_case, word, dirs, true, deadline)
             }
-            _ => rg_search(root, terms, ignore_case, word, &[], true, None),
+            _ => rg_search(root, terms, ignore_case, word, &[], true, deadline),
         };
         if let Some(rows) = rows {
             return rows;
@@ -2438,7 +3092,17 @@ fn search_text_scopes(
             .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
-    search_text(root, terms, ignore_case, word, &files)
+    search_text_until(root, terms, ignore_case, word, &files, deadline)
+}
+
+fn search_text_scopes(
+    root: &Path,
+    terms: &[String],
+    ignore_case: bool,
+    word: bool,
+    dirs: Option<&[String]>,
+) -> Vec<SearchRow> {
+    search_text_scopes_until(root, terms, ignore_case, word, dirs, search_deadline())
 }
 
 fn compact_evidence_miss(
@@ -3404,7 +4068,14 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             if initial_terms.is_empty() {
                 Vec::new()
             } else {
-                search_text(root, initial_terms, true, false, &[])
+                search_text_until(
+                    root,
+                    initial_terms,
+                    true,
+                    false,
+                    &[],
+                    search_deadline(),
+                )
             }
         });
         let revision = scope.spawn(|| short_rev(root));
@@ -3717,19 +4388,34 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let planned_scope = scope_dirs(&seed_body_files);
     // 计划驱动的二次检索与反向图词根检索互相独立，并行执行。
     let search_stage = Instant::now();
+    let plan_deadline = search_deadline();
     let (planned_rows, discover_rows) = std::thread::scope(|scope| {
         let planned = scope.spawn(|| {
             if planned_terms.is_empty() {
                 Vec::<SearchRow>::new()
             } else {
-                search_text_scopes(root, &planned_terms, false, false, planned_scope.as_deref())
+                search_text_scopes_until(
+                    root,
+                    &planned_terms,
+                    false,
+                    false,
+                    planned_scope.as_deref(),
+                    plan_deadline,
+                )
             }
         });
         let stems = scope.spawn(|| {
             if discover_stems.is_empty() {
                 Vec::<SearchRow>::new()
             } else {
-                search_text_scopes(root, &discover_stems, true, false, None)
+                search_text_scopes_until(
+                    root,
+                    &discover_stems,
+                    true,
+                    false,
+                    None,
+                    plan_deadline,
+                )
             }
         });
         (
@@ -3816,7 +4502,14 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             if stem.len() >= 3 && searched.insert(target.to_string()) {
                 // 种子目标的词根行来自预取的批量检索；动态发现的中转目标才单独补搜。
                 let rows = stem_rows.get(&stem).cloned().unwrap_or_else(|| {
-                    search_text_scopes(root, &[stem.clone()], true, false, None)
+                    search_text_scopes_until(
+                        root,
+                        &[stem.clone()],
+                        true,
+                        false,
+                        None,
+                        search_deadline(),
+                    )
                 });
                 let mut seen_files = HashSet::<String>::new();
                 for row in rows {
@@ -5620,6 +6313,55 @@ mod tests {
     }
 
     #[test]
+    fn indexed_candidates_ignore_wide_terms_when_a_rare_anchor_exists() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("rare.go"), "roblox sql query").unwrap();
+        for index in 0..SEARCH_INDEX_MAX_CANDIDATES + 2 {
+            fs::write(root.path().join(format!("wide-{index}.go")), "sql query").unwrap();
+        }
+        let files: Vec<String> = list_code_files(root.path()).iter().cloned().collect();
+        let mut postings = HashMap::<String, Vec<String>>::new();
+        let mut contents = HashMap::<String, String>::new();
+        let mut file_tokens = HashMap::<String, Vec<String>>::new();
+        for file in &files {
+            let text = fs::read_to_string(root.path().join(file)).unwrap();
+            let tokens = tokens_for_search_text(&text);
+            for token in &tokens {
+                postings.entry(token.clone()).or_default().push(file.clone());
+            }
+            file_tokens.insert(file.clone(), tokens);
+            contents.insert(file.clone(), text);
+        }
+        for files in postings.values_mut() {
+            files.sort();
+            files.dedup();
+        }
+        let snapshot = SearchSnapshot {
+            version: SEARCH_SNAPSHOT_VERSION,
+            root: normalize_root(root.path()),
+            head: "unknown".into(),
+            git_signature: String::new(),
+            dirty_files: Vec::new(),
+            postings,
+            contents,
+            file_tokens,
+        };
+        let key = normalize_root(root.path());
+        SEARCH_INDEXES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(key, index_from_snapshot(snapshot));
+
+        let candidates = indexed_candidate_files(
+            root.path(),
+            &["roblox".into(), "sql".into()],
+        )
+        .unwrap();
+        assert_eq!(candidates, vec!["rare.go"]);
+    }
+
+    #[test]
     fn scoped_search_only_returns_requested_files() {
         let d = tempdir().unwrap();
         fs::create_dir(d.path().join("src")).unwrap();
@@ -5633,12 +6375,13 @@ mod tests {
             "export const bridge = 'shared';\n",
         )
         .unwrap();
-        let rows = search_text(
+        let rows = search_text_until(
             d.path(),
             &["shared".into()],
             false,
             false,
             &["src/b.ts".into()],
+            None,
         );
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].file, "src/b.ts");
