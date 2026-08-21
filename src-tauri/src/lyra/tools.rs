@@ -505,14 +505,15 @@ async fn execute_inner(
                         })
                 })
                 .unwrap_or_default();
+            let memory_enabled = std::env::var("NOVA_EXPERIENCE_TOOLS")
+                .map(|value| value == "1")
+                .unwrap_or(false);
             // 代码上下文与训练知识是独立数据源，同轮并行，附加召回不会串行拖慢 polaris。
             let code_job = tokio::task::spawn_blocking(move || {
                 crate::nova_tools_native::context::polaris(&code_root, args)
             });
             let memory_job = tokio::task::spawn_blocking(move || {
-                let enabled = crate::settings::Settings::load(&crate::lyra::config::nova_root())
-                    .experience_training_enabled;
-                if !enabled || memory_query.is_empty() {
+                if !memory_enabled || memory_query.is_empty() {
                     None
                 } else {
                     crate::experience::load_trained_memory(
