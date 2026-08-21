@@ -9,13 +9,15 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
 
 const MAX_TRAIN_THREADS: usize = 12;
 const MAX_EXPERIENCES_PER_EXPERT: usize = 800;
 static STORE: OnceLock<Mutex<ExperienceStore>> = OnceLock::new();
 static PROJECT_IDENTITIES: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+static RECALL_SNAPSHOT: OnceLock<Mutex<Option<Arc<RecallSnapshot>>>> = OnceLock::new();
+static RECALL_PROJECT_IDENTITIES: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
 static TRAINING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -204,6 +206,89 @@ struct EvolutionReviewedExperience {
     experience: CandidateExperience,
 }
 
+#[derive(Clone)]
+struct RecallEntry {
+    entry: ExperienceEntry,
+    terms: HashSet<String>,
+}
+
+struct RecallProject {
+    entries: Vec<RecallEntry>,
+    expert_activations: HashMap<String, u64>,
+}
+
+struct RecallSnapshot {
+    universal: Vec<RecallEntry>,
+    projects: HashMap<String, RecallProject>,
+}
+
+fn recall_entry(entry: &ExperienceEntry) -> RecallEntry {
+    RecallEntry {
+        entry: entry.clone(),
+        terms: terms(&format!(
+            "{} {} {} {}",
+            entry.trigger,
+            entry.action,
+            entry.avoid,
+            entry.scope.join(" ")
+        )),
+    }
+}
+
+fn recall_snapshot() -> Result<Arc<RecallSnapshot>, String> {
+    let cache = RECALL_SNAPSHOT.get_or_init(|| Mutex::new(None));
+    if let Some(snapshot) = cache
+        .lock()
+        .map_err(|_| "经验召回缓存锁已损坏".to_string())?
+        .clone()
+    {
+        return Ok(snapshot);
+    }
+    let snapshot = {
+        let guard = store()?.lock().map_err(|_| "经验库锁已损坏".to_string())?;
+        let universal = guard
+            .universal_experiences
+            .iter()
+            .filter(|entry| entry.knowledge_scope == "universal")
+            .map(recall_entry)
+            .collect();
+        let projects = guard
+            .projects
+            .iter()
+            .map(|(key, project)| {
+                (
+                    key.clone(),
+                    RecallProject {
+                        entries: project
+                            .experiences
+                            .iter()
+                            .filter(|entry| entry.knowledge_scope != "universal")
+                            .map(recall_entry)
+                            .collect(),
+                        expert_activations: project.expert_activations.clone(),
+                    },
+                )
+            })
+            .collect();
+        Arc::new(RecallSnapshot {
+            universal,
+            projects,
+        })
+    };
+    let mut cached = cache
+        .lock()
+        .map_err(|_| "经验召回缓存锁已损坏".to_string())?;
+    Ok(cached.get_or_insert_with(|| snapshot).clone())
+}
+
+fn invalidate_recall_snapshot() {
+    if let Some(cache) = RECALL_SNAPSHOT.get() {
+        if let Ok(mut cached) = cache.lock() {
+            *cached = None;
+        }
+    }
+}
+
 impl ExperienceStore {
     fn load(root: &Path) -> Self {
         let path = root.join("experience_memory.json");
@@ -231,6 +316,7 @@ impl ExperienceStore {
     }
 
     fn save(&self) {
+        invalidate_recall_snapshot();
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -331,20 +417,6 @@ fn terms(text: &str) -> HashSet<String> {
     out
 }
 
-fn relevance(query: &HashSet<String>, entry: &ExperienceEntry) -> f64 {
-    if query.is_empty() {
-        return 0.0;
-    }
-    let hay = terms(&format!(
-        "{} {} {} {}",
-        entry.trigger,
-        entry.action,
-        entry.avoid,
-        entry.scope.join(" ")
-    ));
-    query.intersection(&hay).count() as f64 / query.len().max(1) as f64
-}
-
 /// 词面相似度（Jaccard），用于捕获演进产生的近似重复条目。
 /// 中英文都走 terms() 的双字片段，阈值 0.65 视为语义重复。
 fn text_similarity(a: &str, b: &str) -> f64 {
@@ -372,33 +444,45 @@ fn entries_duplicate(a: &ExperienceEntry, b: &ExperienceEntry) -> bool {
             || text_similarity(&a.trigger, &b.trigger) >= 0.45)
 }
 
+fn recall_project_identity(cwd: &str) -> Result<(String, String), String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() || cwd.contains(SCRATCH_MARK) {
+        return Err("请选择一个项目后再使用大熊座".into());
+    }
+    let cache = RECALL_PROJECT_IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(identity) = cache
+        .lock()
+        .map_err(|_| "经验召回项目缓存已损坏".to_string())?
+        .get(cwd)
+        .cloned()
+    {
+        return Ok(identity);
+    }
+    let identity = project_identity(cwd)?;
+    cache
+        .lock()
+        .map_err(|_| "经验召回项目缓存已损坏".to_string())?
+        .insert(cwd.to_string(), identity.clone());
+    Ok(identity)
+}
+
 pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value, String> {
-    let (project_key, project_root) = project_identity(cwd)?;
-    let (mut universal, mut project) = {
-        let guard = store()?.lock().map_err(|_| "经验库锁已损坏".to_string())?;
-        let universal: Vec<ExperienceEntry> = guard
-            .universal_experiences
-            .iter()
-            .filter(|entry| entry.knowledge_scope == "universal")
-            .cloned()
-            .collect();
-        let mut project = guard.project(&project_key);
-        project
-            .experiences
-            .retain(|entry| entry.knowledge_scope != "universal");
-        (universal, project)
-    };
-    let universal_len = universal.len();
-    let mut entries = Vec::with_capacity(universal_len + project.experiences.len());
-    entries.append(&mut universal);
-    entries.append(&mut project.experiences);
+    let (project_key, project_root) = recall_project_identity(cwd)?;
+    let snapshot = recall_snapshot()?;
+    let project = snapshot.projects.get(&project_key);
     let query_terms = terms(query);
-    let mut by_expert: HashMap<String, Vec<(usize, f64)>> = HashMap::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.status == "quarantined" {
+    let mut by_expert: HashMap<String, Vec<(&ExperienceEntry, f64)>> = HashMap::new();
+    for cached in snapshot
+        .universal
+        .iter()
+        .chain(project.into_iter().flat_map(|project| project.entries.iter()))
+    {
+        let entry = &cached.entry;
+        if entry.status == "quarantined" || query_terms.is_empty() {
             continue;
         }
-        let rel = relevance(&query_terms, entry);
+        let rel = query_terms.intersection(&cached.terms).count() as f64
+            / query_terms.len().max(1) as f64;
         if rel <= 0.0 {
             continue;
         }
@@ -406,7 +490,7 @@ pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value
         by_expert
             .entry(entry.expert_id.clone())
             .or_default()
-            .push((index, score));
+            .push((entry, score));
     }
     for entries in by_expert.values_mut() {
         entries.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -417,7 +501,10 @@ pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value
         .map(|(id, rows)| {
             let preview =
                 rows.iter().take(3).map(|x| x.1).sum::<f64>() / rows.len().min(3).max(1) as f64;
-            let activations = *project.expert_activations.get(id).unwrap_or(&0) as f64;
+            let activations = project
+                .and_then(|project| project.expert_activations.get(id))
+                .copied()
+                .unwrap_or(0) as f64;
             // 相关性为主，叠加有界随机扰动与低激活奖励；无关岛不会进入候选。
             let jitter = deterministic_roll(&format!("recall:{nonce}:{id}")) * 0.16;
             (
@@ -431,57 +518,44 @@ pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value
     let mut candidates = Vec::new();
     for id in &selected {
         if let Some(rows) = by_expert.get(id) {
-            for &(index, score) in rows.iter().take(4) {
-                candidates.push((index, score));
-            }
+            candidates.extend(rows.iter().take(4).copied());
         }
     }
     candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let mut chosen = Vec::new();
+    let mut chosen: Vec<&ExperienceEntry> = Vec::new();
     let mut per_expert: HashMap<String, usize> = HashMap::new();
-    for (index, _) in candidates {
+    for (entry, _) in candidates {
         if chosen.len() >= limit.clamp(1, 12) {
             break;
         }
-        let id = entries[index].expert_id.clone();
-        if *per_expert.get(&id).unwrap_or(&0) >= 3 {
+        if *per_expert.get(&entry.expert_id).unwrap_or(&0) >= 3 {
             continue;
         }
-        if chosen.iter().any(|&old: &usize| {
-            let a = terms(&entries[old].action);
-            let b = terms(&entries[index].action);
+        if chosen.iter().any(|old| {
+            let a = terms(&old.action);
+            let b = terms(&entry.action);
             !a.is_empty()
                 && a.intersection(&b).count() as f64 / a.len().min(b.len()).max(1) as f64 > 0.8
         }) {
             continue;
         }
-        *per_expert.entry(id).or_default() += 1;
-        chosen.push(index);
+        *per_expert.entry(entry.expert_id.clone()).or_default() += 1;
+        chosen.push(entry);
     }
-    let now = now_ms();
-    for id in &selected {
-        *project.expert_activations.entry(id.clone()).or_default() += 1;
-    }
-    let result: Vec<Value> = chosen.into_iter().map(|index| {
-        let entry = &mut entries[index];
-        entry.hit_count = entry.hit_count.saturating_add(1);
-        entry.last_used_at = now;
-        json!({
-            "id": entry.id, "expertId": entry.expert_id, "kind": entry.kind,
-            "projectId": entry.project_id, "projectRoot": entry.project_root,
-            "knowledgeScope": entry.knowledge_scope,
-            "trigger": entry.trigger, "action": entry.action, "avoid": entry.avoid, "scope": entry.scope,
-            "confidence": entry.confidence, "utility": entry.utility
+    let result: Vec<Value> = chosen
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id, "expertId": entry.expert_id, "kind": entry.kind,
+                "projectId": entry.project_id, "projectRoot": entry.project_root,
+                "knowledgeScope": entry.knowledge_scope,
+                "trigger": entry.trigger, "action": entry.action, "avoid": entry.avoid, "scope": entry.scope,
+                "confidence": entry.confidence, "utility": entry.utility
+            })
         })
-    }).collect();
-    let project_entries = entries.split_off(universal_len);
-    let universal_entries = entries;
-    project.experiences = project_entries;
-    let mut guard = store()?.lock().map_err(|_| "经验库锁已损坏".to_string())?;
-    guard.universal_experiences = universal_entries;
-    guard.projects.insert(project_key, project);
-    // 命中次数与专家激活是召回遥测，不应让每次 polaris 都同步重写完整经验库。
-    // 保留内存态，后续训练、反馈或删除等真实写操作会一并持久化。
+        .collect();
+    // 召回是只读热路径：命中计数/随机岛激活不再克隆并替换整个经验库。
+    // 训练、反馈和删除仍通过各自写路径更新并持久化真实状态。
     Ok(
         json!({ "activatedExperts": selected, "experiences": result, "projectRoot": project_root,
         "instruction": "knowledgeScope=universal 的知识可跨项目使用；knowledgeScope=project 的知识只适用于当前 projectRoot。memory 是可参考事实，rule 是强约束，experience 仅在触发条件匹配时参考；当前会话事实始终优先。" }),
@@ -1817,6 +1891,51 @@ fn evolve_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trained_memory_recall_is_read_only() {
+        let root = std::env::temp_dir().join(format!("nova-memory-recall-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        init(&root);
+        let (project_key, project_root) = project_identity(&root.to_string_lossy()).unwrap();
+        let entry = ExperienceEntry {
+            id: "recall-entry".into(),
+            expert_id: "fast".into(),
+            project_id: project_key.clone(),
+            project_root: project_root.clone(),
+            knowledge_scope: "project".into(),
+            kind: "memory".into(),
+            trigger: "polaris latency".into(),
+            action: "keep the hot path read only".into(),
+            confidence: 0.9,
+            utility: 0.8,
+            ..Default::default()
+        };
+        {
+            let mut guard = store().unwrap().lock().unwrap();
+            guard
+                .project_mut(&project_key, &project_root)
+                .experiences
+                .push(entry);
+            invalidate_recall_snapshot();
+        }
+
+        let result = load_trained_memory(&root.to_string_lossy(), "polaris latency", 8).unwrap();
+        assert_eq!(result["experiences"][0]["id"], "recall-entry");
+        let guard = store().unwrap().lock().unwrap();
+        let stored = guard
+            .projects
+            .get(&project_key)
+            .unwrap()
+            .experiences
+            .iter()
+            .find(|entry| entry.id == "recall-entry")
+            .unwrap();
+        assert_eq!(stored.hit_count, 0);
+        assert_eq!(stored.last_used_at, 0);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn training_randomly_activates_two_or_three_experts() {
