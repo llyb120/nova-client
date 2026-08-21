@@ -63,9 +63,9 @@ export function createNovaBatchTools(cwd, options = {}) {
           query: { type: "string", minLength: 1, description: "简短检索词；兼容单字符串调用，如 cursor" },
           task: { type: "string", minLength: 1, description: "自然语言任务描述，将自动提取检索词" },
           files: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "明确要纳入上下文的仓库相对文件路径" },
-          maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "兼容旧调用；快速模式固定使用小输出预算" },
-          budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧调用，快速片段模式忽略此参数" },
-          coupling: { type: "boolean", description: "兼容旧调用，快速片段模式忽略此参数" },
+          maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "输出字符预算，通常无需设置" },
+          budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，通常无需设置" },
+          coupling: { type: "boolean", description: "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" },
         },
         anyOf: [
           { required: ["keywords"] },
@@ -107,12 +107,12 @@ export function novaDevinBatchToolPolicy(options = {}) {
     `ROUTING RULE — before choosing any tool: Nova endpoints must NEVER be selected as direct tool calls. Select Devin's top-level mcp_call_tool first, then pass server_name="nova-tools" and the endpoint name in tool_name. ${novaToolsPhrase} Never select or invoke any of those names directly, even after mcp_list_tools lists them; a direct invocation produces \`Unknown tool ... This tool is not available.\` Your only valid execution path for a Nova tool is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string "nova-tools" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: ${example}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as \`use/call ${callExampleName}\` means \`call mcp_call_tool with server_name nova-tools and tool_name ${callExampleName}\`; it never authorizes a direct tool call. If a direct call reports \`Unknown tool\`, retry once through mcp_call_tool. If parsing reports missing field \`server_name\`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints.`,
     "Prefer minimal reads via Devin native read: when line ranges are known, read only those segments; expand nearby context only as needed. "
       + (fastContext
-        ? "When location is unknown, call polaris first for ranked snippets and exact path:start-end hints under a 3-second hard deadline; then use native read for the relevant ranges, parallelizing independent reads. "
+        ? "When location is unknown, you must call only polaris; then read only coverage gaps / next_reads with native read. "
         : "When location is unknown, search first (see below), then read near hits. ")
       + "Do not dump large files blindly."
       + " For edits, use Devin native edit tools. Multiple edits for the same file must be merged into one native edit call.",
     (fastContext
-      ? "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, call polaris first for fast candidate snippets; it does not build a dependency/caller closure. Do not immediately re-discover the same keywords with shell `rg`/`git grep` or Devin grep. If candidates are insufficient, narrow the directory/file type before a bounded fallback search. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
+      ? "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only polaris (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with Devin native read. After polaris, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside polaris. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that polaris did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
       : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
       + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];
