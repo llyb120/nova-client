@@ -112,11 +112,12 @@ fn salvage_json(fragment: &str) -> Option<Value> {
     None
 }
 
-/// 无副作用工具白名单：参数齐备（以必需字段为准）才可投机预执行。
+/// 仅允许真正轻量、可取消且不会进入阻塞线程池的只读工具投机执行。
+/// Polaris 内部会 spawn_blocking 并启动 rg/git；abort Tokio 句柄无法终止已开始的阻塞
+/// 工作。流式参数每次演进都投机一次会留下整批孤儿检索，形成查询风暴。
 fn speculatable(name: &str, args: &Value) -> bool {
     match name {
         "read" => args.get("path").and_then(Value::as_str).is_some(),
-        "polaris" => args.get("keywords").and_then(Value::as_array).is_some(),
         _ => false,
     }
 }
@@ -527,6 +528,15 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polaris_is_not_speculated_because_blocking_search_cannot_be_aborted() {
+        assert!(!speculatable(
+            "polaris",
+            &json!({ "keywords": ["roblox", "sql"] })
+        ));
+        assert!(speculatable("read", &json!({ "path": "src/lib.rs" })));
+    }
 
     #[test]
     fn salvage_json_closes_partial_object_and_array() {
