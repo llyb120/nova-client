@@ -6,21 +6,96 @@ const path = require('path');
 const out = (obj) => process.stdout.write('__NOVA__' + JSON.stringify(obj) + '\n');
 const collectorSource = fs.readFileSync(path.join(__dirname, 'browser_collector.js'), 'utf8');
 let browser = null;
+let context = null;
 let page = null;
 let recording = false;
 let paused = false;
-let collectorReady = false;
-// 最近一次可能触发导航的页面操作；用于排除点击、提交、页面输入回车造成的导航。
-let pendingNavigationAction = null;
-let pendingNavigationUntil = 0;
-// 主文档请求信息，用 redirectedFrom 排除后续 HTTP 重定向，只记录地址栏首次导航。
-let mainDocumentRequest = null;
-// 用户在地址栏输入网址后，站点可能继续用 location/SPA 路由跳转；短时间内均视为同一导航链，
-// 只记录链首，避免把登录重定向误记为新的地址栏 goto。
-let addressNavigationChainUntil = 0;
-const storageStatePath = process.env.NOVA_BROWSER_STORAGE_STATE || '';
-let context = null;
+let shuttingDown = false;
+let closedEmitted = false;
 let saveStateTimer = null;
+let pendingAddressNavigations = 0;
+const pendingAddressWaiters = [];
+const attachedPages = new WeakSet();
+const pageStates = new WeakMap();
+const storageStatePath = process.env.NOVA_BROWSER_STORAGE_STATE || '';
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function finishPendingAddressNavigation() {
+  pendingAddressNavigations = Math.max(0, pendingAddressNavigations - 1);
+  if (pendingAddressNavigations !== 0) return;
+  for (const resolve of pendingAddressWaiters.splice(0)) resolve();
+}
+
+function waitForPendingAddressNavigations() {
+  if (pendingAddressNavigations === 0) return Promise.resolve();
+  return new Promise((resolve) => pendingAddressWaiters.push(resolve));
+}
+
+function stateOf(target) {
+  let state = pageStates.get(target);
+  if (!state) {
+    state = {
+      collectorReady: false,
+      pendingNavigationUntil: 0,
+      mainDocumentRequest: null,
+      lastReportedUrl: '',
+      lastRecordedNavigationUrl: '',
+      lastRecordedNavigationAt: 0,
+      lastOperationAt: 0,
+    };
+    pageStates.set(target, state);
+  }
+  return state;
+}
+
+function livePages() {
+  return context ? context.pages().filter((candidate) => !candidate.isClosed()) : [];
+}
+
+function currentPage() {
+  if (page && !page.isClosed()) return page;
+  const pages = livePages();
+  page = pages.at(-1) || null;
+  return page;
+}
+
+function focusedPage(fallback = currentPage()) {
+  const pages = livePages();
+  if (pages.length < 2) return Promise.resolve(fallback);
+  return Promise.all(pages.map(async (candidate) => ({
+    candidate,
+    focused: await candidate.evaluate(() => document.hasFocus()).catch(() => false),
+  }))).then((results) => {
+    const focused = results.find((result) => result.focused)?.candidate || fallback;
+    if (focused) page = focused;
+    return focused;
+  });
+}
+
+function comparableUrl(value) {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    return url.href;
+  } catch {
+    return value;
+  }
+}
+
+function reportNavigation(target, url, navigationSource = 'operation', error) {
+  const state = stateOf(target);
+  state.lastReportedUrl = url;
+  out({ type: 'nav', url, navigationSource, ...(error ? { error } : {}) });
+}
+
+function emitClosedAndExit() {
+  if (!closedEmitted) {
+    closedEmitted = true;
+    out({ type: 'closed' });
+  }
+  setImmediate(() => process.exit(0));
+}
 
 function scheduleStorageStateSave() {
   if (!context || !storageStatePath) return;
@@ -39,97 +114,161 @@ async function saveStorageState() {
 }
 
 async function syncFlags() {
-  if (!page) return;
-  await page.evaluate(([on, isPaused]) => {
+  await Promise.all(livePages().map((target) => target.evaluate(([on, isPaused]) => {
     window.__novaRecording = on;
     window.__novaRecordingPaused = isPaused;
-  }, [recording, paused]);
+  }, [recording, paused]).catch(() => {})));
+}
+
+function attachPage(target) {
+  if (attachedPages.has(target)) return;
+  attachedPages.add(target);
+  page = target;
+  const state = stateOf(target);
+
+  target.on('request', (request) => {
+    if (request.frame() !== target.mainFrame() || request.resourceType() !== 'document') return;
+    const requestAt = Date.now();
+    const redirected = Boolean(request.redirectedFrom());
+    state.mainDocumentRequest = { url: request.url(), redirected };
+    if (redirected) return;
+
+    // framenavigated 只会在重定向链最终提交时触发；若等到那里，最初在地址栏输入的 URL
+    // 已被覆盖成 redirected 请求，整条跳转就会漏录。候选请求稍等一小段时间再落步骤，
+    // 让同一时刻的点击/回车绑定先到 Node，避免把页面操作触发的跳转误判为地址栏输入。
+    const commandNavigation = requestAt <= state.pendingNavigationUntil;
+    const url = request.url();
+    if (!commandNavigation && url && url !== 'about:blank') {
+      pendingAddressNavigations += 1;
+      setTimeout(() => {
+        try {
+          const operationNavigation = requestAt <= state.lastOperationAt + 2500;
+          const now = Date.now();
+          if (
+            recording &&
+            !paused &&
+            !operationNavigation &&
+            (state.lastRecordedNavigationUrl !== url || now - state.lastRecordedNavigationAt > 500)
+          ) {
+            state.lastRecordedNavigationUrl = url;
+            state.lastRecordedNavigationAt = now;
+            out({
+              type: 'event',
+              ts: requestAt,
+              kind: 'navigate',
+              url,
+              target: null,
+              data: { navigationSource: 'address_bar', trigger: null },
+            });
+          }
+        } finally {
+          finishPendingAddressNavigation();
+        }
+      }, 75);
+    }
+  });
+
+  target.on('framenavigated', async (frame) => {
+    if (frame !== target.mainFrame()) return;
+    page = target;
+    state.collectorReady = false;
+    const url = target.url();
+    const now = Date.now();
+    const requestInfo = state.mainDocumentRequest;
+    const requestMatches = requestInfo && comparableUrl(requestInfo.url) === comparableUrl(url);
+    const operationNavigation = now <= state.pendingNavigationUntil;
+    const directAddressNavigation = Boolean(!operationNavigation && requestMatches && !requestInfo.redirected);
+    state.pendingNavigationUntil = 0;
+    state.mainDocumentRequest = null;
+    reportNavigation(target, url, directAddressNavigation ? 'address_bar' : 'operation');
+    await target.waitForLoadState('domcontentloaded').catch(() => {});
+    await syncFlags();
+    scheduleStorageStateSave();
+  });
+
+  target.on('close', () => {
+    if (page === target) page = null;
+    if (livePages().length > 0 || shuttingDown) return;
+    shuttingDown = true;
+    void saveStorageState()
+      .catch(() => {})
+      .then(() => browser?.close().catch(() => {}))
+      .finally(emitClosedAndExit);
+  });
 }
 
 async function ensureBrowser() {
-  if (page && !page.isClosed()) return;
+  const existing = currentPage();
+  if (browser?.isConnected() && context && existing) return existing;
+  if (browser?.isConnected() && context) {
+    const target = await context.newPage();
+    attachPage(target);
+    return target;
+  }
+
   let lastError = null;
   for (const channel of ['chrome', 'msedge']) {
     try {
-      browser = await chromium.launch({
+      const launchedBrowser = await chromium.launch({
         channel,
         headless: false,
         args: ['--start-maximized'],
       });
-      context = await browser.newContext({
+      const launchedContext = await launchedBrowser.newContext({
         viewport: null,
         ...(storageStatePath && fs.existsSync(storageStatePath) ? { storageState: storageStatePath } : {}),
       });
-      await context.exposeFunction('__novaPush', (event) => {
-        const now = Date.now();
-        if (
-          event.kind === 'click' ||
-          event.kind === 'submit' ||
-          (event.kind === 'key' && event.data?.key === 'Enter')
-        ) {
-          pendingNavigationAction = {
-            kind: event.kind,
-            selector: event.target?.selector || '',
-          };
-          pendingNavigationUntil = now + 2500;
+      browser = launchedBrowser;
+      context = launchedContext;
+      shuttingDown = false;
+      closedEmitted = false;
+
+      await context.exposeBinding('__novaPush', ({ page: sourcePage }, event) => {
+        if (sourcePage) {
+          attachPage(sourcePage);
+          page = sourcePage;
+          const state = stateOf(sourcePage);
+          if (
+            event.kind === 'click' ||
+            event.kind === 'submit' ||
+            (event.kind === 'key' && event.data?.key === 'Enter')
+          ) {
+            const now = Date.now();
+            state.lastOperationAt = now;
+            state.pendingNavigationUntil = now + 2500;
+          }
         }
+        const now = Date.now();
         out({ type: 'event', ts: now, ...event });
         scheduleStorageStateSave();
       });
-      await context.exposeFunction('__novaCollectorReady', ({ url }) => {
-        collectorReady = true;
+      await context.exposeBinding('__novaCollectorReady', ({ page: sourcePage }, { url }) => {
+        if (sourcePage) {
+          attachPage(sourcePage);
+          stateOf(sourcePage).collectorReady = true;
+        }
         out({ type: 'collectorReady', url });
       });
       await context.addInitScript({ content: collectorSource });
-      page = await context.newPage();
-      page.on('request', (request) => {
-        if (request.frame() !== page.mainFrame() || request.resourceType() !== 'document') return;
-        mainDocumentRequest = {
-          url: request.url(),
-          redirected: Boolean(request.redirectedFrom()),
-        };
+      context.on('page', attachPage);
+      launchedBrowser.on('disconnected', () => {
+        if (browser !== launchedBrowser) return;
+        browser = null;
+        context = null;
+        page = null;
+        emitClosedAndExit();
       });
-      page.on('framenavigated', async (frame) => {
-        if (frame !== page.mainFrame()) return;
-        collectorReady = false;
-        const url = page.url();
-        // 只记录用户直接在浏览器地址栏输入网址产生的首次主文档导航：
-        // - 页面点击/提交/输入框回车后的导航不记录；
-        // - HTTP 重定向不记录；
-        // - SPA/脚本导航没有地址栏输入证据，也不记录。
-        const now = Date.now();
-        const operationNavigation = now <= pendingNavigationUntil;
-        const requestInfo = mainDocumentRequest?.url === url ? mainDocumentRequest : null;
-        const inAddressNavigationChain = now <= addressNavigationChainUntil;
-        const directAddressNavigation = !operationNavigation && !inAddressNavigationChain && requestInfo && !requestInfo.redirected;
-        if (directAddressNavigation) addressNavigationChainUntil = now + 10000;
-        pendingNavigationUntil = 0;
-        mainDocumentRequest = null;
-        out({ type: 'nav', url, navigationSource: directAddressNavigation ? 'address_bar' : 'operation' });
-        if (recording && url && url !== 'about:blank' && directAddressNavigation) {
-          out({
-            type: 'event',
-            ts: now,
-            kind: 'navigate',
-            url,
-            target: null,
-            data: { navigationSource: 'address_bar', trigger: null },
-          });
-        }
-        await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await syncFlags().catch(() => {});
-        scheduleStorageStateSave();
-      });
-      page.on('close', () => {
-        out({ type: 'closed' });
-        process.exit(0);
-      });
-      return;
+
+      const target = await context.newPage();
+      attachPage(target);
+      return target;
     } catch (error) {
       lastError = error;
-      if (browser) await browser.close().catch(() => {});
+      const failedBrowser = browser;
       browser = null;
+      context = null;
       page = null;
+      if (failedBrowser) await failedBrowser.close().catch(() => {});
     }
   }
   throw new Error('未找到 Chrome 或 Edge: ' + String(lastError?.message || lastError));
@@ -137,30 +276,70 @@ async function ensureBrowser() {
 
 const commands = {
   async navigate(command) {
-    await ensureBrowser();
+    const target = await ensureBrowser();
     let url = String(command.url || '').trim();
     if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+    const state = stateOf(target);
+    const previousPendingNavigationUntil = state.pendingNavigationUntil;
+    const commandNavigationUntil = Date.now() + 35000;
+    state.pendingNavigationUntil = commandNavigationUntil;
     try {
-      await page.goto(url || 'about:blank', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await target.goto(url || 'about:blank', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await syncFlags();
-      out({ type: 'nav', url: page.url() });
+      const currentUrl = target.url();
+      if (state.lastReportedUrl !== currentUrl) reportNavigation(target, currentUrl, 'operation');
+      return { url: currentUrl };
     } catch (error) {
-      out({ type: 'nav', url: page.url(), error: String(error?.message || error) });
+      const message = String(error?.message || error);
+      reportNavigation(target, target.url(), 'operation', message);
+      throw error;
+    } finally {
+      // 若命令执行期间页面内又发生了点击/回车，保留那个更晚的操作导航窗口；
+      // 只清掉本次 goto 自己设置的标记。
+      if (state.pendingNavigationUntil === commandNavigationUntil) {
+        state.pendingNavigationUntil = previousPendingNavigationUntil;
+      }
     }
   },
   async startRecord() {
-    await ensureBrowser();
+    const fallback = await ensureBrowser();
+    const target = await focusedPage(fallback) || fallback;
+    for (const candidate of livePages()) {
+      const state = stateOf(candidate);
+      state.pendingNavigationUntil = 0;
+      state.mainDocumentRequest = null;
+      state.lastRecordedNavigationUrl = '';
+      state.lastRecordedNavigationAt = 0;
+      state.lastOperationAt = 0;
+    }
     recording = true;
     paused = false;
     await syncFlags();
-    out({ type: 'recording', on: true, collectorReady });
+    const url = target.url();
+    if (url && url !== 'about:blank') {
+      stateOf(target).lastRecordedNavigationUrl = url;
+      stateOf(target).lastRecordedNavigationAt = Date.now();
+      out({
+        type: 'event',
+        ts: Date.now(),
+        kind: 'navigate',
+        url,
+        target: null,
+        data: { navigationSource: 'record_start', trigger: null },
+      });
+    }
+    out({ type: 'recording', on: true, collectorReady: stateOf(target).collectorReady });
+    return { url };
   },
   async stopRecord() {
+    // 给刚发生的地址栏跳转/输入事件一个进入事件管道的机会，再发送完成确认。
+    await delay(120);
+    await waitForPendingAddressNavigations();
     recording = false;
     paused = false;
     await syncFlags();
     await saveStorageState();
-    out({ type: 'recording', on: false, collectorReady });
+    out({ type: 'recording', on: false, collectorReady: livePages().some((target) => stateOf(target).collectorReady) });
   },
   async pause() {
     paused = true;
@@ -171,8 +350,9 @@ const commands = {
     await syncFlags();
   },
   async regionScreenshot(command) {
-    await ensureBrowser();
-    const clip = await page.evaluate(() => new Promise((resolve) => {
+    const fallback = await ensureBrowser();
+    const target = await focusedPage(fallback) || fallback;
+    const clip = await target.evaluate(() => new Promise((resolve) => {
       const overlay = document.createElement('div');
       overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:crosshair;background:rgba(0,0,0,.08)';
       const tip = document.createElement('div');
@@ -223,18 +403,21 @@ const commands = {
       out({ type: 'shot', reqId: command.reqId, data: null, cancelled: true });
       return;
     }
-    const image = await page.screenshot({ clip });
+    const image = await target.screenshot({ clip });
     out({ type: 'shot', reqId: command.reqId, data: 'data:image/png;base64,' + image.toString('base64'), clip });
   },
   async close() {
+    shuttingDown = true;
     await saveStorageState().catch(() => {});
     if (browser) await browser.close().catch(() => {});
-    process.exit(0);
+    emitClosedAndExit();
   },
 };
 
 const readline = require('readline');
-readline.createInterface({ input: process.stdin }).on('line', (line) => {
+const input = readline.createInterface({ input: process.stdin });
+let commandQueue = Promise.resolve();
+input.on('line', (line) => {
   let command;
   try {
     command = JSON.parse(line);
@@ -242,8 +425,24 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     return;
   }
   const handler = commands[command.cmd];
-  if (handler) Promise.resolve(handler(command)).catch((error) => {
-    out({ type: 'error', error: String(error?.message || error), cmd: command.cmd });
+  if (!handler) return;
+  commandQueue = commandQueue.then(async () => {
+    try {
+      const data = await handler(command);
+      if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: true, data: data ?? null });
+    } catch (error) {
+      const message = String(error?.message || error);
+      out({ type: 'error', error: message, cmd: command.cmd });
+      if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: false, error: message });
+    }
+  });
+});
+input.on('close', () => {
+  commandQueue.finally(async () => {
+    shuttingDown = true;
+    await saveStorageState().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+    process.exit(0);
   });
 });
 out({ type: 'hello' });

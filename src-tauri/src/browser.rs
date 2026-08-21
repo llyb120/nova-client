@@ -104,6 +104,15 @@ pub enum NodeMsg {
     },
     #[serde(rename = "recording")]
     Recording { on: bool },
+    #[serde(rename = "commandResult")]
+    CommandResult {
+        command_id: String,
+        ok: bool,
+        #[serde(default)]
+        data: Value,
+        #[serde(default)]
+        error: Option<String>,
+    },
     #[serde(rename = "shot")]
     Shot {
         req_id: String,
@@ -121,6 +130,7 @@ pub enum NodeMsg {
 }
 
 struct RecorderProc {
+    id: String,
     stdin: std::process::ChildStdin,
 }
 
@@ -129,7 +139,9 @@ pub struct BrowserManager {
     pub paused: AtomicBool,
     pub url: Mutex<String>,
     pub events: Mutex<Vec<Value>>,
-    pub pending_shots: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Option<String>, String>>>>,
+    pub pending_shots:
+        Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Option<String>, String>>>>,
+    pending_commands: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     pub last_event_id: Mutex<u64>,
     proc: Mutex<Option<RecorderProc>>,
 }
@@ -142,6 +154,7 @@ impl BrowserManager {
             url: Mutex::new(String::new()),
             events: Mutex::new(Vec::new()),
             pending_shots: Mutex::new(HashMap::new()),
+            pending_commands: Mutex::new(HashMap::new()),
             last_event_id: Mutex::new(0),
             proc: Mutex::new(None),
         }
@@ -181,7 +194,11 @@ fn ensure_proc(app: &AppHandle) -> Result<(), String> {
 
     let stdin = child.stdin.take().ok_or("无法获取录制进程 stdin")?;
     let stdout = child.stdout.take().ok_or("无法获取录制进程 stdout")?;
-    state.browser.proc.lock().unwrap().replace(RecorderProc { stdin });
+    let proc_id = uuid::Uuid::new_v4().to_string();
+    state.browser.proc.lock().unwrap().replace(RecorderProc {
+        id: proc_id.clone(),
+        stdin,
+    });
 
     // stdout 读取循环
     let app2 = app.clone();
@@ -190,23 +207,87 @@ fn ensure_proc(app: &AppHandle) -> Result<(), String> {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             let Ok(line) = line else { break };
-            let Some(rest) = line.strip_prefix("__NOVA__") else { continue };
-            let Ok(msg) = serde_json::from_str::<NodeMsg>(rest) else { continue };
-            handle_node_msg(&app2, msg);
+            let Some(rest) = line.strip_prefix("__NOVA__") else {
+                continue;
+            };
+            let Ok(msg) = serde_json::from_str::<NodeMsg>(rest) else {
+                continue;
+            };
+            handle_node_msg(&app2, &proc_id, msg);
         }
-        // 进程退出：清理
+        // 旧录制进程可能在新进程启动后才结束；只允许清理自己，不能误关新浏览器。
         let st = app2.state::<AppState>();
-        st.browser.proc.lock().unwrap().take();
+        if clear_proc_if_current(&st, &proc_id) {
         st.browser.recording.store(false, Ordering::SeqCst);
+            st.browser.paused.store(false, Ordering::SeqCst);
         let _ = app2.emit("browser://info", info_of(&st));
         let _ = app2.emit("browser://closed", ());
+        }
     });
 
     Ok(())
 }
 
-fn handle_node_msg(app: &AppHandle, msg: NodeMsg) {
+fn clear_proc_if_current(state: &AppState, proc_id: &str) -> bool {
+    let mut guard = state.browser.proc.lock().unwrap();
+    if guard.as_ref().is_some_and(|proc| proc.id == proc_id) {
+        guard.take();
+        drop(guard);
+        let pending = std::mem::take(&mut *state.browser.pending_commands.lock().unwrap());
+        for (_, tx) in pending {
+            let _ = tx.send(Err("浏览器进程已关闭".into()));
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn handle_node_msg(app: &AppHandle, proc_id: &str, msg: NodeMsg) {
     let state = app.state::<AppState>();
+    if let NodeMsg::CommandResult {
+        command_id,
+        ok,
+        data,
+        error,
+    } = msg
+    {
+        let is_current = state
+            .browser
+            .proc
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|proc| proc.id == proc_id);
+        if !is_current {
+            return;
+        }
+        let tx = state
+            .browser
+            .pending_commands
+            .lock()
+            .unwrap()
+            .remove(&command_id);
+        if let Some(tx) = tx {
+            let result = if ok {
+                Ok(data)
+            } else {
+                Err(error.unwrap_or_else(|| "浏览器命令执行失败".into()))
+            };
+            let _ = tx.send(result);
+        }
+        return;
+    }
+    let is_current = state
+        .browser
+        .proc
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|proc| proc.id == proc_id);
+    if !is_current {
+        return;
+    }
     match msg {
         NodeMsg::Hello => {
             eprintln!("[browser] recorder process ready");
@@ -265,17 +346,25 @@ fn handle_node_msg(app: &AppHandle, msg: NodeMsg) {
                 let _ = app.emit("browser://info", info_of(&state));
             }
         }
-        NodeMsg::Shot { req_id, data, cancelled, .. } => {
+        NodeMsg::CommandResult { .. } => unreachable!(),
+        NodeMsg::Shot {
+            req_id,
+            data,
+            cancelled,
+            ..
+        } => {
             let tx = state.browser.pending_shots.lock().unwrap().remove(&req_id);
             if let Some(tx) = tx {
                 let _ = tx.send(if cancelled { Ok(None) } else { Ok(data) });
             }
         }
         NodeMsg::Closed => {
-            state.browser.proc.lock().unwrap().take();
+            if clear_proc_if_current(&state, proc_id) {
             state.browser.recording.store(false, Ordering::SeqCst);
+                state.browser.paused.store(false, Ordering::SeqCst);
             let _ = app.emit("browser://closed", ());
             let _ = app.emit("browser://info", info_of(&state));
+        }
         }
         NodeMsg::Error { error } => {
             eprintln!("[browser] recorder error: {error}");
@@ -303,9 +392,48 @@ fn send_cmd(app: &AppHandle, cmd: Value) -> Result<(), String> {
         return Err("录制进程未启动".into());
     };
     let line = serde_json::to_string(&cmd).map_err(|e| e.to_string())? + "\n";
-    proc.stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    proc.stdin
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())?;
     proc.stdin.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+async fn send_cmd_wait(app: AppHandle, mut cmd: Value) -> Result<Value, String> {
+    let command_id = uuid::Uuid::new_v4().to_string();
+    let Some(object) = cmd.as_object_mut() else {
+        return Err("浏览器命令格式错误".into());
+    };
+    object.insert("commandId".into(), json!(command_id));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.state::<AppState>()
+        .browser
+        .pending_commands
+        .lock()
+        .unwrap()
+        .insert(command_id.clone(), tx);
+    if let Err(error) = send_cmd(&app, cmd) {
+        app.state::<AppState>()
+            .browser
+            .pending_commands
+            .lock()
+            .unwrap()
+            .remove(&command_id);
+        return Err(error);
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(35), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("浏览器命令响应通道已关闭".into()),
+        Err(_) => {
+            app.state::<AppState>()
+                .browser
+                .pending_commands
+                .lock()
+                .unwrap()
+                .remove(&command_id);
+            Err("浏览器命令执行超时".into())
+        }
+    }
 }
 
 #[tauri::command]
@@ -327,44 +455,59 @@ pub fn browser_navigate(app: AppHandle, url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn browser_record_start(app: AppHandle) -> Result<(), String> {
+pub async fn browser_record_start(app: AppHandle) -> Result<(), String> {
     {
         let state = app.state::<AppState>();
         state.browser.events.lock().unwrap().clear();
         state.browser.recording.store(true, Ordering::SeqCst);
         state.browser.paused.store(false, Ordering::SeqCst);
     }
-    send_cmd(&app, json!({ "cmd": "startRecord" }))
+    if let Err(error) = send_cmd_wait(app.clone(), json!({ "cmd": "startRecord" })).await {
+        let state = app.state::<AppState>();
+        state.browser.recording.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn browser_record_stop(app: AppHandle) -> Result<Vec<Value>, String> {
-    {
+pub async fn browser_record_stop(app: AppHandle) -> Result<Vec<Value>, String> {
+    // Node 确认停止前保持接收，避免地址栏跳转后立刻停止时丢掉尾部事件。
+    let result = send_cmd_wait(app.clone(), json!({ "cmd": "stopRecord" })).await;
         let state = app.state::<AppState>();
         state.browser.recording.store(false, Ordering::SeqCst);
         state.browser.paused.store(false, Ordering::SeqCst);
-    }
-    send_cmd(&app, json!({ "cmd": "stopRecord" }))?;
-    let state = app.state::<AppState>();
+    result?;
     let events = std::mem::take(&mut *state.browser.events.lock().unwrap());
     Ok(events)
 }
 
 #[tauri::command]
 pub fn browser_record_pause(app: AppHandle) -> Result<(), String> {
-    app.state::<AppState>().browser.paused.store(true, Ordering::SeqCst);
+    app.state::<AppState>()
+        .browser
+        .paused
+        .store(true, Ordering::SeqCst);
     send_cmd(&app, json!({ "cmd": "pause" }))
 }
 
 #[tauri::command]
 pub fn browser_record_resume(app: AppHandle) -> Result<(), String> {
-    app.state::<AppState>().browser.paused.store(false, Ordering::SeqCst);
+    app.state::<AppState>()
+        .browser
+        .paused
+        .store(false, Ordering::SeqCst);
     send_cmd(&app, json!({ "cmd": "resume" }))
 }
 
 #[tauri::command]
 pub fn browser_events(app: AppHandle) -> Vec<Value> {
-    app.state::<AppState>().browser.events.lock().unwrap().clone()
+    app.state::<AppState>()
+        .browser
+        .events
+        .lock()
+        .unwrap()
+        .clone()
 }
 
 /// 整页截图（视口）

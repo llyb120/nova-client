@@ -30,7 +30,7 @@ export interface RecordEvent {
     value?: string;
     checked?: boolean;
     key?: string;
-    navigationSource?: "operation" | "address_bar";
+    navigationSource?: "operation" | "address_bar" | "record_start";
     inputType?: "paste";
     trigger?: { kind?: string; selector?: string } | null;
     recordContent?: string;
