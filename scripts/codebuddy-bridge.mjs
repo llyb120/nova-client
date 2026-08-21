@@ -57,10 +57,10 @@ function codeBuddyBatchToolPolicy(request, env = process.env) {
     `You have CodeBuddy built-in filesystem/search tools${tools}. The following tool-selection rules are hard constraints.`,
     "Prefer minimal reads: when a path and line range are known, read only that segment and expand nearby context only as needed. Do not dump large files blindly.",
     fastContext
-      ? "When edit distribution is unknown, or when a task requires understanding two or more unread files, call nova-tools polaris first. One polaris call typically replaces 5–10 grep+read round-trips. Treat its displayed ranges as already read, and read only coverage gaps or explicitly suggested next locations."
+      ? "When edit distribution or code location is unknown, call nova-tools polaris first. It returns ranked snippets and exact path:start-end hints under a 3-second hard deadline; then use native reads for the relevant ranges, in parallel when independent."
       : "When location is unknown, use a cost-bounded search first and then read only near relevant hits.",
     fastContext
-      ? "Do not re-discover the same keywords with Grep, rg, or git grep after polaris. If polaris reports CTX MISS, retry once using its next hint or explicit files instead of falling back to repeated searches."
+      ? "Do not re-discover the same keywords immediately with Grep, rg, or git grep after polaris. If candidates are insufficient, narrow the directory or file type before a bounded fallback search."
       : "Do not use unscoped recursive grep over a repository or source root.",
     "Do not scan build artifacts, dependencies, caches, generated files, or large binary directories unless the task requires them. Keep edits focused and run the lowest-cost effective validation.",
   ];
