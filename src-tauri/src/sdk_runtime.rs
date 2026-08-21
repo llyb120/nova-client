@@ -274,7 +274,7 @@ impl SdkManager {
                     .as_deref()
                     .and_then(|selection| thread.cached_auto_model(selection)),
             );
-            store.save();
+            store.save_thread(&thread_id);
             values
         };
         if let Some((prompt, fallback)) = title_job {
@@ -338,7 +338,7 @@ impl SdkManager {
                             );
                             let _ = self.emit_update(&thread_id, &item);
                         }
-                        store.save();
+                        store.save_thread(&thread_id);
                     }
                     Err(error) => {
                         self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
@@ -367,7 +367,7 @@ impl SdkManager {
                             thread.model = None;
                             thread.reasoning_effort = None;
                         }
-                        store.save();
+                        store.save_thread(&thread_id);
                     }
                 }
             }
@@ -445,7 +445,7 @@ impl SdkManager {
                 if let Some(thread) = store.get_mut(&thread_id) {
                     thread.handoff_from = Some(AgentKind::Cursor);
                 }
-                store.save();
+                store.save_thread(&thread_id);
             }
         }
         self.finish_turn_if_current(
@@ -503,7 +503,7 @@ impl SdkManager {
                 if let Some(thread) = store.get_mut(thread_id) {
                     thread.handoff_from = Some(self.adapter.agent_kind());
                 }
-                store.save();
+                store.save_thread(&thread_id);
             }
         }
         self.finish_turn(thread_id, "cancelled", None);
@@ -571,7 +571,7 @@ impl SdkManager {
             };
             let item = thread.push_user(text.clone(), images.clone());
             let _ = self.emit_update(thread_id, &item);
-            store.save();
+            store.save_thread(thread_id);
         }
 
         let parts = prompt_parts(self.adapter.as_ref(), &text, &images);
@@ -617,7 +617,7 @@ impl SdkManager {
             // independently of the cancelled provider run or its asynchronous memory file.
             thread.handoff_from = Some(self.adapter.agent_kind());
         }
-        store.save();
+        store.save_thread(thread_id);
     }
 
     pub fn forget_session_of_thread(&self, thread_id: &str) {
@@ -847,7 +847,7 @@ impl SdkManager {
             if let Some(thread) = store.get_mut(&thread_id) {
                 if thread.title == "新会话" || thread.title == fallback {
                     thread.title = title;
-                    store.save();
+                    store.save_thread(&thread_id);
                     let _ = manager.app.emit(EV_THREADS, json!({}));
                 }
             }
@@ -1437,7 +1437,7 @@ impl SdkManager {
             if let Some(thread) = store.get_mut(thread_id) {
                 thread.cwd = cwd.clone();
             }
-            store.save();
+            store.save_thread(thread_id);
         }
         // touch 同时覆盖“已有则切换到最前、没有则创建”，并持久化 projects.json。
         state.projects.lock().unwrap().touch(&cwd);
@@ -1467,7 +1467,7 @@ impl SdkManager {
             }
             thread.acp_session_id = Some(session_id.to_string());
         }
-        store.save();
+        store.save_thread(thread_id);
     }
 
     fn clear_session_id(&self, thread_id: &str) {
@@ -1479,7 +1479,7 @@ impl SdkManager {
                 thread.codex_usage_snapshot = None;
             }
         }
-        store.save();
+        store.save_thread(thread_id);
     }
 
     fn save_checkpoint(&self, thread_id: &str, user_item_id: u64, event: &Value) {
@@ -1498,7 +1498,7 @@ impl SdkManager {
                 position.to_string(),
             );
         }
-        store.save();
+        store.save_thread(thread_id);
     }
 
     fn apply_item(&self, thread_id: &str, value: &Value, ids: &mut HashMap<String, u64>) {
@@ -1620,7 +1620,7 @@ impl SdkManager {
         if let Some(plan) = plan {
             let _ = self.emit_op(thread_id, json!({ "t": "plan", "plan": plan }));
         }
-        store.save();
+        store.save_thread(thread_id);
     }
 
     fn apply_plan(&self, thread_id: &str, plan: &Value) {
@@ -1636,7 +1636,7 @@ impl SdkManager {
         thread.plan = Some(plan.clone());
         thread.updated_at = now_ms();
         let _ = self.emit_op(thread_id, json!({ "t": "plan", "plan": plan }));
-        store.save();
+        store.save_thread(thread_id);
     }
 
     fn emit_permission(&self, thread_id: &str, permission: &Value) {
@@ -1699,7 +1699,7 @@ impl SdkManager {
             let item = thread.push_system(text, level);
             let _ = self.emit_update(thread_id, &item);
         }
-        store.save();
+        store.save_thread(thread_id);
     }
 
     fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<&str>) {
@@ -1753,7 +1753,7 @@ impl SdkManager {
             let item = thread.push_turn(duration, usage.as_ref(), stop_reason);
             let _ = self.emit_update(thread_id, &item);
         }
-        store.save();
+        store.save_thread(thread_id);
         drop(store);
         self.set_running(thread_id, false, Some(stop_reason));
     }

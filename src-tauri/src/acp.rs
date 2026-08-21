@@ -1329,7 +1329,7 @@ impl AcpManager {
                         self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                     }
                     if completed {
-                        store.save();
+                        store.save_thread(&thread_id);
                     }
                 }
                 "plan" => {
@@ -1351,7 +1351,7 @@ impl AcpManager {
                         if thread.mode.as_deref() != Some(reported.as_str()) {
                             thread.mode = Some(reported.clone());
                             thread.updated_at = now_ms();
-                            store.save();
+                            store.save_thread(&thread_id);
                             self.emit_update(&thread_id, json!({ "t": "mode", "mode": reported }));
                         }
                     }
@@ -1394,7 +1394,7 @@ impl AcpManager {
 
             thread.updated_at = now_ms();
             let plan = plan.clone();
-            store.save();
+            store.save_thread(thread_id);
             plan
         };
 
@@ -1414,7 +1414,7 @@ impl AcpManager {
             }
             thread.plan = None;
             thread.updated_at = now_ms();
-            store.save();
+            store.save_thread(thread_id);
             true
         };
 
@@ -1472,7 +1472,7 @@ impl AcpManager {
                 let item = thread.push_turn(duration_ms, usage.as_ref(), &stop_reason);
                 self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
             }
-            store.save();
+            store.save_thread(thread_id);
         }
         self.maybe_emit_plan_action(thread_id, &stop_reason);
         self.set_running(thread_id, false, Some(stop_reason.clone()));
@@ -1783,7 +1783,7 @@ impl AcpManager {
                             );
                             self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
                         }
-                        store.save();
+                        store.save_thread(thread_id);
                         new_sid
                     }
                 }
@@ -1796,7 +1796,7 @@ impl AcpManager {
                     if let Some(thread) = store.get_mut(thread_id) {
                         thread.acp_session_id = Some(sid.clone());
                     }
-                    store.save();
+                    store.save_thread(thread_id);
                 }
                 sid
             }
@@ -1824,7 +1824,7 @@ impl AcpManager {
             let item = thread.push_system(warn, "warn");
             self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
         }
-        store.save();
+        store.save_thread(&thread_id);
     }
 
     /// 按需把线程级模型/模式同步到 session（只在变化时发请求）
@@ -2216,7 +2216,7 @@ impl AcpManager {
                 None
             });
             if consumed_marker {
-                store.save();
+                store.save_thread(&thread_id);
             }
             ctx
         };
@@ -2235,7 +2235,7 @@ impl AcpManager {
                 title_job = Some((text.clone(), fallback));
                 let _ = self.app.emit(EV_THREADS, json!({}));
             }
-            store.save();
+            store.save_thread(&thread_id);
             self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
         }
         self.clear_plan(&thread_id);
@@ -2265,9 +2265,6 @@ impl AcpManager {
 
         // 轮次已被强制结束（看门狗/重启 devin），丢弃迟到的结果
         if !self.is_running(&thread_id) {
-            let state = self.app.state::<AppState>();
-            let store = state.store.lock().unwrap();
-            store.save();
             return;
         }
 
@@ -2464,7 +2461,7 @@ impl AcpManager {
             let mut store = state.store.lock().unwrap();
             if let Some(thread) = store.get_mut(&thread_id) {
                 let item = thread.push_system(msg, "error");
-                store.save();
+                store.save_thread(&thread_id);
                 self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
             }
         };
@@ -2489,7 +2486,7 @@ impl AcpManager {
                 return;
             };
             let item = thread.push_user(text.clone(), images.clone());
-            store.save();
+            store.save_thread(&thread_id);
             self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
         }
         self.mark_plan_interrupted(&thread_id, "interrupted", false);
@@ -2521,7 +2518,7 @@ impl AcpManager {
                             "上一条消息随已停止的任务一起中断了，未被处理，请重新发送。".into(),
                             "warn",
                         );
-                        store.save();
+                        store.save_thread(&tid);
                         mgr.emit_update(&tid, json!({ "t": "upsert", "item": item }));
                     }
                 }
@@ -2691,7 +2688,7 @@ impl AcpManager {
                                 );
                                 self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
                             }
-                            store.save();
+                            store.save_thread(thread_id);
                         }
                         return Ok(("end_turn".into(), None));
                     }
@@ -2718,7 +2715,7 @@ impl AcpManager {
                 self.routes.lock().unwrap().remove(&sid);
             }
         }
-        store.save();
+        store.save_thread(thread_id);
     }
 
     /// 强制本地结束一个轮次（devin 不响应 cancel 或网络卡死时的兜底）
@@ -2731,7 +2728,7 @@ impl AcpManager {
                 let item = thread.push_system(msg.to_string(), "warn");
                 self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
             }
-            store.save();
+            store.save_thread(thread_id);
         }
         self.finish_turn(thread_id, "force_cancelled".into(), None);
         let _ = self.app.emit(EV_THREADS, json!({}));

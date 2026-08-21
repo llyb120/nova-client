@@ -5225,6 +5225,7 @@ pub fn run() {
 
             // 数据目录必须最先确定，后续窗口还原/更新都要读取其中的 marker。
             let dir = nova_data_dir(app.handle());
+            nova_tools_native::context::set_data_root(dir.clone());
             if !cfg!(debug_assertions) {
                 migrate_data_to_home(app.handle(), &dir);
             }
@@ -5479,9 +5480,8 @@ pub fn run() {
                 }
             }
 
-            // 会话后台落盘器：store.save() 只置脏标记，这里以 600ms 防抖合并，
-            // 把每个会话序列化为独立紧凑 JSON 后在阻塞线程写盘。写盘不再发生在流式热路径，
-            // 也不再把所有后端的全部历史塞进单个 threads.json。
+            // 会话后台落盘器：普通更新仅克隆并写入脏会话；删除等结构变化才做全量快照。
+            // ThreadStore 锁内不再执行 JSON 序列化，工具完成事件不会被大历史阻塞。
             {
                 let save_notify = {
                     let state = app.state::<AppState>();
@@ -5495,24 +5495,35 @@ pub fn run() {
                         save_notify.notified().await;
                         // 防抖窗口：聚合流式期间密集的 save 请求
                         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-                        let payload = {
+                        let snapshot = {
                             let state = flush_app.state::<AppState>();
-                            let mut store = state.store.lock().unwrap();
-                            if !store.take_dirty() {
-                                continue;
-                            }
-                            store
-                                .serialize_files()
-                                .map(|files| (store.directory_path(), files))
+                            let store = state.store.lock().unwrap();
+                            store.take_persist_snapshot()
                         };
-                        if let Some((dir, files)) = payload {
-                            // 写盘放阻塞线程，不占用 tokio worker
-                            let _ = tauri::async_runtime::spawn_blocking(move || {
-                                if let Err(error) = ThreadStore::write_files(&dir, &files) {
-                                    eprintln!("[threads] 后台保存会话失败：{error}");
-                                }
+                        if let Some(mut snapshot) = snapshot {
+                            let result = tauri::async_runtime::spawn_blocking(move || {
+                                let result = ThreadStore::write_persist_snapshot(&mut snapshot);
+                                (snapshot, result)
                             })
                             .await;
+                            match result {
+                                Ok((_, Ok(()))) => {}
+                                Ok((snapshot, Err(error))) => {
+                                    eprintln!("[threads] 后台保存会话失败：{error}");
+                                    let state = flush_app.state::<AppState>();
+                                    state
+                                        .store
+                                        .lock()
+                                        .unwrap()
+                                        .retry_persist_snapshot(&snapshot);
+                                }
+                                Err(error) => {
+                                    // worker panic 时 snapshot 已随任务丢失，保守退回全量持久化。
+                                    eprintln!("[threads] 后台保存 worker 失败：{error}");
+                                    let state = flush_app.state::<AppState>();
+                                    state.store.lock().unwrap().save();
+                                }
+                            }
                         }
                     }
                 });

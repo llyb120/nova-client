@@ -4,8 +4,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 use crate::clues::ClueContextSnapshot;
@@ -1167,11 +1166,26 @@ impl ThreadTrashStore {
     }
 }
 
+#[derive(Default)]
+struct DirtyThreads {
+    all: bool,
+    ids: HashSet<String>,
+}
+
+/// 一次后台持久化的不可变会话快照。快照在 ThreadStore 锁内只做必要 clone，
+/// JSON 序列化与文件 IO 均在锁外的 blocking worker 完成。
+pub struct ThreadPersistSnapshot {
+    dir: PathBuf,
+    threads: Vec<Thread>,
+    requested_ids: HashSet<String>,
+    full: bool,
+}
+
 pub struct ThreadStore {
     dir: PathBuf,
     pub threads: Vec<Thread>,
-    /// 有未落盘的修改。save() 只置位，由后台 flusher（lib.rs）节流合并写盘。
-    dirty: Arc<AtomicBool>,
+    /// 待落盘会话。普通会话更新只登记对应 id；结构变化（迁移/删除）登记 full。
+    dirty: Arc<Mutex<DirtyThreads>>,
     /// 唤醒后台 flusher（notify_one 在无等待者时会存一个 permit，不丢通知）
     save_notify: Arc<Notify>,
 }
@@ -1220,7 +1234,7 @@ impl ThreadStore {
         let mut store = ThreadStore {
             dir,
             threads,
-            dirty: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(Mutex::new(DirtyThreads::default())),
             save_notify: Arc::new(Notify::new()),
         };
         // 上次进程未正常退出时残留的临时会话，启动时一并清掉
@@ -1295,19 +1309,71 @@ impl ThreadStore {
         ephemeral
     }
 
-    /// 请求持久化（异步节流）。
-    ///
-    /// 这里只置脏标记并唤醒后台 flusher，不做任何序列化/IO：save 的调用点遍布流式
-    /// 热路径（每个工具完成、每条消息、每次 plan 更新……）。后台会把每个会话写到独立
-    /// 文件，避免单个 threads.json 随全部历史持续膨胀，也避免某个会话损坏所有记录。
+    /// 请求全量持久化（异步节流）。用于会话集合发生结构变化的路径，例如删除。
+    /// 普通单会话更新应调用 save_thread，避免一个工具事件重写全部历史。
     pub fn save(&self) {
-        self.dirty.store(true, Ordering::Release);
+        let mut dirty = self.dirty.lock().unwrap();
+        dirty.all = true;
+        dirty.ids.clear();
+        drop(dirty);
         self.save_notify.notify_one();
     }
 
-    /// 后台 flusher 用：取走脏标记（返回 true 表示需要写盘）
-    pub fn take_dirty(&self) -> bool {
-        self.dirty.swap(false, Ordering::AcqRel)
+    /// 只标记一个会话待持久化。登记和唤醒均为常量开销，可安全用于流式/工具热路径。
+    pub fn save_thread(&self, id: &str) {
+        if id.is_empty() {
+            self.save();
+            return;
+        }
+        let mut dirty = self.dirty.lock().unwrap();
+        if !dirty.all {
+            dirty.ids.insert(id.to_string());
+        }
+        drop(dirty);
+        self.save_notify.notify_one();
+    }
+
+    /// 取走当前脏集合并在 ThreadStore 锁内创建最小快照。取走后发生的新更新会重新
+    /// 登记并留下 notify permit，因此当前快照写盘期间的更新不会丢失。
+    pub fn take_persist_snapshot(&self) -> Option<ThreadPersistSnapshot> {
+        let (full, requested_ids) = {
+            let mut dirty = self.dirty.lock().unwrap();
+            if !dirty.all && dirty.ids.is_empty() {
+                return None;
+            }
+            let full = dirty.all;
+            dirty.all = false;
+            let ids = std::mem::take(&mut dirty.ids);
+            (full, ids)
+        };
+        let threads = if full {
+            self.threads.clone()
+        } else {
+            self.threads
+                .iter()
+                .filter(|thread| requested_ids.contains(&thread.id))
+                .cloned()
+                .collect()
+        };
+        Some(ThreadPersistSnapshot {
+            dir: self.dir.clone(),
+            threads,
+            requested_ids,
+            full,
+        })
+    }
+
+    /// 写盘失败时把快照对应的脏标记放回队列；期间新增的脏标记会一并保留。
+    pub fn retry_persist_snapshot(&self, snapshot: &ThreadPersistSnapshot) {
+        let mut dirty = self.dirty.lock().unwrap();
+        if snapshot.full {
+            dirty.all = true;
+            dirty.ids.clear();
+        } else if !dirty.all {
+            dirty.ids.extend(snapshot.requested_ids.iter().cloned());
+        }
+        drop(dirty);
+        self.save_notify.notify_one();
     }
 
     /// 后台 flusher 用：save() 的唤醒器句柄
@@ -1315,17 +1381,17 @@ impl ThreadStore {
         self.save_notify.clone()
     }
 
-    /// 序列化当前全部会话为独立的紧凑 JSON（借用序列化，不 clone）。
+    /// 序列化当前全部会话为独立的紧凑 JSON（同步退出/迁移路径）。
     pub fn serialize_files(&mut self) -> Option<Vec<(PathBuf, String)>> {
         Self::serialize_threads(&self.dir, &mut self.threads).ok()
     }
 
-    pub fn directory_path(&self) -> PathBuf {
-        self.dir.clone()
-    }
-
-    /// 原子写入会话快照，并删除已不在快照中的旧会话文件。
-    pub fn write_files(dir: &Path, files: &[(PathBuf, String)]) -> Result<(), String> {
+    fn write_file_batch(
+        dir: &Path,
+        files: &[(PathBuf, String)],
+        cleanup_all: bool,
+        requested_ids: &HashSet<String>,
+    ) -> Result<(), String> {
         fs::create_dir_all(dir).map_err(|error| error.to_string())?;
         for (path, json) in files {
             let tmp = path.with_extension("json.tmp");
@@ -1340,22 +1406,56 @@ impl ThreadStore {
             }
         }
 
-        let expected: HashSet<&Path> = files.iter().map(|(path, _)| path.as_path()).collect();
-        for entry in fs::read_dir(dir)
-            .map_err(|error| error.to_string())?
-            .flatten()
-        {
-            let path = entry.path();
-            if path.extension() == Some(OsStr::new("json")) && !expected.contains(path.as_path()) {
-                fs::remove_file(path).map_err(|error| error.to_string())?;
+        if cleanup_all {
+            let expected: HashSet<&Path> = files.iter().map(|(path, _)| path.as_path()).collect();
+            for entry in fs::read_dir(dir)
+                .map_err(|error| error.to_string())?
+                .flatten()
+            {
+                let path = entry.path();
+                if path.extension() == Some(OsStr::new("json"))
+                    && !expected.contains(path.as_path())
+                {
+                    fs::remove_file(path).map_err(|error| error.to_string())?;
+                }
+            }
+        } else {
+            let written = files
+                .iter()
+                .filter_map(|(path, _)| path.file_name())
+                .collect::<HashSet<_>>();
+            for id in requested_ids {
+                let file_name = Self::thread_file_name(id);
+                if !written.contains(OsStr::new(&file_name)) {
+                    let path = dir.join(file_name);
+                    if path.exists() {
+                        fs::remove_file(path).map_err(|error| error.to_string())?;
+                    }
+                }
             }
         }
         Ok(())
     }
 
+    /// 在 ThreadStore 锁外序列化并原子写入一次快照。
+    pub fn write_persist_snapshot(snapshot: &mut ThreadPersistSnapshot) -> Result<(), String> {
+        let files = Self::serialize_threads(&snapshot.dir, &mut snapshot.threads)?;
+        Self::write_file_batch(
+            &snapshot.dir,
+            &files,
+            snapshot.full,
+            &snapshot.requested_ids,
+        )
+    }
+
+    /// 原子写入全量会话快照，并删除已不在快照中的旧会话文件。
+    pub fn write_files(dir: &Path, files: &[(PathBuf, String)]) -> Result<(), String> {
+        Self::write_file_batch(dir, files, true, &HashSet::new())
+    }
+
     /// 立即同步落盘（进程退出/升级重启前的最终保存），并清除脏标记
     pub fn save_now(&mut self) {
-        self.dirty.store(false, Ordering::Release);
+        *self.dirty.lock().unwrap() = DirtyThreads::default();
         if let Some(files) = self.serialize_files() {
             if let Err(error) = Self::write_files(&self.dir, &files) {
                 eprintln!("[threads] 保存会话失败：{error}");
@@ -1649,6 +1749,57 @@ mod tests {
         assert_eq!(reloaded.threads.len(), 2);
         assert!(ids.iter().all(|id| reloaded.get(id).is_some()));
 
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn incremental_snapshot_writes_only_dirty_thread_and_keeps_later_updates() {
+        let data_dir = temp_thread_store_dir();
+        let mut store = ThreadStore::load(data_dir.clone());
+        let mut first = Thread::new(
+            "/tmp/project-a".into(),
+            AgentKind::Alkaid,
+            None,
+            None,
+            None,
+            false,
+        );
+        first.title = "First".into();
+        let first_id = first.id.clone();
+        let mut second = Thread::new(
+            "/tmp/project-b".into(),
+            AgentKind::Codex,
+            None,
+            None,
+            None,
+            false,
+        );
+        second.title = "Second".into();
+        let second_id = second.id.clone();
+        store.threads = vec![first, second];
+        store.save_now();
+
+        let second_path = data_dir
+            .join("threads")
+            .join(ThreadStore::thread_file_name(&second_id));
+        let second_before = fs::read_to_string(&second_path).unwrap();
+        store.get_mut(&first_id).unwrap().title = "First v1".into();
+        store.save_thread(&first_id);
+        let mut first_snapshot = store.take_persist_snapshot().unwrap();
+        assert!(!first_snapshot.full);
+        assert_eq!(first_snapshot.threads.len(), 1);
+
+        // 旧快照写盘期间到达的新更新必须保留为下一批，而不是被 take 清掉。
+        store.get_mut(&first_id).unwrap().title = "First v2".into();
+        store.save_thread(&first_id);
+        ThreadStore::write_persist_snapshot(&mut first_snapshot).unwrap();
+        let mut second_snapshot = store.take_persist_snapshot().unwrap();
+        ThreadStore::write_persist_snapshot(&mut second_snapshot).unwrap();
+
+        assert_eq!(fs::read_to_string(&second_path).unwrap(), second_before);
+        let reloaded = ThreadStore::load(data_dir.clone());
+        assert_eq!(reloaded.get(&first_id).unwrap().title, "First v2");
+        assert_eq!(reloaded.get(&second_id).unwrap().title, "Second");
         fs::remove_dir_all(data_dir).unwrap();
     }
 
