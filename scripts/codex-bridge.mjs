@@ -5,6 +5,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join } from "node:path";
+import { ponytailPrompt } from "./ponytail-prompt.mjs";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -72,6 +73,13 @@ async function inputParts(request) {
       await writeFile(path, Buffer.from(part.data, "base64"));
       parts.push({ type: "local_image", path });
     }
+  }
+  // Codex ThreadOptions 无 system prompt 字段；把 ponytail 极简规则前缀到首条文本。
+  const ponytail = ponytailPrompt();
+  if (ponytail) {
+    const first = parts.find((part) => part.type === "text");
+    if (first) first.text = `${ponytail}\n\n${first.text}`;
+    else parts.unshift({ type: "text", text: ponytail });
   }
   return { parts, imageDir };
 }

@@ -287,6 +287,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [autoChangeProjectEnabled, setAutoChangeProjectEnabled] = createSignal(
     s?.autoChangeProjectEnabled !== false,
   );
+  const [ponytailEnabled, setPonytailEnabled] = createSignal(s?.ponytailEnabled ?? true);
   const [checkpointEnabled, setCheckpointEnabled] = createSignal(
     s?.checkpointEnabled ?? false,
   );
@@ -758,6 +759,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     vegaProxy: vegaProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
+    ponytailEnabled: ponytailEnabled(),
     checkpointEnabled: checkpointEnabled(),
     contextRetrievalMode: contextRetrievalMode(),
 
@@ -1602,6 +1604,20 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </label>
                 <span class="field-hint">
                   默认开启。关闭后 Lyra 和 Vega 不再提供切换工作目录/项目的工具，也不会注入对应提示词。
+                </span>
+              </div>
+              <div class="field">
+                <span class="field-label">ponytail 极简模式</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={ponytailEnabled()}
+                    onChange={(e) => setPonytailEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  默认开启。让 Lyra 以“懒惰资深工程师”方式工作：能不写就不写，优先复用现有代码/标准库/原生能力，最小 diff、最少文件。保存后对新会话生效。
                 </span>
               </div>
             </section>

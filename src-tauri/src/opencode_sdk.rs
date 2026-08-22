@@ -584,12 +584,13 @@ impl OpenCodeSdkManager {
     }
 
     fn spawn_bridge(&self, cwd: &str) -> Result<Child, String> {
-        let (opencode_path, proxy) = {
+        let (opencode_path, proxy, ponytail) = {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap();
             (
                 settings.opencode_path.clone(),
                 settings.opencode_proxy.clone(),
+                settings.ponytail_enabled,
             )
         };
         let node = resolve_program_on_path("node")
@@ -602,6 +603,7 @@ impl OpenCodeSdkManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        command.env("NOVA_PONYTAIL", if ponytail { "1" } else { "0" });
         if !self.launch_env.is_empty() {
             crate::credential_roaming::isolate_borrowed_command(&mut command);
             command.envs(&self.launch_env);

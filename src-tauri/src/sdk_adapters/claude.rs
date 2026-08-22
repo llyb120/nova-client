@@ -51,6 +51,10 @@ impl SdkAdapter for ClaudeAdapter {
                     "NOVA_CONTEXT_RETRIEVAL_MODE",
                     settings.context_retrieval_mode.as_str().into(),
                 ),
+                (
+                    "NOVA_PONYTAIL",
+                    if settings.ponytail_enabled { "1" } else { "0" }.into(),
+                ),
             ],
         }
     }

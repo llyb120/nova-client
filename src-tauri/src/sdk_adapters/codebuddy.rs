@@ -41,6 +41,10 @@ impl SdkAdapter for CodeBuddyAdapter {
                     "NOVA_CONTEXT_RETRIEVAL_MODE",
                     settings.context_retrieval_mode.as_str().into(),
                 ),
+                (
+                    "NOVA_PONYTAIL",
+                    if settings.ponytail_enabled { "1" } else { "0" }.into(),
+                ),
                 // Windows 上 CodeBuddy 的 Bash 工具默认走 Git Bash；显式指定 PowerShell，
                 // 避免依赖 Git Bash 安装，同时与 Nova 自身的 PowerShell 工具约定一致。
                 #[cfg(windows)]

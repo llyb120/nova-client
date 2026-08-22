@@ -56,6 +56,7 @@ impl ContextRetrievalMode {
 }
 
 fn default_experience_training_interval_minutes() -> u32 { 60 }
+fn default_true() -> bool { true }
 fn default_experience_evolution_interval_minutes() -> u32 { 720 }
 fn default_experience_training_agent() -> String { "lyra".into() }
 fn default_experience_experts() -> Vec<ExperienceExpertConfig> {
@@ -153,6 +154,9 @@ pub struct Settings {
     pub windows_shell_shim_enabled: bool,
     /// 是否允许 Lyra/Vega 自动切换当前项目和工具工作目录；默认开启。
     pub auto_change_project_enabled: bool,
+    /// ponytail 极简模式：在 system prompt 注入「最小实现/最少改动」规则。默认开启。
+    #[serde(default = "default_true")]
+    pub ponytail_enabled: bool,
     /// 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件。
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
@@ -264,6 +268,7 @@ impl Default for Settings {
             vega_proxy: String::new(),
             windows_shell_shim_enabled: false,
             auto_change_project_enabled: true,
+            ponytail_enabled: true,
             checkpoint_enabled: false,
             default_mode: String::new(),
             lightweight_model_agent: "alkaid".into(),

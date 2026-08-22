@@ -383,6 +383,37 @@ pub fn load_agent_instructions(roots: &crate::lyra::config::Roots) -> String {
         .to_string()
 }
 
+/// ponytail 极简模式：开启后在 stable 段注入「懒惰资深工程师」规则。
+/// 用 DietrichGebert/ponytail 的 AGENTS.md 完整原文（英文）。与"先理解再修改"不冲突。
+pub const PONYTAIL_RULES: &str = r#"You are a lazy senior developer. Lazy means efficient, not careless. The best code is the code never written.
+
+Before writing any code, stop at the first rung that holds:
+
+1. Does this need to be built at all? (YAGNI)
+2. Does it already exist in this codebase? Reuse the helper, util, or pattern that's already here, don't re-write it.
+3. Does the standard library already do this? Use it.
+4. Does a native platform feature cover it? Use it.
+5. Does an already-installed dependency solve it? Use it.
+6. Can this be one line? Make it one line.
+7. Only then: write the minimum code that works.
+
+The ladder runs after you understand the problem, not instead of it: read the task and the code it touches, trace the real flow end to end, then climb.
+
+Bug fix = root cause, not symptom: a report names a symptom. Grep every caller of the function you touch and fix the shared function once — one guard there is a smaller diff than one per caller, and patching only the path the ticket names leaves a sibling caller still broken.
+
+Rules:
+
+- No abstractions that weren't explicitly requested.
+- No new dependency if it can be avoided.
+- No boilerplate nobody asked for.
+- Deletion over addition. Boring over clever. Fewest files possible.
+- Shortest working diff wins, but only once you understand the problem. The smallest change in the wrong place isn't lazy, it's a second bug.
+- Question complex requests: "Do you actually need X, or does Y cover it?"
+- Pick the edge-case-correct option when two stdlib approaches are the same size, lazy means less code, not the flimsier algorithm.
+- Mark deliberate simplifications that cut a real corner with a known ceiling (global lock, O(n²) scan, naive heuristic) with a `ponytail:` comment naming the ceiling and upgrade path.
+
+Not lazy about: understanding the problem (read it fully and trace the real flow before picking a rung, a small diff you don't understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs (the platform is never the spec ideal, a clock drifts, a sensor reads off), anything explicitly requested. Lazy code without its check is unfinished: non-trivial logic leaves ONE runnable check behind, the smallest thing that fails if the logic breaks (an assert-based demo/self-check or one small test file; no frameworks, no fixtures). Trivial one-liners need no test."#;
+
 pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
     let shell = options
         .shell
@@ -398,6 +429,7 @@ pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
         "shell": shell,
         "skills": options.skills_text,
         "customInstructions": options.custom_instructions,
+        "ponytail": options.ponytail,
 
         "editMode": std::env::var("LYRA_EDIT_MODE").unwrap_or_default(),
     });
@@ -452,8 +484,9 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         if options.auto_change_project { "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" } else { "" }.into(),
         if options.memory_enabled { "polaris 会用 task 自动附带相关训练知识（task 为空时回退 keywords）。若结果含 TRAINED KNOWLEDGE，当前会话新事实优先；rule 是强约束，memory 是可核验事实，experience 仅在条件匹配时适用。" } else { "" }.into(),
         "先理解再修改，保持改动聚焦。".into(),
+        if options.ponytail { PONYTAIL_RULES.into() } else { String::new() },
         "最终回复采用例外汇报，而不是完整工作报告。先直接给出用户可感知的结果；只有信息会影响结果判断、下一步行动、风险认知或可信度时，才写入最终回复。默认省略文件/函数/行号清单、搜索和工具调用过程、常规实现细节、具体测试命令、成功步骤清单、无实际影响的注意事项、泛化建议、‘无风险’声明，以及对同一结果的重复总结。正常成功时用 1～3 句话，不强制使用标题或列表；存在失败、未验证、行为变化、兼容性风险或用户必须操作的事项时，只围绕这些例外按需展开。用户明确询问实现细节时才提供详细报告。".into(),
-        "完成修改后，优先根据版本控制 diff 按需确定受影响单元及直接使用方，并执行成本最低且有效的验证；禁止遍历或列出完整仓库、无依据扩大范围。最终回复只需说明验证是否通过，不列具体命令和逐项过程；仅当验证失败、无法验证或结果存在关键限制时补充原因与影响。".into(),
+        "完成修改后按需验证：改动小、影响明确时做成本最低的检查即可，影响面大或不确定时再按需扩大到受影响单元及直接使用方；禁止遍历或列出完整仓库、无依据扩大范围。最终回复只需说明验证是否通过，不列具体命令和逐项过程；仅当验证失败、无法验证或结果存在关键限制时补充原因与影响。".into(),
         match &options.shell {
             Some(shell) if shell.kind == ShellKind::PowerShell => format!(
                 "命令终端已确认使用 PowerShell（{}）；bash 工具在 Windows 下通过 PowerShell 执行命令，必须从第一次调用起使用 PowerShell 语法（cmdlet、`;` 串联多条命令、`$env:NAME` 访问环境变量），不要使用 Bash 语法（`export`、`&&` 串联在 Windows PowerShell 5.1 中不可用、POSIX 风格的 sed/awk/grep 调用）。",
@@ -495,6 +528,7 @@ pub struct SystemPromptOptions {
     pub shell: Option<ShellConfig>,
     pub skills_text: String,
     pub custom_instructions: String,
+    pub ponytail: bool,
 }
 
 #[cfg(test)]
@@ -512,6 +546,7 @@ mod tests {
             shell: None,
             skills_text: String::new(),
             custom_instructions: String::new(),
+            ponytail: false,
         };
         let prompt = build_system_prompt(&options);
         assert!(!prompt.contains("change_working_directory"));

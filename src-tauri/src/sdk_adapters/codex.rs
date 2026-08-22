@@ -27,7 +27,10 @@ impl SdkAdapter for CodexAdapter {
             proxy: settings.codex_proxy.clone(),
             path_env: "NOVA_CODEX_PATH",
             api_key: None,
-            extra_env: Vec::new(),
+            extra_env: vec![(
+                "NOVA_PONYTAIL",
+                if settings.ponytail_enabled { "1" } else { "0" }.into(),
+            )],
         }
     }
 

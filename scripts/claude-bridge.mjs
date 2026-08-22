@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { ponytailPrompt } from "./ponytail-prompt.mjs";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
@@ -197,6 +198,9 @@ async function main() {
       permissionMode: request.mode === "plan" ? "plan" : "default",
       abortController: controller,
       pathToClaudeCodeExecutable: claudePathOverride(),
+      ...(ponytailPrompt()
+        ? { systemPrompt: { type: "preset", preset: "claude_code", append: ponytailPrompt() } }
+        : {}),
       canUseTool: (tool, input, options) => new Promise((resolve) => {
         pending.set(options.toolUseID, resolve);
         send({ type: "permission", permission: { id: options.toolUseID, permission: tool, metadata: input } });
