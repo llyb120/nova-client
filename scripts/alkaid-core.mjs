@@ -9,6 +9,7 @@ import {
   loadSkillsFromDir,
 } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/skills.js";
 import { getShellConfig } from "../node_modules/@earendil-works/pi-coding-agent/dist/utils/shell.js";
+import { ponytailPrompt } from "./ponytail-prompt.mjs";
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -610,7 +611,8 @@ export function buildAlkaidSystemPrompt(options = {}) {
       ? "polaris 会自动附带相关训练知识。当前会话事实优先；rule 是强约束，memory 是可核验事实，experience 只在条件匹配时适用。若结果含 TRAINED KNOWLEDGE，最终回复前调用 feedback_memory，只反馈实际采用的条目；用户沉默不算成功，未采用或无法验证时用 reward=0。"
       : "",
     "先理解再修改，保持改动聚焦；完成后简洁报告结果和验证。",
-    "完成修改后，优先根据版本控制 diff 按需确定受影响单元及直接使用方，并执行成本最低且有效的验证；禁止遍历或列出完整仓库、无依据扩大范围，纯文档类改动可说明依据后跳过测试，无法验证时须报告原因、建议命令及剩余风险。",
+    ponytailPrompt(),
+    "完成修改后按需验证：改动小、影响明确时做成本最低的检查即可，影响面大或不确定时再按需扩大到受影响单元及直接使用方；禁止遍历或列出完整仓库、无依据扩大范围，纯文档类改动可说明依据后跳过测试，无法验证时须报告原因、建议命令及剩余风险。",
     options.shellConfig
       ? options.shellConfig.kind === "powershell"
         ? `命令终端已确认使用 PowerShell（${options.shellConfig.shell}）；bash 工具在 Windows 下通过 PowerShell 执行命令，必须从第一次调用起使用 PowerShell 语法（cmdlet、\`;\` 串联多条命令、\`$env:NAME\` 访问环境变量），不要使用 Bash 语法（\`export\`、\`&&\` 串联在 Windows PowerShell 5.1 中不可用、POSIX 风格的 sed/awk/grep 调用）。`

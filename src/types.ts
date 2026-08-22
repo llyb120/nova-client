@@ -441,6 +441,8 @@ export interface Settings {
   windowsShellShimEnabled: boolean;
   /** 是否允许 Lyra/Vega 自动切换当前项目和工具工作目录；默认开启。 */
   autoChangeProjectEnabled: boolean;
+  /** ponytail 极简模式：system prompt 注入最小实现/最少改动规则；默认开启。 */
+  ponytailEnabled: boolean;
   /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
   checkpointEnabled: boolean;
   /** 代码上下文检索模式：无 / FastContext。 */

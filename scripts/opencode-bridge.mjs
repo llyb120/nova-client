@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline";
 import { createOpencode } from "@opencode-ai/sdk/v2";
+import { ponytailPrompt } from "./ponytail-prompt.mjs";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -249,10 +250,19 @@ function startPrompt(client, sessionId, request) {
   if (request.model) body.model = request.model;
   if (request.agent) body.agent = request.agent;
   if (request.variant) body.variant = request.variant;
+  // OpenCode SDK 无 system prompt 字段；把 ponytail 极简规则前缀到首条文本 part。
+  const ponytail = ponytailPrompt();
+  const parts = ponytail
+    ? request.parts.map((part, index) =>
+        part.type === "text" && !request.parts.slice(0, index).some((p) => p.type === "text")
+          ? { ...part, text: `${ponytail}\n\n${part.text}` }
+          : part,
+      )
+    : request.parts;
   return client.session.promptAsync({
     sessionID: sessionId,
     ...body,
-    parts: request.parts,
+    parts,
   });
 }
 

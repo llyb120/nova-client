@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { createSdkMcpServer, query, tool, unstable_v2_createSession } from "@tencent-ai/agent-sdk";
 import { z } from "zod";
 import { createNovaBatchTools } from "./nova-batch-tools.mjs";
+import { ponytailPrompt } from "./ponytail-prompt.mjs";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -65,7 +66,8 @@ function codeBuddyBatchToolPolicy(request, env = process.env) {
     "Do not scan build artifacts, dependencies, caches, generated files, or large binary directories unless the task requires them. Keep edits focused and run the lowest-cost effective validation.",
   ];
   if (readOnly) lines.push("Current mode is plan/read-only: analyze only; do not modify files.");
-  return lines.join("\n");
+  const ponytail = ponytailPrompt(env);
+  return [ponytail, lines.join("\n")].filter(Boolean).join("\n\n");
 }
 
 /**

@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
 import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
+import { ponytailPrompt } from "./ponytail-prompt.mjs";
 
 /**
  * Nova context tools for Cursor SDK `local.customTools`.
@@ -74,7 +75,7 @@ export function cursorBatchToolPolicy(options = {}) {
   return lines.join("\n");
 }
 
-/** Every-turn prompt prefix: batch FS/search policy. */
+/** Every-turn prompt prefix: batch FS/search policy + ponytail 极简规则。 */
 export function cursorPromptPrefix(options = {}) {
-  return cursorBatchToolPolicy(options);
+  return [ponytailPrompt(), cursorBatchToolPolicy(options)].filter(Boolean).join("\n\n");
 }
