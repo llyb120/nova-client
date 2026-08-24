@@ -4,6 +4,7 @@ use crate::lyra::config::Resolved;
 use crate::lyra::prompt::ShellConfig;
 use crate::lyra::provider::{stream_chat, StreamEvent};
 use crate::lyra::tools::{execute, Tool, ToolOutcome};
+use crate::lyra::watchdog::{arm_idle_watchdog, DiagnosticLog, IdleWatchdog};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -79,6 +80,8 @@ pub struct Agent {
     /// 中断轨迹增量落盘钩子：每条消息入列后以完整消息数组回调（对齐 PI 的
     /// message_end 增量持久化），任务被强杀/崩溃时磁盘上仍有截至中断点的轨迹。
     pub checkpoint: Option<Box<dyn FnMut(&[Value]) + Send>>,
+    /// provider 空闲看门狗与超时诊断（对齐 Vega/PI）：由 bridge 注入会话根目录。
+    pub watchdog: Option<(std::sync::Arc<IdleWatchdog>, std::sync::Arc<DiagnosticLog>)>,
 }
 
 fn now_ms() -> u64 {
@@ -265,6 +268,15 @@ impl Agent {
                 archive_dir: self.archive_dir.clone(),
             };
             let stream_error: Option<String> = None;
+            // 看门狗（对齐 Vega）：挂起时给 stream_chat 一个独立取消标志，超时
+            // 置位后 provider 内 wait_cancelled 会把请求转成可重试的 idle timeout 错误，
+            // 不污染会话级取消（否则 bridge 会当成用户取消而丢弃重试机会）。
+            let watchdog_cancel = self.watchdog.as_ref().map(|(w, _)| arm_idle_watchdog(w));
+            let effective_cancel = watchdog_cancel
+                .as_ref()
+                .map(|(trip, _)| trip.clone())
+                .unwrap_or_else(|| self.cancelled.clone());
+            let watchdog_state = self.watchdog.as_ref().map(|(w, _)| w.clone());
             let result = stream_chat(
                 http,
                 &self.model.model,
@@ -274,10 +286,18 @@ impl Agent {
                 &self.messages,
                 &self.tools,
                 Some(&self.session_id),
-                &self.cancelled,
+                &effective_cancel,
                 &mut |event| {
                     if stream_error.is_some() {
                         return;
+                    }
+                    if let Some(w) = &watchdog_state {
+                        w.touch();
+                        match &event {
+                            StreamEvent::TextDelta(_) => w.activity.bump(crate::lyra::watchdog::DeltaKind::Text),
+                            StreamEvent::ThinkingDelta(_) => w.activity.bump(crate::lyra::watchdog::DeltaKind::Thinking),
+                            StreamEvent::ToolArgsDelta { .. } => w.activity.bump(crate::lyra::watchdog::DeltaKind::ToolArgs),
+                        }
                     }
                     match event {
                         StreamEvent::TextDelta(delta) => on_event(AgentEvent::TextDelta(delta)),
@@ -291,6 +311,33 @@ impl Agent {
                 },
             )
             .await;
+            let watchdog_tripped = watchdog_cancel
+                .as_ref()
+                .is_some_and(|(trip, _)| trip.load(Ordering::SeqCst));
+            if let Some((_, task)) = watchdog_cancel {
+                task.abort();
+            }
+            if let Some((w, _)) = &self.watchdog {
+                w.disarm();
+            }
+            let result = if watchdog_tripped {
+                if let Some((w, diag)) = &self.watchdog {
+                    diag.record(crate::lyra::watchdog::timeout_event(
+                        &self.session_id,
+                        &self.model.model.provider,
+                        &self.model.model.id,
+                        &self.model.model.api,
+                        &w.activity,
+                        &self.messages[self.messages.len().saturating_sub(8)..],
+                    ));
+                }
+                Err(format!(
+                    "provider stream idle timeout: {}s 无增量事件",
+                    crate::lyra::watchdog::IDLE_TIMEOUT.as_secs()
+                ))
+            } else {
+                result
+            };
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
@@ -487,7 +534,15 @@ impl Agent {
                 }
             })
             .collect();
+        // 工具执行期间暂停看门狗（对齐 Vega 的 activeTools pause/resume），
+        // 避免长工具（如 cargo check）被误判为 provider 挂死。
+        if let Some((w, _)) = &self.watchdog {
+            w.pause();
+        }
         let results = futures_util::future::join_all(futures).await;
+        if let Some((w, _)) = &self.watchdog {
+            w.resume();
+        }
         for ((call, spec_hit), outcome) in prepared.into_iter().zip(spec_hits).zip(results) {
             let ToolOutcome {
                 content,

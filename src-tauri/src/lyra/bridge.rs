@@ -476,6 +476,12 @@ async fn handle_prompt(
         steering: steering.clone(),
         spec_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         checkpoint: None,
+        watchdog: Some((
+            crate::lyra::watchdog::IdleWatchdog::new(),
+            Arc::new(crate::lyra::watchdog::DiagnosticLog::new(Some(
+                sessions_root.clone(),
+            ))),
+        )),
     };
     // 后台单写者：Agent 热路径只更新最新 snapshot；300ms debounce 后由
     // spawn_blocking 完成序列化与原子写盘，不阻塞 provider/tool 执行。
