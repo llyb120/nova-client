@@ -3,9 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use base64::Engine;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::threads::PromptImage;
 use crate::{dispatch_prompt, is_running, AppState, AgentKind, Item};
 
 const ANALYSIS_TIMEOUT_MS: u64 = 120_000;
@@ -45,6 +47,7 @@ async fn run_ephemeral_prompt(
     agent_kind: AgentKind,
     model: Option<String>,
     retain_browser_thread: bool,
+    images: Vec<PromptImage>,
 ) -> Result<String, String> {
     let thread = crate::create_thread(
         app.clone(),
@@ -85,7 +88,7 @@ async fn run_ephemeral_prompt(
             .insert(thread_id.clone(), tx);
     }
 
-    dispatch_prompt(&app, thread_id.clone(), prompt, Vec::new())?;
+    dispatch_prompt(&app, thread_id.clone(), prompt, images)?;
 
     // 轮询线程运行状态；结束后取最后一条 assistant 文本
     let app_clone = app.clone();
@@ -189,11 +192,11 @@ pub async fn analyze_screenshot(
         hint = if hint.trim().is_empty() { "（未填写，请根据截图内容判断）" } else { hint.trim() },
     );
 
-    run_ephemeral_prompt(app, &state, cwd, prompt, ANALYSIS_TIMEOUT_MS, AgentKind::Lyra, None, false).await
+    run_ephemeral_prompt(app, &state, cwd, prompt, ANALYSIS_TIMEOUT_MS, AgentKind::Lyra, None, false, Vec::new()).await
 }
 
-/// 运行计划：把 Playwright 计划落盘，交给后台临时会话，由 agent/skill
-/// 自己调用 Playwright（CLI / MCP / 脚本）执行并验证，返回执行结论文本。
+/// 运行计划：agent 通过本地 HTTP 端口闭环驱动已打开的浏览器逐步执行。
+/// 每次运行绑定一个独立 tab（runId），可并行多个；agent 发一条命令、看结果、再决策。
 #[tauri::command]
 pub async fn run_plan_with_agent(
     app: AppHandle,
@@ -203,53 +206,99 @@ pub async fn run_plan_with_agent(
     agent_kind: AgentKind,
     model: Option<String>,
 ) -> Result<String, String> {
-    let config_dir = state.config_dir.clone();
-    let runtime = tauri::async_runtime::spawn_blocking(move || {
-        crate::browser::ensure_playwright_runtime(&config_dir)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    let runtime_node_modules = runtime.join("node_modules");
-    let storage_state = runtime.join("storage-state.json");
-    let headless = plan.get("headless").and_then(Value::as_bool).unwrap_or(true);
-    let run_id = uuid::Uuid::new_v4();
-    let record_output_dir = state.config_dir.join("browser-records").join(run_id.to_string());
+    // 确保浏览器已打开并拿到执行端口；未打开则启动录制进程。
+    let exec_port = crate::browser::ensure_exec_port(&app).await?;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let record_output_dir = state.config_dir.join("browser-records").join(&run_id);
     std::fs::create_dir_all(&record_output_dir).map_err(|e| format!("创建记录截图目录失败: {e}"))?;
-    // 不再落盘 Plan 文件：把 Plan 直接拼进提示词，agent 不读文件。
     let plan_json = serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?;
+    let record_dir = record_output_dir.to_string_lossy().replace('\\', "/");
+
+    // 收集 plan 里所有步骤的参考图，读成 base64 作为消息图片随提示词一起发给 agent，
+    // 这样多模态模型能直接“看到”参考图，不依赖 agent 本地读文件权限或 execReadImage。
+    let mut ref_images: Vec<PromptImage> = Vec::new();
+    if let Some(steps) = plan.get("steps").and_then(|s| s.as_array()) {
+        for step in steps {
+            if let Some(paths) = step.get("targetImagePaths").and_then(|p| p.as_array()) {
+                for p in paths {
+                    let Some(path) = p.as_str() else { continue };
+                    let Ok(bytes) = std::fs::read(path) else { continue };
+                    let mime = if path.to_ascii_lowercase().ends_with(".jpg") || path.to_ascii_lowercase().ends_with(".jpeg") {
+                        "image/jpeg"
+                    } else if path.to_ascii_lowercase().ends_with(".webp") {
+                        "image/webp"
+                    } else {
+                        "image/png"
+                    };
+                    ref_images.push(PromptImage {
+                        name: std::path::Path::new(path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "ref.png".into()),
+                        mime_type: mime.into(),
+                        data: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                        uri: None,
+                        size: None,
+                    });
+                }
+            }
+        }
+    }
+
     let prompt = format!(
-        "请严格按顺序执行以下 Plan 中的全部步骤：\n\
-         ```json\n{plan_json}\n```\n\
-         Plan 是唯一事实来源：不得添加、删除、折叠、重排或跳过任何步骤；Plan 可以不包含 goto，直接从当前挂载页面执行其余步骤。\n\
-         执行环境：\n\
-         - 使用 Nova 共享 playwright-core：{node_modules}，禁止安装、升级或下载任何依赖或浏览器；\n\
-         - 每次新建 browser/context/page，不复用历史标签页或历史 URL；\n\
-         - 可加载登录态文件 {storage_state} 保留 Cookie/localStorage；Plan 中遇到 goto 时按所在顺序执行，没有 goto 时不补充导航。goto 携带 sessionStorage 时，必须通过 context.addInitScript 在目标文档创建时按目标 origin 注入，再发起首次 page.goto，确保鉴权脚本和请求读取前已经存在。\n\
-         - Plan 顶层 headless={headless}；false 时必须使用系统 Chrome/Edge 显示真实窗口，true 时使用无头模式。\n\
-         定位规则：\n\
-         - 步骤只有三种：goto（按 url 跳转）、record（截取页面模块）、operate（操作）；operate 步骤的 prompt 就是自然语言描述的操作内容，看懂后在当前页面自行定位元素并完成操作，可结合 targetImagePaths 参考图辅助定位；\n\
-         - record 步骤必须根据该步骤上已有的信息自行定位，包括 selector、targetImagePaths 参考图和 recordContent 补充要求；不得让用户在运行时补充信息。selector 存在时先用它快速验证候选模块；selector 为空或失效时，根据参考图和提示词在 DOM 中生成并验证唯一、稳定的 locator。确定元素后必须调用 locator.screenshot，而不是按参考图坐标裁切页面；locator 的唯一性不能只凭首个匹配判断，必须先在整页统计匹配数量，若大于 1 则结合参考图和 recordContent 再筛选，禁止直接取 first()；\n\
-         - record 步骤必须遵循“等待页面就绪、识别步骤信息、匹配当前页面、生成并验证 locator、截图 DOM、检查结果”的顺序。所有 record 结果截图必须保存到目录 {record_output_dir}（不存在时先创建），禁止保存到其它位置。第一步不是立即定位：先等待 domcontentloaded，再对 networkidle 做有限等待（超时不能直接视为就绪）；持续检查页面中的 loading/spinner/skeleton/progress、全屏或模块级 mask/overlay、空数据占位和禁用态，等待它们消失。随后对候选模块每隔 800ms 读取一次关键特征（可见行数、文本长度、容器尺寸、表头及首末行），至少连续 3 次一致且存在实质数据后才算稳定；仅有表头、骨架、空白或“加载中”时禁止截图。若有 Cookie 提示、引导层等可关闭遮挡，应先正常关闭；不可关闭的遮挡必须等待或报告阻断，不得透过遮挡强行截图；\n\
-         - 页面稳定后，实际读取每张 targetImagePaths 图片，提取模块类型、标题/表头、布局、边界、相邻元素、行列数量和大致尺寸等视觉特征；再枚举当前页面全部候选 DOM 区块（不要只查第一个），将候选的文字、结构、位置、尺寸及必要的候选截图与参考图逐项比对，只有确认是同类模块后才能确定 locator。禁止把参考图本身复制为结果，禁止看到相似文字后直接截取最小文字节点，也禁止未读取参考图就猜 selector；\n\
-         - 所有 record 步骤都只能产出截图，不采集或返回文本、HTML、JSON 等其它形式的数据。outputName 是记录结果名称，必须保留并用于 analysisRecordRefs 的结果引用；recordContent 是该条记录的补充要求，可能同时包含定位线索、截图范围和其它约束，必须完整遵守；targetImagePaths 是视觉参考。确定模块后，应从命中的表头或子元素逐级向上检查父级，选择同时覆盖表头和真实数据区的最小合理容器；必须用数据行数量、容器 boundingBox 高度和截图预览验证，不能仅凭 class 名或 locator 首次命中。要求“完整表格数据”时，至少要看到表头和一行真实数据；若表格使用固定表头、内部滚动或虚拟列表，单次 locator.screenshot 只包含表头或当前视口就不算完成，必须滚动表格数据区并按顺序保存多张无遗漏、可衔接的截图，直到末行，所有截图归入同一 outputName；禁止截单元格、标题、局部行或整页代替；禁止把只含表头、没有数据行的截图当作完成，也不得在 record 残缺时仍进入后续分析步骤；\n\
-         - 每张结果截图保存后必须立即重新读取刚保存的图片文件进行自检：确认不存在 spinner/skeleton/mask，并逐项对照 recordContent 核对截图包含的表头、数据行数量和内容范围。若只看到表头、数据行缺失、遮挡、裁剪或仍在加载，应删除/覆盖该无效结果，重新等待并改选容器或采用分段滚动截图，最多修正 3 次；不得把已知不完整的截图当作成功继续执行。截图文件名应包含步骤序号、安全化后的 outputName 和分段序号；\n\
-         自适应执行规则（像人操作，不要先生成一份固定脚本后一次性运行）：\n\
-         - 逐步处理 Plan：每次只处理当前步骤，先观察当前 URL、页面结构和可见状态，再决定具体 Playwright 调用；当前步骤成功后才进入下一步；\n\
-         - 允许等待页面加载、动画结束、异步数据出现，处理遮罩、Cookie 提示、普通弹窗、新标签页和必要的滚动；\n\
-         - 单步失败时先截图和检查页面状态，最多进行 2 次有依据的修正重试；不得机械重复同一个失败调用；\n\
-         - 可以修正定位方式和等待策略，但不得改变步骤业务意图、跳过步骤或打乱顺序；goto 的目标 URL 不允许替换；\n\
-         - 如果被登录、验证码、权限或不可恢复错误阻断，应停止后续步骤并在结论中明确说明阻断位置和原因。\n\
-         执行与验证：\n\
-         - goto 步骤出现时必须访问 step.url；若该 goto 带 sessionStorage，必须先注册 context.addInitScript，并在脚本中仅当 location.origin 等于 step.url 的 origin 时写入对应 key/value，然后再首次 page.goto(step.url)。禁止先访问目标站点、临时页面或业务地址再写入，必须确保目标站点首个鉴权脚本和请求读取到该值；不得用当前地址或历史页面代替；Plan 没有 goto 时直接执行其它步骤，不得自行补充 goto；\n\
-         - 每步失败时保留错误和当前页面截图，经过允许的修正重试后仍失败才停止；\n\
-         - 所有步骤完成后再按照 analysisPrompt 分析 analysisRecordRefs 指定名称对应的 record 页面块截图；analysisRecordRefs 为空时可使用全部 record 结果。不得直接使用 DOM 文本、HTML、参考文字或参考图片作为分析数据。\n\
-         最终只返回自然语言结论，不要 JSON、代码块或逐步原始日志。结论应简洁说明：是否完成、关键结果、发生过的必要定位修正，以及失败时的阻断步骤和原因。",
+        "你要通过本地 HTTP 接口驱动一个已打开的浏览器，逐步完成以下 Plan。这是闭环：每发一条命令拿到结果后再决定下一步，不要预先写死整个流程。\n\
+         Plan：\n```json\n{plan_json}\n```\n\
+         本次运行的 runId = `{run_id}`，所有命令都必须带上它（多任务并行时用于区分各自独立的 tab，禁止混用其它 runId）。\n\
+         执行接口：POST http://127.0.0.1:{exec_port}/ ，请求体是 JSON 命令，返回 `{{ ok, data }}` 或 `{{ ok:false, error }}`。用 curl / Invoke-RestMethod / fetch 均可，逐条发送。\n\
+         可用命令（cmd 字段 + runId 字段）：\n\
+         - execOpen：新建本次运行的专属 tab。必须先发一次。例 `{{\"cmd\":\"execOpen\",\"runId\":\"{run_id}\"}}`\n\
+         - execGoto：跳转。`{{...,\"url\":\"https://...\"}}`；如需先写 sessionStorage 再加 `\"sessionStorage\":{{\"key\":\"k\",\"value\":\"v\"}}`。\n\
+         - execEval：在页面执行 JS 并返回结果。`{{...,\"expression\":\"...\"}}`。expression 会在页面里 eval，返回可 JSON 序列化的值。\n\
+         - execClick / execFill：按 selector 点击 / 填值。`{{...,\"selector\":\"...\"}}`（execFill 加 `\"value\":\"...\"`）。\n\
+         - execViewport：返回当前视口宽高，据此知道截图坐标范围。\n\
+         - execMouseClick / execMouseMove / execScroll / execType / execKey：纯视觉坐标操作。`{{...,\"x\":123,\"y\":456}}` 在视口坐标点击（execMouseClick 可加 `\"double\":true` 双击）；execScroll 用 `\"deltaY\":600` 滚动；execType 用 `\"text\":\"...\"` 逐键输入；execKey 用 `\"key\":\"Enter\"`。\n\
+         - execQuery：探测某个 selector 匹配到的元素（最多 20 个），只返回 tag/前 60 字文本/是否可见。`{{...,\"selector\":\"...\"}}`。**仅作纯视觉失败时的后备**，平时别用。\n\
+         - execShot：截图保存到文件。整页 `{{...,\"path\":\"<绝对路径.png>\"}}`；截某元素加 `\"selector\":\"...\"`；元素是内部滚动容器（表格/列表有滚动条）时再加 `\"full\":true`，会展开截出完整内容而不是只截可见一屏。\n\
+         - execReadImage：读取本地参考图返回 dataURL。`{{...,\"path\":\"<绝对路径>\"}}`，用于查看 Plan 里的 targetImagePaths。\n\
+         - execClose：关闭本次运行的 tab。全部完成后发。\n\
+         操作方式（纯视觉优先，像人一样不看 DOM）：\n\
+         - **默认用纯视觉操作**：先用 execShot 截当前页面，用你自己的看图工具看截图，认出目标元素在图里的像素位置，再用 execMouseClick(x,y) 在该坐标真实点击、execType 输入文字、execScroll 滚动把视野外目标滚进来再截再点。截图坐标与视口坐标 1:1（可先用 execViewport 拿宽高确认范围）。\n\
+         - 所有操作都产生真实鼠标/键盘事件，页面自身的校验、联动、监听会正常触发。\n\
+         - **禁止**用 execEval 改 DOM、设 value、dispatchEvent、调页面内部函数来绕过真实操作。execEval/execQuery/execClick/execFill 只在纯视觉反复失败时作后备，且 execEval 只读不改。\n\
+         - 高效：不要拉整个 DOM/outerHTML 分析；靠看截图定位即可。\n\
+         - **一次只执行一个鼠标动作**：每条命令只点一下/滚一次/输一段，发完拿到结果、重新截图确认后再发下一个。禁止一次连点多个位置或把多步操作攒在一起发，否则会因页面未及时响应而点错。\n\
+         - 下拉/筛选类操作：先 execClick 展开，再用 execEval 列出候选项文本（像上面那样只取 value+文本），选中匹配项后 execClick 该项，最后确认。\n\
+         联动筛选器（选了第一个才出现/更新第二个）：\n\
+         - 不要指望一开始就在 DOM 里看到所有筛选项。按依赖顺序逐个处理：选完第一个筛选项后，用 execWait 等第二个筛选项出现/刷新（等它的 selector 可见，或等 loading 消失、选项数量变化），再用 execQuery/execEval 读取它的最新候选项并选择。\n\
+         - 选中某一级后，后续级可能被重置或重载，每次都要重新读候选项，不要用选上一级之前拿到的旧选项。\n\
+         - 某一级选完后页面可能异步刷新数据，进下一级或截图前先 execWait 等加载结束。\n\
+         关于选项匹配（重要）：\n\
+         - Plan 要求选某个值（如国家=美国）但页面没有完全相同选项时，**不要放弃也不要直接退出**。选最接近的合理项（如 North America / USA / United States），照常完成后续步骤，并在最终结论里明确说明\"页面无 X，已选 Y\"。只有完全没有任何相关可选项才算阻断。\n\
+         - 同理，目标元素找不到时先换 selector/文字/role 再试，而不是立即报错停止。\n\
+         文件路径：所有 path 用正斜杠 `/` 写绝对路径（如 `{record_dir}/xxx.png`），不要用反斜杠，避免转义或乱码导致保存失败。\n\
+         步骤执行要点：\n\
+         - goto 步骤：execGoto。\n\
+         - operate 步骤：prompt 是自然语言操作。按上面拟人方式完成（execClick/execFill）。**每步操作后必须做视觉自检**（见下“视觉反馈”），确认生效再进下一步；不要只看接口返回 ok 就当成功。\n\
+         参考图（必看）：\n\
+         - 各步骤配置时附加的参考截图已作为**图片附件**随本提示一起发给你（targetImagePaths 对应的图），请先查看再执行对应步骤，不得忽略。顺序与 plan 中各步骤出现的顺序一致。\n\
+         - operate：据参考图确认要操作的目标（哪个按钮/筛选项/填什么值），再用 execQuery 定位、execClick/execFill 拟人执行；图与页面不一致时以页面实际为准。\n\
+         - record：参考图展示了要截的模块样子，截完用它对照自检（结构/表头/数据区是否一致）。\n\
+         - record 步骤：截取一个完整页面模块截图。流程：等页面稳定（用 execEval 轮询直到无 loading/spinner 且关键内容连续几次一致）→ 定位到同时覆盖表头和数据区的最小容器 → execShot 带 selector 截图，path 存到 {record_dir}/ 下（文件名含 outputName 和分段序号）→ 保存后自检（只有表头/数据缺失/遮挡/加载中都算失败，最多修正 3 次）。表格/列表要看到表头和至少一行数据；目标内容一屏装不下时（无论滚动条在容器还是 body 上），用 execShot 加 `\"full\":true`，它会展开目标及其祖先让完整内容渲染出来再截；若仍截不全或是虚拟列表，再分段滚动截到末行，归同一 outputName。record 只产出截图，不采文本。\n\
+         - 遮挡处理：操作或截图前若目标被侧栏/弹窗/悬浮窗遮挡，先找到并点击其关闭按钮；关不掉的调大窗口或滚动让目标露出；仍不行的仅对遮挡元素设 display:none 后截图，截完恢复。禁止改目标模块本身。\n\
+         视觉反馈（强制，每个 operate 后必做）：\n\
+         - 操作后用 execShot 截一张当前页面的图（整页即可，存到 {record_dir}/ 下，如 verify-步骤名.png）。\n\
+         - 然后**用你自己内置的看图/读图工具打开这张截图**，亲眼确认页面状态：上一步是否生效、目标是否出现/选中、有没有报错或遮挡。\n\
+         - 看清楚再决定下一步：生效就继续；没生效就换 selector/等待后重试（最多 2 次）。禁止不看图就盲目连发操作。\n\
+         - 参考图（配置时的 targetImagePaths）已作为图片附件发给你，对照它和当前截图判断操作是否到位。\n\
+         - 内容一屏看不全时（长列表/长表格/需滚动区域）：用 execScroll 分段滚动，每滚一段 execShot 截一张并看图，滚动+截图交替直到看全目标内容，再继续操作或拼接判断；不要只凭第一屏就下结论。\n\
+         - 单步失败：先看 error，用最小化 execEval/execShot 检查页面状态，换定位方式或等待重试，最多 2 次；不得跳过步骤、打乱顺序、替换 goto 的 url。被登录/验证码/权限阻断则停止并说明。\n\
+         全部步骤完成后，按 analysisPrompt 分析 analysisRecordRefs 指定的 record 截图（为空则用全部 record 结果），用 execShot 或直接读已保存的截图文件分析，不得用 DOM 文本代替。最后发 execClose。\n\
+         最终只返回自然语言结论，不要 JSON/代码块/原始日志：是否完成、关键结果、必要的定位修正与选项替代说明、失败时的阻断步骤和原因。",
         plan_json = plan_json,
-        node_modules = runtime_node_modules.to_string_lossy(),
-        storage_state = storage_state.to_string_lossy(),
-        record_output_dir = record_output_dir.to_string_lossy(),
-        headless = headless,
+        run_id = run_id,
+        exec_port = exec_port,
+        record_dir = record_dir,
     );
 
-    run_ephemeral_prompt(app, &state, cwd, prompt, PLAN_RUN_TIMEOUT_MS, agent_kind, model, true).await
+    run_ephemeral_prompt(app, &state, cwd, prompt, PLAN_RUN_TIMEOUT_MS, agent_kind, model, true, ref_images).await
 }
