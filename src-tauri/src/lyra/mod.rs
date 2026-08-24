@@ -19,6 +19,7 @@ mod provider;
 mod read;
 mod reasonix;
 mod tools;
+mod watchdog;
 
 pub use bridge::{run_oneshot, spawn_prompt, InProcessSession};
 pub use config::set_nova_root;
