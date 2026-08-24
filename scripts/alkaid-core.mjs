@@ -492,6 +492,9 @@ export function createFilesystemTools(cwd, _editTool = null, opts = {}) {
       async execute(_id, params) {
         const args = params ?? {};
         const root = currentRoot();
+        // 入参宽容：超限不报校验错误，直接收敛到有效范围。
+        if (Array.isArray(args.keywords) && args.keywords.length > 5) args.keywords = args.keywords.slice(0, 5);
+        if (Number.isFinite(args.budget) && args.budget > 1200) args.budget = 1200;
         // 代码上下文与训练知识同轮返回；模型不需要再调用独立的 load 工具。
         const codeText = await callGlobalContextTool("polaris", root, args);
         return textResult(await appendTrainedKnowledge(codeText, args, root));
