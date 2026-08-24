@@ -130,6 +130,8 @@ pub enum NodeMsg {
     },
     #[serde(rename = "closed")]
     Closed,
+    #[serde(rename = "execPort")]
+    ExecPort { port: u16 },
     #[serde(rename = "error")]
     Error { error: String },
 }
@@ -148,6 +150,8 @@ pub struct BrowserManager {
         Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Option<String>, String>>>>,
     pending_commands: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     pub last_event_id: Mutex<u64>,
+    /// agent 闭环执行的 HTTP 控制端口（录制进程启动后上报）
+    pub exec_port: std::sync::atomic::AtomicU16,
     proc: Mutex<Option<RecorderProc>>,
 }
 
@@ -161,6 +165,7 @@ impl BrowserManager {
             pending_shots: Mutex::new(HashMap::new()),
             pending_commands: Mutex::new(HashMap::new()),
             last_event_id: Mutex::new(0),
+            exec_port: std::sync::atomic::AtomicU16::new(0),
             proc: Mutex::new(None),
         }
     }
@@ -300,6 +305,10 @@ fn handle_node_msg(app: &AppHandle, proc_id: &str, msg: NodeMsg) {
         NodeMsg::Hello => {
             eprintln!("[browser] recorder process ready");
         }
+        NodeMsg::ExecPort { port } => {
+            state.browser.exec_port.store(port, Ordering::SeqCst);
+            eprintln!("[browser] exec port: {port}");
+        }
         NodeMsg::Nav { url, error } => {
             *state.browser.url.lock().unwrap() = url.clone();
             if let Some(e) = error {
@@ -400,6 +409,19 @@ fn info_of(state: &AppState) -> BrowserInfo {
         running: b.proc.lock().unwrap().is_some(),
         event_count: b.events.lock().unwrap().len(),
     }
+}
+
+/// 确保浏览器录制进程已启动，并返回 agent 闭环执行端口（等待上报）。
+pub(crate) async fn ensure_exec_port(app: &AppHandle) -> Result<u16, String> {
+    ensure_proc(app)?;
+    for _ in 0..50 {
+        let port = app.state::<AppState>().browser.exec_port.load(Ordering::SeqCst);
+        if port != 0 {
+            return Ok(port);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err("浏览器执行端口未就绪".into())
 }
 
 fn send_cmd(app: &AppHandle, cmd: Value) -> Result<(), String> {

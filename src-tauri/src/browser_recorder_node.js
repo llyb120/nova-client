@@ -412,10 +412,217 @@ const commands = {
     if (browser) await browser.close().catch(() => {});
     emitClosedAndExit();
   },
+
+  // ---------- 双子座计划执行：每个 runId 绑定一个专用 tab，可并行多个 ----------
+  async execOpen(command) {
+    await ensureBrowser();
+    const target = await context.newPage();
+    attachPage(target);
+    runPages.set(command.runId, target);
+    target.on('close', () => {
+      if (runPages.get(command.runId) === target) runPages.delete(command.runId);
+    });
+    return { url: target.url() };
+  },
+  async execClose(command) {
+    const target = runPages.get(command.runId);
+    runPages.delete(command.runId);
+    if (target && !target.isClosed()) await target.close().catch(() => {});
+    return null;
+  },
+  async execGoto(command) {
+    const target = runPageOf(command.runId);
+    let url = String(command.url || '').trim();
+    if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+    if (command.sessionStorage && command.sessionStorage.key) {
+      const { key, value } = command.sessionStorage;
+      let origin = '';
+      try { origin = new URL(url).origin; } catch {}
+      await context.addInitScript(([k, v, o]) => {
+        try { if (!o || location.origin === o) sessionStorage.setItem(k, v); } catch {}
+      }, [key, value, origin]);
+    }
+    await target.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    return { url: target.url() };
+  },
+  async execEval(command) {
+    const target = runPageOf(command.runId);
+    const result = await target.evaluate(command.expression);
+    return { result: result === undefined ? null : result };
+  },
+  async execClick(command) {
+    const target = runPageOf(command.runId);
+    await target.click(command.selector, { timeout: command.timeout || 10000 });
+    return null;
+  },
+  async execFill(command) {
+    const target = runPageOf(command.runId);
+    await target.fill(command.selector, String(command.value ?? ''), { timeout: command.timeout || 10000 });
+    return null;
+  },
+  // ---- 纯视觉坐标操作（不看 DOM）：截图像素 == CSS 像素（context viewport:null），1:1 对齐 ----
+  // 返回当前视口尺寸，agent 据此知道截图坐标范围。
+  async execViewport(command) {
+    const target = runPageOf(command.runId);
+    return target.viewportSize() || { width: 1280, height: 800 };
+  },
+  // 在视口坐标 (x,y) 真实点击鼠标；可选先滚动把页面某点带进视野由 agent 自行控制。
+  async execMouseClick(command) {
+    const target = runPageOf(command.runId);
+    const x = Number(command.x), y = Number(command.y);
+    await target.mouse.move(x, y);
+    await target.mouse.click(x, y, { button: command.button || 'left', clickCount: command.double ? 2 : 1 });
+    return { x, y };
+  },
+  async execMouseMove(command) {
+    const target = runPageOf(command.runId);
+    await target.mouse.move(Number(command.x), Number(command.y));
+    return null;
+  },
+  // 滚动页面（deltaY>0 向下），用于把视野外目标滚进来再截图。
+  async execScroll(command) {
+    const target = runPageOf(command.runId);
+    await target.mouse.wheel(Number(command.deltaX || 0), Number(command.deltaY ?? 600));
+    return null;
+  },
+  // 拟人逐键输入（触发真实键盘事件，配合 execMouseClick 先点进输入框）。
+  async execType(command) {
+    const target = runPageOf(command.runId);
+    await target.keyboard.type(String(command.text ?? ''), { delay: command.delay || 30 });
+    return null;
+  },
+  async execKey(command) {
+    const target = runPageOf(command.runId);
+    await target.keyboard.press(String(command.key || 'Enter'));
+    return null;
+  },
+  async execQuery(command) {
+    const target = runPageOf(command.runId);
+    const result = await target.evaluate((selector) => {
+      const els = Array.from(document.querySelectorAll(selector)).slice(0, 20);
+      return els.map((el) => ({
+        tag: el.tagName.toLowerCase(),
+        text: (el.textContent || '').trim().slice(0, 60),
+        visible: !!(el.offsetWidth || el.offsetHeight),
+      }));
+    }, command.selector);
+    return { count: result.length, items: result };
+  },
+  // 读取参考图（targetImagePaths）为 dataURL 返回，agent 无需本地读文件权限即可查看。
+  async execReadImage(command) {
+    const fs = require('fs');
+    const rawPath = String(command.path || '').replace(/\\/g, '/');
+    const buf = fs.readFileSync(rawPath);
+    const ext = (rawPath.split('.').pop() || 'png').toLowerCase();
+    const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'webp' ? 'image/webp' : 'image/png';
+    return { dataUrl: `data:${mime};base64,${buf.toString('base64')}` };
+  },
+  // 等待 selector 出现/可见，或自定义条件成立；联动筛选依赖它等待下一个筛选项加载出来。
+  async execWait(command) {
+    const target = runPageOf(command.runId);
+    const timeout = command.timeout || 10000;
+    if (command.expression) {
+      await target.waitForFunction(command.expression, { timeout });
+      return { waited: 'expression' };
+    }
+    if (command.selector) {
+      await target.waitForSelector(command.selector, { state: command.state || 'visible', timeout });
+      return { waited: command.selector };
+    }
+    // 无参数时当作固定延时（等待异步刷新）
+    await new Promise((resolve) => setTimeout(resolve, command.ms || 800));
+    return { waited: 'ms' };
+  },
+  async execShot(command) {
+    const target = runPageOf(command.runId);
+    // 兼容反斜杠/正斜杠路径，避免 Windows 下转义乱码；并确保目录存在。
+    const rawPath = String(command.path || '').replace(/\\/g, '/');
+    const fs = require('fs');
+    const pathMod = require('path');
+    fs.mkdirSync(pathMod.dirname(rawPath), { recursive: true });
+    const options = { path: rawPath };
+    if (command.selector) {
+      // 等元素出现且可见，避免截到半渲染的空壳。
+      await target.waitForSelector(command.selector, { state: 'visible', timeout: command.timeout || 10000 });
+      if (command.full) {
+        // 不改 DOM（overflow/flex/类样式撑不开）：先滚动整页触发懒加载，再用 fullPage+clip
+        // 按元素的文档坐标截出完整内容，body 滚动、sticky 表头、内部容器均适用。
+        await target.evaluate(async () => {
+          await new Promise((resolve) => {
+            let last = -1;
+            const step = () => {
+              window.scrollBy(0, window.innerHeight);
+              const y = window.scrollY;
+              if (y !== last && y + window.innerHeight < document.documentElement.scrollHeight) {
+                last = y; setTimeout(step, 120);
+              } else { window.scrollTo(0, 0); setTimeout(resolve, 200); }
+            };
+            step();
+          });
+        });
+        const clip = await target.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: Math.max(0, r.left + window.scrollX), y: Math.max(0, r.top + window.scrollY), width: r.width, height: r.height };
+        }, command.selector);
+        if (clip && clip.width > 0 && clip.height > 0) {
+          await target.screenshot({ path: rawPath, fullPage: true, clip });
+        } else {
+          await target.screenshot({ path: rawPath, fullPage: true });
+        }
+      } else {
+        const locator = target.locator(command.selector).first();
+        await locator.screenshot(options);
+      }
+    } else {
+      await target.screenshot(options);
+    }
+    return { path: rawPath };
+  },
 };
+
+const runPages = new Map();
+
+function runPageOf(runId) {
+  const target = runPages.get(runId);
+  if (!target || target.isClosed()) throw new Error('运行页不存在或已关闭: ' + runId);
+  return target;
+}
 
 const readline = require('readline');
 const input = readline.createInterface({ input: process.stdin });
+
+// ---------- HTTP 控制端口：供 agent 闭环执行；与 stdin 录制通道并行 ----------
+let execServer = null;
+let execQueue = Promise.resolve();
+function startExecServer() {
+  const http = require('http');
+  execServer = http.createServer((req, res) => {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      let command;
+      try { command = JSON.parse(body || '{}'); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'bad json' })); return; }
+      const handler = commands[command.cmd];
+      if (!handler) { res.writeHead(404, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'unknown cmd: ' + command.cmd })); return; }
+      execQueue = execQueue.then(async () => {
+        try {
+          const data = await handler(command);
+          res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: true, data: data ?? null }));
+        } catch (error) {
+          res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: false, error: String(error?.message || error) }));
+        }
+      });
+    });
+  });
+  execServer.listen(0, '127.0.0.1', () => {
+    out({ type: 'execPort', port: execServer.address().port });
+  });
+}
+startExecServer();
+
 let commandQueue = Promise.resolve();
 input.on('line', (line) => {
   let command;

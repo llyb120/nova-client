@@ -238,7 +238,8 @@ export default function BrowserView() {
     });
   }
 
-  async function pasteRecordImages(eventId: number, event: ClipboardEvent) {
+  /** 粘贴截图到步骤的 data.imagePaths（operate / record 共用） */
+  async function pasteStepImages(eventId: number, event: ClipboardEvent, prefix: string) {
     const files = Array.from(event.clipboardData?.files || []).filter((file) => file.type.startsWith("image/"));
     if (!files.length) return;
     event.preventDefault();
@@ -250,17 +251,19 @@ export default function BrowserView() {
         reader.onerror = () => reject(reader.error);
         reader.readAsDataURL(file);
       });
-      paths.push(await saveShot(dataUrl, `record-${Date.now()}-${paths.length}`));
+      paths.push(await saveShot(dataUrl, `${prefix}-${Date.now()}-${paths.length}`));
     }
-    const clip = activeClip();
-    const current = clip?.events.find((item) => item.id === eventId);
+    const current = activeClip()?.events.find((item) => item.id === eventId);
     updateStep(eventId, { data: { ...current?.data, imagePaths: [...(current?.data?.imagePaths || []), ...paths] } });
   }
 
-  function removeRecordImage(eventId: number, path: string) {
-    const clip = activeClip();
-    const current = clip?.events.find((item) => item.id === eventId);
+  function removeStepImage(eventId: number, path: string) {
+    const current = activeClip()?.events.find((item) => item.id === eventId);
     updateStep(eventId, { data: { ...current?.data, imagePaths: (current?.data?.imagePaths || []).filter((item) => item !== path) } });
+  }
+
+  function stepImages(eventId: number) {
+    return activeClip()?.events.find((item) => item.id === eventId)?.data?.imagePaths || [];
   }
 
   // ---------- 录制 ----------
@@ -517,14 +520,21 @@ export default function BrowserView() {
 
                           <Show when={event.kind === "navigate"} fallback={
                             <Show when={event.kind === "record"} fallback={
-                              <label class="be-field be-record-content"><span>提示词</span><textarea value={event.data?.value || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, value: e.currentTarget.value } })} placeholder="描述要在当前页面完成的操作，例如：在搜索框输入关键词并点击搜索" /></label>
+                              <div class="be-record-simple">
+                                <label class="be-field be-record-content"><span>提示词</span><textarea value={event.data?.value || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, value: e.currentTarget.value } })} onPaste={(e) => void pasteStepImages(event.id, e, "operate")} placeholder="描述要在当前页面完成的操作，例如：在搜索框输入关键词并点击搜索；也可粘贴截图辅助定位" /></label>
+                                <Show when={stepImages(event.id).length > 0}>
+                                  <div class="be-record-images">
+                                    <For each={stepImages(event.id)}>{(path) => <div class="be-record-image"><span>{path}</span><button class="bt-icon-btn danger" onClick={() => removeStepImage(event.id, path)}><IconTrash size={11} /></button></div>}</For>
+                                  </div>
+                                </Show>
+                              </div>
                             }>
                               <div class="be-record-simple">
                                 <label class="be-field"><span>记录名</span><input value={event.data?.outputName || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, outputName: e.currentTarget.value } })} placeholder="用于最终分析引用此记录结果" /></label>
-                                <label class="be-field be-record-content"><span>补充要求</span><textarea value={event.data?.recordContent || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, recordContent: e.currentTarget.value } })} onPaste={(e) => void pasteRecordImages(event.id, e)} placeholder="补充说明这条记录的定位线索、截图范围或其它要求；也可粘贴参考图片" /></label>
-                                <Show when={(event.data?.imagePaths || []).length > 0}>
+                                <label class="be-field be-record-content"><span>补充要求</span><textarea value={event.data?.recordContent || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, recordContent: e.currentTarget.value } })} onPaste={(e) => void pasteStepImages(event.id, e, "record")} placeholder="补充说明这条记录的定位线索、截图范围或其它要求；也可粘贴参考图片" /></label>
+                                <Show when={stepImages(event.id).length > 0}>
                                   <div class="be-record-images">
-                                    <For each={event.data?.imagePaths || []}>{(path) => <div class="be-record-image"><span>{path}</span><button class="bt-icon-btn danger" onClick={() => removeRecordImage(event.id, path)}><IconTrash size={11} /></button></div>}</For>
+                                    <For each={stepImages(event.id)}>{(path) => <div class="be-record-image"><span>{path}</span><button class="bt-icon-btn danger" onClick={() => removeStepImage(event.id, path)}><IconTrash size={11} /></button></div>}</For>
                                   </div>
                                 </Show>
                               </div>

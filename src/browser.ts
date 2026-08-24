@@ -169,7 +169,7 @@ export function compilePlan(events: RecordEvent[]): PlayPlan {
       });
     } else {
       // 旧录制事件（点击/输入/按键等）统一转成“操作”提示词步骤
-      steps.push({ action: "operate", prompt: ev.data?.value || "" });
+      steps.push({ action: "operate", prompt: ev.data?.value || "", targetImagePaths: ev.data?.imagePaths || [] });
     }
   }
   return { version: 1, steps };
