@@ -541,7 +541,9 @@ const commands = {
     const pathMod = require('path');
     fs.mkdirSync(pathMod.dirname(rawPath), { recursive: true });
     const options = { path: rawPath };
-    if (command.selector) {
+    if (command.fullPage && !command.selector) {
+      await target.screenshot({ path: rawPath, fullPage: true });
+    } else if (command.selector) {
       // 等元素出现且可见，避免截到半渲染的空壳。
       await target.waitForSelector(command.selector, { state: 'visible', timeout: command.timeout || 10000 });
       if (command.full) {
