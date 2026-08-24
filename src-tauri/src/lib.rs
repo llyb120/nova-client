@@ -5756,7 +5756,6 @@ pub fn run() {
             browser::browser_capture_screenshot,
             browser::browser_capture_region,
             browser::browser_save_shot,
-            browser::browser_compile_plan,
             browser_agent::analyze_screenshot,
             browser_agent::run_plan_with_agent
         ])

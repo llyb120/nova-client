@@ -11,7 +11,8 @@ export interface BrowserInfo {
   eventCount: number;
 }
 
-export type BrowserAction = "click" | "input" | "change" | "key" | "submit" | "navigate" | "record";
+/** 双子座步骤只保留三种：跳转、记录、操作（操作内容即提示词） */
+export type BrowserAction = "navigate" | "record" | "operate";
 
 export interface RecordEvent {
   id: number;
@@ -67,16 +68,15 @@ export interface ClipMark {
 }
 
 export interface PlayStep {
-  action: "goto" | "click" | "fill" | "selectOption" | "press" | "waitForSelector" | "assertVisible" | "assertText" | "record";
+  action: "goto" | "record" | "operate";
   selector?: string;
   targetImagePaths?: string[];
-  value?: string;
   url?: string;
-  key?: string;
   sessionStorage?: { key: string; value: string };
-  timeoutMs?: number;
   recordContent?: string;
   outputName?: string;
+  /** operate 步骤的提示词 */
+  prompt?: string;
 }
 
 export interface PlayPlan {
@@ -141,8 +141,38 @@ export async function saveShot(dataUrl: string, name?: string): Promise<string> 
   return invoke<string>("browser_save_shot", { dataUrl, name });
 }
 
-export async function compilePlan(events: RecordEvent[]): Promise<PlayPlan> {
-  return invoke<PlayPlan>("browser_compile_plan", { events });
+/** 把片段事件编排为运行 Plan：仅保留 跳转(goto)/记录(record)/操作(operate) 三类步骤 */
+export function compilePlan(events: RecordEvent[]): PlayPlan {
+  const steps: PlayStep[] = [];
+  for (const ev of events) {
+    if (ev.kind === "navigate") {
+      const url = (ev.url || "").trim();
+      if (!url) continue;
+      const storageEnabled = ev.data?.navigateStorageEnabled ?? false;
+      const storageKey = ev.data?.storageKey || "";
+      if (storageEnabled && storageKey) {
+        steps.push({
+          action: "goto",
+          url,
+          sessionStorage: { key: storageKey, value: ev.data?.storageValue || "" },
+        });
+      } else {
+        steps.push({ action: "goto", url });
+      }
+    } else if (ev.kind === "record") {
+      steps.push({
+        action: "record",
+        selector: ev.target?.selector || "",
+        outputName: ev.data?.outputName || "",
+        recordContent: ev.data?.recordContent || "",
+        targetImagePaths: ev.data?.imagePaths || [],
+      });
+    } else {
+      // 旧录制事件（点击/输入/按键等）统一转成“操作”提示词步骤
+      steps.push({ action: "operate", prompt: ev.data?.value || "" });
+    }
+  }
+  return { version: 1, steps };
 }
 
 export async function analyzeScreenshot(cwd: string, imageDataUrl: string, hint: string): Promise<string> {
