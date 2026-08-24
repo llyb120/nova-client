@@ -25,7 +25,7 @@ import {
 import { enabledAgentKinds, ensureModelOptions, lastUsed, state } from "../store";
 import type { AgentKind } from "../types";
 import { ModelPicker } from "./ConfigSelects";
-import { IconGlobe, IconPlus, IconStop, IconTrash, IconPencil, IconCheck } from "./icons";
+import { IconGlobe, IconPlus, IconStop, IconTrash } from "./icons";
 
 const STORAGE_KEY = "nova.browser.clips";
 
@@ -49,14 +49,11 @@ export default function BrowserView() {
   const [analyzing, setAnalyzing] = createSignal(false);
   const [running, setRunning] = createSignal(false);
   const [runResult, setRunResult] = createSignal<PlanRunResult | null>(null);
-  // 编辑中的事件（步骤）
-  const [editingEventId, setEditingEventId] = createSignal<number | null>(null);
-  const [editSelector, setEditSelector] = createSignal("");
-  const [editValue, setEditValue] = createSignal("");
+  // 新建步骤
+  const [newAction, setNewAction] = createSignal<BrowserAction>("operate");
   // 截图标记的备注输入
   const [pendingMark, setPendingMark] = createSignal<{ dataUrl: string; path: string } | null>(null);
   const [markNote, setMarkNote] = createSignal("");
-  const [newAction, setNewAction] = createSignal<BrowserAction>("click");
   const [notice, setNotice] = createSignal<{ text: string; kind: "info" | "error" } | null>(null);
   const [draggingStepId, setDraggingStepId] = createSignal<number | null>(null);
   const [dragOverStepId, setDragOverStepId] = createSignal<number | null>(null);
@@ -107,15 +104,17 @@ export default function BrowserView() {
     const clip = activeClip();
     if (!clip) return;
     const action = newAction();
-    const event = {
+    const event: RecordEvent = {
       id: Date.now(),
       ts: Date.now(),
       url: clip.startUrl,
       kind: action,
-      target: { selector: "" },
-      data: action === "record"
-        ? { recordContent: "", outputName: `记录${clip.events.filter((item) => item.kind === "record").length + 1}`, imagePaths: [] }
-        : {},
+      data:
+        action === "record"
+          ? { recordContent: "", outputName: `记录${clip.events.filter((item) => item.kind === "record").length + 1}`, imagePaths: [] }
+          : action === "operate"
+            ? { value: "" }
+            : {},
     };
     updateClip(clip.id, (value) => ({ ...value, events: [...value.events, event] }));
   }
@@ -239,29 +238,6 @@ export default function BrowserView() {
     });
   }
 
-  async function pasteTargetImages(eventId: number, event: ClipboardEvent) {
-    const files = Array.from(event.clipboardData?.files || []).filter((file) => file.type.startsWith("image/"));
-    if (!files.length) return;
-    event.preventDefault();
-    const paths: string[] = [];
-    for (const file of files) {
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = () => reject(reader.error);
-        reader.readAsDataURL(file);
-      });
-      paths.push(await saveShot(dataUrl, `target-${Date.now()}-${paths.length}`));
-    }
-    const current = activeClip()?.events.find((item) => item.id === eventId);
-    updateStep(eventId, { target: { ...current?.target, imagePaths: [...(current?.target?.imagePaths || []), ...paths] } });
-  }
-
-  function removeTargetImage(eventId: number, path: string) {
-    const current = activeClip()?.events.find((item) => item.id === eventId);
-    updateStep(eventId, { target: { ...current?.target, imagePaths: (current?.target?.imagePaths || []).filter((item) => item !== path) } });
-  }
-
   async function pasteRecordImages(eventId: number, event: ClipboardEvent) {
     const files = Array.from(event.clipboardData?.files || []).filter((file) => file.type.startsWith("image/"));
     if (!files.length) return;
@@ -345,34 +321,6 @@ export default function BrowserView() {
     if (activeClipId() === id) setActiveClipId(null);
   }
 
-  // ---------- 步骤编辑 ----------
-  function startEditEvent(evId: number, selector: string, value: string) {
-    setEditingEventId(evId);
-    setEditSelector(selector);
-    setEditValue(value);
-  }
-
-  function saveEditEvent() {
-    const clipId = activeClipId();
-    const evId = editingEventId();
-    if (!clipId || evId == null) return;
-    const next = clips().map((c) =>
-      c.id === clipId
-        ? {
-            ...c,
-            events: c.events.map((ev) =>
-              ev.id === evId
-                ? { ...ev, target: { ...ev.target, selector: editSelector() }, data: { ...ev.data, value: editValue() } }
-                : ev,
-            ),
-          }
-        : c,
-    );
-    setClips(next);
-    saveClips(next);
-    setEditingEventId(null);
-  }
-
   function deleteEvent(evId: number) {
     const clipId = activeClipId();
     if (!clipId) return;
@@ -442,7 +390,7 @@ export default function BrowserView() {
     setRunning(true);
     setRunResult(null);
     try {
-      const plan: PlayPlan = await compilePlan(clip.events);
+      const plan = compilePlan(clip.events);
       plan.analysisPrompt = clip.analysisPrompt || "";
       plan.analysisRecordRefs = clip.analysisRecordRefs || [];
       plan.headless = clip.headless ?? true;
@@ -525,11 +473,9 @@ export default function BrowserView() {
                   </div>
                   <div class="bt-row">
                     <select class="bt-input" value={newAction()} onChange={(e) => setNewAction(e.currentTarget.value as BrowserAction)}>
-                      <option value="click">点击</option>
-                      <option value="input">输入</option>
-                      <option value="navigate">访问网址</option>
-                      <option value="key">按键</option>
+                      <option value="navigate">跳转</option>
                       <option value="record">记录</option>
+                      <option value="operate">操作</option>
                     </select>
                     <button class="bt-btn primary" onClick={addManualStep}><IconPlus size={13} /> 新建步骤</button>
                   </div>
@@ -555,15 +501,12 @@ export default function BrowserView() {
                           <div class="be-step-top">
                             <select
                               class="be-action"
-                              value={event.kind}
+                              value={event.kind === "navigate" || event.kind === "record" ? event.kind : "operate"}
                               onChange={(e) => updateStep(event.id, { kind: e.currentTarget.value as BrowserAction })}
                             >
-                              <option value="click">点击</option>
-                              <option value="input">输入</option>
-                              <option value="change">选择</option>
-                              <option value="key">按键</option>
-                              <option value="navigate">访问网址</option>
+                              <option value="navigate">跳转</option>
                               <option value="record">记录</option>
+                              <option value="operate">操作</option>
                             </select>
                             <div class="be-step-actions">
                               <button class="bt-icon-btn" title="上移" onClick={() => moveStep(event.id, -1)}>↑</button>
@@ -574,15 +517,7 @@ export default function BrowserView() {
 
                           <Show when={event.kind === "navigate"} fallback={
                             <Show when={event.kind === "record"} fallback={
-                              <>
-                                <label class="be-field be-target-field"><span>目标元素</span><div class="be-target-input"><input value={event.target?.selector || ""} onChange={(e) => updateStep(event.id, { target: { ...event.target, selector: e.currentTarget.value } })} onPaste={(e) => void pasteTargetImages(event.id, e)} placeholder="输入 selector，或直接粘贴图片辅助定位" /><Show when={(event.target?.imagePaths || []).length > 0}><div class="be-target-images"><For each={event.target?.imagePaths || []}>{(path) => <div class="be-record-image"><span>{path}</span><button class="bt-icon-btn danger" onClick={() => removeTargetImage(event.id, path)}><IconTrash size={11} /></button></div>}</For></div></Show></div></label>
-                                <Show when={event.kind === "input" || event.kind === "change"}>
-                                  <label class="be-field"><span>输入值</span><input value={event.data?.value || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, value: e.currentTarget.value } })} /></label>
-                                </Show>
-                                <Show when={event.kind === "key"}>
-                                  <label class="be-field"><span>按键</span><input value={event.data?.key || "Enter"} onChange={(e) => updateStep(event.id, { data: { ...event.data, key: e.currentTarget.value } })} /></label>
-                                </Show>
-                              </>
+                              <label class="be-field be-record-content"><span>提示词</span><textarea value={event.data?.value || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, value: e.currentTarget.value } })} placeholder="描述要在当前页面完成的操作，例如：在搜索框输入关键词并点击搜索" /></label>
                             }>
                               <div class="be-record-simple">
                                 <label class="be-field"><span>记录名</span><input value={event.data?.outputName || ""} onChange={(e) => updateStep(event.id, { data: { ...event.data, outputName: e.currentTarget.value } })} placeholder="用于最终分析引用此记录结果" /></label>

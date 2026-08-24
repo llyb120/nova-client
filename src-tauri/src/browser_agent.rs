@@ -203,16 +203,6 @@ pub async fn run_plan_with_agent(
     agent_kind: AgentKind,
     model: Option<String>,
 ) -> Result<String, String> {
-    // Plan 原样落盘：只包含当前片段编辑器中的步骤和运行配置，不补 startUrl、不改顺序、不预执行。
-    let dir = state.config_dir.join("browser-plans");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let run_id = uuid::Uuid::new_v4();
-    let path = dir.join(format!("plan-{run_id}.json"));
-    let record_output_dir = state.config_dir.join("browser-records").join(run_id.to_string());
-    std::fs::create_dir_all(&record_output_dir).map_err(|e| format!("创建记录截图目录失败: {e}"))?;
-    let body = serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?;
-    std::fs::write(&path, &body).map_err(|e| e.to_string())?;
-
     let config_dir = state.config_dir.clone();
     let runtime = tauri::async_runtime::spawn_blocking(move || {
         crate::browser::ensure_playwright_runtime(&config_dir)
@@ -222,8 +212,14 @@ pub async fn run_plan_with_agent(
     let runtime_node_modules = runtime.join("node_modules");
     let storage_state = runtime.join("storage-state.json");
     let headless = plan.get("headless").and_then(Value::as_bool).unwrap_or(true);
+    let run_id = uuid::Uuid::new_v4();
+    let record_output_dir = state.config_dir.join("browser-records").join(run_id.to_string());
+    std::fs::create_dir_all(&record_output_dir).map_err(|e| format!("创建记录截图目录失败: {e}"))?;
+    // 不再落盘 Plan 文件：把 Plan 直接拼进提示词，agent 不读文件。
+    let plan_json = serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?;
     let prompt = format!(
-        "请严格按顺序执行这个 Plan 文件中的全部步骤：{path}\n\
+        "请严格按顺序执行以下 Plan 中的全部步骤：\n\
+         ```json\n{plan_json}\n```\n\
          Plan 是唯一事实来源：不得添加、删除、折叠、重排或跳过任何步骤；Plan 可以不包含 goto，直接从当前挂载页面执行其余步骤。\n\
          执行环境：\n\
          - 使用 Nova 共享 playwright-core：{node_modules}，禁止安装、升级或下载任何依赖或浏览器；\n\
@@ -231,17 +227,14 @@ pub async fn run_plan_with_agent(
          - 可加载登录态文件 {storage_state} 保留 Cookie/localStorage；Plan 中遇到 goto 时按所在顺序执行，没有 goto 时不补充导航。goto 携带 sessionStorage 时，必须通过 context.addInitScript 在目标文档创建时按目标 origin 注入，再发起首次 page.goto，确保鉴权脚本和请求读取前已经存在。\n\
          - Plan 顶层 headless={headless}；false 时必须使用系统 Chrome/Edge 显示真实窗口，true 时使用无头模式。\n\
          定位规则：\n\
-         - 普通操作步骤优先使用 selector；若 selector 为空、失效或不唯一，必须先逐张读取并识别 targetImagePaths，再在当前页面寻找视觉结构相似的模块后执行；\n\
-         - targetImagePaths 只用于视觉定位，不是待分析数据；不得因为图片存在而跳过对应操作，也不得未经图片识别就仅凭页面文字或第一个匹配元素定位；\n\
+         - 步骤只有三种：goto（按 url 跳转）、record（截取页面模块）、operate（操作）；operate 步骤的 prompt 就是自然语言描述的操作内容，看懂后在当前页面自行定位元素并完成操作，可结合 targetImagePaths 参考图辅助定位；\n\
          - record 步骤必须根据该步骤上已有的信息自行定位，包括 selector、targetImagePaths 参考图和 recordContent 补充要求；不得让用户在运行时补充信息。selector 存在时先用它快速验证候选模块；selector 为空或失效时，根据参考图和提示词在 DOM 中生成并验证唯一、稳定的 locator。确定元素后必须调用 locator.screenshot，而不是按参考图坐标裁切页面；locator 的唯一性不能只凭首个匹配判断，必须先在整页统计匹配数量，若大于 1 则结合参考图和 recordContent 再筛选，禁止直接取 first()；\n\
          - record 步骤必须遵循“等待页面就绪、识别步骤信息、匹配当前页面、生成并验证 locator、截图 DOM、检查结果”的顺序。所有 record 结果截图必须保存到目录 {record_output_dir}（不存在时先创建），禁止保存到其它位置。第一步不是立即定位：先等待 domcontentloaded，再对 networkidle 做有限等待（超时不能直接视为就绪）；持续检查页面中的 loading/spinner/skeleton/progress、全屏或模块级 mask/overlay、空数据占位和禁用态，等待它们消失。随后对候选模块每隔 800ms 读取一次关键特征（可见行数、文本长度、容器尺寸、表头及首末行），至少连续 3 次一致且存在实质数据后才算稳定；仅有表头、骨架、空白或“加载中”时禁止截图。若有 Cookie 提示、引导层等可关闭遮挡，应先正常关闭；不可关闭的遮挡必须等待或报告阻断，不得透过遮挡强行截图；\n\
          - 页面稳定后，实际读取每张 targetImagePaths 图片，提取模块类型、标题/表头、布局、边界、相邻元素、行列数量和大致尺寸等视觉特征；再枚举当前页面全部候选 DOM 区块（不要只查第一个），将候选的文字、结构、位置、尺寸及必要的候选截图与参考图逐项比对，只有确认是同类模块后才能确定 locator。禁止把参考图本身复制为结果，禁止看到相似文字后直接截取最小文字节点，也禁止未读取参考图就猜 selector；\n\
          - 所有 record 步骤都只能产出截图，不采集或返回文本、HTML、JSON 等其它形式的数据。outputName 是记录结果名称，必须保留并用于 analysisRecordRefs 的结果引用；recordContent 是该条记录的补充要求，可能同时包含定位线索、截图范围和其它约束，必须完整遵守；targetImagePaths 是视觉参考。确定模块后，应从命中的表头或子元素逐级向上检查父级，选择同时覆盖表头和真实数据区的最小合理容器；必须用数据行数量、容器 boundingBox 高度和截图预览验证，不能仅凭 class 名或 locator 首次命中。要求“完整表格数据”时，至少要看到表头和一行真实数据；若表格使用固定表头、内部滚动或虚拟列表，单次 locator.screenshot 只包含表头或当前视口就不算完成，必须滚动表格数据区并按顺序保存多张无遗漏、可衔接的截图，直到末行，所有截图归入同一 outputName；禁止截单元格、标题、局部行或整页代替；禁止把只含表头、没有数据行的截图当作完成，也不得在 record 残缺时仍进入后续分析步骤；\n\
          - 每张结果截图保存后必须立即重新读取刚保存的图片文件进行自检：确认不存在 spinner/skeleton/mask，并逐项对照 recordContent 核对截图包含的表头、数据行数量和内容范围。若只看到表头、数据行缺失、遮挡、裁剪或仍在加载，应删除/覆盖该无效结果，重新等待并改选容器或采用分段滚动截图，最多修正 3 次；不得把已知不完整的截图当作成功继续执行。截图文件名应包含步骤序号、安全化后的 outputName 和分段序号；\n\
-         - 选择器失效时允许根据当前页面、文字参考和截图推断等价 selector，但必须执行原步骤 action。\n\
          自适应执行规则（像人操作，不要先生成一份固定脚本后一次性运行）：\n\
-         - 逐步读取 Plan：每次只处理当前步骤，先观察当前 URL、页面结构和可见状态，再决定具体 Playwright 调用；当前步骤成功后才进入下一步；\n\
-         - selector 只是首选提示而不是唯一答案。找不到、不可见、不唯一或页面结构变化时，可结合元素文字、role、label、placeholder、附近内容以及 targetImagePaths 重新定位；\n\
+         - 逐步处理 Plan：每次只处理当前步骤，先观察当前 URL、页面结构和可见状态，再决定具体 Playwright 调用；当前步骤成功后才进入下一步；\n\
          - 允许等待页面加载、动画结束、异步数据出现，处理遮罩、Cookie 提示、普通弹窗、新标签页和必要的滚动；\n\
          - 单步失败时先截图和检查页面状态，最多进行 2 次有依据的修正重试；不得机械重复同一个失败调用；\n\
          - 可以修正定位方式和等待策略，但不得改变步骤业务意图、跳过步骤或打乱顺序；goto 的目标 URL 不允许替换；\n\
@@ -251,7 +244,7 @@ pub async fn run_plan_with_agent(
          - 每步失败时保留错误和当前页面截图，经过允许的修正重试后仍失败才停止；\n\
          - 所有步骤完成后再按照 analysisPrompt 分析 analysisRecordRefs 指定名称对应的 record 页面块截图；analysisRecordRefs 为空时可使用全部 record 结果。不得直接使用 DOM 文本、HTML、参考文字或参考图片作为分析数据。\n\
          最终只返回自然语言结论，不要 JSON、代码块或逐步原始日志。结论应简洁说明：是否完成、关键结果、发生过的必要定位修正，以及失败时的阻断步骤和原因。",
-        path = path.to_string_lossy(),
+        plan_json = plan_json,
         node_modules = runtime_node_modules.to_string_lossy(),
         storage_state = storage_state.to_string_lossy(),
         record_output_dir = record_output_dir.to_string_lossy(),
