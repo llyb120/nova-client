@@ -43,6 +43,26 @@ function mergeCodeBuddyUsage(total, usage) {
   return found ? next : total;
 }
 
+/**
+ * 按 assistant uuid 去重后累计 usage。assistant.message.usage 是该消息所代表模型请求的
+ * 独立用量，但同一 uuid 的快照可能重复下发；resume 的会话也会重放历史 assistant 消息。
+ * 若一律累加，恢复/分叉后的轮次会把历史 token 再计一遍，导致统计明显偏大。
+ */
+function createCodeBuddyUsageTracker() {
+  const seen = new Set();
+  return {
+    total: undefined,
+    add(uuid, usage) {
+      if (uuid) {
+        if (seen.has(uuid)) return undefined;
+        seen.add(uuid);
+      }
+      this.total = mergeCodeBuddyUsage(this.total, usage);
+      return this.total;
+    },
+  };
+}
+
 function permissionModeFor(mode) {
   return mode === "plan" ? "plan" : "bypassPermissions";
 }
@@ -260,7 +280,7 @@ async function runPrompt(lines, request) {
   let sessionId = request.sessionId;
   let checkpoint;
   let activeQuery;
-  let liveUsage;
+  const usageTracker = createCodeBuddyUsageTracker();
   const cliPath = resolveCodeBuddyCliPath(process.env.NOVA_CODEBUDDY_PATH || undefined);
   const input = (async () => {
     for await (const line of lines) {
@@ -320,8 +340,9 @@ async function runPrompt(lines, request) {
       emitContent(message, stream);
       // CodeBuddy 在每次模型请求结束时把真实 usage 放在 assistant.message 上。
       // 逐次累计并立即上报，让工具调用期间标题栏也能更新，而不是等整个 agent turn 结束。
-      liveUsage = mergeCodeBuddyUsage(liveUsage, message.message?.usage);
-      if (liveUsage) send({ type: "usage", usage: liveUsage });
+      // 按 uuid 去重：resume 会话会重放历史 assistant 消息，直接累加会重复计数。
+      const merged = usageTracker.add(message.uuid, message.message?.usage);
+      if (merged) send({ type: "usage", usage: merged });
     }
     else if (message.type === "user") {
       for (const item of toolResultItems(message, stream)) send({ type: "item", item });
@@ -333,7 +354,7 @@ async function runPrompt(lines, request) {
       for (const item of completePendingTools(stream)) send({ type: "item", item });
       if (sessionId && checkpoint) send({ type: "checkpoint", sessionId, position: checkpoint });
       // result.usage 是 SDK 汇总终值；缺失时回退到 assistant 事件累计值。
-      send({ type: "done", usage: message.usage ?? liveUsage });
+      send({ type: "done", usage: message.usage ?? usageTracker.total });
     }
   }
   void input;
@@ -438,4 +459,4 @@ async function main() {
 
 if (process.env.NOVA_CODEBUDDY_BRIDGE_TEST !== "1") void main();
 
-export { assistantItems, assistantText, codeBuddyBatchToolPolicy, completePendingTools, mergeCodeBuddyUsage, novaToolsMcpServers, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem, toolResultItems };
+export { assistantItems, assistantText, codeBuddyBatchToolPolicy, completePendingTools, createCodeBuddyUsageTracker, mergeCodeBuddyUsage, novaToolsMcpServers, permissionModeFor, promptMessages, resolveCodeBuddyCliPath, streamEventItem, toolResultItems };
