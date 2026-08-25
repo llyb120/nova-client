@@ -1352,6 +1352,9 @@ fn list_code_files(root: &Path) -> Arc<Vec<String>> {
     files
 }
 
+/// mmap 缓存文件上限：超限视为无缓存，避免反序列化一次性吃掉过多内存。
+const MAX_MAPPED_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
 #[cfg(windows)]
 fn with_mapped_file<T>(path: &Path, consume: impl FnOnce(&[u8]) -> Option<T>) -> Option<T> {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -1360,7 +1363,7 @@ fn with_mapped_file<T>(path: &Path, consume: impl FnOnce(&[u8]) -> Option<T>) ->
     };
     let file = fs::File::open(path).ok()?;
     let size = file.metadata().ok()?.len() as usize;
-    if size == 0 {
+    if size == 0 || size > MAX_MAPPED_CACHE_BYTES {
         return None;
     }
     unsafe {
@@ -1392,7 +1395,7 @@ fn with_mapped_file<T>(path: &Path, consume: impl FnOnce(&[u8]) -> Option<T>) ->
 fn with_mapped_file<T>(path: &Path, consume: impl FnOnce(&[u8]) -> Option<T>) -> Option<T> {
     let file = fs::File::open(path).ok()?;
     let size = file.metadata().ok()?.len() as usize;
-    if size == 0 {
+    if size == 0 || size > MAX_MAPPED_CACHE_BYTES {
         return None;
     }
     unsafe {
