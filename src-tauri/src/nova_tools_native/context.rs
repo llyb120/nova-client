@@ -421,7 +421,10 @@ pub fn preload_indexes(roots: &[String]) -> usize {
         }
         // 符号索引只解决定义/import；同时预载或后台构建全文倒排索引，避免首次
         // Polaris 查询仍退回全仓 rg。构建门保证多个项目不会同时扫盘。
-        let _ = search_index_now(root);
+        // 全文索引只认 git 仓库：非 git 目录跳后台构建与常驻轮询。
+        if root.join(".git").exists() {
+            let _ = search_index_now(root);
+        }
     }
     loaded
 }
@@ -954,6 +957,10 @@ fn apply_search_delta(mut index: SearchIndex, delta: &SearchDelta) -> Option<Sea
 }
 
 fn load_search_snapshot(root: &Path) -> Option<SearchIndex> {
+    // 全文索引只认 git 仓库；非 git 目录忽略已有快照文件。
+    if !root.join(".git").exists() {
+        return None;
+    }
     let snapshot = with_mapped_file(&search_snapshot_path(root), |bytes| {
         bincode::deserialize::<SearchSnapshot>(bytes).ok()
     })?;
@@ -1134,6 +1141,10 @@ fn spawn_search_index_build(root: &Path, key: String) {
 }
 
 fn search_index_now(root: &Path) -> Option<SearchIndex> {
+    // 全文索引只认 git 仓库；非 git 目录不构建、不加载、不起轮询。
+    if !root.join(".git").exists() {
+        return None;
+    }
     let key = normalize_root(root);
     let indexes = SEARCH_INDEXES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(index) = indexes.lock().unwrap().get(&key).cloned() {
@@ -6315,6 +6326,8 @@ mod tests {
     #[test]
     fn indexed_candidates_ignore_wide_terms_when_a_rare_anchor_exists() {
         let root = tempdir().unwrap();
+        // 全文索引只认 git 仓库：测试目录补一个 .git 占位。
+        fs::create_dir(root.path().join(".git")).unwrap();
         fs::write(root.path().join("rare.go"), "roblox sql query").unwrap();
         for index in 0..SEARCH_INDEX_MAX_CANDIDATES + 2 {
             fs::write(root.path().join(format!("wide-{index}.go")), "sql query").unwrap();

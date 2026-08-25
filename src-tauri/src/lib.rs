@@ -5094,10 +5094,6 @@ fn register_remote_permission_capture(app: &tauri::AppHandle) {
     });
 }
 
-/// 旧的 Tauri app_data_dir 标识（按新→旧排列），仅用于一次性迁移到 ~/.nova。
-/// com.nova.desktop：更名 Nova 后的目录；com.fuckdevin.desktop：更早的品牌目录。
-const LEGACY_IDENTIFIERS: &[&str] = &["com.nova.desktop", "com.fuckdevin.desktop"];
-
 pub const fn nova_data_dir_name() -> &'static str {
     data_dir_name(cfg!(debug_assertions))
 }
@@ -5142,63 +5138,6 @@ pub fn nova_data_dir(app: &tauri::AppHandle) -> PathBuf {
     dir
 }
 
-/// 首次以 `~/.nova` 启动、且该目录尚无数据时，从旧的 Tauri 数据目录整体拷贝过来
-///（优先 com.nova.desktop，其次更早的 com.fuckdevin.desktop），实现老用户数据无缝延续。
-/// 用拷贝而非移动：万一在新旧版本间来回切换也不会丢数据。
-fn migrate_data_to_home(app: &tauri::AppHandle, new_dir: &Path) {
-    // 新目录已有任何数据 → 已在用 .nova，直接用它，不再从旧目录复制，以免覆盖现有数据/设置。
-    if dir_has_entries(new_dir) {
-        return;
-    }
-    // 旧目录都在 app_data_dir 的同级：<roaming>/<identifier>。用当前 app_data_dir 的父目录推导。
-    let Ok(app_data) = app.path().app_data_dir() else {
-        return;
-    };
-    let Some(parent) = app_data.parent() else {
-        return;
-    };
-    for id in LEGACY_IDENTIFIERS {
-        let legacy = parent.join(id);
-        if legacy.as_path() == new_dir || !dir_has_entries(&legacy) {
-            continue;
-        }
-        match copy_dir_all(&legacy, new_dir) {
-            Ok(_) => {
-                eprintln!(
-                    "[nova] 已迁移旧数据目录 {} -> {}",
-                    legacy.display(),
-                    new_dir.display()
-                );
-                return;
-            }
-            Err(e) => eprintln!("[nova] 旧数据目录迁移失败（不影响启动）: {e}"),
-        }
-    }
-}
-
-/// 目录存在且至少含一个条目（用于判断数据目录是否已有内容）。
-fn dir_has_entries(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|mut it| it.next().is_some())
-        .unwrap_or(false)
-}
-
-/// 递归拷贝目录内容（尽力而为，供旧数据迁移使用）。
-fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let src = entry.path();
-        let dst = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_all(&src, &dst)?;
-        } else {
-            std::fs::copy(&src, &dst)?;
-        }
-    }
-    Ok(())
-}
-
 /// Lyra agent 原生入口（`nova lyra`）：命中则执行 stdio bridge 协议并退出，不启动 GUI。
 pub fn maybe_run_lyra() -> bool {
     lyra::maybe_run()
@@ -5226,9 +5165,6 @@ pub fn run() {
             // 数据目录必须最先确定，后续窗口还原/更新都要读取其中的 marker。
             let dir = nova_data_dir(app.handle());
             nova_tools_native::context::set_data_root(dir.clone());
-            if !cfg!(debug_assertions) {
-                migrate_data_to_home(app.handle(), &dir);
-            }
             if let Err(error) = agent_config::sync_global_instructions(&dir) {
                 eprintln!("[agent-config] 启动同步失败：{error}");
             }
