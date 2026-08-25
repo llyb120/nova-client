@@ -150,8 +150,8 @@ pub struct BrowserManager {
         Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Option<String>, String>>>>,
     pending_commands: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     pub last_event_id: Mutex<u64>,
-    /// agent 闭环执行的 HTTP 控制端口（录制进程启动后上报）
-    pub exec_port: std::sync::atomic::AtomicU16,
+    /// agent 闭环执行的 HTTP 控制端口，和录制进程 id 绑定，避免进程重启后复用旧端口。
+    exec_endpoint: Mutex<Option<(String, u16)>>,
     proc: Mutex<Option<RecorderProc>>,
 }
 
@@ -165,7 +165,7 @@ impl BrowserManager {
             pending_shots: Mutex::new(HashMap::new()),
             pending_commands: Mutex::new(HashMap::new()),
             last_event_id: Mutex::new(0),
-            exec_port: std::sync::atomic::AtomicU16::new(0),
+            exec_endpoint: Mutex::new(None),
             proc: Mutex::new(None),
         }
     }
@@ -246,6 +246,7 @@ fn clear_proc_if_current(state: &AppState, proc_id: &str) -> bool {
     if guard.as_ref().is_some_and(|proc| proc.id == proc_id) {
         guard.take();
         drop(guard);
+        *state.browser.exec_endpoint.lock().unwrap() = None;
         let pending = std::mem::take(&mut *state.browser.pending_commands.lock().unwrap());
         for (_, tx) in pending {
             let _ = tx.send(Err("浏览器进程已关闭".into()));
@@ -306,7 +307,7 @@ fn handle_node_msg(app: &AppHandle, proc_id: &str, msg: NodeMsg) {
             eprintln!("[browser] recorder process ready");
         }
         NodeMsg::ExecPort { port } => {
-            state.browser.exec_port.store(port, Ordering::SeqCst);
+            *state.browser.exec_endpoint.lock().unwrap() = Some((proc_id.to_string(), port));
             eprintln!("[browser] exec port: {port}");
         }
         NodeMsg::Nav { url, error } => {
@@ -411,12 +412,28 @@ fn info_of(state: &AppState) -> BrowserInfo {
     }
 }
 
-/// 确保浏览器录制进程已启动，并返回 agent 闭环执行端口（等待上报）。
+fn exec_port_for(endpoint: &Option<(String, u16)>, proc_id: &str) -> Option<u16> {
+    endpoint
+        .as_ref()
+        .filter(|(owner, _)| owner == proc_id)
+        .map(|(_, port)| *port)
+}
+
+/// 确保浏览器录制进程已启动，并返回 agent 闭环执行端口（等待当前进程上报）。
 pub(crate) async fn ensure_exec_port(app: &AppHandle) -> Result<u16, String> {
     ensure_proc(app)?;
     for _ in 0..50 {
-        let port = app.state::<AppState>().browser.exec_port.load(Ordering::SeqCst);
-        if port != 0 {
+        let state = app.state::<AppState>();
+        let proc_id = state
+            .browser
+            .proc
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|proc| proc.id.clone());
+        if let Some(port) = proc_id.and_then(|id| {
+            exec_port_for(&state.browser.exec_endpoint.lock().unwrap(), &id)
+        }) {
             return Ok(port);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -474,6 +491,16 @@ async fn send_cmd_wait(app: AppHandle, mut cmd: Value) -> Result<Value, String> 
             Err("浏览器命令执行超时".into())
         }
     }
+}
+
+/// 切换双子座执行浏览器模式。已有浏览器由 Node 侧安全重启，登录态继续复用。
+pub(crate) async fn set_headless(app: AppHandle, headless: bool) -> Result<(), String> {
+    send_cmd_wait(
+        app,
+        json!({ "cmd": "setHeadless", "headless": headless }),
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -648,5 +675,18 @@ fn sanitize_filename(s: &str) -> String {
         .chars()
         .take(48)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exec_port_for;
+
+    #[test]
+    fn exec_port_is_only_reused_by_its_recorder_process() {
+        let endpoint = Some(("old-recorder".to_string(), 43123));
+        assert_eq!(exec_port_for(&endpoint, "old-recorder"), Some(43123));
+        assert_eq!(exec_port_for(&endpoint, "new-recorder"), None);
+        assert_eq!(exec_port_for(&None, "new-recorder"), None);
+    }
 }
 

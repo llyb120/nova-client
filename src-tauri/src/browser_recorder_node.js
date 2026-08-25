@@ -18,6 +18,23 @@ const pendingAddressWaiters = [];
 const attachedPages = new WeakSet();
 const pageStates = new WeakMap();
 const storageStatePath = process.env.NOVA_BROWSER_STORAGE_STATE || '';
+let requestedHeadless = false;
+let relaunching = false;
+const runPages = new Map();
+
+function browserLaunchOptions(headless) {
+  return {
+    headless,
+    ...(headless ? {} : { args: ['--start-maximized'] }),
+  };
+}
+
+function contextLaunchOptions(headless) {
+  return {
+    viewport: headless ? { width: 1280, height: 800 } : null,
+    ...(storageStatePath && fs.existsSync(storageStatePath) ? { storageState: storageStatePath } : {}),
+  };
+}
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -211,13 +228,9 @@ async function ensureBrowser() {
     try {
       const launchedBrowser = await chromium.launch({
         channel,
-        headless: false,
-        args: ['--start-maximized'],
+        ...browserLaunchOptions(requestedHeadless),
       });
-      const launchedContext = await launchedBrowser.newContext({
-        viewport: null,
-        ...(storageStatePath && fs.existsSync(storageStatePath) ? { storageState: storageStatePath } : {}),
-      });
+      const launchedContext = await launchedBrowser.newContext(contextLaunchOptions(requestedHeadless));
       browser = launchedBrowser;
       context = launchedContext;
       shuttingDown = false;
@@ -256,7 +269,7 @@ async function ensureBrowser() {
         browser = null;
         context = null;
         page = null;
-        emitClosedAndExit();
+        if (!relaunching) emitClosedAndExit();
       });
 
       const target = await context.newPage();
@@ -275,6 +288,22 @@ async function ensureBrowser() {
 }
 
 const commands = {
+  async setHeadless(command) {
+    const next = Boolean(command.headless);
+    if (requestedHeadless === next) return { headless: next };
+    requestedHeadless = next;
+    if (browser?.isConnected()) {
+      relaunching = true;
+      runPages.clear();
+      await saveStorageState().catch(() => {});
+      await browser.close().catch(() => {});
+      browser = null;
+      context = null;
+      page = null;
+      relaunching = false;
+    }
+    return { headless: next };
+  },
   async navigate(command) {
     const target = await ensureBrowser();
     let url = String(command.url || '').trim();
@@ -584,16 +613,11 @@ const commands = {
   },
 };
 
-const runPages = new Map();
-
 function runPageOf(runId) {
   const target = runPages.get(runId);
   if (!target || target.isClosed()) throw new Error('运行页不存在或已关闭: ' + runId);
   return target;
 }
-
-const readline = require('readline');
-const input = readline.createInterface({ input: process.stdin });
 
 // ---------- HTTP 控制端口：供 agent 闭环执行；与 stdin 录制通道并行 ----------
 let execServer = null;
@@ -623,35 +647,41 @@ function startExecServer() {
     out({ type: 'execPort', port: execServer.address().port });
   });
 }
-startExecServer();
+if (process.env.NOVA_BROWSER_RECORDER_TEST === '1') {
+  module.exports = { browserLaunchOptions, contextLaunchOptions };
+} else {
+  const readline = require('readline');
+  const input = readline.createInterface({ input: process.stdin });
+  startExecServer();
 
-let commandQueue = Promise.resolve();
-input.on('line', (line) => {
-  let command;
-  try {
-    command = JSON.parse(line);
-  } catch {
-    return;
-  }
-  const handler = commands[command.cmd];
-  if (!handler) return;
-  commandQueue = commandQueue.then(async () => {
+  let commandQueue = Promise.resolve();
+  input.on('line', (line) => {
+    let command;
     try {
-      const data = await handler(command);
-      if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: true, data: data ?? null });
-    } catch (error) {
-      const message = String(error?.message || error);
-      out({ type: 'error', error: message, cmd: command.cmd });
-      if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: false, error: message });
+      command = JSON.parse(line);
+    } catch {
+      return;
     }
+    const handler = commands[command.cmd];
+    if (!handler) return;
+    commandQueue = commandQueue.then(async () => {
+      try {
+        const data = await handler(command);
+        if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: true, data: data ?? null });
+      } catch (error) {
+        const message = String(error?.message || error);
+        out({ type: 'error', error: message, cmd: command.cmd });
+        if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: false, error: message });
+      }
+    });
   });
-});
-input.on('close', () => {
-  commandQueue.finally(async () => {
-    shuttingDown = true;
-    await saveStorageState().catch(() => {});
-    if (browser) await browser.close().catch(() => {});
-    process.exit(0);
+  input.on('close', () => {
+    commandQueue.finally(async () => {
+      shuttingDown = true;
+      await saveStorageState().catch(() => {});
+      if (browser) await browser.close().catch(() => {});
+      process.exit(0);
+    });
   });
-});
-out({ type: 'hello' });
+  out({ type: 'hello' });
+}

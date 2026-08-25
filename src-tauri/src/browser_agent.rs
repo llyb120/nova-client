@@ -206,7 +206,15 @@ pub async fn run_plan_with_agent(
     agent_kind: AgentKind,
     model: Option<String>,
 ) -> Result<String, String> {
-    // 确保浏览器已打开并拿到执行端口；未打开则启动录制进程。
+    // 双子座的无头开关属于浏览器进程启动配置；先校准模式，再获取执行端口。
+    let mut headless = plan
+        .get("headless")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if crate::server::is_headless() {
+        headless = true;
+    }
+    crate::browser::set_headless(app.clone(), headless).await?;
     let exec_port = crate::browser::ensure_exec_port(&app).await?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let record_output_dir = state.config_dir.join("browser-records").join(&run_id);
