@@ -214,7 +214,7 @@ pub async fn run_plan_with_agent(
     if crate::server::is_headless() {
         headless = true;
     }
-    crate::browser::set_headless(app.clone(), headless).await?;
+    crate::browser::prepare_browser(app.clone(), headless).await?;
     let exec_port = crate::browser::ensure_exec_port(&app).await?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let record_output_dir = state.config_dir.join("browser-records").join(&run_id);

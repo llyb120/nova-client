@@ -194,14 +194,21 @@ fn ensure_proc(app: &AppHandle) -> Result<(), String> {
         .config_dir
         .join("browser-runtime")
         .join("storage-state.json");
-    let mut child = std::process::Command::new("node")
+    let mut command = std::process::Command::new("node");
+    command
         .arg(&script)
         .env("NODE_PATH", &node_path)
         .env("NOVA_BROWSER_STORAGE_STATE", &storage_state)
         .current_dir(&dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("启动录制进程失败（需要 node 在 PATH）: {e}"))?;
 
@@ -493,14 +500,17 @@ async fn send_cmd_wait(app: AppHandle, mut cmd: Value) -> Result<Value, String> 
     }
 }
 
-/// 切换双子座执行浏览器模式。已有浏览器由 Node 侧安全重启，登录态继续复用。
-pub(crate) async fn set_headless(app: AppHandle, headless: bool) -> Result<(), String> {
+/// 切换双子座执行浏览器模式并确认浏览器本体可用。启动 Chrome/Edge 失败时在此返回，
+/// 不把任务交给 agent 后再表现为一直运行。
+pub(crate) async fn prepare_browser(app: AppHandle, headless: bool) -> Result<(), String> {
     send_cmd_wait(
-        app,
+        app.clone(),
         json!({ "cmd": "setHeadless", "headless": headless }),
     )
-    .await
-    .map(|_| ())
+    .await?;
+    send_cmd_wait(app, json!({ "cmd": "ensureBrowser" }))
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]

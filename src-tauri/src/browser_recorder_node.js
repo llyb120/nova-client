@@ -25,6 +25,7 @@ const runPages = new Map();
 function browserLaunchOptions(headless) {
   return {
     headless,
+    timeout: 20000,
     ...(headless ? {} : { args: ['--start-maximized'] }),
   };
 }
@@ -288,6 +289,10 @@ async function ensureBrowser() {
 }
 
 const commands = {
+  async ensureBrowser() {
+    const target = await ensureBrowser();
+    return { url: target.url(), headless: requestedHeadless };
+  },
   async setHeadless(command) {
     const next = Boolean(command.headless);
     if (requestedHeadless === next) return { headless: next };
@@ -650,12 +655,11 @@ function startExecServer() {
 if (process.env.NOVA_BROWSER_RECORDER_TEST === '1') {
   module.exports = { browserLaunchOptions, contextLaunchOptions };
 } else {
-  const readline = require('readline');
-  const input = readline.createInterface({ input: process.stdin });
   startExecServer();
 
   let commandQueue = Promise.resolve();
-  input.on('line', (line) => {
+  let inputBuffer = '';
+  const enqueueLine = (line) => {
     let command;
     try {
       command = JSON.parse(line);
@@ -674,8 +678,21 @@ if (process.env.NOVA_BROWSER_RECORDER_TEST === '1') {
         if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: false, error: message });
       }
     });
+  };
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    inputBuffer += chunk;
+    for (;;) {
+      const newline = inputBuffer.indexOf('\n');
+      if (newline < 0) break;
+      const line = inputBuffer.slice(0, newline).trimEnd();
+      inputBuffer = inputBuffer.slice(newline + 1);
+      if (line) enqueueLine(line);
+    }
   });
-  input.on('close', () => {
+  process.stdin.on('end', () => {
+    const line = inputBuffer.trim();
+    if (line) enqueueLine(line);
     commandQueue.finally(async () => {
       shuttingDown = true;
       await saveStorageState().catch(() => {});

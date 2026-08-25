@@ -20,13 +20,14 @@ writeFileSync(recorder, source);
 const { browserLaunchOptions, contextLaunchOptions } = require(recorder);
 
 test("headless mode reaches Playwright launch and uses a deterministic viewport", () => {
-  assert.deepEqual(browserLaunchOptions(true), { headless: true });
+  assert.deepEqual(browserLaunchOptions(true), { headless: true, timeout: 20000 });
   assert.deepEqual(contextLaunchOptions(true), { viewport: { width: 1280, height: 800 } });
 });
 
 test("visible mode keeps the system browser maximized", () => {
   assert.deepEqual(browserLaunchOptions(false), {
     headless: false,
+    timeout: 20000,
     args: ["--start-maximized"],
   });
   assert.deepEqual(contextLaunchOptions(false), { viewport: null });
