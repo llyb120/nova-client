@@ -1394,6 +1394,7 @@ export function ChatView() {
               groups={groups()}
               permissions={permissions()}
               running={isRunning() && !previewItems()}
+              loading={state.loadingThread}
               showHint={displayedItems().length === 0 && !state.loadingThread}
               hintCwd={cwdDisplay()}
               threadId={state.currentId ?? ""}

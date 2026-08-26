@@ -4,6 +4,7 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createSignal, onCleanup, untrack } from "solid-js";
 import { api } from "../ipc";
 import { state } from "../store";
+import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { createFileContextMenu } from "./FileContextMenu";
 
 marked.setOptions({ gfm: true, breaks: true });
@@ -11,20 +12,11 @@ marked.setOptions({ gfm: true, breaks: true });
 // 流式输出时 props.text 持续增长，若每个 delta 都重新 parse 整段 Markdown 并替换
 // 整棵 innerHTML，长消息会明显卡顿（开销随长度增长）。三层优化：
 // 1. 匀速出字：delta 是一坨一坨到达的（网络/后端合批），直接显示会「一顿一顿蹦字」。
-//    这里维护一个逐步逼近目标文本的 shown 指针，每 TICK_MS 放出一小步（步长随积压自适应），
-//    把突发的整块文本摊成连续的打字机效果，即使 delta 间有间隔也在持续出字。
+//    这里先短暂预缓冲，再由 rAF 按帧间隔、积压量和速度上下限平滑消化。
 // 2. 增量渲染：把「离流式尾部足够远、结构上安全」的前缀固化成稳定 DOM（不再重新 parse/重建），
 //    每次只重渲染活跃尾部——长消息的单次渲染成本从 O(全文) 降为 O(尾部)。
-// 3. 渲染频率天然受 TICK_MS 限制（出字节拍即渲染节拍），无需额外节流。
+// 3. 渲染频率由 requestAnimationFrame 限制，无需额外节流。
 
-/** 出字节拍：约 30fps，与后端 delta 合批窗口（33ms）对齐，观感连续且开销可控 */
-const TICK_MS = 33;
-/** 每拍至少放出的字符数（积压很小时的底速，避免尾巴拖太久） */
-const MIN_STEP = 2;
-/** 追赶系数：每拍放出 backlog/CATCH_UP 个字符，约 8 拍（~260ms）追平当前积压 */
-const CATCH_UP = 8;
-/** 积压超过该值直接跳到最新：会话回放/重同步等场景不做动画 */
-const JUMP_AT = 3000;
 
 /** 尾部至少积累这么多字符才尝试固化一段前缀（小消息不走增量路径） */
 const STABLE_MIN_CHUNK = 1200;
@@ -206,52 +198,57 @@ function cachedRenderMarkdown(src: string, markFiles: boolean): string {
 
 export function Markdown(props: { text: string; markFiles?: boolean; live?: boolean }) {
   const fileMenu = createFileContextMenu();
-  // 平滑出字层：shown 是 props.text 的一个前缀，按节拍逐步追上目标。
-  // 初始即为完整文本——历史消息、非流式内容立即全量显示，不做动画。
+  // 组件挂载时的内容属于已有快照（包括切换到仍在运行的会话），直接显示；
+  // 只有同一实例后续收到的追加 delta 才进入预缓冲动画。
   const [shown, setShown] = createSignal(props.text);
-  let timer: number | undefined;
+  let revealRaf = 0;
+  let lastTickAt = performance.now();
+  let readyAt = 0;
+  let remainder = 0;
 
   const stopTick = () => {
-    if (timer !== undefined) {
-      window.clearTimeout(timer);
-      timer = undefined;
+    if (revealRaf) {
+      cancelAnimationFrame(revealRaf);
+      revealRaf = 0;
     }
+    readyAt = 0;
+    remainder = 0;
   };
 
-  const tick = () => {
-    timer = undefined;
+  const tick = (now: number) => {
+    revealRaf = 0;
+    if (now < readyAt) {
+      revealRaf = requestAnimationFrame(tick);
+      return;
+    }
     const target = props.text;
     const cur = untrack(shown);
-    if (!target.startsWith(cur)) {
-      setShown(target);
-      return;
-    }
-    const backlog = target.length - cur.length;
-    if (backlog <= 0) return;
-    if (backlog > JUMP_AT) {
-      setShown(target);
-      return;
-    }
-    const step = Math.max(MIN_STEP, Math.ceil(backlog / CATCH_UP));
-    let end = cur.length + step;
-    // 不在代理对（emoji 等）中间断开，避免瞬时渲染出乱码
-    const c = target.charCodeAt(end - 1);
-    if (c >= 0xd800 && c <= 0xdbff && end < target.length) end += 1;
-    setShown(target.slice(0, end));
-    if (end < target.length) timer = window.setTimeout(tick, TICK_MS);
+    const next = advanceStreamText(cur, target, now - lastTickAt, remainder);
+    lastTickAt = now;
+    remainder = next.remainder;
+    if (next.text !== cur) setShown(next.text);
+    if (next.text.length < target.length) revealRaf = requestAnimationFrame(tick);
+  };
+
+  const startTick = () => {
+    if (revealRaf) return;
+    const now = performance.now();
+    readyAt = now + STREAM_PREBUFFER_MS;
+    lastTickAt = readyAt;
+    revealRaf = requestAnimationFrame(tick);
   };
 
   createEffect(() => {
     const target = props.text;
     const cur = untrack(shown);
-    if (!target.startsWith(cur)) {
-      // 非纯追加（编辑/重同步/切换内容）：立即同步，不做动画
+    if (!props.live || !target.startsWith(cur)) {
+      // 历史消息、流结束、编辑或重同步均立即同步，不残留预缓冲动画。
       stopTick();
-      setShown(target);
+      if (target !== cur) setShown(target);
       return;
     }
-    // 有新增且当前没有动画在跑：立即放出第一步（首字不等节拍），随后按节拍续
-    if (target.length > cur.length && timer === undefined) tick();
+    // 每段新突发先积累约 100ms；持续流式时已有 rAF 不会重复等待。
+    if (target.length > cur.length) startTick();
   });
 
   onCleanup(stopTick);

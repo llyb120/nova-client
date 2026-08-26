@@ -6,6 +6,7 @@ import {
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded } from "../store";
+import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
@@ -953,6 +954,86 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let cursorStyle = "default";
   /** code-copy-btn feedback: hoverKey → hide-after timestamp */
   const copiedCodeUntil = new Map<string, number>();
+  const shownText = new Map<number, string>();
+  const targetText = new Map<number, string>();
+  const revealReadyAt = new Map<number, number>();
+  const revealRemainders = new Map<number, number>();
+  let revealRaf = 0;
+  let lastRevealAt = performance.now();
+  let revealsInitialized = false;
+
+  const visibleText = (item: { id: number; text: string }) => {
+    if (!targetText.has(item.id)) return item.text;
+    const shown = shownText.get(item.id);
+    return shown !== undefined && item.text.startsWith(shown) ? shown : item.text;
+  };
+
+  const revealFrame = (now: number) => {
+    revealRaf = 0;
+    let changed = false;
+    let pending = false;
+    for (const [id, target] of targetText) {
+      const current = shownText.get(id) ?? target;
+      if (now < (revealReadyAt.get(id) ?? 0)) {
+        pending = current.length < target.length;
+        continue;
+      }
+      const next = advanceStreamText(
+        current,
+        target,
+        now - lastRevealAt,
+        revealRemainders.get(id) ?? 0,
+      );
+      revealRemainders.set(id, next.remainder);
+      if (next.text !== current) {
+        shownText.set(id, next.text);
+        changed = true;
+      }
+      if (next.text.length < target.length) pending = true;
+    }
+    lastRevealAt = now;
+    if (changed) scheduleRebuild(false, true);
+    if (pending) revealRaf = requestAnimationFrame(revealFrame);
+  };
+
+  const syncRevealTargets = (showExisting: boolean) => {
+    targetText.clear();
+    const now = performance.now();
+    if (showExisting) {
+      if (revealRaf) cancelAnimationFrame(revealRaf);
+      revealRaf = 0;
+      shownText.clear();
+      revealReadyAt.clear();
+      revealRemainders.clear();
+    }
+    for (const group of props.groups) {
+      if (group.turn) continue;
+      for (const item of group.body) {
+        if (item.type !== "assistant" && item.type !== "thought") continue;
+        targetText.set(item.id, item.text);
+        if (!shownText.has(item.id)) {
+          const immediate = showExisting || !props.running || item.text === "思考中…";
+          shownText.set(item.id, immediate ? item.text : "");
+          revealReadyAt.set(item.id, immediate ? 0 : now + STREAM_PREBUFFER_MS);
+          revealRemainders.set(item.id, 0);
+        }
+      }
+    }
+    for (const id of [...shownText.keys()]) {
+      if (targetText.has(id)) continue;
+      shownText.delete(id);
+      revealReadyAt.delete(id);
+      revealRemainders.delete(id);
+    }
+    const needsReveal = [...targetText].some(([id, target]) =>
+      target.startsWith(shownText.get(id) ?? target) &&
+      target.length > (shownText.get(id)?.length ?? target.length),
+    );
+    if (needsReveal && !revealRaf) {
+      lastRevealAt = now;
+      revealRaf = requestAnimationFrame(revealFrame);
+    }
+  };
 
   // per-block scroll for clipped tool-content（按内容身份记，避免 rebuild 丢位置）
   const blockScrolls = new Map<string, number>();
@@ -979,6 +1060,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let closedGroupSigCache = new WeakMap<Group, string>();
   let layoutGeneration = 0;
   let renderedThreadId = props.threadId;
+  let waitingForInitialSnapshot = props.loading && props.groups.length === 0;
 
   // selection state
   let selection: Selection | null = null;
@@ -1479,7 +1561,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       y += 6 + 24;
       if (open) {
         // .thought-body: margin-top 6px; padding 8px 14px; border-left 2px border-light
-        const mdBl = parseMarkdownBlocks(item.text);
+        const text = visibleText(item);
+        const mdBl = parseMarkdownBlocks(text);
         let thY = y + 6 + 8; // margin + padding
         let codeIdx = 0;
         for (const mb of mdBl) {
@@ -1527,12 +1610,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
 
     if (item.type === "assistant") {
-      const trimmed = item.text.trim();
+      const text = visibleText(item);
+      const trimmed = text.trim();
       // Skip empty / placeholder replies so they don't leave blank gaps between user prompts.
       if (!trimmed || trimmed === "None") return y;
       // .msg-assistant: margin 14px 0; line-height 1.7
       y += 14;
-      const mdBlocks = parseMarkdownBlocks(item.text);
+      const mdBlocks = parseMarkdownBlocks(text);
       for (let mi = 0; mi < mdBlocks.length; mi++) {
         const mb = mdBlocks[mi];
         if (mb.type === "hr") {
@@ -3362,6 +3446,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       editResizeObserver?.disconnect();
       editResizeObserver = undefined;
       editHostEl = undefined;
+      if (revealRaf) cancelAnimationFrame(revealRaf);
       if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
       if (rebuildTimer !== undefined) window.clearTimeout(rebuildTimer);
       if (busyTimer !== undefined) window.clearTimeout(busyTimer);
@@ -3405,9 +3490,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     void props.emptyHint;
     void editing()?.id;
     const switchedThread = threadId !== renderedThreadId;
+    if (switchedThread) waitingForInitialSnapshot = groups.length === 0;
+    // 缓存未命中时会先以空 items 进入 loading，再在同一 threadId 下提交快照；
+    // 这次首个非空快照也属于已有内容，不能按新 delta 从空串重放。
+    const loadedInitialSnapshot = waitingForInitialSnapshot && groups.length > 0;
+    if (loadedInitialSnapshot) waitingForInitialSnapshot = false;
     if (switchedThread) {
       renderedThreadId = threadId;
       layoutGeneration++;
+      shownText.clear();
+      targetText.clear();
+      revealReadyAt.clear();
+      revealRemainders.clear();
       clearEditing();
       selection = null;
       groupYs = [];
@@ -3422,6 +3516,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       totalHeight = viewH;
       if (canvasEl) paintAll();
     }
+    syncRevealTargets(switchedThread || loadedInitialSnapshot || !revealsInitialized);
+    revealsInitialized = true;
     scheduleRebuild(switchedThread);
   });
 

@@ -1173,8 +1173,30 @@ export async function openThread(id: string) {
     showThreadSnapshot(thread, loadingThread, reconcileItems);
   };
 
-  // 缓存命中时立即展示；未命中则保留旧会话，等完整快照到达后一次性切换，
-  // 避免中途空白，同时不使用页面截图、滤镜或动画阻塞主线程。
+  // 缓存未命中也要在本次同步调用内切走旧 transcript；否则 await IPC 期间
+  // currentId/items 仍指向旧会话，Canvas/DOM 会再绘制一帧旧内容后才换新。
+  if (switching && !cached) {
+    const meta = state.threads.find((thread) => thread.id === id);
+    discardPendingStreamUpdates();
+    resetExpanded();
+    setState({
+      currentId: id,
+      items: [],
+      plan: null,
+      proposedPlan: null,
+      cwd: meta?.cwd ?? "",
+      title: meta?.title ?? "",
+      agentKind: meta?.agentKind ?? state.agentKind,
+      model: meta?.model ?? "",
+      mode: "",
+      reasoningEffort: "",
+      roamingPeer: null,
+      loadingThread: true,
+      liveUsage: state.running[id] ? (liveUsageByThread.get(id) ?? null) : null,
+    });
+  }
+
+  // 缓存命中时立即展示；未命中时已同步切换到目标会话的加载态，
   if (cached) {
     commitSnapshot(cached, true);
     if (request !== openThreadRequest || state.currentId !== id) return;
