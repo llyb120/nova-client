@@ -584,7 +584,7 @@ async fn stop_backend(state: &AppState, kind: &AgentKind) {
             state.codexplus.shutdown();
             state.codex.restart().await;
         }
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddyplus.shutdown(),
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.shutdown(),
         AgentKind::ClaudeCode => state.claudeplus.shutdown(),
         AgentKind::Cursor => state.cursorplus.shutdown(),
         AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.shutdown(),

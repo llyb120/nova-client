@@ -486,7 +486,7 @@ export interface Settings {
   cursorEnabled: boolean;
   opencodeEnabled: boolean;
   codexIntegration: "sdk";
-  codebuddyIntegration: "sdk";
+  codebuddyIntegration: "sdk" | "acp";
   claudecodeIntegration: "sdk";
   cursorIntegration: "sdk";
   opencodeIntegration: "sdk";

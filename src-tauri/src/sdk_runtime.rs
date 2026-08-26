@@ -2063,7 +2063,7 @@ mod tests {
         text_snapshot_change, tool_call, TextSnapshotChange, TOOL_OUTPUT_LIMIT,
     };
     use crate::sdk_adapters::{
-        AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter, SdkAdapter,
+        AlkaidAdapter, ClaudeAdapter, CodexAdapter, CursorAdapter, SdkAdapter,
     };
     use crate::threads::{now_ms, AgentKind, CodexUsageSnapshot, Item, Thread, ToolCall};
     use serde_json::json;
@@ -2228,19 +2228,17 @@ mod tests {
             "cache_read_input_tokens": 300,
             "cache_creation_input_tokens": 40
         });
-        for adapter in [&ClaudeAdapter as &dyn SdkAdapter, &CodeBuddyAdapter] {
-            let (usage, _) = adapter.normalize_usage(Some(&raw), None, None);
-            assert_eq!(
-                usage,
-                Some(json!({
-                    "inputTokens": 440,
-                    "outputTokens": 20,
-                    "totalTokens": 460,
-                    "cacheReadTokens": 300,
-                    "cacheWriteTokens": 40
-                }))
-            );
-        }
+        let (usage, _) = ClaudeAdapter.normalize_usage(Some(&raw), None, None);
+        assert_eq!(
+            usage,
+            Some(json!({
+                "inputTokens": 440,
+                "outputTokens": 20,
+                "totalTokens": 460,
+                "cacheReadTokens": 300,
+                "cacheWriteTokens": 40
+            }))
+        );
 
         let partial = json!({ "input_tokens": 100 });
         let (usage, _) = ClaudeAdapter.normalize_usage(Some(&partial), None, None);

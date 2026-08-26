@@ -800,7 +800,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     cursorEnabled: cursorEnabled(),
     opencodeEnabled: opencodeEnabled(),
     codexIntegration: "sdk",
-    codebuddyIntegration: "sdk",
+    codebuddyIntegration: "acp",
     claudecodeIntegration: "sdk",
     cursorIntegration: "sdk",
     opencodeIntegration: "sdk",

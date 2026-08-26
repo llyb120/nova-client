@@ -5,9 +5,7 @@
 
 use crate::acp::AcpManager;
 use crate::opencode_sdk::OpenCodeSdkManager;
-use crate::sdk_adapters::{
-    AlkaidAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, CursorAdapter, LyraAdapter,
-};
+use crate::sdk_adapters::{AlkaidAdapter, ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter};
 use crate::sdk_runtime::SdkManager;
 use crate::threads::AgentKind;
 use crate::AppState;
@@ -399,7 +397,12 @@ pub fn materialize_runtime(
             BorrowedManager::Sdk(SdkManager::new_with_env(app, CodexAdapter, launch_env))
         }
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-            BorrowedManager::Sdk(SdkManager::new_with_env(app, CodeBuddyAdapter, launch_env))
+            BorrowedManager::Acp(AcpManager::new_with_env(
+                app,
+                AgentKind::CodeBuddy,
+                launch_env,
+                format!("quota-{thread_id}-cbp-"),
+            ))
         }
         AgentKind::ClaudeCode => {
             BorrowedManager::Sdk(SdkManager::new_with_env(app, ClaudeAdapter, launch_env))
