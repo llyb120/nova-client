@@ -284,6 +284,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
+  const [powershellUtf8Enabled, setPowershellUtf8Enabled] = createSignal(
+    s?.powershellUtf8Enabled ?? true,
+  );
   const [autoChangeProjectEnabled, setAutoChangeProjectEnabled] = createSignal(
     s?.autoChangeProjectEnabled !== false,
   );
@@ -758,6 +761,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     codexProxy: codexProxy().trim(),
     vegaProxy: vegaProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
+    powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
     ponytailEnabled: ponytailEnabled(),
     checkpointEnabled: checkpointEnabled(),
@@ -1618,6 +1622,20 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </label>
                 <span class="field-hint">
                   默认开启。让 Lyra 以“懒惰资深工程师”方式工作：能不写就不写，优先复用现有代码/标准库/原生能力，最小 diff、最少文件。保存后对新会话生效。
+                </span>
+              </div>
+              <div class="field">
+                <span class="field-label">PowerShell UTF-8 输出</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={powershellUtf8Enabled()}
+                    onChange={(e) => setPowershellUtf8Enabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  默认开启。Windows 下 Vega 与 Lyra 的 bash 工具按 UTF-8 捕获 PowerShell 输出，修复中文等字符出现「?」或乱码的问题。保存后对新会话生效。
                 </span>
               </div>
             </section>

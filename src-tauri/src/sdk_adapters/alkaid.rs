@@ -62,6 +62,15 @@ impl SdkAdapter for AlkaidAdapter {
                     "NOVA_PONYTAIL",
                     if settings.ponytail_enabled { "1" } else { "0" }.into(),
                 ),
+                (
+                    "NOVA_POWERSHELL_UTF8",
+                    if settings.powershell_utf8_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
             ],
         }
     }

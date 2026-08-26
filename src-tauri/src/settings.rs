@@ -61,6 +61,9 @@ fn default_experience_training_interval_minutes() -> u32 {
 fn default_true() -> bool {
     true
 }
+fn default_powershell_utf8() -> bool {
+    true
+}
 fn default_experience_evolution_interval_minutes() -> u32 {
     720
 }
@@ -209,6 +212,10 @@ pub struct Settings {
     pub vega_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
+    /// PowerShell 输出按 UTF-8 捕获（Vega 与 Lyra 的 bash 工具注入一次性前缀，把控制台
+    /// 输出切到 UTF-8），避免 GBK(cp936) 与 UTF-8 解码错配产生乱码。默认开启。
+    #[serde(default = "default_powershell_utf8")]
+    pub powershell_utf8_enabled: bool,
     /// 是否允许 Lyra/Vega 自动切换当前项目和工具工作目录；默认开启。
     pub auto_change_project_enabled: bool,
     /// ponytail 极简模式：在 system prompt 注入「最小实现/最少改动」规则。默认开启。
@@ -324,6 +331,7 @@ impl Default for Settings {
             codex_proxy: String::new(),
             vega_proxy: String::new(),
             windows_shell_shim_enabled: false,
+            powershell_utf8_enabled: true,
             auto_change_project_enabled: true,
             ponytail_enabled: true,
             checkpoint_enabled: false,
@@ -377,6 +385,16 @@ impl Default for Settings {
 mod tests {
     use super::Settings;
     use std::fs;
+
+    #[test]
+    fn powershell_utf8_is_enabled_by_default_and_round_trips() {
+        assert!(Settings::default().powershell_utf8_enabled);
+        // 旧配置缺该字段时按默认开启解析。
+        let legacy: Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(legacy.powershell_utf8_enabled);
+        let off: Settings = serde_json::from_str(r#"{"powershellUtf8Enabled":false}"#).unwrap();
+        assert!(!off.powershell_utf8_enabled);
+    }
 
     #[test]
     fn windows_shell_shim_is_disabled_by_default() {

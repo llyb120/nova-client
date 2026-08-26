@@ -666,8 +666,11 @@ function createAlkaidStreamFn() {
   });
 }
 
-// Windows 下依次尝试：System32 自带的 Windows PowerShell → PATH 上的 powershell.exe。
+// Windows 下优先 PowerShell 7 (pwsh.exe)：默认 UTF-8、行为更接近现代 shell；
+// 未安装时回退 System32 自带的 Windows PowerShell 5.1 → PATH 上的 powershell.exe。
 export function findWindowsPowerShell(env = process.env) {
+  const pwsh = findWindowsPwsh(env);
+  if (pwsh) return pwsh;
   const roots = [env.SystemRoot, env.windir].filter(Boolean);
   for (const root of roots) {
     const candidate = join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
@@ -679,6 +682,37 @@ export function findWindowsPowerShell(env = process.env) {
     if (existsSync(candidate)) return candidate;
   }
   return null;
+}
+
+// PowerShell 7：先查 PATH 上的 pwsh.exe，再查标准安装目录 ProgramFiles\PowerShell\7。
+export function findWindowsPwsh(env = process.env) {
+  const pathEntry = Object.entries(env).find(([key]) => key.toLowerCase() === "path");
+  for (const dir of (pathEntry?.[1] ?? "").split(delimiter).filter(Boolean)) {
+    const candidate = join(dir, "pwsh.exe");
+    if (existsSync(candidate)) return candidate;
+  }
+  for (const key of ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]) {
+    const root = env[key];
+    if (!root) continue;
+    const candidate = join(root, "PowerShell", "7", "pwsh.exe");
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+// 高级设置「PowerShell UTF-8 输出」开启时（NOVA_POWERSHELL_UTF8=1），为每条命令加
+// 一次性前缀，把该子进程的控制台输出切到 UTF-8，避免 GBK(cp936) 与 UTF-8 解码错配乱码。
+// 前缀以 `;` 结尾、不污染 stdout（赋给 $null）。仅在 powershell 模式下注入。
+const POWERSHELL_UTF8_PREFIX =
+  "$null = ([Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)); ";
+export function powershellUtf8Enabled(env = process.env) {
+  const raw = env.NOVA_POWERSHELL_UTF8;
+  return raw != null && raw !== "" && raw !== "0";
+}
+export function withUtf8ConsolePrefix(command, shellKind, env = process.env) {
+  const raw = String(command ?? "");
+  if (shellKind !== "powershell" || !powershellUtf8Enabled(env) || !raw.trim()) return raw;
+  return POWERSHELL_UTF8_PREFIX + raw;
 }
 
 // Vega 默认 shell 探测：Windows 直接使用 PowerShell（不再依赖 Git Bash），
@@ -728,7 +762,8 @@ export function proxyAlkaidBashTool(tool, shellKind, options = {}) {
     async execute(toolCallId, params, signal, onUpdate) {
       // `rtk rewrite` is the source-of-truth allowlist: unsupported commands return
       // no rewrite and execute byte-for-byte unchanged in the original shell.
-      const command = rewriteAlkaidBashCommand(params?.command, shellKind, options);
+      const rewritten = rewriteAlkaidBashCommand(params?.command, shellKind, options);
+      const command = withUtf8ConsolePrefix(rewritten, shellKind);
       return tool.execute(toolCallId, { ...params, command }, signal, onUpdate);
     },
   };
