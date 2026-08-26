@@ -217,6 +217,7 @@ pub struct ShellConfig {
 pub fn detect_shell() -> ShellConfig {
     if cfg!(windows) {
         // 优先 PowerShell 7 (pwsh.exe)：默认 UTF-8；未安装时回退 Windows PowerShell 5.1。
+        #[cfg(windows)]
         if let Some(pwsh) = find_pwsh() {
             return ShellConfig {
                 program: pwsh,

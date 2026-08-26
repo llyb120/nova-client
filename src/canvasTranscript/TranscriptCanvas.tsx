@@ -10,6 +10,7 @@ import { IMAGE_FILE_RE } from "../components/Markdown";
 import type { Group } from "../components/TurnGroup";
 import { api } from "../ipc";
 import { editUserMessage, isExpanded, respondPermission, toggleExpanded } from "../store";
+import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
 import type { PermissionRequest, PromptImage, RevertChange, UserItem } from "../types";
 import {
   type Action,
@@ -60,6 +61,7 @@ export function TranscriptCanvas(props: {
   groups: Group[];
   permissions: PermissionRequest[];
   running: boolean;
+  loading: boolean;
   showHint: boolean;
   hintCwd: string;
   threadId: string;
@@ -125,7 +127,13 @@ export function TranscriptCanvas(props: {
   const permCustom = new Map<string, string[]>();
   const shownMap = new Map<number, string>();
   const revealTargets = new Map<number, string>();
-  let revealTimer: number | undefined;
+  const revealReadyAt = new Map<number, number>();
+  const revealRemainders = new Map<number, number>();
+  let revealRaf = 0;
+  let lastRevealAt = performance.now();
+  let revealThreadId = props.threadId;
+  let revealsInitialized = false;
+  let waitingForInitialSnapshot = props.loading && props.groups.length === 0;
 
   const fileMenu = createFileContextMenu();
 
@@ -164,76 +172,103 @@ export function TranscriptCanvas(props: {
     return item.text;
   };
 
-  /** 流式期间限制布局重建频率：每 100ms 最多一次，避免 marked.lexer 每帧跑 */
+  /** 流式期间限制布局重建频率：按动画帧合并，避免同帧重复跑 marked.lexer */
   let layoutDirty = false;
-  let layoutThrottleTimer: number | undefined;
+  let layoutRaf = 0;
   const scheduleLayoutRebuild = () => {
-    if (layoutThrottleTimer !== undefined) return;
-    layoutThrottleTimer = window.setTimeout(() => {
-      layoutThrottleTimer = undefined;
+    if (layoutRaf) return;
+    layoutRaf = requestAnimationFrame(() => {
+      layoutRaf = 0;
       if (layoutDirty) {
         layoutDirty = false;
         bump();
       }
-    }, 100);
+    });
   };
 
-  const revealStep = () => {
-    revealTimer = undefined;
+  const revealStep = (now: number) => {
+    revealRaf = 0;
     let changed = false;
     let pending = false;
     for (const [id, target] of revealTargets) {
       const shown = shownMap.get(id) ?? target;
-      if (!target.startsWith(shown)) {
-        shownMap.set(id, target);
+      if (now < (revealReadyAt.get(id) ?? 0)) {
+        pending = shown.length < target.length;
         continue;
       }
-      const backlog = target.length - shown.length;
-      if (backlog <= 0) continue;
-      if (backlog > 3000) {
-        shownMap.set(id, target);
+      const next = advanceStreamText(
+        shown,
+        target,
+        now - lastRevealAt,
+        revealRemainders.get(id) ?? 0,
+      );
+      revealRemainders.set(id, next.remainder);
+      if (next.text !== shown) {
+        shownMap.set(id, next.text);
         changed = true;
-        continue;
       }
-      const step = Math.max(2, Math.ceil(backlog / 8));
-      let end = shown.length + step;
-      const c = target.charCodeAt(end - 1);
-      if (c >= 0xd800 && c <= 0xdbff && end < target.length) end += 1;
-      shownMap.set(id, target.slice(0, end));
-      changed = true;
-      if (end < target.length) pending = true;
+      if (next.text.length < target.length) pending = true;
     }
+    lastRevealAt = now;
     if (changed) {
       layoutDirty = true;
       scheduleLayoutRebuild();
     }
-    if (pending) revealTimer = window.setTimeout(revealStep, 33);
+    if (pending) revealRaf = requestAnimationFrame(revealStep);
   };
 
   /** 只在 groups 引用变化时同步 reveal 目标，不在每次 rebuild 里跑 */
-  const syncReveals = () => {
+  const syncReveals = (showExisting: boolean) => {
     revealTargets.clear();
+    const now = performance.now();
+    if (showExisting) {
+      if (revealRaf) cancelAnimationFrame(revealRaf);
+      revealRaf = 0;
+      shownMap.clear();
+      revealReadyAt.clear();
+      revealRemainders.clear();
+    }
     for (const g of props.groups) {
+      if (g.turn) continue;
       for (const it of g.body) {
         if (it.type !== "assistant" && it.type !== "thought") continue;
         revealTargets.set(it.id, it.text);
-        if (!shownMap.has(it.id)) shownMap.set(it.id, it.text);
+        if (!shownMap.has(it.id)) {
+          const immediate = showExisting || !props.running || it.text === "思考中…";
+          shownMap.set(it.id, immediate ? it.text : "");
+          revealReadyAt.set(it.id, immediate ? 0 : now + STREAM_PREBUFFER_MS);
+          revealRemainders.set(it.id, 0);
+        }
       }
     }
-    let needs = false;
-    for (const [id, target] of revealTargets) {
-      const shown = shownMap.get(id)!;
-      if (target.startsWith(shown) && target.length > shown.length) {
-        needs = true;
-        break;
-      }
+    for (const id of [...shownMap.keys()]) {
+      if (revealTargets.has(id)) continue;
+      shownMap.delete(id);
+      revealReadyAt.delete(id);
+      revealRemainders.delete(id);
     }
-    if (needs && revealTimer === undefined) revealTimer = window.setTimeout(revealStep, 33);
+    const needs = [...revealTargets].some(([id, target]) => {
+      const shown = shownMap.get(id) ?? target;
+      return target.startsWith(shown) && target.length > shown.length;
+    });
+    if (needs && !revealRaf) {
+      lastRevealAt = now;
+      revealRaf = requestAnimationFrame(revealStep);
+    }
   };
   // groups 变化时同步 reveal 目标（独立于 rebuild）
   createEffect(() => {
-    void props.groups;
-    syncReveals();
+    const threadId = props.threadId;
+    const groups = props.groups;
+    void props.loading;
+    const switchedThread = threadId !== revealThreadId;
+    if (switchedThread) waitingForInitialSnapshot = groups.length === 0;
+    const loadedInitialSnapshot = waitingForInitialSnapshot && groups.length > 0;
+    const showExisting = !revealsInitialized || switchedThread || loadedInitialSnapshot;
+    if (loadedInitialSnapshot) waitingForInitialSnapshot = false;
+    revealThreadId = threadId;
+    syncReveals(showExisting);
+    revealsInitialized = true;
   });
 
   /* ===== 权限卡片临时答案状态 ===== */
@@ -259,7 +294,6 @@ export function TranscriptCanvas(props: {
 
     if (props.threadId !== prevThread) {
       prevThread = props.threadId;
-      shownMap.clear();
       selA = selB = selAnchor = -1;
     }
 
@@ -1273,8 +1307,8 @@ export function TranscriptCanvas(props: {
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("pointerup", finishPointer, true);
       window.removeEventListener("pointercancel", finishPointer, true);
-      if (revealTimer !== undefined) window.clearTimeout(revealTimer);
-      if (layoutThrottleTimer !== undefined) window.clearTimeout(layoutThrottleTimer);
+      if (revealRaf) cancelAnimationFrame(revealRaf);
+      if (layoutRaf) cancelAnimationFrame(layoutRaf);
     });
   });
 
