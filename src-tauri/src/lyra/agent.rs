@@ -294,9 +294,15 @@ impl Agent {
                     if let Some(w) = &watchdog_state {
                         w.touch();
                         match &event {
-                            StreamEvent::TextDelta(_) => w.activity.bump(crate::lyra::watchdog::DeltaKind::Text),
-                            StreamEvent::ThinkingDelta(_) => w.activity.bump(crate::lyra::watchdog::DeltaKind::Thinking),
-                            StreamEvent::ToolArgsDelta { .. } => w.activity.bump(crate::lyra::watchdog::DeltaKind::ToolArgs),
+                            StreamEvent::TextDelta(_) => {
+                                w.activity.bump(crate::lyra::watchdog::DeltaKind::Text)
+                            }
+                            StreamEvent::ThinkingDelta(_) => {
+                                w.activity.bump(crate::lyra::watchdog::DeltaKind::Thinking)
+                            }
+                            StreamEvent::ToolArgsDelta { .. } => {
+                                w.activity.bump(crate::lyra::watchdog::DeltaKind::ToolArgs)
+                            }
                         }
                     }
                     match event {
@@ -405,8 +411,15 @@ impl Agent {
             self.drain_steering();
             self.checkpoint_now();
             let has_more_work = !self.messages.is_empty()
-                && self.messages.last().and_then(|m| m.get("role")).and_then(Value::as_str) != Some("assistant");
-            if !has_more_work { return Ok(outcome); }
+                && self
+                    .messages
+                    .last()
+                    .and_then(|m| m.get("role"))
+                    .and_then(Value::as_str)
+                    != Some("assistant");
+            if !has_more_work {
+                return Ok(outcome);
+            }
         }
     }
 

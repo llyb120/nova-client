@@ -107,7 +107,10 @@ impl IdleWatchdog {
 /// 会将其转成流错误，错误文案带 "idle timeout"，命中既有可重试清单）。
 pub fn arm_idle_watchdog(
     watchdog: &std::sync::Arc<IdleWatchdog>,
-) -> (std::sync::Arc<std::sync::atomic::AtomicBool>, tokio::task::JoinHandle<()>) {
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
     use std::sync::atomic::AtomicBool;
     let trip = std::sync::Arc::new(AtomicBool::new(false));
     let weak = std::sync::Arc::downgrade(watchdog);
@@ -116,7 +119,9 @@ pub fn arm_idle_watchdog(
     let handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let Some(watchdog) = weak.upgrade() else { return };
+            let Some(watchdog) = weak.upgrade() else {
+                return;
+            };
             if watchdog.last_event_ms.load(Ordering::Relaxed) == 0 {
                 return; // 已解除武装：本次请求结束。
             }
@@ -150,7 +155,11 @@ impl DiagnosticLog {
             let _ = std::fs::create_dir_all(dir);
         }
         use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = file.write_all(line.as_bytes());
         }
     }
@@ -200,8 +209,10 @@ mod tests {
         assert!(!w.expired(), "未武装不应过期");
         w.touch();
         assert!(!w.expired(), "刚 touch 不应过期");
-        w.last_event_ms
-            .store(now_ms() - IDLE_TIMEOUT.as_millis() as u64 - 1, Ordering::Relaxed);
+        w.last_event_ms.store(
+            now_ms() - IDLE_TIMEOUT.as_millis() as u64 - 1,
+            Ordering::Relaxed,
+        );
         assert!(w.expired(), "超过阈值应过期");
         w.pause();
         assert!(!w.expired(), "工具执行暂停期间不应过期");

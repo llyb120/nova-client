@@ -659,17 +659,9 @@ async fn handle_prompt(
         AgentEvent::MessageEnd { usage } => {
             // 费用字段按整轮累计；contextTokens 始终表示最后一次真实 provider 请求的输入上下文。
             let input = usage.get("input").and_then(Value::as_u64).unwrap_or(0);
-            let cache_read = usage
-                .get("cacheRead")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let cache_write = usage
-                .get("cacheWrite")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            last_context_tokens = input
-                .saturating_add(cache_read)
-                .saturating_add(cache_write);
+            let cache_read = usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0);
+            let cache_write = usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0);
+            last_context_tokens = input.saturating_add(cache_read).saturating_add(cache_write);
             merge_usage(&mut total_usage, &usage);
             total_usage["contextTokens"] = json!(last_context_tokens);
             emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));

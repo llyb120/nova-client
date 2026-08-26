@@ -1,4 +1,3 @@
-
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -179,7 +178,6 @@ struct SearchGitState {
     dirty_files: HashSet<String>,
 }
 
-
 #[derive(Debug, Clone)]
 struct Definition {
     file: String,
@@ -290,8 +288,7 @@ static SEARCH_INDEX_UPDATERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new()
 static SEARCH_INDEX_COMPACTED: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 fn search_deadline() -> Option<Instant> {
-    (!cfg!(test))
-        .then(|| Instant::now() + Duration::from_millis(SEARCH_DEADLINE_MS))
+    (!cfg!(test)).then(|| Instant::now() + Duration::from_millis(SEARCH_DEADLINE_MS))
 }
 
 /// Per-stage wall-clock logging for fast_context. Always on: a slow lookup must be diagnosable
@@ -705,13 +702,9 @@ fn list_code_files_uncached(root: &Path) -> Vec<String> {
         "--".into(),
     ];
     args.extend(EXTENSIONS.iter().map(|extension| format!("*.{extension}")));
-    if let Some(stdout) = run_command_until_limited(
-        root,
-        "git",
-        &args,
-        None,
-        MAX_FILE_LIST_OUTPUT_BYTES,
-    ) {
+    if let Some(stdout) =
+        run_command_until_limited(root, "git", &args, None, MAX_FILE_LIST_OUTPUT_BYTES)
+    {
         let mut seen = HashSet::new();
         let files: Vec<_> = stdout
             .split(|byte| *byte == 0)
@@ -755,7 +748,12 @@ fn parse_git_paths(bytes: &[u8], rename_pairs: bool) -> HashSet<String> {
         if !path.is_empty() && is_searchable_implementation_file(&path) {
             paths.insert(path);
         }
-        if rename_pairs && text.as_bytes().first().is_some_and(|ch| matches!(ch, b'R' | b'C')) {
+        if rename_pairs
+            && text
+                .as_bytes()
+                .first()
+                .is_some_and(|ch| matches!(ch, b'R' | b'C'))
+        {
             if let Some(next) = fields.get(index) {
                 index += 1;
                 let old = normalize_rel(std::str::from_utf8(next).unwrap_or(""));
@@ -852,7 +850,10 @@ fn build_search_snapshot(root: &Path) -> Option<SearchSnapshot> {
         };
         let tokens = tokens_for_search_text(&text);
         for token in &tokens {
-            postings.entry(token.clone()).or_default().push(file.clone());
+            postings
+                .entry(token.clone())
+                .or_default()
+                .push(file.clone());
         }
         file_tokens.insert(file.clone(), tokens);
         contents.insert(file.clone(), text);
@@ -1180,7 +1181,13 @@ fn search_index_rows(
     let candidates = indexed_candidate_files_from(&index, terms)?;
     let needles = terms
         .iter()
-        .map(|term| if ignore_case { term.to_lowercase() } else { term.clone() })
+        .map(|term| {
+            if ignore_case {
+                term.to_lowercase()
+            } else {
+                term.clone()
+            }
+        })
         .collect::<Vec<_>>();
     let word_res = if word {
         terms
@@ -1199,7 +1206,9 @@ fn search_index_rows(
     };
     let mut rows = Vec::new();
     'files: for file in candidates {
-        if dirs.is_some_and(|dirs| !dirs.is_empty() && !dirs.iter().any(|dir| file.starts_with(dir))) {
+        if dirs
+            .is_some_and(|dirs| !dirs.is_empty() && !dirs.iter().any(|dir| file.starts_with(dir)))
+        {
             continue;
         }
         if deadline.is_some_and(|limit| Instant::now() >= limit) {
@@ -1298,11 +1307,15 @@ fn indexed_candidate_files(root: &Path, terms: &[String]) -> Option<Vec<String>>
 fn list_code_files(root: &Path) -> Arc<Vec<String>> {
     let key = normalize_root(root);
     let cache = FILE_LIST_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let entry = cache.lock().unwrap().get(&key).map(|entry| FileListCacheEntry {
-        files: entry.files.clone(),
-        at: entry.at,
-        fingerprint: entry.fingerprint.clone(),
-    });
+    let entry = cache
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|entry| FileListCacheEntry {
+            files: entry.files.clone(),
+            at: entry.at,
+            fingerprint: entry.fingerprint.clone(),
+        });
     if let Some(entry) = entry {
         if entry.at.elapsed() < Duration::from_millis(FILE_LIST_TTL_MS) {
             return entry.files;
@@ -1416,7 +1429,6 @@ fn with_mapped_file<T>(path: &Path, consume: impl FnOnce(&[u8]) -> Option<T>) ->
         result
     }
 }
-
 
 fn git_value(root: &Path, args: &[&str]) -> String {
     let args = args
@@ -1682,9 +1694,7 @@ fn search_text_until(
     if files.len() > 128 {
         let mut rows = files
             .chunks(128)
-            .flat_map(|chunk| {
-                search_text_until(root, &terms, ignore_case, word, chunk, deadline)
-            })
+            .flat_map(|chunk| search_text_until(root, &terms, ignore_case, word, chunk, deadline))
             .collect::<Vec<_>>();
         rows.sort_by(|a, b| {
             a.file
@@ -3865,7 +3875,6 @@ fn backfill_block(
     Some(true)
 }
 
-
 pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     polaris(root, params)
 }
@@ -4082,14 +4091,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             if initial_terms.is_empty() {
                 Vec::new()
             } else {
-                search_text_until(
-                    root,
-                    initial_terms,
-                    true,
-                    false,
-                    &[],
-                    search_deadline(),
-                )
+                search_text_until(root, initial_terms, true, false, &[], search_deadline())
             }
         });
         let revision = scope.spawn(|| short_rev(root));
@@ -4270,7 +4272,11 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     preliminary.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     preliminary.dedup_by(|a, b| a.0 == b.0);
     if preliminary.is_empty() {
-        return Ok(format!("# CTX @{}\n无命中: {}\n提示: 换更短的符号名/字符串片段，或用 grep 定位后用 read。",short_rev(root),terms.join(" ")));
+        return Ok(format!(
+            "# CTX @{}\n无命中: {}\n提示: 换更短的符号名/字符串片段，或用 grep 定位后用 read。",
+            short_rev(root),
+            terms.join(" ")
+        ));
     }
     let mut candidates = preliminary
         .iter()
@@ -4422,14 +4428,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             if discover_stems.is_empty() {
                 Vec::<SearchRow>::new()
             } else {
-                search_text_scopes_until(
-                    root,
-                    &discover_stems,
-                    true,
-                    false,
-                    None,
-                    plan_deadline,
-                )
+                search_text_scopes_until(root, &discover_stems, true, false, None, plan_deadline)
             }
         });
         (
@@ -6343,7 +6342,10 @@ mod tests {
             let text = fs::read_to_string(root.path().join(file)).unwrap();
             let tokens = tokens_for_search_text(&text);
             for token in &tokens {
-                postings.entry(token.clone()).or_default().push(file.clone());
+                postings
+                    .entry(token.clone())
+                    .or_default()
+                    .push(file.clone());
             }
             file_tokens.insert(file.clone(), tokens);
             contents.insert(file.clone(), text);
@@ -6369,11 +6371,8 @@ mod tests {
             .unwrap()
             .insert(key, index_from_snapshot(snapshot));
 
-        let candidates = indexed_candidate_files(
-            root.path(),
-            &["roblox".into(), "sql".into()],
-        )
-        .unwrap();
+        let candidates =
+            indexed_candidate_files(root.path(), &["roblox".into(), "sql".into()]).unwrap();
         assert_eq!(candidates, vec!["rare.go"]);
     }
 
@@ -7142,5 +7141,4 @@ mod tests {
             "{out}"
         );
     }
-
 }

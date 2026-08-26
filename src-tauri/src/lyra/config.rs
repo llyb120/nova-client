@@ -427,12 +427,8 @@ mod tests {
                 }
             }
         });
-        let resolved = resolve_model(
-            &config,
-            Some("custom/gpt/variant/medium"),
-            &HashMap::new(),
-        )
-        .unwrap();
+        let resolved =
+            resolve_model(&config, Some("custom/gpt/variant/medium"), &HashMap::new()).unwrap();
         assert_eq!(resolved.model.max_tokens_field, "max_completion_tokens");
         assert!(!resolved.model.session_affinity_headers);
     }
