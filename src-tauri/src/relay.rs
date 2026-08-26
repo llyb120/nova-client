@@ -1172,8 +1172,6 @@ impl RelayManager {
             .unwrap_or_default())
     }
 
-
-
     fn clue_request(
         &self,
         method: reqwest::Method,
@@ -1275,7 +1273,9 @@ impl RelayManager {
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response).await?.group)
+        Ok(decode_relay_json::<RelayClueAssociate>(response)
+            .await?
+            .group)
     }
 
     pub async fn clue_disassociate(
@@ -1295,7 +1295,9 @@ impl RelayManager {
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response).await?.group)
+        Ok(decode_relay_json::<RelayClueAssociate>(response)
+            .await?
+            .group)
     }
 
     pub async fn clue_split(&self, card_id: &str, space: &str) -> Result<ClueNodeGroup, String> {
@@ -1306,10 +1308,16 @@ impl RelayManager {
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response).await?.group)
+        Ok(decode_relay_json::<RelayClueAssociate>(response)
+            .await?
+            .group)
     }
 
-    pub async fn clue_stack(&self, card_ids: &[String], space: &str) -> Result<ClueNodeGroup, String> {
+    pub async fn clue_stack(
+        &self,
+        card_ids: &[String],
+        space: &str,
+    ) -> Result<ClueNodeGroup, String> {
         let response = self
             .clue_request(reqwest::Method::POST, "/v2/clues/stack")?
             .query(&[("space", space)])
@@ -1317,7 +1325,9 @@ impl RelayManager {
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response).await?.group)
+        Ok(decode_relay_json::<RelayClueAssociate>(response)
+            .await?
+            .group)
     }
 
     pub async fn clue_delete(&self, card_id: &str, space: &str) -> Result<(), String> {
@@ -1589,30 +1599,59 @@ impl RelayManager {
         let response = self
             .clue_request(reqwest::Method::POST, "/v2/workflows/revoke")?
             .json(&json!({ "workflowId": workflow_id }))
-            .send().await.map_err(|error| error.to_string())?;
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
         let value: Value = decode_relay_json(response).await?;
         Ok(value.get("count").and_then(Value::as_u64).unwrap_or(0) as usize)
     }
 
     fn on_workflow(&self, env: &InEnvelope) {
         let stages = env.data.get("stages").and_then(|v| v.as_array());
-        if stages.map(|a| a.is_empty()).unwrap_or(true) { return; }
-        let share = WorkflowShare { id: uuid::Uuid::new_v4().to_string(), from: env.from.clone(), from_name: env.from_name.clone(), def: env.data.clone(), ts: now_ms() };
+        if stages.map(|a| a.is_empty()).unwrap_or(true) {
+            return;
+        }
+        let share = WorkflowShare {
+            id: uuid::Uuid::new_v4().to_string(),
+            from: env.from.clone(),
+            from_name: env.from_name.clone(),
+            def: env.data.clone(),
+            ts: now_ms(),
+        };
         {
             let mut inbox = self.workflow_inbox.lock().unwrap();
-            let workflow_id = share.def.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string);
-            let existing = workflow_id.as_deref().and_then(|id| inbox.iter().position(|item| item.from == share.from && item.def.get("id").and_then(Value::as_str) == Some(id)));
-            if let Some(index) = existing { inbox[index] = share; } else { inbox.push(share); }
+            let workflow_id = share
+                .def
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+            let existing = workflow_id.as_deref().and_then(|id| {
+                inbox.iter().position(|item| {
+                    item.from == share.from
+                        && item.def.get("id").and_then(Value::as_str) == Some(id)
+                })
+            });
+            if let Some(index) = existing {
+                inbox[index] = share;
+            } else {
+                inbox.push(share);
+            }
             persist_workflow_inbox(&self.config_dir, &inbox);
         }
         self.emit_workflow_inbox();
     }
 
     fn on_workflow_revoke(&self, env: &InEnvelope) {
-        let Some(workflow_id) = env.data.get("workflowId").and_then(Value::as_str) else { return; };
+        let Some(workflow_id) = env.data.get("workflowId").and_then(Value::as_str) else {
+            return;
+        };
         {
             let mut inbox = self.workflow_inbox.lock().unwrap();
-            inbox.retain(|item| !(item.from == env.from && item.def.get("id").and_then(Value::as_str) == Some(workflow_id)));
+            inbox.retain(|item| {
+                !(item.from == env.from
+                    && item.def.get("id").and_then(Value::as_str) == Some(workflow_id))
+            });
             persist_workflow_inbox(&self.config_dir, &inbox);
         }
         self.emit_workflow_inbox();
@@ -1752,7 +1791,7 @@ impl RelayManager {
                 });
             }
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                let mgr = state.codebuddyplus.clone();
+                let mgr = state.codebuddy.clone();
                 tauri::async_runtime::spawn(async move {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
@@ -2698,7 +2737,7 @@ impl RelayManager {
                     }
                     AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
                         app.state::<AppState>()
-                            .codebuddyplus
+                            .codebuddy
                             .ensure_model_options()
                             .await
                     }
@@ -3212,9 +3251,7 @@ impl RelayManager {
         state.acp.forget_session_of_thread(&host_thread_id);
         state.codex.forget_session_of_thread(&host_thread_id);
         state.codexplus.forget_session_of_thread(&host_thread_id);
-        state
-            .codebuddyplus
-            .forget_session_of_thread(&host_thread_id);
+        state.codebuddy.forget_session_of_thread(&host_thread_id);
         state.claudeplus.forget_session_of_thread(&host_thread_id);
         state.cursorplus.forget_session_of_thread(&host_thread_id);
         state.opencodeplus.forget_session_of_thread(&host_thread_id);
@@ -3335,7 +3372,7 @@ impl RelayManager {
                 });
             }
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                let mgr = state.codebuddyplus.clone();
+                let mgr = state.codebuddy.clone();
                 tauri::async_runtime::spawn(async move {
                     if !host_prompt_is_current(&prompt_epoch) {
                         return;
@@ -3443,7 +3480,7 @@ impl RelayManager {
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                let mgr = state.codebuddyplus.clone();
+                let mgr = state.codebuddy.clone();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
             AgentKind::ClaudeCode => {
@@ -3532,7 +3569,7 @@ impl RelayManager {
             .to_string();
         let state = self.app.state::<AppState>();
         if request_key.starts_with("cbp-") {
-            let mgr = state.codebuddyplus.clone();
+            let mgr = state.codebuddy.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = mgr.respond_permission(&request_key, &option_id).await;
             });

@@ -55,19 +55,44 @@ impl ContextRetrievalMode {
     }
 }
 
-fn default_experience_training_interval_minutes() -> u32 { 60 }
-fn default_true() -> bool { true }
-fn default_experience_evolution_interval_minutes() -> u32 { 720 }
-fn default_experience_training_agent() -> String { "lyra".into() }
+fn default_experience_training_interval_minutes() -> u32 {
+    60
+}
+fn default_true() -> bool {
+    true
+}
+fn default_powershell_utf8() -> bool {
+    true
+}
+fn default_experience_evolution_interval_minutes() -> u32 {
+    720
+}
+fn default_experience_training_agent() -> String {
+    "lyra".into()
+}
 fn default_experience_experts() -> Vec<ExperienceExpertConfig> {
     vec![
-        ExperienceExpertConfig::new("fast", "天枢", 0.90, 0.50, 0.08, 0.25, 0.05, 0.35, 0.40, 1.0),
-        ExperienceExpertConfig::new("concrete", "天璇", 0.70, 0.30, 0.03, 0.10, 0.10, 0.20, 0.30, 1.0),
-        ExperienceExpertConfig::new("balanced", "天玑", 0.55, 0.25, 0.02, 0.12, 0.08, 0.50, 0.50, 1.0),
-        ExperienceExpertConfig::new("abstract", "天权", 0.50, 0.20, 0.015, 0.12, 0.10, 0.85, 0.45, 0.8),
-        ExperienceExpertConfig::new("negative", "玉衡", 0.60, 0.45, 0.04, 0.15, 0.08, 0.45, 0.35, 1.5),
-        ExperienceExpertConfig::new("novel", "开阳", 0.80, 0.35, 0.06, 0.40, 0.05, 0.60, 0.85, 1.0),
-        ExperienceExpertConfig::new("slow", "摇光", 0.30, 0.10, 0.005, 0.03, 0.05, 0.55, 0.20, 0.7),
+        ExperienceExpertConfig::new(
+            "fast", "天枢", 0.90, 0.50, 0.08, 0.25, 0.05, 0.35, 0.40, 1.0,
+        ),
+        ExperienceExpertConfig::new(
+            "concrete", "天璇", 0.70, 0.30, 0.03, 0.10, 0.10, 0.20, 0.30, 1.0,
+        ),
+        ExperienceExpertConfig::new(
+            "balanced", "天玑", 0.55, 0.25, 0.02, 0.12, 0.08, 0.50, 0.50, 1.0,
+        ),
+        ExperienceExpertConfig::new(
+            "abstract", "天权", 0.50, 0.20, 0.015, 0.12, 0.10, 0.85, 0.45, 0.8,
+        ),
+        ExperienceExpertConfig::new(
+            "negative", "玉衡", 0.60, 0.45, 0.04, 0.15, 0.08, 0.45, 0.35, 1.5,
+        ),
+        ExperienceExpertConfig::new(
+            "novel", "开阳", 0.80, 0.35, 0.06, 0.40, 0.05, 0.60, 0.85, 1.0,
+        ),
+        ExperienceExpertConfig::new(
+            "slow", "摇光", 0.30, 0.10, 0.005, 0.03, 0.05, 0.55, 0.20, 0.7,
+        ),
     ]
 }
 
@@ -87,15 +112,49 @@ pub struct ExperienceExpertConfig {
 }
 
 impl ExperienceExpertConfig {
-    fn new(id: &str, name: &str, write_rate: f64, value_learning_rate: f64, forget_rate: f64, mutation_rate: f64, migration_rate: f64, abstraction_level: f64, novelty_preference: f64, negative_sensitivity: f64) -> Self {
-        Self { id: id.into(), name: name.into(), write_rate, value_learning_rate, forget_rate, mutation_rate, migration_rate, abstraction_level, novelty_preference, negative_sensitivity }
+    fn new(
+        id: &str,
+        name: &str,
+        write_rate: f64,
+        value_learning_rate: f64,
+        forget_rate: f64,
+        mutation_rate: f64,
+        migration_rate: f64,
+        abstraction_level: f64,
+        novelty_preference: f64,
+        negative_sensitivity: f64,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            write_rate,
+            value_learning_rate,
+            forget_rate,
+            mutation_rate,
+            migration_rate,
+            abstraction_level,
+            novelty_preference,
+            negative_sensitivity,
+        }
     }
 }
 
 impl Default for ExperienceExpertConfig {
-    fn default() -> Self { Self::new("expert", "无名观测者", 0.5, 0.2, 0.02, 0.1, 0.1, 0.5, 0.5, 1.0) }
+    fn default() -> Self {
+        Self::new(
+            "expert",
+            "无名观测者",
+            0.5,
+            0.2,
+            0.02,
+            0.1,
+            0.1,
+            0.5,
+            0.5,
+            1.0,
+        )
+    }
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
@@ -108,7 +167,8 @@ pub struct Settings {
     pub devin_proxy: String,
     /// CodeBuddy CLI 可执行文件路径（默认 codebuddy，依赖 PATH）
     pub codebuddy_path: String,
-    /// 旧版 CodeBuddy ACP 启动参数，仅用于兼容已有设置。
+    /// 旧版 CodeBuddy ACP 启动参数（`--acp` 时代遗留）；当前走官方 HTTP 传输
+    /// （`codebuddy --serve` + /api/v1/acp），不再使用该字段，仅兼容反序列化。
     pub codebuddy_args: String,
     /// CodeBuddy 代理地址
     pub codebuddy_proxy: String,
@@ -152,6 +212,10 @@ pub struct Settings {
     pub vega_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
+    /// PowerShell 输出按 UTF-8 捕获（Vega 与 Lyra 的 bash 工具注入一次性前缀，把控制台
+    /// 输出切到 UTF-8），避免 GBK(cp936) 与 UTF-8 解码错配产生乱码。默认开启。
+    #[serde(default = "default_powershell_utf8")]
+    pub powershell_utf8_enabled: bool,
     /// 是否允许 Lyra/Vega 自动切换当前项目和工具工作目录；默认开启。
     pub auto_change_project_enabled: bool,
     /// ponytail 极简模式：在 system prompt 注入「最小实现/最少改动」规则。默认开启。
@@ -267,6 +331,7 @@ impl Default for Settings {
             codex_proxy: String::new(),
             vega_proxy: String::new(),
             windows_shell_shim_enabled: false,
+            powershell_utf8_enabled: true,
             auto_change_project_enabled: true,
             ponytail_enabled: true,
             checkpoint_enabled: false,
@@ -297,7 +362,7 @@ impl Default for Settings {
             opencode_enabled: false,
             opencodeplus_enabled: false,
             codex_integration: "sdk".into(),
-            codebuddy_integration: "sdk".into(),
+            codebuddy_integration: "acp".into(),
             claudecode_integration: "sdk".into(),
             cursor_integration: "sdk".into(),
             opencode_integration: "sdk".into(),
@@ -320,6 +385,16 @@ impl Default for Settings {
 mod tests {
     use super::Settings;
     use std::fs;
+
+    #[test]
+    fn powershell_utf8_is_enabled_by_default_and_round_trips() {
+        assert!(Settings::default().powershell_utf8_enabled);
+        // 旧配置缺该字段时按默认开启解析。
+        let legacy: Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(legacy.powershell_utf8_enabled);
+        let off: Settings = serde_json::from_str(r#"{"powershellUtf8Enabled":false}"#).unwrap();
+        assert!(!off.powershell_utf8_enabled);
+    }
 
     #[test]
     fn windows_shell_shim_is_disabled_by_default() {
@@ -523,21 +598,22 @@ mod tests {
     fn sdk_integration_defaults_match_backend_policy() {
         let settings = Settings::default();
         assert_eq!(settings.codex_integration, "sdk");
-        assert_eq!(settings.codebuddy_integration, "sdk");
+        assert_eq!(settings.codebuddy_integration, "acp");
         assert_eq!(settings.opencode_integration, "sdk");
         assert_eq!(settings.claudecode_integration, "sdk");
         assert_eq!(settings.cursor_integration, "sdk");
     }
 
     #[test]
-    fn load_forces_persisted_integrations_to_sdk() {
+    fn load_forces_integrations_to_backend_policy() {
         let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("settings.json"),
             r#"{
                 "codexIntegration":"acp",
-                "codebuddyIntegration":"acp",
+                "codebuddyIntegration":"sdk",
+                "codebuddyplusEnabled":true,
                 "claudecodeIntegration":"acp",
                 "cursorIntegration":"acp",
                 "opencodeIntegration":"acp"
@@ -548,7 +624,8 @@ mod tests {
         let settings = Settings::load(&dir);
 
         assert_eq!(settings.codex_integration, "sdk");
-        assert_eq!(settings.codebuddy_integration, "sdk");
+        assert_eq!(settings.codebuddy_integration, "acp");
+        assert!(!settings.codebuddyplus_enabled);
         assert_eq!(settings.claudecode_integration, "sdk");
         assert_eq!(settings.cursor_integration, "sdk");
         assert_eq!(settings.opencode_integration, "sdk");
@@ -595,20 +672,13 @@ impl Settings {
                 .unwrap_or(24 * 30);
         }
         // 旧版把 SDK 暴露为独立 “+” 后端；升级后折叠为同一后端的接入方式。
-        if settings.codexplus_enabled {
-            settings.codex_integration = "sdk".into();
-        }
-        if settings.codebuddyplus_enabled {
-            settings.codebuddy_integration = "sdk".into();
-        }
-        if settings.opencodeplus_enabled {
-            settings.opencode_integration = "sdk".into();
-        }
         settings.codexplus_enabled = false;
         settings.codebuddyplus_enabled = false;
         settings.opencodeplus_enabled = false;
+        // SDK bridge 已移除：CodeBuddy 固定走官方 HTTP 传输（`codebuddy --serve`
+        // + /api/v1/acp）；其余后端 SDK 是唯一受支持的接入方式。
         settings.codex_integration = "sdk".into();
-        settings.codebuddy_integration = "sdk".into();
+        settings.codebuddy_integration = "acp".into();
         settings.claudecode_integration = "sdk".into();
         settings.cursor_integration = "sdk".into();
         settings.opencode_integration = "sdk".into();
@@ -623,15 +693,45 @@ impl Settings {
         let baseline = default_experience_experts();
         let builtin_ids = ["fast", "concrete", "abstract", "negative", "novel", "slow"];
         let legacy_six = settings.experience_experts.len() == builtin_ids.len()
-            && builtin_ids.iter().all(|id| settings.experience_experts.iter().any(|expert| expert.id == *id));
+            && builtin_ids.iter().all(|id| {
+                settings
+                    .experience_experts
+                    .iter()
+                    .any(|expert| expert.id == *id)
+            });
         for expert in &mut settings.experience_experts {
-            let default_name = baseline.iter().find(|item| item.id == expert.id)
-                .map(|item| item.name.clone()).unwrap_or_else(|| "无名观测者".into());
-            let legacy_name = matches!(expert.name.as_str(),
-                "参宿一" | "参宿二" | "参宿四" | "参宿五" | "参宿六" | "参宿七"
-                | "绯红瞬学者" | "永夜守忆者" | "万象刻印师" | "虚空演绎者" | "灾厄审判官" | "混沌启示录"
-                | "流星信使" | "恒星守望者" | "星图记录者" | "星云推演者" | "蚀影校准者" | "远星探路者"
-                | "星驰" | "辰守" | "星图" | "云衍" | "蚀鉴" | "远航");
+            let default_name = baseline
+                .iter()
+                .find(|item| item.id == expert.id)
+                .map(|item| item.name.clone())
+                .unwrap_or_else(|| "无名观测者".into());
+            let legacy_name = matches!(
+                expert.name.as_str(),
+                "参宿一"
+                    | "参宿二"
+                    | "参宿四"
+                    | "参宿五"
+                    | "参宿六"
+                    | "参宿七"
+                    | "绯红瞬学者"
+                    | "永夜守忆者"
+                    | "万象刻印师"
+                    | "虚空演绎者"
+                    | "灾厄审判官"
+                    | "混沌启示录"
+                    | "流星信使"
+                    | "恒星守望者"
+                    | "星图记录者"
+                    | "星云推演者"
+                    | "蚀影校准者"
+                    | "远星探路者"
+                    | "星驰"
+                    | "辰守"
+                    | "星图"
+                    | "云衍"
+                    | "蚀鉴"
+                    | "远航"
+            );
             if expert.name.trim().is_empty() || legacy_name {
                 expert.name = default_name;
             }
@@ -655,7 +755,11 @@ impl Settings {
         );
         std::env::set_var(
             "NOVA_EXPERIENCE_TOOLS",
-            if self.experience_training_enabled { "1" } else { "0" },
+            if self.experience_training_enabled {
+                "1"
+            } else {
+                "0"
+            },
         );
     }
 

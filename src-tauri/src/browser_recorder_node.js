@@ -18,8 +18,94 @@ const pendingAddressWaiters = [];
 const attachedPages = new WeakSet();
 const pageStates = new WeakMap();
 const storageStatePath = process.env.NOVA_BROWSER_STORAGE_STATE || '';
+let requestedHeadless = false;
+let relaunching = false;
+const runPages = new Map();
+const runOutputDirs = new Map();
+
+function browserLaunchOptions(headless) {
+  return {
+    headless,
+    timeout: 20000,
+    ...(headless ? {} : { args: ['--start-maximized'] }),
+  };
+}
+
+function contextLaunchOptions(headless) {
+  return {
+    viewport: headless ? { width: 1280, height: 800 } : null,
+    ...(storageStatePath && fs.existsSync(storageStatePath) ? { storageState: storageStatePath } : {}),
+  };
+}
+
+function safeShotName(requestedPath) {
+  const name = path.basename(requestedPath || 'current.png').replace(/[^a-zA-Z0-9._-]/g, '-');
+  return name && name !== '.' && name !== '..' ? name : 'current.png';
+}
+
+function execShotPath(command) {
+  const requestedPath = String(command.path || '').replace(/\\/g, '/');
+  const outputDir = runOutputDirs.get(command.runId);
+  return outputDir ? path.join(outputDir, safeShotName(requestedPath)) : requestedPath;
+}
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function pageViewport(target) {
+  return target.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight, deviceScaleFactor: window.devicePixelRatio }));
+}
+
+function mapViewportPoint(command, viewport) {
+  let x = Number(command.x), y = Number(command.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('点击坐标必须是有效数字');
+  if (command.normalized) {
+    if (x < 0 || x > 1000 || y < 0 || y > 1000) throw new Error('归一化坐标必须在 0..1000 内');
+    x = x * viewport.width / 1000;
+    y = y * viewport.height / 1000;
+  } else if (command.imageWidth || command.imageHeight) {
+    const imageWidth = Number(command.imageWidth), imageHeight = Number(command.imageHeight);
+    if (!(imageWidth > 0) || !(imageHeight > 0)) throw new Error('截图尺寸必须大于 0');
+    x = x * viewport.width / imageWidth;
+    y = y * viewport.height / imageHeight;
+  }
+  if (x < 0 || x > viewport.width || y < 0 || y > viewport.height) throw new Error('点击坐标超出当前视口');
+  return { x: Math.min(x, viewport.width - 1), y: Math.min(y, viewport.height - 1) };
+}
+
+async function commandPoint(target, command) {
+  return mapViewportPoint(command, await pageViewport(target));
+}
+
+async function prepareFullPageScreenshot(target) {
+  await target.evaluate(async () => {
+    const originalX = window.scrollX, originalY = window.scrollY;
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    let previousHeight = 0, stableBottom = 0;
+    window.scrollTo(0, 0);
+    await wait(120);
+    // ponytail: 最多预滚动 100 次，超长或无限流页面仍由分段截图兜底。
+    for (let step = 0; step < 100 && stableBottom < 2; step += 1) {
+      const height = document.scrollingElement?.scrollHeight || document.documentElement.scrollHeight;
+      const bottom = Math.max(0, height - window.innerHeight);
+      const next = Math.min(bottom, window.scrollY + Math.max(1, Math.floor(window.innerHeight * 0.8)));
+      window.scrollTo(0, next);
+      window.dispatchEvent(new Event('scroll'));
+      await wait(120);
+      const updatedHeight = document.scrollingElement?.scrollHeight || document.documentElement.scrollHeight;
+      stableBottom = window.scrollY >= bottom && updatedHeight === previousHeight ? stableBottom + 1 : 0;
+      previousHeight = updatedHeight;
+    }
+    window.scrollTo(originalX, originalY);
+    await wait(200);
+  });
+}
+
+function semanticLocator(target, command) {
+  if (command.role && command.name) return target.getByRole(String(command.role), { name: String(command.name), exact: command.exact !== false });
+  if (command.label) return target.getByLabel(String(command.label), { exact: command.exact !== false });
+  if (command.text) return target.getByText(String(command.text), { exact: command.exact !== false });
+  return null;
+}
 
 function finishPendingAddressNavigation() {
   pendingAddressNavigations = Math.max(0, pendingAddressNavigations - 1);
@@ -120,6 +206,10 @@ async function syncFlags() {
   }, [recording, paused]).catch(() => {})));
 }
 
+function shouldExitAfterLastPageCloses(pageCount, isShuttingDown, isRelaunching) {
+  return pageCount === 0 && !isShuttingDown && !isRelaunching;
+}
+
 function attachPage(target) {
   if (attachedPages.has(target)) return;
   attachedPages.add(target);
@@ -188,7 +278,7 @@ function attachPage(target) {
 
   target.on('close', () => {
     if (page === target) page = null;
-    if (livePages().length > 0 || shuttingDown) return;
+    if (!shouldExitAfterLastPageCloses(livePages().length, shuttingDown, relaunching)) return;
     shuttingDown = true;
     void saveStorageState()
       .catch(() => {})
@@ -211,13 +301,9 @@ async function ensureBrowser() {
     try {
       const launchedBrowser = await chromium.launch({
         channel,
-        headless: false,
-        args: ['--start-maximized'],
+        ...browserLaunchOptions(requestedHeadless),
       });
-      const launchedContext = await launchedBrowser.newContext({
-        viewport: null,
-        ...(storageStatePath && fs.existsSync(storageStatePath) ? { storageState: storageStatePath } : {}),
-      });
+      const launchedContext = await launchedBrowser.newContext(contextLaunchOptions(requestedHeadless));
       browser = launchedBrowser;
       context = launchedContext;
       shuttingDown = false;
@@ -256,7 +342,7 @@ async function ensureBrowser() {
         browser = null;
         context = null;
         page = null;
-        emitClosedAndExit();
+        if (!relaunching) emitClosedAndExit();
       });
 
       const target = await context.newPage();
@@ -275,6 +361,26 @@ async function ensureBrowser() {
 }
 
 const commands = {
+  async ensureBrowser() {
+    const target = await ensureBrowser();
+    return { url: target.url(), headless: requestedHeadless };
+  },
+  async setHeadless(command) {
+    const next = Boolean(command.headless);
+    if (requestedHeadless === next) return { headless: next };
+    requestedHeadless = next;
+    if (browser?.isConnected()) {
+      relaunching = true;
+      runPages.clear();
+      await saveStorageState().catch(() => {});
+      await browser.close().catch(() => {});
+      browser = null;
+      context = null;
+      page = null;
+      relaunching = false;
+    }
+    return { headless: next };
+  },
   async navigate(command) {
     const target = await ensureBrowser();
     let url = String(command.url || '').trim();
@@ -403,7 +509,7 @@ const commands = {
       out({ type: 'shot', reqId: command.reqId, data: null, cancelled: true });
       return;
     }
-    const image = await target.screenshot({ clip });
+    const image = await target.screenshot({ clip, scale: 'css' });
     out({ type: 'shot', reqId: command.reqId, data: 'data:image/png;base64,' + image.toString('base64'), clip });
   },
   async close() {
@@ -414,6 +520,12 @@ const commands = {
   },
 
   // ---------- 双子座计划执行：每个 runId 绑定一个专用 tab，可并行多个 ----------
+  async execConfigure(command) {
+    const outputDir = String(command.outputDir || '');
+    if (!command.runId || !outputDir) throw new Error('运行截图目录未配置');
+    runOutputDirs.set(command.runId, outputDir);
+    return null;
+  },
   async execOpen(command) {
     await ensureBrowser();
     const target = await context.newPage();
@@ -427,6 +539,7 @@ const commands = {
   async execClose(command) {
     const target = runPages.get(command.runId);
     runPages.delete(command.runId);
+    runOutputDirs.delete(command.runId);
     if (target && !target.isClosed()) await target.close().catch(() => {});
     return null;
   },
@@ -452,7 +565,14 @@ const commands = {
   },
   async execClick(command) {
     const target = runPageOf(command.runId);
-    await target.click(command.selector, { timeout: command.timeout || 10000 });
+    const semantic = semanticLocator(target, command);
+    if (!semantic) {
+      await target.click(command.selector, { timeout: command.timeout || 10000 });
+      return null;
+    }
+    const count = await semantic.count();
+    if (count !== 1) throw new Error(`语义点击目标匹配到 ${count} 个元素`);
+    await semantic.click({ timeout: command.timeout || 10000 });
     return null;
   },
   async execFill(command) {
@@ -460,24 +580,23 @@ const commands = {
     await target.fill(command.selector, String(command.value ?? ''), { timeout: command.timeout || 10000 });
     return null;
   },
-  // ---- 纯视觉坐标操作（不看 DOM）：截图像素 == CSS 像素（context viewport:null），1:1 对齐 ----
-  // 返回当前视口尺寸，agent 据此知道截图坐标范围。
+  // ---- 纯视觉坐标操作（不看 DOM）：截图强制按 CSS 像素输出，另支持 0..1000 归一化坐标 ----
+  // viewport:null 时 Playwright viewportSize() 为 null，必须从页面读取真实窗口尺寸。
   async execViewport(command) {
-    const target = runPageOf(command.runId);
-    return target.viewportSize() || { width: 1280, height: 800 };
+    return pageViewport(runPageOf(command.runId));
   },
-  // 在视口坐标 (x,y) 真实点击鼠标；可选先滚动把页面某点带进视野由 agent 自行控制。
   async execMouseClick(command) {
     const target = runPageOf(command.runId);
-    const x = Number(command.x), y = Number(command.y);
+    const { x, y } = await commandPoint(target, command);
     await target.mouse.move(x, y);
     await target.mouse.click(x, y, { button: command.button || 'left', clickCount: command.double ? 2 : 1 });
     return { x, y };
   },
   async execMouseMove(command) {
     const target = runPageOf(command.runId);
-    await target.mouse.move(Number(command.x), Number(command.y));
-    return null;
+    const { x, y } = await commandPoint(target, command);
+    await target.mouse.move(x, y);
+    return { x, y };
   },
   // 滚动页面（deltaY>0 向下），用于把视野外目标滚进来再截图。
   async execScroll(command) {
@@ -535,33 +654,22 @@ const commands = {
   },
   async execShot(command) {
     const target = runPageOf(command.runId);
-    // 兼容反斜杠/正斜杠路径，避免 Windows 下转义乱码；并确保目录存在。
-    const rawPath = String(command.path || '').replace(/\\/g, '/');
-    const fs = require('fs');
-    const pathMod = require('path');
-    fs.mkdirSync(pathMod.dirname(rawPath), { recursive: true });
-    const options = { path: rawPath };
+    // 计划截图固定落在 Nova 数据目录；agent 只传 ASCII 文件名，避免 Windows PowerShell
+    // 5.1 把命令中的非 ASCII 用户目录转成问号后再发进 JSON。
+    const rawPath = execShotPath(command);
+    fs.mkdirSync(path.dirname(rawPath), { recursive: true });
+    const options = { path: rawPath, scale: 'css' };
     if (command.fullPage && !command.selector) {
-      await target.screenshot({ path: rawPath, fullPage: true });
+      // 先逐屏触发 body 页面懒加载，再交给 Playwright 原生 fullPage 一次成图。
+      await prepareFullPageScreenshot(target);
+      await target.screenshot({ ...options, fullPage: true });
     } else if (command.selector) {
       // 等元素出现且可见，避免截到半渲染的空壳。
       await target.waitForSelector(command.selector, { state: 'visible', timeout: command.timeout || 10000 });
       if (command.full) {
         // 不改 DOM（overflow/flex/类样式撑不开）：先滚动整页触发懒加载，再用 fullPage+clip
         // 按元素的文档坐标截出完整内容，body 滚动、sticky 表头、内部容器均适用。
-        await target.evaluate(async () => {
-          await new Promise((resolve) => {
-            let last = -1;
-            const step = () => {
-              window.scrollBy(0, window.innerHeight);
-              const y = window.scrollY;
-              if (y !== last && y + window.innerHeight < document.documentElement.scrollHeight) {
-                last = y; setTimeout(step, 120);
-              } else { window.scrollTo(0, 0); setTimeout(resolve, 200); }
-            };
-            step();
-          });
-        });
+        await prepareFullPageScreenshot(target);
         const clip = await target.evaluate((sel) => {
           const el = document.querySelector(sel);
           if (!el) return null;
@@ -569,9 +677,9 @@ const commands = {
           return { x: Math.max(0, r.left + window.scrollX), y: Math.max(0, r.top + window.scrollY), width: r.width, height: r.height };
         }, command.selector);
         if (clip && clip.width > 0 && clip.height > 0) {
-          await target.screenshot({ path: rawPath, fullPage: true, clip });
+          await target.screenshot({ ...options, fullPage: true, clip });
         } else {
-          await target.screenshot({ path: rawPath, fullPage: true });
+          await target.screenshot({ ...options, fullPage: true });
         }
       } else {
         const locator = target.locator(command.selector).first();
@@ -580,20 +688,15 @@ const commands = {
     } else {
       await target.screenshot(options);
     }
-    return { path: rawPath };
+    return { path: rawPath, viewport: await pageViewport(target) };
   },
 };
-
-const runPages = new Map();
 
 function runPageOf(runId) {
   const target = runPages.get(runId);
   if (!target || target.isClosed()) throw new Error('运行页不存在或已关闭: ' + runId);
   return target;
 }
-
-const readline = require('readline');
-const input = readline.createInterface({ input: process.stdin });
 
 // ---------- HTTP 控制端口：供 agent 闭环执行；与 stdin 录制通道并行 ----------
 let execServer = null;
@@ -623,35 +726,63 @@ function startExecServer() {
     out({ type: 'execPort', port: execServer.address().port });
   });
 }
-startExecServer();
+if (process.env.NOVA_BROWSER_RECORDER_TEST === '1') {
+  module.exports = {
+    browserLaunchOptions,
+    contextLaunchOptions,
+    execShotPath,
+    mapViewportPoint,
+    pageViewport,
+    prepareFullPageScreenshot,
+    safeShotName,
+    semanticLocator,
+    shouldExitAfterLastPageCloses,
+  };
+} else {
+  startExecServer();
 
-let commandQueue = Promise.resolve();
-input.on('line', (line) => {
-  let command;
-  try {
-    command = JSON.parse(line);
-  } catch {
-    return;
-  }
-  const handler = commands[command.cmd];
-  if (!handler) return;
-  commandQueue = commandQueue.then(async () => {
+  let commandQueue = Promise.resolve();
+  let inputBuffer = '';
+  const enqueueLine = (line) => {
+    let command;
     try {
-      const data = await handler(command);
-      if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: true, data: data ?? null });
-    } catch (error) {
-      const message = String(error?.message || error);
-      out({ type: 'error', error: message, cmd: command.cmd });
-      if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: false, error: message });
+      command = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const handler = commands[command.cmd];
+    if (!handler) return;
+    commandQueue = commandQueue.then(async () => {
+      try {
+        const data = await handler(command);
+        if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: true, data: data ?? null });
+      } catch (error) {
+        const message = String(error?.message || error);
+        out({ type: 'error', error: message, cmd: command.cmd });
+        if (command.commandId) out({ type: 'commandResult', commandId: command.commandId, ok: false, error: message });
+      }
+    });
+  };
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    inputBuffer += chunk;
+    for (;;) {
+      const newline = inputBuffer.indexOf('\n');
+      if (newline < 0) break;
+      const line = inputBuffer.slice(0, newline).trimEnd();
+      inputBuffer = inputBuffer.slice(newline + 1);
+      if (line) enqueueLine(line);
     }
   });
-});
-input.on('close', () => {
-  commandQueue.finally(async () => {
-    shuttingDown = true;
-    await saveStorageState().catch(() => {});
-    if (browser) await browser.close().catch(() => {});
-    process.exit(0);
+  process.stdin.on('end', () => {
+    const line = inputBuffer.trim();
+    if (line) enqueueLine(line);
+    commandQueue.finally(async () => {
+      shuttingDown = true;
+      await saveStorageState().catch(() => {});
+      if (browser) await browser.close().catch(() => {});
+      process.exit(0);
+    });
   });
-});
-out({ type: 'hello' });
+  out({ type: 'hello' });
+}

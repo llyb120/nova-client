@@ -62,6 +62,15 @@ impl SdkAdapter for LyraAdapter {
                     "NOVA_CONTEXT_RETRIEVAL_MODE",
                     settings.context_retrieval_mode.as_str().into(),
                 ),
+                (
+                    "NOVA_POWERSHELL_UTF8",
+                    if settings.powershell_utf8_enabled {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
             ],
         }
     }

@@ -216,6 +216,13 @@ pub struct ShellConfig {
 
 pub fn detect_shell() -> ShellConfig {
     if cfg!(windows) {
+        // 优先 PowerShell 7 (pwsh.exe)：默认 UTF-8；未安装时回退 Windows PowerShell 5.1。
+        if let Some(pwsh) = find_pwsh() {
+            return ShellConfig {
+                program: pwsh,
+                kind: ShellKind::PowerShell,
+            };
+        }
         for root in [
             std::env::var("SystemRoot").ok(),
             std::env::var("windir").ok(),
@@ -252,6 +259,26 @@ pub fn detect_shell() -> ShellConfig {
         program: "sh".into(),
         kind: ShellKind::Bash,
     }
+}
+
+#[cfg(windows)]
+fn find_pwsh() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("pwsh.exe");
+        if candidate.is_file() {
+            return Some(candidate.display().to_string());
+        }
+    }
+    for key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Ok(root) = std::env::var(key) {
+            let candidate = PathBuf::from(root).join("PowerShell").join("7").join("pwsh.exe");
+            if candidate.is_file() {
+                return Some(candidate.display().to_string());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -443,17 +470,23 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     let read_only = options.read_only;
     // 与 Vega 提示词对齐：显式列出可用工具（按 Lyra 实际注册的工具集，只读模式无 bash/edit/write）。
     let tool_lines: Vec<&str> = [
-        options.auto_change_project.then_some("- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目"),
+        options.auto_change_project.then_some(
+            "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
+        ),
         Some("- read: 读取单个文件"),
         if read_only {
             None
         } else {
             Some(match &options.shell {
-                Some(shell) if shell.kind == ShellKind::PowerShell => "- bash: 执行 PowerShell 命令",
+                Some(shell) if shell.kind == ShellKind::PowerShell => {
+                    "- bash: 执行 PowerShell 命令"
+                }
                 _ => "- bash: 执行 Bash 命令",
             })
         },
-        polaris.then_some("- polaris: 一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG（内部批量 rg + 增量符号索引）"),
+        polaris.then_some(
+            "- polaris: 一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG（内部批量 rg + 增量符号索引）",
+        ),
         if read_only {
             None
         } else {

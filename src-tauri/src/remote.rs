@@ -1031,9 +1031,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
             AgentKind::Lyra => state.lyra.get_model_options(),
             AgentKind::Devin => state.acp.get_model_options(),
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
-            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                state.codebuddyplus.get_model_options()
-            }
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.get_model_options(),
             AgentKind::ClaudeCode => state.claudeplus.get_model_options(),
             AgentKind::Cursor => state.cursorplus.get_model_options(),
             AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.get_model_options(),
@@ -2000,7 +1998,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
                 state.codexplus.forget_session_of_thread(&cmd.thread_id)
             }
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                state.codebuddyplus.forget_session_of_thread(&cmd.thread_id)
+                state.codebuddy.forget_session_of_thread(&cmd.thread_id)
             }
             AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
@@ -2028,7 +2026,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
                 state.codexplus.forget_session_of_thread(&cmd.thread_id)
             }
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                state.codebuddyplus.forget_session_of_thread(&cmd.thread_id)
+                state.codebuddy.forget_session_of_thread(&cmd.thread_id)
             }
             AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
@@ -2066,7 +2064,7 @@ async fn respond_remote_permission(
             .await
     } else if request_key.starts_with("cbp-") {
         state
-            .codebuddyplus
+            .codebuddy
             .respond_permission(request_key, option_id)
             .await
     } else if request_key.starts_with("clp-") {
@@ -2641,9 +2639,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         AgentKind::Lyra => state.lyra.cancel(thread_id).await,
         AgentKind::Devin => state.acp.cancel(thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-            state.codebuddyplus.cancel(thread_id).await
-        }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.cancel(thread_id).await,
         AgentKind::ClaudeCode => state.claudeplus.cancel(thread_id).await,
         AgentKind::Cursor => state.cursorplus.cancel(thread_id).await,
         AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.cancel(thread_id).await,

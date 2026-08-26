@@ -1,13 +1,11 @@
 mod alkaid;
 mod claude;
-mod codebuddy;
 mod codex;
 mod cursor;
 mod lyra;
 
 pub use alkaid::AlkaidAdapter;
 pub use claude::ClaudeAdapter;
-pub use codebuddy::CodeBuddyAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
 pub use lyra::LyraAdapter;

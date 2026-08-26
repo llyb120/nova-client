@@ -275,6 +275,23 @@ fn rewrite_with_embedded_rtk(command: &str, shell: &crate::lyra::prompt::ShellCo
     rewritten.replace("rtk ", &prefix)
 }
 
+// 高级设置「PowerShell UTF-8 输出」开启时，为 PowerShell 命令加一次性前缀，把该子进程
+// 控制台输出切到 UTF-8，避免 GBK(cp936) 与 UTF-8 解码错配乱码。赋值给 $null，不污染 stdout。
+const POWERSHELL_UTF8_PREFIX: &str =
+    "$null = ([Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)); ";
+
+fn apply_powershell_utf8(command: String, shell: &crate::lyra::prompt::ShellConfig) -> String {
+    use crate::lyra::prompt::ShellKind;
+    if shell.kind != ShellKind::PowerShell || command.trim().is_empty() {
+        return command;
+    }
+    let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
+    if !settings.powershell_utf8_enabled {
+        return command;
+    }
+    format!("{POWERSHELL_UTF8_PREFIX}{command}")
+}
+
 async fn run_bash(
     root: &Path,
     shell: &crate::lyra::prompt::ShellConfig,
@@ -284,7 +301,7 @@ async fn run_bash(
 ) -> Result<String, String> {
     use crate::lyra::prompt::ShellKind;
     let timeout_secs = timeout_secs.clamp(1, 600);
-    let command = rewrite_with_embedded_rtk(command, shell);
+    let command = apply_powershell_utf8(rewrite_with_embedded_rtk(command, shell), shell);
     let mut process = match shell.kind {
         ShellKind::PowerShell => {
             let mut p = tokio::process::Command::new(&shell.program);
@@ -312,7 +329,6 @@ async fn run_bash(
     #[cfg(windows)]
     {
         // 避免 Windows 下弹出控制台窗口
-        use std::os::windows::process::CommandExt;
         process.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     let mut child = process

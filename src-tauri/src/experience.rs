@@ -17,7 +17,8 @@ const MAX_EXPERIENCES_PER_EXPERT: usize = 800;
 static STORE: OnceLock<Mutex<ExperienceStore>> = OnceLock::new();
 static PROJECT_IDENTITIES: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
 static RECALL_SNAPSHOT: OnceLock<Mutex<Option<Arc<RecallSnapshot>>>> = OnceLock::new();
-static RECALL_PROJECT_IDENTITIES: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+static RECALL_PROJECT_IDENTITIES: OnceLock<Mutex<HashMap<String, (String, String)>>> =
+    OnceLock::new();
 static TRAINING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -472,11 +473,11 @@ pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value
     let project = snapshot.projects.get(&project_key);
     let query_terms = terms(query);
     let mut by_expert: HashMap<String, Vec<(&ExperienceEntry, f64)>> = HashMap::new();
-    for cached in snapshot
-        .universal
-        .iter()
-        .chain(project.into_iter().flat_map(|project| project.entries.iter()))
-    {
+    for cached in snapshot.universal.iter().chain(
+        project
+            .into_iter()
+            .flat_map(|project| project.entries.iter()),
+    ) {
         let entry = &cached.entry;
         if entry.status == "quarantined" || query_terms.is_empty() {
             continue;
@@ -727,7 +728,11 @@ pub fn set_user_feedback(
 }
 
 /// 自动调度路径传入已知 project_key；手动触发传 None，由 cwd 推导。
-pub async fn evolve_memory(app: &AppHandle, project_key_hint: Option<&str>, cwd: &str) -> Result<Value, String> {
+pub async fn evolve_memory(
+    app: &AppHandle,
+    project_key_hint: Option<&str>,
+    cwd: &str,
+) -> Result<Value, String> {
     let (project_key, project_root) = match project_key_hint {
         Some(key) => {
             let (_, root) = project_identity(cwd)?;
@@ -1131,7 +1136,7 @@ async fn run_training_turn(
             }
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
                 state
-                    .codebuddyplus
+                    .codebuddy
                     .clone()
                     .run_prompt(thread_id.into(), prompt, Vec::new())
                     .await
@@ -1159,9 +1164,9 @@ async fn run_training_turn(
             }
             AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                 return Err(format!(
-                    "{} 暂不支持经验训练，请选择 Vega、Lyra、Devin、Codex、CodeBuddy、Claude 或 Cursor",
-                    agent.label()
-                ))
+                "{} 暂不支持经验训练，请选择 Vega、Lyra、Devin、Codex、CodeBuddy、Claude 或 Cursor",
+                agent.label()
+            ))
             }
         }
     }
@@ -1689,9 +1694,7 @@ fn evolve(store: &mut ProjectExperienceStore, configs: &[ExperienceExpertConfig]
 /// 7 天足够发现误隔离并手动回滚；正常演进路径不会把近期条目长时间留在 quarantined。
 fn purge_quarantined(experiences: &mut Vec<ExperienceEntry>) {
     let cutoff = now_ms() - 7 * 86_400_000;
-    experiences.retain(|entry| {
-        !(entry.status == "quarantined" && entry.updated_at < cutoff)
-    });
+    experiences.retain(|entry| !(entry.status == "quarantined" && entry.updated_at < cutoff));
 }
 
 /// 用词面相似度把同一 expert 内的近似重复条目隔离，保留适应度最高的一条。
@@ -1894,7 +1897,8 @@ mod tests {
 
     #[test]
     fn trained_memory_recall_is_read_only() {
-        let root = std::env::temp_dir().join(format!("nova-memory-recall-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("nova-memory-recall-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         init(&root);
         let (project_key, project_root) = project_identity(&root.to_string_lossy()).unwrap();

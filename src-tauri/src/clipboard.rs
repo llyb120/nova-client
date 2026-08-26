@@ -17,7 +17,9 @@ pub fn file_paths() -> Vec<String> {
 #[cfg(windows)]
 fn windows_hdrop_paths() -> Vec<String> {
     use std::ptr;
-    use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
     use windows_sys::Win32::UI::Shell::DragQueryFileW;
 
     const CF_HDROP: u32 = 15;
@@ -47,7 +49,8 @@ fn windows_hdrop_paths() -> Vec<String> {
                 continue;
             }
             let mut buf = vec![0u16; len + 1];
-            let written = DragQueryFileW(handle, index, buf.as_mut_ptr(), buf.len() as u32) as usize;
+            let written =
+                DragQueryFileW(handle, index, buf.as_mut_ptr(), buf.len() as u32) as usize;
             if written == 0 {
                 continue;
             }
