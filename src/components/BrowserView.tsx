@@ -396,7 +396,7 @@ export default function BrowserView() {
       const plan = compilePlan(clip.events);
       plan.analysisPrompt = clip.analysisPrompt || "";
       plan.analysisRecordRefs = clip.analysisRecordRefs || [];
-      plan.headless = clip.headless ?? true;
+      plan.headless = clip.headless ?? false;
       const runAgentKind = clip.runAgentKind || lastUsed.agentKind();
       const raw = await runPlanWithAgent(state.cwd || ".", plan, runAgentKind, clip.runModel || lastUsed.model(runAgentKind));
       const conclusion = raw.trim();
@@ -605,7 +605,7 @@ export default function BrowserView() {
                     <label class="be-headless-check">
                       <input
                         type="checkbox"
-                        checked={currentClip().headless ?? true}
+                        checked={currentClip().headless ?? false}
                         onChange={(e) => updateClip(currentClip().id, (value) => ({ ...value, headless: e.currentTarget.checked }))}
                       />
                       启用无头模式

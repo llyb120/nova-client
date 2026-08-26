@@ -438,9 +438,9 @@ pub(crate) async fn ensure_exec_port(app: &AppHandle) -> Result<u16, String> {
             .unwrap()
             .as_ref()
             .map(|proc| proc.id.clone());
-        if let Some(port) = proc_id.and_then(|id| {
-            exec_port_for(&state.browser.exec_endpoint.lock().unwrap(), &id)
-        }) {
+        if let Some(port) =
+            proc_id.and_then(|id| exec_port_for(&state.browser.exec_endpoint.lock().unwrap(), &id))
+        {
             return Ok(port);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -500,17 +500,64 @@ async fn send_cmd_wait(app: AppHandle, mut cmd: Value) -> Result<Value, String> 
     }
 }
 
-/// 切换双子座执行浏览器模式并确认浏览器本体可用。启动 Chrome/Edge 失败时在此返回，
-/// 不把任务交给 agent 后再表现为一直运行。
-pub(crate) async fn prepare_browser(app: AppHandle, headless: bool) -> Result<(), String> {
-    send_cmd_wait(
-        app.clone(),
-        json!({ "cmd": "setHeadless", "headless": headless }),
-    )
-    .await?;
-    send_cmd_wait(app, json!({ "cmd": "ensureBrowser" }))
+fn parse_exec_response(value: Value) -> Result<Value, String> {
+    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(value.get("data").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("浏览器执行接口返回无效响应")
+            .to_string())
+    }
+}
+
+async fn send_exec_cmd(port: u16, cmd: Value) -> Result<Value, String> {
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("创建浏览器执行接口客户端失败: {e}"))?
+        .post(format!("http://127.0.0.1:{port}/"))
+        .json(&cmd)
+        .timeout(std::time::Duration::from_secs(35))
+        .send()
         .await
-        .map(|_| ())
+        .map_err(|e| format!("浏览器执行接口请求失败: {e}"))?;
+    let status = response.status();
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("浏览器执行接口响应无效: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("浏览器执行接口返回 HTTP {status}"));
+    }
+    parse_exec_response(value)
+}
+
+/// 通过已经就绪的本地执行接口切换模式并启动浏览器。计划执行不走录制 stdin 通道，
+/// 避免 Windows GUI 子进程偶发收不到首条管道命令而空等到超时。
+pub(crate) async fn prepare_browser(app: &AppHandle, headless: bool) -> Result<u16, String> {
+    let port = ensure_exec_port(app).await?;
+    send_exec_cmd(port, json!({ "cmd": "setHeadless", "headless": headless })).await?;
+    send_exec_cmd(port, json!({ "cmd": "ensureBrowser" })).await?;
+    Ok(port)
+}
+
+pub(crate) async fn configure_plan_run(
+    port: u16,
+    run_id: &str,
+    output_dir: &std::path::Path,
+) -> Result<(), String> {
+    send_exec_cmd(
+        port,
+        json!({
+            "cmd": "execConfigure",
+            "runId": run_id,
+            "outputDir": output_dir.to_string_lossy(),
+        }),
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -689,7 +736,8 @@ fn sanitize_filename(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::exec_port_for;
+    use super::{exec_port_for, parse_exec_response};
+    use serde_json::json;
 
     #[test]
     fn exec_port_is_only_reused_by_its_recorder_process() {
@@ -698,5 +746,18 @@ mod tests {
         assert_eq!(exec_port_for(&endpoint, "new-recorder"), None);
         assert_eq!(exec_port_for(&None, "new-recorder"), None);
     }
-}
 
+    #[test]
+    fn exec_response_preserves_browser_errors() {
+        assert_eq!(
+            parse_exec_response(json!({ "ok": true, "data": { "headless": false } }))
+                .unwrap()["headless"],
+            false
+        );
+        assert_eq!(
+            parse_exec_response(json!({ "ok": false, "error": "Chrome 启动失败" }))
+                .unwrap_err(),
+            "Chrome 启动失败"
+        );
+    }
+}
