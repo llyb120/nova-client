@@ -13,7 +13,7 @@ import {
   preloadPeerModels,
   refreshQuota,
   refreshRelayStatus,
-  roamingPeers,
+  quotaPeers,
   setState,
   setTheme,
   state,
@@ -540,7 +540,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       });
 
   const shortcutSharedModels = createMemo<SharedModelSource[]>(() =>
-    roamingPeers()
+    quotaPeers()
       .map((peer) => ({
         peer: { token: peer.token, name: peer.name },
         options: state.peerModels[peer.token]?.sharedOptions ?? {},
