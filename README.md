@@ -145,5 +145,5 @@ src-tauri/src/
 ## 注意
 
 - 想全自动不弹审批：在**设置 → 新会话默认模式**选 `Bypass Permissions`（或在会话里手动切换模式）。该模式会自动批准包括写文件、执行命令在内的所有工具调用，请只在可信目录使用。
-- 看到 agent 报 `Get-ChildItem: A parameter cannot be found that matches parameter name 'la'` 之类错误，是 devin 在 Windows 上尝试了 unix 命令（如 `ls -la`）后自行重试纠正，属 agent 行为，非应用问题。
+- Windows 上 Nova 会在 Devin 新 ACP 会话的首条提示词中隐式注入 PowerShell 5.1 约束，避免 agent 把 `ls -la` 等 Unix 命令交给 PowerShell；该上下文不会显示或保存为用户消息。
 - 修改设置会重启 agent 进程；进行中的轮次会被打断，历史上下文在下次发消息时自动恢复。

@@ -3242,18 +3242,21 @@ impl AcpManager {
             };
             guidance.push(nova_tools_prompt_guidance(context_tools, read_only));
         }
-        // Shell 解释器由 Devin 的执行层选择，且可能在同一 Windows 会话中切换。
-        // 每轮带上短契约，旧 session 也能立即纠正 Bash / PowerShell 混用。
-        let context_tools = self
-            .app
-            .state::<AppState>()
-            .settings
-            .lock()
-            .unwrap()
-            .context_tools_enabled();
+        // Devin 的 Windows shell 契约只随新 ACP session 的首条 prompt 注入；用户消息仍按原文落库和展示。
+        // CodeBuddy 保持原有逐轮 guidance，避免改变无关 agent 的行为。
         let runtime_guidance = match self.kind {
             AgentKind::CodeBuddy => codebuddy_runtime_guidance(),
-            _ => devin_runtime_guidance(context_tools),
+            AgentKind::Devin if include_runtime_guidance => {
+                let context_tools = self
+                    .app
+                    .state::<AppState>()
+                    .settings
+                    .lock()
+                    .unwrap()
+                    .context_tools_enabled();
+                devin_runtime_guidance(context_tools)
+            }
+            _ => None,
         };
         if let Some(runtime) = runtime_guidance {
             guidance.push(runtime);
@@ -4433,11 +4436,13 @@ mod nova_tools_config_tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_devin_guidance_does_not_mix_powershell_with_default_bash() {
+    fn windows_devin_guidance_requires_powershell_5_1_syntax() {
         let guidance = super::devin_runtime_guidance(true).unwrap();
-        assert!(guidance.contains("default command interpreter may be `/usr/bin/bash`"));
-        assert!(guidance.contains("powershell.exe -NoProfile -NonInteractive -Command"));
-        assert!(guidance.contains("Do not mix Bash pipelines/operators with PowerShell cmdlets"));
+        assert!(guidance.contains("Windows PowerShell 5.1"));
+        assert!(guidance.contains("Use PowerShell syntax from the first command onward"));
+        assert!(guidance.contains("`$env:NAME`"));
+        assert!(guidance.contains("Do not emit Bash/POSIX syntax"));
+        assert!(guidance.contains("do not use `&&` or `||`"));
         assert!(!super::devin_runtime_guidance(false)
             .unwrap()
             .contains("polaris"));
@@ -4502,12 +4507,12 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
 #[cfg(windows)]
 fn devin_runtime_guidance(polaris: bool) -> Option<String> {
     let search_guidance = if polaris {
-        " Do not use Bash to recursively search when Nova polaris already covers the task."
+        " Use Nova polaris instead of shell recursion when it covers the search task."
     } else {
         ""
     };
     Some(format!(
-        "Windows shell contract for this local Devin session (hard constraint): Devin's native command tool is hosted on Windows but its default command interpreter may be `/usr/bin/bash` (Git Bash/MSYS), not PowerShell. Never place PowerShell cmdlets such as `Get-ChildItem`, `Select-Object`, `Get-Content`, `Where-Object`, or `$env:NAME` directly in a default shell command. For ordinary repository commands, use portable Bash syntax and forward-slash paths, for example `pwd`, `ls -la`, `cat file`, `rg pattern src`, `git status --short`, `command -v node`, and `$NAME`.{search_guidance} When Windows-specific behavior or PowerShell cmdlets are genuinely required, invoke PowerShell explicitly as `powershell.exe -NoProfile -NonInteractive -Command \"...\"`; inside that quoted script use PowerShell syntax and `$env:NAME`. Do not mix Bash pipelines/operators with PowerShell cmdlets in the same command. If a command fails with `/usr/bin/bash: ...: command not found`, correct the shell mismatch immediately instead of retrying the same syntax."
+        "Windows shell contract for this local Devin session (hard constraint): the native command tool runs Windows PowerShell 5.1. Use PowerShell syntax from the first command onward. Use cmdlets such as `Get-ChildItem`, `Select-String`, and `Get-Content`; use `$env:NAME` for environment variables and `;` to sequence commands. Do not emit Bash/POSIX syntax such as `export`, `VAR=value command`, `/dev/null`, `ls -la`, `rm -rf`, `grep`, `sed`, or `awk`; Windows PowerShell 5.1 does not support Bash-style chaining, so do not use `&&` or `||`.{search_guidance} Use Bash only when the user explicitly requests it or a required script has no PowerShell-compatible entry point."
     ))
 }
 
