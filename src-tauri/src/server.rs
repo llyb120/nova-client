@@ -63,9 +63,9 @@ const HELP: &str = r#"Nova Headless Server
   context（none / fast / super，默认 super）
   devin-path, codex-path, codex-args, codebuddy-path, claude-path,
   cursor-path, opencode-path
-  vega-proxy, devin-proxy, codex-proxy, codebuddy-proxy, claude-proxy,
+  lyra-proxy, devin-proxy, codex-proxy, codebuddy-proxy, claude-proxy,
   cursor-proxy, opencode-proxy
-  vega-enabled, devin-enabled, codex-enabled, codebuddy-enabled, claude-enabled,
+  lyra-enabled, devin-enabled, codex-enabled, codebuddy-enabled, claude-enabled,
   cursor-enabled, opencode-enabled
   env.<NAME>（例如 config.toml 中自定义 provider 的 env_key）
 
@@ -297,7 +297,7 @@ fn show_config(show_token: bool) -> Result<(), String> {
         "defaultMode": settings.default_mode,
         "contextRetrievalMode": settings.context_retrieval_mode.as_str(),
         "agents": {
-            "vega": { "enabled": settings.vega_enabled, "proxy": settings.vega_proxy },
+            "lyra": { "enabled": settings.lyra_enabled, "proxy": settings.lyra_proxy },
             "devin": { "enabled": settings.devin_enabled, "path": settings.devin_path, "proxy": settings.devin_proxy },
             "codex": { "enabled": settings.codex_enabled, "path": settings.codex_path, "args": settings.codex_args, "proxy": settings.codex_proxy },
             "codebuddy": { "enabled": settings.codebuddy_enabled, "path": settings.codebuddy_path, "proxy": settings.codebuddy_proxy },
@@ -356,14 +356,14 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
             "claude-path" => settings.claudecode_path = value.into(),
             "cursor-path" => settings.cursor_path = value.into(),
             "opencode-path" => settings.opencode_path = value.into(),
-            "vega-proxy" => settings.vega_proxy = value.into(),
+            "lyra-proxy" | "vega-proxy" => settings.lyra_proxy = value.into(),
             "devin-proxy" => settings.devin_proxy = value.into(),
             "codex-proxy" => settings.codex_proxy = value.into(),
             "codebuddy-proxy" => settings.codebuddy_proxy = value.into(),
             "claude-proxy" => settings.claudecode_proxy = value.into(),
             "cursor-proxy" => settings.cursor_proxy = value.into(),
             "opencode-proxy" => settings.opencode_proxy = value.into(),
-            "vega-enabled" => settings.vega_enabled = parse_bool(value)?,
+            "lyra-enabled" | "vega-enabled" => settings.lyra_enabled = parse_bool(value)?,
             "devin-enabled" => settings.devin_enabled = parse_bool(value)?,
             "codex-enabled" => settings.codex_enabled = parse_bool(value)?,
             "codebuddy-enabled" => settings.codebuddy_enabled = parse_bool(value)?,

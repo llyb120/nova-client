@@ -643,13 +643,6 @@ button {
   background: color-mix(in srgb, var(--blue) 13%, transparent);
 }
 
-.thread-agent.alkaid,
-.agent-badge.alkaid {
-  color: var(--cyan);
-  border-color: color-mix(in srgb, var(--cyan) 40%, transparent);
-  background: color-mix(in srgb, var(--cyan) 14%, transparent);
-}
-
 .thread-agent.lyra,
 .agent-badge.lyra {
   color: var(--tea);
@@ -1010,7 +1003,7 @@ button {
   color: var(--text-faint);
 }
 
-/* 会话世界线：Vega 已持有完整上下文，因此把每轮提示词变成可穿梭的时间刻度。 */
+/* 会话世界线：Lyra 已持有完整上下文，因此把每轮提示词变成可穿梭的时间刻度。 */
 .time-rail {
   position: relative;
   z-index: 3;

@@ -52,14 +52,6 @@ fn configured_cli_program(configured: &str, expected_names: &[&str], fallback: &
 
 fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
     match kind {
-        AgentKind::Alkaid => CliSpec {
-            kind: kind.clone(),
-            cli_name: "alkaid",
-            program: "node".into(),
-            version_args: vec!["--version".into()],
-            install_command: String::new(),
-            proxy: String::new(),
-        },
         AgentKind::Lyra => CliSpec {
             kind: kind.clone(),
             cli_name: "lyra",
@@ -279,10 +271,7 @@ pub fn install_command(kind: &AgentKind, settings: &Settings) -> String {
 }
 
 pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
-    if matches!(
-        kind,
-        AgentKind::Cursor | AgentKind::Alkaid | AgentKind::Lyra
-    ) {
+    if matches!(kind, AgentKind::Cursor | AgentKind::Lyra) {
         return true;
     }
     resolve_program_on_path(&spec_for(kind, settings).program).is_some()

@@ -192,7 +192,6 @@ export const [state, setState] = createStore<AppStore>({
   agent: null,
   settings: null,
   modelOptions: {
-    alkaid: null,
     lyra: null,
     devin: null,
     codex: null,
@@ -210,7 +209,6 @@ export const [state, setState] = createStore<AppStore>({
   updateStaging: false,
   updatePromptAt: 0,
   slashCommands: {
-    alkaid: [],
     lyra: [],
     devin: [],
     codex: [],
@@ -421,8 +419,8 @@ export function reasoningEffortChoices(
 }
 
 const modelOptionsLoading = new Set<AgentKind>();
-/** Vega 配置文件当前声明的默认模型；用于配置热更新时同步新会话页。 */
-export const [alkaidConfigDefaultModel, setAlkaidConfigDefaultModel] = createSignal("");
+/** Lyra 配置文件当前声明的默认模型；用于配置热更新时同步新会话页。 */
+export const [lyraConfigDefaultModel, setLyraConfigDefaultModel] = createSignal("");
 
 /** store 的对象赋值是浅合并，占位里的 pending 不会被后来的真实列表冲掉，必须显式复位。 */
 function setModelOptions(agentKind: AgentKind, opts: ModelOptions | null) {
@@ -438,7 +436,7 @@ export async function ensureModelOptions(agentKind: AgentKind) {
   try {
     const opts = await api.getModelOptions(agentKind);
     setModelOptions(agentKind, opts);
-    syncAlkaidConfigDefaultModel(agentKind, opts);
+    syncLyraConfigDefaultModel(agentKind, opts);
     // 选项就绪后回填友好名，供下次冷启动触发器使用
     const model = lastUsed.model(agentKind);
     const name = modelChoices(agentKind).find((c) => c.value === model)?.name;
@@ -452,7 +450,6 @@ export async function ensureModelOptions(agentKind: AgentKind) {
 
 /** 模型后端固定展示顺序 */
 export const ALL_AGENT_KINDS: AgentKind[] = [
-  "alkaid",
   "lyra",
   "devin",
   "codex",
@@ -465,8 +462,6 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
 /** 某后端在设置里是否启用。缺字段（老版本 settings）按启用处理（!== false）。 */
 function agentEnabled(s: Settings, k: AgentKind): boolean {
   switch (k) {
-    case "alkaid":
-      return s.vegaEnabled === true;
     case "lyra":
       return s.lyraEnabled !== false;
     case "devin":
@@ -1329,8 +1324,11 @@ export async function createThread(
 
 /** 记住最近一次选择的模型/模式，作为新会话默认值 */
 export const lastUsed = {
-  agentKind: (): AgentKind =>
-    (localStorage.getItem("fd:lastAgentKind") as AgentKind | null) ?? "devin",
+  agentKind: (): AgentKind => {
+    const raw = localStorage.getItem("fd:lastAgentKind") as AgentKind | null;
+    // Vega 已移除：旧的 alkaid 选择指向 Lyra。
+    return !raw || raw === ("alkaid" as AgentKind) ? "lyra" : raw;
+  },
   setAgentKind: (v: AgentKind) => localStorage.setItem("fd:lastAgentKind", v),
   model: (agentKind: AgentKind = "devin") => {
     if (agentKind !== lastUsed.agentKind()) return "";
@@ -1379,22 +1377,22 @@ export const lastUsed = {
     localStorage.setItem(`fd:${agentKind}:lastReasoningEffort`, v),
 };
 
-function syncAlkaidConfigDefaultModel(agentKind: AgentKind, options: ModelOptions | null) {
-  if (agentKind !== "alkaid" || !options || options.pending) return;
+function syncLyraConfigDefaultModel(agentKind: AgentKind, options: ModelOptions | null) {
+  if (agentKind !== "lyra" || !options || options.pending) return;
   const configured = options.configOptions
     ?.find((option) => option.id === "model")
     ?.currentValue?.trim();
   if (!configured) return;
 
-  const previous = alkaidConfigDefaultModel();
-  if (previous && previous !== configured && lastUsed.agentKind() === "alkaid") {
-    const remembered = lastUsed.model("alkaid");
+  const previous = lyraConfigDefaultModel();
+  if (previous && previous !== configured && lastUsed.agentKind() === "lyra") {
+    const remembered = lastUsed.model("lyra");
     if (!remembered || remembered === previous) {
-      const choice = modelChoices("alkaid").find((item) => item.value === configured);
-      lastUsed.setModel("alkaid", configured, choice?.name);
+      const choice = modelChoices("lyra").find((item) => item.value === configured);
+      lastUsed.setModel("lyra", configured, choice?.name);
     }
   }
-  setAlkaidConfigDefaultModel(configured);
+  setLyraConfigDefaultModel(configured);
 }
 
 export async function setThreadModel(model: string) {
@@ -1688,7 +1686,7 @@ async function tryBuiltinPrompt(
     const goal = builtInInput.replace(/^\/setup(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /setup 后输入要接入的模型，例如 /setup qwen3.8");
     // /setup 由 agent 修改本地 config.jsonc；本轮结束后复用设置页的刷新机制，
-    // 让 Vega 立刻重读配置并刷新模型列表，而不要求用户手动点「刷新配置」。
+    // 让 Lyra 立刻重读配置并刷新模型列表，而不要求用户手动点「刷新配置」。
     pendingSetupConfigRefresh.add(threadId);
     try {
       await deliverPrompt(threadId, buildIntegrateModelPrompt(goal), images);
@@ -1848,7 +1846,7 @@ type FireRelayStep = {
 };
 
 const fireRelaySteps = new Map<string, FireRelayStep>();
-// 已发送 /setup、等待该轮结束后重载 Vega 本地配置的会话。
+// 已发送 /setup、等待该轮结束后重载 Lyra 本地配置的会话。
 const pendingSetupConfigRefresh = new Set<string>();
 // 中断不丢弃 Fire 上下文。用户在阶段再次发言时可重新挂回自动验收流程，
 // 同时避免网络错误把一次尚未完成的响应误当成最终结论送去判断。
@@ -2628,8 +2626,8 @@ export async function initStore() {
       liveUsageByThread.delete(threadId);
       if (threadId === state.currentId) setState("liveUsage", null);
       if (pendingSetupConfigRefresh.delete(threadId)) {
-        void api.refreshAlkaidConfig().catch((error) =>
-          console.error("Refresh Vega config after /setup failed", error),
+        void api.refreshLyraConfig().catch((error) =>
+          console.error("Refresh Lyra config after /setup failed", error),
         );
       }
       if (fireRelaySteps.has(e.payload.threadId)) {
@@ -2698,13 +2696,13 @@ export async function initStore() {
     const payload = e.payload;
     if ("options" in payload && "agentKind" in payload) {
       setModelOptions(payload.agentKind, payload.options);
-      syncAlkaidConfigDefaultModel(payload.agentKind, payload.options);
+      syncLyraConfigDefaultModel(payload.agentKind, payload.options);
       const model = lastUsed.model(payload.agentKind);
       const name = modelChoices(payload.agentKind).find((c) => c.value === model)?.name;
       if (model && name) lastUsed.setModelName(payload.agentKind, name);
     } else {
       setModelOptions("devin", payload as ModelOptions);
-      syncAlkaidConfigDefaultModel("devin", payload as ModelOptions);
+      syncLyraConfigDefaultModel("devin", payload as ModelOptions);
     }
   });
 

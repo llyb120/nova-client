@@ -113,7 +113,7 @@ function analyzeThread(d) {
         }
       }
       call.targets = [...after].filter((f) => !before.has(f));
-      // 遥测兜底：alkaid 旧会话只有 content 没有 rawOutput；两者都取
+      // 遥测兜底：旧会话只有 content 没有 rawOutput；两者都取
       const outText = [collectStrings(call.rawOutput).join("\n"), collectStrings(call.content).join("\n")].join("\n");
       call.outLen = outText.length;
       call.outFiles = filesInOutput(outText);

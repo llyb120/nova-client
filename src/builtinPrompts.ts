@@ -38,11 +38,11 @@ ${goal}`;
 }
 
 /**
- * 展开 `/setup <目标>`：指导 agent 把一个模型 / provider 接入 Vega（alkaid 后端）。
+ * 展开 `/setup <目标>`：指导 agent 把一个模型 / provider 接入 Lyra。
  * 提示词内嵌 ~/.nova/alkaid/config.jsonc 的真实结构与约束，agent 照此编辑即可。
  */
 export function buildIntegrateModelPrompt(goal: string): string {
-  return `请把模型「${goal}」接入 Vega（alkaid 后端）。
+  return `请把模型「${goal}」接入 Lyra。
 
 ## 目标配置文件
 ~/.nova/alkaid/config.jsonc —— OpenCode 风格的 JSONC，允许注释与尾逗号（加载器会自动剥离）。
@@ -70,10 +70,10 @@ export function buildIntegrateModelPrompt(goal: string): string {
    - 常见示例：DashScope（通义千问，OpenAI 兼容）baseURL 为 https://dashscope.aliyuncs.com/compatible-mode/v1。
 3. 在 provider 下新增或更新一个 provider 块；如需设为默认，把顶层 model 更新为 \`<providerId>/<modelId>\`。
 4. apiKey 直接明文写入配置文件即可。
-5. 完成后告诉我：本次 /setup 轮次结束后 Nova 会自动重载 Vega 配置并刷新模型列表，无需手动重启；如果没有看到新模型，再提示我在设置·模型后端中点击「刷新配置」。
+5. 完成后告诉我：本次 /setup 轮次结束后 Nova 会自动重载 Lyra 配置并刷新模型列表，无需手动重启；如果没有看到新模型，再提示我在设置·模型后端中点击「刷新配置」。
 
 ## 验证
-改动后若当前工作区就是 Nova 仓库，可冒烟测试：\`npm run alkaid -- --prompt "请只回复 Vega OK"\`；否则提示我等待本次 setup 完成后确认新模型出现在模型列表中。`;
+改动后若当前工作区就是 Nova 仓库，可冒烟测试：\`cargo run --manifest-path src-tauri/Cargo.toml -- lyra\` 启动调试会话；否则提示我等待本次 setup 完成后确认新模型出现在模型列表中。`;
 }
 
 /**

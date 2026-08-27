@@ -520,7 +520,7 @@ export function ChatView() {
     }
     return { total, read, output, cacheRead, cacheWrite };
   });
-  // 本轮进行中的实时用量（Vega 流式上报；预览世界线时不混入当前轮）。
+  // 本轮进行中的实时用量（Lyra 流式上报；预览世界线时不混入当前轮）。
   const liveUsage = () => (previewItems() ? null : state.liveUsage);
   const totalTokens = () => tokenStats().total + (liveUsage()?.totalTokens ?? 0);
   const totalTokensTitle = () => {

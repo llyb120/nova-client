@@ -5,7 +5,7 @@
 
 use crate::acp::AcpManager;
 use crate::opencode_sdk::OpenCodeSdkManager;
-use crate::sdk_adapters::{AlkaidAdapter, ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter};
+use crate::sdk_adapters::{ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter};
 use crate::sdk_runtime::SdkManager;
 use crate::threads::AgentKind;
 use crate::AppState;
@@ -211,18 +211,17 @@ pub fn collect_credentials(
     app: &AppHandle,
     agent_kind: AgentKind,
     model: &str,
-    alkaid_config: Option<&str>,
+    lyra_config: Option<&str>,
 ) -> Result<CredentialBundle, String> {
     let mut files = Vec::new();
     let mut env = HashMap::new();
     match &agent_kind {
-        AgentKind::Alkaid | AgentKind::Lyra => {
-            // 出借方已通过 bridge 导出合并后的生效配置（含解析后的密钥），直接打包。
-            // Lyra 与 Vega 共用同一份配置文件。
-            let config = alkaid_config
+        AgentKind::Lyra => {
+            // 出借方已导出合并后的生效配置（含解析后的密钥），直接打包。
+            let config = lyra_config
                 .map(str::trim)
                 .filter(|config| !config.is_empty())
-                .ok_or("Vega 凭证导出结果缺失")?;
+                .ok_or("Lyra 凭证导出结果缺失")?;
             files.push(CredentialFile {
                 path: "alkaid/config.jsonc".into(),
                 data: base64::engine::general_purpose::STANDARD.encode(config.as_bytes()),
@@ -380,9 +379,6 @@ pub fn materialize_runtime(
     )?;
     stage_local_skills(&app, expected_kind, &launch_env)?;
     let manager = match expected_kind {
-        AgentKind::Alkaid => {
-            BorrowedManager::Sdk(SdkManager::new_with_env(app, AlkaidAdapter, launch_env))
-        }
         AgentKind::Lyra => {
             BorrowedManager::Sdk(SdkManager::new_with_env(app, LyraAdapter, launch_env))
         }
@@ -420,8 +416,8 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
     let mut env = HashMap::new();
     let as_string = |path: PathBuf| path.to_string_lossy().to_string();
     match kind {
-        AgentKind::Alkaid | AgentKind::Lyra => {
-            // bridge 从 NOVA_DATA_DIR/alkaid/config.jsonc 读配置，指向隔离根目录即可
+        AgentKind::Lyra => {
+            // 进程内运行时从 NOVA_DATA_DIR/alkaid/config.jsonc 读配置，指向隔离根目录即可
             env.insert("NOVA_DATA_DIR".into(), as_string(root.to_path_buf()));
         }
         AgentKind::Devin => {
@@ -505,7 +501,7 @@ fn stage_local_skills(
     env: &HashMap<String, String>,
 ) -> Result<(), String> {
     let root = match kind {
-        AgentKind::Alkaid | AgentKind::Lyra => env
+        AgentKind::Lyra => env
             .get("NOVA_DATA_DIR")
             .map(PathBuf::from)
             .map(|path| path.join("alkaid").join("skills")),
@@ -564,7 +560,7 @@ pub fn isolate_borrowed_command(command: &mut Command) {
 fn credential_path_allowed(kind: &AgentKind, raw: &str) -> bool {
     let path = raw.replace('\\', "/");
     match kind {
-        AgentKind::Alkaid | AgentKind::Lyra => path == "alkaid/config.jsonc",
+        AgentKind::Lyra => path == "alkaid/config.jsonc",
         AgentKind::Devin => path == "appdata/devin/credentials.toml",
         AgentKind::Codex | AgentKind::CodexPlus => path == "codex-home/auth.json",
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => path
@@ -818,22 +814,22 @@ mod tests {
     }
 
     #[test]
-    fn alkaid_launch_env_points_nova_data_dir_to_isolated_root() {
+    fn lyra_launch_env_points_nova_data_dir_to_isolated_root() {
         let root = std::env::temp_dir().join(format!(
-            "nova-alkaid-launch-env-test-{}",
+            "nova-lyra-launch-env-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let env = launch_env(&AgentKind::Alkaid, &root).unwrap();
+        let env = launch_env(&AgentKind::Lyra, &root).unwrap();
         assert_eq!(
             env.get("NOVA_DATA_DIR"),
             Some(&root.to_string_lossy().to_string())
         );
         assert!(credential_path_allowed(
-            &AgentKind::Alkaid,
+            &AgentKind::Lyra,
             "alkaid/config.jsonc"
         ));
         assert!(!credential_path_allowed(
-            &AgentKind::Alkaid,
+            &AgentKind::Lyra,
             "alkaid/sessions/a.json"
         ));
     }

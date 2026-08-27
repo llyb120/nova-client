@@ -87,12 +87,12 @@ function mCtx() {
   return _mCtx;
 }
 const _mCache = new Map<string, number>();
-function measure(text: string, fs: number, ff: string, fw = "400"): number {
-  const key = `${fw}|${fs}|${ff}|${text}`;
+function measure(text: string, fs: number, ff: string, fw = "400", style = "normal"): number {
+  const key = `${style}|${fw}|${fs}|${ff}|${text}`;
   let w = _mCache.get(key);
   if (w != null) return w;
   const ctx = mCtx();
-  ctx.font = `${fw} ${fs}px ${ff}`;
+  ctx.font = `${style} ${fw} ${fs}px ${ff}`;
   w = ctx.measureText(text).width;
   // 大会话唯一字符串远超旧上限 8192，整表清空会让热点全部重测；提高上限并只淘汰最旧的一半
   if (_mCache.size > 32768) {
@@ -349,7 +349,7 @@ function wrapStyledTextIndexed(
         if (next.bold !== style.bold || next.italic !== style.italic || next.code !== style.code || next.link !== style.link) break;
         end++;
       }
-      width += measure(line.slice(start, end), style.code ? 12.5 : fs, style.code ? mono : ff, style.bold ? "bold" : baseFw);
+      width += measure(line.slice(start, end), style.code ? 12.5 : fs, style.code ? mono : ff, style.bold ? "bold" : baseFw, style.italic ? "italic" : "normal");
       if (style.code) width += 12;
       start = end;
     }
@@ -2424,10 +2424,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const segFw = cs.bold ? "bold" : baseFw;
           const segFs = cs.code ? 12.5 : fs;
           const segFf = cs.code ? pal.mono : ff;
-          const rw = measure(run, segFs, segFf, segFw);
+          const segStyle = cs.italic ? "italic" : "normal";
+          const rw = measure(run, segFs, segFf, segFw, segStyle);
           const codePad = cs.code ? 6 : 0;
           for (let c = 0; c < run.length; c++) {
-            charX[ri + c] = cx + codePad + measure(run.slice(0, c), segFs, segFf, segFw);
+            charX[ri + c] = cx + codePad + measure(run.slice(0, c), segFs, segFf, segFw, segStyle);
           }
           cx += rw + codePad * 2;
           ri = runEnd;
@@ -2466,7 +2467,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         const segFs = cs.code ? 12.5 : fs;
         const segFf = cs.code ? pal.mono : ff;
         const segStyle = cs.italic ? "italic" : "normal";
-        const rw = measure(run, segFs, segFf, segFw);
+        const rw = measure(run, segFs, segFf, segFw, segStyle);
         const codePad = cs.code ? 6 : 0;
 
         if (cs.code) {

@@ -170,7 +170,7 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     match model.thinking_format.as_deref() {
         Some("deepseek") | Some("zai") => {
             body["thinking"] = json!({ "type": if enabled { "enabled" } else { "disabled" } });
-            // 与 Vega 对齐：deepseek 等在 thinking.enabled 之外同时发送 reasoning_effort（如 max）。
+            // deepseek 等在 thinking.enabled 之外同时发送 reasoning_effort（如 max）。
             if enabled && model.supports_reasoning_effort {
                 if let Some(level) = level {
                     body["reasoning_effort"] = json!(level);
@@ -348,7 +348,7 @@ fn responses_body(
         body["tools"] = Value::Array(tool_defs);
     }
     if model.reasoning && level != Some("off") {
-        // 与 Vega/PI 对齐：OpenAI Responses 只有显式请求 summary 才会流式返回
+        // OpenAI Responses 只有显式请求 summary 才会流式返回
         // response.reasoning_summary_text.delta；仅发送 effort 会有推理开销但前端无内容可展示。
         let mut reasoning = Map::new();
         reasoning.insert("summary".into(), json!("auto"));
@@ -431,7 +431,7 @@ async fn post_stream(
     }
     if model.session_affinity_headers {
         if let Some(session) = session_id {
-            // 与 Vega(PI) 对齐：openrouter 只发 x-session-id；其余发 session_id（openai 格式）
+            // openrouter 只发 x-session-id；其余发 session_id（openai 格式）
             // + x-client-request-id + x-session-affinity，提高代理层会话亲和/前缀缓存命中。
             if model.session_affinity_format == "openrouter" {
                 request = request.header("x-session-id", session);
@@ -492,7 +492,7 @@ async fn read_sse(
             if line.ends_with('\r') {
                 line.pop();
             }
-            let Some(data) = crate::alkaid_complete::sse_data_payload(&line) else {
+            let Some(data) = crate::lyra_complete::sse_data_payload(&line) else {
                 continue;
             };
             if data == "[DONE]" {
@@ -637,7 +637,7 @@ async fn stream_completions(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
-    let url = crate::alkaid_complete::join_url(&model.base_url, "chat/completions");
+    let url = crate::lyra_complete::join_url(&model.base_url, "chat/completions");
     let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await?;
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
@@ -766,7 +766,7 @@ async fn stream_responses(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
-    let url = crate::alkaid_complete::join_url(&model.base_url, "responses");
+    let url = crate::lyra_complete::join_url(&model.base_url, "responses");
     let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await?;
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
@@ -1523,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_payload_requests_reasoning_summary_like_vega() {
+    fn responses_payload_requests_reasoning_summary() {
         let model = test_model("openai-responses");
         let body = responses_body(
             &model,

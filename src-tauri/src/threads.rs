@@ -47,10 +47,9 @@ pub fn session_cleanup_is_expired(timestamp: i64, now: i64, hours: u32) -> bool 
     elapsed_ms > timeout_ms
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
-    Alkaid,
     Devin,
     Codex,
     CodexPlus,
@@ -69,10 +68,17 @@ impl Default for AgentKind {
     }
 }
 
+/// 反序列化走 from_str，从而兼容历史数据里的 "alkaid"（一律映射为 Lyra）。
+impl<'de> Deserialize<'de> for AgentKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        AgentKind::from_str(&raw).ok_or_else(|| serde::de::Error::custom(format!("未知后端：{raw}")))
+    }
+}
+
 impl AgentKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            AgentKind::Alkaid => "alkaid",
             AgentKind::Devin => "devin",
             AgentKind::Codex => "codex",
             AgentKind::CodexPlus => "codexplus",
@@ -89,7 +95,8 @@ impl AgentKind {
     /// 从字符串解析后端标识（大小写不敏感）；无法识别返回 None。
     pub fn from_str(s: &str) -> Option<AgentKind> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "alkaid" => Some(AgentKind::Alkaid),
+            // Vega 已移除：旧的 alkaid 标识一律映射到 Lyra。
+            "alkaid" => Some(AgentKind::Lyra),
             "devin" => Some(AgentKind::Devin),
             "codex" => Some(AgentKind::Codex),
             "codexplus" => Some(AgentKind::CodexPlus),
@@ -107,7 +114,6 @@ impl AgentKind {
     /// 展示用名称（注入接力上下文 / 系统提示用）
     pub fn label(&self) -> &'static str {
         match self {
-            AgentKind::Alkaid => "Vega",
             AgentKind::Devin => "Devin",
             AgentKind::Codex => "Codex",
             AgentKind::CodexPlus => "Codex",
@@ -1715,7 +1721,7 @@ mod tests {
         let data_dir = temp_thread_store_dir();
         let mut first = Thread::new(
             "/tmp/project-a".into(),
-            AgentKind::Alkaid,
+            AgentKind::Lyra,
             None,
             None,
             None,
@@ -1765,7 +1771,7 @@ mod tests {
         let mut store = ThreadStore::load(data_dir.clone());
         let mut first = Thread::new(
             "/tmp/project-a".into(),
-            AgentKind::Alkaid,
+            AgentKind::Lyra,
             None,
             None,
             None,
@@ -1816,7 +1822,7 @@ mod tests {
         let mut store = ThreadStore::load(data_dir.clone());
         let first = Thread::new(
             "/tmp/project-a".into(),
-            AgentKind::Alkaid,
+            AgentKind::Lyra,
             None,
             None,
             None,

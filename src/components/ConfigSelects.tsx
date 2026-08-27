@@ -248,7 +248,7 @@ export function ModelPicker(props: {
   const modelValue = createMemo(() => {
     const peerToken = props.quotaPeerToken;
     if (peerToken) return encodeQuotaModelValue(peerToken, props.agentKind, effectiveModel());
-    // allowDefault 时空值代表「默认/关闭」，保持 ""，避免触发器显示编码残片（如 "alkaid:"）
+    // allowDefault 时空值代表「默认/关闭」，保持 ""，避免触发器显示编码残片（如 "lyra:"）
     if (props.allowDefault && !effectiveModel()) return "";
     return merged() ? encodeModelValue(props.agentKind, effectiveModel()) : effectiveModel();
   });

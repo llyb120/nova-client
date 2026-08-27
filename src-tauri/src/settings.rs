@@ -206,15 +206,16 @@ pub struct Settings {
     pub codex_args: String,
     /// Codex 代理地址（空 = 不覆盖环境变量）
     pub codex_proxy: String,
-    /// Vega provider 代理地址（空 = 不覆盖环境变量）
-    pub vega_proxy: String,
+    /// Lyra provider 代理地址（空 = 不覆盖环境变量）
+    #[serde(alias = "vegaProxy")]
+    pub lyra_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
-    /// PowerShell 输出按 UTF-8 捕获（Vega 与 Lyra 的 bash 工具注入一次性前缀，把控制台
+    /// PowerShell 输出按 UTF-8 捕获（Lyra 的 bash 工具注入一次性前缀，把控制台
     /// 输出切到 UTF-8），避免 GBK(cp936) 与 UTF-8 解码错配产生乱码。默认开启。
     #[serde(default = "default_powershell_utf8")]
     pub powershell_utf8_enabled: bool,
-    /// 是否允许 Lyra/Vega 自动切换当前项目和工具工作目录；默认开启。
+    /// 是否允许 Lyra 自动切换当前项目和工具工作目录；默认开启。
     pub auto_change_project_enabled: bool,
     /// ponytail 极简模式：在 system prompt 注入「最小实现/最少改动」规则。默认开启。
     #[serde(default = "default_true")]
@@ -257,8 +258,9 @@ pub struct Settings {
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
+    /// 旧 Vega 开关，仅兼容反序列化（迁移到 lyra_enabled 后忽略）。
     pub vega_enabled: bool,
-    /// Lyra 原生 agent（与 Vega 共用配置）。
+    /// Lyra Rust 原生 agent（进程内运行，不经 Node bridge）。
     pub lyra_enabled: bool,
     pub codex_enabled: bool,
     /// 旧版独立 SDK 后端开关，仅用于兼容反序列化。
@@ -326,14 +328,14 @@ impl Default for Settings {
             codex_path: "codex".into(),
             codex_args: "app-server --stdio".into(),
             codex_proxy: String::new(),
-            vega_proxy: String::new(),
+            lyra_proxy: String::new(),
             windows_shell_shim_enabled: false,
             powershell_utf8_enabled: true,
             auto_change_project_enabled: true,
             ponytail_enabled: true,
             checkpoint_enabled: false,
             default_mode: String::new(),
-            lightweight_model_agent: "alkaid".into(),
+            lightweight_model_agent: "lyra".into(),
             lightweight_model: String::new(),
             stage_models: Vec::new(),
             editor: "code".into(),
@@ -380,7 +382,7 @@ impl Default for Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::Settings;
+    use super::{SessionShortcut, Settings, StageModelTarget};
     use std::fs;
 
     #[test]
@@ -520,9 +522,39 @@ mod tests {
     }
 
     #[test]
-    fn legacy_alkaid_enabled_does_not_enable_vega() {
-        let settings: Settings = serde_json::from_str(r#"{"alkaidEnabled":true}"#).unwrap();
+    fn vega_config_migrates_to_lyra() {
+        let mut settings = Settings::default();
+        settings.vega_enabled = true;
+        settings.lyra_enabled = false;
+        settings.lightweight_model_agent = "alkaid".into();
+        settings.experience_training_agent = "alkaid".into();
+        settings.stage_models.push(StageModelTarget {
+            agent_kind: "alkaid".into(),
+            model: "p/m".into(),
+        });
+        settings.quota_shared_models = vec!["alkaid:p/m".into()];
+        settings.model_favorites = vec!["alkaid:p/m".into()];
+        settings.session_shortcuts.push(SessionShortcut {
+            id: "1".into(),
+            keys: "Ctrl+1".into(),
+            action: "selectModel".into(),
+            target: "alkaid:p/m".into(),
+        });
+        settings.migrate_legacy_vega();
+        assert!(settings.lyra_enabled);
         assert!(!settings.vega_enabled);
+        assert_eq!(settings.lightweight_model_agent, "lyra");
+        assert_eq!(settings.experience_training_agent, "lyra");
+        assert_eq!(settings.stage_models[0].agent_kind, "lyra");
+        assert_eq!(settings.quota_shared_models[0], "lyra:p/m");
+        assert_eq!(settings.model_favorites[0], "lyra:p/m");
+        assert_eq!(settings.session_shortcuts[0].target, "lyra:p/m");
+    }
+
+    #[test]
+    fn legacy_vega_switch_enables_lyra() {
+        let settings: Settings = serde_json::from_str(r#"{"vegaEnabled":true}"#).unwrap();
+        assert!(settings.vega_enabled);
     }
 
     #[test]
@@ -551,7 +583,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
         let mut settings = Settings::default();
         settings.quota_shared_models = vec![
-            "alkaid:provider/model".into(),
+            "lyra:provider/model".into(),
             "devin:swe-1.6".into(),
             "codex:gpt-5.6".into(),
             "codebuddy:claude-sonnet".into(),
@@ -628,7 +660,52 @@ mod tests {
     }
 }
 
+/// `<agentKind>:<modelId>` / roam/quota 编码键中，值为 alkaid 的段改写为 lyra；其余不变。
+fn migrate_alkaid_key(key: &mut String) {
+    if key.split(':').any(|seg| seg == "alkaid") {
+        *key = key
+            .split(':')
+            .map(|seg| if seg == "alkaid" { "lyra" } else { seg })
+            .collect::<Vec<_>>()
+            .join(":");
+    }
+}
+
+fn migrate_alkaid_keys(keys: &mut [String]) {
+    for key in keys.iter_mut() {
+        migrate_alkaid_key(key);
+    }
+}
+
+fn migrate_alkaid_target(target: &mut String) {
+    migrate_alkaid_key(target);
+}
+
 impl Settings {
+    /// Vega 已移除：旧的开关与 alkaid 键统一迁移到 Lyra。
+    fn migrate_legacy_vega(&mut self) {
+        if self.vega_enabled {
+            self.lyra_enabled = true;
+            self.vega_enabled = false;
+        }
+        if self.lightweight_model_agent.trim() == "alkaid" {
+            self.lightweight_model_agent = "lyra".into();
+        }
+        if self.experience_training_agent.trim() == "alkaid" {
+            self.experience_training_agent = "lyra".into();
+        }
+        for target in &mut self.stage_models {
+            if target.agent_kind.trim() == "alkaid" {
+                target.agent_kind = "lyra".into();
+            }
+        }
+        migrate_alkaid_keys(&mut self.quota_shared_models);
+        migrate_alkaid_keys(&mut self.model_favorites);
+        for shortcut in &mut self.session_shortcuts {
+            migrate_alkaid_target(&mut shortcut.target);
+        }
+    }
+
     pub fn load(dir: &PathBuf) -> Self {
         let raw = fs::read_to_string(dir.join("settings.json")).ok();
         let raw_value = raw
@@ -677,6 +754,8 @@ impl Settings {
         settings.claudecode_integration = "sdk".into();
         settings.cursor_integration = "sdk".into();
         settings.opencode_integration = "sdk".into();
+        // Vega 已移除：旧的开关与 alkaid 键统一迁移到 Lyra。
+        settings.migrate_legacy_vega();
         if settings.cursor_context_mode != "super" {
             settings.cursor_context_mode = "default".into();
         }

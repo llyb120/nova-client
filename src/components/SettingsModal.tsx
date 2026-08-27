@@ -250,7 +250,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [opencodePath, setOpencodePath] = createSignal(s?.opencodePath ?? "opencode");
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
-  const [vegaProxy, setVegaProxy] = createSignal(s?.vegaProxy ?? "");
+  const [lyraProxy, setLyraProxy] = createSignal(s?.lyraProxy ?? "");
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
@@ -290,7 +290,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   );
   const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
   const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
-  const [vegaEnabled, setVegaEnabled] = createSignal(s?.vegaEnabled === true);
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
   const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
@@ -299,7 +298,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [opencodeEnabled, setOpencodeEnabled] = createSignal(s?.opencodeEnabled !== false);
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
   const [lightweightAgent, setLightweightAgent] = createSignal<AgentKind>(
-    (s?.lightweightModelAgent as AgentKind) || "alkaid",
+    (s?.lightweightModelAgent as AgentKind) || "lyra",
   );
   const [lightweightModel, setLightweightModel] = createSignal(s?.lightweightModel ?? "");
   const [stageModels, setStageModels] = createSignal<Settings["stageModels"]>(
@@ -369,20 +368,20 @@ export function SettingsModal(props: { onClose: () => void }) {
     }
   };
 
-  const [vegaRefreshing, setVegaRefreshing] = createSignal(false);
-  const [vegaRefreshMsg, setVegaRefreshMsg] = createSignal("");
+  const [lyraRefreshing, setLyraRefreshing] = createSignal(false);
+  const [lyraRefreshMsg, setLyraRefreshMsg] = createSignal("");
 
-  const refreshVegaConfig = async () => {
-    setVegaRefreshing(true);
-    setVegaRefreshMsg("");
+  const refreshLyraConfig = async () => {
+    setLyraRefreshing(true);
+    setLyraRefreshMsg("");
     try {
-      await api.refreshAlkaidConfig();
-      setVegaRefreshMsg("已重载配置，模型列表刷新中…");
-      setTimeout(() => setVegaRefreshMsg(""), 4000);
+      await api.refreshLyraConfig();
+      setLyraRefreshMsg("已重载配置，模型列表刷新中…");
+      setTimeout(() => setLyraRefreshMsg(""), 4000);
     } catch (e) {
-      setVegaRefreshMsg(`刷新失败：${String(e)}`);
+      setLyraRefreshMsg(`刷新失败：${String(e)}`);
     } finally {
-      setVegaRefreshing(false);
+      setLyraRefreshing(false);
     }
   };
 
@@ -419,7 +418,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const enabledCount = () =>
     [
       devinEnabled(),
-      vegaEnabled(),
       lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
@@ -430,7 +428,6 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const quotaShareKinds = createMemo<AgentKind[]>(() => {
     const kinds: AgentKind[] = [];
-    if (vegaEnabled()) kinds.push("alkaid");
     if (lyraEnabled()) kinds.push("lyra");
     if (devinEnabled()) kinds.push("devin");
     if (codexEnabled()) kinds.push("codex");
@@ -700,7 +697,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     opencodePath: opencodePath().trim() || "opencode",
     codexPath: codexPath().trim() || "codex",
     codexProxy: codexProxy().trim(),
-    vegaProxy: vegaProxy().trim(),
+    lyraProxy: lyraProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
     powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
@@ -736,7 +733,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     modelFavorites: state.settings?.modelFavorites ?? [],
     sessionShortcuts: draftSessionShortcuts(),
     devinEnabled: devinEnabled(),
-    vegaEnabled: vegaEnabled(),
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
@@ -1284,7 +1280,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                                         when={item().action === "selectProject"}
                                         fallback={
                                           <ModelPicker
-                                            agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "alkaid")}
+                                            agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "lyra")}
                                             agentKinds={enabledAgentKinds()}
                                             model={modelTarget()?.model ?? ""}
                                             sharedModels={shortcutSharedModels()}
@@ -1397,7 +1393,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                         /stage{stageModels().length + 1}
                       </span>
                       <ModelPicker
-                        agentKind={draftStageKind() ?? (enabledAgentKinds()[0] ?? "alkaid")}
+                        agentKind={draftStageKind() ?? (enabledAgentKinds()[0] ?? "lyra")}
                         agentKinds={enabledAgentKinds()}
                         model={draftStageModel()}
                         allowDefault
@@ -1518,7 +1514,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  默认开启。关闭后 Lyra 和 Vega 不再提供切换工作目录/项目的工具，也不会注入对应提示词。
+                  默认开启。关闭后 Lyra 不再提���切换工作目录/项目的工具，也不会注入对应提示词。
                 </span>
               </div>
               <div class="field">
@@ -1546,7 +1542,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  默认开启。Windows 下 Vega 与 Lyra 的 bash 工具按 UTF-8 捕获 PowerShell 输出，修复中文等字符出现「?」或乱码的问题。保存后对新会话生效。
+                  默认开启。Windows 下 Lyra 的 bash 工具按 UTF-8 捕获 PowerShell 输出，修复中文等字符出现「?」或乱码的问题。保存后对新会话生效。
                 </span>
               </div>
             </section>
@@ -1620,41 +1616,8 @@ export function SettingsModal(props: { onClose: () => void }) {
 
             <div class="backend-card">
               <div class="backend-card-head">
-                <span class={`agent-badge alkaid`}>{agentLabel("alkaid")}</span>
-                <span class="fixed-integration">PI</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={vegaEnabled()}
-                    disabled={vegaEnabled() && enabledCount() === 1}
-                    onChange={(e) => setVegaEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <span class="field-hint">复用本机 Codex provider 凭据，支持并行文件工具、MCP 与 Skills。</span>
-              <ProxyField value={vegaProxy()} onInput={setVegaProxy} />
-              <div class="backend-quota-row">
-                <span class="field-label">本地配置</span>
-                <span class="field-hint">修改 ~/.nova/alkaid/config.jsonc 后点此按钮，立即重载模型列表、补全与预热配置。</span>
-                <Show when={vegaRefreshMsg()}>
-                  <span class="field-hint">{vegaRefreshMsg()}</span>
-                </Show>
-                <button
-                  type="button"
-                  class="link-btn backend-quota-refresh"
-                  disabled={vegaRefreshing()}
-                  onClick={() => void refreshVegaConfig()}
-                >
-                  {vegaRefreshing() ? "刷新中…" : "刷新配置"}
-                </button>
-              </div>
-            </div>
-
-            <div class="backend-card">
-              <div class="backend-card-head">
                 <span class={`agent-badge lyra`}>{agentLabel("lyra")}</span>
-                <span class="fixed-integration">原生</span>
+                <span class="fixed-integration">Rust</span>
                 <label class="backend-switch">
                   <input
                     type="checkbox"
@@ -1665,7 +1628,23 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <span class="field-hint">Rust 原生 agent，不经 Node bridge；与 Vega 共用模型配置与 Skills。</span>
+              <span class="field-hint">Rust 原生 agent，不经 Node bridge；复用本机模型 provider 配置与 Skills。</span>
+              <ProxyField value={lyraProxy()} onInput={setLyraProxy} />
+              <div class="backend-quota-row">
+                <span class="field-label">本地配置</span>
+                <span class="field-hint">修改 ~/.nova/alkaid/config.jsonc 后点此按钮，立即重载模型列表、补全与预热配置。</span>
+                <Show when={lyraRefreshMsg()}>
+                  <span class="field-hint">{lyraRefreshMsg()}</span>
+                </Show>
+                <button
+                  type="button"
+                  class="link-btn backend-quota-refresh"
+                  disabled={lyraRefreshing()}
+                  onClick={() => void refreshLyraConfig()}
+                >
+                  {lyraRefreshing() ? "刷新中…" : "刷新配置"}
+                </button>
+              </div>
             </div>
 
             <div class="backend-card">

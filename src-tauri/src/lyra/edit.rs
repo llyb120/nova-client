@@ -366,7 +366,7 @@ fn generate_diff(path: &str, old: &str, new: &str) -> (String, String, usize) {
     (display, patch, first_changed_line)
 }
 
-/// Lyra edit intentionally mirrors Vega's PI edit contract and behavior:
+/// Lyra edit mirrors the legacy PI edit contract and behavior:
 /// path + edits[{oldText,newText}], all matches against one original snapshot.
 pub fn edit(root: &Path, path: &str, edits: Value) -> Result<Value, String> {
     let edits: Vec<EditInput> =

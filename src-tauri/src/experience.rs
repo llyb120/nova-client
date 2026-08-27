@@ -1113,13 +1113,6 @@ async fn run_training_turn(
     {
         let state = app.state::<AppState>();
         match agent {
-            AgentKind::Alkaid => {
-                state
-                    .alkaid
-                    .clone()
-                    .run_prompt(thread_id.into(), prompt, Vec::new())
-                    .await
-            }
             AgentKind::Lyra => {
                 state
                     .lyra
@@ -1164,7 +1157,7 @@ async fn run_training_turn(
             }
             AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                 return Err(format!(
-                "{} 暂不支持经验训练，请选择 Vega、Lyra、Devin、Codex、CodeBuddy、Claude 或 Cursor",
+                "{} 暂不支持经验训练，请选择 Lyra、Devin、Codex、CodeBuddy、Claude 或 Cursor",
                 agent.label()
             ))
             }
