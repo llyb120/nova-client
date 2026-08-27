@@ -1049,7 +1049,7 @@ export async function respondRoamRequest(
   }
 }
 
-/** 本机目录执行，临时使用在线队友授权的后端额度。 */
+/** 本机目录执行，使用已同步的队友共享后端额度。 */
 export async function createQuotaThread(
   peer: Peer,
   cwd: string,

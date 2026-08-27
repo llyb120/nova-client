@@ -212,12 +212,15 @@ fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
     }
 }
 
-fn shared_quota_model_keys(shared_options: &Value) -> HashSet<String> {
-    let mut shared = HashSet::new();
+fn shared_quota_leases(peer: &str, shared_options: &Value) -> HashMap<QuotaLeaseKey, String> {
+    let mut leases = HashMap::new();
     let Some(backends) = shared_options.as_object() else {
-        return shared;
+        return leases;
     };
     for (kind, options) in backends {
+        let Some(kind) = AgentKind::from_str(kind) else {
+            continue;
+        };
         let model_options = options["configOptions"]
             .as_array()
             .and_then(|items| {
@@ -230,12 +233,15 @@ fn shared_quota_model_keys(shared_options: &Value) -> HashSet<String> {
             continue;
         };
         for model in model_options {
-            if let Some(value) = model["value"].as_str().filter(|value| !value.is_empty()) {
-                shared.insert(format!("{kind}:{value}"));
+            let Some(value) = model["value"].as_str().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            if let Ok(key) = QuotaLeaseKey::new(peer.to_string(), kind.clone(), value) {
+                leases.entry(key).or_insert_with(|| value.to_string());
             }
         }
     }
-    shared
+    leases
 }
 
 fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> bool {
@@ -616,17 +622,6 @@ impl RelayManager {
         let _ = self.app.emit(EV_RELAY_STATUS, self.status());
     }
 
-    fn clear_quota_leases(&self) {
-        self.quota_leases.lock().unwrap().clear();
-    }
-
-    fn invalidate_quota_leases_for_peer(&self, peer: &str) {
-        self.quota_leases
-            .lock()
-            .unwrap()
-            .retain(|key, _| key.peer != peer);
-    }
-
     fn retain_online_quota_leases(&self, _peers: &Value) {
         // 额度共享租约不应因提供方离线而失效：只要对方未撤销共享（sharedOptions 仍包含该模型），
         // 借用方应可持续使用已获取的凭证，直到收到明确的撤销通知（retain_shared_quota_leases）。
@@ -634,21 +629,11 @@ impl RelayManager {
     }
 
     fn retain_shared_quota_leases(&self, peer: &str, shared_options: &Value) {
-        let shared = shared_quota_model_keys(shared_options);
-        self.quota_leases.lock().unwrap().retain(|key, _| {
-            if key.peer != peer {
-                return true;
-            }
-            let prefix = format!("{}:", key.agent_kind.as_str());
-            shared.iter().any(|model| {
-                let Some(model) = model.strip_prefix(&prefix) else {
-                    return false;
-                };
-                key.auth_scope.is_empty()
-                    || model == key.auth_scope
-                    || model.starts_with(&format!("{}/", key.auth_scope))
-            })
-        });
+        let shared = shared_quota_leases(peer, shared_options);
+        self.quota_leases
+            .lock()
+            .unwrap()
+            .retain(|key, _| key.peer != peer || shared.contains_key(key));
     }
 
     fn set_connected(&self, on: bool) {
@@ -2663,7 +2648,7 @@ impl RelayManager {
         if env.from.is_empty() {
             return;
         }
-        self.invalidate_quota_leases_for_peer(&env.from);
+        // 等完整列表返回后再按凭证作用域清理；刷新失败不能误删仍有效的离线租约。
         self.spawn_send_now(env.from.clone(), "roaming.models_request", json!({}));
     }
 
@@ -2753,16 +2738,30 @@ impl RelayManager {
         });
     }
 
-    /// guest：收到 host 回传的模型列表，转发给前端按对端 token 缓存。
+    /// guest：收到 host 回传的模型列表，转发给前端按对端 token 缓存，
+    /// 并趁 host 在线预取共享凭证，使用户稍后选择模型时不依赖 host 仍在线。
     fn on_roaming_models(&self, env: &InEnvelope) {
-        self.retain_shared_quota_leases(&env.from, &env.data["sharedOptions"]);
+        let shared_options = &env.data["sharedOptions"];
+        let leases = shared_quota_leases(&env.from, shared_options);
+        self.retain_shared_quota_leases(&env.from, shared_options);
+        for (key, model) in leases {
+            if self.quota_lease_ready(&key) {
+                continue;
+            }
+            let relay = self.app.state::<AppState>().relay.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = relay.acquire_quota_lease(key, model, None).await {
+                    relay.log(format!("[relay] 共享模型凭证预取失败：{error}"));
+                }
+            });
+        }
         let _ = self.app.emit(
             EV_RELAY_PEER_MODELS,
             json!({
                 "peer": env.from,
                 "backends": env.data["backends"].clone(),
                 "options": env.data["options"].clone(),
-                "sharedOptions": env.data["sharedOptions"].clone(),
+                "sharedOptions": shared_options.clone(),
             }),
         );
     }
@@ -4796,22 +4795,41 @@ mod tests {
     }
 
     #[test]
-    fn shared_quota_model_keys_follow_peer_payload() {
-        let shared = shared_quota_model_keys(&json!({
-            "cursor": {
-                "configOptions": [{
-                    "id": "model",
-                    "options": [
-                        { "value": "cursor-small" },
-                        { "value": "cursor-large" }
-                    ]
-                }]
-            }
-        }));
+    fn shared_quota_leases_follow_peer_payload_and_auth_scope() {
+        let shared = shared_quota_leases(
+            "peer-a",
+            &json!({
+                "cursor": {
+                    "configOptions": [{
+                        "id": "model",
+                        "options": [
+                            { "value": "cursor-small" },
+                            { "value": "cursor-large" }
+                        ]
+                    }]
+                },
+                "opencode": {
+                    "configOptions": [{
+                        "id": "model",
+                        "options": [
+                            { "value": "anthropic/sonnet" },
+                            { "value": "openai/gpt-5" }
+                        ]
+                    }]
+                }
+            }),
+        );
 
-        assert!(shared.contains("cursor:cursor-small"));
-        assert!(shared.contains("cursor:cursor-large"));
-        assert!(!shared.contains("codex:cursor-small"));
+        assert_eq!(shared.len(), 3);
+        assert!(shared.contains_key(
+            &QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor, "cursor-small").unwrap()
+        ));
+        assert!(shared.contains_key(
+            &QuotaLeaseKey::new("peer-a".into(), AgentKind::OpenCode, "anthropic/sonnet").unwrap()
+        ));
+        assert!(!shared.contains_key(
+            &QuotaLeaseKey::new("peer-b".into(), AgentKind::Cursor, "cursor-small").unwrap()
+        ));
     }
 
     #[tokio::test]
