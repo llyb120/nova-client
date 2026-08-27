@@ -13,6 +13,10 @@ use crate::{dispatch_prompt, is_running, AgentKind, AppState, Item};
 const ANALYSIS_TIMEOUT_MS: u64 = 120_000;
 const PLAN_RUN_TIMEOUT_MS: u64 = 600_000;
 
+fn browser_session_dir() -> Result<String, String> {
+    crate::scratch_dir()
+}
+
 pub struct BrowserAgentState {
     /// 后台会话：threadId -> oneshot 等待者
     pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<String, String>>>>,
@@ -41,7 +45,6 @@ fn last_assistant_text(thread: &crate::Thread) -> Option<String> {
 async fn run_ephemeral_prompt(
     app: AppHandle,
     state: &State<'_, AppState>,
-    cwd: String,
     prompt: String,
     timeout_ms: u64,
     agent_kind: AgentKind,
@@ -52,7 +55,7 @@ async fn run_ephemeral_prompt(
     let thread = crate::create_thread(
         app.clone(),
         state.clone(),
-        cwd,
+        browser_session_dir()?,
         Some(agent_kind),
         model.filter(|value| !value.trim().is_empty()),
         None,
@@ -204,10 +207,11 @@ pub async fn analyze_screenshot(
         },
     );
 
+    // 双子座不绑定当前项目；保留 cwd 参数仅兼容现有前端命令协议。
+    let _ = cwd;
     run_ephemeral_prompt(
         app,
         &state,
-        cwd,
         prompt,
         ANALYSIS_TIMEOUT_MS,
         AgentKind::Lyra,
@@ -336,10 +340,11 @@ pub async fn run_plan_with_agent(
         record_dir = record_dir,
     );
 
+    // 双子座执行始终隔离在新的临时目录，不能继承当前项目。
+    let _ = cwd;
     run_ephemeral_prompt(
         app,
         &state,
-        cwd,
         prompt,
         PLAN_RUN_TIMEOUT_MS,
         agent_kind,
@@ -348,4 +353,19 @@ pub async fn run_plan_with_agent(
         ref_images,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::browser_session_dir;
+    use crate::SCRATCH_MARK;
+
+    #[test]
+    fn browser_session_directory_is_temporary_scratch() {
+        let cwd = browser_session_dir().unwrap();
+        let path = std::path::Path::new(&cwd);
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(cwd.contains(SCRATCH_MARK));
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
