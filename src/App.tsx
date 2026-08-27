@@ -2,7 +2,6 @@ import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
-import { CliOperationModal } from "./components/CliOperationModal";
 import { EvidenceChainView } from "./components/EvidenceChainView";
 import { HomeView } from "./components/HomeView";
 import BrowserView from "./components/BrowserView";
@@ -117,7 +116,6 @@ export default function App() {
       </Show>
       <RoamRequestModal />
       <UpdateModal show={showUpdate()} onClose={() => setShowUpdate(false)} />
-      <CliOperationModal />
       <SignatureSplash />
     </div>
   );

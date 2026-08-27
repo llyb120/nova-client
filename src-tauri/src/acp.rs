@@ -1378,9 +1378,14 @@ impl AcpManager {
             "--env".into(),
             format!("NOVA_CONTEXT_RETRIEVAL_MODE={retrieval_mode}"),
         ];
+        let activation_env = codebuddy_activation_env(&self.launch_env);
         #[cfg(windows)]
-        args.extend(["--env".into(), "CODEBUDDY_CODE_SHELL=powershell".into()]);
-        for (key, value) in &self.launch_env {
+        let activation_env = {
+            let mut env = activation_env;
+            env.insert("CODEBUDDY_CODE_SHELL".into(), "powershell".into());
+            env
+        };
+        for (key, value) in activation_env {
             args.extend(["--env".into(), format!("{key}={value}")]);
         }
         if let Some(proxy) = proxy {
@@ -1408,6 +1413,8 @@ impl AcpManager {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         let output = match timeout(Duration::from_secs(10), cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
@@ -2495,6 +2502,8 @@ impl AcpManager {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true);
+            #[cfg(windows)]
+            ping.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
             if timeout(Duration::from_secs(3), ping.status())
                 .await
                 .ok()
@@ -3237,18 +3246,21 @@ impl AcpManager {
             };
             guidance.push(nova_tools_prompt_guidance(context_tools, read_only));
         }
-        // Shell 解释器由 Devin 的执行层选择，且可能在同一 Windows 会话中切换。
-        // 每轮带上短契约，旧 session 也能立即纠正 Bash / PowerShell 混用。
-        let context_tools = self
-            .app
-            .state::<AppState>()
-            .settings
-            .lock()
-            .unwrap()
-            .context_tools_enabled();
+        // Devin 的 Windows shell 契约只随新 ACP session 的首条 prompt 注入；用户消息仍按原文落库和展示。
+        // CodeBuddy 保持原有逐轮 guidance，避免改变无关 agent 的行为。
         let runtime_guidance = match self.kind {
             AgentKind::CodeBuddy => codebuddy_runtime_guidance(),
-            _ => devin_runtime_guidance(context_tools),
+            AgentKind::Devin if include_runtime_guidance => {
+                let context_tools = self
+                    .app
+                    .state::<AppState>()
+                    .settings
+                    .lock()
+                    .unwrap()
+                    .context_tools_enabled();
+                devin_runtime_guidance(context_tools)
+            }
+            _ => None,
         };
         if let Some(runtime) = runtime_guidance {
             guidance.push(runtime);
@@ -3831,6 +3843,32 @@ fn resolve_sibling_program(configured_program: &str, sibling: &str) -> String {
     sibling.to_string()
 }
 
+/// `cbc-prewarm activate` 通过 `--env` 显式构造最终服务环境；普通本机会话必须把
+/// 当前进程继承的 CodeBuddy 配置一并传入，否则预热路径会表现为启动后环境变量消失。
+/// 额度借用保持隔离，只使用租约提供的 launch_env，禁止继承本机 CodeBuddy 凭据。
+fn merge_codebuddy_activation_env(
+    launch_env: &HashMap<String, String>,
+    inherited: impl IntoIterator<Item = (String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    let borrowed = launch_env.contains_key("NOVA_QUOTA_BORROWED");
+    let mut env = std::collections::BTreeMap::new();
+    if !borrowed {
+        env.extend(
+            inherited
+                .into_iter()
+                .filter(|(key, _)| key.to_ascii_uppercase().starts_with("CODEBUDDY_")),
+        );
+    }
+    env.extend(launch_env.clone());
+    env
+}
+
+fn codebuddy_activation_env(
+    launch_env: &HashMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    merge_codebuddy_activation_env(launch_env, std::env::vars())
+}
+
 /// 从 CodeBuddy `--serve` 的 stdout 行提取服务入口（官方文档：打印 "Endpoint  http://127.0.0.1:<port>"）。
 fn extract_codebuddy_endpoint(line: &str) -> Option<String> {
     let rest = line.strip_prefix("Endpoint")?.trim_start();
@@ -3843,9 +3881,35 @@ fn extract_codebuddy_endpoint(line: &str) -> Option<String> {
 mod codebuddy_http_tests {
     use super::{
         codebuddy_nova_tools_mcp_server_value, extract_codebuddy_endpoint, json_rpc_request_id,
-        thread_connection_key, SseDecoder,
+        merge_codebuddy_activation_env, thread_connection_key, SseDecoder,
     };
     use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn prewarm_activation_preserves_local_codebuddy_environment_but_isolates_borrowed_sessions() {
+        let inherited = [
+            ("CODEBUDDY_API_KEY".into(), "local-secret".into()),
+            ("OTHER_KEY".into(), "ignored".into()),
+        ];
+        let local = merge_codebuddy_activation_env(&HashMap::new(), inherited.clone());
+        assert_eq!(
+            local.get("CODEBUDDY_API_KEY").map(String::as_str),
+            Some("local-secret")
+        );
+        assert!(!local.contains_key("OTHER_KEY"));
+
+        let borrowed = HashMap::from([
+            ("NOVA_QUOTA_BORROWED".into(), "1".into()),
+            ("CODEBUDDY_CONFIG_DIR".into(), "isolated".into()),
+        ]);
+        let isolated = merge_codebuddy_activation_env(&borrowed, inherited);
+        assert!(!isolated.contains_key("CODEBUDDY_API_KEY"));
+        assert_eq!(
+            isolated.get("CODEBUDDY_CONFIG_DIR").map(String::as_str),
+            Some("isolated")
+        );
+    }
 
     #[test]
     fn only_client_requests_expect_a_post_stream_response() {
@@ -4376,11 +4440,13 @@ mod nova_tools_config_tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_devin_guidance_does_not_mix_powershell_with_default_bash() {
+    fn windows_devin_guidance_requires_powershell_5_1_syntax() {
         let guidance = super::devin_runtime_guidance(true).unwrap();
-        assert!(guidance.contains("default command interpreter may be `/usr/bin/bash`"));
-        assert!(guidance.contains("powershell.exe -NoProfile -NonInteractive -Command"));
-        assert!(guidance.contains("Do not mix Bash pipelines/operators with PowerShell cmdlets"));
+        assert!(guidance.contains("Windows PowerShell 5.1"));
+        assert!(guidance.contains("Use PowerShell syntax from the first command onward"));
+        assert!(guidance.contains("`$env:NAME`"));
+        assert!(guidance.contains("Do not emit Bash/POSIX syntax"));
+        assert!(guidance.contains("do not use `&&` or `||`"));
         assert!(!super::devin_runtime_guidance(false)
             .unwrap()
             .contains("polaris"));
@@ -4445,12 +4511,12 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
 #[cfg(windows)]
 fn devin_runtime_guidance(polaris: bool) -> Option<String> {
     let search_guidance = if polaris {
-        " Do not use Bash to recursively search when Nova polaris already covers the task."
+        " Use Nova polaris instead of shell recursion when it covers the search task."
     } else {
         ""
     };
     Some(format!(
-        "Windows shell contract for this local Devin session (hard constraint): Devin's native command tool is hosted on Windows but its default command interpreter may be `/usr/bin/bash` (Git Bash/MSYS), not PowerShell. Never place PowerShell cmdlets such as `Get-ChildItem`, `Select-Object`, `Get-Content`, `Where-Object`, or `$env:NAME` directly in a default shell command. For ordinary repository commands, use portable Bash syntax and forward-slash paths, for example `pwd`, `ls -la`, `cat file`, `rg pattern src`, `git status --short`, `command -v node`, and `$NAME`.{search_guidance} When Windows-specific behavior or PowerShell cmdlets are genuinely required, invoke PowerShell explicitly as `powershell.exe -NoProfile -NonInteractive -Command \"...\"`; inside that quoted script use PowerShell syntax and `$env:NAME`. Do not mix Bash pipelines/operators with PowerShell cmdlets in the same command. If a command fails with `/usr/bin/bash: ...: command not found`, correct the shell mismatch immediately instead of retrying the same syntax."
+        "Windows shell contract for this local Devin session (hard constraint): the native command tool runs Windows PowerShell 5.1. Use PowerShell syntax from the first command onward. Use cmdlets such as `Get-ChildItem`, `Select-String`, and `Get-Content`; use `$env:NAME` for environment variables and `;` to sequence commands. Do not emit Bash/POSIX syntax such as `export`, `VAR=value command`, `/dev/null`, `ls -la`, `rm -rf`, `grep`, `sed`, or `awk`; Windows PowerShell 5.1 does not support Bash-style chaining, so do not use `&&` or `||`.{search_guidance} Use Bash only when the user explicitly requests it or a required script has no PowerShell-compatible entry point."
     ))
 }
 

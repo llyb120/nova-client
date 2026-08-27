@@ -199,8 +199,7 @@ fn quota_model_key(kind: &AgentKind, model: &str) -> String {
 
 fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
     match kind {
-        AgentKind::Alkaid
-        | AgentKind::Lyra
+        AgentKind::Lyra
         | AgentKind::Devin
         | AgentKind::Codex
         | AgentKind::CodexPlus
@@ -241,7 +240,6 @@ fn shared_quota_model_keys(shared_options: &Value) -> HashSet<String> {
 
 fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> bool {
     let enabled = match kind {
-        AgentKind::Alkaid => settings.vega_enabled,
         AgentKind::Lyra => settings.lyra_enabled,
         AgentKind::Devin => settings.devin_enabled,
         AgentKind::Codex => settings.codex_enabled,
@@ -1722,7 +1720,7 @@ impl RelayManager {
         } else {
             make_scratch_dir()?
         };
-        // 后端优先用调用方临时选择；为空回退统一轻量级模型，再兜底 Vega。
+        // 后端优先用调用方临时选择；为空回退统一轻量级模型，再兜底 Lyra。
         let agent_kind = {
             let raw = if agent.trim().is_empty() {
                 let state = self.app.state::<AppState>();
@@ -1731,7 +1729,7 @@ impl RelayManager {
             } else {
                 agent.trim().to_string()
             };
-            AgentKind::from_str(&raw).unwrap_or(AgentKind::Alkaid)
+            AgentKind::from_str(&raw).unwrap_or(AgentKind::Lyra)
         };
         // 模型优先用调用方临时选择；为空回退统一轻量级模型。
         let model = if model.trim().is_empty() {
@@ -1766,12 +1764,6 @@ impl RelayManager {
         let state = self.app.state::<AppState>();
         let run_id = new_id.clone();
         match agent_kind {
-            AgentKind::Alkaid => {
-                let mgr = state.alkaid.clone();
-                tauri::async_runtime::spawn(async move {
-                    mgr.run_prompt(run_id, seed, vec![]).await;
-                });
-            }
             AgentKind::Lyra => {
                 let mgr = state.lyra.clone();
                 tauri::async_runtime::spawn(async move {
@@ -2115,21 +2107,11 @@ impl RelayManager {
         };
         operation.ensure_active()?;
         if !crate::cli_manager::is_installed(&agent_kind, &settings) {
-            self.emit_quota_progress(
-                operation_id,
-                "installing",
-                format!("本机缺少 {} CLI，正在一键安装…", agent_kind.label()),
-            );
-            let state = self.app.state::<AppState>();
-            crate::cli_manager::ensure_installed(
-                &self.app,
-                state.inner(),
-                agent_kind.clone(),
-                &settings,
-                operation_id,
-            )
-            .await?;
-            operation.ensure_active()?;
+            let command = crate::cli_manager::install_command(&agent_kind, &settings);
+            return Err(format!(
+                "本机缺少 {} CLI，请先在终端执行：{command}",
+                agent_kind.label()
+            ));
         }
 
         let model = model
@@ -2273,12 +2255,12 @@ impl RelayManager {
         let app = self.app.clone();
         let to = env.from.clone();
         tauri::async_runtime::spawn(async move {
-            // Vega/Lyra 没有独立登录凭证文件（两者共用同一份配置）：先在出借方把
+            // Lyra 没有独立登录凭证文件：先在出借方把
             // 生效配置（含密钥解析）导出，再走统一的凭证打包加密链路
-            let alkaid_config = if matches!(agent_kind, AgentKind::Alkaid | AgentKind::Lyra) {
+            let lyra_config = if matches!(agent_kind, AgentKind::Lyra) {
                 match app
                     .state::<AppState>()
-                    .alkaid
+                    .lyra
                     .export_quota_credentials()
                     .await
                 {
@@ -2304,7 +2286,7 @@ impl RelayManager {
                     &app,
                     agent_kind,
                     &model,
-                    alkaid_config.as_deref(),
+                    lyra_config.as_deref(),
                 )
                 .and_then(|bundle| {
                     crate::credential_roaming::encrypt_bundle(&public_key, &req_id, &bundle)
@@ -2686,7 +2668,7 @@ impl RelayManager {
     }
 
     /// host：收到模型请求，收集本机「已启用且检测可用」后端的模型/模式列表回给对端。
-    /// 顺序与前端 ALL_AGENT_KINDS 保持一致（alkaid → devin → codex → codebuddy → claudecode → cursor → opencode）。
+    /// 顺序与前端 ALL_AGENT_KINDS 保持一致（lyra → devin → codex → codebuddy → claudecode → cursor → opencode）。
     fn on_roaming_models_request(&self, env: &InEnvelope) {
         let to = env.from.clone();
         let app = self.app.clone();
@@ -2696,7 +2678,6 @@ impl RelayManager {
                 let s = state.settings.lock().unwrap();
                 let avail = state.backend_availability.lock().unwrap();
                 let kinds = [
-                    (AgentKind::Alkaid, s.vega_enabled),
                     (AgentKind::Lyra, s.lyra_enabled),
                     (AgentKind::Devin, s.devin_enabled),
                     (AgentKind::Codex, s.codex_enabled),
@@ -2719,9 +2700,6 @@ impl RelayManager {
             for kind in kinds {
                 backends.push(kind.as_str());
                 let fetched = match kind {
-                    AgentKind::Alkaid => {
-                        app.state::<AppState>().alkaid.ensure_model_options().await
-                    }
                     AgentKind::Lyra => app.state::<AppState>().lyra.ensure_model_options().await,
                     AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                         app.state::<AppState>()
@@ -3347,14 +3325,6 @@ impl RelayManager {
             (epoch, value)
         };
         match agent_kind {
-            AgentKind::Alkaid => {
-                let mgr = state.alkaid.clone();
-                tauri::async_runtime::spawn(async move {
-                    if host_prompt_is_current(&prompt_epoch) {
-                        mgr.run_prompt(host_thread_id, text, images).await;
-                    }
-                });
-            }
             AgentKind::Lyra => {
                 let mgr = state.lyra.clone();
                 tauri::async_runtime::spawn(async move {
@@ -3463,10 +3433,6 @@ impl RelayManager {
             return;
         }
         match agent_kind {
-            AgentKind::Alkaid => {
-                let mgr = state.alkaid.clone();
-                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
-            }
             AgentKind::Lyra => {
                 let mgr = state.lyra.clone();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
@@ -4773,18 +4739,18 @@ mod tests {
             "cursor-small"
         ));
 
-        let mut vega_settings = Settings::default();
-        vega_settings.vega_enabled = true;
-        vega_settings.quota_shared_models = vec!["alkaid:provider/model".into()];
+        let mut lyra_settings = Settings::default();
+        lyra_settings.lyra_enabled = true;
+        lyra_settings.quota_shared_models = vec!["lyra:provider/model".into()];
         assert!(quota_model_is_shared(
-            &vega_settings,
-            &AgentKind::Alkaid,
+            &lyra_settings,
+            &AgentKind::Lyra,
             "provider/model"
         ));
-        vega_settings.vega_enabled = false;
+        lyra_settings.lyra_enabled = false;
         assert!(!quota_model_is_shared(
-            &vega_settings,
-            &AgentKind::Alkaid,
+            &lyra_settings,
+            &AgentKind::Lyra,
             "provider/model"
         ));
     }
@@ -4817,7 +4783,7 @@ mod tests {
     #[test]
     fn quota_runtime_supports_every_frontend_backend() {
         for kind in [
-            AgentKind::Alkaid,
+            AgentKind::Lyra,
             AgentKind::Devin,
             AgentKind::Codex,
             AgentKind::CodeBuddy,

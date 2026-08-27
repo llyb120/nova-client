@@ -1,6 +1,6 @@
 mod acp;
 mod agent_config;
-mod alkaid_complete;
+mod lyra_complete;
 mod browser;
 mod browser_agent;
 mod cli_manager;
@@ -49,13 +49,12 @@ use codex::CodexManager;
 use credential_roaming::{BorrowedManager, BorrowedRuntime};
 use opencode_sdk::OpenCodeSdkManager;
 use relay::{RelayManager, Share, WorkflowShare};
-use sdk_adapters::{AlkaidAdapter, ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter};
+use sdk_adapters::{ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter};
 use sdk_runtime::SdkManager;
 use serde_json::{json, Value};
 use settings::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use threads::{
@@ -86,9 +85,7 @@ pub struct AppState {
     pub codex: Arc<CodexManager>,
     /// CodeBuddy 后端（官方 HTTP 传输：`codebuddy --serve` + /api/v1/acp JSON-RPC over SSE）。
     pub codebuddy: Arc<AcpManager>,
-    /// Alkaid 自研 pi agent 后端。
-    pub alkaid: Arc<SdkManager>,
-    /// Lyra Rust 原生 agent 后端（与 Vega 共用配置，不经 Node bridge）。
+    /// Lyra Rust 原生 agent 后端（进程内运行，不经 Node bridge）。
     pub lyra: Arc<SdkManager>,
     /// Codex 官方 TypeScript SDK 后端，不经过 app-server 集成层。
     pub codexplus: Arc<SdkManager>,
@@ -105,13 +102,8 @@ pub struct AppState {
     pub last_activity_ms: Mutex<i64>,
     /// 前端当前打开的会话 id（None = 停在主页）。升级重启前写入恢复标记，重启后据此恢复显示。
     pub active_thread: Mutex<Option<String>>,
-    /// 后端可用性检测结果（agent_kind → 是否可用）。启动后并发按需检测（解析 PATH，
-    /// 不拉起进程），前端据此只显示真正可用的后端。空 map 表示尚未检测完成。
+    /// 后端可用性检测结果（agent_kind → 是否可用）。
     pub backend_availability: Mutex<HashMap<String, bool>>,
-    /// CLI 升级串行执行，避免两个包管理器/自更新器同时改写 PATH 下的文件。
-    pub cli_upgrade_lock: tokio::sync::Mutex<()>,
-    /// 正在执行的 CLI 安装/升级任务；值为取消标记，设置页和额度前置安装共用。
-    pub cli_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 编辑历史消息后正在后台 restore/fork、等待自动重发的会话。
     pub pending_prompt_restores: Mutex<HashSet<String>>,
     /// 仓库世界线的创建/恢复互斥；同一进程内禁止两个恢复事务交叉写文件。
@@ -147,7 +139,6 @@ impl AppState {
     pub fn agent_enabled(&self, kind: &AgentKind) -> bool {
         let s = self.settings.lock().unwrap();
         match kind {
-            AgentKind::Alkaid => s.vega_enabled,
             AgentKind::Lyra => s.lyra_enabled,
             AgentKind::Devin => s.devin_enabled,
             AgentKind::Codex => s.codex_enabled,
@@ -227,26 +218,11 @@ impl AppState {
                 .generate_title_async(thread_id, prompt, fallback, String::new());
             return;
         }
-        if AgentKind::from_str(&agent_raw) == Some(AgentKind::Alkaid)
-            && self.agent_enabled(&AgentKind::Alkaid)
-        {
-            self.alkaid
-                .generate_title_async(thread_id, prompt, fallback, model);
-            return;
-        }
         if AgentKind::from_str(&agent_raw) == Some(AgentKind::Lyra)
             && self.agent_enabled(&AgentKind::Lyra)
         {
             self.lyra
                 .generate_title_async(thread_id, prompt, fallback, model);
-            return;
-        }
-        if agent_raw.is_empty()
-            && origin == &AgentKind::Alkaid
-            && self.agent_enabled(&AgentKind::Alkaid)
-        {
-            self.alkaid
-                .generate_title_async(thread_id, prompt, fallback, String::new());
             return;
         }
         if agent_raw.is_empty()
@@ -322,7 +298,6 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
             .unwrap_or(false);
     }
     match thread.agent_kind {
-        AgentKind::Alkaid => state.alkaid.is_running(&thread.id),
         AgentKind::Lyra => state.lyra.is_running(&thread.id),
         AgentKind::Devin => state.acp.is_running(&thread.id),
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.is_running(&thread.id),
@@ -341,16 +316,14 @@ fn running_by_id(state: &AppState, thread_id: &str) -> bool {
     is_running(state, thread)
 }
 
-fn is_ordinary_thread(thread: &Thread) -> bool {
-    thread.roaming_role.is_none() && thread.quota_peer.is_none()
-}
-
 fn is_starrable_thread(thread: &Thread) -> bool {
     thread.roaming_role.is_none()
 }
 
 fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
-    is_ordinary_thread(thread) && !thread.experience_thread && !thread.starred
+    // 漫游会话（host 替别人执行 / guest 收看别人执行）与普通会话一样参与自动清理；
+    // 仍豁免：额度租借会话、经验训练会话和星标会话。运行中的会话由调用方另行排除。
+    thread.quota_peer.is_none() && !thread.experience_thread && !thread.starred
 }
 
 fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
@@ -457,6 +430,16 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
     };
     let now = now_ms();
     let permanently_removed = state.thread_trash.lock().unwrap().purge_expired(now, hours);
+    let retained_session_ids = state
+        .store
+        .lock()
+        .unwrap()
+        .threads
+        .iter()
+        .filter_map(|thread| thread.acp_session_id.clone())
+        .chain(state.thread_trash.lock().unwrap().session_ids())
+        .collect();
+    cleanup_lyra_session_files(&state.config_dir, &permanently_removed, &retained_session_ids);
     for thread in permanently_removed {
         if thread.cwd.contains(SCRATCH_MARK) {
             let _ = std::fs::remove_dir_all(thread.cwd);
@@ -509,7 +492,6 @@ fn any_session_running(state: &AppState) -> bool {
 pub(crate) async fn shutdown_agent_processes(state: &AppState) {
     state.acp.kill_conn().await;
     state.codex.kill_conn().await;
-    state.alkaid.shutdown();
     state.codexplus.shutdown();
     state.codebuddy.shutdown();
     state.claudeplus.shutdown();
@@ -547,9 +529,9 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
 #[cfg(test)]
 mod session_auto_cleanup_tests {
     use super::{
-        experience_thread_is_expired, is_normal_thread_for_auto_cleanup, is_starrable_thread,
-        thread_is_expired, tree_contains_starred_thread, AgentKind, Thread,
-        EXPERIENCE_THREAD_RETENTION_MS,
+        cleanup_lyra_session_files, experience_thread_is_expired,
+        is_normal_thread_for_auto_cleanup, is_starrable_thread, thread_is_expired,
+        tree_contains_starred_thread, AgentKind, Thread, EXPERIENCE_THREAD_RETENTION_MS,
     };
     use std::collections::HashSet;
 
@@ -616,7 +598,14 @@ mod session_auto_cleanup_tests {
         thread.experience_thread = true;
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
         thread.experience_thread = false;
+        // 漫游会话（两种角色）不豁免自动清理
         thread.roaming_role = Some("host".into());
+        assert!(is_normal_thread_for_auto_cleanup(&thread));
+        thread.roaming_role = Some("guest".into());
+        assert!(is_normal_thread_for_auto_cleanup(&thread));
+        thread.roaming_role = None;
+        // 额度租借会话仍豁免
+        thread.quota_peer = Some("peer-token".into());
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
     }
 
@@ -636,6 +625,40 @@ mod session_auto_cleanup_tests {
         let starred = HashSet::from(["child".to_string()]);
 
         assert!(tree_contains_starred_thread(&tree, &starred));
+    }
+
+    #[test]
+    fn removing_lyra_thread_cleans_its_session_files_only() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "nova-lyra-session-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions = data_dir.join("alkaid").join("sessions");
+        let tool_results = data_dir.join("alkaid").join("tool-results");
+        std::fs::create_dir_all(tool_results.join("session-a")).unwrap();
+        std::fs::create_dir_all(tool_results.join("session-b")).unwrap();
+        for name in ["session-a.json", "session-a.slim.json", "session-b.json"] {
+            std::fs::create_dir_all(&sessions).unwrap();
+            std::fs::write(sessions.join(name), "{}").unwrap();
+        }
+        let mut removed = Thread::new(String::new(), AgentKind::Lyra, None, None, None, false);
+        removed.acp_session_id = Some("session-a".into());
+
+        cleanup_lyra_session_files(
+            &data_dir,
+            std::slice::from_ref(&removed),
+            &HashSet::from(["session-a".into()]),
+        );
+        assert!(sessions.join("session-a.json").exists());
+        assert!(tool_results.join("session-a").exists());
+
+        cleanup_lyra_session_files(&data_dir, &[removed], &HashSet::new());
+        assert!(!sessions.join("session-a.json").exists());
+        assert!(!sessions.join("session-a.slim.json").exists());
+        assert!(!tool_results.join("session-a").exists());
+        assert!(sessions.join("session-b.json").exists());
+        assert!(tool_results.join("session-b").exists());
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 }
 
@@ -769,7 +792,7 @@ pub const EV_BACKENDS: &str = "backends:availability";
 fn backend_is_available(kind: &AgentKind, program: &str) -> bool {
     matches!(
         kind,
-        AgentKind::Alkaid | AgentKind::Lyra | AgentKind::ClaudeCode | AgentKind::Cursor
+        AgentKind::Lyra | AgentKind::ClaudeCode | AgentKind::Cursor
     ) || acp::resolve_program_on_path(program).is_some()
 }
 
@@ -780,7 +803,7 @@ mod backend_availability_tests {
     #[test]
     fn sdk_backends_are_available_without_legacy_cli_paths() {
         let missing = "__nova_missing_backend_executable__";
-        for kind in [AgentKind::Alkaid, AgentKind::ClaudeCode, AgentKind::Cursor] {
+        for kind in [AgentKind::Lyra, AgentKind::ClaudeCode, AgentKind::Cursor] {
             assert!(backend_is_available(&kind, missing), "{kind:?}");
         }
         assert!(!backend_is_available(&AgentKind::Devin, missing));
@@ -797,8 +820,8 @@ fn spawn_backend_availability_check(app: tauri::AppHandle) {
             let state = app.state::<AppState>();
             let s = state.settings.lock().unwrap();
             vec![
-                // Alkaid 是随 Nova 提供的内置后端；占位 program 不参与其可用性判定。
-                (AgentKind::Alkaid, String::new()),
+                // Lyra 是随 Nova 提供的内置后端；占位 program 不参与其可用性判定。
+                (AgentKind::Lyra, String::new()),
                 (AgentKind::Devin, s.devin_path.clone()),
                 (AgentKind::Codex, s.codex_path.clone()),
                 (AgentKind::CodeBuddy, s.codebuddy_path.clone()),
@@ -842,25 +865,11 @@ async fn get_cli_statuses(settings: Settings) -> Vec<cli_manager::CliStatus> {
 }
 
 #[tauri::command]
-async fn upgrade_cli(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    agent_kind: AgentKind,
-    settings: Settings,
-    operation_id: String,
-) -> Result<cli_manager::CliStatus, String> {
-    let status = cli_manager::upgrade(&app, &state, agent_kind, &settings, &operation_id).await?;
-    spawn_backend_availability_check(app);
-    Ok(status)
-}
-
-#[tauri::command]
-fn cancel_cli_operation(state: State<'_, AppState>, operation_id: String) -> bool {
-    cli_manager::cancel(&state, &operation_id)
-}
-
-#[tauri::command]
 fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
+    thread_metas(&state)
+}
+
+fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
     // 会话自身没带 worktree 标注、但 cwd 正好是某条已知 worktree 工作目录时
     // （在项目选择器里直接选中 worktree 目录开的会话、员工 worktree 会话等），
     // 按 worktree 记录表现场补齐标注，避免左侧列表把 uuid 目录名当分组标题展示。
@@ -1105,6 +1114,22 @@ async fn delete_clue(
     drop(store);
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(())
+}
+
+#[tauri::command]
+fn load_threads(state: State<'_, AppState>) -> (Vec<ThreadMeta>, Vec<Thread>) {
+    let metas = thread_metas(&state);
+    let store = state.store.lock().unwrap();
+    let by_id: HashMap<&str, &Thread> = store
+        .threads
+        .iter()
+        .map(|thread| (thread.id.as_str(), thread))
+        .collect();
+    let threads = metas
+        .iter()
+        .filter_map(|meta| by_id.get(meta.id.as_str()).map(|thread| (*thread).clone()))
+        .collect();
+    (metas, threads)
 }
 
 #[tauri::command]
@@ -1448,10 +1473,10 @@ fn list_codex_skill_commands(config_dir: &Path) -> Vec<Value> {
     list_skill_commands(codex_skill_roots(config_dir), "Codex skill", "", "$")
 }
 
-fn list_alkaid_skill_commands(config_dir: &Path) -> Vec<Value> {
+fn list_lyra_skill_commands(config_dir: &Path) -> Vec<Value> {
     list_skill_commands(
         vec![config_dir.join("alkaid").join("skills")],
-        "Vega skill",
+        "Lyra skill",
         "skill:",
         "/skill:",
     )
@@ -1462,8 +1487,8 @@ mod slash_skill_command_tests {
     use super::*;
 
     #[test]
-    fn alkaid_skills_use_pi_slash_command_syntax() {
-        let root = std::env::temp_dir().join(format!("nova-vega-slash-{}", uuid::Uuid::new_v4()));
+    fn lyra_skills_use_pi_slash_command_syntax() {
+        let root = std::env::temp_dir().join(format!("nova-lyra-slash-{}", uuid::Uuid::new_v4()));
         let skill_dir = root.join("alkaid").join("skills").join("review");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
@@ -1472,7 +1497,7 @@ mod slash_skill_command_tests {
         )
         .unwrap();
 
-        let commands = list_alkaid_skill_commands(&root);
+        let commands = list_lyra_skill_commands(&root);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0]["name"], "skill:review");
         assert_eq!(commands[0]["input"], "/skill:review ");
@@ -2003,22 +2028,7 @@ fn remove_worktree(
     }
     state.worktrees.lock().unwrap().remove(&id);
     if !doomed.is_empty() {
-        {
-            let mut store = state.store.lock().unwrap();
-            store.threads.retain(|t| !doomed.contains(&t.id));
-            store.save();
-        }
-        for tid in &doomed {
-            state.acp.forget_session_of_thread(tid);
-            state.codex.forget_session_of_thread(tid);
-            state.alkaid.forget_session_of_thread(tid);
-            state.codexplus.forget_session_of_thread(tid);
-            state.codebuddy.forget_session_of_thread(tid);
-            state.claudeplus.forget_session_of_thread(tid);
-            state.cursorplus.forget_session_of_thread(tid);
-            state.opencodeplus.forget_session_of_thread(tid);
-        }
-        let _ = app.emit(acp::EV_THREADS, json!({}));
+        remove_threads(&app, &state, doomed);
     }
     // worktree 目录没了，项目列表里对应条目也要跟着消失（可能曾被当项目选择过）
     state.projects.lock().unwrap().remove(&rec.path);
@@ -2132,12 +2142,6 @@ async fn merge_worktree_thread(
                 wt.branch
             );
             match agent_kind {
-                AgentKind::Alkaid => {
-                    let mgr = state.alkaid.clone();
-                    tauri::async_runtime::spawn(async move {
-                        mgr.run_prompt(thread_id, prompt, vec![]).await;
-                    });
-                }
                 AgentKind::Lyra => {
                     let mgr = state.lyra.clone();
                     tauri::async_runtime::spawn(async move {
@@ -2272,25 +2276,7 @@ fn delete_thread(
     if delete_ids.iter().any(|id| running_by_id(&state, id)) {
         return Err("会话树中有运行中的会话，请先停止".into());
     }
-    for id in &delete_ids {
-        state.relay.notify_host_thread_deleted(id);
-    }
-    {
-        let mut store = state.store.lock().unwrap();
-        store.threads.retain(|t| !delete_ids.contains(&t.id));
-        store.save();
-    }
-    for id in &delete_ids {
-        state.acp.forget_session_of_thread(id);
-        state.codex.forget_session_of_thread(id);
-        state.codexplus.forget_session_of_thread(id);
-        state.codebuddy.forget_session_of_thread(id);
-        state.claudeplus.forget_session_of_thread(id);
-        state.cursorplus.forget_session_of_thread(id);
-        state.opencodeplus.forget_session_of_thread(id);
-        cleanup_borrowed_runtime(&state, id);
-    }
-    let _ = app.emit(acp::EV_THREADS, json!({}));
+    remove_threads(&app, &state, delete_ids);
     Ok(())
 }
 
@@ -2336,30 +2322,91 @@ fn collect_deletable_thread_ids(
     delete_set.into_iter().collect()
 }
 
-/// 从正常会话存储移除，并清理关联的运行时状态；返回完整会话快照供回收站持久化。
+fn valid_lyra_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn cleanup_lyra_session_files(
+    data_dir: &Path,
+    removed: &[Thread],
+    retained_session_ids: &HashSet<String>,
+) {
+    let session_root = data_dir.join("alkaid").join("sessions");
+    let tool_results_root = data_dir.join("alkaid").join("tool-results");
+    let session_ids: HashSet<&str> = removed
+        .iter()
+        .filter(|thread| thread.agent_kind == AgentKind::Lyra)
+        .filter_map(|thread| thread.acp_session_id.as_deref())
+        .filter(|id| valid_lyra_session_id(id) && !retained_session_ids.contains(*id))
+        .collect();
+    for id in session_ids {
+        for file_name in [format!("{id}.json"), format!("{id}.slim.json")] {
+            let path = session_root.join(file_name);
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("[threads] 清理 Lyra session 文件 {} 失败：{error}", path.display());
+                }
+            }
+        }
+        let tool_results = tool_results_root.join(id);
+        if let Err(error) = std::fs::remove_dir_all(&tool_results) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "[threads] 清理 Lyra session 工具结果 {} 失败：{error}",
+                    tool_results.display()
+                );
+            }
+        }
+    }
+}
+
+/// 从正常会话存储移除，并清理关联的运行时与 Lyra session；返回完整会话快照供回收站持久化。
 fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<String>) -> Vec<Thread> {
     for id in &deletable {
         state.relay.notify_host_thread_deleted(id);
     }
-    let removed = {
+    let (removed, retained_session_ids) = {
         let mut store = state.store.lock().unwrap();
         let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut store.threads)
             .into_iter()
             .partition(|thread| deletable.contains(&thread.id));
+        let retained_session_ids: Vec<_> = kept
+            .iter()
+            .filter_map(|thread| thread.acp_session_id.clone())
+            .collect();
         store.threads = kept;
         store.save();
-        removed
+        (removed, retained_session_ids)
     };
-    for id in &deletable {
+    for thread in &removed {
+        let id = &thread.id;
         state.acp.forget_session_of_thread(id);
         state.codex.forget_session_of_thread(id);
+        state.lyra.forget_session_of_thread(id);
         state.codexplus.forget_session_of_thread(id);
         state.codebuddy.forget_session_of_thread(id);
         state.claudeplus.forget_session_of_thread(id);
         state.cursorplus.forget_session_of_thread(id);
         state.opencodeplus.forget_session_of_thread(id);
-        cleanup_borrowed_runtime(&state, id);
+        cleanup_borrowed_runtime(state, id);
     }
+    // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
+    // 手动删除、worktree 删除及训练会话清理则没有回收站，立即清理。
+    let trashed_session_ids: HashSet<String> = state
+        .thread_trash
+        .lock()
+        .unwrap()
+        .session_ids()
+        .into_iter()
+        .collect();
+    let retained_session_ids = retained_session_ids
+        .into_iter()
+        .chain(trashed_session_ids)
+        .collect();
+    cleanup_lyra_session_files(&state.config_dir, &removed, &retained_session_ids);
     let _ = app.emit(acp::EV_THREADS, json!({}));
     removed
 }
@@ -3099,10 +3146,9 @@ fn delete_time_machine_context(
         (agent_kind, timeline)
     };
 
-    // Vega / Cursor 的下一轮会从编辑后的 transcript 直接重建精简上下文；其余后端
+    // Lyra / Cursor 的下一轮会从编辑后的 transcript 直接重建精简上下文；其余后端
     // 作废原生 session，并通过一次无感接力在新 session 中继续。旧压缩摘要也随之失效。
     match agent_kind {
-        AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&thread_id),
         AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
         AgentKind::Devin => state.acp.forget_session_of_thread(&thread_id),
         AgentKind::Codex | AgentKind::CodexPlus => {
@@ -3230,7 +3276,6 @@ fn set_thread_model(
         });
     } else if !was_running {
         match agent_kind {
-            AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&thread_id),
             AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
             AgentKind::Codex | AgentKind::CodexPlus => {
                 state.codexplus.forget_session_of_thread(&thread_id)
@@ -3440,7 +3485,6 @@ async fn get_model_options(
         return Err(format!("{} 后端已关闭", agent_kind.label()));
     }
     match agent_kind {
-        AgentKind::Alkaid => state.alkaid.ensure_model_options().await.map(Some),
         AgentKind::Lyra => state.lyra.ensure_model_options().await.map(Some),
         AgentKind::Devin => state.acp.ensure_model_options().await.map(Some),
         AgentKind::Codex | AgentKind::CodexPlus => {
@@ -3457,14 +3501,12 @@ async fn get_model_options(
     }
 }
 
-/// 手动刷新 Vega 本地配置（`~/.nova/alkaid/config.jsonc`）：清空模型列表缓存、
+/// 手动刷新 Lyra 本地配置（`~/.nova/alkaid/config.jsonc`）：清空模型列表缓存、
 /// 杀掉预热实例，并由后台重拉模型列表推给前端。用于设置页「刷新配置」按钮；
-/// 不打断正在运行的会话（bridge 每轮请求本就会重读配置）。
+/// 不打断正在运行的会话（每轮请求本就会重读配置）。
 #[tauri::command]
-fn refresh_alkaid_config(state: State<'_, AppState>) {
-    state.alkaid.notify_alkaid_config_changed();
-    // Lyra 与 Vega 共用配置文件，同步失效其模型列表缓存。
-    state.lyra.notify_alkaid_config_changed();
+fn refresh_lyra_config(state: State<'_, AppState>) {
+    state.lyra.notify_config_changed();
 }
 
 #[tauri::command]
@@ -3477,7 +3519,7 @@ async fn get_slash_commands(
         return Ok(Vec::new());
     }
     match agent_kind {
-        AgentKind::Alkaid | AgentKind::Lyra => Ok(list_alkaid_skill_commands(&state.config_dir)),
+        AgentKind::Lyra => Ok(list_lyra_skill_commands(&state.config_dir)),
         AgentKind::Devin => {
             let commands = state.acp.fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
@@ -3681,7 +3723,7 @@ pub(crate) fn dispatch_prompt(
                 }
             }
             BorrowedManager::Sdk(manager) => {
-                // Alkaid：原生 steer；Cursor 等：打断当前轮后以新 turn / slim memory 继续。
+                // Lyra：原生 steer；Cursor 等：打断当前轮后以新 turn / slim memory 继续。
                 if manager.is_running(&thread_id) {
                     tauri::async_runtime::spawn(async move {
                         manager.steer_prompt(thread_id, text, images).await;
@@ -3701,18 +3743,6 @@ pub(crate) fn dispatch_prompt(
         return Ok(());
     }
     match agent_kind {
-        AgentKind::Alkaid => {
-            let mgr = state.alkaid.clone();
-            if mgr.is_running(&thread_id) {
-                tauri::async_runtime::spawn(async move {
-                    mgr.steer_prompt(thread_id, text, images).await;
-                });
-            } else {
-                tauri::async_runtime::spawn(async move {
-                    mgr.run_prompt(thread_id, text, images).await;
-                });
-            }
-        }
         AgentKind::Lyra => {
             let mgr = state.lyra.clone();
             if mgr.is_running(&thread_id) {
@@ -4055,7 +4085,6 @@ async fn cancel_turn(
     }
     let kind = agent_kind_for_thread(&state, &thread_id)?;
     match kind {
-        AgentKind::Alkaid => state.alkaid.cancel(&thread_id).await,
         AgentKind::Lyra => state.lyra.cancel(&thread_id).await,
         AgentKind::Devin => state.acp.cancel(&thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(&thread_id).await,
@@ -4204,7 +4233,6 @@ async fn apply_runtime_settings(
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
     let (
-        restart_vega,
         restart_lyra,
         restart_devin,
         restart_codebuddy,
@@ -4226,18 +4254,11 @@ async fn apply_runtime_settings(
         if context_runtime_changed || experience_tools_changed {
             settings.apply_context_retrieval_environment();
         }
-        let restart_vega = restart_all_agents
-            || context_runtime_changed
-            || experience_tools_changed
-            || auto_change_project_changed
-            || s.vega_proxy != settings.vega_proxy
-            || s.vega_context_mode != settings.vega_context_mode
-            || s.vega_enabled != settings.vega_enabled;
         let restart_lyra = restart_all_agents
             || context_runtime_changed
             || experience_tools_changed
             || auto_change_project_changed
-            || s.vega_proxy != settings.vega_proxy
+            || s.lyra_proxy != settings.lyra_proxy
             || s.lyra_enabled != settings.lyra_enabled;
         let restart_devin = restart_all_agents
             || context_runtime_changed
@@ -4292,7 +4313,6 @@ async fn apply_runtime_settings(
             s.save(&state.config_dir);
         }
         (
-            restart_vega,
             restart_lyra,
             restart_devin,
             restart_codebuddy,
@@ -4305,10 +4325,6 @@ async fn apply_runtime_settings(
             recheck_availability,
         )
     };
-    if restart_vega {
-        state.alkaid.shutdown();
-        state.alkaid.refresh_model_options_soon();
-    }
     if restart_lyra {
         state.lyra.shutdown();
         state.lyra.refresh_model_options_soon();
@@ -4472,13 +4488,6 @@ async fn run_auxiliary_prompt(
 ) {
     let state = app.state::<AppState>();
     match kind {
-        AgentKind::Alkaid => {
-            state
-                .alkaid
-                .clone()
-                .run_prompt(thread_id, prompt, Vec::new())
-                .await
-        }
         AgentKind::Lyra => {
             state
                 .lyra
@@ -4572,7 +4581,7 @@ async fn summarize_clue(
     let (lightweight_agent, lightweight_model) = {
         let s = state.settings.lock().unwrap();
         (
-            AgentKind::from_str(&s.lightweight_model_agent).unwrap_or(AgentKind::Alkaid),
+            AgentKind::from_str(&s.lightweight_model_agent).unwrap_or(AgentKind::Lyra),
             (!s.lightweight_model.trim().is_empty())
                 .then(|| s.lightweight_model.trim().to_string()),
         )
@@ -4621,7 +4630,7 @@ async fn summarize_clue(
         }
         state.acp.forget_session_of_thread(&run_id);
         state.codex.forget_session_of_thread(&run_id);
-        state.alkaid.forget_session_of_thread(&run_id);
+        state.lyra.forget_session_of_thread(&run_id);
         state.codexplus.forget_session_of_thread(&run_id);
         state.codebuddy.forget_session_of_thread(&run_id);
         state.claudeplus.forget_session_of_thread(&run_id);
@@ -4703,7 +4712,7 @@ struct RouteJudgeOption {
 /// 传给判断模型的节点结论字数上限（结论通常在后面，取末尾）。
 const ROUTE_JUDGE_CONCLUSION_MAX: usize = 2000;
 
-/// 提示词模式连线判断：用配置的 Vega 轻量级模型根据节点结论选择下一条连线。
+/// 提示词模式连线判断：用配置的轻量级模型根据节点结论选择下一条连线。
 /// 返回选中的连线 id；无法判断返回空串，由前端按「待补充」暂停处理。
 #[tauri::command]
 async fn judge_workflow_route(
@@ -4718,7 +4727,7 @@ async fn judge_workflow_route(
         let s = state.settings.lock().unwrap();
         let lightweight = s.lightweight_model.trim().to_string();
         let lightweight_agent = s.lightweight_model_agent.trim();
-        if (lightweight_agent.is_empty() || lightweight_agent == "alkaid")
+        if (lightweight_agent.is_empty() || lightweight_agent == "lyra")
             && !lightweight.is_empty()
         {
             lightweight
@@ -4727,7 +4736,7 @@ async fn judge_workflow_route(
         }
     };
     if model.is_empty() {
-        return Err("未配置 Vega 轻量级模型，无法使用提示词判断连线".into());
+        return Err("未配置轻量级模型，无法使用提示词判断连线".into());
     }
     let list = options
         .iter()
@@ -4744,7 +4753,7 @@ async fn judge_workflow_route(
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let fut = state.alkaid.complete_once(&cwd, &model, seed);
+    let fut = state.lyra.complete_once(&cwd, &model, seed);
     let raw = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
         .await
         .map_err(|_| "连线判断超时".to_string())??;
@@ -4963,9 +4972,7 @@ async fn prepare_quota_lease(
 
 #[tauri::command]
 fn cancel_quota_roaming(state: State<'_, AppState>, operation_id: String) -> bool {
-    let roaming_cancelled = state.relay.cancel_quota_roaming(&operation_id);
-    let cli_cancelled = cli_manager::cancel(&state, &operation_id);
-    roaming_cancelled || cli_cancelled
+    state.relay.cancel_quota_roaming(&operation_id)
 }
 
 /// guest：召回漫游会话——请求 host 把完整会话快照 Flow 回来，
@@ -5014,7 +5021,6 @@ fn respond_roam_request(
 async fn restart_devin(state: State<'_, AppState>) -> Result<(), String> {
     state.acp.restart().await;
     state.codex.restart().await;
-    state.alkaid.shutdown();
     state.codexplus.shutdown();
     state.codebuddy.shutdown();
     state.claudeplus.shutdown();
@@ -5219,10 +5225,7 @@ pub fn run() {
     builder
         .setup(|app| {
             #[cfg(windows)]
-            {
-                spawn_single_instance_focus_listener(app.handle());
-                path_env::refresh_process_environment_in_background();
-            }
+            spawn_single_instance_focus_listener(app.handle());
 
             // 数据目录必须最先确定，后续窗口还原/更新都要读取其中的 marker。
             let dir = nova_data_dir(app.handle());
@@ -5318,7 +5321,6 @@ pub fn run() {
             let codebuddy_acp = AcpManager::new(app.handle().clone(), AgentKind::CodeBuddy);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
-            let alkaid = SdkManager::new(app.handle().clone(), AlkaidAdapter);
             let lyra = SdkManager::new(app.handle().clone(), LyraAdapter);
             // Lyra 进程内运行时：会话/技能/配置目录锚定到当前 profile 的数据根
             // （debug 构建不回退到 release 的 ~/.nova）。
@@ -5342,7 +5344,6 @@ pub fn run() {
                 opencodeplus,
                 codex,
                 codebuddy: codebuddy_acp,
-                alkaid,
                 lyra,
                 codexplus,
                 claudeplus,
@@ -5355,8 +5356,6 @@ pub fn run() {
                 last_activity_ms: Mutex::new(now_ms()),
                 active_thread: Mutex::new(None),
                 backend_availability: Mutex::new(HashMap::new()),
-                cli_upgrade_lock: tokio::sync::Mutex::new(()),
-                cli_operations: Mutex::new(HashMap::new()),
                 pending_prompt_restores: Mutex::new(HashSet::new()),
                 time_machine_lock: Mutex::new(()),
                 remote_permissions: Mutex::new(HashMap::new()),
@@ -5396,11 +5395,6 @@ pub fn run() {
                     state.opencodeplus.seed_model_options(v);
                 }
                 state.opencodeplus.spawn_revalidate_model_options();
-                if let Some(v) = model_cache::load(&dir, AgentKind::Alkaid.as_str()) {
-                    state.alkaid.seed_model_options(v);
-                }
-                // Lyra 与 Vega 共用配置，刷新成功后同样按 "lyra" 写了磁盘缓存；
-                // 启动时一并灌入内存，避免首次打开选择器只能看到 pending 空占位。
                 if let Some(v) = model_cache::load(&dir, AgentKind::Lyra.as_str()) {
                     state.lyra.seed_model_options(v);
                 }
@@ -5426,7 +5420,6 @@ pub fn run() {
                 }
                 let default_kind = [
                     AgentKind::Devin,
-                    AgentKind::Alkaid,
                     AgentKind::Codex,
                     AgentKind::CodeBuddy,
                     AgentKind::ClaudeCode,
@@ -5442,9 +5435,6 @@ pub fn run() {
                 if server::is_headless() {
                     if state.agent_enabled(&AgentKind::Devin) {
                         state.acp.spawn_revalidate_model_options();
-                    }
-                    if state.agent_enabled(&AgentKind::Alkaid) {
-                        state.alkaid.spawn_revalidate_model_options();
                     }
                     if state.agent_enabled(&AgentKind::Codex) {
                         state.codex.spawn_revalidate_model_options();
@@ -5465,7 +5455,6 @@ pub fn run() {
                     // 与 get_model_options 共用 refreshing 闸门，避免桌面启动时双开探测 session
                     match default_kind {
                         AgentKind::Devin => state.acp.spawn_revalidate_model_options(),
-                        AgentKind::Alkaid => state.alkaid.spawn_revalidate_model_options(),
                         AgentKind::Codex | AgentKind::CodexPlus => {
                             state.codex.spawn_revalidate_model_options()
                         }
@@ -5475,7 +5464,7 @@ pub fn run() {
                         _ => {}
                     }
                 }
-                // Lyra 与 Vega 共用配置且进程内拉取零成本，启动时静默刷新，
+                // Lyra 进程内拉取零成本，启动时静默刷新，
                 // 避免首次打开模型选择器才生成 ~/.nova/model-options/lyra.json。
                 if state.agent_enabled(&AgentKind::Lyra) {
                     state.lyra.spawn_revalidate_model_options();
@@ -5626,6 +5615,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_threads,
+            load_threads,
             get_thread,
             list_clue_groups,
             get_clue_context,
@@ -5681,7 +5671,7 @@ pub fn run() {
             set_thread_starred,
             set_thread_agent,
             get_model_options,
-            refresh_alkaid_config,
+            refresh_lyra_config,
             get_slash_commands,
             list_experiences,
             feedback_experience,
@@ -5700,8 +5690,6 @@ pub fn run() {
             set_global_agent_instructions,
             get_backend_availability,
             get_cli_statuses,
-            upgrade_cli,
-            cancel_cli_operation,
             restart_devin,
             get_status,
             get_logs,

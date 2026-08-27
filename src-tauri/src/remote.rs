@@ -902,7 +902,7 @@ fn config(app: &AppHandle) -> Option<RemoteConfig> {
         .unwrap_or_else(|| "Nova".into());
     let proxy = crate::server::configured_proxy().unwrap_or_else(|| {
         [
-            &s.vega_proxy,
+            &s.lyra_proxy,
             &s.devin_proxy,
             &s.codex_proxy,
             &s.codebuddy_proxy,
@@ -1003,7 +1003,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
     let state = app.state::<AppState>();
     let mut out = HashMap::new();
     for kind in [
-        AgentKind::Alkaid,
+        AgentKind::Lyra,
         AgentKind::Devin,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
@@ -1011,7 +1011,6 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         AgentKind::Cursor,
         AgentKind::OpenCode,
         AgentKind::OpenCodePlus,
-        AgentKind::Lyra,
     ] {
         if !state.agent_enabled(&kind) {
             continue;
@@ -1027,7 +1026,6 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
             continue;
         }
         let value = match kind {
-            AgentKind::Alkaid => state.alkaid.get_model_options(),
             AgentKind::Lyra => state.lyra.get_model_options(),
             AgentKind::Devin => state.acp.get_model_options(),
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
@@ -2005,7 +2003,6 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                 state.opencodeplus.forget_session_of_thread(&cmd.thread_id)
             }
-            AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
         }
         if let Some(item) = switched_item {
@@ -2019,7 +2016,6 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         // 同 agent 仅切模型：作废旧 session 让新模型生效。
         // 仅切 mode 不需要作废 session（mode 每轮下发，不绑定 session）。
         match new_kind {
-            AgentKind::Alkaid => state.alkaid.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Codex | AgentKind::CodexPlus => {
@@ -2635,7 +2631,6 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         thread.agent_kind.clone()
     };
     match kind {
-        AgentKind::Alkaid => state.alkaid.cancel(thread_id).await,
         AgentKind::Lyra => state.lyra.cancel(thread_id).await,
         AgentKind::Devin => state.acp.cancel(thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,

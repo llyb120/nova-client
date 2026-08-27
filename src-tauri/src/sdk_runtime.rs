@@ -117,9 +117,9 @@ pub struct SdkManager {
     model_options: Mutex<Option<Value>>,
     model_options_refreshing: AtomicBool,
     model_options_revalidated: AtomicBool,
-    /// 本地 Vega 配置变化代数，避免旧模型列表覆盖新配置结果。
-    alkaid_config_generation: AtomicU64,
-    /// 进程内原生 agent（Lyra）的 HTTP 连接池：按 vega_proxy 设置构建一次并复用。
+    /// 本地 Lyra 配置变化代数，避免旧模型列表覆盖新配置结果。
+    config_generation: AtomicU64,
+    /// 进程内原生 agent（Lyra）的 HTTP 连接池：按 lyra_proxy 设置构建一次并复用。
     native_http: Mutex<Option<reqwest::Client>>,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
@@ -156,7 +156,7 @@ impl SdkManager {
             model_options: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
             model_options_revalidated: AtomicBool::new(false),
-            alkaid_config_generation: AtomicU64::new(0),
+            config_generation: AtomicU64::new(0),
             native_http: Mutex::new(None),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
@@ -175,14 +175,14 @@ impl SdkManager {
         self.launch_env.get("NOVA_DATA_DIR").map(PathBuf::from)
     }
 
-    /// 进程内原生 agent 的 HTTP 连接池：按 vega_proxy 设置构建一次复用，避免每轮冷建 TLS。
+    /// 进程内原生 agent 的 HTTP 连接池：按 lyra_proxy 设置构建一次复用，避免每轮冷建 TLS。
     fn native_http(&self) -> reqwest::Client {
         if let Some(client) = self.native_http.lock().unwrap().as_ref() {
             return client.clone();
         }
         let proxy = {
             let state = self.app.state::<AppState>();
-            let proxy = state.settings.lock().unwrap().vega_proxy.clone();
+            let proxy = state.settings.lock().unwrap().lyra_proxy.clone();
             proxy
         };
         let mut builder = reqwest::Client::builder()
@@ -379,13 +379,10 @@ impl SdkManager {
             }
         }
         parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
-        let lightweight_model = if matches!(
-            self.adapter.agent_kind(),
-            AgentKind::Alkaid | AgentKind::Lyra
-        ) {
+        let lightweight_model = if self.adapter.agent_kind() == AgentKind::Lyra {
             let app_state = self.app.state::<AppState>();
             let settings = app_state.settings.lock().unwrap();
-            (AgentKind::from_str(&settings.lightweight_model_agent) == Some(AgentKind::Alkaid))
+            (AgentKind::from_str(&settings.lightweight_model_agent) == Some(AgentKind::Lyra))
                 .then(|| settings.lightweight_model.trim().to_string())
                 .filter(|model| !model.is_empty())
         } else {
@@ -555,7 +552,7 @@ impl SdkManager {
             } else {
                 self.push_system(
                     thread_id,
-                    "Vega 引导失败：运行通道尚未就绪。".into(),
+                    "引导失败：运行通道尚未就绪。".into(),
                     "error",
                 );
             }
@@ -578,7 +575,7 @@ impl SdkManager {
         if let Err(error) =
             write_control(&control, &json!({ "action": "steer", "parts": parts })).await
         {
-            self.push_system(thread_id, format!("Vega 引导发送失败：{error}"), "error");
+            self.push_system(thread_id, format!("引导发送失败：{error}"), "error");
         }
     }
 
@@ -682,21 +679,18 @@ impl SdkManager {
         });
     }
 
-    /// 本地 `config.jsonc` 发生变化时调用。当前正在执行的 bridge 不打断，
+    /// 本地 `config.jsonc` 发生变化时调用。当前正在执行的任务不打断，
     /// 但会让下一轮请求、模型列表和预热实例使用新配置。
-    pub fn notify_alkaid_config_changed(self: &Arc<Self>) {
-        if !matches!(
-            self.adapter.agent_kind(),
-            AgentKind::Alkaid | AgentKind::Lyra
-        ) {
+    pub fn notify_config_changed(self: &Arc<Self>) {
+        if self.adapter.agent_kind() != AgentKind::Lyra {
             return;
         }
-        self.invalidate_alkaid_config();
+        self.invalidate_lyra_config();
     }
 
-    fn invalidate_alkaid_config(self: &Arc<Self>) {
-        crate::alkaid_complete::invalidate_config_cache();
-        self.alkaid_config_generation.fetch_add(1, Ordering::SeqCst);
+    fn invalidate_lyra_config(self: &Arc<Self>) {
+        crate::lyra_complete::invalidate_config_cache();
+        self.config_generation.fetch_add(1, Ordering::SeqCst);
         *self.model_options.lock().unwrap() = None;
         let _ = self.app.emit(
             EV_OPTIONS,
@@ -711,12 +705,12 @@ impl SdkManager {
         self.refresh_model_options_soon();
     }
 
-    /// 出借 Vega 额度：跑一次 bridge 导出本地 config.jsonc 的生效配置，
+    /// 出借 Lyra 额度：进程内导出本地 config.jsonc 的生效配置，
     /// 并把 {env:NAME} 密钥占位符解析成字面量，
     /// 借用方无需出借方的环境变量即可直接使用该配置。
     pub async fn export_quota_credentials(&self) -> Result<String, String> {
-        if self.adapter.agent_kind() != AgentKind::Alkaid {
-            return Err("仅 Vega 支持导出共享凭证".into());
+        if self.adapter.agent_kind() != AgentKind::Lyra {
+            return Err("仅 Lyra 支持导出共享凭证".into());
         }
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
@@ -726,7 +720,7 @@ impl SdkManager {
             .as_str()
             .filter(|config| !config.trim().is_empty())
             .map(str::to_string)
-            .ok_or_else(|| "Vega 凭证导出结果无效".into())
+            .ok_or_else(|| "Lyra 凭证导出结果无效".into())
     }
 
     /// 返回当前缓存的模型列表，供同步的远程快照构建逻辑使用。
@@ -781,7 +775,7 @@ impl SdkManager {
     }
 
     async fn refresh_model_options(&self) -> Result<Value, String> {
-        let generation = self.alkaid_config_generation.load(Ordering::SeqCst);
+        let generation = self.config_generation.load(Ordering::SeqCst);
         let cwd = std::env::current_dir()
             .unwrap_or_default()
             .to_string_lossy()
@@ -789,8 +783,8 @@ impl SdkManager {
         let value = self
             .run_bridge(&cwd, json!({ "action": "models", "cwd": cwd }))
             .await?;
-        if generation != self.alkaid_config_generation.load(Ordering::SeqCst) {
-            return Err("Vega 配置已更新，丢弃旧模型列表".into());
+        if generation != self.config_generation.load(Ordering::SeqCst) {
+            return Err("Lyra 配置已更新，丢弃旧模型列表".into());
         }
         *self.model_options.lock().unwrap() = Some(value.clone());
         let kind = self.adapter.agent_kind();
@@ -863,7 +857,7 @@ impl SdkManager {
         prompt: String,
     ) -> Result<String, String> {
         let data_dir = nova_data_dir(&self.app);
-        match crate::alkaid_complete::complete_direct(
+        match crate::lyra_complete::complete_direct(
             &self.http,
             &data_dir,
             &self.launch_env,
@@ -875,7 +869,7 @@ impl SdkManager {
             Ok(text) => return Ok(text),
             Err(error)
                 if error.contains("补全暂不支持直连协议")
-                    || error.contains("Vega provider 缺少 api") =>
+                    || error.contains("provider 缺少 api") =>
             {
                 // anthropic / google 等仍走 bridge
             }
@@ -1376,11 +1370,6 @@ impl SdkManager {
             // Node bridges also persist app-owned state. Pin them to the same profile-specific
             // root as Rust so debug builds never fall back to the release ~/.nova directory.
             .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
-        if self.adapter.agent_kind() == AgentKind::Alkaid {
-            let exe = std::env::current_exe()
-                .map_err(|e| format!("定位 Vega 内嵌 RTK 可执行文件失败：{e}"))?;
-            command.env("NOVA_RTK_EXE", exe);
-        }
         {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap();
@@ -2062,9 +2051,7 @@ mod tests {
         is_codex_model_resume_warning, normalize_title, parse_bridge_output, resolve_codex_model,
         text_snapshot_change, tool_call, TextSnapshotChange, TOOL_OUTPUT_LIMIT,
     };
-    use crate::sdk_adapters::{
-        AlkaidAdapter, ClaudeAdapter, CodexAdapter, CursorAdapter, SdkAdapter,
-    };
+    use crate::sdk_adapters::{ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter, SdkAdapter};
     use crate::threads::{now_ms, AgentKind, CodexUsageSnapshot, Item, Thread, ToolCall};
     use serde_json::json;
 
@@ -2177,14 +2164,14 @@ mod tests {
     }
 
     #[test]
-    fn alkaid_usage_includes_pi_cached_input() {
+    fn lyra_usage_includes_pi_cached_input() {
         let raw = json!({
             "input": 100,
             "output": 20,
             "cacheRead": 300,
             "cacheWrite": 40
         });
-        let (usage, _) = AlkaidAdapter.normalize_usage(Some(&raw), None, None);
+        let (usage, _) = LyraAdapter.normalize_usage(Some(&raw), None, None);
 
         assert_eq!(
             usage,

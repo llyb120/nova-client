@@ -185,7 +185,7 @@ fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
         config_dir.to_string_lossy().into_owned(),
     );
     [
-        AgentKind::Alkaid,
+        AgentKind::Lyra,
         AgentKind::Devin,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
@@ -204,9 +204,9 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
         .or_else(user_home_dir)
         .ok_or("无法确定用户主目录")?;
     let (label, path, format) = match kind {
-        // Lyra 与 Vega 共用数据目录与 AGENTS.md。
-        AgentKind::Alkaid | AgentKind::Lyra => (
-            "Vega",
+        // Lyra 沿用旧 Vega 数据目录与 AGENTS.md。
+        AgentKind::Lyra => (
+            "Lyra",
             configured_dir(overrides, "NOVA_DATA_DIR")
                 .unwrap_or_else(|| home.join(".nova"))
                 .join("alkaid")

@@ -196,7 +196,7 @@ export function Sidebar(props: {
     rows.sort((a, b) => b.chainUpdatedAt - a.chainUpdatedAt);
     return rows;
   };
-  const showHistoryByTime = () => state.settings?.historyDisplayMode === "time";
+  const showHistoryByTime = () => isBrowserView() || state.settings?.historyDisplayMode === "time";
   const timeRows = createMemo(() => {
     const effectiveUpdatedAt = (row: ThreadTreeRow) =>
       row.chainUpdatedAt ?? Math.max(row.thread.updatedAt, row.mergedChild?.updatedAt ?? 0);

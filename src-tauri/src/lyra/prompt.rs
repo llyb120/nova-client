@@ -157,6 +157,7 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "stream ended without finish_reason",
     "error decoding response body",
     "idle timeout",
+    "sse 连续",
     "429",
     "too many requests",
     "rate limit",
@@ -273,7 +274,10 @@ fn find_pwsh() -> Option<String> {
     }
     for key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
         if let Ok(root) = std::env::var(key) {
-            let candidate = PathBuf::from(root).join("PowerShell").join("7").join("pwsh.exe");
+            let candidate = PathBuf::from(root)
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
             if candidate.is_file() {
                 return Some(candidate.display().to_string());
             }
@@ -331,7 +335,7 @@ fn parse_skill(path: &Path) -> Option<Skill> {
     })
 }
 
-/// 与 Vega 共用技能目录（<root>/alkaid/skills/<name>/SKILL.md）。
+/// 技能目录（<root>/alkaid/skills/<name>/SKILL.md）。
 pub fn load_skills(roots: &crate::lyra::config::Roots) -> Vec<Skill> {
     let root = roots.skills();
     let mut skills = Vec::new();
@@ -403,7 +407,7 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     expanded
 }
 
-/// 应用级 AGENTS.md（与 Vega 共用数据目录）。
+/// 应用级 AGENTS.md（共享数据目录）。
 pub fn load_agent_instructions(roots: &crate::lyra::config::Roots) -> String {
     std::fs::read_to_string(roots.data().join("AGENTS.md"))
         .unwrap_or_default()
@@ -469,7 +473,7 @@ pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
 pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     let polaris = options.fast_context;
     let read_only = options.read_only;
-    // 与 Vega 提示词对齐：显式列出可用工具（按 Lyra 实际注册的工具集，只读模式无 bash/edit/write）。
+    // 显式列出可用工具（按 Lyra 实际注册的工具集，只读模式无 bash/edit/write）。
     let tool_lines: Vec<&str> = [
         options.auto_change_project.then_some(
             "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
@@ -539,7 +543,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     if read_only {
         dynamic.push("当前为计划模式：只读分析，不得修改文件。".into());
     }
-    // 与 Vega 对齐：统一为正斜杠并去掉 Windows 的 \\?\ 前缀。
+    // 统一为正斜杠并去掉 Windows 的 \\?\ 前缀。
     let cwd = options.cwd.trim_start_matches(r"\\?\").replace('\\', "/");
     dynamic.push(format!("Current working directory: {cwd}"));
     if !options.skills_text.is_empty() {
@@ -621,6 +625,12 @@ mod tests {
         ));
         assert!(is_retryable_provider_error(
             "读取响应流失败：error decoding response body"
+        ));
+        assert!(is_retryable_provider_error(
+            "provider SSE 连续 90s 无数据"
+        ));
+        assert!(is_retryable_provider_error(
+            "provider stream idle timeout: 90s 无增量事件"
         ));
         assert!(!is_retryable_provider_error("invalid api key"));
     }

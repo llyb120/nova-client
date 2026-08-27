@@ -163,7 +163,7 @@ fn init(app: &AppHandle, launch_env: &HashMap<String, String>) -> Result<ShellSh
     if pwsh.is_some() {
         ensure_alias(&helper, &dir, "pwsh.exe")?;
     }
-    // Alkaid / Cursor 可能用绝对路径启动 Git Bash，单纯覆盖 PATH 无法拦截。
+    // Lyra / Cursor 可能用绝对路径启动 Git Bash，单纯覆盖 PATH 无法拦截。
     // 为它们提供 bash helper；Cursor 还要求路径看起来像 Git Bash，因此放到 git\bin 下。
     // 同时保留根目录 bash.exe，兼容只查 PATH 裸名、不校验 git 路径的后端。
     let bash = real_bash(launch_env);

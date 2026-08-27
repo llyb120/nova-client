@@ -170,7 +170,7 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     match model.thinking_format.as_deref() {
         Some("deepseek") | Some("zai") => {
             body["thinking"] = json!({ "type": if enabled { "enabled" } else { "disabled" } });
-            // 与 Vega 对齐：deepseek 等在 thinking.enabled 之外同时发送 reasoning_effort（如 max）。
+            // deepseek 等在 thinking.enabled 之外同时发送 reasoning_effort（如 max）。
             if enabled && model.supports_reasoning_effort {
                 if let Some(level) = level {
                     body["reasoning_effort"] = json!(level);
@@ -230,6 +230,12 @@ fn completions_body(
     }
     if let Some(tier) = &model.service_tier {
         body["service_tier"] = json!(tier);
+    }
+    if let Some(temperature) = model.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = model.top_p {
+        body["top_p"] = json!(top_p);
     }
     body
 }
@@ -342,7 +348,7 @@ fn responses_body(
         body["tools"] = Value::Array(tool_defs);
     }
     if model.reasoning && level != Some("off") {
-        // 与 Vega/PI 对齐：OpenAI Responses 只有显式请求 summary 才会流式返回
+        // OpenAI Responses 只有显式请求 summary 才会流式返回
         // response.reasoning_summary_text.delta；仅发送 effort 会有推理开销但前端无内容可展示。
         let mut reasoning = Map::new();
         reasoning.insert("summary".into(), json!("auto"));
@@ -360,6 +366,12 @@ fn responses_body(
     if let Some(tier) = &model.service_tier {
         body["service_tier"] = json!(tier);
     }
+    if let Some(temperature) = model.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = model.top_p {
+        body["top_p"] = json!(top_p);
+    }
     body
 }
 
@@ -368,7 +380,7 @@ fn responses_body(
 // PI/OpenAI SDK 的请求可由 AbortSignal 打断；Lyra 使用 reqwest 时必须显式把取消和
 // deadline 并入网络 future，否则代理接受连接后不发响应头/SSE 时会永久挂起。
 const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 async fn wait_cancelled(cancel: &Arc<AtomicBool>) {
@@ -419,7 +431,7 @@ async fn post_stream(
     }
     if model.session_affinity_headers {
         if let Some(session) = session_id {
-            // 与 Vega(PI) 对齐：openrouter 只发 x-session-id；其余发 session_id（openai 格式）
+            // openrouter 只发 x-session-id；其余发 session_id（openai 格式）
             // + x-client-request-id + x-session-affinity，提高代理层会话亲和/前缀缓存命中。
             if model.session_affinity_format == "openrouter" {
                 request = request.header("x-session-id", session);
@@ -480,7 +492,7 @@ async fn read_sse(
             if line.ends_with('\r') {
                 line.pop();
             }
-            let Some(data) = crate::alkaid_complete::sse_data_payload(&line) else {
+            let Some(data) = crate::lyra_complete::sse_data_payload(&line) else {
                 continue;
             };
             if data == "[DONE]" {
@@ -625,7 +637,7 @@ async fn stream_completions(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
-    let url = crate::alkaid_complete::join_url(&model.base_url, "chat/completions");
+    let url = crate::lyra_complete::join_url(&model.base_url, "chat/completions");
     let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await?;
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
@@ -754,7 +766,7 @@ async fn stream_responses(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
-    let url = crate::alkaid_complete::join_url(&model.base_url, "responses");
+    let url = crate::lyra_complete::join_url(&model.base_url, "responses");
     let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await?;
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
@@ -950,7 +962,7 @@ fn is_retryable_stream_error(error: &str) -> bool {
         "timeout",
         "timed out",
         "响应头等待超过",
-        "sse 连续",
+        // SSE 空闲由 bridge 做“无新用户消息的继续”重试，避免这里与外层叠加。
         "http 429",
         "too many requests",
         "rate limit",
@@ -1463,6 +1475,8 @@ mod tests {
             context_window: 128_000,
             max_output_tokens: 32_000,
             service_tier: Some("flex".into()),
+            temperature: Some(1.0),
+            top_p: Some(0.95),
             supports_images: true,
             requires_reasoning_content: false,
             session_affinity_headers: false,
@@ -1479,6 +1493,10 @@ mod tests {
         ));
         assert!(is_retryable_stream_error("HTTP 503 Service Unavailable"));
         assert!(is_retryable_stream_error("connection reset by peer"));
+        assert!(
+            !is_retryable_stream_error("provider SSE 连续 90s 无数据"),
+            "SSE 空闲应交给外层 continuation 重试"
+        );
         assert!(!is_retryable_stream_error("HTTP 401 Unauthorized"));
         assert!(!is_retryable_stream_error("provider 错误：invalid request"));
     }
@@ -1497,13 +1515,15 @@ mod tests {
         assert_eq!(body["prompt_cache_key"], "session-1");
         assert_eq!(body["prompt_cache_retention"], "24h");
         assert_eq!(body["service_tier"], "flex");
+        assert_eq!(body["temperature"], 1.0);
+        assert_eq!(body["top_p"], 0.95);
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"][0]["text"], "你好");
     }
 
     #[test]
-    fn responses_payload_requests_reasoning_summary_like_vega() {
+    fn responses_payload_requests_reasoning_summary() {
         let model = test_model("openai-responses");
         let body = responses_body(
             &model,

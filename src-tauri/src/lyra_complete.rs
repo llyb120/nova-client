@@ -1,4 +1,4 @@
-//! 输入框补全：Rust 直连 Vega provider HTTP，不再为每次补全冷启 Node bridge。
+//! 输入框补全：Rust 直连 Lyra provider HTTP，不再为每次补全冷启 Node bridge。
 
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -24,6 +24,8 @@ struct ResolvedCompletionTarget {
     max_tokens_field: &'static str,
     reasoning: bool,
     service_tier: Option<String>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 struct CachedConfig {
@@ -74,6 +76,12 @@ async fn complete_openai_completions(
     if let Some(service_tier) = &target.service_tier {
         body["service_tier"] = json!(service_tier);
     }
+    if let Some(temperature) = target.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = target.top_p {
+        body["top_p"] = json!(top_p);
+    }
     apply_thinking_disabled_completions(&mut body, target);
     let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
     read_completions_sse(&mut response).await
@@ -94,6 +102,12 @@ async fn complete_openai_responses(
     });
     if let Some(service_tier) = &target.service_tier {
         body["service_tier"] = json!(service_tier);
+    }
+    if let Some(temperature) = target.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = target.top_p {
+        body["top_p"] = json!(top_p);
     }
     if target.reasoning {
         body["reasoning"] = json!({ "effort": "none" });
@@ -347,16 +361,16 @@ pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
     let config = match std::fs::read_to_string(&path) {
         Ok(text) => parse_jsonc(&text)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!("未找到 Vega 配置：{}", path.display()));
+            return Err(format!("未找到 Lyra 配置：{}", path.display()));
         }
-        Err(error) => return Err(format!("读取 Vega 配置失败：{error}")),
+        Err(error) => return Err(format!("读取 Lyra 配置失败：{error}")),
     };
     if !config
         .get("provider")
         .map(Value::is_object)
         .unwrap_or(false)
     {
-        return Err("Vega 配置缺少 provider".into());
+        return Err("Lyra 配置缺少 provider".into());
     }
     *config_cache().lock().unwrap() = Some(CachedConfig {
         path,
@@ -372,7 +386,7 @@ fn resolve_target(
     env: &HashMap<String, String>,
 ) -> Result<ResolvedCompletionTarget, String> {
     if selection.is_empty() || !selection.contains('/') {
-        return Err("Vega model 必须是 provider/model 格式".into());
+        return Err("Lyra model 必须是 provider/model 格式".into());
     }
     let marker = "/variant/";
     let base_selection = selection
@@ -381,13 +395,13 @@ fn resolve_target(
         .unwrap_or(selection);
     let (provider_id, model_id) = base_selection
         .split_once('/')
-        .ok_or_else(|| "Vega model 必须是 provider/model 格式".to_string())?;
+        .ok_or_else(|| "Lyra model 必须是 provider/model 格式".to_string())?;
     let provider = config
         .pointer(&format!("/provider/{provider_id}"))
-        .ok_or_else(|| format!("Vega provider 不存在：{provider_id}"))?;
+        .ok_or_else(|| format!("Lyra provider 不存在：{provider_id}"))?;
     let model = provider
         .pointer(&format!("/models/{model_id}"))
-        .ok_or_else(|| format!("Vega model 不存在：{base_selection}"))?;
+        .ok_or_else(|| format!("Lyra model 不存在：{base_selection}"))?;
     let options = provider
         .get("options")
         .cloned()
@@ -401,7 +415,7 @@ fn resolve_target(
         env,
     )?;
     if base_url.is_empty() {
-        return Err(format!("Vega provider 缺少 options.baseURL：{provider_id}"));
+        return Err(format!("Lyra provider 缺少 options.baseURL：{provider_id}"));
     }
     let api_key = resolve_env_string(
         options
@@ -427,6 +441,24 @@ fn resolve_target(
         .or_else(|| provider.pointer("/options/service_tier"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    // 采样参数：variant > model.options > provider.options，camel/snake 均可。
+    fn sampling_number(
+        variant_options: Option<&Map<String, Value>>,
+        model: &Value,
+        provider: &Value,
+        camel: &str,
+        snake: &str,
+    ) -> Option<f64> {
+        variant_options
+            .and_then(|value| value.get(camel).or_else(|| value.get(snake)))
+            .or_else(|| model.pointer(&format!("/options/{camel}")))
+            .or_else(|| model.pointer(&format!("/options/{snake}")))
+            .or_else(|| provider.pointer(&format!("/options/{camel}")))
+            .or_else(|| provider.pointer(&format!("/options/{snake}")))
+            .and_then(Value::as_f64)
+    }
+    let temperature = sampling_number(variant_options, model, provider, "temperature", "temperature");
+    let top_p = sampling_number(variant_options, model, provider, "topP", "top_p");
     let reasoning = model
         .get("reasoning")
         .and_then(Value::as_bool)
@@ -457,6 +489,8 @@ fn resolve_target(
         max_tokens_field,
         reasoning,
         service_tier,
+        temperature,
+        top_p,
     })
 }
 
@@ -480,7 +514,7 @@ pub(crate) fn provider_api(provider: &Value) -> Result<String, String> {
     if npm.contains("openai") {
         return Ok("openai-responses".into());
     }
-    Err("Vega provider 缺少 api，且无法从 npm 推导协议".into())
+    Err("Lyra provider 缺少 api，且无法从 npm 推导协议".into())
 }
 
 pub(crate) fn detect_thinking_format(
@@ -526,7 +560,7 @@ pub(crate) fn detect_max_tokens_field(base_url: &str, provider: &Value) -> &'sta
     {
         "max_tokens"
     } else {
-        // 与 Vega/PI 对齐：标准及未知 OpenAI-compatible 默认 max_completion_tokens；
+        // 与 Lyra/PI 对齐：标准及未知 OpenAI-compatible 默认 max_completion_tokens；
         // 只有 PI 明确识别的兼容服务默认使用旧 max_tokens，配置仍可显式覆盖。
         "max_completion_tokens"
     }
@@ -546,7 +580,7 @@ pub(crate) fn resolve_env_string(
             .get(name)
             .cloned()
             .or_else(|| std::env::var(name).ok())
-            .ok_or_else(|| format!("Vega 配置引用的环境变量 {name} 未注入 Nova 进程"))?;
+            .ok_or_else(|| format!("Lyra 配置引用的环境变量 {name} 未注入 Nova 进程"))?;
         out = out.replace(full, &resolved);
     }
     Ok(out)
@@ -562,7 +596,7 @@ pub(crate) fn join_url(base: &str, path: &str) -> String {
 
 pub(crate) fn parse_jsonc(text: &str) -> Result<Value, String> {
     let stripped = strip_trailing_commas(&strip_json_comments(text));
-    serde_json::from_str(&stripped).map_err(|e| format!("解析 Vega 配置失败：{e}"))
+    serde_json::from_str(&stripped).map_err(|e| format!("解析 Lyra 配置失败：{e}"))
 }
 
 fn strip_json_comments(text: &str) -> String {

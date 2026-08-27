@@ -1,5 +1,4 @@
 import { getVersion } from "@tauri-apps/api/app";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
 import * as QRCode from "qrcode";
@@ -36,7 +35,6 @@ import {
 import type {
   AgentInstructionTarget,
   AgentKind,
-  CliOperationProgress,
   CliStatus,
   Peer,
   SessionShortcut,
@@ -178,14 +176,16 @@ function ProxyField(props: { value: string; onInput: (v: string) => void }) {
 function CliManager(props: {
   status?: CliStatus;
   loading: boolean;
-  busy: boolean;
-  upgrading: boolean;
-  message?: string;
-  progress?: CliOperationProgress;
-  output?: string;
-  onUpgrade: () => void;
 }) {
-  const failed = () => props.message?.includes("失败") || props.progress?.stage === "failed";
+  const [copied, setCopied] = createSignal(false);
+  const command = () => props.status?.installCommand ?? "";
+  const copy = () => {
+    if (!command()) return;
+    void navigator.clipboard.writeText(command()).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    });
+  };
   return (
     <div class="cli-manager">
       <div class="cli-manager-main">
@@ -202,44 +202,14 @@ function CliManager(props: {
             {props.loading ? "正在读取版本…" : (props.status?.version ?? "尚未检测")}
           </span>
         </div>
-        <button
-          type="button"
-          class="btn secondary cli-upgrade-btn"
-          disabled={props.loading || props.busy || props.status?.upgradeSupported !== true}
-          onClick={props.onUpgrade}
-        >
-          {props.upgrading
-            ? (props.status?.installed === false ? "安装中…" : "升级中…")
-            : (props.status?.installed === false ? "一键安装" : "一键升级")}
-        </button>
-        <Show when={props.message}>
-          <span class={`cli-manager-message ${failed() ? "bad" : "ok"}`} title={props.message}>
-            {props.message}
-          </span>
-        </Show>
-        <Show when={!props.message && !props.loading && props.status?.upgradeSupported === false}>
-          <span class="cli-manager-message bad" title={props.status?.detail}>
-            {props.status?.detail}
-          </span>
-        </Show>
       </div>
-      <Show when={props.progress}>
-        {(progress) => (
-          <div class="cli-operation-progress">
-            <div class="cli-progress-track" aria-label={`${progress().action}进度 ${progress().percent}%`}>
-              <span style={{ width: `${progress().percent}%` }} />
-            </div>
-            <span classList={{ "cli-progress-label": true, bad: failed() }}>
-              {progress().percent}% · {progress().message}
-            </span>
-          </div>
-        )}
-      </Show>
-      <Show when={props.output}>
-        <details class="cli-shell-output" open={props.upgrading || failed()}>
-          <summary>Shell 输出</summary>
-          <pre>{props.output}</pre>
-        </details>
+      <Show when={command()}>
+        <div class="cli-install-row">
+          <code title={command()}>{command()}</code>
+          <button type="button" class="btn secondary cli-copy-btn" onClick={copy}>
+            {copied() ? "已复制" : "复制"}
+          </button>
+        </div>
       </Show>
     </div>
   );
@@ -280,7 +250,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [opencodePath, setOpencodePath] = createSignal(s?.opencodePath ?? "opencode");
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
-  const [vegaProxy, setVegaProxy] = createSignal(s?.vegaProxy ?? "");
+  const [lyraProxy, setLyraProxy] = createSignal(s?.lyraProxy ?? "");
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
@@ -315,15 +285,11 @@ export function SettingsModal(props: { onClose: () => void }) {
       .filter((item) => item.action !== "stopSession")
       .map((item) => ({ ...item })),
   );
-  const [vegaContextMode] = createSignal<"default" | "super">(
-    s?.vegaContextMode === "super" ? "super" : "default",
-  );
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
     s?.cursorContextMode === "super" ? "super" : "default",
   );
   const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
   const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
-  const [vegaEnabled, setVegaEnabled] = createSignal(s?.vegaEnabled === true);
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
   const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
@@ -332,7 +298,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [opencodeEnabled, setOpencodeEnabled] = createSignal(s?.opencodeEnabled !== false);
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
   const [lightweightAgent, setLightweightAgent] = createSignal<AgentKind>(
-    (s?.lightweightModelAgent as AgentKind) || "alkaid",
+    (s?.lightweightModelAgent as AgentKind) || "lyra",
   );
   const [lightweightModel, setLightweightModel] = createSignal(s?.lightweightModel ?? "");
   const [stageModels, setStageModels] = createSignal<Settings["stageModels"]>(
@@ -391,32 +357,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [environmentRefreshFailed, setEnvironmentRefreshFailed] = createSignal(false);
   const [cliStatuses, setCliStatuses] = createSignal<Partial<Record<AgentKind, CliStatus>>>({});
   const [cliLoading, setCliLoading] = createSignal(false);
-  const [upgradingCli, setUpgradingCli] = createSignal<AgentKind | null>(null);
-  const [cliMessages, setCliMessages] = createSignal<Partial<Record<AgentKind, string>>>({});
-  const [cliProgress, setCliProgress] = createSignal<Partial<Record<AgentKind, CliOperationProgress>>>({});
-  const [cliOutputs, setCliOutputs] = createSignal<Partial<Record<AgentKind, string>>>({});
-  const activeCliOperations: Partial<Record<AgentKind, string>> = {};
-  let disposedCliProgressListener = false;
-  let stopCliProgressListener: (() => void) | undefined;
-  void listen<CliOperationProgress>("cli:operation-progress", (event) => {
-    const progress = event.payload;
-    if (activeCliOperations[progress.agentKind] !== progress.operationId) return;
-    setCliProgress((prev) => ({ ...prev, [progress.agentKind]: progress }));
-    const isTicker = progress.stage === "running" && /^正在(安装|升级) .+…$/.test(progress.message);
-    if (isTicker) return;
-    setCliOutputs((prev) => {
-      const current = prev[progress.agentKind] ?? "";
-      const next = current ? `${current}\n${progress.message}` : progress.message;
-      return { ...prev, [progress.agentKind]: next.slice(-12000) };
-    });
-  }).then((unlisten) => {
-    if (disposedCliProgressListener) unlisten();
-    else stopCliProgressListener = unlisten;
-  });
-  onCleanup(() => {
-    disposedCliProgressListener = true;
-    stopCliProgressListener?.();
-  });
   const [quotaRefreshing, setQuotaRefreshing] = createSignal(false);
 
   const reloadQuota = async () => {
@@ -428,20 +368,20 @@ export function SettingsModal(props: { onClose: () => void }) {
     }
   };
 
-  const [vegaRefreshing, setVegaRefreshing] = createSignal(false);
-  const [vegaRefreshMsg, setVegaRefreshMsg] = createSignal("");
+  const [lyraRefreshing, setLyraRefreshing] = createSignal(false);
+  const [lyraRefreshMsg, setLyraRefreshMsg] = createSignal("");
 
-  const refreshVegaConfig = async () => {
-    setVegaRefreshing(true);
-    setVegaRefreshMsg("");
+  const refreshLyraConfig = async () => {
+    setLyraRefreshing(true);
+    setLyraRefreshMsg("");
     try {
-      await api.refreshAlkaidConfig();
-      setVegaRefreshMsg("已重载配置，模型列表刷新中…");
-      setTimeout(() => setVegaRefreshMsg(""), 4000);
+      await api.refreshLyraConfig();
+      setLyraRefreshMsg("已重载配置，模型列表刷新中…");
+      setTimeout(() => setLyraRefreshMsg(""), 4000);
     } catch (e) {
-      setVegaRefreshMsg(`刷新失败：${String(e)}`);
+      setLyraRefreshMsg(`刷新失败：${String(e)}`);
     } finally {
-      setVegaRefreshing(false);
+      setLyraRefreshing(false);
     }
   };
 
@@ -478,7 +418,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const enabledCount = () =>
     [
       devinEnabled(),
-      vegaEnabled(),
       lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
@@ -489,7 +428,6 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const quotaShareKinds = createMemo<AgentKind[]>(() => {
     const kinds: AgentKind[] = [];
-    if (vegaEnabled()) kinds.push("alkaid");
     if (lyraEnabled()) kinds.push("lyra");
     if (devinEnabled()) kinds.push("devin");
     if (codexEnabled()) kinds.push("codex");
@@ -759,7 +697,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     opencodePath: opencodePath().trim() || "opencode",
     codexPath: codexPath().trim() || "codex",
     codexProxy: codexProxy().trim(),
-    vegaProxy: vegaProxy().trim(),
+    lyraProxy: lyraProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
     powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
@@ -777,7 +715,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     cursorModelContexts: cursorModelContexts()
       .map((rule) => ({ prefix: rule.prefix.trim(), contextWindow: rule.contextWindow }))
       .filter((rule) => rule.prefix.length > 0),
-    vegaContextMode: vegaContextMode(),
     cursorContextMode: cursorContextMode(),
     opencodeProxy: opencodeProxy().trim(),
     defaultMode: "build",
@@ -796,7 +733,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     modelFavorites: state.settings?.modelFavorites ?? [],
     sessionShortcuts: draftSessionShortcuts(),
     devinEnabled: devinEnabled(),
-    vegaEnabled: vegaEnabled(),
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
@@ -831,35 +767,6 @@ export function SettingsModal(props: { onClose: () => void }) {
       setCliStatuses(next);
     } finally {
       setCliLoading(false);
-    }
-  };
-
-  const upgradeCli = async (kind: AgentKind) => {
-    const wasInstalled = cliStatuses()[kind]?.installed !== false;
-    const operationId = typeof globalThis.crypto?.randomUUID === "function"
-      ? globalThis.crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    activeCliOperations[kind] = operationId;
-    setUpgradingCli(kind);
-    setCliMessages((prev) => ({ ...prev, [kind]: "" }));
-    setCliProgress((prev) => ({ ...prev, [kind]: undefined }));
-    setCliOutputs((prev) => ({ ...prev, [kind]: "" }));
-    try {
-      const status = await api.upgradeCli(kind, draftSettings(), operationId);
-      setCliStatuses((prev) => ({ ...prev, [kind]: status }));
-      setCliMessages((prev) => ({
-        ...prev,
-        [kind]: `${wasInstalled ? "更新" : "安装"}成功：${status.version}`,
-      }));
-    } catch (e) {
-      const cancelled = String(e).includes("CLI 操作已取消");
-      setCliMessages((prev) => ({
-        ...prev,
-        [kind]: cancelled ? "操作已取消" : `${wasInstalled ? "升级" : "安装"}失败：${String(e)}`,
-      }));
-    } finally {
-      delete activeCliOperations[kind];
-      setUpgradingCli(null);
     }
   };
 
@@ -1373,7 +1280,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                                         when={item().action === "selectProject"}
                                         fallback={
                                           <ModelPicker
-                                            agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "alkaid")}
+                                            agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "lyra")}
                                             agentKinds={enabledAgentKinds()}
                                             model={modelTarget()?.model ?? ""}
                                             sharedModels={shortcutSharedModels()}
@@ -1486,7 +1393,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                         /stage{stageModels().length + 1}
                       </span>
                       <ModelPicker
-                        agentKind={draftStageKind() ?? (enabledAgentKinds()[0] ?? "alkaid")}
+                        agentKind={draftStageKind() ?? (enabledAgentKinds()[0] ?? "lyra")}
                         agentKinds={enabledAgentKinds()}
                         model={draftStageModel()}
                         allowDefault
@@ -1607,7 +1514,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  默认开启。关闭后 Lyra 和 Vega 不再提供切换工作目录/项目的工具，也不会注入对应提示词。
+                  默认开启。关闭后 Lyra 不再提���切换工作目录/项目的工具，也不会注入对应提示词。
                 </span>
               </div>
               <div class="field">
@@ -1635,7 +1542,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  默认开启。Windows 下 Vega 与 Lyra 的 bash 工具按 UTF-8 捕获 PowerShell 输出，修复中文等字符出现「?」或乱码的问题。保存后对新会话生效。
+                  默认开启。Windows 下 Lyra 的 bash 工具按 UTF-8 捕获 PowerShell 输出，修复中文等字符出现「?」或乱码的问题。保存后对新会话生效。
                 </span>
               </div>
             </section>
@@ -1709,41 +1616,8 @@ export function SettingsModal(props: { onClose: () => void }) {
 
             <div class="backend-card">
               <div class="backend-card-head">
-                <span class={`agent-badge alkaid`}>{agentLabel("alkaid")}</span>
-                <span class="fixed-integration">PI</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={vegaEnabled()}
-                    disabled={vegaEnabled() && enabledCount() === 1}
-                    onChange={(e) => setVegaEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <span class="field-hint">复用本机 Codex provider 凭据，支持并行文件工具、MCP 与 Skills。</span>
-              <ProxyField value={vegaProxy()} onInput={setVegaProxy} />
-              <div class="backend-quota-row">
-                <span class="field-label">本地配置</span>
-                <span class="field-hint">修改 ~/.nova/alkaid/config.jsonc 后点此按钮，立即重载模型列表、补全与预热配置。</span>
-                <Show when={vegaRefreshMsg()}>
-                  <span class="field-hint">{vegaRefreshMsg()}</span>
-                </Show>
-                <button
-                  type="button"
-                  class="link-btn backend-quota-refresh"
-                  disabled={vegaRefreshing()}
-                  onClick={() => void refreshVegaConfig()}
-                >
-                  {vegaRefreshing() ? "刷新中…" : "刷新配置"}
-                </button>
-              </div>
-            </div>
-
-            <div class="backend-card">
-              <div class="backend-card-head">
                 <span class={`agent-badge lyra`}>{agentLabel("lyra")}</span>
-                <span class="fixed-integration">原生</span>
+                <span class="fixed-integration">Rust</span>
                 <label class="backend-switch">
                   <input
                     type="checkbox"
@@ -1754,7 +1628,23 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <span class="field-hint">Rust 原生 agent，不经 Node bridge；与 Vega 共用模型配置与 Skills。</span>
+              <span class="field-hint">Rust 原生 agent，不经 Node bridge；复用本机模型 provider 配置与 Skills。</span>
+              <ProxyField value={lyraProxy()} onInput={setLyraProxy} />
+              <div class="backend-quota-row">
+                <span class="field-label">本地配置</span>
+                <span class="field-hint">修改 ~/.nova/alkaid/config.jsonc 后点此按钮，立即重载模型列表、补全与预热配置。</span>
+                <Show when={lyraRefreshMsg()}>
+                  <span class="field-hint">{lyraRefreshMsg()}</span>
+                </Show>
+                <button
+                  type="button"
+                  class="link-btn backend-quota-refresh"
+                  disabled={lyraRefreshing()}
+                  onClick={() => void refreshLyraConfig()}
+                >
+                  {lyraRefreshing() ? "刷新中…" : "刷新配置"}
+                </button>
+              </div>
             </div>
 
             <div class="backend-card">
@@ -1774,16 +1664,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <CliManager
-                status={cliStatuses().devin}
-                loading={cliLoading()}
-                busy={upgradingCli() !== null}
-                upgrading={upgradingCli() === "devin"}
-                message={cliMessages().devin}
-                progress={cliProgress().devin}
-                output={cliOutputs().devin}
-                onUpgrade={() => void upgradeCli("devin")}
-              />
+              <CliManager status={cliStatuses().devin} loading={cliLoading()} />
               <div class="backend-fields">
                 <label class="backend-field">
                   <span class="field-label">可执行文件</span>
@@ -1839,16 +1720,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <CliManager
-                status={cliStatuses().codebuddy}
-                loading={cliLoading()}
-                busy={upgradingCli() !== null}
-                upgrading={upgradingCli() === "codebuddy"}
-                message={cliMessages().codebuddy}
-                progress={cliProgress().codebuddy}
-                output={cliOutputs().codebuddy}
-                onUpgrade={() => void upgradeCli("codebuddy")}
-              />
+              <CliManager status={cliStatuses().codebuddy} loading={cliLoading()} />
               <div class="backend-fields">
                 <label class="backend-field">
                   <span class="field-label">可执行文件</span>
@@ -1875,16 +1747,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <CliManager
-                status={cliStatuses().claudecode}
-                loading={cliLoading()}
-                busy={upgradingCli() !== null}
-                upgrading={upgradingCli() === "claudecode"}
-                message={cliMessages().claudecode}
-                progress={cliProgress().claudecode}
-                output={cliOutputs().claudecode}
-                onUpgrade={() => void upgradeCli("claudecode")}
-              />
+              <CliManager status={cliStatuses().claudecode} loading={cliLoading()} />
               <div class="backend-fields">
                 <label class="backend-field">
                   <span class="field-label">可执行文件</span>
@@ -1915,16 +1778,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <CliManager
-                status={cliStatuses().codex}
-                loading={cliLoading()}
-                busy={upgradingCli() !== null}
-                upgrading={upgradingCli() === "codex"}
-                message={cliMessages().codex}
-                progress={cliProgress().codex}
-                output={cliOutputs().codex}
-                onUpgrade={() => void upgradeCli("codex")}
-              />
+              <CliManager status={cliStatuses().codex} loading={cliLoading()} />
               <div class="backend-fields">
                 <label class="backend-field">
                   <span class="field-label">可执行文件</span>
@@ -2036,16 +1890,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
               </div>
-              <CliManager
-                status={cliStatuses().opencode}
-                loading={cliLoading()}
-                busy={upgradingCli() !== null}
-                upgrading={upgradingCli() === "opencode"}
-                message={cliMessages().opencode}
-                progress={cliProgress().opencode}
-                output={cliOutputs().opencode}
-                onUpgrade={() => void upgradeCli("opencode")}
-              />
+              <CliManager status={cliStatuses().opencode} loading={cliLoading()} />
               <div class="backend-fields">
                 <label class="backend-field">
                   <span class="field-label">可执行文件</span>

@@ -74,7 +74,7 @@ fn truncate_at_restore(messages: Vec<Value>, restore_at: Option<&str>) -> Vec<Va
     }
 }
 
-/// 与 Vega/PI 的 settlePendingInput 对齐：provider 最后一轮结束与控制通道收取
+/// provider 最后一轮结束与控制通道收取需要对齐：provider 最后一轮结束与控制通道收取
 /// steer 之间存在竞争，必须等到控制通道经历一个安静窗口后才能判定任务结束。
 async fn settle_pending_input(command_busy: &AtomicBool, command_revision: &AtomicU64) {
     loop {
@@ -361,7 +361,7 @@ async fn handle_prompt(
     let mut use_full_context =
         reasonix::should_use_full_context(&memory, force_context_tokens, max_context_chars);
     memory.append_turn(&text);
-    // 与 Vega 一致：摘要容量判断基于重建后的 slim memory，而不是即将丢弃的
+    // 摘要容量判断基于重建后的 slim memory，而不是即将丢弃的
     // 原生 reasoning/tool trajectory usage。
     let rebuilt_context_tokens = estimate_text_tokens(&memory.format());
     let summarize_model = lightweight.clone().unwrap_or_else(|| resolved.clone());
@@ -917,7 +917,7 @@ async fn handle_prompt(
 
 fn models_data(request: &Value, roots: &Roots) -> Result<Value, String> {
     let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
-    // 与 Vega bridge 相同的 configOptions 形状：前端与漫游/雷达都只认 id=="model" 的包裹结构，
+    // 沿用旧 bridge的 configOptions 形状：前端与漫游/雷达都只认 id=="model" 的包裹结构，
     // 直接返回扁平选项列表会导致选择器永远为空。
     let current = config::default_model(&config_value)?; // 与 JS 一样先校验存在可用模型
     Ok(json!({
@@ -983,7 +983,7 @@ async fn complete_data(
         .get("prompt")
         .and_then(Value::as_str)
         .ok_or_else(|| "complete 请求缺少 prompt".to_string())?;
-    let data = crate::alkaid_complete::complete_direct(
+    let data = crate::lyra_complete::complete_direct(
         http,
         roots.nova(),
         &config::process_env(),

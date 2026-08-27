@@ -1,6 +1,6 @@
 import type { WorkflowDef } from "./workflow/types";
 
-export type AgentKind = "alkaid" | "lyra" | "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
+export type AgentKind = "lyra" | "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
 
 export interface SlashCommand {
   name: string;
@@ -426,8 +426,6 @@ export interface Settings {
   cursorDisableSubagents: boolean;
   /** Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。 */
   cursorModelContexts: CursorModelContextRule[];
-  /** Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
-  vegaContextMode: "default" | "super";
   /** Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
   cursorContextMode: "default" | "super";
   /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */
@@ -435,13 +433,13 @@ export interface Settings {
   opencodeProxy: string;
   codexPath: string;
   codexProxy: string;
-  /** Vega provider 代理地址 */
-  vegaProxy: string;
+  /** Lyra provider 代理地址 */
+  lyraProxy: string;
   /** Windows shell 启动 shim（保存后重启应用生效） */
   windowsShellShimEnabled: boolean;
   /** PowerShell 输出按 UTF-8 捕获，避免 GBK 与 UTF-8 解码错配乱码；默认开启。 */
   powershellUtf8Enabled: boolean;
-  /** 是否允许 Lyra/Vega 自动切换当前项目和工具工作目录；默认开启。 */
+  /** 是否允许 Lyra 自动切换当前项目和工具工作目录；默认开启。 */
   autoChangeProjectEnabled: boolean;
   /** ponytail 极简模式：system prompt 注入最小实现/最少改动规则；默认开启。 */
   ponytailEnabled: boolean;
@@ -480,7 +478,6 @@ export interface Settings {
   sessionShortcuts: SessionShortcut[];
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
-  vegaEnabled: boolean;
   lyraEnabled: boolean;
   codexEnabled: boolean;
   codebuddyEnabled: boolean;
@@ -605,17 +602,8 @@ export interface CliStatus {
   cliName: string;
   installed: boolean;
   version: string;
-  upgradeSupported: boolean;
+  installCommand: string;
   detail: string;
-}
-
-export interface CliOperationProgress {
-  operationId: string;
-  agentKind: AgentKind;
-  action: "安装" | "升级";
-  stage: "waiting" | "running" | "verifying" | "completed" | "failed" | "cancelled";
-  percent: number;
-  message: string;
 }
 
 /** worktree「基于分支」下拉的数据：当前分支 + 本地分支列表 */
@@ -708,7 +696,7 @@ export interface IncomingRoamRequest {
 
 export interface QuotaRoamingProgress {
   operationId: string;
-  stage: "requesting" | "installing" | "preparing" | "ready";
+  stage: "requesting" | "preparing" | "ready";
   message: string;
 }
 

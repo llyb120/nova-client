@@ -1146,7 +1146,7 @@ mod tests {
     fn removes_complete_prompt_turns_and_keeps_neighboring_context() {
         let mut thread = Thread::new(
             ".".into(),
-            crate::threads::AgentKind::Alkaid,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,

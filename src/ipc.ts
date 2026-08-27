@@ -45,6 +45,7 @@ function fileUriPath(uri: string) {
 
 export const api = {
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
+  loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),
   getThread: (threadId: string) => invoke<Thread>("get_thread", { threadId }),
   createTimeMachineCheckpoint: (threadId: string) =>
     invoke<TimeMachineTimeline>("create_time_machine_checkpoint", { threadId }),
@@ -212,8 +213,8 @@ export const api = {
     invoke<void>("set_thread_agent", { threadId, agentKind, model, mode, reasoningEffort }),
   getModelOptions: (agentKind: AgentKind) =>
     invoke<ModelOptions | null>("get_model_options", { agentKind }),
-  /** 设置页手动刷新 Vega 本地配置：重读 config.jsonc 并后台重拉模型列表。 */
-  refreshAlkaidConfig: () => invoke<void>("refresh_alkaid_config"),
+  /** 设置页手动刷新 Lyra 本地配置：重读 config.jsonc 并后台重拉模型列表。 */
+  refreshLyraConfig: () => invoke<void>("refresh_lyra_config"),
   getSlashCommands: (agentKind: AgentKind) =>
     invoke<SlashCommand[]>("get_slash_commands", { agentKind }),
   renameThread: (threadId: string, title: string) =>
@@ -255,10 +256,6 @@ export const api = {
     invoke<Record<string, boolean>>("get_backend_availability"),
   getCliStatuses: (settings: Settings) =>
     invoke<CliStatus[]>("get_cli_statuses", { settings }),
-  upgradeCli: (agentKind: AgentKind, settings: Settings, operationId: string) =>
-    invoke<CliStatus>("upgrade_cli", { agentKind, settings, operationId }),
-  cancelCliOperation: (operationId: string) =>
-    invoke<boolean>("cancel_cli_operation", { operationId }),
   restartDevin: () => invoke<void>("restart_devin"),
   getStatus: () => invoke<Status>("get_status"),
   getLogs: () => invoke<string[]>("get_logs"),

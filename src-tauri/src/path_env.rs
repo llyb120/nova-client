@@ -15,7 +15,12 @@ const PATH_MARKER_END: &[u8] = b"__NOVA_PATH_END__";
 /// 因此必须在任何后端检测、CLI 子命令或 Tauri 线程启动前恢复终端使用的 PATH。
 pub fn init_process_path() {
     #[cfg(windows)]
-    init_windows_process_path();
+    {
+        // Tauri GUI may inherit Explorer's stale environment block. Refresh synchronously before
+        // any CodeBuddy prewarm/model probe can spawn and snapshot missing CODEBUDDY_* values.
+        let _ = refresh_windows_process_environment();
+        init_windows_process_path();
+    }
     #[cfg(target_os = "macos")]
     init_macos_process_path();
 }
@@ -32,16 +37,6 @@ pub fn refresh_process_environment() -> Result<usize, String> {
     {
         Err("刷新环境变量仅支持 Windows".into())
     }
-}
-
-/// 启动后在独立线程刷新一次 Windows 环境块。失败静默忽略，不阻塞应用初始化。
-#[cfg(windows)]
-pub(crate) fn refresh_process_environment_in_background() {
-    let _ = std::thread::Builder::new()
-        .name("nova-env-refresh".into())
-        .spawn(|| {
-            let _ = refresh_windows_process_environment();
-        });
 }
 
 #[cfg(any(windows, target_os = "macos", test))]

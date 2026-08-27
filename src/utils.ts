@@ -3,8 +3,6 @@ import type { AgentKind, ToolContent, ToolItem } from "./types";
 /** agent 展示名（徽标 / 标题 / 提示文案统一用） */
 export function agentLabel(kind: AgentKind): string {
   switch (kind) {
-    case "alkaid":
-      return "Vega";
     case "lyra":
       return "Lyra";
     case "codex":
@@ -22,12 +20,10 @@ export function agentLabel(kind: AgentKind): string {
   }
 }
 
-/** agent 单字徽标（侧边栏紧凑展示）：Vega=V / Devin=D / Codex=C / CodeBuddy=B /
+/** agent 单字徽标（侧边栏紧凑展示）：Lyra=L / Devin=D / Codex=C / CodeBuddy=B /
  *  Claude Code=CC / Cursor=CS / OpenCode=OC */
 export function agentShort(kind: AgentKind): string {
   switch (kind) {
-    case "alkaid":
-      return "V";
     case "lyra":
       return "L";
     case "codex":
@@ -55,9 +51,9 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_RE, "").replace(BARE_SGR_RE, "");
 }
 
-/** 历史工具记录仍保留内部后端名；只在界面层替换品牌展示。 */
+/** 历史工具记录可能保留旧后端名；统一为当前品牌展示。 */
 export function displayToolTitle(title: string): string {
-  return title.replace(/^Alkaid(\s*\/)/, "Vega$1");
+  return title.replace(/^(?:Alkaid|Vega)(\s*\/)/, "Lyra$1");
 }
 
 // ─── 工具调用摘要展示（DOM ToolCallCard 与 canvas 渲染共用） ─────────────────

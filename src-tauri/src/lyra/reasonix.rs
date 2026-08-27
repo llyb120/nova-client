@@ -1,6 +1,6 @@
 //! Reasonix 精简上下文：只追加的 slim memory（用户提示原文 + 助手结论），
 //! 压力分层（warn/snip/elide/force）下先压缩旧工具结果，再把完成的历史折叠为冻结摘要。
-//! 文件格式与 Vega 的 sessions/<id>.slim.json（version 3）完全兼容。
+//! 文件格式沿用原 sessions/<id>.slim.json（version 3）。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

@@ -1,13 +1,12 @@
 import { listen } from "@tauri-apps/api/event";
 import { batch, createSignal } from "solid-js";
-import { createStore, produce, reconcile } from "solid-js/store";
+import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { api } from "./ipc";
 import type {
   Achievement,
   AgentKind,
   BranchList,
   CaptureClueResult,
-  CliOperationProgress,
   ClueAttachment,
   ClueCard,
   ClueNodeGroup,
@@ -141,7 +140,6 @@ interface AppStore {
   updatePromptAt: number;
   slashCommands: Record<AgentKind, SlashCommand[]>;
   updateProgress: UpdateProgress | null;
-  cliOperationProgress: CliOperationProgress | null;
   relay: RelayStatus;
   peers: Peer[];
   peerModels: Record<string, PeerModels>;
@@ -194,7 +192,6 @@ export const [state, setState] = createStore<AppStore>({
   agent: null,
   settings: null,
   modelOptions: {
-    alkaid: null,
     lyra: null,
     devin: null,
     codex: null,
@@ -212,7 +209,6 @@ export const [state, setState] = createStore<AppStore>({
   updateStaging: false,
   updatePromptAt: 0,
   slashCommands: {
-    alkaid: [],
     lyra: [],
     devin: [],
     codex: [],
@@ -222,7 +218,6 @@ export const [state, setState] = createStore<AppStore>({
     opencode: [],
   },
   updateProgress: null,
-  cliOperationProgress: null,
   relay: { enabled: false, connected: false },
   peers: [],
   peerModels: {},
@@ -424,8 +419,8 @@ export function reasoningEffortChoices(
 }
 
 const modelOptionsLoading = new Set<AgentKind>();
-/** Vega 配置文件当前声明的默认模型；用于配置热更新时同步新会话页。 */
-export const [alkaidConfigDefaultModel, setAlkaidConfigDefaultModel] = createSignal("");
+/** Lyra 配置文件当前声明的默认模型；用于配置热更新时同步新会话页。 */
+export const [lyraConfigDefaultModel, setLyraConfigDefaultModel] = createSignal("");
 
 /** store 的对象赋值是浅合并，占位里的 pending 不会被后来的真实列表冲掉，必须显式复位。 */
 function setModelOptions(agentKind: AgentKind, opts: ModelOptions | null) {
@@ -441,7 +436,7 @@ export async function ensureModelOptions(agentKind: AgentKind) {
   try {
     const opts = await api.getModelOptions(agentKind);
     setModelOptions(agentKind, opts);
-    syncAlkaidConfigDefaultModel(agentKind, opts);
+    syncLyraConfigDefaultModel(agentKind, opts);
     // 选项就绪后回填友好名，供下次冷启动触发器使用
     const model = lastUsed.model(agentKind);
     const name = modelChoices(agentKind).find((c) => c.value === model)?.name;
@@ -455,7 +450,6 @@ export async function ensureModelOptions(agentKind: AgentKind) {
 
 /** 模型后端固定展示顺序 */
 export const ALL_AGENT_KINDS: AgentKind[] = [
-  "alkaid",
   "lyra",
   "devin",
   "codex",
@@ -468,8 +462,6 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
 /** 某后端在设置里是否启用。缺字段（老版本 settings）按启用处理（!== false）。 */
 function agentEnabled(s: Settings, k: AgentKind): boolean {
   switch (k) {
-    case "alkaid":
-      return s.vegaEnabled === true;
     case "lyra":
       return s.lyraEnabled !== false;
     case "devin":
@@ -516,11 +508,18 @@ export async function refreshThreads() {
   // 但后端此时还没来得及把异步 agent 任务登记为 running。记录请求开始时的
   // 事件版本，若期间已经收到 acp:turn，就不能再用这份旧快照覆盖事件结果。
   const runningVersionsBeforeRequest = new Map(runningEventVersions);
-  const threads = await api.listThreads();
+  const [threads, snapshots] = threadSnapshotsLoaded
+    ? [await api.listThreads(), null]
+    : await api.loadThreads();
   // 多次刷新并发时，较早的响应不能覆盖较新的响应。
   if (request !== refreshThreadsRequest) return;
   // 按 id reconcile 而非整体替换：保留未变线程的对象身份，
   // 避免 <For> 重建整个列表 DOM 导致侧边栏滚动位置被重置
+  if (snapshots) {
+    threadSnapshots.clear();
+    for (const thread of snapshots) rememberThreadSnapshot(thread);
+    threadSnapshotsLoaded = true;
+  }
   setState("threads", reconcile(threads, { key: "id" }));
   const running: Record<string, boolean> = {};
   for (const t of threads) {
@@ -535,9 +534,15 @@ export async function refreshThreads() {
         : t.running;
   }
   setState("running", running);
-  for (const thread of threads.filter((thread) => thread.running).slice(0, THREAD_SNAPSHOT_LIMIT)) {
-    preloadThreadSnapshot(thread.id);
-  }
+  // ThreadStore 后端本就常驻内存、异步落盘；首次加载在单次 IPC 中把全部快照
+  // 搬进 WebView。后续刷新仅补载新会话，切换会话不再等待磁盘或 IPC。
+  const ids = new Set(threads.map((thread) => thread.id));
+  for (const id of threadSnapshots.keys()) if (!ids.has(id)) threadSnapshots.delete(id);
+  await Promise.all(
+    threads
+      .filter((thread) => !threadSnapshots.has(thread.id))
+      .map((thread) => preloadThreadSnapshot(thread.id, request)),
+  );
 }
 
 export async function refreshProjects() {
@@ -1093,38 +1098,52 @@ export function clearQuotaRoamingProgress() {
   setState("quotaRoamingProgress", null);
 }
 
-const THREAD_SNAPSHOT_LIMIT = 2;
 const threadSnapshots = new Map<string, Thread>();
-const loadingThreadSnapshots = new Set<string>();
+const loadingThreadSnapshots = new Map<string, Promise<void>>();
+let threadSnapshotsLoaded = false;
 /** 运行中各会话最近一次实时用量；切换会话时恢复，避免等待下一次 usage 事件。 */
 const liveUsageByThread = new Map<string, LiveUsage>();
 
 function rememberThreadSnapshot(thread: Thread) {
-  threadSnapshots.delete(thread.id);
   threadSnapshots.set(thread.id, thread);
-  while (threadSnapshots.size > THREAD_SNAPSHOT_LIMIT) {
-    const oldest = threadSnapshots.keys().next().value;
-    if (!oldest) break;
-    threadSnapshots.delete(oldest);
-  }
 }
 
 function getThreadSnapshot(id: string): Thread | undefined {
-  const thread = threadSnapshots.get(id);
-  if (!thread) return undefined;
-  threadSnapshots.delete(id);
-  threadSnapshots.set(id, thread);
-  return thread;
+  return threadSnapshots.get(id);
 }
 
-function preloadThreadSnapshot(id: string) {
-  if (id === state.currentId || threadSnapshots.has(id) || loadingThreadSnapshots.has(id)) return;
-  loadingThreadSnapshots.add(id);
-  void api
+function rememberCurrentThreadSnapshot() {
+  const id = state.currentId;
+  if (!id) return;
+  const thread = threadSnapshots.get(id);
+  if (!thread) return;
+  rememberThreadSnapshot({
+    ...thread,
+    title: state.title,
+    cwd: state.cwd,
+    agentKind: state.agentKind,
+    model: state.model || null,
+    mode: state.mode || null,
+    reasoningEffort: state.reasoningEffort || null,
+    // Solid store 的 raw 数组本就驻留内存；保留引用即可，切换时不深拷贝整段 transcript。
+    items: unwrap(state.items),
+    plan: state.plan ? unwrap(state.plan) : null,
+  });
+}
+
+function preloadThreadSnapshot(id: string, request = refreshThreadsRequest): Promise<void> {
+  if (threadSnapshots.has(id)) return Promise.resolve();
+  const existing = loadingThreadSnapshots.get(id);
+  if (existing) return existing;
+  const loading = api
     .getThread(id)
-    .then(rememberThreadSnapshot)
+    .then((thread) => {
+      if (request === refreshThreadsRequest) rememberThreadSnapshot(thread);
+    })
     .catch(() => {})
     .finally(() => loadingThreadSnapshots.delete(id));
+  loadingThreadSnapshots.set(id, loading);
+  return loading;
 }
 
 function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileItems = false) {
@@ -1164,7 +1183,8 @@ let openThreadRequest = 0;
 export async function openThread(id: string) {
   const switching = state.currentId !== id;
   const request = switching ? ++openThreadRequest : openThreadRequest;
-  if (!switching) flushPendingStreamUpdates();
+  flushPendingStreamUpdates();
+  if (switching) rememberCurrentThreadSnapshot();
 
   const cached = getThreadSnapshot(id);
   const commitSnapshot = (thread: Thread, loadingThread: boolean, reconcileItems = false) => {
@@ -1196,14 +1216,14 @@ export async function openThread(id: string) {
     });
   }
 
-  // 缓存命中时立即展示；未命中时已同步切换到目标会话的加载态，
+  // 内存命中时立即完成切换；后面的后端内存快照只做静默校准，不进入加载态。
   if (cached) {
-    commitSnapshot(cached, true);
+    commitSnapshot(cached, false);
     if (request !== openThreadRequest || state.currentId !== id) return;
   }
 
   try {
-    // 先切换后端 active_thread，再获取快照，保证加载期间产生的增量包含在快照中。
+    // 先切换后端 active_thread，再静默校准快照，补齐后台会话运行期间未广播的高频增量。
     await api.reportActivity(id);
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
@@ -1228,6 +1248,8 @@ export async function openThread(id: string) {
 }
 
 export function closeThread() {
+  flushPendingStreamUpdates();
+  rememberCurrentThreadSnapshot();
   discardPendingStreamUpdates();
   resetExpanded();
   const agentKind = lastUsed.agentKind();
@@ -1302,8 +1324,11 @@ export async function createThread(
 
 /** 记住最近一次选择的模型/模式，作为新会话默认值 */
 export const lastUsed = {
-  agentKind: (): AgentKind =>
-    (localStorage.getItem("fd:lastAgentKind") as AgentKind | null) ?? "devin",
+  agentKind: (): AgentKind => {
+    const raw = localStorage.getItem("fd:lastAgentKind") as AgentKind | null;
+    // Vega 已移除：旧的 alkaid 选择指向 Lyra。
+    return !raw || raw === ("alkaid" as AgentKind) ? "lyra" : raw;
+  },
   setAgentKind: (v: AgentKind) => localStorage.setItem("fd:lastAgentKind", v),
   model: (agentKind: AgentKind = "devin") => {
     if (agentKind !== lastUsed.agentKind()) return "";
@@ -1352,22 +1377,22 @@ export const lastUsed = {
     localStorage.setItem(`fd:${agentKind}:lastReasoningEffort`, v),
 };
 
-function syncAlkaidConfigDefaultModel(agentKind: AgentKind, options: ModelOptions | null) {
-  if (agentKind !== "alkaid" || !options || options.pending) return;
+function syncLyraConfigDefaultModel(agentKind: AgentKind, options: ModelOptions | null) {
+  if (agentKind !== "lyra" || !options || options.pending) return;
   const configured = options.configOptions
     ?.find((option) => option.id === "model")
     ?.currentValue?.trim();
   if (!configured) return;
 
-  const previous = alkaidConfigDefaultModel();
-  if (previous && previous !== configured && lastUsed.agentKind() === "alkaid") {
-    const remembered = lastUsed.model("alkaid");
+  const previous = lyraConfigDefaultModel();
+  if (previous && previous !== configured && lastUsed.agentKind() === "lyra") {
+    const remembered = lastUsed.model("lyra");
     if (!remembered || remembered === previous) {
-      const choice = modelChoices("alkaid").find((item) => item.value === configured);
-      lastUsed.setModel("alkaid", configured, choice?.name);
+      const choice = modelChoices("lyra").find((item) => item.value === configured);
+      lastUsed.setModel("lyra", configured, choice?.name);
     }
   }
-  setAlkaidConfigDefaultModel(configured);
+  setLyraConfigDefaultModel(configured);
 }
 
 export async function setThreadModel(model: string) {
@@ -1661,7 +1686,7 @@ async function tryBuiltinPrompt(
     const goal = builtInInput.replace(/^\/setup(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /setup 后输入要接入的模型，例如 /setup qwen3.8");
     // /setup 由 agent 修改本地 config.jsonc；本轮结束后复用设置页的刷新机制，
-    // 让 Vega 立刻重读配置并刷新模型列表，而不要求用户手动点「刷新配置」。
+    // 让 Lyra 立刻重读配置并刷新模型列表，而不要求用户手动点「刷新配置」。
     pendingSetupConfigRefresh.add(threadId);
     try {
       await deliverPrompt(threadId, buildIntegrateModelPrompt(goal), images);
@@ -1821,7 +1846,7 @@ type FireRelayStep = {
 };
 
 const fireRelaySteps = new Map<string, FireRelayStep>();
-// 已发送 /setup、等待该轮结束后重载 Vega 本地配置的会话。
+// 已发送 /setup、等待该轮结束后重载 Lyra 本地配置的会话。
 const pendingSetupConfigRefresh = new Set<string>();
 // 中断不丢弃 Fire 上下文。用户在阶段再次发言时可重新挂回自动验收流程，
 // 同时避免网络错误把一次尚未完成的响应误当成最终结论送去判断。
@@ -2601,8 +2626,8 @@ export async function initStore() {
       liveUsageByThread.delete(threadId);
       if (threadId === state.currentId) setState("liveUsage", null);
       if (pendingSetupConfigRefresh.delete(threadId)) {
-        void api.refreshAlkaidConfig().catch((error) =>
-          console.error("Refresh Vega config after /setup failed", error),
+        void api.refreshLyraConfig().catch((error) =>
+          console.error("Refresh Lyra config after /setup failed", error),
         );
       }
       if (fireRelaySteps.has(e.payload.threadId)) {
@@ -2671,13 +2696,13 @@ export async function initStore() {
     const payload = e.payload;
     if ("options" in payload && "agentKind" in payload) {
       setModelOptions(payload.agentKind, payload.options);
-      syncAlkaidConfigDefaultModel(payload.agentKind, payload.options);
+      syncLyraConfigDefaultModel(payload.agentKind, payload.options);
       const model = lastUsed.model(payload.agentKind);
       const name = modelChoices(payload.agentKind).find((c) => c.value === model)?.name;
       if (model && name) lastUsed.setModelName(payload.agentKind, name);
     } else {
       setModelOptions("devin", payload as ModelOptions);
-      syncAlkaidConfigDefaultModel("devin", payload as ModelOptions);
+      syncLyraConfigDefaultModel("devin", payload as ModelOptions);
     }
   });
 
@@ -2688,10 +2713,6 @@ export async function initStore() {
   // 后端可用性只用于设置页的 CLI 缺失提示；选择器是否展示完全由启用开关决定。
   await listen<{ availability: Record<string, boolean> }>("backends:availability", (e) => {
     setState("backendAvailability", reconcile(e.payload.availability ?? {}));
-  });
-
-  await listen<CliOperationProgress>("cli:operation-progress", (e) => {
-    setState("cliOperationProgress", e.payload);
   });
 
   await listen<string>("acp:log", (e) => {

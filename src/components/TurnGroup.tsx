@@ -1,4 +1,5 @@
 import { createMemo, For, Show } from "solid-js";
+import { latestStreamTextItem } from "../streamReveal";
 import { state, toggleExpanded } from "../store";
 import type { Item, TurnItem, UserItem } from "../types";
 import { EditedFilesCard } from "./EditedFilesCard";
@@ -178,14 +179,7 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
   // 仅「正在流式输出的那一项」随组活跃而自动展开。Codex 有时会先吐一句
   // assistant 进度说明，然后继续在其上方的工具卡片里刷新输出；此时真正活跃的
   // 是前面的 pending/in_progress 工具或“思考中…”，不能只看 body 末项。
-  const activeBodyId = () => {
-    const b = props.group.body;
-    if (!props.active) return -1;
-    for (let i = b.length - 1; i >= 0; i--) {
-      if (isBusyItem(b[i])) return b[i].id;
-    }
-    return b.length ? b[b.length - 1].id : -1;
-  };
+  const activeBodyId = () => latestStreamTextItem([props.group], props.active)?.id ?? -1;
 
   // 当最后一行只是上一句 assistant 进度说明、实际仍在上方工具卡片里跑时，
   // 在底部补一个轻量活动尾标，避免用户看到“最后一句不动”误以为卡死。

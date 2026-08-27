@@ -80,7 +80,7 @@ pub struct Agent {
     /// 中断轨迹增量落盘钩子：每条消息入列后以完整消息数组回调（对齐 PI 的
     /// message_end 增量持久化），任务被强杀/崩溃时磁盘上仍有截至中断点的轨迹。
     pub checkpoint: Option<Box<dyn FnMut(&[Value]) + Send>>,
-    /// provider 空闲看门狗与超时诊断（对齐 Vega/PI）：由 bridge 注入会话根目录。
+    /// provider 空闲看门狗与超时诊断：由 bridge 注入会话根目录。
     pub watchdog: Option<(std::sync::Arc<IdleWatchdog>, std::sync::Arc<DiagnosticLog>)>,
 }
 
@@ -268,7 +268,7 @@ impl Agent {
                 archive_dir: self.archive_dir.clone(),
             };
             let stream_error: Option<String> = None;
-            // 看门狗（对齐 Vega）：挂起时给 stream_chat 一个独立取消标志，超时
+            // 看门狗：挂起时给 stream_chat 一个独立取消标志，超时
             // 置位后 provider 内 wait_cancelled 会把请求转成可重试的 idle timeout 错误，
             // 不污染会话级取消（否则 bridge 会当成用户取消而丢弃重试机会）。
             let watchdog_cancel = self.watchdog.as_ref().map(|(w, _)| arm_idle_watchdog(w));
@@ -547,7 +547,7 @@ impl Agent {
                 }
             })
             .collect();
-        // 工具执行期间暂停看门狗（对齐 Vega 的 activeTools pause/resume），
+        // 工具执行期间暂停看门狗，
         // 避免长工具（如 cargo check）被误判为 provider 挂死。
         if let Some((w, _)) = &self.watchdog {
             w.pause();

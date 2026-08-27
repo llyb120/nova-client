@@ -21,7 +21,7 @@ export function ShareModal(props: {
   const [prompt, setPrompt] = createSignal("总结这段会话的要点");
   // 高级分享仍可临时选择处理模型，默认使用统一的轻量级模型。
   const [agent, setAgent] = createSignal<AgentKind>(
-    (state.settings?.lightweightModelAgent as AgentKind) || "alkaid",
+    (state.settings?.lightweightModelAgent as AgentKind) || "lyra",
   );
   const [model, setModel] = createSignal(state.settings?.lightweightModel || "");
   const [busy, setBusy] = createSignal(false);

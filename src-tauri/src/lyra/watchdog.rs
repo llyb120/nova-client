@@ -1,4 +1,4 @@
-//! Provider 空闲看门狗与超时诊断落盘，对齐 Vega/PI 的 createAlkaidIdleTimeout
+//! Provider 空闲看门狗与超时诊断落盘。
 //! 与 provider-timeouts.jsonl：流式请求无增量事件超过阈值即视为挂死，
 //! 由 agent 终止本次请求并走既有重试链；超时时把现场快照追加到
 //! `<sessions_root>/logs/provider-timeouts.jsonl`。健康请求零落盘开销。
@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// 无增量事件判定挂死的阈值，与 Vega 的 ALKAID_PROVIDER_IDLE_TIMEOUT_MS 对齐。
-pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// 无增量事件判定挂死的阈值。
+pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub enum DeltaKind {
     Text,
@@ -165,7 +165,7 @@ impl DiagnosticLog {
     }
 }
 
-/// 对齐 Vega provider_stream_idle_timeout 的现场快照（去掉凭证与完整内容，只留形状）。
+/// 挂死诊断的现场快照（去掉凭证与完整内容，只留形状）。
 pub fn timeout_event(
     session_id: &str,
     provider: &str,

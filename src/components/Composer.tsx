@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
   promptHistory as globalPromptHistory,
@@ -139,27 +139,28 @@ export function Composer() {
     return Number.isFinite(value) && value >= 2_000 ? value : null;
   };
   const [runClock, setRunClock] = createSignal(Date.now());
-  const [runStartedAt, setRunStartedAt] = createSignal<number | null>(null);
-  createEffect(() => {
+  // 从会话尾部向前找本轮 user 项作为计时起点。找不到返回 null 的两种情形：
+  // - 尾部已是收尾的 turn（轮次未开始/已结束）；
+  // - 后台运行会话的快照尚未加载完（尾部是工具/思考流，没有 user 项）。
+  // 第二种绝不能回退 Date.now()，否则切到运行中的会话会从 0 重计；
+  // 保持响应式读取 items，快照到达后自动得出真实起点。
+  const runStartTs = createMemo<number | null>(() => {
     const threadId = state.currentId;
-    if (!threadId || !state.running[threadId]) {
-      setRunStartedAt(null);
-      return;
+    if (!threadId || !state.running[threadId]) return null;
+    for (let index = state.items.length - 1; index >= 0; index--) {
+      if (state.items[index].type === "turn") return null;
+      if (state.items[index].type === "user") return state.items[index].ts;
     }
-    const startedAt = untrack(() => {
-      for (let index = state.items.length - 1; index >= 0; index--) {
-        if (state.items[index].type === "turn") break;
-        if (state.items[index].type === "user") return state.items[index].ts;
-      }
-      return Date.now();
-    });
-    setRunStartedAt(startedAt);
+    return null;
+  });
+  createEffect(() => {
+    if (runStartTs() === null) return;
     setRunClock(Date.now());
     const timer = window.setInterval(() => setRunClock(Date.now()), 1_000);
     onCleanup(() => window.clearInterval(timer));
   });
   const runElapsed = () => {
-    const startedAt = runStartedAt();
+    const startedAt = runStartTs();
     if (startedAt === null) return "0:00";
     const seconds = Math.max(0, Math.floor((runClock() - startedAt) / 1_000));
     const hours = Math.floor(seconds / 3_600);
@@ -172,9 +173,8 @@ export function Composer() {
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
-  // 原生注入当前轮：Alkaid / Lyra / Codex / Devin。
+  // 原生注入当前轮：Lyra / Codex / Devin。
   const supportsLiveSteer = () =>
-    state.agentKind === "alkaid" ||
     state.agentKind === "lyra" ||
     state.agentKind === "codex" ||
     state.agentKind === "devin";

@@ -307,7 +307,7 @@
     <p>回车会把新提示词加入「待发送队列」，输入框上方出现队列条目（带序号、文本预览、附件数）。每条右边两个按钮：</p>
     <ul>
       <li><strong>撤回</strong>（撤销图标）：把这条拿回输入框，可改后再发。</li>
-      <li><strong>发送</strong>（纸飞机图标）：立即作为引导发送。支持引导的后端（Vega、Lyra、Codex、Devin、Cursor、OpenCode）可在运行中直接插入；不支持的按钮会置灰。</li>
+      <li><strong>发送</strong>（纸飞机图标）：立即作为引导发送。支持引导的后端（Lyra、Codex、Devin、Cursor、OpenCode）可在运行中直接插入；不支持的按钮会置灰。</li>
     </ul>
     <p>队列头部提示「当前任务结束后自动发送」或「已停止，可手动发送或撤回」。空输入框按 <kbd>Enter</kbd> 也会立即发送队列第一条作为引导。</p>
 
@@ -323,7 +323,7 @@
         <tr><td><code>/target</code></td><td>为 <code>/fire</code> 明确指定验收规则，需与 <code>/fire</code> 一起发送。</td></tr>
         <tr><td><code>/run 工作流名 目标</code></td><td>运行一个已配置的工作流。例如 <code>/run 评审 修复登录页</code>。可用 <code>--</code> 附带自定义变量：<code>/run 评审 修复登录页 -- criteria=不能有类型错误</code>。</td></tr>
         <tr><td><code>/train</code></td><td>立即用大熊座配置的模型训练一次经验库。训练完弹窗告诉你新学了几条经验，并自动跳到大熊座视图。</td></tr>
-        <tr><td><code>/setup 模型名</code></td><td>把一个模型 / provider 接入 Vega。</td></tr>
+        <tr><td><code>/setup 模型名</code></td><td>把一个模型 / provider 接入 Lyra。</td></tr>
       </tbody>
     </table>
 
@@ -588,8 +588,7 @@
     <table>
       <thead><tr><th>后端</th><th>卡片上的配置项</th></tr></thead>
       <tbody>
-        <tr><td><strong>Vega (alkaid)</strong></td><td>启用勾选 · 代理 · 「刷新配置」按钮（修改 <code>~/.nova/alkaid/config.jsonc</code> 后点此重载模型列表）</td></tr>
-        <tr><td><strong>Lyra</strong></td><td>启用勾选（Rust 原生 agent，与 Vega 共用模型配置与 Skills）</td></tr>
+        <tr><td><strong>Lyra</strong></td><td>启用勾选 · 代理 · 「刷新配置」按钮（修改 <code>~/.nova/alkaid/config.jsonc</code> 后点此重载模型列表）；Rust 原生 agent，不经 Node bridge</td></tr>
         <tr><td><strong>Devin</strong></td><td>启用勾选 · CLI 管理器（查看状态/升级）· 可执行文件 · 启动参数 · 代理 · 额度（日/周百分比 + 积分，可刷新）</td></tr>
         <tr><td><strong>CodeBuddy</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · 代理</td></tr>
         <tr><td><strong>Claude Code</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · Anthropic API Key · 代理</td></tr>

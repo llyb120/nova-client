@@ -77,7 +77,7 @@ export function getSlashSuggestions(
     },
     {
       name: "setup",
-      description: "把一个模型 / provider 接入 Vega：/setup 模型名",
+      description: "把一个模型 / provider 接入 Lyra：/setup 模型名",
       kind: "Nova",
       input: "/setup ",
     },
