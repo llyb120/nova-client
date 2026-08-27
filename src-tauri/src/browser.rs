@@ -750,13 +750,12 @@ mod tests {
     #[test]
     fn exec_response_preserves_browser_errors() {
         assert_eq!(
-            parse_exec_response(json!({ "ok": true, "data": { "headless": false } }))
-                .unwrap()["headless"],
+            parse_exec_response(json!({ "ok": true, "data": { "headless": false } })).unwrap()
+                ["headless"],
             false
         );
         assert_eq!(
-            parse_exec_response(json!({ "ok": false, "error": "Chrome 启动失败" }))
-                .unwrap_err(),
+            parse_exec_response(json!({ "ok": false, "error": "Chrome 启动失败" })).unwrap_err(),
             "Chrome 启动失败"
         );
     }

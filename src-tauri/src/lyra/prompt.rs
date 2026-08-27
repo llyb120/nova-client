@@ -274,7 +274,10 @@ fn find_pwsh() -> Option<String> {
     }
     for key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
         if let Ok(root) = std::env::var(key) {
-            let candidate = PathBuf::from(root).join("PowerShell").join("7").join("pwsh.exe");
+            let candidate = PathBuf::from(root)
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
             if candidate.is_file() {
                 return Some(candidate.display().to_string());
             }

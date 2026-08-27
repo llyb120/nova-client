@@ -138,8 +138,6 @@ fn all_specs(settings: &Settings) -> Vec<CliSpec> {
 
 #[cfg(windows)]
 fn build_command(program: &str, args: &[String]) -> tokio::process::Command {
-    use std::os::windows::process::CommandExt;
-
     let resolved = resolve_program_on_path(program);
     let mut cmd = match resolved
         .as_ref()
