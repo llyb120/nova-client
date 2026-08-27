@@ -769,20 +769,6 @@ impl AcpManager {
 
     /// 最近一次捕获到的可选模型 value 列表（configOptions 里 id=="model" 的 options）。
     /// 返回 None 表示尚未捕获到模型列表，调用方应跳过校验、按原样下发。
-    fn known_model_values(&self) -> Option<Vec<String>> {
-        let guard = self.model_options.lock().unwrap();
-        let cfg = guard.as_ref()?.get("configOptions")?.as_array()?;
-        let model = cfg
-            .iter()
-            .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("model"))?;
-        let options = model.get("options")?.as_array()?;
-        let values: Vec<String> = options
-            .iter()
-            .filter_map(|o| o.get("value").and_then(|v| v.as_str()).map(str::to_string))
-            .collect();
-        (!values.is_empty()).then_some(values)
-    }
-
     pub fn get_commands(&self) -> Option<Value> {
         self.available_commands.lock().unwrap().clone()
     }
@@ -2647,26 +2633,6 @@ impl AcpManager {
         Ok(sid)
     }
 
-    /// 把模型标记为「已处理」（避免同一会话每轮 prompt 反复处理），并在会话里推一条警告。
-    /// 用于所选模型不在可用列表等不应下发的场景。
-    fn mark_model_applied_with_warn(&self, sid: &str, model: &str, warn: String) {
-        let thread_id = {
-            let mut routes = self.routes.lock().unwrap();
-            routes.get_mut(sid).map(|route| {
-                route.applied_model = Some(model.to_string());
-                route.thread_id.clone()
-            })
-        };
-        let Some(thread_id) = thread_id else { return };
-        let state = self.app.state::<AppState>();
-        let mut store = state.store.lock().unwrap();
-        if let Some(thread) = store.get_mut(&thread_id) {
-            let item = thread.push_system(warn, "warn");
-            self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
-        }
-        store.save_thread(&thread_id);
-    }
-
     /// 按需把线程级模型/模式同步到 session（只在变化时发请求）
     async fn apply_session_config(
         &self,
@@ -2676,7 +2642,7 @@ impl AcpManager {
         model: Option<String>,
         mode: Option<String>,
     ) {
-        let (mut need_model, need_mode) = {
+        let (need_model, need_mode) = {
             let routes = self.routes.lock().unwrap();
             let Some(r) = routes.get(sid) else { return };
             (
@@ -2709,21 +2675,6 @@ impl AcpManager {
                         self.kind.label()
                     ));
                 }
-            }
-        }
-        // 防「发送无反应」：所选模型若不在当前可用列表里，强行下发会让 agent 在 prompt 阶段直接
-        // 返回 refusal 且不产生任何内容。这里跳过下发、回退到会话默认模型，并提示用户。
-        if let Some(m) = need_model.clone() {
-            if self
-                .known_model_values()
-                .is_some_and(|known| !known.contains(&m))
-            {
-                need_model = None;
-                self.mark_model_applied_with_warn(
-                    sid,
-                    &m,
-                    format!("所选模型「{m}」当前不可用，已改用默认模型，可在下方重新选择模型。"),
-                );
             }
         }
         if need_model.is_none() && need_mode.is_none() {
