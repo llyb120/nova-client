@@ -137,16 +137,14 @@ pub fn run_server_update(check_only: bool) -> Result<(), String> {
 
 async fn run_server_update_async(check_only: bool) -> Result<(), String> {
     let current = compiled_app_version();
-    let client = update_http_client(
+    let url = github_api_latest("release");
+    let (response, client) = request_update_release(
+        &url,
         Some(&format!("Nova/{current}")),
         Some(Duration::from_secs(30)),
-    )?;
-    let response = client
-        .get(github_api_latest("release"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|error| format!("检查更新失败：{error}"))?;
+    )
+    .await
+    .map_err(|error| format!("检查更新失败：{error}"))?;
     if !response.status().is_success() {
         return Err(format!("检查更新失败：HTTP {}", response.status()));
     }
@@ -805,8 +803,12 @@ fn current_exe_name() -> String {
 fn update_http_client(
     user_agent: Option<&str>,
     request_timeout: Option<Duration>,
+    use_proxy: bool,
 ) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
+    if !use_proxy {
+        builder = builder.no_proxy();
+    }
     if let Some(t) = request_timeout {
         builder = builder.timeout(t);
     }
@@ -816,20 +818,54 @@ fn update_http_client(
     builder.build().map_err(|e| e.to_string())
 }
 
+fn update_proxy_configured(url: &str) -> bool {
+    let Ok(uri) = url.parse() else { return false };
+    hyper_util::client::proxy::matcher::Matcher::from_system()
+        .intercept(&uri)
+        .is_some()
+}
+
+fn should_retry_update_without_proxy(status: reqwest::StatusCode, proxy_configured: bool) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN && proxy_configured
+}
+
+async fn request_update_release(
+    url: &str,
+    user_agent: Option<&str>,
+    request_timeout: Option<Duration>,
+) -> Result<(reqwest::Response, reqwest::Client), String> {
+    let proxy_configured = update_proxy_configured(url);
+    let mut client = update_http_client(user_agent, request_timeout, true)?;
+    let mut response = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if should_retry_update_without_proxy(response.status(), proxy_configured) {
+        client = update_http_client(user_agent, request_timeout, false)?;
+        response = client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok((response, client))
+}
+
 /// 查询最新版本并与当前版本比较（GitHub Releases）
 pub async fn check(app: &AppHandle) -> Result<Value, String> {
     let current = app.package_info().version.to_string();
     let channel = selected_update_channel(app);
-    let client = update_http_client(
+    let url = github_api_latest(&channel);
+    let (resp, _) = request_update_release(
+        &url,
         Some(&format!("Nova/{current}")),
         Some(Duration::from_secs(15)),
-    )?;
-    let resp = client
-        .get(github_api_latest(&channel))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("检查更新失败:{e}"))?;
+    )
+    .await
+    .map_err(|e| format!("检查更新失败:{e}"))?;
     if resp.status().as_u16() == 404 {
         return Ok(json!({ "current": current, "hasUpdate": false }));
     }
@@ -1170,7 +1206,7 @@ pub async fn download_and_stage(app: AppHandle) -> Result<Value, String> {
     };
 
     // 1. 下载（流式，带进度；走系统代理；不设整请求超时，大包由分块进度推进）
-    let client = update_http_client(None, None)?;
+    let client = update_http_client(None, None, true)?;
     let mut resp = client
         .get(&url)
         .send()
@@ -1415,12 +1451,29 @@ pub fn cleanup_old() {
 
 #[cfg(test)]
 mod tests {
-    use super::staged_is_latest_discovered;
+    use super::{should_retry_update_without_proxy, staged_is_latest_discovered};
+    use reqwest::StatusCode;
 
     #[test]
     fn downloaded_intermediate_version_is_ignored_after_latest_is_discovered() {
         assert!(staged_is_latest_discovered("1.2.0", None));
         assert!(staged_is_latest_discovered("1.3.0", Some("1.3.0")));
         assert!(!staged_is_latest_discovered("1.2.0", Some("1.3.0")));
+    }
+
+    #[test]
+    fn update_check_retries_only_proxy_forbidden_response_without_proxy() {
+        assert!(should_retry_update_without_proxy(
+            StatusCode::FORBIDDEN,
+            true
+        ));
+        assert!(!should_retry_update_without_proxy(
+            StatusCode::FORBIDDEN,
+            false
+        ));
+        assert!(!should_retry_update_without_proxy(
+            StatusCode::BAD_GATEWAY,
+            true
+        ));
     }
 }
