@@ -241,15 +241,14 @@ pub fn collect_credentials(
             )?;
         }
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-            let root = configured_home("CODEBUDDY_CONFIG_DIR", ".codebuddy");
-            collect_directory(
-                &root.join("local_storage"),
-                "profile/.codebuddy/local_storage",
-                &mut files,
-            )?;
-            collect_optional_file(
-                &root.join("instances.json"),
-                "profile/.codebuddy/instances.json",
+            let source = codebuddy_credentials_path(app)?;
+            let name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("CodeBuddy 登录凭证文件名无效")?;
+            collect_file(
+                &source,
+                &format!("profile/AppData/Local/CodeBuddyExtension/Data/Public/auth/{name}"),
                 &mut files,
             )?;
         }
@@ -458,9 +457,15 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
             let profile = root.join("profile");
             let config = profile.join(".codebuddy");
-            std::fs::create_dir_all(&config).map_err(|e| e.to_string())?;
+            let local = profile.join("AppData").join("Local");
+            let roaming = profile.join("AppData").join("Roaming");
+            for dir in [&config, &local, &roaming] {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
             env.insert("USERPROFILE".into(), as_string(profile.clone()));
             env.insert("HOME".into(), as_string(profile));
+            env.insert("LOCALAPPDATA".into(), as_string(local));
+            env.insert("APPDATA".into(), as_string(roaming));
             env.insert("CODEBUDDY_CONFIG_DIR".into(), as_string(config));
         }
         AgentKind::ClaudeCode => {
@@ -562,10 +567,9 @@ fn credential_path_allowed(kind: &AgentKind, raw: &str) -> bool {
         AgentKind::Alkaid | AgentKind::Lyra => path == "alkaid/config.jsonc",
         AgentKind::Devin => path == "appdata/devin/credentials.toml",
         AgentKind::Codex | AgentKind::CodexPlus => path == "codex-home/auth.json",
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-            path == "profile/.codebuddy/instances.json"
-                || path.starts_with("profile/.codebuddy/local_storage/")
-        }
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => path
+            .strip_prefix("profile/AppData/Local/CodeBuddyExtension/Data/Public/auth/")
+            .is_some_and(|name| !name.is_empty() && !name.contains('/')),
         AgentKind::ClaudeCode | AgentKind::Cursor => false,
         AgentKind::OpenCode | AgentKind::OpenCodePlus => path == "opencode-data/opencode/auth.json",
     }
@@ -612,6 +616,72 @@ fn devin_credentials_path() -> Result<PathBuf, String> {
     }
 }
 
+fn codebuddy_credentials_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join("AppData").join("Local"));
+    let auth_dir = local
+        .join("CodeBuddyExtension")
+        .join("Data")
+        .join("Public")
+        .join("auth");
+    let configured = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .codebuddy_path
+        .clone();
+    if let Some(id) = codebuddy_auth_id(&configured) {
+        let path = auth_dir.join(format!("{id}.info"));
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    let mut candidates = std::fs::read_dir(&auth_dir)
+        .map_err(|_| {
+            format!(
+                "未找到 {} 登录凭证，请先在额度提供方完成登录",
+                auth_dir.display()
+            )
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("info"))
+        });
+    let credential = candidates.next().ok_or_else(|| {
+        format!(
+            "未找到 {} 登录凭证，请先在额度提供方完成登录",
+            auth_dir.display()
+        )
+    })?;
+    if candidates.next().is_some() {
+        return Err("发现多个 CodeBuddy 登录凭证，无法确定当前 CLI 使用的账号".into());
+    }
+    Ok(credential)
+}
+
+fn codebuddy_auth_id(program: &str) -> Option<String> {
+    let executable = crate::acp::resolve_program_on_path(program)?;
+    let package = executable
+        .parent()?
+        .join("node_modules")
+        .join("@tencent-ai")
+        .join("codebuddy-code")
+        .join("product.json");
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(package).ok()?).ok()?;
+    value
+        .pointer("/authentication/id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 fn collect_file(path: &Path, target: &str, files: &mut Vec<CredentialFile>) -> Result<(), String> {
     let data = std::fs::read(path).map_err(|_| {
         format!(
@@ -626,17 +696,6 @@ fn collect_file(path: &Path, target: &str, files: &mut Vec<CredentialFile>) -> R
         path: target.into(),
         data: base64::engine::general_purpose::STANDARD.encode(data),
     });
-    Ok(())
-}
-
-fn collect_optional_file(
-    path: &Path,
-    target: &str,
-    files: &mut Vec<CredentialFile>,
-) -> Result<(), String> {
-    if path.is_file() {
-        collect_file(path, target, files)?;
-    }
     Ok(())
 }
 
@@ -665,51 +724,6 @@ fn collect_json_entry(
         path: target.into(),
         data: base64::engine::general_purpose::STANDARD.encode(filtered),
     });
-    Ok(())
-}
-
-fn collect_directory(
-    source: &Path,
-    target: &str,
-    files: &mut Vec<CredentialFile>,
-) -> Result<(), String> {
-    if !source.is_dir() {
-        return Err(format!(
-            "未找到 {} 登录凭证，请先在额度提供方完成登录",
-            source.display()
-        ));
-    }
-    let initial_file_count = files.len();
-    let mut pending = vec![source.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let file_type = entry.file_type().map_err(|e| e.to_string())?;
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                pending.push(entry.path());
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            let relative = entry
-                .path()
-                .strip_prefix(source)
-                .map_err(|_| "凭证目录结构无效".to_string())?
-                .to_string_lossy()
-                .replace('\\', "/");
-            collect_file(&entry.path(), &format!("{target}/{relative}"), files)?;
-            if files.len() > MAX_BUNDLE_FILES {
-                return Err("凭证文件数量过多，已拒绝发送".into());
-            }
-        }
-    }
-    if files.len() == initial_file_count {
-        return Err(format!("登录凭证目录为空：{}", source.display()));
-    }
     Ok(())
 }
 
@@ -847,6 +861,42 @@ mod tests {
         assert!(value.get("openai").is_some());
         assert!(value.get("anthropic").is_none());
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codebuddy_launch_env_uses_isolated_auth_data_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-codebuddy-launch-env-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let env = launch_env(&AgentKind::CodeBuddy, &root).unwrap();
+        let profile = root.join("profile");
+        let local = profile.join("AppData").join("Local");
+        assert_eq!(
+            env.get("LOCALAPPDATA"),
+            Some(&local.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            env.get("APPDATA"),
+            Some(
+                &profile
+                    .join("AppData")
+                    .join("Roaming")
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+        let credential = "profile/AppData/Local/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info";
+        assert!(credential_path_allowed(&AgentKind::CodeBuddy, credential));
+        assert_eq!(
+            root.join(safe_relative_path(credential).unwrap()),
+            local.join("CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info")
+        );
+        assert!(!credential_path_allowed(
+            &AgentKind::CodeBuddy,
+            "profile/AppData/Local/CodeBuddyExtension/Data/Public/auth/nested/credential.info"
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
