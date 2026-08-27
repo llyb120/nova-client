@@ -137,21 +137,14 @@ pub fn run_server_update(check_only: bool) -> Result<(), String> {
 
 async fn run_server_update_async(check_only: bool) -> Result<(), String> {
     let current = compiled_app_version();
-    let url = github_api_latest("release");
-    let (response, client) = request_update_release(
-        &url,
+    let (release, client) = fetch_update_release(
+        "release",
         Some(&format!("Nova/{current}")),
         Some(Duration::from_secs(30)),
     )
     .await
     .map_err(|error| format!("检查更新失败：{error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("检查更新失败：HTTP {}", response.status()));
-    }
-    let release: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("更新信息解析失败：{error}"))?;
+    let release = release.ok_or("没有找到最新 Release")?;
     let latest = release_version(&release);
     if latest.is_empty() {
         return Err("最新 Release 没有有效版本号".into());
@@ -854,29 +847,125 @@ async fn request_update_release(
     Ok((response, client))
 }
 
+fn release_tag_from_feed(feed: &str, channel: &str) -> Option<String> {
+    feed.split("<entry>").skip(1).find_map(|entry| {
+        let id = entry.split_once("<id>")?.1.split_once("</id>")?.0.trim();
+        let repository_and_tag = id.split_once("Repository/")?.1;
+        let tag = repository_and_tag.split_once('/')?.1.trim();
+        let matches_channel = if channel == "pre-release" {
+            tag.starts_with("pre-v")
+        } else {
+            tag.starts_with('v')
+        };
+        matches_channel.then(|| tag.to_string())
+    })
+}
+
+fn release_from_tag(tag: &str, channel: &str) -> Option<Value> {
+    let version = tag
+        .trim()
+        .trim_start_matches("pre-")
+        .trim_start_matches('v');
+    if version.is_empty() {
+        return None;
+    }
+    let asset = asset_name_for(version);
+    Some(json!({
+        "tag_name": tag,
+        "prerelease": channel == "pre-release",
+        "draft": false,
+        "assets": [{
+            "name": asset,
+            "browser_download_url": format!(
+                "https://github.com/{}/releases/download/{tag}/{asset}",
+                github_repo()
+            )
+        }]
+    }))
+}
+
+/// GitHub REST API 的匿名额度按出口 IP 共享；额度耗尽返回 403 时改走不计该额度的
+/// Releases 网页/Atom，并按项目固定的资产命名约定构造下载地址。
+async fn github_web_release(
+    client: &reqwest::Client,
+    channel: &str,
+) -> Result<Option<Value>, String> {
+    let tag = if channel == "pre-release" {
+        let response = client
+            .get(format!(
+                "https://github.com/{}/releases.atom",
+                github_repo()
+            ))
+            .header("Accept", "application/atom+xml")
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("备用更新源 HTTP {}", response.status()));
+        }
+        release_tag_from_feed(
+            &response.text().await.map_err(|error| error.to_string())?,
+            channel,
+        )
+    } else {
+        let response = client
+            .get(format!(
+                "https://github.com/{}/releases/latest",
+                github_repo()
+            ))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(format!("备用更新源 HTTP {}", response.status()));
+        }
+        response
+            .url()
+            .path()
+            .split_once("/releases/tag/")
+            .map(|(_, tag)| tag.to_string())
+    };
+    Ok(tag.and_then(|tag| release_from_tag(&tag, channel)))
+}
+
+async fn fetch_update_release(
+    channel: &str,
+    user_agent: Option<&str>,
+    request_timeout: Option<Duration>,
+) -> Result<(Option<Value>, reqwest::Client), String> {
+    let url = github_api_latest(channel);
+    let (response, client) = request_update_release(&url, user_agent, request_timeout).await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok((None, client));
+    }
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Ok((github_web_release(&client, channel).await?, client));
+    }
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let raw = response
+        .json()
+        .await
+        .map_err(|error| format!("更新信息解析失败:{error}"))?;
+    Ok((select_release(raw, channel), client))
+}
+
 /// 查询最新版本并与当前版本比较（GitHub Releases）
 pub async fn check(app: &AppHandle) -> Result<Value, String> {
     let current = app.package_info().version.to_string();
     let channel = selected_update_channel(app);
-    let url = github_api_latest(&channel);
-    let (resp, _) = request_update_release(
-        &url,
+    let (release, _) = fetch_update_release(
+        &channel,
         Some(&format!("Nova/{current}")),
         Some(Duration::from_secs(15)),
     )
     .await
     .map_err(|e| format!("检查更新失败:{e}"))?;
-    if resp.status().as_u16() == 404 {
-        return Ok(json!({ "current": current, "hasUpdate": false }));
-    }
-    if !resp.status().is_success() {
-        return Err(format!("检查更新失败:HTTP {}", resp.status()));
-    }
-    let raw: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("更新信息解析失败:{e}"))?;
-    let Some(v) = select_release(raw, &channel) else {
+    let Some(v) = release else {
         return Ok(json!({ "current": current, "channel": channel, "hasUpdate": false }));
     };
 
@@ -1463,8 +1552,26 @@ pub fn cleanup_old() {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_retry_update_without_proxy, staged_is_latest_discovered};
+    use super::{
+        release_tag_from_feed, should_retry_update_without_proxy, staged_is_latest_discovered,
+    };
     use reqwest::StatusCode;
+
+    #[test]
+    fn release_feed_selects_the_requested_channel() {
+        let feed = r#"
+            <entry><id>tag:github.com,2008:Repository/1/v1.2.3</id></entry>
+            <entry><id>tag:github.com,2008:Repository/1/pre-v1.2.4</id></entry>
+        "#;
+        assert_eq!(
+            release_tag_from_feed(feed, "release").as_deref(),
+            Some("v1.2.3")
+        );
+        assert_eq!(
+            release_tag_from_feed(feed, "pre-release").as_deref(),
+            Some("pre-v1.2.4")
+        );
+    }
 
     #[test]
     fn downloaded_intermediate_version_is_ignored_after_latest_is_discovered() {
