@@ -891,12 +891,15 @@ pub async fn check(app: &AppHandle) -> Result<Value, String> {
     let want = asset_name_for(&latest);
     let mut download_url = String::new();
     let mut size = json!(null);
+    // 优先用资产 API 端点而非 github.com 的 browser_download_url：两者连到不同域名，
+    // 直连 GitHub 网页域不可达的网络里 API 域往往仍可用，可避免「检查成功、下载失败」。
     if let Some(assets) = v["assets"].as_array() {
         for a in assets {
             let name = a["name"].as_str().unwrap_or_default();
             if name.eq_ignore_ascii_case(&want) {
-                download_url = a["browser_download_url"]
+                download_url = a["url"]
                     .as_str()
+                    .or_else(|| a["browser_download_url"].as_str())
                     .unwrap_or_default()
                     .to_string();
                 size = a["size"].clone();
@@ -1205,13 +1208,22 @@ pub async fn download_and_stage(app: AppHandle) -> Result<Value, String> {
         );
     };
 
-    // 1. 下载（流式，带进度；走系统代理；不设整请求超时，大包由分块进度推进）
+    // 下载走系统代理；有代理时 GitHub 可能对代理出口返回 403，此时绕开代理重试。
     let client = update_http_client(None, None, true)?;
     let mut resp = client
         .get(&url)
+        .header("Accept", "application/octet-stream")
         .send()
         .await
         .map_err(|e| format!("下载失败:{e}"))?;
+    if should_retry_update_without_proxy(resp.status(), update_proxy_configured(&url)) {
+        resp = update_http_client(None, None, false)?
+            .get(&url)
+            .header("Accept", "application/octet-stream")
+            .send()
+            .await
+            .map_err(|e| format!("下载失败:{e}"))?;
+    }
     if !resp.status().is_success() {
         return Err(format!("下载失败:HTTP {}", resp.status()));
     }
