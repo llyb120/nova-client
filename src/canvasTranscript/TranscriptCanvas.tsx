@@ -10,7 +10,7 @@ import { IMAGE_FILE_RE } from "../components/Markdown";
 import type { Group } from "../components/TurnGroup";
 import { api } from "../ipc";
 import { editUserMessage, isExpanded, respondPermission, toggleExpanded } from "../store";
-import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
+import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import type { PermissionRequest, PromptImage, RevertChange, UserItem } from "../types";
 import {
   type Action,
@@ -221,6 +221,7 @@ export function TranscriptCanvas(props: {
   const syncReveals = (showExisting: boolean) => {
     revealTargets.clear();
     const now = performance.now();
+    const latest = latestStreamTextItem(props.groups, props.running);
     if (showExisting) {
       if (revealRaf) cancelAnimationFrame(revealRaf);
       revealRaf = 0;
@@ -228,17 +229,12 @@ export function TranscriptCanvas(props: {
       revealReadyAt.clear();
       revealRemainders.clear();
     }
-    for (const g of props.groups) {
-      if (g.turn) continue;
-      for (const it of g.body) {
-        if (it.type !== "assistant" && it.type !== "thought") continue;
-        revealTargets.set(it.id, it.text);
-        if (!shownMap.has(it.id)) {
-          const immediate = showExisting || !props.running || it.text === "思考中…";
-          shownMap.set(it.id, immediate ? it.text : "");
-          revealReadyAt.set(it.id, immediate ? 0 : now + STREAM_PREBUFFER_MS);
-          revealRemainders.set(it.id, 0);
-        }
+    if (latest) {
+      revealTargets.set(latest.id, latest.text);
+      if (!shownMap.has(latest.id)) {
+        shownMap.set(latest.id, showExisting ? latest.text : "");
+        revealReadyAt.set(latest.id, showExisting ? 0 : now + STREAM_PREBUFFER_MS);
+        revealRemainders.set(latest.id, 0);
       }
     }
     for (const id of [...shownMap.keys()]) {

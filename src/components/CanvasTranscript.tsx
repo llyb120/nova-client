@@ -6,7 +6,7 @@ import {
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded } from "../store";
-import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
+import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
@@ -999,6 +999,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   const syncRevealTargets = (showExisting: boolean) => {
     targetText.clear();
     const now = performance.now();
+    const latest = latestStreamTextItem(props.groups, props.running);
     if (showExisting) {
       if (revealRaf) cancelAnimationFrame(revealRaf);
       revealRaf = 0;
@@ -1006,17 +1007,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       revealReadyAt.clear();
       revealRemainders.clear();
     }
-    for (const group of props.groups) {
-      if (group.turn) continue;
-      for (const item of group.body) {
-        if (item.type !== "assistant" && item.type !== "thought") continue;
-        targetText.set(item.id, item.text);
-        if (!shownText.has(item.id)) {
-          const immediate = showExisting || !props.running || item.text === "思考中…";
-          shownText.set(item.id, immediate ? item.text : "");
-          revealReadyAt.set(item.id, immediate ? 0 : now + STREAM_PREBUFFER_MS);
-          revealRemainders.set(item.id, 0);
-        }
+    if (latest) {
+      targetText.set(latest.id, latest.text);
+      if (!shownText.has(latest.id)) {
+        shownText.set(latest.id, showExisting ? latest.text : "");
+        revealReadyAt.set(latest.id, showExisting ? 0 : now + STREAM_PREBUFFER_MS);
+        revealRemainders.set(latest.id, 0);
       }
     }
     for (const id of [...shownText.keys()]) {

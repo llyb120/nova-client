@@ -10,6 +10,28 @@ export interface StreamRevealStep {
   remainder: number;
 }
 
+interface StreamTextItem {
+  type: string;
+  text?: string;
+}
+
+/** Only the tail text item of the current unfinished group is allowed to animate. */
+export function latestStreamTextItem<T extends StreamTextItem>(
+  groups: ArrayLike<{ body: T[]; turn?: unknown }>,
+  running: boolean,
+): (T & { type: "assistant" | "thought"; text: string }) | undefined {
+  if (!running || groups.length === 0) return undefined;
+  const group = groups[groups.length - 1];
+  if (group.turn) return undefined;
+  const item = group.body[group.body.length - 1];
+  return item &&
+    (item.type === "assistant" || item.type === "thought") &&
+    typeof item.text === "string" &&
+    item.text !== "思考中…"
+    ? item as T & { type: "assistant" | "thought"; text: string }
+    : undefined;
+}
+
 /**
  * Consume a buffered stream according to backlog and real frame time.
  * The fractional remainder prevents low rates from being rounded up or lost each frame.
