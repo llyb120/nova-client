@@ -1152,6 +1152,13 @@ impl ThreadTrashStore {
         Ok(())
     }
 
+    pub fn session_ids(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.thread.acp_session_id.clone())
+            .collect()
+    }
+
     /// 回收站内停留满同一个保留周期后才彻底清除，返回需要一并删除工作目录的会话。
     pub fn purge_expired(&mut self, now: i64, hours: u32) -> Vec<Thread> {
         let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)

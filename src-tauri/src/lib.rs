@@ -451,6 +451,16 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
     };
     let now = now_ms();
     let permanently_removed = state.thread_trash.lock().unwrap().purge_expired(now, hours);
+    let retained_session_ids = state
+        .store
+        .lock()
+        .unwrap()
+        .threads
+        .iter()
+        .filter_map(|thread| thread.acp_session_id.clone())
+        .chain(state.thread_trash.lock().unwrap().session_ids())
+        .collect();
+    cleanup_alkaid_session_files(&state.config_dir, &permanently_removed, &retained_session_ids);
     for thread in permanently_removed {
         if thread.cwd.contains(SCRATCH_MARK) {
             let _ = std::fs::remove_dir_all(thread.cwd);
@@ -541,9 +551,9 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
 #[cfg(test)]
 mod session_auto_cleanup_tests {
     use super::{
-        experience_thread_is_expired, is_normal_thread_for_auto_cleanup, is_starrable_thread,
-        thread_is_expired, tree_contains_starred_thread, AgentKind, Thread,
-        EXPERIENCE_THREAD_RETENTION_MS,
+        cleanup_alkaid_session_files, experience_thread_is_expired,
+        is_normal_thread_for_auto_cleanup, is_starrable_thread, thread_is_expired,
+        tree_contains_starred_thread, AgentKind, Thread, EXPERIENCE_THREAD_RETENTION_MS,
     };
     use std::collections::HashSet;
 
@@ -630,6 +640,40 @@ mod session_auto_cleanup_tests {
         let starred = HashSet::from(["child".to_string()]);
 
         assert!(tree_contains_starred_thread(&tree, &starred));
+    }
+
+    #[test]
+    fn removing_alkaid_thread_cleans_its_session_files_only() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "nova-alkaid-session-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions = data_dir.join("alkaid").join("sessions");
+        let tool_results = data_dir.join("alkaid").join("tool-results");
+        std::fs::create_dir_all(tool_results.join("session-a")).unwrap();
+        std::fs::create_dir_all(tool_results.join("session-b")).unwrap();
+        for name in ["session-a.json", "session-a.slim.json", "session-b.json"] {
+            std::fs::create_dir_all(&sessions).unwrap();
+            std::fs::write(sessions.join(name), "{}").unwrap();
+        }
+        let mut removed = Thread::new(String::new(), AgentKind::Alkaid, None, None, None, false);
+        removed.acp_session_id = Some("session-a".into());
+
+        cleanup_alkaid_session_files(
+            &data_dir,
+            std::slice::from_ref(&removed),
+            &HashSet::from(["session-a".into()]),
+        );
+        assert!(sessions.join("session-a.json").exists());
+        assert!(tool_results.join("session-a").exists());
+
+        cleanup_alkaid_session_files(&data_dir, &[removed], &HashSet::new());
+        assert!(!sessions.join("session-a.json").exists());
+        assert!(!sessions.join("session-a.slim.json").exists());
+        assert!(!tool_results.join("session-a").exists());
+        assert!(sessions.join("session-b.json").exists());
+        assert!(tool_results.join("session-b").exists());
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 }
 
@@ -1979,22 +2023,7 @@ fn remove_worktree(
     }
     state.worktrees.lock().unwrap().remove(&id);
     if !doomed.is_empty() {
-        {
-            let mut store = state.store.lock().unwrap();
-            store.threads.retain(|t| !doomed.contains(&t.id));
-            store.save();
-        }
-        for tid in &doomed {
-            state.acp.forget_session_of_thread(tid);
-            state.codex.forget_session_of_thread(tid);
-            state.alkaid.forget_session_of_thread(tid);
-            state.codexplus.forget_session_of_thread(tid);
-            state.codebuddy.forget_session_of_thread(tid);
-            state.claudeplus.forget_session_of_thread(tid);
-            state.cursorplus.forget_session_of_thread(tid);
-            state.opencodeplus.forget_session_of_thread(tid);
-        }
-        let _ = app.emit(acp::EV_THREADS, json!({}));
+        remove_threads(&app, &state, doomed);
     }
     // worktree 目录没了，项目列表里对应条目也要跟着消失（可能曾被当项目选择过）
     state.projects.lock().unwrap().remove(&rec.path);
@@ -2248,25 +2277,7 @@ fn delete_thread(
     if delete_ids.iter().any(|id| running_by_id(&state, id)) {
         return Err("会话树中有运行中的会话，请先停止".into());
     }
-    for id in &delete_ids {
-        state.relay.notify_host_thread_deleted(id);
-    }
-    {
-        let mut store = state.store.lock().unwrap();
-        store.threads.retain(|t| !delete_ids.contains(&t.id));
-        store.save();
-    }
-    for id in &delete_ids {
-        state.acp.forget_session_of_thread(id);
-        state.codex.forget_session_of_thread(id);
-        state.codexplus.forget_session_of_thread(id);
-        state.codebuddy.forget_session_of_thread(id);
-        state.claudeplus.forget_session_of_thread(id);
-        state.cursorplus.forget_session_of_thread(id);
-        state.opencodeplus.forget_session_of_thread(id);
-        cleanup_borrowed_runtime(&state, id);
-    }
-    let _ = app.emit(acp::EV_THREADS, json!({}));
+    remove_threads(&app, &state, delete_ids);
     Ok(())
 }
 
@@ -2312,30 +2323,92 @@ fn collect_deletable_thread_ids(
     delete_set.into_iter().collect()
 }
 
-/// 从正常会话存储移除，并清理关联的运行时状态；返回完整会话快照供回收站持久化。
+fn valid_alkaid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn cleanup_alkaid_session_files(
+    data_dir: &Path,
+    removed: &[Thread],
+    retained_session_ids: &HashSet<String>,
+) {
+    let session_root = data_dir.join("alkaid").join("sessions");
+    let tool_results_root = data_dir.join("alkaid").join("tool-results");
+    let session_ids: HashSet<&str> = removed
+        .iter()
+        .filter(|thread| thread.agent_kind == AgentKind::Alkaid)
+        .filter_map(|thread| thread.acp_session_id.as_deref())
+        .filter(|id| valid_alkaid_session_id(id) && !retained_session_ids.contains(*id))
+        .collect();
+    for id in session_ids {
+        for file_name in [format!("{id}.json"), format!("{id}.slim.json")] {
+            let path = session_root.join(file_name);
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("[threads] 清理 Vega session 文件 {} 失败：{error}", path.display());
+                }
+            }
+        }
+        let tool_results = tool_results_root.join(id);
+        if let Err(error) = std::fs::remove_dir_all(&tool_results) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "[threads] 清理 Vega session 工具结果 {} 失败：{error}",
+                    tool_results.display()
+                );
+            }
+        }
+    }
+}
+
+/// 从正常会话存储移除，并清理关联的运行时与 Alkaid session；返回完整会话快照供回收站持久化。
 fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<String>) -> Vec<Thread> {
     for id in &deletable {
         state.relay.notify_host_thread_deleted(id);
     }
-    let removed = {
+    let (removed, retained_session_ids) = {
         let mut store = state.store.lock().unwrap();
         let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut store.threads)
             .into_iter()
             .partition(|thread| deletable.contains(&thread.id));
+        let retained_session_ids: Vec<_> = kept
+            .iter()
+            .filter_map(|thread| thread.acp_session_id.clone())
+            .collect();
         store.threads = kept;
         store.save();
-        removed
+        (removed, retained_session_ids)
     };
-    for id in &deletable {
+    for thread in &removed {
+        let id = &thread.id;
         state.acp.forget_session_of_thread(id);
         state.codex.forget_session_of_thread(id);
+        state.alkaid.forget_session_of_thread(id);
+        state.lyra.forget_session_of_thread(id);
         state.codexplus.forget_session_of_thread(id);
         state.codebuddy.forget_session_of_thread(id);
         state.claudeplus.forget_session_of_thread(id);
         state.cursorplus.forget_session_of_thread(id);
         state.opencodeplus.forget_session_of_thread(id);
-        cleanup_borrowed_runtime(&state, id);
+        cleanup_borrowed_runtime(state, id);
     }
+    // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
+    // 手动删除、worktree 删除及训练会话清理则没有回收站，立即清理。
+    let trashed_session_ids: HashSet<String> = state
+        .thread_trash
+        .lock()
+        .unwrap()
+        .session_ids()
+        .into_iter()
+        .collect();
+    let retained_session_ids = retained_session_ids
+        .into_iter()
+        .chain(trashed_session_ids)
+        .collect();
+    cleanup_alkaid_session_files(&state.config_dir, &removed, &retained_session_ids);
     let _ = app.emit(acp::EV_THREADS, json!({}));
     removed
 }
