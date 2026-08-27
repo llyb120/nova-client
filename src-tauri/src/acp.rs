@@ -1413,6 +1413,8 @@ impl AcpManager {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         let output = match timeout(Duration::from_secs(10), cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
@@ -2500,6 +2502,8 @@ impl AcpManager {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true);
+            #[cfg(windows)]
+            ping.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
             if timeout(Duration::from_secs(3), ping.status())
                 .await
                 .ok()
