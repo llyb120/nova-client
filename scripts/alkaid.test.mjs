@@ -35,6 +35,7 @@ import {
   formatAlkaidSkillsPrompt,
   governToolResult,
   injectOpenAIPromptCacheKey,
+  injectOpenAISamplingParams,
   injectOpenAIServiceTier,
   isRetryableAlkaidProviderError,
   loadAlkaidAgentInstructions,
@@ -80,14 +81,14 @@ test("OpenCode-style JSONC config resolves providers and models", () => {
         "custom": {
           "npm": "@ai-sdk/openai-compatible",
           "name": "Custom",
-          "options": { "baseURL": "http://127.0.0.1/v1", "apiKey": "{env:TEST_KEY}", "serviceTier": "priority" },
+          "options": { "baseURL": "http://127.0.0.1/v1", "apiKey": "{env:TEST_KEY}", "serviceTier": "priority", "temperature": 1 },
           "models": {
             "gpt-test": {
               "name": "GPT Test",
               "reasoning": true,
               "modalities": { "input": ["text", "image"], "output": ["text"] },
               "limit": { "context": 200000, "output": 64000 },
-              "options": { "reasoningEffort": "medium" },
+              "options": { "reasoningEffort": "medium", "top_p": 0.95 },
               "variants": {
                 "medium": { "reasoningEffort": "medium" },
                 "high": { "reasoningEffort": "high" },
@@ -106,6 +107,8 @@ test("OpenCode-style JSONC config resolves providers and models", () => {
   assert.equal(resolved.model.provider, "custom");
   assert.equal(resolved.model.contextWindow, 200000);
   assert.equal(resolved.model.serviceTier, "priority");
+  assert.equal(resolved.model.temperature, 1);
+  assert.equal(resolved.model.topP, 0.95);
   assert.deepEqual(resolved.model.input, ["text", "image"]);
   assert.equal(resolved.thinkingLevel, "medium");
   assert.deepEqual(resolved.model.thinkingLevelMap, { medium: "medium", high: "high", fast: "medium" });
@@ -131,6 +134,8 @@ test("OpenCode-style JSONC config resolves providers and models", () => {
   const fast = resolveAlkaidModel(config, "custom/gpt-test/variant/fast");
   assert.equal(fast.thinkingLevel, "medium");
   assert.equal(fast.model.serviceTier, "priority");
+  assert.equal(fast.model.temperature, 1);
+  assert.equal(fast.model.topP, 0.95);
   assert.throws(() => resolveAlkaidModel(config, "custom/gpt-test/variant/max"), /不支持思考强度/);
   delete config.model;
   assert.equal(resolveAlkaidModel(config).thinkingLevel, "medium");
@@ -1001,6 +1006,13 @@ test("configured OpenAI service tier is injected into request payloads", () => {
   });
   assert.equal(injectOpenAIServiceTier({ service_tier: "default" }, "priority"), undefined);
   assert.equal(injectOpenAIServiceTier({ model: "gpt" }, undefined), undefined);
+  assert.deepEqual(injectOpenAISamplingParams({ model: "gpt" }, { temperature: 1, topP: 0.95 }), {
+    model: "gpt",
+    temperature: 1,
+    top_p: 0.95,
+  });
+  assert.equal(injectOpenAISamplingParams({ temperature: 0.2 }, { temperature: 1 }), undefined);
+  assert.equal(injectOpenAISamplingParams({ model: "gpt" }, {}), undefined);
 });
 
 test("compat defaults enable session affinity for openai-compatible proxies", () => {

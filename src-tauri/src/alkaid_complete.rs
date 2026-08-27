@@ -24,6 +24,8 @@ struct ResolvedCompletionTarget {
     max_tokens_field: &'static str,
     reasoning: bool,
     service_tier: Option<String>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 struct CachedConfig {
@@ -74,6 +76,12 @@ async fn complete_openai_completions(
     if let Some(service_tier) = &target.service_tier {
         body["service_tier"] = json!(service_tier);
     }
+    if let Some(temperature) = target.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = target.top_p {
+        body["top_p"] = json!(top_p);
+    }
     apply_thinking_disabled_completions(&mut body, target);
     let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
     read_completions_sse(&mut response).await
@@ -94,6 +102,12 @@ async fn complete_openai_responses(
     });
     if let Some(service_tier) = &target.service_tier {
         body["service_tier"] = json!(service_tier);
+    }
+    if let Some(temperature) = target.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = target.top_p {
+        body["top_p"] = json!(top_p);
     }
     if target.reasoning {
         body["reasoning"] = json!({ "effort": "none" });
@@ -427,6 +441,24 @@ fn resolve_target(
         .or_else(|| provider.pointer("/options/service_tier"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    // 采样参数：variant > model.options > provider.options，camel/snake 均可。
+    fn sampling_number(
+        variant_options: Option<&Map<String, Value>>,
+        model: &Value,
+        provider: &Value,
+        camel: &str,
+        snake: &str,
+    ) -> Option<f64> {
+        variant_options
+            .and_then(|value| value.get(camel).or_else(|| value.get(snake)))
+            .or_else(|| model.pointer(&format!("/options/{camel}")))
+            .or_else(|| model.pointer(&format!("/options/{snake}")))
+            .or_else(|| provider.pointer(&format!("/options/{camel}")))
+            .or_else(|| provider.pointer(&format!("/options/{snake}")))
+            .and_then(Value::as_f64)
+    }
+    let temperature = sampling_number(variant_options, model, provider, "temperature", "temperature");
+    let top_p = sampling_number(variant_options, model, provider, "topP", "top_p");
     let reasoning = model
         .get("reasoning")
         .and_then(Value::as_bool)
@@ -457,6 +489,8 @@ fn resolve_target(
         max_tokens_field,
         reasoning,
         service_tier,
+        temperature,
+        top_p,
     })
 }
 

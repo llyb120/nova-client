@@ -659,6 +659,24 @@ export function injectOpenAIServiceTier(payload, serviceTier) {
   return { ...payload, service_tier: serviceTier.trim() };
 }
 
+/** Add configured sampling params (temperature / top_p) without overriding explicit payload values. */
+export function injectOpenAISamplingParams(payload, sampling) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  let next = payload;
+  let changed = false;
+  if (typeof sampling?.temperature === "number" && Number.isFinite(sampling.temperature)
+    && !Object.hasOwn(next, "temperature")) {
+    next = { ...next, temperature: sampling.temperature };
+    changed = true;
+  }
+  if (typeof sampling?.topP === "number" && Number.isFinite(sampling.topP)
+    && !Object.hasOwn(next, "top_p")) {
+    next = { ...next, top_p: sampling.topP };
+    changed = true;
+  }
+  return changed ? next : undefined;
+}
+
 function createAlkaidStreamFn() {
   return (model, context, options = {}) => streamSimple(model, context, {
     ...options,
@@ -904,6 +922,11 @@ export async function createAlkaidAgent(options = {}) {
       const withServiceTier = injectOpenAIServiceTier(next, options.model.serviceTier);
       if (withServiceTier) {
         next = withServiceTier;
+        changed = true;
+      }
+      const withSampling = injectOpenAISamplingParams(next, options.model);
+      if (withSampling) {
+        next = withSampling;
         changed = true;
       }
       const withCache = injectOpenAIPromptCacheKey(next, sessionId);

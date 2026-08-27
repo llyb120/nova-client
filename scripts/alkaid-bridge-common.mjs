@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
-import { createAlkaidAgent, injectOpenAIServiceTier } from "./alkaid-core.mjs";
+import { createAlkaidAgent, injectOpenAISamplingParams, injectOpenAIServiceTier } from "./alkaid-core.mjs";
 import { alkaidDataRoot, alkaidModelOptions, defaultAlkaidModel, loadAlkaidConfig, resolveAlkaidConfigEnv, resolveAlkaidModel } from "./alkaid-config.mjs";
 
 export function send(value) {
@@ -94,7 +94,10 @@ async function complete(request) {
       apiKey: resolved.apiKey,
       maxTokens: 64,
       signal: controller.signal,
-      onPayload: (payload) => injectOpenAIServiceTier(payload, resolved.model.serviceTier),
+      onPayload: (payload) => {
+        const next = injectOpenAIServiceTier(payload, resolved.model.serviceTier) ?? payload;
+        return injectOpenAISamplingParams(next, resolved.model) ?? (next === payload ? undefined : next);
+      },
     },
   );
   let text = "";

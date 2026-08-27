@@ -85,6 +85,9 @@ pub struct ResolvedModel {
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub service_tier: Option<String>,
+    /// 采样参数：temperature / top_p，按 variant > model.options > provider.options 解析。
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
     /// 当前模型是否声明支持图片输入；旧会话中的图片对 text-only 模型应降级为占位文本。
     pub supports_images: bool,
     /// deepseek 等要求 assistant 消息回传 reasoning_content。
@@ -305,6 +308,25 @@ pub fn resolve_model(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty());
+    // 采样参数：variant > model.options > provider.options，camel/snake 均可。
+    fn sampling_number(
+        variant_options: &Value,
+        model: &Value,
+        provider: &Value,
+        camel: &str,
+        snake: &str,
+    ) -> Option<f64> {
+        variant_options
+            .get(camel)
+            .or_else(|| variant_options.get(snake))
+            .or_else(|| model.pointer(&format!("/options/{camel}")))
+            .or_else(|| model.pointer(&format!("/options/{snake}")))
+            .or_else(|| provider.pointer(&format!("/options/{camel}")))
+            .or_else(|| provider.pointer(&format!("/options/{snake}")))
+            .and_then(Value::as_f64)
+    }
+    let temperature = sampling_number(&variant_options, model, provider, "temperature", "temperature");
+    let top_p = sampling_number(&variant_options, model, provider, "topP", "top_p");
     let thinking_level = variant.and_then(|name| {
         model
             .pointer(&format!("/variants/{name}/reasoningEffort"))
@@ -367,6 +389,8 @@ pub fn resolve_model(
                 .and_then(Value::as_u64)
                 .unwrap_or(32_000),
             service_tier,
+            temperature,
+            top_p,
             supports_images: model
                 .pointer("/modalities/input")
                 .and_then(Value::as_array)
@@ -431,6 +455,38 @@ mod tests {
             resolve_model(&config, Some("custom/gpt/variant/medium"), &HashMap::new()).unwrap();
         assert_eq!(resolved.model.max_tokens_field, "max_completion_tokens");
         assert!(!resolved.model.session_affinity_headers);
+    }
+
+    #[test]
+    fn sampling_params_resolve_variant_over_model_over_provider() {
+        let config = json!({
+            "provider": {
+                "custom": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "http://127.0.0.1:8317/v1",
+                        "apiKey": "key",
+                        "temperature": 1,
+                        "top_p": 0.9
+                    },
+                    "models": {
+                        "gpt": {
+                            "options": { "topP": 0.95 },
+                            "variants": {
+                                "medium": { "reasoningEffort": "medium", "temperature": 0.2 }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let base = resolve_model(&config, Some("custom/gpt"), &HashMap::new()).unwrap();
+        assert_eq!(base.model.temperature, Some(1.0));
+        assert_eq!(base.model.top_p, Some(0.95));
+        let variant =
+            resolve_model(&config, Some("custom/gpt/variant/medium"), &HashMap::new()).unwrap();
+        assert_eq!(variant.model.temperature, Some(0.2));
+        assert_eq!(variant.model.top_p, Some(0.95));
     }
 
     #[test]

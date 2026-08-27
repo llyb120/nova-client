@@ -56,6 +56,14 @@ Vega 是一个基于 pi agent core 的轻量 coding agent，目标是少往返�
 ```
 
 这样模型列表会保留 `medium`、`high` 和 `fast` 三个枚举；只有选择 `.../variant/fast` 时才发送 `"service_tier": "priority"`。Vega 会对正常对话、标题/补全请求以及 Rust 直连的行内补全转发该字段；未配置时不发送。代理必须自行支持并转发此参数。
+
+model 的 `options`（或 provider `options` / `variants` 中的同名字段）还支持采样参数，同名优先级 variant > model > provider：
+
+```jsonc
+"options": { "reasoningEffort": "medium", "temperature": 1, "top_p": 0.95 }
+```
+
+`top_p` 也可写成 `topP`。仅对 `openai-completions` / `openai-responses` 协议生效；未配置时不发送，payload 中已有显式值时不覆盖。Vega（Node bridge）与 Lyra（Rust 原生）都会转发这两个字段。
 - 已作为独立的 `alkaid` 后端接入桌面端；后端选择顺序为“收藏 → Vega → 其他后端”。
 - 会话消息持久化到 `~/.nova/alkaid/sessions`，支持跨 bridge 进程续接多轮上下文。OpenAI/GPT 已完成轮次不再回传 reasoning；当前轮次及中断后续做所需的原生工具轨迹仍完整保留。重组后的提示词/结论上下文按实际用量或保守估算计数，达到模型窗口 60% 时压缩，且压缩阈值最低为 150k tokens；优先使用设置中的轻量级模型，失败后回退当前会话模型。
 - Plan 模式不暴露写文件工具；Build 模式开放并行读写。

@@ -201,6 +201,11 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
     ?? modelOptions.service_tier
     ?? options.serviceTier
     ?? options.service_tier;
+  const pickSamplingNumber = (camelKey, snakeKey) => [variantOptions, modelOptions, options]
+    .map((source) => source[camelKey] ?? source[snakeKey])
+    .find((value) => typeof value === "number" && Number.isFinite(value));
+  const temperature = pickSamplingNumber("temperature", "temperature");
+  const topP = pickSamplingNumber("topP", "top_p");
   return {
     apiKey: resolveEnv(options.apiKey, config.env),
     thinkingLevel: variant
@@ -220,6 +225,8 @@ export function resolveAlkaidModel(config, selection = defaultAlkaidModel(config
       maxTokens: model.limit?.output ?? 32000,
       headers: options.headers,
       serviceTier,
+      temperature,
+      topP,
       compat: mergeAlkaidCompatDefaults(api, modelId, baseUrl, model.compat ?? provider.compat),
     },
   };

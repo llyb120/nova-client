@@ -231,6 +231,12 @@ fn completions_body(
     if let Some(tier) = &model.service_tier {
         body["service_tier"] = json!(tier);
     }
+    if let Some(temperature) = model.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = model.top_p {
+        body["top_p"] = json!(top_p);
+    }
     body
 }
 
@@ -359,6 +365,12 @@ fn responses_body(
     }
     if let Some(tier) = &model.service_tier {
         body["service_tier"] = json!(tier);
+    }
+    if let Some(temperature) = model.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = model.top_p {
+        body["top_p"] = json!(top_p);
     }
     body
 }
@@ -1463,6 +1475,8 @@ mod tests {
             context_window: 128_000,
             max_output_tokens: 32_000,
             service_tier: Some("flex".into()),
+            temperature: Some(1.0),
+            top_p: Some(0.95),
             supports_images: true,
             requires_reasoning_content: false,
             session_affinity_headers: false,
@@ -1501,6 +1515,8 @@ mod tests {
         assert_eq!(body["prompt_cache_key"], "session-1");
         assert_eq!(body["prompt_cache_retention"], "24h");
         assert_eq!(body["service_tier"], "flex");
+        assert_eq!(body["temperature"], 1.0);
+        assert_eq!(body["top_p"], 0.95);
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"][0]["text"], "你好");
