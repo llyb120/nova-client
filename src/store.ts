@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { batch, createSignal } from "solid-js";
-import { createStore, produce, reconcile } from "solid-js/store";
+import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { api } from "./ipc";
 import type {
   Achievement,
@@ -513,11 +513,18 @@ export async function refreshThreads() {
   // 但后端此时还没来得及把异步 agent 任务登记为 running。记录请求开始时的
   // 事件版本，若期间已经收到 acp:turn，就不能再用这份旧快照覆盖事件结果。
   const runningVersionsBeforeRequest = new Map(runningEventVersions);
-  const threads = await api.listThreads();
+  const [threads, snapshots] = threadSnapshotsLoaded
+    ? [await api.listThreads(), null]
+    : await api.loadThreads();
   // 多次刷新并发时，较早的响应不能覆盖较新的响应。
   if (request !== refreshThreadsRequest) return;
   // 按 id reconcile 而非整体替换：保留未变线程的对象身份，
   // 避免 <For> 重建整个列表 DOM 导致侧边栏滚动位置被重置
+  if (snapshots) {
+    threadSnapshots.clear();
+    for (const thread of snapshots) rememberThreadSnapshot(thread);
+    threadSnapshotsLoaded = true;
+  }
   setState("threads", reconcile(threads, { key: "id" }));
   const running: Record<string, boolean> = {};
   for (const t of threads) {
@@ -532,9 +539,15 @@ export async function refreshThreads() {
         : t.running;
   }
   setState("running", running);
-  for (const thread of threads.filter((thread) => thread.running).slice(0, THREAD_SNAPSHOT_LIMIT)) {
-    preloadThreadSnapshot(thread.id);
-  }
+  // ThreadStore 后端本就常驻内存、异步落盘；首次加载在单次 IPC 中把全部快照
+  // 搬进 WebView。后续刷新仅补载新会话，切换会话不再等待磁盘或 IPC。
+  const ids = new Set(threads.map((thread) => thread.id));
+  for (const id of threadSnapshots.keys()) if (!ids.has(id)) threadSnapshots.delete(id);
+  await Promise.all(
+    threads
+      .filter((thread) => !threadSnapshots.has(thread.id))
+      .map((thread) => preloadThreadSnapshot(thread.id, request)),
+  );
 }
 
 export async function refreshProjects() {
@@ -1090,38 +1103,52 @@ export function clearQuotaRoamingProgress() {
   setState("quotaRoamingProgress", null);
 }
 
-const THREAD_SNAPSHOT_LIMIT = 2;
 const threadSnapshots = new Map<string, Thread>();
-const loadingThreadSnapshots = new Set<string>();
+const loadingThreadSnapshots = new Map<string, Promise<void>>();
+let threadSnapshotsLoaded = false;
 /** 运行中各会话最近一次实时用量；切换会话时恢复，避免等待下一次 usage 事件。 */
 const liveUsageByThread = new Map<string, LiveUsage>();
 
 function rememberThreadSnapshot(thread: Thread) {
-  threadSnapshots.delete(thread.id);
   threadSnapshots.set(thread.id, thread);
-  while (threadSnapshots.size > THREAD_SNAPSHOT_LIMIT) {
-    const oldest = threadSnapshots.keys().next().value;
-    if (!oldest) break;
-    threadSnapshots.delete(oldest);
-  }
 }
 
 function getThreadSnapshot(id: string): Thread | undefined {
-  const thread = threadSnapshots.get(id);
-  if (!thread) return undefined;
-  threadSnapshots.delete(id);
-  threadSnapshots.set(id, thread);
-  return thread;
+  return threadSnapshots.get(id);
 }
 
-function preloadThreadSnapshot(id: string) {
-  if (id === state.currentId || threadSnapshots.has(id) || loadingThreadSnapshots.has(id)) return;
-  loadingThreadSnapshots.add(id);
-  void api
+function rememberCurrentThreadSnapshot() {
+  const id = state.currentId;
+  if (!id) return;
+  const thread = threadSnapshots.get(id);
+  if (!thread) return;
+  rememberThreadSnapshot({
+    ...thread,
+    title: state.title,
+    cwd: state.cwd,
+    agentKind: state.agentKind,
+    model: state.model || null,
+    mode: state.mode || null,
+    reasoningEffort: state.reasoningEffort || null,
+    // Solid store 的 raw 数组本就驻留内存；保留引用即可，切换时不深拷贝整段 transcript。
+    items: unwrap(state.items),
+    plan: state.plan ? unwrap(state.plan) : null,
+  });
+}
+
+function preloadThreadSnapshot(id: string, request = refreshThreadsRequest): Promise<void> {
+  if (threadSnapshots.has(id)) return Promise.resolve();
+  const existing = loadingThreadSnapshots.get(id);
+  if (existing) return existing;
+  const loading = api
     .getThread(id)
-    .then(rememberThreadSnapshot)
+    .then((thread) => {
+      if (request === refreshThreadsRequest) rememberThreadSnapshot(thread);
+    })
     .catch(() => {})
     .finally(() => loadingThreadSnapshots.delete(id));
+  loadingThreadSnapshots.set(id, loading);
+  return loading;
 }
 
 function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileItems = false) {
@@ -1161,7 +1188,8 @@ let openThreadRequest = 0;
 export async function openThread(id: string) {
   const switching = state.currentId !== id;
   const request = switching ? ++openThreadRequest : openThreadRequest;
-  if (!switching) flushPendingStreamUpdates();
+  flushPendingStreamUpdates();
+  if (switching) rememberCurrentThreadSnapshot();
 
   const cached = getThreadSnapshot(id);
   const commitSnapshot = (thread: Thread, loadingThread: boolean, reconcileItems = false) => {
@@ -1193,14 +1221,14 @@ export async function openThread(id: string) {
     });
   }
 
-  // 缓存命中时立即展示；未命中时已同步切换到目标会话的加载态，
+  // 内存命中时立即完成切换；后面的后端内存快照只做静默校准，不进入加载态。
   if (cached) {
-    commitSnapshot(cached, true);
+    commitSnapshot(cached, false);
     if (request !== openThreadRequest || state.currentId !== id) return;
   }
 
   try {
-    // 先切换后端 active_thread，再获取快照，保证加载期间产生的增量包含在快照中。
+    // 先切换后端 active_thread，再静默校准快照，补齐后台会话运行期间未广播的高频增量。
     await api.reportActivity(id);
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
@@ -1225,6 +1253,8 @@ export async function openThread(id: string) {
 }
 
 export function closeThread() {
+  flushPendingStreamUpdates();
+  rememberCurrentThreadSnapshot();
   discardPendingStreamUpdates();
   resetExpanded();
   const agentKind = lastUsed.agentKind();

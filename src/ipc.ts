@@ -45,6 +45,7 @@ function fileUriPath(uri: string) {
 
 export const api = {
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
+  loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),
   getThread: (threadId: string) => invoke<Thread>("get_thread", { threadId }),
   createTimeMachineCheckpoint: (threadId: string) =>
     invoke<TimeMachineTimeline>("create_time_machine_checkpoint", { threadId }),

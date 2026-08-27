@@ -881,6 +881,10 @@ async fn get_cli_statuses(settings: Settings) -> Vec<cli_manager::CliStatus> {
 
 #[tauri::command]
 fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
+    thread_metas(&state)
+}
+
+fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
     // 会话自身没带 worktree 标注、但 cwd 正好是某条已知 worktree 工作目录时
     // （在项目选择器里直接选中 worktree 目录开的会话、员工 worktree 会话等），
     // 按 worktree 记录表现场补齐标注，避免左侧列表把 uuid 目录名当分组标题展示。
@@ -1125,6 +1129,22 @@ async fn delete_clue(
     drop(store);
     let _ = app.emit(clues::EV_CLUES, json!({}));
     Ok(())
+}
+
+#[tauri::command]
+fn load_threads(state: State<'_, AppState>) -> (Vec<ThreadMeta>, Vec<Thread>) {
+    let metas = thread_metas(&state);
+    let store = state.store.lock().unwrap();
+    let by_id: HashMap<&str, &Thread> = store
+        .threads
+        .iter()
+        .map(|thread| (thread.id.as_str(), thread))
+        .collect();
+    let threads = metas
+        .iter()
+        .filter_map(|meta| by_id.get(meta.id.as_str()).map(|thread| (*thread).clone()))
+        .collect();
+    (metas, threads)
 }
 
 #[tauri::command]
@@ -5668,6 +5688,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_threads,
+            load_threads,
             get_thread,
             list_clue_groups,
             get_clue_context,
