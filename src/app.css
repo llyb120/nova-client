@@ -4946,6 +4946,52 @@ button {
   border-top: 1px solid var(--border);
 }
 
+.merge-desc,
+.merge-hint {
+  line-height: 1.55;
+}
+.merge-branches {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: min(320px, 45vh);
+  overflow-y: auto;
+}
+.merge-branch {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  text-align: left;
+}
+.merge-branch:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+.merge-branch.on {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-panel));
+}
+.merge-branch:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+  outline-offset: 2px;
+}
+.merge-branch-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.merge-hint {
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+
 .roam-req-modal {
   width: 460px;
   max-width: 92vw;
