@@ -55,7 +55,6 @@ use serde_json::{json, Value};
 use settings::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use threads::{
@@ -105,13 +104,8 @@ pub struct AppState {
     pub last_activity_ms: Mutex<i64>,
     /// 前端当前打开的会话 id（None = 停在主页）。升级重启前写入恢复标记，重启后据此恢复显示。
     pub active_thread: Mutex<Option<String>>,
-    /// 后端可用性检测结果（agent_kind → 是否可用）。启动后并发按需检测（解析 PATH，
-    /// 不拉起进程），前端据此只显示真正可用的后端。空 map 表示尚未检测完成。
+    /// 后端可用性检测结果（agent_kind → 是否可用）。
     pub backend_availability: Mutex<HashMap<String, bool>>,
-    /// CLI 升级串行执行，避免两个包管理器/自更新器同时改写 PATH 下的文件。
-    pub cli_upgrade_lock: tokio::sync::Mutex<()>,
-    /// 正在执行的 CLI 安装/升级任务；值为取消标记，设置页和额度前置安装共用。
-    pub cli_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 编辑历史消息后正在后台 restore/fork、等待自动重发的会话。
     pub pending_prompt_restores: Mutex<HashSet<String>>,
     /// 仓库世界线的创建/恢复互斥；同一进程内禁止两个恢复事务交叉写文件。
@@ -839,24 +833,6 @@ fn get_backend_availability(state: State<'_, AppState>) -> HashMap<String, bool>
 #[tauri::command]
 async fn get_cli_statuses(settings: Settings) -> Vec<cli_manager::CliStatus> {
     cli_manager::statuses(&settings).await
-}
-
-#[tauri::command]
-async fn upgrade_cli(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    agent_kind: AgentKind,
-    settings: Settings,
-    operation_id: String,
-) -> Result<cli_manager::CliStatus, String> {
-    let status = cli_manager::upgrade(&app, &state, agent_kind, &settings, &operation_id).await?;
-    spawn_backend_availability_check(app);
-    Ok(status)
-}
-
-#[tauri::command]
-fn cancel_cli_operation(state: State<'_, AppState>, operation_id: String) -> bool {
-    cli_manager::cancel(&state, &operation_id)
 }
 
 #[tauri::command]
@@ -4963,9 +4939,7 @@ async fn prepare_quota_lease(
 
 #[tauri::command]
 fn cancel_quota_roaming(state: State<'_, AppState>, operation_id: String) -> bool {
-    let roaming_cancelled = state.relay.cancel_quota_roaming(&operation_id);
-    let cli_cancelled = cli_manager::cancel(&state, &operation_id);
-    roaming_cancelled || cli_cancelled
+    state.relay.cancel_quota_roaming(&operation_id)
 }
 
 /// guest：召回漫游会话——请求 host 把完整会话快照 Flow 回来，
@@ -5219,10 +5193,7 @@ pub fn run() {
     builder
         .setup(|app| {
             #[cfg(windows)]
-            {
-                spawn_single_instance_focus_listener(app.handle());
-                path_env::refresh_process_environment_in_background();
-            }
+            spawn_single_instance_focus_listener(app.handle());
 
             // 数据目录必须最先确定，后续窗口还原/更新都要读取其中的 marker。
             let dir = nova_data_dir(app.handle());
@@ -5355,8 +5326,6 @@ pub fn run() {
                 last_activity_ms: Mutex::new(now_ms()),
                 active_thread: Mutex::new(None),
                 backend_availability: Mutex::new(HashMap::new()),
-                cli_upgrade_lock: tokio::sync::Mutex::new(()),
-                cli_operations: Mutex::new(HashMap::new()),
                 pending_prompt_restores: Mutex::new(HashSet::new()),
                 time_machine_lock: Mutex::new(()),
                 remote_permissions: Mutex::new(HashMap::new()),
@@ -5700,8 +5669,6 @@ pub fn run() {
             set_global_agent_instructions,
             get_backend_availability,
             get_cli_statuses,
-            upgrade_cli,
-            cancel_cli_operation,
             restart_devin,
             get_status,
             get_logs,

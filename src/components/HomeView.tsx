@@ -693,7 +693,7 @@ export function HomeView() {
     } catch (error) {
       submittingPrompt = false;
       const text = String(error);
-      if (!text.includes("额度漫游已取消") && !text.includes("CLI 操作已取消")) {
+      if (!text.includes("额度漫游已取消")) {
         await message(text, { kind: "error" });
       }
     } finally {
@@ -1308,7 +1308,7 @@ export function HomeView() {
       </Show>
       <Show
         when={
-          state.quotaRoamingProgress && state.quotaRoamingProgress.stage !== "installing"
+          state.quotaRoamingProgress
         }
       >
         <div class="modal-backdrop quota-loading-backdrop">

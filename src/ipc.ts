@@ -255,10 +255,6 @@ export const api = {
     invoke<Record<string, boolean>>("get_backend_availability"),
   getCliStatuses: (settings: Settings) =>
     invoke<CliStatus[]>("get_cli_statuses", { settings }),
-  upgradeCli: (agentKind: AgentKind, settings: Settings, operationId: string) =>
-    invoke<CliStatus>("upgrade_cli", { agentKind, settings, operationId }),
-  cancelCliOperation: (operationId: string) =>
-    invoke<boolean>("cancel_cli_operation", { operationId }),
   restartDevin: () => invoke<void>("restart_devin"),
   getStatus: () => invoke<Status>("get_status"),
   getLogs: () => invoke<string[]>("get_logs"),

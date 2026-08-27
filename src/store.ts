@@ -7,7 +7,6 @@ import type {
   AgentKind,
   BranchList,
   CaptureClueResult,
-  CliOperationProgress,
   ClueAttachment,
   ClueCard,
   ClueNodeGroup,
@@ -141,7 +140,6 @@ interface AppStore {
   updatePromptAt: number;
   slashCommands: Record<AgentKind, SlashCommand[]>;
   updateProgress: UpdateProgress | null;
-  cliOperationProgress: CliOperationProgress | null;
   relay: RelayStatus;
   peers: Peer[];
   peerModels: Record<string, PeerModels>;
@@ -222,7 +220,6 @@ export const [state, setState] = createStore<AppStore>({
     opencode: [],
   },
   updateProgress: null,
-  cliOperationProgress: null,
   relay: { enabled: false, connected: false },
   peers: [],
   peerModels: {},
@@ -2688,10 +2685,6 @@ export async function initStore() {
   // 后端可用性只用于设置页的 CLI 缺失提示；选择器是否展示完全由启用开关决定。
   await listen<{ availability: Record<string, boolean> }>("backends:availability", (e) => {
     setState("backendAvailability", reconcile(e.payload.availability ?? {}));
-  });
-
-  await listen<CliOperationProgress>("cli:operation-progress", (e) => {
-    setState("cliOperationProgress", e.payload);
   });
 
   await listen<string>("acp:log", (e) => {

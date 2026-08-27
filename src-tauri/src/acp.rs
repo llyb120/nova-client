@@ -1378,9 +1378,14 @@ impl AcpManager {
             "--env".into(),
             format!("NOVA_CONTEXT_RETRIEVAL_MODE={retrieval_mode}"),
         ];
+        let activation_env = codebuddy_activation_env(&self.launch_env);
         #[cfg(windows)]
-        args.extend(["--env".into(), "CODEBUDDY_CODE_SHELL=powershell".into()]);
-        for (key, value) in &self.launch_env {
+        let activation_env = {
+            let mut env = activation_env;
+            env.insert("CODEBUDDY_CODE_SHELL".into(), "powershell".into());
+            env
+        };
+        for (key, value) in activation_env {
             args.extend(["--env".into(), format!("{key}={value}")]);
         }
         if let Some(proxy) = proxy {
@@ -3831,6 +3836,32 @@ fn resolve_sibling_program(configured_program: &str, sibling: &str) -> String {
     sibling.to_string()
 }
 
+/// `cbc-prewarm activate` 通过 `--env` 显式构造最终服务环境；普通本机会话必须把
+/// 当前进程继承的 CodeBuddy 配置一并传入，否则预热路径会表现为启动后环境变量消失。
+/// 额度借用保持隔离，只使用租约提供的 launch_env，禁止继承本机 CodeBuddy 凭据。
+fn merge_codebuddy_activation_env(
+    launch_env: &HashMap<String, String>,
+    inherited: impl IntoIterator<Item = (String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    let borrowed = launch_env.contains_key("NOVA_QUOTA_BORROWED");
+    let mut env = std::collections::BTreeMap::new();
+    if !borrowed {
+        env.extend(
+            inherited
+                .into_iter()
+                .filter(|(key, _)| key.to_ascii_uppercase().starts_with("CODEBUDDY_")),
+        );
+    }
+    env.extend(launch_env.clone());
+    env
+}
+
+fn codebuddy_activation_env(
+    launch_env: &HashMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    merge_codebuddy_activation_env(launch_env, std::env::vars())
+}
+
 /// 从 CodeBuddy `--serve` 的 stdout 行提取服务入口（官方文档：打印 "Endpoint  http://127.0.0.1:<port>"）。
 fn extract_codebuddy_endpoint(line: &str) -> Option<String> {
     let rest = line.strip_prefix("Endpoint")?.trim_start();
@@ -3843,9 +3874,35 @@ fn extract_codebuddy_endpoint(line: &str) -> Option<String> {
 mod codebuddy_http_tests {
     use super::{
         codebuddy_nova_tools_mcp_server_value, extract_codebuddy_endpoint, json_rpc_request_id,
-        thread_connection_key, SseDecoder,
+        merge_codebuddy_activation_env, thread_connection_key, SseDecoder,
     };
     use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn prewarm_activation_preserves_local_codebuddy_environment_but_isolates_borrowed_sessions() {
+        let inherited = [
+            ("CODEBUDDY_API_KEY".into(), "local-secret".into()),
+            ("OTHER_KEY".into(), "ignored".into()),
+        ];
+        let local = merge_codebuddy_activation_env(&HashMap::new(), inherited.clone());
+        assert_eq!(
+            local.get("CODEBUDDY_API_KEY").map(String::as_str),
+            Some("local-secret")
+        );
+        assert!(!local.contains_key("OTHER_KEY"));
+
+        let borrowed = HashMap::from([
+            ("NOVA_QUOTA_BORROWED".into(), "1".into()),
+            ("CODEBUDDY_CONFIG_DIR".into(), "isolated".into()),
+        ]);
+        let isolated = merge_codebuddy_activation_env(&borrowed, inherited);
+        assert!(!isolated.contains_key("CODEBUDDY_API_KEY"));
+        assert_eq!(
+            isolated.get("CODEBUDDY_CONFIG_DIR").map(String::as_str),
+            Some("isolated")
+        );
+    }
 
     #[test]
     fn only_client_requests_expect_a_post_stream_response() {

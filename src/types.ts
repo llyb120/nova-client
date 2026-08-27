@@ -605,17 +605,8 @@ export interface CliStatus {
   cliName: string;
   installed: boolean;
   version: string;
-  upgradeSupported: boolean;
+  installCommand: string;
   detail: string;
-}
-
-export interface CliOperationProgress {
-  operationId: string;
-  agentKind: AgentKind;
-  action: "安装" | "升级";
-  stage: "waiting" | "running" | "verifying" | "completed" | "failed" | "cancelled";
-  percent: number;
-  message: string;
 }
 
 /** worktree「基于分支」下拉的数据：当前分支 + 本地分支列表 */
@@ -708,7 +699,7 @@ export interface IncomingRoamRequest {
 
 export interface QuotaRoamingProgress {
   operationId: string;
-  stage: "requesting" | "installing" | "preparing" | "ready";
+  stage: "requesting" | "preparing" | "ready";
   message: string;
 }
 

@@ -2115,21 +2115,11 @@ impl RelayManager {
         };
         operation.ensure_active()?;
         if !crate::cli_manager::is_installed(&agent_kind, &settings) {
-            self.emit_quota_progress(
-                operation_id,
-                "installing",
-                format!("本机缺少 {} CLI，正在一键安装…", agent_kind.label()),
-            );
-            let state = self.app.state::<AppState>();
-            crate::cli_manager::ensure_installed(
-                &self.app,
-                state.inner(),
-                agent_kind.clone(),
-                &settings,
-                operation_id,
-            )
-            .await?;
-            operation.ensure_active()?;
+            let command = crate::cli_manager::install_command(&agent_kind, &settings);
+            return Err(format!(
+                "本机缺少 {} CLI，请先在终端执行：{command}",
+                agent_kind.label()
+            ));
         }
 
         let model = model

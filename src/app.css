@@ -4846,90 +4846,35 @@ button {
   color: var(--text-dim);
 }
 
-.cli-manager-version.missing,
-.cli-manager-message.bad,
-.cli-progress-label.bad {
+.cli-manager-version.missing {
   color: var(--red);
 }
 
-.cli-upgrade-btn {
-  flex: none;
-  min-height: 28px;
-  padding: 4px 10px;
-  font-size: 12px;
-}
-
-.cli-upgrade-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.cli-manager-message {
-  flex: 0 1 auto;
-  max-width: 42%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11.5px;
-}
-
-.cli-manager-message.ok {
-  color: var(--green);
-}
-
-.cli-operation-progress {
-  display: grid;
-  grid-template-columns: minmax(80px, 1fr) minmax(0, 3fr);
+.cli-install-row {
+  display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.cli-progress-track {
-  height: 4px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--border);
-}
-
-.cli-progress-track > span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: var(--accent);
-  transition: width 180ms ease;
-}
-
-.cli-progress-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-dim);
-  font-size: 11px;
-}
-
-.cli-shell-output {
+.cli-install-row code {
   min-width: 0;
-  color: var(--text-dim);
-  font-size: 11px;
-}
-
-.cli-shell-output summary {
-  width: max-content;
-  cursor: pointer;
-  user-select: none;
-}
-
-.cli-shell-output pre {
-  max-height: 180px;
-  margin: 6px 0 1px;
-  padding: 8px;
-  overflow: auto;
+  flex: 1;
+  overflow: hidden;
+  padding: 7px 9px;
   border-radius: 6px;
   background: color-mix(in srgb, var(--bg) 84%, black);
   color: var(--text);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.cli-copy-btn {
+  flex: none;
+  min-width: 58px;
+  min-height: 28px;
+  padding: 4px 10px;
+  font-size: 12px;
 }
 
 /* ===== 团队共享：逐行添加列表（漫游项目 / 共享模型额度） ===== */
