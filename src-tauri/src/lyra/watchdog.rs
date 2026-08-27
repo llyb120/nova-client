@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// 无增量事件判定挂死的阈值，与 Vega 的 ALKAID_PROVIDER_IDLE_TIMEOUT_MS 对齐。
-pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub enum DeltaKind {
     Text,

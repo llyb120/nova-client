@@ -368,7 +368,7 @@ fn responses_body(
 // PI/OpenAI SDK 的请求可由 AbortSignal 打断；Lyra 使用 reqwest 时必须显式把取消和
 // deadline 并入网络 future，否则代理接受连接后不发响应头/SSE 时会永久挂起。
 const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 async fn wait_cancelled(cancel: &Arc<AtomicBool>) {
@@ -950,7 +950,7 @@ fn is_retryable_stream_error(error: &str) -> bool {
         "timeout",
         "timed out",
         "响应头等待超过",
-        "sse 连续",
+        // SSE 空闲由 bridge 做“无新用户消息的继续”重试，避免这里与外层叠加。
         "http 429",
         "too many requests",
         "rate limit",
@@ -1479,6 +1479,10 @@ mod tests {
         ));
         assert!(is_retryable_stream_error("HTTP 503 Service Unavailable"));
         assert!(is_retryable_stream_error("connection reset by peer"));
+        assert!(
+            !is_retryable_stream_error("provider SSE 连续 90s 无数据"),
+            "SSE 空闲应交给外层 continuation 重试"
+        );
         assert!(!is_retryable_stream_error("HTTP 401 Unauthorized"));
         assert!(!is_retryable_stream_error("provider 错误：invalid request"));
     }

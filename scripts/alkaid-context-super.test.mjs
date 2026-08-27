@@ -327,13 +327,13 @@ test("timeout diagnostics write JSONL only when explicitly recorded", async () =
   await log.flush();
   await assert.rejects(readFile(log.path, "utf8"), { code: "ENOENT" });
 
-  log.record({ event: "provider_stream_idle_timeout", timeoutMs: 120000 });
-  log.record({ event: "provider_stream_idle_timeout", timeoutMs: 120000, attempt: 2 });
+  log.record({ event: "provider_stream_idle_timeout", timeoutMs: 90000 });
+  log.record({ event: "provider_stream_idle_timeout", timeoutMs: 90000, attempt: 2 });
   await log.flush();
   const lines = (await readFile(join(root, "logs", ALKAID_PROVIDER_DIAGNOSTIC_LOG), "utf8")).trim().split("\n");
   assert.deepEqual(lines.map(JSON.parse), [
-    { event: "provider_stream_idle_timeout", timeoutMs: 120000 },
-    { event: "provider_stream_idle_timeout", timeoutMs: 120000, attempt: 2 },
+    { event: "provider_stream_idle_timeout", timeoutMs: 90000 },
+    { event: "provider_stream_idle_timeout", timeoutMs: 90000, attempt: 2 },
   ]);
   assert.equal(alkaidDiagnosticEndpoint("https://user:secret@example.com/private?token=secret"), "https://example.com");
 });

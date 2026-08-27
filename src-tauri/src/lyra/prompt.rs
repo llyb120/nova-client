@@ -157,6 +157,7 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "stream ended without finish_reason",
     "error decoding response body",
     "idle timeout",
+    "sse 连续",
     "429",
     "too many requests",
     "rate limit",
@@ -621,6 +622,12 @@ mod tests {
         ));
         assert!(is_retryable_provider_error(
             "读取响应流失败：error decoding response body"
+        ));
+        assert!(is_retryable_provider_error(
+            "provider SSE 连续 90s 无数据"
+        ));
+        assert!(is_retryable_provider_error(
+            "provider stream idle timeout: 90s 无增量事件"
         ));
         assert!(!is_retryable_provider_error("invalid api key"));
     }
