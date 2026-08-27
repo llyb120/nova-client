@@ -23,7 +23,7 @@
     "test:alkaid": "node --test scripts/alkaid.test.mjs",
     "test:nova-tools-mcp": "node --test scripts/nova-tools-mcp.test.mjs",
     "test:nova-tools-native": "cargo test --manifest-path src-tauri/Cargo.toml nova_tools_native",
-    "test:context-parity": "node scripts/audit-context-parity.mjs && node scripts/alkaid-context-super.test.mjs && node scripts/cursor-context-super.test.mjs",
+    "test:context-parity": "node scripts/audit-context-parity.mjs && node scripts/cursor-context-super.test.mjs",
     "eval:context-recall": "node scripts/ctx-recall.eval.mjs",
     "eval:context-invoke": "node scripts/ctx-invoke.eval.mjs"
   },

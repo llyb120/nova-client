@@ -44,7 +44,6 @@ impl SdkAdapter for AlkaidAdapter {
                     }
                     .into(),
                 ),
-                ("NOVA_CONTEXT_MODE", settings.vega_context_mode.clone()),
                 (
                     "NOVA_FAST_CONTEXT",
                     if settings.context_tools_enabled() {

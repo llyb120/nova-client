@@ -192,8 +192,6 @@ pub struct Settings {
     pub cursor_disable_subagents: bool,
     /// Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。
     pub cursor_model_contexts: Vec<CursorModelContextRule>,
-    /// Vega 上下文机制：default = Reasonix，super = 改造前的超级上下文。
-    pub vega_context_mode: String,
     /// Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。
     pub cursor_context_mode: String,
     /// OpenCode CLI 可执行文件路径（默认 opencode，依赖 PATH）
@@ -321,7 +319,6 @@ impl Default for Settings {
             cursor_sdk_api_key: String::new(),
             cursor_disable_subagents: false,
             cursor_model_contexts: Vec::new(),
-            vega_context_mode: "default".into(),
             cursor_context_mode: "default".into(),
             opencode_path: "opencode".into(),
             opencode_args: "acp".into(),
@@ -503,12 +500,10 @@ mod tests {
     #[test]
     fn context_modes_default_and_round_trip() {
         let defaults = Settings::default();
-        assert_eq!(defaults.vega_context_mode, "default");
         assert_eq!(defaults.cursor_context_mode, "default");
         let settings: Settings =
-            serde_json::from_str(r#"{"vegaContextMode":"super","cursorContextMode":"super"}"#)
+            serde_json::from_str(r#"{"cursorContextMode":"super","vegaContextMode":"super"}"#)
                 .unwrap();
-        assert_eq!(settings.vega_context_mode, "super");
         assert_eq!(settings.cursor_context_mode, "super");
     }
 
@@ -682,9 +677,6 @@ impl Settings {
         settings.claudecode_integration = "sdk".into();
         settings.cursor_integration = "sdk".into();
         settings.opencode_integration = "sdk".into();
-        if settings.vega_context_mode != "super" {
-            settings.vega_context_mode = "default".into();
-        }
         if settings.cursor_context_mode != "super" {
             settings.cursor_context_mode = "default".into();
         }

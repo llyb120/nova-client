@@ -335,16 +335,14 @@ fn running_by_id(state: &AppState, thread_id: &str) -> bool {
     is_running(state, thread)
 }
 
-fn is_ordinary_thread(thread: &Thread) -> bool {
-    thread.roaming_role.is_none() && thread.quota_peer.is_none()
-}
-
 fn is_starrable_thread(thread: &Thread) -> bool {
     thread.roaming_role.is_none()
 }
 
 fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
-    is_ordinary_thread(thread) && !thread.experience_thread && !thread.starred
+    // 漫游会话（host 替别人执行 / guest 收看别人执行）与普通会话一样参与自动清理；
+    // 仍豁免：额度租借会话、经验训练会话和星标会话。运行中的会话由调用方另行排除。
+    thread.quota_peer.is_none() && !thread.experience_thread && !thread.starred
 }
 
 fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
@@ -620,7 +618,14 @@ mod session_auto_cleanup_tests {
         thread.experience_thread = true;
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
         thread.experience_thread = false;
+        // 漫游会话（两种角色）不豁免自动清理
         thread.roaming_role = Some("host".into());
+        assert!(is_normal_thread_for_auto_cleanup(&thread));
+        thread.roaming_role = Some("guest".into());
+        assert!(is_normal_thread_for_auto_cleanup(&thread));
+        thread.roaming_role = None;
+        // 额度租借会话仍豁免
+        thread.quota_peer = Some("peer-token".into());
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
     }
 
@@ -4300,7 +4305,6 @@ async fn apply_runtime_settings(
             || experience_tools_changed
             || auto_change_project_changed
             || s.vega_proxy != settings.vega_proxy
-            || s.vega_context_mode != settings.vega_context_mode
             || s.vega_enabled != settings.vega_enabled;
         let restart_lyra = restart_all_agents
             || context_runtime_changed

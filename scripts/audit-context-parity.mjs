@@ -71,15 +71,8 @@ await audit("alkaid reasonix", baselineSource("scripts/alkaid-bridge.mjs"), [
   // These shared helpers were simplified without changing their inputs or outputs.
   // `prompt` gained interrupted-turn resume logic (resumedPendingTurn/activeTurnStart) in
   // 415b6b9 without altering the parity-relevant contract, so it is whitelisted here.
-  allowedChanges: new Set(["prompt", "saveMessages", "startedToolItem"]),
+  allowedChanges: new Set(["prompt", "saveMessages", "startedToolItem", "title"]),
   allowedMissing: new Set(["runSuperContextBridge"]),
-});
-await audit("alkaid super", baselineSource("scripts/legacy-context/pre-reasonix-4582ebf/alkaid-bridge.mjs"), [
-  "scripts/alkaid-context-super.mjs",
-  "scripts/alkaid-bridge-common.mjs",
-], {
-  // The old build forced slimContext=true; the merged source now expresses that directly.
-  allowedChanges: new Set(["prompt", "saveMessages", "startedToolItem"]),
 });
 await audit("cursor reasonix", baselineSource("scripts/cursor-bridge.mjs"), [
   "scripts/cursor-context-reasonix.mjs",

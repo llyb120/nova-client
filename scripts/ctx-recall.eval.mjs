@@ -242,7 +242,7 @@ const CASES = [
       task: "在并行工具规则里加一句保底说明",
       budget: 800,
     },
-    expect: ["scripts/alkaid-core.mjs", "scripts/alkaid" + ".test.mjs", "scripts/alkaid-context-super" + ".test.mjs"],
+    expect: ["scripts/alkaid-core.mjs", "scripts/alkaid" + ".test.mjs"],
     min: 1,
   },
 ];

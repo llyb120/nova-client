@@ -285,9 +285,6 @@ export function SettingsModal(props: { onClose: () => void }) {
       .filter((item) => item.action !== "stopSession")
       .map((item) => ({ ...item })),
   );
-  const [vegaContextMode] = createSignal<"default" | "super">(
-    s?.vegaContextMode === "super" ? "super" : "default",
-  );
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
     s?.cursorContextMode === "super" ? "super" : "default",
   );
@@ -721,7 +718,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     cursorModelContexts: cursorModelContexts()
       .map((rule) => ({ prefix: rule.prefix.trim(), contextWindow: rule.contextWindow }))
       .filter((rule) => rule.prefix.length > 0),
-    vegaContextMode: vegaContextMode(),
     cursorContextMode: cursorContextMode(),
     opencodeProxy: opencodeProxy().trim(),
     defaultMode: "build",
