@@ -251,6 +251,22 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
     if (target.length > cur.length) startTick();
   });
 
+  // 轮次结束时 live 变 false：不能再等 shown 追平 target 才补尾渲染
+  //（tail effect 只订阅 shown，shown 追平时 tail 未必重跑），必须立即
+  // 用完整文本走非流式路径补齐尾部。shown 同步与补尾必须原子完成，
+  // 否则中间帧会读到未追平的 shown 切片。
+  createEffect(() => {
+    const target = props.text;
+    if (props.live) return;
+    const cur = untrack(shown);
+    if (!target.startsWith(cur) || target !== cur) {
+      stopTick();
+      if (target !== cur) setShown(target);
+      const tail = target.slice(stableSrc.length);
+      setTailHtml(cachedRenderMarkdown(tail, !!props.markFiles));
+    }
+  });
+
   onCleanup(stopTick);
 
   // 增量渲染状态：stableSrc 为已固化的源文本前缀，其 DOM 只追加、从不重建；尾部每次重渲染
