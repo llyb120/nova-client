@@ -1,4 +1,4 @@
-import type { ThemeColors } from "./base";
+import type { BackdropTheme } from "./base";
 
 /**
  * 星图背景：按当前时间（格林尼治恒星时）旋转天球，绘制接近真实星空的效果。
@@ -496,7 +496,7 @@ export function paintStarMap(
   ctx: CanvasRenderingContext2D,
   width: number,
   height: number,
-  theme: Pick<ThemeColors, "bg" | "glowAccent">,
+  theme: Pick<BackdropTheme, "bg" | "glowAccent">,
   now: number,
 ): void {
   if (width < 80 || height < 80) return;

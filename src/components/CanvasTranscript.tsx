@@ -81,9 +81,21 @@ function readPalette(): Palette {
 
 // ─── Text measurement (cached) ──────────────────────────────────────────────
 
+/** 行内代码块 chip 的内边距：文字 → chip 边缘 */
+const CODE_PAD = 7;
+/** 行内代码块 chip 与相邻文字之间的空隙。chip 绘制时左右各外扩 1px（描边），
+ *  所以实际视觉空隙 = CODE_GAP - 1。 */
+const CODE_GAP = 5;
+
 let _mCtx: CanvasRenderingContext2D | null = null;
 function mCtx() {
-  if (!_mCtx) _mCtx = document.createElement("canvas").getContext("2d")!;
+  if (!_mCtx) {
+    _mCtx = document.createElement("canvas").getContext("2d")!;
+    // 与主画布（paint 里的 optimizeLegibility / fontKerning）保持同一套文本整形，
+    // 否则 measureText 与 fillText 量出的宽度不一致，chip 尺寸与文字位置都会偏。
+    _mCtx.textRendering = "optimizeLegibility";
+    _mCtx.fontKerning = "normal";
+  }
   return _mCtx;
 }
 const _mCache = new Map<string, number>();
@@ -350,7 +362,8 @@ function wrapStyledTextIndexed(
         end++;
       }
       width += measure(line.slice(start, end), style.code ? 12.5 : fs, style.code ? mono : ff, style.bold ? "bold" : baseFw, style.italic ? "italic" : "normal");
-      if (style.code) width += 12;
+      // 与 paintStyledText 中 code run 的推进量保持一致
+      if (style.code) width += CODE_PAD * 2 + CODE_GAP * 2;
       start = end;
     }
     return width;
@@ -488,13 +501,19 @@ function tokenizeInline(text: string): TextSegment[] {
     let m: RegExpMatchArray | null;
     m = rest.match(/^`([^`]+)`/);
     if (m) { flush(); tokens.push({ text: m[1], code: true }); i += m[0].length; continue; }
-    m = rest.match(/^\*\*(.+?)\*\*/);
+    // `__` 粗体要求开定界符前是空白/标点/行首（CommonMark flanking），避免把
+    // mcp__nova-tools__polaris 中的 __nova-tools__ 误识别为粗体吃掉两侧 __。
+    const prevCh = i > 0 ? text[i - 1] : "";
+    const preOk = i === 0 || /[\s\p{P}]/u.test(prevCh);
+    m = rest.match(/^\*\*([^*\s](?:[^*]*[^*\s])?)\*\*(?![\w])/) ;
     if (m) { flush(); tokens.push({ text: m[1], bold: true }); i += m[0].length; continue; }
-    m = rest.match(/^__(.+?)__/);
+    m = preOk && prevCh !== "_" ? rest.match(/^(?!_)__([^_\s](?:[^_]*[^_\s])?)__(?![\w_])/) : null;
     if (m) { flush(); tokens.push({ text: m[1], bold: true }); i += m[0].length; continue; }
-    m = rest.match(/^\*([^*]+)\*/);
+    m = preOk ? rest.match(/^\*([^*\s](?:[^*]*[^*\s])?)\*(?![\w])/) : null;
     if (m) { flush(); tokens.push({ text: m[1], italic: true }); i += m[0].length; continue; }
-    m = rest.match(/^_([^_]+)_/);
+    // 下划线斜体要求前一个字符不是下划线（排除 __ 前缀、标识符内的连续下划线），
+    // 且闭合定界符后不接词字符。
+    m = preOk && prevCh !== "_" ? rest.match(/^(?!__)_([^_\s](?:[^_]*[^_\s])?)_(?![\w_])/) : null;
     if (m) { flush(); tokens.push({ text: m[1], italic: true }); i += m[0].length; continue; }
     m = rest.match(/^\[([^\]]+)\]\(([^)\s]+)\)/);
     if (m) { flush(); tokens.push({ text: m[1], link: m[2] }); i += m[0].length; continue; }
@@ -2426,11 +2445,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const segFf = cs.code ? pal.mono : ff;
           const segStyle = cs.italic ? "italic" : "normal";
           const rw = measure(run, segFs, segFf, segFw, segStyle);
-          const codePad = cs.code ? 6 : 0;
+          const codePad = cs.code ? CODE_PAD : 0;
+          const codeGap = cs.code ? CODE_GAP : 0;
           for (let c = 0; c < run.length; c++) {
-            charX[ri + c] = cx + codePad + measure(run.slice(0, c), segFs, segFf, segFw, segStyle);
+            charX[ri + c] = cx + codeGap + codePad + measure(run.slice(0, c), segFs, segFf, segFw, segStyle);
           }
-          cx += rw + codePad * 2;
+          cx += rw + codePad * 2 + codeGap * 2;
           ri = runEnd;
         }
         charX[line.length] = cx;
@@ -2468,25 +2488,28 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         const segFf = cs.code ? pal.mono : ff;
         const segStyle = cs.italic ? "italic" : "normal";
         const rw = measure(run, segFs, segFf, segFw, segStyle);
-        const codePad = cs.code ? 6 : 0;
+        const codePad = cs.code ? CODE_PAD : 0;
+        const codeGap = cs.code ? CODE_GAP : 0;
+        const chipX = startX + cx + codeGap;
+        const runX = chipX + codePad;
 
         if (cs.code) {
           ctx.fillStyle = pal.panel;
-          roundRect(ctx, startX + cx - 1, tySnap - 2, rw + codePad * 2 + 2, segFs + 5, 5);
+          roundRect(ctx, chipX - 1, tySnap - 2, rw + codePad * 2 + 2, segFs + 5, 5);
           ctx.fill();
           ctx.strokeStyle = pal.border;
           ctx.lineWidth = 1;
-          roundRect(ctx, startX + cx - 0.5, tySnap - 1.5, rw + codePad * 2 + 1, segFs + 4, 5);
+          roundRect(ctx, chipX - 0.5, tySnap - 1.5, rw + codePad * 2 + 1, segFs + 4, 5);
           ctx.stroke();
         }
 
         ctx.fillStyle = cs.link ? pal.blue : (b.color || pal.text);
         ctx.font = `${segStyle} ${segFw} ${segFs}px ${segFf}`;
-        fillTextCrisp(ctx, run, startX + cx + codePad, tySnap);
+        fillTextCrisp(ctx, run, runX, tySnap);
         if (cs.link) {
-          ctx.fillRect(startX + cx + codePad, tySnap + segFs + 1, rw, 1);
+          ctx.fillRect(runX, tySnap + segFs + 1, rw, 1);
         }
-        cx += rw + codePad * 2;
+        cx += rw + codePad * 2 + codeGap * 2;
         ri = runEnd;
       }
       globalOffset += line.length;

@@ -316,12 +316,8 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
   );
-  const [chatViewRender, setChatViewRender] = createSignal<"dom" | "canvas" | "canvas_qwen">(
-    s?.chatViewRender === "dom"
-      ? "dom"
-      : s?.chatViewRender === "canvas_qwen"
-        ? "canvas_qwen"
-        : "canvas",
+  const [chatViewRender, setChatViewRender] = createSignal<"dom" | "canvas">(
+    s?.chatViewRender === "dom" ? "dom" : "canvas",
   );
   // server 留空回退默认地址；这里也预填，避免误存成空导致团队/漫游被静默关闭
   const [relayServer, setRelayServer] = createSignal(s?.relayServer || DEFAULT_RELAY_SERVER);
@@ -1555,18 +1551,14 @@ export function SettingsModal(props: { onClose: () => void }) {
                   class="field-input"
                   value={chatViewRender()}
                   onChange={(e) => {
-                    const v = e.currentTarget.value;
-                    setChatViewRender(
-                      v === "dom" ? "dom" : v === "canvas_qwen" ? "canvas_qwen" : "canvas",
-                    );
+                    setChatViewRender(e.currentTarget.value === "dom" ? "dom" : "canvas");
                   }}
                 >
                   <option value="canvas">Canvas（默认）</option>
-                  <option value="canvas_qwen">canvas(qwen)</option>
                   <option value="dom">DOM</option>
                 </select>
                 <span class="field-hint">
-                  Canvas 在超长会话时更省 DOM 节点、滚动更轻；DOM 选区/复制更可靠；canvas(qwen) 为 GLM canvas 渲染实验实现。可随时切换，保存后立即生效。
+                  Canvas 在超长会话时更省 DOM 节点、滚动更轻；DOM 选区/复制更可靠。可随时切换，保存后立即生效。
                 </span>
               </label>
             </section>
