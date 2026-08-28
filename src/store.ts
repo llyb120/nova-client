@@ -2537,6 +2537,22 @@ export async function initStore() {
   if (initialized) return;
   initialized = true;
 
+  // 必须先监听模型更新，再读取 settings 触发 ensureModelOptions；否则缓存命中后的后台
+  // 重验可能在其余监听串行注册期间完成，磁盘已更新但当前窗口仍停在旧列表。
+  await listen<OptionsEvent>("acp:options", (e) => {
+    const payload = e.payload;
+    if ("options" in payload && "agentKind" in payload) {
+      setModelOptions(payload.agentKind, payload.options);
+      syncLyraConfigDefaultModel(payload.agentKind, payload.options);
+      const model = lastUsed.model(payload.agentKind);
+      const name = modelChoices(payload.agentKind).find((c) => c.value === model)?.name;
+      if (model && name) lastUsed.setModelName(payload.agentKind, name);
+    } else {
+      setModelOptions("devin", payload as ModelOptions);
+      syncLyraConfigDefaultModel("devin", payload as ModelOptions);
+    }
+  });
+
   // settings 是本地快照且不依赖事件监听：先并行拉取并尽快写进 store。
   // 后面的 listen 仍照常尽早注册；但不会再因为逐个 await listen 而拖慢设置页回显。
   const settingsReady = api.getSettings().then((settings) => {
@@ -2690,20 +2706,6 @@ export async function initStore() {
 
   await listen<Status>("acp:status", (e) => {
     setState({ connected: e.payload.connected, agent: e.payload.agent });
-  });
-
-  await listen<OptionsEvent>("acp:options", (e) => {
-    const payload = e.payload;
-    if ("options" in payload && "agentKind" in payload) {
-      setModelOptions(payload.agentKind, payload.options);
-      syncLyraConfigDefaultModel(payload.agentKind, payload.options);
-      const model = lastUsed.model(payload.agentKind);
-      const name = modelChoices(payload.agentKind).find((c) => c.value === model)?.name;
-      if (model && name) lastUsed.setModelName(payload.agentKind, name);
-    } else {
-      setModelOptions("devin", payload as ModelOptions);
-      syncLyraConfigDefaultModel("devin", payload as ModelOptions);
-    }
   });
 
   await listen<CommandsEvent>("acp:commands", (e) => {
