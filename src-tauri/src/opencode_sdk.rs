@@ -913,6 +913,16 @@ impl OpenCodeSdkManager {
     }
 
     fn emit_update(&self, thread_id: &str, item: &Item) -> Result<(), tauri::Error> {
+        // 同 acp.rs：只给前台正在查看的会话推流。后台会话的高频增量广播到 WebView 只会
+        // 被前端按 threadId 丢弃，却仍跨 IPC 全量反序列化，多会话并发时把渲染进程拖垮。
+        // 增量已落库，切回时经 get_thread 快照补齐。
+        {
+            let state = self.app.state::<AppState>();
+            let active = state.active_thread.lock().unwrap();
+            if active.as_deref() != Some(thread_id) {
+                return Ok(());
+            }
+        }
         self.app.emit(
             EV_UPDATE,
             json!({
