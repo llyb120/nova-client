@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
+import { LruMap } from "./lruMap";
 import { api } from "./ipc";
 import type {
   Achievement,
@@ -508,18 +509,11 @@ export async function refreshThreads() {
   // 但后端此时还没来得及把异步 agent 任务登记为 running。记录请求开始时的
   // 事件版本，若期间已经收到 acp:turn，就不能再用这份旧快照覆盖事件结果。
   const runningVersionsBeforeRequest = new Map(runningEventVersions);
-  const [threads, snapshots] = threadSnapshotsLoaded
-    ? [await api.listThreads(), null]
-    : await api.loadThreads();
+  const threads = await api.listThreads();
   // 多次刷新并发时，较早的响应不能覆盖较新的响应。
   if (request !== refreshThreadsRequest) return;
   // 按 id reconcile 而非整体替换：保留未变线程的对象身份，
   // 避免 <For> 重建整个列表 DOM 导致侧边栏滚动位置被重置
-  if (snapshots) {
-    threadSnapshots.clear();
-    for (const thread of snapshots) rememberThreadSnapshot(thread);
-    threadSnapshotsLoaded = true;
-  }
   setState("threads", reconcile(threads, { key: "id" }));
   const running: Record<string, boolean> = {};
   for (const t of threads) {
@@ -534,15 +528,14 @@ export async function refreshThreads() {
         : t.running;
   }
   setState("running", running);
-  // ThreadStore 后端本就常驻内存、异步落盘；首次加载在单次 IPC 中把全部快照
-  // 搬进 WebView。后续刷新仅补载新会话，切换会话不再等待磁盘或 IPC。
+  // 完整 transcript 只在 WebView 中保留少量 LRU 快照。旧实现会在启动和每次刷新时
+  // 把所有会话补齐进 JS，运行过的长会话越多，内存与 GC 停顿越明显，最终连点击和发送都会卡。
   const ids = new Set(threads.map((thread) => thread.id));
   for (const id of threadSnapshots.keys()) if (!ids.has(id)) threadSnapshots.delete(id);
-  await Promise.all(
-    threads
-      .filter((thread) => !threadSnapshots.has(thread.id))
-      .map((thread) => preloadThreadSnapshot(thread.id, request)),
-  );
+  for (const thread of threads) {
+    const snapshot = threadSnapshots.peek(thread.id);
+    if (snapshot && thread.updatedAt > snapshot.updatedAt) staleThreadSnapshots.add(thread.id);
+  }
 }
 
 export async function refreshProjects() {
@@ -1098,14 +1091,16 @@ export function clearQuotaRoamingProgress() {
   setState("quotaRoamingProgress", null);
 }
 
-const threadSnapshots = new Map<string, Thread>();
-const loadingThreadSnapshots = new Map<string, Promise<void>>();
-let threadSnapshotsLoaded = false;
+const THREAD_SNAPSHOT_LIMIT = 3;
+const threadSnapshots = new LruMap<string, Thread>(THREAD_SNAPSHOT_LIMIT);
+const staleThreadSnapshots = new Set<string>();
 /** 运行中各会话最近一次实时用量；切换会话时恢复，避免等待下一次 usage 事件。 */
 const liveUsageByThread = new Map<string, LiveUsage>();
 
 function rememberThreadSnapshot(thread: Thread) {
-  threadSnapshots.set(thread.id, thread);
+  const evicted = threadSnapshots.set(thread.id, thread, state.currentId ?? undefined);
+  staleThreadSnapshots.delete(thread.id);
+  for (const id of evicted) staleThreadSnapshots.delete(id);
 }
 
 function getThreadSnapshot(id: string): Thread | undefined {
@@ -1115,7 +1110,7 @@ function getThreadSnapshot(id: string): Thread | undefined {
 function rememberCurrentThreadSnapshot() {
   const id = state.currentId;
   if (!id) return;
-  const thread = threadSnapshots.get(id);
+  const thread = threadSnapshots.peek(id);
   if (!thread) return;
   rememberThreadSnapshot({
     ...thread,
@@ -1129,21 +1124,6 @@ function rememberCurrentThreadSnapshot() {
     items: unwrap(state.items),
     plan: state.plan ? unwrap(state.plan) : null,
   });
-}
-
-function preloadThreadSnapshot(id: string, request = refreshThreadsRequest): Promise<void> {
-  if (threadSnapshots.has(id)) return Promise.resolve();
-  const existing = loadingThreadSnapshots.get(id);
-  if (existing) return existing;
-  const loading = api
-    .getThread(id)
-    .then((thread) => {
-      if (request === refreshThreadsRequest) rememberThreadSnapshot(thread);
-    })
-    .catch(() => {})
-    .finally(() => loadingThreadSnapshots.delete(id));
-  loadingThreadSnapshots.set(id, loading);
-  return loading;
 }
 
 function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileItems = false) {
@@ -1183,8 +1163,14 @@ let openThreadRequest = 0;
 export async function openThread(id: string) {
   const switching = state.currentId !== id;
   const request = switching ? ++openThreadRequest : openThreadRequest;
+  const previousId = state.currentId;
   flushPendingStreamUpdates();
-  if (switching) rememberCurrentThreadSnapshot();
+  if (switching) {
+    rememberCurrentThreadSnapshot();
+    if (previousId && state.running[previousId] && threadSnapshots.has(previousId)) {
+      staleThreadSnapshots.add(previousId);
+    }
+  }
 
   const cached = getThreadSnapshot(id);
   const commitSnapshot = (thread: Thread, loadingThread: boolean, reconcileItems = false) => {
@@ -1227,6 +1213,14 @@ export async function openThread(id: string) {
     await api.reportActivity(id);
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
+    if (cached && switching && !staleThreadSnapshots.has(id)) {
+      const agentKind = cached.agentKind ?? "devin";
+      const roamingPeer =
+        cached.roamingRole === "guest" ? cached.roamingPeer ?? null : cached.quotaPeer ?? null;
+      if (roamingPeer) ensurePeerModels(roamingPeer);
+      else void ensureModelOptions(agentKind);
+      return;
+    }
     const t = await api.getThread(id);
     if (request !== openThreadRequest) return;
     rememberThreadSnapshot(t);
@@ -1320,6 +1314,118 @@ export async function createThread(
   void refreshProjects();
   void ensureModelOptions(storedAgentKind);
   return t.id;
+}
+
+/** 待创建会话的占位 id 前缀：永不落库，仅用于乐观进入聊天页。 */
+export const PENDING_THREAD_PREFIX = "__pending__";
+
+export function isPendingThreadId(id: string | null | undefined): boolean {
+  return !!id && id.startsWith(PENDING_THREAD_PREFIX);
+}
+
+/**
+ * 乐观创建本地会话：先切进聊天页并上屏用户消息，后台 create_thread 完成后
+ * 把占位替换成真会话并补发首条提示词。失败时回退到首页并保留输入。
+ * 与 worktree 的「会话先落库返回」同一体验目标：消除提交后到进入界面的卡顿。
+ */
+export function createThreadOptimistic(
+  cwd: string,
+  agentKind: AgentKind,
+  model: string,
+  mode: string,
+  reasoningEffort: string,
+  text: string,
+  images: PromptImage[],
+  ephemeral: boolean,
+  clueCardId: string,
+): void {
+  const pendingId = PENDING_THREAD_PREFIX + crypto.randomUUID();
+  setState("expanded", reconcile({}));
+  setState({
+    currentId: pendingId,
+    items: [],
+    plan: null,
+    proposedPlan: null,
+    cwd,
+    title: "",
+    agentKind,
+    model,
+    mode,
+    reasoningEffort,
+    loadingThread: false,
+  });
+  // 用户消息立即上屏，与 deliverPrompt 的乐观项同一约定（负 id 临时项）。
+  setState("items", 0, {
+    type: "user",
+    id: -Date.now(),
+    text,
+    images,
+    ts: Date.now(),
+  } as Item);
+  bumpChatScrollToBottom();
+  void (async () => {
+    try {
+      const t = await api.createThread(
+        cwd,
+        agentKind,
+        model || null,
+        mode || null,
+        agentKind === "codex" ? reasoningEffort || null : null,
+        ephemeral,
+        false,
+        null,
+        null,
+        clueCardId || null,
+        null,
+      );
+      rememberThreadSnapshot(t);
+      const storedAgentKind = t.agentKind ?? agentKind;
+      lastUsed.setMode(storedAgentKind, t.mode ?? "");
+      if (storedAgentKind === "codex") {
+        lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
+      }
+      // 用户可能已切走：仅在仍停留在该占位会话时才接管界面。
+      if (state.currentId === pendingId) {
+        setState({
+          currentId: t.id,
+          items: t.items,
+          plan: (t.plan as PlanEntry[] | null) ?? null,
+          proposedPlan: null,
+          cwd: t.cwd,
+          title: t.title,
+          agentKind: storedAgentKind,
+          model: t.model ?? "",
+          mode: t.mode ?? "",
+          reasoningEffort: t.reasoningEffort ?? "",
+          loadingThread: false,
+        });
+        setState("running", t.id, true);
+        reportActivity(true);
+        await sendPromptTo(t.id, text, images);
+      } else {
+        // 已切走：后台建好后直接发，保持 optimisticRunningThreads 状态一致。
+        optimisticRunningThreads.add(t.id);
+        setState("running", t.id, true);
+        try {
+          await api.sendPrompt(t.id, text, images);
+        } catch (error) {
+          optimisticRunningThreads.delete(t.id);
+          setState("running", t.id, false);
+          throw error;
+        }
+      }
+      void refreshThreads();
+      void refreshProjects();
+      void ensureModelOptions(storedAgentKind);
+    } catch (error) {
+      if (state.currentId === pendingId) {
+        setState("items", (items) => items.filter((item) => item.id >= 0));
+        setState("currentId", null);
+        setView("home");
+      }
+      console.error("optimistic create_thread failed", error);
+    }
+  })();
 }
 
 /** 记住最近一次选择的模型/模式，作为新会话默认值 */
@@ -1767,6 +1873,15 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
     if (images.length > 0) throw new Error("/fire 暂不支持附件");
     parseFireInput(builtInInput);
+    return;
+  }
+  if (/^\/browser(?:\s|$)/i.test(builtInInput)) {
+    const goal = builtInInput.replace(/^\/browser(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
+    if (!goal) throw new Error("请在 /browser 后输入网址和调试目标，例如 /browser localhost:5173 检查登录页");
+    return;
+  }
+  if (/^\/browser-exit(?:\s|$)/i.test(builtInInput)) {
+    if (!/^\/browser-exit\s*$/i.test(builtInInput)) throw new Error("/browser-exit 后不需要附加内容");
     return;
   }
   if (/^\/setup(?:\s|$)/i.test(builtInInput)) {
@@ -2521,10 +2636,22 @@ function normalizeSlashCommands(commands: unknown): SlashCommand[] {
     .filter((c): c is SlashCommand => !!c);
 }
 
+const BROWSER_SLASH_COMMANDS: SlashCommand[] = [
+  { name: "browser", description: "进入持续浏览器调试模式（Playwright）", kind: "builtin", input: "/browser " },
+  { name: "browser-exit", description: "退出浏览器调试模式", kind: "builtin", input: "/browser-exit" },
+];
+
 export async function refreshSlashCommands(agentKind: AgentKind) {
   try {
     const commands = await api.getSlashCommands(agentKind);
-    setState("slashCommands", agentKind, normalizeSlashCommands(commands));
+    const list = normalizeSlashCommands(commands);
+    // 内置 /browser 调试命令对 Lyra 与 ACP 后端可用（后端支持 MCP 注入时生效）。
+    if (["lyra", "devin", "codebuddy"].includes(agentKind)) {
+      for (const cmd of BROWSER_SLASH_COMMANDS) {
+        if (!list.some((c) => c.name === cmd.name)) list.push(cmd);
+      }
+    }
+    setState("slashCommands", agentKind, list);
   } catch (err) {
     console.warn(`拉取 ${agentKind} 斜杠命令失败`, err);
   }
@@ -2588,7 +2715,10 @@ export async function initStore() {
     for (const op of ops) {
       if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
     }
-    if (e.payload.threadId !== state.currentId) return;
+    if (e.payload.threadId !== state.currentId) {
+      if (threadSnapshots.has(e.payload.threadId)) staleThreadSnapshots.add(e.payload.threadId);
+      return;
+    }
     // 切换会话加载快照期间忽略增量：此刻 items 还是旧会话的，getThread 快照会包含
     // 已落库的全部内容，加载完成（loadingThread=false）后再应用后续实时增量。
     // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
@@ -2615,7 +2745,7 @@ export async function initStore() {
 
   await listen<{ threadId: string; cwd: string }>("thread:cwd-changed", (e) => {
     const { threadId, cwd } = e.payload;
-    const cached = threadSnapshots.get(threadId);
+    const cached = threadSnapshots.peek(threadId);
     if (cached) rememberThreadSnapshot({ ...cached, cwd });
     setState("threads", (thread) => thread.id === threadId, "cwd", cwd);
     if (state.currentId === threadId) setState("cwd", cwd);
@@ -2627,13 +2757,15 @@ export async function initStore() {
     runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
     optimisticRunningThreads.delete(threadId);
     setState("running", threadId, e.payload.running);
+    if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
+      staleThreadSnapshots.add(threadId);
+    }
     if (e.payload.running) {
       // 只在新一轮开始时丢弃上一轮残留；重复 running 事件不能覆盖本轮已收到的 usage。
       if (!wasRunning) {
         liveUsageByThread.delete(threadId);
         if (threadId === state.currentId) setState("liveUsage", null);
       }
-      preloadThreadSnapshot(e.payload.threadId);
       // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
       resumeFireRelay(e.payload.threadId);
       handleWorkflowTurnStart(e.payload.threadId);

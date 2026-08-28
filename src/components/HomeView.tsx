@@ -12,6 +12,7 @@ import {
   createRoamingThread,
   createQuotaThread,
   createThread,
+  createThreadOptimistic,
   clearPendingClueCard,
   clearQuotaRoamingProgress,
   enabledAgentKinds,
@@ -664,21 +665,41 @@ export function HomeView() {
         stashWorktreePrompt(id, prompt, images, workflow?.id ?? null);
       } else {
         const ephemeral = opts.ephemeral ?? false;
-        await createThread(
-          cwd(),
-          agentKind(),
-          model(),
-          mode(),
-          "",
-          ephemeral,
-          false,
-          "",
-          "",
-          clue?.id ?? "",
-        );
-        if (!ephemeral) lastUsed.setModel(agentKind(), model());
-        if (clue) clearPendingClueCard();
-        await sendPrompt(prompt, images, workflow?.id ?? null);
+        const workflowId = workflow?.id ?? null;
+        if (workflowId) {
+          // 工作流：会话需先建好再启动工作流，沿用同步创建，不乐观跳转。
+          await createThread(
+            cwd(),
+            agentKind(),
+            model(),
+            mode(),
+            "",
+            ephemeral,
+            false,
+            "",
+            "",
+            clue?.id ?? "",
+          );
+          if (!ephemeral) lastUsed.setModel(agentKind(), model());
+          if (clue) clearPendingClueCard();
+          await sendPrompt(prompt, images, workflowId);
+        } else {
+          // 乐观进入聊天页：消息立即上屏，后台建会话并补发，失败回退。
+          if (!ephemeral) lastUsed.setModel(agentKind(), model());
+          const clueId = clue?.id ?? "";
+          if (clue) clearPendingClueCard();
+          createThreadOptimistic(
+            cwd(),
+            agentKind(),
+            model(),
+            mode(),
+            "",
+            prompt,
+            images,
+            ephemeral,
+            clueId,
+          );
+        }
       }
       setText("");
       setQuote("");
