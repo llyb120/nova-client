@@ -152,6 +152,32 @@ fn json_rpc_request_id(message: &Value) -> Option<u64> {
         .and_then(Value::as_u64)
 }
 
+/// CodeBuddy 同时返回标准 `models` 和旧扩展 `configOptions`；标准字段会随账号权限
+/// 实时更新，而扩展模型项可能仍是启动缓存。仅替换模型项，保留 mode 等其它扩展项。
+fn replace_model_config_option(config_options: Value, model_config_options: Value) -> Value {
+    let Some(model) = model_config_options
+        .as_array()
+        .and_then(|options| options.first())
+        .cloned()
+    else {
+        return config_options;
+    };
+    let mut options = config_options.as_array().cloned().unwrap_or_default();
+    if let Some(existing) = options
+        .iter_mut()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
+    {
+        *existing = model;
+    } else {
+        options.push(model);
+    }
+    Value::Array(options)
+}
+
+fn publishes_model_options(launch_env: &HashMap<String, String>) -> bool {
+    !launch_env.contains_key("NOVA_QUOTA_BORROWED")
+}
+
 fn http_rpc_error(id: u64, message: String) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -2342,12 +2368,19 @@ impl AcpManager {
         if !has_config && !has_models && !has_modes {
             return;
         }
-        // configOptions 优先用扩展字段；没有则从标准 models 转换。
-        let config_options = if has_config {
-            result.get("configOptions").cloned().unwrap_or(Value::Null)
-        } else {
-            models_to_config_options(result.get("models"))
-        };
+        // CodeBuddy 同时提供标准 models 和兼容旧客户端的 configOptions。后者可能是
+        // 进程启动缓存（实测账号新增模型已能调用、models 已更新，但扩展列表仍旧），
+        // 因此只对 CodeBuddy 用标准模型项覆盖扩展模型项；Devin 继续优先其扩展元数据。
+        let extension_config_options = result.get("configOptions").cloned().unwrap_or(Value::Null);
+        let standard_config_options = models_to_config_options(result.get("models"));
+        let config_options =
+            if self.kind == AgentKind::CodeBuddy && !standard_config_options.is_null() {
+                replace_model_config_option(extension_config_options, standard_config_options)
+            } else if has_config {
+                extension_config_options
+            } else {
+                standard_config_options
+            };
         let modes = match result.get("modes") {
             Some(m) if !m.is_null() => m.clone(),
             _ => modes_from_config_options(&config_options),
@@ -2357,11 +2390,14 @@ impl AcpManager {
             "modes": modes,
         });
         *self.model_options.lock().unwrap() = Some(v.clone());
-        self.persist_model_options(&v);
-        let _ = self.app.emit(
-            EV_OPTIONS,
-            json!({ "agentKind": self.kind.as_str(), "options": v }),
-        );
+        // 额度借用实例属于另一个账号；只保留自己的进程内列表，不能覆盖主账号缓存/UI。
+        if publishes_model_options(&self.launch_env) {
+            self.persist_model_options(&v);
+            let _ = self.app.emit(
+                EV_OPTIONS,
+                json!({ "agentKind": self.kind.as_str(), "options": v }),
+            );
+        }
     }
 
     fn capture_commands(&self, update: &Value) {
@@ -3832,10 +3868,34 @@ fn extract_codebuddy_endpoint(line: &str) -> Option<String> {
 mod codebuddy_http_tests {
     use super::{
         codebuddy_nova_tools_mcp_server_value, extract_codebuddy_endpoint, json_rpc_request_id,
-        merge_codebuddy_activation_env, thread_connection_key, SseDecoder,
+        merge_codebuddy_activation_env, publishes_model_options, replace_model_config_option,
+        thread_connection_key, SseDecoder,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn codebuddy_prefers_standard_models_and_borrowed_instances_do_not_publish_them() {
+        let merged = replace_model_config_option(
+            json!([
+                { "id": "mode", "options": [{ "value": "plan", "name": "Plan" }] },
+                { "id": "model", "currentValue": "old", "options": [
+                    { "value": "old", "name": "Old" }
+                ] }
+            ]),
+            json!([{ "id": "model", "currentValue": "glm-5.3-flash", "options": [
+                { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
+            ] }]),
+        );
+        assert_eq!(merged[0]["id"], "mode");
+        assert_eq!(merged[1]["currentValue"], "glm-5.3-flash");
+        assert_eq!(merged[1]["options"][0]["value"], "glm-5.3-flash");
+        assert!(publishes_model_options(&HashMap::new()));
+        assert!(!publishes_model_options(&HashMap::from([(
+            "NOVA_QUOTA_BORROWED".into(),
+            "1".into(),
+        )])));
+    }
 
     #[test]
     fn prewarm_activation_preserves_local_codebuddy_environment_but_isolates_borrowed_sessions() {
