@@ -137,6 +137,8 @@ export interface ThreadMeta {
   stageSourceThreadId?: string | null;
   /** 当前会话在证据链中的线索位置 */
   activeClueCardId?: string | null;
+  /** 已进入 Lyra Playwright 前端调试模式 */
+  browserDebugMode?: boolean;
 }
 
 /** 用户随 prompt 带上的附件。图片可带 base64，普通文件走 file:// resource_link。 */
@@ -294,6 +296,8 @@ export interface Thread {
   /** Stage 会话动态引用的源会话。 */
   stageSourceThreadId?: string | null;
   activeClueCardId?: string | null;
+  /** 已进入 Lyra Playwright 前端调试模式 */
+  browserDebugMode?: boolean;
   clueContext?: ClueContextSnapshot | null;
   createdAt: number;
   updatedAt: number;
@@ -460,8 +464,8 @@ export interface Settings {
   theme: string;
   /** 会话历史展示方式（按项目 / 按时间） */
   historyDisplayMode: "project" | "time";
-  /** 聊天视图渲染方式（dom / canvas / canvas_qwen；默认 canvas；canvas_qwen 为 GLM canvas 渲染，与默认 canvas 实现相互独立） */
-  chatViewRender: "dom" | "canvas" | "canvas_qwen";
+  /** 聊天视图渲染方式（dom / canvas；默认 canvas） */
+  chatViewRender: "dom" | "canvas";
   /** 团队/漫游中转服务地址（空 = 关闭团队/漫游） */
   relayServer: string;
   /** 团队/漫游身份 token（永久，用以区分每个人） */

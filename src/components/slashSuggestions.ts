@@ -75,6 +75,20 @@ export function getSlashSuggestions(
       kind: "Nova",
       input: "/train",
     },
+    ...(agentKind === "lyra" ? [
+      {
+        name: "browser",
+        description: "进入持续的 Playwright 前端调试模式：/browser 网址和任务",
+        kind: "Nova",
+        input: "/browser ",
+      },
+      {
+        name: "browser-exit",
+        description: "退出 Playwright 前端调试模式",
+        kind: "Nova",
+        input: "/browser-exit",
+      },
+    ] : []),
     {
       name: "setup",
       description: "把一个模型 / provider 接入 Lyra：/setup 模型名",

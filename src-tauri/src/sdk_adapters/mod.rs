@@ -66,6 +66,11 @@ pub trait SdkAdapter: Send + Sync {
         false
     }
 
+    /// 是否支持 `/browser` 进入持续浏览器调试模式（Lyra 原生实现；其余 SDK 暂不支持）。
+    fn supports_browser_debug(&self) -> bool {
+        false
+    }
+
     fn accepts_data_image(&self, mime_type: &str) -> bool {
         mime_type.starts_with("image/")
     }

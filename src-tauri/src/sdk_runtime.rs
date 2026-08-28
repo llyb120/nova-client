@@ -236,6 +236,8 @@ impl SdkManager {
             native_restore,
             user_item_id,
             cached_auto_model,
+            browser_debug_mode,
+            browser_mode_changed,
         ) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
@@ -243,6 +245,19 @@ impl SdkManager {
                 return;
             };
             let context = thread.take_prompt_context(self.adapter.label());
+            let supports_browser = self.adapter.supports_browser_debug();
+            let browser_command = supports_browser && crate::lyra::is_browser_command(&text);
+            let browser_exit_command =
+                supports_browser && crate::lyra::is_browser_exit_command(&text);
+            let previous_browser_debug_mode = thread.browser_debug_mode;
+            if browser_command {
+                thread.browser_debug_mode = true;
+            } else if browser_exit_command {
+                thread.browser_debug_mode = false;
+            }
+            let browser_debug_mode =
+                thread.browser_debug_mode || (browser_exit_command && previous_browser_debug_mode);
+            let browser_mode_changed = thread.browser_debug_mode != previous_browser_debug_mode;
             let native_restore = thread.pending_native_restore.take();
             let session_id = native_restore
                 .as_ref()
@@ -273,10 +288,25 @@ impl SdkManager {
                     .model
                     .as_deref()
                     .and_then(|selection| thread.cached_auto_model(selection)),
+                browser_debug_mode,
+                browser_mode_changed,
             );
             store.save_thread(&thread_id);
             values
         };
+        if browser_mode_changed {
+            let _ = self.app.emit(EV_THREADS, json!({}));
+        }
+        // Lyra 的 Playwright 启动与 provider/context 准备并行，避免首个 browser 调用
+        // 才安装运行时并等待录制进程就绪。
+        if browser_mode_changed && browser_debug_mode {
+            let app = self.app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = crate::browser::ensure_exec_port(&app).await {
+                    eprintln!("[browser] 预热 Playwright 失败：{error}");
+                }
+            });
+        }
         if let Some((prompt, fallback)) = title_job {
             self.app.state::<AppState>().generate_title(
                 &self.adapter.agent_kind(),
@@ -398,6 +428,7 @@ impl SdkManager {
             "mode": mode,
             "reasoningEffort": reasoning_effort,
             "lightweightModel": lightweight_model,
+            "browserDebugMode": browser_debug_mode,
             "parts": parts
         });
         let mut outcome = self
@@ -514,6 +545,16 @@ impl SdkManager {
         text: String,
         images: Vec<PromptImage>,
     ) {
+        let changes_browser_mode = self.adapter.supports_browser_debug()
+            && (crate::lyra::is_browser_command(&text)
+                || crate::lyra::is_browser_exit_command(&text));
+        if changes_browser_mode {
+            if self.is_running(&thread_id) {
+                self.interrupt_for_steer(&thread_id).await;
+            }
+            self.clone().run_prompt(thread_id, text, images).await;
+            return;
+        }
         if self.is_running(&thread_id) && self.adapter.supports_native_steer() {
             self.native_steer_prompt(&thread_id, text, images).await;
             return;
@@ -550,11 +591,7 @@ impl SdkManager {
                     .run_prompt(thread_id.to_string(), text, images)
                     .await;
             } else {
-                self.push_system(
-                    thread_id,
-                    "引导失败：运行通道尚未就绪。".into(),
-                    "error",
-                );
+                self.push_system(thread_id, "引导失败：运行通道尚未就绪。".into(), "error");
             }
             return;
         };
@@ -571,7 +608,30 @@ impl SdkManager {
             store.save_thread(thread_id);
         }
 
-        let parts = prompt_parts(self.adapter.as_ref(), &text, &images);
+        let mut parts = prompt_parts(self.adapter.as_ref(), &text, &images);
+        // 原生 steer 把消息注入仍在运行的 Agent；其工具集在首轮已固定，无法中途增减。
+        // 调试模式期间把状态写进提示，让模型知道本轮起可用 browser 工具联动调试。
+        if self.adapter.supports_browser_debug() {
+            let browser_debug_mode = {
+                let state = self.app.state::<AppState>();
+                let store = state.store.lock().unwrap();
+                store
+                    .get(thread_id)
+                    .map(|thread| thread.browser_debug_mode)
+                    .unwrap_or(false)
+            };
+            if browser_debug_mode && !text.is_empty() {
+                if let Some(part) = parts.first_mut().and_then(|part| part.as_object_mut()) {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        let note = "\n\n（当前处于浏览器调试模式，可使用 browser 工具打开页面、查看 Console/错误并截图联合作业。）";
+                        if let Some(text_value) = part.get("text").and_then(Value::as_str) {
+                            let merged = format!("{text_value}{note}");
+                            part.insert("text".into(), json!(merged));
+                        }
+                    }
+                }
+            }
+        }
         if let Err(error) =
             write_control(&control, &json!({ "action": "steer", "parts": parts })).await
         {
@@ -1067,6 +1127,7 @@ impl SdkManager {
             request,
             context_tools,
             self.borrowed_root(),
+            Some(self.app.clone()),
         );
         let abort = session.task.abort_handle();
         self.running_children.lock().unwrap().insert(
@@ -1772,6 +1833,21 @@ impl SdkManager {
     }
 
     fn emit_op(&self, thread_id: &str, op: Value) -> Result<(), tauri::Error> {
+        // 同 acp.rs：只给前台正在查看的会话推流。后台会话的高频增量（delta/upsert/usage）
+        // 广播到 WebView 只会被前端按 threadId 丢弃，却仍跨 IPC 全量反序列化，多会话并发
+        // 时把 WebView2 渲染进程拖垮。增量已落库，切回时经 get_thread 快照补齐。
+        // plan 是低频关键状态，不走 emit_op 的 emit 路径仍始终推送。
+        let always = op
+            .get("t")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == "plan");
+        if !always {
+            let state = self.app.state::<AppState>();
+            let active = state.active_thread.lock().unwrap();
+            if active.as_deref() != Some(thread_id) {
+                return Ok(());
+            }
+        }
         self.app
             .emit(EV_UPDATE, json!({ "threadId": thread_id, "op": op }))
     }
@@ -2051,9 +2127,29 @@ mod tests {
         is_codex_model_resume_warning, normalize_title, parse_bridge_output, resolve_codex_model,
         text_snapshot_change, tool_call, TextSnapshotChange, TOOL_OUTPUT_LIMIT,
     };
-    use crate::sdk_adapters::{ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter, SdkAdapter};
+    use crate::sdk_adapters::{
+        ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter, SdkAdapter,
+    };
     use crate::threads::{now_ms, AgentKind, CodexUsageSnapshot, Item, Thread, ToolCall};
     use serde_json::json;
+
+    #[test]
+    fn steer_injects_browser_debug_hint() {
+        let mut parts = vec![json!({ "type": "text", "text": "帮我改下首页样式" })];
+        let note = "\n\n（当前处于浏览器调试模式，可使用 browser 工具打开页面、查看 Console/错误并截图联合作业。）";
+        if let Some(part) = parts.first_mut().and_then(|part| part.as_object_mut()) {
+            if part.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                if let Some(text_value) = part.get("text").and_then(serde_json::Value::as_str) {
+                    let merged = format!("{text_value}{note}");
+                    part.insert("text".into(), json!(merged));
+                }
+            }
+        }
+        assert!(parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("浏览器调试模式"));
+    }
 
     #[test]
     fn title_fallback_uses_first_prompt_line_or_image() {

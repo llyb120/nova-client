@@ -5,6 +5,7 @@
 use crate::lyra::config::ResolvedModel;
 use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text};
 use crate::lyra::tools::Tool;
+use base64::Engine;
 use serde_json::{json, Map, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -57,6 +58,33 @@ fn tool_result_text(message: &Value) -> String {
         .map(|parts| content_text_parts(parts))
         .unwrap_or_default();
     clamp_tool_output_text(&text)
+}
+
+fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
+    if !model.supports_images {
+        return Vec::new();
+    }
+    let mut images: Vec<Value> = message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("image"))
+        .cloned()
+        .collect();
+    if let Some(path) = message
+        .pointer("/details/imagePath")
+        .and_then(Value::as_str)
+    {
+        if let Ok(data) = std::fs::read(path) {
+            images.push(json!({
+                "type": "image",
+                "mimeType": "image/png",
+                "data": base64::engine::general_purpose::STANDARD.encode(data),
+            }));
+        }
+    }
+    images
 }
 
 // ---------- chat/completions ----------
@@ -155,6 +183,19 @@ fn completions_messages(
                     "tool_call_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default(),
                     "content": tool_result_text(message),
                 }));
+                let images = tool_result_images(message, model);
+                if !images.is_empty() {
+                    let mut parts = vec![
+                        json!({ "type": "text", "text": "Screenshot returned by the browser tool." }),
+                    ];
+                    parts.extend(images.into_iter().map(|image| json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}",
+                            image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
+                            image.get("data").and_then(Value::as_str).unwrap_or_default()) }
+                    })));
+                    out.push(json!({ "role": "user", "content": parts }));
+                }
             }
             _ => {}
         }
@@ -310,6 +351,20 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                     "call_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default(),
                     "output": tool_result_text(message),
                 }));
+                let images = tool_result_images(message, model);
+                if !images.is_empty() {
+                    let mut content = vec![json!({
+                        "type": "input_text",
+                        "text": "Screenshot returned by the browser tool."
+                    })];
+                    content.extend(images.into_iter().map(|image| json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{};base64,{}",
+                            image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
+                            image.get("data").and_then(Value::as_str).unwrap_or_default())
+                    })));
+                    out.push(json!({ "type": "message", "role": "user", "content": content }));
+                }
             }
             _ => {}
         }
@@ -1096,7 +1151,7 @@ fn anthropic_thinking_budget(level: Option<&str>, max_output_tokens: u64) -> Opt
     Some(budget.min(cap))
 }
 
-fn anthropic_messages(messages: &[Value]) -> Vec<Value> {
+fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for message in messages {
         match message.get("role").and_then(Value::as_str) {
@@ -1172,6 +1227,22 @@ fn anthropic_messages(messages: &[Value]) -> Vec<Value> {
                         "is_error": is_error,
                     }],
                 }));
+                let images = tool_result_images(message, model);
+                if !images.is_empty() {
+                    let mut content = vec![json!({
+                        "type": "text",
+                        "text": "Screenshot returned by the browser tool."
+                    })];
+                    content.extend(images.into_iter().map(|image| json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
+                            "data": image.get("data").and_then(Value::as_str).unwrap_or_default(),
+                        }
+                    })));
+                    out.push(json!({ "role": "user", "content": content }));
+                }
             }
             _ => {}
         }
@@ -1189,7 +1260,7 @@ fn anthropic_body(
     let mut body = json!({
         "model": model.id,
         "max_tokens": model.max_output_tokens,
-        "messages": anthropic_messages(messages),
+        "messages": anthropic_messages(messages, model),
         "stream": true,
     });
     if !system_prompt.is_empty() {
@@ -1587,6 +1658,30 @@ mod tests {
         );
         assert_eq!(out[3]["role"], "tool");
         assert_eq!(out[3]["content"], "文件内容");
+    }
+
+    #[test]
+    fn multimodal_tool_results_keep_browser_screenshots() {
+        let model = test_model("openai-completions");
+        let image_path = std::env::temp_dir().join(format!(
+            "nova-browser-provider-test-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&image_path, b"ABC").unwrap();
+        let messages = vec![json!({
+            "role": "toolResult", "toolCallId": "shot", "toolName": "browser",
+            "content": [{ "type": "text", "text": "当前页面" }],
+            "details": { "imagePath": image_path }
+        })];
+        let out = completions_messages("sys", &messages, &model);
+        let _ = std::fs::remove_file(image_path);
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[2]["content"][0]["type"], "text");
+        assert_eq!(out[2]["content"][1]["type"], "image_url");
+        assert_eq!(
+            out[2]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
     }
 
     #[test]

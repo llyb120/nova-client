@@ -191,6 +191,8 @@ export function Composer() {
     const version = card ? clueCurrentVersion(card) : undefined;
     return { id: cardId, title: version?.title || "未命名线索" };
   });
+  const browserDebugMode = () =>
+    !!state.threads.find((item) => item.id === state.currentId)?.browserDebugMode;
   const openEvidenceChain = () => {
     const clue = activeClue();
     if (clue) {
@@ -585,6 +587,13 @@ export function Composer() {
     >
       <noteFlow.Notes />
       <ExclusiveChatMark token={state.roamingPeer || state.settings?.relayToken || ""} />
+      <Show when={browserDebugMode()}>
+        <div class="clue-context-chip" title="后续轮次持续携带 Playwright browser 工具；发送 /browser-exit 退出">
+          <span class="clue-context-label">浏览器调试模式</span>
+          <span class="clue-context-separator" aria-hidden="true" />
+          <span class="clue-context-title">/browser-exit 退出</span>
+        </div>
+      </Show>
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
       <Show when={manualReview()}>
         {(review) => (

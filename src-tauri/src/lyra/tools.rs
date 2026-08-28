@@ -8,10 +8,18 @@ use crate::lyra::prompt::{
     TOOL_OUTPUT_CONTEXT_MAX_BYTES,
 };
 use crate::lyra::{edit as native_edit, read as native_read};
+use base64::Engine;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tauri::AppHandle;
+
+#[derive(Clone)]
+pub struct BrowserTools {
+    pub app: AppHandle,
+    pub session_id: String,
+}
 
 const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文时先调用：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，并自动使用 task（缺省时回退 keywords）检索相关的猎户座经验、记忆与守则，一并返回。目标行段已明确时直接 read。";
 
@@ -42,6 +50,7 @@ pub fn tool_set(
     polaris: bool,
     memory_enabled: bool,
     auto_change_project: bool,
+    browser: bool,
 ) -> Vec<Tool> {
     let mut tools = Vec::new();
     if auto_change_project {
@@ -93,6 +102,38 @@ pub fn tool_set(
             "required": ["path"]
         })),
     });
+    if browser {
+        tools.push(Tool {
+            name: "browser",
+            description: "复用双子座的 Playwright 通信进程进行持续的前端开发与调试。可打开/跳转网站、交互、查看 console/pageerror/失败请求与 HTTP 错误，并截图交给视觉模型描述。每个 Lyra 会话使用独立且跨轮次保留的标签页；仅在用户要求或退出调试模式时 close。".into(),
+            parameters: schema(json!({
+                "type": "object",
+                "properties": {
+                    "operation": { "type": "string", "enum": ["open", "goto", "inspect", "screenshot", "act", "close"] },
+                    "url": { "type": "string", "description": "open/goto 的网址；localhost 默认补 http://" },
+                    "headless": { "type": "boolean", "description": "open 是否无头，默认 false，前端联调通常保持可见" },
+                    "action": { "type": "string", "enum": ["click", "fill", "press", "type", "scroll", "wait"], "description": "operation=act 时的操作" },
+                    "selector": { "type": "string", "description": "CSS selector；用于交互、等待或元素截图" },
+                    "role": { "type": "string" },
+                    "name": { "type": "string" },
+                    "label": { "type": "string" },
+                    "text": { "type": "string" },
+                    "value": { "type": "string" },
+                    "key": { "type": "string" },
+                    "deltaX": { "type": "number" },
+                    "deltaY": { "type": "number" },
+                    "ms": { "type": "integer", "minimum": 0, "maximum": 30000 },
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": 30000 },
+                    "state": { "type": "string", "enum": ["attached", "detached", "visible", "hidden"] },
+                    "fullPage": { "type": "boolean" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "clear": { "type": "boolean", "description": "inspect 清空事件" }
+                },
+                "required": ["operation"],
+                "additionalProperties": false
+            })),
+        });
+    }
     if !read_only {
         tools.push(Tool {
             name: "bash",
@@ -187,6 +228,11 @@ fn resolve_path(root: &Path, input: &str) -> PathBuf {
     } else {
         root.join(path)
     }
+}
+
+fn browser_url_allowed(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    !url.contains("://") || url.starts_with("http://") || url.starts_with("https://")
 }
 
 fn text_of(value: &Value) -> String {
@@ -514,8 +560,9 @@ pub async fn execute(
     archive_dir: Option<&Path>,
     call_id: &str,
     cancelled: Option<&Arc<AtomicBool>>,
+    browser: Option<&BrowserTools>,
 ) -> ToolOutcome {
-    let outcome = execute_inner(root, name, args, shell, cancelled).await;
+    let outcome = execute_inner(root, name, args, shell, cancelled, browser, archive_dir).await;
     govern(outcome, name, call_id, archive_dir)
 }
 
@@ -525,6 +572,8 @@ async fn execute_inner(
     args: &Value,
     shell: Option<&crate::lyra::prompt::ShellConfig>,
     cancelled: Option<&Arc<AtomicBool>>,
+    browser: Option<&BrowserTools>,
+    screenshot_dir: Option<&Path>,
 ) -> ToolOutcome {
     match name {
         "polaris" => {
@@ -740,6 +789,104 @@ async fn execute_inner(
                 Err(e) => ToolOutcome::error(format!("写入 {path} 失败：{e}")),
             }
         }
+        "browser" => {
+            let Some(browser) = browser else {
+                return ToolOutcome::error("browser 仅在 Nova 桌面应用内可用");
+            };
+            let operation = args
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let cmd = match operation {
+                "open" => {
+                    let url = args.get("url").and_then(Value::as_str).unwrap_or_default();
+                    if !browser_url_allowed(url) {
+                        return ToolOutcome::error("browser 仅允许 http/https 网站");
+                    }
+                    let mut cmd = args.clone();
+                    cmd["cmd"] = json!("devOpen");
+                    cmd["sessionId"] = json!(browser.session_id);
+                    cmd
+                }
+                "goto" => {
+                    let Some(url) = args.get("url").and_then(Value::as_str) else {
+                        return ToolOutcome::error("browser goto 缺少 url");
+                    };
+                    if !browser_url_allowed(url) {
+                        return ToolOutcome::error("browser 仅允许 http/https 网站");
+                    }
+                    let mut cmd = args.clone();
+                    cmd["cmd"] = json!("devGoto");
+                    cmd["sessionId"] = json!(browser.session_id);
+                    cmd
+                }
+                "inspect" => json!({
+                    "cmd": "devInspect", "sessionId": browser.session_id,
+                    "limit": args.get("limit"), "clear": args.get("clear"),
+                }),
+                "screenshot" => json!({
+                    "cmd": "devScreenshot", "sessionId": browser.session_id,
+                    "selector": args.get("selector"), "fullPage": args.get("fullPage"),
+                    "timeout": args.get("timeout"),
+                }),
+                "act" => {
+                    let Some(action) = args.get("action").and_then(Value::as_str) else {
+                        return ToolOutcome::error("browser act 缺少 action");
+                    };
+                    let mut cmd = args.clone();
+                    cmd["cmd"] = json!("devAct");
+                    cmd["sessionId"] = json!(browser.session_id);
+                    cmd["action"] = json!(action);
+                    cmd
+                }
+                "close" => json!({ "cmd": "devClose", "sessionId": browser.session_id }),
+                _ => return ToolOutcome::error("browser operation 无效"),
+            };
+            match crate::browser::execute_development_command(&browser.app, cmd).await {
+                Ok(mut value) if operation == "screenshot" => {
+                    let Some(image) = value
+                        .get_mut("image")
+                        .map(Value::take)
+                        .and_then(|image| image.as_str().map(str::to_string))
+                    else {
+                        return ToolOutcome::error("Playwright 未返回截图");
+                    };
+                    let image_bytes = match base64::engine::general_purpose::STANDARD.decode(&image)
+                    {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            return ToolOutcome::error(format!("Playwright 截图解码失败：{error}"))
+                        }
+                    };
+                    let image_dir = screenshot_dir
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| std::env::temp_dir().join("nova-browser-shots"));
+                    let image_path = image_dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+                    if let Some(parent) = image_path.parent() {
+                        if let Err(error) = std::fs::create_dir_all(parent) {
+                            return ToolOutcome::error(format!("创建截图目录失败：{error}"));
+                        }
+                    }
+                    if let Err(error) = std::fs::write(&image_path, image_bytes) {
+                        return ToolOutcome::error(format!("保存截图失败：{error}"));
+                    }
+                    let summary = json!({
+                        "url": value.get("url"),
+                        "viewport": value.get("viewport"),
+                        "path": image_path,
+                    });
+                    ToolOutcome {
+                        content: vec![
+                            json!({ "type": "text", "text": format!("浏览器截图：{summary}") }),
+                        ],
+                        details: Some(json!({ "imagePath": image_path })),
+                        is_error: false,
+                    }
+                }
+                Ok(value) => ToolOutcome::text(value.to_string()),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
         "change_working_directory" => {
             let Some(path) = args.get("path").and_then(Value::as_str).map(str::trim) else {
                 return ToolOutcome::error("change_working_directory 缺少 path");
@@ -767,16 +914,28 @@ async fn execute_inner(
 #[cfg(test)]
 mod embedded_rtk_tests {
     use super::{
-        capture_bash_pipe, drain_bash_pipes, render_trained_knowledge, rewrite_with_embedded_rtk,
-        tool_set,
+        browser_url_allowed, capture_bash_pipe, drain_bash_pipes, render_trained_knowledge,
+        rewrite_with_embedded_rtk, tool_set,
     };
     use crate::lyra::prompt::{ShellConfig, ShellKind};
     use serde_json::json;
 
     #[test]
+    fn browser_rejects_non_http_schemes() {
+        assert!(browser_url_allowed("localhost:5173"));
+        assert!(browser_url_allowed("https://example.com"));
+        assert!(!browser_url_allowed("file:///etc/passwd"));
+        assert!(!browser_url_allowed("ftp://example.com"));
+    }
+
+    #[test]
     fn disabled_feedback_memory_is_not_advertised() {
-        let tools = tool_set(false, true, true, false);
+        let tools = tool_set(false, true, true, false, false);
         assert!(tools.iter().all(|tool| tool.name != "feedback_memory"));
+        assert!(tools.iter().all(|tool| tool.name != "browser"));
+        assert!(tool_set(false, true, true, false, true)
+            .iter()
+            .any(|tool| tool.name == "browser"));
         let polaris = tools.iter().find(|tool| tool.name == "polaris").unwrap();
         assert!(!polaris.description.contains("feedback_memory"));
 

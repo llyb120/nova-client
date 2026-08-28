@@ -21,6 +21,11 @@ mod reasonix;
 mod tools;
 mod watchdog;
 
+pub use prompt::{
+    expand_browser_command, expand_browser_exit_command, is_browser_command,
+    is_browser_exit_command,
+};
+
 pub use bridge::{run_oneshot, spawn_prompt, InProcessSession};
 pub use config::set_nova_root;
 

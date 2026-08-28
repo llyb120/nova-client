@@ -1,6 +1,75 @@
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
 import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
+
+function browserDebugEnabled(options = {}) {
+  if (typeof options.browserDebug === "boolean") return options.browserDebug;
+  return process.env.NOVA_BROWSER_DEBUG === "1";
+}
+
+async function browserMcpPort() {
+  const file = process.env.NOVA_BROWSER_MCP_PORT_FILE;
+  if (!file) throw new Error("NOVA_BROWSER_MCP_PORT_FILE 未配置，browser 工具不可用");
+  const raw = await readFile(file, "utf8");
+  const port = Number.parseInt(raw.trim(), 10);
+  if (!Number.isInteger(port) || port <= 0) {
+    throw new Error("Nova browser 中转端口不可用，请先在 Lyra 中发送 /browser 打开浏览器");
+  }
+  return port;
+}
+
+async function callBrowserTool(command) {
+  const port = await browserMcpPort();
+  const response = await fetch(`http://127.0.0.1:${port}/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(command),
+    signal: AbortSignal.timeout(35_000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.ok !== true) {
+    throw new Error(payload.error || `browser 中转返回 HTTP ${response.status}`);
+  }
+  return payload.data;
+}
+
+const BROWSER_DESCRIPTION =
+  "通过 Nova 复用双子座的 Playwright 进程进行持续的前端开发与调试。可打开/跳转网站、交互、查看 console/pageerror/失败请求与 HTTP 错误，并截图。每个会话使用独立且跨轮次保留的标签页；仅在用户要求或退出调试模式时 close。";
+
+function browserInputSchema() {
+  return {
+    type: "object",
+    properties: {
+      operation: { type: "string", enum: ["open", "goto", "inspect", "screenshot", "act", "close"] },
+      url: { type: "string", description: "open/goto 的网址；localhost 默认补 http://" },
+      headless: { type: "boolean", description: "open 是否无头，默认 false" },
+      action: { type: "string", enum: ["click", "fill", "press", "type", "scroll", "wait"], description: "operation=act 时的操作" },
+      selector: { type: "string", description: "CSS selector；用于交互、等待或元素截图" },
+      text: { type: "string" },
+      limit: { type: "integer" },
+      clear: { type: "boolean" },
+      fullPage: { type: "boolean" },
+      timeout: { type: "integer" },
+    },
+    required: ["operation"],
+    additionalProperties: false,
+  };
+}
+
+function browserCommand(params, sessionId) {
+  const operation = String(params.operation ?? "");
+  const base = { sessionId };
+  switch (operation) {
+    case "open": return { ...base, cmd: "devOpen", url: params.url, headless: params.headless };
+    case "goto": return { ...base, cmd: "devGoto", url: params.url };
+    case "inspect": return { ...base, cmd: "devInspect", limit: params.limit, clear: params.clear };
+    case "screenshot": return { ...base, cmd: "devScreenshot", selector: params.selector, fullPage: params.fullPage, timeout: params.timeout };
+    case "act": return { ...base, cmd: "devAct", action: params.action, selector: params.selector, text: params.text };
+    case "close": return { ...base, cmd: "devClose" };
+    default: throw new Error(`browser operation 无效：${operation}`);
+  }
+}
 
 function fastContextEnabled(options = {}) {
   const enabled = typeof options.fastContext === "boolean"
@@ -41,11 +110,27 @@ export function normalizePolarisArgs(params = {}) {
  */
 export function createNovaBatchTools(cwd, options = {}) {
   const fastContext = fastContextEnabled(options);
+  const browserDebug = browserDebugEnabled(options);
   readOnlyEnabled(options);
   const root = resolve(cwd);
+  const browserSessionId = `nova-mcp-${process.pid}`;
 
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
   const tools = {};
+
+  if (browserDebug) {
+    tools.browser = {
+      description: BROWSER_DESCRIPTION,
+      inputSchema: browserInputSchema(),
+      async execute(params) {
+        const data = await callBrowserTool(browserCommand(params ?? {}, browserSessionId));
+        if (params?.operation === "screenshot" && data?.image) {
+          return `[browser screenshot saved: ${data.path ?? "(inline)"}] ${data.url ?? ""}`;
+        }
+        return typeof data === "string" ? data : JSON.stringify(data);
+      },
+    };
+  }
 
   if (fastContext) {
     tools.polaris = {
