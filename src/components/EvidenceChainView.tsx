@@ -320,7 +320,7 @@ export function EvidenceChainView() {
               const comments = () => card.comments ?? [];
               const commentById = (id?: string | null) =>
                 id ? comments().find((comment) => comment.id === id) : undefined;
-              const timeline = createMemo<TimelineEntry[]>(() => {
+              const timeline = (): TimelineEntry[] => {
                 if (!expanded()) return [];
                 const entries: TimelineEntry[] = comments().map((comment) => ({
                   kind: "comment",
@@ -333,7 +333,7 @@ export function EvidenceChainView() {
                 });
                 entries.sort((left, right) => left.at - right.at);
                 return entries;
-              });
+              };
               return (
                 <article
                   class="clue-feed-card"
