@@ -22,7 +22,7 @@ fn render_trained_knowledge(project_root: &str, activated: &Value, rendered: &st
 }
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。";
-const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。禁止无排除的递归搜索（grep -r 等）。";
+const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。禁止无排除的递归搜索（grep -r 等）。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
     "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
@@ -292,6 +292,55 @@ fn apply_powershell_utf8(command: String, shell: &crate::lyra::prompt::ShellConf
     format!("{POWERSHELL_UTF8_PREFIX}{command}")
 }
 
+fn capture_bash_pipe<R>(
+    mut pipe: Option<R>,
+) -> (Arc<std::sync::Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = output.clone();
+    let task = tokio::spawn(async move {
+        let Some(mut pipe) = pipe.take() else {
+            return;
+        };
+        let mut chunk = [0u8; 8192];
+        loop {
+            use tokio::io::AsyncReadExt;
+            match pipe.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => captured.lock().unwrap().extend_from_slice(&chunk[..read]),
+            }
+        }
+    });
+    (output, task)
+}
+
+// 子孙进程可能逃出进程树清理并继续持有 stdout/stderr。只给正常输出一个短暂排空窗口，
+// 随后关闭本进程的读取端，不能让工具收尾无限等待 EOF。
+async fn drain_bash_pipes(
+    read_out: &mut tokio::task::JoinHandle<()>,
+    read_err: &mut tokio::task::JoinHandle<()>,
+) {
+    const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+    if tokio::time::timeout(DRAIN_GRACE, async {
+        let _ = tokio::join!(&mut *read_out, &mut *read_err);
+    })
+    .await
+    .is_err()
+    {
+        read_out.abort();
+        read_err.abort();
+    }
+}
+
+fn captured_bash_output(output: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u8> {
+    output
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 async fn run_bash(
     root: &Path,
     shell: &crate::lyra::prompt::ShellConfig,
@@ -335,27 +384,16 @@ async fn run_bash(
         .spawn()
         .map_err(|e| format!("启动 shell 失败：{e}"))?;
     let mut guard = PidGuard(child.id());
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let read_out = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe.take() {
-            use tokio::io::AsyncReadExt;
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
-    let read_err = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stderr_pipe.take() {
-            use tokio::io::AsyncReadExt;
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
+    let (output_stdout, mut read_out) = capture_bash_pipe(child.stdout.take());
+    let (output_stderr, mut read_err) = capture_bash_pipe(child.stderr.take());
     enum Wait {
         Exited(std::io::Result<std::process::ExitStatus>),
         Cancelled,
+    }
+    enum Completion {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Cancelled,
+        TimedOut,
     }
     // PI 语义：取消信号穿透到工具，bash 轮询取消标志，命中即强杀整棵进程树。
     let wait = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
@@ -374,37 +412,44 @@ async fn run_bash(
         }
     })
     .await;
-    let status = match wait {
+    let completion = match wait {
         Ok(Wait::Exited(result)) => {
             guard.disarm();
-            result.map_err(|e| format!("执行命令失败：{e}"))?
+            Completion::Exited(result)
         }
         Ok(Wait::Cancelled) => {
-            // 与超时一致的清理：显式强杀整棵进程树（含孙进程）并回收，管道随之 EOF。
             if let Some(pid) = guard.0.take() {
                 crate::acp::kill_process_tree(pid);
             }
-            let _ = child.wait().await;
-            return Err(cancel_message(
-                &read_out.await.unwrap_or_default(),
-                &read_err.await.unwrap_or_default(),
-            ));
+            let _ = child.start_kill();
+            Completion::Cancelled
         }
         Err(_) => {
-            // 显式强杀整棵进程树（含孙进程）并回收，管道随之 EOF。
             if let Some(pid) = guard.0.take() {
                 crate::acp::kill_process_tree(pid);
             }
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            Completion::TimedOut
+        }
+    };
+    if matches!(&completion, Completion::Cancelled | Completion::TimedOut) {
+        // kill/reap 也必须有界；遗漏的后代进程可能仍持有管道句柄。
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+    }
+    drain_bash_pipes(&mut read_out, &mut read_err).await;
+    let output_stdout = captured_bash_output(&output_stdout);
+    let output_stderr = captured_bash_output(&output_stderr);
+    let status = match completion {
+        Completion::Exited(result) => result.map_err(|e| format!("执行命令失败：{e}"))?,
+        Completion::Cancelled => return Err(cancel_message(&output_stdout, &output_stderr)),
+        Completion::TimedOut => {
             return Err(timeout_message(
                 timeout_secs,
-                &read_out.await.unwrap_or_default(),
-                &read_err.await.unwrap_or_default(),
+                &output_stdout,
+                &output_stderr,
             ));
         }
     };
-    let output_stdout = read_out.await.unwrap_or_default();
-    let output_stderr = read_err.await.unwrap_or_default();
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&output_stdout));
     if !output_stderr.is_empty() {
@@ -721,7 +766,10 @@ async fn execute_inner(
 
 #[cfg(test)]
 mod embedded_rtk_tests {
-    use super::{render_trained_knowledge, rewrite_with_embedded_rtk, tool_set};
+    use super::{
+        capture_bash_pipe, drain_bash_pipes, render_trained_knowledge, rewrite_with_embedded_rtk,
+        tool_set,
+    };
     use crate::lyra::prompt::{ShellConfig, ShellKind};
     use serde_json::json;
 
@@ -763,6 +811,20 @@ mod embedded_rtk_tests {
         ] {
             assert_eq!(rewrite_with_embedded_rtk(unsupported, &shell), unsupported);
         }
+    }
+
+    #[tokio::test]
+    async fn inherited_stdio_has_a_bounded_drain() {
+        let (stdout, _stdout_writer) = tokio::io::duplex(64);
+        let (stderr, _stderr_writer) = tokio::io::duplex(64);
+        let (_, mut read_out) = capture_bash_pipe(Some(stdout));
+        let (_, mut read_err) = capture_bash_pipe(Some(stderr));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drain_bash_pipes(&mut read_out, &mut read_err),
+        )
+        .await
+        .expect("继承的管道句柄不能无限阻塞工具收尾");
     }
 }
 
@@ -824,6 +886,38 @@ mod tests {
             wait_pid_exit(grandchild),
             "超时后孙进程 {grandchild} 未被清理"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 即使有逃出进程组的后代继续持有 stdout，超时收尾也必须在固定窗口内返回。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_timeout_does_not_wait_forever_for_inherited_stdio() {
+        let dir = temp_case_dir("inherited-stdio");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_bash(
+                &dir,
+                &shell(),
+                "setsid sh -c 'echo $$ > detached.pid; exec sleep 300' & wait",
+                1,
+                None,
+            ),
+        )
+        .await;
+        if let Ok(pid) = std::fs::read_to_string(dir.join("detached.pid"))
+            .unwrap_or_default()
+            .trim()
+            .parse::<i32>()
+        {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let err = outcome
+            .expect("超时清理被继承的 stdout 阻塞")
+            .expect_err("必须报告命令超时");
+        assert!(err.contains("已终止"), "err={err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
