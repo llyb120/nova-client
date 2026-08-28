@@ -205,6 +205,8 @@ pub struct AcpConn {
     child: StdMutex<Option<Child>>,
     /// HTTP 传输的 stdout/stderr 日志任务；kill 时中止，保证 on_conn_closed 能即时触发。
     log_tasks: StdMutex<Vec<JoinHandle<()>>>,
+    /// 热连接 LRU 的最近使用戳（单调计数，越大越新）。回收按它挑最旧的非运行中线程连接。
+    last_used: AtomicU64,
 }
 
 impl AcpConn {
@@ -577,6 +579,8 @@ pub struct AcpManager {
     permission_scope: String,
     /// 用户线程各用独立连接；模型/命令/标题等辅助任务共用 SHARED。
     slots: StdMutex<HashMap<String, Arc<TokioMutex<Option<Arc<AcpConn>>>>>>,
+    /// 热连接 LRU 单调时钟：每次连接被取用时 +1 写入 conn.last_used。
+    lru_clock: AtomicU64,
     /// CodeBuddy 官方 one-shot 预热槽：草稿页启动，首个匹配目录的用户连接消费。
     codebuddy_prewarm: TokioMutex<Option<CodeBuddyPrewarm>>,
     /// 存活连接计数：spawn 成功 +1、连接关闭 -1；用于 connected() 与断连广播（归零才广播）。
@@ -624,6 +628,7 @@ impl AcpManager {
             launch_env,
             permission_scope,
             slots: StdMutex::new(HashMap::new()),
+            lru_clock: AtomicU64::new(0),
             codebuddy_prewarm: TokioMutex::new(None),
             alive_conns: AtomicU64::new(0),
             routes: StdMutex::new(HashMap::new()),
@@ -693,6 +698,73 @@ impl AcpManager {
 
     fn slot_opt(&self, key: &str) -> Option<Arc<TokioMutex<Option<Arc<AcpConn>>>>> {
         self.slots.lock().unwrap().get(key).cloned()
+    }
+
+    /// 单个 `codebuddy --serve` 进程常驻 200MB+，每个会话各持一条会随会话数线性堆内存，
+    /// 拖垮长时间运行后的切换。热连接按 LRU 封顶：CodeBuddy 一进程一会话、最吃内存，只留
+    /// 最近 1 条；其余后端留 3 条。被回收线程下次发送时经 session/load 自动恢复上下文。
+    /// 共享槽（探测/标题等辅助任务）不参与回收。
+    fn hot_thread_conn_cap(&self) -> usize {
+        match self.kind {
+            AgentKind::CodeBuddy => 1,
+            _ => 3,
+        }
+    }
+
+    fn touch_conn(&self, conn: &Arc<AcpConn>) {
+        conn.last_used
+            .store(self.lru_clock.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+    }
+
+    /// 超出热连接上限时回收最旧的「非运行中」线程连接；正在跑轮的线程永不回收。
+    /// 只清槽并 kill 进程：路由/权限/回放等会话状态由 SSE reader 触发的 on_conn_closed 统一清理，
+    /// 旧会话下次发送时走「routes 缺失 → session/load」的既有恢复路径。
+    fn evict_lru_thread_conns(self: &Arc<Self>, keep_key: &str) {
+        let cap = self.hot_thread_conn_cap();
+        let mut victims: Vec<(String, Arc<TokioMutex<Option<Arc<AcpConn>>>>)> = Vec::new();
+        {
+            let slots = self.slots.lock().unwrap();
+            let mut candidates: Vec<(u64, String, Arc<TokioMutex<Option<Arc<AcpConn>>>>)> = slots
+                .iter()
+                .filter(|(key, _)| {
+                    key.starts_with("thread:")
+                        && key.as_str() != keep_key
+                        && !self.is_running(&key["thread:".len()..])
+                })
+                .filter_map(|(key, slot)| {
+                    slot.try_lock().ok().and_then(|g| g.clone()).map(|conn| {
+                        (conn.last_used.load(Ordering::SeqCst), key.clone(), slot.clone())
+                    })
+                })
+                .collect();
+            for key in lru_evict_keys(
+                candidates.iter().map(|(used, key, _)| (*used, key.as_str())),
+                keep_key,
+                cap,
+            ) {
+                if let Some((_, key, slot)) = candidates.iter().find(|(_, k, _)| k == key) {
+                    victims.push((key.clone(), slot.clone()));
+                }
+            }
+            candidates.clear();
+        }
+        if victims.is_empty() {
+            return;
+        }
+        self.push_log(format!(
+            "[nova] {} 热连接超过上限（{cap}），回收最久未用的 {} 条；旧会话再次发送时自动恢复",
+            self.kind.label(),
+            victims.len()
+        ));
+        for (key, slot) in victims {
+            let mgr = self.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(conn) = slot.lock().await.take() {
+                    conn.kill();
+                }
+                mgr.slots.lock().unwrap().remove(&key);
+            });
+        }
     }
 
     pub fn get_logs(&self) -> Vec<String> {
@@ -975,6 +1047,7 @@ impl AcpManager {
         let mut guard = slot.lock().await;
         if let Some(c) = guard.as_ref() {
             if c.alive.load(Ordering::SeqCst) {
+                self.touch_conn(c);
                 return Ok(c.clone());
             }
         }
@@ -984,7 +1057,11 @@ impl AcpManager {
             s
         };
         let conn = self.spawn_conn(&settings, conn_key, want_cwd).await?;
+        self.touch_conn(&conn);
         *guard = Some(conn.clone());
+        if conn_key.starts_with("thread:") {
+            self.evict_lru_thread_conns(conn_key);
+        }
         Ok(conn)
     }
 
@@ -1108,6 +1185,7 @@ impl AcpManager {
             alive: AtomicBool::new(true),
             child: StdMutex::new(Some(child)),
             log_tasks: StdMutex::new(Vec::new()),
+            last_used: AtomicU64::new(0),
         });
         // 每创建一条连接 +1；对应的 stdout reader 结束时在 on_conn_closed 里 -1，恒定配对。
         self.alive_conns.fetch_add(1, Ordering::SeqCst);
@@ -1536,8 +1614,9 @@ impl AcpManager {
             alive: AtomicBool::new(true),
             child: StdMutex::new(Some(child)),
             log_tasks: StdMutex::new(log_tasks),
+            last_used: AtomicU64::new(0),
         });
-        // POST SSE 与独立 GET SSE 可并行到达；统一串到现有 ACP 消息路由。
+        // POST SSE 与独立 GET SSE 可并行到达；统一串到��有 ACP 消息路由。
         // 使用 Weak 避免 receiver 与 conn.transport.inbound 形成引用环。
         {
             let mgr = self.clone();
@@ -3918,6 +3997,24 @@ fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::C
     (program.to_string(), cmd)
 }
 
+/// LRU 回收决策：keep_key 即将占用一个名额，返回最旧的若干候选键让总数压到 cap 以内。
+/// 纯函数抽出，evict_lru_thread_conns 收集候选后据此挑选回收对象。
+fn lru_evict_keys<'a>(
+    candidates: impl Iterator<Item = (u64, &'a str)>,
+    keep_key: &'a str,
+    cap: usize,
+) -> Vec<&'a str> {
+    let mut pool: Vec<(u64, &'a str)> = candidates.collect();
+    pool.push((u64::MAX, keep_key)); // keep 永远最新，不参与淘汰
+    let overflow = pool.len().saturating_sub(cap);
+    pool.sort_unstable_by_key(|(used, _)| *used);
+    pool.into_iter()
+        .take(overflow)
+        .filter(|(_, key)| *key != keep_key)
+        .map(|(_, key)| key)
+        .collect()
+}
+
 /// `cbc-prewarm` 与配置的 CodeBuddy CLI 同目录安装；找不到同目录 helper 时退回 PATH。
 fn resolve_sibling_program(configured_program: &str, sibling: &str) -> String {
     let Some(program) = resolve_program_on_path(configured_program) else {
@@ -3981,12 +4078,41 @@ fn extract_codebuddy_endpoint(line: &str) -> Option<String> {
 mod codebuddy_http_tests {
     use super::{
         codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
-        extract_codebuddy_endpoint, json_rpc_request_id, merge_codebuddy_activation_env,
-        publishes_model_options, replace_model_config_option, thread_connection_key, AcpManager,
-        SseDecoder,
+        extract_codebuddy_endpoint, json_rpc_request_id, lru_evict_keys,
+        merge_codebuddy_activation_env, publishes_model_options, replace_model_config_option,
+        thread_connection_key, AcpManager, SseDecoder,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn lru_evict_keys_keeps_total_within_cap_and_never_evicts_keep() {
+        // 未超上限：不回收
+        assert!(lru_evict_keys([(1, "thread:a")].into_iter(), "thread:b", 2).is_empty());
+        // cap=1（CodeBuddy）：新连接占掉名额，旧连接必须回收
+        assert_eq!(
+            lru_evict_keys([(1, "thread:a")].into_iter(), "thread:b", 1),
+            ["thread:a"]
+        );
+        // 超上限：回收最旧的，keep 即使最旧也不回收
+        assert_eq!(
+            lru_evict_keys(
+                [(3, "thread:c"), (1, "thread:a"), (2, "thread:b")].into_iter(),
+                "thread:d",
+                3
+            ),
+            ["thread:a"]
+        );
+        assert_eq!(
+            lru_evict_keys([(1, "thread:a"), (2, "thread:b")].into_iter(), "thread:c", 1),
+            ["thread:a", "thread:b"]
+        );
+        // cap 为 0 时全部回收（防御分支，实际 cap >= 1）
+        assert_eq!(
+            lru_evict_keys([(1, "thread:a")].into_iter(), "thread:b", 0),
+            ["thread:a"]
+        );
+    }
 
     #[test]
     fn codebuddy_prefers_standard_models_and_borrowed_instances_do_not_publish_them() {
