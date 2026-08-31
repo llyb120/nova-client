@@ -798,15 +798,15 @@ fn update_http_client(
     request_timeout: Option<Duration>,
     use_proxy: bool,
 ) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        // GitHub asset API returns 403 without User-Agent; downloads call this with None.
+        .user_agent(user_agent.unwrap_or("Nova"));
     if !use_proxy {
         builder = builder.no_proxy();
     }
     if let Some(t) = request_timeout {
         builder = builder.timeout(t);
-    }
-    if let Some(ua) = user_agent {
-        builder = builder.user_agent(ua);
     }
     builder.build().map_err(|e| e.to_string())
 }
