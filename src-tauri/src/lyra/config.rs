@@ -121,6 +121,62 @@ fn variant_label(variant: &str) -> String {
     }
 }
 
+fn is_model_config(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.is_empty()
+        || [
+            "name",
+            "reasoning",
+            "modalities",
+            "limit",
+            "options",
+            "variants",
+            "compat",
+        ]
+        .iter()
+        .any(|key| object.contains_key(*key))
+}
+
+fn collect_model_entries<'a>(
+    models: &'a Map<String, Value>,
+    prefix: &str,
+    out: &mut Vec<(String, &'a Value)>,
+) {
+    for (id, value) in models {
+        let id = if prefix.is_empty() {
+            id.clone()
+        } else {
+            format!("{prefix}/{id}")
+        };
+        if is_model_config(value) {
+            out.push((id, value));
+        } else if let Some(children) = value.as_object() {
+            collect_model_entries(children, &id, out);
+        }
+    }
+}
+
+fn model_entries(provider: &Value) -> Vec<(String, &Value)> {
+    let mut out = Vec::new();
+    if let Some(models) = provider.get("models").and_then(Value::as_object) {
+        collect_model_entries(models, "", &mut out);
+    }
+    out
+}
+
+fn model_by_id<'a>(provider: &'a Value, model_id: &str) -> Option<&'a Value> {
+    let models = provider.get("models")?;
+    if let Some(model) = models.get(model_id).filter(|value| is_model_config(value)) {
+        return Some(model);
+    }
+    let model = model_id
+        .split('/')
+        .try_fold(models, |current, segment| current.get(segment))?;
+    is_model_config(model).then_some(model)
+}
+
 /// 模型选择器枚举，与 alkaidModelOptions 输出保持一致。
 pub fn model_options(config: &Value) -> Vec<Value> {
     let mut out = Vec::new();
@@ -128,10 +184,7 @@ pub fn model_options(config: &Value) -> Vec<Value> {
         return out;
     };
     for (provider_id, provider) in providers {
-        let Some(models) = provider.get("models").and_then(Value::as_object) else {
-            continue;
-        };
-        for (model_id, model) in models {
+        for (model_id, model) in model_entries(provider) {
             let value = format!("{provider_id}/{model_id}");
             let name = format!(
                 "{} / {}",
@@ -142,7 +195,7 @@ pub fn model_options(config: &Value) -> Vec<Value> {
                 model
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or(model_id)
+                    .unwrap_or(&model_id)
             );
             let supports_images = model
                 .pointer("/modalities/input")
@@ -199,9 +252,10 @@ pub fn default_model(config: &Value) -> Result<String, String> {
             // 兼容旧配置：model 无 variant 后缀时按 options.reasoningEffort 补全。
             let (provider_id, model_id) = current.split_once('/').unwrap_or((&current, ""));
             let effort = config
-                .pointer(&format!(
-                    "/provider/{provider_id}/models/{model_id}/options/reasoningEffort"
-                ))
+                .get("provider")
+                .and_then(|providers| providers.get(provider_id))
+                .and_then(|provider| model_by_id(provider, model_id))
+                .and_then(|model| model.pointer("/options/reasoningEffort"))
                 .and_then(Value::as_str);
             selection = effort
                 .map(|effort| format!("{current}/variant/{effort}"))
@@ -253,13 +307,17 @@ pub fn resolve_model(
         return Err("Lyra model 必须是 provider/model 格式".into());
     }
     let provider = config
-        .pointer(&format!("/provider/{provider_id}"))
+        .get("provider")
+        .and_then(|providers| providers.get(provider_id))
         .ok_or_else(|| format!("Lyra provider 不存在：{provider_id}"))?;
-    let model = provider
-        .pointer(&format!("/models/{model_id}"))
+    let model = model_by_id(provider, model_id)
         .ok_or_else(|| format!("Lyra model 不存在：{base_selection}"))?;
     if let Some(variant) = variant {
-        if model.pointer(&format!("/variants/{variant}")).is_none() {
+        if model
+            .get("variants")
+            .and_then(|variants| variants.get(variant))
+            .is_none()
+        {
             return Err(format!("Lyra model 不支持思考强度：{selection}"));
         }
     }
@@ -295,7 +353,11 @@ pub fn resolve_model(
         ));
     }
     let variant_options = variant
-        .and_then(|name| model.pointer(&format!("/variants/{name}")))
+        .and_then(|name| {
+            model
+                .get("variants")
+                .and_then(|variants| variants.get(name))
+        })
         .cloned()
         .unwrap_or(Value::Null);
     let service_tier = variant_options
@@ -335,7 +397,9 @@ pub fn resolve_model(
     let top_p = sampling_number(&variant_options, model, provider, "topP", "top_p");
     let thinking_level = variant.and_then(|name| {
         model
-            .pointer(&format!("/variants/{name}/reasoningEffort"))
+            .get("variants")
+            .and_then(|variants| variants.get(name))
+            .and_then(|variant| variant.get("reasoningEffort"))
             .and_then(Value::as_str)
             .map(str::to_string)
     });
@@ -493,6 +557,46 @@ mod tests {
             resolve_model(&config, Some("custom/gpt/variant/medium"), &HashMap::new()).unwrap();
         assert_eq!(variant.model.temperature, Some(0.2));
         assert_eq!(variant.model.top_p, Some(0.95));
+    }
+
+    #[test]
+    fn model_ids_with_slashes_are_listed_and_resolved() {
+        let config = json!({
+            "model": "custom/qwen/qwen3.8-flash",
+            "provider": {
+                "custom": {
+                    "name": "Command Code GOAT",
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": { "baseURL": "http://127.0.0.1:8317/v1", "apiKey": "key" },
+                    "models": {
+                        "qwen": {
+                            "qwen3.8-flash": {
+                                "name": "Qwen/Qwen 3.8 Flash",
+                                "options": { "reasoningEffort": "max" },
+                                "variants": {
+                                    "high": { "reasoningEffort": "high" },
+                                    "max": { "reasoningEffort": "max" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            default_model(&config).unwrap(),
+            "custom/qwen/qwen3.8-flash/variant/max"
+        );
+        assert!(model_options(&config).iter().any(|option| {
+            option.get("value").and_then(Value::as_str)
+                == Some("custom/qwen/qwen3.8-flash/variant/max")
+                && option.get("name").and_then(Value::as_str)
+                    == Some("Command Code GOAT / Qwen/Qwen 3.8 Flash · Max")
+        }));
+        let resolved = resolve_model(&config, None, &HashMap::new()).unwrap();
+        assert_eq!(resolved.model.id, "qwen/qwen3.8-flash");
+        assert_eq!(resolved.thinking_level.as_deref(), Some("max"));
     }
 
     #[test]
