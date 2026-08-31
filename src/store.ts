@@ -2699,8 +2699,12 @@ export async function initStore() {
       setTheme(resolvedSettings.theme);
     }
     setState({ settings: resolvedSettings, agentKind: initialAgent });
-    // 后端启动时已把磁盘缓存灌入内存，立即读取，不等待其余事件监听和会话初始化。
+    // 后端先返回上次缓存，并在进程内只后台重验一次；CodeBuddy 即使不是当前后端也要
+    // 静默同步云端动态模型，选择器打开时继续展示旧列表，不清空、不阻塞。
     void ensureModelOptions(initialAgent);
+    if (initialAgent !== "codebuddy" && agentEnabled(resolvedSettings, "codebuddy")) {
+      void ensureModelOptions("codebuddy");
+    }
     return { settings: resolvedSettings, initialAgent };
   }).catch((error: unknown) => {
     // 设置读取失败也不能让窗口永久隐藏；此时沿用 localStorage 的首帧主题。
