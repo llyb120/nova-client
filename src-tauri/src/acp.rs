@@ -31,6 +31,12 @@ pub const EV_NOTIFY_OPEN: &str = "acp:notify-open";
 const LOG_CAP: usize = 800;
 const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
 
+/// ACP 后端（Devin / CodeBuddy）支持 `/browser` 进入持续浏览器调试模式；
+/// 工具通过注入 nova-tools MCP 提供。
+fn acp_supports_browser_debug(kind: &AgentKind) -> bool {
+    matches!(kind, AgentKind::Devin | AgentKind::CodeBuddy)
+}
+
 /// 模型探测、命令探测和标题生成共用的辅助连接。
 const SHARED_KEY: &str = "__shared__";
 
@@ -152,6 +158,32 @@ fn json_rpc_request_id(message: &Value) -> Option<u64> {
         .and_then(Value::as_u64)
 }
 
+/// CodeBuddy 同时返回标准 `models` 和旧扩展 `configOptions`；标准字段会随账号权限
+/// 实时更新，而扩展模型项可能仍是启动缓存。仅替换模型项，保留 mode 等其它扩展项。
+fn replace_model_config_option(config_options: Value, model_config_options: Value) -> Value {
+    let Some(model) = model_config_options
+        .as_array()
+        .and_then(|options| options.first())
+        .cloned()
+    else {
+        return config_options;
+    };
+    let mut options = config_options.as_array().cloned().unwrap_or_default();
+    if let Some(existing) = options
+        .iter_mut()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
+    {
+        *existing = model;
+    } else {
+        options.push(model);
+    }
+    Value::Array(options)
+}
+
+fn publishes_model_options(launch_env: &HashMap<String, String>) -> bool {
+    !launch_env.contains_key("NOVA_QUOTA_BORROWED")
+}
+
 fn http_rpc_error(id: u64, message: String) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -173,6 +205,8 @@ pub struct AcpConn {
     child: StdMutex<Option<Child>>,
     /// HTTP 传输的 stdout/stderr 日志任务；kill 时中止，保证 on_conn_closed 能即时触发。
     log_tasks: StdMutex<Vec<JoinHandle<()>>>,
+    /// 热连接 LRU 的最近使用戳（单调计数，越大越新）。回收按它挑最旧的非运行中线程连接。
+    last_used: AtomicU64,
 }
 
 impl AcpConn {
@@ -545,6 +579,8 @@ pub struct AcpManager {
     permission_scope: String,
     /// 用户线程各用独立连接；模型/命令/标题等辅助任务共用 SHARED。
     slots: StdMutex<HashMap<String, Arc<TokioMutex<Option<Arc<AcpConn>>>>>>,
+    /// 热连接 LRU 单调时钟：每次连接被取用时 +1 写入 conn.last_used。
+    lru_clock: AtomicU64,
     /// CodeBuddy 官方 one-shot 预热槽：草稿页启动，首个匹配目录的用户连接消费。
     codebuddy_prewarm: TokioMutex<Option<CodeBuddyPrewarm>>,
     /// 存活连接计数：spawn 成功 +1、连接关闭 -1；用于 connected() 与断连广播（归零才广播）。
@@ -592,6 +628,7 @@ impl AcpManager {
             launch_env,
             permission_scope,
             slots: StdMutex::new(HashMap::new()),
+            lru_clock: AtomicU64::new(0),
             codebuddy_prewarm: TokioMutex::new(None),
             alive_conns: AtomicU64::new(0),
             routes: StdMutex::new(HashMap::new()),
@@ -661,6 +698,73 @@ impl AcpManager {
 
     fn slot_opt(&self, key: &str) -> Option<Arc<TokioMutex<Option<Arc<AcpConn>>>>> {
         self.slots.lock().unwrap().get(key).cloned()
+    }
+
+    /// 单个 `codebuddy --serve` 进程常驻 200MB+，每个会话各持一条会随会话数线性堆内存，
+    /// 拖垮长时间运行后的切换。热连接按 LRU 封顶：CodeBuddy 一进程一会话、最吃内存，只留
+    /// 最近 1 条；其余后端留 3 条。被回收线程下次发送时经 session/load 自动恢复上下文。
+    /// 共享槽（探测/标题等辅助任务）不参与回收。
+    fn hot_thread_conn_cap(&self) -> usize {
+        match self.kind {
+            AgentKind::CodeBuddy => 1,
+            _ => 3,
+        }
+    }
+
+    fn touch_conn(&self, conn: &Arc<AcpConn>) {
+        conn.last_used
+            .store(self.lru_clock.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+    }
+
+    /// 超出热连接上限时回收最旧的「非运行中」线程连接；正在跑轮的线程永不回收。
+    /// 只清槽并 kill 进程：路由/权限/回放等会话状态由 SSE reader 触发的 on_conn_closed 统一清理，
+    /// 旧会话下次发送时走「routes 缺失 → session/load」的既有恢复路径。
+    fn evict_lru_thread_conns(self: &Arc<Self>, keep_key: &str) {
+        let cap = self.hot_thread_conn_cap();
+        let mut victims: Vec<(String, Arc<TokioMutex<Option<Arc<AcpConn>>>>)> = Vec::new();
+        {
+            let slots = self.slots.lock().unwrap();
+            let mut candidates: Vec<(u64, String, Arc<TokioMutex<Option<Arc<AcpConn>>>>)> = slots
+                .iter()
+                .filter(|(key, _)| {
+                    key.starts_with("thread:")
+                        && key.as_str() != keep_key
+                        && !self.is_running(&key["thread:".len()..])
+                })
+                .filter_map(|(key, slot)| {
+                    slot.try_lock().ok().and_then(|g| g.clone()).map(|conn| {
+                        (conn.last_used.load(Ordering::SeqCst), key.clone(), slot.clone())
+                    })
+                })
+                .collect();
+            for key in lru_evict_keys(
+                candidates.iter().map(|(used, key, _)| (*used, key.as_str())),
+                keep_key,
+                cap,
+            ) {
+                if let Some((_, key, slot)) = candidates.iter().find(|(_, k, _)| k == key) {
+                    victims.push((key.clone(), slot.clone()));
+                }
+            }
+            candidates.clear();
+        }
+        if victims.is_empty() {
+            return;
+        }
+        self.push_log(format!(
+            "[nova] {} 热连接超过上限（{cap}），回收最久未用的 {} 条；旧会话再次发送时自动恢复",
+            self.kind.label(),
+            victims.len()
+        ));
+        for (key, slot) in victims {
+            let mgr = self.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(conn) = slot.lock().await.take() {
+                    conn.kill();
+                }
+                mgr.slots.lock().unwrap().remove(&key);
+            });
+        }
     }
 
     pub fn get_logs(&self) -> Vec<String> {
@@ -769,20 +873,6 @@ impl AcpManager {
 
     /// 最近一次捕获到的可选模型 value 列表（configOptions 里 id=="model" 的 options）。
     /// 返回 None 表示尚未捕获到模型列表，调用方应跳过校验、按原样下发。
-    fn known_model_values(&self) -> Option<Vec<String>> {
-        let guard = self.model_options.lock().unwrap();
-        let cfg = guard.as_ref()?.get("configOptions")?.as_array()?;
-        let model = cfg
-            .iter()
-            .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("model"))?;
-        let options = model.get("options")?.as_array()?;
-        let values: Vec<String> = options
-            .iter()
-            .filter_map(|o| o.get("value").and_then(|v| v.as_str()).map(str::to_string))
-            .collect();
-        (!values.is_empty()).then_some(values)
-    }
-
     pub fn get_commands(&self) -> Option<Value> {
         self.available_commands.lock().unwrap().clone()
     }
@@ -957,6 +1047,7 @@ impl AcpManager {
         let mut guard = slot.lock().await;
         if let Some(c) = guard.as_ref() {
             if c.alive.load(Ordering::SeqCst) {
+                self.touch_conn(c);
                 return Ok(c.clone());
             }
         }
@@ -966,7 +1057,11 @@ impl AcpManager {
             s
         };
         let conn = self.spawn_conn(&settings, conn_key, want_cwd).await?;
+        self.touch_conn(&conn);
         *guard = Some(conn.clone());
+        if conn_key.starts_with("thread:") {
+            self.evict_lru_thread_conns(conn_key);
+        }
         Ok(conn)
     }
 
@@ -1090,6 +1185,7 @@ impl AcpManager {
             alive: AtomicBool::new(true),
             child: StdMutex::new(Some(child)),
             log_tasks: StdMutex::new(Vec::new()),
+            last_used: AtomicU64::new(0),
         });
         // 每创建一条连接 +1；对应的 stdout reader 结束时在 on_conn_closed 里 -1，恒定配对。
         self.alive_conns.fetch_add(1, Ordering::SeqCst);
@@ -1228,6 +1324,9 @@ impl AcpManager {
                 "none",
             ],
         );
+        if let Some(cwd) = want_cwd {
+            cmd.current_dir(cwd);
+        }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1515,8 +1614,9 @@ impl AcpManager {
             alive: AtomicBool::new(true),
             child: StdMutex::new(Some(child)),
             log_tasks: StdMutex::new(log_tasks),
+            last_used: AtomicU64::new(0),
         });
-        // POST SSE 与独立 GET SSE 可并行到达；统一串到现有 ACP 消息路由。
+        // POST SSE 与独立 GET SSE 可并行到达；统一串到��有 ACP 消息路由。
         // 使用 Weak 避免 receiver 与 conn.transport.inbound 形成引用环。
         {
             let mgr = self.clone();
@@ -2356,12 +2456,19 @@ impl AcpManager {
         if !has_config && !has_models && !has_modes {
             return;
         }
-        // configOptions 优先用扩展字段；没有则从标准 models 转换。
-        let config_options = if has_config {
-            result.get("configOptions").cloned().unwrap_or(Value::Null)
-        } else {
-            models_to_config_options(result.get("models"))
-        };
+        // CodeBuddy 同时提供标准 models 和兼容旧客户端的 configOptions。后者可能是
+        // 进程启动缓存（实测账号新增模型已能调用、models 已更新，但扩展列表仍旧），
+        // 因此只对 CodeBuddy 用标准模型项覆盖扩展模型项；Devin 继续优先其扩展元数据。
+        let extension_config_options = result.get("configOptions").cloned().unwrap_or(Value::Null);
+        let standard_config_options = models_to_config_options(result.get("models"));
+        let config_options =
+            if self.kind == AgentKind::CodeBuddy && !standard_config_options.is_null() {
+                replace_model_config_option(extension_config_options, standard_config_options)
+            } else if has_config {
+                extension_config_options
+            } else {
+                standard_config_options
+            };
         let modes = match result.get("modes") {
             Some(m) if !m.is_null() => m.clone(),
             _ => modes_from_config_options(&config_options),
@@ -2371,11 +2478,14 @@ impl AcpManager {
             "modes": modes,
         });
         *self.model_options.lock().unwrap() = Some(v.clone());
-        self.persist_model_options(&v);
-        let _ = self.app.emit(
-            EV_OPTIONS,
-            json!({ "agentKind": self.kind.as_str(), "options": v }),
-        );
+        // 额度借用实例属于另一个账号；只保留自己的进程内列表，不能覆盖主账号缓存/UI。
+        if publishes_model_options(&self.launch_env) {
+            self.persist_model_options(&v);
+            let _ = self.app.emit(
+                EV_OPTIONS,
+                json!({ "agentKind": self.kind.as_str(), "options": v }),
+            );
+        }
     }
 
     fn capture_commands(&self, update: &Value) {
@@ -2555,7 +2665,7 @@ impl AcpManager {
         let conn = self.ensure_conn_for(&key, Some(&cwd)).await?;
 
         let read_only = mode.as_deref().map(unify_mode_id).as_deref() == Some("plan");
-        let mcp_servers = self.session_mcp_servers(&cwd, read_only)?;
+        let mcp_servers = self.session_mcp_servers(&cwd, read_only, thread_id)?;
         let sid = match existing {
             Some(sid) if self.routes.lock().unwrap().contains_key(&sid) => sid,
             Some(sid) => {
@@ -2647,26 +2757,6 @@ impl AcpManager {
         Ok(sid)
     }
 
-    /// 把模型标记为「已处理」（避免同一会话每轮 prompt 反复处理），并在会话里推一条警告。
-    /// 用于所选模型不在可用列表等不应下发的场景。
-    fn mark_model_applied_with_warn(&self, sid: &str, model: &str, warn: String) {
-        let thread_id = {
-            let mut routes = self.routes.lock().unwrap();
-            routes.get_mut(sid).map(|route| {
-                route.applied_model = Some(model.to_string());
-                route.thread_id.clone()
-            })
-        };
-        let Some(thread_id) = thread_id else { return };
-        let state = self.app.state::<AppState>();
-        let mut store = state.store.lock().unwrap();
-        if let Some(thread) = store.get_mut(&thread_id) {
-            let item = thread.push_system(warn, "warn");
-            self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
-        }
-        store.save_thread(&thread_id);
-    }
-
     /// 按需把线程级模型/模式同步到 session（只在变化时发请求）
     async fn apply_session_config(
         &self,
@@ -2676,7 +2766,7 @@ impl AcpManager {
         model: Option<String>,
         mode: Option<String>,
     ) {
-        let (mut need_model, need_mode) = {
+        let (need_model, need_mode) = {
             let routes = self.routes.lock().unwrap();
             let Some(r) = routes.get(sid) else { return };
             (
@@ -2709,21 +2799,6 @@ impl AcpManager {
                         self.kind.label()
                     ));
                 }
-            }
-        }
-        // 防「发送无反应」：所选模型若不在当前可用列表里，强行下发会让 agent 在 prompt 阶段直接
-        // 返回 refusal 且不产生任何内容。这里跳过下发、回退到会话默认模型，并提示用户。
-        if let Some(m) = need_model.clone() {
-            if self
-                .known_model_values()
-                .is_some_and(|known| !known.contains(&m))
-            {
-                need_model = None;
-                self.mark_model_applied_with_warn(
-                    sid,
-                    &m,
-                    format!("所选模型「{m}」当前不可用，已改用默认模型，可在下方重新选择模型。"),
-                );
             }
         }
         if need_model.is_none() && need_mode.is_none() {
@@ -3067,6 +3142,37 @@ impl AcpManager {
             }
             ctx
         };
+        // `/browser` 进入持续浏览器调试模式：本轮起 nova-tools MCP 附带 browser 工具，
+        // 模式跨轮次保留直到 /browser-exit。
+        let browser_command =
+            acp_supports_browser_debug(&self.kind) && crate::lyra::is_browser_command(&text);
+        let browser_exit_command =
+            acp_supports_browser_debug(&self.kind) && crate::lyra::is_browser_exit_command(&text);
+        if browser_command || browser_exit_command {
+            let state = self.app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(&thread_id) {
+                thread.browser_debug_mode = browser_command;
+            }
+            store.save_thread(&thread_id);
+            let _ = self.app.emit(EV_THREADS, json!({}));
+        }
+        // Browser 准备与 CodeBuddy/Devin 的连接、session 创建并行，避免首次工具调用再串行
+        // 安装运行时、启动录制进程和等待执行端口。
+        if browser_command {
+            let app = self.app.clone();
+            tauri::async_runtime::spawn(async move {
+                let bridge = crate::browser::ensure_mcp_bridge(&app);
+                let recorder = crate::browser::ensure_exec_port(&app);
+                let (bridge_result, recorder_result) = tokio::join!(bridge, recorder);
+                if let Err(error) = bridge_result {
+                    eprintln!("[browser] 启动 MCP 中转失败：{error}");
+                }
+                if let Err(error) = recorder_result {
+                    eprintln!("[browser] 预热 Playwright 失败：{error}");
+                }
+            });
+        }
         // 1. 本地先落用户消息
         let mut title_job: Option<(String, String)> = None;
         {
@@ -3106,6 +3212,13 @@ impl AcpManager {
             store.get(&thread_id).map(|t| t.items.len()).unwrap_or(0)
         };
 
+        let text = if acp_supports_browser_debug(&self.kind) {
+            crate::lyra::expand_browser_command(&text)
+                .or_else(|| crate::lyra::expand_browser_exit_command(&text))
+                .unwrap_or(text)
+        } else {
+            text
+        };
         let outcome = self
             .drive_prompt(&thread_id, &text, &images, handoff.as_deref())
             .await;
@@ -3246,10 +3359,21 @@ impl AcpManager {
             };
             guidance.push(nova_tools_prompt_guidance(context_tools, read_only));
         }
-        // Devin 的 Windows shell 契约只随新 ACP session 的首条 prompt 注入；用户消息仍按原文落库和展示。
-        // CodeBuddy 保持原有逐轮 guidance，避免改变无关 agent 的行为。
+        // CodeBuddy 的工作目录契约逐轮附在用户文本末尾。其 CLI 会把同一条 ACP
+        // prompt 中最后一个 text block 当成最新指令；若 guidance 放在最前面，模型可能
+        // 把它当成当前消息而忽略随后真正的用户请求。
         let runtime_guidance = match self.kind {
-            AgentKind::CodeBuddy => codebuddy_runtime_guidance(),
+            AgentKind::CodeBuddy => {
+                let cwd = {
+                    let state = self.app.state::<AppState>();
+                    let store = state.store.lock().unwrap();
+                    store
+                        .get(thread_id)
+                        .map(|thread| thread.cwd.clone())
+                        .unwrap_or_default()
+                };
+                codebuddy_runtime_guidance(&cwd)
+            }
             AgentKind::Devin if include_runtime_guidance => {
                 let context_tools = self
                     .app
@@ -3266,7 +3390,20 @@ impl AcpManager {
             guidance.push(runtime);
         }
         if !guidance.is_empty() {
-            prompt.insert(0, json!({ "type": "text", "text": guidance.join("\n\n") }));
+            let guidance = guidance.join("\n\n");
+            if self.kind == AgentKind::CodeBuddy {
+                if let Some(block) = prompt
+                    .iter_mut()
+                    .find(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                {
+                    let text = block.get("text").and_then(Value::as_str).unwrap_or_default();
+                    block["text"] = json!(format!("{text}\n\n<system-reminder>\n{guidance}\n</system-reminder>"));
+                } else {
+                    prompt.push(json!({ "type": "text", "text": guidance }));
+                }
+            } else {
+                prompt.insert(0, json!({ "type": "text", "text": guidance }));
+            }
         }
         prompt
     }
@@ -3346,6 +3483,32 @@ impl AcpManager {
         self.mark_plan_interrupted(&thread_id, "interrupted", false);
         self.emit_proposed_plan(&thread_id, None);
         let _ = self.app.emit(EV_THREADS, json!({}));
+        // 浏览器调试模式下，引导消息同样要带模式上下文。
+        let text = if acp_supports_browser_debug(&self.kind) {
+            let browser_debug_mode = {
+                let state = self.app.state::<AppState>();
+                let store = state.store.lock().unwrap();
+                store
+                    .get(&thread_id)
+                    .map(|thread| thread.browser_debug_mode)
+                    .unwrap_or(false)
+            };
+            let expanded = crate::lyra::expand_browser_command(&text)
+                .or_else(|| crate::lyra::expand_browser_exit_command(&text))
+                .unwrap_or(text);
+            if browser_debug_mode
+                && !crate::lyra::is_browser_command(&expanded)
+                && !crate::lyra::is_browser_exit_command(&expanded)
+            {
+                format!(
+                    "{expanded}\n\n（当前处于浏览器调试模式，可使用 browser 工具打开页面、查看 Console/错误并截图联合作业。）"
+                )
+            } else {
+                expanded
+            }
+        } else {
+            text
+        };
         let prompt = Self::build_prompt_blocks(&text, &images);
         let mgr = self.clone();
         let tid = thread_id.clone();
@@ -3708,19 +3871,32 @@ impl AcpManager {
     }
 
     /// session/new 与 session/load 携带的 MCP server 列表。
-    /// Devin 靠进程启动目录的本地 MCP 配置；CodeBuddy 按 ACP mcpServers 注入 polaris。
-    fn session_mcp_servers(&self, cwd: &str, read_only: bool) -> Result<Value, String> {
+    /// Devin 靠进程启动目录的本地 MCP 配置；CodeBuddy 按 ACP mcpServers 注入 polaris / browser。
+    fn session_mcp_servers(
+        &self,
+        cwd: &str,
+        read_only: bool,
+        thread_id: &str,
+    ) -> Result<Value, String> {
         if self.kind != AgentKind::CodeBuddy {
             return Ok(json!([]));
         }
         let state = self.app.state::<AppState>();
+        let browser_debug = {
+            let store = state.store.lock().unwrap();
+            store
+                .get(thread_id)
+                .map(|thread| thread.browser_debug_mode)
+                .unwrap_or(false)
+        };
         let context_mode = {
             let settings = state.settings.lock().unwrap();
-            if !settings.context_tools_enabled() {
-                return Ok(json!([]));
-            }
             settings.context_retrieval_mode.as_str().to_string()
         };
+        // browser 独立于上下文检索；关闭 polaris 时仍需挂载只包含 browser 的 nova-tools。
+        if !browser_debug && !state.settings.lock().unwrap().context_tools_enabled() {
+            return Ok(json!([]));
+        }
         let server = codebuddy_nova_tools_mcp_server(
             &self.app,
             cwd,
@@ -3728,9 +3904,12 @@ impl AcpManager {
             read_only,
             state.context_service.endpoint(),
             state.context_service.token(),
+            browser_debug,
+            &state.config_dir,
         )?;
         self.push_log(format!(
-            "[nova] CodeBuddy 已为 {cwd} 注入 nova-tools/polaris"
+            "[nova] CodeBuddy 已为 {cwd} 注入 nova-tools{}",
+            if browser_debug { "/browser" } else { "" }
         ));
         Ok(json!([server]))
     }
@@ -3818,6 +3997,24 @@ fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::C
     (program.to_string(), cmd)
 }
 
+/// LRU 回收决策：keep_key 即将占用一个名额，返回最旧的若干候选键让总数压到 cap 以内。
+/// 纯函数抽出，evict_lru_thread_conns 收集候选后据此挑选回收对象。
+fn lru_evict_keys<'a>(
+    candidates: impl Iterator<Item = (u64, &'a str)>,
+    keep_key: &'a str,
+    cap: usize,
+) -> Vec<&'a str> {
+    let mut pool: Vec<(u64, &'a str)> = candidates.collect();
+    pool.push((u64::MAX, keep_key)); // keep 永远最新，不参与淘汰
+    let overflow = pool.len().saturating_sub(cap);
+    pool.sort_unstable_by_key(|(used, _)| *used);
+    pool.into_iter()
+        .take(overflow)
+        .filter(|(_, key)| *key != keep_key)
+        .map(|(_, key)| key)
+        .collect()
+}
+
 /// `cbc-prewarm` 与配置的 CodeBuddy CLI 同目录安装；找不到同目录 helper 时退回 PATH。
 fn resolve_sibling_program(configured_program: &str, sibling: &str) -> String {
     let Some(program) = resolve_program_on_path(configured_program) else {
@@ -3880,11 +4077,65 @@ fn extract_codebuddy_endpoint(line: &str) -> Option<String> {
 #[cfg(test)]
 mod codebuddy_http_tests {
     use super::{
-        codebuddy_nova_tools_mcp_server_value, extract_codebuddy_endpoint, json_rpc_request_id,
-        merge_codebuddy_activation_env, thread_connection_key, SseDecoder,
+        codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
+        extract_codebuddy_endpoint, json_rpc_request_id, lru_evict_keys,
+        merge_codebuddy_activation_env, publishes_model_options, replace_model_config_option,
+        thread_connection_key, AcpManager, SseDecoder,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn lru_evict_keys_keeps_total_within_cap_and_never_evicts_keep() {
+        // 未超上限：不回收
+        assert!(lru_evict_keys([(1, "thread:a")].into_iter(), "thread:b", 2).is_empty());
+        // cap=1（CodeBuddy）：新连接占掉名额，旧连接必须回收
+        assert_eq!(
+            lru_evict_keys([(1, "thread:a")].into_iter(), "thread:b", 1),
+            ["thread:a"]
+        );
+        // 超上限：回收最旧的，keep 即使最旧也不回收
+        assert_eq!(
+            lru_evict_keys(
+                [(3, "thread:c"), (1, "thread:a"), (2, "thread:b")].into_iter(),
+                "thread:d",
+                3
+            ),
+            ["thread:a"]
+        );
+        assert_eq!(
+            lru_evict_keys([(1, "thread:a"), (2, "thread:b")].into_iter(), "thread:c", 1),
+            ["thread:a", "thread:b"]
+        );
+        // cap 为 0 时全部回收（防御分支，实际 cap >= 1）
+        assert_eq!(
+            lru_evict_keys([(1, "thread:a")].into_iter(), "thread:b", 0),
+            ["thread:a"]
+        );
+    }
+
+    #[test]
+    fn codebuddy_prefers_standard_models_and_borrowed_instances_do_not_publish_them() {
+        let merged = replace_model_config_option(
+            json!([
+                { "id": "mode", "options": [{ "value": "plan", "name": "Plan" }] },
+                { "id": "model", "currentValue": "old", "options": [
+                    { "value": "old", "name": "Old" }
+                ] }
+            ]),
+            json!([{ "id": "model", "currentValue": "glm-5.3-flash", "options": [
+                { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
+            ] }]),
+        );
+        assert_eq!(merged[0]["id"], "mode");
+        assert_eq!(merged[1]["currentValue"], "glm-5.3-flash");
+        assert_eq!(merged[1]["options"][0]["value"], "glm-5.3-flash");
+        assert!(publishes_model_options(&HashMap::new()));
+        assert!(!publishes_model_options(&HashMap::from([(
+            "NOVA_QUOTA_BORROWED".into(),
+            "1".into(),
+        )])));
+    }
 
     #[test]
     fn prewarm_activation_preserves_local_codebuddy_environment_but_isolates_borrowed_sessions() {
@@ -3959,6 +4210,8 @@ mod codebuddy_http_tests {
             true,
             "http://127.0.0.1:1234",
             "secret",
+            false,
+            std::path::Path::new("C:/nova-config"),
         );
         assert_eq!(server["name"], "nova-tools");
         assert_eq!(server["command"], "C:/node.exe");
@@ -3975,6 +4228,51 @@ mod codebuddy_http_tests {
                 item["name"].as_str() == Some(name) && item["value"].as_str() == Some(value)
             }));
         }
+    }
+
+    #[test]
+    fn browser_only_server_does_not_reenable_disabled_context_tools() {
+        let server = codebuddy_nova_tools_mcp_server_value(
+            "C:/node.exe",
+            "C:/nova-tools.mjs",
+            "D:/repo",
+            "none",
+            false,
+            "http://127.0.0.1:1234",
+            "secret",
+            true,
+            std::path::Path::new("C:/nova-config"),
+        );
+        let env = server["env"].as_array().unwrap();
+        assert!(env
+            .iter()
+            .any(|item| { item["name"] == "NOVA_FAST_CONTEXT" && item["value"] == "0" }));
+        assert!(env.iter().any(|item| item["name"] == "NOVA_BROWSER_DEBUG"));
+    }
+
+    #[test]
+    fn codebuddy_guidance_pins_native_tools_to_the_session_workspace() {
+        let guidance = codebuddy_runtime_guidance("D:/code/intelligence-pc-v2").unwrap();
+        assert!(guidance.contains("D:/code/intelligence-pc-v2"));
+        assert!(guidance.contains("required working directory"));
+        assert!(guidance.contains("not in Nova's own"));
+    }
+
+    #[test]
+    fn codebuddy_guidance_keeps_the_latest_user_request_in_the_same_text_block() {
+        let manager = AcpManager::new_with_env;
+        let source = include_str!("acp.rs");
+        let body = source
+            .split("fn build_user_prompt_blocks(")
+            .nth(1)
+            .unwrap()
+            .split("/// 运行中追加提示")
+            .next()
+            .unwrap();
+        let _ = manager;
+        assert!(body.contains("<system-reminder>"));
+        assert!(body.contains("block[\"text\"]"));
+        assert!(!body.contains("AgentKind::CodeBuddy => prompt.insert(0"));
     }
 
     #[test]
@@ -4136,16 +4434,17 @@ fn materialize_nova_tools_mcp(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
-fn codebuddy_runtime_guidance() -> Option<String> {
-    Some(
-        "Windows shell contract for this local CodeBuddy session (hard constraint): Nova runs on Windows and the Bash tool is configured to use PowerShell (`CODEBUDDY_CODE_SHELL=powershell`). Write commands in PowerShell syntax; use `;` to chain commands and `$env:NAME` for environment variables. Do not use Bash syntax (`export`, `&&` chains, POSIX grep/sed/awk) in Bash tool commands."
-            .into(),
-    )
+fn codebuddy_runtime_guidance(cwd: &str) -> Option<String> {
+    Some(format!(
+        "Windows shell contract for this local CodeBuddy session (hard constraint): Nova runs on Windows and the Bash tool is configured to use PowerShell (`CODEBUDDY_CODE_SHELL=powershell`). The session workspace and required working directory is `{cwd}`; run every code/search/shell operation there, not in Nova's own installation or source directory. Write commands in PowerShell syntax; use `;` to chain commands and `$env:NAME` for environment variables. Do not use Bash syntax (`export`, `&&` chains, POSIX grep/sed/awk) in Bash tool commands."
+    ))
 }
 
 #[cfg(not(windows))]
-fn codebuddy_runtime_guidance() -> Option<String> {
-    None
+fn codebuddy_runtime_guidance(cwd: &str) -> Option<String> {
+    Some(format!(
+        "The session workspace and required working directory is `{cwd}`; run every code/search/shell operation there, not in Nova's own installation or source directory."
+    ))
 }
 
 fn codebuddy_nova_tools_mcp_server(
@@ -4155,6 +4454,8 @@ fn codebuddy_nova_tools_mcp_server(
     read_only: bool,
     context_endpoint: &str,
     context_token: &str,
+    browser_debug: bool,
+    config_dir: &std::path::Path,
 ) -> Result<Value, String> {
     let script = materialize_nova_tools_mcp(app)?;
     let node = resolve_program_on_path("node")
@@ -4167,6 +4468,8 @@ fn codebuddy_nova_tools_mcp_server(
         read_only,
         context_endpoint,
         context_token,
+        browser_debug,
+        config_dir,
     ))
 }
 
@@ -4178,10 +4481,12 @@ fn codebuddy_nova_tools_mcp_server_value(
     read_only: bool,
     context_endpoint: &str,
     context_token: &str,
+    browser_debug: bool,
+    config_dir: &std::path::Path,
 ) -> Value {
     let mut env = vec![
         json!({ "name": "NOVA_TOOLS_CWD", "value": cwd }),
-        json!({ "name": "NOVA_FAST_CONTEXT", "value": "1" }),
+        json!({ "name": "NOVA_FAST_CONTEXT", "value": if context_mode == "none" { "0" } else { "1" } }),
         json!({ "name": "NOVA_CONTEXT_RETRIEVAL_MODE", "value": context_mode }),
         json!({ "name": "NOVA_CONTEXT_SERVICE_ENDPOINT", "value": context_endpoint }),
         json!({ "name": "NOVA_CONTEXT_SERVICE_TOKEN", "value": context_token }),
@@ -4189,11 +4494,19 @@ fn codebuddy_nova_tools_mcp_server_value(
     if read_only {
         env.push(json!({ "name": "NOVA_TOOLS_READ_ONLY", "value": "1" }));
     }
+    if browser_debug {
+        env.push(json!({ "name": "NOVA_BROWSER_DEBUG", "value": "1" }));
+        env.push(json!({
+            "name": "NOVA_BROWSER_MCP_PORT_FILE",
+            "value": crate::browser::mcp_port_file(config_dir).to_string_lossy(),
+        }));
+    }
     json!({
         "name": "nova-tools",
         "command": node,
         "args": [script],
-        "env": env
+        "env": env,
+        "defer_loading": false
     })
 }
 

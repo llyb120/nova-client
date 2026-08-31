@@ -18,10 +18,34 @@ const pendingAddressWaiters = [];
 const attachedPages = new WeakSet();
 const pageStates = new WeakMap();
 const storageStatePath = process.env.NOVA_BROWSER_STORAGE_STATE || '';
+const sessionStorageStatePath = storageStatePath ? `${storageStatePath}.session` : '';
 let requestedHeadless = false;
 let relaunching = false;
 const runPages = new Map();
 const runOutputDirs = new Map();
+const SESSION_STORAGE_RESTORED = '__nova_session_storage_restored__';
+let savedSessionStorage = loadSessionStorageState();
+
+function loadSessionStorageState() {
+  if (!sessionStorageStatePath || !fs.existsSync(sessionStorageStatePath)) return {};
+  try {
+    const value = JSON.parse(fs.readFileSync(sessionStorageStatePath, 'utf8'));
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+async function installSessionStorageRestore(target) {
+  await target.addInitScript(([stateByOrigin, marker]) => {
+    if (sessionStorage.getItem(marker) === '1') return;
+    const entries = stateByOrigin?.[location.origin];
+    if (Array.isArray(entries)) {
+      for (const [key, value] of entries) sessionStorage.setItem(key, value);
+    }
+    sessionStorage.setItem(marker, '1');
+  }, [savedSessionStorage, SESSION_STORAGE_RESTORED]);
+}
 
 function browserLaunchOptions(headless) {
   return {
@@ -129,6 +153,11 @@ function stateOf(target) {
       lastRecordedNavigationUrl: '',
       lastRecordedNavigationAt: 0,
       lastOperationAt: 0,
+      authAtNavigation: '',
+      authRecoveryAttempted: false,
+      authRecoveryChecks: 0,
+      authRecoveryTimer: null,
+      navigationStartedAt: 0,
     };
     pageStates.set(target, state);
   }
@@ -187,16 +216,95 @@ function scheduleStorageStateSave() {
   if (!context || !storageStatePath) return;
   clearTimeout(saveStateTimer);
   saveStateTimer = setTimeout(() => {
-    context.storageState({ path: storageStatePath }).catch((error) => {
+    saveStorageState().catch((error) => {
       out({ type: 'error', error: '保存浏览器登录态失败: ' + String(error?.message || error) });
     });
   }, 250);
 }
 
+async function captureSessionStorageState() {
+  if (!sessionStorageStatePath) return;
+  const snapshots = await Promise.all(livePages().map((target) => target.evaluate(() => {
+    if (!/^https?:$/.test(location.protocol)) return null;
+    return {
+      origin: location.origin,
+      entries: Object.entries(sessionStorage).filter(([key]) => key !== '__nova_session_storage_restored__'),
+    };
+  }).catch(() => null)));
+  for (const snapshot of snapshots) {
+    if (snapshot?.origin && Array.isArray(snapshot.entries)) {
+      savedSessionStorage[snapshot.origin] = snapshot.entries;
+    }
+  }
+  const temporary = `${sessionStorageStatePath}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(savedSessionStorage));
+  fs.renameSync(temporary, sessionStorageStatePath);
+}
+
 async function saveStorageState() {
   if (!context || !storageStatePath) return;
   clearTimeout(saveStateTimer);
-  await context.storageState({ path: storageStatePath });
+  await Promise.all([
+    context.storageState({ path: storageStatePath }),
+    captureSessionStorageState(),
+  ]);
+}
+
+async function sessionAuthFingerprint(target) {
+  return target.evaluate(() => JSON.stringify(
+    Object.entries(sessionStorage)
+      .filter(([key, value]) => value && /(auth|token)/i.test(key))
+      .sort(([left], [right]) => left.localeCompare(right)),
+  )).catch(() => '');
+}
+
+function shouldRecoverLateSessionAuth(events, navigationStartedAt, before, after, attempted) {
+  if (attempted || !navigationStartedAt || !after || after === '[]' || before === after) return false;
+  return events.some((event) =>
+    event.kind === 'response' && event.status === 401 && event.ts >= navigationStartedAt
+  );
+}
+
+async function markAuthNavigation(target) {
+  const state = stateOf(target);
+  state.navigationStartedAt = Date.now();
+  state.authAtNavigation = await sessionAuthFingerprint(target);
+  state.authRecoveryAttempted = false;
+  state.authRecoveryChecks = 0;
+  clearTimeout(state.authRecoveryTimer);
+  state.authRecoveryTimer = null;
+}
+
+function scheduleAuthRecovery(target) {
+  const state = stateOf(target);
+  if (state.authRecoveryAttempted || state.authRecoveryTimer || state.authRecoveryChecks >= 6) return;
+  state.authRecoveryTimer = setTimeout(async () => {
+    state.authRecoveryTimer = null;
+    state.authRecoveryChecks += 1;
+    const recovered = await recoverLateSessionAuth(target).catch(() => false);
+    if (!recovered) scheduleAuthRecovery(target);
+  }, 500);
+}
+
+async function recoverLateSessionAuth(target) {
+  const state = stateOf(target);
+  const currentAuth = await sessionAuthFingerprint(target);
+  if (!shouldRecoverLateSessionAuth(
+    state.debugEvents,
+    state.navigationStartedAt,
+    state.authAtNavigation,
+    currentAuth,
+    state.authRecoveryAttempted,
+  )) return false;
+
+  // ponytail: only retry one navigation when an auth-like sessionStorage value changed after a
+  // startup 401. Sites with a different auth bootstrap can still be retried explicitly via goto.
+  state.authRecoveryAttempted = true;
+  state.debugEvents.length = 0;
+  await target.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+  await syncFlags();
+  scheduleStorageStateSave();
+  return true;
 }
 
 async function syncFlags() {
@@ -210,11 +318,39 @@ function shouldExitAfterLastPageCloses(pageCount, isShuttingDown, isRelaunching)
   return pageCount === 0 && !isShuttingDown && !isRelaunching;
 }
 
+function normalizeDevUrl(value) {
+  const url = String(value || '').trim();
+  if (!url || /^https?:\/\//i.test(url)) return url;
+  const local = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?=[:/]|$)/i.test(url);
+  return (local ? 'http://' : 'https://') + url;
+}
+
+function pushDebugEvent(events, event) {
+  events.push({ ts: Date.now(), ...event });
+  if (events.length > 200) events.shift();
+}
+
 function attachPage(target) {
   if (attachedPages.has(target)) return;
   attachedPages.add(target);
   page = target;
   const state = stateOf(target);
+  state.debugEvents = [];
+  const debug = (event) => pushDebugEvent(state.debugEvents, event);
+  target.on('console', (message) => debug({ kind: 'console', level: message.type(), text: message.text().slice(0, 2000) }));
+  target.on('pageerror', (error) => debug({ kind: 'pageerror', text: String(error?.stack || error).slice(0, 4000) }));
+  target.on('requestfailed', (request) => debug({
+    kind: 'requestfailed',
+    method: request.method(),
+    url: request.url(),
+    error: request.failure()?.errorText || '',
+  }));
+  target.on('response', (response) => {
+    if (response.status() >= 400) {
+      debug({ kind: 'response', status: response.status(), url: response.url() });
+    }
+    if (response.status() === 401) scheduleAuthRecovery(target);
+  });
 
   target.on('request', (request) => {
     if (request.frame() !== target.mainFrame() || request.resourceType() !== 'document') return;
@@ -277,6 +413,7 @@ function attachPage(target) {
   });
 
   target.on('close', () => {
+    clearTimeout(state.authRecoveryTimer);
     if (page === target) page = null;
     if (!shouldExitAfterLastPageCloses(livePages().length, shuttingDown, relaunching)) return;
     shuttingDown = true;
@@ -292,6 +429,7 @@ async function ensureBrowser() {
   if (browser?.isConnected() && context && existing) return existing;
   if (browser?.isConnected() && context) {
     const target = await context.newPage();
+    await installSessionStorageRestore(target);
     attachPage(target);
     return target;
   }
@@ -309,6 +447,33 @@ async function ensureBrowser() {
       shuttingDown = false;
       closedEmitted = false;
 
+      await context.exposeBinding('__novaSessionStorageChanged', ({ page: sourcePage }) => {
+        if (sourcePage) attachPage(sourcePage);
+        scheduleStorageStateSave();
+      });
+      await context.addInitScript(() => {
+        if (window.__novaSessionStorageHooked) return;
+        window.__novaSessionStorageHooked = true;
+        const notify = () => window.__novaSessionStorageChanged?.().catch(() => {});
+        const setItem = Storage.prototype.setItem;
+        const removeItem = Storage.prototype.removeItem;
+        const clear = Storage.prototype.clear;
+        Storage.prototype.setItem = function (...args) {
+          const result = setItem.apply(this, args);
+          if (this === sessionStorage) notify();
+          return result;
+        };
+        Storage.prototype.removeItem = function (...args) {
+          const result = removeItem.apply(this, args);
+          if (this === sessionStorage) notify();
+          return result;
+        };
+        Storage.prototype.clear = function (...args) {
+          const result = clear.apply(this, args);
+          if (this === sessionStorage) notify();
+          return result;
+        };
+      });
       await context.exposeBinding('__novaPush', ({ page: sourcePage }, event) => {
         if (sourcePage) {
           attachPage(sourcePage);
@@ -346,6 +511,7 @@ async function ensureBrowser() {
       });
 
       const target = await context.newPage();
+      await installSessionStorageRestore(target);
       attachPage(target);
       return target;
     } catch (error) {
@@ -529,6 +695,7 @@ const commands = {
   async execOpen(command) {
     await ensureBrowser();
     const target = await context.newPage();
+    await installSessionStorageRestore(target);
     attachPage(target);
     runPages.set(command.runId, target);
     target.on('close', () => {
@@ -690,6 +857,108 @@ const commands = {
     }
     return { path: rawPath, viewport: await pageViewport(target) };
   },
+
+  // ---------- Lyra 前端开发：复用双子座的长驻 Playwright tab ----------
+  async devOpen(command) {
+    // ponytail: Playwright launch mode is shared process-wide; only an explicit headless value
+    // relaunches it. Independent per-tab modes would require separate browser processes.
+    if (typeof command.headless === 'boolean' && requestedHeadless !== command.headless) {
+      await commands.setHeadless({ headless: command.headless });
+    }
+    await ensureBrowser();
+    const previous = runPages.get(command.sessionId);
+    if (previous && !previous.isClosed()) {
+      await previous.bringToFront();
+      return { url: previous.url(), reused: true };
+    }
+    const target = await context.newPage();
+    await installSessionStorageRestore(target);
+    attachPage(target);
+    runPages.set(command.sessionId, target);
+    target.on('close', () => {
+      if (runPages.get(command.sessionId) === target) runPages.delete(command.sessionId);
+    });
+    const url = normalizeDevUrl(command.url);
+    let authRecovered = false;
+    if (url) {
+      await markAuthNavigation(target);
+      await target.goto(url, { waitUntil: 'domcontentloaded', timeout: command.timeout || 30000 });
+      authRecovered = await recoverLateSessionAuth(target);
+    }
+    await target.bringToFront();
+    scheduleStorageStateSave();
+    return { url: target.url(), reused: false, authRecovered };
+  },
+  async devClose(command) {
+    const target = runPages.get(command.sessionId);
+    runPages.delete(command.sessionId);
+    if (target && !target.isClosed()) {
+      await saveStorageState().catch(() => {});
+      await target.close().catch(() => {});
+    }
+    return null;
+  },
+  async devGoto(command) {
+    const target = runPageOf(command.sessionId);
+    const url = normalizeDevUrl(command.url);
+    await markAuthNavigation(target);
+    await target.goto(url || 'about:blank', { waitUntil: 'domcontentloaded', timeout: command.timeout || 30000 });
+    const authRecovered = await recoverLateSessionAuth(target);
+    await target.bringToFront();
+    scheduleStorageStateSave();
+    return { url: target.url(), authRecovered };
+  },
+  async devInspect(command) {
+    const target = runPageOf(command.sessionId);
+    const authRecovered = await recoverLateSessionAuth(target);
+    const requestedLimit = Number(command.limit ?? 100);
+    const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(200, Math.floor(requestedLimit))) : 100;
+    const state = stateOf(target);
+    const events = state.debugEvents.slice(-limit);
+    if (command.clear) state.debugEvents.length = 0;
+    return {
+      url: target.url(),
+      title: await target.title(),
+      viewport: await pageViewport(target),
+      authRecovered,
+      events,
+    };
+  },
+  async devAct(command) {
+    const target = runPageOf(command.sessionId);
+    const action = String(command.action || '');
+    if (action === 'click') {
+      const locator = semanticLocator(target, command) || (command.selector ? target.locator(command.selector) : null);
+      if (!locator) throw new Error('click 需要 selector，或 role+name / label / text');
+      await locator.first().click({ timeout: command.timeout || 10000 });
+    } else if (action === 'fill') {
+      if (!command.selector) throw new Error('fill 需要 selector');
+      await target.locator(command.selector).first().fill(String(command.value ?? ''), { timeout: command.timeout || 10000 });
+    } else if (action === 'press') {
+      await target.keyboard.press(String(command.key || 'Enter'));
+    } else if (action === 'type') {
+      await target.keyboard.type(String(command.text ?? ''), { delay: command.delay || 20 });
+    } else if (action === 'scroll') {
+      await target.mouse.wheel(Number(command.deltaX || 0), Number(command.deltaY ?? 600));
+    } else if (action === 'wait') {
+      if (command.selector) await target.waitForSelector(command.selector, { state: command.state || 'visible', timeout: command.timeout || 10000 });
+      else await delay(Number(command.ms ?? 500));
+    } else {
+      throw new Error('未知前端操作: ' + action);
+    }
+    return { url: target.url() };
+  },
+  async devScreenshot(command) {
+    const target = runPageOf(command.sessionId);
+    const image = command.selector
+      ? await target.locator(command.selector).first().screenshot({ scale: 'css', timeout: command.timeout || 10000 })
+      : await target.screenshot({ fullPage: Boolean(command.fullPage), scale: 'css' });
+    return {
+      url: target.url(),
+      viewport: await pageViewport(target),
+      image: image.toString('base64'),
+    };
+  },
 };
 
 function runPageOf(runId) {
@@ -732,11 +1001,14 @@ if (process.env.NOVA_BROWSER_RECORDER_TEST === '1') {
     contextLaunchOptions,
     execShotPath,
     mapViewportPoint,
+    normalizeDevUrl,
     pageViewport,
     prepareFullPageScreenshot,
+    pushDebugEvent,
     safeShotName,
     semanticLocator,
     shouldExitAfterLastPageCloses,
+    shouldRecoverLateSessionAuth,
   };
 } else {
   startExecServer();

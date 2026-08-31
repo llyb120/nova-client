@@ -22,9 +22,37 @@ const {
   contextLaunchOptions,
   execShotPath,
   mapViewportPoint,
+  normalizeDevUrl,
+  pushDebugEvent,
   safeShotName,
   shouldExitAfterLastPageCloses,
+  shouldRecoverLateSessionAuth,
 } = require(recorder);
+
+test("development URLs use https except for local servers", () => {
+  assert.equal(normalizeDevUrl("example.com/app"), "https://example.com/app");
+  assert.equal(normalizeDevUrl("localhost:5173"), "http://localhost:5173");
+  assert.equal(normalizeDevUrl("127.0.0.1:3000"), "http://127.0.0.1:3000");
+  assert.equal(normalizeDevUrl("http://dev.local"), "http://dev.local");
+});
+
+test("debug event buffer keeps the latest 200 entries", () => {
+  const events = [];
+  for (let index = 0; index < 205; index += 1) pushDebugEvent(events, { index });
+  assert.equal(events.length, 200);
+  assert.equal(events[0].index, 5);
+  assert.equal(events[199].index, 204);
+});
+
+test("late session auth only retries a navigation that already received 401", () => {
+  const startedAt = 1000;
+  const unauthorized = [{ ts: 1001, kind: "response", status: 401 }];
+  assert.equal(shouldRecoverLateSessionAuth(unauthorized, startedAt, "[]", '[["authorization","token"]]', false), true);
+  assert.equal(shouldRecoverLateSessionAuth(unauthorized, startedAt, "same", "same", false), false);
+  assert.equal(shouldRecoverLateSessionAuth([{ ts: 999, kind: "response", status: 401 }], startedAt, "[]", "token", false), false);
+  assert.equal(shouldRecoverLateSessionAuth([{ ts: 1001, kind: "response", status: 403 }], startedAt, "[]", "token", false), false);
+  assert.equal(shouldRecoverLateSessionAuth(unauthorized, startedAt, "[]", "token", true), false);
+});
 
 test("headless mode reaches Playwright launch and uses a deterministic viewport", () => {
   assert.deepEqual(browserLaunchOptions(true), { headless: true, timeout: 20000 });

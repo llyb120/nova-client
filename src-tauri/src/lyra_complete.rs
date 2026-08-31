@@ -457,7 +457,13 @@ fn resolve_target(
             .or_else(|| provider.pointer(&format!("/options/{snake}")))
             .and_then(Value::as_f64)
     }
-    let temperature = sampling_number(variant_options, model, provider, "temperature", "temperature");
+    let temperature = sampling_number(
+        variant_options,
+        model,
+        provider,
+        "temperature",
+        "temperature",
+    );
     let top_p = sampling_number(variant_options, model, provider, "topP", "top_p");
     let reasoning = model
         .get("reasoning")

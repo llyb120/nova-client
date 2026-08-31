@@ -1,6 +1,5 @@
 mod acp;
 mod agent_config;
-mod lyra_complete;
 mod browser;
 mod browser_agent;
 mod cli_manager;
@@ -14,6 +13,7 @@ mod experience;
 mod gitwt;
 mod http_stream;
 mod lyra;
+mod lyra_complete;
 mod model_cache;
 mod nova_tools_native;
 mod opencode_sdk;
@@ -439,7 +439,11 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
         .filter_map(|thread| thread.acp_session_id.clone())
         .chain(state.thread_trash.lock().unwrap().session_ids())
         .collect();
-    cleanup_lyra_session_files(&state.config_dir, &permanently_removed, &retained_session_ids);
+    cleanup_lyra_session_files(
+        &state.config_dir,
+        &permanently_removed,
+        &retained_session_ids,
+    );
     for thread in permanently_removed {
         if thread.cwd.contains(SCRATCH_MARK) {
             let _ = std::fs::remove_dir_all(thread.cwd);
@@ -914,6 +918,7 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
                 .or_else(|| wt_by_path.get(&t.cwd).cloned()),
             experience_thread: t.experience_thread,
             browser_thread: t.browser_thread,
+            browser_debug_mode: t.browser_debug_mode,
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             active_clue_card_id: t.active_clue_card_id.clone(),
@@ -2347,7 +2352,10 @@ fn cleanup_lyra_session_files(
             let path = session_root.join(file_name);
             if let Err(error) = std::fs::remove_file(&path) {
                 if error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("[threads] 清理 Lyra session 文件 {} 失败：{error}", path.display());
+                    eprintln!(
+                        "[threads] 清理 Lyra session 文件 {} 失败：{error}",
+                        path.display()
+                    );
                 }
             }
         }
@@ -3463,6 +3471,13 @@ fn set_thread_agent(
                 AgentKind::OpenCode => state.opencodeplus.forget_session_of_thread(&thread_id),
                 _ => {}
             }
+        }
+        if old_kind == AgentKind::Lyra && agent_kind != AgentKind::Lyra {
+            let mut store = state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(&thread_id) {
+                thread.browser_debug_mode = false;
+            }
+            store.save_thread(&thread_id);
         }
         if let Some(item) = switched_item {
             let _ = app.emit(
@@ -4727,8 +4742,7 @@ async fn judge_workflow_route(
         let s = state.settings.lock().unwrap();
         let lightweight = s.lightweight_model.trim().to_string();
         let lightweight_agent = s.lightweight_model_agent.trim();
-        if (lightweight_agent.is_empty() || lightweight_agent == "lyra")
-            && !lightweight.is_empty()
+        if (lightweight_agent.is_empty() || lightweight_agent == "lyra") && !lightweight.is_empty()
         {
             lightweight
         } else {

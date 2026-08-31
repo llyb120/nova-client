@@ -4,13 +4,14 @@
 use crate::lyra::agent::{estimate_text_tokens, user_message, Agent, AgentEvent};
 use crate::lyra::config::{self, Resolved, Roots};
 use crate::lyra::prompt::{
-    self, build_system_prompt, expand_skill_command, format_skills_prompt, image_media_type,
-    is_context_window_error, is_retryable_provider_error, load_agent_instructions, load_skills,
-    merge_usage, system_prompt_fingerprint, SystemPromptOptions, PROVIDER_RETRY_DELAYS_MS,
+    self, build_system_prompt, expand_browser_command, expand_browser_exit_command,
+    expand_skill_command, format_skills_prompt, image_media_type, is_context_window_error,
+    is_retryable_provider_error, load_agent_instructions, load_skills, merge_usage,
+    system_prompt_fingerprint, SystemPromptOptions, PROVIDER_RETRY_DELAYS_MS,
 };
 use crate::lyra::provider::{stream_chat, StreamEvent};
 use crate::lyra::reasonix::{self, context_tokens_from_messages, load_legacy_messages, SlimMemory};
-use crate::lyra::tools::tool_set;
+use crate::lyra::tools::{tool_set, BrowserTools};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
@@ -235,6 +236,7 @@ async fn handle_prompt(
     fast_context: bool,
     roots: &Roots,
     mut line_rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    app: Option<tauri::AppHandle>,
 ) -> Result<(), String> {
     let turn_started = Instant::now();
     let sessions_root = roots.sessions();
@@ -293,6 +295,20 @@ async fn handle_prompt(
             .unwrap_or_default()
             .as_slice(),
     );
+    let browser_exit = text.trim().eq_ignore_ascii_case("/browser-exit");
+    // 桌面运行时（app 有值）才附加 browser；CLI 调试入口（dispatch，app=None）不支持。
+    let browser_enabled = app.is_some()
+        && !read_only
+        && (request
+            .get("browserDebugMode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || browser_exit);
+    if let Some(expanded) =
+        expand_browser_command(&text).or_else(|| expand_browser_exit_command(&text))
+    {
+        text = expanded;
+    }
     let skills = load_skills(roots);
     text = expand_skill_command(&text, &skills);
 
@@ -332,6 +348,7 @@ async fn handle_prompt(
         fast_context,
         memory_enabled,
         auto_change_project,
+        browser: browser_enabled,
         shell: shell.clone(),
         skills_text,
         custom_instructions: agent_instructions,
@@ -414,7 +431,13 @@ async fn handle_prompt(
     } else {
         build_system_prompt(&prompt_options)
     };
-    let agent_tools = tool_set(read_only, fast_context, memory_enabled, auto_change_project);
+    let agent_tools = tool_set(
+        read_only,
+        fast_context,
+        memory_enabled,
+        auto_change_project,
+        browser_enabled,
+    );
     let system_prompt_hash = stable_hash(system_prompt.as_bytes());
     let tool_shape = serde_json::to_string(
         &agent_tools
@@ -472,6 +495,10 @@ async fn handle_prompt(
         session_id: ctx.session_id.clone(),
         archive_dir,
         shell,
+        browser: app.filter(|_| browser_enabled).map(|app| BrowserTools {
+            app,
+            session_id: ctx.session_id.clone(),
+        }),
         cancelled: cancelled.clone(),
         steering: steering.clone(),
         spec_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -516,7 +543,7 @@ async fn handle_prompt(
                     }
                     Some("steer") => {
                         command_busy.store(true, Ordering::SeqCst);
-                        let (text, images) = prompt_input(
+                        let (mut text, images) = prompt_input(
                             value
                                 .get("parts")
                                 .and_then(Value::as_array)
@@ -524,6 +551,18 @@ async fn handle_prompt(
                                 .unwrap_or_default()
                                 .as_slice(),
                         );
+                        // 原生 steer 直接注入已存在的 Agent（其工具集在开启调试模式前就固定了），
+                        // 这里展开命令并显式告诉模型本轮起可用的工具，让它继续调用 browser。
+                        if let Some(expanded) = expand_browser_command(&text)
+                            .or_else(|| expand_browser_exit_command(&text))
+                        {
+                            text = expanded;
+                        }
+                        if browser_enabled && !text.is_empty() {
+                            text.push_str(
+                                "\n\n（当前仍处于浏览器调试模式，本轮起可使用 browser 工具联合作业。）",
+                            );
+                        }
                         steering
                             .lock()
                             .unwrap()
@@ -1042,6 +1081,7 @@ pub fn spawn_prompt(
     request: Value,
     fast_context: bool,
     borrowed_root: Option<PathBuf>,
+    app: Option<tauri::AppHandle>,
 ) -> InProcessSession {
     let roots = borrowed_root
         .map(Roots::borrowed)
@@ -1063,7 +1103,7 @@ pub fn spawn_prompt(
             }
         });
         if let Err(error) =
-            handle_prompt(&http, &request, &emit, fast_context, &roots, line_rx).await
+            handle_prompt(&http, &request, &emit, fast_context, &roots, line_rx, app).await
         {
             emit(&json!({ "ok": false, "error": error }));
         }
@@ -1095,7 +1135,7 @@ async fn dispatch(http: &reqwest::Client, request: &Value) -> Result<(), String>
                     }
                 }
             });
-            handle_prompt(http, request, &emit, fast_context, &roots, line_rx).await
+            handle_prompt(http, request, &emit, fast_context, &roots, line_rx, None).await
         }
         Some("models") => {
             let data = models_data(request, &roots)?;
@@ -1238,6 +1278,7 @@ mod tests {
                 "parts": [{ "type": "text", "text": "运行 bash 工具执行 echo lyra-inprocess，然后简短汇报" }],
             }),
             true,
+            None,
             None,
         );
         let abort = session.task.abort_handle();

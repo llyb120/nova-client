@@ -150,8 +150,14 @@ pub struct BrowserManager {
         Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Option<String>, String>>>>,
     pending_commands: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     pub last_event_id: Mutex<u64>,
+    /// 浏览器录制进程的单飞启动锁，避免预热与首个工具调用并发拉起两个 Node 进程。
+    proc_start_lock: Mutex<()>,
     /// agent 闭环执行的 HTTP 控制端口，和录制进程 id 绑定，避免进程重启后复用旧端口。
     exec_endpoint: Mutex<Option<(String, u16)>>,
+    /// MCP browser 中转端口（供其它 agent 的 MCP 脚本访问）。
+    mcp_bridge_port: Mutex<Option<u16>>,
+    /// MCP 中转的单飞启动锁。
+    mcp_bridge_start_lock: tokio::sync::Mutex<()>,
     proc: Mutex<Option<RecorderProc>>,
 }
 
@@ -165,7 +171,10 @@ impl BrowserManager {
             pending_shots: Mutex::new(HashMap::new()),
             pending_commands: Mutex::new(HashMap::new()),
             last_event_id: Mutex::new(0),
+            proc_start_lock: Mutex::new(()),
             exec_endpoint: Mutex::new(None),
+            mcp_bridge_port: Mutex::new(None),
+            mcp_bridge_start_lock: tokio::sync::Mutex::new(()),
             proc: Mutex::new(None),
         }
     }
@@ -179,6 +188,7 @@ fn node_modules_root(state: &AppState) -> Result<String, String> {
 /// 确保录制进程已启动；返回是否为新启动。
 fn ensure_proc(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let _start_guard = state.browser.proc_start_lock.lock().unwrap();
     if state.browser.proc.lock().unwrap().is_some() {
         return Ok(());
     }
@@ -428,7 +438,10 @@ fn exec_port_for(endpoint: &Option<(String, u16)>, proc_id: &str) -> Option<u16>
 
 /// 确保浏览器录制进程已启动，并返回 agent 闭环执行端口（等待当前进程上报）。
 pub(crate) async fn ensure_exec_port(app: &AppHandle) -> Result<u16, String> {
-    ensure_proc(app)?;
+    let start_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || ensure_proc(&start_app))
+        .await
+        .map_err(|e| format!("启动浏览器准备任务失败: {e}"))??;
     for _ in 0..50 {
         let state = app.state::<AppState>();
         let proc_id = state
@@ -558,6 +571,100 @@ pub(crate) async fn configure_plan_run(
     )
     .await
     .map(|_| ())
+}
+
+/// Lyra 前端开发工具与双子座共用同一 Playwright 进程和命令协议。
+pub(crate) async fn execute_development_command(
+    app: &AppHandle,
+    command: Value,
+) -> Result<Value, String> {
+    let port = ensure_exec_port(app).await?;
+    send_exec_cmd(port, command).await
+}
+
+// ---- MCP browser 中转：为其它 agent（Devin/CodeBuddy）暴露同一 Playwright 能力 ----
+// MCP 脚本是独立 Node 进程，无法直接访问 Rust 内存中的 exec 端口；
+// 这里在 127.0.0.1 上监听一个一次性本地端口，把 JSON 命令转发到 Playwright 执行接口。
+// 端口写入 <config_dir>/browser-runtime/mcp-port，仅监听回环地址。
+
+/// 供 MCP 脚本读取的中转端口文件路径。
+pub(crate) fn mcp_port_file(config_dir: &std::path::Path) -> std::path::PathBuf {
+    config_dir.join("browser-runtime").join("mcp-port")
+}
+
+/// 启动（幂等）本地中转，返回监听端口。
+pub(crate) async fn ensure_mcp_bridge(app: &AppHandle) -> Result<u16, String> {
+    let state = app.state::<AppState>();
+    let _start_guard = state.browser.mcp_bridge_start_lock.lock().await;
+    if let Some(port) = *state.browser.mcp_bridge_port.lock().unwrap() {
+        return Ok(port);
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("browser MCP 中转监听失败：{e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("browser MCP 中转端口获取失败：{e}"))?
+        .port();
+    *state.browser.mcp_bridge_port.lock().unwrap() = Some(port);
+    let file = mcp_port_file(&state.config_dir);
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&file, port.to_string());
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let app = app2.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = serve_mcp_bridge_conn(&app, stream).await;
+            });
+        }
+    });
+    eprintln!("[browser] mcp bridge port: {port}");
+    Ok(port)
+}
+
+async fn serve_mcp_bridge_conn(
+    app: &AppHandle,
+    mut stream: tokio::net::TcpStream,
+) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 最小 HTTP 解析：只支持 POST /，body 为 JSON 命令。
+    let mut buf = vec![0u8; 1024 * 1024];
+    let read = stream
+        .read(&mut buf)
+        .await
+        .map_err(|e| format!("读取 MCP 中转请求失败：{e}"))?;
+    if read == 0 {
+        return Ok(());
+    }
+    let request = String::from_utf8_lossy(&buf[..read]);
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.trim())
+        .unwrap_or_default();
+    let command: Value =
+        serde_json::from_str(body).map_err(|e| format!("MCP 中转请求不是有效 JSON：{e}"))?;
+    let result = execute_development_command(app, command).await;
+    let payload = match result {
+        Ok(data) => json!({ "ok": true, "data": data }),
+        Err(error) => json!({ "ok": false, "error": error }),
+    };
+    let body = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|e| format!("写入 MCP 中转响应失败：{e}"))?;
+    Ok(())
 }
 
 #[tauri::command]

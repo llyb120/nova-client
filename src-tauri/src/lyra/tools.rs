@@ -8,10 +8,18 @@ use crate::lyra::prompt::{
     TOOL_OUTPUT_CONTEXT_MAX_BYTES,
 };
 use crate::lyra::{edit as native_edit, read as native_read};
+use base64::Engine;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tauri::AppHandle;
+
+#[derive(Clone)]
+pub struct BrowserTools {
+    pub app: AppHandle,
+    pub session_id: String,
+}
 
 const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文时先调用：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，并自动使用 task（缺省时回退 keywords）检索相关的猎户座经验、记忆与守则，一并返回。目标行段已明确时直接 read。";
 
@@ -22,7 +30,7 @@ fn render_trained_knowledge(project_root: &str, activated: &Value, rendered: &st
 }
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。";
-const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。禁止无排除的递归搜索（grep -r 等）。";
+const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。禁止无排除的递归搜索（grep -r 等）。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
     "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
@@ -42,6 +50,7 @@ pub fn tool_set(
     polaris: bool,
     memory_enabled: bool,
     auto_change_project: bool,
+    browser: bool,
 ) -> Vec<Tool> {
     let mut tools = Vec::new();
     if auto_change_project {
@@ -93,6 +102,38 @@ pub fn tool_set(
             "required": ["path"]
         })),
     });
+    if browser {
+        tools.push(Tool {
+            name: "browser",
+            description: "复用双子座的 Playwright 通信进程进行持续的前端开发与调试。可打开/跳转网站、交互、查看 console/pageerror/失败请求与 HTTP 错误，并截图交给视觉模型描述。每个 Lyra 会话使用独立且跨轮次保留的标签页；仅在用户要求或退出调试模式时 close。".into(),
+            parameters: schema(json!({
+                "type": "object",
+                "properties": {
+                    "operation": { "type": "string", "enum": ["open", "goto", "inspect", "screenshot", "act", "close"] },
+                    "url": { "type": "string", "description": "open/goto 的网址；localhost 默认补 http://" },
+                    "headless": { "type": "boolean", "description": "open 是否无头，默认 false，前端联调通常保持可见" },
+                    "action": { "type": "string", "enum": ["click", "fill", "press", "type", "scroll", "wait"], "description": "operation=act 时的操作" },
+                    "selector": { "type": "string", "description": "CSS selector；用于交互、等待或元素截图" },
+                    "role": { "type": "string" },
+                    "name": { "type": "string" },
+                    "label": { "type": "string" },
+                    "text": { "type": "string" },
+                    "value": { "type": "string" },
+                    "key": { "type": "string" },
+                    "deltaX": { "type": "number" },
+                    "deltaY": { "type": "number" },
+                    "ms": { "type": "integer", "minimum": 0, "maximum": 30000 },
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": 30000 },
+                    "state": { "type": "string", "enum": ["attached", "detached", "visible", "hidden"] },
+                    "fullPage": { "type": "boolean" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "clear": { "type": "boolean", "description": "inspect 清空事件" }
+                },
+                "required": ["operation"],
+                "additionalProperties": false
+            })),
+        });
+    }
     if !read_only {
         tools.push(Tool {
             name: "bash",
@@ -187,6 +228,11 @@ fn resolve_path(root: &Path, input: &str) -> PathBuf {
     } else {
         root.join(path)
     }
+}
+
+fn browser_url_allowed(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    !url.contains("://") || url.starts_with("http://") || url.starts_with("https://")
 }
 
 fn text_of(value: &Value) -> String {
@@ -292,6 +338,55 @@ fn apply_powershell_utf8(command: String, shell: &crate::lyra::prompt::ShellConf
     format!("{POWERSHELL_UTF8_PREFIX}{command}")
 }
 
+fn capture_bash_pipe<R>(
+    mut pipe: Option<R>,
+) -> (Arc<std::sync::Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = output.clone();
+    let task = tokio::spawn(async move {
+        let Some(mut pipe) = pipe.take() else {
+            return;
+        };
+        let mut chunk = [0u8; 8192];
+        loop {
+            use tokio::io::AsyncReadExt;
+            match pipe.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => captured.lock().unwrap().extend_from_slice(&chunk[..read]),
+            }
+        }
+    });
+    (output, task)
+}
+
+// 子孙进程可能逃出进程树清理并继续持有 stdout/stderr。只给正常输出一个短暂排空窗口，
+// 随后关闭本进程的读取端，不能让工具收尾无限等待 EOF。
+async fn drain_bash_pipes(
+    read_out: &mut tokio::task::JoinHandle<()>,
+    read_err: &mut tokio::task::JoinHandle<()>,
+) {
+    const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+    if tokio::time::timeout(DRAIN_GRACE, async {
+        let _ = tokio::join!(&mut *read_out, &mut *read_err);
+    })
+    .await
+    .is_err()
+    {
+        read_out.abort();
+        read_err.abort();
+    }
+}
+
+fn captured_bash_output(output: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u8> {
+    output
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 async fn run_bash(
     root: &Path,
     shell: &crate::lyra::prompt::ShellConfig,
@@ -335,27 +430,16 @@ async fn run_bash(
         .spawn()
         .map_err(|e| format!("启动 shell 失败：{e}"))?;
     let mut guard = PidGuard(child.id());
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let read_out = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe.take() {
-            use tokio::io::AsyncReadExt;
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
-    let read_err = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stderr_pipe.take() {
-            use tokio::io::AsyncReadExt;
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
+    let (output_stdout, mut read_out) = capture_bash_pipe(child.stdout.take());
+    let (output_stderr, mut read_err) = capture_bash_pipe(child.stderr.take());
     enum Wait {
         Exited(std::io::Result<std::process::ExitStatus>),
         Cancelled,
+    }
+    enum Completion {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Cancelled,
+        TimedOut,
     }
     // PI 语义：取消信号穿透到工具，bash 轮询取消标志，命中即强杀整棵进程树。
     let wait = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
@@ -374,37 +458,44 @@ async fn run_bash(
         }
     })
     .await;
-    let status = match wait {
+    let completion = match wait {
         Ok(Wait::Exited(result)) => {
             guard.disarm();
-            result.map_err(|e| format!("执行命令失败：{e}"))?
+            Completion::Exited(result)
         }
         Ok(Wait::Cancelled) => {
-            // 与超时一致的清理：显式强杀整棵进程树（含孙进程）并回收，管道随之 EOF。
             if let Some(pid) = guard.0.take() {
                 crate::acp::kill_process_tree(pid);
             }
-            let _ = child.wait().await;
-            return Err(cancel_message(
-                &read_out.await.unwrap_or_default(),
-                &read_err.await.unwrap_or_default(),
-            ));
+            let _ = child.start_kill();
+            Completion::Cancelled
         }
         Err(_) => {
-            // 显式强杀整棵进程树（含孙进程）并回收，管道随之 EOF。
             if let Some(pid) = guard.0.take() {
                 crate::acp::kill_process_tree(pid);
             }
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            Completion::TimedOut
+        }
+    };
+    if matches!(&completion, Completion::Cancelled | Completion::TimedOut) {
+        // kill/reap 也必须有界；遗漏的后代进程可能仍持有管道句柄。
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+    }
+    drain_bash_pipes(&mut read_out, &mut read_err).await;
+    let output_stdout = captured_bash_output(&output_stdout);
+    let output_stderr = captured_bash_output(&output_stderr);
+    let status = match completion {
+        Completion::Exited(result) => result.map_err(|e| format!("执行命令失败：{e}"))?,
+        Completion::Cancelled => return Err(cancel_message(&output_stdout, &output_stderr)),
+        Completion::TimedOut => {
             return Err(timeout_message(
                 timeout_secs,
-                &read_out.await.unwrap_or_default(),
-                &read_err.await.unwrap_or_default(),
+                &output_stdout,
+                &output_stderr,
             ));
         }
     };
-    let output_stdout = read_out.await.unwrap_or_default();
-    let output_stderr = read_err.await.unwrap_or_default();
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&output_stdout));
     if !output_stderr.is_empty() {
@@ -469,8 +560,9 @@ pub async fn execute(
     archive_dir: Option<&Path>,
     call_id: &str,
     cancelled: Option<&Arc<AtomicBool>>,
+    browser: Option<&BrowserTools>,
 ) -> ToolOutcome {
-    let outcome = execute_inner(root, name, args, shell, cancelled).await;
+    let outcome = execute_inner(root, name, args, shell, cancelled, browser, archive_dir).await;
     govern(outcome, name, call_id, archive_dir)
 }
 
@@ -480,6 +572,8 @@ async fn execute_inner(
     args: &Value,
     shell: Option<&crate::lyra::prompt::ShellConfig>,
     cancelled: Option<&Arc<AtomicBool>>,
+    browser: Option<&BrowserTools>,
+    screenshot_dir: Option<&Path>,
 ) -> ToolOutcome {
     match name {
         "polaris" => {
@@ -695,6 +789,104 @@ async fn execute_inner(
                 Err(e) => ToolOutcome::error(format!("写入 {path} 失败：{e}")),
             }
         }
+        "browser" => {
+            let Some(browser) = browser else {
+                return ToolOutcome::error("browser 仅在 Nova 桌面应用内可用");
+            };
+            let operation = args
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let cmd = match operation {
+                "open" => {
+                    let url = args.get("url").and_then(Value::as_str).unwrap_or_default();
+                    if !browser_url_allowed(url) {
+                        return ToolOutcome::error("browser 仅允许 http/https 网站");
+                    }
+                    let mut cmd = args.clone();
+                    cmd["cmd"] = json!("devOpen");
+                    cmd["sessionId"] = json!(browser.session_id);
+                    cmd
+                }
+                "goto" => {
+                    let Some(url) = args.get("url").and_then(Value::as_str) else {
+                        return ToolOutcome::error("browser goto 缺少 url");
+                    };
+                    if !browser_url_allowed(url) {
+                        return ToolOutcome::error("browser 仅允许 http/https 网站");
+                    }
+                    let mut cmd = args.clone();
+                    cmd["cmd"] = json!("devGoto");
+                    cmd["sessionId"] = json!(browser.session_id);
+                    cmd
+                }
+                "inspect" => json!({
+                    "cmd": "devInspect", "sessionId": browser.session_id,
+                    "limit": args.get("limit"), "clear": args.get("clear"),
+                }),
+                "screenshot" => json!({
+                    "cmd": "devScreenshot", "sessionId": browser.session_id,
+                    "selector": args.get("selector"), "fullPage": args.get("fullPage"),
+                    "timeout": args.get("timeout"),
+                }),
+                "act" => {
+                    let Some(action) = args.get("action").and_then(Value::as_str) else {
+                        return ToolOutcome::error("browser act 缺少 action");
+                    };
+                    let mut cmd = args.clone();
+                    cmd["cmd"] = json!("devAct");
+                    cmd["sessionId"] = json!(browser.session_id);
+                    cmd["action"] = json!(action);
+                    cmd
+                }
+                "close" => json!({ "cmd": "devClose", "sessionId": browser.session_id }),
+                _ => return ToolOutcome::error("browser operation 无效"),
+            };
+            match crate::browser::execute_development_command(&browser.app, cmd).await {
+                Ok(mut value) if operation == "screenshot" => {
+                    let Some(image) = value
+                        .get_mut("image")
+                        .map(Value::take)
+                        .and_then(|image| image.as_str().map(str::to_string))
+                    else {
+                        return ToolOutcome::error("Playwright 未返回截图");
+                    };
+                    let image_bytes = match base64::engine::general_purpose::STANDARD.decode(&image)
+                    {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            return ToolOutcome::error(format!("Playwright 截图解码失败：{error}"))
+                        }
+                    };
+                    let image_dir = screenshot_dir
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| std::env::temp_dir().join("nova-browser-shots"));
+                    let image_path = image_dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+                    if let Some(parent) = image_path.parent() {
+                        if let Err(error) = std::fs::create_dir_all(parent) {
+                            return ToolOutcome::error(format!("创建截图目录失败：{error}"));
+                        }
+                    }
+                    if let Err(error) = std::fs::write(&image_path, image_bytes) {
+                        return ToolOutcome::error(format!("保存截图失败：{error}"));
+                    }
+                    let summary = json!({
+                        "url": value.get("url"),
+                        "viewport": value.get("viewport"),
+                        "path": image_path,
+                    });
+                    ToolOutcome {
+                        content: vec![
+                            json!({ "type": "text", "text": format!("浏览器截图：{summary}") }),
+                        ],
+                        details: Some(json!({ "imagePath": image_path })),
+                        is_error: false,
+                    }
+                }
+                Ok(value) => ToolOutcome::text(value.to_string()),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
         "change_working_directory" => {
             let Some(path) = args.get("path").and_then(Value::as_str).map(str::trim) else {
                 return ToolOutcome::error("change_working_directory 缺少 path");
@@ -721,14 +913,29 @@ async fn execute_inner(
 
 #[cfg(test)]
 mod embedded_rtk_tests {
-    use super::{render_trained_knowledge, rewrite_with_embedded_rtk, tool_set};
+    use super::{
+        browser_url_allowed, capture_bash_pipe, drain_bash_pipes, render_trained_knowledge,
+        rewrite_with_embedded_rtk, tool_set,
+    };
     use crate::lyra::prompt::{ShellConfig, ShellKind};
     use serde_json::json;
 
     #[test]
+    fn browser_rejects_non_http_schemes() {
+        assert!(browser_url_allowed("localhost:5173"));
+        assert!(browser_url_allowed("https://example.com"));
+        assert!(!browser_url_allowed("file:///etc/passwd"));
+        assert!(!browser_url_allowed("ftp://example.com"));
+    }
+
+    #[test]
     fn disabled_feedback_memory_is_not_advertised() {
-        let tools = tool_set(false, true, true, false);
+        let tools = tool_set(false, true, true, false, false);
         assert!(tools.iter().all(|tool| tool.name != "feedback_memory"));
+        assert!(tools.iter().all(|tool| tool.name != "browser"));
+        assert!(tool_set(false, true, true, false, true)
+            .iter()
+            .any(|tool| tool.name == "browser"));
         let polaris = tools.iter().find(|tool| tool.name == "polaris").unwrap();
         assert!(!polaris.description.contains("feedback_memory"));
 
@@ -763,6 +970,20 @@ mod embedded_rtk_tests {
         ] {
             assert_eq!(rewrite_with_embedded_rtk(unsupported, &shell), unsupported);
         }
+    }
+
+    #[tokio::test]
+    async fn inherited_stdio_has_a_bounded_drain() {
+        let (stdout, _stdout_writer) = tokio::io::duplex(64);
+        let (stderr, _stderr_writer) = tokio::io::duplex(64);
+        let (_, mut read_out) = capture_bash_pipe(Some(stdout));
+        let (_, mut read_err) = capture_bash_pipe(Some(stderr));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drain_bash_pipes(&mut read_out, &mut read_err),
+        )
+        .await
+        .expect("继承的管道句柄不能无限阻塞工具收尾");
     }
 }
 
@@ -824,6 +1045,38 @@ mod tests {
             wait_pid_exit(grandchild),
             "超时后孙进程 {grandchild} 未被清理"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 即使有逃出进程组的后代继续持有 stdout，超时收尾也必须在固定窗口内返回。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_timeout_does_not_wait_forever_for_inherited_stdio() {
+        let dir = temp_case_dir("inherited-stdio");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_bash(
+                &dir,
+                &shell(),
+                "setsid sh -c 'echo $$ > detached.pid; exec sleep 300' & wait",
+                1,
+                None,
+            ),
+        )
+        .await;
+        if let Ok(pid) = std::fs::read_to_string(dir.join("detached.pid"))
+            .unwrap_or_default()
+            .trim()
+            .parse::<i32>()
+        {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let err = outcome
+            .expect("超时清理被继承的 stdout 阻塞")
+            .expect_err("必须报告命令超时");
+        assert!(err.contains("已终止"), "err={err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

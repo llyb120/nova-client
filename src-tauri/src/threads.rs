@@ -72,7 +72,8 @@ impl Default for AgentKind {
 impl<'de> Deserialize<'de> for AgentKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        AgentKind::from_str(&raw).ok_or_else(|| serde::de::Error::custom(format!("未知后端：{raw}")))
+        AgentKind::from_str(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("未知后端：{raw}")))
     }
 }
 
@@ -555,6 +556,9 @@ pub struct Thread {
     /// 双子座浏览器计划执行会话：仅在双子座左侧历史展示。
     #[serde(default)]
     pub browser_thread: bool,
+    /// Lyra 前端调试模式：由 /browser 开启，后续轮次持续附加 Playwright 工具。
+    #[serde(default)]
+    pub browser_debug_mode: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -627,6 +631,7 @@ impl Thread {
             worktree: None,
             experience_thread: false,
             browser_thread: false,
+            browser_debug_mode: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
             pending_stage_context: None,
@@ -892,6 +897,9 @@ pub struct ThreadMeta {
     /// 双子座浏览器执行会话：只在双子座左侧历史展示。
     #[serde(default)]
     pub browser_thread: bool,
+    /// Lyra 前端调试模式是否已开启。
+    #[serde(default)]
+    pub browser_debug_mode: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,

@@ -86,6 +86,10 @@ impl SdkAdapter for LyraAdapter {
         true
     }
 
+    fn supports_browser_debug(&self) -> bool {
+        true
+    }
+
     fn uses_text_deltas(&self) -> bool {
         true
     }

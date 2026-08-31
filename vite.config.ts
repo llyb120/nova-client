@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
 
 export default defineConfig({
-  plugins: [solid()],
+  plugins: [solid({ hot: false })],
   clearScreen: false,
   server: {
     host: "127.0.0.1",

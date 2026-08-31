@@ -20,7 +20,6 @@ import {
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import type { AgentKind, Item, Thread, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
-import { TranscriptCanvas, type TranscriptCanvasApi } from "../canvasTranscript/TranscriptCanvas";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
 import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
@@ -226,7 +225,6 @@ export function ChatView() {
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
   let transcriptRef: CanvasTranscriptHandle | undefined;
-  let qwenApi: TranscriptCanvasApi | null = null;
   const renderMode = () => state.settings?.chatViewRender ?? "canvas";
   const hasWorkflowPreview = () => displayedItems().some(
     (item) => item.type === "system" && item.level === "workflow",
@@ -234,9 +232,7 @@ export function ChatView() {
   /** 工作流设计图需要 SVG/DOM 渲染；包含预览时自动回退 DOM transcript。 */
   const forceDomTranscript = () => hasWorkflowPreview();
   const useCanvas = () => renderMode() === "canvas" && !forceDomTranscript();
-  /** canvas(qwen)：feat/glm_canvas 分支的独立 canvas 渲染，与默认 canvas 互不影响 */
-  const useQwenCanvas = () => renderMode() === "canvas_qwen" && !forceDomTranscript();
-  const useAnyCanvas = () => !forceDomTranscript() && renderMode() !== "dom";
+  const useAnyCanvas = useCanvas;
   const [stickToBottom, setStickToBottom] = createSignal(true);
 
   mountSessionShortcuts({
@@ -285,11 +281,6 @@ export function ChatView() {
   const syncTimeCursor = () => {
     const stops = timeStops();
     if (stops.length === 0) { setActiveTimeIndex(-1); return; }
-    if (useQwenCanvas()) {
-      // qwen canvas 内部自管滚动且不暴露当前分组位置；吸底时光标跟随最新轮次
-      if (stickToBottom()) setActiveTimeIndex(latestTimeIndex());
-      return;
-    }
     if (useCanvas()) {
       if (!transcriptRef) return;
       const groupIndex = transcriptRef.activeGroup();
@@ -316,10 +307,6 @@ export function ChatView() {
 
   const travelTo = (index: number) => {
     cancelBottomFollow();
-    if (useQwenCanvas()) {
-      qwenApi?.scrollToGroup(index);
-      return;
-    }
     if (useCanvas()) {
       transcriptRef?.scrollToGroup(index);
       syncTimeCursor();
@@ -384,18 +371,14 @@ export function ChatView() {
   const maxScrollTop = () =>
     useCanvas()
       ? (transcriptRef?.maxScrollTop() ?? 0)
-      : useQwenCanvas()
-        ? 0
-        : scrollRef
-          ? Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight)
-          : 0;
+      : scrollRef
+        ? Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight)
+        : 0;
 
   const isAtBottom = () =>
     useCanvas()
       ? (transcriptRef?.isAtBottom() ?? true)
-      : useQwenCanvas()
-        ? stickToBottom()
-        : !scrollRef || maxScrollTop() - scrollRef.scrollTop <= 1;
+      : !scrollRef || maxScrollTop() - scrollRef.scrollTop <= 1;
 
   const cancelBottomFollow = () => setStickToBottom(false);
 
@@ -456,7 +439,6 @@ export function ChatView() {
 
   const pinBottom = () => {
     if (!stickToBottom() || pointerActive) return;
-    if (useQwenCanvas()) return; // qwen canvas 依据 stickToBottom prop 自行钉底
     if (useCanvas()) {
       transcriptRef?.scrollToBottom();
       lastScrollTop = transcriptRef?.scrollTop() ?? 0;
@@ -601,7 +583,6 @@ export function ChatView() {
       const scrollsDown = scrollDownKeys.has(event.key) || (event.key === " " && !event.shiftKey);
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       if (!scrollsUp && !scrollsDown) return;
-      if (useQwenCanvas()) return; // qwen canvas 自带键盘滚动处理
       if (useCanvas()) {
         if (transcriptRef?.hasFocusedInput()) return;
         const delta = scrollsDown ? 100 : -100;
@@ -649,7 +630,6 @@ export function ChatView() {
     const id = state.currentId;
     if (id !== prevId) {
       enableBottomFollow();
-      if (useQwenCanvas()) qwenApi?.enableBottomFollow();
       setActiveTimeIndex(latestTimeIndex());
     }
     return id;
@@ -1366,46 +1346,25 @@ export function ChatView() {
             </div>
           }
         >
-          <Show
-            when={useQwenCanvas()}
-            fallback={
-              <CanvasTranscript
-                ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
-                threadId={state.currentId}
-                groups={groups()}
-                permissions={permissions()}
-                running={isRunning() && !previewItems()}
-                loading={state.loadingThread}
-                preview={!!previewCheckpointId()}
-                onReturnToCurrent={returnToCurrentTimeline}
-                onScroll={(top, max, user) => {
-                  if (user) {
-                    setStickToBottom(max - top <= 2);
-                    lastScrollTop = top;
-                  }
-                  syncTimeCursor();
-                }}
-                onBrowseDetail={cancelBottomFollow}
-                emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
-              />
-            }
-          >
-            <TranscriptCanvas
-              groups={groups()}
-              permissions={permissions()}
-              running={isRunning() && !previewItems()}
-              loading={state.loadingThread}
-              showHint={displayedItems().length === 0 && !state.loadingThread}
-              hintCwd={cwdDisplay()}
-              threadId={state.currentId ?? ""}
-              previewBanner={!!previewCheckpointId()}
-              fading={previewFading()}
-              stickToBottom={stickToBottom()}
-              onStickChange={setStickToBottom}
-              onReturnToTimeline={returnToCurrentTimeline}
-              onApi={(a) => { qwenApi = a; scheduleBottomPin(); }}
-            />
-          </Show>
+          <CanvasTranscript
+            ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
+            threadId={state.currentId}
+            groups={groups()}
+            permissions={permissions()}
+            running={isRunning() && !previewItems()}
+            loading={state.loadingThread}
+            preview={!!previewCheckpointId()}
+            onReturnToCurrent={returnToCurrentTimeline}
+            onScroll={(top, max, user) => {
+              if (user) {
+                setStickToBottom(max - top <= 2);
+                lastScrollTop = top;
+              }
+              syncTimeCursor();
+            }}
+            onBrowseDetail={cancelBottomFollow}
+            emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
+          />
         </Show>
       </div>
 

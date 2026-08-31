@@ -351,14 +351,15 @@ export function Sidebar(props: {
   };
 
   // 单条会话行：用户会话与员工会话共用同一渲染。
-  const ThreadRow = (
-    t: (typeof state.threads)[number],
-    child = false,
-    childCount = 0,
-    mergedChild?: ThreadMeta,
-    historyProject?: string,
-  ) => {
-    const activeThread = mergedChild ?? t;
+  const ThreadRow = (props: {
+    thread: (typeof state.threads)[number];
+    child?: boolean;
+    childCount?: number;
+    mergedChild?: ThreadMeta;
+    historyProject?: string;
+  }) => {
+    const t = props.thread;
+    const activeThread = () => props.mergedChild ?? t;
     const chainThreads = () => {
       const ids = new Set<string>([t.id]);
       let changed = true;
@@ -375,44 +376,45 @@ export function Sidebar(props: {
     };
     const running = () => chainThreads().some((thread) => !!state.running[thread.id]);
     const active = () => !!state.currentId && chainThreads().some((thread) => thread.id === state.currentId);
-    const title = () => mergedChild?.title ?? t.title;
+    const title = () => props.mergedChild?.title ?? t.title;
     const updatedAt = () => Math.max(...chainThreads().map((thread) => thread.updatedAt));
     return (
       <div
         class="thread-item"
         classList={{
           active: active(),
-          "history-time": !!historyProject,
-          child,
-          parent: childCount > 0,
-          starred: !!(t.starred || mergedChild?.starred),
+          "history-time": !!props.historyProject,
+          child: !!props.child,
+          parent: (props.childCount ?? 0) > 0,
+          starred: !!(t.starred || props.mergedChild?.starred),
         }}
         onClick={() =>
           void openHistoryThread(
-            latestFireStage(state.threads, activeThread)?.id ?? activeThread.id,
+            latestFireStage(state.threads, activeThread())?.id ?? activeThread().id,
           )
         }
         onContextMenu={(e) => {
           e.preventDefault();
-          if (activeThread.worktree?.path) {
+          const thread = activeThread();
+          if (thread.worktree?.path) {
             setTmenu({
               x: Math.min(e.clientX, window.innerWidth - 200),
               y: Math.min(e.clientY, window.innerHeight - 120),
-              id: activeThread.id,
-              wt: activeThread.worktree,
+              id: thread.id,
+              wt: thread.worktree,
               running: running(),
             });
           } else {
             setMenu({
               x: Math.min(e.clientX, window.innerWidth - 180),
               y: Math.min(e.clientY, window.innerHeight - 90),
-              path: activeThread.cwd,
-              remote: activeThread.roamingRole === "guest",
+              path: thread.cwd,
+              remote: thread.roamingRole === "guest",
             });
           }
         }}
       >
-        <Show when={child}>
+        <Show when={props.child}>
           <span class="thread-tree-mark" title="属于上方预检会话">
             └
           </span>
@@ -420,13 +422,13 @@ export function Sidebar(props: {
         <span class={`thread-agent ${t.agentKind}`} title={`Wake · ${agentLabel(t.agentKind)}`}>
           {agentShort(t.agentKind)}
         </span>
-        <Show when={mergedChild}>
+        <Show when={props.mergedChild}>
           <span class="thread-pair-arrow">→</span>
           <span
-            class={`thread-agent ${mergedChild!.agentKind}`}
-            title={`Do · ${agentLabel(mergedChild!.agentKind)}`}
+            class={`thread-agent ${props.mergedChild!.agentKind}`}
+            title={`Do · ${agentLabel(props.mergedChild!.agentKind)}`}
           >
-            {agentShort(mergedChild!.agentKind)}
+            {agentShort(props.mergedChild!.agentKind)}
           </span>
         </Show>
         <span class="thread-run-slot">
@@ -439,28 +441,28 @@ export function Sidebar(props: {
             class="thread-title"
             text={title()}
             title={title()}
-            animate={state.titleTyping[t.id] || !!(mergedChild && state.titleTyping[mergedChild.id])}
+            animate={state.titleTyping[t.id] || !!(props.mergedChild && state.titleTyping[props.mergedChild.id])}
           />
-          <Show when={historyProject}>
+          <Show when={props.historyProject}>
             <span
               class="thread-history-meta"
-              title={`项目：${historyProject}\n模型：${activeThread.model || "默认模型"}`}
+              title={`项目：${props.historyProject}\n模型：${activeThread().model || "默认模型"}`}
             >
-              {historyProject} · {activeThread.model || "默认模型"}
+              {props.historyProject} · {activeThread().model || "默认模型"}
             </span>
           </Show>
         </span>
-        <Show when={activeThread.worktree}>
+        <Show when={activeThread().worktree}>
           <span
             class="thread-worktree"
-            title={`在 worktree 中执行 · 分支：${activeThread.worktree!.branch}`}
+            title={`在 worktree 中执行 · 分支：${activeThread().worktree!.branch}`}
           >
-            ⎇ {activeThread.worktree!.branch}
+            ⎇ {activeThread().worktree!.branch}
           </span>
         </Show>
-        <Show when={childCount > 0}>
-          <span class="thread-tree-badge" title={`该预检会话下有 ${childCount} 个开发子会话`}>
-            预检 · {childCount}
+        <Show when={(props.childCount ?? 0) > 0}>
+          <span class="thread-tree-badge" title={`该预检会话下有 ${props.childCount} 个开发子会话`}>
+            预检 · {props.childCount}
           </span>
         </Show>
         <Show when={t.ephemeral}>
@@ -639,7 +641,13 @@ export function Sidebar(props: {
         >
           <Show when={showHistoryByTime()}>
             <For each={timeRows()}>
-              {(row) => ThreadRow(row.thread, false, 0, row.mergedChild, groupName(row.cwd))}
+              {(row) => (
+                <ThreadRow
+                  thread={row.thread}
+                  mergedChild={row.mergedChild}
+                  historyProject={groupName(row.cwd)}
+                />
+              )}
             </For>
           </Show>
           <Show when={!showHistoryByTime()}>
@@ -648,7 +656,7 @@ export function Sidebar(props: {
                 const guestThread = threads.find((t) => t.roamingRole === "guest");
                 const isRemote = !!guestThread;
                 const peerName = guestThread?.roamingPeerName ?? "";
-                const rows = createMemo(() => threadTreeRows(threads));
+                const rows = () => threadTreeRows(threads);
                 const expanded = () => expandedGroups().has(cwd);
                 const collapsible = () => rows().length > COLLAPSED_THREAD_LIMIT;
                 const visibleRows = () =>
@@ -697,7 +705,14 @@ export function Sidebar(props: {
                       </button>
                     </div>
                     <For each={visibleRows()}>
-                      {(row) => ThreadRow(row.thread, row.child, row.childCount, row.mergedChild)}
+                      {(row) => (
+                        <ThreadRow
+                          thread={row.thread}
+                          child={row.child}
+                          childCount={row.childCount}
+                          mergedChild={row.mergedChild}
+                        />
+                      )}
                     </For>
                     <Show when={collapsible()}>
                       <button
