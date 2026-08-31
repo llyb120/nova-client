@@ -271,6 +271,17 @@ mod tests {
         assert!(status.success());
     }
 
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
     #[test]
     fn linked_worktree_uses_the_main_worktree_as_project_root() {
         let temp = std::env::temp_dir().join(format!("nova-project-root-{}", uuid::Uuid::new_v4()));
@@ -297,7 +308,13 @@ mod tests {
 
         let main_root = project_root(&main.to_string_lossy()).unwrap();
         let worktree_root = project_root(&worktree.to_string_lossy()).unwrap();
-        assert_eq!(main_root, worktree_root);
+        let checked_out = super::branch_checked_out(&main_root, "feature").unwrap();
+        assert_eq!(main_root, main.to_string_lossy());
+        assert_eq!(worktree_root, main_root);
+        assert_eq!(
+            git_output(&worktree, &["rev-parse", "--show-toplevel"]),
+            checked_out.replace('\\', "/")
+        );
         let _ = fs::remove_dir_all(temp);
     }
 }

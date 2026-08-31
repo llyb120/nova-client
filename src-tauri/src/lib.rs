@@ -1621,7 +1621,8 @@ pub fn create_worktree_for(
     if !gitwt::is_repo(dir) {
         return Err(format!("不是 git 仓库，无法创建 worktree：{dir}"));
     }
-    let repo = gitwt::repo_root(dir)?;
+    // worktree 操作统一从主工作区发起；若 dir 本身是目标链接 worktree，后续复用逻辑会直接采用它。
+    let repo = gitwt::project_root(dir)?;
     let branch = branch.map(|s| s.trim()).unwrap_or("").to_string();
     // 基于哪个分支/提交创建（空 = 当前 HEAD，仅新建分支时允许为空）
     let base_branch = base_branch.map(|s| s.trim()).unwrap_or("").to_string();
@@ -1718,7 +1719,8 @@ async fn create_thread(
         if !gitwt::is_repo(&cwd) {
             return Err(format!("不是 git 仓库，无法创建 worktree：{cwd}"));
         }
-        let repo = gitwt::repo_root(&cwd)?;
+        // worktree 操作统一从主工作区发起；若 cwd 本身是目标链接 worktree，直接复用而不重复检出。
+        let repo = gitwt::project_root(&cwd)?;
         let branch = worktree_branch
             .as_deref()
             .map(|s| s.trim())
