@@ -6,6 +6,7 @@ import {
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded } from "../store";
+import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
@@ -1068,8 +1069,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     groupYs: number[];
     until: number;
   }
-  const prefixLayoutCaches = new Map<string, PrefixLayoutCache>();
-  const PREFIX_CACHE_LIMIT = 10;
+  // 与 transcript 快照保持同一小窗口；每份缓存都持有完整 Block 树，按会话数放大后
+  // 会抵消快照 LRU 的内存收益，并让运行越久后的 GC 停顿重新拖慢会话切换。
+  const prefixLayoutCaches = new LruMap<string, PrefixLayoutCache>(3);
   // groupItems 会保留已闭合分组的对象身份；缓存其内容签名，避免每个流式 token
   // 都重新遍历整段历史文本。展开状态变化时会整体换新此 WeakMap。
   let closedGroupSigCache = new WeakMap<Group, string>();
@@ -1218,7 +1220,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (const item of g.body) {
       if (item.type === "tool") {
         parts.push(
-          `tool:${item.id}:${item.status}:${item.title}:${item.content.length}:${item.locations.length}:${item.rawInput !== undefined}:${JSON.stringify(item.rawOutput)}:${!!state.expanded[`tool-${item.id}`]}`,
+          `tool:${item.id}:${item.status}:${item.title}:${item.content.length}:${item.locations.length}:${item.rawInput !== undefined}:${item.rawOutput !== undefined}:${!!state.expanded[`tool-${item.id}`]}`,
         );
       } else if ("text" in item) {
         parts.push(
@@ -1480,7 +1482,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     totalHeight = y + 16;
 
     if (closedUntil > 0 && reuseUntil < closedUntil && cacheKey) {
-      prefixLayoutCaches.delete(cacheKey);
       prefixLayoutCaches.set(cacheKey, {
         meta: metaSig,
         sigs: closedSigs,
@@ -1489,11 +1490,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         groupYs: nextGroupYs.slice(0, closedUntil),
         height: closedUntil < groups.length ? nextGroupYs[closedUntil] : y,
       });
-      while (prefixLayoutCaches.size > PREFIX_CACHE_LIMIT) {
-        const oldest = prefixLayoutCaches.keys().next().value;
-        if (oldest == null) break;
-        prefixLayoutCaches.delete(oldest);
-      }
     }
     return true;
   }
