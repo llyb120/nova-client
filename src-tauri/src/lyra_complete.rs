@@ -1,5 +1,6 @@
 //! 输入框补全：Rust 直连 Lyra provider HTTP，不再为每次补全冷启 Node bridge。
 
+use crate::http_stream::SseDecoder;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -167,30 +168,32 @@ async fn post_stream(
 }
 
 async fn read_completions_sse(response: &mut reqwest::Response) -> Result<String, String> {
-    let mut buffer = String::new();
+    let mut decoder = SseDecoder::new();
     let mut out = String::new();
     loop {
         let chunk = response
             .chunk()
             .await
             .map_err(|e| format!("读取补全流失败：{e}"))?;
-        let Some(chunk) = chunk else {
-            break;
+        let (events, finished) = match chunk {
+            Some(chunk) => (
+                decoder
+                    .push(&chunk)
+                    .map_err(|e| format!("读取补全流失败：{e}"))?,
+                false,
+            ),
+            None => (
+                decoder
+                    .finish()
+                    .map_err(|e| format!("读取补全流失败：{e}"))?,
+                true,
+            ),
         };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(idx) = buffer.find('\n') {
-            let mut line = buffer[..idx].to_string();
-            buffer.drain(..=idx);
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            let Some(data) = sse_data_payload(&line) else {
-                continue;
-            };
+        for data in events {
             if data == "[DONE]" {
                 return Ok(out.trim().to_string());
             }
-            let Ok(value) = serde_json::from_str::<Value>(data) else {
+            let Ok(value) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
             // 非流式回退：偶发代理把 stream 请求仍按整包 JSON 返回
@@ -207,35 +210,39 @@ async fn read_completions_sse(response: &mut reqwest::Response) -> Result<String
                 }
             }
         }
+        if finished {
+            return Ok(out.trim().to_string());
+        }
     }
-    Ok(out.trim().to_string())
 }
 
 async fn read_responses_sse(response: &mut reqwest::Response) -> Result<String, String> {
-    let mut buffer = String::new();
+    let mut decoder = SseDecoder::new();
     let mut out = String::new();
     loop {
         let chunk = response
             .chunk()
             .await
             .map_err(|e| format!("读取补全流失败：{e}"))?;
-        let Some(chunk) = chunk else {
-            break;
+        let (events, finished) = match chunk {
+            Some(chunk) => (
+                decoder
+                    .push(&chunk)
+                    .map_err(|e| format!("读取补全流失败：{e}"))?,
+                false,
+            ),
+            None => (
+                decoder
+                    .finish()
+                    .map_err(|e| format!("读取补全流失败：{e}"))?,
+                true,
+            ),
         };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(idx) = buffer.find('\n') {
-            let mut line = buffer[..idx].to_string();
-            buffer.drain(..=idx);
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            let Some(data) = sse_data_payload(&line) else {
-                continue;
-            };
+        for data in events {
             if data == "[DONE]" {
                 return Ok(out.trim().to_string());
             }
-            let Ok(value) = serde_json::from_str::<Value>(data) else {
+            let Ok(value) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
             // 非流式整包
@@ -263,16 +270,10 @@ async fn read_responses_sse(response: &mut reqwest::Response) -> Result<String, 
                 }
             }
         }
+        if finished {
+            return Ok(out.trim().to_string());
+        }
     }
-    Ok(out.trim().to_string())
-}
-
-pub(crate) fn sse_data_payload(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with("data:") {
-        return None;
-    }
-    Some(trimmed[5..].trim_start())
 }
 
 fn should_early_stop(text: &str) -> bool {

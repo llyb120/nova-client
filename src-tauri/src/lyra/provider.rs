@@ -2,6 +2,7 @@
 //! 消息互转、reasoning 参数、缓存优化注入（prompt_cache_key / service_tier /
 //! prompt_cache_retention / 会话亲和头）。
 
+use crate::http_stream::SseDecoder;
 use crate::lyra::config::ResolvedModel;
 use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text};
 use crate::lyra::tools::Tool;
@@ -523,7 +524,7 @@ async fn read_sse(
     cancel: &Arc<AtomicBool>,
     mut on_data: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<bool, String> {
-    let mut buffer = String::new();
+    let mut decoder = SseDecoder::new();
     loop {
         let chunk = tokio::select! {
             result = tokio::time::timeout(SSE_IDLE_TIMEOUT, response.chunk()) => {
@@ -537,23 +538,28 @@ async fn read_sse(
             }
             _ = wait_cancelled(cancel) => return Ok(true),
         };
-        let Some(chunk) = chunk else {
-            return Ok(false);
+        let (events, finished) = match chunk {
+            Some(chunk) => (
+                decoder
+                    .push(&chunk)
+                    .map_err(|e| format!("读取响应流失败：{e}"))?,
+                false,
+            ),
+            None => (
+                decoder
+                    .finish()
+                    .map_err(|e| format!("读取响应流失败：{e}"))?,
+                true,
+            ),
         };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(index) = buffer.find('\n') {
-            let mut line = buffer[..index].to_string();
-            buffer.drain(..=index);
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            let Some(data) = crate::lyra_complete::sse_data_payload(&line) else {
-                continue;
-            };
+        for data in events {
             if data == "[DONE]" {
                 return Ok(false);
             }
-            on_data(data)?;
+            on_data(&data)?;
+        }
+        if finished {
+            return Ok(false);
         }
     }
 }
