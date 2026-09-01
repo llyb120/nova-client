@@ -147,3 +147,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release edit "pre-v${{ needs.prepare.outputs.version }}" --draft=false --prerelease
+
+      - name: Keep only the 10 most recent pre-releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 只看预发布通道（pre-v*），按 createdAt 升序取除最新 10 个之外的 release
+          mapfile -t TO_DELETE < <(gh release list --limit 1000 \
+            --json createdAt,tagName \
+            --jq 'map(select(.tagName | startswith("pre-v"))) | sort_by(.createdAt) | .[:-10] | .[].tagName')
+          if [ ${#TO_DELETE[@]} -eq 0 ]; then
+            echo "无需清理（pre-release 数量 ≤ 10）"
+            exit 0
+          fi
+          for tag in "${TO_DELETE[@]}"; do
+            echo "删除旧 pre-release: $tag"
+            gh release delete "$tag" --cleanup-tag -y || echo "警告：删除 $tag 失败"
+          done
