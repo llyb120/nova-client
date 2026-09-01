@@ -1589,6 +1589,9 @@ export async function sendPrompt(
   text: string,
   images: PromptImage[] = [],
   workflowId?: string | null,
+  /** 新会话启动工作流时用户原始选择的后端/模型（createThread 可能已被首节点覆盖），
+   *  作为「跟随会话」节点的跟随锚点。 */
+  workflowFollowFrom?: { agentKind: AgentKind; model: string | null },
 ) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
@@ -1602,7 +1605,7 @@ export async function sendPrompt(
   }
   // 新会话页选择了工作流：会话输入就是首节点输入，文本作为 goal、图片作为首节点附件。
   if (workflowId) {
-    await startWorkflow(workflowId, { goal: text.trim() }, id, images);
+    await startWorkflow(workflowId, { goal: text.trim() }, id, images, workflowFollowFrom);
     return;
   }
   // 内置命令优先于工作流触发器，避免 /fire、/hard 等被当成普通内容。
@@ -2303,7 +2306,12 @@ function bumpChatScrollToBottom() {
 /** 本地 worktree 会话：worktree 在后台创建，暂存首条提示词，就绪后（acp:worktree-ready）再自动发送 */
 const pendingWorktreePrompts = new Map<
   string,
-  { text: string; images: PromptImage[]; workflowId?: string | null }
+  {
+    text: string;
+    images: PromptImage[];
+    workflowId?: string | null;
+    followFrom?: { agentKind: AgentKind; model: string | null };
+  }
 >();
 
 function flushWorktreePrompt(threadId: string) {
@@ -2312,7 +2320,7 @@ function flushWorktreePrompt(threadId: string) {
   pendingWorktreePrompts.delete(threadId);
   // 新会话页选了工作流：就绪后直接启动工作流（goal 为暂存提示词），否则按普通提示词发送。
   const action = prompt.workflowId
-    ? startWorkflow(prompt.workflowId, { goal: prompt.text.trim() }, threadId, prompt.images)
+    ? startWorkflow(prompt.workflowId, { goal: prompt.text.trim() }, threadId, prompt.images, prompt.followFrom)
     : sendPromptTo(threadId, prompt.text, prompt.images);
   void action.catch((error) => {
     console.error("worktree prompt flush failed", error);
@@ -2324,9 +2332,10 @@ export function stashWorktreePrompt(
   text: string,
   images: PromptImage[],
   workflowId?: string | null,
+  followFrom?: { agentKind: AgentKind; model: string | null },
 ) {
   if (!text.trim() && images.length === 0) return;
-  pendingWorktreePrompts.set(threadId, { text, images, workflowId: workflowId ?? null });
+  pendingWorktreePrompts.set(threadId, { text, images, workflowId: workflowId ?? null, followFrom });
   // create_thread 可能直接复用已就绪的 worktree，或后台 ready 事件可能先于 invoke 返回。
   // 主动核对持久化状态，避免首条提示词永远留在暂存 Map。
   void api

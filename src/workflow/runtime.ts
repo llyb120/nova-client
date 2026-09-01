@@ -178,13 +178,16 @@ async function createStageThread(
 ): Promise<void> {
   const h = requireHost();
   const root = await api.getThread(run.rootId);
-  // 节点可覆盖后端/模型：未配置时跟随启动会话；配置了后端但未配模型时用该后端默认模型。
-  const stageAgentKind = stage.agentKind ?? root.agentKind;
+  // 节点可覆盖后端/模型：「跟随会话」跟随启动工作流时用户选择的会话（首节点覆盖前的锚点），
+  // 而不是上一个节点/首节点的会话；配置了后端但未配模型时用该后端默认模型。
+  const followAgentKind = (run.followAgentKind as AgentKind | undefined) ?? root.agentKind;
+  const followModel = run.followModel !== undefined ? run.followModel : (root.model ?? null);
+  const stageAgentKind = stage.agentKind ?? followAgentKind;
   const stageModel = stage.model?.trim()
     ? stage.model
     : stage.agentKind
       ? null
-      : (root.model ?? null);
+      : followModel;
   const thread = await api.createThread(
     root.cwd,
     stageAgentKind,
@@ -389,6 +392,9 @@ export function startWorkflow(
   rootId: string,
   /** 首节点附件：会话输入即首节点输入，图片随首阶段提示词一起发送。 */
   images: PromptImage[] = [],
+  /** 「跟随会话」锚点：启动工作流时用户选择的会话后端/模型。新会话页创建会话时若已用首节点
+   *  配置覆盖，由调用方把用户原始选择传入；缺省时用 root 会话在首节点覆盖前的值。 */
+  followFrom?: { agentKind: AgentKind; model: string | null },
 ): Promise<void> {
   const h = requireHost();
   const def = getWorkflow(workflowId);
@@ -422,6 +428,9 @@ export function startWorkflow(
     if (h.isRunning(rootId)) throw new Error("请等待当前会话结束后再启动工作流");
 
     await applyStageConfig(rootId, entry);
+    // 「跟随会话」锚点：优先用调用方传入的用户原始选择，否则用首节点覆盖前（第 417 行读取）的 root 值。
+    const followAgentKind = followFrom?.agentKind ?? root.agentKind;
+    const followModel = followFrom ? followFrom.model : (root.model ?? null);
     // 自定义环境变量作为 {{xx}} 替换的兜底来源：流程变量（goal 等）优先，
     // 未在流程变量中出现的模板键回落到设置里配置的环境变量。
     let mergedVars = vars;
@@ -438,6 +447,8 @@ export function startWorkflow(
       stageCount: 1,
       attempts: { [entry.id]: 1 },
       vars: mergedVars,
+      followAgentKind,
+      followModel,
     };
     activeRuns.set(rootId, run);
     runHistory.set(rootId, run);

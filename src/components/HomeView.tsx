@@ -663,7 +663,10 @@ export function HomeView() {
           clue?.id ?? "",
         );
         if (clue) clearPendingClueCard();
-        stashWorktreePrompt(id, prompt, images, workflow?.id ?? null);
+        stashWorktreePrompt(id, prompt, images, workflow?.id ?? null, {
+          agentKind: agentKind(),
+          model: model() || null,
+        });
       } else {
         const ephemeral = opts.ephemeral ?? false;
         const workflowId = workflow?.id ?? null;
@@ -690,7 +693,11 @@ export function HomeView() {
           );
           if (!ephemeral) lastUsed.setModel(entryAgentKind, entryModel);
           if (clue) clearPendingClueCard();
-          await sendPrompt(prompt, images, workflowId);
+          // 「跟随会话」节点跟随用户在新会话页选择的后端/模型，而非被首节点覆盖后的值。
+          await sendPrompt(prompt, images, workflowId, {
+            agentKind: agentKind(),
+            model: model() || null,
+          });
         } else {
           // 乐观进入聊天页：消息立即上屏，后台建会话并补发，失败回退。
           if (!ephemeral) lastUsed.setModel(agentKind(), model());
