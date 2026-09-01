@@ -1885,7 +1885,7 @@ fn create_stage_thread(
     stage_index: usize,
     inherit_source_model: bool,
 ) -> Result<Thread, String> {
-    let (cwd, source_id, source_agent_kind, source_model) = {
+    let (cwd, source_id, source_agent_kind, source_model, source_worktree) = {
         let store = state.store.lock().unwrap();
         let source = store.get(&source_thread_id).ok_or("源会话不存在")?;
         (
@@ -1893,6 +1893,7 @@ fn create_stage_thread(
             source.id.clone(),
             source.agent_kind.clone(),
             source.model.clone(),
+            source.worktree.clone(),
         )
     };
     let (agent_kind, model) = if inherit_source_model {
@@ -1919,6 +1920,9 @@ fn create_stage_thread(
         return Err(format!("Stage 模型后端 {} 已关闭", agent_kind.label()));
     }
     let mut thread = Thread::new(cwd, agent_kind, model, Some("build".into()), None, false);
+    // 源会话在 worktree 中执行时，新会话沿用同一 worktree（cwd 已指向其工作目录），
+    // 补齐标注以便前端显示分支标记并正确归属 worktree 分组。
+    thread.worktree = source_worktree;
     thread.parent_thread_id = Some(source_id.clone());
     thread.stage_source_thread_id = Some(source_id);
     thread.title = "[Stage] 新会话".into();
@@ -5018,6 +5022,7 @@ fn respond_roam_request(
     worktree: Option<bool>,
     worktree_branch: Option<String>,
     worktree_base: Option<String>,
+    duration_minutes: Option<u64>,
 ) -> Result<(), String> {
     state.relay.respond_roam_request(
         &req_id,
@@ -5029,6 +5034,7 @@ fn respond_roam_request(
         worktree,
         worktree_branch,
         worktree_base,
+        duration_minutes,
     )
 }
 
