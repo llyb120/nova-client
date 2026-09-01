@@ -186,6 +186,21 @@ fn publishes_model_options(launch_env: &HashMap<String, String>) -> bool {
     !launch_env.contains_key("NOVA_QUOTA_BORROWED")
 }
 
+/// 把 codebuddy 上报的当前模型并入可选列表（置顶，若原本不在列表里）。
+/// 应对云端清单异步就绪导致的「当前模型不在可选清单」残缺快照。
+fn merge_current_model_option(options: Vec<Value>, current: &str) -> Vec<Value> {
+    if current.is_empty()
+        || options
+            .iter()
+            .any(|o| o.get("value").and_then(Value::as_str) == Some(current))
+    {
+        return options;
+    }
+    let mut merged = vec![json!({ "value": current, "name": current })];
+    merged.extend(options);
+    merged
+}
+
 fn http_rpc_error(id: u64, message: String) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -2451,13 +2466,17 @@ impl AcpManager {
                     Some(opt)
                 })
                 .collect();
-            if options.is_empty() {
-                return Value::Null;
-            }
             let current = models
                 .get("currentModelId")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            if options.is_empty() && current.is_empty() {
+                return Value::Null;
+            }
+            // CodeBuddy 云端模型清单异步就绪：session/new 若在就绪前返回，availableModels 会缺
+            // 云端动态模型（如 hy4-preview），但 currentModelId 已是它。把当前模型并入列表（置顶），
+            // 否则选择器里看不到、用户一选会话就被解析回列表第一项。
+            let options = merge_current_model_option(options, current);
             json!([{ "id": "model", "name": "Model", "currentValue": current, "options": options }])
         }
 
@@ -4130,8 +4149,8 @@ mod codebuddy_http_tests {
     use super::{
         codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
         extract_codebuddy_endpoint, json_rpc_request_id, lru_evict_keys,
-        merge_codebuddy_activation_env, publishes_model_options, replace_model_config_option,
-        thread_connection_key, AcpManager, SseDecoder,
+        merge_codebuddy_activation_env, merge_current_model_option, publishes_model_options,
+        replace_model_config_option, thread_connection_key, AcpManager, SseDecoder,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -4163,6 +4182,26 @@ mod codebuddy_http_tests {
             lru_evict_keys([(1, "thread:a")].into_iter(), "thread:b", 0),
             ["thread:a"]
         );
+    }
+
+    #[test]
+    fn merge_current_model_option_pins_unlisted_current_model() {
+        // 当前模型不在清单里：并入并置顶，且不影响其它项
+        let merged = merge_current_model_option(
+            vec![json!({ "value": "hy3", "name": "Hy3" })],
+            "hy4-preview",
+        );
+        assert_eq!(merged[0]["value"], "hy4-preview");
+        assert_eq!(merged[1]["value"], "hy3");
+        // 已在清单里：不重复添加
+        let existing = merge_current_model_option(
+            vec![json!({ "value": "hy4-preview", "name": "Hy4" })],
+            "hy4-preview",
+        );
+        assert_eq!(existing.len(), 1);
+        // 空当前模型：原样返回
+        let passthrough = merge_current_model_option(vec![json!({ "value": "hy3" })], "");
+        assert_eq!(passthrough.len(), 1);
     }
 
     #[test]
