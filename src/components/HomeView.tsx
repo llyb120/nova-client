@@ -649,11 +649,12 @@ export function HomeView() {
         // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词。
         // 先校验 /fire，避免建完 worktree 才因语法错误失败。
         assertBuiltinPrompt(t, images);
+        const entry = workflow?.stages.find((stage) => stage.id === workflow.entry);
         const id = await createThread(
           cwd(),
-          agentKind(),
-          model(),
-          mode(),
+          entry?.agentKind ?? agentKind(),
+          entry?.agentKind ? (entry.model?.trim() || "") : (entry?.model?.trim() || model()),
+          entry?.mode ?? mode(),
           "",
           opts.ephemeral ?? false,
           true,
@@ -668,11 +669,18 @@ export function HomeView() {
         const workflowId = workflow?.id ?? null;
         if (workflowId) {
           // 工作流：会话需先建好再启动工作流，沿用同步创建，不乐观跳转。
+          // 首节点配置了后端/模型时直接以其创建会话，避免创建后再 setThreadModel
+          // 时首轮仍命中按旧模型预热的 bridge（Cursor 等 keeps_bridge_alive 后端）。
+          const entry = workflow?.stages.find((stage) => stage.id === workflow.entry);
+          const entryAgentKind = entry?.agentKind ?? agentKind();
+          const entryModel = entry?.agentKind
+            ? (entry.model?.trim() || "")
+            : (entry?.model?.trim() || model());
           await createThread(
             cwd(),
-            agentKind(),
-            model(),
-            mode(),
+            entryAgentKind,
+            entryModel,
+            entry?.mode ?? mode(),
             "",
             ephemeral,
             false,
@@ -680,7 +688,7 @@ export function HomeView() {
             "",
             clue?.id ?? "",
           );
-          if (!ephemeral) lastUsed.setModel(agentKind(), model());
+          if (!ephemeral) lastUsed.setModel(entryAgentKind, entryModel);
           if (clue) clearPendingClueCard();
           await sendPrompt(prompt, images, workflowId);
         } else {
