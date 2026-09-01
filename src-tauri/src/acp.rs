@@ -75,8 +75,6 @@ struct CodeBuddyPrewarm {
     child: Child,
     endpoint_rx: oneshot::Receiver<Result<String, String>>,
     log_tasks: Vec<JoinHandle<()>>,
-    /// 云端 product config 就绪标志（预热进程 standby 不拉配置，激活后才拉取）。
-    config_ready: Arc<AtomicBool>,
 }
 
 impl CodeBuddyPrewarm {
@@ -1394,11 +1392,8 @@ impl AcpManager {
         // 日志与就绪检测分离：stdout 一旦被 BufReader 持有就会一直读，不能同时再被
         // 另一个任务持有；因此把「endpoint 行已见」经 oneshot 上报后就绪，日志照常走 push_log。
         let (endpoint_tx, endpoint_rx) = oneshot::channel::<Result<String, String>>();
-        // 云端 product config 就绪标志：stdout 出现 "Fetched configuration from remote" 置位。
-        let config_ready = Arc::new(AtomicBool::new(false));
         let stdout_task = {
             let mgr = self.clone();
-            let config_ready = config_ready.clone();
             tokio::spawn(async move {
                 let mut tx = Some(endpoint_tx);
                 let mut lines = BufReader::new(stdout).lines();
@@ -1413,9 +1408,6 @@ impl AcpManager {
                                         let _ = tx.send(Ok(ep));
                                     }
                                 }
-                            }
-                            if trimmed.contains("Fetched configuration from remote") {
-                                config_ready.store(true, Ordering::SeqCst);
                             }
                             mgr.push_log(format!("[codebuddy] {trimmed}"));
                         }
@@ -1459,14 +1451,8 @@ impl AcpManager {
             }
         };
 
-        self.finish_codebuddy_http_conn(
-            conn_key,
-            endpoint,
-            child,
-            vec![stdout_task, stderr_task],
-            config_ready,
-        )
-        .await
+        self.finish_codebuddy_http_conn(conn_key, endpoint, child, vec![stdout_task, stderr_task])
+            .await
     }
 
     async fn activate_codebuddy_prewarm(
@@ -1577,35 +1563,8 @@ impl AcpManager {
             }
         };
         self.push_log(format!("[nova] CodeBuddy 已消费预热进程 {id}：{endpoint}"));
-        self.finish_codebuddy_http_conn(
-            conn_key,
-            endpoint,
-            prewarm.child,
-            prewarm.log_tasks,
-            prewarm.config_ready,
-        )
-        .await
-    }
-
-    /// 连接建立后等 CodeBuddy 云端 product config 就绪再返回连接。
-    /// CodeBuddy 进程先用本地打包清单解析模型（无 hy4 等新模型），云端清单异步晚到 ~1-2s；
-    /// 在此之前进入推理会把可用模型解析成默认（hy3）。stdout 出现
-    /// "Fetched configuration from remote" 表示云端清单已生效。超时仅放行，不退化行为。
-    async fn wait_codebuddy_cloud_config(&self, config_ready: &Arc<AtomicBool>, conn_key: &str) {
-        // 实测云端拉取 237-1026ms；8s 为保守上限，离线/缓存命中不打日志时超时兜底。
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-        while !config_ready.load(Ordering::SeqCst) {
-            if tokio::time::Instant::now() >= deadline {
-                self.push_log(format!(
-                    "[nova] CodeBuddy 云端模型清单等待超时（key={conn_key}），按当前清单继续"
-                ));
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-        self.push_log(format!(
-            "[nova] CodeBuddy 云端模型清单已就绪（key={conn_key}）"
-        ));
+        self.finish_codebuddy_http_conn(conn_key, endpoint, prewarm.child, prewarm.log_tasks)
+            .await
     }
 
     async fn finish_codebuddy_http_conn(
@@ -1614,7 +1573,6 @@ impl AcpManager {
         endpoint: String,
         child: Child,
         log_tasks: Vec<JoinHandle<()>>,
-        config_ready: Arc<AtomicBool>,
     ) -> Result<Arc<AcpConn>, String> {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -1759,8 +1717,6 @@ impl AcpManager {
                     json!({ "connected": true, "agent": result.get("agentInfo").cloned() }),
                 );
                 self.push_log(format!("[nova] CodeBuddy HTTP 服务已连接：{endpoint}"));
-                // 等云端模型清单就绪，避免 hy4-preview 等新模型在旧清单窗口内被解析成默认。
-                self.wait_codebuddy_cloud_config(&config_ready, conn_key).await;
                 Ok(conn)
             }
             Err(e) => {
@@ -2639,10 +2595,8 @@ impl AcpManager {
             .take()
             .ok_or("无法获取 CodeBuddy 预热 stderr")?;
         let (endpoint_tx, endpoint_rx) = oneshot::channel();
-        let config_ready = Arc::new(AtomicBool::new(false));
         let stdout_task = {
             let mgr = self.clone();
-            let config_ready = config_ready.clone();
             tokio::spawn(async move {
                 let mut endpoint_tx = Some(endpoint_tx);
                 let mut lines = BufReader::new(stdout).lines();
@@ -2652,9 +2606,6 @@ impl AcpManager {
                         if let Some(tx) = endpoint_tx.take() {
                             let _ = tx.send(Ok(endpoint));
                         }
-                    }
-                    if trimmed.contains("Fetched configuration from remote") {
-                        config_ready.store(true, Ordering::SeqCst);
                     }
                     mgr.push_log(format!("[codebuddy-prewarm] {trimmed}"));
                 }
@@ -2695,7 +2646,6 @@ impl AcpManager {
                     child,
                     endpoint_rx,
                     log_tasks: vec![stdout_task, stderr_task],
-                    config_ready,
                 });
             }
             if child.try_wait().ok().flatten().is_some() {
