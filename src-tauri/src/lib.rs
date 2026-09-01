@@ -1621,7 +1621,8 @@ pub fn create_worktree_for(
     if !gitwt::is_repo(dir) {
         return Err(format!("不是 git 仓库，无法创建 worktree：{dir}"));
     }
-    let repo = gitwt::repo_root(dir)?;
+    // worktree 操作统一从主工作区发起；若 dir 本身是目标链接 worktree，后续复用逻辑会直接采用它。
+    let repo = gitwt::project_root(dir)?;
     let branch = branch.map(|s| s.trim()).unwrap_or("").to_string();
     // 基于哪个分支/提交创建（空 = 当前 HEAD，仅新建分支时允许为空）
     let base_branch = base_branch.map(|s| s.trim()).unwrap_or("").to_string();
@@ -1718,7 +1719,8 @@ async fn create_thread(
         if !gitwt::is_repo(&cwd) {
             return Err(format!("不是 git 仓库，无法创建 worktree：{cwd}"));
         }
-        let repo = gitwt::repo_root(&cwd)?;
+        // worktree 操作统一从主工作区发起；若 cwd 本身是目标链接 worktree，直接复用而不重复检出。
+        let repo = gitwt::project_root(&cwd)?;
         let branch = worktree_branch
             .as_deref()
             .map(|s| s.trim())
@@ -1883,7 +1885,7 @@ fn create_stage_thread(
     stage_index: usize,
     inherit_source_model: bool,
 ) -> Result<Thread, String> {
-    let (cwd, source_id, source_agent_kind, source_model) = {
+    let (cwd, source_id, source_agent_kind, source_model, source_worktree) = {
         let store = state.store.lock().unwrap();
         let source = store.get(&source_thread_id).ok_or("源会话不存在")?;
         (
@@ -1891,6 +1893,7 @@ fn create_stage_thread(
             source.id.clone(),
             source.agent_kind.clone(),
             source.model.clone(),
+            source.worktree.clone(),
         )
     };
     let (agent_kind, model) = if inherit_source_model {
@@ -1917,6 +1920,9 @@ fn create_stage_thread(
         return Err(format!("Stage 模型后端 {} 已关闭", agent_kind.label()));
     }
     let mut thread = Thread::new(cwd, agent_kind, model, Some("build".into()), None, false);
+    // 源会话在 worktree 中执行时，新会话沿用同一 worktree（cwd 已指向其工作目录），
+    // 补齐标注以便前端显示分支标记并正确归属 worktree 分组。
+    thread.worktree = source_worktree;
     thread.parent_thread_id = Some(source_id.clone());
     thread.stage_source_thread_id = Some(source_id);
     thread.title = "[Stage] 新会话".into();
@@ -4260,6 +4266,9 @@ async fn apply_runtime_settings(
         recheck_availability,
     ) = {
         let mut s = state.settings.lock().unwrap();
+        // 自定义环境变量：先应用（新启动的 agent 子进程继承），再做后续比较。
+        settings.apply_custom_env_vars(&s.custom_env_vars);
+        let custom_env_changed = s.custom_env_vars != settings.custom_env_vars;
         let context_runtime_changed = s.context_retrieval_mode != settings.context_retrieval_mode;
 
         let auto_change_project_changed =
@@ -4273,6 +4282,7 @@ async fn apply_runtime_settings(
             || context_runtime_changed
             || experience_tools_changed
             || auto_change_project_changed
+            || custom_env_changed
             || s.lyra_proxy != settings.lyra_proxy
             || s.lyra_enabled != settings.lyra_enabled;
         let restart_devin = restart_all_agents
@@ -5016,6 +5026,7 @@ fn respond_roam_request(
     worktree: Option<bool>,
     worktree_branch: Option<String>,
     worktree_base: Option<String>,
+    duration_minutes: Option<u64>,
 ) -> Result<(), String> {
     state.relay.respond_roam_request(
         &req_id,
@@ -5027,6 +5038,7 @@ fn respond_roam_request(
         worktree,
         worktree_branch,
         worktree_base,
+        duration_minutes,
     )
 }
 

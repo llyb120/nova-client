@@ -93,8 +93,6 @@ struct PendingRoam {
     images: Vec<PromptImage>,
 }
 
-const ROAM_AUTHORIZATION_DURATION: Duration = Duration::from_secs(30 * 60);
-
 struct PendingQuotaClient {
     peer: String,
     agent_kind: AgentKind,
@@ -3013,6 +3011,7 @@ impl RelayManager {
         worktree: Option<bool>,
         worktree_branch: Option<String>,
         worktree_base: Option<String>,
+        duration_minutes: Option<u64>,
     ) -> Result<(), String> {
         let mut pending = self
             .incoming_roams
@@ -3039,12 +3038,14 @@ impl RelayManager {
         pending.prompt = prompt
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        // 授权方可在审批时选择有效期（分钟），默认 1 小时。
+        let duration = Duration::from_secs(duration_minutes.unwrap_or(60).saturating_mul(60));
         if let Some(host_thread_id) = pending.host_thread_id.clone() {
             let Some(text) = pending.prompt else {
                 return Err("提示词不能为空".into());
             };
             if let Some(guest) = self.hosted.lock().unwrap().get_mut(&host_thread_id) {
-                guest.approved_until = Instant::now() + ROAM_AUTHORIZATION_DURATION;
+                guest.approved_until = Instant::now() + duration;
             } else {
                 return Err("漫游会话已失效".into());
             }
@@ -3061,12 +3062,12 @@ impl RelayManager {
         pending.worktree_base = worktree_base.filter(|value| !value.trim().is_empty());
         let this = Arc::clone(self);
         let req_id = req_id.to_string();
-        std::thread::spawn(move || this.finish_roam_accept(req_id, pending));
+        std::thread::spawn(move || this.finish_roam_accept(req_id, pending, duration));
         Ok(())
     }
 
     /// host 侧：后台完成漫游会话创建（含 worktree），成败都回 roaming.created。
-    fn finish_roam_accept(self: &Arc<Self>, req_id: String, pending: PendingRoam) {
+    fn finish_roam_accept(self: &Arc<Self>, req_id: String, pending: PendingRoam, duration: Duration) {
         // 请求等待确认期间用户可能撤销目录授权，最终落地前必须再次校验。
         if !self.roaming_folder_allowed(&pending.folder) {
             self.spawn_send_now(
@@ -3131,7 +3132,7 @@ impl RelayManager {
             RoamGuest {
                 token: pending.from.clone(),
                 guest_thread_id: pending.guest_thread_id.clone(),
-                approved_until: Instant::now() + ROAM_AUTHORIZATION_DURATION,
+                approved_until: Instant::now() + duration,
             },
         );
         let _ = self.app.emit(EV_THREADS, json!({}));

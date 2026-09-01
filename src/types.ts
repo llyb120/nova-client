@@ -508,6 +508,8 @@ export interface Settings {
   experienceTrainingIntervalMinutes: number;
   experienceEvolutionIntervalMinutes: number;
   experienceExperts: ExperienceExpertConfig[];
+  /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程并供工作流 {{xx}} 替换。 */
+  customEnvVars: Record<string, string>;
 }
 
 export interface ExperienceEntry {

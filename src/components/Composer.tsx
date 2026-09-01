@@ -282,15 +282,19 @@ export function Composer() {
   });
 
   // 打开已有会话时，把后端保存的用户输入并入全局历史，供新会话页使用。
-  createEffect(() => {
-    const currentId = state.currentId;
-    if (!currentId) return;
-    for (const item of state.items) {
-      if (item.type === "user") {
-        rememberPromptHistory(item.text, item.images ?? [], item.ts, `${currentId}:item:${item.id}`);
+  createEffect(on(
+    () => [state.currentId, state.loadingThread] as const,
+    ([currentId, loadingThread]) => {
+      // 缓存未命中时 currentId 会先于快照切换；等快照提交后只扫描一次，
+      // 不再让每个流式 item 追加都全量遍历越来越长的 transcript。
+      if (!currentId || loadingThread) return;
+      for (const item of state.items) {
+        if (item.type === "user") {
+          rememberPromptHistory(item.text, item.images ?? [], item.ts, `${currentId}:item:${item.id}`);
+        }
       }
-    }
-  });
+    },
+  ));
 
   createEffect(() => {
     activeSlashIndex();

@@ -100,6 +100,13 @@ pub fn backend_skill_roots() -> Vec<PathBuf> {
     if let Some(home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
         roots.push(home.join("skills"));
     }
+    // CodeBuddy 的用户级 skills 目录在其配置根下（默认 ~/.codebuddy，可被 CODEBUDDY_CONFIG_DIR 覆盖）。
+    if let Some(root) = std::env::var_os("CODEBUDDY_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| user_home_dir().map(|home| home.join(".codebuddy")))
+    {
+        roots.push(root.join("skills"));
+    }
     if let Some(home) = user_home_dir() {
         roots.push(home.join(".nova").join("alkaid").join("skills"));
         roots.push(home.join(".codex").join("skills"));

@@ -132,6 +132,15 @@ mod tests {
     }
 
     #[test]
+    fn preserves_utf8_split_across_chunks() {
+        let source = "data: 懒加载\n\n".as_bytes();
+        let split = "data: ".len() + 1;
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.push(&source[..split]).unwrap().is_empty());
+        assert_eq!(decoder.push(&source[split..]).unwrap(), vec!["懒加载"]);
+    }
+
+    #[test]
     fn decodes_per_event_gzip_envelope() {
         let source = serde_json::json!({"op": "event", "text": "x".repeat(4096)});
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());

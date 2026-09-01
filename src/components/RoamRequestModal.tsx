@@ -19,6 +19,7 @@ export function RoamRequestModal() {
   const [worktree, setWorktree] = createSignal(false);
   const [worktreeBranch, setWorktreeBranch] = createSignal("");
   const [worktreeBase, setWorktreeBase] = createSignal("");
+  const [durationMinutes, setDurationMinutes] = createSignal(60);
   const [branches, setBranches] = createSignal<BranchList | null>(null);
 
   createEffect(() => {
@@ -31,6 +32,7 @@ export function RoamRequestModal() {
     setWorktree(req.worktree ?? false);
     setWorktreeBranch(req.worktreeBranch ?? "");
     setWorktreeBase(req.worktreeBase ?? "");
+    setDurationMinutes(60);
     setBranches(null);
     if (!req.continuation && req.folderExists !== false) {
       void api.listBranches(req.folder).then((list) => {
@@ -61,6 +63,7 @@ export function RoamRequestModal() {
         worktree: worktree(),
         worktreeBranch: worktreeBranch(),
         worktreeBase: worktreeBase(),
+        durationMinutes: durationMinutes(),
       });
     } catch (e) {
       await message(String(e), { kind: "error" });
@@ -104,6 +107,19 @@ export function RoamRequestModal() {
                   value={prompt()}
                   onInput={(e) => setPrompt(e.currentTarget.value)}
                 />
+              </label>
+              <label class="field">
+                <span class="field-label">授权时长</span>
+                <select
+                  class="field-input"
+                  value={durationMinutes()}
+                  onChange={(e) => setDurationMinutes(Number(e.currentTarget.value))}
+                >
+                  <option value={30}>30 分钟</option>
+                  <option value={60}>1 小时</option>
+                  <option value={240}>4 小时</option>
+                  <option value={1440}>24 小时</option>
+                </select>
               </label>
               <Show when={req().folderExists === false}>
                 <p class="roam-req-warn">
@@ -150,8 +166,8 @@ export function RoamRequestModal() {
               </Show>
               <p class="field-hint">
                 {req().continuation
-                  ? "上次授权已超过 30 分钟。同意后将续期 30 分钟并执行上方提示词。"
-                  : "同意后对方可在该目录驱动会话、读写文件并执行命令，授权有效期为 30 分钟。"}
+                  ? "上次授权已过期。同意后将按所选时长续期并执行上方提示词。"
+                  : `同意后对方可在该目录驱动会话、读写文件并执行命令，授权有效期为 ${durationMinutes() >= 60 ? `${durationMinutes() / 60} 小时` : `${durationMinutes()} 分钟`}。`}
               </p>
             </div>
             <div class="modal-foot">

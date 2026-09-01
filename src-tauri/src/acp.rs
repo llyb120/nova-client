@@ -12,9 +12,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
-use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Duration};
-use tokio_stream::StreamExt;
 
 pub const EV_UPDATE: &str = "acp:update";
 pub const EV_TURN: &str = "acp:turn";
@@ -39,6 +37,7 @@ fn acp_supports_browser_debug(kind: &AgentKind) -> bool {
 
 /// 模型探测、命令探测和标题生成共用的辅助连接。
 const SHARED_KEY: &str = "__shared__";
+const CODEBUDDY_ACP_ARGS: [&str; 3] = ["--acp", "--acp-transport", "stdio"];
 
 pub struct PendingPermission {
     pub rpc_id: Value,
@@ -68,18 +67,15 @@ struct TitleJob {
     output: String,
 }
 
-/// CodeBuddy 官方 one-shot 预热进程；激活后句柄和日志任务转交给 AcpConn。
+/// CodeBuddy 官方 one-shot 预热进程；激活后句柄直接转为 ACP stdio 连接。
 struct CodeBuddyPrewarm {
     id: String,
     cwd: String,
     child: Child,
-    endpoint_rx: oneshot::Receiver<Result<String, String>>,
-    log_tasks: Vec<JoinHandle<()>>,
 }
 
 impl CodeBuddyPrewarm {
     fn kill(mut self) {
-        self.log_tasks.drain(..).for_each(|task| task.abort());
         if let Some(pid) = self.child.id() {
             kill_process_tree(pid);
         }
@@ -87,81 +83,14 @@ impl CodeBuddyPrewarm {
     }
 }
 
-/// ACP 连接的出站传输：Devin 走 stdio 行协议；CodeBuddy 走官方 Streamable HTTP。
-/// 每个 POST 自己返回该请求的 SSE 响应流，独立 GET SSE 只接收异步通知。
 enum AcpTransport {
     Stdio(mpsc::UnboundedSender<String>),
-    Http {
-        client: reqwest::Client,
-        url: String,
-        connection_id: String,
-        session_token: String,
-        inbound: mpsc::UnboundedSender<String>,
-    },
 }
 
-#[derive(Default)]
-struct SseDecoder {
-    buffer: Vec<u8>,
-    data_lines: Vec<String>,
-}
-
-impl SseDecoder {
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buffer.extend_from_slice(chunk);
-        self.drain_lines(false)
-    }
-
-    fn finish(&mut self) -> Vec<String> {
-        self.drain_lines(true)
-    }
-
-    fn drain_lines(&mut self, finish: bool) -> Vec<String> {
-        let mut payloads = Vec::new();
-        while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.buffer.drain(..=pos).collect();
-            self.accept_line(&line, &mut payloads);
-        }
-        if finish {
-            if !self.buffer.is_empty() {
-                let line = std::mem::take(&mut self.buffer);
-                self.accept_line(&line, &mut payloads);
-            }
-            self.emit_payload(&mut payloads);
-        }
-        payloads
-    }
-
-    fn accept_line(&mut self, line: &[u8], payloads: &mut Vec<String>) {
-        let line = String::from_utf8_lossy(line);
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            self.emit_payload(payloads);
-        } else if let Some(data) = line.strip_prefix("data:") {
-            self.data_lines
-                .push(data.strip_prefix(' ').unwrap_or(data).to_string());
-        }
-    }
-
-    fn emit_payload(&mut self, payloads: &mut Vec<String>) {
-        if !self.data_lines.is_empty() {
-            payloads.push(self.data_lines.join("\n"));
-            self.data_lines.clear();
-        }
-    }
-}
-
-fn json_rpc_request_id(message: &Value) -> Option<u64> {
-    message
-        .get("method")
-        .and_then(|_| message.get("id"))
-        .and_then(Value::as_u64)
-}
-
-/// CodeBuddy 同时返回标准 `models` 和旧扩展 `configOptions`；标准字段会随账号权限
-/// 实时更新，而扩展模型项可能仍是启动缓存。仅替换模型项，保留 mode 等其它扩展项。
-fn replace_model_config_option(config_options: Value, model_config_options: Value) -> Value {
-    let Some(model) = model_config_options
+/// CodeBuddy 同时返回标准 `models` 和旧扩展 `configOptions`；两边的动态模型可能
+/// 各自不完整。以标准字段的当前模型和元数据为准，并补入扩展字段中独有的模型。
+fn merge_model_config_option(config_options: Value, model_config_options: Value) -> Value {
+    let Some(mut model) = model_config_options
         .as_array()
         .and_then(|options| options.first())
         .cloned()
@@ -173,6 +102,31 @@ fn replace_model_config_option(config_options: Value, model_config_options: Valu
         .iter_mut()
         .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
     {
+        if let (Some(standard), Some(extension)) = (
+            model.get_mut("options").and_then(Value::as_array_mut),
+            existing.get("options").and_then(Value::as_array),
+        ) {
+            let mut seen: HashSet<String> = standard
+                .iter()
+                .filter_map(|option| {
+                    option
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+            standard.extend(
+                extension
+                    .iter()
+                    .filter(|option| {
+                        option
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| seen.insert(value.to_owned()))
+                    })
+                    .cloned(),
+            );
+        }
         *existing = model;
     } else {
         options.push(model);
@@ -184,13 +138,19 @@ fn publishes_model_options(launch_env: &HashMap<String, String>) -> bool {
     !launch_env.contains_key("NOVA_QUOTA_BORROWED")
 }
 
-fn http_rpc_error(id: u64, message: String) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": { "code": -32000, "message": message }
-    })
-    .to_string()
+/// 把 codebuddy 上报的当前模型并入可选列表（置顶，若原本不在列表里）。
+/// 应对云端清单异步就绪导致的「当前模型不在可选清单」残缺快照。
+fn merge_current_model_option(options: Vec<Value>, current: &str) -> Vec<Value> {
+    if current.is_empty()
+        || options
+            .iter()
+            .any(|o| o.get("value").and_then(Value::as_str) == Some(current))
+    {
+        return options;
+    }
+    let mut merged = vec![json!({ "value": current, "name": current })];
+    merged.extend(options);
+    merged
 }
 
 pub struct AcpConn {
@@ -203,8 +163,6 @@ pub struct AcpConn {
     next_id: AtomicU64,
     pub alive: AtomicBool,
     child: StdMutex<Option<Child>>,
-    /// HTTP 传输的 stdout/stderr 日志任务；kill 时中止，保证 on_conn_closed 能即时触发。
-    log_tasks: StdMutex<Vec<JoinHandle<()>>>,
     /// 热连接 LRU 的最近使用戳（单调计数，越大越新）。回收按它挑最旧的非运行中线程连接。
     last_used: AtomicU64,
 }
@@ -215,88 +173,6 @@ impl AcpConn {
             AcpTransport::Stdio(tx) => tx
                 .send(msg.to_string())
                 .map_err(|_| format!("{} 进程不可写（已退出？）", self.label)),
-            AcpTransport::Http {
-                client,
-                url,
-                connection_id,
-                session_token,
-                inbound,
-            } => {
-                // CodeBuddy 使用 Streamable HTTP：请求结果不走独立 GET，而在本次 POST
-                // 的 text/event-stream 响应里返回。Accept 必须同时声明两种类型，否则
-                // 服务端会返回 406。POST 可能覆盖整个 prompt 生命周期，不能设置总超时。
-                // JSON-RPC 响应也有 id，但它是对服务端请求的回答，不会再收到响应。
-                // 只跟踪同时含 method + id 的客户端请求，避免把权限答复误配给 pending。
-                let request_id = json_rpc_request_id(&msg);
-                let req = client
-                    .post(url)
-                    .header("X-CodeBuddy-Request", "1")
-                    .header("acp-connection-id", connection_id)
-                    .header("acp-session-token", session_token)
-                    .header("Accept", "application/json, text/event-stream")
-                    .json(&msg);
-                let inbound = inbound.clone();
-                tauri::async_runtime::spawn(async move {
-                    let result = async {
-                        let response = req
-                            .send()
-                            .await
-                            .map_err(|e| format!("CodeBuddy ACP POST 失败：{e}"))?;
-                        let status = response.status();
-                        if !status.is_success() {
-                            let body = timeout(Duration::from_secs(5), response.text())
-                                .await
-                                .ok()
-                                .and_then(Result::ok)
-                                .unwrap_or_default();
-                            return Err(format!(
-                                "CodeBuddy ACP POST HTTP {status}: {}",
-                                body.chars().take(500).collect::<String>()
-                            ));
-                        }
-
-                        let mut stream = response.bytes_stream();
-                        let mut decoder = SseDecoder::default();
-                        let mut received_response = request_id.is_none();
-                        while let Some(chunk) = stream.next().await {
-                            let chunk = chunk
-                                .map_err(|e| format!("读取 CodeBuddy ACP POST 响应失败：{e}"))?;
-                            for payload in decoder.push(&chunk) {
-                                if request_id.is_some_and(|id| {
-                                    serde_json::from_str::<Value>(&payload)
-                                        .ok()
-                                        .and_then(|value| value.get("id").and_then(Value::as_u64))
-                                        == Some(id)
-                                }) {
-                                    received_response = true;
-                                }
-                                let _ = inbound.send(payload);
-                            }
-                        }
-                        for payload in decoder.finish() {
-                            if request_id.is_some_and(|id| {
-                                serde_json::from_str::<Value>(&payload)
-                                    .ok()
-                                    .and_then(|value| value.get("id").and_then(Value::as_u64))
-                                    == Some(id)
-                            }) {
-                                received_response = true;
-                            }
-                            let _ = inbound.send(payload);
-                        }
-                        if received_response {
-                            Ok(())
-                        } else {
-                            Err("CodeBuddy ACP POST 响应流未返回对应 JSON-RPC 结果".into())
-                        }
-                    }
-                    .await;
-                    if let (Err(error), Some(id)) = (result, request_id) {
-                        let _ = inbound.send(http_rpc_error(id, error));
-                    }
-                });
-                Ok(())
-            }
         }
     }
 
@@ -353,32 +229,6 @@ impl AcpConn {
 
     pub fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
-        // HTTP 传输：显式断连释放服务端 connection；进程句柄在下方统一回收。
-        if let AcpTransport::Http {
-            client,
-            url,
-            connection_id,
-            session_token,
-            ..
-        } = &self.transport
-        {
-            let req = client
-                .delete(url)
-                .header("X-CodeBuddy-Request", "1")
-                .header("acp-connection-id", connection_id)
-                .header("acp-session-token", session_token);
-            tauri::async_runtime::spawn(async move {
-                let _ = req.send().await;
-            });
-        }
-        // HTTP 传输：reader 任务结束于「连接关闭」语义，kill 时要显式中止日志任务，
-        // 否则 kill_process_tree 后任务被 AbortOnDrop 丢弃、conn 强引用随任务消失，
-        // 存活计数永不归零、断连状态不广播。
-        self.log_tasks
-            .lock()
-            .unwrap()
-            .drain(..)
-            .for_each(|t| t.abort());
         if let Some(mut child) = self.child.lock().unwrap().take() {
             // 先杀整棵进程树：ACP agent 常经 cmd 垫片启动（cmd→node），且 agent 执行工具调用时
             // 会 spawn shell（powershell/bash）。仅 start_kill 只终止直接子进程，node 与其拉起的
@@ -654,8 +504,7 @@ impl AcpManager {
         self.running_threads.lock().unwrap().contains(thread_id)
     }
 
-    /// 用户线程一线程一连接。CodeBuddy 官方预热契约也是「一进程一会话」；共享同一
-    /// Streamable HTTP connection 会让后发 session/prompt 中断前一个会话。
+    /// 用户线程一线程一连接。CodeBuddy 官方 ACP 与预热契约都是「一进程一会话」。
     fn conn_key_for_thread(&self, thread_id: &str) -> String {
         thread_connection_key(thread_id)
     }
@@ -686,7 +535,7 @@ impl AcpManager {
     /// 只是按键分裂：不同键各自的槽互不阻塞，可并发建连接/跑会话。
     ///
     /// 辅助探测调用会并发打到 SHARED 槽，所以槽内必须记录「建连中」状态让后来者排队复用，
-    /// 避免每个并发调用各自拉起一个 `codebuddy --serve` 常驻进程。
+    /// 避免每个并发调用各自拉起一个 CodeBuddy 常驻进程。
     fn slot(&self, key: &str) -> Arc<TokioMutex<Option<Arc<AcpConn>>>> {
         self.slots
             .lock()
@@ -700,7 +549,7 @@ impl AcpManager {
         self.slots.lock().unwrap().get(key).cloned()
     }
 
-    /// 单个 `codebuddy --serve` 进程常驻 200MB+，每个会话各持一条会随会话数线性堆内存，
+    /// 单个 CodeBuddy ACP 进程常驻 200MB+，每个会话各持一条会随会话数线性堆内存，
     /// 拖垮长时间运行后的切换。热连接按 LRU 封顶：CodeBuddy 一进程一会话、最吃内存，只留
     /// 最近 1 条；其余后端留 3 条。被回收线程下次发送时经 session/load 自动恢复上下文。
     /// 共享槽（探测/标题等辅助任务）不参与回收。
@@ -717,7 +566,7 @@ impl AcpManager {
     }
 
     /// 超出热连接上限时回收最旧的「非运行中」线程连接；正在跑轮的线程永不回收。
-    /// 只清槽并 kill 进程：路由/权限/回放等会话状态由 SSE reader 触发的 on_conn_closed 统一清理，
+    /// 只清槽并 kill 进程：路由/权限/回放等会话状态由 stdout reader 触发的 on_conn_closed 统一清理，
     /// 旧会话下次发送时走「routes 缺失 → session/load」的既有恢复路径。
     fn evict_lru_thread_conns(self: &Arc<Self>, keep_key: &str) {
         let cap = self.hot_thread_conn_cap();
@@ -1081,14 +930,13 @@ impl AcpManager {
         conn_key: &str,
         want_cwd: Option<&str>,
     ) -> Result<Arc<AcpConn>, String> {
-        // CodeBuddy 官方 HTTP 传输：`codebuddy --serve` 起本地 HTTP 服务，
-        // JSON-RPC 经 POST /api/v1/acp 下发、响应与事件经 SSE 订阅回收。
+        // CodeBuddy 走官方 ACP stdio；优先消费官方 one-shot prewarm，失败时冷启动。
         if self.kind == AgentKind::CodeBuddy {
             self.push_log(format!(
-                "[nova] CodeBuddy 正在启动 HTTP 传输（key={conn_key}）"
+                "[nova] CodeBuddy 正在启动 ACP stdio（key={conn_key}）"
             ));
             return self
-                .spawn_codebuddy_http_conn(settings, conn_key, want_cwd)
+                .spawn_codebuddy_stdio_conn(settings, conn_key, want_cwd)
                 .await;
         }
         // Devin 走自己的可执行文件与 acp_args。
@@ -1164,12 +1012,20 @@ impl AcpManager {
         // 把 ~/.nova/skills 用软链接/目录联接同步到各后端全局 skills 目录
         crate::skills::sync_skills_from_home();
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| format!("无法启动 {}（{program}）：{e}", self.kind.label()))?;
         // 兜底：挂进 KILL_ON_JOB_CLOSE 的 Job，Nova 无论如何退出都不会残留 agent 孤儿进程
         assign_to_agent_job(&child);
 
+        self.finish_stdio_conn(conn_key, child).await
+    }
+
+    async fn finish_stdio_conn(
+        self: &Arc<Self>,
+        conn_key: &str,
+        mut child: Child,
+    ) -> Result<Arc<AcpConn>, String> {
         let stdin = child.stdin.take().ok_or("无法获取 agent stdin")?;
         let stdout = child.stdout.take().ok_or("无法获取 agent stdout")?;
         let stderr = child.stderr.take().ok_or("无法获取 agent stderr")?;
@@ -1184,27 +1040,23 @@ impl AcpManager {
             next_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
             child: StdMutex::new(Some(child)),
-            log_tasks: StdMutex::new(Vec::new()),
             last_used: AtomicU64::new(0),
         });
         // 每创建一条连接 +1；对应的 stdout reader 结束时在 on_conn_closed 里 -1，恒定配对。
         self.alive_conns.fetch_add(1, Ordering::SeqCst);
 
-        // stdin writer
         tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(line) = stdin_rx.recv().await {
-                if stdin.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-                if stdin.write_all(b"\n").await.is_err() {
+                if stdin.write_all(line.as_bytes()).await.is_err()
+                    || stdin.write_all(b"\n").await.is_err()
+                {
                     break;
                 }
                 let _ = stdin.flush().await;
             }
         });
 
-        // stderr reader（devin 的日志走 stderr）
         {
             let mgr = self.clone();
             tokio::spawn(async move {
@@ -1215,31 +1067,21 @@ impl AcpManager {
             });
         }
 
-        // stdout reader（JSON-RPC 消息流）
         {
             let mgr = self.clone();
             let conn2 = conn.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => {
-                            let line = line.trim().to_string();
-                            if line.is_empty() {
-                                continue;
-                            }
-                            mgr.handle_line(&conn2, &line);
-                        }
-                        _ => break,
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        mgr.handle_line(&conn2, line);
                     }
                 }
                 mgr.on_conn_closed(&conn2).await;
             });
         }
 
-        let client_capabilities = json!({
-            "fs": { "readTextFile": false, "writeTextFile": false }
-        });
         let init = conn
             .request(
                 "initialize",
@@ -1250,11 +1092,9 @@ impl AcpManager {
                         "title": "Nova",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    // 不声明 fs 能力：我们不是编辑器、没有未保存缓冲区，
-                    // 让 devin 走自己内部的文件读写管线——它对图片等二进制
-                    // 文件有专门处理，经客户端 fs/read_text_file 读图片必然
-                    // UTF-8 报错（导致带图会话前几个工具调用失败）
-                    "clientCapabilities": client_capabilities
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false }
+                    }
                 }),
                 Some(Duration::from_secs(60)),
             )
@@ -1269,17 +1109,15 @@ impl AcpManager {
                 );
                 Ok(conn)
             }
-            Err(e) => {
+            Err(error) => {
                 conn.kill();
-                Err(format!("{} ACP 初始化失败：{e}", self.kind.label()))
+                Err(format!("{} ACP 初始化失败：{error}", self.kind.label()))
             }
         }
     }
 
-    /// CodeBuddy 官方 HTTP 传输：优先消费匹配目录的 one-shot 预热进程，否则冷启动
-    /// `codebuddy --serve`。POST /api/v1/acp 下发 JSON-RPC，SSE 接收响应与事件。
-    /// 鉴权关闭（仅绑环回地址）；服务 stdout 打印的入口行同时作启动就绪信号。
-    async fn spawn_codebuddy_http_conn(
+    /// CodeBuddy 官方 ACP stdio：优先消费匹配目录的 one-shot prewarm，否则冷启动。
+    async fn spawn_codebuddy_stdio_conn(
         self: &Arc<Self>,
         settings: &Settings,
         conn_key: &str,
@@ -1306,45 +1144,28 @@ impl AcpManager {
                 {
                     Ok(conn) => return Ok(conn),
                     Err(error) => self.push_log(format!(
-                        "[nova] CodeBuddy 预热激活失败，回退冷启动：{error}"
+                        "[nova] CodeBuddy 预热激活失败，回退 ACP 冷启动：{error}"
                     )),
                 }
             }
         }
 
-        let (program, mut cmd) = codebuddy_command(
-            &settings.codebuddy_path,
-            &[
-                "--serve",
-                "--port",
-                "0",
-                "--host",
-                "127.0.0.1",
-                "--auth",
-                "none",
-            ],
-        );
+        let (program, mut cmd) = codebuddy_command(&settings.codebuddy_path, &CODEBUDDY_ACP_ARGS);
         if let Some(cwd) = want_cwd {
             cmd.current_dir(cwd);
         }
-        cmd.stdin(std::process::Stdio::null())
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        cmd.creation_flags(0x0800_0000);
         #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
+        cmd.process_group(0);
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
         cmd.envs(&self.launch_env);
         #[cfg(windows)]
-        {
-            // Windows 上 CodeBuddy 的 Bash 工具默认走 Git Bash；显式指定 PowerShell，
-            // 避免依赖 Git Bash 安装，同时与 Nova 自身的 PowerShell 工具约定一致。
-            cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
-        }
+        cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
         {
             let state = self.app.state::<AppState>();
             cmd.env(
@@ -1359,92 +1180,25 @@ impl AcpManager {
         }
         #[cfg(windows)]
         if self.app.state::<AppState>().windows_shell_shim_enabled {
-            if let Err(e) = crate::windows_shell_shim::apply(&self.app, &mut cmd, &self.launch_env)
+            if let Err(error) =
+                crate::windows_shell_shim::apply(&self.app, &mut cmd, &self.launch_env)
             {
-                self.push_log(format!("[windows-shell-shim] {e}"));
+                self.push_log(format!("[windows-shell-shim] {error}"));
             }
         }
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
-            .map_err(|e| format!("无法启动 CodeBuddy（{program}）：{e}"))?;
+            .map_err(|error| format!("无法启动 CodeBuddy ACP（{program}）：{error}"))?;
         assign_to_agent_job(&child);
-        let stdout = child.stdout.take().ok_or("无法获取 CodeBuddy stdout")?;
-        let stderr = child.stderr.take().ok_or("无法获取 CodeBuddy stderr")?;
-
-        // 服务启动后在 stdout 打印 "Endpoint  http://127.0.0.1:<port>"（见官方文档）；
-        // 逐行扫描提取端口，兼作进程就绪信号，避免按端口探测的空转等待。
-        // 日志与就绪检测分离：stdout 一旦被 BufReader 持有就会一直读，不能同时再被
-        // 另一个任务持有；因此把「endpoint 行已见」经 oneshot 上报后就绪，日志照常走 push_log。
-        let (endpoint_tx, endpoint_rx) = oneshot::channel::<Result<String, String>>();
-        let stdout_task = {
-            let mgr = self.clone();
-            tokio::spawn(async move {
-                let mut tx = Some(endpoint_tx);
-                let mut lines = BufReader::new(stdout).lines();
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => {
-                            let trimmed = line.trim();
-                            // endpoint 只在启动初期出现一次；take 后 tx 为 None 不再重复解析。
-                            if tx.is_some() {
-                                if let Some(ep) = extract_codebuddy_endpoint(trimmed) {
-                                    if let Some(tx) = tx.take() {
-                                        let _ = tx.send(Ok(ep));
-                                    }
-                                }
-                            }
-                            mgr.push_log(format!("[codebuddy] {trimmed}"));
-                        }
-                        _ => {
-                            if let Some(tx) = tx.take() {
-                                let _ =
-                                    tx.send(Err("CodeBuddy 服务启动失败（stdout 已关闭）".into()));
-                            }
-                            break;
-                        }
-                    }
-                }
-            })
-        };
-        let stderr_task = {
-            let mgr = self.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    mgr.push_log(format!("[codebuddy] {}", line.trim()));
-                }
-            })
-        };
-
-        let endpoint = match timeout(Duration::from_secs(90), endpoint_rx).await {
-            Ok(Ok(Ok(ep))) => {
-                self.push_log(format!("[nova] CodeBuddy 服务入口已就绪：{ep}"));
-                ep
-            }
-            Ok(Ok(Err(e))) => {
-                let _ = child.start_kill();
-                return Err(e);
-            }
-            Ok(Err(_)) => {
-                let _ = child.start_kill();
-                return Err("CodeBuddy 服务启动通道异常关闭".into());
-            }
-            Err(_) => {
-                let _ = child.start_kill();
-                return Err("等待 CodeBuddy 服务就绪超时（90s）".into());
-            }
-        };
-
-        self.finish_codebuddy_http_conn(conn_key, endpoint, child, vec![stdout_task, stderr_task])
-            .await
+        self.finish_stdio_conn(conn_key, child).await
     }
 
     async fn activate_codebuddy_prewarm(
         self: &Arc<Self>,
         settings: &Settings,
         conn_key: &str,
-        mut prewarm: CodeBuddyPrewarm,
+        prewarm: CodeBuddyPrewarm,
     ) -> Result<Arc<AcpConn>, String> {
         let helper = resolve_sibling_program(&settings.codebuddy_path, "cbc-prewarm");
         let cwd = prewarm.cwd.clone();
@@ -1492,20 +1246,8 @@ impl AcpManager {
                 args.extend(["--env".into(), format!("{key}={proxy}")]);
             }
         }
-        args.extend(
-            [
-                "--",
-                "--serve",
-                "--port",
-                "0",
-                "--host",
-                "127.0.0.1",
-                "--auth",
-                "none",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
+        args.push("--".into());
+        args.extend(CODEBUDDY_ACP_ARGS.into_iter().map(str::to_string));
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (_, mut cmd) = codebuddy_command(&helper, &arg_refs);
         cmd.stdin(std::process::Stdio::null())
@@ -1532,183 +1274,16 @@ impl AcpManager {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        let endpoint = match timeout(Duration::from_secs(180), &mut prewarm.endpoint_rx).await {
-            Ok(Ok(Ok(endpoint))) => endpoint,
-            Ok(Ok(Err(error))) => {
-                prewarm.kill();
-                return Err(error);
-            }
-            Ok(Err(_)) => {
-                prewarm.kill();
-                return Err("CodeBuddy 预热就绪通道已关闭".into());
-            }
-            Err(_) => {
-                prewarm.kill();
-                return Err("等待 CodeBuddy 预热服务就绪超时（180s）".into());
-            }
-        };
-        self.push_log(format!("[nova] CodeBuddy 已消费预热进程 {id}：{endpoint}"));
-        self.finish_codebuddy_http_conn(conn_key, endpoint, prewarm.child, prewarm.log_tasks)
-            .await
-    }
-
-    async fn finish_codebuddy_http_conn(
-        self: &Arc<Self>,
-        conn_key: &str,
-        endpoint: String,
-        child: Child,
-        log_tasks: Vec<JoinHandle<()>>,
-    ) -> Result<Arc<AcpConn>, String> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("创建 CodeBuddy HTTP 客户端失败：{e}"))?;
-        let acp_url = format!("{endpoint}/api/v1/acp");
-
-        // 1) 建立 ACP 连接
-        let conn_resp = client
-            .post(format!("{acp_url}/connect"))
-            .header("X-CodeBuddy-Request", "1")
-            .json(&json!({}))
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(|e| format!("CodeBuddy ACP 连接建立失败：{e}"))?;
-        let conn_status = conn_resp.status();
-        let conn_body: Value = conn_resp
-            .json()
-            .await
-            .map_err(|e| format!("CodeBuddy ACP 连接响应解析失败：{e}"))?;
+        let activation: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("cbc-prewarm activate 响应解析失败：{error}"))?;
+        if activation.get("ok").and_then(Value::as_bool) != Some(true) {
+            prewarm.kill();
+            return Err(format!("cbc-prewarm activate 未确认成功：{activation}"));
+        }
         self.push_log(format!(
-            "[nova] CodeBuddy ACP connect HTTP {conn_status}: {}",
-            conn_body.to_string().chars().take(300).collect::<String>()
+            "[nova] CodeBuddy 已消费官方预热进程 {id}，切换到 ACP stdio"
         ));
-        let connection_id = conn_body
-            .pointer("/data/connectionId")
-            .or_else(|| conn_body.get("connectionId"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| format!("CodeBuddy ACP 连接响应缺少 connectionId：{conn_body}"))?;
-        let session_token = conn_body
-            .pointer("/data/sessionToken")
-            .or_else(|| conn_body.get("sessionToken"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| format!("CodeBuddy ACP 连接响应缺少 sessionToken：{conn_body}"))?;
-
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<String>();
-        let conn = Arc::new(AcpConn {
-            key: conn_key.to_string(),
-            read_only: false,
-            label: self.kind.label(),
-            transport: AcpTransport::Http {
-                client: client.clone(),
-                url: acp_url.clone(),
-                connection_id: connection_id.clone(),
-                session_token: session_token.clone(),
-                inbound: inbound_tx,
-            },
-            pending: StdMutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            alive: AtomicBool::new(true),
-            child: StdMutex::new(Some(child)),
-            log_tasks: StdMutex::new(log_tasks),
-            last_used: AtomicU64::new(0),
-        });
-        // POST SSE 与独立 GET SSE 可并行到达；统一串到��有 ACP 消息路由。
-        // 使用 Weak 避免 receiver 与 conn.transport.inbound 形成引用环。
-        {
-            let mgr = self.clone();
-            let weak_conn = Arc::downgrade(&conn);
-            tokio::spawn(async move {
-                while let Some(payload) = inbound_rx.recv().await {
-                    let Some(conn) = weak_conn.upgrade() else {
-                        break;
-                    };
-                    mgr.handle_line(&conn, &payload);
-                }
-            });
-        }
-        // 每创建一条连接 +1；SSE reader 结束时在 on_conn_closed 里 -1，恒定配对。
-        self.alive_conns.fetch_add(1, Ordering::SeqCst);
-
-        // 2) 独立 SSE 只订阅不属于某个 POST 的异步通知；请求响应由各自 POST 流接收。
-        let sse_resp = client
-            .get(&acp_url)
-            .header("X-CodeBuddy-Request", "1")
-            .header("acp-connection-id", &connection_id)
-            .header("acp-session-token", &session_token)
-            .header("Accept", "text/event-stream")
-            // SSE 是长连接，不能用 request timeout；建连超时已由 connect_timeout 封顶。
-            .send()
-            .await
-            .map_err(|e| format!("CodeBuddy ACP 事件流订阅失败：{e}"))?;
-        let sse_status = sse_resp.status();
-        let sse_content_type = sse_resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        self.push_log(format!(
-            "[nova] CodeBuddy ACP SSE HTTP {sse_status} content-type={sse_content_type}"
-        ));
-        if !sse_status.is_success() {
-            conn.kill();
-            return Err(format!("CodeBuddy ACP 事件流订阅被拒：{sse_status}"));
-        }
-        {
-            let mgr = self.clone();
-            let conn2 = conn.clone();
-            tokio::spawn(async move {
-                let mut stream = sse_resp.bytes_stream();
-                let mut decoder = SseDecoder::default();
-                while let Some(chunk) = stream.next().await {
-                    let Ok(chunk) = chunk else { break };
-                    for payload in decoder.push(&chunk) {
-                        mgr.handle_line(&conn2, &payload);
-                    }
-                }
-                for payload in decoder.finish() {
-                    mgr.handle_line(&conn2, &payload);
-                }
-                mgr.push_log("[nova] CodeBuddy ACP 事件流已断开".into());
-                mgr.on_conn_closed(&conn2).await;
-            });
-        }
-
-        // 3) initialize 握手（与 stdio 传输同一套载荷）
-        let init = conn
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": 1,
-                    "clientInfo": {
-                        "name": "nova",
-                        "title": "Nova",
-                        "version": env!("CARGO_PKG_VERSION")
-                    },
-                    "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false } }
-                }),
-                Some(Duration::from_secs(60)),
-            )
-            .await;
-        match init {
-            Ok(result) => {
-                *self.agent_info.lock().unwrap() = Some(result.clone());
-                let _ = self.app.emit(
-                    EV_STATUS,
-                    json!({ "connected": true, "agent": result.get("agentInfo").cloned() }),
-                );
-                self.push_log(format!("[nova] CodeBuddy HTTP 服务已连接：{endpoint}"));
-                Ok(conn)
-            }
-            Err(e) => {
-                conn.kill();
-                Err(format!("CodeBuddy ACP 初始化失败：{e}"))
-            }
-        }
+        self.finish_stdio_conn(conn_key, prewarm.child).await
     }
 
     async fn on_conn_closed(&self, conn: &Arc<AcpConn>) {
@@ -1791,7 +1366,6 @@ impl AcpManager {
 
     fn handle_line(self: &Arc<Self>, conn: &Arc<AcpConn>, line: &str) {
         let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            // HTTP 传输下 stdout 行就是 SSE payload，把无法解析的帧如实记录便于诊断。
             self.push_log(format!(
                 "[nova] 无法解析的 {} 消息: {line}",
                 self.kind.label()
@@ -2407,13 +1981,17 @@ impl AcpManager {
                     Some(opt)
                 })
                 .collect();
-            if options.is_empty() {
-                return Value::Null;
-            }
             let current = models
                 .get("currentModelId")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            if options.is_empty() && current.is_empty() {
+                return Value::Null;
+            }
+            // CodeBuddy 云端模型清单异步就绪：session/new 若在就绪前返回，availableModels 会缺
+            // 云端动态模型（如 hy4-preview），但 currentModelId 已是它。把当前模型并入列表（置顶），
+            // 否则选择器里看不到、用户一选会话就被解析回列表第一项。
+            let options = merge_current_model_option(options, current);
             json!([{ "id": "model", "name": "Model", "currentValue": current, "options": options }])
         }
 
@@ -2456,14 +2034,13 @@ impl AcpManager {
         if !has_config && !has_models && !has_modes {
             return;
         }
-        // CodeBuddy 同时提供标准 models 和兼容旧客户端的 configOptions。后者可能是
-        // 进程启动缓存（实测账号新增模型已能调用、models 已更新，但扩展列表仍旧），
-        // 因此只对 CodeBuddy 用标准模型项覆盖扩展模型项；Devin 继续优先其扩展元数据。
+        // CodeBuddy 同时提供标准 models 和兼容旧客户端的 configOptions，两边可能分别缺少
+        // 刚下发的动态模型，因此以标准项为主合并扩展项；Devin 继续优先其扩展元数据。
         let extension_config_options = result.get("configOptions").cloned().unwrap_or(Value::Null);
         let standard_config_options = models_to_config_options(result.get("models"));
         let config_options =
             if self.kind == AgentKind::CodeBuddy && !standard_config_options.is_null() {
-                replace_model_config_option(extension_config_options, standard_config_options)
+                merge_model_config_option(extension_config_options, standard_config_options)
             } else if has_config {
                 extension_config_options
             } else {
@@ -2502,7 +2079,7 @@ impl AcpManager {
     }
 
     /// CodeBuddy 官方预热：后台完成 bundle / DI / 配置 / MCP discovery，首条消息时
-    /// one-shot 激活为当前项目的 `--serve --port 0` 进程。Devin 保持原行为，不预热。
+    /// 通过 cbc-prewarm activate 绑定项目，并在原进程管道上切换为 ACP stdio。
     pub async fn prewarm(self: &Arc<Self>, cwd: String) {
         if self.kind != AgentKind::CodeBuddy {
             return;
@@ -2539,7 +2116,7 @@ impl AcpManager {
             &["--prewarm", "--prewarm-id", id.as_str()],
         );
         cmd.current_dir(&cwd)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -2567,43 +2144,8 @@ impl AcpManager {
             .spawn()
             .map_err(|e| format!("无法启动 CodeBuddy 预热进程（{program}）：{e}"))?;
         assign_to_agent_job(&child);
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("无法获取 CodeBuddy 预热 stdout")?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or("无法获取 CodeBuddy 预热 stderr")?;
-        let (endpoint_tx, endpoint_rx) = oneshot::channel();
-        let stdout_task = {
-            let mgr = self.clone();
-            tokio::spawn(async move {
-                let mut endpoint_tx = Some(endpoint_tx);
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(endpoint) = extract_codebuddy_endpoint(line.trim()) {
-                        if let Some(tx) = endpoint_tx.take() {
-                            let _ = tx.send(Ok(endpoint));
-                        }
-                    }
-                    mgr.push_log(format!("[codebuddy-prewarm] {}", line.trim()));
-                }
-                if let Some(tx) = endpoint_tx {
-                    let _ = tx.send(Err("CodeBuddy 预热进程在激活前退出".into()));
-                }
-            })
-        };
-        let stderr_task = {
-            let mgr = self.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    mgr.push_log(format!("[codebuddy-prewarm] {}", line.trim()));
-                }
-            })
-        };
-        // 官方客户端的 ping 是毫秒级 IPC；总等待严格封顶 30s，绝不无限阻塞调用线程。
+        // 官方 prewarm 以 cbc-prewarm ping 作为唯一就绪信号；stdin/stdout 必须保留，
+        // activate -- --acp --acp-transport stdio 后原进程会直接在这组管道上讲 ACP。
         let helper = resolve_sibling_program(&settings.codebuddy_path, "cbc-prewarm");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         while tokio::time::Instant::now() < deadline {
@@ -2620,23 +2162,13 @@ impl AcpManager {
                 .and_then(Result::ok)
                 .is_some_and(|status| status.success())
             {
-                return Ok(CodeBuddyPrewarm {
-                    id,
-                    cwd,
-                    child,
-                    endpoint_rx,
-                    log_tasks: vec![stdout_task, stderr_task],
-                });
+                return Ok(CodeBuddyPrewarm { id, cwd, child });
             }
             if child.try_wait().ok().flatten().is_some() {
-                stdout_task.abort();
-                stderr_task.abort();
                 return Err("CodeBuddy 预热进程提前退出".into());
             }
             sleep(Duration::from_millis(200)).await;
         }
-        stdout_task.abort();
-        stderr_task.abort();
         if let Some(pid) = child.id() {
             kill_process_tree(pid);
         }
@@ -3980,20 +3512,36 @@ pub(crate) fn resolve_program_on_path(name: &str) -> Option<std::path::PathBuf> 
     })
 }
 
-/// Windows：构造 CodeBuddy 启动命令（复用 build_acp_command 的 exe/cmd 解析逻辑）。
+/// Windows：构造 CodeBuddy 启动命令；参数逐项传递，避免 prewarm 的 cwd/env 含空格时
+/// 被通用 ACP 参数字符串的 split_whitespace 拆坏。
 #[cfg(windows)]
 fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::Command) {
-    (
-        program.to_string(),
-        build_acp_command(program, &args.join(" ")),
-    )
+    let resolved = resolve_program_on_path(program);
+    let mut cmd = match resolved.as_ref() {
+        Some(path)
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")) =>
+        {
+            tokio::process::Command::new(path)
+        }
+        Some(path) => {
+            let mut cmd = tokio::process::Command::new("cmd");
+            cmd.arg("/D").arg("/S").arg("/C").arg(path);
+            cmd
+        }
+        None => tokio::process::Command::new(program),
+    };
+    cmd.args(args).env("CODEBUDDY_DEFER_TOOL_LOADING", "0");
+    (program.to_string(), cmd)
 }
 
 /// 非 Windows：直接以给定程序与参数启动。
 #[cfg(not(windows))]
 fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::Command) {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
+    cmd.args(args).env("CODEBUDDY_DEFER_TOOL_LOADING", "0");
     (program.to_string(), cmd)
 }
 
@@ -4066,24 +3614,34 @@ fn codebuddy_activation_env(
     merge_codebuddy_activation_env(launch_env, std::env::vars())
 }
 
-/// 从 CodeBuddy `--serve` 的 stdout 行提取服务入口（官方文档：打印 "Endpoint  http://127.0.0.1:<port>"）。
-fn extract_codebuddy_endpoint(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("Endpoint")?.trim_start();
-    let rest = rest.strip_prefix("http://127.0.0.1:")?;
-    let port: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    (!port.is_empty()).then(|| format!("http://127.0.0.1:{port}"))
-}
-
 #[cfg(test)]
-mod codebuddy_http_tests {
+mod codebuddy_acp_tests {
     use super::{
-        codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
-        extract_codebuddy_endpoint, json_rpc_request_id, lru_evict_keys,
-        merge_codebuddy_activation_env, publishes_model_options, replace_model_config_option,
-        thread_connection_key, AcpManager, SseDecoder,
+        codebuddy_command, codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
+        lru_evict_keys, merge_codebuddy_activation_env, merge_current_model_option,
+        merge_model_config_option, publishes_model_options, thread_connection_key, AcpManager,
+        CODEBUDDY_ACP_ARGS,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn codebuddy_uses_official_stdio_acp_contract() {
+        assert_eq!(CODEBUDDY_ACP_ARGS, ["--acp", "--acp-transport", "stdio"]);
+    }
+
+    #[test]
+    fn codebuddy_process_disables_deferred_tool_loading_and_preserves_arguments() {
+        let (_, command) =
+            codebuddy_command("codebuddy", &["--acp", "--cwd", "D:/repo with spaces"]);
+        assert!(command.as_std().get_envs().any(|(key, value)| {
+            key == "CODEBUDDY_DEFER_TOOL_LOADING" && value == Some(std::ffi::OsStr::new("0"))
+        }));
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == "D:/repo with spaces"));
+    }
 
     #[test]
     fn lru_evict_keys_keeps_total_within_cap_and_never_evicts_keep() {
@@ -4115,21 +3673,47 @@ mod codebuddy_http_tests {
     }
 
     #[test]
-    fn codebuddy_prefers_standard_models_and_borrowed_instances_do_not_publish_them() {
-        let merged = replace_model_config_option(
+    fn merge_current_model_option_pins_unlisted_current_model() {
+        // 当前模型不在清单里：并入并置顶，且不影响其它项
+        let merged = merge_current_model_option(
+            vec![json!({ "value": "hy3", "name": "Hy3" })],
+            "hy4-preview",
+        );
+        assert_eq!(merged[0]["value"], "hy4-preview");
+        assert_eq!(merged[1]["value"], "hy3");
+        // 已在清单里：不重复添加
+        let existing = merge_current_model_option(
+            vec![json!({ "value": "hy4-preview", "name": "Hy4" })],
+            "hy4-preview",
+        );
+        assert_eq!(existing.len(), 1);
+        // 空当前模型：原样返回
+        let passthrough = merge_current_model_option(vec![json!({ "value": "hy3" })], "");
+        assert_eq!(passthrough.len(), 1);
+    }
+
+    #[test]
+    fn codebuddy_merges_standard_and_extension_models_and_borrowed_instances_do_not_publish_them() {
+        let merged = merge_model_config_option(
             json!([
                 { "id": "mode", "options": [{ "value": "plan", "name": "Plan" }] },
-                { "id": "model", "currentValue": "old", "options": [
-                    { "value": "old", "name": "Old" }
+                { "id": "model", "currentValue": "glm-5.3-flash", "options": [
+                    { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
                 ] }
             ]),
-            json!([{ "id": "model", "currentValue": "glm-5.3-flash", "options": [
-                { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
+            json!([{ "id": "model", "currentValue": "hy4-preview", "options": [
+                { "value": "hy4-preview", "name": "HY4 Preview" }
             ] }]),
         );
         assert_eq!(merged[0]["id"], "mode");
-        assert_eq!(merged[1]["currentValue"], "glm-5.3-flash");
-        assert_eq!(merged[1]["options"][0]["value"], "glm-5.3-flash");
+        assert_eq!(merged[1]["currentValue"], "hy4-preview");
+        assert_eq!(
+            merged[1]["options"],
+            json!([
+                { "value": "hy4-preview", "name": "HY4 Preview" },
+                { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
+            ])
+        );
         assert!(publishes_model_options(&HashMap::new()));
         assert!(!publishes_model_options(&HashMap::from([(
             "NOVA_QUOTA_BORROWED".into(),
@@ -4163,34 +3747,6 @@ mod codebuddy_http_tests {
     }
 
     #[test]
-    fn only_client_requests_expect_a_post_stream_response() {
-        assert_eq!(
-            json_rpc_request_id(&json!({"jsonrpc":"2.0","id":7,"method":"initialize"})),
-            Some(7)
-        );
-        assert_eq!(
-            json_rpc_request_id(&json!({"jsonrpc":"2.0","id":7,"result":{}})),
-            None
-        );
-        assert_eq!(
-            json_rpc_request_id(&json!({"jsonrpc":"2.0","method":"session/cancel"})),
-            None
-        );
-    }
-
-    #[test]
-    fn decodes_fragmented_streamable_http_sse() {
-        let mut decoder = SseDecoder::default();
-        assert!(decoder.push(b":ok\r\n\r\nevent: message\r\nda").is_empty());
-        assert_eq!(
-            decoder.push(b"ta: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":1}\r\n\r\n"),
-            vec!["{\"jsonrpc\":\"2.0\",\n\"id\":1}".to_string()]
-        );
-        assert!(decoder.push(b"data: final").is_empty());
-        assert_eq!(decoder.finish(), vec!["final".to_string()]);
-    }
-
-    #[test]
     fn user_threads_use_distinct_codebuddy_connections() {
         assert_eq!(thread_connection_key("alpha"), "thread:alpha");
         assert_ne!(
@@ -4216,9 +3772,17 @@ mod codebuddy_http_tests {
         assert_eq!(server["name"], "nova-tools");
         assert_eq!(server["command"], "C:/node.exe");
         assert_eq!(server["args"], json!(["C:/nova-tools.mjs"]));
+        // CodeBuddy 从 _meta 读取 defer_loading / tools，顶层字段会被丢弃；
+        // 必须在 _meta 显式关闭延迟加载，否则工具退回默认 defer、走 ToolSearch/Defer。
+        assert_eq!(server["_meta"]["defer_loading"], json!(false));
+        assert_eq!(
+            server["_meta"]["tools"]["polaris"]["defer_loading"],
+            json!(false)
+        );
         let env = server["env"].as_array().unwrap();
         for (name, value) in [
             ("NOVA_TOOLS_CWD", "D:/repo"),
+            ("NOVA_MCP_DIRECT", "1"),
             ("NOVA_CONTEXT_RETRIEVAL_MODE", "fast"),
             ("NOVA_CONTEXT_SERVICE_ENDPOINT", "http://127.0.0.1:1234"),
             ("NOVA_CONTEXT_SERVICE_TOKEN", "secret"),
@@ -4273,23 +3837,6 @@ mod codebuddy_http_tests {
         assert!(body.contains("<system-reminder>"));
         assert!(body.contains("block[\"text\"]"));
         assert!(!body.contains("AgentKind::CodeBuddy => prompt.insert(0"));
-    }
-
-    #[test]
-    fn extracts_endpoint_line() {
-        assert_eq!(
-            extract_codebuddy_endpoint("Endpoint  http://127.0.0.1:8321"),
-            Some("http://127.0.0.1:8321".to_string())
-        );
-        assert_eq!(
-            extract_codebuddy_endpoint("Web UI  http://127.0.0.1:8321/?password=x"),
-            None
-        );
-        assert_eq!(
-            extract_codebuddy_endpoint("Endpoint  http://0.0.0.0:8321"),
-            None
-        );
-        assert_eq!(extract_codebuddy_endpoint("random log line"), None);
     }
 }
 
@@ -4486,6 +4033,7 @@ fn codebuddy_nova_tools_mcp_server_value(
 ) -> Value {
     let mut env = vec![
         json!({ "name": "NOVA_TOOLS_CWD", "value": cwd }),
+        json!({ "name": "NOVA_MCP_DIRECT", "value": "1" }),
         json!({ "name": "NOVA_FAST_CONTEXT", "value": if context_mode == "none" { "0" } else { "1" } }),
         json!({ "name": "NOVA_CONTEXT_RETRIEVAL_MODE", "value": context_mode }),
         json!({ "name": "NOVA_CONTEXT_SERVICE_ENDPOINT", "value": context_endpoint }),
@@ -4501,11 +4049,24 @@ fn codebuddy_nova_tools_mcp_server_value(
             "value": crate::browser::mcp_port_file(config_dir).to_string_lossy(),
         }));
     }
+    // CodeBuddy 从 `_meta` 读取 defer_loading / tools（见 AcpUtils.convertAcpMcpServersToDynamic），
+    // 顶层同名字段会被丢弃，工具就退回内置默认（MCP 工具默认延迟加载，走 ToolSearch/Defer 检索）。
+    // 服务器级 + 工具级都显式置 false，确保 polaris / browser 作为顶层工具直接进模型工具列表。
+    let mut meta = json!({ "defer_loading": false });
+    if browser_debug {
+        meta["tools"] = json!({
+            "polaris": { "defer_loading": false },
+            "browser": { "defer_loading": false },
+        });
+    } else {
+        meta["tools"] = json!({ "polaris": { "defer_loading": false } });
+    }
     json!({
         "name": "nova-tools",
         "command": node,
         "args": [script],
         "env": env,
+        "_meta": meta,
         "defer_loading": false
     })
 }

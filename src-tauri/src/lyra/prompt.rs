@@ -155,6 +155,8 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "safe to retry",
     "stream ended before a terminal response event",
     "stream ended without finish_reason",
+    "provider finish_reason",
+    "provider stop_reason",
     "error decoding response body",
     "idle timeout",
     "sse 连续",
@@ -672,6 +674,8 @@ mod tests {
             "读取响应流失败：error decoding response body"
         ));
         assert!(is_retryable_provider_error("provider SSE 连续 90s 无数据"));
+        assert!(is_retryable_provider_error("provider finish_reason: other"));
+        assert!(is_retryable_provider_error("provider stop_reason: refusal"));
         assert!(is_retryable_provider_error(
             "provider stream idle timeout: 90s 无增量事件"
         ));

@@ -2,6 +2,7 @@
 //! 消息互转、reasoning 参数、缓存优化注入（prompt_cache_key / service_tier /
 //! prompt_cache_retention / 会话亲和头）。
 
+use crate::http_stream::SseDecoder;
 use crate::lyra::config::ResolvedModel;
 use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text};
 use crate::lyra::tools::Tool;
@@ -523,7 +524,7 @@ async fn read_sse(
     cancel: &Arc<AtomicBool>,
     mut on_data: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<bool, String> {
-    let mut buffer = String::new();
+    let mut decoder = SseDecoder::new();
     loop {
         let chunk = tokio::select! {
             result = tokio::time::timeout(SSE_IDLE_TIMEOUT, response.chunk()) => {
@@ -537,23 +538,28 @@ async fn read_sse(
             }
             _ = wait_cancelled(cancel) => return Ok(true),
         };
-        let Some(chunk) = chunk else {
-            return Ok(false);
+        let (events, finished) = match chunk {
+            Some(chunk) => (
+                decoder
+                    .push(&chunk)
+                    .map_err(|e| format!("读取响应流失败：{e}"))?,
+                false,
+            ),
+            None => (
+                decoder
+                    .finish()
+                    .map_err(|e| format!("读取响应流失败：{e}"))?,
+                true,
+            ),
         };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(index) = buffer.find('\n') {
-            let mut line = buffer[..index].to_string();
-            buffer.drain(..=index);
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            let Some(data) = crate::lyra_complete::sse_data_payload(&line) else {
-                continue;
-            };
+        for data in events {
             if data == "[DONE]" {
                 return Ok(false);
             }
-            on_data(data)?;
+            on_data(&data)?;
+        }
+        if finished {
+            return Ok(false);
         }
     }
 }
@@ -670,12 +676,22 @@ fn finalize_tool_calls(calls: Vec<ToolCallAccum>, result: &mut StreamResult) {
     }
 }
 
-fn map_finish_reason(reason: Option<&str>, has_tool_calls: bool) -> (String, Option<String>) {
+fn map_finish_reason(
+    reason: Option<&str>,
+    has_tool_calls: bool,
+    has_content: bool,
+) -> (String, Option<String>) {
     match reason {
         Some("tool_calls") => ("toolUse".into(), None),
         Some("stop") | None if has_tool_calls => ("toolUse".into(), None),
         Some("stop") | None => ("stop".into(), None),
         Some("length") | Some("max_tokens") => ("length".into(), None),
+        // 未知 finish_reason（如网关返回的 "other"）：已产出内容时按 stop 收尾，
+        // 空响应才报错并交给外层重试。
+        Some(other) if has_tool_calls || has_content => (
+            if has_tool_calls { "toolUse" } else { "stop" }.into(),
+            None,
+        ),
         Some(other) => (
             "error".into(),
             Some(format!("provider finish_reason: {other}")),
@@ -805,8 +821,14 @@ async fn stream_completions(
         return Ok(result);
     }
     let has_tool_calls = calls.iter().any(|call| !call.name.is_empty());
+    let has_content = result.content.iter().any(|part| {
+        matches!(
+            part.get("type").and_then(Value::as_str),
+            Some("text") | Some("thinking")
+        )
+    });
     finalize_tool_calls(calls, &mut result);
-    let (stop, error) = map_finish_reason(finish_reason.as_deref(), has_tool_calls);
+    let (stop, error) = map_finish_reason(finish_reason.as_deref(), has_tool_calls, has_content);
     result.stop_reason = stop;
     result.error_message = error;
     Ok(result)
@@ -1316,13 +1338,22 @@ fn anthropic_usage(usage: &Value, out: &mut Value) {
     out["totalTokens"] = json!(total);
 }
 
-fn map_anthropic_stop(reason: Option<&str>, has_tool_calls: bool) -> (String, Option<String>) {
+fn map_anthropic_stop(
+    reason: Option<&str>,
+    has_tool_calls: bool,
+    has_content: bool,
+) -> (String, Option<String>) {
     match reason {
         Some("tool_use") => ("toolUse".into(), None),
         Some("end_turn") | Some("stop_sequence") => ("stop".into(), None),
         Some("max_tokens") => ("length".into(), None),
         None if has_tool_calls => ("toolUse".into(), None),
         None => ("stop".into(), None),
+        // 未知 stop_reason：已产出内容时按 stop/toolUse 收尾，空响应才报错重试。
+        Some(other) if has_tool_calls || has_content => (
+            if has_tool_calls { "toolUse" } else { "stop" }.into(),
+            None,
+        ),
         Some(other) => (
             "error".into(),
             Some(format!("provider stop_reason: {other}")),
@@ -1521,7 +1552,11 @@ async fn stream_anthropic(
         .content
         .iter()
         .any(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"));
-    let (stop, error) = map_anthropic_stop(stop_reason.as_deref(), has_tool_calls);
+    let has_content = result
+        .content
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("text"));
+    let (stop, error) = map_anthropic_stop(stop_reason.as_deref(), has_tool_calls, has_content);
     result.stop_reason = stop;
     result.error_message = error;
     Ok(result)
@@ -1555,6 +1590,17 @@ mod tests {
             supports_long_cache_retention: true,
             supports_reasoning_effort: true,
         }
+    }
+
+    #[test]
+    fn unknown_finish_reason_degrades_to_stop_when_content_exists() {
+        assert_eq!(map_finish_reason(Some("other"), false, true).0, "stop");
+        assert_eq!(map_finish_reason(Some("other"), true, true).0, "toolUse");
+        let (stop, error) = map_finish_reason(Some("other"), false, false);
+        assert_eq!(stop, "error");
+        assert_eq!(error.as_deref(), Some("provider finish_reason: other"));
+        assert_eq!(map_finish_reason(Some("stop"), false, false).0, "stop");
+        assert_eq!(map_finish_reason(None, true, false).0, "toolUse");
     }
 
     #[test]
@@ -1770,11 +1816,16 @@ mod tests {
 
     #[test]
     fn anthropic_stop_and_usage_mapping() {
-        assert_eq!(map_anthropic_stop(Some("tool_use"), false).0, "toolUse");
-        assert_eq!(map_anthropic_stop(Some("end_turn"), false).0, "stop");
-        assert_eq!(map_anthropic_stop(Some("max_tokens"), false).0, "length");
-        assert_eq!(map_anthropic_stop(None, true).0, "toolUse");
-        assert_eq!(map_anthropic_stop(Some("refusal"), false).0, "error");
+        assert_eq!(map_anthropic_stop(Some("tool_use"), false, false).0, "toolUse");
+        assert_eq!(map_anthropic_stop(Some("end_turn"), false, false).0, "stop");
+        assert_eq!(map_anthropic_stop(Some("max_tokens"), false, false).0, "length");
+        assert_eq!(map_anthropic_stop(None, true, false).0, "toolUse");
+        // 未知 stop_reason：有内容时收尾，空响应才报错（可重试）。
+        assert_eq!(map_anthropic_stop(Some("other"), false, true).0, "stop");
+        assert_eq!(map_anthropic_stop(Some("other"), true, true).0, "toolUse");
+        let (stop, error) = map_anthropic_stop(Some("refusal"), false, false);
+        assert_eq!(stop, "error");
+        assert_eq!(error.as_deref(), Some("provider stop_reason: refusal"));
         let mut usage = json!({});
         anthropic_usage(
             &json!({ "input_tokens": 100, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 50 }),

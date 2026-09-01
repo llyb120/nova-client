@@ -59,6 +59,20 @@ test("polaris keywords normalize to top five", () => {
   assert(schema.anyOf.some((option) => option.type === "string"));
 });
 
+test("CodeBuddy direct mode describes polaris as a direct tool", () => {
+  const previous = process.env.NOVA_MCP_DIRECT;
+  process.env.NOVA_MCP_DIRECT = "1";
+  try {
+    const tool = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }).polaris);
+    assert.match(tool.description, /直接调用/);
+    assert.doesNotMatch(tool.description, /mcp_call_tool/);
+    assert.doesNotMatch(tool.description, /ToolSearch|DeferExecuteTool/);
+  } finally {
+    if (previous === undefined) delete process.env.NOVA_MCP_DIRECT;
+    else process.env.NOVA_MCP_DIRECT = previous;
+  }
+});
+
 test("devin policy routes context through MCP when the native service exists", () => {
   const policy = withContextService(() => novaDevinBatchToolPolicy({ fastContext: true }));
   assert.match(policy, /mcp_call_tool/);

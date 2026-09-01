@@ -334,6 +334,7 @@ export const api = {
       worktree: boolean;
       worktreeBranch: string;
       worktreeBase: string;
+      durationMinutes: number;
     },
   ) => invoke<void>("respond_roam_request", { reqId, accept, ...changes }),
   createQuotaThread: (

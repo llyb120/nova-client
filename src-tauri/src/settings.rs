@@ -300,6 +300,10 @@ pub struct Settings {
     pub experience_evolution_interval_minutes: u32,
     #[serde(default = "default_experience_experts")]
     pub experience_experts: Vec<ExperienceExpertConfig>,
+    /// 用户自定义追加的环境变量（覆盖同名用户/系统变量），
+    /// 注入所有 agent 子进程，并作为工作流模板 {{xx}} 的替换来源。
+    #[serde(default)]
+    pub custom_env_vars: std::collections::HashMap<String, String>,
 }
 
 impl Default for Settings {
@@ -376,6 +380,7 @@ impl Default for Settings {
             experience_training_interval_minutes: default_experience_training_interval_minutes(),
             experience_evolution_interval_minutes: default_experience_evolution_interval_minutes(),
             experience_experts: default_experience_experts(),
+            custom_env_vars: std::collections::HashMap::new(),
         }
     }
 }
@@ -398,6 +403,36 @@ mod tests {
     #[test]
     fn windows_shell_shim_is_disabled_by_default() {
         assert!(!Settings::default().windows_shell_shim_enabled);
+    }
+
+    #[test]
+    fn custom_env_vars_default_empty_and_round_trips() {
+        assert!(Settings::default().custom_env_vars.is_empty());
+        // 旧配置缺该字段时按空表解析。
+        let legacy: Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(legacy.custom_env_vars.is_empty());
+        let with_vars: Settings =
+            serde_json::from_str(r#"{"customEnvVars":{"MY_KEY":"abc"}}"#).unwrap();
+        assert_eq!(with_vars.custom_env_vars["MY_KEY"], "abc");
+    }
+
+    #[test]
+    fn apply_custom_env_vars_sets_and_removes() {
+        let unique = |suffix: &str| format!("NOVA_TEST_CUSTOM_ENV_{suffix}");
+        let (keep, removed) = (unique("KEEP"), unique("REMOVED"));
+        let mut previous = std::collections::HashMap::new();
+        previous.insert(keep.clone(), "old".into());
+        previous.insert(removed.clone(), "x".into());
+        std::env::set_var(&keep, "old");
+        std::env::set_var(&removed, "x");
+
+        let mut settings = Settings::default();
+        settings.custom_env_vars.insert(keep.clone(), "new".into());
+        settings.apply_custom_env_vars(&previous);
+
+        assert_eq!(std::env::var(&keep).as_deref(), Ok("new"));
+        assert!(std::env::var_os(&removed).is_none());
+        std::env::remove_var(&keep);
     }
 
     #[test]
@@ -832,6 +867,19 @@ impl Settings {
                 "0"
             },
         );
+    }
+
+    /// 把用户自定义环境变量写入当前进程，之后新启动的 agent 子进程继承。
+    /// 先移除上一轮由 Nova 注入、本轮已被删除的变量，避免残留。
+    pub fn apply_custom_env_vars(&self, previous: &std::collections::HashMap<String, String>) {
+        for name in previous.keys() {
+            if !self.custom_env_vars.contains_key(name) {
+                std::env::remove_var(name);
+            }
+        }
+        for (name, value) in &self.custom_env_vars {
+            std::env::set_var(name, value);
+        }
     }
 
     pub fn save(&self, dir: &PathBuf) {

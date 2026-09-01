@@ -134,7 +134,9 @@ export function createNovaBatchTools(cwd, options = {}) {
 
   if (fastContext) {
     tools.polaris = {
-      description: `远程 MCP 端点，只能通过 Devin 顶层 mcp_call_tool 调用：server_name="nova-tools", tool_name="polaris"；禁止把 polaris 当作顶层工具直接调用。${POLARIS_DESCRIPTION} 必须提供 keywords、query、task 或 files 至少一个；例如 {"query":"cursor bridge"}。`,
+      description: process.env.NOVA_MCP_DIRECT === "1"
+        ? `Nova 上下文工具。需要跨文件查找、分析修改位置或读取多个文件时直接调用，禁止经过任何中间工具。${POLARIS_DESCRIPTION} 必须提供 keywords、query、task 或 files 至少一个；例如 {"query":"cursor bridge"}。`
+        : `远程 MCP 端点，只能通过 Devin 顶层 mcp_call_tool 调用：server_name="nova-tools", tool_name="polaris"；禁止把 polaris 当作顶层工具直接调用。${POLARIS_DESCRIPTION} 必须提供 keywords、query、task 或 files 至少一个；例如 {"query":"cursor bridge"}。`,
       inputSchema: {
         type: "object",
         properties: {

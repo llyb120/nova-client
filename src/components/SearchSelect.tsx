@@ -92,25 +92,37 @@ export function SearchSelect(props: {
 
   const currentOption = createMemo(() => props.options.find((o) => o.value === props.value));
 
-  /** 高亮/选中的有效值：命中当前值则用它；否则允许「默认」时为 ""，不允许则回退到第一项。 */
+  /** 高亮/选中的有效值：命中当前值则用它；值非空但未命中列表时保持原值（不高亮任何项），
+   *  避免把列表第一项误标为已选；空值才允许「默认」或回退到第一项。 */
   const activeValue = createMemo(() => {
     if (currentOption()) return props.value;
+    if (props.value) return props.value;
     if (props.allowDefault) return "";
     return firstSelectable()?.value ?? props.value;
   });
 
   const currentLabel = createMemo(() => {
-    // 不提供「默认」时，空值/未命中回退到第一项作为默认显示
-    const opt = currentOption() ?? (props.allowDefault ? undefined : firstSelectable());
-    if (opt) {
+    // 命中当前值：直接用该项 label
+    const hit = currentOption();
+    if (hit) {
       // 三级（合并后端）模式下，触发器带上后端名便于区分
+      if (isThreeLevel() && hit.backendLabel) {
+        return hit.isDefault ? `${hit.backendLabel} 默认` : `${hit.backendLabel} · ${hit.label}`;
+      }
+      return hit.label;
+    }
+    // 值非空但未命中列表（如 codebuddy 云端清单未就绪时的中间态）：用友好名/原值显示，
+    // 不回退到第一项，否则触发器会显示成别的模型（显示与实际选择不一致）。
+    if (props.value) return props.fallbackLabel ?? props.value;
+    // 空值：不提供「默认」时回退到第一项，提供则用默认 label
+    const opt = props.allowDefault ? undefined : firstSelectable();
+    if (opt) {
       if (isThreeLevel() && opt.backendLabel) {
         return opt.isDefault ? `${opt.backendLabel} 默认` : `${opt.backendLabel} · ${opt.label}`;
       }
       return opt.label;
     }
-    if (props.fallbackLabel && props.value) return props.fallbackLabel;
-    return props.value ? props.value : defaultLabel();
+    return defaultLabel();
   });
 
   const filtered = createMemo(() => {

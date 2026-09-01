@@ -102,6 +102,10 @@ export interface WorkflowRunStep {
   attempts: Record<string, number>;
   /** 流程变量：goal / criteria 及用户自定义。 */
   vars: Record<string, string>;
+  /** 「跟随会话」节点的锚点：启动工作流时用户选择的会话后端/模型（首节点覆盖前）。
+   *  缺省时回退到 root 会话当前值。 */
+  followAgentKind?: string;
+  followModel?: string | null;
 }
 
 function escapeRegExp(text: string): string {
