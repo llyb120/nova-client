@@ -4266,6 +4266,9 @@ async fn apply_runtime_settings(
         recheck_availability,
     ) = {
         let mut s = state.settings.lock().unwrap();
+        // 自定义环境变量：先应用（新启动的 agent 子进程继承），再做后续比较。
+        settings.apply_custom_env_vars(&s.custom_env_vars);
+        let custom_env_changed = s.custom_env_vars != settings.custom_env_vars;
         let context_runtime_changed = s.context_retrieval_mode != settings.context_retrieval_mode;
 
         let auto_change_project_changed =
@@ -4279,6 +4282,7 @@ async fn apply_runtime_settings(
             || context_runtime_changed
             || experience_tools_changed
             || auto_change_project_changed
+            || custom_env_changed
             || s.lyra_proxy != settings.lyra_proxy
             || s.lyra_enabled != settings.lyra_enabled;
         let restart_devin = restart_all_agents

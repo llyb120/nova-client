@@ -225,6 +225,7 @@ type SettingsTab =
   | "memory"
   | "worktree"
   | "skills"
+  | "env"
   | "about";
 
 const TABS: { id: SettingsTab; name: string }[] = [
@@ -237,6 +238,7 @@ const TABS: { id: SettingsTab; name: string }[] = [
   { id: "memory", name: "记忆检索" },
   { id: "worktree", name: "Worktree" },
   { id: "skills", name: "Skills" },
+  { id: "env", name: "环境变量" },
   { id: "about", name: "关于" },
 ];
 
@@ -289,6 +291,9 @@ export function SettingsModal(props: { onClose: () => void }) {
     s?.cursorContextMode === "super" ? "super" : "default",
   );
   const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
+  const [customEnvVars, setCustomEnvVars] = createSignal<{ name: string; value: string }[]>(
+    Object.entries(s?.customEnvVars ?? {}).map(([name, value]) => ({ name, value })),
+  );
   const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
@@ -752,6 +757,11 @@ export function SettingsModal(props: { onClose: () => void }) {
     experienceTrainingIntervalMinutes: Math.max(5, Math.floor(experienceTrainingIntervalMinutes() || 30)),
     experienceEvolutionIntervalMinutes: Math.max(10, Math.floor(experienceEvolutionIntervalMinutes() || 720)),
     experienceExperts: experienceExperts(),
+    customEnvVars: Object.fromEntries(
+      customEnvVars()
+        .map((item) => [item.name.trim(), item.value] as const)
+        .filter(([name]) => name.length > 0),
+    ),
   });
 
   const refreshCliStatuses = async () => {
@@ -2499,6 +2509,94 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </div>
               </Show>
             </div>
+          </Show>
+
+          {/* ===== 环境变量 ===== */}
+          <Show when={tab() === "env"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">自定义环境变量</h3>
+              <div class="field">
+                <span class="field-hint">
+                  追加到所有 agent 子进程的环境变量，同名时覆盖用户环境变量。工作流提示词模板中的 {"{{xx}}"} 占位符也会用这里的值替换。
+                </span>
+                <div class="session-shortcut-list">
+                  <For each={customEnvVars()}>
+                    {(item, index) => (
+                      <div class="session-shortcut-row env-var-row">
+                        <input
+                          class="field-input"
+                          style={{ flex: "1" }}
+                          placeholder="变量名，如 MY_API_KEY"
+                          value={item.name}
+                          onInput={(e) =>
+                            setCustomEnvVars((list) =>
+                              list.map((entry, i) =>
+                                i === index() ? { ...entry, name: e.currentTarget.value } : entry,
+                              ),
+                            )
+                          }
+                        />
+                        <input
+                          class="field-input"
+                          style={{ flex: "2" }}
+                          placeholder="变量值"
+                          value={item.value}
+                          onInput={(e) =>
+                            setCustomEnvVars((list) =>
+                              list.map((entry, i) =>
+                                i === index() ? { ...entry, value: e.currentTarget.value } : entry,
+                              ),
+                            )
+                          }
+                        />
+                        <button
+                          type="button"
+                          class="btn secondary"
+                          onClick={() =>
+                            setCustomEnvVars((list) => list.filter((_, i) => i !== index()))
+                          }
+                        >
+                          删除
+                        </button>
+                      </div>
+                    )}
+                  </For>
+                </div>
+                <button
+                  type="button"
+                  class="btn secondary"
+                  style={{ "align-self": "flex-start" }}
+                  onClick={() => setCustomEnvVars((list) => [...list, { name: "", value: "" }])}
+                >
+                  添加变量
+                </button>
+              </div>
+            </section>
+
+            <section class="settings-group">
+              <h3 class="settings-group-title">系统环境变量</h3>
+              <div class="field">
+                <span class="field-label">刷新 Windows 环境变量</span>
+                <button
+                  type="button"
+                  class="btn secondary"
+                  style={{ "align-self": "flex-start" }}
+                  disabled={environmentRefreshing()}
+                  onClick={() => void refreshEnvironmentVariables()}
+                >
+                  {environmentRefreshing() ? "刷新中…" : "刷新环境变量"}
+                </button>
+                <Show when={environmentRefreshMsg()}>
+                  <span class={`relay-verify ${environmentRefreshFailed() ? "bad" : "ok"}`}>
+                    {environmentRefreshMsg()}
+                  </span>
+                </Show>
+                <span class="field-hint">
+                  从 Windows 注册表重新读取系统和当前用户环境变量，并覆盖 Nova
+                  启动时继承的同名变量。之后新启动的 agent 进程会使用新值。
+                </span>
+              </div>
+            </section>
           </Show>
 
           {/* ===== 关于 ===== */}

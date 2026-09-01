@@ -422,13 +422,22 @@ export function startWorkflow(
     if (h.isRunning(rootId)) throw new Error("请等待当前会话结束后再启动工作流");
 
     await applyStageConfig(rootId, entry);
+    // 自定义环境变量作为 {{xx}} 替换的兜底来源：流程变量（goal 等）优先，
+    // 未在流程变量中出现的模板键回落到设置里配置的环境变量。
+    let mergedVars = vars;
+    try {
+      const customEnv = (await api.getSettings()).customEnvVars ?? {};
+      mergedVars = { ...customEnv, ...vars };
+    } catch {
+      // 设置读取失败不打断工作流，仅用流程变量替换。
+    }
     const run: WorkflowRunStep = {
       rootId,
       workflowId,
       stageId: entry.id,
       stageCount: 1,
       attempts: { [entry.id]: 1 },
-      vars,
+      vars: mergedVars,
     };
     activeRuns.set(rootId, run);
     runHistory.set(rootId, run);
