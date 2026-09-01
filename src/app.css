@@ -4915,6 +4915,11 @@ button {
   max-width: none;
   color: var(--text);
 }
+/* SearchSelect wide 形态给 pill-text 设了 240px 上限（特异性更高），这里提升特异性压过它，
+   让共享模型名能占满整行完整显示。 */
+.share-row .sel.wide .pill-text {
+  max-width: none;
+}
 .share-row-remove {
   justify-self: center;
 }
