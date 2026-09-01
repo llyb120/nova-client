@@ -158,10 +158,10 @@ fn json_rpc_request_id(message: &Value) -> Option<u64> {
         .and_then(Value::as_u64)
 }
 
-/// CodeBuddy 同时返回标准 `models` 和旧扩展 `configOptions`；标准字段会随账号权限
-/// 实时更新，而扩展模型项可能仍是启动缓存。仅替换模型项，保留 mode 等其它扩展项。
-fn replace_model_config_option(config_options: Value, model_config_options: Value) -> Value {
-    let Some(model) = model_config_options
+/// CodeBuddy 同时返回标准 `models` 和旧扩展 `configOptions`；两边的动态模型可能
+/// 各自不完整。以标准字段的当前模型和元数据为准，并补入扩展字段中独有的模型。
+fn merge_model_config_option(config_options: Value, model_config_options: Value) -> Value {
+    let Some(mut model) = model_config_options
         .as_array()
         .and_then(|options| options.first())
         .cloned()
@@ -173,6 +173,31 @@ fn replace_model_config_option(config_options: Value, model_config_options: Valu
         .iter_mut()
         .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
     {
+        if let (Some(standard), Some(extension)) = (
+            model.get_mut("options").and_then(Value::as_array_mut),
+            existing.get("options").and_then(Value::as_array),
+        ) {
+            let mut seen: HashSet<String> = standard
+                .iter()
+                .filter_map(|option| {
+                    option
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+            standard.extend(
+                extension
+                    .iter()
+                    .filter(|option| {
+                        option
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| seen.insert(value.to_owned()))
+                    })
+                    .cloned(),
+            );
+        }
         *existing = model;
     } else {
         options.push(model);
@@ -2475,14 +2500,13 @@ impl AcpManager {
         if !has_config && !has_models && !has_modes {
             return;
         }
-        // CodeBuddy 同时提供标准 models 和兼容旧客户端的 configOptions。后者可能是
-        // 进程启动缓存（实测账号新增模型已能调用、models 已更新，但扩展列表仍旧），
-        // 因此只对 CodeBuddy 用标准模型项覆盖扩展模型项；Devin 继续优先其扩展元数据。
+        // CodeBuddy 同时提供标准 models 和兼容旧客户端的 configOptions，两边可能分别缺少
+        // 刚下发的动态模型，因此以标准项为主合并扩展项；Devin 继续优先其扩展元数据。
         let extension_config_options = result.get("configOptions").cloned().unwrap_or(Value::Null);
         let standard_config_options = models_to_config_options(result.get("models"));
         let config_options =
             if self.kind == AgentKind::CodeBuddy && !standard_config_options.is_null() {
-                replace_model_config_option(extension_config_options, standard_config_options)
+                merge_model_config_option(extension_config_options, standard_config_options)
             } else if has_config {
                 extension_config_options
             } else {
@@ -4003,17 +4027,18 @@ pub(crate) fn resolve_program_on_path(name: &str) -> Option<std::path::PathBuf> 
 /// Windows：构造 CodeBuddy 启动命令（复用 build_acp_command 的 exe/cmd 解析逻辑）。
 #[cfg(windows)]
 fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::Command) {
-    (
-        program.to_string(),
-        build_acp_command(program, &args.join(" ")),
-    )
+    let mut cmd = build_acp_command(program, &args.join(" "));
+    // CodeBuddy 2.143 即使 MCP server 标记 defer_loading=false，仍可能把工具放进
+    // DeferExecuteTool；进程级关闭后 nova-tools 的 polaris/browser 会直接进入工具列表。
+    cmd.env("CODEBUDDY_DEFER_TOOL_LOADING", "0");
+    (program.to_string(), cmd)
 }
 
 /// 非 Windows：直接以给定程序与参数启动。
 #[cfg(not(windows))]
 fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::Command) {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
+    cmd.args(args).env("CODEBUDDY_DEFER_TOOL_LOADING", "0");
     (program.to_string(), cmd)
 }
 
@@ -4097,13 +4122,21 @@ fn extract_codebuddy_endpoint(line: &str) -> Option<String> {
 #[cfg(test)]
 mod codebuddy_http_tests {
     use super::{
-        codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
+        codebuddy_command, codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
         extract_codebuddy_endpoint, json_rpc_request_id, lru_evict_keys,
-        merge_codebuddy_activation_env, merge_current_model_option, publishes_model_options,
-        replace_model_config_option, thread_connection_key, AcpManager, SseDecoder,
+        merge_codebuddy_activation_env, merge_current_model_option, merge_model_config_option,
+        publishes_model_options, thread_connection_key, AcpManager, SseDecoder,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn codebuddy_process_disables_deferred_tool_loading() {
+        let (_, command) = codebuddy_command("codebuddy", &["--serve"]);
+        assert!(command.as_std().get_envs().any(|(key, value)| {
+            key == "CODEBUDDY_DEFER_TOOL_LOADING" && value == Some(std::ffi::OsStr::new("0"))
+        }));
+    }
 
     #[test]
     fn lru_evict_keys_keeps_total_within_cap_and_never_evicts_keep() {
@@ -4155,21 +4188,27 @@ mod codebuddy_http_tests {
     }
 
     #[test]
-    fn codebuddy_prefers_standard_models_and_borrowed_instances_do_not_publish_them() {
-        let merged = replace_model_config_option(
+    fn codebuddy_merges_standard_and_extension_models_and_borrowed_instances_do_not_publish_them() {
+        let merged = merge_model_config_option(
             json!([
                 { "id": "mode", "options": [{ "value": "plan", "name": "Plan" }] },
-                { "id": "model", "currentValue": "old", "options": [
-                    { "value": "old", "name": "Old" }
+                { "id": "model", "currentValue": "glm-5.3-flash", "options": [
+                    { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
                 ] }
             ]),
-            json!([{ "id": "model", "currentValue": "glm-5.3-flash", "options": [
-                { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
+            json!([{ "id": "model", "currentValue": "hy4-preview", "options": [
+                { "value": "hy4-preview", "name": "HY4 Preview" }
             ] }]),
         );
         assert_eq!(merged[0]["id"], "mode");
-        assert_eq!(merged[1]["currentValue"], "glm-5.3-flash");
-        assert_eq!(merged[1]["options"][0]["value"], "glm-5.3-flash");
+        assert_eq!(merged[1]["currentValue"], "hy4-preview");
+        assert_eq!(
+            merged[1]["options"],
+            json!([
+                { "value": "hy4-preview", "name": "HY4 Preview" },
+                { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
+            ])
+        );
         assert!(publishes_model_options(&HashMap::new()));
         assert!(!publishes_model_options(&HashMap::from([(
             "NOVA_QUOTA_BORROWED".into(),
@@ -4266,6 +4305,7 @@ mod codebuddy_http_tests {
         let env = server["env"].as_array().unwrap();
         for (name, value) in [
             ("NOVA_TOOLS_CWD", "D:/repo"),
+            ("NOVA_MCP_DIRECT", "1"),
             ("NOVA_CONTEXT_RETRIEVAL_MODE", "fast"),
             ("NOVA_CONTEXT_SERVICE_ENDPOINT", "http://127.0.0.1:1234"),
             ("NOVA_CONTEXT_SERVICE_TOKEN", "secret"),
@@ -4533,6 +4573,7 @@ fn codebuddy_nova_tools_mcp_server_value(
 ) -> Value {
     let mut env = vec![
         json!({ "name": "NOVA_TOOLS_CWD", "value": cwd }),
+        json!({ "name": "NOVA_MCP_DIRECT", "value": "1" }),
         json!({ "name": "NOVA_FAST_CONTEXT", "value": if context_mode == "none" { "0" } else { "1" } }),
         json!({ "name": "NOVA_CONTEXT_RETRIEVAL_MODE", "value": context_mode }),
         json!({ "name": "NOVA_CONTEXT_SERVICE_ENDPOINT", "value": context_endpoint }),
