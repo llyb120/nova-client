@@ -2520,18 +2520,19 @@ export function SettingsModal(props: { onClose: () => void }) {
                   追加到所有 agent 子进程的环境变量，同名时覆盖用户环境变量。工作流提示词模板中的 {"{{xx}}"} 占位符也会用这里的值替换。
                 </span>
                 <div class="session-shortcut-list">
-                  <For each={customEnvVars()}>
+                  {/* Index 按索引追踪：输入时仅更新对应值，不重建行 DOM，避免输入框失焦。 */}
+                  <Index each={customEnvVars()}>
                     {(item, index) => (
                       <div class="session-shortcut-row env-var-row">
                         <input
                           class="field-input"
                           style={{ flex: "1" }}
                           placeholder="变量名，如 MY_API_KEY"
-                          value={item.name}
+                          value={item().name}
                           onInput={(e) =>
                             setCustomEnvVars((list) =>
                               list.map((entry, i) =>
-                                i === index() ? { ...entry, name: e.currentTarget.value } : entry,
+                                i === index ? { ...entry, name: e.currentTarget.value } : entry,
                               ),
                             )
                           }
@@ -2540,11 +2541,11 @@ export function SettingsModal(props: { onClose: () => void }) {
                           class="field-input"
                           style={{ flex: "2" }}
                           placeholder="变量值"
-                          value={item.value}
+                          value={item().value}
                           onInput={(e) =>
                             setCustomEnvVars((list) =>
                               list.map((entry, i) =>
-                                i === index() ? { ...entry, value: e.currentTarget.value } : entry,
+                                i === index ? { ...entry, value: e.currentTarget.value } : entry,
                               ),
                             )
                           }
@@ -2553,14 +2554,14 @@ export function SettingsModal(props: { onClose: () => void }) {
                           type="button"
                           class="btn secondary"
                           onClick={() =>
-                            setCustomEnvVars((list) => list.filter((_, i) => i !== index()))
+                            setCustomEnvVars((list) => list.filter((_, i) => i !== index))
                           }
                         >
                           删除
                         </button>
                       </div>
                     )}
-                  </For>
+                  </Index>
                 </div>
                 <button
                   type="button"
