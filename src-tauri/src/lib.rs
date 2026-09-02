@@ -321,9 +321,10 @@ fn is_starrable_thread(thread: &Thread) -> bool {
 }
 
 fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
-    // 漫游会话（host 替别人执行 / guest 收看别人执行）与普通会话一样参与自动清理；
-    // 仍豁免：额度租借会话、经验训练会话和星标会话。运行中的会话由调用方另行排除。
-    thread.quota_peer.is_none() && !thread.experience_thread && !thread.starred
+    // 漫游会话（host 替别人执行 / guest 收看别人执行）、额度租借会话与普通会话一样参与自动
+    // 清理：后者的运行时与隔离凭证只存活于单次运行，重启后只剩再也跑不动的僵尸记录。
+    // 仍豁免：经验训练会话和星标会话。运行中的会话由调用方另行排除。
+    !thread.experience_thread && !thread.starred
 }
 
 fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
@@ -608,9 +609,9 @@ mod session_auto_cleanup_tests {
         thread.roaming_role = Some("guest".into());
         assert!(is_normal_thread_for_auto_cleanup(&thread));
         thread.roaming_role = None;
-        // 额度租借会话仍豁免
+        // 额度租借会话不再豁免
         thread.quota_peer = Some("peer-token".into());
-        assert!(!is_normal_thread_for_auto_cleanup(&thread));
+        assert!(is_normal_thread_for_auto_cleanup(&thread));
     }
 
     #[test]
