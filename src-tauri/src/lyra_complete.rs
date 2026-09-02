@@ -485,7 +485,7 @@ fn resolve_target(
         }
     }
     let thinking_format = detect_thinking_format(provider_id, &base_url, model, provider);
-    let max_tokens_field = detect_max_tokens_field(&base_url, provider);
+    let max_tokens_field = detect_max_tokens_field(&base_url, model, provider);
     Ok(ResolvedCompletionTarget {
         api,
         model_id: model_id.to_string(),
@@ -530,12 +530,18 @@ pub(crate) fn detect_thinking_format(
     model: &Value,
     provider: &Value,
 ) -> Option<String> {
-    if let Some(format) = model
-        .pointer("/compat/thinkingFormat")
-        .or_else(|| provider.pointer("/compat/thinkingFormat"))
-        .and_then(Value::as_str)
+    // 与 compat_flag 同优先级：model.options 覆盖 provider.options。
+    for scope in [model.get("options"), provider.get("options")]
+    .into_iter()
+    .flatten()
     {
-        return Some(format.to_string());
+        if let Some(format) = scope
+            .get("thinkingFormat")
+            .or_else(|| scope.get("thinking_format"))
+            .and_then(Value::as_str)
+        {
+            return Some(format.to_string());
+        }
     }
     let id = format!("{provider_id} {base_url}").to_lowercase();
     if id.contains("deepseek") {
@@ -547,9 +553,14 @@ pub(crate) fn detect_thinking_format(
     }
 }
 
-pub(crate) fn detect_max_tokens_field(base_url: &str, provider: &Value) -> &'static str {
-    if let Some(field) = provider
-        .pointer("/compat/maxTokensField")
+pub(crate) fn detect_max_tokens_field(
+    base_url: &str,
+    model: &Value,
+    provider: &Value,
+) -> &'static str {
+    if let Some(field) = model
+        .pointer("/options/maxTokensField")
+        .or_else(|| provider.pointer("/options/maxTokensField"))
         .and_then(Value::as_str)
     {
         return if field == "max_tokens" {

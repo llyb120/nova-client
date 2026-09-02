@@ -63,9 +63,23 @@ export function buildIntegrateModelPrompt(goal: string): string {
 }
 \`\`\`
 
+## 推理模型可选开关（全部写在 options）
+所有可选开关统一写在 provider 或单个 model 的 \`options\`，**逐键**按 model.options > provider.options 覆盖（同名才覆盖，不同名合并）。\`options\` 里的**任意非内置键会原样附加到请求体顶层**（snake_case，如 \`tool_stream\`、\`thinking_budget\`、\`preserve_thinking\`），厂商特有字段无需改代码即可接入：
+- \`thinking_format\`：声明端点/中转站按哪种风格收思考字段，**接入中转站时必配**，可选值：
+  - \`"zai"\` / \`"deepseek"\`：发 \`thinking: {type}\`，同时发顶层 \`reasoning_effort\` 控制深度；
+  - \`"qwen"\`：发顶层 \`enable_thinking\`，中转普遍同时收 \`reasoning_effort\`（默认也发，官方 DashScope 只认 \`thinking_budget\` 时配 \`supportsReasoningEffort: false\` 关掉）；
+  - \`"kimi"\`：只发顶层 \`reasoning_effort\`，**绝不发 \`thinking\` 对象**（K3 官方明确禁止）；
+  - 不设时按域名自动识别（deepseek / api.z.ai / open.bigmodel.cn），识别不到则等同 \`"kimi"\` 只发 effort；纯 OpenAI 端点保持不设。
+- \`supportsReasoningEffort\`（默认 true）：是否在上述思考字段之外同时发顶层 \`reasoning_effort\` 控制深度；仅当端点明确不支持时设为 false。
+- \`clearThinking\`（布尔，默认不下发、由端点决定）：仅 GLM 系（thinking_format=zai）需要时才配——\`false\` 开启 Preserved Thinking（保留历史思维链，代码自动回传 reasoning_content），\`true\` 强制清除省 token。其他厂商协议不同（Kimi 用 preserve_thinking / thinking.keep），不要套用。
+- \`requiresReasoningContentOnAssistantMessages\`：是否在历史 assistant 消息回传 reasoning_content（模型名含 deepseek 时自动开）。官方要求多轮/工具循环必须原样回传 reasoning_content 的模型（如 Kimi K3、k2.7-code）必须设 true。
+- \`maxTokensField\`: \`"max_tokens"\` | \`"max_completion_tokens"\`，默认按域名识别。
+- \`sendSessionAffinityHeaders\`（默认 false）/ \`supportsLongCacheRetention\`（默认仅官方 OpenAI）：前缀缓存优化，不确定就不动。
+判据一律以目标模型官方 API 文档为准；文档没提到的开关一律不写，靠默认值。
+
 ## 步骤
 1. 先读取现有 ~/.nova/alkaid/config.jsonc；不存在则新建为 \`{ "provider": {} }\`。
-2. 确定「${goal}」的接入信息：baseURL、精确模型 id、是否推理模型、上下文/输出窗口、API key。
+2. 确定「${goal}」的接入信息：baseURL、精确模型 id、是否推理模型、上下文/输出窗口、API key，以及上文 options 开关中哪些需要按官方文档显式设置。
    - **凡是不能从当前工作区或我给出的信息中确定的参数（尤其是上下文/输出窗口、模型特有能力或配置），必须联网搜索官方文档确认，禁止凭记忆臆测。** 搜索后仍无法确认的，列出待确认项向我询问，不要填入猜测值。
    - 常见示例：DashScope（通义千问，OpenAI 兼容）baseURL 为 https://dashscope.aliyuncs.com/compatible-mode/v1。
 3. 在 provider 下新增或更新一个 provider 块；如需设为默认，把顶层 model 更新为 \`<providerId>/<modelId>\`。
