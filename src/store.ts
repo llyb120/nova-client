@@ -1,4 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
+import { message } from "@tauri-apps/plugin-dialog";
 import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { LruMap } from "./lruMap";
@@ -1536,7 +1537,13 @@ export async function setThreadModel(model: string) {
   const id = state.currentId;
   if (!id) return;
   setState("model", model);
-  await api.setThreadModel(id, model || null);
+  try {
+    await api.setThreadModel(id, model || null);
+  } catch (error) {
+    // 额度会话只能切到出借方已共享且本机已持有租约的模型：被拒时以后端为准回滚选择
+    await openThread(id).catch(() => {});
+    void message(String(error), { kind: "error" });
+  }
 }
 
 /** 进行中的会话切换模型：同 agent 仅换模型；跨 agent（Devin⇄Codex）连同 agent 一起切，
