@@ -434,6 +434,9 @@ pub struct RelayManager {
     quota_operations: StdMutex<HashMap<String, Arc<QuotaOperation>>>,
     /// 借用方：共享模型的应用级内存租约；每个会话仍各自创建隔离运行目录。
     quota_leases: StdMutex<HashMap<QuotaLeaseKey, CredentialBundle>>,
+    /// 借用方最近一次收到的每位队友共享模型全集（`<agentKind>:<modelId>`）。
+    /// 租约可能按账号/provider 复用，换模型时仍需用这份精确名单校验具体模型。
+    quota_shared_models: StdMutex<HashMap<String, HashSet<String>>>,
     /// 同一租约同时预热/创建时只向对端请求一次，其余调用等待同一结果。
     quota_lease_flights: StdMutex<HashMap<QuotaLeaseKey, Vec<QuotaLeaseWaiter>>>,
     /// 高级分享：本机处理线程 id -> 处理完成后要分享给谁
@@ -492,6 +495,7 @@ impl RelayManager {
             pending_quota: StdMutex::new(HashMap::new()),
             quota_operations: StdMutex::new(HashMap::new()),
             quota_leases: StdMutex::new(HashMap::new()),
+            quota_shared_models: StdMutex::new(HashMap::new()),
             quota_lease_flights: StdMutex::new(HashMap::new()),
             advanced: StdMutex::new(HashMap::new()),
             last_store_save: StdMutex::new(Instant::now()),
@@ -1899,6 +1903,24 @@ impl RelayManager {
         self.quota_leases.lock().unwrap().contains_key(key)
     }
 
+    /// 本机是否已持有该队友/后端所需凭证，且该具体模型仍在队友最近公布的共享名单中。
+    /// 非 OpenCode 租约按账号复用，不能只看租约键，否则同后端任意未共享模型也会误通过。
+    pub fn can_switch_quota_model(
+        &self,
+        peer: &str,
+        agent_kind: &AgentKind,
+        model: &str,
+    ) -> bool {
+        let model_key = quota_model_key(agent_kind, model);
+        self.quota_shared_models
+            .lock()
+            .unwrap()
+            .get(peer)
+            .is_some_and(|models| models.contains(&model_key))
+            && QuotaLeaseKey::new(peer.to_string(), agent_kind.clone(), model)
+                .is_ok_and(|key| self.quota_lease_ready(&key))
+    }
+
     async fn wait_quota_lease_flight(
         wait: oneshot::Receiver<QuotaLeaseResult>,
         operation: Option<&QuotaOperation>,
@@ -2741,6 +2763,13 @@ impl RelayManager {
     fn on_roaming_models(&self, env: &InEnvelope) {
         let shared_options = &env.data["sharedOptions"];
         let leases = shared_quota_leases(&env.from, shared_options);
+        self.quota_shared_models.lock().unwrap().insert(
+            env.from.clone(),
+            leases
+                .iter()
+                .map(|(key, model)| quota_model_key(&key.agent_kind, model))
+                .collect(),
+        );
         self.retain_shared_quota_leases(&env.from, shared_options);
         for (key, model) in leases {
             if self.quota_lease_ready(&key) {
@@ -4831,6 +4860,17 @@ mod tests {
         assert!(!shared.contains_key(
             &QuotaLeaseKey::new("peer-b".into(), AgentKind::Cursor, "cursor-small").unwrap()
         ));
+
+        // Cursor 等后端的凭证按账号复用，两个模型映射到同一租约；具体模型是否共享
+        // 必须另存完整模型键，不能仅凭租约键判断。
+        let cursor_models: HashSet<_> = shared
+            .iter()
+            .filter(|(key, _)| key.agent_kind == AgentKind::Cursor)
+            .map(|(key, model)| quota_model_key(&key.agent_kind, model))
+            .collect();
+        assert_eq!(cursor_models.len(), 2);
+        assert!(cursor_models.contains("cursor:cursor-small"));
+        assert!(cursor_models.contains("cursor:cursor-large"));
     }
 
     #[tokio::test]
