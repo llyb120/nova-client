@@ -3307,9 +3307,12 @@ fn subject_match(file: &str, subject_terms: &[String], term_freq: &HashMap<Strin
         return 0.0;
     }
     let segments = file_segments(file);
+    // 驼峰/连字符文件名的合并形态（ChatView.tsx → chatview）：subject term 是
+    // 整词小写，按段比较永远落空，导致文件名与关键词同名的文件反而拿不到主题加分。
+    let joined = segments.concat();
     let mut best = 0.0_f64;
     for term in subject_terms {
-        if !segments.iter().any(|segment| segment == term) {
+        if joined != *term && !segments.iter().any(|segment| segment == term) {
             continue;
         }
         let freq = term_freq.get(term).copied().unwrap_or(0).max(1) as f64;
@@ -3323,9 +3326,10 @@ fn is_subject_file(file: &str, subject_terms: &[String]) -> bool {
         return false;
     }
     let segments = file_segments(file);
+    let joined = segments.concat();
     subject_terms
         .iter()
-        .any(|term| segments.iter().any(|segment| segment == term))
+        .any(|term| joined == *term || segments.iter().any(|segment| segment == term))
 }
 
 fn stop_word(value: &str) -> bool {
@@ -3437,6 +3441,8 @@ fn stop_word(value: &str) -> bool {
             | "then"
             | "when"
             | "that"
+            // 工具名常出现在任务描述里（排查 polaris 自身时），不是代码锚点。
+            | "polaris"
     )
 }
 
@@ -4750,9 +4756,19 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             ranked.push((file.clone(), 550.0));
         }
     }
-    // 伴生测试：默认把与种子共改（或同目录 *.test.* 命名）的测试文件并入闭包。
+    // 伴生测试：默认把与精确种子共改（或同目录 *.test.* 命名）的测试文件并入闭包。
     // 改实现通常要同步改测试，而测试文件被 noise_path 过滤且任务文本零重叠。
-    let companion_tests = if ordered_seed_files.is_empty() {
+    // 仅限全等匹配种子（weight≥2）：contains 弱匹配种子经由 git 共改会把与查询
+    // 零重叠的测试文件顶进 EDIT 区，反而挤掉真正的目标文件。
+    let mut ordered_strong_seed_files = seeds
+        .iter()
+        .filter(|(_, _, weight)| *weight >= 2)
+        .map(|(definition, _, _)| definition.file.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ordered_strong_seed_files.sort();
+    let companion_tests = if ordered_strong_seed_files.is_empty() {
         Vec::new()
     } else {
         // 只排除非测试文件：已进 ranked 的测试文件仍会被 noise 过滤丢弃，
@@ -4763,7 +4779,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             .map(|(file, _)| file.clone())
             .collect::<HashSet<_>>();
         // 零命中且超过 FULL 上限的伴生无法产出任何块，只会挤占候选槽位。
-        companion_test_files(root, &ordered_seed_files, &exclude, 4)
+        companion_test_files(root, &ordered_strong_seed_files, &exclude, 4)
             .into_iter()
             .filter(|file| hit_files.contains_key(file) || file_is_small(root, file))
             .take(3)
@@ -6297,6 +6313,15 @@ mod tests {
         assert!(damped < 300.0 && damped >= 100.0, "{damped}");
         // camelCase 切段后仍可命中
         assert!(subject_match("src/components/PlanActionCard.tsx", &terms, &freq) > 0.0);
+        // 整词小写形式命中驼峰合并段：chatview ↔ ChatView.tsx（前端组件命名的常态）
+        let camel = vec!["chatview".to_string()];
+        assert_eq!(
+            subject_match("src/components/ChatView.tsx", &camel, &HashMap::new()),
+            600.0
+        );
+        assert!(is_subject_file("src/components/ChatView.tsx", &camel));
+        assert!(is_subject_file("src/components/chat-view.tsx", &camel));
+        assert!(!is_subject_file("src/components/Chat.tsx", &camel));
     }
 
     #[test]
@@ -7108,6 +7133,44 @@ mod tests {
         )
         .unwrap();
         assert!(out2.contains("### lib/widget.test.ts"), "{out2}");
+    }
+
+    #[test]
+    fn companion_tests_skip_weak_contains_seeds() {
+        // contains 弱匹配种子（weight 1）不该触发共改伴生注入：跨语言同名符号的
+        // 共改测试与查询零重叠，FULL 打包后会把真正的目标文件挤出 EDIT 区。
+        let d = tempdir().unwrap();
+        git(d.path(), &["init", "-q"]);
+        git(
+            d.path(),
+            &["config", "user.email", "native-test@nova.local"],
+        );
+        git(d.path(), &["config", "user.name", "Nova Native Test"]);
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        for round in 0..3 {
+            // 只有 contains 弱匹配定义（missing_beta_view_defaults 含 beta_view），
+            // 仓库中不存在 BetaView 的精确定义。
+            fs::write(
+                d.path().join("src/settings.ts"),
+                format!("export function missing_beta_view_defaults() {{\n  return {round};\n}}\n"),
+            )
+            .unwrap();
+            fs::write(
+                d.path().join("src/settings.test.ts"),
+                format!("assert.equal(settingsResult, {round});\n"),
+            )
+            .unwrap();
+            fs::write(
+                d.path().join("src/App.ts"),
+                format!("// renders BetaView here\nexport function renderApp() {{\n  return {round};\n}}\n"),
+            )
+            .unwrap();
+            git(d.path(), &["add", "-A"]);
+            git(d.path(), &["commit", "-qm", "change"]);
+        }
+        let out = fast_context(d.path(), serde_json::json!({"keywords":["BetaView"]})).unwrap();
+        assert!(!out.contains("# CTX MISS"), "{out}");
+        assert!(!out.contains("### src/settings.test.ts"), "{out}");
     }
     #[test]
     fn fast_context_run_includes_sql_and_markdown_candidates() {
