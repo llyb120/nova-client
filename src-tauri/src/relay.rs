@@ -242,6 +242,31 @@ fn shared_quota_leases(peer: &str, shared_options: &Value) -> HashMap<QuotaLease
     leases
 }
 
+/// 对端公布的全部共享模型键（`<agentKind>:<modelId>`）：租约按账号/Provider 复用去重后
+/// 会丢失同租约键下的其余模型，需要从原始 shared_options 独立提取完整名单。
+fn shared_model_keys(peer: &str, shared_options: &Value) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for (kind, options) in shared_options.as_object().into_iter().flatten() {
+        let Some(kind) = AgentKind::from_str(kind) else {
+            continue;
+        };
+        let model_options = options["configOptions"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["id"].as_str() == Some("model"))
+            })
+            .and_then(|item| item["options"].as_array());
+        for model in model_options.into_iter().flatten() {
+            if let Some(value) = model["value"].as_str().filter(|value| !value.is_empty()) {
+                keys.insert(quota_model_key(&kind, value));
+            }
+        }
+    }
+    keys
+}
+
 fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> bool {
     let enabled = match kind {
         AgentKind::Lyra => settings.lyra_enabled,
@@ -2763,13 +2788,10 @@ impl RelayManager {
     fn on_roaming_models(&self, env: &InEnvelope) {
         let shared_options = &env.data["sharedOptions"];
         let leases = shared_quota_leases(&env.from, shared_options);
-        self.quota_shared_models.lock().unwrap().insert(
-            env.from.clone(),
-            leases
-                .iter()
-                .map(|(key, model)| quota_model_key(&key.agent_kind, model))
-                .collect(),
-        );
+        self.quota_shared_models
+            .lock()
+            .unwrap()
+            .insert(env.from.clone(), shared_model_keys(&env.from, shared_options));
         self.retain_shared_quota_leases(&env.from, shared_options);
         for (key, model) in leases {
             if self.quota_lease_ready(&key) {
@@ -4862,12 +4884,21 @@ mod tests {
         ));
 
         // Cursor 等后端的凭证按账号复用，两个模型映射到同一租约；具体模型是否共享
-        // 必须另存完整模型键，不能仅凭租约键判断。
-        let cursor_models: HashSet<_> = shared
-            .iter()
-            .filter(|(key, _)| key.agent_kind == AgentKind::Cursor)
-            .map(|(key, model)| quota_model_key(&key.agent_kind, model))
-            .collect();
+        // 必须另存完整模型键（shared_model_keys 从原始 shared_options 提取），不能仅凭租约键判断。
+        let cursor_models = shared_model_keys(
+            "peer-a",
+            &json!({
+                "cursor": {
+                    "configOptions": [{
+                        "id": "model",
+                        "options": [
+                            { "value": "cursor-small" },
+                            { "value": "cursor-large" }
+                        ]
+                    }]
+                }
+            }),
+        );
         assert_eq!(cursor_models.len(), 2);
         assert!(cursor_models.contains("cursor:cursor-small"));
         assert!(cursor_models.contains("cursor:cursor-large"));
