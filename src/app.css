@@ -5,66 +5,67 @@
   --sans: "Inter Variable", "Noto Sans SC Variable", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
 }
 
-/* ===== 深色（默认）：近中性深灰基底、雾蓝主色、暖金辅助 =====
-   设计原则：基底低饱和微蓝（深邃不闷）；背景六档由深到浮拉开纵深；
-   文字四档对比充足；层级靠明度差与柔和投影，不靠描边堆砌。 */
+/* ===== 深色（默认）：Cursor / VS Code 风格——纯中性深灰基底、编辑器蓝主色 =====
+   设计原则：基底无色相（#1e1e1e 系纯灰阶，不发暖不发蓝）；侧栏更深一档、面板浮起；
+   主色用编辑器链接蓝 #3794ff；语义色对齐 VS Code Dark+ 语法色；
+   层级靠明度差与柔和投影，不靠描边堆砌。 */
 :root,
 :root[data-theme="ink-dark"] {
   color-scheme: dark;
-  --bg: #0e1014;
-  --bg-sidebar: #0a0c10;
-  --bg-panel: #171b23;
-  --bg-hover: #1e232d;
-  --bg-active: #272e3b;
-  --bg-float: #1a1f28;
-  --border: #252a33;
-  --border-light: #313844;
-  --border-strong: #49515f;
-  /* 表单输入底色：比面板略亮（浮起可交互） */
-  --bg-input: #1e232d;
-  --card-border: #313844;
+  --bg: #1e1e1e;
+  --bg-sidebar: #181818;
+  --bg-panel: #212121;
+  --bg-hover: #2a2a2a;
+  --bg-active: #333333;
+  --bg-float: #252526;
+  --border: #2b2b2b;
+  --border-light: #3c3c3c;
+  --border-strong: #5a5a5a;
+  /* 表单输入底色：VS Code 输入框同款，比面板明显更亮（浮起可交互） */
+  --bg-input: #313131;
+  --card-border: #3c3c3c;
   /* DOM 文字维持原层级；Canvas 对低对比小字单独提亮，抵消深底栅格化后的发虚。 */
-  --text: #e4e7ec;
-  --text-dim: #a9b0bd;
-  --text-muted: #7d8593;
-  --text-faint: #5d6470;
-  --canvas-text: #e4e7ec;
-  --canvas-text-dim: #b3bac6;
-  --canvas-text-muted: #8992a1;
-  --canvas-text-faint: #707987;
-  --canvas-glow-accent: rgba(110, 147, 248, 0.11);
-  --canvas-glow-cyan: rgba(63, 212, 228, 0.06);
-  --canvas-glow-corner: rgba(110, 147, 248, 0.05);
-  --accent: #6e93f8;
-  --accent-dim: rgba(110, 147, 248, 0.14);
-  --on-accent: #0c1220;
+  --text: #cccccc;
+  --text-dim: #b4b4b4;
+  --text-muted: #8b8b8b;
+  --text-faint: #6e6e6e;
+  --canvas-text: #d4d4d4;
+  --canvas-text-dim: #b8b8b8;
+  --canvas-text-muted: #9a9a9a;
+  --canvas-text-faint: #7d7d7d;
+  --canvas-glow-accent: rgba(0, 122, 204, 0.12);
+  --canvas-glow-cyan: rgba(79, 193, 233, 0.06);
+  --canvas-glow-corner: rgba(0, 122, 204, 0.05);
+  --accent: #3794ff;
+  --accent-dim: rgba(55, 148, 255, 0.16);
+  --on-accent: #0f0f0e;
   /* 渐变主色的深端：primary 按钮 / Logo 用 */
-  --accent-2: #4a5fd4;
-  /* 科技感点睛色：电光青，只用于渐变、辉光、极少量强调 */
-  --cyan: #3fd4e4;
+  --accent-2: #0078d4;
+  /* 科技感点睛色：编辑器青，只用于渐变、辉光、极少量强调 */
+  --cyan: #4fc1e9;
   /* 表面顶部一道极淡的内高光——暗色面板「精雕细琢」感的关键 */
-  --inset-hi: inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  --seal: #d19a66;
+  --inset-hi: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  --seal: #ce9178;
   --on-seal: #221607;
-  --blue: #7aa2f2;
-  --red: #e07d76;
-  --yellow: #d4b26e;
-  --violet: #b19ddd;
-  --green: #8ec489;
+  --blue: #569cd6;
+  --red: #f14c4c;
+  --yellow: #cca700;
+  --violet: #c586c0;
+  --green: #89d185;
   /* 灰原哀发色：薄茶偏红的红茶色，亮底主题用加深版保对比 */
   --tea: #e09b78;
-  --amber: #d9a05f;
+  --amber: #d7ba7d;
   --purple: var(--violet);
   --ok: var(--green);
-  --scroll: #2e333d;
-  --scroll-hover: #454c5a;
-  --shadow: rgba(0, 0, 0, 0.55);
-  --backdrop: rgba(5, 7, 10, 0.6);
+  --scroll: #414141;
+  --scroll-hover: #5a5a5a;
+  --shadow: rgba(0, 0, 0, 0.5);
+  --backdrop: rgba(0, 0, 0, 0.5);
   /* 极淡的功能性晕染（工作台头部等局部使用） */
-  --wash-1: rgba(111, 151, 240, 0.05);
-  --wash-2: rgba(209, 154, 102, 0.04);
+  --wash-1: rgba(55, 148, 255, 0.05);
+  --wash-2: rgba(206, 145, 120, 0.04);
   /* 点阵网格浓度 */
-  --grid-dot: rgba(228, 231, 236, 0.045);
+  --grid-dot: rgba(255, 255, 255, 0.05);
   /* 层级令牌：圆角三档 + 投影三档 */
   --r-sm: 6px;
   --r-md: 10px;
@@ -2622,10 +2623,10 @@ button {
   will-change: transform, opacity;
 }
 :root[data-theme="ink-dark"] .composer-note {
-  color: #dce3ec;
+  color: #d4d4d4;
   text-shadow:
-    0 0 5px rgba(230, 239, 250, 0.72),
-    0 0 11px rgba(164, 190, 222, 0.38);
+    0 0 5px rgba(228, 228, 228, 0.72),
+    0 0 11px rgba(160, 160, 160, 0.38);
 }
 @keyframes composer-note-flow {
   0% {
@@ -5380,7 +5381,7 @@ body,
   flex-shrink: 0;
 }
 .theme-swatch.dark {
-  background: radial-gradient(circle at 32% 30%, #2b303a, #0e1014 70%);
+  background: radial-gradient(circle at 32% 30%, #333333, #1e1e1e 70%);
 }
 .theme-swatch.light {
   background: radial-gradient(circle at 32% 30%, #ffffff, #dfe2e8 75%);
