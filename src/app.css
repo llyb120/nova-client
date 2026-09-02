@@ -3321,11 +3321,11 @@ button {
   0%, 100% { opacity: .45; }
   50% { opacity: 1; }
 }
-/* 模型选择保持紧凑，长模型名在 pill 内省略 */
+/* 模型选择：容器放宽到 420px，长模型名（后端 · 厂商名）尽量显示完整；空间不足时仍可收缩省略 */
 .composer-bar .sel.wide {
-  flex: 0 1 280px;
+  flex: 0 1 420px;
   min-width: 0;
-  max-width: min(280px, 100%);
+  max-width: min(420px, 100%);
 }
 .sel.wide .pill {
   justify-content: flex-start;
@@ -3336,6 +3336,10 @@ button {
   flex: 1;
   min-width: 0;
   max-width: 240px;
+}
+/* composer 内不设文本上限，由 .sel.wide 容器宽度控制（见上方 420px 规则） */
+.composer-bar .sel.wide .pill-text {
+  max-width: none;
 }
 .pill svg {
   flex-shrink: 0;
