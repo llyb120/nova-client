@@ -28,6 +28,8 @@ pub const EV_NOTIFY_OPEN: &str = "acp:notify-open";
 
 const LOG_CAP: usize = 800;
 const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
+/// session/prompt 发出后允许「零通知」的最长静默；超过即判定连接假死（见 prompt_with_stall_guard）。
+const PROMPT_FIRST_RESPONSE_STALL: Duration = Duration::from_secs(90);
 
 /// ACP 后端（Devin / CodeBuddy）支持 `/browser` 进入持续浏览器调试模式；
 /// 工具通过注入 nova-tools MCP 提供。
@@ -3177,6 +3179,8 @@ impl AcpManager {
         } else {
             String::new()
         };
+        // 上一次失败是「假死」而非崩溃：重建连接时保留 sessionId，用 session/load 找回上下文。
+        let mut keep_session_on_rebuild = false;
         for attempt in 1..=max_attempts {
             if !self.is_running(thread_id) {
                 return Err("任务已停止".into());
@@ -3205,7 +3209,12 @@ impl AcpManager {
                 if let Some(conn) = conn.as_ref() {
                     conn.kill();
                 }
-                self.clear_thread_session_for_respawn(thread_id);
+                if keep_session_on_rebuild {
+                    // 假死不是崩溃：只解除进程内挂载，sessionId 留着走 session/load。
+                    self.unmount_thread_sessions(thread_id);
+                } else {
+                    self.clear_thread_session_for_respawn(thread_id);
+                }
                 session_id = self.ensure_session(thread_id).await?;
                 conn = self.conn_for_key(&conn_key).await;
                 if conn.is_none() {
@@ -3246,15 +3255,8 @@ impl AcpManager {
                 .lock()
                 .unwrap()
                 .insert(session_id.clone(), std::time::Instant::now());
-            match conn
-                .request(
-                    "session/prompt",
-                    json!({
-                        "sessionId": session_id,
-                        "prompt": prompt
-                    }),
-                    None,
-                )
+            match self
+                .prompt_with_stall_guard(conn, &session_id, &prompt, attempt, max_attempts)
                 .await
             {
                 Ok(resp) => {
@@ -3265,8 +3267,15 @@ impl AcpManager {
                     let usage = resp.get("usage").cloned().filter(|v| !v.is_null());
                     return Ok((stop, usage));
                 }
-                Err(e) => {
-                    last_err = e;
+                Err(failure) => {
+                    keep_session_on_rebuild = matches!(failure, PromptFailure::Stalled(_));
+                    last_err = failure.into_message();
+                    // 用户已经停止本轮：结果作废，不重试也不再往会话里补任何提示。
+                    // force_finish 已经收尾并落了 system/turn 条目，若继续往下走，
+                    // 那些条目会被算成「本轮已有输出」，误报一条「云端连接短暂中断」。
+                    if !self.is_running(thread_id) {
+                        return Err("任务已停止".into());
+                    }
                     let dead =
                         is_process_exit_error(&last_err) || !conn.alive.load(Ordering::SeqCst);
                     if !is_retriable_rpc_error(&last_err) && !dead {
@@ -3312,6 +3321,61 @@ impl AcpManager {
             }
         }
         Err(last_err)
+    }
+
+    /// 发出 session/prompt 并看住「首个响应」：agent 收下请求后可能再不回任何通知与响应
+    /// （实测长时间空闲的 CodeBuddy 进程最常见），而 session/prompt 本身不设超时，
+    /// 界面会永远停在「正在工作」，队列里的消息也永远等不到发送。
+    ///
+    /// 判定只看「一条 update 都没收到」：正常轮次在 1 秒内就会有 session_info_update /
+    /// usage_update，静默这么久必然是连接假死。判定成立就把连接标记为已死并杀掉，
+    /// 交给调用方既有的「重建会话 + 重发 prompt」链路自愈；只要收到过任何通知，
+    /// 就继续无限等待（长思考、长工具调用都属于正常情况，交由云端自身超时收尾）。
+    async fn prompt_with_stall_guard(
+        self: &Arc<Self>,
+        conn: &Arc<AcpConn>,
+        session_id: &str,
+        prompt: &[Value],
+        attempt: u32,
+        max_attempts: u32,
+    ) -> Result<Value, PromptFailure> {
+        let request = conn.request(
+            "session/prompt",
+            json!({ "sessionId": session_id, "prompt": prompt }),
+            None,
+        );
+        tokio::pin!(request);
+        let settled = tokio::select! {
+            result = &mut request => Some(result),
+            _ = sleep(PROMPT_FIRST_RESPONSE_STALL) => None,
+        };
+        let result = match settled {
+            Some(result) => result,
+            // 看门狗到点：本会话一条通知都没收到才算假死；收到过就继续无限等待。
+            None if self.prompt_sent_at.lock().unwrap().contains_key(session_id) => {
+                self.push_log(format!(
+                    "[nova] session/prompt 已发出 {}s 但 {} 无任何响应，判定连接假死并重建（第{attempt}/{max_attempts}次）",
+                    PROMPT_FIRST_RESPONSE_STALL.as_secs(),
+                    self.kind.label()
+                ));
+                conn.alive.store(false, Ordering::SeqCst);
+                conn.kill();
+                return Err(PromptFailure::Stalled(stalled_prompt_error(
+                    self.kind.label(),
+                )));
+            }
+            None => request.await,
+        };
+        result.map_err(PromptFailure::Rpc)
+    }
+
+    /// 只解除线程上 session 的进程内挂载（保留 thread.acp_session_id）：
+    /// 下次 ensure_session 会用 session/load 找回上下文，而不是新建一个空会话。
+    fn unmount_thread_sessions(&self, thread_id: &str) {
+        self.routes
+            .lock()
+            .unwrap()
+            .retain(|_, route| route.thread_id != thread_id);
     }
 
     /// 进程崩溃后清掉线程上的 ACP session，下次 ensure_session 会新建。
@@ -3393,8 +3457,8 @@ impl AcpManager {
         // 失败的环节，表现为「停止后第一次发送失败、第二次才成功」。
         // 统一改为：协议级 session/cancel 尽力而为 + 本地立即结束 + 忘掉该 session
         // 的路由（对 cancel 支持不稳定，迟到的 update 会被忽略，停止在界面上
-        // 立即生效）。连接保持热存活，下次发送直接复用；session 仍留在 agent 侧，
-        // 可经 session/load 恢复上下文。
+        // 立即生效）。forget_session_of_thread 只回收该线程自己的连接（不影响其它
+        // 线程），thread.acp_session_id 保留，下次发送冷启动并经 session/load 找回上下文。
         self.force_finish(thread_id, "已停止当前任务。").await;
         self.forget_session_of_thread(thread_id);
     }
@@ -3677,9 +3741,10 @@ fn codebuddy_activation_env(
 mod codebuddy_acp_tests {
     use super::{
         codebuddy_command, codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
-        keep_known_model_options, lru_evict_keys, merge_codebuddy_activation_env,
-        merge_current_model_option, merge_model_config_option, publishes_model_options,
-        thread_connection_key, AcpManager, CODEBUDDY_ACP_ARGS,
+        is_process_exit_error, is_retriable_rpc_error, keep_known_model_options, lru_evict_keys,
+        merge_codebuddy_activation_env, merge_current_model_option, merge_model_config_option,
+        prompt_conn_needs_rebuild, publishes_model_options, stalled_prompt_error,
+        thread_connection_key, AcpManager, PromptFailure, CODEBUDDY_ACP_ARGS,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -3778,6 +3843,25 @@ mod codebuddy_acp_tests {
             "NOVA_QUOTA_BORROWED".into(),
             "1".into(),
         )])));
+    }
+
+    #[test]
+    fn stalled_prompt_is_recovered_by_rebuilding_the_connection() {
+        // 假死文案要走「连接不可用 → 重建 + 重发」链路，而不是被当成普通 RPC 报错结束本轮。
+        let error = stalled_prompt_error("CodeBuddy");
+        assert!(is_process_exit_error(&error));
+        assert!(prompt_conn_needs_rebuild(Some(true), &error));
+        assert!(prompt_conn_needs_rebuild(None, ""));
+        // 正常轮次（连接存活、无错）不该触发重建。
+        assert!(!prompt_conn_needs_rebuild(Some(true), ""));
+        // 假死与云端瞬时抖动是两种恢复策略：前者必须换连接，后者原连接退避重发。
+        assert!(!is_retriable_rpc_error(&error));
+        assert!(is_retriable_rpc_error("RetriableError: Connection stalled"));
+        assert_eq!(
+            PromptFailure::Stalled(error.clone()).into_message(),
+            error.clone()
+        );
+        assert_eq!(PromptFailure::Rpc(error.clone()).into_message(), error);
     }
 
     #[test]
@@ -4035,6 +4119,28 @@ fn is_process_exit_error(err: &str) -> bool {
 
 fn prompt_conn_needs_rebuild(conn_alive: Option<bool>, last_err: &str) -> bool {
     conn_alive != Some(true) || is_process_exit_error(last_err)
+}
+
+/// 假死判定的错误文案。必须能被 is_process_exit_error 识别，否则 prompt 重试链路
+/// 不会把它当成「连接坏了」去重建连接，本轮会直接报错结束而不是自愈重发。
+fn stalled_prompt_error(label: &str) -> String {
+    format!("{label} 进程已退出（收下本轮请求后长时间无任何响应）")
+}
+
+/// session/prompt 的失败原因。Stalled = agent 收下请求后长时间零响应被判定假死：
+/// 与进程崩溃不同，会话在 agent 侧仍然完好，重建连接后必须 session/load 找回上下文，
+/// 不能像崩溃那样丢掉 sessionId 从空会话重来。
+enum PromptFailure {
+    Rpc(String),
+    Stalled(String),
+}
+
+impl PromptFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::Rpc(message) | Self::Stalled(message) => message,
+        }
+    }
 }
 
 /// 瞬时错误退避：1s → 2s → 4s → 8s（封顶 8s）。
