@@ -239,7 +239,8 @@ export function ChatView() {
     allowedActions: ["selectModel"],
     onSelectProject: () => {},
     onSelectModel: (agentKind, model, quotaPeer) => {
-      // 进行中的会话不支持额度租借切换（与 Composer 一致）。
+      // 额度会话的共享模型条目（快捷键 target 带队友）不能拿来换后端；只当前后端
+      // 的模型走 set_thread_model，由后端按已持有的额度租约把关。
       if (quotaPeer) return;
       void pickThreadModel(agentKind, model);
     },
