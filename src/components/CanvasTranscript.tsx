@@ -988,8 +988,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     return shown !== undefined && item.text.startsWith(shown) ? shown : item.text;
   };
 
+  /** rAF 回调与卸载状态串行：追加提示词触发的 reveal rebuild 若在卸载后落地，
+   *  会拿旧 blocks/scrollY 重绘并触发 onScroll，与 mounted 判断一起兜底卡死场景。 */
+  let disposed = false;
+
   const revealFrame = (now: number) => {
     revealRaf = 0;
+    if (disposed) return;
     let changed = false;
     let pending = false;
     for (const [id, target] of targetText) {
@@ -1012,8 +1017,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (next.text.length < target.length) pending = true;
     }
     lastRevealAt = now;
-    if (changed) scheduleRebuild(false, true);
-    if (pending) revealRaf = requestAnimationFrame(revealFrame);
+    // 卸载/悬挂期间（如会话切换中）stream 仍能改 shownText：只更新缓冲，
+    // 不触发 rebuild —— 否则会把流式长帧叠进切换流程，且 revealed 文字可能基于
+    // 已废弃的 blocks 布局，滚轮锁定随之错位。复挂载后的 effect 会重新 rebuild。
+    if (changed && !disposed) scheduleRebuild(false, true);
+    if (pending && !disposed) revealRaf = requestAnimationFrame(revealFrame);
   };
 
   const syncRevealTargets = (showExisting: boolean) => {
@@ -2884,6 +2892,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     requestPaint();
   }
 
+  // onWheel 的 rAF 合并状态
+  let wheelDelta = 0;
+  let wheelRaf = 0;
+
   function scrollFromPointerY(clientY: number) {
     const g = scrollbarGeom();
     if (!g || g.travel <= 0) return;
@@ -3195,33 +3207,39 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function onWheel(e: WheelEvent) {
     e.preventDefault();
-    const dy = e.deltaY;
+    // 高频滚轮事件按帧合并：一次滚动手势会产生数十个事件，逐个同步改 scrollY +
+    // applyEditStyle 叠加流式 rebuild/paint 的长帧，会把输入队列堵死（滚轮看似锁死）。
+    wheelDelta += e.deltaY;
+    if (wheelRaf) return;
+    wheelRaf = requestAnimationFrame(() => {
+      wheelRaf = 0;
+      if (disposed) return;
+      const dy = wheelDelta;
+      wheelDelta = 0;
+      if (!dy) return;
 
-    // When selecting text, always scroll the main canvas (don't trap in block)
-    if (!selecting) {
-      const idx = hitTest(e.clientX, e.clientY);
-      if (idx >= 0) {
-        const b = blocks[idx];
-        if (b.data?.clipped && b.kind === "tool-content") {
-          const fullH = (b.data.fullH as number) || b.h;
-          const maxBlockScroll = fullH - b.h;
-          const key = blockScrollKey(b);
-          const curScroll = blockScrolls.get(key) || 0;
-          const newScroll = Math.max(0, Math.min(maxBlockScroll, curScroll + dy));
-          if (newScroll !== curScroll) {
-            blockScrolls.set(key, newScroll);
-            requestPaint();
-            return;
+      // When selecting text, always scroll the main canvas (don't trap in block)
+      if (!selecting) {
+        const idx = hitTest(e.clientX, e.clientY);
+        if (idx >= 0) {
+          const b = blocks[idx];
+          if (b.data?.clipped && b.kind === "tool-content") {
+            const fullH = (b.data.fullH as number) || b.h;
+            const maxBlockScroll = fullH - b.h;
+            const key = blockScrollKey(b);
+            const curScroll = blockScrolls.get(key) || 0;
+            const newScroll = Math.max(0, Math.min(maxBlockScroll, curScroll + dy));
+            if (newScroll !== curScroll) {
+              blockScrolls.set(key, newScroll);
+              requestPaint();
+              return;
+            }
           }
         }
       }
-    }
 
-    scrollY = Math.max(0, Math.min(maxScroll, scrollY + dy));
-    keepBottom = maxScroll - scrollY <= 2;
-    applyEditStyle();
-    props.onScroll?.(scrollY, maxScroll, true);
-    requestPaint();
+      applyScrollY(scrollY + dy, true);
+    });
   }
 
   function onCopy(e: ClipboardEvent) {
@@ -3244,6 +3262,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     paintQueued = true;
     requestAnimationFrame(() => {
       paintQueued = false;
+      if (disposed) return;
       paintAll();
     });
   }
@@ -3454,6 +3473,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     });
 
     onCleanup(() => {
+      disposed = true;
       ro.disconnect();
       visibilityObserver.disconnect();
       mo.disconnect();
@@ -3463,6 +3483,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       editResizeObserver = undefined;
       editHostEl = undefined;
       if (revealRaf) cancelAnimationFrame(revealRaf);
+      if (wheelRaf) { cancelAnimationFrame(wheelRaf); wheelRaf = 0; wheelDelta = 0; }
       if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
       if (rebuildTimer !== undefined) window.clearTimeout(rebuildTimer);
       if (busyTimer !== undefined) window.clearTimeout(busyTimer);
