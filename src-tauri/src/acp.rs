@@ -2649,14 +2649,12 @@ impl AcpManager {
         Ok(sid)
     }
 
-    /// 在指定线程上执行一轮对话。
-    /// already_pushed：steer 转新轮次时用户消息已由 steer 落库上屏，跳过 push_user 避免重复气泡。
-    async fn run_prompt_inner(
+    /// 在指定线程上执行一轮对话
+    pub async fn run_prompt(
         self: &Arc<Self>,
         thread_id: String,
         text: String,
         images: Vec<PromptImage>,
-        already_pushed: bool,
     ) {
         // 新会话的 Paper Trail / 跨 agent 接力上下文，在真实用户输入前隐式注入。
         let handoff = {
@@ -2715,24 +2713,16 @@ impl AcpManager {
             let Some(thread) = store.get_mut(&thread_id) else {
                 return;
             };
+            let item = thread.push_user(text.clone(), images.clone());
             if thread.title == "新会话" {
                 let fallback = derive_title(&text, !images.is_empty());
                 thread.title = fallback.clone();
                 title_job = Some((text.clone(), fallback));
                 let _ = self.app.emit(EV_THREADS, json!({}));
             }
-            if already_pushed {
-                store.save_thread(&thread_id);
-            } else {
-                let item = thread.push_user(text.clone(), images.clone());
-                store.save_thread(&thread_id);
-                self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
-            }
+            store.save_thread(&thread_id);
+            self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
         }
-        // 先于 set_running 占位本论收尾：若这是 steer 转入的新轮次，上一轮被 defer 的
-        // 收尾会在下一轮次真正开始前完成（steer 已推的用户消息会落进那一轮的耗时区间），
-        // 保证结束后 running=false 事件一定发出，杜绝「回复已完但界面一直 loading」。
-        self.reserve_steer(&thread_id);
         self.clear_plan(&thread_id);
         self.set_running(&thread_id, true, None);
 
@@ -2765,19 +2755,8 @@ impl AcpManager {
             .drive_prompt(&thread_id, &text, &images, handoff.as_deref())
             .await;
 
-        // 轮次已被强制结束（看门狗/重启 devin），丢弃迟到的结果。
-        // 本论的收尾占位仍在 steer_turns 里：不再触碰 running，但要把占位释放，
-        // 否则下一次 finish_turn_after_steers 会被这个孤儿占位永久挂起，表现为一直 loading。
+        // 轮次已被强制结束（看门狗/重启 devin），丢弃迟到的结果
         if !self.is_running(&thread_id) {
-            {
-                let mut turns = self.steer_turns.lock().unwrap();
-                if let Some(state) = turns.get_mut(&thread_id) {
-                    state.pending = state.pending.saturating_sub(1);
-                    if state.pending == 0 {
-                        turns.remove(&thread_id);
-                    }
-                }
-            }
             return;
         }
 
@@ -2820,16 +2799,6 @@ impl AcpManager {
         };
         self.finish_turn_after_steers(&thread_id, stop_reason, usage);
         let _ = self.app.emit(EV_THREADS, json!({}));
-    }
-
-    /// 在指定线程上执行一轮对话
-    pub async fn run_prompt(
-        self: &Arc<Self>,
-        thread_id: String,
-        text: String,
-        images: Vec<PromptImage>,
-    ) {
-        self.run_prompt_inner(thread_id, text, images, false).await;
     }
 
     /// 构建 session/prompt 的 content blocks（文本 + 附件）。
@@ -3004,21 +2973,10 @@ impl AcpManager {
         }
         // 「停止 → 立刻重发」竞态：路由到这里时轮次还在跑，但此刻 cancel 已落地。
         // 再注入只会随被取消的轮次一起丢弃（消息上屏却永远没有回应，表现为发送失败），
-        // 改走正常新轮次。消息在上面已推过一次，转到新轮次时不再重复推，避免重复气泡；
-        // 收尾占位由新轮次内部接管（reserve + finish_turn_after_steers），这里只做落库。
+        // 改走正常新轮次。
         if !self.is_running(&thread_id) {
-            {
-                let state = self.app.state::<AppState>();
-                let mut store = state.store.lock().unwrap();
-                if let Some(thread) = store.get_mut(&thread_id) {
-                    let item = thread.push_user(text.clone(), images.clone());
-                    store.save_thread(&thread_id);
-                    self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
-                }
-            }
-            self.clone()
-                .run_prompt_inner(thread_id, text, images, true)
-                .await;
+            self.complete_steer(&thread_id);
+            self.clone().run_prompt(thread_id, text, images).await;
             return;
         }
         let err = |msg: String| {
