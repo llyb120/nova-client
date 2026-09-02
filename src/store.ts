@@ -1093,7 +1093,10 @@ export function clearQuotaRoamingProgress() {
   setState("quotaRoamingProgress", null);
 }
 
-const THREAD_SNAPSHOT_LIMIT = 3;
+// 覆盖典型 /stage 链（源会话 + 多个 stage 节点）来回切换，避免快照互相挤出后
+// 每次切换都退化成 getThread 全量拉取整条 transcript。items 是 unwrap 浅引用，
+// 单条快照内存开销可控，上限取 8 而非无上限。
+const THREAD_SNAPSHOT_LIMIT = 8;
 const threadSnapshots = new LruMap<string, Thread>(THREAD_SNAPSHOT_LIMIT);
 const staleThreadSnapshots = new Set<string>();
 /** 运行中各会话最近一次实时用量；切换会话时恢复，避免等待下一次 usage 事件。 */

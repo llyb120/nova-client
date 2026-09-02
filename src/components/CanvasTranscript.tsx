@@ -1079,7 +1079,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
   // 与 transcript 快照保持同一小窗口；每份缓存都持有完整 Block 树，按会话数放大后
   // 会抵消快照 LRU 的内存收益，并让运行越久后的 GC 停顿重新拖慢会话切换。
-  const prefixLayoutCaches = new LruMap<string, PrefixLayoutCache>(3);
+  // 与 threadSnapshots 同理：stage 链 > 3 个节点来回切换时，3 格前缀布局缓存互相
+  // 挤出，导致每次切回都把全部已闭合分组从头重排（measureText + 布局 + 光栅化），
+  // 这正是"会话都已加载、来回切换仍卡"的来源。调大到能容纳典型 stage 链。
+  const prefixLayoutCaches = new LruMap<string, PrefixLayoutCache>(8);
   // groupItems 会保留已闭合分组的对象身份；缓存其内容签名，避免每个流式 token
   // 都重新遍历整段历史文本。展开状态变化时会整体换新此 WeakMap。
   let closedGroupSigCache = new WeakMap<Group, string>();
