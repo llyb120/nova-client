@@ -1162,10 +1162,34 @@ function recoverProposedPlan(_thread: Thread): string | null {
 
 let openThreadRequest = 0;
 
+/** 切换会话耗时自测：仅在总耗时超阈值时写一行 agent 日志，release 包也能定位卡点。 */
+let switchTraceStart = 0;
+export function markThreadSwitchStart() {
+  switchTraceStart = performance.now();
+}
+function traceThreadSwitch(id: string, phase: string) {
+  if (!switchTraceStart) return;
+  const ms = Math.round(performance.now() - switchTraceStart);
+  if (ms < 150) return; // 150ms 内不算卡，不刷日志
+  setState("logs", (logs) => [...logs, `[切换卡顿] ${phase} +${ms}ms (会话 ${id.slice(0, 8)})`]);
+}
+/** 布局落地后收尾：写一行总耗时并清零，避免后续无关操作重复打点。 */
+export function traceThreadSwitchLayoutDone(threadId: string | null, groupCount: number) {
+  if (!switchTraceStart || !threadId) return;
+  const ms = Math.round(performance.now() - switchTraceStart);
+  switchTraceStart = 0;
+  if (ms < 150) return;
+  setState("logs", (logs) => [
+    ...logs,
+    `[切换卡顿] 布局+绘制落地 总${ms}ms (${groupCount} 组, 会话 ${threadId.slice(0, 8)})`,
+  ]);
+}
+
 export async function openThread(id: string) {
   const switching = state.currentId !== id;
   const request = switching ? ++openThreadRequest : openThreadRequest;
   const previousId = state.currentId;
+  if (switching && !switchTraceStart) markThreadSwitchStart();
   flushPendingStreamUpdates();
   if (switching) {
     rememberCurrentThreadSnapshot();
@@ -1213,6 +1237,7 @@ export async function openThread(id: string) {
   try {
     // 先切换后端 active_thread，再静默校准快照，补齐后台会话运行期间未广播的高频增量。
     await api.reportActivity(id);
+    traceThreadSwitch(id, "reportActivity(IPC) 返回");
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
     if (cached && switching && !staleThreadSnapshots.has(id)) {
@@ -1224,6 +1249,7 @@ export async function openThread(id: string) {
       return;
     }
     const t = await api.getThread(id);
+    traceThreadSwitch(id, "getThread(IPC) 返回");
     if (request !== openThreadRequest) return;
     rememberThreadSnapshot(t);
     const agentKind = t.agentKind ?? "devin";

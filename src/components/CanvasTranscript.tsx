@@ -5,7 +5,7 @@ import {
 } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
-import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded } from "../store";
+import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
@@ -3317,6 +3317,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, false);
     paintAll();
+    // 仅在切换后有实际内容时收尾；缓存未命中会先空布局一帧，不能误清零起点。
+    if (props.groups.length > 0) traceThreadSwitchLayoutDone(props.threadId, props.groups.length);
   }
 
   const queueRebuildFrame = () => {
@@ -3469,7 +3471,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       scrollTop() { return scrollY; },
       maxScrollTop() { return maxScroll; },
       activeGroup() { let a = -1; for (let i = 0; i < groupYs.length; i++) { if (groupYs[i] <= scrollY + 32) a = i; } return a; },
-      hasFocusedInput() { return !!editing(); },
+      hasFocusedInput() {
+        if (editing()) return true;
+        const el = document.activeElement;
+        return el instanceof HTMLElement && (el.isContentEditable || el.tagName === "INPUT" || el.tagName === "TEXTAREA");
+      },
     });
 
     onCleanup(() => {
