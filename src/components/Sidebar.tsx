@@ -375,6 +375,14 @@ export function Sidebar(props: {
       return state.threads.filter((thread) => ids.has(thread.id));
     };
     const running = () => chainThreads().some((thread) => !!state.running[thread.id]);
+    // 运行状态直接标在模型徽标上（发光 + 流线扫圈），不再占用右侧文字空间
+    const runChild = () => !!(props.mergedChild && state.running[props.mergedChild.id]);
+    const runSelf = () => running() && !runChild();
+    // 链上任一会话有未读的新轮次结论 → 在模型徽标右上角显示未读数
+    const unreadCount = () =>
+      active()
+        ? 0
+        : chainThreads().reduce((sum, thread) => sum + (state.unreadTurns[thread.id] ?? 0), 0);
     const active = () => !!state.currentId && chainThreads().some((thread) => thread.id === state.currentId);
     const title = () => props.mergedChild?.title ?? t.title;
     const updatedAt = () => Math.max(...chainThreads().map((thread) => thread.updatedAt));
@@ -419,23 +427,33 @@ export function Sidebar(props: {
             └
           </span>
         </Show>
-        <span class={`thread-agent ${t.agentKind}`} title={`Wake · ${agentLabel(t.agentKind)}`}>
+        <span
+          class={`thread-agent ${t.agentKind}`}
+          classList={{ running: runSelf(), unread: unreadCount() > 0 && !runChild() }}
+          title={`Wake · ${agentLabel(t.agentKind)}`}
+        >
           {agentShort(t.agentKind)}
+          <Show when={unreadCount() > 0 && !runChild()}>
+            <span class="thread-unread-badge">
+              {unreadCount() > 9 ? "9+" : unreadCount()}
+            </span>
+          </Show>
         </span>
         <Show when={props.mergedChild}>
           <span class="thread-pair-arrow">→</span>
           <span
             class={`thread-agent ${props.mergedChild!.agentKind}`}
+            classList={{ running: runChild(), unread: unreadCount() > 0 && runChild() }}
             title={`Do · ${agentLabel(props.mergedChild!.agentKind)}`}
           >
             {agentShort(props.mergedChild!.agentKind)}
+            <Show when={unreadCount() > 0 && runChild()}>
+              <span class="thread-unread-badge">
+                {unreadCount() > 9 ? "9+" : unreadCount()}
+              </span>
+            </Show>
           </span>
         </Show>
-        <span class="thread-run-slot">
-          <Show when={running()}>
-            <span class="spinner small" />
-          </Show>
-        </span>
         <span class="thread-content">
           <TypewriterText
             class="thread-title"

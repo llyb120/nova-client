@@ -552,6 +552,14 @@ button {
 .thread-item.history-time {
   height: 42px;
 }
+/* 两行布局下模型徽标放大到两行内容的高度，成小方块主图标 */
+.thread-item.history-time .thread-agent {
+  width: 22px;
+  height: 22px;
+  line-height: 22px;
+  font-size: 12px;
+  border-radius: 6px;
+}
 .thread-history-meta {
   display: block;
   min-width: 0;
@@ -628,13 +636,60 @@ button {
   font-size: 10px;
 }
 
-.thread-run-slot {
-  display: flex;
+/* 会话运行中：不给 spinner 单独占位，模型徽标做流光效果——
+   一道白色斜向光带周期性从左扫到右，徽标本体不动 */
+.thread-item .thread-agent.running {
+  position: relative;
+  overflow: hidden;
+}
+.thread-item .thread-agent.running::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -120%;
+  width: 70%;
+  background: linear-gradient(
+    100deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.28) 38%,
+    rgba(255, 255, 255, 0.5) 50%,
+    rgba(255, 255, 255, 0.28) 62%,
+    transparent 100%
+  );
+  animation: thread-shine 1.9s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes thread-shine {
+  0% { left: -120%; }
+  65%, 100% { left: 160%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thread-item .thread-agent.running::after { display: none; }
+}
+/* 未读新轮次结论：徽标右上角数字角标（stage 链多次完成会累计） */
+.thread-item .thread-agent.unread {
+  position: relative;
+}
+.thread-unread-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--red, #e5484d);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 11px;
-  height: 11px;
-  flex-shrink: 0;
+  border: 1.5px solid var(--bg);
+  pointer-events: none;
+  z-index: 1;
 }
 
 .thread-agent.codex,

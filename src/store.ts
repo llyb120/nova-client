@@ -126,6 +126,8 @@ interface AppStore {
   reasoningEffort: string;
   /** 当前打开线程若是漫游 guest，其对端（host）token；否则 null。用于取对端模型列表 */
   roamingPeer: string | null;
+  /** 各会话未读新轮次结论数：每次轮次正常结束且该会话非当前打开则 +1，stage 链各自累计 */
+  unreadTurns: Record<string, number>;
   running: Record<string, boolean>;
   permissions: PermissionRequest[];
   connected: boolean;
@@ -236,6 +238,7 @@ export const [state, setState] = createStore<AppStore>({
   roamingFolders: [],
   expanded: {},
   titleTyping: {},
+  unreadTurns: {},
   view: "home",
   clueSpace: "personal",
   clueGroups: [],
@@ -1190,6 +1193,7 @@ export function traceThreadSwitchLayoutDone(threadId: string | null, groupCount:
 }
 
 export async function openThread(id: string) {
+  if (state.unreadTurns[id]) setState("unreadTurns", id, 0);
   const switching = state.currentId !== id;
   const request = switching ? ++openThreadRequest : openThreadRequest;
   const previousId = state.currentId;
@@ -2821,6 +2825,12 @@ export async function initStore() {
       resumeFireRelay(e.payload.threadId);
       handleWorkflowTurnStart(e.payload.threadId);
     } else {
+      // 轮次正常收尾且该会话未打开 → 标记未读，提醒回看结论
+      const completedNormally =
+        e.payload.stopReason === "end_turn" || e.payload.stopReason === "max_turn_requests";
+      if (completedNormally && threadId !== state.currentId) {
+        setState("unreadTurns", threadId, (state.unreadTurns[threadId] ?? 0) + 1);
+      }
       // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
       liveUsageByThread.delete(threadId);
       if (threadId === state.currentId) setState("liveUsage", null);

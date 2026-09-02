@@ -123,6 +123,8 @@ export interface ThreadMeta {
   roamingRole?: string | null;
   /** 漫游对端展示名 */
   roamingPeerName?: string | null;
+  /** 非空：本机会话使用该在线队友临时授权的额度（提供方 token） */
+  quotaPeer?: string | null;
   /** 额度租借提供方展示名 */
   quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行 */
