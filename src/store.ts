@@ -822,7 +822,9 @@ export function openNewSession(quote = "") {
   const id = state.currentId;
   if (id) {
     const meta = state.threads.find((thread) => thread.id === id);
-    const cwd = meta?.worktree?.repo || state.cwd;
+    // worktree 会话的 state.cwd 已指向 worktree 工作目录，新会话应留在同一 worktree；
+    // 只有 cwd 缺失时才回退到源仓库（后端也会按已知 worktree 目录补齐标注）。
+    const cwd = state.cwd || meta?.worktree?.repo || "";
     const seed: PendingNewSessionSeed = {
       cwd,
       agentKind: state.agentKind,
