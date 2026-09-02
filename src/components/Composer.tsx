@@ -8,6 +8,7 @@ import {
 import {
   dispatchQueuedPrompt,
   dispatchingQueueIds,
+  dropQueuedPromptsMatching,
   enqueuePrompt,
   failedQueueIds,
   holdPromptQueue,
@@ -400,8 +401,12 @@ export function Composer() {
       enqueuePrompt(currentId, value, images);
       return;
     }
-    releasePromptQueue(currentId);
-    void sendPrompt(value, images);
+    // 停止后重新输入同一条时，队列里通常还留着停止前排入的同一份内容；先撤下，
+    // 否则它会在手动这轮结束后再自动投递一次，用户看到两条相同消息。
+    dropQueuedPromptsMatching(currentId, value, images);
+    // 解挂必须晚于本轮 running 置位（与 store 里「编辑历史消息重发」同样的问题）：
+    // 提前解挂会让 dispatcher 在 running 置位前把队列里剩余的条目并发投递出去。
+    void sendPrompt(value, images).finally(() => releasePromptQueue(currentId));
   };
 
   const insertSlashSuggestion = (item: SlashSuggestion) => {
