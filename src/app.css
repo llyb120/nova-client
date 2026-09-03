@@ -157,7 +157,6 @@ body {
   background: var(--bg);
   overflow: hidden;
   user-select: none;
-  -webkit-font-smoothing: antialiased;
 }
 
 ::selection {
