@@ -12,10 +12,10 @@
 
 mod agent;
 mod bridge;
-mod config;
+pub(crate) mod config;
 mod edit;
 mod prompt;
-mod provider;
+pub(crate) mod provider;
 mod read;
 mod reasonix;
 mod tools;

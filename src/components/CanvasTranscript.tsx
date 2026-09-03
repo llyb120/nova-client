@@ -1,15 +1,19 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { message } from "@tauri-apps/plugin-dialog";
 import {
   paintCanvasBackdrop,
   STAR_MAP_UPDATE_MS,
 } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
-import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded } from "../store";
+import { api } from "../ipc";
+import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
+import { relPath } from "./EditedFilesCard";
+import { createFileContextMenu } from "./FileContextMenu";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
 import { fmtDuration, fmtTokens, turnTokenTitle } from "./TurnGroup";
@@ -59,23 +63,23 @@ function readPalette(): Palette {
   const s = getComputedStyle(document.documentElement);
   const v = (n: string, fb: string) => s.getPropertyValue(n).trim() || fb;
   return {
-    bg: v("--bg", "#0e1014"), panel: v("--bg-panel", "#171b23"),
-    sidebar: v("--bg-sidebar", "#0a0c10"), hover: v("--bg-hover", "#1e232d"),
-    border: v("--border", "#252a33"), borderLight: v("--border-light", "#313844"),
-    text: v("--canvas-text", v("--text", "#e4e7ec")),
-    dim: v("--canvas-text-dim", v("--text-dim", "#a9b0bd")),
-    muted: v("--canvas-text-muted", v("--text-muted", "#7d8593")),
-    faint: v("--canvas-text-faint", v("--text-faint", "#5d6470")),
-    accent: v("--accent", "#6e93f8"), accentDim: v("--accent-dim", "rgba(110,147,248,.14)"),
+    bg: v("--bg", "#1e1e1e"), panel: v("--bg-panel", "#212121"),
+    sidebar: v("--bg-sidebar", "#181818"), hover: v("--bg-hover", "#2a2a2a"),
+    border: v("--border", "#2b2b2b"), borderLight: v("--border-light", "#3c3c3c"),
+    text: v("--canvas-text", v("--text", "#d4d4d4")),
+    dim: v("--canvas-text-dim", v("--text-dim", "#b8b8b8")),
+    muted: v("--canvas-text-muted", v("--text-muted", "#8b8b8b")),
+    faint: v("--canvas-text-faint", v("--text-faint", "#6e6e6e")),
+    accent: v("--accent", "#3794ff"), accentDim: v("--accent-dim", "rgba(55,148,255,.16)"),
     red: v("--red", "#e07d76"), yellow: v("--yellow", "#d4b26e"),
     green: v("--green", "#8ec489"), blue: v("--blue", "#7aa2f2"),
-    scroll: v("--scroll", "#2e333d"),
+    scroll: v("--scroll", "#31302e"),
     wash1: v("--wash-1", "rgba(111,151,240,.05)"),
-    wash2: v("--wash-2", "rgba(209,154,102,.04)"),
-    gridDot: v("--grid-dot", "rgba(228,231,236,.045)"),
-    glowAccent: v("--canvas-glow-accent", "rgba(110,147,248,.11)"),
-    glowCyan: v("--canvas-glow-cyan", "rgba(63,212,228,.06)"),
-    glowCorner: v("--canvas-glow-corner", "rgba(110,147,248,.05)"),
+    wash2: v("--wash-2", "rgba(206,145,120,.04)"),
+    gridDot: v("--grid-dot", "rgba(255,255,255,.05)"),
+    glowAccent: v("--canvas-glow-accent", "rgba(0,122,204,.12)"),
+    glowCyan: v("--canvas-glow-cyan", "rgba(79,193,233,.06)"),
+    glowCorner: v("--canvas-glow-corner", "rgba(0,122,204,.05)"),
     mono: v("--mono", "monospace"), sans: v("--sans", "sans-serif"),
   };
 }
@@ -950,6 +954,13 @@ function lineAtOffset(b: Block, offset: number): TextLine | null {
   return offset < lines[0].offset ? lines[0] : lines[lines.length - 1];
 }
 
+/** 在配置的编辑器中打开文件（带可选行号），失败弹错误（对齐 DOM ToolCallCard） */
+function openInEditor(path: string, line?: number) {
+  const id = state.currentId;
+  if (!id || !path) return;
+  void api.openInEditor(id, path, line).catch((e) => void message(String(e), { kind: "error" }));
+}
+
 // ─── Main component ──────────────────────────────────────────────────────────
 
 export function CanvasTranscript(props: CanvasTranscriptProps) {
@@ -974,6 +985,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let cursorStyle = "default";
   /** code-copy-btn feedback: hoverKey → hide-after timestamp */
   const copiedCodeUntil = new Map<string, number>();
+  const fileMenu = createFileContextMenu();
   const shownText = new Map<number, string>();
   const targetText = new Map<number, string>();
   const revealReadyAt = new Map<number, number>();
@@ -988,8 +1000,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     return shown !== undefined && item.text.startsWith(shown) ? shown : item.text;
   };
 
+  /** rAF 回调与卸载状态串行：追加提示词触发的 reveal rebuild 若在卸载后落地，
+   *  会拿旧 blocks/scrollY 重绘并触发 onScroll，与 mounted 判断一起兜底卡死场景。 */
+  let disposed = false;
+
   const revealFrame = (now: number) => {
     revealRaf = 0;
+    if (disposed) return;
     let changed = false;
     let pending = false;
     for (const [id, target] of targetText) {
@@ -1012,8 +1029,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (next.text.length < target.length) pending = true;
     }
     lastRevealAt = now;
-    if (changed) scheduleRebuild(false, true);
-    if (pending) revealRaf = requestAnimationFrame(revealFrame);
+    // 卸载/悬挂期间（如会话切换中）stream 仍能改 shownText：只更新缓冲，
+    // 不触发 rebuild —— 否则会把流式长帧叠进切换流程，且 revealed 文字可能基于
+    // 已废弃的 blocks 布局，滚轮锁定随之错位。复挂载后的 effect 会重新 rebuild。
+    if (changed && !disposed) scheduleRebuild(false, true);
+    if (pending && !disposed) revealRaf = requestAnimationFrame(revealFrame);
   };
 
   const syncRevealTargets = (showExisting: boolean) => {
@@ -1071,7 +1091,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
   // 与 transcript 快照保持同一小窗口；每份缓存都持有完整 Block 树，按会话数放大后
   // 会抵消快照 LRU 的内存收益，并让运行越久后的 GC 停顿重新拖慢会话切换。
-  const prefixLayoutCaches = new LruMap<string, PrefixLayoutCache>(3);
+  // 与 threadSnapshots 同理：stage 链 > 3 个节点来回切换时，3 格前缀布局缓存互相
+  // 挤出，导致每次切回都把全部已闭合分组从头重排（measureText + 布局 + 光栅化），
+  // 这正是"会话都已加载、来回切换仍卡"的来源。调大到能容纳典型 stage 链。
+  const prefixLayoutCaches = new LruMap<string, PrefixLayoutCache>(8);
   // groupItems 会保留已闭合分组的对象身份；缓存其内容签名，避免每个流式 token
   // 都重新遍历整段历史文本。展开状态变化时会整体换新此 WeakMap。
   let closedGroupSigCache = new WeakMap<Group, string>();
@@ -1784,7 +1807,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         let rowH = 0;
         for (const loc of item.locations) {
           if (!loc.path) continue;
-          const name = `${loc.path.split(/[\\/]/).pop() ?? loc.path}${loc.line != null ? `:${loc.line}` : ""}`;
+          const locPath = loc.path;
+          const name = `${locPath.split(/[\\/]/).pop() ?? locPath}${loc.line != null ? `:${loc.line}` : ""}`;
           const chipW = measure(name, 11.5, p.mono) + 18; // padding 2*9
           if (lx + chipW > contentX + contentW && lx > contentX) {
             lx = contentX; by += 24; // chip h ~20 + gap
@@ -1794,8 +1818,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             text: name, color: p.blue, fontSize: 11.5, font: p.mono,
             bg: p.panel, hoverBg: p.hover, borderRadius: 20, cursor: "pointer",
             selectable: false,
-            data: { padX: 9, padY: 2, underlineOnHover: true },
-            clickAction: () => { /* openFile */ } });
+            title: `在编辑器中打开 ${locPath}`,
+            data: { padX: 9, padY: 2, underlineOnHover: true, filePath: locPath },
+            clickAction: () => openInEditor(locPath, loc.line ?? undefined) });
           lx += chipW + 6;
           rowH = 20;
         }
@@ -1806,6 +1831,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       for (const content of contentBlocks) {
         if (content.type === "diff") {
           const diff = content as { type: "diff"; path: string; oldText?: string | null; newText: string };
+          // 与 DOM DiffView 一致：diff 上方显示文件路径，点击打开编辑器、右键弹文件菜单
+          result.push({ kind: "tool-diff-path", id: item.id, groupIdx: gi,
+            x: contentX, y: by, w: contentW, h: 26,
+            text: relPath(diff.path), color: p.blue, fontSize: 11.5, lineHeight: 1.2, font: p.mono,
+            bg: p.panel, border: p.border, borderRadius: [7, 7, 0, 0], hoverBg: p.hover,
+            cursor: "pointer", selectable: false,
+            title: `在编辑器中打开 ${diff.path}`,
+            data: { padX: 10, padY: 6, underlineOnHover: true, filePath: diff.path },
+            clickAction: () => openInEditor(diff.path) });
+          by += 26;
           const preview = (diff.oldText ?? "").slice(0, 200) + "\n→\n" + diff.newText.slice(0, 200);
           const lines = wrapText(preview, contentW - 20, 12, p.mono);
           const fullH = lines.length * 12 * 1.55 + 20;
@@ -1813,7 +1848,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           result.push({ kind: "tool-content", id: item.id, groupIdx: gi,
             x: contentX, y: by, w: contentW, h,
             text: preview, color: p.dim, fontSize: 12, lineHeight: 1.55, font: p.mono,
-            bg: p.sidebar, border: p.border, borderRadius: 7, selectable: true,
+            bg: p.sidebar, border: p.border, borderRadius: [0, 0, 7, 7], selectable: true,
             data: { padX: 10, padY: 10, fullH, clipped: fullH > 320 } });
           by += h + 8;
         } else if (content.type === "content") {
@@ -2013,6 +2048,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         case "tool-content":
         case "actual-model":
         case "tool-location":
+        case "tool-diff-path":
           paintTextBlock(ctx, b, bx, by, !!isHover, i);
           break;
         case "thinking-status":
@@ -2884,6 +2920,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     requestPaint();
   }
 
+  // onWheel 的 rAF 合并状态
+  let wheelDelta = 0;
+  let wheelRaf = 0;
+
   function scrollFromPointerY(clientY: number) {
     const g = scrollbarGeom();
     if (!g || g.travel <= 0) return;
@@ -3193,35 +3233,49 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
   }
 
+  // 文件块右键弹文件菜单（复用 DOM 的 FileContextMenu）；其余区域仅屏蔽浏览器默认菜单
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    const idx = hitTest(e.clientX, e.clientY);
+    const path = idx >= 0 ? (blocks[idx].data?.filePath as string | undefined) : undefined;
+    if (path) fileMenu.open(e, path);
+  }
+
   function onWheel(e: WheelEvent) {
     e.preventDefault();
-    const dy = e.deltaY;
+    // 高频滚轮事件按帧合并：一次滚动手势会产生数十个事件，逐个同步改 scrollY +
+    // applyEditStyle 叠加流式 rebuild/paint 的长帧，会把输入队列堵死（滚轮看似锁死）。
+    wheelDelta += e.deltaY;
+    if (wheelRaf) return;
+    wheelRaf = requestAnimationFrame(() => {
+      wheelRaf = 0;
+      if (disposed) return;
+      const dy = wheelDelta;
+      wheelDelta = 0;
+      if (!dy) return;
 
-    // When selecting text, always scroll the main canvas (don't trap in block)
-    if (!selecting) {
-      const idx = hitTest(e.clientX, e.clientY);
-      if (idx >= 0) {
-        const b = blocks[idx];
-        if (b.data?.clipped && b.kind === "tool-content") {
-          const fullH = (b.data.fullH as number) || b.h;
-          const maxBlockScroll = fullH - b.h;
-          const key = blockScrollKey(b);
-          const curScroll = blockScrolls.get(key) || 0;
-          const newScroll = Math.max(0, Math.min(maxBlockScroll, curScroll + dy));
-          if (newScroll !== curScroll) {
-            blockScrolls.set(key, newScroll);
-            requestPaint();
-            return;
+      // When selecting text, always scroll the main canvas (don't trap in block)
+      if (!selecting) {
+        const idx = hitTest(e.clientX, e.clientY);
+        if (idx >= 0) {
+          const b = blocks[idx];
+          if (b.data?.clipped && b.kind === "tool-content") {
+            const fullH = (b.data.fullH as number) || b.h;
+            const maxBlockScroll = fullH - b.h;
+            const key = blockScrollKey(b);
+            const curScroll = blockScrolls.get(key) || 0;
+            const newScroll = Math.max(0, Math.min(maxBlockScroll, curScroll + dy));
+            if (newScroll !== curScroll) {
+              blockScrolls.set(key, newScroll);
+              requestPaint();
+              return;
+            }
           }
         }
       }
-    }
 
-    scrollY = Math.max(0, Math.min(maxScroll, scrollY + dy));
-    keepBottom = maxScroll - scrollY <= 2;
-    applyEditStyle();
-    props.onScroll?.(scrollY, maxScroll, true);
-    requestPaint();
+      applyScrollY(scrollY + dy, true);
+    });
   }
 
   function onCopy(e: ClipboardEvent) {
@@ -3244,6 +3298,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     paintQueued = true;
     requestAnimationFrame(() => {
       paintQueued = false;
+      if (disposed) return;
       paintAll();
     });
   }
@@ -3298,6 +3353,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, false);
     paintAll();
+    // 仅在切换后有实际内容时收尾；缓存未命中会先空布局一帧，不能误清零起点。
+    if (props.groups.length > 0) traceThreadSwitchLayoutDone(props.threadId, props.groups.length);
   }
 
   const queueRebuildFrame = () => {
@@ -3439,6 +3496,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     canvasEl.addEventListener("mousedown", onMouseDown);
     canvasEl.addEventListener("mouseup", onMouseUp);
     canvasEl.addEventListener("click", onClick);
+    canvasEl.addEventListener("contextmenu", onContextMenu);
     canvasEl.addEventListener("wheel", onWheel, { passive: false });
     canvasEl.addEventListener("copy", onCopy);
 
@@ -3450,10 +3508,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       scrollTop() { return scrollY; },
       maxScrollTop() { return maxScroll; },
       activeGroup() { let a = -1; for (let i = 0; i < groupYs.length; i++) { if (groupYs[i] <= scrollY + 32) a = i; } return a; },
-      hasFocusedInput() { return !!editing(); },
+      hasFocusedInput() {
+        if (editing()) return true;
+        const el = document.activeElement;
+        return el instanceof HTMLElement && (el.isContentEditable || el.tagName === "INPUT" || el.tagName === "TEXTAREA");
+      },
     });
 
     onCleanup(() => {
+      disposed = true;
       ro.disconnect();
       visibilityObserver.disconnect();
       mo.disconnect();
@@ -3463,6 +3526,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       editResizeObserver = undefined;
       editHostEl = undefined;
       if (revealRaf) cancelAnimationFrame(revealRaf);
+      if (wheelRaf) { cancelAnimationFrame(wheelRaf); wheelRaf = 0; wheelDelta = 0; }
       if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
       if (rebuildTimer !== undefined) window.clearTimeout(rebuildTimer);
       if (busyTimer !== undefined) window.clearTimeout(busyTimer);
@@ -3471,6 +3535,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       canvasEl.removeEventListener("mousedown", onMouseDown);
       canvasEl.removeEventListener("mouseup", onMouseUp);
       canvasEl.removeEventListener("click", onClick);
+      canvasEl.removeEventListener("contextmenu", onContextMenu);
       canvasEl.removeEventListener("wheel", onWheel);
       canvasEl.removeEventListener("copy", onCopy);
       endScrollDrag();
@@ -3566,6 +3631,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   return (
     <div class="canvas-transcript-host" ref={hostEl}>
+      <fileMenu.Menu />
       <canvas ref={backdropCanvasEl} class="transcript-canvas-backdrop" aria-hidden="true" />
       <canvas ref={canvasEl} class="transcript-canvas-only" tabindex="0" aria-label="会话记录" />
       {editing() && (

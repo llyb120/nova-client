@@ -154,6 +154,8 @@ export function mountSessionShortcuts(options: {
     quotaPeer?: { token: string; name: string } | null,
   ) => void;
   onNewSession?: () => void;
+  /** 新会话页选择工作流；工作流已停用或不存在时由调用方提示。 */
+  onSelectWorkflow?: (workflowId: string) => void;
   /**
    * 返回 true 表示已插入到当前会话输入框。
    * mayFocus=true 表示允许先聚焦输入框再插入（焦点在别处时的全局触发）；
@@ -199,6 +201,12 @@ export function mountSessionShortcuts(options: {
       if (!handled) return;
       event.preventDefault();
       event.stopPropagation();
+      return;
+    }
+    if (hit.action === "selectWorkflow") {
+      event.preventDefault();
+      event.stopPropagation();
+      options.onSelectWorkflow?.(hit.target);
       return;
     }
     if (hit.action === "newSession") {

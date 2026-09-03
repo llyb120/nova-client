@@ -8,6 +8,7 @@ import {
 import {
   dispatchQueuedPrompt,
   dispatchingQueueIds,
+  dropQueuedPromptsMatching,
   enqueuePrompt,
   failedQueueIds,
   holdPromptQueue,
@@ -224,11 +225,24 @@ export function Composer() {
   // 进行中 / 漫游会话不开放跨后端切换，退回当前后端单选；否则可在已启用后端间切换
   const isGuest = () =>
     (state.threads.find((t) => t.id === state.currentId)?.roamingRole ?? null) === "guest";
-  const isQuotaBorrowed = () =>
-    !!state.threads.find((t) => t.id === state.currentId)?.quotaPeerName;
+  const quotaThread = () => state.threads.find((t) => t.id === state.currentId);
+  const isQuotaBorrowed = () => !!quotaThread()?.quotaPeerName;
   const usesPeerModels = () => isGuest();
   const agentKinds = (): AgentKind[] =>
-    !running() && !usesPeerModels() ? enabledAgentKinds() : [state.agentKind];
+    !running() && !usesPeerModels() && !isQuotaBorrowed() ? enabledAgentKinds() : [state.agentKind];
+  // 额度会话：模型列表用出借方共享的那一份（本机同后端列表可能包含没凭证的模型）。
+  // ThreadMeta 只带展示名，出借方 token 在打开会话时回填到 state.roamingPeer。
+  const quotaPeerToken = () => (isQuotaBorrowed() ? state.roamingPeer : null);
+  const quotaSharedModels = () => {
+    const token = quotaPeerToken();
+    if (!token) return undefined;
+    return [
+      {
+        peer: { token, name: quotaThread()?.quotaPeerName ?? "队友" },
+        options: state.peerModels[token]?.sharedOptions ?? {},
+      },
+    ];
+  };
   // 漫游 guest：模型选择用对端（host）的列表（本机模型对方可能没有）
   const guestModels = () => {
     const t = state.roamingPeer;
@@ -237,7 +251,12 @@ export function Composer() {
   const guestModelSource = (k: AgentKind) => guestModels()?.options[k] ?? null;
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => {
-    if (!usesPeerModels() && !isQuotaBorrowed()) void ensureModelOptions(state.agentKind);
+    if (!usesPeerModels()) void ensureModelOptions(state.agentKind);
+  });
+  // 额度会话：已拉取共享列表后只展示共享模型（后端固定，只能换模型）
+  createEffect(() => {
+    const t = quotaPeerToken();
+    if (t) ensurePeerModels(t);
   });
   // 漫游 guest：确保已拉取对端模型列表
   createEffect(() => {
@@ -400,8 +419,12 @@ export function Composer() {
       enqueuePrompt(currentId, value, images);
       return;
     }
-    releasePromptQueue(currentId);
-    void sendPrompt(value, images);
+    // 停止后重新输入同一条时，队列里通常还留着停止前排入的同一份内容；先撤下，
+    // 否则它会在手动这轮结束后再自动投递一次，用户看到两条相同消息。
+    dropQueuedPromptsMatching(currentId, value, images);
+    // 解挂必须晚于本轮 running 置位（与 store 里「编辑历史消息重发」同样的问题）：
+    // 提前解挂会让 dispatcher 在 running 置位前把队列里剩余的条目并发投递出去。
+    void sendPrompt(value, images).finally(() => releasePromptQueue(currentId));
   };
 
   const insertSlashSuggestion = (item: SlashSuggestion) => {
@@ -754,20 +777,18 @@ export function Composer() {
         />
       </div>
       <div class="composer-bar">
-        <Show
-          when={!isQuotaBorrowed()}
-          fallback={<span class="pill">模型：{state.model || "默认"}（额度会话已锁定）</span>}
-        >
-          <ConfigSelects
-            agentKind={state.agentKind}
-            agentKinds={agentKinds()}
-            model={state.model}
-            modelSource={usesPeerModels() ? guestModelSource : undefined}
-            onPickModel={(k, m) => void pickThreadModel(k, m)}
-            anchorTo=".composer"
-            favorites
-          />
-        </Show>
+        <ConfigSelects
+          agentKind={state.agentKind}
+          agentKinds={agentKinds()}
+          model={state.model}
+          modelSource={usesPeerModels() ? guestModelSource : undefined}
+          sharedModels={quotaSharedModels()}
+          sharedModelsOnly={isQuotaBorrowed()}
+          quotaPeerToken={quotaPeerToken()}
+          onPickModel={(k, m) => void pickThreadModel(k, m)}
+          anchorTo=".composer"
+          favorites
+        />
         <Show when={running()}>
           <span
             class="composer-run-stats"

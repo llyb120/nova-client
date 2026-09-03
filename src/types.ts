@@ -123,6 +123,8 @@ export interface ThreadMeta {
   roamingRole?: string | null;
   /** 漫游对端展示名 */
   roamingPeerName?: string | null;
+  /** 非空：本机会话使用该在线队友临时授权的额度（提供方 token） */
+  quotaPeer?: string | null;
   /** 额度租借提供方展示名 */
   quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行 */
@@ -384,16 +386,18 @@ export type SessionShortcutAction =
   | "selectModel"
   | "newSession"
   | "insertText"
+  /** 选中新会话页要运行的工作流；target 为工作流 id。仅新会话页生效。 */
+  | "selectWorkflow"
   /** 内置 Esc 终止，仅运行时使用，不可在设置中配置。 */
   | "stopSession";
 
-/** 会话快捷键：一键切到指定项目或模型、快速新会话、插入文本。 */
+/** 会话快捷键：一键切到指定项目或模型、快速新会话、插入文本、选择工作流。 */
 export interface SessionShortcut {
   id: string;
   /** 规范化按键，如 Ctrl+1 / Alt+P。 */
   keys: string;
   action: SessionShortcutAction;
-  /** 本地项目路径、roam/quota 编码、agentKind:model，或 insertText 的插入内容；newSession 可为空。 */
+  /** 本地项目路径、roam/quota 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession 可为空。 */
   target: string;
 }
 

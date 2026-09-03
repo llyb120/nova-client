@@ -22,6 +22,7 @@ import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker, type SharedModelSource } from "./ConfigSelects";
 import { IconPlus, IconX } from "./icons";
 import { ProjectPicker } from "./ProjectPicker";
+import { WorkflowPicker } from "./WorkflowPicker";
 import {
   encodeModelTarget,
   encodeQuotaModelTarget,
@@ -530,7 +531,9 @@ export function SettingsModal(props: { onClose: () => void }) {
               ? "newSession"
               : item.action === "insertText"
                 ? "insertText"
-                : "selectModel",
+                : item.action === "selectWorkflow"
+                  ? "selectWorkflow"
+                  : "selectModel",
         target: item.target.trim(),
       }))
       .filter((item) => {
@@ -1216,7 +1219,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与终止回合有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效。默认 Esc 终止当前回合。
+                      一键切换项目/模型/工作流、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与终止回合有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。默认 Esc 终止当前回合。
                     </div>
                   </div>
                   <button
@@ -1262,7 +1265,9 @@ export function SettingsModal(props: { onClose: () => void }) {
                                       ? "newSession"
                                       : action === "insertText"
                                         ? "insertText"
-                                        : "selectModel";
+                                        : action === "selectWorkflow"
+                                          ? "selectWorkflow"
+                                          : "selectModel";
                                 updateSessionShortcut(index, {
                                   action: nextAction,
                                   target: "",
@@ -1273,6 +1278,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                               <option value="selectModel">选择模型</option>
                               <option value="selectProject">选择项目</option>
                               <option value="newSession">快速新会话</option>
+                              <option value="selectWorkflow">选择工作流</option>
                               <option value="insertText">快捷输入</option>
                             </select>
                             <div class="session-shortcut-target">
@@ -1285,22 +1291,36 @@ export function SettingsModal(props: { onClose: () => void }) {
                                       <Show
                                         when={item().action === "selectProject"}
                                         fallback={
-                                          <ModelPicker
-                                            agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "lyra")}
-                                            agentKinds={enabledAgentKinds()}
-                                            model={modelTarget()?.model ?? ""}
-                                            sharedModels={shortcutSharedModels()}
-                                            quotaPeerToken={modelTarget()?.peerToken}
-                                            onPickModel={(agentKind, model, quotaPeer) =>
-                                              updateSessionShortcut(index, {
-                                                target: quotaPeer
-                                                  ? encodeQuotaModelTarget(quotaPeer.token, agentKind, model)
-                                                  : encodeModelTarget(agentKind, model),
-                                              })
+                                          <Show
+                                            when={item().action === "selectWorkflow"}
+                                            fallback={
+                                              <ModelPicker
+                                                agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "lyra")}
+                                                agentKinds={enabledAgentKinds()}
+                                                model={modelTarget()?.model ?? ""}
+                                                sharedModels={shortcutSharedModels()}
+                                                quotaPeerToken={modelTarget()?.peerToken}
+                                                onPickModel={(agentKind, model, quotaPeer) =>
+                                                  updateSessionShortcut(index, {
+                                                    target: quotaPeer
+                                                      ? encodeQuotaModelTarget(quotaPeer.token, agentKind, model)
+                                                      : encodeModelTarget(agentKind, model),
+                                                  })
+                                                }
+                                                title="快捷键目标模型"
+                                                portal
+                                              />
                                             }
-                                            title="快捷键目标模型"
-                                            portal
-                                          />
+                                          >
+                                            <WorkflowPicker
+                                              workflowId={item().target}
+                                              onChange={(workflowId) =>
+                                                updateSessionShortcut(index, { target: workflowId })
+                                              }
+                                              title="快捷键目标工作流"
+                                              portal
+                                            />
+                                          </Show>
                                         }
                                       >
                                         <ProjectPicker

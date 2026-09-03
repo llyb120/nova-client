@@ -8,8 +8,9 @@ use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text};
 use crate::lyra::tools::Tool;
 use base64::Engine;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug)]
 pub enum StreamEvent {
@@ -219,14 +220,35 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
                 }
             }
         }
+        // thinking_format 由用户在 options 显式指定，代表中转站接受的风格：
+        // kimi → 只发 reasoning_effort；qwen → enable_thinking 且中转普遍同时收 effort，
+        // 端点只认 thinking_budget 时配 supportsReasoningEffort: false 关掉。
         Some("qwen") => {
             body["enable_thinking"] = json!(enabled);
+            if enabled && model.supports_reasoning_effort {
+                if let Some(level) = level {
+                    body["reasoning_effort"] = json!(level);
+                }
+            }
         }
         _ => {
             if enabled {
                 if let Some(level) = level {
                     body["reasoning_effort"] = json!(level);
                 }
+            }
+        }
+    }
+    // 与 thinking_format 无关：显式配置即下发 thinking.clear_thinking（Some(false) =
+    // GLM Preserved Thinking）。已有 thinking 对象时合并，没有则新建。
+    if let Some(clear) = model.clear_thinking.filter(|_| enabled) {
+        if let Some(object) = body.as_object_mut() {
+            let thinking = object
+                .entry("thinking")
+                .or_insert_with(|| json!({}))
+                .as_object_mut();
+            if let Some(thinking) = thinking {
+                thinking.insert("clear_thinking".into(), json!(clear));
             }
         }
     }
@@ -262,6 +284,12 @@ fn completions_body(
     body[model.max_tokens_field] = json!(model.max_output_tokens);
     if !tool_defs.is_empty() {
         body["tools"] = Value::Array(tool_defs);
+    }
+    // 用户在 options 里配置的非内置字段直接附加到请求体顶层（tool_stream 等）。
+    if let Some(object) = body.as_object_mut() {
+        for (key, value) in &model.extra_options {
+            object.insert(key.clone(), value.clone());
+        }
     }
     apply_reasoning_completions(&mut body, model, level);
     if let Some(key) = session_id.and_then(clamp_prompt_cache_key) {
@@ -1097,6 +1125,32 @@ async fn stream_chat_once(
     }
 }
 
+/// 模型级 proxy 配置的 HTTP 客户端：按代理地址缓存并复用连接池。
+/// 无协议前缀按 http 代理处理；URL 无法解析时退化为直连（与全局 lyra-proxy 一致）。
+pub(crate) fn client_for_proxy(proxy: &str) -> reqwest::Client {
+    static CLIENTS: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut clients = clients.lock().unwrap();
+    if let Some(client) = clients.get(proxy) {
+        return client.clone();
+    }
+    let url = if proxy.contains("://") {
+        proxy.to_string()
+    } else {
+        format!("http://{proxy}")
+    };
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_max_idle_per_host(4)
+        .tcp_keepalive(std::time::Duration::from_secs(20));
+    if let Ok(parsed) = reqwest::Proxy::all(&url) {
+        builder = builder.proxy(parsed);
+    }
+    let client = builder.build().unwrap_or_default();
+    clients.insert(proxy.to_string(), client.clone());
+    client
+}
+
 /// 一次流式模型调用。网络/响应体解码错误会在尚未向调用方发送任何增量时静默重试；
 /// 已经发送增量后不重试，避免 UI、工具参数或会话内容重复。取消时返回 stop_reason = aborted。
 pub async fn stream_chat(
@@ -1111,6 +1165,16 @@ pub async fn stream_chat(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
+    // 模型在 config.jsonc 声明了 options.proxy 时改用按代理地址缓存的客户端；
+    // 未声明则沿用调用方客户端（已含全局 lyra-proxy 设置）。
+    let proxied;
+    let http = match model.proxy.as_deref() {
+        Some(proxy) => {
+            proxied = client_for_proxy(proxy);
+            &proxied
+        }
+        None => http,
+    };
     let mut retry = 0;
     loop {
         let mut emitted = false;
@@ -1589,7 +1653,18 @@ mod tests {
             session_affinity_format: "openai".into(),
             supports_long_cache_retention: true,
             supports_reasoning_effort: true,
+            clear_thinking: None,
+            extra_options: Map::new(),
+            proxy: None,
         }
+    }
+
+    #[test]
+    fn client_for_proxy_builds_caches_and_tolerates_invalid() {
+        let _ = client_for_proxy("http://127.0.0.1:10808");
+        let _ = client_for_proxy("http://127.0.0.1:10808"); // 命中缓存
+        let _ = client_for_proxy("127.0.0.1:10809"); // 无协议前缀按 http 处理
+        let _ = client_for_proxy("not a url"); // 无效代理退化为直连，不 panic
     }
 
     #[test]
@@ -1801,6 +1876,74 @@ mod tests {
         assert_eq!(out[1]["content"][1]["input"]["path"], "a.rs");
         assert_eq!(out[2]["content"][0]["type"], "tool_result");
         assert_eq!(out[2]["content"][0]["tool_use_id"], "toolu-1");
+    }
+
+    #[test]
+    fn zai_thinking_sends_clear_thinking_and_suppresses_reasoning_content() {
+        let mut model = test_model("openai-completions");
+        model.thinking_format = Some("zai".into());
+        model.clear_thinking = Some(true);
+        let mut body = json!({});
+        apply_reasoning_completions(&mut body, &model, Some("high"));
+        assert_eq!(body["thinking"], json!({ "type": "enabled", "clear_thinking": true }));
+        // GLM-5.3 思考深度只认 reasoning_effort。
+        assert_eq!(body["reasoning_effort"], json!("high"));
+
+        // Some(false)：Preserved Thinking。
+        model.clear_thinking = Some(false);
+        let mut body = json!({});
+        apply_reasoning_completions(&mut body, &model, Some("max"));
+        assert_eq!(
+            body["thinking"],
+            json!({ "type": "enabled", "clear_thinking": false })
+        );
+
+        // None：交给端点默认值，不造多余字段。
+        model.clear_thinking = None;
+        let mut body = json!({});
+        apply_reasoning_completions(&mut body, &model, Some("off"));
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+    }
+
+    #[test]
+    fn clear_thinking_applies_regardless_of_thinking_format() {
+        // 无 thinking_format：只新建 thinking 对象带 clear_thinking，reasoning_effort 照旧。
+        let mut model = test_model("openai-completions");
+        model.clear_thinking = Some(true);
+        let mut body = json!({});
+        apply_reasoning_completions(&mut body, &model, Some("high"));
+        assert_eq!(body["thinking"], json!({ "clear_thinking": true }));
+        assert_eq!(body["reasoning_effort"], json!("high"));
+
+        model.thinking_format = Some("qwen".into());
+        let mut body = json!({});
+        apply_reasoning_completions(&mut body, &model, Some("high"));
+        assert_eq!(body["enable_thinking"], json!(true));
+        assert_eq!(body["thinking"], json!({ "clear_thinking": true }));
+    }
+
+    #[test]
+    fn qwen_and_kimi_styles_send_levels() {
+        // qwen 中转：enable_thinking 之外默认也发档位，可显式关掉。
+        let mut model = test_model("openai-completions");
+        model.thinking_format = Some("qwen".into());
+        let mut body = json!({});
+        apply_reasoning_completions(&mut body, &model, Some("high"));
+        assert_eq!(body["enable_thinking"], json!(true));
+        assert_eq!(body["reasoning_effort"], json!("high"));
+
+        model.supports_reasoning_effort = false;
+        let mut body = json!({});
+        apply_reasoning_completions(&mut body, &model, Some("high"));
+        assert!(body.get("reasoning_effort").is_none());
+
+        // kimi 风格：只发 reasoning_effort，不造 thinking / enable_thinking。
+        model.thinking_format = Some("kimi".into());
+        let mut body = json!({});
+        apply_reasoning_completions(&mut body, &model, Some("max"));
+        assert_eq!(body["reasoning_effort"], json!("max"));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("enable_thinking").is_none());
     }
 
     #[test]

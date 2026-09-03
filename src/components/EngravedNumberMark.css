@@ -108,11 +108,11 @@
 }
 
 :root[data-theme="ink-dark"] .engraved-number-mark {
-  --engraved-base: color-mix(in srgb, var(--bg-active) 82%, #8c816c 18%);
-  --engraved-ink: color-mix(in srgb, var(--text-dim) 62%, #07090c 38%);
-  --engraved-edge-light: rgba(255, 248, 232, 0.24);
+  --engraved-base: color-mix(in srgb, var(--bg-active) 82%, #8c8c8c 18%);
+  --engraved-ink: color-mix(in srgb, var(--text-dim) 62%, #080808 38%);
+  --engraved-edge-light: rgba(255, 255, 255, 0.24);
   --engraved-edge-dark: rgba(0, 0, 0, 0.82);
-  border-color: color-mix(in srgb, var(--border-strong) 82%, #95866d 18%);
+  border-color: color-mix(in srgb, var(--border-strong) 82%, #8f8f8f 18%);
 }
 
 /* 会话专属标识直接刻在输入框背景上，不呈现独立牌体，也不参与输入布局。 */
@@ -198,10 +198,10 @@
 }
 
 :root[data-theme="ink-dark"] .composer-engraved-mark.engraved-number-mark {
-  --signature-from: #8196c7;
-  --signature-mid: #f1f5ff;
-  --signature-to: #7089c4;
-  --signature-glow: rgba(112, 151, 245, 0.42);
+  --signature-from: #7cb7ff;
+  --signature-mid: #eaf4ff;
+  --signature-to: #5aa9f8;
+  --signature-glow: rgba(55, 148, 255, 0.42);
   opacity: 0.42;
 }
 
@@ -209,5 +209,5 @@
 :root[data-theme="ink-dark"] .composer-engraved-mark .engraved-number-mark-serial {
   filter:
     drop-shadow(0 0 3px var(--signature-glow))
-    drop-shadow(0 0 7px rgba(94, 133, 230, 0.16));
+    drop-shadow(0 0 7px rgba(55, 148, 255, 0.16));
 }

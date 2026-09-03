@@ -85,7 +85,8 @@ pub struct ResolvedModel {
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub service_tier: Option<String>,
-    /// 采样参数：temperature / top_p，按 variant > model.options > provider.options 解析。
+    /// 采样/推理开关等可选参数统一写在 options（model 覆盖 provider）；非内置键
+    /// 原样透传进请求体顶层。采样参数按 variant > model.options > provider.options。
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     /// 当前模型是否声明支持图片输入；旧会话中的图片对 text-only 模型应降级为占位文本。
@@ -97,9 +98,19 @@ pub struct ResolvedModel {
     pub session_affinity_format: String,
     /// 官方 OpenAI 或显式开启时支持 24h 长缓存保持。
     pub supports_long_cache_retention: bool,
-    /// 是否在 thinking.enabled 之外同时发送 reasoning_effort；zai 默认不发送，
-    /// 可用 compat.supportsReasoningEffort 显式覆盖。
+    /// 控制思考强度的协议字段。deepseek/zai 发 thinking.type；GLM-5.2+ / deepseek 同时发
+    /// reasoning_effort。端点不支持时可用 options.supportsReasoningEffort 关掉。
     pub supports_reasoning_effort: bool,
+    /// 是否下发 thinking.clear_thinking（控制服务端是否抹掉历史 reasoning_content）。
+    /// None 表示不下发、由端点默认值决定（GLM 标准端点默认 true=清除）；
+    /// Some(false) 开启 Preserved Thinking，需同时回传 reasoning_content。
+    pub clear_thinking: Option<bool>,
+    /// options 里非内置键原样透传进请求体顶层（model.options 覆盖 provider.options），
+    /// 厂商特有字段（tool_stream、thinking_budget、preserve_thinking 等）无需逐个接线。
+    pub extra_options: Map<String, Value>,
+    /// config.jsonc 中按模型/provider 配置的代理（model.options.proxy 覆盖
+    /// provider.options.proxy）；None = 跟随全局 lyra-proxy 设置。
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,7 +144,6 @@ fn is_model_config(value: &Value) -> bool {
             "limit",
             "options",
             "variants",
-            "compat",
         ]
         .iter()
         .any(|key| object.contains_key(*key))
@@ -274,11 +284,56 @@ pub fn default_model(config: &Value) -> Result<String, String> {
     Ok(selection)
 }
 
+/// options 中被解析器消费、不应透传到请求体的内置键。
+const RESERVED_OPTION_KEYS: &[&str] = &[
+    "baseURL",
+    "baseUrl",
+    "apiKey",
+    "headers",
+    "temperature",
+    "top_p",
+    "topP",
+    "reasoningEffort",
+    "serviceTier",
+    "service_tier",
+    "thinkingFormat",
+    "thinking_format",
+    "maxTokensField",
+    "sendSessionAffinityHeaders",
+    "requiresReasoningContentOnAssistantMessages",
+    "supportsLongCacheRetention",
+    "supportsReasoningEffort",
+    "clearThinking",
+    "proxy",
+];
+
+/// 解析细粒度代理：model.options.proxy 覆盖 provider.options.proxy。
+/// 支持 {env:NAME} 占位符；空/缺省返回 None，表示跟随全局 lyra-proxy 设置。
+pub fn resolve_proxy(
+    model: &Value,
+    provider: &Value,
+    env: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    let Some(raw) = [model.pointer("/options/proxy"), provider.pointer("/options/proxy")]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let proxy = resolve_env_string(raw, env)?.trim().to_string();
+    Ok((!proxy.is_empty()).then_some(proxy))
+}
+
 fn compat_flag(model: &Value, provider: &Value, key: &str) -> Option<bool> {
-    model
-        .pointer(&format!("/compat/{key}"))
-        .or_else(|| provider.pointer(&format!("/compat/{key}")))
-        .and_then(Value::as_bool)
+    // 只有 options 一处入口：model.options 覆盖 provider.options。
+    [
+        model.pointer(&format!("/options/{key}")),
+        provider.pointer(&format!("/options/{key}")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_bool)
 }
 
 /// 解析 provider/model[/variant/x] 选择，返回可直接发请求的目标模型。
@@ -437,16 +492,45 @@ pub fn resolve_model(
     let supports_long_cache_retention =
         compat_flag(model, provider, "supportsLongCacheRetention").unwrap_or(official_openai);
     let thinking_format = detect_thinking_format(provider_id, &base_url, model, provider);
-    // zai 默认不发 reasoning_effort，其余（含 deepseek）默认发送。
-    let supports_reasoning_effort = compat_flag(model, provider, "supportsReasoningEffort")
-        .unwrap_or(!matches!(thinking_format.as_deref(), Some("zai")));
+    // deepseek / zai 在 thinking.type 之外同时发 reasoning_effort 控制思考深度
+    // （GLM-5.2+ 已支持，可用 options.supportsReasoningEffort 显式关闭）。
+    let supports_reasoning_effort =
+        compat_flag(model, provider, "supportsReasoningEffort").unwrap_or(true);
+    // 三态：不下发（沿用端点默认）/ 强制清除 / 强制保留（Preserved Thinking）。
+    // GLM 标准端点默认清除、Coding Plan 端点默认保留，因此默认保持沉默交给端点。
+    let clear_thinking = compat_flag(model, provider, "clearThinking");
+    // options 里的非内置键原样透传进请求体顶层（厂商特有字段如 tool_stream、
+    // thinking_budget、preserve_thinking 无需逐个接线）；model.options 覆盖 provider.options。
+    let mut extra_options = Map::new();
+    for scope in [
+        Some(&options),
+        model.get("options"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(object) = scope.as_object() {
+            for (key, value) in object {
+                if !RESERVED_OPTION_KEYS.contains(&key.as_str()) {
+                    extra_options.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    // 保留历史思维链必须同时回传 reasoning_content，否则服务端拼不回原序列；
+    // 反向若确定要清除，回传只是白烧 input token。
+    let requires_reasoning_content = match clear_thinking {
+        Some(true) => false,
+        Some(false) => true,
+        None => requires_reasoning_content,
+    };
     Ok(Resolved {
         model: ResolvedModel {
             provider: provider_id.to_string(),
             id: model_id.to_string(),
             api,
             thinking_format,
-            max_tokens_field: detect_max_tokens_field(&base_url, provider),
+            max_tokens_field: detect_max_tokens_field(&base_url, model, provider),
             base_url,
             headers,
             reasoning,
@@ -474,6 +558,9 @@ pub fn resolve_model(
             },
             supports_long_cache_retention,
             supports_reasoning_effort,
+            clear_thinking,
+            extra_options,
+            proxy: resolve_proxy(model, provider, env)?,
         },
         api_key,
         thinking_level,
@@ -605,11 +692,13 @@ mod tests {
             "provider": {
                 "custom": {
                     "npm": "@ai-sdk/openai-compatible",
-                    "compat": {
+                    "options": {
+                        "baseURL": "http://127.0.0.1:8317/v1",
+                        "apiKey": "key",
                         "maxTokensField": "max_tokens",
-                        "sendSessionAffinityHeaders": true
+                        "sendSessionAffinityHeaders": true,
+                        "clearThinking": true
                     },
-                    "options": { "baseURL": "http://127.0.0.1:8317/v1", "apiKey": "key" },
                     "models": { "gpt": {} }
                 }
             }
@@ -617,5 +706,73 @@ mod tests {
         let resolved = resolve_model(&config, Some("custom/gpt"), &HashMap::new()).unwrap();
         assert_eq!(resolved.model.max_tokens_field, "max_tokens");
         assert!(resolved.model.session_affinity_headers);
+        assert_eq!(resolved.model.clear_thinking, Some(true));
+    }
+
+    #[test]
+    fn model_proxy_overrides_provider_proxy_and_resolves_env() {
+        let config = json!({
+            "provider": {
+                "custom": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "http://127.0.0.1:8317/v1",
+                        "apiKey": "key",
+                        "proxy": "http://127.0.0.1:10808"
+                    },
+                    "models": {
+                        "inherit": {},
+                        "proxied": { "options": { "proxy": "{env:LYRA_TEST_PROXY}" } },
+                        "direct": { "options": { "proxy": "" } }
+                    }
+                }
+            }
+        });
+        let env = HashMap::from([(
+            "LYRA_TEST_PROXY".to_string(),
+            "socks5://127.0.0.1:1080".to_string(),
+        )]);
+        // 模型未配置时继承 provider 级代理。
+        let inherit = resolve_model(&config, Some("custom/inherit"), &env).unwrap();
+        assert_eq!(inherit.model.proxy.as_deref(), Some("http://127.0.0.1:10808"));
+        // 模型级覆盖 provider 级，且 {env:NAME} 占位符被解析。
+        let proxied = resolve_model(&config, Some("custom/proxied"), &env).unwrap();
+        assert_eq!(proxied.model.proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
+        // proxy 是内置键，不透传进请求体。
+        assert!(!proxied.model.extra_options.contains_key("proxy"));
+        // 显式空串视为未配置（跟随全局 lyra-proxy）。
+        let direct = resolve_model(&config, Some("custom/direct"), &env).unwrap();
+        assert_eq!(direct.model.proxy, None);
+    }
+
+    #[test]
+    fn unknown_options_pass_through_but_reserved_keys_are_consumed() {
+        let config = json!({
+            "provider": {
+                "custom": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "https://api.z.ai/api/paas/v4",
+                        "apiKey": "key",
+                        "tool_stream": true,
+                        "thinking_format": "deepseek"
+                    },
+                    "models": {
+                        "glm": {
+                            "options": { "thinking_budget": 2048, "clearThinking": false }
+                        }
+                    }
+                }
+            }
+        });
+        let resolved = resolve_model(&config, Some("custom/glm"), &HashMap::new()).unwrap();
+        // 未知键透传；model.options 覆盖 provider.options。
+        assert_eq!(resolved.model.extra_options["tool_stream"], json!(true));
+        assert_eq!(resolved.model.extra_options["thinking_budget"], json!(2048));
+        // 内置键被消费，不会重复下发；snake 风格的 thinking_format 同样生效。
+        assert!(!resolved.model.extra_options.contains_key("clearThinking"));
+        assert!(!resolved.model.extra_options.contains_key("thinking_format"));
+        assert_eq!(resolved.model.thinking_format.as_deref(), Some("deepseek"));
+        assert_eq!(resolved.model.clear_thinking, Some(false));
     }
 }

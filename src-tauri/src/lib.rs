@@ -321,9 +321,10 @@ fn is_starrable_thread(thread: &Thread) -> bool {
 }
 
 fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
-    // 漫游会话（host 替别人执行 / guest 收看别人执行）与普通会话一样参与自动清理；
-    // 仍豁免：额度租借会话、经验训练会话和星标会话。运行中的会话由调用方另行排除。
-    thread.quota_peer.is_none() && !thread.experience_thread && !thread.starred
+    // 漫游会话（host 替别人执行 / guest 收看别人执行）、额度租借会话与普通会话一样参与自动
+    // 清理：后者的运行时与隔离凭证只存活于单次运行，重启后只剩再也跑不动的僵尸记录。
+    // 仍豁免：经验训练会话和星标会话。运行中的会话由调用方另行排除。
+    !thread.experience_thread && !thread.starred
 }
 
 fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
@@ -608,9 +609,9 @@ mod session_auto_cleanup_tests {
         thread.roaming_role = Some("guest".into());
         assert!(is_normal_thread_for_auto_cleanup(&thread));
         thread.roaming_role = None;
-        // 额度租借会话仍豁免
+        // 额度租借会话不再豁免
         thread.quota_peer = Some("peer-token".into());
-        assert!(!is_normal_thread_for_auto_cleanup(&thread));
+        assert!(is_normal_thread_for_auto_cleanup(&thread));
     }
 
     #[test]
@@ -3235,9 +3236,38 @@ fn set_thread_model(
     thread_id: String,
     model: Option<String>,
 ) -> Result<(), String> {
+    // 额度租借会话可以换模型，但只能换到本会话出借方明确共享、且凭证已就绪的模型。
+    // 同时向多人租借时，挑到别人的模型会串凭证；校验放在写库前，被拒时不留半套状态。
+    let is_quota = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(&thread_id).ok_or("线程不存在")?;
+        if !thread.is_quota_borrowed() {
+            false
+        } else {
+            // OpenCode 凭证按 provider 隔离，换模型要重建隔离运行时，会杀掉正在输出的进程；
+            // 其余后端的凭证与具体模型无关，像普通会话一样下一轮生效即可。
+            let rebuild =
+                matches!(thread.agent_kind, AgentKind::OpenCode | AgentKind::OpenCodePlus);
+            if rebuild && is_running(&state, thread) {
+                return Err("额度会话正在运行，请等待当前轮结束后再切换模型".into());
+            }
+            let value = model.as_deref().unwrap_or("").trim();
+            let peer = thread.quota_peer.clone().unwrap_or_default();
+            if value.is_empty()
+                || !state
+                    .relay
+                    .can_switch_quota_model(&peer, &thread.agent_kind, value)
+            {
+                return Err(format!(
+                    "额度会话只能切换到{}已共享且凭证已就绪的模型",
+                    thread.quota_peer_name.as_deref().unwrap_or("该队友")
+                ));
+            }
+            true
+        }
+    };
     let agent_kind;
     let is_guest;
-    let is_quota;
     let was_running;
     {
         let mut store = state.store.lock().unwrap();
@@ -3252,10 +3282,16 @@ fn set_thread_model(
         thread.model = model;
         agent_kind = thread.agent_kind.clone();
         is_guest = thread.is_roaming_guest();
-        is_quota = thread.is_quota_borrowed();
         store.save();
     }
-    if is_guest {
+    // OpenCode 凭证按 provider 隔离（auth.json 只包含该模型所属 provider 的密钥）：换模型必须
+    // 销毁隔离运行时，下一轮发送按新模型的租约重新申请凭证并重建；其余后端的凭证与具体模型
+    // 无关，保留运行时—删临时目录会连带删掉 provider 侧的 session 文件，把上下文丢掉。
+    let quota_rebuild_runtime =
+        is_quota && matches!(agent_kind, AgentKind::OpenCode | AgentKind::OpenCodePlus);
+    if quota_rebuild_runtime {
+        cleanup_borrowed_runtime(&state, &thread_id);
+    } else if is_guest {
         state.relay.guest_sync_config(&thread_id);
     } else if let Some(runtime) = state.borrowed_runtime(&thread_id) {
         match runtime.manager {
@@ -3276,7 +3312,8 @@ fn set_thread_model(
             }
         }
     } else if is_quota {
-        return Err("额度凭证已过期，请重新发起租借".into());
+        // 重启后隔离运行时已丢、但本次已持有目标模型租约：新模型已落库，
+        // 下一轮发送会走 restore_quota_runtime 重建，不能去动本机全局 manager。
     } else if agent_kind == AgentKind::Devin
         || matches!(agent_kind, AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus)
     {

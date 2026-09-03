@@ -28,6 +28,8 @@ pub const EV_NOTIFY_OPEN: &str = "acp:notify-open";
 
 const LOG_CAP: usize = 800;
 const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
+/// session/prompt 发出后允许「零通知」的最长静默；超过即判定连接假死（见 prompt_with_stall_guard）。
+const PROMPT_FIRST_RESPONSE_STALL: Duration = Duration::from_secs(90);
 
 /// ACP 后端（Devin / CodeBuddy）支持 `/browser` 进入持续浏览器调试模式；
 /// 工具通过注入 nova-tools MCP 提供。
@@ -153,6 +155,47 @@ fn merge_current_model_option(options: Vec<Value>, current: &str) -> Vec<Value> 
     merged
 }
 
+fn model_config_option(config_options: &Value) -> Option<&Value> {
+    config_options
+        .as_array()?
+        .iter()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
+}
+
+/// 预热激活的 CodeBuddy 进程会终身上报「本地打包兜底清单」：官方 CLI 在 standby 阶段
+/// 就记忆了模型元数据快照（AgentManager.initializeMetadata 只计算一次），而 standby 明确
+/// 推迟产品配置初始化（日志 `prewarm standby: defer init until activate`），激活后补拉到
+/// 的云端清单不会回填这份快照。所以这类连接只有「当前模型」可信，可选清单必须沿用冷启动
+/// 探测到的权威清单，否则 hy4-preview / glm-5.3-flash 等云端动态模型会时有时无。
+fn keep_known_model_options(fresh: Value, known: Option<&Value>) -> Value {
+    let Some(mut model) = known.and_then(model_config_option).cloned() else {
+        return fresh;
+    };
+    let current = model_config_option(&fresh)
+        .and_then(|option| option.get("currentValue"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !current.is_empty() {
+        let options = model
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        model["options"] = Value::Array(merge_current_model_option(options, &current));
+        model["currentValue"] = json!(current);
+    }
+    let mut options = fresh.as_array().cloned().unwrap_or_default();
+    match options
+        .iter_mut()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
+    {
+        Some(existing) => *existing = model,
+        None => options.push(model),
+    }
+    Value::Array(options)
+}
+
 pub struct AcpConn {
     /// 该连接在连接池中的键；用户线程独立，辅助任务使用 SHARED。
     key: String,
@@ -165,6 +208,9 @@ pub struct AcpConn {
     child: StdMutex<Option<Child>>,
     /// 热连接 LRU 的最近使用戳（单调计数，越大越新）。回收按它挑最旧的非运行中线程连接。
     last_used: AtomicU64,
+    /// 该连接是否由 CodeBuddy 官方预热进程激活而来。预热进程上报的模型清单是本地兜底
+    /// 快照（见 keep_known_model_options），不能用来覆盖权威清单。
+    from_prewarm: bool,
 }
 
 impl AcpConn {
@@ -747,7 +793,7 @@ impl AcpManager {
             )
             .await
             .map_err(|e| format!("拉取 {} 斜杠命令失败：{e}", self.kind.label()))?;
-        self.capture_options(&resp);
+        self.capture_options(&resp, !conn.from_prewarm);
         for _ in 0..40 {
             if let Some(v) = self.get_commands() {
                 return Ok(v);
@@ -782,7 +828,7 @@ impl AcpManager {
             )
             .await
             .map_err(|e| format!("拉取 {} 模型列表失败：{e}", self.kind.label()))?;
-        self.capture_options(&resp);
+        self.capture_options(&resp, !conn.from_prewarm);
         self.get_model_options()
             .ok_or_else(|| format!("{} 未返回模型列表", self.kind.label()))
     }
@@ -1018,13 +1064,14 @@ impl AcpManager {
         // 兜底：挂进 KILL_ON_JOB_CLOSE 的 Job，Nova 无论如何退出都不会残留 agent 孤儿进程
         assign_to_agent_job(&child);
 
-        self.finish_stdio_conn(conn_key, child).await
+        self.finish_stdio_conn(conn_key, child, false).await
     }
 
     async fn finish_stdio_conn(
         self: &Arc<Self>,
         conn_key: &str,
         mut child: Child,
+        from_prewarm: bool,
     ) -> Result<Arc<AcpConn>, String> {
         let stdin = child.stdin.take().ok_or("无法获取 agent stdin")?;
         let stdout = child.stdout.take().ok_or("无法获取 agent stdout")?;
@@ -1041,6 +1088,7 @@ impl AcpManager {
             alive: AtomicBool::new(true),
             child: StdMutex::new(Some(child)),
             last_used: AtomicU64::new(0),
+            from_prewarm,
         });
         // 每创建一条连接 +1；对应的 stdout reader 结束时在 on_conn_closed 里 -1，恒定配对。
         self.alive_conns.fetch_add(1, Ordering::SeqCst);
@@ -1191,7 +1239,7 @@ impl AcpManager {
             .spawn()
             .map_err(|error| format!("无法启动 CodeBuddy ACP（{program}）：{error}"))?;
         assign_to_agent_job(&child);
-        self.finish_stdio_conn(conn_key, child).await
+        self.finish_stdio_conn(conn_key, child, false).await
     }
 
     async fn activate_codebuddy_prewarm(
@@ -1283,7 +1331,7 @@ impl AcpManager {
         self.push_log(format!(
             "[nova] CodeBuddy 已消费官方预热进程 {id}，切换到 ACP stdio"
         ));
-        self.finish_stdio_conn(conn_key, prewarm.child).await
+        self.finish_stdio_conn(conn_key, prewarm.child, true).await
     }
 
     async fn on_conn_closed(&self, conn: &Arc<AcpConn>) {
@@ -1952,8 +2000,10 @@ impl AcpManager {
         crate::sys_notify::notify_thread_done(&self.app, thread_id, &title, body, EV_NOTIFY_OPEN);
     }
 
-    /// 缓存 session/new 返回的模型/模式选项并通知前端
-    fn capture_options(self: &Arc<Self>, result: &Value) {
+    /// 缓存 session/new 返回的模型/模式选项并通知前端。
+    /// `model_list_trusted=false` 表示响应来自预热激活的 CodeBuddy 进程，其可选模型清单
+    /// 是本地兜底快照，只取当前模型、清单沿用已知的权威清单。
+    fn capture_options(self: &Arc<Self>, result: &Value, model_list_trusted: bool) {
         // ACP 标准模型放在 `models`(SessionModelState)，Cognition/Devin 扩展放在
         // `configOptions`。统一收敛成前端期望的 configOptions 形状：
         // [{ id:"model", currentValue, options:[{value,name,description}] }]。
@@ -2046,6 +2096,17 @@ impl AcpManager {
             } else {
                 standard_config_options
             };
+        // 预热进程的清单不可信：沿用已知权威清单，并（每进程一次）后台冷启动重探一次，
+        // 保证首装等还没有权威清单的场景也能很快收敛到云端清单。
+        let config_options = if model_list_trusted {
+            config_options
+        } else {
+            let known = self.get_model_options();
+            let known = known.as_ref().and_then(|options| options.get("configOptions"));
+            let kept = keep_known_model_options(config_options, known);
+            self.spawn_revalidate_model_options();
+            kept
+        };
         let modes = match result.get("modes") {
             Some(m) if !m.is_null() => m.clone(),
             _ => modes_from_config_options(&config_options),
@@ -2428,7 +2489,7 @@ impl AcpManager {
             )
             .await
             .map_err(|e| format!("创建标题会话失败：{e}"))?;
-        self.capture_options(&resp);
+        self.capture_options(&resp, !conn.from_prewarm);
         let sid = resp["sessionId"]
             .as_str()
             .ok_or("session/new 未返回 sessionId")?
@@ -2633,7 +2694,7 @@ impl AcpManager {
             }
         }
         let resp = resp.ok_or_else(|| format!("创建会话失败：{last_err}"))?;
-        self.capture_options(&resp);
+        self.capture_options(&resp, !conn.from_prewarm);
         let sid = resp["sessionId"]
             .as_str()
             .ok_or("session/new 未返回 sessionId")?
@@ -3118,6 +3179,8 @@ impl AcpManager {
         } else {
             String::new()
         };
+        // 上一次失败是「假死」而非崩溃：重建连接时保留 sessionId，用 session/load 找回上下文。
+        let mut keep_session_on_rebuild = false;
         for attempt in 1..=max_attempts {
             if !self.is_running(thread_id) {
                 return Err("任务已停止".into());
@@ -3146,7 +3209,12 @@ impl AcpManager {
                 if let Some(conn) = conn.as_ref() {
                     conn.kill();
                 }
-                self.clear_thread_session_for_respawn(thread_id);
+                if keep_session_on_rebuild {
+                    // 假死不是崩溃：只解除进程内挂载，sessionId 留着走 session/load。
+                    self.unmount_thread_sessions(thread_id);
+                } else {
+                    self.clear_thread_session_for_respawn(thread_id);
+                }
                 session_id = self.ensure_session(thread_id).await?;
                 conn = self.conn_for_key(&conn_key).await;
                 if conn.is_none() {
@@ -3187,15 +3255,8 @@ impl AcpManager {
                 .lock()
                 .unwrap()
                 .insert(session_id.clone(), std::time::Instant::now());
-            match conn
-                .request(
-                    "session/prompt",
-                    json!({
-                        "sessionId": session_id,
-                        "prompt": prompt
-                    }),
-                    None,
-                )
+            match self
+                .prompt_with_stall_guard(conn, &session_id, &prompt, attempt, max_attempts)
                 .await
             {
                 Ok(resp) => {
@@ -3206,8 +3267,15 @@ impl AcpManager {
                     let usage = resp.get("usage").cloned().filter(|v| !v.is_null());
                     return Ok((stop, usage));
                 }
-                Err(e) => {
-                    last_err = e;
+                Err(failure) => {
+                    keep_session_on_rebuild = matches!(failure, PromptFailure::Stalled(_));
+                    last_err = failure.into_message();
+                    // 用户已经停止本轮：结果作废，不重试也不再往会话里补任何提示。
+                    // force_finish 已经收尾并落了 system/turn 条目，若继续往下走，
+                    // 那些条目会被算成「本轮已有输出」，误报一条「云端连接短暂中断」。
+                    if !self.is_running(thread_id) {
+                        return Err("任务已停止".into());
+                    }
                     let dead =
                         is_process_exit_error(&last_err) || !conn.alive.load(Ordering::SeqCst);
                     if !is_retriable_rpc_error(&last_err) && !dead {
@@ -3253,6 +3321,61 @@ impl AcpManager {
             }
         }
         Err(last_err)
+    }
+
+    /// 发出 session/prompt 并看住「首个响应」：agent 收下请求后可能再不回任何通知与响应
+    /// （实测长时间空闲的 CodeBuddy 进程最常见），而 session/prompt 本身不设超时，
+    /// 界面会永远停在「正在工作」，队列里的消息也永远等不到发送。
+    ///
+    /// 判定只看「一条 update 都没收到」：正常轮次在 1 秒内就会有 session_info_update /
+    /// usage_update，静默这么久必然是连接假死。判定成立就把连接标记为已死并杀掉，
+    /// 交给调用方既有的「重建会话 + 重发 prompt」链路自愈；只要收到过任何通知，
+    /// 就继续无限等待（长思考、长工具调用都属于正常情况，交由云端自身超时收尾）。
+    async fn prompt_with_stall_guard(
+        self: &Arc<Self>,
+        conn: &Arc<AcpConn>,
+        session_id: &str,
+        prompt: &[Value],
+        attempt: u32,
+        max_attempts: u32,
+    ) -> Result<Value, PromptFailure> {
+        let request = conn.request(
+            "session/prompt",
+            json!({ "sessionId": session_id, "prompt": prompt }),
+            None,
+        );
+        tokio::pin!(request);
+        let settled = tokio::select! {
+            result = &mut request => Some(result),
+            _ = sleep(PROMPT_FIRST_RESPONSE_STALL) => None,
+        };
+        let result = match settled {
+            Some(result) => result,
+            // 看门狗到点：本会话一条通知都没收到才算假死；收到过就继续无限等待。
+            None if self.prompt_sent_at.lock().unwrap().contains_key(session_id) => {
+                self.push_log(format!(
+                    "[nova] session/prompt 已发出 {}s 但 {} 无任何响应，判定连接假死并重建（第{attempt}/{max_attempts}次）",
+                    PROMPT_FIRST_RESPONSE_STALL.as_secs(),
+                    self.kind.label()
+                ));
+                conn.alive.store(false, Ordering::SeqCst);
+                conn.kill();
+                return Err(PromptFailure::Stalled(stalled_prompt_error(
+                    self.kind.label(),
+                )));
+            }
+            None => request.await,
+        };
+        result.map_err(PromptFailure::Rpc)
+    }
+
+    /// 只解除线程上 session 的进程内挂载（保留 thread.acp_session_id）：
+    /// 下次 ensure_session 会用 session/load 找回上下文，而不是新建一个空会话。
+    fn unmount_thread_sessions(&self, thread_id: &str) {
+        self.routes
+            .lock()
+            .unwrap()
+            .retain(|_, route| route.thread_id != thread_id);
     }
 
     /// 进程崩溃后清掉线程上的 ACP session，下次 ensure_session 会新建。
@@ -3334,8 +3457,8 @@ impl AcpManager {
         // 失败的环节，表现为「停止后第一次发送失败、第二次才成功」。
         // 统一改为：协议级 session/cancel 尽力而为 + 本地立即结束 + 忘掉该 session
         // 的路由（对 cancel 支持不稳定，迟到的 update 会被忽略，停止在界面上
-        // 立即生效）。连接保持热存活，下次发送直接复用；session 仍留在 agent 侧，
-        // 可经 session/load 恢复上下文。
+        // 立即生效）。forget_session_of_thread 只回收该线程自己的连接（不影响其它
+        // 线程），thread.acp_session_id 保留，下次发送冷启动并经 session/load 找回上下文。
         self.force_finish(thread_id, "已停止当前任务。").await;
         self.forget_session_of_thread(thread_id);
     }
@@ -3618,9 +3741,10 @@ fn codebuddy_activation_env(
 mod codebuddy_acp_tests {
     use super::{
         codebuddy_command, codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
-        lru_evict_keys, merge_codebuddy_activation_env, merge_current_model_option,
-        merge_model_config_option, publishes_model_options, thread_connection_key, AcpManager,
-        CODEBUDDY_ACP_ARGS,
+        is_process_exit_error, is_retriable_rpc_error, keep_known_model_options, lru_evict_keys,
+        merge_codebuddy_activation_env, merge_current_model_option, merge_model_config_option,
+        prompt_conn_needs_rebuild, publishes_model_options, stalled_prompt_error,
+        thread_connection_key, AcpManager, PromptFailure, CODEBUDDY_ACP_ARGS,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -3719,6 +3843,73 @@ mod codebuddy_acp_tests {
             "NOVA_QUOTA_BORROWED".into(),
             "1".into(),
         )])));
+    }
+
+    #[test]
+    fn stalled_prompt_is_recovered_by_rebuilding_the_connection() {
+        // 假死文案要走「连接不可用 → 重建 + 重发」链路，而不是被当成普通 RPC 报错结束本轮。
+        let error = stalled_prompt_error("CodeBuddy");
+        assert!(is_process_exit_error(&error));
+        assert!(prompt_conn_needs_rebuild(Some(true), &error));
+        assert!(prompt_conn_needs_rebuild(None, ""));
+        // 正常轮次（连接存活、无错）不该触发重建。
+        assert!(!prompt_conn_needs_rebuild(Some(true), ""));
+        // 假死与云端瞬时抖动是两种恢复策略：前者必须换连接，后者原连接退避重发。
+        assert!(!is_retriable_rpc_error(&error));
+        assert!(is_retriable_rpc_error("RetriableError: Connection stalled"));
+        assert_eq!(
+            PromptFailure::Stalled(error.clone()).into_message(),
+            error.clone()
+        );
+        assert_eq!(PromptFailure::Rpc(error.clone()).into_message(), error);
+    }
+
+    #[test]
+    fn prewarm_sessions_keep_the_authoritative_model_list_but_adopt_its_current_model() {
+        let known = json!([
+            { "id": "mode", "options": [{ "value": "plan", "name": "Plan" }] },
+            { "id": "model", "name": "Model", "currentValue": "hy4-preview", "options": [
+                { "value": "hy4-preview", "name": "Hy4 preview" },
+                { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
+            ] }
+        ]);
+        // 预热进程上报的本地兜底清单（缺 hy4-preview / glm-5.3-flash）不能覆盖权威清单，
+        // 但它上报的当前模型要生效；非模型项（如 mode）仍取本次会话的最新值。
+        let kept = keep_known_model_options(
+            json!([
+                { "id": "mode", "options": [{ "value": "plan", "name": "Plan" }, { "value": "bypass", "name": "Bypass" }] },
+                { "id": "model", "currentValue": "glm-5.3-flash", "options": [
+                    { "value": "hy3", "name": "Hy3" },
+                    { "value": "glm-4.7", "name": "GLM-4.7" }
+                ] }
+            ]),
+            Some(&known),
+        );
+        assert_eq!(kept[0]["options"].as_array().map(Vec::len), Some(2));
+        assert_eq!(kept[1]["currentValue"], "glm-5.3-flash");
+        assert_eq!(
+            kept[1]["options"],
+            json!([
+                { "value": "hy4-preview", "name": "Hy4 preview" },
+                { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
+            ])
+        );
+        // 当前模型不在权威清单里：并入置顶，不丢失云端清单。
+        let pinned = keep_known_model_options(
+            json!([{ "id": "model", "currentValue": "hy3", "options": [] }]),
+            Some(&known),
+        );
+        assert_eq!(pinned[0]["options"][0]["value"], "hy3");
+        assert_eq!(pinned[0]["options"].as_array().map(Vec::len), Some(3));
+        // 还没有权威清单（首装）：原样采用本次快照，由后台冷启动重探收敛。
+        let fresh = json!([{ "id": "model", "currentValue": "hy3", "options": [
+            { "value": "hy3", "name": "Hy3" }
+        ] }]);
+        assert_eq!(keep_known_model_options(fresh.clone(), None), fresh);
+        assert_eq!(
+            keep_known_model_options(fresh.clone(), Some(&json!([{ "id": "mode" }]))),
+            fresh
+        );
     }
 
     #[test]
@@ -3928,6 +4119,28 @@ fn is_process_exit_error(err: &str) -> bool {
 
 fn prompt_conn_needs_rebuild(conn_alive: Option<bool>, last_err: &str) -> bool {
     conn_alive != Some(true) || is_process_exit_error(last_err)
+}
+
+/// 假死判定的错误文案。必须能被 is_process_exit_error 识别，否则 prompt 重试链路
+/// 不会把它当成「连接坏了」去重建连接，本轮会直接报错结束而不是自愈重发。
+fn stalled_prompt_error(label: &str) -> String {
+    format!("{label} 进程已退出（收下本轮请求后长时间无任何响应）")
+}
+
+/// session/prompt 的失败原因。Stalled = agent 收下请求后长时间零响应被判定假死：
+/// 与进程崩溃不同，会话在 agent 侧仍然完好，重建连接后必须 session/load 找回上下文，
+/// 不能像崩溃那样丢掉 sessionId 从空会话重来。
+enum PromptFailure {
+    Rpc(String),
+    Stalled(String),
+}
+
+impl PromptFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::Rpc(message) | Self::Stalled(message) => message,
+        }
+    }
 }
 
 /// 瞬时错误退避：1s → 2s → 4s → 8s（封顶 8s）。

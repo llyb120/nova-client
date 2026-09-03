@@ -1,4 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
+import { message } from "@tauri-apps/plugin-dialog";
 import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { LruMap } from "./lruMap";
@@ -125,6 +126,8 @@ interface AppStore {
   reasoningEffort: string;
   /** 当前打开线程若是漫游 guest，其对端（host）token；否则 null。用于取对端模型列表 */
   roamingPeer: string | null;
+  /** 各会话未读新轮次结论数：每次轮次正常结束且该会话非当前打开则 +1，stage 链各自累计 */
+  unreadTurns: Record<string, number>;
   running: Record<string, boolean>;
   permissions: PermissionRequest[];
   connected: boolean;
@@ -235,6 +238,7 @@ export const [state, setState] = createStore<AppStore>({
   roamingFolders: [],
   expanded: {},
   titleTyping: {},
+  unreadTurns: {},
   view: "home",
   clueSpace: "personal",
   clueGroups: [],
@@ -822,7 +826,9 @@ export function openNewSession(quote = "") {
   const id = state.currentId;
   if (id) {
     const meta = state.threads.find((thread) => thread.id === id);
-    const cwd = meta?.worktree?.repo || state.cwd;
+    // worktree 会话的 state.cwd 已指向 worktree 工作目录，新会话应留在同一 worktree；
+    // 只有 cwd 缺失时才回退到源仓库（后端也会按已知 worktree 目录补齐标注）。
+    const cwd = state.cwd || meta?.worktree?.repo || "";
     const seed: PendingNewSessionSeed = {
       cwd,
       agentKind: state.agentKind,
@@ -1091,7 +1097,10 @@ export function clearQuotaRoamingProgress() {
   setState("quotaRoamingProgress", null);
 }
 
-const THREAD_SNAPSHOT_LIMIT = 3;
+// 覆盖典型 /stage 链（源会话 + 多个 stage 节点）来回切换，避免快照互相挤出后
+// 每次切换都退化成 getThread 全量拉取整条 transcript。items 是 unwrap 浅引用，
+// 单条快照内存开销可控，上限取 8 而非无上限。
+const THREAD_SNAPSHOT_LIMIT = 8;
 const threadSnapshots = new LruMap<string, Thread>(THREAD_SNAPSHOT_LIMIT);
 const staleThreadSnapshots = new Set<string>();
 /** 运行中各会话最近一次实时用量；切换会话时恢复，避免等待下一次 usage 事件。 */
@@ -1160,10 +1169,48 @@ function recoverProposedPlan(_thread: Thread): string | null {
 
 let openThreadRequest = 0;
 
+/** 切换会话耗时自测：仅在总耗时超阈值时写一行 agent 日志，release 包也能定位卡点。 */
+let switchTraceStart = 0;
+/** 用户在会话行上按下指针的瞬间（早于 click/openThread），用于暴露"点击→开始切换"盲区。 */
+let switchPointerDownAt = 0;
+export function markThreadSwitchPointerDown() {
+  switchPointerDownAt = performance.now();
+}
+export function markThreadSwitchStart() {
+  switchTraceStart = performance.now();
+  // 点击/按下 到 openThread 真正开始执行之间的等待（主线程被占时点击看似没反应）。
+  if (switchPointerDownAt) {
+    const wait = Math.round(switchTraceStart - switchPointerDownAt);
+    switchPointerDownAt = 0;
+    if (wait >= 150) {
+      setState("logs", (logs) => [...logs, `[切换卡顿] 点击→开始切换 等待 ${wait}ms（主线程被占）`]);
+    }
+  }
+}
+function traceThreadSwitch(id: string, phase: string) {
+  if (!switchTraceStart) return;
+  const ms = Math.round(performance.now() - switchTraceStart);
+  if (ms < 150) return; // 150ms 内不算卡，不刷日志
+  setState("logs", (logs) => [...logs, `[切换卡顿] ${phase} +${ms}ms (会话 ${id.slice(0, 8)})`]);
+}
+/** 布局落地后收尾：写一行总耗时并清零，避免后续无关操作重复打点。 */
+export function traceThreadSwitchLayoutDone(threadId: string | null, groupCount: number) {
+  if (!switchTraceStart || !threadId) return;
+  const ms = Math.round(performance.now() - switchTraceStart);
+  switchTraceStart = 0;
+  if (ms < 150) return;
+  setState("logs", (logs) => [
+    ...logs,
+    `[切换卡顿] 布局+绘制落地 总${ms}ms (${groupCount} 组, 会话 ${threadId.slice(0, 8)})`,
+  ]);
+}
+
 export async function openThread(id: string) {
+  if (state.unreadTurns[id]) setState("unreadTurns", id, 0);
   const switching = state.currentId !== id;
   const request = switching ? ++openThreadRequest : openThreadRequest;
   const previousId = state.currentId;
+  if (switching && !switchTraceStart) markThreadSwitchStart();
   flushPendingStreamUpdates();
   if (switching) {
     rememberCurrentThreadSnapshot();
@@ -1209,8 +1256,12 @@ export async function openThread(id: string) {
   }
 
   try {
-    // 先切换后端 active_thread，再静默校准快照，补齐后台会话运行期间未广播的高频增量。
-    await api.reportActivity(id);
+    // 切换后端 active_thread 是纯副作用（只设时间戳），不返回任何被后续依赖的值，
+    // 且 getThread 按 thread_id 显式拉取、不读 active_thread——无需 await。
+    // 之前 await 它会让切换卡在 Tauri 命令队列里：stage 会话的标题生成/model-options
+    // 等慢命令（session/new 触发 skills 扫描 + 最长 120s 的 session/prompt）排在前面，
+    // 把 reportActivity 堵 800ms。发射即忘让 getThread 立即并行入队，不再被堵。
+    void api.reportActivity(id).catch(() => {});
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
     if (cached && switching && !staleThreadSnapshots.has(id)) {
@@ -1222,6 +1273,7 @@ export async function openThread(id: string) {
       return;
     }
     const t = await api.getThread(id);
+    traceThreadSwitch(id, "getThread(IPC) 返回");
     if (request !== openThreadRequest) return;
     rememberThreadSnapshot(t);
     const agentKind = t.agentKind ?? "devin";
@@ -1505,7 +1557,13 @@ export async function setThreadModel(model: string) {
   const id = state.currentId;
   if (!id) return;
   setState("model", model);
-  await api.setThreadModel(id, model || null);
+  try {
+    await api.setThreadModel(id, model || null);
+  } catch (error) {
+    // 额度会话只能切到出借方已共享且本机已持有租约的模型：被拒时以后端为准回滚选择
+    await openThread(id).catch(() => {});
+    void message(String(error), { kind: "error" });
+  }
 }
 
 /** 进行中的会话切换模型：同 agent 仅换模型；跨 agent（Devin⇄Codex）连同 agent 一起切，
@@ -2783,6 +2841,12 @@ export async function initStore() {
       resumeFireRelay(e.payload.threadId);
       handleWorkflowTurnStart(e.payload.threadId);
     } else {
+      // 轮次正常收尾且该会话未打开 → 标记未读，提醒回看结论
+      const completedNormally =
+        e.payload.stopReason === "end_turn" || e.payload.stopReason === "max_turn_requests";
+      if (completedNormally && threadId !== state.currentId) {
+        setState("unreadTurns", threadId, (state.unreadTurns[threadId] ?? 0) + 1);
+      }
       // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
       liveUsageByThread.delete(threadId);
       if (threadId === state.currentId) setState("liveUsage", null);

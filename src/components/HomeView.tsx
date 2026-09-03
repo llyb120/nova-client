@@ -450,8 +450,21 @@ export function HomeView() {
   };
 
   mountSessionShortcuts({
-    allowedActions: ["selectProject", "selectModel", "insertText"],
+    allowedActions: ["selectProject", "selectModel", "selectWorkflow", "insertText"],
     onInsertText: insertShortcutText,
+    onSelectWorkflow: (workflowId) => {
+      // 已停用/已删除的工作流不可选：提示后保持当前选择，避免静默失效。
+      const workflow = enabledWorkflows().find((item) => item.id === workflowId);
+      if (!workflow) {
+        void message("该工作流已删除或已停用，请在设置里重新选择。", { kind: "error" });
+        return;
+      }
+      if (roam() || quotaPeer()) {
+        void message("漫游与额度会话不支持工作流，请先取消漫游/额度。", { kind: "error" });
+        return;
+      }
+      setSelectedWorkflowId(workflowId);
+    },
     onSelectProject: (path, roam) => {
       if (roam) {
         const peer = state.peers.find((item) => item.token === roam.peerToken);

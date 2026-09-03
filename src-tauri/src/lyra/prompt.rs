@@ -192,6 +192,8 @@ pub fn is_context_window_error(error: &str) -> bool {
     ]
     .iter()
     .any(|fragment| message.contains(fragment))
+        // k3 等 provider 的超限文案形如 “k3-256k supports only 256K context.”。
+        || (message.contains("supports only") && message.contains("context"))
 }
 
 pub const PROVIDER_RETRY_DELAYS_MS: &[u64] = &[1_000, 3_000];
@@ -721,6 +723,10 @@ mod context_error_tests {
             "invalid_request_error: context_length_exceeded"
         ));
         assert!(is_context_window_error("Prompt is too long"));
+        assert!(is_context_window_error(
+            "HTTP 401 Unauthorized: {\"error\":{\"message\":\"k3-256k supports only 256K context.\",\"type\":\"invalid_authentication_error\"}}"
+        ));
         assert!(!is_context_window_error("connection reset by peer"));
+        assert!(!is_context_window_error("this model supports only text input"));
     }
 }

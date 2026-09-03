@@ -93,6 +93,40 @@ export function removeQueuedPrompt(itemId: string): QueuedPrompt | null {
   return removed;
 }
 
+/** 附件集合比较：重发时的图片是克隆对象，按名称/类型/大小判定是否同一批。 */
+function sameImageSet(a: PromptImage[], b: PromptImage[]) {
+  if (a.length !== b.length) return false;
+  return a.every((image, index) => {
+    const other = b[index];
+    return (
+      image.name === other.name &&
+      image.mimeType === other.mimeType &&
+      image.size === other.size
+    );
+  });
+}
+
+/**
+ * 撤下与即将手动发送内容重复的排队条目。
+ * 用户停止后重新输入同一条提示词（例如从历史里取回刚排队的那条）时，队列里往往
+ * 还留着停止前排入的同一份内容；放任它在手动那轮结束后自动投递，用户就会看到
+ * 两条完全相同的消息。
+ */
+export function dropQueuedPromptsMatching(
+  threadId: string,
+  text: string,
+  images: PromptImage[],
+) {
+  const target = text.trim();
+  if (!target && images.length === 0) return;
+  for (const queued of queuedPrompts()) {
+    if (queued.threadId !== threadId) continue;
+    if (queued.text.trim() !== target) continue;
+    if (!sameImageSet(queued.images, images)) continue;
+    removeQueuedPrompt(queued.id);
+  }
+}
+
 export async function dispatchQueuedPrompt(item: QueuedPrompt, steerNow = false) {
   if (dispatchingQueueIds().has(item.id)) return;
   // 用户主动发送或恢复队列后，允许后续条目在回合结束后继续自动投递。
