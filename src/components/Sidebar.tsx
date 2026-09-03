@@ -12,6 +12,7 @@ import {
   markThreadSwitchPointerDown,
   openNewSession,
   openThread,
+  setState,
   setTrainingProject,
   setView,
   state,
@@ -117,11 +118,35 @@ export function Sidebar(props: {
   const isTrainingView = () => state.view === "training";
   const isBrowserView = () => state.view === "browser";
 
+  const threadOf = (id: string) => state.threads.find((item) => item.id === id);
+  /** 会话及其子孙（接力链）上的未读总数，与 ThreadRow 徽标口径一致。 */
+  const chainUnreadCount = (thread: ThreadMeta | undefined): number => {
+    if (!thread) return 0;
+    const ids = new Set<string>([thread.id]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const candidate of state.threads) {
+        if (candidate.parentThreadId && ids.has(candidate.parentThreadId) && !ids.has(candidate.id)) {
+          ids.add(candidate.id);
+          changed = true;
+        }
+      }
+    }
+    return state.threads.reduce(
+      (sum, candidate) => sum + (ids.has(candidate.id) ? (state.unreadTurns[candidate.id] ?? 0) : 0),
+      0,
+    );
+  };
   const openHistoryThread = async (id: string) => {
     const thread = state.threads.find((item) => item.id === id);
     // 大熊座、双子座会话各自保持对应 tab；普通会话回到普通模式。
     if (thread?.experienceThread) setTrainingProject(thread.worktree?.repo || thread.cwd);
     setView(thread?.experienceThread ? "training" : thread?.browserThread ? "browser" : "home");
+    // 打开时若链上仍有其它阶段未读，仅消费一条未读（聚合徽标 -1）；本 stage 自身清零。
+    if (state.unreadTurns[id] && chainUnreadCount(threadOf(id)) > 1) {
+      setState("unreadTurns", id, (count) => (count ?? 1) - 1);
+    }
     await openThread(id);
   };
 
@@ -400,8 +425,12 @@ export function Sidebar(props: {
         onPointerDown={() => markThreadSwitchPointerDown()}
         onClick={() =>
           void openHistoryThread(
-            latestFireStage(state.threads, activeThread(), (id) => !!state.running[id])?.id ??
-            activeThread().id,
+            latestFireStage(
+              state.threads,
+              activeThread(),
+              (id) => !!state.running[id],
+              (id) => state.unreadTurns[id] ?? 0,
+            )?.id ?? activeThread().id,
           )
         }
         onContextMenu={(e) => {
