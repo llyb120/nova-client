@@ -8,6 +8,7 @@ import {
   chatScrollToBottomSignal,
   createThread,
   deleteThread,
+  markThreadSwitchPointerDown,
   openThread,
   pickThreadModel,
   refreshThreads,
@@ -1532,6 +1533,7 @@ export function ChatView() {
                 class="stage-rail-item"
                 classList={{ active: thread.id === state.currentId }}
                 title={thread.title}
+                onPointerDown={() => markThreadSwitchPointerDown()}
                 onClick={() => {
                   setStageContextMenu(null);
                   void jumpToStage(thread.id);

@@ -1171,8 +1171,21 @@ let openThreadRequest = 0;
 
 /** 切换会话耗时自测：仅在总耗时超阈值时写一行 agent 日志，release 包也能定位卡点。 */
 let switchTraceStart = 0;
+/** 用户在会话行上按下指针的瞬间（早于 click/openThread），用于暴露"点击→开始切换"盲区。 */
+let switchPointerDownAt = 0;
+export function markThreadSwitchPointerDown() {
+  switchPointerDownAt = performance.now();
+}
 export function markThreadSwitchStart() {
   switchTraceStart = performance.now();
+  // 点击/按下 到 openThread 真正开始执行之间的等待（主线程被占时点击看似没反应）。
+  if (switchPointerDownAt) {
+    const wait = Math.round(switchTraceStart - switchPointerDownAt);
+    switchPointerDownAt = 0;
+    if (wait >= 150) {
+      setState("logs", (logs) => [...logs, `[切换卡顿] 点击→开始切换 等待 ${wait}ms（主线程被占）`]);
+    }
+  }
 }
 function traceThreadSwitch(id: string, phase: string) {
   if (!switchTraceStart) return;
