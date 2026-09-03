@@ -27,6 +27,8 @@ struct ResolvedCompletionTarget {
     service_tier: Option<String>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    /// config.jsonc 中按模型/provider 配置的代理；None = 跟随全局 lyra-proxy 设置。
+    proxy: Option<String>,
 }
 
 struct CachedConfig {
@@ -55,6 +57,15 @@ pub async fn complete_direct(
 ) -> Result<String, String> {
     let config = load_config(data_dir)?;
     let target = resolve_target(&config, model_selection, env)?;
+    // 模型在 config.jsonc 声明了 options.proxy 时改用按代理地址缓存的客户端。
+    let proxied;
+    let http = match target.proxy.as_deref() {
+        Some(proxy) => {
+            proxied = crate::lyra::provider::client_for_proxy(proxy);
+            &proxied
+        }
+        None => http,
+    };
     match target.api.as_str() {
         "openai-completions" => complete_openai_completions(http, &target, prompt).await,
         "openai-responses" => complete_openai_responses(http, &target, prompt).await,
@@ -498,6 +509,7 @@ fn resolve_target(
         service_tier,
         temperature,
         top_p,
+        proxy: crate::lyra::config::resolve_proxy(model, provider, env)?,
     })
 }
 

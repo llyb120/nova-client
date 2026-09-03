@@ -8,8 +8,9 @@ use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text};
 use crate::lyra::tools::Tool;
 use base64::Engine;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug)]
 pub enum StreamEvent {
@@ -1124,6 +1125,32 @@ async fn stream_chat_once(
     }
 }
 
+/// 模型级 proxy 配置的 HTTP 客户端：按代理地址缓存并复用连接池。
+/// 无协议前缀按 http 代理处理；URL 无法解析时退化为直连（与全局 lyra-proxy 一致）。
+pub(crate) fn client_for_proxy(proxy: &str) -> reqwest::Client {
+    static CLIENTS: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut clients = clients.lock().unwrap();
+    if let Some(client) = clients.get(proxy) {
+        return client.clone();
+    }
+    let url = if proxy.contains("://") {
+        proxy.to_string()
+    } else {
+        format!("http://{proxy}")
+    };
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_max_idle_per_host(4)
+        .tcp_keepalive(std::time::Duration::from_secs(20));
+    if let Ok(parsed) = reqwest::Proxy::all(&url) {
+        builder = builder.proxy(parsed);
+    }
+    let client = builder.build().unwrap_or_default();
+    clients.insert(proxy.to_string(), client.clone());
+    client
+}
+
 /// 一次流式模型调用。网络/响应体解码错误会在尚未向调用方发送任何增量时静默重试；
 /// 已经发送增量后不重试，避免 UI、工具参数或会话内容重复。取消时返回 stop_reason = aborted。
 pub async fn stream_chat(
@@ -1138,6 +1165,16 @@ pub async fn stream_chat(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
+    // 模型在 config.jsonc 声明了 options.proxy 时改用按代理地址缓存的客户端；
+    // 未声明则沿用调用方客户端（已含全局 lyra-proxy 设置）。
+    let proxied;
+    let http = match model.proxy.as_deref() {
+        Some(proxy) => {
+            proxied = client_for_proxy(proxy);
+            &proxied
+        }
+        None => http,
+    };
     let mut retry = 0;
     loop {
         let mut emitted = false;
@@ -1618,7 +1655,16 @@ mod tests {
             supports_reasoning_effort: true,
             clear_thinking: None,
             extra_options: Map::new(),
+            proxy: None,
         }
+    }
+
+    #[test]
+    fn client_for_proxy_builds_caches_and_tolerates_invalid() {
+        let _ = client_for_proxy("http://127.0.0.1:10808");
+        let _ = client_for_proxy("http://127.0.0.1:10808"); // 命中缓存
+        let _ = client_for_proxy("127.0.0.1:10809"); // 无协议前缀按 http 处理
+        let _ = client_for_proxy("not a url"); // 无效代理退化为直连，不 panic
     }
 
     #[test]

@@ -108,6 +108,9 @@ pub struct ResolvedModel {
     /// options 里非内置键原样透传进请求体顶层（model.options 覆盖 provider.options），
     /// 厂商特有字段（tool_stream、thinking_budget、preserve_thinking 等）无需逐个接线。
     pub extra_options: Map<String, Value>,
+    /// config.jsonc 中按模型/provider 配置的代理（model.options.proxy 覆盖
+    /// provider.options.proxy）；None = 跟随全局 lyra-proxy 设置。
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,7 +304,26 @@ const RESERVED_OPTION_KEYS: &[&str] = &[
     "supportsLongCacheRetention",
     "supportsReasoningEffort",
     "clearThinking",
+    "proxy",
 ];
+
+/// 解析细粒度代理：model.options.proxy 覆盖 provider.options.proxy。
+/// 支持 {env:NAME} 占位符；空/缺省返回 None，表示跟随全局 lyra-proxy 设置。
+pub fn resolve_proxy(
+    model: &Value,
+    provider: &Value,
+    env: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    let Some(raw) = [model.pointer("/options/proxy"), provider.pointer("/options/proxy")]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let proxy = resolve_env_string(raw, env)?.trim().to_string();
+    Ok((!proxy.is_empty()).then_some(proxy))
+}
 
 fn compat_flag(model: &Value, provider: &Value, key: &str) -> Option<bool> {
     // 只有 options 一处入口：model.options 覆盖 provider.options。
@@ -538,6 +560,7 @@ pub fn resolve_model(
             supports_reasoning_effort,
             clear_thinking,
             extra_options,
+            proxy: resolve_proxy(model, provider, env)?,
         },
         api_key,
         thinking_level,
@@ -684,6 +707,42 @@ mod tests {
         assert_eq!(resolved.model.max_tokens_field, "max_tokens");
         assert!(resolved.model.session_affinity_headers);
         assert_eq!(resolved.model.clear_thinking, Some(true));
+    }
+
+    #[test]
+    fn model_proxy_overrides_provider_proxy_and_resolves_env() {
+        let config = json!({
+            "provider": {
+                "custom": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "http://127.0.0.1:8317/v1",
+                        "apiKey": "key",
+                        "proxy": "http://127.0.0.1:10808"
+                    },
+                    "models": {
+                        "inherit": {},
+                        "proxied": { "options": { "proxy": "{env:LYRA_TEST_PROXY}" } },
+                        "direct": { "options": { "proxy": "" } }
+                    }
+                }
+            }
+        });
+        let env = HashMap::from([(
+            "LYRA_TEST_PROXY".to_string(),
+            "socks5://127.0.0.1:1080".to_string(),
+        )]);
+        // 模型未配置时继承 provider 级代理。
+        let inherit = resolve_model(&config, Some("custom/inherit"), &env).unwrap();
+        assert_eq!(inherit.model.proxy.as_deref(), Some("http://127.0.0.1:10808"));
+        // 模型级覆盖 provider 级，且 {env:NAME} 占位符被解析。
+        let proxied = resolve_model(&config, Some("custom/proxied"), &env).unwrap();
+        assert_eq!(proxied.model.proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
+        // proxy 是内置键，不透传进请求体。
+        assert!(!proxied.model.extra_options.contains_key("proxy"));
+        // 显式空串视为未配置（跟随全局 lyra-proxy）。
+        let direct = resolve_model(&config, Some("custom/direct"), &env).unwrap();
+        assert_eq!(direct.model.proxy, None);
     }
 
     #[test]
