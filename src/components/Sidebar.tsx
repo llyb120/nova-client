@@ -9,6 +9,7 @@ import {
   closeThread,
   deleteProjectThreads,
   deleteThread,
+  markThreadSwitchPointerDown,
   openNewSession,
   openThread,
   setTrainingProject,
@@ -396,9 +397,11 @@ export function Sidebar(props: {
           parent: (props.childCount ?? 0) > 0,
           starred: !!(t.starred || props.mergedChild?.starred),
         }}
+        onPointerDown={() => markThreadSwitchPointerDown()}
         onClick={() =>
           void openHistoryThread(
-            latestFireStage(state.threads, activeThread())?.id ?? activeThread().id,
+            latestFireStage(state.threads, activeThread(), (id) => !!state.running[id])?.id ??
+            activeThread().id,
           )
         }
         onContextMenu={(e) => {
