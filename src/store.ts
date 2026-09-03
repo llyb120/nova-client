@@ -1256,9 +1256,12 @@ export async function openThread(id: string) {
   }
 
   try {
-    // 先切换后端 active_thread，再静默校准快照，补齐后台会话运行期间未广播的高频增量。
-    await api.reportActivity(id);
-    traceThreadSwitch(id, "reportActivity(IPC) 返回");
+    // 切换后端 active_thread 是纯副作用（只设时间戳），不返回任何被后续依赖的值，
+    // 且 getThread 按 thread_id 显式拉取、不读 active_thread——无需 await。
+    // 之前 await 它会让切换卡在 Tauri 命令队列里：stage 会话的标题生成/model-options
+    // 等慢命令（session/new 触发 skills 扫描 + 最长 120s 的 session/prompt）排在前面，
+    // 把 reportActivity 堵 800ms。发射即忘让 getThread 立即并行入队，不再被堵。
+    void api.reportActivity(id).catch(() => {});
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
     if (cached && switching && !staleThreadSnapshots.has(id)) {
