@@ -1,15 +1,19 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { message } from "@tauri-apps/plugin-dialog";
 import {
   paintCanvasBackdrop,
   STAR_MAP_UPDATE_MS,
 } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
+import { api } from "../ipc";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
+import { relPath } from "./EditedFilesCard";
+import { createFileContextMenu } from "./FileContextMenu";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
 import { fmtDuration, fmtTokens, turnTokenTitle } from "./TurnGroup";
@@ -950,6 +954,13 @@ function lineAtOffset(b: Block, offset: number): TextLine | null {
   return offset < lines[0].offset ? lines[0] : lines[lines.length - 1];
 }
 
+/** 在配置的编辑器中打开文件（带可选行号），失败弹错误（对齐 DOM ToolCallCard） */
+function openInEditor(path: string, line?: number) {
+  const id = state.currentId;
+  if (!id || !path) return;
+  void api.openInEditor(id, path, line).catch((e) => void message(String(e), { kind: "error" }));
+}
+
 // ─── Main component ──────────────────────────────────────────────────────────
 
 export function CanvasTranscript(props: CanvasTranscriptProps) {
@@ -974,6 +985,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let cursorStyle = "default";
   /** code-copy-btn feedback: hoverKey → hide-after timestamp */
   const copiedCodeUntil = new Map<string, number>();
+  const fileMenu = createFileContextMenu();
   const shownText = new Map<number, string>();
   const targetText = new Map<number, string>();
   const revealReadyAt = new Map<number, number>();
@@ -1795,7 +1807,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         let rowH = 0;
         for (const loc of item.locations) {
           if (!loc.path) continue;
-          const name = `${loc.path.split(/[\\/]/).pop() ?? loc.path}${loc.line != null ? `:${loc.line}` : ""}`;
+          const locPath = loc.path;
+          const name = `${locPath.split(/[\\/]/).pop() ?? locPath}${loc.line != null ? `:${loc.line}` : ""}`;
           const chipW = measure(name, 11.5, p.mono) + 18; // padding 2*9
           if (lx + chipW > contentX + contentW && lx > contentX) {
             lx = contentX; by += 24; // chip h ~20 + gap
@@ -1805,8 +1818,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             text: name, color: p.blue, fontSize: 11.5, font: p.mono,
             bg: p.panel, hoverBg: p.hover, borderRadius: 20, cursor: "pointer",
             selectable: false,
-            data: { padX: 9, padY: 2, underlineOnHover: true },
-            clickAction: () => { /* openFile */ } });
+            title: `在编辑器中打开 ${locPath}`,
+            data: { padX: 9, padY: 2, underlineOnHover: true, filePath: locPath },
+            clickAction: () => openInEditor(locPath, loc.line ?? undefined) });
           lx += chipW + 6;
           rowH = 20;
         }
@@ -1817,6 +1831,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       for (const content of contentBlocks) {
         if (content.type === "diff") {
           const diff = content as { type: "diff"; path: string; oldText?: string | null; newText: string };
+          // 与 DOM DiffView 一致：diff 上方显示文件路径，点击打开编辑器、右键弹文件菜单
+          result.push({ kind: "tool-diff-path", id: item.id, groupIdx: gi,
+            x: contentX, y: by, w: contentW, h: 26,
+            text: relPath(diff.path), color: p.blue, fontSize: 11.5, lineHeight: 1.2, font: p.mono,
+            bg: p.panel, border: p.border, borderRadius: [7, 7, 0, 0], hoverBg: p.hover,
+            cursor: "pointer", selectable: false,
+            title: `在编辑器中打开 ${diff.path}`,
+            data: { padX: 10, padY: 6, underlineOnHover: true, filePath: diff.path },
+            clickAction: () => openInEditor(diff.path) });
+          by += 26;
           const preview = (diff.oldText ?? "").slice(0, 200) + "\n→\n" + diff.newText.slice(0, 200);
           const lines = wrapText(preview, contentW - 20, 12, p.mono);
           const fullH = lines.length * 12 * 1.55 + 20;
@@ -1824,7 +1848,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           result.push({ kind: "tool-content", id: item.id, groupIdx: gi,
             x: contentX, y: by, w: contentW, h,
             text: preview, color: p.dim, fontSize: 12, lineHeight: 1.55, font: p.mono,
-            bg: p.sidebar, border: p.border, borderRadius: 7, selectable: true,
+            bg: p.sidebar, border: p.border, borderRadius: [0, 0, 7, 7], selectable: true,
             data: { padX: 10, padY: 10, fullH, clipped: fullH > 320 } });
           by += h + 8;
         } else if (content.type === "content") {
@@ -2024,6 +2048,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         case "tool-content":
         case "actual-model":
         case "tool-location":
+        case "tool-diff-path":
           paintTextBlock(ctx, b, bx, by, !!isHover, i);
           break;
         case "thinking-status":
@@ -3208,6 +3233,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
   }
 
+  // 文件块右键弹文件菜单（复用 DOM 的 FileContextMenu）；其余区域仅屏蔽浏览器默认菜单
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    const idx = hitTest(e.clientX, e.clientY);
+    const path = idx >= 0 ? (blocks[idx].data?.filePath as string | undefined) : undefined;
+    if (path) fileMenu.open(e, path);
+  }
+
   function onWheel(e: WheelEvent) {
     e.preventDefault();
     // 高频滚轮事件按帧合并：一次滚动手势会产生数十个事件，逐个同步改 scrollY +
@@ -3463,6 +3496,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     canvasEl.addEventListener("mousedown", onMouseDown);
     canvasEl.addEventListener("mouseup", onMouseUp);
     canvasEl.addEventListener("click", onClick);
+    canvasEl.addEventListener("contextmenu", onContextMenu);
     canvasEl.addEventListener("wheel", onWheel, { passive: false });
     canvasEl.addEventListener("copy", onCopy);
 
@@ -3501,6 +3535,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       canvasEl.removeEventListener("mousedown", onMouseDown);
       canvasEl.removeEventListener("mouseup", onMouseUp);
       canvasEl.removeEventListener("click", onClick);
+      canvasEl.removeEventListener("contextmenu", onContextMenu);
       canvasEl.removeEventListener("wheel", onWheel);
       canvasEl.removeEventListener("copy", onCopy);
       endScrollDrag();
@@ -3596,6 +3631,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   return (
     <div class="canvas-transcript-host" ref={hostEl}>
+      <fileMenu.Menu />
       <canvas ref={backdropCanvasEl} class="transcript-canvas-backdrop" aria-hidden="true" />
       <canvas ref={canvasEl} class="transcript-canvas-only" tabindex="0" aria-label="会话记录" />
       {editing() && (
