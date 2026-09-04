@@ -1384,6 +1384,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           // 世界线预览是静态快照，即使当前主线仍在运行，也应允许从历史消息编辑并分叉。
           // 使用父组件传入的有效 running 状态，避免直接读取主线状态把预览中的编辑入口隐藏。
           if (!props.running) {
+            result.push({ kind: "resend-btn", id: item.id, groupIdx: gi,
+              x: bx - 52, y: y + bubbleH - 26 - 4, w: 24, h: 24,
+              hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
+              hoverKey: `user-${item.id}`, title: "原样重发此消息",
+              clickAction: () => { void editUserMessage(item.id, item.text, item.images ?? []); } });
             result.push({ kind: "edit-btn", id: item.id, groupIdx: gi,
               x: bx - 28, y: y + bubbleH - 26 - 4, w: 24, h: 24,
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
@@ -1957,7 +1962,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ctx.save();
 
       // background — hoverBg for interactive blocks; edit/copy btns only visible on hover (or copied)
-      if (b.kind === "edit-btn") {
+      if (b.kind === "edit-btn" || b.kind === "resend-btn") {
         if (isHover) {
           ctx.fillStyle = b.hoverBg || pal.hover;
           roundRect(ctx, bx, by, b.w, b.h, b.borderRadius || 6);
@@ -1989,7 +1994,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
 
       // border
-      if (b.border && b.kind !== "edit-btn" && b.kind !== "code-copy-btn") {
+      if (b.border && b.kind !== "edit-btn" && b.kind !== "resend-btn" && b.kind !== "code-copy-btn") {
         ctx.strokeStyle = b.border;
         ctx.lineWidth = 1;
         if (b.borderRadius) {
@@ -2007,6 +2012,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           break;
         case "edit-btn":
           if (isHover) paintEditIcon(ctx, bx + 5, by + 5, 13, isHover ? p.text : p.faint);
+          break;
+        case "resend-btn":
+          if (isHover) paintRefreshIcon(ctx, bx + 5, by + 5, 13, p.text);
           break;
         case "code-copy-btn": {
           const copied = (copiedCodeUntil.get(b.hoverKey || "") || 0) > performance.now();
@@ -2736,6 +2744,33 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.quadraticCurveTo(22, 5, 19, 3);
     ctx.quadraticCurveTo(17, 1, 15, 3);
     ctx.lineTo(3, 17); ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function paintRefreshIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, color: string) {
+    // 与 icons.tsx 的 IconRefresh（lucide refresh-cw）同形
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const s = size / 24;
+    ctx.translate(x, y);
+    ctx.scale(s, s);
+    ctx.beginPath();
+    ctx.arc(12, 12, 9, Math.PI, Math.PI * 1.75);
+    ctx.lineTo(21, 8);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(21, 3); ctx.lineTo(21, 8); ctx.lineTo(16, 8);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(12, 12, 9, 0, Math.PI * 0.75);
+    ctx.lineTo(3, 16);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(8, 16); ctx.lineTo(3, 16); ctx.lineTo(3, 21);
     ctx.stroke();
     ctx.restore();
   }
