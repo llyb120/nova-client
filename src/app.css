@@ -7363,6 +7363,25 @@ button.clue-bar-item:hover,
   box-shadow: var(--shadow-md); backdrop-filter: blur(6px); pointer-events: none;
   animation: wfDrop2 .2s ease-out;
 }
+/* 气泡形态：贴着输入框左上角弹出，小尾巴靠近左侧指向输入框（下方放不下时翻到上侧） */
+.app-toast.bubble::after {
+  content: "";
+  position: absolute; left: 18px; bottom: -6px;
+  width: 10px; height: 10px;
+  transform: rotate(45deg);
+  background: inherit;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  border-bottom-right-radius: 2px;
+}
+.app-toast.bubble.below::after {
+  bottom: auto; top: -6px;
+  border-right: none; border-bottom: none;
+  border-left: 1px solid var(--border);
+  border-top: 1px solid var(--border);
+  border-bottom-right-radius: 0;
+  border-top-left-radius: 2px;
+}
 
 /* 减少焦虑：提示词化作星尘沿弧线飞入室女座（位置由 ZenDropChip 的 rAF 驱动） */
 .zen-drop {

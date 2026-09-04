@@ -127,12 +127,20 @@ function AppToastChip(props: { text: string }) {
     const composer = document.querySelector(".home-composer") ?? document.querySelector(".composer");
     if (!el || !composer) return;
     const rect = composer.getBoundingClientRect();
-    const below = rect.bottom + 12;
+    const gap = 10;
     el.style.bottom = "auto";
-    el.style.top =
-      below + el.offsetHeight <= window.innerHeight - 8
-        ? `${below}px`
-        : `${Math.max(8, rect.top - el.offsetHeight - 12)}px`;
+    el.classList.add("bubble");
+    // 左对齐到输入框左上角，不再水平居中。
+    el.style.left = `${rect.left}px`;
+    el.style.transform = "none";
+    const above = rect.top - el.offsetHeight - gap;
+    if (above >= 8) {
+      el.style.top = `${above}px`;
+    } else {
+      // 上方放不下时退到输入框下方，气泡尾巴翻到上侧。
+      el.classList.add("below");
+      el.style.top = `${rect.bottom + gap}px`;
+    }
   });
   return (
     <div ref={el} class="app-toast">
