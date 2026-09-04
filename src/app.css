@@ -635,36 +635,17 @@ button {
   font-size: 10px;
 }
 
-/* 会话运行中：不给 spinner 单独占位，模型徽标做流光效果——
-   一道白色斜向光带周期性从左扫到右，徽标本体不动 */
-.thread-item .thread-agent.running {
-  position: relative;
-  overflow: hidden;
+/* 会话运行中：标题逐字上下跳动（波浪感），比徽标流光明显；
+   位移由 TitleBounce 的共享 rAF 逐帧驱动（跟随 token 输出速率平滑变速），
+   这里只保留布局与合成层提示 */
+.thread-title-bounce {
+  /* 上边给跳动留空间，负 margin 保持行高不变 */
+  padding-top: 3px;
+  margin-top: -3px;
 }
-.thread-item .thread-agent.running::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: -120%;
-  width: 70%;
-  background: linear-gradient(
-    100deg,
-    transparent 0%,
-    rgba(255, 255, 255, 0.28) 38%,
-    rgba(255, 255, 255, 0.5) 50%,
-    rgba(255, 255, 255, 0.28) 62%,
-    transparent 100%
-  );
-  animation: thread-shine 1.9s ease-in-out infinite;
-  pointer-events: none;
-}
-@keyframes thread-shine {
-  0% { left: -120%; }
-  65%, 100% { left: 160%; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .thread-item .thread-agent.running::after { display: none; }
+.thread-title-bounce .tb-char {
+  display: inline-block;
+  will-change: transform;
 }
 /* 未读新轮次结论：徽标右上角数字角标（stage 链多次完成会累计） */
 .thread-item .thread-agent.unread {
