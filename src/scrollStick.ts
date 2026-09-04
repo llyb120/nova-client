@@ -23,3 +23,16 @@ export function resolveScrollAfterLayout(opts: {
     scrollY: stick ? maxScroll : Math.max(0, Math.min(maxScroll, opts.scrollY)),
   };
 }
+
+/**
+ * 用户手动滚动后的吸底判定（canvas 与 ChatView 共用，语义对齐 DOM 版 wheel：
+ * 上滚 cancelBottomFollow、下滚到底 enableBottomFollow）：上滚（位置变小）立即
+ * 解除吸底；下滚贴底 2px 内才恢复。
+ *
+ * 纯位置阈值（maxScroll - top <= 2）会把触控板/高精度滚轮慢扫的 1-2px 上滚误判为
+ * 仍贴底，流式 rebuild/pin 随即把 scrollY 钉回新底部吞掉滚动量，表现为手动滚动
+ * 偶发无法解除吸底（快速滚动单帧 delta 超阈值，所以只是偶发）。
+ */
+export function resolveUserScrollStick(prevTop: number, nextTop: number, maxScroll: number): boolean {
+  return nextTop < prevTop ? false : maxScroll - nextTop <= 2;
+}

@@ -10,7 +10,7 @@ import { api } from "../ipc";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
-import { resolveScrollAfterLayout } from "../scrollStick";
+import { resolveScrollAfterLayout, resolveUserScrollStick } from "../scrollStick";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { relPath } from "./EditedFilesCard";
@@ -2949,8 +2949,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function applyScrollY(next: number, user: boolean) {
+    const prev = scrollY;
     scrollY = Math.max(0, Math.min(maxScroll, next));
-    keepBottom = maxScroll - scrollY <= 2;
+    // 用户滚动按方向判定（上滚即解除吸底）；非用户滚动保持纯阈值。
+    keepBottom = user ? resolveUserScrollStick(prev, scrollY, maxScroll) : maxScroll - scrollY <= 2;
     applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, user);
     requestPaint();
@@ -3538,7 +3540,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     props.ref?.({
       scrollToBottom() { keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
       scrollToGroup(idx) { if (groupYs[idx] != null) { scrollY = Math.max(0, Math.min(maxScroll, groupYs[idx] - 20)); keepBottom = false; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); } },
-      scrollBy(delta) { scrollY = Math.max(0, Math.min(maxScroll, scrollY + delta)); keepBottom = maxScroll - scrollY <= 2; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, true); },
+      scrollBy(delta) { applyScrollY(scrollY + delta, true); },
       isAtBottom() { return maxScroll - scrollY <= 2; },
       scrollTop() { return scrollY; },
       maxScrollTop() { return maxScroll; },

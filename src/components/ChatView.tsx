@@ -19,6 +19,7 @@ import {
   timeMachineChangedSignal,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
+import { resolveUserScrollStick } from "../scrollStick";
 import type { AgentKind, Item, Thread, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
@@ -1362,9 +1363,12 @@ export function ChatView() {
             onReturnToCurrent={returnToCurrentTimeline}
             onScroll={(top, max, user) => {
               if (user) {
-                setStickToBottom(max - top <= 2);
-                lastScrollTop = top;
+                // 与 canvas 内部判定共用方向语义：上滚即解除吸底，下滚贴底才恢复。
+                setStickToBottom(resolveUserScrollStick(lastScrollTop, top, max));
               }
+              // user=false（rebuild 钉底/钳位）也要同步基准位置，
+              // 否则下一次上滚的方向判定拿旧基准会误判为下滚。
+              lastScrollTop = top;
               syncTimeCursor();
             }}
             onBrowseDetail={cancelBottomFollow}
