@@ -599,7 +599,34 @@ export function isWorkflowThread(threadId: string): boolean {
   return activeRuns.has(threadId) || suspendedRuns.has(threadId) || runHistory.has(threadId);
 }
 
-/** 阶段接力在途的 root 集合（室女座判定「整条链仍在运行」用）。 */
-export function advancingWorkflowRoots(): Set<string> {
-  return new Set(advancingRoots);
+const liveRoots = (runs: Iterable<WorkflowRunStep>): Set<string> => {
+  const roots = new Set<string>();
+  for (const run of runs) {
+    if (run?.rootId && !completedRoots.has(run.rootId)) roots.add(run.rootId);
+  }
+  return roots;
+};
+
+/**
+ * 仍在推进的工作流 root：有活动阶段或阶段接力在途。
+ * 暂停待补充、等待人工审核不在内（这些是「等人」，不算在跑）。
+ */
+export function busyWorkflowRoots(): Set<string> {
+  const roots = liveRoots(activeRuns.values());
+  for (const root of advancingRoots) {
+    if (!completedRoots.has(root)) roots.add(root);
+  }
+  return roots;
+}
+
+/**
+ * 尚未走到终点的工作流 root 集合（室女座判定「整条链仍未完成」用）。
+ * 除了仍在推进的链，还包含回合被取消/无转移命中而暂停待补充、等待人工审核这些
+ * 「后端 running 已经是 false，但流程没跑完」的状态：只按 running 判定的话，
+ * refreshThreads 的一份快照就会把没完成的工作流弹回普通列表。
+ */
+export function unfinishedWorkflowRoots(): Set<string> {
+  const roots = busyWorkflowRoots();
+  for (const root of liveRoots(suspendedRuns.values())) roots.add(root);
+  return roots;
 }

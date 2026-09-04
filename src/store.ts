@@ -43,14 +43,17 @@ import type {
   UpdateProgress,
 } from "./types";
 import { isScratch, scratchParent } from "./utils";
+import { virgoChains } from "./virgoChains";
 import {
-  advancingWorkflowRoots,
+  busyWorkflowRoots,
   handleTurnEnd as handleWorkflowTurnEnd,
   handleTurnStart as handleWorkflowTurnStart,
   initWorkflowRuntime,
   preparePrompt as prepareWorkflowPrompt,
   startWorkflow,
   suspendActive as suspendWorkflowActive,
+  unfinishedWorkflowRoots,
+  workflowReviewRevision,
 } from "./workflow/runtime";
 import {
   findTriggeredWorkflow,
@@ -527,6 +530,8 @@ const runningEventVersions = new Map<string, number>();
 // send_prompt 先乐观置忙，后端随后才会登记 manager.running；在这段窗口内刷新
 // list_threads 只能看到 false，额度租借创建线程时尤其容易撞上这个竞态。
 const optimisticRunningThreads = new Set<string>();
+/** 不需要接入室女座口径时的空集（避免每份刷新新建 Set）。 */
+const EMPTY_IDS: Set<string> = new Set();
 
 export async function refreshThreads() {
   const request = ++refreshThreadsRequest;
@@ -548,6 +553,9 @@ export async function refreshThreads() {
     }
   }
   const running: Record<string, boolean> = {};
+  // 室女座里仍在推进（含阶段接力空档）的任务链：后端 running 在这段空档就是 false，
+  // 快照不能把链上已有的忙碌态冲掉，否则侧栏转圈和徽标会闪断（以事件/乐观态为准）。
+  const zenBusyChains = zenModeOn() ? zenRunningChains().busy : EMPTY_IDS;
   for (const t of threads) {
     // 运行事件在本次请求期间到达时，以事件为准；否则使用后端快照。
     // 这样不会因额度租借的「创建线程刷新」竞态把实际运行态冲回 false。
@@ -555,7 +563,7 @@ export async function refreshThreads() {
     const current = runningEventVersions.get(t.id) ?? 0;
     running[t.id] = optimisticRunningThreads.has(t.id)
       ? true
-      : current !== before
+      : current !== before || zenBusyChains.has(t.id)
         ? !!state.running[t.id]
         : t.running;
   }
@@ -1449,37 +1457,24 @@ function zenModeOn() {
   return !!state.settings?.zenModeEnabled;
 }
 /**
- * 减少焦虑模式的运行态口径（侧栏、首页最近会话共用）：
- * hidden = 运行中任务链（含父子接力整条链）的全部会话 id；rootCount = 运行中任务数（室女座徽标）。
+ * 减少焦虑模式的运行态口径（侧栏、首页最近会话、refreshThreads 共用）：
+ * hidden = 归室女座的任务链（含父子接力整条链）的全部会话 id；
+ * busy = 工作流仍在推进（活动阶段或阶段接力空档）的链上的会话 id，
+ *        refreshThreads 合并后端快照时据此保留运行态；
+ * rootCount = 运行中任务数（室女座徽标，不把「暂停等人」的任务计入）。
+ * 集合计算在 virgoChains（纯函数，单测见 scripts/virgo-chains.test.mjs），
+ * 这里只接入信号与工作流运行时。
  */
-export function zenRunningChains(): { hidden: Set<string>; rootCount: number } {
-  const byId = new Map(state.threads.map((t) => [t.id, t]));
-  const rootOf = new Map<string, string>();
-  for (const t of state.threads) {
-    let cur = t;
-    const seen = new Set<string>([cur.id]);
-    while (cur.parentThreadId) {
-      const parent = byId.get(cur.parentThreadId);
-      if (!parent || seen.has(parent.id)) break;
-      cur = parent;
-      seen.add(cur.id);
-    }
-    rootOf.set(t.id, cur.id);
-  }
-  const runningRoots = new Set<string>();
-  for (const t of state.threads) {
-    if (state.running[t.id]) runningRoots.add(rootOf.get(t.id) ?? t.id);
-  }
-  // 工作流阶段接力在途（上一节点已结束、下一节点还没起来）时整条链仍未完成，
-  // 不能因为这一瞬没有任何会话 running 就把工作流弹回普通模式。
-  for (const root of advancingWorkflowRoots()) {
-    runningRoots.add(rootOf.get(root) ?? root);
-  }
-  const hidden = new Set<string>();
-  for (const t of state.threads) {
-    if (runningRoots.has(rootOf.get(t.id) ?? t.id)) hidden.add(t.id);
-  }
-  return { hidden, rootCount: runningRoots.size };
+export function zenRunningChains(): { hidden: Set<string>; busy: Set<string>; rootCount: number } {
+  // 工作流运行态（activeRuns/suspendedRuns/advancingRoots）是普通内存集合，不是响应式信号；
+  // 读一下 revision，侧栏/首页才不会等到下一次 refreshThreads 才反映室女座归属。
+  workflowReviewRevision();
+  return virgoChains({
+    threads: state.threads,
+    isRunning: (id) => !!state.running[id],
+    advancingRoots: busyWorkflowRoots(),
+    unfinishedRoots: unfinishedWorkflowRoots(),
+  });
 }
 /** 发送成功后离开会话详情并播放「提示词飞入室女座」动画；/fire、/stage 等内置命令的编排流程不在此列。 */
 function zenHideAfterSend(text: string) {

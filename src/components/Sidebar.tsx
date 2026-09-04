@@ -421,7 +421,12 @@ export function Sidebar(props: {
       }
       return state.threads.filter((thread) => ids.has(thread.id));
     };
-    const running = () => chainThreads().some((thread) => !!state.running[thread.id]);
+    // 整条链的忙碌态：工作流阶段接力空档里没有任何会话 running，
+    // 只看 state.running 会让侧栏转圈在刷新/回合结束时闪断，这里并入室女座运行链口径。
+    const running = () => {
+      const { busy } = chainInfo();
+      return chainThreads().some((thread) => !!state.running[thread.id] || busy.has(thread.id));
+    };
     // 运行状态直接标在模型徽标上（发光 + 流线扫圈），不再占用右侧文字空间
     const runChild = () => !!(props.mergedChild && state.running[props.mergedChild.id]);
     const runSelf = () => running() && !runChild();
