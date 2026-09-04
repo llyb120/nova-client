@@ -505,6 +505,8 @@ export interface Settings {
   sessionAutoCleanupEnabled: boolean;
   /** 自动清理会话的保留时长（小时） */
   sessionAutoCleanupHours: number;
+  /** 减少焦虑（室女座）：运行中的会话只在室女座显示，结束后自动回到普通模式 */
+  zenModeEnabled: boolean;
   /** 独立经验库训练；经验不同于客观记忆和必须遵守的守则。开启后 Lyra polaris 也会并行召回训练知识。 */
   experienceTrainingEnabled: boolean;
   experienceTrainingAgent: AgentKind;

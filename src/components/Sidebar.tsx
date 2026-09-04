@@ -96,7 +96,7 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "training" | "browser") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo") => {
     setView(view);
     closeThread();
   };
@@ -114,9 +114,37 @@ export function Sidebar(props: {
   };
   const openWorkflows = () => switchView("workflows");
   const openBrowser = () => switchView("browser");
+  const openVirgo = () => switchView("virgo");
 
   const isTrainingView = () => state.view === "training";
   const isBrowserView = () => state.view === "browser";
+  // 减少焦虑（高级设置开启）：运行中的任务链移入室女座，普通模式不再显示，结束后自动移回。
+  const zenMode = () => !!state.settings?.zenModeEnabled;
+  const isVirgoView = () => zenMode() && state.view === "virgo";
+
+  // 任务链（父子接力）根会话映射，以及链上有会话正在运行的根集合。
+  const chainInfo = createMemo(() => {
+    const byId = new Map(state.threads.map((t) => [t.id, t]));
+    const rootOf = new Map<string, string>();
+    for (const t of state.threads) {
+      let cur = t;
+      const seen = new Set<string>([cur.id]);
+      while (cur.parentThreadId) {
+        const parent = byId.get(cur.parentThreadId);
+        if (!parent || seen.has(parent.id)) break;
+        cur = parent;
+        seen.add(cur.id);
+      }
+      rootOf.set(t.id, cur.id);
+    }
+    const runningRoots = new Set<string>();
+    for (const t of state.threads) {
+      if (state.running[t.id]) runningRoots.add(rootOf.get(t.id) ?? t.id);
+    }
+    return { rootOf, runningRoots };
+  });
+  const inRunningChain = (t: ThreadMeta) =>
+    chainInfo().runningRoots.has(chainInfo().rootOf.get(t.id) ?? t.id);
 
   const threadOf = (id: string) => state.threads.find((item) => item.id === id);
   /** 会话及其子孙（接力链）上的未读总数，与 ThreadRow 徽标口径一致。 */
@@ -140,9 +168,17 @@ export function Sidebar(props: {
   };
   const openHistoryThread = async (id: string) => {
     const thread = state.threads.find((item) => item.id === id);
-    // 大熊座、双子座会话各自保持对应 tab；普通会话回到普通模式。
+    // 大熊座、双子座会话各自保持对应 tab；减少焦虑模式下运行中的普通会话留在室女座，其余回到普通模式。
     if (thread?.experienceThread) setTrainingProject(thread.worktree?.repo || thread.cwd);
-    setView(thread?.experienceThread ? "training" : thread?.browserThread ? "browser" : "home");
+    setView(
+      thread?.experienceThread
+        ? "training"
+        : thread?.browserThread
+          ? "browser"
+          : thread && zenMode() && inRunningChain(thread)
+            ? "virgo"
+            : "home",
+    );
     // 打开时若链上仍有其它阶段未读，仅消费一条未读（聚合徽标 -1）；本 stage 自身清零。
     if (state.unreadTurns[id] && chainUnreadCount(threadOf(id)) > 1) {
       setState("unreadTurns", id, (count) => (count ?? 1) - 1);
@@ -177,7 +213,11 @@ export function Sidebar(props: {
       ? state.threads.filter((t) => t.experienceThread)
       : isBrowserView()
         ? state.threads.filter((t) => t.browserThread)
-        : state.threads.filter((t) => !t.experienceThread && !t.browserThread);
+        : isVirgoView()
+          ? state.threads.filter((t) => !t.experienceThread && !t.browserThread && inRunningChain(t))
+          : state.threads.filter(
+              (t) => !t.experienceThread && !t.browserThread && (!zenMode() || !inRunningChain(t)),
+            );
     return groupByCwd(threads);
   });
 
@@ -662,6 +702,17 @@ export function Sidebar(props: {
             >
               大熊座
             </button>
+            <Show when={zenMode()}>
+              <button
+                id="virgo-tab"
+                class="mode-seg-btn"
+                classList={{ active: state.view === "virgo" }}
+                onClick={openVirgo}
+                title="室女座（减少焦虑）：运行中的会话暂时移到这里，结束后自动回到普通模式"
+              >
+                室女座
+              </button>
+            </Show>
             <button
               class="mode-seg-btn"
               classList={{ active: state.view === "browser" }}
@@ -683,9 +734,11 @@ export function Sidebar(props: {
             <div class="thread-empty">
               {isTrainingView()
                 ? "还没有训练会话。点击右侧“立即训练”开始。"
-                : isBrowserView()
-                  ? "还没有双子座执行会话。运行一个片段后会显示在这里。"
-                  : "还没有会话。在右侧输入任务开始。"}
+                : isVirgoView()
+                  ? "没有正在运行的会话。运行中的会话会暂时移到这里，结束后自动回到普通模式。"
+                  : isBrowserView()
+                    ? "还没有双子座执行会话。运行一个片段后会显示在这里。"
+                    : "还没有会话。在右侧输入任务开始。"}
             </div>
           }
         >

@@ -319,6 +319,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [sessionAutoCleanupHours, setSessionAutoCleanupHours] = createSignal(
     s?.sessionAutoCleanupHours ?? 24 * 30,
   );
+  const [zenModeEnabled, setZenModeEnabled] = createSignal(s?.zenModeEnabled ?? false);
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
   );
@@ -752,6 +753,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     updateChannel: updateChannel(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
+    zenModeEnabled: zenModeEnabled(),
     historyDisplayMode: historyDisplayMode(),
     chatViewRender: chatViewRender(),
     experienceTrainingEnabled: experienceTrainingEnabled(),
@@ -1591,6 +1593,24 @@ export function SettingsModal(props: { onClose: () => void }) {
                   Canvas 在超长会话时更省 DOM 节点、滚动更轻；DOM 选区/复制更可靠。可随时切换，保存后立即生效。
                 </span>
               </label>
+            </section>
+
+            <section class="settings-group">
+              <h3 class="settings-group-title">减少焦虑</h3>
+              <div class="field">
+                <span class="field-label">室女座</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={zenModeEnabled()}
+                    onChange={(e) => setZenModeEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  启用后侧栏多出「室女座」：会话发出后即转入后台运行并移入室女座（有轻提示，想看进度可手动点开），普通模式不再显示，会话结束后自动移回。不必一直盯着运行中的会话，专心做自己的事。
+                </span>
+              </div>
             </section>
 
             <section class="settings-group">

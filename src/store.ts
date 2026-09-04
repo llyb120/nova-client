@@ -160,8 +160,8 @@ interface AppStore {
   roamingFolders: string[];
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
-  /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "clues" | "workflows" | "training" | "browser";
+  /** 主区域视图（currentId 非空时优先显示会话，与本字段无关）；virgo = 室女座（减少焦虑） */
+  view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -714,7 +714,7 @@ export async function refreshRoamingFolders() {
   }
 }
 
-export function setView(view: "home" | "clues" | "workflows" | "training" | "browser") {
+export function setView(view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo") {
   setState("view", view);
 }
 
@@ -1375,6 +1375,18 @@ export function isPendingThreadId(id: string | null | undefined): boolean {
   return !!id && id.startsWith(PENDING_THREAD_PREFIX);
 }
 
+/** 减少焦虑模式（室女座）：会话发出后转入后台运行，详情需到室女座手动查看。 */
+const ZEN_TOAST = "会话已在后台运行，去喝杯咖啡吧~";
+function zenModeOn() {
+  return !!state.settings?.zenModeEnabled;
+}
+/** 发送成功后离开会话详情并播放「提示词飞入室女座」动画；/fire、/stage 等内置命令的编排流程不在此列。 */
+function zenHideAfterSend(text: string) {
+  if (!zenModeOn() || !state.currentId) return;
+  closeThread();
+  zenDropPrompt(text);
+}
+
 /**
  * 乐观创建本地会话：先切进聊天页并上屏用户消息，后台 create_thread 完成后
  * 把占位替换成真会话并补发首条提示词。失败时回退到首页并保留输入。
@@ -1392,29 +1404,34 @@ export function createThreadOptimistic(
   clueCardId: string,
 ): void {
   const pendingId = PENDING_THREAD_PREFIX + crypto.randomUUID();
-  setState("expanded", reconcile({}));
-  setState({
-    currentId: pendingId,
-    items: [],
-    plan: null,
-    proposedPlan: null,
-    cwd,
-    title: "",
-    agentKind,
-    model,
-    mode,
-    reasoningEffort,
-    loadingThread: false,
-  });
-  // 用户消息立即上屏，与 deliverPrompt 的乐观项同一约定（负 id 临时项）。
-  setState("items", 0, {
-    type: "user",
-    id: -Date.now(),
-    text,
-    images,
-    ts: Date.now(),
-  } as Item);
-  bumpChatScrollToBottom();
+  // 减少焦虑：不进入会话页，留在首页并播放飞入室女座动画；下方后台分支完成创建与发送。
+  if (zenModeOn()) {
+    zenDropPrompt(text);
+  } else {
+    setState("expanded", reconcile({}));
+    setState({
+      currentId: pendingId,
+      items: [],
+      plan: null,
+      proposedPlan: null,
+      cwd,
+      title: "",
+      agentKind,
+      model,
+      mode,
+      reasoningEffort,
+      loadingThread: false,
+    });
+    // 用户消息立即上屏，与 deliverPrompt 的乐观项同一约定（负 id 临时项）。
+    setState("items", 0, {
+      type: "user",
+      id: -Date.now(),
+      text,
+      images,
+      ts: Date.now(),
+    } as Item);
+    bumpChatScrollToBottom();
+  }
   void (async () => {
     try {
       const t = await api.createThread(
@@ -1455,16 +1472,9 @@ export function createThreadOptimistic(
         reportActivity(true);
         await sendPromptTo(t.id, text, images);
       } else {
-        // 已切走：后台建好后直接发，保持 optimisticRunningThreads 状态一致。
-        optimisticRunningThreads.add(t.id);
-        setState("running", t.id, true);
-        try {
-          await api.sendPrompt(t.id, text, images);
-        } catch (error) {
-          optimisticRunningThreads.delete(t.id);
-          setState("running", t.id, false);
-          throw error;
-        }
+        // 已切走或减少焦虑：后台建好后直接发；走 sendPromptTo 统一拦截 /fire 等
+        // 内置命令，running 状态由 deliverPrompt 维护。
+        await sendPromptTo(t.id, text, images);
       }
       void refreshThreads();
       void refreshProjects();
@@ -1474,6 +1484,9 @@ export function createThreadOptimistic(
         setState("items", (items) => items.filter((item) => item.id >= 0));
         setState("currentId", null);
         setView("home");
+      } else if (zenModeOn()) {
+        // 减少焦虑下用户只看到气泡飞走，创建失败必须显式告知，否则提示词静默丢失。
+        showToast("会话创建失败，请重试");
       }
       console.error("optimistic create_thread failed", error);
     }
@@ -1664,6 +1677,7 @@ export async function sendPrompt(
   // 新会话页选择了工作流：会话输入就是首节点输入，文本作为 goal、图片作为首节点附件。
   if (workflowId) {
     await startWorkflow(workflowId, { goal: text.trim() }, id, images, workflowFollowFrom);
+    zenHideAfterSend(text);
     return;
   }
   // 内置命令优先于工作流触发器，避免 /fire、/hard 等被当成普通内容。
@@ -1679,6 +1693,7 @@ export async function sendPrompt(
     id = restored.threadId;
   }
   await deliverPrompt(id, text, images);
+  zenHideAfterSend(text);
 }
 
 type StageInput = { currentPrompt: string; stagePrompt: string; stageIndex: number };
@@ -2344,6 +2359,35 @@ async function handleFireStart(threadId: string, text: string) {
 
 /** ChatView 订阅：发送新提示词时强制滚到底 */
 const [chatScrollToBottomTick, setChatScrollToBottomTick] = createSignal(0);
+
+/** 全局轻提示（非 alert）：showToast 展示数秒后自动消失，不阻断操作。 */
+const [toastMessage, setToastMessage] = createSignal<string | null>(null);
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+export function toastMessageSignal() {
+  return toastMessage();
+}
+export function showToast(text: string, ms = 3600) {
+  setToastMessage(text);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => setToastMessage(null), ms);
+}
+
+/** 减少焦虑：提示词飞入室女座的动画信号，由 App 的 ZenDropOverlay 消费。 */
+export type ZenDrop = { text: string; tick: number };
+const [zenDrop, setZenDrop] = createSignal<ZenDrop | null>(null);
+let zenDropTick = 0;
+export function zenDropSignal() {
+  return zenDrop();
+}
+function zenDropPrompt(text: string) {
+  const snippet = text.trim().split(/\r?\n/, 1)[0].slice(0, 24);
+  setZenDrop({ text: snippet || "消息已发送", tick: ++zenDropTick });
+}
+/** 飞入动画落地：收起气泡、给出轻提示。 */
+export function zenDropLanded() {
+  setZenDrop(null);
+  showToast(ZEN_TOAST);
+}
 const [timeMachineChangedTick, setTimeMachineChangedTick] = createSignal(0);
 let timeMachineEditTarget: { threadId: string; checkpointId: string } | null = null;
 export function setTimeMachineEditTarget(

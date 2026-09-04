@@ -7355,6 +7355,39 @@ button.clue-bar-item:hover,
 .wf-toast.error { border-color: color-mix(in srgb, var(--red) 55%, var(--border)); color: var(--red); }
 @keyframes wfDrop2 { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
+/* 全局轻提示（减少焦虑模式等）：底部居中，自动消失，不拦截点击 */
+.app-toast {
+  position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); z-index: 100;
+  padding: 9px 16px; border-radius: 999px; font-size: 12.5px; color: var(--text); white-space: nowrap;
+  background: color-mix(in srgb, var(--bg-float) 94%, transparent); border: 1px solid var(--border);
+  box-shadow: var(--shadow-md); backdrop-filter: blur(6px); pointer-events: none;
+  animation: wfDrop2 .2s ease-out;
+}
+
+/* 减少焦虑：提示词化作星尘沿弧线飞入室女座（位置由 ZenDropChip 的 rAF 驱动） */
+.zen-drop {
+  position: fixed; left: 0; top: 0; z-index: 100; width: 0; height: 0;
+  pointer-events: none; will-change: transform;
+}
+.zen-drop-dot {
+  position: absolute; left: -6px; top: -6px; width: 12px; height: 12px; border-radius: 50%;
+  background: radial-gradient(circle, #fff 0%, color-mix(in srgb, var(--accent) 75%, #fff) 38%, color-mix(in srgb, var(--accent) 50%, transparent) 62%, transparent 74%);
+  box-shadow: 0 0 10px 2px color-mix(in srgb, var(--accent) 65%, transparent),
+              0 0 26px 8px color-mix(in srgb, var(--accent) 26%, transparent);
+}
+.zen-drop-label {
+  position: absolute; left: 0; top: 14px; transform: translateX(-50%);
+  padding: 4px 11px; border-radius: 999px; font-size: 11.5px; color: var(--text-dim); white-space: nowrap;
+  background: color-mix(in srgb, var(--bg-float) 82%, transparent);
+  border: 1px solid var(--border); backdrop-filter: blur(6px);
+}
+.mode-seg-btn.virgo-landed { animation: virgoLand .85s cubic-bezier(.2, .8, .3, 1); }
+@keyframes virgoLand {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 transparent, 0 0 14px 3px transparent; }
+  30% { transform: scale(1.09); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent), 0 0 14px 3px color-mix(in srgb, var(--accent) 38%, transparent); }
+  100% { transform: scale(1); box-shadow: 0 0 0 12px transparent, 0 0 14px 3px transparent; }
+}
+
 /* 空状态 */
 .wf-empty-stage { position: absolute; inset: 0; z-index: 2; display: flex; align-items: center; justify-content: center; }
 .wf-empty-glow {
