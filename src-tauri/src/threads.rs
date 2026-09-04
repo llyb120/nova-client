@@ -1173,6 +1173,14 @@ impl ThreadTrashStore {
             .collect()
     }
 
+    /// 回收站中的会话 id：延迟删除期间这些会话的关联数据（世界线、scratch 目录）要保留。
+    pub fn thread_ids(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|entry| entry.thread.id.clone())
+            .collect()
+    }
+
     /// 回收站内停留满同一个保留周期后才彻底清除，返回需要一并删除工作目录的会话。
     pub fn purge_expired(&mut self, now: i64, hours: u32) -> Vec<Thread> {
         let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
