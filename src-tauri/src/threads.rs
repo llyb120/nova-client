@@ -528,6 +528,10 @@ pub struct Thread {
     /// 用户星标：在所在项目内置顶，并豁免自动清理与项目一键删除。
     #[serde(default)]
     pub starred: bool,
+    /// 尚未回看的收尾轮次数。只在内存里计数的话，重启会把后台完成的未读点抹掉，
+    /// 因此随会话文件落盘，由前端在计数变化时写回。
+    #[serde(default)]
+    pub unread_turns: u32,
     /// 漫游角色：None = 本地会话；Some("host") = 我替别人在本机执行；
     /// Some("guest") = 我在别人机器上执行、本机只接收展示
     #[serde(default)]
@@ -622,6 +626,7 @@ impl Thread {
             codex_usage_snapshot: None,
             ephemeral,
             starred: false,
+            unread_turns: 0,
             roaming_role: None,
             roaming_peer: None,
             roaming_peer_name: None,
@@ -882,6 +887,9 @@ pub struct ThreadMeta {
     #[serde(default)]
     pub ephemeral: bool,
     pub starred: bool,
+    /// 未读轮次数：前端据此在重启后恢复未读点。
+    #[serde(default)]
+    pub unread_turns: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roaming_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2203,12 +2211,14 @@ mod tests {
         let mut value = serde_json::to_value(thread).expect("线程应可序列化");
         let object = value.as_object_mut().expect("线程应序列化为对象");
         object.remove("starred");
+        object.remove("unreadTurns");
         object.remove("providerCheckpoints");
         object.remove("pendingNativeRestore");
         object.remove("codexUsageSnapshot");
 
         let restored: Thread = serde_json::from_value(value).expect("旧线程应可反序列化");
         assert!(!restored.starred);
+        assert_eq!(restored.unread_turns, 0);
         assert!(restored.provider_checkpoints.is_empty());
         assert!(restored.pending_native_restore.is_none());
         assert!(restored.codex_usage_snapshot.is_none());

@@ -203,6 +203,8 @@ export const api = {
     invoke<void>("set_thread_reasoning_effort", { threadId, reasoningEffort }),
   setThreadStarred: (threadId: string, starred: boolean) =>
     invoke<void>("set_thread_starred", { threadId, starred }),
+  setThreadUnread: (threadId: string, unread: number) =>
+    invoke<void>("set_thread_unread", { threadId, unread }),
   setThreadAgent: (
     threadId: string,
     agentKind: AgentKind,

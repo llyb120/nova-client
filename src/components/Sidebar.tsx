@@ -12,7 +12,7 @@ import {
   markThreadSwitchPointerDown,
   openNewSession,
   openThread,
-  setState,
+  setUnreadTurns,
   setTrainingProject,
   setView,
   state,
@@ -162,7 +162,7 @@ export function Sidebar(props: {
     );
     // 打开时若链上仍有其它阶段未读，仅消费一条未读（聚合徽标 -1）；本 stage 自身清零。
     if (state.unreadTurns[id] && chainUnreadCount(threadOf(id)) > 1) {
-      setState("unreadTurns", id, (count) => (count ?? 1) - 1);
+      setUnreadTurns(id, Math.max((state.unreadTurns[id] ?? 1) - 1, 0));
     }
     await openThread(id);
   };

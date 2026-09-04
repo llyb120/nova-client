@@ -119,6 +119,8 @@ export interface ThreadMeta {
   ephemeral?: boolean;
   /** 用户星标：在所在项目内置顶 */
   starred: boolean;
+  /** 尚未回看的收尾轮次数（随会话落盘，重启后仍能恢复未读点） */
+  unreadTurns: number;
   /** 漫游角色：host = 我替别人执行；guest = 在别人机器上执行、本机只接收 */
   roamingRole?: string | null;
   /** 漫游对端展示名 */

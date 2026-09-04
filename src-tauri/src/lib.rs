@@ -987,6 +987,7 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
             running: is_running(&state, t),
             ephemeral: t.ephemeral,
             starred: t.starred,
+            unread_turns: t.unread_turns,
             roaming_role: t.roaming_role.clone(),
             roaming_peer_name: t.roaming_peer_name.clone(),
             quota_peer_name: t.quota_peer_name.clone(),
@@ -3570,6 +3571,25 @@ fn set_thread_reasoning_effort(
     Ok(())
 }
 
+/// 未读点由前端在轮次收尾时计数；计数必须随会话落盘，否则重启后未读会消失。
+#[tauri::command]
+fn set_thread_unread(
+    state: State<'_, AppState>,
+    thread_id: String,
+    unread: u32,
+) -> Result<(), String> {
+    {
+        let mut store = state.store.lock().unwrap();
+        let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
+        if thread.unread_turns == unread {
+            return Ok(());
+        }
+        thread.unread_turns = unread;
+    }
+    state.store.lock().unwrap().save_thread(&thread_id);
+    Ok(())
+}
+
 #[tauri::command]
 fn set_thread_starred(
     app: tauri::AppHandle,
@@ -5906,6 +5926,7 @@ pub fn run() {
             set_thread_mode,
             set_thread_reasoning_effort,
             set_thread_starred,
+            set_thread_unread,
             set_thread_agent,
             get_model_options,
             refresh_lyra_config,

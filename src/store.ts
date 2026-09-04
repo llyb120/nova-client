@@ -66,6 +66,26 @@ export type ThemePref = "ink-dark" | "ink-light";
 
 const THEME_KEY = "fd:theme";
 const MODEL_FAVORITES_KEY = "fd:modelFavorites";
+const UNREAD_CLUE_MENTIONS_KEY = "fd:unreadClueMentions:v1";
+
+/** 证据链 @提及红点只存内存时，重启会把还没看过的提及抹掉；读卡 id 写入本地。 */
+function readUnreadClueMentions(): string[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(UNREAD_CLUE_MENTIONS_KEY) ?? "[]");
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function setUnreadClueMentions(ids: string[]) {
+  setState("unreadClueMentions", ids);
+  try {
+    localStorage.setItem(UNREAD_CLUE_MENTIONS_KEY, JSON.stringify(ids));
+  } catch {
+    // 落盘失败只丢跨重启持久化，本次窗口内的红点仍按内存状态展示。
+  }
+}
 
 function readThemePref(): ThemePref {
   return localStorage.getItem(THEME_KEY) === "ink-light" ? "ink-light" : "ink-dark";
@@ -247,7 +267,7 @@ export const [state, setState] = createStore<AppStore>({
   pendingNewSessionSeed: null,
   homeComposerFocusAt: 0,
   clueOpenRequest: null,
-  unreadClueMentions: [],
+  unreadClueMentions: readUnreadClueMentions(),
   theme: readThemePref(),
   backendAvailability: {},
 });
@@ -520,6 +540,13 @@ export async function refreshThreads() {
   // 按 id reconcile 而非整体替换：保留未变线程的对象身份，
   // 避免 <For> 重建整个列表 DOM 导致侧边栏滚动位置被重置
   setState("threads", reconcile(threads, { key: "id" }));
+  // 重启后从会话文件恢复未读点：只在本地还没记过这个会话时采纳后端计数，
+  // 避免刷新期间并行发出的旧快照把刚清零的未读又顶回来。
+  for (const t of threads) {
+    if (t.unreadTurns > 0 && state.unreadTurns[t.id] === undefined) {
+      setState("unreadTurns", t.id, t.unreadTurns);
+    }
+  }
   const running: Record<string, boolean> = {};
   for (const t of threads) {
     // 运行事件在本次请求期间到达时，以事件为准；否则使用后端快照。
@@ -808,6 +835,10 @@ export async function stackClues(cardIds: string[]) {
 
 export async function deleteClue(cardId: string) {
   await api.deleteClue(cardId, state.clueSpace);
+  // 卡片已不存在时，不能留下一个永远消费不掉的未读点。
+  if (state.unreadClueMentions.includes(cardId)) {
+    setUnreadClueMentions(state.unreadClueMentions.filter((id) => id !== cardId));
+  }
   await Promise.all([refreshClueGroups(), refreshThreads()]);
 }
 
@@ -864,7 +895,7 @@ export function takePendingNewSessionSeed(): PendingNewSessionSeed | null {
 
 export function openClueCard(cardId: string) {
   if (!cardId) return;
-  setState("unreadClueMentions", (ids) => ids.filter((id) => id !== cardId));
+  setUnreadClueMentions(state.unreadClueMentions.filter((id) => id !== cardId));
   setView("clues");
   closeThread();
   setState("clueOpenRequest", cardId);
@@ -876,7 +907,7 @@ export function clearClueOpenRequest(cardId: string) {
 }
 
 export function markClueMentionRead(cardId: string) {
-  setState("unreadClueMentions", (ids) => ids.filter((id) => id !== cardId));
+  setUnreadClueMentions(state.unreadClueMentions.filter((id) => id !== cardId));
 }
 
 /** 在线的其他人（排除自己）。漫游只能选择对方已共享（上报）的目录，不再支持手输路径；
@@ -1206,8 +1237,19 @@ export function traceThreadSwitchLayoutDone(threadId: string | null, groupCount:
   ]);
 }
 
+/**
+ * 未读点原本只活在前端内存里，重启后后台跑完但未回看的会话会被抹平；
+ * 因此每次计数变化都写回会话文件，启动时由 refreshThreads 从后端快照恢复。
+ */
+export function setUnreadTurns(id: string, count: number) {
+  setState("unreadTurns", id, count);
+  void api.setThreadUnread(id, count).catch(() => {
+    // 落盘失败只丢跨重启持久化，本次窗口内的未读点仍按内存状态展示。
+  });
+}
+
 export async function openThread(id: string) {
-  if (state.unreadTurns[id]) setState("unreadTurns", id, 0);
+  if (state.unreadTurns[id]) setUnreadTurns(id, 0);
   const switching = state.currentId !== id;
   const request = switching ? ++openThreadRequest : openThreadRequest;
   const previousId = state.currentId;
@@ -2952,11 +2994,12 @@ export async function initStore() {
       resumeFireRelay(e.payload.threadId);
       handleWorkflowTurnStart(e.payload.threadId);
     } else {
-      // 轮次正常收尾且该会话未打开 → 标记未读，提醒回看结论
-      const completedNormally =
-        e.payload.stopReason === "end_turn" || e.payload.stopReason === "max_turn_requests";
-      if (completedNormally && threadId !== state.currentId) {
-        setState("unreadTurns", threadId, (state.unreadTurns[threadId] ?? 0) + 1);
+      // 轮次收尾（正常或出错）且该会话未打开 → 标记未读，提醒回看结论或错误；
+      // 与后端 notify_done 的分类一致，只有用户主动取消不算未读。
+      const manuallyInterrupted =
+        e.payload.stopReason === "cancelled" || e.payload.stopReason === "force_cancelled";
+      if (!manuallyInterrupted && threadId !== state.currentId) {
+        setUnreadTurns(threadId, (state.unreadTurns[threadId] ?? 0) + 1);
       }
       // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
       liveUsageByThread.delete(threadId);
@@ -3111,7 +3154,7 @@ export async function initStore() {
   await listen<{ cardId: string }>("clues:mentioned", (e) => {
     const cardId = e.payload.cardId;
     if (!cardId || state.unreadClueMentions.includes(cardId)) return;
-    setState("unreadClueMentions", (ids) => [...ids, cardId]);
+    setUnreadClueMentions([...state.unreadClueMentions, cardId]);
   });
 
   // 系统通知点击：跳转到对应会话
