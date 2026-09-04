@@ -108,6 +108,39 @@ const root = meta("root", "[Fire] 目标", 1);
   );
 }
 
+// 普通 /stage 链：root 是常规会话标题，stage 以 stageSourceThreadId 识别
+// （标题可能已被自动改名），点击 root 直达运行中的 stage
+{
+  const stageRoot = meta("r2", "修 bug", 1);
+  const threads = [
+    stageRoot,
+    { ...meta("s1", "已改名的 stage", 2, "r2"), stageSourceThreadId: "r2" },
+  ];
+  const running = new Set(["s1"]);
+  assert.equal(
+    latestFireStage(threads, stageRoot, (id) => running.has(id))?.id,
+    "s1",
+  );
+}
+
+// /stage 链都未运行 → 回退到最新创建的 stage（含嵌套 /stage）
+{
+  const stageRoot = meta("r3", "普通会话", 1);
+  const threads = [
+    stageRoot,
+    { ...meta("s1", "[Stage] 第一次", 2, "r3"), stageSourceThreadId: "r3" },
+    { ...meta("s2", "[Stage] 第二次", 3, "s1"), stageSourceThreadId: "s1" },
+  ];
+  assert.equal(latestFireStage(threads, stageRoot, () => false)?.id, "s2");
+}
+
+// 预检→开发子会话（无 stage 标记、root 非 Fire/WF）保持原行为：不自动跳转
+{
+  const preRoot = meta("p2", "预检会话", 1);
+  const threads = [preRoot, meta("dev", "开发子会话", 2, "p2")];
+  assert.equal(latestFireStage(threads, preRoot, () => true), undefined);
+}
+
 // 无 fire 子会话 → undefined；root 非 fire → undefined
 assert.equal(latestFireStage([root], root), undefined);
 assert.equal(

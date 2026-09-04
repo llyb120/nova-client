@@ -1672,6 +1672,14 @@ button {
   font-family: var(--mono);
   font-size: 9px;
 }
+/* stage 导航条上的未读角标：复用侧栏未读徽标样式，仅调整定位 */
+.stage-rail-item.unread {
+  position: relative;
+}
+.stage-rail-item .thread-unread-badge {
+  top: 1px;
+  right: 2px;
+}
 @media (max-width: 820px) {
   .chat {
     --stage-width: 72px;

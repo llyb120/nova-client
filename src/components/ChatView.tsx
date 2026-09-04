@@ -750,6 +750,9 @@ export function ChatView() {
     if (!thread.parentThreadId && stageThreads().some((t) => isStageTitle(t.title))) return "目标";
     return thread.title || "会话";
   };
+  // 链上其它 stage 的未读轮次数：当前打开的 stage 在 openThread 时已清零，不会再显示角标。
+  const stageUnread = (thread: (typeof state.threads)[number]) =>
+    thread.id === state.currentId ? 0 : (state.unreadTurns[thread.id] ?? 0);
   const jumpToStage = async (threadId: string) => {
     // 每个 stage 都是独立会话；切换 stage 只切换会话，不再拼接 transcript。
     await openThread(threadId);
@@ -1531,7 +1534,7 @@ export function ChatView() {
               <button
                 type="button"
                 class="stage-rail-item"
-                classList={{ active: thread.id === state.currentId }}
+                classList={{ active: thread.id === state.currentId, unread: stageUnread(thread) > 0 }}
                 title={thread.title}
                 onPointerDown={() => markThreadSwitchPointerDown()}
                 onClick={() => {
@@ -1546,6 +1549,9 @@ export function ChatView() {
               >
                 <span>{stageName(thread)}</span>
                 <small>{index() + 1}</small>
+                <Show when={stageUnread(thread) > 0}>
+                  <span class="thread-unread-badge">{stageUnread(thread) > 9 ? "9+" : stageUnread(thread)}</span>
+                </Show>
               </button>
             )}
           </For>
