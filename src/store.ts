@@ -1448,7 +1448,8 @@ function zenHold(threadId: string) {
   setState("running", threadId, true);
 }
 function zenUnhold(threadId: string) {
-  zenHoldThreads.delete(threadId);
+  // 只处理首页发起时的占位；没占位过（非减少焦虑、/run 等其它入口）时不能碰真实运行态。
+  if (!zenHoldThreads.delete(threadId)) return;
   optimisticRunningThreads.delete(threadId);
   setState("running", threadId, false);
 }
@@ -1476,7 +1477,7 @@ export function zenRunningChains(): { hidden: Set<string>; busy: Set<string>; ro
     unfinishedRoots: unfinishedWorkflowRoots(),
   });
 }
-/** 发送成功后离开会话详情并播放「提示词飞入室女座」动画；/fire、/stage 等内置命令的编排流程不在此列。 */
+/** 发送成功后离开会话详情并播放「提示词飞入室女座」动画；/fire 等内置命令的编排流程不在此列（/stage 在 startStageThread 内自行处理）。 */
 function zenHideAfterSend(text: string) {
   if (!zenModeOn() || !state.currentId) return;
   closeThread();
@@ -1755,10 +1756,6 @@ export async function deleteProjectThreads(ids: string[]): Promise<number> {
 export async function sendPrompt(
   text: string,
   images: PromptImage[] = [],
-  workflowId?: string | null,
-  /** 新会话启动工作流时用户原始选择的后端/模型（createThread 可能已被首节点覆盖），
-   *  作为「跟随会话」节点的跟随锚点。 */
-  workflowFollowFrom?: { agentKind: AgentKind; model: string | null },
 ) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
@@ -1768,12 +1765,6 @@ export async function sendPrompt(
     if (!cwd) throw new Error("请先选择一个项目再训练");
     setTrainingProject(cwd);
     await api.trainExperience(cwd);
-    return;
-  }
-  // 新会话页选择了工作流：会话输入就是首节点输入，文本作为 goal、图片作为首节点附件。
-  if (workflowId) {
-    await startWorkflow(workflowId, { goal: text.trim() }, id, images, workflowFollowFrom);
-    zenHideAfterSend(text);
     return;
   }
   // 内置命令优先于工作流触发器，避免 /fire、/hard 等被当成普通内容。
@@ -1790,6 +1781,34 @@ export async function sendPrompt(
   }
   await deliverPrompt(id, text, images);
   zenHideAfterSend(text);
+}
+
+/**
+ * 在指定会话上启动工作流（不依赖 currentId）：首页在减少焦虑模式下建完会话并不进
+ * 会话页（避免新会话闪一下才进室女座），所以只能按 threadId 直接投递。
+ * 启动失败（工作流停用/校验不过/首节点发送失败）时收回首页发起时的占位忙碌态，
+ * 会话回到普通列表等用户处理，不会卡在室女座空转。
+ */
+export async function startWorkflowOnThread(
+  threadId: string,
+  text: string,
+  images: PromptImage[],
+  workflowId: string,
+  followFrom?: { agentKind: AgentKind; model: string | null },
+): Promise<void> {
+  try {
+    await startWorkflow(workflowId, { goal: text.trim() }, threadId, images, followFrom);
+  } catch (e) {
+    // 启动失败（工作流停用/校验不过/首节点发送失败）：收回首页发起时的占位忙碌态，
+    // 会话回到普通列表等用户处理，不会卡在室女座空转。
+    zenUnhold(threadId);
+    throw e;
+  }
+  // 工作流已自己接管运行态（host.setRunning 会同时记乐观忙碌），首页占位可以收掉；
+  // 这里不能走 zenUnhold，它会把刚置上的 running 冲回 false。
+  zenHoldThreads.delete(threadId);
+  if (state.currentId === threadId) zenHideAfterSend(text);
+  else if (zenModeOn()) zenDropPrompt(text);
 }
 
 type StageInput = { currentPrompt: string; stagePrompt: string; stageIndex: number };
@@ -1818,7 +1837,13 @@ async function startStageThread(
   thread.title = ownTitle;
   rememberThreadSnapshot(thread);
   await refreshThreads();
-  await openThread(thread.id);
+  if (zenModeOn()) {
+    // 室女座：不进入 Stage 会话页，回到首页并播放飞入动画；Stage 链在后台推进。
+    closeThread();
+    zenDropPrompt(prompt);
+  } else {
+    await openThread(thread.id);
+  }
   setState("running", thread.id, true);
   // Stage 使用自己的任务生成标题，不沿用来源会话名；失败时保留上面的提示词兜底标题。
   void api.generateThreadTitle(thread.id, prompt.slice(0, 1200)).catch(() => {});
@@ -2120,6 +2145,7 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
       suspendWorkflowActive(threadId);
     }
     setState("running", threadId, false);
+    zenHoldThreads.delete(threadId);
     throw e;
   }
 }
@@ -2525,7 +2551,7 @@ function flushWorktreePrompt(threadId: string) {
   pendingWorktreePrompts.delete(threadId);
   // 新会话页选了工作流：就绪后直接启动工作流（goal 为暂存提示词），否则按普通提示词发送。
   const action = prompt.workflowId
-    ? startWorkflow(prompt.workflowId, { goal: prompt.text.trim() }, threadId, prompt.images, prompt.followFrom)
+    ? startWorkflowOnThread(threadId, prompt.text, prompt.images, prompt.workflowId, prompt.followFrom)
     : sendPromptTo(threadId, prompt.text, prompt.images);
   void action.catch((error) => {
     console.error("worktree prompt flush failed", error);
@@ -3243,6 +3269,8 @@ export async function initStore() {
   // 本地 worktree 后台创建失败：丢弃暂存提示词（会话里已有错误系统消息）
   await listen<{ threadId: string; error?: string }>("acp:worktree-failed", (e) => {
     pendingWorktreePrompts.delete(e.payload.threadId);
+    // 首页发起时占位到室女座的会话，worktree 没建起来就没后续轮次事件了，在这里收回。
+    zenUnhold(e.payload.threadId);
     void refreshThreads();
   });
   // host 侧：收到漫游请求，入队等本机用户在弹框里确认

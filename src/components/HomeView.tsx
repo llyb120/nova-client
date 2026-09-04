@@ -34,6 +34,7 @@ import {
   setView,
   state,
   stashWorktreePrompt,
+  startWorkflowOnThread,
   takePendingNewSessionSeed,
   assertBuiltinPrompt,
   zenRunningChains,
@@ -693,7 +694,7 @@ export function HomeView() {
           const entryModel = entry?.agentKind
             ? (entry.model?.trim() || "")
             : (entry?.model?.trim() || model());
-          await createThread(
+          const threadId = await createThread(
             cwd(),
             entryAgentKind,
             entryModel,
@@ -708,7 +709,8 @@ export function HomeView() {
           if (!ephemeral) lastUsed.setModel(entryAgentKind, entryModel);
           if (clue) clearPendingClueCard();
           // 「跟随会话」节点跟随用户在新会话页选择的后端/模型，而非被首节点覆盖后的值。
-          await sendPrompt(prompt, images, workflowId, {
+          // 减少焦虑模式下 createThread 不会进入会话页（currentId 仍为空），所以按会话 id 直接启动。
+          await startWorkflowOnThread(threadId, prompt, images, workflowId, {
             agentKind: agentKind(),
             model: model() || null,
           });
