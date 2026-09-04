@@ -44,6 +44,7 @@ import type {
 } from "./types";
 import { isScratch, scratchParent } from "./utils";
 import {
+  advancingWorkflowRoots,
   handleTurnEnd as handleWorkflowTurnEnd,
   handleTurnStart as handleWorkflowTurnStart,
   initWorkflowRuntime,
@@ -1346,6 +1347,14 @@ export async function createThread(
   if (storedAgentKind === "codex") {
     lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
   }
+  // 减少焦虑：首页发起的会话不该先进会话页再被收起（新会话会闪一下才进室女座），
+  // 直接留在首页，由后续发送链路把运行态归到室女座。
+  if (zenModeOn() && !state.currentId) {
+    zenHold(t.id);
+    void refreshThreads();
+    void refreshProjects();
+    return t.id;
+  }
   setState("expanded", reconcile({}));
   setState({
     currentId: t.id,
@@ -1377,6 +1386,23 @@ export function isPendingThreadId(id: string | null | undefined): boolean {
 
 /** 减少焦虑模式（室女座）：会话发出后转入后台运行，详情需到室女座手动查看。 */
 const ZEN_TOAST = "会话已在后台运行，去喝杯咖啡吧~";
+
+/**
+ * 首页发起、提示词还没真正跑起来的会话占位：计入运行态（立即归入室女座，
+ * 不会先在普通列表闪现），但不算「正在忙」，以免挡住紧随其后的工作流启动。
+ */
+const zenHoldThreads = new Set<string>();
+function zenHold(threadId: string) {
+  zenHoldThreads.add(threadId);
+  optimisticRunningThreads.add(threadId);
+  setState("running", threadId, true);
+}
+function zenUnhold(threadId: string) {
+  zenHoldThreads.delete(threadId);
+  optimisticRunningThreads.delete(threadId);
+  setState("running", threadId, false);
+}
+
 function zenModeOn() {
   return !!state.settings?.zenModeEnabled;
 }
@@ -1401,6 +1427,11 @@ export function zenRunningChains(): { hidden: Set<string>; rootCount: number } {
   const runningRoots = new Set<string>();
   for (const t of state.threads) {
     if (state.running[t.id]) runningRoots.add(rootOf.get(t.id) ?? t.id);
+  }
+  // 工作流阶段接力在途（上一节点已结束、下一节点还没起来）时整条链仍未完成，
+  // 不能因为这一瞬没有任何会话 running 就把工作流弹回普通模式。
+  for (const root of advancingWorkflowRoots()) {
+    runningRoots.add(rootOf.get(root) ?? root);
   }
   const hidden = new Set<string>();
   for (const t of state.threads) {
@@ -2135,8 +2166,14 @@ restoreFireRelayState();
 // 通用工作流运行时（/run）：复用会话接力模式，与 /fire 专用路径并存。
 initWorkflowRuntime({
   currentId: () => state.currentId,
-  isRunning: (id) => !!state.running[id],
-  setRunning: (id, v) => setState("running", id, v),
+  isRunning: (id) => !!state.running[id] && !zenHoldThreads.has(id),
+  // 工作流节点在「已置忙 → sendPrompt 真正起来」的间隙里同样需要乐观运行态，
+  // 否则阶段接力期间 refreshThreads 的后端 false 快照会把会话冲回普通列表。
+  setRunning: (id, v) => {
+    if (v) optimisticRunningThreads.add(id);
+    else optimisticRunningThreads.delete(id);
+    setState("running", id, v);
+  },
   refreshThreads: () => refreshThreads(),
   openThread: (id) => openThread(id),
   bumpScrollToBottom: () => bumpChatScrollToBottom(),
@@ -2900,6 +2937,7 @@ export async function initStore() {
     const wasRunning = !!state.running[threadId];
     runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
     optimisticRunningThreads.delete(threadId);
+    zenHoldThreads.delete(threadId);
     setState("running", threadId, e.payload.running);
     if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
       staleThreadSnapshots.add(threadId);

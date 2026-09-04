@@ -40,6 +40,8 @@ const runHistory = new Map<string, WorkflowRunStep>();
 const latestThreadByRoot = new Map<string, string>();
 const completedRoots = new Set<string>();
 const pendingManualReviews = new Set<string>();
+/** 阶段接力在途的 root：本阶段回合已结束、下一节点会话尚未起来的间隙。 */
+const advancingRoots = new Set<string>();
 const [workflowReviewRevision, setWorkflowReviewRevision] = createSignal(0);
 export { workflowReviewRevision };
 const RUNS_KEY = "fd:workflowRuns:v1";
@@ -210,6 +212,9 @@ async function createStageThread(
   runHistory.set(thread.id, run);
   latestThreadByRoot.set(run.rootId, thread.id);
   persistRuns();
+  // 先置运行态再刷新列表：否则减少焦虑模式下「上一节点已结束、本节点还没起来」的
+  // 这一瞬会让整条链脱离运行态，会话先弹回普通列表再跳回室女座。
+  h.setRunning(thread.id, true);
   await h.refreshThreads();
   // 竞态保护：若在等待期间用户的干预消息已把原阶段重新挂回流程，放弃新阶段，
   // 避免同一运行态被两个会话同时驱动导致链分叉；原阶段回合结束后会重新推进。
@@ -218,13 +223,20 @@ async function createStageThread(
     runHistory.delete(thread.id);
     latestThreadByRoot.set(run.rootId, originThreadId);
     persistRuns();
+    h.setRunning(thread.id, false);
     await api.deleteThread(thread.id).catch(() => {});
     await h.refreshThreads();
     return;
   }
   if (isViewingChain(run.rootId)) await h.openThread(thread.id);
-  h.setRunning(thread.id, true);
-  await api.sendPrompt(thread.id, prompt, []);
+  try {
+    await api.sendPrompt(thread.id, prompt, []);
+  } catch (e) {
+    // 发送失败：挂起本阶段并收回乐观运行态，避免会话永久停在室女座空转。
+    suspendWorkflow(thread.id, false);
+    h.setRunning(thread.id, false);
+    throw e;
+  }
 }
 
 async function followTransition(
@@ -281,8 +293,19 @@ async function advanceWorkflow(threadId: string): Promise<void> {
   const run = activeRuns.get(threadId);
   if (!run) return;
   activeRuns.delete(threadId);
+  // 结论读取、路由判断、建会话、发提示词整段都算「接力在途」：期间链上没有任何会话
+  // 处于 running，减少焦虑模式若只看 running 会把没跑完的工作流弹回普通模式。
+  advancingRoots.add(run.rootId);
   persistRuns();
+  try {
+    await doAdvance(threadId, run);
+  } finally {
+    advancingRoots.delete(run.rootId);
+  }
+}
 
+async function doAdvance(threadId: string, run: WorkflowRunStep): Promise<void> {
+  const h = requireHost();
   const def = getWorkflow(run.workflowId);
   const stage = def?.stages.find((s) => s.id === run.stageId);
   if (!def || !stage) {
@@ -426,9 +449,7 @@ export function startWorkflow(
       throw new Error("工作流仅支持本地会话");
     }
     if (h.isRunning(rootId)) throw new Error("请等待当前会话结束后再启动工作流");
-
-    await applyStageConfig(rootId, entry);
-    // 「跟随会话」锚点：优先用调用方传入的用户原始选择，否则用首节点覆盖前（第 417 行读取）的 root 值。
+    // 「跟随会话」锚点：优先用调用方传入的用户原始选择，否则用首节点覆盖前的 root 值。
     const followAgentKind = followFrom?.agentKind ?? root.agentKind;
     const followModel = followFrom ? followFrom.model : (root.model ?? null);
     // 自定义环境变量作为 {{xx}} 替换的兜底来源：流程变量（goal 等）优先，
@@ -458,10 +479,12 @@ export function startWorkflow(
     persistRuns();
 
     const ctx = runContext(run, "");
+    // 先占运行态再刷新列表：首节点提示词还没跑起来时，减少焦虑模式下新会话不会
+    // 先在普通列表闪现一下才进室女座。
+    h.setRunning(rootId, true);
     await h.refreshThreads();
     if (h.currentId() === rootId) h.bumpScrollToBottom();
     h.clearProposedPlan();
-    h.setRunning(rootId, true);
     try {
       await api.sendPrompt(rootId, resolvePrompt(def, entry, ctx), images);
     } catch (e) {
@@ -550,7 +573,12 @@ export async function chooseManualWorkflowTransition(
   const transition = stage?.transitions.find((candidate) => candidate.id === transitionId);
   if (!run || !def || !stage || !transition) throw new Error("人工审核选项已失效");
   const thread = await api.getThread(threadId);
-  await followTransition(threadId, run, def, stage, stageConclusion(thread), transition);
+  advancingRoots.add(run.rootId);
+  try {
+    await followTransition(threadId, run, def, stage, stageConclusion(thread), transition);
+  } finally {
+    advancingRoots.delete(run.rootId);
+  }
 }
 
 export function isActive(threadId: string): boolean {
@@ -569,4 +597,9 @@ export function latestStageThread(rootId: string): string | undefined {
 
 export function isWorkflowThread(threadId: string): boolean {
   return activeRuns.has(threadId) || suspendedRuns.has(threadId) || runHistory.has(threadId);
+}
+
+/** 阶段接力在途的 root 集合（室女座判定「整条链仍在运行」用）。 */
+export function advancingWorkflowRoots(): Set<string> {
+  return new Set(advancingRoots);
 }
