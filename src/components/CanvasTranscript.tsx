@@ -10,6 +10,7 @@ import { api } from "../ipc";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
+import { resolveScrollAfterLayout } from "../scrollStick";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { relPath } from "./EditedFilesCard";
@@ -3360,7 +3361,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const oldScroll = scrollY;
     const lock = scrollLock;
     scrollLock = null;
-    const wasBottom = !lock && (keepBottom || maxScroll - scrollY <= 2);
     if (!await computeLayout(generation)) return;
     // blocks are replaced during layout; an index from the previous block array may now
     // identify an unrelated block (often the first tool), producing a phantom hover card.
@@ -3375,15 +3375,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (const key of [...blockScrolls.keys()]) {
       if (!liveKeys.has(key)) blockScrolls.delete(key);
     }
-    maxScroll = Math.max(0, totalHeight - viewH);
+    // 布局让帧期间用户可能已滚离底部：吸底判定取提交时实时状态，不能用 await 前快照。
+    const settled = resolveScrollAfterLayout({ keepBottom, scrollY, maxScrollBefore: maxScroll, totalHeight, viewH });
+    maxScroll = settled.maxScroll;
     if (lock) {
       const match = blocks.find((x) => x.kind === lock.kind && x.id === lock.id);
       const y = match?.y ?? oldScroll + lock.viewOffset;
       scrollY = Math.max(0, Math.min(maxScroll, y - lock.viewOffset));
-    } else if (wasBottom) {
-      scrollY = maxScroll;
     } else {
-      scrollY = Math.max(0, Math.min(maxScroll, oldScroll));
+      scrollY = settled.scrollY;
     }
     applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, false);
