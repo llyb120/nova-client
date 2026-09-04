@@ -16,6 +16,7 @@ import {
   setTrainingProject,
   setView,
   state,
+  zenRunningChains,
 } from "../store";
 import { agentLabel, agentShort, isScratch, scratchParent } from "../utils";
 import {
@@ -122,29 +123,9 @@ export function Sidebar(props: {
   const zenMode = () => !!state.settings?.zenModeEnabled;
   const isVirgoView = () => zenMode() && state.view === "virgo";
 
-  // 任务链（父子接力）根会话映射，以及链上有会话正在运行的根集合。
-  const chainInfo = createMemo(() => {
-    const byId = new Map(state.threads.map((t) => [t.id, t]));
-    const rootOf = new Map<string, string>();
-    for (const t of state.threads) {
-      let cur = t;
-      const seen = new Set<string>([cur.id]);
-      while (cur.parentThreadId) {
-        const parent = byId.get(cur.parentThreadId);
-        if (!parent || seen.has(parent.id)) break;
-        cur = parent;
-        seen.add(cur.id);
-      }
-      rootOf.set(t.id, cur.id);
-    }
-    const runningRoots = new Set<string>();
-    for (const t of state.threads) {
-      if (state.running[t.id]) runningRoots.add(rootOf.get(t.id) ?? t.id);
-    }
-    return { rootOf, runningRoots };
-  });
-  const inRunningChain = (t: ThreadMeta) =>
-    chainInfo().runningRoots.has(chainInfo().rootOf.get(t.id) ?? t.id);
+  // 运行中的任务链（含父子接力整条链）：与室女座列表、首页最近会话同一口径。
+  const chainInfo = createMemo(() => zenRunningChains());
+  const inRunningChain = (t: ThreadMeta) => chainInfo().hidden.has(t.id);
 
   const threadOf = (id: string) => state.threads.find((item) => item.id === id);
   /** 会话及其子孙（接力链）上的未读总数，与 ThreadRow 徽标口径一致。 */
@@ -711,6 +692,9 @@ export function Sidebar(props: {
                 title="室女座（减少焦虑）：运行中的会话暂时移到这里，结束后自动回到普通模式"
               >
                 室女座
+                <Show when={chainInfo().rootCount > 0}>
+                  <span class="mode-seg-badge" title="正在运行的任务数">{chainInfo().rootCount}</span>
+                </Show>
               </button>
             </Show>
             <button

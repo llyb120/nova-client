@@ -36,6 +36,7 @@ import {
   stashWorktreePrompt,
   takePendingNewSessionSeed,
   assertBuiltinPrompt,
+  zenRunningChains,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
@@ -988,8 +989,14 @@ export function HomeView() {
     }
   };
 
-  // 训练与世代演进会话只在训练视图展示，不进入首页最近会话。
-  const recent = () => state.threads.filter((t) => !t.experienceThread).slice(0, 6);
+  // 训练与世代演进会话只在训练视图展示，不进入首页最近会话；
+  // 减少焦虑模式下，运行中的任务链移入室女座，最近会话要等结束后才显示。
+  const recent = createMemo(() => {
+    const hidden = state.settings?.zenModeEnabled ? zenRunningChains().hidden : null;
+    return state.threads
+      .filter((t) => !t.experienceThread && (!hidden || !hidden.has(t.id)))
+      .slice(0, 6);
+  });
 
   return (
     <main class="home">

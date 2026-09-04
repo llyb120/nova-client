@@ -1380,6 +1380,34 @@ const ZEN_TOAST = "会话已在后台运行，去喝杯咖啡吧~";
 function zenModeOn() {
   return !!state.settings?.zenModeEnabled;
 }
+/**
+ * 减少焦虑模式的运行态口径（侧栏、首页最近会话共用）：
+ * hidden = 运行中任务链（含父子接力整条链）的全部会话 id；rootCount = 运行中任务数（室女座徽标）。
+ */
+export function zenRunningChains(): { hidden: Set<string>; rootCount: number } {
+  const byId = new Map(state.threads.map((t) => [t.id, t]));
+  const rootOf = new Map<string, string>();
+  for (const t of state.threads) {
+    let cur = t;
+    const seen = new Set<string>([cur.id]);
+    while (cur.parentThreadId) {
+      const parent = byId.get(cur.parentThreadId);
+      if (!parent || seen.has(parent.id)) break;
+      cur = parent;
+      seen.add(cur.id);
+    }
+    rootOf.set(t.id, cur.id);
+  }
+  const runningRoots = new Set<string>();
+  for (const t of state.threads) {
+    if (state.running[t.id]) runningRoots.add(rootOf.get(t.id) ?? t.id);
+  }
+  const hidden = new Set<string>();
+  for (const t of state.threads) {
+    if (runningRoots.has(rootOf.get(t.id) ?? t.id)) hidden.add(t.id);
+  }
+  return { hidden, rootCount: runningRoots.size };
+}
 /** 发送成功后离开会话详情并播放「提示词飞入室女座」动画；/fire、/stage 等内置命令的编排流程不在此列。 */
 function zenHideAfterSend(text: string) {
   if (!zenModeOn() || !state.currentId) return;
@@ -2382,11 +2410,12 @@ export function zenDropSignal() {
 function zenDropPrompt(text: string) {
   const snippet = text.trim().split(/\r?\n/, 1)[0].slice(0, 24);
   setZenDrop({ text: snippet || "消息已发送", tick: ++zenDropTick });
+  // 不等飞行动画落地，发出即弹轻提示，让用户立刻知道会话已转入后台。
+  showToast(ZEN_TOAST);
 }
-/** 飞入动画落地：收起气泡、给出轻提示。 */
+/** 飞入动画落地：收起气泡。 */
 export function zenDropLanded() {
   setZenDrop(null);
-  showToast(ZEN_TOAST);
 }
 const [timeMachineChangedTick, setTimeMachineChangedTick] = createSignal(0);
 let timeMachineEditTarget: { threadId: string; checkpointId: string } | null = null;
