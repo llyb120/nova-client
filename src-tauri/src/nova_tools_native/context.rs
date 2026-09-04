@@ -4236,6 +4236,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 f.clone(),
                 score_path(f)
                     + r.len().min(8) as i64 * 4
+                    // 超过 8 行的命中每 4 行再记 1 分（封顶 60 行）：密集命中是"本文件就在讲这个主题"
+                    // 的直接证据，不应与零星命中同分（命中上百行的引擎文件原来与 8 命中文件打平被挤出候选）。
+                    + r.len().saturating_sub(8).min(52) as i64 / 4
                     + file_keywords
                         .get(f)
                         .map(|set| {
@@ -4267,15 +4270,24 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             )
         })
         .collect();
-    for f in files.iter().chain(
-        all.iter()
-            .filter(|file| subject_match(file, &subject_terms, &term_freq) >= 300.0),
-    ) {
+    // 文件名段命中查询词是最强的定位信号，泛词高频时不应被衰减门槛挡住（命名为 *Plan*
+    // 的目标文件在 plan 命中数高时会被转录噪声文件挤出候选）。实现路径上的 subject 文件
+    // 直接提为候选；score_path>0 排除 docs/build 等非生产路径。
+    for f in files.iter().chain(all.iter().filter(|file| {
+        subject_match(file, &subject_terms, &term_freq) >= 300.0
+            || (score_path(file) > 0 && is_subject_file(file, &subject_terms))
+    })) {
         if !preliminary.iter().any(|(x, _)| x == f) {
             preliminary.push((f.clone(), if files.contains(f) { 1000 } else { 550 }));
         }
     }
-    preliminary.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // 同分优先生产路径（src/ > scripts/ > docs/）：原字母序兜底在泛词同分时把
+    // scripts/docs 噪声排在 src/ 目标之前。
+    preliminary.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| score_path(&b.0).cmp(&score_path(&a.0)))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     preliminary.dedup_by(|a, b| a.0 == b.0);
     if preliminary.is_empty() {
         return Ok(format!(
@@ -7203,5 +7215,33 @@ mod tests {
             out.contains("docs/queries/minigame.sql") || out.contains("docs/queries/minigame.md"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn subject_named_file_survives_generic_word_noise() {
+        // 目标文件名段命中查询词（planActionCard），但 "plan" 只以驼峰内嵌形式出现在
+        // 标识符里，词边界检索零命中；泛词 "plan" 同时制造 300+ 行噪声命中（高频使
+        // subject 衰减到候选门槛以下）。文件名 subject 文件应提为候选，不被挤出。
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/planActionCard.tsx"),
+            "export function PlanActionCard() {\n  return proposedPlanView;\n}\n",
+        )
+        .unwrap();
+        for i in 0..12 {
+            let mut body = String::from("export function noiseNotes() {\n");
+            for n in 0..25 {
+                body.push_str(&format!("  const plan{n} = \"plan mode {i}\";\n"));
+            }
+            body.push_str("  return plan0;\n}\n");
+            fs::write(d.path().join(format!("src/notes{i}.ts")), body).unwrap();
+        }
+        let out = fast_context_run(
+            d.path(),
+            &serde_json::json!({"keywords":["plan mode"],"task":"remove plan mode selection"}),
+        )
+        .unwrap();
+        assert!(out.contains("### src/planActionCard.tsx"), "{out}");
     }
 }
