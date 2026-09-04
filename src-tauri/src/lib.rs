@@ -55,6 +55,7 @@ use serde_json::{json, Value};
 use settings::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use threads::{
@@ -493,6 +494,26 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
         return experience_removed;
     }
     experience_removed + remove_threads(app, &state, deletable).len()
+}
+
+static SESSION_CLEANUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// 清理含回收站整体重写、世界线 GC 与 session 文件扫描等重同步 IO，首次开启时可能积压
+/// 大量过期会话：必须在后台 blocking 线程执行，且并发只允许一个实例（重复触发直接跳过）。
+fn spawn_session_auto_cleanup(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        if SESSION_CLEANUP_IN_FLIGHT.swap(true, Ordering::Acquire) {
+            return;
+        }
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                SESSION_CLEANUP_IN_FLIGHT.store(false, Ordering::Release);
+            }
+        }
+        let _done = Done;
+        run_session_auto_cleanup(&app);
+    });
 }
 
 /// 是否有任意会话正在运行（本地 Devin/Codex、漫游 guest、被别人漫游的 host 均算）。
@@ -4576,7 +4597,7 @@ async fn apply_runtime_settings(
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     sync_global_session_shortcuts(app);
-    run_session_auto_cleanup(app);
+    spawn_session_auto_cleanup(app.clone());
     Ok(())
 }
 
@@ -5582,13 +5603,13 @@ pub fn run() {
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             sync_global_session_shortcuts(app.handle());
-            run_session_auto_cleanup(app.handle());
+            spawn_session_auto_cleanup(app.handle().clone());
             let cleanup_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 use tokio::time::{sleep, Duration};
                 loop {
                     sleep(Duration::from_secs(60 * 60)).await;
-                    run_session_auto_cleanup(&cleanup_app);
+                    spawn_session_auto_cleanup(cleanup_app.clone());
                 }
             });
 
