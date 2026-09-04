@@ -2678,6 +2678,41 @@ export async function respondPermission(requestKey: string, optionId: string) {
 }
 
 const pendingDeltas = new Map<number, string>();
+
+/* —— 侧栏标题跳动速度：按流式 delta 字符吞吐粗估输出速率 ——
+   1 token ≈ 4 字符只用于驱动动画节奏，无需精确；约 0.5s 一个采样窗口并做平滑。 */
+const RATE_WINDOW_MS = 500;
+const rateWindows = new Map<string, { chars: number; since: number; tokensPerSec: number }>();
+export const [outputRates, setOutputRates] = createSignal<Record<string, number>>({});
+
+function trackDeltaRate(threadId: string, chars: number) {
+  const now = performance.now();
+  let w = rateWindows.get(threadId);
+  if (!w) {
+    w = { chars: 0, since: now, tokensPerSec: 0 };
+    rateWindows.set(threadId, w);
+  }
+  if (now - w.since >= RATE_WINDOW_MS) {
+    const inst = w.chars / 4 / ((now - w.since) / 1000);
+    w.tokensPerSec = w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
+    w.chars = 0;
+    w.since = now;
+    const rounded = Math.round(w.tokensPerSec);
+    setOutputRates((rates) =>
+      rates[threadId] === rounded ? rates : { ...rates, [threadId]: rounded },
+    );
+  }
+  w.chars += chars;
+}
+
+function clearDeltaRate(threadId: string) {
+  if (!rateWindows.delete(threadId)) return;
+  setOutputRates((rates) => {
+    if (!(threadId in rates)) return rates;
+    const { [threadId]: _dropped, ...rest } = rates;
+    return rest;
+  });
+}
 let deltaFlushTimer: number | undefined;
 let lastDeltaFlush = 0;
 /** delta 合并窗口：足够小保证流式顺滑，配合 leading-edge 让首字几乎即时 */
@@ -2958,6 +2993,7 @@ export async function initStore() {
     // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
     for (const op of ops) {
       if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
+      else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text.length);
     }
     if (e.payload.threadId !== state.currentId) {
       if (threadSnapshots.has(e.payload.threadId)) staleThreadSnapshots.add(e.payload.threadId);
@@ -3009,6 +3045,7 @@ export async function initStore() {
       // 只在新一轮开始时丢弃上一轮残留；重复 running 事件不能覆盖本轮已收到的 usage。
       if (!wasRunning) {
         liveUsageByThread.delete(threadId);
+        clearDeltaRate(threadId);
         if (threadId === state.currentId) setState("liveUsage", null);
       }
       // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
@@ -3024,6 +3061,7 @@ export async function initStore() {
       }
       // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
       liveUsageByThread.delete(threadId);
+      clearDeltaRate(threadId);
       if (threadId === state.currentId) setState("liveUsage", null);
       if (pendingSetupConfigRefresh.delete(threadId)) {
         void api.refreshLyraConfig().catch((error) =>
