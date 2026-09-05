@@ -46,6 +46,49 @@ fn send_timing(emit: &Emit, phase: &str, start: Instant) {
     }));
 }
 
+/// 流式全文推送的合并间隔：每个 delta 都推一次累积全文，序列化与 IPC 开销随消息长度
+/// 平方增长；按间隔合并一次全文推送，体感仍是流式。消息结束时强制刷出尾部保证完整。
+const DELTA_EMIT_INTERVAL: Duration = Duration::from_millis(40);
+
+/// text/thinking 全文推送的节流状态，按消息为生命周期（MessageStart 重置）。
+struct DeltaThrottle {
+    last_emit: Option<Instant>,
+    pending: bool,
+}
+
+impl DeltaThrottle {
+    fn new() -> Self {
+        Self {
+            last_emit: None,
+            pending: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_emit = None;
+        self.pending = false;
+    }
+
+    /// 累积一个 delta 后返回是否应立即推送全文（首个 delta 立即推，保证流式体感）。
+    fn tick(&mut self) -> bool {
+        self.pending = true;
+        if self.last_emit.is_none_or(|t| t.elapsed() >= DELTA_EMIT_INTERVAL) {
+            self.last_emit = Some(Instant::now());
+            self.pending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 消息结束收取被节流压住的尾部：存在未推送增量时返回 true。
+    fn flush(&mut self) -> bool {
+        let pending = self.pending;
+        self.pending = false;
+        pending
+    }
+}
+
 fn stable_hash(value: impl AsRef<[u8]>) -> String {
     let digest = Sha256::digest(value.as_ref());
     format!("{digest:x}")[..16].to_string()
@@ -631,6 +674,8 @@ async fn handle_prompt(
     let mut agent_message_index = 0u64;
     let mut current_text = String::new();
     let mut current_thinking = String::new();
+    let mut text_throttle = DeltaThrottle::new();
+    let mut thinking_throttle = DeltaThrottle::new();
     let mut started_tools: std::collections::HashMap<String, Value> =
         std::collections::HashMap::new();
 
@@ -640,6 +685,8 @@ async fn handle_prompt(
             emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
             current_text.clear();
             current_thinking.clear();
+            text_throttle.reset();
+            thinking_throttle.reset();
             // 快照刷新可能清掉前端的临时 liveUsage；下一次 request 开始时用此前
             // request 已返回的真实累计 usage 重发一次，不做任何 token 估算。
             if total_usage
@@ -651,17 +698,21 @@ async fn handle_prompt(
         }
         AgentEvent::TextDelta(delta) => {
             current_text.push_str(&delta);
-            emit(&json!({
-                "type": "item",
-                "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
-            }));
+            if text_throttle.tick() {
+                emit(&json!({
+                    "type": "item",
+                    "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
+                }));
+            }
         }
         AgentEvent::ThinkingDelta(delta) => {
             current_thinking.push_str(&delta);
-            emit(&json!({
-                "type": "item",
-                "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
-            }));
+            if thinking_throttle.tick() {
+                emit(&json!({
+                    "type": "item",
+                    "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
+                }));
+            }
         }
 
         AgentEvent::ToolStart { id, name, args } => {
@@ -696,6 +747,19 @@ async fn handle_prompt(
             }
         }
         AgentEvent::MessageEnd { usage } => {
+            // 刷出节流压住的全文尾部，保证前端拿到完整文本。
+            if text_throttle.flush() {
+                emit(&json!({
+                    "type": "item",
+                    "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
+                }));
+            }
+            if thinking_throttle.flush() {
+                emit(&json!({
+                    "type": "item",
+                    "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
+                }));
+            }
             // 费用字段按整轮累计；contextTokens 始终表示最后一次真实 provider 请求的输入上下文。
             let input = usage.get("input").and_then(Value::as_u64).unwrap_or(0);
             let cache_read = usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0);
@@ -1194,6 +1258,18 @@ pub async fn run() -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn delta_throttle_merges_and_flushes() {
+        let mut t = super::DeltaThrottle::new();
+        assert!(t.tick(), "首个 delta 应立即推送");
+        assert!(!t.tick(), "间隔内的后续 delta 应被合并");
+        assert!(t.flush(), "有未推送尾部时 flush 应为 true");
+        assert!(!t.flush(), "重复 flush 不应再推送");
+        std::thread::sleep(std::time::Duration::from_millis(45));
+        assert!(t.tick(), "超过间隔后应再次推送");
+        assert!(!t.flush(), "刚推送过则无尾部");
+    }
 
     /// 借用额度运行时：进程内按隔离数据根加载凭证配置（不起子进程、不读全局配置）。
     #[tokio::test]
