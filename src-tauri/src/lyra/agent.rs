@@ -6,7 +6,7 @@ use crate::lyra::provider::{stream_chat, StreamEvent};
 use crate::lyra::tools::{execute, BrowserTools, Tool, ToolOutcome};
 use crate::lyra::watchdog::{arm_idle_watchdog, DiagnosticLog, IdleWatchdog};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -122,8 +122,45 @@ fn salvage_json(fragment: &str) -> Option<Value> {
 fn speculatable(name: &str, args: &Value) -> bool {
     match name {
         "read" => args.get("path").and_then(Value::as_str).is_some(),
+        // polaris 走 spawn_blocking，索引已有 CACHE_LOCKS 等进程内锁；
+        // 猜错时代价只是一份后台搜索 CPU，不构成正确性问题。
+        "polaris" => args
+            .get("keywords")
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.is_empty()),
         _ => false,
     }
+}
+
+/// 从 polaris 渲染文本的 `## EDIT` 段提取按 rank 排序的目标文件，
+/// 作为下一步 read/edit 的预热候选。
+fn polaris_preload_paths(text: &str, limit: usize) -> Vec<String> {
+    let mut in_edit = false;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            in_edit = line.starts_with("## EDIT");
+            continue;
+        }
+        if !in_edit {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("### ") else { continue };
+        let file = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !file.is_empty() && seen.insert(file.clone()) {
+            out.push(file);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// 投机上下文：流式回调内部不可借用 &mut Agent，预克隆所需状态。
@@ -204,6 +241,39 @@ impl Agent {
     fn drain_steering(&mut self) {
         let queued: Vec<Value> = self.steering.lock().unwrap().drain(..).collect();
         self.messages.extend(queued);
+    }
+
+    /// polaris 结果预热：对 EDIT 目标文件后台起 read 投机句柄，下回合模型决定读时命中。
+    /// 仅注入到独立槽位（索引排在现有条目之后），不覆盖模型正在流式生成的投机。
+    fn preload_reads(&self, paths: Vec<String>) {
+        if !speculate_enabled() || paths.is_empty() {
+            return;
+        }
+        let mut cache = self.spec_cache.lock().unwrap();
+        let mut slot = cache.keys().max().map_or(0, |max| max + 1);
+        for path in paths {
+            let args = json!({ "path": path });
+            let root = self.cwd.clone();
+            let shell = self.shell.clone();
+            let archive_dir = self.archive_dir.clone();
+            let call_id = format!("preload-{slot}");
+            let exec_args = args.clone();
+            let handle = tokio::spawn(async move {
+                execute(
+                    &root,
+                    "read",
+                    &exec_args,
+                    shell.as_ref(),
+                    archive_dir.as_deref(),
+                    &call_id,
+                    None,
+                    None,
+                )
+                .await
+            });
+            cache.insert(slot, Speculative { args, handle });
+            slot += 1;
+        }
     }
 
     /// 追加用户提示并跑到本轮结束（含工具循环与 steering 消化）。
@@ -566,6 +636,15 @@ impl Agent {
                 details,
                 is_error,
             } = outcome;
+            // polaris 命中后预热其 EDIT 目标文件的 read 投机，下回合模型决定读时直接收结果。
+            if !is_error && call.name == "polaris" {
+                if let Some(text) = details
+                    .as_ref()
+                    .and_then(|value| value.get("polaris").and_then(Value::as_str))
+                {
+                    self.preload_reads(polaris_preload_paths(text, 3));
+                }
+            }
             if !is_error && call.name == "change_working_directory" {
                 if let Some(path) = details
                     .as_ref()
@@ -602,12 +681,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn polaris_is_not_speculated_because_blocking_search_cannot_be_aborted() {
-        assert!(!speculatable(
+    #[test]
+    fn polaris_and_read_are_speculatable() {
+        assert!(speculatable(
             "polaris",
             &json!({ "keywords": ["roblox", "sql"] })
         ));
+        assert!(!speculatable("polaris", &json!({ "keywords": [] })));
         assert!(speculatable("read", &json!({ "path": "src/lib.rs" })));
+        assert!(!speculatable("bash", &json!({ "command": "ls" })));
+    }
+
+    #[test]
+    fn polaris_preload_paths_extracts_edit_section_in_rank_order() {
+        let text = "# CTX q=x\n## EDIT\n### src/a.rs (100L) FULL\n@@ 1-5 fn a\n### src/b.rs (50L) shown=1-10\n## DEPS (依赖定义)\n### src/c.rs (10L) FULL\n";
+        assert_eq!(
+            polaris_preload_paths(text, 3),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        assert!(polaris_preload_paths("## DEPS\n### src/c.rs (1L) FULL", 3).is_empty());
     }
 
     #[test]

@@ -68,3 +68,7 @@ release/
 tmp/
 
 .libnode/
+
+# bench scratch
+bench/work/
+bench/results-*.json

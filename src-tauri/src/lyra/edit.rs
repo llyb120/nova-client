@@ -70,19 +70,89 @@ fn count_occurrences(content: &str, needle: &str) -> usize {
     content.match_indices(&needle).count()
 }
 
-fn not_found_error(path: &str, edit_index: usize, total: usize) -> String {
-    if total == 1 {
-        format!("Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines.")
-    } else {
-        format!("Could not find edits[{edit_index}] in {path}. The oldText must match exactly including all whitespace and newlines.")
+/// 报错自愈线索：用字符 bigram Dice 系数在原文中定位与 oldText 最相似的一行，
+/// 让模型拿着真实内容一次重试即中，而不是整文件重读。
+fn best_match_line(content: &str, old_text: &str) -> Option<usize> {
+    // 以 oldText 中最有辨识度（最长）的一行作锚，避免 `}` 之类的噪声行。
+    let anchor = old_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .max_by_key(|line| line.chars().count())?;
+    let mut best: Option<(usize, f64)> = None;
+    for (index, line) in content.lines().enumerate() {
+        let score = line_similarity(anchor, line.trim());
+        if best.map_or(true, |(_, best_score)| score > best_score) {
+            best = Some((index, score));
+        }
     }
+    best.filter(|(_, score)| *score >= 0.4)
+        .map(|(index, _)| index)
 }
 
-fn duplicate_error(path: &str, edit_index: usize, total: usize, occurrences: usize) -> String {
-    if total == 1 {
-        format!("Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique.")
+fn line_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+    let bigrams = |text: &str| -> Vec<(char, char)> {
+        let chars: Vec<char> = text.chars().collect();
+        chars.windows(2).map(|pair| (pair[0], pair[1])).collect()
+    };
+    let (x, y) = (bigrams(a), bigrams(b));
+    if x.is_empty() || y.is_empty() {
+        return 0.0;
+    }
+    let mut used = vec![false; y.len()];
+    let mut overlap = 0usize;
+    for pair in &x {
+        if let Some(hit) = y
+            .iter()
+            .zip(used.iter_mut())
+            .position(|(candidate, consumed)| !*consumed && candidate == pair)
+        {
+            used[hit] = true;
+            overlap += 1;
+        }
+    }
+    2.0 * overlap as f64 / (x.len() + y.len()) as f64
+}
+
+fn not_found_error(content: &str, old_text: &str, path: &str, edit_index: usize, total: usize) -> String {
+    let head = if total == 1 {
+        format!("Could not find the exact text in {path}.")
     } else {
-        format!("Found {occurrences} occurrences of edits[{edit_index}] in {path}. Each oldText must be unique. Please provide more context to make it unique.")
+        format!("Could not find edits[{edit_index}] in {path}.")
+    };
+    let Some(center) = best_match_line(content, old_text) else {
+        return format!("{head} The old text must match exactly including all whitespace and newlines.");
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let start = center.saturating_sub(2);
+    let end = (center + 3).min(lines.len());
+    let mut excerpt = String::new();
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        let number = start + offset + 1;
+        let marker = if start + offset == center { '>' } else { ' ' };
+        let clipped: String = line.chars().take(160).collect();
+        excerpt.push_str(&format!("\n{marker} {number} | {clipped}"));
+    }
+    format!(
+        "{head} Closest existing match is line {} (marked >):{excerpt}\nUse the real content above to fix oldText and retry once; do not re-read the whole file.",
+        center + 1
+    )
+}
+
+fn duplicate_error(path: &str, edit_index: usize, total: usize, lines: &[usize]) -> String {
+    let occurrences = lines.len();
+    let list = lines
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total == 1 {
+        format!("Found {occurrences} occurrences of the text in {path} (starting at lines: {list}). The text must be unique. Please provide more context to make it unique.")
+    } else {
+        format!("Found {occurrences} occurrences of edits[{edit_index}] in {path} (starting at lines: {list}). Each oldText must be unique. Please provide more context to make it unique.")
     }
 }
 
@@ -241,11 +311,22 @@ fn apply_edits(content: &str, edits: &[EditInput], path: &str) -> Result<String,
             edit.old_text.clone()
         };
         let Some(match_index) = replacement_base.find(&needle) else {
-            return Err(not_found_error(path, index, edits.len()));
+            return Err(not_found_error(content, &edit.old_text, path, index, edits.len()));
         };
         let occurrences = count_occurrences(&replacement_base, &needle);
         if occurrences > 1 {
-            return Err(duplicate_error(path, index, edits.len(), occurrences));
+            let spans = line_spans(&replacement_base);
+            let lines: Vec<usize> = replacement_base
+                .match_indices(&needle)
+                .map(|(pos, _)| {
+                    spans
+                        .iter()
+                        .position(|(lo, hi)| pos >= *lo && pos < *hi)
+                        .unwrap_or(0)
+                        + 1
+                })
+                .collect();
+            return Err(duplicate_error(path, index, edits.len(), &lines));
         }
         replacements.push(Replacement {
             edit_index: index,
@@ -469,6 +550,43 @@ mod tests {
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "keep   \nquote(\"new\");\ntail\n"
         );
+    }
+
+    #[test]
+    fn not_found_error_points_to_closest_match_without_writing() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.css"),
+            ".a { color: red; }\n.b { color: blue; }\n.c { color: green; }\n",
+        )
+        .unwrap();
+        let error = edit(
+            dir.path(),
+            "a.css",
+            json!([{"oldText":".b { color: blu; }","newText":".b { color: navy; }"}]),
+        )
+        .unwrap_err();
+        assert!(error.contains("Closest existing match is line 2"), "{error}");
+        assert!(error.contains("color: blue"), "{error}");
+        assert!(error.contains("do not re-read"), "{error}");
+        // 失败不落盘
+        assert!(fs::read_to_string(dir.path().join("a.css"))
+            .unwrap()
+            .contains("color: blue"));
+    }
+
+    #[test]
+    fn duplicate_error_lists_line_numbers() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "x\nsame\ny\nsame\n").unwrap();
+        let error = edit(
+            dir.path(),
+            "a.txt",
+            json!([{"oldText":"same","newText":"z"}]),
+        )
+        .unwrap_err();
+        assert!(error.contains("Found 2 occurrences"), "{error}");
+        assert!(error.contains("lines: 2, 4"), "{error}");
     }
 
     #[test]

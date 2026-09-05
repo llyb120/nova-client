@@ -219,6 +219,11 @@ impl ToolOutcome {
             is_error: true,
         }
     }
+
+    fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
 }
 
 fn resolve_path(root: &Path, input: &str) -> PathBuf {
@@ -688,7 +693,8 @@ async fn execute_inner(
                             &rendered,
                         ));
                     }
-                    ToolOutcome::text(text)
+                    ToolOutcome::text(text.clone())
+                        .with_details(json!({ "polaris": text }))
                 }
                 Ok(Err(error)) => ToolOutcome::error(error),
                 Err(e) => ToolOutcome::error(format!("polaris 执行失败：{e}")),
