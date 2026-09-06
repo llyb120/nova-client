@@ -116,36 +116,19 @@ fn salvage_json(fragment: &str) -> Option<Value> {
     None
 }
 
-/// 投机准入的名称白名单。必须先于参数解析短路：provider 对所有工具都发
-/// ToolArgsDelta，而 salvage_json 会对累积片段反复补全解析，write/edit 这类
-/// 大参数工具逐 delta 白跑一遍是纯 O(n²) CPU（且必然不会命中）。
+/// 投机准入：仅 read（轻量、可取消、不进阻塞线程池）。
+/// 名称判断必须先于参数解析：provider 对所有工具都发 ToolArgsDelta，salvage_json 会对
+/// 累积片段反复补全解析，write/edit 这类大参数工具逐 delta 白跑一遍是纯 O(n²) CPU
+/// 且必然不会命中。polaris 曾纳入投机，但它走 spawn_blocking 启动 rg/git，abort
+/// 句柄终止不了已开始的阻塞检索，keywords 逐 token 演进会留下一批孤儿查询，
+/// 而等到参数完整才投机时重叠窗口已接近于零，得不偿失，故不投机。
 fn speculatable_name(name: &str) -> bool {
-    matches!(name, "read" | "polaris")
+    name == "read"
 }
 
-/// 仅允许真正轻量、可取消且不会进入阻塞线程池的只读工具投机执行。
-/// 调用前已经过 speculatable_name 门控，这里只判断参数是否齐备。
+/// 调用前已经过 speculatable_name 门控，这里补上参数齐备性判断。
 fn speculatable(name: &str, args: &Value) -> bool {
-    match name {
-        "read" => args.get("path").and_then(Value::as_str).is_some(),
-        "polaris" => args
-            .get("keywords")
-            .and_then(Value::as_array)
-            .is_some_and(|values| !values.is_empty()),
-        _ => false,
-    }
-}
-
-/// 投机参数解析策略：polaris 只吃完整合法 JSON，read 用 salvage 补全抢早命中。
-/// polaris 走 spawn_blocking 并启动 rg/git，abort Tokio 句柄终止不了已开始的阻塞
-/// 检索；keywords 数组逐 token 生成时用 salvage 会把每次参数演进都当成一次全量
-/// 检索重跑，留下一批孤儿查询。read 参数小、无阻塞检索，继续抢早。
-fn speculative_args(name: &str, fragment: &str) -> Option<Value> {
-    if name == "polaris" {
-        serde_json::from_str(fragment.trim()).ok()
-    } else {
-        salvage_json(fragment)
-    }
+    speculatable_name(name) && args.get("path").and_then(Value::as_str).is_some()
 }
 
 /// 从 polaris 渲染文本的 `## EDIT` 段提取按 rank 排序的目标文件，
@@ -193,7 +176,7 @@ fn maybe_speculate(spec: &SpecContext, index: usize, name: &str, fragment: &str)
     if !speculate_enabled() || !speculatable_name(name) {
         return;
     }
-    let Some(args) = speculative_args(name, fragment) else {
+    let Some(args) = salvage_json(fragment) else {
         return;
     };
 
@@ -697,35 +680,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn polaris_and_read_are_speculatable() {
-        assert!(speculatable(
-            "polaris",
-            &json!({ "keywords": ["roblox", "sql"] })
-        ));
-        assert!(!speculatable("polaris", &json!({ "keywords": [] })));
+    fn only_read_is_speculatable() {
         assert!(speculatable("read", &json!({ "path": "src/lib.rs" })));
-        assert!(!speculatable("bash", &json!({ "command": "ls" })));
+        assert!(!speculatable("read", &json!({})));
+        // polaris 的检索无法被 abort 取消，不再投机（预热走 preload_reads）。
+        assert!(!speculatable("polaris", &json!({ "keywords": ["roblox"] })));
     }
 
     #[test]
     fn name_gate_admits_only_speculatable_tools() {
-        // write/edit/bash 的参数片段不应进入 salvage_json（逐 delta 白解析）。
+        // 其余工具的参数片段不应进入 salvage_json（逐 delta 白解析）。
         assert!(speculatable_name("read"));
-        assert!(speculatable_name("polaris"));
-        for name in ["write", "edit", "bash", "change_working_directory", "browser"] {
+        for name in [
+            "polaris",
+            "write",
+            "edit",
+            "bash",
+            "change_working_directory",
+            "browser",
+        ] {
             assert!(!speculatable_name(name), "{name} 不应过名称门控");
         }
-    }
-
-    #[test]
-    fn polaris_waits_for_complete_args_while_read_salvages() {
-        // 生成中途的残缺 polaris 参数不得触发检索，避免每次演进重跑全量 rg/git。
-        assert!(speculative_args("polaris", r#"{"keywords":["robo"#).is_none());
-        let complete = speculative_args("polaris", r#"{"keywords":["roblox","sql"]}"#).unwrap();
-        assert!(speculatable("polaris", &complete));
-        // read 参数小且无阻塞检索，保留补全抢早命中的行为。
-        let salvaged = speculative_args("read", r#"{"path":"src/lib.rs""#).unwrap();
-        assert!(speculatable("read", &salvaged));
     }
 
     #[test]
