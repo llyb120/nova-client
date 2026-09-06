@@ -4037,6 +4037,47 @@ fn module_search_files(all: &[String], terms: &[String]) -> Vec<String> {
     }
 }
 
+/// 实验性字段加权 BM25，仅供离线 A/B，不改变生产排序。
+/// ponytail: 只重排旧排序前 24 个候选，IDF/平均长度也来自该候选集；
+/// 验证收益后再把字段统计持久化到增量索引，避免查询时重复读源码。
+#[cfg(test)]
+fn bm25_rerank(root: &Path, ranked: &mut [(String, f64)], terms: &[String]) {
+    let terms = terms.iter().map(|term| term.to_lowercase())
+        .filter(|term| !term.is_empty() && !stop_word(term))
+        .collect::<HashSet<_>>().into_iter().collect::<Vec<_>>();
+    let mut selected = ranked.iter().enumerate().collect::<Vec<_>>();
+    selected.sort_by(|a, b| b.1.1.total_cmp(&a.1.1).then(a.1.0.cmp(&b.1.0)));
+    let docs = selected.into_iter().take(24).filter_map(|(position, (file, _))| {
+        // 不扫描大资源；与文本检索的 2MB 单文件上限一致。
+        if fs::metadata(root.join(file)).ok()?.len() > 2 * 1024 * 1024 { return None; }
+        let src = source(root, file, None)?;
+        let body = src.lines.join("\n").to_lowercase();
+        let path = file.to_lowercase();
+        let symbols = src.syms.iter().map(|symbol| symbol.name.to_lowercase()).collect::<Vec<_>>();
+        let tf = terms.iter().map(|term| {
+            let path_hit = path.split('/').any(|part| part == term)
+                || file_segments(file).iter().any(|part| part == term);
+            let symbol_hits = symbols.iter().filter(|name| *name == term).count();
+            ((if path_hit { 6.0 } else { 0.0 }) + 4.0 * symbol_hits as f64,
+                body.matches(term.as_str()).count() as f64)
+        }).collect::<Vec<_>>();
+        Some((position, body.len().max(1) as f64, tf))
+    }).collect::<Vec<_>>();
+    if docs.is_empty() { return; }
+    let n = docs.len() as f64;
+    let average = docs.iter().map(|(_, len, _)| len).sum::<f64>() / n;
+    let df = (0..terms.len()).map(|term| docs.iter().filter(|(_, _, tf)| tf[term].0 + tf[term].1 > 0.0).count() as f64).collect::<Vec<_>>();
+    for (position, len, tf) in docs {
+        let score = tf.iter().enumerate().map(|(term, (fields, body_tf))| {
+            let idf = (1.0 + (n - df[term] + 0.5) / (df[term] + 0.5)).ln();
+            // 正文单独饱和；路径/符号作为独立字段证据，不受正文重复挤压。
+            idf * (fields + body_tf * 2.2
+                / (body_tf + 1.2 * (0.25 + 0.75 * len / average)))
+        }).sum::<f64>();
+        ranked[position].1 += score * 100.0;
+    }
+}
+
 fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let mut keyword_seen = HashSet::new();
     let keywords: Vec<String> = params
@@ -4863,6 +4904,10 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             ranked.push((file.clone(), 520.0));
         }
     }
+    #[cfg(test)]
+    if params.get("_bm25Experiment").and_then(Value::as_bool) == Some(true) {
+        bm25_rerank(root, &mut ranked, &terms);
+    }
     ranked.sort_by(|a, b| {
         files.contains(&b.0).cmp(&files.contains(&a.0))
             .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -5211,7 +5256,13 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     }
     // 显式文件是调用方给定的范围，不只是可被全仓泛词淹没的评分提示。
     // 保留组内的相关性排序；大单元仍受字节预算约束。
-    units.sort_by_key(|unit| !files.contains(&unit.file));
+    // 精确符号先占名额，避免部分名称匹配的小单元凭性价比挤掉真正定义。
+    // 仅调整已召回单元；不能恢复初始候选截断时遗漏的文件。
+    let exact_first = !cfg!(test) || params.get("_legacyUnitOrder").and_then(Value::as_bool) != Some(true);
+    units.sort_by_key(|unit| (
+        !files.contains(&unit.file),
+        exact_first && unit.seed_weight < 2,
+    ));
     let mut plans = Vec::<PlannedFile>::new();
     let mut sigs = Vec::<(String, usize, String)>::new();
     let mut deferred = Vec::<Deferred>::new();
@@ -6235,6 +6286,85 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn exact_definition_is_not_displaced_by_partial_name_matches() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        for i in 0..4 {
+            fs::write(d.path().join(format!("src/partial{i}.rs")),
+                format!("pub fn polaris_option_{i}() {{}}\n{}", "// padding\n".repeat(300))).unwrap();
+        }
+        fs::write(d.path().join("src/target.rs"),
+            format!("pub fn polaris() {{\n{}\n}}\n{}", "    do_work();\n".repeat(100), "// padding\n".repeat(300))).unwrap();
+        let legacy = fast_context_run(d.path(), &serde_json::json!({
+            "keywords":["polaris"], "_legacyUnitOrder": true
+        })).unwrap();
+        assert!(!legacy.contains("pub fn polaris()"), "fixture must reproduce the old omission: {legacy}");
+        let out = fast_context_run(d.path(), &serde_json::json!({"keywords":["polaris"]})).unwrap();
+        assert!(out.contains("pub fn polaris()"), "{out}");
+        assert!(out.len() <= DEFAULT_HARD_BYTES);
+    }
+
+    #[test]
+    fn bm25_rewards_exact_fields_over_repeated_noise() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("refresh.rs"), "pub fn refresh() {}\n").unwrap();
+        fs::write(d.path().join("noise.rs"), "// refresh refresh refresh\n".repeat(200)).unwrap();
+        let mut ranked = vec![("refresh.rs".into(), 0.0), ("noise.rs".into(), 0.0)];
+        bm25_rerank(d.path(), &mut ranked, &["refresh".into()]);
+        assert!(ranked[0].1 > ranked[1].1, "{ranked:?}");
+        assert!(ranked.iter().all(|(_, score)| score.is_finite()));
+    }
+
+    /// 固定真实仓库查询，交错 A/B；只统计已展开正文，不把头部路径/SIG 算作覆盖。
+    /// 运行时显式 --ignored --nocapture；不发模型请求、不改仓库文件。
+    #[test]
+    #[ignore]
+    fn bm25_repository_ab() {
+        repository_ranking_ab(false);
+    }
+
+    #[test]
+    #[ignore]
+    fn exact_symbol_repository_ab() {
+        repository_ranking_ab(true);
+    }
+
+    fn repository_ranking_ab(exact_experiment: bool) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let cases = [
+            (vec!["lyra", "agent"], "分析 Lyra 工具执行主循环", "src-tauri/src/lyra/agent.rs"),
+            (vec!["polaris"], "分析上下文检索实现", "src-tauri/src/nova_tools_native/context.rs"),
+            (vec!["subject_match"], "检查文件主题评分", "src-tauri/src/nova_tools_native/context.rs"),
+            (vec!["read", "govern"], "Lyra 读取输出治理", "src-tauri/src/lyra/tools.rs"),
+            (vec!["compact", "reasonix"], "Lyra 上下文压缩", "src-tauri/src/lyra/reasonix.rs"),
+            (vec!["build_system_prompt"], "Lyra 工具提示规则", "src-tauri/src/lyra/prompt.rs"),
+        ];
+        for (keywords, task, expected) in cases {
+            for run in 0..4 {
+                for enabled in if run % 2 == 0 { [false, true] } else { [true, false] } {
+                    let start = Instant::now();
+                    let out = fast_context_run(root, &serde_json::json!({
+                        "keywords": keywords, "task": task,
+                        "_bm25Experiment": !exact_experiment && enabled,
+                        "_legacyUnitOrder": !exact_experiment || !enabled
+                    })).unwrap();
+                    let elapsed = start.elapsed().as_millis();
+                    let expanded = out.lines().filter_map(|line| line.strip_prefix("### "))
+                        .filter_map(|line| line.split_whitespace().next()).collect::<Vec<_>>();
+                    let rank = expanded.iter().position(|file| *file == expected).map(|rank| rank + 1);
+                    println!("BM25_AB {}", serde_json::json!({
+                        "query": keywords, "run": run, "bm25": !exact_experiment && enabled,
+                        "exactFirst": exact_experiment && enabled,
+                        "ms": elapsed, "bytes": out.len(), "expectedRank": rank,
+                        "expandedFiles": expanded.len()
+                    }));
+                    assert!(out.len() <= DEFAULT_HARD_BYTES);
+                }
+            }
+        }
+    }
+
     #[test]
     fn chinese_task_extracts_generic_ngrams_without_stop_words() {
         let tokens = task_tokens("检查支持中心的问题反馈处理器");
