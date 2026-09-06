@@ -54,7 +54,7 @@ const TASKS = {
 
   // 真实历史任务：来自本机 thread 6a0bc774... 的第一个用户请求。
   r1: {
-    cwd: () => "D:\\code\\nova-client",
+    cwd: () => REPO,
     mode: "plan",
     text: "fastcontext还有无优化空间？例如目前只给了起始行号没有给终点，模型还要小段read来补全",
   },
@@ -124,9 +124,7 @@ function runOnce({ cell, variant, task }) {
   return new Promise((resolve) => {
     const env = { ...process.env };
     if (task.dataRoot) env.NOVA_DATA_DIR = task.dataRoot;
-    if (variant === "baseline" && !EXE_AB) {
-      env.LYRA_SPECULATE = "off";
-    }
+    env.LYRA_SPECULATE = variant === "baseline" && !EXE_AB ? "off" : "on";
     const started = Date.now();
     const child = spawn(EXE_BY_VARIANT[variant] || EXE_DEFAULT, ["lyra"], { env, stdio: ["pipe", "pipe", "pipe"] });
     let stderr = "";
@@ -215,10 +213,12 @@ async function main() {
   for (const cell of cellsArg) {
     const def = TASKS[cell];
     if (!def) continue;
-    for (const variant of ["baseline", "treatment"]) {
-      for (let run = 1; run <= runs; run++) {
+    for (let run = 1; run <= runs; run++) {
+      // 交错并反转每对先后顺序，降低时间漂移和热缓存的顺序偏差。
+      for (const variant of run % 2 ? ["baseline", "treatment"] : ["treatment", "baseline"]) {
         const task = {
           text: def.text,
+          mode: def.mode,
           cwdPath: def.cwd(),
           dataRoot: benchDataRoot(`${cell}-${variant}-${run}`),
         };

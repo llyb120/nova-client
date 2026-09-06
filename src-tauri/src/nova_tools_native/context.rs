@@ -4284,7 +4284,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     // 同分优先生产路径（src/ > scripts/ > docs/）：原字母序兜底在泛词同分时把
     // scripts/docs 噪声排在 src/ 目标之前。
     preliminary.sort_by(|a, b| {
-        b.1.cmp(&a.1)
+        files.contains(&b.0).cmp(&files.contains(&a.0))
+            .then_with(|| b.1.cmp(&a.1))
             .then_with(|| score_path(&b.0).cmp(&score_path(&a.0)))
             .then_with(|| a.0.cmp(&b.0))
     });
@@ -4805,8 +4806,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
     }
     ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        files.contains(&b.0).cmp(&files.contains(&a.0))
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| a.0.cmp(&b.0))
     });
     // 特性④ git 共改耦合（可选开关）：抓文本零耦合的关联文件（DI 注册表、路由表、
@@ -5150,6 +5151,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
         units.push(picked);
     }
+    // 显式文件是调用方给定的范围，不只是可被全仓泛词淹没的评分提示。
+    // 保留组内的相关性排序；大单元仍受字节预算约束。
+    units.sort_by_key(|unit| !files.contains(&unit.file));
     let mut plans = Vec::<PlannedFile>::new();
     let mut sigs = Vec::<(String, usize, String)>::new();
     let mut deferred = Vec::<Deferred>::new();
@@ -5376,6 +5380,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 || (unit.role == "test"
                     && (plan_intent.tests || companion_tests.contains(&unit.file))));
         let effective_required = unit.required || required_representative;
+        let explicit_file = files.contains(&unit.file);
         if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
             eprintln!(
                 "[ctx] unit {}:{}-{} role={} tag={} obl={:?} req={} plan_idx={:?} hits={:?} score={:.1}",
@@ -5385,7 +5390,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 unit.hits, unit.score
             );
         }
-        if plan_index.is_none() && plans.len() >= file_limit && !required_representative {
+        if plan_index.is_none() && plans.len() >= file_limit && !required_representative && !explicit_file {
             continue;
         }
         if plan_index.is_some_and(|index| plans[index].blocks.len() >= units_per_file)
@@ -5834,6 +5839,11 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 .len()
         };
         body.push("## PROOF (任务闭包检查)".into());
+        for file in &files {
+            if !plans.iter().any(|plan| plan.file == *file && (plan.full || !plan.blocks.is_empty())) {
+                body.push(format!("显式文件缺口: {file}（未展开正文：预算不足、无匹配单元或文件不可读）；next: 用 files 单独定位该文件或按已知行段 read。"));
+            }
+        }
         body.push(format!(
             "符号关系: {}",
             if planned_terms.is_empty() {
@@ -5972,7 +5982,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             .iter()
             .enumerate()
             .filter(|(_, plan)| plan.full || !plan.blocks.is_empty())
-            .max_by_key(|(_, plan)| (if plan.section == "dep" { 1 } else { 0 }, plan.rank))
+            .max_by_key(|(_, plan)| (!files.contains(&plan.file), if plan.section == "dep" { 1 } else { 0 }, plan.rank))
             .map(|(index, _)| index)
         else {
             break;
@@ -7184,6 +7194,33 @@ mod tests {
         assert!(!out.contains("# CTX MISS"), "{out}");
         assert!(!out.contains("### src/settings.test.ts"), "{out}");
     }
+    #[test]
+    fn explicit_large_file_precedes_unrelated_targets() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        let requested = format!("{}\npub fn requested() {{\n    shared();\n}}\n", "// padding\n".repeat(EXPLICIT_FULL_MAX + 1));
+        fs::write(d.path().join("src/requested.rs"), requested).unwrap();
+        for i in 0..16 {
+            fs::write(d.path().join(format!("src/noise{i}.rs")), "pub fn shared() {}\n").unwrap();
+        }
+        let out = fast_context_run(d.path(), &serde_json::json!({
+            "keywords": ["shared"], "files": ["src/requested.rs"], "budget": 100
+        })).unwrap();
+        assert!(out.contains("### src/requested.rs"), "{out}");
+        assert!(out.contains("pub fn requested()"), "{out}");
+    }
+
+    #[test]
+    fn explicit_file_without_matching_units_reports_gap() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("large.rs"), "// padding\n".repeat(EXPLICIT_FULL_MAX + 1)).unwrap();
+        let out = fast_context_run(d.path(), &serde_json::json!({
+            "files": ["large.rs", "missing.rs"]
+        })).unwrap();
+        assert!(out.contains("显式文件缺口: large.rs"), "{out}");
+        assert!(out.contains("显式文件缺口: missing.rs"), "{out}");
+    }
+
     #[test]
     fn fast_context_run_includes_sql_and_markdown_candidates() {
         let d = tempdir().unwrap();
