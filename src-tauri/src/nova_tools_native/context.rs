@@ -1256,19 +1256,25 @@ fn indexed_candidate_files_from(index: &SearchIndex, terms: &[String]) -> Option
         if tokens.is_empty() {
             continue;
         }
-        let mut per_term: Option<HashSet<String>> = None;
+        // 先交最短倒排表；借用其余表的字符串，避免每个 token 克隆文件路径。
+        // 增量快照的 postings 未必有序，不能直接 binary_search。
+        let mut postings = Vec::new();
         for token in tokens {
             let Some(files) = index.postings.get(&token) else {
-                per_term = Some(HashSet::new());
+                postings.clear();
                 break;
             };
-            let set = files.iter().cloned().collect::<HashSet<_>>();
-            per_term = Some(match per_term {
-                Some(current) => current.intersection(&set).cloned().collect(),
-                None => set,
-            });
+            postings.push(files);
         }
-        let per_term = per_term.unwrap_or_default();
+        postings.sort_by_key(|files| files.len());
+        let mut per_term = postings.first().map(|files| (*files).clone()).unwrap_or_default();
+        for files in postings.iter().skip(1) {
+            let membership = files.iter().collect::<HashSet<_>>();
+            per_term.retain(|file| membership.contains(file));
+            if per_term.is_empty() {
+                break;
+            }
+        }
         // SQL/build/config 等超高频词不具备候选收敛能力。查询同时有 roblox 这类
         // 稀有锚点时跳过泛词，避免一个泛词把候选重新膨胀到全仓。
         if per_term.len() > SEARCH_INDEX_MAX_CANDIDATES {
@@ -3995,6 +4001,42 @@ fn levenshtein(a: &str, b: &str, cap: usize) -> usize {
     prev[b.len()]
 }
 
+/// ponytail: 仅识别唯一、至多 128 文件且小于半仓的同名模块目录；
+/// 歧义或大模块保留全局检索，后续有召回评测再扩展为多模块路由。
+fn module_search_files(all: &[String], terms: &[String]) -> Vec<String> {
+    let mut dirs = HashSet::new();
+    for file in all {
+        if anchor_noise_path(file) {
+            continue;
+        }
+        let Some((parent, _)) = file.rsplit_once('/') else { continue };
+        let mut prefix = String::new();
+        for segment in parent.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            if terms.iter().any(|term| {
+                term.len() >= 4 && !stop_word(&term.to_lowercase())
+                    && !matches!(term.to_ascii_lowercase().as_str(), "src" | "source" | "scripts" | "components" | "services" | "utils" | "lib" | "tests")
+                    && segment.eq_ignore_ascii_case(term)
+            }) {
+                dirs.insert(format!("{prefix}/"));
+            }
+        }
+    }
+    if dirs.len() != 1 {
+        return Vec::new();
+    }
+    let dir = dirs.into_iter().next().unwrap();
+    let files = all.iter().filter(|file| file.starts_with(&dir)).take(129).cloned().collect::<Vec<_>>();
+    if files.len() > 128 || files.len() * 2 >= all.len() {
+        Vec::new()
+    } else {
+        files
+    }
+}
+
 fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let mut keyword_seen = HashSet::new();
     let keywords: Vec<String> = params
@@ -4091,21 +4133,33 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let soft_bytes = hard * 64 / 100;
     let total_start = Instant::now();
     let stage = Instant::now();
-    let (all, rows, revision) = std::thread::scope(|scope| {
-        let files = scope.spawn(|| list_code_files(root));
-        let search = scope.spawn(|| {
-            if initial_terms.is_empty() {
-                Vec::new()
-            } else {
-                search_text_until(root, initial_terms, true, false, &[], search_deadline())
-            }
-        });
+    let (all, rows, revision, module_files) = std::thread::scope(|scope| {
         let revision = scope.spawn(|| short_rev(root));
-        (
-            files.join().unwrap_or_default(),
-            search.join().unwrap_or_default(),
-            revision.join().unwrap_or_else(|_| "unknown".into()),
-        )
+        let all = list_code_files(root);
+        let module_files = if files.is_empty() {
+            module_search_files(&all, &terms)
+        } else {
+            Vec::new()
+        };
+        let deadline = search_deadline();
+        let rows = if initial_terms.is_empty() {
+            Vec::new()
+        } else if module_files.is_empty() {
+            search_text_until(root, initial_terms, true, false, &[], deadline)
+        } else {
+            let local = search_text_until(root, initial_terms, true, false, &module_files, deadline);
+            // 路径命中不能证明正文命中；其它锚点在模块内缺失时恢复全局召回。
+            let missing_anchor = anchor_terms.iter().any(|term| {
+                !module_files.iter().any(|file| file.split('/').any(|part| part.eq_ignore_ascii_case(term)))
+                    && !local.iter().any(|row| row.text.to_lowercase().contains(&term.to_lowercase()))
+            });
+            if local.is_empty() || missing_anchor {
+                search_text_until(root, initial_terms, true, false, &[], deadline)
+            } else {
+                local
+            }
+        };
+        (all, rows, revision.join().unwrap_or_else(|_| "unknown".into()), module_files)
     });
     let mut all = (*all).clone();
     trace("fast_context.search_and_files", stage);
@@ -4266,6 +4320,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                         0
                     }
                     + subject_match(f, &subject_terms, &term_freq) as i64
+                    + if module_files.contains(f) { 600 } else { 0 }
                     + if files.contains(f) { 500 } else { 0 },
             )
         })
@@ -4722,6 +4777,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 score += 120.0;
             }
             score += subject_match(file, &subject_terms, &term_freq);
+            if module_files.contains(file) {
+                score += 600.0;
+            }
             if files.contains(file) {
                 score += 500.0;
             }
@@ -7194,6 +7252,50 @@ mod tests {
         assert!(!out.contains("# CTX MISS"), "{out}");
         assert!(!out.contains("### src/settings.test.ts"), "{out}");
     }
+    #[test]
+    fn posting_intersection_handles_unsorted_incremental_lists() {
+        let mut postings = HashMap::new();
+        for token in search_index_tokens("alpha beta") {
+            postings.insert(token, vec!["z.rs".into(), "a.rs".into(), "m.rs".into()]);
+        }
+        for token in search_index_tokens("beta") {
+            postings.insert(token, vec!["m.rs".into(), "a.rs".into()]);
+        }
+        let index = index_from_snapshot(SearchSnapshot {
+            version: SEARCH_SNAPSHOT_VERSION,
+            root: String::new(), head: String::new(), git_signature: String::new(),
+            dirty_files: Vec::new(), postings, contents: HashMap::new(), file_tokens: HashMap::new(),
+        });
+        assert_eq!(indexed_candidate_files_from(&index, &["alpha beta".into()]).unwrap(), vec!["a.rs", "m.rs"]);
+    }
+
+    #[test]
+    fn module_scope_is_unique_bounded_and_segment_exact() {
+        let all = ["src/lyra/agent.rs", "src/lyra/tools.rs", "src/lyra-extra/a.rs", "src/other/a.rs", "src/other/b.rs"]
+            .map(str::to_string);
+        assert_eq!(module_search_files(&all, &["Lyra".into()]), all[..2]);
+        assert!(module_search_files(&all, &["lyr".into()]).is_empty());
+        assert!(module_search_files(&all, &["lyra".into(), "other".into()]).is_empty());
+        assert!(module_search_files(&all, &["src".into()]).is_empty());
+        assert!(module_search_files(&all[..2], &["lyra".into()]).is_empty());
+    }
+
+    #[test]
+    fn module_search_prefers_local_body_and_recovers_external_anchor() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src/lyra")).unwrap();
+        fs::create_dir_all(d.path().join("src/other")).unwrap();
+        fs::write(d.path().join("src/lyra/agent.rs"), "pub fn execute() { /* lyra */ }\n").unwrap();
+        fs::write(d.path().join("src/other/external.rs"), "pub fn external_anchor() {}\n").unwrap();
+        for i in 0..8 {
+            fs::write(d.path().join(format!("src/other/n{i}.rs")), "pub fn execute() {}\n").unwrap();
+        }
+        let local = fast_context_run(d.path(), &serde_json::json!({"keywords":["lyra", "execute"]})).unwrap();
+        assert!(local.contains("### src/lyra/agent.rs"), "{local}");
+        let fallback = fast_context_run(d.path(), &serde_json::json!({"keywords":["lyra", "external_anchor"]})).unwrap();
+        assert!(fallback.contains("### src/other/external.rs"), "{fallback}");
+    }
+
     #[test]
     fn explicit_large_file_precedes_unrelated_targets() {
         let d = tempdir().unwrap();

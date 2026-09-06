@@ -21,7 +21,7 @@ pub struct BrowserTools {
     pub session_id: String,
 }
 
-const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文时先调用：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，并自动使用 task（缺省时回退 keywords）检索相关的猎户座经验、记忆与守则，一并返回。目标行段已明确时直接 read。";
+const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，并自动使用 task（缺省时回退 keywords）检索相关的猎户座经验、记忆与守则，一并返回。目标行段已明确时直接 read。";
 
 fn render_trained_knowledge(project_root: &str, activated: &Value, rendered: &str) -> String {
     format!(
