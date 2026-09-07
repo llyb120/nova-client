@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug)]
 pub enum StreamEvent {
+    /// 收到网络数据（包括 SSE 注释心跳），不代表已输出内容。
+    Activity,
     TextDelta(String),
     ThinkingDelta(String),
     /// 工具调用参数的流式增量：index 为本条消息内工具调用序号，
@@ -630,6 +632,10 @@ async fn read_sse(
             }
             _ = wait_cancelled(cancel) => return Ok(true),
         };
+        // 空负载仅为内部网络活动通知；SSE 解码仍按原协议进行。
+        if chunk.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+            on_data("")?;
+        }
         let (events, finished) = match chunk {
             Some(chunk) => (
                 decoder
@@ -810,6 +816,7 @@ async fn stream_completions(
     let mut calls: Vec<ToolCallAccum> = Vec::new();
     let mut finish_reason: Option<String> = None;
     let cancelled = read_sse(&mut response, cancel, |data| {
+        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
@@ -947,6 +954,7 @@ async fn stream_responses(
     let mut terminal = false;
     let mut completed_items = std::collections::BTreeMap::new();
     let cancelled = read_sse(&mut response, cancel, |data| {
+        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
@@ -1287,7 +1295,7 @@ pub async fn stream_chat(
             session_id,
             cancel,
             &mut |event| {
-                emitted = true;
+                emitted |= !matches!(event, StreamEvent::Activity);
                 on_event(event);
             },
         )
@@ -1595,6 +1603,7 @@ async fn stream_anthropic(
         std::collections::HashMap::new();
     let mut stop_reason: Option<String> = None;
     let cancelled = read_sse(&mut response, cancel, |data| {
+        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
@@ -1972,6 +1981,30 @@ mod tests {
         assert_eq!(usage["input"], 20);
         assert_eq!(usage["cacheWrite"], 20);
         assert_eq!(usage["reasoning"], 5);
+    }
+
+    #[tokio::test]
+    async fn sse_comment_heartbeat_reports_activity() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            socket.read(&mut [0; 8192]).unwrap();
+            let body = ": heartbeat\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let mut response = reqwest::Client::builder().no_proxy().build().unwrap()
+            .get(format!("http://{address}")).send().await.unwrap();
+        let mut activity = 0;
+        read_sse(&mut response, &Arc::new(AtomicBool::new(false)), |data| {
+            assert!(data.is_empty(), "注释心跳不能变成模型内容");
+            activity += 1;
+            Ok(())
+        }).await.unwrap();
+        server.join().unwrap();
+        assert!(activity > 0);
     }
 
     #[tokio::test]
