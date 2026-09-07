@@ -73,6 +73,7 @@ export function buildIntegrateModelPrompt(goal: string): string {
 - \`supportsReasoningEffort\`（默认 true）：是否在上述思考字段之外同时发顶层 \`reasoning_effort\` 控制深度；仅当端点明确不支持时设为 false。
 - \`clearThinking\`（布尔，默认不下发、由端点决定）：仅 GLM 系（thinking_format=zai）需要时才配——\`false\` 开启 Preserved Thinking（保留历史思维链，代码自动回传 reasoning_content），\`true\` 强制清除省 token。其他厂商协议不同（Kimi 用 preserve_thinking / thinking.keep），不要套用。
 - \`requiresReasoningContentOnAssistantMessages\`：是否在历史 assistant 消息回传 reasoning_content（模型名含 deepseek 时自动开）。官方要求多轮/工具循环必须原样回传 reasoning_content 的模型（如 Kimi K3、k2.7-code）必须设 true。
+- \`headers\`（对象）：附加到每次请求的自定义请求头（如 \`{ "x-opencode-session": "abc" }\`），逐键按 model.options > provider.options 合并，值支持 \`{env:NAME}\`，\`null\` 表示删除继承来的同名头。端点强制要求某个固定头时才配。
 - \`maxTokensField\`: \`"max_tokens"\` | \`"max_completion_tokens"\`，默认按域名识别。
 - \`sendSessionAffinityHeaders\`（默认 false）/ \`supportsLongCacheRetention\`（默认仅官方 OpenAI）：前缀缓存优化，不确定就不动。
 判据一律以目标模型官方 API 文档为准；文档没提到的开关一律不写，靠默认值。

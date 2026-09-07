@@ -487,14 +487,7 @@ fn resolve_target(
                 .map(|v| !v.is_empty())
                 .unwrap_or(false)
         });
-    let mut headers = Map::new();
-    if let Some(object) = options.get("headers").and_then(Value::as_object) {
-        for (key, value) in object {
-            if let Some(text) = value.as_str() {
-                headers.insert(key.clone(), json!(resolve_env_string(text, env)?));
-            }
-        }
-    }
+    let headers = crate::lyra::config::resolve_headers(model, provider, env)?;
     let thinking_format = detect_thinking_format(provider_id, &base_url, model, provider);
     let max_tokens_field = detect_max_tokens_field(&base_url, model, provider);
     Ok(ResolvedCompletionTarget {
@@ -773,6 +766,7 @@ mod tests {
         assert_eq!(target.max_tokens_field, "max_completion_tokens");
         assert!(target.reasoning);
     }
+
 
     #[test]
     fn extracts_completions_message_text() {
