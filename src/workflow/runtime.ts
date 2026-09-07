@@ -21,6 +21,7 @@ import {
   type WorkflowStageDef,
   type WorkflowTransition,
 } from "./types";
+import { isManualStop, isNormalStop } from "./stopReason";
 
 export interface WorkflowHost {
   currentId(): string | null;
@@ -567,11 +568,11 @@ function resumeSuspendedStage(threadId: string): boolean {
 /** acp:turn running=false：正常结束则推进；手动停止视为放弃流程（移出室女座）；其余异常暂停待补充。 */
 export function handleTurnEnd(threadId: string, stopReason: string | null | undefined): boolean {
   if (!activeRuns.has(threadId) && !resumeSuspendedStage(threadId)) return false;
-  const manual = stopReason === "cancelled" || stopReason === "force_cancelled";
-  const normal = stopReason === "end_turn" || stopReason === "max_turn_requests";
-  const action = normal
+  const action = isNormalStop(stopReason)
     ? advanceWorkflow(threadId)
-    : Promise.resolve(manual ? finishWorkflow(threadId) : suspendWorkflow(threadId));
+    : Promise.resolve(
+        isManualStop(stopReason) ? finishWorkflow(threadId) : suspendWorkflow(threadId),
+      );
   void action.catch((error) => console.error("Workflow advance failed", error));
   return true;
 }
