@@ -222,6 +222,78 @@ fn get_blob(data_dir: &Path, hash: &str) -> Result<Vec<u8>, String> {
     fs::read(object_path(data_dir, hash)).map_err(|e| format!("读取世界线对象 {hash} 失败：{e}"))
 }
 
+/// 删除会话时连带清理其世界线数据：把这些会话从所在 timeline 摘掉；已无任何存活会话的
+/// timeline 整条移除，最后回收不再被任何 checkpoint 引用的 objects blob。
+pub fn remove_threads_data(data_dir: &Path, thread_ids: &HashSet<String>) {
+    if thread_ids.is_empty() {
+        return;
+    }
+    let mut store = match load_store(data_dir) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("[time-machine] 读取世界线数据失败，跳过清理：{error}");
+            return;
+        }
+    };
+    let mut changed = false;
+    let before = store.timelines.len();
+    store.timelines.retain_mut(|timeline| {
+        let heads_before = timeline.thread_heads.len();
+        let threads_before = timeline.thread_ids.len();
+        timeline.thread_ids.retain(|id| !thread_ids.contains(id));
+        timeline.thread_heads.retain(|id, _| !thread_ids.contains(id));
+        changed = changed
+            || timeline.thread_ids.len() != threads_before
+            || timeline.thread_heads.len() != heads_before;
+        // root 被删但同线 fork 出的其它会话还在：timeline 留给它们继续导航。
+        !timeline.thread_ids.is_empty() || !thread_ids.contains(&timeline.root_thread_id)
+    });
+    changed = changed || store.timelines.len() != before;
+    if !changed {
+        return;
+    }
+    if let Err(error) = save_store(data_dir, &store) {
+        eprintln!("[time-machine] 落盘世界线清理失败：{error}");
+        return;
+    }
+    gc_unreferenced_objects(data_dir, &store);
+}
+
+/// objects 按内容寻址、跨 timeline 去重共享；只删不再被任何存活 checkpoint 引用的 blob。
+fn gc_unreferenced_objects(data_dir: &Path, store: &StoreFile) {
+    let referenced: HashSet<&str> = store
+        .timelines
+        .iter()
+        .flat_map(|timeline| timeline.checkpoints.iter())
+        .flat_map(|checkpoint| checkpoint.entries.iter())
+        .map(|entry| entry.blob.as_str())
+        .collect();
+    let objects = time_machine_dir(data_dir).join("objects");
+    let Ok(prefixes) = fs::read_dir(&objects) else {
+        return;
+    };
+    for prefix in prefixes.flatten() {
+        let prefix_path = prefix.path();
+        if !prefix_path.is_dir() {
+            continue;
+        }
+        let prefix_name = prefix.file_name().to_string_lossy().into_owned();
+        if let Ok(files) = fs::read_dir(&prefix_path) {
+            for file in files.flatten() {
+                let path = file.path();
+                let Some(rest) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !referenced.contains(format!("{prefix_name}{rest}").as_str()) {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        // 只剩空前缀目录时顺手收掉；非空时 remove_dir 报错，正好跳过。
+        let _ = fs::remove_dir(&prefix_path);
+    }
+}
+
 fn workspace_root(cwd: &Path) -> Result<PathBuf, String> {
     let root =
         fs::canonicalize(cwd).map_err(|e| format!("无法访问工作目录 {}：{e}", cwd.display()))?;
@@ -1176,6 +1248,102 @@ mod tests {
             .items
             .iter()
             .any(|item| { matches!(item, Item::System { text, .. } if text == "second result") }));
+    }
+
+    #[test]
+    fn removing_threads_data_drops_dead_timelines_and_garbage_collects_objects() {
+        let root = std::env::temp_dir().join(format!(
+            "nova-time-machine-remove-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        fs::create_dir_all(time_machine_dir(&data)).unwrap();
+
+        let blob_a = put_blob(&data, b"a").unwrap();
+        let blob_shared = put_blob(&data, b"shared").unwrap();
+        let blob_dead = put_blob(&data, b"dead").unwrap();
+        // 不被任何 checkpoint 引用的游荡 blob，应一并被回收。
+        let blob_orphan = put_blob(&data, b"orphan").unwrap();
+
+        let snapshot = || {
+            Thread::new(
+                ".".into(),
+                crate::threads::AgentKind::Lyra,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let checkpoint = |id: &str, source: &str, blobs: Vec<String>| Checkpoint {
+            id: id.into(),
+            parent_id: None,
+            source_thread_id: source.into(),
+            title: id.into(),
+            created_at: 0,
+            workspace_root: ".".into(),
+            entries: blobs
+                .into_iter()
+                .map(|blob| PatchEntry {
+                    path: "f".into(),
+                    blob,
+                    executable: false,
+                })
+                .collect(),
+            workspace_captured: true,
+            thread_snapshot: snapshot(),
+            automatic: false,
+            outcome: None,
+        };
+        let store = StoreFile {
+            version: STORE_VERSION,
+            timelines: vec![
+                Timeline {
+                    id: "tl-a".into(),
+                    root_thread_id: "t1".into(),
+                    thread_ids: vec!["t1".into(), "t2".into()],
+                    thread_heads: HashMap::from([
+                        ("t1".to_string(), "c1".to_string()),
+                        ("t2".to_string(), "c2".to_string()),
+                    ]),
+                    current_checkpoint_id: Some("c2".into()),
+                    checkpoints: vec![
+                        checkpoint("c1", "t1", vec![blob_a.clone()]),
+                        checkpoint("c2", "t2", vec![blob_shared.clone()]),
+                    ],
+                },
+                Timeline {
+                    id: "tl-b".into(),
+                    root_thread_id: "t3".into(),
+                    thread_ids: vec!["t3".into()],
+                    thread_heads: HashMap::from([("t3".to_string(), "c3".to_string())]),
+                    current_checkpoint_id: Some("c3".into()),
+                    checkpoints: vec![checkpoint("c3", "t3", vec![blob_dead.clone()])],
+                },
+            ],
+        };
+        save_store(&data, &store).unwrap();
+
+        // 删掉 t3：整条 timeline 随之移除，独占 blob 与孤儿 blob 被回收，存活线的 blob 保留。
+        remove_threads_data(&data, &HashSet::from(["t3".to_string()]));
+        let store = load_store(&data).unwrap();
+        assert_eq!(store.timelines.len(), 1);
+        assert_eq!(store.timelines[0].id, "tl-a");
+        assert!(!object_path(&data, &blob_dead).exists());
+        assert!(!object_path(&data, &blob_orphan).exists());
+        assert!(object_path(&data, &blob_a).exists());
+        assert!(object_path(&data, &blob_shared).exists());
+
+        // 再删 t1：t2 仍在，timeline 保留，只摘掉 t1 的成员与分支头，其 checkpoint 留给 t2 导航。
+        remove_threads_data(&data, &HashSet::from(["t1".to_string()]));
+        let store = load_store(&data).unwrap();
+        assert_eq!(store.timelines.len(), 1);
+        assert_eq!(store.timelines[0].thread_ids, vec!["t2".to_string()]);
+        assert!(!store.timelines[0].thread_heads.contains_key("t1"));
+        assert_eq!(store.timelines[0].checkpoints.len(), 2);
+        assert!(object_path(&data, &blob_a).exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

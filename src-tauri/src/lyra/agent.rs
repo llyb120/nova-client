@@ -116,14 +116,19 @@ fn salvage_json(fragment: &str) -> Option<Value> {
     None
 }
 
-/// 仅允许真正轻量、可取消且不会进入阻塞线程池的只读工具投机执行。
-/// Polaris 内部会 spawn_blocking 并启动 rg/git；abort Tokio 句柄无法终止已开始的阻塞
-/// 工作。流式参数每次演进都投机一次会留下整批孤儿检索，形成查询风暴。
+/// 投机准入：仅 read（轻量、可取消、不进阻塞线程池）。
+/// 名称判断必须先于参数解析：provider 对所有工具都发 ToolArgsDelta，salvage_json 会对
+/// 累积片段反复补全解析，write/edit 这类大参数工具逐 delta 白跑一遍是纯 O(n²) CPU
+/// 且必然不会命中。polaris 曾纳入投机，但它走 spawn_blocking 启动 rg/git，abort
+/// 句柄终止不了已开始的阻塞检索，keywords 逐 token 演进会留下一批孤儿查询，
+/// 而等到参数完整才投机时重叠窗口已接近于零，得不偿失，故不投机。
+fn speculatable_name(name: &str) -> bool {
+    name == "read"
+}
+
+/// 调用前已经过 speculatable_name 门控，这里补上参数齐备性判断。
 fn speculatable(name: &str, args: &Value) -> bool {
-    match name {
-        "read" => args.get("path").and_then(Value::as_str).is_some(),
-        _ => false,
-    }
+    speculatable_name(name) && args.get("path").and_then(Value::as_str).is_some()
 }
 
 /// 投机上下文：流式回调内部不可借用 &mut Agent，预克隆所需状态。
@@ -137,7 +142,7 @@ struct SpecContext {
 /// 流式参数增量驱动投机执行：参数可挽救解析且齐备时立即预执行，与剩余生成重叠。
 /// 同序号参数演进时以最新为准，旧句柄中止。
 fn maybe_speculate(spec: &SpecContext, index: usize, name: &str, fragment: &str) {
-    if !speculate_enabled() {
+    if !speculate_enabled() || !speculatable_name(name) {
         return;
     }
     let Some(args) = salvage_json(fragment) else {
@@ -602,12 +607,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn polaris_is_not_speculated_because_blocking_search_cannot_be_aborted() {
-        assert!(!speculatable(
-            "polaris",
-            &json!({ "keywords": ["roblox", "sql"] })
-        ));
+    fn only_read_is_speculatable() {
         assert!(speculatable("read", &json!({ "path": "src/lib.rs" })));
+        assert!(!speculatable("read", &json!({})));
+        // polaris 的检索无法被 abort 取消，不再投机。
+        assert!(!speculatable("polaris", &json!({ "keywords": ["roblox"] })));
+    }
+
+    #[test]
+    fn name_gate_admits_only_speculatable_tools() {
+        // 其余工具的参数片段不应进入 salvage_json（逐 delta 白解析）。
+        assert!(speculatable_name("read"));
+        for name in [
+            "polaris",
+            "write",
+            "edit",
+            "bash",
+            "change_working_directory",
+            "browser",
+        ] {
+            assert!(!speculatable_name(name), "{name} 不应过名称门控");
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@ import { createSignal, For, Match, Show, Switch } from "solid-js";
 import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
 import type { Item, PromptImage } from "../types";
 import { createFileContextMenu } from "./FileContextMenu";
-import { IconChevron, IconFile, IconPencil } from "./icons";
+import { IconChevron, IconFile, IconPencil, IconRefresh } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { Markdown } from "./Markdown";
 import { ToolCallCard } from "./ToolCallCard";
@@ -105,6 +105,13 @@ function UserMessage(props: { item: Extract<Item, { type: "user" }> }) {
         }
       >
         <Show when={!running()}>
+          <button
+            class="user-edit-btn"
+            title="原样重发此消息"
+            onClick={() => void editUserMessage(props.item.id, props.item.text, props.item.images ?? [])}
+          >
+            <IconRefresh size={13} />
+          </button>
           <button class="user-edit-btn" title="编辑此消息，并从这里重新开始" onClick={startEdit}>
             <IconPencil size={13} />
           </button>

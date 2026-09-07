@@ -19,6 +19,7 @@ import {
   timeMachineChangedSignal,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
+import { resolveUserScrollStick } from "../scrollStick";
 import type { AgentKind, Item, Thread, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
@@ -750,6 +751,9 @@ export function ChatView() {
     if (!thread.parentThreadId && stageThreads().some((t) => isStageTitle(t.title))) return "目标";
     return thread.title || "会话";
   };
+  // 链上其它 stage 的未读轮次数：当前打开的 stage 在 openThread 时已清零，不会再显示角标。
+  const stageUnread = (thread: (typeof state.threads)[number]) =>
+    thread.id === state.currentId ? 0 : (state.unreadTurns[thread.id] ?? 0);
   const jumpToStage = async (threadId: string) => {
     // 每个 stage 都是独立会话；切换 stage 只切换会话，不再拼接 transcript。
     await openThread(threadId);
@@ -1359,9 +1363,12 @@ export function ChatView() {
             onReturnToCurrent={returnToCurrentTimeline}
             onScroll={(top, max, user) => {
               if (user) {
-                setStickToBottom(max - top <= 2);
-                lastScrollTop = top;
+                // 与 canvas 内部判定共用方向语义：上滚即解除吸底，下滚贴底才恢复。
+                setStickToBottom(resolveUserScrollStick(lastScrollTop, top, max));
               }
+              // user=false（rebuild 钉底/钳位）也要同步基准位置，
+              // 否则下一次上滚的方向判定拿旧基准会误判为下滚。
+              lastScrollTop = top;
               syncTimeCursor();
             }}
             onBrowseDetail={cancelBottomFollow}
@@ -1531,7 +1538,7 @@ export function ChatView() {
               <button
                 type="button"
                 class="stage-rail-item"
-                classList={{ active: thread.id === state.currentId }}
+                classList={{ active: thread.id === state.currentId, unread: stageUnread(thread) > 0 }}
                 title={thread.title}
                 onPointerDown={() => markThreadSwitchPointerDown()}
                 onClick={() => {
@@ -1546,6 +1553,9 @@ export function ChatView() {
               >
                 <span>{stageName(thread)}</span>
                 <small>{index() + 1}</small>
+                <Show when={stageUnread(thread) > 0}>
+                  <span class="thread-unread-badge">{stageUnread(thread) > 9 ? "9+" : stageUnread(thread)}</span>
+                </Show>
               </button>
             )}
           </For>

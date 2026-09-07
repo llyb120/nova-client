@@ -119,6 +119,8 @@ export interface ThreadMeta {
   ephemeral?: boolean;
   /** 用户星标：在所在项目内置顶 */
   starred: boolean;
+  /** 尚未回看的收尾轮次数（随会话落盘，重启后仍能恢复未读点） */
+  unreadTurns: number;
   /** 漫游角色：host = 我替别人执行；guest = 在别人机器上执行、本机只接收 */
   roamingRole?: string | null;
   /** 漫游对端展示名 */
@@ -385,6 +387,8 @@ export type SessionShortcutAction =
   | "selectProject"
   | "selectModel"
   | "newSession"
+  /** 循环打开普通模式下有未读轮次的会话；无 target。可注册为全局快捷键（最小化也生效）。 */
+  | "openUnread"
   | "insertText"
   /** 选中新会话页要运行的工作流；target 为工作流 id。仅新会话页生效。 */
   | "selectWorkflow"
@@ -397,7 +401,7 @@ export interface SessionShortcut {
   /** 规范化按键，如 Ctrl+1 / Alt+P。 */
   keys: string;
   action: SessionShortcutAction;
-  /** 本地项目路径、roam/quota 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession 可为空。 */
+  /** 本地项目路径、roam/quota 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession / openUnread 可为空。 */
   target: string;
 }
 
@@ -505,6 +509,8 @@ export interface Settings {
   sessionAutoCleanupEnabled: boolean;
   /** 自动清理会话的保留时长（小时） */
   sessionAutoCleanupHours: number;
+  /** 减少焦虑（室女座）：运行中的会话只在室女座显示，结束后自动回到普通模式 */
+  zenModeEnabled: boolean;
   /** 独立经验库训练；经验不同于客观记忆和必须遵守的守则。开启后 Lyra polaris 也会并行召回训练知识。 */
   experienceTrainingEnabled: boolean;
   experienceTrainingAgent: AgentKind;

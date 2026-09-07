@@ -39,6 +39,7 @@ mod windows_shell_shim;
 pub const SCRATCH_MARK: &str = "Nova-scratch";
 /// Native global shortcut event for creating a new session.
 const EV_NEW_SESSION_SHORTCUT: &str = "session-shortcut:new-session";
+const EV_OPEN_UNREAD_SHORTCUT: &str = "session-shortcut:open-unread";
 
 pub use path_env::init_process_path;
 pub use server::configure_from_args as configure_server_mode;
@@ -55,6 +56,7 @@ use serde_json::{json, Value};
 use settings::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use threads::{
@@ -445,6 +447,14 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
         &permanently_removed,
         &retained_session_ids,
     );
+    sweep_orphan_lyra_session_files(&state.config_dir, &retained_session_ids, now, hours);
+    time_machine::remove_threads_data(
+        &state.config_dir,
+        &permanently_removed
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect(),
+    );
     for thread in permanently_removed {
         if thread.cwd.contains(SCRATCH_MARK) {
             let _ = std::fs::remove_dir_all(thread.cwd);
@@ -485,6 +495,26 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
         return experience_removed;
     }
     experience_removed + remove_threads(app, &state, deletable).len()
+}
+
+static SESSION_CLEANUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// 清理含回收站整体重写、世界线 GC 与 session 文件扫描等重同步 IO，首次开启时可能积压
+/// 大量过期会话：必须在后台 blocking 线程执行，且并发只允许一个实例（重复触发直接跳过）。
+fn spawn_session_auto_cleanup(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        if SESSION_CLEANUP_IN_FLIGHT.swap(true, Ordering::Acquire) {
+            return;
+        }
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                SESSION_CLEANUP_IN_FLIGHT.store(false, Ordering::Release);
+            }
+        }
+        let _done = Done;
+        run_session_auto_cleanup(&app);
+    });
 }
 
 /// 是否有任意会话正在运行（本地 Devin/Codex、漫游 guest、被别人漫游的 host 均算）。
@@ -535,8 +565,9 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
 mod session_auto_cleanup_tests {
     use super::{
         cleanup_lyra_session_files, experience_thread_is_expired,
-        is_normal_thread_for_auto_cleanup, is_starrable_thread, thread_is_expired,
-        tree_contains_starred_thread, AgentKind, Thread, EXPERIENCE_THREAD_RETENTION_MS,
+        is_normal_thread_for_auto_cleanup, is_starrable_thread, now_ms,
+        sweep_orphan_lyra_session_files, thread_is_expired, tree_contains_starred_thread,
+        AgentKind, Thread, EXPERIENCE_THREAD_RETENTION_MS,
     };
     use std::collections::HashSet;
 
@@ -642,7 +673,13 @@ mod session_auto_cleanup_tests {
         let tool_results = data_dir.join("alkaid").join("tool-results");
         std::fs::create_dir_all(tool_results.join("session-a")).unwrap();
         std::fs::create_dir_all(tool_results.join("session-b")).unwrap();
-        for name in ["session-a.json", "session-a.slim.json", "session-b.json"] {
+        for name in [
+            "session-a.json",
+            "session-a.slim.json",
+            "session-a.pending.json",
+            "session-a.pending.pending.tmp",
+            "session-b.json",
+        ] {
             std::fs::create_dir_all(&sessions).unwrap();
             std::fs::write(sessions.join(name), "{}").unwrap();
         }
@@ -660,9 +697,50 @@ mod session_auto_cleanup_tests {
         cleanup_lyra_session_files(&data_dir, &[removed], &HashSet::new());
         assert!(!sessions.join("session-a.json").exists());
         assert!(!sessions.join("session-a.slim.json").exists());
+        assert!(!sessions.join("session-a.pending.json").exists());
+        assert!(!sessions.join("session-a.pending.pending.tmp").exists());
         assert!(!tool_results.join("session-a").exists());
         assert!(sessions.join("session-b.json").exists());
         assert!(tool_results.join("session-b").exists());
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn auto_cleanup_sweeps_expired_orphan_lyra_session_files() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "nova-lyra-session-sweep-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions = data_dir.join("alkaid").join("sessions");
+        let tool_results = data_dir.join("alkaid").join("tool-results");
+        std::fs::create_dir_all(tool_results.join("lyra-orphan")).unwrap();
+        std::fs::create_dir_all(tool_results.join("lyra-kept")).unwrap();
+        for name in [
+            "lyra-orphan.json",
+            "lyra-orphan.slim.json",
+            "lyra-orphan.pending.json",
+            "lyra-orphan.pending.pending.tmp",
+            "lyra-kept.slim.json",
+        ] {
+            std::fs::create_dir_all(&sessions).unwrap();
+            std::fs::write(sessions.join(name), "{}").unwrap();
+        }
+        let retained = HashSet::from(["lyra-kept".to_string()]);
+        // 文件刚写入、mtime 未过期：孤儿也保留（刚启动的会话还没来得及回写 session id）。
+        let now = now_ms();
+        sweep_orphan_lyra_session_files(&data_dir, &retained, now, 1);
+        assert!(sessions.join("lyra-orphan.json").exists());
+        assert!(tool_results.join("lyra-orphan").exists());
+        // 把 now 推到 8 天后：无论周几运行都跨过足够工作日，同一批文件全部过期。
+        let later = now + 8 * 24 * 60 * 60 * 1000;
+        sweep_orphan_lyra_session_files(&data_dir, &retained, later, 1);
+        assert!(!sessions.join("lyra-orphan.json").exists());
+        assert!(!sessions.join("lyra-orphan.slim.json").exists());
+        assert!(!sessions.join("lyra-orphan.pending.json").exists());
+        assert!(!sessions.join("lyra-orphan.pending.pending.tmp").exists());
+        assert!(!tool_results.join("lyra-orphan").exists());
+        assert!(sessions.join("lyra-kept.slim.json").exists());
+        assert!(tool_results.join("lyra-kept").exists());
         std::fs::remove_dir_all(data_dir).unwrap();
     }
 }
@@ -725,7 +803,7 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
         settings
             .session_shortcuts
             .iter()
-            .filter(|shortcut| shortcut.action == "newSession")
+            .filter(|shortcut| matches!(shortcut.action.as_str(), "newSession" | "openUnread"))
             .filter_map(|shortcut| {
                 let keys = normalize_global_shortcut(&shortcut.keys);
                 if keys.is_empty() || !seen.insert(keys.to_ascii_lowercase()) {
@@ -738,7 +816,7 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
                         return None;
                     }
                 };
-                Some(parsed)
+                Some((parsed, shortcut.action.clone()))
             })
             .collect::<Vec<_>>()
     };
@@ -746,11 +824,11 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
     if shortcuts.is_empty() {
         return;
     }
-    for shortcut in shortcuts {
+    for (shortcut, action) in shortcuts {
         let label = shortcut.to_string();
         if let Err(error) = app
             .global_shortcut()
-            .on_shortcut(shortcut, |app, _shortcut, event| {
+            .on_shortcut(shortcut, move |app, _shortcut, event| {
                 if event.state == ShortcutState::Pressed {
                     // A global shortcut is often used while Nova is behind another window or
                     // minimized. Bring it back before delivering the event so the user can see
@@ -763,13 +841,18 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
                         let _ = window.unminimize();
                         let _ = window.set_focus();
                     }
-                    let _ = app.emit(EV_NEW_SESSION_SHORTCUT, ());
+                    let name = if action == "openUnread" {
+                        EV_OPEN_UNREAD_SHORTCUT
+                    } else {
+                        EV_NEW_SESSION_SHORTCUT
+                    };
+                    let _ = app.emit(name, ());
                 }
             })
         {
-            eprintln!("[shortcut] 注册新建会话全局快捷键失败（{label}）：{error}");
+            eprintln!("[shortcut] 注册全局快捷键失败（{label}）：{error}");
         } else {
-            eprintln!("[shortcut] 已注册新建会话全局快捷键：{label}");
+            eprintln!("[shortcut] 已注册全局快捷键：{label}");
         }
     }
 }
@@ -910,6 +993,7 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
             running: is_running(&state, t),
             ephemeral: t.ephemeral,
             starred: t.starred,
+            unread_turns: t.unread_turns,
             roaming_role: t.roaming_role.clone(),
             roaming_peer_name: t.roaming_peer_name.clone(),
             quota_peer_name: t.quota_peer_name.clone(),
@@ -2355,7 +2439,12 @@ fn cleanup_lyra_session_files(
         .filter(|id| valid_lyra_session_id(id) && !retained_session_ids.contains(*id))
         .collect();
     for id in session_ids {
-        for file_name in [format!("{id}.json"), format!("{id}.slim.json")] {
+        for file_name in [
+            format!("{id}.json"),
+            format!("{id}.slim.json"),
+            format!("{id}.pending.json"),
+            format!("{id}.pending.pending.tmp"),
+        ] {
             let path = session_root.join(file_name);
             if let Err(error) = std::fs::remove_file(&path) {
                 if error.kind() != std::io::ErrorKind::NotFound {
@@ -2372,6 +2461,85 @@ fn cleanup_lyra_session_files(
                 eprintln!(
                     "[threads] 清理 Lyra session 工具结果 {} 失败：{error}",
                     tool_results.display()
+                );
+            }
+        }
+    }
+}
+
+/// 从 session 文件名还原 session id；只识别 Lyra 自己写的几类文件（含中断轨迹
+/// checkpoint 的原子写入临时文件），其余（logs/ 目录、未知文件）一律不动。
+fn lyra_session_file_id(name: &str) -> Option<&str> {
+    [".pending.pending.tmp", ".slim.json", ".pending.json", ".json"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .filter(|id| valid_lyra_session_id(id))
+}
+
+fn file_is_expired(path: &Path, now: i64, hours: u32) -> bool {
+    let modified_ms = path
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+    modified_ms.is_some_and(|ms| session_cleanup_is_expired(ms, now, hours))
+}
+
+/// 自动清理兜底：上面的定向清理只覆盖「本次被删会话」的文件；历史版本残留、进程崩溃
+/// 留下的孤儿 session 文件（会话记录早已不存在）靠这里扫掉。刚启动、session id 尚未
+/// 回写到会话记录的新文件按修改时间豁免（与过期判定同口径），避免误删活跃 session。
+fn sweep_orphan_lyra_session_files(
+    data_dir: &Path,
+    retained_session_ids: &HashSet<String>,
+    now: i64,
+    hours: u32,
+) {
+    let sessions_root = data_dir.join("alkaid").join("sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(lyra_session_file_id)
+            else {
+                continue;
+            };
+            if retained_session_ids.contains(id) || !file_is_expired(&path, now, hours) {
+                continue;
+            }
+            if let Err(error) = std::fs::remove_file(&path) {
+                eprintln!(
+                    "[threads] 清理孤儿 Lyra session 文件 {} 失败：{error}",
+                    path.display()
+                );
+            }
+        }
+    }
+    let tool_results_root = data_dir.join("alkaid").join("tool-results");
+    if let Ok(entries) = std::fs::read_dir(&tool_results_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !valid_lyra_session_id(id)
+                || retained_session_ids.contains(id)
+                || !file_is_expired(&path, now, hours)
+            {
+                continue;
+            }
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                eprintln!(
+                    "[threads] 清理孤儿 Lyra 工具结果 {} 失败：{error}",
+                    path.display()
                 );
             }
         }
@@ -2410,18 +2578,31 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
     }
     // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
     // 手动删除、worktree 删除及训练会话清理则没有回收站，立即清理。
-    let trashed_session_ids: HashSet<String> = state
-        .thread_trash
-        .lock()
-        .unwrap()
-        .session_ids()
-        .into_iter()
-        .collect();
+    let (trashed_session_ids, trashed_thread_ids): (HashSet<String>, HashSet<String>) = {
+        let trash = state.thread_trash.lock().unwrap();
+        (
+            trash.session_ids().into_iter().collect(),
+            trash.thread_ids().into_iter().collect(),
+        )
+    };
     let retained_session_ids = retained_session_ids
         .into_iter()
         .chain(trashed_session_ids)
         .collect();
     cleanup_lyra_session_files(&state.config_dir, &removed, &retained_session_ids);
+    // 不进回收站的删除：世界线数据与 scratch 工作目录随会话一起删掉。
+    // 进回收站的留给彻底清除那一步，与 session 文件同一节奏。
+    let permanent_ids: HashSet<String> = removed
+        .iter()
+        .filter(|thread| !trashed_thread_ids.contains(&thread.id))
+        .map(|thread| thread.id.clone())
+        .collect();
+    time_machine::remove_threads_data(&state.config_dir, &permanent_ids);
+    for thread in &removed {
+        if permanent_ids.contains(&thread.id) && thread.cwd.contains(SCRATCH_MARK) {
+            let _ = std::fs::remove_dir_all(&thread.cwd);
+        }
+    }
     let _ = app.emit(acp::EV_THREADS, json!({}));
     removed
 }
@@ -3393,6 +3574,25 @@ fn set_thread_reasoning_effort(
     let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
     thread.reasoning_effort = reasoning_effort.filter(|s| !s.is_empty());
     store.save();
+    Ok(())
+}
+
+/// 未读点由前端在轮次收尾时计数；计数必须随会话落盘，否则重启后未读会消失。
+#[tauri::command]
+fn set_thread_unread(
+    state: State<'_, AppState>,
+    thread_id: String,
+    unread: u32,
+) -> Result<(), String> {
+    {
+        let mut store = state.store.lock().unwrap();
+        let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
+        if thread.unread_turns == unread {
+            return Ok(());
+        }
+        thread.unread_turns = unread;
+    }
+    state.store.lock().unwrap().save_thread(&thread_id);
     Ok(())
 }
 
@@ -4423,7 +4623,7 @@ async fn apply_runtime_settings(
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     sync_global_session_shortcuts(app);
-    run_session_auto_cleanup(app);
+    spawn_session_auto_cleanup(app.clone());
     Ok(())
 }
 
@@ -5429,13 +5629,13 @@ pub fn run() {
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             sync_global_session_shortcuts(app.handle());
-            run_session_auto_cleanup(app.handle());
+            spawn_session_auto_cleanup(app.handle().clone());
             let cleanup_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 use tokio::time::{sleep, Duration};
                 loop {
                     sleep(Duration::from_secs(60 * 60)).await;
-                    run_session_auto_cleanup(&cleanup_app);
+                    spawn_session_auto_cleanup(cleanup_app.clone());
                 }
             });
 
@@ -5732,6 +5932,7 @@ pub fn run() {
             set_thread_mode,
             set_thread_reasoning_effort,
             set_thread_starred,
+            set_thread_unread,
             set_thread_agent,
             get_model_options,
             refresh_lyra_config,

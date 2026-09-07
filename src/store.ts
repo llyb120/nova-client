@@ -43,13 +43,17 @@ import type {
   UpdateProgress,
 } from "./types";
 import { isScratch, scratchParent } from "./utils";
+import { virgoChains } from "./virgoChains";
 import {
+  busyWorkflowRoots,
   handleTurnEnd as handleWorkflowTurnEnd,
   handleTurnStart as handleWorkflowTurnStart,
   initWorkflowRuntime,
   preparePrompt as prepareWorkflowPrompt,
   startWorkflow,
   suspendActive as suspendWorkflowActive,
+  unfinishedWorkflowRoots,
+  workflowReviewRevision,
 } from "./workflow/runtime";
 import {
   findTriggeredWorkflow,
@@ -57,6 +61,7 @@ import {
   registerTransientWorkflow,
   unregisterTransientWorkflow,
 } from "./workflow/storage";
+import { latestFireStage } from "./threadDisplay";
 import { normalizeGeneratedWorkflow } from "./workflow/types";
 import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
 
@@ -65,6 +70,26 @@ export type ThemePref = "ink-dark" | "ink-light";
 
 const THEME_KEY = "fd:theme";
 const MODEL_FAVORITES_KEY = "fd:modelFavorites";
+const UNREAD_CLUE_MENTIONS_KEY = "fd:unreadClueMentions:v1";
+
+/** 证据链 @提及红点只存内存时，重启会把还没看过的提及抹掉；读卡 id 写入本地。 */
+function readUnreadClueMentions(): string[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(UNREAD_CLUE_MENTIONS_KEY) ?? "[]");
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function setUnreadClueMentions(ids: string[]) {
+  setState("unreadClueMentions", ids);
+  try {
+    localStorage.setItem(UNREAD_CLUE_MENTIONS_KEY, JSON.stringify(ids));
+  } catch {
+    // 落盘失败只丢跨重启持久化，本次窗口内的红点仍按内存状态展示。
+  }
+}
 
 function readThemePref(): ThemePref {
   return localStorage.getItem(THEME_KEY) === "ink-light" ? "ink-light" : "ink-dark";
@@ -129,6 +154,8 @@ interface AppStore {
   /** 各会话未读新轮次结论数：每次轮次正常结束且该会话非当前打开则 +1，stage 链各自累计 */
   unreadTurns: Record<string, number>;
   running: Record<string, boolean>;
+  /** 提示词队列仍有待发条目（未挂起）的会话；接力空档保持室女座归属，由 promptQueue 镜像。 */
+  promptQueued: Record<string, boolean>;
   permissions: PermissionRequest[];
   connected: boolean;
   agent: Status["agent"];
@@ -160,8 +187,8 @@ interface AppStore {
   roamingFolders: string[];
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
-  /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "clues" | "workflows" | "training" | "browser";
+  /** 主区域视图（currentId 非空时优先显示会话，与本字段无关）；virgo = 室女座（减少焦虑） */
+  view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -191,6 +218,7 @@ export const [state, setState] = createStore<AppStore>({
   reasoningEffort: "",
   roamingPeer: null,
   running: {},
+  promptQueued: {},
   permissions: [],
   connected: false,
   agent: null,
@@ -246,7 +274,7 @@ export const [state, setState] = createStore<AppStore>({
   pendingNewSessionSeed: null,
   homeComposerFocusAt: 0,
   clueOpenRequest: null,
-  unreadClueMentions: [],
+  unreadClueMentions: readUnreadClueMentions(),
   theme: readThemePref(),
   backendAvailability: {},
 });
@@ -506,6 +534,8 @@ const runningEventVersions = new Map<string, number>();
 // send_prompt 先乐观置忙，后端随后才会登记 manager.running；在这段窗口内刷新
 // list_threads 只能看到 false，额度租借创建线程时尤其容易撞上这个竞态。
 const optimisticRunningThreads = new Set<string>();
+/** 不需要接入室女座口径时的空集（避免每份刷新新建 Set）。 */
+const EMPTY_IDS: Set<string> = new Set();
 
 export async function refreshThreads() {
   const request = ++refreshThreadsRequest;
@@ -519,7 +549,17 @@ export async function refreshThreads() {
   // 按 id reconcile 而非整体替换：保留未变线程的对象身份，
   // 避免 <For> 重建整个列表 DOM 导致侧边栏滚动位置被重置
   setState("threads", reconcile(threads, { key: "id" }));
+  // 重启后从会话文件恢复未读点：只在本地还没记过这个会话时采纳后端计数，
+  // 避免刷新期间并行发出的旧快照把刚清零的未读又顶回来。
+  for (const t of threads) {
+    if (t.unreadTurns > 0 && state.unreadTurns[t.id] === undefined) {
+      setState("unreadTurns", t.id, t.unreadTurns);
+    }
+  }
   const running: Record<string, boolean> = {};
+  // 室女座里仍在推进（含阶段接力空档）的任务链：后端 running 在这段空档就是 false，
+  // 快照不能把链上已有的忙碌态冲掉，否则侧栏转圈和徽标会闪断（以事件/乐观态为准）。
+  const zenBusyChains = zenModeOn() ? zenRunningChains().busy : EMPTY_IDS;
   for (const t of threads) {
     // 运行事件在本次请求期间到达时，以事件为准；否则使用后端快照。
     // 这样不会因额度租借的「创建线程刷新」竞态把实际运行态冲回 false。
@@ -527,7 +567,7 @@ export async function refreshThreads() {
     const current = runningEventVersions.get(t.id) ?? 0;
     running[t.id] = optimisticRunningThreads.has(t.id)
       ? true
-      : current !== before
+      : current !== before || zenBusyChains.has(t.id)
         ? !!state.running[t.id]
         : t.running;
   }
@@ -714,7 +754,7 @@ export async function refreshRoamingFolders() {
   }
 }
 
-export function setView(view: "home" | "clues" | "workflows" | "training" | "browser") {
+export function setView(view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo") {
   setState("view", view);
 }
 
@@ -807,6 +847,10 @@ export async function stackClues(cardIds: string[]) {
 
 export async function deleteClue(cardId: string) {
   await api.deleteClue(cardId, state.clueSpace);
+  // 卡片已不存在时，不能留下一个永远消费不掉的未读点。
+  if (state.unreadClueMentions.includes(cardId)) {
+    setUnreadClueMentions(state.unreadClueMentions.filter((id) => id !== cardId));
+  }
   await Promise.all([refreshClueGroups(), refreshThreads()]);
 }
 
@@ -863,7 +907,7 @@ export function takePendingNewSessionSeed(): PendingNewSessionSeed | null {
 
 export function openClueCard(cardId: string) {
   if (!cardId) return;
-  setState("unreadClueMentions", (ids) => ids.filter((id) => id !== cardId));
+  setUnreadClueMentions(state.unreadClueMentions.filter((id) => id !== cardId));
   setView("clues");
   closeThread();
   setState("clueOpenRequest", cardId);
@@ -875,7 +919,7 @@ export function clearClueOpenRequest(cardId: string) {
 }
 
 export function markClueMentionRead(cardId: string) {
-  setState("unreadClueMentions", (ids) => ids.filter((id) => id !== cardId));
+  setUnreadClueMentions(state.unreadClueMentions.filter((id) => id !== cardId));
 }
 
 /** 在线的其他人（排除自己）。漫游只能选择对方已共享（上报）的目录，不再支持手输路径；
@@ -1205,8 +1249,28 @@ export function traceThreadSwitchLayoutDone(threadId: string | null, groupCount:
   ]);
 }
 
+/**
+ * 未读点原本只活在前端内存里，重启后后台跑完但未回看的会话会被抹平；
+ * 因此每次计数变化都写回会话文件，启动时由 refreshThreads 从后端快照恢复。
+ */
+export function setUnreadTurns(id: string, count: number) {
+  setState("unreadTurns", id, count);
+  void api.setThreadUnread(id, count).catch(() => {
+    // 落盘失败只丢跨重启持久化，本次窗口内的未读点仍按内存状态展示。
+  });
+}
+
+/** promptQueue 镜像过来的队列占位；内容不变时不写，避免室女座归属 memo 空转。 */
+export function setPromptQueuedThreads(ids: ReadonlySet<string>) {
+  const cur = state.promptQueued;
+  if (Object.keys(cur).length === ids.size && [...ids].every((id) => cur[id])) return;
+  const next: Record<string, boolean> = {};
+  for (const id of ids) next[id] = true;
+  setState("promptQueued", next);
+}
+
 export async function openThread(id: string) {
-  if (state.unreadTurns[id]) setState("unreadTurns", id, 0);
+  if (state.unreadTurns[id]) setUnreadTurns(id, 0);
   const switching = state.currentId !== id;
   const request = switching ? ++openThreadRequest : openThreadRequest;
   const previousId = state.currentId;
@@ -1346,6 +1410,14 @@ export async function createThread(
   if (storedAgentKind === "codex") {
     lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
   }
+  // 减少焦虑：首页发起的会话不该先进会话页再被收起（新会话会闪一下才进室女座），
+  // 直接留在首页，由后续发送链路把运行态归到室女座。
+  if (zenModeOn() && !state.currentId) {
+    zenHold(t.id);
+    void refreshThreads();
+    void refreshProjects();
+    return t.id;
+  }
   setState("expanded", reconcile({}));
   setState({
     currentId: t.id,
@@ -1375,6 +1447,113 @@ export function isPendingThreadId(id: string | null | undefined): boolean {
   return !!id && id.startsWith(PENDING_THREAD_PREFIX);
 }
 
+/** 减少焦虑模式（室女座）：会话发出后转入后台运行，详情需到室女座手动查看。 */
+const ZEN_TOAST = "会话已在后台运行，去喝杯咖啡吧~";
+
+/**
+ * 首页发起、提示词还没真正跑起来的会话占位：计入运行态（立即归入室女座，
+ * 不会先在普通列表闪现），但不算「正在忙」，以免挡住紧随其后的工作流启动。
+ */
+const zenHoldThreads = new Set<string>();
+function zenHold(threadId: string) {
+  zenHoldThreads.add(threadId);
+  optimisticRunningThreads.add(threadId);
+  setState("running", threadId, true);
+}
+function zenUnhold(threadId: string) {
+  // 只处理首页发起时的占位；没占位过（非减少焦虑、/run 等其它入口）时不能碰真实运行态。
+  if (!zenHoldThreads.delete(threadId)) return;
+  optimisticRunningThreads.delete(threadId);
+  setState("running", threadId, false);
+}
+
+function zenModeOn() {
+  return !!state.settings?.zenModeEnabled;
+}
+/**
+ * 减少焦虑模式的运行态口径（侧栏、首页最近会话、refreshThreads 共用）：
+ * hidden = 归室女座的任务链（含父子接力整条链）的全部会话 id；
+ * busy = 工作流仍在推进（活动阶段或阶段接力空档）的链上的会话 id，
+ *        refreshThreads 合并后端快照时据此保留运行态；
+ * rootCount = 运行中任务数（室女座徽标，不把「暂停等人」的任务计入）。
+ * 集合计算在 virgoChains（纯函数，单测见 scripts/virgo-chains.test.mjs），
+ * 这里只接入信号与工作流运行时。
+ */
+export function zenRunningChains(): { hidden: Set<string>; busy: Set<string>; rootCount: number } {
+  // 工作流运行态（activeRuns/suspendedRuns/advancingRoots）是普通内存集合，不是响应式信号；
+  // 读一下 revision，侧栏/首页才不会等到下一次 refreshThreads 才反映室女座归属。
+  workflowReviewRevision();
+  return virgoChains({
+    threads: state.threads,
+    isRunning: (id) => !!state.running[id],
+    advancingRoots: busyWorkflowRoots(),
+    unfinishedRoots: unfinishedWorkflowRoots(),
+    queuedThreads: Object.keys(state.promptQueued),
+  });
+}
+
+/** 会话及其子孙（接力链）上的未读总数，与侧栏徽标口径一致。 */
+export function chainUnreadTurns(thread: ThreadMeta | undefined): number {
+  if (!thread) return 0;
+  const ids = new Set<string>([thread.id]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const candidate of state.threads) {
+      if (candidate.parentThreadId && ids.has(candidate.parentThreadId) && !ids.has(candidate.id)) {
+        ids.add(candidate.id);
+        changed = true;
+      }
+    }
+  }
+  return state.threads.reduce(
+    (sum, candidate) => sum + (ids.has(candidate.id) ? (state.unreadTurns[candidate.id] ?? 0) : 0),
+    0,
+  );
+}
+
+/**
+ * 「打开未读消息」快捷键（含全局触发）：循环打开普通模式下有未读轮次的会话链。
+ * 口径与侧栏普通模式列表一致：排除大熊座/双子座会话；减少焦虑模式下排除室女座运行链。
+ */
+export async function openNextUnreadThread(): Promise<void> {
+  const zenMode = !!state.settings?.zenModeEnabled;
+  const hidden = zenRunningChains().hidden;
+  const visible = state.threads.filter(
+    (t) => !t.experienceThread && !t.browserThread && (!zenMode || !hidden.has(t.id)),
+  );
+  const visibleIds = new Set(visible.map((t) => t.id));
+  const unreadRoots = visible.filter(
+    (t) => (!t.parentThreadId || !visibleIds.has(t.parentThreadId)) && chainUnreadTurns(t) > 0,
+  );
+  if (unreadRoots.length === 0) return;
+  // 当前打开的会话在某条未读链上时取下一组，循环轮转；否则从第一组开始
+  const currentIndex = unreadRoots.findIndex((root) => {
+    let node = state.threads.find((t) => t.id === state.currentId);
+    while (node) {
+      if (node.id === root.id) return true;
+      node = state.threads.find((t) => t.id === node?.parentThreadId);
+    }
+    return false;
+  });
+  const root = unreadRoots[(currentIndex + 1) % unreadRoots.length];
+  const target =
+    latestFireStage(
+      state.threads,
+      root,
+      (id) => !!state.running[id],
+      (id) => state.unreadTurns[id] ?? 0,
+    ) ?? root;
+  setView("home");
+  await openThread(target.id);
+}
+/** 发送成功后离开会话详情并播放「提示词飞入室女座」动画；/fire 等内置命令的编排流程不在此列（/stage 在 startStageThread 内自行处理）。 */
+function zenHideAfterSend(text: string) {
+  if (!zenModeOn() || !state.currentId) return;
+  closeThread();
+  zenDropPrompt(text);
+}
+
 /**
  * 乐观创建本地会话：先切进聊天页并上屏用户消息，后台 create_thread 完成后
  * 把占位替换成真会话并补发首条提示词。失败时回退到首页并保留输入。
@@ -1392,29 +1571,34 @@ export function createThreadOptimistic(
   clueCardId: string,
 ): void {
   const pendingId = PENDING_THREAD_PREFIX + crypto.randomUUID();
-  setState("expanded", reconcile({}));
-  setState({
-    currentId: pendingId,
-    items: [],
-    plan: null,
-    proposedPlan: null,
-    cwd,
-    title: "",
-    agentKind,
-    model,
-    mode,
-    reasoningEffort,
-    loadingThread: false,
-  });
-  // 用户消息立即上屏，与 deliverPrompt 的乐观项同一约定（负 id 临时项）。
-  setState("items", 0, {
-    type: "user",
-    id: -Date.now(),
-    text,
-    images,
-    ts: Date.now(),
-  } as Item);
-  bumpChatScrollToBottom();
+  // 减少焦虑：不进入会话页，留在首页并播放飞入室女座动画；下方后台分支完成创建与发送。
+  if (zenModeOn()) {
+    zenDropPrompt(text);
+  } else {
+    setState("expanded", reconcile({}));
+    setState({
+      currentId: pendingId,
+      items: [],
+      plan: null,
+      proposedPlan: null,
+      cwd,
+      title: "",
+      agentKind,
+      model,
+      mode,
+      reasoningEffort,
+      loadingThread: false,
+    });
+    // 用户消息立即上屏，与 deliverPrompt 的乐观项同一约定（负 id 临时项）。
+    setState("items", 0, {
+      type: "user",
+      id: -Date.now(),
+      text,
+      images,
+      ts: Date.now(),
+    } as Item);
+    bumpChatScrollToBottom();
+  }
   void (async () => {
     try {
       const t = await api.createThread(
@@ -1455,16 +1639,9 @@ export function createThreadOptimistic(
         reportActivity(true);
         await sendPromptTo(t.id, text, images);
       } else {
-        // 已切走：后台建好后直接发，保持 optimisticRunningThreads 状态一致。
-        optimisticRunningThreads.add(t.id);
-        setState("running", t.id, true);
-        try {
-          await api.sendPrompt(t.id, text, images);
-        } catch (error) {
-          optimisticRunningThreads.delete(t.id);
-          setState("running", t.id, false);
-          throw error;
-        }
+        // 已切走或减少焦虑：后台建好后直接发；走 sendPromptTo 统一拦截 /fire 等
+        // 内置命令，running 状态由 deliverPrompt 维护。
+        await sendPromptTo(t.id, text, images);
       }
       void refreshThreads();
       void refreshProjects();
@@ -1474,6 +1651,9 @@ export function createThreadOptimistic(
         setState("items", (items) => items.filter((item) => item.id >= 0));
         setState("currentId", null);
         setView("home");
+      } else if (zenModeOn()) {
+        // 减少焦虑下用户只看到气泡飞走，创建失败必须显式告知，否则提示词静默丢失。
+        showToast("会话创建失败，请重试");
       }
       console.error("optimistic create_thread failed", error);
     }
@@ -1646,10 +1826,6 @@ export async function deleteProjectThreads(ids: string[]): Promise<number> {
 export async function sendPrompt(
   text: string,
   images: PromptImage[] = [],
-  workflowId?: string | null,
-  /** 新会话启动工作流时用户原始选择的后端/模型（createThread 可能已被首节点覆盖），
-   *  作为「跟随会话」节点的跟随锚点。 */
-  workflowFollowFrom?: { agentKind: AgentKind; model: string | null },
 ) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
@@ -1659,11 +1835,6 @@ export async function sendPrompt(
     if (!cwd) throw new Error("请先选择一个项目再训练");
     setTrainingProject(cwd);
     await api.trainExperience(cwd);
-    return;
-  }
-  // 新会话页选择了工作流：会话输入就是首节点输入，文本作为 goal、图片作为首节点附件。
-  if (workflowId) {
-    await startWorkflow(workflowId, { goal: text.trim() }, id, images, workflowFollowFrom);
     return;
   }
   // 内置命令优先于工作流触发器，避免 /fire、/hard 等被当成普通内容。
@@ -1679,6 +1850,35 @@ export async function sendPrompt(
     id = restored.threadId;
   }
   await deliverPrompt(id, text, images);
+  zenHideAfterSend(text);
+}
+
+/**
+ * 在指定会话上启动工作流（不依赖 currentId）：首页在减少焦虑模式下建完会话并不进
+ * 会话页（避免新会话闪一下才进室女座），所以只能按 threadId 直接投递。
+ * 启动失败（工作流停用/校验不过/首节点发送失败）时收回首页发起时的占位忙碌态，
+ * 会话回到普通列表等用户处理，不会卡在室女座空转。
+ */
+export async function startWorkflowOnThread(
+  threadId: string,
+  text: string,
+  images: PromptImage[],
+  workflowId: string,
+  followFrom?: { agentKind: AgentKind; model: string | null },
+): Promise<void> {
+  try {
+    await startWorkflow(workflowId, { goal: text.trim() }, threadId, images, followFrom);
+  } catch (e) {
+    // 启动失败（工作流停用/校验不过/首节点发送失败）：收回首页发起时的占位忙碌态，
+    // 会话回到普通列表等用户处理，不会卡在室女座空转。
+    zenUnhold(threadId);
+    throw e;
+  }
+  // 工作流已自己接管运行态（host.setRunning 会同时记乐观忙碌），首页占位可以收掉；
+  // 这里不能走 zenUnhold，它会把刚置上的 running 冲回 false。
+  zenHoldThreads.delete(threadId);
+  if (state.currentId === threadId) zenHideAfterSend(text);
+  else if (zenModeOn()) zenDropPrompt(text);
 }
 
 type StageInput = { currentPrompt: string; stagePrompt: string; stageIndex: number };
@@ -1707,7 +1907,13 @@ async function startStageThread(
   thread.title = ownTitle;
   rememberThreadSnapshot(thread);
   await refreshThreads();
-  await openThread(thread.id);
+  if (zenModeOn()) {
+    // 室女座：不进入 Stage 会话页，回到首页并播放飞入动画；Stage 链在后台推进。
+    closeThread();
+    zenDropPrompt(prompt);
+  } else {
+    await openThread(thread.id);
+  }
   setState("running", thread.id, true);
   // Stage 使用自己的任务生成标题，不沿用来源会话名；失败时保留上面的提示词兜底标题。
   void api.generateThreadTitle(thread.id, prompt.slice(0, 1200)).catch(() => {});
@@ -2009,6 +2215,7 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
       suspendWorkflowActive(threadId);
     }
     setState("running", threadId, false);
+    zenHoldThreads.delete(threadId);
     throw e;
   }
 }
@@ -2092,8 +2299,14 @@ restoreFireRelayState();
 // 通用工作流运行时（/run）：复用会话接力模式，与 /fire 专用路径并存。
 initWorkflowRuntime({
   currentId: () => state.currentId,
-  isRunning: (id) => !!state.running[id],
-  setRunning: (id, v) => setState("running", id, v),
+  isRunning: (id) => !!state.running[id] && !zenHoldThreads.has(id),
+  // 工作流节点在「已置忙 → sendPrompt 真正起来」的间隙里同样需要乐观运行态，
+  // 否则阶段接力期间 refreshThreads 的后端 false 快照会把会话冲回普通列表。
+  setRunning: (id, v) => {
+    if (v) optimisticRunningThreads.add(id);
+    else optimisticRunningThreads.delete(id);
+    setState("running", id, v);
+  },
   refreshThreads: () => refreshThreads(),
   openThread: (id) => openThread(id),
   bumpScrollToBottom: () => bumpChatScrollToBottom(),
@@ -2344,6 +2557,36 @@ async function handleFireStart(threadId: string, text: string) {
 
 /** ChatView 订阅：发送新提示词时强制滚到底 */
 const [chatScrollToBottomTick, setChatScrollToBottomTick] = createSignal(0);
+
+/** 全局轻提示（非 alert）：showToast 展示数秒后自动消失，不阻断操作。 */
+const [toastMessage, setToastMessage] = createSignal<string | null>(null);
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+export function toastMessageSignal() {
+  return toastMessage();
+}
+export function showToast(text: string, ms = 3600) {
+  setToastMessage(text);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => setToastMessage(null), ms);
+}
+
+/** 减少焦虑：提示词飞入室女座的动画信号，由 App 的 ZenDropOverlay 消费。 */
+export type ZenDrop = { text: string; tick: number };
+const [zenDrop, setZenDrop] = createSignal<ZenDrop | null>(null);
+let zenDropTick = 0;
+export function zenDropSignal() {
+  return zenDrop();
+}
+function zenDropPrompt(text: string) {
+  const snippet = text.trim().split(/\r?\n/, 1)[0].slice(0, 24);
+  setZenDrop({ text: snippet || "消息已发送", tick: ++zenDropTick });
+  // 不等飞行动画落地，发出即弹轻提示，让用户立刻知道会话已转入后台。
+  showToast(ZEN_TOAST);
+}
+/** 飞入动画落地：收起气泡。 */
+export function zenDropLanded() {
+  setZenDrop(null);
+}
 const [timeMachineChangedTick, setTimeMachineChangedTick] = createSignal(0);
 let timeMachineEditTarget: { threadId: string; checkpointId: string } | null = null;
 export function setTimeMachineEditTarget(
@@ -2378,7 +2621,7 @@ function flushWorktreePrompt(threadId: string) {
   pendingWorktreePrompts.delete(threadId);
   // 新会话页选了工作流：就绪后直接启动工作流（goal 为暂存提示词），否则按普通提示词发送。
   const action = prompt.workflowId
-    ? startWorkflow(prompt.workflowId, { goal: prompt.text.trim() }, threadId, prompt.images, prompt.followFrom)
+    ? startWorkflowOnThread(threadId, prompt.text, prompt.images, prompt.workflowId, prompt.followFrom)
     : sendPromptTo(threadId, prompt.text, prompt.images);
   void action.catch((error) => {
     console.error("worktree prompt flush failed", error);
@@ -2505,6 +2748,41 @@ export async function respondPermission(requestKey: string, optionId: string) {
 }
 
 const pendingDeltas = new Map<number, string>();
+
+/* —— 侧栏标题跳动速度：按流式 delta 字符吞吐粗估输出速率 ——
+   1 token ≈ 4 字符只用于驱动动画节奏，无需精确；约 0.5s 一个采样窗口并做平滑。 */
+const RATE_WINDOW_MS = 500;
+const rateWindows = new Map<string, { chars: number; since: number; tokensPerSec: number }>();
+export const [outputRates, setOutputRates] = createSignal<Record<string, number>>({});
+
+function trackDeltaRate(threadId: string, chars: number) {
+  const now = performance.now();
+  let w = rateWindows.get(threadId);
+  if (!w) {
+    w = { chars: 0, since: now, tokensPerSec: 0 };
+    rateWindows.set(threadId, w);
+  }
+  if (now - w.since >= RATE_WINDOW_MS) {
+    const inst = w.chars / 4 / ((now - w.since) / 1000);
+    w.tokensPerSec = w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
+    w.chars = 0;
+    w.since = now;
+    const rounded = Math.round(w.tokensPerSec);
+    setOutputRates((rates) =>
+      rates[threadId] === rounded ? rates : { ...rates, [threadId]: rounded },
+    );
+  }
+  w.chars += chars;
+}
+
+function clearDeltaRate(threadId: string) {
+  if (!rateWindows.delete(threadId)) return;
+  setOutputRates((rates) => {
+    if (!(threadId in rates)) return rates;
+    const { [threadId]: _dropped, ...rest } = rates;
+    return rest;
+  });
+}
 let deltaFlushTimer: number | undefined;
 let lastDeltaFlush = 0;
 /** delta 合并窗口：足够小保证流式顺滑，配合 leading-edge 让首字几乎即时 */
@@ -2785,6 +3063,7 @@ export async function initStore() {
     // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
     for (const op of ops) {
       if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
+      else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text.length);
     }
     if (e.payload.threadId !== state.currentId) {
       if (threadSnapshots.has(e.payload.threadId)) staleThreadSnapshots.add(e.payload.threadId);
@@ -2827,6 +3106,7 @@ export async function initStore() {
     const wasRunning = !!state.running[threadId];
     runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
     optimisticRunningThreads.delete(threadId);
+    zenHoldThreads.delete(threadId);
     setState("running", threadId, e.payload.running);
     if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
       staleThreadSnapshots.add(threadId);
@@ -2835,20 +3115,23 @@ export async function initStore() {
       // 只在新一轮开始时丢弃上一轮残留；重复 running 事件不能覆盖本轮已收到的 usage。
       if (!wasRunning) {
         liveUsageByThread.delete(threadId);
+        clearDeltaRate(threadId);
         if (threadId === state.currentId) setState("liveUsage", null);
       }
       // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
       resumeFireRelay(e.payload.threadId);
       handleWorkflowTurnStart(e.payload.threadId);
     } else {
-      // 轮次正常收尾且该会话未打开 → 标记未读，提醒回看结论
-      const completedNormally =
-        e.payload.stopReason === "end_turn" || e.payload.stopReason === "max_turn_requests";
-      if (completedNormally && threadId !== state.currentId) {
-        setState("unreadTurns", threadId, (state.unreadTurns[threadId] ?? 0) + 1);
+      // 轮次收尾（正常或出错）且该会话未打开 → 标记未读，提醒回看结论或错误；
+      // 与后端 notify_done 的分类一致，只有用户主动取消不算未读。
+      const manuallyInterrupted =
+        e.payload.stopReason === "cancelled" || e.payload.stopReason === "force_cancelled";
+      if (!manuallyInterrupted && threadId !== state.currentId) {
+        setUnreadTurns(threadId, (state.unreadTurns[threadId] ?? 0) + 1);
       }
       // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
       liveUsageByThread.delete(threadId);
+      clearDeltaRate(threadId);
       if (threadId === state.currentId) setState("liveUsage", null);
       if (pendingSetupConfigRefresh.delete(threadId)) {
         void api.refreshLyraConfig().catch((error) =>
@@ -3000,7 +3283,7 @@ export async function initStore() {
   await listen<{ cardId: string }>("clues:mentioned", (e) => {
     const cardId = e.payload.cardId;
     if (!cardId || state.unreadClueMentions.includes(cardId)) return;
-    setState("unreadClueMentions", (ids) => [...ids, cardId]);
+    setUnreadClueMentions([...state.unreadClueMentions, cardId]);
   });
 
   // 系统通知点击：跳转到对应会话
@@ -3094,6 +3377,8 @@ export async function initStore() {
   // 本地 worktree 后台创建失败：丢弃暂存提示词（会话里已有错误系统消息）
   await listen<{ threadId: string; error?: string }>("acp:worktree-failed", (e) => {
     pendingWorktreePrompts.delete(e.payload.threadId);
+    // 首页发起时占位到室女座的会话，worktree 没建起来就没后续轮次事件了，在这里收回。
+    zenUnhold(e.payload.threadId);
     void refreshThreads();
   });
   // host 侧：收到漫游请求，入队等本机用户在弹框里确认

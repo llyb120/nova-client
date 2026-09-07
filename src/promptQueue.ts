@@ -1,7 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { createEffect, createRoot, createSignal } from "solid-js";
 import { api } from "./ipc";
-import { sendPrompt, sendPromptTo, state } from "./store";
+import { sendPrompt, sendPromptTo, setPromptQueuedThreads, state } from "./store";
 import type { PromptImage } from "./types";
 
 export type QueuedPrompt = {
@@ -165,6 +165,16 @@ export async function dispatchQueuedPrompt(item: QueuedPrompt, steerNow = false)
 /** 任意会话回合结束后按 FIFO 自动投递；不依赖 Composer 是否挂载或是否为前台会话。 */
 function startPromptQueueDispatcher() {
   createRoot(() => {
+    // 队列占位镜像进 store：回合结束到下一条自动投递之间的空档，会话保持室女座归属，
+    // 不会在普通列表闪一下再回来。挂起的队列不占位（用户已主动停下，会话回到普通列表）。
+    createEffect(() => {
+      const held = queueHeldThreadIds();
+      const ids = new Set<string>();
+      for (const item of queuedPrompts()) {
+        if (!held.has(item.threadId)) ids.add(item.threadId);
+      }
+      setPromptQueuedThreads(ids);
+    });
     createEffect(() => {
       const items = queuedPrompts();
       const held = queueHeldThreadIds();

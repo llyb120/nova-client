@@ -1256,19 +1256,25 @@ fn indexed_candidate_files_from(index: &SearchIndex, terms: &[String]) -> Option
         if tokens.is_empty() {
             continue;
         }
-        let mut per_term: Option<HashSet<String>> = None;
+        // 先交最短倒排表；借用其余表的字符串，避免每个 token 克隆文件路径。
+        // 增量快照的 postings 未必有序，不能直接 binary_search。
+        let mut postings = Vec::new();
         for token in tokens {
             let Some(files) = index.postings.get(&token) else {
-                per_term = Some(HashSet::new());
+                postings.clear();
                 break;
             };
-            let set = files.iter().cloned().collect::<HashSet<_>>();
-            per_term = Some(match per_term {
-                Some(current) => current.intersection(&set).cloned().collect(),
-                None => set,
-            });
+            postings.push(files);
         }
-        let per_term = per_term.unwrap_or_default();
+        postings.sort_by_key(|files| files.len());
+        let mut per_term = postings.first().map(|files| (*files).clone()).unwrap_or_default();
+        for files in postings.iter().skip(1) {
+            let membership = files.iter().collect::<HashSet<_>>();
+            per_term.retain(|file| membership.contains(file));
+            if per_term.is_empty() {
+                break;
+            }
+        }
         // SQL/build/config 等超高频词不具备候选收敛能力。查询同时有 roblox 这类
         // 稀有锚点时跳过泛词，避免一个泛词把候选重新膨胀到全仓。
         if per_term.len() > SEARCH_INDEX_MAX_CANDIDATES {
@@ -3995,6 +4001,83 @@ fn levenshtein(a: &str, b: &str, cap: usize) -> usize {
     prev[b.len()]
 }
 
+/// ponytail: 仅识别唯一、至多 128 文件且小于半仓的同名模块目录；
+/// 歧义或大模块保留全局检索，后续有召回评测再扩展为多模块路由。
+fn module_search_files(all: &[String], terms: &[String]) -> Vec<String> {
+    let mut dirs = HashSet::new();
+    for file in all {
+        if anchor_noise_path(file) {
+            continue;
+        }
+        let Some((parent, _)) = file.rsplit_once('/') else { continue };
+        let mut prefix = String::new();
+        for segment in parent.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            if terms.iter().any(|term| {
+                term.len() >= 4 && !stop_word(&term.to_lowercase())
+                    && !matches!(term.to_ascii_lowercase().as_str(), "src" | "source" | "scripts" | "components" | "services" | "utils" | "lib" | "tests")
+                    && segment.eq_ignore_ascii_case(term)
+            }) {
+                dirs.insert(format!("{prefix}/"));
+            }
+        }
+    }
+    if dirs.len() != 1 {
+        return Vec::new();
+    }
+    let dir = dirs.into_iter().next().unwrap();
+    let files = all.iter().filter(|file| file.starts_with(&dir)).take(129).cloned().collect::<Vec<_>>();
+    if files.len() > 128 || files.len() * 2 >= all.len() {
+        Vec::new()
+    } else {
+        files
+    }
+}
+
+/// 实验性字段加权 BM25，仅供离线 A/B，不改变生产排序。
+/// ponytail: 只重排旧排序前 24 个候选，IDF/平均长度也来自该候选集；
+/// 验证收益后再把字段统计持久化到增量索引，避免查询时重复读源码。
+#[cfg(test)]
+fn bm25_rerank(root: &Path, ranked: &mut [(String, f64)], terms: &[String]) {
+    let terms = terms.iter().map(|term| term.to_lowercase())
+        .filter(|term| !term.is_empty() && !stop_word(term))
+        .collect::<HashSet<_>>().into_iter().collect::<Vec<_>>();
+    let mut selected = ranked.iter().enumerate().collect::<Vec<_>>();
+    selected.sort_by(|a, b| b.1.1.total_cmp(&a.1.1).then(a.1.0.cmp(&b.1.0)));
+    let docs = selected.into_iter().take(24).filter_map(|(position, (file, _))| {
+        // 不扫描大资源；与文本检索的 2MB 单文件上限一致。
+        if fs::metadata(root.join(file)).ok()?.len() > 2 * 1024 * 1024 { return None; }
+        let src = source(root, file, None)?;
+        let body = src.lines.join("\n").to_lowercase();
+        let path = file.to_lowercase();
+        let symbols = src.syms.iter().map(|symbol| symbol.name.to_lowercase()).collect::<Vec<_>>();
+        let tf = terms.iter().map(|term| {
+            let path_hit = path.split('/').any(|part| part == term)
+                || file_segments(file).iter().any(|part| part == term);
+            let symbol_hits = symbols.iter().filter(|name| *name == term).count();
+            ((if path_hit { 6.0 } else { 0.0 }) + 4.0 * symbol_hits as f64,
+                body.matches(term.as_str()).count() as f64)
+        }).collect::<Vec<_>>();
+        Some((position, body.len().max(1) as f64, tf))
+    }).collect::<Vec<_>>();
+    if docs.is_empty() { return; }
+    let n = docs.len() as f64;
+    let average = docs.iter().map(|(_, len, _)| len).sum::<f64>() / n;
+    let df = (0..terms.len()).map(|term| docs.iter().filter(|(_, _, tf)| tf[term].0 + tf[term].1 > 0.0).count() as f64).collect::<Vec<_>>();
+    for (position, len, tf) in docs {
+        let score = tf.iter().enumerate().map(|(term, (fields, body_tf))| {
+            let idf = (1.0 + (n - df[term] + 0.5) / (df[term] + 0.5)).ln();
+            // 正文单独饱和；路径/符号作为独立字段证据，不受正文重复挤压。
+            idf * (fields + body_tf * 2.2
+                / (body_tf + 1.2 * (0.25 + 0.75 * len / average)))
+        }).sum::<f64>();
+        ranked[position].1 += score * 100.0;
+    }
+}
+
 fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let mut keyword_seen = HashSet::new();
     let keywords: Vec<String> = params
@@ -4091,21 +4174,33 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let soft_bytes = hard * 64 / 100;
     let total_start = Instant::now();
     let stage = Instant::now();
-    let (all, rows, revision) = std::thread::scope(|scope| {
-        let files = scope.spawn(|| list_code_files(root));
-        let search = scope.spawn(|| {
-            if initial_terms.is_empty() {
-                Vec::new()
-            } else {
-                search_text_until(root, initial_terms, true, false, &[], search_deadline())
-            }
-        });
+    let (all, rows, revision, module_files) = std::thread::scope(|scope| {
         let revision = scope.spawn(|| short_rev(root));
-        (
-            files.join().unwrap_or_default(),
-            search.join().unwrap_or_default(),
-            revision.join().unwrap_or_else(|_| "unknown".into()),
-        )
+        let all = list_code_files(root);
+        let module_files = if files.is_empty() {
+            module_search_files(&all, &terms)
+        } else {
+            Vec::new()
+        };
+        let deadline = search_deadline();
+        let rows = if initial_terms.is_empty() {
+            Vec::new()
+        } else if module_files.is_empty() {
+            search_text_until(root, initial_terms, true, false, &[], deadline)
+        } else {
+            let local = search_text_until(root, initial_terms, true, false, &module_files, deadline);
+            // 路径命中不能证明正文命中；其它锚点在模块内缺失时恢复全局召回。
+            let missing_anchor = anchor_terms.iter().any(|term| {
+                !module_files.iter().any(|file| file.split('/').any(|part| part.eq_ignore_ascii_case(term)))
+                    && !local.iter().any(|row| row.text.to_lowercase().contains(&term.to_lowercase()))
+            });
+            if local.is_empty() || missing_anchor {
+                search_text_until(root, initial_terms, true, false, &[], deadline)
+            } else {
+                local
+            }
+        };
+        (all, rows, revision.join().unwrap_or_else(|_| "unknown".into()), module_files)
     });
     let mut all = (*all).clone();
     trace("fast_context.search_and_files", stage);
@@ -4236,6 +4331,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 f.clone(),
                 score_path(f)
                     + r.len().min(8) as i64 * 4
+                    // 超过 8 行的命中每 4 行再记 1 分（封顶 60 行）：密集命中是"本文件就在讲这个主题"
+                    // 的直接证据，不应与零星命中同分（命中上百行的引擎文件原来与 8 命中文件打平被挤出候选）。
+                    + r.len().saturating_sub(8).min(52) as i64 / 4
                     + file_keywords
                         .get(f)
                         .map(|set| {
@@ -4263,19 +4361,30 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                         0
                     }
                     + subject_match(f, &subject_terms, &term_freq) as i64
+                    + if module_files.contains(f) { 600 } else { 0 }
                     + if files.contains(f) { 500 } else { 0 },
             )
         })
         .collect();
-    for f in files.iter().chain(
-        all.iter()
-            .filter(|file| subject_match(file, &subject_terms, &term_freq) >= 300.0),
-    ) {
+    // 文件名段命中查询词是最强的定位信号，泛词高频时不应被衰减门槛挡住（命名为 *Plan*
+    // 的目标文件在 plan 命中数高时会被转录噪声文件挤出候选）。实现路径上的 subject 文件
+    // 直接提为候选；score_path>0 排除 docs/build 等非生产路径。
+    for f in files.iter().chain(all.iter().filter(|file| {
+        subject_match(file, &subject_terms, &term_freq) >= 300.0
+            || (score_path(file) > 0 && is_subject_file(file, &subject_terms))
+    })) {
         if !preliminary.iter().any(|(x, _)| x == f) {
             preliminary.push((f.clone(), if files.contains(f) { 1000 } else { 550 }));
         }
     }
-    preliminary.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // 同分优先生产路径（src/ > scripts/ > docs/）：原字母序兜底在泛词同分时把
+    // scripts/docs 噪声排在 src/ 目标之前。
+    preliminary.sort_by(|a, b| {
+        files.contains(&b.0).cmp(&files.contains(&a.0))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| score_path(&b.0).cmp(&score_path(&a.0)))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     preliminary.dedup_by(|a, b| a.0 == b.0);
     if preliminary.is_empty() {
         return Ok(format!(
@@ -4709,6 +4818,9 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 score += 120.0;
             }
             score += subject_match(file, &subject_terms, &term_freq);
+            if module_files.contains(file) {
+                score += 600.0;
+            }
             if files.contains(file) {
                 score += 500.0;
             }
@@ -4792,9 +4904,13 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             ranked.push((file.clone(), 520.0));
         }
     }
+    #[cfg(test)]
+    if params.get("_bm25Experiment").and_then(Value::as_bool) == Some(true) {
+        bm25_rerank(root, &mut ranked, &terms);
+    }
     ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        files.contains(&b.0).cmp(&files.contains(&a.0))
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| a.0.cmp(&b.0))
     });
     // 特性④ git 共改耦合（可选开关）：抓文本零耦合的关联文件（DI 注册表、路由表、
@@ -5138,6 +5254,15 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
         units.push(picked);
     }
+    // 显式文件是调用方给定的范围，不只是可被全仓泛词淹没的评分提示。
+    // 保留组内的相关性排序；大单元仍受字节预算约束。
+    // 精确符号先占名额，避免部分名称匹配的小单元凭性价比挤掉真正定义。
+    // 仅调整已召回单元；不能恢复初始候选截断时遗漏的文件。
+    let exact_first = !cfg!(test) || params.get("_legacyUnitOrder").and_then(Value::as_bool) != Some(true);
+    units.sort_by_key(|unit| (
+        !files.contains(&unit.file),
+        exact_first && unit.seed_weight < 2,
+    ));
     let mut plans = Vec::<PlannedFile>::new();
     let mut sigs = Vec::<(String, usize, String)>::new();
     let mut deferred = Vec::<Deferred>::new();
@@ -5364,6 +5489,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 || (unit.role == "test"
                     && (plan_intent.tests || companion_tests.contains(&unit.file))));
         let effective_required = unit.required || required_representative;
+        let explicit_file = files.contains(&unit.file);
         if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
             eprintln!(
                 "[ctx] unit {}:{}-{} role={} tag={} obl={:?} req={} plan_idx={:?} hits={:?} score={:.1}",
@@ -5373,7 +5499,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 unit.hits, unit.score
             );
         }
-        if plan_index.is_none() && plans.len() >= file_limit && !required_representative {
+        if plan_index.is_none() && plans.len() >= file_limit && !required_representative && !explicit_file {
             continue;
         }
         if plan_index.is_some_and(|index| plans[index].blocks.len() >= units_per_file)
@@ -5822,6 +5948,11 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 .len()
         };
         body.push("## PROOF (任务闭包检查)".into());
+        for file in &files {
+            if !plans.iter().any(|plan| plan.file == *file && (plan.full || !plan.blocks.is_empty())) {
+                body.push(format!("显式文件缺口: {file}（未展开正文：预算不足、无匹配单元或文件不可读）；next: 用 files 单独定位该文件或按已知行段 read。"));
+            }
+        }
         body.push(format!(
             "符号关系: {}",
             if planned_terms.is_empty() {
@@ -5960,7 +6091,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             .iter()
             .enumerate()
             .filter(|(_, plan)| plan.full || !plan.blocks.is_empty())
-            .max_by_key(|(_, plan)| (if plan.section == "dep" { 1 } else { 0 }, plan.rank))
+            .max_by_key(|(_, plan)| (!files.contains(&plan.file), if plan.section == "dep" { 1 } else { 0 }, plan.rank))
             .map(|(index, _)| index)
         else {
             break;
@@ -6155,6 +6286,85 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn exact_definition_is_not_displaced_by_partial_name_matches() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        for i in 0..4 {
+            fs::write(d.path().join(format!("src/partial{i}.rs")),
+                format!("pub fn polaris_option_{i}() {{}}\n{}", "// padding\n".repeat(300))).unwrap();
+        }
+        fs::write(d.path().join("src/target.rs"),
+            format!("pub fn polaris() {{\n{}\n}}\n{}", "    do_work();\n".repeat(100), "// padding\n".repeat(300))).unwrap();
+        let legacy = fast_context_run(d.path(), &serde_json::json!({
+            "keywords":["polaris"], "_legacyUnitOrder": true
+        })).unwrap();
+        assert!(!legacy.contains("pub fn polaris()"), "fixture must reproduce the old omission: {legacy}");
+        let out = fast_context_run(d.path(), &serde_json::json!({"keywords":["polaris"]})).unwrap();
+        assert!(out.contains("pub fn polaris()"), "{out}");
+        assert!(out.len() <= DEFAULT_HARD_BYTES);
+    }
+
+    #[test]
+    fn bm25_rewards_exact_fields_over_repeated_noise() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("refresh.rs"), "pub fn refresh() {}\n").unwrap();
+        fs::write(d.path().join("noise.rs"), "// refresh refresh refresh\n".repeat(200)).unwrap();
+        let mut ranked = vec![("refresh.rs".into(), 0.0), ("noise.rs".into(), 0.0)];
+        bm25_rerank(d.path(), &mut ranked, &["refresh".into()]);
+        assert!(ranked[0].1 > ranked[1].1, "{ranked:?}");
+        assert!(ranked.iter().all(|(_, score)| score.is_finite()));
+    }
+
+    /// 固定真实仓库查询，交错 A/B；只统计已展开正文，不把头部路径/SIG 算作覆盖。
+    /// 运行时显式 --ignored --nocapture；不发模型请求、不改仓库文件。
+    #[test]
+    #[ignore]
+    fn bm25_repository_ab() {
+        repository_ranking_ab(false);
+    }
+
+    #[test]
+    #[ignore]
+    fn exact_symbol_repository_ab() {
+        repository_ranking_ab(true);
+    }
+
+    fn repository_ranking_ab(exact_experiment: bool) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let cases = [
+            (vec!["lyra", "agent"], "分析 Lyra 工具执行主循环", "src-tauri/src/lyra/agent.rs"),
+            (vec!["polaris"], "分析上下文检索实现", "src-tauri/src/nova_tools_native/context.rs"),
+            (vec!["subject_match"], "检查文件主题评分", "src-tauri/src/nova_tools_native/context.rs"),
+            (vec!["read", "govern"], "Lyra 读取输出治理", "src-tauri/src/lyra/tools.rs"),
+            (vec!["compact", "reasonix"], "Lyra 上下文压缩", "src-tauri/src/lyra/reasonix.rs"),
+            (vec!["build_system_prompt"], "Lyra 工具提示规则", "src-tauri/src/lyra/prompt.rs"),
+        ];
+        for (keywords, task, expected) in cases {
+            for run in 0..4 {
+                for enabled in if run % 2 == 0 { [false, true] } else { [true, false] } {
+                    let start = Instant::now();
+                    let out = fast_context_run(root, &serde_json::json!({
+                        "keywords": keywords, "task": task,
+                        "_bm25Experiment": !exact_experiment && enabled,
+                        "_legacyUnitOrder": !exact_experiment || !enabled
+                    })).unwrap();
+                    let elapsed = start.elapsed().as_millis();
+                    let expanded = out.lines().filter_map(|line| line.strip_prefix("### "))
+                        .filter_map(|line| line.split_whitespace().next()).collect::<Vec<_>>();
+                    let rank = expanded.iter().position(|file| *file == expected).map(|rank| rank + 1);
+                    println!("BM25_AB {}", serde_json::json!({
+                        "query": keywords, "run": run, "bm25": !exact_experiment && enabled,
+                        "exactFirst": exact_experiment && enabled,
+                        "ms": elapsed, "bytes": out.len(), "expectedRank": rank,
+                        "expandedFiles": expanded.len()
+                    }));
+                    assert!(out.len() <= DEFAULT_HARD_BYTES);
+                }
+            }
+        }
+    }
+
     #[test]
     fn chinese_task_extracts_generic_ngrams_without_stop_words() {
         let tokens = task_tokens("检查支持中心的问题反馈处理器");
@@ -7173,6 +7383,77 @@ mod tests {
         assert!(!out.contains("### src/settings.test.ts"), "{out}");
     }
     #[test]
+    fn posting_intersection_handles_unsorted_incremental_lists() {
+        let mut postings = HashMap::new();
+        for token in search_index_tokens("alpha beta") {
+            postings.insert(token, vec!["z.rs".into(), "a.rs".into(), "m.rs".into()]);
+        }
+        for token in search_index_tokens("beta") {
+            postings.insert(token, vec!["m.rs".into(), "a.rs".into()]);
+        }
+        let index = index_from_snapshot(SearchSnapshot {
+            version: SEARCH_SNAPSHOT_VERSION,
+            root: String::new(), head: String::new(), git_signature: String::new(),
+            dirty_files: Vec::new(), postings, contents: HashMap::new(), file_tokens: HashMap::new(),
+        });
+        assert_eq!(indexed_candidate_files_from(&index, &["alpha beta".into()]).unwrap(), vec!["a.rs", "m.rs"]);
+    }
+
+    #[test]
+    fn module_scope_is_unique_bounded_and_segment_exact() {
+        let all = ["src/lyra/agent.rs", "src/lyra/tools.rs", "src/lyra-extra/a.rs", "src/other/a.rs", "src/other/b.rs"]
+            .map(str::to_string);
+        assert_eq!(module_search_files(&all, &["Lyra".into()]), all[..2]);
+        assert!(module_search_files(&all, &["lyr".into()]).is_empty());
+        assert!(module_search_files(&all, &["lyra".into(), "other".into()]).is_empty());
+        assert!(module_search_files(&all, &["src".into()]).is_empty());
+        assert!(module_search_files(&all[..2], &["lyra".into()]).is_empty());
+    }
+
+    #[test]
+    fn module_search_prefers_local_body_and_recovers_external_anchor() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src/lyra")).unwrap();
+        fs::create_dir_all(d.path().join("src/other")).unwrap();
+        fs::write(d.path().join("src/lyra/agent.rs"), "pub fn execute() { /* lyra */ }\n").unwrap();
+        fs::write(d.path().join("src/other/external.rs"), "pub fn external_anchor() {}\n").unwrap();
+        for i in 0..8 {
+            fs::write(d.path().join(format!("src/other/n{i}.rs")), "pub fn execute() {}\n").unwrap();
+        }
+        let local = fast_context_run(d.path(), &serde_json::json!({"keywords":["lyra", "execute"]})).unwrap();
+        assert!(local.contains("### src/lyra/agent.rs"), "{local}");
+        let fallback = fast_context_run(d.path(), &serde_json::json!({"keywords":["lyra", "external_anchor"]})).unwrap();
+        assert!(fallback.contains("### src/other/external.rs"), "{fallback}");
+    }
+
+    #[test]
+    fn explicit_large_file_precedes_unrelated_targets() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        let requested = format!("{}\npub fn requested() {{\n    shared();\n}}\n", "// padding\n".repeat(EXPLICIT_FULL_MAX + 1));
+        fs::write(d.path().join("src/requested.rs"), requested).unwrap();
+        for i in 0..16 {
+            fs::write(d.path().join(format!("src/noise{i}.rs")), "pub fn shared() {}\n").unwrap();
+        }
+        let out = fast_context_run(d.path(), &serde_json::json!({
+            "keywords": ["shared"], "files": ["src/requested.rs"], "budget": 100
+        })).unwrap();
+        assert!(out.contains("### src/requested.rs"), "{out}");
+        assert!(out.contains("pub fn requested()"), "{out}");
+    }
+
+    #[test]
+    fn explicit_file_without_matching_units_reports_gap() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("large.rs"), "// padding\n".repeat(EXPLICIT_FULL_MAX + 1)).unwrap();
+        let out = fast_context_run(d.path(), &serde_json::json!({
+            "files": ["large.rs", "missing.rs"]
+        })).unwrap();
+        assert!(out.contains("显式文件缺口: large.rs"), "{out}");
+        assert!(out.contains("显式文件缺口: missing.rs"), "{out}");
+    }
+
+    #[test]
     fn fast_context_run_includes_sql_and_markdown_candidates() {
         let d = tempdir().unwrap();
         fs::create_dir_all(d.path().join("services/game")).unwrap();
@@ -7203,5 +7484,33 @@ mod tests {
             out.contains("docs/queries/minigame.sql") || out.contains("docs/queries/minigame.md"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn subject_named_file_survives_generic_word_noise() {
+        // 目标文件名段命中查询词（planActionCard），但 "plan" 只以驼峰内嵌形式出现在
+        // 标识符里，词边界检索零命中；泛词 "plan" 同时制造 300+ 行噪声命中（高频使
+        // subject 衰减到候选门槛以下）。文件名 subject 文件应提为候选，不被挤出。
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("src/planActionCard.tsx"),
+            "export function PlanActionCard() {\n  return proposedPlanView;\n}\n",
+        )
+        .unwrap();
+        for i in 0..12 {
+            let mut body = String::from("export function noiseNotes() {\n");
+            for n in 0..25 {
+                body.push_str(&format!("  const plan{n} = \"plan mode {i}\";\n"));
+            }
+            body.push_str("  return plan0;\n}\n");
+            fs::write(d.path().join(format!("src/notes{i}.ts")), body).unwrap();
+        }
+        let out = fast_context_run(
+            d.path(),
+            &serde_json::json!({"keywords":["plan mode"],"task":"remove plan mode selection"}),
+        )
+        .unwrap();
+        assert!(out.contains("### src/planActionCard.tsx"), "{out}");
     }
 }

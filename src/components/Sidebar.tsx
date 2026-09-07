@@ -2,20 +2,22 @@ import { getVersion } from "@tauri-apps/api/app";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
-import { latestFireStage } from "../threadDisplay";
+import { chainGroupAnchor, latestFireStage } from "../threadDisplay";
 import type { ThreadMeta, Worktree } from "../types";
 import {
   checkAndStageUpdate,
+  chainUnreadTurns,
   closeThread,
   deleteProjectThreads,
   deleteThread,
   markThreadSwitchPointerDown,
   openNewSession,
   openThread,
-  setState,
+  setUnreadTurns,
   setTrainingProject,
   setView,
   state,
+  zenRunningChains,
 } from "../store";
 import { agentLabel, agentShort, isScratch, scratchParent } from "../utils";
 import {
@@ -96,7 +98,7 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "training" | "browser") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo") => {
     setView(view);
     closeThread();
   };
@@ -114,38 +116,35 @@ export function Sidebar(props: {
   };
   const openWorkflows = () => switchView("workflows");
   const openBrowser = () => switchView("browser");
+  const openVirgo = () => switchView("virgo");
 
   const isTrainingView = () => state.view === "training";
   const isBrowserView = () => state.view === "browser";
+  // 减少焦虑（高级设置开启）：运行中的任务链移入室女座，普通模式不再显示，结束后自动移回。
+  const zenMode = () => !!state.settings?.zenModeEnabled;
+  const isVirgoView = () => zenMode() && state.view === "virgo";
+
+  // 运行中的任务链（含父子接力整条链）：与室女座列表、首页最近会话同一口径。
+  const chainInfo = createMemo(() => zenRunningChains());
+  const inRunningChain = (t: ThreadMeta) => chainInfo().hidden.has(t.id);
 
   const threadOf = (id: string) => state.threads.find((item) => item.id === id);
-  /** 会话及其子孙（接力链）上的未读总数，与 ThreadRow 徽标口径一致。 */
-  const chainUnreadCount = (thread: ThreadMeta | undefined): number => {
-    if (!thread) return 0;
-    const ids = new Set<string>([thread.id]);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const candidate of state.threads) {
-        if (candidate.parentThreadId && ids.has(candidate.parentThreadId) && !ids.has(candidate.id)) {
-          ids.add(candidate.id);
-          changed = true;
-        }
-      }
-    }
-    return state.threads.reduce(
-      (sum, candidate) => sum + (ids.has(candidate.id) ? (state.unreadTurns[candidate.id] ?? 0) : 0),
-      0,
-    );
-  };
   const openHistoryThread = async (id: string) => {
     const thread = state.threads.find((item) => item.id === id);
-    // 大熊座、双子座会话各自保持对应 tab；普通会话回到普通模式。
+    // 大熊座、双子座会话各自保持对应 tab；减少焦虑模式下运行中的普通会话留在室女座，其余回到普通模式。
     if (thread?.experienceThread) setTrainingProject(thread.worktree?.repo || thread.cwd);
-    setView(thread?.experienceThread ? "training" : thread?.browserThread ? "browser" : "home");
+    setView(
+      thread?.experienceThread
+        ? "training"
+        : thread?.browserThread
+          ? "browser"
+          : thread && zenMode() && inRunningChain(thread)
+            ? "virgo"
+            : "home",
+    );
     // 打开时若链上仍有其它阶段未读，仅消费一条未读（聚合徽标 -1）；本 stage 自身清零。
-    if (state.unreadTurns[id] && chainUnreadCount(threadOf(id)) > 1) {
-      setState("unreadTurns", id, (count) => (count ?? 1) - 1);
+    if (state.unreadTurns[id] && chainUnreadTurns(threadOf(id)) > 1) {
+      setUnreadTurns(id, Math.max((state.unreadTurns[id] ?? 1) - 1, 0));
     }
     await openThread(id);
   };
@@ -154,17 +153,17 @@ export function Sidebar(props: {
   // 归到源仓库组，用分支 badge 区分。（guest 漫游会话仍按对方目录分组。）
   const groupByCwd = (threads: typeof state.threads) => {
     const map = new Map<string, typeof state.threads>();
-    const byId = new Map(threads.map((t) => [t.id, t]));
     const rawKey = (t: ThreadMeta) =>
       t.worktree?.path
         ? t.worktree.repo
         : isScratch(t.cwd)
           ? scratchParent(t.cwd)
           : t.cwd;
+    // 子会话无论是否在 worktree/新 cwd 中执行，都归到链根所在分组；
+    // 锚点必须一路取到最高祖先（chainGroupAnchor），只看直接父级会让多级
+    // stage 链里 cwd 被中途切换的孙子会话裂到另一组、被当作链根单独显示。
     for (const t of threads) {
-      const parent = t.parentThreadId ? byId.get(t.parentThreadId) : null;
-      // 子会话无论是否在 worktree/新 cwd 中执行，都归到父会话所在分组。
-      const key = parent ? rawKey(parent) : rawKey(t);
+      const key = rawKey(chainGroupAnchor(threads, t));
       const list = map.get(key) ?? [];
       if (list.length === 0) map.set(key, list);
       list.push(t);
@@ -177,7 +176,11 @@ export function Sidebar(props: {
       ? state.threads.filter((t) => t.experienceThread)
       : isBrowserView()
         ? state.threads.filter((t) => t.browserThread)
-        : state.threads.filter((t) => !t.experienceThread && !t.browserThread);
+        : isVirgoView()
+          ? state.threads.filter((t) => !t.experienceThread && !t.browserThread && inRunningChain(t))
+          : state.threads.filter(
+              (t) => !t.experienceThread && !t.browserThread && (!zenMode() || !inRunningChain(t)),
+            );
     return groupByCwd(threads);
   });
 
@@ -400,7 +403,12 @@ export function Sidebar(props: {
       }
       return state.threads.filter((thread) => ids.has(thread.id));
     };
-    const running = () => chainThreads().some((thread) => !!state.running[thread.id]);
+    // 整条链的忙碌态：工作流阶段接力空档里没有任何会话 running，
+    // 只看 state.running 会让侧栏转圈在刷新/回合结束时闪断，这里并入室女座运行链口径。
+    const running = () => {
+      const { busy } = chainInfo();
+      return chainThreads().some((thread) => !!state.running[thread.id] || busy.has(thread.id));
+    };
     // 运行状态直接标在模型徽标上（发光 + 流线扫圈），不再占用右侧文字空间
     const runChild = () => !!(props.mergedChild && state.running[props.mergedChild.id]);
     const runSelf = () => running() && !runChild();
@@ -520,7 +528,9 @@ export function Sidebar(props: {
             临时
           </span>
         </Show>
-        <span class="thread-time">{fmtTime(updatedAt())}</span>
+        <Show when={running()} fallback={<span class="thread-time">{fmtTime(updatedAt())}</span>}>
+          <span class="spinner thread-time-loading" title="运行中" />
+        </Show>
         <button
           class="thread-delete"
           title="删除会话"
@@ -662,6 +672,20 @@ export function Sidebar(props: {
             >
               大熊座
             </button>
+            <Show when={zenMode()}>
+              <button
+                id="virgo-tab"
+                class="mode-seg-btn"
+                classList={{ active: state.view === "virgo" }}
+                onClick={openVirgo}
+                title="室女座（减少焦虑）：运行中的会话暂时移到这里，结束后自动回到普通模式"
+              >
+                室女座
+                <Show when={chainInfo().rootCount > 0}>
+                  <span class="mode-seg-badge" title="正在运行的任务数">{chainInfo().rootCount}</span>
+                </Show>
+              </button>
+            </Show>
             <button
               class="mode-seg-btn"
               classList={{ active: state.view === "browser" }}
@@ -683,9 +707,11 @@ export function Sidebar(props: {
             <div class="thread-empty">
               {isTrainingView()
                 ? "还没有训练会话。点击右侧“立即训练”开始。"
-                : isBrowserView()
-                  ? "还没有双子座执行会话。运行一个片段后会显示在这里。"
-                  : "还没有会话。在右侧输入任务开始。"}
+                : isVirgoView()
+                  ? "没有正在运行的会话。运行中的会话会暂时移到这里，结束后自动回到普通模式。"
+                  : isBrowserView()
+                    ? "还没有双子座执行会话。运行一个片段后会显示在这里。"
+                    : "还没有会话。在右侧输入任务开始。"}
             </div>
           }
         >

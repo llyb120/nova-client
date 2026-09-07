@@ -10,6 +10,7 @@ import { api } from "../ipc";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
+import { resolveScrollAfterLayout, resolveUserScrollStick } from "../scrollStick";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { relPath } from "./EditedFilesCard";
@@ -1384,6 +1385,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           // 世界线预览是静态快照，即使当前主线仍在运行，也应允许从历史消息编辑并分叉。
           // 使用父组件传入的有效 running 状态，避免直接读取主线状态把预览中的编辑入口隐藏。
           if (!props.running) {
+            result.push({ kind: "resend-btn", id: item.id, groupIdx: gi,
+              x: bx - 52, y: y + bubbleH - 26 - 4, w: 24, h: 24,
+              hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
+              hoverKey: `user-${item.id}`, title: "原样重发此消息",
+              clickAction: () => { void editUserMessage(item.id, item.text, item.images ?? []); } });
             result.push({ kind: "edit-btn", id: item.id, groupIdx: gi,
               x: bx - 28, y: y + bubbleH - 26 - 4, w: 24, h: 24,
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
@@ -1957,7 +1963,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ctx.save();
 
       // background — hoverBg for interactive blocks; edit/copy btns only visible on hover (or copied)
-      if (b.kind === "edit-btn") {
+      if (b.kind === "edit-btn" || b.kind === "resend-btn") {
         if (isHover) {
           ctx.fillStyle = b.hoverBg || pal.hover;
           roundRect(ctx, bx, by, b.w, b.h, b.borderRadius || 6);
@@ -1989,7 +1995,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
 
       // border
-      if (b.border && b.kind !== "edit-btn" && b.kind !== "code-copy-btn") {
+      if (b.border && b.kind !== "edit-btn" && b.kind !== "resend-btn" && b.kind !== "code-copy-btn") {
         ctx.strokeStyle = b.border;
         ctx.lineWidth = 1;
         if (b.borderRadius) {
@@ -2007,6 +2013,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           break;
         case "edit-btn":
           if (isHover) paintEditIcon(ctx, bx + 5, by + 5, 13, isHover ? p.text : p.faint);
+          break;
+        case "resend-btn":
+          if (isHover) paintRefreshIcon(ctx, bx + 5, by + 5, 13, p.text);
           break;
         case "code-copy-btn": {
           const copied = (copiedCodeUntil.get(b.hoverKey || "") || 0) > performance.now();
@@ -2740,6 +2749,33 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.restore();
   }
 
+  function paintRefreshIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, color: string) {
+    // 与 icons.tsx 的 IconRefresh（lucide refresh-cw）同形
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const s = size / 24;
+    ctx.translate(x, y);
+    ctx.scale(s, s);
+    ctx.beginPath();
+    ctx.arc(12, 12, 9, Math.PI, Math.PI * 1.75);
+    ctx.lineTo(21, 8);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(21, 3); ctx.lineTo(21, 8); ctx.lineTo(16, 8);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(12, 12, 9, 0, Math.PI * 0.75);
+    ctx.lineTo(3, 16);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(8, 16); ctx.lineTo(3, 16); ctx.lineTo(3, 21);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   function paintCopyIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, color: string) {
     // IconCopy: rect 9,9 13x13 rx2 + path M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1
     ctx.save();
@@ -2913,8 +2949,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function applyScrollY(next: number, user: boolean) {
+    const prev = scrollY;
     scrollY = Math.max(0, Math.min(maxScroll, next));
-    keepBottom = maxScroll - scrollY <= 2;
+    // 用户滚动按方向判定（上滚即解除吸底）；非用户滚动保持纯阈值。
+    keepBottom = user ? resolveUserScrollStick(prev, scrollY, maxScroll) : maxScroll - scrollY <= 2;
     applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, user);
     requestPaint();
@@ -3325,7 +3363,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const oldScroll = scrollY;
     const lock = scrollLock;
     scrollLock = null;
-    const wasBottom = !lock && (keepBottom || maxScroll - scrollY <= 2);
     if (!await computeLayout(generation)) return;
     // blocks are replaced during layout; an index from the previous block array may now
     // identify an unrelated block (often the first tool), producing a phantom hover card.
@@ -3340,15 +3377,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (const key of [...blockScrolls.keys()]) {
       if (!liveKeys.has(key)) blockScrolls.delete(key);
     }
-    maxScroll = Math.max(0, totalHeight - viewH);
+    // 布局让帧期间用户可能已滚离底部：吸底判定取提交时实时状态，不能用 await 前快照。
+    const settled = resolveScrollAfterLayout({ keepBottom, scrollY, maxScrollBefore: maxScroll, totalHeight, viewH });
+    maxScroll = settled.maxScroll;
     if (lock) {
       const match = blocks.find((x) => x.kind === lock.kind && x.id === lock.id);
       const y = match?.y ?? oldScroll + lock.viewOffset;
       scrollY = Math.max(0, Math.min(maxScroll, y - lock.viewOffset));
-    } else if (wasBottom) {
-      scrollY = maxScroll;
     } else {
-      scrollY = Math.max(0, Math.min(maxScroll, oldScroll));
+      scrollY = settled.scrollY;
     }
     applyEditStyle();
     props.onScroll?.(scrollY, maxScroll, false);
@@ -3503,7 +3540,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     props.ref?.({
       scrollToBottom() { keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
       scrollToGroup(idx) { if (groupYs[idx] != null) { scrollY = Math.max(0, Math.min(maxScroll, groupYs[idx] - 20)); keepBottom = false; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); } },
-      scrollBy(delta) { scrollY = Math.max(0, Math.min(maxScroll, scrollY + delta)); keepBottom = maxScroll - scrollY <= 2; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, true); },
+      scrollBy(delta) { applyScrollY(scrollY + delta, true); },
       isAtBottom() { return maxScroll - scrollY <= 2; },
       scrollTop() { return scrollY; },
       maxScrollTop() { return maxScroll; },
