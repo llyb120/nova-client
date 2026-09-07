@@ -124,23 +124,32 @@ function AppToast() {
 function AppToastChip(props: { text: string }) {
   let el: HTMLDivElement | undefined;
   onMount(() => {
-    const composer = document.querySelector(".home-composer") ?? document.querySelector(".composer");
-    if (!el || !composer) return;
-    const rect = composer.getBoundingClientRect();
-    const gap = 10;
-    el.style.bottom = "auto";
-    el.classList.add("bubble");
-    // 左对齐到输入框左上角，不再水平居中。
-    el.style.left = `${rect.left}px`;
-    el.style.transform = "none";
-    const above = rect.top - el.offsetHeight - gap;
-    if (above >= 8) {
-      el.style.top = `${above}px`;
-    } else {
-      // 上方放不下时退到输入框下方，气泡尾巴翻到上侧。
-      el.classList.add("below");
-      el.style.top = `${rect.bottom + gap}px`;
-    }
+    if (!el) return;
+    // 发送方随后才会清空输入框/附件/引用，首页居中布局随之收缩下移；
+    // 先隐藏，等下一帧布局稳定后再测量定位，避免贴着「收缩前」的输入框。
+    el.style.visibility = "hidden";
+    requestAnimationFrame(() => {
+      const composer = document.querySelector(".home-composer") ?? document.querySelector(".composer");
+      if (!el) return;
+      if (composer) {
+        const rect = composer.getBoundingClientRect();
+        const gap = 10;
+        el.style.bottom = "auto";
+        el.classList.add("bubble");
+        // 左对齐到输入框左上角，不再水平居中。
+        el.style.left = `${rect.left}px`;
+        el.style.transform = "none";
+        const above = rect.top - el.offsetHeight - gap;
+        if (above >= 8) {
+          el.style.top = `${above}px`;
+        } else {
+          // 上方放不下时退到输入框下方，气泡尾巴翻到上侧。
+          el.classList.add("below");
+          el.style.top = `${rect.bottom + gap}px`;
+        }
+      }
+      el.style.visibility = "";
+    });
   });
   return (
     <div ref={el} class="app-toast">
