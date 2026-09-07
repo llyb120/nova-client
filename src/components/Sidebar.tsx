@@ -2,7 +2,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
-import { latestFireStage } from "../threadDisplay";
+import { chainGroupAnchor, latestFireStage } from "../threadDisplay";
 import type { ThreadMeta, Worktree } from "../types";
 import {
   checkAndStageUpdate,
@@ -153,17 +153,17 @@ export function Sidebar(props: {
   // 归到源仓库组，用分支 badge 区分。（guest 漫游会话仍按对方目录分组。）
   const groupByCwd = (threads: typeof state.threads) => {
     const map = new Map<string, typeof state.threads>();
-    const byId = new Map(threads.map((t) => [t.id, t]));
     const rawKey = (t: ThreadMeta) =>
       t.worktree?.path
         ? t.worktree.repo
         : isScratch(t.cwd)
           ? scratchParent(t.cwd)
           : t.cwd;
+    // 子会话无论是否在 worktree/新 cwd 中执行，都归到链根所在分组；
+    // 锚点必须一路取到最高祖先（chainGroupAnchor），只看直接父级会让多级
+    // stage 链里 cwd 被中途切换的孙子会话裂到另一组、被当作链根单独显示。
     for (const t of threads) {
-      const parent = t.parentThreadId ? byId.get(t.parentThreadId) : null;
-      // 子会话无论是否在 worktree/新 cwd 中执行，都归到父会话所在分组。
-      const key = parent ? rawKey(parent) : rawKey(t);
+      const key = rawKey(chainGroupAnchor(threads, t));
       const list = map.get(key) ?? [];
       if (list.length === 0) map.set(key, list);
       list.push(t);

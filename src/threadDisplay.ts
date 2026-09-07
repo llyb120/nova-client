@@ -11,6 +11,28 @@ function isStageThread(thread: ThreadMeta): boolean {
 }
 
 /**
+ * 任务链分组锚点：多级 stage 链里各环节的 cwd 可能已被 agent 中途切换
+ *（change_working_directory），侧栏分组若只向上一级找父会话，会把孙子会话
+ * 分进另一组，组内找不到父节点而被当作链根，普通列表与室女座都裂成两条会话。
+ * 返回该会话在 threads 内可见的最高祖先（父级不在列表或成环时停在当前会话）。
+ */
+export function chainGroupAnchor(
+  threads: readonly ThreadMeta[],
+  thread: ThreadMeta,
+): ThreadMeta {
+  const byId = new Map(threads.map((t) => [t.id, t]));
+  let cur = thread;
+  const seen = new Set<string>([cur.id]);
+  while (cur.parentThreadId) {
+    const parent = byId.get(cur.parentThreadId);
+    if (!parent || seen.has(parent.id)) break;
+    cur = parent;
+    seen.add(cur.id);
+  }
+  return cur;
+}
+
+/**
  * Fire 任务链与 /stage 链在侧栏只显示根会话，但用户真正关心的是当前进行到的阶段：
  * 点击时优先直达链上有未读的阶段会话（多个取最早创建的），其次正在运行的
  * （多个取最新创建的），都没有时回退到最新创建的阶段会话，

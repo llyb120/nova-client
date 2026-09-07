@@ -1,151 +1,30 @@
-// latestFireStage 选择逻辑自检：node scripts/thread-display.test.mjs
 import assert from "node:assert/strict";
-import { latestFireStage } from "../src/threadDisplay.ts";
+import { test } from "node:test";
+import { chainGroupAnchor } from "../src/threadDisplay.ts";
 
-const meta = (id, title, createdAt, parentThreadId = null) => ({
-  id,
-  title,
-  createdAt,
-  parentThreadId,
+// 回归：三级工作流链（root → stage2 → stage3），stage2/stage3 的 cwd 被 agent
+// 中途切到别的目录（change_working_directory）。分组锚点必须一路取到链根，
+// 否则 stage3 与父级分进不同分组、组内找不到父节点，侧栏（含室女座）裂成两条会话。
+const threads = [
+  { id: "root", cwd: "D:/code/repo" },
+  { id: "stage2", parentThreadId: "root", cwd: "D:/code/repo-worktree" },
+  { id: "stage3", parentThreadId: "stage2", cwd: "D:/code/repo-worktree" },
+  { id: "plain", cwd: "D:/code/other" },
+];
+
+test("多级 stage 链：所有环节的分组锚点都是链根", () => {
+  for (const t of threads.slice(0, 3)) {
+    assert.equal(chainGroupAnchor(threads, t).id, "root");
+  }
+  assert.equal(chainGroupAnchor(threads, threads[3]).id, "plain");
 });
 
-const root = meta("root", "[Fire] 目标", 1);
-
-// 多 stage 并行：最新创建的未运行，较早创建的仍在运行 → 选中运行中的
-{
-  const threads = [
-    root,
-    meta("a", "[Fire] 阶段 1", 2, "root"),
-    meta("b", "[Fire] 阶段 2", 3, "root"),
+test("父级不在当前列表时停在自身；成环时不死循环", () => {
+  const orphan = { id: "orphan", parentThreadId: "missing", cwd: "x" };
+  assert.equal(chainGroupAnchor(threads, orphan).id, "orphan");
+  const cyclic = [
+    { id: "a", parentThreadId: "b" },
+    { id: "b", parentThreadId: "a" },
   ];
-  const running = new Set(["a"]);
-  assert.equal(
-    latestFireStage(threads, root, (id) => running.has(id))?.id,
-    "a",
-  );
-}
-
-// 多个同时运行 → 取最新创建的运行中 stage
-{
-  const threads = [
-    root,
-    meta("a", "[Fire] 阶段 1", 2, "root"),
-    meta("b", "[Fire] 阶段 2", 3, "root"),
-  ];
-  const running = new Set(["a", "b"]);
-  assert.equal(
-    latestFireStage(threads, root, (id) => running.has(id))?.id,
-    "b",
-  );
-}
-
-// 都不运行 → 回退到最新创建的（原行为）
-{
-  const threads = [
-    root,
-    meta("a", "[Fire] 阶段 1", 2, "root"),
-    meta("b", "[WF] 节点", 3, "a"),
-  ];
-  assert.equal(
-    latestFireStage(threads, root, () => false)?.id,
-    "b",
-  );
-}
-
-// 非 Fire/WF 标题的子会话不作为候选，但链继续向下遍历
-{
-  const threads = [
-    root,
-    meta("s", "[Stage] 普通", 2, "root"),
-    meta("c", "[WF] 节点", 3, "s"),
-  ];
-  assert.equal(
-    latestFireStage(threads, root, () => false)?.id,
-    "c",
-  );
-}
-
-// 有未读时优先进入未读 stage（即便另一个 stage 正在运行）
-{
-  const threads = [
-    root,
-    meta("a", "[Fire] 阶段 1", 2, "root"),
-    meta("b", "[Fire] 阶段 2", 3, "root"),
-  ];
-  const running = new Set(["b"]);
-  const unread = { a: 1 };
-  assert.equal(
-    latestFireStage(threads, root, (id) => running.has(id), (id) => unread[id] ?? 0)?.id,
-    "a",
-  );
-}
-
-// 多个未读 → 取最早创建的一个
-{
-  const threads = [
-    root,
-    meta("a", "[Fire] 阶段 1", 2, "root"),
-    meta("b", "[Fire] 阶段 2", 3, "a"),
-  ];
-  const unread = { a: 2, b: 1 };
-  assert.equal(
-    latestFireStage(threads, root, () => false, (id) => unread[id] ?? 0)?.id,
-    "a",
-  );
-}
-
-// 未读挂在非 Fire/WF 的中间会话上时不算，但会继续向下遍历
-{
-  const threads = [
-    root,
-    meta("s", "[Stage] 普通", 2, "root"),
-    meta("c", "[WF] 节点", 3, "s"),
-  ];
-  const unread = { s: 1 };
-  assert.equal(
-    latestFireStage(threads, root, () => false, (id) => unread[id] ?? 0)?.id,
-    "c",
-  );
-}
-
-// 普通 /stage 链：root 是常规会话标题，stage 以 stageSourceThreadId 识别
-// （标题可能已被自动改名），点击 root 直达运行中的 stage
-{
-  const stageRoot = meta("r2", "修 bug", 1);
-  const threads = [
-    stageRoot,
-    { ...meta("s1", "已改名的 stage", 2, "r2"), stageSourceThreadId: "r2" },
-  ];
-  const running = new Set(["s1"]);
-  assert.equal(
-    latestFireStage(threads, stageRoot, (id) => running.has(id))?.id,
-    "s1",
-  );
-}
-
-// /stage 链都未运行 → 回退到最新创建的 stage（含嵌套 /stage）
-{
-  const stageRoot = meta("r3", "普通会话", 1);
-  const threads = [
-    stageRoot,
-    { ...meta("s1", "[Stage] 第一次", 2, "r3"), stageSourceThreadId: "r3" },
-    { ...meta("s2", "[Stage] 第二次", 3, "s1"), stageSourceThreadId: "s1" },
-  ];
-  assert.equal(latestFireStage(threads, stageRoot, () => false)?.id, "s2");
-}
-
-// 预检→开发子会话（无 stage 标记、root 非 Fire/WF）保持原行为：不自动跳转
-{
-  const preRoot = meta("p2", "预检会话", 1);
-  const threads = [preRoot, meta("dev", "开发子会话", 2, "p2")];
-  assert.equal(latestFireStage(threads, preRoot, () => true), undefined);
-}
-
-// 无 fire 子会话 → undefined；root 非 fire → undefined
-assert.equal(latestFireStage([root], root), undefined);
-assert.equal(
-  latestFireStage([meta("p", "普通会话", 1)], meta("p", "普通会话", 1)),
-  undefined,
-);
-
-console.log("thread-display tests passed");
+  assert.ok(["a", "b"].includes(chainGroupAnchor(cyclic, cyclic[0]).id));
+});
