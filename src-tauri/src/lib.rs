@@ -39,6 +39,7 @@ mod windows_shell_shim;
 pub const SCRATCH_MARK: &str = "Nova-scratch";
 /// Native global shortcut event for creating a new session.
 const EV_NEW_SESSION_SHORTCUT: &str = "session-shortcut:new-session";
+const EV_OPEN_UNREAD_SHORTCUT: &str = "session-shortcut:open-unread";
 
 pub use path_env::init_process_path;
 pub use server::configure_from_args as configure_server_mode;
@@ -802,7 +803,7 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
         settings
             .session_shortcuts
             .iter()
-            .filter(|shortcut| shortcut.action == "newSession")
+            .filter(|shortcut| matches!(shortcut.action.as_str(), "newSession" | "openUnread"))
             .filter_map(|shortcut| {
                 let keys = normalize_global_shortcut(&shortcut.keys);
                 if keys.is_empty() || !seen.insert(keys.to_ascii_lowercase()) {
@@ -815,7 +816,7 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
                         return None;
                     }
                 };
-                Some(parsed)
+                Some((parsed, shortcut.action.clone()))
             })
             .collect::<Vec<_>>()
     };
@@ -823,11 +824,11 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
     if shortcuts.is_empty() {
         return;
     }
-    for shortcut in shortcuts {
+    for (shortcut, action) in shortcuts {
         let label = shortcut.to_string();
         if let Err(error) = app
             .global_shortcut()
-            .on_shortcut(shortcut, |app, _shortcut, event| {
+            .on_shortcut(shortcut, move |app, _shortcut, event| {
                 if event.state == ShortcutState::Pressed {
                     // A global shortcut is often used while Nova is behind another window or
                     // minimized. Bring it back before delivering the event so the user can see
@@ -840,13 +841,18 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
                         let _ = window.unminimize();
                         let _ = window.set_focus();
                     }
-                    let _ = app.emit(EV_NEW_SESSION_SHORTCUT, ());
+                    let name = if action == "openUnread" {
+                        EV_OPEN_UNREAD_SHORTCUT
+                    } else {
+                        EV_NEW_SESSION_SHORTCUT
+                    };
+                    let _ = app.emit(name, ());
                 }
             })
         {
-            eprintln!("[shortcut] 注册新建会话全局快捷键失败（{label}）：{error}");
+            eprintln!("[shortcut] 注册全局快捷键失败（{label}）：{error}");
         } else {
-            eprintln!("[shortcut] 已注册新建会话全局快捷键：{label}");
+            eprintln!("[shortcut] 已注册全局快捷键：{label}");
         }
     }
 }

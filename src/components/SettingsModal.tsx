@@ -530,7 +530,9 @@ export function SettingsModal(props: { onClose: () => void }) {
             ? "selectProject"
             : item.action === "newSession"
               ? "newSession"
-              : item.action === "insertText"
+              : item.action === "openUnread"
+                ? "openUnread"
+                : item.action === "insertText"
                 ? "insertText"
                 : item.action === "selectWorkflow"
                   ? "selectWorkflow"
@@ -540,7 +542,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       .filter((item) => {
         if (!item.keys) return false;
         if (item.action === "stopSession") return false;
-        if (item.action === "newSession") return true;
+        if (item.action === "newSession" || item.action === "openUnread") return true;
         return item.target.length > 0;
       });
 
@@ -1221,7 +1223,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型/工作流、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与终止回合有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。默认 Esc 终止当前回合。
+                      一键切换项目/模型/工作流、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与终止回合有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发。默认 Esc 终止当前回合。
                     </div>
                   </div>
                   <button
@@ -1265,7 +1267,9 @@ export function SettingsModal(props: { onClose: () => void }) {
                                     ? "selectProject"
                                     : action === "newSession"
                                       ? "newSession"
-                                      : action === "insertText"
+                                      : action === "openUnread"
+                                        ? "openUnread"
+                                        : action === "insertText"
                                         ? "insertText"
                                         : action === "selectWorkflow"
                                           ? "selectWorkflow"
@@ -1280,12 +1284,13 @@ export function SettingsModal(props: { onClose: () => void }) {
                               <option value="selectModel">选择模型</option>
                               <option value="selectProject">选择项目</option>
                               <option value="newSession">快速新会话</option>
+                              <option value="openUnread">打开未读消息</option>
                               <option value="selectWorkflow">选择工作流</option>
                               <option value="insertText">快捷输入</option>
                             </select>
                             <div class="session-shortcut-target">
                               <Show
-                                when={item().action === "newSession"}
+                                when={item().action === "newSession" || item().action === "openUnread"}
                                 fallback={
                                   <Show
                                     when={item().action === "insertText"}
@@ -1352,7 +1357,11 @@ export function SettingsModal(props: { onClose: () => void }) {
                                   </Show>
                                 }
                               >
-                                <div class="session-shortcut-target-none">任意页 · 继承当前目录与模型</div>
+                                <div class="session-shortcut-target-none">
+                                  {item().action === "openUnread"
+                                    ? "循环打开有未读轮次的普通会话"
+                                    : "任意页 · 继承当前目录与模型"}
+                                </div>
                               </Show>
                             </div>
                             <button

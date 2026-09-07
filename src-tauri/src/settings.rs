@@ -22,7 +22,7 @@ pub struct SessionShortcut {
     pub id: String,
     /// 规范化按键，如 Ctrl+1 / Alt+P。
     pub keys: String,
-    /// selectProject | selectModel | newSession | insertText
+    /// selectProject | selectModel | newSession | openUnread | insertText | selectWorkflow
     pub action: String,
     /// 项目绝对路径、`<agentKind>:<modelId>` / roam/quota 编码，或 insertText 文本；newSession 可为空。
     pub target: String,

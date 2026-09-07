@@ -16,7 +16,8 @@ import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
 import "./training-ground.css";
 import { selectedChatText } from "./chatSelection";
-import { initStore, openNewSession, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
+import { initStore, openNewSession, openNextUnreadThread, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
+import { mountSessionShortcuts } from "./sessionShortcuts";
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -169,17 +170,24 @@ export default function App() {
 
     // Native global shortcut events also arrive while the WebView is unfocused/minimized.
     let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void listen("session-shortcut:new-session", () => {
-      openNewSession(selectedChatText());
-    }).then((remove) => {
-      if (disposed) remove();
-      else unlisten = remove;
-    });
+    const unlistens: Array<() => void> = [];
+    const onGlobalShortcut = (event: string, handler: () => void) =>
+      void listen(event, handler).then((remove) => {
+        if (disposed) remove();
+        else unlistens.push(remove);
+      });
+    onGlobalShortcut("session-shortcut:new-session", () => openNewSession(selectedChatText()));
+    onGlobalShortcut("session-shortcut:open-unread", () => void openNextUnreadThread());
     onCleanup(() => {
       disposed = true;
-      unlisten?.();
+      for (const unlisten of unlistens) unlisten();
     });
+  });
+
+  // 「打开未读消息」在应用聚焦时的按键处理；全局注册（Rust 侧）覆盖最小化/失焦场景。
+  mountSessionShortcuts({
+    allowedActions: ["openUnread"],
+    onOpenUnread: () => void openNextUnreadThread(),
   });
 
   // 空闲时后端请求更新（update:prompt）→ 自动弹出更新对话框，由用户选择是否现在更新。

@@ -154,6 +154,8 @@ export function mountSessionShortcuts(options: {
     quotaPeer?: { token: string; name: string } | null,
   ) => void;
   onNewSession?: () => void;
+  /** 循环打开普通模式下有未读轮次的会话。 */
+  onOpenUnread?: () => void;
   /** 新会话页选择工作流；工作流已停用或不存在时由调用方提示。 */
   onSelectWorkflow?: (workflowId: string) => void;
   /**
@@ -175,7 +177,7 @@ export function mountSessionShortcuts(options: {
     const hit = findSessionShortcut(event, shortcuts);
     if (!hit?.keys) return;
     if (!allowed.has(hit.action)) return;
-    if (hit.action !== "newSession" && hit.action !== "stopSession" && !hit.target) return;
+    if (hit.action !== "newSession" && hit.action !== "openUnread" && hit.action !== "stopSession" && !hit.target) return;
     // insertText / stopSession 允许无修饰键；其它动作在可编辑区需 Ctrl/Alt/Meta。
     if (
       hit.action !== "insertText" &&
@@ -213,6 +215,12 @@ export function mountSessionShortcuts(options: {
       event.preventDefault();
       event.stopPropagation();
       options.onNewSession?.();
+      return;
+    }
+    if (hit.action === "openUnread") {
+      event.preventDefault();
+      event.stopPropagation();
+      options.onOpenUnread?.();
       return;
     }
     if (hit.action === "selectProject") {

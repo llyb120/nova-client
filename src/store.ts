@@ -61,6 +61,7 @@ import {
   registerTransientWorkflow,
   unregisterTransientWorkflow,
 } from "./workflow/storage";
+import { latestFireStage } from "./threadDisplay";
 import { normalizeGeneratedWorkflow } from "./workflow/types";
 import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
 
@@ -1489,6 +1490,62 @@ export function zenRunningChains(): { hidden: Set<string>; busy: Set<string>; ro
     unfinishedRoots: unfinishedWorkflowRoots(),
     queuedThreads: Object.keys(state.promptQueued),
   });
+}
+
+/** 会话及其子孙（接力链）上的未读总数，与侧栏徽标口径一致。 */
+export function chainUnreadTurns(thread: ThreadMeta | undefined): number {
+  if (!thread) return 0;
+  const ids = new Set<string>([thread.id]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const candidate of state.threads) {
+      if (candidate.parentThreadId && ids.has(candidate.parentThreadId) && !ids.has(candidate.id)) {
+        ids.add(candidate.id);
+        changed = true;
+      }
+    }
+  }
+  return state.threads.reduce(
+    (sum, candidate) => sum + (ids.has(candidate.id) ? (state.unreadTurns[candidate.id] ?? 0) : 0),
+    0,
+  );
+}
+
+/**
+ * 「打开未读消息」快捷键（含全局触发）：循环打开普通模式下有未读轮次的会话链。
+ * 口径与侧栏普通模式列表一致：排除大熊座/双子座会话；减少焦虑模式下排除室女座运行链。
+ */
+export async function openNextUnreadThread(): Promise<void> {
+  const zenMode = !!state.settings?.zenModeEnabled;
+  const hidden = zenRunningChains().hidden;
+  const visible = state.threads.filter(
+    (t) => !t.experienceThread && !t.browserThread && (!zenMode || !hidden.has(t.id)),
+  );
+  const visibleIds = new Set(visible.map((t) => t.id));
+  const unreadRoots = visible.filter(
+    (t) => (!t.parentThreadId || !visibleIds.has(t.parentThreadId)) && chainUnreadTurns(t) > 0,
+  );
+  if (unreadRoots.length === 0) return;
+  // 当前打开的会话在某条未读链上时取下一组，循环轮转；否则从第一组开始
+  const currentIndex = unreadRoots.findIndex((root) => {
+    let node = state.threads.find((t) => t.id === state.currentId);
+    while (node) {
+      if (node.id === root.id) return true;
+      node = state.threads.find((t) => t.id === node?.parentThreadId);
+    }
+    return false;
+  });
+  const root = unreadRoots[(currentIndex + 1) % unreadRoots.length];
+  const target =
+    latestFireStage(
+      state.threads,
+      root,
+      (id) => !!state.running[id],
+      (id) => state.unreadTurns[id] ?? 0,
+    ) ?? root;
+  setView("home");
+  await openThread(target.id);
 }
 /** 发送成功后离开会话详情并播放「提示词飞入室女座」动画；/fire 等内置命令的编排流程不在此列（/stage 在 startStageThread 内自行处理）。 */
 function zenHideAfterSend(text: string) {
