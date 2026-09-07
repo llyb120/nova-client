@@ -233,7 +233,7 @@ async function createStageThread(
     await api.sendPrompt(thread.id, prompt, []);
   } catch (e) {
     // 发送失败：挂起本阶段并收回乐观运行态，避免会话永久停在室女座空转。
-    suspendWorkflow(thread.id, false);
+    suspendWorkflow(thread.id);
     h.setRunning(thread.id, false);
     throw e;
   }
@@ -376,12 +376,24 @@ async function judgeLlmTransition(
   }
 }
 
-function suspendWorkflow(threadId: string, _manual: boolean): void {
+function suspendWorkflow(threadId: string): void {
   const run = activeRuns.get(threadId);
   if (!run) return;
   activeRuns.delete(threadId);
   suspendedRuns.set(threadId, run);
   persistRuns();
+}
+
+/** 用户手动停止工作流回合：视为放弃当前流程，标记完成让整条链移出室女座。
+ *  runHistory 仍保留，用户在链最新会话再发消息时 reattach 会把流程挂回继续。 */
+function finishWorkflow(threadId: string): void {
+  const run = activeRuns.get(threadId);
+  if (!run) return;
+  activeRuns.delete(threadId);
+  pendingManualReviews.delete(threadId);
+  completedRoots.add(run.rootId);
+  persistRuns();
+  setWorkflowReviewRevision((value) => value + 1);
 }
 
 /** turn 开始或用户补充消息时重新挂回流程；返回该 thread 的运行态（非工作流会话返回 null）。 */
@@ -527,12 +539,14 @@ export function handleTurnStart(threadId: string): void {
   reattach(threadId);
 }
 
-/** acp:turn running=false：正常结束则推进，否则暂停。返回是否为本运行时管理的会话。 */
+/** acp:turn running=false：正常结束则推进；手动停止视为放弃流程（移出室女座）；其余异常暂停待补充。 */
 export function handleTurnEnd(threadId: string, stopReason: string | null | undefined): boolean {
   if (!activeRuns.has(threadId)) return false;
   const manual = stopReason === "cancelled" || stopReason === "force_cancelled";
   const normal = stopReason === "end_turn" || stopReason === "max_turn_requests";
-  const action = normal ? advanceWorkflow(threadId) : Promise.resolve(suspendWorkflow(threadId, manual));
+  const action = normal
+    ? advanceWorkflow(threadId)
+    : Promise.resolve(manual ? finishWorkflow(threadId) : suspendWorkflow(threadId));
   void action.catch((error) => console.error("Workflow advance failed", error));
   return true;
 }
@@ -587,7 +601,7 @@ export function isActive(threadId: string): boolean {
 
 /** sendPrompt 失败时由 store 调用，把当前阶段挂起。 */
 export function suspendActive(threadId: string): void {
-  suspendWorkflow(threadId, false);
+  suspendWorkflow(threadId);
 }
 
 /** 某 root 链当前尖端会话（侧栏分组/跳转用）。 */
@@ -621,9 +635,10 @@ export function busyWorkflowRoots(): Set<string> {
 
 /**
  * 尚未走到终点的工作流 root 集合（室女座判定「整条链仍未完成」用）。
- * 除了仍在推进的链，还包含回合被取消/无转移命中而暂停待补充、等待人工审核这些
+ * 除了仍在推进的链，还包含异常收尾/无转移命中而暂停待补充、等待人工审核这些
  * 「后端 running 已经是 false，但流程没跑完」的状态：只按 running 判定的话，
  * refreshThreads 的一份快照就会把没完成的工作流弹回普通列表。
+ * 用户手动停止（cancelled）在 handleTurnEnd 已直接标记完成，不在此列。
  */
 export function unfinishedWorkflowRoots(): Set<string> {
   const roots = busyWorkflowRoots();
