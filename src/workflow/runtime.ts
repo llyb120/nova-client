@@ -249,11 +249,8 @@ async function followTransition(
 ): Promise<void> {
   const h = requireHost();
   if (isTerminal(transition.to)) {
-    completedRoots.add(run.rootId);
+    completeWorkflow(run.rootId);
     unregisterTransientWorkflow(run.workflowId);
-    pendingManualReviews.delete(threadId);
-    persistRuns();
-    setWorkflowReviewRevision((value) => value + 1);
     void api.notifyWorkflowDone(threadId, true).catch(() => {});
     return;
   }
@@ -261,11 +258,8 @@ async function followTransition(
   const next = def.stages.find((candidate) => candidate.id === transition.to);
   if (!next) return;
   if (run.stageCount + 1 > def.maxTotalStages) {
-    completedRoots.add(run.rootId);
+    completeWorkflow(run.rootId);
     unregisterTransientWorkflow(run.workflowId);
-    pendingManualReviews.delete(threadId);
-    persistRuns();
-    setWorkflowReviewRevision((value) => value + 1);
     void api.notifyWorkflowDone(threadId, false).catch(() => {});
     return;
   }
@@ -325,6 +319,9 @@ async function doAdvance(threadId: string, run: WorkflowRunStep): Promise<void> 
     pendingManualReviews.add(threadId);
     persistRuns();
     setWorkflowReviewRevision((value) => value + 1);
+    // 链停在等用户选连线：用户若正停在链上别的阶段，把他带到这个节点，
+    // 否则看不到审核入口，整条链会一直留在室女座出不来。
+    if (isViewingChain(run.rootId)) void h.openThread(threadId);
     return;
   }
 
@@ -343,6 +340,8 @@ async function doAdvance(threadId: string, run: WorkflowRunStep): Promise<void> 
     // 没有任何转移命中：停在当前阶段等用户补充。
     suspendedRuns.set(threadId, run);
     persistRuns();
+    setWorkflowReviewRevision((value) => value + 1);
+    if (isViewingChain(run.rootId)) void h.openThread(threadId);
     return;
   }
 
@@ -384,16 +383,31 @@ function suspendWorkflow(threadId: string): void {
   persistRuns();
 }
 
+/**
+ * 工作流走到终点（正常结束 / 超出阶段上限 / 用户手动停止）。
+ * 除了标记完成，还要清掉这条链在运行时的全部残留：阶段接力空档或中途挂起留下的
+ * active/suspended/待审核条目如果留着，链上一旦再有会话被判成忙碌，整条链就会
+ * 重新落回室女座。runHistory / latestThreadByRoot 保留，供后续查看与续跑。
+ */
+function completeWorkflow(rootId: string): void {
+  completedRoots.add(rootId);
+  advancingRoots.delete(rootId);
+  for (const [id, run] of [...activeRuns]) if (run.rootId === rootId) activeRuns.delete(id);
+  for (const [id, run] of [...suspendedRuns]) if (run.rootId === rootId) suspendedRuns.delete(id);
+  for (const id of [...pendingManualReviews]) {
+    const run = runHistory.get(id);
+    if (!run || run.rootId === rootId) pendingManualReviews.delete(id);
+  }
+  persistRuns();
+  setWorkflowReviewRevision((value) => value + 1);
+}
+
 /** 用户手动停止工作流回合：视为放弃当前流程，标记完成让整条链移出室女座。
  *  runHistory 仍保留，用户在链最新会话再发消息时 reattach 会把流程挂回继续。 */
 function finishWorkflow(threadId: string): void {
   const run = activeRuns.get(threadId);
   if (!run) return;
-  activeRuns.delete(threadId);
-  pendingManualReviews.delete(threadId);
-  completedRoots.add(run.rootId);
-  persistRuns();
-  setWorkflowReviewRevision((value) => value + 1);
+  completeWorkflow(run.rootId);
 }
 
 /** turn 开始或用户补充消息时重新挂回流程；返回该 thread 的运行态（非工作流会话返回 null）。 */
@@ -539,9 +553,20 @@ export function handleTurnStart(threadId: string): void {
   reattach(threadId);
 }
 
+/**
+ * 回合已经真正跑起来之后发送链路才失败（IPC 超时、晚到的错误等）时，阶段已被
+ * suspendWorkflow 挂起，运行态不在 activeRuns 里；这一轮收尾必须重新挂回并继续
+ * 推进，否则整条链会永远停在室女座里等一次不会出现的用户输入。
+ * 等待人工审核的会话不在此列：连线要由用户明确选择。
+ */
+function resumeSuspendedStage(threadId: string): boolean {
+  if (!suspendedRuns.has(threadId) || pendingManualReviews.has(threadId)) return false;
+  return !!reattach(threadId);
+}
+
 /** acp:turn running=false：正常结束则推进；手动停止视为放弃流程（移出室女座）；其余异常暂停待补充。 */
 export function handleTurnEnd(threadId: string, stopReason: string | null | undefined): boolean {
-  if (!activeRuns.has(threadId)) return false;
+  if (!activeRuns.has(threadId) && !resumeSuspendedStage(threadId)) return false;
   const manual = stopReason === "cancelled" || stopReason === "force_cancelled";
   const normal = stopReason === "end_turn" || stopReason === "max_turn_requests";
   const action = normal

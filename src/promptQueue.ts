@@ -169,9 +169,12 @@ function startPromptQueueDispatcher() {
     // 不会在普通列表闪一下再回来。挂起的队列不占位（用户已主动停下，会话回到普通列表）。
     createEffect(() => {
       const held = queueHeldThreadIds();
+      // 发送失败的条目不会再自动投递，不能继续占着「有待发条目」的位：否则它所在的
+      // 任务链会被永久留在室女座（unfinished 只认队列里有待发条目的会话）。
+      const failed = failedQueueIds();
       const ids = new Set<string>();
       for (const item of queuedPrompts()) {
-        if (!held.has(item.threadId)) ids.add(item.threadId);
+        if (!held.has(item.threadId) && !failed.has(item.id)) ids.add(item.threadId);
       }
       setPromptQueuedThreads(ids);
     });
