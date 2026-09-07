@@ -554,6 +554,8 @@ pub(crate) fn detect_thinking_format(
     } else if id.contains("api.z.ai") || id.contains("open.bigmodel.cn") {
         Some("zai".into())
     } else {
+        // opencode 不做域名推断：只有显式写 thinking_format: "opencode" 才附加路由头，
+        // 避免同名中转/自建端点被误判后多发出 x-opencode-session。
         None
     }
 }
@@ -767,6 +769,41 @@ mod tests {
         assert!(target.reasoning);
     }
 
+    #[test]
+    fn opencode_thinking_format_requires_explicit_option() {
+        let config = json!({
+            "provider": {
+                "opencode": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "https://api.opencode.ai/v1",
+                        "apiKey": "sk-test"
+                    },
+                    "models": { "gpt": { "reasoning": true } }
+                }
+            }
+        });
+        // 域名含 opencode 也不自动推断，避免误判后多发出 x-opencode-session。
+        let target = resolve_target(&config, "opencode/gpt", &HashMap::new()).unwrap();
+        assert_eq!(target.thinking_format, None);
+
+        let explicit = json!({
+            "provider": {
+                "opencode": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "https://api.opencode.ai/v1",
+                        "apiKey": "sk-test",
+                        "thinking_format": "opencode"
+                    },
+                    "models": { "gpt": { "reasoning": true } }
+                }
+            }
+        });
+        let target = resolve_target(&explicit, "opencode/gpt", &HashMap::new()).unwrap();
+        // 显式声明后 provider 侧自动附加 x-opencode-session 路由头。
+        assert_eq!(target.thinking_format.as_deref(), Some("opencode"));
+    }
 
     #[test]
     fn extracts_completions_message_text() {

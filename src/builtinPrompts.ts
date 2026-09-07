@@ -69,6 +69,7 @@ export function buildIntegrateModelPrompt(goal: string): string {
   - \`"zai"\` / \`"deepseek"\`：发 \`thinking: {type}\`，同时发顶层 \`reasoning_effort\` 控制深度；
   - \`"qwen"\`：发顶层 \`enable_thinking\`，中转普遍同时收 \`reasoning_effort\`（默认也发，官方 DashScope 只认 \`thinking_budget\` 时配 \`supportsReasoningEffort: false\` 关掉）；
   - \`"kimi"\`：只发顶层 \`reasoning_effort\`，**绝不发 \`thinking\` 对象**（K3 官方明确禁止）；
+  - \`"opencode"\`：opencode 网关（Console Go / Zen），只发顶层 \`reasoning_effort\`，并自动按会话附加 \`x-opencode-session\` 路由头（缺头会 400）；**必须显式写这个值才会启用**，不会按域名自动识别。
   - 不设时按域名自动识别（deepseek / api.z.ai / open.bigmodel.cn），识别不到则等同 \`"kimi"\` 只发 effort；纯 OpenAI 端点保持不设。
 - \`supportsReasoningEffort\`（默认 true）：是否在上述思考字段之外同时发顶层 \`reasoning_effort\` 控制深度；仅当端点明确不支持时设为 false。
 - \`clearThinking\`（布尔，默认不下发、由端点决定）：仅 GLM 系（thinking_format=zai）需要时才配——\`false\` 开启 Preserved Thinking（保留历史思维链，代码自动回传 reasoning_content），\`true\` 强制清除省 token。其他厂商协议不同（Kimi 用 preserve_thinking / thinking.keep），不要套用。

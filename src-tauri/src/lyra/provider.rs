@@ -491,6 +491,22 @@ async fn send_request(
     }
 }
 
+/// opencode 网关（Console Go / Zen）要求带 x-opencode-session 才能高效路由，缺失直接
+/// 400 MissingSessionID；会话 id 由客户端按会话生成，无需配置，且晚于自定义头下发。
+fn apply_opencode_session_header(
+    request: reqwest::RequestBuilder,
+    model: &ResolvedModel,
+    session_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if model.thinking_format.as_deref() != Some("opencode") {
+        return request;
+    }
+    match session_id {
+        Some(session) => request.header("x-opencode-session", session),
+        None => request,
+    }
+}
+
 async fn post_stream(
     http: &reqwest::Client,
     url: &str,
@@ -513,6 +529,7 @@ async fn post_stream(
             request = request.header(key.as_str(), text);
         }
     }
+    request = apply_opencode_session_header(request, model, session_id);
     if model.session_affinity_headers {
         if let Some(session) = session_id {
             // openrouter 只发 x-session-id；其余发 session_id（openai 格式）
@@ -1119,7 +1136,7 @@ async fn stream_chat_once(
         }
         "anthropic-messages" => {
             let body = anthropic_body(model, system_prompt, messages, tools, thinking_level);
-            stream_anthropic(http, model, api_key, body, cancel, on_event).await
+            stream_anthropic(http, model, api_key, body, session_id, cancel, on_event).await
         }
         other => Err(format!("Lyra 暂不支持协议 {other}")),
     }
@@ -1430,6 +1447,7 @@ async fn stream_anthropic(
     model: &ResolvedModel,
     api_key: &str,
     body: Value,
+    session_id: Option<&str>,
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
@@ -1471,6 +1489,7 @@ async fn stream_anthropic(
             request = request.header(key.as_str(), text);
         }
     }
+    request = apply_opencode_session_header(request, model, session_id);
     let mut response = send_request(request, cancel).await?;
     let status = response.status();
     if !status.is_success() {
@@ -1691,6 +1710,45 @@ mod tests {
         );
         assert!(!is_retryable_stream_error("HTTP 401 Unauthorized"));
         assert!(!is_retryable_stream_error("provider 错误：invalid request"));
+    }
+
+    #[tokio::test]
+    async fn opencode_format_sends_session_routing_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: [DONE]\r\n\r\n")
+                .await;
+            String::from_utf8_lossy(&head).to_string()
+        });
+        let mut model = test_model("openai-completions");
+        model.thinking_format = Some("opencode".into());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = post_stream(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/v1/chat/completions"),
+            &model,
+            "key",
+            Some("lyra-abc-1"),
+            json!({ "model": "m" }),
+            &cancel,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        let head = server.await.unwrap().to_lowercase();
+        assert!(head.contains("x-opencode-session: lyra-abc-1"), "{head}");
     }
 
     #[test]
