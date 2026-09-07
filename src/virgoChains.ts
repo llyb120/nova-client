@@ -1,10 +1,12 @@
 /**
  * 室女座（减少焦虑）任务链归属计算：纯函数，便于脱离 Solid/Tauri 单测。
  * 这里判定的两套口径必须分开：
- * - hidden：整条链是否留在室女座（工作流没走到终点就一直在，哪怕这一瞬没人 running）。
+ * - hidden：整条链是否留在室女座（工作流没走到终点、或提示词队列还有待发条目就一直在，
+ *   哪怕这一瞬没人 running）。
  * - busy：链上是否有推进中的阶段（回合在跑或阶段接力空档），refreshThreads 据此
  *   决定「后端快照 running=false」能不能冲掉前端已有的忙碌态。
- * 只按 running 判定会让未完成的工作流在室女座与普通列表之间来回闪。
+ * 只按 running 判定会让未完成的工作流在室女座与普通列表之间来回闪；
+ * 回合结束到队列自动投递下一条之间的空档同理。
  */
 export type VirgoChainInput = {
   threads: { id: string; parentThreadId?: string | null }[];
@@ -14,6 +16,8 @@ export type VirgoChainInput = {
   advancingRoots: Iterable<string>;
   /** 尚未走到终点的工作流 root（含暂停待补充、等待人工审核）。 */
   unfinishedRoots: Iterable<string>;
+  /** 提示词队列仍有待发条目（未挂起）的会话：接力空档保持归属，但不算在跑、不锁忙碌态。 */
+  queuedThreads: Iterable<string>;
 };
 
 export function virgoChains(input: VirgoChainInput): {
@@ -42,6 +46,8 @@ export function virgoChains(input: VirgoChainInput): {
   for (const root of input.advancingRoots) advancing.add(resolve(root));
   const unfinished = new Set<string>(advancing);
   for (const root of input.unfinishedRoots) unfinished.add(resolve(root));
+  // 队列待发条目只保归属：计为未完成，但不计入运行中任务数、不撑忙碌态。
+  for (const id of input.queuedThreads) unfinished.add(resolve(id));
 
   // 运行中任务数：本回合在跑的链 + 工作流推进中的链（阶段接力空档也算在跑）。
   const runningRoots = new Set<string>(advancing);

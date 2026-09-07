@@ -153,6 +153,8 @@ interface AppStore {
   /** 各会话未读新轮次结论数：每次轮次正常结束且该会话非当前打开则 +1，stage 链各自累计 */
   unreadTurns: Record<string, number>;
   running: Record<string, boolean>;
+  /** 提示词队列仍有待发条目（未挂起）的会话；接力空档保持室女座归属，由 promptQueue 镜像。 */
+  promptQueued: Record<string, boolean>;
   permissions: PermissionRequest[];
   connected: boolean;
   agent: Status["agent"];
@@ -215,6 +217,7 @@ export const [state, setState] = createStore<AppStore>({
   reasoningEffort: "",
   roamingPeer: null,
   running: {},
+  promptQueued: {},
   permissions: [],
   connected: false,
   agent: null,
@@ -1256,6 +1259,15 @@ export function setUnreadTurns(id: string, count: number) {
   });
 }
 
+/** promptQueue 镜像过来的队列占位；内容不变时不写，避免室女座归属 memo 空转。 */
+export function setPromptQueuedThreads(ids: ReadonlySet<string>) {
+  const cur = state.promptQueued;
+  if (Object.keys(cur).length === ids.size && [...ids].every((id) => cur[id])) return;
+  const next: Record<string, boolean> = {};
+  for (const id of ids) next[id] = true;
+  setState("promptQueued", next);
+}
+
 export async function openThread(id: string) {
   if (state.unreadTurns[id]) setUnreadTurns(id, 0);
   const switching = state.currentId !== id;
@@ -1475,6 +1487,7 @@ export function zenRunningChains(): { hidden: Set<string>; busy: Set<string>; ro
     isRunning: (id) => !!state.running[id],
     advancingRoots: busyWorkflowRoots(),
     unfinishedRoots: unfinishedWorkflowRoots(),
+    queuedThreads: Object.keys(state.promptQueued),
   });
 }
 /** 发送成功后离开会话详情并播放「提示词飞入室女座」动画；/fire 等内置命令的编排流程不在此列（/stage 在 startStageThread 内自行处理）。 */

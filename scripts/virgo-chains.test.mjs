@@ -13,6 +13,7 @@ const run = (over = {}) =>
     isRunning: () => false,
     advancingRoots: [],
     unfinishedRoots: [],
+    queuedThreads: [],
     ...over,
   });
 
@@ -42,6 +43,18 @@ test("busy 只认工作流推进态：假忙碌的普通会话能被后端快照
   assert.equal(r.busy.size, 0);
 });
 
+test("提示词队列待发：接力空档留在室女座，但不算在跑、不锁忙碌态", () => {
+  const r = run({ queuedThreads: ["plain"] });
+  assert.deepEqual([...r.hidden], ["plain"]);
+  assert.equal(r.rootCount, 0);
+  assert.equal(r.busy.size, 0);
+  // 队列条目在子会话上时，整条链都保持归属。
+  const chained = run({ queuedThreads: ["stage2"] });
+  assert.deepEqual([...chained.hidden].sort(), ["root", "stage2"]);
+  // 队列清空即回到普通列表。
+  assert.equal(run().hidden.size, 0);
+});
+
 test("parentThreadId 成环或指向链外会话时不死循环", () => {
   const cyclic = [
     { id: "a", parentThreadId: "b" },
@@ -53,6 +66,7 @@ test("parentThreadId 成环或指向链外会话时不死循环", () => {
     isRunning: () => false,
     advancingRoots: [],
     unfinishedRoots: ["c"],
+    queuedThreads: [],
   });
   // c 的父会话不在列表里 → 自己就是根；a/b 成环不会把整条链扫进空。
   assert.deepEqual([...r.hidden], ["c"]);
