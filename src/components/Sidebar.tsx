@@ -10,6 +10,7 @@ import {
   closeThread,
   deleteProjectThreads,
   deleteThread,
+  liveWorkflowStage,
   markThreadSwitchPointerDown,
   openNewSession,
   openThread,
@@ -433,6 +434,8 @@ export function Sidebar(props: {
         onPointerDown={() => markThreadSwitchPointerDown()}
         onClick={() =>
           void openHistoryThread(
+            // 工作流链：直接用运行时记录的链尖，接力空档/等待补充时也不会落到旧阶段。
+            liveWorkflowStage(t.id) ??
             latestFireStage(
               state.threads,
               activeThread(),

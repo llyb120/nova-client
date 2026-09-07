@@ -53,6 +53,7 @@ import {
   startWorkflow,
   suspendActive as suspendWorkflowActive,
   unfinishedWorkflowRoots,
+  workflowChainTip,
   workflowReviewRevision,
 } from "./workflow/runtime";
 import {
@@ -1497,6 +1498,18 @@ export function zenRunningChains(): { hidden: Set<string>; busy: Set<string>; ro
     unfinishedRoots: unfinishedWorkflowRoots(),
     queuedThreads: Object.keys(state.promptQueued),
   });
+}
+
+/**
+ * 未完成的工作流链当前进行到的阶段会话（链尖），不存在时返回 undefined。
+ * 点击任务链时优先用它：latestFireStage 只能按「谁在 running / 谁有未读」猜，
+ * 阶段接力空档和等待补充/审核时会落到已结束的旧阶段。
+ */
+export function liveWorkflowStage(rootId: string): string | undefined {
+  workflowReviewRevision();
+  const tip = workflowChainTip(rootId);
+  if (!tip) return undefined;
+  return state.threads.some((thread) => thread.id === tip) ? tip : undefined;
 }
 
 /** 会话及其子孙（接力链）上的未读总数，与侧栏徽标口径一致。 */

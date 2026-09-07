@@ -634,6 +634,18 @@ export function latestStageThread(rootId: string): string | undefined {
   return latestThreadByRoot.get(rootId);
 }
 
+/**
+ * 尚未走到终点的工作流链，返回它当前进行到的阶段会话（链尖）。
+ * 侧栏/首页点击任务链时用它直达运行中的阶段：只看「谁在 running + 谁有未读」会在
+ * 阶段接力空档和等待用户补充/审核时落回已结束的旧阶段，用户看不到当前节点，
+ * 流程也就一直停在室女座走不下去。已完成的链返回 undefined，交回通用阶段导航。
+ */
+export function workflowChainTip(rootId: string): string | undefined {
+  if (completedRoots.has(rootId)) return undefined;
+  const tip = latestThreadByRoot.get(rootId);
+  return tip === rootId ? undefined : tip;
+}
+
 export function isWorkflowThread(threadId: string): boolean {
   return activeRuns.has(threadId) || suspendedRuns.has(threadId) || runHistory.has(threadId);
 }

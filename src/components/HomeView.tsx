@@ -21,6 +21,7 @@ import {
   ensurePeerBranches,
   ensurePeerModels,
   lastUsed,
+  liveWorkflowStage,
   peerBranchKey,
   modelChoices,
   openThread,
@@ -1250,6 +1251,7 @@ export function HomeView() {
                   onClick={() =>
                     void openThread(
                       // 与侧栏同口径：任务链运行中时直达当前进行到的阶段，而不是回到根会话。
+                      liveWorkflowStage(t.id) ??
                       latestFireStage(
                         state.threads,
                         t,
