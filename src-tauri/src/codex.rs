@@ -2,6 +2,7 @@ use crate::acp::{
     EV_LOG, EV_NOTIFY_OPEN, EV_OPTIONS, EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS, EV_TURN,
     EV_UPDATE,
 };
+use crate::lyra::{is_retryable_provider_error, PROVIDER_RETRY_DELAYS_MS};
 use crate::model_cache;
 use crate::nova_data_dir;
 use crate::settings::Settings;
@@ -1784,9 +1785,49 @@ impl CodexManager {
         self.clear_plan(&thread_id);
         self.set_running(&thread_id, true, None);
 
-        let outcome = self
+        // 开轮前的条目数：轮次失败只在「什么都没产出」时才自动重发，已有部分输出则保留。
+        let items_before = {
+            let state = self.app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            store.get(&thread_id).map(|t| t.items.len()).unwrap_or(0)
+        };
+        let mut outcome = self
             .drive_prompt(&thread_id, &text, &images, handoff.as_deref())
             .await;
+        // 云端连接类瞬时失败（如 "Connection error, send a message to continue retrying"）
+        // 静默重发整轮，代替提示用户手动发消息重试。
+        for retry in 1..=PROVIDER_RETRY_DELAYS_MS.len() {
+            let retriable = match &outcome {
+                Ok(o) => o
+                    .error
+                    .as_deref()
+                    .map(is_retryable_provider_error)
+                    .unwrap_or(false),
+                Err(e) => is_retryable_provider_error(e),
+            };
+            if !retriable || !self.is_running(&thread_id) {
+                break;
+            }
+            let produced = {
+                let state = self.app.state::<AppState>();
+                let store = state.store.lock().unwrap();
+                store
+                    .get(&thread_id)
+                    .map(|t| t.items.len() > items_before)
+                    .unwrap_or(false)
+            };
+            if produced {
+                break;
+            }
+            let delay = PROVIDER_RETRY_DELAYS_MS[retry - 1];
+            self.push_log(format!(
+                "[nova] Codex 轮次瞬时失败，{delay}ms 后静默重发（第{retry}次）"
+            ));
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            outcome = self
+                .drive_prompt(&thread_id, &text, &images, handoff.as_deref())
+                .await;
+        }
         if !self.is_running(&thread_id) {
             return;
         }

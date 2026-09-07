@@ -3857,6 +3857,9 @@ mod codebuddy_acp_tests {
         // 假死与云端瞬时抖动是两种恢复策略：前者必须换连接，后者原连接退避重发。
         assert!(!is_retriable_rpc_error(&error));
         assert!(is_retriable_rpc_error("RetriableError: Connection stalled"));
+        assert!(is_retriable_rpc_error(
+            "Connection error, send a message to continue retrying"
+        ));
         assert_eq!(
             PromptFailure::Stalled(error.clone()).into_message(),
             error.clone()
@@ -4097,6 +4100,9 @@ fn is_retriable_rpc_error(err: &str) -> bool {
     lower.contains("retriable")
         || lower.contains("ping timed out")
         || lower.contains("connection stalled")
+        // agent 上游模型连接失败的原始文案（如 "Connection error, send a message to
+        // continue retrying"）：会话仍存活，原连接退避重发即可，无需用户手动重发
+        || lower.contains("connection error")
         || lower.contains("[unavailable]")
         || lower.contains("econnreset")
         || lower.contains("etimedout")
