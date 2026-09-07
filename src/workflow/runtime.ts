@@ -602,6 +602,32 @@ export function manualWorkflowReview(threadId: string): ManualWorkflowReview | n
   };
 }
 
+/**
+ * 「暂停待补充」提示：路由没命中下一跳、或回合异常收尾时流程会挂在 suspendedRuns，
+ * 而这一状态没有任何其它界面痕迹——会话静静留在室女座，用户既不知道要补一条消息，
+ * 也没有出口。等待人工审核的链有独立的连线选择器，不在此列。
+ */
+export function workflowSuspendedNotice(threadId: string): { stageName: string } | null {
+  if (pendingManualReviews.has(threadId)) return null;
+  const run = suspendedRuns.get(threadId);
+  if (!run || completedRoots.has(run.rootId)) return null;
+  const stage = getWorkflow(run.workflowId)?.stages.find((candidate) => candidate.id === run.stageId);
+  return { stageName: stage?.name ?? run.stageId };
+}
+
+/**
+ * 用户主动结束流程，把整条链移出室女座。
+ * finishWorkflow 只认 activeRuns，对已挂起的链是空操作——这正是「停住就出不去」：
+ * 暂停待补充或等待审核时按停止，completeWorkflow 永远不会被调用。
+ */
+export function abandonWorkflow(threadId: string): boolean {
+  const run =
+    activeRuns.get(threadId) ?? suspendedRuns.get(threadId) ?? runHistory.get(threadId);
+  if (!run || completedRoots.has(run.rootId)) return false;
+  completeWorkflow(run.rootId);
+  return true;
+}
+
 export async function chooseManualWorkflowTransition(
   threadId: string,
   transitionId: string,

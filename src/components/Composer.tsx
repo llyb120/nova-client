@@ -39,9 +39,11 @@ import {
 import type { AgentKind, PromptImage } from "../types";
 import { agentLabel } from "../utils";
 import {
+  abandonWorkflow,
   chooseManualWorkflowTransition,
   manualWorkflowReview,
   workflowReviewRevision,
+  workflowSuspendedNotice,
 } from "../workflow/runtime";
 import { ConfigSelects } from "./ConfigSelects";
 import { ExclusiveChatMark } from "./ExclusiveChatMark";
@@ -570,6 +572,16 @@ export function Composer() {
     return state.currentId ? manualWorkflowReview(state.currentId) : null;
   });
 
+  const suspendedNotice = createMemo(() => {
+    workflowReviewRevision();
+    return state.currentId ? workflowSuspendedNotice(state.currentId) : null;
+  });
+
+  const abandonWorkflowChain = () => {
+    const threadId = state.currentId;
+    if (threadId) abandonWorkflow(threadId);
+  };
+
   const chooseWorkflowRoute = async (transitionId: string) => {
     const threadId = state.currentId;
     if (!threadId || choosingWorkflowRoute()) return;
@@ -642,6 +654,21 @@ export function Composer() {
                   </button>
                 )}
               </For>
+            </div>
+          </div>
+        )}
+      </Show>
+      <Show when={suspendedNotice()}>
+        {(notice) => (
+          <div class="workflow-manual-review">
+            <div class="workflow-manual-review-head">
+              <strong>工作流已暂停</strong>
+              <span>「{notice().stageName}」没判定出下一步，直接发消息可继续</span>
+            </div>
+            <div class="workflow-manual-review-actions">
+              <button type="button" class="btn secondary small" onClick={abandonWorkflowChain}>
+                结束流程并移出室女座
+              </button>
             </div>
           </div>
         )}
