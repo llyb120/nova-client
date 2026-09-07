@@ -12,7 +12,6 @@ import {
   markThreadSwitchPointerDown,
   openNewSession,
   openThread,
-  outputRates,
   setUnreadTurns,
   setTrainingProject,
   setView,
@@ -38,7 +37,6 @@ import {
   IconTrophy,
   IconX,
 } from "./icons";
-import { TitleBounce } from "./TitleBounce";
 import { TypewriterText } from "./TypewriterText";
 
 const COLLAPSED_THREAD_LIMIT = 5;
@@ -439,9 +437,6 @@ export function Sidebar(props: {
         : chainThreads().reduce((sum, thread) => sum + (state.unreadTurns[thread.id] ?? 0), 0);
     const active = () => !!state.currentId && chainThreads().some((thread) => thread.id === state.currentId);
     const title = () => props.mergedChild?.title ?? t.title;
-    // 跳动速度跟整条链里输出最快的那个会话（工作流阶段接力时速率不闪断）
-    const bounceRate = () =>
-      chainThreads().reduce((m, thread) => Math.max(m, outputRates()[thread.id] ?? 0), 0);
     const updatedAt = () => Math.max(...chainThreads().map((thread) => thread.updatedAt));
     return (
       <div
@@ -518,21 +513,12 @@ export function Sidebar(props: {
           </span>
         </Show>
         <span class="thread-content">
-          <Show when={running()} fallback={
-            <TypewriterText
-              class="thread-title"
-              text={title()}
-              title={title()}
-              animate={state.titleTyping[t.id] || !!(props.mergedChild && state.titleTyping[props.mergedChild.id])}
-            />
-          }>
-            <TitleBounce
-              class="thread-title"
-              text={title()}
-              title={title()}
-              tokensPerSec={bounceRate()}
-            />
-          </Show>
+          <TypewriterText
+            class="thread-title"
+            text={title()}
+            title={title()}
+            animate={state.titleTyping[t.id] || !!(props.mergedChild && state.titleTyping[props.mergedChild.id])}
+          />
           <Show when={props.historyProject}>
             <span
               class="thread-history-meta"
@@ -560,7 +546,9 @@ export function Sidebar(props: {
             临时
           </span>
         </Show>
-        <span class="thread-time">{fmtTime(updatedAt())}</span>
+        <Show when={running()} fallback={<span class="thread-time">{fmtTime(updatedAt())}</span>}>
+          <span class="spinner thread-time-loading" title="运行中" />
+        </Show>
         <button
           class="thread-delete"
           title="删除会话"

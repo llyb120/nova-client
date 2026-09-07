@@ -635,18 +635,6 @@ button {
   font-size: 10px;
 }
 
-/* 会话运行中：标题逐字上下跳动（波浪感），比徽标流光明显；
-   位移由 TitleBounce 的共享 rAF 逐帧驱动（跟随 token 输出速率平滑变速），
-   这里只保留布局与合成层提示 */
-.thread-title-bounce {
-  /* 上边给跳动留空间，负 margin 保持行高不变 */
-  padding-top: 3px;
-  margin-top: -3px;
-}
-.thread-title-bounce .tb-char {
-  display: inline-block;
-  will-change: transform;
-}
 /* 未读新轮次结论：徽标右上角数字角标（stage 链多次完成会累计） */
 .thread-item .thread-agent.unread {
   position: relative;
@@ -775,6 +763,13 @@ button {
 }
 /* hover 时时间淡出、删除键淡入，二者重叠同一位置，行宽行高不变 */
 .thread-item:hover .thread-time {
+  opacity: 0;
+}
+/* 运行中的会话：时间位置换成加载圈，hover 时同样淡出给删除键让位 */
+.thread-time-loading {
+  transition: opacity 0.1s;
+}
+.thread-item:hover .thread-time-loading {
   opacity: 0;
 }
 
