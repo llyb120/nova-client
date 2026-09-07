@@ -1550,6 +1550,7 @@ export async function openNextUnreadThread(): Promise<void> {
       root,
       (id) => !!state.running[id],
       (id) => state.unreadTurns[id] ?? 0,
+      "unread",
     ) ?? root;
   setView("home");
   await openThread(target.id);

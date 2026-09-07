@@ -34,15 +34,20 @@ export function chainGroupAnchor(
 
 /**
  * Fire 任务链与 /stage 链在侧栏只显示根会话，但用户真正关心的是当前进行到的阶段：
- * 点击时优先直达链上有未读的阶段会话（多个取最早创建的），其次正在运行的
- * （多个取最新创建的），都没有时回退到最新创建的阶段会话，
+ * 点击时优先直达链上正在运行的阶段会话（多个取最新创建的）——链运行中时旧阶段
+ * 的未读不应把点击劫持到已完成的环节；没有运行中的阶段时再优先有未读的
+ * （多个取最早创建的），都没有时回退到最新创建的阶段会话，
  * 而不是回到最初的目标会话。
+ * 「打开未读消息」快捷键（openNextUnreadThread）语义相反：prefer 传 "unread"
+ * 保持未读优先，否则链运行中时快捷键会反复落在运行中的 stage，永远消费不掉
+ * 旧阶段遗留的未读。
  */
 export function latestFireStage(
   threads: readonly ThreadMeta[],
   root: ThreadMeta,
   isRunning?: (id: string) => boolean,
   unreadOf?: (id: string) => number,
+  prefer: "running" | "unread" = "running",
 ): ThreadMeta | undefined {
   let latest = root;
   let running: ThreadMeta | undefined;
@@ -69,6 +74,7 @@ export function latestFireStage(
   }
   // 链上没有任何 stage 节点（如预检→开发子会话）时保持原行为：打开被点击的会话本身。
   if (!isFireThread(root) && !hasStage) return undefined;
-  const target = unread ?? running ?? latest;
+  const target =
+    prefer === "unread" ? unread ?? running ?? latest : running ?? unread ?? latest;
   return target === root ? undefined : target;
 }

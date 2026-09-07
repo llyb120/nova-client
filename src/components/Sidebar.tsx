@@ -436,7 +436,9 @@ export function Sidebar(props: {
             latestFireStage(
               state.threads,
               activeThread(),
-              (id) => !!state.running[id],
+              // 与本行转圈口径一致：阶段接力空档里没有任何会话 running，
+              // 但整条链仍在推进（busy），点击同样要直达链上最新的阶段。
+              (id) => !!state.running[id] || chainInfo().busy.has(id),
               (id) => state.unreadTurns[id] ?? 0,
             )?.id ?? activeThread().id,
           )

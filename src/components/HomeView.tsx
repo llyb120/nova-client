@@ -2,6 +2,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 
 import { api } from "../ipc";
+import { latestFireStage } from "../threadDisplay";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
   promptHistory,
@@ -1244,7 +1245,20 @@ export function HomeView() {
             <div class="recent-label">最近会话</div>
             <For each={recent()}>
               {(t) => (
-                <button class="recent-item" onClick={() => void openThread(t.id)}>
+                <button
+                  class="recent-item"
+                  onClick={() =>
+                    void openThread(
+                      // 与侧栏同口径：任务链运行中时直达当前进行到的阶段，而不是回到根会话。
+                      latestFireStage(
+                        state.threads,
+                        t,
+                        (id) => !!state.running[id] || zenRunningChains().busy.has(id),
+                        (id) => state.unreadTurns[id] ?? 0,
+                      )?.id ?? t.id,
+                    )
+                  }
+                >
                   <IconFolder size={14} />
                   <span class={`agent-badge ${t.agentKind}`}>{agentLabel(t.agentKind)}</span>
                   <TypewriterText
