@@ -3265,6 +3265,7 @@ button {
 /* ===== 草稿首页 ===== */
 .home {
   flex: 1;
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3272,7 +3273,19 @@ button {
   overflow-y: auto;
 }
 
+/* 银河背景画布：与会话画布同款，星图仅暗色主题绘制 */
+.home-backdrop {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
 .home-center {
+  position: relative;
+  z-index: 1;
   width: 100%;
   max-width: clamp(560px, 62vw, 720px);
   display: flex;

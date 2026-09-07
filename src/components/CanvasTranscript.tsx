@@ -2,6 +2,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { message } from "@tauri-apps/plugin-dialog";
 import {
   paintCanvasBackdrop,
+  readBackdropTheme,
   STAR_MAP_UPDATE_MS,
 } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
@@ -64,7 +65,8 @@ function readPalette(): Palette {
   const s = getComputedStyle(document.documentElement);
   const v = (n: string, fb: string) => s.getPropertyValue(n).trim() || fb;
   return {
-    bg: v("--bg", "#1e1e1e"), panel: v("--bg-panel", "#212121"),
+    ...readBackdropTheme(),
+    panel: v("--bg-panel", "#212121"),
     sidebar: v("--bg-sidebar", "#181818"), hover: v("--bg-hover", "#2a2a2a"),
     border: v("--border", "#2b2b2b"), borderLight: v("--border-light", "#3c3c3c"),
     text: v("--canvas-text", v("--text", "#d4d4d4")),
@@ -77,10 +79,6 @@ function readPalette(): Palette {
     scroll: v("--scroll", "#31302e"),
     wash1: v("--wash-1", "rgba(111,151,240,.05)"),
     wash2: v("--wash-2", "rgba(206,145,120,.04)"),
-    gridDot: v("--grid-dot", "rgba(255,255,255,.05)"),
-    glowAccent: v("--canvas-glow-accent", "rgba(0,122,204,.12)"),
-    glowCyan: v("--canvas-glow-cyan", "rgba(79,193,233,.06)"),
-    glowCorner: v("--canvas-glow-corner", "rgba(0,122,204,.05)"),
     mono: v("--mono", "monospace"), sans: v("--sans", "sans-serif"),
   };
 }
