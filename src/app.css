@@ -3242,7 +3242,8 @@ button {
   margin-bottom: 6px;
 }
 .bubble-images img {
-  max-width: 240px;
+  /* 窄气泡下 240px 上限仍会超出气泡内宽，同时受容器宽度约束 */
+  max-width: min(240px, 100%);
   max-height: 180px;
   border-radius: 10px;
   display: block;

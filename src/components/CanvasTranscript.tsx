@@ -401,11 +401,12 @@ function promptImageSrc(img: PromptImage): string {
     : convertFileSrc(decodeURI((img.uri ?? "").replace(/^file:\/\/+/, "")));
 }
 
-function bubbleImageSize(el: HTMLImageElement | null | undefined): { w: number; h: number } {
+function bubbleImageSize(el: HTMLImageElement | null | undefined, maxW = BUBBLE_IMG_MAX_W): { w: number; h: number } {
   const nw = el?.naturalWidth ?? 0;
   const nh = el?.naturalHeight ?? 0;
-  if (!nw || !nh) return { w: 160, h: 120 };
-  const scale = Math.min(1, BUBBLE_IMG_MAX_W / nw, BUBBLE_IMG_MAX_H / nh);
+  if (!nw || !nh) return { w: Math.min(160, Math.round(maxW)), h: 120 };
+  // 除固定的 240×180 上限外，还要限制在气泡可用内宽内：窄面板下 240px 的图会顶出气泡右缘。
+  const scale = Math.min(1, maxW / nw, BUBBLE_IMG_MAX_H / nh);
   return { w: Math.max(1, Math.round(nw * scale)), h: Math.max(1, Math.round(nh * scale)) };
 }
 
@@ -417,18 +418,20 @@ function layoutBubbleImages(
   images: PromptImage[] | undefined,
   maxInnerW: number,
   load: (img: PromptImage) => HTMLImageElement | null,
-): { layouts: BubbleImageLayout[]; usedW: number; stackH: number } {
+): { layouts: BubbleImageLayout[]; usedW: number; stackH: number; imgMaxW: number } {
   const layouts: BubbleImageLayout[] = [];
   let usedW = 0;
   let stackH = 0;
-  if (!images?.length) return { layouts, usedW, stackH };
+  // 绘制侧要用同一份上限复核尺寸（见 paintUserBubble），保证窄气泡下两边计算一致。
+  const imgMaxW = Math.max(1, Math.min(BUBBLE_IMG_MAX_W, maxInnerW));
+  if (!images?.length) return { layouts, usedW, stackH, imgMaxW };
 
   let x = 0;
   let y = 0;
   let rowH = 0;
   for (const img of images) {
     if (!img.mimeType.startsWith("image/")) continue;
-    const size = bubbleImageSize(load(img));
+    const size = bubbleImageSize(load(img), imgMaxW);
     if (x > 0 && x + size.w > maxInnerW) {
       usedW = Math.max(usedW, x - BUBBLE_IMG_GAP);
       y += rowH + BUBBLE_IMG_GAP;
@@ -439,10 +442,10 @@ function layoutBubbleImages(
     x += size.w + BUBBLE_IMG_GAP;
     rowH = Math.max(rowH, size.h);
   }
-  if (!layouts.length) return { layouts, usedW, stackH };
+  if (!layouts.length) return { layouts, usedW, stackH, imgMaxW };
   usedW = Math.max(usedW, x > 0 ? x - BUBBLE_IMG_GAP : 0);
   stackH = y + rowH + BUBBLE_IMG_MARGIN_BOTTOM;
-  return { layouts, usedW, stackH };
+  return { layouts, usedW, stackH, imgMaxW };
 }
 
 // ─── Markdown parser ─────────────────────────────────────────────────────────
@@ -1354,7 +1357,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         if (item.id !== editing()?.id) {
           const maxBubble = contentW * 0.85;
           // DOM .bubble-images: flex-wrap, img max 240×180, gap 6, margin-bottom 6
-          const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH } =
+          const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH, imgMaxW } =
             layoutBubbleImages(item.images, maxBubble - 32, loadImage);
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
           // Re-wrap at the final inner width so height matches painted lines.
@@ -1379,7 +1382,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             borderRadius: [14, 14, 6, 14], fontSize: 14, lineHeight: 1.6, font: p.sans,
             selectable: true, hoverKey: `user-${item.id}`,
             _lines: textLines,
-            data: { images: item.images, editItem: item, imageLayouts } });
+            data: { images: item.images, editItem: item, imageLayouts, imgMaxW } });
 
           // .user-edit-btn: padding 5px, margin 0 2px 4px 0, align-self flex-end
           // 世界线预览是静态快照，即使当前主线仍在运行，也应允许从历史消息编辑并分叉。
@@ -2122,11 +2125,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function paintUserBubble(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette, hover: boolean) {
     const imageLayouts = (b.data?.imageLayouts as BubbleImageLayout[] | undefined) ?? [];
+    const imgMaxW = (b.data?.imgMaxW as number | undefined) ?? BUBBLE_IMG_MAX_W;
     for (const layout of imageLayouts) {
       const cached = loadImage(layout.img);
       if (!cached) continue;
       // Always draw with aspect-correct size; stale layout slots trigger rebuild.
-      const size = bubbleImageSize(cached);
+      const size = bubbleImageSize(cached, imgMaxW);
       if (size.w !== layout.w || size.h !== layout.h) scheduleRebuild();
       const ix = bx + layout.dx;
       const iy = by + layout.dy;
