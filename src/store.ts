@@ -565,6 +565,13 @@ export async function refreshThreads() {
     // 这样不会因额度租借的「创建线程刷新」竞态把实际运行态冲回 false。
     const before = runningVersionsBeforeRequest.get(t.id) ?? 0;
     const current = runningEventVersions.get(t.id) ?? 0;
+    const optimistic = optimisticRunningThreads.has(t.id);
+    // 乐观位卡死的自愈：后端快照明确未运行、本次请求间无新运行事件、且非工作流
+    // 接力空档时，收回这个滞留的乐观位——否则手动中止后若 agent 未回 acp:turn(false)，
+    // 568 行的硬优先会让普通会话永久扣在室女座，重启才消失。
+    if (optimistic && !t.running && current === before && !zenBusyChains.has(t.id)) {
+      optimisticRunningThreads.delete(t.id);
+    }
     running[t.id] = optimisticRunningThreads.has(t.id)
       ? true
       : current !== before || zenBusyChains.has(t.id)
