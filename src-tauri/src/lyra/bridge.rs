@@ -1036,11 +1036,10 @@ async fn complete_data(
 
 fn export_data(request: &Value, roots: &Roots) -> Result<Value, String> {
     let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
-    let mut config_value = config_value;
-    if let Some(map) = config_value.as_object_mut() {
-        map.remove("root");
-        map.remove("env");
-    }
+    let selected = request["model"].as_str().ok_or("共享导出缺少模型")?;
+    let selections: Vec<String> = serde_json::from_value(request["sharedModels"].clone())
+        .map_err(|_| "共享导出缺少模型白名单")?;
+    let config_value = config::shared_config(&config_value, &selections, selected)?;
     let resolved = config::resolve_config_env(&config_value, &config::process_env())?;
     Ok(Value::String(
         serde_json::to_string_pretty(&resolved).map_err(|e| e.to_string())?,

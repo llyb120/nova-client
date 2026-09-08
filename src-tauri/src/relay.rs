@@ -1967,6 +1967,12 @@ impl RelayManager {
         model: String,
         operation: Option<&QuotaOperation>,
     ) -> QuotaLeaseResult {
+        // Lyra 租约是配置快照；每次新建/恢复都重新授权，避免沿用已变更的模型和凭证。
+        if key.agent_kind == AgentKind::Lyra {
+            let bundle = self.request_quota_bundle(&key, &model, operation).await?;
+            self.quota_leases.lock().unwrap().insert(key, bundle.clone());
+            return Ok(bundle);
+        }
         if let Some(bundle) = self.quota_leases.lock().unwrap().get(&key).cloned() {
             return Ok(bundle);
         }
@@ -2291,7 +2297,7 @@ impl RelayManager {
                 match app
                     .state::<AppState>()
                     .lyra
-                    .export_quota_credentials()
+                    .export_quota_credentials(&model)
                     .await
                 {
                     Ok(config) => Some(config),

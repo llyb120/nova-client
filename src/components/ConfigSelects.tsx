@@ -223,7 +223,7 @@ export function ModelPicker(props: {
       ),
     ),
   );
-  // 共享列表未就绪时退回本机当前后端列表（选错了由后端根据已持有的额度租约拒绝）。
+  // 共享列表未就绪时保持空列表，不能用本机模型冒充共享模型。
   const sharedReady = createMemo(() => sharedOnly() && sharedList().length > 0);
   // 调用方显式给出后端列表时始终保留「后端」一级，即使只有一个后端或模型尚未加载。
   // 这样设置里启用的后端不会因为模型探测失败而从选择器中完全消失。
@@ -239,7 +239,7 @@ export function ModelPicker(props: {
 
   const modelOptions = createMemo<SelectOption[]>(() => {
     if (sharedReady()) return sharedList();
-    if (sharedOnly()) return modelOptionsOf(props.agentKind, false, sourceOf(props.agentKind));
+    if (sharedOnly()) return [];
     if (!merged()) return modelOptionsOf(props.agentKind, false, sourceOf(props.agentKind));
     return [
       ...kinds().flatMap((k) => modelOptionsOf(k, true, sourceOf(k))),
@@ -248,6 +248,7 @@ export function ModelPicker(props: {
   });
 
   const effectiveModel = createMemo(() => {
+    if (sharedOnly()) return props.model ?? "";
     // 允许「默认」时空值合法（跟随默认），未命中列表的旧值也原样保留显示
     if (props.allowDefault) return props.model ?? "";
     // 已有明确选择：即使暂不在列表也保留（用 fallbackLabel 显示友好名），避免中间态闪成第一项/Auto
@@ -300,7 +301,7 @@ export function ModelPicker(props: {
   };
 
   const fallbackLabel = createMemo(() => {
-    if (props.modelSource) return undefined;
+    if (props.modelSource || sharedOnly()) return undefined;
     if (props.quotaPeerToken && !sharedOnly()) {
       const peer = quotaPeerForToken(props.quotaPeerToken);
       return peer
