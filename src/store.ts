@@ -415,38 +415,53 @@ function selectedModelChoice(agentKind: AgentKind, model: string): ModelChoice |
   const choices = modelChoices(agentKind);
   return (
     choices.find((m) => m.value === model) ??
-    choices.find((m) => m._meta?.["codex.ai/default"] === true) ??
+    choices.find(
+      (m) =>
+        m._meta?.["codex.ai/default"] === true ||
+        m._meta?.["codebuddy.ai/default"] === true,
+    ) ??
     choices[0]
   );
+}
+
+/** 只有 codex 走「单独的思考强度」这条路；CodeBuddy 的档位已折进模型选项
+ *  （`hy4-preview:high`），不再单独下发，见后端 expand_codebuddy_effort_options。 */
+const EFFORT_AGENT_KINDS: AgentKind[] = ["codex"];
+
+/** 建会话/切后端时随线程下发的思考强度；不支持的后端传 null。 */
+function threadEffort(agentKind: AgentKind, reasoningEffort: string): string | null {
+  return agentKind === "codex" ? reasoningEffort || null : null;
 }
 
 export function reasoningEffortChoices(
   agentKind: AgentKind = state.agentKind,
   model: string = state.model,
 ): EffortChoice[] {
-  if (agentKind !== "codex") return [];
-  const selected = selectedModelChoice(agentKind, model);
-  const raw = selected?._meta?.["codex.ai/supportedReasoningEfforts"];
-  if (Array.isArray(raw)) {
-    return raw
-      .map((e) => {
-        if (typeof e === "string") return { value: e, name: e } satisfies EffortChoice;
-        if (e && typeof e === "object") {
-          const obj = e as Record<string, unknown>;
-          const value = obj.value ?? obj.reasoningEffort;
-          const name = obj.name ?? value;
-          if (typeof value === "string" && typeof name === "string") {
-            return {
-              value,
-              name,
-              description:
-                typeof obj.description === "string" ? obj.description : undefined,
-            } satisfies EffortChoice;
+  if (!EFFORT_AGENT_KINDS.includes(agentKind)) return [];
+  if (agentKind === "codex") {
+    const selected = selectedModelChoice(agentKind, model);
+    const raw = selected?._meta?.["codex.ai/supportedReasoningEfforts"];
+    if (Array.isArray(raw)) {
+      return raw
+        .map((e) => {
+          if (typeof e === "string") return { value: e, name: e } satisfies EffortChoice;
+          if (e && typeof e === "object") {
+            const obj = e as Record<string, unknown>;
+            const value = obj.value ?? obj.reasoningEffort;
+            const name = obj.name ?? value;
+            if (typeof value === "string" && typeof name === "string") {
+              return {
+                value,
+                name,
+                description:
+                  typeof obj.description === "string" ? obj.description : undefined,
+              } satisfies EffortChoice;
+            }
           }
-        }
-        return null;
-      })
-      .filter((e): e is EffortChoice => !!e);
+          return null;
+        })
+        .filter((e): e is EffortChoice => !!e);
+    }
   }
   const opts = state.modelOptions[agentKind]?.configOptions?.find((o) => o.id === "effort");
   return ((opts?.options as EffortChoice[] | undefined) ?? []).filter((e) => !!e.value);
@@ -1406,7 +1421,7 @@ export async function createThread(
     agentKind,
     model || null,
     mode || null,
-    agentKind === "codex" ? reasoningEffort || null : null,
+    threadEffort(agentKind, reasoningEffort),
     ephemeral,
     worktree,
     worktreeBranch.trim() || null,
@@ -1416,7 +1431,7 @@ export async function createThread(
   rememberThreadSnapshot(t);
   const storedAgentKind = t.agentKind ?? agentKind;
   lastUsed.setMode(storedAgentKind, t.mode ?? "");
-  if (storedAgentKind === "codex") {
+  if (EFFORT_AGENT_KINDS.includes(storedAgentKind)) {
     lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
   }
   // 减少焦虑：首页发起的会话不该先进会话页再被收起（新会话会闪一下才进室女座），
@@ -1479,6 +1494,7 @@ function zenUnhold(threadId: string) {
 function zenModeOn() {
   return !!state.settings?.zenModeEnabled;
 }
+
 /**
  * 减少焦虑模式的运行态口径（侧栏、首页最近会话、refreshThreads 共用）：
  * hidden = 归室女座的任务链（含父子接力整条链）的全部会话 id；
@@ -1628,7 +1644,7 @@ export function createThreadOptimistic(
         agentKind,
         model || null,
         mode || null,
-        agentKind === "codex" ? reasoningEffort || null : null,
+        threadEffort(agentKind, reasoningEffort),
         ephemeral,
         false,
         null,
@@ -1778,7 +1794,9 @@ export async function pickThreadModel(agentKind: AgentKind, model: string) {
     return;
   }
   const mode = lastUsed.mode(agentKind);
-  const reasoningEffort = agentKind === "codex" ? lastUsed.reasoningEffort(agentKind) : "";
+  const reasoningEffort = EFFORT_AGENT_KINDS.includes(agentKind)
+    ? lastUsed.reasoningEffort(agentKind)
+    : "";
   setState({ agentKind, model, mode, reasoningEffort });
   void ensureModelOptions(agentKind);
   void refreshSlashCommands(agentKind);

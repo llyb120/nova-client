@@ -41,6 +41,10 @@ fn acp_supports_browser_debug(kind: &AgentKind) -> bool {
 const SHARED_KEY: &str = "__shared__";
 const CODEBUDDY_ACP_ARGS: [&str; 3] = ["--acp", "--acp-transport", "stdio"];
 
+/// CodeBuddy ACP `thought_level`（会话级）实际开放的档位。官方 CLI 还支持
+/// `minimal` / `medium` / `xhigh`，这里按 nova 的取舍只暴露三档。
+const CODEBUDDY_EFFORT_LEVELS: [&str; 3] = ["low", "high", "max"];
+
 pub struct PendingPermission {
     pub rpc_id: Value,
     pub session_id: String,
@@ -53,6 +57,7 @@ struct Route {
     thread_id: String,
     applied_model: Option<String>,
     applied_mode: Option<String>,
+    applied_effort: Option<String>,
 }
 
 fn permission_request_key(permission_scope: &str, id: &Value) -> String {
@@ -160,6 +165,142 @@ fn model_config_option(config_options: &Value) -> Option<&Value> {
         .as_array()?
         .iter()
         .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
+}
+
+/// 拆分模型选项 value：组合形式 `<model>:<effort>` -> (模型, 思考强度)。
+/// 只在后缀是 nova 开放的档位时才拆，避免误伤 `custom-local:xxx` 这类自带冒号的模型 id。
+fn split_model_effort(model: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(m) = model.filter(|m| !m.is_empty()) else {
+        return (None, None);
+    };
+    match m.rsplit_once(':') {
+        Some((id, effort))
+            if !id.is_empty() && CODEBUDDY_EFFORT_LEVELS.contains(&effort) =>
+        {
+            (Some(id.to_string()), Some(effort.to_string()))
+        }
+        _ => (Some(m.to_string()), None),
+    }
+}
+
+fn effort_display_name(effort: &str) -> String {
+    match effort {
+        "low" => "Low",
+        "high" => "High",
+        "max" => "Max",
+        other => other,
+    }
+    .to_string()
+}
+
+/// CodeBuddy 没有独立的思考强度下拉：按 codex 的惯例把档位折进模型选项，一个模型展开成
+/// `<model>:<effort>` 若干条（如 `hy4-preview:high`），选中后由 apply_session_config
+/// 拆成 model + `thought_level` 分别下发。
+fn expand_codebuddy_effort_options(config_options: &Value) -> Value {
+    let Some(options) = config_options.as_array() else {
+        return config_options.clone();
+    };
+    let Some(model_opt) = options
+        .iter()
+        .find(|o| o.get("id").and_then(Value::as_str) == Some("model"))
+    else {
+        return config_options.clone();
+    };
+    let Some(models) = model_opt.get("options").and_then(Value::as_array) else {
+        return config_options.clone();
+    };
+    // 进程当前档位来自 thought_level 的 currentValue（可能是 enabled 这类开关值）。
+    let current_effort = options
+        .iter()
+        .find(|o| o.get("id").and_then(Value::as_str) == Some("thought_level"))
+        .and_then(|o| o.get("currentValue"))
+        .and_then(Value::as_str)
+        .filter(|e| CODEBUDDY_EFFORT_LEVELS.contains(e))
+        .unwrap_or("high");
+    let current_model = model_opt
+        .get("currentValue")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let current_base = if current_model.is_empty() {
+        String::new()
+    } else {
+        split_model_effort(Some(current_model)).0.unwrap_or_default()
+    };
+
+    // 模型缓存里可能已经展开过、也可能混着裸 id：统一按「base + 档位」去重，
+    // 避免同一模型既出现 `hy4-preview` 又出现 `hy4-preview:high` 的重复条目。
+    let mut expanded: Vec<Value> = Vec::with_capacity(models.len() * CODEBUDDY_EFFORT_LEVELS.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for m in models {
+        let Some(value) = m.get("value").and_then(Value::as_str) else {
+            continue;
+        };
+        if value.is_empty() || !seen.insert(value.to_string()) {
+            continue;
+        }
+        // 已经带档位后缀（模型缓存里展开过的）：原样保留，不再二次展开成 `model:high:low`，
+        // 但默认标记要按当前进程重算，否则缓存里的旧 default 会和新的并存。
+        let (base, cached_effort) = split_model_effort(Some(value));
+        if cached_effort.is_some() {
+            let mut opt = m.clone();
+            let is_default = !current_base.is_empty()
+                && base.as_deref() == Some(current_base.as_str())
+                && cached_effort.as_deref() == Some(current_effort);
+            let mut meta = m.get("_meta").cloned().unwrap_or_else(|| json!({}));
+            if let Some(obj) = meta.as_object_mut() {
+                if is_default {
+                    obj.insert("codebuddy.ai/default".into(), json!(true));
+                } else {
+                    obj.remove("codebuddy.ai/default");
+                }
+            }
+            opt["_meta"] = meta;
+            expanded.push(opt);
+            continue;
+        }
+        let name = m.get("name").and_then(Value::as_str).unwrap_or(value);
+        let is_current_model = !current_base.is_empty() && current_base == value;
+        for effort in CODEBUDDY_EFFORT_LEVELS {
+            let combined = format!("{value}:{effort}");
+            if !seen.insert(combined.clone()) {
+                continue;
+            }
+            let mut opt = m.clone();
+            opt["value"] = json!(combined);
+            opt["name"] = json!(format!("{name} · {}", effort_display_name(effort)));
+            let mut meta = m.get("_meta").cloned().unwrap_or_else(|| json!({}));
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("codebuddy.ai/effort".into(), json!(effort));
+                if is_current_model && effort == current_effort {
+                    obj.insert("codebuddy.ai/default".into(), json!(true));
+                }
+            }
+            opt["_meta"] = meta;
+            expanded.push(opt);
+        }
+    }
+
+    let mut model_opt = model_opt.clone();
+    model_opt["options"] = json!(expanded);
+    if let Some(default) = expanded
+        .iter()
+        .find(|o| {
+            o.pointer("/_meta/codebuddy.ai~1default")
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .and_then(|o| o.get("value").and_then(Value::as_str))
+    {
+        model_opt["currentValue"] = json!(default);
+    }
+    let mut out = options.clone();
+    if let Some(existing) = out
+        .iter_mut()
+        .find(|o| o.get("id").and_then(Value::as_str) == Some("model"))
+    {
+        *existing = model_opt;
+    }
+    Value::Array(out)
 }
 
 /// 预热激活的 CodeBuddy 进程会终身上报「本地打包兜底清单」：官方 CLI 在 standby 阶段
@@ -2113,6 +2254,13 @@ impl AcpManager {
             self.spawn_revalidate_model_options();
             kept
         };
+        // CodeBuddy 的思考强度不单列下拉，按 codex 的惯例折进模型选项
+        // （`hy4-preview:high`），下发时再拆成 model + thought_level。
+        let config_options = if self.effort_config_id().is_some() {
+            expand_codebuddy_effort_options(&config_options)
+        } else {
+            config_options
+        };
         let modes = match result.get("modes") {
             Some(m) if !m.is_null() => m.clone(),
             _ => modes_from_config_options(&config_options),
@@ -2248,7 +2396,7 @@ impl AcpManager {
         let lock = self.thread_lock(thread_id);
         let _guard = lock.lock().await;
 
-        let (cwd, existing, model, mode) = {
+        let (cwd, existing, model, mode, effort) = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             let thread = store.get(thread_id).ok_or("线程不存在")?;
@@ -2257,6 +2405,7 @@ impl AcpManager {
                 thread.acp_session_id.clone(),
                 thread.model.clone(),
                 thread.mode.clone(),
+                thread.reasoning_effort.clone(),
             )
         };
         // 每个用户线程使用独立连接：Devin 隔离项目 MCP；CodeBuddy 避免新 prompt 中断旧会话。
@@ -2276,6 +2425,7 @@ impl AcpManager {
                         thread_id: thread_id.to_string(),
                         applied_model: None,
                         applied_mode: None,
+                        applied_effort: None,
                     },
                 );
                 let load_attempts: u32 = 2;
@@ -2351,12 +2501,12 @@ impl AcpManager {
             }
         };
 
-        self.apply_session_config(&conn, &key, &sid, model, mode)
+        self.apply_session_config(&conn, &key, &sid, model, mode, effort)
             .await;
         Ok(sid)
     }
 
-    /// 按需把线程级模型/模式同步到 session（只在变化时发请求）
+    /// 按需把线程级模型/模式/思考强度同步到 session（只在变化时发请求）
     async fn apply_session_config(
         &self,
         conn: &Arc<AcpConn>,
@@ -2364,13 +2514,22 @@ impl AcpManager {
         sid: &str,
         model: Option<String>,
         mode: Option<String>,
+        effort: Option<String>,
     ) {
-        let (need_model, need_mode) = {
+        // CodeBuddy 的模型选项带 `<model>:<effort>` 后缀：只把模型 id 交给后端，
+        // 档位走会话级 thought_level。模型里没带档位时退回线程上单独存的强度。
+        let (model_to_send, effort_from_model) = match self.effort_config_id() {
+            Some(_) => split_model_effort(model.as_deref()),
+            None => (model.clone(), None),
+        };
+        let effort_to_apply = self.effort_to_apply(effort_from_model.or(effort));
+        let (need_model, need_mode, need_effort) = {
             let routes = self.routes.lock().unwrap();
             let Some(r) = routes.get(sid) else { return };
             (
-                model.filter(|m| r.applied_model.as_ref() != Some(m)),
+                model_to_send.filter(|m| r.applied_model.as_ref() != Some(m)),
                 mode.filter(|m| r.applied_mode.as_ref() != Some(m)),
+                effort_to_apply.filter(|e| r.applied_effort.as_ref() != Some(e)),
             )
         };
         // 统一模式翻译：界面只暴露 build / plan 两种，这里翻成各后端的真实模式 id。
@@ -2400,11 +2559,11 @@ impl AcpManager {
                 }
             }
         }
-        if need_model.is_none() && need_mode.is_none() {
+        if need_model.is_none() && need_mode.is_none() && need_effort.is_none() {
             return;
         }
         let t_cfg = std::time::Instant::now();
-        // 模型与模式互相独立，并发下发以省一次往返，缩短首字前的等待。
+        // 模型、模式与思考强度互相独立，并发下发以省一次往返，缩短首字前的等待。
         let model_fut = async {
             if let Some(model) = need_model {
                 let method = "session/set_config_option";
@@ -2443,7 +2602,26 @@ impl AcpManager {
                 }
             }
         };
-        tokio::join!(model_fut, mode_fut);
+        let effort_fut = async {
+            if let (Some(cfg_id), Some(effort)) = (self.effort_config_id(), need_effort) {
+                let r = conn
+                    .request(
+                        "session/set_config_option",
+                        json!({ "sessionId": sid, "configId": cfg_id, "value": effort }),
+                        Some(Duration::from_secs(30)),
+                    )
+                    .await;
+                match r {
+                    Ok(_) => {
+                        if let Some(route) = self.routes.lock().unwrap().get_mut(sid) {
+                            route.applied_effort = Some(effort);
+                        }
+                    }
+                    Err(e) => self.push_log(format!("[nova] 设置思考强度失败: {e}")),
+                }
+            }
+        };
+        tokio::join!(model_fut, mode_fut, effort_fut);
         self.push_log(format!(
             "[nova][timing] apply_session_config {}ms",
             t_cfg.elapsed().as_millis()
@@ -2504,9 +2682,15 @@ impl AcpManager {
         // 标题用轻量模型生成：model 由上层按「标题后端」解析好后传入（已保证是本后端的模型 id），
         // 非空即下发；空则用本后端会话默认模型。
         if !model.is_empty() {
+            // 模型可能带 `<model>:<effort>` 后缀，后端只认模型 id。
+            let (base_model, _) = split_model_effort(Some(model.as_str()));
             conn.request(
                 "session/set_config_option",
-                json!({ "sessionId": sid, "configId": "model", "value": model }),
+                json!({
+                    "sessionId": sid,
+                    "configId": "model",
+                    "value": base_model.unwrap_or_else(|| model.clone())
+                }),
                 Some(Duration::from_secs(30)),
             )
             .await
@@ -2586,15 +2770,41 @@ impl AcpManager {
         }
     }
 
-    /// Devin 的模式读写权限绑定进程级 MCP 配置，变化时要重启连接刷新；
+    /// 会话级推理强度在各后端 ACP 的 configId。CodeBuddy 用 `thought_level`
+    /// （`enabled` / `disabled` / 六个档位），其余后端暂不支持会话级下发。
+    fn effort_config_id(&self) -> Option<&'static str> {
+        match self.kind {
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => Some("thought_level"),
+            _ => None,
+        }
+    }
+
+    /// 把线程上的思考强度翻成可下发的档位；后端不支持或档位非法时返回 None。
+    fn effort_to_apply(&self, effort: Option<String>) -> Option<String> {
+        let effort = effort?;
+        if self.effort_config_id().is_none() {
+            return None;
+        }
+        if CODEBUDDY_EFFORT_LEVELS.contains(&effort.as_str()) {
+            Some(effort)
+        } else {
+            self.push_log(format!(
+                "[nova] 思考强度「{effort}」不是 {} 支持的档位，已忽略",
+                self.kind.label()
+            ));
+            None
+        }
+    }
+
+/// Devin 的模式读写权限绑定进程级 MCP 配置，变化时要重启连接刷新；
     /// CodeBuddy 无此耦合，模式变化经 session/set_mode 即时生效。
     fn restart_conn_on_mode_change(&self) -> bool {
         self.kind != AgentKind::CodeBuddy
     }
 
-    /// 线程的模型/模式被修改后，若 session 已挂载则立即同步
+    /// 线程的模型/模式/思考强度被修改后，若 session 已挂载则立即同步
     pub async fn sync_thread_config(self: &Arc<Self>, thread_id: &str) {
-        let (sid, model, mode) = {
+        let (sid, model, mode, effort) = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             let Some(thread) = store.get(thread_id) else {
@@ -2603,7 +2813,12 @@ impl AcpManager {
             let Some(sid) = thread.acp_session_id.clone() else {
                 return;
             };
-            (sid, thread.model.clone(), thread.mode.clone())
+            (
+                sid,
+                thread.model.clone(),
+                thread.mode.clone(),
+                thread.reasoning_effort.clone(),
+            )
         };
         if !self.routes.lock().unwrap().contains_key(&sid) {
             return; // 未挂载，等下次 ensure_session 时应用
@@ -2626,7 +2841,7 @@ impl AcpManager {
             ));
             return;
         }
-        self.apply_session_config(&conn, &key, &sid, model, mode)
+        self.apply_session_config(&conn, &key, &sid, model, mode, effort)
             .await;
     }
 
@@ -2711,6 +2926,7 @@ impl AcpManager {
                 thread_id: thread_id.to_string(),
                 applied_model: None,
                 applied_mode: None,
+                applied_effort: None,
             },
         );
         Ok(sid)
