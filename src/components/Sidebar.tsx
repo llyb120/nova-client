@@ -18,6 +18,7 @@ import {
   setTrainingProject,
   setView,
   state,
+  virgoHiddenThreads,
   zenRunningChains,
 } from "../store";
 import { agentLabel, agentShort, isScratch, scratchParent } from "../utils";
@@ -122,12 +123,23 @@ export function Sidebar(props: {
   const isTrainingView = () => state.view === "training";
   const isBrowserView = () => state.view === "browser";
   // 减少焦虑（高级设置开启）：运行中的任务链移入室女座，普通模式不再显示，结束后自动移回。
+  // 未开启时室女座仍是手动收纳位：快捷键收起的会话放在这里，tab 随收纳内容出现/隐藏。
   const zenMode = () => !!state.settings?.zenModeEnabled;
-  const isVirgoView = () => zenMode() && state.view === "virgo";
+  const virgoHidden = createMemo(() => virgoHiddenThreads());
+  const virgoVisible = () => zenMode() || virgoHidden().size > 0;
+  const isVirgoView = () => virgoVisible() && state.view === "virgo";
 
-  // 运行中的任务链（含父子接力整条链）：与室女座列表、首页最近会话同一口径。
+  // 运行中任务链（含父子接力整条链）：整链的忙碌态与「正在运行的任务数」徽标沿用这套口径。
   const chainInfo = createMemo(() => zenRunningChains());
-  const inRunningChain = (t: ThreadMeta) => chainInfo().hidden.has(t.id);
+  const inRunningChain = (t: ThreadMeta) => virgoHidden().has(t.id);
+  // 室女座里的任务数：减少焦虑下按运行中任务链计，手动收纳下按收纳的会话链计。
+  const virgoChainCount = createMemo(() => {
+    const ids = virgoHidden();
+    if (zenMode()) return chainInfo().rootCount;
+    return state.threads.filter(
+      (t) => ids.has(t.id) && (!t.parentThreadId || !ids.has(t.parentThreadId)),
+    ).length;
+  });
 
   // 只在会话树变化时重建索引，切换选中项不再让每行扫描全部历史。
   const childrenById = createMemo(() => {
@@ -190,9 +202,7 @@ export function Sidebar(props: {
         ? state.threads.filter((t) => t.browserThread)
         : isVirgoView()
           ? state.threads.filter((t) => !t.experienceThread && !t.browserThread && inRunningChain(t))
-          : state.threads.filter(
-              (t) => !t.experienceThread && !t.browserThread && (!zenMode() || !inRunningChain(t)),
-            );
+          : state.threads.filter((t) => !t.experienceThread && !t.browserThread && !inRunningChain(t));
     return groupByCwd(threads);
   });
 
@@ -687,17 +697,26 @@ export function Sidebar(props: {
             >
               大熊座
             </button>
-            <Show when={zenMode()}>
+            <Show when={virgoVisible()}>
               <button
                 id="virgo-tab"
                 class="mode-seg-btn"
                 classList={{ active: state.view === "virgo" }}
                 onClick={openVirgo}
-                title="室女座（减少焦虑）：运行中的会话暂时移到这里，结束后自动回到普通模式"
+                title={
+                  zenMode()
+                    ? "室女座（减少焦虑）：运行中的会话暂时移到这里，结束后自动回到普通模式"
+                    : "室女座：快捷键收起的会话放在这里，打开即回到普通会话"
+                }
               >
                 室女座
-                <Show when={chainInfo().rootCount > 0}>
-                  <span class="mode-seg-badge" title="正在运行的任务数">{chainInfo().rootCount}</span>
+                <Show when={virgoChainCount() > 0}>
+                  <span
+                    class="mode-seg-badge"
+                    title={zenMode() ? "正在运行的任务数" : "已收起的会话数"}
+                  >
+                    {virgoChainCount()}
+                  </span>
                 </Show>
               </button>
             </Show>

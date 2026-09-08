@@ -44,6 +44,7 @@ import {
   startWorkflowOnThread,
   takePendingNewSessionSeed,
   assertBuiltinPrompt,
+  virgoHiddenThreads,
   zenRunningChains,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
@@ -1036,11 +1037,11 @@ export function HomeView() {
   };
 
   // 训练与世代演进会话只在训练视图展示，不进入首页最近会话；
-  // 减少焦虑模式下，运行中的任务链移入室女座，最近会话要等结束后才显示。
+  // 减少焦虑模式下运行中的任务链、以及快捷键手动收进室女座的会话都不再出现在最近会话。
   const recent = createMemo(() => {
-    const hidden = state.settings?.zenModeEnabled ? zenRunningChains().hidden : null;
+    const hidden = virgoHiddenThreads();
     return state.threads
-      .filter((t) => !t.experienceThread && (!hidden || !hidden.has(t.id)))
+      .filter((t) => !t.experienceThread && !hidden.has(t.id))
       .slice(0, 6);
   });
 

@@ -1294,6 +1294,8 @@ export function setPromptQueuedThreads(ids: ReadonlySet<string>) {
 }
 
 export async function openThread(id: string) {
+  // 手动收进室女座的会话一旦打开就回到普通列表，避免用户盯着一个看不见归属的会话。
+  unhideVirgoThread(id);
   if (state.unreadTurns[id]) setUnreadTurns(id, 0);
   const switching = state.currentId !== id;
   const request = switching ? ++openThreadRequest : openThreadRequest;
@@ -1495,6 +1497,109 @@ function zenModeOn() {
   return !!state.settings?.zenModeEnabled;
 }
 
+const VIRGO_MANUAL_KEY = "fd:virgoManualHidden:v1";
+
+/**
+ * 快捷键手动收进室女座的会话链根 id：整条父子接力链一起收纳，重启后仍保留，
+ * 再次打开链上任一会话时自动解纳（unhideVirgoThread）回到普通列表。
+ */
+const virgoManualRoots = new Set<string>(readVirgoManualRoots());
+const [virgoManualVersion, setVirgoManualVersion] = createSignal(0);
+
+function readVirgoManualRoots(): string[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(VIRGO_MANUAL_KEY) ?? "[]");
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistVirgoManualRoots() {
+  try {
+    localStorage.setItem(VIRGO_MANUAL_KEY, JSON.stringify([...virgoManualRoots]));
+  } catch {
+    // 落盘失败只丢跨重启持久化，本次窗口内仍按内存状态收纳会话。
+  }
+}
+
+/** 读取前先订阅版本：收纳/解纳只改 Set，侧栏与首页的 memo 才会跟着重算。 */
+function virgoManualRootsSnapshot(): string[] {
+  virgoManualVersion();
+  return [...virgoManualRoots];
+}
+
+/** 会话所在任务链的根 id（父级不在列表或成环时以自身为根）。 */
+function virgoChainRoot(threadId: string): string {
+  const seen = new Set<string>([threadId]);
+  let cur = state.threads.find((thread) => thread.id === threadId);
+  while (cur?.parentThreadId && !seen.has(cur.parentThreadId)) {
+    const parent = state.threads.find((thread) => thread.id === cur!.parentThreadId);
+    if (!parent) break;
+    seen.add(parent.id);
+    cur = parent;
+  }
+  return cur?.id ?? threadId;
+}
+
+/** 给定链根所在整条父子链的全部会话 id。 */
+function virgoChainIds(roots: string[]): Set<string> {
+  if (roots.length === 0) return EMPTY_IDS;
+  const ids = new Set<string>();
+  for (const thread of state.threads) if (roots.includes(thread.id)) ids.add(thread.id);
+  // 逐级向下传递，覆盖多级 stage 接力链。
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const thread of state.threads) {
+      if (thread.parentThreadId && ids.has(thread.parentThreadId) && !ids.has(thread.id)) {
+        ids.add(thread.id);
+        changed = true;
+      }
+    }
+  }
+  return ids;
+}
+
+/** 手动收进室女座的会话 id（未开启减少焦虑时的收纳口径）。 */
+function virgoManualHidden(): Set<string> {
+  return virgoChainIds(virgoManualRootsSnapshot());
+}
+
+/**
+ * 室女座收纳口径（侧栏列表、首页最近会话、未读跳转共用）：
+ * 开启减少焦虑时按运行链自动收纳；关闭时只认快捷键手动收起的会话。
+ */
+export function virgoHiddenThreads(): Set<string> {
+  return zenModeOn() ? zenRunningChains().hidden : virgoManualHidden();
+}
+
+/**
+ * 快捷键「把会话隐藏入室女座」：减少焦虑已开启时不生效（那时运行链自动归位），
+ * 也不收起还没落库的乐观占位会话。返回是否已收纳。
+ */
+export function hideCurrentThreadToVirgo(): boolean {
+  const id = state.currentId;
+  if (!id || zenModeOn() || isPendingThreadId(id)) return false;
+  const root = virgoChainRoot(id);
+  if (virgoManualRoots.has(root)) return false;
+  virgoManualRoots.add(root);
+  setVirgoManualVersion((version) => version + 1);
+  persistVirgoManualRoots();
+  closeThread();
+  // 会话可能来自证据链/双子座等页面：收起后统一回到首页，不要留在原来的子页面。
+  setView("home");
+  showToast("会话已移入室女座，打开即回到普通会话");
+  return true;
+}
+
+/** 打开会话同时解手动收纳：会话回到普通列表，室女座 tab 随之腾空。 */
+function unhideVirgoThread(threadId: string): void {
+  if (zenModeOn() || virgoManualRoots.size === 0) return;
+  if (!virgoManualRoots.delete(virgoChainRoot(threadId))) return;
+  setVirgoManualVersion((version) => version + 1);
+  persistVirgoManualRoots();
+}
 /**
  * 减少焦虑模式的运行态口径（侧栏、首页最近会话、refreshThreads 共用）：
  * hidden = 归室女座的任务链（含父子接力整条链）的全部会话 id；
@@ -1554,10 +1659,10 @@ export function chainUnreadTurns(thread: ThreadMeta | undefined): number {
  * 口径与侧栏普通模式列表一致：排除大熊座/双子座会话；减少焦虑模式下排除室女座运行链。
  */
 export async function openNextUnreadThread(): Promise<void> {
-  const zenMode = !!state.settings?.zenModeEnabled;
-  const hidden = zenRunningChains().hidden;
+  // 口径与侧栏普通模式列表一致：排除大熊座/双子座会话，以及室女座收起的会话（含快捷键手动收纳）。
+  const hidden = virgoHiddenThreads();
   const visible = state.threads.filter(
-    (t) => !t.experienceThread && !t.browserThread && (!zenMode || !hidden.has(t.id)),
+    (t) => !t.experienceThread && !t.browserThread && !hidden.has(t.id),
   );
   const visibleIds = new Set(visible.map((t) => t.id));
   const unreadRoots = visible.filter(

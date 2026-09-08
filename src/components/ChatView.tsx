@@ -8,6 +8,7 @@ import {
   chatScrollToBottomSignal,
   createThread,
   deleteThread,
+  hideCurrentThreadToVirgo,
   markThreadSwitchPointerDown,
   openThread,
   pickThreadModel,
@@ -238,7 +239,7 @@ export function ChatView() {
   const [stickToBottom, setStickToBottom] = createSignal(true);
 
   mountSessionShortcuts({
-    allowedActions: ["selectModel"],
+    allowedActions: ["selectModel", "hideToVirgo"],
     onSelectProject: () => {},
     onSelectModel: (agentKind, model, quotaPeer) => {
       // 额度会话的共享模型条目（快捷键 target 带队友）不能拿来换后端；只当前后端
@@ -246,6 +247,7 @@ export function ChatView() {
       if (quotaPeer) return;
       void pickThreadModel(agentKind, model);
     },
+    onHideToVirgo: () => hideCurrentThreadToVirgo(),
   });
   let scrollQueued = false;
   let scrollFrame = 0;

@@ -536,13 +536,15 @@ export function SettingsModal(props: { onClose: () => void }) {
                 ? "insertText"
                 : item.action === "selectWorkflow"
                   ? "selectWorkflow"
-                  : "selectModel",
+                  : item.action === "hideToVirgo"
+                    ? "hideToVirgo"
+                    : "selectModel",
         target: item.target.trim(),
       }))
       .filter((item) => {
         if (!item.keys) return false;
         if (item.action === "stopSession") return false;
-        if (item.action === "newSession" || item.action === "openUnread") return true;
+        if (item.action === "newSession" || item.action === "openUnread" || item.action === "hideToVirgo") return true;
         return item.target.length > 0;
       });
 
@@ -1223,7 +1225,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型/工作流、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与终止回合有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发。默认 Esc 终止当前回合。
+                      一键切换项目/模型/工作流、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换、终止回合与隐藏到室女座有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发；「隐藏会话到室女座」仅在未开启减少焦虑（室女座）时可用，会话被收起期间侧栏会出现「室女座」tab，重新打开即回到普通会话。默认 Esc 终止当前回合。
                     </div>
                   </div>
                   <button
@@ -1271,9 +1273,11 @@ export function SettingsModal(props: { onClose: () => void }) {
                                         ? "openUnread"
                                         : action === "insertText"
                                         ? "insertText"
-                                        : action === "selectWorkflow"
-                                          ? "selectWorkflow"
-                                          : "selectModel";
+                                  : action === "selectWorkflow"
+                                    ? "selectWorkflow"
+                                    : action === "hideToVirgo"
+                                      ? "hideToVirgo"
+                                      : "selectModel";
                                 updateSessionShortcut(index, {
                                   action: nextAction,
                                   target: "",
@@ -1287,10 +1291,15 @@ export function SettingsModal(props: { onClose: () => void }) {
                               <option value="openUnread">打开未读消息</option>
                               <option value="selectWorkflow">选择工作流</option>
                               <option value="insertText">快捷输入</option>
+                              <option value="hideToVirgo">隐藏会话到室女座</option>
                             </select>
                             <div class="session-shortcut-target">
                               <Show
-                                when={item().action === "newSession" || item().action === "openUnread"}
+                                when={
+                                  item().action === "newSession" ||
+                                  item().action === "openUnread" ||
+                                  item().action === "hideToVirgo"
+                                }
                                 fallback={
                                   <Show
                                     when={item().action === "insertText"}
@@ -1360,7 +1369,9 @@ export function SettingsModal(props: { onClose: () => void }) {
                                 <div class="session-shortcut-target-none">
                                   {item().action === "openUnread"
                                     ? "循环打开有未读轮次的普通会话"
-                                    : "任意页 · 继承当前目录与模型"}
+                                    : item().action === "hideToVirgo"
+                                      ? "会话页生效 · 仅在未开启减少焦虑时可用"
+                                      : "任意页 · 继承当前目录与模型"}
                                 </div>
                               </Show>
                             </div>

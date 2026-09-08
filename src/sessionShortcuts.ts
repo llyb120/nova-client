@@ -166,6 +166,8 @@ export function mountSessionShortcuts(options: {
   onInsertText?: (text: string, mayFocus: boolean) => boolean;
   /** 返回 true 表示已终止当前回合（例如正在运行且未被其它 Esc 用途占用）。 */
   onStopSession?: () => boolean;
+  /** 返回 true 表示已把当前会话收进室女座（未开启减少焦虑且有会话打开）。 */
+  onHideToVirgo?: () => boolean;
 }): void {
   const allowed = new Set(options.allowedActions);
   const onKeyDown = (event: KeyboardEvent) => {
@@ -177,7 +179,15 @@ export function mountSessionShortcuts(options: {
     const hit = findSessionShortcut(event, shortcuts);
     if (!hit?.keys) return;
     if (!allowed.has(hit.action)) return;
-    if (hit.action !== "newSession" && hit.action !== "openUnread" && hit.action !== "stopSession" && !hit.target) return;
+    if (
+      hit.action !== "newSession" &&
+      hit.action !== "openUnread" &&
+      hit.action !== "hideToVirgo" &&
+      hit.action !== "stopSession" &&
+      !hit.target
+    ) {
+      return;
+    }
     // insertText / stopSession 允许无修饰键；其它动作在可编辑区需 Ctrl/Alt/Meta。
     if (
       hit.action !== "insertText" &&
@@ -221,6 +231,13 @@ export function mountSessionShortcuts(options: {
       event.preventDefault();
       event.stopPropagation();
       options.onOpenUnread?.();
+      return;
+    }
+    if (hit.action === "hideToVirgo") {
+      const handled = options.onHideToVirgo?.() ?? false;
+      if (!handled) return;
+      event.preventDefault();
+      event.stopPropagation();
       return;
     }
     if (hit.action === "selectProject") {
