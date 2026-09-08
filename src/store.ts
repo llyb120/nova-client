@@ -1274,7 +1274,8 @@ export function setPromptQueuedThreads(ids: ReadonlySet<string>) {
   if (Object.keys(cur).length === ids.size && [...ids].every((id) => cur[id])) return;
   const next: Record<string, boolean> = {};
   for (const id of ids) next[id] = true;
-  setState("promptQueued", next);
+  // Solid 的对象 setter 默认合并；必须删除旧 key，否则清空/挂起队列后仍被视为待发。
+  setState("promptQueued", reconcile(next));
 }
 
 export async function openThread(id: string) {
