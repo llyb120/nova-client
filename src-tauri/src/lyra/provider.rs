@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug)]
 pub enum StreamEvent {
+    /// 收到网络数据（包括 SSE 注释心跳），不代表已输出内容。
+    Activity,
     TextDelta(String),
     ThinkingDelta(String),
     /// 工具调用参数的流式增量：index 为本条消息内工具调用序号，
@@ -42,6 +44,22 @@ impl StreamResult {
             error_message: None,
         }
     }
+}
+
+// PI Responses IDs contain call_id|item_id; other protocols forbid '|'.
+// Use the entire ID to retain uniqueness, identically on calls and results.
+fn replay_tool_id(id: &str) -> String {
+    if !id.contains('|') {
+        return id.to_string();
+    }
+    let normalized: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    if normalized.len() <= 40 {
+        return normalized;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hash);
+    format!("{}_{:016x}", &normalized[..23], hash.finish())
 }
 
 fn content_text_parts(content: &[Value]) -> String {
@@ -140,7 +158,7 @@ fn completions_messages(
                     .filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
                     .map(|part| {
                         json!({
-                            "id": part.get("id").and_then(Value::as_str).unwrap_or_default(),
+                            "id": replay_tool_id(part.get("id").and_then(Value::as_str).unwrap_or_default()),
                             "type": "function",
                             "function": {
                                 "name": part.get("name").and_then(Value::as_str).unwrap_or_default(),
@@ -182,7 +200,7 @@ fn completions_messages(
             Some("toolResult") => {
                 out.push(json!({
                     "role": "tool",
-                    "tool_call_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default(),
+                    "tool_call_id": replay_tool_id(message.get("toolCallId").and_then(Value::as_str).unwrap_or_default()),
                     "content": tool_result_text(message),
                 }));
                 let images = tool_result_images(message, model);
@@ -353,31 +371,57 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                let text = content_text_parts(&content);
-                if !text.is_empty() {
-                    out.push(json!({
-                        "type": "message", "role": "assistant",
-                        "content": [{ "type": "output_text", "text": text }]
-                    }));
-                }
+                let same_model = message.get("model").and_then(Value::as_str) == Some(model.id.as_str())
+                    && message.get("provider").and_then(Value::as_str) == Some(model.provider.as_str())
+                    && message.get("api").and_then(Value::as_str) == Some(model.api.as_str());
                 for part in &content {
-                    if part.get("type").and_then(Value::as_str) != Some("toolCall") {
-                        continue;
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("thinking") if same_model => {
+                            if let Some(item) = part.get("thinkingSignature").and_then(Value::as_str)
+                                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                .filter(|v| v["type"] == "reasoning") {
+                                out.push(item);
+                            }
+                        }
+                        Some("text") => {
+                            let mut item = json!({
+                                "type": "message", "role": "assistant",
+                                "content": [{ "type": "output_text", "text": part["text"], "annotations": [] }]
+                            });
+                            if same_model {
+                                if let Some(signature) = part.get("textSignature").and_then(Value::as_str)
+                                    .and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                                    if let Some(id) = signature.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 64) {
+                                        item["id"] = json!(id);
+                                    }
+                                    if let Some(phase) = signature.get("phase").filter(|p| *p == "commentary" || *p == "final_answer") {
+                                        item["phase"] = phase.clone();
+                                    }
+                                }
+                            }
+                            out.push(item);
+                        }
+                        Some("toolCall") => {
+                            let id = part.get("id").and_then(Value::as_str).unwrap_or_default();
+                            let (call_id, item_id) = id.split_once('|').unwrap_or((id, ""));
+                            let mut item = json!({
+                                "type": "function_call", "call_id": call_id,
+                                "name": part["name"],
+                                "arguments": serde_json::to_string(part.get("arguments").unwrap_or(&Value::Null)).unwrap(),
+                            });
+                            if same_model && !item_id.is_empty() {
+                                item["id"] = json!(item_id);
+                            }
+                            out.push(item);
+                        }
+                        _ => {}
                     }
-                    out.push(json!({
-                        "type": "function_call",
-                        "call_id": part.get("id").and_then(Value::as_str).unwrap_or_default(),
-                        "name": part.get("name").and_then(Value::as_str).unwrap_or_default(),
-                        "arguments": serde_json::to_string(
-                            part.get("arguments").unwrap_or(&Value::Object(Map::new()))
-                        ).unwrap_or_else(|_| "{}".into()),
-                    }));
                 }
             }
             Some("toolResult") => {
                 out.push(json!({
                     "type": "function_call_output",
-                    "call_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default(),
+                    "call_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default().split('|').next().unwrap_or_default(),
                     "output": tool_result_text(message),
                 }));
                 let images = tool_result_images(message, model);
@@ -417,6 +461,7 @@ fn responses_body(
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.parameters,
+                "strict": false,
             })
         })
         .collect();
@@ -426,8 +471,11 @@ fn responses_body(
         "input": responses_input(messages, model),
         "store": false,
         "stream": true,
-        "max_output_tokens": model.max_output_tokens,
+        "max_output_tokens": model.max_output_tokens.max(16),
     });
+    if let Some(object) = body.as_object_mut() {
+        object.extend(model.extra_options.clone());
+    }
     if !tool_defs.is_empty() {
         body["tools"] = Value::Array(tool_defs);
     }
@@ -440,6 +488,7 @@ fn responses_body(
             reasoning.insert("effort".into(), json!(level));
         }
         body["reasoning"] = Value::Object(reasoning);
+        body["include"] = json!(["reasoning.encrypted_content"]);
     }
     if let Some(key) = session_id.and_then(clamp_prompt_cache_key) {
         body["prompt_cache_key"] = json!(key);
@@ -491,6 +540,22 @@ async fn send_request(
     }
 }
 
+/// opencode 网关（Console Go / Zen）要求带 x-opencode-session 才能高效路由，缺失直接
+/// 400 MissingSessionID；会话 id 由客户端按会话生成，无需配置，且晚于自定义头下发。
+fn apply_opencode_session_header(
+    request: reqwest::RequestBuilder,
+    model: &ResolvedModel,
+    session_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if model.thinking_format.as_deref() != Some("opencode") {
+        return request;
+    }
+    match session_id {
+        Some(session) => request.header("x-opencode-session", session),
+        None => request,
+    }
+}
+
 async fn post_stream(
     http: &reqwest::Client,
     url: &str,
@@ -513,6 +578,7 @@ async fn post_stream(
             request = request.header(key.as_str(), text);
         }
     }
+    request = apply_opencode_session_header(request, model, session_id);
     if model.session_affinity_headers {
         if let Some(session) = session_id {
             // openrouter 只发 x-session-id；其余发 session_id（openai 格式）
@@ -566,6 +632,10 @@ async fn read_sse(
             }
             _ = wait_cancelled(cancel) => return Ok(true),
         };
+        // 空负载仅为内部网络活动通知；SSE 解码仍按原协议进行。
+        if chunk.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+            on_data("")?;
+        }
         let (events, finished) = match chunk {
             Some(chunk) => (
                 decoder
@@ -679,12 +749,16 @@ fn responses_usage(usage: &Value) -> Value {
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let written = usage.pointer("/input_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64).unwrap_or(0);
     json!({
-        "input": input.saturating_sub(cached),
+        "input": input.saturating_sub(cached).saturating_sub(written),
         "output": output,
         "cacheRead": cached,
-        "cacheWrite": 0,
-        "totalTokens": input + output,
+        "cacheWrite": written,
+        "reasoning": usage.pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64).unwrap_or(0),
+        "totalTokens": usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(input + output),
     })
 }
 
@@ -742,6 +816,7 @@ async fn stream_completions(
     let mut calls: Vec<ToolCallAccum> = Vec::new();
     let mut finish_reason: Option<String> = None;
     let cancelled = read_sse(&mut response, cancel, |data| {
+        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
@@ -875,8 +950,11 @@ async fn stream_responses(
     let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await?;
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
-    let mut open_call: Option<usize> = None;
+    let mut call_indices = HashMap::new();
+    let mut terminal = false;
+    let mut completed_items = std::collections::BTreeMap::new();
     let cancelled = read_sse(&mut response, cancel, |data| {
+        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
@@ -885,7 +963,7 @@ async fn stream_responses(
             .and_then(Value::as_str)
             .unwrap_or_default();
         match kind {
-            "response.output_text.delta" | "response.text.delta" => {
+            "response.output_text.delta" | "response.text.delta" | "response.refusal.delta" => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                     push_delta(&mut result, "text", delta, on_event);
                 }
@@ -922,13 +1000,17 @@ async fn stream_responses(
                             .unwrap_or_default()
                             .into(),
                     });
-                    open_call = Some(calls.len() - 1);
+                    call_indices.insert(value.get("output_index").and_then(Value::as_u64).unwrap_or(0), calls.len() - 1);
                 }
             }
-            "response.function_call_arguments.delta" => {
-                if let Some(index) = open_call {
-                    if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                        calls[index].arguments.push_str(delta);
+            "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
+                if let Some(&index) = call_indices.get(&value.get("output_index").and_then(Value::as_u64).unwrap_or(0)) {
+                    if let Some(delta) = value.get(if kind.ends_with(".done") { "arguments" } else { "delta" }).and_then(Value::as_str) {
+                        if kind.ends_with(".done") {
+                            calls[index].arguments = delta.to_string();
+                        } else {
+                            calls[index].arguments.push_str(delta);
+                        }
                         on_event(StreamEvent::ToolArgsDelta {
                             index,
                             name: calls[index].name.clone(),
@@ -937,10 +1019,14 @@ async fn stream_responses(
                     }
                 }
             }
+            "response.reasoning_summary_part.done" => {
+                push_delta(&mut result, "thinking", "\n\n", on_event);
+            }
             "response.output_item.done" => {
                 let item = value.get("item").cloned().unwrap_or(Value::Null);
+                completed_items.insert(value.get("output_index").and_then(Value::as_u64).unwrap_or(0), item.clone());
                 if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    if let Some(index) = open_call {
+                    if let Some(&index) = call_indices.get(&value.get("output_index").and_then(Value::as_u64).unwrap_or(0)) {
                         if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
                             if !arguments.is_empty() {
                                 calls[index].arguments = arguments.to_string();
@@ -952,10 +1038,14 @@ async fn stream_responses(
                             }
                         }
                     }
-                    open_call = None;
                 }
             }
             "response.completed" | "response.incomplete" => {
+                terminal = true;
+                if let Some(output) = value.pointer("/response/output").and_then(Value::as_array).filter(|v| !v.is_empty()) {
+                    // 终态是权威版本：部分服务只在这里提供 encrypted_content。
+                    completed_items = output.iter().cloned().enumerate().map(|(i, v)| (i as u64, v)).collect();
+                }
                 if let Some(usage) = value.pointer("/response/usage") {
                     result.usage = responses_usage(usage);
                 }
@@ -975,6 +1065,7 @@ async fn stream_responses(
             _ => {
                 // 非流式整包回退
                 if value.get("output").is_some() || value.get("output_text").is_some() {
+                    terminal = true;
                     parse_responses_object(&value, &mut result, &mut calls);
                 }
             }
@@ -986,7 +1077,15 @@ async fn stream_responses(
         result.stop_reason = "aborted".into();
         return Ok(result);
     }
-    let has_tool_calls = calls.iter().any(|call| !call.name.is_empty());
+    if !terminal {
+        return Err("provider stream error: Responses 流在终止事件之前结束".into());
+    }
+    if !completed_items.is_empty() {
+        result.content.clear();
+        calls.clear();
+        parse_responses_object(&json!({"output": completed_items.into_values().collect::<Vec<_>>()}), &mut result, &mut calls);
+    }
+    let has_tool_calls = !calls.is_empty() || result.content.iter().any(|p| p["type"] == "toolCall");
     finalize_tool_calls(calls, &mut result);
     if result.stop_reason.is_empty() {
         result.stop_reason = if has_tool_calls { "toolUse" } else { "stop" }.into();
@@ -997,7 +1096,7 @@ async fn stream_responses(
 fn parse_responses_object(
     value: &Value,
     result: &mut StreamResult,
-    calls: &mut Vec<ToolCallAccum>,
+    _calls: &mut Vec<ToolCallAccum>,
 ) {
     let items: Vec<Value> = if let Some(output) = value.get("output").and_then(Value::as_array) {
         output.clone()
@@ -1006,42 +1105,49 @@ fn parse_responses_object(
     };
     for item in items {
         match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {
+                let text = item.get("summary").or_else(|| item.get("content"))
+                    .and_then(Value::as_array).into_iter().flatten()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n\n");
+                result.content.push(json!({"type":"thinking", "thinking":text,
+                    "thinkingSignature": serde_json::to_string(&item).unwrap()}));
+            }
             Some("message") => {
-                if let Some(parts) = item.get("content").and_then(Value::as_array) {
-                    for part in parts {
-                        if matches!(
-                            part.get("type").and_then(Value::as_str),
-                            Some("output_text") | Some("text")
-                        ) {
-                            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                result.content.push(json!({ "type": "text", "text": text }));
-                            }
-                        }
-                    }
+                let text = item.get("content").and_then(Value::as_array).into_iter().flatten()
+                    .filter_map(|p| p.get("text").or_else(|| p.get("refusal")).and_then(Value::as_str))
+                    .collect::<Vec<_>>().join("");
+                let mut signature = json!({"v":1, "id":item["id"]});
+                if let Some(phase) = item.get("phase") {
+                    signature["phase"] = phase.clone();
                 }
+                result.content.push(json!({"type":"text", "text":text,
+                    "textSignature":serde_json::to_string(&signature).unwrap()}));
             }
             Some("function_call") => {
-                calls.push(ToolCallAccum {
-                    id: item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| item.get("id").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .into(),
-                    name: item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .into(),
-                    arguments: item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .into(),
-                });
+                let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default();
+                let id = match item.get("id").and_then(Value::as_str) {
+                    Some(id) if id != call_id => format!("{call_id}|{id}"),
+                    _ => call_id.to_string(),
+                };
+                let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                result.content.push(json!({"type":"toolCall", "id":id, "name":item["name"],
+                    "arguments":serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({"__invalidJson":arguments}))}));
             }
             _ => {}
         }
+    }
+    if value.get("output").is_none() {
+        if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+            result.content.push(json!({"type":"text", "text":text}));
+        }
+    }
+    match value.get("status").and_then(Value::as_str) {
+        Some("incomplete") => result.stop_reason = "length".into(),
+        Some("failed" | "cancelled") => {
+            result.stop_reason = "error".into();
+            result.error_message = Some(value.pointer("/error/message").and_then(Value::as_str).unwrap_or("Responses request failed").into());
+        }
+        _ => {}
     }
     if let Some(usage) = value.get("usage") {
         result.usage = responses_usage(usage);
@@ -1119,7 +1225,7 @@ async fn stream_chat_once(
         }
         "anthropic-messages" => {
             let body = anthropic_body(model, system_prompt, messages, tools, thinking_level);
-            stream_anthropic(http, model, api_key, body, cancel, on_event).await
+            stream_anthropic(http, model, api_key, body, session_id, cancel, on_event).await
         }
         other => Err(format!("Lyra 暂不支持协议 {other}")),
     }
@@ -1189,7 +1295,7 @@ pub async fn stream_chat(
             session_id,
             cancel,
             &mut |event| {
-                emitted = true;
+                emitted |= !matches!(event, StreamEvent::Activity);
                 on_event(event);
             },
         )
@@ -1290,7 +1396,7 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                         }
                         Some("toolCall") => parts.push(json!({
                             "type": "tool_use",
-                            "id": block.get("id").and_then(Value::as_str).unwrap_or_default(),
+                            "id": replay_tool_id(block.get("id").and_then(Value::as_str).unwrap_or_default()),
                             "name": block.get("name").and_then(Value::as_str).unwrap_or_default(),
                             "input": block.get("arguments").cloned().unwrap_or_else(|| json!({})),
                         })),
@@ -1308,7 +1414,7 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                     "role": "user",
                     "content": [{
                         "type": "tool_result",
-                        "tool_use_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default(),
+                        "tool_use_id": replay_tool_id(message.get("toolCallId").and_then(Value::as_str).unwrap_or_default()),
                         "content": [{ "type": "text", "text": tool_result_text(message) }],
                         "is_error": is_error,
                     }],
@@ -1430,6 +1536,7 @@ async fn stream_anthropic(
     model: &ResolvedModel,
     api_key: &str,
     body: Value,
+    session_id: Option<&str>,
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
@@ -1471,6 +1578,7 @@ async fn stream_anthropic(
             request = request.header(key.as_str(), text);
         }
     }
+    request = apply_opencode_session_header(request, model, session_id);
     let mut response = send_request(request, cancel).await?;
     let status = response.status();
     if !status.is_success() {
@@ -1495,6 +1603,7 @@ async fn stream_anthropic(
         std::collections::HashMap::new();
     let mut stop_reason: Option<String> = None;
     let cancelled = read_sse(&mut response, cancel, |data| {
+        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
@@ -1693,6 +1802,45 @@ mod tests {
         assert!(!is_retryable_stream_error("provider 错误：invalid request"));
     }
 
+    #[tokio::test]
+    async fn opencode_format_sends_session_routing_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: [DONE]\r\n\r\n")
+                .await;
+            String::from_utf8_lossy(&head).to_string()
+        });
+        let mut model = test_model("openai-completions");
+        model.thinking_format = Some("opencode".into());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = post_stream(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/v1/chat/completions"),
+            &model,
+            "key",
+            Some("lyra-abc-1"),
+            json!({ "model": "m" }),
+            &cancel,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        let head = server.await.unwrap().to_lowercase();
+        assert!(head.contains("x-opencode-session: lyra-abc-1"), "{head}");
+    }
+
     #[test]
     fn completions_payload_injects_cache_fields() {
         let model = test_model("openai-completions");
@@ -1803,6 +1951,133 @@ mod tests {
             out[2]["content"][1]["image_url"]["url"],
             "data:image/png;base64,QUJD"
         );
+    }
+
+    #[test]
+    fn responses_replays_pi_ids_and_options() {
+        let mut model = test_model("openai-responses");
+        model.max_output_tokens = 1;
+        model.extra_options.insert("tool_choice".into(), json!("auto"));
+        let messages = vec![
+            json!({"role":"assistant", "model":"m", "provider":"p", "api":"openai-responses", "content":[
+                {"type":"thinking", "thinkingSignature":"{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\",\"summary\":[]}"},
+                {"type":"toolCall", "id":"call_1|fc_1", "name":"read", "arguments":{}}
+            ]}),
+            json!({"role":"toolResult", "toolCallId":"call_1|fc_1", "content":[]})
+        ];
+        let body = responses_body(&model, "sys", &messages, &[], None, None);
+        assert_eq!(body["max_output_tokens"], 16);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["input"][0]["encrypted_content"], "opaque");
+        assert_eq!(body["input"][1]["id"], "fc_1");
+        assert_eq!(body["input"][1]["call_id"], body["input"][2]["call_id"]);
+        model.id = "other".into();
+        let input = responses_input(&messages, &model);
+        assert_eq!(input[0]["type"], "function_call");
+        assert!(input[0].get("id").is_none());
+        let usage = responses_usage(&json!({"input_tokens":100,"output_tokens":10,
+            "input_tokens_details":{"cached_tokens":60,"cache_write_tokens":20},
+            "output_tokens_details":{"reasoning_tokens":5}}));
+        assert_eq!(usage["input"], 20);
+        assert_eq!(usage["cacheWrite"], 20);
+        assert_eq!(usage["reasoning"], 5);
+    }
+
+    #[tokio::test]
+    async fn sse_comment_heartbeat_reports_activity() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            socket.read(&mut [0; 8192]).unwrap();
+            let body = ": heartbeat\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let mut response = reqwest::Client::builder().no_proxy().build().unwrap()
+            .get(format!("http://{address}")).send().await.unwrap();
+        let mut activity = 0;
+        read_sse(&mut response, &Arc::new(AtomicBool::new(false)), |data| {
+            assert!(data.is_empty(), "注释心跳不能变成模型内容");
+            activity += 1;
+            Ok(())
+        }).await.unwrap();
+        server.join().unwrap();
+        assert!(activity > 0);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_terminal_backfills_without_duplicates() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = [0; 8192];
+            socket.read(&mut request).unwrap();
+            let events = vec![
+                json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"a","id":"fc_a","name":"read","arguments":""}}),
+                json!({"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","call_id":"b","id":"fc_b","name":"bash","arguments":""}}),
+                json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"path\":\"a\"}"}),
+                json!({"type":"response.function_call_arguments.done","output_index":3,"arguments":"{\"command\":\"pwd\"}"}),
+                json!({"type":"response.output_text.delta","output_index":1,"delta":"Reading"}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[
+                    {"type":"reasoning","id":"rs_1","encrypted_content":"secret","summary":[]},
+                    {"type":"message","id":"msg_1","phase":"commentary","content":[{"type":"output_text","text":"Reading"}]},
+                    {"type":"function_call","call_id":"a","id":"fc_a","name":"read","arguments":"{\"path\":\"a\"}"},
+                    {"type":"function_call","call_id":"b","id":"fc_b","name":"bash","arguments":"{\"command\":\"pwd\"}"}
+                ]}}),
+            ];
+            let body = events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let mut model = test_model("openai-responses");
+        model.base_url = format!("http://{address}");
+        let mut args = Vec::new();
+        let result = stream_responses(&reqwest::Client::builder().no_proxy().build().unwrap(), &model, "", json!({}), None,
+            &Arc::new(AtomicBool::new(false)), &mut |event| {
+                if let StreamEvent::ToolArgsDelta { name, args: value, .. } = event { args.push((name, value)); }
+            }).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(args[0], ("read".into(), "{\"path\":\"a\"}".into()));
+        assert_eq!(args[1], ("bash".into(), "{\"command\":\"pwd\"}".into()));
+        assert_eq!(result.stop_reason, "toolUse");
+        assert_eq!(result.content.len(), 4);
+        assert_eq!(result.content[1]["text"], "Reading");
+        assert_eq!(result.content[2]["id"], "a|fc_a");
+        let signature: Value = serde_json::from_str(result.content[0]["thinkingSignature"].as_str().unwrap()).unwrap();
+        assert_eq!(signature["encrypted_content"], "secret");
+    }
+
+    #[test]
+    fn responses_signatures_roundtrip_in_order() {
+        let model = test_model("openai-responses");
+        let output = json!({"status":"completed", "output":[
+            {"type":"reasoning", "id":"rs_1", "summary":[], "encrypted_content":"opaque"},
+            {"type":"message", "id":"msg_1", "phase":"commentary", "content":[{"type":"output_text", "text":"Reading"}]},
+            {"type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"read", "arguments":"{}"},
+            {"type":"message", "id":"msg_2", "phase":"final_answer", "content":[{"type":"refusal", "refusal":"No"}]}
+        ]});
+        let mut result = StreamResult::empty();
+        parse_responses_object(&output, &mut result, &mut vec![]);
+        assert_eq!(result.content[2]["id"], "call_1|fc_1");
+        assert_eq!(result.content[3]["text"], "No");
+        let messages = vec![json!({"role":"assistant", "model":"m", "provider":"p", "api":"openai-responses", "content":result.content}),
+            json!({"role":"toolResult", "toolCallId":"call_1|fc_1", "content":[]})];
+        let replay = responses_input(&messages, &model);
+        assert_eq!(replay[0], output["output"][0]);
+        assert_eq!(replay[1]["phase"], "commentary");
+        assert_eq!(replay[1]["id"], "msg_1");
+        assert_eq!(replay[2]["id"], "fc_1");
+        assert_eq!(replay[3]["phase"], "final_answer");
+        let completions = completions_messages("sys", &messages, &model);
+        assert_eq!(completions[1]["tool_calls"][0]["id"], completions[2]["tool_call_id"]);
+        assert!(!completions[2]["tool_call_id"].as_str().unwrap().contains('|'));
+        assert_ne!(replay_tool_id(&format!("{}|a", "c".repeat(100))), replay_tool_id(&format!("{}|b", "c".repeat(100))));
+        assert_eq!(responses_body(&model, "sys", &[], &[], None, None)["include"], json!(["reasoning.encrypted_content"]));
     }
 
     #[test]

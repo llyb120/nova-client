@@ -700,23 +700,44 @@ export function ChatView() {
   );
   const isFireThread = () => /^\[Fire\]/.test(currentMeta()?.title ?? "");
   const showTimeMachine = () => timeStops().length > 0 && !isFireThread();
-  const stageThreads = createMemo(() => {
-    const current = currentMeta();
-    if (!current) return [];
+  // 索引只依赖会话树；同链切换时根 id 不变，不重扫历史、不重建阶段列表。
+  const stageIndex = createMemo(() => {
     const byId = new Map(state.threads.map((thread) => [thread.id, thread]));
-    const rootOf = (start: typeof current) => {
-      let root = start;
-      const seen = new Set<string>();
-      while (root.parentThreadId && !seen.has(root.id)) {
-        seen.add(root.id);
-        const parent = byId.get(root.parentThreadId);
-        if (!parent) break;
-        root = parent;
+    const children = new Map<string, ThreadMeta[]>();
+    for (const thread of state.threads) {
+      if (!thread.parentThreadId) continue;
+      const siblings = children.get(thread.parentThreadId) ?? [];
+      siblings.push(thread);
+      children.set(thread.parentThreadId, siblings);
+    }
+    return { byId, children };
+  });
+  const stageRootId = createMemo(() => {
+    const { byId } = stageIndex();
+    let root = byId.get(state.currentId ?? "");
+    if (!root) return null;
+    const seen = new Set<string>([root.id]);
+    while (root.parentThreadId) {
+      const parent = byId.get(root.parentThreadId);
+      if (!parent || seen.has(parent.id)) break;
+      root = parent;
+      seen.add(root.id);
+    }
+    return root.id;
+  });
+  const stageThreads = createMemo(() => {
+    const { byId, children } = stageIndex();
+    const root = byId.get(stageRootId() ?? "");
+    if (!root) return [];
+    const chain = [root];
+    const seen = new Set<string>([root.id]);
+    for (let i = 0; i < chain.length; i++) {
+      for (const child of children.get(chain[i].id) ?? []) {
+        if (seen.has(child.id)) continue;
+        seen.add(child.id);
+        chain.push(child);
       }
-      return root;
-    };
-    const root = rootOf(current);
-    const chain = state.threads.filter((thread) => rootOf(thread).id === root.id);
+    }
     return chain.sort((a, b) => a.createdAt - b.createdAt);
   });
   /** 是否工作流/Fire/员工事件链的会话标题（决定导航栏是否从第一个节点起就显示）。 */

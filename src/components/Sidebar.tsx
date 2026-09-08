@@ -10,6 +10,7 @@ import {
   closeThread,
   deleteProjectThreads,
   deleteThread,
+  liveWorkflowStage,
   markThreadSwitchPointerDown,
   openNewSession,
   openThread,
@@ -128,6 +129,17 @@ export function Sidebar(props: {
   const chainInfo = createMemo(() => zenRunningChains());
   const inRunningChain = (t: ThreadMeta) => chainInfo().hidden.has(t.id);
 
+  // 只在会话树变化时重建索引，切换选中项不再让每行扫描全部历史。
+  const childrenById = createMemo(() => {
+    const children = new Map<string, ThreadMeta[]>();
+    for (const thread of state.threads) {
+      if (!thread.parentThreadId) continue;
+      const siblings = children.get(thread.parentThreadId) ?? [];
+      siblings.push(thread);
+      children.set(thread.parentThreadId, siblings);
+    }
+    return children;
+  });
   const threadOf = (id: string) => state.threads.find((item) => item.id === id);
   const openHistoryThread = async (id: string) => {
     const thread = state.threads.find((item) => item.id === id);
@@ -389,20 +401,19 @@ export function Sidebar(props: {
   }) => {
     const t = props.thread;
     const activeThread = () => props.mergedChild ?? t;
-    const chainThreads = () => {
+    const chainThreads = createMemo(() => {
+      const children = childrenById();
       const ids = new Set<string>([t.id]);
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const thread of state.threads) {
-          if (thread.parentThreadId && ids.has(thread.parentThreadId) && !ids.has(thread.id)) {
-            ids.add(thread.id);
-            changed = true;
-          }
+      const chain = [t];
+      for (let i = 0; i < chain.length; i++) {
+        for (const child of children.get(chain[i].id) ?? []) {
+          if (ids.has(child.id)) continue;
+          ids.add(child.id);
+          chain.push(child);
         }
       }
-      return state.threads.filter((thread) => ids.has(thread.id));
-    };
+      return chain;
+    });
     // 整条链的忙碌态：工作流阶段接力空档里没有任何会话 running，
     // 只看 state.running 会让侧栏转圈在刷新/回合结束时闪断，这里并入室女座运行链口径。
     const running = () => {
@@ -433,10 +444,14 @@ export function Sidebar(props: {
         onPointerDown={() => markThreadSwitchPointerDown()}
         onClick={() =>
           void openHistoryThread(
+            // 工作流链：直接用运行时记录的链尖，接力空档/等待补充时也不会落到旧阶段。
+            liveWorkflowStage(t.id) ??
             latestFireStage(
               state.threads,
               activeThread(),
-              (id) => !!state.running[id],
+              // 与本行转圈口径一致：阶段接力空档里没有任何会话 running，
+              // 但整条链仍在推进（busy），点击同样要直达链上最新的阶段。
+              (id) => !!state.running[id] || chainInfo().busy.has(id),
               (id) => state.unreadTurns[id] ?? 0,
             )?.id ?? activeThread().id,
           )

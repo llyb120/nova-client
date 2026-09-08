@@ -301,6 +301,7 @@ impl Agent {
                     if let Some(w) = &watchdog_state {
                         w.touch();
                         match &event {
+                            StreamEvent::Activity => {}
                             StreamEvent::TextDelta(_) => {
                                 w.activity.bump(crate::lyra::watchdog::DeltaKind::Text)
                             }
@@ -313,6 +314,7 @@ impl Agent {
                         }
                     }
                     match event {
+                        StreamEvent::Activity => {}
                         StreamEvent::TextDelta(delta) => on_event(AgentEvent::TextDelta(delta)),
                         StreamEvent::ThinkingDelta(delta) => {
                             on_event(AgentEvent::ThinkingDelta(delta))
@@ -345,7 +347,7 @@ impl Agent {
                     ));
                 }
                 Err(format!(
-                    "provider stream idle timeout: {}s 无增量事件",
+                    "provider stream idle timeout: {}s 无网络活动",
                     crate::lyra::watchdog::IDLE_TIMEOUT.as_secs()
                 ))
             } else {
@@ -354,6 +356,20 @@ impl Agent {
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
+                    // 网络层可能先于看门狗返回；不能只记录 watchdog_tripped。
+                    if !watchdog_tripped && (error.contains("provider SSE 连续") || error.contains("响应头等待超过")) {
+                        if let Some((w, diag)) = &self.watchdog {
+                            let mut event = crate::lyra::watchdog::timeout_event(
+                                &self.session_id, &self.model.model.provider,
+                                &self.model.model.id, &self.model.model.api, &w.activity,
+                                &self.messages[self.messages.len().saturating_sub(8)..],
+                            );
+                            event["event"] = json!("provider_network_timeout");
+                            event["stage"] = json!(if error.contains("响应头") { "headers" } else { "sse" });
+                            event["timeoutMs"] = json!(if error.contains("响应头") { 60_000 } else { 90_000 });
+                            diag.record(event);
+                        }
+                    }
                     outcome.stop_reason = "error".into();
                     outcome.error = Some(error.clone());
                     // 追加一条 error 占位 assistant 消息，保持轨迹完整（与 PI 一致）。

@@ -23,7 +23,7 @@ mod watchdog;
 
 pub use prompt::{
     expand_browser_command, expand_browser_exit_command, is_browser_command,
-    is_browser_exit_command,
+    is_browser_exit_command, is_retryable_provider_error, PROVIDER_RETRY_DELAYS_MS,
 };
 
 pub use bridge::{run_oneshot, spawn_prompt, InProcessSession};

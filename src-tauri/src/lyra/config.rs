@@ -325,6 +325,45 @@ pub fn resolve_proxy(
     Ok((!proxy.is_empty()).then_some(proxy))
 }
 
+/// 解析自定义请求头：model.options.headers 逐键覆盖 provider.options.headers。
+/// 值支持 {env:NAME} 占位符；数字/布尔按其字面文本发送；null 表示删除继承来的同名头。
+pub fn resolve_headers(
+    model: &Value,
+    provider: &Value,
+    env: &HashMap<String, String>,
+) -> Result<Map<String, Value>, String> {
+    let mut headers = Map::new();
+    for scope in [
+        provider.pointer("/options/headers"),
+        model.pointer("/options/headers"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(object) = scope.as_object() else {
+            continue;
+        };
+        for (key, value) in object {
+            match value {
+                Value::Null => {
+                    headers.remove(key);
+                }
+                Value::String(text) => {
+                    headers.insert(key.clone(), json!(resolve_env_string(text, env)?));
+                }
+                Value::Bool(flag) => {
+                    headers.insert(key.clone(), json!(flag.to_string()));
+                }
+                Value::Number(number) => {
+                    headers.insert(key.clone(), json!(number.to_string()));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(headers)
+}
+
 fn compat_flag(model: &Value, provider: &Value, key: &str) -> Option<bool> {
     // 只有 options 一处入口：model.options 覆盖 provider.options。
     [
@@ -468,14 +507,7 @@ pub fn resolve_model(
                 .map(|variants| !variants.is_empty())
                 .unwrap_or(false)
         });
-    let mut headers = Map::new();
-    if let Some(object) = options.get("headers").and_then(Value::as_object) {
-        for (key, value) in object {
-            if let Some(text) = value.as_str() {
-                headers.insert(key.clone(), json!(resolve_env_string(text, env)?));
-            }
-        }
-    }
+    let mut headers = resolve_headers(model, provider, env)?;
     let url_lower = base_url.to_lowercase();
     let official_openai = url_lower.contains("api.openai.com");
     // 默认不注入会话亲和 header；仅 provider/model 显式声明时发送。
@@ -743,6 +775,51 @@ mod tests {
         // 显式空串视为未配置（跟随全局 lyra-proxy）。
         let direct = resolve_model(&config, Some("custom/direct"), &env).unwrap();
         assert_eq!(direct.model.proxy, None);
+    }
+
+    #[test]
+    fn custom_headers_merge_model_over_provider() {
+        let config = json!({
+            "provider": {
+                "custom": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "http://127.0.0.1:8317/v1",
+                        "apiKey": "key",
+                        "headers": {
+                            "x-opencode-session": "{env:LYRA_TEST_SESSION}",
+                            "x-shared": "provider",
+                            "x-dropped": "gone"
+                        }
+                    },
+                    "models": {
+                        "inherit": {},
+                        "gpt": {
+                            "options": {
+                                "headers": {
+                                    "x-shared": "model",
+                                    "x-dropped": null,
+                                    "x-flag": true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let env = HashMap::from([("LYRA_TEST_SESSION".to_string(), "sess-1".to_string())]);
+        // 模型未配置时继承 provider 级请求头，且 {env:NAME} 占位符被解析。
+        let inherit = resolve_model(&config, Some("custom/inherit"), &env).unwrap();
+        assert_eq!(inherit.model.headers["x-opencode-session"], "sess-1");
+        assert_eq!(inherit.model.headers["x-shared"], "provider");
+        // 模型级逐键覆盖；null 删除继承的头；布尔按字面文本发送。
+        let gpt = resolve_model(&config, Some("custom/gpt"), &env).unwrap();
+        assert_eq!(gpt.model.headers["x-opencode-session"], "sess-1");
+        assert_eq!(gpt.model.headers["x-shared"], "model");
+        assert_eq!(gpt.model.headers["x-flag"], "true");
+        assert!(!gpt.model.headers.contains_key("x-dropped"));
+        // headers 是内置键，不透传进请求体。
+        assert!(!gpt.model.extra_options.contains_key("headers"));
     }
 
     #[test]

@@ -612,8 +612,10 @@ impl AcpManager {
     }
 
     /// 超出热连接上限时回收最旧的「非运行中」线程连接；正在跑轮的线程永不回收。
-    /// 只清槽并 kill 进程：路由/权限/回放等会话状态由 stdout reader 触发的 on_conn_closed 统一清理，
-    /// 旧会话下次发送时走「routes 缺失 → session/load」的既有恢复路径。
+    /// 路由/回放等会话状态必须由回收方自己清理：槽位在 kill 前已腾空，on_conn_closed 的
+    /// stale 判定会跳过清理，若依赖它统一清理会残留路由，导致旧会话下次发送时跳过
+    /// session/load 直打 session/prompt，新进程报 session not found。
+    /// 清理后旧会话下次发送时走「routes 缺失 → session/load」的既有恢复路径。
     fn evict_lru_thread_conns(self: &Arc<Self>, keep_key: &str) {
         let cap = self.hot_thread_conn_cap();
         let mut victims: Vec<(String, Arc<TokioMutex<Option<Arc<AcpConn>>>>)> = Vec::new();
@@ -657,6 +659,10 @@ impl AcpManager {
                 if let Some(conn) = slot.lock().await.take() {
                     conn.kill();
                 }
+                // kill 期间槽锁仍被本任务持有（if-let 临时 guard），on_conn_closed 只会判 stale
+                // 提前返回；这里自己清路由。此刻不可能存在新挂载的路由：同线程重连必须拿到
+                // 槽锁并重新 spawn + session/load，远慢于本行同步清理。
+                mgr.clear_sessions_of_key(&key);
                 mgr.slots.lock().unwrap().remove(&key);
             });
         }
@@ -3857,6 +3863,9 @@ mod codebuddy_acp_tests {
         // 假死与云端瞬时抖动是两种恢复策略：前者必须换连接，后者原连接退避重发。
         assert!(!is_retriable_rpc_error(&error));
         assert!(is_retriable_rpc_error("RetriableError: Connection stalled"));
+        assert!(is_retriable_rpc_error(
+            "Connection error, send a message to continue retrying"
+        ));
         assert_eq!(
             PromptFailure::Stalled(error.clone()).into_message(),
             error.clone()
@@ -4097,6 +4106,9 @@ fn is_retriable_rpc_error(err: &str) -> bool {
     lower.contains("retriable")
         || lower.contains("ping timed out")
         || lower.contains("connection stalled")
+        // agent 上游模型连接失败的原始文案（如 "Connection error, send a message to
+        // continue retrying"）：会话仍存活，原连接退避重发即可，无需用户手动重发
+        || lower.contains("connection error")
         || lower.contains("[unavailable]")
         || lower.contains("econnreset")
         || lower.contains("etimedout")

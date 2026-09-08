@@ -53,6 +53,7 @@ import {
   startWorkflow,
   suspendActive as suspendWorkflowActive,
   unfinishedWorkflowRoots,
+  workflowChainTip,
   workflowReviewRevision,
 } from "./workflow/runtime";
 import {
@@ -565,6 +566,13 @@ export async function refreshThreads() {
     // 这样不会因额度租借的「创建线程刷新」竞态把实际运行态冲回 false。
     const before = runningVersionsBeforeRequest.get(t.id) ?? 0;
     const current = runningEventVersions.get(t.id) ?? 0;
+    const optimistic = optimisticRunningThreads.has(t.id);
+    // 乐观位卡死的自愈：后端快照明确未运行、本次请求间无新运行事件、且非工作流
+    // 接力空档时，收回这个滞留的乐观位——否则手动中止后若 agent 未回 acp:turn(false)，
+    // 568 行的硬优先会让普通会话永久扣在室女座，重启才消失。
+    if (optimistic && !t.running && current === before && !zenBusyChains.has(t.id)) {
+      optimisticRunningThreads.delete(t.id);
+    }
     running[t.id] = optimisticRunningThreads.has(t.id)
       ? true
       : current !== before || zenBusyChains.has(t.id)
@@ -1266,7 +1274,8 @@ export function setPromptQueuedThreads(ids: ReadonlySet<string>) {
   if (Object.keys(cur).length === ids.size && [...ids].every((id) => cur[id])) return;
   const next: Record<string, boolean> = {};
   for (const id of ids) next[id] = true;
-  setState("promptQueued", next);
+  // Solid 的对象 setter 默认合并；必须删除旧 key，否则清空/挂起队列后仍被视为待发。
+  setState("promptQueued", reconcile(next));
 }
 
 export async function openThread(id: string) {
@@ -1492,6 +1501,18 @@ export function zenRunningChains(): { hidden: Set<string>; busy: Set<string>; ro
   });
 }
 
+/**
+ * 未完成的工作流链当前进行到的阶段会话（链尖），不存在时返回 undefined。
+ * 点击任务链时优先用它：latestFireStage 只能按「谁在 running / 谁有未读」猜，
+ * 阶段接力空档和等待补充/审核时会落到已结束的旧阶段。
+ */
+export function liveWorkflowStage(rootId: string): string | undefined {
+  workflowReviewRevision();
+  const tip = workflowChainTip(rootId);
+  if (!tip) return undefined;
+  return state.threads.some((thread) => thread.id === tip) ? tip : undefined;
+}
+
 /** 会话及其子孙（接力链）上的未读总数，与侧栏徽标口径一致。 */
 export function chainUnreadTurns(thread: ThreadMeta | undefined): number {
   if (!thread) return 0;
@@ -1543,6 +1564,7 @@ export async function openNextUnreadThread(): Promise<void> {
       root,
       (id) => !!state.running[id],
       (id) => state.unreadTurns[id] ?? 0,
+      "unread",
     ) ?? root;
   setView("home");
   await openThread(target.id);

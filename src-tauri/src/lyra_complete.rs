@@ -487,14 +487,7 @@ fn resolve_target(
                 .map(|v| !v.is_empty())
                 .unwrap_or(false)
         });
-    let mut headers = Map::new();
-    if let Some(object) = options.get("headers").and_then(Value::as_object) {
-        for (key, value) in object {
-            if let Some(text) = value.as_str() {
-                headers.insert(key.clone(), json!(resolve_env_string(text, env)?));
-            }
-        }
-    }
+    let headers = crate::lyra::config::resolve_headers(model, provider, env)?;
     let thinking_format = detect_thinking_format(provider_id, &base_url, model, provider);
     let max_tokens_field = detect_max_tokens_field(&base_url, model, provider);
     Ok(ResolvedCompletionTarget {
@@ -561,6 +554,8 @@ pub(crate) fn detect_thinking_format(
     } else if id.contains("api.z.ai") || id.contains("open.bigmodel.cn") {
         Some("zai".into())
     } else {
+        // opencode 不做域名推断：只有显式写 thinking_format: "opencode" 才附加路由头，
+        // 避免同名中转/自建端点被误判后多发出 x-opencode-session。
         None
     }
 }
@@ -772,6 +767,42 @@ mod tests {
         assert_eq!(target.thinking_format.as_deref(), Some("deepseek"));
         assert_eq!(target.max_tokens_field, "max_completion_tokens");
         assert!(target.reasoning);
+    }
+
+    #[test]
+    fn opencode_thinking_format_requires_explicit_option() {
+        let config = json!({
+            "provider": {
+                "opencode": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "https://api.opencode.ai/v1",
+                        "apiKey": "sk-test"
+                    },
+                    "models": { "gpt": { "reasoning": true } }
+                }
+            }
+        });
+        // 域名含 opencode 也不自动推断，避免误判后多发出 x-opencode-session。
+        let target = resolve_target(&config, "opencode/gpt", &HashMap::new()).unwrap();
+        assert_eq!(target.thinking_format, None);
+
+        let explicit = json!({
+            "provider": {
+                "opencode": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "https://api.opencode.ai/v1",
+                        "apiKey": "sk-test",
+                        "thinking_format": "opencode"
+                    },
+                    "models": { "gpt": { "reasoning": true } }
+                }
+            }
+        });
+        let target = resolve_target(&explicit, "opencode/gpt", &HashMap::new()).unwrap();
+        // 显式声明后 provider 侧自动附加 x-opencode-session 路由头。
+        assert_eq!(target.thinking_format.as_deref(), Some("opencode"));
     }
 
     #[test]

@@ -18,6 +18,19 @@ export interface BackdropTheme {
   gridDot: string;
 }
 
+/** 从 CSS 变量读取背景主题，与 DOM 版主题（深/浅色）一致；星图仅暗色主题绘制。 */
+export function readBackdropTheme(): BackdropTheme {
+  const s = getComputedStyle(document.documentElement);
+  const v = (n: string, fb: string) => s.getPropertyValue(n).trim() || fb;
+  return {
+    bg: v("--bg", "#1e1e1e"),
+    glowAccent: v("--canvas-glow-accent", "rgba(0,122,204,.12)"),
+    glowCyan: v("--canvas-glow-cyan", "rgba(79,193,233,.06)"),
+    glowCorner: v("--canvas-glow-corner", "rgba(0,122,204,.05)"),
+    gridDot: v("--grid-dot", "rgba(255,255,255,.05)"),
+  };
+}
+
 const backdropCache = new Map<string, HTMLCanvasElement>();
 const pendingBackdrops = new Set<string>();
 
