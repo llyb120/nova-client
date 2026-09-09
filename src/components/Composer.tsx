@@ -625,7 +625,6 @@ export function Composer() {
       classList={{ "is-dragging": attach.dragging() }}
     >
       <noteFlow.Notes />
-      <ExclusiveChatMark token={state.roamingPeer || state.settings?.relayToken || ""} />
       <Show when={browserDebugMode()}>
         <div class="clue-context-chip" title="后续轮次持续携带 Playwright browser 工具；发送 /browser-exit 退出">
           <span class="clue-context-label">浏览器调试模式</span>
@@ -832,33 +831,36 @@ export function Composer() {
           </span>
         </Show>
         <span class="bar-spacer" />
-        <button
-          type="button"
-          class="composer-btn clue"
-          classList={{ active: !!activeClue() }}
-          title={activeClue() ? "查看本会话证据链" : "打开证据链"}
-          onClick={openEvidenceChain}
-        >
-          <IconClue size={16} />
-        </button>
-        <span class="composer-stop-slot" classList={{ hidden: !running() }}>
+        <div class="composer-actions">
+          <ExclusiveChatMark token={state.roamingPeer || state.settings?.relayToken || ""} />
           <button
-            class="composer-btn stop"
-            onClick={requestStop}
-            title={running() ? stopShortcutLabel() : "停止"}
-            disabled={!running()}
+            type="button"
+            class="composer-btn clue"
+            classList={{ active: !!activeClue() }}
+            title={activeClue() ? "查看本会话证据链" : "打开证据链"}
+            onClick={openEvidenceChain}
           >
-            <IconStop size={16} />
+            <IconClue size={16} />
           </button>
-        </span>
-        <button
-          class="composer-btn send"
-          disabled={empty()}
-          onClick={submit}
-          title={running() ? "加入提示词队列" : "发送"}
-        >
-          <IconSend size={16} />
-        </button>
+          <span class="composer-stop-slot" classList={{ hidden: !running() }}>
+            <button
+              class="composer-btn stop"
+              onClick={requestStop}
+              title={running() ? stopShortcutLabel() : "停止"}
+              disabled={!running()}
+            >
+              <IconStop size={16} />
+            </button>
+          </span>
+          <button
+            class="composer-btn send"
+            disabled={empty()}
+            onClick={submit}
+            title={running() ? "加入提示词队列" : "发送"}
+          >
+            <IconSend size={16} />
+          </button>
+        </div>
       </div>
     </div>
   );

@@ -1006,17 +1006,17 @@ export function HomeView() {
   return (
     <main class="home">
       <div class="home-center">
-        <IconLogo size={44} class="home-logo" />
-        <h1 class="home-title">我们该做什么？</h1>
+        <header class="home-intro">
+          <div class="home-eyebrow"><IconLogo size={28} class="home-logo" /><span>NOVA WORKSPACE</span></div>
+          <h1 class="home-title">让想法，从这里开始。</h1>
+          <p class="home-description">选择项目，描述任务，和 Nova 一起把想法变成现实。</p>
+        </header>
 
         <div
           class="home-composer"
           classList={{ "is-dragging": attach.dragging() }}
         >
           <noteFlow.Notes />
-          <ExclusiveChatMark
-            token={roam()?.peer.token || state.settings?.relayToken || ""}
-          />
           <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
           <Show when={quote()}>
             <div class="clue-context-chip" title={quote()}>
@@ -1161,84 +1161,89 @@ export function HomeView() {
               />
             </Show>
             <span class="bar-spacer" />
-            <Show when={!roam() && !quotaPeer()}>
-              <div ref={workflowPickerRef} class="composer-workflow-picker">
-                <Show when={workflowMenuOpen()}>
-                  <div class="composer-workflow-menu">
-                    <div class="composer-workflow-head">本次会话运行的工作流</div>
-                    <button
-                      type="button"
-                      classList={{
-                        "composer-workflow-item": true,
-                        active: !selectedWorkflowId(),
-                      }}
-                      onClick={() => pickWorkflow(null)}
-                    >
-                      <span>普通会话</span>
-                      <small>不运行工作流，直接执行任务</small>
-                    </button>
-                    <For each={workflowChoices()}>
-                      {(wf) => (
-                        <button
-                          type="button"
-                          classList={{
-                            "composer-workflow-item": true,
-                            active: selectedWorkflowId() === wf.id,
-                          }}
-                          onClick={() => pickWorkflow(wf.id)}
-                          title={wf.sharedBy ? `来自 ${wf.sharedBy} 的团队分享` : undefined}
-                        >
-                          <span>{wf.name}</span>
-                          <small>
-                            {wf.sharedBy
-                              ? `团队 · ${wf.sharedBy}`
-                              : wf.builtin
-                                ? "内置"
-                                : "自定义"} · {wf.stages.length} 个节点
-                          </small>
-                        </button>
-                      )}
-                    </For>
-                  </div>
-                </Show>
-                <button
-                  type="button"
-                  class="composer-btn workflow"
-                  classList={{ active: !!selectedWorkflow() }}
-                  onClick={() => setWorkflowMenuOpen((open) => !open)}
-                  title={
-                    selectedWorkflow()
-                      ? `工作流：${selectedWorkflow()!.name}`
-                      : "选择用哪个工作流运行本次任务"
-                  }
-                >
-                  <IconMerge size={16} />
-                </button>
-              </div>
-            </Show>
-            <button
-              type="button"
-              class="composer-btn clue"
-              title={state.pendingClueCard ? "查看或更换证据链" : "从证据链发起会话"}
-              onClick={() => setView("clues")}
-            >
-              <IconClue size={16} />
-            </button>
-            <button
-              class="composer-btn send"
-              disabled={
-                (!text().trim() && attach.images().length === 0) ||
-                (!!selectedWorkflow() && !text().trim() && attach.images().length === 0) ||
-                (!cwd() && !roam()) ||
-                busy() ||
-                !peerReady() ||
-                (usesPeerModels() && configAgentKinds().length === 0)
-              }
-              onClick={(e) => void submit({ ephemeral: e.ctrlKey || e.metaKey })}
-              title="发送（Enter）· Ctrl+Enter 临时会话"
-            >
-              <IconSend size={16} />
-            </button>
+            <div class="composer-actions">
+              <ExclusiveChatMark
+              token={roam()?.peer.token || state.settings?.relayToken || ""}
+              />
+              <Show when={!roam() && !quotaPeer()}>
+                <div ref={workflowPickerRef} class="composer-workflow-picker">
+                  <Show when={workflowMenuOpen()}>
+                    <div class="composer-workflow-menu">
+                      <div class="composer-workflow-head">本次会话运行的工作流</div>
+                      <button
+                        type="button"
+                        classList={{
+                          "composer-workflow-item": true,
+                          active: !selectedWorkflowId(),
+                        }}
+                        onClick={() => pickWorkflow(null)}
+                      >
+                        <span>普通会话</span>
+                        <small>不运行工作流，直接执行任务</small>
+                      </button>
+                      <For each={workflowChoices()}>
+                        {(wf) => (
+                          <button
+                            type="button"
+                            classList={{
+                              "composer-workflow-item": true,
+                              active: selectedWorkflowId() === wf.id,
+                            }}
+                            onClick={() => pickWorkflow(wf.id)}
+                            title={wf.sharedBy ? `来自 ${wf.sharedBy} 的团队分享` : undefined}
+                          >
+                            <span>{wf.name}</span>
+                            <small>
+                              {wf.sharedBy
+                                ? `团队 · ${wf.sharedBy}`
+                                : wf.builtin
+                                  ? "内置"
+                                  : "自定义"} · {wf.stages.length} 个节点
+                            </small>
+                          </button>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                  <button
+                    type="button"
+                    class="composer-btn workflow"
+                    classList={{ active: !!selectedWorkflow() }}
+                    onClick={() => setWorkflowMenuOpen((open) => !open)}
+                    title={
+                      selectedWorkflow()
+                        ? `工作流：${selectedWorkflow()!.name}`
+                        : "选择用哪个工作流运行本次任务"
+                    }
+                  >
+                    <IconMerge size={16} />
+                  </button>
+                </div>
+              </Show>
+              <button
+                type="button"
+                class="composer-btn clue"
+                title={state.pendingClueCard ? "查看或更换证据链" : "从证据链发起会话"}
+                onClick={() => setView("clues")}
+              >
+                <IconClue size={16} />
+              </button>
+              <button
+                class="composer-btn send"
+                disabled={
+                  (!text().trim() && attach.images().length === 0) ||
+                  (!!selectedWorkflow() && !text().trim() && attach.images().length === 0) ||
+                  (!cwd() && !roam()) ||
+                  busy() ||
+                  !peerReady() ||
+                  (usesPeerModels() && configAgentKinds().length === 0)
+                }
+                onClick={(e) => void submit({ ephemeral: e.ctrlKey || e.metaKey })}
+                title="发送（Enter）· Ctrl+Enter 临时会话"
+              >
+                <IconSend size={16} />
+              </button>
+            </div>
           </div>
         </div>
 

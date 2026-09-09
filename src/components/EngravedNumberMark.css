@@ -117,13 +117,15 @@
 
 /* 会话专属标识直接刻在输入框背景上，不呈现独立牌体，也不参与输入布局。 */
 .composer-engraved-watermark {
-  position: absolute;
+  position: relative;
   z-index: 0;
-  right: 14px;
-  bottom: 47px;
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: flex-end;
+  min-width: 0;
+  height: 48px;
+  padding: 0 16px 0 8px;
   pointer-events: none;
   user-select: none;
 }
@@ -150,7 +152,7 @@
   background: transparent;
   box-shadow: none;
   contain: none;
-  font-size: clamp(27px, 3.8vw, 46px);
+  font-size: clamp(44px, 4.2vw, 56px);
   opacity: 0.26;
 }
 
@@ -159,8 +161,17 @@
 }
 
 .composer-engraved-mark .engraved-number-mark-text {
+  align-items: center;
+  line-height: 0.85;
+  /* 花体实际笔画偏下，补偿字面中心，让签名与底排图标视觉对齐。 */
+  transform: translateY(-0.08em);
   color: inherit;
   text-shadow: none;
+}
+
+.composer-engraved-mark .engraved-number-mark-serial {
+  font-size: 0.24em;
+  transform: none;
 }
 
 .composer-engraved-mark .engraved-number-mark-name,
@@ -187,7 +198,7 @@
   --signature-mid: #d9b77d;
   --signature-to: #735033;
   --signature-glow: rgba(181, 121, 61, 0.28);
-  opacity: 0.36;
+  opacity: 0.52;
 }
 
 :root[data-theme="ink-light"] .composer-engraved-mark .engraved-number-mark-name,

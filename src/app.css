@@ -5,42 +5,39 @@
   --sans: "Inter Variable", "Noto Sans SC Variable", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
 }
 
-/* ===== 深色（默认）：Cursor / VS Code 风格——纯中性深灰基底、编辑器蓝主色 =====
-   设计原则：基底无色相（#1e1e1e 系纯灰阶，不发暖不发蓝）；侧栏更深一档、面板浮起；
-   主色用编辑器链接蓝 #3794ff；语义色对齐 VS Code Dark+ 语法色；
-   层级靠明度差与柔和投影，不靠描边堆砌。 */
+/* 深色工作台：深侧栏、石墨内容底色、抬亮的交互面板。 */
 :root,
 :root[data-theme="ink-dark"] {
   color-scheme: dark;
-  --bg: #1e1e1e;
-  --bg-sidebar: #181818;
-  --bg-panel: #212121;
-  --bg-hover: #2a2a2a;
-  --bg-active: #333333;
-  --bg-float: #252526;
-  --border: #2b2b2b;
-  --border-light: #3c3c3c;
-  --border-strong: #5a5a5a;
-  /* 表单输入底色：VS Code 输入框同款，比面板明显更亮（浮起可交互） */
-  --bg-input: #313131;
-  --card-border: #3c3c3c;
-  /* DOM 文字维持原层级；Canvas 对低对比小字单独提亮，抵消深底栅格化后的发虚。 */
-  --text: #cccccc;
-  --text-dim: #b4b4b4;
-  --text-muted: #8b8b8b;
-  --text-faint: #6e6e6e;
-  --canvas-text: #d4d4d4;
-  --canvas-text-dim: #b8b8b8;
-  --canvas-text-muted: #9a9a9a;
-  --canvas-text-faint: #7d7d7d;
+  --bg: #191c22;
+  --bg-sidebar: #12151a;
+  --bg-panel: #22262e;
+  --bg-hover: #2b303a;
+  --bg-active: #303745;
+  --bg-float: #282d36;
+  --border: #2b313b;
+  --border-light: #3b4350;
+  --border-strong: #626d7e;
+  /* 表单输入内凹于面板，和外部内容区域保持区分。 */
+  --bg-input: #191d24;
+  --card-border: #343c48;
+  /* DOM 与 Canvas 使用协调的文字明度阶梯。 */
+  --text: #edf0f5;
+  --text-dim: #bac3d0;
+  --text-muted: #959faf;
+  --text-faint: #8590a1;
+  --canvas-text: #e1e6ee;
+  --canvas-text-dim: #b9c3d1;
+  --canvas-text-muted: #9ba7b8;
+  --canvas-text-faint: #8590a1;
   --canvas-glow-accent: rgba(0, 122, 204, 0.12);
   --canvas-glow-cyan: rgba(79, 193, 233, 0.06);
   --canvas-glow-corner: rgba(0, 122, 204, 0.05);
-  --accent: #3794ff;
-  --accent-dim: rgba(55, 148, 255, 0.16);
+  --accent: #91adff;
+  --accent-dim: rgba(145, 173, 255, 0.12);
   --on-accent: #0f0f0e;
   /* 渐变主色的深端：primary 按钮 / Logo 用 */
-  --accent-2: #0078d4;
+  --accent-2: #526ed2;
   /* 科技感点睛色：编辑器青，只用于渐变、辉光、极少量强调 */
   --cyan: #4fc1e9;
   /* 表面顶部一道极淡的内高光——暗色面板「精雕细琢」感的关键 */
@@ -66,20 +63,16 @@
   --wash-2: rgba(206, 145, 120, 0.04);
   /* 点阵网格浓度 */
   --grid-dot: rgba(255, 255, 255, 0.05);
-  /* 大容器底色：留出透明度让全局星野透上来（100% = 完全遮住银河）。
-     侧栏遮光 78%（=透光 22%），与输入区同一档：银河是隐约透出的底纹，不抢文字。
-     想让银河更明显就把这个数字调小。 */
-  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 78%, transparent);
-  /* 输入区（composer）底色：同样留出透明度让银河透上来。这里是正在输入的正文，
-     透光比侧栏保守得多——低于 ~70% 后占位符与长文本会开始发飘。想更透就调小百分比。 */
-  --composer-veil: color-mix(in srgb, var(--bg-panel) 78%, transparent);
+  /* 暗色功能面板透出少量星野，同时保留稳定的文字对比。 */
+  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 82%, transparent);
+  --composer-veil: color-mix(in srgb, var(--bg-panel) 84%, transparent);
   /* 层级令牌：圆角三档 + 投影三档 */
-  --r-sm: 6px;
-  --r-md: 10px;
-  --r-lg: 14px;
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
-  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.45);
-  --shadow-lg: 0 18px 50px rgba(0, 0, 0, 0.55), 0 4px 14px rgba(0, 0, 0, 0.4);
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 18px;
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.16);
+  --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.18);
+  --shadow-lg: 0 24px 80px rgba(0, 0, 0, 0.4);
 }
 
 /* ===== 亮色：冷调云白基底、靛蓝主色 =====
@@ -88,34 +81,34 @@
 :root[data-theme="ink-light"] {
   color-scheme: light;
   /* 白底为主、浅灰侧栏为辅：干净通透，不发灰 */
-  --bg: #fbfcfe;
-  --bg-sidebar: #f2f4f7;
+  --bg: #f5f7fa;
+  --bg-sidebar: #edf1f6;
   --bg-panel: #ffffff;
-  --bg-hover: #eef0f4;
-  --bg-active: #e4e7ec;
+  --bg-hover: #e9edf4;
+  --bg-active: #dfe6f2;
   --bg-float: #ffffff;
-  --border: #e5e7ec;
-  --border-light: #d6dae2;
-  --border-strong: #aab1be;
+  --border: #e0e5ed;
+  --border-light: #d2d9e4;
+  --border-strong: #8e9aaf;
   --bg-input: #f2f4f7;
   --card-border: #e5e7ec;
   /* Canvas 使用略柔和的独立文字阶，降低亮底高对比笔画的锐利感，不影响 DOM。 */
-  --text: #181c24;
-  --text-dim: #454d5c;
-  --text-muted: #68707f;
-  --text-faint: #969daa;
+  --text: #202938;
+  --text-dim: #4a586c;
+  --text-muted: #647187;
+  --text-faint: #6f7c90;
   --canvas-text: #252a33;
   --canvas-text-dim: #505866;
   --canvas-text-muted: #707887;
-  --canvas-text-faint: #9299a5;
+  --canvas-text-faint: #6f7c90;
   /* 亮底对光色更敏感，压低到 DOM 背景叠加后的实际观感。 */
   --canvas-glow-accent: rgba(59, 94, 224, 0.055);
   --canvas-glow-cyan: rgba(13, 157, 180, 0.028);
   --canvas-glow-corner: rgba(59, 94, 224, 0.025);
-  --accent: #3b5ee0;
+  --accent: #4363c7;
   --accent-dim: rgba(59, 94, 224, 0.09);
   --on-accent: #ffffff;
-  --accent-2: #2a44b8;
+  --accent-2: #3554b7;
   --cyan: #0d9db4;
   --inset-hi: inset 0 1px 0 rgba(255, 255, 255, 0.55);
   --seal: #b06f2f;
@@ -137,15 +130,15 @@
   --wash-2: rgba(176, 111, 47, 0.045);
   /* 点阵网格浓度：亮底压得更淡，否则显脏 */
   --grid-dot: rgba(24, 28, 36, 0.028);
-  /* 亮色不出星图，大容器不必透光 */
-  --sidebar-veil: var(--bg-sidebar);
-  --composer-veil: var(--bg-panel);
-  --r-sm: 6px;
-  --r-md: 10px;
-  --r-lg: 14px;
-  --shadow-sm: 0 1px 2px rgba(24, 28, 36, 0.05);
-  --shadow-md: 0 4px 14px rgba(24, 28, 36, 0.08), 0 1px 3px rgba(24, 28, 36, 0.05);
-  --shadow-lg: 0 18px 50px rgba(24, 28, 36, 0.14), 0 4px 14px rgba(24, 28, 36, 0.07);
+  /* 亮色面板轻透公式背景，保留白色面板的阅读层次。 */
+  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 84%, transparent);
+  --composer-veil: color-mix(in srgb, var(--bg-panel) 86%, transparent);
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 18px;
+  --shadow-sm: 0 1px 3px rgba(30, 45, 75, 0.04);
+  --shadow-md: 0 8px 28px rgba(30, 45, 75, 0.07);
+  --shadow-lg: 0 24px 80px rgba(30, 45, 75, 0.18);
 }
 
 * {
@@ -198,6 +191,7 @@ button {
   height: 100%;
   z-index: -1;
   pointer-events: none;
+  opacity: 0.72;
 }
 
 /* ===== 滚动条：细巧现代，hover 才显现 ===== */
@@ -220,26 +214,23 @@ button {
 /* ===== 侧边栏 ===== */
 .sidebar {
   position: relative;
-  width: 270px;
-  min-width: 270px;
-  /* 顶部沁入一丝品牌色，向下快速隐没——与全局辉光呼应的纵深。
-     底色用 --sidebar-veil（暗色下带透明度），星野才能从侧栏透出来。 */
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--accent) 4%, var(--sidebar-veil)), var(--sidebar-veil) 220px);
+  width: clamp(248px, 20vw, 292px);
+  min-width: 248px;
+  background: var(--sidebar-veil);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
 }
 
 .sidebar-head {
-  padding: 14px 14px 10px;
+  padding: 24px 18px 18px;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 2px 2px 12px;
+  gap: 10px;
+  padding: 0 2px 24px;
 }
 
 .brand-icon {
@@ -249,8 +240,8 @@ button {
 
 .brand-name {
   font-weight: 600;
-  font-size: 16px;
-  letter-spacing: 0.2px;
+  font-size: 19px;
+  letter-spacing: -0.03em;
 }
 
 .brand-version {
@@ -269,22 +260,18 @@ button {
   justify-content: center;
   gap: 7px;
   width: 100%;
-  padding: 9px;
+  padding: 12px;
   border-radius: var(--r-md);
-  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 96%, #fff 4%), color-mix(in srgb, var(--accent-2) 76%, var(--cyan) 24%));
+  background: var(--accent-2);
   color: #fff;
   border: 1px solid transparent;
   font-weight: 550;
-  box-shadow:
-    0 2px 10px color-mix(in srgb, var(--accent) 30%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  box-shadow: var(--shadow-sm);
   transition: filter 0.15s, box-shadow 0.15s;
 }
 .new-thread-btn:hover {
   filter: brightness(1.07);
-  box-shadow:
-    0 4px 16px color-mix(in srgb, var(--accent) 38%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  box-shadow: var(--shadow-sm);
 }
 .new-thread-btn:active {
   filter: brightness(0.96);
@@ -294,20 +281,20 @@ button {
 .mode-stack {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  margin-top: 8px;
+  gap: 6px;
+  margin-top: 18px;
 }
 .mode-seg {
   display: flex;
-  gap: 3px;
+  gap: 4px;
   margin-top: 0;
-  padding: 3px;
+  padding: 0;
   border-radius: var(--r-md);
-  background: color-mix(in srgb, var(--text) 5%, transparent);
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 0;
 }
 .mode-seg.secondary {
-  background: color-mix(in srgb, var(--text) 3%, transparent);
+  background: transparent;
 }
 .mode-seg-btn {
   position: relative;
@@ -317,7 +304,7 @@ button {
   align-items: center;
   justify-content: center;
   gap: 5px;
-  height: 28px;
+  height: 36px;
   border-radius: var(--r-sm);
   font-size: 12px;
   color: var(--text-dim);
@@ -327,10 +314,10 @@ button {
   color: var(--text);
 }
 .mode-seg-btn.active {
-  color: var(--text);
+  color: var(--accent);
   font-weight: 550;
-  background: var(--bg-float);
-  box-shadow: var(--shadow-sm);
+  background: var(--accent-dim);
+  box-shadow: none;
 }
 .mode-seg-btn.open {
   color: var(--accent);
@@ -425,7 +412,7 @@ button {
 .thread-list {
   flex: 1;
   overflow-y: auto;
-  padding: 4px 8px;
+  padding: 8px 12px;
 }
 
 .thread-empty {
@@ -464,12 +451,12 @@ button {
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 26px;
+  height: 34px;
   padding: 0 8px;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.05em;
-  color: var(--text-faint);
+  color: var(--text-muted);
   text-transform: none;
 }
 .group-label svg {
@@ -514,8 +501,8 @@ button {
   display: flex;
   align-items: center;
   gap: 7px;
-  height: 32px;
-  padding: 0 8px;
+  height: 38px;
+  padding: 0 10px;
   border-radius: var(--r-sm);
   cursor: pointer;
   color: var(--text-dim);
@@ -527,9 +514,9 @@ button {
   color: var(--text);
 }
 .thread-item.active {
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg-active));
+  background: var(--accent-dim);
   color: var(--text);
-  box-shadow: inset 2px 0 0 var(--accent), var(--shadow-sm);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .thread-item.child {
   padding-left: 20px;
@@ -820,7 +807,7 @@ button {
 }
 
 .sidebar-foot {
-  padding: 10px 14px;
+  padding: 14px 18px;
   border-top: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -859,14 +846,15 @@ button {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 20px;
+  padding: 18px 28px;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
+  min-height: 68px;
 }
 
 .chat-title {
   font-weight: 600;
-  font-size: 14px;
+  font-size: 16px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2603,7 +2591,7 @@ button {
 
 /* ===== 输入区 ===== */
 .chat-foot {
-  padding: 10px clamp(14px, 3vw, 24px) 16px;
+  padding: 16px clamp(16px, 3vw, 32px) 24px;
   max-width: clamp(720px, 78vw, 980px);
   margin: 0 auto;
   width: 100%;
@@ -2616,13 +2604,13 @@ button {
   background: var(--composer-veil);
   border: 1px solid var(--border-light);
   border-radius: var(--r-lg);
-  padding: 12px 12px 8px 16px;
+  padding: 18px 18px 12px;
   box-shadow: var(--shadow-md), var(--inset-hi);
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 .composer:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  box-shadow: var(--shadow-md), 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent), var(--inset-hi);
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--border-light));
+  box-shadow: var(--shadow-md), 0 0 0 3px color-mix(in srgb, var(--accent) 9%, transparent);
 }
 .workflow-manual-review {
   margin: -4px 0 10px;
@@ -2745,13 +2733,13 @@ button {
   font-family: var(--sans);
   font-size: 14px;
   line-height: 1.5;
-  min-height: 64px;
+  min-height: clamp(140px, 20vh, 200px);
   max-height: min(520px, max(220px, 55vh));
   overflow-y: auto;
   user-select: text;
 }
 .composer-input::placeholder {
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
 .prompt-queue {
@@ -3285,10 +3273,11 @@ button {
   flex: 1;
   position: relative;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: center;
-  padding: clamp(20px, 5vh, 48px) clamp(12px, 3vw, 28px);
+  padding: clamp(32px, 7vh, 80px) clamp(24px, 5vw, 80px);
   overflow-y: auto;
+  min-width: 0;
 }
 
 /* 银河背景由 App 根的全局星野画布提供，首页自身不再挂画布 */
@@ -3297,11 +3286,12 @@ button {
   position: relative;
   z-index: 1;
   width: 100%;
-  max-width: clamp(560px, 62vw, 720px);
+  max-width: 880px;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: clamp(12px, 2.2vh, 20px);
+  align-items: stretch;
+  gap: 28px;
+  margin: auto;
 }
 
 .home-logo {
@@ -3309,15 +3299,15 @@ button {
 }
 
 .home-title {
-  font-size: clamp(23px, 2.8vw, 31px);
-  font-weight: 650;
+  font-size: clamp(28px, 3.2vw, 44px);
+  font-weight: 600;
   /* 大标题收紧字距，是无衬线排印「精致感」的关键 */
-  letter-spacing: -0.02em;
-  /* 蓝→青渐变文字：科技感主视觉 */
-  background: linear-gradient(100deg, var(--text) 30%, color-mix(in srgb, var(--accent) 72%, var(--cyan) 28%) 85%);
+  letter-spacing: -0.04em;
+  background: none;
   -webkit-background-clip: text;
   background-clip: text;
-  color: transparent;
+  color: var(--text);
+  line-height: 1.3;
 }
 
 .home-composer {
@@ -3326,17 +3316,19 @@ button {
   background: var(--composer-veil);
   border: 1px solid var(--border-light);
   border-radius: var(--r-lg);
-  padding: 14px 14px 10px;
+  padding: 24px 24px 16px;
   box-shadow: var(--shadow-md), var(--inset-hi);
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 .home-composer:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  box-shadow: var(--shadow-md), 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent), var(--inset-hi);
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--border-light));
+  box-shadow: var(--shadow-md), 0 0 0 3px color-mix(in srgb, var(--accent) 9%, transparent);
 }
 .home-composer .composer-input {
   width: 100%;
-  min-height: 64px;
+  min-height: clamp(180px, 24vh, 240px);
+  font-size: 15px;
+  line-height: 1.7;
 }
 
 /* ===== composer 工具条 ===== */
@@ -3344,7 +3336,7 @@ button {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding-top: 10px;
+  padding-top: 14px;
   /* 不换行：空间不足时 pill 文本内部省略，避免发送按钮被挤到下一行 */
   flex-wrap: nowrap;
 }
@@ -3356,6 +3348,16 @@ button {
 .composer-bar .pill {
   max-width: 100%;
   min-width: 0;
+  min-height: 32px;
+  border-color: transparent;
+  border-radius: 8px;
+  background: transparent;
+  text-align: left;
+}
+.composer-bar .pill:hover,
+.composer-bar .pill[aria-expanded="true"] {
+  background: var(--bg-hover);
+  border-color: var(--border);
 }
 .composer-run-stats {
   display: inline-flex;
@@ -3383,9 +3385,9 @@ button {
   0%, 100% { opacity: .45; }
   50% { opacity: 1; }
 }
-/* 模型选择：容器放宽到 420px，长模型名（后端 · 厂商名）尽量显示完整；空间不足时仍可收缩省略 */
+/* 模型选择按内容取宽，避免短标签撑成长条；长名称仍可收缩省略。 */
 .composer-bar .sel.wide {
-  flex: 0 1 420px;
+  flex: 0 1 auto;
   min-width: 0;
   max-width: min(420px, 100%);
 }
@@ -3399,8 +3401,9 @@ button {
   min-width: 0;
   max-width: 240px;
 }
-/* composer 内不设文本上限，由 .sel.wide 容器宽度控制（见上方 420px 规则） */
+/* 工具栏内由容器控制宽度，标签左对齐。 */
 .composer-bar .sel.wide .pill-text {
+  text-align: left;
   max-width: none;
 }
 .pill svg {
@@ -4262,29 +4265,33 @@ button {
 }
 
 .recent {
-  margin-top: 26px;
+  margin-top: 8px;
   width: 100%;
-  max-width: 480px;
+  max-width: none;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
 }
 
 .recent-label {
   font-size: 12px;
-  color: var(--text-faint);
-  margin-bottom: 4px;
-  padding-left: 10px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  padding-left: 12px;
+  font-weight: 550;
 }
 
 .recent-item {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 9px 12px;
+  gap: 12px;
+  padding: 13px 12px;
   border-radius: 8px;
   color: var(--text-dim);
   text-align: left;
+  min-width: 0;
 }
 .recent-item svg {
   flex-shrink: 0;
@@ -4296,10 +4303,12 @@ button {
 
 .recent-title {
   flex-shrink: 0;
-  max-width: 42%;
+  max-width: none;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
+  min-width: 0;
 }
 
 .recent-cwd {
@@ -4309,6 +4318,8 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  max-width: 36%;
+  text-align: right;
 }
 
 /* ===== 按钮 / 弹窗 ===== */
@@ -4424,8 +4435,8 @@ button {
 
 /* 设置弹窗：更宽更高、留白更足，切换选项卡时窗口大小稳定，内容区滚动而非整体伸缩 */
 .settings-modal {
-  width: 640px;
-  height: min(704px, 90vh);
+  width: 800px;
+  height: min(780px, 90vh);
 }
 .settings-modal .modal-head {
   padding: 16px 24px;
@@ -4435,8 +4446,10 @@ button {
 .settings-modal .modal-body {
   flex: 1 1 auto;
   min-height: 0;
-  gap: 16px;
-  padding: 16px 24px 20px;
+  gap: 20px;
+  padding: 24px 28px;
+  background: var(--bg);
+  border-radius: 0 0 var(--r-lg) var(--r-lg);
 }
 
 /* 设置分页导航：窄窗口自动换行，不横向溢出 */
@@ -4475,8 +4488,8 @@ button {
 .settings-group {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 18px;
+  gap: 20px;
+  padding: 24px;
   border: 1px solid var(--card-border);
   border-radius: 12px;
   background: var(--bg-panel);
@@ -4502,7 +4515,7 @@ button {
   margin: -8px 0 0;
   font-size: 12px;
   line-height: 1.6;
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
 /* Devin 后端内的紧凑额度信息 */
@@ -5353,18 +5366,14 @@ select.field-input {
    全局观感：环境辉光 / 明暗过渡 / 品牌 Logo / 主题切换
    ====================================================================== */
 
-/* 环境层：双色极光（品牌蓝 + 电光青）+ 极淡点阵网格，撑起空间的纵深与科技感 */
+/* 环境装饰统一交给低透明度星野，避免多层纹理叠加。 */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  background:
-    radial-gradient(1000px 520px at 28% -14%, color-mix(in srgb, var(--accent) 11%, transparent), transparent 70%),
-    radial-gradient(780px 460px at 86% -10%, color-mix(in srgb, var(--cyan) 6%, transparent), transparent 70%),
-    radial-gradient(820px 560px at 104% 112%, color-mix(in srgb, var(--accent) 5%, transparent), transparent 72%),
-    radial-gradient(circle, var(--grid-dot) 1px, transparent 1.6px);
+  background: none;
   background-size: auto, auto, auto, 26px 26px;
 }
 
@@ -7777,3 +7786,190 @@ button.clue-bar-item:hover,
 .be-target-field { align-items:start; }
 .be-target-input { display:flex; flex-direction:column; gap:6px; min-width:0; }
 .be-target-images { display:flex; flex-direction:column; gap:5px; }
+
+/* 首页标题、输入与历史保持同一条对齐轴。 */
+.home-intro {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.home-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+}
+.home-eyebrow .home-logo {
+  padding: 5px;
+  border-radius: 8px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  box-shadow: none;
+}
+.home-description {
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.8;
+}
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+@media (max-width: 1100px) {
+  .sidebar {
+    width: 248px;
+  }
+  .home {
+    padding: 36px 28px;
+  }
+  .home-composer {
+    padding: 20px 16px 14px;
+  }
+  .chat-head {
+    padding: 16px 20px;
+    gap: 8px;
+  }
+}
+@media (max-width: 760px) {
+  .sidebar {
+    width: 216px;
+    min-width: 216px;
+  }
+  .sidebar-head {
+    padding: 18px 12px 12px;
+  }
+  .home {
+    padding: 28px 18px;
+  }
+  .home-center {
+    gap: 22px;
+  }
+  .home-title {
+    font-size: 28px;
+  }
+  .home-description {
+    font-size: 13px;
+  }
+  .composer-bar {
+    flex-wrap: wrap;
+  }
+  .recent-cwd {
+    display: none;
+  }
+  .settings-group {
+    padding: 18px;
+  }
+}
+@media (max-height: 700px) {
+  .home {
+    padding-top: 28px;
+    padding-bottom: 28px;
+  }
+  .home-center {
+    gap: 20px;
+  }
+  .home-intro {
+    gap: 12px;
+    margin-bottom: 0;
+  }
+  .home-composer .composer-input {
+    min-height: 140px;
+  }
+  .recent {
+    padding-top: 16px;
+  }
+}
+
+/* 科学手稿：经典公式与线框图分区排布，中央降低对比。 */
+.dawn-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  overflow: hidden;
+  mask-image: radial-gradient(ellipse at 48% 46%, rgba(0, 0, 0, 0.06) 10%, rgba(0, 0, 0, 0.3) 42%, #000 82%);
+}
+:root[data-theme="ink-light"] .sky-backdrop { visibility: hidden; }
+:root[data-theme="ink-light"] .dawn-backdrop { display: block; }
+.science-field {
+  position: absolute;
+  inset: 16px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-rows: repeat(5, minmax(0, 1fr));
+  gap: 12px 20px;
+  animation: science-drift 100s ease-in-out infinite alternate;
+}
+.science-tile {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  opacity: 0.26;
+}
+.science-tile:nth-child(3n) { opacity: 0.18; }
+.science-equation {
+  fill: #62758d;
+  font-family: "Cambria Math", "Times New Roman", serif;
+}
+.science-geometry {
+  stroke: #62758d;
+  stroke-width: 1.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.science-hidden-edge { stroke-dasharray: 4 5; opacity: 0.65; }
+@keyframes science-drift {
+  from { transform: translate3d(-6px, 4px, 0); }
+  to { transform: translate3d(6px, -4px, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .science-field { animation: none; }
+}
+@media (max-width: 900px) {
+  .science-field { grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: repeat(6, minmax(0, 1fr)); gap: 8px; }
+  .science-tile:nth-child(n + 19) { display: none; }
+}
+
+/* 签名与发送操作共同换行，始终在底排对齐。 */
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+/* 根据输入面板实际宽度切换；窄面板中签名浮印在按钮上方，点击穿透。 */
+.home-composer,
+.composer {
+  container-type: inline-size;
+  container-name: composer;
+}
+.composer-actions {
+  position: relative;
+}
+@container composer (max-width: 620px) {
+  .composer-actions .composer-engraved-watermark {
+    position: absolute;
+    top: 50%;
+    right: 0;
+    transform: translateY(-50%);
+    z-index: 4;
+    padding: 0;
+    pointer-events: none;
+  }
+}
+
+.composer-bar { min-height: 64px; }
+@media (max-height: 600px) {
+  .composer .composer-input { min-height: 110px; }
+}
