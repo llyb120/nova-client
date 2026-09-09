@@ -285,11 +285,19 @@ const MILKY_CLUMPS: MilkyClump[] = (() => {
  * 云气层用 destination-out 擦出暗带还不够——那层之上撒的银河带恒星也要同步变稀、
  * 变暗，裂谷才真的"没有星星"，而不是一块贴上去的暗斑。
  */
+function dustCenter(l: number): number {
+  return 1.6 * Math.sin(l * D2R * 3) + 0.7 * Math.sin(l * D2R * 11);
+}
+
 function dustLane(l: number, b: number): number {
   const lw = l > 180 ? l - 360 : l;
   if (lw < -20 || lw > 95) return 0;
   const along = Math.min(1, Math.min(lw + 20, 95 - lw) / 15); // 两端收口
-  return along * Math.exp(-((b / 3.2) ** 2));
+  const center = dustCenter(lw);
+  const width = 1.7 + 0.7 * (1 + Math.sin(lw * D2R * 7));
+  const main = Math.exp(-(((b - center) / width) ** 2));
+  const branch = 0.55 * Math.exp(-(((b - center - 4.5) / 1.6) ** 2));
+  return along * Math.max(main, branch);
 }
 
 /** 银河带里的星场增强：沿银道多撒暗星，让"银河由无数恒星组成"的感觉出来 */
@@ -300,7 +308,7 @@ const MILKY_STARS: Star[] = (() => {
     const u = Math.max(rand(), 1e-9);
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
   };
-  for (let attempt = 0; stars.length < 420 && attempt < 4000; attempt++) {
+  for (let attempt = 0; stars.length < 1800 && attempt < 9000; attempt++) {
     const l = rand() * 360;
     const width = 7 + 6 * Math.exp(-((dlFromCore(l) / 55) ** 2));
     const b = gauss() * width * 0.8;
@@ -309,7 +317,7 @@ const MILKY_STARS: Star[] = (() => {
     // 尘埃越厚恒星越暗，并按概率直接省掉一部分，接近真实星野的疏密不均。
     if (dust > 0.45 && rand() < dust) continue;
     const eq = galacticToEquatorial(l, b);
-    stars.push({ ra: eq.ra, dec: eq.dec, mag: 3.4 + rand() * 2.4 + dust * 1.6 });
+    stars.push({ ra: eq.ra, dec: eq.dec, mag: 4.2 + Math.sqrt(rand()) * 2.6 + dust * 1.6 });
   }
   return stars;
 })();
@@ -328,10 +336,12 @@ const RIFT_CLUMPS: Array<{ ra: number; dec: number; size: number }> = (() => {
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
   };
   const rift: Array<{ ra: number; dec: number; size: number }> = [];
-  for (let i = 0; i < 70; i++) {
-    const l = ((rand() * 110 - 15) % 360 + 360) % 360; // 银心→天鹅段
-    const eq = galacticToEquatorial(l, gauss() * 1.9);
-    rift.push({ ra: eq.ra, dec: eq.dec, size: 4 + rand() * 7 });
+  for (let i = 0; i < 140; i++) {
+    const l = -18 + i * 0.8;
+    const branch = i % 3 === 0;
+    const eq = galacticToEquatorial(l, dustCenter(l) + (branch ? 4.5 : 0) + gauss() * 0.65);
+    const taper = Math.min(1, (l + 20) / 15, (95 - l) / 15);
+    rift.push({ ra: eq.ra, dec: eq.dec, size: (branch ? 2 : 3.2) * taper + rand() * 1.4 });
   }
   return rift;
 })();
@@ -479,6 +489,38 @@ const CLUMP_COOL_LEVELS = 8;
 const CLUMP_SPRITE_SIZE = 128;
 const CLUMP_SPRITES: HTMLCanvasElement[] = [];
 
+/** 固定种子的多尺度云纹只在精灵首次创建时计算，重绘只做 drawImage。 */
+function cloudTexture(canvas: HTMLCanvasElement, seed: number): void {
+  const ctx = canvas.getContext("2d")!;
+  const size = canvas.width;
+  const pixels = ctx.getImageData(0, 0, size, size);
+  const rand = mulberry32(seed);
+  const noise = new Float32Array(size * size);
+  for (const [cells, weight] of [[4, 0.5], [9, 0.28], [21, 0.15], [47, 0.07]]) {
+    const stride = cells + 1;
+    const grid = Float32Array.from({ length: stride * stride }, () => rand());
+    for (let y = 0; y < size; y++) {
+      const gy = y / size * cells;
+      const iy = Math.floor(gy);
+      const fy = gy - iy;
+      const ty = fy * fy * (3 - 2 * fy);
+      for (let x = 0; x < size; x++) {
+        const gx = x / size * cells;
+        const ix = Math.floor(gx);
+        const fx = gx - ix;
+        const tx = fx * fx * (3 - 2 * fx);
+        const a = grid[iy * stride + ix] * (1 - tx) + grid[iy * stride + ix + 1] * tx;
+        const b = grid[(iy + 1) * stride + ix] * (1 - tx) + grid[(iy + 1) * stride + ix + 1] * tx;
+        noise[y * size + x] += (a * (1 - ty) + b * ty) * weight;
+      }
+    }
+  }
+  for (let i = 0; i < noise.length; i++) {
+    pixels.data[i * 4 + 3] *= Math.min(1, 0.08 + noise[i] ** 2 * 2.5);
+  }
+  ctx.putImageData(pixels, 0, 0);
+}
+
 /** 径向渐变圆盘：中心实、边缘透，银河团块与银心辉光共用的软画笔。 */
 function makeDiscSprite(rgb: Rgb, coreStop: number): HTMLCanvasElement {
   const half = CLUMP_SPRITE_SIZE / 2;
@@ -500,14 +542,15 @@ function clumpSpriteFor(level: number): HTMLCanvasElement {
   let s = CLUMP_SPRITES[level];
   if (s) return s;
   // 颜色混合：暖白 ↔ 冷蓝
-  const warm: Rgb = [224, 216, 235];
-  const cool: Rgb = [186, 206, 250];
+  const warm: Rgb = [232, 222, 205];
+  const cool: Rgb = [202, 216, 237];
   const t = level / (CLUMP_COOL_LEVELS - 1);
   s = makeDiscSprite([
     Math.round(warm[0] + (cool[0] - warm[0]) * t),
     Math.round(warm[1] + (cool[1] - warm[1]) * t),
     Math.round(warm[2] + (cool[2] - warm[2]) * t),
   ], 0.45);
+  cloudTexture(s, 8191 + level * 137);
   CLUMP_SPRITES[level] = s;
   return s;
 }
@@ -515,7 +558,10 @@ function clumpSpriteFor(level: number): HTMLCanvasElement {
 /** 银心（核球）：老年恒星群的积分光是琥珀黄而非蓝白，中心也要更实一点才像核球。 */
 let coreSprite: HTMLCanvasElement | null = null;
 function galacticCoreSprite(): HTMLCanvasElement {
-  if (!coreSprite) coreSprite = makeDiscSprite([255, 222, 176], 0.3);
+  if (!coreSprite) {
+    coreSprite = makeDiscSprite([245, 224, 191], 0.3);
+    cloudTexture(coreSprite, 27182);
+  }
   return coreSprite;
 }
 
@@ -573,9 +619,9 @@ export function paintStarMap(
     x + r >= -margin && x - r <= width + margin && y + r >= -margin && y - r <= height + margin;
 
   // ── 银河（最底层）：低分云气层 + screen 叠加 ────────────────────────────
-  // ponytail: 云气层上限 480px，靠放大模糊代替细节，4K 下出现块状再换瓦片噪声。
+  // 云纹层最长边限制为 960px（最多约 3.5MiB），不随屏幕 DPR 增长。
   {
-    const scale = Math.min(0.4, 480 / Math.max(width, height));
+    const scale = Math.min(0.65, 960 / Math.max(width, height));
     const lw = Math.max(2, Math.round(width * scale));
     const lh = Math.max(2, Math.round(height * scale));
     if (!milkyLayer || milkyLayer.width !== lw || milkyLayer.height !== lh) {
@@ -594,7 +640,7 @@ export function paintStarMap(
         Math.round(c.cool * (CLUMP_COOL_LEVELS - 1)),
       );
       // 大团按面积摊薄，避免大光斑压过星野
-      m.globalAlpha = 0.12 * c.b * (7 / (4 + c.size));
+      m.globalAlpha = 0.2 * c.b * (7 / (4 + c.size));
       m.drawImage(clumpSpriteFor(level), (x - r) * scale, (y - r) * scale, r * 2 * scale, r * 2 * scale);
     }
     // 银心辉光：暖色大团一次点亮
@@ -602,7 +648,7 @@ export function paintStarMap(
       const { x, y, s } = project(proj, GALACTIC_CORE);
       const r = proj.s * 13 * D2R * 1.5 * s;
       if (inView(x, y, r)) {
-        m.globalAlpha = 0.4;
+        m.globalAlpha = 0.32;
         m.drawImage(galacticCoreSprite(), (x - r) * scale, (y - r) * scale, r * 2 * scale, r * 2 * scale);
       }
     }
@@ -612,7 +658,7 @@ export function paintStarMap(
       const { x, y, s } = project(proj, c);
       const r = proj.s * c.size * D2R * s;
       if (!inView(x, y, r)) continue;
-      m.globalAlpha = 0.28;
+      m.globalAlpha = 0.65;
       m.drawImage(clumpSpriteFor(0), (x - r) * scale, (y - r) * scale, r * 2 * scale, r * 2 * scale);
     }
     m.globalCompositeOperation = "source-over";
@@ -624,8 +670,6 @@ export function paintStarMap(
   }
 
   // 亮星带衍射芒、暗星不带；两种各三套色温（精灵缓存见模块级 starSpriteFor）
-  const tintRand = mulberry32(4451);
-
   const drawStar = (star: Star, boost = 0) => {
     const { x, y } = project(proj, star);
     if (!inView(x, y)) return;
@@ -637,7 +681,17 @@ export function paintStarMap(
     // 已知红超巨星固定暖色，其余按随机色温
     const isWarmGiant =
       Math.abs(star.ra - 5.92) < 0.05 || Math.abs(star.ra - 16.49) < 0.05; // 参宿四 / 心宿二
-    const color: Rgb = isWarmGiant ? [255, 206, 160] : starTint(tintRand());
+    // 色温由天体坐标决定，星星进出视口不会使其他恒星突然变色。
+    const tint = Math.abs(Math.sin(star.ra * 127.1 + star.dec * 311.7) * 43758.5453) % 1;
+    const color: Rgb = isWarmGiant ? [255, 206, 160] : starTint(tint);
+    if (star.mag > 5) {
+      const flux = 10 ** (-0.4 * (star.mag - 5));
+      ctx.globalAlpha = 0.28 * flux;
+      ctx.fillStyle = `rgb(${color.join(",")})`;
+      ctx.fillRect(x - 0.35, y - 0.35, 0.7, 0.7);
+      ctx.globalAlpha = 1;
+      return;
+    }
     const sprite = starSpriteFor(color, bright);
     ctx.globalAlpha = alpha;
     ctx.drawImage(sprite, x - size / 2, y - size / 2, size, size);

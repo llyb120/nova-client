@@ -8,6 +8,11 @@ import { paintStarMap } from "./starMap";
 /** 星图背景低频更新间隔；恒星位移很小，30 秒步进不会产生可见跳动。 */
 export const STAR_MAP_UPDATE_MS = 30_000;
 
+/** 装饰性背景最多 4M 像素 / 2x；文字画布保持自己的原生分辨率。 */
+export function backdropPixelRatio(width: number, height: number): number {
+  return Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(4_000_000 / Math.max(1, width * height)));
+}
+
 const SKY_BUCKET_MS = 30_000;
 
 export interface BackdropTheme {
@@ -152,7 +157,7 @@ export function paintCanvasBackdrop(
   onReady?: () => void,
   canBuild: () => boolean = () => true,
 ): void {
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = backdropPixelRatio(width, height);
   const pixelW = Math.max(1, Math.round(width * dpr));
   const pixelH = Math.max(1, Math.round(height * dpr));
   const themeKey = [theme.bg, theme.glowAccent, theme.glowCyan, theme.glowCorner, theme.gridDot].join("|");
