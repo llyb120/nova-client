@@ -768,14 +768,18 @@ impl SdkManager {
     /// 出借 Lyra 额度：进程内导出本地 config.jsonc 的生效配置，
     /// 并把 {env:NAME} 密钥占位符解析成字面量，
     /// 借用方无需出借方的环境变量即可直接使用该配置。
-    pub async fn export_quota_credentials(&self) -> Result<String, String> {
+    pub async fn export_quota_credentials(&self, model: &str) -> Result<String, String> {
         if self.adapter.agent_kind() != AgentKind::Lyra {
             return Err("仅 Lyra 支持导出共享凭证".into());
         }
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let value = self.run_bridge(&cwd, json!({ "action": "export" })).await?;
+        let shared_models: Vec<String> = self.app.state::<AppState>().settings.lock().unwrap()
+            .quota_shared_models.iter().filter_map(|key| key.strip_prefix("lyra:").map(str::to_string)).collect();
+        let value = self.run_bridge(&cwd, json!({
+            "action": "export", "model": model, "sharedModels": shared_models
+        })).await?;
         value
             .as_str()
             .filter(|config| !config.trim().is_empty())
@@ -848,12 +852,14 @@ impl SdkManager {
         }
         *self.model_options.lock().unwrap() = Some(value.clone());
         let kind = self.adapter.agent_kind();
-        model_cache::save(&crate::nova_data_dir(&self.app), kind.as_str(), &value);
+        if self.borrowed_root().is_none() {
+            model_cache::save(&crate::nova_data_dir(&self.app), kind.as_str(), &value);
+            let _ = self.app.emit(
+                EV_OPTIONS,
+                json!({ "agentKind": kind.as_str(), "options": value }),
+            );
+        }
         self.model_options_revalidated.store(true, Ordering::SeqCst);
-        let _ = self.app.emit(
-            EV_OPTIONS,
-            json!({ "agentKind": kind.as_str(), "options": value }),
-        );
         Ok(value)
     }
 
@@ -916,7 +922,7 @@ impl SdkManager {
         model: &str,
         prompt: String,
     ) -> Result<String, String> {
-        let data_dir = nova_data_dir(&self.app);
+        let data_dir = self.borrowed_root().unwrap_or_else(|| nova_data_dir(&self.app));
         match crate::lyra_complete::complete_direct(
             &self.http,
             &data_dir,

@@ -246,6 +246,42 @@ pub fn model_options(config: &Value) -> Vec<Value> {
     out
 }
 
+/// 仅导出明确共享的模型；不携带其它 provider、模型或顶层私有配置。
+pub fn shared_config(config: &Value, selections: &[String], selected: &str) -> Result<Value, String> {
+    if !selections.iter().any(|value| value == selected) {
+        return Err("Lyra 模型已取消共享".into());
+    }
+    let available = model_options(config);
+    let mut providers = Map::new();
+    for selection in selections {
+        if !available.iter().any(|option| option["value"].as_str() == Some(selection)) {
+            if selection == selected {
+                return Err(format!("共享的 Lyra 模型不存在：{selected}"));
+            }
+            continue;
+        }
+        let (base, variant) = selection.rsplit_once("/variant/")
+            .map(|(base, variant)| (base, Some(variant))).unwrap_or((selection, None));
+        let (provider_id, model_id) = base.split_once('/').ok_or("Lyra 模型格式无效")?;
+        let source = &config["provider"][provider_id];
+        let mut model = model_by_id(source, model_id).ok_or("Lyra 模型不存在")?.clone();
+        let variant_config = variant.map(|name| model["variants"][name].clone());
+        model.as_object_mut().ok_or("Lyra 模型配置无效")?.remove("variants");
+        let provider = providers.entry(provider_id.to_string()).or_insert_with(|| {
+            let mut provider = source.clone();
+            provider["models"] = json!({});
+            provider
+        });
+        let models = provider["models"].as_object_mut().ok_or("Lyra models 配置无效")?;
+        let entry = models.entry(model_id.to_string()).or_insert(model);
+        if let Some(name) = variant {
+            if entry.get("variants").is_none() { entry["variants"] = json!({}); }
+            entry["variants"][name] = variant_config.unwrap();
+        }
+    }
+    Ok(json!({ "model": selected, "provider": providers }))
+}
+
 pub fn default_model(config: &Value) -> Result<String, String> {
     let options = model_options(config);
     let has = |value: &str| {
@@ -286,6 +322,7 @@ pub fn default_model(config: &Value) -> Result<String, String> {
 
 /// options 中被解析器消费、不应透传到请求体的内置键。
 const RESERVED_OPTION_KEYS: &[&str] = &[
+    "model",
     "baseURL",
     "baseUrl",
     "apiKey",
@@ -384,6 +421,9 @@ pub fn resolve_model(
     let owned;
     let selection = match selection {
         Some(value) if value.contains('/') => value,
+        Some(value) if !value.trim().is_empty() => {
+            return Err("Lyra model 必须是 provider/model 格式".into());
+        }
         _ => {
             owned = default_model(config)?;
             &owned
@@ -623,6 +663,28 @@ pub fn resolve_config_env(value: &Value, env: &HashMap<String, String>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_config_limits_models_and_rejects_invalid_selection() {
+        let config = json!({"model":"p/other", "private":"secret", "provider": {
+            "p":{"api":"openai-completions", "options":{"baseURL":"http://localhost/v1", "apiKey":"key", "model":"wrong"},
+                "models":{"gemini/model":{"variants":{"low":{}, "high":{}}}, "other":{}}},
+            "private":{"options":{"apiKey":"private-key"}, "models":{"hidden":{}}}
+        }});
+        let selected = "p/gemini/model/variant/high";
+        let shared = shared_config(&config, &[selected.into()], selected).unwrap();
+        assert_eq!(model_options(&shared).len(), 1);
+        assert_eq!(default_model(&shared).unwrap(), selected);
+        assert!(shared.get("private").is_none());
+        assert!(shared["provider"].get("private").is_none());
+        assert!(shared["provider"]["p"]["models"].get("other").is_none());
+        let resolved = resolve_model(&shared, Some(selected), &HashMap::new()).unwrap();
+        assert_eq!(resolved.model.id, "gemini/model");
+        assert!(!resolved.model.extra_options.contains_key("model"));
+        assert!(resolve_model(&shared, Some("gpt"), &HashMap::new()).is_err());
+        assert!(resolve_model(&shared, Some("p/other"), &HashMap::new()).is_err());
+        assert!(shared_config(&config, &[selected.into()], "p/other").is_err());
+    }
 
     #[test]
     fn unknown_openai_proxy_defaults_match_legacy_pi() {

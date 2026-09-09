@@ -2,6 +2,7 @@ import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
+import { SkyBackdrop } from "./components/SkyBackdrop";
 import { EvidenceChainView } from "./components/EvidenceChainView";
 import { HomeView } from "./components/HomeView";
 import BrowserView from "./components/BrowserView";
@@ -202,6 +203,8 @@ export default function App() {
 
   return (
     <div class="app">
+      {/* 全局星野：整扇窗口一张画布，压在应用层之下，暗色主题才出银河 */}
+      <SkyBackdrop />
       <Sidebar
         onOpenSettings={() => setShowSettings(true)}
         onOpenAchievements={() => setShowAchievements(true)}

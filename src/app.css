@@ -66,6 +66,13 @@
   --wash-2: rgba(206, 145, 120, 0.04);
   /* 点阵网格浓度 */
   --grid-dot: rgba(255, 255, 255, 0.05);
+  /* 大容器底色：留出透明度让全局星野透上来（100% = 完全遮住银河）。
+     侧栏遮光 78%（=透光 22%），与输入区同一档：银河是隐约透出的底纹，不抢文字。
+     想让银河更明显就把这个数字调小。 */
+  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 78%, transparent);
+  /* 输入区（composer）底色：同样留出透明度让银河透上来。这里是正在输入的正文，
+     透光比侧栏保守得多——低于 ~70% 后占位符与长文本会开始发飘。想更透就调小百分比。 */
+  --composer-veil: color-mix(in srgb, var(--bg-panel) 78%, transparent);
   /* 层级令牌：圆角三档 + 投影三档 */
   --r-sm: 6px;
   --r-md: 10px;
@@ -130,6 +137,9 @@
   --wash-2: rgba(176, 111, 47, 0.045);
   /* 点阵网格浓度：亮底压得更淡，否则显脏 */
   --grid-dot: rgba(24, 28, 36, 0.028);
+  /* 亮色不出星图，大容器不必透光 */
+  --sidebar-veil: var(--bg-sidebar);
+  --composer-veil: var(--bg-panel);
   --r-sm: 6px;
   --r-md: 10px;
   --r-lg: 14px;
@@ -178,6 +188,18 @@ button {
   height: 100%;
 }
 
+/* 全局星野背景：整扇窗口一张画布，压在应用层之下（负 z-index）。
+   拖动窗口期间由 CSS 拉伸旧位图，停手后再按新尺寸重绘。 */
+.sky-backdrop {
+  position: fixed;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  z-index: -1;
+  pointer-events: none;
+}
+
 /* ===== 滚动条：细巧现代，hover 才显现 ===== */
 ::-webkit-scrollbar {
   width: 10px;
@@ -200,9 +222,10 @@ button {
   position: relative;
   width: 270px;
   min-width: 270px;
-  /* 顶部沁入一丝品牌色，向下快速隐没——与全局辉光呼应的纵深 */
+  /* 顶部沁入一丝品牌色，向下快速隐没——与全局辉光呼应的纵深。
+     底色用 --sidebar-veil（暗色下带透明度），星野才能从侧栏透出来。 */
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--accent) 4%, var(--bg-sidebar)), var(--bg-sidebar) 220px);
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 4%, var(--sidebar-veil)), var(--sidebar-veil) 220px);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -976,20 +999,15 @@ button {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: var(--bg);
+  /* 背景交给全局星野画布；正文画布是透明层，透明到这里才能看到银河。 */
+  background: transparent;
 }
-.transcript-canvas-backdrop,
 .transcript-canvas-only {
   position: absolute;
   inset: 0;
   display: block;
   width: 100%;
   height: 100%;
-}
-.transcript-canvas-backdrop {
-  pointer-events: none;
-}
-.transcript-canvas-only {
   outline: none;
   cursor: default;
   -webkit-font-smoothing: antialiased;
@@ -2595,7 +2613,7 @@ button {
   position: relative;
   display: flex;
   flex-direction: column;
-  background: var(--bg-panel);
+  background: var(--composer-veil);
   border: 1px solid var(--border-light);
   border-radius: var(--r-lg);
   padding: 12px 12px 8px 16px;
@@ -3273,15 +3291,7 @@ button {
   overflow-y: auto;
 }
 
-/* 银河背景画布：与会话画布同款，星图仅暗色主题绘制 */
-.home-backdrop {
-  position: absolute;
-  inset: 0;
-  display: block;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-}
+/* 银河背景由 App 根的全局星野画布提供，首页自身不再挂画布 */
 
 .home-center {
   position: relative;
@@ -3313,7 +3323,7 @@ button {
 .home-composer {
   position: relative;
   width: 100%;
-  background: var(--bg-panel);
+  background: var(--composer-veil);
   border: 1px solid var(--border-light);
   border-radius: var(--r-lg);
   padding: 14px 14px 10px;

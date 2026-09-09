@@ -3570,10 +3570,29 @@ fn set_thread_reasoning_effort(
     thread_id: String,
     reasoning_effort: Option<String>,
 ) -> Result<(), String> {
-    let mut store = state.store.lock().unwrap();
-    let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
-    thread.reasoning_effort = reasoning_effort.filter(|s| !s.is_empty());
-    store.save();
+    let agent_kind;
+    {
+        let mut store = state.store.lock().unwrap();
+        let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
+        thread.reasoning_effort = reasoning_effort.filter(|s| !s.is_empty());
+        agent_kind = thread.agent_kind.clone();
+        store.save();
+    }
+    // CodeBuddy 的思考强度是会话级配置（ACP `session/set_config_option` 的
+    // `thought_level`），已挂载的会话要即时下发，否则要等下一次 ensure_session 才生效。
+    if matches!(
+        agent_kind,
+        AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus
+    ) {
+        let mgr = if agent_kind == AgentKind::Devin {
+            state.acp.clone()
+        } else {
+            state.codebuddy.clone()
+        };
+        tauri::async_runtime::spawn(async move {
+            mgr.sync_thread_config(&thread_id).await;
+        });
+    }
     Ok(())
 }
 

@@ -280,6 +280,18 @@ const MILKY_CLUMPS: MilkyClump[] = (() => {
   return clumps;
 })();
 
+/**
+ * 大裂谷尘埃带的消光权重（0-1）：银心→天鹅一段沿银道的分子云把背后的星光挡掉。
+ * 云气层用 destination-out 擦出暗带还不够——那层之上撒的银河带恒星也要同步变稀、
+ * 变暗，裂谷才真的"没有星星"，而不是一块贴上去的暗斑。
+ */
+function dustLane(l: number, b: number): number {
+  const lw = l > 180 ? l - 360 : l;
+  if (lw < -20 || lw > 95) return 0;
+  const along = Math.min(1, Math.min(lw + 20, 95 - lw) / 15); // 两端收口
+  return along * Math.exp(-((b / 3.2) ** 2));
+}
+
 /** 银河带里的星场增强：沿银道多撒暗星，让"银河由无数恒星组成"的感觉出来 */
 const MILKY_STARS: Star[] = (() => {
   const rand = mulberry32(778899);
@@ -288,16 +300,44 @@ const MILKY_STARS: Star[] = (() => {
     const u = Math.max(rand(), 1e-9);
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
   };
-  for (let i = 0; i < 420; i++) {
+  for (let attempt = 0; stars.length < 420 && attempt < 4000; attempt++) {
     const l = rand() * 360;
     const width = 7 + 6 * Math.exp(-((dlFromCore(l) / 55) ** 2));
     const b = gauss() * width * 0.8;
     if (Math.abs(b) > width * 2) continue;
+    const dust = dustLane(l, b);
+    // 尘埃越厚恒星越暗，并按概率直接省掉一部分，接近真实星野的疏密不均。
+    if (dust > 0.45 && rand() < dust) continue;
     const eq = galacticToEquatorial(l, b);
-    stars.push({ ra: eq.ra, dec: eq.dec, mag: 3.4 + rand() * 2.4 });
+    stars.push({ ra: eq.ra, dec: eq.dec, mag: 3.4 + rand() * 2.4 + dust * 1.6 });
   }
   return stars;
 })();
+
+/** 银心方向（人马座），银河最亮点的辉光锚点 */
+const GALACTIC_CORE = galacticToEquatorial(0, 0);
+
+/**
+ * 大裂谷尘埃带：银心到天鹅座之间沿银道面的暗带，只存赤道坐标，
+ * 绘制时在云气层上 destination-out 擦出裂缝，银河才有“分叉”感。
+ */
+const RIFT_CLUMPS: Array<{ ra: number; dec: number; size: number }> = (() => {
+  const rand = mulberry32(112358);
+  const gauss = () => {
+    const u = Math.max(rand(), 1e-9);
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
+  };
+  const rift: Array<{ ra: number; dec: number; size: number }> = [];
+  for (let i = 0; i < 70; i++) {
+    const l = ((rand() * 110 - 15) % 360 + 360) % 360; // 银心→天鹅段
+    const eq = galacticToEquatorial(l, gauss() * 1.9);
+    rift.push({ ra: eq.ra, dec: eq.dec, size: 4 + rand() * 7 });
+  }
+  return rift;
+})();
+
+/** 银河云气低分层复用，避免每 30s 重建分配 */
+let milkyLayer: HTMLCanvasElement | null = null;
 
 /** 全天背景暗星 */
 const FIELD_STARS: Star[] = (() => {
@@ -306,7 +346,8 @@ const FIELD_STARS: Star[] = (() => {
   for (let i = 0; i < 360; i++) {
     stars.push({
       ra: rand() * 24,
-      dec: rand() * 160 - 80,
+      // 等面积采样：赤纬必须按 asin 分布，直接均匀取赤纬会让天球极区在投影里堆成一团。
+      dec: Math.asin(rand() * 2 - 1) / D2R,
       mag: 3.0 + rand() * 2.6,
     });
   }
@@ -343,8 +384,12 @@ function makeProjection(width: number, height: number, now: number): Projection 
   };
 }
 
-/** 球面立体投影（约 160° 广角） */
-function project(p: Projection, star: { ra: number; dec: number }): { x: number; y: number } {
+/**
+ * 球面立体投影（约 160° 广角）。
+ * 返回值里的 s 是该点处的局部放大率（视场中心 = 1，边缘最大约 3）。广角投影会把边缘面元
+ * 拉大，云气团块必须按 s 一起放大，否则银河带靠近视场边缘时会相对收缩，看着被“掐”细。
+ */
+function project(p: Projection, star: { ra: number; dec: number }): { x: number; y: number; s: number } {
   const dec = star.dec * D2R;
   const dRa = star.ra * 15 * D2R - p.raC;
   const sinD = Math.sin(dec);
@@ -354,6 +399,8 @@ function project(p: Projection, star: { ra: number; dec: number }): { x: number;
   return {
     x: p.cx + k * cosD * Math.sin(dRa),
     y: p.cy - k * (p.cosC * sinD - p.sinC * cosD * Math.cos(dRa)),
+    // 切向放大率 2/(1+cosθ)； θ 接近 180°（观测者背后）时不让它爆炸。
+    s: Math.min(3, Math.max(0.75, 2 / Math.max(denom, 0.667))),
   };
 }
 
@@ -432,6 +479,23 @@ const CLUMP_COOL_LEVELS = 8;
 const CLUMP_SPRITE_SIZE = 128;
 const CLUMP_SPRITES: HTMLCanvasElement[] = [];
 
+/** 径向渐变圆盘：中心实、边缘透，银河团块与银心辉光共用的软画笔。 */
+function makeDiscSprite(rgb: Rgb, coreStop: number): HTMLCanvasElement {
+  const half = CLUMP_SPRITE_SIZE / 2;
+  const [r, g, b] = rgb;
+  const c = document.createElement("canvas");
+  c.width = CLUMP_SPRITE_SIZE;
+  c.height = CLUMP_SPRITE_SIZE;
+  const ctx = c.getContext("2d")!;
+  const grad = ctx.createRadialGradient(half, half, 0, half, half, half);
+  grad.addColorStop(0, `rgba(${r},${g},${b},1)`);
+  grad.addColorStop(coreStop, `rgba(${r},${g},${b},0.55)`);
+  grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, CLUMP_SPRITE_SIZE, CLUMP_SPRITE_SIZE);
+  return c;
+}
+
 function clumpSpriteFor(level: number): HTMLCanvasElement {
   let s = CLUMP_SPRITES[level];
   if (s) return s;
@@ -439,22 +503,20 @@ function clumpSpriteFor(level: number): HTMLCanvasElement {
   const warm: Rgb = [224, 216, 235];
   const cool: Rgb = [186, 206, 250];
   const t = level / (CLUMP_COOL_LEVELS - 1);
-  const r = Math.round(warm[0] + (cool[0] - warm[0]) * t);
-  const g = Math.round(warm[1] + (cool[1] - warm[1]) * t);
-  const b = Math.round(warm[2] + (cool[2] - warm[2]) * t);
-  const half = CLUMP_SPRITE_SIZE / 2;
-  const c = document.createElement("canvas");
-  c.width = CLUMP_SPRITE_SIZE;
-  c.height = CLUMP_SPRITE_SIZE;
-  const ctx = c.getContext("2d")!;
-  const grad = ctx.createRadialGradient(half, half, 0, half, half, half);
-  grad.addColorStop(0, `rgba(${r},${g},${b},1)`);
-  grad.addColorStop(0.45, `rgba(${r},${g},${b},0.55)`);
-  grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, CLUMP_SPRITE_SIZE, CLUMP_SPRITE_SIZE);
-  CLUMP_SPRITES[level] = c;
-  return c;
+  s = makeDiscSprite([
+    Math.round(warm[0] + (cool[0] - warm[0]) * t),
+    Math.round(warm[1] + (cool[1] - warm[1]) * t),
+    Math.round(warm[2] + (cool[2] - warm[2]) * t),
+  ], 0.45);
+  CLUMP_SPRITES[level] = s;
+  return s;
+}
+
+/** 银心（核球）：老年恒星群的积分光是琥珀黄而非蓝白，中心也要更实一点才像核球。 */
+let coreSprite: HTMLCanvasElement | null = null;
+function galacticCoreSprite(): HTMLCanvasElement {
+  if (!coreSprite) coreSprite = makeDiscSprite([255, 222, 176], 0.3);
+  return coreSprite;
 }
 
 /* ===== 主题适配 ===== */
@@ -506,24 +568,59 @@ export function paintStarMap(
 
   const proj = makeProjection(width, height, now);
   const margin = 48;
-  const inView = (x: number, y: number) =>
-    x >= -margin && x <= width + margin && y >= -margin && y <= height + margin;
+  // 圆形物体的可见性：整体外接盒与视场求交，不能只看左上/右下两个角（大团会误判为不可见）。
+  const inView = (x: number, y: number, r = 0) =>
+    x + r >= -margin && x - r <= width + margin && y + r >= -margin && y - r <= height + margin;
 
-  // ── 银河（最底层）：星团云气叠加（预生成精灵 + globalAlpha，避免逐团创建渐变）──
+  // ── 银河（最底层）：低分云气层 + screen 叠加 ────────────────────────────
+  // ponytail: 云气层上限 480px，靠放大模糊代替细节，4K 下出现块状再换瓦片噪声。
   {
-    const baseA = 0.055;
+    const scale = Math.min(0.4, 480 / Math.max(width, height));
+    const lw = Math.max(2, Math.round(width * scale));
+    const lh = Math.max(2, Math.round(height * scale));
+    if (!milkyLayer || milkyLayer.width !== lw || milkyLayer.height !== lh) {
+      milkyLayer = document.createElement("canvas");
+      milkyLayer.width = lw;
+      milkyLayer.height = lh;
+    }
+    const m = milkyLayer.getContext("2d")!;
+    m.clearRect(0, 0, lw, lh);
     for (const c of MILKY_CLUMPS) {
-      const { x, y } = project(proj, c);
-      const r = proj.s * c.size * D2R * 1.5;
-      if (!inView(x - r, y - r) && !inView(x + r, y + r)) continue;
+      const { x, y, s } = project(proj, c);
+      const r = proj.s * c.size * D2R * 1.5 * s;
+      if (!inView(x, y, r)) continue;
       const level = Math.min(
         CLUMP_COOL_LEVELS - 1,
         Math.round(c.cool * (CLUMP_COOL_LEVELS - 1)),
       );
-      ctx.globalAlpha = baseA * c.b;
-      ctx.drawImage(clumpSpriteFor(level), x - r, y - r, r * 2, r * 2);
+      // 大团按面积摊薄，避免大光斑压过星野
+      m.globalAlpha = 0.12 * c.b * (7 / (4 + c.size));
+      m.drawImage(clumpSpriteFor(level), (x - r) * scale, (y - r) * scale, r * 2 * scale, r * 2 * scale);
     }
-    ctx.globalAlpha = 1;
+    // 银心辉光：暖色大团一次点亮
+    {
+      const { x, y, s } = project(proj, GALACTIC_CORE);
+      const r = proj.s * 13 * D2R * 1.5 * s;
+      if (inView(x, y, r)) {
+        m.globalAlpha = 0.4;
+        m.drawImage(galacticCoreSprite(), (x - r) * scale, (y - r) * scale, r * 2 * scale, r * 2 * scale);
+      }
+    }
+    // 大裂谷：擦除银道面上的细长暗带，银河出现分叉
+    m.globalCompositeOperation = "destination-out";
+    for (const c of RIFT_CLUMPS) {
+      const { x, y, s } = project(proj, c);
+      const r = proj.s * c.size * D2R * s;
+      if (!inView(x, y, r)) continue;
+      m.globalAlpha = 0.28;
+      m.drawImage(clumpSpriteFor(0), (x - r) * scale, (y - r) * scale, r * 2 * scale, r * 2 * scale);
+    }
+    m.globalCompositeOperation = "source-over";
+    m.globalAlpha = 1;
+    ctx.save();
+    ctx.globalCompositeOperation = "screen";
+    ctx.drawImage(milkyLayer, 0, 0, lw, lh, 0, 0, width, height);
+    ctx.restore();
   }
 
   // 亮星带衍射芒、暗星不带；两种各三套色温（精灵缓存见模块级 starSpriteFor）
@@ -567,13 +664,23 @@ export function paintStarMap(
     ctx.stroke();
   }
 
-  // ── 星座名称：低透明度小字，跟随投影位置 ──────────────────────────────
+  // ── 星座主星（压在连线之上）─────────────────────────────────────────────
+  for (const con of CONSTELLATIONS) {
+    for (const s of con.stars) drawStar(s, 0.1);
+  }
+  drawStar(POLARIS, 0.15);
+
+  // ── 星座名称：最后压在所有星点之上，不被云气与亮星盖住 ────────────────
   {
-    ctx.fillStyle = "rgba(198,210,238,0.30)";
     ctx.font =
       '500 10.5px "Inter Variable","Noto Sans SC Variable","Segoe UI","Microsoft YaHei UI","PingFang SC",system-ui,sans-serif';
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
+    // 字形下方垫一层紧贴的暗色柔影：银河亮区的雾气冲不淡字，
+    // 又比在整块区域压一层暗板自然。
+    ctx.shadowColor = "rgba(8,9,12,0.9)";
+    ctx.shadowBlur = 5;
+    ctx.fillStyle = "rgba(206,218,244,0.38)";
     const spaced = ctx as CanvasRenderingContext2D & { letterSpacing?: string };
     if (spaced.letterSpacing !== undefined) spaced.letterSpacing = "2px";
     for (const con of CONSTELLATIONS) {
@@ -582,11 +689,7 @@ export function paintStarMap(
       ctx.fillText(con.name, x, y);
     }
     if (spaced.letterSpacing !== undefined) spaced.letterSpacing = "0px";
+    ctx.shadowColor = "transparent";
+    ctx.shadowBlur = 0;
   }
-
-  // ── 星座主星（压在线之上）───────────────────────────────────────────────
-  for (const con of CONSTELLATIONS) {
-    for (const s of con.stars) drawStar(s, 0.1);
-  }
-  drawStar(POLARIS, 0.15);
 }
