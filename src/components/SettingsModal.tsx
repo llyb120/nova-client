@@ -748,7 +748,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     claudecodeEnabled: claudecodeEnabled(),
     cursorEnabled: cursorEnabled(),
     opencodeEnabled: opencodeEnabled(),
-    codexIntegration: "sdk",
+    codexIntegration: "app-server",
     codebuddyIntegration: "acp",
     claudecodeIntegration: "sdk",
     cursorIntegration: "sdk",
@@ -1826,7 +1826,7 @@ export function SettingsModal(props: { onClose: () => void }) {
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge codex`}>{agentLabel("codex")}</span>
-                <span class="fixed-integration">SDK</span>
+                <span class="fixed-integration">app-server</span>
                 <Show when={backendMissing("codex")}>
                   <span class="backend-missing">未检测到 CLI</span>
                 </Show>

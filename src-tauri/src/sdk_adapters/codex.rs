@@ -11,7 +11,7 @@ impl SdkAdapter for CodexAdapter {
     }
 
     fn label(&self) -> &'static str {
-        "Codex+"
+        "Codex app-server"
     }
 
     fn bridge(&self) -> (&'static str, &'static [u8]) {
@@ -27,11 +27,42 @@ impl SdkAdapter for CodexAdapter {
             proxy: settings.codex_proxy.clone(),
             path_env: "NOVA_CODEX_PATH",
             api_key: None,
-            extra_env: vec![(
-                "NOVA_PONYTAIL",
-                if settings.ponytail_enabled { "1" } else { "0" }.into(),
-            )],
+            extra_env: vec![
+                (
+                    "NOVA_PONYTAIL",
+                    if settings.ponytail_enabled { "1" } else { "0" }.into(),
+                ),
+                (
+                    "NOVA_FAST_CONTEXT",
+                    if settings.context_tools_enabled() {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .into(),
+                ),
+            ],
         }
+    }
+
+    fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
+        &[(
+            "nova-tools-mcp.mjs",
+            include_bytes!("../../resources/nova-tools-mcp.mjs"),
+        )]
+    }
+
+    fn done_is_cancelled(&self, event: &Value) -> bool {
+        event["cancelled"].as_bool().unwrap_or(false)
+    }
+
+    fn supports_native_steer(&self) -> bool {
+        true
+    }
+
+    fn cancel_grace_attempts(&self) -> usize {
+        // Let turn/interrupt persist the turn and app-server shut down its MCP children.
+        60
     }
 
     fn permission_prefix(&self) -> &'static str {

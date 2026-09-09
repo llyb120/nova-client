@@ -2079,7 +2079,7 @@ enum TextSnapshotChange<'a> {
     Replace,
 }
 
-/// Codex SDK 的 `item.updated` 携带累计文本快照。把纯追加部分转换成前端 delta，
+/// Codex app-server 桥接层输出累计文本快照。把纯追加部分转换成前端 delta，
 /// 同文快照不重复刷新；若服务端改写了既有文本，则回退到整条 upsert。
 fn text_snapshot_change<'a>(previous: &Item, next: &'a Item) -> TextSnapshotChange<'a> {
     let texts = match (previous, next) {
@@ -2100,7 +2100,7 @@ fn text_snapshot_change<'a>(previous: &Item, next: &'a Item) -> TextSnapshotChan
         .unwrap_or(TextSnapshotChange::Replace)
 }
 
-/// Codex SDK 用 `todo_list` 快照表达计划进度；转换成 Nova 各后端共用的计划结构。
+/// 旧版 Codex 桥接层用 `todo_list` 快照表达计划进度；转换成 Nova 各后端共用的计划结构。
 fn codex_todo_plan(value: &Value) -> Option<Value> {
     if value.get("type").and_then(Value::as_str) != Some("todo_list") {
         return None;

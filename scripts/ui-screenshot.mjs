@@ -59,7 +59,7 @@ const mockSettings = {
   relayServer: "", relayToken: "", relayGroups: "", remoteControlEnabled: false,
   quotaSharedModels: [], devinEnabled: true, codexEnabled: true,
   codebuddyEnabled: false, claudecodeEnabled: false, cursorEnabled: false,
-  opencodeEnabled: false, codexIntegration: "sdk", codebuddyIntegration: "sdk",
+  opencodeEnabled: false, codexIntegration: "app-server", codebuddyIntegration: "sdk",
   claudecodeIntegration: "sdk", cursorIntegration: "sdk", opencodeIntegration: "sdk",
   worktreeDir: "", sessionAutoCleanupEnabled: false, sessionAutoCleanupHours: 720,
   semanticEnabled: false, embedEndpoint: "", embedModel: "", embedApiKey: "",

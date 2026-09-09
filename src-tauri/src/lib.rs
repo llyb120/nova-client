@@ -89,7 +89,7 @@ pub struct AppState {
     pub codebuddy: Arc<AcpManager>,
     /// Lyra Rust 原生 agent 后端（进程内运行，不经 Node bridge）。
     pub lyra: Arc<SdkManager>,
-    /// Codex 官方 TypeScript SDK 后端，不经过 app-server 集成层。
+    /// Codex app-server 对话后端，复用公共桥接运行时；不依赖 Codex SDK。
     pub codexplus: Arc<SdkManager>,
     pub claudeplus: Arc<SdkManager>,
     pub cursorplus: Arc<SdkManager>,
@@ -154,7 +154,7 @@ impl AppState {
         }
     }
 
-    /// ACP 标题生成只由 Devin 提供；OpenCode/Codex SDK 有自己的标题入口。
+    /// ACP 标题生成只由 Devin 提供；OpenCode SDK / Codex app-server 有自己的标题入口。
     fn title_fallback_mgr(&self, _origin: &AgentKind) -> Arc<AcpManager> {
         self.acp.clone()
     }

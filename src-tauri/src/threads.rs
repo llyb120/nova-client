@@ -519,7 +519,7 @@ pub struct Thread {
     /// Claude / CodeBuddy 在下一条 prompt 启动时执行的原生分叉位置。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_native_restore: Option<PendingNativeRestore>,
-    /// Codex SDK 返回会话累计量；保留上次快照以换算本轮增量。
+    /// Codex app-server 返回会话累计量；保留上次快照以换算本轮增量。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_usage_snapshot: Option<CodexUsageSnapshot>,
     /// 临时会话：程序关闭时自动删除，不跨重启持久化

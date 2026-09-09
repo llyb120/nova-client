@@ -5,6 +5,13 @@
 
 技术栈：**Rust (Tauri 2) + SolidJS + TypeScript**。
 
+Codex 后端通过本机 `codex app-server` 的 stdio JSON-RPC 接入，不依赖 `@openai/codex-sdk`。
+对话、新建/恢复/分叉会话、标题生成、取消和运行中追加引导均使用 app-server；沿用本机 Codex 登录、代理与隔离凭证配置。
+开启上下文检索时，每次新建或恢复会话都会挂载 `nova-tools` MCP 的 Polaris 工具，并注入工具使用规则；Ponytail 引导遵循设置开关，计划模式保持只读。
+设置中的旧 `codexIntegration: "sdk"` 会自动迁移为 `"app-server"`。
+
+修改接入代码后可运行 `npm run test:codex-app-server`。设置环境变量 `NOVA_CODEX_LIVE_TEST=1`，并先运行 `npm run build:codex-bridge` 和 `npm run build:nova-tools-mcp`，可额外验证本机 app-server 的对话、恢复、标题和打包 Polaris MCP 调用链（使用本地模拟模型与测试上下文服务，不访问真实模型服务）。
+
 ## 工作原理
 
 应用不调用任何 HTTP API，而是把本机的 `devin` CLI 作为子进程拉起：
