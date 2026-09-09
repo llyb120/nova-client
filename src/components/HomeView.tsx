@@ -3,11 +3,6 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show }
 
 import { api } from "../ipc";
 import { latestFireStage } from "../threadDisplay";
-import {
-  paintCanvasBackdrop,
-  readBackdropTheme,
-  STAR_MAP_UPDATE_MS,
-} from "../canvasTranscript/base";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
   promptHistory,
@@ -75,7 +70,6 @@ export function HomeView() {
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
   const attach = createImageAttachments({ enableFileDrop: true });
   const noteFlow = createNoteFlow();
-  let backdropEl!: HTMLCanvasElement;
   const [cwd, setCwd] = createSignal(
     sessionSeed && !sessionSeed.roam ? sessionSeed.cwd : "",
   );
@@ -160,42 +154,6 @@ export function HomeView() {
     document.addEventListener("pointerdown", closeWorkflowMenu);
     onCleanup(() => {
       document.removeEventListener("pointerdown", closeWorkflowMenu);
-    });
-  });
-
-  // 与会话画布同款的银河背景；paintStarMap 按底色亮度跳过浅色主题，仅暗色下出星空。
-  onMount(() => {
-    const paint = () => {
-      const canvas = backdropEl;
-      const w = canvas.clientWidth;
-      const h = canvas.clientHeight;
-      if (!w || !h) return;
-      const dpr = window.devicePixelRatio || 1;
-      const pixelW = Math.max(1, Math.round(w * dpr));
-      const pixelH = Math.max(1, Math.round(h * dpr));
-      if (canvas.width !== pixelW || canvas.height !== pixelH) {
-        canvas.width = pixelW;
-        canvas.height = pixelH;
-      }
-      const ctx = canvas.getContext("2d", { alpha: false });
-      if (!ctx) return;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      // 星图按 30s 时桶缓存，新桶 idle 构建完成后经 onReady 重绘。
-      paintCanvasBackdrop(ctx, w, h, readBackdropTheme(), Date.now(), paint);
-    };
-    paint();
-    const ro = new ResizeObserver(paint);
-    ro.observe(backdropEl);
-    // 主题切换时立即按新配色重绘，不等低频星图定时器。
-    const mo = new MutationObserver(paint);
-    mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    const starMapTimer = window.setInterval(() => {
-      if (!document.hidden) paint();
-    }, STAR_MAP_UPDATE_MS);
-    onCleanup(() => {
-      ro.disconnect();
-      mo.disconnect();
-      window.clearInterval(starMapTimer);
     });
   });
 
@@ -1047,7 +1005,6 @@ export function HomeView() {
 
   return (
     <main class="home">
-      <canvas ref={backdropEl} class="home-backdrop" aria-hidden="true" />
       <div class="home-center">
         <IconLogo size={44} class="home-logo" />
         <h1 class="home-title">我们该做什么？</h1>

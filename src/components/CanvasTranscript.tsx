@@ -1,9 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { message } from "@tauri-apps/plugin-dialog";
 import {
-  paintCanvasBackdrop,
   readBackdropTheme,
-  STAR_MAP_UPDATE_MS,
 } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
@@ -967,7 +965,6 @@ function openInEditor(path: string, line?: number) {
 
 export function CanvasTranscript(props: CanvasTranscriptProps) {
   let canvasEl!: HTMLCanvasElement;
-  let backdropCanvasEl!: HTMLCanvasElement;
   let hostEl!: HTMLDivElement;
 
   // state
@@ -1915,21 +1912,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function fillTextCrisp(ctx: CanvasRenderingContext2D, text: string, x: number, y: number) {
     ctx.fillText(text, snap(x), snap(y));
-  }
-
-  function paintBackdrop(timestamp = Date.now()) {
-    const canvas = backdropCanvasEl;
-    if (!canvas || viewW <= 0 || viewH <= 0) return;
-    const pixelW = Math.max(1, Math.round(viewW * dpr));
-    const pixelH = Math.max(1, Math.round(viewH * dpr));
-    if (canvas.width !== pixelW || canvas.height !== pixelH) {
-      canvas.width = pixelW;
-      canvas.height = pixelH;
-    }
-    const ctx = canvas.getContext("2d", { alpha: false });
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    paintCanvasBackdrop(ctx, viewW, viewH, pal, timestamp, paintBackdrop, () => !props.running);
   }
 
   function paintAll() {
@@ -3449,13 +3431,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     viewW = w; viewH = h;
     const pixelW = Math.max(1, Math.round(w * dpr));
     const pixelH = Math.max(1, Math.round(h * dpr));
-    backdropCanvasEl.width = pixelW;
-    backdropCanvasEl.height = pixelH;
     canvasEl.width = pixelW;
     canvasEl.height = pixelH;
     maxScroll = Math.max(0, totalHeight - viewH);
     if (keepBottom) scrollY = maxScroll;
-    paintBackdrop();
     paintAll();
   }
 
@@ -3466,7 +3445,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     void rebuild();
 
     let resizeTimer: number | undefined;
-    let canvasVisible = false;
     // 窗口尺寸：区分“用户拖动窗口”与“应用内部布局变化”（发送消息、切会话、
     // 侧边栏/阶段栏开合都会改变宿主尺寸）。内部变化时旧位图会被 CSS 拉伸，
     // 文字位图跟着缩放，表现为“字体大小闪变”，必须立即重分配并重排；
@@ -3495,12 +3473,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         void rebuild();
       }, 200);
     });
-    const visibilityObserver = new IntersectionObserver(([entry]) => {
-      canvasVisible = !!entry?.isIntersecting;
-      if (canvasVisible && !props.running) paintBackdrop();
-    });
     ro.observe(hostEl);
-    visibilityObserver.observe(hostEl);
 
     // Rebuild fallback-font measurements after bundled web fonts become available.
     void document.fonts.ready.then(() => {
@@ -3509,16 +3482,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     });
 
     const mo = new MutationObserver(() => {
-      // 背景 Canvas 不参与正文 rebuild，主题切换时必须立即重绘；否则会一直保留
-      // 旧主题，直到低频星图定时器的下一帧。
+      // 背景已交给全局星野画布维护，这里只需按新配色重排正文。
       pal = readPalette();
-      paintBackdrop();
       void rebuild();
     });
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    const starMapTimer = window.setInterval(() => {
-      if (!document.hidden && canvasVisible && !props.running) paintBackdrop();
-    }, STAR_MAP_UPDATE_MS);
 
     function onMouseLeave() {
       if (scrollDragging || selecting) return;
@@ -3557,9 +3525,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     onCleanup(() => {
       disposed = true;
       ro.disconnect();
-      visibilityObserver.disconnect();
       mo.disconnect();
-      window.clearInterval(starMapTimer);
       if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
       editResizeObserver?.disconnect();
       editResizeObserver = undefined;
@@ -3671,7 +3637,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   return (
     <div class="canvas-transcript-host" ref={hostEl}>
       <fileMenu.Menu />
-      <canvas ref={backdropCanvasEl} class="transcript-canvas-backdrop" aria-hidden="true" />
       <canvas ref={canvasEl} class="transcript-canvas-only" tabindex="0" aria-label="会话记录" />
       {editing() && (
         <div class="canvas-prompt-editor" style={editStyle()} ref={bindEditHost}>

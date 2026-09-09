@@ -38,14 +38,39 @@ type IdleWindow = Window & {
   requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
 };
 
+/**
+ * 缓存里每张都是整幅设备位图：1080p@2x 约 20MB，4K 约 33MB。按「张数」限 8 会放行
+ * 上百 MB，所以按实际像素内存回收，最多 4 张（够容纳两种画布尺寸各一个时桶）。
+ */
+const BACKDROP_CACHE_MAX_BYTES = 72 * 1024 * 1024;
+const BACKDROP_CACHE_MAX_ENTRIES = 4;
+
+function backdropBytes(surface: HTMLCanvasElement): number {
+  return surface.width * surface.height * 4;
+}
+
+/** Map 保持插入序，从头删就是最旧的那张；至少留一张，避免新旧交替时空窗重建。 */
+function trimBackdropCache(): void {
+  let bytes = 0;
+  for (const surface of backdropCache.values()) bytes += backdropBytes(surface);
+  while (
+    backdropCache.size > 1 &&
+    (bytes > BACKDROP_CACHE_MAX_BYTES || backdropCache.size > BACKDROP_CACHE_MAX_ENTRIES)
+  ) {
+    const oldestKey = backdropCache.keys().next().value!;
+    bytes -= backdropBytes(backdropCache.get(oldestKey)!);
+    backdropCache.delete(oldestKey);
+  }
+}
+
 function cacheBackdrop(groupKey: string, key: string, surface: HTMLCanvasElement): void {
   // 每个尺寸/主题只保留最新恒星时桶，避免旧桶占满小缓存后规律性 miss。
   for (const cachedKey of backdropCache.keys()) {
     if (cachedKey.startsWith(`${groupKey}|`) && cachedKey !== key) backdropCache.delete(cachedKey);
   }
   if (backdropCache.has(key)) backdropCache.delete(key);
-  while (backdropCache.size >= 8) backdropCache.delete(backdropCache.keys().next().value!);
   backdropCache.set(key, surface);
+  trimBackdropCache();
 }
 
 /** 创建不含星图的静态底图（纯色底 + 柔光 + 点阵）。 */
