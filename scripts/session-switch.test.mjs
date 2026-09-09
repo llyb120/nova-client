@@ -10,6 +10,53 @@ const store = readFileSync(new URL("../src/store.ts", import.meta.url), "utf8");
 const sidebar = readFileSync(new URL("../src/components/Sidebar.tsx", import.meta.url), "utf8");
 const js = (source) => transformSync(source, { loader: "ts", target: "esnext" }).code;
 
+test("缓存切换跳过加载帧并取消流式节流，首次加载仍允许先绘制提示", () => {
+  const canvas = readFileSync(new URL("../src/components/CanvasTranscript.tsx", import.meta.url), "utf8");
+  const source = canvas.slice(canvas.indexOf("  const queueRebuildFrame ="), canvas.indexOf("  function resizeCanvas()"));
+  const frames = new Map();
+  const timers = new Map();
+  let serial = 0;
+  let paints = 0;
+  const props = { running: true };
+  const schedule = new Function("props", "requestAnimationFrame", "cancelAnimationFrame", "window", "performance", "rebuild", `
+    let rebuildRaf = 0, rebuildAfterPaint = false, rebuildTimer, lastRebuildAt = 0;
+    const STREAM_LAYOUT_INTERVAL_MS = 80;
+    ${js(source)}
+    return scheduleRebuild;
+  `)(props, (cb) => { frames.set(++serial, cb); return serial; }, (id) => frames.delete(id), {
+    setTimeout: (cb) => { timers.set(++serial, cb); return serial; },
+    clearTimeout: (id) => timers.delete(id),
+  }, { now: () => 0 }, () => { paints++; });
+  const frame = () => {
+    const pending = [...frames.values()];
+    frames.clear();
+    for (const cb of pending) cb();
+  };
+
+  schedule(); // streaming update is throttled
+  assert.equal(timers.size, 1);
+  schedule(false, true); // warm switch must bypass that timer
+  assert.equal(timers.size, 0);
+  frame();
+  assert.equal(paints, 1);
+
+  schedule(true, true); // cold switch retains a loading paint
+  frame();
+  assert.equal(paints, 1);
+  assert.equal(frames.size, 1);
+  schedule(false, true); // snapshot arrives during the loading frame
+  assert.equal(frames.size, 1);
+  frame();
+  assert.equal(paints, 2);
+  assert.equal(frames.size, 0);
+
+  schedule(true, true);
+  frame();
+  assert.equal(paints, 2);
+  frame();
+  assert.equal(paints, 3);
+});
+
 test("多 stage 同链反复切换复用导航列表，新增阶段后更新，断链和成环不挂起", () => {
   const chat = readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8");
   const source = chat.slice(chat.indexOf("  const stageIndex ="), chat.indexOf("  /** 是否工作流/Fire/员工事件链"));
