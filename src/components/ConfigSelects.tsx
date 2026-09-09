@@ -213,7 +213,7 @@ export function ModelPicker(props: {
   const sharedList = createMemo<SelectOption[]>(() =>
     (props.sharedModels ?? []).flatMap(({ peer, options }) =>
       (sharedOnly() ? [props.agentKind] : ALL_AGENT_KINDS).flatMap((kind) =>
-        modelOptionsOf(kind, !sharedOnly(), options[kind] ?? null).map((option) => ({
+        modelOptionsOf(kind, false, options[kind] ?? null).map((option) => ({
           ...option,
           value: sharedOnly() ? option.value : encodeQuotaModelValue(peer.token, kind, option.value),
           backend: sharedOnly() ? undefined : `quota:${peer.token}:${kind}`,
