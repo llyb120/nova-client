@@ -15,10 +15,11 @@ impl SdkAdapter for CodexAdapter {
     }
 
     fn bridge(&self) -> (&'static str, &'static [u8]) {
-        (
-            "codex-bridge.mjs",
-            include_bytes!("../../resources/codex-bridge.mjs"),
-        )
+        ("", &[])
+    }
+
+    fn runs_inprocess(&self) -> bool {
+        true
     }
 
     fn launch_config(&self, settings: &Settings) -> LaunchConfig {
@@ -43,13 +44,6 @@ impl SdkAdapter for CodexAdapter {
                 ),
             ],
         }
-    }
-
-    fn bridge_sidecars(&self) -> &'static [(&'static str, &'static [u8])] {
-        &[(
-            "nova-tools-mcp.mjs",
-            include_bytes!("../../resources/nova-tools-mcp.mjs"),
-        )]
     }
 
     fn done_is_cancelled(&self, event: &Value) -> bool {

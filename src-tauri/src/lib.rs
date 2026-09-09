@@ -7,6 +7,7 @@ mod clipboard;
 mod clues;
 mod codex;
 mod codex_radar;
+mod codex_app_server;
 mod context_service;
 mod credential_roaming;
 mod experience;
@@ -5491,6 +5492,11 @@ pub fn nova_data_dir(app: &tauri::AppHandle) -> PathBuf {
 /// Lyra agent 原生入口（`nova lyra`）：命中则执行 stdio bridge 协议并退出，不启动 GUI。
 pub fn maybe_run_lyra() -> bool {
     lyra::maybe_run()
+}
+
+/// Codex 的原生 Polaris MCP 入口，在 GUI 和单实例检查之前处理 stdio。
+pub fn maybe_run_codex_mcp() -> bool {
+    codex_app_server::mcp::maybe_run()
 }
 
 /// 自更新内部 helper 入口：命中则替换旧 exe 并退出，不启动 GUI。

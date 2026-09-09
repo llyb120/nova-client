@@ -27,6 +27,7 @@ pub use prompt::{
 };
 
 pub use bridge::{run_oneshot, spawn_prompt, InProcessSession};
+pub(crate) use prompt::PONYTAIL_RULES;
 pub use config::set_nova_root;
 
 /// 若 argv 命中 `lyra` 子命令则执行 stdio bridge 协议并返回 true（调用方随后直接退出）。
