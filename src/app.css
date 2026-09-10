@@ -949,6 +949,7 @@ button {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   /* 禁止滚动到边界后的橡皮筋回弹和向外层继续传递滚动。 */
   overscroll-behavior: none;
   /* 防止浏览器滚动锚定在虚拟列表卸挂时把位置拽回去，导致发送后钉底失效 */

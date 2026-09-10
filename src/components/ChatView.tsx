@@ -701,7 +701,7 @@ export function ChatView() {
     state.threads.find((t) => t.id === state.currentId),
   );
   const isFireThread = () => /^\[Fire\]/.test(currentMeta()?.title ?? "");
-  const showTimeMachine = () => timeStops().length > 0 && !isFireThread();
+  const showTimeMachine = () => !isFireThread();
   // 索引只依赖会话树；同链切换时根 id 不变，不重扫历史、不重建阶段列表。
   const stageIndex = createMemo(() => {
     const byId = new Map(state.threads.map((thread) => [thread.id, thread]));
