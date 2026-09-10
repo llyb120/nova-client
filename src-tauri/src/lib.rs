@@ -7,6 +7,7 @@ mod clipboard;
 mod clues;
 mod codex;
 mod codex_radar;
+mod codex_app_server;
 mod context_service;
 mod credential_roaming;
 mod experience;
@@ -89,7 +90,7 @@ pub struct AppState {
     pub codebuddy: Arc<AcpManager>,
     /// Lyra Rust 原生 agent 后端（进程内运行，不经 Node bridge）。
     pub lyra: Arc<SdkManager>,
-    /// Codex 官方 TypeScript SDK 后端，不经过 app-server 集成层。
+    /// Codex app-server 对话后端，复用公共桥接运行时；不依赖 Codex SDK。
     pub codexplus: Arc<SdkManager>,
     pub claudeplus: Arc<SdkManager>,
     pub cursorplus: Arc<SdkManager>,
@@ -154,7 +155,7 @@ impl AppState {
         }
     }
 
-    /// ACP 标题生成只由 Devin 提供；OpenCode/Codex SDK 有自己的标题入口。
+    /// ACP 标题生成只由 Devin 提供；OpenCode SDK / Codex app-server 有自己的标题入口。
     fn title_fallback_mgr(&self, _origin: &AgentKind) -> Arc<AcpManager> {
         self.acp.clone()
     }
@@ -5491,6 +5492,11 @@ pub fn nova_data_dir(app: &tauri::AppHandle) -> PathBuf {
 /// Lyra agent 原生入口（`nova lyra`）：命中则执行 stdio bridge 协议并退出，不启动 GUI。
 pub fn maybe_run_lyra() -> bool {
     lyra::maybe_run()
+}
+
+/// Codex 的原生 Polaris MCP 入口，在 GUI 和单实例检查之前处理 stdio。
+pub fn maybe_run_codex_mcp() -> bool {
+    codex_app_server::mcp::maybe_run()
 }
 
 /// 自更新内部 helper 入口：命中则替换旧 exe 并退出，不启动 GUI。

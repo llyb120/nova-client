@@ -271,7 +271,7 @@ pub struct Settings {
     pub cursor_enabled: bool,
     pub opencode_enabled: bool,
     pub opencodeplus_enabled: bool,
-    /// 各后端接入方式：sdk / acp。Devin 固定使用 ACP。
+    /// 各后端接入方式：app-server / sdk / acp。Codex 固定使用 app-server。
     pub codex_integration: String,
     pub codebuddy_integration: String,
     pub claudecode_integration: String,
@@ -366,7 +366,7 @@ impl Default for Settings {
             cursor_enabled: false,
             opencode_enabled: false,
             opencodeplus_enabled: false,
-            codex_integration: "sdk".into(),
+            codex_integration: "app-server".into(),
             codebuddy_integration: "acp".into(),
             claudecode_integration: "sdk".into(),
             cursor_integration: "sdk".into(),
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn sdk_integration_defaults_match_backend_policy() {
         let settings = Settings::default();
-        assert_eq!(settings.codex_integration, "sdk");
+        assert_eq!(settings.codex_integration, "app-server");
         assert_eq!(settings.codebuddy_integration, "acp");
         assert_eq!(settings.opencode_integration, "sdk");
         assert_eq!(settings.claudecode_integration, "sdk");
@@ -676,7 +676,7 @@ mod tests {
         fs::write(
             dir.join("settings.json"),
             r#"{
-                "codexIntegration":"acp",
+                "codexIntegration":"sdk",
                 "codebuddyIntegration":"sdk",
                 "codebuddyplusEnabled":true,
                 "claudecodeIntegration":"acp",
@@ -688,7 +688,7 @@ mod tests {
 
         let settings = Settings::load(&dir);
 
-        assert_eq!(settings.codex_integration, "sdk");
+        assert_eq!(settings.codex_integration, "app-server");
         assert_eq!(settings.codebuddy_integration, "acp");
         assert!(!settings.codebuddyplus_enabled);
         assert_eq!(settings.claudecode_integration, "sdk");
@@ -786,8 +786,8 @@ impl Settings {
         settings.codebuddyplus_enabled = false;
         settings.opencodeplus_enabled = false;
         // SDK bridge 已移除：CodeBuddy 固定走官方 HTTP 传输（`codebuddy --serve`
-        // + /api/v1/acp）；其余后端 SDK 是唯一受支持的接入方式。
-        settings.codex_integration = "sdk".into();
+        // + /api/v1/acp）；Codex 固定走 app-server，其余后端使用 SDK。
+        settings.codex_integration = "app-server".into();
         settings.codebuddy_integration = "acp".into();
         settings.claudecode_integration = "sdk".into();
         settings.cursor_integration = "sdk".into();

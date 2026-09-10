@@ -5,6 +5,14 @@
 
 技术栈：**Rust (Tauri 2) + SolidJS + TypeScript**。
 
+Codex 后端由 Rust 直接启动和管理本机 `codex app-server`，通过 stdio JSON-RPC 接入，不经过 Node.js / `.mjs` 桥接，也不依赖 `@openai/codex-sdk`。
+对话、新建/恢复/分叉会话、标题生成、取消和运行中追加引导均使用 app-server；沿用本机 Codex 登录、代理与隔离凭证配置。
+开启上下文检索时，每次新建或恢复会话都会挂载 `nova-tools` MCP 的 Polaris 工具，并注入工具使用规则；Ponytail 引导遵循设置开关，计划模式保持只读。
+设置中的旧 `codexIntegration: "sdk"` 会自动迁移为 `"app-server"`。
+Codex 会话默认注入内置 RTK 的调用指令，使用 `nova __rtk` 压缩受支持命令的输出，无需额外安装 RTK。新建、恢复和分叉会话均适用，与 Polaris/Ponytail 开关无关；标题生成不注入。这与 RTK 上游的 Codex 接入方式一致，依赖模型遵循指令，并非 Lyra 的执行前强制重写；需要原始输出或不受支持的命令仍直接执行。
+
+修改接入代码后可运行 `npm run test:codex-app-server`，验证原生 stdio 协议、流式输出、恢复、取消、引导、审批、标题、分叉和图片清理。安装 Codex CLI 并执行 `cargo build --manifest-path src-tauri/Cargo.toml --bin nova` 后，运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib codex_app_server::tests::live -- --ignored` 可验证真实 app-server 对话与原生 Polaris MCP 调用（使用本地模拟模型，不访问真实模型服务）。Codex 的 Polaris MCP 由 `nova __codex-mcp` 原生子命令提供，复用 Rust 上下文服务及索引缓存；Codex 对话和 Polaris 均不依赖 Node。
+
 ## 工作原理
 
 应用不调用任何 HTTP API，而是把本机的 `devin` CLI 作为子进程拉起：

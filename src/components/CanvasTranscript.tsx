@@ -3399,6 +3399,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   };
 
   function scheduleRebuild(afterPaint = false, immediate = false) {
+    // A session snapshot supersedes a queued loading frame or streaming update.
+    // Cancel even the second RAF of a deferred rebuild so a warm switch paints next frame.
+    if (immediate) {
+      if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
+      rebuildRaf = 0;
+      rebuildAfterPaint = false;
+    }
     rebuildAfterPaint ||= afterPaint;
     // 停止、切会话、展开/折叠等状态要立即落屏，不受流式节流影响。
     // immediate 时也必须清掉已排队的流式 timer：否则展开/收起触发的 rebuild
@@ -3576,6 +3583,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     void props.emptyHint;
     void editing()?.id;
     const switchedThread = threadId !== renderedThreadId;
+    const warmSwitch = switchedThread && groups.length > 0 && prefixLayoutCaches.has(threadId ?? "");
     if (switchedThread) waitingForInitialSnapshot = groups.length === 0;
     // 缓存未命中时会先以空 items 进入 loading，再在同一 threadId 下提交快照；
     // 这次首个非空快照也属于已有内容，不能按新 delta 从空串重放。
@@ -3600,11 +3608,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         selectable: false,
       }];
       totalHeight = viewH;
-      if (canvasEl) paintAll();
+      // Keep the previous pixels until the next frame can paint the cached layout;
+      // hit testing already uses the cleared blocks, so old content is not interactive.
+      if (canvasEl && !warmSwitch) paintAll();
     }
     syncRevealTargets(switchedThread || loadedInitialSnapshot || !revealsInitialized);
     revealsInitialized = true;
-    scheduleRebuild(switchedThread);
+    scheduleRebuild(switchedThread && !warmSwitch, switchedThread || loadedInitialSnapshot);
   });
 
   let expandedEffectThreadId = props.threadId;

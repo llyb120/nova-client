@@ -1203,28 +1203,30 @@ function rememberCurrentThreadSnapshot() {
 }
 
 function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileItems = false) {
-  const agentKind = thread.agentKind ?? "devin";
-  if (reconcileItems) {
-    setState("items", reconcile(thread.items, { key: "id" }));
-  }
-  setState({
-    currentId: thread.id,
-    ...(!reconcileItems ? { items: thread.items } : {}),
-    plan: (thread.plan as PlanEntry[] | null) ?? null,
-    proposedPlan: recoverProposedPlan(thread),
-    cwd: thread.cwd,
-    title: thread.title,
-    agentKind,
-    model: thread.model ?? "",
-    mode: thread.mode ?? "",
-    reasoningEffort: thread.reasoningEffort ?? "",
-    roamingPeer:
-      thread.roamingRole === "guest"
-        ? thread.roamingPeer ?? null
-        : thread.quotaPeer ?? null,
-    loadingThread,
-    // 运行中切回会话时恢复此前收到的 usage；结束会话仍以 Turn 项的最终值为准。
-    liveUsage: state.running[thread.id] ? (liveUsageByThread.get(thread.id) ?? null) : null,
+  batch(() => {
+    const agentKind = thread.agentKind ?? "devin";
+    if (reconcileItems) {
+      setState("items", reconcile(thread.items, { key: "id" }));
+    }
+    setState({
+      currentId: thread.id,
+      ...(!reconcileItems ? { items: thread.items } : {}),
+      plan: (thread.plan as PlanEntry[] | null) ?? null,
+      proposedPlan: recoverProposedPlan(thread),
+      cwd: thread.cwd,
+      title: thread.title,
+      agentKind,
+      model: thread.model ?? "",
+      mode: thread.mode ?? "",
+      reasoningEffort: thread.reasoningEffort ?? "",
+      roamingPeer:
+        thread.roamingRole === "guest"
+          ? thread.roamingPeer ?? null
+          : thread.quotaPeer ?? null,
+      loadingThread,
+      // 运行中切回会话时恢复此前收到的 usage；结束会话仍以 Turn 项的最终值为准。
+      liveUsage: state.running[thread.id] ? (liveUsageByThread.get(thread.id) ?? null) : null,
+    });
   });
 }
 
@@ -1312,8 +1314,10 @@ export async function openThread(id: string) {
   const cached = getThreadSnapshot(id);
   const commitSnapshot = (thread: Thread, loadingThread: boolean, reconcileItems = false) => {
     discardPendingStreamUpdates();
-    resetExpanded();
-    showThreadSnapshot(thread, loadingThread, reconcileItems);
+    batch(() => {
+      resetExpanded();
+      showThreadSnapshot(thread, loadingThread, reconcileItems);
+    });
   };
 
   // 缓存未命中也要在本次同步调用内切走旧 transcript；否则 await IPC 期间
@@ -1321,21 +1325,23 @@ export async function openThread(id: string) {
   if (switching && !cached) {
     const meta = state.threads.find((thread) => thread.id === id);
     discardPendingStreamUpdates();
-    resetExpanded();
-    setState({
-      currentId: id,
-      items: [],
-      plan: null,
-      proposedPlan: null,
-      cwd: meta?.cwd ?? "",
-      title: meta?.title ?? "",
-      agentKind: meta?.agentKind ?? state.agentKind,
-      model: meta?.model ?? "",
-      mode: "",
-      reasoningEffort: "",
-      roamingPeer: null,
-      loadingThread: true,
-      liveUsage: state.running[id] ? (liveUsageByThread.get(id) ?? null) : null,
+    batch(() => {
+      resetExpanded();
+      setState({
+        currentId: id,
+        items: [],
+        plan: null,
+        proposedPlan: null,
+        cwd: meta?.cwd ?? "",
+        title: meta?.title ?? "",
+        agentKind: meta?.agentKind ?? state.agentKind,
+        model: meta?.model ?? "",
+        mode: "",
+        reasoningEffort: "",
+        roamingPeer: null,
+        loadingThread: true,
+        liveUsage: state.running[id] ? (liveUsageByThread.get(id) ?? null) : null,
+      });
     });
   }
 

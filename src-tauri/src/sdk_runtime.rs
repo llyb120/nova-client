@@ -775,11 +775,24 @@ impl SdkManager {
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let shared_models: Vec<String> = self.app.state::<AppState>().settings.lock().unwrap()
-            .quota_shared_models.iter().filter_map(|key| key.strip_prefix("lyra:").map(str::to_string)).collect();
-        let value = self.run_bridge(&cwd, json!({
-            "action": "export", "model": model, "sharedModels": shared_models
-        })).await?;
+        let shared_models: Vec<String> = self
+            .app
+            .state::<AppState>()
+            .settings
+            .lock()
+            .unwrap()
+            .quota_shared_models
+            .iter()
+            .filter_map(|key| key.strip_prefix("lyra:").map(str::to_string))
+            .collect();
+        let value = self
+            .run_bridge(
+                &cwd,
+                json!({
+                    "action": "export", "model": model, "sharedModels": shared_models
+                }),
+            )
+            .await?;
         value
             .as_str()
             .filter(|config| !config.trim().is_empty())
@@ -922,7 +935,9 @@ impl SdkManager {
         model: &str,
         prompt: String,
     ) -> Result<String, String> {
-        let data_dir = self.borrowed_root().unwrap_or_else(|| nova_data_dir(&self.app));
+        let data_dir = self
+            .borrowed_root()
+            .unwrap_or_else(|| nova_data_dir(&self.app));
         match crate::lyra_complete::complete_direct(
             &self.http,
             &data_dir,
@@ -952,6 +967,11 @@ impl SdkManager {
     }
 
     async fn run_bridge(&self, cwd: &str, request: Value) -> Result<Value, String> {
+        if self.adapter.agent_kind() == AgentKind::Codex {
+            let (command, options) = self.codex_launch(cwd, request["action"] == "title")?;
+            let (_tx, controls) = tokio::sync::mpsc::unbounded_channel();
+            return crate::codex_app_server::run(command, request, options, controls, |_| {}).await;
+        }
         if self.use_inprocess() {
             return crate::lyra::run_oneshot(&self.native_http(), &request, self.borrowed_root())
                 .await;
@@ -1114,7 +1134,7 @@ impl SdkManager {
         result
     }
 
-    /// 进程内运行 Lyra：不起子进程，会话在同进程 tokio 任务中执行，
+    /// 原生会话控制在同进程 tokio 任务中执行（Codex 直接管理 app-server 子进程），
     /// 事件/控制行走 mpsc 通道，事件处理与进程桥完全同一路径。
     async fn run_prompt_inprocess(
         &self,
@@ -1128,13 +1148,19 @@ impl SdkManager {
             let enabled = state.settings.lock().unwrap().context_tools_enabled();
             enabled
         };
-        let session = crate::lyra::spawn_prompt(
-            self.native_http(),
-            request,
-            context_tools,
-            self.borrowed_root(),
-            Some(self.app.clone()),
-        );
+        let session = if self.adapter.agent_kind() == AgentKind::Codex {
+            let (command, options) =
+                self.codex_launch(request["cwd"].as_str().unwrap_or_default(), false)?;
+            crate::codex_app_server::spawn_prompt(command, request, options)
+        } else {
+            crate::lyra::spawn_prompt(
+                self.native_http(),
+                request,
+                context_tools,
+                self.borrowed_root(),
+                Some(self.app.clone()),
+            )
+        };
         let abort = session.task.abort_handle();
         self.running_children.lock().unwrap().insert(
             thread_id.to_string(),
@@ -1164,10 +1190,10 @@ impl SdkManager {
         // 错误均已作为 {ok:false} 事件流出；这里只打捞 panic 信息，interrupt 的 abort 属正常。
         match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
             Ok(Err(join_error)) if join_error.is_panic() => Err(format!(
-                "{}；Lyra 任务 panic：{join_error}",
+                "{}；原生任务 panic：{join_error}",
                 result
                     .err()
-                    .unwrap_or_else(|| "Lyra 任务异常结束".to_string())
+                    .unwrap_or_else(|| "原生任务异常结束".to_string())
             )),
             Err(_) => {
                 abort.abort();
@@ -1478,6 +1504,56 @@ impl SdkManager {
                 format!("启动 {} Node bridge 失败：{e}", self.adapter.label())
             }
         })
+    }
+
+    /// Native Codex launch: preserve the process-local credential/proxy/shim environment.
+    /// Polaris runs as a lightweight native MCP subprocess of the same application.
+    fn codex_launch(
+        &self,
+        cwd: &str,
+        title: bool,
+    ) -> Result<(Command, crate::codex_app_server::Options), String> {
+        let state = self.app.state::<AppState>();
+        let settings = state.settings.lock().unwrap();
+        let executable = crate::codex_app_server::executable(&settings.codex_path)?;
+        let mut command = Command::new(executable);
+        command
+            .arg("app-server")
+            .current_dir(cwd)
+            .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
+        if !self.launch_env.is_empty() {
+            crate::credential_roaming::isolate_borrowed_command(&mut command);
+            command.envs(&self.launch_env);
+        }
+        apply_proxy_env(&mut command, &settings.codex_proxy);
+        #[cfg(windows)]
+        if state.windows_shell_shim_enabled {
+            crate::windows_shell_shim::apply(&self.app, &mut command, &self.launch_env)
+                .map_err(|e| format!("应用 Windows shell shim 失败：{e}"))?;
+        }
+        let polaris = if !title && settings.context_tools_enabled() {
+            if state.context_service.endpoint().is_empty()
+                || state.context_service.token().is_empty()
+            {
+                return Err("Polaris 已开启，但 Rust 上下文服务不可用".into());
+            }
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            Some(
+                json!({"command":exe,"args":["__codex-mcp"],"required":true,"enabled":true,"env":{
+                    "NOVA_CONTEXT_SERVICE_ENDPOINT":state.context_service.endpoint(),
+                    "NOVA_CONTEXT_SERVICE_TOKEN":state.context_service.token()
+                }}),
+            )
+        } else {
+            None
+        };
+        Ok((
+            command,
+            crate::codex_app_server::Options {
+                ponytail: settings.ponytail_enabled,
+                polaris,
+            },
+        ))
     }
 
     fn change_working_directory(&self, thread_id: &str, cwd: &str) {
@@ -2079,7 +2155,7 @@ enum TextSnapshotChange<'a> {
     Replace,
 }
 
-/// Codex SDK 的 `item.updated` 携带累计文本快照。把纯追加部分转换成前端 delta，
+/// Codex app-server 桥接层输出累计文本快照。把纯追加部分转换成前端 delta，
 /// 同文快照不重复刷新；若服务端改写了既有文本，则回退到整条 upsert。
 fn text_snapshot_change<'a>(previous: &Item, next: &'a Item) -> TextSnapshotChange<'a> {
     let texts = match (previous, next) {
@@ -2100,7 +2176,7 @@ fn text_snapshot_change<'a>(previous: &Item, next: &'a Item) -> TextSnapshotChan
         .unwrap_or(TextSnapshotChange::Replace)
 }
 
-/// Codex SDK 用 `todo_list` 快照表达计划进度；转换成 Nova 各后端共用的计划结构。
+/// 旧版 Codex 桥接层用 `todo_list` 快照表达计划进度；转换成 Nova 各后端共用的计划结构。
 fn codex_todo_plan(value: &Value) -> Option<Value> {
     if value.get("type").and_then(Value::as_str) != Some("todo_list") {
         return None;
