@@ -344,7 +344,7 @@ export function modelChoices(
   if (!opts) return [];
   const model = opts.find((o) => o.id === "model");
   const choices = (model?.options as ModelChoice[]) ?? [];
-  if (agentKind !== "codex" && agentKind !== "opencode") return choices;
+  if (agentKind !== "opencode") return choices;
   // OpenCode 的 Auto 只能路由到 GPT；未配置任何 GPT 时不展示，避免产生无效入口。
   if (
     agentKind === "opencode" &&

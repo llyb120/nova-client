@@ -131,7 +131,7 @@
   /* 点阵网格浓度：亮底压得更淡，否则显脏 */
   --grid-dot: rgba(24, 28, 36, 0.028);
   /* 亮色面板轻透公式背景，保留白色面板的阅读层次。 */
-  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 84%, transparent);
+  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 38%, transparent);
   --composer-veil: color-mix(in srgb, var(--bg-panel) 86%, transparent);
   --r-sm: 8px;
   --r-md: 12px;
@@ -7895,58 +7895,18 @@ button:focus-visible {
   }
 }
 
-/* 科学手稿：经典公式与线框图分区排布，中央降低对比。 */
+/* 工程手稿保留清晰细线，轻覆底色降低背景对比度。 */
 .dawn-backdrop {
   display: none;
   position: fixed;
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  overflow: hidden;
-  mask-image: radial-gradient(ellipse at 48% 46%, rgba(0, 0, 0, 0.06) 10%, rgba(0, 0, 0, 0.3) 42%, #000 82%);
+  background: linear-gradient(rgba(245, 247, 250, 0.25), rgba(245, 247, 250, 0.25)),
+    url("./assets/engineering-sketch.webp") center / cover no-repeat;
 }
 :root[data-theme="ink-light"] .sky-backdrop { visibility: hidden; }
 :root[data-theme="ink-light"] .dawn-backdrop { display: block; }
-.science-field {
-  position: absolute;
-  inset: 16px;
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-template-rows: repeat(5, minmax(0, 1fr));
-  gap: 12px 20px;
-  animation: science-drift 100s ease-in-out infinite alternate;
-}
-.science-tile {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-  opacity: 0.26;
-}
-.science-tile:nth-child(3n) { opacity: 0.18; }
-.science-equation {
-  fill: #62758d;
-  font-family: "Cambria Math", "Times New Roman", serif;
-}
-.science-geometry {
-  stroke: #62758d;
-  stroke-width: 1.2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-.science-hidden-edge { stroke-dasharray: 4 5; opacity: 0.65; }
-@keyframes science-drift {
-  from { transform: translate3d(-6px, 4px, 0); }
-  to { transform: translate3d(6px, -4px, 0); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .science-field { animation: none; }
-}
-@media (max-width: 900px) {
-  .science-field { grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: repeat(6, minmax(0, 1fr)); gap: 8px; }
-  .science-tile:nth-child(n + 19) { display: none; }
-}
 
 /* 签名与发送操作共同换行，始终在底排对齐。 */
 .composer-actions {
