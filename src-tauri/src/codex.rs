@@ -2419,6 +2419,7 @@ fn codex_thread_params(
         "cwd": cwd,
         "approvalPolicy": approval_policy,
         "sandbox": sandbox,
+        "developerInstructions": crate::codex_app_server::rtk_guidance(),
         "approvalsReviewer": "user"
     });
     if let Some(thread_id) = thread_id {

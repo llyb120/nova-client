@@ -19,10 +19,39 @@ pub struct Options {
     pub polaris: Option<Value>,
 }
 
+pub(super) fn rtk_guidance() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return String::new();
+    };
+    let path = exe.to_string_lossy();
+    let path = if cfg!(windows) {
+        path.trim_start_matches(r"\\?\").replace('\\', "/")
+    } else {
+        path.into_owned()
+    };
+    let powershell = format!("& '{}' __rtk", path.replace('\'', "''"));
+    let bash = format!("'{}' __rtk", path.replace('\'', "'\\''"));
+    // ponytail: instruction-based like upstream RTK's Codex integration; enforcing every
+    // command requires a Codex pre-execution rewrite hook when that API is available.
+    format!(
+        "Nova includes RTK for compact shell output; no separate rtk installation is needed. \
+         Invoke it through Codex's native shell tool using the prefix for that shell:\n\
+         PowerShell: {powershell}\nBash/sh: {bash}\n\
+         For supported commands whose output you are reading, use this prefix, e.g. \
+         `<prefix> git status`, `<prefix> git diff`, `<prefix> git log -5`, `<prefix> cargo test`. \
+         Use `<prefix> --help` to check supported commands when needed. \
+         Keep unsupported commands, shell builtins, and commands whose exact/raw output is \
+         needed (including output parsed by scripts or pipelines) native. Preserve arguments, \
+         working directory, shell syntax, and approval/sandbox restrictions. \
+         Do not blindly rerun a failed command that may have side effects."
+    )
+}
+
 fn thread_options(request: &Value, options: &Options) -> Value {
     let title = request["action"] == "title";
     let read_only = title || request["mode"] == "plan";
     let mut guidance = Vec::new();
+    let rtk = rtk_guidance();
     let mut mcp = if title { None } else { options.polaris.clone() };
     if let Some(mcp) = mcp.as_mut() {
         mcp["env"]["NOVA_TOOLS_CWD"] = request["cwd"].clone();
@@ -30,6 +59,9 @@ fn thread_options(request: &Value, options: &Options) -> Value {
         guidance.push(POLARIS_GUIDANCE);
     }
     if !title {
+        if !rtk.is_empty() {
+            guidance.push(&rtk);
+        }
         if options.ponytail {
             guidance.push(crate::lyra::PONYTAIL_RULES);
         }

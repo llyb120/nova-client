@@ -73,6 +73,10 @@ async fn stdio_stream_and_early_completion() {
     assert_eq!(calls[0]["method"], "initialize");
     assert_eq!(calls[1]["method"], "initialized");
     assert_eq!(calls[2]["method"], "thread/start");
+    assert!(calls[2]["params"]["developerInstructions"]
+        .as_str()
+        .unwrap()
+        .contains("__rtk"));
     assert_eq!(calls[3]["params"]["effort"], "high");
 }
 
@@ -92,9 +96,12 @@ async fn initialization_retains_cancel_and_resume_steer() {
     )
     .await;
     assert!(result.is_ok());
-    assert!(calls
-        .iter()
-        .any(|c| c["method"] == "thread/resume" && c["params"]["threadId"] == "previous"));
+    assert!(calls.iter().any(|c| c["method"] == "thread/resume"
+        && c["params"]["threadId"] == "previous"
+        && c["params"]["developerInstructions"]
+            .as_str()
+            .unwrap()
+            .contains("__rtk")));
     assert!(calls.iter().any(|c| c["method"] == "turn/steer"
         && c["params"]["expectedTurnId"] == "turn-1"
         && c["params"]["input"][0]["text"] == "next"));
@@ -119,6 +126,7 @@ async fn title_and_fork_use_native_transport() {
     assert_eq!(result.unwrap(), "hello world");
     assert!(events.is_empty());
     assert_eq!(calls[2]["params"]["ephemeral"], true);
+    assert_eq!(calls[2]["params"]["developerInstructions"], "");
     assert_eq!(calls[3]["params"]["sandboxPolicy"]["type"], "readOnly");
     let mut req = request();
     req["action"] = json!("fork");
@@ -127,6 +135,10 @@ async fn title_and_fork_use_native_transport() {
     let (result, _, calls) = exercise("stream", req, None).await;
     assert_eq!(result.unwrap(), "fork-1");
     assert_eq!(calls[3]["params"]["lastTurnId"], "second");
+    assert!(calls[3]["params"]["developerInstructions"]
+        .as_str()
+        .unwrap()
+        .contains("__rtk"));
 }
 
 #[tokio::test]
@@ -163,6 +175,7 @@ fn options_preserve_polaris_ponytail_and_plan_mode() {
     let instructions = value["developerInstructions"].as_str().unwrap();
     assert!(
         instructions.contains("polaris")
+            && instructions.contains("__rtk")
             && instructions.contains("ponytail:")
             && instructions.contains("do not modify files")
     );
@@ -345,6 +358,9 @@ requires_openai_auth = false
     assert!(events.is_empty());
     let requests = provider.await.unwrap();
     assert!(requests[0].contains("ponytail:"));
+    assert!(requests[0].contains("__rtk"));
+    assert!(requests[1].contains("__rtk"));
+    assert!(!requests[2].contains("__rtk"));
     assert!(requests[1].contains("hello") && requests[1].contains("continue"));
 }
 
