@@ -7902,7 +7902,7 @@ button:focus-visible {
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  background: linear-gradient(rgba(245, 247, 250, 0.25), rgba(245, 247, 250, 0.25)),
+  background: linear-gradient(rgba(245, 247, 250, 0.3), rgba(245, 247, 250, 0.3)),
     url("./assets/engineering-sketch.webp") center / cover no-repeat;
 }
 :root[data-theme="ink-light"] .sky-backdrop { visibility: hidden; }
