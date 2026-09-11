@@ -49,7 +49,6 @@ import { agentLabel, isScratch } from "../utils";
 import { enabledWorkflows } from "../workflow/storage";
 import type { WorkflowDef } from "../workflow/types";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
-import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconClue, IconFile, IconFolder, IconLogo, IconMerge, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
@@ -1160,11 +1159,7 @@ export function HomeView() {
                 favorites
               />
             </Show>
-            <span class="bar-spacer" />
             <div class="composer-actions">
-              <ExclusiveChatMark
-              token={roam()?.peer.token || state.settings?.relayToken || ""}
-              />
               <Show when={!roam() && !quotaPeer()}>
                 <div ref={workflowPickerRef} class="composer-workflow-picker">
                   <Show when={workflowMenuOpen()}>

@@ -166,7 +166,7 @@ export function mountSessionShortcuts(options: {
   onInsertText?: (text: string, mayFocus: boolean) => boolean;
   /** 返回 true 表示已终止当前回合（例如正在运行且未被其它 Esc 用途占用）。 */
   onStopSession?: () => boolean;
-  /** 返回 true 表示已把当前会话收进室女座（未开启减少焦虑且有会话打开）。 */
+  /** 返回 true 表示已收起运行中的会话：当前优先，否则取首个尚未隐藏的会话。 */
   onHideToVirgo?: () => boolean;
 }): void {
   const allowed = new Set(options.allowedActions);

@@ -131,7 +131,7 @@
   /* 点阵网格浓度：亮底压得更淡，否则显脏 */
   --grid-dot: rgba(24, 28, 36, 0.028);
   /* 亮色面板轻透公式背景，保留白色面板的阅读层次。 */
-  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 84%, transparent);
+  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 52%, transparent);
   --composer-veil: color-mix(in srgb, var(--bg-panel) 86%, transparent);
   --r-sm: 8px;
   --r-md: 12px;
@@ -2599,6 +2599,7 @@ button {
 }
 
 .composer {
+  --composer-veil: color-mix(in srgb, var(--bg-panel) 76%, transparent);
   position: relative;
   display: flex;
   flex-direction: column;
@@ -3344,10 +3345,20 @@ button {
   /* 不换行：空间不足时 pill 文本内部省略，避免发送按钮被挤到下一行 */
   flex-wrap: nowrap;
 }
+/* 签名浮到右下角后不再占位：目录/模型选择器等分剩余宽度并各自拉满。 */
 .composer-bar .sel,
 .composer-bar .proj-picker {
   min-width: 0;
-  flex-shrink: 1;
+  flex: 1 1 auto;
+}
+.composer-bar .proj-picker .pill {
+  width: 100%;
+}
+.composer-bar .proj-picker .pill-text {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  text-align: left;
 }
 .composer-bar .pill {
   max-width: 100%;
@@ -3389,11 +3400,11 @@ button {
   0%, 100% { opacity: .45; }
   50% { opacity: 1; }
 }
-/* 模型选择按内容取宽，避免短标签撑成长条；长名称仍可收缩省略。 */
+/* 模型选择器与目录选择器一同拉长，吃掉签名腾出的宽度。 */
 .composer-bar .sel.wide {
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   min-width: 0;
-  max-width: min(420px, 100%);
+  max-width: none;
 }
 .sel.wide .pill {
   justify-content: flex-start;
@@ -3409,6 +3420,17 @@ button {
 .composer-bar .sel.wide .pill-text {
   text-align: left;
   max-width: none;
+}
+.composer .composer-bar {
+  flex-wrap: wrap;
+}
+.composer .composer-bar .sel.wide {
+  flex: 1 1 max-content;
+  max-width: 100%;
+}
+.composer .composer-bar .sel.wide .pill-text {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .pill svg {
   flex-shrink: 0;
@@ -4827,6 +4849,7 @@ button {
   color: var(--text);
 }
 
+.session-shortcut-row .sel .pill-text,
 .session-shortcut-row .pill-text {
   flex: 1;
   min-width: 0;
@@ -7895,87 +7918,26 @@ button:focus-visible {
   }
 }
 
-/* 科学手稿：经典公式与线框图分区排布，中央降低对比。 */
+/* 工程手稿保留清晰细线，轻覆底色降低背景对比度。 */
 .dawn-backdrop {
   display: none;
   position: fixed;
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  overflow: hidden;
-  mask-image: radial-gradient(ellipse at 48% 46%, rgba(0, 0, 0, 0.06) 10%, rgba(0, 0, 0, 0.3) 42%, #000 82%);
+  background: linear-gradient(rgba(245, 247, 250, 0.3), rgba(245, 247, 250, 0.3)),
+    url("./assets/engineering-sketch.webp") center / cover no-repeat;
 }
 :root[data-theme="ink-light"] .sky-backdrop { visibility: hidden; }
 :root[data-theme="ink-light"] .dawn-backdrop { display: block; }
-.science-field {
-  position: absolute;
-  inset: 16px;
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-template-rows: repeat(5, minmax(0, 1fr));
-  gap: 12px 20px;
-  animation: science-drift 100s ease-in-out infinite alternate;
-}
-.science-tile {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-  opacity: 0.26;
-}
-.science-tile:nth-child(3n) { opacity: 0.18; }
-.science-equation {
-  fill: #62758d;
-  font-family: "Cambria Math", "Times New Roman", serif;
-}
-.science-geometry {
-  stroke: #62758d;
-  stroke-width: 1.2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-.science-hidden-edge { stroke-dasharray: 4 5; opacity: 0.65; }
-@keyframes science-drift {
-  from { transform: translate3d(-6px, 4px, 0); }
-  to { transform: translate3d(6px, -4px, 0); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .science-field { animation: none; }
-}
-@media (max-width: 900px) {
-  .science-field { grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: repeat(6, minmax(0, 1fr)); gap: 8px; }
-  .science-tile:nth-child(n + 19) { display: none; }
-}
 
-/* 签名与发送操作共同换行，始终在底排对齐。 */
+/* 底排右侧的操作区，始终靠右对齐。 */
 .composer-actions {
   display: flex;
   align-items: center;
   gap: 8px;
   flex: 0 0 auto;
   margin-left: auto;
-}
-
-/* 根据输入面板实际宽度切换；窄面板中签名浮印在按钮上方，点击穿透。 */
-.home-composer,
-.composer {
-  container-type: inline-size;
-  container-name: composer;
-}
-.composer-actions {
-  position: relative;
-}
-@container composer (max-width: 620px) {
-  .composer-actions .composer-engraved-watermark {
-    position: absolute;
-    top: 50%;
-    right: 0;
-    transform: translateY(-50%);
-    z-index: 4;
-    padding: 0;
-    pointer-events: none;
-  }
 }
 
 .composer-bar { min-height: 64px; }

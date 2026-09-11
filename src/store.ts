@@ -37,6 +37,7 @@ import type {
   Status,
   Thread,
   ThreadMeta,
+  ToolItem,
   TurnEvent,
   UpdateInfo,
   UpdateOp,
@@ -344,7 +345,7 @@ export function modelChoices(
   if (!opts) return [];
   const model = opts.find((o) => o.id === "model");
   const choices = (model?.options as ModelChoice[]) ?? [];
-  if (agentKind !== "codex" && agentKind !== "opencode") return choices;
+  if (agentKind !== "opencode") return choices;
   // OpenCode 的 Auto 只能路由到 GPT；未配置任何 GPT 时不展示，避免产生无效入口。
   if (
     agentKind === "opencode" &&
@@ -1237,6 +1238,7 @@ function recoverProposedPlan(_thread: Thread): string | null {
 }
 
 let openThreadRequest = 0;
+let snapshotToolUpdates: { threadId: string; items: Map<number, ToolItem> } | undefined;
 
 /** 切换会话耗时自测：仅在总耗时超阈值时写一行 agent 日志，release 包也能定位卡点。 */
 let switchTraceStart = 0;
@@ -1351,13 +1353,12 @@ export async function openThread(id: string) {
     if (request !== openThreadRequest || state.currentId !== id) return;
   }
 
+  const toolUpdates = { threadId: id, items: new Map<number, ToolItem>() };
+  snapshotToolUpdates = toolUpdates;
   try {
-    // 切换后端 active_thread 是纯副作用（只设时间戳），不返回任何被后续依赖的值，
-    // 且 getThread 按 thread_id 显式拉取、不读 active_thread——无需 await。
-    // 之前 await 它会让切换卡在 Tauri 命令队列里：stage 会话的标题生成/model-options
-    // 等慢命令（session/new 触发 skills 扫描 + 最长 120s 的 session/prompt）排在前面，
-    // 把 reportActivity 堵 800ms。发射即忘让 getThread 立即并行入队，不再被堵。
-    void api.reportActivity(id).catch(() => {});
+    // 先接通前台推流再取快照，避免工具在快照之后、active_thread 切换之前完成而漏报。
+    // 缓存仍在 await 前显示；只让后台校准等待这次交接。
+    await api.reportActivity(id);
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
     if (cached && switching && !staleThreadSnapshots.has(id)) {
@@ -1380,12 +1381,18 @@ export async function openThread(id: string) {
       commitSnapshot(t, false);
       if (request !== openThreadRequest || state.currentId !== id) return;
     }
+    // IPC 返回途中收到的终态可能比快照更新，冷加载不能丢，暖加载不能被旧快照覆盖。
+    batch(() => {
+      for (const item of toolUpdates.items.values()) applyOp({ t: "upsert", item });
+    });
     const roamingPeer =
       t.roamingRole === "guest" ? t.roamingPeer ?? null : t.quotaPeer ?? null;
     if (roamingPeer) ensurePeerModels(roamingPeer);
     else void ensureModelOptions(agentKind);
   } catch {
     if (state.currentId === id) setState({ loadingThread: false });
+  } finally {
+    if (snapshotToolUpdates === toolUpdates) snapshotToolUpdates = undefined;
   }
 }
 
@@ -1585,16 +1592,23 @@ export function virgoHiddenThreads(): Set<string> {
  * 也不收起还没落库的乐观占位会话。返回是否已收纳。
  */
 export function hideCurrentThreadToVirgo(): boolean {
-  const id = state.currentId;
-  if (!id || zenModeOn() || isPendingThreadId(id)) return false;
+  if (zenModeOn()) return false;
+  const canHide = (id: string) =>
+    !!state.running[id] && !isPendingThreadId(id) && !virgoManualRoots.has(virgoChainRoot(id));
+  const id = state.currentId && canHide(state.currentId)
+    ? state.currentId
+    : state.threads.find((thread) => canHide(thread.id))?.id;
+  if (!id) return false;
   const root = virgoChainRoot(id);
   if (virgoManualRoots.has(root)) return false;
   virgoManualRoots.add(root);
   setVirgoManualVersion((version) => version + 1);
   persistVirgoManualRoots();
-  closeThread();
-  // 会话可能来自证据链/双子座等页面：收起后统一回到首页，不要留在原来的子页面。
-  setView("home");
+  if (state.currentId && virgoChainRoot(state.currentId) === root) {
+    closeThread();
+    // 当前页面属于被收起的会话链时回到首页。
+    setView("home");
+  }
   showToast("会话已移入室女座，打开即回到普通会话");
   return true;
 }
@@ -3225,6 +3239,10 @@ export async function initStore() {
     // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
     // 时选择器与「实施此计划」按钮会对不齐。
     const apply = (op: UpdateOp) => {
+      if (snapshotToolUpdates?.threadId === e.payload.threadId && op.t === "upsert"
+        && op.item.type === "tool" && op.item.status !== "pending" && op.item.status !== "in_progress") {
+        snapshotToolUpdates.items.set(op.item.id, op.item);
+      }
       if (
         state.loadingThread &&
         op.t !== "mode" &&

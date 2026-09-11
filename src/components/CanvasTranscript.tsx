@@ -1234,7 +1234,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ? !!(state.expanded[foldKey] ?? bodyExpandedFor(g.body))
       : false;
     const parts = [
-      g.user ? `u:${g.user.id}:${textSig(g.user.text)}:${userImagesSig(g.user.images)}` : "-",
+      g.user ? `u:${g.user.id}:${textSig(g.user.text)}` : "-",
       g.turn
         ? `t:${g.turn.id}:${g.turn.durationMs}:${g.turn.totalTokens ?? ""}:${g.turn.actualModel ?? ""}:${foldOpen}`
         : "-",
@@ -1256,11 +1256,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function cachedClosedGroupSig(g: Group): string {
-    const cached = closedGroupSigCache.get(g);
-    if (cached !== undefined) return cached;
-    const sig = closedGroupSig(g);
-    closedGroupSigCache.set(g, sig);
-    return sig;
+    let sig = closedGroupSigCache.get(g);
+    if (sig === undefined) {
+      sig = closedGroupSig(g);
+      closedGroupSigCache.set(g, sig);
+    }
+    // 图片异步加载不会改变 Group 身份，尺寸签名不能跟随文本一起缓存。
+    return `${sig}|${userImagesSig(g.user?.images)}`;
   }
 
   async function computeLayout(generation: number): Promise<boolean> {
@@ -2109,9 +2111,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (const layout of imageLayouts) {
       const cached = loadImage(layout.img);
       if (!cached) continue;
-      // Always draw with aspect-correct size; stale layout slots trigger rebuild.
+      // 旧占位布局不能混用真实尺寸；等气泡、换行和文字位置一起重排后再绘制。
       const size = bubbleImageSize(cached, imgMaxW);
-      if (size.w !== layout.w || size.h !== layout.h) scheduleRebuild();
+      if (size.w !== layout.w || size.h !== layout.h) {
+        scheduleRebuild();
+        continue;
+      }
       const ix = bx + layout.dx;
       const iy = by + layout.dy;
       ctx.save();
