@@ -17,7 +17,7 @@ import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
 import "./training-ground.css";
 import { selectedChatText } from "./chatSelection";
-import { initStore, openNewSession, openNextUnreadThread, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
+import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
 import { mountSessionShortcuts } from "./sessionShortcuts";
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
@@ -187,8 +187,9 @@ export default function App() {
 
   // 「打开未读消息」在应用聚焦时的按键处理；全局注册（Rust 侧）覆盖最小化/失焦场景。
   mountSessionShortcuts({
-    allowedActions: ["openUnread"],
+    allowedActions: ["openUnread", "hideToVirgo"],
     onOpenUnread: () => void openNextUnreadThread(),
+    onHideToVirgo: hideCurrentThreadToVirgo,
   });
 
   // 空闲时后端请求更新（update:prompt）→ 自动弹出更新对话框，由用户选择是否现在更新。

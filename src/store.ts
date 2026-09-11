@@ -1592,16 +1592,23 @@ export function virgoHiddenThreads(): Set<string> {
  * 也不收起还没落库的乐观占位会话。返回是否已收纳。
  */
 export function hideCurrentThreadToVirgo(): boolean {
-  const id = state.currentId;
-  if (!id || zenModeOn() || isPendingThreadId(id)) return false;
+  if (zenModeOn()) return false;
+  const canHide = (id: string) =>
+    !!state.running[id] && !isPendingThreadId(id) && !virgoManualRoots.has(virgoChainRoot(id));
+  const id = state.currentId && canHide(state.currentId)
+    ? state.currentId
+    : state.threads.find((thread) => canHide(thread.id))?.id;
+  if (!id) return false;
   const root = virgoChainRoot(id);
   if (virgoManualRoots.has(root)) return false;
   virgoManualRoots.add(root);
   setVirgoManualVersion((version) => version + 1);
   persistVirgoManualRoots();
-  closeThread();
-  // 会话可能来自证据链/双子座等页面：收起后统一回到首页，不要留在原来的子页面。
-  setView("home");
+  if (state.currentId && virgoChainRoot(state.currentId) === root) {
+    closeThread();
+    // 当前页面属于被收起的会话链时回到首页。
+    setView("home");
+  }
   showToast("会话已移入室女座，打开即回到普通会话");
   return true;
 }
