@@ -131,7 +131,7 @@
   /* 点阵网格浓度：亮底压得更淡，否则显脏 */
   --grid-dot: rgba(24, 28, 36, 0.028);
   /* 亮色面板轻透公式背景，保留白色面板的阅读层次。 */
-  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 38%, transparent);
+  --sidebar-veil: color-mix(in srgb, var(--bg-sidebar) 52%, transparent);
   --composer-veil: color-mix(in srgb, var(--bg-panel) 86%, transparent);
   --r-sm: 8px;
   --r-md: 12px;
@@ -4755,6 +4755,7 @@ button {
 .session-shortcut-row .proj-picker,
 .session-shortcut-row .sel,
 .session-shortcut-row .search-select,
+.session-shortcut-row .sel .pill,
 .session-shortcut-row .pill {
   min-width: 0;
   width: 100%;
@@ -4827,6 +4828,7 @@ button {
   color: var(--text);
 }
 
+.session-shortcut-row .sel .pill-text,
 .session-shortcut-row .pill-text {
   flex: 1;
   min-width: 0;
