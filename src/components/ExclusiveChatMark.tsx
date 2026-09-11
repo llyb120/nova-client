@@ -45,31 +45,31 @@ export function ExclusiveChatMark(props: { token: string }) {
   return (
     <Show when={identity()}>
       {(value) => (
-        <div
-          class="composer-engraved-watermark"
-          classList={{
-            "awaiting-signature": !signatureVisible(),
-            signing: signatureProgress() !== null,
-          }}
-          aria-hidden="true"
-          style={
-            revealMask()
-              ? {
-                  "mask-image": revealMask()!,
-                  "-webkit-mask-image": revealMask()!,
-                  // 默认按边框盒裁剪会切掉花体溢出笔画；no-clip 保留完整字迹。
-                  "mask-clip": "no-clip",
-                  "-webkit-mask-clip": "no-clip",
-                }
-              : undefined
-          }
-        >
-          <EngravedNumberMark
-            username={value().username}
-            number={value().number}
-            class="composer-engraved-mark"
-          />
-        </div>
+          <div
+            class="composer-engraved-watermark"
+            classList={{
+              "awaiting-signature": !signatureVisible(),
+              signing: signatureProgress() !== null,
+            }}
+            aria-hidden="true"
+            style={
+              revealMask()
+                ? {
+                    "mask-image": revealMask()!,
+                    "-webkit-mask-image": revealMask()!,
+                    // 默认按边框盒裁剪会切掉花体溢出笔画；no-clip 保留完整字迹。
+                    "mask-clip": "no-clip",
+                    "-webkit-mask-clip": "no-clip",
+                  }
+                : undefined
+            }
+          >
+            <EngravedNumberMark
+              username={value().username}
+              number={value().number}
+              class="composer-engraved-mark"
+            />
+          </div>
       )}
     </Show>
   );

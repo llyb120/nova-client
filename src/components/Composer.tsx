@@ -46,7 +46,6 @@ import {
   workflowSuspendedNotice,
 } from "../workflow/runtime";
 import { ConfigSelects } from "./ConfigSelects";
-import { ExclusiveChatMark } from "./ExclusiveChatMark";
 import { IconClue, IconFile, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
@@ -830,9 +829,7 @@ export function Composer() {
             </span>
           </span>
         </Show>
-        <span class="bar-spacer" />
         <div class="composer-actions">
-          <ExclusiveChatMark token={state.roamingPeer || state.settings?.relayToken || ""} />
           <button
             type="button"
             class="composer-btn clue"

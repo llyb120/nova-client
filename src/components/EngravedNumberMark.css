@@ -115,17 +115,15 @@
   border-color: color-mix(in srgb, var(--border-strong) 82%, #8f8f8f 18%);
 }
 
-/* 会话专属标识直接刻在输入框背景上，不呈现独立牌体，也不参与输入布局。 */
+/* 签名挂到页面右下角，避免输入框的裁剪和定位影响，也不占用工具条宽度。 */
 .composer-engraved-watermark {
-  position: relative;
-  z-index: 0;
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: -1;
   display: flex;
-  flex: 0 0 auto;
-  align-items: center;
+  align-items: flex-end;
   justify-content: flex-end;
-  min-width: 0;
-  height: 48px;
-  padding: 0 16px 0 8px;
   pointer-events: none;
   user-select: none;
 }
@@ -170,6 +168,7 @@
 }
 
 .composer-engraved-mark .engraved-number-mark-serial {
+  align-self: flex-end;
   font-size: 0.24em;
   transform: none;
 }
@@ -191,6 +190,13 @@
   background-clip: text;
   -webkit-background-clip: text;
   filter: drop-shadow(0 0 3px var(--signature-glow));
+}
+
+/* 花体首字母（如 z 的起笔回锋）会向左溢出字形盒，background-clip:text 按盒裁剪会切掉它；
+   左侧同样扩盒 + 负 margin 回补，保证文字位置与整体宽度不变。 */
+.composer-engraved-mark .engraved-number-mark-name {
+  padding-inline-start: 0.12em;
+  margin-inline-start: -0.12em;
 }
 
 :root[data-theme="ink-light"] .composer-engraved-mark.engraved-number-mark {

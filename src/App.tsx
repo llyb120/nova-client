@@ -5,6 +5,7 @@ import { ChatView } from "./components/ChatView";
 import { SkyBackdrop } from "./components/SkyBackdrop";
 import { EvidenceChainView } from "./components/EvidenceChainView";
 import { HomeView } from "./components/HomeView";
+import { ExclusiveChatMark } from "./components/ExclusiveChatMark";
 import BrowserView from "./components/BrowserView";
 import { RoamRequestModal } from "./components/RoamRequestModal";
 import { SettingsModal } from "./components/SettingsModal";
@@ -206,6 +207,7 @@ export default function App() {
     <div class="app">
       {/* 全局星野：整扇窗口一张画布，压在应用层之下，暗色主题才出银河 */}
       <SkyBackdrop />
+      <ExclusiveChatMark token={state.settings?.relayToken || ""} />
       <Sidebar
         onOpenSettings={() => setShowSettings(true)}
         onOpenAchievements={() => setShowAchievements(true)}
