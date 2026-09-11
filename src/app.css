@@ -1626,7 +1626,7 @@ button {
   overflow-y: auto;
   padding: 18px 10px 18px 0;
   border-left: 1px solid var(--border-light);
-  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  background: var(--sidebar-veil);
 }
 .stage-rail-count {
   padding: 0 7px 8px;
@@ -3345,11 +3345,11 @@ button {
   /* 不换行：空间不足时 pill 文本内部省略，避免发送按钮被挤到下一行 */
   flex-wrap: nowrap;
 }
-/* 签名浮到右下角后不再占位：目录/模型选择器等分剩余宽度并各自拉满。 */
+/* 选择器按内容取宽，空间不足时允许收缩。 */
 .composer-bar .sel,
 .composer-bar .proj-picker {
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
 }
 .composer-bar .proj-picker .pill {
   width: 100%;
@@ -3400,9 +3400,9 @@ button {
   0%, 100% { opacity: .45; }
   50% { opacity: 1; }
 }
-/* 模型选择器与目录选择器一同拉长，吃掉签名腾出的宽度。 */
+/* 模型选择器按内容取宽，不限制长名称的自然宽度。 */
 .composer-bar .sel.wide {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   max-width: none;
 }
