@@ -259,15 +259,8 @@ export function SearchSelect(props: {
     const anchor = props.anchorTo
       ? rootRef.closest(props.anchorTo)?.getBoundingClientRect()
       : undefined;
-    // 大面板锚定容器时贴容器上/下沿整体出现；
-    // 小的扁平下拉仍贴触发器，避免两行选项孤零零飘在容器另一侧
-    const box = big && anchor ? anchor : r;
-    const spaceBelow = window.innerHeight - box.bottom;
-    // 容器锚定优先向下弹（不遮住输入区），放不下再向上；其余沿用向上优先
-    const down =
-      big && anchor
-        ? spaceBelow >= height + 8 || (box.top < height + 8 && spaceBelow > box.top)
-        : r.top < height && window.innerHeight - r.bottom > r.top;
+    // 容器只约束水平边界，垂直始终贴触发器，避免输入框增高后浮层远离按钮。
+    const down = r.top < height + 8 && window.innerHeight - r.bottom > r.top;
     const right = r.left + width > window.innerWidth - 8;
     setPlace({ down, right });
     if (!usePortal()) return;
@@ -284,12 +277,12 @@ export function SearchSelect(props: {
     left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
     if (down) {
       // 下方空间不足时整体上移，保证浮层完整可见
-      const top = Math.max(8, Math.min(box.bottom + 8, window.innerHeight - height - 8));
+      const top = Math.max(8, Math.min(r.bottom + 8, window.innerHeight - height - 8));
       setCoords({ left, top, width: w });
     } else {
       const bottom = Math.max(
         8,
-        Math.min(window.innerHeight - box.top + 8, window.innerHeight - height - 8),
+        Math.min(window.innerHeight - r.top + 8, window.innerHeight - height - 8),
       );
       setCoords({ left, bottom, width: w });
     }
