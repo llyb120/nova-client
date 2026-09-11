@@ -37,6 +37,7 @@ import type {
   Status,
   Thread,
   ThreadMeta,
+  ToolItem,
   TurnEvent,
   UpdateInfo,
   UpdateOp,
@@ -1237,6 +1238,7 @@ function recoverProposedPlan(_thread: Thread): string | null {
 }
 
 let openThreadRequest = 0;
+let snapshotToolUpdates: { threadId: string; items: Map<number, ToolItem> } | undefined;
 
 /** 切换会话耗时自测：仅在总耗时超阈值时写一行 agent 日志，release 包也能定位卡点。 */
 let switchTraceStart = 0;
@@ -1351,13 +1353,12 @@ export async function openThread(id: string) {
     if (request !== openThreadRequest || state.currentId !== id) return;
   }
 
+  const toolUpdates = { threadId: id, items: new Map<number, ToolItem>() };
+  snapshotToolUpdates = toolUpdates;
   try {
-    // 切换后端 active_thread 是纯副作用（只设时间戳），不返回任何被后续依赖的值，
-    // 且 getThread 按 thread_id 显式拉取、不读 active_thread——无需 await。
-    // 之前 await 它会让切换卡在 Tauri 命令队列里：stage 会话的标题生成/model-options
-    // 等慢命令（session/new 触发 skills 扫描 + 最长 120s 的 session/prompt）排在前面，
-    // 把 reportActivity 堵 800ms。发射即忘让 getThread 立即并行入队，不再被堵。
-    void api.reportActivity(id).catch(() => {});
+    // 先接通前台推流再取快照，避免工具在快照之后、active_thread 切换之前完成而漏报。
+    // 缓存仍在 await 前显示；只让后台校准等待这次交接。
+    await api.reportActivity(id);
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
     if (cached && switching && !staleThreadSnapshots.has(id)) {
@@ -1380,12 +1381,18 @@ export async function openThread(id: string) {
       commitSnapshot(t, false);
       if (request !== openThreadRequest || state.currentId !== id) return;
     }
+    // IPC 返回途中收到的终态可能比快照更新，冷加载不能丢，暖加载不能被旧快照覆盖。
+    batch(() => {
+      for (const item of toolUpdates.items.values()) applyOp({ t: "upsert", item });
+    });
     const roamingPeer =
       t.roamingRole === "guest" ? t.roamingPeer ?? null : t.quotaPeer ?? null;
     if (roamingPeer) ensurePeerModels(roamingPeer);
     else void ensureModelOptions(agentKind);
   } catch {
     if (state.currentId === id) setState({ loadingThread: false });
+  } finally {
+    if (snapshotToolUpdates === toolUpdates) snapshotToolUpdates = undefined;
   }
 }
 
@@ -3225,6 +3232,10 @@ export async function initStore() {
     // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
     // 时选择器与「实施此计划」按钮会对不齐。
     const apply = (op: UpdateOp) => {
+      if (snapshotToolUpdates?.threadId === e.payload.threadId && op.t === "upsert"
+        && op.item.type === "tool" && op.item.status !== "pending" && op.item.status !== "in_progress") {
+        snapshotToolUpdates.items.set(op.item.id, op.item);
+      }
       if (
         state.loadingThread &&
         op.t !== "mode" &&
