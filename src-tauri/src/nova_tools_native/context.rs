@@ -123,7 +123,7 @@ struct FileEntry {
 struct DiskCache {
     version: u32,
     root: String,
-    files: HashMap<String, FileEntry>,
+    files: HashMap<String, Arc<FileEntry>>,
     /// 反向 import 图随缓存持久化：无文件变更的调用直接复用，不再每次全量重建。
     #[serde(default)]
     reverse: HashMap<String, Vec<ReverseImport>>,
@@ -190,7 +190,7 @@ struct Definition {
 
 #[derive(Default)]
 struct IndexView {
-    files: HashMap<String, FileEntry>,
+    files: HashMap<String, Arc<FileEntry>>,
     defs: HashMap<String, Vec<Definition>>,
     imports: HashMap<String, HashMap<String, String>>,
 }
@@ -1643,7 +1643,7 @@ fn rg_search(
     paths: &[String],
     code_glob: bool,
     deadline: Option<Instant>,
-) -> Option<Vec<SearchRow>> {
+) -> Option<(Vec<SearchRow>, bool)> {
     let mut args = vec![
         "-n".into(),
         "--with-filename".into(),
@@ -1705,7 +1705,16 @@ fn rg_search(
     }
     let stdout = run_command_until_limited(root, "rg", &args, deadline, MAX_SEARCH_OUTPUT_BYTES)?;
     if stdout.len() >= MAX_SEARCH_OUTPUT_BYTES { return None; }
-    Some(parse_search_rows(stdout))
+    let valid_utf8 = std::str::from_utf8(&stdout).is_ok();
+    let rows = parse_search_rows(stdout);
+    let mut counts = HashMap::<&str, usize>::new();
+    // 保守完整性证明：任何文件达到行上限、长行省略、总行上限或非UTF8，都不能证明零命中。
+    let complete = valid_utf8 && rows.len() < MAX_HIT_LINES && rows.iter().all(|row| {
+        let count = counts.entry(&row.file).or_default();
+        *count += 1;
+        *count < MAX_HITS_PER_FILE && !row.text.contains("[Omitted long matching line]")
+    });
+    Some((rows, complete))
 }
 
 fn search_text_until(
@@ -1759,6 +1768,7 @@ fn search_text_until(
         // rg is the bounded primary path. A timeout/output-cap failure must not fall through to an
         // unbounded `git grep` over the same large repository.
         return rg_search(root, &terms, ignore_case, word, files, false, deadline)
+            .map(|(rows, _)| rows)
             .unwrap_or_else(|| { search.incomplete.store(true, Ordering::Relaxed); Vec::new() });
     }
     let inside = git_value(root, &["rev-parse", "--is-inside-work-tree"]);
@@ -2444,7 +2454,7 @@ fn resolve_specifier(spec: &str, from: &str, files: &HashSet<String>) -> Option<
 /// 反向 import 图由全量缓存（含历史扫描）构建，让一次调用就能利用仓库级
 /// import 关系；个别条目可能陈旧，消费侧读当前文件验证 local 名的 import
 /// 行后再采信。
-fn reverse_from_files(files: &HashMap<String, FileEntry>, all_set: &HashSet<String>) -> ReverseMap {
+fn reverse_from_files(files: &HashMap<String, Arc<FileEntry>>, all_set: &HashSet<String>) -> ReverseMap {
     let mut reverse: ReverseMap = HashMap::new();
     for (file, entry) in files {
         for import in &entry.imports {
@@ -2470,7 +2480,8 @@ fn build_index(
     dependency_depth: usize,
     known_files: Option<&[String]>,
 ) -> (IndexView, Arc<Vec<String>>, Arc<DiskCache>) {
-    // ponytail: 同仓库更新仍串行；无变更时借用快照，若冷扫描争锁再拆分扫描与发布。
+    // ponytail: 更新扫描仍按仓库串行以合并相同冷请求；实测锁外重复扫描更慢。
+    // 文件清单/请求视图留在锁外；若不同闭包争锁成为瓶颈，再引入按文件的扫描合并。
     let cache_lock = CACHE_LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -2478,14 +2489,14 @@ fn build_index(
         .entry(normalize_root(root))
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
-    let lock_start = Instant::now();
-    let _cache_guard = cache_lock.lock().unwrap();
-    trace("build_index.lock_wait", lock_start);
     let all = known_files
         .map(|files| Arc::new(files.to_vec()))
         .unwrap_or_else(|| list_code_files(root));
     let all_set: HashSet<_> = all.iter().cloned().collect();
     // 无变更时不复制全仓符号和反向图；首次实际变更才复制并原子发布。
+    let lock_start = Instant::now();
+    let _cache_guard = cache_lock.lock().unwrap();
+    trace("build_index.lock_wait", lock_start);
     let cache = load_cache(root);
     let initially_empty = cache.files.is_empty();
     let mut fresh = Cow::Borrowed(cache.as_ref());
@@ -2516,10 +2527,12 @@ fn build_index(
                 .unwrap_or(true);
             if stale {
                 if let Ok(text) = fs::read_to_string(&path) {
+                    // 文件在读取中被编辑时不发布混合 stamp 的索引，下次请求重新扫描。
+                    if metadata_stamp(&path) != Some((size, modified_ns)) { continue; }
                     let mut entry = scan_source(&text, &file);
                     entry.size = size;
                     entry.modified_ns = modified_ns;
-                    fresh.to_mut().files.insert(file.clone(), entry);
+                    fresh.to_mut().files.insert(file.clone(), Arc::new(entry));
                     dirty = true;
                     changed += 1;
                     rescanned_files.push(file.clone());
@@ -2557,21 +2570,6 @@ fn build_index(
             removed_files.extend(pruned);
         }
     }
-    // Focused results must depend on this request, not files left by older cache history.
-    // Persist the full incremental cache, but expose only the requested dependency closure.
-    let selected = if wanted.is_some() {
-        targets
-            .iter()
-            .filter_map(|file| {
-                fresh
-                    .files
-                    .get(file)
-                    .map(|entry| (file.clone(), entry.clone()))
-            })
-            .collect()
-    } else {
-        fresh.files.clone()
-    };
     // 反向图随缓存持久化：无文件变更的调用直接复用。有变更时始终增量补丁
     //（先按 importer 删旧边，再按新 import 表加边），复杂度与变更文件数成正比，
     // 与仓库规模无关；大仓库一次 rebase/批量改动不再触发整图重建。
@@ -2614,9 +2612,6 @@ fn build_index(
     // PERSIST_INTERVAL_MS 节流并异步执行，查询线程不再阻塞在磁盘上。首次建缓存
     // （initially_empty）立即持久化，保证冷启动有基线可用。
     let persist = dirty && (initially_empty || changed > 0);
-    // Publish the updated cache before releasing the per-root mutation lock. Persistence is
-    // queued to a background thread, so another request can use the warm in-memory snapshot
-    // instead of waiting for a full bincode serialization and disk replacement.
     let updated = match fresh {
         Cow::Borrowed(_) => cache,
         Cow::Owned(fresh) => {
@@ -2626,6 +2621,10 @@ fn build_index(
         }
     };
     drop(_cache_guard);
+    // 请求视图只暴露当前闭包，条目 Arc 共享；无需持锁复制全量符号。
+    let selected = if wanted.is_some() {
+        targets.iter().filter_map(|file| updated.files.get(file).map(|entry| (file.clone(), entry.clone()))).collect()
+    } else { updated.files.clone() };
     let mut view = IndexView {
         files: selected,
         ..Default::default()
@@ -2673,18 +2672,21 @@ fn build_index(
 fn source(
     root: &Path,
     file: &str,
-    entry: Option<&FileEntry>,
+    entry: Option<&Arc<FileEntry>>,
     sources: &mut HashMap<String, Source>,
 ) -> Option<Source> {
     if let Some(src) = sources.get(file) {
         return Some(src.clone());
     }
-    let text = fs::read_to_string(root.join(file)).ok()?;
+    let path = root.join(file);
+    let before = metadata_stamp(&path)?;
+    let text = fs::read_to_string(&path).ok()?;
+    let unchanged = metadata_stamp(&path) == Some(before);
     let mut lines: Vec<_> = text.split('\n').map(str::to_string).collect();
     if lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
-    let syms = if entry.is_some_and(|e| e.total == lines.len()) {
+    let syms = if unchanged && entry.is_some_and(|e| e.total == lines.len() && (e.size, e.modified_ns) == before) {
         entry.unwrap().syms.clone()
     } else {
         scan_source(&text, file).syms
@@ -3175,11 +3177,23 @@ fn search_text_scopes_until(
     dirs: Option<&[String]>,
     search: &SearchSession,
 ) -> Vec<SearchRow> {
-    if search.expired() || terms.is_empty() { return Vec::new(); }
+    search_scopes_result(root, terms, ignore_case, word, dirs, search).0
+}
+
+// complete 只用于证明整批搜索无遗漏；倒排候选裁剪/后备路径暂不提供负命中证明。
+fn search_scopes_result(
+    root: &Path,
+    terms: &[String],
+    ignore_case: bool,
+    word: bool,
+    dirs: Option<&[String]>,
+    search: &SearchSession,
+) -> (Vec<SearchRow>, bool) {
+    if search.expired() || terms.is_empty() { return (Vec::new(), false); }
     let deadline = search.deadline;
     if let Some(rows) = search.index.as_ref().and_then(|index| search_index_rows(index, terms, ignore_case, word, dirs, deadline)) {
         search.expired();
-        return rows;
+        return (rows, false);
     }
     if rg_available(root) {
         let rows = match dirs {
@@ -3189,7 +3203,7 @@ fn search_text_scopes_until(
             _ => rg_search(root, terms, ignore_case, word, &[], true, deadline),
         };
         // rg 失败不能再对同一范围重跑一遍；输出显式缺口而不是隐藏超时。
-        return rows.unwrap_or_else(|| { search.incomplete.store(true, Ordering::Relaxed); Vec::new() });
+        return rows.unwrap_or_else(|| { search.incomplete.store(true, Ordering::Relaxed); (Vec::new(), false) });
     }
     let files = match dirs {
         Some(dirs) if !dirs.is_empty() => list_code_files(root)
@@ -3199,7 +3213,7 @@ fn search_text_scopes_until(
             .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
-    search_text_until(root, terms, ignore_case, word, &files, search)
+    (search_text_until(root, terms, ignore_case, word, &files, search), false)
 }
 
 fn compact_evidence_miss(
@@ -3925,6 +3939,7 @@ fn backfill_block(
         return None;
     }
     let src = source(root, file, index.files.get(file), sources)?;
+    if block.start == 0 || block.end > src.lines.len() { return None; }
     plans.push(PlannedFile {
         file: file.to_string(),
         source: src,
@@ -4555,11 +4570,8 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     let seed_bodies = seeds
         .iter()
         .filter_map(|(definition, _, _)| {
-            source(root, &definition.file, index.files.get(&definition.file), &mut sources).map(|src| {
-                (
-                    definition.file.clone(),
-                    src.lines[definition.symbol.ln - 1..definition.symbol.end].join("\n"),
-                )
+            source(root, &definition.file, index.files.get(&definition.file), &mut sources).and_then(|src| {
+                Some((definition.file.clone(), src.lines.get(definition.symbol.ln.checked_sub(1)?..definition.symbol.end)?.join("\n")))
             })
         })
         .collect::<Vec<_>>();
@@ -4599,7 +4611,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     let planned_scope = scope_dirs(&seed_body_files);
     // 计划驱动的二次检索与反向图词根检索互相独立，并行执行。
     let search_stage = Instant::now();
-    let (planned_rows, discover_rows) = std::thread::scope(|scope| {
+    let (planned_rows, (discover_rows, discover_complete)) = std::thread::scope(|scope| {
         let planned = scope.spawn(|| {
             if planned_terms.is_empty() {
                 Vec::<SearchRow>::new()
@@ -4616,9 +4628,9 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         });
         let stems = scope.spawn(|| {
             if discover_stems.is_empty() {
-                Vec::<SearchRow>::new()
+                (Vec::<SearchRow>::new(), false)
             } else {
-                search_text_scopes_until(root, &discover_stems, true, false, None, search)
+                search_scopes_result(root, &discover_stems, true, false, None, search)
             }
         });
         (
@@ -4664,7 +4676,10 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         .iter()
         .map(|stem| stem.to_lowercase())
         .collect::<Vec<_>>();
-    let mut stem_rows = HashMap::<String, Vec<SearchRow>>::new();
+    // 仅完整实时搜索可缓存空命中。被截断/候选裁剪/超时的批次仍允许逐词补搜。
+    let mut stem_rows = if discover_complete {
+        discover_stems.iter().cloned().map(|stem| (stem, Vec::<SearchRow>::new())).collect()
+    } else { HashMap::<String, Vec<SearchRow>>::new() };
     for row in discover_rows {
         let lower = row.text.to_lowercase();
         for (index, stem) in discover_stems.iter().enumerate() {
@@ -5731,6 +5746,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
             dependencies.push((dep_name, def.clone(), dep_depth));
             if dep_depth < 2 {
                 if let Some(src) = source(root, &def.file, index.files.get(&def.file), &mut sources) {
+                    if def.symbol.ln == 0 || def.symbol.end > src.lines.len() { continue; }
                     next_plans.push(PlannedFile {
                         file: def.file,
                         source: src,
@@ -5777,6 +5793,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         let Some(src) = source(root, &def.file, index.files.get(&def.file), &mut sources) else {
             continue;
         };
+        if def.symbol.ln == 0 || def.symbol.end > src.lines.len() { continue; }
         let n = def.symbol.end - def.symbol.ln + 1;
         let bytes = range_cost(&src, def.symbol.ln, def.symbol.end);
         let required = dep_depth == 0;
@@ -6362,6 +6379,72 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn parallel_cold_scans_keep_all_disjoint_updates() {
+        let dir = tempdir().unwrap();
+        let all = (0..4).map(|i| format!("f{i}.rs")).collect::<Vec<_>>();
+        for (i, file) in all.iter().enumerate() {
+            fs::write(dir.path().join(file), format!("pub fn target_{i}() {{}}\n")).unwrap();
+        }
+        let barrier = std::sync::Barrier::new(4);
+        thread::scope(|scope| {
+            for (i, file) in all.iter().enumerate() {
+                let barrier = &barrier;
+                let all = &all;
+                let root = dir.path();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let wanted = HashSet::from([file.clone()]);
+                    let (view, _, _) = build_index(root, Some(&wanted), 0, Some(all));
+                    assert!(view.defs.contains_key(&format!("target_{i}")));
+                });
+            }
+        });
+        assert_eq!(load_cache(dir.path()).files.len(), 4);
+        let (view, _, _) = build_index(dir.path(), None, 0, Some(&all));
+        assert_eq!(view.files.len(), 4);
+        assert_eq!(load_cache(dir.path()).files.len(), 4);
+    }
+
+    #[test]
+    fn symbol_arc_cache_keeps_old_disk_format() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyCache { version: u32, root: String, files: HashMap<String, FileEntry>, reverse: ReverseMap }
+        let legacy = LegacyCache { version: CACHE_VERSION, root: "test".into(), files: HashMap::from([
+            ("a.rs".into(), scan_source("pub fn a() {}", "a.rs"))
+        ]), reverse: HashMap::new() };
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let cache: DiskCache = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(cache.files["a.rs"].syms[0].name, "a");
+        assert_eq!(bincode::serialize(&cache).unwrap(), bytes);
+    }
+
+    #[test]
+    fn rg_negative_evidence_requires_untruncated_search() {
+        let dir = tempdir().unwrap();
+        if !rg_available(dir.path()) { return; }
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let (_, complete) = rg_search(root, &["absent".into()], true, false, &[], true, None).unwrap();
+        assert!(complete);
+        fs::write(root.join("a.rs"), "alpha\n".repeat(MAX_HITS_PER_FILE)).unwrap();
+        assert!(!rg_search(root, &["alpha".into(), "absent".into()], true, false, &[], true, None).unwrap().1);
+        fs::write(root.join("a.rs"), format!("{}alpha\n", "x".repeat(1200))).unwrap();
+        assert!(!rg_search(root, &["alpha".into(), "absent".into()], true, false, &[], true, None).unwrap().1);
+        assert!(rg_search(root, &["alpha".into()], true, false, &[], true, Some(Instant::now())).is_none());
+    }
+
+    #[test]
+    fn source_rescans_when_line_count_stays_equal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        fs::write(&path, "pub fn old() {}\n").unwrap();
+        let old = Arc::new(scan_source("pub fn old() {}\n", "a.rs"));
+        fs::write(&path, "pub fn renamed_function() {}\n").unwrap();
+        let src = source(dir.path(), "a.rs", Some(&old), &mut HashMap::new()).unwrap();
+        assert_eq!(src.syms[0].name, "renamed_function");
+    }
 
     #[test]
     fn failed_history_is_not_cached_as_no_coupling() {
@@ -7222,7 +7305,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = rg_search(
+        let (rows, _) = rg_search(
             d.path(),
             &["context_anchor".to_string()],
             false,
@@ -7287,13 +7370,13 @@ mod tests {
         let mut files = HashMap::new();
         files.insert(
             "src/cached.ts".into(),
-            FileEntry {
+            Arc::new(FileEntry {
                 size: 21,
                 modified_ns: 1,
                 total: 1,
                 syms: Vec::new(),
                 imports: Vec::new(),
-            },
+            }),
         );
         let cache = DiskCache {
             version: CACHE_VERSION,

@@ -296,20 +296,28 @@ impl ExperienceStore {
 
     fn save(&self) {
         if let Some(cache) = RECALL_SNAPSHOT.get() {
-            if let Ok(mut cached) = cache.lock() {
-                // 比较召回字段而非训练会话/计时器，只有实际知识或激活权重变化才失效。
-                // ponytail: 写路径比较最多64个缓存项目；若泛用库很大，再给分区加版本号。
-                cached.retain(|key, snapshot| {
-                    let universal_same = snapshot.universal.iter().map(|x| &x.entry).eq(
-                        self.universal_experiences.iter().filter(|x| x.knowledge_scope == "universal"));
-                    let project_same = match (snapshot.projects.get(key), self.projects.get(key)) {
-                        (Some(old), Some(now)) => old.expert_activations == now.expert_activations
-                            && old.entries.iter().map(|x| &x.entry).eq(now.experiences.iter().filter(|x| x.knowledge_scope != "universal")),
-                        (None, None) => true,
-                        _ => false,
-                    };
-                    universal_same && project_same
-                });
+            // save 的调用者持 store 锁；先只克隆 Arc，在 cache 锁外比较，热召回不用等全库比较。
+            let snapshots = cache.lock().map(|cached| cached.clone()).unwrap_or_default();
+            // ponytail: 写路径比较最多64个缓存项目；若泛用库很大，再给分区加版本号。
+            let invalid = snapshots.into_iter().filter(|(key, snapshot)| {
+                let universal_same = snapshot.universal.iter().map(|x| &x.entry).eq(
+                    self.universal_experiences.iter().filter(|x| x.knowledge_scope == "universal"));
+                let project_same = match (snapshot.projects.get(key), self.projects.get(key)) {
+                    (Some(old), Some(now)) => old.expert_activations == now.expert_activations
+                        && old.entries.iter().map(|x| &x.entry).eq(now.experiences.iter().filter(|x| x.knowledge_scope != "universal")),
+                    (None, None) => true,
+                    _ => false,
+                };
+                !(universal_same && project_same)
+            }).collect::<Vec<_>>();
+            if !invalid.is_empty() {
+                if let Ok(mut cached) = cache.lock() {
+                    for (key, snapshot) in invalid {
+                        if cached.get(&key).is_some_and(|current| Arc::ptr_eq(current, &snapshot)) {
+                            cached.remove(&key);
+                        }
+                    }
+                }
             }
         }
         if let Some(parent) = self.path.parent() {

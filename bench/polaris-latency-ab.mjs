@@ -1,5 +1,5 @@
 // Matched production-mode Polaris A/B + Command Code GLM evidence check.
-// node bench/polaris-latency-ab.mjs [--model] [--cold-check] [--index-update] [--baseline <git-ref>] [--corpus-ref <git-ref>] [--out <report.json>]
+// node bench/polaris-latency-ab.mjs [--model] [--cold-check] [--index-update] [--symbol-update] [--concurrency] [--baseline <git-ref>] [--corpus-ref <git-ref>] [--out <report.json>]
 // Builds the unchanged native module from each arm in one optimized standalone binary.
 // No model calls unless --model; credentials stay in the existing local config.
 import assert from 'node:assert/strict';
@@ -96,7 +96,7 @@ version = "0.0.0"
 edition = "2021"
 [dependencies]
 regex = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 sha2 = "0.10"
 wait-timeout = "0.2"
@@ -144,9 +144,36 @@ opt-level = 3
         serde_json::json!({"files":1500,"updatesMs":updates,"replaysMs":replays})
     }
   ` : '';
+  const symbolProbe = args.includes('--symbol-update') ? `
+    pub fn symbol_update_probe(root: &Path) -> serde_json::Value {
+        std::fs::create_dir_all(root).unwrap();
+        let all = (0..800).map(|i| format!("f{i}.rs")).collect::<Vec<_>>();
+        for (i, file) in all.iter().enumerate() {
+            let text = (0..20).map(|j| format!("pub fn symbol_{i}_{j}() {{}}\\n")).collect::<String>();
+            std::fs::write(root.join(file), text).unwrap();
+        }
+        let (_, _, original) = build_index(root, None, 0, Some(&all));
+        let wanted = HashSet::from(["f0.rs".to_string()]);
+        let mut updates = Vec::new();
+        let mut warm = Vec::new();
+        for i in 0..8 {
+            let name = format!("changed_{}", "x".repeat(i+1));
+            std::fs::write(root.join("f0.rs"), format!("pub fn {name}() {{}}\\n")).unwrap();
+            let start = Instant::now();
+            let (view, _, _) = build_index(root, Some(&wanted), 0, Some(&all));
+            updates.push(start.elapsed().as_secs_f64()*1000.0);
+            assert!(view.defs.contains_key(&name));
+            assert_eq!(original.files["f0.rs"].syms[0].name, "symbol_0_0");
+            let start = Instant::now();
+            let _ = build_index(root, Some(&wanted), 0, Some(&all));
+            warm.push(start.elapsed().as_secs_f64()*1000.0);
+        }
+        serde_json::json!({"files":800,"symbolsPerFile":20,"updatesMs":updates,"warmMs":warm})
+    }
+  ` : '';
   await writeFile(join(work, 'src/main.rs'), `#![allow(dead_code)]
-mod a { include!("a.rs"); ${updateProbe} }
-mod b { include!("b.rs"); ${updateProbe} }
+mod a { include!("a.rs"); ${updateProbe} ${symbolProbe} }
+mod b { include!("b.rs"); ${updateProbe} ${symbolProbe} }
 use std::{io::{BufRead, Write}, path::Path, time::Instant};
 fn main() {
     let args: Vec<_> = std::env::args().collect();
@@ -161,6 +188,29 @@ fn main() {
             std::io::stdout().flush().unwrap();
             continue;
         }` : ''}
+        ${args.includes('--symbol-update') ? `if req["params"]["_symbolUpdateProbe"] == true {
+            let root = Path::new(&args[2]).join("symbol-probe");
+            let probe = if args[1] == "A" { a::symbol_update_probe(&root) } else { b::symbol_update_probe(&root) };
+            println!("{}", serde_json::json!({"id":req["id"],"probe":probe}));
+            std::io::stdout().flush().unwrap();
+            continue;
+        }` : ''}
+        if let Some(width) = req["params"]["_concurrencyProbe"].as_u64() {
+            let params = req["params"]["query"].clone();
+            let barrier = std::sync::Barrier::new(width as usize);
+            let samples = std::thread::scope(|scope| {
+                let jobs = (0..width).map(|_| scope.spawn(|| {
+                    barrier.wait();
+                    let start = Instant::now();
+                    let result = if args[1] == "A" { a::polaris(root, params.clone()) } else { b::polaris(root, params.clone()) };
+                    serde_json::json!({"ms":start.elapsed().as_secs_f64()*1000.0,"text":result.unwrap()})
+                })).collect::<Vec<_>>();
+                jobs.into_iter().map(|job| job.join().unwrap()).collect::<Vec<_>>()
+            });
+            println!("{}", serde_json::json!({"id":req["id"],"samples":samples,"ms":start.elapsed().as_secs_f64()*1000.0}));
+            std::io::stdout().flush().unwrap();
+            continue;
+        }
         let result = if args[1] == "A" { a::polaris(root, req["params"].clone()) } else { b::polaris(root, req["params"].clone()) };
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         let response = match result {
@@ -182,6 +232,20 @@ fn main() {
       const invoke = worker(exe, arm, `${arm}-cold-${repeat}`);
       const result = await invoke({ keywords: test.keywords, task: test.task });
       report.coldChecks.push({ arm, repeat, ms: result.ms, text: result.text, hash: sha(result.text), profile: result.profile });
+      children.at(-1).kill();
+    }
+  }
+  if (args.includes('--concurrency')) {
+    report.concurrency = [];
+    for (let repeat = 0; repeat < 3; repeat++) for (const arm of repeat % 2 ? ['B', 'A'] : ['A', 'B']) {
+      const invoke = worker(exe, arm, `${arm}-parallel-${repeat}`);
+      const query = { keywords: cases[1].keywords, task: cases[1].task };
+      for (const phase of ['cold', 'warm']) {
+        const result = await invoke({ _concurrencyProbe: 4, query });
+        report.concurrency.push({ arm, repeat, phase, wallMs: result.ms,
+          samples: result.samples.map(({ms,text}) => ({ ms, hash: sha(text), bytes: Buffer.byteLength(text), expanded: [...text.matchAll(/^### (\S+)/gm)].map(m=>m[1]) })) });
+        if (phase === 'cold') await new Promise(done => setTimeout(done, 2000));
+      }
       children.at(-1).kill();
     }
   }
@@ -213,6 +277,10 @@ fn main() {
     return { id: test.id, medianA: A, medianB: B, improvementPercent: 100 * (A - B) / A, pairs,
       identicalWarmOutput: pairs.filter(p => p.run >= 1).every(p => p.identicalOutput) };
   });
+  if (args.includes('--symbol-update')) {
+    report.symbolUpdateProbe = {};
+    for (const arm of ['A', 'B']) report.symbolUpdateProbe[arm] = (await workers[arm]({ _symbolUpdateProbe: true })).probe;
+  }
   if (args.includes('--index-update')) {
     report.indexUpdateProbe = {};
     for (const arm of ['A', 'B']) report.indexUpdateProbe[arm] = (await workers[arm]({ _indexUpdateProbe: true })).probe;
