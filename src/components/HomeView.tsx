@@ -51,6 +51,7 @@ import type { WorkflowDef } from "../workflow/types";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
 import { IconClue, IconFile, IconFolder, IconLogo, IconMerge, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { HaibaraBubble } from "./HaibaraBubble";
 import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
@@ -1005,6 +1006,7 @@ export function HomeView() {
   return (
     <main class="home">
       <div class="home-center">
+        <HaibaraBubble />
         <header class="home-intro">
           <div class="home-eyebrow"><IconLogo size={28} class="home-logo" /><span>NOVA WORKSPACE</span></div>
           <h1 class="home-title">让想法，从这里开始。</h1>

@@ -1753,6 +1753,78 @@ button {
   font-size: 12px;
 }
 
+/* ===== 新会话灰原哀气泡 =====
+   定位对齐室女座气泡：锚定输入框（.home-composer）左上角上方，长出尖角指向输入框。
+   依附于 .home-center 流内，锚点缺失时安全隐藏。 */
+.home-center {
+  position: relative;
+}
+.haibara-bubble {
+  position: absolute;
+  left: 20px;
+  bottom: calc(100% - 13px);
+  max-width: 320px;
+  background: var(--bg-float);
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  padding: 10px 12px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  z-index: 5;
+}
+.haibara-bubble::after {
+  content: "";
+  position: absolute;
+  left: 26px;
+  bottom: -7px;
+  width: 12px;
+  height: 12px;
+  background: var(--bg-float);
+  border-right: 1px solid var(--border-light);
+  border-bottom: 1px solid var(--border-light);
+  transform: rotate(45deg);
+}
+.haibara-bubble-head {
+  position: relative;
+  z-index: 1;
+}
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.haibara-bubble-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.haibara-bubble-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  flex: 1;
+}
+.haibara-bubble-actions button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.haibara-bubble-actions button:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+.haibara-bubble-text {
+  position: relative;
+  z-index: 1;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+
 /* ===== 轮次折叠（codex 风格） ===== */
 .turn-fold {
   display: flex;
