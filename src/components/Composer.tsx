@@ -29,6 +29,7 @@ import {
   enabledAgentKinds,
   ensureModelOptions,
   ensurePeerModels,
+  getOutputRate,
   openClueCard,
   pickThreadModel,
   refreshSlashCommands,
@@ -172,6 +173,8 @@ export function Composer() {
       ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
       : `${minutes}:${String(remainder).padStart(2, "0")}`;
   };
+  // 输出速度（tok/s 估算）。runClock 秒级 ticker 保证运行中停顿 >1.5s 时归零刷新。
+  const tokenSpeed = () => getOutputRate(state.currentId);
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
@@ -827,6 +830,10 @@ export function Composer() {
             <span>
               上下文 {fmtTokens(contextUsedTokens())} / {contextWindow() ? fmtTokens(contextWindow()!) : "--"}
             </span>
+            <Show when={tokenSpeed() > 0}>
+              <span class="composer-run-sep">·</span>
+              <span>{tokenSpeed()} tok/s</span>
+            </Show>
           </span>
         </Show>
         <div class="composer-actions">

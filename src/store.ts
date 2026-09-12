@@ -2918,10 +2918,12 @@ const pendingDeltas = new Map<number, string>();
    1 token ≈ 4 字符只用于驱动动画节奏，无需精确；约 0.5s 一个采样窗口并做平滑。 */
 const RATE_WINDOW_MS = 500;
 const rateWindows = new Map<string, { chars: number; since: number; tokensPerSec: number }>();
+const rateUpdatedAt = new Map<string, number>();
 export const [outputRates, setOutputRates] = createSignal<Record<string, number>>({});
 
 function trackDeltaRate(threadId: string, chars: number) {
   const now = performance.now();
+  rateUpdatedAt.set(threadId, now);
   let w = rateWindows.get(threadId);
   if (!w) {
     w = { chars: 0, since: now, tokensPerSec: 0 };
@@ -2940,7 +2942,18 @@ function trackDeltaRate(threadId: string, chars: number) {
   w.chars += chars;
 }
 
+/* 实时输出速度（tok/s）：按流式 delta 字符吞吐估算，约 1 token = 4 字符。
+   超过 1.5s 没有新 delta（如工具执行中）视为停顿，返回 0。
+   依赖组件侧的运行中秒级 ticker 刷新 staleness。 */
+export function getOutputRate(threadId: string | null | undefined): number {
+  if (!threadId) return 0;
+  const at = rateUpdatedAt.get(threadId);
+  if (at === undefined || performance.now() - at > 1_500) return 0;
+  return outputRates()[threadId] ?? 0;
+}
+
 function clearDeltaRate(threadId: string) {
+  rateUpdatedAt.delete(threadId);
   if (!rateWindows.delete(threadId)) return;
   setOutputRates((rates) => {
     if (!(threadId in rates)) return rates;

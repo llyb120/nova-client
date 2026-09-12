@@ -16,7 +16,7 @@ import { relPath } from "./EditedFilesCard";
 import { createFileContextMenu } from "./FileContextMenu";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
-import { fmtDuration, fmtTokens, turnTokenTitle } from "./TurnGroup";
+import { fmtDuration, fmtTokens, turnAvgTokensPerSec, turnTokenTitle } from "./TurnGroup";
 
 // ─── Public interface ────────────────────────────────────────────────────────
 
@@ -1448,8 +1448,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (g.turn && process.length) {
         const foldKey = `turn-${g.turn.id ?? g.user?.id ?? process[0]?.id ?? 0}`;
         const open = state.expanded[foldKey] ?? bodyExpandedFor(process);
+        const avgRate = turnAvgTokensPerSec(g.turn);
         const label = ["已处理", fmtDuration(g.turn.durationMs),
-          g.turn.totalTokens ? `· ${fmtTokens(g.turn.totalTokens)} tokens` : ""].filter(Boolean).join(" ");
+          g.turn.totalTokens ? `· ${fmtTokens(g.turn.totalTokens)} tokens` : "",
+          avgRate != null ? `· ${fmtTokens(avgRate)} tok/s` : "",
+        ].filter(Boolean).join(" ");
         const tokenTip = turnTokenTitle(g.turn);
 
         // .turn-fold: padding 4px 8px; margin 12px 0 2px -8px; font 13; gap 6
