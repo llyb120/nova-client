@@ -25,7 +25,7 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 // Keep in lockstep with scripts/ctx-index.mjs INDEX_CACHE_VERSION.
-const CACHE_VERSION: u32 = 14;
+const CACHE_VERSION: u32 = 15;
 const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 8_000;
 const MAX_HITS_PER_FILE: usize = 60;
@@ -2234,27 +2234,40 @@ fn scan_source(text: &str, file: &str) -> FileEntry {
         let Some((name, kind)) = declaration(stripped, depth) else {
             continue;
         };
+        let callable = matches!(kind.as_str(), "fn" | "method");
         let current = code[i].trim_end();
-        let end = if after[i] <= depth && current.ends_with([';', ',']) {
+        let mut delimiters = 0usize;
+        let end = if after[i] <= depth && current.ends_with(';') {
             i
         } else {
             let mut open = None;
             let mut early_end = None;
-            for j in i..(i + 14).min(lines.len()) {
+            // ponytail: 签名最多前瞻 256 行；更长或更复杂的语法应升级为语法解析器。
+            let lookahead = if callable { 256 } else { 14 };
+            for j in i..(i + lookahead).min(lines.len()) {
+                for ch in code[j].chars() {
+                    match ch {
+                        '(' | '[' => delimiters += 1,
+                        ')' | ']' => delimiters = delimiters.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                // 参数里的逗号、空行、数组分号和对象类型花括号都不是声明结束。
+                if delimiters > 0 {
+                    continue;
+                }
                 if after[j] > depth {
                     open = Some(j);
                     break;
                 }
-                if j > i {
-                    let value = code[j].trim_end();
-                    if value.ends_with([';', ',']) {
-                        early_end = Some(j);
-                        break;
-                    }
-                    if value.trim().is_empty() {
-                        early_end = Some(j - 1);
-                        break;
-                    }
+                let value = code[j].trim_end();
+                if value.ends_with(';') || (!callable && value.ends_with(',')) {
+                    early_end = Some(j);
+                    break;
+                }
+                if j > i && !callable && value.trim().is_empty() {
+                    early_end = Some(j - 1);
+                    break;
                 }
             }
             if let Some(end) = early_end {
@@ -6286,6 +6299,29 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn multiline_function_boundaries() {
+        let cases = [
+            ("a.rs", "pub fn target(\n    values: [u8; 4],\n\n    // ) ignored\n    callback: fn(\n        u8,\n    ),\n)\nwhere\n    T: Copy,\n{\n    callback(values[0]);\n}\n", 13),
+            ("a.rs", "trait Example {\n    fn target(\n        &self,\n        value: u8,\n    );\n    fn next(&self);\n}\n", 5),
+            ("a.ts", "export function target(\n    options: {\n        value: number,\n    },\n\n    callback: (value: number) => void,\n) {\n    callback(options.value);\n}\n", 9),
+            ("a.ts", "export const target = 1,\n    next = 2;\n", 1),
+        ];
+        for (file, text, end) in cases {
+            let entry = scan_source(text, file);
+            let symbol = entry.syms.iter().find(|symbol| symbol.name == "target").unwrap();
+            assert_eq!(symbol.end, end, "{file}: {text}");
+        }
+        let text = format!("pub fn target(\n{}) {{\n    work();\n}}\n", "    arg: u8,\n".repeat(20));
+        assert_eq!(scan_source(&text, "a.rs").syms[0].end, 24);
+        let text = include_str!("../lyra/provider.rs");
+        let entry = scan_source(text, "provider.rs");
+        let symbol = entry.syms.iter().find(|symbol| symbol.name == "completions_body").unwrap();
+        let body = text.lines().skip(symbol.ln - 1).take(symbol.end - symbol.ln + 1).collect::<Vec<_>>().join("\n");
+        assert!(body.contains("apply_reasoning_completions(&mut body"));
+        assert!(body.ends_with("\n}"));
+    }
+
     #[test]
     fn exact_definition_is_not_displaced_by_partial_name_matches() {
         let d = tempdir().unwrap();
