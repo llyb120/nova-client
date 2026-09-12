@@ -623,20 +623,23 @@ async fn execute_inner(
             let memory_enabled = std::env::var("NOVA_EXPERIENCE_TOOLS")
                 .map(|value| value == "1")
                 .unwrap_or(false);
-            // 代码上下文与训练知识是独立数据源，同轮并行，附加召回不会串行拖慢 polaris。
+            // 两侧并行但返回仍等待较慢一侧；分别计时以定位知识召回/工作线程排队。
+            let started = std::time::Instant::now();
             let code_job = tokio::task::spawn_blocking(move || {
-                crate::nova_tools_native::context::polaris(&code_root, args)
+                let result = crate::nova_tools_native::context::polaris(&code_root, args);
+                eprintln!("[nova-tools-profile] polaris.code_with_queue: {:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
+                result
             });
             let memory_job = tokio::task::spawn_blocking(move || {
                 if !memory_enabled || memory_query.is_empty() {
                     None
                 } else {
-                    crate::experience::load_trained_memory(
-                        &memory_root.to_string_lossy(),
-                        &memory_query,
-                        8,
-                    )
-                    .ok()
+                    let result = crate::experience::load_trained_memory(
+                        &memory_root.to_string_lossy(), &memory_query, 8,
+                    );
+                    eprintln!("[nova-tools-profile] polaris.memory_with_queue: {:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
+                    if let Err(error) = &result { eprintln!("[polaris] knowledge recall failed: {error}"); }
+                    result.ok()
                 }
             });
             let (code_result, memory_result) = tokio::join!(code_job, memory_job);

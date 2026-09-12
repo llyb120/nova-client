@@ -1,5 +1,5 @@
 // Matched production-mode Polaris A/B + Command Code GLM evidence check.
-// node bench/polaris-latency-ab.mjs [--model] [--cold-check] [--baseline <git-ref>] [--out <report.json>]
+// node bench/polaris-latency-ab.mjs [--model] [--cold-check] [--index-update] [--baseline <git-ref>] [--corpus-ref <git-ref>] [--out <report.json>]
 // Builds the unchanged native module from each arm in one optimized standalone binary.
 // No model calls unless --model; credentials stay in the existing local config.
 import assert from 'node:assert/strict';
@@ -15,6 +15,7 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const option = (key, fallback) => args.includes(key) ? args[args.indexOf(key) + 1] : fallback;
 const baseline = option('--baseline', 'HEAD');
+const corpusRef = option('--corpus-ref', baseline);
 const out = resolve(option('--out', join(repo, 'bench/polaris-latency-ab.report.json')));
 const model = 'z-ai/glm-5.3-flash';
 const cases = [
@@ -27,7 +28,7 @@ const median = values => { const sorted = [...values].sort((a, b) => a - b); ret
 const work = await mkdtemp(join(tmpdir(), 'nova-polaris-ab-'));
 const children = [];
 const corpus = join(work, 'corpus');
-const report = { ranAt: new Date().toISOString(), baseline, model: args.includes('--model') ? model : null,
+const report = { ranAt: new Date().toISOString(), baseline, corpusRef, model: args.includes('--model') ? model : null,
   methodology: 'Same optimized binary, production cfg/deadlines, fixed baseline source corpus (src-tauri/src, src, scripts), separate per-arm caches. Corpus has one synthetic commit, not original git history; no new benchmark/answer files. Alternating A/B order. First observation is cold process/index, not cold OS cache. Model receives one forced Polaris tool result; no agent loop. Fact hits are smoke checks, not semantic correctness scores.',
   queries: [], modelRuns: [] };
 
@@ -47,12 +48,18 @@ function worker(exe, arm, cacheName = arm) {
   children.push(child);
   const pending = new Map();
   let seq = 0;
-  child.stderr.resume();
+  let profile = [];
+  createInterface({ input: child.stderr }).on('line', line => {
+    const match = line.match(/^\[nova-tools-profile\] ([^:]+): (.+)$/);
+    if (match && profile.length < 200) profile.push({ stage: match[1], value: match[2] });
+  });
   createInterface({ input: child.stdout }).on('line', line => {
     const value = JSON.parse(line);
     const job = pending.get(value.id);
     if (!job) return;
     pending.delete(value.id); clearTimeout(job.timer);
+    value.profile = profile;
+    profile = [];
     value.error ? job.fail(new Error(value.error)) : job.done(value);
   });
   child.on('exit', code => {
@@ -72,10 +79,10 @@ try {
   const a = execFileSync('git', ['show', `${baseline}:${path}`], { cwd: repo, maxBuffer: 2 * 1024 * 1024 }).toString();
   const b = await readFile(join(repo, path), 'utf8');
   report.sourceHashes = { A: sha(a), B: sha(b) };
-  report.workspaceRevision = execFileSync('git', ['rev-parse', `${baseline}^{commit}`], { cwd: repo }).toString().trim();
+  report.workspaceRevision = execFileSync('git', ['rev-parse', `${corpusRef}^{commit}`], { cwd: repo }).toString().trim();
   await mkdir(corpus);
   const archive = join(work, 'corpus.tar');
-  await command('git', ['archive', '--format=tar', '-o', archive, baseline, 'src-tauri/src', 'src', 'scripts']);
+  await command('git', ['archive', '--format=tar', '-o', archive, corpusRef, 'src-tauri/src', 'src', 'scripts']);
   await command('tar', ['-xf', archive, '-C', corpus]);
   await command('git', ['-C', corpus, 'init', '--quiet']);
   await command('git', ['-C', corpus, 'add', 'src-tauri/src', 'src', 'scripts']);
@@ -99,9 +106,47 @@ bincode = "1.3"
 [profile.release]
 opt-level = 3
 `);
+  const updateProbe = args.includes('--index-update') ? `
+    pub fn index_update_probe() -> serde_json::Value {
+        let mut postings = HashMap::<String, Vec<String>>::new();
+        let mut contents = HashMap::new();
+        let mut file_tokens = HashMap::new();
+        for i in 0..1500 {
+            let file = format!("src/file_{i}.rs");
+            let text = format!("pub fn symbol_{i}() {}", "shared field value;".repeat(256));
+            let tokens = tokens_for_search_text(&text);
+            for token in &tokens { postings.entry(token.clone()).or_default().push(file.clone()); }
+            file_tokens.insert(file.clone(), tokens);
+            contents.insert(file, text);
+        }
+        let mut index = index_from_snapshot(SearchSnapshot { version: SEARCH_SNAPSHOT_VERSION,
+            root: "synthetic".into(), head: "base".into(), git_signature: "base".into(),
+            dirty_files: Vec::new(), postings, contents, file_tokens });
+        let mut delta = SearchDelta { version: SEARCH_SNAPSHOT_VERSION, root: "synthetic".into(),
+            base_head: "base".into(), base_signature: "base".into(), head: "base".into(),
+            git_signature: "dirty".into(), dirty_files: vec!["src/file_0.rs".into()], files: HashMap::new() };
+        let mut updates = Vec::new();
+        let mut replays = Vec::new();
+        for i in 0..8 {
+            let body = format!("pub fn changed_{i}() {{}}");
+            delta.files.insert("src/file_0.rs".into(), Some(body.clone()));
+            let start = Instant::now();
+            let updated = apply_search_delta(index.clone(), &delta).unwrap();
+            updates.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(updated.contents["src/file_0.rs"].as_str(), body.as_str());
+            assert!(index.contents["src/file_1499.rs"].contains("symbol_1499"));
+            let start = Instant::now();
+            let replay = apply_search_delta(updated.clone(), &delta).unwrap();
+            replays.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(replay.contents["src/file_0.rs"].as_str(), body.as_str());
+            index = replay;
+        }
+        serde_json::json!({"files":1500,"updatesMs":updates,"replaysMs":replays})
+    }
+  ` : '';
   await writeFile(join(work, 'src/main.rs'), `#![allow(dead_code)]
-mod a { include!("a.rs"); }
-mod b { include!("b.rs"); }
+mod a { include!("a.rs"); ${updateProbe} }
+mod b { include!("b.rs"); ${updateProbe} }
 use std::{io::{BufRead, Write}, path::Path, time::Instant};
 fn main() {
     let args: Vec<_> = std::env::args().collect();
@@ -110,6 +155,12 @@ fn main() {
         let req: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         let root = Path::new(req["root"].as_str().unwrap());
         let start = Instant::now();
+        ${args.includes('--index-update') ? `if req["params"]["_indexUpdateProbe"] == true {
+            let value = if args[1] == "A" { a::index_update_probe() } else { b::index_update_probe() };
+            println!("{}", serde_json::json!({"id":req["id"],"probe":value}));
+            std::io::stdout().flush().unwrap();
+            continue;
+        }` : ''}
         let result = if args[1] == "A" { a::polaris(root, req["params"].clone()) } else { b::polaris(root, req["params"].clone()) };
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         let response = match result {
@@ -130,7 +181,7 @@ fn main() {
       const test = cases[0];
       const invoke = worker(exe, arm, `${arm}-cold-${repeat}`);
       const result = await invoke({ keywords: test.keywords, task: test.task });
-      report.coldChecks.push({ arm, repeat, ms: result.ms, text: result.text, hash: sha(result.text) });
+      report.coldChecks.push({ arm, repeat, ms: result.ms, text: result.text, hash: sha(result.text), profile: result.profile });
       children.at(-1).kill();
     }
   }
@@ -143,7 +194,7 @@ fn main() {
         assert(!result.text.startsWith('# CTX MISS'), `${test.id}/${arm} missed`);
         assert(Buffer.byteLength(result.text) <= 32768);
         const expanded = [...result.text.matchAll(/^### (\S+)/gm)].map(m => m[1]);
-        const row = { id: test.id, arm, run, ms: result.ms, bytes: Buffer.byteLength(result.text), hash: sha(result.text), expanded };
+        const row = { id: test.id, arm, run, ms: result.ms, bytes: Buffer.byteLength(result.text), hash: sha(result.text), expanded, profile: result.profile };
         report.queries.push(row);
         if (run === 5) contexts[`${test.id}/${arm}`] = result.text;
         console.log(`${test.id}/${arm} #${run}: ${result.ms.toFixed(1)}ms ${row.bytes}B`);
@@ -162,6 +213,10 @@ fn main() {
     return { id: test.id, medianA: A, medianB: B, improvementPercent: 100 * (A - B) / A, pairs,
       identicalWarmOutput: pairs.filter(p => p.run >= 1).every(p => p.identicalOutput) };
   });
+  if (args.includes('--index-update')) {
+    report.indexUpdateProbe = {};
+    for (const arm of ['A', 'B']) report.indexUpdateProbe[arm] = (await workers[arm]({ _indexUpdateProbe: true })).probe;
+  }
   await writeFile(out, JSON.stringify(report, null, 2));
   assert(report.toolSummary.every(row => row.identicalWarmOutput), 'warm evidence changed; inspect paired hashes before model evaluation');
 

@@ -16,12 +16,12 @@ const MAX_TRAIN_THREADS: usize = 12;
 const MAX_EXPERIENCES_PER_EXPERT: usize = 800;
 static STORE: OnceLock<Mutex<ExperienceStore>> = OnceLock::new();
 static PROJECT_IDENTITIES: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
-static RECALL_SNAPSHOT: OnceLock<Mutex<Option<Arc<RecallSnapshot>>>> = OnceLock::new();
+static RECALL_SNAPSHOT: OnceLock<Mutex<HashMap<String, Arc<RecallSnapshot>>>> = OnceLock::new();
 static RECALL_PROJECT_IDENTITIES: OnceLock<Mutex<HashMap<String, (String, String)>>> =
     OnceLock::new();
 static TRAINING: AtomicBool = AtomicBool::new(false);
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExperienceEntry {
     pub id: String,
@@ -236,56 +236,34 @@ fn recall_entry(entry: &ExperienceEntry) -> RecallEntry {
     }
 }
 
-fn recall_snapshot() -> Result<Arc<RecallSnapshot>, String> {
-    let cache = RECALL_SNAPSHOT.get_or_init(|| Mutex::new(None));
-    if let Some(snapshot) = cache
-        .lock()
-        .map_err(|_| "经验召回缓存锁已损坏".to_string())?
-        .clone()
-    {
+fn recall_snapshot(project_key: &str) -> Result<Arc<RecallSnapshot>, String> {
+    let cache = RECALL_SNAPSHOT.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(snapshot) = cache.lock().map_err(|_| "经验召回缓存锁已损坏".to_string())?.get(project_key).cloned() {
         return Ok(snapshot);
     }
-    let snapshot = {
-        let guard = store()?.lock().map_err(|_| "经验库锁已损坏".to_string())?;
-        let universal = guard
-            .universal_experiences
-            .iter()
-            .filter(|entry| entry.knowledge_scope == "universal")
-            .map(recall_entry)
-            .collect();
-        let projects = guard
-            .projects
-            .iter()
-            .map(|(key, project)| {
-                (
-                    key.clone(),
-                    RecallProject {
-                        entries: project
-                            .experiences
-                            .iter()
-                            .filter(|entry| entry.knowledge_scope != "universal")
-                            .map(recall_entry)
-                            .collect(),
-                        expert_activations: project.expert_activations.clone(),
-                    },
-                )
-            })
-            .collect();
-        Arc::new(RecallSnapshot {
-            universal,
-            projects,
-        })
-    };
-    let mut cached = cache
-        .lock()
-        .map_err(|_| "经验召回缓存锁已损坏".to_string())?;
-    Ok(cached.get_or_insert_with(|| snapshot).clone())
+    // 锁序固定 store -> cache，持 store 锁直到发布，避免保存失效后重新发布旧快照。
+    let guard = store()?.lock().map_err(|_| "经验库锁已损坏".to_string())?;
+    if let Some(snapshot) = cache.lock().map_err(|_| "经验召回缓存锁已损坏".to_string())?.get(project_key).cloned() { return Ok(snapshot); }
+    // 构建期间不持 cache 锁，其它项目的热召回无需等待。
+    let universal = guard.universal_experiences.iter()
+        .filter(|entry| entry.knowledge_scope == "universal").map(recall_entry).collect();
+    let projects = guard.projects.get(project_key).map(|project| (project_key.to_string(), RecallProject {
+        entries: project.experiences.iter().filter(|entry| entry.knowledge_scope != "universal").map(recall_entry).collect(),
+        expert_activations: project.expert_activations.clone(),
+    })).into_iter().collect();
+    let snapshot = Arc::new(RecallSnapshot { universal, projects });
+    let mut cached = cache.lock().map_err(|_| "经验召回缓存锁已损坏".to_string())?;
+    // ponytail: 缓存至多64个活跃项目，达到上限清空；若频繁切换更多项目再改LRU。
+    if cached.len() >= 64 { cached.clear(); }
+    cached.insert(project_key.to_string(), snapshot.clone());
+    Ok(snapshot)
 }
 
+#[cfg(test)]
 fn invalidate_recall_snapshot() {
     if let Some(cache) = RECALL_SNAPSHOT.get() {
         if let Ok(mut cached) = cache.lock() {
-            *cached = None;
+            cached.clear();
         }
     }
 }
@@ -317,7 +295,23 @@ impl ExperienceStore {
     }
 
     fn save(&self) {
-        invalidate_recall_snapshot();
+        if let Some(cache) = RECALL_SNAPSHOT.get() {
+            if let Ok(mut cached) = cache.lock() {
+                // 比较召回字段而非训练会话/计时器，只有实际知识或激活权重变化才失效。
+                // ponytail: 写路径比较最多64个缓存项目；若泛用库很大，再给分区加版本号。
+                cached.retain(|key, snapshot| {
+                    let universal_same = snapshot.universal.iter().map(|x| &x.entry).eq(
+                        self.universal_experiences.iter().filter(|x| x.knowledge_scope == "universal"));
+                    let project_same = match (snapshot.projects.get(key), self.projects.get(key)) {
+                        (Some(old), Some(now)) => old.expert_activations == now.expert_activations
+                            && old.entries.iter().map(|x| &x.entry).eq(now.experiences.iter().filter(|x| x.knowledge_scope != "universal")),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    universal_same && project_same
+                });
+            }
+        }
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -469,7 +463,7 @@ fn recall_project_identity(cwd: &str) -> Result<(String, String), String> {
 
 pub fn load_trained_memory(cwd: &str, query: &str, limit: usize) -> Result<Value, String> {
     let (project_key, project_root) = recall_project_identity(cwd)?;
-    let snapshot = recall_snapshot()?;
+    let snapshot = recall_snapshot(&project_key)?;
     let project = snapshot.projects.get(&project_key);
     let query_terms = terms(query);
     let mut by_expert: HashMap<String, Vec<(&ExperienceEntry, f64)>> = HashMap::new();
@@ -1931,6 +1925,30 @@ mod tests {
         assert_eq!(stored.hit_count, 0);
         assert_eq!(stored.last_used_at, 0);
         drop(guard);
+        let snapshot = recall_snapshot(&project_key).unwrap();
+        {
+            let mut guard = store().unwrap().lock().unwrap();
+            guard.project_mut(&project_key, &project_root).last_attempt_at += 1;
+            guard.project_mut("unrelated", "elsewhere").experiences.push(ExperienceEntry::default());
+            guard.save();
+        }
+        assert!(Arc::ptr_eq(&snapshot, &recall_snapshot(&project_key).unwrap()));
+        assert!(!snapshot.projects.contains_key("unrelated"));
+        {
+            let mut guard = store().unwrap().lock().unwrap();
+            guard.project_mut(&project_key, &project_root).experiences[0].action = "updated".into();
+            guard.save();
+        }
+        let updated = recall_snapshot(&project_key).unwrap();
+        assert!(!Arc::ptr_eq(&snapshot, &updated));
+        assert_eq!(snapshot.projects[&project_key].entries[0].entry.action, "keep the hot path read only");
+        assert_eq!(updated.projects[&project_key].entries[0].entry.action, "updated");
+        {
+            let mut guard = store().unwrap().lock().unwrap();
+            guard.universal_experiences.push(ExperienceEntry { knowledge_scope: "universal".into(), ..Default::default() });
+            guard.save();
+        }
+        assert!(!Arc::ptr_eq(&updated, &recall_snapshot(&project_key).unwrap()));
         fs::remove_dir_all(root).unwrap();
     }
 
