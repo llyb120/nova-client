@@ -1,0 +1,981 @@
+{
+  "ranAt": "2026-09-12T08:35:34.777Z",
+  "baseline": "HEAD",
+  "model": "z-ai/glm-5.3-flash",
+  "methodology": "Same optimized binary, production cfg/deadlines, fixed baseline source corpus (src-tauri/src, src, scripts), separate per-arm caches. Corpus has one synthetic commit, not original git history; no new benchmark/answer files. Alternating A/B order. First observation is cold process/index, not cold OS cache. Model receives one forced Polaris tool result; no agent loop. Fact hits are smoke checks, not semantic correctness scores.",
+  "validationNotes": {
+    "identicalWarmPairs": "15/15",
+    "coldException": "index run 0 had different auxiliary files; both returned primary targets. Later warm outputs were identical. Async text-index readiness is a possible, not traced/proven, cause.",
+    "coldFollowUp": {
+      "method": "3 additional crossed-order pairs of fresh workers with separate empty caches against the same baseline source corpus; not cold OS cache",
+      "identicalPairs": "3/3",
+      "A_ms": [277.618875, 342.537593, 241.213571],
+      "B_ms": [150.883685, 230.359417, 224.829096]
+    },
+    "modelSummary": {
+      "A": {"completed": 6, "anchorHits": "10/10", "factWordHits": "16/18", "promptTokens": 41216, "completionTokens": 4547, "averageMs": 24595.94711150001},
+      "B": {"completed": 6, "anchorHits": "10/10", "factWordHits": "16/18", "promptTokens": 41216, "completionTokens": 6578, "averageMs": 29214.999085166666}
+    },
+    "limitations": "Literal word checks are not semantic correctness. Controlled one-tool-result model calls, not a full Agent benchmark. No model latency or token savings demonstrated. See polaris-latency-ab.md."
+  },
+  "queries": [
+    {
+      "id": "index",
+      "arm": "A",
+      "run": 0,
+      "ms": 325.535293,
+      "bytes": 31413,
+      "hash": "ab2b6621530f273be6a4fe365dc8f6531debbb878deee6fb4dc6ba6bf6e13498",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "B",
+      "run": 0,
+      "ms": 193.528238,
+      "bytes": 24546,
+      "hash": "66646cfdcc23bf47f19b43e0ef97273c1e744087427f5eb36e91a771def75af6",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "scripts/cursor-context-reasonix.mjs",
+        "scripts/cursor-context-super.mjs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "A",
+      "run": 0,
+      "ms": 102.512097,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "B",
+      "run": 0,
+      "ms": 55.546513999999995,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "A",
+      "run": 0,
+      "ms": 90.159896,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "B",
+      "run": 0,
+      "ms": 44.740793000000004,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "B",
+      "run": 1,
+      "ms": 90.720955,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "A",
+      "run": 1,
+      "ms": 156.505858,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "B",
+      "run": 1,
+      "ms": 75.958283,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "A",
+      "run": 1,
+      "ms": 52.189916000000004,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "B",
+      "run": 1,
+      "ms": 28.697842,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "A",
+      "run": 1,
+      "ms": 34.590838999999995,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "A",
+      "run": 2,
+      "ms": 112.459188,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "B",
+      "run": 2,
+      "ms": 86.56829400000001,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "A",
+      "run": 2,
+      "ms": 100.118056,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "B",
+      "run": 2,
+      "ms": 55.678584,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "A",
+      "run": 2,
+      "ms": 35.774332,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "B",
+      "run": 2,
+      "ms": 28.860521,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "B",
+      "run": 3,
+      "ms": 84.016285,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "A",
+      "run": 3,
+      "ms": 119.754531,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "B",
+      "run": 3,
+      "ms": 61.115838,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "A",
+      "run": 3,
+      "ms": 68.281498,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "B",
+      "run": 3,
+      "ms": 27.219251,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "A",
+      "run": 3,
+      "ms": 33.027988,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "A",
+      "run": 4,
+      "ms": 132.463965,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "B",
+      "run": 4,
+      "ms": 93.781662,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "A",
+      "run": 4,
+      "ms": 62.012871999999994,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "B",
+      "run": 4,
+      "ms": 46.057789,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "A",
+      "run": 4,
+      "ms": 39.641435,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "B",
+      "run": 4,
+      "ms": 29.63919,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "B",
+      "run": 5,
+      "ms": 78.939971,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "A",
+      "run": 5,
+      "ms": 125.201706,
+      "bytes": 31393,
+      "hash": "40ee314745d6da9cd7c5e078264a3ed1a52158f933a77f078d897325f3b23147",
+      "expanded": [
+        "src-tauri/src/nova_tools_native/context.rs",
+        "scripts/ctx-index.mjs",
+        "src-tauri/src/experience.rs",
+        "src-tauri/src/lib.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "B",
+      "run": 5,
+      "ms": 45.312331,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "A",
+      "run": 5,
+      "ms": 62.416214,
+      "bytes": 29877,
+      "hash": "9e1593492ce18c26d58786f72df7d74eede33bc2ef973c3fcb413f52670185f4",
+      "expanded": [
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/agent.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/provider.rs",
+        "src-tauri/src/nova_tools_native/context.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "B",
+      "run": 5,
+      "ms": 29.338432,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "A",
+      "run": 5,
+      "ms": 37.492637,
+      "bytes": 22536,
+      "hash": "3021e33e26fa61121dea01b4d01dc7b3c571087e154cc5af350637d77e26306d",
+      "expanded": [
+        "src-tauri/src/lyra/prompt.rs",
+        "src-tauri/src/lyra/bridge.rs",
+        "src-tauri/src/lyra/tools.rs",
+        "src-tauri/src/lyra/mod.rs",
+        "src-tauri/src/lyra/agent.rs"
+      ]
+    }
+  ],
+  "modelRuns": [
+    {
+      "id": "index",
+      "arm": "A",
+      "repeat": 0,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 23168.712998000003,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 7731,
+        "completion_tokens": 933,
+        "total_tokens": 8664,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 420,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "符号索引缓存分 Rust 与 JS 两套实现，流程如下：\n\n**Rust 侧（src-tauri/src/nova_tools_native/context.rs）**\n\n1. **读取**：`load_cache`（L374-391）先用 `normalize_root` 归一化根路径作键，查进程级 `MEMO`（`OnceLock<Mutex<HashMap<String, Arc<DiskCache>>>>`，L266）；未命中则 `mmap_cache` 做 mmap 加载（失败回退空 `DiskCache`），并立即写入 MEMO，让并发调用者共享同一暖基线。\n2. **增量更新**：`build_index`（L2420-2619）先取 per-root `CACHE_LOCKS` 串行化；从 `load_cache` 得到共享快照后拷贝到本地 `fresh`，按 `metadata_stamp`（size/modified_ns）判断过期并重扫；反向 import 图做增量补丁（删旧边、加新边、排序去重）。\n3. **发布**：更新完成后在释放锁前调用 `store_cache`（L429-437）——总是更新 MEMO；持久化条件为 `dirty && (initially_empty || changed > 0)`，首次建缓存立即落盘保证冷启动基线。\n4. **异步写盘**：`write_cache_async`（L442-459）按 `PERSIST_INTERVAL_MS` 节流（`PERSIST_LAST` 记录上次时间），超时则 spawn 后台线程 `write_cache_at`，查询线程不阻塞在磁盘。\n\n**JS 侧（scripts/ctx-index.mjs）**\n\n- `getIndex`（L869-953）按归一化根查 `memo`；未命中先 `cleanupNovaCodemap` 清理过期/超限缓存，再 `loadCache`（L644-655，校验 `INDEX_CACHE_VERSION` 与 workspaceRoot，不符返回 null）。\n- `cacheEntryFresh`（L807-816）按 size/mtimeMs 判断新鲜度，仅重扫过期文件；`saveCache` 仅在 `scanned > 0` 时调用；focused 模式通过 `viewCache` 只暴露请求闭包，完整缓存保留复用。\n\n（返回结果中 experience.rs、lib.rs 为无关命中，未采用。）",
+      "anchorHits": [
+        "load_cache",
+        "store_cache"
+      ],
+      "factHits": [
+        "MEMO",
+        "Arc",
+        "persist"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "B",
+      "repeat": 0,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 23800.31333200002,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 7731,
+        "completion_tokens": 956,
+        "total_tokens": 8687,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 501,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "符号索引有两条缓存流程（Rust 侧与 JS 侧）：\n\n**Rust 侧 `src-tauri/src/nova_tools_native/context.rs`**\n- 读取：`build_index` 先用 `CACHE_LOCKS` 按 root 串行化，再调 `load_cache`。后者以 `normalize_root` 归一化路径为 key 查进程级 `MEMO`（OnceLock<Mutex<HashMap>>），命中直接返回；未命中经 `mmap_cache` 一次性加载，失败则回退空 `DiskCache`（结构含 files、reverse 反向 import 图），立即放入 MEMO 让并发调用者共享温热基线。\n- 发布：增量扫描后构建 `fresh` 副本，在释放 per-root 锁**之前**调 `store_cache(root, updated, persist)` 原子发布到 MEMO，后续请求无需等待落盘即可用新快照。\n- 落盘：`persist = dirty && (initially_empty || changed > 0)`；`write_cache_async` 用 `PERSIST_LAST` 按 `PERSIST_INTERVAL_MS` 节流，通过后台线程 `write_cache_at` 写盘，不阻塞查询线程。\n\n**JS 侧 `scripts/ctx-index.mjs`**\n- 读取：`getIndex` 先查 `memo`（按 `normalizeWorkspaceRoot` 归一化的 ws 为 key），未命中时先 `cleanupNovaCodemap` 清理过期桶，再 `loadCache` 读 JSON 并校验 `INDEX_CACHE_VERSION`(15) 与 `workspaceRoot`，不合法即返回 null 并新建空缓存。\n- 发布：`cacheEntryFresh` 以 size/mtimeMs 判定过期文件，`scanIntoCache` 重扫；`scanned > 0` 时更新 `updatedAt` 并调 `saveCache` 持久化。focused 模式仅暴露 requested 依赖闭包的 `viewCache`，完整缓存仍保留复用。\n\n两流程共同点：内存 memo 优先、路径归一化作 key、增量校验新鲜度、发布不依赖同步落盘。",
+      "anchorHits": [
+        "load_cache",
+        "store_cache"
+      ],
+      "factHits": [
+        "MEMO",
+        "persist"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "A",
+      "repeat": 0,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 22059.548375000013,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 7038,
+        "completion_tokens": 586,
+        "total_tokens": 7624,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 252,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "**执行入口**：`tools.rs:560 pub async fn execute(...)` — 接收 root/name/args/shell/archive_dir/call_id/cancelled/browser，先调 `execute_inner`（tools.rs:572，按 name 分发 polaris/read/bash/edit/write/browser 等工具），随后把结果交给 `govern` 治理。agent.rs:7 导入 `execute` 供主循环使用。\n\n**预算治理**：`tools.rs:259 fn govern(outcome, name, call_id, archive_dir)`：\n- 按工具取预算：polaris 用 `POLARIS_OUTPUT_MAX_BYTES`，其余用 `TOOL_OUTPUT_CONTEXT_MAX_BYTES`（均来自 lyra::prompt）。\n- 超限则调 `prompt.rs:74 govern_tool_text`：先把原文归档到 archive_dir（`{call_id}-{tool_name}.txt`），生成 elided 通知，按 head 3/5 + tail 截断（`truncate_utf8_head/tail`，UTF-8 边界安全）。\n- 回填 details：`archivedToolOutput` 与 `originalBytes`，并用治理后文本替换原 text 部分。\n- 另有字符级钳制 `prompt.rs:116 clamp_tool_output_text`（阈值 `OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS`），在 bash 输出、polaris 结果及 provider.rs:80 tool_result_text 处使用。\n\n测试见 prompt.rs:643 `governs_oversized_text_with_head_tail`。证据完整。",
+      "anchorHits": [
+        "govern",
+        "execute_inner"
+      ],
+      "factHits": [
+        "polaris",
+        "archive"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "B",
+      "repeat": 0,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 24656.955902999995,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 7038,
+        "completion_tokens": 815,
+        "total_tokens": 7853,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 443,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "**执行入口**（src-tauri/src/lyra/tools.rs）\n- `execute`（L560）：对外入口，被 agent.rs 主循环（L10 导入，L450 `execute_tools`）调用；先执行 `execute_inner`，再对结果统一做 `govern`。\n- `execute_inner`（L573）：按工具名分发（polaris/read/bash/edit/write/browser/change_working_directory），各工具产出 `ToolOutcome`（L195）。\n\n**预算治理**\n1. `govern`（tools.rs L259）：按工具选预算——polaris 用 `POLARIS_OUTPUT_MAX_BYTES`，其余用 `TOOL_OUTPUT_CONTEXT_MAX_BYTES`；超限则调 `govern_tool_text`，并在 details 写入 `archivedToolOutput` 与 `originalBytes`，用治理后文本替换原 text 内容。\n2. `govern_tool_text`（prompt.rs L74）：完整原文归档到 `archive_dir/<call_id>-<tool_name>.txt`（`safe_segment` 清洗文件名），追加省略通知（含字节数与归档路径），按 3/5 头 + 尾部保留，经 `truncate_utf8_head/tail` 保证 UTF-8 边界安全。测试 `governs_oversized_text_with_head_tail`（L643）覆盖该行为。\n3. `clamp_tool_output_text`（prompt.rs L116）：按字符数硬截断（`OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS` = 10_485_760−512），在 `execute_inner` 内已用于 bash/polaris 输出，provider.rs 的 `tool_result_text`（L80）再次兜底。",
+      "anchorHits": [
+        "govern",
+        "execute_inner"
+      ],
+      "factHits": [
+        "polaris",
+        "archive",
+        "ToolOutcome"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "A",
+      "repeat": 0,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 19886.332426000008,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 5839,
+        "completion_tokens": 635,
+        "total_tokens": 6474,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 339,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "**工具选择规则**（`build_system_prompt`，src-tauri/src/lyra/prompt.rs:514-605）：\n\n- 按 `options.fast_context`（polaris）分支：\n  - 开启时为硬性约束：读取遵循最小必要原则，已知行段只读相关行段；跨文件查找/修改且上下文不足时先调一次 polaris（一次替代 5–10 轮 rg+read）；已展示上下文足够则直接作答，不重复检索；polaris 调用后不得对同批关键词再用 bash 的 `rg`/`gi`。\n  - 关闭时：先用搜索工具定位行号再读必要上下文，大文件禁止无目的全量读取；多处修改合并进同一次 edit 的 edits 数组，多文件可并行但禁止对同一文件并发 edit；禁止 `grep -r` 无排除递归，优先 `rg`；`| head`/`| tail` 不算工作量限制。\n\n**只读模式**（`SystemPromptOptions.read_only`，prompt.rs:607-618）：\n\n- 工具清单中省略 bash 和 edit/write（read_only 时对应项为 `None`），仅保留 read 等只读工具。\n- dynamic 段追加：「当前为计划模式：只读分析，不得修改文件。」",
+      "anchorHits": [
+        "build_system_prompt"
+      ],
+      "factHits": [
+        "read_only",
+        "polaris",
+        "dynamic"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "B",
+      "repeat": 0,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 19554.896573000005,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 5839,
+        "completion_tokens": 672,
+        "total_tokens": 6511,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 378,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "依据 `build_system_prompt`（src-tauri/src/lyra/prompt.rs:514-605）：\n\n**工具选择规则**（写入提示词的硬性约束）：\n- 开启 polaris 时：读取遵循最小必要原则，已知行段只读相关行段；跨文件查找/修改且上下文不足时先调一次 polaris，一次调用替代 5–10 轮 rg+read；已展示上下文足够时不重复检索；调用后不得对同批关键词再用 `rg`/`gi`；SIG/IMPACT 仅需函数体时精确补读。\n- 未开启时：先搜索定位行号再读附近上下文，大文件禁止无目的全量读取；同一文件多处修改合并进一次 edit 的 edits 数组；可跨文件并行 edit，但禁止对同一文件并发 edit。\n- 工具清单按选项动态生成：browser、polaris、bash（文案随 ShellKind 为 PowerShell 或 Bash）、edit/write 等（prompt.rs:514-605）。\n\n**只读模式**：`options.read_only` 为真时，工具清单中省略 bash、edit/write；动态段追加\"当前为计划模式：只读分析，不得修改文件\"。该开关由 bridge.rs 的 handle_prompt 构造 SystemPromptOptions 时传入（bridge.rs:345-356）。",
+      "anchorHits": [
+        "build_system_prompt"
+      ],
+      "factHits": [
+        "read_only",
+        "polaris"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "B",
+      "repeat": 1,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 25318.322938999976,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 7731,
+        "completion_tokens": 1038,
+        "total_tokens": 8769,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 508,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "## 符号索引缓存读取与发布流程\n\n两套实现（Rust 侧 `src-tauri/src/nova_tools_native/context.rs`、JS 侧 `scripts/ctx-index.mjs`）：\n\n**读取（Rust）**\n- `load_cache`（context.rs:374-391）：以 `normalize_root` 归一化路径为 key，先查进程内 `MEMO`（:266，`OnceLock<Mutex<HashMap<String, Arc<DiskCache>>>>`）热缓存；未命中则 `mmap_cache` 加载磁盘索引（失败回退空 `DiskCache`），并**立即写入 MEMO 发布**，使并发调用共享同一暖基线。\n\n**读取（JS）**\n- `getIndex`（ctx-index.mjs:869-953）：`memo.get(ws)` 未命中时先 `cleanupNovaCodemap`（:532-642，清理过期/损坏/超大缓存桶并按 LRU 驱逐），再 `loadCache`（:644-655，校验 `INDEX_CACHE_VERSION=15` 与 `workspaceRoot` 一致，否则视为无效返回 null），最后写入 memo。\n\n**增量更新**\n- Rust `build_index`（:2420-2619）：按 root 的 `CACHE_LOCKS` 串行化；修改只进本地 `fresh` 副本，经 `metadata_stamp` 比对 size/mtime 判过期、`scan_source` 重扫，并按依赖 frontier 扩展与反向 import 图增量补丁。\n- JS 用 `cacheEntryFresh`（:807-816）判定新鲜度，`scanIntoCache` 只扫过期文件。\n\n**发布**\n- Rust `store_cache`（:429-437）：始终更新 MEMO；`persist=true` 时经 `write_cache_async`（:442-459）按 `PERSIST_INTERVAL_MS` 节流、后台线程异步写盘，释放 root 锁前先发布内存快照；冷启动（`initially_empty`）立即持久化。\n- JS：`scanned > 0` 时更新 `updatedAt` 并 `saveCache`；focused 模式仅暴露请求闭包 `viewCache`，完整缓存仍保留复用。\n\n**未展开证据**：`saveCache`、`mmap_cache`、`write_cache_at` 函数体未展示，写盘格式细节不作断言。",
+      "anchorHits": [
+        "load_cache",
+        "store_cache"
+      ],
+      "factHits": [
+        "MEMO",
+        "Arc",
+        "persist"
+      ]
+    },
+    {
+      "id": "index",
+      "arm": "A",
+      "repeat": 1,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 30465.154119000013,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 7731,
+        "completion_tokens": 886,
+        "total_tokens": 8617,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 446,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "符号索引缓存分两套实现：\n\n**Rust 侧**（`src-tauri/src/nova_tools_native/context.rs`）\n\n读取：\n- `load_cache`(374L)：以 `normalize_root` 归一化路径为 key，先查进程级 `MEMO`（OnceLock 中的 Mutex<HashMap>）；未命中则 `mmap_cache` 做 mmap 加载，失败则回退空 `DiskCache`，并**立即写入 MEMO 发布**，让并发调用共享同一热基线。\n- `build_index`(2420L) 先拿 per-root 的 `CACHE_LOCKS` 锁再 `load_cache`，把共享快照复制到本地 `fresh` 做增量更新（按 size/modified_ns 判 stale，重扫后增量补反向 import 图）。\n\n发布：\n- `store_cache`(429L)：更新 MEMO；`persist=true` 时走 `write_cache_async`。\n- `write_cache_async`(442L)：按 root 以 `PERSIST_INTERVAL_MS` 节流，距上次写盘过近则跳过；否则 `thread::spawn` 后台线程执行 `write_cache_at` 全量 bincode 序列化写盘，查询线程不阻塞。\n- 持久化条件 `dirty && (initially_empty || changed > 0)`——冷启动首次立即落盘建基线；发布在释放 per-root 锁**之前**完成。\n\n**JS 侧**（`scripts/ctx-index.mjs`）\n\n- `getIndex`(869L)：按归一化 workspace root 查 `memo`；未命中先 `cleanupNovaCodemap` 清理过期桶，再 `loadCache`(644L) 读 JSON 并校验 `INDEX_CACHE_VERSION`(49L，=15) 与 workspaceRoot，校验失败返回 null 重建。\n- 有扫描变更（`scanned > 0`）时调 `saveCache` 写盘；focused 模式只暴露请求闭包（`viewCache`），完整缓存仍保留复用。",
+      "anchorHits": [
+        "load_cache",
+        "store_cache"
+      ],
+      "factHits": [
+        "MEMO",
+        "persist"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "B",
+      "repeat": 1,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 35220.475836,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 7038,
+        "completion_tokens": 1112,
+        "total_tokens": 8150,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 569,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "## Lyra 工具结果预算治理与执行入口\n\n**执行入口**：`src-tauri/src/lyra/tools.rs` 的 `execute`（560-572 行）。它是 agent 主循环（`agent.rs` 的 `execute_tools`）与具体工具之间的统一网关：先 `await execute_inner(...)` 分发工具，随后**始终**用 `govern(outcome, name, call_id, archive_dir)` 包裹返回结果——治理在入口统一收口，而非散落在各工具内。\n\n**execute_inner 分发**（571-917 行）：按 `name` 匹配 `polaris`/`read`/`bash`/`edit`/`write`/`browser`/`change_working_directory`，`feedback_memory` 已禁用，未知工具报错。注意 `polaris` 与 `bash` 在工具内部已先调 `clamp_tool_output_text` 做一层字符级截断。\n\n**govern**（tools.rs 259-293）：\n1. 从 `ToolOutcome.content` 提取文本（`text_of`）；\n2. 按工具选预算：`polaris` 用 `POLARIS_OUTPUT_MAX_BYTES`，其余用 `TOOL_OUTPUT_CONTEXT_MAX_BYTES`（两者自 `lyra::prompt` 导入，证据中未展示其具体值）；\n3. 超预算则调 `govern_tool_text`，把 `archivedToolOutput`（归档路径）与 `originalBytes` 写入 `details`；\n4. 用治理后文本替换原 text 分片，保留非 text 分片（如图片）。\n\n**govern_tool_text**（prompt.rs 74-113）实现字节级裁剪：\n- 超限时先归档原文到 `{archive_dir}/{call_id}-{tool_name}.txt`（`safe_segment` 清洗路径段）；\n- 注入提示 `…[elided tool result — N bytes; archived at …; use read with offset/limit…]`；\n- 预算扣除提示长度后，头部取约 3/5、尾部取其余，经 `truncate_utf8_head/tail` 保证 UTF-8 字符边界安全。\n\n测试 `governs_oversized_text_with_head_tail`（prompt.rs 643-650）验证裁剪上限与归档为 None 的行为。此外 `provider.rs` 的 `tool_result_text` 在发送前再调 `clamp_tool_output_text` 兜底。",
+      "anchorHits": [
+        "govern",
+        "execute_inner"
+      ],
+      "factHits": [
+        "polaris",
+        "archive",
+        "ToolOutcome"
+      ]
+    },
+    {
+      "id": "tools",
+      "arm": "A",
+      "repeat": 1,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 29781.183216999983,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 7038,
+        "completion_tokens": 788,
+        "total_tokens": 7826,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 389,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "**执行入口**：`src-tauri/src/lyra/tools.rs` 的 `execute`（560L）——异步分发 `execute_inner`（571L，处理 polaris/read/bash/edit/write/browser/change_working_directory），返回 `ToolOutcome` 后统一调用 `govern` 治理。上层由 `agent.rs::execute_tools`（450L）并行调用，bridge.rs 通过 `tool_set` 接入。\n\n**预算治理**：`tools.rs::govern`（259L）：\n- 阈值按工具区分：polaris 用 `POLARIS_OUTPUT_MAX_BYTES`，其余用 `TOOL_OUTPUT_CONTEXT_MAX_BYTES`\n- 未超限直接返回；超限则调 `prompt.rs::govern_tool_text`（74L）\n- 治理后 details 记录 `archivedToolOutput`（归档路径）与 `originalBytes`，并保留非 text 内容块\n\n**govern_tool_text 逻辑**（prompt.rs）：\n- 原文归档到 `archive_dir/{call_id}-{tool_name}.txt`（经 `safe_segment` 清洗）\n- 拼接通知 `…[elided tool result — N bytes; archived at ...]`，预算为 max_bytes 减通知长度\n- 头部占 3/5、尾部占剩余，用 `truncate_utf8_head/tail` 保证 UTF-8 边界\n\n**辅助钳制**：`clamp_tool_output_text`（116L）在 bash/polaris 输出（tools.rs）及 `provider.rs::tool_result_text` 处按字符数截断（`OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS` = 10_485_760 - 512）。测试见 prompt.rs:643 `governs_oversized_text_with_head_tail`。",
+      "anchorHits": [
+        "govern",
+        "execute_inner"
+      ],
+      "factHits": [
+        "polaris",
+        "archive",
+        "ToolOutcome"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "B",
+      "repeat": 1,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 46739.029928,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 5839,
+        "completion_tokens": 1985,
+        "total_tokens": 7824,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 1544,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "基于 `src-tauri/src/lyra/prompt.rs` 的 `build_system_prompt`（514–605 行）：\n\n**工具选择规则**（硬性约束，按选项动态拼装工具清单）：\n- `read` 恒定提供；`change_working_directory` 仅在 `auto_change_project` 时列出，且必须单独调用、等待成功后才能调用依赖新目录的工具；`browser` 依赖 `browser` 选项；`polaris` 依赖 `fast_context`；`bash` 描述按 `ShellKind` 显示为 Bash 或 PowerShell。\n- 启用 polaris 时：最小必要读取；跨文件任务且上下文不足先调用一次 polaris（替代 5–10 轮 rg+read 往返），已展示范围视为已读，调用后不得对同批关键词重复用 `rg`。\n- 未启用时：先搜索定位行号再读，禁止大文件无目的全量读取；同一文件多处修改合并进一次 `edit` 的 `edits` 数组，多文件可并行但禁止对同一文件并发 edit，有依赖的 edit 须等待前者完成。\n- 搜索成本有界：禁 `grep -r` 无排除递归，优先 `rg`；`head/tail` 截断不算工作量限制。\n\n**只读模式**（`SystemPromptOptions.read_only`）：\n- 工具清单中移除 `bash` 与 `edit/write`（代码注释：\"只读模式无 bash/edit/write\"）。\n- dynamic 段追加声明：\"当前为计划模式：只读分析，不得修改文件。\"\n- 该标志经 `bridge.rs` 的 `handle_prompt`（345–356 行）传入，但上游如何设置 `read_only` 的证据未在结果中展示，无法确认。\n\n另外 `bridge.rs` 429–433 行显示系统提示词在 `system_changed` 为假时复用 `system_prompt_snapshot` 缓存。",
+      "anchorHits": [
+        "build_system_prompt"
+      ],
+      "factHits": [
+        "read_only",
+        "polaris",
+        "dynamic"
+      ]
+    },
+    {
+      "id": "prompt",
+      "arm": "A",
+      "repeat": 1,
+      "model": "z-ai/glm-5.3-flash",
+      "ms": 22214.75153400004,
+      "finishReason": "stop",
+      "usage": {
+        "prompt_tokens": 5839,
+        "completion_tokens": 719,
+        "total_tokens": 6558,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 300,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0
+      },
+      "text": "根据 `src-tauri/src/lyra/prompt.rs` 的 `build_system_prompt`（514-605行）：\n\n**工具清单生成**：按 `SystemPromptOptions`（607-618行）动态拼接：\n- 始终包含 `read`；`read_only=true` 时剔除 `bash`（531-541行）和 `edit/write`（549-552行）\n- `fast_context`（polaris）开启时加入 `polaris`；`browser`、`auto_change_project` 分别控制 `browser`、`change_working_directory` 是否出现\n\n**工具选择规则**（硬性约束，随 polaris 开关分两套文案）：\n- polaris 开启：读取遵循最小必要原则，已知行段只读相关段；理解大文件整体结构用 polaris；跨文件查找或修改且上下文不足时先调用一次 polaris，一次通常替代 5-10 轮 rg+read；polaris 已展示范围视为已读，调用后不得再用 bash 的 `rg`/`gi...` 重复检索\n- polaris 关闭：先搜索定位行号再读；禁止 `grep -r/-R` 无排除递归，优先 `rg`；`head/tail` 只限制展示、不限制工作量\n- edit 约束（非 polaris 分支）：同文件多处修改合并进一次 edit 的 `edits` 数组；互不依赖的文件可并行 edit，但禁止同一文件并发\n\n**只读模式**：`read_only=true` 时在 dynamic 段追加\"当前为计划模式：只读分析，不得修改文件\"（586-588行），仅靠移除写入类工具加文字约束；bridge.rs（345-356行）的 `handle_prompt` 将 `read_only` 传入该选项。证据中未见工具执行层的强制拦截逻辑。",
+      "anchorHits": [
+        "build_system_prompt"
+      ],
+      "factHits": [
+        "read_only",
+        "polaris",
+        "dynamic"
+      ]
+    }
+  ],
+  "sourceHashes": {
+    "A": "8c038f14df68174ad3e960a3f8b1a33809ed7fe2461618ff433716c9a06548a3",
+    "B": "6245593b435a429f412bf13d82c8a88d2724d2b219891f788d34858f9c6a47ba"
+  },
+  "workspaceRevision": "30126f74dff555f1af7ba4b572d834d20772f051",
+  "toolSummary": [
+    {
+      "id": "index",
+      "medianA": 125.201706,
+      "medianB": 86.56829400000001,
+      "improvementPercent": 30.856937364735263,
+      "identicalOutput": true
+    },
+    {
+      "id": "tools",
+      "medianA": 62.416214,
+      "medianB": 55.678584,
+      "improvementPercent": 10.794679087712684,
+      "identicalOutput": true
+    },
+    {
+      "id": "prompt",
+      "medianA": 35.774332,
+      "medianB": 28.860521,
+      "improvementPercent": 19.326177774612262,
+      "identicalOutput": true
+    }
+  ]
+}

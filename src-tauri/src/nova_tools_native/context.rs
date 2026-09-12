@@ -2,6 +2,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
@@ -205,8 +206,8 @@ type ReverseMap = HashMap<String, Vec<ReverseImport>>;
 
 #[derive(Clone)]
 struct Source {
-    lines: Vec<String>,
-    syms: Vec<Symbol>,
+    lines: Arc<Vec<String>>,
+    syms: Arc<Vec<Symbol>>,
 }
 
 #[derive(Clone)]
@@ -2422,9 +2423,8 @@ fn build_index(
     wanted: Option<&HashSet<String>>,
     dependency_depth: usize,
     known_files: Option<&[String]>,
-) -> (IndexView, Arc<Vec<String>>, Arc<ReverseMap>) {
-    // load_cache temporarily moves this root's cache out of MEMO. Serialize all users of the same
-    // workspace so concurrent Lyra sessions and bridge calls cannot observe an empty cache.
+) -> (IndexView, Arc<Vec<String>>, Arc<DiskCache>) {
+    // ponytail: 同仓库更新仍串行；无变更时借用快照，若冷扫描争锁再拆分扫描与发布。
     let cache_lock = CACHE_LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -2432,21 +2432,17 @@ fn build_index(
         .entry(normalize_root(root))
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
+    let lock_start = Instant::now();
     let _cache_guard = cache_lock.lock().unwrap();
+    trace("build_index.lock_wait", lock_start);
     let all = known_files
         .map(|files| Arc::new(files.to_vec()))
         .unwrap_or_else(|| list_code_files(root));
     let all_set: HashSet<_> = all.iter().cloned().collect();
-    // Shared snapshot. Mutations go into a local `fresh` copy and are published back atomically,
-    // so holding the per-root lock never requires deep-copying the shared cache.
+    // 无变更时不复制全仓符号和反向图；首次实际变更才复制并原子发布。
     let cache = load_cache(root);
     let initially_empty = cache.files.is_empty();
-    let mut fresh = DiskCache {
-        version: cache.version,
-        root: cache.root.clone(),
-        files: cache.files.clone(),
-        reverse: cache.reverse.clone(),
-    };
+    let mut fresh = Cow::Borrowed(cache.as_ref());
     let mut targets: HashSet<String> = wanted.cloned().unwrap_or_else(|| all_set.clone());
     let mut frontier: Vec<String> = targets.iter().cloned().collect();
     let mut dirty = false;
@@ -2459,7 +2455,8 @@ fn build_index(
         for file in current {
             let path = root.join(&file);
             let Some((size, modified_ns)) = metadata_stamp(&path) else {
-                if fresh.files.remove(&file).is_some() {
+                if fresh.files.contains_key(&file) {
+                    fresh.to_mut().files.remove(&file);
                     dirty = true;
                     changed += 1;
                     removed_files.push(file.clone());
@@ -2476,7 +2473,7 @@ fn build_index(
                     let mut entry = scan_source(&text, &file);
                     entry.size = size;
                     entry.modified_ns = modified_ns;
-                    fresh.files.insert(file.clone(), entry);
+                    fresh.to_mut().files.insert(file.clone(), entry);
                     dirty = true;
                     changed += 1;
                     rescanned_files.push(file.clone());
@@ -2506,7 +2503,7 @@ fn build_index(
             .cloned()
             .collect();
         for file in &pruned {
-            fresh.files.remove(file);
+            fresh.to_mut().files.remove(file);
         }
         if !pruned.is_empty() {
             dirty = true;
@@ -2533,8 +2530,12 @@ fn build_index(
     //（先按 importer 删旧边，再按新 import 表加边），复杂度与变更文件数成正比，
     // 与仓库规模无关；大仓库一次 rebase/批量改动不再触发整图重建。
     if changed == 0 && fresh.reverse.is_empty() && !fresh.files.is_empty() {
-        fresh.reverse = reverse_from_files(&fresh.files, &all_set);
+        let reverse = reverse_from_files(&fresh.files, &all_set);
+        if !reverse.is_empty() {
+            fresh.to_mut().reverse = reverse;
+        }
     } else if changed > 0 {
+        let fresh = fresh.to_mut();
         for file in removed_files.iter().chain(rescanned_files.iter()) {
             for edges in fresh.reverse.values_mut() {
                 edges.retain(|edge| edge.importer != *file);
@@ -2563,7 +2564,6 @@ fn build_index(
             edges.dedup_by(|a, b| a.importer == b.importer && a.local == b.local);
         }
     }
-    let reverse = Arc::new(fresh.reverse.clone());
     // 少量变更只更新内存 MEMO；整仓缓存的 bincode 全量序列化写盘按
     // PERSIST_INTERVAL_MS 节流并异步执行，查询线程不再阻塞在磁盘上。首次建缓存
     // （initially_empty）立即持久化，保证冷启动有基线可用。
@@ -2571,8 +2571,14 @@ fn build_index(
     // Publish the updated cache before releasing the per-root mutation lock. Persistence is
     // queued to a background thread, so another request can use the warm in-memory snapshot
     // instead of waiting for a full bincode serialization and disk replacement.
-    let updated = Arc::new(fresh);
-    store_cache(root, updated.clone(), persist);
+    let updated = match fresh {
+        Cow::Borrowed(_) => cache,
+        Cow::Owned(fresh) => {
+            let updated = Arc::new(fresh);
+            store_cache(root, updated.clone(), persist);
+            updated
+        }
+    };
     drop(_cache_guard);
     let mut view = IndexView {
         files: selected,
@@ -2615,10 +2621,18 @@ fn build_index(
     for definitions in view.defs.values_mut() {
         definitions.sort_by(|a, b| a.file.cmp(&b.file).then(a.symbol.ln.cmp(&b.symbol.ln)));
     }
-    (view, all, reverse)
+    (view, all, updated)
 }
 
-fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> {
+fn source(
+    root: &Path,
+    file: &str,
+    entry: Option<&FileEntry>,
+    sources: &mut HashMap<String, Source>,
+) -> Option<Source> {
+    if let Some(src) = sources.get(file) {
+        return Some(src.clone());
+    }
     let text = fs::read_to_string(root.join(file)).ok()?;
     let mut lines: Vec<_> = text.split('\n').map(str::to_string).collect();
     if lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
@@ -2629,7 +2643,9 @@ fn source(root: &Path, file: &str, entry: Option<&FileEntry>) -> Option<Source> 
     } else {
         scan_source(&text, file).syms
     };
-    Some(Source { lines, syms })
+    let src = Source { lines: Arc::new(lines), syms: Arc::new(syms) };
+    sources.insert(file.to_string(), src.clone());
+    Some(src)
 }
 
 fn js_utf16_len(value: &str) -> usize {
@@ -3853,7 +3869,7 @@ pub fn code_map(root: &Path, params: Value) -> Result<String, String> {
 fn backfill_block(
     root: &Path,
     index: &IndexView,
-    sources: &HashMap<String, Source>,
+    sources: &mut HashMap<String, Source>,
     plans: &mut Vec<PlannedFile>,
     sigs: &mut Vec<(String, usize, String)>,
     file: &str,
@@ -3880,10 +3896,7 @@ fn backfill_block(
     if plans.iter().any(|plan| plan.file == file) {
         return None;
     }
-    let src = sources
-        .get(file)
-        .cloned()
-        .or_else(|| source(root, file, index.files.get(file)))?;
+    let src = source(root, file, index.files.get(file), sources)?;
     plans.push(PlannedFile {
         file: file.to_string(),
         source: src,
@@ -4060,10 +4073,11 @@ fn bm25_rerank(root: &Path, ranked: &mut [(String, f64)], terms: &[String]) {
         .collect::<HashSet<_>>().into_iter().collect::<Vec<_>>();
     let mut selected = ranked.iter().enumerate().collect::<Vec<_>>();
     selected.sort_by(|a, b| b.1.1.total_cmp(&a.1.1).then(a.1.0.cmp(&b.1.0)));
+    let mut sources = HashMap::new();
     let docs = selected.into_iter().take(24).filter_map(|(position, (file, _))| {
         // 不扫描大资源；与文本检索的 2MB 单文件上限一致。
         if fs::metadata(root.join(file)).ok()?.len() > 2 * 1024 * 1024 { return None; }
-        let src = source(root, file, None)?;
+        let src = source(root, file, None, &mut sources)?;
         let body = src.lines.join("\n").to_lowercase();
         let path = file.to_lowercase();
         let symbols = src.syms.iter().map(|symbol| symbol.name.to_lowercase()).collect::<Vec<_>>();
@@ -4424,9 +4438,11 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         }
     }
     let stage = Instant::now();
-    let (index, _, reverse) = build_index(root, Some(&wanted), 3, Some(all.as_slice()));
+    let (index, _, snapshot) = build_index(root, Some(&wanted), 3, Some(all.as_slice()));
     trace("fast_context.index", stage);
     let stage = Instant::now();
+    // 请求内共享正文；下一次调用重新读取，避免编辑后的内容被跨请求缓存遮蔽。
+    let mut sources = HashMap::<String, Source>::new();
     let mut def_names = index.defs.keys().cloned().collect::<Vec<_>>();
     def_names.sort();
     let mut seeds = Vec::<(Definition, String, usize)>::new();
@@ -4492,7 +4508,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     let seed_bodies = seeds
         .iter()
         .filter_map(|(definition, _, _)| {
-            source(root, &definition.file, index.files.get(&definition.file)).map(|src| {
+            source(root, &definition.file, index.files.get(&definition.file), &mut sources).map(|src| {
                 (
                     definition.file.clone(),
                     src.lines[definition.symbol.ln - 1..definition.symbol.end].join("\n"),
@@ -4697,7 +4713,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
         let mut graph_queue = Vec::<(String, String, String, String, usize)>::new();
         let mut graph_seen = HashSet::<(String, String)>::new();
         for (definition, name, _) in &seeds {
-            for edge in discover(&definition.file, &mut searched_targets, reverse.as_ref()) {
+            for edge in discover(&definition.file, &mut searched_targets, &snapshot.reverse) {
                 if edge.local == *name || edge.orig.as_deref() == Some(name.as_str()) {
                     graph_queue.push((
                         name.clone(),
@@ -4723,7 +4739,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             if !is_code_file(&importer) || !root.join(&importer).is_file() {
                 continue;
             }
-            let Some(src) = source(root, &importer, index.files.get(&importer)) else {
+            let Some(src) = source(root, &importer, index.files.get(&importer), &mut sources) else {
                 continue;
             };
             // 复核：当前文件必须仍存在提及 local 名的 import/use/export 行（剔除陈旧缓存）。
@@ -4740,7 +4756,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                     symbol.name == seed_name && symbol.depth <= 1 && symbol.kind != "prop"
                 })
             {
-                for edge in discover(&importer, &mut searched_targets, reverse.as_ref()) {
+                for edge in discover(&importer, &mut searched_targets, &snapshot.reverse) {
                     if edge.local == local || edge.orig.as_deref() == Some(local.as_str()) {
                         graph_queue.push((
                             seed_name.clone(),
@@ -4964,11 +4980,8 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
     if final_candidates.is_empty() {
         final_candidates = ranked.iter().take(3).cloned().collect();
     }
-    let mut sources = HashMap::<String, Source>::new();
     for (file, _) in &final_candidates {
-        if let Some(source) = source(root, file, index.files.get(file)) {
-            sources.insert(file.clone(), source);
-        }
+        let _ = source(root, file, index.files.get(file), &mut sources);
     }
     let file_rank = final_candidates
         .iter()
@@ -5673,7 +5686,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             dep_seen.insert(dep_key);
             dependencies.push((dep_name, def.clone(), dep_depth));
             if dep_depth < 2 {
-                if let Some(src) = source(root, &def.file, index.files.get(&def.file)) {
+                if let Some(src) = source(root, &def.file, index.files.get(&def.file), &mut sources) {
                     next_plans.push(PlannedFile {
                         file: def.file,
                         source: src,
@@ -5717,7 +5730,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             push_sig(&mut sigs, &def.file, def.symbol.ln, &def.symbol.sig);
             continue;
         }
-        let Some(src) = source(root, &def.file, index.files.get(&def.file)) else {
+        let Some(src) = source(root, &def.file, index.files.get(&def.file), &mut sources) else {
             continue;
         };
         let n = def.symbol.end - def.symbol.ln + 1;
@@ -6234,7 +6247,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
                 }
                 Dropped::Block(file, block) => {
                     let created = backfill_block(
-                        root, &index, &sources, &mut plans, &mut sigs, &file, &block, 99,
+                        root, &index, &mut sources, &mut plans, &mut sigs, &file, &block, 99,
                     );
                     let Some(created) = created else {
                         continue;
@@ -6263,7 +6276,7 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
             let created = backfill_block(
                 root,
                 &index,
-                &sources,
+                &mut sources,
                 &mut plans,
                 &mut sigs,
                 &item.file,
@@ -6299,6 +6312,51 @@ fn fast_context_run(root: &Path, params: &Value) -> Result<String, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn warm_index_reuses_snapshot_and_updates_without_mutating_readers() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.ts"), "import { b } from './b';\nexport function a() { b(); }\n").unwrap();
+        fs::write(dir.path().join("b.ts"), "export function b() {}\n").unwrap();
+        let all = vec!["a.ts".to_string(), "b.ts".to_string()];
+        let wanted = HashSet::from(["a.ts".to_string()]);
+        let (_, _, first) = build_index(dir.path(), Some(&wanted), 1, Some(&all));
+        let (_, _, warm) = build_index(dir.path(), Some(&wanted), 1, Some(&all));
+        assert!(Arc::ptr_eq(&first, &warm), "warm queries must not copy the full cache");
+        assert_eq!(first.reverse["b.ts"][0].importer, "a.ts");
+        fs::write(dir.path().join("a.ts"), "export function renamed() {}\n").unwrap();
+        let (view, _, changed) = build_index(dir.path(), Some(&wanted), 1, Some(&all));
+        assert!(!Arc::ptr_eq(&warm, &changed));
+        assert!(view.defs.contains_key("renamed"));
+        assert!(!changed.reverse.contains_key("b.ts"));
+        assert!(first.reverse.contains_key("b.ts"));
+        let (_, _, warm_again) = build_index(dir.path(), Some(&wanted), 1, Some(&all));
+        assert!(Arc::ptr_eq(&changed, &warm_again), "an empty reverse graph is also reusable");
+        fs::remove_file(dir.path().join("a.ts")).unwrap();
+        let (view, _, deleted) = build_index(dir.path(), Some(&wanted), 1, Some(&all));
+        assert!(!view.files.contains_key("a.ts"));
+        assert!(!deleted.files.contains_key("a.ts"));
+        assert!(changed.files.contains_key("a.ts"));
+    }
+
+    #[test]
+    fn source_cache_shares_body_only_within_one_request() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        fs::write(&path, "pub fn first() {}\n").unwrap();
+        let mut sources = HashMap::new();
+        let first = source(dir.path(), "a.rs", None, &mut sources).unwrap();
+        fs::remove_file(&path).unwrap();
+        let cached = source(dir.path(), "a.rs", None, &mut sources).unwrap();
+        assert!(Arc::ptr_eq(&first.lines, &cached.lines));
+        assert!(Arc::ptr_eq(&first.syms, &cached.syms));
+        assert!(source(dir.path(), "a.rs", None, &mut HashMap::new()).is_none());
+        fs::write(&path, "pub fn other() {}\n").unwrap();
+        let next = source(dir.path(), "a.rs", None, &mut HashMap::new()).unwrap();
+        assert_eq!(next.syms[0].name, "other");
+        assert_eq!(cached.syms[0].name, "first");
+    }
+
     #[test]
     fn multiline_function_boundaries() {
         let cases = [
