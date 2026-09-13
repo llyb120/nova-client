@@ -1006,7 +1006,6 @@ export function HomeView() {
   return (
     <main class="home">
       <div class="home-center">
-        <HaibaraBubble />
         <header class="home-intro">
           <div class="home-eyebrow"><IconLogo size={28} class="home-logo" /><span>NOVA WORKSPACE</span></div>
           <h1 class="home-title">让想法，从这里开始。</h1>
@@ -1017,6 +1016,7 @@ export function HomeView() {
           class="home-composer"
           classList={{ "is-dragging": attach.dragging() }}
         >
+          <HaibaraBubble />
           <noteFlow.Notes />
           <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
           <Show when={quote()}>

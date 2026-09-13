@@ -1754,15 +1754,12 @@ button {
 }
 
 /* ===== 新会话灰原哀气泡 =====
-   定位对齐室女座气泡：锚定输入框（.home-composer）左上角上方，长出尖角指向输入框。
-   依附于 .home-center 流内，锚点缺失时安全隐藏。 */
-.home-center {
-  position: relative;
-}
+   锚定输入框（.home-composer）右上角上方悬浮，尖角指向输入框右上角。
+   作为 .home-composer 的绝对定位子元素，随 HomeView 挂载出现。 */
 .haibara-bubble {
   position: absolute;
-  left: 20px;
-  bottom: calc(100% - 13px);
+  right: 0;
+  bottom: calc(100% + 14px);
   max-width: 320px;
   background: var(--bg-float);
   border: 1px solid var(--border-light);
@@ -1774,7 +1771,7 @@ button {
 .haibara-bubble::after {
   content: "";
   position: absolute;
-  left: 26px;
+  right: 26px;
   bottom: -7px;
   width: 12px;
   height: 12px;
@@ -1783,26 +1780,11 @@ button {
   border-bottom: 1px solid var(--border-light);
   transform: rotate(45deg);
 }
-.haibara-bubble-head {
-  position: relative;
+.haibara-bubble-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
   z-index: 1;
-}
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
-}
-.haibara-bubble-name {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--accent);
-}
-.haibara-bubble-hint {
-  font-size: 11px;
-  color: var(--text-faint);
-  flex: 1;
-}
-.haibara-bubble-actions button {
   background: none;
   border: none;
   color: var(--text-muted);
@@ -1812,7 +1794,7 @@ button {
   padding: 2px 4px;
   border-radius: 4px;
 }
-.haibara-bubble-actions button:hover {
+.haibara-bubble-close:hover {
   color: var(--text);
   background: var(--bg-hover);
 }
@@ -1820,6 +1802,7 @@ button {
   position: relative;
   z-index: 1;
   margin: 0;
+  padding-right: 20px;
   font-size: 13px;
   line-height: 1.7;
   color: var(--text-dim);
