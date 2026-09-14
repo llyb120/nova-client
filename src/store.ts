@@ -2914,8 +2914,9 @@ export async function respondPermission(requestKey: string, optionId: string) {
 
 const pendingDeltas = new Map<number, string>();
 
-/* ponytail: 统一按 4 字符/token 估算可见输出，中文和不同 tokenizer 会有偏差；
-   精确速率需要各 provider 提供逐块 token 计数。 */
+/* ponytail: 参照 Claude Code 2.0.76 spinner，以输出字符数 / 4 估算；
+   包含回答、思考和工具参数。中文/tokenizer 及未推送的参数流会有偏差，
+   精确速率需要 provider 提供逐块 token 计数。 */
 const RATE_WINDOW_MS = 500;
 const rateWindows = new Map<string, { chars: number; since: number; tokensPerSec: number }>();
 const rateUpdatedAt = new Map<string, number>();
@@ -2931,7 +2932,13 @@ function trackDeltaRate(threadId: string, chars: number) {
   }
   if (now - w.since >= RATE_WINDOW_MS) {
     const inst = w.chars / 4 / ((now - w.since) / 1000);
-    w.tokensPerSec = inst && w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
+    // 短段输出之间的空窗口保留上次采样，真正停顿才归零。
+    // 归零也必须写 signal，不能在 getter 中用非响应式时钟临时返回 0。
+    if (w.chars > 0) {
+      w.tokensPerSec = w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
+    } else if (now - (rateUpdatedAt.get(threadId) ?? now) >= 1_500) {
+      w.tokensPerSec = 0;
+    }
     w.chars = 0;
     w.since = now;
     const rounded = Math.round(w.tokensPerSec);
@@ -2942,13 +2949,10 @@ function trackDeltaRate(threadId: string, chars: number) {
   w.chars += chars;
 }
 
-/* 实时输出速度（tok/s）：按增量及完整文本的新增字符估算。
-   共享采样器负责停顿归零，1.5s 过期检查覆盖切回后台会话的旧值。 */
+/* 实时输出速度（tok/s）：共享采样器负责发布速度及停顿归零。 */
 export function getOutputRate(threadId: string | null | undefined): number {
   const rates = outputRates();
   if (!threadId) return 0;
-  const at = rateUpdatedAt.get(threadId);
-  if (at === undefined || performance.now() - at > 1_500) return 0;
   return rates[threadId] ?? 0;
 }
 
@@ -3039,13 +3043,17 @@ function applyUpsert(item: Item) {
     if (optimistic >= 0) setState("items", (items) => items.filter((_, i) => i !== optimistic));
   }
   const idx = state.items.findIndex((current) => current.id === item.id);
-  // OpenCode 等后端发送完整文本；只统计新增部分，delta 后的最终快照不会重复计数。
-  if (state.currentId && state.running[state.currentId]
-    && (item.type === "assistant" || item.type === "thought")) {
+  // 完整快照只统计新增输出；工具参数属于模型输出，工具结果/日志不属于。
+  if (state.currentId && state.running[state.currentId]) {
+    const outputLength = (value: Item | undefined): number => {
+      if (value?.type === "assistant" || value?.type === "thought") {
+        return value.text === "思考中…" ? 0 : value.text.length;
+      }
+      if (value?.type !== "tool" || value.rawInput == null) return 0;
+      return (typeof value.rawInput === "string" ? value.rawInput : JSON.stringify(value.rawInput))?.length ?? 0;
+    };
     const previous = idx >= 0 ? state.items[idx] : undefined;
-    const length = previous && (previous.type === "assistant" || previous.type === "thought")
-      ? previous.text.length : 0;
-    const added = Math.max(0, item.text.length - length);
+    const added = Math.max(0, outputLength(item) - outputLength(previous));
     if (added) trackDeltaRate(state.currentId, added);
   }
   if (idx >= 0) setState("items", idx, reconcile(item));

@@ -828,7 +828,7 @@ export function Composer() {
             <span class="composer-run-dot" aria-hidden="true" />
             <span>{runElapsed()}</span>
             <span class="composer-run-sep">·</span>
-            <span title="实时输出速度（估算，按流式文本约 4 字符/token，含可见思考）">
+            <span title="实时输出速度（估算）：回答、思考及工具参数按约 4 字符/token 统计，不含工具结果。未提供参数增量的后端在参数到达时更新。">
               ≈{tokenSpeed()} tok/s
             </span>
             <span class="composer-run-sep">·</span>
