@@ -187,7 +187,9 @@ export function Sidebar(props: {
     // 锚点必须一路取到最高祖先（chainGroupAnchor），只看直接父级会让多级
     // stage 链里 cwd 被中途切换的孙子会话裂到另一组、被当作链根单独显示。
     for (const t of threads) {
-      const key = rawKey(chainGroupAnchor(threads, t));
+      const key = rawKey(chainGroupAnchor(threads, t))
+        .replace(/^\\\\\?\\UNC\\/i, "\\\\")
+        .replace(/^\\\\\?\\/, "");
       const list = map.get(key) ?? [];
       if (list.length === 0) map.set(key, list);
       list.push(t);

@@ -1,6 +1,28 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
+import { transformSync } from "esbuild";
 import { chainGroupAnchor, latestFireStage } from "../src/threadDisplay.ts";
+import { isScratch, scratchParent } from "../src/utils.ts";
+
+test("侧栏将 Windows 长路径前缀与普通源仓库路径归为同组", () => {
+  const sidebar = readFileSync(new URL("../src/components/Sidebar.tsx", import.meta.url), "utf8");
+  const body = sidebar.slice(sidebar.indexOf("const groupByCwd ="), sidebar.indexOf("const currentGroups ="));
+  const { code } = transformSync(`${body}\nreturn groupByCwd;`, { loader: "ts" });
+  const group = new Function("chainGroupAnchor", "isScratch", "scratchParent", code)(chainGroupAnchor, isScratch, scratchParent);
+  for (const repo of [String.raw`D:\code\repo`, String.raw`\\server\share\repo`]) {
+    const extended = repo.startsWith("\\\\") ? `\\\\?\\UNC\\${repo.slice(2)}` : `\\\\?\\${repo}`;
+    const rows = [
+      { id: "plain", cwd: repo, roamingRole: "guest" },
+      { id: "worktree", cwd: "worktree-dir", roamingRole: "guest", worktree: { repo: extended, path: "worktree-dir" } },
+      { id: "other", cwd: `${repo}-other`, roamingRole: "guest" },
+    ];
+    const groups = group(rows);
+    assert.equal(groups.length, 2);
+    assert.equal(groups[0][0], repo);
+    assert.deepEqual(groups[0][1].map((thread) => thread.id), ["plain", "worktree"]);
+  }
+});
 
 // 回归：三级工作流链（root → stage2 → stage3），stage2/stage3 的 cwd 被 agent
 // 中途切到别的目录（change_working_directory）。分组锚点必须一路取到链根，
