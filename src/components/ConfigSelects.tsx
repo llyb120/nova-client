@@ -51,6 +51,9 @@ function groupOf(value: string, name: string, cost?: ModelCost): string {
   if (v.includes("swe") || v.includes("adaptive") || v.includes("windsurf")) return "Windsurf";
   if (v.includes("kimi")) return "Kimi";
   if (v.includes("glm")) return "GLM";
+  if (v.includes("qwen") || v.includes("tongyi")) return "Qwen";
+  // Meta Muse Spark 系列（含 meta/ 前缀的中转模型名），避免落进「其他」分组
+  if (v.includes("muse") || v.includes("meta/")) return "Meta";
   if (v.includes("deepseek")) return "DeepSeek";
   if (v.includes("grok")) return "Grok";
   if (v.includes("minimax")) return "MiniMax";
