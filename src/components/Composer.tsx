@@ -173,7 +173,7 @@ export function Composer() {
       ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
       : `${minutes}:${String(remainder).padStart(2, "0")}`;
   };
-  // 输出速度（tok/s 估算）。runClock 秒级 ticker 保证运行中停顿 >1.5s 时归零刷新。
+  // 共享采样器定时刷新，停顿时也会归零。
   const tokenSpeed = () => getOutputRate(state.currentId);
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
@@ -827,13 +827,13 @@ export function Composer() {
             <span class="composer-run-dot" aria-hidden="true" />
             <span>{runElapsed()}</span>
             <span class="composer-run-sep">·</span>
+            <span title="实时输出速度（估算，按流式文本约 4 字符/token，含可见思考）">
+              ≈{tokenSpeed()} tok/s
+            </span>
+            <span class="composer-run-sep">·</span>
             <span>
               上下文 {fmtTokens(contextUsedTokens())} / {contextWindow() ? fmtTokens(contextWindow()!) : "--"}
             </span>
-            <Show when={tokenSpeed() > 0}>
-              <span class="composer-run-sep">·</span>
-              <span>{tokenSpeed()} tok/s</span>
-            </Show>
           </span>
         </Show>
         <div class="composer-actions">

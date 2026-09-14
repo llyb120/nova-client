@@ -2914,8 +2914,8 @@ export async function respondPermission(requestKey: string, optionId: string) {
 
 const pendingDeltas = new Map<number, string>();
 
-/* —— 侧栏标题跳动速度：按流式 delta 字符吞吐粗估输出速率 ——
-   1 token ≈ 4 字符只用于驱动动画节奏，无需精确；约 0.5s 一个采样窗口并做平滑。 */
+/* ponytail: 统一按 4 字符/token 估算可见输出，中文和不同 tokenizer 会有偏差；
+   精确速率需要各 provider 提供逐块 token 计数。 */
 const RATE_WINDOW_MS = 500;
 const rateWindows = new Map<string, { chars: number; since: number; tokensPerSec: number }>();
 const rateUpdatedAt = new Map<string, number>();
@@ -2923,7 +2923,7 @@ export const [outputRates, setOutputRates] = createSignal<Record<string, number>
 
 function trackDeltaRate(threadId: string, chars: number) {
   const now = performance.now();
-  rateUpdatedAt.set(threadId, now);
+  if (chars > 0) rateUpdatedAt.set(threadId, now);
   let w = rateWindows.get(threadId);
   if (!w) {
     w = { chars: 0, since: now, tokensPerSec: 0 };
@@ -2931,7 +2931,7 @@ function trackDeltaRate(threadId: string, chars: number) {
   }
   if (now - w.since >= RATE_WINDOW_MS) {
     const inst = w.chars / 4 / ((now - w.since) / 1000);
-    w.tokensPerSec = w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
+    w.tokensPerSec = inst && w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
     w.chars = 0;
     w.since = now;
     const rounded = Math.round(w.tokensPerSec);
@@ -2942,14 +2942,14 @@ function trackDeltaRate(threadId: string, chars: number) {
   w.chars += chars;
 }
 
-/* 实时输出速度（tok/s）：按流式 delta 字符吞吐估算，约 1 token = 4 字符。
-   超过 1.5s 没有新 delta（如工具执行中）视为停顿，返回 0。
-   依赖组件侧的运行中秒级 ticker 刷新 staleness。 */
+/* 实时输出速度（tok/s）：按增量及完整文本的新增字符估算。
+   共享采样器负责停顿归零，1.5s 过期检查覆盖切回后台会话的旧值。 */
 export function getOutputRate(threadId: string | null | undefined): number {
+  const rates = outputRates();
   if (!threadId) return 0;
   const at = rateUpdatedAt.get(threadId);
   if (at === undefined || performance.now() - at > 1_500) return 0;
-  return outputRates()[threadId] ?? 0;
+  return rates[threadId] ?? 0;
 }
 
 function clearDeltaRate(threadId: string) {
@@ -3039,6 +3039,15 @@ function applyUpsert(item: Item) {
     if (optimistic >= 0) setState("items", (items) => items.filter((_, i) => i !== optimistic));
   }
   const idx = state.items.findIndex((current) => current.id === item.id);
+  // OpenCode 等后端发送完整文本；只统计新增部分，delta 后的最终快照不会重复计数。
+  if (state.currentId && state.running[state.currentId]
+    && (item.type === "assistant" || item.type === "thought")) {
+    const previous = idx >= 0 ? state.items[idx] : undefined;
+    const length = previous && (previous.type === "assistant" || previous.type === "thought")
+      ? previous.text.length : 0;
+    const added = Math.max(0, item.text.length - length);
+    if (added) trackDeltaRate(state.currentId, added);
+  }
   if (idx >= 0) setState("items", idx, reconcile(item));
   else setState("items", state.items.length, item);
 }
@@ -3186,6 +3195,13 @@ export const [restoreSettled, setRestoreSettled] = createSignal(false);
 export async function initStore() {
   if (initialized) return;
   initialized = true;
+  // 无新消息也结算采样窗口：首块及时显示，工具执行/等待期间归零。
+  setInterval(() => {
+    for (const threadId of rateWindows.keys()) {
+      if (state.running[threadId]) trackDeltaRate(threadId, 0);
+      else clearDeltaRate(threadId);
+    }
+  }, RATE_WINDOW_MS);
 
   // 必须先监听模型更新，再读取 settings 触发 ensureModelOptions；否则缓存命中后的后台
   // 重验可能在其余监听串行注册期间完成，磁盘已更新但当前窗口仍停在旧列表。

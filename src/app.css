@@ -3480,7 +3480,7 @@ button {
   flex-wrap: wrap;
 }
 .composer .composer-bar .sel.wide {
-  flex: 1 1 max-content;
+  flex: 0 1 max-content;
   max-width: 100%;
 }
 .composer .composer-bar .sel.wide .pill-text {
