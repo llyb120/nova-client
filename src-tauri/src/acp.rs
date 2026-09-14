@@ -3357,6 +3357,14 @@ impl AcpManager {
     ) -> Vec<Value> {
         let mut prompt = Self::build_prompt_blocks(text, images);
         let mut guidance = Vec::new();
+        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
+            // ponytail: ACP has no system-prompt setter; repeat rules per turn so resumed
+            // sessions and setting changes work. Use session-level instructions if ACP adds them.
+            guidance.push(crate::codex_app_server::rtk_guidance());
+            if self.app.state::<AppState>().settings.lock().unwrap().ponytail_enabled {
+                guidance.push(crate::lyra::PONYTAIL_RULES.to_string());
+            }
+        }
         if include_runtime_guidance {
             let (context_tools, read_only) = {
                 let state = self.app.state::<AppState>();
@@ -3524,7 +3532,7 @@ impl AcpManager {
         } else {
             text
         };
-        let prompt = Self::build_prompt_blocks(&text, &images);
+        let prompt = self.build_user_prompt_blocks(&thread_id, &text, &images, false);
         let codebuddy = self.kind == AgentKind::CodeBuddy;
         let mgr = self.clone();
         let tid = thread_id.clone();
@@ -4486,6 +4494,19 @@ mod codebuddy_acp_tests {
         assert!(body.contains("<system-reminder>"));
         assert!(body.contains("block[\"text\"]"));
         assert!(!body.contains("AgentKind::CodeBuddy => prompt.insert(0"));
+        let rules = body.split("if include_runtime_guidance {").next().unwrap();
+        assert!(rules.contains("AgentKind::CodeBuddy | AgentKind::Kimi"));
+        assert!(rules.contains("crate::codex_app_server::rtk_guidance()"));
+        assert!(rules.contains("ponytail_enabled"));
+        assert!(rules.contains("crate::lyra::PONYTAIL_RULES"));
+        let steer = source.split("pub async fn steer_prompt(").nth(1).unwrap()
+            .split("async fn drive_prompt(").next().unwrap();
+        assert!(steer.contains("self.build_user_prompt_blocks(&thread_id, &text, &images, false)"));
+        let rtk = crate::codex_app_server::rtk_guidance();
+        assert!(rtk.contains("__rtk"));
+        assert!(rtk.contains("PowerShell:") && rtk.contains("Bash/sh:"));
+        assert!(rtk.contains("exact/raw output") && rtk.contains("approval/sandbox"));
+        assert!(!rtk.contains("Codex's"));
     }
 }
 
