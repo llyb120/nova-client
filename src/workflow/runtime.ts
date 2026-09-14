@@ -560,7 +560,7 @@ async function applyStageConfig(rootId: string, config: WorkflowStageConfig): Pr
   if (!agentKind && !model) return;
   const root = await api.getThread(rootId);
   if (agentKind && agentKind !== root.agentKind) {
-    await api.setThreadAgent(rootId, agentKind as AgentKind, model || null, null, null);
+    await api.setThreadAgent(rootId, agentKind as AgentKind, model || null, root.mode ?? null, null);
   } else if (model && model !== (root.model ?? "")) {
     await api.setThreadModel(rootId, model);
   }

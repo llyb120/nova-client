@@ -28,7 +28,7 @@ assert.match(runtime, /api\.checkRoamingWorkflow\(originThreadId \?\? root\.id\)
 // 使用真实运行时、内存 IPC 检查两阶段接力；不需要启动 Tauri 或实际模型。
 const { build } = await import("esbuild");
 const threads = new Map([["root", {
-  id: "root", cwd: "remote-project", agentKind: "lyra", model: "default", roamingRole: "host", items: [],
+  id: "root", cwd: "remote-project", agentKind: "lyra", model: "default", mode: "build", roamingRole: "host", items: [],
 }]]);
 const sent = [];
 const checked = [];
@@ -48,9 +48,9 @@ globalThis.__roamingTest = {
     async getThread(id) { return structuredClone(threads.get(id)); },
     async checkRoamingWorkflow(id) { checked.push(id); },
     async getSettings() { return {}; },
-    async setThreadAgent(id, agentKind, model) { Object.assign(threads.get(id), { agentKind, model }); },
+    async setThreadAgent(id, agentKind, model, mode) { Object.assign(threads.get(id), { agentKind, model, mode }); },
     async setThreadModel(id, model) { threads.get(id).model = model; },
-    async setThreadMode() {},
+    async setThreadMode(id, mode) { threads.get(id).mode = mode; },
     async renameThread(id, title) { threads.get(id).title = title; },
     async sendPrompt(id, text, images) { sent.push({ id, text, images }); },
     async generateThreadTitle() {},
@@ -82,6 +82,7 @@ try {
   await engine.startWorkflow(definition.id, { goal: "goal" }, "root", [{ name: "image" }]);
   assert.equal(sent[0].text, "first goal");
   assert.equal(threads.get("root").agentKind, "codex");
+  assert.equal(threads.get("root").mode, "build", "切换后端保留原会话权限模式");
   assert.equal(sent[0].images.length, 1);
   threads.get("root").items = [{ type: "assistant", id: 1, text: "first conclusion" }];
   running.delete("root");
@@ -92,6 +93,13 @@ try {
   assert.equal(threads.get("child").parentThreadId, "root");
   assert.equal(threads.get("child").agentKind, "lyra", "跟随节点使用启动前的远端配置");
   assert.equal(checked.length, 2);
+  for (const mode of ["build", "plan"]) {
+    const id = `mode-${mode}`;
+    threads.set(id, { ...threads.get("root"), id, agentKind: "lyra", mode: "build", items: [] });
+    definition.stages[0].mode = mode;
+    await engine.startWorkflow(definition.id, { goal: "goal" }, id);
+    assert.equal(threads.get(id).mode, mode, "节点显式模式不能被后端切换清空");
+  }
   threads.set("guest", { ...threads.get("root"), id: "guest", roamingRole: "guest" });
   await assert.rejects(engine.startWorkflow(definition.id, { goal: "goal" }, "guest"), /执行端/);
 } finally {
