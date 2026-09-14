@@ -55,6 +55,7 @@ pub struct PendingPermission {
 /// 已挂载到 devin 进程上的 session → 线程路由与已应用的配置
 struct Route {
     thread_id: String,
+    text_items: HashMap<(String, String, bool), usize>,
     applied_model: Option<String>,
     applied_mode: Option<String>,
     applied_effort: Option<String>,
@@ -1851,7 +1852,7 @@ impl AcpManager {
                     }
                 }
                 "agent_message_chunk" | "agent_thought_chunk" => {
-                    for item in complete_pending_tools(thread, None) {
+                    for item in complete_pending_tools_on_update(thread, None) {
                         self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                     }
                     let text = extract_text(&update["content"]);
@@ -1859,10 +1860,17 @@ impl AcpManager {
                         return;
                     }
                     let is_thought = kind == "agent_thought_chunk";
+                    let target = if self.kind == AgentKind::CodeBuddy {
+                        let mut routes = self.routes.lock().unwrap();
+                        let Some(route) = routes.get_mut(session_id) else { return };
+                        acp_text_target(&thread.items, update, &mut route.text_items)
+                    } else {
+                        thread.items.len().checked_sub(1)
+                    };
                     // devin 在工具调用间隙会泄漏内容恰为 "None" 的独立消息块（上游 bug），
                     // 仅在「将创建新条目」时丢弃，正常长文本中的 None 字样不受影响
-                    if text.trim() == "None" {
-                        let continues_last = match thread.items.last() {
+                    if self.kind == AgentKind::Devin && text.trim() == "None" {
+                        let continues_last = match target.and_then(|i| thread.items.get(i)) {
                             Some(Item::Assistant { .. }) => !is_thought,
                             Some(Item::Thought { .. }) => is_thought,
                             _ => false,
@@ -1871,7 +1879,7 @@ impl AcpManager {
                             return;
                         }
                     }
-                    let appended = match thread.items.last_mut() {
+                    let appended = match target.and_then(|i| thread.items.get_mut(i)) {
                         Some(Item::Assistant { id, text: t, .. }) if !is_thought => {
                             t.push_str(&text);
                             Some((*id, text.clone()))
@@ -1936,7 +1944,7 @@ impl AcpManager {
                         }
                     }
                     if !found {
-                        for item in complete_pending_tools(thread, Some(&tc_id)) {
+                        for item in complete_pending_tools_on_update(thread, Some(&tc_id)) {
                             self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                         }
                         let call = tool_call_from_update(&tc_id, update);
@@ -2100,6 +2108,9 @@ impl AcpManager {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             if let Some(thread) = store.get_mut(thread_id) {
+                for route in self.routes.lock().unwrap().values_mut().filter(|r| r.thread_id == thread_id) {
+                    route.text_items.clear();
+                }
                 for item in complete_pending_tools(thread, None) {
                     self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
                 }
@@ -2492,6 +2503,7 @@ impl AcpManager {
                     sid.clone(),
                     Route {
                         thread_id: thread_id.to_string(),
+                        text_items: HashMap::new(),
                         applied_model: None,
                         applied_mode: None,
                         applied_effort: None,
@@ -2993,6 +3005,7 @@ impl AcpManager {
             sid.clone(),
             Route {
                 thread_id: thread_id.to_string(),
+                text_items: HashMap::new(),
                 applied_model: None,
                 applied_mode: None,
                 applied_effort: None,
@@ -5019,6 +5032,37 @@ fn derive_title(text: &str, has_images: bool) -> String {
     }
 }
 
+// CodeBuddy 并行模型共享 session，按模型消息、父工具及正文/思考分别续写。
+fn acp_text_target(
+    items: &[Item],
+    update: &Value,
+    ids: &mut HashMap<(String, String, bool), usize>,
+) -> Option<usize> {
+    let meta = &update["_meta"];
+    let message = [
+        &meta["codebuddy.ai/modelRequestId"],
+        &meta["codebuddy.ai/llmMessageId"],
+        &update["messageId"],
+        &meta["codebuddy.ai/messageId"],
+    ].into_iter().filter_map(Value::as_str).find(|id| !id.is_empty());
+    let Some(message) = message else { return items.len().checked_sub(1) };
+    let thought = update["sessionUpdate"] == "agent_thought_chunk";
+    let key = (
+        meta["codebuddy.ai/parentToolCallId"].as_str().unwrap_or_default().to_string(),
+        message.to_string(),
+        thought,
+    );
+    if let Some(&index) = ids.get(&key) {
+        if matches!(items.get(index), Some(Item::Thought { .. }) if thought)
+            || matches!(items.get(index), Some(Item::Assistant { .. }) if !thought)
+        {
+            return Some(index);
+        }
+    }
+    ids.insert(key, items.len());
+    None
+}
+
 fn extract_text(content: &Value) -> String {
     match content["type"].as_str() {
         Some("text") => content["text"].as_str().unwrap_or_default().to_string(),
@@ -5132,6 +5176,60 @@ fn set_tool_duration(call: &mut ToolCall, duration_ms: u64) {
     if let Some(object) = output.as_object_mut() {
         object.insert("durationMs".into(), json!(duration_ms));
     }
+}
+
+fn complete_pending_tools_on_update(thread: &mut Thread, except_tool_call_id: Option<&str>) -> Vec<Item> {
+    // 并行消息/工具开始不代表其它工具已结束；CodeBuddy 会上报终态。
+    if matches!(thread.agent_kind, AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus) {
+        return Vec::new();
+    }
+    complete_pending_tools(thread, except_tool_call_id)
+}
+
+#[test]
+fn codebuddy_parallel_text_streams_keep_their_items() {
+    let mut thread = Thread::new(String::new(), AgentKind::CodeBuddy, None, None, None, false);
+    let mut ids = HashMap::new();
+    // 同一 messageId 下的并行模型、正文/思考和父工具均须隔离。
+    for (model, parent, thought, text) in [
+        ("a", "", false, "正文"),
+        ("b", "task", true, "思考"),
+        ("a", "", false, "继续"),
+        ("b", "task", true, "继续"),
+        ("b", "task", false, "结果"),
+        ("b", "other", false, "另一任务"),
+        ("c", "", false, "下一消息"),
+    ] {
+        let update = json!({"sessionUpdate": if thought { "agent_thought_chunk" } else { "agent_message_chunk" },
+            "messageId": "shared", "_meta": {"codebuddy.ai/modelRequestId": model,
+            "codebuddy.ai/parentToolCallId": parent}});
+        if let Some(index) = acp_text_target(&thread.items, &update, &mut ids) {
+            match &mut thread.items[index] {
+                Item::Assistant { text: value, .. } | Item::Thought { text: value, .. } => value.push_str(text),
+                _ => panic!("text stream targeted a non-text item"),
+            }
+        } else {
+            let id = thread.next_item_id();
+            thread.items.push(if thought {
+                Item::Thought { id, text: text.into(), ts: 0 }
+            } else {
+                Item::Assistant { id, text: text.into(), ts: 0 }
+            });
+        }
+    }
+    let texts: Vec<_> = thread.items.iter().map(|item| match item {
+        Item::Assistant { text, .. } | Item::Thought { text, .. } => text.as_str(),
+        _ => unreachable!(),
+    }).collect();
+    assert_eq!(texts, ["正文继续", "思考继续", "结果", "另一任务", "下一消息"]);
+    assert_eq!(acp_text_target(&thread.items, &json!({}), &mut ids), Some(4));
+    for update in [json!({"messageId": "fresh"}), json!({"_meta": {"codebuddy.ai/messageId": "fresh"}})] {
+        assert_eq!(acp_text_target(&thread.items, &update, &mut ids), None);
+    }
+    thread.items.push(Item::Tool { id: 6, ts: now_ms(), call: tool_call_from_update("tool", &json!({"status": "in_progress"})) });
+    assert!(complete_pending_tools_on_update(&mut thread, None).is_empty());
+    assert!(complete_pending_tools_on_update(&mut thread, Some("other")).is_empty());
+    assert_eq!(complete_pending_tools(&mut thread, None).len(), 1);
 }
 
 fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>) -> Vec<Item> {
