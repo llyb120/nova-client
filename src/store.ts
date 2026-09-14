@@ -3283,189 +3283,337 @@ export async function initStore() {
     void api.showMainWindow().catch(() => {});
     return { error };
   });
-
-  await listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
-    const ops = e.payload.ops ?? (e.payload.op ? [e.payload.op] : []);
-    // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
-    for (const op of ops) {
-      if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
-      else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text.length);
-    }
-    if (e.payload.threadId !== state.currentId) {
-      if (threadSnapshots.has(e.payload.threadId)) staleThreadSnapshots.add(e.payload.threadId);
-      return;
-    }
-    // 切换会话加载快照期间忽略增量：此刻 items 还是旧会话的，getThread 快照会包含
-    // 已落库的全部内容，加载完成（loadingThread=false）后再应用后续实时增量。
-    // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
-    // 时选择器与「实施此计划」按钮会对不齐。
-    const apply = (op: UpdateOp) => {
-      if (snapshotToolUpdates?.threadId === e.payload.threadId && op.t === "upsert"
-        && op.item.type === "tool" && op.item.status !== "pending" && op.item.status !== "in_progress") {
-        snapshotToolUpdates.items.set(op.item.id, op.item);
+  // 各监听互不依赖：并发注册，全部就绪后再读取会话快照，避免遗漏状态事件。
+  await Promise.all([
+    listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
+      const ops = e.payload.ops ?? (e.payload.op ? [e.payload.op] : []);
+      // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
+      for (const op of ops) {
+        if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
+        else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text.length);
       }
-      if (
-        state.loadingThread &&
-        op.t !== "mode" &&
-        op.t !== "proposed_plan" &&
-        op.t !== "plan"
-      ) {
+      if (e.payload.threadId !== state.currentId) {
+        if (threadSnapshots.has(e.payload.threadId)) staleThreadSnapshots.add(e.payload.threadId);
         return;
       }
-      applyOp(op);
-    };
-    if (ops.length > 1) {
-      batch(() => {
-        for (const op of ops) apply(op);
-      });
-    } else if (ops[0]) {
-      apply(ops[0]);
-    }
-  });
+      // 切换会话加载快照期间忽略增量：此刻 items 还是旧会话的，getThread 快照会包含
+      // 已落库的全部内容，加载完成（loadingThread=false）后再应用后续实时增量。
+      // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
+      // 时选择器与「实施此计划」按钮会对不齐。
+      const apply = (op: UpdateOp) => {
+        if (snapshotToolUpdates?.threadId === e.payload.threadId && op.t === "upsert"
+          && op.item.type === "tool" && op.item.status !== "pending" && op.item.status !== "in_progress") {
+          snapshotToolUpdates.items.set(op.item.id, op.item);
+        }
+        if (
+          state.loadingThread &&
+          op.t !== "mode" &&
+          op.t !== "proposed_plan" &&
+          op.t !== "plan"
+        ) {
+          return;
+        }
+        applyOp(op);
+      };
+      if (ops.length > 1) {
+        batch(() => {
+          for (const op of ops) apply(op);
+        });
+      } else if (ops[0]) {
+        apply(ops[0]);
+      }
+    }),
 
-  await listen<{ threadId: string; cwd: string }>("thread:cwd-changed", (e) => {
-    const { threadId, cwd } = e.payload;
-    const cached = threadSnapshots.peek(threadId);
-    if (cached) rememberThreadSnapshot({ ...cached, cwd });
-    setState("threads", (thread) => thread.id === threadId, "cwd", cwd);
-    if (state.currentId === threadId) setState("cwd", cwd);
-  });
+    listen<{ threadId: string; cwd: string }>("thread:cwd-changed", (e) => {
+      const { threadId, cwd } = e.payload;
+      const cached = threadSnapshots.peek(threadId);
+      if (cached) rememberThreadSnapshot({ ...cached, cwd });
+      setState("threads", (thread) => thread.id === threadId, "cwd", cwd);
+      if (state.currentId === threadId) setState("cwd", cwd);
+    }),
 
-  await listen<TurnEvent>("acp:turn", (e) => {
-    const threadId = e.payload.threadId;
-    const wasRunning = !!state.running[threadId];
-    runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
-    optimisticRunningThreads.delete(threadId);
-    zenHoldThreads.delete(threadId);
-    setState("running", threadId, e.payload.running);
-    if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
-      staleThreadSnapshots.add(threadId);
-    }
-    if (e.payload.running) {
-      // 只在新一轮开始时丢弃上一轮残留；重复 running 事件不能覆盖本轮已收到的 usage。
-      if (!wasRunning) {
+    listen<TurnEvent>("acp:turn", (e) => {
+      const threadId = e.payload.threadId;
+      const wasRunning = !!state.running[threadId];
+      runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
+      optimisticRunningThreads.delete(threadId);
+      zenHoldThreads.delete(threadId);
+      setState("running", threadId, e.payload.running);
+      if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
+        staleThreadSnapshots.add(threadId);
+      }
+      if (e.payload.running) {
+        // 只在新一轮开始时丢弃上一轮残留；重复 running 事件不能覆盖本轮已收到的 usage。
+        if (!wasRunning) {
+          liveUsageByThread.delete(threadId);
+          clearDeltaRate(threadId);
+          if (threadId === state.currentId) setState("liveUsage", null);
+        }
+        // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
+        resumeFireRelay(e.payload.threadId);
+        handleWorkflowTurnStart(e.payload.threadId);
+      } else {
+        // 轮次收尾（正常或出错）且该会话未打开 → 标记未读，提醒回看结论或错误；
+        // 与后端 notify_done 的分类一致，只有用户主动取消不算未读。
+        const manuallyInterrupted =
+          e.payload.stopReason === "cancelled" || e.payload.stopReason === "force_cancelled";
+        if (!manuallyInterrupted && threadId !== state.currentId) {
+          setUnreadTurns(threadId, (state.unreadTurns[threadId] ?? 0) + 1);
+        }
+        // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
         liveUsageByThread.delete(threadId);
         clearDeltaRate(threadId);
         if (threadId === state.currentId) setState("liveUsage", null);
-      }
-      // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
-      resumeFireRelay(e.payload.threadId);
-      handleWorkflowTurnStart(e.payload.threadId);
-    } else {
-      // 轮次收尾（正常或出错）且该会话未打开 → 标记未读，提醒回看结论或错误；
-      // 与后端 notify_done 的分类一致，只有用户主动取消不算未读。
-      const manuallyInterrupted =
-        e.payload.stopReason === "cancelled" || e.payload.stopReason === "force_cancelled";
-      if (!manuallyInterrupted && threadId !== state.currentId) {
-        setUnreadTurns(threadId, (state.unreadTurns[threadId] ?? 0) + 1);
-      }
-      // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
-      liveUsageByThread.delete(threadId);
-      clearDeltaRate(threadId);
-      if (threadId === state.currentId) setState("liveUsage", null);
-      if (pendingSetupConfigRefresh.delete(threadId)) {
-        void api.refreshLyraConfig().catch((error) =>
-          console.error("Refresh Lyra config after /setup failed", error),
-        );
-      }
-      if (fireRelaySteps.has(e.payload.threadId)) {
-        const reason = e.payload.stopReason;
-        const manuallyInterrupted = reason === "cancelled" || reason === "force_cancelled";
-        const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
-        // 只有明确正常收尾才进入判断。网络、进程或模型错误均暂停在当前阶段，
-        // 用户补充提示或发送“继续”后，会从这一阶段恢复完整 Fire 流程。
-        const action = completedNormally
-          ? advanceFireRelay(e.payload.threadId)
-          : suspendFireRelay(e.payload.threadId, manuallyInterrupted);
-        void action.catch((error) => console.error("Fire relay failed", error));
-      }
-      // 通用工作流（/run）与 Fire 互斥：非 Fire 会话才会被其接管。
-      handleWorkflowTurnEnd(e.payload.threadId, e.payload.stopReason);
-      if (pendingHardDesign.has(threadId)) {
-        const reason = e.payload.stopReason;
-        const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
-        if (completedNormally) {
-          void finalizeHardDesign(threadId).catch((error) =>
-            console.error("Hard workflow design failed", error),
+        if (pendingSetupConfigRefresh.delete(threadId)) {
+          void api.refreshLyraConfig().catch((error) =>
+            console.error("Refresh Lyra config after /setup failed", error),
           );
         }
+        if (fireRelaySteps.has(e.payload.threadId)) {
+          const reason = e.payload.stopReason;
+          const manuallyInterrupted = reason === "cancelled" || reason === "force_cancelled";
+          const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
+          // 只有明确正常收尾才进入判断。网络、进程或模型错误均暂停在当前阶段，
+          // 用户补充提示或发送“继续”后，会从这一阶段恢复完整 Fire 流程。
+          const action = completedNormally
+            ? advanceFireRelay(e.payload.threadId)
+            : suspendFireRelay(e.payload.threadId, manuallyInterrupted);
+          void action.catch((error) => console.error("Fire relay failed", error));
+        }
+        // 通用工作流（/run）与 Fire 互斥：非 Fire 会话才会被其接管。
+        handleWorkflowTurnEnd(e.payload.threadId, e.payload.stopReason);
+        if (pendingHardDesign.has(threadId)) {
+          const reason = e.payload.stopReason;
+          const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
+          if (completedNormally) {
+            void finalizeHardDesign(threadId).catch((error) =>
+              console.error("Hard workflow design failed", error),
+            );
+          }
+        }
+        if (
+          e.payload.threadId === state.currentId &&
+          state.items.some((item) => item.id < 0)
+        ) {
+          // 后台 restore 被取消或自动重发失败：清掉尚未落库的乐观消息。
+          void openThread(e.payload.threadId);
+        }
       }
-      if (
-        e.payload.threadId === state.currentId &&
-        state.items.some((item) => item.id < 0)
-      ) {
-        // 后台 restore 被取消或自动重发失败：清掉尚未落库的乐观消息。
-        void openThread(e.payload.threadId);
-      }
-    }
-  });
+    }),
 
-  await listen<{ threadId: string; text: string }>("fire:start", (e) => {
-    void handleFireStart(e.payload.threadId, e.payload.text).catch((error) =>
-      console.error("Fire start failed", error),
-    );
-  });
-
-  await listen<{ threadId: string; text: string; images?: PromptImage[] }>(
-    "remote-prompt:dispatch",
-    (e) => {
-      void sendPromptTo(e.payload.threadId, e.payload.text, e.payload.images ?? []).catch((error) =>
-        console.error("Remote prompt dispatch failed", error),
+    listen<{ threadId: string; text: string }>("fire:start", (e) => {
+      void handleFireStart(e.payload.threadId, e.payload.text).catch((error) =>
+        console.error("Fire start failed", error),
       );
-    },
-  );
+    }),
 
-  await listen<PermissionRequest>("acp:permission", (e) => {
-    setState("permissions", state.permissions.length, e.payload);
-  });
+    listen<{ threadId: string; text: string; images?: PromptImage[] }>(
+      "remote-prompt:dispatch",
+      (e) => {
+        void sendPromptTo(e.payload.threadId, e.payload.text, e.payload.images ?? []).catch((error) =>
+          console.error("Remote prompt dispatch failed", error),
+        );
+      },
+    ),
 
-  await listen<{ requestKey: string }>("acp:permission-resolved", (e) => {
-    setState(
-      "permissions",
-      state.permissions.filter((p) => p.requestKey !== e.payload.requestKey),
-    );
-  });
+    listen<PermissionRequest>("acp:permission", (e) => {
+      setState("permissions", state.permissions.length, e.payload);
+    }),
 
-  await listen<Status>("acp:status", (e) => {
-    setState({ connected: e.payload.connected, agent: e.payload.agent });
-  });
+    listen<{ requestKey: string }>("acp:permission-resolved", (e) => {
+      setState(
+        "permissions",
+        state.permissions.filter((p) => p.requestKey !== e.payload.requestKey),
+      );
+    }),
 
-  await listen<CommandsEvent>("acp:commands", (e) => {
-    setState("slashCommands", e.payload.agentKind, normalizeSlashCommands(e.payload.commands));
-  });
+    listen<Status>("acp:status", (e) => {
+      setState({ connected: e.payload.connected, agent: e.payload.agent });
+    }),
 
-  // 后端可用性只用于设置页的 CLI 缺失提示；选择器是否展示完全由启用开关决定。
-  await listen<{ availability: Record<string, boolean> }>("backends:availability", (e) => {
-    setState("backendAvailability", reconcile(e.payload.availability ?? {}));
-  });
+    listen<CommandsEvent>("acp:commands", (e) => {
+      setState("slashCommands", e.payload.agentKind, normalizeSlashCommands(e.payload.commands));
+    }),
 
-  await listen<string>("acp:log", (e) => {
-    setState(
-      "logs",
-      produce((logs) => {
-        logs.push(e.payload);
-        if (logs.length > 500) logs.splice(0, logs.length - 500);
-      }),
-    );
-  });
+    // 后端可用性只用于设置页的 CLI 缺失提示；选择器是否展示完全由启用开关决定。
+    listen<{ availability: Record<string, boolean> }>("backends:availability", (e) => {
+      setState("backendAvailability", reconcile(e.payload.availability ?? {}));
+    }),
 
-  // 自动更新：检测 + 静默下载暂存改由后端 tokio 定时器负责（每 10 分钟，不只启动时），
-  // 避免 WebView 计时器在窗口最小化/隐藏时被节流，导致「只有启动才检测、角标不出现」。
-  // 前端只负责响应事件并展示角标。
-  await listen<UpdateProgress>("update:progress", (e) => {
-    setState("updateProgress", e.payload);
-  });
-  // 后端暂存就绪 → 显示左上角「可更新」角标，并填充更新弹窗信息
-  await listen<UpdateInfo>("update:available", (e) => {
-    setState("update", { ...e.payload, staged: true });
-    setState("updateStaging", false);
-  });
-  // 空闲（无会话/无任务）+ 新版本已下载好 → 后端主动请求弹窗，让用户选择是否现在更新
-  await listen<UpdateInfo>("update:prompt", (e) => {
-    setState("update", { ...e.payload, staged: true });
-    setState("updateStaging", false);
-    setState("updatePromptAt", Date.now());
-  });
+    listen<string>("acp:log", (e) => {
+      setState(
+        "logs",
+        produce((logs) => {
+          logs.push(e.payload);
+          if (logs.length > 500) logs.splice(0, logs.length - 500);
+        }),
+      );
+    }),
+
+    // 自动更新：检测 + 静默下载暂存改由后端 tokio 定时器负责（每 10 分钟，不只启动时），
+    // 避免 WebView 计时器在窗口最小化/隐藏时被节流，导致「只有启动才检测、角标不出现」。
+    // 前端只负责响应事件并展示角标。
+    listen<UpdateProgress>("update:progress", (e) => {
+      setState("updateProgress", e.payload);
+    }),
+    // 后端暂存就绪 → 显示左上角「可更新」角标，并填充更新弹窗信息
+    listen<UpdateInfo>("update:available", (e) => {
+      setState("update", { ...e.payload, staged: true });
+      setState("updateStaging", false);
+    }),
+    // 空闲（无会话/无任务）+ 新版本已下载好 → 后端主动请求弹窗，让用户选择是否现在更新
+    listen<UpdateInfo>("update:prompt", (e) => {
+      setState("update", { ...e.payload, staged: true });
+      setState("updateStaging", false);
+      setState("updatePromptAt", Date.now());
+    }),
+
+    listen<{ threadId: string }>("threads:title-generated", (e) => {
+      const id = e.payload.threadId;
+      setState("titleTyping", id, true);
+      window.setTimeout(() => {
+        setState("titleTyping", id, false);
+      }, 3000);
+    }),
+
+    listen("threads:changed", () => {
+      // 标题可能由首条消息生成：直接用列表 meta 同步，不再 getThread 全量拉当前会话
+      // （那会把整段历史 items 走一遍 IPC 序列化，长会话时每轮结束都白搬几 MB）
+      void refreshThreads().then(() => {
+        const id = state.currentId;
+        if (!id) return;
+        const meta = state.threads.find((t) => t.id === id);
+        if (meta && meta.title !== state.title) setState("title", meta.title);
+      });
+      // 项目列表由后端合并会话目录生成，会话增删后同步刷新
+      void refreshProjects();
+    }),
+
+    // worktree 删除等操作导致项目列表变化
+    listen("projects:changed", () => {
+      void refreshProjects();
+    }),
+
+    listen("clues:changed", () => {
+      void refreshClueGroups();
+    }),
+
+    listen<{ cardId: string }>("clues:mention-open", (e) => {
+      openClueCard(e.payload.cardId);
+    }),
+
+    listen<{ cardId: string }>("clues:mentioned", (e) => {
+      const cardId = e.payload.cardId;
+      if (!cardId || state.unreadClueMentions.includes(cardId)) return;
+      setUnreadClueMentions([...state.unreadClueMentions, cardId]);
+    }),
+
+    // 系统通知点击：跳转到对应会话
+    listen<{ threadId: string }>("acp:notify-open", (e) => {
+      void openThread(e.payload.threadId);
+    }),
+
+    // 漫游快照重同步（重连/轮次结束自愈）：用 reconcile 按 id 合并，保留未变条目的
+    // DOM 与滚动位置、思考/工具展开状态，避免整段重渲染导致的闪烁与跳动。
+    listen<{ threadId: string }>("acp:reload", (e) => {
+      const id = e.payload.threadId;
+      if (state.currentId !== id) return;
+      void api.getThread(id).then((t) => {
+        if (state.currentId !== id) return;
+        flushPendingStreamUpdates();
+        setState("items", reconcile(t.items, { key: "id" }));
+        setState({
+          plan: (t.plan as PlanEntry[] | null) ?? null,
+          title: t.title,
+        });
+      });
+    }),
+
+    // 团队/漫游中转站事件
+    listen<RelayStatus>("relay:status", (e) => {
+      setState("relay", e.payload);
+      if (e.payload.connected) {
+        void refreshInbox();
+        void refreshWorkflowInbox();
+        // 重连后强制校准：离线期间对端可能已调整共享模型，旧 peerModels 不能继续复用。
+        preloadPeerModels(true);
+      }
+    }),
+    listen<{ peers: Peer[] } | Peer[]>("relay:peers", (e) => {
+      setState("peers", normalizePeers(e.payload));
+      // 名单变化（有人上线/重连）即强制刷新，避免继续复用该成员断线前的旧模型列表。
+      preloadPeerModels(true);
+    }),
+    // 漫游：对端回传其可选模型/模式，按 token 缓存供选择器使用
+    listen<{
+      peer: string;
+      backends: AgentKind[];
+      options: PeerModels["options"];
+      sharedOptions: PeerModels["sharedOptions"];
+    }>(
+      "relay:peer-models",
+      (e) => {
+        const { peer, backends, options, sharedOptions } = e.payload;
+        if (!peer) return;
+        setState("peerModels", peer, {
+          backends: Array.isArray(backends) ? backends : [],
+          options: options ?? {},
+          sharedOptions: sharedOptions ?? {},
+        });
+      },
+    ),
+    // 漫游：对端回传某目录的本地分支列表，按「token+目录」缓存供 worktree 下拉使用
+    listen<{ peer: string; folder: string; current: string; branches: string[] }>(
+      "relay:peer-branches",
+      (e) => {
+        const { peer, folder, current, branches } = e.payload;
+        if (!peer) return;
+        setState("peerBranches", peerBranchKey(peer, folder), {
+          current: current ?? "",
+          branches: Array.isArray(branches) ? branches : [],
+        });
+      },
+    ),
+    listen<IncomingShare[]>("relay:inbox", (e) => {
+      // 漫游召回的快照到达时自动弹出收件箱，用户直接选项目接收
+      const known = new Set(state.inbox.map((s) => s.id));
+      const hasNewRecall = e.payload.some((s) => s.recall && !known.has(s.id));
+      setState("inbox", e.payload);
+      if (hasNewRecall) setState("inboxPromptAt", Date.now());
+    }),
+    // 队友分享的工作流到达：进入工作流收件箱，在「工作流」页接收
+    listen<IncomingWorkflowShare[]>("relay:workflow-inbox", (e) => {
+      setState("workflowInbox", e.payload);
+    }),
+    // 本地 worktree 后台创建就绪：切到 worktree 的 cwd 已由后端回写，这里补发暂存的首条提示词
+    listen<{ threadId: string }>("acp:worktree-ready", (e) => {
+      const id = e.payload.threadId;
+      void refreshThreads();
+      if (state.currentId === id) {
+        void api.getThread(id).then((t) => {
+          if (state.currentId === id) setState("cwd", t.cwd);
+        });
+      }
+      flushWorktreePrompt(id);
+    }),
+    // 本地 worktree 后台创建失败：丢弃暂存提示词（会话里已有错误系统消息）
+    listen<{ threadId: string; error?: string }>("acp:worktree-failed", (e) => {
+      pendingWorktreePrompts.delete(e.payload.threadId);
+      // 首页发起时占位到室女座的会话，worktree 没建起来就没后续轮次事件了，在这里收回。
+      zenUnhold(e.payload.threadId);
+      void refreshThreads();
+    }),
+    // host 侧：收到漫游请求，入队等本机用户在弹框里确认
+    listen<IncomingRoamRequest>("relay:roam-request", (e) => {
+      setState("incomingRoams", (prev) => [
+        ...prev.filter((r) => r.reqId !== e.payload.reqId),
+        e.payload,
+      ]);
+    }),
+    listen<QuotaRoamingProgress>("relay:quota-progress", (e) => {
+      setState("quotaRoamingProgress", e.payload);
+    }),
+  ]);
   // 启动即反映「已暂存好」的更新，让角标立刻出现（新版本的下载交给后端静默处理）
   void api
     .checkUpdate()
@@ -3475,152 +3623,6 @@ export async function initStore() {
     .catch(() => {
       // 网络不可用等场景静默失败，后端定时器会按周期重试
     });
-
-  await listen<{ threadId: string }>("threads:title-generated", (e) => {
-    const id = e.payload.threadId;
-    setState("titleTyping", id, true);
-    window.setTimeout(() => {
-      setState("titleTyping", id, false);
-    }, 3000);
-  });
-
-  await listen("threads:changed", () => {
-    // 标题可能由首条消息生成：直接用列表 meta 同步，不再 getThread 全量拉当前会话
-    // （那会把整段历史 items 走一遍 IPC 序列化，长会话时每轮结束都白搬几 MB）
-    void refreshThreads().then(() => {
-      const id = state.currentId;
-      if (!id) return;
-      const meta = state.threads.find((t) => t.id === id);
-      if (meta && meta.title !== state.title) setState("title", meta.title);
-    });
-    // 项目列表由后端合并会话目录生成，会话增删后同步刷新
-    void refreshProjects();
-  });
-
-  // worktree 删除等操作导致项目列表变化
-  await listen("projects:changed", () => {
-    void refreshProjects();
-  });
-
-  await listen("clues:changed", () => {
-    void refreshClueGroups();
-  });
-
-  await listen<{ cardId: string }>("clues:mention-open", (e) => {
-    openClueCard(e.payload.cardId);
-  });
-
-  await listen<{ cardId: string }>("clues:mentioned", (e) => {
-    const cardId = e.payload.cardId;
-    if (!cardId || state.unreadClueMentions.includes(cardId)) return;
-    setUnreadClueMentions([...state.unreadClueMentions, cardId]);
-  });
-
-  // 系统通知点击：跳转到对应会话
-  await listen<{ threadId: string }>("acp:notify-open", (e) => {
-    void openThread(e.payload.threadId);
-  });
-
-  // 漫游快照重同步（重连/轮次结束自愈）：用 reconcile 按 id 合并，保留未变条目的
-  // DOM 与滚动位置、思考/工具展开状态，避免整段重渲染导致的闪烁与跳动。
-  await listen<{ threadId: string }>("acp:reload", (e) => {
-    const id = e.payload.threadId;
-    if (state.currentId !== id) return;
-    void api.getThread(id).then((t) => {
-      if (state.currentId !== id) return;
-      flushPendingStreamUpdates();
-      setState("items", reconcile(t.items, { key: "id" }));
-      setState({
-        plan: (t.plan as PlanEntry[] | null) ?? null,
-        title: t.title,
-      });
-    });
-  });
-
-  // 团队/漫游中转站事件
-  await listen<RelayStatus>("relay:status", (e) => {
-    setState("relay", e.payload);
-    if (e.payload.connected) {
-      void refreshInbox();
-      void refreshWorkflowInbox();
-      // 重连后强制校准：离线期间对端可能已调整共享模型，旧 peerModels 不能继续复用。
-      preloadPeerModels(true);
-    }
-  });
-  await listen<{ peers: Peer[] } | Peer[]>("relay:peers", (e) => {
-    setState("peers", normalizePeers(e.payload));
-    // 名单变化（有人上线/重连）即强制刷新，避免继续复用该成员断线前的旧模型列表。
-    preloadPeerModels(true);
-  });
-  // 漫游：对端回传其可选模型/模式，按 token 缓存供选择器使用
-  await listen<{
-    peer: string;
-    backends: AgentKind[];
-    options: PeerModels["options"];
-    sharedOptions: PeerModels["sharedOptions"];
-  }>(
-    "relay:peer-models",
-    (e) => {
-      const { peer, backends, options, sharedOptions } = e.payload;
-      if (!peer) return;
-      setState("peerModels", peer, {
-        backends: Array.isArray(backends) ? backends : [],
-        options: options ?? {},
-        sharedOptions: sharedOptions ?? {},
-      });
-    },
-  );
-  // 漫游：对端回传某目录的本地分支列表，按「token+目录」缓存供 worktree 下拉使用
-  await listen<{ peer: string; folder: string; current: string; branches: string[] }>(
-    "relay:peer-branches",
-    (e) => {
-      const { peer, folder, current, branches } = e.payload;
-      if (!peer) return;
-      setState("peerBranches", peerBranchKey(peer, folder), {
-        current: current ?? "",
-        branches: Array.isArray(branches) ? branches : [],
-      });
-    },
-  );
-  await listen<IncomingShare[]>("relay:inbox", (e) => {
-    // 漫游召回的快照到达时自动弹出收件箱，用户直接选项目接收
-    const known = new Set(state.inbox.map((s) => s.id));
-    const hasNewRecall = e.payload.some((s) => s.recall && !known.has(s.id));
-    setState("inbox", e.payload);
-    if (hasNewRecall) setState("inboxPromptAt", Date.now());
-  });
-  // 队友分享的工作流到达：进入工作流收件箱，在「工作流」页接收
-  await listen<IncomingWorkflowShare[]>("relay:workflow-inbox", (e) => {
-    setState("workflowInbox", e.payload);
-  });
-  // 本地 worktree 后台创建就绪：切到 worktree 的 cwd 已由后端回写，这里补发暂存的首条提示词
-  await listen<{ threadId: string }>("acp:worktree-ready", (e) => {
-    const id = e.payload.threadId;
-    void refreshThreads();
-    if (state.currentId === id) {
-      void api.getThread(id).then((t) => {
-        if (state.currentId === id) setState("cwd", t.cwd);
-      });
-    }
-    flushWorktreePrompt(id);
-  });
-  // 本地 worktree 后台创建失败：丢弃暂存提示词（会话里已有错误系统消息）
-  await listen<{ threadId: string; error?: string }>("acp:worktree-failed", (e) => {
-    pendingWorktreePrompts.delete(e.payload.threadId);
-    // 首页发起时占位到室女座的会话，worktree 没建起来就没后续轮次事件了，在这里收回。
-    zenUnhold(e.payload.threadId);
-    void refreshThreads();
-  });
-  // host 侧：收到漫游请求，入队等本机用户在弹框里确认
-  await listen<IncomingRoamRequest>("relay:roam-request", (e) => {
-    setState("incomingRoams", (prev) => [
-      ...prev.filter((r) => r.reqId !== e.payload.reqId),
-      e.payload,
-    ]);
-  });
-  await listen<QuotaRoamingProgress>("relay:quota-progress", (e) => {
-    setState("quotaRoamingProgress", e.payload);
-  });
 
   // settingsReady 在 initStore 开头已经启动并会尽快 setState；这里 await 只是拿到值供后续
   // 主题迁移、团队刷新、模型预拉等初始化步骤继续使用。
