@@ -606,6 +606,58 @@ struct SteerTurnState {
     deferred_finish: Option<(String, Option<Value>)>,
 }
 
+// CodeBuddy 的 usage 通知是单次模型消息快照；重复通知覆盖，同轮多次模型调用累加。
+#[derive(Default)]
+struct CodeBuddyTurnUsage {
+    messages: HashMap<String, (u64, u64)>,
+}
+
+#[test]
+fn codebuddy_turn_usage_deduplicates_model_messages() {
+    let mut usage = CodeBuddyTurnUsage::default();
+    assert!(CodeBuddyTurnUsage::default().finish().is_none());
+    let update = json!({"used": 25310, "_meta": {
+        "codebuddy.ai/messageId": "message-1",
+        "usage": {"prompt_tokens": 25310, "completion_tokens": 211, "total_tokens": 25521}
+    }});
+    usage.update(&update);
+    usage.update(&update);
+    // 后续上下文通知和无效计数不会抹掉/伪造输出统计。
+    usage.update(&json!({"used": 26000, "_meta": {"codebuddy.ai/messageId": "message-1"}}));
+    usage.update(&json!({"_meta": {"codebuddy.ai/messageId": "bad", "usage": {
+        "prompt_tokens": 100, "completion_tokens": -1
+    }}}));
+    let mut next = update.clone();
+    next["_meta"]["codebuddy.ai/messageId"] = json!("message-2");
+    next["_meta"]["usage"]["completion_tokens"] = json!(229);
+    usage.update(&next);
+    let mut thread = Thread::new(String::new(), AgentKind::CodeBuddy, None, None, None, false);
+    let turn = serde_json::to_value(thread.push_turn(22_000, usage.finish().as_ref(), "end_turn")).unwrap();
+    assert_eq!(turn["outputTokens"], 440);
+    assert_eq!(turn["totalTokens"], 51060);
+    assert_eq!(turn["durationMs"], 22_000);
+}
+
+impl CodeBuddyTurnUsage {
+    fn update(&mut self, update: &Value) {
+        let Some(meta) = update.get("_meta") else { return };
+        let Some(id) = meta.get("codebuddy.ai/messageId").and_then(Value::as_str).filter(|id| !id.is_empty()) else { return };
+        let Some(usage) = meta.get("usage") else { return };
+        // used 是上下文占用量，不能当成输出 token；缺少完整计数的通知不覆盖已有快照。
+        let Some(input) = usage.get("prompt_tokens").and_then(Value::as_u64) else { return };
+        let Some(output) = usage.get("completion_tokens").and_then(Value::as_u64) else { return };
+        self.messages.insert(id.to_string(), (input, output));
+    }
+
+    fn finish(self) -> Option<Value> {
+        if self.messages.is_empty() { return None; }
+        let (input, output) = self.messages.values().fold((0u64, 0u64), |(input, output), (i, o)| {
+            (input.saturating_add(*i), output.saturating_add(*o))
+        });
+        Some(json!({ "inputTokens": input, "outputTokens": output, "totalTokens": input.saturating_add(output) }))
+    }
+}
+
 pub struct AcpManager {
     pub app: AppHandle,
     /// 保留 agent 类型供现有路由和事件载荷使用；ACP 实现仅支持 Devin。
@@ -631,6 +683,7 @@ pub struct AcpManager {
     steer_turns: StdMutex<HashMap<String, SteerTurnState>>,
     /// 轮次开始时间，用于结束时计算耗时
     turn_started: StdMutex<HashMap<String, std::time::Instant>>,
+    codebuddy_turn_usage: StdMutex<HashMap<String, CodeBuddyTurnUsage>>,
     /// 诊断：session/prompt 发出时刻 → 用于测量「首响应延迟」(session_id)
     prompt_sent_at: StdMutex<HashMap<String, std::time::Instant>>,
     pending_permissions: StdMutex<HashMap<String, PendingPermission>>,
@@ -673,6 +726,7 @@ impl AcpManager {
             running_threads: StdMutex::new(HashSet::new()),
             steer_turns: StdMutex::new(HashMap::new()),
             turn_started: StdMutex::new(HashMap::new()),
+            codebuddy_turn_usage: StdMutex::new(HashMap::new()),
             prompt_sent_at: StdMutex::new(HashMap::new()),
             pending_permissions: StdMutex::new(HashMap::new()),
             thread_locks: StdMutex::new(HashMap::new()),
@@ -1791,6 +1845,11 @@ impl AcpManager {
             };
 
             match kind {
+                "usage_update" if self.kind == AgentKind::CodeBuddy => {
+                    if let Some(usage) = self.codebuddy_turn_usage.lock().unwrap().get_mut(&thread_id) {
+                        usage.update(update);
+                    }
+                }
                 "agent_message_chunk" | "agent_thought_chunk" => {
                     for item in complete_pending_tools(thread, None) {
                         self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
@@ -1995,6 +2054,14 @@ impl AcpManager {
     }
 
     fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<String>) {
+        if self.kind == AgentKind::CodeBuddy {
+            let mut usage = self.codebuddy_turn_usage.lock().unwrap();
+            if running {
+                usage.insert(thread_id.to_string(), CodeBuddyTurnUsage::default());
+            } else {
+                usage.remove(thread_id);
+            }
+        }
         self.app
             .state::<AppState>()
             .sleep_inhibitor
@@ -2019,6 +2086,8 @@ impl AcpManager {
 
     /// 轮次收尾：写入 turn item（耗时 + token 用量）并结束 running 状态
     fn finish_turn(&self, thread_id: &str, stop_reason: String, usage: Option<Value>) {
+        let usage = self.codebuddy_turn_usage.lock().unwrap().remove(thread_id)
+            .and_then(CodeBuddyTurnUsage::finish).or(usage);
         self.steer_turns.lock().unwrap().remove(thread_id);
         let duration_ms = self
             .turn_started
@@ -2939,6 +3008,11 @@ impl AcpManager {
         text: String,
         images: Vec<PromptImage>,
     ) {
+        // 漫游和额度入口也会直接调用 run_prompt；追加消息统一走 CodeBuddy 原生引导。
+        if self.kind == AgentKind::CodeBuddy && self.is_running(&thread_id) {
+            Box::pin(self.steer_prompt(thread_id, text, images)).await;
+            return;
+        }
         // 新会话的 Paper Trail / 跨 agent 接力上下文，在真实用户输入前隐式注入。
         let handoff = {
             let state = self.app.state::<AppState>();
@@ -3223,7 +3297,7 @@ impl AcpManager {
         prompt
     }
 
-    /// 运行中追加提示（引导）：向当前活跃 session 直接注入新的 session/prompt。
+    /// 运行中追加提示：CodeBuddy 使用 session/steer，Devin 使用并发 session/prompt。
     /// devin 会把它合并进当前轮次（实测：注入请求与主请求在轮次结束时返回同一结果），
     /// 因此这里只落库用户消息并发出请求，轮次收尾仍由主 drive 负责。
     pub async fn steer_prompt(
@@ -3325,29 +3399,45 @@ impl AcpManager {
             text
         };
         let prompt = Self::build_prompt_blocks(&text, &images);
+        let codebuddy = self.kind == AgentKind::CodeBuddy;
         let mgr = self.clone();
         let tid = thread_id.clone();
-        // 该请求要到轮次结束才返回（与主 prompt 一同返回），结果由主 drive 收尾，这里只记录失败
+        // Devin 随主 prompt 返回；CodeBuddy 立即确认注入，当前轮仍由主 drive 收尾。
         tauri::async_runtime::spawn(async move {
             let result = conn
                 .request(
-                    "session/prompt",
-                    json!({ "sessionId": session_id, "prompt": prompt }),
+                    if codebuddy { "session/steer" } else { "session/prompt" },
+                    if codebuddy {
+                        json!({ "sessionId": session_id, "contentBlocks": prompt })
+                    } else {
+                        json!({ "sessionId": session_id, "prompt": prompt })
+                    },
                     None,
                 )
-                .await;
+                .await
+                .and_then(|result| {
+                    if codebuddy && result.get("steered").and_then(Value::as_bool) != Some(true) {
+                        Err(format!("CodeBuddy 未接受引导：{}", result.get("reason").and_then(Value::as_str).unwrap_or("unknown")))
+                    } else {
+                        Ok(result)
+                    }
+                });
             // 必须先释放引导占位；若主请求已经返回，这一步会完成被延后的轮次收尾。
             mgr.complete_steer(&tid);
             if let Err(e) = result {
                 mgr.push_log(format!("[nova] 引导消息发送失败 {tid}: {e}"));
                 // 注入随轮次一起夭折（如注入后用户立刻停止/连接被杀）：轮次已结束的话，
                 // 这条消息不会再有任何回应，明确提示用户重发，避免看起来「发出去但没反应」。
-                if !mgr.is_running(&tid) {
+                if codebuddy || !mgr.is_running(&tid) {
                     let state = mgr.app.state::<AppState>();
                     let mut store = state.store.lock().unwrap();
                     if let Some(thread) = store.get_mut(&tid) {
                         let item = thread.push_system(
-                            "上一条消息随已停止的任务一起中断了，未被处理，请重新发送。".into(),
+                            if codebuddy {
+                                format!("引导失败：{e}。请重新发送；若接口不受支持，请升级 CodeBuddy CLI。")
+                            } else {
+                                "上一条消息随已停止的任务一起中断了，未被处理，请重新发送。".into()
+                            },
                             "warn",
                         );
                         store.save_thread(&tid);
