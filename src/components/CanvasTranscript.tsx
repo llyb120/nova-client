@@ -6,6 +6,7 @@ import {
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { api } from "../ipc";
+import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
@@ -459,7 +460,7 @@ interface MdTableCell {
 }
 
 interface MdBlock {
-  type: "paragraph" | "heading" | "code" | "list-item" | "blockquote" | "hr" | "table";
+  type: "paragraph" | "heading" | "code" | "list-item" | "blockquote" | "hr" | "table" | "image";
   segments: TextSegment[];
   level?: number;
   lang?: string;
@@ -534,6 +535,12 @@ function parseMarkdownBlocks(md: string): MdBlock[] {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
+    const image = line.trim().match(/^!\[([^\]]*)\]\((?:<([^>]+)>|([^\s]+))\)$/);
+    if (image) {
+      blocks.push({ type: "image", raw: image[2] ?? image[3], segments: [{ text: image[1] || "生成图片" }] });
+      i++;
+      continue;
+    }
     // Be lenient with model-generated indentation. CommonMark only allows up to
     // three leading spaces, but treating deeper-indented fences as prose leaves
     // literal backticks and turns the text between them into inline code.
@@ -608,7 +615,7 @@ function parseMarkdownBlocks(md: string): MdBlock[] {
       const l = lines[i];
       if (/^\s*$/.test(l) || /^\s*(`{3,}|~{3,})/.test(l) || /^(#{1,6})\s+/.test(l) || /^>\s?/.test(l)
         || /^\s*[-*+]\s+/.test(l) || /^\s*\d+[.)]\s+/.test(l) || /^\s*([-*_])\1{2,}\s*$/.test(l)
-        || isTableStart(lines, i)) break;
+        || /^\s*!\[[^\]]*\]\(/.test(l) || isTableStart(lines, i)) break;
       buf.push(l); i++;
     }
     blocks.push({ type: "paragraph", segments: tokenizeInline(buf.join("\n")) });
@@ -1662,7 +1669,20 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const mdBlocks = parseMarkdownBlocks(text);
       for (let mi = 0; mi < mdBlocks.length; mi++) {
         const mb = mdBlocks[mi];
-        if (mb.type === "hr") {
+        if (mb.type === "image") {
+          const src = transcriptImageSrc(mb.raw ?? "");
+          const path = localImagePath(mb.raw ?? "");
+          if (src) {
+            loadImageSource(src);
+            result.push({ kind: "generated-image", id: item.id, groupIdx: gi,
+              x, y, w: Math.min(proseW, 480), h: 300, title: segmentsPlainText(mb.segments),
+              data: { src, filePath: path }, cursor: path ? "pointer" : undefined,
+              clickAction: path ? () => {
+                if (props.threadId) void api.openFileDefault(props.threadId, path).catch((e) => void message(String(e), { kind: "error" }));
+              } : undefined });
+            y += 310;
+          }
+        } else if (mb.type === "hr") {
           result.push({ kind: "md-hr", id: item.id, groupIdx: gi,
             x, y, w: proseW, h: 25 });
           y += 25;
@@ -2023,6 +2043,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           if (b.data?.busy) busyBlockIndices.push(i);
           paintToolHeader(ctx, b, bx, by, p);
           break;
+        case "generated-image": {
+          const image = loadImageSource(String(b.data?.src ?? ""));
+          if (image) {
+            const scale = Math.min(b.w / image.naturalWidth, b.h / image.naturalHeight, 1);
+            ctx.drawImage(image, bx, by, image.naturalWidth * scale, image.naturalHeight * scale);
+          } else {
+            ctx.font = `14px ${p.sans}`;
+            ctx.fillStyle = p.dim;
+            ctx.fillText("图片加载中或文件不可用，点击打开原图", bx, by + 24);
+          }
+          break;
+        }
         case "md-paragraph":
         case "md-heading":
         case "md-list-item":
@@ -3336,7 +3368,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   // ─── Image loading ─────────────────────────────────────────────────────────
 
   function loadImage(img: PromptImage): HTMLImageElement | null {
-    const src = promptImageSrc(img);
+    return loadImageSource(promptImageSrc(img));
+  }
+
+  function loadImageSource(src: string): HTMLImageElement | null {
     let el = imgCache.get(src);
     if (el) return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
     el = new Image();

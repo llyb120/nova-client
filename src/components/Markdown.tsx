@@ -4,10 +4,20 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createSignal, onCleanup, untrack } from "solid-js";
 import { api } from "../ipc";
 import { state } from "../store";
+import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { createFileContextMenu } from "./FileContextMenu";
 
 marked.setOptions({ gfm: true, breaks: true });
+marked.use({ renderer: {
+  image({ href, text }) {
+    const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const src = transcriptImageSrc(href);
+    if (!src) return escape(text);
+    const path = localImagePath(href);
+    return `<img src="${escape(src)}" alt="${escape(text || "生成图片")}"${path ? ` data-image-path="${escape(path)}" title="点击打开原图"` : ""} style="display:block;max-width:100%;max-height:360px;object-fit:contain" />`;
+  },
+} });
 
 // 流式输出时 props.text 持续增长，若每个 delta 都重新 parse 整段 Markdown 并替换
 // 整棵 innerHTML，长消息会明显卡顿（开销随长度增长）。三层优化：
@@ -299,13 +309,19 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   });
 
   const onContextMenu = (e: MouseEvent) => {
-    const file = (e.target as HTMLElement).closest<HTMLButtonElement>(".md-file-ref");
-    const path = file?.dataset.path;
+    const target = e.target as HTMLElement;
+    const path = target.closest<HTMLImageElement>("img[data-image-path]")?.dataset.imagePath
+      ?? target.closest<HTMLButtonElement>(".md-file-ref")?.dataset.path;
     if (path) fileMenu.open(e, path);
   };
 
   const onClick = (e: MouseEvent) => {
     const target = e.target as HTMLElement;
+    const imagePath = target.closest<HTMLImageElement>("img[data-image-path]")?.dataset.imagePath;
+    if (imagePath && state.currentId) {
+      void api.openFileDefault(state.currentId, imagePath).catch((err) => void message(String(err), { kind: "error" }));
+      return;
+    }
     const btn = target.closest<HTMLButtonElement>(".code-copy");
     if (btn) {
       const pre = btn.parentElement?.querySelector("pre");

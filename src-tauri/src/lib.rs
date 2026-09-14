@@ -13,6 +13,7 @@ mod credential_roaming;
 mod experience;
 mod gitwt;
 mod http_stream;
+pub mod image_generation;
 mod lyra;
 mod lyra_complete;
 mod model_cache;
@@ -5979,6 +5980,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            image_generation::image_command_context,
             list_threads,
             load_threads,
             get_thread,

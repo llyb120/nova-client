@@ -2,7 +2,7 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createSignal, onCleanup, Show } from "solid-js";
 import { api } from "../ipc";
 import { state } from "../store";
-import { IconFolder } from "./icons";
+import { IconCopy, IconFolder } from "./icons";
 
 type FileMenu = { x: number; y: number; path: string };
 
@@ -36,7 +36,7 @@ export function createFileContextMenu() {
     e.stopPropagation();
     setMenu({
       x: Math.min(e.clientX, window.innerWidth - 190),
-      y: Math.min(e.clientY, window.innerHeight - 48),
+      y: Math.max(0, Math.min(e.clientY, window.innerHeight - 84)),
       path: absolutePath(path),
     });
   };
@@ -54,6 +54,17 @@ export function createFileContextMenu() {
         >
           <IconFolder size={13} />
           打开所在目录
+        </button>
+        <button
+          class="ctx-item"
+          onClick={() => {
+            const path = menu()!.path;
+            closeMenu();
+            void navigator.clipboard.writeText(path).catch((e) => void message(String(e), { kind: "error" }));
+          }}
+        >
+          <IconCopy size={13} />
+          复制文件地址
         </button>
       </div>
     </Show>

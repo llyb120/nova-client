@@ -24,7 +24,19 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "**/*.[pP][nN][gG]",
+          "**/*.[jJ][pP][gG]",
+          "**/*.[jJ][pP][eE][gG]",
+          "**/*.[wW][eE][bB][pP]",
+          "**/*.[gG][iI][fF]",
+          "**/*.[bB][mM][pP]",
+          "**/*.[sS][vV][gG]"
+        ]
+      }
     }
   },
   "bundle": {

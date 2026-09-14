@@ -4,6 +4,7 @@ import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { LruMap } from "./lruMap";
 import { api } from "./ipc";
+import { rememberPromptDraft } from "./promptDraft";
 import type {
   Achievement,
   AgentKind,
@@ -66,7 +67,7 @@ import {
 import { latestFireStage } from "./threadDisplay";
 import { normalizeGeneratedWorkflow } from "./workflow/types";
 import { initRoamingWorkflows, setPeerWorkflows } from "./workflow/roaming";
-import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
+import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt, buildSetupImagePrompt, buildGenerateImagePrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
@@ -1783,6 +1784,7 @@ export function createThreadOptimistic(
     bumpChatScrollToBottom();
   }
   void (async () => {
+    let createdId: string | null = null;
     try {
       const t = await api.createThread(
         cwd,
@@ -1797,6 +1799,7 @@ export function createThreadOptimistic(
         clueCardId || null,
         null,
       );
+      createdId = t.id;
       rememberThreadSnapshot(t);
       const storedAgentKind = t.agentKind ?? agentKind;
       lastUsed.setMode(storedAgentKind, t.mode ?? "");
@@ -1830,14 +1833,17 @@ export function createThreadOptimistic(
       void refreshProjects();
       void ensureModelOptions(storedAgentKind);
     } catch (error) {
-      if (state.currentId === pendingId) {
-        setState("items", (items) => items.filter((item) => item.id >= 0));
+      if (createdId) {
+        setState("running", createdId, false);
+        optimisticRunningThreads.delete(createdId);
+      }
+      if (state.currentId === pendingId || (createdId && state.currentId === createdId)) {
+        rememberPromptDraft(text, images);
+        setState("items", []);
         setState("currentId", null);
         setView("home");
-      } else if (zenModeOn()) {
-        // 减少焦虑下用户只看到气泡飞走，创建失败必须显式告知，否则提示词静默丢失。
-        showToast("会话创建失败，请重试");
       }
+      showToast(`${createdId ? "消息发送失败" : "会话创建失败"}：${String(error)}`);
       console.error("optimistic create_thread failed", error);
     }
   })();
@@ -2201,6 +2207,14 @@ async function tryBuiltinPrompt(
   images: PromptImage[],
 ): Promise<boolean> {
   const builtInInput = text.trim();
+  if (/^\/(?:setup-image|generate-image)(?:\s|$)/i.test(builtInInput)) {
+    assertBuiltinPrompt(text, images);
+    const setup = /^\/setup-image(?:\s|$)/i.test(builtInInput);
+    const goal = builtInInput.replace(/^\/(?:setup-image|generate-image)\s*/i, "").trim();
+    const context = await api.imageCommandContext(!setup);
+    await deliverPrompt(threadId, setup ? buildSetupImagePrompt(goal, context.configPath) : buildGenerateImagePrompt(goal, context), []);
+    return true;
+  }
   const stage = parseStageInput(builtInInput);
   if (stage) {
     if (images.length > 0) throw new Error("/stage 暂不支持附件");
@@ -2304,6 +2318,11 @@ function parseRunInput(input: string): { workflowId: string; vars: Record<string
 /** 创建会话 / 暂存前提前校验内置命令，避免 worktree 建完才发现 /fire 非法。 */
 export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   const builtInInput = text.trim();
+  if (/^\/(?:setup-image|generate-image)(?:\s|$)/i.test(builtInInput)) {
+    if (images.length > 0) throw new Error("图片指令暂不支持参考图附件");
+    if (/^\/generate-image\s*$/i.test(builtInInput)) throw new Error("请在 /generate-image 后输入图片描述");
+    return;
+  }
   const stage = parseStageInput(builtInInput);
   if (stage) {
     if (images.length > 0) throw new Error("/stage 暂不支持附件");

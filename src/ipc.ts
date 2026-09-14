@@ -44,6 +44,7 @@ function fileUriPath(uri: string) {
 }
 
 export const api = {
+  imageCommandContext: (configured: boolean) => invoke<{ configPath: string; executable: string; models: string[] }>("image_command_context", { configured }),
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
   loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),
   getThread: (threadId: string) => invoke<Thread>("get_thread", { threadId }),

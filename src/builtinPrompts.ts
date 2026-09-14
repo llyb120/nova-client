@@ -17,6 +17,29 @@ export function buildPlanPrompt(goal: string): string {
 ${goal}`;
 }
 
+export function buildSetupImagePrompt(goal: string, configPath: string): string {
+  return `为 Nova 配置独立图片服务，供所有聊天后端的 /generate-image 使用。
+配置文件：${JSON.stringify(configPath)}
+格式为严格 JSON：{ "baseURL": "https://服务地址/v1", "apiKey": "API Token", "models": ["图片模型 ID", "另一图片模型 ID"] }。
+先检查配置文件是否存在，保留已有配置。根据用户要求配置地址、Token 和可选图片模型数组；缺失信息向用户询问，不猜测。使用 OpenAI 兼容的 POST /images/generations 接口，需支持 PNG 和 data[].b64_json 返回；baseURL 不包含 /images/generations 后缀。不要修改 Lyra 或其他聊天后端配置。
+Token 只写入配置文件，不在回复、日志或示例命令中回显；验证已有配置时只输出是否存在 Token。不要为验证配置自动发起收费生图请求。
+配置保存后立即对后续 /generate-image 生效，无需重启。
+用户要求：${goal || "配置图片 API 地址、Token 和可选模型"}`;
+}
+
+export function buildGenerateImagePrompt(goal: string, context: { configPath: string; executable: string; models: string[] }): string {
+  return `使用 Nova 的通用生图命令完成以下任务，不依赖当前后端是否有内置生图工具。
+目标：${goal}
+可选图片模型（按配置顺序）：${JSON.stringify(context.models)}
+用户指定模型时优先选择它；否则按已知能力和用户的画质、速度、成本要求选择。不确定模型差异时使用列表第一项，不臆测能力或价格，不能选择列表之外的模型。
+将主体、构图、风格、文字等要求整理成 prompt。使用文件写入工具创建一个临时 UTF-8 JSON 请求文件（无 BOM）：{ "prompt": "完整图片提示词", "model": "所选模型 ID", "size": "auto", "outputDir": "当前工作目录的绝对路径" }。size 可选 auto、1024x1024、1024x1536、1536x1024。每次生成一张新 PNG，不支持参考图编辑。
+可执行文件路径：${JSON.stringify(context.executable)}
+配置路径：${JSON.stringify(context.configPath)}
+用命令行工具执行上述可执行文件，依次传入三个独立参数：__generate_image、配置文件路径、请求文件路径。按当前 shell 正确引用路径，提示词不得直接拼入命令。PowerShell 用 & 调用并将输出管道传给 Out-String，以等待 GUI 子系统程序结束。执行超时设为至少 600 秒；若返回运行中句柄，继续等待，不要重复发起生图。
+Nova 会自行读取 Token，不要读取、输出或复制配置文件中的 Token，不需要 OPENAI_API_KEY。
+只有命令成功返回 JSON 的 path 后才表示图片生成完成。最终回复用独立一行 ![生成图片](<返回的绝对路径>) 展示图片，保留尖括号以支持空格路径。失败时说明原因，不自动反复重试。未配置服务时提示用户使用 /setup-image。`;
+}
+
 /**
  * 展开 `/easy <目标>`：用于目标明确、改法直接的小改动。
  * 这是一次性提示词约束，不改变会话模式，也不把 `/easy` 交给后端解析。
