@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   createNovaBatchTools,
   normalizePolarisArgs,
@@ -78,4 +81,51 @@ test("devin policy routes context through MCP when the native service exists", (
   assert.match(policy, /mcp_call_tool/);
   assert.match(policy, /polaris/);
   assert.match(policy, /Devin native edit tools/);
+});
+
+test("directory switching is session scoped, works without polaris, and updates its root only on success", async () => {
+  const endpoint = process.platform === "win32"
+    ? `\\\\.\\pipe\\nova-cwd-test-${process.pid}`
+    : join(tmpdir(), `nova-cwd-test-${process.pid}.sock`);
+  const previous = { ...process.env };
+  const calls = [];
+  const target = resolve("new project");
+  const server = createServer((socket) => {
+    let line = "";
+    socket.on("data", (chunk) => {
+      line += chunk;
+      if (!line.includes("\n")) return;
+      const request = JSON.parse(line.trim());
+      calls.push(request);
+      const rejected = request.params.path === "missing";
+      socket.end(JSON.stringify(rejected
+        ? { ok: false, error: "directory missing" }
+        : { ok: true, result: request.method === "polaris" ? "context" : { cwd: target, changed: true } }) + "\n");
+    });
+  });
+  try {
+    await new Promise((done, reject) => { server.once("error", reject); server.listen(endpoint, done); });
+    process.env.NOVA_CONTEXT_SERVICE_ENDPOINT = endpoint;
+    process.env.NOVA_CONTEXT_SERVICE_TOKEN = "secret";
+    delete process.env.NOVA_CWD_CHANGE_SCOPE;
+    assert.equal(createNovaBatchTools(process.cwd()).change_working_directory, undefined);
+    process.env.NOVA_CWD_CHANGE_SCOPE = "session-A";
+    const tools = createNovaBatchTools(process.cwd(), { fastContext: true });
+    assert(createNovaBatchTools(process.cwd(), { fastContext: false }).change_working_directory);
+    await assert.rejects(tools.change_working_directory.execute({ path: " " }), /缺少 path/);
+    assert.equal(calls.length, 0);
+    await assert.rejects(tools.change_working_directory.execute({ path: "missing" }), /directory missing/);
+    await tools.polaris.execute({ query: "Widget" });
+    assert.equal(calls.at(-1).root, process.cwd());
+    await tools.change_working_directory.execute({ path: "../new project" });
+    assert.deepEqual(calls.at(-1).params, { scope: "session-A", path: "../new project" });
+    await tools.polaris.execute({ query: "Widget" });
+    assert.equal(calls.at(-1).root, target);
+  } finally {
+    for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN", "NOVA_CWD_CHANGE_SCOPE"]) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    await new Promise((done) => server.close(done));
+  }
 });

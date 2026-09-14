@@ -1569,7 +1569,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  默认开启。关闭后 Lyra 不再提���切换工作目录/项目的工具，也不会注入对应提示词。
+                  默认开启，支持 Lyra 和 CodeBuddy。切换后会更新会话目录及所属项目；CodeBuddy 会恢复会话并继续任务。关闭后不提供目录切换工具。
                 </span>
               </div>
               <div class="field">

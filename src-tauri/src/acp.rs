@@ -2589,7 +2589,11 @@ impl AcpManager {
     }
 
     /// 确保线程的 ACP session 就绪（按需建立/恢复），返回 sessionId
-    async fn ensure_session(self: &Arc<Self>, thread_id: &str) -> Result<String, String> {
+    async fn ensure_session(
+        self: &Arc<Self>,
+        thread_id: &str,
+        require_restore: bool,
+    ) -> Result<String, String> {
         let lock = self.thread_lock(thread_id);
         let _guard = lock.lock().await;
 
@@ -2665,6 +2669,11 @@ impl AcpManager {
                     }
                     Err(e) => {
                         self.routes.lock().unwrap().remove(&sid);
+                        if require_restore {
+                            return Err(format!(
+                                "工作目录已切换，但原会话恢复失败：{e}。历史会话已保留，请重试。"
+                            ));
+                        }
                         self.push_log(format!("[nova] session/load 失败，转为新建会话：{e}"));
                         let new_sid = self
                             .new_session_for(&conn, &key, thread_id, &cwd, &mcp_servers)
@@ -2685,6 +2694,9 @@ impl AcpManager {
                 }
             }
             None => {
+                if require_restore {
+                    return Err("工作目录已切换，但原会话标识已失效，无法自动续接".into());
+                }
                 let sid = self
                     .new_session_for(&conn, &key, thread_id, &cwd, &mcp_servers)
                     .await?;
@@ -3246,13 +3258,59 @@ impl AcpManager {
         } else {
             text
         };
-        let outcome = self
-            .drive_prompt(&thread_id, &text, &images, handoff.as_deref())
+        let mut cwd_changes = self
+            .app
+            .state::<AppState>()
+            .context_service
+            .subscribe_cwd_changes(self.cwd_change_scope(&thread_id));
+        let mut outcome = self
+            .drive_prompt(
+                &thread_id,
+                &text,
+                &images,
+                handoff.as_deref(),
+                false,
+                &mut cwd_changes,
+            )
             .await;
+        let mut resumed_after_cwd_change = false;
+        while matches!(&outcome, Ok((stop, _)) if stop == "nova_cwd_changed")
+            && self.is_running(&thread_id)
+            && cwd_changes.is_current()
+        {
+            resumed_after_cwd_change = true;
+            // CodeBuddy may not persist the interrupted turn, even when session/load
+            // succeeds. Reuse Nova's bounded handoff transcript to retain the task.
+            let handoff = {
+                let state = self.app.state::<AppState>();
+                let store = state.store.lock().unwrap();
+                store.get(&thread_id).and_then(|thread| {
+                    crate::threads::render_handoff_context(
+                        &thread.items,
+                        thread.plan.as_ref(),
+                        self.kind.label(),
+                        self.kind.label(),
+                    )
+                })
+            };
+            outcome = self.drive_prompt(
+                &thread_id,
+                "Nova 已完成 change_working_directory，已在新的工作目录重启工具进程并恢复会话。此前目录切换工具即使显示取消也无需重试；请按最新工作目录继续完成用户尚未完成的任务。",
+                &[], handoff.as_deref(), true, &mut cwd_changes,
+            ).await;
+        }
 
-        // 轮次已被强制结束（看门狗/重启 devin），丢弃迟到的结果
-        if !self.is_running(&thread_id) {
+        // 轮次已被强制结束或已开启新轮次，丢弃迟到的结果。
+        if !self.is_running(&thread_id) || !cwd_changes.is_current() {
             return;
+        }
+        if resumed_after_cwd_change && outcome.is_ok() {
+            let state = self.app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(&thread_id) {
+                thread.handoff_from = None;
+            }
+            store.save_thread(&thread_id);
         }
 
         let (stop_reason, usage) = match outcome {
@@ -3423,6 +3481,18 @@ impl AcpManager {
         };
         if let Some(runtime) = runtime_guidance {
             guidance.push(runtime);
+        }
+        if self.kind == AgentKind::CodeBuddy
+            && self
+                .app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap()
+                .auto_change_project_enabled
+            && !self.app.state::<AppState>().context_service.endpoint().is_empty()
+        {
+            guidance.push("需要更换工作目录/项目时，单独调用 nova-tools 的 change_working_directory(path)，不要与其它工具并行。Nova 会在新目录恢复本会话并自动继续；普通 cd 不能更改 Nova 会话目录。".into());
         }
         if !guidance.is_empty() {
             let guidance = guidance.join("\n\n");
@@ -3600,6 +3670,8 @@ impl AcpManager {
         text: &str,
         images: &[PromptImage],
         handoff: Option<&str>,
+        require_restore: bool,
+        cwd_changes: &mut crate::context_service::CwdChangeSubscription,
     ) -> Result<(String, Option<Value>), String> {
         let include_runtime_guidance = {
             let state = self.app.state::<AppState>();
@@ -3609,8 +3681,8 @@ impl AcpManager {
             sid.is_none()
         };
         let t_ensure = std::time::Instant::now();
-        let mut session_id = self.ensure_session(thread_id).await?;
-        if !self.is_running(thread_id) {
+        let mut session_id = self.ensure_session(thread_id, require_restore).await?;
+        if !self.is_running(thread_id) || !cwd_changes.is_current() {
             return Err("任务已停止".into());
         }
         self.push_log(format!(
@@ -3621,9 +3693,18 @@ impl AcpManager {
         let conn_key = self.conn_key_for_thread(thread_id);
         // ensure_session 返回后进程可能恰好退出；交给下面的重建分支恢复。
         let mut conn = self.conn_for_key(&conn_key).await;
-        let mut prompt =
-            self.build_user_prompt_blocks(thread_id, text, images, include_runtime_guidance);
-        if let Some(ctx) = handoff {
+        // CodeBuddy treats the final text block as the current message; keep the
+        // handoff and continuation together so interrupted user messages survive.
+        let codebuddy_text = handoff
+            .filter(|_| self.kind == AgentKind::CodeBuddy)
+            .map(|context| format!("{context}\n\n{text}"));
+        let mut prompt = self.build_user_prompt_blocks(
+            thread_id,
+            codebuddy_text.as_deref().unwrap_or(text),
+            images,
+            include_runtime_guidance,
+        );
+        if let Some(ctx) = handoff.filter(|_| self.kind != AgentKind::CodeBuddy) {
             prompt.insert(0, json!({ "type": "text", "text": ctx }));
         }
         let items_at_prompt = {
@@ -3638,9 +3719,9 @@ impl AcpManager {
             String::new()
         };
         // 上一次失败是「假死」而非崩溃：重建连接时保留 sessionId，用 session/load 找回上下文。
-        let mut keep_session_on_rebuild = false;
+        let mut keep_session_on_rebuild = require_restore;
         for attempt in 1..=max_attempts {
-            if !self.is_running(thread_id) {
+            if !self.is_running(thread_id) || !cwd_changes.is_current() {
                 return Err("任务已停止".into());
             }
             let needs_rebuild = prompt_conn_needs_rebuild(
@@ -3673,7 +3754,7 @@ impl AcpManager {
                 } else {
                     self.clear_thread_session_for_respawn(thread_id);
                 }
-                session_id = self.ensure_session(thread_id).await?;
+                session_id = self.ensure_session(thread_id, require_restore).await?;
                 conn = self.conn_for_key(&conn_key).await;
                 if conn.is_none() {
                     last_err = format!("{} 未连接", self.kind.label());
@@ -3714,7 +3795,15 @@ impl AcpManager {
                 .unwrap()
                 .insert(session_id.clone(), std::time::Instant::now());
             match self
-                .prompt_with_stall_guard(conn, &session_id, &prompt, attempt, max_attempts)
+                .prompt_with_cwd_changes(
+                    thread_id,
+                    conn,
+                    &session_id,
+                    &prompt,
+                    attempt,
+                    max_attempts,
+                    cwd_changes,
+                )
                 .await
             {
                 Ok(resp) => {
@@ -3726,12 +3815,13 @@ impl AcpManager {
                     return Ok((stop, usage));
                 }
                 Err(failure) => {
-                    keep_session_on_rebuild = matches!(failure, PromptFailure::Stalled(_));
+                    keep_session_on_rebuild =
+                        require_restore || matches!(failure, PromptFailure::Stalled(_));
                     last_err = failure.into_message();
                     // 用户已经停止本轮：结果作废，不重试也不再往会话里补任何提示。
                     // force_finish 已经收尾并落了 system/turn 条目，若继续往下走，
                     // 那些条目会被算成「本轮已有输出」，误报一条「云端连接短暂中断」。
-                    if !self.is_running(thread_id) {
+                    if !self.is_running(thread_id) || !cwd_changes.is_current() {
                         return Err("任务已停止".into());
                     }
                     let dead =
@@ -3779,6 +3869,138 @@ impl AcpManager {
             }
         }
         Err(last_err)
+    }
+
+    fn cwd_change_scope(&self, thread_id: &str) -> String {
+        format!(
+            "{}:{}:{thread_id}",
+            self.kind.label(),
+            self.permission_scope
+        )
+    }
+
+    async fn prompt_with_cwd_changes(
+        self: &Arc<Self>,
+        thread_id: &str,
+        conn: &Arc<AcpConn>,
+        session_id: &str,
+        prompt: &[Value],
+        attempt: u32,
+        max_attempts: u32,
+        changes: &mut crate::context_service::CwdChangeSubscription,
+    ) -> Result<Value, PromptFailure> {
+        let request = self.prompt_with_stall_guard(conn, session_id, prompt, attempt, max_attempts);
+        tokio::pin!(request);
+        loop {
+            let change = tokio::select! {
+                result = &mut request => return result,
+                Some(change) = changes.receiver.recv() => change,
+            };
+            let target = (|| {
+                let state = self.app.state::<AppState>();
+                if self.kind != AgentKind::CodeBuddy
+                    || !state.settings.lock().unwrap().auto_change_project_enabled
+                    || !self.is_running(thread_id)
+                    || !changes.is_current()
+                {
+                    return Err("当前会话不允许切换工作目录".to_string());
+                }
+                let store = state.store.lock().unwrap();
+                let thread = store.get(thread_id).ok_or("会话不存在")?;
+                let cwd = resolve_changed_working_directory(&thread.cwd, &change.path)?;
+                let current = resolve_changed_working_directory(&thread.cwd, ".")
+                    .unwrap_or_else(|_| thread.cwd.clone());
+                Ok((cwd, current))
+            })();
+            let (cwd, current) = match target {
+                Ok(target) => target,
+                Err(error) => {
+                    let _ = change.reply.send(Err(error));
+                    continue;
+                }
+            };
+            if cwd == current {
+                let _ = change
+                    .reply
+                    .send(Ok(json!({ "cwd": cwd, "changed": false })));
+                continue;
+            }
+            // Queue cancellation before acknowledging the switch, so CodeBuddy cannot
+            // treat the MCP result as permission to keep working in its old process.
+            if let Err(error) = conn.send_raw(json!({
+                "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session_id }
+            })) {
+                let _ = change.reply.send(Err(error.clone()));
+                return Err(PromptFailure::Rpc(error));
+            }
+            if change
+                .reply
+                .send(Ok(json!({
+                    "cwd": cwd, "changed": true,
+                    "message": "Nova 正在切换工作目录，将自动恢复会话并继续任务。请勿再执行工具。"
+                })))
+                .is_err()
+            {
+                continue;
+            }
+            // CodeBuddy ignores cwd in session/load and has no live cwd setter. Cancel
+            // before replacing its process; MCP chdir alone leaves native tools in the old root.
+            let permission_keys: Vec<_> = self
+                .pending_permissions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, permission)| permission.session_id == session_id)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in permission_keys {
+                let _ = self.respond_permission(&key, "").await;
+            }
+            let settled = timeout(Duration::from_secs(10), &mut request).await;
+            if !self.is_running(thread_id) || !changes.is_current() {
+                return Err(PromptFailure::Rpc("任务已停止".into()));
+            }
+            let key = self.conn_key_for_thread(thread_id);
+            if let Some(slot) = self.slot_opt(&key) {
+                let mut active = slot.lock().await;
+                if active
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, conn))
+                {
+                    active.take();
+                } else {
+                    return Err(PromptFailure::Rpc("切换目录时会话连接已失效".into()));
+                }
+            }
+            self.unmount_thread_sessions(thread_id);
+            conn.kill();
+            self.prompt_sent_at.lock().unwrap().remove(session_id);
+            let state = self.app.state::<AppState>();
+            {
+                let mut store = state.store.lock().unwrap();
+                let thread = store
+                    .get_mut(thread_id)
+                    .ok_or_else(|| PromptFailure::Rpc("会话不存在".into()))?;
+                thread.cwd = cwd.clone();
+                // Retain this marker if loading/continuing fails, for the next retry.
+                thread.handoff_from = Some(self.kind.clone());
+                for item in complete_pending_tools(thread, None) {
+                    self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
+                }
+                store.save_thread(thread_id);
+            }
+            state.projects.lock().unwrap().touch(&cwd);
+            let _ = self.app.emit("projects:changed", json!({}));
+            let _ = self.app.emit(
+                "thread:cwd-changed",
+                json!({ "threadId": thread_id, "cwd": cwd }),
+            );
+            let _ = self.app.emit(EV_THREADS, json!({}));
+            if !matches!(settled, Ok(Ok(_))) {
+                self.push_log("[nova] 目录切换：旧执行未正常结束，将尝试恢复已保存的会话".into());
+            }
+            return Ok(json!({ "stopReason": "nova_cwd_changed" }));
+        }
     }
 
     /// 发出 session/prompt 并看住「首个响应」：agent 收下请求后可能再不回任何通知与响应
@@ -4008,11 +4230,17 @@ impl AcpManager {
             let settings = state.settings.lock().unwrap();
             settings.context_retrieval_mode.as_str().to_string()
         };
-        // browser 独立于上下文检索；关闭 polaris 时仍需挂载只包含 browser 的 nova-tools。
-        if !browser_debug && !state.settings.lock().unwrap().context_tools_enabled() {
+        let auto_change_project = self.kind == AgentKind::CodeBuddy
+            && state.settings.lock().unwrap().auto_change_project_enabled
+            && !state.context_service.endpoint().is_empty();
+        // browser 和目录切换均独立于上下文检索开关。
+        if !browser_debug
+            && !auto_change_project
+            && !state.settings.lock().unwrap().context_tools_enabled()
+        {
             return Ok(json!([]));
         }
-        let server = codebuddy_nova_tools_mcp_server(
+        let mut server = codebuddy_nova_tools_mcp_server(
             &self.app,
             cwd,
             &context_mode,
@@ -4022,6 +4250,13 @@ impl AcpManager {
             browser_debug,
             &state.config_dir,
         )?;
+        if auto_change_project {
+            server["env"].as_array_mut().unwrap().push(json!({
+                "name": "NOVA_CWD_CHANGE_SCOPE", "value": self.cwd_change_scope(thread_id)
+            }));
+            server["_meta"]["tools"]["change_working_directory"] =
+                json!({ "defer_loading": false });
+        }
         self.push_log(format!(
             "[nova] {} 已为 {cwd} 注入 nova-tools{}",
             self.kind.label(),
@@ -4692,6 +4927,49 @@ fn codebuddy_runtime_guidance(cwd: &str) -> Option<String> {
     Some(format!(
         "Windows shell contract for this local CodeBuddy session (hard constraint): Nova runs on Windows and the Bash tool is configured to use PowerShell (`CODEBUDDY_CODE_SHELL=powershell`). The session workspace and required working directory is `{cwd}`; run every code/search/shell operation there, not in Nova's own installation or source directory. Write commands in PowerShell syntax; use `;` to chain commands and `$env:NAME` for environment variables. Do not use Bash syntax (`export`, `&&` chains, POSIX grep/sed/awk) in Bash tool commands."
     ))
+}
+
+fn resolve_changed_working_directory(current: &str, path: &str) -> Result<String, String> {
+    if path.trim().is_empty() {
+        return Err("change_working_directory 缺少 path".into());
+    }
+    let path = std::path::Path::new(current).join(path);
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|error| format!("无法访问工作目录 {}：{error}", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("工作目录不是文件夹：{}", path.display()));
+    }
+    Ok(crate::sdk_runtime::display_working_directory(&canonical))
+}
+
+#[cfg(test)]
+mod cwd_change_tests {
+    use super::resolve_changed_working_directory;
+
+    #[test]
+    fn directory_change_resolves_relative_paths_and_rejects_files() {
+        let root = std::env::temp_dir().join(format!("nova-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("子目录 with spaces")).unwrap();
+        std::fs::write(root.join("file.txt"), "test").unwrap();
+        let current = root.to_str().unwrap();
+        let expected = resolve_changed_working_directory(current, "子目录 with spaces").unwrap();
+        assert_eq!(
+            resolve_changed_working_directory(current, &expected).unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolve_changed_working_directory(&expected, "..").unwrap(),
+            resolve_changed_working_directory(current, ".").unwrap()
+        );
+        for path in ["", "  ", "missing", "file.txt"] {
+            assert!(
+                resolve_changed_working_directory(current, path).is_err(),
+                "{path}"
+            );
+        }
+        assert!(!expected.starts_with(r"\\?\"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(not(windows))]

@@ -112,11 +112,34 @@ export function createNovaBatchTools(cwd, options = {}) {
   const fastContext = fastContextEnabled(options);
   const browserDebug = browserDebugEnabled(options);
   readOnlyEnabled(options);
-  const root = resolve(cwd);
+  let root = resolve(cwd);
   const browserSessionId = `nova-mcp-${process.pid}`;
 
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
   const tools = {};
+
+  const cwdScope = process.env.NOVA_CWD_CHANGE_SCOPE;
+  if (cwdScope && globalContextServiceConfigured()) {
+    tools.change_working_directory = {
+      description: "切换本会话的工作目录，并让 Nova 切换或创建对应项目。目录必须已存在，相对路径基于当前工作目录。必须单独调用，不要与其它工具并行；Nova 会停止当前执行，在新目录恢复会话并自动继续任务。",
+      inputSchema: {
+        type: "object",
+        properties: { path: { type: "string", minLength: 1, description: "新的绝对或相对工作目录" } },
+        required: ["path"],
+        additionalProperties: false,
+      },
+      async execute(params) {
+        if (typeof params?.path !== "string" || !params.path.trim()) {
+          throw new Error("change_working_directory 缺少 path");
+        }
+        const result = await callGlobalContextTool("change_working_directory", root, {
+          scope: cwdScope, path: params.path,
+        });
+        root = result.cwd;
+        return JSON.stringify(result);
+      },
+    };
+  }
 
   if (browserDebug) {
     tools.browser = {

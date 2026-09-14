@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -12,6 +13,43 @@ pub(crate) struct ContextService {
     token: String,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    cwd_changes: CwdChanges,
+}
+
+type CwdChanges = Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<CwdChange>>>>;
+
+pub(crate) struct CwdChange {
+    pub path: String,
+    pub reply: mpsc::Sender<Result<Value, String>>,
+}
+
+pub(crate) struct CwdChangeSubscription {
+    scope: String,
+    changes: CwdChanges,
+    sender: tokio::sync::mpsc::UnboundedSender<CwdChange>,
+    pub receiver: tokio::sync::mpsc::UnboundedReceiver<CwdChange>,
+}
+
+impl CwdChangeSubscription {
+    pub fn is_current(&self) -> bool {
+        self.changes
+            .lock()
+            .unwrap()
+            .get(&self.scope)
+            .is_some_and(|sender| sender.same_channel(&self.sender))
+    }
+}
+
+impl Drop for CwdChangeSubscription {
+    fn drop(&mut self) {
+        let mut changes = self.changes.lock().unwrap();
+        if changes
+            .get(&self.scope)
+            .is_some_and(|sender| sender.same_channel(&self.sender))
+        {
+            changes.remove(&self.scope);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -50,7 +88,11 @@ impl ContextResponse {
     }
 }
 
-fn dispatch(request: ContextRequest, token: &str) -> Result<Value, String> {
+fn dispatch(
+    request: ContextRequest,
+    token: &str,
+    cwd_changes: &CwdChanges,
+) -> Result<Value, String> {
     if request.token != token {
         return Err("unauthorized context service request".into());
     }
@@ -60,6 +102,32 @@ fn dispatch(request: ContextRequest, token: &str) -> Result<Value, String> {
             "transport": "nova-context-jsonl-v1",
             "runtime": "rust"
         }));
+    }
+
+    if request.method == "change_working_directory" {
+        let scope = request.params["scope"]
+            .as_str()
+            .ok_or("missing session scope")?;
+        let path = request.params["path"]
+            .as_str()
+            .filter(|p| !p.trim().is_empty())
+            .ok_or("missing directory path")?;
+        let sender = cwd_changes
+            .lock()
+            .unwrap()
+            .get(scope)
+            .cloned()
+            .ok_or("当前会话未运行或不支持切换工作目录")?;
+        let (reply, response) = mpsc::channel();
+        sender
+            .send(CwdChange {
+                path: path.to_string(),
+                reply,
+            })
+            .map_err(|_| "会话已停止".to_string())?;
+        return response
+            .recv_timeout(Duration::from_secs(15))
+            .map_err(|_| "切换工作目录请求未被处理".to_string())?;
     }
 
     let root = Path::new(&request.root);
@@ -86,9 +154,9 @@ fn dispatch(request: ContextRequest, token: &str) -> Result<Value, String> {
     Ok(Value::String(output))
 }
 
-fn response_for_line(line: &str, token: &str) -> ContextResponse {
+fn response_for_line(line: &str, token: &str, cwd_changes: &CwdChanges) -> ContextResponse {
     match serde_json::from_str::<ContextRequest>(line) {
-        Ok(request) => match dispatch(request, token) {
+        Ok(request) => match dispatch(request, token, cwd_changes) {
             Ok(result) => ContextResponse::success(result),
             Err(error) => ContextResponse::failure(error),
         },
@@ -96,7 +164,7 @@ fn response_for_line(line: &str, token: &str) -> ContextResponse {
     }
 }
 
-async fn serve_stream<S>(stream: S, token: &str)
+async fn serve_stream<S>(stream: S, token: &str, cwd_changes: CwdChanges)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -107,7 +175,7 @@ where
         Ok(_) if line.len() <= 2 * 1024 * 1024 => {
             let line = line.trim_end().to_string();
             let token = token.to_string();
-            tokio::task::spawn_blocking(move || response_for_line(&line, &token))
+            tokio::task::spawn_blocking(move || response_for_line(&line, &token, &cwd_changes))
                 .await
                 .unwrap_or_else(|error| {
                     ContextResponse::failure(format!("context worker failed: {error}"))
@@ -128,6 +196,7 @@ where
 async fn run_server(
     endpoint: String,
     token: String,
+    cwd_changes: CwdChanges,
     ready: mpsc::Sender<Result<(), String>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -157,7 +226,8 @@ async fn run_server(
             connected = server.connect() => {
                 if connected.is_err() { continue; }
                 let token = token.clone();
-                tokio::spawn(async move { serve_stream(server, &token).await });
+                let cwd_changes = cwd_changes.clone();
+                tokio::spawn(async move { serve_stream(server, &token, cwd_changes).await });
             }
         }
     }
@@ -167,6 +237,7 @@ async fn run_server(
 async fn run_server(
     endpoint: String,
     token: String,
+    cwd_changes: CwdChanges,
     ready: mpsc::Sender<Result<(), String>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -187,7 +258,8 @@ async fn run_server(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let token = token.clone();
-                    tokio::spawn(async move { serve_stream(stream, &token).await });
+                    let cwd_changes = cwd_changes.clone();
+                    tokio::spawn(async move { serve_stream(stream, &token, cwd_changes).await });
                 }
                 Err(_) => break,
             }
@@ -205,6 +277,7 @@ impl ContextService {
             token: String::new(),
             shutdown: Mutex::new(None),
             worker: Mutex::new(None),
+            cwd_changes: Arc::default(),
         }
     }
 
@@ -227,6 +300,8 @@ impl ContextService {
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker_endpoint = endpoint.clone();
         let worker_token = token.clone();
+        let cwd_changes = CwdChanges::default();
+        let worker_cwd_changes = cwd_changes.clone();
         let worker = std::thread::Builder::new()
             .name("nova-context-service".into())
             .spawn(move || {
@@ -246,6 +321,7 @@ impl ContextService {
                 runtime.block_on(run_server(
                     worker_endpoint,
                     worker_token,
+                    worker_cwd_changes,
                     ready_tx,
                     shutdown_rx,
                 ));
@@ -261,6 +337,7 @@ impl ContextService {
                     token,
                     shutdown: Mutex::new(Some(shutdown_tx)),
                     worker: Mutex::new(Some(worker)),
+                    cwd_changes,
                 })
             }
             Ok(Err(error)) => {
@@ -277,6 +354,20 @@ impl ContextService {
 
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub(crate) fn subscribe_cwd_changes(&self, scope: String) -> CwdChangeSubscription {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.cwd_changes
+            .lock()
+            .unwrap()
+            .insert(scope.clone(), sender.clone());
+        CwdChangeSubscription {
+            scope,
+            changes: self.cwd_changes.clone(),
+            sender,
+            receiver,
+        }
     }
 
     pub(crate) fn token(&self) -> &str {
@@ -313,6 +404,7 @@ mod tests {
         let response = response_for_line(
             r#"{"token":"secret","method":"ping","root":"","params":{}}"#,
             "secret",
+            &CwdChanges::default(),
         );
         assert!(response.ok);
         assert_eq!(response.result.unwrap()["runtime"], "rust");
@@ -323,7 +415,61 @@ mod tests {
         let response = response_for_line(
             r#"{"token":"wrong","method":"ping","root":"","params":{}}"#,
             "secret",
+            &CwdChanges::default(),
         );
         assert!(!response.ok);
+    }
+
+    #[test]
+    fn directory_requests_only_reach_the_registered_session() {
+        let changes = CwdChanges::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        changes.lock().unwrap().insert("session-A".into(), sender);
+        let request = |scope: &str| ContextRequest {
+            token: "secret".into(),
+            method: "change_working_directory".into(),
+            root: String::new(),
+            params: serde_json::json!({ "scope": scope, "path": "../new project" }),
+        };
+        assert!(dispatch(request("session-B"), "secret", &changes).is_err());
+        let worker = std::thread::spawn(move || {
+            let change = receiver.blocking_recv().unwrap();
+            assert_eq!(change.path, "../new project");
+            change
+                .reply
+                .send(Ok(serde_json::json!({ "cwd": "new project" })))
+                .unwrap();
+        });
+        assert_eq!(
+            dispatch(request("session-A"), "secret", &changes).unwrap()["cwd"],
+            "new project"
+        );
+        worker.join().unwrap();
+        assert!(dispatch(request("session-A"), "secret", &changes).is_err());
+    }
+
+    #[test]
+    fn dropping_an_old_directory_subscription_keeps_the_new_run() {
+        let changes = CwdChanges::default();
+        let subscribe = || {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            changes
+                .lock()
+                .unwrap()
+                .insert("session".into(), sender.clone());
+            CwdChangeSubscription {
+                scope: "session".into(),
+                changes: changes.clone(),
+                sender,
+                receiver,
+            }
+        };
+        let old = subscribe();
+        let current = subscribe();
+        assert!(!old.is_current());
+        drop(old);
+        assert!(current.is_current());
+        drop(current);
+        assert!(changes.lock().unwrap().is_empty());
     }
 }

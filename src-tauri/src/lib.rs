@@ -4599,6 +4599,7 @@ async fn apply_runtime_settings(
             || s.devin_enabled != settings.devin_enabled;
         let restart_codebuddy = restart_all_agents
             || context_runtime_changed
+            || auto_change_project_changed
             || s.codebuddy_path != settings.codebuddy_path
             || s.codebuddy_proxy != settings.codebuddy_proxy
             || s.codebuddy_enabled != settings.codebuddy_enabled;

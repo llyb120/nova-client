@@ -2034,7 +2034,7 @@ fn parse_bridge_output(output: &str, label: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("{label} bridge 响应缺少 data"))
 }
 
-fn display_working_directory(path: &std::path::Path) -> String {
+pub(crate) fn display_working_directory(path: &std::path::Path) -> String {
     let value = path.to_string_lossy();
     if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
