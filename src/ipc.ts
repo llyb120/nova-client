@@ -368,6 +368,12 @@ export const api = {
     invoke<void>("recall_roaming_thread", { threadId }),
   requestPeerModels: (peerToken: string) =>
     invoke<void>("request_peer_models", { peerToken }),
+  replyRoamingWorkflows: (peer: string, workflows: { id: string; name: string; stageCount: number }[]) =>
+    invoke<void>("reply_roaming_workflows", { peer, workflows }),
+  checkRoamingWorkflow: (threadId: string) =>
+    invoke<void>("check_roaming_workflow", { threadId }),
+  failRoamingWorkflow: (threadId: string, error: string) =>
+    invoke<void>("fail_roaming_workflow", { threadId, error }),
 
   // worktree（独立工作目录执行）
   isGitRepo: (path: string) => invoke<boolean>("is_git_repo", { path }),

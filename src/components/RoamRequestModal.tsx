@@ -7,12 +7,15 @@ import { agentLabel } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
 import { IconFolder } from "./icons";
 import { SearchSelect } from "./SearchSelect";
+import { parseRoamingWorkflowPrompt, roamingWorkflowPrompt, ROAMING_WORKFLOW_PREFIX } from "../workflow/roamingProtocol";
+import { getWorkflow } from "../workflow/storage";
 
 /** host 侧：有人请求漫游本机项目时弹出，确认后才真正建立会话 */
 export function RoamRequestModal() {
   const [busy, setBusy] = createSignal(false);
   const current = () => state.incomingRoams[0] ?? null;
   const [prompt, setPrompt] = createSignal("");
+  const [workflow, setWorkflow] = createSignal<{ id: string; name: string } | null>(null);
   const [folder, setFolder] = createSignal("");
   const [model, setModel] = createSignal("");
   const [mode, setMode] = createSignal("build");
@@ -25,7 +28,15 @@ export function RoamRequestModal() {
   createEffect(() => {
     const req = current();
     if (!req) return;
+    setWorkflow(null);
     setPrompt(req.prompt ?? "");
+    if (req.prompt?.startsWith(ROAMING_WORKFLOW_PREFIX)) {
+      try {
+        const request = parseRoamingWorkflowPrompt(req.prompt);
+        setWorkflow({ id: request.id, name: getWorkflow(request.id)?.name ?? "工作流已不存在" });
+        setPrompt(request.goal);
+      } catch { /* 保留原始请求供授权方查看；执行端仍会校验。 */ }
+    }
     setFolder(req.folder);
     setModel(req.model ?? "");
     setMode("build");
@@ -56,7 +67,7 @@ export function RoamRequestModal() {
     setBusy(true);
     try {
       await respondRoamRequest(req.reqId, accept, {
-        prompt: prompt(),
+        prompt: workflow() ? roamingWorkflowPrompt(workflow()!, prompt()) : prompt(),
         folder: folder(),
         model: model(),
         mode: mode(),
@@ -99,6 +110,9 @@ export function RoamRequestModal() {
                   <span class="field-label">执行目录</span>
                   <input class="field-input" value={folder()} onInput={(e) => setFolder(e.currentTarget.value)} />
                 </label>
+              </Show>
+              <Show when={workflow()}>
+                {(selected) => <p class="field-hint">运行本机工作流：{selected().name}（后续 Stage 会同步给对方）</p>}
               </Show>
               <label class="field">
                 <span class="field-label">提示词</span>

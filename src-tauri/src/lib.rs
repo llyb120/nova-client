@@ -1954,13 +1954,15 @@ async fn create_thread(
         return Ok(thread);
     }
 
-    // 普通会话：直接落库
+    // 普通会话：直接落库；host 的 Stage 同步建立独立漫游路由。
+    state.relay.inherit_roaming_stage(&mut thread)?;
     let project_dir = thread.cwd.clone();
     {
         let mut store = state.store.lock().unwrap();
         store.threads.push(thread.clone());
         store.save();
     }
+    state.relay.publish_roaming_stage(&thread);
     // 临时会话目录不进入最近项目列表
     if !project_dir.contains(SCRATCH_MARK) {
         state.projects.lock().unwrap().touch(&project_dir);
@@ -2020,11 +2022,13 @@ fn create_stage_thread(
     thread.parent_thread_id = Some(source_id.clone());
     thread.stage_source_thread_id = Some(source_id);
     thread.title = "[Stage] 新会话".into();
+    state.relay.inherit_roaming_stage(&mut thread)?;
     {
         let mut store = state.store.lock().unwrap();
         store.threads.push(thread.clone());
         store.save();
     }
+    state.relay.publish_roaming_stage(&thread);
     let _ = app.emit(acp::EV_THREADS, json!({}));
     Ok(thread)
 }
@@ -5327,6 +5331,21 @@ fn request_peer_models(state: State<'_, AppState>, peer_token: String) {
     state.relay.request_peer_models(peer_token);
 }
 
+#[tauri::command]
+fn reply_roaming_workflows(state: State<'_, AppState>, peer: String, workflows: serde_json::Value) {
+    state.relay.reply_roaming_workflows(peer, workflows);
+}
+
+#[tauri::command]
+fn check_roaming_workflow(state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
+    state.relay.check_roaming_workflow(&thread_id)
+}
+
+#[tauri::command]
+fn fail_roaming_workflow(state: State<'_, AppState>, thread_id: String, error: String) {
+    state.relay.fail_roaming_workflow(&thread_id, &error);
+}
+
 /// host：对收到的漫游请求作出应答（接受/拒绝）
 #[tauri::command]
 fn respond_roam_request(
@@ -6082,6 +6101,9 @@ pub fn run() {
             cancel_quota_roaming,
             recall_roaming_thread,
             request_peer_models,
+            reply_roaming_workflows,
+            check_roaming_workflow,
+            fail_roaming_workflow,
             respond_roam_request,
             directory_exists,
             clipboard_file_paths,

@@ -874,10 +874,14 @@ impl RelayManager {
             "roaming.recall" => self.on_roaming_recall(&env),
             "roaming.models_changed" => self.on_roaming_models_changed(&env),
             "roaming.models_request" => self.on_roaming_models_request(&env),
+            "roaming.workflows" => {
+                let _ = self.app.emit("relay:peer-workflows", json!({ "peer": env.from, "workflows": env.data }));
+            }
             "roaming.branches_request" => self.on_roaming_branches_request(&env),
             "quota.request" => self.on_quota_request(&env),
             // host -> guest
             "roaming.created" => self.on_roaming_created(&env),
+            "roaming.stage" => self.on_roaming_stage(&env),
             "roaming.models" => self.on_roaming_models(&env),
             "roaming.branches" => self.on_roaming_branches(&env),
             "roaming.update" => self.on_roaming_update(&env),
@@ -2713,7 +2717,121 @@ impl RelayManager {
 
     /// host：收到模型请求，收集本机「已启用且检测可用」后端的模型/模式列表回给对端。
     /// 顺序与前端 ALL_AGENT_KINDS 保持一致（lyra → devin → codex → codebuddy → claudecode → cursor → opencode）。
+    /// 所有 host 子会话共用父会话的授权，但各自拥有独立的 guest 镜像和事件路由。
+    pub fn inherit_roaming_stage(&self, thread: &mut Thread) -> Result<(), String> {
+        let Some(parent_id) = thread.parent_thread_id.clone() else { return Ok(()); };
+        let parent = {
+            let state = self.app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            store.get(&parent_id).cloned()
+        };
+        let Some(parent) = parent else { return Ok(()); };
+        if parent.is_roaming_guest() {
+            return Err("请在对方机器上创建漫游 Stage".into());
+        }
+        if parent.roaming_role.as_deref() != Some("host") { return Ok(()); }
+        if thread.cwd != parent.cwd {
+            return Err("漫游 Stage 必须沿用已授权的工作目录".into());
+        }
+        self.ensure_hosted(&parent_id);
+        let guest = self.hosted.lock().unwrap().get(&parent_id).cloned().ok_or("漫游会话已失效")?;
+        thread.roaming_role = Some("host".into());
+        thread.roaming_peer = parent.roaming_peer;
+        thread.roaming_peer_name = parent.roaming_peer_name;
+        thread.roaming_remote_id = Some(uuid::Uuid::new_v4().to_string());
+        thread.worktree = parent.worktree;
+        thread.active_clue_card_id = parent.active_clue_card_id;
+        thread.clue_context = parent.clue_context;
+        self.hosted.lock().unwrap().insert(thread.id.clone(), RoamGuest {
+            token: guest.token,
+            guest_thread_id: thread.roaming_remote_id.clone().unwrap(),
+            approved_until: guest.approved_until,
+        });
+        Ok(())
+    }
+
+    pub fn publish_roaming_stage(&self, thread: &Thread) {
+        if thread.roaming_role.as_deref() != Some("host") { return; }
+        let parent = {
+            let state = self.app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            thread.parent_thread_id.as_deref().and_then(|id| store.get(id)).cloned()
+        };
+        let Some(parent) = parent else { return; };
+        let (Some(peer), Some(guest_id), Some(parent_guest_id)) = (
+            thread.roaming_peer.clone(), thread.roaming_remote_id.clone(), parent.roaming_remote_id,
+        ) else { return; };
+        let mut mirror = thread.clone();
+        mirror.items.clear();
+        mirror.plan = None;
+        mirror.acp_session_id = None;
+        mirror.provider_checkpoints.clear();
+        mirror.pending_native_restore = None;
+        mirror.clue_context = None;
+        self.spawn_send_now(peer, "roaming.stage", json!({
+            "guestThreadId": guest_id, "parentGuestThreadId": parent_guest_id, "thread": mirror,
+        }));
+    }
+
+    fn on_roaming_stage(&self, env: &InEnvelope) {
+        let (Some(guest_id), Some(parent_id)) = (
+            env.data["guestThreadId"].as_str(), env.data["parentGuestThreadId"].as_str(),
+        ) else { return; };
+        if uuid::Uuid::parse_str(guest_id).is_err() || guest_id == parent_id { return; }
+        let Ok(source) = serde_json::from_value::<Thread>(env.data["thread"].clone()) else { return; };
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        let Some(parent) = store.get(parent_id) else { return; };
+        if !parent.is_roaming_guest() || parent.roaming_peer.as_deref() != Some(env.from.as_str()) { return; }
+        let peer_name = parent.roaming_peer_name.clone();
+        if let Some(existing) = store.get(guest_id) {
+            // 重传不能清空已收到的消息，也不能覆盖其它本机会话。
+            if !existing.is_roaming_guest() || existing.roaming_peer.as_deref() != Some(env.from.as_str())
+                || existing.roaming_remote_id.as_deref() != Some(source.id.as_str()) { return; }
+            return;
+        }
+        let mut thread = Thread::new(source.cwd, source.agent_kind, source.model, source.mode, source.reasoning_effort, false);
+        thread.id = guest_id.to_string();
+        thread.title = source.title;
+        thread.created_at = source.created_at;
+        thread.parent_thread_id = Some(parent_id.to_string());
+        thread.roaming_role = Some("guest".into());
+        thread.roaming_peer = Some(env.from.clone());
+        thread.roaming_peer_name = peer_name;
+        thread.roaming_remote_id = Some(source.id);
+        thread.worktree = source.worktree;
+        store.threads.push(thread);
+        store.save();
+        drop(store);
+        let _ = self.app.emit(EV_THREADS, json!({}));
+    }
+
+    pub fn reply_roaming_workflows(&self, peer: String, workflows: Value) {
+        self.spawn_send_now(peer, "roaming.workflows", workflows);
+    }
+
+    pub fn check_roaming_workflow(&self, thread_id: &str) -> Result<(), String> {
+        if !self.ensure_hosted(thread_id) {
+            return Err("漫游会话已失效".into());
+        }
+        let hosted = self.hosted.lock().unwrap();
+        if !hosted.get(thread_id).is_some_and(|guest| guest.approved_until > Instant::now()) {
+            return Err("漫游授权已到期，请重新授权后继续工作流".into());
+        }
+        Ok(())
+    }
+
+    pub fn fail_roaming_workflow(&self, thread_id: &str, error: &str) {
+        let guest = self.hosted.lock().unwrap().get(thread_id).cloned();
+        if let Some(guest) = guest {
+            self.spawn_send_now(guest.token, "roaming.error", json!({
+                "guestThreadId": guest.guest_thread_id, "error": error,
+            }));
+        }
+    }
+
     fn on_roaming_models_request(&self, env: &InEnvelope) {
+        let _ = self.app.emit("relay:workflows-request", json!({ "peer": env.from }));
         let to = env.from.clone();
         let app = self.app.clone();
         tauri::async_runtime::spawn(async move {
@@ -2938,6 +3056,7 @@ impl RelayManager {
                 .threads
                 .iter()
                 .filter(|t| t.is_roaming_guest())
+                .filter(|t| !t.parent_thread_id.as_deref().and_then(|id| store.get(id)).is_some_and(|parent| parent.is_roaming_guest()))
                 .filter_map(|t| {
                     let peer = t.roaming_peer.clone()?;
                     let host = t.roaming_remote_id.clone()?;
@@ -2949,7 +3068,7 @@ impl RelayManager {
             let _ = self.send_blocking(
                 &peer,
                 "roaming.resync",
-                json!({ "hostThreadId": host_thread_id, "guestThreadId": guest_thread_id }),
+                json!({ "hostThreadId": host_thread_id, "guestThreadId": guest_thread_id, "includeStages": true }),
             );
         }
     }
@@ -3374,6 +3493,12 @@ impl RelayManager {
     }
 
     fn run_roaming_prompt(&self, host_thread_id: String, text: String, images: Vec<PromptImage>) {
+        if text.starts_with("/nova-workflow ") {
+            let _ = self.app.emit("relay:workflow-start", json!({
+                "threadId": host_thread_id, "text": text, "images": images,
+            }));
+            return;
+        }
         let agent_kind = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
@@ -3485,6 +3610,11 @@ impl RelayManager {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        if !self.ensure_hosted(&host_thread_id)
+            || !self.hosted.lock().unwrap().get(&host_thread_id).is_some_and(|guest| guest.token == env.from)
+        {
+            return;
+        }
         let agent_kind = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
@@ -3693,11 +3823,52 @@ impl RelayManager {
             // 另一个仍在正常执行的实例误报成「会话已结束」。
             return;
         };
+        if guest.token != env.from { return; }
         self.send_snapshot(&host_thread_id, &guest);
+        if !env.data["includeStages"].as_bool().unwrap_or(false) { return; }
+        // 按父先子后补齐整条链；重连/升级前已存在的 Stage 也能恢复。
+        // ponytail: 重连每个根扫描 O(n) 会话索引；大量独立根时改为共享父子索引。
+        let children = {
+            let state = self.app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            let mut children: HashMap<String, Vec<String>> = HashMap::new();
+            for thread in &store.threads {
+                if let Some(parent) = &thread.parent_thread_id {
+                    children.entry(parent.clone()).or_default().push(thread.id.clone());
+                }
+            }
+            children
+        };
+        let mut pending = vec![host_thread_id];
+        let mut seen = HashSet::new();
+        while let Some(parent_id) = pending.pop() {
+            if !seen.insert(parent_id.clone()) { continue; }
+            for child_id in children.get(&parent_id).into_iter().flatten() {
+                let child = {
+                    let state = self.app.state::<AppState>();
+                    let store = state.store.lock().unwrap();
+                    store.get(child_id).cloned()
+                };
+                let Some(mut child) = child else { continue; };
+                if child.roaming_role.is_none() {
+                    if self.inherit_roaming_stage(&mut child).is_err() { continue; }
+                    let state = self.app.state::<AppState>();
+                    let mut store = state.store.lock().unwrap();
+                    if let Some(stored) = store.get_mut(&child.id) { *stored = child.clone(); }
+                    store.save();
+                }
+                if child.roaming_peer.as_deref() != Some(env.from.as_str()) { continue; }
+                self.publish_roaming_stage(&child);
+                self.ensure_hosted(&child.id);
+                let child_guest = self.hosted.lock().unwrap().get(&child.id).cloned();
+                if let Some(child_guest) = child_guest { self.send_snapshot(&child.id, &child_guest); }
+                pending.push(child.id);
+            }
+        }
     }
 
     fn send_snapshot(&self, host_thread_id: &str, guest: &RoamGuest) {
-        let (items, plan, running) = {
+        let (items, plan, running, metadata) = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             let Some(t) = store.get(host_thread_id) else {
@@ -3718,6 +3889,8 @@ impl RelayManager {
                 serde_json::to_value(&items).unwrap_or(json!([])),
                 t.plan.clone().unwrap_or(json!(null)),
                 running,
+                json!({ "title": t.title, "cwd": t.cwd, "agentKind": t.agent_kind,
+                    "model": t.model, "mode": t.mode, "worktree": t.worktree }),
             )
         };
         self.spawn_send_now(
@@ -3728,6 +3901,7 @@ impl RelayManager {
                 "items": items,
                 "plan": plan,
                 "running": running,
+                "metadata": metadata,
             }),
         );
     }
@@ -4195,6 +4369,12 @@ impl RelayManager {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        {
+            let state = self.app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            if !store.get(&thread_id).is_some_and(|thread| thread.is_roaming_guest()
+                && thread.roaming_peer.as_deref() == Some(env.from.as_str())) { return; }
+        }
         let snap_items: Vec<Item> =
             serde_json::from_value(env.data["items"].clone()).unwrap_or_default();
         let plan = env.data["plan"].clone();
@@ -4232,6 +4412,17 @@ impl RelayManager {
                     Vec::with_capacity(snap_items.len() + local_users.len());
                 for it in snap_items {
                     if let Some(snap_text) = item_user_text(&it) {
+                        // 工作流启动指令由 host 展开为首节点提示词，消费原指令并保留附件，
+                        // 否则它会被当作尚未执行的本地消息追加到回复末尾。
+                        if li == 0 && local_users.first().and_then(item_user_text)
+                            .is_some_and(|text| text.starts_with("/nova-workflow "))
+                        {
+                            let mut local = local_users[li].clone();
+                            if let Item::User { text, .. } = &mut local { *text = snap_text.to_string(); }
+                            merged.push(local);
+                            li += 1;
+                            continue;
+                        }
                         // 文本与下一条待匹配的本地用户消息一致 → 用本地版本（恢复附件、稳定 id）
                         if li < local_users.len()
                             && item_user_text(&local_users[li]) == Some(snap_text)
@@ -4249,6 +4440,14 @@ impl RelayManager {
                 }
                 t.items = merged;
                 t.plan = if plan.is_null() { None } else { Some(plan) };
+                if let Some(metadata) = env.data.get("metadata").filter(|value| value.is_object()) {
+                    if let Some(title) = metadata["title"].as_str() { t.title = title.to_string(); }
+                    if let Some(cwd) = metadata["cwd"].as_str() { t.cwd = cwd.to_string(); }
+                    if let Ok(kind) = serde_json::from_value(metadata["agentKind"].clone()) { t.agent_kind = kind; }
+                    t.model = metadata["model"].as_str().map(str::to_string);
+                    t.mode = metadata["mode"].as_str().map(str::to_string);
+                    if let Ok(worktree) = serde_json::from_value(metadata["worktree"].clone()) { t.worktree = worktree; }
+                }
                 t.updated_at = now_ms();
                 store.save();
                 *self.last_store_save.lock().unwrap() = Instant::now();
