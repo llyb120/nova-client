@@ -1425,15 +1425,17 @@ fn prewarm(
     };
     if matches!(
         agent_kind,
-        AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus
+        AgentKind::Devin | AgentKind::Kimi | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus
     ) {
-        let mgr = if agent_kind == AgentKind::Devin {
+        let mgr = if agent_kind == AgentKind::Kimi {
+            state.kimi.clone()
+        } else if agent_kind == AgentKind::Devin {
             state.acp.clone()
         } else {
             state.codebuddy.clone()
         };
         tauri::async_runtime::spawn(async move {
-            mgr.prewarm(cwd).await;
+            mgr.prewarm(cwd, mode).await;
         });
         return;
     }
@@ -3572,8 +3574,7 @@ fn set_thread_mode(
         }
     } else if is_quota {
         return Err("额度凭证已过期，请重新发起租借".into());
-    } else if agent_kind == AgentKind::Devin {
-        let mgr = state.acp.clone();
+    } else if let Some(mgr) = state.acp_for(&agent_kind) {
         tauri::async_runtime::spawn(async move {
             mgr.sync_thread_config(&thread_id).await;
         });
@@ -3599,9 +3600,11 @@ fn set_thread_reasoning_effort(
     // `thought_level`），已挂载的会话要即时下发，否则要等下一次 ensure_session 才生效。
     if matches!(
         agent_kind,
-        AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus
+        AgentKind::Devin | AgentKind::Kimi | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus
     ) {
-        let mgr = if agent_kind == AgentKind::Devin {
+        let mgr = if agent_kind == AgentKind::Kimi {
+            state.kimi.clone()
+        } else if agent_kind == AgentKind::Devin {
             state.acp.clone()
         } else {
             state.codebuddy.clone()

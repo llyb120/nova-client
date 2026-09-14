@@ -117,6 +117,7 @@ export function HomeView() {
   // 漫游首次同步时优先保留从当前会话继承的模型。
   let preferSeedModelOnRoamSync = !!sessionSeed?.roam && !!sessionSeed.model;
   let lastPrewarmKey = "";
+  let lastPrewarmAt = 0;
   let lastRoamModelSyncKey = "";
   let scratchLoading = false;
   let submittingPrompt = false;
@@ -251,19 +252,23 @@ export function HomeView() {
   });
 
   const prewarmCurrent = (target: PrewarmTarget = {}) => {
-    if (roam() || quotaPeer()) return;
+    if (!state.settings || roam() || quotaPeer()) return;
     const p = target.cwd ?? cwd();
     if (!p) return;
     const nextAgentKind = target.agentKind ?? agentKind();
     const nextModel = target.model ?? model();
     const nextMode = target.mode ?? mode();
     const key = `${nextAgentKind}\n${p}\n${nextModel}\n${nextMode}`;
-    if (key === lastPrewarmKey) return;
+    if (key === lastPrewarmKey && Date.now() - lastPrewarmAt < 15_000) return;
     lastPrewarmKey = key;
+    lastPrewarmAt = Date.now();
     const shouldRestoreFocus = document.activeElement === textareaRef;
     const selectionStart = textareaRef?.selectionStart ?? null;
     const selectionEnd = textareaRef?.selectionEnd ?? null;
-    void api.prewarm(p, nextAgentKind, nextModel || null, nextMode || null).finally(() => {
+    void api.prewarm(p, nextAgentKind, nextModel || null, nextMode || null).catch((error) => {
+      if (lastPrewarmKey === key) lastPrewarmKey = "";
+      console.warn("prewarm failed", error);
+    }).finally(() => {
       if (!shouldRestoreFocus || !textareaRef) return;
       textareaRef.focus();
       if (selectionStart !== null && selectionEnd !== null) {
@@ -272,10 +277,18 @@ export function HomeView() {
     });
   };
 
+  // 恢复项目/草稿和切换模式也要预热，把用户阅读、输入的时间用于启动 ACP。
+  createEffect(() => {
+    if (!state.settings || roam() || quotaPeer()) return;
+    const target = { cwd: cwd(), agentKind: agentKind(), model: model(), mode: mode() };
+    if (!target.cwd) return;
+    const timer = setTimeout(() => prewarmCurrent(target), 150);
+    onCleanup(() => clearTimeout(timer));
+  });
+
   const pickModel = (v: string) => {
     setModel(v);
     lastUsed.setModel(agentKind(), v);
-    prewarmCurrent({ model: v });
   };
   const pickModelAgent = (next: AgentKind) => {
     if (next === agentKind()) return;
@@ -287,7 +300,6 @@ export function HomeView() {
       void ensureModelOptions(next);
       void refreshSlashCommands(next);
     }
-    prewarmCurrent({ agentKind: next, model: nextModel, mode: "build" });
   };
   // 三级菜单一次性提交「后端 + 模型」：跨后端时切后端，同后端时仅换模型
   const pickModelCombined = (next: AgentKind, m: string, borrowed?: QuotaModelPeer | null) => {
@@ -316,7 +328,6 @@ export function HomeView() {
       void refreshSlashCommands(next);
     }
     setModel(m);
-    prewarmCurrent({ agentKind: next, model: m, mode: "build" });
   };
 
   // ===== 漫游：用对端（host）的模型列表，而不是本机的（本机模型对方可能没有）=====
@@ -425,12 +436,11 @@ export function HomeView() {
     });
   });
 
-  const selectProject = (p: string, warm = false) => {
+  const selectProject = (p: string) => {
     setRoam(null); // 选了本地项目就退出漫游
     setCwd(p);
     if (isScratch(p)) localStorage.removeItem(LAST_NEW_THREAD_PROJECT_KEY);
     else localStorage.setItem(LAST_NEW_THREAD_PROJECT_KEY, p);
-    if (warm) prewarmCurrent({ cwd: p });
   };
 
   const insertShortcutText = (snippet: string, mayFocus: boolean): boolean => {
@@ -495,7 +505,7 @@ export function HomeView() {
         } catch {
           // 目录校验不可用时仍尝试切换。
         }
-        selectProject(path, true);
+        selectProject(path);
       })();
     },
     onSelectModel: (next, modelId, quotaPeer) => {

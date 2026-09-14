@@ -3673,8 +3673,7 @@ impl RelayManager {
             ak
         };
         let state = self.app.state::<AppState>();
-        if agent_kind == AgentKind::Devin {
-            let mgr = state.acp.clone();
+        if let Some(mgr) = state.acp_for(&agent_kind) {
             tauri::async_runtime::spawn(async move {
                 mgr.sync_thread_config(&host_thread_id).await;
             });

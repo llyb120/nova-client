@@ -82,6 +82,44 @@ struct CodeBuddyPrewarm {
     child: Child,
 }
 
+struct AcpPrewarm {
+    cwd: String,
+    read_only: bool,
+    conn: TokioMutex<Option<Arc<AcpConn>>>,
+}
+
+impl AcpPrewarm {
+    async fn take(
+        slot: &StdMutex<Option<Arc<Self>>>,
+        cwd: &str,
+        read_only: bool,
+    ) -> Option<Arc<AcpConn>> {
+        let entry = {
+            let slot = slot.lock().unwrap();
+            slot.as_ref()
+                .filter(|s| s.cwd == cwd && s.read_only == read_only)?
+                .clone()
+        };
+        // 只短等匹配的飞行任务；慢预热不能把正常发送拖进 30/60 秒超时。
+        let ready = timeout(Duration::from_millis(250), entry.conn.lock()).await;
+        let mut slot = slot.lock().unwrap();
+        if !slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, &entry)) {
+            return None;
+        }
+        slot.take();
+        let conn = ready.ok()?.take();
+        conn.filter(|conn| conn.alive.load(Ordering::SeqCst))
+    }
+}
+
+impl Drop for AcpPrewarm {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.get_mut().take() {
+            conn.kill();
+        }
+    }
+}
+
 impl CodeBuddyPrewarm {
     fn kill(mut self) {
         if let Some(pid) = self.child.id() {
@@ -340,7 +378,7 @@ fn keep_known_model_options(fresh: Value, known: Option<&Value>) -> Value {
 
 pub struct AcpConn {
     /// 该连接在连接池中的键；用户线程独立，辅助任务使用 SHARED。
-    key: String,
+    key: StdMutex<String>,
     read_only: bool,
     label: &'static str,
     transport: AcpTransport,
@@ -661,7 +699,7 @@ impl CodeBuddyTurnUsage {
 
 pub struct AcpManager {
     pub app: AppHandle,
-    /// 保留 agent 类型供现有路由和事件载荷使用；ACP 实现仅支持 Devin。
+    /// ACP 后端类型，用于启动配置、路由和事件载荷。
     pub kind: AgentKind,
     /// 额度租借实例使用的独立凭证环境；普通全局实例为空。
     launch_env: HashMap<String, String>,
@@ -671,8 +709,8 @@ pub struct AcpManager {
     slots: StdMutex<HashMap<String, Arc<TokioMutex<Option<Arc<AcpConn>>>>>>,
     /// 热连接 LRU 单调时钟：每次连接被取用时 +1 写入 conn.last_used。
     lru_clock: AtomicU64,
-    /// CodeBuddy 官方 one-shot 预热槽：草稿页启动，首个匹配目录的用户连接消费。
-    codebuddy_prewarm: TokioMutex<Option<CodeBuddyPrewarm>>,
+    /// ponytail: 单个草稿预热槽；多项目预热需求出现后再扩为有界池。
+    prewarmed: StdMutex<Option<Arc<AcpPrewarm>>>,
     /// 存活连接计数：spawn 成功 +1、连接关闭 -1；用于 connected() 与断连广播（归零才广播）。
     alive_conns: AtomicU64,
     routes: StdMutex<HashMap<String, Route>>,
@@ -720,7 +758,7 @@ impl AcpManager {
             permission_scope,
             slots: StdMutex::new(HashMap::new()),
             lru_clock: AtomicU64::new(0),
-            codebuddy_prewarm: TokioMutex::new(None),
+            prewarmed: StdMutex::new(None),
             alive_conns: AtomicU64::new(0),
             routes: StdMutex::new(HashMap::new()),
             loading_sessions: StdMutex::new(HashSet::new()),
@@ -1057,9 +1095,8 @@ impl AcpManager {
     /// 杀掉全部 Devin 连接并清空全局路由。
     /// 用于「重启 agent」「改配置」「应用退出」等需要彻底重置的场景。
     pub async fn kill_conn(&self) {
-        if let Some(prewarm) = self.codebuddy_prewarm.lock().await.take() {
-            prewarm.kill();
-        }
+        // 就绪连接由 Drop 清理；飞行中的旧任务完成后检查归属并销毁。
+        self.prewarmed.lock().unwrap().take();
         let slots: Vec<_> = self.slots.lock().unwrap().drain().map(|(_, v)| v).collect();
         for slot in slots {
             if let Some(conn) = slot.lock().await.take() {
@@ -1157,7 +1194,20 @@ impl AcpManager {
             let s = state.settings.lock().unwrap().clone();
             s
         };
-        let conn = self.spawn_conn(&settings, conn_key, want_cwd).await?;
+        let read_only = self.thread_is_read_only(conn_key);
+        let warmed = if conn_key.starts_with("thread:") {
+            AcpPrewarm::take(&self.prewarmed, want_cwd.unwrap_or_default(), read_only).await
+        } else {
+            None
+        };
+        let conn = match warmed {
+            Some(conn) => {
+                *conn.key.lock().unwrap() = conn_key.to_string();
+                self.push_log(format!("[nova] {} 命中 ACP 预热连接", self.kind.label()));
+                conn
+            }
+            None => self.spawn_conn(&settings, conn_key, want_cwd, read_only).await?,
+        };
         self.touch_conn(&conn);
         *guard = Some(conn.clone());
         if conn_key.starts_with("thread:") {
@@ -1181,8 +1231,9 @@ impl AcpManager {
         settings: &Settings,
         conn_key: &str,
         want_cwd: Option<&str>,
+        read_only: bool,
     ) -> Result<Arc<AcpConn>, String> {
-        // CodeBuddy 走官方 ACP stdio；优先消费官方 one-shot prewarm，失败时冷启动。
+        // 未命中预热时，CodeBuddy 走官方 ACP stdio 冷启动。
         if self.kind == AgentKind::CodeBuddy {
             self.push_log(format!(
                 "[nova] CodeBuddy 正在启动 ACP stdio（key={conn_key}）"
@@ -1192,7 +1243,11 @@ impl AcpManager {
                 .await;
         }
         // Devin 走自己的可执行文件与 acp_args。
-        let (program, args_str) = (settings.devin_path.clone(), settings.acp_args.clone());
+        let (program, args_str) = if self.kind == AgentKind::Kimi {
+            (settings.kimi_path.clone(), "acp".to_string())
+        } else {
+            (settings.devin_path.clone(), settings.acp_args.clone())
+        };
         #[cfg(windows)]
         let mut cmd = build_acp_command(&program, &args_str);
         #[cfg(not(windows))]
@@ -1203,14 +1258,19 @@ impl AcpManager {
         };
         // Devin 的项目级 MCP 配置需要绑定到线程连接的启动目录；CodeBuddy 在
         // session/new 时按标准 ACP mcpServers 注入，进程无需按目录分裂。
+        if self.kind == AgentKind::Kimi {
+            if let Some(cwd) = want_cwd {
+                cmd.current_dir(cwd);
+            }
+        }
         if self.kind == AgentKind::Devin {
-            if let Some(cwd) = want_cwd.filter(|_| conn_key.starts_with("thread:")) {
+            if let Some(cwd) = want_cwd {
                 let launch_dir = prepare_devin_nova_tools_config(
                     &self.app,
                     conn_key,
                     cwd,
                     settings.context_retrieval_mode.as_str(),
-                    self.thread_is_read_only(conn_key),
+                    read_only,
                 )?;
                 cmd.current_dir(&launch_dir);
                 self.push_log(format!(
@@ -1270,7 +1330,7 @@ impl AcpManager {
         // 兜底：挂进 KILL_ON_JOB_CLOSE 的 Job，Nova 无论如何退出都不会残留 agent 孤儿进程
         assign_to_agent_job(&child);
 
-        self.finish_stdio_conn(conn_key, child, false).await
+        self.finish_stdio_conn(conn_key, child, false, read_only).await
     }
 
     async fn finish_stdio_conn(
@@ -1278,6 +1338,7 @@ impl AcpManager {
         conn_key: &str,
         mut child: Child,
         from_prewarm: bool,
+        read_only: bool,
     ) -> Result<Arc<AcpConn>, String> {
         let stdin = child.stdin.take().ok_or("无法获取 agent stdin")?;
         let stdout = child.stdout.take().ok_or("无法获取 agent stdout")?;
@@ -1285,8 +1346,8 @@ impl AcpManager {
 
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
         let conn = Arc::new(AcpConn {
-            key: conn_key.to_string(),
-            read_only: self.thread_is_read_only(conn_key),
+            key: StdMutex::new(conn_key.to_string()),
+            read_only,
             label: self.kind.label(),
             transport: AcpTransport::Stdio(stdin_tx),
             pending: StdMutex::new(HashMap::new()),
@@ -1370,7 +1431,7 @@ impl AcpManager {
         }
     }
 
-    /// CodeBuddy 官方 ACP stdio：优先消费匹配目录的 one-shot prewarm，否则冷启动。
+    /// CodeBuddy 官方 ACP stdio 冷启动（预热认领统一由 ensure_conn_for 完成）。
     async fn spawn_codebuddy_stdio_conn(
         self: &Arc<Self>,
         settings: &Settings,
@@ -1378,31 +1439,6 @@ impl AcpManager {
         want_cwd: Option<&str>,
     ) -> Result<Arc<AcpConn>, String> {
         crate::skills::sync_skills_from_home();
-
-        if let Some(cwd) = want_cwd {
-            let (prewarm, stale) = {
-                let mut slot = self.codebuddy_prewarm.lock().await;
-                if slot.as_ref().is_some_and(|prewarm| prewarm.cwd == cwd) {
-                    (slot.take(), None)
-                } else {
-                    (None, slot.take())
-                }
-            };
-            if let Some(stale) = stale {
-                stale.kill();
-            }
-            if let Some(prewarm) = prewarm {
-                match self
-                    .activate_codebuddy_prewarm(settings, conn_key, prewarm)
-                    .await
-                {
-                    Ok(conn) => return Ok(conn),
-                    Err(error) => self.push_log(format!(
-                        "[nova] CodeBuddy 预热激活失败，回退 ACP 冷启动：{error}"
-                    )),
-                }
-            }
-        }
 
         let (program, mut cmd) = codebuddy_command(&settings.codebuddy_path, &CODEBUDDY_ACP_ARGS);
         if let Some(cwd) = want_cwd {
@@ -1445,7 +1481,7 @@ impl AcpManager {
             .spawn()
             .map_err(|error| format!("无法启动 CodeBuddy ACP（{program}）：{error}"))?;
         assign_to_agent_job(&child);
-        self.finish_stdio_conn(conn_key, child, false).await
+        self.finish_stdio_conn(conn_key, child, false, false).await
     }
 
     async fn activate_codebuddy_prewarm(
@@ -1537,7 +1573,7 @@ impl AcpManager {
         self.push_log(format!(
             "[nova] CodeBuddy 已消费官方预热进程 {id}，切换到 ACP stdio"
         ));
-        self.finish_stdio_conn(conn_key, prewarm.child, true).await
+        self.finish_stdio_conn(conn_key, prewarm.child, true, false).await
     }
 
     async fn on_conn_closed(&self, conn: &Arc<AcpConn>) {
@@ -1552,7 +1588,7 @@ impl AcpManager {
         for (_, tx) in pending {
             let _ = tx.send(Err(format!("{} 进程已退出", self.kind.label())));
         }
-        let key = conn.key.clone();
+        let key = conn.key.lock().unwrap().clone();
         // stale 判定：若该键的槽已换成别的连接（如切目录重启被主动替换的旧连接），本回调只失败
         // pending、不做会话清理，避免误伤新连接。是自己才把槽置空并继续清理本连接的会话。
         let is_current = if let Some(slot) = self.slot_opt(&key) {
@@ -2390,30 +2426,82 @@ impl AcpManager {
         );
     }
 
-    /// CodeBuddy 官方预热：后台完成 bundle / DI / 配置 / MCP discovery，首条消息时
-    /// 通过 cbc-prewarm activate 绑定项目，并在原进程管道上切换为 ACP stdio。
-    pub async fn prewarm(self: &Arc<Self>, cwd: String) {
-        if self.kind != AgentKind::CodeBuddy {
+    /// 草稿页提前启动并完成 ACP initialize；CodeBuddy 的官方 activate 也在后台完成。
+    /// 不创建 session，发送时仍按真实线程注入 MCP 并设置模型/模式。
+    pub async fn prewarm(self: &Arc<Self>, cwd: String, mode: Option<String>) {
+        if !matches!(self.kind, AgentKind::Devin | AgentKind::CodeBuddy) {
             return;
         }
-        // 持槽锁完成替换，保证用户快速切换 A→B 项目时旧 A 的迟到结果不会覆盖 B。
-        let mut slot = self.codebuddy_prewarm.lock().await;
-        if slot.as_ref().is_some_and(|prewarm| prewarm.cwd == cwd) {
-            return;
-        }
+        let read_only = self.kind == AgentKind::Devin
+            && mode.as_deref().map(unify_mode_id).as_deref() == Some("plan");
+        let entry = Arc::new(AcpPrewarm {
+            cwd: cwd.clone(),
+            read_only,
+            conn: TokioMutex::new(None),
+        });
+        // 先锁新条目再发布，发送路径看到它时就能等待正在进行的初始化。
+        let mut ready = entry.conn.lock().await;
+        let old = {
+            let mut slot = self.prewarmed.lock().unwrap();
+            if let Some(current) = slot.as_ref() {
+                if current.cwd == cwd && current.read_only == read_only {
+                    match current.conn.try_lock() {
+                        Err(_) => return,
+                        Ok(conn)
+                            if conn
+                                .as_ref()
+                                .is_some_and(|c| c.alive.load(Ordering::SeqCst)) =>
+                        {
+                            return
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            slot.replace(entry.clone())
+        };
+        drop(old);
         let settings = {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap().clone();
             settings
         };
-        match self.spawn_codebuddy_prewarm(&settings, cwd.clone()).await {
-            Ok(prewarm) => {
-                if let Some(old) = slot.replace(prewarm) {
-                    old.kill();
+        crate::skills::sync_skills_from_home();
+        let started = std::time::Instant::now();
+        let key = format!("prewarm-{}", uuid::Uuid::new_v4().simple());
+        let result = if self.kind == AgentKind::CodeBuddy {
+            match self.spawn_codebuddy_prewarm(&settings, cwd.clone()).await {
+                Ok(process) => {
+                    self.activate_codebuddy_prewarm(&settings, &key, process)
+                        .await
                 }
-                self.push_log(format!("[nova] CodeBuddy 预热已就绪：{cwd}"));
+                Err(error) => Err(error),
             }
-            Err(error) => self.push_log(format!("[nova] CodeBuddy 预热失败：{error}")),
+        } else {
+            self.spawn_conn(&settings, &key, Some(&cwd), read_only)
+                .await
+        };
+        let mut slot = self.prewarmed.lock().unwrap();
+        let current = slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, &entry));
+        match result {
+            Ok(conn) if current => {
+                *ready = Some(conn);
+                self.push_log(format!(
+                    "[nova] {} ACP 预热已就绪：{cwd}（{}ms）",
+                    self.kind.label(),
+                    started.elapsed().as_millis()
+                ));
+            }
+            Ok(conn) => conn.kill(),
+            Err(error) => {
+                if current {
+                    slot.take();
+                }
+                self.push_log(format!(
+                    "[nova] {} ACP 预热失败：{error}",
+                    self.kind.label()
+                ));
+            }
         }
     }
 
@@ -2558,7 +2646,8 @@ impl AcpManager {
                 }
                 self.loading_sessions.lock().unwrap().remove(&sid);
                 match loaded {
-                    Ok(_) => {
+                    Ok(result) => {
+                        self.capture_options(&result, !conn.from_prewarm);
                         // session/load 成功，继续复用该会话。
                         sid
                     }
@@ -2935,7 +3024,8 @@ impl AcpManager {
             }
             self.slots.lock().unwrap().remove(&key);
             self.push_log(format!(
-                "[nova] Devin 模式读写权限变化，已重启线程连接以刷新 nova-tools（thread={thread_id}）"
+                "[nova] {} 模式读写权限变化，已重启线程连接以刷新 nova-tools（thread={thread_id}）",
+                self.kind.label()
             ));
             return;
         }
@@ -3851,8 +3941,8 @@ impl AcpManager {
     /// Devin 保持无前缀的 perm- key；CodeBuddy 每线程一条连接、RPC id 各自递增，
     /// 必须把连接键纳入作用域，避免两个并发会话的权限请求互相覆盖。
     fn permission_key(&self, conn: &AcpConn, id: &Value) -> String {
-        let scope = if self.kind == AgentKind::CodeBuddy {
-            format!("{}{}-", self.permission_scope_prefix(), conn.key)
+        let scope = if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
+            format!("{}{}-", self.permission_scope_prefix(), conn.key.lock().unwrap())
         } else {
             self.permission_scope_prefix()
         };
@@ -3883,7 +3973,7 @@ impl AcpManager {
         read_only: bool,
         thread_id: &str,
     ) -> Result<Value, String> {
-        if self.kind != AgentKind::CodeBuddy {
+        if !matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
             return Ok(json!([]));
         }
         let state = self.app.state::<AppState>();
@@ -5289,4 +5379,81 @@ fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod acp_prewarm_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prewarm_claim_is_matched_bounded_and_one_shot() {
+        fn entry(cwd: &str, read_only: bool, alive: bool) -> Arc<AcpPrewarm> {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            Arc::new(AcpPrewarm {
+                cwd: cwd.into(),
+                read_only,
+                conn: TokioMutex::new(Some(Arc::new(AcpConn {
+                    key: StdMutex::new("prewarm-test".into()),
+                    read_only,
+                    label: "test",
+                    transport: AcpTransport::Stdio(tx),
+                    pending: StdMutex::new(HashMap::new()),
+                    next_id: AtomicU64::new(1),
+                    alive: AtomicBool::new(alive),
+                    child: StdMutex::new(None),
+                    last_used: AtomicU64::new(0),
+                    from_prewarm: false,
+                }))),
+            })
+        }
+        let first = entry("A", true, true);
+        let slot = StdMutex::new(Some(first.clone()));
+        assert!(AcpPrewarm::take(&slot, "B", true).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        assert!(slot.lock().unwrap().is_some());
+        assert!(AcpPrewarm::take(&slot, "A", true).await.is_some());
+        assert!(AcpPrewarm::take(&slot, "A", true).await.is_none());
+
+        *slot.lock().unwrap() = Some(entry("A", false, false));
+        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        assert!(slot.lock().unwrap().is_none());
+
+        let pending = entry("A", false, true);
+        let held = pending.conn.lock().await;
+        *slot.lock().unwrap() = Some(pending.clone());
+        assert!(
+            timeout(Duration::from_secs(2), AcpPrewarm::take(&slot, "A", false))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(slot.lock().unwrap().is_none());
+        drop(held);
+
+        // 旧目录的等待结束时不能认领或清空后来发布的新目录。
+        let held = pending.conn.lock().await;
+        *slot.lock().unwrap() = Some(pending.clone());
+        let next = entry("B", false, true);
+        let (claimed, ()) = tokio::join!(AcpPrewarm::take(&slot, "A", false), async {
+            sleep(Duration::from_millis(10)).await;
+            *slot.lock().unwrap() = Some(next.clone());
+            drop(held);
+        });
+        assert!(claimed.is_none());
+        assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &next));
+        assert!(AcpPrewarm::take(&slot, "B", false).await.is_some());
+
+        // 槽替换/关闭即便撞上预热完成，最后一个条目引用释放时仍要杀掉未认领连接。
+        let unused = entry("C", false, true);
+        let conn = unused.conn.lock().await.as_ref().unwrap().clone();
+        drop(unused);
+        assert!(!conn.alive.load(Ordering::SeqCst));
+
+        *slot.lock().unwrap() = Some(entry("D", false, true));
+        let (a, b) = tokio::join!(
+            AcpPrewarm::take(&slot, "D", false),
+            AcpPrewarm::take(&slot, "D", false)
+        );
+        assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
+    }
 }
