@@ -1451,7 +1451,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         const avgRate = turnAvgTokensPerSec(g.turn);
         const label = ["已处理", fmtDuration(g.turn.durationMs),
           g.turn.totalTokens ? `· ${fmtTokens(g.turn.totalTokens)} tokens` : "",
-          avgRate != null ? `· ${fmtTokens(avgRate)} tok/s` : "",
+          avgRate != null ? `· 平均输出 ${fmtTokens(avgRate)} tok/s` : "",
         ].filter(Boolean).join(" ");
         const tokenTip = turnTokenTitle(g.turn);
 

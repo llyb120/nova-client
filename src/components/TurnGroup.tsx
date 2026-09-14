@@ -125,12 +125,12 @@ export function turnTokenTitle(t: TurnItem | undefined | null): string | undefin
   return `${parts.join(" / ")} tokens`;
 }
 
-/** 平均 token 速度：轮次总 tokens / 耗时（秒）。耗时 <1s 时样本无意义，返回 null。 */
+/** 平均输出速度：输出 tokens / 整轮耗时（含工具执行和等待），不是模型纯生成速度。 */
 export function turnAvgTokensPerSec(t: TurnItem | undefined | null): number | null {
-  const total = t?.totalTokens ?? 0;
+  const output = t?.outputTokens;
   const ms = t?.durationMs ?? 0;
-  if (!total || ms < 1_000) return null;
-  return Math.round(total / (ms / 1_000));
+  if (output == null || !Number.isFinite(output) || output < 0 || !Number.isFinite(ms) || ms < 1_000) return null;
+  return Math.round(output / (ms / 1_000));
 }
 
 function isBusyItem(item: Item): boolean {
@@ -204,7 +204,7 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
     const dur = t ? fmtDuration(t.durationMs) : "";
     const tok = t?.totalTokens ? `${fmtTokens(t.totalTokens)} tokens` : "";
     const avg = turnAvgTokensPerSec(t);
-    return ["已处理", dur, tok ? `· ${tok}` : "", avg != null ? `· ${fmtTokens(avg)} tok/s` : ""]
+    return ["已处理", dur, tok ? `· ${tok}` : "", avg != null ? `· 平均输出 ${fmtTokens(avg)} tok/s` : ""]
       .filter(Boolean).join(" ");
   };
 
