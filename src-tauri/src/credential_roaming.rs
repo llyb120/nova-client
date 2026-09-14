@@ -216,6 +216,7 @@ pub fn collect_credentials(
     let mut files = Vec::new();
     let mut env = HashMap::new();
     match &agent_kind {
+        AgentKind::Kimi => return Err("Kimi Code 暂不支持额度租借".into()),
         AgentKind::Lyra => {
             // 出借方已导出合并后的生效配置（含解析后的密钥），直接打包。
             let config = lyra_config
@@ -379,6 +380,7 @@ pub fn materialize_runtime(
     )?;
     stage_local_skills(&app, expected_kind, &launch_env)?;
     let manager = match expected_kind {
+        AgentKind::Kimi => return Err("Kimi Code 暂不支持额度租借".into()),
         AgentKind::Lyra => {
             BorrowedManager::Sdk(SdkManager::new_with_env(app, LyraAdapter, launch_env))
         }
@@ -416,6 +418,7 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
     let mut env = HashMap::new();
     let as_string = |path: PathBuf| path.to_string_lossy().to_string();
     match kind {
+        AgentKind::Kimi => return Err("Kimi Code 暂不支持额度租借".into()),
         AgentKind::Lyra => {
             // 进程内运行时从 NOVA_DATA_DIR/alkaid/config.jsonc 读配置，指向隔离根目录即可
             env.insert("NOVA_DATA_DIR".into(), as_string(root.to_path_buf()));
@@ -501,6 +504,7 @@ fn stage_local_skills(
     env: &HashMap<String, String>,
 ) -> Result<(), String> {
     let root = match kind {
+        AgentKind::Kimi => return Err("Kimi Code 暂不支持额度租借".into()),
         AgentKind::Lyra => env
             .get("NOVA_DATA_DIR")
             .map(PathBuf::from)
@@ -566,7 +570,7 @@ fn credential_path_allowed(kind: &AgentKind, raw: &str) -> bool {
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => path
             .strip_prefix("profile/AppData/Local/CodeBuddyExtension/Data/Public/auth/")
             .is_some_and(|name| !name.is_empty() && !name.contains('/')),
-        AgentKind::ClaudeCode | AgentKind::Cursor => false,
+        AgentKind::Kimi | AgentKind::ClaudeCode | AgentKind::Cursor => false,
         AgentKind::OpenCode | AgentKind::OpenCodePlus => path == "opencode-data/opencode/auth.json",
     }
 }

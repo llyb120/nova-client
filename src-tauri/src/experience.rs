@@ -1157,6 +1157,13 @@ async fn run_training_turn(
                     .run_prompt(thread_id.into(), prompt, Vec::new())
                     .await
             }
+            AgentKind::Kimi => {
+                state
+                    .kimi
+                    .clone()
+                    .run_prompt(thread_id.into(), prompt, Vec::new())
+                    .await
+            }
             AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                 return Err(format!(
                     "{} 暂不支持经验训练，请选择 Lyra、Devin、Codex、CodeBuddy、Claude 或 Cursor",

@@ -1,6 +1,6 @@
 import type { WorkflowDef } from "./workflow/types";
 
-export type AgentKind = "lyra" | "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
+export type AgentKind = "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
 
 export interface SlashCommand {
   name: string;
@@ -421,6 +421,9 @@ export interface PendingNewSessionSeed {
 }
 
 export interface Settings {
+  kimiPath: string;
+  kimiProxy: string;
+  kimiEnabled: boolean;
   devinPath: string;
   acpArgs: string;
   /** Devin 代理地址（空 = 不代理；下同：注入 HTTP(S)_PROXY 到该后端子进程） */

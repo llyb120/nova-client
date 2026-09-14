@@ -1005,6 +1005,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
     for kind in [
         AgentKind::Lyra,
         AgentKind::Devin,
+        AgentKind::Kimi,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
         AgentKind::ClaudeCode,
@@ -1028,6 +1029,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         let value = match kind {
             AgentKind::Lyra => state.lyra.get_model_options(),
             AgentKind::Devin => state.acp.get_model_options(),
+            AgentKind::Kimi => state.kimi.get_model_options(),
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.get_model_options(),
             AgentKind::ClaudeCode => state.claudeplus.get_model_options(),
@@ -1992,6 +1994,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         // 不能清理目标后端：独占连接的 manager 会异步杀连接，可能误杀新连接。
         match old_kind {
             AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Kimi => state.kimi.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Codex | AgentKind::CodexPlus => {
                 state.codexplus.forget_session_of_thread(&cmd.thread_id)
             }
@@ -2018,6 +2021,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         match new_kind {
             AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Kimi => state.kimi.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Codex | AgentKind::CodexPlus => {
                 state.codexplus.forget_session_of_thread(&cmd.thread_id)
             }
@@ -2053,7 +2057,9 @@ async fn respond_remote_permission(
     if let Some(runtime) = borrowed {
         return runtime.respond_permission(request_key, option_id).await;
     }
-    if request_key.starts_with("cdp-") {
+    if request_key.starts_with("kimi-") {
+        state.kimi.respond_permission(request_key, option_id).await
+    } else if request_key.starts_with("cdp-") {
         state
             .codexplus
             .respond_permission(request_key, option_id)
@@ -2633,6 +2639,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
     match kind {
         AgentKind::Lyra => state.lyra.cancel(thread_id).await,
         AgentKind::Devin => state.acp.cancel(thread_id).await,
+        AgentKind::Kimi => state.kimi.cancel(thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.cancel(thread_id).await,
         AgentKind::ClaudeCode => state.claudeplus.cancel(thread_id).await,

@@ -2,6 +2,7 @@ import type { AgentKind, ToolContent, ToolItem } from "./types";
 
 /** agent 展示名（徽标 / 标题 / 提示文案统一用） */
 export function agentLabel(kind: AgentKind): string {
+  if (kind === "kimi") return "Kimi Code";
   switch (kind) {
     case "lyra":
       return "Lyra";
@@ -23,6 +24,7 @@ export function agentLabel(kind: AgentKind): string {
 /** agent 单字徽标（侧边栏紧凑展示）：Lyra=L / Devin=D / Codex=C / CodeBuddy=B /
  *  Claude Code=CC / Cursor=CS / OpenCode=OC */
 export function agentShort(kind: AgentKind): string {
+  if (kind === "kimi") return "K";
   switch (kind) {
     case "lyra":
       return "L";

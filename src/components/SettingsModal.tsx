@@ -246,6 +246,9 @@ const TABS: { id: SettingsTab; name: string }[] = [
 export function SettingsModal(props: { onClose: () => void }) {
   const s = state.settings;
   const [tab, setTab] = createSignal<SettingsTab>("general");
+  const [kimiPath, setKimiPath] = createSignal(s?.kimiPath ?? "kimi");
+  const [kimiProxy, setKimiProxy] = createSignal(s?.kimiProxy ?? "");
+  const [kimiEnabled, setKimiEnabled] = createSignal(s?.kimiEnabled === true);
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
   const [acpArgs, setAcpArgs] = createSignal(s?.acpArgs ?? "acp");
   const [codebuddyPath, setCodebuddyPath] = createSignal(s?.codebuddyPath ?? "codebuddy");
@@ -421,6 +424,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const enabledCount = () =>
     [
       devinEnabled(),
+      kimiEnabled(),
       lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
@@ -697,6 +701,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   };
 
   const draftSettings = (): Settings => ({
+    kimiPath: kimiPath().trim() || "kimi",
+    kimiProxy: kimiProxy().trim(),
+    kimiEnabled: kimiEnabled(),
     devinPath: devinPath().trim() || "devin",
     acpArgs: acpArgs().trim() || "acp",
     codebuddyPath: codebuddyPath().trim() || "codebuddy",
@@ -1707,6 +1714,27 @@ export function SettingsModal(props: { onClose: () => void }) {
                   {lyraRefreshing() ? "刷新中…" : "刷新配置"}
                 </button>
               </div>
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class="agent-badge kimi">Kimi Code</span>
+                <span class="fixed-integration">ACP</span>
+                <Show when={backendMissing("kimi")}><span class="backend-missing">未检测到 CLI</span></Show>
+                <label class="backend-switch">
+                  <input type="checkbox" checked={kimiEnabled()} disabled={kimiEnabled() && enabledCount() === 1} onChange={(e) => setKimiEnabled(e.currentTarget.checked)} />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager status={cliStatuses().kimi} loading={cliLoading()} />
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">可执行文件</span>
+                  <input class="field-input" value={kimiPath()} onInput={(e) => setKimiPath(e.currentTarget.value)} placeholder="kimi" />
+                </label>
+              </div>
+              <ProxyField value={kimiProxy()} onInput={setKimiProxy} />
+              <p class="field-hint">安装后先在终端运行 kimi，通过 /login 登录，再启用并保存。Windows 需要 Git for Windows；自定义 Git Bash 路径可在环境变量中设置 KIMI_SHELL_PATH。</p>
             </div>
 
             <div class="backend-card">

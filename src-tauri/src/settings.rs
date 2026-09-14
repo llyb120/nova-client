@@ -159,6 +159,10 @@ impl Default for ExperienceExpertConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    /// Kimi Code CLI，使用固定的 `acp` 子命令。
+    pub kimi_path: String,
+    pub kimi_proxy: String,
+    pub kimi_enabled: bool,
     /// ACP agent 可执行文件路径（默认 devin，依赖 PATH）
     pub devin_path: String,
     /// Devin ACP 启动参数（空格分隔）。
@@ -311,6 +315,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            kimi_path: "kimi".into(),
+            kimi_proxy: String::new(),
+            kimi_enabled: false,
             devin_path: "devin".into(),
             acp_args: "acp".into(),
             devin_proxy: String::new(),

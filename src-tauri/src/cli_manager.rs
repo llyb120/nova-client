@@ -52,6 +52,14 @@ fn configured_cli_program(configured: &str, expected_names: &[&str], fallback: &
 
 fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
     match kind {
+        AgentKind::Kimi => CliSpec {
+            kind: kind.clone(),
+            cli_name: "kimi-code",
+            program: settings.kimi_path.clone(),
+            version_args: vec!["--version".into()],
+            install_command: "npm install -g @moonshot-ai/kimi-code@latest".into(),
+            proxy: settings.kimi_proxy.clone(),
+        },
         AgentKind::Lyra => CliSpec {
             kind: kind.clone(),
             cli_name: "lyra",
@@ -117,6 +125,7 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
 
 fn all_specs(settings: &Settings) -> Vec<CliSpec> {
     [
+        AgentKind::Kimi,
         AgentKind::Devin,
         AgentKind::Codex,
         AgentKind::CodeBuddy,

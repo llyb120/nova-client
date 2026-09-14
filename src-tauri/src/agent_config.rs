@@ -187,6 +187,7 @@ fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
     [
         AgentKind::Lyra,
         AgentKind::Devin,
+        AgentKind::Kimi,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
         AgentKind::ClaudeCode,
@@ -204,6 +205,13 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
         .or_else(user_home_dir)
         .ok_or("无法确定用户主目录")?;
     let (label, path, format) = match kind {
+        AgentKind::Kimi => (
+            kind.label(),
+            configured_dir(overrides, "KIMI_CODE_HOME")
+                .unwrap_or_else(|| home.join(".kimi-code"))
+                .join("AGENTS.md"),
+            TargetFormat::Markdown,
+        ),
         // Lyra 沿用旧 Vega 数据目录与 AGENTS.md。
         AgentKind::Lyra => (
             "Lyra",

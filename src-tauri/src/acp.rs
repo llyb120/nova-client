@@ -937,7 +937,10 @@ impl AcpManager {
     /// 界面只暴露两种模式：build（放开全部权限执行，等价原 Bypass Permissions）与
     /// plan（只规划不执行）。旧数据里的 bypass 视同 build；其余值（历史会话存的
     /// 后端原生模式，如 accept-edits / ask）原样透传，交由可用列表校验兜底。
-    fn backend_mode_id(&self, mode: &str) -> String {
+    fn backend_mode_id(kind: &AgentKind, mode: &str) -> String {
+        if *kind == AgentKind::Kimi && matches!(mode, "build" | "bypass") {
+            return "yolo".into();
+        }
         match mode {
             "build" | "bypass" => "bypass".into(),
             "plan" => "plan".into(),
@@ -948,6 +951,7 @@ impl AcpManager {
     /// 该后端在设置里配置的代理地址（空 = 不代理）
     fn proxy_of<'a>(&self, settings: &'a Settings) -> &'a str {
         match self.kind {
+            AgentKind::Kimi => &settings.kimi_proxy,
             AgentKind::CodeBuddy => &settings.codebuddy_proxy,
             _ => &settings.devin_proxy,
         }
@@ -1647,7 +1651,11 @@ impl AcpManager {
             let tx = conn.pending.lock().unwrap().remove(&id);
             if let Some(tx) = tx {
                 if let Some(err) = msg.get("error") {
-                    let text = err["message"].as_str().unwrap_or("未知错误").to_string();
+                    let text = if self.kind == AgentKind::Kimi && err["code"].as_i64() == Some(-32000) {
+                        "Kimi Code 尚未登录：请在终端运行 kimi，通过 /login 登录后重试。".to_string()
+                    } else {
+                        err["message"].as_str().unwrap_or("未知错误").to_string()
+                    };
                     let _ = tx.send(Err(text));
                 } else {
                     let _ = tx.send(Ok(msg["result"].clone()));
@@ -1686,7 +1694,8 @@ impl AcpManager {
                         .map(|m| is_full_permission_mode(&m))
                         .unwrap_or(false)
                 };
-                if is_build {
+                // Kimi 同一通道也承载问题提问，必须交给用户选择。
+                if is_build && self.kind != AgentKind::Kimi {
                     let allow = params
                         .get("options")
                         .and_then(|o| o.as_array())
@@ -1813,6 +1822,10 @@ impl AcpManager {
 
         if kind == "available_commands_update" {
             self.capture_commands(update);
+            return;
+        }
+        if kind == "config_option_update" && self.kind == AgentKind::Kimi {
+            self.capture_options(update, true);
             return;
         }
 
@@ -1976,7 +1989,11 @@ impl AcpManager {
                     // 以前若只改了后端 session、UI 事件被 active_thread 门控丢掉，就会出现
                     // 「已进 Plan 并停住，但前端仍显示 Build、也没有实施按钮」。
                     if let Some(mode) = update["currentModeId"].as_str() {
-                        let reported = unify_mode_id(mode);
+                        let reported = if self.kind == AgentKind::Kimi && mode == "yolo" {
+                            "build".to_string()
+                        } else {
+                            unify_mode_id(mode)
+                        };
                         if let Some(r) = self.routes.lock().unwrap().get_mut(session_id) {
                             r.applied_mode = Some(reported.clone());
                         }
@@ -2617,7 +2634,7 @@ impl AcpManager {
         // 翻译结果不在可用列表时：先找语义等价 fallback（Build→其它全权限 id）；
         // 没有 fallback 仍尝试下发，避免以前「直接标成已应用」导致 UI 显示 Build、
         // session 实际停在默认 Plan、也没有「实施」按钮。
-        let mut mode_to_send = need_mode.clone().map(|m| self.backend_mode_id(&m));
+        let mut mode_to_send = need_mode.clone().map(|m| Self::backend_mode_id(&self.kind, &m));
         if let (Some(m), Some(target)) = (need_mode.clone(), mode_to_send.clone()) {
             if self
                 .known_mode_ids()
@@ -3021,6 +3038,12 @@ impl AcpManager {
         text: String,
         images: Vec<PromptImage>,
     ) {
+        // ACP 不提供并发 prompt 注入；桌面输入沿用提示词队列，其它入口明确报忙。
+        if self.kind == AgentKind::Kimi && self.is_running(&thread_id) {
+            crate::append_thread_error(&self.app, &thread_id,
+                "Kimi Code 正在工作，请将消息加入队列或停止后重试".into());
+            return;
+        }
         // 漫游和额度入口也会直接调用 run_prompt；追加消息统一走 CodeBuddy 原生引导。
         if self.kind == AgentKind::CodeBuddy && self.is_running(&thread_id) {
             Box::pin(self.steer_prompt(thread_id, text, images)).await;
@@ -3816,7 +3839,9 @@ impl AcpManager {
     /// 该连接需要自动代答的权限请求作用域：Devin 与 CodeBuddy 的递增 RPC id
     /// 都在同一前端路由表里，CodeBuddy 加 cbp- 前缀避免键碰撞。
     fn permission_scope_prefix(&self) -> String {
-        if self.permission_scope.is_empty() && self.kind == AgentKind::CodeBuddy {
+        if self.permission_scope.is_empty() && self.kind == AgentKind::Kimi {
+            "kimi-".to_string()
+        } else if self.permission_scope.is_empty() && self.kind == AgentKind::CodeBuddy {
             "cbp-".to_string()
         } else {
             self.permission_scope.clone()
@@ -3888,7 +3913,8 @@ impl AcpManager {
             &state.config_dir,
         )?;
         self.push_log(format!(
-            "[nova] CodeBuddy 已为 {cwd} 注入 nova-tools{}",
+            "[nova] {} 已为 {cwd} 注入 nova-tools{}",
+            self.kind.label(),
             if browser_debug { "/browser" } else { "" }
         ));
         Ok(json!([server]))
@@ -4064,6 +4090,20 @@ fn codebuddy_activation_env(
 
 #[cfg(test)]
 mod codebuddy_acp_tests {
+    #[test]
+    fn kimi_acp_configuration_contract() {
+        let settings: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.kimi_path, "kimi");
+        assert!(!settings.kimi_enabled);
+        assert_eq!(super::AgentKind::from_str("kimi"), Some(super::AgentKind::Kimi));
+        assert_eq!(serde_json::to_string(&super::AgentKind::Kimi).unwrap(), "\"kimi\"");
+        for (mode, expected) in [("build", "yolo"), ("bypass", "yolo"), ("plan", "plan"), ("default", "default")] {
+            assert_eq!(super::AcpManager::backend_mode_id(&super::AgentKind::Kimi, mode), expected);
+        }
+        assert_eq!(super::AcpManager::backend_mode_id(&super::AgentKind::Devin, "build"), "bypass");
+        assert_eq!(super::AcpManager::backend_mode_id(&super::AgentKind::CodeBuddy, "build"), "bypass");
+    }
+
     use super::{
         codebuddy_command, codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
         is_process_exit_error, is_retriable_rpc_error, keep_known_model_options, lru_evict_keys,

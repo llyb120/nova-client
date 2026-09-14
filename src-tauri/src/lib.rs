@@ -83,6 +83,7 @@ pub struct AppState {
     /// socket and calls the same in-process engine directly.
     pub(crate) context_service: context_service::ContextService,
     pub acp: Arc<AcpManager>,
+    pub kimi: Arc<AcpManager>,
     /// OpenCode 官方 SDK 对应的 HTTP API 后端，不经过 ACP。
     pub opencodeplus: Arc<OpenCodeSdkManager>,
     pub codex: Arc<CodexManager>,
@@ -122,9 +123,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Devin 是唯一使用 ACP 的后端。
+    /// 使用公共 ACP 运行时的后端。
     pub fn acp_for(&self, kind: &AgentKind) -> Option<Arc<AcpManager>> {
         match kind {
+            AgentKind::Kimi => Some(self.kimi.clone()),
             AgentKind::Devin => Some(self.acp.clone()),
             _ => None,
         }
@@ -144,6 +146,7 @@ impl AppState {
         match kind {
             AgentKind::Lyra => s.lyra_enabled,
             AgentKind::Devin => s.devin_enabled,
+            AgentKind::Kimi => s.kimi_enabled,
             AgentKind::Codex => s.codex_enabled,
             AgentKind::CodexPlus => s.codexplus_enabled,
             AgentKind::CodeBuddy => s.codebuddy_enabled,
@@ -303,6 +306,7 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     match thread.agent_kind {
         AgentKind::Lyra => state.lyra.is_running(&thread.id),
         AgentKind::Devin => state.acp.is_running(&thread.id),
+        AgentKind::Kimi => state.kimi.is_running(&thread.id),
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.is_running(&thread.id),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.is_running(&thread.id),
         AgentKind::ClaudeCode => state.claudeplus.is_running(&thread.id),
@@ -527,6 +531,7 @@ fn any_session_running(state: &AppState) -> bool {
 
 pub(crate) async fn shutdown_agent_processes(state: &AppState) {
     state.acp.kill_conn().await;
+    state.kimi.kill_conn().await;
     state.codex.kill_conn().await;
     state.codexplus.shutdown();
     state.codebuddy.shutdown();
@@ -912,6 +917,7 @@ fn spawn_backend_availability_check(app: tauri::AppHandle) {
                 // Lyra 是随 Nova 提供的内置后端；占位 program 不参与其可用性判定。
                 (AgentKind::Lyra, String::new()),
                 (AgentKind::Devin, s.devin_path.clone()),
+                (AgentKind::Kimi, s.kimi_path.clone()),
                 (AgentKind::Codex, s.codex_path.clone()),
                 (AgentKind::CodeBuddy, s.codebuddy_path.clone()),
                 (AgentKind::ClaudeCode, s.claudecode_path.clone()),
@@ -2251,6 +2257,12 @@ async fn merge_worktree_thread(
                         mgr.run_prompt(thread_id, prompt, vec![]).await;
                     });
                 }
+                AgentKind::Kimi => {
+                    let mgr = state.kimi.clone();
+                    tauri::async_runtime::spawn(async move {
+                        mgr.run_prompt(thread_id, prompt, vec![]).await;
+                    });
+                }
                 AgentKind::Codex | AgentKind::CodexPlus => {
                     let mgr = state.codexplus.clone();
                     tauri::async_runtime::spawn(async move {
@@ -2568,6 +2580,7 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
     for thread in &removed {
         let id = &thread.id;
         state.acp.forget_session_of_thread(id);
+        state.kimi.forget_session_of_thread(id);
         state.codex.forget_session_of_thread(id);
         state.lyra.forget_session_of_thread(id);
         state.codexplus.forget_session_of_thread(id);
@@ -3348,6 +3361,7 @@ fn delete_time_machine_context(
     match agent_kind {
         AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
         AgentKind::Devin => state.acp.forget_session_of_thread(&thread_id),
+        AgentKind::Kimi => state.kimi.forget_session_of_thread(&thread_id),
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codexplus.forget_session_of_thread(&thread_id)
         }
@@ -3496,10 +3510,12 @@ fn set_thread_model(
     } else if is_quota {
         // 重启后隔离运行时已丢、但本次已持有目标模型租约：新模型已落库，
         // 下一轮发送会走 restore_quota_runtime 重建，不能去动本机全局 manager。
-    } else if agent_kind == AgentKind::Devin
+    } else if matches!(agent_kind, AgentKind::Devin | AgentKind::Kimi)
         || matches!(agent_kind, AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus)
     {
-        let mgr = if agent_kind == AgentKind::Devin {
+        let mgr = if agent_kind == AgentKind::Kimi {
+            state.kimi.clone()
+        } else if agent_kind == AgentKind::Devin {
             state.acp.clone()
         } else {
             state.codebuddy.clone()
@@ -3518,7 +3534,7 @@ fn set_thread_model(
             AgentKind::OpenCode | AgentKind::OpenCodePlus => {
                 state.opencodeplus.forget_session_of_thread(&thread_id)
             }
-            AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {}
+            AgentKind::Devin | AgentKind::Kimi | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {}
         }
     }
     Ok(())
@@ -3727,6 +3743,7 @@ fn set_thread_agent(
         } else {
             match old_kind {
                 AgentKind::Devin => state.acp.forget_session_of_thread(&thread_id),
+                AgentKind::Kimi => state.kimi.forget_session_of_thread(&thread_id),
                 AgentKind::Codex => state.codexplus.forget_session_of_thread(&thread_id),
                 AgentKind::CodeBuddy => state.codebuddy.forget_session_of_thread(&thread_id),
                 AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&thread_id),
@@ -3765,6 +3782,7 @@ async fn get_model_options(
     match agent_kind {
         AgentKind::Lyra => state.lyra.ensure_model_options().await.map(Some),
         AgentKind::Devin => state.acp.ensure_model_options().await.map(Some),
+        AgentKind::Kimi => state.kimi.ensure_model_options().await.map(Some),
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codex.ensure_model_options().await.map(Some)
         }
@@ -3800,6 +3818,10 @@ async fn get_slash_commands(
         AgentKind::Lyra => Ok(list_lyra_skill_commands(&state.config_dir)),
         AgentKind::Devin => {
             let commands = state.acp.fetch_commands().await?;
+            Ok(commands.as_array().cloned().unwrap_or_default())
+        }
+        AgentKind::Kimi => {
+            let commands = state.kimi.fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
         }
         AgentKind::Codex | AgentKind::CodexPlus => Ok(list_codex_skill_commands(&state.config_dir)),
@@ -4095,6 +4117,15 @@ pub(crate) fn dispatch_prompt(
                 mgr.run_prompt(thread_id, text, images).await;
             });
         }
+        AgentKind::Kimi => {
+            let mgr = state.kimi.clone();
+            if mgr.is_running(&thread_id) {
+                return Err("Kimi Code 正在工作，请将消息加入队列或停止后重试".into());
+            }
+            tauri::async_runtime::spawn(async move {
+                mgr.run_prompt(thread_id, text, images).await;
+            });
+        }
     }
     Ok(())
 }
@@ -4190,6 +4221,7 @@ fn truncate_thread(
         state.relay.guest_truncate(&thread_id, item_id)?;
     }
     state.acp.forget_session_of_thread(&thread_id);
+    state.kimi.forget_session_of_thread(&thread_id);
     state.codex.forget_session_of_thread(&thread_id);
     state.codexplus.forget_session_of_thread(&thread_id);
     state.codebuddy.forget_session_of_thread(&thread_id);
@@ -4365,6 +4397,7 @@ async fn cancel_turn(
     match kind {
         AgentKind::Lyra => state.lyra.cancel(&thread_id).await,
         AgentKind::Devin => state.acp.cancel(&thread_id).await,
+        AgentKind::Kimi => state.kimi.cancel(&thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(&thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.cancel(&thread_id).await,
         AgentKind::ClaudeCode => state.claudeplus.cancel(&thread_id).await,
@@ -4428,7 +4461,9 @@ async fn respond_permission(
     if let Some(runtime) = borrowed {
         return runtime.respond_permission(&request_key, &option_id).await;
     }
-    if request_key.starts_with("cdp-") {
+    if request_key.starts_with("kimi-") {
+        state.kimi.respond_permission(&request_key, &option_id).await
+    } else if request_key.starts_with("cdp-") {
         state
             .codexplus
             .respond_permission(&request_key, &option_id)
@@ -4513,6 +4548,7 @@ async fn apply_runtime_settings(
     let (
         restart_lyra,
         restart_devin,
+        restart_kimi,
         restart_codebuddy,
         restart_claudecode,
         restart_cursor,
@@ -4542,6 +4578,12 @@ async fn apply_runtime_settings(
             || custom_env_changed
             || s.lyra_proxy != settings.lyra_proxy
             || s.lyra_enabled != settings.lyra_enabled;
+        let restart_kimi = restart_all_agents
+            || custom_env_changed
+            || context_runtime_changed
+            || s.kimi_path != settings.kimi_path
+            || s.kimi_proxy != settings.kimi_proxy
+            || s.kimi_enabled != settings.kimi_enabled;
         let restart_devin = restart_all_agents
             || context_runtime_changed
             || s.devin_path != settings.devin_path
@@ -4584,7 +4626,7 @@ async fn apply_runtime_settings(
             || s.relay_token != settings.relay_token
             || s.relay_groups != settings.relay_groups;
         // 任一后端的路径变化都可能影响「是否可用」，保存后重新并发检测
-        let recheck_availability = restart_devin
+        let recheck_availability = restart_kimi || restart_devin
             || restart_codebuddy
             || restart_claudecode
             || restart_cursor
@@ -4597,6 +4639,7 @@ async fn apply_runtime_settings(
         (
             restart_lyra,
             restart_devin,
+            restart_kimi,
             restart_codebuddy,
             restart_claudecode,
             restart_cursor,
@@ -4614,6 +4657,9 @@ async fn apply_runtime_settings(
     if restart_devin {
         // 杀掉当前进程，下次发消息时用新配置重启（历史会话靠 session/load 恢复）
         state.acp.kill_conn().await;
+    }
+    if restart_kimi {
+        state.kimi.restart().await;
     }
     if restart_codebuddy {
         state.codebuddy.shutdown();
@@ -4784,6 +4830,13 @@ async fn run_auxiliary_prompt(
                 .run_prompt(thread_id, prompt, Vec::new())
                 .await
         }
+        AgentKind::Kimi => {
+            state
+                .kimi
+                .clone()
+                .run_prompt(thread_id, prompt, Vec::new())
+                .await
+        }
         AgentKind::Codex | AgentKind::CodexPlus => {
             state
                 .codexplus
@@ -4911,6 +4964,7 @@ async fn summarize_clue(
             store.save();
         }
         state.acp.forget_session_of_thread(&run_id);
+        state.kimi.forget_session_of_thread(&run_id);
         state.codex.forget_session_of_thread(&run_id);
         state.lyra.forget_session_of_thread(&run_id);
         state.codexplus.forget_session_of_thread(&run_id);
@@ -5322,6 +5376,12 @@ async fn get_status(state: State<'_, AppState>) -> Result<Value, String> {
         .unwrap()
         .as_ref()
         .and_then(|v| v.get("agentInfo").cloned());
+    if state.kimi.connected().await {
+        connected = true;
+        if agent.is_none() {
+            agent = state.kimi.agent_info.lock().unwrap().as_ref().and_then(|v| v.get("agentInfo").cloned());
+        }
+    }
     if state.codex.connected().await {
         connected = true;
         if agent.is_none() {
@@ -5341,6 +5401,7 @@ async fn get_status(state: State<'_, AppState>) -> Result<Value, String> {
 fn get_logs(state: State<'_, AppState>) -> Vec<String> {
     let mut logs = state.acp.get_logs();
     logs.extend(state.codex.get_logs());
+    logs.extend(state.kimi.get_logs());
     logs
 }
 
@@ -5606,6 +5667,7 @@ pub fn run() {
                     context_service::ContextService::disabled()
                 });
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
+            let kimi = AcpManager::new(app.handle().clone(), AgentKind::Kimi);
             let codebuddy_acp = AcpManager::new(app.handle().clone(), AgentKind::CodeBuddy);
             let opencodeplus = OpenCodeSdkManager::new(app.handle().clone());
             let codex = CodexManager::new(app.handle().clone());
@@ -5629,6 +5691,7 @@ pub fn run() {
                 worktrees: Mutex::new(worktrees),
                 context_service,
                 acp,
+                kimi,
                 opencodeplus,
                 codex,
                 codebuddy: codebuddy_acp,
@@ -5676,6 +5739,12 @@ pub fn run() {
             {
                 let state = app.state::<AppState>();
                 let dir = state.config_dir.clone();
+                if let Some(v) = model_cache::load(&dir, "kimi") {
+                    state.kimi.seed_model_options(v);
+                }
+                if state.agent_enabled(&AgentKind::Kimi) {
+                    state.kimi.spawn_revalidate_model_options();
+                }
                 if let Some(v) = model_cache::load(&dir, AgentKind::Devin.as_str()) {
                     state.acp.seed_model_options(v);
                 }
@@ -5743,6 +5812,7 @@ pub fn run() {
                     // 与 get_model_options 共用 refreshing 闸门，避免桌面启动时双开探测 session
                     match default_kind {
                         AgentKind::Devin => state.acp.spawn_revalidate_model_options(),
+                        AgentKind::Kimi => state.kimi.spawn_revalidate_model_options(),
                         AgentKind::Codex | AgentKind::CodexPlus => {
                             state.codex.spawn_revalidate_model_options()
                         }

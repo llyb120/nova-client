@@ -50,6 +50,7 @@ pub fn session_cleanup_is_expired(timestamp: i64, now: i64, hours: u32) -> bool 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
+    Kimi,
     Devin,
     Codex,
     CodexPlus,
@@ -80,6 +81,7 @@ impl<'de> Deserialize<'de> for AgentKind {
 impl AgentKind {
     pub fn as_str(&self) -> &'static str {
         match self {
+            AgentKind::Kimi => "kimi",
             AgentKind::Devin => "devin",
             AgentKind::Codex => "codex",
             AgentKind::CodexPlus => "codexplus",
@@ -96,6 +98,7 @@ impl AgentKind {
     /// 从字符串解析后端标识（大小写不敏感）；无法识别返回 None。
     pub fn from_str(s: &str) -> Option<AgentKind> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "kimi" => Some(AgentKind::Kimi),
             // Vega 已移除：旧的 alkaid 标识一律映射到 Lyra。
             "alkaid" => Some(AgentKind::Lyra),
             "devin" => Some(AgentKind::Devin),
@@ -115,6 +118,7 @@ impl AgentKind {
     /// 展示用名称（注入接力上下文 / 系统提示用）
     pub fn label(&self) -> &'static str {
         match self {
+            AgentKind::Kimi => "Kimi Code",
             AgentKind::Devin => "Devin",
             AgentKind::Codex => "Codex",
             AgentKind::CodexPlus => "Codex",
