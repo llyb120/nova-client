@@ -7201,9 +7201,12 @@ mod tests {
     }
 
     fn git(root: &Path, args: &[&str]) {
-        let args = args
-            .iter()
-            .map(|value| (*value).to_string())
+        // 临时仓库不带身份，commit 会以 "Author identity unknown" 退出 128。身份用 -c 只注入本次
+        // 调用，测试就不再依赖开发机/CI 的全局 git 配置。
+        let args = ["-c", "user.email=native-test@nova.local", "-c", "user.name=Nova Native Test"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .map(str::to_string)
             .collect::<Vec<_>>();
         let status = hidden_command("git")
             .args(args)
