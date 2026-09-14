@@ -151,7 +151,19 @@
   box-shadow: none;
   contain: none;
   font-size: clamp(44px, 4.2vw, 56px);
+  gap: 0.2em;
   opacity: 0.26;
+}
+
+.signature-writing {
+  /* SVG 的下伸笔画和底部留白让字迹偏高；只下移字迹，不改变编号及容器锚点。 */
+  position: relative;
+  top: 0.5em;
+  display: block;
+  height: auto;
+  max-width: 65vw;
+  overflow: visible;
+  filter: drop-shadow(0 0 3px var(--signature-glow));
 }
 
 .composer-engraved-mark.engraved-number-mark::after {
@@ -204,6 +216,8 @@
   --signature-mid: #d9b77d;
   --signature-to: #735033;
   --signature-glow: rgba(181, 121, 61, 0.28);
+  /* 覆盖浅色铭牌的高优先级阴影，签名只保留 SVG 手写收笔线。 */
+  box-shadow: none;
   opacity: 0.52;
 }
 
