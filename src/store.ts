@@ -65,6 +65,7 @@ import {
 } from "./workflow/storage";
 import { latestFireStage } from "./threadDisplay";
 import { normalizeGeneratedWorkflow } from "./workflow/types";
+import { initRoamingWorkflows, setPeerWorkflows } from "./workflow/roaming";
 import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
@@ -970,6 +971,11 @@ export function quotaPeers(): Peer[] {
 export function ensurePeerModels(token: string, force = false) {
   if (!token) return;
   if (!force && state.peerModels[token]) return;
+  if (force) setPeerWorkflows((previous) => {
+    const next = { ...previous };
+    delete next[token];
+    return next;
+  });
   void api.requestPeerModels(token).catch(() => {
     // 对端离线/未连接时静默失败，选择器回退为空，用户可稍后重试
   });
@@ -1519,7 +1525,7 @@ const VIRGO_MANUAL_KEY = "fd:virgoManualHidden:v1";
 
 /**
  * 快捷键手动收进室女座的会话链根 id：整条父子接力链一起收纳，重启后仍保留，
- * 再次打开链上任一会话时自动解纳（unhideVirgoThread）回到普通列表。
+ * 整条任务链结束或再次打开链上任一会话时自动解纳回到普通列表。
  */
 const virgoManualRoots = new Set<string>(readVirgoManualRoots());
 const [virgoManualVersion, setVirgoManualVersion] = createSignal(0);
@@ -1581,7 +1587,16 @@ function virgoChainIds(roots: string[]): Set<string> {
 
 /** 手动收进室女座的会话 id（未开启减少焦虑时的收纳口径）。 */
 function virgoManualHidden(): Set<string> {
-  return virgoChainIds(virgoManualRootsSnapshot());
+  const roots = virgoManualRootsSnapshot();
+  const active = zenRunningChains().hidden;
+  const knownIds = new Set(state.threads.map((thread) => thread.id));
+  const finished = roots.filter((root) => knownIds.has(root) && !active.has(root));
+  if (finished.length > 0) {
+    for (const root of finished) virgoManualRoots.delete(root);
+    setVirgoManualVersion((version) => version + 1);
+    persistVirgoManualRoots();
+  }
+  return virgoChainIds(roots.filter((root) => active.has(root)));
 }
 
 /**
@@ -1614,7 +1629,7 @@ export function hideCurrentThreadToVirgo(): boolean {
     // 当前页面属于被收起的会话链时回到首页。
     setView("home");
   }
-  showToast("会话已移入室女座，打开即回到普通会话");
+  showToast("会话已移入室女座，结束后自动移回，也可手动打开");
   return true;
 }
 
@@ -2240,7 +2255,10 @@ async function tryBuiltinPrompt(
     return true;
   }
   // 触发条件：提示词命中某工作流的 slash/contains/regex 触发器时自动启动。
-  const triggered = findTriggeredWorkflow(builtInInput);
+  // 漫游会话的普通补充消息不能被本机工作流触发器抢走。
+  const roamingRole = state.threads.find((thread) => thread.id === threadId)?.roamingRole
+    ?? getThreadSnapshot(threadId)?.roamingRole;
+  const triggered = roamingRole === "guest" ? null : findTriggeredWorkflow(builtInInput);
   if (triggered) {
     await startWorkflow(triggered.id, { goal: triggered.goal }, threadId, images);
     return true;
@@ -3208,6 +3226,7 @@ export const [restoreSettled, setRestoreSettled] = createSignal(false);
 export async function initStore() {
   if (initialized) return;
   initialized = true;
+  await initRoamingWorkflows();
   // 无新消息也结算采样窗口：首块及时显示，工具执行/等待期间归零。
   setInterval(() => {
     for (const threadId of rateWindows.keys()) {
