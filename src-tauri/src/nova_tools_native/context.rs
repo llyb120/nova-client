@@ -427,35 +427,6 @@ fn mmap_cache(root: &Path, key: &str) -> Option<DiskCache> {
     .filter(|cache| cache.version == CACHE_VERSION && cache.root == key)
 }
 
-/// Load persisted FastContext indexes once into the shared process at startup. mmap avoids an
-/// additional file-sized read buffer; bincode materializes the mutable in-memory cache used by
-/// later incremental updates. A workspace first opened after startup uses the same mmap path once.
-pub fn preload_indexes(roots: &[String]) -> usize {
-    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut loaded = 0usize;
-    for root in roots {
-        let root = Path::new(root);
-        if !root.is_dir() {
-            continue;
-        }
-        let key = normalize_root(root);
-        if memo.lock().unwrap().contains_key(&key) {
-            continue;
-        }
-        if let Some(cache) = mmap_cache(root, &key) {
-            memo.lock().unwrap().insert(key, Arc::new(cache));
-            loaded += 1;
-        }
-        // 符号索引只解决定义/import；同时预载或后台构建全文倒排索引，避免首次
-        // Polaris 查询仍退回全仓 rg。构建门保证多个项目不会同时扫盘。
-        // 全文索引只认 git 仓库：非 git 目录跳后台构建与常驻轮询。
-        if root.join(".git").exists() {
-            let _ = search_index_now(root);
-        }
-    }
-    loaded
-}
-
 fn store_cache(root: &Path, cache: Arc<DiskCache>, persist: bool) {
     if persist {
         write_cache_async(root, cache.clone());
@@ -7364,7 +7335,8 @@ mod tests {
         assert_eq!(output.len(), 1024);
     }
 
-    fn preload_indexes_uses_mmap_and_queries_do_not_reload_disk() {
+    #[test]
+    fn first_query_loads_mmap_and_later_queries_do_not_reload_disk() {
         let d = tempdir().unwrap();
         let key = normalize_root(d.path());
         let mut files = HashMap::new();
@@ -7392,12 +7364,11 @@ mod tests {
             .unwrap()
             .remove(&key);
 
-        assert_eq!(
-            preload_indexes(&[d.path().to_string_lossy().into_owned()]),
-            1
-        );
+        let first = load_cache(d.path());
+        assert!(first.files.contains_key("src/cached.ts"));
         fs::remove_file(path).unwrap();
         let loaded = load_cache(d.path());
+        assert!(Arc::ptr_eq(&first, &loaded));
         assert!(loaded.files.contains_key("src/cached.ts"));
         store_cache(d.path(), loaded, false);
     }

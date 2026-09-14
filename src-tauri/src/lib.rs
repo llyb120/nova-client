@@ -5667,23 +5667,7 @@ pub fn run() {
             let worktrees = WorktreeStore::load(&dir);
             experience::init(&dir);
             settings.apply_context_retrieval_environment();
-            // Load known roots once into the process-wide cache shared by Lyra and every bridge.
-            // Include active thread/worktree roots so alternate checkouts do not cold-rebuild.
-            let mut preload_roots = projects.projects.clone();
-            preload_roots.extend(store.threads.iter().map(|thread| thread.cwd.clone()));
-            preload_roots.extend(
-                worktrees
-                    .worktrees
-                    .iter()
-                    .flat_map(|worktree| [worktree.repo.clone(), worktree.path.clone()]),
-            );
-            preload_roots.sort();
-            preload_roots.dedup();
-            let loaded_indexes = nova_tools_native::context::preload_indexes(&preload_roots);
-            eprintln!(
-                "[fast-context] shared mmap-loaded {loaded_indexes}/{} workspace indexes",
-                preload_roots.len()
-            );
+            // 查询时按需 mmap 加载索引；启动不遍历历史项目/worktree，也不为闲置仓库启动索引轮询。
             let context_service =
                 context_service::ContextService::start(&dir).unwrap_or_else(|error| {
                     eprintln!("[fast-context] native context service disabled: {error}");
