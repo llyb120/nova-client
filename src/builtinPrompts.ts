@@ -18,13 +18,16 @@ ${goal}`;
 }
 
 export function buildSetupImagePrompt(goal: string, configPath: string): string {
-  return `为 Nova 配置独立图片服务，供所有聊天后端的 /generate-image 使用。
+  return `为 Nova 配置独立图片服务，供所有聊天后端的 /generate-image 和 /edit-image 使用。
 配置文件：${JSON.stringify(configPath)}
 格式为严格 JSON：{ "baseURL": "https://服务地址/v1", "apiKey": "API Token", "models": ["图片模型 ID", "另一图片模型 ID"] }。
-先检查配置文件是否存在，保留已有配置。根据用户要求配置地址、Token 和可选图片模型数组；缺失信息向用户询问，不猜测。使用 OpenAI 兼容的 POST /images/generations 接口，需支持 PNG 和 data[].b64_json 返回；baseURL 不包含 /images/generations 后缀。不要修改 Lyra 或其他聊天后端配置。
+先检查配置文件是否存在，保留用户未要求修改的已有配置。baseURL、apiKey 和 models 均为必填；models 必须是至少包含一个真实图片模型 ID 的非空字符串数组，不能省略、留空或写入示例占位符。使用 OpenAI 兼容的 POST /images/generations 接口，需支持 PNG 和 data[].b64_json 返回；baseURL 不包含 /images/generations 后缀。不要修改 Lyra 或其他聊天后端配置。
+用户明确指定模型时按要求配置；未指定时，同一服务可保留已有的有效图片模型。新配置、已有 models 缺失或为空、或服务地址变更时，使用配置的地址和 Token 请求 GET <baseURL>/models（Token 仅从文件或内存读取并放入 Authorization 请求头，不拼入命令），结合服务返回的能力信息或服务文档，筛选明确支持上述图片接口的真实模型 ID。模型列表包含聊天模型，不要全部写入 models，也不要仅凭名称包含 image 就认定接口兼容。多个已确认兼容的图片模型可以一并写入，首项作为默认模型；用户指定的默认模型排在首项。
+地址或 Token 缺失时询问用户；模型列表接口不可用、没有可确认的图片模型或兼容性不明确时，说明缺少的信息并询问用户图片模型 ID，不猜测模型或套用其他服务的默认模型。models 未确定前不能宣称配置完成。
+需要参考图/图生图时，还需确认所选模型支持 POST /images/edits 的 multipart/form-data 图片上传及 PNG、data[].b64_json 返回；不能把仅支持文生图的模型说成支持图生图。baseURL 也不能包含 /images/edits 后缀。
 Token 只写入配置文件，不在回复、日志或示例命令中回显；验证已有配置时只输出是否存在 Token。不要为验证配置自动发起收费生图请求。
-配置保存后立即对后续 /generate-image 生效，无需重启。
-用户要求：${goal || "配置图片 API 地址、Token 和可选模型"}`;
+保存后重新读取并校验严格 JSON、HTTP(S) 地址、非空 Token 和非空模型字符串数组；最终回复列出实际配置的模型 ID 及默认模型，区分本地配置校验与实际生图验证，不能将模型列表查询成功说成生图验证成功。配置保存后立即对后续 /generate-image 生效，无需重启。
+用户要求：${goal || "配置图片 API 地址、Token 和图片模型"}`;
 }
 
 export function buildGenerateImagePrompt(goal: string, context: { configPath: string; executable: string; models: string[]; referenceImages?: string[] }, mode: "generate" | "edit" = "generate"): string {

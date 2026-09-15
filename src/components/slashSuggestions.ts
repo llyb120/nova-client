@@ -29,7 +29,7 @@ export function getSlashSuggestions(
   const builtins: SlashCommand[] = [
     { name: "generate-image", description: "生成新图，可参考附图的内容或风格：/generate-image 图片描述", kind: "Nova", input: "/generate-image " },
     { name: "edit-image", description: "编辑原图，保留未要求改动的内容：/edit-image 修改要求", kind: "Nova", input: "/edit-image " },
-    { name: "setup-image", description: "配置通用生图 API 地址、Token 和可选模型", kind: "Nova", input: "/setup-image " },
+    { name: "setup-image", description: "配置通用生图 API 地址、Token 和图片模型", kind: "Nova", input: "/setup-image " },
     {
       name: "plan",
       description: "先出实施计划（少追问），仍在 Build 下发送",

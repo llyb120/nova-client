@@ -19,6 +19,16 @@ function exportsOf(source, imports = {}) {
   return module.exports;
 }
 
+test("setup-image requires models and discovers compatible image models before reporting completion", () => {
+  const { buildSetupImagePrompt } = exportsOf(read("../src/builtinPrompts.ts"));
+  const prompt = buildSetupImagePrompt("", "D:/image.json");
+  for (const required of ["均为必填", "非空字符串数组", "GET <baseURL>/models", "不要全部写入 models", "询问用户图片模型 ID", "models 未确定前不能宣称配置完成", "默认模型", "不要为验证配置自动发起收费生图请求"]) {
+    assert.ok(prompt.includes(required), `Missing setup requirement: ${required}`);
+  }
+  assert.ok(!prompt.includes("可选模型"));
+  assert.ok(!prompt.includes("可选图片模型数组"));
+});
+
 test("image commands are available to every backend and keep credentials out of generation instructions", () => {
   const prompts = exportsOf(read("../src/builtinPrompts.ts"));
   const suggestions = exportsOf(read("../src/components/slashSuggestions.ts"), { "../utils": { agentLabel: (id) => id } });
