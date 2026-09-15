@@ -256,6 +256,8 @@ export const api = {
   respondPermission: (requestKey: string, optionId: string) =>
     invoke<void>("respond_permission", { requestKey, optionId }),
   getSettings: () => invoke<Settings>("get_settings"),
+  getWindowLayout: () => invoke<{width: number; height: number; maximized: boolean; remember: boolean}>("get_window_layout"),
+  setWindowLayout: (layout: {width?: number; height?: number; maximized?: boolean; remember?: boolean; reset?: boolean}) => invoke<void>("set_window_layout", layout),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   refreshEnvironmentVariables: () => invoke<number>("refresh_environment_variables"),
   getGlobalAgentInstructions: () =>

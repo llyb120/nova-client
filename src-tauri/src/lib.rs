@@ -5797,6 +5797,8 @@ pub fn run() {
             apply_staged_update,
             report_activity,
             show_main_window,
+            updater::get_window_layout,
+            updater::set_window_layout,
             take_restore_thread,
             signature_pending,
             create_thread,
@@ -5920,6 +5922,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Nova 启动失败")
         .run(|app, event| {
+            #[cfg(windows)]
+            if let tauri::RunEvent::WindowEvent { label, event, .. } = &event {
+                if label == "main" {
+                    match event {
+                        tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => updater::remember_window_layout(app, false),
+                        tauri::WindowEvent::CloseRequested { .. } => updater::remember_window_layout(app, true),
+                        _ => {}
+                    }
+                }
+            }
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
                 // 临时会话随程序关闭一并删除，并清理其临时工作目录。
