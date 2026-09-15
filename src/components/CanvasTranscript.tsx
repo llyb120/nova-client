@@ -3562,42 +3562,63 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // ─── Rebuild / effects ─────────────────────────────────────────────────────
 
+  let activeLayout: { key: string; generation: number } | undefined;
+  let layoutPending = false;
   async function rebuild() {
-    const generation = ++layoutGeneration;
     pal = readPalette();
-    const oldScroll = scrollY;
-    if (!await computeLayout(generation)) return;
-    // 被后续重排取代的异步任务不能消费点击锚点；只由真正提交的布局使用。
-    const lock = scrollLock;
-    scrollLock = null;
-    // blocks are replaced during layout; an index from the previous block array may now
-    // identify an unrelated block (often the first tool), producing a phantom hover card.
-    hoverBlockIdx = -1;
-    if (canvasEl) {
-      canvasEl.style.cursor = "default";
-      canvasEl.title = "";
+    const key = `${props.threadId}|${viewW}|${viewH}|${pal.bg}|${pal.text}|${props.running}|${expandedRevision()}|${editing()?.id ?? ""}`;
+    // 流式 delta/reveal 合并到下一次排版，不能反复取消尚未完成的历史重排。
+    // 切会话、改宽度、主题和用户开合仍立即取代旧任务。
+    if (activeLayout?.key === key && activeLayout.generation === layoutGeneration) {
+      layoutPending = true;
+      return;
     }
-    const liveKeys = new Set(
-      blocks.filter((b) => b.data?.clipped).map((b) => blockScrollKey(b)),
-    );
-    for (const key of [...blockScrolls.keys()]) {
-      if (!liveKeys.has(key)) blockScrolls.delete(key);
+    const generation = ++layoutGeneration;
+    activeLayout = { key, generation };
+    layoutPending = false;
+    try {
+      const oldScroll = scrollY;
+      if (!await computeLayout(generation)) return;
+      // 被后续重排取代的异步任务不能消费点击锚点；只由真正提交的布局使用。
+      const lock = scrollLock;
+      scrollLock = null;
+      // blocks are replaced during layout; an index from the previous block array may now
+      // identify an unrelated block (often the first tool), producing a phantom hover card.
+      hoverBlockIdx = -1;
+      if (canvasEl) {
+        canvasEl.style.cursor = "default";
+        canvasEl.title = "";
+      }
+      const liveKeys = new Set(
+        blocks.filter((b) => b.data?.clipped).map((b) => blockScrollKey(b)),
+      );
+      for (const key of [...blockScrolls.keys()]) {
+        if (!liveKeys.has(key)) blockScrolls.delete(key);
+      }
+      // 布局让帧期间用户可能已滚离底部：吸底判定取提交时实时状态，不能用 await 前快照。
+      const settled = resolveScrollAfterLayout({ keepBottom, scrollY, maxScrollBefore: maxScroll, totalHeight, viewH });
+      maxScroll = settled.maxScroll;
+      if (lock) {
+        const match = blocks.find((x) => x.kind === lock.kind && x.id === lock.id);
+        const y = match?.y ?? oldScroll + lock.viewOffset;
+        scrollY = Math.max(0, Math.min(maxScroll, y - lock.viewOffset));
+      } else {
+        scrollY = settled.scrollY;
+      }
+      applyEditStyle();
+      props.onScroll?.(scrollY, maxScroll, false);
+      paintAll();
+      // 仅在切换后有实际内容时收尾；缓存未命中会先空布局一帧，不能误清零起点。
+      if (props.groups.length > 0) traceThreadSwitchLayoutDone(props.threadId, props.groups.length);
+    } finally {
+      if (activeLayout?.generation === generation) {
+        activeLayout = undefined;
+        if (layoutPending && !disposed) {
+          layoutPending = false;
+          scheduleRebuild(false, true);
+        }
+      }
     }
-    // 布局让帧期间用户可能已滚离底部：吸底判定取提交时实时状态，不能用 await 前快照。
-    const settled = resolveScrollAfterLayout({ keepBottom, scrollY, maxScrollBefore: maxScroll, totalHeight, viewH });
-    maxScroll = settled.maxScroll;
-    if (lock) {
-      const match = blocks.find((x) => x.kind === lock.kind && x.id === lock.id);
-      const y = match?.y ?? oldScroll + lock.viewOffset;
-      scrollY = Math.max(0, Math.min(maxScroll, y - lock.viewOffset));
-    } else {
-      scrollY = settled.scrollY;
-    }
-    applyEditStyle();
-    props.onScroll?.(scrollY, maxScroll, false);
-    paintAll();
-    // 仅在切换后有实际内容时收尾；缓存未命中会先空布局一帧，不能误清零起点。
-    if (props.groups.length > 0) traceThreadSwitchLayoutDone(props.threadId, props.groups.length);
   }
 
   const queueRebuildFrame = () => {
