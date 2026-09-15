@@ -25,10 +25,28 @@ fn load_config(path: &Path) -> Result<Config, String> {
 
 /// 只向会话提供路径和模型列表，不把 Token 放入提示词。
 #[tauri::command]
-pub fn image_command_context(app: tauri::AppHandle, configured: bool) -> Result<Value, String> {
+pub fn image_command_context(app: tauri::AppHandle, configured: bool, images: Option<Vec<crate::threads::PromptImage>>) -> Result<Value, String> {
     let path = crate::nova_data_dir(&app).join("image-generation.json");
     let models = if configured { load_config(&path)?.models } else { Vec::new() };
-    Ok(json!({ "configPath": path, "executable": std::env::current_exe().map_err(|e| e.to_string())?, "models": models }))
+    let reference_images = reference_image_paths(&images.unwrap_or_default())?;
+    Ok(json!({ "configPath": path, "executable": std::env::current_exe().map_err(|e| e.to_string())?, "models": models, "referenceImages": reference_images }))
+}
+
+fn reference_image_paths(images: &[crate::threads::PromptImage]) -> Result<Vec<String>, String> {
+    if images.len() > 16 { return Err("参考图最多 16 张".into()); }
+    images.iter().map(|image| {
+        if !matches!(image.mime_type.as_str(), "image/png" | "image/jpeg" | "image/webp") {
+            return Err("参考图仅支持 PNG、JPEG 和 WebP".into());
+        }
+        if let Some(data) = &image.data {
+            if data.len() > ((crate::threads::MAX_EMBED_BYTES + 2) / 3 * 4) as usize {
+                return Err("单张参考图不能超过 25 MiB".into());
+            }
+            return crate::threads::save_attachment_to_temp(image).ok_or_else(|| "参考图保存失败或 Base64 无效".into());
+        }
+        image.uri.as_deref().and_then(crate::threads::file_uri_to_local_path)
+            .ok_or_else(|| "参考图缺少图片数据或本地文件路径".into())
+    }).collect()
 }
 
 #[derive(Deserialize)]
@@ -39,6 +57,8 @@ struct Request {
     #[serde(default = "auto_size")]
     size: String,
     output_dir: PathBuf,
+    #[serde(default)]
+    reference_images: Vec<PathBuf>,
 }
 
 fn auto_size() -> String { "auto".into() }
@@ -53,10 +73,40 @@ async fn generate(http: &reqwest::Client, config: &Config, request: &Request) ->
     }
     let output_dir = request.output_dir.canonicalize().map_err(|_| "图片输出目录不存在")?;
     if !output_dir.is_dir() { return Err("图片输出路径必须是目录".into()); }
-    let mut response = http.post(format!("{}/images/generations", config.base_url.trim_end_matches('/')))
-        .bearer_auth(&config.api_key)
-        .json(&json!({ "model": request.model, "prompt": request.prompt, "size": request.size, "n": 1, "output_format": "png" }))
-        .send().await.map_err(|e| format!("图片请求失败：{}", e.without_url()))?;
+    let base_url = config.base_url.trim_end_matches('/');
+    let call = if request.reference_images.is_empty() {
+        http.post(format!("{base_url}/images/generations"))
+            .json(&json!({ "model": request.model, "prompt": request.prompt, "size": request.size, "n": 1, "output_format": "png" }))
+    } else {
+        use std::io::Read;
+        if request.reference_images.len() > 16 { return Err("参考图最多 16 张".into()); }
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", request.model.clone()).text("prompt", request.prompt.clone())
+            .text("size", request.size.clone()).text("n", "1").text("output_format", "png");
+        let mut total = 0;
+        for (index, path) in request.reference_images.iter().enumerate() {
+            if !path.is_absolute() { return Err("参考图需要本地文件绝对路径".into()); }
+            let file = std::fs::File::open(path).map_err(|_| "参考图文件无法读取")?;
+            if !file.metadata().map_err(|_| "参考图文件信息无法读取")?.is_file() {
+                return Err("参考图路径必须是文件".into());
+            }
+            let mut bytes = Vec::new();
+            file.take(crate::threads::MAX_EMBED_BYTES + 1).read_to_end(&mut bytes).map_err(|_| "参考图读取失败")?;
+            if bytes.len() as u64 > crate::threads::MAX_EMBED_BYTES { return Err("单张参考图不能超过 25 MiB".into()); }
+            total += bytes.len();
+            if total > 64 * 1024 * 1024 { return Err("参考图总计不能超过 64 MiB".into()); }
+            let (mime, ext) = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { ("image/png", "png") }
+                else if bytes.starts_with(b"\xff\xd8\xff") { ("image/jpeg", "jpg") }
+                else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") { ("image/webp", "webp") }
+                else { return Err("参考图内容必须为 PNG、JPEG 或 WebP".into()); };
+            let part = reqwest::multipart::Part::bytes(bytes).file_name(format!("reference-{index}.{ext}"))
+                .mime_str(mime).map_err(|_| "参考图类型无效")?;
+            form = form.part(if request.reference_images.len() == 1 { "image" } else { "image[]" }, part);
+        }
+        http.post(format!("{base_url}/images/edits")).multipart(form)
+    };
+    let mut response = call.bearer_auth(&config.api_key).send().await
+        .map_err(|e| format!("图片请求失败：{}", e.without_url()))?;
     let status = response.status();
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| "图片响应读取失败")? {
@@ -110,15 +160,19 @@ mod tests {
     async fn image_generation_validates_model_and_saves_only_valid_output() {
         use std::io::{Read, Write};
         let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=").unwrap();
-        for (status, body, success) in [
-            ("200 OK", json!({ "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(&png) }] }), true),
-            ("200 OK", json!({ "data": [{ "b64_json": "invalid" }] }), false),
-            ("200 OK", json!({ "data": [] }), false),
-            ("401 Unauthorized", json!({ "error": { "message": "secret-token" } }), false),
+        for (reference_count, status, body, success) in [
+            (0, "200 OK", json!({ "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(&png) }] }), true),
+            (1, "200 OK", json!({ "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(&png) }] }), true),
+            (2, "200 OK", json!({ "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(&png) }] }), true),
+            (0, "200 OK", json!({ "data": [{ "b64_json": "invalid" }] }), false),
+            (0, "200 OK", json!({ "data": [] }), false),
+            (0, "401 Unauthorized", json!({ "error": { "message": "secret-token" } }), false),
+            (1, "400 Bad Request", json!({ "error": { "message": "secret-token" } }), false),
         ] {
             let root = tempfile::tempdir().unwrap();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
+            let expected_png = png.clone();
             let server = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
@@ -137,19 +191,37 @@ mod tests {
                     assert!(n > 0);
                     bytes.extend_from_slice(&chunk[..n]);
                 }
-                assert!(headers.starts_with("post /v1/images/generations "));
                 assert!(headers.contains("authorization: bearer secret-token"));
-                let request: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
-                assert_eq!(request["model"], "second-image");
-                assert_eq!(request["n"], 1);
+                if reference_count == 0 {
+                    assert!(headers.starts_with("post /v1/images/generations "));
+                    let request: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                    assert_eq!(request["model"], "second-image");
+                    assert_eq!(request["n"], 1);
+                } else {
+                    assert!(headers.starts_with("post /v1/images/edits "));
+                    assert!(headers.contains("multipart/form-data; boundary="));
+                    let body = &bytes[end..end + length];
+                    let text = String::from_utf8_lossy(body);
+                    assert!(text.contains("name=\"model\"\r\n\r\nsecond-image"));
+                    assert!(text.contains("name=\"prompt\"\r\n\r\ntest"));
+                    let field = if reference_count == 1 { "name=\"image\"" } else { "name=\"image[]\"" };
+                    assert_eq!(text.matches(field).count(), reference_count);
+                    assert_eq!(body.windows(expected_png.len()).filter(|v| *v == expected_png.as_slice()).count(), reference_count);
+                }
                 let body = body.to_string();
                 write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             });
             let config = Config { base_url: format!("http://{address}/v1"), api_key: "secret-token".into(), models: vec!["first-image".into(), "second-image".into()] };
-            let mut request = Request { prompt: "test".into(), model: "unlisted".into(), size: "auto".into(), output_dir: root.path().into() };
+            let mut request = Request { prompt: "test".into(), model: "unlisted".into(), size: "auto".into(), output_dir: root.path().into(), reference_images: vec![] };
             let http = reqwest::Client::builder().no_proxy().build().unwrap();
             assert!(generate(&http, &config, &request).await.unwrap_err().contains("未配置"));
             request.model = "second-image".into();
+            let references = tempfile::tempdir().unwrap();
+            for index in 0..reference_count {
+                let path = references.path().join(format!("参考 {index}.png"));
+                std::fs::write(&path, &png).unwrap();
+                request.reference_images.push(path);
+            }
             let result = generate(&http, &config, &request).await;
             server.join().unwrap();
             assert_eq!(result.is_ok(), success);
@@ -161,6 +233,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn reference_attachments_preserve_bytes_and_reject_missing_data() {
+        let mut image = crate::threads::PromptImage {
+            name: "参考.png".into(), mime_type: "image/png".into(),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"reference bytes")), uri: None, size: None,
+        };
+        let paths = reference_image_paths(std::slice::from_ref(&image)).unwrap();
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"reference bytes");
+        std::fs::remove_file(&paths[0]).unwrap();
+        std::fs::remove_dir(Path::new(&paths[0]).parent().unwrap()).unwrap();
+        image.data = None;
+        assert!(reference_image_paths(std::slice::from_ref(&image)).is_err());
+        image.uri = Some("https://example.com/image.png".into());
+        assert!(reference_image_paths(std::slice::from_ref(&image)).is_err());
+        image.uri = Some("file:///D:/reference.png".into());
+        assert_eq!(reference_image_paths(std::slice::from_ref(&image)).unwrap().len(), 1);
+        image.mime_type = "text/plain".into();
+        assert!(reference_image_paths(&[image]).is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_references_fail_before_network_request() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("not-an-image.png");
+        std::fs::write(&path, b"not an image").unwrap();
+        let config = Config { base_url: "http://127.0.0.1:1/v1".into(), api_key: "secret-token".into(), models: vec!["image".into()] };
+        let mut request: Request = serde_json::from_value(json!({ "prompt": "test", "model": "image", "outputDir": root.path() })).unwrap();
+        assert!(request.reference_images.is_empty());
+        for (paths, expected) in [
+            (vec![path.clone()], "参考图内容"),
+            (vec![root.path().join("missing.png")], "无法读取"),
+            (vec![PathBuf::from("relative.png")], "绝对路径"),
+            (vec![path.clone(); 17], "最多 16 张"),
+        ] {
+            request.reference_images = paths;
+            assert!(generate(&reqwest::Client::new(), &config, &request).await.unwrap_err().contains(expected));
+        }
+        std::fs::File::create(&path).unwrap().set_len(crate::threads::MAX_EMBED_BYTES + 1).unwrap();
+        request.reference_images = vec![path];
+        assert!(generate(&reqwest::Client::new(), &config, &request).await.unwrap_err().contains("25 MiB"));
     }
 
     #[test]

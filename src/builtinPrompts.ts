@@ -27,12 +27,17 @@ Token 只写入配置文件，不在回复、日志或示例命令中回显；�
 用户要求：${goal || "配置图片 API 地址、Token 和可选模型"}`;
 }
 
-export function buildGenerateImagePrompt(goal: string, context: { configPath: string; executable: string; models: string[] }): string {
+export function buildGenerateImagePrompt(goal: string, context: { configPath: string; executable: string; models: string[]; referenceImages?: string[] }, mode: "generate" | "edit" = "generate"): string {
   return `使用 Nova 的通用生图命令完成以下任务，不依赖当前后端是否有内置生图工具。
 目标：${goal}
+${mode === "edit"
+    ? "当前命令：/edit-image，任务是编辑原图。必须取得用户附上或明确指定的原图，以原图为基础只修改用户要求的部分，保留未要求改动的主体身份、构图、背景、文字和风格。将修改项和保留项明确写入发送给图片模型的 prompt。多图时明确哪张是待编辑原图、哪些是辅助参考图，并将原图放在 referenceImages 首项；无法确定编辑对象时先询问用户。没有可用原图时请用户提供，不得发起请求或改为生成新图。"
+    : "当前命令：/generate-image，任务是生成新图。有参考图时，将其作为用户指定的内容、风格、配色或构图参考，围绕目标创作一张新图；在发送给图片模型的 prompt 中明确参考哪些特征，不默认保留原图全部内容，也不默认按局部编辑处理。没有参考图时按文字描述生成。"}
 可选图片模型（按配置顺序）：${JSON.stringify(context.models)}
 用户指定模型时优先选择它；否则按已知能力和用户的画质、速度、成本要求选择。不确定模型差异时使用列表第一项，不臆测能力或价格，不能选择列表之外的模型。
-将主体、构图、风格、文字等要求整理成 prompt。使用文件写入工具创建一个临时 UTF-8 JSON 请求文件（无 BOM）：{ "prompt": "完整图片提示词", "model": "所选模型 ID", "size": "auto", "outputDir": "当前工作目录的绝对路径" }。size 可选 auto、1024x1024、1024x1536、1536x1024。每次生成一张新 PNG，不支持参考图编辑。
+本轮参考图本地路径（与附件顺序一致）：${JSON.stringify(context.referenceImages ?? [])}
+将主体、构图、风格、文字等要求整理成 prompt。使用文件写入工具创建一个临时 UTF-8 JSON 请求文件（无 BOM）：{ "prompt": "完整图片提示词", "model": "所选模型 ID", "size": "auto", "outputDir": "当前工作目录的绝对路径", "referenceImages": [] }。size 可选 auto、1024x1024、1024x1536、1536x1024。每次生成一张新 PNG。
+用户提供参考图时必须将上述参考图路径填入 referenceImages 数组；用户在文字或历史会话中指定参考图片时，找到对应的真实本地文件绝对路径后填入，不得编造路径或仅用文字描述替代原图。找不到原图时请用户补充。参考图支持 PNG、JPEG、WebP，最多 16 张，单张不超过 25 MiB，总计不超过 64 MiB。有参考图时 Nova 自动使用 POST /images/edits 上传图片，选择支持该接口的已配置模型；接口不支持时说明原因并提示 /setup-image，不能丢弃参考图退回文生图。接口名不决定创作意图，传给图片模型的 prompt 必须遵循上述命令语义。${mode === "edit" ? "编辑模式的 referenceImages 必须非空，成功后另存新 PNG，不覆盖原图。" : "没有参考图时 referenceImages 留空，使用 /images/generations。"}
 可执行文件路径：${JSON.stringify(context.executable)}
 配置路径：${JSON.stringify(context.configPath)}
 用命令行工具执行上述可执行文件，依次传入三个独立参数：__generate_image、配置文件路径、请求文件路径。按当前 shell 正确引用路径，提示词不得直接拼入命令。PowerShell 用 & 调用并将输出管道传给 Out-String，以等待 GUI 子系统程序结束。执行超时设为至少 600 秒；若返回运行中句柄，继续等待，不要重复发起生图。

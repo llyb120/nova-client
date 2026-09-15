@@ -2207,12 +2207,13 @@ async function tryBuiltinPrompt(
   images: PromptImage[],
 ): Promise<boolean> {
   const builtInInput = text.trim();
-  if (/^\/(?:setup-image|generate-image)(?:\s|$)/i.test(builtInInput)) {
+  if (/^\/(?:setup-image|generate-image|edit-image)(?:\s|$)/i.test(builtInInput)) {
     assertBuiltinPrompt(text, images);
     const setup = /^\/setup-image(?:\s|$)/i.test(builtInInput);
-    const goal = builtInInput.replace(/^\/(?:setup-image|generate-image)\s*/i, "").trim();
-    const context = await api.imageCommandContext(!setup);
-    await deliverPrompt(threadId, setup ? buildSetupImagePrompt(goal, context.configPath) : buildGenerateImagePrompt(goal, context), []);
+    const edit = /^\/edit-image(?:\s|$)/i.test(builtInInput);
+    const goal = builtInInput.replace(/^\/(?:setup-image|generate-image|edit-image)\s*/i, "").trim();
+    const context = await api.imageCommandContext(!setup, images);
+    await deliverPrompt(threadId, setup ? buildSetupImagePrompt(goal, context.configPath) : buildGenerateImagePrompt(goal, context, edit ? "edit" : "generate"), images);
     return true;
   }
   const stage = parseStageInput(builtInInput);
@@ -2318,9 +2319,11 @@ function parseRunInput(input: string): { workflowId: string; vars: Record<string
 /** 创建会话 / 暂存前提前校验内置命令，避免 worktree 建完才发现 /fire 非法。 */
 export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   const builtInInput = text.trim();
-  if (/^\/(?:setup-image|generate-image)(?:\s|$)/i.test(builtInInput)) {
-    if (images.length > 0) throw new Error("图片指令暂不支持参考图附件");
+  if (/^\/(?:setup-image|generate-image|edit-image)(?:\s|$)/i.test(builtInInput)) {
+    if (/^\/setup-image(?:\s|$)/i.test(builtInInput) && images.length > 0) throw new Error("/setup-image 不支持附件，请用 /generate-image 或 /edit-image 提交参考图");
+    if (images.some((image) => !["image/png", "image/jpeg", "image/webp"].includes(image.mimeType))) throw new Error("参考图仅支持 PNG、JPEG 和 WebP");
     if (/^\/generate-image\s*$/i.test(builtInInput)) throw new Error("请在 /generate-image 后输入图片描述");
+    if (/^\/edit-image\s*$/i.test(builtInInput)) throw new Error("请在 /edit-image 后输入修改要求，并附上或指定要编辑的原图");
     return;
   }
   const stage = parseStageInput(builtInInput);
