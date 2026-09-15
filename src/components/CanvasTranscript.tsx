@@ -1328,7 +1328,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
     // 逐组比对签名，取最长连续匹配前缀复用：展开/收起中间某个工具不再整份作废，
     // 只从该分组起重排（此前签名是全量拼接、一处变化全部重排，展开后长时间卡顿）
-    const metaSig = `${Math.round(W)}|${p.bg}|${p.text}`;
+    const metaSig = `${Math.round(W)}|${p.bg}|${p.text}|${running}`;
     const cacheKey = threadId ?? "";
     const prefixCache = prefixLayoutCaches.get(cacheKey);
     let reuseUntil = 0;
