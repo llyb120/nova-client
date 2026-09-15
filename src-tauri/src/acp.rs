@@ -1465,7 +1465,7 @@ impl AcpManager {
         #[cfg(unix)]
         cmd.process_group(0);
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
-        cmd.envs(&self.launch_env);
+        cmd.envs(codebuddy_activation_env(&self.launch_env));
         #[cfg(windows)]
         cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
         {
@@ -2537,7 +2537,7 @@ impl AcpManager {
         #[cfg(unix)]
         cmd.process_group(0);
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
-        cmd.envs(&self.launch_env);
+        cmd.envs(codebuddy_activation_env(&self.launch_env));
         #[cfg(windows)]
         cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
         {
@@ -4352,7 +4352,9 @@ fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::C
         }
         None => tokio::process::Command::new(program),
     };
-    cmd.args(args).env("CODEBUDDY_DEFER_TOOL_LOADING", "0");
+    cmd.args(args)
+        .env("CODEBUDDY_DEFER_TOOL_LOADING", "0")
+        .env("DISABLE_AUTOUPDATER", "1");
     (program.to_string(), cmd)
 }
 
@@ -4360,7 +4362,9 @@ fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::C
 #[cfg(not(windows))]
 fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::Command) {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args).env("CODEBUDDY_DEFER_TOOL_LOADING", "0");
+    cmd.args(args)
+        .env("CODEBUDDY_DEFER_TOOL_LOADING", "0")
+        .env("DISABLE_AUTOUPDATER", "1");
     (program.to_string(), cmd)
 }
 
@@ -4424,6 +4428,10 @@ fn merge_codebuddy_activation_env(
         );
     }
     env.extend(launch_env.clone());
+    // Nova kills managed process trees on eviction/exit. An interrupted npm self-update can
+    // leave global CLI shims renamed to temporary backups; keep updates outside this lifecycle.
+    // Prewarm activation replaces the environment, so explicitly carry this policy across it.
+    env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
     env
 }
 
@@ -4470,6 +4478,9 @@ mod codebuddy_acp_tests {
             codebuddy_command("codebuddy", &["--acp", "--cwd", "D:/repo with spaces"]);
         assert!(command.as_std().get_envs().any(|(key, value)| {
             key == "CODEBUDDY_DEFER_TOOL_LOADING" && value == Some(std::ffi::OsStr::new("0"))
+        }));
+        assert!(command.as_std().get_envs().any(|(key, value)| {
+            key == "DISABLE_AUTOUPDATER" && value == Some(std::ffi::OsStr::new("1"))
         }));
         assert!(command
             .as_std()
@@ -4637,13 +4648,16 @@ mod codebuddy_acp_tests {
             Some("local-secret")
         );
         assert!(!local.contains_key("OTHER_KEY"));
+        assert_eq!(local["DISABLE_AUTOUPDATER"], "1");
 
         let borrowed = HashMap::from([
             ("NOVA_QUOTA_BORROWED".into(), "1".into()),
             ("CODEBUDDY_CONFIG_DIR".into(), "isolated".into()),
+            ("DISABLE_AUTOUPDATER".into(), "0".into()),
         ]);
         let isolated = merge_codebuddy_activation_env(&borrowed, inherited);
         assert!(!isolated.contains_key("CODEBUDDY_API_KEY"));
+        assert_eq!(isolated["DISABLE_AUTOUPDATER"], "1");
         assert_eq!(
             isolated.get("CODEBUDDY_CONFIG_DIR").map(String::as_str),
             Some("isolated")
