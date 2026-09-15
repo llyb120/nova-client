@@ -1,3 +1,4 @@
+import { processSegments, processSummary, processLiveLines } from "../processDisplay";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { message } from "@tauri-apps/plugin-dialog";
 import {
@@ -1285,6 +1286,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         : "-",
     ];
     for (const item of g.body) {
+      parts.push(`process:${item.id}:${!!state.expanded[`process-${item.id}-done`]}`);
       if (item.type === "tool") {
         parts.push(
           `tool:${item.id}:${item.status}:${item.title}:${item.content.length}:${item.locations.length}:${item.rawInput !== undefined}:${item.rawOutput !== undefined}:${!!state.expanded[`tool-${item.id}`]}`,
@@ -1533,6 +1535,37 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       // Body content follows: commit user bottom margin (don't defer past fold/assistant).
       if ((g.turn && process.length) || process.length > 0 || conclusion.length > 0) flushBottom();
 
+      const layoutProcess = (items: Item[], xOffset: number, width: number, startY: number, live: boolean) => {
+        let py = startY;
+        const segments = processSegments(items);
+        for (const segment of segments) {
+          if (segment.type === "item") {
+            py = layoutItem(segment.item, result, gi, side, xOffset, width, width, py, live && segment.id === items.at(-1)?.id);
+            continue;
+          }
+          const isLive = live && segment === segments.at(-1);
+          const foldKey = `process-${segment.id}-${isLive ? "live" : "done"}`;
+          const open = !!state.expanded[foldKey];
+          const lines = isLive
+            ? processLiveLines(segment.items, text => wrapText(text, Math.max(1, width - 40), 12, p.sans))
+            : [processSummary(segment.items)];
+          py += 4 + (isLive ? (2 - lines.length) * 24 : 0);
+          for (const [lineIndex, line] of lines.entries()) {
+            result.push({ kind: "fold", id: segment.id, groupIdx: gi,
+              x: side + xOffset, y: py, w: width, h: 24,
+              text: ellipsize(line, Math.max(1, width - 40), 12, p.sans), title: line, color: p.muted, fontSize: 12, font: p.sans,
+              hoverBg: p.hover, borderRadius: 6, cursor: "pointer", data: { open, foldKey, hideChevron: lineIndex < lines.length - 1 },
+              clickAction: () => toggleExpanded(foldKey) });
+            py += 24;
+          }
+          if (open) for (const item of segment.items) {
+            py = layoutItem(item, result, gi, side, xOffset + 12, width - 12, width - 12, py, false);
+          }
+          py += 4;
+        }
+        return py;
+      };
+
       if (g.turn && process.length) {
         const foldKey = `turn-${g.turn.id ?? g.user?.id ?? process[0]?.id ?? 0}`;
         const open = state.expanded[foldKey] ?? bodyExpandedFor(process);
@@ -1566,9 +1599,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const processPadLeft = 12;
           const borderX = side + proseOff;
           let processY = processStartY;
-          for (const item of process) {
-            processY = layoutItem(item, result, gi, side, proseOff + processPadLeft, contentW - processPadLeft, proseW - processPadLeft, processY, false);
-          }
+          processY = layoutProcess(process, proseOff + processPadLeft, contentW - processPadLeft, processY, false);
           if (processY > processStartY) {
             result.push({ kind: "process-border", id: 0, groupIdx: gi,
               x: borderX, y: processStartY, w: 2, h: processY - processStartY,
@@ -1577,10 +1608,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           y = processY + 2 + 6;
         }
       } else {
-        for (const item of process) {
-          const isActive = active && item.id === (process[process.length - 1]?.id);
-          y = layoutItem(item, result, gi, side, proseOff, contentW, proseW, y, isActive);
-        }
+        y = layoutProcess(process, proseOff, contentW, y, active);
       }
 
       for (const item of conclusion) {
@@ -2298,6 +2326,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.textBaseline = "middle";
     const textX = isThought ? bx + padL + iconSize + gap : bx + padL;
     fillTextCrisp(ctx, b.text!, textX, by + b.h / 2);
+
+    if (b.data?.hideChevron) return;
 
     const iconX = isThought
       ? bx + padL

@@ -1,5 +1,6 @@
+import "./ProcessBlock.css";
 import { createMemo, For, Show } from "solid-js";
-import { latestStreamTextItem } from "../streamReveal";
+import { processSegments, processSummary, processLiveLines } from "../processDisplay";
 import { state, toggleExpanded } from "../store";
 import type { Item, TurnItem, UserItem } from "../types";
 import { EditedFilesCard } from "./EditedFilesCard";
@@ -133,11 +134,22 @@ export function turnAvgTokensPerSec(t: TurnItem | undefined | null): number | nu
   return Math.round(output / (ms / 1_000));
 }
 
-function isBusyItem(item: Item): boolean {
-  return (
-    (item.type === "tool" && (item.status === "pending" || item.status === "in_progress")) ||
-    (item.type === "thought" && item.text === "思考中…")
-  );
+function ProcessBody(props: { items: Item[]; active: boolean }) {
+  const segments = createMemo(() => processSegments(props.items));
+  return <For each={segments()}>{segment => {
+    if (segment.type === "item") return <TranscriptItem item={segment.item} active={props.active && segment.id === props.items.at(-1)?.id} />;
+    const live = () => props.active && segment === segments().at(-1);
+    const key = () => `process-${segment.id}-${live() ? "live" : "done"}`;
+    const open = () => !!state.expanded[key()];
+    const lines = () => live() ? processLiveLines(segment.items) : [processSummary(segment.items)];
+    return <div class="process-block">
+      <button type="button" class="process-toggle" aria-expanded={open()} onClick={() => toggleExpanded(key())}>
+        <IconChevron size={12} open={open()} />
+        <span class="process-lines" classList={{ "process-lines-live": live() }}><span>{lines().join("\n")}</span></span>
+      </button>
+      <Show when={open()}><div class="turn-process"><For each={segment.items}>{item => <TranscriptItem item={item} />}</For></div></Show>
+    </div>;
+  }}</For>;
 }
 
 /**
@@ -184,21 +196,6 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
     };
   });
 
-  // 仅「正在流式输出的那一项」随组活跃而自动展开。Codex 有时会先吐一句
-  // assistant 进度说明，然后继续在其上方的工具卡片里刷新输出；此时真正活跃的
-  // 是前面的 pending/in_progress 工具或“思考中…”，不能只看 body 末项。
-  const activeBodyId = () => latestStreamTextItem([props.group], props.active)?.id ?? -1;
-
-  // 当最后一行只是上一句 assistant 进度说明、实际仍在上方工具卡片里跑时，
-  // 在底部补一个轻量活动尾标，避免用户看到“最后一句不动”误以为卡死。
-  const showLiveTail = () => {
-    if (!props.active) return false;
-    const b = props.group.body;
-    if (b.length === 0 || !b.some(isBusyItem)) return false;
-    const last = b[b.length - 1];
-    return last.type === "assistant" || last.type === "system";
-  };
-
   const foldLabel = () => {
     const t = props.group.turn;
     const dur = t ? fmtDuration(t.durationMs) : "";
@@ -222,14 +219,7 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
         <Show
           when={foldable()}
           fallback={
-            <For each={split().process}>
-              {(item) => (
-                <TranscriptItem
-                  item={item}
-                  active={props.active && item.id === activeBodyId()}
-                />
-              )}
-            </For>
+            <ProcessBody items={split().process} active={props.active} />
           }
         >
           <button
@@ -242,16 +232,10 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
           </button>
           <Show when={open()}>
             <div class="turn-process">
-              <For each={split().process}>{(item) => <TranscriptItem item={item} />}</For>
+              <ProcessBody items={split().process} active={false} />
             </div>
           </Show>
         </Show>
-      </Show>
-      <Show when={showLiveTail()}>
-        <div class="turn-live-tail">
-          <span class="spinner small" />
-          继续处理中…
-        </div>
       </Show>
       <For each={split().conclusion}>{(item) => <TranscriptItem item={item} />}</For>
       <Show when={foldable()}>
