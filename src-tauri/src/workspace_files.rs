@@ -266,6 +266,7 @@ fn save_text(root: &Path, path: &str, original: &str, text: &str) -> Result<(), 
 
 #[tauri::command]
 pub async fn save_workspace_file(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     path: String,
@@ -273,9 +274,35 @@ pub async fn save_workspace_file(
     text: String,
 ) -> Result<(), String> {
     let root = root(&state, &thread_id)?;
+    let saved_path = path.clone();
     tauri::async_runtime::spawn_blocking(move || save_text(&root, &path, &original, &text))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+    let mut store = state.store.lock().map_err(|e| e.to_string())?;
+    if let Some(thread) = store.get_mut(&thread_id) {
+        let item = crate::threads::Item::Tool {
+            id: thread.next_item_id(),
+            ts: crate::threads::now_ms(),
+            call: crate::threads::ToolCall {
+                tool_call_id: format!("workspace-save-{}", uuid::Uuid::new_v4()),
+                title: format!("手动保存 {saved_path}"),
+                kind: "edit".into(),
+                status: "completed".into(),
+                content: vec![],
+                locations: vec![serde_json::json!({"path": saved_path})],
+                raw_input: None,
+                raw_output: None,
+            },
+        };
+        thread.items.push(item.clone());
+        thread.updated_at = crate::threads::now_ms();
+        store.save_thread(&thread_id);
+        let _ = app.emit(
+            crate::acp::EV_UPDATE,
+            serde_json::json!({"threadId":thread_id,"op":{"t":"upsert","item":item}}),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

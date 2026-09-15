@@ -10,14 +10,22 @@ export function collectWorkspaceArtifacts(items: readonly Item[]): string[] {
       .replace(/(?::\d+(?::\d+)?|#L\d+(?:-L?\d+)?)$/i, "");
     paths.add(path);
   };
-  // ponytail: 最近 2000 条记录、200 个产物；完整历史仍通过会话内文件菜单打开。
-  for (let i = items.length - 1; i >= Math.max(0, items.length - 2000) && paths.size < 200; i--) {
+  for (let i = items.length - 1; i >= 0; i--) {
     const item = items[i];
     if (item.type === "tool") {
+      if (item.status && item.status !== "completed") continue;
       for (const content of item.content) if (content.type === "diff") add(content.path);
+      if (["edit", "write", "create", "file_change"].includes(item.kind)) {
+        for (const location of item.locations ?? []) add(location.path);
+        const input = item.rawInput as Record<string, unknown> | undefined;
+        if (input && typeof input === "object") {
+          add(input.path ?? input.file_path ?? input.filePath);
+          if (Array.isArray(input.files)) for (const file of input.files) add(file?.path ?? file?.file_path);
+        }
+      }
     } else if (item.type === "assistant") {
       for (const match of item.text.matchAll(/!?\[[^\]]*\]\((?:<([^>]+)>|([^\s()]*(?:\([^()]*\)[^\s()]*)*))\)/g)) add(match[1] ?? match[2]);
     }
   }
-  return [...paths].slice(0, 200);
+  return [...paths];
 }

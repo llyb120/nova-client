@@ -7,5 +7,11 @@ const items = [
 ];
 assert.deepEqual(collectWorkspaceArtifacts(items), ["output.png", "src/main.ts", "D:/项目/a b.md"]);
 assert.deepEqual(collectWorkspaceArtifacts([{ type: "assistant", text: "[x](file:///D:/a%20b.md#L12)" }]), ["D:/a b.md"]);
-assert.equal(collectWorkspaceArtifacts(Array.from({ length: 300 }, (_, i) => ({ type: "tool", content: [{ type: "diff", path: `${i}.txt` }] }))).length, 200);
+assert.equal(collectWorkspaceArtifacts(Array.from({ length: 300 }, (_, i) => ({ type: "tool", content: [{ type: "diff", path: `${i}.txt` }] }))).length, 300);
+assert.deepEqual(collectWorkspaceArtifacts([
+  {type:'tool',kind:'read',status:'completed',locations:[{path:'read.txt'}],content:[]},
+  {type:'tool',kind:'edit',status:'failed',locations:[{path:'failed.txt'}],content:[]},
+  {type:'tool',kind:'edit',status:'completed',locations:[{path:'edited.txt'}],content:[]},
+  {type:'tool',kind:'write',status:'completed',rawInput:{file_path:'new.txt'},content:[]},
+]), ['new.txt','edited.txt']);
 console.log("workspace artifacts checks passed");
